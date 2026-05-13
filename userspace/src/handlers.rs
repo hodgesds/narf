@@ -317,6 +317,7 @@ pub fn init_per_task_state() {
     sched_param_init();
     pgid_init();
     sid_init();
+    wait_init();
 }
 
 /// Reset the registry — test hook; drops every per-task ring set.
@@ -3487,8 +3488,174 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     cwd_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
+    // Parent-of bookkeeping for waitpid: the child's exit fires
+    // an observer that uses this to find the parent's pending-
+    // exits queue. Without it, the parent's wait4 has no way to
+    // see the child's exit status.
+    parent_of_set(child_tid.raw(), parent_pid);
     let _ = child_pid; // tid != pid distinction lands with thread-group bookkeeping
     ctx.set_return(SyscallReturn::ok(child_tid.raw()));
+}
+
+// ── waitpid / wait4 — parent observes child exit status ────────────
+//
+// POSIX wait4(pid, &status, options, &rusage):
+//   pid  > 0  → wait for that specific child
+//   pid == -1 → any child
+//   pid == 0  → any child in same process group (we map to -1)
+//   pid < -1  → any child in pgid -pid (we map to -1)
+// options bit 0 = WNOHANG (return 0 immediately if no exited
+// child rather than blocking).
+//
+// Wire shape (`Syscall::Wait4 = 180`, four args):
+//   arg0 = pid (signed, fits in u64 via wrap)
+//   arg1 = status user-pointer (may be 0 to discard)
+//   arg2 = options (low bit = WNOHANG)
+//   arg3 = rusage user-pointer (zeroed today, no per-process
+//          resource accounting)
+//
+// Return value:
+//   ok(child_pid)  on a successful reap
+//   ok(0)          on WNOHANG with no exited child
+//   invalid_op     on no children to wait for (POSIX ECHILD;
+//                  we don't have multiple errno values yet)
+
+/// child_pid → parent_pid lookup. Set by fork; consumed by the
+/// exit observer to find the parent's pending-exits queue.
+static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// parent_pid → list of (child_pid, status) pairs not yet reaped.
+/// status is the POSIX-shaped 32-bit value: low 8 bits hold the
+/// signal that killed the child (or 0 for normal exit), bits
+/// 8..16 hold the exit code from sys_exit_task. Pre-fix, no
+/// signals are tracked; status == (exit_code << 8).
+static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, alloc::vec::Vec<(u64, i32)>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn wait_init() {
+    *PARENT_OF.lock() = Some(BTreeMap::new());
+    *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    crate::user_task::register_exit_observer(on_child_exit);
+}
+
+#[doc(hidden)]
+pub fn __test_wait_reset() {
+    *PARENT_OF.lock() = None;
+    *PENDING_EXITS.lock() = None;
+}
+
+fn parent_of_set(child: u64, parent: u64) {
+    let mut g = PARENT_OF.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(child, parent);
+    }
+}
+
+fn parent_of_get(child: u64) -> Option<u64> {
+    let g = PARENT_OF.lock();
+    g.as_ref().and_then(|m| m.get(&child).copied())
+}
+
+/// Exit observer registered by `wait_init`. Called when a polled
+/// user task transitions to Exited; pushes (child_pid, status)
+/// onto the parent's pending-exits queue so a future wait4 can
+/// reap it. Status: today we don't carry the user-supplied exit
+/// code through the polling routine, so this records 0. Future
+/// fix: thread the sys_exit_task `arg0` exit code through
+/// `EXIT_REASON_EXITED` to here.
+fn on_child_exit(child_pid: u64) {
+    let parent = match parent_of_get(child_pid) {
+        Some(p) => p,
+        None => return, // No registered parent — orphan; nothing to reap.
+    };
+    let mut g = PENDING_EXITS.lock();
+    if let Some(m) = g.as_mut() {
+        m.entry(parent)
+            .or_insert_with(alloc::vec::Vec::new)
+            .push((child_pid, 0));
+    }
+}
+
+fn sys_wait4(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let want_pid = args.arg0 as i64;
+    let status_ptr = args.arg1 as *mut i32;
+    let options = args.arg2 as u32;
+    let _rusage_ptr = args.arg3; // ignored; no resource accounting yet
+    const WNOHANG: u32 = 1;
+
+    let parent = current_task_id();
+
+    // Try-reap closure: pops the matching (child_pid, status)
+    // from the parent's queue if any. Returns Some on success.
+    let try_reap = |parent: u64, want: i64| -> Option<(u64, i32)> {
+        let mut g = PENDING_EXITS.lock();
+        let m = g.as_mut()?;
+        let q = m.get_mut(&parent)?;
+        let idx = if want > 0 {
+            // Specific child.
+            q.iter().position(|&(p, _)| p == want as u64)?
+        } else {
+            // Any child (including pid == 0 / pid < -1 we
+            // collapse to -1 for simplicity — no per-pgid wait
+            // until process groups are real).
+            if q.is_empty() {
+                return None;
+            }
+            0
+        };
+        Some(q.remove(idx))
+    };
+
+    if let Some((reaped, status)) = try_reap(parent, want_pid) {
+        if !status_ptr.is_null() {
+            // SAFETY: user-provided pointer; if bogus we fault and
+            // the trap path handles it. We're still in the user AS
+            // because the syscall handler hasn't swapped CR3.
+            unsafe {
+                core::ptr::write_volatile(status_ptr, status);
+            }
+        }
+        ctx.set_return(SyscallReturn::ok(reaped));
+        return;
+    }
+
+    if options & WNOHANG != 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    // Blocking wait — busy-poll with sleep_pumps so kernel async
+    // tasks (FB drain, cursor pump, IRQ wakers) keep making
+    // progress. Cap at 60 s to bound a wedged child + missing
+    // exit observer wiring.
+    let deadline = narf_time::Deadline::after_ms(60_000);
+    let mut reaped = None;
+    while !deadline.expired() {
+        if let Some(entry) = try_reap(parent, want_pid) {
+            reaped = Some(entry);
+            break;
+        }
+        narf_scheduler::sleep_pumps::run();
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
+    }
+    match reaped {
+        Some((child, status)) => {
+            if !status_ptr.is_null() {
+                // SAFETY: see above.
+                unsafe { core::ptr::write_volatile(status_ptr, status); }
+            }
+            ctx.set_return(SyscallReturn::ok(child));
+        }
+        // Use u64::MAX as the "error" sentinel since 0 is the
+        // legitimate WNOHANG-with-no-exited-child return value
+        // (so we can't reuse `invalid_op` whose rax = 0).
+        None => ctx.set_return(SyscallReturn::ok(u64::MAX)),
+    }
 }
 
 // ── Per-task pgid table ────────────────────────────────────────────
@@ -5748,6 +5915,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::MLock, "mlock", RawFnHandler(sys_mlock));
     table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
+    table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

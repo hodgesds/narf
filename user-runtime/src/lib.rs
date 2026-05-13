@@ -71,6 +71,7 @@ pub const SYS_MPROTECT: u64 = 172;
 pub const SYS_MLOCK: u64 = 173;
 pub const SYS_MUNLOCK: u64 = 174;
 pub const SYS_EXECVE: u64 = 179;
+pub const SYS_WAIT4: u64 = 181;
 pub const SYS_FB_CONNECT: u64 = 240;
 pub const SYS_FB_INFO: u64 = 241;
 pub const SYS_FB_RING_MAP: u64 = 242;
@@ -1107,6 +1108,42 @@ pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), ()> {
         Ok(())
     } else {
         Err(())
+    }
+}
+
+/// `wait4(pid, &status, options, &rusage)` — block (or poll under
+/// WNOHANG = 1) until a child of the calling task exits. Returns
+/// the reaped child pid (>0), `Ok(0)` on WNOHANG-with-no-exited-
+/// child, `Err(())` on no-children / timeout.
+///
+/// `pid` is signed: > 0 = specific child, -1 = any child. `0` and
+/// `< -1` (POSIX process-group variants) collapse to "any child"
+/// today; per-pgid wait lands when process groups become real.
+///
+/// # Safety
+/// `status` and `rusage` must be either null or valid writable
+/// pointers in the calling task's AS for the duration of the call.
+#[inline]
+pub unsafe fn wait4(
+    pid: i64,
+    status: *mut i32,
+    options: u32,
+    rusage: *mut u8,
+) -> Result<i64, ()> {
+    // SAFETY: SYS_WAIT4 4-arg signature.
+    let r = unsafe {
+        syscall4(
+            SYS_WAIT4,
+            pid as u64,
+            status as u64,
+            options as u64,
+            rusage as u64,
+        )
+    };
+    if r == u64::MAX {
+        Err(())
+    } else {
+        Ok(r as i64)
     }
 }
 

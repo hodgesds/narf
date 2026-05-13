@@ -386,6 +386,17 @@ pub enum Syscall {
     /// args, ELF parse failure, or out-of-task-context call.
     Execve = 179,
 
+    /// `wait4(pid, &status, options, &rusage)` — block (or
+    /// poll under WNOHANG) until a child of the calling task
+    /// exits, then reap its exit status. arg0 = pid (signed —
+    /// >0 specific child, -1 any), arg1 = status user-pointer
+    /// (may be 0), arg2 = options bitmask (low bit = WNOHANG),
+    /// arg3 = rusage user-pointer (zeroed; no per-process
+    /// resource accounting yet). Returns the reaped child pid
+    /// on success, 0 on WNOHANG with no exited child, InvalidOp
+    /// on no-children / timeout.
+    Wait4 = 181,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -958,6 +969,7 @@ impl Syscall {
             173 => Syscall::MLock,
             174 => Syscall::MUnlock,
             179 => Syscall::Execve,
+            181 => Syscall::Wait4,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,
