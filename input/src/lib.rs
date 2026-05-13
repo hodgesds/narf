@@ -393,12 +393,18 @@ pub fn init_global_ring(capacity: usize) {
 /// drops if `init_global_ring` hasn't been called.
 pub fn push_global(ev: InputEvent) -> bool {
     let is_key = matches!(ev, InputEvent::Key(_));
+    let is_ascii = matches!(ev, InputEvent::AsciiByte(_));
     let ring = ring_for(&ev);
     let g = ring.lock();
     if let Some(r) = g.as_ref() {
         let ok = r.push(ev);
-        if ok && is_key {
-            KEY_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if ok {
+            if is_key {
+                KEY_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if is_ascii {
+                ASCII_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         ok
     } else {
@@ -440,6 +446,7 @@ pub fn pop_scroll() -> Option<ScrollEvent> {
 pub fn pop_ascii_byte() -> Option<u8> {
     let ev = BYTE_RING.lock().as_ref().and_then(|r| r.pop())?;
     if let InputEvent::AsciiByte(b) = ev {
+        ASCII_POP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some(b)
     } else {
         None
@@ -508,6 +515,16 @@ pub static I8042_MOUSE_INIT_OK: core::sync::atomic::AtomicBool =
 /// IRQs are firing without requiring serial. If kbd-pushes stays
 /// at 0 across keystroke attempts, IRQ 1 isn't firing.
 pub static KEY_PUSH_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Same shape for `AsciiByte` events (serial / UART RX). 0 means
+/// no serial bytes ever reached the input ring — useful when
+/// debugging "shell isn't seeing typed input" on QEMU.
+pub static ASCII_PUSH_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Counts pop_ascii_byte successes — distinguishes "bytes
+/// pushed but never consumed" (push>pop, possible reader bug)
+/// from "no bytes ever pushed" (push=0).
+pub static ASCII_POP_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
 /// Stage::Subsys initcall: install all per-class rings before any

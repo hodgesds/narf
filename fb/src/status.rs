@@ -110,16 +110,16 @@ pub fn paint(fb: &FbWriter) {
         use core::sync::atomic::Ordering;
         let kbd_init = narf_input::I8042_KBD_INIT_OK.load(Ordering::Acquire);
         let kbd_irq = narf_input::I8042_KBD_IRQ_ROUTED.load(Ordering::Acquire);
-        let mouse_init = narf_input::I8042_MOUSE_INIT_OK.load(Ordering::Acquire);
-        let mouse_irq = narf_input::I8042_MOUSE_IRQ_ROUTED.load(Ordering::Acquire);
-        let pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
+        let kbd_pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
+        let ascii_pushes = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
+        let ascii_pops = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
         format!(
-            "i8042: kbd init={} irq={} mouse init={} irq={} key-pushes={}",
+            "input: kbd init={}/irq={} key-push={} ascii push={}/pop={}",
             if kbd_init { "ok" } else { "FAIL" },
             if kbd_irq { "ok" } else { "FAIL" },
-            if mouse_init { "ok" } else { "FAIL" },
-            if mouse_irq { "ok" } else { "FAIL" },
-            pushes,
+            kbd_pushes,
+            ascii_pushes,
+            ascii_pops,
         )
     };
 
