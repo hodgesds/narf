@@ -347,44 +347,88 @@ pub unsafe extern "C" fn pthread_mutex_destroy(_mutex: *mut pthread_mutex_t) -> 
     0
 }
 
-/// `pthread_mutex_lock(mutex)` — bump the lock counter. Single-
-/// threaded so we never block.
+/// `pthread_mutex_lock(mutex)` — POSIX mutex with futex contention.
+///
+/// State machine on `locked`:
+///   0 = unlocked
+///   1 = locked, no waiters
+///   2 = locked, waiters present
+///
+/// Fast path: cmpxchg(0 → 1). Slow path: swap-to-2 to record
+/// "waiters present", then futex_wait until the holder releases.
+/// Matches Linux's classic 3-state mutex (Drepper, "Futexes Are
+/// Tricky" §6).
 ///
 /// # Safety
 /// `mutex` must be a valid writable `*mut pthread_mutex_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return -1; }
-    // SAFETY: caller-supplied; single-threaded races impossible.
-    unsafe {
-        (*mutex).locked = (*mutex).locked.wrapping_add(1);
-        (*mutex).owner  = MAIN_THREAD;
+    let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
+    // Fast path: try uncontended acquire.
+    let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
+    if atomic
+        .compare_exchange(
+            0, 1,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        unsafe { (*mutex).owner = pthread_self(); }
+        return 0;
     }
-    0
+    // Slow path: announce ourselves as a waiter, then park.
+    loop {
+        // Set state to "locked + waiters" (2). swap returns old.
+        let old = atomic.swap(2, core::sync::atomic::Ordering::AcqRel);
+        if old == 0 {
+            unsafe { (*mutex).owner = pthread_self(); }
+            return 0;
+        }
+        // Park until *locked changes (the unlocker swaps it to 0).
+        // Expected value passed to futex_wait must match the
+        // current observed value (2) — if it changed, we'll
+        // recheck above.
+        let _ = narf_user_runtime::futex_wait(locked_ptr as u64, 2, 0);
+    }
 }
 
-/// `pthread_mutex_trylock(mutex)` — same as lock under single-
-/// threaded model (always succeeds).
+/// `pthread_mutex_trylock(mutex)` — non-blocking try; returns
+/// 0 on success, EBUSY (16) if already locked.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { pthread_mutex_lock(mutex) }
+    if mutex.is_null() { return -1; }
+    let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
+    let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
+    match atomic.compare_exchange(
+        0, 1,
+        core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed,
+    ) {
+        Ok(_) => {
+            unsafe { (*mutex).owner = pthread_self(); }
+            0
+        }
+        Err(_) => 16, // EBUSY
+    }
 }
 
-/// `pthread_mutex_unlock(mutex)` — decrement the counter. We do
-/// not surface "unlock of unlocked" as an error to keep the
-/// behaviour permissive for libstdc++ early-init paths.
+/// `pthread_mutex_unlock(mutex)` — release. If anyone was waiting
+/// (state was 2), wake one to retry the acquire.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return -1; }
-    // SAFETY: caller-supplied.
-    unsafe {
-        if (*mutex).locked > 0 {
-            (*mutex).locked -= 1;
-        }
-        if (*mutex).locked == 0 {
-            (*mutex).owner = 0;
-        }
+    let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
+    let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
+    // Clear ownership before releasing — between the swap and
+    // the wake any waiter that wins the race must see a clean
+    // owner field.
+    unsafe { (*mutex).owner = 0; }
+    let old = atomic.swap(0, core::sync::atomic::Ordering::Release);
+    if old == 2 {
+        // There were waiters — wake one.
+        let _ = narf_user_runtime::futex_wake(locked_ptr as u64, 1);
     }
     0
 }
@@ -482,5 +526,333 @@ pub unsafe extern "C" fn pthread_getspecific(key: pthread_key_t) -> *mut core::f
     unsafe {
         if !TLS_USED[i] { return core::ptr::null_mut(); }
         TLS_VALUES[i] as *mut core::ffi::c_void
+    }
+}
+
+// ── pthread_cond — condvar atop futex ───────────────────────────
+
+// We treat the first 4 bytes of pthread_cond_t as a sequence
+// number bumped on every signal/broadcast. cond_wait reads the
+// sequence, drops the mutex, futex_waits with that exact value;
+// any signal that bumps the sequence wakes us. The remaining
+// bytes are unused (room for a future state).
+
+fn cond_seq_ptr(cond: *mut pthread_cond_t) -> *mut u32 {
+    cond as *mut u32
+}
+
+/// `pthread_cond_init(cond, attr)` — zero the struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_cond_init(
+    cond: *mut pthread_cond_t,
+    _attr: *const pthread_condattr_t,
+) -> c_int {
+    if cond.is_null() { return -1; }
+    unsafe { *cond = pthread_cond_t::default(); }
+    0
+}
+
+/// `pthread_cond_destroy(cond)` — no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_cond_destroy(_cond: *mut pthread_cond_t) -> c_int {
+    0
+}
+
+/// `pthread_cond_wait(cond, mutex)` — atomically drop `mutex`,
+/// wait for a signal/broadcast on `cond`, re-acquire `mutex`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_cond_wait(
+    cond:  *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+) -> c_int {
+    if cond.is_null() || mutex.is_null() { return -1; }
+    let seq_ptr = cond_seq_ptr(cond);
+    let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
+    let seq = atomic.load(core::sync::atomic::Ordering::Acquire);
+    // Drop the mutex.
+    let _ = unsafe { pthread_mutex_unlock(mutex) };
+    // Park until the sequence changes (POSIX permits spurious
+    // wakeups; we futex_wait with the observed sequence and
+    // re-acquire on any wake).
+    let _ = narf_user_runtime::futex_wait(seq_ptr as u64, seq, 0);
+    // Re-take the mutex.
+    let _ = unsafe { pthread_mutex_lock(mutex) };
+    0
+}
+
+/// `pthread_cond_timedwait(cond, mutex, abstime)` — same as
+/// pthread_cond_wait but with an absolute timeout. Returns
+/// ETIMEDOUT (110) if the deadline passes.
+///
+/// # Safety
+/// `abstime` must point at a `timespec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_cond_timedwait(
+    cond:    *mut pthread_cond_t,
+    mutex:   *mut pthread_mutex_t,
+    abstime: *const crate::time::timespec,
+) -> c_int {
+    if cond.is_null() || mutex.is_null() || abstime.is_null() {
+        return -1;
+    }
+    let seq_ptr = cond_seq_ptr(cond);
+    let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
+    let seq = atomic.load(core::sync::atomic::Ordering::Acquire);
+    let _ = unsafe { pthread_mutex_unlock(mutex) };
+    // Compute relative-ns timeout from the abstime (CLOCK_REALTIME).
+    let mut now = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+    let _ = unsafe { crate::time::clock_gettime(0 /* REALTIME */, &mut now) };
+    let abs = unsafe { *abstime };
+    let now_ns = (now.tv_sec as i64).saturating_mul(1_000_000_000)
+        .saturating_add(now.tv_nsec as i64);
+    let abs_ns = (abs.tv_sec as i64).saturating_mul(1_000_000_000)
+        .saturating_add(abs.tv_nsec as i64);
+    let rel_ns = (abs_ns - now_ns).max(0) as u64;
+    let r = narf_user_runtime::futex_wait(seq_ptr as u64, seq, rel_ns);
+    let _ = unsafe { pthread_mutex_lock(mutex) };
+    if r < 0 { 110 /* ETIMEDOUT */ } else { 0 }
+}
+
+/// `pthread_cond_signal(cond)` — wake one waiter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int {
+    if cond.is_null() { return -1; }
+    let seq_ptr = cond_seq_ptr(cond);
+    let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
+    atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let _ = narf_user_runtime::futex_wake(seq_ptr as u64, 1);
+    0
+}
+
+/// `pthread_cond_broadcast(cond)` — wake all waiters.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut pthread_cond_t) -> c_int {
+    if cond.is_null() { return -1; }
+    let seq_ptr = cond_seq_ptr(cond);
+    let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
+    atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let _ = narf_user_runtime::futex_wake(seq_ptr as u64, i32::MAX as u32);
+    0
+}
+
+// ── pthread_rwlock — reader-writer lock atop futex ──────────────
+
+// State word in the first 4 bytes of pthread_rwlock_t:
+//   0          = unlocked
+//   1..u32::MAX-1 = N readers
+//   u32::MAX   = writer locked (exclusive)
+//
+// Single state word is sufficient; the futex_wake on unlock wakes
+// every waiter and they re-race for the next slot. Not the
+// fairest scheduling but correct under POSIX which doesn't
+// promise reader/writer priority.
+
+const WRLOCK_SENTINEL: u32 = u32::MAX;
+
+fn rwlock_state_ptr(rw: *mut pthread_rwlock_t) -> *mut u32 {
+    rw as *mut u32
+}
+
+/// `pthread_rwlock_init(rw, attr)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_init(
+    rw:    *mut pthread_rwlock_t,
+    _attr: *const core::ffi::c_void,
+) -> c_int {
+    if rw.is_null() { return -1; }
+    unsafe { *rw = pthread_rwlock_t::default(); }
+    0
+}
+
+/// `pthread_rwlock_destroy(rw)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_destroy(_rw: *mut pthread_rwlock_t) -> c_int {
+    0
+}
+
+/// `pthread_rwlock_rdlock(rw)` — acquire a reader slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_rdlock(rw: *mut pthread_rwlock_t) -> c_int {
+    if rw.is_null() { return -1; }
+    let p = rwlock_state_ptr(rw);
+    let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
+    loop {
+        let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
+        if cur == WRLOCK_SENTINEL || cur == WRLOCK_SENTINEL - 1 {
+            // Writer-locked or one short of overflow — park.
+            let _ = narf_user_runtime::futex_wait(p as u64, cur, 0);
+            continue;
+        }
+        if atomic
+            .compare_exchange(
+                cur, cur + 1,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return 0;
+        }
+    }
+}
+
+/// `pthread_rwlock_wrlock(rw)` — acquire exclusive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_wrlock(rw: *mut pthread_rwlock_t) -> c_int {
+    if rw.is_null() { return -1; }
+    let p = rwlock_state_ptr(rw);
+    let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
+    loop {
+        if atomic
+            .compare_exchange(
+                0, WRLOCK_SENTINEL,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return 0;
+        }
+        let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
+        if cur == 0 { continue; } // raced; retry cmpxchg
+        let _ = narf_user_runtime::futex_wait(p as u64, cur, 0);
+    }
+}
+
+/// `pthread_rwlock_tryrdlock(rw)` — non-blocking reader acquire.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_tryrdlock(rw: *mut pthread_rwlock_t) -> c_int {
+    if rw.is_null() { return -1; }
+    let p = rwlock_state_ptr(rw);
+    let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
+    let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
+    if cur >= WRLOCK_SENTINEL - 1 { return 16; /* EBUSY */ }
+    match atomic.compare_exchange(
+        cur, cur + 1,
+        core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed,
+    ) {
+        Ok(_) => 0,
+        Err(_) => 16,
+    }
+}
+
+/// `pthread_rwlock_trywrlock(rw)` — non-blocking writer acquire.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_trywrlock(rw: *mut pthread_rwlock_t) -> c_int {
+    if rw.is_null() { return -1; }
+    let p = rwlock_state_ptr(rw);
+    let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
+    match atomic.compare_exchange(
+        0, WRLOCK_SENTINEL,
+        core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed,
+    ) {
+        Ok(_) => 0,
+        Err(_) => 16,
+    }
+}
+
+/// `pthread_rwlock_unlock(rw)` — release. If we were the writer
+/// or the last reader, wake everyone so they can re-race.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_unlock(rw: *mut pthread_rwlock_t) -> c_int {
+    if rw.is_null() { return -1; }
+    let p = rwlock_state_ptr(rw);
+    let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
+    loop {
+        let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
+        let next = if cur == WRLOCK_SENTINEL { 0 } else { cur.saturating_sub(1) };
+        if atomic
+            .compare_exchange(
+                cur, next,
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            if next == 0 {
+                let _ = narf_user_runtime::futex_wake(p as u64, i32::MAX as u32);
+            }
+            return 0;
+        }
+    }
+}
+
+// ── pthread_barrier — N-thread synchronization point ────────────
+
+/// Layout: { count: u32, generation: u32, threshold: u32, _pad: u32 }.
+/// barrier_init records `threshold`. barrier_wait increments
+/// `count`; if count reaches threshold, the last arrival bumps
+/// `generation` (which is the futex word) + zeroes count + wakes
+/// all. Earlier arrivals futex_wait on the previous generation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct pthread_barrier_t {
+    pub count: u32,
+    pub generation: u32,
+    pub threshold: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct pthread_barrierattr_t {
+    pub _opaque: u32,
+}
+
+/// `pthread_barrier_init(bar, attr, count)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_barrier_init(
+    bar:   *mut pthread_barrier_t,
+    _attr: *const pthread_barrierattr_t,
+    count: u32,
+) -> c_int {
+    if bar.is_null() || count == 0 { return -1; }
+    unsafe {
+        *bar = pthread_barrier_t {
+            count: 0,
+            generation: 0,
+            threshold: count,
+            _pad: 0,
+        };
+    }
+    0
+}
+
+/// `pthread_barrier_destroy(bar)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_barrier_destroy(_bar: *mut pthread_barrier_t) -> c_int {
+    0
+}
+
+/// `pthread_barrier_wait(bar)` — block until `threshold` threads
+/// have called wait. Returns PTHREAD_BARRIER_SERIAL_THREAD (-1)
+/// for exactly one thread per generation; 0 for the others.
+pub const PTHREAD_BARRIER_SERIAL_THREAD: c_int = -1;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_barrier_wait(bar: *mut pthread_barrier_t) -> c_int {
+    if bar.is_null() { return -1; }
+    let count_ptr = unsafe { &raw mut (*bar).count } as *mut u32;
+    let gen_ptr = unsafe { &raw mut (*bar).generation } as *mut u32;
+    let count_atomic = unsafe { &*(count_ptr as *const core::sync::atomic::AtomicU32) };
+    let gen_atomic = unsafe { &*(gen_ptr as *const core::sync::atomic::AtomicU32) };
+    let threshold = unsafe { (*bar).threshold };
+    let my_gen = gen_atomic.load(core::sync::atomic::Ordering::Acquire);
+    let arrival = count_atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+    if arrival == threshold {
+        // Last arrival — reset count, bump generation, wake all.
+        count_atomic.store(0, core::sync::atomic::Ordering::Release);
+        gen_atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        let _ = narf_user_runtime::futex_wake(gen_ptr as u64, i32::MAX as u32);
+        PTHREAD_BARRIER_SERIAL_THREAD
+    } else {
+        // Wait until generation advances.
+        loop {
+            let cur = gen_atomic.load(core::sync::atomic::Ordering::Acquire);
+            if cur != my_gen { return 0; }
+            let _ = narf_user_runtime::futex_wait(gen_ptr as u64, my_gen, 0);
+        }
     }
 }

@@ -43,6 +43,78 @@ fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
     (2 + n) as u32
 }
 
+// Globals for condwait. The cond + mutex are static so the worker
+// extern "C" fn can address them without a per-thread arg.
+static mut CONDWAIT_MTX: libc::pthread_mutex_t = libc::pthread_mutex_t {
+    locked: 0, _pad: 0, owner: 0,
+};
+static mut CONDWAIT_COND: libc::pthread_cond_t = libc::pthread_cond_t {
+    _opaque: [0; 48],
+};
+static CONDWAIT_RELEASED: AtomicU32 = AtomicU32::new(0);
+static CONDWAIT_HITS: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn condwait_worker(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    use core::sync::atomic::Ordering;
+    unsafe {
+        let _ = libc::pthread_mutex_lock(&raw mut CONDWAIT_MTX);
+        // Wait until the main broadcasts and sets RELEASED.
+        while CONDWAIT_RELEASED.load(Ordering::Acquire) == 0 {
+            let _ = libc::pthread_cond_wait(
+                &raw mut CONDWAIT_COND,
+                &raw mut CONDWAIT_MTX,
+            );
+        }
+        let _ = libc::pthread_mutex_unlock(&raw mut CONDWAIT_MTX);
+    }
+    CONDWAIT_HITS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    core::ptr::null_mut()
+}
+
+fn condwait_run(fd: i32) {
+    use core::sync::atomic::Ordering;
+    const N: usize = 4;
+    CONDWAIT_RELEASED.store(0, Ordering::SeqCst);
+    CONDWAIT_HITS.store(0, Ordering::SeqCst);
+    unsafe {
+        CONDWAIT_MTX = libc::pthread_mutex_t { locked: 0, _pad: 0, owner: 0 };
+        CONDWAIT_COND = libc::pthread_cond_t { _opaque: [0; 48] };
+    }
+    let mut tids = [0u64; N];
+    for i in 0..N {
+        let attr = core::ptr::null::<libc::pthread_attr_t>();
+        let _ = unsafe {
+            libc::pthread_create(
+                &mut tids[i] as *mut u64,
+                attr,
+                condwait_worker,
+                core::ptr::null_mut(),
+            )
+        };
+    }
+    // Let the workers reach pthread_cond_wait.
+    unsafe { libc::usleep(50_000); }
+    // Release them with a broadcast under the mutex (so the
+    // RELEASED store can't race with the worker's loop).
+    unsafe {
+        let _ = libc::pthread_mutex_lock(&raw mut CONDWAIT_MTX);
+        CONDWAIT_RELEASED.store(1, Ordering::Release);
+        let _ = libc::pthread_cond_broadcast(&raw mut CONDWAIT_COND);
+        let _ = libc::pthread_mutex_unlock(&raw mut CONDWAIT_MTX);
+    }
+    for i in 0..N {
+        let _ = unsafe { libc::pthread_join(tids[i], core::ptr::null_mut()) };
+    }
+    let hits = CONDWAIT_HITS.load(Ordering::SeqCst);
+    let mut buf = [0u8; 12];
+    let s = u32_to_decimal(hits, &mut buf);
+    unsafe {
+        write_all(fd, b"condwait: hits=");
+        write_all(fd, s);
+        write_all(fd, b" expected=4\n");
+    }
+}
+
 fn polltest_run(fd: i32) {
     // Step 1: create an eventfd, poll with 10ms timeout, expect 0.
     let efd = unsafe { libc::eventfd(0, 0) };
@@ -417,6 +489,12 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             write_all(fd, s);
             write_all(fd, NEWLINE);
         }
+    } else if cmd == b"condwait" {
+        // condwait — spawn 4 threads that cond_wait on a shared
+        // condvar; main sleeps 50ms then broadcasts; all threads
+        // wake, increment a counter, exit. Main joins all and
+        // verifies the counter == 4.
+        condwait_run(fd);
     } else if cmd == b"polltest" {
         // polltest — exercise eventfd + poll + timerfd:
         //   1. eventfd; poll(events=POLLIN, timeout=10ms) → 0 (timeout)

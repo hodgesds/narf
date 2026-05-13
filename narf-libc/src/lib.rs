@@ -1,11 +1,11 @@
-//! narf-libc — relibc-shaped libc shim for NARF user binaries.
+//! narf-libc — POSIX libc shim for NARF user binaries.
 //!
-//! Path B of the relibc rollout: an in-tree, `no_std`, no-alloc-by-
-//! default crate that supplies a user binary the relibc startup
-//! contract (`_start` -> `__libc_start_main` -> user `main`) plus a
-//! minimum libc surface (write/printf-shim, exit, getpid, malloc-on-
-//! brk, errno-via-TLS, mem/str helpers) needed to validate the
-//! Stage-4 user-mode toolchain end-to-end.
+//! Path B: an in-tree, `no_std`, no-alloc-by-default crate that
+//! supplies a user binary the standard SysV C startup contract
+//! (`_start` -> `__libc_start_main` -> user `main`) plus a minimum
+//! libc surface (write/printf-shim, exit, getpid, malloc-on-brk,
+//! errno-via-TLS, mem/str helpers) needed to validate the Stage-4
+//! user-mode toolchain end-to-end. Surface follows POSIX.1-2017.
 //!
 //! Every libc-style entry delegates into [`narf_user_runtime`] for
 //! the actual syscall — this crate adds the C-ABI startup glue and
@@ -178,13 +178,21 @@ pub use term::{
     TCSADRAIN, TCSAFLUSH, TCSANOW,
 };
 pub use pthread::{
-    pthread_attr_destroy, pthread_attr_init, pthread_attr_t, pthread_cond_t,
+    pthread_attr_destroy, pthread_attr_init, pthread_attr_t,
+    pthread_barrier_destroy, pthread_barrier_init, pthread_barrier_t,
+    pthread_barrier_wait, pthread_barrierattr_t,
+    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init,
+    pthread_cond_signal, pthread_cond_t, pthread_cond_timedwait, pthread_cond_wait,
     pthread_condattr_t, pthread_create, pthread_detach, pthread_equal,
     pthread_getspecific, pthread_join, pthread_key_create, pthread_key_delete,
     pthread_key_t, pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock,
     pthread_mutex_t, pthread_mutex_trylock, pthread_mutex_unlock,
-    pthread_mutexattr_t, pthread_once, pthread_once_t, pthread_rwlock_t,
-    pthread_self, pthread_setspecific, pthread_t, MAIN_THREAD, PTHREAD_ONCE_INIT,
+    pthread_mutexattr_t, pthread_once, pthread_once_t,
+    pthread_rwlock_destroy, pthread_rwlock_init, pthread_rwlock_rdlock,
+    pthread_rwlock_t, pthread_rwlock_tryrdlock, pthread_rwlock_trywrlock,
+    pthread_rwlock_unlock, pthread_rwlock_wrlock,
+    pthread_self, pthread_setspecific, pthread_t,
+    MAIN_THREAD, PTHREAD_BARRIER_SERIAL_THREAD, PTHREAD_ONCE_INIT,
 };
 pub use process::{
     abort, atexit, execv, execve, execvp, exit, fork, getegid, geteuid, getgid,
