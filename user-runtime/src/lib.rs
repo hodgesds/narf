@@ -13,19 +13,21 @@
 //!   `userspace/src/handlers.rs`. Layout is `#[repr(C)]` and is
 //!   considered wire-stable; updates must land on both sides.
 //!
-//! The x86_64 syscall ABI is the `syscall` instruction with rax =
-//! number, rdi / rsi / rdx / r10 / r8 / r9 = args, rax = return
-//! value, RDX = status word. The kernel-side fast entry lives at
-//! `frame::x86_64::syscall::syscall_entry_x86_64` (LSTAR-driven)
-//! and shares dispatch with the legacy `int 0x80` path via
-//! `narf_userspace::kernel_syscall_entry_plain`. Every wrapper
+//! The x86_64 syscall ABI is `int 0x80` with rax = number, rdi /
+//! rsi / rdx / r10 / r8 / r9 = args, rax = return value, and RDX
+//! is also written by the kernel as the status word. Every wrapper
 //! that takes ≥3 args declares RDX as `inout` so rustc doesn't
 //! assume RDX is preserved across the trap (this is a real
 //! correctness issue — without the clobber rustc may keep a value
 //! it expected in RDX live across the syscall and read garbage).
-//! `syscall` additionally clobbers RCX (user RIP) and R11 (user
-//! RFLAGS) — the asm declares both as `out` so rustc treats them
-//! as scratch.
+//!
+//! Note: a fast `syscall`/`sysret` MSR-driven path exists in
+//! `frame::x86_64::syscall::syscall_entry_x86_64` and EFER.SCE
+//! is enabled at boot, but the libc shim still uses `int 0x80`
+//! today. The fast-path entry has a stack-marshalling bug we
+//! haven't fully diagnosed; once fixed, the wrappers below
+//! flip back to `syscall` for the perf win. Both paths share
+//! `narf_userspace::kernel_syscall_entry_plain` for dispatch.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -192,7 +194,7 @@ unsafe fn syscall0(num: u64) -> u64 {
     // 0-arg call.
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             out("rcx") _, out("r11") _, out("rdx") _,
             options(nostack, preserves_flags),
@@ -208,7 +210,7 @@ unsafe fn syscall1(num: u64, a0: u64) -> u64 {
     // SAFETY: see `syscall0`.
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             in("rdi") a0,
             out("rcx") _, out("r11") _, out("rdx") _,
@@ -225,7 +227,7 @@ unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
     // SAFETY: see `syscall0`.
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1,
             out("rcx") _, out("r11") _, out("rdx") _,
@@ -244,7 +246,7 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // expect any prior RDX value to survive.
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             out("rcx") _, out("r11") _,
@@ -262,7 +264,7 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     // amd64 kernel convention; see `syscall3` for the RDX rationale).
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _, in("r10") a3,
             out("rcx") _, out("r11") _,
@@ -280,7 +282,7 @@ unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64
     // amd64 kernel convention; see `syscall3` for the RDX rationale).
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             in("r10") a3, in("r8") a4,
@@ -298,7 +300,7 @@ unsafe fn syscall6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u6
     // SAFETY: r9 is the 6th-arg register per the kernel convention.
     unsafe {
         core::arch::asm!(
-            "syscall",
+            "int 0x80",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             in("r10") a3, in("r8") a4, in("r9") a5,

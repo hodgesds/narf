@@ -83,19 +83,20 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov gs:[0], rsp",
         "mov rsp, gs:[8]",
 
-        // Save the registers that `sysretq` needs to consume on
-        // return: rcx (user RIP) and r11 (user RFLAGS). Push
-        // these first so they're easy to find on the way out.
+        // Save the registers `sysretq` consumes on return:
+        // rcx (user RIP) and r11 (user RFLAGS).
         "push r11",
         "push rcx",
 
-        // Build a SyscallArgs struct on the stack from the
-        // user-side argument registers. SysV passes args in
-        // rdi/rsi/rdx/rcx/r8/r9; the syscall ABI substitutes r10
-        // for rcx because rcx carries the return RIP. Push in
-        // reverse so the struct lays out as
-        // { arg0=rdi, arg1=rsi, arg2=rdx, arg3=r10, arg4=r8, arg5=r9 }
-        // when we pass &args = rsp.
+        // Build a SyscallArgs struct in-place on the kernel
+        // stack from rdi/rsi/rdx/r10/r8/r9 (the user-side
+        // syscall arg registers — note r10 substitutes for rcx
+        // because the syscall instruction clobbered rcx with
+        // the user RIP). SyscallArgs is `#[repr(C)]` so the
+        // declaration order { arg0, arg1, ..., arg5 } is the
+        // memory order, matching this push sequence (reverse
+        // order so &SyscallArgs = current rsp lays out arg0
+        // at offset 0).
         "push r9",        // arg5
         "push r8",        // arg4
         "push r10",       // arg3
@@ -103,16 +104,19 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "push rsi",       // arg1
         "push rdi",       // arg0
 
-        // Stash the syscall number (rax) so the dispatcher's
-        // calling convention can use it as the first argument
-        // without losing it across the call.
-        "mov edi, eax",   // syscall number → arg0
-        "mov rsi, rsp",   // &SyscallArgs → arg1
+        // SysV calling convention for `dispatch_syscall(num, &args)`:
+        // arg0 (num) → rdi, arg1 (&args) → rsi.
+        "mov edi, eax",   // syscall number
+        "mov rsi, rsp",   // &SyscallArgs
 
-        // Reserve the 16-byte SysV stack alignment + nothing else;
-        // we already pushed 6+2=8 dwords (64 bytes), so RSP is
-        // already 16-byte-aligned for the call.
+        // Pre-call rsp = kernel_stack_top - 16 (r11+rcx) - 48
+        // (six 8-byte arg pushes) = -64, which is 16-aligned ✓.
+        // The call's return-address push lands at -72, which is
+        // 16k+8 — exactly what SysV requires inside the callee.
         "call {dispatch}",
+
+        // Drop the SyscallArgs scratch (6 × 8 bytes).
+        "add rsp, 48",
 
         // SyscallReturn is a 16-byte struct: status:u32 + padding,
         // then value:u64. SysV returns it in rax + rdx; rax holds
@@ -122,12 +126,7 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // (set_return in trap.rs: frame.rax = value, frame.rdx =
         // status), so user-runtime's syscall wrappers see the same
         // register layout regardless of which entry path was used.
-        // `xchg` accomplishes the swap in one instruction with no
-        // scratch register needed.
         "xchg rax, rdx",
-
-        // Drop the SyscallArgs scratch (6 × 8 = 48 bytes).
-        "add rsp, 48",
 
         // Restore user rcx (RIP) and r11 (RFLAGS) from the slots
         // we pushed at entry.
@@ -148,7 +147,10 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
 /// C-ABI dispatcher invoked from the naked asm. Marshals into
 /// the existing `narf_userspace::kernel_syscall_entry_plain`
 /// machinery so the int 0x80 path and the SYSCALL path share
-/// dispatch logic.
+/// dispatch logic. `args` is a borrow of the 6-u64 struct the
+/// asm built directly on the kernel stack — `SyscallArgs` is
+/// `#[repr(C)]` so the asm's push order matches the field
+/// layout exactly.
 extern "C" fn dispatch_syscall(
     num: u32,
     args: &narf_userspace::SyscallArgs,
