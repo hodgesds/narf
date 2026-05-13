@@ -222,11 +222,12 @@ impl Controller {
         // loopback transport returns immediately. The controller's
         // bring-up budget is generous (per Vol 4 Part E §6 the
         // command-complete timeout is ≥ 5 s on a real controller).
-        // responsive_spin ticks sleep_pumps so cursor/FB/serial
-        // stay alive across the multi-second budget.
+        // responsive_spin_until ticks sleep_pumps so cursor/FB/serial
+        // stay alive across the multi-second budget. 5 s spec
+        // upper bound (Vol 4 Part E §6) + a small overhead margin.
         let mut got: Option<Event> = None;
         let mut transport_err: Option<TransportError> = None;
-        let _ = narf_scheduler::responsive_spin(
+        let _ = narf_scheduler::responsive_spin_until(
             || match self.transport.recv_event() {
                 Ok(Some(e)) => {
                     got = Some(e);
@@ -238,7 +239,7 @@ impl Controller {
                     true
                 }
             },
-            1_000_000,
+            narf_time::Deadline::after_ms(5_500),
         );
         if let Some(e) = transport_err {
             return Err(BringupError::Transport(e));

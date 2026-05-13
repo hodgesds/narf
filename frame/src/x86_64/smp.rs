@@ -328,14 +328,12 @@ pub unsafe fn start_aps() -> u32 {
         viable_len
     );
 
-    // Single shared online-spin watchdog instead of per-AP. Bound
-    // it generously enough that a slow-coming-up AP doesn't drop
-    // out, but tight enough that a wedged controller doesn't burn
-    // forever. ~500M spins ≈ 100-500 ms at modern clock speeds.
-    // responsive_spin keeps cursor/FB/serial alive while we wait
-    // for APs to report online.
-    const ONLINE_SPIN_BUDGET: u32 = 500_000_000;
-    let _ = narf_scheduler::responsive_spin(
+    // Single shared online-spin watchdog instead of per-AP.
+    // 500 ms wall-clock budget — generous for real APs (typically
+    // come up in <10 ms each) and tight enough that a wedged
+    // controller doesn't burn forever. responsive_spin_until
+    // ticks sleep_pumps so cursor/FB/serial stay alive.
+    let _ = narf_scheduler::responsive_spin_until(
         || {
             viable
                 .iter()
@@ -343,7 +341,7 @@ pub unsafe fn start_aps() -> u32 {
                 .count() as u32
                 == viable_len as u32
         },
-        ONLINE_SPIN_BUDGET,
+        narf_time::Deadline::after_ms(500),
     );
     let started = viable
         .iter()
