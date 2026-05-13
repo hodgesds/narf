@@ -192,6 +192,31 @@ pub unsafe fn load_user_process_with(
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
 
+    // Stack guard: a single PROT_NONE region one page BELOW
+    // the stack base. A stack-overflow access faults with P=0
+    // (page not present) — currently surfaces as a generic
+    // user-mode #PF that the kernel handler reports +
+    // terminates the task. Without the explicit region the
+    // overflow could silently extend into whatever else is
+    // mapped in the heap / mmap arena (for now nothing —
+    // brk + mmap live well below DEFAULT_USER_STACK_BASE — but
+    // the explicit guard means a future arena that does happen
+    // to grow up to the stack stays distinct from a real stack
+    // overflow). 4 KiB is the natural page granularity; one
+    // frame is the smallest meaningful guard.
+    let guard_base = DEFAULT_USER_STACK_BASE - 0x1000;
+    let guard_phys = narf_memory::alloc_frame()
+        .map_err(|_| ProcessLoadError::StackAllocFailed)?
+        .start_address();
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(guard_base),
+            len: 0x1000,
+            perms: RegionPerms(0), // PROT_NONE — no PTE installed
+            phys: alloc::vec![guard_phys],
+        })
+        .map_err(|_| ProcessLoadError::StackMapFailed)?;
+
     // SAFETY: AS is from `load_elf_bytes` (hence `new_for_user`)
     // and stack region was just pushed.
     unsafe { address_space.materialize() }.map_err(|_| ProcessLoadError::StackMaterializeFailed)?;

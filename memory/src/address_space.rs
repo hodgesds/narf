@@ -356,6 +356,17 @@ impl AddressSpace {
             return;
         }
         for r in regions {
+            // PROT_NONE: tear down the leaf PTEs without freeing
+            // the underlying frames (region.phys still owns them).
+            // The next mprotect-back-to-RW just re-installs.
+            if r.perms.0 == 0 {
+                for i in 0..r.phys.len() {
+                    let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
+                    // SAFETY: same identity-map invariant.
+                    let _ = unsafe { unmap_4kb(self.root, v) };
+                }
+                continue;
+            }
             let mut flags = PtFlags::USER;
             if r.perms.contains(RegionPerms::WRITE) {
                 flags = flags | PtFlags::WRITABLE;
@@ -381,6 +392,14 @@ impl AddressSpace {
             return;
         }
         for r in regions {
+            if r.perms.0 == 0 {
+                for i in 0..r.phys.len() {
+                    let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
+                    // SAFETY: see x86_64 variant.
+                    let _ = unsafe { unmap_4kb(self.root, v) };
+                }
+                continue;
+            }
             let mut flags = PtFlags::AP_RW_EL1;
             if !r.perms.contains(RegionPerms::EXEC) {
                 flags = flags | PtFlags::UXN | PtFlags::PXN;
@@ -421,6 +440,14 @@ impl AddressSpace {
         }
         let regions = self.regions.lock();
         for r in regions.iter() {
+            // PROT_NONE region: bookkeeping is recorded but no PTE
+            // installed. User-mode access faults with P=0 (page
+            // not present), which `frame::x86_64::trap` reports
+            // as a clean SEGV-equivalent. Used for stack guard
+            // pages + post-mprotect(PROT_NONE) regions.
+            if r.perms.0 == 0 {
+                continue;
+            }
             let mut flags = PtFlags::USER;
             if r.perms.contains(RegionPerms::WRITE) {
                 flags = flags | PtFlags::WRITABLE;
@@ -453,6 +480,11 @@ impl AddressSpace {
         }
         let regions = self.regions.lock();
         for r in regions.iter() {
+            // PROT_NONE region: no PTE installed. See x86_64
+            // counterpart for rationale.
+            if r.perms.0 == 0 {
+                continue;
+            }
             // aarch64 perm translation:
             // - AP_RW_EL1 = kernel-writable; for user the AP field
             //   changes to RW-EL1/EL0 (0b01<<6). For now Stage-4
