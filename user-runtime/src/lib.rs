@@ -68,6 +68,8 @@ pub const SYS_PIPE: u64 = 117;
 pub const SYS_MMAP: u64 = 120;
 pub const SYS_MUNMAP: u64 = 121;
 pub const SYS_MPROTECT: u64 = 172;
+pub const SYS_MLOCK: u64 = 173;
+pub const SYS_MUNLOCK: u64 = 174;
 pub const SYS_FB_CONNECT: u64 = 240;
 pub const SYS_FB_INFO: u64 = 241;
 pub const SYS_FB_RING_MAP: u64 = 242;
@@ -1105,6 +1107,28 @@ pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), ()> {
     } else {
         Err(())
     }
+}
+
+/// Force-back every demand-paged page in `[addr, addr+len)` and
+/// flag the region as LOCKED so future swap / reclaim passes
+/// leave it alone. Returns `Ok(())` on success, `Err(())` on
+/// failure (no region intersects / OOM / AS lookup failed).
+#[inline]
+pub unsafe fn mlock(addr: *const u8, len: usize) -> Result<(), ()> {
+    // SAFETY: SYS_MLOCK signature: arg0 base, arg1 len.
+    let r = unsafe { syscall2(SYS_MLOCK, addr as u64, len as u64) };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Clear the LOCKED flag on `[addr, addr+len)`. Frames stay
+/// backed (no swap exists yet to reclaim them); call `munmap` to
+/// actually release storage. Returns `Ok(())` / `Err(())` as
+/// `mlock`.
+#[inline]
+pub unsafe fn munlock(addr: *const u8, len: usize) -> Result<(), ()> {
+    // SAFETY: SYS_MUNLOCK signature: arg0 base, arg1 len.
+    let r = unsafe { syscall2(SYS_MUNLOCK, addr as u64, len as u64) };
+    if r == 0 { Ok(()) } else { Err(()) }
 }
 
 /// Query (`new_break == 0`) or resize the per-task heap break.

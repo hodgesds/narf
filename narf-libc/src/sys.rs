@@ -95,13 +95,38 @@ pub unsafe extern "C" fn mprotect(addr: *mut c_void, len: usize, prot: c_int) ->
     }
 }
 
-/// `mlock(addr, len)` — accept and ignore.
+/// `mlock(addr, len)` — force-back every demand-paged page in the
+/// range and tell the kernel "don't reclaim me." Backed by the
+/// kernel SYS_MLOCK introduced this session. Returns 0 on
+/// success, -1 + errno=ENOMEM on failure (no region intersects /
+/// OOM trying to back the lazy pages).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mlock(_addr: *const c_void, _len: usize) -> c_int { 0 }
+pub unsafe extern "C" fn mlock(addr: *const c_void, len: usize) -> c_int {
+    // SAFETY: forwarded; user-runtime issues SYS_MLOCK.
+    match unsafe { narf_user_runtime::mlock(addr as *const u8, len) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(12); // ENOMEM
+            -1
+        }
+    }
+}
 
-/// `munlock(addr, len)` — accept and ignore.
+/// `munlock(addr, len)` — clear the LOCKED flag. Frames stay
+/// backed (no swap exists yet to reclaim them); call `munmap`
+/// to actually release storage. Returns 0 on success, -1 +
+/// errno=EINVAL if no region intersects.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn munlock(_addr: *const c_void, _len: usize) -> c_int { 0 }
+pub unsafe extern "C" fn munlock(addr: *const c_void, len: usize) -> c_int {
+    // SAFETY: forwarded; user-runtime issues SYS_MUNLOCK.
+    match unsafe { narf_user_runtime::munlock(addr as *const u8, len) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}
 
 /// `mlockall(flags)` — accept and ignore.
 #[unsafe(no_mangle)]

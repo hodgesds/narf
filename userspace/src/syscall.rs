@@ -342,6 +342,19 @@ pub enum Syscall {
     /// range or the AS lookup failed.
     MProtect = 172,
 
+    /// `mlock(addr, len)` — force-back every lazy (demand-paged)
+    /// page in `[addr, addr + len)` and set the LOCKED flag so
+    /// future swap/reclaim passes leave the region alone.
+    /// arg0 = base addr, arg1 = length in bytes. Ok(0) on
+    /// success, InvalidOp on no-region / OOM.
+    MLock = 173,
+
+    /// `munlock(addr, len)` — clear the LOCKED flag. Frames stay
+    /// backed (no swap exists yet to reclaim them). arg0 = base
+    /// addr, arg1 = length in bytes. Ok(0) on success, InvalidOp
+    /// on no-region.
+    MUnlock = 174,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -911,6 +924,8 @@ impl Syscall {
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             172 => Syscall::MProtect,
+            173 => Syscall::MLock,
+            174 => Syscall::MUnlock,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,
