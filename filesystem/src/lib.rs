@@ -148,6 +148,54 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// POSIX-2017 §B.2.1 access check: given a file's mode/uid/gid and
+/// the accessor's identity, decide whether the requested operation
+/// (one of read/write/exec) is permitted.
+///
+/// - UID 0 (root) is always allowed (POSIX privileged-process rule).
+/// - Otherwise: pick owner / group / other triplet by matching uid
+///   then gid, and AND with the requested-mode bits (R=4, W=2, X=1).
+pub fn posix_access_ok(
+    file_uid: u32,
+    file_gid: u32,
+    file_perms: u16,
+    accessor_uid: u32,
+    accessor_gid: u32,
+    want_r: bool,
+    want_w: bool,
+    want_x: bool,
+) -> bool {
+    if accessor_uid == 0 {
+        // Root always has read+write; exec still requires *some*
+        // exec bit on the file (matches Linux's get_acl_root path
+        // where root gets X iff any exec bit is set, otherwise the
+        // file is treated as data even for root).
+        if want_x && (file_perms & 0o111) == 0 {
+            return false;
+        }
+        return true;
+    }
+    let triplet_shift = if accessor_uid == file_uid {
+        6 // owner: bits 8..6
+    } else if accessor_gid == file_gid {
+        3 // group: bits 5..3
+    } else {
+        0 // other: bits 2..0
+    };
+    let bits = (file_perms >> triplet_shift) & 0o7;
+    let mut want = 0u16;
+    if want_r {
+        want |= 0o4;
+    }
+    if want_w {
+        want |= 0o2;
+    }
+    if want_x {
+        want |= 0o1;
+    }
+    (bits & want) == want
+}
+
 /// Combined `(FileType, perms)` mode word.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Mode {
@@ -254,6 +302,25 @@ pub trait FileOps: Send + Sync {
     /// Resize the file to exactly `len` bytes. Growing zero-fills;
     /// shrinking truncates.
     fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// POSIX-2017 `struct stat` `st_uid` / `st_gid`. FSes that have
+    /// no native owner concept (FAT, initramfs) keep the default
+    /// (0, 0) — owned by root. ext2 / minix / virtiofs override.
+    fn owners(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// Update `st_uid` / `st_gid`. Default returns Unsupported;
+    /// FSes that persist owners override.
+    fn set_owners<'a>(&'a self, _uid: u32, _gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Update the low-9 permission bits in `Stat::mode`. Default
+    /// returns Unsupported; FSes that persist mode bits override.
+    fn set_perms<'a>(&'a self, _perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 }

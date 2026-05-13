@@ -684,7 +684,35 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         }
     };
 
+    // POSIX-2017 permission check. The accessor's UID/GID come from
+    // the per-task uidgid table; the file's owners + perms come from
+    // its FileOps trait. UID 0 (root) shortcuts; non-root must own
+    // a matching r/w bit per POSIX `open(2)` description. Today most
+    // FSes report (uid=0, gid=0, perms=0o666) so non-root tasks see
+    // the "other" triplet's rw bits and pass; the gate is structural
+    // until ext2/minix start surfacing real owners.
     let task = current_task_id();
+    let stat = ops.stat();
+    let (file_uid, file_gid) = ops.owners();
+    let acc = read_uidgid(task);
+    // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Bits 0..1 of flags.
+    let access_mode = flags & 0o3;
+    let want_r = access_mode == 0 || access_mode == 2;
+    let want_w = access_mode == 1 || access_mode == 2;
+    if !narf_filesystem::posix_access_ok(
+        file_uid,
+        file_gid,
+        stat.mode.perms,
+        acc.uid,
+        acc.gid,
+        want_r,
+        want_w,
+        false,
+    ) {
+        ctx.set_return(fail);
+        return;
+    }
+
     let new_fd = match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops,
