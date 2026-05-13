@@ -132,6 +132,18 @@ fn pick_gsi(mask: u32, min_gsi: u8) -> Option<u8> {
             return Some(g);
         }
     }
+    // Fallback: scan low GSIs skipping the well-known legacy
+    // assignments. GSI 0 = PIT, GSI 1 = i8042 kbd, GSI 8 = RTC,
+    // GSI 13 = FPU. GSI 2 (historically PIC cascade) is allowed
+    // because the PIT is masked on systems running HPET — on
+    // QEMU, HPET timer 0 route_cap is 0x4 (GSI 2 only), so
+    // without this allowance hpet_oneshot returns NoSafeGsi.
+    const LEGACY_RESERVED: u32 = (1 << 0) | (1 << 1) | (1 << 8) | (1 << 13);
+    for g in 0u8..16 {
+        if mask & (1u32 << g) != 0 && LEGACY_RESERVED & (1u32 << g) == 0 {
+            return Some(g);
+        }
+    }
     None
 }
 

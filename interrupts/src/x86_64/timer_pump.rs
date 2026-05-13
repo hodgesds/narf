@@ -72,12 +72,31 @@ static STATE: PumpState = PumpState {
     dest_apic: AtomicU8::new(0),
 };
 
-/// Pick the first GSI in `mask` >= `min_gsi`. Identical
-/// algorithm to `hpet_oneshot::pick_gsi`; duplicated here so
-/// the modules don't cross-call private fns.
+/// Pick a GSI in `mask`. Tries the high range first (>= `min_gsi`,
+/// typically 16, to stay out of legacy ISA territory), then falls
+/// back to lower GSIs skipping the well-known legacy allocations
+/// (0 = PIT cascade, 1 = i8042 kbd, 2 = legacy PIC cascade,
+/// 8 = RTC, 13 = FPU). On QEMU the HPET timer 0 route_cap often
+/// only advertises low GSIs (4-7) — without this fallback
+/// `timer_pump` init returns NoSafeGsi and async sleeps fall back
+/// to busy-poll.
 fn pick_gsi(mask: u32, min_gsi: u8) -> Option<u8> {
     for g in min_gsi..32 {
         if mask & (1u32 << g) != 0 {
+            return Some(g);
+        }
+    }
+    // Fallback: scan low GSIs skipping the well-known legacy
+    // assignments. GSI 0 = legacy PIT, GSI 1 = i8042 kbd, GSI 8 =
+    // RTC, GSI 13 = FPU. GSI 2 (historically PIC cascade / re-
+    // routed PIT) is allowed because we never enable the PIT for
+    // timekeeping — modern systems run HPET / LAPIC timer there.
+    // On QEMU, HPET timer 0 route_cap is exactly 0x4 (GSI 2 only),
+    // so without this allowance timer_pump init returns NoSafeGsi
+    // and async sleep_cycles falls back to busy-poll.
+    const LEGACY_RESERVED: u32 = (1 << 0) | (1 << 1) | (1 << 8) | (1 << 13);
+    for g in 0u8..16 {
+        if mask & (1u32 << g) != 0 && LEGACY_RESERVED & (1u32 << g) == 0 {
             return Some(g);
         }
     }
@@ -185,7 +204,16 @@ pub fn init() -> Result<(), TimerPumpInitError> {
     let route_cap = narf_time::hpet::timer_route_cap(0);
     let gsi = match pick_gsi(route_cap, 16) {
         Some(g) => g,
-        None => return Err(bail(TimerPumpInitError::NoSafeGsi)),
+        None => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  timer_pump: HPET timer 0 route_cap = {:#010x} \
+                 (no usable GSI found)",
+                route_cap,
+            );
+            return Err(bail(TimerPumpInitError::NoSafeGsi));
+        }
     };
 
     let vector = match crate::vector::alloc() {
