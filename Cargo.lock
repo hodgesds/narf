@@ -502,6 +502,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
  "narf-time",
 ]
 
@@ -531,6 +532,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
  "narf-shmem",
  "narf-userspace",
 ]
@@ -559,6 +561,7 @@ dependencies = [
  "narf-capabilities",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -580,6 +583,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
  "narf-time",
 ]
 
@@ -811,6 +815,7 @@ dependencies = [
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -865,6 +870,8 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -883,6 +890,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -926,6 +934,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
  "narf-time",
 ]
 
@@ -958,6 +967,7 @@ dependencies = [
  "narf-capabilities",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
  "narf-usbpd",
 ]
 
@@ -979,6 +989,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1038,6 +1049,7 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-shmem",
+ "narf-time",
  "narf-userspace",
 ]
 
@@ -1279,6 +1291,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
  "narf-time",
 ]
 

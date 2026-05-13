@@ -885,9 +885,12 @@ impl Controller {
         // bumps from the ISR. As a defensive belt-and-braces check
         // we also bail if the CQE phase flips first (e.g. if the
         // interrupt got lost; QEMU has been observed to do this on
-        // hot reset paths). responsive_spin ticks sleep_pumps so the
-        // FB cursor / serial drain stay alive.
-        let done = narf_scheduler::responsive_spin(
+        // hot reset paths). responsive_spin_until ticks sleep_pumps
+        // so the FB cursor / serial drain stay alive. Wall-clock
+        // budget 5 s — well clear of typical sub-ms NVMe I/O
+        // completion latency, finite enough to surface a wedged
+        // controller.
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 if narf_interrupts::fire_count(v) > baseline {
                     return true;
@@ -896,7 +899,7 @@ impl Controller {
                 let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
                 (cqe.status & 1) == (io.cq_phase & 1)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(5_000),
         );
         if !done {
             return Err(NvmeError::CompletionTimeout);
@@ -1133,15 +1136,18 @@ impl Controller {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
-/// Bounded poll for a `CSTS` predicate. Loops up to ~1M MMIO reads,
-/// returning `ControllerFailed` on timeout or `ControllerFatal` if
-/// `CFS` is set during the wait.
+/// Bounded poll for a `CSTS` predicate. Wall-clock-bounded at 5 s
+/// (NVMe 1.4 §3.1.5: CSTS.RDY transition is bounded by CAP.TO * 500
+/// ms, which can be up to ~127 s nominal but in practice settles in
+/// well under a second on every controller we've seen — 5 s is the
+/// "real wedge" threshold). Returns `ControllerFailed` on timeout or
+/// `ControllerFatal` if `CFS` is set during the wait.
 fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeError> {
-    // responsive_spin ticks sleep_pumps every ~4096 iterations so
-    // the cursor / FB / serial console stay alive while we busy-
+    // responsive_spin_until ticks sleep_pumps every ~4096 iterations
+    // so the cursor / FB / serial console stay alive while we busy-
     // wait on a stuck controller.
     let mut fatal = false;
-    let done = narf_scheduler::responsive_spin(
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped MMIO, naturally aligned.
             let s = unsafe { bar.read32(REG_CSTS) };
@@ -1151,7 +1157,7 @@ fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeErro
             }
             ok(s)
         },
-        1_000_000,
+        narf_time::Deadline::after_ms(5_000),
     );
     if fatal {
         return Err(NvmeError::ControllerFatal);
@@ -1197,16 +1203,18 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
 /// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
     let base = buf.phys_addr().raw() as *const Cqe;
-    // responsive_spin keeps cursor/FB/serial alive on a slow or
-    // stuck controller.
-    let done = narf_scheduler::responsive_spin(
+    // responsive_spin_until keeps cursor/FB/serial alive on a slow
+    // or stuck controller. 5 s wall-clock budget — NVMe admin
+    // commands (IDENTIFY etc.) are sub-millisecond on real hardware;
+    // 5 s is the "real wedge" threshold.
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: caller guarantees buf is page-aligned and large
             // enough; index is bounded.
             let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
             (cqe.status & 1) == (expected_phase & 1)
         },
-        10_000_000,
+        narf_time::Deadline::after_ms(5_000),
     );
     if !done {
         return Err(NvmeError::CompletionTimeout);
