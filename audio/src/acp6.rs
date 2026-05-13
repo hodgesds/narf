@@ -158,12 +158,14 @@ impl AcpDevice {
         unsafe {
             mmio.write32(regs::ACP_SOFT_RESET, regs::RESET_REQUEST);
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-        // during ACP soft-reset settle.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive during ACP soft-reset settle. 100 ms wedge
+        // threshold (typical reset latches in <1 ms per AMD PPR
+        // §13.3.2).
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(regs::ACP_SOFT_RESET) } & regs::RESET_DONE != 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         if !done {
             return Err(AcpError::ResetTimeout);
@@ -223,13 +225,14 @@ impl AcpDevice {
             self.mmio.write32(regs::ACP_RI_KICK, 1);
         }
 
-        // Wait for ACP_STATUS.READY. responsive_spin ticks
+        // Wait for ACP_STATUS.READY. responsive_spin_until ticks
         // sleep_pumps so cursor/FB/serial stay alive across the
-        // ~10ms RI DMA load.
-        let ready = narf_scheduler::responsive_spin(
+        // ~10 ms RI DMA load. 500 ms wedge threshold (50x typical
+        // per AMD PPR §13.3.4).
+        let ready = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { self.mmio.read32(regs::ACP_STATUS) } & regs::STATUS_READY != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(500),
         );
         if !ready {
             return Err(AcpError::FirmwareLoadFailed);

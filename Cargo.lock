@@ -534,6 +534,7 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-shmem",
+ "narf-time",
  "narf-userspace",
 ]
 
@@ -816,6 +817,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -968,6 +970,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
+ "narf-time",
  "narf-usbpd",
 ]
 

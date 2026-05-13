@@ -411,23 +411,25 @@ impl IntelHda {
             let g = bar0.read32(REG_GCTL);
             bar0.write32(REG_GCTL, g & !GCTL_CRST);
         }
-        // Wait for reset to take effect. responsive_spin ticks
-        // sleep_pumps so cursor/FB stay alive across the deassert.
-        let _ = narf_scheduler::responsive_spin(
+        // Wait for reset to take effect. responsive_spin_until
+        // ticks sleep_pumps so cursor/FB stay alive across the
+        // deassert. 10 ms wedge threshold (HDA §4.2.2: CRST clears
+        // in <1 ms on healthy controllers).
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { bar0.read32(REG_GCTL) } & GCTL_CRST == 0,
-            10_000,
+            narf_time::Deadline::after_ms(10),
         );
         // SAFETY: same.
         unsafe {
             bar0.write32(REG_GCTL, GCTL_CRST | GCTL_UNSOL);
         }
-        // responsive_spin keeps cursor/FB alive while the
-        // controller comes out of reset.
-        let crst_ok = narf_scheduler::responsive_spin(
+        // responsive_spin_until keeps cursor/FB alive while the
+        // controller comes out of reset. 50 ms wedge threshold.
+        let crst_ok = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { bar0.read32(REG_GCTL) } & GCTL_CRST != 0,
-            50_000,
+            narf_time::Deadline::after_ms(50),
         );
         if !crst_ok {
             return Err(HdaError::ResetTimeout);
@@ -530,21 +532,23 @@ impl IntelHda {
         unsafe {
             bar0.write16(REG_CORBRP, 1 << 15);
         }
-        // responsive_spin ticks sleep_pumps across the read-pointer
-        // reset handshake.
-        let _ = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps across the
+        // read-pointer reset handshake. 10 ms wedge threshold
+        // (CORBRPRST handshake completes in microseconds on
+        // healthy controllers).
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { bar0.read16(REG_CORBRP) } & (1 << 15) != 0,
-            10_000,
+            narf_time::Deadline::after_ms(10),
         );
         // SAFETY: same.
         unsafe {
             bar0.write16(REG_CORBRP, 0);
         }
-        let _ = narf_scheduler::responsive_spin(
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { bar0.read16(REG_CORBRP) } & (1 << 15) == 0,
-            10_000,
+            narf_time::Deadline::after_ms(10),
         );
         // CORBWP starts at 0; software writes the *next* slot's
         // index, hardware advances CORBRP to it.
@@ -707,21 +711,23 @@ impl IntelHda {
         unsafe {
             bar0.write32(sd + SD_CTL, SDCTL_SRST);
         }
-        // responsive_spin ticks sleep_pumps across the per-stream
-        // SRST handshake.
-        let _ = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps across the
+        // per-stream SRST handshake. 10 ms wedge threshold (HDA
+        // §3.3.35: SRST settles in microseconds on healthy
+        // controllers).
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { bar0.read32(sd + SD_CTL) } & SDCTL_SRST != 0,
-            10_000,
+            narf_time::Deadline::after_ms(10),
         );
         // SAFETY: same.
         unsafe {
             bar0.write32(sd + SD_CTL, 0);
         }
-        let _ = narf_scheduler::responsive_spin(
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { bar0.read32(sd + SD_CTL) } & SDCTL_SRST == 0,
-            10_000,
+            narf_time::Deadline::after_ms(10),
         );
 
         // 14. Allocate BDL (must be 128-byte aligned, §3.6.2; a 4 KiB
@@ -1163,12 +1169,14 @@ impl IntelHda {
         unsafe {
             self.bar0.write32(sd + SD_CTL, cur | SDCTL_RUN);
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB stay
-        // alive while the engine acks RUN.
-        narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB
+        // stay alive while the engine acks RUN. 100 ms wedge
+        // threshold (RUN ack is microseconds on healthy
+        // controllers).
+        narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { self.bar0.read32(sd + SD_CTL) } & SDCTL_RUN != 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         )
     }
 
@@ -1186,12 +1194,13 @@ impl IntelHda {
         unsafe {
             self.bar0.write32(sd + SD_CTL, cur & !SDCTL_RUN);
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB stay
-        // alive while the engine acks the stop.
-        narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB
+        // stay alive while the engine acks the stop. 100 ms wedge
+        // threshold.
+        narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { self.bar0.read32(sd + SD_CTL) } & SDCTL_RUN == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         )
     }
 
@@ -1522,14 +1531,16 @@ unsafe fn send_verb_polled(
     }
 
     // 3. Poll RIRBWP for the matching response. RIRB entries are
-    //    8 bytes: u32 response + u32 response_extended. responsive_spin
-    //    ticks sleep_pumps so cursor/FB/serial stay alive across a
-    //    slow codec response.
+    //    8 bytes: u32 response + u32 response_extended.
+    //    responsive_spin_until ticks sleep_pumps so cursor/FB/
+    //    serial stay alive across a slow codec response. 100 ms
+    //    wedge threshold (HDA §3.4: codec response is bounded by
+    //    a few ms in practice).
     let target = next; // RIRB and CORB advance in lockstep
-    let done = narf_scheduler::responsive_spin(
+    let done = narf_scheduler::responsive_spin_until(
         // SAFETY: BAR0 mapped.
         || unsafe { bar0.read16(REG_RIRBWP) } == target,
-        1_000_000,
+        narf_time::Deadline::after_ms(100),
     );
     if !done {
         return Err(HdaError::CommandTimeout);
