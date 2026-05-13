@@ -115,8 +115,16 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "call {dispatch}",
 
         // SyscallReturn is a 16-byte struct: status:u32 + padding,
-        // then value:u64. SysV returns it in rax + rdx; rax already
-        // holds status (low 32 bits zero-extended), rdx holds value.
+        // then value:u64. SysV returns it in rax + rdx; rax holds
+        // status (low 32 bits zero-extended), rdx holds value.
+        //
+        // Match the int 0x80 path's userland-visible convention
+        // (set_return in trap.rs: frame.rax = value, frame.rdx =
+        // status), so user-runtime's syscall wrappers see the same
+        // register layout regardless of which entry path was used.
+        // `xchg` accomplishes the swap in one instruction with no
+        // scratch register needed.
+        "xchg rax, rdx",
 
         // Drop the SyscallArgs scratch (6 × 8 = 48 bytes).
         "add rsp, 48",

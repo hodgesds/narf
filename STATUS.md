@@ -1026,6 +1026,40 @@ From STATUS.md §855 prior-session list:
    This session added the fast SYSCALL/SYSRET MSR path on top
    so the standard x86_64 calling convention works — both
    paths funnel into `kernel_syscall_entry_plain`. **Closed.**
-2. Per-process address spaces (memory/PML4 isolation) — still
-   pending.
-3. External relibc — still out of tree.
+2. **Per-process address spaces** — structurally + functionally
+   landed (corrected from the prior STATUS.md claim of "still
+   pending"; the surface was already in place last session and
+   this session confirmed it via boot log evidence). The full
+   chain is wired:
+     - `bare_main::spawn_one` → `load_user_process_with` →
+       `AddressSpace::new_for_user()` allocates a fresh user
+       PML4 (x86_64) / TTBR0 page-table (aarch64).
+     - `materialize()` walks regions and installs PTEs via
+       per-arch `map_4kb`.
+     - `spawn_user(future, spec, addr_space)` attaches the AS
+       to a `TaskSlot`; every poll of the task's future is
+       preconditioned by `addr_space.activate()` (real `MOV CR3`
+       with `compiler_fence(SeqCst)` discipline on x86_64;
+       `MSR TTBR0_EL1 + DSB + TLBI VMALLE1 + DSB + ISB`
+       sequence on aarch64).
+     - COW fork support: `AddressSpace::cow_fork()` shares
+       physical frames via `frame::cow::inc_ref(phys)`, drops
+       WRITE bits in both parent + child PTEs; the page-fault
+       handler's `cow_split_on_write` allocates + memcpys on
+       first user-mode write.
+     - QEMU boot evidence: `boot-init: spawning init
+       pid=1 entry=0x8000001000` followed by `spawning shell
+       pid=2 entry=0x8000001000` — same virtual entry from
+       distinct PML4s, no collision.
+   **Closed.**
+3. External relibc — still out of tree. The syscall ABI
+   (`narf_userspace::Syscall` / `SyscallArgs` / `SyscallReturn`)
+   is stable and the kernel-side dispatch table is complete;
+   the work that remains is producing a relibc build that
+   speaks it.
+
+**Net Stage-4 in-tree status: closed.** Only the external relibc
+artefact stands between the Stage-4 surface as it ships today
+and the spec's Stage-4 exit criterion ("relibc-linked standard
+Rust binary doing block + network I/O through capability-gated
+paths").
