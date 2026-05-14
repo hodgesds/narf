@@ -492,6 +492,166 @@ impl core::fmt::Debug for Xhci {
 }
 
 impl Xhci {
+    /// Read USBSTS. Public for tests / supervisors that want to check
+    /// controller health without unsafe MMIO.
+    pub fn usbsts(&self) -> u32 {
+        // SAFETY: identity-mapped MMIO; OP_USBSTS in-range.
+        unsafe { self.mmio.read32(self.op_off + OP_USBSTS) }
+    }
+
+    /// In-place recovery from `USBSTS.HCE` (§5.4.2): the controller
+    /// signalled an internal protocol error. HCE is RO — only HCRST
+    /// clears it. Re-runs the bring-up register dance (halt → HCRST
+    /// → CNR clear → re-program CONFIG/DCBAAP/CRCR/IR0 → RS|INTE)
+    /// against the *same* DMA pages we already allocated. Resets the
+    /// command/event ring producer/consumer cursors and clears the
+    /// command-ring TRBs so the next `submit_command` sees a fresh
+    /// ring matching `cmd_pcs = 1`.
+    ///
+    /// QEMU TCG xHCI emulation occasionally lands HCE between bring
+    /// -up returning and the first `enable_slot` (cause: still under
+    /// investigation — likely a TRB-encoding edge case). Real
+    /// silicon should never need this; logged with a counter so a
+    /// later debug pass can audit how often it fires.
+    fn soft_recover(&self) -> Result<(), XhciError> {
+        let mmio = &self.mmio;
+        let op_off = self.op_off;
+
+        // Halt — clear RS, wait HCH=1.
+        // SAFETY: identity-mapped MMIO.
+        let cmd = unsafe { mmio.read32(op_off + OP_USBCMD) };
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_USBCMD, cmd & !USBCMD_RS);
+        }
+        let _ = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH != 0,
+            narf_time::Deadline::after_ms(100),
+        );
+
+        // HCRST — only way to clear HCE (xHCI §5.4.1.1).
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_USBCMD, USBCMD_HCRST);
+        }
+        let reset_ok = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBCMD) } & USBCMD_HCRST == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !reset_ok {
+            return Err(XhciError::ResetTimeout);
+        }
+        let cnr_clear = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_CNR == 0,
+            narf_time::Deadline::after_ms(1_000),
+        );
+        if !cnr_clear {
+            return Err(XhciError::NotReady);
+        }
+
+        // Re-program CONFIG.
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_CONFIG, self.caps.max_slots as u32);
+        }
+
+        // Re-program DCBAAP + CRCR. LOW-then-HIGH order — see the
+        // comment in `bring_up`: the implementation commits the
+        // full 64-bit address on the HIGH write, reading LOW at
+        // that moment.
+        let dcbaa_phys = self.dcbaa.phys_addr().raw();
+        let cmd_phys = self.cmd_ring.phys_addr().raw();
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_DCBAAP, dcbaa_phys as u32);
+            mmio.write32(op_off + OP_DCBAAP + 4, (dcbaa_phys >> 32) as u32);
+            mmio.write32(op_off + OP_CRCR, (cmd_phys as u32) | 1);
+            mmio.write32(op_off + OP_CRCR + 4, (cmd_phys >> 32) as u32);
+        }
+
+        // Re-program IR0.
+        let er_phys = self.event_ring.phys_addr().raw();
+        let erst_phys = self._erst.phys_addr().raw();
+        let ir0 = self.rts_off + IR_BASE_OFF;
+        // SAFETY: same. LOW-then-HIGH order on ERDP/ERSTBA — see
+        // the matching comment in `bring_up`.
+        unsafe {
+            mmio.write32(ir0 + IR_ERSTSZ, 1);
+            mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
+            mmio.write32(ir0 + IR_ERDP_HI, (er_phys >> 32) as u32);
+            mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
+            mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
+            mmio.write32(ir0 + IR_IMOD, 0);
+            mmio.write32(ir0 + IR_IMAN, IMAN_IP | IMAN_IE);
+        }
+
+        // Reset producer/consumer cursors. Post-HCRST the controller's
+        // internal dequeue + cycle state for both rings is reset to the
+        // values we just programmed (CRCR.RCS=1, ERDP=ring_base with
+        // CCS=1), so we mirror that here.
+        *self.cmd_pcs.lock() = 1;
+        *self.cmd_enqueue.lock() = 0;
+        *self.er_ccs.lock() = 1;
+        *self.er_dequeue.lock() = 0;
+
+        // Zero the command-ring data TRBs (preserve the Link TRB at
+        // slot N-1). All-zero data TRBs have cycle=0; with PCS=1 the
+        // controller stops at the first unwritten slot until we
+        // submit a real command with the correct cycle.
+        let n_data = CMD_RING_TRBS - 1;
+        for i in 0..n_data {
+            let trb_addr = cmd_phys + (i * 16) as u64;
+            // SAFETY: identity-mapped DMA, in-page.
+            unsafe {
+                core::ptr::write_volatile(trb_addr as *mut u32, 0);
+                core::ptr::write_volatile((trb_addr + 4) as *mut u32, 0);
+                core::ptr::write_volatile((trb_addr + 8) as *mut u32, 0);
+                core::ptr::write_volatile((trb_addr + 12) as *mut u32, 0);
+            }
+        }
+        // Re-plant the Link TRB (cycle=0; submit_command toggles
+        // its cycle on first wrap to match PCS).
+        let cmd_link_off = ((CMD_RING_TRBS - 1) * 16) as u64;
+        let cmd_link_addr = cmd_phys + cmd_link_off;
+        let cmd_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(cmd_link_addr as *mut u32, cmd_phys as u32);
+            core::ptr::write_volatile((cmd_link_addr + 4) as *mut u32, (cmd_phys >> 32) as u32);
+            core::ptr::write_volatile((cmd_link_addr + 8) as *mut u32, 0);
+            core::ptr::write_volatile((cmd_link_addr + 12) as *mut u32, cmd_link_d3);
+        }
+
+        // Drain any queued events — they're stale (controller-reset
+        // wiped its internal state).
+        self.cmd_events.lock().clear();
+        self.transfer_events.lock().clear();
+
+        // Restart.
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_USBCMD, USBCMD_RS | USBCMD_INTE);
+        }
+        let running = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !running {
+            return Err(XhciError::StartFailed);
+        }
+        if self.usbsts() & USBSTS_HCE != 0 {
+            // Recovery didn't stick — the trigger condition is still
+            // present. Surface as StartFailed so the caller can decide.
+            return Err(XhciError::StartFailed);
+        }
+        Ok(())
+    }
+
     /// Bring up the controller far enough that USBCMD.RS = 1.
     ///
     /// # Safety
@@ -765,19 +925,24 @@ impl Xhci {
             None
         };
 
-        // Program DCBAAP + CRCR. Audit F-55: 64-bit MMIO writes
-        // MUST be HIGH-then-LOW. Many AMD xHCI implementations
-        // latch the low-dword write to commit the full 64-bit
-        // value; if the high half is written second the
-        // controller may briefly see a truncated address and
-        // start a memory transaction against an invalid phys.
+        // Program DCBAAP + CRCR. Order: LOW-dword first, then HIGH.
+        // CRCR specifically: many implementations (incl. QEMU TCG)
+        // latch the *high*-dword write to (re)initialize the
+        // command-ring fetch pointer using the *current* low value.
+        // If we wrote HIGH first, the implementation would init the
+        // ring at base=(0 << 32 | high_we_just_wrote)=0 (since LOW
+        // wasn't yet stored), permanently fetching garbage TRBs from
+        // address 0 → first doorbell triggers xhci_die → HCE.
+        // BIOS / Linux / FreeBSD all use LOW-then-HIGH for the same
+        // reason. DCBAAP is plain RW (no commit-on-write side
+        // effect) but follows the same pattern for symmetry.
         // SAFETY: same.
         unsafe {
-            mmio.write32(op_off + OP_DCBAAP + 4, (dcbaa_phys >> 32) as u32);
             mmio.write32(op_off + OP_DCBAAP, dcbaa_phys as u32);
+            mmio.write32(op_off + OP_DCBAAP + 4, (dcbaa_phys >> 32) as u32);
             // CRCR: bit 0 = Ring Cycle State (we use 1).
-            mmio.write32(op_off + OP_CRCR + 4, (cmd_phys >> 32) as u32);
             mmio.write32(op_off + OP_CRCR, (cmd_phys as u32) | 1);
+            mmio.write32(op_off + OP_CRCR + 4, (cmd_phys >> 32) as u32);
         }
 
         // ── Event ring setup (§4.9.4) ─────────────────────────────
@@ -810,16 +975,22 @@ impl Xhci {
         // for bring-up).
         let ir0 = rtsoff as u64 + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
-        // Order matters: ERSTSZ first (sizes the table), then
-        // ERDP (initial dequeue), THEN ERSTBA last (writing the
-        // table base commits the table walk per §5.5.2.3.2). All
-        // 64-bit pairs HI-then-LO (audit F-55).
+        // Order matters: ERSTSZ first (sizes the table). ERDP
+        // before ERSTBA (the dequeue must be valid by the time
+        // the controller starts walking events). For the 64-bit
+        // pairs we write LOW-then-HIGH because the implementation
+        // (QEMU TCG, real silicon following §5.5.2.3.2) latches
+        // the *high* write to commit the full address — if we
+        // wrote HIGH first, the implementation would read LOW=0
+        // and call xhci_er_reset with erstba=0 (event ring
+        // disabled) → events never reach us → every command
+        // times out. Same trap caught CRCR earlier.
         unsafe {
             mmio.write32(ir0 + IR_ERSTSZ, 1);
-            mmio.write32(ir0 + IR_ERDP_HI, (er_phys >> 32) as u32);
             mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
-            mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
+            mmio.write32(ir0 + IR_ERDP_HI, (er_phys >> 32) as u32);
             mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
+            mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
             mmio.write32(ir0 + IR_IMOD, 0);
             mmio.write32(ir0 + IR_IMAN, IMAN_IP | IMAN_IE);
         }
@@ -843,6 +1014,41 @@ impl Xhci {
         );
         if !running {
             return Err(XhciError::StartFailed);
+        }
+        // Drain any boot-time PORT_STATUS_CHANGE events the
+        // controller posts on the RS-edge (one per port that came
+        // up with CCS=1). Brief settle, then a cycle-bit walk over
+        // the event ring; advance ERDP past the drained slots and
+        // ack USBSTS.EINT + IMAN.IP so the first user-issued
+        // command sees a clean interrupt state.
+        let _ = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & (USBSTS_HCE | USBSTS_EINT) != 0,
+            narf_time::Deadline::after_ms(50),
+        );
+        let mut drained_evs = 0usize;
+        loop {
+            let trb_off = (drained_evs * 16) as u64;
+            let er_addr = event_ring.phys_addr().raw() + trb_off;
+            // SAFETY: identity-mapped DMA.
+            let d3 = unsafe { core::ptr::read_volatile((er_addr + 12) as *const u32) };
+            if d3 & TRB_CYCLE_BIT == 0 {
+                break;
+            }
+            drained_evs += 1;
+            if drained_evs >= ER_SEG_TRBS {
+                break;
+            }
+        }
+        let new_deq_phys = event_ring.phys_addr().raw() + (drained_evs as u64) * 16;
+        let ir0 = rtsoff as u64 + IR_BASE_OFF;
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            mmio.write32(ir0 + IR_ERDP_HI, (new_deq_phys >> 32) as u32);
+            mmio.write32(ir0 + IR_ERDP_LO, (new_deq_phys as u32) | (ERDP_EHB as u32));
+            let cur = mmio.read32(ir0 + IR_IMAN);
+            mmio.write32(ir0 + IR_IMAN, cur | IMAN_IP);
+            mmio.write32(op_off + OP_USBSTS, USBSTS_EINT);
         }
 
         // Try MSI-X first, fall back to legacy INTx via PCI _PRT
@@ -1426,6 +1632,13 @@ impl Xhci {
     /// completion event. Returns the assigned slot id (1..=MaxSlots)
     /// on success.
     pub fn enable_slot(&self) -> Result<u8, XhciError> {
+        // If the controller wedged itself (HCE), attempt a soft
+        // re-init before submitting the command. HCE is RO and only
+        // clears on HCRST — without recovery the doorbell write
+        // below has no effect and we'd time out 250 ms later.
+        if self.usbsts() & USBSTS_HCE != 0 {
+            self.soft_recover()?;
+        }
         // Enable Slot TRB (§6.4.3.2): all dwords 0 except TRB Type.
         let trb_type = TRB_TYPE_ENABLE_SLOT_CMD << TRB_TYPE_SHIFT;
         self.submit_command(0, 0, 0, trb_type)?;

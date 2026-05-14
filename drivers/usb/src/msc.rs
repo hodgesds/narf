@@ -461,38 +461,54 @@ fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
         .port_speed(port)
         .ok_or(MscError::EndpointsMissing)?;
     let slot_id = xhci_dev.enable_slot().map_err(MscError::Xhci)?;
-    xhci_dev
-        .address_device(slot_id, port, speed)
-        .map_err(MscError::Xhci)?;
+    // Wrap the post-enable_slot enumeration so we always free the
+    // controller-allocated slot if anything fails (was a leak that
+    // bound port→slot until the next HCRST and tripped a later
+    // Address Device on the same port with TRB Error "port already
+    // assigned"). Best-effort disable_slot — the real failure code
+    // is what matters.
+    let result = (|| -> Result<MscDevice, MscError> {
+        xhci_dev
+            .address_device(slot_id, port, speed)
+            .map_err(MscError::Xhci)?;
 
-    // Read 9-byte cfg header for wTotalLength.
-    let mut head = [0u8; 9];
-    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head)?;
-    if n < 9 {
-        return Err(MscError::NotMsc);
+        // Read 9-byte cfg header for wTotalLength.
+        let mut head = [0u8; 9];
+        let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head)?;
+        if n < 9 {
+            return Err(MscError::NotMsc);
+        }
+        let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+        if total < 9 || total > 4096 {
+            return Err(MscError::NotMsc);
+        }
+
+        // Pull the full descriptor tree.
+        let mut full = alloc::vec![0u8; total];
+        let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full)?;
+        if n2 < total {
+            full.truncate(n2);
+        }
+
+        let (ep_in, ep_out) = find_bot_endpoints(&full)?;
+        xhci_dev
+            .configure_endpoints(slot_id, &[ep_in, ep_out])
+            .map_err(MscError::Xhci)?;
+
+        let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
+        let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
+        MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci)
+    })();
+    match result {
+        Ok(dev) => {
+            MSC_DEVICES.lock().push(dev);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = xhci_dev.disable_slot(slot_id);
+            Err(e)
+        }
     }
-    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total < 9 || total > 4096 {
-        return Err(MscError::NotMsc);
-    }
-
-    // Pull the full descriptor tree.
-    let mut full = alloc::vec![0u8; total];
-    let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full)?;
-    if n2 < total {
-        full.truncate(n2);
-    }
-
-    let (ep_in, ep_out) = find_bot_endpoints(&full)?;
-    xhci_dev
-        .configure_endpoints(slot_id, &[ep_in, ep_out])
-        .map_err(MscError::Xhci)?;
-
-    let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
-    let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
-    let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci)?;
-    MSC_DEVICES.lock().push(dev);
-    Ok(())
 }
 
 /// Number of MSC devices currently bound.
