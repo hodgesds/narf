@@ -10,7 +10,7 @@
 
 use core::fmt::Write as _;
 
-use crate::console;
+use narf_console as console;
 
 /// Wire every cross-crate fn-pointer hook the kernel needs at
 /// boot time. Called once from `bare_main` after the per-task
@@ -42,23 +42,20 @@ fn install_proc_hooks() {
 }
 
 fn install_net_stack() {
-    // TCP-over-NIC: register the RX dispatch handler and spawn
-    // an async RX-pump task. Drivers register their own (mac,
-    // send_fn, drain_fn) at probe; the stack picks them up here.
+    // TCP-over-NIC: register the RX dispatch handler. The driver
+    // registers itself as a sleep_pump so `block_on` (used by the
+    // TCP stack's connect / arp_resolve futures) drains the NIC
+    // RX ring between poll attempts and wakes the parked future
+    // as soon as a matching reply lands.
     narf_net::tcp_stack::init();
+    narf_scheduler::sleep_pumps::register(net_rx_pump);
     let _ = writeln!(
         console::Writer,
         "  net: tcp_stack init; iface count = {}",
         narf_net::iface::count()
     );
-    narf_scheduler::spawn(async {
-        // Background RX pump — drains the e1000 ring whenever the
-        // executor visits this task. Kernel busy-wait paths (ARP
-        // resolve, TCP handshake) call iface::drain_pump directly
-        // so they don't depend on this loop.
-        loop {
-            while narf_drivers_net::e1000::rx_pump_step() {}
-            narf_scheduler::yield_now().await;
-        }
-    });
+}
+
+fn net_rx_pump() {
+    while narf_drivers_net::e1000::rx_pump_step() {}
 }

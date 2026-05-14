@@ -6,7 +6,6 @@
 //! Stage-1: single global iface keyed by name. Multi-NIC routing
 //! lands when a real consumer needs it.
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -135,37 +134,9 @@ pub fn on_rx_frame(frame: &[u8]) {
     h(frame);
 }
 
-// ── RX drain hook ───────────────────────────────────────────────
-//
-// Kernel-side syscalls that busy-wait (ARP resolver, TCP connect)
-// need the NIC RX ring to keep getting drained while they spin —
-// otherwise inbound replies never reach the dispatch. Drivers
-// register a `drain_step()` fn here at probe; busy-waiters call
-// `drain_pump()` to give the registered driver a chance to
-// process one pending frame each iteration.
-
-type DrainFn = fn() -> bool;
-
-static DRAIN_FN: AtomicUsize = AtomicUsize::new(0);
-
-pub fn install_rx_drain(f: DrainFn) {
-    DRAIN_FN.store(f as usize, Ordering::Release);
-}
-
-/// Drain-one-frame step. Returns true iff a frame was processed.
-/// Safe to call from busy-wait loops.
-pub fn drain_pump() -> bool {
-    let v = DRAIN_FN.load(Ordering::Acquire);
-    if v == 0 {
-        return false;
-    }
-    let f: DrainFn = unsafe { core::mem::transmute(v) };
-    f()
-}
-
-/// Stub used when no handler is installed — keeps the pin shape
-/// callable without panicking during early boot.
-#[allow(dead_code)]
-fn _force_pin() -> Box<dyn FnOnce()> {
-    Box::new(|| {})
-}
+// RX-ring draining is wired through `narf_scheduler::sleep_pumps`:
+// the e1000 driver registers `rx_pump_step` as a sleep_pump at
+// probe time, and `narf_scheduler::block_on` ticks all sleep_pumps
+// between poll attempts. Kernel-side TCP waits become regular
+// futures with wakers fired from `tcp_stack::handle_*` — no manual
+// drain loop, no yield hook indirection.

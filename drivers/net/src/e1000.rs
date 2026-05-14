@@ -807,11 +807,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     // Register with the kernel-side TCP stack: hands the stack a
     // `(mac, send_fn)` pair and a name. The stack's outbound
-    // path then routes through `e1000_send_frame` below.
-    // Also register the RX drain hook so kernel busy-wait loops
-    // (ARP resolver, TCP handshake) keep the RX ring moving.
+    // path then routes through `e1000_send_frame` below. The
+    // RX-pump is registered as a sleep_pump in cross_crate_init
+    // so `block_on` ticks it between waker polls.
     narf_net::iface::register("eth0", mac, e1000_send_frame);
-    narf_net::iface::install_rx_drain(rx_pump_step);
     Ok(())
 }
 

@@ -18,15 +18,15 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_scheduler::narf_time;
 
 use crate::iface;
 use crate::pkt::{
     self, parse_arp, parse_eth_header, parse_ipv4, write_eth_header, write_ipv4_header,
-    ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETH_HDR_LEN,
+    ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETH_HDR_LEN,
     IPV4_HDR_LEN, IP_PROTO_TCP,
 };
 use crate::pkt_tcp::{TcpHeader, ipv4_pseudo_checksum};
@@ -60,36 +60,19 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {
     iface::send(&frame[..n])
 }
 
-/// Resolve an IPv4 address to a MAC, sending ARP requests if
-/// needed. Spins up to ~`timeout_ms` waiting for a reply. Returns
-/// the MAC on success, Err on timeout or no iface.
+/// Resolve an IPv4 address to a MAC, sending an ARP request if
+/// not cached. Waits via `responsive_spin_until`, which ticks the
+/// registered sleep_pumps (including the e1000 RX-pump) so the
+/// reply gets drained off the NIC and into the cache. Returns
+/// the MAC on success, Err on `timeout_ms` deadline.
 pub fn arp_resolve(ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
     if let Some(m) = arp_lookup(ip) {
         return Ok(m);
     }
     let _ = send_arp_request(ip);
-    let deadline = narf_scheduler::narf_time::monotonic_ns()
-        .saturating_add(timeout_ms.saturating_mul(1_000_000));
-    while narf_scheduler::narf_time::monotonic_ns() < deadline {
-        if let Some(m) = arp_lookup(ip) {
-            return Ok(m);
-        }
-        // Re-send every 100ms so we don't lose a single ARP packet.
-        let next_ns = narf_scheduler::narf_time::monotonic_ns()
-            .saturating_add(100_000_000);
-        while narf_scheduler::narf_time::monotonic_ns() < next_ns
-            && narf_scheduler::narf_time::monotonic_ns() < deadline
-        {
-            // Drive the RX ring while we wait so inbound replies
-            // reach the dispatch table. Without this the syscall
-            // handler holds the CPU and the spawned RX-pump task
-            // never runs.
-            while iface::drain_pump() {}
-            core::hint::spin_loop();
-        }
-        let _ = send_arp_request(ip);
-    }
-    Err(())
+    let deadline = narf_time::Deadline::after_ns(timeout_ms.saturating_mul(1_000_000));
+    let _ = narf_scheduler::responsive_spin_until(|| arp_lookup(ip).is_some(), deadline);
+    arp_lookup(ip).ok_or(())
 }
 
 // ── TCB (per-connection state) ──────────────────────────────────
@@ -154,26 +137,22 @@ pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
         let m = g.get_or_insert_with(BTreeMap::new);
         m.insert(id, arc.clone());
     }
-    // Send the SYN.
+    // Send the SYN, then spin waiting for the state machine to
+    // advance. responsive_spin_until ticks sleep_pumps each
+    // iteration; the e1000 RX-pump is registered as one, so a
+    // SYN-ACK landing on the wire gets drained, dispatched
+    // through handle_tcp, and flips state to Established.
     send_tcp_segment(&arc, isn, 0, TcpFlags::SYN, &[]);
-    // Wait for ESTABLISHED with 3s timeout. Drive the RX pump
-    // each iteration so the SYN-ACK reply gets processed by the
-    // state machine — without this drain, the spawned async RX
-    // task never gets a turn while we're spinning in the syscall.
-    let deadline = narf_scheduler::narf_time::monotonic_ns()
-        .saturating_add(3_000_000_000);
-    while narf_scheduler::narf_time::monotonic_ns() < deadline {
-        while iface::drain_pump() {}
-        let st = arc.lock().state;
-        if st == TcpState::Established {
-            return Ok(id);
-        }
-        if st == TcpState::Closed {
-            return Err(());
-        }
-        core::hint::spin_loop();
+    let deadline = narf_time::Deadline::after_ns(3_000_000_000);
+    let _ = narf_scheduler::responsive_spin_until(
+        || arc.lock().state != TcpState::SynSent,
+        deadline,
+    );
+    let st = arc.lock().state;
+    match st {
+        TcpState::Established => Ok(id),
+        _ => Err(()),
     }
-    Err(())
 }
 
 /// Send `buf` as a single TCP segment on the connection. Returns
