@@ -1064,6 +1064,24 @@ impl Xhci {
                 None => (None, None),
             },
         };
+        // After MSI-X enable, re-write IMAN so QEMU's xhci_intr_update
+        // sees IE=1 *while* msix_enabled() returns true and calls
+        // msix_vector_use() to register interrupter 0's vector. We
+        // wrote IMAN earlier (during IR0 setup) but at that point
+        // MSI-X wasn't enabled yet, so xhci_pci_intr_update bailed
+        // and the vector was never marked "used" → msix_notify is
+        // silently ignored on subsequent transfer events. Re-issuing
+        // the same write here triggers the registration. INTx-fallback
+        // path doesn't need this; the legacy path delivers via
+        // IOAPIC redirection set up by `try_install_intx`.
+        if msix.is_some() {
+            // SAFETY: identity-mapped MMIO; same offset as the
+            // earlier write.
+            unsafe {
+                let cur = mmio.read32(ir0 + IR_IMAN);
+                mmio.write32(ir0 + IR_IMAN, cur | IMAN_IE);
+            }
+        }
 
         Ok(Self {
             mmio,
@@ -2522,6 +2540,98 @@ impl Xhci {
             out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         Ok(xferred)
+    }
+
+    /// Stage one Normal TRB on an interrupt-IN endpoint and ring the
+    /// doorbell, without waiting for completion. Used to pre-arm
+    /// interrupt-IN polling: the controller starts polling the
+    /// device on the EP's bInterval cadence, and a Transfer Event
+    /// gets posted whenever the device returns data. The supervisor
+    /// task drives this by alternating `arm_interrupt_in` →
+    /// `wait_for_irq` → `poll_interrupt_in` per cycle. Returns the
+    /// staged DMA buffer phys for inspection (caller need not use).
+    pub fn arm_interrupt_in(&self, slot_id: u8, dci: u8, len: u32) -> Result<u64, XhciError> {
+        if len == 0 || len > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let phys = self.ep_dma_phys(slot_id, dci)?;
+        // Zero the prefix so a stale page doesn't masquerade as
+        // device data.
+        // SAFETY: identity-mapped DMA page; bounds-checked above.
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, len as usize);
+        }
+        self.ep_enqueue_normal(slot_id, dci, phys, len)?;
+        self.ring_slot_doorbell(slot_id, dci as u32);
+        Ok(phys)
+    }
+
+    /// Non-blocking interrupt-IN poll: drains *one* matching Transfer
+    /// Event from the demux queue (without re-enqueueing or waiting),
+    /// reads the bytes the controller wrote into the EP DMA buffer,
+    /// and stages a fresh Normal TRB so the next report arrives. The
+    /// caller must have armed the endpoint with `arm_interrupt_in`
+    /// at least once before the first call.
+    ///
+    /// Returns:
+    /// - `Ok(Some(n))` — `n` bytes received; a fresh TRB is now armed
+    /// - `Ok(None)`    — no event pending; nothing to do
+    /// - `Err(e)`      — controller-side error
+    ///
+    /// This is the right shape for an interrupt-IN endpoint: the
+    /// controller may take an indefinite amount of time to deliver
+    /// the next report (a HID kbd with SET_IDLE only sends on state
+    /// change), so the synchronous `bulk_in` 250 ms timeout
+    /// model would either fire CmdTimeout on every idle cycle or
+    /// block the supervisor for far too long.
+    pub fn poll_interrupt_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, XhciError> {
+        if out.is_empty() || out.len() > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let want_ep = (dci as u32) << 16;
+        // Drain the ring into queues so any event already posted
+        // since the last poll lands in transfer_events.
+        while self.demux_one_event().is_some() {}
+        // Try to pop one matching event (no waiting).
+        let ev = {
+            let mut g = self.transfer_events.lock();
+            let pos = g.iter().position(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            });
+            match pos {
+                Some(p) => match g.remove(p) {
+                    Some(e) => e,
+                    None => return Ok(None),
+                },
+                None => return Ok(None),
+            }
+        };
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 && ccode != 13 {
+            // Re-arm before bailing so a transient device error
+            // doesn't permanently silence the endpoint.
+            let _ = self.arm_interrupt_in(slot_id, dci, out.len() as u32);
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let residue = ev[2] & 0x00FF_FFFF;
+        let xferred = (out.len() as u32).saturating_sub(residue) as usize;
+        let phys = self.ep_dma_phys(slot_id, dci)?;
+        // SAFETY: identity-mapped DMA page.
+        for i in 0..xferred.min(out.len()) {
+            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        }
+        // Re-arm for the next report.
+        self.arm_interrupt_in(slot_id, dci, out.len() as u32)?;
+        Ok(Some(xferred))
     }
 
     /// Resolve the persistent DMA buffer phys for an endpoint.

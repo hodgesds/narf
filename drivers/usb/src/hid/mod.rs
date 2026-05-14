@@ -243,6 +243,16 @@ impl BootKeyboard {
             interface_num as u16,
             &mut nothing,
         );
+        // Pre-arm the interrupt-IN endpoint with one Normal TRB so
+        // the controller starts polling the device immediately. The
+        // first state-change report from the device completes that
+        // TRB and posts a Transfer Event; our `pump_once` consumes
+        // the event + restages a fresh TRB. Without this the device
+        // never sees a token from the host and never produces any
+        // input report.
+        xhci_dev
+            .arm_interrupt_in(slot_id, interrupt_in_ep, 8)
+            .map_err(HidError::Xhci)?;
         Ok(BootKeyboard {
             slot_id,
             interrupt_in_ep,
@@ -251,42 +261,33 @@ impl BootKeyboard {
         })
     }
 
-    /// Poll a single 8-byte boot-keyboard report off the interrupt-IN
-    /// endpoint. Blocks until the device sends a report — typical
-    /// keyboards send one every 8 ms while keys are held + on every
-    /// state change.
-    pub fn read_report(&self, xhci_dev: &Xhci) -> Result<KbdReport, HidError> {
+    /// Drain any pending interrupt-IN report. Returns
+    /// `Ok(Some(report))` if the device produced a state-change
+    /// report since the last poll, `Ok(None)` if no report has
+    /// arrived yet (the controller is still waiting on the device's
+    /// next interrupt-IN response). Non-blocking: returns
+    /// immediately. The caller drives cadence via `wait_for_irq`.
+    pub fn read_report(&self, xhci_dev: &Xhci) -> Result<Option<KbdReport>, HidError> {
         let mut buf = [0u8; 8];
-        let n = xhci_dev.bulk_in(self.slot_id, self.interrupt_in_ep, &mut buf)?;
-        if n < 8 {
-            // Short report — pad zeroes (the device sends 8 even
-            // when no keys are pressed; a short one means a bus
-            // glitch, but we can still decode what arrived).
+        match xhci_dev
+            .poll_interrupt_in(self.slot_id, self.interrupt_in_ep, &mut buf)
+            .map_err(HidError::Xhci)?
+        {
+            Some(_) => Ok(Some(KbdReport::from_bytes(buf))),
+            None => Ok(None),
         }
-        Ok(KbdReport::from_bytes(buf))
     }
 
-    /// Poll one report and push the resulting press / release
-    /// `KeyEvent`s onto the global input ring. Returns the number
-    /// of events emitted.
-    ///
-    /// Diff semantics:
-    ///   - A modifier bit that turned ON since the last report
-    ///     emits a press of the corresponding modifier key; one
-    ///     that turned OFF emits a release. Live `Modifiers` is
-    ///     stamped on every event.
-    ///   - A Usage ID present in this report but not the previous
-    ///     one emits a press; one present in the previous report
-    ///     but not this one emits a release. Held keys (present
-    ///     in both) emit nothing — auto-repeat is a userspace
-    ///     concern.
-    ///   - The HID error roll-over indicator (Usage 0x01) is
-    ///     ignored — the spec says all six positions read 0x01
-    ///     when too many keys are held, which would otherwise
-    ///     produce six bogus events.
+    /// Drain all pending reports and push press/release events to the
+    /// global input ring. Returns the number of events emitted across
+    /// however many reports arrived since the last call. Non-blocking
+    /// (zero or more reports per call).
     pub fn pump_once(&mut self, xhci_dev: &Xhci) -> Result<usize, HidError> {
-        let report = self.read_report(xhci_dev)?;
-        Ok(self.translate_report(report))
+        let mut total = 0usize;
+        while let Some(report) = self.read_report(xhci_dev)? {
+            total += self.translate_report(report);
+        }
+        Ok(total)
     }
 
     /// Same diff logic as `pump_once`, but works from a caller-
@@ -522,9 +523,23 @@ fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
 }
 
 fn note_attach_ok(port: u8) {
-    use core::sync::atomic::Ordering;
-    LAST_KBD_FAIL_STEP[port as usize].store(0, Ordering::Release);
+    use core::fmt::Write as _;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let was_failing = LAST_KBD_FAIL_STEP[port as usize].swap(0, Ordering::AcqRel) != 0;
     KBD_FAIL_REPEATS[port as usize].store(0, Ordering::Release);
+    // Log a one-line "attached" notification per port so a real-HW
+    // boot makes it obvious that the kbd pipeline came up. Bitmask
+    // dedupes against the supervisor's per-cycle re-call.
+    static ATTACHED_PORTS: AtomicU64 = AtomicU64::new(0);
+    let bit = 1u64 << (port as u32 & 63);
+    let prev = ATTACHED_PORTS.fetch_or(bit, Ordering::AcqRel);
+    if prev & bit == 0 || was_failing {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  usb-hid: kbd attached on port {}",
+            port
+        );
+    }
 }
 
 /// Public per-port attach used by the supervisor's per-port

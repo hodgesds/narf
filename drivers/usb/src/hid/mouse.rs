@@ -159,6 +159,12 @@ impl BootMouse {
                 &mut nothing,
             )
             .map_err(|_| HidError::SetProtocolFailed)?;
+        // Pre-arm the interrupt-IN endpoint so the controller starts
+        // polling the device. Without this no Transfer Event ever
+        // posts and the supervisor's IRQ-driven pump never wakes.
+        xhci_dev
+            .arm_interrupt_in(slot_id, interrupt_in_ep, 8)
+            .map_err(HidError::Xhci)?;
         Ok(BootMouse {
             slot_id,
             interrupt_in_ep,
@@ -167,27 +173,32 @@ impl BootMouse {
         })
     }
 
-    /// Poll one report off the interrupt-IN endpoint. Reads up to 8
-    /// bytes (covers boot + any vendor wheel-padding) and feeds the
-    /// first 3 to `MouseReport::from_bytes`.
-    pub fn read_report(&self, xhci_dev: &Xhci) -> Result<MouseReport, HidError> {
+    /// Drain one pending interrupt-IN report off the endpoint without
+    /// blocking. Returns `Ok(Some(report))` when the device produced
+    /// a state-change report, `Ok(None)` when the controller is
+    /// still waiting on the device.
+    pub fn read_report(&self, xhci_dev: &Xhci) -> Result<Option<MouseReport>, HidError> {
         let mut buf = [0u8; 8];
-        let n = xhci_dev.bulk_in(self.slot_id, self.interrupt_in_ep, &mut buf)?;
-        if n < 3 {
-            // Short — no movement data. Treat as idle report.
-            return Ok(MouseReport::default());
+        match xhci_dev
+            .poll_interrupt_in(self.slot_id, self.interrupt_in_ep, &mut buf)
+            .map_err(HidError::Xhci)?
+        {
+            Some(n) if n >= 3 => Ok(Some(MouseReport::from_bytes(&buf[..n]))),
+            Some(_) => Ok(Some(MouseReport::default())),
+            None => Ok(None),
         }
-        Ok(MouseReport::from_bytes(&buf[..n]))
     }
 
-    /// Poll one report and emit at most one `PointerEvent` to the
-    /// global input ring. Returns the number of events emitted (0 or
-    /// 1). A report with zero deltas and no button transitions is
-    /// silent — userspace doesn't need a stream of "nothing changed"
-    /// pings.
+    /// Drain all pending reports and push translated `PointerEvent`s
+    /// to the global input ring. Returns the total number of events
+    /// emitted across however many reports arrived since the last
+    /// call. Non-blocking.
     pub fn pump_once(&mut self, xhci_dev: &Xhci) -> Result<usize, HidError> {
-        let report = self.read_report(xhci_dev)?;
-        Ok(self.translate_report(report))
+        let mut total = 0usize;
+        while let Some(report) = self.read_report(xhci_dev)? {
+            total += self.translate_report(report);
+        }
+        Ok(total)
     }
 
     /// Same translation as `pump_once`, but works from a caller-

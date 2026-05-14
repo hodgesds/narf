@@ -158,7 +158,7 @@ fn pump_irq() {
         let _ = narf_time::hpet::disarm(0);
     }
     let now = narf_time::now_cycles();
-    let _woken = narf_time::timer_wheel::fire_due(now);
+    let _ = narf_time::timer_wheel::fire_due(now);
     if let Some(next) = narf_time::timer_wheel::next_deadline_cycles() {
         wheel_arm(next);
     }
