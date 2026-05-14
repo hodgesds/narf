@@ -680,7 +680,22 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     }
     // SAFETY: identity-reachable per caller contract.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
-    for slot in 0..=255usize {
+    // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
+    // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
+    // PDPT[0] PD[0] PT[1], and `new_user_pml4` allocates a fresh
+    // PDPT for that slot). Every other PML4[0..256] entry is a
+    // bulk-copied pointer to a SHARED kernel page-table page —
+    //   - PML4[0]: the kernel low-4-GiB identity PDPT (`PDPT_lo` in
+    //     `EARLY_PAGE_TABLES`), reused by every AS for DMA / phys
+    //     access from kernel mode.
+    //   - PML4[2..=255]: currently reserved-zero, but if the kernel
+    //     ever lights one up it'll be shared too.
+    // Walking those and freeing the PDPT they point at returns
+    // kernel page tables to the buddy allocator; the next
+    // `alloc_coherent` hands the freed PDPT to a driver, `memset`
+    // zeros it, and the huge-page entries vanish mid-write — the
+    // exact #PF that surfaced the audio probe regression.
+    for slot in [1usize] {
         let pml4e = pml4.entries[slot];
         if !pml4e.is_present() {
             continue;
