@@ -7465,3 +7465,186 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fork_resumes_child_with_rax_zero);
+
+// ── execve smokes ───────────────────────────────────────────────
+//
+// `sys_execve` (Syscall::Execve = 179) replaces the current process
+// image. Full end-to-end requires a polling user-task ctx (so the
+// EXECVE longjmp + ExecRequest pickup can fire); the no-ctx path
+// returns `invalid_op()` after the load completes, which is exactly
+// what we need to validate the load-side without entering ring 3.
+
+#[cfg(target_arch = "x86_64")]
+fn build_minimal_elf_for_execve() -> alloc::vec::Vec<u8> {
+    // Same ELF shape used by smoke_userspace_load_user_process_*:
+    // one PT_LOAD R|X segment, entry at 0x80_0000_1111.
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
+    bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&2u16.to_le_bytes());          // e_type ET_EXEC
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes());       // e_machine x86_64
+    bytes.extend_from_slice(&1u32.to_le_bytes());          // e_version
+    bytes.extend_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes()); // e_entry
+    bytes.extend_from_slice(&64u64.to_le_bytes());         // e_phoff
+    bytes.extend_from_slice(&0u64.to_le_bytes());          // e_shoff
+    bytes.extend_from_slice(&0u32.to_le_bytes());          // e_flags
+    bytes.extend_from_slice(&64u16.to_le_bytes());         // e_ehsize
+    bytes.extend_from_slice(&56u16.to_le_bytes());         // e_phentsize
+    bytes.extend_from_slice(&1u16.to_le_bytes());          // e_phnum
+    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shentsize
+    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shnum
+    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shstrndx
+    // PT_LOAD program header.
+    bytes.extend_from_slice(&1u32.to_le_bytes());          // p_type PT_LOAD
+    bytes.extend_from_slice(&5u32.to_le_bytes());          // p_flags R|X
+    bytes.extend_from_slice(&(64u64 + 56).to_le_bytes());  // p_offset
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_vaddr
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_paddr
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_filesz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_align
+    bytes.resize(64 + 56 + 0x1000, 0);
+    bytes
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_rejects_short_elf() -> TestResult {
+    // ELF length below 64-byte header → handler must reject without
+    // touching the loader (defensive arg check).
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0xDEAD_BEEFu64,  // any non-null pointer
+            arg1: 32,               // < 64 — too short
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    if r != SyscallReturn::invalid_op() {
+        return TestResult::Fail("short-elf should be rejected with invalid_op");
+    }
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_rejects_short_elf);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_rejects_null_ptr() -> TestResult {
+    // Null ELF pointer → handler bails before the user-memory copy.
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0,                // null
+            arg1: 4096,             // plausible len
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    if r != SyscallReturn::invalid_op() {
+        return TestResult::Fail("null-ptr should be rejected with invalid_op");
+    }
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_rejects_null_ptr);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_rejects_oversized_elf() -> TestResult {
+    // 64+ MiB cap is the defensive upper bound on `elf_len`.
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0xDEAD_BEEFu64,
+            arg1: 65 * 1024 * 1024,  // > 64 MiB
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    if r != SyscallReturn::invalid_op() {
+        return TestResult::Fail("oversized elf_len should be rejected with invalid_op");
+    }
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_rejects_oversized_elf);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult {
+    // End-to-end the load side: a valid minimal ELF + valid argv
+    // pack. The handler runs `load_user_process_with` to completion,
+    // updates /proc/[pid]/{argv,comm}, then discovers there's no
+    // active user-task ctx (we're in a kernel-test stub) and bails
+    // with `invalid_op()`. Confirms the load-and-publish path
+    // doesn't fault on a clean input.
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    // argv pack: "init\0" — one NUL-terminated string.
+    let argv: alloc::vec::Vec<u8> = b"init\0".to_vec();
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: elf.as_ptr() as u64,
+            arg1: elf.len() as u64,
+            arg2: argv.as_ptr() as u64,
+            arg3: argv.len() as u64,
+            arg4: 0,                    // empty envp
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    // load completed but no user ctx → bail with invalid_op.
+    if r != SyscallReturn::invalid_op() {
+        return TestResult::Fail("expected invalid_op fallback when no user ctx");
+    }
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_loads_elf_then_bails_without_user_ctx);
