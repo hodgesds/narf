@@ -796,6 +796,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    let mac = dev.mac;
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
@@ -804,7 +805,42 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+    // Register with the kernel-side TCP stack: hands the stack a
+    // `(mac, send_fn)` pair and a name. The stack's outbound
+    // path then routes through `e1000_send_frame` below.
+    // Also register the RX drain hook so kernel busy-wait loops
+    // (ARP resolver, TCP handshake) keep the RX ring moving.
+    narf_net::iface::register("eth0", mac, e1000_send_frame);
+    narf_net::iface::install_rx_drain(rx_pump_step);
     Ok(())
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes
+/// the kernel-side TCP stack's outbound frames through E1000::tx.
+fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
+    let g = CONTROLLER.lock();
+    let ctrl = g.as_ref().ok_or(())?;
+    ctrl.tx(frame).map_err(|_| ())
+}
+
+/// Drain one frame from the RX ring + dispatch it through the
+/// network stack's RX handler. Returns true iff a frame was
+/// processed. Called from a kernel-side polling task spawned at
+/// boot.
+pub fn rx_pump_step() -> bool {
+    let mut buf = [0u8; 1600];
+    let n = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(c) => c.rx_recv(&mut buf),
+            None => 0,
+        }
+    };
+    if n == 0 {
+        return false;
+    }
+    narf_net::iface::on_rx_frame(&buf[..n]);
+    true
 }
 
 /// Register the driver against every Intel device id we recognise.

@@ -19,6 +19,7 @@ narf-console      = { path = "../console" }
 narf-filesystem   = { path = "../filesystem" }
 narf-block        = { path = "../block" }
 narf-drivers-fs-fat = { path = "../drivers/fs/fat" }
+narf-net          = { path = "../net" }
 narf-firmware     = { path = "../firmware" }
 narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }

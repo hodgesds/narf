@@ -154,6 +154,15 @@ enum SocketState {
         peer_addr: u32,
         peer_port: u16,
     },
+    /// AF_INET SOCK_STREAM connection routed through the
+    /// kernel-side TCP-over-NIC stack. `tcb_id` indexes
+    /// `narf_net::tcp_stack::TCB_TABLE`. send/recv forward to the
+    /// stack's helpers.
+    InetWired {
+        tcb_id: u32,
+        peer_addr: u32,
+        peer_port: u16,
+    },
     /// AF_INET SOCK_DGRAM endpoint. UDP is connectionless: a single
     /// per-socket inbox holds (peer_addr, peer_port, payload)
     /// records pushed by other UDP sockets that sendto'd here.
@@ -219,6 +228,7 @@ impl SocketFile {
             Inet6([u8; 16], u16),
             UnixDgram(String),
             InetDgram(u32, u16),
+            Tcb(u32),
             None,
         }
         let reg = {
@@ -231,6 +241,7 @@ impl SocketFile {
                 SocketState::InetDgram { local_addr, local_port, .. } => {
                     Reg::InetDgram(*local_addr, *local_port)
                 }
+                SocketState::InetWired { tcb_id, .. } => Reg::Tcb(*tcb_id),
                 _ => Reg::None,
             }
         };
@@ -249,6 +260,9 @@ impl SocketFile {
             }
             Reg::InetDgram(a, p) => {
                 if let Some(map) = INET_DGRAM_BOUND.lock().as_mut() { map.remove(&(a, p)); }
+            }
+            Reg::Tcb(id) => {
+                let _ = narf_net::tcp_stack::close(id);
             }
             Reg::None => {}
         }
@@ -335,6 +349,13 @@ impl FileOps for SocketFile {
                     bits |= narf_filesystem::POLL_IN;
                 }
                 bits
+            }
+            SocketState::InetWired { .. } => {
+                // Always-writable; readability is tracked
+                // implicitly inside the TCP stack — Stage-1 just
+                // reports POLL_OUT. POLL_IN gating lands once the
+                // stack exposes a per-TCB readability accessor.
+                narf_filesystem::POLL_OUT
             }
         }
     }
@@ -596,7 +617,33 @@ impl SocketFile {
                 };
                 let listener = match listener {
                     Some(l) => l,
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    None => {
+                        // No in-process listener — try the kernel
+                        // TCP-over-NIC path. Loopback addresses
+                        // (127.x.x.x) skip this and return ECONNREFUSED.
+                        let is_loopback = (ip >> 24) == 127;
+                        if !is_loopback {
+                            let ip_bytes = ip.to_be_bytes();
+                            match narf_net::tcp_stack::connect(ip_bytes, port) {
+                                Ok(tcb_id) => {
+                                    let mut state = self.state.lock();
+                                    if matches!(&*state, SocketState::Fresh) {
+                                        *state = SocketState::InetWired {
+                                            tcb_id,
+                                            peer_addr: ip,
+                                            peer_port: port,
+                                        };
+                                        return SocketOpResult::Ok(0);
+                                    }
+                                    return SocketOpResult::Err(SockError::AlreadyConnected);
+                                }
+                                Err(_) => {
+                                    return SocketOpResult::Err(SockError::ConnectionRefused);
+                                }
+                            }
+                        }
+                        return SocketOpResult::Err(SockError::ConnectionRefused);
+                    }
                 };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
@@ -1061,6 +1108,12 @@ impl SocketFile {
         _addr: Option<SockAddr>,
     ) -> Result<usize, SockError> {
         let state = self.state.lock();
+        // InetWired sockets route through the kernel TCP-over-NIC stack.
+        if let SocketState::InetWired { tcb_id, .. } = &*state {
+            let id = *tcb_id;
+            drop(state);
+            return narf_net::tcp_stack::send(id, buf).map_err(|_| SockError::Pipe);
+        }
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. }
             | SocketState::InetConnected { tx, .. }
@@ -1084,6 +1137,15 @@ impl SocketFile {
         _flags: u32,
     ) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
+        if let SocketState::InetWired { tcb_id, .. } = &*state {
+            let id = *tcb_id;
+            drop(state);
+            let n = narf_net::tcp_stack::recv(id, buf).map_err(|_| SockError::NotConnected)?;
+            if n == 0 && !buf.is_empty() {
+                return Err(SockError::WouldBlock);
+            }
+            return Ok((n, None));
+        }
         let rx = match &*state {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }

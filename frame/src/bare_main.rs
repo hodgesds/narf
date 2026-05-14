@@ -49,6 +49,7 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
+mod cross_crate_init;
 mod measure;
 
 /// Called from the arch-specific boot stub once the CPU is in a state
@@ -2273,19 +2274,10 @@ fn boot_userspace_init() {
     signal_init();
     narf_userspace::handlers::init_per_task_state();
     narf_userspace::fd::init();
-    // Wire ^C / ^\ / ^Z input-byte handling into the console
-    // driver so they deliver SIGINT/SIGQUIT/SIGTSTP to the
-    // foreground task instead of bubbling up as ASCII bytes.
-    narf_filesystem::install_console_signal_hook(
-        narf_userspace::handlers::maybe_deliver_signal_for_input,
-    );
-    // /proc per-pid hooks — exposes the live scheduler task list +
-    // per-task metadata to /proc/[pid]/* and /proc/self/*.
-    narf_filesystem::procfs::install_proc_hooks(
-        narf_userspace::handlers::proc_current_pid,
-        narf_userspace::handlers::proc_list_pids,
-        narf_userspace::handlers::proc_task_info,
-    );
+    // Cross-crate fn-pointer wiring (console signal hook, /proc
+    // per-pid hooks, kernel-side TCP stack + RX pump). One call
+    // covers everything that used to be inline here.
+    cross_crate_init::install_all_hooks();
 
     // Syscall table.
     let mut t = SyscallTable::new();

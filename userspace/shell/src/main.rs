@@ -209,6 +209,56 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+fn tcpwire_run(fd: i32) {
+    // Open AF_INET SOCK_STREAM + connect to 10.0.2.2:7777
+    // (QEMU user-net's host gateway). The kernel TCP-over-NIC
+    // stack handles ARP + SYN/SYN-ACK/ACK + ESTABLISHED.
+    let s = unsafe { libc::socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0) };
+    if s < 0 {
+        unsafe { write_all(fd, b"tcpwire: socket() failed\n"); }
+        return;
+    }
+    let mut addr = [0u8; 16];
+    let alen = make_sockaddr_in(&mut addr, 7777, 0x0A000202 /* 10.0.2.2 */);
+    let r = unsafe {
+        libc::connect(s, addr.as_ptr() as *const libc::sockaddr, alen)
+    };
+    if r != 0 {
+        unsafe {
+            write_all(fd, b"tcpwire: connect() rc=");
+            let mut buf = [0u8; 12];
+            let st = u32_to_decimal(r as u32, &mut buf);
+            write_all(fd, st);
+            write_all(fd, b" (no host-side listener?)\n");
+        }
+        let _ = unsafe { libc::posix::close(s) };
+        return;
+    }
+    // Send "ping\n", try to read a response.
+    let _ = unsafe {
+        libc::send(s, b"ping\n".as_ptr() as *const _, 5, 0)
+    };
+    let mut rbuf = [0u8; 64];
+    let n = unsafe {
+        libc::recv(s, rbuf.as_mut_ptr() as *mut _, rbuf.len(), 0)
+    };
+    let _ = unsafe { libc::posix::close(s) };
+    unsafe {
+        write_all(fd, b"tcpwire: connected + ");
+        if n > 0 {
+            write_all(fd, b"recv ");
+            let mut nb = [0u8; 12];
+            let s = u32_to_decimal(n as u32, &mut nb);
+            write_all(fd, s);
+            write_all(fd, b" bytes: '");
+            write_all(fd, &rbuf[..n as usize]);
+            write_all(fd, b"'\n");
+        } else {
+            write_all(fd, b"no response\n");
+        }
+    }
+}
+
 fn pidtest_run(fd: i32) {
     // Read /proc/self/comm — should contain "shell\n" at boot
     // (set_proc_comm seeded by bare_main when the boot-init
@@ -1043,6 +1093,12 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"tcpwire" {
+        // tcpwire — try to connect to 10.0.2.2:7777 over the
+        // wire (QEMU user-net forwards to the host's gateway).
+        // Reports the connect rc; a host-side `nc -l 7777` is
+        // needed to actually see ESTABLISHED.
+        tcpwire_run(fd);
     } else if cmd == b"pidtest" {
         // pidtest — read /proc/self/{stat,comm,status},
         // /proc/<our-pid>/comm, verify pid matches.

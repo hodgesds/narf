@@ -29,6 +29,7 @@ narf-block         = { path = "../block" }
 narf-drivers-nvme    = { path = "../drivers/nvme" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
 narf-drivers-net     = { path = "../drivers/net" }
+narf-net             = { path = "../net" }
 narf-drivers-wireless = { path = "../drivers/wireless" }
 narf-drivers-i3c      = { path = "../drivers/i3c" }
 narf-drivers-i2c      = { path = "../drivers/i2c" }
