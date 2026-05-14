@@ -192,30 +192,49 @@ kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);
 // ── relocated from verification ──
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_hpet_pick_gsi_skips_low_block() -> TestResult {
-    // pick_gsi(mask, 16) must skip GSIs in the legacy ISA block
-    // (0..16) even when `mask` bits there are set.
+fn smoke_hpet_pick_gsi_prefers_high_block_with_legacy_fallback() -> TestResult {
+    // pick_gsi(mask, min_gsi) prefers GSIs ≥ min_gsi (high range)
+    // but FALLS BACK to non-reserved low-block GSIs (0..16) so HPET
+    // works on QEMU q35 where timer 0 route_cap is 0x4 (GSI 2 only).
+    // LEGACY_RESERVED skips the well-known legacy assignments
+    // (0=PIT, 1=i8042, 8=RTC, 13=FPU); GSI 2 (historic PIC cascade)
+    // is allowed because the PIT is masked when HPET is running.
     use crate::x86_64::hpet_oneshot::__pick_gsi_for_test as pick;
-    // Mask = 0..32 all set. With min_gsi=16 we expect GSI 16.
+    // High range satisfied → return min_gsi (lowest set high bit).
     if pick(0xFFFF_FFFF, 16) != Some(16) {
-        return TestResult::Fail("did not skip ISA block");
+        return TestResult::Fail("did not pick lowest high GSI");
     }
-    // Mask = ISA-only. Expect None.
-    if pick(0x0000_FFFF, 16).is_some() {
-        return TestResult::Fail("returned a low GSI when only ISA bits set");
+    // Only ISA bits set → fallback hits the low block, returns
+    // GSI 2 (lowest non-reserved low bit).
+    match pick(0x0000_FFFF, 16) {
+        Some(2) => {}
+        Some(g) => {
+            let _ = g;
+            return TestResult::Fail("low fallback returned wrong GSI (expected 2)");
+        }
+        None => return TestResult::Fail("low fallback returned None"),
     }
-    // Mask with a single high bit at GSI 22. Expect 22.
+    // Single high bit at GSI 22 → return 22.
     if pick(1u32 << 22, 16) != Some(22) {
         return TestResult::Fail("did not pick the only high GSI");
     }
-    // Empty mask.
+    // Empty mask → None.
     if pick(0, 16).is_some() {
         return TestResult::Fail("returned a GSI for an empty mask");
+    }
+    // Only LEGACY_RESERVED low bits set (0,1,8,13) → None
+    // (fallback skips every reserved assignment).
+    let legacy_only = (1u32 << 0) | (1u32 << 1) | (1u32 << 8) | (1u32 << 13);
+    if pick(legacy_only, 16).is_some() {
+        return TestResult::Fail("returned a reserved legacy GSI");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/hpet", smoke_hpet_pick_gsi_skips_low_block);
+kernel_test_in!(
+    "interrupts/hpet",
+    smoke_hpet_pick_gsi_prefers_high_block_with_legacy_fallback
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_hpet_oneshot_fires_handler() -> TestResult {
