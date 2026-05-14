@@ -156,10 +156,14 @@ pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
     }
     // Send the SYN.
     send_tcp_segment(&arc, isn, 0, TcpFlags::SYN, &[]);
-    // Wait for ESTABLISHED with 3s timeout.
+    // Wait for ESTABLISHED with 3s timeout. Drive the RX pump
+    // each iteration so the SYN-ACK reply gets processed by the
+    // state machine — without this drain, the spawned async RX
+    // task never gets a turn while we're spinning in the syscall.
     let deadline = narf_scheduler::narf_time::monotonic_ns()
         .saturating_add(3_000_000_000);
     while narf_scheduler::narf_time::monotonic_ns() < deadline {
+        while iface::drain_pump() {}
         let st = arc.lock().state;
         if st == TcpState::Established {
             return Ok(id);

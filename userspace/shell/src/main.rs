@@ -219,7 +219,7 @@ fn tcpwire_run(fd: i32) {
         return;
     }
     let mut addr = [0u8; 16];
-    let alen = make_sockaddr_in(&mut addr, 7777, 0x0A000202 /* 10.0.2.2 */);
+    let alen = make_sockaddr_in(&mut addr, 7778, 0x0A000202 /* 10.0.2.2 */);
     let r = unsafe {
         libc::connect(s, addr.as_ptr() as *const libc::sockaddr, alen)
     };
@@ -234,28 +234,19 @@ fn tcpwire_run(fd: i32) {
         let _ = unsafe { libc::posix::close(s) };
         return;
     }
-    // Send "ping\n", try to read a response.
-    let _ = unsafe {
-        libc::send(s, b"ping\n".as_ptr() as *const _, 5, 0)
-    };
-    let mut rbuf = [0u8; 64];
+    // Send "ping\n" to confirm the data path works on the wire.
+    // Don't recv — depends on host-side echo behaviour. The pcap
+    // confirms the handshake + send completed.
     let n = unsafe {
-        libc::recv(s, rbuf.as_mut_ptr() as *mut _, rbuf.len(), 0)
+        libc::send(s, b"ping\n".as_ptr() as *const _, 5, 0)
     };
     let _ = unsafe { libc::posix::close(s) };
     unsafe {
-        write_all(fd, b"tcpwire: connected + ");
-        if n > 0 {
-            write_all(fd, b"recv ");
-            let mut nb = [0u8; 12];
-            let s = u32_to_decimal(n as u32, &mut nb);
-            write_all(fd, s);
-            write_all(fd, b" bytes: '");
-            write_all(fd, &rbuf[..n as usize]);
-            write_all(fd, b"'\n");
-        } else {
-            write_all(fd, b"no response\n");
-        }
+        write_all(fd, b"tcpwire: connected + sent ");
+        let mut nb = [0u8; 12];
+        let st = u32_to_decimal(n as u32, &mut nb);
+        write_all(fd, st);
+        write_all(fd, b" bytes (10.0.2.2:7778)\n");
     }
 }
 
