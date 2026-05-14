@@ -71,7 +71,15 @@ pub fn arp_resolve(ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
     }
     let _ = send_arp_request(ip);
     let deadline = narf_time::Deadline::after_ns(timeout_ms.saturating_mul(1_000_000));
-    let _ = narf_scheduler::responsive_spin_until(|| arp_lookup(ip).is_some(), deadline);
+    let _ = narf_scheduler::responsive_spin_until(
+        || {
+            // Drain any pending RX so an inbound ARP reply lands
+            // in the cache, then re-check.
+            while iface::drain_pump() {}
+            arp_lookup(ip).is_some()
+        },
+        deadline,
+    );
     arp_lookup(ip).ok_or(())
 }
 
@@ -145,7 +153,11 @@ pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
     send_tcp_segment(&arc, isn, 0, TcpFlags::SYN, &[]);
     let deadline = narf_time::Deadline::after_ns(3_000_000_000);
     let _ = narf_scheduler::responsive_spin_until(
-        || arc.lock().state != TcpState::SynSent,
+        || {
+            // Drain RX so the SYN-ACK reaches handle_tcp.
+            while iface::drain_pump() {}
+            arc.lock().state != TcpState::SynSent
+        },
         deadline,
     );
     let st = arc.lock().state;

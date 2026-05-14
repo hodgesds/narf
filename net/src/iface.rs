@@ -134,9 +134,29 @@ pub fn on_rx_frame(frame: &[u8]) {
     h(frame);
 }
 
-// RX-ring draining is wired through `narf_scheduler::sleep_pumps`:
-// the e1000 driver registers `rx_pump_step` as a sleep_pump at
-// probe time, and `narf_scheduler::block_on` ticks all sleep_pumps
-// between poll attempts. Kernel-side TCP waits become regular
-// futures with wakers fired from `tcp_stack::handle_*` — no manual
-// drain loop, no yield hook indirection.
+// ── RX drain hook ───────────────────────────────────────────────
+//
+// Kernel busy-wait paths in `tcp_stack::arp_resolve` / `connect`
+// run inside a syscall handler (i.e. inside `UserTaskFuture::poll`).
+// While they're spinning, the executor cannot poll any other
+// task, so the spawned RX-pump task is frozen. This hook lets the
+// busy-waiter pull frames out of the NIC ring directly each
+// iteration so inbound replies actually reach the dispatch.
+
+type DrainFn = fn() -> bool;
+
+static DRAIN_FN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn install_rx_drain(f: DrainFn) {
+    DRAIN_FN.store(f as usize, Ordering::Release);
+}
+
+/// Drain-one-frame step. Returns true iff a frame was processed.
+pub fn drain_pump() -> bool {
+    let v = DRAIN_FN.load(Ordering::Acquire);
+    if v == 0 {
+        return false;
+    }
+    let f: DrainFn = unsafe { core::mem::transmute(v) };
+    f()
+}

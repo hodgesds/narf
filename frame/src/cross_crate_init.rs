@@ -42,20 +42,24 @@ fn install_proc_hooks() {
 }
 
 fn install_net_stack() {
-    // TCP-over-NIC: register the RX dispatch handler. The driver
-    // registers itself as a sleep_pump so `block_on` (used by the
-    // TCP stack's connect / arp_resolve futures) drains the NIC
-    // RX ring between poll attempts and wakes the parked future
-    // as soon as a matching reply lands.
+    // TCP-over-NIC: register the RX dispatch handler. Inline drain
+    // happens via `iface::drain_pump` from `tcp_stack::arp_resolve`
+    // / `connect`, so the kernel-side TCP stack works without any
+    // spawned background pump.
+    //
+    // TEMPORARILY DISABLED: the spawned RX-pump task below is
+    // suspected of hanging the boot-init shell load. Re-enable
+    // once the FS-read / async-yield interaction is understood.
     narf_net::tcp_stack::init();
-    narf_scheduler::sleep_pumps::register(net_rx_pump);
+    // narf_scheduler::spawn(async {
+    //     loop {
+    //         while narf_drivers_net::e1000::rx_pump_step() {}
+    //         narf_scheduler::yield_now().await;
+    //     }
+    // });
     let _ = writeln!(
         console::Writer,
         "  net: tcp_stack init; iface count = {}",
         narf_net::iface::count()
     );
-}
-
-fn net_rx_pump() {
-    while narf_drivers_net::e1000::rx_pump_step() {}
 }

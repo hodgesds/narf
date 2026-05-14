@@ -806,11 +806,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     // Register with the kernel-side TCP stack: hands the stack a
-    // `(mac, send_fn)` pair and a name. The stack's outbound
-    // path then routes through `e1000_send_frame` below. The
-    // RX-pump is registered as a sleep_pump in cross_crate_init
-    // so `block_on` ticks it between waker polls.
+    // `(mac, send_fn)` pair and a name. The RX-drain hook lets
+    // kernel-side busy-wait paths (ARP / TCP handshake) pull
+    // frames off the NIC ring directly while spinning, since the
+    // spawned RX-pump task can't run while a syscall is parked
+    // in `responsive_spin_until`.
     narf_net::iface::register("eth0", mac, e1000_send_frame);
+    narf_net::iface::install_rx_drain(rx_pump_step);
     Ok(())
 }
 
