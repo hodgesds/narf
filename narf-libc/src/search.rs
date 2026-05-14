@@ -188,7 +188,7 @@ pub unsafe extern "C" fn tdelete(
     }
 }
 
-/// VISIT enumeration for `twalk`. Same numeric values as glibc.
+/// VISIT enumeration for `twalk`. Numeric values per SUSv4 `<search.h>`.
 pub const PREORDER:  c_int = 0;
 pub const POSTORDER: c_int = 1;
 pub const ENDORDER:  c_int = 2;
@@ -231,9 +231,9 @@ pub unsafe extern "C" fn twalk(root: *const c_void, action: WalkAction) {
 
 // ── utmp ────────────────────────────────────────────────────────────
 
-/// `<utmp.h>` `struct utmp` — glibc layout, simplified. The full
-/// struct has many architecture-specific quirks; we ship the load-
-/// bearing fields most callers touch.
+/// `<utmp.h>` `struct utmp` per SUSv4, simplified. The full struct
+/// has many architecture-specific quirks; we ship the load-bearing
+/// fields most callers touch.
 #[repr(C)]
 pub struct utmp {
     pub ut_type:    i16,
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn getutent() -> *mut utmp {
 }
 
 /// `pututline(ut)` — append `ut` to the utmp DB. No-op success
-/// (returns the input pointer per glibc).
+/// (returns the input pointer per SUSv4).
 ///
 /// # Safety
 /// `ut`, when non-null, must point at a valid `utmp`. We don't
@@ -288,8 +288,9 @@ pub unsafe extern "C" fn utmpname(_file: *const c_char) -> c_int {
 // ── crypt ───────────────────────────────────────────────────────────
 
 /// `<crypt.h>` `struct crypt_data` — opaque scratchpad for `crypt_r`.
-/// Fields don't matter (we never inspect them); shape mirrors glibc
-/// so a binary's `sizeof(struct crypt_data)` lines up.
+/// Fields don't matter (we never inspect them); shape matches the
+/// conventional `<crypt.h>` layout so a binary's
+/// `sizeof(struct crypt_data)` lines up.
 #[repr(C)]
 pub struct crypt_data {
     pub keysched:    [c_char; 16 * 8],

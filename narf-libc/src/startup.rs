@@ -1,11 +1,11 @@
-//! `__libc_start_main` — the Rust-side of the relibc startup
+//! `__libc_start_main` — the Rust-side of the SysV C startup
 //! contract. Parses argc/argv/envp/auxv off the SysV-AMD64 entry
 //! stack, calls user `main`, then `exit`s with the returned status.
 //!
-//! Why this shape: relibc / glibc share the same observable
+//! Why this shape: the x86_64 SysV ABI defines the observable
 //! contract — `_start` (asm, captures rsp) -> `__libc_start_main`
 //! (C, parses startup vectors + initialises libc internals) ->
-//! user `main` -> `exit`. NARF doesn't yet need the full glibc
+//! user `main` -> `exit`. NARF doesn't yet need the full SysV
 //! pipeline (no ctors/dtors, no env-table linking, no
 //! `__libc_init_first`) so we ship just the parsing + dispatch
 //! frame and keep the rest as TODO follow-ups.
@@ -62,7 +62,7 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
     // honour the C ABI (we declared it `extern "C"`).
     let rc = unsafe { super::main(argc, argv, envp) };
     // SAFETY: `exit` is the C-ABI shape; calling it here completes
-    // the relibc startup contract and never returns.
+    // the SysV C startup contract and never returns.
     unsafe { exit(rc) }
 }
 

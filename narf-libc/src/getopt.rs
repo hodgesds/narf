@@ -312,7 +312,7 @@ pub unsafe extern "C" fn getopt_long(
 }
 
 /// Print a getopt diagnostic to stderr in the `program: msg -- X`
-/// shape glibc uses.
+/// shape SUSv4 specifies.
 unsafe fn emit_diag(argv: *const *mut c_char, msg: &str, opt: u8) {
     // SAFETY: caller contract — argv[0] (when non-null) is a C
     // string with the program name.

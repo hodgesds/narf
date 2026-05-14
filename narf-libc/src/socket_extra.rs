@@ -6,9 +6,9 @@
 //! kernel transport on NARF; the surface exists so a link succeeds,
 //! and every functional entry refuses with `errno = ENOSYS`.
 //!
-//! The struct shapes match Linux/glibc on x86_64 and aarch64 so a
-//! binary compiled against system headers observes the expected
-//! field offsets and array sizes.
+//! The struct shapes match the SUSv4 `<sys/un.h>` / `<sys/socket.h>`
+//! definitions on x86_64 and aarch64 so a binary compiled against
+//! system headers observes the expected field offsets and array sizes.
 
 #![allow(non_camel_case_types)]
 
@@ -21,7 +21,7 @@ pub const ENOSYS: c_int = 38;
 // ── struct sockaddr_un ──────────────────────────────────────────────
 
 /// `<sys/un.h>` `struct sockaddr_un` — Unix-domain socket address.
-/// `sun_path` is 108 bytes per Linux convention; the abstract-socket
+/// `sun_path` is the conventional 108 bytes; the abstract-socket
 /// trick (leading NUL) sits inside that array.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -39,7 +39,7 @@ impl Default for sockaddr_un {
 // ── struct msghdr / cmsghdr ─────────────────────────────────────────
 
 /// `<sys/socket.h>` `struct msghdr` — recvmsg / sendmsg packet
-/// descriptor. Field shapes match glibc.
+/// descriptor. Field layout per SUSv4.
 #[repr(C)]
 pub struct msghdr {
     pub msg_name:        *mut c_void,

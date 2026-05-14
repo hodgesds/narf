@@ -3,7 +3,7 @@
 //! C99 §7.4: each function takes an `int` whose value is either an
 //! `unsigned char` cast to `int` or `EOF` (-1). We mirror that
 //! contract with `c_int` arguments and 1/0 (or the converted value)
-//! returns. POSIX guarantees these are LC_CTYPE-aware in glibc, but
+//! returns. POSIX.1-2017 specifies these as LC_CTYPE-aware, but
 //! Stage-4 NARF has no locale support — we implement the C/POSIX
 //! locale only, matching what an early-boot consumer expects.
 //!

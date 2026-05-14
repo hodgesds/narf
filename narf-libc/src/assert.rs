@@ -7,13 +7,13 @@
 //!      __assert_fail(#expr, __FILE__, __LINE__, __func__))
 //!
 //! so we ship `__assert_fail` here. The implementation prints a
-//! glibc-shaped diagnostic to stderr and calls `abort()`. Naming
-//! matches glibc's: a real C `<assert.h>` will work without
-//! additional shims.
+//! POSIX-shaped diagnostic to stderr and calls `abort()`. The symbol
+//! name `__assert_fail` is the standard SysV C-runtime hook a real C
+//! `<assert.h>` expands to, so consumers link without additional shims.
 
 use crate::posix::c_char;
 
-/// Glibc-shaped assertion failure handler. Never returns.
+/// SysV-C-runtime assertion failure handler. Never returns.
 ///
 /// # Safety
 /// All four pointer arguments must be NUL-terminated C strings (or

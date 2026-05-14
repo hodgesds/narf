@@ -16,7 +16,7 @@
 
 use crate::posix::{c_char, c_int};
 
-// Compile / exec flags (numeric values match glibc).
+// Compile / exec flags (numeric values per the SUSv4 `<regex.h>` ABI).
 pub const REG_EXTENDED: c_int = 0o00001;
 pub const REG_ICASE:    c_int = 0o00002;
 pub const REG_NOSUB:    c_int = 0o00004;
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn regcomp(
 /// `regexec(*compiled, string, nmatch, *pmatch, eflags)` — always
 /// returns `REG_NOMATCH`. When `nmatch > 0` we zero the first
 /// match slot (POSIX requires the caller's match array to be in a
-/// known state on no-match; glibc clears `rm_so / rm_eo` to -1).
+/// known state on no-match; conventional impls clear `rm_so / rm_eo` to -1).
 ///
 /// # Safety
 /// `pmatch`, when non-null and `nmatch > 0`, must be writable for

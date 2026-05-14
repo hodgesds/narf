@@ -9,9 +9,9 @@
 //! and bail; returning a fixed entry lets them proceed.
 //!
 //! The returned pointer is to a `'static` table; callers must not
-//! free it. The shape of `passwd` and `group` matches glibc on
-//! x86_64 / aarch64 so a binary compiled against system headers
-//! observes the expected field offsets.
+//! free it. The shape of `passwd` and `group` matches the SUSv4
+//! `<pwd.h>` / `<grp.h>` definitions on x86_64 / aarch64 so a binary
+//! compiled against system headers observes the expected field offsets.
 
 #![allow(non_camel_case_types)]
 
@@ -22,9 +22,9 @@ pub type gid_t = u32;
 
 // ── struct passwd ───────────────────────────────────────────────────
 
-/// `<pwd.h>` `struct passwd` — glibc layout. `pw_passwd` is the
-/// classic shadow-redirect "x"; real password material lives in
-/// `/etc/shadow` on glibc systems and we don't ship a shadow DB.
+/// `<pwd.h>` `struct passwd` per SUSv4. `pw_passwd` is the
+/// classic shadow-redirect "x"; real password material conventionally
+/// lives in `/etc/shadow` and we don't ship a shadow DB.
 #[repr(C)]
 pub struct passwd {
     pub pw_name:   *mut c_char,
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn getpwent() -> *mut passwd {
 
 // ── struct group ────────────────────────────────────────────────────
 
-/// `<grp.h>` `struct group` — glibc layout. `gr_mem` is a NULL-
+/// `<grp.h>` `struct group` per SUSv4. `gr_mem` is a NULL-
 /// terminated array of member-name pointers; we ship a single-element
 /// `["narf", NULL]` array so iterators terminate cleanly.
 #[repr(C)]
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn getgrent() -> *mut group {
 /// with the group memberships of `user`. NARF's single-user model:
 /// the user "narf" is in exactly one group (gid 0). `ngroups` is an
 /// in/out parameter; we set it to the actual count and return -1 if
-/// the caller's buffer was too small (per glibc).
+/// the caller's buffer was too small (per SUSv4).
 ///
 /// # Safety
 /// `groups` must point to at least `*ngroups` `gid_t` slots when

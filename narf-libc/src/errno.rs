@@ -1,10 +1,10 @@
 //! errno via TLS slot.
 //!
-//! POSIX `errno` is per-thread state. The relibc-shape we follow
-//! places it at a fixed negative offset from the thread pointer
-//! (the SysV-AMD64 `fs:[0]` self-pointer). The validate binary's
-//! linker script reserves the last 8 bytes of the TLS template
-//! for this slot.
+//! POSIX `errno` is per-thread state. We place it at a fixed
+//! negative offset from the thread pointer (the SysV-AMD64
+//! `fs:[0]` self-pointer per the x86_64 SysV ABI). The validate
+//! binary's linker script reserves the last 8 bytes of the TLS
+//! template for this slot.
 //!
 //! Why a fixed offset and not a dynamic TLS lookup: dynamic-TLS
 //! requires DT_TLSDESC + a runtime resolver, which would pull in
@@ -18,9 +18,9 @@ use narf_user_runtime::thread_pointer;
 /// matches this layout.
 const ERRNO_TLS_OFFSET: isize = -8;
 
-/// POSIX errno values the libc shim sets. We keep the Linux
-/// numbering so a future relibc swap-in observes the same wire
-/// numbers without translation. The list grows as more shims
+/// POSIX errno values the libc shim sets. We use the conventional
+/// SysV numbering so the wire numbers match what consumer code
+/// expects without translation. The list grows as more shims
 /// land — only the values actually written show up here.
 pub const EINVAL: i32 = 22;
 pub const ERANGE: i32 = 34;
@@ -40,7 +40,7 @@ pub fn set_errno(v: i32) {
     unsafe { *__errno_location() = v; }
 }
 
-// ── relibc-shape errno accessor ────────────────────────────────────
+// ── SysV-shape errno accessor ─────────────────────────────────────
 //
 // C consumers want `int *__errno_location(void)` rather than a Rust
 // `fn() -> i32` / `fn(i32)` pair — `errno` in C is a macro that
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn __errno_location() -> *mut i32 {
 // ── strerror ────────────────────────────────────────────────────────
 //
 // Each entry is a NUL-terminated static byte literal. We index by
-// the Linux errno number; unknown codes route to "Unknown error".
+// the SysV errno number; unknown codes route to "Unknown error".
 // Returns a pointer to a `'static` byte; callers must not free it
 // (matches the standard `char *strerror(int)` ABI).
 

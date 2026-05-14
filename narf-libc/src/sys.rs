@@ -396,8 +396,8 @@ pub unsafe extern "C" fn prlimit(
 
 // ── <sched.h> CPU affinity ─────────────────────────────────────────
 
-/// glibc-shaped `cpu_set_t`. 1024 bits = 128 bytes = 16 u64 words.
-/// Linux's actual cpu_set_t is the same shape.
+/// `cpu_set_t` per `<sched.h>`. 1024 bits = 128 bytes = 16 u64 words.
+/// Wire-compatible with the SUSv4 shape.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct cpu_set_t {
@@ -437,7 +437,7 @@ pub unsafe extern "C" fn CPU_ISSET(cpu: c_int, set: *const cpu_set_t) -> c_int {
     bit as c_int
 }
 
-/// `sched_getaffinity(pid, cpusetsize, mask)` — Linux signature.
+/// `sched_getaffinity(pid, cpusetsize, mask)` per `<sched.h>`.
 /// Returns 0 on success, -1 on bad pointer or oversized request.
 ///
 /// # Safety
@@ -528,17 +528,16 @@ pub unsafe extern "C" fn sched_setparam(pid: i32, param: *const sched_param) -> 
 // ── <sched.h> sched_getcpu ─────────────────────────────────────────
 
 /// `sched_getcpu()` — return the CPU id the calling task is
-/// currently running on. Linux extension; consumer code uses it
-/// to pin per-CPU caches. NARF user mode is single-CPU; this
-/// always returns 0.
+/// currently running on. Used by consumer code to pin per-CPU
+/// caches. NARF user mode is single-CPU; this always returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sched_getcpu() -> c_int {
     let (cpu, _node) = narf_user_runtime::getcpu();
     cpu as c_int
 }
 
-/// `getcpu(cpu, node)` — Linux glibc shape. Both pointers may be
-/// null. Returns 0 on success.
+/// `getcpu(cpu, node)` per the SUSv4 extended sched API. Both
+/// pointers may be null. Returns 0 on success.
 ///
 /// # Safety
 /// `cpu` and `node`, when non-null, must be writable `*mut u32`.

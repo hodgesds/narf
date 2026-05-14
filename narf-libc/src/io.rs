@@ -21,8 +21,8 @@
 //! require an extra Arg slot per `*`).
 //!
 //! Unknown conversions fall through verbatim (we emit `%` + the
-//! offending byte), matching glibc's "leak the format string"
-//! behaviour rather than panicking.
+//! offending byte), matching the conventional "leak the format
+//! string" behaviour rather than panicking.
 
 /// Tagged-union arg consumed by [`printf_str`]. Lifetime allows
 /// borrowing string args without forcing a `'static` bound.
@@ -452,7 +452,7 @@ fn emit_uint(sink: &mut Sink<'_>, spec: &FmtSpec, v: u64) -> usize {
 
 /// Pointer rendering: `0x` + hex of the raw bits. Honours the
 /// caller's spec so `%20p` etc. still pad, but we force the alt-
-/// form prefix on so the `0x` is unconditional (matches glibc).
+/// form prefix on so the `0x` is unconditional (per SUSv4 `%p`).
 fn emit_ptr(sink: &mut Sink<'_>, spec: &FmtSpec, p: *const u8) -> usize {
     let mut s = *spec;
     s.alt_form = true;
@@ -461,8 +461,8 @@ fn emit_ptr(sink: &mut Sink<'_>, spec: &FmtSpec, p: *const u8) -> usize {
 
 /// String emit with width-pad + precision-truncate. Precision on
 /// `%s` caps the byte count emitted (per C99). Width pads the
-/// remainder with spaces (we honour `0` for symmetry with glibc,
-/// though it's a non-standard combination).
+/// remainder with spaces (we honour `0` for symmetry with the
+/// conventional impl, though it's a non-standard combination).
 fn emit_str(sink: &mut Sink<'_>, spec: &FmtSpec, s: &str) -> usize {
     let bytes = s.as_bytes();
     let take = spec.precision.map(|p| p.min(bytes.len())).unwrap_or(bytes.len());
@@ -566,8 +566,8 @@ fn vformat(sink: &mut Sink<'_>, fmt: &str, args: &[Arg<'_>]) -> usize {
                 arg_idx += 1;
             }
             b'b' => {
-                // NARF extension. Glibc 2.35+ also accepts `%b` for
-                // binary; we follow that convention.
+                // NARF extension for binary, matching the C23 `%b`
+                // conversion now adopted by major C runtimes.
                 if let Some(Arg::Uint(v)) = args.get(arg_idx) {
                     emitted += emit_uint_base(sink, &spec, *v, 2);
                 }

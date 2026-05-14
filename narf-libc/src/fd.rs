@@ -1,9 +1,9 @@
 //! POSIX-shaped fd-control helpers — `dup` / `dup2` / `fcntl` /
 //! `pipe` / `stat` / `fstat`.
 //!
-//! Path-B scope (Stage 4 round 2): mirror the relibc surface real
-//! C programs reach for after they have a working `open` / `read` /
-//! `write` / `close`. Every entry delegates to
+//! Path-B scope (Stage 4 round 2): mirror the POSIX.1-2017 surface
+//! real C programs reach for after they have a working `open` / `read`
+//! / `write` / `close`. Every entry delegates to
 //! [`narf_user_runtime`] for the actual syscall — this layer only
 //! adds the i32 vs u32 fd-shape coercion and the POSIX `pipefd[2]`
 //! out-pointer convention.

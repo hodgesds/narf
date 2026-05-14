@@ -176,14 +176,14 @@ extern "C" {
 // mask in user mode (the kernel surfaces a structural sigprocmask
 // stub but the libc shim today is a no-op), so the `savemask`
 // argument is accepted-and-ignored. The forwarding macro shape
-// matches glibc: same `jmp_buf` type, same return contract.
+// matches POSIX.1-2017: same `jmp_buf` type, same return contract.
 //
 // `siglongjmp(env, val)` is exactly `longjmp(env, val)` — there's
 // no mask to restore.
 
-/// Opaque sigjmp_buf: same shape as [`jmp_buf`] (real glibc grows
-/// it for the saved sigset_t; NARF doesn't ship a sigset
-/// representation worth saving, so we alias).
+/// Opaque sigjmp_buf: same shape as [`jmp_buf`] (POSIX.1-2017
+/// permits growing it for the saved sigset_t; NARF doesn't ship a
+/// sigset representation worth saving, so we alias).
 pub type sigjmp_buf = jmp_buf;
 
 /// `sigsetjmp(env, savemask)` — POSIX. `savemask` is recorded into
