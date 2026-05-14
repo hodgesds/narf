@@ -14,7 +14,7 @@
 
 use core::fmt::Write;
 
-use narf_console::Writer;
+use narf_console::TrapWriter;
 
 /// The on-stack layout that `common_trap` builds before calling here.
 ///
@@ -290,14 +290,19 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             narf_memory::beacon::paint_at(slot, 4, color);
         }
     }
-    let _ = writeln!(Writer, "\n*** CPU EXCEPTION ***");
+    // Lock-free TrapWriter: the original faulting code may already
+    // hold `CONSOLE.lock` (e.g. it faulted mid-`write_str`); a
+    // blocking re-acquire from inside the trap handler would
+    // deadlock against itself, which is why every line past the
+    // first one used to vanish.
+    let _ = writeln!(TrapWriter, "\n*** CPU EXCEPTION ***");
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  vector: {:3} — {}",
         frame.vector,
         vector_name(frame.vector)
     );
-    let _ = writeln!(Writer, "  error:  {:#018x}", frame.error_code);
+    let _ = writeln!(TrapWriter, "  error:  {:#018x}", frame.error_code);
     if frame.vector == 14 {
         // #PF: CR2 holds the faulting linear address.
         let cr2: u64;
@@ -306,54 +311,54 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
             options(nostack, preserves_flags));
         }
-        let _ = writeln!(Writer, "  cr2:    {:#018x}", cr2);
+        let _ = writeln!(TrapWriter, "  cr2:    {:#018x}", cr2);
     }
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  rip:    {:#018x}   cs:     {:#018x}",
         frame.rip, frame.cs
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  rflags: {:#018x}   rsp:    {:#018x}   ss: {:#018x}",
         frame.rflags, frame.rsp, frame.ss
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  rax:    {:#018x}   rbx:    {:#018x}",
         frame.rax, frame.rbx
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  rcx:    {:#018x}   rdx:    {:#018x}",
         frame.rcx, frame.rdx
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  rsi:    {:#018x}   rdi:    {:#018x}",
         frame.rsi, frame.rdi
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  rbp:    {:#018x}   r8:     {:#018x}",
         frame.rbp, frame.r8
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  r9:     {:#018x}   r10:    {:#018x}",
         frame.r9, frame.r10
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  r11:    {:#018x}   r12:    {:#018x}",
         frame.r11, frame.r12
     );
     let _ = writeln!(
-        Writer,
+        TrapWriter,
         "  r13:    {:#018x}   r14:    {:#018x}",
         frame.r13, frame.r14
     );
-    let _ = writeln!(Writer, "  r15:    {:#018x}", frame.r15);
+    let _ = writeln!(TrapWriter, "  r15:    {:#018x}", frame.r15);
 
     // SAFETY: after a fatal exception we have no policy to resume; exit with
     // a non-zero code so xtask / verification can see the failure.

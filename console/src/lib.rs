@@ -312,6 +312,49 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     narf_arch::halt_forever();
 }
 
+/// Lock-free string emit used by the CPU trap path. The trap may
+/// have fired while the original code was holding `CONSOLE.lock`
+/// (mid-`write_str`); a blocking re-acquire from the trap handler
+/// would deadlock against itself, which is why every line past
+/// the first one in the exception printer used to vanish. Same
+/// shape as `panic_sink` minus the format-into-stack-buf step
+/// since callers usually want raw writes interleaved with their
+/// own register dumps.
+pub fn trap_sink(s: &str) {
+    // Skip `klog::record` deliberately — it takes an
+    // `IrqSafeSpinLock` (`RING.lock()`) and the original faulting
+    // code may already hold it; deadlock there manifests as the
+    // trap printer dying after one line. The FB hook is also
+    // skipped for the same reason — the FB-console writer's path
+    // takes its own locks.
+    if let Some(kind) = CONSOLE.kind.get() {
+        let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+        if base != 0 {
+            // SAFETY: kind + base were published Release; we accept
+            // the interleave risk versus deadlocking on the lock.
+            unsafe {
+                backend::write_bytes(base, *kind, s.as_bytes());
+            }
+        }
+    }
+}
+
+/// Lock-free `fmt::Write` adapter for the trap printer.
+pub struct TrapWriter;
+
+impl fmt::Debug for TrapWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrapWriter").finish()
+    }
+}
+
+impl fmt::Write for TrapWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        trap_sink(s);
+        Ok(())
+    }
+}
+
 /// Formatter adapter for `write!` / `writeln!`.
 pub struct Writer;
 
