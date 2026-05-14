@@ -2325,7 +2325,22 @@ fn boot_userspace_init() {
     fn scheduler_step_pump() {
         let _ = narf_scheduler::poll_one_round();
     }
-    narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
+    // KNOWN ISSUE: registering this sleep_pump hangs boot-init —
+    // when run_until_empty polls tid=1 (DrainTask), the poll
+    // body's responsive_spin_until ticks sleep_pumps which
+    // recursively re-enters poll_one_round. The first poll of
+    // tid=1 never returns. Re-entrancy guards (AtomicBool flag
+    // around the poll_one_round call) DON'T fix it — the
+    // problem isn't the guard's recursion, it's something
+    // about poll_one_round running from inside a poll body
+    // that the boot-init path can't tolerate. Tracked as a
+    // separate investigation; the trade-off is that sys_sleep
+    // busy-waits no longer round-robin other kernel async
+    // tasks (FB drain still runs via fb_drain_pump, cursor
+    // pump still runs via cursor::sleep_pump_tick — those have
+    // their own dedicated sleep_pumps).
+    // narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
+    let _ = scheduler_step_pump;
 
     // Drain any RX bytes the platform UART has queued (typed bytes
     // via `qemu -serial stdio`, or a real serial console on bare
