@@ -656,6 +656,74 @@ fn build_user_binary(
     Ok(bin)
 }
 
+/// Encode a CPIO newc (`070701`) archive containing `entries` plus
+/// the mandatory `TRAILER!!!` sentinel. Each entry is `(name,
+/// data)`; names appear at the archive's root (no leading `/`),
+/// matching what `narf_filesystem::Initramfs::from_cpio` expects.
+///
+/// Format reference (POSIX 1003.1-1988 + the de-facto cpio newc
+/// addendum used by Linux + BSD initramfs tooling):
+///   <https://www.kernel.org/doc/Documentation/early-userspace/buffer-format.txt>
+///
+/// 110-byte ASCII-hex header per entry followed by NUL-terminated
+/// name (padded to 4-byte boundary including the 110-byte header)
+/// + file data (padded to 4-byte boundary). Mode is 0o100644
+/// (regular file, owner rw, others r). Inode + nlink + mtime are
+/// fixed because we only build deterministic archives — anything
+/// else would invalidate ISO checksums on rebuilds.
+fn encode_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    fn pad_to_4(out: &mut Vec<u8>) {
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    fn write_hex8(out: &mut Vec<u8>, v: u32) {
+        // ASCII uppercase hex, exactly 8 chars, zero-padded.
+        let s = format!("{:08X}", v);
+        out.extend_from_slice(s.as_bytes());
+    }
+    fn write_entry(
+        out: &mut Vec<u8>,
+        ino: u32,
+        mode: u32,
+        name: &str,
+        data: &[u8],
+    ) {
+        let name_bytes = name.as_bytes();
+        let namesize = (name_bytes.len() + 1) as u32; // +1 for NUL
+        out.extend_from_slice(b"070701");
+        write_hex8(out, ino); // c_ino
+        write_hex8(out, mode); // c_mode
+        write_hex8(out, 0); // c_uid
+        write_hex8(out, 0); // c_gid
+        write_hex8(out, 1); // c_nlink
+        write_hex8(out, 0); // c_mtime
+        write_hex8(out, data.len() as u32); // c_filesize
+        write_hex8(out, 0); // c_devmajor
+        write_hex8(out, 0); // c_devminor
+        write_hex8(out, 0); // c_rdevmajor
+        write_hex8(out, 0); // c_rdevminor
+        write_hex8(out, namesize); // c_namesize (incl. NUL)
+        write_hex8(out, 0); // c_check (always 0 for newc)
+        out.extend_from_slice(name_bytes);
+        out.push(0); // NUL
+        pad_to_4(out);
+        out.extend_from_slice(data);
+        pad_to_4(out);
+    }
+    let mut out = Vec::with_capacity(
+        entries.iter().map(|(n, d)| 110 + n.len() + 4 + d.len() + 4).sum::<usize>() + 256,
+    );
+    for (i, (name, data)) in entries.iter().enumerate() {
+        // Inode 0 is reserved for the trailer; start at 1.
+        write_entry(&mut out, (i + 1) as u32, 0o100644, name, data);
+    }
+    // TRAILER!!! sentinel — type fields all zero, name is the
+    // literal "TRAILER!!!" (10 bytes + NUL = 11), no data.
+    write_entry(&mut out, 0, 0, "TRAILER!!!", &[]);
+    out
+}
+
 fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
     let off = (idx + idx / 2) as usize;
     let v = val & 0x0FFF;
@@ -812,6 +880,30 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     std::fs::copy(&bootx64, efi_dir.join("BOOTX64.EFI"))
         .with_context(|| format!("copying {}", bootx64.display()))?;
 
+    // Build init + shell ELFs into a CPIO newc archive that Limine
+    // will pass through as a multiboot2 module tagged "initramfs".
+    // The kernel's `narf_initramfs::stage_from_phys` parses it and
+    // `root-mount-auto` mounts it at "/" so boot-init's
+    // `try_load_from_root("init"/"shell")` resolves CPIO entries
+    // instead of falling back to the baked-in ELFs. Lets the user
+    // binaries iterate without rebuilding the kernel.
+    let init_elf = build_user_binary(&root, "userspace/init", "init", "init.ld")?;
+    let shell_elf = build_user_binary(&root, "userspace/shell", "shell", "shell.ld")?;
+    let init_bytes = std::fs::read(&init_elf)
+        .with_context(|| format!("reading init ELF at {}", init_elf.display()))?;
+    let shell_bytes = std::fs::read(&shell_elf)
+        .with_context(|| format!("reading shell ELF at {}", shell_elf.display()))?;
+    let cpio = encode_cpio_newc(&[("init", &init_bytes), ("shell", &shell_bytes)]);
+    let cpio_path = boot_dir.join("initramfs.cpio");
+    std::fs::write(&cpio_path, &cpio)
+        .with_context(|| format!("writing initramfs CPIO to {}", cpio_path.display()))?;
+    println!(
+        "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes)",
+        cpio.len(),
+        init_bytes.len(),
+        shell_bytes.len()
+    );
+
     // BIOS support files are nice-to-have. xorriso flags below
     // reference them; if missing, drop the BIOS-side El-Torito
     // entry so the ISO still builds (UEFI-only).
@@ -833,6 +925,10 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     // `serial: yes` mirrors Limine's own bring-up logging to COM1
     // (16550A 0x3F8) so a `-serial stdio` QEMU run captures both
     // Limine's stages and the kernel's UART writes.
+    // `module_path` ships the CPIO archive to the kernel as a
+    // multiboot2 module; `module_string` sets the module's command-
+    // line so `narf_boot::x86_64::multiboot2::initramfs_module`
+    // matches it (case-insensitive equality with "initramfs").
     let cfg = "\
 timeout: 5
 serial: yes
@@ -844,6 +940,8 @@ interface_resolution: 1024x768
 /NARF
     protocol: multiboot2
     path: boot():/boot/narf-frame
+    module_path: boot():/boot/initramfs.cpio
+    module_string: initramfs
 ";
     std::fs::write(limine_stage.join("limine.conf"), cfg).context("writing limine.conf")?;
 
