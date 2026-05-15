@@ -35,7 +35,7 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 5;
+const HEADER_LINES: u32 = 6;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -129,9 +129,37 @@ pub fn paint(fb: &FbWriter) {
     let cpu_line = narf_power::cpu_status_line()
         .unwrap_or_else(|| alloc::string::String::from("CPU: pstate (not initialised)"));
 
+    // Battery + AC summary from registered PowerSources. Renders
+    // each source as "<name>: <pct>%[ chg|on]" so the user can see
+    // at a glance whether acpi-battery / acpi-ac-adapter actually
+    // bound on real laptop boot.
+    let pwr_line = {
+        use narf_power::PowerSourceType;
+        let sources = narf_power::list_sources();
+        if sources.is_empty() {
+            alloc::string::String::from("PWR: (no sources)")
+        } else {
+            let mut s = alloc::string::String::from("PWR:");
+            for src in sources.iter() {
+                let pct = src.capacity_percent();
+                let suffix = match (src.source_type(), src.is_charging()) {
+                    (PowerSourceType::Battery, true) => " chg",
+                    (PowerSourceType::AcAdaptor, true) => " on",
+                    _ => "",
+                };
+                let _ = core::fmt::write(
+                    &mut s,
+                    format_args!(" {}: {}%{}", src.name(), pct, suffix),
+                );
+            }
+            s
+        }
+    };
+
     let header = [
         fb_line.as_str(),
         cpu_line.as_str(),
+        pwr_line.as_str(),
         dev_line.as_str(),
         cursor_line.as_str(),
         i8042_diag.as_str(),
