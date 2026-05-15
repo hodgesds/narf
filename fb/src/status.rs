@@ -35,7 +35,7 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 6;
+const HEADER_LINES: u32 = 7;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -156,10 +156,38 @@ pub fn paint(fb: &FbWriter) {
         }
     };
 
+    // Thermal zones from acpi-thermal. Renders the basename of
+    // each zone path (last `.`-segment) plus current temperature
+    // in C; warm/critical states get a bracket suffix so the user
+    // can spot a hot zone without reading every digit.
+    let thermal_line = {
+        use narf_power::thermal::{zones_snapshot, ThermalState};
+        let zones = zones_snapshot();
+        if zones.is_empty() {
+            alloc::string::String::from("THERM: (no zones)")
+        } else {
+            let mut s = alloc::string::String::from("THERM:");
+            for (path, milli, state) in zones.iter() {
+                let basename = path.rsplit('.').next().unwrap_or(path.as_str());
+                let suffix = match state {
+                    ThermalState::Critical => "!CRIT",
+                    ThermalState::Warm => "!warm",
+                    ThermalState::Normal => "",
+                };
+                let _ = core::fmt::write(
+                    &mut s,
+                    format_args!(" {}: {}C{}", basename, milli / 1000, suffix),
+                );
+            }
+            s
+        }
+    };
+
     let header = [
         fb_line.as_str(),
         cpu_line.as_str(),
         pwr_line.as_str(),
+        thermal_line.as_str(),
         dev_line.as_str(),
         cursor_line.as_str(),
         i8042_diag.as_str(),

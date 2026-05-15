@@ -257,6 +257,21 @@ pub fn zone_count() -> usize {
     REG.lock().as_ref().map(|r| r.zones.len()).unwrap_or(0)
 }
 
+/// Snapshot every registered zone for diagnostic display. Returns
+/// `(name, milli_c, state)` per zone — owned strings so the
+/// caller doesn't have to hold the registry lock across rendering.
+pub fn zones_snapshot() -> Vec<(String, i32, ThermalState)> {
+    let r = REG.lock();
+    match r.as_ref() {
+        Some(reg) => reg
+            .zones
+            .iter()
+            .map(|z| (z.name.clone(), z.temp(), z.state()))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Test helper: reset registry to empty.
 #[doc(hidden)]
 pub fn __test_reset() {
