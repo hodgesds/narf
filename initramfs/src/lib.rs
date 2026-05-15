@@ -102,10 +102,22 @@ pub unsafe fn stage_from_phys(name: &'static str, phys: u64, len: u64) -> Result
 pub fn mount_at_boot(
     auth: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
 ) -> Result<(), ()> {
+    mount_at_path(auth, "/boot")
+}
+
+/// Mount the staged initramfs at an arbitrary VFS path. Used by
+/// the boot-path's `root-mount-auto` to mount the initramfs at "/"
+/// when no on-disk FAT volume turned up — the boot-init `init` /
+/// `shell` loader then resolves `/init` and `/shell` against the
+/// CPIO entries.
+pub fn mount_at_path(
+    auth: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    path: &str,
+) -> Result<(), ()> {
     let fs = staged().ok_or(())?;
     let proxy = MountProxy { fs };
     narf_filesystem::registry()
-        .mount(auth, "/boot", proxy)
+        .mount(auth, path, proxy)
         .map(|_handle| ())
         .map_err(|_| ())
 }

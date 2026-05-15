@@ -1790,6 +1790,39 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
+                // No-disk fallback: if the bootloader staged an
+                // initramfs (CPIO) into RAM, mount it at "/" so the
+                // boot-init flow's `try_load_from_root("init")` /
+                // `try_load_from_root("shell")` resolves against the
+                // initramfs files instead of falling through to the
+                // baked-in ELFs. This is the path used on real
+                // hardware when there's no FAT volume yet (e.g. a
+                // freshly-imaged USB stick that's purely an
+                // initramfs delivery vehicle), and it lets the
+                // userspace binaries iterate without rebuilding the
+                // kernel. Tried BEFORE the disk walk so an
+                // initramfs always wins over a stale FAT volume on
+                // disk — the on-disk image typically lags the
+                // tree's HEAD whereas the initramfs is rebuilt with
+                // every kernel image.
+                if narf_initramfs::is_staged() {
+                    match narf_initramfs::mount_at_path(&auth, "/") {
+                        Ok(()) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: initramfs mounted at \"/\""
+                            );
+                            return narf_init::InitResult::Ok;
+                        }
+                        Err(()) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: initramfs mount at \"/\" rejected"
+                            );
+                        }
+                    }
+                }
+
                 // Walk every block-device-registry entry, wrap in
                 // SyncBlock, and try a FAT mount. Any device that
                 // turns out not to be FAT returns Unsupported; we
