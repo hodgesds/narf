@@ -27,7 +27,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::eval::evaluate_method;
-use narf_aml::find_device_by_hid;
+use narf_aml::find_all_devices_by_hid;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::ec::{subscribe_platform_event, PlatformEvent};
@@ -140,21 +140,18 @@ fn refresh_all() {
 }
 
 /// Walk the AML namespace, register every PNP0C0D as a lid device,
-/// subscribe to the EC platform event feed.
+/// subscribe to the EC platform event feed. Convertible laptops
+/// list two lid devices (one per panel); we register all of them
+/// so subscribers are notified on either transition.
 pub fn init() {
     let mut count = 0u32;
-    if let Some(dev) = find_device_by_hid("PNP0C0D") {
+    for dev in find_all_devices_by_hid("PNP0C0D") {
         let lid = Arc::new(LidDevice::new(dev.path.clone()));
         // Prime the cache with the boot-time state.
         let _ = lid.refresh();
         LIDS.lock().push(lid);
         count += 1;
     }
-
-    // Some laptops list multiple lid devices (convertibles); the
-    // current AML walker only exposes a single `find_device_by_hid`,
-    // so for now we capture the first. A full multi-device walk
-    // lands when AML grows a `for_each_device_by_hid`.
 
     if count == 0 {
         let _ = writeln!(
