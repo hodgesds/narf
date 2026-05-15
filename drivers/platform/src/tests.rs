@@ -335,6 +335,17 @@ kernel_test_in!(
     smoke_battery_init_walks_aml_namespace_without_panic
 );
 
+// ── AC adapter ─────────────────────────────────────────────────────
+
+fn smoke_ac_adapter_init_walks_aml_namespace_without_panic() -> TestResult {
+    crate::ac_adapter::init();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/ac_adapter",
+    smoke_ac_adapter_init_walks_aml_namespace_without_panic
+);
+
 // ── TPM ────────────────────────────────────────────────────────────
 
 fn smoke_tpm_init_default() -> TestResult {

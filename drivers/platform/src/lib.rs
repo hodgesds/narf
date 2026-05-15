@@ -25,6 +25,8 @@ pub mod ec;
 /// PMIC drivers (not yet ported) — gate these on x86_64 too.
 #[cfg(target_arch = "x86_64")]
 pub mod battery;
+#[cfg(target_arch = "x86_64")]
+pub mod ac_adapter;
 pub mod thermal;
 pub mod fan;
 #[cfg(target_arch = "x86_64")]
@@ -54,6 +56,11 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-battery", || {
         battery::init();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "acpi-ac-adapter", || {
+        ac_adapter::init();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "acpi-thermal", || {
