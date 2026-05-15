@@ -86,6 +86,51 @@ pub fn list_sources() -> Vec<Arc<dyn PowerSource>> {
 /// Force-link hook.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // CPU-frequency scaling bring-up. Detect HWP (Skylake+) /
+    // SpeedStep (older Intel) / AMD HwPstate (Family 10h+,
+    // including the Zen2/Zen3/Zen4 lines that this kernel targets
+    // on real silicon) and program a sane initial P-state target.
+    // Without this the CPU sticks at whatever frequency the
+    // firmware chose at boot — typically the lowest P-state on
+    // laptops booted by EFI without an OS PM driver, so a
+    // freshly-booted narf laptop runs cool but slow.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "cpu-pstate", || {
+        let m = pstate::detect();
+        // SAFETY: CPL=0 boot context; init is idempotent + only
+        // touches MSRs the detected mechanism advertises support
+        // for via CPUID.
+        unsafe { pstate::init() };
+        match m {
+            pstate::Mechanism::Hwp => {
+                // SAFETY: HWP support gated by detect.
+                let caps = unsafe { pstate::hwp_capabilities() };
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  cpu-pstate: HWP enabled (max={} guaranteed={} efficient={} min={})",
+                    caps.max_perf, caps.guaranteed_perf, caps.efficient_perf, caps.min_perf
+                );
+                InitResult::Ok
+            }
+            pstate::Mechanism::SpeedStep => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  cpu-pstate: legacy SpeedStep available; firmware default left in place"
+                );
+                InitResult::Ok
+            }
+            pstate::Mechanism::AmdLegacy => {
+                let summary = pstate::amd_pstate_summary();
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  cpu-pstate: AMD HwPstate enabled; {} defined ({})",
+                    summary.defined, summary.formatted_freqs
+                );
+                InitResult::Ok
+            }
+            pstate::Mechanism::None => InitResult::NotPresent,
+        }
+    });
     narf_init::register(Stage::Late, "power-monitor", || {
         narf_scheduler::spawn(async move {
             let _ = writeln!(narf_console::Writer, "  power-monitor: starting background telemetry...");

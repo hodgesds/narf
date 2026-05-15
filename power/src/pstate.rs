@@ -8,6 +8,8 @@
 #![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use narf_arch::x86_64::cpuid::cpuid;
@@ -236,7 +238,11 @@ pub unsafe fn legacy_set(id: u16) {
 
 /// Boot-time bring-up: detect mechanism, enable HWP if available,
 /// set HWP request to `(min, max)` from capabilities (autonomous,
-/// balanced EPP). On legacy paths, leave whatever firmware did.
+/// balanced EPP). For AMD HwPstate, clear `MSR_AMD_PSTATE_LIMIT`
+/// so the hardware is allowed to clock up to P0 (highest
+/// frequency) — laptop firmware often boots with the limit pinned
+/// at the slowest P-state for thermal headroom and the OS is
+/// expected to release it.
 ///
 /// # Safety
 /// CPL = 0, boot context.
@@ -259,7 +265,96 @@ pub unsafe fn init() {
                 );
             }
         }
-        _ => {} // No-op for SpeedStep / AmdLegacy / None.
+        Mechanism::AmdLegacy => {
+            // Clear the P-state ceiling so the hardware governor
+            // can climb to P0 when load demands it. AMD BKDG (Family
+            // 17h Models 30h..70h, public) §2.1.10 PStateCurLim:
+            // bits[2:0] = PstateMaxVal — write 0 to permit the
+            // highest-numbered P-state (P0 / highest frequency).
+            // SAFETY: caller-asserted CPL=0; HwPstate confirmed
+            // present via CPUID(0x8000_0007).EDX[7].
+            unsafe {
+                wrmsr(MSR_AMD_PSTATE_LIMIT, 0);
+            }
+        }
+        _ => {} // No-op for SpeedStep / None.
+    }
+}
+
+/// Decoded P-state definition register entry (AMD BKDG §2.1.10
+/// PStateDef). `enabled = false` means the slot is reserved /
+/// unused; the platform exposes `defined` slots out of 8 max.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AmdPstateDef {
+    /// True iff `PstateEn` (bit 63) is set.
+    pub enabled: bool,
+    /// Decoded core frequency in MHz. Computed from `CpuFid` /
+    /// `CpuDfsId` per Family 17h+ encoding (Family 15h is similar
+    /// but with different scale; we render Family 17h+ which is
+    /// what Zen2/Zen3/Zen4 — the bringup target — uses).
+    pub mhz: u32,
+}
+
+/// Summary of the AMD P-state def table for boot-time logging.
+/// `defined` is the number of `PstateEn=1` slots (1..=8); the
+/// `formatted_freqs` string is built lazily from those slots so
+/// the boot log doesn't need to format inside an `unsafe { rdmsr }`.
+#[derive(Clone, Debug)]
+pub struct AmdPstateSummary {
+    pub defined: u8,
+    pub formatted_freqs: alloc::string::String,
+}
+
+/// Walk `MSR_AMD_PSTATE_DEF_0..7` and return how many slots are
+/// enabled + a `"3500/3000/2200 MHz"`-style display string for the
+/// boot log.
+///
+/// AMD BKDG §2.1.10 PStateDef (Family 17h+ encoding):
+///   bits[7:0]   CpuFid    — core frequency multiplier
+///   bits[13:8]  CpuDfsId  — divisor (8..=63)
+///   bit [63]    PstateEn
+///
+/// Frequency = `(CpuFid * 200) / (CpuDfsId / 8)` MHz (BKDG eq.).
+/// The result is integer-rounded. Slots with `PstateEn=0` are
+/// skipped + don't count toward `defined`.
+pub fn amd_pstate_summary() -> AmdPstateSummary {
+    if !matches!(detect(), Mechanism::AmdLegacy) {
+        return AmdPstateSummary {
+            defined: 0,
+            formatted_freqs: alloc::string::String::new(),
+        };
+    }
+    use alloc::string::String;
+    use core::fmt::Write as _;
+    let mut out = String::new();
+    let mut defined = 0u8;
+    for i in 0..8u8 {
+        // SAFETY: CPL=0, AMD HwPstate confirmed; the def MSRs are
+        // read-only and reading any unimplemented index returns 0
+        // (PstateEn=0) without GP-fault on Family 10h+.
+        let v = unsafe { rdmsr(MSR_AMD_PSTATE_DEF_0 + i as u32) };
+        if v >> 63 == 0 {
+            continue;
+        }
+        let cpu_fid = (v & 0xFF) as u32;
+        let cpu_dfs_id = ((v >> 8) & 0x3F) as u32;
+        // Avoid divide-by-zero on a malformed slot.
+        if cpu_dfs_id == 0 {
+            continue;
+        }
+        let mhz = (cpu_fid * 200 * 8) / cpu_dfs_id;
+        if !out.is_empty() {
+            out.push('/');
+        }
+        let _ = write!(&mut out, "{}", mhz);
+        defined += 1;
+    }
+    if !out.is_empty() {
+        out.push_str(" MHz");
+    }
+    AmdPstateSummary {
+        defined,
+        formatted_freqs: out,
     }
 }
 
