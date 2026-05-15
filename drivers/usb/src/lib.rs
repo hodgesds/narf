@@ -143,7 +143,13 @@ fn spawn_supervisor_task() {
                 // and back-to-back resets disturb the device. The
                 // alternate-class interface gets retried next tick if
                 // still unclaimed.
-                if claimed_mouse & bit == 0
+                // Only attempt mouse if NOTHING is claimed on this
+                // port yet (kbd or mouse) — a port hosts at most one
+                // logical HID device. Trying mouse on a port already
+                // bound to a kbd's slot triggers Address Device with
+                // TRB_ERROR "port already assigned".
+                if claimed_kbd & bit == 0
+                    && claimed_mouse & bit == 0
                     && tried_this_cycle & bit == 0
                     && mouse_fail_count[pi] < MAX_PER_PORT_RETRIES
                 {
@@ -161,8 +167,19 @@ fn spawn_supervisor_task() {
             }
             let _ = xhci::with_controller(|c| hid::pump_all(c));
             let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
+            // Wake on either:
+            //   (a) the next xHCI IRQ — a Transfer Event for a bound
+            //       endpoint or a Port Status Change Event (hot-plug),
+            //   (b) a 100 ms wall-clock timeout — re-tries enumeration
+            //       on unattached ports + handles the case where IRQs
+            //       never fire (no MSI-X / device that never sends).
+            // The IRQ-only wait left the supervisor parked forever
+            // when the first attach attempt on a port failed (no slot,
+            // no armed TRB, no IRQ source) — so the second-try kbd
+            // path or the kbd-failed → mouse-fallback path never ran.
             if let Some(v) = irq_vector {
-                let _ = narf_interrupts::wait_for_irq(v).await;
+                let deadline = narf_time::Deadline::after_ms(100);
+                let _ = narf_interrupts::wait_for_irq_until(v, deadline).await;
             } else {
                 narf_time::sleep_cycles(PUMP_CYCLES).await;
             }

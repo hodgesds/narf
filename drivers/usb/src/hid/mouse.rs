@@ -262,7 +262,22 @@ pub fn enumerate_and_attach_mice(xhci_dev: &Xhci) -> usize {
 /// Public per-port attach used by the supervisor's per-port
 /// retry loop. Same shape as the keyboard variant.
 pub fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    try_attach_port(xhci_dev, port)
+    let r = try_attach_port(xhci_dev, port);
+    if r.is_ok() {
+        use core::fmt::Write as _;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static ATTACHED_PORTS: AtomicU64 = AtomicU64::new(0);
+        let bit = 1u64 << (port as u32 & 63);
+        let prev = ATTACHED_PORTS.fetch_or(bit, Ordering::AcqRel);
+        if prev & bit == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-hid: mouse attached on port {}",
+                port
+            );
+        }
+    }
+    r
 }
 
 fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
