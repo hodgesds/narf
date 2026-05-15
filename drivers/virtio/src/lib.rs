@@ -86,6 +86,39 @@ pub fn register_initcalls() {
         console_pci::register_pci_driver();
         InitResult::Ok
     });
+    // Stage::Late so it runs after pci-probe-all has bound any
+    // virtio-keyboard / virtio-tablet / virtio-mouse devices. The
+    // pump task drains every bound virtio-input device's eventQ on
+    // a 16 ms cadence, pushing translated KeyEvent / PointerEvent
+    // items onto the global narf_input ring. Without this the GTK
+    // QEMU window's keyboard input lands in the device queue but
+    // never reaches the kernel.
+    narf_init::register(Stage::Late, "virtio-input-pump", || {
+        if !input_pci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        spawn_input_pump_task();
+        InitResult::Ok
+    });
+}
+
+/// Spawn the long-running virtio-input drain task. Walks every bound
+/// `VirtioInputPci` instance every 16 ms (≈ HID `bInterval` cadence)
+/// and pushes consumed event-queue entries through to
+/// `narf_input::push_global` — so the GTK keyboard / virtio-tablet
+/// pointer input lands on the same input ring the USB-HID supervisor
+/// uses.
+fn spawn_input_pump_task() {
+    narf_scheduler::spawn(async {
+        // 16 ms in TSC cycles at the typical 3.3 GHz ballpark
+        // (53 Mcyc). Auto-scales: it's a soft cadence — sleep_cycles
+        // doesn't need to land at exactly 16 ms.
+        const PUMP_CYCLES: u64 = 53_000_000;
+        loop {
+            let _ = input_pci::with_controller(|c| c.drain_events());
+            narf_time::sleep_cycles(PUMP_CYCLES).await;
+        }
+    });
 }
 
 use alloc::boxed::Box;
