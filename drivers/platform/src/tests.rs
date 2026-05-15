@@ -316,6 +316,25 @@ kernel_test_in!(
     smoke_backlight_cap_revocation_blocks_set_percent
 );
 
+// ── Battery (AML-driven) ───────────────────────────────────────────
+
+fn smoke_battery_init_walks_aml_namespace_without_panic() -> TestResult {
+    // Smoke: `battery::init()` must complete without panic on a
+    // namespace that may or may not contain PNP0C0A devices.
+    // Under QEMU's stock DSDT there's no battery, so the walk
+    // returns an empty vec and `init()` is a no-op. Locks down
+    // the contract that init handles "no batteries" gracefully —
+    // important because every real laptop boot calls init() and
+    // a regression would crash the bring-up before the FB
+    // status panel paints.
+    crate::battery::init();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/battery",
+    smoke_battery_init_walks_aml_namespace_without_panic
+);
+
 // ── TPM ────────────────────────────────────────────────────────────
 
 fn smoke_tpm_init_default() -> TestResult {
