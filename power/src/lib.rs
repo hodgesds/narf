@@ -96,6 +96,25 @@ pub fn register_initcalls() {
     // freshly-booted narf laptop runs cool but slow.
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "cpu-pstate", || {
+        // CPPC supersedes legacy AMD HwPstate on Zen2+ and gives
+        // finer-grained EPP control. Prefer it when the core
+        // advertises support; fall back to whatever `pstate::detect`
+        // picked otherwise.
+        if cppc::supported() {
+            // SAFETY: CPL=0 boot context; gated by `supported()`.
+            let caps = unsafe { cppc::init() };
+            if let Some(caps) = caps {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  cpu-pstate: AMD CPPC enabled (highest={} nominal={} lownl={} lowest={} EPP=balanced)",
+                    caps.highest_perf(),
+                    caps.nominal_perf(),
+                    caps.lowest_nonlinear_perf(),
+                    caps.lowest_perf()
+                );
+                return InitResult::Ok;
+            }
+        }
         let m = pstate::detect();
         // SAFETY: CPL=0 boot context; init is idempotent + only
         // touches MSRs the detected mechanism advertises support

@@ -136,3 +136,91 @@ pub mod epp {
     pub const BALANCED_POWER: u8 = 0x80;
     pub const POWERSAVE: u8 = 0xFF;
 }
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::*;
+    use narf_arch::x86_64::cpuid::cpuid;
+    use narf_arch::x86_64::msr::{rdmsr, wrmsr};
+
+    /// AMD APM Vol 2 §17 / PPR: `CPUID(0x8000_0008).EBX[27] = CPPC`.
+    /// Set when the core implements the CPPC MSRs at
+    /// 0xC001_0294..0xC001_0298. Distinct from the legacy HwPstate
+    /// bit (`CPUID(0x8000_0007).EDX[7]`) — Zen2+ parts typically
+    /// expose both, in which case we prefer CPPC for finer-grained
+    /// EPP control.
+    pub fn supported() -> bool {
+        // SAFETY: extended-leaf cpuid; bounded by the max-extended check.
+        let (max, _, _, _) = unsafe { cpuid(0x8000_0000, 0) };
+        if max < 0x8000_0008 {
+            return false;
+        }
+        let (_, ebx, _, _) = unsafe { cpuid(0x8000_0008, 0) };
+        ebx & (1 << 27) != 0
+    }
+
+    /// Read `MSR_AMD_CPPC_CAP1`. Caller must have verified `supported()`.
+    ///
+    /// # Safety
+    /// CPL = 0; CPPC supported on this core.
+    pub unsafe fn read_cap1() -> Cap1 {
+        // SAFETY: caller-asserted.
+        Cap1(unsafe { rdmsr(MSR_AMD_CPPC_CAP1) })
+    }
+
+    /// Set the master CPPC enable bit. Sticky — once set the MSR
+    /// can't be cleared without a reset.
+    ///
+    /// # Safety
+    /// CPL = 0; CPPC supported on this core.
+    pub unsafe fn enable() {
+        // SAFETY: caller-asserted.
+        unsafe {
+            wrmsr(MSR_AMD_CPPC_ENABLE, ENABLE_BIT);
+        }
+    }
+
+    /// Program `MSR_AMD_CPPC_REQ` from a built `Request`.
+    ///
+    /// # Safety
+    /// CPL = 0; CPPC enabled on this core.
+    pub unsafe fn write_request(req: Request) {
+        // SAFETY: caller-asserted.
+        unsafe {
+            wrmsr(MSR_AMD_CPPC_REQ, req.0);
+        }
+    }
+
+    /// Boot-time bring-up: if CPPC is supported, enable it and
+    /// program a "use the full perf range, balanced EPP" request so
+    /// the firmware governor is allowed to climb to highest_perf.
+    /// Returns `Some(cap1)` when programmed, `None` otherwise.
+    ///
+    /// # Safety
+    /// CPL = 0, boot context.
+    pub unsafe fn init() -> Option<Cap1> {
+        if !supported() {
+            return None;
+        }
+        // SAFETY: gated by `supported()`.
+        unsafe {
+            enable();
+        }
+        // SAFETY: same.
+        let caps = unsafe { read_cap1() };
+        let req = Request::build(
+            caps.lowest_perf(),
+            caps.highest_perf(),
+            /*desired*/ 0,
+            epp::BALANCED_PERFORMANCE,
+        );
+        // SAFETY: same; ENABLE_BIT was set above.
+        unsafe {
+            write_request(req);
+        }
+        Some(caps)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use x86::{enable, init, read_cap1, supported, write_request};

@@ -600,6 +600,25 @@ kernel_test_in!("power/cppc", smoke_cppc_cap1_field_layout);
 
 
 
+#[cfg(target_arch = "x86_64")]
+
+fn smoke_cppc_supported_query_does_not_fault() -> TestResult {
+
+    // `cppc::supported()` must be safe to call on any host —
+    // CPUID-only, no MSR access. This pins down the contract that
+    // detection is GP-fault-safe before the boot path queries it.
+    let _ = crate::cppc::supported();
+
+    TestResult::Pass
+
+}
+
+#[cfg(target_arch = "x86_64")]
+
+kernel_test_in!("power/cppc", smoke_cppc_supported_query_does_not_fault);
+
+
+
 // ── CPU power syscall bridge ──────────────────────────────────────
 
 
