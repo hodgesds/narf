@@ -770,6 +770,17 @@ impl MountNamespace {
         let q = self.inner.lock();
         q.iter().map(|m| m.path.clone()).collect()
     }
+
+    /// List `(mount_path, fs_name)` for every mount. Used by
+    /// `/proc/mounts` + `/proc/filesystems` so the synthetic FS can
+    /// surface the per-mount FsInstance name without exposing the
+    /// internal `Mount` shape.
+    pub fn list_with_names(&self) -> Vec<(String, String)> {
+        let q = self.inner.lock();
+        q.iter()
+            .map(|m| (m.path.clone(), String::from(m.fs.name())))
+            .collect()
+    }
 }
 
 /// Bootstrap the mount-authority cap. TCB-only path — the kernel
@@ -901,6 +912,19 @@ impl VfsRegistry {
     pub fn list(&self) -> alloc::vec::Vec<alloc::string::String> {
         let q = self.inner.lock();
         q.iter().map(|m| m.path.clone()).collect()
+    }
+
+    /// List `(mount_path, fs_name)` for every mount. Used by
+    /// `/proc/mounts` + `/proc/filesystems` so the synthetic FS can
+    /// surface the per-mount FsInstance name without exposing the
+    /// internal `Mount` shape.
+    pub fn list_with_names(
+        &self,
+    ) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+        let q = self.inner.lock();
+        q.iter()
+            .map(|m| (m.path.clone(), alloc::string::String::from(m.fs.name())))
+            .collect()
     }
 
     /// Unmount the FS at `path`. The `handle` cap must be live and

@@ -299,6 +299,10 @@ impl DirOps for ProcRoot {
             "mounts" => Some(Arc::new(ProcStaticFile { name: "mounts", gen: gen_mounts })),
             "uptime" => Some(Arc::new(ProcStaticFile { name: "uptime", gen: gen_uptime })),
             "version" => Some(Arc::new(ProcStaticFile { name: "version", gen: gen_version })),
+            "cmdline" => Some(Arc::new(ProcStaticFile { name: "cmdline", gen: gen_cmdline })),
+            "loadavg" => Some(Arc::new(ProcStaticFile { name: "loadavg", gen: gen_loadavg })),
+            "filesystems" => Some(Arc::new(ProcStaticFile { name: "filesystems", gen: gen_filesystems })),
+            "partitions" => Some(Arc::new(ProcStaticFile { name: "partitions", gen: gen_partitions })),
             "self" => Some(Arc::new(ProcDirMarker)),
             _ => {
                 // Numeric pid → directory marker (lookup-as-file).
@@ -342,6 +346,10 @@ impl DirOps for ProcRoot {
             DirEntry { name: "mounts", file_type: FileType::File },
             DirEntry { name: "uptime", file_type: FileType::File },
             DirEntry { name: "version", file_type: FileType::File },
+            DirEntry { name: "cmdline", file_type: FileType::File },
+            DirEntry { name: "loadavg", file_type: FileType::File },
+            DirEntry { name: "filesystems", file_type: FileType::File },
+            DirEntry { name: "partitions", file_type: FileType::File },
             DirEntry { name: "self", file_type: FileType::Dir },
         ];
         for pid in list_pids() {
@@ -416,22 +424,87 @@ fn gen_cpuinfo() -> String {
 }
 
 fn gen_meminfo() -> String {
+    use core::fmt::Write as _;
+    let stats = narf_memory::frame::stats();
+    // Frames are 4 KiB on every arch we target.
+    let total_kb = stats.total * 4;
+    let free_kb = stats.free * 4;
+    let reserved_kb = stats.reserved * 4;
     let mut s = String::new();
-    s.push_str("MemTotal:        32768 kB\n");
-    s.push_str("MemFree:         16384 kB\n");
-    s.push_str("MemAvailable:    16384 kB\n");
-    s.push_str("Buffers:             0 kB\n");
-    s.push_str("Cached:              0 kB\n");
+    let _ = writeln!(s, "MemTotal:     {:>10} kB", total_kb);
+    let _ = writeln!(s, "MemFree:      {:>10} kB", free_kb);
+    // Without page-cache + slab accounting separated out we can't
+    // distinguish "available" from "free"; report the same value
+    // so the standard `free` math (`available = MemAvailable`)
+    // still produces a meaningful number.
+    let _ = writeln!(s, "MemAvailable: {:>10} kB", free_kb);
+    let _ = writeln!(s, "Buffers:      {:>10} kB", 0);
+    let _ = writeln!(s, "Cached:       {:>10} kB", 0);
+    let _ = writeln!(s, "Reserved:     {:>10} kB", reserved_kb);
     s
 }
 
 fn gen_mounts() -> String {
     let mut s = String::new();
-    for path in crate::registry().list() {
+    for (path, fs_name) in crate::registry().list_with_names() {
         let _ = core::fmt::Write::write_fmt(
             &mut s,
-            format_args!("none {} narfs rw 0 0\n", path),
+            format_args!("none {} {} rw 0 0\n", path, fs_name),
         );
+    }
+    s
+}
+
+fn gen_cmdline() -> String {
+    let mut s = String::from(narf_boot::cmdline());
+    s.push('\n');
+    s
+}
+
+fn gen_loadavg() -> String {
+    // Linux format: "0.00 0.00 0.00 1/1 1\n"
+    //   1/5/15-min averages | runnable/total | last_pid
+    // We don't track EWMA averages today; report the same
+    // instantaneous total task count for all three slots so the
+    // standard parsers (`uptime`, `top`, `glibc::getloadavg`)
+    // produce a meaningful number rather than zeros. last_pid is
+    // approximated by the number of live tasks.
+    let n = narf_scheduler::all_task_ids().len();
+    format!("{n}.00 {n}.00 {n}.00 {n}/{n} {n}\n")
+}
+
+fn gen_filesystems() -> String {
+    use alloc::collections::BTreeSet;
+    use core::fmt::Write as _;
+    // Distinct fs.name() values from currently-mounted instances.
+    // Linux's /proc/filesystems prefixes "nodev" for FS types that
+    // can't back a block device; our mount surface doesn't track
+    // that today, so omit the prefix — bare `mount` (no -t) only
+    // checks for the FS-type token.
+    let names: BTreeSet<String> = crate::registry()
+        .list_with_names()
+        .into_iter()
+        .map(|(_p, n)| n)
+        .collect();
+    let mut s = String::new();
+    for n in names {
+        let _ = writeln!(s, "\t{}", n);
+    }
+    s
+}
+
+fn gen_partitions() -> String {
+    use core::fmt::Write as _;
+    // Linux format:
+    //   major minor  #blocks  name
+    // We don't have a major/minor allocator (no devnode space yet),
+    // so report 0/N for major and the registry index for minor.
+    // #blocks is capacity_kb, derived from capacity * lba_size.
+    let mut s = String::from("major minor  #blocks  name\n");
+    for (i, dev) in narf_block::block_devices().iter().enumerate() {
+        let bytes = dev.dev.capacity().saturating_mul(dev.dev.lba_size() as u64);
+        let kb = bytes / 1024;
+        let _ = writeln!(s, "    0  {:>4}  {:>10}  {}", i, kb, dev.name);
     }
     s
 }
