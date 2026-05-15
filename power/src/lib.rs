@@ -83,6 +83,26 @@ pub fn list_sources() -> Vec<Arc<dyn PowerSource>> {
     SOURCES.lock().clone()
 }
 
+// ── CPU status line for diagnostic surfaces ────────────────────────
+//
+// One-shot summary of the active P-state mechanism so the FB
+// status panel + any future `/proc/cpuinfo`-style surface can
+// render a single line ("CPU: CPPC 24..255 (nom 102, EPP
+// balanced)") without re-reading MSRs. Set once by the
+// cpu-pstate Stage::Subsys initcall; readers see whatever the
+// initcall last wrote.
+
+static CPU_STATUS_LINE: IrqSafeSpinLock<Option<alloc::string::String>> =
+    IrqSafeSpinLock::new(None);
+
+pub fn set_cpu_status_line(line: alloc::string::String) {
+    *CPU_STATUS_LINE.lock() = Some(line);
+}
+
+pub fn cpu_status_line() -> Option<alloc::string::String> {
+    CPU_STATUS_LINE.lock().clone()
+}
+
 /// Force-link hook.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
@@ -104,14 +124,14 @@ pub fn register_initcalls() {
             // SAFETY: CPL=0 boot context; gated by `supported()`.
             let caps = unsafe { cppc::init() };
             if let Some(caps) = caps {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  cpu-pstate: AMD CPPC enabled (highest={} nominal={} lownl={} lowest={} EPP=balanced)",
+                let line = alloc::format!(
+                    "CPU: CPPC {}..{} (nom {}, EPP balanced)",
+                    caps.lowest_perf(),
                     caps.highest_perf(),
                     caps.nominal_perf(),
-                    caps.lowest_nonlinear_perf(),
-                    caps.lowest_perf()
                 );
+                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
+                set_cpu_status_line(line);
                 return InitResult::Ok;
             }
         }
@@ -124,30 +144,34 @@ pub fn register_initcalls() {
             pstate::Mechanism::Hwp => {
                 // SAFETY: HWP support gated by detect.
                 let caps = unsafe { pstate::hwp_capabilities() };
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  cpu-pstate: HWP enabled (max={} guaranteed={} efficient={} min={})",
-                    caps.max_perf, caps.guaranteed_perf, caps.efficient_perf, caps.min_perf
+                let line = alloc::format!(
+                    "CPU: HWP {}..{} (gtd {}, eff {})",
+                    caps.min_perf, caps.max_perf, caps.guaranteed_perf, caps.efficient_perf
                 );
+                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
+                set_cpu_status_line(line);
                 InitResult::Ok
             }
             pstate::Mechanism::SpeedStep => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  cpu-pstate: legacy SpeedStep available; firmware default left in place"
-                );
+                let line = alloc::string::String::from("CPU: SpeedStep (firmware default)");
+                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
+                set_cpu_status_line(line);
                 InitResult::Ok
             }
             pstate::Mechanism::AmdLegacy => {
                 let summary = pstate::amd_pstate_summary();
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  cpu-pstate: AMD HwPstate enabled; {} defined ({})",
+                let line = alloc::format!(
+                    "CPU: HwPstate {} slots ({})",
                     summary.defined, summary.formatted_freqs
                 );
+                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
+                set_cpu_status_line(line);
                 InitResult::Ok
             }
-            pstate::Mechanism::None => InitResult::NotPresent,
+            pstate::Mechanism::None => {
+                set_cpu_status_line(alloc::string::String::from("CPU: pstate n/a"));
+                InitResult::NotPresent
+            }
         }
     });
     narf_init::register(Stage::Late, "power-monitor", || {

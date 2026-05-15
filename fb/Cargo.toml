@@ -31,6 +31,7 @@ narf-drivers-gpio = { path = "../drivers/gpio" }
 narf-drivers-usb  = { path = "../drivers/usb" }
 narf-console      = { path = "../console" }
 narf-aml          = { path = "../aml" }
+narf-power        = { path = "../power" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]

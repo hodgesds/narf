@@ -35,7 +35,7 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 4;
+const HEADER_LINES: u32 = 5;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -123,8 +123,15 @@ pub fn paint(fb: &FbWriter) {
         )
     };
 
+    // CPU power/freq mechanism — set by `power::register_initcalls`'
+    // `cpu-pstate` initcall. Falls back to a placeholder if the
+    // initcall hasn't run yet (test harness, aarch64, etc.).
+    let cpu_line = narf_power::cpu_status_line()
+        .unwrap_or_else(|| alloc::string::String::from("CPU: pstate (not initialised)"));
+
     let header = [
         fb_line.as_str(),
+        cpu_line.as_str(),
         dev_line.as_str(),
         cursor_line.as_str(),
         i8042_diag.as_str(),
