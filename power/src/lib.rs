@@ -116,62 +116,41 @@ pub fn register_initcalls() {
     // freshly-booted narf laptop runs cool but slow.
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "cpu-pstate", || {
-        // CPPC supersedes legacy AMD HwPstate on Zen2+ and gives
-        // finer-grained EPP control. Prefer it when the core
-        // advertises support; fall back to whatever `pstate::detect`
-        // picked otherwise.
-        if cppc::supported() {
-            // SAFETY: CPL=0 boot context; gated by `supported()`.
-            let caps = unsafe { cppc::init() };
-            if let Some(caps) = caps {
-                let line = alloc::format!(
-                    "CPU: CPPC {}..{} (nom {}, EPP balanced)",
-                    caps.lowest_perf(),
-                    caps.highest_perf(),
-                    caps.nominal_perf(),
-                );
-                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
-                set_cpu_status_line(line);
-                return InitResult::Ok;
+        // Detection-only path. Writing MSR_AMD_CPPC_ENABLE /
+        // MSR_AMD_CPPC_REQ / MSR_AMD_PSTATE_LIMIT on real Zen2
+        // silicon hung boot at this initcall on the bring-up
+        // laptop — BIOS likely locks the CPPC MSRs or expects a
+        // pre-enable handshake we're skipping. Until the trap
+        // path can recover from #GP on a wrmsr we limit this
+        // initcall to CPUID-only detection + the diagnostic
+        // status line. Re-enabling the MSR writes requires per-
+        // mechanism guards verified on real silicon.
+        let cppc_supported = cppc::supported();
+        let mech = pstate::detect();
+        let line = if cppc_supported {
+            alloc::string::String::from("CPU: CPPC supported (writes disabled)")
+        } else {
+            match mech {
+                pstate::Mechanism::Hwp => {
+                    alloc::string::String::from("CPU: HWP supported (writes disabled)")
+                }
+                pstate::Mechanism::SpeedStep => {
+                    alloc::string::String::from("CPU: SpeedStep (firmware default)")
+                }
+                pstate::Mechanism::AmdLegacy => {
+                    alloc::string::String::from("CPU: AMD HwPstate (firmware default)")
+                }
+                pstate::Mechanism::None => {
+                    alloc::string::String::from("CPU: pstate n/a")
+                }
             }
-        }
-        let m = pstate::detect();
-        // SAFETY: CPL=0 boot context; init is idempotent + only
-        // touches MSRs the detected mechanism advertises support
-        // for via CPUID.
-        unsafe { pstate::init() };
-        match m {
-            pstate::Mechanism::Hwp => {
-                // SAFETY: HWP support gated by detect.
-                let caps = unsafe { pstate::hwp_capabilities() };
-                let line = alloc::format!(
-                    "CPU: HWP {}..{} (gtd {}, eff {})",
-                    caps.min_perf, caps.max_perf, caps.guaranteed_perf, caps.efficient_perf
-                );
-                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
-                set_cpu_status_line(line);
-                InitResult::Ok
-            }
-            pstate::Mechanism::SpeedStep => {
-                let line = alloc::string::String::from("CPU: SpeedStep (firmware default)");
-                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
-                set_cpu_status_line(line);
-                InitResult::Ok
-            }
-            pstate::Mechanism::AmdLegacy => {
-                let summary = pstate::amd_pstate_summary();
-                let line = alloc::format!(
-                    "CPU: HwPstate {} slots ({})",
-                    summary.defined, summary.formatted_freqs
-                );
-                let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
-                set_cpu_status_line(line);
-                InitResult::Ok
-            }
-            pstate::Mechanism::None => {
-                set_cpu_status_line(alloc::string::String::from("CPU: pstate n/a"));
-                InitResult::NotPresent
-            }
+        };
+        let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
+        set_cpu_status_line(line);
+        if cppc_supported || !matches!(mech, pstate::Mechanism::None) {
+            InitResult::Ok
+        } else {
+            InitResult::NotPresent
         }
     });
     narf_init::register(Stage::Late, "power-monitor", || {
