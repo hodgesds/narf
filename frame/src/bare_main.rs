@@ -2313,35 +2313,43 @@ fn boot_userspace_init() {
 
     // Register a scheduler-step pump so the cooperative executor
     // keeps draining its run-queue while a user task is parked in
-    // `sys_sleep`. Without this, the busy-wait loop in `sys_sleep`
-    // owns the only CPU for the entire deadline — every other
-    // kernel async task (FB drain, USB HID supervisor, the
-    // boot-time async demo, future device pumps) starves until the
-    // sleeper resumes, which in turn means the sleeper's own puts
-    // / writes never reach the console because nothing else can
-    // poll the IRQ-driven console writer's drain. Matches the
-    // pattern `fb-drain-task` already uses for the framebuffer
-    // command ring. Cheap: one extra fn-pointer call per spin
-    // iteration.
+    // `sys_sleep` or while a sync driver path is busy-waiting
+    // inside `responsive_spin_until`. Without this, kernel async
+    // tasks that don't have their own dedicated sleep_pump (USB-HID
+    // supervisor, virtio-input pump, TCPM task, ...) stop making
+    // forward progress during long busy-waits, so e.g. typing
+    // through a USB-kbd into a userspace `sleep 5` would have keys
+    // queued in the kbd report ring but never drained because the
+    // supervisor task wasn't polled.
+    //
+    // Re-entrancy: `poll_one_round` re-enters here every time the
+    // task it polls calls into a sync path that ticks sleep_pumps.
+    // A per-CPU recursion guard breaks the chain — only the
+    // outermost call drives `poll_one_round`; nested calls see
+    // the flag set and skip. The skip is correct because the
+    // outermost call is already round-robining tasks; nested
+    // calls would just visit the same queue position twice.
     fn scheduler_step_pump() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        // Per-CPU "currently inside scheduler_step_pump" flag.
+        // SMP scaling: BSP only for now (boot-init runs on the
+        // BSP); when AP-side run_forever loops also call into
+        // sleep_pumps the flag should be promoted to a per-CPU
+        // array. Guarding only the BSP is safe because nested
+        // sync waits on APs can still tick sleep_pumps without
+        // reaching this fn — they fire OTHER pumps (FB drain,
+        // cursor) but skip the scheduler step.
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        if IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let _ = narf_scheduler::poll_one_round();
+        IN_FLIGHT.store(false, Ordering::Release);
     }
-    // KNOWN ISSUE: registering this sleep_pump hangs boot-init —
-    // when run_until_empty polls tid=1 (DrainTask), the poll
-    // body's responsive_spin_until ticks sleep_pumps which
-    // recursively re-enters poll_one_round. The first poll of
-    // tid=1 never returns. Re-entrancy guards (AtomicBool flag
-    // around the poll_one_round call) DON'T fix it — the
-    // problem isn't the guard's recursion, it's something
-    // about poll_one_round running from inside a poll body
-    // that the boot-init path can't tolerate. Tracked as a
-    // separate investigation; the trade-off is that sys_sleep
-    // busy-waits no longer round-robin other kernel async
-    // tasks (FB drain still runs via fb_drain_pump, cursor
-    // pump still runs via cursor::sleep_pump_tick — those have
-    // their own dedicated sleep_pumps).
-    // narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
-    let _ = scheduler_step_pump;
+    narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
 
     // Drain any RX bytes the platform UART has queued (typed bytes
     // via `qemu -serial stdio`, or a real serial console on bare
