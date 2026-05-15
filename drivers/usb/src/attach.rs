@@ -305,5 +305,71 @@ fn dispatch_after_address(
     // (same shape as the existing root-hub path with kbd_fail_count
     // → mouse fallback). This keeps the recursion logic simple.
     let _ = mouse::try_bind_mouse_already_addressed; // silences unused
+
+    // UnknownClass: log what we DID see at the interface level so a
+    // future class-driver pass can prioritise. Reading the config
+    // descriptor here is cheap (the slot is still addressed) and
+    // surfaces the class triple of every interface in the log.
+    log_unknown_device_classes(xhci_dev, slot_id, port);
     AttachOutcome::UnknownClass
+}
+
+/// Walk the device's configuration descriptor and log the
+/// (class, subclass, protocol) triple of every interface descriptor.
+/// Useful for "what's on this port that we don't recognise" diagnosis
+/// on real hardware. Quiet on failure — the device is being given up
+/// on regardless.
+fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
+    use core::fmt::Write as _;
+    let mut head = [0u8; 9];
+    if xhci_dev.get_config_descriptor(slot_id, 0, &mut head).is_err() {
+        return;
+    }
+    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+    if !(9..=4096).contains(&total) {
+        return;
+    }
+    let mut full = alloc::vec![0u8; total];
+    let n = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    if n < total {
+        full.truncate(n);
+    }
+    // USB 2.0 §9.6.5: Interface Descriptor is 9 bytes, type=4.
+    // bInterfaceClass at +5, bSubClass at +6, bProtocol at +7.
+    let mut i = 0usize;
+    while i + 2 <= full.len() {
+        let len = full[i] as usize;
+        if len < 2 || i + len > full.len() {
+            break;
+        }
+        if full[i + 1] == 4 && len >= 9 {
+            let cls = full[i + 5];
+            let sub = full[i + 6];
+            let prot = full[i + 7];
+            let s = match (cls, sub) {
+                (0x03, _) => "HID",
+                (0x08, _) => "Mass-Storage",
+                (0x09, _) => "Hub",
+                (0x0A, _) => "CDC-Data",
+                (0x02, _) => "CDC-Comms",
+                (0x0E, 0x01) => "UVC-VideoControl",
+                (0x0E, 0x02) => "UVC-VideoStreaming",
+                (0x0E, _) => "Video",
+                (0x01, _) => "Audio",
+                (0xE0, 0x01) => "USB-Bluetooth",
+                (0xFE, 0x01) => "DFU",
+                (0xFF, _) => "Vendor",
+                _ => "?",
+            };
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-attach: port={} slot={} unknown class {:02x}/{:02x}/{:02x} ({})",
+                port, slot_id, cls, sub, prot, s
+            );
+        }
+        i += len;
+    }
 }

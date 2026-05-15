@@ -112,11 +112,7 @@ fn probe_bus(bus: &Arc<dyn narf_drivers_i2c::I2cBus>) -> usize {
             bus_name, id
         );
         let chip: Arc<dyn Tcpc> = Arc::new(fusb);
-        PORTS.lock().push(PortBinding {
-            bus_name: bus_name.into(),
-            i2c_addr: fusb302::FUSB302_DEFAULT_I2C_ADDR,
-            tcpc: chip,
-        });
+        register_port(bus_name, fusb302::FUSB302_DEFAULT_I2C_ADDR, chip);
         n += 1;
     }
 
@@ -129,15 +125,110 @@ fn probe_bus(bus: &Arc<dyn narf_drivers_i2c::I2cBus>) -> usize {
             bus_name, vendor, device
         );
         let chip: Arc<dyn Tcpc> = Arc::new(tps);
-        PORTS.lock().push(PortBinding {
-            bus_name: bus_name.into(),
-            i2c_addr: tps65987::TPS65987_DEFAULT_I2C_ADDR,
-            tcpc: chip,
-        });
+        register_port(bus_name, tps65987::TPS65987_DEFAULT_I2C_ADDR, chip);
         n += 1;
     }
 
     n
+}
+
+/// Park a detected TCPC in [`PORTS`] + spawn its TCPM sink-role
+/// task. The task drives `SinkPort::step` until it reports
+/// `StepOutcome::Ready`, logs the negotiated contract, then settles
+/// into the steady-state poll loop.
+fn register_port(bus_name: &str, i2c_addr: u8, tcpc: Arc<dyn Tcpc>) {
+    use narf_usbpd::tcpm::SinkPort;
+    let sink = Arc::new(SinkPort::new(tcpc.clone()));
+    PORTS.lock().push(PortBinding {
+        bus_name: bus_name.into(),
+        i2c_addr,
+        tcpc,
+    });
+    spawn_sink_task(sink, alloc::format!("{}@0x{:02x}", bus_name, i2c_addr));
+}
+
+/// Spawn an async task that drives one TCPM sink-role state machine
+/// to a Ready contract + keeps it alive across HardResets. Cadence
+/// derived from USB-PD 3.1 §8.3 + §6.6.1: short between Advanced
+/// steps (yield only), 25 ms while Idle (matches
+/// tTypeCSinkWaitCap minimum observation), 100 ms once Ready.
+fn spawn_sink_task(sink: Arc<narf_usbpd::tcpm::SinkPort>, label: alloc::string::String) {
+    use core::fmt::Write as _;
+    use narf_usbpd::tcpm::{SinkState, StepOutcome};
+    narf_scheduler::spawn(async move {
+        // Mint the USB-PD authority cap once per task. Cap revoke
+        // surfaces as `SinkError::AuthorityRevoked` which exits
+        // the loop cleanly.
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let mut last_logged_state = SinkState::Unattached;
+        let mut announced_contract = false;
+        loop {
+            let outcome = match sink.step(&cap) {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  usbpd: {} step failed: {:?}",
+                        label, e
+                    );
+                    if matches!(e, narf_usbpd::tcpm::SinkError::AuthorityRevoked) {
+                        return;
+                    }
+                    // Other errors: back off + retry. The state
+                    // machine itself handles HardReset transitions.
+                    narf_time::sleep_cycles(330_000_000).await;
+                    continue;
+                }
+            };
+            // Surface state transitions so a real-HW boot makes
+            // negotiation phases visible in the serial log.
+            if sink.state() != last_logged_state {
+                last_logged_state = sink.state();
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  usbpd: {} → {:?}",
+                    label, last_logged_state
+                );
+                // Reset contract-announcement flag on any state
+                // exit from Ready so a re-negotiation re-announces.
+                if last_logged_state != SinkState::Ready {
+                    announced_contract = false;
+                }
+            }
+            match outcome {
+                StepOutcome::Ready { contract } => {
+                    if !announced_contract {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  usbpd: {} contract: PDO#{} {} mV @ {} mA",
+                            label,
+                            contract.object_position,
+                            contract.voltage_mv,
+                            contract.op_current_ma
+                        );
+                        announced_contract = true;
+                    }
+                    // Steady-state poll cadence — long enough to
+                    // not flood the I²C bus, short enough to notice
+                    // a HardReset / source re-negotiation within
+                    // ~100 ms. 330 Mcycles ≈ 100 ms at 3.3 GHz TSC.
+                    narf_time::sleep_cycles(330_000_000).await;
+                }
+                StepOutcome::Idle(_) => {
+                    // 25 ms idle between Idle-state polls. PD 3.1
+                    // §6.6.1 tTypeCSinkWaitCap is 310-620 ms — we
+                    // poll faster so a CC change wakes us within
+                    // one tick. 82.5 Mcycles ≈ 25 ms at 3.3 GHz.
+                    narf_time::sleep_cycles(82_500_000).await;
+                }
+                StepOutcome::Advanced(_) => {
+                    // Don't sleep — back-to-back step() until the
+                    // state machine settles into Idle/Ready.
+                    narf_scheduler::yield_now().await;
+                }
+            }
+        }
+    });
 }
 
 /// Number of TCPC ports currently bound. Useful for tests +
