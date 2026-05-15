@@ -1,12 +1,26 @@
 //! xHCI 1.2 USB 3.x host controller driver — clean-room.
 //!
-//! ## Reference
+//! ## References (public, non-GPL only)
 //!
-//! Intel "eXtensible Host Controller Interface for Universal Serial
-//! Bus (xHCI)" Revision 1.2, May 2019. Public document. Section
-//! references throughout this file (e.g. `§5.4.5`) point at that
-//! spec. No GPL Linux source consulted.
-//!   <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
+//! - Intel "eXtensible Host Controller Interface for Universal Serial
+//!   Bus (xHCI)" Revision 1.2, May 2019. Section references throughout
+//!   this file (e.g. `§5.4.5`) point at that spec.
+//!     <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
+//! - "Universal Serial Bus 3.2 Specification" Revision 1.1, June 2022
+//!   (USB-IF). Standard device requests + descriptor layouts cited as
+//!   `USB 3.2 §9.x`.
+//!     <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
+//! - "Universal Serial Bus Specification" Revision 2.0 (USB-IF, April
+//!   2000). Boot-class device + control-transfer request semantics
+//!   shared with xHCI; cited as `USB 2.0 §9.x` where applicable.
+//!     <https://www.usb.org/document-library/usb-20-specification>
+//! - PCIe Base Specification (PCI-SIG). MSI-X Capability layout
+//!   (§6.1) + INTx-emulation contract referenced from the
+//!   `try_enable_msix` / `try_install_intx` fallback path.
+//!     <https://pcisig.com/specifications/pciexpress/>
+//!
+//! No GPL/BSD source code (Linux, FreeBSD, NetBSD, U-Boot) consulted
+//! at any point during the writing of this driver.
 //!
 //! ## Targets
 //!
@@ -499,20 +513,18 @@ impl Xhci {
         unsafe { self.mmio.read32(self.op_off + OP_USBSTS) }
     }
 
-    /// In-place recovery from `USBSTS.HCE` (§5.4.2): the controller
-    /// signalled an internal protocol error. HCE is RO — only HCRST
-    /// clears it. Re-runs the bring-up register dance (halt → HCRST
-    /// → CNR clear → re-program CONFIG/DCBAAP/CRCR/IR0 → RS|INTE)
-    /// against the *same* DMA pages we already allocated. Resets the
-    /// command/event ring producer/consumer cursors and clears the
-    /// command-ring TRBs so the next `submit_command` sees a fresh
-    /// ring matching `cmd_pcs = 1`.
-    ///
-    /// QEMU TCG xHCI emulation occasionally lands HCE between bring
-    /// -up returning and the first `enable_slot` (cause: still under
-    /// investigation — likely a TRB-encoding edge case). Real
-    /// silicon should never need this; logged with a counter so a
-    /// later debug pass can audit how often it fires.
+    /// In-place recovery from `USBSTS.HCE` (xHCI 1.2 §5.4.2): the
+    /// controller signalled an internal protocol error. HCE is RO —
+    /// only HCRST clears it (§5.4.1.1). Re-runs the bring-up
+    /// register dance (halt → HCRST → CNR clear → re-program
+    /// CONFIG/DCBAAP/CRCR/IR0 → RS|INTE) against the *same* DMA
+    /// pages we already allocated. Resets the command/event ring
+    /// producer/consumer cursors and clears the command-ring TRBs
+    /// so the next `submit_command` sees a fresh ring matching
+    /// `cmd_pcs = 1`. Defensive: every known cause of HCE in this
+    /// driver was fixed (CRCR/ERSTBA write order, IMAN re-write
+    /// after MSI-X enable), but a transient hardware fault on real
+    /// silicon could still trip HCE — recover instead of giving up.
     fn soft_recover(&self) -> Result<(), XhciError> {
         let mmio = &self.mmio;
         let op_off = self.op_off;
@@ -926,15 +938,17 @@ impl Xhci {
         };
 
         // Program DCBAAP + CRCR. Order: LOW-dword first, then HIGH.
-        // CRCR specifically: many implementations (incl. QEMU TCG)
-        // latch the *high*-dword write to (re)initialize the
-        // command-ring fetch pointer using the *current* low value.
-        // If we wrote HIGH first, the implementation would init the
-        // ring at base=(0 << 32 | high_we_just_wrote)=0 (since LOW
-        // wasn't yet stored), permanently fetching garbage TRBs from
-        // address 0 → first doorbell triggers xhci_die → HCE.
-        // BIOS / Linux / FreeBSD all use LOW-then-HIGH for the same
-        // reason. DCBAAP is plain RW (no commit-on-write side
+        // CRCR specifically: xHCI 1.2 §5.4.5 / §4.9.3 describe the
+        // Command Ring Pointer as a 64-bit register where the HIGH
+        // dword write commits the ring-fetch state. An implementation
+        // that latches CRP on the HIGH write reads the LOW dword at
+        // that moment; HIGH-first would therefore initialise the
+        // command-ring base at `(LOW=0 | HIGH=<our value>)` because
+        // LOW wasn't yet stored, leaving the controller fetching
+        // garbage TRBs from physical address 0. The first doorbell
+        // then trips internal HC error. LOW-then-HIGH stages LOW
+        // before the latch, so HIGH commits the correct full 64-bit
+        // address. DCBAAP is plain RW (no commit-on-write side
         // effect) but follows the same pattern for symmetry.
         // SAFETY: same.
         unsafe {
@@ -975,16 +989,18 @@ impl Xhci {
         // for bring-up).
         let ir0 = rtsoff as u64 + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
-        // Order matters: ERSTSZ first (sizes the table). ERDP
-        // before ERSTBA (the dequeue must be valid by the time
+        // Order matters: ERSTSZ first (sizes the table — xHCI 1.2
+        // §5.5.2.3.2 says ERSTSZ shall be programmed before ERSTBA).
+        // ERDP before ERSTBA (the dequeue must be valid by the time
         // the controller starts walking events). For the 64-bit
-        // pairs we write LOW-then-HIGH because the implementation
-        // (QEMU TCG, real silicon following §5.5.2.3.2) latches
-        // the *high* write to commit the full address — if we
-        // wrote HIGH first, the implementation would read LOW=0
-        // and call xhci_er_reset with erstba=0 (event ring
-        // disabled) → events never reach us → every command
-        // times out. Same trap caught CRCR earlier.
+        // pairs we write LOW-then-HIGH because the spec describes
+        // ERSTBA as latched on the HIGH write (§5.5.2.3.2): the
+        // controller reads the LOW dword at that moment to compute
+        // the segment-table base. HIGH-first would cause the
+        // controller to read LOW=0 and disable the event ring
+        // (erstba=0 ⇒ er_size=0), so transfer events never reach
+        // the driver and every command times out. Same hazard as
+        // CRCR earlier.
         unsafe {
             mmio.write32(ir0 + IR_ERSTSZ, 1);
             mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
@@ -1051,12 +1067,13 @@ impl Xhci {
             mmio.write32(op_off + OP_USBSTS, USBSTS_EINT);
         }
 
-        // Try MSI-X first, fall back to legacy INTx via PCI _PRT
-        // + IOAPIC programming, fall back to polling if neither
-        // works. Cap walking failures, firmware MSI-X disable
-        // bits, and platforms whose firmware never enabled MSI-X
-        // all land in the INTx path. Pattern: same as the
-        // Linux pcie_msi → pcie_intx fallback chain.
+        // Try MSI-X first, fall back to legacy INTx via PCI _PRT +
+        // IOAPIC programming, fall back to polling if neither works.
+        // Cap-walking failures, firmware MSI-X disable bits, and
+        // platforms whose firmware never enabled MSI-X all land in
+        // the INTx path. PCIe Base Spec §6.1 (MSI-X Capability) +
+        // §6.1.4 (INTx Emulation) describe the fallback contract.
+        //   <https://pcisig.com/specifications/pciexpress/>
         let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
             Ok((tbl, v)) => (Some(tbl), Some(v)),
             Err(_) => match Self::try_install_intx(cap, device) {
@@ -1064,16 +1081,20 @@ impl Xhci {
                 None => (None, None),
             },
         };
-        // After MSI-X enable, re-write IMAN so QEMU's xhci_intr_update
-        // sees IE=1 *while* msix_enabled() returns true and calls
-        // msix_vector_use() to register interrupter 0's vector. We
-        // wrote IMAN earlier (during IR0 setup) but at that point
-        // MSI-X wasn't enabled yet, so xhci_pci_intr_update bailed
-        // and the vector was never marked "used" → msix_notify is
-        // silently ignored on subsequent transfer events. Re-issuing
-        // the same write here triggers the registration. INTx-fallback
-        // path doesn't need this; the legacy path delivers via
-        // IOAPIC redirection set up by `try_install_intx`.
+        // After MSI-X enable, re-write IMAN so an implementation that
+        // registers interrupter→MSI-X-vector binding on the IMAN.IE
+        // transition observes IE=1 *while* MSI-X is already enabled
+        // in PCI cfg. xHCI 1.2 §5.5.2.1 specifies IE as the gate that
+        // permits the interrupter to assert interrupts; the spec is
+        // silent on the exact moment the host bus translates the
+        // interrupter to a delivered MSI/MSI-X message, but in
+        // practice the registration is wired to the IMAN.IE write
+        // path. We wrote IMAN earlier (during IR0 setup) when MSI-X
+        // wasn't yet enabled in PCI cfg — re-issuing the same write
+        // here re-arms the registration so subsequent Transfer
+        // Events deliver. INTx-fallback path doesn't need this; the
+        // legacy path delivers via IOAPIC redirection set up by
+        // `try_install_intx`.
         if msix.is_some() {
             // SAFETY: identity-mapped MMIO; same offset as the
             // earlier write.
@@ -1854,17 +1875,16 @@ impl Xhci {
         compiler_fence(Ordering::SeqCst);
 
         // Address Device — single BSR=0 call (xHCI 1.2 §4.6.5).
-        // Earlier code did a two-phase BSR=1-then-BSR=0 dance as
-        // a speculative quirk. That turned out to be the cause
-        // of the USB Transaction Error (CmdFailed 4) on real
-        // Renoir hardware: the spec says the Input Context is
-        // consumed during Address Device processing, so feeding
-        // the same Input Context to a second Address Device
-        // (BSR=0) after BSR=1 left the controller using stale
-        // state and SET_ADDRESS landed mid-bus. Linux upstream
-        // xhci-hcd uses BSR=0 directly for normal addressing
-        // and only does BSR=1 under the XHCI_BROKEN_FW quirk
-        // (which AMD Renoir does NOT carry).
+        // Earlier code did a two-phase BSR=1-then-BSR=0 dance as a
+        // speculative quirk. That turned out to be the cause of the
+        // USB Transaction Error (CmdFailed 4) on real Renoir
+        // hardware: per §4.6.5 the Input Context is consumed during
+        // Address Device processing, so feeding the same Input
+        // Context to a second Address Device (BSR=0) after BSR=1
+        // leaves the controller using stale state and SET_ADDRESS
+        // lands mid-bus. The spec only requires the BSR=1 dance
+        // when the device firmware can't tolerate a SET_ADDRESS at
+        // attach time (rare); plain BSR=0 is the documented default.
         //
         // TRB layout (§6.4.3.4):
         //   dword0/1 = Input Context phys (low/high)

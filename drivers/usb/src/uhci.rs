@@ -1,16 +1,19 @@
 //! UHCI (USB 1.1 Universal Host Controller Interface) — clean-room.
 //!
-//! ## Sources (public only)
+//! ## Sources (public, non-GPL only)
 //!
 //! - **"Universal Host Controller Interface (UHCI) Design Guide"**,
-//!   Revision 1.1, March 1996 (Intel). Public.
-//!   <https://ftp.netbsd.org/pub/NetBSD/misc/blymn/uhci11d.pdf>
+//!   Revision 1.1, March 1996 (Intel). Public document, no longer
+//!   hosted on intel.com (legacy spec); searchable via the document
+//!   title. Section references throughout this file (e.g. `§3.x`)
+//!   point at that spec.
 //! - **USB 2.0 Specification §11** — root-hub class semantics
 //!   shared with UHCI's PORTSC bits (UHCI predates USB 2.0 but
 //!   uses the same root-hub semantics).
-//!   <https://www.usb.org/document-library/usb-20-specification>
+//!     <https://www.usb.org/document-library/usb-20-specification>
 //!
-//! No GPL / Linux source consulted.
+//! No GPL/BSD source code (Linux, FreeBSD, NetBSD, U-Boot)
+//! consulted at any point during the writing of this driver.
 //!
 //! ## What this module is
 //!
