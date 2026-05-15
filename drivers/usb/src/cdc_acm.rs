@@ -218,6 +218,268 @@ pub const CTRL_DTR: u16 = 1 << 0;
 /// Bit 1 — RTS.
 pub const CTRL_RTS: u16 = 1 << 1;
 
+// ── Live driver: discovery + bind + bulk-IN pump ──────────────────
+
+extern crate alloc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::cdc::{USB_CLASS_CDC_COMM, USB_CLASS_CDC_DATA, CDC_SUBCLASS_ACM};
+use crate::xhci::{EndpointConfig, EndpointKind, PortSpeed, Xhci, XhciError};
+
+/// `bmRequestType` for ACM class requests (Host-to-Device, Class,
+/// Interface recipient — USB 2.0 §9.3).
+pub const RT_HOST_TO_DEV_CLASS_IFACE: u8 = 0x21;
+
+/// One bound CDC-ACM device. Held in the global [`ACM_DEVICES`]
+/// registry; the supervisor drains its bulk-IN endpoint each cycle
+/// and pushes received bytes onto `narf_input`'s AsciiByte ring so
+/// `/dev/console` reads them just like UART input.
+#[derive(Debug)]
+pub struct AcmDevice {
+    pub slot_id: u8,
+    /// Data interface number (USB 2.0 §9.3 — needed for class
+    /// requests + SET_INTERFACE).
+    pub data_iface: u8,
+    /// Comm interface number — used for SET_LINE_CODING /
+    /// SET_CONTROL_LINE_STATE class requests (recipient = Interface).
+    pub comm_iface: u8,
+    /// DCI of the bulk-IN endpoint (incoming bytes from device).
+    pub bulk_in_dci: u8,
+    /// DCI of the bulk-OUT endpoint (host-to-device bytes).
+    pub bulk_out_dci: u8,
+    /// Cached negotiated line coding for diagnostics + GET retries.
+    pub line_coding: LineCoding,
+}
+
+/// Global registry of bound CDC-ACM devices. Populated by
+/// [`try_bind_acm_already_addressed`]; drained by [`pump_all`].
+static ACM_DEVICES: IrqSafeSpinLock<Vec<Arc<AcmDevice>>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Walk a configuration descriptor looking for a CDC-ACM Comm +
+/// Data interface pair. Returns:
+///   `(comm_iface, data_iface, bulk_in_ep, bulk_out_ep)`
+///
+/// Topology (CDC PSTN §3.6 + USB 2.0 §9.6.5):
+///   - Interface descriptor with class=0x02 (Comm) subclass=0x02
+///     (ACM) — that's the Comm interface; usually carries one
+///     interrupt-IN notification endpoint.
+///   - Interface descriptor with class=0x0A (Data) — that's the
+///     Data interface; carries the bulk-IN + bulk-OUT pair we
+///     drain for terminal bytes.
+pub fn find_acm_interfaces(
+    cfg: &[u8],
+) -> Option<(u8, u8, EndpointConfig, EndpointConfig)> {
+    let mut i = 0usize;
+    let mut comm_iface: Option<u8> = None;
+    let mut data_iface: Option<u8> = None;
+    let mut bulk_in: Option<EndpointConfig> = None;
+    let mut bulk_out: Option<EndpointConfig> = None;
+    let mut current_class: u8 = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let dtype = cfg[i + 1];
+        match dtype {
+            // Interface Descriptor (USB 2.0 §9.6.5).
+            4 if len >= 9 => {
+                let cls = cfg[i + 5];
+                let sub = cfg[i + 6];
+                current_class = cls;
+                if cls == USB_CLASS_CDC_COMM && sub == CDC_SUBCLASS_ACM {
+                    comm_iface = Some(cfg[i + 2]);
+                } else if cls == USB_CLASS_CDC_DATA {
+                    data_iface = Some(cfg[i + 2]);
+                }
+            }
+            // Endpoint Descriptor (USB 2.0 §9.6.6). Only the bulk
+            // pair on the Data interface matters for the terminal
+            // pipeline; the Comm interface's interrupt-IN
+            // notification endpoint we ignore for now.
+            5 if len >= 7 && current_class == USB_CLASS_CDC_DATA => {
+                let ep_addr = cfg[i + 2];
+                let attr = cfg[i + 3];
+                let mps = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
+                let xfer_t = attr & 0x03;
+                if xfer_t == 2 {
+                    // Bulk
+                    let cfg = EndpointConfig {
+                        ep_addr,
+                        max_packet: mps,
+                        kind: if ep_addr & 0x80 != 0 {
+                            EndpointKind::BulkIn
+                        } else {
+                            EndpointKind::BulkOut
+                        },
+                    };
+                    if ep_addr & 0x80 != 0 && bulk_in.is_none() {
+                        bulk_in = Some(cfg);
+                    } else if ep_addr & 0x80 == 0 && bulk_out.is_none() {
+                        bulk_out = Some(cfg);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    Some((comm_iface?, data_iface?, bulk_in?, bulk_out?))
+}
+
+/// Post-address ACM bind: caller has already issued port_reset +
+/// enable_slot + address_device. We pull the config descriptor,
+/// match the Comm + Data interface pair, configure the bulk
+/// endpoints, then issue `SET_CONFIGURATION` →
+/// `SET_LINE_CODING(115200 8N1)` →
+/// `SET_CONTROL_LINE_STATE(DTR | RTS)` so the device knows the host
+/// is ready to receive bytes. Failure on any step returns Err and
+/// the caller's cleanup_guard frees the slot.
+pub fn try_bind_acm_already_addressed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+    speed: PortSpeed,
+) -> Result<(), CdcError> {
+    let _ = speed; // reserved for future MaxPacketSize-aware setup
+    let (comm_iface, data_iface, bulk_in, bulk_out) =
+        find_acm_interfaces(cfg).ok_or(CdcError::Truncated)?;
+
+    // Configure xHC-side endpoint contexts for the bulk pair.
+    xhci_dev
+        .configure_endpoints(slot_id, &[bulk_in, bulk_out])
+        .map_err(|_| CdcError::Truncated)?;
+
+    // SET_CONFIGURATION before any class request (USB 2.0 §9.4.7).
+    if cfg.len() < 9 || cfg[1] != 2 {
+        return Err(CdcError::Truncated);
+    }
+    let cfg_value = cfg[5];
+    let mut nothing = [0u8; 0];
+    xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .map_err(|_| CdcError::Truncated)?;
+
+    // SET_LINE_CODING(115200 8N1) — the dev-board default. PSTN 1.2
+    // §6.3.10. Failure here is non-fatal for some chips that ignore
+    // line coding (Arduino-style sketches just sample any baud).
+    let coding = LineCoding::N_115200_8N1;
+    let coding_bytes = coding.encode();
+    let _ = xhci_dev.control_out(
+        slot_id,
+        RT_HOST_TO_DEV_CLASS_IFACE,
+        REQ_SET_LINE_CODING,
+        0,
+        comm_iface as u16,
+        &coding_bytes,
+    );
+
+    // SET_CONTROL_LINE_STATE(DTR | RTS) — tells the device the host
+    // is present + ready to receive (PSTN 1.2 §6.3.12). On many
+    // USB-to-serial dongles this gates whether the chip drives RXD.
+    let _ = xhci_dev.control_out(
+        slot_id,
+        RT_HOST_TO_DEV_CLASS_IFACE,
+        REQ_SET_CONTROL_LINE_STATE,
+        CTRL_DTR | CTRL_RTS,
+        comm_iface as u16,
+        &[],
+    );
+
+    // Pre-arm the bulk-IN endpoint so the controller starts polling
+    // the device for bytes. Same pattern as the persistent-arm
+    // interrupt-IN we use for HID kbd / mouse.
+    let bulk_in_ep = bulk_in.ep_addr & 0x0F;
+    let bulk_in_dci = (bulk_in_ep * 2) + 1;
+    let bulk_out_ep = bulk_out.ep_addr & 0x0F;
+    let bulk_out_dci = bulk_out_ep * 2;
+    xhci_dev
+        .arm_interrupt_in(slot_id, bulk_in_dci, bulk_in.max_packet.min(64) as u32)
+        .map_err(|_| CdcError::Truncated)?;
+
+    let dev = Arc::new(AcmDevice {
+        slot_id,
+        data_iface,
+        comm_iface,
+        bulk_in_dci,
+        bulk_out_dci,
+        line_coding: coding,
+    });
+    {
+        use core::fmt::Write as _;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static ATTACHED: AtomicU64 = AtomicU64::new(0);
+        let bit = 1u64 << (slot_id as u32 & 63);
+        let prev = ATTACHED.fetch_or(bit, Ordering::AcqRel);
+        if prev & bit == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  cdc-acm: serial attached on slot {} ({} bps)",
+                slot_id, coding.baud_rate
+            );
+        }
+    }
+    ACM_DEVICES.lock().push(dev);
+    Ok(())
+}
+
+/// Drain one report from each bound ACM device's bulk-IN endpoint
+/// and forward the bytes to the global input ring as
+/// [`narf_input::InputEvent::AsciiByte`] events. `/dev/console` reads
+/// pop these the same way it consumes UART input — so a USB serial
+/// adaptor wired to a debug header becomes a kernel console source.
+pub fn pump_all(xhci_dev: &Xhci) -> usize {
+    let devs: Vec<Arc<AcmDevice>> = {
+        let g = ACM_DEVICES.lock();
+        g.clone()
+    };
+    let mut total = 0usize;
+    for d in &devs {
+        let mut buf = [0u8; 64];
+        loop {
+            match xhci_dev.poll_interrupt_in(d.slot_id, d.bulk_in_dci, &mut buf) {
+                Ok(Some(n)) => {
+                    for &b in &buf[..n.min(buf.len())] {
+                        narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+                        total += 1;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+    total
+}
+
+/// Send bytes to a bound ACM device's bulk-OUT endpoint. Returns
+/// the number of bytes the controller acknowledged delivering.
+/// First device only for now; multi-device routing follows when a
+/// `/dev/ttyUSB0` namespace lands.
+pub fn send(xhci_dev: &Xhci, data: &[u8]) -> Result<usize, XhciError> {
+    let devs: Vec<Arc<AcmDevice>> = {
+        let g = ACM_DEVICES.lock();
+        g.clone()
+    };
+    let dev = devs.first().ok_or(XhciError::CmdFailed(0xFC))?;
+    xhci_dev.bulk_out(dev.slot_id, dev.bulk_out_dci, data)
+}
+
+/// Number of bound ACM devices. Test + diagnostics helper.
+pub fn attached_count() -> usize {
+    ACM_DEVICES.lock().len()
+}
+
 // ── SETUP-packet builders ────────────────────────────────────────
 
 /// USB setup packet — 8 bytes per USB 2.0 §9.3.

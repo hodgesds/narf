@@ -56,6 +56,10 @@ pub enum AttachOutcome {
     /// Device bound as a HID Precision Touchpad (PTP). Slot stays
     /// alive; entry was added to `hid::touchpad::TOUCHPADS`.
     Touchpad,
+    /// Device bound as a CDC-ACM serial adaptor (USB-to-serial
+    /// dongle, Arduino-style virtual COM port). Slot stays alive;
+    /// entry was added to `cdc_acm::ACM_DEVICES`.
+    SerialAcm,
     /// Device bound as a USB hub. Slot stays alive; entry was added
     /// to [`HUBS`] for downstream walking.
     Hub,
@@ -301,18 +305,32 @@ fn dispatch_after_address(
     if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed).is_ok() {
         return AttachOutcome::Keyboard;
     }
-    // PTP touchpad: needs the config descriptor to locate the HID
-    // interface + report descriptor length, so fetch it here and
-    // hand the buffer to the binder.
-    if let Some((iface, hid_off, ep, cfg_blob)) =
-        fetch_cfg_and_find_hid(xhci_dev, slot_id)
-    {
-        if hid::touchpad::try_bind_touchpad_already_addressed(
-            xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
-        )
-        .is_ok()
+    // PTP touchpad / CDC-ACM serial: both class binders consume the
+    // device's full configuration descriptor. Fetch once + hand to
+    // each in turn so we don't issue multiple GET_DESCRIPTOR(CONFIG)
+    // round-trips.
+    if let Some(cfg_blob) = fetch_full_config(xhci_dev, slot_id) {
+        // PTP touchpad first — HID class.
+        if let Some((iface, hid_off, ep)) =
+            hid::touchpad::find_hid_interface(&cfg_blob)
         {
-            return AttachOutcome::Touchpad;
+            if hid::touchpad::try_bind_touchpad_already_addressed(
+                xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
+            )
+            .is_ok()
+            {
+                return AttachOutcome::Touchpad;
+            }
+        }
+        // CDC-ACM serial — Comm + Data interface pair.
+        if crate::cdc_acm::find_acm_interfaces(&cfg_blob).is_some() {
+            if crate::cdc_acm::try_bind_acm_already_addressed(
+                xhci_dev, slot_id, &cfg_blob, speed,
+            )
+            .is_ok()
+            {
+                return AttachOutcome::SerialAcm;
+            }
         }
     }
     // try_bind_kbd_already_addressed disables the slot on failure,
@@ -332,15 +350,11 @@ fn dispatch_after_address(
     AttachOutcome::UnknownClass
 }
 
-/// Read the device's first configuration descriptor in full and
-/// locate a HID interface with an interrupt-IN endpoint. Returns
-/// `(interface_num, hid_descriptor_offset, endpoint, full_blob)` for
-/// the touchpad binder to consume. None on any descriptor-fetch
-/// error or no HID interface match.
-fn fetch_cfg_and_find_hid(
-    xhci_dev: &Xhci,
-    slot_id: u8,
-) -> Option<(u8, usize, crate::xhci::EndpointConfig, alloc::vec::Vec<u8>)> {
+/// Read the device's first configuration descriptor in full so the
+/// per-class binders can search it for their interface signature
+/// without re-issuing GET_DESCRIPTOR. Returns the full blob (header
+/// + interface + endpoint descriptors), or None on any error.
+fn fetch_full_config(xhci_dev: &Xhci, slot_id: u8) -> Option<alloc::vec::Vec<u8>> {
     let mut head = [0u8; 9];
     xhci_dev.get_config_descriptor(slot_id, 0, &mut head).ok()?;
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
@@ -352,8 +366,7 @@ fn fetch_cfg_and_find_hid(
     if n < total {
         full.truncate(n);
     }
-    let (iface, hid_off, ep) = hid::touchpad::find_hid_interface(&full)?;
-    Some((iface, hid_off, ep, full))
+    Some(full)
 }
 
 /// Walk the device's configuration descriptor and log the
