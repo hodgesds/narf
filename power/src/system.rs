@@ -60,12 +60,18 @@ pub fn reboot() -> ! {
     narf_arch::halt_forever();
 }
 
-/// Power off the system via ACPI S5. Caller supplies the
-/// platform's SLP_TYPa / SLP_TYPb (from `\_S5_`); pass
-/// `(QEMU_S5_SLP_TYPA, QEMU_S5_SLP_TYPB)` for QEMU and most
-/// x86 firmware. Never returns on success.
+/// Power off the system via ACPI S5. Reads `\_S5` from the AML
+/// namespace for the SLP_TYPa / SLP_TYPb pair; falls back to the
+/// QEMU defaults when the namespace is missing the package or
+/// reports a degenerate `(0, 0)` (QEMU q35 ships this — a
+/// SLP_TYP of 0 means "enter S0" which would be a no-op write
+/// to PM1a_CNT). Never returns on success.
 #[cfg(target_arch = "x86_64")]
-pub fn power_off(slp_typ_a: u8, slp_typ_b: u8) -> ! {
+pub fn power_off() -> ! {
+    let (slp_typ_a, slp_typ_b) = match narf_aml::evaluate_s5() {
+        Some((0, 0)) | None => (QEMU_S5_SLP_TYPA, QEMU_S5_SLP_TYPB),
+        Some(p) => p,
+    };
     // SAFETY: enters S5 — the platform powers off; this call
     // is documented to never return.
     unsafe {
@@ -93,10 +99,7 @@ pub fn reboot() -> ! {
 
 /// aarch64 power-off via PSCI SYSTEM_OFF.
 #[cfg(target_arch = "aarch64")]
-pub fn power_off(_slp_typ_a: u8, _slp_typ_b: u8) -> ! {
-    // SLP_TYP args ignored on aarch64 — PSCI SYSTEM_OFF doesn't
-    // need them. Kept in the signature so x86_64 + aarch64 share
-    // the same call shape.
+pub fn power_off() -> ! {
     // SAFETY: SMC at EL1; PSCI SYSTEM_OFF doesn't return.
     unsafe {
         let _ = psci_smc(crate::psci::fn_id::SYSTEM_OFF, 0, 0, 0);
@@ -146,6 +149,6 @@ pub fn reboot() -> ! {
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub fn power_off(_slp_typ_a: u8, _slp_typ_b: u8) -> ! {
+pub fn power_off() -> ! {
     narf_arch::halt_forever();
 }
