@@ -952,6 +952,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-hid",
  "narf-init",
  "narf-input",
  "narf-interrupts",

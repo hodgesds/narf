@@ -223,7 +223,7 @@ const DCI_CONTROL_EP: u32 = 1;
 const CTRL_TR_TRBS: usize = 64;
 
 // Standard USB request constants (§9.4 USB 2.0).
-const USB_REQ_GET_DESCRIPTOR: u8 = 6;
+pub const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 const USB_DESC_TYPE_DEVICE: u8 = 1;
 
 /// Per xHCI 1.2 §4.5.2 / §6.2.2: bus topology hint passed to
@@ -2399,6 +2399,96 @@ impl Xhci {
             out[i] = unsafe { core::ptr::read_volatile((data_phys + i as u64) as *const u8) };
         }
         Ok(xferred)
+    }
+
+    /// Issue a host-to-device control transfer with an OUT data
+    /// stage (USB 2.0 §9.3 / xHCI 1.2 §6.4.1.2). Mirror of
+    /// [`Self::control_in`]: SETUP TRB, optional Data Stage TRB
+    /// (DIR=OUT), Status Stage TRB (DIR=IN), then await Transfer
+    /// Event. `data` may be empty for class requests that pack
+    /// everything into the SETUP packet's wValue/wIndex fields.
+    /// Returns the bytes the controller acknowledged delivering.
+    pub fn control_out(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, XhciError> {
+        if data.len() > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let w_length = data.len() as u16;
+        let data_phys = {
+            let g = self.devices.lock();
+            let d = g
+                .get(slot_id as usize)
+                .and_then(|x| x.as_ref())
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            d.ctrl_data.phys_addr().raw()
+        };
+        // Stage caller's bytes into the persistent control-data
+        // buffer (audit F-45). Zero the prefix first so a stale
+        // tail can't leak into a subsequent transfer.
+        // SAFETY: identity-mapped DMA page; ≤ 4 KiB.
+        unsafe {
+            core::ptr::write_bytes(data_phys as *mut u8, 0, 4096);
+            for (i, b) in data.iter().enumerate() {
+                core::ptr::write_volatile((data_phys + i as u64) as *mut u8, *b);
+            }
+        }
+
+        // ── Setup Stage TRB ───────────────────────────────────────
+        let setup_d0 =
+            (bm_request_type as u32) | ((b_request as u32) << 8) | ((w_value as u32) << 16);
+        let setup_d1 = (w_index as u32) | ((w_length as u32) << 16);
+        let setup_d2 = 8u32;
+        let trt = if w_length > 0 {
+            TRT_OUT_DATA
+        } else {
+            TRT_NO_DATA
+        };
+        let setup_d3 = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT) | TRB_IDT | (trt << 16);
+        self.ctrl_enqueue(slot_id, setup_d0, setup_d1, setup_d2, setup_d3)?;
+
+        // ── Data Stage TRB (DIR=OUT) ──────────────────────────────
+        if w_length > 0 {
+            let data_d3 = (TRB_TYPE_DATA_STAGE << TRB_TYPE_SHIFT) | TRB_IOC; // DIR bit clear = OUT
+            self.ctrl_enqueue(
+                slot_id,
+                data_phys as u32,
+                (data_phys >> 32) as u32,
+                w_length as u32,
+                data_d3,
+            )?;
+        }
+
+        // ── Status Stage TRB ──────────────────────────────────────
+        // For an OUT data stage, status stage is IN (DIR=1). For
+        // NO_DATA the status stage is also IN.
+        let status_d3 =
+            (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_DIR_IN | TRB_IOC;
+        self.ctrl_enqueue(slot_id, 0, 0, 0, status_d3)?;
+
+        self.ring_slot_doorbell(slot_id, DCI_CONTROL_EP);
+
+        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let want_ep = (DCI_CONTROL_EP) << 16;
+        let ev = self
+            .await_event(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            })?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 && ccode != 13 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let residue = ev[2] & 0x00FF_FFFF;
+        Ok((w_length as u32).saturating_sub(residue) as usize)
     }
 
     /// Fetch the 18-byte USB Device Descriptor (§9.6.1) for an

@@ -66,6 +66,7 @@ pub(crate) const HID_BOOT_PROTOCOL: u16 = 0;
 pub(crate) const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
 pub mod mouse;
+pub mod touchpad;
 
 /// Modifier mask bits in byte 0 of the boot keyboard report.
 pub mod kbd_mod {

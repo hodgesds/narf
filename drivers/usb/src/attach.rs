@@ -53,6 +53,9 @@ pub enum AttachOutcome {
     Keyboard,
     /// Device bound as a HID Boot Mouse. Slot stays alive.
     Mouse,
+    /// Device bound as a HID Precision Touchpad (PTP). Slot stays
+    /// alive; entry was added to `hid::touchpad::TOUCHPADS`.
+    Touchpad,
     /// Device bound as a USB hub. Slot stays alive; entry was added
     /// to [`HUBS`] for downstream walking.
     Hub,
@@ -291,11 +294,26 @@ fn dispatch_after_address(
         return AttachOutcome::Hub;
     }
 
-    // Not a hub — try HID Boot Keyboard, then HID Boot Mouse. Each
-    // call frees the slot on failure. The Mouse path runs only if
-    // the Kbd path didn't bind, so we don't double-disable.
+    // Not a hub — try HID Boot Keyboard first, then PTP touchpad
+    // (post-Boot HID Report-protocol). Each call frees the slot on
+    // failure. The mouse / touchpad paths only run if kbd didn't
+    // bind, so we don't double-disable.
     if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed).is_ok() {
         return AttachOutcome::Keyboard;
+    }
+    // PTP touchpad: needs the config descriptor to locate the HID
+    // interface + report descriptor length, so fetch it here and
+    // hand the buffer to the binder.
+    if let Some((iface, hid_off, ep, cfg_blob)) =
+        fetch_cfg_and_find_hid(xhci_dev, slot_id)
+    {
+        if hid::touchpad::try_bind_touchpad_already_addressed(
+            xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
+        )
+        .is_ok()
+        {
+            return AttachOutcome::Touchpad;
+        }
     }
     // try_bind_kbd_already_addressed disables the slot on failure,
     // so we need to re-enable + re-address for the mouse attempt.
@@ -312,6 +330,30 @@ fn dispatch_after_address(
     // surfaces the class triple of every interface in the log.
     log_unknown_device_classes(xhci_dev, slot_id, port);
     AttachOutcome::UnknownClass
+}
+
+/// Read the device's first configuration descriptor in full and
+/// locate a HID interface with an interrupt-IN endpoint. Returns
+/// `(interface_num, hid_descriptor_offset, endpoint, full_blob)` for
+/// the touchpad binder to consume. None on any descriptor-fetch
+/// error or no HID interface match.
+fn fetch_cfg_and_find_hid(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+) -> Option<(u8, usize, crate::xhci::EndpointConfig, alloc::vec::Vec<u8>)> {
+    let mut head = [0u8; 9];
+    xhci_dev.get_config_descriptor(slot_id, 0, &mut head).ok()?;
+    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+    if !(9..=4096).contains(&total) {
+        return None;
+    }
+    let mut full = alloc::vec![0u8; total];
+    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut full).ok()?;
+    if n < total {
+        full.truncate(n);
+    }
+    let (iface, hid_off, ep) = hid::touchpad::find_hid_interface(&full)?;
+    Some((iface, hid_off, ep, full))
 }
 
 /// Walk the device's configuration descriptor and log the

@@ -132,6 +132,7 @@ fn spawn_supervisor_task() {
                 match outcome {
                     AttachOutcome::Keyboard
                     | AttachOutcome::Mouse
+                    | AttachOutcome::Touchpad
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -200,6 +201,7 @@ fn spawn_supervisor_task() {
                     match outcome {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse
+                        | AttachOutcome::Touchpad
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }
@@ -216,6 +218,7 @@ fn spawn_supervisor_task() {
 
             let _ = xhci::with_controller(|c| hid::pump_all(c));
             let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
+            let _ = xhci::with_controller(|c| hid::touchpad::pump_all(c));
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
             //       endpoint or a Port Status Change Event (hot-plug),
