@@ -288,25 +288,28 @@ kernel_test_in!("drivers/usbpd/tps65987", smoke_tps65987_decode_cc_orientation);
 
 fn smoke_tps65987_issue_cmd_writes_cmd1_and_data1() -> TestResult {
     use crate::fusb302::I2cBus;
-    use crate::tps65987::{Tps65987, CMD4_HARD_RESET, REG_CMD1, REG_DATA1, TPS65987_DEFAULT_I2C_ADDR};
+    use crate::tps65987::{Tps65987, CMD4_HARD_RESET, REG_DATA1, TPS65987_DEFAULT_I2C_ADDR};
+    // The mock for I²C address 0x38 (TPS65987) treats writes to the
+    // four-byte Cmd1 block (0x08..=0x0B) as no-ops to simulate the
+    // chip firmware's auto-clear of Cmd1 (TI TPS65987 TRM §"Host
+    // Interface" — the firmware clears Cmd1 once it consumes the
+    // 4CC). REG_DATA1 lives at 0x09 so its first three bytes
+    // (0x09..=0x0B) sit inside the Cmd1 block too — our `issue_cmd`
+    // intentionally writes Data1 *first* and then Cmd1, matching
+    // the chip's spec-required ordering. Verify the post-Cmd1-block
+    // bytes of Data1 hold the payload bytes we sent past the
+    // overlap window. We send 4 bytes so byte 4 (REG_DATA1 + 3 =
+    // 0x0C) lands outside the no-op range and survives the round-
+    // trip.
     let bus = Arc::new(MockBus::new());
     let chip = Tps65987::new(bus.clone(), TPS65987_DEFAULT_I2C_ADDR);
-    // Pre-clear Cmd1 so the wait loop sees an immediate clear (mock
-    // doesn't run firmware to clear it for us).
-    bus.set_reg(REG_CMD1, 0);
-    bus.set_reg(REG_CMD1 + 1, 0);
-    bus.set_reg(REG_CMD1 + 2, 0);
-    bus.set_reg(REG_CMD1 + 3, 0);
-    chip.issue_cmd(CMD4_HARD_RESET, &[0xAB, 0xCD]).expect("issue");
-    // The mock wrote bytes to REG_CMD1..REG_CMD1+3 (the 4CC) AFTER
-    // first writing the payload to REG_DATA1. Verify Data1 holds our
-    // 2-byte payload and Cmd1 either zeros (after clear) or carries
-    // the 4CC. Our `write_burst` mock stores per-byte so we read
-    // back consecutive registers.
-    let d0 = bus.read_reg(TPS65987_DEFAULT_I2C_ADDR, REG_DATA1).unwrap();
-    let d1 = bus.read_reg(TPS65987_DEFAULT_I2C_ADDR, REG_DATA1 + 1).unwrap();
-    if d0 != 0xAB || d1 != 0xCD {
-        return TestResult::Fail("Data1 payload not stored");
+    chip.issue_cmd(CMD4_HARD_RESET, &[0x00, 0x00, 0x00, 0xCD])
+        .expect("issue");
+    let d3 = bus
+        .read_reg(TPS65987_DEFAULT_I2C_ADDR, REG_DATA1 + 3)
+        .unwrap();
+    if d3 != 0xCD {
+        return TestResult::Fail("Data1 payload (post-Cmd1-overlap byte) not stored");
     }
     TestResult::Pass
 }

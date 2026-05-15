@@ -17,6 +17,9 @@ narf-usbpd        = { path = "../../usbpd" }
 narf-capabilities = { path = "../../capabilities" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
+narf-init         = { path = "../../init" }
+narf-console      = { path = "../../console" }
+narf-drivers-i2c  = { path = "../i2c" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]

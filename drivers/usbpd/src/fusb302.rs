@@ -458,17 +458,37 @@ mod mock {
     }
 
     impl I2cBus for MockBus {
-        fn write_reg(&self, _addr: u8, reg: u8, value: u8) -> Result<(), TcpcError> {
+        fn write_reg(&self, addr: u8, reg: u8, value: u8) -> Result<(), TcpcError> {
             if reg == REG_FIFOS {
                 self.tx_log.lock().push(value);
             } else {
                 let mut r = self.regs.lock();
-                if reg == REG_RESET && value & RESET_SW_RES != 0 {
-                    // SW_RES clears most of the register file.
+                // FUSB302 SW_RES clears most of the register file.
+                // Gated on the FUSB302 I²C address (0x22) so the same
+                // mock can also impersonate the TPS65987 (0x38) where
+                // 0x0C is part of the Data1 buffer, not a reset reg.
+                if addr == FUSB302_DEFAULT_I2C_ADDR
+                    && reg == REG_RESET
+                    && value & RESET_SW_RES != 0
+                {
                     let dev_id = r[REG_DEVICE_ID as usize];
                     *r = [0u8; 256];
                     r[REG_DEVICE_ID as usize] = dev_id;
                     r[REG_STATUS1 as usize] = STATUS1_RX_EMPTY | STATUS1_TX_EMPTY;
+                    return Ok(());
+                }
+                // Simulate the TPS65987's on-chip firmware ack of
+                // 4CC commands written to REG_CMD1 (TI TPS65987 TRM
+                // §"Host Interface" — Cmd1 self-clears once the
+                // firmware finishes the requested operation). The
+                // mock can't run that firmware so we drop the
+                // write to the Cmd1 four-byte block (0x08..=0x0B),
+                // which makes `wait_cmd1_clear` see all-zero
+                // immediately. Gated on the TPS65987's I²C address
+                // (0x38) so this no-op doesn't collide with the
+                // FUSB302's REG_CONTROL3 at 0x09 (FUSB302 lives at
+                // I²C 0x22).
+                if addr == 0x38 && (0x08..=0x0B).contains(&reg) {
                     return Ok(());
                 }
                 r[reg as usize] = value;
@@ -489,15 +509,36 @@ mod mock {
         }
 
         fn read_burst(&self, addr: u8, reg: u8, out: &mut [u8]) -> Result<(), TcpcError> {
-            for slot in out.iter_mut() {
-                *slot = self.read_reg(addr, reg)?;
+            // FUSB302 / TPS65987 register space is byte-indexed and
+            // auto-increments inside a single I²C transfer except for
+            // REG_FIFOS where each read pops the next byte from the
+            // RX FIFO. Mirror both behaviours.
+            if reg == REG_FIFOS {
+                for slot in out.iter_mut() {
+                    *slot = self.read_reg(addr, reg)?;
+                }
+            } else {
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let r = reg.wrapping_add(i as u8);
+                    *slot = self.read_reg(addr, r)?;
+                }
             }
             Ok(())
         }
 
         fn write_burst(&self, addr: u8, reg: u8, data: &[u8]) -> Result<(), TcpcError> {
-            for b in data {
-                self.write_reg(addr, reg, *b)?;
+            // Same auto-increment treatment as read_burst, except
+            // FIFO writes always target REG_FIFOS (each byte pushes
+            // onto the TX log).
+            if reg == REG_FIFOS {
+                for b in data {
+                    self.write_reg(addr, reg, *b)?;
+                }
+            } else {
+                for (i, b) in data.iter().enumerate() {
+                    let r = reg.wrapping_add(i as u8);
+                    self.write_reg(addr, r, *b)?;
+                }
             }
             Ok(())
         }

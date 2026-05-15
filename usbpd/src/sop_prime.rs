@@ -170,7 +170,11 @@ impl PassiveCableVdo {
         if self.epr_mode_capable {
             v |= 1 << 16;
         }
-        v |= ((self.cable_latency as u32) & 0x0F) << 13;
+        // Cable Latency is 3 bits at [15:13] (USB-PD 3.1 §6.4.4.3.1.5
+        // table 6-37). PD 3.0 had it as 4 bits at [16:13]; PD 3.1
+        // reclaimed bit 16 for EPR Mode Capable so the field
+        // narrowed to 3 bits with mask 0x07.
+        v |= ((self.cable_latency as u32) & 0x07) << 13;
         v |= ((self.cable_termination as u32) & 0x03) << 11;
         v |= ((self.max_vbus_voltage as u32) & 0x03) << 9;
         v |= ((self.vbus_current as u32) & 0x03) << 5;
@@ -185,7 +189,8 @@ impl PassiveCableVdo {
             vdo_version: ((v >> 21) & 0x07) as u8,
             plug_type: ((v >> 18) & 0x03) as u8,
             epr_mode_capable: (v & (1 << 16)) != 0,
-            cable_latency: ((v >> 13) & 0x0F) as u8,
+            // 3-bit field — see encode comment above.
+            cable_latency: ((v >> 13) & 0x07) as u8,
             cable_termination: ((v >> 11) & 0x03) as u8,
             max_vbus_voltage: ((v >> 9) & 0x03) as u8,
             vbus_current: ((v >> 5) & 0x03) as u8,
