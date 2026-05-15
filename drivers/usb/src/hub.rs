@@ -81,6 +81,11 @@ pub const C_PORT_RESET: u16 = 20;
 pub const PSTAT_CONNECTION: u16 = 1 << 0;
 pub const PSTAT_ENABLE: u16 = 1 << 1;
 pub const PSTAT_RESET: u16 = 1 << 4;
+/// Low Speed Device Attached (§11.24.2.7.1 bit 9). Mutually
+/// exclusive with `PSTAT_HIGH_SPEED`; both clear means full-speed.
+pub const PSTAT_LOW_SPEED: u16 = 1 << 9;
+/// High Speed Device Attached (§11.24.2.7.1 bit 10).
+pub const PSTAT_HIGH_SPEED: u16 = 1 << 10;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HubError {
@@ -281,5 +286,26 @@ impl UsbHub {
             }
         }
         v
+    }
+
+    /// Decode the negotiated USB speed for a downstream port from
+    /// the hub-class GET_STATUS word. USB 2.0 §11.24.2.7.1: the LS
+    /// bit (9) and HS bit (10) of the status word are mutually
+    /// exclusive; both clear means full-speed. USB 3.x hubs report
+    /// SuperSpeed via the PORT_LINK_STATE field — the device-class
+    /// hub spec for SS hubs ("USB 3.0 Hub Specification" §11.5)
+    /// rides on top of this same encoding for the SS LinkState
+    /// nibble. For Stage 1 we only resolve LS / FS / HS; SS hubs
+    /// are reported as HS until link-state decoding lands.
+    pub fn port_speed(&self, xhci_dev: &Xhci, port: u8) -> Result<crate::xhci::PortSpeed, HubError> {
+        use crate::xhci::PortSpeed;
+        let s = self.port_status(xhci_dev, port)? as u16;
+        if s & PSTAT_LOW_SPEED != 0 {
+            Ok(PortSpeed::Low)
+        } else if s & PSTAT_HIGH_SPEED != 0 {
+            Ok(PortSpeed::High)
+        } else {
+            Ok(PortSpeed::Full)
+        }
     }
 }

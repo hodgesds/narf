@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod attach;
 pub mod cdc;
 pub mod ehci;
 pub mod ohci;
@@ -79,28 +80,28 @@ pub fn register_initcalls() {
 }
 
 /// Spawn the long-running USB HID supervisor task. Walks every
-/// xHCI port the controller reports as connected, attempts to
-/// bind a HID Boot Keyboard and Boot Mouse on each, then loops
-/// pumping interrupt-IN reports onto the global input ring.
+/// xHCI root-hub port the controller reports as connected, then
+/// every downstream port of every bound USB hub, attempting to
+/// bind one of {HID Boot Keyboard, HID Boot Mouse, USB Hub} per
+/// device. Loops pumping interrupt-IN reports onto the global
+/// input ring between wakes.
 fn spawn_supervisor_task() {
     narf_scheduler::spawn(async {
+        use crate::attach::{self, AttachOutcome, HUBS};
         const PUMP_CYCLES: u64 = 16_000_000;
         // Cap per-port enumeration attempts. After this many
         // consecutive failures (typically all PortResetTimeout on a
-        // dead USB3 port that the rate-matching hub has internally
-        // routed elsewhere, OR a port whose attached device
-        // genuinely doesn't speak HID), give up to stop burning
-        // cycles + log noise. 8 retries × ~16 ms supervisor cadence
-        // = ~125 ms of grace before we move on.
+        // dead USB3 port the rate-matching hub has internally
+        // routed elsewhere, OR a port whose attached device doesn't
+        // match any class driver we have), give up to stop burning
+        // cycles + log noise.
         const MAX_PER_PORT_RETRIES: u8 = 8;
         let mut irq_vector: Option<u8> = None;
-        // Per-port claimed-by-keyboard / claimed-by-mouse
-        // bitmasks (audit #9 fix).
-        let mut claimed_kbd: u128 = 0;
-        let mut claimed_mouse: u128 = 0;
-        // Per-port retry counters. Indexed by port id (1..=128).
-        let mut kbd_fail_count = [0u8; 128];
-        let mut mouse_fail_count = [0u8; 128];
+        // Per-root-port claimed mask: 1 = something is bound to
+        // that port and we don't need to re-try.
+        let mut claimed_root: u128 = 0;
+        // Per-root-port consecutive-failure counter.
+        let mut root_fail_count = [0u8; 128];
         loop {
             if !xhci::is_probed() {
                 narf_time::sleep_cycles(PUMP_CYCLES).await;
@@ -109,62 +110,110 @@ fn spawn_supervisor_task() {
             if irq_vector.is_none() {
                 irq_vector = xhci::with_controller(|c| c.irq_vector).flatten();
             }
-            let connected_ports: alloc::vec::Vec<u8> = xhci::with_controller(|c| {
+
+            // ── Phase 1: root-hub ports ────────────────────────────
+            let connected_root: alloc::vec::Vec<u8> = xhci::with_controller(|c| {
                 c.connected_ports().iter().map(|(p, _)| *p).collect()
             })
             .unwrap_or_default();
-            // Audit F-87: avoid double port_reset per cycle. Each
-            // try_attach_*_on_port unconditionally calls port_reset
-            // and a second reset within the same cycle disturbs the
-            // device's link state — some FS keyboards re-enter
-            // Default state and reject the next Address Device. If
-            // the kbd attach already failed on a port this cycle,
-            // skip the mouse attempt; conversely if kbd already
-            // claimed it, mouse skip is automatic via claimed_mouse.
-            let mut tried_this_cycle: u128 = 0;
-            for &p in &connected_ports {
+            for &p in &connected_root {
                 let bit = 1u128 << (p as u32 & 127);
                 let pi = (p as usize) & 127;
-                if claimed_kbd & bit == 0 && kbd_fail_count[pi] < MAX_PER_PORT_RETRIES {
-                    tried_this_cycle |= bit;
-                    let attached = xhci::with_controller(|c| {
-                        hid::try_attach_keyboard_on_port(c, p).is_ok()
-                    })
-                    .unwrap_or(false);
-                    if attached {
-                        claimed_kbd |= bit;
-                        kbd_fail_count[pi] = 0;
-                    } else {
-                        kbd_fail_count[pi] = kbd_fail_count[pi].saturating_add(1);
-                    }
+                if claimed_root & bit != 0 {
+                    continue;
                 }
-                // Skip mouse if kbd was attempted this cycle (success
-                // or fail) — both helpers issue their own port_reset,
-                // and back-to-back resets disturb the device. The
-                // alternate-class interface gets retried next tick if
-                // still unclaimed.
-                // Only attempt mouse if NOTHING is claimed on this
-                // port yet (kbd or mouse) — a port hosts at most one
-                // logical HID device. Trying mouse on a port already
-                // bound to a kbd's slot triggers Address Device with
-                // TRB_ERROR "port already assigned".
-                if claimed_kbd & bit == 0
-                    && claimed_mouse & bit == 0
-                    && tried_this_cycle & bit == 0
-                    && mouse_fail_count[pi] < MAX_PER_PORT_RETRIES
-                {
-                    let attached = xhci::with_controller(|c| {
-                        hid::mouse::try_attach_mouse_on_port(c, p).is_ok()
-                    })
-                    .unwrap_or(false);
-                    if attached {
-                        claimed_mouse |= bit;
-                        mouse_fail_count[pi] = 0;
-                    } else {
-                        mouse_fail_count[pi] = mouse_fail_count[pi].saturating_add(1);
+                if root_fail_count[pi] >= MAX_PER_PORT_RETRIES {
+                    continue;
+                }
+                let outcome =
+                    xhci::with_controller(|c| attach::try_attach_root(c, p)).unwrap_or(
+                        AttachOutcome::UnknownClass,
+                    );
+                match outcome {
+                    AttachOutcome::Keyboard
+                    | AttachOutcome::Mouse
+                    | AttachOutcome::Hub => {
+                        claimed_root |= bit;
+                        root_fail_count[pi] = 0;
+                    }
+                    AttachOutcome::UnknownClass => {
+                        root_fail_count[pi] = root_fail_count[pi].saturating_add(1);
                     }
                 }
             }
+
+            // ── Phase 2: walk every bound hub's downstream ports ───
+            // BFS ordering: HUBS append-only, so iterating linearly
+            // visits a parent hub before any child it spawns this
+            // cycle. Snapshot the (route, tier, root_port, hub_slot,
+            // num_ports) tuples up front so the registry lock isn't
+            // held across the per-port enumeration attempts.
+            let walks: alloc::vec::Vec<(u32, u32, u8, u8, u8, u64)> = {
+                let g = HUBS.lock();
+                g.iter()
+                    .map(|h| {
+                        (
+                            h.route_string,
+                            h.tier,
+                            h.root_hub_port,
+                            h.hub.slot_id,
+                            h.hub.descriptor.num_ports,
+                            h.bound_downstream,
+                        )
+                    })
+                    .collect()
+            };
+            for (idx, (route, tier, root_port, _hub_slot, num_ports, bound_mask)) in
+                walks.iter().enumerate()
+            {
+                // Per-cycle: enumerate the hub's connected
+                // downstream ports + try to attach an unbound one.
+                let connected = xhci::with_controller(|c| {
+                    let g = HUBS.lock();
+                    g.get(idx).map(|h| h.hub.connected_downstream_ports(c)).unwrap_or_default()
+                })
+                .unwrap_or_default();
+                let mut new_bound_bits: u64 = 0;
+                for &dp in &connected {
+                    if (*num_ports != 0) && dp > *num_ports {
+                        continue;
+                    }
+                    let dpb = 1u64 << (dp as u32 & 63);
+                    if (bound_mask | new_bound_bits) & dpb != 0 {
+                        continue;
+                    }
+                    let outcome = xhci::with_controller(|c| {
+                        let g = HUBS.lock();
+                        match g.get(idx) {
+                            Some(h) => attach::try_attach_via_hub(
+                                c,
+                                &h.hub,
+                                *route,
+                                *tier,
+                                *root_port,
+                                dp,
+                            ),
+                            None => AttachOutcome::UnknownClass,
+                        }
+                    })
+                    .unwrap_or(AttachOutcome::UnknownClass);
+                    match outcome {
+                        AttachOutcome::Keyboard
+                        | AttachOutcome::Mouse
+                        | AttachOutcome::Hub => {
+                            new_bound_bits |= dpb;
+                        }
+                        AttachOutcome::UnknownClass => {}
+                    }
+                }
+                if new_bound_bits != 0 {
+                    let mut g = HUBS.lock();
+                    if let Some(h) = g.get_mut(idx) {
+                        h.bound_downstream |= new_bound_bits;
+                    }
+                }
+            }
+
             let _ = xhci::with_controller(|c| hid::pump_all(c));
             let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
             // Wake on either:
@@ -173,10 +222,6 @@ fn spawn_supervisor_task() {
             //   (b) a 100 ms wall-clock timeout — re-tries enumeration
             //       on unattached ports + handles the case where IRQs
             //       never fire (no MSI-X / device that never sends).
-            // The IRQ-only wait left the supervisor parked forever
-            // when the first attach attempt on a port failed (no slot,
-            // no armed TRB, no IRQ source) — so the second-try kbd
-            // path or the kbd-failed → mouse-fallback path never ran.
             if let Some(v) = irq_vector {
                 let deadline = narf_time::Deadline::after_ms(100);
                 let _ = narf_interrupts::wait_for_irq_until(v, deadline).await;

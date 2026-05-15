@@ -226,6 +226,68 @@ const CTRL_TR_TRBS: usize = 64;
 const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 const USB_DESC_TYPE_DEVICE: u8 = 1;
 
+/// Per xHCI 1.2 §4.5.2 / §6.2.2: bus topology hint passed to
+/// `address_device_with` so the controller can route through one or
+/// more USB hubs to reach a downstream device. Construct via
+/// [`Topology::ROOT`] for a device on the root hub, or via
+/// [`Topology::for_downstream`] when descending into a hub.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Topology {
+    /// xHCI 1.2 §4.5.2 "Route String": packed 4-bit hop sequence
+    /// from the root downwards. Tier 1 hub port goes in bits[3:0],
+    /// tier 2 in bits[7:4], etc., up to 5 tiers (20 bits). 0 for a
+    /// device on the root hub.
+    pub route_string: u32,
+    /// Slot ID of the parent high-speed hub when this is a low- or
+    /// full-speed device behind it (§6.2.2 dword2[7:0]). 0 for HS+
+    /// devices or devices on the root hub.
+    pub parent_hub_slot_id: u8,
+    /// Port number on the parent hub for an LS/FS device behind it
+    /// (§6.2.2 dword2[15:8]). 0 if not applicable.
+    pub parent_hub_port: u8,
+    /// TT Think Time (§6.2.2 dword2[17:16]) — 0/1/2/3 = 8/16/24/32
+    /// FS bit-times. Only meaningful for an LS/FS device behind a
+    /// multi-TT high-speed hub.
+    pub tt_think_time: u8,
+}
+
+impl Topology {
+    /// Topology for a device directly on a root-hub port.
+    pub const ROOT: Self = Self {
+        route_string: 0,
+        parent_hub_slot_id: 0,
+        parent_hub_port: 0,
+        tt_think_time: 0,
+    };
+
+    /// Compute the topology for a device reached via `parent_hub`
+    /// at downstream port `hub_port`. `tier` is the number of hubs
+    /// traversed before the parent (0 if `parent_hub` sits on the
+    /// root hub). For HS+ devices, `parent_hub_slot_id` /
+    /// `parent_hub_port` stay zero per §6.2.2 (the TT fields only
+    /// matter when stepping LS/FS through an HS hub). Callers that
+    /// know they're addressing an LS/FS device should override
+    /// those fields manually.
+    pub const fn for_downstream(
+        parent_route: u32,
+        parent_tier: u32,
+        hub_port: u8,
+    ) -> Self {
+        // Append `hub_port` to the next 4-bit nibble. xHCI clamps
+        // the route string at 20 bits (5 hubs); ports >15 must be
+        // encoded as 15 per §4.5.2.
+        let port4 = if hub_port > 15 { 15u32 } else { hub_port as u32 };
+        let shift = parent_tier * 4;
+        let route = parent_route | ((port4 & 0xF) << shift);
+        Self {
+            route_string: route & 0x000F_FFFF,
+            parent_hub_slot_id: 0,
+            parent_hub_port: 0,
+            tt_think_time: 0,
+        }
+    }
+}
+
 /// Speed values reported in PORTSC[10..13] / Slot Context (§4.19.7).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PortSpeed {
@@ -1741,10 +1803,24 @@ impl Xhci {
         PortSpeed::from_portsc_speed(speed_field)
     }
 
-    /// Issue the Address Device command (§4.6.5) for `slot_id` against
-    /// `port` and the device's negotiated `speed`. Allocates a Device
-    /// Context + Input Context + Control Transfer Ring, programs the
-    /// Slot + EP0 contexts per §4.3.3, and waits for the Command
+    /// Issue the Address Device command (§4.6.5) for `slot_id`
+    /// against the *root-hub* `port` (xHCI 1.2 §4.5.2: a downstream
+    /// device's Root Hub Port Number is always the chipset port the
+    /// path *originates* from, regardless of how many hubs it
+    /// transits). Equivalent to `address_device_with(slot_id, port,
+    /// speed, Topology::ROOT)` — for devices reached through one or
+    /// more USB hubs use `address_device_with` directly.
+    pub fn address_device(&self, slot_id: u8, port: u8, speed: PortSpeed) -> Result<u8, XhciError> {
+        self.address_device_with(slot_id, port, speed, Topology::ROOT)
+    }
+
+    /// Issue the Address Device command (§4.6.5) for `slot_id`,
+    /// programming the Slot Context with the supplied `topology`.
+    /// Use `Topology::ROOT` for a device on the root hub (port-only
+    /// addressing); supply the full hub-walk + parent-TT info for
+    /// devices behind one or more USB hubs. Allocates a Device
+    /// Context + Input Context + Control Transfer Ring, programs
+    /// the Slot + EP0 contexts per §4.3.3, and waits for the Command
     /// Completion Event. Returns the slot id on success and stashes
     /// the per-slot state in `self.devices`.
     ///
@@ -1752,7 +1828,13 @@ impl Xhci {
     /// the per-context stride is `0x20` or `0x40` respectively, but
     /// the field layout *within* each context is identical (the
     /// 64-byte form just pads the upper half).
-    pub fn address_device(&self, slot_id: u8, port: u8, speed: PortSpeed) -> Result<u8, XhciError> {
+    pub fn address_device_with(
+        &self,
+        slot_id: u8,
+        port: u8,
+        speed: PortSpeed,
+        topology: Topology,
+    ) -> Result<u8, XhciError> {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
@@ -1835,14 +1917,42 @@ impl Xhci {
             core::ptr::write_volatile((input_ctrl + 4) as *mut u32, (1 << 0) | (1 << 1));
         }
 
-        // Slot Context dword0 + dword1.
+        // Slot Context dword0 + dword1 + dword2 (xHCI 1.2 §6.2.2).
+        //   dword0[19:0]  Route String — 4-bit per hop down a hub
+        //                 chain (§4.5.2). 0 for a root-hub device.
+        //   dword0[23:20] Speed (Table 6-7: 1=FS, 2=LS, 3=HS,
+        //                 4=SS, 5=SSP).
+        //   dword0[25]    MTT (multi-TT) — 0 unless this device
+        //                 itself is a multi-TT hub.
+        //   dword0[26]    Hub — 1 if this device is a USB hub. Set
+        //                 separately via Evaluate Context after the
+        //                 hub descriptor is read.
+        //   dword0[31:27] Context Entries — DCI of the highest
+        //                 valid endpoint (1 here = EP0 only).
+        //   dword1[15:0]  Max Exit Latency (0).
+        //   dword1[23:16] Root Hub Port Number — the chipset port
+        //                 the path originates from, even for a
+        //                 device behind a multi-level hub chain.
+        //   dword1[31:24] Number of Ports (0 for non-hubs).
+        //   dword2[7:0]   TT Hub Slot ID — slot of the parent
+        //                 high-speed hub for an LS/FS device behind
+        //                 it; 0 otherwise.
+        //   dword2[15:8]  TT Port Number on the parent hub.
+        //   dword2[17:16] TT Think Time (0..3 = 8/16/24/32 FS bit
+        //                 times) — only meaningful if the parent is
+        //                 a multi-TT hub.
         let slot_d0 = (1u32 << 27)              // Context Entries = 1
-                    | ((speed as u32) << 20); // Speed
+                    | ((speed as u32) << 20)    // Speed
+                    | (topology.route_string & 0x000F_FFFF); // Route String
         let slot_d1 = (port as u32) << 16; // Root Hub Port Number
-                                           // SAFETY: same.
+        let slot_d2 = (topology.parent_hub_slot_id as u32)
+                    | ((topology.parent_hub_port as u32) << 8)
+                    | ((topology.tt_think_time as u32 & 0x3) << 16);
+        // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
             core::ptr::write_volatile((slot_ctx + 4) as *mut u32, slot_d1);
+            core::ptr::write_volatile((slot_ctx + 8) as *mut u32, slot_d2);
         }
 
         // EP0 Context — Control endpoint, default MaxPacketSize.
@@ -1942,6 +2052,82 @@ impl Xhci {
     ///
     /// Idempotent: if `new_mps` matches the cached value, returns Ok
     /// without bothering the controller.
+    /// Re-issue Evaluate Context (xHCI 1.2 §4.6.7) to flip the
+    /// device's Slot Context into "is a USB hub" state once we've
+    /// read the Hub Class Descriptor. Per §6.2.2 the controller
+    /// uses the Hub bit + Number of Ports to size internal hub
+    /// state for Transaction-Translator routing on LS/FS devices
+    /// behind it; without this flip the controller may refuse to
+    /// address downstream devices.
+    ///
+    /// Input Context layout:
+    ///   - A0=1 (Slot context valid), all other A bits = 0.
+    ///   - Slot dword0: re-stamped with current Speed + Context
+    ///     Entries, plus the Hub bit (`1<<26`) and optional MTT
+    ///     bit (`1<<25`).
+    ///   - Slot dword1: re-stamped with Root Hub Port Number plus
+    ///     Number of Ports in bits[31:24].
+    pub fn mark_as_hub(
+        &self,
+        slot_id: u8,
+        num_ports: u8,
+        multi_tt: bool,
+    ) -> Result<(), XhciError> {
+        if slot_id == 0 || slot_id > self.caps.max_slots {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        let (speed, port) = {
+            let g = self.devices.lock();
+            let d = g
+                .get(slot_id as usize)
+                .and_then(|x| x.as_ref())
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            (d.speed, d.port)
+        };
+
+        let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
+        let input_phys = input.phys_addr().raw();
+        // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
+        unsafe {
+            core::ptr::write_bytes(input_phys as *mut u8, 0, 4096);
+        }
+        let cs = self.context_stride();
+        let input_ctrl = input_phys;
+        let slot_ctx = input_phys + cs;
+
+        // Add Slot only (A0=1). Drop mask = 0.
+        // SAFETY: identity-mapped, in-page.
+        unsafe {
+            core::ptr::write_volatile((input_ctrl + 4) as *mut u32, 1 << 0);
+        }
+
+        let mut slot_d0 = (1u32 << 27) | ((speed as u32) << 20) | (1u32 << 26); // Hub
+        if multi_tt {
+            slot_d0 |= 1u32 << 25; // MTT
+        }
+        let slot_d1 = ((port as u32) << 16) | ((num_ports as u32) << 24);
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
+            core::ptr::write_volatile((slot_ctx + 4) as *mut u32, slot_d1);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        let trb_type = TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT;
+        let dword3 = trb_type | ((slot_id as u32) << 24);
+        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
+        let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let ev = self
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let _ = input;
+        Ok(())
+    }
+
     pub fn evaluate_context_ep0_mps(
         &self,
         slot_id: u8,

@@ -280,18 +280,49 @@ pub fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidErro
     r
 }
 
+/// Hub-downstream mouse attach: caller has already issued port_reset
+/// (on the hub's downstream port), enable_slot, and
+/// address_device_with(_with_topology). This entry point picks up
+/// from there. On failure the slot is disabled so the caller doesn't
+/// leak it.
+pub fn try_bind_mouse_already_addressed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    speed: crate::xhci::PortSpeed,
+) -> Result<(), HidError> {
+    let r = bind_mouse_addressed_slot(xhci_dev, slot_id, speed);
+    if r.is_err() {
+        let _ = xhci_dev.disable_slot(slot_id);
+    }
+    r
+}
+
 fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
     let slot_id = xhci_dev.enable_slot().map_err(HidError::Xhci)?;
-    // Slot-cleanup guard (audit F-84): every failure past this point
-    // must call disable_slot or we leak xHCI device contexts. Same
-    // shape as the keyboard path.
     let res = (|| -> Result<(), HidError> {
         xhci_dev
             .address_device(slot_id, port, speed)
             .map_err(HidError::Xhci)?;
+        bind_mouse_addressed_slot(xhci_dev, slot_id, speed)
+    })();
+    if res.is_err() {
+        let _ = xhci_dev.disable_slot(slot_id);
+    }
+    res
+}
 
+/// Post-address mouse bind: assumes caller has already addressed
+/// the slot. Does GET_DESCRIPTOR + EP0-MPS refresh + interface
+/// match + configure_endpoints + SET_CONFIGURATION + SET_PROTOCOL
+/// + arm_interrupt_in + registry push. No disable_slot — caller's
+/// guard handles that.
+fn bind_mouse_addressed_slot(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    speed: crate::xhci::PortSpeed,
+) -> Result<(), HidError> {
         // Refresh EP0 MPS via Evaluate Context once the device tells
         // us its real bMaxPacketSize0. Same logic as kbd path
         // (audit F-22 + F-23).
@@ -369,11 +400,6 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         let m = BootMouse::attach(xhci_dev, slot_id, iface, dci)?;
         MICE.lock().push(m);
         Ok(())
-    })();
-    if res.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id);
-    }
-    res
 }
 
 /// Number of mice currently bound.

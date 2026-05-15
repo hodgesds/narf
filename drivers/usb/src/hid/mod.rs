@@ -554,6 +554,31 @@ pub fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidE
     r
 }
 
+/// Hub-downstream variant: caller has already issued port_reset on
+/// the hub's downstream port, allocated `slot_id` via `enable_slot`,
+/// and called `address_device_with` for the topology-aware address.
+/// This entry point picks up from there: GET_DESCRIPTOR + refresh
+/// EP0 MPS + class match + bind. `port` is the hub's downstream
+/// port number (used purely for log dedup / failure attribution —
+/// not for any xHCI register access). On failure the slot is
+/// disabled so the caller doesn't leak it. On success the kbd is
+/// added to the global registry and `note_attach_ok` records the
+/// port for one-shot logging.
+pub fn try_bind_kbd_already_addressed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    port: u8,
+    speed: xhci::PortSpeed,
+) -> Result<(), HidError> {
+    let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed);
+    if r.is_err() {
+        let _ = xhci_dev.disable_slot(slot_id);
+    } else {
+        note_attach_ok(port);
+    }
+    r
+}
+
 fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(|e| {
         let err = HidError::Xhci(e);
@@ -570,19 +595,36 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         note_attach_fail(port, AttachStep::EnableSlot, &err);
         err
     })?;
-    // Slot-cleanup guard: any failure past this point must call
-    // disable_slot or we leak xHCI device contexts. xHCI MaxSlots
-    // on AMD is typically 32; an internal Renoir USB tree can hold
-    // 8+ devices, so even a few leaked slots break later
-    // enumeration. Manual `?` flow doesn't unwind, so explicit
-    // wrappers below.
     let res = (|| -> Result<(), HidError> {
         xhci_dev.address_device(slot_id, port, speed).map_err(|e| {
             let err = HidError::Xhci(e);
             note_attach_fail(port, AttachStep::AddressDevice, &err);
             err
         })?;
+        bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed)
+    })();
+    if res.is_err() {
+        // Free the slot so a retry doesn't leak xHCI device
+        // contexts. AMD Renoir's MaxSlots is typically 32 and a
+        // laptop with multiple internal USB devices can burn
+        // through them quickly across enumeration retries.
+        let _ = xhci_dev.disable_slot(slot_id);
+    }
+    res
+}
 
+/// Post-address kbd bind: assumes the caller has already issued
+/// port_reset / enable_slot / address_device(_with). Does the
+/// device + config descriptor walk, EP0-MPS refresh, kbd interface
+/// match, configure_endpoints, SET_CONFIGURATION, SET_PROTOCOL,
+/// arm_interrupt_in, and registry push. Does NOT call disable_slot
+/// on failure — caller's cleanup_guard handles that.
+fn bind_kbd_addressed_slot(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    port: u8,
+    speed: xhci::PortSpeed,
+) -> Result<(), HidError> {
         // GET_DESCRIPTOR(DEVICE) and refresh EP0 MaxPacketSize via
         // Evaluate Context if the device's real bMaxPacketSize0
         // differs from the speed-default we programmed at Address
@@ -696,15 +738,6 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         })?;
         KEYBOARDS.lock().push(kbd);
         Ok(())
-    })();
-    if res.is_err() {
-        // Free the slot so a retry doesn't leak xHCI device
-        // contexts. AMD Renoir's MaxSlots is typically 32 and a
-        // laptop with multiple internal USB devices can burn
-        // through them quickly across enumeration retries.
-        let _ = xhci_dev.disable_slot(slot_id);
-    }
-    res
 }
 
 /// Number of keyboards currently bound.
