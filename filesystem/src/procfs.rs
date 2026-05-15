@@ -371,14 +371,47 @@ impl FsInstance for ProcFs {
 // ── Generators (system-wide) ────────────────────────────────────
 
 fn gen_cpuinfo() -> String {
+    use core::fmt::Write as _;
     let mut s = String::new();
-    s.push_str("processor\t: 0\n");
-    s.push_str("vendor_id\t: NARF\n");
-    s.push_str("cpu family\t: 0\n");
-    s.push_str("model\t\t: 0\n");
-    s.push_str("model name\t: NARF kernel CPU\n");
-    s.push_str("stepping\t: 0\n");
-    s.push_str("\n");
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_arch::x86_64::ident;
+        let id = ident::read();
+        let vendor_str = match id.vendor {
+            ident::Vendor::Intel => "GenuineIntel",
+            ident::Vendor::Amd => "AuthenticAMD",
+            ident::Vendor::Hygon => "HygonGenuine",
+            ident::Vendor::Centaur => "CentaurHauls",
+            ident::Vendor::Via => "VIA VIA VIA ",
+            ident::Vendor::Zhaoxin => "  Shanghai  ",
+            ident::Vendor::Other(_) => "Unknown",
+        };
+        let brand = ident::brand_str(&id);
+        let model_name = if brand.is_empty() {
+            "(unknown)"
+        } else {
+            brand
+        };
+        // One block per logical CPU. SMP enumeration lands when the
+        // userspace AP-count surface is wired through; today we
+        // report the BSP only — matches what /proc/cpuinfo on a
+        // single-CPU Linux config would show, and the fields are
+        // identical per-block on a homogeneous system anyway.
+        let _ = writeln!(s, "processor\t: 0");
+        let _ = writeln!(s, "vendor_id\t: {}", vendor_str);
+        let _ = writeln!(s, "cpu family\t: {}", id.family);
+        let _ = writeln!(s, "model\t\t: {}", id.model);
+        let _ = writeln!(s, "model name\t: {}", model_name);
+        let _ = writeln!(s, "stepping\t: {}", id.stepping);
+        let _ = writeln!(s, "");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = writeln!(s, "processor\t: 0");
+        let _ = writeln!(s, "vendor_id\t: NARF");
+        let _ = writeln!(s, "model name\t: (arch ident not yet wired)");
+        let _ = writeln!(s, "");
+    }
     s
 }
 
