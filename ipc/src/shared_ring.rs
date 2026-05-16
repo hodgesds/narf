@@ -185,8 +185,23 @@ impl<T, const N: usize> SharedProducer<T, N> {
         // SAFETY: producer is sole writer of slot `idx` until the
         // release-store of `head` publishes it; consumer cannot
         // observe slot before that store.
+        //
+        // `write_volatile` (rather than `MaybeUninit::write`) is
+        // load-bearing: the consumer reaches the slot through a
+        // raw `*mut SharedRing<T, N>` cast from a `u64` phys
+        // address that traversed an opaque kernel/user boundary
+        // (function-pointer dispatch in the syscall table). LLVM
+        // can't trace the read across that boundary, and the
+        // int-to-pointer cast on both sides carries no provenance,
+        // so a plain store of the non-atomic slot payload is
+        // eligible for dead-store elimination — the consumer then
+        // reads zero bytes even though the atomic `head` store
+        // (immune to DSE) advances correctly. Volatile pins the
+        // write as architecturally observable, matching the actual
+        // contract: the slot is a wire-format mailbox shared with
+        // another execution context the compiler can't see.
         unsafe {
-            (*r.slots[idx].get()).write(msg);
+            core::ptr::write_volatile(r.slots[idx].get() as *mut MaybeUninit<T>, MaybeUninit::new(msg));
         }
         // Release: pairs with consumer's Acquire on `head` — slot
         // payload becomes visible before the consumer sees the new
@@ -242,8 +257,15 @@ impl<T, const N: usize> SharedConsumer<T, N> {
         let idx = (tail & SharedRing::<T, N>::MASK) as usize;
         // SAFETY: producer published this slot before its release
         // store of `head`; we acquired that store, so the payload
-        // is now ours to read.
-        let msg = unsafe { (*r.slots[idx].get()).assume_init_read() };
+        // is now ours to read. Volatile pairs with the producer's
+        // `write_volatile` — same reasoning: the slot lives in a
+        // wire-format page shared with an execution context LLVM
+        // can't see, so non-volatile reads were eligible for
+        // load forwarding from a stale "uninitialized" lattice.
+        let msg = unsafe {
+            core::ptr::read_volatile(r.slots[idx].get() as *const MaybeUninit<T>)
+                .assume_init()
+        };
         // Release: pairs with producer's Acquire on tail — frees
         // the slot for the producer to reuse.
         r.tail.store(tail.wrapping_add(1), Ordering::Release);
