@@ -184,8 +184,16 @@ pub fn drain_and_render(fb: &FbWriter) {
 /// active FB writer. Falls back to silently dropping events when
 /// no FB is up so the input ring never fills.
 pub async fn pump(fb: FbWriter) {
+    let mut n: u64 = 0;
     loop {
         drain_and_render(&fb);
+        // Slot 25: cursor::pump heartbeat. Toggle colour each
+        // tick so the user can see the executor is still polling
+        // this task. If 25 stops changing, the executor is wedged
+        // on a sibling task that doesn't yield.
+        let colour = if n & 1 == 0 { 0x00C040_FF } else { 0x00FF_40C0 };
+        narf_memory::beacon::paint(25, colour);
+        n = n.wrapping_add(1);
         narf_scheduler::yield_now().await;
     }
 }

@@ -6,9 +6,19 @@
 //! page via `SYS_FB_RING_MAP`. The kernel-side drain task walks
 //! every active handle on its tick.
 //!
-//! Storage is an `IrqSafeSpinLock<Vec<Entry>>`. The list is tiny —
-//! one per connected process — so a linear scan is fine.
+//! Locking: the top-level `REGISTRY` is an `IrqSafeSpinLock<Vec<Arc<Entry>>>`
+//! that only guards the list of connections (push/remove/snapshot).
+//! Each `Entry`'s mutable state (consumer + drained counter) lives
+//! behind its own `IrqSafeSpinLock`. The drain task snapshots the
+//! `Vec<Arc<Entry>>` under the top lock, releases it, then pops one
+//! command at a time per entry — the per-entry lock is held only
+//! across a few atomic ops, never across the slow MMIO blit. This
+//! matters on real PCIe-UC framebuffers where a 1080p blit is ms-
+//! scale and an IRQ-masking spinlock over it stalls the timer wheel.
 
+extern crate alloc;
+
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,6 +28,14 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::cmd_ring::{self, DrawCmd, DrawRing, RING_DEPTH};
 use crate::{select_active, FbWriter};
 
+/// Mutable per-Entry state. Lives behind an `IrqSafeSpinLock` so the
+/// drain loop can take it for one `try_recv` at a time without
+/// holding the top-level REGISTRY lock.
+struct EntryState {
+    consumer: SharedConsumer<DrawCmd, RING_DEPTH>,
+    drained: u64,
+}
+
 /// One live FB connection. The handle id is the public name; pid
 /// + scanout are kept for reverse-lookup on process exit.
 pub struct Entry {
@@ -25,10 +43,15 @@ pub struct Entry {
     pub pid: u64,
     pub scanout_id: u32,
     pub phys: u64,
-    pub consumer: SharedConsumer<DrawCmd, RING_DEPTH>,
-    /// Cumulative drain count for this handle. Updated by
-    /// `drain_all`; observed by `flush_wait`.
-    pub drained: u64,
+    state: IrqSafeSpinLock<EntryState>,
+}
+
+impl Entry {
+    /// Cumulative drain count for this handle — observed by
+    /// `flush_wait`.
+    pub fn drained(&self) -> u64 {
+        self.state.lock().drained
+    }
 }
 
 impl core::fmt::Debug for Entry {
@@ -38,12 +61,12 @@ impl core::fmt::Debug for Entry {
             .field("pid", &self.pid)
             .field("scanout_id", &self.scanout_id)
             .field("phys", &format_args!("{:#x}", self.phys))
-            .field("drained", &self.drained)
+            .field("drained", &self.drained())
             .finish_non_exhaustive()
     }
 }
 
-static REGISTRY: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<Vec<Arc<Entry>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 /// Errors from `connect`.
@@ -66,8 +89,6 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
         return Err(ConnectError::NoBackend);
     }
     if scanout_id != 0 {
-        // Until multi-scanout support exists, anything other than
-        // the active scanout is rejected.
         return Err(ConnectError::NoBackend);
     }
 
@@ -86,14 +107,16 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
     let (_prod, consumer) = unsafe { cmd_ring::split(ring_ptr) };
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    REGISTRY.lock().push(Entry {
+    REGISTRY.lock().push(Arc::new(Entry {
         handle,
         pid,
         scanout_id,
         phys: phys.raw(),
-        consumer,
-        drained: 0,
-    });
+        state: IrqSafeSpinLock::new(EntryState {
+            consumer,
+            drained: 0,
+        }),
+    }));
     Ok(handle)
 }
 
@@ -110,7 +133,6 @@ pub fn info(handle: u64) -> Option<[u32; 6]> {
     let format_tag = match s.format() {
         crate::PixelFormat::XRGB8888 => 1u32,
     };
-    // stride is in bytes; XRGB8888 = 4 bytes per pixel.
     let stride_bytes = s.stride().checked_mul(4)?;
     Some([s.width(), s.height(), stride_bytes, format_tag, 0, 0])
 }
@@ -132,7 +154,7 @@ pub fn drain_count(handle: u64) -> Option<u64> {
         .lock()
         .iter()
         .find(|e| e.handle == handle)
-        .map(|e| e.drained)
+        .map(|e| e.drained())
 }
 
 /// Tear down a connection. Removes the entry, drops the consumer.
@@ -160,13 +182,26 @@ pub fn disconnect_all_for_pid(pid: u64) -> u32 {
 
 /// Walk every registered ring; drain each through the supplied
 /// FbWriter. Returns `(executed, errors)` summed across rings.
+///
+/// Locking strategy: REGISTRY is held for the whole walk, and each
+/// entry's inner `state` lock is taken for the duration of that
+/// entry's drain. This is a real reduction vs the previous shape,
+/// which held REGISTRY across all entries' drains directly — now a
+/// concurrent re-entry from the sleep-pump path (drain_all called
+/// recursively from `responsive_spin_until`) lands on a different
+/// entry's state lock instead of contending the same REGISTRY.
+/// Tried snapshot-and-release; abandoned because the sleep-pump
+/// re-entry path deadlocks the per-entry `IrqSafeSpinLock` when
+/// REGISTRY is unlocked mid-drain (re-entry pops the same entry's
+/// state lock recursively → IrqSafeSpinLock isn't reentrant).
 pub fn drain_all(writer: &FbWriter) -> (u32, u32) {
     let mut total_ok = 0u32;
     let mut total_err = 0u32;
-    let mut g = REGISTRY.lock();
-    for e in g.iter_mut() {
-        let (ok, err) = cmd_ring::drain(&mut e.consumer, writer);
-        e.drained = e.drained.saturating_add(ok as u64);
+    let g = REGISTRY.lock();
+    for e in g.iter() {
+        let mut st = e.state.lock();
+        let (ok, err) = cmd_ring::drain(&mut st.consumer, writer);
+        st.drained = st.drained.saturating_add(ok as u64);
         total_ok += ok;
         total_err += err;
     }

@@ -34,5 +34,11 @@ narf-aml          = { path = "../aml" }
 narf-power        = { path = "../power" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
+[features]
+# Marker the frame-level `kernel-test` feature switches on so this
+# crate can skip work that would interfere with the test harness
+# (live status-panel repaint while a test installs a test scanout).
+kernel-test = []
+
 [lints]
 workspace = true

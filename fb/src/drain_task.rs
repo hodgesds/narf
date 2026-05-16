@@ -21,11 +21,23 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
+#[cfg(not(feature = "kernel-test"))]
+use crate::status;
 use crate::{registry, FbWriter};
 
 static DRAIN_TICKS: AtomicU64 = AtomicU64::new(0);
 static DRAIN_EXECUTED: AtomicU64 = AtomicU64::new(0);
 static DRAIN_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// TSC at last status-panel repaint. Drives a wheel-independent
+/// ~250 ms refresh in `DrainTask::poll` (the `fb-status-refresh`
+/// initcall relies on `narf_time::sleep_cycles` which silently
+/// never wakes when the timer wheel arm callback isn't installed —
+/// HPET probe failure on Zen2 mobile silicon is the motivating
+/// case). Read via raw `now_cycles()` so no wheel dependency.
+#[cfg(not(feature = "kernel-test"))]
+static STATUS_LAST_TSC: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "kernel-test"))]
+const STATUS_REPAINT_CYCLES: u64 = 250_000_000;
 
 /// Snapshot the per-tick / per-call counters. Returns
 /// `(ticks, executed, errors)`.
@@ -71,12 +83,50 @@ impl DrainTask {
 impl Future for DrainTask {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Slot 22: paint UNCONDITIONALLY at poll entry, before
+        // anything else. If slot 22 doesn't paint on the laptop
+        // *with this build*, DrainTask isn't being polled at all
+        // → BSP wedged inside whatever task is ahead of DrainTask
+        // in the queue. If slot 22 paints but slot 27 (further
+        // down) doesn't, drain_once is wedging.
+        narf_memory::beacon::paint(22, 0x00FF_FFFF); // white
         // Run one pass, then re-arm the awake flag so the
         // executor re-polls us next round. Same pattern as
         // narf_scheduler::yield_now — without the wake_by_ref the
         // scheduler's `awake.swap(false)` gate parks us after one
         // poll and the FB scanout stops advancing.
         drain_once(&self.writer);
+        // Slot 27: DrainTask::poll heartbeat. Toggles colour each
+        // poll so the user sees that the executor IS polling the
+        // drain task. If 27 stays a single colour, BSP is wedged
+        // on something else (init/shell/measure-phys task).
+        #[cfg(not(feature = "kernel-test"))]
+        {
+            let n = DRAIN_TICKS.load(Ordering::Relaxed);
+            let colour = if n & 1 == 0 { 0x00FF_4040 } else { 0x0040_FF40 };
+            narf_memory::beacon::paint(27, colour);
+        }
+        // Wheel-independent status-panel refresh. Each poll reads
+        // TSC; ~250 ms apart we re-paint. Skipped under kernel-test
+        // because tests install/clear scratch scanouts and the live
+        // subsystem queries panel does (USB, I2C, AML, power) can
+        // corrupt the test scanout or read mid-reset state.
+        #[cfg(not(feature = "kernel-test"))]
+        {
+            let now = narf_time::now_cycles();
+            let last = STATUS_LAST_TSC.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= STATUS_REPAINT_CYCLES {
+                STATUS_LAST_TSC.store(now, Ordering::Relaxed);
+                status::paint(&self.writer);
+                // Slot 26: status::paint heartbeat. Toggles each
+                // repaint. If 26 changes but the panel isn't on
+                // screen, status::paint runs but its writes aren't
+                // landing (FbWriter cap issue, scanout swap, etc).
+                let n = STATUS_LAST_TSC.load(Ordering::Relaxed);
+                let colour = if (n >> 28) & 1 == 0 { 0x000080_FF } else { 0x00FF_8000 };
+                narf_memory::beacon::paint(26, colour);
+            }
+        }
         cx.waker().wake_by_ref();
         Poll::Pending
     }
