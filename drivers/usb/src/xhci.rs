@@ -1402,11 +1402,6 @@ impl Xhci {
         // proceed. A glitchy connect that toggles within the
         // window is treated as "not yet stable" — caller's
         // supervisor poll re-tries on the next tick.
-        //
-        // We call `sleep_pumps::run()` once per sample so the FB /
-        // cursor / serial console stay alive through the 100 ms
-        // synchronous wait — matches the discipline `await_event`
-        // already follows for command-completion waits.
         const DEBOUNCE_SAMPLES: u32 = 100;
         for _ in 0..DEBOUNCE_SAMPLES {
             // SAFETY: same MMIO region.
@@ -1414,7 +1409,6 @@ impl Xhci {
             if v & PORTSC_CCS == 0 {
                 return Err(XhciError::BadPort);
             }
-            narf_scheduler::sleep_pumps::run();
             for _ in 0..100_000 {
                 core::hint::spin_loop();
             }

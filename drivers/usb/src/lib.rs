@@ -112,20 +112,6 @@ fn spawn_supervisor_task() {
             }
 
             // ── Phase 1: root-hub ports ────────────────────────────
-            //
-            // Each port's reset+enumerate path inside
-            // `try_attach_root` runs sync (PORTSC debounce + Address
-            // Device + descriptor reads) and can take several
-            // hundred ms to ~1 s per port on real silicon. With a
-            // dozen connected ports the first supervisor iteration
-            // would block the executor for 10+ s — long enough for
-            // the cursor pump, FB drain task, and shell prompt
-            // task to never appear to make progress.
-            //
-            // Yield to the scheduler between every port so other
-            // tasks get to poll. The yield is cheap (no IO; just
-            // re-enqueues the supervisor) and the actual port work
-            // still happens at the same wall-clock rate.
             let connected_root: alloc::vec::Vec<u8> = xhci::with_controller(|c| {
                 c.connected_ports().iter().map(|(p, _)| *p).collect()
             })
@@ -156,7 +142,6 @@ fn spawn_supervisor_task() {
                         root_fail_count[pi] = root_fail_count[pi].saturating_add(1);
                     }
                 }
-                narf_scheduler::yield_now().await;
             }
 
             // ── Phase 2: walk every bound hub's downstream ports ───
@@ -231,18 +216,11 @@ fn spawn_supervisor_task() {
                         h.bound_downstream |= new_bound_bits;
                     }
                 }
-                // Same starvation reasoning as Phase 1 — yield
-                // between hubs so a long downstream-port walk on
-                // one hub doesn't block other tasks.
-                narf_scheduler::yield_now().await;
             }
 
             let _ = xhci::with_controller(|c| hid::pump_all(c));
-            narf_scheduler::yield_now().await;
             let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
-            narf_scheduler::yield_now().await;
             let _ = xhci::with_controller(|c| hid::touchpad::pump_all(c));
-            narf_scheduler::yield_now().await;
             let _ = xhci::with_controller(|c| cdc_acm::pump_all(c));
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
