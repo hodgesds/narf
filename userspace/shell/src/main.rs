@@ -5,16 +5,21 @@
 //! Single-process, no fork — every command runs synchronously inside
 //! the shell's own trap context.
 //!
-//! Built-in commands:
-//!   help               — list commands.
-//!   echo <text>        — write text + newline back to the console.
-//!   uname              — print "NARF" + the kernel version banner.
-//!   pid                — call `getpid()` and print the result.
-//!   exit               — terminate the shell process.
+//! Built-in commands grouped by surface they exercise:
+//!
+//!   basic:  help echo uname pid pwd cd whoami hostname clear date env
+//!           getenv true false exit
+//!   fs:     cat ls stat head wc mkdir rmdir rm mv touch
+//!   proc:   sleep kill exec
+//!   smoke:  termtest condwait polltest tcpwire pidtest flocktest
+//!           mqtest proctest udptest entropytest shmtest tcptest
+//!           socktest threads raise
 //!
 //! Anything else is reported as "unknown command". The dispatch table
 //! lives in `dispatch_line` so adding a new built-in is one match arm
-//! plus its handler.
+//! plus its handler. Path-taking builtins share the `trim_arg` helper
+//! (strips leading whitespace + trailing control bytes) and a stack
+//! 256-byte NUL buffer for the C-string handoff.
 
 #![no_std]
 #![no_main]
@@ -1001,7 +1006,503 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
     }
     if cmd == b"help" {
         unsafe {
-            write_all(fd, b"commands: help echo uname pid cat ls exec exit\n");
+            write_all(
+                fd,
+                b"commands:\n  \
+                  basic: help echo uname pid pwd cd whoami hostname clear date env getenv\n  \
+                  fs:    cat ls stat head wc mkdir rmdir rm mv touch\n  \
+                  proc:  sleep kill true false exec exit\n  \
+                  smoke: termtest condwait polltest tcpwire pidtest flocktest mqtest\n         \
+                         proctest udptest entropytest shmtest tcptest socktest threads raise\n",
+            );
+        }
+    } else if cmd == b"pwd" {
+        // pwd — print the current working directory. POSIX `getcwd`
+        // surfaces -1/NULL on overflow; we cap at 1 KiB which is more
+        // than enough for the shell's depth budget.
+        let mut buf = [0u8; 1024];
+        let p = unsafe { libc::getcwd(buf.as_mut_ptr(), buf.len()) };
+        if p.is_null() {
+            unsafe { write_all(fd, b"pwd: failed\n"); }
+        } else {
+            let mut n = 0usize;
+            while n < buf.len() && buf[n] != 0 {
+                n += 1;
+            }
+            unsafe {
+                write_all(fd, &buf[..n]);
+                write_all(fd, NEWLINE);
+            }
+        }
+    } else if cmd == b"cd" {
+        // cd <path> — chdir; bare `cd` is rejected (no $HOME shim).
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"cd: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"cd: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let r = unsafe { libc::chdir(pbuf.as_ptr()) };
+                if r != 0 {
+                    unsafe { write_all(fd, b"cd: failed\n"); }
+                }
+            }
+        }
+    } else if cmd == b"whoami" {
+        // whoami — print the numeric uid. /etc/passwd lookup will land
+        // alongside the account/ getpwuid wiring; for now show the
+        // value getuid returns.
+        let uid = unsafe { libc::getuid() } as u32;
+        let mut buf = [0u8; 12];
+        let s = u32_to_decimal(uid, &mut buf);
+        unsafe {
+            write_all(fd, b"uid=");
+            write_all(fd, s);
+            write_all(fd, NEWLINE);
+        }
+    } else if cmd == b"hostname" {
+        // hostname        — read.
+        // hostname <name> — write (sethostname).
+        let arg = trim_arg(rest);
+        if arg.is_empty() {
+            let mut buf = [0u8; 256];
+            let r = unsafe {
+                libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len())
+            };
+            if r != 0 {
+                unsafe { write_all(fd, b"hostname: gethostname failed\n"); }
+            } else {
+                let mut n = 0usize;
+                while n < buf.len() && buf[n] != 0 {
+                    n += 1;
+                }
+                unsafe {
+                    write_all(fd, &buf[..n]);
+                    write_all(fd, NEWLINE);
+                }
+            }
+        } else if arg.len() > 64 {
+            unsafe { write_all(fd, b"hostname: name too long (max 64)\n"); }
+        } else {
+            let r = unsafe {
+                libc::sethostname(arg.as_ptr() as *const i8, arg.len())
+            };
+            if r != 0 {
+                unsafe { write_all(fd, b"hostname: sethostname failed\n"); }
+            }
+        }
+    } else if cmd == b"clear" {
+        // clear — ANSI CSI 2J (erase entire screen) + CSI H (cursor home).
+        // The console driver honours both sequences; falls back gracefully
+        // on terminals that don't.
+        unsafe { write_all(fd, b"\x1b[2J\x1b[H"); }
+    } else if cmd == b"true" {
+        // true — POSIX no-op succeeds. Useful as a `false ;` placeholder
+        // and to validate the dispatcher with a zero-arg builtin.
+    } else if cmd == b"false" {
+        // false — POSIX no-op fails. Surface the failure via a stderr-ish
+        // marker so test scripts can grep it.
+        unsafe { write_all(fd, b"(false)\n"); }
+    } else if cmd == b"sleep" {
+        // sleep <secs> — block for N seconds via libc::sleep, which
+        // routes to sys_sleep. Capped at 60 s so a typo doesn't wedge
+        // the shell.
+        let s = skip_ws(rest);
+        let mut secs: u32 = 0;
+        for &b in s.iter() {
+            if (b as char).is_ascii_digit() {
+                secs = secs.saturating_mul(10) + ((b - b'0') as u32);
+            } else {
+                break;
+            }
+        }
+        if secs == 0 {
+            unsafe { write_all(fd, b"sleep: positive seconds required\n"); }
+        } else if secs > 60 {
+            unsafe { write_all(fd, b"sleep: clamped to 60s\n"); }
+            let _ = unsafe { libc::sleep(60) };
+        } else {
+            let _ = unsafe { libc::sleep(secs) };
+        }
+    } else if cmd == b"date" {
+        // date — print the wall clock in `YYYY-MM-DD HH:MM:SS` UTC.
+        // Uses clock_gettime(CLOCK_REALTIME) → gmtime_r → manual format
+        // so we don't depend on strftime locale state.
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let r = unsafe { libc::clock_gettime(0, &mut ts) };
+        if r != 0 {
+            unsafe { write_all(fd, b"date: clock_gettime failed\n"); }
+        } else {
+            let mut t = libc::tm::default();
+            let _ = unsafe { libc::gmtime_r(&ts.tv_sec, &mut t) };
+            // YYYY-MM-DD HH:MM:SS\n
+            let mut buf = [0u8; 24];
+            let year = (t.tm_year as i64) + 1900;
+            let mon = (t.tm_mon as i64) + 1;
+            let mday = t.tm_mday as i64;
+            let hour = t.tm_hour as i64;
+            let min = t.tm_min as i64;
+            let sec = t.tm_sec as i64;
+            fn fill4(buf: &mut [u8], pos: usize, mut v: i64) {
+                for i in (0..4).rev() {
+                    buf[pos + i] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                }
+            }
+            fn fill2(buf: &mut [u8], pos: usize, mut v: i64) {
+                for i in (0..2).rev() {
+                    buf[pos + i] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                }
+            }
+            fill4(&mut buf, 0, year);
+            buf[4] = b'-';
+            fill2(&mut buf, 5, mon);
+            buf[7] = b'-';
+            fill2(&mut buf, 8, mday);
+            buf[10] = b' ';
+            fill2(&mut buf, 11, hour);
+            buf[13] = b':';
+            fill2(&mut buf, 14, min);
+            buf[16] = b':';
+            fill2(&mut buf, 17, sec);
+            buf[19] = b'\n';
+            unsafe { write_all(fd, &buf[..20]); }
+        }
+    } else if cmd == b"env" {
+        // env — walk the global environ table and print one entry per
+        // line. NUL-terminated C strings; we measure each in place.
+        let envp = unsafe { libc::ENVIRON };
+        if envp.is_null() {
+            unsafe { write_all(fd, b"(no environ)\n"); }
+        } else {
+            let mut i = 0isize;
+            loop {
+                let entry = unsafe { *envp.offset(i) };
+                if entry.is_null() {
+                    break;
+                }
+                // Find the NUL.
+                let mut n = 0usize;
+                while n < 4096 && unsafe { *entry.add(n) } != 0 {
+                    n += 1;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(entry, n) };
+                unsafe {
+                    write_all(fd, bytes);
+                    write_all(fd, NEWLINE);
+                }
+                i += 1;
+            }
+        }
+    } else if cmd == b"getenv" {
+        // getenv KEY — print the value of an env var, or "(unset)".
+        let key = trim_arg(rest);
+        if key.is_empty() {
+            unsafe { write_all(fd, b"getenv: missing key\n"); }
+        } else {
+            let v = unsafe { libc::getenv(key.as_ptr(), key.len()) };
+            if v.is_null() {
+                unsafe { write_all(fd, b"(unset)\n"); }
+            } else {
+                let mut n = 0usize;
+                while n < 4096 && unsafe { *v.add(n) } != 0 {
+                    n += 1;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(v, n) };
+                unsafe {
+                    write_all(fd, bytes);
+                    write_all(fd, NEWLINE);
+                }
+            }
+        }
+    } else if cmd == b"mkdir" {
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"mkdir: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"mkdir: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let r = unsafe {
+                    libc::posix_mkdir(pbuf.as_ptr() as *const i8, 0o755)
+                };
+                if r != 0 {
+                    unsafe { write_all(fd, b"mkdir: failed\n"); }
+                }
+            }
+        }
+    } else if cmd == b"rmdir" {
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"rmdir: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"rmdir: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let r = unsafe { libc::posix_rmdir(pbuf.as_ptr() as *const i8) };
+                if r != 0 {
+                    unsafe { write_all(fd, b"rmdir: failed\n"); }
+                }
+            }
+        }
+    } else if cmd == b"rm" {
+        // rm <path> — unlink a single file. No recursion (no -r),
+        // no -f. Matches the minimalist shell aesthetic.
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"rm: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"rm: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let r = unsafe { libc::posix_unlink(pbuf.as_ptr() as *const i8) };
+                if r != 0 {
+                    unsafe { write_all(fd, b"rm: failed\n"); }
+                }
+            }
+        }
+    } else if cmd == b"mv" {
+        // mv <from> <to> — rename a file. Splits `rest` on the first
+        // run of whitespace; both halves must be non-empty.
+        let s = skip_ws(rest);
+        let (from, after) = split_first(s);
+        let to = trim_arg(after);
+        if from.is_empty() || to.is_empty() {
+            unsafe { write_all(fd, b"mv: usage: mv <from> <to>\n"); }
+        } else if from.len() + 1 >= 256 || to.len() + 1 >= 256 {
+            unsafe { write_all(fd, b"mv: path too long\n"); }
+        } else {
+            let mut fbuf = [0u8; 256];
+            let mut tbuf = [0u8; 256];
+            fbuf[..from.len()].copy_from_slice(from);
+            tbuf[..to.len()].copy_from_slice(to);
+            let r = unsafe {
+                libc::posix_rename(
+                    fbuf.as_ptr() as *const i8,
+                    tbuf.as_ptr() as *const i8,
+                )
+            };
+            if r != 0 {
+                unsafe { write_all(fd, b"mv: failed\n"); }
+            }
+        }
+    } else if cmd == b"touch" {
+        // touch <path> — open(O_CREAT|O_WRONLY); close. Doesn't update
+        // mtime on an existing file (the kernel's utimes is a stub).
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"touch: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"touch: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let r = unsafe {
+                    libc::posix_open(
+                        pbuf.as_ptr() as *const i8,
+                        libc::O_WRONLY | libc::O_CREAT,
+                        0o644,
+                    )
+                };
+                if r < 0 {
+                    unsafe { write_all(fd, b"touch: open failed\n"); }
+                } else {
+                    unsafe { libc::posix_close(r); }
+                }
+            }
+        }
+    } else if cmd == b"stat" {
+        // stat <path> — print size + mode + file kind. We don't pull in
+        // a printf, so emit each field on its own line.
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"stat: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"stat: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let mut st = libc::StatBuf::default();
+                let r = unsafe { libc::stat(pbuf.as_ptr(), &mut st) };
+                if r != 0 {
+                    unsafe { write_all(fd, b"stat: failed\n"); }
+                } else {
+                    let kind: &[u8] =
+                        if (st.mode & libc::S_IFMT) == libc::S_IFDIR { b"dir" }
+                        else if (st.mode & libc::S_IFMT) == libc::S_IFREG { b"file" }
+                        else if (st.mode & libc::S_IFMT) == libc::S_IFLNK { b"symlink" }
+                        else { b"special" };
+                    let mut buf = [0u8; 24];
+                    let sz_s = u64_to_decimal(st.size, &mut buf);
+                    unsafe {
+                        write_all(fd, b"kind=");
+                        write_all(fd, kind);
+                        write_all(fd, b" size=");
+                        write_all(fd, sz_s);
+                        write_all(fd, NEWLINE);
+                    }
+                    let mut mbuf = [0u8; 12];
+                    let m_s = u32_to_octal(st.mode & 0o777, &mut mbuf);
+                    unsafe {
+                        write_all(fd, b"mode=0");
+                        write_all(fd, m_s);
+                        write_all(fd, NEWLINE);
+                    }
+                }
+            }
+        }
+    } else if cmd == b"head" {
+        // head <path> — first 10 lines, capped at 8 KiB total.
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"head: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"head: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let in_fd = unsafe {
+                    libc::posix_open(pbuf.as_ptr() as *const i8, libc::O_RDONLY, 0)
+                };
+                if in_fd < 0 {
+                    unsafe { write_all(fd, b"head: open failed\n"); }
+                } else {
+                    let mut buf = [0u8; 1024];
+                    let mut lines = 0u32;
+                    let mut total = 0usize;
+                    'outer: loop {
+                        let n = unsafe {
+                            libc::posix_read(in_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                        };
+                        if n <= 0 || total >= 8 * 1024 {
+                            break;
+                        }
+                        let mut start = 0usize;
+                        for i in 0..n as usize {
+                            if buf[i] == b'\n' {
+                                unsafe { write_all(fd, &buf[start..=i]); }
+                                start = i + 1;
+                                lines += 1;
+                                if lines >= 10 {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        if start < n as usize {
+                            unsafe { write_all(fd, &buf[start..n as usize]); }
+                        }
+                        total += n as usize;
+                    }
+                    unsafe { libc::posix_close(in_fd); }
+                }
+            }
+        }
+    } else if cmd == b"wc" {
+        // wc <path> — count bytes + lines + words. Whitespace-delimited
+        // words; treats consecutive WS as one separator.
+        let path = trim_arg(rest);
+        if path.is_empty() {
+            unsafe { write_all(fd, b"wc: missing path\n"); }
+        } else {
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"wc: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let in_fd = unsafe {
+                    libc::posix_open(pbuf.as_ptr() as *const i8, libc::O_RDONLY, 0)
+                };
+                if in_fd < 0 {
+                    unsafe { write_all(fd, b"wc: open failed\n"); }
+                } else {
+                    let mut bytes: u64 = 0;
+                    let mut lines: u64 = 0;
+                    let mut words: u64 = 0;
+                    let mut in_word = false;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = unsafe {
+                            libc::posix_read(in_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                        };
+                        if n <= 0 {
+                            break;
+                        }
+                        bytes += n as u64;
+                        for i in 0..n as usize {
+                            let b = buf[i];
+                            if b == b'\n' {
+                                lines += 1;
+                            }
+                            let ws = b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+                            if !ws && !in_word {
+                                in_word = true;
+                                words += 1;
+                            } else if ws {
+                                in_word = false;
+                            }
+                        }
+                    }
+                    unsafe { libc::posix_close(in_fd); }
+                    let mut lbuf = [0u8; 24];
+                    let l_s = u64_to_decimal(lines, &mut lbuf);
+                    let mut wbuf = [0u8; 24];
+                    let w_s = u64_to_decimal(words, &mut wbuf);
+                    let mut bbuf = [0u8; 24];
+                    let b_s = u64_to_decimal(bytes, &mut bbuf);
+                    unsafe {
+                        write_all(fd, b"lines=");
+                        write_all(fd, l_s);
+                        write_all(fd, b" words=");
+                        write_all(fd, w_s);
+                        write_all(fd, b" bytes=");
+                        write_all(fd, b_s);
+                        write_all(fd, NEWLINE);
+                    }
+                }
+            }
+        }
+    } else if cmd == b"kill" {
+        // kill <pid> <signum> — signal-delivery smoke. Both args
+        // required; we parse two decimal integers from rest.
+        let s = skip_ws(rest);
+        let (pid_str, after) = split_first(s);
+        let sig_str = trim_arg(after);
+        let mut pid: i64 = 0;
+        for &b in pid_str.iter() {
+            if (b as char).is_ascii_digit() {
+                pid = pid * 10 + ((b - b'0') as i64);
+            } else {
+                break;
+            }
+        }
+        let mut signum: i32 = 0;
+        for &b in sig_str.iter() {
+            if (b as char).is_ascii_digit() {
+                signum = signum * 10 + ((b - b'0') as i32);
+            } else {
+                break;
+            }
+        }
+        if pid <= 0 || signum <= 0 {
+            unsafe { write_all(fd, b"kill: usage: kill <pid> <signum>\n"); }
+        } else {
+            let r = unsafe { libc::kill(pid, signum) };
+            if r != 0 {
+                unsafe { write_all(fd, b"kill: failed\n"); }
+            }
         }
     } else if cmd == b"exec" {
         // exec <path> — POSIX-style replace-current-task with the
@@ -1334,6 +1835,55 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Strip leading whitespace + trailing whitespace/control bytes from
+/// the back of an arg slice. Used by the path-taking builtins so a
+/// stray trailing CR (from CRLF terminals) or padding space doesn't
+/// land inside the NUL-terminated buffer the syscall sees.
+fn trim_arg(s: &[u8]) -> &[u8] {
+    let s = skip_ws(s);
+    let mut end = s.len();
+    while end > 0 && (s[end - 1] == b' ' || s[end - 1] < 0x20) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn u64_to_decimal(mut v: u64, buf: &mut [u8]) -> &[u8] {
+    if v == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut tmp = [0u8; 24];
+    let mut i = 0;
+    while v != 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    for (j, &c) in tmp[..i].iter().rev().enumerate() {
+        buf[j] = c;
+    }
+    &buf[..i]
+}
+
+fn u32_to_octal(mut v: u32, buf: &mut [u8]) -> &[u8] {
+    if v == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut tmp = [0u8; 12];
+    let mut i = 0;
+    while v != 0 {
+        tmp[i] = b'0' + (v & 0o7) as u8;
+        v >>= 3;
+        i += 1;
+    }
+    for (j, &c) in tmp[..i].iter().rev().enumerate() {
+        buf[j] = c;
+    }
+    &buf[..i]
 }
 
 fn u32_to_decimal(mut v: u32, buf: &mut [u8]) -> &[u8] {
