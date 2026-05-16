@@ -590,3 +590,288 @@ fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("block", smoke_block_deadline_tags_are_monotonic);
+
+// ── extended block coverage ────────────────────────────────────────
+//
+// Existing surface hit read/write balancing, deadline promotion, the
+// MQ round-robin, encrypted round-trip, and the SCSI / OPAL wire
+// shapes. New smokes close the remaining invariants on the
+// scheduler primitives + registry + MQ edge cases.
+
+fn smoke_block_deadline_empty_dequeue_is_none() -> TestResult {
+    // Fresh scheduler: dequeue_next returns None on both lanes empty,
+    // len() == 0, is_empty() == true.
+    use crate::DeadlineScheduler;
+    let s = DeadlineScheduler::new();
+    if !s.is_empty() {
+        return TestResult::Fail("fresh scheduler not empty");
+    }
+    if s.len() != 0 || s.reads_pending() != 0 || s.writes_pending() != 0 {
+        return TestResult::Fail("fresh scheduler pending counts non-zero");
+    }
+    if s.dequeue_next(0).is_some() {
+        return TestResult::Fail("dequeue on empty returned Some");
+    }
+    if s.dequeue_next(u64::MAX).is_some() {
+        return TestResult::Fail("dequeue with max-now on empty returned Some");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_deadline_empty_dequeue_is_none);
+
+fn smoke_block_deadline_write_only_drains_in_order() -> TestResult {
+    // No reads at all → writes drain in enqueue order, every dequeue
+    // resets the read-streak counter implicitly.
+    use crate::{BlockOp, DeadlineScheduler};
+    let s = DeadlineScheduler::new();
+    for i in 0..4 {
+        s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x100 + i), u64::MAX);
+    }
+    if s.writes_pending() != 4 {
+        return TestResult::Fail("writes_pending didn't reach 4");
+    }
+    for i in 0..4 {
+        let r = s.dequeue_next(0).expect("pending write");
+        if !matches!(r.op, BlockOp::Write { .. }) || r.user_tag != 0x100 + i {
+            return TestResult::Fail("write-only drain order broken");
+        }
+    }
+    if !s.is_empty() {
+        return TestResult::Fail("scheduler should be empty after draining all writes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_deadline_write_only_drains_in_order);
+
+fn smoke_block_lane_of_classifies_ops() -> TestResult {
+    // Lane::of maps Read → Read; every other op → Write (including
+    // WriteZeroes and Trim — Stage-3 collapses Trim into the write
+    // lane intentionally; the spec calls out a future Trim lane).
+    use crate::{BlockOp, Lane};
+    if Lane::of(BlockOp::Read) != Lane::Read {
+        return TestResult::Fail("Read didn't map to Lane::Read");
+    }
+    if Lane::of(BlockOp::Write { fua: false }) != Lane::Write {
+        return TestResult::Fail("Write didn't map to Lane::Write");
+    }
+    if Lane::of(BlockOp::Write { fua: true }) != Lane::Write {
+        return TestResult::Fail("Write{fua:true} didn't map to Lane::Write");
+    }
+    if Lane::of(BlockOp::WriteZeroes) != Lane::Write {
+        return TestResult::Fail("WriteZeroes didn't map to Lane::Write");
+    }
+    if Lane::of(BlockOp::Trim) != Lane::Write {
+        return TestResult::Fail("Trim didn't map to Lane::Write (Stage-3 collapse)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_lane_of_classifies_ops);
+
+fn smoke_block_deadline_streak_resets_after_write() -> TestResult {
+    // The consecutive-read counter must reset after any write
+    // dispatch. Enqueue 4 reads + 1 write + 4 more reads; the write
+    // should fire after the first 4 reads (no STARVE_BOUND hit), and
+    // the post-write reads must NOT be subjected to a phantom
+    // bound-already-near state.
+    use crate::{BlockOp, DeadlineScheduler, STARVE_BOUND};
+    let s = DeadlineScheduler::new();
+    // STARVE_BOUND reads then 1 write — write promotes after the run.
+    for i in 0..STARVE_BOUND {
+        s.enqueue(make_block_request(BlockOp::Read, 0x100 + i as u64), u64::MAX);
+    }
+    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0xC0), u64::MAX);
+    // Now add 5 more reads + 1 more write so we can observe streak
+    // reset behaviour.
+    for i in 0..STARVE_BOUND {
+        s.enqueue(make_block_request(BlockOp::Read, 0x200 + i as u64), u64::MAX);
+    }
+    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0xCC), u64::MAX);
+
+    // First batch of reads: STARVE_BOUND of them.
+    for _ in 0..STARVE_BOUND {
+        let r = s.dequeue_next(0).expect("read");
+        if r.op != BlockOp::Read {
+            return TestResult::Fail("expected Read in first batch");
+        }
+    }
+    // First write fires (streak hit STARVE_BOUND, write was queued).
+    let r = s.dequeue_next(0).expect("write");
+    if r.user_tag != 0xC0 {
+        return TestResult::Fail("first write tag mismatch");
+    }
+    // Counter reset → next STARVE_BOUND reads come out before the
+    // second write.
+    for _ in 0..STARVE_BOUND {
+        let r = s.dequeue_next(0).expect("post-reset read");
+        if r.op != BlockOp::Read {
+            return TestResult::Fail("post-reset read lane drained wrong op");
+        }
+    }
+    let r = s.dequeue_next(0).expect("second write");
+    if r.user_tag != 0xCC {
+        return TestResult::Fail("second write tag mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_deadline_streak_resets_after_write);
+
+fn smoke_block_mq_enqueue_on_out_of_range_returns_none() -> TestResult {
+    // `enqueue_on(invalid_lane, ...)` returns None and DOESN'T panic
+    // or insert anything anywhere.
+    use crate::{BlockOp, MqDeadlineScheduler};
+    let s = MqDeadlineScheduler::with_lanes(4);
+    let r = s.enqueue_on(4, make_block_request(BlockOp::Read, 0x99), u64::MAX);
+    if r.is_some() {
+        return TestResult::Fail("out-of-range lane accepted submission");
+    }
+    let r = s.enqueue_on(64, make_block_request(BlockOp::Read, 0x99), u64::MAX);
+    if r.is_some() {
+        return TestResult::Fail("very-out-of-range lane accepted submission");
+    }
+    if s.len() != 0 {
+        return TestResult::Fail("failed enqueue still bumped pending count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_mq_enqueue_on_out_of_range_returns_none);
+
+fn smoke_block_mq_lane_count_and_accessor() -> TestResult {
+    // lane_count() reflects construction; lane(i) returns Some(&Sched)
+    // in-range and None out-of-range.
+    use crate::MqDeadlineScheduler;
+    let s = MqDeadlineScheduler::with_lanes(8);
+    if s.lane_count() != 8 {
+        return TestResult::Fail("lane_count drifted from construction");
+    }
+    if s.lane(0).is_none() || s.lane(7).is_none() {
+        return TestResult::Fail("in-range lane accessor returned None");
+    }
+    if s.lane(8).is_some() {
+        return TestResult::Fail("out-of-range lane accessor returned Some");
+    }
+    // Per-lane sub-scheduler starts empty.
+    if !s.lane(3).unwrap().is_empty() {
+        return TestResult::Fail("fresh lane not empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_mq_lane_count_and_accessor);
+
+// NOTE: a "cross-lane expired-promotion wins regardless of cursor"
+// test would be valuable, but `MqDeadlineScheduler::drain_expired`
+// today just walks lanes in order and pulls from the first
+// non-empty one — so an in-deadline entry on lane 0 beats an
+// expired entry on lane 2. The docstring above `dequeue_next`
+// claims the opposite ("expired-lane promotion wins regardless of
+// cursor"), so either the docstring or the code is wrong. Pinning
+// either side would lock in the present bug; leaving this slot
+// open until the spec gap is resolved (and then the test pins the
+// chosen behaviour).
+
+fn smoke_block_mq_dequeue_skips_empty_lanes() -> TestResult {
+    // Three lanes, only lane 2 has a request. dequeue_next must walk
+    // round-robin from the current cursor, skip empties, and find
+    // the one queued request.
+    use crate::{BlockOp, MqDeadlineScheduler};
+    let s = MqDeadlineScheduler::with_lanes(3);
+    s.enqueue_on(2, make_block_request(BlockOp::Read, 0xD0), u64::MAX);
+    let r = s.dequeue_next(0).expect("non-empty lane");
+    if r.user_tag != 0xD0 {
+        return TestResult::Fail("dequeue didn't find the queued request");
+    }
+    if !s.is_empty() {
+        return TestResult::Fail("post-dequeue MQ not empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_mq_dequeue_skips_empty_lanes);
+
+fn smoke_block_registry_register_find_round_trip() -> TestResult {
+    // Register a synthetic device, find it by name, confirm
+    // block_device_count + block_devices reflect the registration.
+    // Re-register with the same name replaces in place (no double-
+    // count).
+    use crate::registry::{
+        block_device_count, find_block_device, register_block_device, BlockDeviceSync,
+        BlockIoError, __reset_for_test,
+    };
+    use alloc::sync::Arc;
+
+    struct Stub;
+    impl BlockDeviceSync for Stub {
+        fn lba_size(&self) -> u32 { 512 }
+        fn capacity(&self) -> u64 { 8 }
+        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> { Ok(()) }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> { Ok(()) }
+    }
+
+    __reset_for_test();
+    if block_device_count() != 0 {
+        return TestResult::Fail("registry not empty after reset");
+    }
+    register_block_device("smoke-stub-a", Arc::new(Stub));
+    register_block_device("smoke-stub-b", Arc::new(Stub));
+    if block_device_count() != 2 {
+        __reset_for_test();
+        return TestResult::Fail("register didn't bump count to 2");
+    }
+    if find_block_device("smoke-stub-a").is_none() {
+        __reset_for_test();
+        return TestResult::Fail("find didn't locate registered device");
+    }
+    if find_block_device("nonexistent").is_some() {
+        __reset_for_test();
+        return TestResult::Fail("find returned Some for missing device");
+    }
+    // Re-register same name → replaces in place; count stays 2.
+    register_block_device("smoke-stub-a", Arc::new(Stub));
+    if block_device_count() != 2 {
+        __reset_for_test();
+        return TestResult::Fail("re-register inflated count past 2");
+    }
+    __reset_for_test();
+    if block_device_count() != 0 {
+        return TestResult::Fail("reset didn't clear registry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_registry_register_find_round_trip);
+
+fn smoke_block_cancel_result_distinct_variants() -> TestResult {
+    // Pin the three CancelResult variants are distinct via Eq.
+    // Catches accidental discriminant collapse in a refactor.
+    use crate::CancelResult;
+    let pairs: &[(CancelResult, CancelResult)] = &[
+        (CancelResult::Cancelled, CancelResult::Completed),
+        (CancelResult::Completed, CancelResult::NotFound),
+        (CancelResult::NotFound, CancelResult::Cancelled),
+    ];
+    for &(a, b) in pairs {
+        if a == b {
+            return TestResult::Fail("two CancelResult variants compared equal");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_cancel_result_distinct_variants);
+
+fn smoke_block_error_variants_distinct() -> TestResult {
+    // Same for BlockError.
+    use crate::BlockError;
+    let all = [
+        BlockError::IOError,
+        BlockError::PermissionDenied,
+        BlockError::InvalidRange,
+        BlockError::DeviceRemoved,
+        BlockError::Cancelled,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("two BlockError variants compared equal");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_error_variants_distinct);
