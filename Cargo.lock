@@ -1056,6 +1056,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-shmem",
  "narf-time",
@@ -1066,7 +1067,9 @@ dependencies = [
 name = "narf-filesystem"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-block",
+ "narf-boot",
  "narf-capabilities",
  "narf-console",
  "narf-init",
@@ -1074,6 +1077,7 @@ dependencies = [
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-scheduler",
  "narf-time",
 ]

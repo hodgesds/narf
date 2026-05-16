@@ -110,6 +110,7 @@ kernel-test  = [
     "narf-pmbus/kernel-test",
     "narf-spdm/kernel-test",
     "narf-scmi/kernel-test",
+    "narf-fb/kernel-test",
 ]
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the

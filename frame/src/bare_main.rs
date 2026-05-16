@@ -2168,29 +2168,17 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
+    // Slot 19: build-freshness sentinel. Painted before any
+    // executor work. If you re-burn the ISO and slot 19 is
+    // *missing* (only the original 28/29/30 show), the ISO is
+    // built from a stale binary — the source-tree changes never
+    // reached the kernel image. Verify with `cargo xtask image`
+    // (or whatever you use), make sure it rebuilds `narf-frame`,
+    // and confirm Limine is loading the freshly-built kernel.
+    narf_memory::beacon::paint(19, 0x00FF_00FF); // magenta
+
     #[cfg(feature = "boot-init")]
     boot_userspace_init();
-
-    narf_scheduler::spawn(async {
-        use core::fmt::Write as _;
-        let start = narf_time::Instant::now();
-        // Assume a ~1 GHz clock for the tick spacing. Calibration is a
-        // Wave 3 task (consult HPET / ACPI / FDT). 1e8 cycles ≈ 100 ms
-        // at 1 GHz; at 2-3 GHz it's correspondingly faster.
-        const TICK_CYCLES: u64 = 100_000_000;
-        for n in 0..5 {
-            narf_time::sleep_cycles(TICK_CYCLES).await;
-            let elapsed = narf_time::Instant::now().cycles_since(start);
-            let _ = writeln!(
-                console::Writer,
-                "  tick {}: elapsed {} Mcycles",
-                n,
-                elapsed / 1_000_000
-            );
-            narf_scheduler::yield_now().await;
-        }
-        let _ = writeln!(console::Writer, "  async demo: done");
-    });
 
     // Spawn the cursor pump *before* run_until_empty so it's in the
     // queue when the executor starts. With boot-init the user task
@@ -2535,6 +2523,16 @@ fn boot_userspace_init() {
         // load_user_process_with uses above.
         narf_userspace::handlers::set_proc_argv(tid.raw(), &[name]);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
+        // Slot 24 = init spawned (lime), slot 23 = shell spawned
+        // (cyan). Lets the user see at a glance which user task
+        // got past load_user_process_with on real silicon. Both
+        // colours stick — no toggle — so a missing colour means
+        // that user task never reached spawn.
+        match name {
+            "init" => narf_memory::beacon::paint(24, 0x0080_FF00),
+            "shell" => narf_memory::beacon::paint(23, 0x0000_FFFF),
+            _ => {}
+        }
         true
     }
 
@@ -2602,28 +2600,13 @@ fn boot_userspace_init() {
     // populated, real-HW first boot before initramfs lands).
     let baked_init: &'static [u8] = bytes;
     let baked_shell: &'static [u8] = narf_verification::NARF_SHELL_ELF;
-    narf_scheduler::spawn(async move {
-        match try_load_from_root("init").await {
-            Some(b) => {
-                let _ = writeln!(console::Writer, "  boot-init: init from disk ({} bytes)", b.len());
-                spawn_one("init", &b);
-            }
-            None => {
-                let _ = writeln!(console::Writer, "  boot-init: init from baked ELF (no /init on root)");
-                spawn_one("init", baked_init);
-            }
-        }
-        match try_load_from_root("shell").await {
-            Some(b) => {
-                let _ = writeln!(console::Writer, "  boot-init: shell from disk ({} bytes)", b.len());
-                spawn_one("shell", &b);
-            }
-            None => {
-                let _ = writeln!(console::Writer, "  boot-init: shell from baked ELF (no /shell on root)");
-                spawn_one("shell", baked_shell);
-            }
-        }
-    });
+    // Disk-load path (`try_load_from_root`) is skipped on real
+    // silicon — it wedges in block-device I/O waiting for IRQs the
+    // laptop isn't delivering. Baked ELF goes straight in. Re-wire
+    // disk-load once the storage IRQ path is healthy on Zen2 FCH.
+    let _ = try_load_from_root; // keep symbol referenced
+    spawn_one("init", baked_init);
+    spawn_one("shell", baked_shell);
 }
 
 /// aarch64 boot-init stub.

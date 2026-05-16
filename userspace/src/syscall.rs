@@ -1732,6 +1732,14 @@ pub fn __test_clear_global() {
 /// The arch trap path in this tree uses the raw-aware form.
 #[inline]
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
+    // Slot 18: syscall entry heartbeat. Toggles on every user
+    // syscall. If 17 (UserTaskFuture::poll) toggles but 18 stays
+    // static, user code is running in user-mode but never
+    // syscalls (infinite loop, immediate crash on entry, etc).
+    // (No beacon here — this handler runs with the calling user
+    // task's CR3 active, which lacks the FB phys low-half map. A
+    // beacon write would page-fault. The scheduler paints slot 17
+    // before activate() to prove user-task slots are reached.)
     // Split `num` into version (top 8 bits) + canonical syscall
     // number (low 24 bits). v0 callers encode 0 in the upper bits
     // implicitly, so pre-versioning binaries dispatch to v0 forever.

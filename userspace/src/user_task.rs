@@ -521,6 +521,16 @@ impl core::future::Future for UserTaskFuture {
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<()> {
+        // Slot 17: UserTaskFuture::poll heartbeat. Toggles each
+        // poll. If this toggles but no shell prompt, the executor
+        // IS polling user tasks but they're not running their
+        // user-mode code (stuck in trap/return path). If it never
+        // toggles, the executor isn't reaching user task slots at
+        // all.
+        // (Slot 17 user-task heartbeat lives in the scheduler,
+        // before activate(). A beacon here would page-fault: this
+        // body runs with the user AS active, which lacks the low-
+        // half identity map that the FB phys lives in.)
         // Pin guarantees we're not moved between polls. We need
         // &mut access to the inner struct so the hooks see a stable
         // address for `self.ctx` and `self.jmp`.
