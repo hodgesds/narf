@@ -1289,32 +1289,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         started,
                         narf_lib::smp::online_count()
                     );
-                    // APs are spinning in run_forever with empty
-                    // queues; without work-stealing they idle
-                    // forever while the BSP serializes every
-                    // spawned task — exactly the starvation pattern
-                    // we just hit on the Zen2 laptop. Flip the
-                    // global enable so idle CPUs steal from
-                    // siblings (try_steal_one in run_forever's
-                    // halt path is the consumer side).
-                    //
-                    // kernel-test build is excluded: the existing
-                    // kernel-test smokes call `__reset_queues_for_test`
-                    // + `spawn` + sync `run_until_empty` on BSP and
-                    // assume BSP-only execution. With work-stealing
-                    // on, APs steal in-flight tests' spawned tasks
-                    // and the synchronous `run_until_empty` returns
-                    // before the AP polls the task — racing the
-                    // smoke's assertion. Making those smokes
-                    // SMP-safe is a separate effort.
-                    #[cfg(not(feature = "kernel-test"))]
-                    if started > 0 {
-                        narf_scheduler::enable_work_stealing();
-                        let _ = writeln!(
-                            console::Writer,
-                            "  smp: work-stealing enabled"
-                        );
-                    }
                 }
             }
             #[cfg(target_arch = "aarch64")]
@@ -1440,14 +1414,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     started,
                     narf_lib::smp::online_count()
                 );
-                #[cfg(not(feature = "kernel-test"))]
-                if started > 0 {
-                    narf_scheduler::enable_work_stealing();
-                    let _ = writeln!(
-                        console::Writer,
-                        "  smp: work-stealing enabled"
-                    );
-                }
             }
 
             // ── PCIe driver registration + dispatch ───────────────
