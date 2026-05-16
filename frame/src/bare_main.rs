@@ -1289,6 +1289,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         started,
                         narf_lib::smp::online_count()
                     );
+                    // APs idle in run_forever until work-stealing
+                    // lets them pull from BSP's queue. Gated out
+                    // of kernel-test because the existing smokes
+                    // call sync run_until_empty + assume BSP-only
+                    // execution — APs stealing in-flight test
+                    // tasks races the smoke's assertion. SMP-safing
+                    // the test harness is a separate effort.
+                    #[cfg(not(feature = "kernel-test"))]
+                    if started > 0 {
+                        narf_scheduler::enable_work_stealing();
+                        let _ = writeln!(
+                            console::Writer,
+                            "  smp: work-stealing enabled"
+                        );
+                    }
                 }
             }
             #[cfg(target_arch = "aarch64")]
@@ -1414,6 +1429,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     started,
                     narf_lib::smp::online_count()
                 );
+                #[cfg(not(feature = "kernel-test"))]
+                if started > 0 {
+                    narf_scheduler::enable_work_stealing();
+                    let _ = writeln!(
+                        console::Writer,
+                        "  smp: work-stealing enabled"
+                    );
+                }
             }
 
             // ── PCIe driver registration + dispatch ───────────────
