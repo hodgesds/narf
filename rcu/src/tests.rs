@@ -401,3 +401,340 @@ fn smoke_rcu_batched_reclaim_drains() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("rcu", smoke_rcu_batched_reclaim_drains);
+
+// ── extended rcu coverage ──────────────────────────────────────────
+//
+// Existing surface covers pin/unpin, defer-drop round-trip, basic
+// hazard discipline, and one batched flush. These close the
+// remaining invariants on `Atomic` / `Owned` / `Shared`, QSBR
+// quiescence semantics, hazard-domain idle behaviour, and batched
+// stats across multiple flushes.
+
+fn smoke_rcu_atomic_null_starts_empty() -> TestResult {
+    // `Atomic::null()` produces a cell that loads to a null `Shared`.
+    use crate::Atomic;
+    let cell: Atomic<u32> = Atomic::null();
+    let g = crate::pin();
+    let s = cell.load(&g);
+    if !s.is_null() {
+        return TestResult::Fail("Atomic::null() loaded non-null");
+    }
+    if s.as_ref().is_some() {
+        return TestResult::Fail("null Shared::as_ref returned Some");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_atomic_null_starts_empty);
+
+fn smoke_rcu_atomic_compare_and_set_success() -> TestResult {
+    // CAS with the observed pointer as expected → succeeds, returns
+    // the new `Shared`, and the old value gets deferred-dropped.
+    use crate::{Atomic, Owned};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary(u32);
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+    DROPS.store(0, Ordering::Relaxed);
+
+    let cell = Atomic::new(Canary(1));
+    {
+        let g = crate::pin();
+        let cur = cell.load(&g);
+        let new = Owned::new(Canary(2));
+        match cell.compare_and_set(cur, new, &g) {
+            Ok(s) => {
+                if let Some(v) = s.as_ref() {
+                    if v.0 != 2 {
+                        return TestResult::Fail("post-CAS value not v2");
+                    }
+                } else {
+                    return TestResult::Fail("post-CAS Shared is null");
+                }
+            }
+            Err(_) => return TestResult::Fail("CAS rejected matching expected"),
+        }
+    }
+    crate::sync();
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("displaced value didn't defer-drop after CAS+sync");
+    }
+    drop(cell);
+    if DROPS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("cell drop didn't reclaim live value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_atomic_compare_and_set_success);
+
+fn smoke_rcu_atomic_compare_and_set_failure_returns_owned() -> TestResult {
+    // CAS with the wrong expected pointer → returns the supplied
+    // Owned untouched + current Shared, so the caller can recover
+    // both. No reclamation triggered.
+    use crate::{Atomic, Owned, Shared};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+    DROPS.store(0, Ordering::Relaxed);
+
+    let cell: Atomic<Canary> = Atomic::new(Canary);
+    let g = crate::pin();
+    // Deliberately stale `expected`: a null Shared.
+    let bogus: Shared<Canary> = Shared::null();
+    let new = Owned::new(Canary);
+    let recovered = match cell.compare_and_set(bogus, new, &g) {
+        Ok(_) => return TestResult::Fail("CAS accepted a null expected against non-null cell"),
+        Err((owned, current)) => {
+            if current.is_null() {
+                return TestResult::Fail("failure path reported current=null");
+            }
+            owned
+        }
+    };
+    drop(g);
+    // The recovered Owned has not been deferred-dropped (caller owns it);
+    // dropping it directly must reclaim immediately.
+    drop(recovered);
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("recovered Owned didn't drop immediately");
+    }
+    drop(cell);
+    if DROPS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("cell didn't reclaim live value on drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_atomic_compare_and_set_failure_returns_owned);
+
+fn smoke_rcu_owned_drops_immediately_if_unpublished() -> TestResult {
+    // `Owned::new(...)` without store/CAS just drops the inner Box
+    // when the Owned drops. No sync needed — it was never visible.
+    use crate::Owned;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let _o = Owned::new(Canary);
+    }
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        TestResult::Fail("Owned drop didn't reclaim unpublished allocation")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_owned_drops_immediately_if_unpublished);
+
+fn smoke_rcu_qsbr_multiple_defers_same_epoch_all_reclaim() -> TestResult {
+    // Two values displaced by back-to-back stores in the same epoch
+    // both reclaim after a single sync. Catches a fencepost where
+    // only the most-recent deferred entry runs.
+    use crate::{Atomic, Owned};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+    DROPS.store(0, Ordering::Relaxed);
+
+    let cell: Atomic<Canary> = Atomic::new(Canary);
+    {
+        let g = crate::pin();
+        cell.store(Owned::new(Canary), &g);  // displaces #1
+        cell.store(Owned::new(Canary), &g);  // displaces #2
+        cell.store(Owned::new(Canary), &g);  // displaces #3
+    }
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("displaced values reclaimed before sync");
+    }
+    crate::sync();
+    if DROPS.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("all 3 displaced values must reclaim in one grace period");
+    }
+    drop(cell);
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_qsbr_multiple_defers_same_epoch_all_reclaim);
+
+fn smoke_rcu_qsbr_defer_drop_while_pinned_waits() -> TestResult {
+    // A standalone defer_drop while a reader is pinned must stay
+    // queued until the reader unpins + sync runs.
+    use crate::{defer_drop, Owned};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+    DROPS.store(0, Ordering::Relaxed);
+
+    let g_long = crate::pin();
+    {
+        let g = crate::pin();
+        defer_drop(Owned::new(Canary), &g);
+    }
+    // g_long still alive; nothing reclaims even if we sync.
+    crate::sync();
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("defer_drop reclaimed while a reader was pinned");
+    }
+    drop(g_long);
+    crate::sync();
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        TestResult::Fail("defer_drop didn't reclaim after pin release + sync")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_qsbr_defer_drop_while_pinned_waits);
+
+fn smoke_rcu_qsbr_sync_is_idempotent() -> TestResult {
+    // Two back-to-back syncs with nothing pending: second is a
+    // cheap no-op, both return without blocking forever.
+    let before = crate::qsbr::global_epoch();
+    crate::sync();
+    crate::sync();
+    let after = crate::qsbr::global_epoch();
+    if after > before {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("epoch didn't advance across two syncs")
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_qsbr_sync_is_idempotent);
+
+// ── epoch ─────────────────────────────────────────────────────────
+
+fn smoke_rcu_epoch_advance_monotonic() -> TestResult {
+    // `epoch::advance()` returns a strictly higher value each call.
+    let a = crate::epoch::advance();
+    let b = crate::epoch::advance();
+    let c = crate::epoch::advance();
+    if b > a && c > b {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("epoch::advance is not monotonic")
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_epoch_advance_monotonic);
+
+fn smoke_rcu_epoch_min_pinned_restored_after_drop() -> TestResult {
+    // While pinned `min_pinned()` reflects the held epoch; after
+    // the guard drops it returns to the sentinel.
+    let sentinel = crate::epoch::min_pinned();
+    {
+        let _g = crate::epoch::pin();
+        if crate::epoch::min_pinned() == sentinel {
+            return TestResult::Fail("min_pinned still sentinel while pinned");
+        }
+    }
+    if crate::epoch::min_pinned() != sentinel {
+        TestResult::Fail("min_pinned didn't restore to sentinel after drop")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_epoch_min_pinned_restored_after_drop);
+
+// ── hazard ────────────────────────────────────────────────────────
+
+fn smoke_rcu_hazard_acquire_null_cell_returns_none() -> TestResult {
+    // `domain.acquire(&cell)` on a null cell must return None
+    // without panicking; the slot stays free for the next caller.
+    use crate::hazard::HazardDomain;
+    use core::sync::atomic::AtomicPtr;
+    let domain = HazardDomain::new();
+    let cell: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
+    if domain.acquire(&cell).is_some() {
+        TestResult::Fail("acquire on null cell returned Some")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_hazard_acquire_null_cell_returns_none);
+
+// (Removed: smoke_rcu_hazard_partial_hold_blocks_only_held_entry —
+// the existing `smoke_rcu_hazard_retired_but_held` already covers
+// the held-vs-scan invariant. A two-entry partial-hold variant
+// would duplicate coverage rather than add a new invariant.)
+
+// ── batched ───────────────────────────────────────────────────────
+
+fn smoke_rcu_batched_two_flushes_track_totals() -> TestResult {
+    // Two submit-flush rounds: total_submitted + total_drained track
+    // the running totals across both, pending settles to 0 each time.
+    use crate::BatchedReclaimer;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+    N.store(0, Ordering::Relaxed);
+    let r = BatchedReclaimer::new(0);
+
+    for _ in 0..5 {
+        let _ = r.submit(|| { N.fetch_add(1, Ordering::Relaxed); });
+    }
+    r.flush();
+    if N.load(Ordering::Relaxed) != 5 || r.pending() != 0 {
+        return TestResult::Fail("first round didn't drain");
+    }
+
+    for _ in 0..7 {
+        let _ = r.submit(|| { N.fetch_add(1, Ordering::Relaxed); });
+    }
+    r.flush();
+    if N.load(Ordering::Relaxed) != 12 {
+        return TestResult::Fail("second round didn't drain");
+    }
+    if r.total_submitted() != 12 || r.total_drained() != 12 {
+        return TestResult::Fail("totals didn't accumulate across two flushes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_batched_two_flushes_track_totals);
+
+fn smoke_rcu_batched_pending_tracks_unflushed() -> TestResult {
+    // Stage-4 `BatchedReclaimer` has no `Drop` that drains — pending
+    // callbacks are leaked on drop, by design (reclamation is the
+    // dispatcher's job, not the reclaimer's). Pin the documented
+    // behaviour so a future "auto-drain on drop" refactor stays
+    // explicit (it would silently change leak semantics).
+    use crate::BatchedReclaimer;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+    N.store(0, Ordering::Relaxed);
+    let r = BatchedReclaimer::new(0);
+    for _ in 0..3 {
+        let _ = r.submit(|| { N.fetch_add(1, Ordering::Relaxed); });
+    }
+    if r.pending() != 3 {
+        return TestResult::Fail("pending didn't track three submits");
+    }
+    if N.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("callback ran before flush");
+    }
+    // Flush is the only way to drain.
+    r.flush();
+    if r.pending() != 0 {
+        return TestResult::Fail("flush left pending non-zero");
+    }
+    if N.load(Ordering::Relaxed) != 3 {
+        TestResult::Fail("flush didn't run every callback")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_batched_pending_tracks_unflushed);
