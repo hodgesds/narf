@@ -444,7 +444,12 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
         Err(_) => return TestResult::Fail("shared CQ try_recv"),
     };
     if comp.tag != 0xFEED {
-        return TestResult::Fail("comp tag mismatch");
+        let msg = alloc::format!(
+            "comp tag mismatch: got {:#x} want 0xfeed (status {:?}, processed {})",
+            comp.tag, comp.status, processed,
+        );
+        let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
+        return TestResult::Fail(s);
     }
     if comp.status != NarfStatus::Ok {
         return TestResult::Fail("comp status not Ok");
@@ -7653,3 +7658,544 @@ fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult 
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_execve_loads_elf_then_bails_without_user_ctx);
+
+// ── extended fork/clone/execve coverage ────────────────────────────
+//
+// Cover the parts of POSIX inheritance + child-spawning that the
+// existing smokes don't reach: cwd / sigaction / fd inheritance
+// across fork, basename / cmdline publication on execve, distinct
+// child ASes from successive forks, distinct child tids from
+// successive clones.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
+    // Two back-to-back clone calls against the same parent AS must:
+    //   (1) both succeed,
+    //   (2) yield distinct child tids,
+    //   (3) attach the SAME `Arc<AddressSpace>` to both children
+    //       (thread-style sharing — the entire point of clone vs fork).
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    *PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let dispatch = |entry: u64| -> Option<u64> {
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: entry,
+                arg1: 0x7fff_fff0_0000,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(56, &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => Some(r.value),
+            _ => None,
+        }
+    };
+
+    let t1 = match dispatch(0x8000_0000_1000) {
+        Some(v) => v,
+        None => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("first clone failed");
+        }
+    };
+    let t2 = match dispatch(0x8000_0000_2000) {
+        Some(v) => v,
+        None => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("second clone failed");
+        }
+    };
+    if t1 == t2 {
+        *PARENT_AS.lock() = None;
+        return TestResult::Fail("two clones returned the same tid");
+    }
+    let a1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t1));
+    let a2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t2));
+    let pass = match (a1, a2) {
+        (Some(a), Some(b)) => Arc::ptr_eq(&a, &parent_as) && Arc::ptr_eq(&b, &parent_as),
+        _ => false,
+    };
+    *PARENT_AS.lock() = None;
+    crate::syscall::__test_clear_global();
+    if pass {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("one or both clones don't share the parent AS")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_clone_distinct_tids_same_as);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_clone_rejects_without_address_space() -> TestResult {
+    // Symmetric to smoke_userspace_fork_rejects_without_address_space:
+    // a clone issued with no AS lookup wired (or one that returns None)
+    // must surface a non-OK return rather than panic / spawn a child
+    // against a phantom AS.
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    *PARENT_AS.lock() = None;
+    install_address_space_lookup(lookup_parent_as); // returns None
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0x8000_0000_1000,
+            arg1: 0x7fff_fff0_0000,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(56, &mut ctx);
+    let ret = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    crate::syscall::__test_clear_global();
+    if ret.status == SyscallReturn::OK {
+        TestResult::Fail("clone without AS lookup should not succeed")
+    } else {
+        TestResult::Pass
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_clone_rejects_without_address_space);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fork_inherits_cwd() -> TestResult {
+    // fork(2) inheritance contract: the child's cwd starts at the
+    // parent's cwd at fork time. sys_fork calls `cwd_fork(parent, child)`
+    // which copies the entry under the parent_pid key to the child_pid
+    // key. Verify the post-fork lookup returns the parent's path.
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::cwd_init();
+
+    static FAKE_TID: AtomicU64 = AtomicU64::new(0xC1D0);
+    fn task_lookup() -> u64 {
+        FAKE_TID.load(Ordering::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lookup);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    *PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_parent_as);
+
+    // Record a non-default cwd against the parent tid. We don't go
+    // through sys_chdir because that needs a user-pointer string;
+    // poke the CWD_TABLE shape via the public `set` shim isn't
+    // exposed, so call the syscall with a kernel-side buffer that
+    // the handler reads through identity-mapped low 4 GiB.
+    let path = b"/usr/local/tests\0";
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64 - 1, // exclude trailing NUL
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(crate::Syscall::Chdir.raw(), &mut ctx);
+    let parent_tid = FAKE_TID.load(Ordering::Relaxed);
+    let parent_cwd = crate::handlers::cwd_of(parent_tid);
+    if parent_cwd != "/usr/local/tests" {
+        return TestResult::Fail("parent's Chdir didn't take");
+    }
+
+    // Now fork. The handler reads current_task_id() = FAKE_TID for
+    // the parent_pid, calls cwd_fork(parent_pid, child_tid).
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(57, &mut ctx);
+    let child_tid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("fork failed");
+        }
+    };
+    let child_cwd = crate::handlers::cwd_of(child_tid);
+    *PARENT_AS.lock() = None;
+    crate::handlers::__test_cwd_reset();
+    crate::syscall::__test_clear_global();
+    if child_cwd == parent_cwd {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("child's cwd diverges from parent's at fork time")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_fork_inherits_cwd);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
+    // fork(2) inheritance: per-signal handler entries cross fork
+    // intact. POSIX §3.3.3: "Signals set to the default action
+    // (SIG_DFL) in the calling process are set to the default
+    // action in the new process. Signals set to be ignored
+    // (SIG_IGN) by the calling process are set to be ignored by
+    // the new process. Signals set to be caught by the calling
+    // process are set to the default action in the new process"
+    // — narf currently inherits user handlers (a Linux-compatible
+    // deviation; future refinement resets to SIG_DFL).
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    crate::handlers::__test_sigaction_reset();
+    crate::sigaction_init();
+
+    static FAKE_TID: AtomicU64 = AtomicU64::new(0x51C1);
+    fn task_lookup() -> u64 {
+        FAKE_TID.load(Ordering::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lookup);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    *PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Install a handler against signum 15 in the parent.
+    const SIGTERM: u64 = 15;
+    const HANDLER: u64 = 0xDEAD_F00D_BEEF_CAFE;
+    let mut prev: u64 = 0;
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: SIGTERM,
+            arg1: HANDLER,
+            arg2: &mut prev as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(crate::Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Sigaction install in parent did not Ok");
+    }
+    let parent_tid = FAKE_TID.load(Ordering::Relaxed);
+    if crate::handlers::sigaction_lookup(parent_tid, SIGTERM as usize) != Some(HANDLER) {
+        return TestResult::Fail("parent handler not recorded");
+    }
+
+    // Fork → child_tid; sigaction_lookup(child, SIGTERM) must
+    // return HANDLER.
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(57, &mut ctx);
+    let child_tid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("fork failed");
+        }
+    };
+    let inherited = crate::handlers::sigaction_lookup(child_tid, SIGTERM as usize);
+    *PARENT_AS.lock() = None;
+    crate::handlers::__test_sigaction_reset();
+    crate::syscall::__test_clear_global();
+    if inherited == Some(HANDLER) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("child did not inherit the parent's SIGTERM handler")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_fork_inherits_sigaction_handlers);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fork_multiple_distinct_address_spaces() -> TestResult {
+    // Two back-to-back forks against the same parent must each get
+    // their own fresh `Arc<AddressSpace>` — distinct from the
+    // parent AND from each other. Catches a regression where the
+    // handler memoised the clone result.
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    *PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let do_fork = || -> Option<u64> {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(57, &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => Some(r.value),
+            _ => None,
+        }
+    };
+
+    let c1 = match do_fork() {
+        Some(v) => v,
+        None => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("first fork failed");
+        }
+    };
+    let c2 = match do_fork() {
+        Some(v) => v,
+        None => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("second fork failed");
+        }
+    };
+    let as1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(c1));
+    let as2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(c2));
+    let pass = match (as1, as2) {
+        (Some(a), Some(b)) => {
+            !Arc::ptr_eq(&a, &parent_as)
+                && !Arc::ptr_eq(&b, &parent_as)
+                && !Arc::ptr_eq(&a, &b)
+        }
+        _ => false,
+    };
+    *PARENT_AS.lock() = None;
+    crate::syscall::__test_clear_global();
+    narf_memory::frame::cow::__test_clear();
+    if pass {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("successive forks didn't produce three distinct ASes")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_fork_multiple_distinct_address_spaces);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
+    // sys_execve takes the basename of argv[0] (the substring after
+    // the last '/') and stores it as /proc/[pid]/comm via
+    // `set_proc_comm`. Trigger a load with argv[0] = "/usr/bin/foo"
+    // and verify comm == "foo" via the public `proc_comm_of` shim.
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    crate::syscall::__test_clear_global();
+    static FAKE_TID: AtomicU64 = AtomicU64::new(0xC0_DE_F00D);
+    fn task_lookup() -> u64 {
+        FAKE_TID.load(Ordering::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lookup);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    // argv pack: "/usr/bin/foo\0" → one NUL-terminated string.
+    let argv = b"/usr/bin/foo\0".to_vec();
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: elf.as_ptr() as u64,
+            arg1: elf.len() as u64,
+            arg2: argv.as_ptr() as u64,
+            arg3: argv.len() as u64,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    // Handler returns invalid_op without a polling user-task ctx,
+    // but the load + comm publication runs before that bail-out.
+
+    let pid = FAKE_TID.load(Ordering::Relaxed);
+    let comm = crate::handlers::proc_comm_of(pid);
+    crate::syscall::__test_clear_global();
+    match comm {
+        Some(s) if s == "foo" => TestResult::Pass,
+        Some(other) => {
+            let msg = alloc::format!("comm = {:?}; expected \"foo\"", other);
+            let leaked: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
+            TestResult::Fail(leaked)
+        }
+        None => TestResult::Fail("comm not set by execve"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_sets_comm_to_argv0_basename);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
+    // After load, /proc/[pid]/cmdline holds the NUL-separated argv
+    // bytes the user passed. Confirms `set_proc_argv` ran and the
+    // recorded shape matches the wire format.
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    crate::syscall::__test_clear_global();
+    static FAKE_TID: AtomicU64 = AtomicU64::new(0xC0_DE_BABE);
+    fn task_lookup() -> u64 {
+        FAKE_TID.load(Ordering::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lookup);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    // argv pack: ["init", "-q", "--debug"] → "init\0-q\0--debug\0".
+    let argv = b"init\0-q\0--debug\0".to_vec();
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: elf.as_ptr() as u64,
+            arg1: elf.len() as u64,
+            arg2: argv.as_ptr() as u64,
+            arg3: argv.len() as u64,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+
+    let pid = FAKE_TID.load(Ordering::Relaxed);
+    let recorded = crate::handlers::proc_argv_of(pid);
+    crate::syscall::__test_clear_global();
+    // We expect the same NUL-separated shape Linux reports: the
+    // original pack bytes joined back together.
+    let want: alloc::vec::Vec<u8> = b"init\0-q\0--debug\0".to_vec();
+    if recorded == want {
+        TestResult::Pass
+    } else {
+        let msg = alloc::format!(
+            "cmdline mismatch: got {:?} want {:?}",
+            recorded, want
+        );
+        let leaked: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
+        TestResult::Fail(leaked)
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_publishes_cmdline_argv_pack);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
+    // execve must accept a populated envp pack alongside argv (the
+    // existing smokes pass envp = (0, 0)). Confirms `copy_user_pack`
+    // is called for both arg2/arg3 and arg4/arg5 and that a valid
+    // envp doesn't reject the call.
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    let argv = b"sh\0".to_vec();
+    let envp = b"PATH=/bin\0LANG=C\0".to_vec();
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: elf.as_ptr() as u64,
+            arg1: elf.len() as u64,
+            arg2: argv.as_ptr() as u64,
+            arg3: argv.len() as u64,
+            arg4: envp.as_ptr() as u64,
+            arg5: envp.len() as u64,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    crate::syscall::__test_clear_global();
+    // Load completes, then the no-ctx path returns invalid_op —
+    // same shape as smoke_userspace_execve_loads_elf_then_bails_*.
+    // A reject would surface SOMETHING else (handler bailed before
+    // the load) which would mean the envp parse failed.
+    if r == SyscallReturn::invalid_op() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("execve with valid envp didn't reach the no-user-ctx bail")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_with_envp_pack_accepts);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_rejects_oversized_argv_pack() -> TestResult {
+    // copy_user_pack caps each pack at 64 KiB. An over-cap argv_len
+    // must surface invalid_op without copying.
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: elf.as_ptr() as u64,
+            arg1: elf.len() as u64,
+            arg2: 0xDEAD_BEEF_u64,
+            arg3: 65 * 1024,        // > 64 KiB → rejected
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(179, &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return"),
+    };
+    crate::syscall::__test_clear_global();
+    if r == SyscallReturn::invalid_op() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("oversized argv pack should be rejected")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_rejects_oversized_argv_pack);

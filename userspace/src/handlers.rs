@@ -5958,14 +5958,20 @@ pub fn set_proc_comm(pid: u64, name: &str) {
     map.insert(pid, trimmed);
 }
 
-fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
+/// Read-only accessor for the NUL-separated argv pack recorded
+/// against `pid`. Used by `/proc/[pid]/cmdline` and by the execve
+/// smoke tests to verify the post-load argv publish step.
+pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
     let g = PROC_ARGV.lock();
     g.as_ref()
         .and_then(|m| m.get(&pid).cloned())
         .unwrap_or_default()
 }
 
-fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
+/// Read-only accessor for the comm name recorded against `pid`. Used
+/// by `/proc/[pid]/comm` and by the execve smoke tests to confirm
+/// the comm-from-argv[0]-basename step ran.
+pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.lock();
     g.as_ref().and_then(|m| m.get(&pid).cloned())
 }
