@@ -642,3 +642,372 @@ fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_filesystem_devfs_mount_default_idempotent);
+
+// ── extended filesystem coverage ───────────────────────────────────
+//
+// Existing surface hits the initramfs + memfs + devfs happy paths
+// and one mount-prefix scenario. New smokes close invariants on:
+//   - `posix_access_ok` permission algebra
+//   - sync `resolve` path-shape validation
+//   - PageCache edges (missing key, idempotent drain, generation bump)
+//   - VfsRegistry mount/unmount round-trip
+//   - Mode constants
+//   - error-discriminant distinctness
+
+fn smoke_fs_posix_access_root_bypass() -> TestResult {
+    use crate::posix_access_ok;
+    // Root reads + writes anything regardless of perms (POSIX privileged-process rule).
+    if !posix_access_ok(1000, 1000, 0o000, 0, 0, true, true, false) {
+        return TestResult::Fail("root denied read on perms=000");
+    }
+    if !posix_access_ok(1000, 1000, 0o000, 0, 0, false, true, false) {
+        return TestResult::Fail("root denied write on perms=000");
+    }
+    // Root exec requires at least one exec bit somewhere.
+    if posix_access_ok(1000, 1000, 0o644, 0, 0, false, false, true) {
+        return TestResult::Fail("root got exec on perms=644 (no x bit anywhere)");
+    }
+    if !posix_access_ok(1000, 1000, 0o755, 0, 0, false, false, true) {
+        return TestResult::Fail("root denied exec on perms=755");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_posix_access_root_bypass);
+
+fn smoke_fs_posix_access_owner_group_other() -> TestResult {
+    use crate::posix_access_ok;
+    // File owned by 1000:2000 with perms=0o640 (owner rw-, group r--, other ---).
+    // Owner (uid=1000): can read + write, can't exec.
+    if !posix_access_ok(1000, 2000, 0o640, 1000, 0, true, true, false) {
+        return TestResult::Fail("owner denied legitimate rw");
+    }
+    if posix_access_ok(1000, 2000, 0o640, 1000, 0, false, false, true) {
+        return TestResult::Fail("owner got exec when perms had no x");
+    }
+    // Group member (gid=2000 but uid != owner): can read, can't write.
+    if !posix_access_ok(1000, 2000, 0o640, 1001, 2000, true, false, false) {
+        return TestResult::Fail("group member denied read");
+    }
+    if posix_access_ok(1000, 2000, 0o640, 1001, 2000, false, true, false) {
+        return TestResult::Fail("group member got write when group bits forbade it");
+    }
+    // Other (different uid + gid): no access at all.
+    if posix_access_ok(1000, 2000, 0o640, 1001, 2001, true, false, false) {
+        return TestResult::Fail("other got read on perms=640 (other=---)");
+    }
+    // Other with perms=0o644 → other can read but not write.
+    if !posix_access_ok(1000, 2000, 0o644, 1001, 2001, true, false, false) {
+        return TestResult::Fail("other denied read on perms=644");
+    }
+    if posix_access_ok(1000, 2000, 0o644, 1001, 2001, false, true, false) {
+        return TestResult::Fail("other got write on perms=644");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_posix_access_owner_group_other);
+
+fn smoke_fs_resolve_rejects_empty_path() -> TestResult {
+    // resolve() rejects empty paths with InvalidPath.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
+    struct EmptyDir;
+    impl DirOps for EmptyDir {
+        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> { None }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    match resolve(Arc::new(EmptyDir), "") {
+        Err(FsError::InvalidPath) => TestResult::Pass,
+        _ => TestResult::Fail("empty path didn't surface InvalidPath"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_resolve_rejects_empty_path);
+
+fn smoke_fs_resolve_rejects_absolute_path() -> TestResult {
+    // resolve() is for RELATIVE paths — leading `/` must be rejected.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
+    struct EmptyDir;
+    impl DirOps for EmptyDir {
+        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> { None }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    match resolve(Arc::new(EmptyDir), "/foo") {
+        Err(FsError::InvalidPath) => TestResult::Pass,
+        _ => TestResult::Fail("absolute path didn't surface InvalidPath"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_resolve_rejects_absolute_path);
+
+fn smoke_fs_resolve_rejects_dot_dot() -> TestResult {
+    // sync resolve() doesn't support `..` — must surface InvalidPath
+    // rather than walking off the mount.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
+    struct EmptyDir;
+    impl DirOps for EmptyDir {
+        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> { None }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    match resolve(Arc::new(EmptyDir), "foo/../bar") {
+        Err(FsError::InvalidPath) => TestResult::Pass,
+        _ => TestResult::Fail(".. didn't surface InvalidPath"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_resolve_rejects_dot_dot);
+
+fn smoke_fs_resolve_tolerates_redundant_separators_and_dot() -> TestResult {
+    // `//` and `.` segments are tolerated and skipped. Confirm that
+    // `foo` and `.//foo` resolve to the same node by stub instrumentation.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsFuture, Mode, Stat};
+
+    static LOOKUPS: AtomicU32 = AtomicU32::new(0);
+    LOOKUPS.store(0, Ordering::Relaxed);
+
+    struct StubFile;
+    impl FileOps for StubFile {
+        fn read<'a>(&'a self, _: u64, _: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(&'a self, _: u64, _: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0, mode: Mode::FILE_RO, mtime_cycles: 0 }
+        }
+    }
+    struct StubDir;
+    impl DirOps for StubDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "foo" {
+                LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::new(StubFile))
+            } else {
+                None
+            }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    if resolve(Arc::new(StubDir), "foo").is_err() {
+        return TestResult::Fail("plain foo didn't resolve");
+    }
+    if resolve(Arc::new(StubDir), "./foo").is_err() {
+        return TestResult::Fail("./foo didn't resolve");
+    }
+    if resolve(Arc::new(StubDir), ".//foo").is_err() {
+        return TestResult::Fail(".//foo didn't resolve");
+    }
+    if LOOKUPS.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("expected exactly 3 lookups across the three resolutions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_resolve_tolerates_redundant_separators_and_dot);
+
+fn smoke_fs_page_cache_lookup_missing_is_none() -> TestResult {
+    use crate::{PageCache, PageKey};
+    let pc = PageCache::new();
+    let k = PageKey { fs_id: 99, inode: 99, page_off: 99 };
+    if pc.lookup(k).is_some() {
+        return TestResult::Fail("lookup on absent key returned Some");
+    }
+    if !pc.is_empty() {
+        return TestResult::Fail("fresh cache reported non-empty");
+    }
+    if pc.mark_dirty(k) {
+        return TestResult::Fail("mark_dirty on absent key returned true");
+    }
+    if !pc.drain_dirty().is_empty() {
+        return TestResult::Fail("drain_dirty on empty cache returned entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_page_cache_lookup_missing_is_none);
+
+fn smoke_fs_page_cache_generation_bumps_on_dirty() -> TestResult {
+    // mark_dirty bumps the generation counter — readers use this
+    // to detect they raced against a writer.
+    use crate::{Page, PageCache, PageKey};
+    let pc = PageCache::new();
+    let k = PageKey { fs_id: 1, inode: 1, page_off: 0 };
+    pc.insert(k, Page::zeroed());
+    let g0 = pc.lookup(k).unwrap().gen;
+    pc.mark_dirty(k);
+    let g1 = pc.lookup(k).unwrap().gen;
+    if g1 != g0 + 1 {
+        return TestResult::Fail("generation didn't bump by 1 on first dirty");
+    }
+    // drain_dirty clears `dirty` but does NOT reset the generation.
+    let drained = pc.drain_dirty();
+    if drained.len() != 1 || !drained[0].1.dirty {
+        return TestResult::Fail("drained page shape wrong");
+    }
+    let g2 = pc.lookup(k).unwrap().gen;
+    if g2 != g1 {
+        return TestResult::Fail("drain_dirty altered generation");
+    }
+    // Re-mark dirty → bumps again.
+    pc.mark_dirty(k);
+    let g3 = pc.lookup(k).unwrap().gen;
+    if g3 != g1 + 1 {
+        return TestResult::Fail("second mark_dirty didn't bump generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_page_cache_generation_bumps_on_dirty);
+
+fn smoke_fs_page_cache_insert_overwrites() -> TestResult {
+    // Insert replaces in place — second insert with same key wins.
+    use crate::{Page, PageCache, PageKey};
+    let pc = PageCache::new();
+    let k = PageKey { fs_id: 1, inode: 1, page_off: 0 };
+    pc.insert(k, Page::zeroed());
+    if pc.len() != 1 {
+        return TestResult::Fail("first insert didn't grow to 1");
+    }
+    let mut p2 = Page::zeroed();
+    p2.gen = 42;
+    pc.insert(k, p2);
+    if pc.len() != 1 {
+        return TestResult::Fail("second insert grew length (should overwrite in place)");
+    }
+    let got = pc.lookup(k).unwrap();
+    if got.gen != 42 {
+        return TestResult::Fail("second insert didn't replace value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_page_cache_insert_overwrites);
+
+fn smoke_fs_mode_constants_match_perms() -> TestResult {
+    use crate::{FileType, Mode};
+    if Mode::FILE_RO.file_type != FileType::File || Mode::FILE_RO.perms != 0o444 {
+        return TestResult::Fail("FILE_RO drifted");
+    }
+    if Mode::FILE_RW.file_type != FileType::File || Mode::FILE_RW.perms != 0o666 {
+        return TestResult::Fail("FILE_RW drifted");
+    }
+    if Mode::DIR_RO.file_type != FileType::Dir || Mode::DIR_RO.perms != 0o555 {
+        return TestResult::Fail("DIR_RO drifted");
+    }
+    if Mode::DIR_RW.file_type != FileType::Dir || Mode::DIR_RW.perms != 0o777 {
+        return TestResult::Fail("DIR_RW drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_mode_constants_match_perms);
+
+fn smoke_fs_registry_mount_unmount_round_trip() -> TestResult {
+    // Mount a MemFs, observe it in list(), unmount via the handle,
+    // confirm it's gone.
+    use crate::{bootstrap_mount_authority, registry, MemFs};
+    let auth = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("rt-mu", &[("greeting", b"hi")]);
+    let path = "/smoke-mu";
+    let handle = match registry().mount(&auth, path, fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount failed"),
+    };
+    let listed = registry().list();
+    if !listed.iter().any(|p| p == path) {
+        return TestResult::Fail("mount didn't show up in registry.list()");
+    }
+    if registry().unmount(&handle, path).is_err() {
+        return TestResult::Fail("unmount failed with a live handle");
+    }
+    let listed_after = registry().list();
+    if listed_after.iter().any(|p| p == path) {
+        return TestResult::Fail("mount still in registry after unmount");
+    }
+    // Second unmount on same path → NotFound.
+    match registry().unmount(&handle, path) {
+        Err(crate::FsError::NotFound) => TestResult::Pass,
+        _ => TestResult::Fail("double unmount didn't surface NotFound"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_registry_mount_unmount_round_trip);
+
+fn smoke_fs_registry_unmount_revoked_handle_rejected() -> TestResult {
+    // A revoked handle must not be able to unmount, regardless of
+    // path validity.
+    use crate::{bootstrap_mount_authority, registry, FsError, MemFs};
+    let auth = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("rt-rev", &[("x", b"y")]);
+    let path = "/smoke-rev-mu";
+    let handle = match registry().mount(&auth, path, fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount failed"),
+    };
+    handle.revoke();
+    match registry().unmount(&handle, path) {
+        Err(FsError::PermissionDenied) => {
+            // Restore so subsequent tests aren't sitting on a corpse:
+            // mount a fresh handle to clean up.
+            let auth2 = bootstrap_mount_authority();
+            let h2 = registry()
+                .mount(&auth2, "/smoke-rev-cleanup", MemFs::with_seeds("c", &[]))
+                .ok();
+            // Remove the original entry now that we have a fresh handle —
+            // but we can't unmount the revoked one. Leave it; tests are
+            // additive and the suite tolerates registry residue.
+            let _ = h2;
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("revoked handle accepted unmount"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_registry_unmount_revoked_handle_rejected);
+
+fn smoke_fs_error_variants_distinct() -> TestResult {
+    use crate::FsError;
+    let all = [
+        FsError::NotFound,
+        FsError::PermissionDenied,
+        FsError::InvalidPath,
+        FsError::Busy,
+        FsError::ReadOnly,
+        FsError::NoSpace,
+        FsError::Unsupported,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("two FsError variants compared equal");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_error_variants_distinct);
+
+fn smoke_fs_filetype_variants_distinct() -> TestResult {
+    use crate::FileType;
+    let all = [
+        FileType::File,
+        FileType::Dir,
+        FileType::Symlink,
+        FileType::Special,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("two FileType variants compared equal");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_filetype_variants_distinct);
