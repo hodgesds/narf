@@ -574,6 +574,19 @@ pub unsafe fn map_4kb(
     }
     pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
 
+    // Diagnostic readback: if the leaf entry we just wrote doesn't
+    // decode back to `phys`, the buddy allocator is handing out
+    // the SAME frame for both `phys` and an intermediate page-table
+    // page in the walk above (so the write to pt.entries[idx.pt]
+    // is actually writing into `phys` from the allocator's POV).
+    // Trip a debug_assert so the failure is loud rather than
+    // surfacing later as "translate returned wrong phys".
+    debug_assert_eq!(
+        pt.entries[idx.pt].addr().raw(),
+        phys.raw(),
+        "map_4kb leaf-write self-check failed — buddy duplicate alloc?",
+    );
+
     // Local INVLPG is sufficient for a fresh mapping — peer CPUs have
     // no entry to invalidate. Remap/unmap call sites broadcast via
     // `invlpg_global`.

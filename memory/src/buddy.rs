@@ -270,6 +270,43 @@ impl BuddyZone {
         self.free_frames
     }
 
+    /// Diagnostic: walk every free-list entry and confirm no frame
+    /// is covered by more than one block (across all orders).
+    ///
+    /// Returns `Ok(())` if the buddy state is internally consistent,
+    /// or `Err((frame_no, order_a, order_b))` describing the first
+    /// overlap found.
+    ///
+    /// No-alloc O(N²) so it can run from inside the buddy lock
+    /// without deadlocking through the slab. Used by the smoke-test
+    /// runner to pinpoint corruption.
+    pub fn validate_no_overlap(&self) -> Result<(), (u64, u8, u8)> {
+        for oa in 0..NUM_ORDERS {
+            let span_a = order_frames(oa as u8);
+            for (ia, &sa) in self.free_lists[oa].iter().enumerate() {
+                let ea = sa + span_a;
+                // Other entries at the same order, after index ia.
+                for &sb in self.free_lists[oa][ia + 1..].iter() {
+                    let eb = sb + span_a;
+                    if sa < eb && sb < ea {
+                        return Err((sa.max(sb), oa as u8, oa as u8));
+                    }
+                }
+                // Entries at any higher order.
+                for ob in (oa + 1)..NUM_ORDERS {
+                    let span_b = order_frames(ob as u8);
+                    for &sb in self.free_lists[ob].iter() {
+                        let eb = sb + span_b;
+                        if sa < eb && sb < ea {
+                            return Err((sa.max(sb), oa as u8, ob as u8));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Number of total frames donated to this zone.
     pub fn total_frame_count(&self) -> usize {
         self.total_frames

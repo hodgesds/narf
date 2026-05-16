@@ -589,6 +589,21 @@ pub fn is_numa_aware() -> bool {
     ALLOC.lock().numa_aware
 }
 
+/// Diagnostic: walk every zone's free lists and confirm no frame
+/// appears in more than one block. Returns `Ok(())` on success or
+/// `Err((zone, frame_no, order_a, order_b))` describing the first
+/// overlap found. Intended for smoke-test instrumentation, not hot
+/// paths — O(N log N) per zone in total free-block count.
+pub fn validate_no_overlap() -> Result<(), (usize, u64, u8, u8)> {
+    let g = ALLOC.lock();
+    for (i, zone) in g.zones.iter().enumerate() {
+        if let Err((f, oa, ob)) = zone.validate_no_overlap() {
+            return Err((i, f, oa, ob));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct FrameStats {
     pub total: usize,

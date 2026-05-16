@@ -116,6 +116,19 @@ pub fn run_all() -> Summary {
                 skip += 1;
             }
         }
+        // Buddy state self-check after memory-related tests. Limited
+        // to that subset because the O(N²) no-alloc walk is too slow
+        // to run after every test (must avoid alloc inside the buddy
+        // lock to prevent slab→buddy recursive lock).
+        if t.subsystem.starts_with("memory") {
+            if let Err((zone, frame_no, oa, ob)) = narf_memory::frame_validate_no_overlap() {
+                let _ = writeln!(
+                    Writer,
+                    "  [BUDDY-CORRUPT after {}/{}] zone {} frame {:#x} order {} vs {}",
+                    t.subsystem, t.name, zone, frame_no << narf_memory::PAGE_SHIFT, oa, ob,
+                );
+            }
+        }
     }
     let _ = writeln!(
         Writer,
