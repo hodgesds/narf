@@ -303,6 +303,7 @@ impl DirOps for ProcRoot {
             "loadavg" => Some(Arc::new(ProcStaticFile { name: "loadavg", gen: gen_loadavg })),
             "filesystems" => Some(Arc::new(ProcStaticFile { name: "filesystems", gen: gen_filesystems })),
             "partitions" => Some(Arc::new(ProcStaticFile { name: "partitions", gen: gen_partitions })),
+            "sched" => Some(Arc::new(ProcStaticFile { name: "sched", gen: gen_sched })),
             "self" => Some(Arc::new(ProcDirMarker)),
             _ => {
                 // Numeric pid → directory marker (lookup-as-file).
@@ -350,6 +351,7 @@ impl DirOps for ProcRoot {
             DirEntry { name: "loadavg", file_type: FileType::File },
             DirEntry { name: "filesystems", file_type: FileType::File },
             DirEntry { name: "partitions", file_type: FileType::File },
+            DirEntry { name: "sched", file_type: FileType::File },
             DirEntry { name: "self", file_type: FileType::Dir },
         ];
         for pid in list_pids() {
@@ -489,6 +491,21 @@ fn gen_filesystems() -> String {
     let mut s = String::new();
     for n in names {
         let _ = writeln!(s, "\t{}", n);
+    }
+    s
+}
+
+fn gen_sched() -> String {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    let tasks = narf_scheduler::all_task_ids().len();
+    let depths = narf_scheduler::cpu_queue_depths();
+    let online = depths.len();
+    let _ = writeln!(s, "online_cpus:\t{}", online);
+    let _ = writeln!(s, "total_tasks:\t{}", tasks);
+    let _ = writeln!(s, "per_cpu_ready:");
+    for (cpu, len) in depths {
+        let _ = writeln!(s, "  cpu{:<3} {:>6}", cpu, len);
     }
     s
 }

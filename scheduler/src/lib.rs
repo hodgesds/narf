@@ -870,6 +870,23 @@ pub fn run_until_empty() {
     }
 }
 
+/// Snapshot per-CPU ready-queue depths. Returns one entry per
+/// online CPU as `(cpu_id, len)`. Diagnostic surface — the FB
+/// status panel renders this so a wedged executor is visible
+/// at a glance (`sched: c0=42 c1=0 c2=0 …` means BSP is hoarding
+/// while APs idle).
+pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
+    let mut out = alloc::vec::Vec::new();
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        let len = READY[cpu].lock().as_ref().map(|d| d.len()).unwrap_or(0);
+        out.push((cpu as u32, len));
+    }
+    out
+}
+
 /// Try to steal one task from another CPU's queue. Returns `true` if
 /// a slot was moved onto `cpu`'s queue.
 ///

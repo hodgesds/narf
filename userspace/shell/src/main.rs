@@ -1001,7 +1001,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
     }
     if cmd == b"help" {
         unsafe {
-            write_all(fd, b"commands: help echo uname pid exec exit\n");
+            write_all(fd, b"commands: help echo uname pid cat ls exec exit\n");
         }
     } else if cmd == b"exec" {
         // exec <path> — POSIX-style replace-current-task with the
@@ -1233,6 +1233,94 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 write_all(fd, b" handler-hits=");
                 write_all(fd, s);
                 write_all(fd, NEWLINE);
+            }
+        }
+    } else if cmd == b"cat" {
+        // cat <path> — read the file at <path> and write its bytes
+        // to stdout. No flags, no concatenation across args; a
+        // single path per call. Bounded read at 64 KiB so a runaway
+        // pseudo-file doesn't fill the console buffer.
+        let path = skip_ws(rest);
+        let path: &[u8] = {
+            let mut end = path.len();
+            while end > 0 && (path[end - 1] == b' ' || path[end - 1] < 0x20) {
+                end -= 1;
+            }
+            &path[..end]
+        };
+        if path.is_empty() {
+            unsafe { write_all(fd, b"cat: missing path\n"); }
+        } else {
+            // posix_open wants a NUL-terminated C string.
+            let mut pbuf = [0u8; 256];
+            if path.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"cat: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let in_fd = unsafe {
+                    libc::posix_open(pbuf.as_ptr() as *const i8, libc::O_RDONLY, 0)
+                };
+                if in_fd < 0 {
+                    unsafe { write_all(fd, b"cat: open failed\n"); }
+                } else {
+                    let mut buf = [0u8; 1024];
+                    let mut total: usize = 0;
+                    loop {
+                        let n = unsafe {
+                            libc::posix_read(in_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                        };
+                        if n <= 0 || total >= 64 * 1024 {
+                            break;
+                        }
+                        unsafe { write_all(fd, &buf[..n as usize]); }
+                        total += n as usize;
+                    }
+                    unsafe { libc::posix_close(in_fd); }
+                }
+            }
+        }
+    } else if cmd == b"ls" {
+        // ls [path] — directory listing. Default to "/" when no
+        // path supplied. Uses opendir/readdir from narf-libc.
+        let path = skip_ws(rest);
+        let path: &[u8] = {
+            let mut end = path.len();
+            while end > 0 && (path[end - 1] == b' ' || path[end - 1] < 0x20) {
+                end -= 1;
+            }
+            &path[..end]
+        };
+        let default: &[u8] = b"/";
+        let path = if path.is_empty() { default } else { path };
+        let mut pbuf = [0u8; 256];
+        if path.len() + 1 >= pbuf.len() {
+            unsafe { write_all(fd, b"ls: path too long\n"); }
+        } else {
+            pbuf[..path.len()].copy_from_slice(path);
+            let dir = unsafe { libc::opendir(pbuf.as_ptr() as *const i8) };
+            if dir.is_null() {
+                unsafe { write_all(fd, b"ls: opendir failed\n"); }
+            } else {
+                loop {
+                    let ent = unsafe { libc::readdir(dir) };
+                    if ent.is_null() {
+                        break;
+                    }
+                    // dirent.d_name is a C string; find its length.
+                    let name_ptr = unsafe {
+                        core::ptr::addr_of!((*ent).d_name) as *const u8
+                    };
+                    let mut nlen = 0usize;
+                    while nlen < 256 && unsafe { *name_ptr.add(nlen) } != 0 {
+                        nlen += 1;
+                    }
+                    let name = unsafe { core::slice::from_raw_parts(name_ptr, nlen) };
+                    unsafe {
+                        write_all(fd, name);
+                        write_all(fd, NEWLINE);
+                    }
+                }
+                unsafe { libc::closedir(dir); }
             }
         }
     } else if cmd == b"exit" {
