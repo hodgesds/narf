@@ -259,11 +259,18 @@ pub struct TaskSpec {
 }
 
 impl TaskSpec {
-    /// Default: any CPU, unthrottled, no cap gate. Matches the
-    /// Stage-2 `spawn` behaviour byte-for-byte in the executor.
+    /// Default: BSP-pinned, unthrottled, no cap gate. Pinning to
+    /// the boot CPU is a load-bearing safety property today —
+    /// most spawn-and-forget tasks (FB drain, USB-HID supervisor,
+    /// virtio-input pump, …) were written assuming single-CPU
+    /// execution and reach into shared state without locks. Until
+    /// each is audited for SMP safety, the default keeps them on
+    /// CPU0 even when work-stealing is enabled and APs are alive.
+    /// Tasks that have been verified SMP-safe can opt into
+    /// migration with `Affinity::any()` via spawn_with_spec.
     pub const fn unthrottled() -> Self {
         Self {
-            affinity: Affinity::any(),
+            affinity: Affinity::pinned(crate::affinity::CpuId::BOOT),
             budget: ResourceBudget::unthrottled(),
             budget_cap: None,
             class: SchedClass::Normal,
@@ -276,7 +283,7 @@ impl TaskSpec {
     /// `check_live` the cap each round.
     pub const fn budgeted(budget: ResourceBudget, cap: Cap<CpuBudget, Spend>) -> Self {
         Self {
-            affinity: Affinity::any(),
+            affinity: Affinity::pinned(crate::affinity::CpuId::BOOT),
             budget,
             budget_cap: Some(cap),
             class: SchedClass::Normal,
