@@ -507,3 +507,328 @@ fn smoke_atomic_pool_usable_from_real_irq_handler() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts", smoke_atomic_pool_usable_from_real_irq_handler);
+
+// ── extended interrupts coverage ───────────────────────────────────
+//
+// The smokes above hit IRQ-end-to-end and the basic alloc/dispatch
+// shape. These close the remaining invariants on:
+//   - dispatch sync-handler install / clear / firing-order vs waker
+//   - independent per-vector accounting
+//   - vector allocator: rollback, OutOfRange edges, reuse-after-free
+//   - WaitForIrq baseline + Drop-clears-waker
+
+// Test-only vectors. The ones below 200 are reserved for `on_irq()`
+// software-synthesised tests so they don't collide with hardware
+// vectors (timer = 32, TLB shootdown = 0xF0, APIC error = 0xFE,
+// spurious = 0xFF). 0xE0/0xE1 are used by the `int <vec>` IRQ-ctx
+// smokes above; keep these in 110..=130.
+const SCRATCH_VEC_A: u8 = 110;
+const SCRATCH_VEC_B: u8 = 111;
+const SCRATCH_VEC_HANDLER: u8 = 112;
+const SCRATCH_VEC_HANDLER_CLEAR: u8 = 113;
+const SCRATCH_VEC_HANDLER_ORDER: u8 = 114;
+const SCRATCH_VEC_BASELINE: u8 = 115;
+const SCRATCH_VEC_DROP_CLEARS: u8 = 116;
+
+fn smoke_dispatch_sync_handler_runs_on_on_irq() -> TestResult {
+    // `install(v, h)` + `on_irq(v)` fires the synchronous handler.
+    // No trap path involved — just exercises the dispatch table.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    HITS.store(0, Ordering::Relaxed);
+    fn h() { HITS.fetch_add(1, Ordering::Relaxed); }
+
+    crate::dispatch::install(SCRATCH_VEC_HANDLER, h);
+    crate::on_irq(SCRATCH_VEC_HANDLER);
+    crate::on_irq(SCRATCH_VEC_HANDLER);
+    crate::dispatch::clear_handler(SCRATCH_VEC_HANDLER);
+    if HITS.load(Ordering::Relaxed) == 2 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("sync handler didn't run twice across two on_irq calls")
+    }
+}
+kernel_test_in!("interrupts", smoke_dispatch_sync_handler_runs_on_on_irq);
+
+fn smoke_dispatch_clear_handler_stops_invocations() -> TestResult {
+    // Install, fire (handler runs), clear, fire again (handler must NOT run).
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    HITS.store(0, Ordering::Relaxed);
+    fn h() { HITS.fetch_add(1, Ordering::Relaxed); }
+
+    crate::dispatch::install(SCRATCH_VEC_HANDLER_CLEAR, h);
+    crate::on_irq(SCRATCH_VEC_HANDLER_CLEAR);
+    crate::dispatch::clear_handler(SCRATCH_VEC_HANDLER_CLEAR);
+    crate::on_irq(SCRATCH_VEC_HANDLER_CLEAR);
+    if HITS.load(Ordering::Relaxed) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("clear_handler didn't stop subsequent invocations")
+    }
+}
+kernel_test_in!("interrupts", smoke_dispatch_clear_handler_stops_invocations);
+
+fn smoke_dispatch_sync_handler_runs_before_waker() -> TestResult {
+    // Documented contract: the synchronous handler observes a fully
+    // consistent `fire_count` snapshot, then the waker fires. We
+    // verify the handler sees `fire_count > baseline` already.
+    use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    static HANDLER_SEEN: AtomicU64 = AtomicU64::new(0);
+    static WAKER_AFTER_HANDLER: AtomicU8 = AtomicU8::new(0); // 0 init, 1 wake-after-handler, 2 wake-before-handler
+
+    fn h() {
+        HANDLER_SEEN.store(
+            crate::fire_count(SCRATCH_VEC_HANDLER_ORDER),
+            Ordering::Release,
+        );
+    }
+
+    // Custom waker that records whether the handler ran first.
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn wake(_: *const ()) {
+        // If HANDLER_SEEN is still 0, the waker fired *before* the
+        // handler — would be a contract violation.
+        if HANDLER_SEEN.load(Ordering::Acquire) == 0 {
+            WAKER_AFTER_HANDLER.store(2, Ordering::Release);
+        } else {
+            WAKER_AFTER_HANDLER.store(1, Ordering::Release);
+        }
+    }
+    fn wake_ref(p: *const ()) { wake(p); }
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
+
+    HANDLER_SEEN.store(0, Ordering::Release);
+    WAKER_AFTER_HANDLER.store(0, Ordering::Release);
+
+    // SAFETY: vtable functions are sound (no-op + atomic flag).
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    crate::dispatch::set_waker(SCRATCH_VEC_HANDLER_ORDER, w);
+    crate::dispatch::install(SCRATCH_VEC_HANDLER_ORDER, h);
+    crate::on_irq(SCRATCH_VEC_HANDLER_ORDER);
+    crate::dispatch::clear_handler(SCRATCH_VEC_HANDLER_ORDER);
+
+    match WAKER_AFTER_HANDLER.load(Ordering::Acquire) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("waker fired BEFORE sync handler — contract violation"),
+        _ => TestResult::Fail("waker never fired"),
+    }
+}
+kernel_test_in!("interrupts", smoke_dispatch_sync_handler_runs_before_waker);
+
+fn smoke_dispatch_vectors_are_independent() -> TestResult {
+    // Firing vector A must not bump vector B's fire_count.
+    let a_before = crate::fire_count(SCRATCH_VEC_A);
+    let b_before = crate::fire_count(SCRATCH_VEC_B);
+    for _ in 0..5 {
+        crate::on_irq(SCRATCH_VEC_A);
+    }
+    let a_after = crate::fire_count(SCRATCH_VEC_A);
+    let b_after = crate::fire_count(SCRATCH_VEC_B);
+    if a_after - a_before != 5 {
+        return TestResult::Fail("A's count didn't advance by 5");
+    }
+    if b_after != b_before {
+        return TestResult::Fail("firing A leaked into B's count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_dispatch_vectors_are_independent);
+
+fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
+    // set_waker(v, w); clear_waker(v); on_irq(v) — the waker must
+    // NOT fire. Models the cancellation path when a future is
+    // dropped before its IRQ lands.
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn wake(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn wake_ref(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
+
+    WOKEN.store(false, Ordering::Release);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    crate::dispatch::set_waker(SCRATCH_VEC_DROP_CLEARS, w);
+    crate::dispatch::clear_waker(SCRATCH_VEC_DROP_CLEARS);
+    crate::on_irq(SCRATCH_VEC_DROP_CLEARS);
+    if WOKEN.load(Ordering::Acquire) {
+        TestResult::Fail("clear_waker didn't prevent the wake")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("interrupts", smoke_dispatch_clear_waker_prevents_wake);
+
+// ── vector allocator extended ─────────────────────────────────────
+
+fn smoke_vector_alloc_then_free_reuse() -> TestResult {
+    // alloc → free → alloc on the same scan range should reuse the
+    // first vector (linear-scan + bitmap means the lowest free bit
+    // wins).
+    use crate::vector::{alloc, free};
+    let v0 = alloc().expect("alloc");
+    free(v0).expect("free");
+    let v1 = alloc().expect("alloc#2");
+    if v1 != v0 {
+        let _ = free(v1);
+        return TestResult::Fail("free-then-alloc didn't reuse the freed slot");
+    }
+    free(v1).expect("cleanup");
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_then_free_reuse);
+
+fn smoke_vector_free_out_of_range() -> TestResult {
+    // free(v < ALLOC_BASE) and free(v > ALLOC_MAX) both return
+    // OutOfRange. On x86_64 ALLOC_BASE = 48 so vector 10 is below;
+    // vector 250 is above ALLOC_MAX (240) on every arch.
+    use crate::vector::{free, VectorError};
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 10 is below ALLOC_BASE=48 on x86_64.
+        if free(10) != Err(VectorError::OutOfRange) {
+            return TestResult::Fail("free(10) didn't surface OutOfRange on x86_64");
+        }
+    }
+    if free(250) != Err(VectorError::OutOfRange) {
+        return TestResult::Fail("free(250) didn't surface OutOfRange");
+    }
+    if free(255) != Err(VectorError::OutOfRange) {
+        return TestResult::Fail("free(255) didn't surface OutOfRange");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_free_out_of_range);
+
+fn smoke_vector_alloc_block_zero_rejected() -> TestResult {
+    // alloc_block(0) is meaningless; it must surface OutOfRange
+    // rather than silently succeed with no reservation.
+    use crate::vector::{alloc_block, VectorError};
+    match alloc_block(0) {
+        Err(VectorError::OutOfRange) => TestResult::Pass,
+        _ => TestResult::Fail("alloc_block(0) didn't reject"),
+    }
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_zero_rejected);
+
+fn smoke_vector_alloc_block_releases_all_on_free() -> TestResult {
+    // alloc_block(8) + free each → all 8 bits clear.
+    use crate::vector::{alloc_block, free, is_allocated};
+    let base = match alloc_block(8) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_block(8) failed"),
+    };
+    for i in 0..8 {
+        if !is_allocated(base + i) {
+            for j in 0..8 { let _ = free(base + j); }
+            return TestResult::Fail("block bit not set");
+        }
+    }
+    for i in 0..8 {
+        free(base + i).expect("free");
+    }
+    for i in 0..8 {
+        if is_allocated(base + i) {
+            return TestResult::Fail("free didn't clear bit");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_releases_all_on_free);
+
+fn smoke_vector_double_free_returns_already_free() -> TestResult {
+    // free(v) twice — second call must report AlreadyFree.
+    use crate::vector::{alloc, free, VectorError};
+    let v = alloc().expect("alloc");
+    free(v).expect("first free");
+    match free(v) {
+        Err(VectorError::AlreadyFree) => TestResult::Pass,
+        _ => TestResult::Fail("double-free didn't surface AlreadyFree"),
+    }
+}
+kernel_test_in!("interrupts", smoke_vector_double_free_returns_already_free);
+
+// ── WaitForIrq edge cases ─────────────────────────────────────────
+
+fn smoke_wait_for_irq_baseline_ignores_prior_fires() -> TestResult {
+    // Bump fire_count BEFORE constructing wait_for_irq. The future
+    // snapshots the count at construction so it must NOT resolve
+    // Ready on its first poll — the IRQs already counted are part
+    // of the baseline.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    crate::on_irq(SCRATCH_VEC_BASELINE);
+    crate::on_irq(SCRATCH_VEC_BASELINE);
+
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_wake(_: *const ()) {}
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&w);
+
+    let mut fut = crate::wait_for_irq(SCRATCH_VEC_BASELINE);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut cx) {
+        Poll::Pending => {
+            // Now fire once and re-poll — must resolve.
+            crate::on_irq(SCRATCH_VEC_BASELINE);
+            let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+            match pinned.poll(&mut cx) {
+                Poll::Ready(_) => TestResult::Pass,
+                Poll::Pending => TestResult::Fail("post-baseline IRQ didn't resolve future"),
+            }
+        }
+        Poll::Ready(_) => {
+            TestResult::Fail("baseline snapshot ignored — fired BEFORE construction leaked through")
+        }
+    }
+}
+kernel_test_in!("interrupts", smoke_wait_for_irq_baseline_ignores_prior_fires);
+
+fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
+    // Construct WaitForIrq, poll once to install the waker, then
+    // drop. Subsequent on_irq must NOT call the waker (its memory
+    // could be reused by then — undefined behaviour to wake a
+    // dropped task).
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn wake(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, wake, wake, noop_drop);
+
+    WOKEN.store(false, Ordering::Release);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&w);
+
+    {
+        let mut fut = crate::wait_for_irq(120);
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        let _ = pinned.poll(&mut cx); // installs waker
+        // fut drops here → WaitForIrq::Drop clears the slot.
+    }
+    crate::on_irq(120);
+    if WOKEN.load(Ordering::Acquire) {
+        TestResult::Fail("on_irq woke a dropped future — Drop didn't clear the waker")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("interrupts", smoke_wait_for_irq_drop_clears_waker);
