@@ -116,6 +116,28 @@ pub enum TpmError {
     BadResponse,
 }
 
+/// Yielding equivalent of `narf_scheduler::responsive_spin_until`.
+/// Polls `cond()` between `narf_scheduler::yield_now().await`s so
+/// peer tasks (FB drain, cursor pump, USB-HID supervisor) keep
+/// making progress while we wait on a TPM status bit that can take
+/// up to 5 s on real silicon. Returns true if `cond` succeeded
+/// before `deadline`, false on timeout. The TSC-based `Deadline`
+/// uses `RDTSC` directly so it doesn't depend on the timer wheel.
+async fn poll_yielding_until<F: FnMut() -> bool>(
+    mut cond: F,
+    deadline: narf_time::Deadline,
+) -> bool {
+    loop {
+        if cond() {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
 #[derive(Debug)]
 pub struct Tpm {
     base: u64,
@@ -235,14 +257,21 @@ impl Tpm {
     /// TIS path: writes byte-by-byte into the data FIFO with
     /// EXPECT/VALID flow control, sets STS.GO, drains the FIFO
     /// when DATA_AVAIL asserts.
-    pub fn submit(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+    ///
+    /// Async-shaped because the worst-case CRB / TIS poll budgets
+    /// run up to 5 s on real silicon (RSA keygen, AMD PSP fTPM
+    /// slow paths). A sync spin would block the executor for that
+    /// entire window, starving every other task (FB drain, cursor
+    /// pump, USB-HID supervisor, init). Each polling loop yields
+    /// to the executor between MMIO reads so peers keep ticking.
+    pub async fn submit(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
         match self.kind {
-            TpmKind::Crb => self.submit_crb(cmd),
-            TpmKind::Tis => self.submit_tis(cmd),
+            TpmKind::Crb => self.submit_crb(cmd).await,
+            TpmKind::Tis => self.submit_tis(cmd).await,
         }
     }
 
-    fn submit_crb(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+    async fn submit_crb(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
         if cmd.is_empty() || cmd.len() > self.cmd_size as usize {
             return Err(TpmError::BadResponse);
         }
@@ -255,11 +284,12 @@ impl Tpm {
         // 750 ms TIMEOUT_A. Timeout ignored, mirroring prior
         // behaviour — the GO write below will fail loudly if the
         // TPM never left idle.
-        let _ = narf_scheduler::responsive_spin_until(
+        let _ = poll_yielding_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { read32(self.base + REG_CRB_CTRL_STS) } & CTRL_STS_TPM_IDLE == 0,
             narf_time::Deadline::after_ms(750),
-        );
+        )
+        .await;
         // 2. Write command into the command buffer.
         // SAFETY: command buffer phys was published by firmware/ACPI.
         unsafe {
@@ -274,13 +304,14 @@ impl Tpm {
         }
         // 4. Poll for start bit to self-clear (cmd complete).
         // 5 s wall-clock budget — TIMEOUT_C / TIMEOUT_D worst
-        // cases (e.g. RSA keygen). responsive_spin_until ticks
-        // sleep_pumps.
-        let done = narf_scheduler::responsive_spin_until(
+        // cases (e.g. RSA keygen). Yields to the executor between
+        // MMIO reads so peer tasks make progress during the wait.
+        let done = poll_yielding_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { read32(self.base + REG_CRB_CTRL_START) } & CTRL_START_GO == 0,
             narf_time::Deadline::after_ms(5_000),
-        );
+        )
+        .await;
         if !done {
             return Err(TpmError::BusyTimeout);
         }
@@ -305,27 +336,29 @@ impl Tpm {
         Ok(out)
     }
 
-    fn submit_tis(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+    async fn submit_tis(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
         // 1. Request locality 0.
         // SAFETY: identity-mapped MMIO.
         unsafe {
             write8(self.base + REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
         }
         // 750 ms TIMEOUT_A — locality acknowledgement.
-        let _ = narf_scheduler::responsive_spin_until(
+        let _ = poll_yielding_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { read8(self.base + REG_TIS_ACCESS) } & TIS_ACCESS_ACTIVE != 0,
             narf_time::Deadline::after_ms(750),
-        );
+        )
+        .await;
         // 2. Write command into the FIFO.
         for b in cmd {
             // Wait for STS.EXPECT before each byte. 750 ms
             // TIMEOUT_A — typical sub-microsecond on real TPMs.
-            let _ = narf_scheduler::responsive_spin_until(
+            let _ = poll_yielding_until(
                 // SAFETY: identity-mapped MMIO.
                 || unsafe { read8(self.base + REG_TIS_STS) } & TIS_STS_EXPECT != 0,
                 narf_time::Deadline::after_ms(750),
-            );
+            )
+            .await;
             // SAFETY: same.
             unsafe {
                 write8(self.base + REG_TIS_DATA_FIFO, *b);
@@ -338,14 +371,15 @@ impl Tpm {
         }
         // 4. Wait for STS.DATA_AVAIL. 5 s wall-clock budget —
         // TIMEOUT_C / TIMEOUT_D worst cases (RSA keygen etc.).
-        let done = narf_scheduler::responsive_spin_until(
+        let done = poll_yielding_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 let s = unsafe { read8(self.base + REG_TIS_STS) };
                 s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
             },
             narf_time::Deadline::after_ms(5_000),
-        );
+        )
+        .await;
         if !done {
             return Err(TpmError::BusyTimeout);
         }
@@ -370,7 +404,7 @@ impl Tpm {
     /// `TPM2_GetRandom(bytes_requested)` — convenience wrapper.
     /// Returns up to `bytes` bytes of random data. The TPM may
     /// return fewer than requested.
-    pub fn tpm2_get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+    pub async fn tpm2_get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
         // TPM2 wire format §5.6:
         //   tag: u16 BE = 0x8001 (TPM_ST_NO_SESSIONS)
         //   commandSize: u32 BE
@@ -381,7 +415,7 @@ impl Tpm {
         req.extend_from_slice(&12u32.to_be_bytes()); // size
         req.extend_from_slice(&0x0000_017Bu32.to_be_bytes()); // GetRandom
         req.extend_from_slice(&bytes.to_be_bytes());
-        let resp = self.submit(&req)?;
+        let resp = self.submit(&req).await?;
         if resp.len() < 12 {
             return Err(TpmError::BadResponse);
         }
@@ -406,7 +440,7 @@ impl TpmDevice for Tpm {
     }
 
     async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, HighLevelTpmError> {
-        self.submit(cmd).map_err(|e| match e {
+        self.submit(cmd).await.map_err(|e| match e {
             TpmError::NotPresent => HighLevelTpmError::NotPresent,
             TpmError::LocalityTimeout => HighLevelTpmError::LocalityTimeout,
             TpmError::BusyTimeout => HighLevelTpmError::BusyTimeout,
@@ -417,6 +451,7 @@ impl TpmDevice for Tpm {
 
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, HighLevelTpmError> {
         self.tpm2_get_random(bytes)
+            .await
             .map_err(|_| HighLevelTpmError::HardwareError)
     }
 
