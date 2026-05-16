@@ -752,6 +752,20 @@ pub fn run_until_empty() {
     };
 
     loop {
+        // Slot 21: run_until_empty round entry beacon. White → red
+        // toggles each round. If this stays a single colour, the
+        // executor never completes one round (wedged in first
+        // task's poll). If it toggles but slot 22 (DrainTask poll
+        // entry) doesn't, the task ahead of DrainTask never
+        // returns Pending and the round never reaches DrainTask.
+        narf_memory::beacon::paint(
+            21,
+            if (narf_time::now_cycles() >> 27) & 1 == 0 {
+                0x00FF_FFFF
+            } else {
+                0x00FF_0000
+            },
+        );
         // Snapshot queue length. We'll visit each task at most once per
         // round; spawns during the round land at the back and get
         // visited on the NEXT round.
@@ -791,6 +805,71 @@ pub fn run_until_empty() {
                 continue;
             }
 
+            // Slot 17: user-task poll heartbeat — painted in
+            // KERNEL AS, before `activate()` swaps CR3 to the
+            // user's AS (which lacks the low-half identity map
+            // that the FB phys lives in; a beacon paint after
+            // activate would page-fault and the next kernel task
+            // polled with stale CR3 would page-fault too).
+            // Blue ↔ red toggle.
+            if slot.addr_space.is_some() {
+                use core::sync::atomic::{AtomicU64, Ordering as O};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let v = N.fetch_add(1, O::Relaxed);
+                let colour = if v & 1 == 0 { 0x0000_00FF } else { 0x00FF_0000 };
+                narf_memory::beacon::paint(17, colour);
+            }
+
+            // Save the kernel per-AS register before activating
+            // the user AS so we can swap back after `poll()`
+            // returns. Without this, the next kernel task to be
+            // polled runs with the stale user mapping register
+            // active — any low-half access (FB phys, identity-
+            // mapped MMIO, beacon paint) page-faults on x86_64.
+            //
+            // x86_64: the single CR3 holds both halves; leaving
+            // it on the user AS is the actual bug we hit on Zen2
+            // (init's user AS lacked the FB phys low-half map,
+            // every subsequent kernel task faulted silently).
+            //
+            // aarch64: split TTBR0/TTBR1. Kernel always resolves
+            // via TTBR1, so kernel tasks following a user task
+            // are fine even without this restore. But two user
+            // tasks back-to-back would inherit the previous one's
+            // TTBR0 until their own activate() runs — same
+            // save/restore shape prevents the user-vs-user leak
+            // pre-emptively.
+            #[cfg(target_arch = "x86_64")]
+            let saved_cr3: u64 = if slot.addr_space.is_some() {
+                // SAFETY: read_cr3 has no preconditions.
+                let raw: u64;
+                unsafe {
+                    core::arch::asm!(
+                        "mov {0}, cr3",
+                        out(reg) raw,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                raw
+            } else {
+                0
+            };
+            #[cfg(target_arch = "aarch64")]
+            let saved_ttbr0: u64 = if slot.addr_space.is_some() {
+                // SAFETY: TTBR0_EL1 read is unconditional at EL1.
+                let raw: u64;
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {0}, ttbr0_el1",
+                        out(reg) raw,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                raw
+            } else {
+                0
+            };
+
             // If the task owns an address space, activate it before
             // polling so user-mode accesses land in the right low-half
             // mappings. Live on x86_64 (CR3 swap) and aarch64 (TTBR0
@@ -818,6 +897,49 @@ pub fn run_until_empty() {
             let poll_result = slot.task.as_mut().poll(&mut ctx);
             CURRENT_TASK.store(0, Ordering::Release);
             *ACTIVE_USER_AS.lock() = None;
+            // Restore kernel per-AS register — see save comment
+            // above. Without this, every kernel task polled after
+            // a user task runs with stale user-AS CR3 (x86_64)
+            // and faults on any low-half access; on aarch64 two
+            // back-to-back user tasks would inherit each other's
+            // TTBR0 until their own activate() runs.
+            #[cfg(target_arch = "x86_64")]
+            if saved_cr3 != 0 {
+                // SAFETY: `saved_cr3` was just read from CR3 in
+                // kernel context above; writing it back is
+                // identity-safe.
+                unsafe {
+                    core::arch::asm!(
+                        "mov cr3, {0}",
+                        in(reg) saved_cr3,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            if saved_ttbr0 != 0 {
+                // SAFETY: `saved_ttbr0` was just read from
+                // TTBR0_EL1 in kernel context above. The
+                // architected sequence for a TTBR swap is MSR +
+                // ISB; we also broadcast a TLBI VMALLE1IS to
+                // clear stale Stage-1 TLB entries from the
+                // intervening user-AS activation. This is the
+                // same dance `aarch64::paging::write_ttbr0_el1`
+                // performs internally, replicated here so we
+                // don't pull a circular dep on `narf-memory`
+                // from inside `narf-scheduler`'s hot path.
+                unsafe {
+                    core::arch::asm!(
+                        "msr ttbr0_el1, {0}",
+                        "isb",
+                        "tlbi vmalle1is",
+                        "dsb ish",
+                        "isb",
+                        in(reg) saved_ttbr0,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+            }
             let elapsed = Instant::now().cycles_since(start);
             slot.account.charge(elapsed, &slot.spec.budget);
 

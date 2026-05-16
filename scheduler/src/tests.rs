@@ -511,6 +511,313 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_spawn_user_carries_address_space);
 
+/// Regression: polling a user task must restore the kernel CR3
+/// before returning to the caller, otherwise any subsequent
+/// low-half access (FB phys, identity-mapped MMIO, beacon write)
+/// from kernel context page-faults.
+///
+/// The original `boot-init` symptom: `DrainTask` polled fine in
+/// the first round, then the executor activated init's user AS,
+/// polled `UserTaskFuture` (returning Pending), and left CR3 in
+/// init's user PML4. The next kernel task in the queue
+/// (cursor::pump, status-refresh, the periodic FB drain) ran with
+/// stale user CR3 and faulted on the first low-half access.
+/// Existing user-task smokes didn't catch this because they only
+/// spawned one user task and the test never asserted on CR3 or
+/// queued a follow-up task that touched low-half memory.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use narf_memory::AddressSpace;
+    use crate::{spawn_user, TaskSpec};
+
+    // SAFETY: `mov %cr3, reg` is unconditional at CPL=0.
+    #[inline(always)]
+    unsafe fn read_cr3() -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, cr3",
+                out(reg) v,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        v
+    }
+
+    crate::__reset_queues_for_test();
+    let kernel_cr3 = unsafe { read_cr3() };
+
+    let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    let user_cr3 = user_as.root.as_u64();
+    if user_cr3 == kernel_cr3 {
+        return TestResult::Fail("new user AS shares root with kernel AS");
+    }
+    let arc_as = Arc::new(user_as);
+
+    let _tid = spawn_user(
+        async {
+            // No-op user-task body. The bug isn't in the body —
+            // it's that the scheduler leaks CR3 to the *next*
+            // task after this one returns.
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_as),
+    );
+
+    crate::run_until_empty();
+
+    let cr3_after = unsafe { read_cr3() };
+    if cr3_after == kernel_cr3 {
+        TestResult::Pass
+    } else if cr3_after == user_cr3 {
+        TestResult::Fail("CR3 left in user AS after run_until_empty")
+    } else {
+        TestResult::Fail("CR3 ended in unexpected value after run_until_empty")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_user_task_poll_restores_kernel_cr3
+);
+
+/// aarch64 mirror of the x86_64 `…restores_kernel_cr3` test:
+/// asserts that polling a user task leaves TTBR0_EL1 at the
+/// kernel root after `run_until_empty` returns. Today
+/// `AddressSpace::activate()` on aarch64 is a diagnostic no-op
+/// (writes TTBR0 back to itself), so the test passes trivially —
+/// but the assertion stays in place so that if/when activate()
+/// is wired to swap TTBR0 to `self.root`, the scheduler MUST
+/// continue to save and restore it. Without the save/restore,
+/// two user tasks back-to-back would inherit each other's TTBR0
+/// until their own activate() ran.
+#[cfg(target_arch = "aarch64")]
+fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use narf_memory::AddressSpace;
+    use crate::{spawn_user, TaskSpec};
+
+    // SAFETY: `MRS TTBR0_EL1` is unconditional at EL1.
+    #[inline(always)]
+    unsafe fn read_ttbr0() -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, ttbr0_el1",
+                out(reg) v,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        v
+    }
+
+    crate::__reset_queues_for_test();
+    let kernel_ttbr0 = unsafe { read_ttbr0() };
+
+    let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    let arc_as = Arc::new(user_as);
+
+    let _tid = spawn_user(
+        async {},
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_as),
+    );
+
+    crate::run_until_empty();
+
+    let ttbr0_after = unsafe { read_ttbr0() };
+    drop(arc_as);
+    if ttbr0_after == kernel_ttbr0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TTBR0_EL1 not restored to kernel root after run_until_empty")
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_user_task_poll_restores_kernel_ttbr0
+);
+
+/// Regression: a user task followed by a kernel task on the same
+/// CPU queue must BOTH run, and CR3 must be the kernel root by
+/// the time the kernel task is polled. Otherwise any low-half
+/// access in the kernel task would page-fault (the production
+/// `boot-init` symptom: DrainTask polled fine, then init's user
+/// AS was activated, then cursor::pump / status-refresh / the
+/// FB drain task all ran with stale user CR3 and faulted
+/// silently on their first FB-phys beacon write).
+///
+/// Reads CR3 from inside the kernel task — that's where the
+/// regression hits in production.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use narf_memory::AddressSpace;
+    use crate::{spawn, spawn_user, TaskSpec};
+
+    static USER_RAN: AtomicBool = AtomicBool::new(false);
+    static KERNEL_RAN: AtomicBool = AtomicBool::new(false);
+    static KERNEL_CR3_OBSERVED: AtomicU64 = AtomicU64::new(0);
+    USER_RAN.store(false, Ordering::Relaxed);
+    KERNEL_RAN.store(false, Ordering::Relaxed);
+    KERNEL_CR3_OBSERVED.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+
+    // SAFETY: `mov %cr3, reg` is unconditional at CPL=0.
+    #[inline(always)]
+    unsafe fn read_cr3() -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, cr3",
+                out(reg) v,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        v
+    }
+    let kernel_cr3 = unsafe { read_cr3() };
+
+    let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    let user_cr3 = user_as.root.as_u64();
+    let arc_as = Arc::new(user_as);
+
+    let _utid = spawn_user(
+        async {
+            USER_RAN.store(true, Ordering::Relaxed);
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_as),
+    );
+
+    spawn(async move {
+        // SAFETY: see read_cr3.
+        let cr3_seen = unsafe { read_cr3() };
+        KERNEL_CR3_OBSERVED.store(cr3_seen, Ordering::Relaxed);
+        KERNEL_RAN.store(true, Ordering::Relaxed);
+    });
+
+    crate::run_until_empty();
+
+    if !USER_RAN.load(Ordering::Relaxed) {
+        return TestResult::Fail("user task didn't run");
+    }
+    if !KERNEL_RAN.load(Ordering::Relaxed) {
+        return TestResult::Fail("kernel task didn't run after user task");
+    }
+    let observed = KERNEL_CR3_OBSERVED.load(Ordering::Relaxed);
+    if observed == user_cr3 {
+        return TestResult::Fail("kernel task observed stale user CR3 — leak");
+    }
+    if observed != kernel_cr3 {
+        return TestResult::Fail("kernel task observed unexpected CR3 value");
+    }
+    // arc_as drops here, exercising AddressSpace::drop. The new
+    // memory smoke tests assert drop-then-realloc cycles are
+    // hermetic, so this no longer needs the leak workaround.
+    drop(arc_as);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_user_then_kernel_task_sees_kernel_cr3
+);
+
+/// aarch64 mirror of `…sees_kernel_cr3`. Spawns a user task
+/// followed by a kernel task on the same CPU queue; the kernel
+/// task reads its own TTBR0_EL1 and asserts the scheduler
+/// restored it to the kernel value (NOT the leaked user AS).
+/// Trivially passes today because aarch64 activate() is a no-op,
+/// but pins the contract so a future activate() rewrite stays
+/// honest.
+#[cfg(target_arch = "aarch64")]
+fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use narf_memory::AddressSpace;
+    use crate::{spawn, spawn_user, TaskSpec};
+
+    static USER_RAN: AtomicBool = AtomicBool::new(false);
+    static KERNEL_RAN: AtomicBool = AtomicBool::new(false);
+    static KERNEL_TTBR0_OBSERVED: AtomicU64 = AtomicU64::new(0);
+    USER_RAN.store(false, Ordering::Relaxed);
+    KERNEL_RAN.store(false, Ordering::Relaxed);
+    KERNEL_TTBR0_OBSERVED.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+
+    // SAFETY: `MRS TTBR0_EL1` is unconditional at EL1.
+    #[inline(always)]
+    unsafe fn read_ttbr0() -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, ttbr0_el1",
+                out(reg) v,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        v
+    }
+    let kernel_ttbr0 = unsafe { read_ttbr0() };
+
+    let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    let user_root = user_as.root.as_u64();
+    let arc_as = Arc::new(user_as);
+
+    let _utid = spawn_user(
+        async {
+            USER_RAN.store(true, Ordering::Relaxed);
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_as),
+    );
+
+    spawn(async move {
+        // SAFETY: see read_ttbr0.
+        let observed = unsafe { read_ttbr0() };
+        KERNEL_TTBR0_OBSERVED.store(observed, Ordering::Relaxed);
+        KERNEL_RAN.store(true, Ordering::Relaxed);
+    });
+
+    crate::run_until_empty();
+
+    drop(arc_as);
+
+    if !USER_RAN.load(Ordering::Relaxed) {
+        return TestResult::Fail("user task didn't run");
+    }
+    if !KERNEL_RAN.load(Ordering::Relaxed) {
+        return TestResult::Fail("kernel task didn't run after user task");
+    }
+    let observed = KERNEL_TTBR0_OBSERVED.load(Ordering::Relaxed);
+    // The user-root bit comparison: TTBR0 holds the root phys in
+    // its top bits plus ASID in low bits. We mask to the table-
+    // address bits before comparison.
+    const ROOT_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    if (observed & ROOT_MASK) == (user_root & ROOT_MASK) {
+        return TestResult::Fail("kernel task observed stale user TTBR0 — leak");
+    }
+    if (observed & ROOT_MASK) != (kernel_ttbr0 & ROOT_MASK) {
+        return TestResult::Fail("kernel task observed unexpected TTBR0 value");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0
+);
+
 // ── relocated from verification ──
 
 fn smoke_sleep_future_waits() -> TestResult {
