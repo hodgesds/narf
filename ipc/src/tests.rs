@@ -491,3 +491,433 @@ fn smoke_ipc_mpsc_closed_surfaces() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("ipc", smoke_ipc_mpsc_closed_surfaces);
+
+// ── extended ipc coverage ──────────────────────────────────────────
+//
+// The smokes above hit the headline paths; the ones below close the
+// remaining invariants: wrap-around, waker pairing on Pending →
+// Ready, drop-runs-destructors, and per-half close detection on each
+// of SPSC, MPSC, and SharedRing.
+
+fn smoke_ipc_spsc_wrap_around_indices() -> TestResult {
+    // Push N items, drain, push N more — the consumer's view of
+    // ordering must persist across the modular index wrap. A bad
+    // mask or off-by-one shows up as out-of-order delivery or a
+    // missing element in the second batch.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SUM: AtomicU64 = AtomicU64::new(0);
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+
+    SUM.store(0, Ordering::Relaxed);
+    SEEN.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (mut tx, mut rx) = crate::channel::<u64, 4>();
+    narf_scheduler::spawn(async move {
+        for i in 1u64..=32 {
+            let _ = tx.send(i).await;
+        }
+    });
+    narf_scheduler::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(v) => {
+                    SUM.fetch_add(v, Ordering::Relaxed);
+                    SEEN.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    narf_scheduler::run_until_empty();
+
+    if SEEN.load(Ordering::Relaxed) != 32 {
+        return TestResult::Fail("dropped a message across the wrap");
+    }
+    // 1 + 2 + … + 32 = 528.
+    if SUM.load(Ordering::Relaxed) != 528 {
+        return TestResult::Fail("payload corruption across wrap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_spsc_wrap_around_indices);
+
+fn smoke_ipc_spsc_send_blocks_until_drain() -> TestResult {
+    // Fill a 2-slot ring synchronously, then `send` async — the
+    // producer future must park on Full and resolve only after the
+    // consumer drains. Validates the producer-side waker pairing.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static PRODUCED: AtomicU8 = AtomicU8::new(0);
+    PRODUCED.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (mut tx, mut rx) = crate::channel::<u32, 2>();
+    // Pre-fill via try_send so the async send below starts at Full.
+    tx.try_send(0xAA).expect("slot 0");
+    tx.try_send(0xBB).expect("slot 1");
+
+    narf_scheduler::spawn(async move {
+        // This send parks on Full until the consumer drains a slot.
+        let _ = tx.send(0xCC).await;
+        PRODUCED.store(1, Ordering::Relaxed);
+        let _ = tx.send(0xDD).await;
+        PRODUCED.store(2, Ordering::Relaxed);
+    });
+
+    narf_scheduler::spawn(async move {
+        // Yield once so the producer parks first.
+        narf_scheduler::yield_now().await;
+        // Drain one — wakes the parked producer.
+        let _ = rx.recv().await;
+        // Drain remaining.
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+    });
+    narf_scheduler::run_until_empty();
+
+    if PRODUCED.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("parked producer never resumed after consumer drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_spsc_send_blocks_until_drain);
+
+fn smoke_ipc_spsc_drop_ring_runs_payload_destructors() -> TestResult {
+    // Items remaining in the ring when the last handle drops must
+    // have their destructors run. We can't observe the Ring's Drop
+    // path directly through `channel()` (it sits behind an Arc), so
+    // construct an item type with a Drop that bumps a static
+    // counter, fill the ring, drop both halves, then verify the
+    // counter saw every undrained value.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static DROPS: AtomicU32 = AtomicU32::new(0);
+
+    struct Counted(u32);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let (mut tx, rx) = crate::channel::<Counted, 4>();
+        for i in 0..3 {
+            tx.try_send(Counted(i)).ok();
+        }
+        // Drop producer first, then consumer — Arc<Ring> drops on
+        // last reference, which runs Ring::drop's loop over
+        // [tail, head).
+        drop(tx);
+        drop(rx);
+    }
+    if DROPS.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("Ring::drop didn't run destructors on undrained slots");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_spsc_drop_ring_runs_payload_destructors);
+
+fn smoke_ipc_spsc_close_from_consumer_drop() -> TestResult {
+    // Drop the consumer first; the producer's next try_send must
+    // surface Closed (handing the value back so the caller can
+    // recover it).
+    let (mut tx, rx) = crate::channel::<u32, 4>();
+    drop(rx);
+    match tx.try_send(42) {
+        Err(crate::TrySendError::Closed(42)) => TestResult::Pass,
+        Err(crate::TrySendError::Closed(_)) => TestResult::Fail("Closed dropped the payload"),
+        Err(crate::TrySendError::Full(_)) => TestResult::Fail("expected Closed, got Full"),
+        Ok(()) => TestResult::Fail("send accepted after consumer drop"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_spsc_close_from_consumer_drop);
+
+fn smoke_ipc_spsc_recv_parked_then_woken() -> TestResult {
+    // Consumer recv-future parks first (empty ring), THEN producer
+    // sends. The producer's send must wake the parked consumer; the
+    // consumer's poll must resolve to Ok(value).
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static GOT: AtomicU32 = AtomicU32::new(0);
+
+    GOT.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (mut tx, mut rx) = crate::channel::<u32, 4>();
+    narf_scheduler::spawn(async move {
+        match rx.recv().await {
+            Ok(v) => GOT.store(v, Ordering::Relaxed),
+            Err(_) => GOT.store(0xDEAD, Ordering::Relaxed),
+        }
+    });
+    narf_scheduler::spawn(async move {
+        // Give the consumer time to park on Empty.
+        narf_scheduler::yield_now().await;
+        let _ = tx.send(0xC0FFEE).await;
+    });
+    narf_scheduler::run_until_empty();
+
+    match GOT.load(Ordering::Relaxed) {
+        0xC0FFEE => TestResult::Pass,
+        0xDEAD => TestResult::Fail("recv future returned Closed instead of value"),
+        0 => TestResult::Fail("parked recv never resumed"),
+        _ => TestResult::Fail("recv resolved to wrong value"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_spsc_recv_parked_then_woken);
+
+// ── shared ring extended ──────────────────────────────────────────
+
+fn smoke_ipc_shared_ring_wrap_around() -> TestResult {
+    // Same wrap discipline as the SPSC test, but through the
+    // SharedRing path (kernel/user wire layout). Push 4, drain 4,
+    // push 4 more — every slot index wraps once.
+    use crate::{SharedConsumer, SharedProducer, SharedRing};
+
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    unsafe {
+        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        SharedRing::<u32, 4>::init_in(frame.raw() as *mut SharedRing<u32, 4>);
+    }
+    let view = frame.raw() as *mut SharedRing<u32, 4>;
+    let mut prod = unsafe { SharedProducer::<u32, 4>::from_raw(view) };
+    let mut cons = unsafe { SharedConsumer::<u32, 4>::from_raw(view) };
+
+    for i in 0u32..4 {
+        if prod.try_send(0x100 + i).is_err() {
+            return TestResult::Fail("first-batch send failed");
+        }
+    }
+    for expected in 0u32..4 {
+        match cons.try_recv() {
+            Ok(v) if v == 0x100 + expected => {}
+            _ => return TestResult::Fail("first-batch order violated"),
+        }
+    }
+    for i in 0u32..4 {
+        if prod.try_send(0x200 + i).is_err() {
+            return TestResult::Fail("second-batch send failed (wrap)");
+        }
+    }
+    for expected in 0u32..4 {
+        match cons.try_recv() {
+            Ok(v) if v == 0x200 + expected => {}
+            _ => return TestResult::Fail("second-batch order violated (wrap)"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_shared_ring_wrap_around);
+
+fn smoke_ipc_shared_ring_close_from_consumer() -> TestResult {
+    // Symmetric to the producer-side close test: consumer closes,
+    // producer's next try_send must surface Closed(value) — handing
+    // the payload back so it isn't silently lost.
+    use crate::{SharedConsumer, SharedProducer, SharedRing, SharedTrySendError};
+
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    unsafe {
+        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        SharedRing::<u64, 4>::init_in(frame.raw() as *mut SharedRing<u64, 4>);
+    }
+    let view = frame.raw() as *mut SharedRing<u64, 4>;
+    let mut prod = unsafe { SharedProducer::<u64, 4>::from_raw(view) };
+    let mut cons = unsafe { SharedConsumer::<u64, 4>::from_raw(view) };
+
+    cons.close();
+    match prod.try_send(0xFEED) {
+        Err(SharedTrySendError::Closed(0xFEED)) => TestResult::Pass,
+        Err(SharedTrySendError::Closed(_)) => TestResult::Fail("Closed dropped the payload"),
+        Err(SharedTrySendError::Full(_)) => TestResult::Fail("expected Closed, got Full"),
+        Ok(()) => TestResult::Fail("send accepted after consumer close"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_shared_ring_close_from_consumer);
+
+fn smoke_ipc_shared_ring_volatile_payload_persists() -> TestResult {
+    // Regression guard for the dead-store-elimination bug fixed by
+    // moving try_send / try_recv to ptr::write_volatile /
+    // ptr::read_volatile: write a non-trivial payload, read the
+    // memory back through a raw pointer at the slot offset, and
+    // assert the bytes landed. Without volatile, LLVM saw the
+    // payload store as dead (no in-scope reader of the raw
+    // pointer) and elided it; the head atomic still advanced, so
+    // the consumer would see uninit garbage.
+    use crate::{SharedProducer, SharedRing};
+
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    unsafe {
+        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        SharedRing::<u64, 4>::init_in(frame.raw() as *mut SharedRing<u64, 4>);
+    }
+    let view = frame.raw() as *mut SharedRing<u64, 4>;
+    let mut prod = unsafe { SharedProducer::<u64, 4>::from_raw(view) };
+    if prod.try_send(0xDEAD_BEEF_CAFE_F00D).is_err() {
+        return TestResult::Fail("try_send failed");
+    }
+    // Header is exactly 64 bytes (head + tail + closed + pad). The
+    // first slot's payload sits at offset 64. We deliberately do
+    // NOT use SharedConsumer here so the read goes through an
+    // independent pointer the compiler can't fold into the producer.
+    let v = unsafe { core::ptr::read_volatile((frame.raw() + 64) as *const u64) };
+    if v == 0xDEAD_BEEF_CAFE_F00D {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("producer payload was elided — volatile guarantee broken")
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_shared_ring_volatile_payload_persists);
+
+fn smoke_ipc_shared_ring_full_then_drain_then_send_again() -> TestResult {
+    // Fill, observe Full, drain one, can send again. Validates
+    // the head/tail arithmetic on the "tail caught up" branch.
+    use crate::{SharedConsumer, SharedProducer, SharedRing, SharedTrySendError};
+
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    unsafe {
+        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        SharedRing::<u32, 2>::init_in(frame.raw() as *mut SharedRing<u32, 2>);
+    }
+    let view = frame.raw() as *mut SharedRing<u32, 2>;
+    let mut prod = unsafe { SharedProducer::<u32, 2>::from_raw(view) };
+    let mut cons = unsafe { SharedConsumer::<u32, 2>::from_raw(view) };
+
+    prod.try_send(1).expect("slot 0");
+    prod.try_send(2).expect("slot 1");
+    if !matches!(prod.try_send(3), Err(SharedTrySendError::Full(3))) {
+        return TestResult::Fail("3rd send didn't surface Full");
+    }
+    match cons.try_recv() {
+        Ok(1) => {}
+        _ => return TestResult::Fail("first drain wrong value"),
+    }
+    if prod.try_send(3).is_err() {
+        return TestResult::Fail("post-drain send unexpectedly failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_shared_ring_full_then_drain_then_send_again);
+
+// ── mpsc extended ─────────────────────────────────────────────────
+
+fn smoke_ipc_mpsc_backpressure_full_then_drain() -> TestResult {
+    // try_send into a full queue returns Full; pop one via the
+    // consumer's try_recv; the next try_send must succeed.
+    use crate::{mpsc_channel, MpscSendError};
+
+    let (tx, rx) = mpsc_channel::<u32>(2);
+    tx.try_send(1).unwrap();
+    tx.try_send(2).unwrap();
+    match tx.try_send(3) {
+        Err(MpscSendError::Full(3)) => {}
+        _ => return TestResult::Fail("Full not reported on third send"),
+    }
+    match rx.try_recv() {
+        Ok(Some(1)) => {}
+        _ => return TestResult::Fail("drain ordering wrong"),
+    }
+    if tx.try_send(3).is_err() {
+        return TestResult::Fail("post-drain send blocked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_backpressure_full_then_drain);
+
+fn smoke_ipc_mpsc_try_recv_empty_open_is_ok_none() -> TestResult {
+    // Empty channel with the consumer's producer half still alive
+    // must surface Ok(None), not Closed. Distinct semantics
+    // (caller can spin); Closed means truly done.
+    use crate::mpsc_channel;
+    let (_tx, rx) = mpsc_channel::<u32>(4);
+    match rx.try_recv() {
+        Ok(None) => TestResult::Pass,
+        Ok(Some(_)) => TestResult::Fail("recv returned a value on an empty channel"),
+        Err(_) => TestResult::Fail("empty open channel surfaced Closed"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_try_recv_empty_open_is_ok_none);
+
+fn smoke_ipc_mpsc_recv_future_wakes_on_send() -> TestResult {
+    // Consumer parks on empty; producer.try_send must wake it via
+    // the consumer_waker slot.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::mpsc_channel;
+    static GOT: AtomicU32 = AtomicU32::new(0);
+
+    GOT.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (tx, mut rx) = mpsc_channel::<u32>(4);
+    narf_scheduler::spawn(async move {
+        match rx.recv().await {
+            Ok(v) => GOT.store(v, Ordering::Relaxed),
+            Err(_) => GOT.store(0xDEAD, Ordering::Relaxed),
+        }
+    });
+    narf_scheduler::spawn(async move {
+        narf_scheduler::yield_now().await;
+        tx.try_send(0xA110_CA73).unwrap();
+    });
+    narf_scheduler::run_until_empty();
+
+    match GOT.load(Ordering::Relaxed) {
+        0xA110_CA73 => TestResult::Pass,
+        0xDEAD => TestResult::Fail("consumer got Closed instead of value"),
+        _ => TestResult::Fail("parked consumer didn't wake on send"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_recv_future_wakes_on_send);
+
+fn smoke_ipc_mpsc_pending_count_tracks_queue_depth() -> TestResult {
+    // pending() reports the queue depth at the moment of call.
+    // Useful as a back-pressure diagnostic; this just guards
+    // against an off-by-one in the accessor.
+    use crate::mpsc_channel;
+    let (tx, rx) = mpsc_channel::<u32>(8);
+    if rx.pending() != 0 {
+        return TestResult::Fail("fresh channel pending != 0");
+    }
+    tx.try_send(1).unwrap();
+    tx.try_send(2).unwrap();
+    tx.try_send(3).unwrap();
+    if rx.pending() != 3 {
+        return TestResult::Fail("pending didn't track three sends");
+    }
+    let _ = rx.try_recv();
+    if rx.pending() != 2 {
+        return TestResult::Fail("pending didn't decrement on recv");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_pending_count_tracks_queue_depth);
+
+fn smoke_ipc_mpsc_consumer_drop_makes_late_send_closed() -> TestResult {
+    // Producer keeps a clone across the consumer drop; subsequent
+    // try_send must surface Closed. Models a driver task whose
+    // submission queue's consumer (the dispatcher) was torn down.
+    use crate::{mpsc_channel, MpscSendError};
+    let (tx, rx) = mpsc_channel::<u8>(4);
+    let tx2 = tx.clone();
+    drop(rx);
+    if !tx.is_closed() {
+        return TestResult::Fail("is_closed false after consumer drop");
+    }
+    match tx2.try_send(7) {
+        Err(MpscSendError::Closed(7)) => TestResult::Pass,
+        _ => TestResult::Fail("post-consumer-drop send didn't surface Closed"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_consumer_drop_makes_late_send_closed);
