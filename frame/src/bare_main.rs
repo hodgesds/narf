@@ -2200,10 +2200,18 @@ fn run_async_demo() -> ! {
     // Cursor pump + USB HID supervisor are spawned by their own
     // Stage::Late initcalls — no manual re-spawn needed now that
     // the redundant scheduler::init() above is gone.
+    // Beacon slot 28 (free): `narf_fb::info()` returned Some — i.e.
+    // a scanout was registered. If you see this beacon BUT no
+    // status panel + no shell, the panel-paint code path failed
+    // independently. If you DON'T see this beacon, no scanout was
+    // ever registered (Limine FB tag absent / select_active picked
+    // None).
     if narf_fb::info().is_some() {
+        narf_memory::beacon::paint(28, 0x00FF_8C00); // dark-orange: fb-info-some
         let cap = narf_fb::bootstrap_writer();
         if let Ok(panel_writer) = narf_fb::FbWriter::new(cap) {
             narf_fb::status::paint(&panel_writer);
+            narf_memory::beacon::paint(29, 0x00FF_FF40); // pale-yellow: panel-painted
         }
     }
     // FB up implies the cursor-pump task was spawned by the
@@ -2217,7 +2225,13 @@ fn run_async_demo() -> ! {
         console::Writer,
         "  scheduler: spawning 1 task, running to completion"
     );
+    // Beacon slot 30: about to enter run_until_empty. If you see
+    // 30 paint but never see 31, run_until_empty hung (busy-spin
+    // task or kernel-wide deadlock). If you see 31, the executor
+    // returned cleanly and the issue is later.
+    narf_memory::beacon::paint(30, 0x0000_FF80); // mint: pre-run_until_empty
     narf_scheduler::run_until_empty();
+    narf_memory::beacon::paint(31, 0x0080_FF00); // chartreuse: post-run_until_empty
 
     let _ = writeln!(
         console::Writer,
