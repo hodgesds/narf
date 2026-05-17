@@ -3267,7 +3267,7 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
                     a4: sub.inline[4],
                     a5: sub.inline[5],
                 };
-                let r = abi_file_op_bridge(kind, &args);
+                let r = abi_file_op_bridge(kind, &args, &narf_abi::CancelCtx::detached());
                 let status = if r.status == 0 {
                     NarfStatus::Ok
                 } else {
@@ -7647,11 +7647,21 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
 
 /// Bridge fn boot installs into `narf_abi::install_file_op_bridge`.
 /// Routes ring-submitted file ops through the same `SyscallTable`
-/// the int-0x80 / svc gate uses.
+/// the int-0x80 / svc gate uses. The `cx` cancel context is the
+/// per-inflight token the dispatcher hands us — we check it before
+/// dispatching the (synchronous) syscall body so a parallel
+/// `OpCode::Cancel` lands cleanly.
 pub fn abi_file_op_bridge(
     kind: narf_abi::FileOpKind,
     args: &narf_abi::FileOpArgs,
+    cx: &narf_abi::CancelCtx<'_>,
 ) -> narf_abi::FileOpReturn {
+    if cx.is_cancel_requested() {
+        // Signal Cancelled to the dispatcher (status=2 mirrors
+        // NarfStatus::Cancelled). The dispatcher converts to
+        // Cancelled / CancelRequested based on CANCELLABLE.
+        return narf_abi::FileOpReturn { status: 2, value: 0 };
+    }
     let num: u32 = match kind {
         narf_abi::FileOpKind::Open => Syscall::OpenFile.raw(),
         narf_abi::FileOpKind::Read => Syscall::Read.raw(),

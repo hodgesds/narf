@@ -959,3 +959,310 @@ fn smoke_abi_cpu_op_args_default_is_all_zero() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("abi", smoke_abi_cpu_op_args_default_is_all_zero);
+
+// ── mid-op cooperative cancellation ────────────────────────────────
+//
+// Spec §3.1: a long-running op polls a per-inflight CancelToken
+// between meaningful steps and unwinds with `Cancelled` (when
+// CANCELLABLE) or `CancelRequested` (otherwise) if the flag is
+// set. These smokes pin the `CancelToken` / `CancelCtx` surface
+// and the dispatcher's mid-op cancel path through the bridges.
+
+fn smoke_abi_cancel_token_basic_flag() -> TestResult {
+    use crate::{CancelToken, Tag};
+    let t = CancelToken::new(Tag::new(0x99));
+    if t.tag() != Tag::new(0x99) {
+        return TestResult::Fail("CancelToken::tag round-trip");
+    }
+    if t.is_requested() {
+        return TestResult::Fail("freshly-created token already requested");
+    }
+    t.request();
+    if !t.is_requested() {
+        return TestResult::Fail("request() did not set flag");
+    }
+    // Idempotent.
+    t.request();
+    if !t.is_requested() {
+        return TestResult::Fail("second request() cleared flag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_cancel_token_basic_flag);
+
+fn smoke_abi_cancel_ctx_detached_never_requests() -> TestResult {
+    // Detached contexts (slow-path bridge callers) must never
+    // surface a cancel request — they have no inflight registration.
+    use crate::CancelCtx;
+    let cx = CancelCtx::detached();
+    if cx.is_cancel_requested() {
+        return TestResult::Fail("detached ctx reported cancel request");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_cancel_ctx_detached_never_requests);
+
+fn smoke_abi_cancel_ctx_from_token_observes_flag() -> TestResult {
+    use crate::{CancelCtx, CancelToken, Tag};
+    let t = CancelToken::new(Tag::new(0x1));
+    let cx = CancelCtx::from_token(&t);
+    if cx.is_cancel_requested() {
+        return TestResult::Fail("ctx surfaced cancel before token requested");
+    }
+    t.request();
+    if !cx.is_cancel_requested() {
+        return TestResult::Fail("ctx did not observe token flip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_cancel_ctx_from_token_observes_flag);
+
+fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
+    // Install a file-op bridge that flips a parallel cancel via the
+    // dispatcher's `request_inflight_cancel` hook from inside itself
+    // — simulating a mid-op cancel landing while the bridge runs.
+    // The bridge then polls `cx.is_cancel_requested()` and returns
+    // status=2 so the dispatcher converts the outcome per CANCELLABLE.
+    use crate::{
+        completion_channel, install_file_op_bridge, submission_channel, CancelCtx, Dispatcher,
+        FileOpArgs, FileOpKind, FileOpReturn, NarfStatus, OpCode, Submission, SubmissionFlags, Tag,
+    };
+    use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    // The bridge cooperates with the test by flipping the cancel
+    // token via a side-channel: the test stashes a raw pointer to
+    // the dispatcher under DISPATCHER_PTR; the bridge calls
+    // `request_inflight_cancel` against it before polling.
+    static DISPATCHER_PTR: AtomicU64 = AtomicU64::new(0);
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    static CALLED: AtomicU8 = AtomicU8::new(0);
+
+    fn bridge(_k: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
+        CALLED.fetch_add(1, Ordering::Relaxed);
+        // Simulate "midway through a multi-step op": flip the cancel
+        // via the dispatcher hook, then poll between meaningful steps.
+        let raw = DISPATCHER_PTR.load(Ordering::Relaxed);
+        if raw != 0 {
+            let d = unsafe { &*(raw as *const Dispatcher<4>) };
+            d.request_inflight_cancel(Tag::new(args.a0));
+        }
+        if cx.is_cancel_requested() {
+            return FileOpReturn { status: 2, value: 0 };
+        }
+        FileOpReturn { status: 0, value: 0 }
+    }
+
+    DISPATCHER_PTR.store(0, Ordering::Relaxed);
+    OUTCOME.store(0, Ordering::Relaxed);
+    CALLED.store(0, Ordering::Relaxed);
+
+    install_file_op_bridge(bridge);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    // Heap-allocate the dispatcher so the bridge can find it via a
+    // raw pointer that outlives the borrow checker's view.
+    let dispatcher: alloc::boxed::Box<Dispatcher<4>> =
+        alloc::boxed::Box::new(Dispatcher::new(sq_rx, cq_tx));
+    DISPATCHER_PTR.store(
+        dispatcher.as_ref() as *const Dispatcher<4> as u64,
+        Ordering::Relaxed,
+    );
+    // SAFETY: the dispatcher outlives the spawned task because it
+    // lives in a `Box` we leak below.
+    let dispatcher_addr =
+        alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
+
+    narf_scheduler::spawn(async move {
+        // SAFETY: leaked above; only one mutable user.
+        let d = unsafe { &mut *(dispatcher_addr as *mut Dispatcher<4>) };
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let target = Tag::new(0xABCD);
+        let mut sub = Submission::noop(target);
+        sub.op = OpCode::OpenFile;
+        sub.flags = SubmissionFlags::CANCELLABLE;
+        sub.inline[0] = target.raw(); // the bridge uses this to find its own tag
+        sq_tx.send(sub).await.unwrap();
+        let c = cq_rx.recv().await.unwrap();
+        if c.tag() != target {
+            OUTCOME.store(2, Ordering::Relaxed);
+        } else if c.status != NarfStatus::Cancelled {
+            OUTCOME.store(3, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(1, Ordering::Relaxed);
+        }
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    if CALLED.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("bridge never invoked");
+    }
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("completion tag mismatch"),
+        3 => TestResult::Fail("mid-op cancel did not surface Cancelled"),
+        _ => TestResult::Fail("producer did not drain a completion"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_dispatcher_inflight_cancel_during_bridge);
+
+fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestResult {
+    // Mid-op cancel against a non-CANCELLABLE submission must surface
+    // `CancelRequested` per spec §3.1.
+    use crate::{
+        completion_channel, install_file_op_bridge, submission_channel, CancelCtx, Dispatcher,
+        FileOpArgs, FileOpKind, FileOpReturn, NarfStatus, OpCode, Submission, Tag,
+    };
+    use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static DISPATCHER_PTR: AtomicU64 = AtomicU64::new(0);
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    fn bridge(_k: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
+        let raw = DISPATCHER_PTR.load(Ordering::Relaxed);
+        if raw != 0 {
+            let d = unsafe { &*(raw as *const Dispatcher<4>) };
+            d.request_inflight_cancel(Tag::new(args.a0));
+        }
+        if cx.is_cancel_requested() {
+            return FileOpReturn { status: 2, value: 0 };
+        }
+        FileOpReturn { status: 0, value: 0 }
+    }
+
+    DISPATCHER_PTR.store(0, Ordering::Relaxed);
+    OUTCOME.store(0, Ordering::Relaxed);
+    install_file_op_bridge(bridge);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+    let dispatcher: alloc::boxed::Box<Dispatcher<4>> =
+        alloc::boxed::Box::new(Dispatcher::new(sq_rx, cq_tx));
+    DISPATCHER_PTR.store(
+        dispatcher.as_ref() as *const Dispatcher<4> as u64,
+        Ordering::Relaxed,
+    );
+    let dispatcher_addr =
+        alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
+
+    narf_scheduler::spawn(async move {
+        let d = unsafe { &mut *(dispatcher_addr as *mut Dispatcher<4>) };
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let target = Tag::new(0xCAFE);
+        let mut sub = Submission::noop(target);
+        sub.op = OpCode::OpenFile;
+        // No CANCELLABLE — bridge still observes cancel but the
+        // dispatcher must yield `CancelRequested`.
+        sub.inline[0] = target.raw();
+        sq_tx.send(sub).await.unwrap();
+        let c = cq_rx.recv().await.unwrap();
+        if c.tag() != target {
+            OUTCOME.store(2, Ordering::Relaxed);
+        } else if c.status != NarfStatus::CancelRequested {
+            OUTCOME.store(3, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(1, Ordering::Relaxed);
+        }
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("completion tag mismatch"),
+        3 => TestResult::Fail("non-CANCELLABLE mid-op cancel didn't yield CancelRequested"),
+        _ => TestResult::Fail("producer never saw a completion"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request);
+
+fn smoke_abi_cancel_after_target_completes_is_noop() -> TestResult {
+    // Cancel arriving *after* its target already completed must be a
+    // benign no-op: the cancel op completes Ok; no later submission
+    // inherits the cancel.
+    use crate::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag,
+    };
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let target = Tag::new(0x55);
+        // First submit + drain the target — it completes Ok.
+        sq_tx.send(Submission::noop(target)).await.unwrap();
+        let c1 = cq_rx.recv().await.unwrap();
+        if c1.tag() != target || c1.status != NarfStatus::Ok {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        // Now cancel a tag that already drained. Spec §3.1: cancel is
+        // non-blocking and "always succeeds (Ok)".
+        sq_tx
+            .send(Submission::cancel(Tag::new(0xC0), target))
+            .await
+            .unwrap();
+        let c2 = cq_rx.recv().await.unwrap();
+        if c2.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        }
+        // A subsequent unrelated submission must complete Ok.
+        let other = Tag::new(0x66);
+        sq_tx.send(Submission::noop(other)).await.unwrap();
+        let c3 = cq_rx.recv().await.unwrap();
+        if c3.tag() != other || c3.status != NarfStatus::Ok {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("initial target did not complete Ok"),
+        3 => TestResult::Fail("cancel after completion did not return Ok"),
+        4 => TestResult::Fail("post-cancel unrelated submission was tainted"),
+        _ => TestResult::Fail("dispatcher round-trip aborted"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_cancel_after_target_completes_is_noop);
+
+fn smoke_abi_request_inflight_cancel_miss_returns_false() -> TestResult {
+    // The diagnostic hook returns false when no inflight token
+    // matches — i.e. a cancel for a never-submitted tag against a
+    // fresh dispatcher.
+    use crate::{completion_channel, submission_channel, Dispatcher, Tag};
+    let (_sq_tx, sq_rx) = submission_channel::<2>();
+    let (cq_tx, _cq_rx) = completion_channel::<2>();
+    let d = Dispatcher::new(sq_rx, cq_tx);
+    if d.request_inflight_cancel(Tag::new(0xDEAD)) {
+        return TestResult::Fail("hook reported a hit on a tag never submitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_request_inflight_cancel_miss_returns_false);

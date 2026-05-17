@@ -50,7 +50,9 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_capabilities::CapSlot;
 use narf_ipc::{Consumer, Producer};
@@ -81,6 +83,95 @@ pub static ABI_DISPATCH_LATENCY: FnTime = FnTime::new("abi::dispatch_one");
 /// separate from `ABI_DISPATCH_LATENCY` so the arithmetic cost of the
 /// cancel-chain consume/enter is observable in isolation.
 pub static ABI_CANCEL_CHECK_LATENCY: FnTime = FnTime::new("abi::cancel_check");
+
+// ── Cooperative cancellation token ─────────────────────────────────
+//
+// Spec §3.1: every long-running op is cooperatively cancellable.
+// Stage-4 only consulted the pending-cancel registry at dispatch
+// time. Stage-5 wires a per-inflight `CancelToken` the dispatcher
+// hands the op body so a mid-op cancel observed by an `OpCode::Cancel`
+// arriving on a parallel submission is seen by the in-flight op the
+// next time it polls. Bridges and async ops poll the token between
+// meaningful steps and return `Cancelled` / `CancelRequested` per
+// the CANCELLABLE flag on the submission.
+//
+// Concept reference: POSIX deferred-cancellation rationale — a
+// cancellation point is somewhere the op explicitly checks for a
+// pending cancel and unwinds. No GPL sources cited.
+
+/// Per-inflight cancel flag. Set by `OpCode::Cancel` when the
+/// dispatcher matches the target tag against the inflight token
+/// table. Op bodies (or bridges) poll via `CancelCtx`.
+#[derive(Debug)]
+pub struct CancelToken {
+    tag: u64,
+    requested: AtomicBool,
+}
+
+impl CancelToken {
+    /// Construct a fresh token for `tag`. Initial state: not requested.
+    #[inline]
+    pub fn new(tag: Tag) -> Self {
+        Self {
+            tag: tag.raw(),
+            requested: AtomicBool::new(false),
+        }
+    }
+
+    /// Tag this token guards.
+    #[inline]
+    pub fn tag(&self) -> Tag {
+        Tag(self.tag)
+    }
+
+    /// Mark cancellation requested. Idempotent.
+    #[inline]
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Has cancellation been requested?
+    #[inline]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+/// Borrowed cancel context handed to a long-running op body /
+/// bridge. Polled between meaningful steps; a `true` return means
+/// the op should unwind and return `Cancelled` (if CANCELLABLE was
+/// set) or `CancelRequested` (otherwise; the op continues, then the
+/// dispatcher converts the outcome).
+#[derive(Copy, Clone, Debug)]
+pub struct CancelCtx<'a> {
+    token: Option<&'a CancelToken>,
+}
+
+impl<'a> CancelCtx<'a> {
+    /// Construct a context that wraps a live token.
+    #[inline]
+    pub const fn from_token(token: &'a CancelToken) -> Self {
+        Self { token: Some(token) }
+    }
+
+    /// Construct a detached context for callers off the ABI hot path
+    /// (e.g. the slow-path `sys_ring_kick` shim). Never reports a
+    /// cancel request; the slow path doesn't see mid-op cancels.
+    #[inline]
+    pub const fn detached() -> Self {
+        Self { token: None }
+    }
+
+    /// Has cancellation been requested for the inflight op this
+    /// context is bound to? Returns `false` on a detached context.
+    #[inline]
+    pub fn is_cancel_requested(&self) -> bool {
+        match self.token {
+            Some(t) => t.is_requested(),
+            None => false,
+        }
+    }
+}
 
 // ── File-op delegate ──────────────────────────────────────────────
 //
@@ -122,21 +213,22 @@ pub struct FileOpReturn {
     pub value: u64,
 }
 
-type FileOpBridge = fn(FileOpKind, &FileOpArgs) -> FileOpReturn;
+pub type FileOpBridge = fn(FileOpKind, &FileOpArgs, &CancelCtx<'_>) -> FileOpReturn;
 
 static FILE_OP_BRIDGE: IrqSafeSpinLock<Option<FileOpBridge>> = IrqSafeSpinLock::new(None);
 
 /// Install the bridge that routes ring-submitted file ops into the
 /// kernel's regular syscall path. Boot calls this once with
-/// `narf_userspace::handlers::abi_file_op_bridge`.
+/// `narf_userspace::handlers::abi_file_op_bridge`. The bridge is
+/// handed a `CancelCtx` it polls between meaningful steps.
 pub fn install_file_op_bridge(bridge: FileOpBridge) {
     *FILE_OP_BRIDGE.lock() = Some(bridge);
 }
 
-fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs) -> FileOpReturn {
+fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
     let g = FILE_OP_BRIDGE.lock();
     match *g {
-        Some(b) => b(kind, args),
+        Some(b) => b(kind, args, cx),
         None => FileOpReturn {
             status: 1, /* InvalidOp */
             value: 0,
@@ -184,7 +276,7 @@ pub struct CpuOpReturn {
     pub result: [u64; 6],
 }
 
-type CpuOpBridge = fn(CpuOpKind, &CpuOpArgs) -> CpuOpReturn;
+pub type CpuOpBridge = fn(CpuOpKind, &CpuOpArgs, &CancelCtx<'_>) -> CpuOpReturn;
 
 static CPU_OP_BRIDGE: IrqSafeSpinLock<Option<CpuOpBridge>> = IrqSafeSpinLock::new(None);
 
@@ -192,10 +284,10 @@ pub fn install_cpu_op_bridge(bridge: CpuOpBridge) {
     *CPU_OP_BRIDGE.lock() = Some(bridge);
 }
 
-fn dispatch_cpu_op(kind: CpuOpKind, args: &CpuOpArgs) -> CpuOpReturn {
+fn dispatch_cpu_op(kind: CpuOpKind, args: &CpuOpArgs, cx: &CancelCtx<'_>) -> CpuOpReturn {
     let g = CPU_OP_BRIDGE.lock();
     match *g {
-        Some(b) => b(kind, args),
+        Some(b) => b(kind, args, cx),
         None => CpuOpReturn {
             status: 1, /* InvalidOp */
             result: [0; 6],
@@ -684,6 +776,18 @@ pub fn completion_channel<const N: usize>() -> (CompletionQueue<N>, CompletionDr
     narf_ipc::channel::<Completion, N>()
 }
 
+/// Build the right cancellation outcome for a submission given its
+/// flags. Spec §3.1: CANCELLABLE → `Cancelled`; non-CANCELLABLE →
+/// `CancelRequested` (op kept running, caller awaits eventual Ok).
+fn cancel_outcome(tag: Tag, flags: SubmissionFlags) -> Completion {
+    let status = if flags.contains(SubmissionFlags::CANCELLABLE) {
+        NarfStatus::Cancelled
+    } else {
+        NarfStatus::CancelRequested
+    };
+    Completion::with(tag, status, [0; 6])
+}
+
 // ── Dispatcher ──────────────────────────────────────────────────────
 
 /// Pending-cancel registry — tags whose producers have issued an
@@ -720,6 +824,11 @@ struct CancelInner {
     /// Monotonic chain-id allocator; starts at 1 so `last_chain == 0`
     /// unambiguously means "no chain seen yet".
     next_chain: u32,
+    /// Live cancel tokens for ops currently inside `dispatch_one`.
+    /// `OpCode::Cancel` flips the `requested` flag on the matching
+    /// entry so the in-flight op observes the cancel the next time
+    /// its bridge polls `CancelCtx::is_cancel_requested`.
+    inflight: Vec<Arc<CancelToken>>,
 }
 
 impl PendingCancels {
@@ -731,7 +840,61 @@ impl PendingCancels {
                 chain_of: Vec::new(),
                 last_chain: 0,
                 next_chain: 1,
+                inflight: Vec::new(),
             }),
+        }
+    }
+
+    /// Register a fresh inflight cancel token for `tag`. Called at
+    /// the top of `dispatch_one` so a parallel `OpCode::Cancel` can
+    /// flip the token while the op body runs. If the cancel already
+    /// fired (tag is in `tags` or its chain is in `chains`), the
+    /// returned token is pre-set so the op observes the cancel on
+    /// its very first poll.
+    fn enter_inflight(&self, tag: Tag, chain: u32) -> Arc<CancelToken> {
+        let mut g = self.inner.lock();
+        let tok = Arc::new(CancelToken::new(tag));
+        let pre_cancelled = g.tags.iter().any(|&t| t == tag.raw())
+            || g.chains.iter().any(|&c| c == chain);
+        if pre_cancelled {
+            tok.request();
+        }
+        g.inflight.push(tok.clone());
+        tok
+    }
+
+    /// Deregister an inflight token at the bottom of `dispatch_one`.
+    fn exit_inflight(&self, tag: Tag) {
+        let mut g = self.inner.lock();
+        if let Some(pos) = g.inflight.iter().position(|t| t.tag == tag.raw()) {
+            g.inflight.swap_remove(pos);
+        }
+    }
+
+    /// Flip the cancel flag on any inflight token whose tag matches.
+    /// Also propagates across linked chain members.
+    fn signal_inflight(&self, target: Tag) {
+        let g = self.inner.lock();
+        let chain_id = g
+            .chain_of
+            .iter()
+            .find(|&&(t, _)| t == target.raw())
+            .map(|&(_, c)| c);
+        for tok in g.inflight.iter() {
+            if tok.tag == target.raw() {
+                tok.request();
+                continue;
+            }
+            if let Some(cid) = chain_id {
+                let tc = g
+                    .chain_of
+                    .iter()
+                    .find(|&&(t, _)| t == tok.tag)
+                    .map(|&(_, c)| c);
+                if tc == Some(cid) {
+                    tok.request();
+                }
+            }
         }
     }
 
@@ -862,29 +1025,46 @@ impl<const N: usize> Dispatcher<N> {
         // `OpCode::Cancel` itself bypasses the check (cancelling a
         // cancel is a no-op whose completion still always succeeds).
         if sub.op != OpCode::Cancel && self.pending.consume(tag, chain) {
-            let status = if sub.flags.contains(SubmissionFlags::CANCELLABLE) {
-                NarfStatus::Cancelled
-            } else {
-                NarfStatus::CancelRequested
-            };
-            return Completion::with(tag, status, [0; 6]);
+            return cancel_outcome(tag, sub.flags);
         }
 
-        match sub.op {
+        // Register a per-inflight cancel token so a parallel
+        // `OpCode::Cancel(tag)` can flip it while the body runs.
+        // `OpCode::Cancel` itself does not register — it is the
+        // signaller, not a cancellation target.
+        let token = if sub.op != OpCode::Cancel {
+            Some(self.pending.enter_inflight(tag, chain))
+        } else {
+            None
+        };
+
+        let completion = match sub.op {
             OpCode::Noop => Completion::ok(tag),
 
             OpCode::Cancel => {
                 // §3.1: cancel always succeeds; the target's terminal
                 // completion reports the outcome separately.
                 // `request` also marks the target's whole chain so
-                // linked peers auto-cancel.
-                self.pending.request(sub.cancel_target());
+                // linked peers auto-cancel; `signal_inflight` flips
+                // the per-inflight token so a mid-op poll observes
+                // the cancel.
+                let target = sub.cancel_target();
+                self.pending.request(target);
+                self.pending.signal_inflight(target);
                 Completion::ok(tag)
             }
 
             OpCode::Yield => {
                 narf_scheduler::yield_now().await;
-                Completion::ok(tag)
+                let cancelled = token
+                    .as_ref()
+                    .map(|t| t.is_requested())
+                    .unwrap_or(false);
+                if cancelled {
+                    cancel_outcome(tag, sub.flags)
+                } else {
+                    Completion::ok(tag)
+                }
             }
 
             OpCode::OpenFile
@@ -910,15 +1090,23 @@ impl<const N: usize> Dispatcher<N> {
                     a4: sub.inline[4],
                     a5: sub.inline[5],
                 };
-                let r = dispatch_file_op(kind, &args);
-                let status = if r.status == 0 {
-                    NarfStatus::Ok
-                } else {
-                    NarfStatus::InvalidOp
+                let cx = match token.as_ref() {
+                    Some(t) => CancelCtx::from_token(t),
+                    None => CancelCtx::detached(),
                 };
-                let mut result = [0u64; 6];
-                result[0] = r.value;
-                Completion::with(tag, status, result)
+                let r = dispatch_file_op(kind, &args, &cx);
+                // Bridge may have observed the cancel and returned
+                // status=2 (Cancelled). Translate per CANCELLABLE.
+                let result_completion = match r.status {
+                    0 => {
+                        let mut result = [0u64; 6];
+                        result[0] = r.value;
+                        Completion::with(tag, NarfStatus::Ok, result)
+                    }
+                    2 => cancel_outcome(tag, sub.flags),
+                    _ => Completion::with(tag, NarfStatus::InvalidOp, [0; 6]),
+                };
+                result_completion
             }
 
             OpCode::CpuTopology
@@ -952,22 +1140,31 @@ impl<const N: usize> Dispatcher<N> {
                     a4: sub.inline[4],
                     a5: sub.inline[5],
                 };
-                let r = dispatch_cpu_op(kind, &args);
-                let status = match r.status {
-                    0 => NarfStatus::Ok,
-                    5 => NarfStatus::InvalidOp,
-                    8 => NarfStatus::Forbidden,
-                    9 => NarfStatus::Unsupported,
-                    _ => NarfStatus::InvalidOp,
+                let cx = match token.as_ref() {
+                    Some(t) => CancelCtx::from_token(t),
+                    None => CancelCtx::detached(),
                 };
-                Completion::with(tag, status, r.result)
+                let r = dispatch_cpu_op(kind, &args, &cx);
+                match r.status {
+                    0 => Completion::with(tag, NarfStatus::Ok, r.result),
+                    2 => cancel_outcome(tag, sub.flags),
+                    5 => Completion::with(tag, NarfStatus::InvalidOp, r.result),
+                    8 => Completion::with(tag, NarfStatus::Forbidden, r.result),
+                    9 => Completion::with(tag, NarfStatus::Unsupported, r.result),
+                    _ => Completion::with(tag, NarfStatus::InvalidOp, r.result),
+                }
             }
 
             _ => {
                 // unrecognized opcode.
                 Completion::with(tag, NarfStatus::InvalidOp, [0; 6])
             }
+        };
+
+        if token.is_some() {
+            self.pending.exit_inflight(tag);
         }
+        completion
     }
 
     /// Count of cancel requests that have been recorded but not yet
@@ -976,5 +1173,21 @@ impl<const N: usize> Dispatcher<N> {
     pub fn pending_cancels(&self) -> usize {
         let g = self.pending.inner.lock();
         g.tags.len()
+    }
+
+    /// Test/observability hook: request mid-op cancellation of a
+    /// currently-inflight submission by tag. Returns `true` iff an
+    /// inflight token was found and signalled. An `OpCode::Cancel`
+    /// wire submission triggers the same path internally.
+    pub fn request_inflight_cancel(&self, target: Tag) -> bool {
+        let g = self.pending.inner.lock();
+        let mut hit = false;
+        for tok in g.inflight.iter() {
+            if tok.tag == target.raw() {
+                tok.request();
+                hit = true;
+            }
+        }
+        hit
     }
 }

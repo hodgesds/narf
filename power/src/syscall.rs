@@ -598,7 +598,14 @@ pub fn install_bridge() {
     narf_abi::install_cpu_op_bridge(bridge_thunk);
 }
 
-fn bridge_thunk(kind: CpuOpKind, args: &CpuOpArgs) -> CpuOpReturn {
+fn bridge_thunk(
+    kind: CpuOpKind,
+    args: &CpuOpArgs,
+    cx: &narf_abi::CancelCtx<'_>,
+) -> CpuOpReturn {
+    if cx.is_cancel_requested() {
+        return CpuOpReturn { status: 2 /* Cancelled */, result: [0; 6] };
+    }
     // Boot order may install us before SMP brings up the per-CPU
     // id register; treat "no current cpu" as cpu 0 + non-TCB so
     // the early bring-up path can probe the API.
