@@ -358,3 +358,72 @@ fn smoke_obs_peek_provider_registration() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("observability", smoke_obs_peek_provider_registration);
+
+// ── deep observability coverage ───────────────────────────────────
+
+fn smoke_obs_error_variants_distinct() -> TestResult {
+    use crate::ObsError;
+    let all = [
+        ObsError::Revoked,
+        ObsError::NotAvailable,
+        ObsError::CounterDisabled,
+        ObsError::EnableUnsupported,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("ObsError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_error_variants_distinct);
+
+fn smoke_obs_panic_snapshot_ring_empty_after_reset() -> TestResult {
+    // __test_clear_panic_ring drains the snapshot ring but does NOT
+    // reset install_count (counts the panic-hook *installations*,
+    // not ring entries). Verify the ring is drained.
+    crate::__test_clear_panic_ring();
+    if crate::take_snapshot().is_some() {
+        return TestResult::Fail("take_snapshot returned Some after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_panic_snapshot_ring_empty_after_reset);
+
+fn smoke_obs_pmu_read_cycles_revoked_cap_rejected() -> TestResult {
+    use crate::{ObsError, Pmu};
+    use narf_capabilities::{Cap, Read};
+    let cap: Cap<Pmu, Read> = Cap::bootstrap();
+    cap.revoke();
+    match crate::read_cycles(&cap) {
+        Err(ObsError::Revoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked cap didn't surface Revoked"),
+    }
+}
+kernel_test_in!("observability", smoke_obs_pmu_read_cycles_revoked_cap_rejected);
+
+fn smoke_obs_pmu_read_instructions_revoked_cap_rejected() -> TestResult {
+    use crate::{ObsError, Pmu};
+    use narf_capabilities::{Cap, Read};
+    let cap: Cap<Pmu, Read> = Cap::bootstrap();
+    cap.revoke();
+    match crate::read_instructions(&cap) {
+        Err(ObsError::Revoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked cap didn't surface Revoked"),
+    }
+}
+kernel_test_in!("observability", smoke_obs_pmu_read_instructions_revoked_cap_rejected);
+
+fn smoke_obs_pmu_enable_user_reads_revoked_cap_rejected() -> TestResult {
+    use crate::{ObsError, Pmu};
+    use narf_capabilities::{Cap, Write};
+    let cap: Cap<Pmu, Write> = Cap::bootstrap();
+    cap.revoke();
+    match crate::enable_user_reads(&cap) {
+        Err(ObsError::Revoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked cap didn't surface Revoked"),
+    }
+}
+kernel_test_in!("observability", smoke_obs_pmu_enable_user_reads_revoked_cap_rejected);
