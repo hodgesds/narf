@@ -11,7 +11,8 @@
 //! second cadence kernel logs run at; far from optimal for a real
 //! TTY but this isn't one yet.
 
-use core::{fmt, ptr};
+use core::fmt;
+use core::ptr;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -132,26 +133,58 @@ impl FbConsole {
     fn newline(&mut self) {
         self.cur_col = 0;
         if self.cur_row + 1 >= self.rows {
-            // Screen full. The previous behaviour memmoved the
-            // entire framebuffer up one row (~8 MiB on 1080p)
-            // through write-uncached MMIO — hundreds of ms per
-            // newline on real HW, the visible cause of "one
-            // line per second" boot output.
+            // Screen full — scroll up one glyph row. The previous
+            // wrap-to-row-0 behaviour was cheap but unreadable on
+            // real-HW boot ("newest line is somewhere on screen
+            // depending on where the cursor was at wrap time").
             //
-            // Wrap the cursor back to row 0 instead and clear
-            // the new line. Loses scrollback (the next ~135
-            // lines overwrite the prior screen), but boot
-            // throughput stops being framebuffer-bound. Real
-            // scrollback wants a shadow buffer + page-flip,
-            // separate work.
-            self.cur_row = 0;
+            // Cost of this memmove on a 1280×800 GOP FB at UC-MMIO
+            // write speed: ~40 ms (792 source rows × 1280 px × 4 B
+            // = 4 MB) per newline. The bring-up workflow needs
+            // readability more than throughput, and once the screen
+            // settles at the shell prompt scrolls happen only on
+            // user input cadence.
+            self.scroll_up_one_row();
+            // cur_row stays at rows-1; cursor returns to bottom-
+            // left for the next line.
         } else {
             self.cur_row += 1;
+            // Clear the row we're about to write to so old text
+            // doesn't bleed through.
+            let y = self.cur_row * GLYPH_H;
+            self.fb.fill_rect(0, y, self.fb.width, GLYPH_H, self.bg);
         }
-        // Clear the row we're about to write to so old text
-        // doesn't bleed through.
-        let y = self.cur_row * GLYPH_H;
-        self.fb.fill_rect(0, y, self.fb.width, GLYPH_H, self.bg);
+    }
+
+    /// Memmove the visible FB content up by one glyph row, then
+    /// clear the bottom row. Operates directly on the FB pixel
+    /// buffer — no shadow. The FB's stride may exceed `width` (GPU
+    /// alignment), so we iterate rows individually rather than
+    /// memmove the whole buffer as one contiguous range.
+    fn scroll_up_one_row(&mut self) {
+        let glyph_h = GLYPH_H as usize;
+        let stride = self.fb.stride as usize;
+        let width = self.fb.width as usize;
+        let total_pixel_rows = (self.rows * GLYPH_H) as usize;
+        // SAFETY: `self.fb.base()` is a valid pixel buffer covering
+        // at least `stride * height` u32s, and rows referenced
+        // below (src y .. y+glyph_h, dst y .. y+glyph_h) are all
+        // within [0, total_pixel_rows). Stride ≥ width keeps each
+        // row's `width` columns inside the buffer.
+        let base = self.fb.base();
+        unsafe {
+            for dst_y in 0..total_pixel_rows.saturating_sub(glyph_h) {
+                let src_y = dst_y + glyph_h;
+                let src = base.add(src_y * stride);
+                let dst = base.add(dst_y * stride);
+                ptr::copy(src, dst, width);
+            }
+        }
+        // Clear the bottom glyph row.
+        let bottom_y = (self.rows - 1) * GLYPH_H;
+        self.fb.fill_rect(0, bottom_y, self.fb.width, GLYPH_H, self.bg);
+        // Cursor lands at the (now-cleared) bottom row.
+        self.cur_row = self.rows - 1;
     }
 }
 
