@@ -2201,7 +2201,12 @@ fn run_async_demo() -> ! {
             ) -> core::task::Poll<()> {
                 use core::sync::atomic::{AtomicU64, Ordering};
                 static LAST_TSC: AtomicU64 = AtomicU64::new(0);
-                const PERIOD_CYCLES: u64 = 5_000_000_000;
+                // Tick at ~10 Hz so the FB beacon slots animate
+                // promptly when keystrokes arrive (a 5s period would
+                // mean a typed char takes 5s to reflect). The serial
+                // line only prints every 5s; the beacon slots paint
+                // every tick.
+                const PERIOD_CYCLES: u64 = 100_000_000;
                 let now = narf_time::now_cycles();
                 let last = LAST_TSC.load(Ordering::Relaxed);
                 if now.saturating_sub(last) >= PERIOD_CYCLES {
@@ -2209,10 +2214,43 @@ fn run_async_demo() -> ! {
                     let ascii_in = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
                     let ascii_out = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
                     let key_in = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
-                    let _ = writeln!(
-                        console::Writer,
-                        "  heartbeat: ascii in={ascii_in} out={ascii_out} key={key_in}",
-                    );
+                    // FB beacon visualization — six slots on row 0,
+                    // far right of the row. White label slots paint
+                    // once-and-stick; counter slots cycle colour as
+                    // the corresponding counter increments. If the
+                    // user presses a key and slot 37 changes colour,
+                    // the kbd is delivering KEY_PUSH events. Same
+                    // for slot 35 = serial RX pushes, slot 33 =
+                    // ascii pops drained by the shell.
+                    const PALETTE: [u32; 8] = [
+                        0x00FF_0000, // red
+                        0x00FF_8000, // orange
+                        0x00FF_FF00, // yellow
+                        0x0000_FF00, // green
+                        0x0000_FF80, // mint
+                        0x0000_FFFF, // cyan
+                        0x0000_80FF, // sky
+                        0x00FF_00FF, // magenta
+                    ];
+                    narf_memory::beacon::paint(40, 0x00FF_FFFF); // label "I"
+                    narf_memory::beacon::paint(41, PALETTE[(ascii_in as usize) & 7]);
+                    narf_memory::beacon::paint(42, 0x00FF_FFFF); // label "O"
+                    narf_memory::beacon::paint(43, PALETTE[(ascii_out as usize) & 7]);
+                    narf_memory::beacon::paint(44, 0x00FF_FFFF); // label "K"
+                    narf_memory::beacon::paint(45, PALETTE[(key_in as usize) & 7]);
+                    // Heartbeat serial line every ~5s, gated below
+                    // the 10 Hz beacon paint above so we don't
+                    // flood the console.
+                    static LAST_SERIAL: AtomicU64 = AtomicU64::new(0);
+                    const SERIAL_PERIOD: u64 = 5_000_000_000;
+                    let last_s = LAST_SERIAL.load(Ordering::Relaxed);
+                    if now.saturating_sub(last_s) >= SERIAL_PERIOD {
+                        LAST_SERIAL.store(now, Ordering::Relaxed);
+                        let _ = writeln!(
+                            console::Writer,
+                            "  heartbeat: ascii in={ascii_in} out={ascii_out} key={key_in}",
+                        );
+                    }
                 }
                 cx.waker().wake_by_ref();
                 core::task::Poll::Pending
