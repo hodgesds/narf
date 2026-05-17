@@ -1502,3 +1502,130 @@ fn smoke_aarch64_mpidr_aff_present() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch", smoke_aarch64_mpidr_aff_present);
+
+// ── deep arch coverage — pure-logic invariants ────────────────────
+//
+// Pin the type-level surface of arch's hardware-feature structs so
+// a refactor that shifts a CPUID bit or renames a field surfaces
+// at test time, not at boot.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_x86_features_default_is_all_false() -> TestResult {
+    use crate::x86_64::Features;
+    let d = Features::default();
+    if d.nx || d.pku || d.pks || d.uipi || d.invariant_tsc
+        || d.rdseed || d.rdrand || d.x2apic || d.apic {
+        return TestResult::Fail("Features::default() should be all-false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_arch_x86_features_default_is_all_false);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_x86_features_probe_idempotent() -> TestResult {
+    use crate::x86_64::Features;
+    // SAFETY: CPUID at CPL=0 is always legal.
+    let f1 = unsafe { Features::probe() };
+    let f2 = unsafe { Features::probe() };
+    if f1.nx != f2.nx
+        || f1.pku != f2.pku
+        || f1.pks != f2.pks
+        || f1.uipi != f2.uipi
+        || f1.invariant_tsc != f2.invariant_tsc
+        || f1.rdseed != f2.rdseed
+        || f1.rdrand != f2.rdrand
+        || f1.x2apic != f2.x2apic
+        || f1.apic != f2.apic
+    {
+        return TestResult::Fail("Features::probe() not idempotent");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_arch_x86_features_probe_idempotent);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_topology_level_kind_distinct() -> TestResult {
+    use crate::x86_64::topology::LevelKind;
+    let all = [
+        LevelKind::Invalid,
+        LevelKind::Smt,
+        LevelKind::Core,
+        LevelKind::Module,
+        LevelKind::Tile,
+        LevelKind::Die,
+        LevelKind::Domain,
+        LevelKind::Package,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("LevelKind variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_arch_topology_level_kind_distinct);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_topology_cache_kind_distinct() -> TestResult {
+    use crate::x86_64::topology::CacheKind;
+    let all = [CacheKind::Null, CacheKind::Data, CacheKind::Instr, CacheKind::Unified];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("CacheKind variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_arch_topology_cache_kind_distinct);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_topology_default_is_empty() -> TestResult {
+    use crate::x86_64::topology::Topology;
+    let t = Topology::default();
+    if t.n_levels != 0 {
+        return TestResult::Fail("default Topology has non-zero levels");
+    }
+    if t.package_count != 0 || t.core_count != 0 || t.thread_count != 0 {
+        return TestResult::Fail("default Topology has non-zero counts");
+    }
+    if t.hybrid || t.core_type != 0 {
+        return TestResult::Fail("default Topology has non-default hybrid/core_type");
+    }
+    for slot in t.levels.iter() {
+        if slot.is_some() {
+            return TestResult::Fail("default Topology has a populated level slot");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_arch_topology_default_is_empty);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_topology_discover_self_consistent() -> TestResult {
+    // discover() must produce a topology where thread_count >=
+    // core_count >= package_count >= 1. Hardware always has at
+    // least one of each.
+    use crate::x86_64::topology;
+    let t = topology::discover();
+    if t.package_count == 0 {
+        return TestResult::Skip("topology::discover returned package_count=0 (CPUID leaf 1F/0B missing?)");
+    }
+    if t.thread_count < t.core_count {
+        return TestResult::Fail("thread_count < core_count");
+    }
+    if t.core_count < t.package_count {
+        return TestResult::Fail("core_count < package_count");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_arch_topology_discover_self_consistent);
