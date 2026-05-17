@@ -220,7 +220,60 @@ mod x86 {
         }
         Some(caps)
     }
+
+    /// Outcome of [`init_or_gp`] — distinguishes "we didn't try"
+    /// from "we tried and got `#GP`" so the cpu-pstate initcall can
+    /// surface the difference in its status line.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum InitOutcome {
+        /// CPUID says CPPC isn't supported on this core.
+        NotSupported,
+        /// `MSR_AMD_CPPC_ENABLE` write `#GP`'d — BIOS likely locked
+        /// the MSR. CPU stays at firmware-chosen P-state.
+        EnableGp,
+        /// Enable succeeded; reading `MSR_AMD_CPPC_CAP1` `#GP`'d.
+        Cap1Gp,
+        /// Enable + cap1 succeeded; programming `MSR_AMD_CPPC_REQ`
+        /// `#GP`'d.
+        ReqGp,
+        /// Full happy path: enabled + programmed.
+        Ok(Cap1),
+    }
+
+    /// Same as [`init`] but uses `wrmsr_or_gp` / `rdmsr_or_gp` so a
+    /// firmware lock on the CPPC MSRs doesn't wedge boot — the
+    /// caller gets a structured outcome instead of an `#GP` panic.
+    ///
+    /// References (clean-room, public-spec only):
+    /// - AMD APM Vol 2 §17 (Collaborative Processor Performance
+    ///   Control) — `https://www.amd.com/system/files/TechDocs/24593.pdf`
+    /// - AMD PPR (Processor Programming Reference) for the relevant
+    ///   family — `https://www.amd.com/en/support/tech-docs` (per-
+    ///   family PPRs).
+    pub fn init_or_gp() -> InitOutcome {
+        use narf_arch::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
+        if !supported() {
+            return InitOutcome::NotSupported;
+        }
+        if wrmsr_or_gp(MSR_AMD_CPPC_ENABLE, ENABLE_BIT).is_err() {
+            return InitOutcome::EnableGp;
+        }
+        let cap1 = match rdmsr_or_gp(MSR_AMD_CPPC_CAP1) {
+            Ok(v) => Cap1(v),
+            Err(_) => return InitOutcome::Cap1Gp,
+        };
+        let req = Request::build(
+            cap1.lowest_perf(),
+            cap1.highest_perf(),
+            0,
+            epp::BALANCED_PERFORMANCE,
+        );
+        if wrmsr_or_gp(MSR_AMD_CPPC_REQ, req.0).is_err() {
+            return InitOutcome::ReqGp;
+        }
+        InitOutcome::Ok(cap1)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use x86::{enable, init, read_cap1, supported, write_request};
+pub use x86::{enable, init, init_or_gp, read_cap1, supported, write_request, InitOutcome};

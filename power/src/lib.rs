@@ -116,41 +116,55 @@ pub fn register_initcalls() {
     // freshly-booted narf laptop runs cool but slow.
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "cpu-pstate", || {
-        // Detection-only path. Writing MSR_AMD_CPPC_ENABLE /
-        // MSR_AMD_CPPC_REQ / MSR_AMD_PSTATE_LIMIT on real Zen2
-        // silicon hung boot at this initcall on the bring-up
-        // laptop — BIOS likely locks the CPPC MSRs or expects a
-        // pre-enable handshake we're skipping. Until the trap
-        // path can recover from #GP on a wrmsr we limit this
-        // initcall to CPUID-only detection + the diagnostic
-        // status line. Re-enabling the MSR writes requires per-
-        // mechanism guards verified on real silicon.
-        let cppc_supported = cppc::supported();
-        let mech = pstate::detect();
-        let line = if cppc_supported {
-            alloc::string::String::from("CPU: CPPC supported (writes disabled)")
-        } else {
-            match mech {
+        // The MSR writes here used to hang the Zen2 bring-up laptop
+        // at boot — BIOS-locked CPPC MSRs `#GP` on `wrmsr` and the
+        // unrecoverable trap wedged the kernel. `cppc::init_or_gp`
+        // uses `wrmsr_or_gp` / `rdmsr_or_gp` (probe-armed) so a
+        // locked MSR surfaces as `EnableGp` / `Cap1Gp` / `ReqGp`
+        // and the CPU stays at the firmware-chosen P-state instead
+        // of crashing. CPPC is preferred when supported (Zen2+);
+        // legacy `pstate::detect` covers older Intel HWP / SpeedStep
+        // and AMD HwPstate as detection-only (we don't yet have the
+        // gp-safe variants for those programs).
+        use alloc::string::String;
+        let outcome = cppc::init_or_gp();
+        let line = match outcome {
+            cppc::InitOutcome::Ok(cap1) => alloc::format!(
+                "CPU: CPPC programmed (perf {}..{}, nom {}, EPP balanced)",
+                cap1.lowest_perf(),
+                cap1.highest_perf(),
+                cap1.nominal_perf(),
+            ),
+            cppc::InitOutcome::EnableGp => {
+                String::from("CPU: CPPC enable #GP'd (BIOS lock) — firmware default")
+            }
+            cppc::InitOutcome::Cap1Gp => {
+                String::from("CPU: CPPC enabled but CAP1 #GP'd — firmware default")
+            }
+            cppc::InitOutcome::ReqGp => {
+                String::from("CPU: CPPC enabled but REQ #GP'd — firmware default")
+            }
+            cppc::InitOutcome::NotSupported => match pstate::detect() {
                 pstate::Mechanism::Hwp => {
-                    alloc::string::String::from("CPU: HWP supported (writes disabled)")
+                    String::from("CPU: HWP supported (writes disabled)")
                 }
                 pstate::Mechanism::SpeedStep => {
-                    alloc::string::String::from("CPU: SpeedStep (firmware default)")
+                    String::from("CPU: SpeedStep (firmware default)")
                 }
                 pstate::Mechanism::AmdLegacy => {
-                    alloc::string::String::from("CPU: AMD HwPstate (firmware default)")
+                    String::from("CPU: AMD HwPstate (firmware default)")
                 }
-                pstate::Mechanism::None => {
-                    alloc::string::String::from("CPU: pstate n/a")
-                }
-            }
+                pstate::Mechanism::None => String::from("CPU: pstate n/a"),
+            },
         };
         let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
         set_cpu_status_line(line);
-        if cppc_supported || !matches!(mech, pstate::Mechanism::None) {
-            InitResult::Ok
-        } else {
+        if matches!(outcome, cppc::InitOutcome::NotSupported)
+            && matches!(pstate::detect(), pstate::Mechanism::None)
+        {
             InitResult::NotPresent
+        } else {
+            InitResult::Ok
         }
     });
     narf_init::register(Stage::Late, "power-monitor", || {

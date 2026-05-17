@@ -1833,3 +1833,59 @@ fn smoke_arch_pt_features_require_base() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/pt", smoke_arch_pt_features_require_base);
+
+// ── wrmsr_or_gp / rdmsr_or_gp — probe-armed MSR access ───────────
+//
+// The fallible MSR helpers catch #GP on BIOS-locked / unsupported
+// MSRs via the recoverable-probe machinery. QEMU TCG returns zero
+// for unsupported MSRs instead of #GP'ing, so the #GP-catch path
+// exercises on real silicon only; here we pin the happy path and
+// the `MsrFault` enum shape.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_msr_fault_variants_distinct() -> TestResult {
+    use crate::x86_64::msr::MsrFault;
+    if MsrFault::GeneralProtection == MsrFault::OtherTrap(13) {
+        return TestResult::Fail("GP != OtherTrap(13) is the whole point");
+    }
+    if MsrFault::OtherTrap(6) == MsrFault::OtherTrap(8) {
+        return TestResult::Fail("OtherTrap Eq collapsed across vectors");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/msr", smoke_msr_fault_variants_distinct);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_msr_wrmsr_or_gp_round_trip_on_safe_msr() -> TestResult {
+    // IA32_TSC_AUX (0xC0000103) is the only architecturally-defined
+    // MSR we can both read and rewrite without disturbing observable
+    // CPU state: it's an opaque 32-bit cookie returned by RDPID /
+    // RDTSCP that the OS uses to identify the logical processor.
+    // Round-trip: read it, write a sentinel, read back, restore the
+    // original. All four ops go through wrmsr_or_gp / rdmsr_or_gp.
+    use crate::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
+    const TSC_AUX: u32 = 0xC0000103;
+    let original = match rdmsr_or_gp(TSC_AUX) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Skip("IA32_TSC_AUX not present on this CPU"),
+    };
+    let sentinel: u64 = 0xDEAD_BEEF_CAFE_F00D & 0xFFFF_FFFF;
+    if wrmsr_or_gp(TSC_AUX, sentinel).is_err() {
+        return TestResult::Fail("wrmsr_or_gp #GP'd on a writable MSR");
+    }
+    let read_back = match rdmsr_or_gp(TSC_AUX) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = wrmsr_or_gp(TSC_AUX, original);
+            return TestResult::Fail("rdmsr_or_gp #GP'd after a successful write");
+        }
+    };
+    let _ = wrmsr_or_gp(TSC_AUX, original);
+    if read_back != sentinel {
+        return TestResult::Fail("written value didn't round-trip through rdmsr");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/msr", smoke_msr_wrmsr_or_gp_round_trip_on_safe_msr);
