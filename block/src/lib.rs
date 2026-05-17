@@ -144,6 +144,12 @@ pub struct BlockCompletion {
     pub result: Result<(), BlockError>,
 }
 
+// Block payloads cross IPC rings; the `DmaBuffer` reference is via
+// a cap index + phys handle, not a raw pointer in-struct, so MTE
+// retag is the trait's identity default.
+impl narf_ipc::Retag for BlockRequest {}
+impl narf_ipc::Retag for BlockCompletion {}
+
 /// Possible block I/O errors.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BlockError {

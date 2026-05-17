@@ -248,6 +248,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         buf: DmaBuffer,
         cap: Cap<DmaBuffer, Read>,
     }
+    impl crate::Retag for Handoff {}
 
     OUTCOME.store(0, Ordering::Relaxed);
     READ_LEN.store(0, Ordering::Relaxed);
@@ -347,6 +348,7 @@ fn smoke_exit_gate_revoked_cap_rejected() -> TestResult {
         buf: DmaBuffer,
         cap: Cap<DmaBuffer, Read>,
     }
+    impl crate::Retag for Handoff {}
 
     OUTCOME.store(0, Ordering::Relaxed);
 
@@ -599,6 +601,7 @@ fn smoke_ipc_spsc_drop_ring_runs_payload_destructors() -> TestResult {
             DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }
+    impl crate::Retag for Counted {}
 
     DROPS.store(0, Ordering::Relaxed);
     {
@@ -1208,3 +1211,122 @@ fn smoke_ipc_spmc_ring_drop_runs_payload_destructors() -> TestResult {
     }
 }
 kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_drop_runs_payload_destructors);
+
+// ── retag-on-publish ──────────────────────────────────────────────
+
+fn smoke_ipc_retag_default_is_identity() -> TestResult {
+    // A type that does NOT implement `Retag` must flow through the
+    // ring untouched. Sending eight u64 values verifies the autoref
+    // fallback path is exercised (and yields the same values back).
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SUM: AtomicU64 = AtomicU64::new(0);
+
+    SUM.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (mut tx, mut rx) = crate::channel::<u64, 8>();
+    narf_scheduler::spawn(async move {
+        for i in 1u64..=8 {
+            let _ = tx.send(i).await;
+        }
+    });
+    narf_scheduler::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(v) => {
+                    SUM.fetch_add(v, Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    narf_scheduler::run_until_empty();
+    if SUM.load(Ordering::Relaxed) == 36 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("identity retag path corrupted the payload")
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_retag_default_is_identity);
+
+fn smoke_ipc_retag_opt_in_type_invokes_retag() -> TestResult {
+    // A type that DOES implement `Retag` must observe its `retag`
+    // hook called exactly once per `Producer::try_send`. The hook
+    // increments a static counter; we send N messages and assert N.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HITS: AtomicU32 = AtomicU32::new(0);
+
+    #[derive(Debug)]
+    struct Tagged(u32);
+    impl crate::Retag for Tagged {
+        fn retag(self) -> Self {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            self
+        }
+    }
+
+    HITS.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (mut tx, mut rx) = crate::channel::<Tagged, 4>();
+    narf_scheduler::spawn(async move {
+        for i in 0u32..5 {
+            let _ = tx.send(Tagged(i)).await;
+        }
+    });
+    narf_scheduler::spawn(async move {
+        let mut seen = 0u32;
+        while let Ok(Tagged(v)) = rx.recv().await {
+            if v != seen {
+                HITS.store(0xDEAD, Ordering::Relaxed);
+                break;
+            }
+            seen += 1;
+        }
+    });
+    narf_scheduler::run_until_empty();
+
+    match HITS.load(Ordering::Relaxed) {
+        5 => TestResult::Pass,
+        0xDEAD => TestResult::Fail("Retag delivered out of order"),
+        _ => TestResult::Fail("Retag::retag not invoked exactly once per send"),
+    }
+}
+kernel_test_in!("ipc", smoke_ipc_retag_opt_in_type_invokes_retag);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_arch_mte_irg_stg_round_trip() -> TestResult {
+    // IRG a 16-byte-aligned scratch buffer, STG the granule, LDG it
+    // back, assert the logical tag in bits 59:56 of the returned
+    // pointer matches the IRG output. Skipped on CPUs without MTE.
+    use narf_arch::aarch64::mte;
+    if !mte::supported() {
+        return TestResult::Skip("MTE not supported (QEMU virt,mte=on absent)");
+    }
+    #[repr(align(16))]
+    struct Granule([u8; 16]);
+    let mut scratch = Granule([0u8; 16]);
+    let raw = scratch.0.as_mut_ptr();
+
+    // SAFETY: supported() gated; IRG/STG/LDG operate on a stack
+    // buffer the kernel owns; tag-storage is mapped for kernel RAM
+    // when SCTLR_EL1.ATA=1 (boot.S precondition).
+    unsafe {
+        let tagged = mte::irg(raw);
+        mte::stg(tagged);
+        let read_back = mte::ldg(raw);
+        let mask_addr = 0x00FF_FFFF_FFFF_FFFFu64;
+        let tag_bits = (tagged as u64) & !mask_addr;
+        let lbits = (read_back as u64) & !mask_addr;
+        let addr_bits = (read_back as u64) & mask_addr;
+        if addr_bits != (raw as u64) & mask_addr {
+            return TestResult::Fail("LDG mangled the address bits");
+        }
+        if lbits != tag_bits {
+            return TestResult::Fail("LDG tag does not match the IRG'd tag stored by STG");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("ipc", smoke_arch_mte_irg_stg_round_trip);

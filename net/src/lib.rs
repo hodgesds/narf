@@ -107,6 +107,11 @@ pub struct Frame {
     len: u32,
 }
 
+// `Frame` carries a `DmaBuffer` whose backing storage is referenced
+// via a phys-address handle, not a raw pointer in the struct itself.
+// MTE retag is therefore the trait's identity default.
+impl narf_ipc::Retag for Frame {}
+
 impl fmt::Debug for Frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Frame")

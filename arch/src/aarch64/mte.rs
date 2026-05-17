@@ -3,8 +3,15 @@
 //! aarch64 MTE implements domain isolation via pointer tags and granule
 //! tags. The `DomainPrimitive` trait on aarch64 manages the Tag Check
 //! Fault (TCF) mode and TBI/ATA configuration.
+//!
+//! References (clean-room, public-spec only):
+//!   * ARM DDI0487 D6.2 — Tagged addresses (TBI / logical-tag field).
+//!   * ARM DDI0487 D6.5 — Allocation tags (granule tags in tag storage).
+//!   * ARM DDI0487 C6.2.{IRG, STG, LDG, GMI} — instruction encodings.
+//!   * Arm "Memory Tagging Extension" whitepaper (public).
 
 use crate::aarch64::sysreg;
+use core::arch::asm;
 use core::fmt;
 
 /// Saved MTE state.
@@ -124,4 +131,126 @@ impl crate::DomainPrimitive for Mte {
             Self::restore(saved);
         }
     }
+}
+
+// ── per-pointer tagging surface ─────────────────────────────────────
+//
+// IRG / STG / LDG / GMI don't have stable Rust intrinsics, so the
+// inline asm gates the encoding behind `.arch_extension memtag`. Tag
+// bits live in bits 59:56 of the virtual address (ARM DDI0487 D6.2).
+
+/// MTE level reported by `ID_AA64PFR1_EL1.MTE` ≥ 1, i.e. tagging
+/// instructions are usable. Level 2 additionally permits checked
+/// loads/stores; the per-pointer surface below only needs level 1.
+#[inline]
+pub fn supported() -> bool {
+    // SAFETY: MRS ID_AA64PFR1_EL1 is always legal at EL1.
+    let feats = unsafe { crate::aarch64::Features::probe() };
+    feats.mte >= 1
+}
+
+/// IRG — Insert Random Tag (ARM DDI0487 C6.2.IRG).
+///
+/// Returns `ptr` with bits 59:56 replaced by a random tag generated
+/// per `GCR_EL1`. The address bits 55:0 are unchanged.
+///
+/// # Safety
+/// CPU must report `supported()`. The returned tagged pointer aliases
+/// `ptr`; storing the tag via `stg` is the caller's responsibility
+/// before any tag-checked access.
+#[inline]
+pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
+    let out: *mut u8;
+    // SAFETY: IRG is a pure register-to-register tag generator; no
+    // memory traffic. The `memtag` arch extension is opt-in at the
+    // assembler level so the kernel build doesn't have to pass
+    // `-C target-feature=+mte` globally.
+    unsafe {
+        asm!(
+            ".arch_extension memtag",
+            "irg {out}, {inp}",
+            inp = in(reg) ptr,
+            out = lateout(reg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// STG — Store Allocation Tag (ARM DDI0487 C6.2.STG).
+///
+/// Writes the logical tag carried in bits 59:56 of `ptr` to the
+/// 16-byte allocation-tag granule containing `ptr`.
+///
+/// # Safety
+/// `ptr` must point into writable memory backed by tag storage
+/// (kernel mappings on QEMU `-machine virt,mte=on` qualify). The
+/// CPU must report `supported()`.
+#[inline]
+pub unsafe fn stg(ptr: *mut u8) {
+    // SAFETY: STG writes the granule's allocation-tag. The granule is
+    // 16-byte aligned; STG itself ignores the low 4 bits of the
+    // operand. Caller proves the granule is part of a tag-storage
+    // mapping.
+    unsafe {
+        asm!(
+            ".arch_extension memtag",
+            "stg {p}, [{p}]",
+            p = in(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// LDG — Load Allocation Tag (ARM DDI0487 C6.2.LDG).
+///
+/// Returns `ptr` with bits 59:56 replaced by the allocation tag
+/// currently stored for the granule containing `ptr`. Bits 55:0
+/// are preserved.
+///
+/// # Safety
+/// `ptr` must reference a tag-storage-backed mapping; CPU must
+/// report `supported()`.
+#[inline]
+pub unsafe fn ldg(ptr: *mut u8) -> *mut u8 {
+    let out: *mut u8;
+    // SAFETY: LDG reads tag storage for the granule; no payload access.
+    unsafe {
+        asm!(
+            ".arch_extension memtag",
+            "mov {out}, {inp}",
+            "ldg {out}, [{out}]",
+            inp = in(reg) ptr,
+            out = lateout(reg) out,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// GMI — Tag Mask Insert (ARM DDI0487 C6.2.GMI).
+///
+/// Returns `excl | (1 << logical_tag(ptr))`, i.e. folds `ptr`'s
+/// logical tag into an exclusion mask suitable for feeding back into
+/// `GCR_EL1.Exclude` so subsequent `irg` calls don't pick the same
+/// tag. Useful when an allocator wants neighbours to carry
+/// non-overlapping tags without seeding `GCR_EL1` ahead of time.
+///
+/// # Safety
+/// CPU must report `supported()`.
+#[inline]
+pub unsafe fn gmi(tag_excl_mask: u64, ptr: *mut u8) -> u64 {
+    let out: u64;
+    // SAFETY: GMI is a pure ALU op on the tag field; no memory traffic.
+    unsafe {
+        asm!(
+            ".arch_extension memtag",
+            "gmi {out}, {p}, {m}",
+            p = in(reg) ptr,
+            m = in(reg) tag_excl_mask,
+            out = lateout(reg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
 }

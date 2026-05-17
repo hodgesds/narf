@@ -764,6 +764,13 @@ pub type CompletionQueue<const N: usize> = Producer<Completion, N>;
 /// User-side completion-queue drainer.
 pub type CompletionDrain<const N: usize> = Consumer<Completion, N>;
 
+// Submission / Completion are flat `#[repr(C)]` POD records: their
+// only fields are integers, `CapSlot` indices, and inline u64s. No
+// raw pointers cross domains here, so the MTE retag-on-publish hook
+// is the trait's default identity body.
+impl narf_ipc::Retag for Submission {}
+impl narf_ipc::Retag for Completion {}
+
 /// Create a fresh submission ring-pair (user → kernel direction).
 /// Thin passthrough to `narf_ipc::channel` so callers do not have to
 /// name the payload type.

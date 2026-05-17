@@ -2,7 +2,7 @@
 //!
 //! Spec: `ipc/specification/spec.md`. Stage-3 Wave 1 subset: a single
 //! shared-memory ring split into a `Producer` / `Consumer` pair with
-//! ownership-transfer semantics (`T: Send + 'static`, moved through
+//! ownership-transfer semantics (`T: Send + 'static + Retag`, moved through
 //! `MaybeUninit<T>` slots), cache-line-partitioned header, and
 //! release/acquire discipline on every index transition — the latter
 //! being the #1 correctness hazard per the spec's invariants.
@@ -24,17 +24,23 @@
 //! Non-goals for Wave 1:
 //! - Real `Cap<Ring, Send/Recv>` gating (Wave 2, after cap-table runtime).
 //! - MPSC / SPMC variants.
-//! - aarch64 MTE retag of pointer fields on slot publish (a stub lives
-//!   in `retag::retag_on_publish`; no-op until the MTE pointer-tagging
-//!   surface lands).
 //! - MMIO / UIPI doorbell (Stage 3 driver framework).
 //! - Per-op cancellation via `OpCode::Cancel` (that is `abi/` Wave 2).
+//!
+//! aarch64 MTE retag on publish: the `Retag` trait gives a blanket
+//! identity default; types whose payload carries raw pointers opt in
+//! by implementing `retag` to call `narf_arch::aarch64::mte::{irg,
+//! stg}` on each field. Stable Rust can't reflect into arbitrary `T`,
+//! so opt-in is the only sound surface.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
 extern crate alloc;
+
+pub mod retag;
+pub use retag::Retag;
 
 pub mod mpsc;
 pub use mpsc::{mpsc_channel, MpscConsumer, MpscProducer, MpscRecvError, MpscSendError};
@@ -184,7 +190,7 @@ impl<T, const N: usize> Drop for Ring<T, N> {
 // ── split into producer + consumer ──────────────────────────────────
 
 /// Allocate a fresh ring and split it into a `(Producer, Consumer)` pair.
-pub fn channel<T: Send + 'static, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
+pub fn channel<T: Send + 'static + Retag, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
     let ring = Arc::new(Ring::<T, N>::new());
     (
         Producer {
@@ -201,7 +207,7 @@ pub fn channel<T: Send + 'static, const N: usize>() -> (Producer<T, N>, Consumer
 // ── Producer ────────────────────────────────────────────────────────
 
 /// Send end of the ring. `!Sync` — a single task owns it at a time.
-pub struct Producer<T: Send + 'static, const N: usize> {
+pub struct Producer<T: Send + 'static + Retag, const N: usize> {
     ring: Arc<Ring<T, N>>,
     // `*const ()` is !Send and !Sync. Override Send below; leave !Sync.
     _not_sync: PhantomData<*const ()>,
@@ -210,9 +216,9 @@ pub struct Producer<T: Send + 'static, const N: usize> {
 // SAFETY: Producer is a single-owner handle; `Arc<Ring>` is Send when
 // the payload is Send. The `!Sync` constraint is preserved by keeping
 // the PhantomData above.
-unsafe impl<T: Send + 'static, const N: usize> Send for Producer<T, N> {}
+unsafe impl<T: Send + 'static + Retag, const N: usize> Send for Producer<T, N> {}
 
-impl<T: Send + 'static, const N: usize> core::fmt::Debug for Producer<T, N> {
+impl<T: Send + 'static + Retag, const N: usize> core::fmt::Debug for Producer<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Producer")
             .field("ring", &*self.ring)
@@ -228,7 +234,7 @@ pub enum TrySendError<T> {
     Closed(T),
 }
 
-impl<T: Send + 'static, const N: usize> Producer<T, N> {
+impl<T: Send + 'static + Retag, const N: usize> Producer<T, N> {
     /// Non-blocking send. On `Full`, the message is returned to the
     /// caller so no data is silently dropped.
     pub fn try_send(&mut self, msg: T) -> Result<(), TrySendError<T>> {
@@ -247,7 +253,10 @@ impl<T: Send + 'static, const N: usize> Producer<T, N> {
         // SAFETY: the producer is the sole writer of slot `idx` until
         // the release-store of `head` below publishes it; between
         // `head - tail < N` and that store, the consumer cannot
-        // observe the slot. `retag::retag_on_publish` is a Wave-1 stub.
+        // observe the slot. `retag::retag_on_publish` is identity for
+        // types not implementing `Retag`; opt-in types (e.g. payloads
+        // carrying raw pointers crossing aarch64 MTE domains) get
+        // their `Retag::retag` invoked here.
         unsafe {
             let slots = &mut *self.ring.slots.get();
             slots[idx].write(retag::retag_on_publish(msg));
@@ -277,7 +286,7 @@ impl<T: Send + 'static, const N: usize> Producer<T, N> {
     }
 }
 
-impl<T: Send + 'static, const N: usize> Drop for Producer<T, N> {
+impl<T: Send + 'static + Retag, const N: usize> Drop for Producer<T, N> {
     fn drop(&mut self) {
         self.ring.closed.store(true, Ordering::Release);
         if let Some(w) = self.ring.consumer_waker.lock().take() {
@@ -289,16 +298,16 @@ impl<T: Send + 'static, const N: usize> Drop for Producer<T, N> {
 /// Future returned by `Producer::send`. Holds the message until it has
 /// been moved into a slot (ownership transfer = move semantics).
 #[derive(Debug)]
-pub struct SendFuture<'a, T: Send + 'static, const N: usize> {
+pub struct SendFuture<'a, T: Send + 'static + Retag, const N: usize> {
     producer: &'a mut Producer<T, N>,
     slot: Option<T>,
 }
 
 // SendFuture only owns `&mut Producer` (a reference) and `Option<T>`
 // (movable by value), so it is structurally Unpin regardless of T.
-impl<T: Send + 'static, const N: usize> core::marker::Unpin for SendFuture<'_, T, N> {}
+impl<T: Send + 'static + Retag, const N: usize> core::marker::Unpin for SendFuture<'_, T, N> {}
 
-impl<'a, T: Send + 'static, const N: usize> Future for SendFuture<'a, T, N> {
+impl<'a, T: Send + 'static + Retag, const N: usize> Future for SendFuture<'a, T, N> {
     type Output = Result<(), T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -334,15 +343,15 @@ impl<'a, T: Send + 'static, const N: usize> Future for SendFuture<'a, T, N> {
 
 // ── Consumer ────────────────────────────────────────────────────────
 
-pub struct Consumer<T: Send + 'static, const N: usize> {
+pub struct Consumer<T: Send + 'static + Retag, const N: usize> {
     ring: Arc<Ring<T, N>>,
     _not_sync: PhantomData<*const ()>,
 }
 
 // SAFETY: Consumer is single-owner; see Producer.
-unsafe impl<T: Send + 'static, const N: usize> Send for Consumer<T, N> {}
+unsafe impl<T: Send + 'static + Retag, const N: usize> Send for Consumer<T, N> {}
 
-impl<T: Send + 'static, const N: usize> core::fmt::Debug for Consumer<T, N> {
+impl<T: Send + 'static + Retag, const N: usize> core::fmt::Debug for Consumer<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Consumer")
             .field("ring", &*self.ring)
@@ -357,7 +366,7 @@ pub enum RecvError {
     Closed,
 }
 
-impl<T: Send + 'static, const N: usize> Consumer<T, N> {
+impl<T: Send + 'static + Retag, const N: usize> Consumer<T, N> {
     /// Non-blocking peek-and-take. `None` means empty; `Closed` is
     /// only reported once the ring has drained.
     pub fn try_recv(&mut self) -> Result<Option<T>, RecvError> {
@@ -399,7 +408,7 @@ impl<T: Send + 'static, const N: usize> Consumer<T, N> {
     }
 }
 
-impl<T: Send + 'static, const N: usize> Drop for Consumer<T, N> {
+impl<T: Send + 'static + Retag, const N: usize> Drop for Consumer<T, N> {
     fn drop(&mut self) {
         self.ring.closed.store(true, Ordering::Release);
         if let Some(w) = self.ring.producer_waker.lock(IrqsEnabled).take() {
@@ -409,14 +418,14 @@ impl<T: Send + 'static, const N: usize> Drop for Consumer<T, N> {
 }
 
 #[derive(Debug)]
-pub struct RecvFuture<'a, T: Send + 'static, const N: usize> {
+pub struct RecvFuture<'a, T: Send + 'static + Retag, const N: usize> {
     consumer: &'a mut Consumer<T, N>,
 }
 
 // Same rationale as SendFuture's Unpin: only a &mut reference inside.
-impl<T: Send + 'static, const N: usize> core::marker::Unpin for RecvFuture<'_, T, N> {}
+impl<T: Send + 'static + Retag, const N: usize> core::marker::Unpin for RecvFuture<'_, T, N> {}
 
-impl<'a, T: Send + 'static, const N: usize> Future for RecvFuture<'a, T, N> {
+impl<'a, T: Send + 'static + Retag, const N: usize> Future for RecvFuture<'a, T, N> {
     type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -440,14 +449,3 @@ impl<'a, T: Send + 'static, const N: usize> Future for RecvFuture<'a, T, N> {
     }
 }
 
-// ── arch retag hook (stub) ──────────────────────────────────────────
-
-mod retag {
-    /// aarch64 MTE retag of pointer fields on slot publish (spec §4).
-    /// Wave-1 stub: passthrough. Lands a real impl once the MTE
-    /// pointer-tagging surface exists in `arch::aarch64::mte`.
-    #[inline(always)]
-    pub fn retag_on_publish<T>(msg: T) -> T {
-        msg
-    }
-}
