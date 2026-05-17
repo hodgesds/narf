@@ -332,3 +332,110 @@ fn smoke_io_register_with_cap_resolves() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io", smoke_io_register_with_cap_resolves);
+
+// ── deep io coverage ──────────────────────────────────────────────
+
+fn smoke_io_error_variants_distinct() -> TestResult {
+    use crate::IoError;
+    let all = [
+        IoError::NoMemory,
+        IoError::DomainMismatch,
+        IoError::OutOfIova,
+        IoError::NotMapped,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("IoError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_error_variants_distinct);
+
+fn smoke_io_coherency_variants_distinct() -> TestResult {
+    use crate::Coherency;
+    if Coherency::Coherent == Coherency::Streaming {
+        return TestResult::Fail("Coherency variants collapsed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_coherency_variants_distinct);
+
+fn smoke_io_dma_buffer_accessors() -> TestResult {
+    // alloc_coherent caps requests at one page; pick 3000 bytes
+    // (rounds up to 4096 internally).
+    use crate::{alloc_coherent, Coherency, IoError};
+    use narf_lib::id::DomainId;
+    let buf = match alloc_coherent(3000, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+    // alloc_with rounds len up to PAGE_SIZE.
+    if buf.len() != 4096 {
+        return TestResult::Fail("len wasn't page-rounded");
+    }
+    // Confirm > page rejects with NoMemory.
+    match alloc_coherent(5000, DomainId::DRIVER_0) {
+        Err(IoError::NoMemory) => {}
+        _ => return TestResult::Fail("oversized alloc didn't reject"),
+    }
+    match alloc_coherent(0, DomainId::DRIVER_0) {
+        Err(IoError::NoMemory) => {}
+        _ => return TestResult::Fail("zero-len alloc didn't reject"),
+    }
+    if buf.is_empty() {
+        return TestResult::Fail("is_empty true for sized buffer");
+    }
+    if buf.coherency() != Coherency::Coherent {
+        return TestResult::Fail("coherency() didn't reflect construction");
+    }
+    if buf.domain() != DomainId::DRIVER_0 {
+        return TestResult::Fail("domain() didn't reflect construction");
+    }
+    if buf.phys_addr().raw() == 0 {
+        return TestResult::Fail("phys_addr is zero — frame allocator misfire?");
+    }
+    if buf.slot_index().is_some() {
+        return TestResult::Fail("slot_index Some before register");
+    }
+    let _ = buf.as_ptr();
+    let _ = buf.as_mut_ptr();
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_dma_buffer_accessors);
+
+fn smoke_io_dma_buffer_as_slice_round_trip() -> TestResult {
+    use crate::alloc_coherent;
+    use narf_lib::id::DomainId;
+    let mut buf = match alloc_coherent(128, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc"),
+    };
+    {
+        let s = buf.as_mut_slice();
+        for (i, b) in s.iter_mut().enumerate().take(128) {
+            *b = (i & 0xFF) as u8;
+        }
+    }
+    {
+        let s = buf.as_slice();
+        for (i, b) in s.iter().enumerate().take(128) {
+            if *b != (i & 0xFF) as u8 {
+                return TestResult::Fail("as_slice readback mismatched write");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_dma_buffer_as_slice_round_trip);
+
+fn smoke_io_unknown_resolve_returns_none() -> TestResult {
+    use crate::resolve;
+    if resolve(u32::MAX).is_some() {
+        return TestResult::Fail("resolve(MAX) returned Some");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_unknown_resolve_returns_none);
