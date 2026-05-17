@@ -886,3 +886,539 @@ fn smoke_block_on_spin_drives_yield_chain() -> TestResult {
     }
 }
 kernel_test_in!("scheduler", smoke_block_on_spin_drives_yield_chain);
+
+// ── deep scheduler coverage ────────────────────────────────────────
+//
+// New tests go deep on:
+//   - affinity (CpuId, CpuSet, Affinity)
+//   - priority (SchedClass, Priority, SmtSharePolicy)
+//   - budget (OverrunPolicy, ResourceBudget builders, BudgetAccount::charge)
+//   - cpu_lifecycle (online_count, error variants, lifecycle path)
+//   - TaskSpec builders
+//   - DonateError variants
+//   - YieldNow shape
+//   - responsive_spin
+//   - all_task_ids
+//
+// Pure-logic where possible; runs on every target.
+
+// ── affinity ───────────────────────────────────────────────────────
+
+fn smoke_scheduler_cpu_id_boot_constant() -> TestResult {
+    use crate::affinity::CpuId;
+    if CpuId::BOOT.0 != 0 {
+        return TestResult::Fail("CpuId::BOOT drifted from 0");
+    }
+    if CpuId::default().0 != 0 {
+        return TestResult::Fail("CpuId::default drifted from 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpu_id_boot_constant);
+
+fn smoke_scheduler_cpuset_constants() -> TestResult {
+    use crate::affinity::CpuSet;
+    if !CpuSet::EMPTY.is_empty() {
+        return TestResult::Fail("EMPTY not empty");
+    }
+    if CpuSet::EMPTY.len() != 0 {
+        return TestResult::Fail("EMPTY len != 0");
+    }
+    if CpuSet::ALL.is_empty() {
+        return TestResult::Fail("ALL is empty");
+    }
+    if CpuSet::ALL.len() != 64 {
+        return TestResult::Fail("ALL len != 64");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpuset_constants);
+
+fn smoke_scheduler_cpuset_single_contains() -> TestResult {
+    use crate::affinity::{CpuId, CpuSet};
+    let s = CpuSet::single(CpuId(7));
+    if s.len() != 1 {
+        return TestResult::Fail("single set len != 1");
+    }
+    if !s.contains(CpuId(7)) {
+        return TestResult::Fail("single set didn't contain its member");
+    }
+    if s.contains(CpuId(8)) {
+        return TestResult::Fail("single set contained a non-member");
+    }
+    // bit 71 maps to bit 7 of u64 (modular).
+    if !s.contains(CpuId(7 + 64)) {
+        return TestResult::Fail("CpuId mod-64 wrap not honoured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpuset_single_contains);
+
+fn smoke_scheduler_cpuset_insert_accumulates() -> TestResult {
+    use crate::affinity::{CpuId, CpuSet};
+    let mut s = CpuSet::EMPTY;
+    s.insert(CpuId(1));
+    s.insert(CpuId(3));
+    s.insert(CpuId(5));
+    if s.len() != 3 {
+        return TestResult::Fail("insert didn't accumulate to 3");
+    }
+    if !s.contains(CpuId(1)) || !s.contains(CpuId(3)) || !s.contains(CpuId(5)) {
+        return TestResult::Fail("inserted CPUs missing");
+    }
+    if s.contains(CpuId(2)) || s.contains(CpuId(4)) {
+        return TestResult::Fail("set contained CPUs we didn't insert");
+    }
+    s.insert(CpuId(3));
+    if s.len() != 3 {
+        return TestResult::Fail("re-insert grew the set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpuset_insert_accumulates);
+
+fn smoke_scheduler_affinity_any_and_pinned() -> TestResult {
+    use crate::affinity::{Affinity, CpuId, CpuSet};
+    let any = Affinity::any();
+    if any.preferred.is_some() {
+        return TestResult::Fail("Affinity::any has preferred set");
+    }
+    if any.allowed != CpuSet::ALL {
+        return TestResult::Fail("Affinity::any allowed != ALL");
+    }
+    let p = Affinity::pinned(CpuId(2));
+    if p.preferred != Some(CpuId(2)) {
+        return TestResult::Fail("pinned preferred != target");
+    }
+    if !p.allowed.contains(CpuId(2)) || p.allowed.len() != 1 {
+        return TestResult::Fail("pinned allowed != single(2)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_affinity_any_and_pinned);
+
+// ── priority ───────────────────────────────────────────────────────
+
+fn smoke_scheduler_sched_class_variants_distinct() -> TestResult {
+    use crate::priority::SchedClass;
+    let all = [SchedClass::Normal, SchedClass::RealTime, SchedClass::Idle];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("two SchedClass variants collapsed");
+            }
+        }
+    }
+    if SchedClass::default() != SchedClass::Normal {
+        return TestResult::Fail("SchedClass::default != Normal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_sched_class_variants_distinct);
+
+fn smoke_scheduler_priority_constants_ordered() -> TestResult {
+    use crate::priority::Priority;
+    if Priority::HIGH.raw() != -10 {
+        return TestResult::Fail("HIGH drifted from -10");
+    }
+    if Priority::NORMAL.raw() != 0 {
+        return TestResult::Fail("NORMAL drifted from 0");
+    }
+    if Priority::LOW.raw() != 10 {
+        return TestResult::Fail("LOW drifted from 10");
+    }
+    // PartialOrd: HIGH < NORMAL < LOW (lower nice = higher priority).
+    if !(Priority::HIGH < Priority::NORMAL) {
+        return TestResult::Fail("HIGH not < NORMAL under PartialOrd");
+    }
+    if !(Priority::NORMAL < Priority::LOW) {
+        return TestResult::Fail("NORMAL not < LOW under PartialOrd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_priority_constants_ordered);
+
+fn smoke_scheduler_smt_share_policy_variants_distinct() -> TestResult {
+    use crate::priority::SmtSharePolicy;
+    let all = [
+        SmtSharePolicy::Avoid,
+        SmtSharePolicy::Allow,
+        SmtSharePolicy::Require,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("SmtSharePolicy variants collapsed");
+            }
+        }
+    }
+    if SmtSharePolicy::default() != SmtSharePolicy::Avoid {
+        return TestResult::Fail("SmtSharePolicy::default != Avoid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_smt_share_policy_variants_distinct);
+
+// ── budget ─────────────────────────────────────────────────────────
+
+fn smoke_scheduler_overrun_policy_variants_distinct() -> TestResult {
+    use crate::budget::OverrunPolicy;
+    let all = [
+        OverrunPolicy::Block,
+        OverrunPolicy::Degrade,
+        OverrunPolicy::Ignore,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("OverrunPolicy variants collapsed");
+            }
+        }
+    }
+    if OverrunPolicy::default() != OverrunPolicy::Block {
+        return TestResult::Fail("default != Block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_overrun_policy_variants_distinct);
+
+fn smoke_scheduler_resource_budget_unthrottled_shape() -> TestResult {
+    use crate::budget::{OverrunPolicy, ResourceBudget};
+    let b = ResourceBudget::unthrottled();
+    if b.share_ppm != 1_000_000 {
+        return TestResult::Fail("unthrottled share_ppm != 1M");
+    }
+    if b.burst_cycles != u64::MAX {
+        return TestResult::Fail("unthrottled burst != MAX");
+    }
+    if b.deadline_cycles.is_some() {
+        return TestResult::Fail("unthrottled has deadline");
+    }
+    if b.policy != OverrunPolicy::Ignore {
+        return TestResult::Fail("unthrottled policy != Ignore");
+    }
+    if ResourceBudget::default() != b {
+        return TestResult::Fail("default != unthrottled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_resource_budget_unthrottled_shape);
+
+fn smoke_scheduler_resource_budget_fair_share_shape() -> TestResult {
+    use crate::budget::{OverrunPolicy, ResourceBudget};
+    let b = ResourceBudget::fair_share(250_000, 50_000);
+    if b.share_ppm != 250_000 {
+        return TestResult::Fail("fair_share share didn't take");
+    }
+    if b.burst_cycles != 50_000 {
+        return TestResult::Fail("fair_share burst didn't take");
+    }
+    if b.policy != OverrunPolicy::Block {
+        return TestResult::Fail("fair_share policy != Block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_resource_budget_fair_share_shape);
+
+fn smoke_scheduler_budget_account_tracks_polls_and_cycles() -> TestResult {
+    use crate::budget::{BudgetAccount, ResourceBudget};
+    let b = ResourceBudget::fair_share(500_000, 1_000);
+    let mut a = BudgetAccount::new();
+    let o1 = a.charge(500, &b);
+    let o2 = a.charge(400, &b);
+    let o3 = a.charge(900, &b);
+    if o1 || o2 || o3 {
+        return TestResult::Fail("within-burst polls flagged as overrun");
+    }
+    if a.cycles_spent != 1_800 || a.polls != 3 || a.overruns != 0 {
+        return TestResult::Fail("3 within-burst polls didn't accumulate cleanly");
+    }
+    let o4 = a.charge(2_000, &b);
+    if !o4 {
+        return TestResult::Fail("over-burst poll didn't surface as overrun");
+    }
+    if a.overruns != 1 {
+        return TestResult::Fail("overruns didn't bump to 1");
+    }
+    if a.polls != 4 {
+        return TestResult::Fail("poll count didn't bump to 4");
+    }
+    if a.cycles_spent != 3_800 {
+        return TestResult::Fail("cycles_spent wrong after overrun");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_budget_account_tracks_polls_and_cycles);
+
+fn smoke_scheduler_budget_account_charge_saturates() -> TestResult {
+    use crate::budget::{BudgetAccount, ResourceBudget};
+    let b = ResourceBudget::unthrottled();
+    let mut a = BudgetAccount::new();
+    let huge = u64::MAX - 100;
+    a.charge(huge, &b);
+    if a.cycles_spent != huge {
+        return TestResult::Fail("first huge charge didn't take");
+    }
+    a.charge(huge, &b);
+    if a.cycles_spent != u64::MAX {
+        return TestResult::Fail("second huge charge didn't saturate to MAX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_budget_account_charge_saturates);
+
+// ── cpu_lifecycle ──────────────────────────────────────────────────
+
+fn smoke_scheduler_cpu_online_boot_starts_online() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::cpu_lifecycle::{cpu_online, online_count, __test_reset_online_mask};
+    __test_reset_online_mask();
+    if !cpu_online(CpuId::BOOT) {
+        return TestResult::Fail("CPU 0 not online after reset");
+    }
+    if online_count() != 1 {
+        return TestResult::Fail("online_count after reset != 1");
+    }
+    if cpu_online(CpuId(64)) {
+        return TestResult::Fail("CPU 64 reported online (out of 64-bit range)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpu_online_boot_starts_online);
+
+fn smoke_scheduler_hotplug_error_variants_distinct() -> TestResult {
+    use crate::cpu_lifecycle::HotPlugError;
+    let all = [
+        HotPlugError::AuthorityRevoked,
+        HotPlugError::OutOfRange,
+        HotPlugError::NoChange,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("HotPlugError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_hotplug_error_variants_distinct);
+
+fn smoke_scheduler_cpu_take_offline_refuses_bsp() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::cpu_lifecycle::{cpu_take_offline, HotPlugError, __test_reset_online_mask};
+    use narf_capabilities::{Cap, Invoke};
+    __test_reset_online_mask();
+    let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();
+    match cpu_take_offline(CpuId::BOOT, &cap) {
+        Err(HotPlugError::OutOfRange) => TestResult::Pass,
+        _ => TestResult::Fail("BSP take-offline didn't surface OutOfRange"),
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpu_take_offline_refuses_bsp);
+
+fn smoke_scheduler_cpu_bring_up_take_offline_lifecycle() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::cpu_lifecycle::{
+        cpu_bring_up, cpu_online, cpu_take_offline, online_count, HotPlugError,
+        __test_reset_online_mask,
+    };
+    use narf_capabilities::{Cap, Invoke};
+    __test_reset_online_mask();
+    let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();
+    cpu_bring_up(CpuId(3), &cap).expect("bring up");
+    if !cpu_online(CpuId(3)) {
+        return TestResult::Fail("CPU 3 not online after bring_up");
+    }
+    if online_count() != 2 {
+        return TestResult::Fail("online_count didn't reach 2");
+    }
+    match cpu_bring_up(CpuId(3), &cap) {
+        Err(HotPlugError::NoChange) => {}
+        _ => return TestResult::Fail("re-bring_up didn't surface NoChange"),
+    }
+    cpu_take_offline(CpuId(3), &cap).expect("take offline");
+    if cpu_online(CpuId(3)) {
+        return TestResult::Fail("CPU 3 still online after take_offline");
+    }
+    match cpu_take_offline(CpuId(3), &cap) {
+        Err(HotPlugError::NoChange) => {}
+        _ => return TestResult::Fail("re-take_offline didn't surface NoChange"),
+    }
+    __test_reset_online_mask();
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpu_bring_up_take_offline_lifecycle);
+
+fn smoke_scheduler_cpu_bring_up_out_of_range() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::cpu_lifecycle::{cpu_bring_up, HotPlugError, __test_reset_online_mask};
+    use narf_capabilities::{Cap, Invoke};
+    __test_reset_online_mask();
+    let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();
+    match cpu_bring_up(CpuId(64), &cap) {
+        Err(HotPlugError::OutOfRange) => TestResult::Pass,
+        _ => TestResult::Fail("cpu_bring_up(64) didn't surface OutOfRange"),
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpu_bring_up_out_of_range);
+
+fn smoke_scheduler_cpu_lifecycle_revoked_cap_rejected() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::cpu_lifecycle::{cpu_bring_up, HotPlugError, __test_reset_online_mask};
+    use narf_capabilities::{Cap, Invoke};
+    __test_reset_online_mask();
+    let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();
+    cap.revoke();
+    match cpu_bring_up(CpuId(2), &cap) {
+        Err(HotPlugError::AuthorityRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked cap didn't surface AuthorityRevoked"),
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpu_lifecycle_revoked_cap_rejected);
+
+// ── TaskSpec ───────────────────────────────────────────────────────
+
+fn smoke_scheduler_task_spec_unthrottled_bsp_pinned() -> TestResult {
+    use crate::TaskSpec;
+    use crate::affinity::CpuId;
+    let s = TaskSpec::unthrottled();
+    if s.affinity.preferred != Some(CpuId::BOOT) {
+        return TestResult::Fail("unthrottled not BSP-pinned");
+    }
+    if s.budget_cap.is_some() {
+        return TestResult::Fail("unthrottled carries a budget cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_task_spec_unthrottled_bsp_pinned);
+
+fn smoke_scheduler_task_spec_realtime_shape() -> TestResult {
+    use crate::priority::{Priority, SchedClass};
+    use crate::TaskSpec;
+    let s = TaskSpec::realtime(12_345_678);
+    if s.class != SchedClass::RealTime {
+        return TestResult::Fail("realtime class wrong");
+    }
+    if s.priority != Priority::HIGH {
+        return TestResult::Fail("realtime priority != HIGH");
+    }
+    if s.budget.deadline_cycles != Some(12_345_678) {
+        return TestResult::Fail("realtime deadline didn't take");
+    }
+    // realtime is NOT BSP-pinned (any() allows migration).
+    if s.affinity.preferred.is_some() {
+        return TestResult::Fail("realtime has BSP pin");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_task_spec_realtime_shape);
+
+// ── DonateError ────────────────────────────────────────────────────
+
+fn smoke_scheduler_donate_error_variants_distinct() -> TestResult {
+    use crate::DonateError;
+    let all = [
+        DonateError::AuthorityRevoked,
+        DonateError::TargetNotFound,
+        DonateError::NotReady,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("DonateError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_donate_error_variants_distinct);
+
+// ── all_task_ids + spawn surface ───────────────────────────────────
+
+fn smoke_scheduler_all_task_ids_lists_spawned() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use crate::TaskId;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    DONE.store(false, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+    let pre = crate::all_task_ids().len();
+    let id = crate::spawn(async {
+        DONE.store(true, Ordering::Relaxed);
+    });
+    let after = crate::all_task_ids();
+    if after.len() != pre + 1 {
+        return TestResult::Fail("spawn didn't bump all_task_ids count");
+    }
+    if !after.contains(&id) {
+        return TestResult::Fail("spawned id missing from all_task_ids");
+    }
+    if id == TaskId(0) {
+        return TestResult::Fail("spawn returned zero TaskId");
+    }
+    crate::run_until_empty();
+    if !DONE.load(Ordering::Relaxed) {
+        return TestResult::Fail("spawned task didn't run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_all_task_ids_lists_spawned);
+
+// ── YieldNow ───────────────────────────────────────────────────────
+
+fn smoke_scheduler_yield_now_resolves_on_second_poll() -> TestResult {
+    // YieldNow returns Pending on first poll (after registering its
+    // wake) and Ready on second poll. Confirms the "yield exactly
+    // once" contract.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn wake(_: *const ()) {}
+    fn drop_no(_: *const ()) {}
+    static VT: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake, drop_no);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut cx = Context::from_waker(&w);
+
+    let mut y = crate::yield_now();
+    let p1 = Pin::new(&mut y).poll(&mut cx);
+    if !matches!(p1, Poll::Pending) {
+        return TestResult::Fail("yield_now first poll wasn't Pending");
+    }
+    let p2 = Pin::new(&mut y).poll(&mut cx);
+    if !matches!(p2, Poll::Ready(())) {
+        return TestResult::Fail("yield_now second poll wasn't Ready");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_yield_now_resolves_on_second_poll);
+
+// ── responsive_spin ────────────────────────────────────────────────
+
+fn smoke_scheduler_responsive_spin_returns_true_when_done_immediately() -> TestResult {
+    let result = crate::responsive_spin(|| true, 10);
+    if !result {
+        return TestResult::Fail("responsive_spin with immediate done didn't return true");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_responsive_spin_returns_true_when_done_immediately);
+
+fn smoke_scheduler_responsive_spin_caps_at_max_iters() -> TestResult {
+    use core::cell::Cell;
+    let calls = Cell::new(0u32);
+    let result = crate::responsive_spin(
+        || { calls.set(calls.get() + 1); false },
+        16,
+    );
+    if result {
+        return TestResult::Fail("responsive_spin returned true with never-done predicate");
+    }
+    if calls.get() == 0 {
+        return TestResult::Fail("responsive_spin never invoked predicate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_responsive_spin_caps_at_max_iters);
