@@ -20,6 +20,12 @@ use crate::{font8x8, Framebuffer, Pixel32};
 
 const GLYPH_W: u32 = 8;
 const GLYPH_H: u32 = 8;
+/// Vertical offset from the top of the framebuffer to the first
+/// glyph row. The top 32 px are the build stripe + beacon row,
+/// painted by `narf_memory::beacon`. The console below the offset
+/// stays free for text. Without this offset, beacons overwrite
+/// the first text row constantly and the boot log looks blank.
+const TOP_PX_OFFSET: u32 = 32;
 
 #[derive(Debug)]
 pub struct FbConsole {
@@ -38,8 +44,15 @@ impl FbConsole {
     /// background and starts the cursor at (0, 0).
     pub fn new(mut fb: Framebuffer, fg: Pixel32, bg: Pixel32) -> Self {
         let cols = fb.width / GLYPH_W;
-        let rows = fb.height / GLYPH_H;
-        fb.clear(bg);
+        // Reserve the top TOP_PX_OFFSET px for the beacon strip;
+        // text rows operate below that band only.
+        let rows = (fb.height.saturating_sub(TOP_PX_OFFSET)) / GLYPH_H;
+        // Clear ONLY the text region — the top band (build stripe
+        // + beacons) was painted by the boot path before this
+        // console got installed and contains useful diagnostic
+        // state. A full `fb.clear(bg)` would wipe all of it.
+        let text_h = rows * GLYPH_H;
+        fb.fill_rect(0, TOP_PX_OFFSET, fb.width, text_h, bg);
         Self {
             fb,
             cols,
@@ -98,7 +111,7 @@ impl FbConsole {
                 if self.cur_col > 0 {
                     self.cur_col -= 1;
                     let x = self.cur_col * GLYPH_W;
-                    let y = self.cur_row * GLYPH_H;
+                    let y = TOP_PX_OFFSET + self.cur_row * GLYPH_H;
                     self.fb.fill_rect(x, y, GLYPH_W, GLYPH_H, self.bg);
                 }
             }
@@ -107,7 +120,7 @@ impl FbConsole {
                     self.newline();
                 }
                 let x = self.cur_col * GLYPH_W;
-                let y = self.cur_row * GLYPH_H;
+                let y = TOP_PX_OFFSET + self.cur_row * GLYPH_H;
                 let g = font8x8::lookup(b);
                 self.fb.draw_glyph_8x8(x, y, &g, self.fg, self.bg);
                 self.cur_col += 1;
@@ -132,6 +145,9 @@ impl fmt::Write for FbConsole {
 impl FbConsole {
     fn newline(&mut self) {
         self.cur_col = 0;
+        if self.rows == 0 {
+            return;
+        }
         if self.cur_row + 1 >= self.rows {
             // Screen full — scroll up one glyph row. The previous
             // wrap-to-row-0 behaviour was cheap but unreadable on
@@ -151,7 +167,7 @@ impl FbConsole {
             self.cur_row += 1;
             // Clear the row we're about to write to so old text
             // doesn't bleed through.
-            let y = self.cur_row * GLYPH_H;
+            let y = TOP_PX_OFFSET + self.cur_row * GLYPH_H;
             self.fb.fill_rect(0, y, self.fb.width, GLYPH_H, self.bg);
         }
     }
@@ -162,26 +178,34 @@ impl FbConsole {
     /// alignment), so we iterate rows individually rather than
     /// memmove the whole buffer as one contiguous range.
     fn scroll_up_one_row(&mut self) {
+        if self.rows == 0 {
+            return;
+        }
         let glyph_h = GLYPH_H as usize;
         let stride = self.fb.stride as usize;
         let width = self.fb.width as usize;
-        let total_pixel_rows = (self.rows * GLYPH_H) as usize;
+        let top = TOP_PX_OFFSET as usize;
+        // Scroll only the text region — preserve the top
+        // TOP_PX_OFFSET px (build stripe + beacons). Move pixel
+        // rows [top + glyph_h, top + rows*glyph_h) up to
+        // [top, top + (rows-1)*glyph_h).
+        let text_pixel_rows = (self.rows * GLYPH_H) as usize;
         // SAFETY: `self.fb.base()` is a valid pixel buffer covering
-        // at least `stride * height` u32s, and rows referenced
-        // below (src y .. y+glyph_h, dst y .. y+glyph_h) are all
-        // within [0, total_pixel_rows). Stride ≥ width keeps each
-        // row's `width` columns inside the buffer.
+        // at least `stride * height` u32s; the text region lives
+        // within [top, top + text_pixel_rows). Stride ≥ width keeps
+        // each row's `width` columns inside the buffer.
         let base = self.fb.base();
         unsafe {
-            for dst_y in 0..total_pixel_rows.saturating_sub(glyph_h) {
-                let src_y = dst_y + glyph_h;
+            for offset_dst in 0..text_pixel_rows.saturating_sub(glyph_h) {
+                let src_y = top + offset_dst + glyph_h;
+                let dst_y = top + offset_dst;
                 let src = base.add(src_y * stride);
                 let dst = base.add(dst_y * stride);
                 ptr::copy(src, dst, width);
             }
         }
-        // Clear the bottom glyph row.
-        let bottom_y = (self.rows - 1) * GLYPH_H;
+        // Clear the bottom glyph row of the text region.
+        let bottom_y = TOP_PX_OFFSET + (self.rows - 1) * GLYPH_H;
         self.fb.fill_rect(0, bottom_y, self.fb.width, GLYPH_H, self.bg);
         // Cursor lands at the (now-cleared) bottom row.
         self.cur_row = self.rows - 1;

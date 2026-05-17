@@ -33,7 +33,11 @@ impl Pixel32 {
     pub const YELLOW: Self = Self::rgb(0xFF, 0xFF, 0x00);
     pub const MAGENTA: Self = Self::rgb(0xFF, 0x00, 0xFF);
     pub const NARF_BG: Self = Self::rgb(0x10, 0x10, 0x18);
-    pub const NARF_FG: Self = Self::rgb(0xC0, 0xE0, 0xFF);
+    // Pure white instead of the prior 0xC0E0FF — the dimmer
+    // shade was very hard to read on a Zen2 laptop screen at
+    // 8×8 px glyphs in normal lighting. White lets the boot
+    // log be read at arm's length without squinting.
+    pub const NARF_FG: Self = Self::rgb(0xFF, 0xFF, 0xFF);
 
     #[inline]
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {

@@ -29,21 +29,25 @@ kernel_test_in!("fb", smoke_fb_picker_skips_unprobed_amdgpu);
 fn smoke_fb_console_writes_glyphs() -> TestResult {
     use alloc::vec;
     use narf_graphics::{font8x8, FbConsole, Framebuffer, Pixel32};
-    // Build an in-memory FB just big enough for 4 chars × 1 row.
-    let mut buf = vec![0u32; 32 * 8];
+    // FbConsole reserves the top 32 px for the beacon/build-stripe
+    // band; the first glyph row lands at y=32. Build an FB 32 px wide
+    // × 40 px tall so the first text row fits below the offset.
+    const STRIDE: u32 = 32;
+    const HEIGHT: u32 = 40;
+    const TOP_PX_OFFSET: usize = 32;
+    let mut buf = vec![0u32; (STRIDE * HEIGHT) as usize];
     let ptr = buf.as_mut_ptr();
     // SAFETY: backing buffer outlives the borrow.
-    let fb = unsafe { Framebuffer::new(ptr, 32, 8, 32) };
+    let fb = unsafe { Framebuffer::new(ptr, STRIDE, HEIGHT, STRIDE) };
     let mut con = FbConsole::new(fb, Pixel32::WHITE, Pixel32::BLACK);
     con.write_bytes(b"NARF");
     if con.cursor() != (4, 0) {
         return TestResult::Fail("cursor advance wrong");
     }
-    // First char 'N' at (0..8, 0..8); top row's leftmost pixel set comes
-    // from the glyph. We verify the 'N' top row pattern got drawn.
+    // First char 'N' at (0..8, TOP_PX_OFFSET..TOP_PX_OFFSET+8). Verify
+    // the 'N' top glyph row got drawn at the expected y.
     let n_glyph = font8x8::lookup(b'N');
-    // Top row: pixels (0..8, 0). Each pixel is fg=WHITE iff the corresponding
-    // glyph-row bit is 1.
+    let row_base = TOP_PX_OFFSET * STRIDE as usize;
     for col in 0..8u32 {
         let bit = (n_glyph[0] >> (7 - col)) & 1 != 0;
         let want = if bit {
@@ -51,7 +55,7 @@ fn smoke_fb_console_writes_glyphs() -> TestResult {
         } else {
             Pixel32::BLACK.raw()
         };
-        if buf[col as usize] != want {
+        if buf[row_base + col as usize] != want {
             return TestResult::Fail("N glyph not painted at expected position");
         }
     }
@@ -62,10 +66,11 @@ kernel_test_in!("fb", smoke_fb_console_writes_glyphs);
 fn smoke_fb_console_newline_advances_row() -> TestResult {
     use alloc::vec;
     use narf_graphics::{FbConsole, Framebuffer, Pixel32};
-    let mut buf = vec![0u32; 16 * 24];
+    // 32 px reserved at top + 24 px below = 3 rows of 8-px glyphs.
+    let mut buf = vec![0u32; 16 * 56];
     let ptr = buf.as_mut_ptr();
     // SAFETY: backing buffer outlives the borrow.
-    let fb = unsafe { Framebuffer::new(ptr, 16, 24, 16) };
+    let fb = unsafe { Framebuffer::new(ptr, 16, 56, 16) };
     let mut con = FbConsole::new(fb, Pixel32::WHITE, Pixel32::BLACK);
     con.write_bytes(b"hi\nyo");
     let (col, row) = con.cursor();
