@@ -207,3 +207,261 @@ fn smoke_rights_lattice_derive() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_rights_lattice_derive);
+
+// ── deep capabilities coverage ─────────────────────────────────────
+//
+// Closes the remaining invariants on the rights lattice + CapSlot
+// atomic round-trip + CapKind registry + CapError variants.
+
+fn smoke_cap_rights_bits_are_distinct_singletons() -> TestResult {
+    // Each Rights marker carries a single distinct bit. Catches a
+    // refactor that collapses two markers onto the same wire bit.
+    use crate::{Grant, Invoke, Read, Rights, Spend, Write};
+    let bits = [
+        ("Read", Read::BITS),
+        ("Write", Write::BITS),
+        ("Grant", Grant::BITS),
+        ("Spend", Spend::BITS),
+        ("Invoke", Invoke::BITS),
+    ];
+    for &(_, b) in bits.iter() {
+        if b == 0 {
+            return TestResult::Fail("a Rights marker bit is zero");
+        }
+        if b.count_ones() != 1 {
+            return TestResult::Fail("a Rights bit is not a singleton");
+        }
+    }
+    for (i, &(_, a)) in bits.iter().enumerate() {
+        for (j, &(_, b)) in bits.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("two Rights markers share a bit");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_rights_bits_are_distinct_singletons);
+
+fn smoke_cap_grant_derives_every_lesser_right() -> TestResult {
+    // Grant is the lattice top — must derive Read, Write, Spend,
+    // and Invoke without complaint.
+    use crate::{Cap, CapKind, CapType, Grant, Invoke, Read, Spend, Write};
+    struct TestObj;
+    impl CapType for TestObj { const KIND: CapKind = CapKind::Domain; }
+
+    let g: Cap<TestObj, Grant> = Cap::bootstrap();
+    if g.derive::<Read>().is_err() {
+        return TestResult::Fail("Read ⊂ Grant failed");
+    }
+    if g.derive::<Write>().is_err() {
+        return TestResult::Fail("Write ⊂ Grant failed");
+    }
+    if g.derive::<Spend>().is_err() {
+        return TestResult::Fail("Spend ⊂ Grant failed");
+    }
+    if g.derive::<Invoke>().is_err() {
+        return TestResult::Fail("Invoke ⊂ Grant failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_grant_derives_every_lesser_right);
+
+fn smoke_cap_slot_u128_round_trip() -> TestResult {
+    // as_u128 + from_u128 must round-trip the 16-byte slot bit-for-bit.
+    // The atomic CAS path depends on this.
+    use crate::CapSlot;
+    let cases = [
+        CapSlot::EMPTY,
+        CapSlot::new(1, 2, 3, 4),
+        CapSlot::new(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+        CapSlot::new(0xDEAD_BEEF, 0xCAFE_F00D, 0x1234_5678, 0xABCD_EF01),
+    ];
+    for &c in cases.iter() {
+        let raw = c.as_u128();
+        let back = CapSlot::from_u128(raw);
+        if back != c {
+            return TestResult::Fail("CapSlot u128 round-trip lost data");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_slot_u128_round_trip);
+
+fn smoke_cap_error_variants_distinct() -> TestResult {
+    use crate::CapError;
+    let all = [
+        CapError::Revoked,
+        CapError::DomainMismatch,
+        CapError::TypeMismatch,
+        CapError::RightsTooWeak,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("CapError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_error_variants_distinct);
+
+fn smoke_cap_kind_full_registry_round_trip() -> TestResult {
+    // Every CapKind in KIND_NAMES must round-trip via parse_kind +
+    // kind_name. Catches an entry missing from one side of the
+    // table.
+    use crate::{kind_name, parse_kind, CapKind};
+    let all: &[CapKind] = &[
+        CapKind::BusDevice,
+        CapKind::BusDeviceP2pDma,
+        CapKind::BusReconfigureAcs,
+        CapKind::BusRegistry,
+        CapKind::BlockDevice,
+        CapKind::BlockDeviceBackend,
+        CapKind::BlockIoQueueOwn,
+        CapKind::Namespace,
+        CapKind::NetIface,
+        CapKind::StackInstall,
+        CapKind::FileNode,
+        CapKind::DirNode,
+        CapKind::MountPoint,
+        CapKind::FsInstance,
+        CapKind::Ring,
+        CapKind::RingPair,
+        CapKind::Endpoint,
+        CapKind::Domain,
+        CapKind::DmaBuffer,
+        CapKind::SharedRegion,
+        CapKind::Probe,
+        CapKind::TraceRing,
+        CapKind::Recorder,
+        CapKind::Pmu,
+        CapKind::HwCrypto,
+        CapKind::HwTrace,
+        CapKind::Debugger,
+        CapKind::Diagnostics,
+        CapKind::Watchpoint,
+        CapKind::Key,
+        CapKind::KeyMgr,
+        CapKind::Rng,
+        CapKind::Tpm,
+        CapKind::Spdm,
+        CapKind::Task,
+        CapKind::CpuAffinity,
+        CapKind::CpuLifecycle,
+        CapKind::CpuBudget,
+        CapKind::FreqHint,
+        CapKind::Power,
+        CapKind::Timer,
+        CapKind::DevicePm,
+        CapKind::Governor,
+        CapKind::PmBus,
+        CapKind::SleepableReader,
+        CapKind::Scmi,
+        CapKind::Process,
+        CapKind::Driver,
+        CapKind::FbScanout,
+        CapKind::AudioStream,
+        CapKind::I3cBus,
+        CapKind::Pwm,
+        CapKind::Firmware,
+        CapKind::FirmwareRegistry,
+        CapKind::Bluetooth,
+        CapKind::UsbPd,
+        CapKind::CpuTelemetry,
+    ];
+    for &k in all {
+        let name = kind_name(k);
+        if name == "Unknown" {
+            return TestResult::Fail("a CapKind has no name entry");
+        }
+        match parse_kind(name) {
+            Ok(parsed) if parsed == k => {}
+            _ => return TestResult::Fail("parse_kind didn't round-trip a registered kind"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_kind_full_registry_round_trip);
+
+fn smoke_cap_kind_wire_values_pairwise_distinct() -> TestResult {
+    // Any two CapKind values must have distinct wire u32s. A
+    // refactor that accidentally aliases two kinds breaks
+    // type-tag dispatch across the cap-table runtime.
+    use crate::CapKind;
+    let all: [CapKind; 8] = [
+        CapKind::BusDevice,
+        CapKind::BlockDevice,
+        CapKind::NetIface,
+        CapKind::FileNode,
+        CapKind::Ring,
+        CapKind::Domain,
+        CapKind::Probe,
+        CapKind::Key,
+    ];
+    for (i, &a) in all.iter().enumerate() {
+        for (j, &b) in all.iter().enumerate() {
+            if i != j && (a as u32) == (b as u32) {
+                return TestResult::Fail("two CapKind values share a wire u32");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_kind_wire_values_pairwise_distinct);
+
+fn smoke_cap_badge_default_zero() -> TestResult {
+    use crate::Badge;
+    if Badge::default().0 != 0 {
+        return TestResult::Fail("Badge::default != 0");
+    }
+    if Badge(0xDEAD) == Badge(0xBEEF) {
+        return TestResult::Fail("distinct Badges compared equal");
+    }
+    if Badge(42) != Badge(42) {
+        return TestResult::Fail("identical Badges compared unequal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_badge_default_zero);
+
+fn smoke_cap_clone_preserves_slot() -> TestResult {
+    // Cap is Copy + Clone; both produce a structurally-identical
+    // sibling that shares the underlying object table slot.
+    use crate::{Cap, CapKind, CapType, Write};
+    struct TestObj;
+    impl CapType for TestObj { const KIND: CapKind = CapKind::Endpoint; }
+
+    let a: Cap<TestObj, Write> = Cap::bootstrap();
+    let b = a; // Copy
+    let c = a.clone();
+    if a.slot() != b.slot() || a.slot() != c.slot() {
+        return TestResult::Fail("clone/copy didn't preserve the slot");
+    }
+    // Revoking through one handle must invalidate the rest.
+    a.revoke();
+    if b.is_live() || c.is_live() {
+        return TestResult::Fail("clone/copy survived revoke");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_clone_preserves_slot);
+
+fn smoke_cap_empty_slot_helper() -> TestResult {
+    // CapSlot::EMPTY round-trip + is_empty contract.
+    use crate::CapSlot;
+    if !CapSlot::EMPTY.is_empty() {
+        return TestResult::Fail("EMPTY not empty");
+    }
+    if CapSlot::new(0, 0, 0, 0).is_empty() != true {
+        return TestResult::Fail("all-zero new() not empty");
+    }
+    let mut s = CapSlot::EMPTY;
+    s.generation = 1;
+    if s.is_empty() {
+        return TestResult::Fail("partial-fill slot reported empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_empty_slot_helper);
