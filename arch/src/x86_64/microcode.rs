@@ -47,6 +47,11 @@ pub enum UcodeError {
     /// Update was applied but the CPU didn't bump the revision —
     /// blob was likely already current (or didn't match this CPU).
     NoRevisionChange,
+    /// The patch-loader MSR write raised `#GP`. Most common cause:
+    /// the BIOS locked microcode updates (CPU is treated as
+    /// already-up-to-date by firmware). Caller continues at the
+    /// firmware-supplied revision.
+    LoaderLocked,
 }
 
 /// Detect CPU vendor via CPUID leaf 0.
@@ -102,19 +107,18 @@ pub unsafe fn read_revision() -> u32 {
 /// 1`). Wrong blobs corrupt the CPU's state — only ever feed
 /// vendor-signed bundles from `narf-firmware`.
 pub unsafe fn apply_intel(blob: &[u8]) -> Result<u32, UcodeError> {
+    use crate::x86_64::msr::wrmsr_or_gp;
     if blob.len() < 48 {
         return Err(UcodeError::NoRevisionChange);
     }
     // SAFETY: caller-asserted.
     let _before = unsafe { read_revision() };
-    // The "update data address" the SDM wants is the linear
-    // address of the header (offset 0); on x86_64 with identity-
-    // mapped low memory or any kernel mapping pointing at the
-    // blob, that's just the kernel pointer.
     let addr = blob.as_ptr() as u64;
-    // SAFETY: CPL=0 + valid Intel ucode header.
-    unsafe {
-        wrmsr(MSR_INTEL_BIOS_UPDT_TRIG, addr);
+    // BIOS-locked microcode updates surface as `#GP` on the trigger
+    // MSR write rather than a quiet no-op. Surface that distinctly
+    // so the caller can keep going at the firmware revision.
+    if wrmsr_or_gp(MSR_INTEL_BIOS_UPDT_TRIG, addr).is_err() {
+        return Err(UcodeError::LoaderLocked);
     }
     // SAFETY: same.
     let after = unsafe { read_revision() };
@@ -133,15 +137,15 @@ pub unsafe fn apply_intel(blob: &[u8]) -> Result<u32, UcodeError> {
 /// # Safety
 /// Same as `apply_intel`; AMD blobs only.
 pub unsafe fn apply_amd(blob: &[u8]) -> Result<u32, UcodeError> {
+    use crate::x86_64::msr::wrmsr_or_gp;
     if blob.is_empty() {
         return Err(UcodeError::NoRevisionChange);
     }
     // SAFETY: caller-asserted.
     let before = unsafe { read_revision() };
     let addr = blob.as_ptr() as u64;
-    // SAFETY: CPL=0 + valid AMD patch blob.
-    unsafe {
-        wrmsr(MSR_AMD_PATCH_LOADER, addr);
+    if wrmsr_or_gp(MSR_AMD_PATCH_LOADER, addr).is_err() {
+        return Err(UcodeError::LoaderLocked);
     }
     // SAFETY: same.
     let after = unsafe { read_revision() };
