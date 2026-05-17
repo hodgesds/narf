@@ -106,6 +106,16 @@ fn smoke_xhci_address_device_qemu() -> TestResult {
         Some((p, Some(s))) => (p, s),
         _ => return TestResult::Skip("no connected port / unknown speed"),
     };
+    // Earlier tests (e.g. smoke_xhci_hid_kbd_first_report) may have left
+    // a slot bound to this port. Address Device on a port that's already
+    // assigned to another slot returns TRB Error "port already
+    // assigned", so release any stale binding before exercising the
+    // command. Also clears the hid keyboard registry so a subsequent
+    // hid_kbd run starts from a clean state.
+    crate::hid::__reset_keyboards_for_test();
+    if let Some(Some(stale)) = xhci::with_controller(|c| c.slot_for_port(port)) {
+        let _ = xhci::with_controller(|c| c.disable_slot(stale));
+    }
     let _post = match xhci::with_controller(|c| c.port_reset(port)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("port_reset failed"),

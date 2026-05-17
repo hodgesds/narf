@@ -2517,6 +2517,21 @@ impl Xhci {
         Some((d.port, d.speed, d.max_packet_ep0))
     }
 
+    /// First addressed slot id bound to `port`, or `None` if no slot
+    /// is currently bound. Used by test cleanup to recycle stale port
+    /// bindings left over by prior tests.
+    pub fn slot_for_port(&self, port: u8) -> Option<u8> {
+        let g = self.devices.lock();
+        for (idx, slot) in g.iter().enumerate() {
+            if let Some(d) = slot {
+                if d.port == port {
+                    return Some(idx as u8);
+                }
+            }
+        }
+        None
+    }
+
     /// Fetch the 9-byte Configuration Descriptor header (§9.6.3) for
     /// `cfg_index` (typically 0). To read the full configuration tree
     /// (interface + endpoint descriptors), call again with a buffer
