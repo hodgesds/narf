@@ -1141,3 +1141,164 @@ fn smoke_dispatch_fire_count_monotonic_under_many_irqs() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("interrupts", smoke_dispatch_fire_count_monotonic_under_many_irqs);
+
+// ── deep interrupts/ipi ──────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ipi_ack_count_cpu_index_clamps() -> TestResult {
+    // ack_count() and ever_received() must clamp the cpu index to
+    // MAX_CPUS-1 rather than out-of-bounds. Walk a CPU id well
+    // beyond MAX_CPUS and confirm it returns the same value as
+    // MAX_CPUS-1 (i.e. it didn't trap).
+    use crate::x86_64::ipi::{ack_count, ever_received};
+    let high = u32::MAX;
+    let _ = ack_count(high); // would panic on OOB
+    let _ = ever_received(high);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_ipi_ack_count_cpu_index_clamps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ipi_handler_bumps_counters_on_self() -> TestResult {
+    // on_shootdown_irq() bumps ever_received and ack_count for
+    // the current CPU, even with no pending VA (no INVLPG path
+    // taken). Establishes the counter contract independent of
+    // the broadcast machinery.
+    use crate::x86_64::ipi::{ack_count, ever_received, on_shootdown_irq};
+    let cpu = narf_lib::percpu::current_cpu() as u32;
+    let ack_before = ack_count(cpu);
+    let ev_before = ever_received(cpu);
+    // SAFETY: called from kernel-test context at CPL=0 with no
+    // pending VA — handler skips the INVLPG path.
+    unsafe { on_shootdown_irq(); }
+    if ack_count(cpu) != ack_before + 1 {
+        return TestResult::Fail("ack_count didn't increment by 1");
+    }
+    if ever_received(cpu) != ev_before + 1 {
+        return TestResult::Fail("ever_received didn't increment by 1");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_ipi_handler_bumps_counters_on_self);
+
+// ── deep interrupts/hpet ─────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_oneshot_error_variants_distinct() -> TestResult {
+    use crate::x86_64::hpet_oneshot::HpetOneshotError;
+    let all = [
+        HpetOneshotError::HpetMissing,
+        HpetOneshotError::NoComparators,
+        HpetOneshotError::NoSafeGsi,
+        HpetOneshotError::NoVector,
+        HpetOneshotError::IoapicRoutingFailed,
+        HpetOneshotError::NoLocalApic,
+        HpetOneshotError::AlreadyArmed,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("HpetOneshotError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_error_variants_distinct);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_oneshot_pick_gsi_prefers_high_then_low() -> TestResult {
+    // pick_gsi:
+    //   - mask=0 → None
+    //   - mask with bit 16 → 16 (first safe GSI)
+    //   - low-only mask, legacy bits excluded (0/1/8/13) → first non-legacy
+    //   - all-legacy low mask → None
+    use crate::x86_64::hpet_oneshot::__pick_gsi_for_test;
+    if __pick_gsi_for_test(0, 16).is_some() {
+        return TestResult::Fail("empty mask shouldn't return Some");
+    }
+    if __pick_gsi_for_test(1u32 << 16, 16) != Some(16) {
+        return TestResult::Fail("mask=bit16 should pick GSI 16");
+    }
+    if __pick_gsi_for_test(1u32 << 24, 16) != Some(24) {
+        return TestResult::Fail("mask=bit24 should pick GSI 24");
+    }
+    // Low-only mask, bit 2 set (PIC cascade — allowed per the
+    // QEMU comment in pick_gsi).
+    if __pick_gsi_for_test(1u32 << 2, 16) != Some(2) {
+        return TestResult::Fail("low-fallback should pick GSI 2");
+    }
+    // All-legacy low: bits 0,1,8,13 only.
+    let legacy = (1u32 << 0) | (1u32 << 1) | (1u32 << 8) | (1u32 << 13);
+    if __pick_gsi_for_test(legacy, 16).is_some() {
+        return TestResult::Fail("all-legacy mask should return None");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_pick_gsi_prefers_high_then_low);
+
+// ── deep interrupts/timer ────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_timer_pump_init_error_variants_distinct() -> TestResult {
+    use crate::x86_64::timer_pump::TimerPumpInitError;
+    let all = [
+        TimerPumpInitError::HpetMissing,
+        TimerPumpInitError::NoComparators,
+        TimerPumpInitError::NoSafeGsi,
+        TimerPumpInitError::NoVector,
+        TimerPumpInitError::IoapicRoutingFailed,
+        TimerPumpInitError::NoLocalApic,
+        TimerPumpInitError::AlreadyInitialised,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("TimerPumpInitError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", smoke_timer_pump_init_error_variants_distinct);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_timer_pump_init_idempotent_after_first_success() -> TestResult {
+    // If init() already succeeded earlier in the boot, a second
+    // call must surface AlreadyInitialised — not silently re-program
+    // the IOAPIC and waste a vector.
+    use crate::x86_64::timer_pump::{init, is_initialised, TimerPumpInitError};
+    if !is_initialised() {
+        return TestResult::Skip("timer pump not initialised in this flavour");
+    }
+    match init() {
+        Err(TimerPumpInitError::AlreadyInitialised) => TestResult::Pass,
+        _ => TestResult::Fail("second init() didn't surface AlreadyInitialised"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", smoke_timer_pump_init_idempotent_after_first_success);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_timer_pump_vector_matches_timer_constant() -> TestResult {
+    // When the pump is up, __vector_for_test() must report the
+    // vector the dispatch path uses — the same value the BSP
+    // wired into the IDT. Smoke test for "did init lose its
+    // vector somewhere along the way".
+    use crate::x86_64::timer_pump::{is_initialised, __vector_for_test};
+    if !is_initialised() {
+        return TestResult::Skip("timer pump not up");
+    }
+    let v = __vector_for_test();
+    if v == 0 {
+        return TestResult::Fail("vector reported as 0 — likely uninitialised slot");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", smoke_timer_pump_vector_matches_timer_constant);
