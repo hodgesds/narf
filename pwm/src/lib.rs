@@ -158,4 +158,106 @@ mod tests {
         }
     }
     kernel_test_in!("pwm", smoke_pwm_async);
+
+    fn smoke_pwm_polarity_variants_distinct() -> TestResult {
+        if Polarity::Normal == Polarity::Inversed {
+            return TestResult::Fail("Polarity variants collapsed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pwm", smoke_pwm_polarity_variants_distinct);
+
+    fn smoke_pwm_error_variants_distinct() -> TestResult {
+        let all = [
+            PwmError::InvalidChannel,
+            PwmError::InvalidConfig,
+            PwmError::HardwareError,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("PwmError variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pwm", smoke_pwm_error_variants_distinct);
+
+    fn smoke_pwm_config_round_trip() -> TestResult {
+        let c = PwmConfig {
+            frequency_hz: 100_000,
+            duty_cycle_ns: 5_000,
+            polarity: Polarity::Inversed,
+        };
+        if c.frequency_hz != 100_000 {
+            return TestResult::Fail("frequency_hz round-trip");
+        }
+        if c.duty_cycle_ns != 5_000 {
+            return TestResult::Fail("duty_cycle_ns round-trip");
+        }
+        if c.polarity != Polarity::Inversed {
+            return TestResult::Fail("polarity round-trip");
+        }
+        if c != c.clone() {
+            return TestResult::Fail("PwmConfig Clone broken");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pwm", smoke_pwm_config_round_trip);
+
+    fn smoke_pwm_mock_rejects_invalid_channel() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let pwm = Arc::new(MockPwm {
+            state: IrqSafeSpinLock::new(Vec::new()),
+            channels: 2,
+        });
+        let outcome = Arc::new(core::sync::atomic::AtomicU8::new(0));
+        let p = pwm.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            let cfg = PwmConfig {
+                frequency_hz: 1000,
+                duty_cycle_ns: 1000,
+                polarity: Polarity::Normal,
+            };
+            // Valid channel 0 → Ok.
+            if p.set_config(0, &cfg).await.is_ok() {
+                o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+            // Channel == channel_count (out of range, valid range is 0..count).
+            match p.set_config(2, &cfg).await {
+                Err(PwmError::InvalidChannel) => {
+                    o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            // Channel 100 → InvalidChannel.
+            match p.enable(100).await {
+                Err(PwmError::InvalidChannel) => {
+                    o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(core::sync::atomic::Ordering::SeqCst) == 3 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("PWM channel-bounds rejection not all 3 paths")
+        }
+    }
+    kernel_test_in!("pwm", smoke_pwm_mock_rejects_invalid_channel);
+
+    fn smoke_pwm_channel_count_reflects_construction() -> TestResult {
+        let pwm = MockPwm {
+            state: IrqSafeSpinLock::new(Vec::new()),
+            channels: 8,
+        };
+        if pwm.channel_count() != 8 {
+            return TestResult::Fail("channel_count doesn't reflect construction");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pwm", smoke_pwm_channel_count_reflects_construction);
 }
