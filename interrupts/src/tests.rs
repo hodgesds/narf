@@ -5,6 +5,8 @@
 //! `narf-verification`'s mega-lib so each subsystem owns its own
 //! smokes without cycling on the higher-level harness.
 
+extern crate alloc;
+
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[cfg(target_arch = "x86_64")]
@@ -832,3 +834,310 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
     }
 }
 kernel_test_in!("interrupts", smoke_wait_for_irq_drop_clears_waker);
+
+// ── deep interrupts coverage ───────────────────────────────────────
+//
+// Existing surface covers headline dispatch + alloc + wait edges.
+// New tests close the remaining invariants: handler replacement,
+// in-IRQ context during dispatch, fully-drained allocator, mixed
+// fragmentation + alloc_block, wait_for_irq_until timeout/success,
+// per-vector constants.
+
+const SCRATCH_VEC_REPLACE: u8 = 117;
+const SCRATCH_VEC_INIRQ: u8 = 118;
+const SCRATCH_VEC_WAIT_RETRY: u8 = 119;
+const SCRATCH_VEC_TIMEOUT_A: u8 = 121;
+const SCRATCH_VEC_TIMEOUT_B: u8 = 122;
+
+fn smoke_dispatch_install_replaces_prior_handler() -> TestResult {
+    // install(v, h1) then install(v, h2) — only h2 fires on the
+    // next on_irq. There's one handler slot per vector.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static A: AtomicU32 = AtomicU32::new(0);
+    static B: AtomicU32 = AtomicU32::new(0);
+    A.store(0, Ordering::Relaxed);
+    B.store(0, Ordering::Relaxed);
+    fn h_a() { A.fetch_add(1, Ordering::Relaxed); }
+    fn h_b() { B.fetch_add(1, Ordering::Relaxed); }
+
+    crate::dispatch::install(SCRATCH_VEC_REPLACE, h_a);
+    crate::dispatch::install(SCRATCH_VEC_REPLACE, h_b);
+    crate::on_irq(SCRATCH_VEC_REPLACE);
+    crate::dispatch::clear_handler(SCRATCH_VEC_REPLACE);
+
+    if A.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("first handler fired after being replaced");
+    }
+    if B.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("replacement handler didn't run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_dispatch_install_replaces_prior_handler);
+
+fn smoke_dispatch_in_irq_true_inside_on_irq() -> TestResult {
+    // narf_lib::context::in_irq() observes true inside the
+    // synchronous handler and false again after on_irq returns.
+    // This is the soft-IRQ counterpart to the existing
+    // smoke_dispatch_in_irq_observed_inside_handler (which uses
+    // `int <vec>`).
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static INSIDE: AtomicU8 = AtomicU8::new(0);
+    INSIDE.store(0, Ordering::Relaxed);
+    fn h() {
+        INSIDE.store(
+            if narf_lib::context::in_irq() { 1 } else { 0 },
+            Ordering::Release,
+        );
+    }
+    crate::dispatch::install(SCRATCH_VEC_INIRQ, h);
+    crate::on_irq(SCRATCH_VEC_INIRQ);
+    crate::dispatch::clear_handler(SCRATCH_VEC_INIRQ);
+
+    if INSIDE.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("handler didn't observe in_irq == true");
+    }
+    if narf_lib::context::in_irq() {
+        return TestResult::Fail("in_irq still true after on_irq returned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_dispatch_in_irq_true_inside_on_irq);
+
+fn smoke_dispatch_num_vectors_constant() -> TestResult {
+    // NUM_VECTORS pins at 256 — the IDT-vector budget the table is
+    // sized to. Bumping it requires re-sizing SLOTS / HANDLERS.
+    if crate::dispatch::NUM_VECTORS != 256 {
+        return TestResult::Fail("NUM_VECTORS drifted from 256");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_dispatch_num_vectors_constant);
+
+fn smoke_interrupts_well_known_vector_constants() -> TestResult {
+    // The kernel's documented vector assignments. Drift in any of
+    // these breaks driver assumptions about which vectors are
+    // reserved.
+    if crate::VECTOR_TIMER != 32 {
+        return TestResult::Fail("VECTOR_TIMER drifted from 32");
+    }
+    if crate::VECTOR_TLB_SHOOTDOWN != 0xF0 {
+        return TestResult::Fail("VECTOR_TLB_SHOOTDOWN drifted from 0xF0");
+    }
+    if crate::VECTOR_APIC_ERROR != 0xFE {
+        return TestResult::Fail("VECTOR_APIC_ERROR drifted from 0xFE");
+    }
+    if crate::VECTOR_SPURIOUS != 0xFF {
+        return TestResult::Fail("VECTOR_SPURIOUS drifted from 0xFF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_interrupts_well_known_vector_constants);
+
+fn smoke_vector_alloc_block_of_one_equivalent_to_alloc() -> TestResult {
+    // alloc_block(1) is the same shape as alloc — both reserve a
+    // single vector. Confirms the n=1 boundary case of the block
+    // walker.
+    use crate::vector::{alloc_block, free};
+    let v = match alloc_block(1) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_block(1) failed"),
+    };
+    free(v).expect("cleanup");
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_of_one_equivalent_to_alloc);
+
+fn smoke_vector_alloc_block_rejects_too_large() -> TestResult {
+    // alloc_block(N+1) where N is the allocator's range must return
+    // Exhausted. We can't compute N exactly without internals, but
+    // 200 is well beyond the realistic alloc window of (ALLOC_MAX -
+    // ALLOC_BASE + 1) = 240-48+1 = 193 on x86_64 (and 241 on
+    // aarch64, both < 200 once existing allocations are accounted
+    // for if any).
+    use crate::vector::{alloc_block, VectorError};
+    match alloc_block(250) {
+        Err(VectorError::Exhausted) => TestResult::Pass,
+        _ => TestResult::Fail("alloc_block(250) didn't surface Exhausted"),
+    }
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_rejects_too_large);
+
+fn smoke_vector_alloc_block_after_fragmentation() -> TestResult {
+    // alloc N individually, free every other one, alloc_block(3)
+    // must find a contiguous run in the gaps OR past the
+    // fragmentation. Confirms the scan tries every starting base
+    // until it finds enough contiguous bits.
+    use crate::vector::{alloc, alloc_block, free};
+    let mut held = alloc::vec::Vec::new();
+    for _ in 0..6 {
+        held.push(alloc().expect("alloc"));
+    }
+    // Free vectors at indices 0, 2, 4 — leaves a fragmented
+    // pattern below where contiguous runs of length > 1 might
+    // not exist among the freed slots.
+    free(held[0]).expect("free");
+    free(held[2]).expect("free");
+    free(held[4]).expect("free");
+
+    // alloc_block(3) must still succeed — the bitmap is much bigger
+    // than the 6 allocations we made.
+    let base = match alloc_block(3) {
+        Ok(b) => b,
+        Err(_) => {
+            for v in [held[1], held[3], held[5]] {
+                let _ = free(v);
+            }
+            return TestResult::Fail("alloc_block(3) failed despite plenty of free slots");
+        }
+    };
+    // Cleanup.
+    for i in 0..3 {
+        free(base + i).expect("cleanup block");
+    }
+    for v in [held[1], held[3], held[5]] {
+        free(v).expect("cleanup individual");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_after_fragmentation);
+
+fn smoke_wait_for_irq_until_succeeds_before_deadline() -> TestResult {
+    // wait_for_irq_until with a far-future deadline resolves to
+    // Ok(fire_count) when the IRQ lands first.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_wake(_: *const ()) {}
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&w);
+
+    let deadline = narf_time::Deadline::after_ns(60_000_000_000);
+    let mut fut = crate::wait_for_irq_until(SCRATCH_VEC_TIMEOUT_A, deadline);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    if !matches!(pinned.poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("first poll should be Pending");
+    }
+    crate::on_irq(SCRATCH_VEC_TIMEOUT_A);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut cx) {
+        Poll::Ready(Ok(_)) => TestResult::Pass,
+        Poll::Ready(Err(_)) => TestResult::Fail("IRQ landed before deadline but got Elapsed"),
+        Poll::Pending => TestResult::Fail("post-IRQ poll still Pending"),
+    }
+}
+kernel_test_in!("interrupts", smoke_wait_for_irq_until_succeeds_before_deadline);
+
+fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
+    // Already-expired deadline → first poll returns Err(Elapsed)
+    // without registering a waker (timeout futures short-circuit
+    // when the deadline passed before construction).
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_wake(_: *const ()) {}
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&w);
+
+    // Deadline already in the past (cycles_since_boot - 1).
+    let now = narf_time::Instant::now();
+    let _ = now;
+    let deadline = narf_time::Deadline::after_ns(0); // immediate
+    let mut fut = crate::wait_for_irq_until(SCRATCH_VEC_TIMEOUT_B, deadline);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    // The timeout future may or may not return Elapsed on the first
+    // poll depending on how `after_ns(0)` rounds; loop a few polls
+    // to give it a chance, but bail on too many cycles.
+    let start = narf_time::Instant::now();
+    let mut result = pinned.poll(&mut cx);
+    while matches!(result, Poll::Pending) {
+        if narf_time::Instant::now().cycles_since(start) > 500_000_000 {
+            return TestResult::Fail("timeout future never resolved on past-deadline");
+        }
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        result = pinned.poll(&mut cx);
+    }
+    match result {
+        Poll::Ready(Err(_)) => TestResult::Pass,
+        Poll::Ready(Ok(_)) => TestResult::Fail("past-deadline returned Ok instead of Elapsed"),
+        Poll::Pending => TestResult::Fail("never resolved (loop bailed)"),
+    }
+}
+kernel_test_in!("interrupts", smoke_wait_for_irq_until_times_out_when_no_irq);
+
+fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
+    // Two sequential wait_for_irq on the same vector. After the
+    // first one resolves, a fresh wait_for_irq for the same vector
+    // must NOT resolve until a NEW IRQ arrives (the second future
+    // snapshots its own baseline).
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_wake(_: *const ()) {}
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&w);
+
+    // First wait_for_irq.
+    let mut fut1 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut1) };
+    if !matches!(pinned.poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("first wait first poll should be Pending");
+    }
+    crate::on_irq(SCRATCH_VEC_WAIT_RETRY);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut1) };
+    if !matches!(pinned.poll(&mut cx), Poll::Ready(_)) {
+        return TestResult::Fail("first wait didn't resolve after IRQ");
+    }
+    drop(fut1);
+
+    // Second wait_for_irq — snapshots a NEW baseline after the
+    // first IRQ landed, so first poll is Pending.
+    let mut fut2 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
+    if !matches!(pinned.poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("second wait first poll should be Pending — baseline snapshot leaked first IRQ");
+    }
+    crate::on_irq(SCRATCH_VEC_WAIT_RETRY);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
+    if !matches!(pinned.poll(&mut cx), Poll::Ready(_)) {
+        return TestResult::Fail("second wait didn't resolve after second IRQ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_wait_for_irq_can_be_used_sequentially);
+
+fn smoke_dispatch_fire_count_monotonic_under_many_irqs() -> TestResult {
+    // 1000 on_irq calls bump fire_count by exactly 1000. Catches
+    // an overflow in a future narrower counter or a missed update.
+    const N: u64 = 1000;
+    let before = crate::fire_count(SCRATCH_VEC_A);
+    for _ in 0..N {
+        crate::on_irq(SCRATCH_VEC_A);
+    }
+    let after = crate::fire_count(SCRATCH_VEC_A);
+    if after - before != N {
+        let msg = alloc::format!(
+            "fire_count delta {} != {} after {} on_irq calls",
+            after - before, N, N
+        );
+        let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
+        return TestResult::Fail(s);
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_dispatch_fire_count_monotonic_under_many_irqs);
