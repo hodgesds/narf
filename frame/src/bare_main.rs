@@ -2183,6 +2183,44 @@ fn run_async_demo() -> ! {
     #[cfg(feature = "boot-init")]
     boot_userspace_init();
 
+    // Periodic serial heartbeat — surfaces input-pipeline counters
+    // (ASCII_PUSH / ASCII_POP / KEY_PUSH) every ~2s so a headless
+    // serial capture shows whether keystrokes are reaching the
+    // shell. Spawned BEFORE run_until_empty so it lives in the
+    // queue regardless of the headless-vs-interactive branch
+    // below (run_until_empty doesn't return when there are
+    // boot-init user tasks alive, so a post-run_until_empty
+    // spawn would never reach the executor).
+    {
+        struct Heartbeat;
+        impl core::future::Future for Heartbeat {
+            type Output = ();
+            fn poll(
+                self: core::pin::Pin<&mut Self>,
+                cx: &mut core::task::Context<'_>,
+            ) -> core::task::Poll<()> {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static LAST_TSC: AtomicU64 = AtomicU64::new(0);
+                const PERIOD_CYCLES: u64 = 5_000_000_000;
+                let now = narf_time::now_cycles();
+                let last = LAST_TSC.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= PERIOD_CYCLES {
+                    LAST_TSC.store(now, Ordering::Relaxed);
+                    let ascii_in = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
+                    let ascii_out = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
+                    let key_in = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
+                    let _ = writeln!(
+                        console::Writer,
+                        "  heartbeat: ascii in={ascii_in} out={ascii_out} key={key_in}",
+                    );
+                }
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }
+        let _ = narf_scheduler::spawn(Heartbeat);
+    }
+
     // Spawn the cursor pump *before* run_until_empty so it's in the
     // queue when the executor starts. With boot-init the user task
     // futures (init / shell) loop forever, so run_until_empty never
