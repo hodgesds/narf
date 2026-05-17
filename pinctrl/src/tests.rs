@@ -144,3 +144,161 @@ fn smoke_pinctrl_qcom_pmic_pushpull_writes_sequence() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("pinctrl/qcom-pmic", smoke_pinctrl_qcom_pmic_pushpull_writes_sequence);
+
+// ── deep pinctrl/dwapb coverage ───────────────────────────────────
+
+fn smoke_pinctrl_dwapb_bank_offset_all_banks() -> TestResult {
+    use crate::dwapb::{bank_offset, regs};
+    let cases = [
+        (0u8, regs::SWPORTA_DR, regs::SWPORTA_DDR, regs::SWPORTA_CTL),
+        (1, regs::SWPORTB_DR, regs::SWPORTB_DDR, regs::SWPORTB_CTL),
+        (2, regs::SWPORTC_DR, regs::SWPORTC_DDR, regs::SWPORTC_CTL),
+        (3, regs::SWPORTD_DR, regs::SWPORTD_DDR, regs::SWPORTD_CTL),
+    ];
+    for &(bank, dr, ddr, ctl) in &cases {
+        match bank_offset(bank) {
+            Some((d, dd, c)) if d == dr && dd == ddr && c == ctl => {}
+            _ => return TestResult::Fail("bank_offset returned wrong tuple"),
+        }
+    }
+    if bank_offset(4).is_some() {
+        return TestResult::Fail("bank_offset(4) accepted");
+    }
+    if bank_offset(255).is_some() {
+        return TestResult::Fail("bank_offset(255) accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_bank_offset_all_banks);
+
+fn smoke_pinctrl_dwapb_make_set_output() -> TestResult {
+    use crate::dwapb::make_set_output;
+    let (ddr, dr) = make_set_output(0, 0xF, 5, true);
+    if ddr != (1u32 << 5) {
+        return TestResult::Fail("DDR didn't set the pin bit");
+    }
+    if dr != (0xF | (1u32 << 5)) {
+        return TestResult::Fail("DR didn't OR-in the high value");
+    }
+    let (_, dr2) = make_set_output(0, 0xFF, 5, false);
+    if dr2 != (0xFFu32 & !(1u32 << 5)) {
+        return TestResult::Fail("DR low value didn't clear bit");
+    }
+    // pin & 0x1F masks above 32: pin 37 → bit 5.
+    let (ddr3, _) = make_set_output(0, 0, 37, true);
+    if ddr3 != (1u32 << 5) {
+        return TestResult::Fail("pin mod-32 mask not applied");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_make_set_output);
+
+fn smoke_pinctrl_dwapb_make_set_input_clears_ddr_bit() -> TestResult {
+    use crate::dwapb::make_set_input;
+    let ddr = make_set_input(0xFFFF_FFFF, 7);
+    if ddr != (0xFFFF_FFFFu32 & !(1u32 << 7)) {
+        return TestResult::Fail("set_input didn't clear pin's DDR bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_make_set_input_clears_ddr_bit);
+
+fn smoke_pinctrl_dwapb_pin_level_reads_ext_port_bit() -> TestResult {
+    use crate::dwapb::pin_level;
+    if !pin_level(1u32 << 11, 11) {
+        return TestResult::Fail("pin_level didn't see the set bit");
+    }
+    if pin_level(0, 11) {
+        return TestResult::Fail("pin_level read true on empty port");
+    }
+    if !pin_level(1u32 << 11, 43) {
+        return TestResult::Fail("pin_level didn't apply mod-32 mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_pin_level_reads_ext_port_bit);
+
+fn smoke_pinctrl_dwapb_interrupt_config_table() -> TestResult {
+    use crate::dwapb::make_interrupt_config;
+    let mask = 1u32 << 4;
+    let (en, lvl, pol) = make_interrupt_config(4, true, true);
+    if en != mask || lvl != mask || pol != mask {
+        return TestResult::Fail("edge+rising config wrong");
+    }
+    let (en, lvl, pol) = make_interrupt_config(4, false, false);
+    if en != mask || lvl != 0 || pol != 0 {
+        return TestResult::Fail("level+low config wrong");
+    }
+    let (_, lvl, pol) = make_interrupt_config(4, false, true);
+    if lvl != 0 || pol != mask {
+        return TestResult::Fail("level+high config wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_interrupt_config_table);
+
+// ── deep pinctrl/pinmux coverage ──────────────────────────────────
+
+fn smoke_pinctrl_pinmux_enum_variants_distinct() -> TestResult {
+    use crate::pinmux::{PinDirection, PinDriveStrength, PinPull};
+    let dirs = [PinDirection::Input, PinDirection::Output];
+    for (i, a) in dirs.iter().enumerate() {
+        for (j, b) in dirs.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("PinDirection variants collapsed");
+            }
+        }
+    }
+    let pulls = [PinPull::None, PinPull::Down, PinPull::Up, PinPull::Keeper];
+    for (i, a) in pulls.iter().enumerate() {
+        for (j, b) in pulls.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("PinPull variants collapsed");
+            }
+        }
+    }
+    let drives = [
+        PinDriveStrength::Strength2mA,
+        PinDriveStrength::Strength4mA,
+        PinDriveStrength::Strength6mA,
+        PinDriveStrength::Strength8mA,
+        PinDriveStrength::Strength10mA,
+        PinDriveStrength::Strength12mA,
+        PinDriveStrength::Strength14mA,
+        PinDriveStrength::Strength16mA,
+    ];
+    for (i, a) in drives.iter().enumerate() {
+        for (j, b) in drives.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("PinDriveStrength variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_enum_variants_distinct);
+
+fn smoke_pinctrl_pinmux_default_config_is_safe() -> TestResult {
+    use crate::pinmux::{PinConfig, PinDirection, PinDriveStrength, PinPull};
+    let c: PinConfig = PinConfig::default();
+    // Default must be input + no pull + lowest drive + no special
+    // modifiers; matches the "safe failsafe" power-on shape every
+    // pin controller resets to.
+    if c.direction != PinDirection::Input {
+        return TestResult::Fail("default direction != Input");
+    }
+    if c.pull.0 != PinPull::None {
+        return TestResult::Fail("default pull != None");
+    }
+    if c.drive.0 != PinDriveStrength::Strength2mA {
+        return TestResult::Fail("default drive != 2mA");
+    }
+    if c.output_enabled || c.open_drain || c.schmitt {
+        return TestResult::Fail("default config has unsafe modifier");
+    }
+    if c.function != 0 {
+        return TestResult::Fail("default function != 0 (GPIO)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_default_config_is_safe);
