@@ -2071,3 +2071,178 @@ fn smoke_acpi_fadt_reset_register_present() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("acpi", smoke_acpi_fadt_reset_register_present);
+
+// ── deep acpi core coverage ───────────────────────────────────────
+//
+// The 63 per-table synthetic-decode smokes each exercise one
+// table's wire layout. These cover the shared invariants every
+// table parser depends on.
+
+fn smoke_acpi_sdt_header_size_pin() -> TestResult {
+    // Drift in size_of::<SdtHeader>() would silently misalign every
+    // table body decode (header sits at offset 0 of every table).
+    if core::mem::size_of::<crate::SdtHeader>() != 36 {
+        return TestResult::Fail("SdtHeader size drifted from 36");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_sdt_header_size_pin);
+
+fn smoke_acpi_sig_matches_table() -> TestResult {
+    use crate::{sig_matches, SdtHeader};
+    let mut h = SdtHeader {
+        signature: *b"MADT",
+        length: 0,
+        revision: 0,
+        checksum: 0,
+        oem_id: [0; 6],
+        oem_table_id: [0; 8],
+        oem_revision: 0,
+        creator_id: 0,
+        creator_revision: 0,
+    };
+    if !sig_matches(&h, b"MADT") {
+        return TestResult::Fail("MADT sig didn't match itself");
+    }
+    if sig_matches(&h, b"SRAT") {
+        return TestResult::Fail("MADT sig matched SRAT");
+    }
+    h.signature = *b"SRAT";
+    if !sig_matches(&h, b"SRAT") {
+        return TestResult::Fail("SRAT sig didn't match after assignment");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_sig_matches_table);
+
+fn smoke_acpi_error_variants_distinct() -> TestResult {
+    use crate::AcpiError;
+    let all = [
+        AcpiError::BadRsdpSignature,
+        AcpiError::BadRsdpChecksum,
+        AcpiError::NoXsdt,
+        AcpiError::BadXsdtSignature,
+        AcpiError::NoSrat,
+        AcpiError::BadTableChecksum,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("AcpiError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_error_variants_distinct);
+
+fn smoke_acpi_hmat_kind_distinct() -> TestResult {
+    use crate::HmatLatBwKind;
+    let all = [
+        HmatLatBwKind::AccessLatency,
+        HmatLatBwKind::ReadLatency,
+        HmatLatBwKind::WriteLatency,
+        HmatLatBwKind::AccessBandwidth,
+        HmatLatBwKind::ReadBandwidth,
+        HmatLatBwKind::WriteBandwidth,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("HmatLatBwKind variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_hmat_kind_distinct);
+
+fn smoke_acpi_unknown_state_clean_after_reset() -> TestResult {
+    // __reset_for_test must take the global ACPI state back to its
+    // pre-parse shape.
+    crate::__reset_for_test();
+    if crate::is_topology_known() {
+        return TestResult::Fail("topology_known true after reset");
+    }
+    if crate::is_madt_known() {
+        return TestResult::Fail("madt_known true after reset");
+    }
+    if crate::is_hmat_known() {
+        return TestResult::Fail("hmat_known true after reset");
+    }
+    if crate::is_pmtt_known() {
+        return TestResult::Fail("pmtt_known true after reset");
+    }
+    if crate::node_count() != 0 {
+        return TestResult::Fail("node_count != 0 after reset");
+    }
+    if crate::cpu_count_from_srat() != 0 {
+        return TestResult::Fail("cpu_count_from_srat != 0 after reset");
+    }
+    if crate::cpu_count_from_madt() != 0 {
+        return TestResult::Fail("cpu_count_from_madt != 0 after reset");
+    }
+    if crate::cpu_node(0).is_some() {
+        return TestResult::Fail("cpu_node(0) returned Some after reset");
+    }
+    if crate::memory_node(0).is_some() {
+        return TestResult::Fail("memory_node(0) returned Some after reset");
+    }
+    if crate::lapic_base().is_some() {
+        return TestResult::Fail("lapic_base returned Some after reset");
+    }
+    if crate::mcfg_ecam_base().is_some() {
+        return TestResult::Fail("mcfg_ecam_base returned Some after reset");
+    }
+    if crate::dsdt_phys().is_some() {
+        return TestResult::Fail("dsdt_phys returned Some after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_unknown_state_clean_after_reset);
+
+fn smoke_acpi_copy_memory_ranges_empty_after_reset() -> TestResult {
+    use crate::MemRange;
+    crate::__reset_for_test();
+    let mut buf = [MemRange { base: 0, length: 0, node: 0, enabled: false }; 8];
+    let n = crate::copy_memory_ranges(&mut buf);
+    if n != 0 {
+        return TestResult::Fail("copy_memory_ranges returned items after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_copy_memory_ranges_empty_after_reset);
+
+fn smoke_acpi_hmat_value_returns_none_when_unknown() -> TestResult {
+    use crate::HmatLatBwKind;
+    crate::__reset_for_test();
+    if crate::hmat_value(HmatLatBwKind::AccessLatency, 0, 0, 0).is_some() {
+        return TestResult::Fail("hmat_value returned Some after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_hmat_value_returns_none_when_unknown);
+
+fn smoke_acpi_pmtt_counts_zero_after_reset() -> TestResult {
+    crate::__reset_for_test();
+    let (sockets, dimms, ctrls) = crate::pmtt_counts();
+    if sockets != 0 || dimms != 0 || ctrls != 0 {
+        return TestResult::Fail("pmtt_counts didn't return zeros after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_pmtt_counts_zero_after_reset);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_gpe_blocks_none_after_reset() -> TestResult {
+    crate::__reset_for_test();
+    if crate::gpe0_block().is_some() {
+        return TestResult::Fail("gpe0_block returned Some after reset");
+    }
+    if crate::gpe1_block().is_some() {
+        return TestResult::Fail("gpe1_block returned Some after reset");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("acpi", smoke_acpi_gpe_blocks_none_after_reset);
