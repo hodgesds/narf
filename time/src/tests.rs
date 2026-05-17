@@ -797,3 +797,114 @@ fn smoke_wheel_cancel_after_fire_is_silent() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time/wheel", smoke_wheel_cancel_after_fire_is_silent);
+
+// ── deep time::Instant + time::Deadline coverage ──────────────────
+
+fn smoke_time_instant_now_monotonic_advances() -> TestResult {
+    use crate::Instant;
+    let a = Instant::now();
+    crate::busy_wait_cycles(1_000);
+    let b = Instant::now();
+    if b.as_cycles() <= a.as_cycles() {
+        return TestResult::Fail("Instant::now didn't advance after busy_wait");
+    }
+    if b.cycles_since(a) == 0 {
+        return TestResult::Fail("cycles_since returned 0 after advance");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_instant_now_monotonic_advances);
+
+fn smoke_time_instant_plus_cycles_saturates() -> TestResult {
+    use crate::Instant;
+    // A high-cycle Instant + a huge delta should saturate at MAX,
+    // not wrap.
+    let high = Instant::now().plus_cycles(u64::MAX - 100);
+    let saturated = high.plus_cycles(u64::MAX);
+    if saturated.as_cycles() != u64::MAX {
+        return TestResult::Fail("plus_cycles didn't saturate at MAX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_instant_plus_cycles_saturates);
+
+fn smoke_time_instant_cycles_since_clamps_negative() -> TestResult {
+    use crate::Instant;
+    let now = Instant::now();
+    let later = now.plus_cycles(1000);
+    // Calling `cycles_since` with a future Instant should clamp to 0
+    // (saturating sub), not panic.
+    if now.cycles_since(later) != 0 {
+        return TestResult::Fail("cycles_since didn't clamp negative to 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_instant_cycles_since_clamps_negative);
+
+fn smoke_time_deadline_at_round_trip() -> TestResult {
+    use crate::{Deadline, Instant};
+    let i = Instant::now().plus_cycles(1_000_000);
+    let d = Deadline::at(i);
+    if d.as_instant().as_cycles() != i.as_cycles() {
+        return TestResult::Fail("Deadline::at didn't round-trip the Instant");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_deadline_at_round_trip);
+
+fn smoke_time_deadline_after_cycles_expires_in_future() -> TestResult {
+    use crate::Deadline;
+    let d = Deadline::after_cycles(1_000_000_000);
+    if d.expired() {
+        return TestResult::Fail("future deadline reported expired");
+    }
+    if d.remaining_cycles() == 0 {
+        return TestResult::Fail("future deadline has 0 remaining cycles");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_deadline_after_cycles_expires_in_future);
+
+fn smoke_time_deadline_zero_is_immediately_expired() -> TestResult {
+    use crate::Deadline;
+    let d = Deadline::after_cycles(0);
+    if !d.expired() {
+        return TestResult::Fail("after_cycles(0) didn't expire immediately");
+    }
+    if d.remaining_cycles() != 0 {
+        return TestResult::Fail("expired deadline reported non-zero remaining");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_deadline_zero_is_immediately_expired);
+
+fn smoke_time_deadline_after_units_consistent() -> TestResult {
+    use crate::Deadline;
+    // after_ns(N) == after_cycles(N * cycles_per_ns); after_us(N)
+    // == after_ns(N*1000); after_ms(N) == after_ns(N*1000_000).
+    // We only assert the ordering rather than exact equality (the
+    // calls return different Instants because Instant::now is
+    // sampled twice).
+    let d_short = Deadline::after_us(1);
+    let d_med = Deadline::after_us(100);
+    let d_long = Deadline::after_ms(100);
+    if d_short.as_instant() >= d_med.as_instant() {
+        return TestResult::Fail("after_us(1) >= after_us(100)");
+    }
+    if d_med.as_instant() >= d_long.as_instant() {
+        return TestResult::Fail("after_us(100) >= after_ms(100)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_deadline_after_units_consistent);
+
+fn smoke_time_elapsed_is_distinct_unit_struct() -> TestResult {
+    use crate::Elapsed;
+    let a = Elapsed;
+    let b = Elapsed;
+    if a != b {
+        return TestResult::Fail("two Elapsed values compared unequal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_time_elapsed_is_distinct_unit_struct);
