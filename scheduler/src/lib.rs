@@ -30,8 +30,18 @@
 //! Off by default so the BSP-only test harness sees stable single-
 //! CPU FIFO ordering.
 //!
+//! Stage 5 lands the spec's post-Stage-4 features in three waves:
+//! direct time-slice donation (this commit), PKRS save/restore at
+//! yield points, and fair-share enforcement + NUMA-aware steal.
+//!
+//! Donation fast path (spec §3.3): `donate_to(target, &Cap<Task,
+//! Invoke>)` deducts the donor's remaining burst quantum from its
+//! `BudgetAccount`, credits it to the target, and head-enqueues
+//! the target so the next dispatch services it first. Revoking
+//! the donation cap before the donee polls refunds both sides
+//! atomically at the donee's next pop (`settle_donation`).
+//!
 //! Non-goals still (later waves):
-//! - Direct context transfer / time-slice donation fast path.
 //! - PKRS save/restore at yield points.
 //! - Fair-share enforcement (today's budget accounting is diagnostic).
 //! - NUMA-aware steal targeting.
@@ -224,6 +234,31 @@ struct TaskSlot {
     /// the AS with its process peers. Held as `Arc` so tasks within
     /// one process share one AS without copying.
     addr_space: Option<Arc<AddressSpace>>,
+    /// Pending time-slice donation (§3.3). Set by `donate_to` so the
+    /// next pop either consumes the credit (cap live) or refunds
+    /// the donor (cap revoked). `None` outside an active donation.
+    donation: Option<Donation>,
+}
+
+/// One in-flight time-slice donation handed to a task by
+/// `donate_to`. The donee carries the claim until its next
+/// dispatch round; `settle_donation` then either keeps the credit
+/// (cap still live) or reverts both sides (cap revoked → refund
+/// donor + revert donee's credit). Stored on the donee so the
+/// executor resolves revocation O(1) at pop time.
+struct Donation {
+    donor: TaskId,
+    cycles: u64,
+    cap: Cap<Task, Invoke>,
+}
+
+impl core::fmt::Debug for Donation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Donation")
+            .field("donor", &self.donor)
+            .field("cycles", &self.cycles)
+            .finish_non_exhaustive()
+    }
 }
 
 impl core::fmt::Debug for TaskSlot {
@@ -414,6 +449,7 @@ where
         spec,
         addr_space: None,
         account: BudgetAccount::new(),
+        donation: None,
     };
     let cpu = target_cpu(&spec);
     enqueue_on(cpu, slot);
@@ -448,6 +484,7 @@ where
         spec,
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),
+        donation: None,
     };
     let cpu = target_cpu(&spec);
     enqueue_on(cpu, slot);
@@ -535,16 +572,117 @@ pub enum DonateError {
     NotReady,
 }
 
-/// Direct time-slice donation: cap-gated reorder that moves `target`
-/// to the head of the ready queue so the next dispatch round services
-/// it ahead of its queue position. Matches the spec's §3.3 donation
-/// surface for the single-CPU executor. The SMP fast-path (save caller
-/// state, restore callee's domain, branch directly into the callee)
-/// is Stage-4 work — this Stage-3 form is correct but not performant.
+/// Pending donor-side debit table for donations whose donor is
+/// off-queue (currently being polled). Each entry is `(donor,
+/// cycles)`; the executor drains matching entries when the donor's
+/// slot is re-enqueued and applies them via `add_debit`.
+///
+/// 16 slots covers the realistic in-flight donation graph; an
+/// overflow panics so the misuse surfaces at the call site.
+const MAX_PENDING_DONATIONS: usize = 16;
+static PENDING_DONOR_DEBITS: IrqSafeSpinLock<[(TaskId, u64); MAX_PENDING_DONATIONS]> =
+    IrqSafeSpinLock::new([(TaskId::NONE, 0); MAX_PENDING_DONATIONS]);
+
+fn stage_donor_debit(donor: TaskId, cycles: u64) {
+    let mut t = PENDING_DONOR_DEBITS.lock();
+    for slot in t.iter_mut() {
+        if slot.0 == TaskId::NONE {
+            *slot = (donor, cycles);
+            return;
+        }
+    }
+    panic!("donate_to: pending-debit table full");
+}
+
+fn drain_donor_debit(donor: TaskId) -> u64 {
+    if donor == TaskId::NONE {
+        return 0;
+    }
+    let mut t = PENDING_DONOR_DEBITS.lock();
+    let mut total = 0u64;
+    for slot in t.iter_mut() {
+        if slot.0 == donor {
+            total = total.saturating_add(slot.1);
+            *slot = (TaskId::NONE, 0);
+        }
+    }
+    total
+}
+
+fn cancel_donor_debit(donor: TaskId, cycles: u64) {
+    let mut t = PENDING_DONOR_DEBITS.lock();
+    for slot in t.iter_mut() {
+        if slot.0 == donor {
+            let new = slot.1.saturating_sub(cycles);
+            if new == 0 {
+                *slot = (TaskId::NONE, 0);
+            } else {
+                slot.1 = new;
+            }
+            return;
+        }
+    }
+}
+
+fn refund_donor(donor: TaskId, cycles: u64) {
+    if cycles == 0 || donor == TaskId::NONE {
+        return;
+    }
+    for q in READY.iter() {
+        let mut g = q.lock();
+        if let Some(ref mut dq) = *g {
+            if let Some(s) = dq.iter_mut().find(|s| s.id == donor) {
+                s.account.revert_debit(cycles);
+                return;
+            }
+        }
+    }
+    cancel_donor_debit(donor, cycles);
+}
+
+#[doc(hidden)]
+pub fn __reset_donations_for_test() {
+    *PENDING_DONOR_DEBITS.lock() = [(TaskId::NONE, 0); MAX_PENDING_DONATIONS];
+}
+
+/// Direct time-slice donation fast path (spec §3.3).
+///
+/// On success the scheduler:
+/// 1. Deducts the donor's remaining burst quantum (capped at
+///    `MAX_DONATION_CYCLES` so an unthrottled donor can't transfer
+///    `u64::MAX`) from the donor's `BudgetAccount`. If the donor
+///    is currently being polled (off-queue), the debit is staged
+///    in `PENDING_DONOR_DEBITS` and applied at the donor's next
+///    `push_back`.
+/// 2. Credits the same cycle count to the target via
+///    `BudgetAccount::add_credit`, extending its effective
+///    quantum.
+/// 3. Stamps a `Donation` claim on the target's slot.
+/// 4. Forces the donee awake and moves the slot to the head of
+///    its ready queue so the next dispatch round polls it first
+///    (ahead of normal FIFO order).
+///
+/// Revocation: if `cap.revoke()` is called before the donee
+/// consumes the donation, the executor's `settle_donation` at
+/// the donee's next pop calls `account.revert_credit` on the
+/// donee and `refund_donor` on the donor (refunds via
+/// `revert_debit` if findable, otherwise cancels the pending
+/// debit). The donee continues without the boost.
 pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateError> {
+    /// Hard ceiling on a single donation. 1M cycles is a few
+    /// hundred µs at multi-GHz: large enough to be a real boost,
+    /// small enough that an unthrottled donor's
+    /// `u64::MAX - cycles_spent` doesn't transfer the universe.
+    const MAX_DONATION_CYCLES: u64 = 1_000_000;
+
     cap.check_live()
         .map_err(|_| DonateError::AuthorityRevoked)?;
+
+    let donor_id = current_task_id();
     let mut any_initialised = false;
+    let mut donor_remaining: u64 = 0;
+    let mut donor_debited_inline = false;
+
     for q in READY.iter() {
         let mut g = q.lock();
         let ready = match g.as_mut() {
@@ -553,22 +691,59 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
         };
         any_initialised = true;
         if let Some(pos) = ready.iter().position(|s| s.id == target) {
-            if pos != 0 {
-                let slot = ready.remove(pos).unwrap();
-                // Force-wake the donee so the executor doesn't skip
-                // it on the next round if its waker hasn't fired —
-                // donation is by definition "let me pick this task
-                // even though you wouldn't normally have chosen it".
-                slot.awake.store(true, Ordering::Release);
-                ready.push_front(slot);
+            if donor_id != TaskId::NONE {
+                if let Some(d) = ready.iter_mut().find(|s| s.id == donor_id) {
+                    let rem = d
+                        .spec
+                        .budget
+                        .burst_cycles
+                        .saturating_sub(d.account.cycles_spent);
+                    donor_remaining = rem.min(MAX_DONATION_CYCLES);
+                    if donor_remaining > 0 {
+                        d.account.add_debit(donor_remaining);
+                        donor_debited_inline = true;
+                    }
+                }
             }
+            let mut slot = ready.remove(pos).unwrap();
+            if !donor_debited_inline && donor_id != TaskId::NONE {
+                donor_remaining = MAX_DONATION_CYCLES;
+            }
+            if donor_remaining > 0 {
+                slot.account.add_credit(donor_remaining);
+                slot.donation = Some(Donation {
+                    donor: donor_id,
+                    cycles: donor_remaining,
+                    cap: *cap,
+                });
+                if !donor_debited_inline {
+                    stage_donor_debit(donor_id, donor_remaining);
+                }
+            }
+            slot.awake.store(true, Ordering::Release);
+            ready.push_front(slot);
             return Ok(());
         }
     }
+
     if !any_initialised {
         return Err(DonateError::NotReady);
     }
     Err(DonateError::TargetNotFound)
+}
+
+/// Settle the slot's pending donation claim before polling. Live
+/// cap → consume the claim (credit was already applied at
+/// `donate_to` time); revoked cap → refund both sides so the
+/// donor and donee end up as they would have without the
+/// donation.
+fn settle_donation(slot: &mut TaskSlot) {
+    if let Some(d) = slot.donation.take() {
+        if d.cap.check_live().is_err() {
+            slot.account.revert_credit(d.cycles);
+            refund_donor(d.donor, d.cycles);
+        }
+    }
 }
 
 // ── Waker plumbing ──────────────────────────────────────────────────
@@ -699,6 +874,10 @@ pub fn poll_one_round() -> usize {
             q.as_mut().unwrap().push_back(slot);
             continue;
         }
+        // Settle any pending donation claim before deciding to
+        // drop. A revoked donation cap rolls back both sides; the
+        // donee still polls (donation never happened semantics).
+        settle_donation(&mut slot);
         if let Some(ref cap) = slot.spec.budget_cap {
             if cap.check_live().is_err() {
                 continue;
@@ -731,6 +910,12 @@ pub fn poll_one_round() -> usize {
         *ACTIVE_USER_AS.lock() = outer_as;
         let elapsed = Instant::now().cycles_since(start);
         slot.account.charge(elapsed, &slot.spec.budget);
+        // Apply any donor-side debit that `donate_to` staged
+        // while this task was off-queue (currently polling).
+        let pending = drain_donor_debit(slot.id);
+        if pending > 0 {
+            slot.account.add_debit(pending);
+        }
         narf_rcu::report_quiescent();
         match poll_result {
             Poll::Ready(()) => ready_this_round += 1,
@@ -787,6 +972,12 @@ pub fn run_until_empty() {
                     None => break,
                 }
             };
+
+            // Settle any pending donation claim before deciding to
+            // drop. A revoked donation cap rolls back both sides;
+            // the donee still polls (donation never happened
+            // semantics).
+            settle_donation(&mut slot);
 
             // Budget cap check — a revoked Cap<CpuBudget, Spend>
             // drops the task O(1). No cap attached → skip the check.
@@ -942,6 +1133,13 @@ pub fn run_until_empty() {
             }
             let elapsed = Instant::now().cycles_since(start);
             slot.account.charge(elapsed, &slot.spec.budget);
+
+            // Apply any donor-side debit that `donate_to` staged
+            // while this task was off-queue (currently polling).
+            let pending = drain_donor_debit(slot.id);
+            if pending > 0 {
+                slot.account.add_debit(pending);
+            }
 
             // Announce a QSBR quiescent state: the task has yielded
             // back to the executor and holds no RCU read-guards across

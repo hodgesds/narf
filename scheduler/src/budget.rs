@@ -92,15 +92,20 @@ impl CapType for CpuBudget {
     const KIND: CapKind = CapKind::CpuBudget;
 }
 
-/// Per-task running account. `cycles_spent` is the sum of measured
-/// poll durations; `overruns` ticks once per poll that exceeded
-/// `burst_cycles`. The scheduler updates both fields; `ResourceBudget`
-/// itself is immutable after spawn.
+/// Per-task running account. `cycles_spent` sums measured poll
+/// durations; `overruns` ticks once per poll that exceeded
+/// `burst_cycles`. `donated_in` / `donated_out` track time-slice
+/// donation flow per §3.3 — `add_credit` boosts the donee's
+/// quantum by reducing `cycles_spent`; `add_debit` charges the
+/// donor symmetrically. Both are reversible via `revert_*` so a
+/// revoked donation cap rolls back cleanly.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BudgetAccount {
     pub cycles_spent: u64,
     pub overruns: u64,
     pub polls: u64,
+    pub donated_in: u64,
+    pub donated_out: u64,
 }
 
 impl BudgetAccount {
@@ -109,6 +114,8 @@ impl BudgetAccount {
             cycles_spent: 0,
             overruns: 0,
             polls: 0,
+            donated_in: 0,
+            donated_out: 0,
         }
     }
 
@@ -123,5 +130,36 @@ impl BudgetAccount {
             self.overruns = self.overruns.saturating_add(1);
         }
         over
+    }
+
+    /// Apply a donation credit: bump `donated_in` and reduce
+    /// `cycles_spent` by `cycles` (saturating at 0). Called by the
+    /// executor when stamping a `donate_to` claim on the donee.
+    #[inline]
+    pub fn add_credit(&mut self, cycles: u64) {
+        self.donated_in = self.donated_in.saturating_add(cycles);
+        self.cycles_spent = self.cycles_spent.saturating_sub(cycles);
+    }
+
+    /// Apply a donation debit on the donor side.
+    #[inline]
+    pub fn add_debit(&mut self, cycles: u64) {
+        self.donated_out = self.donated_out.saturating_add(cycles);
+        self.cycles_spent = self.cycles_spent.saturating_add(cycles);
+    }
+
+    /// Reverse `add_credit`. Used when the donation cap is revoked
+    /// before the donee consumed the credit.
+    #[inline]
+    pub fn revert_credit(&mut self, cycles: u64) {
+        self.donated_in = self.donated_in.saturating_sub(cycles);
+        self.cycles_spent = self.cycles_spent.saturating_add(cycles);
+    }
+
+    /// Reverse `add_debit` on the donor side.
+    #[inline]
+    pub fn revert_debit(&mut self, cycles: u64) {
+        self.donated_out = self.donated_out.saturating_sub(cycles);
+        self.cycles_spent = self.cycles_spent.saturating_sub(cycles);
     }
 }

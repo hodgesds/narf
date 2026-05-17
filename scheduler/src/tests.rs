@@ -1422,3 +1422,145 @@ fn smoke_scheduler_responsive_spin_caps_at_max_iters() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_responsive_spin_caps_at_max_iters);
+
+// ── Stage-5 donation fast path ─────────────────────────────────────
+
+fn smoke_scheduler_donation_credit_debit_balance() -> TestResult {
+    // BudgetAccount: a credit on the donee and a debit on the
+    // donor are exact mirrors; revert_* unwinds both sides.
+    use crate::budget::BudgetAccount;
+    let mut donee = BudgetAccount::new();
+    let mut donor = BudgetAccount::new();
+    donor.cycles_spent = 500;
+    donee.cycles_spent = 800;
+    donor.add_debit(300);
+    donee.add_credit(300);
+    if donor.donated_out != 300 || donor.cycles_spent != 800 {
+        return TestResult::Fail("donor debit didn't bump cycles_spent + donated_out");
+    }
+    if donee.donated_in != 300 || donee.cycles_spent != 500 {
+        return TestResult::Fail("donee credit didn't reduce cycles_spent + bump donated_in");
+    }
+    donor.revert_debit(300);
+    donee.revert_credit(300);
+    if donor.donated_out != 0 || donor.cycles_spent != 500 {
+        return TestResult::Fail("revert_debit didn't restore donor");
+    }
+    if donee.donated_in != 0 || donee.cycles_spent != 800 {
+        return TestResult::Fail("revert_credit didn't restore donee");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_donation_credit_debit_balance);
+
+fn smoke_scheduler_donation_credit_saturates_at_zero() -> TestResult {
+    // Crediting more than `cycles_spent` clamps cycles_spent to 0
+    // — the donee can't end up with negative spend.
+    use crate::budget::BudgetAccount;
+    let mut donee = BudgetAccount::new();
+    donee.cycles_spent = 100;
+    donee.add_credit(10_000);
+    if donee.cycles_spent != 0 {
+        return TestResult::Fail("credit didn't saturate cycles_spent to 0");
+    }
+    if donee.donated_in != 10_000 {
+        return TestResult::Fail("donated_in didn't take full credit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_donation_credit_saturates_at_zero);
+
+fn smoke_scheduler_donate_to_revoked_cap_falls_back() -> TestResult {
+    // Donating with a live cap, then revoking before the donee
+    // polls, must leave the donee runnable (donation never
+    // happened semantics) — the executor's settle_donation drops
+    // the claim, the task still completes.
+    use crate::{donate_to, spawn, Task};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Invoke};
+
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let target = spawn(async {
+        RAN.fetch_add(1, Ordering::Relaxed);
+    });
+
+    let cap: Cap<Task, Invoke> = Cap::bootstrap();
+    if donate_to(target, &cap).is_err() {
+        return TestResult::Fail("donate_to on live cap failed");
+    }
+    // Revoke before run_until_empty so settle_donation observes
+    // the dead cap on first pop.
+    cap.revoke();
+
+    crate::run_until_empty();
+
+    if RAN.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("donee didn't run after revoked donation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_donate_to_revoked_cap_falls_back);
+
+fn smoke_scheduler_donate_to_credits_donee_account() -> TestResult {
+    // After donate_to on a live cap, the donee's BudgetAccount
+    // carries the credit on first pop. We can't reach inside the
+    // slot from a test, but we can observe that two donations to
+    // the same target accumulate without panicking the pending
+    // debit table (capacity sanity).
+    use crate::{donate_to, spawn, Task};
+    use narf_capabilities::{Cap, Invoke};
+
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let target = spawn(async {});
+    let cap: Cap<Task, Invoke> = Cap::bootstrap();
+
+    for _ in 0..3 {
+        if donate_to(target, &cap).is_err() {
+            return TestResult::Fail("donate_to failed on live cap");
+        }
+    }
+    crate::run_until_empty();
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_donate_to_credits_donee_account);
+
+fn smoke_scheduler_donate_to_head_enqueues() -> TestResult {
+    // Functional contract from Stage-3: donate_to moves the donee
+    // ahead of FIFO order. Reuses the original `…reorders_head`
+    // shape; included so the Stage-5 fast path doesn't regress
+    // the head-enqueue behaviour.
+    use crate::{donate_to, Task};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Invoke};
+
+    static FIRST_TAG: AtomicU32 = AtomicU32::new(0);
+    FIRST_TAG.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let donation: Cap<Task, Invoke> = Cap::bootstrap();
+    let _a = crate::spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xAAAA, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    let b = crate::spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xBBBB, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    if donate_to(b, &donation).is_err() {
+        return TestResult::Fail("donate_to live cap returned Err");
+    }
+    crate::run_until_empty();
+    match FIRST_TAG.load(Ordering::Relaxed) {
+        0xBBBB => TestResult::Pass,
+        0xAAAA => TestResult::Fail("Stage-5 fast path lost head-enqueue ordering"),
+        _ => TestResult::Fail("neither task ran"),
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_donate_to_head_enqueues);
