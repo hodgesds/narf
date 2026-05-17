@@ -176,3 +176,128 @@ fn smoke_shmem_exit_observer_reaps_handles() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("shmem", smoke_shmem_exit_observer_reaps_handles);
+
+// ── deep shmem coverage ───────────────────────────────────────────
+//
+// Closes the remaining invariants on shmem's public surface that
+// the 3 round-trip smokes don't reach.
+
+fn smoke_shmem_create_rejects_zero_len() -> TestResult {
+    use crate::{__reset_for_test, create, ShmemError};
+    __reset_for_test();
+    match create(7777, 0) {
+        Err(ShmemError::BadLen) => TestResult::Pass,
+        _ => TestResult::Fail("create(0) didn't surface BadLen"),
+    }
+}
+kernel_test_in!("shmem", smoke_shmem_create_rejects_zero_len);
+
+fn smoke_shmem_create_rejects_oversize_request() -> TestResult {
+    // MAX_PAGES_PER_HANDLE * PAGE = 1 MiB; one byte past that
+    // rejects with BadLen.
+    use crate::{__reset_for_test, create, ShmemError};
+    __reset_for_test();
+    match create(7778, 1024 * 1024 + 1) {
+        Err(ShmemError::BadLen) => TestResult::Pass,
+        Ok(h) => {
+            let _ = crate::destroy(h);
+            TestResult::Fail("oversized create unexpectedly succeeded")
+        }
+        Err(_) => TestResult::Fail("oversized create surfaced wrong error"),
+    }
+}
+kernel_test_in!("shmem", smoke_shmem_create_rejects_oversize_request);
+
+fn smoke_shmem_unknown_handle_accessors_return_none() -> TestResult {
+    // phys_at / len_of / pid_of / frames_of on an unknown handle
+    // all return None without panicking.
+    use crate::{__reset_for_test, frames_of, len_of, phys_at, pid_of};
+    __reset_for_test();
+    let bogus = 0xDEAD_BEEFu64;
+    if phys_at(bogus, 0).is_some() {
+        return TestResult::Fail("phys_at returned Some for bogus handle");
+    }
+    if len_of(bogus).is_some() {
+        return TestResult::Fail("len_of returned Some for bogus handle");
+    }
+    if pid_of(bogus).is_some() {
+        return TestResult::Fail("pid_of returned Some for bogus handle");
+    }
+    if frames_of(bogus).is_some() {
+        return TestResult::Fail("frames_of returned Some for bogus handle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_unknown_handle_accessors_return_none);
+
+fn smoke_shmem_handle_id_monotonic() -> TestResult {
+    // create() hands out monotonically-increasing handle ids; the
+    // counter survives destroy().
+    use crate::{__reset_for_test, create, destroy};
+    __reset_for_test();
+    let h1 = create(8001, 4096).expect("create#1");
+    let h2 = create(8001, 4096).expect("create#2");
+    let h3 = create(8002, 4096).expect("create#3");
+    if !(h1 < h2 && h2 < h3) {
+        return TestResult::Fail("handle ids not monotonic");
+    }
+    destroy(h2);
+    let h4 = create(8001, 4096).expect("create#4");
+    if h4 <= h3 {
+        return TestResult::Fail("destroy + create didn't bump past the freed id");
+    }
+    let _ = destroy(h1);
+    let _ = destroy(h3);
+    let _ = destroy(h4);
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_handle_id_monotonic);
+
+fn smoke_shmem_destroy_all_for_pid_only_owner() -> TestResult {
+    // destroy_all_for_pid(p) tears down only p's regions; other
+    // pids' regions survive.
+    use crate::{__reset_for_test, count, create, destroy_all_for_pid};
+    __reset_for_test();
+    let p_dying = 8100u64;
+    let p_keeps = 8101u64;
+    let _ = create(p_dying, 4096).expect("a");
+    let _ = create(p_dying, 4096).expect("b");
+    let _ = create(p_keeps, 4096).expect("c");
+    if count() != 3 {
+        return TestResult::Fail("setup count != 3");
+    }
+    let reaped = destroy_all_for_pid(p_dying);
+    if reaped != 2 {
+        return TestResult::Fail("destroy_all_for_pid didn't reap exactly 2");
+    }
+    if count() != 1 {
+        return TestResult::Fail("survivor count != 1");
+    }
+    // The survivor must belong to p_keeps.
+    let _ = destroy_all_for_pid(p_keeps);
+    if count() != 0 {
+        return TestResult::Fail("survivor cleanup didn't drain");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_destroy_all_for_pid_only_owner);
+
+fn smoke_shmem_error_variants_distinct() -> TestResult {
+    use crate::ShmemError;
+    let all = [
+        ShmemError::OutOfMemory,
+        ShmemError::BadLen,
+        ShmemError::NotFound,
+        ShmemError::NotOwner,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("ShmemError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_error_variants_distinct);
