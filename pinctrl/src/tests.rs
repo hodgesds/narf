@@ -302,3 +302,179 @@ fn smoke_pinctrl_pinmux_default_config_is_safe() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_default_config_is_safe);
+
+// ── deep pinctrl/pinmux ─────────────────────────────────────────
+
+fn smoke_pinctrl_pinmux_pull_repr_pinned() -> TestResult {
+    use crate::pinmux::PinPull;
+    if PinPull::None as u8 != 0 || PinPull::Down as u8 != 1
+        || PinPull::Up as u8 != 2 || PinPull::Keeper as u8 != 3
+    {
+        return TestResult::Fail("PinPull repr drifted");
+    }
+    let all = [PinPull::None, PinPull::Down, PinPull::Up, PinPull::Keeper];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("PinPull variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_pull_repr_pinned);
+
+fn smoke_pinctrl_pinmux_drive_strength_walks_2ma_steps() -> TestResult {
+    use crate::pinmux::PinDriveStrength;
+    // Spec: 2..16 mA in 2-mA steps mapped to 0..7.
+    let pairs = [
+        (PinDriveStrength::Strength2mA, 0u8),
+        (PinDriveStrength::Strength4mA, 1),
+        (PinDriveStrength::Strength6mA, 2),
+        (PinDriveStrength::Strength8mA, 3),
+        (PinDriveStrength::Strength10mA, 4),
+        (PinDriveStrength::Strength12mA, 5),
+        (PinDriveStrength::Strength14mA, 6),
+        (PinDriveStrength::Strength16mA, 7),
+    ];
+    for (s, code) in pairs {
+        if s as u8 != code {
+            return TestResult::Fail("Strength repr drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_drive_strength_walks_2ma_steps);
+
+fn smoke_pinctrl_pinmux_pack_bit_positions() -> TestResult {
+    use crate::pinmux::{
+        PinConfig, PinDirection, PinDriveOpt, PinDriveStrength, PinPull, PinPullOpt,
+    };
+    // function=0xA → low nibble = 0xA.
+    let c = PinConfig {
+        function: 0xA,
+        pull: PinPullOpt(PinPull::Up),
+        drive: PinDriveOpt(PinDriveStrength::Strength16mA),
+        direction: PinDirection::Output,
+        output_enabled: true,
+        open_drain: true,
+        schmitt: true,
+    };
+    let v = c.pack();
+    if v & 0xF != 0xA {
+        return TestResult::Fail("function bits");
+    }
+    if (v >> 4) & 0x3 != 2 {
+        return TestResult::Fail("pull bits should encode Up=2");
+    }
+    if (v >> 6) & 0x7 != 7 {
+        return TestResult::Fail("drive bits should encode 16mA=7");
+    }
+    if v & (1 << 9) == 0 {
+        return TestResult::Fail("direction bit 9 should be set");
+    }
+    if v & (1 << 10) == 0 {
+        return TestResult::Fail("OE bit 10 should be set");
+    }
+    if v & (1 << 11) == 0 {
+        return TestResult::Fail("open-drain bit 11 should be set");
+    }
+    if v & (1 << 12) == 0 {
+        return TestResult::Fail("schmitt bit 12 should be set");
+    }
+    // Bits 13..31 reserved.
+    if v & 0xFFFFE000 != 0 {
+        return TestResult::Fail("reserved bits 13..31 set");
+    }
+    // Unpack round-trips.
+    let c2 = PinConfig::unpack(v);
+    if c2 != c {
+        return TestResult::Fail("pack/unpack didn't round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_pack_bit_positions);
+
+fn smoke_pinctrl_pinmux_builder_helpers_shapes() -> TestResult {
+    use crate::pinmux::{PinConfig, PinDirection};
+    let i = PinConfig::input();
+    if i.direction != PinDirection::Input || i.output_enabled {
+        return TestResult::Fail("input() shape wrong");
+    }
+    let pp = PinConfig::output_pushpull();
+    if pp.direction != PinDirection::Output || !pp.output_enabled || pp.open_drain {
+        return TestResult::Fail("output_pushpull() shape wrong");
+    }
+    let od = PinConfig::output_open_drain();
+    if !od.open_drain || !od.output_enabled {
+        return TestResult::Fail("output_open_drain() shape wrong");
+    }
+    let a = PinConfig::alt(5);
+    if a.function != 5 {
+        return TestResult::Fail("alt(5).function != 5");
+    }
+    // alt(0xFF) must mask to lower 4 bits.
+    let a2 = PinConfig::alt(0xFF);
+    if a2.function != 0xF {
+        return TestResult::Fail("alt() didn't mask high nibble");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_builder_helpers_shapes);
+
+// ── deep pinctrl/spmi ──────────────────────────────────────────
+
+fn smoke_pinctrl_spmi_error_variants_distinct() -> TestResult {
+    use crate::spmi::SpmiError;
+    let all = [SpmiError::Short, SpmiError::BadOpcode, SpmiError::Truncated];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("SpmiError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/spmi", smoke_pinctrl_spmi_error_variants_distinct);
+
+fn smoke_pinctrl_spmi_op_variants_distinct() -> TestResult {
+    use crate::spmi::SpmiOp;
+    if SpmiOp::ExtWrite == SpmiOp::ExtRead {
+        return TestResult::Fail("SpmiOp ExtWrite == ExtRead");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/spmi", smoke_pinctrl_spmi_op_variants_distinct);
+
+fn smoke_pinctrl_spmi_decode_short_buf_rejected() -> TestResult {
+    use crate::spmi::{decode_header, SpmiError};
+    match decode_header(&[0, 0, 0]) {
+        Err(SpmiError::Short) => TestResult::Pass,
+        _ => TestResult::Fail("short buf didn't surface Short"),
+    }
+}
+kernel_test_in!("pinctrl/spmi", smoke_pinctrl_spmi_decode_short_buf_rejected);
+
+fn smoke_pinctrl_spmi_build_ext_write_layout() -> TestResult {
+    use crate::spmi::build_ext_write;
+    let buf = build_ext_write(0x5, 0x1234, &[0xAA, 0xBB]);
+    // Layout: SID nibble | 0x00, opcode (0x10 | bc-1), addr_hi, addr_lo, data.
+    if buf.len() != 6 {
+        return TestResult::Fail("ext_write length != 6 for 2-byte data");
+    }
+    if buf[0] != (0x5 << 4) {
+        return TestResult::Fail("SID byte wrong");
+    }
+    if buf[1] != 0x10 | 1 {
+        return TestResult::Fail("opcode wrong (Ext Write, bc-1=1)");
+    }
+    if buf[2] != 0x12 || buf[3] != 0x34 {
+        return TestResult::Fail("addr bytes wrong");
+    }
+    if buf[4] != 0xAA || buf[5] != 0xBB {
+        return TestResult::Fail("data tail wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("pinctrl/spmi", smoke_pinctrl_spmi_build_ext_write_layout);
