@@ -281,6 +281,69 @@ pub unsafe fn init() {
     }
 }
 
+/// Outcome of [`init_or_gp`] — distinguishes "we didn't try" from
+/// "the firmware locked the MSR" so the boot-path status line can
+/// surface the difference.
+///
+/// References:
+/// - Intel SDM Vol 3B §14.4 (HWP) —
+///   https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+/// - AMD BKDG (Family 17h Models 30h..70h, public) §2.1.10 PStateCurLim
+///   — https://www.amd.com/en/support/tech-docs
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InitOutcome {
+    /// `detect()` returned `None` — no recognised mechanism.
+    NotPresent,
+    /// HWP path: programmed `IA32_PM_ENABLE` + `IA32_HWP_REQUEST`.
+    HwpProgrammed,
+    /// HWP: enable wrmsr `#GP`'d (`MSR_IA32_PM_ENABLE`).
+    HwpEnableGp,
+    /// HWP: enable succeeded but `IA32_HWP_REQUEST` `#GP`'d.
+    HwpRequestGp,
+    /// Legacy SpeedStep — boot init keeps firmware default (no
+    /// writes here; `legacy_set` is on-demand).
+    SpeedStepDetectionOnly,
+    /// AMD HwPstate: cleared `MSR_AMD_PSTATE_LIMIT`.
+    AmdLegacyCleared,
+    /// AMD HwPstate: `MSR_AMD_PSTATE_LIMIT` write `#GP`'d.
+    AmdLegacyGp,
+}
+
+/// Same as [`init`] but uses `wrmsr_or_gp` for the writes so a
+/// BIOS-locked MSR doesn't wedge boot. Symmetric to
+/// [`crate::cppc::init_or_gp`]; safe to call without `unsafe`
+/// because the fallible variants catch traps.
+pub fn init_or_gp() -> InitOutcome {
+    use narf_arch::x86_64::msr::wrmsr_or_gp;
+    match detect() {
+        Mechanism::Hwp => {
+            if wrmsr_or_gp(MSR_IA32_PM_ENABLE, 1).is_err() {
+                return InitOutcome::HwpEnableGp;
+            }
+            // SAFETY: HWP confirmed present and just enabled; the
+            // CPUID-attested layout matches `HwpCaps`.
+            let caps = unsafe { hwp_capabilities() };
+            let v = (caps.min_perf as u64)
+                | ((caps.max_perf as u64) << 8)
+                | (0u64 << 16)
+                | (0x80u64 << 24);
+            if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, v).is_err() {
+                return InitOutcome::HwpRequestGp;
+            }
+            InitOutcome::HwpProgrammed
+        }
+        Mechanism::AmdLegacy => {
+            if wrmsr_or_gp(MSR_AMD_PSTATE_LIMIT, 0).is_err() {
+                InitOutcome::AmdLegacyGp
+            } else {
+                InitOutcome::AmdLegacyCleared
+            }
+        }
+        Mechanism::SpeedStep => InitOutcome::SpeedStepDetectionOnly,
+        Mechanism::None => InitOutcome::NotPresent,
+    }
+}
+
 /// Decoded P-state definition register entry (AMD BKDG §2.1.10
 /// PStateDef). `enabled = false` means the slot is reserved /
 /// unused; the platform exposes `defined` slots out of 8 max.

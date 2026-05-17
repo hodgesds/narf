@@ -144,17 +144,26 @@ pub fn register_initcalls() {
             cppc::InitOutcome::ReqGp => {
                 String::from("CPU: CPPC enabled but REQ #GP'd — firmware default")
             }
-            cppc::InitOutcome::NotSupported => match pstate::detect() {
-                pstate::Mechanism::Hwp => {
-                    String::from("CPU: HWP supported (writes disabled)")
+            cppc::InitOutcome::NotSupported => match pstate::init_or_gp() {
+                pstate::InitOutcome::HwpProgrammed => {
+                    String::from("CPU: HWP programmed (balanced EPP)")
                 }
-                pstate::Mechanism::SpeedStep => {
+                pstate::InitOutcome::HwpEnableGp => {
+                    String::from("CPU: HWP enable #GP'd (BIOS lock) — firmware default")
+                }
+                pstate::InitOutcome::HwpRequestGp => {
+                    String::from("CPU: HWP enabled but REQUEST #GP'd — firmware default")
+                }
+                pstate::InitOutcome::AmdLegacyCleared => {
+                    String::from("CPU: AMD HwPstate cleared limit")
+                }
+                pstate::InitOutcome::AmdLegacyGp => {
+                    String::from("CPU: AMD HwPstate limit clear #GP'd — firmware default")
+                }
+                pstate::InitOutcome::SpeedStepDetectionOnly => {
                     String::from("CPU: SpeedStep (firmware default)")
                 }
-                pstate::Mechanism::AmdLegacy => {
-                    String::from("CPU: AMD HwPstate (firmware default)")
-                }
-                pstate::Mechanism::None => String::from("CPU: pstate n/a"),
+                pstate::InitOutcome::NotPresent => String::from("CPU: pstate n/a"),
             },
         };
         let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
