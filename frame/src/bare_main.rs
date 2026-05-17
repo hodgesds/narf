@@ -1691,6 +1691,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             narf_init::register(narf_init::Stage::Late, "fb-console-install", || {
                 use narf_graphics::{FbConsole, Pixel32};
+                // Skip if the early-FB install already wired a
+                // working console. Re-installing would call
+                // FbConsole::new → fb.clear() and wipe all the
+                // boot-time output (beacons, build stripe, init
+                // log). The early install only succeeds when the
+                // bootloader-supplied FB is below 4 GiB; if it was
+                // skipped (deferred-to-late path), is_installed()
+                // returns false and we proceed.
+                if narf_graphics::console::is_installed() {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  splash: fb-console already installed by early-fb path — skipping re-install"
+                    );
+                    return narf_init::InitResult::Ok;
+                }
                 // Pick the active scanout: bochs / virtio-gpu / amdgpu
                 // / generic. Generic is what Limine + UEFI hand us via
                 // the multiboot2 framebuffer tag — it has no doorbell,

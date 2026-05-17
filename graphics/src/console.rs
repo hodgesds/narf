@@ -193,6 +193,15 @@ impl FbConsole {
 /// out to it without re-entry hazards.
 pub static GLOBAL_FB_CONSOLE: IrqSafeSpinLock<Option<FbConsole>> = IrqSafeSpinLock::new(None);
 
+/// True iff a global FbConsole is currently installed. Used by
+/// `frame::bare_main`'s Late `fb-console-install` initcall to avoid
+/// re-installing on top of a working early-install (which would
+/// clear the FB, wiping all the boot output above the FB-console
+/// area — beacons, build stripe, and the kernel init log).
+pub fn is_installed() -> bool {
+    GLOBAL_FB_CONSOLE.lock().is_some()
+}
+
 /// Install a framebuffer console; subsequent calls to `write_str`
 /// (via the hook below) will mirror kernel logs onto it. If a
 /// console is already installed, the new one replaces it.
