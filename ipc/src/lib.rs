@@ -45,6 +45,12 @@ pub use mpsc_ring::{
     MpscRingSendError,
 };
 
+pub mod spmc_ring;
+pub use spmc_ring::{
+    spmc_ring_channel, SpmcRing, SpmcRingConsumer, SpmcRingProducer, SpmcRingRecvError,
+    SpmcRingSendError,
+};
+
 pub mod shared_ring;
 pub use shared_ring::{
     SharedConsumer, SharedProducer, SharedRing, TryRecvError as SharedTryRecvError,

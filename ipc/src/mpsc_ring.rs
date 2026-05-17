@@ -119,7 +119,7 @@ impl<T, const N: usize> Drop for MpscRing<T, N> {
         while i != tail {
             let idx = (i & Self::MASK) as usize;
             let slot = &mut slots[idx];
-            if *slot.seq.get_mut() == i + 1 {
+            if *slot.seq.get_mut() == i.wrapping_add(1) {
                 // SAFETY: producer published slot at sequence `i + 1`;
                 // consumer never claimed it. Payload is live.
                 unsafe {

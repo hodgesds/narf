@@ -1071,3 +1071,140 @@ fn smoke_ipc_mpsc_ring_drop_runs_payload_destructors() -> TestResult {
     }
 }
 kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_drop_runs_payload_destructors);
+
+// ── ipc/spmc_ring (Vyukov lock-free SPMC) ─────────────────────────
+
+fn smoke_ipc_spmc_ring_empty_pop_none() -> TestResult {
+    let (_tx, rx) = crate::spmc_ring_channel::<u32, 4>();
+    match rx.try_recv() {
+        Ok(None) => TestResult::Pass,
+        _ => TestResult::Fail("empty SpmcRing didn't surface Ok(None)"),
+    }
+}
+kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_empty_pop_none);
+
+fn smoke_ipc_spmc_ring_single_round_trip() -> TestResult {
+    let (mut tx, rx) = crate::spmc_ring_channel::<u32, 4>();
+    if tx.try_send(0xDEAD).is_err() {
+        return TestResult::Fail("try_send failed on empty ring");
+    }
+    match rx.try_recv() {
+        Ok(Some(0xDEAD)) => TestResult::Pass,
+        _ => TestResult::Fail("round-trip lost value"),
+    }
+}
+kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_single_round_trip);
+
+fn smoke_ipc_spmc_ring_fill_then_full() -> TestResult {
+    use crate::SpmcRingSendError;
+    let (mut tx, _rx) = crate::spmc_ring_channel::<u32, 4>();
+    for i in 0..4 {
+        if tx.try_send(i).is_err() {
+            return TestResult::Fail("fill: try_send rejected within capacity");
+        }
+    }
+    match tx.try_send(99) {
+        Err(SpmcRingSendError::Full(99)) => TestResult::Pass,
+        Err(SpmcRingSendError::Full(_)) => TestResult::Fail("Full returned wrong value"),
+        Ok(()) => TestResult::Fail("ring accepted N+1 sends"),
+        Err(SpmcRingSendError::Closed(_)) => TestResult::Fail("unexpected Closed"),
+    }
+}
+kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_fill_then_full);
+
+fn smoke_ipc_spmc_ring_fifo_single_consumer() -> TestResult {
+    let (mut tx, rx) = crate::spmc_ring_channel::<u32, 4>();
+    for batch in 0..4u32 {
+        let base = batch * 4;
+        for i in 0..4u32 {
+            tx.try_send(base + i).unwrap();
+        }
+        for i in 0..4u32 {
+            match rx.try_recv() {
+                Ok(Some(v)) if v == base + i => {}
+                _ => return TestResult::Fail("FIFO order violated"),
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_fifo_single_consumer);
+
+fn smoke_ipc_spmc_ring_multi_consumer_contention() -> TestResult {
+    use crate::spmc_ring_channel;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const TOTAL: u32 = 4000;
+    static SEEN: [AtomicU32; 4000 / 32] = {
+        const Z: AtomicU32 = AtomicU32::new(0);
+        [Z; 4000 / 32]
+    };
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    static DUPLICATE: AtomicU32 = AtomicU32::new(0);
+    for w in &SEEN {
+        w.store(0, Ordering::Relaxed);
+    }
+    COUNT.store(0, Ordering::Relaxed);
+    DUPLICATE.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (mut tx, rx) = spmc_ring_channel::<u32, 64>();
+
+    narf_scheduler::spawn(async move {
+        for v in 0..TOTAL {
+            while tx.try_send(v).is_err() {
+                narf_scheduler::yield_now().await;
+            }
+        }
+    });
+
+    for _ in 0..4u32 {
+        let rx = rx.clone();
+        narf_scheduler::spawn(async move {
+            loop {
+                match rx.try_recv() {
+                    Ok(Some(v)) => {
+                        let word = (v / 32) as usize;
+                        let bit = 1u32 << (v % 32);
+                        let prev = SEEN[word].fetch_or(bit, Ordering::Relaxed);
+                        if prev & bit != 0 {
+                            DUPLICATE.fetch_add(1, Ordering::Relaxed);
+                        }
+                        COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => narf_scheduler::yield_now().await,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    drop(rx);
+
+    narf_scheduler::run_until_empty();
+
+    if COUNT.load(Ordering::Relaxed) != TOTAL {
+        return TestResult::Fail("consumers didn't drain all 4000");
+    }
+    if DUPLICATE.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("duplicate delivery observed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_multi_consumer_contention);
+
+fn smoke_ipc_spmc_ring_drop_runs_payload_destructors() -> TestResult {
+    use alloc::sync::Arc;
+    let counter = Arc::new(());
+    {
+        let (mut tx, _rx) = crate::spmc_ring_channel::<Arc<()>, 8>();
+        for _ in 0..5 {
+            tx.try_send(Arc::clone(&counter)).unwrap();
+        }
+    }
+    if Arc::strong_count(&counter) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("SpmcRing::drop didn't drop undelivered Arc payloads")
+    }
+}
+kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_drop_runs_payload_destructors);
