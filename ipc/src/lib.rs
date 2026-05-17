@@ -39,6 +39,12 @@ extern crate alloc;
 pub mod mpsc;
 pub use mpsc::{mpsc_channel, MpscConsumer, MpscProducer, MpscRecvError, MpscSendError};
 
+pub mod mpsc_ring;
+pub use mpsc_ring::{
+    mpsc_ring_channel, MpscRing, MpscRingConsumer, MpscRingProducer, MpscRingRecvError,
+    MpscRingSendError,
+};
+
 pub mod shared_ring;
 pub use shared_ring::{
     SharedConsumer, SharedProducer, SharedRing, TryRecvError as SharedTryRecvError,

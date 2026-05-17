@@ -921,3 +921,153 @@ fn smoke_ipc_mpsc_consumer_drop_makes_late_send_closed() -> TestResult {
     }
 }
 kernel_test_in!("ipc", smoke_ipc_mpsc_consumer_drop_makes_late_send_closed);
+
+// ── ipc/mpsc_ring (Vyukov lock-free MPSC) ─────────────────────────
+
+fn smoke_ipc_mpsc_ring_empty_pop_none() -> TestResult {
+    let (_tx, mut rx) = crate::mpsc_ring_channel::<u32, 4>();
+    match rx.try_recv() {
+        Ok(None) => TestResult::Pass,
+        _ => TestResult::Fail("empty MpscRing didn't surface Ok(None)"),
+    }
+}
+kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_empty_pop_none);
+
+fn smoke_ipc_mpsc_ring_single_round_trip() -> TestResult {
+    let (tx, mut rx) = crate::mpsc_ring_channel::<u32, 4>();
+    if tx.try_send(0xDEAD).is_err() {
+        return TestResult::Fail("try_send failed on empty ring");
+    }
+    match rx.try_recv() {
+        Ok(Some(0xDEAD)) => TestResult::Pass,
+        _ => TestResult::Fail("round-trip lost value"),
+    }
+}
+kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_single_round_trip);
+
+fn smoke_ipc_mpsc_ring_fill_then_full() -> TestResult {
+    use crate::MpscRingSendError;
+    let (tx, _rx) = crate::mpsc_ring_channel::<u32, 4>();
+    for i in 0..4 {
+        if tx.try_send(i).is_err() {
+            return TestResult::Fail("fill: try_send rejected within capacity");
+        }
+    }
+    match tx.try_send(99) {
+        Err(MpscRingSendError::Full(99)) => TestResult::Pass,
+        Err(MpscRingSendError::Full(_)) => TestResult::Fail("Full returned wrong value"),
+        Ok(()) => TestResult::Fail("ring accepted N+1 sends"),
+        Err(MpscRingSendError::Closed(_)) => TestResult::Fail("unexpected Closed"),
+    }
+}
+kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_fill_then_full);
+
+fn smoke_ipc_mpsc_ring_fifo_single_producer() -> TestResult {
+    // One producer → one consumer preserves FIFO order across wrap.
+    let (tx, mut rx) = crate::mpsc_ring_channel::<u32, 4>();
+    for batch in 0..4u32 {
+        let base = batch * 4;
+        for i in 0..4u32 {
+            tx.try_send(base + i).unwrap();
+        }
+        for i in 0..4u32 {
+            match rx.try_recv() {
+                Ok(Some(v)) if v == base + i => {}
+                _ => return TestResult::Fail("FIFO order violated"),
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_fifo_single_producer);
+
+fn smoke_ipc_mpsc_ring_multi_producer_contention() -> TestResult {
+    // 4 producer tasks push 1000 items each; one consumer drains 4000
+    // and verifies count + no duplication via a bitmap of u32 IDs.
+    use crate::mpsc_ring_channel;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const PER: u32 = 1000;
+    const TOTAL: u32 = 4 * PER;
+    static SEEN: [AtomicU32; 4000 / 32] = {
+        const Z: AtomicU32 = AtomicU32::new(0);
+        [Z; 4000 / 32]
+    };
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    static DUPLICATE: AtomicU32 = AtomicU32::new(0);
+    for w in &SEEN {
+        w.store(0, Ordering::Relaxed);
+    }
+    COUNT.store(0, Ordering::Relaxed);
+    DUPLICATE.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let (tx, mut rx) = mpsc_ring_channel::<u32, 64>();
+    for p in 0..4u32 {
+        let tx = tx.clone();
+        narf_scheduler::spawn(async move {
+            let base = p * PER;
+            for i in 0..PER {
+                let v = base + i;
+                while tx.try_send(v).is_err() {
+                    narf_scheduler::yield_now().await;
+                }
+            }
+        });
+    }
+    // Drop the original; clones keep the ring alive until tasks finish.
+    drop(tx);
+
+    narf_scheduler::spawn(async move {
+        let mut got = 0u32;
+        loop {
+            match rx.try_recv() {
+                Ok(Some(v)) => {
+                    let word = (v / 32) as usize;
+                    let bit = 1u32 << (v % 32);
+                    let prev = SEEN[word].fetch_or(bit, Ordering::Relaxed);
+                    if prev & bit != 0 {
+                        DUPLICATE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    got += 1;
+                    if got == TOTAL {
+                        break;
+                    }
+                }
+                Ok(None) => narf_scheduler::yield_now().await,
+                Err(_) => break,
+            }
+        }
+        COUNT.store(got, Ordering::Relaxed);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    if COUNT.load(Ordering::Relaxed) != TOTAL {
+        return TestResult::Fail("consumer didn't drain all 4000");
+    }
+    if DUPLICATE.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("duplicate delivery observed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_multi_producer_contention);
+
+fn smoke_ipc_mpsc_ring_drop_runs_payload_destructors() -> TestResult {
+    use alloc::sync::Arc;
+    let counter = Arc::new(());
+    {
+        let (tx, _rx) = crate::mpsc_ring_channel::<Arc<()>, 8>();
+        for _ in 0..5 {
+            tx.try_send(Arc::clone(&counter)).unwrap();
+        }
+        // Drop everything; the 5 Arc clones in unread slots must
+        // be dropped by `MpscRing::drop`.
+    }
+    if Arc::strong_count(&counter) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MpscRing::drop didn't drop undelivered Arc payloads")
+    }
+}
+kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_drop_runs_payload_destructors);
