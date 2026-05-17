@@ -139,4 +139,73 @@ mod tests {
     }
 
     kernel_test_in!("scmi", smoke_scmi_async_mock);
+
+    // ── extended SCMI coverage ────────────────────────────────────
+
+    fn smoke_scmi_error_variants_distinct() -> TestResult {
+        let all = [
+            ScmiError::NotSupported,
+            ScmiError::InvalidParameters,
+            ScmiError::Denied,
+            ScmiError::NotFound,
+            ScmiError::ProtocolError,
+            ScmiError::TransportError,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("ScmiError variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("scmi", smoke_scmi_error_variants_distinct);
+
+    fn smoke_scmi_clock_set_rate_and_enable_round_trip() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let ok = Arc::new(AtomicUsize::new(0));
+        let o = ok.clone();
+        narf_scheduler::spawn(async move {
+            let m = MockScmi;
+            if m.set_rate(0, 200_000_000).await.is_ok() {
+                o.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Ok(a) = m.get_attributes(0).await {
+                if a.enabled && a.name == "mock-clk" {
+                    o.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            if m.enable(0, true).await.is_ok() {
+                o.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if ok.load(Ordering::SeqCst) == 3 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("SCMI clock surface didn't round-trip all 3 calls")
+        }
+    }
+    kernel_test_in!("scmi", smoke_scmi_clock_set_rate_and_enable_round_trip);
+
+    fn smoke_scmi_clock_attributes_shape() -> TestResult {
+        // Construct each attribute struct via its public surface and
+        // confirm the fields stick. Catches drift in the Stage-4
+        // ScmiClock attribute shape.
+        let c = ClockAttributes { enabled: true, name: "pll0" };
+        if !c.enabled || c.name != "pll0" {
+            return TestResult::Fail("ClockAttributes field round-trip");
+        }
+        let p = PowerDomainAttributes { name: "gpu" };
+        if p.name != "gpu" {
+            return TestResult::Fail("PowerDomainAttributes field round-trip");
+        }
+        let pf = PerfAttributes { name: "cpu0" };
+        if pf.name != "cpu0" {
+            return TestResult::Fail("PerfAttributes field round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("scmi", smoke_scmi_clock_attributes_shape);
 }

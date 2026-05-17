@@ -579,3 +579,83 @@ fn smoke_spin_lock_try_lock_blocked_while_held() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_spin_lock_try_lock_blocked_while_held);
+
+// ── deep id coverage ──────────────────────────────────────────────
+
+fn smoke_id_typed_ids_are_transparent() -> TestResult {
+    use crate::id::{CpuId, DomainId, IrqId, NodeId, TaskId};
+    use core::mem::size_of;
+    if size_of::<CpuId>() != 2 {
+        return TestResult::Fail("CpuId size != u16");
+    }
+    if size_of::<DomainId>() != 1 {
+        return TestResult::Fail("DomainId size != u8");
+    }
+    if size_of::<TaskId>() != 4 {
+        return TestResult::Fail("TaskId size != u32");
+    }
+    if size_of::<NodeId>() != 2 {
+        return TestResult::Fail("NodeId size != u16");
+    }
+    if size_of::<IrqId>() != 4 {
+        return TestResult::Fail("IrqId size != u32");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_id_typed_ids_are_transparent);
+
+fn smoke_id_typed_id_new_raw_round_trip() -> TestResult {
+    use crate::id::{CpuId, IrqId, TaskId};
+    let c = CpuId::new(7);
+    if c.raw() != 7 { return TestResult::Fail("CpuId round-trip"); }
+    let t = TaskId::new(0xCAFE_BEEF);
+    if t.raw() != 0xCAFE_BEEF { return TestResult::Fail("TaskId round-trip"); }
+    let i = IrqId::new(u32::MAX);
+    if i.raw() != u32::MAX { return TestResult::Fail("IrqId round-trip at MAX"); }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_id_typed_id_new_raw_round_trip);
+
+fn smoke_id_domain_constants_match_security_model() -> TestResult {
+    // Pin the security-model §4.1 table. Drift here is a domain
+    // assignment break.
+    use crate::id::DomainId;
+    let pins: &[(DomainId, u8, &str)] = &[
+        (DomainId::FRAME, 0, "FRAME"),
+        (DomainId::CAPS, 1, "CAPS"),
+        (DomainId::MEMORY_MGR, 2, "MEMORY_MGR"),
+        (DomainId::SCHED, 3, "SCHED"),
+        (DomainId::IPC, 4, "IPC"),
+        (DomainId::TRACER, 5, "TRACER"),
+        (DomainId::KEYS, 6, "KEYS"),
+        (DomainId::OBSERVE, 7, "OBSERVE"),
+        (DomainId::USERSPACE_K, 8, "USERSPACE_K"),
+        (DomainId::DRIVER_0, 9, "DRIVER_0"),
+        (DomainId::DRIVER_1, 10, "DRIVER_1"),
+        (DomainId::DRIVER_2, 11, "DRIVER_2"),
+        (DomainId::DRIVER_3, 12, "DRIVER_3"),
+        (DomainId::DRIVER_4, 13, "DRIVER_4"),
+        (DomainId::DRIVER_5, 14, "DRIVER_5"),
+        (DomainId::SCRATCH, 15, "SCRATCH"),
+    ];
+    for &(d, raw, _name) in pins {
+        if d.raw() != raw {
+            return TestResult::Fail("a DomainId constant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_id_domain_constants_match_security_model);
+
+fn smoke_id_typed_ids_ordering() -> TestResult {
+    // Derived PartialOrd / Ord follow the underlying numeric order.
+    use crate::id::TaskId;
+    if !(TaskId::new(1) < TaskId::new(2)) {
+        return TestResult::Fail("TaskId 1 < 2 broken");
+    }
+    if TaskId::new(5) <= TaskId::new(4) {
+        return TestResult::Fail("TaskId 5 <= 4 should be false");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_id_typed_ids_ordering);
