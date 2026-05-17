@@ -1461,3 +1461,123 @@ fn smoke_bus_hotplug_pcie_cap_walker() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus/hotplug", smoke_bus_hotplug_pcie_cap_walker);
+
+// ── extended bus/pcie_aer coverage ─────────────────────────────────
+//
+// Existing surface had one decode test + one classify test. New
+// tests pin every accessor on the AER cap header + UE classifier
+// + Header Log + MSI number decoder.
+
+fn smoke_aer_ext_cap_header_round_trip_full() -> TestResult {
+    // raw u32 → ExtCapHeader → field round-trip across the full
+    // value range each field permits.
+    use crate::pcie_aer::{ExtCapHeader, AER_CAP_ID};
+    let cases: &[(u16, u8, u16)] = &[
+        (AER_CAP_ID, 1, 0x100),
+        (0xABCD, 0xF, 0x320),
+        (0x0000, 0, 0),
+        (0xFFFF, 0xF, 0xFFF),
+    ];
+    for &(cap_id, cap_version, next_ptr) in cases {
+        let raw = (cap_id as u32)
+            | ((cap_version as u32 & 0xF) << 16)
+            | ((next_ptr as u32 & 0xFFF) << 20);
+        let h = ExtCapHeader::decode(raw);
+        if h.cap_id != cap_id || h.cap_version != cap_version || h.next_ptr != next_ptr {
+            return TestResult::Fail("ExtCapHeader field round-trip");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_ext_cap_header_round_trip_full);
+
+fn smoke_aer_is_aer_classifier() -> TestResult {
+    // Only AER_CAP_ID (0x0001) classifies as AER.
+    use crate::pcie_aer::{ExtCapHeader, AER_CAP_ID};
+    let aer = ExtCapHeader { cap_id: AER_CAP_ID, cap_version: 1, next_ptr: 0 };
+    if !aer.is_aer() {
+        return TestResult::Fail("AER header not classified as AER");
+    }
+    let not_aer = ExtCapHeader { cap_id: 0x0008, cap_version: 1, next_ptr: 0 };
+    if not_aer.is_aer() {
+        return TestResult::Fail("non-AER cap classified as AER");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_is_aer_classifier);
+
+fn smoke_aer_classify_uncorrectable_table() -> TestResult {
+    // Status==0 → None; status set + severity overlap → Severe;
+    // status set + severity zero → NonFatal.
+    use crate::pcie_aer::{classify_uncorrectable, ue, UeSeverity};
+    if classify_uncorrectable(0, ue::DEFAULT_SEVERE) != UeSeverity::None {
+        return TestResult::Fail("status=0 should be None");
+    }
+    if classify_uncorrectable(0, 0) != UeSeverity::None {
+        return TestResult::Fail("status=0+severity=0 should be None");
+    }
+    // POISONED_TLP isn't in DEFAULT_SEVERE → NonFatal.
+    if classify_uncorrectable(ue::POISONED_TLP, ue::DEFAULT_SEVERE) != UeSeverity::NonFatal {
+        return TestResult::Fail("status w/o overlapping severity should be NonFatal");
+    }
+    // MALFORMED_TLP is in DEFAULT_SEVERE → Severe.
+    if classify_uncorrectable(ue::MALFORMED_TLP, ue::DEFAULT_SEVERE) != UeSeverity::Severe {
+        return TestResult::Fail("MALFORMED_TLP with default severity should be Severe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_classify_uncorrectable_table);
+
+fn smoke_aer_header_log_decodes_le_words() -> TestResult {
+    // 16-byte raw → 4 little-endian u32 words.
+    use crate::pcie_aer::HeaderLog;
+    let raw: [u8; 16] = [
+        0x01, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x01, 0x02, 0x03,
+        0x04, 0x05, 0x06, 0x07,
+    ];
+    let log = HeaderLog::decode(&raw);
+    if log.0 != [1, u32::MAX, 0x0302_0100, 0x0706_0504] {
+        return TestResult::Fail("HeaderLog::decode word order/endianness wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_header_log_decodes_le_words);
+
+fn smoke_aer_msi_number_decodes_top_5_bits() -> TestResult {
+    use crate::pcie_aer::aer_msi_number;
+    let pins: &[(u32, u8)] = &[
+        (0, 0),
+        (1 << 27, 1),
+        (31 << 27, 31),
+        ((31u32 << 27) | 0x000F_FFFF, 31),
+    ];
+    for &(raw, want) in pins {
+        let got = aer_msi_number(raw);
+        if got != want {
+            let msg = alloc::format!(
+                "aer_msi_number({:#x}) = {} (expected {})",
+                raw, got, want
+            );
+            let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
+            return TestResult::Fail(s);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_msi_number_decodes_top_5_bits);
+
+fn smoke_aer_ue_severity_variants_distinct() -> TestResult {
+    use crate::pcie_aer::UeSeverity;
+    let all = [UeSeverity::None, UeSeverity::NonFatal, UeSeverity::Severe];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("UeSeverity variants compared equal");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_ue_severity_variants_distinct);
