@@ -1387,3 +1387,67 @@ fn smoke_hid_boot_mouse_button_mask() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_button_mask);
+
+// ── xhci sibling-port pairing (USB2 ↔ USB3) ──────────────────────
+
+fn smoke_xhci_sibling_port_pairs_within_overlap() -> TestResult {
+    // Two synthetic Supported Protocol caps: USB2 covers ports 1..=4,
+    // USB3 covers ports 5..=8. Range-relative index pairs them so
+    // sibling_port(1) == 5, sibling_port(2) == 6, etc., and
+    // sibling_port(5) == 1, sibling_port(6) == 2, etc.
+    use crate::xhci;
+    if !xhci::is_probed() {
+        return TestResult::Skip("xhci not probed");
+    }
+    // We can't construct a synthetic controller easily; just confirm
+    // that on the live controller every USB3 port with a non-zero
+    // sibling has a sibling that's marked USB2 (and vice versa),
+    // proving the table is self-consistent.
+    let max = xhci::with_controller(|c| c.connected_ports().iter().map(|(p, _)| *p).max().unwrap_or(0)).unwrap_or(0);
+    if max == 0 {
+        return TestResult::Skip("no connected port to walk");
+    }
+    let consistent = xhci::with_controller(|c| {
+        for p in 1..=max {
+            let sib = c.sibling_port(p);
+            if sib == 0 {
+                continue;
+            }
+            let p_proto = c.port_protocol(p);
+            let s_proto = c.port_protocol(sib);
+            if !((p_proto == 2 && s_proto == 3) || (p_proto == 3 && s_proto == 2)) {
+                return false;
+            }
+            // Symmetry: sibling of sibling is self.
+            if c.sibling_port(sib) != p {
+                return false;
+            }
+        }
+        true
+    })
+    .unwrap_or(false);
+    if consistent {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("sibling table not USB2↔USB3 symmetric")
+    }
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_sibling_port_pairs_within_overlap);
+
+fn smoke_xhci_sibling_port_zero_when_no_sibling() -> TestResult {
+    // sibling_port for port 0 (sentinel) and port > max_ports is 0.
+    use crate::xhci;
+    if !xhci::is_probed() {
+        return TestResult::Skip("xhci not probed");
+    }
+    let result = xhci::with_controller(|c| {
+        c.sibling_port(0) == 0 && c.sibling_port(255) == 0
+    })
+    .unwrap_or(false);
+    if result {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("out-of-range sibling_port returned non-zero")
+    }
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_sibling_port_zero_when_no_sibling);

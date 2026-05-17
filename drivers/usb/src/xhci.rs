@@ -391,6 +391,28 @@ pub struct Xhci {
     /// PORTSC array, so a naive 1..=max_ports walk would try the
     /// USB3 sibling and then fail Address Device.
     port_protocols: [u8; 256],
+    /// USB2 ↔ USB3 sibling-port pairing. `port_siblings[N]` returns
+    /// the OTHER logical port number that corresponds to the same
+    /// physical receptacle. 0 = no sibling (xHCI lacks a second
+    /// Supported Protocol Capability matching this port).
+    ///
+    /// Computed at init by zip-pairing the per-cap (port_off,
+    /// port_count) ranges of the USB2 and USB3 caps: cap2 port N
+    /// pairs with cap3 port N at the same offset within their
+    /// respective ranges. xHCI 1.2 §7.2.2 / §7.2.2.1.4: the
+    /// Compatible Port Offset / Compatible Port Count fields name
+    /// a contiguous range of PORTSC entries; equivalent-physical-
+    /// port pairing across protocols is by index within the range.
+    ///
+    /// Used by connected_ports() to suppress spurious USB3 CCS
+    /// reports when a USB2 device is plugged in: AMD Renoir's xHCI
+    /// flags the USB3 logical port "connected" with PLS=Polling
+    /// because the SuperSpeed PHY sees voltage on D+/D-, but link
+    /// training never completes (device is USB2-only). The actual
+    /// device-bearing port is the USB2 sibling; reporting both
+    /// causes the supervisor to chase a port that will never
+    /// Address-Device.
+    port_siblings: [u8; 256],
     /// DCBAA backing — kept alive for the controller's lifetime.
     dcbaa: DmaBuffer,
     cmd_ring: DmaBuffer,
@@ -769,6 +791,13 @@ impl Xhci {
         // for cap id 2 (Supported Protocol) which describes a
         // contiguous range of port numbers + their USB version.
         let mut port_protocols = [0u8; 256];
+        let mut port_siblings = [0u8; 256];
+        // Up to four Supported Protocol caps in practice (USB2 +
+        // USB3 each per host-controller half on some xHCIs). Track
+        // (major, port_off, port_count) so we can zip-pair them
+        // after the scan.
+        let mut proto_caps: [(u8, usize, usize); 4] = [(0, 0, 0); 4];
+        let mut proto_caps_n: usize = 0;
         let xecp_dwords = (hcc1 >> 16) & 0xFFFF;
         if xecp_dwords != 0 {
             let mut cap_off = (xecp_dwords as u64) * 4;
@@ -852,6 +881,10 @@ impl Xhci {
                                 port_protocols[p] = major;
                             }
                         }
+                        if proto_caps_n < proto_caps.len() {
+                            proto_caps[proto_caps_n] = (major, port_off, port_count);
+                            proto_caps_n += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -859,6 +892,38 @@ impl Xhci {
                     break;
                 }
                 cap_off += next_dwords * 4;
+            }
+        }
+
+        // Zip-pair USB2 ↔ USB3 Supported Protocol caps. Two caps with
+        // matching port_count (one major=2, one major=3) describe the
+        // same physical ports at different logical PORTSC indices.
+        // Pair them by intra-range index — xHCI 1.2 §7.2.2 names no
+        // explicit pairing field, but in practice every implementation
+        // (Intel, AMD, ASMedia, VIA) lays the USB2 and USB3 sub-ranges
+        // such that range-relative index identifies the same physical
+        // receptacle. If port_counts differ we pair the overlap and
+        // leave the unmatched tail with no sibling.
+        let mut idx_usb2: Option<usize> = None;
+        let mut idx_usb3: Option<usize> = None;
+        for (i, (major, _, _)) in proto_caps[..proto_caps_n].iter().enumerate() {
+            match major {
+                2 if idx_usb2.is_none() => idx_usb2 = Some(i),
+                3 if idx_usb3.is_none() => idx_usb3 = Some(i),
+                _ => {}
+            }
+        }
+        if let (Some(i2), Some(i3)) = (idx_usb2, idx_usb3) {
+            let (_, off2, n2) = proto_caps[i2];
+            let (_, off3, n3) = proto_caps[i3];
+            let n = n2.min(n3);
+            for i in 0..n {
+                let p2 = off2 + i;
+                let p3 = off3 + i;
+                if p2 > 0 && p2 < 256 && p3 > 0 && p3 < 256 {
+                    port_siblings[p2] = p3 as u8;
+                    port_siblings[p3] = p2 as u8;
+                }
             }
         }
 
@@ -1174,6 +1239,7 @@ impl Xhci {
             db_off: dboff as u64,
             csz_64byte,
             port_protocols,
+            port_siblings,
             dcbaa,
             cmd_ring,
             event_ring,
@@ -1361,16 +1427,47 @@ impl Xhci {
     /// protocol siblings first wastes an enumeration round and can
     /// kick the device into a re-attach loop on some firmwares).
     /// Allocates — fine outside hot paths.
+    ///
+    /// AMD Renoir-class quirk: when a USB2 device plugs into a
+    /// physical receptacle, both the USB2 logical port AND its
+    /// USB3 sibling can report CCS=1 — the SuperSpeed PHY sees
+    /// voltage on D+/D- and flags "connected" even though link
+    /// training never completes (device is FS/HS, not SS).
+    /// The USB3 entry then sits at PLS=Polling with PED=0 forever
+    /// and Address Device fails on it. Filter that case out: a
+    /// USB3 port whose USB2 sibling is ALSO connected is treated
+    /// as the spurious entry; the supervisor reaches the real
+    /// device through the USB2 sibling instead.
     pub fn connected_ports(&self) -> alloc::vec::Vec<(u8, u32)> {
         let mut usb2 = alloc::vec::Vec::new();
         let mut usb3 = alloc::vec::Vec::new();
         let mut other = alloc::vec::Vec::new();
+        // Pre-pass: which USB2 ports report CCS? Used to mute
+        // sibling-CCS spurious USB3 entries below.
+        let mut usb2_ccs = [false; 256];
+        for p in 1..=self.caps.max_ports {
+            if self.port_protocol(p) == 2 {
+                if let Some(v) = self.portsc(p) {
+                    if v & PORTSC_CCS != 0 {
+                        usb2_ccs[p as usize] = true;
+                    }
+                }
+            }
+        }
         for p in 1..=self.caps.max_ports {
             if let Some(v) = self.portsc(p) {
                 if v & PORTSC_CCS != 0 {
                     match self.port_protocol(p) {
                         2 => usb2.push((p, v)),
-                        3 => usb3.push((p, v)),
+                        3 => {
+                            let sib = self.sibling_port(p);
+                            if sib != 0 && usb2_ccs[sib as usize] {
+                                // Spurious USB3 connect — the real
+                                // device is on the USB2 sibling.
+                                continue;
+                            }
+                            usb3.push((p, v));
+                        }
                         _ => other.push((p, v)),
                     }
                 }
@@ -1379,6 +1476,19 @@ impl Xhci {
         usb2.extend(usb3);
         usb2.extend(other);
         usb2
+    }
+
+    /// Sibling logical port (paired USB2 ↔ USB3 entry from the
+    /// Supported Protocol Capability) for `port`. Returns 0 when
+    /// there's no sibling (single-protocol controller, or `port`
+    /// outside any cap's range).
+    pub fn sibling_port(&self, port: u8) -> u8 {
+        let i = port as usize;
+        if i < self.port_siblings.len() {
+            self.port_siblings[i]
+        } else {
+            0
+        }
     }
 
     /// Drive `port` through reset. Per xHCI 1.2 §4.19.5 this
