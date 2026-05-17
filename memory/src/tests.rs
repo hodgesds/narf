@@ -3770,3 +3770,250 @@ fn smoke_memory_stack_guard_bit_outside_prot_mask() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_stack_guard_bit_outside_prot_mask);
+
+// ── unmap returns frames to the buddy allocator ──────────────────
+//
+// sys_munmap and sys_brk-shrink route through
+// `AddressSpace::unmap_region`, which walks every page's PTE,
+// unmaps the leaf, and calls `free_frame` per phys. Pre-fix the
+// bookkeeping entry was popped but the frames stayed live — those
+// pages leaked until process exit. These smokes pin the free-back
+// path against a future regression by snapshotting the buddy's
+// free-frame count across the unmap.
+
+/// `unmap_region` returns every backed frame to the allocator.
+/// We snapshot the buddy's free count before mapping, allocate
+/// + map a multi-page region, then unmap and confirm the free
+/// count returns to (or above) the original — equality holds
+/// when no concurrent task is allocating; allocator may also
+/// have merged buddies which is fine.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_unmap_region_returns_frames() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let pages = 4usize;
+    let before = crate::frame::stats().free;
+    if before == 0 {
+        core::mem::forget(a);
+        return TestResult::Skip("frame allocator drained");
+    }
+    let mut phys_list = alloc::vec::Vec::with_capacity(pages);
+    for _ in 0..pages {
+        let f = match crate::alloc_frame() {
+            Ok(f) => f,
+            Err(_) => {
+                core::mem::forget(a);
+                return TestResult::Skip("frame allocator drained mid-test");
+            }
+        };
+        phys_list.push(f.start_address());
+    }
+    let vbase = 0x0000_0080_0600_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: (pages as u64) * 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: phys_list,
+    })
+    .expect("map_region");
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+    let after_alloc = crate::frame::stats().free;
+    if a.unmap_region(VirtAddr::new(vbase)).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("unmap_region failed");
+    }
+    let after_unmap = crate::frame::stats().free;
+    core::mem::forget(a);
+    // Every backed frame must have come back.
+    if after_unmap < after_alloc + pages {
+        return TestResult::Fail("unmap_region didn't return all frames");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_unmap_region_returns_frames);
+
+/// Lazy region (every `phys[i] == 0`) unmap: nothing to free,
+/// the unmap must not crash and the free count is unchanged.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_unmap_region_lazy_is_noop_on_free_count() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0700_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3],
+    })
+    .expect("map_region");
+    let before = crate::frame::stats().free;
+    if a.unmap_region(VirtAddr::new(vbase)).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("unmap_region on lazy region failed");
+    }
+    let after = crate::frame::stats().free;
+    core::mem::forget(a);
+    // Lazy slots have no frame backing — free count must not move.
+    if after != before {
+        return TestResult::Fail("lazy unmap moved free-frame count unexpectedly");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_unmap_region_lazy_is_noop_on_free_count);
+
+/// Mixed region (some lazy + some backed) returns ONLY the
+/// backed slots. The demand-paging contract says lazy slots had
+/// no frame; only post-demand-alloc slots own one.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_unmap_region_mixed_lazy_and_backed() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let backed = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let vbase = 0x0000_0080_0800_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        // page 0: lazy, page 1: backed, page 2: lazy
+        phys: alloc::vec![PhysAddr::new(0), backed, PhysAddr::new(0)],
+    })
+    .expect("map_region");
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+    let before = crate::frame::stats().free;
+    if a.unmap_region(VirtAddr::new(vbase)).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("unmap_region failed");
+    }
+    let after = crate::frame::stats().free;
+    core::mem::forget(a);
+    // Exactly one frame should have come back.
+    if after < before + 1 {
+        return TestResult::Fail("backed page wasn't returned to allocator");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_unmap_region_mixed_lazy_and_backed);
+
+/// Repeated alloc+map / unmap cycles must keep the allocator's
+/// free count stable — leaks would walk it monotonically down.
+/// Anchored against the brk-shrink + munmap teardown path.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let baseline = crate::frame::stats().free;
+    let pages = 3usize;
+    for cycle in 0..4 {
+        let mut phys_list = alloc::vec::Vec::with_capacity(pages);
+        for _ in 0..pages {
+            let f = match crate::alloc_frame() {
+                Ok(f) => f,
+                Err(_) => {
+                    core::mem::forget(a);
+                    return TestResult::Skip("frame allocator drained mid-test");
+                }
+            };
+            phys_list.push(f.start_address());
+        }
+        let vbase = 0x0000_0080_0900_0000u64 + (cycle as u64) * 0x10_0000;
+        a.map_region(Region {
+            base: VirtAddr::new(vbase),
+            len: (pages as u64) * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys_list,
+        })
+        .expect("map_region");
+        if unsafe { a.materialize() }.is_err() {
+            core::mem::forget(a);
+            return TestResult::Fail("materialize failed");
+        }
+        if a.unmap_region(VirtAddr::new(vbase)).is_err() {
+            core::mem::forget(a);
+            return TestResult::Fail("unmap_region failed");
+        }
+    }
+    let after = crate::frame::stats().free;
+    core::mem::forget(a);
+    // After balanced cycles the free count must NOT have dropped
+    // below baseline — a leak would walk it downward by `pages *
+    // cycles` (12 frames here).
+    if after + pages < baseline {
+        return TestResult::Fail("repeated map+unmap leaked frames");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_unmap_region_cycle_no_leak);
+
+/// `unmap_region` clears the bookkeeping AND tears down the PTEs
+/// — a `translate` on the just-unmapped vaddr must return None.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_unmap_region_clears_ptes() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let frame = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let vbase = 0x0000_0080_0A00_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frame],
+    })
+    .expect("map_region");
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+    let before = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
+    if before.is_none() {
+        core::mem::forget(a);
+        return TestResult::Fail("post-materialize translate returned None");
+    }
+    if a.unmap_region(VirtAddr::new(vbase)).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("unmap_region failed");
+    }
+    let after = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
+    core::mem::forget(a);
+    if after.is_some() {
+        return TestResult::Fail("PTE survived unmap_region");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_unmap_region_clears_ptes);
