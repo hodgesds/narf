@@ -187,3 +187,112 @@ fn smoke_table_header_verifies_signature_and_checksum() -> TestResult {
     }
 }
 kernel_test_in!("efi/system-table", smoke_table_header_verifies_signature_and_checksum);
+
+// ── deep efi/time + efi/reset coverage ────────────────────────────
+
+fn smoke_efi_time_decode_rejects_short_buffer() -> TestResult {
+    use crate::time::{EfiTime, TimeError};
+    if EfiTime::decode(&[0u8; 15]) != Err(TimeError::Short) {
+        return TestResult::Fail("< 16 bytes didn't surface Short");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/time", smoke_efi_time_decode_rejects_short_buffer);
+
+fn smoke_efi_time_rejects_year_outside_range() -> TestResult {
+    use crate::time::{EfiTime, TimeError};
+    let bad = EfiTime { year: 1800, month: 1, day: 1, ..EfiTime::default() };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("year=1800 accepted");
+    }
+    let bad = EfiTime { year: 10_000, month: 1, day: 1, ..EfiTime::default() };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("year=10000 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/time", smoke_efi_time_rejects_year_outside_range);
+
+fn smoke_efi_time_rejects_month_day_hour_minute() -> TestResult {
+    use crate::time::{EfiTime, TimeError};
+    let base = EfiTime { year: 2025, month: 1, day: 1, ..EfiTime::default() };
+    let bad = EfiTime { month: 0, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("month=0 accepted");
+    }
+    let bad = EfiTime { month: 13, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("month=13 accepted");
+    }
+    let bad = EfiTime { day: 0, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("day=0 accepted");
+    }
+    let bad = EfiTime { day: 32, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("day=32 accepted");
+    }
+    let bad = EfiTime { hour: 24, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("hour=24 accepted");
+    }
+    let bad = EfiTime { minute: 60, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("minute=60 accepted");
+    }
+    let bad = EfiTime { second: 60, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("second=60 accepted");
+    }
+    let bad = EfiTime { nanosecond: 1_000_000_000, ..base };
+    if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
+        return TestResult::Fail("nanosecond=10^9 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/time", smoke_efi_time_rejects_month_day_hour_minute);
+
+fn smoke_efi_time_unspecified_timezone_sentinel() -> TestResult {
+    use crate::time::EFI_UNSPECIFIED_TIMEZONE;
+    if EFI_UNSPECIFIED_TIMEZONE != 0x07FF {
+        return TestResult::Fail("EFI_UNSPECIFIED_TIMEZONE drifted from 0x07FF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/time", smoke_efi_time_unspecified_timezone_sentinel);
+
+fn smoke_efi_time_capabilities_decode() -> TestResult {
+    use crate::time::{EfiTimeCapabilities, TimeError};
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&1000u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&50_000u32.to_le_bytes());
+    buf[8] = 1;
+    let caps = EfiTimeCapabilities::decode(&buf).expect("decode");
+    if caps.resolution != 1000 || caps.accuracy != 50_000 || !caps.sets_to_zero {
+        return TestResult::Fail("EfiTimeCapabilities field decode wrong");
+    }
+    if EfiTimeCapabilities::decode(&[0u8; 11]) != Err(TimeError::Short) {
+        return TestResult::Fail("< 12 bytes didn't surface Short");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/time", smoke_efi_time_capabilities_decode);
+
+fn smoke_efi_reset_type_variants_distinct() -> TestResult {
+    use crate::reset::EfiResetType;
+    let all = [
+        EfiResetType::Cold,
+        EfiResetType::Warm,
+        EfiResetType::Shutdown,
+        EfiResetType::PlatformSpecific,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("EfiResetType variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/reset", smoke_efi_reset_type_variants_distinct);
