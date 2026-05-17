@@ -3304,3 +3304,229 @@ fn smoke_hugepage_alloc_2m_empty_after_no_reserve() -> TestResult {
     }
 }
 kernel_test_in!("memory/hugepage", smoke_hugepage_alloc_2m_empty_after_no_reserve);
+
+// ── demand paging — AddressSpace::demand_alloc_page surface ──────
+//
+// Anchored on the sys_mmap deferred-back flow: install a region
+// with `phys[i] == 0` so materialize() leaves no PTE for that page;
+// the user-mode #PF handler then routes the fault into
+// `demand_alloc_page`, which allocates + zeroes a frame and
+// installs the leaf PTE with the region's perms. These smokes
+// drive `demand_alloc_page` directly (the trap path's plumbing is
+// covered by smoke_memory_lazy_phys_zero_skipped + the
+// userspace mmap tests).
+//
+// Cite: Intel SDM Vol. 3 §4.7 — page-fault error code semantics
+// the kernel #PF dispatch uses to identify a P=0 (not-present)
+// fault and route it here.
+
+/// `demand_alloc_page` on a lazy slot must allocate a backing
+/// frame, record it in the region's `phys`, and install a
+/// translatable PTE with the region's perm bits.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_demand_alloc_installs_pte() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region");
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+    if unsafe { translate_arch(a.root, VirtAddr::new(vbase)) }.is_some() {
+        core::mem::forget(a);
+        return TestResult::Fail("lazy slot had a PTE before demand-alloc");
+    }
+    if unsafe { a.demand_alloc_page(VirtAddr::new(vbase + 0x123)) }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("demand_alloc_page failed");
+    }
+    let pte = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
+    core::mem::forget(a);
+    if pte.is_none() {
+        return TestResult::Fail("demand-alloc didn't install a PTE");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_demand_alloc_installs_pte);
+
+/// `demand_alloc_page` on an already-backed slot is a spurious
+/// fault (TLB shootdown race). Returns AlignmentMismatch so the
+/// trap handler retries cleanly without double-allocating.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let frame = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let vbase = 0x0000_0080_0010_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frame],
+    })
+    .expect("map_region");
+    let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
+    core::mem::forget(a);
+    match r {
+        Err(AddressSpaceError::AlignmentMismatch) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("backed slot didn't surface spurious-fault sentinel")
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_demand_alloc_already_backed_spurious);
+
+/// `demand_alloc_page` on a PROT_NONE region is a real access
+/// violation; surface as Unmapped so the trap handler can route
+/// the SEGV signal.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_demand_alloc_prot_none_is_unmapped() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0020_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms(0),
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region");
+    let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
+    core::mem::forget(a);
+    match r {
+        Err(AddressSpaceError::Unmapped) => TestResult::Pass,
+        _ => TestResult::Fail("PROT_NONE fault did not surface Unmapped"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_demand_alloc_prot_none_is_unmapped);
+
+/// `demand_alloc_page` outside any region returns Unmapped so the
+/// trap handler falls through to the panic / signal path.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_demand_alloc_outside_region_unmapped() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let r = unsafe { a.demand_alloc_page(VirtAddr::new(0x0000_0090_0000_0000)) };
+    core::mem::forget(a);
+    match r {
+        Err(AddressSpaceError::Unmapped) => TestResult::Pass,
+        _ => TestResult::Fail("out-of-region fault did not surface Unmapped"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_demand_alloc_outside_region_unmapped);
+
+/// Multi-page lazy region: each `demand_alloc_page` call must
+/// allocate a *distinct* frame and install a distinct PTE per
+/// page; the frame allocator is a freelist so identical-frame
+/// regression is the failure mode we're guarding against.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_demand_alloc_multi_page_distinct_frames() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0030_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3],
+    })
+    .expect("map_region");
+    for i in 0..3 {
+        if unsafe { a.demand_alloc_page(VirtAddr::new(vbase + (i as u64) * 0x1000)) }.is_err() {
+            core::mem::forget(a);
+            return TestResult::Fail("demand_alloc_page failed mid-loop");
+        }
+    }
+    let p0 = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
+    let p1 = unsafe { translate_arch(a.root, VirtAddr::new(vbase + 0x1000)) };
+    let p2 = unsafe { translate_arch(a.root, VirtAddr::new(vbase + 0x2000)) };
+    core::mem::forget(a);
+    if p0.is_none() || p1.is_none() || p2.is_none() {
+        return TestResult::Fail("post-demand-alloc translate returned None");
+    }
+    if p0 == p1 || p1 == p2 || p0 == p2 {
+        return TestResult::Fail("demand_alloc_page handed out duplicate frames");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_demand_alloc_multi_page_distinct_frames);
+
+/// Fresh demand-allocated frame is zero-filled. Anonymous mmap
+/// semantics require the user observes zeros — not the previous
+/// owner's bytes.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0040_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region");
+    if unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("demand_alloc_page failed");
+    }
+    let phys = match a.lookup(VirtAddr::new(vbase)) {
+        Some(r) => r.phys[0],
+        None => {
+            core::mem::forget(a);
+            return TestResult::Fail("region disappeared after demand alloc");
+        }
+    };
+    // SAFETY: identity-mapped low 4 GiB; the frame was just returned
+    // by the allocator and is exclusively held by `a`.
+    let all_zero = unsafe {
+        let p = phys.raw() as *const u8;
+        (0..4096).all(|i| *p.add(i) == 0)
+    };
+    core::mem::forget(a);
+    if !all_zero {
+        return TestResult::Fail("demand-allocated frame was not zero-filled");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_demand_alloc_zero_fills_frame);
