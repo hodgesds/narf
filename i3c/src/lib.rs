@@ -119,4 +119,75 @@ mod tests {
         }
     }
     kernel_test_in!("i3c", smoke_i3c_cap_kind);
+
+    fn smoke_i3c_error_variants_distinct() -> TestResult {
+        let all = [
+            I3cError::NoDevice,
+            I3cError::BusBusy,
+            I3cError::Timeout,
+            I3cError::Nack,
+            I3cError::CrcError,
+            I3cError::Denied,
+            I3cError::InvalidArgs,
+            I3cError::HardwareError,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("I3cError variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_error_variants_distinct);
+
+    fn smoke_i3c_mock_read_op_fills_buf_from_mock() -> TestResult {
+        // The MockI3c here writes 0x55 to every Read byte. Exercise
+        // an end-to-end Write-then-Read transfer and assert the
+        // Write tail landed in `transfers` while the Read buf was
+        // populated.
+        narf_scheduler::__reset_queues_for_test();
+        let mock = Arc::new(MockI3c {
+            transfers: IrqSafeSpinLock::new(Vec::new()),
+        });
+        let ok = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let m = mock.clone();
+        let o = ok.clone();
+        narf_scheduler::spawn(async move {
+            let mut rbuf = [0u8; 3];
+            let mut ops = [I3cOp::Write(&[0xAB, 0xCD]), I3cOp::Read(&mut rbuf)];
+            if m.transfer(0x42, &mut ops).await.is_ok()
+                && rbuf == [0x55, 0x55, 0x55]
+            {
+                o.store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if !ok.load(core::sync::atomic::Ordering::SeqCst) {
+            return TestResult::Fail("Write-Read round-trip didn't complete");
+        }
+        // Mock pushed addr then write bytes into transfers.
+        let log = mock.transfers.lock();
+        if log.len() < 3 || log[0] != 0x42 || log[1] != 0xAB || log[2] != 0xCD {
+            return TestResult::Fail("Write tail not recorded by mock");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_mock_read_op_fills_buf_from_mock);
+
+    fn smoke_i3c_ibi_payload_field_round_trip() -> TestResult {
+        let p = IbiPayload {
+            addr: 0x3C,
+            data: alloc::vec![0xDE, 0xAD],
+        };
+        if p.addr != 0x3C {
+            return TestResult::Fail("IbiPayload.addr round-trip");
+        }
+        if p.data != alloc::vec![0xDE, 0xAD] {
+            return TestResult::Fail("IbiPayload.data round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_ibi_payload_field_round_trip);
 }

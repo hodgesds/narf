@@ -117,4 +117,80 @@ mod tests {
         }
     }
     kernel_test_in!("pmbus", smoke_pmbus_cap_kind);
+
+    fn smoke_pmbus_error_variants_distinct() -> TestResult {
+        let all = [
+            PmBusError::NotPresent,
+            PmBusError::Timeout,
+            PmBusError::Nack,
+            PmBusError::CrcError,
+            PmBusError::InvalidArgs,
+            PmBusError::Denied,
+            PmBusError::HardwareError,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("PmBusError variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pmbus", smoke_pmbus_error_variants_distinct);
+
+    fn smoke_pmbus_power_reading_field_round_trip() -> TestResult {
+        let r = PowerReading {
+            voltage_mv: 12_345,
+            current_ma: 6_789,
+            power_mw: 80_000,
+            temp_mc: -25_000,
+        };
+        if r.voltage_mv != 12_345
+            || r.current_ma != 6_789
+            || r.power_mw != 80_000
+            || r.temp_mc != -25_000
+        {
+            return TestResult::Fail("PowerReading fields didn't round-trip");
+        }
+        // Clone preserves all four fields.
+        let c = r.clone();
+        if c.voltage_mv != r.voltage_mv
+            || c.current_ma != r.current_ma
+            || c.power_mw != r.power_mw
+            || c.temp_mc != r.temp_mc
+        {
+            return TestResult::Fail("PowerReading Clone dropped a field");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pmbus", smoke_pmbus_power_reading_field_round_trip);
+
+    fn smoke_pmbus_info_field_round_trip() -> TestResult {
+        let info = PmBusInfo {
+            manufacturer: alloc::vec![b'X', b'Y', b'Z'],
+            model: alloc::vec![b'9', b'0'],
+            revision: 7,
+        };
+        if info.manufacturer != alloc::vec![b'X', b'Y', b'Z'] {
+            return TestResult::Fail("manufacturer round-trip");
+        }
+        if info.model != alloc::vec![b'9', b'0'] {
+            return TestResult::Fail("model round-trip");
+        }
+        if info.revision != 7 {
+            return TestResult::Fail("revision round-trip");
+        }
+        // Eq derives field-wise.
+        let other = PmBusInfo {
+            manufacturer: alloc::vec![b'X', b'Y', b'Z'],
+            model: alloc::vec![b'9', b'0'],
+            revision: 8,
+        };
+        if info == other {
+            return TestResult::Fail("Eq ignored revision");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pmbus", smoke_pmbus_info_field_round_trip);
 }

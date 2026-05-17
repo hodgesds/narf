@@ -310,4 +310,204 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("tpm/tpm2", smoke_tpm2_get_random_response_decode);
+
+    // ── deep tpm/commands coverage ────────────────────────────────────
+    //
+    // `commands::CommandBuilder` + `ResponseParser` build / parse TPM2
+    // wire frames. The fields are big-endian per TCG Part 1 §17.
+
+    fn smoke_tpm_command_builder_writes_size_in_header() -> TestResult {
+        use crate::commands::{CommandBuilder, CommandCode};
+        // After finish(), bytes 2..6 contain the total command length
+        // in big-endian. Build the smallest possible cmd (GetRandom
+        // with bytes=0 produces 12 bytes: 10-byte hdr + 2-byte param).
+        let buf = CommandBuilder::get_random(0);
+        if buf.len() != 12 {
+            return TestResult::Fail("GetRandom(0) command length drifted from 12");
+        }
+        let size = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        if size as usize != buf.len() {
+            return TestResult::Fail("encoded size doesn't match Vec length");
+        }
+        // Tag = TPM_ST_NO_SESSIONS (0x8001).
+        if u16::from_be_bytes([buf[0], buf[1]]) != crate::commands::TPM_ST_NO_SESSIONS {
+            return TestResult::Fail("tag != TPM_ST_NO_SESSIONS");
+        }
+        // CC = GetRandom (0x0000_017B).
+        if u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]) != CommandCode::GetRandom as u32 {
+            return TestResult::Fail("cc != GetRandom");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/commands", smoke_tpm_command_builder_writes_size_in_header);
+
+    fn smoke_tpm_command_builder_pcr_read_encodes_selection() -> TestResult {
+        use crate::commands::{CommandBuilder, CommandCode};
+        // PCR_Read for PCR 7: selection mask byte 0 = 1 << 7 = 0x80.
+        let buf = CommandBuilder::pcr_read(7);
+        // Body starts at offset 10: count(u32) hashAlg(u16) sizeof(u8) mask(3)
+        // total body = 4 + 2 + 1 + 3 = 10 ⇒ command length = 20.
+        if buf.len() != 20 {
+            return TestResult::Fail("pcr_read length drifted from 20");
+        }
+        if u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]) != CommandCode::PcrRead as u32 {
+            return TestResult::Fail("cc != PcrRead");
+        }
+        // count == 1
+        if u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]]) != 1 {
+            return TestResult::Fail("count != 1");
+        }
+        // hashAlg == 0x000B (SHA256)
+        if u16::from_be_bytes([buf[14], buf[15]]) != crate::tpm2::TPM_ALG_SHA256 {
+            return TestResult::Fail("hashAlg != SHA256");
+        }
+        // sizeofSelect == 3
+        if buf[16] != 3 {
+            return TestResult::Fail("sizeofSelect != 3");
+        }
+        // mask: byte 0 bit 7 set
+        if buf[17] != 0x80 || buf[18] != 0 || buf[19] != 0 {
+            return TestResult::Fail("PCR 7 selection mask wrong");
+        }
+        // PCR 16 → mask byte 2 bit 0.
+        let buf16 = CommandBuilder::pcr_read(16);
+        if buf16[17] != 0 || buf16[18] != 0 || buf16[19] != 1 {
+            return TestResult::Fail("PCR 16 selection mask wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/commands", smoke_tpm_command_builder_pcr_read_encodes_selection);
+
+    fn smoke_tpm_command_builder_pcr_extend_carries_digest() -> TestResult {
+        use crate::commands::{CommandBuilder, CommandCode};
+        let digest = [0xA5u8; 32];
+        let buf = CommandBuilder::pcr_extend(3, &digest);
+        // Header (10) + pcrHandle (4) + authSize (4) + auth (9) +
+        // count (4) + hashAlg (2) + digest (32) = 65.
+        if buf.len() != 65 {
+            return TestResult::Fail("pcr_extend length drifted from 65");
+        }
+        if u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]) != CommandCode::PcrExtend as u32 {
+            return TestResult::Fail("cc != PcrExtend");
+        }
+        // pcrHandle BE u32 at body[0..4]
+        if u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]]) != 3 {
+            return TestResult::Fail("pcrHandle != 3");
+        }
+        // authSize == 9
+        if u32::from_be_bytes([buf[14], buf[15], buf[16], buf[17]]) != 9 {
+            return TestResult::Fail("authSize != 9");
+        }
+        // TPM_RS_PW handle 0x4000_0009
+        if u32::from_be_bytes([buf[18], buf[19], buf[20], buf[21]]) != 0x4000_0009 {
+            return TestResult::Fail("session handle != TPM_RS_PW");
+        }
+        // hashAlg = SHA256 at body offset 23..25 (after count u32)
+        // body starts at 10; pcrHandle(4)+authSize(4)+auth(9)+count(4) = 21
+        // so hashAlg lives at 10+21 = 31.
+        if u16::from_be_bytes([buf[31], buf[32]]) != crate::tpm2::TPM_ALG_SHA256 {
+            return TestResult::Fail("hashAlg != SHA256");
+        }
+        // Digest at 33..65.
+        if &buf[33..65] != digest.as_slice() {
+            return TestResult::Fail("digest tail wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/commands", smoke_tpm_command_builder_pcr_extend_carries_digest);
+
+    fn smoke_tpm_response_parser_rejects_short_buf() -> TestResult {
+        use crate::commands::ResponseParser;
+        use crate::types::TpmError;
+        // < 10 bytes → BadResponse.
+        match ResponseParser::new(&[0u8; 9]) {
+            Err(TpmError::BadResponse) => {}
+            _ => return TestResult::Fail("short buf didn't surface BadResponse"),
+        }
+        // Non-zero RC → HardwareError.
+        let mut buf = [0u8; 10];
+        buf[2..6].copy_from_slice(&10u32.to_be_bytes()); // size
+        buf[6..10].copy_from_slice(&0x101u32.to_be_bytes()); // RC = TPM_RC_FAILURE
+        match ResponseParser::new(&buf) {
+            Err(TpmError::HardwareError) => {}
+            _ => return TestResult::Fail("non-zero RC didn't surface HardwareError"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/commands", smoke_tpm_response_parser_rejects_short_buf);
+
+    fn smoke_tpm_response_parser_get_random_decodes_tail() -> TestResult {
+        use crate::commands::ResponseParser;
+        // 10-byte header (RC=0) + 2-byte size + 4 random bytes.
+        let mut buf = alloc::vec::Vec::new();
+        buf.extend_from_slice(&0x8001u16.to_be_bytes()); // tag
+        buf.extend_from_slice(&16u32.to_be_bytes()); // size
+        buf.extend_from_slice(&0u32.to_be_bytes()); // RC
+        buf.extend_from_slice(&4u16.to_be_bytes()); // random size
+        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let p = ResponseParser::new(&buf).expect("parse");
+        let r = p.parse_get_random().expect("parse_get_random");
+        if r != [0xDE, 0xAD, 0xBE, 0xEF] {
+            return TestResult::Fail("random tail decoded wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/commands", smoke_tpm_response_parser_get_random_decodes_tail);
+
+    // ── deep tpm/types coverage ───────────────────────────────────────
+
+    fn smoke_tpm_types_pcr_set_contains_walks_full_range() -> TestResult {
+        use crate::types::PcrSet;
+        // ALL contains every PCR 0..32; out-of-range (>=32) returns false.
+        for pcr in 0u32..32 {
+            if !PcrSet::ALL.contains(pcr) {
+                return TestResult::Fail("ALL didn't contain a PCR in range");
+            }
+        }
+        if PcrSet::ALL.contains(32) {
+            return TestResult::Fail("ALL.contains(32) should be false");
+        }
+        if PcrSet::ALL.contains(u32::MAX) {
+            return TestResult::Fail("ALL.contains(u32::MAX) should be false");
+        }
+        // NONE contains nothing.
+        for pcr in 0u32..32 {
+            if PcrSet::NONE.contains(pcr) {
+                return TestResult::Fail("NONE contained a PCR");
+            }
+        }
+        // Single-bit mask: PcrSet(1 << 5) contains only PCR 5.
+        let just5 = PcrSet(1u32 << 5);
+        if !just5.contains(5) {
+            return TestResult::Fail("just5 didn't contain 5");
+        }
+        if just5.contains(6) || just5.contains(4) {
+            return TestResult::Fail("just5 contained a non-5 PCR");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/types", smoke_tpm_types_pcr_set_contains_walks_full_range);
+
+    fn smoke_tpm_error_variants_distinct() -> TestResult {
+        use crate::types::TpmError;
+        let all = [
+            TpmError::NotPresent,
+            TpmError::LocalityTimeout,
+            TpmError::BusyTimeout,
+            TpmError::NoCommandBuffer,
+            TpmError::BadResponse,
+            TpmError::InvalidArgs,
+            TpmError::Denied,
+            TpmError::HardwareError,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("TpmError variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/types", smoke_tpm_error_variants_distinct);
 }

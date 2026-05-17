@@ -352,4 +352,170 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("spdm/handshake", smoke_spdm_challenge_carries_nonce);
+
+    // ── deep spdm/messages coverage ──────────────────────────────────
+
+    fn smoke_spdm_messages_header_encode_decode_round_trip() -> TestResult {
+        use crate::messages::SpdmHeader;
+        let h = SpdmHeader { version: 0x12, code: 0x84, param1: 0xAA, param2: 0xBB };
+        let mut buf = alloc::vec::Vec::new();
+        h.encode(&mut buf);
+        if buf.len() != 4 {
+            return TestResult::Fail("header encode != 4 bytes");
+        }
+        if buf[0] != 0x12 || buf[1] != 0x84 || buf[2] != 0xAA || buf[3] != 0xBB {
+            return TestResult::Fail("encoded header byte order drifted");
+        }
+        let d = SpdmHeader::decode(&buf).expect("decode");
+        if d != h {
+            return TestResult::Fail("decode didn't round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/messages", smoke_spdm_messages_header_encode_decode_round_trip);
+
+    fn smoke_spdm_messages_header_short_buf_rejected() -> TestResult {
+        use crate::messages::SpdmHeader;
+        if SpdmHeader::decode(&[0u8; 3]).is_some() {
+            return TestResult::Fail("3-byte buf should not decode");
+        }
+        if SpdmHeader::decode(&[0x12, 0x84, 0, 0]).is_none() {
+            return TestResult::Fail("4-byte buf should decode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/messages", smoke_spdm_messages_header_short_buf_rejected);
+
+    fn smoke_spdm_messages_request_response_codes_distinct() -> TestResult {
+        use crate::messages::{ErrorCode, RequestCode, ResponseCode};
+        let reqs = [
+            RequestCode::GetVersion as u8,
+            RequestCode::GetCapabilities as u8,
+            RequestCode::NegotiateAlgs as u8,
+            RequestCode::GetMeasurements as u8,
+        ];
+        for (i, a) in reqs.iter().enumerate() {
+            for (j, b) in reqs.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("RequestCode discriminants collapsed");
+                }
+            }
+        }
+        let rsps = [
+            ResponseCode::Version as u8,
+            ResponseCode::Capabilities as u8,
+            ResponseCode::Algorithms as u8,
+            ResponseCode::Measurements as u8,
+            ResponseCode::Error as u8,
+        ];
+        for (i, a) in rsps.iter().enumerate() {
+            for (j, b) in rsps.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("ResponseCode discriminants collapsed");
+                }
+            }
+        }
+        let errs = [
+            ErrorCode::InvalidRequest as u8,
+            ErrorCode::Busy as u8,
+            ErrorCode::UnexpectedRequest as u8,
+            ErrorCode::Unspecified as u8,
+            ErrorCode::DecryptError as u8,
+            ErrorCode::UnsupportedRequest as u8,
+            ErrorCode::RequestResend as u8,
+        ];
+        for (i, a) in errs.iter().enumerate() {
+            for (j, b) in errs.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("ErrorCode discriminants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/messages", smoke_spdm_messages_request_response_codes_distinct);
+
+    fn smoke_spdm_messages_get_capabilities_layout() -> TestResult {
+        use crate::messages::GetCapabilitiesRequest;
+        // 12-byte frame: 4-byte header + 1 reserved + 1 CT + 2 reserved
+        // + 4 flags-LE.
+        let buf = GetCapabilitiesRequest::encode(0x12);
+        if buf.len() != 12 {
+            return TestResult::Fail("GetCapabilities length != 12");
+        }
+        if buf[0] != 0x12 {
+            return TestResult::Fail("version byte drifted");
+        }
+        if buf[1] != 0xE1 {
+            return TestResult::Fail("code byte != REQ_GET_CAPABILITIES");
+        }
+        let flags = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if flags != 1 {
+            return TestResult::Fail("flags != CERT_CAP=1");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/messages", smoke_spdm_messages_get_capabilities_layout);
+
+    fn smoke_spdm_messages_get_measurements_carries_zero_nonce() -> TestResult {
+        use crate::messages::GetMeasurementsRequest;
+        let buf = GetMeasurementsRequest::encode(0x12, 7);
+        if buf.len() != 36 {
+            return TestResult::Fail("GetMeasurements length != 36");
+        }
+        if buf[0] != 0x12 {
+            return TestResult::Fail("version byte drifted");
+        }
+        if buf[3] != 7 {
+            return TestResult::Fail("index should live in Param2");
+        }
+        if buf[4..36].iter().any(|&b| b != 0) {
+            return TestResult::Fail("nonce should be zero-filled by encoder");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/messages", smoke_spdm_messages_get_measurements_carries_zero_nonce);
+
+    fn smoke_spdm_messages_get_version_pins_to_v10() -> TestResult {
+        // GET_VERSION must always carry version=0x10 per DSP0274; the
+        // existing "spdm/handshake" test pins the handshake module's
+        // encoder. This pins the messages-module encoder symmetric path.
+        use crate::messages::GetVersionRequest;
+        let buf = GetVersionRequest::encode();
+        if buf.len() != 4 {
+            return TestResult::Fail("GET_VERSION should be exactly 4 bytes");
+        }
+        if buf[0] != 0x10 {
+            return TestResult::Fail("GET_VERSION must carry version 0x10");
+        }
+        if buf[1] != 0x84 {
+            return TestResult::Fail("GET_VERSION code byte drifted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/messages", smoke_spdm_messages_get_version_pins_to_v10);
+
+    // ── deep spdm/types coverage ─────────────────────────────────────
+
+    fn smoke_spdm_types_error_variants_distinct() -> TestResult {
+        use crate::types::SpdmError;
+        use narf_tpm::TpmError;
+        let all = [
+            SpdmError::Transport,
+            SpdmError::Protocol,
+            SpdmError::Tpm(TpmError::NotPresent),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("SpdmError variants collapsed");
+                }
+            }
+        }
+        if SpdmError::Tpm(TpmError::NotPresent) == SpdmError::Tpm(TpmError::HardwareError) {
+            return TestResult::Fail("SpdmError::Tpm Eq ignored inner");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/types", smoke_spdm_types_error_variants_distinct);
 }
