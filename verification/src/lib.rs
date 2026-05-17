@@ -355,7 +355,7 @@ fn smoke_x86_64_tlb_shootdown_ipi() -> TestResult {
     // SAFETY: x2APIC online (BSP init), VECTOR_TLB_SHOOTDOWN handler
     // installed at boot, AP 1 online.
     unsafe {
-        ipi::shoot_va(0xFFFF_FFFF_8000_0000);
+        ipi::shoot_va(0xFFFF_FFFF_8000_0000, 0);
     }
     // shoot_va spins until AP acks; if it returned, the counter
     // already moved.
@@ -452,7 +452,7 @@ fn smoke_x86_64_shoot_range_one_ipi() -> TestResult {
     let before = ipi::ack_count(1);
     // SAFETY: x2APIC online; IPI handler installed at boot.
     unsafe {
-        ipi::shoot_range(0xFFFF_FFFF_8000_0000, 8);
+        ipi::shoot_range(0xFFFF_FFFF_8000_0000, 8, 0);
     }
     let after = ipi::ack_count(1);
     if after - before != 1 {

@@ -1302,3 +1302,176 @@ fn smoke_timer_pump_vector_matches_timer_constant() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/timer", smoke_timer_pump_vector_matches_timer_constant);
+
+// ── tag-aware TLB-shootdown IPI (asid-pcid-isolation §4) ──────────
+//
+// Refs:
+//   - Intel SDM Vol 2 INVPCID instruction reference
+//     https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+//   - Intel SDM Vol 3 §4.10 (Cache + TLB)        (same URL)
+//   - ARM DDI0487 D5.10 (TLBI instructions)
+//     https://developer.arm.com/documentation/ddi0487/latest/
+//
+// These pin the four contracts the bridge has to honour:
+//   1) the sender publishes the tag alongside VA + pages;
+//   2) tag-only requests now drive a real per-tag broadcast
+//      (no longer a no-op as the bridge used to leave it);
+//   3) tag == 0 keeps the legacy plain-INVLPG behaviour;
+//   4) the handler's INVPCID branch is taken when a non-zero tag
+//      arrives on a CPU that supports INVPCID.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ipi_shootdown_carries_tag_through() -> TestResult {
+    // Publish (tag=7, va=0x1000) directly into a peer CPU's pending
+    // slot WITHOUT sending the IPI, then read the slot back. Proves
+    // the publish-side wiring carries the tag end-to-end without
+    // depending on the handler running. Works on UP + SMP — no IPI
+    // is involved.
+    use crate::x86_64::ipi;
+    let self_cpu = narf_lib::percpu::current_cpu() as u32;
+    let peer = if self_cpu == 0 { 1 } else { 0 };
+    ipi::__publish_for_test(peer, 0x1000, 1, 7);
+    let observed = ipi::pending_tag(peer);
+    ipi::__clear_for_test(peer);
+    if observed != 7 {
+        return TestResult::Fail("publish path didn't carry tag=7 to peer slot");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_carries_tag_through);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_ipi_shootdown_carries_tag_through() -> TestResult {
+    // aarch64: inner-shareable TLBI (TLBI VAE1IS / ASIDE1IS, ARM
+    // DDI0487 D5.10) is broadcast in hardware, so no peer-IPI
+    // pending-state exists to observe. Skip cleanly so the test
+    // grid still records coverage.
+    TestResult::Skip("aarch64 uses inner-shareable TLBI; no peer-IPI publish-state")
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_carries_tag_through);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
+    // The bridge used to no-op for `(Some(tag), None, _)`; it now
+    // calls `shoot_tag_only` which broadcasts an IPI. Verify by
+    // checking that every peer's EVER_RECEIVED counter advances
+    // when we issue a tag-only ShootdownRequest.
+    use crate::x86_64::ipi;
+    use narf_memory::tlb_shootdown;
+    if narf_lib::smp::cpu_count() <= 1 {
+        return TestResult::Skip("UP boot — no peer CPUs");
+    }
+    let self_cpu = narf_lib::percpu::current_cpu() as u32;
+    let total = narf_lib::smp::cpu_count() as u32;
+    let mut snap = [0u64; narf_lib::percpu::MAX_CPUS];
+    for cpu in 0..total {
+        if cpu == self_cpu {
+            continue;
+        }
+        snap[cpu as usize] = ipi::ever_received(cpu);
+    }
+    tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::for_tag(3));
+    let mut spins = 0u32;
+    loop {
+        let mut all = true;
+        for cpu in 0..total {
+            if cpu == self_cpu {
+                continue;
+            }
+            if ipi::ever_received(cpu) <= snap[cpu as usize] {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            return TestResult::Pass;
+        }
+        spins += 1;
+        if spins > 10_000_000 {
+            return TestResult::Fail("tag-only request didn't broadcast IPI");
+        }
+        core::hint::spin_loop();
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_only_request_routes);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
+    TestResult::Skip("aarch64 routes tag-only flush through inner-shareable TLBI")
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_only_request_routes);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ipi_shootdown_tag_zero_uses_plain_invlpg() -> TestResult {
+    // tag=0 is the explicit "no PCID context — fall back to plain
+    // INVLPG" sentinel. Verify by:
+    //   1) sampling invpcid_path_taken() before,
+    //   2) issuing shoot_range(va, 1, 0),
+    //   3) observing that the INVPCID counter did NOT advance.
+    // On UP boots the broadcast no-ops so there's nothing to assert;
+    // skip cleanly.
+    use crate::x86_64::ipi;
+    if narf_lib::smp::cpu_count() <= 1 {
+        return TestResult::Skip("UP boot — no peer CPUs to run handler");
+    }
+    let before = ipi::invpcid_path_taken();
+    // SAFETY: x2APIC online; vector installed.
+    unsafe {
+        ipi::shoot_range(0xFFFF_FFFF_8000_2000, 1, 0);
+    }
+    // shoot_range spins until peers ACK, so any handler activity
+    // is already visible by the time we sample.
+    let after = ipi::invpcid_path_taken();
+    if after != before {
+        return TestResult::Fail("tag=0 shootdown took the INVPCID branch (should be plain INVLPG)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_zero_uses_plain_invlpg);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_ipi_shootdown_tag_zero_uses_plain_invlpg() -> TestResult {
+    TestResult::Skip("aarch64 doesn't expose an INVPCID-equivalent counter")
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_zero_uses_plain_invlpg);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ipi_shootdown_handler_invpcid_path_taken() -> TestResult {
+    // When supported() is true AND the published tag is non-zero,
+    // the handler MUST take the INVPCID branch on every peer. The
+    // counter increments once per receiving peer per shootdown.
+    use crate::x86_64::ipi;
+    if narf_lib::smp::cpu_count() <= 1 {
+        return TestResult::Skip("UP boot — no peer CPUs run handler");
+    }
+    if !narf_arch::x86_64::pcid::invpcid_supported() {
+        return TestResult::Skip("CPU lacks INVPCID");
+    }
+    let peers = (narf_lib::smp::cpu_count() - 1) as u64;
+    let before = ipi::invpcid_path_taken();
+    // SAFETY: x2APIC online; vector installed; tag=5 is non-zero.
+    unsafe {
+        ipi::shoot_range(0xFFFF_FFFF_8000_3000, 1, 5);
+    }
+    let after = ipi::invpcid_path_taken();
+    let delta = after.wrapping_sub(before);
+    if delta < peers {
+        return TestResult::Fail("INVPCID branch not taken on every peer");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_handler_invpcid_path_taken);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_ipi_shootdown_handler_invpcid_path_taken() -> TestResult {
+    TestResult::Skip("INVPCID is x86_64-specific (ARM uses TLBI VAE1IS)")
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_handler_invpcid_path_taken);

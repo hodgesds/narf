@@ -22,6 +22,17 @@ use narf_arch::aarch64::sysreg;
 /// IPI vector for "yield to scheduler / pick up new work."
 pub const SGI_RESCHED: u8 = 0;
 /// IPI vector for "invalidate VA range" (TLB shootdown).
+///
+/// Note: under ARM DDI0487 D5.10, `TLBI *E1IS` (inner-shareable)
+/// variants — `TLBI VAE1IS`, `TLBI ASIDE1IS`, `TLBI VMALLE1IS` —
+/// are broadcast in hardware to every CPU in the inner-shareable
+/// domain. The local TLBI from `narf_memory::tlb_shootdown` already
+/// covers peers in that domain, so this SGI is currently a delivery
+/// /diagnostic surface only (no tag-aware peer handler is needed).
+/// Tag-aware peer-IPI logic on aarch64 only becomes necessary if a
+/// future SoC reports a partitioned inner-shareable domain. Until
+/// then, the x86_64 path in `interrupts/src/x86_64/ipi.rs` carries
+/// the tag-aware contract for cross-CPU invalidation.
 pub const SGI_TLB_SHOOTDOWN: u8 = 1;
 /// IPI vector for "panic — stop touching the serial port + halt."
 pub const SGI_PANIC_HALT: u8 = 2;

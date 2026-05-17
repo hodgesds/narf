@@ -496,15 +496,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // every unmap_4kb fans out to peer CPUs.
             narf_memory::paging::set_shootdown_hook(|va| {
                 // SAFETY: x2APIC online, IPI handler installed.
+                // tag=0 → handler uses plain INVLPG (this hook fires
+                // from kernel-side mapping mutations that don't know
+                // which PCID owns the entry).
                 unsafe {
-                    narf_interrupts::x86_64::ipi::shoot_va(va);
+                    narf_interrupts::x86_64::ipi::shoot_va(va, 0);
                 }
             });
             // Range hook: one IPI for a contiguous run of pages.
             narf_memory::paging::set_range_shootdown_hook(|va, pages| {
                 // SAFETY: x2APIC online, IPI handler installed.
                 unsafe {
-                    narf_interrupts::x86_64::ipi::shoot_range(va, pages);
+                    narf_interrupts::x86_64::ipi::shoot_range(va, pages, 0);
                 }
             });
             // Install the unified `narf_memory::tlb_shootdown::shootdown`

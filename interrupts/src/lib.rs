@@ -81,45 +81,41 @@ fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
         return;
     }
     match (req.tag, req.addr, req.size) {
-        // Tag + VA + size: range shootdown the existing IPI infra
-        // already supports. Convert size to page count (4 KiB pages).
-        (Some(_tag), Some(va), Some(size)) => {
+        // Tag + VA + size: tag-aware range shootdown. Peers
+        // INVPCID(tag, va) per page. Intel SDM Vol 2 INVPCID type 0.
+        (Some(tag), Some(va), Some(size)) => {
             let pages = (size + 0xFFF) / 0x1000;
             // SAFETY: x2APIC online post-boot; vector installed.
             unsafe {
-                x86_64::ipi::shoot_range(va, pages.max(1));
+                x86_64::ipi::shoot_range(va, pages.max(1), tag);
             }
         }
         // Tag + VA single-page.
-        (Some(_tag), Some(va), None) => {
+        (Some(tag), Some(va), None) => {
             // SAFETY: same.
             unsafe {
-                x86_64::ipi::shoot_va(va);
+                x86_64::ipi::shoot_va(va, tag);
             }
         }
-        // Tag-only (full per-tag flush) — coarsen to broadcast
-        // VMALLE-equivalent. The existing IPI handler is VA-based,
-        // so we use a sentinel large-range shoot covering the kernel
-        // half low boundary; a tag-aware IPI lands in a follow-up.
-        // For now the local apply_local already invalidated the
-        // tag, so peers stay coherent for that tag's entries via
-        // their own apply_local on next switch_to.
-        (Some(_tag), None, _) => {
-            // No-op for fan-out: peer CPUs will pick up the
-            // generation bump on their next page-table switch.
-            // This matches the spec's "tag-scoped fan-out is a
-            // follow-up" line in §4.
+        // Tag-only (full per-tag flush) — real per-tag broadcast.
+        // Peers run `INVPCID(1, tag)` (single-context invalidation,
+        // Intel SDM Vol 3 §4.10.4.1). Matches the spec line in
+        // `memory/specification/asid-pcid-isolation.md` §4 about
+        // tag-scoped fan-out.
+        (Some(tag), None, _) => {
+            // SAFETY: x2APIC online; vector installed.
+            unsafe {
+                x86_64::ipi::shoot_tag_only(tag);
+            }
         }
-        // No tag — full TLB flush via VA = 0 sentinel won't work;
-        // the existing IPI handler skips va == 0. Fall back to
-        // per-CPU broadcast at vector level.
+        // No tag — full TLB flush. The handler skips invalidation
+        // when both tag and VA are zero; we still broadcast the
+        // IPI so every peer's ack counter advances and the
+        // shootdown_count atomic in narf-memory observes delivery.
+        // Peers will pick up the generation bump on their next
+        // page-table switch.
         (None, _, _) => {
             // SAFETY: x2APIC online; broadcast to all-but-self.
-            // The handler will INVLPG nothing (PENDING_VA is 0)
-            // and just bump its counter; peers should reload CR3
-            // explicitly when they observe a generation bump.
-            // Bumping every peer's ack counter still validates
-            // delivery during smokes.
             unsafe {
                 x86_64::apic::wrmsr_icr(
                     0xC0u64 << 12     // dest shorthand all-excluding-self
