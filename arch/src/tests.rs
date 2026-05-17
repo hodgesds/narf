@@ -1629,3 +1629,128 @@ fn smoke_arch_topology_discover_self_consistent() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch", smoke_arch_topology_discover_self_consistent);
+
+// ── low-value: arch caps()-when-unsupported invariants ──────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_avx10_zmm_implies_ymm_implies_xmm() -> TestResult {
+    // ZMM subsumes YMM subsumes XMM — no CPU can advertise ZMM
+    // without YMM (the bit decode in caps() could break this).
+    use crate::x86_64::avx10;
+    let c = avx10::caps();
+    if c.zmm && !c.ymm {
+        return TestResult::Fail("ZMM without YMM");
+    }
+    if c.ymm && !c.xmm {
+        return TestResult::Fail("YMM without XMM");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/avx10", smoke_arch_avx10_zmm_implies_ymm_implies_xmm);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_avx10_unsupported_yields_zero_caps() -> TestResult {
+    // When supported=false, every other bool must also be false
+    // and version == 0. The caps() early-return path is the only
+    // way that's achievable.
+    use crate::x86_64::avx10;
+    let c = avx10::caps();
+    if !c.supported {
+        if c.xmm || c.ymm || c.zmm || c.converged_with_avx512 || c.version != 0 {
+            return TestResult::Fail("!supported but other bits set");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/avx10", smoke_arch_avx10_unsupported_yields_zero_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_cet_cr4_implies_a_component() -> TestResult {
+    // cr4_cet should never be set unless either shadow_stack or
+    // ibt is also present — CR4.CET enables a hardware feature
+    // that requires one of the two CPUID bits.
+    use crate::x86_64::cet;
+    let c = cet::caps();
+    if c.cr4_cet && !c.shadow_stack && !c.ibt {
+        return TestResult::Fail("CR4.CET set without shadow_stack or ibt");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cet", smoke_arch_cet_cr4_implies_a_component);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_x87_and_sse_always_present() -> TestResult {
+    // Every x86_64 CPU supports x87 + SSE; XCR0 advertises both.
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    if c.xcr0_supported & xsave::XSAVE_X87 == 0 {
+        return TestResult::Fail("x87 bit missing");
+    }
+    if c.xcr0_supported & xsave::XSAVE_SSE == 0 {
+        return TestResult::Fail("SSE bit missing");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_x87_and_sse_always_present);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_area_size_at_least_fxsave_minimum() -> TestResult {
+    // FXSAVE area minimum is 512 bytes (x87 + SSE state). XSAVE
+    // builds on that, so area_size_xcr0 must be >= 512 when XCR0
+    // advertises anything.
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    if c.xcr0_supported != 0 && c.area_size_xcr0 < 512 {
+        return TestResult::Fail("area_size_xcr0 < FXSAVE minimum");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_area_size_at_least_fxsave_minimum);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_xcr0_and_xss_disjoint() -> TestResult {
+    // XCR0 = user-mode state, XSS = supervisor-mode state. The two
+    // sets are disjoint by Intel architecture (vol 1 §13.5).
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    if c.xcr0_supported & c.xss_supported != 0 {
+        return TestResult::Fail("XCR0 and XSS bits overlap");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_xcr0_and_xss_disjoint);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_pmu_version_implies_counters() -> TestResult {
+    // Architectural PMU version >= 1 implies a non-zero number of
+    // general-purpose counters per logical processor.
+    use crate::x86_64::pmu;
+    let c = pmu::caps();
+    if c.version >= 1 && c.n_general_counters == 0 {
+        return TestResult::Fail("PMU v>=1 but no GP counters");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pmu", smoke_arch_pmu_version_implies_counters);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_lbr_entries_zero_when_msr_bases_zero() -> TestResult {
+    // If we don't know the LBR MSR base addresses, n_entries must
+    // also be zero — otherwise the ring decoder will try to read
+    // MSR 0x0, which is IA32_TSC.
+    use crate::x86_64::lbr;
+    let c = lbr::caps();
+    if c.from_base == 0 && c.n_entries != 0 {
+        return TestResult::Fail("n_entries != 0 with from_base == 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/lbr", smoke_arch_lbr_entries_zero_when_msr_bases_zero);

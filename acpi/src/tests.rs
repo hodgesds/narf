@@ -2246,3 +2246,69 @@ fn smoke_acpi_gpe_blocks_none_after_reset() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("acpi", smoke_acpi_gpe_blocks_none_after_reset);
+
+// ── low-value: ACPI bounds-check rejections ─────────────────────
+//
+// Each parser has an explicit short-buffer guard returning 0. These
+// tests pin those guards so a future refactor that drops the
+// length check surfaces here instead of corrupting the static.
+
+fn smoke_acpi_iort_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"IORT");
+    buf.extend_from_slice(&[0u8; 10]); // total < 36 + 12
+    if crate::__test_parse_iort_body(&buf) != 0 {
+        return TestResult::Fail("short IORT accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/iort", smoke_acpi_iort_short_buffer_returns_zero);
+
+fn smoke_acpi_dmar_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"DMAR");
+    buf.extend_from_slice(&[0u8; 10]);
+    if crate::__test_parse_dmar_body(&buf) != 0 {
+        return TestResult::Fail("short DMAR accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/dmar", smoke_acpi_dmar_short_buffer_returns_zero);
+
+fn smoke_acpi_ivrs_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"IVRS");
+    buf.extend_from_slice(&[0u8; 10]);
+    if crate::__test_parse_ivrs_body(&buf) != 0 {
+        return TestResult::Fail("short IVRS accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/ivrs", smoke_acpi_ivrs_short_buffer_returns_zero);
+
+fn smoke_acpi_hest_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"HEST");
+    buf.extend_from_slice(&[0u8; 2]); // total < 36 + 4
+    if crate::__test_parse_hest_body(&buf) != 0 {
+        return TestResult::Fail("short HEST accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/hest", smoke_acpi_hest_short_buffer_returns_zero);
+
+fn smoke_acpi_pcct_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"PCCT");
+    buf.extend_from_slice(&[0u8; 10]);
+    if crate::__test_parse_pcct_body(&buf) != 0 {
+        return TestResult::Fail("short PCCT accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/pcct", smoke_acpi_pcct_short_buffer_returns_zero);
