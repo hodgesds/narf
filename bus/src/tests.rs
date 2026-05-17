@@ -1581,3 +1581,245 @@ fn smoke_aer_ue_severity_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/pcie_aer", smoke_aer_ue_severity_variants_distinct);
+
+// ── deep bus/pci + bus/hotplug coverage ───────────────────────────
+
+fn smoke_pci_command_bits_layout() -> TestResult {
+    // Pin the cmd:: bit positions against the PCIe spec §7.5.1.1.3.
+    use crate::pci::cmd;
+    if cmd::IO_SPACE != 1 << 0 {
+        return TestResult::Fail("IO_SPACE bit drifted from 0");
+    }
+    if cmd::MEM_SPACE != 1 << 1 {
+        return TestResult::Fail("MEM_SPACE bit drifted from 1");
+    }
+    if cmd::BUS_MASTER != 1 << 2 {
+        return TestResult::Fail("BUS_MASTER bit drifted from 2");
+    }
+    if cmd::INTX_DISABLE != 1 << 10 {
+        return TestResult::Fail("INTX_DISABLE bit drifted from 10");
+    }
+    // All four bits must be pairwise distinct.
+    let all = [cmd::IO_SPACE, cmd::MEM_SPACE, cmd::BUS_MASTER, cmd::INTX_DISABLE];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("two cmd:: bits share a value");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_command_bits_layout);
+
+fn smoke_pci_command_offset_constant() -> TestResult {
+    use crate::pci::COMMAND_OFFSET;
+    // Type-0 PCI Config Space layout: Command is at byte offset 0x04.
+    if COMMAND_OFFSET != 0x04 {
+        return TestResult::Fail("COMMAND_OFFSET drifted from 0x04");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_command_offset_constant);
+
+fn smoke_pci_error_variants_distinct() -> TestResult {
+    use crate::pci::PciError;
+    let all = [PciError::AuthorityRevoked, PciError::NotPcie];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("PciError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_error_variants_distinct);
+
+fn smoke_pci_requester_id_packs_bdf() -> TestResult {
+    // requester_id encodes BDF as `(bus << 8) | (device << 3) | function`
+    // — same layout the GIC ITS uses for routing. Walk a few coordinates
+    // to confirm the bit shifts.
+    use crate::device::{BusDevice, BusKind};
+    use crate::pci::requester_id;
+
+    fn make_pcie(bus: u8, device: u8, function: u8) -> BusDevice {
+        BusDevice {
+            kind: BusKind::Pcie {
+                addr: crate::addr::PcieAddr::new(0, bus, device, function),
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+            id: crate::device::DeviceId { vendor: 0, device: 0, class: 0 },
+            addr: crate::addr::BusAddr::Pcie(crate::addr::PcieAddr::new(0, bus, device, function)),
+        }
+    }
+    let cases: &[(u8, u8, u8, u16)] = &[
+        (0, 0, 0, 0),
+        (0, 0, 1, 1),
+        (0, 1, 0, 0b0000_0000_0000_1000),
+        (1, 0, 0, 0x0100),
+        (255, 31, 7, (255u16 << 8) | (31u16 << 3) | 7u16),
+    ];
+    for &(b, d, f, want) in cases {
+        let dev = make_pcie(b, d, f);
+        match requester_id(&dev) {
+            Some(rid) if rid == want => {}
+            _ => return TestResult::Fail("requester_id BDF encoding drifted"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_requester_id_packs_bdf);
+
+fn smoke_pci_requester_id_none_for_non_pcie() -> TestResult {
+    use crate::addr::BusAddr;
+    use crate::device::{BusDevice, BusKind, DeviceId};
+    use crate::pci::requester_id;
+    let phys = narf_memory::PhysAddr::new(0xFF00_0000);
+    let dev = BusDevice {
+        addr: BusAddr::Mmio(phys),
+        id: DeviceId { vendor: 0, device: 0, class: 0 },
+        kind: BusKind::VirtioMmio { base: phys, len: 0x200, device_id: 1 },
+    };
+    if requester_id(&dev).is_some() {
+        return TestResult::Fail("requester_id returned Some for virtio-mmio");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_requester_id_none_for_non_pcie);
+
+fn smoke_pci_read_command_revoked_cap_rejected() -> TestResult {
+    // Revoked Cap<BusDeviceCap, Write> rejects cfg-space reads with
+    // AuthorityRevoked regardless of the BusKind underneath.
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::device::{BusDevice, BusKind, DeviceId};
+    use crate::pci::{read_command, PciError};
+    use crate::registry::BusDeviceCap;
+    use narf_capabilities::{Cap, Write};
+    let cap: Cap<BusDeviceCap, Write> = Cap::bootstrap();
+    cap.revoke();
+    let pcie = PcieAddr::new(0, 0, 0, 0);
+    let dev = BusDevice {
+        addr: BusAddr::Pcie(pcie),
+        id: DeviceId { vendor: 0, device: 0, class: 0 },
+        kind: BusKind::Pcie { addr: pcie, cfg_phys: narf_memory::PhysAddr::new(0) },
+    };
+    match read_command(&cap, &dev) {
+        Err(PciError::AuthorityRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked cap didn't surface AuthorityRevoked"),
+    }
+}
+kernel_test_in!("bus/pci", smoke_pci_read_command_revoked_cap_rejected);
+
+// ── bus/hotplug ───────────────────────────────────────────────────
+
+fn smoke_hotplug_error_variants_distinct() -> TestResult {
+    use crate::hotplug::HotplugError;
+    // Only one variant today; verify its shape compiles + Eq works
+    // so a future second variant naturally fits the test.
+    let a = HotplugError::AuthorityRevoked;
+    let b = HotplugError::AuthorityRevoked;
+    if a != b {
+        return TestResult::Fail("HotplugError Eq broken");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_hotplug_error_variants_distinct);
+
+fn smoke_hotplug_register_rejects_revoked_authority() -> TestResult {
+    use crate::hotplug::{register_listener, HotplugError, HotplugEvent, HotplugListener};
+    use crate::registry::BusRegistryCap;
+    use narf_capabilities::{Cap, Grant};
+    use alloc::sync::Arc;
+
+    struct NoOp;
+    impl HotplugListener for NoOp {
+        fn on_event(&self, _: HotplugEvent) {}
+    }
+
+    let auth: Cap<BusRegistryCap, Grant> = Cap::bootstrap();
+    auth.revoke();
+    match register_listener(&auth, Arc::new(NoOp)) {
+        Err(HotplugError::AuthorityRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked authority didn't surface AuthorityRevoked"),
+    }
+}
+kernel_test_in!("bus/hotplug", smoke_hotplug_register_rejects_revoked_authority);
+
+fn smoke_hotplug_dispatch_fans_out_to_listeners() -> TestResult {
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::device::DeviceId;
+    use crate::hotplug::{
+        dispatch_event, listener_count, register_listener, HotplugEvent, HotplugListener,
+        __clear_listeners,
+    };
+    use crate::registry::BusRegistryCap;
+    use narf_capabilities::{Cap, Grant};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static ATTACH_HITS: AtomicU32 = AtomicU32::new(0);
+    static DETACH_HITS: AtomicU32 = AtomicU32::new(0);
+
+    struct Counter;
+    impl HotplugListener for Counter {
+        fn on_event(&self, ev: HotplugEvent) {
+            match ev {
+                HotplugEvent::Attach { .. } => {
+                    ATTACH_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+                HotplugEvent::Detach { .. } => {
+                    DETACH_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    __clear_listeners();
+    ATTACH_HITS.store(0, Ordering::Relaxed);
+    DETACH_HITS.store(0, Ordering::Relaxed);
+
+    let auth: Cap<BusRegistryCap, Grant> = Cap::bootstrap();
+    if register_listener(&auth, Arc::new(Counter)).is_err() {
+        return TestResult::Fail("register failed on live authority");
+    }
+    if register_listener(&auth, Arc::new(Counter)).is_err() {
+        return TestResult::Fail("second register failed");
+    }
+    if listener_count() != 2 {
+        return TestResult::Fail("listener_count != 2");
+    }
+
+    let addr = BusAddr::Pcie(PcieAddr::new(0, 1, 2, 3));
+    let id = DeviceId { vendor: 0x1B36, device: 0x0010, class: 0x010802 };
+    dispatch_event(HotplugEvent::Attach { addr, device_id: id });
+    if ATTACH_HITS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("Attach didn't fan out to both listeners");
+    }
+    dispatch_event(HotplugEvent::Detach { addr });
+    if DETACH_HITS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("Detach didn't fan out to both listeners");
+    }
+
+    __clear_listeners();
+    if listener_count() != 0 {
+        return TestResult::Fail("__clear_listeners didn't drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_hotplug_dispatch_fans_out_to_listeners);
+
+fn smoke_hotplug_event_variants_distinct() -> TestResult {
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::device::DeviceId;
+    use crate::hotplug::HotplugEvent;
+    let addr = BusAddr::Pcie(PcieAddr::new(0, 0, 0, 0));
+    let id = DeviceId { vendor: 0, device: 0, class: 0 };
+    let a = HotplugEvent::Attach { addr, device_id: id };
+    let d = HotplugEvent::Detach { addr };
+    if a == d {
+        return TestResult::Fail("Attach == Detach");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_hotplug_event_variants_distinct);
