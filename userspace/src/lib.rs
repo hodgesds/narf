@@ -31,12 +31,15 @@
 //! above. The shapes here will drive those implementations.
 
 #![no_std]
+#![feature(generic_const_exprs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
+#![allow(incomplete_features)] // generic_const_exprs
 
 extern crate alloc;
 
 pub mod elf;
+pub mod ephemeral_port;
 pub mod fd;
 pub mod handlers;
 pub mod interp;

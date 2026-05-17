@@ -260,6 +260,25 @@ impl SocketFile {
             }
             Reg::InetDgram(a, p) => {
                 if let Some(map) = INET_DGRAM_BOUND.lock().as_mut() { map.remove(&(a, p)); }
+                // Release any ephemeral reservation. clear() on an
+                // unset bit is a no-op, so an explicit bind() to a
+                // port in this range is harmless.
+                if p >= crate::ephemeral_port::EPHEMERAL_MIN {
+                    crate::ephemeral_port::free(
+                        AF_INET,
+                        0,
+                        crate::ephemeral_port::SocketProto::Udp,
+                        p,
+                    );
+                    if a != 0 {
+                        crate::ephemeral_port::free(
+                            AF_INET,
+                            a,
+                            crate::ephemeral_port::SocketProto::Udp,
+                            p,
+                        );
+                    }
+                }
             }
             Reg::Tcb(id) => {
                 let _ = narf_net::tcp_stack::close(id);
@@ -748,12 +767,20 @@ impl SocketFile {
                     addr.body[2], addr.body[3], addr.body[4], addr.body[5],
                 ]);
                 let mut state = self.state.lock();
-                // If unbound, auto-bind to (0, ephemeral). For
-                // simplicity we use port 0 (kernel-pick is a TODO).
+                // If unbound, auto-bind to (0, ephemeral-port).
+                // RFC 6056 §3.2 Algorithm 1, IANA dynamic range.
                 if matches!(&*state, SocketState::Fresh) {
+                    let local_port = match crate::ephemeral_port::alloc(
+                        AF_INET,
+                        0,
+                        crate::ephemeral_port::SocketProto::Udp,
+                    ) {
+                        Some(p) => p,
+                        None => return SocketOpResult::Err(SockError::AddrNotAvail),
+                    };
                     *state = SocketState::InetDgram {
                         local_addr: 0,
-                        local_port: 0,
+                        local_port,
                         inbox: VecDeque::new(),
                         peer: Some((ip, port)),
                     };
