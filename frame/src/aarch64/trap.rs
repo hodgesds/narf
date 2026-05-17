@@ -157,21 +157,43 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
     }
 
     if ec == EC_DATA_ABORT_LOWER_EL {
-        // ISS field for a Data Abort (Arm ARM D17.2.40):
+        // ISS field for a Data Abort (Arm ARM DDI0487 D5.4):
         //   bit  6  (WnR)  : 0 = read, 1 = write
         //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011
         //                    indicate a permission fault (level
-        //                    encoded in the low 2 bits).
+        //                    encoded in the low 2 bits); 0b0001
+        //                    indicates a translation fault (no
+        //                    PTE present at the named level).
         let iss = esr & 0x01FF_FFFF;
         const ISS_WNR: u64 = 1 << 6;
         const DFSC_MASK: u64 = 0x3F;
         const DFSC_PERMISSION_FAULT_TOP: u64 = 0b00_1100;
+        const DFSC_TRANSLATION_FAULT_TOP: u64 = 0b00_0100;
         let is_write = (iss & ISS_WNR) != 0;
         let dfsc = iss & DFSC_MASK;
         let is_perm_fault = (dfsc & 0b11_1100) == DFSC_PERMISSION_FAULT_TOP;
+        let is_translation_fault = (dfsc & 0b11_1100) == DFSC_TRANSLATION_FAULT_TOP;
+        // SAFETY: FAR_EL1 read at EL1 is always defined.
+        let far = unsafe { sysreg::read_far_el1() };
+        // Stack auto-extension + demand paging on translation
+        // fault (no PTE installed). mmap's deferred-back path
+        // surfaces here; if the vaddr lands in a STACK_GUARD
+        // region the trap routes into try_grow_stack instead.
+        if is_translation_fault {
+            if let Some(as_arc) = narf_userspace::active_user_as() {
+                let v = narf_memory::VirtAddr::new(far);
+                // SAFETY: low-RAM phys-as-virt window is live;
+                // AS is the active user AS by construction.
+                if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
+                    return;
+                }
+                // SAFETY: same.
+                if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
+                    return;
+                }
+            }
+        }
         if is_write && is_perm_fault {
-            // SAFETY: FAR_EL1 read at EL1 is always defined.
-            let far = unsafe { sysreg::read_far_el1() };
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(far);
                 // SAFETY: low-RAM identity map is live, frame
@@ -190,8 +212,8 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
             }
         }
         // Fall through to fatal if the abort wasn't a recoverable
-        // user-mode COW write — genuine bugs surface on the
-        // existing diagnostic path.
+        // user-mode COW write / demand-paging miss — genuine bugs
+        // surface on the existing diagnostic path.
     }
 
     // Non-recoverable synchronous exception — fatal.

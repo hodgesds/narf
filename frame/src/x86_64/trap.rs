@@ -220,8 +220,8 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         //       caller-supplied buffer that came from a fresh mmap
         //       grow). Same backing path; the supervisor bit on the
         //       error code just means we got there from kernel mode.
-        // Falls through to COW / panic on any error so the existing
-        // diagnostic still fires for genuine bugs.
+        // Falls through to stack-grow / COW / panic on any error so
+        // the existing diagnostic still fires for genuine bugs.
         let p_clear = (ec & PF_P) == 0;
         if p_clear && (from_user || cr2_in_user_half) {
             if let Some(as_arc) = narf_userspace::active_user_as() {
@@ -230,6 +230,19 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // task whose CR3 is currently active.
                 if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
                     return;
+                }
+                // Demand-alloc surfaced Unmapped: vaddr might land
+                // in a STACK_GUARD region. try_grow_stack promotes
+                // the guard to a real stack page and installs a
+                // fresh guard below; on success the user-mode
+                // instruction retries and lands on the freshly
+                // backed page. POSIX.1-2017 §2.2.2 — stack
+                // auto-extension is implementation-defined.
+                if from_user {
+                    // SAFETY: same identity-map argument.
+                    if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
+                        return;
+                    }
                 }
             }
         }

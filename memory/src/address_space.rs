@@ -42,6 +42,17 @@ impl RegionPerms {
     /// `materialize` flag-translation paths.
     pub const LOCKED: RegionPerms = RegionPerms(1 << 8);
 
+    /// Internal flag: this region is a stack guard page. Carries
+    /// no POSIX prot bits — `materialize` skips installing a PTE
+    /// so a user-mode access faults with P=0 — but the trap path
+    /// recognises the bit, allocates a fresh frame, promotes this
+    /// region to R+W, and installs a *new* one-page guard region
+    /// directly below. Implements POSIX-style automatic stack
+    /// extension on first write to the guard page.
+    /// Bit 9, separate from LOCKED (bit 8); the POSIX prot mask
+    /// strips it the same way.
+    pub const STACK_GUARD: RegionPerms = RegionPerms(1 << 9);
+
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
     /// Used by callers that want to compare permissions without
     /// caring about the internal LOCKED bit.
@@ -434,6 +445,159 @@ impl AddressSpace {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn demand_alloc_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
+    /// Stack auto-extension. Called from the user-mode #PF / data-
+    /// abort handler when the fault address lies in a region
+    /// flagged `STACK_GUARD`. Allocates a fresh zeroed frame,
+    /// promotes the guard region to R+W (installing the leaf PTE
+    /// with the region's perms), and installs a fresh one-page
+    /// guard region directly below — modelled on the implicit
+    /// stack-grow behaviour POSIX.1-2017 §2.2.2 leaves
+    /// implementation-defined.
+    ///
+    /// Rejects (`Overlap`) if a new guard one page below the
+    /// current guard would collide with an existing region — the
+    /// caller surfaces this as a real SEGV.
+    ///
+    /// Returns `Unmapped` if `vaddr` is outside every region or
+    /// the containing region is not flagged `STACK_GUARD` (real
+    /// access violation — the caller takes the SEGV path).
+    ///
+    /// # Safety
+    /// - The low-4-GiB identity map must be live (used to zero
+    ///   the fresh frame).
+    /// - `self.root` must be a valid page-table root for the AS
+    ///   currently active on this CPU.
+    /// - Frame allocator must be initialised.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn try_grow_stack(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
+        let v = vaddr.as_u64() & !0xFFFu64;
+        let mut regions = self.regions.lock();
+        let idx = regions
+            .iter()
+            .position(|r| {
+                let rb = r.base.as_u64();
+                v >= rb && v < rb.saturating_add(r.len)
+            })
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if !regions[idx].perms.contains(RegionPerms::STACK_GUARD) {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let guard_base = regions[idx].base.as_u64();
+        // Reject if the new guard one page below would overlap an
+        // existing region — the user has run out of stack arena
+        // and gets a real SEGV.
+        let new_guard_base = match guard_base.checked_sub(0x1000) {
+            Some(b) => b,
+            None => return Err(AddressSpaceError::OutOfRange),
+        };
+        for (i, r) in regions.iter().enumerate() {
+            if i == idx {
+                continue;
+            }
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if new_guard_base < re && rb < new_guard_base + 0x1000 {
+                return Err(AddressSpaceError::Overlap);
+            }
+        }
+
+        // Promote the existing guard region: allocate + zero
+        // a frame, swap perms to R+W, install the leaf PTE.
+        let phys = crate::frame::alloc_frame()
+            .map_err(|_| AddressSpaceError::OutOfRange)?
+            .start_address();
+        // SAFETY: identity-mapped; freshly-allocated frame is ours
+        // exclusively.
+        unsafe {
+            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+        }
+        regions[idx].phys[0] = phys;
+        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
+
+        let flags = PtFlags::USER | PtFlags::WRITABLE | PtFlags::NO_EXEC;
+        // SAFETY: root is valid (AS active); guard region was
+        // bookkept by `map_region`; phys just allocated.
+        match unsafe { map_4kb(self.root, VirtAddr::new(guard_base), phys, flags) } {
+            Ok(()) | Err(MapError::AlreadyMapped) => {}
+            Err(_) => return Err(AddressSpaceError::NotImplemented),
+        }
+
+        // Install a fresh one-page guard region below. Lazy phys
+        // (the slot stays unbacked — guard pages never need a
+        // backing frame until they themselves get promoted).
+        regions.push(Region {
+            base: VirtAddr::new(new_guard_base),
+            len: 0x1000,
+            perms: RegionPerms::STACK_GUARD,
+            phys: alloc::vec![crate::PhysAddr::new(0)],
+        });
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn try_grow_stack(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
+        let v = vaddr.as_u64() & !0xFFFu64;
+        let mut regions = self.regions.lock();
+        let idx = regions
+            .iter()
+            .position(|r| {
+                let rb = r.base.as_u64();
+                v >= rb && v < rb.saturating_add(r.len)
+            })
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if !regions[idx].perms.contains(RegionPerms::STACK_GUARD) {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let guard_base = regions[idx].base.as_u64();
+        let new_guard_base = match guard_base.checked_sub(0x1000) {
+            Some(b) => b,
+            None => return Err(AddressSpaceError::OutOfRange),
+        };
+        for (i, r) in regions.iter().enumerate() {
+            if i == idx {
+                continue;
+            }
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if new_guard_base < re && rb < new_guard_base + 0x1000 {
+                return Err(AddressSpaceError::Overlap);
+            }
+        }
+
+        let phys = crate::frame::alloc_frame()
+            .map_err(|_| AddressSpaceError::OutOfRange)?
+            .start_address();
+        // SAFETY: phys-as-virt via kernel_mut_ptr stays valid even
+        // under user TTBR0.
+        unsafe {
+            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+        }
+        regions[idx].phys[0] = phys;
+        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
+
+        let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
+        // SAFETY: see x86_64 sibling.
+        match unsafe { map_4kb(self.root, VirtAddr::new(guard_base), phys, flags) } {
+            Ok(()) | Err(MapError::AlreadyMapped) => {}
+            Err(_) => return Err(AddressSpaceError::NotImplemented),
+        }
+
+        regions.push(Region {
+            base: VirtAddr::new(new_guard_base),
+            len: 0x1000,
+            perms: RegionPerms::STACK_GUARD,
+            phys: alloc::vec![crate::PhysAddr::new(0)],
+        });
+        Ok(())
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub unsafe fn try_grow_stack(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }
 

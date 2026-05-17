@@ -3530,3 +3530,243 @@ fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_demand_alloc_zero_fills_frame);
+
+// ── stack auto-extension — AddressSpace::try_grow_stack ──────────
+//
+// The SysV stack init path installs a STACK_GUARD region one page
+// below the user stack. A user-mode write that lands in that
+// region faults with P=0 and the kernel #PF dispatch routes it
+// into try_grow_stack: a fresh frame is allocated + zeroed, the
+// guard region is promoted to R+W (PTE installed), and a new
+// one-page guard region is appended directly below. The behaviour
+// is POSIX.1-2017 §2.2.2 implementation-defined territory; the
+// shape mirrors the standard stack auto-extension contract.
+
+/// Happy path: faulting inside a STACK_GUARD region promotes it
+/// to R+W (installing a PTE) AND appends a fresh guard region
+/// one page below.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_promotes_and_installs_new_guard() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let guard = 0x0000_0080_0100_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(guard),
+        len: 0x1000,
+        perms: RegionPerms::STACK_GUARD,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region guard");
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+    if unsafe { translate_arch(a.root, VirtAddr::new(guard)) }.is_some() {
+        core::mem::forget(a);
+        return TestResult::Fail("STACK_GUARD region had a PTE before grow");
+    }
+    if unsafe { a.try_grow_stack(VirtAddr::new(guard + 0x10)) }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("try_grow_stack failed on a STACK_GUARD region");
+    }
+    let promoted_pte = unsafe { translate_arch(a.root, VirtAddr::new(guard)) };
+    let new_guard_pte = unsafe { translate_arch(a.root, VirtAddr::new(guard - 0x1000)) };
+    let snap = a.regions_snapshot();
+    let region_count = snap.len();
+    let new_guard_present = snap
+        .iter()
+        .any(|r| r.base.as_u64() == guard - 0x1000 && r.perms.contains(RegionPerms::STACK_GUARD));
+    let promoted = snap
+        .iter()
+        .find(|r| r.base.as_u64() == guard)
+        .map(|r| r.perms.contains(RegionPerms::WRITE))
+        .unwrap_or(false);
+    core::mem::forget(a);
+    if promoted_pte.is_none() {
+        return TestResult::Fail("promoted guard didn't get a PTE");
+    }
+    if new_guard_pte.is_some() {
+        return TestResult::Fail("new guard region got a PTE (must stay not-present)");
+    }
+    if region_count != 2 {
+        return TestResult::Fail("expected promoted + new guard regions");
+    }
+    if !new_guard_present {
+        return TestResult::Fail("new STACK_GUARD region missing one page below");
+    }
+    if !promoted {
+        return TestResult::Fail("promoted region missing WRITE perm");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_try_grow_stack_promotes_and_installs_new_guard);
+
+/// try_grow_stack on a non-STACK_GUARD region returns Unmapped
+/// so the trap handler falls through to the SEGV path (a write
+/// to a real PROT_NONE region or a backed RO region is not a
+/// stack-grow event).
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_non_guard_is_unmapped() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0200_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms(0), // PROT_NONE, not STACK_GUARD
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region");
+    let r = unsafe { a.try_grow_stack(VirtAddr::new(vbase)) };
+    core::mem::forget(a);
+    match r {
+        Err(AddressSpaceError::Unmapped) => TestResult::Pass,
+        _ => TestResult::Fail("non-guard region didn't surface Unmapped"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_try_grow_stack_non_guard_is_unmapped);
+
+/// try_grow_stack outside any region returns Unmapped.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_outside_region_is_unmapped() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let r = unsafe { a.try_grow_stack(VirtAddr::new(0x0000_0080_0300_0000)) };
+    core::mem::forget(a);
+    match r {
+        Err(AddressSpaceError::Unmapped) => TestResult::Pass,
+        _ => TestResult::Fail("out-of-region grow didn't surface Unmapped"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_try_grow_stack_outside_region_is_unmapped);
+
+/// New guard one page below the current guard must NOT collide
+/// with an existing region. The grow surfaces Overlap so the trap
+/// handler reports a real stack-overflow SEGV.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let guard = 0x0000_0080_0400_0000u64;
+    // Sitting region immediately below the guard — the new guard
+    // (guard - 0x1000) lands in it.
+    a.map_region(Region {
+        base: VirtAddr::new(guard - 0x1000),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region neighbour");
+    a.map_region(Region {
+        base: VirtAddr::new(guard),
+        len: 0x1000,
+        perms: RegionPerms::STACK_GUARD,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region guard");
+    let r = unsafe { a.try_grow_stack(VirtAddr::new(guard)) };
+    core::mem::forget(a);
+    match r {
+        Err(AddressSpaceError::Overlap) => TestResult::Pass,
+        _ => TestResult::Fail("colliding new-guard install was accepted"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_try_grow_stack_collision_rejected);
+
+/// Sequential grows: starting from a single guard, three grows
+/// produce three R+W stack pages and a guard sitting at the
+/// new bottom. Catches a regression where the new guard install
+/// races against the promotion bookkeeping.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_sequential() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let guard0 = 0x0000_0080_0500_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(guard0),
+        len: 0x1000,
+        perms: RegionPerms::STACK_GUARD,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region guard");
+    // Walk three guards down.
+    let mut cur = guard0;
+    for _ in 0..3 {
+        if unsafe { a.try_grow_stack(VirtAddr::new(cur)) }.is_err() {
+            core::mem::forget(a);
+            return TestResult::Fail("sequential grow failed mid-loop");
+        }
+        cur -= 0x1000;
+    }
+    let snap = a.regions_snapshot();
+    let rw_count = snap
+        .iter()
+        .filter(|r| {
+            !r.perms.contains(RegionPerms::STACK_GUARD)
+                && r.perms.contains(RegionPerms::READ)
+                && r.perms.contains(RegionPerms::WRITE)
+        })
+        .count();
+    let guard_count = snap
+        .iter()
+        .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
+        .count();
+    let lowest_guard = snap
+        .iter()
+        .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
+        .map(|r| r.base.as_u64())
+        .min();
+    core::mem::forget(a);
+    if rw_count != 3 {
+        return TestResult::Fail("expected 3 promoted stack pages");
+    }
+    if guard_count != 1 {
+        return TestResult::Fail("expected exactly one trailing guard");
+    }
+    if lowest_guard != Some(guard0 - 3 * 0x1000) {
+        return TestResult::Fail("trailing guard not three pages below the start");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_try_grow_stack_sequential);
+
+/// STACK_GUARD bit lives outside the POSIX prot mask so an
+/// `mprotect`-style query on the region's perms doesn't observe
+/// it. Pins the bit position so a future flag addition doesn't
+/// silently shadow it.
+fn smoke_memory_stack_guard_bit_outside_prot_mask() -> TestResult {
+    use crate::RegionPerms;
+    let g = RegionPerms::STACK_GUARD;
+    if g.prot_only().0 != 0 {
+        return TestResult::Fail("STACK_GUARD bit leaked into prot mask");
+    }
+    if RegionPerms::STACK_GUARD.0 == RegionPerms::LOCKED.0 {
+        return TestResult::Fail("STACK_GUARD collides with LOCKED bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_stack_guard_bit_outside_prot_mask);
