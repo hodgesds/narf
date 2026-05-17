@@ -41,8 +41,15 @@
 //! the donation cap before the donee polls refunds both sides
 //! atomically at the donee's next pop (`settle_donation`).
 //!
+//! PKRS save/restore at yield points (x86_64, Intel SDM Vol 3
+//! §4.6.2.4): `IA32_PKRS` (MSR `0x6E1`) is snapshotted into the
+//! task slot's `saved_pkrs` after the future returns
+//! `Poll::Pending`; restored before the next `Future::poll`. Two
+//! tasks polled back-to-back never see each other's protection-
+//! key rights view. aarch64 has no PKRS analogue; the field and
+//! the save/restore are gated behind `cfg(target_arch = "x86_64")`.
+//!
 //! Non-goals still (later waves):
-//! - PKRS save/restore at yield points.
 //! - Fair-share enforcement (today's budget accounting is diagnostic).
 //! - NUMA-aware steal targeting.
 
@@ -238,6 +245,13 @@ struct TaskSlot {
     /// next pop either consumes the credit (cap live) or refunds
     /// the donor (cap revoked). `None` outside an active donation.
     donation: Option<Donation>,
+    /// Saved IA32_PKRS (Intel SDM Vol 3 §4.6.2.4). Snapshotted
+    /// after a `Poll::Pending` so the next poll of this slot
+    /// restores the task's protection-key rights view. `None`
+    /// before the first yield. x86_64-only; aarch64 has no
+    /// protection-key analogue.
+    #[cfg(target_arch = "x86_64")]
+    saved_pkrs: Option<narf_arch::x86_64::pks::SavedPkrs>,
 }
 
 /// One in-flight time-slice donation handed to a task by
@@ -450,6 +464,8 @@ where
         addr_space: None,
         account: BudgetAccount::new(),
         donation: None,
+        #[cfg(target_arch = "x86_64")]
+        saved_pkrs: None,
     };
     let cpu = target_cpu(&spec);
     enqueue_on(cpu, slot);
@@ -485,6 +501,8 @@ where
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),
         donation: None,
+        #[cfg(target_arch = "x86_64")]
+        saved_pkrs: None,
     };
     let cpu = target_cpu(&spec);
     enqueue_on(cpu, slot);
@@ -905,6 +923,19 @@ pub fn poll_one_round() -> usize {
         CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
         // No `*ACTIVE_USER_AS.lock() = ...` here because kernel
         // tasks have `addr_space.is_none()` (we filtered above).
+        // Stage-5 PKRS restore (Intel SDM Vol 3 §4.6.2.4):
+        // re-establish the task's protection-key rights view
+        // before re-entering its future. No-op when CR4.PKS is
+        // off (pre-SPR Intel, AMD) or the slot has never yielded
+        // before (saved_pkrs is None).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(saved) = slot.saved_pkrs {
+            if narf_arch::x86_64::pks::is_active() {
+                // SAFETY: CR4.PKS is on (is_active() returned true);
+                // WRMSR IA32_PKRS is well-defined.
+                unsafe { narf_arch::x86_64::pks::restore(saved) };
+            }
+        }
         let poll_result = slot.task.as_mut().poll(&mut ctx);
         CURRENT_TASK.store(outer_task, Ordering::Release);
         *ACTIVE_USER_AS.lock() = outer_as;
@@ -915,6 +946,13 @@ pub fn poll_one_round() -> usize {
         let pending = drain_donor_debit(slot.id);
         if pending > 0 {
             slot.account.add_debit(pending);
+        }
+        // Stage-5 PKRS save: snapshot IA32_PKRS into the slot
+        // so the next poll restores the same rights view.
+        #[cfg(target_arch = "x86_64")]
+        if narf_arch::x86_64::pks::is_active() {
+            // SAFETY: see above.
+            slot.saved_pkrs = Some(unsafe { narf_arch::x86_64::pks::save() });
         }
         narf_rcu::report_quiescent();
         match poll_result {
@@ -1085,6 +1123,17 @@ pub fn run_until_empty() {
             // the queue and thus invisible to that scan.
             CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
             *ACTIVE_USER_AS.lock() = slot.addr_space.clone();
+            // Stage-5 PKRS restore (Intel SDM Vol 3 §4.6.2.4):
+            // re-establish the task's protection-key rights view
+            // before re-entering its future.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(saved) = slot.saved_pkrs {
+                if narf_arch::x86_64::pks::is_active() {
+                    // SAFETY: CR4.PKS is on (is_active() returned
+                    // true); WRMSR IA32_PKRS is well-defined.
+                    unsafe { narf_arch::x86_64::pks::restore(saved) };
+                }
+            }
             let poll_result = slot.task.as_mut().poll(&mut ctx);
             CURRENT_TASK.store(0, Ordering::Release);
             *ACTIVE_USER_AS.lock() = None;
@@ -1139,6 +1188,18 @@ pub fn run_until_empty() {
             let pending = drain_donor_debit(slot.id);
             if pending > 0 {
                 slot.account.add_debit(pending);
+            }
+
+            // Stage-5 PKRS save: snapshot IA32_PKRS into the slot
+            // so the next poll restores the same rights view
+            // (Intel SDM Vol 3 §4.6.2.4). Done on both Ready and
+            // Pending; the Ready case drops the slot immediately
+            // after so the save is redundant but keeps the
+            // invariant uniform.
+            #[cfg(target_arch = "x86_64")]
+            if narf_arch::x86_64::pks::is_active() {
+                // SAFETY: CR4.PKS is on; RDMSR(IA32_PKRS) is well-defined.
+                slot.saved_pkrs = Some(unsafe { narf_arch::x86_64::pks::save() });
             }
 
             // Announce a QSBR quiescent state: the task has yielded

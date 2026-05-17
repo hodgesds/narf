@@ -1564,3 +1564,90 @@ fn smoke_scheduler_donate_to_head_enqueues() -> TestResult {
     }
 }
 kernel_test_in!("scheduler", smoke_scheduler_donate_to_head_enqueues);
+
+// ── Stage-5 PKRS save/restore at yield points ──────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_pkrs_save_restore_round_trip() -> TestResult {
+    // pks::save() then pks::restore() is a no-op when CR4.PKS
+    // isn't active (the BSP under QEMU -cpu max may or may not
+    // have it). The test verifies is_active() is consistent and
+    // when active, save/restore round-trips.
+    use narf_arch::x86_64::pks;
+    if !pks::is_active() {
+        if pks::is_active() {
+            return TestResult::Fail("is_active flapped");
+        }
+        return TestResult::Pass;
+    }
+    // SAFETY: PKS is on; both reads are unconditional at CPL=0.
+    let a = unsafe { pks::save() };
+    unsafe { pks::restore(a) };
+    let b = unsafe { pks::save() };
+    if a != b {
+        return TestResult::Fail("save/restore round-trip didn't preserve PKRS");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("scheduler", smoke_scheduler_pkrs_save_restore_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_saved_pkrs_type_copy_eq() -> TestResult {
+    // SavedPkrs must be Copy + Eq so the scheduler can stash it
+    // in a TaskSlot field and compare reads.
+    use narf_arch::x86_64::pks::SavedPkrs;
+    let a = SavedPkrs(0xDEAD_BEEF);
+    let b = a;
+    if a != b {
+        return TestResult::Fail("SavedPkrs Copy/Eq broken");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("scheduler", smoke_scheduler_saved_pkrs_type_copy_eq);
+
+fn smoke_scheduler_yield_with_pkrs_wiring() -> TestResult {
+    // The executor's PKRS save-after-Pending + restore-before-poll
+    // must not break basic yield semantics. Two tasks each yield
+    // once and complete; the count is the regression assertion.
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    COUNT.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    for _ in 0..2 {
+        crate::spawn(async {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::yield_now().await;
+            COUNT.fetch_add(10, Ordering::Relaxed);
+        });
+    }
+    crate::run_until_empty();
+    if COUNT.load(Ordering::Relaxed) != 22 {
+        return TestResult::Fail("yield + PKRS path didn't drive 2 tasks to completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_yield_with_pkrs_wiring);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_scheduler_pkrs_no_op_on_aarch64() -> TestResult {
+    // aarch64 has no PKRS analogue — scheduler PKRS save/restore
+    // is cfg'd out. Tasks still yield + complete cleanly.
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    COUNT.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    crate::spawn(async {
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::yield_now().await;
+        COUNT.fetch_add(2, Ordering::Relaxed);
+    });
+    crate::run_until_empty();
+    if COUNT.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("aarch64 yield path didn't complete");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("scheduler", smoke_scheduler_pkrs_no_op_on_aarch64);
