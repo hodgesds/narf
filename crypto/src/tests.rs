@@ -190,6 +190,55 @@ fn smoke_crypto_accel_features_struct_default() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("crypto/accel", smoke_crypto_accel_features_struct_default);
+
+fn smoke_crypto_accel_features_probe_idempotent() -> TestResult {
+    // Probe is a pure CPUID/MRS read. Two back-to-back calls must
+    // return the same Features struct — if they don't, a hidden
+    // mutable cache is sneaking in or one of the bit extractions
+    // depends on a transient register.
+    use crate::accel::Features;
+    let a = Features::probe();
+    let b = Features::probe();
+    if a != b {
+        return TestResult::Fail("Features::probe() not idempotent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("crypto/accel", smoke_crypto_accel_features_probe_idempotent);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_crypto_accel_x86_sha1_always_false() -> TestResult {
+    // Intel never shipped a SHA-1 acceleration extension (only
+    // SHA-NI for SHA-256); on x86_64 the sha1 bit is always false.
+    // Pin the invariant from accel.rs:53.
+    use crate::accel::Features;
+    if Features::probe().sha1 {
+        return TestResult::Fail("x86_64 sha1 should always be false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("crypto/accel", smoke_crypto_accel_x86_sha1_always_false);
+
+fn smoke_crypto_accel_features_copy_eq_round_trip() -> TestResult {
+    // Features is #[derive(Copy, Clone, PartialEq, Eq)] — pin the
+    // round-trip so a future refactor that drops Copy (e.g. adds a
+    // Vec field) surfaces here.
+    use crate::accel::Features;
+    let p = Features::probe();
+    let q = p;
+    if p != q {
+        return TestResult::Fail("Copy round-trip broke Eq");
+    }
+    let mut r = p;
+    r.aes = !p.aes;
+    if r == p {
+        return TestResult::Fail("Eq collapses after flipping aes bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("crypto/accel", smoke_crypto_accel_features_copy_eq_round_trip);
+
 // Live `aes_round_forward` execution requires CR4.OSFXSR /
 // OSXMMEXCPT to be set so AESENC's XMM access doesn't trap. The
 // kernel boot path doesn't always get there before tests run,
