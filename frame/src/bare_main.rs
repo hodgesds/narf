@@ -120,6 +120,32 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
             return;
         }
     };
+    // Mark the FB phys range Write-Combining via MTRR so the
+    // memmove on scroll (one full screen worth of u32 writes per
+    // newline) doesn't run at uncached-MMIO speed (~150 ns/write,
+    // ~1 row per second on real-HW UEFI GOP). WC turns those
+    // writes into burst transactions and shaves the scroll cost
+    // by ~10×.
+    //
+    // The variable-MTRR window must be a power of two ≥ FB size,
+    // aligned to its own size. The FB phys (UEFI GOP) is
+    // typically already aligned to 64 KiB or better; we round
+    // the size up to the next power-of-two ≥ end-phys. The MTRR
+    // may then cover ~2× the FB extent — benign because the post-
+    // FB phys is OS-reserved memory we manage.
+    let fb_size = end.saturating_sub(phys);
+    let pow2 = fb_size.next_power_of_two().max(0x100_000); // ≥ 1 MiB
+    // Align phys down to the pow2 boundary so the MTRR window
+    // fully covers the FB. The slop below `phys` is also OS-
+    // managed reserved.
+    let mtrr_phys = phys & !(pow2 - 1);
+    // SAFETY: CPL=0; phys + size point at a UEFI-claimed GOP FB.
+    // The MTRR program runs before any cacheable mapping spans
+    // this window (we're pre-MMU-rebind here in the early-FB
+    // path).
+    let wc_slot = unsafe { narf_arch::x86_64::mtrr::set_write_combining(mtrr_phys, pow2) };
+    let _ = wc_slot;
+
     // SAFETY: BSP, no concurrent draw; FB phys is identity-mapped
     // (verified above to be < 4 GiB).
     let fb = unsafe { scanout.framebuffer() };
@@ -129,12 +155,13 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     console::set_fb_hook(narf_graphics::console::write_bytes);
     let _ = writeln!(
         console::Writer,
-        "  early-fb: console installed via {} ({}x{} → {}x{} chars)",
+        "  early-fb: console installed via {} ({}x{} → {}x{} chars; wc-mtrr={:?})",
         scanout.name(),
         fb_info.width,
         fb_info.height,
         cols,
-        rows
+        rows,
+        wc_slot,
     );
 }
 

@@ -375,23 +375,27 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
         }
     }
     // Native AMD GPU wins over QEMU bochs / virtio-gpu when both
-    // are present (typical: Phoenix iGPU on the bare-metal laptop
-    // running alongside a passthrough QEMU display).
-    //
-    // `current_mode()` accepts the passive (UEFI-GOP-left)
-    // mode without requiring a successful `set_mode`, so the
-    // amdgpu scanout lights up even before DCN bring-up lands.
-    // The firmware-loaded gate (`is_ready`) is intentionally NOT
-    // required: passive scanout is firmware-by-default.
+    // Prefer the Limine GOP "generic-fb" scanout when registered:
+    // the bootloader already painted into it at known-good
+    // dimensions, and the kernel's early-fb console install has
+    // verified it's writeable from the BSP. amdgpu's `current_mode`
+    // returns Some on a UEFI-passive mode regardless of whether
+    // DCN bring-up actually wired the scanout, which on real Zen2
+    // silicon makes the FB-console hook re-bind at Stage::Late to
+    // an amdgpu scanout whose backing isn't actually live —
+    // observable as "boot reaches `scheduler: spawning 1 task`
+    // then no further FB output, no shell prompt". Keep using
+    // GENERIC until amdgpu can prove it owns a working scanout
+    // (firmware-loaded + post-set_mode), tracked separately.
+    if GENERIC_FB.lock().is_some() {
+        return Some(&GENERIC);
+    }
     if narf_drivers_gpu::amdgpu::is_probed() {
         let mode_ok = narf_drivers_gpu::amdgpu::with_controller(|d| d.current_mode().is_some())
             .unwrap_or(false);
         if mode_ok {
             return Some(&AMDGPU);
         }
-    }
-    if GENERIC_FB.lock().is_some() {
-        return Some(&GENERIC);
     }
     if narf_graphics_driver::bochs::is_probed() {
         let reachable =
