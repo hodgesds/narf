@@ -546,3 +546,254 @@ fn smoke_sleep_until_uses_wheel() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time/wheel", smoke_sleep_until_uses_wheel);
+
+// ── extended time/wheel coverage ──────────────────────────────────
+//
+// Existing surface hits register/fire/cancel/full and the
+// SleepUntil integration. New smokes close the remaining
+// invariants on `refresh_waker`, multi-sleeper `fire_due`,
+// `set_arm_callback` replacement, and generation uniqueness.
+
+fn smoke_wheel_arm_callback_installed_reports() -> TestResult {
+    use crate::timer_wheel;
+    timer_wheel::__reset_for_test();
+    if timer_wheel::arm_callback_installed() {
+        return TestResult::Fail("freshly reset: arm callback should be uninstalled");
+    }
+    timer_wheel::set_arm_callback(timer_wheel::__test_arm_callback);
+    if !timer_wheel::arm_callback_installed() {
+        return TestResult::Fail("set_arm_callback didn't flip arm_callback_installed");
+    }
+    timer_wheel::clear_arm_callback();
+    if timer_wheel::arm_callback_installed() {
+        return TestResult::Fail("clear_arm_callback didn't unflip arm_callback_installed");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_arm_callback_installed_reports);
+
+fn smoke_wheel_fire_due_wakes_only_expired() -> TestResult {
+    // Three sleepers at deadlines 100/200/300; fire_due(150) wakes
+    // exactly the first one; subsequent fire_due(250) wakes the
+    // second; fire_due(350) wakes the last. Partial-fire ordering.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    timer_wheel::__reset_for_test();
+    struct W(AtomicU32);
+    impl Wake for W {
+        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+    }
+    let a = Arc::new(W(AtomicU32::new(0)));
+    let b = Arc::new(W(AtomicU32::new(0)));
+    let c = Arc::new(W(AtomicU32::new(0)));
+
+    let _ha = timer_wheel::register(100, a.clone().into()).unwrap();
+    let _hb = timer_wheel::register(200, b.clone().into()).unwrap();
+    let _hc = timer_wheel::register(300, c.clone().into()).unwrap();
+    if timer_wheel::occupied() != 3 {
+        return TestResult::Fail("three registrations not visible in occupied()");
+    }
+
+    if timer_wheel::fire_due(150) != 1 {
+        return TestResult::Fail("fire_due(150) didn't fire exactly one");
+    }
+    if a.0.load(Ordering::Relaxed) != 1 || b.0.load(Ordering::Relaxed) != 0 || c.0.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("wrong waker fired at 150");
+    }
+
+    if timer_wheel::fire_due(250) != 1 {
+        return TestResult::Fail("fire_due(250) didn't fire exactly one");
+    }
+    if b.0.load(Ordering::Relaxed) != 1 || c.0.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("wrong waker fired at 250");
+    }
+
+    if timer_wheel::fire_due(350) != 1 {
+        return TestResult::Fail("fire_due(350) didn't fire exactly one");
+    }
+    if c.0.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("c didn't fire at 350");
+    }
+    if timer_wheel::occupied() != 0 {
+        return TestResult::Fail("wheel not empty after all three fired");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_fire_due_wakes_only_expired);
+
+fn smoke_wheel_fire_due_empty_returns_zero() -> TestResult {
+    // fire_due on an empty wheel returns 0 and doesn't panic.
+    use crate::timer_wheel;
+    timer_wheel::__reset_for_test();
+    if timer_wheel::fire_due(0) != 0 {
+        return TestResult::Fail("fire_due on empty wheel reported wakes");
+    }
+    if timer_wheel::fire_due(u64::MAX) != 0 {
+        return TestResult::Fail("fire_due(MAX) on empty wheel reported wakes");
+    }
+    if timer_wheel::next_deadline_cycles().is_some() {
+        return TestResult::Fail("empty wheel reported a next deadline");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_fire_due_empty_returns_zero);
+
+fn smoke_wheel_refresh_waker_updates_live_slot() -> TestResult {
+    // Refresh on a live handle replaces the slot's waker — the new
+    // one is what fires on deadline.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    timer_wheel::__reset_for_test();
+    struct W(AtomicU32);
+    impl Wake for W {
+        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+    }
+    let old = Arc::new(W(AtomicU32::new(0)));
+    let new = Arc::new(W(AtomicU32::new(0)));
+
+    let h = timer_wheel::register(100, old.clone().into()).unwrap();
+    if !timer_wheel::refresh_waker(h, new.clone().into()) {
+        return TestResult::Fail("refresh_waker on live slot returned false");
+    }
+    let woken = timer_wheel::fire_due(150);
+    if woken != 1 {
+        return TestResult::Fail("fire_due didn't wake");
+    }
+    if old.0.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("old waker fired after refresh");
+    }
+    if new.0.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("new waker didn't fire after refresh");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_refresh_waker_updates_live_slot);
+
+fn smoke_wheel_refresh_waker_rejects_recycled_handle() -> TestResult {
+    // After fire_due reclaims the slot, the original handle's gen
+    // is stale; refresh_waker against it must return false even if
+    // the slot is later re-occupied by a different sleeper.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    struct Noop;
+    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+
+    timer_wheel::__reset_for_test();
+    let waker = Arc::new(Noop).into();
+    let stale_h = timer_wheel::register(100, waker).unwrap();
+    timer_wheel::fire_due(150); // slot cleared
+    // Recycle the same slot with a fresh registration.
+    let _fresh_h = timer_wheel::register(200, Arc::new(Noop).into()).unwrap();
+    // The stale handle's gen mismatches the slot's new gen.
+    if timer_wheel::refresh_waker(stale_h, Arc::new(Noop).into()) {
+        return TestResult::Fail("refresh_waker accepted a recycled-slot stale handle");
+    }
+    // The cancel path should also be silent on the stale handle.
+    timer_wheel::cancel(stale_h);
+    if timer_wheel::occupied() != 1 {
+        return TestResult::Fail("stale cancel evicted the fresh registration");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_refresh_waker_rejects_recycled_handle);
+
+fn smoke_wheel_handles_are_generationally_unique() -> TestResult {
+    // Register / cancel / register cycles through the same slot
+    // but the generations differ; the SleepHandle::generation()
+    // reflects this and is what protects against use-after-recycle.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    struct Noop;
+    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+
+    timer_wheel::__reset_for_test();
+    let h1 = timer_wheel::register(100, Arc::new(Noop).into()).unwrap();
+    let gen1 = h1.generation();
+    timer_wheel::cancel(h1);
+    let h2 = timer_wheel::register(200, Arc::new(Noop).into()).unwrap();
+    let gen2 = h2.generation();
+    if gen1 == gen2 {
+        return TestResult::Fail("re-registered handle reused the same generation");
+    }
+    if gen1 == 0 || gen2 == 0 {
+        return TestResult::Fail("generation 0 leaked (should be skipped as sentinel)");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_handles_are_generationally_unique);
+
+fn smoke_wheel_set_arm_callback_replaces_prior() -> TestResult {
+    // set_arm_callback is idempotent for boot but useful for tests —
+    // a second install replaces the first. Verify the most-recently
+    // installed callback is what fires.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static FIRST: AtomicUsize = AtomicUsize::new(0);
+    static SECOND: AtomicUsize = AtomicUsize::new(0);
+    fn first_cb(_: u64) { FIRST.fetch_add(1, Ordering::Relaxed); }
+    fn second_cb(_: u64) { SECOND.fetch_add(1, Ordering::Relaxed); }
+
+    timer_wheel::__reset_for_test();
+    FIRST.store(0, Ordering::Relaxed);
+    SECOND.store(0, Ordering::Relaxed);
+
+    timer_wheel::set_arm_callback(first_cb);
+    timer_wheel::set_arm_callback(second_cb);
+
+    struct Noop;
+    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+    let _h = timer_wheel::register(100, Arc::new(Noop).into()).unwrap();
+
+    if FIRST.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("first callback fired after being replaced");
+    }
+    if SECOND.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("second (replacement) callback didn't fire");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_set_arm_callback_replaces_prior);
+
+fn smoke_wheel_cancel_after_fire_is_silent() -> TestResult {
+    // A handle whose slot already fired must be safe to cancel —
+    // no panic, no effect on the wheel.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    struct Noop;
+    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+
+    timer_wheel::__reset_for_test();
+    let h = timer_wheel::register(50, Arc::new(Noop).into()).unwrap();
+    let fired = timer_wheel::fire_due(100);
+    if fired != 1 {
+        return TestResult::Fail("expected one fire");
+    }
+    // Now cancel the fired handle — must be silent.
+    timer_wheel::cancel(h);
+    if timer_wheel::occupied() != 0 {
+        return TestResult::Fail("cancel-after-fire changed occupied count");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_cancel_after_fire_is_silent);
