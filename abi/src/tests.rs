@@ -862,3 +862,100 @@ fn smoke_abi_submission_inline_words_constant() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("abi", smoke_abi_submission_inline_words_constant);
+
+// ── deep abi: FileOpKind / CpuOpKind wire pins ───────────────────
+
+fn smoke_abi_file_op_kind_wire_pins() -> TestResult {
+    use crate::FileOpKind;
+    // Numeric values mirror narf_userspace::Syscall discriminants;
+    // pin them so a future renumber of the syscall table breaks
+    // this test before it silently breaks the io_uring bridge.
+    let pairs = [
+        (FileOpKind::Open, 110u8),
+        (FileOpKind::Read, 111),
+        (FileOpKind::Write, 112),
+        (FileOpKind::Close, 113),
+        (FileOpKind::Mmap, 120),
+        (FileOpKind::Munmap, 121),
+    ];
+    for (k, want) in pairs {
+        if k as u8 != want {
+            return TestResult::Fail("FileOpKind wire value drifted");
+        }
+    }
+    // Pairwise distinct.
+    let all = [
+        FileOpKind::Open, FileOpKind::Read, FileOpKind::Write,
+        FileOpKind::Close, FileOpKind::Mmap, FileOpKind::Munmap,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("FileOpKind collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_file_op_kind_wire_pins);
+
+fn smoke_abi_cpu_op_kind_wire_pins() -> TestResult {
+    use crate::CpuOpKind;
+    let pairs = [
+        (CpuOpKind::Topology, 0x20u8),
+        (CpuOpKind::PerfState, 0x21),
+        (CpuOpKind::RaplEnergy, 0x22),
+        (CpuOpKind::LatencyHint, 0x30),
+        (CpuOpKind::LatencyRelease, 0x31),
+        (CpuOpKind::SetFreqRange, 0x40),
+        (CpuOpKind::SetEpp, 0x41),
+        (CpuOpKind::SetGovernor, 0x42),
+        (CpuOpKind::SetEnergyBudget, 0x50),
+        (CpuOpKind::ClearEnergyBudget, 0x51),
+    ];
+    for (k, want) in pairs {
+        if k as u8 != want {
+            return TestResult::Fail("CpuOpKind wire value drifted");
+        }
+    }
+    let all = [
+        CpuOpKind::Topology, CpuOpKind::PerfState, CpuOpKind::RaplEnergy,
+        CpuOpKind::LatencyHint, CpuOpKind::LatencyRelease,
+        CpuOpKind::SetFreqRange, CpuOpKind::SetEpp, CpuOpKind::SetGovernor,
+        CpuOpKind::SetEnergyBudget, CpuOpKind::ClearEnergyBudget,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("CpuOpKind collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_cpu_op_kind_wire_pins);
+
+fn smoke_abi_file_op_return_default_is_ok_zero() -> TestResult {
+    use crate::FileOpReturn;
+    let r = FileOpReturn::default();
+    // status=0 mirrors NarfStatus::Ok; value=0.
+    if r.status != 0 || r.value != 0 {
+        return TestResult::Fail("FileOpReturn default not (0, 0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_file_op_return_default_is_ok_zero);
+
+fn smoke_abi_cpu_op_args_default_is_all_zero() -> TestResult {
+    use crate::{CpuOpArgs, CpuOpReturn};
+    let a = CpuOpArgs::default();
+    if a.a0 != 0 || a.a1 != 0 || a.a2 != 0 || a.a3 != 0 || a.a4 != 0 || a.a5 != 0 {
+        return TestResult::Fail("CpuOpArgs default has non-zero slot");
+    }
+    let r = CpuOpReturn::default();
+    if r.status != 0 || r.result.iter().any(|&v| v != 0) {
+        return TestResult::Fail("CpuOpReturn default has non-zero field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_cpu_op_args_default_is_all_zero);
