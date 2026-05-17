@@ -3149,3 +3149,314 @@ fn smoke_net_icmp_echo_builder() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net", smoke_net_icmp_echo_builder);
+
+// ── extended net/udp + net/tcp + net coverage ──────────────────────
+//
+// Existing surface hits headline wire-format round-trips. New
+// smokes close the remaining edges: zero/oversized payloads,
+// rejection paths, IPv4 + ARP + ICMP builders + ip_checksum.
+
+fn smoke_udp_build_empty_payload() -> TestResult {
+    use crate::pkt_udp::{build_ipv4, verify_ipv4, UDP_HDR_LEN};
+    let mut out = [0u8; 16];
+    let n = build_ipv4(&mut out, [10, 0, 0, 1], [10, 0, 0, 2], 53, 53, b"")
+        .expect("build empty");
+    if n != UDP_HDR_LEN {
+        return TestResult::Fail("empty payload should produce 8-byte datagram");
+    }
+    verify_ipv4([10, 0, 0, 1], [10, 0, 0, 2], &out[..n]).expect("verify");
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_build_empty_payload);
+
+fn smoke_udp_build_buffer_too_small_returns_none() -> TestResult {
+    use crate::pkt_udp::build_ipv4;
+    // Need 8 header + 4 payload = 12; supply 8-byte buffer.
+    let mut out = [0u8; 8];
+    if build_ipv4(&mut out, [0; 4], [0; 4], 0, 0, b"data").is_some() {
+        return TestResult::Fail("build accepted undersized output buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_build_buffer_too_small_returns_none);
+
+fn smoke_udp_verify_rejects_short_datagram() -> TestResult {
+    use crate::pkt_udp::{verify_ipv4, UdpError};
+    // 4 bytes — below the 8-byte header.
+    let short = [0u8; 4];
+    match verify_ipv4([0; 4], [0; 4], &short) {
+        Err(UdpError::Short) => TestResult::Pass,
+        _ => TestResult::Fail("short datagram should surface UdpError::Short"),
+    }
+}
+kernel_test_in!("net/udp", smoke_udp_verify_rejects_short_datagram);
+
+fn smoke_udp_decode_rejects_short_buffer() -> TestResult {
+    use crate::pkt_udp::UdpHeader;
+    // 7 bytes — below UDP_HDR_LEN.
+    if UdpHeader::decode(&[0u8; 7]).is_some() {
+        return TestResult::Fail("UdpHeader::decode accepted < 8 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_decode_rejects_short_buffer);
+
+fn smoke_tcp_build_rst_has_only_rst_flag() -> TestResult {
+    use crate::pkt_tcp::{build_rst, FLAG_RST, TCP_HDR_MIN};
+    let r = build_rst(80, 12345, 0xDEADBEEF);
+    if r.flags != FLAG_RST {
+        return TestResult::Fail("RST builder set extra flags");
+    }
+    if r.header_len != TCP_HDR_MIN as u8 {
+        return TestResult::Fail("RST header_len wrong");
+    }
+    if !r.options.is_empty() {
+        return TestResult::Fail("RST should carry no options");
+    }
+    if r.acknowledgement != 0 || r.window != 0 || r.urgent_ptr != 0 {
+        return TestResult::Fail("RST should have ack=window=urg=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_build_rst_has_only_rst_flag);
+
+fn smoke_tcp_iter_options_on_empty_is_empty() -> TestResult {
+    use crate::pkt_tcp::{iter_options, TcpOption};
+    let none: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut count = 0;
+    for _ in iter_options(&none) {
+        count += 1;
+    }
+    if count != 0 {
+        return TestResult::Fail("iter_options on empty buf yielded items");
+    }
+    // Single EOL byte: iterator stops immediately.
+    let eol = alloc::vec![0u8];
+    for _ in iter_options(&eol) {
+        return TestResult::Fail("iter_options walked past EOL");
+    }
+    // Single NOP only.
+    let nop = alloc::vec![1u8];
+    let mut saw_nop = false;
+    for opt in iter_options(&nop) {
+        if matches!(opt, TcpOption::Nop) {
+            saw_nop = true;
+        }
+    }
+    if !saw_nop {
+        return TestResult::Fail("solo NOP didn't decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_iter_options_on_empty_is_empty);
+
+fn smoke_tcp_fin_ack_round_trip() -> TestResult {
+    use crate::pkt_tcp::{TcpHeader, FLAG_ACK, FLAG_FIN, TCP_HDR_MIN};
+    let h = TcpHeader {
+        src_port: 4444,
+        dst_port: 8000,
+        sequence: 0x1000,
+        acknowledgement: 0x2000,
+        header_len: TCP_HDR_MIN as u8,
+        flags: FLAG_FIN | FLAG_ACK,
+        window: 1024,
+        checksum: 0,
+        urgent_ptr: 0,
+        options: alloc::vec::Vec::new(),
+    };
+    let bytes = h.encode();
+    let (back, _) = TcpHeader::decode(&bytes).expect("decode");
+    if back.flags != FLAG_FIN | FLAG_ACK {
+        return TestResult::Fail("FIN+ACK flag mask didn't round-trip");
+    }
+    if back != h {
+        return TestResult::Fail("FIN+ACK header round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_fin_ack_round_trip);
+
+fn smoke_tcp_verify_rejects_tampered_payload() -> TestResult {
+    use crate::pkt_tcp::{build_rst, ipv4_pseudo_checksum, verify_ipv4, TcpError};
+    let mut r = build_rst(80, 12345, 0);
+    let mut bytes = r.encode();
+    let cs = ipv4_pseudo_checksum([1, 2, 3, 4], [5, 6, 7, 8], &bytes);
+    bytes[16..18].copy_from_slice(&cs.to_be_bytes());
+    r.checksum = cs;
+    // Tamper a non-checksum byte (sequence number).
+    bytes[4] ^= 0xFF;
+    match verify_ipv4([1, 2, 3, 4], [5, 6, 7, 8], &bytes) {
+        Err(TcpError::BadChecksum) => TestResult::Pass,
+        _ => TestResult::Fail("tampered TCP segment should surface BadChecksum"),
+    }
+}
+kernel_test_in!("net/tcp", smoke_tcp_verify_rejects_tampered_payload);
+
+fn smoke_net_ip_checksum_known_vector() -> TestResult {
+    // RFC 1071 §3 worked example: header bytes 4500 003C 1C46 4000
+    // 4006 0000 AC10 0A63 AC10 0A0C should sum (with the zero in
+    // the checksum slot) to a checksum of 0xB1E6.
+    use crate::pkt::ip_checksum;
+    let bytes: [u8; 20] = [
+        0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00,
+        0xac, 0x10, 0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c,
+    ];
+    let cs = ip_checksum(&bytes);
+    if cs != 0xB1E6 {
+        let msg = alloc::format!(
+            "ip_checksum returned {:#06x}, expected 0xb1e6",
+            cs
+        );
+        let leaked: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
+        return TestResult::Fail(leaked);
+    }
+    // Checksum of a buffer that already contains its own checksum
+    // bytes installed sums to 0.
+    let mut with_cs = bytes;
+    with_cs[10..12].copy_from_slice(&cs.to_be_bytes());
+    if ip_checksum(&with_cs) != 0 {
+        return TestResult::Fail("self-checked header didn't sum to 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_ip_checksum_known_vector);
+
+fn smoke_net_ipv4_header_round_trip() -> TestResult {
+    use crate::pkt::{parse_ipv4, set_ipv4_checksum, write_ipv4_header, IPV4_HDR_LEN, IP_PROTO_UDP};
+    let mut out = [0u8; 28];
+    // 28 bytes total = 20 hdr + 8 UDP-shaped payload.
+    {
+        let _ = write_ipv4_header(
+            &mut out,
+            28,
+            IP_PROTO_UDP,
+            [192, 168, 1, 1],
+            [192, 168, 1, 2],
+        )
+        .expect("header write");
+    }
+    set_ipv4_checksum(&mut out);
+    let (hdr, payload) = parse_ipv4(&out).expect("parse");
+    if hdr.total_len != 28 {
+        return TestResult::Fail("total_len round-trip");
+    }
+    if hdr.protocol != IP_PROTO_UDP {
+        return TestResult::Fail("protocol round-trip");
+    }
+    if hdr.src_ip != [192, 168, 1, 1] {
+        return TestResult::Fail("src_ip round-trip");
+    }
+    if hdr.dst_ip != [192, 168, 1, 2] {
+        return TestResult::Fail("dst_ip round-trip");
+    }
+    if payload.len() != 28 - IPV4_HDR_LEN {
+        return TestResult::Fail("payload window wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_ipv4_header_round_trip);
+
+fn smoke_net_ipv4_rejects_wrong_version() -> TestResult {
+    use crate::pkt::parse_ipv4;
+    let mut buf = [0u8; 20];
+    buf[0] = (6 << 4) | 5; // version=6, IHL=5
+    if parse_ipv4(&buf).is_some() {
+        return TestResult::Fail("parse_ipv4 accepted ver=6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_ipv4_rejects_wrong_version);
+
+fn smoke_net_ipv4_rejects_short_buffer() -> TestResult {
+    use crate::pkt::parse_ipv4;
+    let buf = [0u8; 19];
+    if parse_ipv4(&buf).is_some() {
+        return TestResult::Fail("parse_ipv4 accepted < 20 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_ipv4_rejects_short_buffer);
+
+fn smoke_net_arp_reply_builder_matches_request() -> TestResult {
+    // Build a request, parse it, build the reply, parse the reply,
+    // confirm sender/target swap and op==REPLY.
+    use crate::pkt::{
+        build_arp_reply, build_arp_request, parse_arp, parse_eth_header, ARP_OP_REPLY,
+        ARP_PAYLOAD_LEN, ETH_HDR_LEN,
+    };
+    let mut req_buf = [0u8; 64];
+    let n = build_arp_request(
+        &mut req_buf,
+        [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+        [10, 0, 2, 15],
+        [10, 0, 2, 2],
+    )
+    .expect("build req");
+
+    let (_, req_body) = parse_eth_header(&req_buf[..n]).expect("eth");
+    let req = parse_arp(req_body).expect("parse req");
+
+    let mut rep_buf = [0u8; 64];
+    let n2 = build_arp_reply(
+        &mut rep_buf,
+        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        [10, 0, 2, 2],
+        &req,
+    )
+    .expect("build reply");
+    if n2 != ETH_HDR_LEN + ARP_PAYLOAD_LEN {
+        return TestResult::Fail("reply length wrong");
+    }
+    let (_, rep_body) = parse_eth_header(&rep_buf[..n2]).expect("eth");
+    let rep = parse_arp(rep_body).expect("parse reply");
+    if rep.op != ARP_OP_REPLY {
+        return TestResult::Fail("reply op != REPLY");
+    }
+    if rep.spa != req.tpa {
+        return TestResult::Fail("reply spa should be original target");
+    }
+    if rep.tpa != req.spa {
+        return TestResult::Fail("reply tpa should be original sender");
+    }
+    if rep.tha != req.sha {
+        return TestResult::Fail("reply tha should be the requester's MAC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_arp_reply_builder_matches_request);
+
+fn smoke_net_arp_parse_rejects_bad_htype_or_ptype() -> TestResult {
+    use crate::pkt::parse_arp;
+    // 28-byte ARP body with htype=0 (invalid) → reject.
+    let mut buf = [0u8; 28];
+    // htype=0
+    buf[0] = 0;
+    buf[1] = 0;
+    // ptype = IPv4
+    buf[2] = 0x08;
+    buf[3] = 0x00;
+    buf[4] = 6; // hlen
+    buf[5] = 4; // plen
+    if parse_arp(&buf).is_some() {
+        return TestResult::Fail("ARP parse accepted htype=0");
+    }
+    // htype=1 but ptype = some random non-IPv4 (0x86DD = IPv6) → reject.
+    buf[0] = 0;
+    buf[1] = 1;
+    buf[2] = 0x86;
+    buf[3] = 0xDD;
+    if parse_arp(&buf).is_some() {
+        return TestResult::Fail("ARP parse accepted ptype=IPv6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_arp_parse_rejects_bad_htype_or_ptype);
+
+fn smoke_net_icmp_echo_parse_rejects_short() -> TestResult {
+    use crate::pkt::parse_icmp_echo;
+    if parse_icmp_echo(&[0u8; 7]).is_some() {
+        return TestResult::Fail("parse_icmp_echo accepted < 8 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_icmp_echo_parse_rejects_short);
