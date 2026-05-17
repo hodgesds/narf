@@ -152,4 +152,77 @@ mod tests {
         }
     }
     kernel_test_in!("accel", smoke_accel_info_integrity);
+
+    fn smoke_accel_error_variants_distinct() -> TestResult {
+        let all = [
+            AccelError::NotSupported,
+            AccelError::Busy,
+            AccelError::Timeout,
+            AccelError::InvalidArgs,
+            AccelError::HardwareError,
+            AccelError::Denied,
+            AccelError::OutOfMemory,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("AccelError variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("accel", smoke_accel_error_variants_distinct);
+
+    fn smoke_accel_kind_variants_distinct() -> TestResult {
+        use crate::device::AccelKind;
+        let all = [AccelKind::Npu, AccelKind::Tpu, AccelKind::Fpga, AccelKind::Dsp];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j && a == b {
+                    return TestResult::Fail("AccelKind variants collapsed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("accel", smoke_accel_kind_variants_distinct);
+
+    fn smoke_accel_features_bit_layout() -> TestResult {
+        use crate::device::AccelFeatures;
+        if AccelFeatures::BFLOAT16.bits() != 1 << 0 {
+            return TestResult::Fail("BFLOAT16 bit drifted");
+        }
+        if AccelFeatures::INT8.bits() != 1 << 1 {
+            return TestResult::Fail("INT8 bit drifted");
+        }
+        if AccelFeatures::ASYNC_QUEUE.bits() != 1 << 2 {
+            return TestResult::Fail("ASYNC_QUEUE bit drifted");
+        }
+        if AccelFeatures::P2P_DMA.bits() != 1 << 3 {
+            return TestResult::Fail("P2P_DMA bit drifted");
+        }
+        // Union/intersection round-trip.
+        let combo = AccelFeatures::BFLOAT16 | AccelFeatures::INT8;
+        if !combo.contains(AccelFeatures::BFLOAT16) || !combo.contains(AccelFeatures::INT8) {
+            return TestResult::Fail("union doesn't contain its members");
+        }
+        if combo.contains(AccelFeatures::P2P_DMA) {
+            return TestResult::Fail("union contains a bit it shouldn't");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("accel", smoke_accel_features_bit_layout);
+
+    fn smoke_accel_registry_register_and_list() -> TestResult {
+        use crate::registry;
+        let before = registry::list().len();
+        let dev = Arc::new(MockAccel::new()) as Arc<dyn AccelDeviceTrait>;
+        registry::register(dev);
+        if registry::list().len() != before + 1 {
+            return TestResult::Fail("register didn't bump list length");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("accel", smoke_accel_registry_register_and_list);
 }
