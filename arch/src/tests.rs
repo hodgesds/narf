@@ -1754,3 +1754,82 @@ fn smoke_arch_lbr_entries_zero_when_msr_bases_zero() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/lbr", smoke_arch_lbr_entries_zero_when_msr_bases_zero);
+
+// ── more low-value arch invariants ──────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_sgx_sgx2_implies_sgx1() -> TestResult {
+    // SGX2 extends SGX1 — never advertised in isolation.
+    use crate::x86_64::sgx;
+    let c = sgx::caps();
+    if c.sgx2 && !c.sgx1 {
+        return TestResult::Fail("SGX2 without SGX1");
+    }
+    if (c.sgx1 || c.sgx2) && !c.instruction_supported {
+        return TestResult::Fail("SGX1/2 set but instruction_supported false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/sgx", smoke_arch_sgx_sgx2_implies_sgx1);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_hfi_supported_implies_nonzero_size() -> TestResult {
+    // HFI feedback page exists only when supported; its size is a
+    // CPUID leaf 0x14 field that must be non-zero in that case.
+    use crate::x86_64::hfi;
+    let c = hfi::caps();
+    if c.supported && c.size_bytes == 0 {
+        return TestResult::Fail("supported but size_bytes == 0");
+    }
+    if c.supported && c.size_bytes > 4096 {
+        return TestResult::Fail("size_bytes > 4 KiB");
+    }
+    if !c.supported && (c.n_classes != 0 || c.size_bytes != 0) {
+        return TestResult::Fail("!supported but classes/size != 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/hfi", smoke_arch_hfi_supported_implies_nonzero_size);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_rdt_subfeature_implies_parent() -> TestResult {
+    // L3 / L2 / MBA allocation features require the parent
+    // "allocation" bit; L3 monitoring requires the parent
+    // "monitoring" bit.
+    use crate::x86_64::rdt;
+    let c = rdt::caps();
+    if c.l3_cat && !c.allocation {
+        return TestResult::Fail("l3_cat without allocation");
+    }
+    if c.l2_cat && !c.allocation {
+        return TestResult::Fail("l2_cat without allocation");
+    }
+    if c.mba && !c.allocation {
+        return TestResult::Fail("mba without allocation");
+    }
+    if c.l3_monitoring && !c.monitoring {
+        return TestResult::Fail("l3_monitoring without monitoring");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/rdt", smoke_arch_rdt_subfeature_implies_parent);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_pt_features_require_base() -> TestResult {
+    // ToPA / multi-ToPA / branch-filter are all features layered on
+    // top of base PT support — none can be set without supported.
+    use crate::x86_64::pt;
+    let c = pt::caps();
+    if !c.supported && (c.topa || c.multi_topa || c.branch_filter) {
+        return TestResult::Fail("PT sub-feature without base support");
+    }
+    if c.multi_topa && !c.topa {
+        return TestResult::Fail("multi_topa without topa");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pt", smoke_arch_pt_features_require_base);

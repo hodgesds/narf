@@ -2312,3 +2312,123 @@ fn smoke_acpi_pcct_short_buffer_returns_zero() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("acpi/pcct", smoke_acpi_pcct_short_buffer_returns_zero);
+
+fn smoke_acpi_slit_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SLIT");
+    buf.extend_from_slice(&[0u8; 2]); // < SDT_HEADER_SIZE
+    if crate::__test_parse_slit_body(&buf) != 0 {
+        return TestResult::Fail("short SLIT accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/slit", smoke_acpi_slit_short_buffer_returns_zero);
+
+fn smoke_acpi_cedt_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"CEDT");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_cedt_body(&buf) != 0 {
+        return TestResult::Fail("short CEDT accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/cedt", smoke_acpi_cedt_short_buffer_returns_zero);
+
+fn smoke_acpi_lpit_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"LPIT");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_lpit_body(&buf) != 0 {
+        return TestResult::Fail("short LPIT accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/lpit", smoke_acpi_lpit_short_buffer_returns_zero);
+
+fn smoke_acpi_nfit_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"NFIT");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_nfit_body(&buf) != 0 {
+        return TestResult::Fail("short NFIT accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/nfit", smoke_acpi_nfit_short_buffer_returns_zero);
+
+fn smoke_acpi_erst_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"ERST");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_erst_body(&buf) != 0 {
+        return TestResult::Fail("short ERST accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/erst", smoke_acpi_erst_short_buffer_returns_zero);
+
+fn smoke_acpi_einj_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"EINJ");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_einj_body(&buf) != 0 {
+        return TestResult::Fail("short EINJ accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/einj", smoke_acpi_einj_short_buffer_returns_zero);
+
+fn smoke_acpi_aest_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"AEST");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_aest_body(&buf) != 0 {
+        return TestResult::Fail("short AEST accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/aest", smoke_acpi_aest_short_buffer_returns_zero);
+
+fn smoke_acpi_mpst_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"MPST");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_mpst_body(&buf) != 0 {
+        return TestResult::Fail("short MPST accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/mpst", smoke_acpi_mpst_short_buffer_returns_zero);
+
+fn smoke_acpi_sdev_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SDEV");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_sdev_body(&buf) != 0 {
+        return TestResult::Fail("short SDEV accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/sdev", smoke_acpi_sdev_short_buffer_returns_zero);
+
+fn smoke_acpi_ras2_short_buffer_returns_zero() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"RAS2");
+    buf.extend_from_slice(&[0u8; 2]);
+    if crate::__test_parse_ras2_body(&buf) != 0 {
+        return TestResult::Fail("short RAS2 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/ras2", smoke_acpi_ras2_short_buffer_returns_zero);
