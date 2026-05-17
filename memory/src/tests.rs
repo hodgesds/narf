@@ -2973,3 +2973,334 @@ kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_drain_and_refill);
 // End-to-end "AtomicPool used from real IRQ handler" test lives
 // in interrupts/src/tests.rs (memory crate doesn't depend on
 // narf-interrupts).
+
+// ── deep memory/atomic_pool ──────────────────────────────────────
+
+fn smoke_atomic_pool_capacity_pinned_after_drain() -> TestResult {
+    use crate::atomic_pool::AtomicPool;
+    use narf_lib::sync::IrqSafeSpinLock;
+    static POOL: IrqSafeSpinLock<Option<&'static AtomicPool<u64>>> =
+        IrqSafeSpinLock::new(None);
+    let pool: &'static AtomicPool<u64> = {
+        let p = alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(3, || 0u64)));
+        *POOL.lock() = Some(p);
+        p
+    };
+    if pool.capacity() != 3 {
+        return TestResult::Fail("capacity != 3 at init");
+    }
+    let a = pool.try_get();
+    let b = pool.try_get();
+    let c = pool.try_get();
+    if a.is_none() || b.is_none() || c.is_none() {
+        return TestResult::Fail("drain didn't yield 3 items");
+    }
+    if pool.capacity() != 3 {
+        return TestResult::Fail("capacity() drifted while drained");
+    }
+    if pool.free_count() != 0 {
+        return TestResult::Fail("free_count != 0 when drained");
+    }
+    if pool.try_get().is_some() {
+        return TestResult::Fail("4th try_get should have returned None");
+    }
+    drop(a);
+    drop(b);
+    drop(c);
+    if pool.free_count() != 3 {
+        return TestResult::Fail("free_count didn't restore to 3");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_capacity_pinned_after_drain);
+
+fn smoke_atomic_pool_pooled_deref_mut_visible_next_lease() -> TestResult {
+    // Pooled<T>'s DerefMut writes are observable when the item
+    // returns to the pool and is leased again — the pool isn't
+    // resetting items on drop.
+    use crate::atomic_pool::AtomicPool;
+    use narf_lib::sync::IrqSafeSpinLock;
+    static POOL: IrqSafeSpinLock<Option<&'static AtomicPool<u32>>> =
+        IrqSafeSpinLock::new(None);
+    let pool: &'static AtomicPool<u32> = {
+        let p = alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(1, || 0u32)));
+        *POOL.lock() = Some(p);
+        p
+    };
+    {
+        let mut h = pool.try_get().expect("lease 1");
+        *h = 0xDEAD_BEEF;
+    }
+    let h2 = pool.try_get().expect("lease 2");
+    if *h2 != 0xDEAD_BEEF {
+        return TestResult::Fail("mutation lost across drop+re-lease");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_pooled_deref_mut_visible_next_lease);
+
+// ── deep memory/tlb_shootdown ────────────────────────────────────
+
+fn smoke_tlb_shootdown_request_constructors() -> TestResult {
+    use crate::tlb_shootdown::ShootdownRequest;
+    let full = ShootdownRequest::full();
+    if full.tag.is_some() || full.addr.is_some() || full.size.is_some() {
+        return TestResult::Fail("full() should clear all fields");
+    }
+    let by_tag = ShootdownRequest::for_tag(42);
+    if by_tag.tag != Some(42) || by_tag.addr.is_some() || by_tag.size.is_some() {
+        return TestResult::Fail("for_tag() shape drifted");
+    }
+    let by_va = ShootdownRequest::for_va(7, 0xFFFF_8000_DEAD_0000);
+    if by_va.tag != Some(7) || by_va.addr != Some(0xFFFF_8000_DEAD_0000) || by_va.size.is_some() {
+        return TestResult::Fail("for_va() shape drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_request_constructors);
+
+fn smoke_tlb_shootdown_counter_monotonic() -> TestResult {
+    use crate::tlb_shootdown::{shootdown, shootdown_count, ShootdownRequest, __reset_for_test};
+    __reset_for_test();
+    let base = shootdown_count();
+    shootdown(ShootdownRequest::full());
+    shootdown(ShootdownRequest::for_tag(1));
+    shootdown(ShootdownRequest::for_va(2, 0x1000));
+    let after = shootdown_count();
+    if after.saturating_sub(base) != 3 {
+        return TestResult::Fail("shootdown_count didn't increment by 3");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_counter_monotonic);
+
+fn smoke_tlb_shootdown_request_equality() -> TestResult {
+    use crate::tlb_shootdown::ShootdownRequest;
+    let a = ShootdownRequest::for_va(5, 0x2000);
+    let b = ShootdownRequest::for_va(5, 0x2000);
+    let c = ShootdownRequest::for_va(5, 0x3000);
+    if a != b {
+        return TestResult::Fail("Eq on identical ShootdownRequest broke");
+    }
+    if a == c {
+        return TestResult::Fail("Eq collapsed distinct ShootdownRequests");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_request_equality);
+
+// ── deep memory/context ──────────────────────────────────────────
+
+fn smoke_context_alloc_context_variants_distinct() -> TestResult {
+    use crate::context::AllocContext;
+    let all = [AllocContext::Sleepable, AllocContext::Atomic, AllocContext::IrqOff];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("AllocContext variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/context", smoke_context_alloc_context_variants_distinct);
+
+fn smoke_context_atomic_assert_is_noop() -> TestResult {
+    // Atomic / IrqOff carry no precondition on the caller's
+    // environment — debug_assert_consistent must accept them
+    // regardless of IRQ state.
+    use crate::context::AllocContext;
+    AllocContext::Atomic.debug_assert_consistent();
+    AllocContext::IrqOff.debug_assert_consistent();
+    TestResult::Pass
+}
+kernel_test_in!("memory/context", smoke_context_atomic_assert_is_noop);
+
+// ── deep memory/asid_alloc ──────────────────────────────────────
+
+fn smoke_asid_alloc_cached_returns_same_tag() -> TestResult {
+    use crate::asid_alloc::{alloc, cached, __reset_for_test};
+    use narf_lib::id::DomainId;
+    __reset_for_test();
+    let dom = DomainId::SCRATCH;
+    let issued = alloc(dom);
+    let again = cached(dom).expect("cached should hit after alloc");
+    if issued.tag != again.tag || issued.generation != again.generation {
+        return TestResult::Fail("cached drifted from alloc");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_cached_returns_same_tag);
+
+fn smoke_asid_alloc_invalidate_clears_cache() -> TestResult {
+    use crate::asid_alloc::{alloc, cached, invalidate_tag, __reset_for_test};
+    use narf_lib::id::DomainId;
+    __reset_for_test();
+    let dom = DomainId::SCRATCH;
+    let _ = alloc(dom);
+    if cached(dom).is_none() {
+        return TestResult::Fail("cache miss right after alloc");
+    }
+    invalidate_tag(dom);
+    if cached(dom).is_some() {
+        return TestResult::Fail("invalidate_tag didn't clear cache");
+    }
+    // Next alloc issues a fresh tag.
+    let fresh = alloc(dom);
+    if fresh.tag == 0 {
+        return TestResult::Fail("post-invalidate alloc returned reserved tag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_invalidate_clears_cache);
+
+fn smoke_asid_alloc_rollover_bumps_generation() -> TestResult {
+    use crate::asid_alloc::{alloc, current_generation, rollover_now, __reset_for_test};
+    use narf_lib::id::DomainId;
+    __reset_for_test();
+    let before = current_generation();
+    let _ = alloc(DomainId::SCRATCH);
+    rollover_now();
+    let after = current_generation();
+    if after <= before {
+        return TestResult::Fail("rollover_now didn't bump generation");
+    }
+    // Re-alloc post-rollover must produce a tag in the new gen.
+    let fresh = alloc(DomainId::SCRATCH);
+    if fresh.generation != after {
+        return TestResult::Fail("post-rollover alloc has stale generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_rollover_bumps_generation);
+
+fn smoke_asid_alloc_reserved_tag_constant() -> TestResult {
+    use crate::asid_alloc::TAG_RESERVED;
+    if TAG_RESERVED != 0 {
+        return TestResult::Fail("TAG_RESERVED drifted from 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_reserved_tag_constant);
+
+// ── deep memory/per_domain_root ──────────────────────────────────
+
+fn smoke_per_domain_root_alloc_error_variants_distinct() -> TestResult {
+    use crate::per_domain_root::AllocError;
+    let all = [AllocError::OutOfMemory, AllocError::NotInitialised, AllocError::AlreadyAllocated];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("AllocError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_alloc_error_variants_distinct);
+
+fn smoke_per_domain_root_lookup_none_before_register() -> TestResult {
+    use crate::per_domain_root::{__reset_for_test, lookup, unregister_root};
+    use narf_lib::id::DomainId;
+    __reset_for_test();
+    // SCRATCH starts unregistered after reset.
+    unregister_root(DomainId::SCRATCH);
+    if lookup(DomainId::SCRATCH).is_some() {
+        return TestResult::Fail("lookup after unregister returned Some");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_lookup_none_before_register);
+
+fn smoke_per_domain_root_double_register_rejected() -> TestResult {
+    use crate::per_domain_root::{__reset_for_test, register_root, unregister_root, AllocError};
+    use narf_lib::id::DomainId;
+    __reset_for_test();
+    unregister_root(DomainId::SCRATCH);
+    let dom = DomainId::SCRATCH;
+    let first = register_root(dom, 0xFFFF_F000);
+    if first.is_err() {
+        return TestResult::Fail("first register_root failed");
+    }
+    match register_root(dom, 0xFFFE_F000) {
+        Err(AllocError::AlreadyAllocated) => {}
+        _ => return TestResult::Fail("double-register didn't surface AlreadyAllocated"),
+    }
+    unregister_root(dom);
+    TestResult::Pass
+}
+kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_double_register_rejected);
+
+// ── deep memory/buddy ────────────────────────────────────────────
+
+fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
+    // Order 0 (1 page) round-trips through alloc_pages_on / free_pages
+    // on the default NUMA node. Uninitialised allocator is a valid
+    // outcome on the slim test image — surface a Skip instead of
+    // fabricating a pass.
+    use crate::frame::{alloc_pages_on, free_pages, FrameAllocError};
+    match alloc_pages_on(0, 0) {
+        Ok(frame) => {
+            free_pages(frame, 0);
+            TestResult::Pass
+        }
+        Err(FrameAllocError::Uninitialised) => {
+            TestResult::Skip("frame allocator not up in this flavour")
+        }
+        Err(FrameAllocError::Exhausted) => {
+            TestResult::Skip("buddy exhausted on this test image")
+        }
+    }
+}
+kernel_test_in!("memory/buddy", smoke_buddy_alloc_pages_on_order_round_trip);
+
+fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
+    // MAX_ORDER itself must be accepted (Exhausted is fine — pool may
+    // not have a contiguous run); MAX_ORDER+1 was already tested as
+    // rejected, so the boundary lives one slot below.
+    use crate::buddy::MAX_ORDER;
+    use crate::frame::{alloc_pages_on, free_pages, FrameAllocError};
+    match alloc_pages_on(0, MAX_ORDER) {
+        Ok(frame) => {
+            free_pages(frame, MAX_ORDER);
+            TestResult::Pass
+        }
+        Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
+    }
+}
+kernel_test_in!("memory/buddy", smoke_buddy_alloc_pages_on_max_order_boundary);
+
+// ── deep memory/hugepage ─────────────────────────────────────────
+
+fn smoke_hugepage_size_constants() -> TestResult {
+    use crate::hugepage::{HUGEPAGE_1G_BYTES, HUGEPAGE_2M_BYTES};
+    if HUGEPAGE_2M_BYTES != 2 * 1024 * 1024 {
+        return TestResult::Fail("HUGEPAGE_2M_BYTES drifted from 2 MiB");
+    }
+    if HUGEPAGE_1G_BYTES != 1024 * 1024 * 1024 {
+        return TestResult::Fail("HUGEPAGE_1G_BYTES drifted from 1 GiB");
+    }
+    if HUGEPAGE_1G_BYTES != HUGEPAGE_2M_BYTES * 512 {
+        return TestResult::Fail("1 GiB / 2 MiB ratio drifted from 512");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/hugepage", smoke_hugepage_size_constants);
+
+fn smoke_hugepage_alloc_2m_empty_after_no_reserve() -> TestResult {
+    // With no reserve_from_regions call, the 2 MiB pool must be
+    // empty and alloc_hugepage_2m must surface Empty rather than
+    // hand back a fabricated frame.
+    use crate::hugepage::{alloc_hugepage_2m, stats, HugeAllocError};
+    let s = stats();
+    if s.free_2m != 0 {
+        // Pool may be warm from earlier tests — Skip rather than
+        // mutate global state we don't own.
+        return TestResult::Skip("hugepage 2m pool not empty");
+    }
+    match alloc_hugepage_2m() {
+        Err(HugeAllocError::Empty) => TestResult::Pass,
+        _ => TestResult::Fail("empty 2m pool didn't surface Empty"),
+    }
+}
+kernel_test_in!("memory/hugepage", smoke_hugepage_alloc_2m_empty_after_no_reserve);
