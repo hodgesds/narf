@@ -475,3 +475,169 @@ fn smoke_wm8960_init_sequence_starts_with_reset() -> TestResult {
 }
 
 kernel_test_in!("audio/wm8960", smoke_wm8960_init_sequence_starts_with_reset);
+
+// ── deep audio/i2s ──────────────────────────────────────────────
+
+fn smoke_i2s_word_length_variants_distinct() -> TestResult {
+    use crate::i2s::WordLength;
+    let all = [WordLength::Bits16, WordLength::Bits20, WordLength::Bits24, WordLength::Bits32];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("WordLength variants collapsed");
+            }
+        }
+    }
+    // repr(u8) values match the bit count.
+    if WordLength::Bits16 as u8 != 16 { return TestResult::Fail("Bits16 != 16"); }
+    if WordLength::Bits32 as u8 != 32 { return TestResult::Fail("Bits32 != 32"); }
+    TestResult::Pass
+}
+kernel_test_in!("audio/i2s", smoke_i2s_word_length_variants_distinct);
+
+fn smoke_i2s_channels_repr_matches_count() -> TestResult {
+    use crate::i2s::Channels;
+    if Channels::Mono as u8 != 1 { return TestResult::Fail("Mono != 1"); }
+    if Channels::Stereo as u8 != 2 { return TestResult::Fail("Stereo != 2"); }
+    if Channels::Tdm4 as u8 != 4 { return TestResult::Fail("Tdm4 != 4"); }
+    if Channels::Tdm6 as u8 != 6 { return TestResult::Fail("Tdm6 != 6"); }
+    if Channels::Tdm8 as u8 != 8 { return TestResult::Fail("Tdm8 != 8"); }
+    TestResult::Pass
+}
+kernel_test_in!("audio/i2s", smoke_i2s_channels_repr_matches_count);
+
+fn smoke_i2s_frame_format_variants_distinct() -> TestResult {
+    use crate::i2s::FrameFormat;
+    let all = [
+        FrameFormat::Standard,
+        FrameFormat::LeftJustified,
+        FrameFormat::RightJustified,
+        FrameFormat::DspPcm,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("FrameFormat variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/i2s", smoke_i2s_frame_format_variants_distinct);
+
+fn smoke_i2s_cd_quality_default_shape() -> TestResult {
+    use crate::i2s::{Channels, FrameFormat, I2sFormat, WordLength};
+    let f = I2sFormat::cd_quality_stereo();
+    if f.word_length != WordLength::Bits16 { return TestResult::Fail("WL"); }
+    if f.frame_format != FrameFormat::Standard { return TestResult::Fail("FF"); }
+    if f.channels != Channels::Stereo { return TestResult::Fail("CH"); }
+    if f.sample_rate_hz != 44_100 { return TestResult::Fail("SR"); }
+    if !f.host_is_master { return TestResult::Fail("master flag"); }
+    TestResult::Pass
+}
+kernel_test_in!("audio/i2s", smoke_i2s_cd_quality_default_shape);
+
+fn smoke_i2s_bit_clock_scales_with_word_length_and_channels() -> TestResult {
+    use crate::i2s::{Channels, FrameFormat, I2sFormat, WordLength};
+    // 48 kHz / 24-bit / 8-ch TDM: 48000 * 8 * 24 = 9_216_000 Hz.
+    let f = I2sFormat {
+        word_length: WordLength::Bits24,
+        frame_format: FrameFormat::DspPcm,
+        channels: Channels::Tdm8,
+        sample_rate_hz: 48_000,
+        host_is_master: true,
+    };
+    if f.bit_clock_hz() != 48_000u64 * 8 * 24 {
+        return TestResult::Fail("BCLK scaling drifted");
+    }
+    if f.master_clock_hz(384) != 48_000u64 * 384 {
+        return TestResult::Fail("MCLK scaling drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/i2s", smoke_i2s_bit_clock_scales_with_word_length_and_channels);
+
+// ── deep audio/wm8960 ───────────────────────────────────────────
+
+fn smoke_wm8960_i2c_address_pinned() -> TestResult {
+    use crate::wm8960::I2C_ADDRESS;
+    // Datasheet §6: hard-wired 7-bit address 0b0011010 = 0x1A.
+    if I2C_ADDRESS != 0x1A {
+        return TestResult::Fail("I2C address drifted from 0x1A");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/wm8960", smoke_wm8960_i2c_address_pinned);
+
+fn smoke_wm8960_pack_unpack_walks_register_corners() -> TestResult {
+    use crate::wm8960::{pack_register_write, unpack_register_write};
+    // 7-bit register address (0..127) + 9-bit data (0..511).
+    let corners = [
+        (0u8, 0u16),
+        (0x7F, 0x1FF),
+        (0x40, 0x100),
+        (0x01, 0x000),
+        (0x37, 0x0AB),
+    ];
+    for (reg, data) in corners {
+        let buf = pack_register_write(reg, data);
+        let (r, d) = unpack_register_write(buf);
+        if r != reg || d != data {
+            return TestResult::Fail("pack/unpack failed at a corner");
+        }
+    }
+    // High bit of reg must be masked (datasheet only specifies 7-bit
+    // address). Verify upper-bit input doesn't leak into the data.
+    let buf = pack_register_write(0xFF, 0x123);
+    let (r, d) = unpack_register_write(buf);
+    if r != 0x7F || d != 0x123 {
+        return TestResult::Fail("register address high bit not masked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/wm8960", smoke_wm8960_pack_unpack_walks_register_corners);
+
+fn smoke_wm8960_audio_iface_format_bits_distinct() -> TestResult {
+    use crate::wm8960::audio_iface::{
+        FORMAT_DSP, FORMAT_I2S, FORMAT_LEFT_JUSTIFIED, FORMAT_RIGHT_JUSTIFIED,
+    };
+    let all = [FORMAT_RIGHT_JUSTIFIED, FORMAT_LEFT_JUSTIFIED, FORMAT_I2S, FORMAT_DSP];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("audio_iface FORMAT_* collapsed");
+            }
+        }
+    }
+    // Datasheet pins these values (R7 bits [1:0]).
+    if FORMAT_RIGHT_JUSTIFIED != 0 { return TestResult::Fail("RJ != 0"); }
+    if FORMAT_LEFT_JUSTIFIED != 1 { return TestResult::Fail("LJ != 1"); }
+    if FORMAT_I2S != 2 { return TestResult::Fail("I2S != 2"); }
+    if FORMAT_DSP != 3 { return TestResult::Fail("DSP != 3"); }
+    TestResult::Pass
+}
+kernel_test_in!("audio/wm8960", smoke_wm8960_audio_iface_format_bits_distinct);
+
+fn smoke_wm8960_init_sequence_drives_dac_volume() -> TestResult {
+    use crate::wm8960::{build_init_sequence_i2s_master_16bit, regs};
+    // The init sequence must drive both LEFT_DAC_VOLUME and
+    // RIGHT_DAC_VOLUME with the simultaneous-update flag (bit 8 set)
+    // — otherwise the codec only updates after the next L/R volume
+    // write and audio is muted on the path between them.
+    let seq = build_init_sequence_i2s_master_16bit();
+    let left = seq.iter().find(|(r, _)| *r == regs::LEFT_DAC_VOLUME);
+    let right = seq.iter().find(|(r, _)| *r == regs::RIGHT_DAC_VOLUME);
+    match (left, right) {
+        (Some((_, lv)), Some((_, rv))) => {
+            if lv & (1 << 8) == 0 {
+                return TestResult::Fail("LEFT_DAC missing simultaneous-update bit");
+            }
+            if rv & (1 << 8) == 0 {
+                return TestResult::Fail("RIGHT_DAC missing simultaneous-update bit");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("init sequence skipped a DAC-volume write"),
+    }
+}
+kernel_test_in!("audio/wm8960", smoke_wm8960_init_sequence_drives_dac_volume);

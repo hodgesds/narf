@@ -427,3 +427,109 @@ fn smoke_obs_pmu_enable_user_reads_revoked_cap_rejected() -> TestResult {
     }
 }
 kernel_test_in!("observability", smoke_obs_pmu_enable_user_reads_revoked_cap_rejected);
+
+// ── deep observability/gdb + peek ───────────────────────────────────
+
+fn smoke_obs_gdb_packet_to_wire_format() -> TestResult {
+    use crate::gdb::GdbPacket;
+    let pkt = GdbPacket::new("OK");
+    // 'O' + 'K' = 0x4F + 0x4B = 0x9A.
+    let s = pkt.to_wire();
+    if s != "$OK#9a" {
+        return TestResult::Fail("to_wire format drifted from $payload#XX");
+    }
+    // Empty payload checksum = 0 → "$#00".
+    let empty = GdbPacket::new("");
+    if empty.to_wire() != "$#00" {
+        return TestResult::Fail("empty payload should serialise to $#00");
+    }
+    // Round-trip: checksum_valid() agrees with new().
+    let p = GdbPacket::new("qSupported");
+    if !p.checksum_valid() {
+        return TestResult::Fail("freshly-built packet failed checksum_valid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_packet_to_wire_format);
+
+fn smoke_obs_gdb_command_variants_distinct() -> TestResult {
+    use crate::gdb::GdbCommand;
+    let a = GdbCommand::ReadRegs;
+    let b = GdbCommand::WriteRegs(alloc::vec![1, 2]);
+    let c = GdbCommand::ReadMem { addr: 0x1000, len: 4 };
+    let d = GdbCommand::WriteMem { addr: 0x2000, bytes: alloc::vec![0xFF] };
+    let e = GdbCommand::Continue { addr: None };
+    let f = GdbCommand::Step { addr: Some(0x3000) };
+    let g = GdbCommand::InsertBp { addr: 0x4000, kind: 1 };
+    let h = GdbCommand::RemoveBp { addr: 0x4000, kind: 1 };
+    let i = GdbCommand::HaltReason;
+    let j = GdbCommand::QSupported(alloc::string::String::from("multiprocess+"));
+    // Spot-check distinctness on a few pairs that share addr/kind
+    // but differ by variant — Eq must distinguish by variant tag.
+    if g == h {
+        return TestResult::Fail("InsertBp == RemoveBp with same addr/kind");
+    }
+    if a == i {
+        return TestResult::Fail("ReadRegs == HaltReason");
+    }
+    if e == f {
+        return TestResult::Fail("Continue(None) == Step(Some)");
+    }
+    // Same-variant inequality: WriteRegs with different bytes.
+    let b2 = GdbCommand::WriteRegs(alloc::vec![1, 3]);
+    if b == b2 {
+        return TestResult::Fail("WriteRegs Eq ignored inner");
+    }
+    let _ = (c, d, j); // touch the rest to keep them constructible
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_command_variants_distinct);
+
+fn smoke_obs_gdb_error_variants_distinct() -> TestResult {
+    use crate::gdb::GdbError;
+    let all = [
+        GdbError::AuthorityRevoked,
+        GdbError::MalformedPacket,
+        GdbError::Unsupported,
+        GdbError::NotImplemented,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("GdbError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_error_variants_distinct);
+
+fn smoke_obs_peek_metric_value_variants_distinct() -> TestResult {
+    use crate::peek::MetricValue;
+    // Different variants never equal.
+    if MetricValue::U64(0) == MetricValue::Bool(false) {
+        return TestResult::Fail("U64(0) == Bool(false)");
+    }
+    // Same variant, different inner.
+    if MetricValue::U64(1) == MetricValue::U64(2) {
+        return TestResult::Fail("U64(1) == U64(2)");
+    }
+    if MetricValue::Bool(true) == MetricValue::Bool(false) {
+        return TestResult::Fail("Bool(true) == Bool(false)");
+    }
+    // Same variant, same inner.
+    if MetricValue::U64(42) != MetricValue::U64(42) {
+        return TestResult::Fail("U64(42) != U64(42)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_peek_metric_value_variants_distinct);
+
+fn smoke_obs_peek_error_variants_distinct() -> TestResult {
+    use crate::peek::PeekError;
+    if PeekError::AuthorityRevoked == PeekError::NotRegistered {
+        return TestResult::Fail("PeekError variants collapsed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_peek_error_variants_distinct);

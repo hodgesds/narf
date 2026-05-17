@@ -439,3 +439,114 @@ fn smoke_io_unknown_resolve_returns_none() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io", smoke_io_unknown_resolve_returns_none);
+
+// ── deep io/iommu coverage ─────────────────────────────────────────
+
+fn smoke_iommu_vendor_repr_pins_discriminants() -> TestResult {
+    use crate::iommu::IommuVendor;
+    if IommuVendor::None as u8 != 0 {
+        return TestResult::Fail("None discriminant drifted from 0");
+    }
+    if IommuVendor::AmdVi as u8 != 1 {
+        return TestResult::Fail("AmdVi drifted from 1");
+    }
+    if IommuVendor::IntelVtd as u8 != 2 {
+        return TestResult::Fail("IntelVtd drifted from 2");
+    }
+    let all = [IommuVendor::None, IommuVendor::AmdVi, IommuVendor::IntelVtd];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("IommuVendor collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_vendor_repr_pins_discriminants);
+
+fn smoke_iommu_mode_variants_distinct() -> TestResult {
+    use crate::iommu::IommuMode;
+    let all = [IommuMode::Disabled, IommuMode::Identity, IommuMode::PerDomain];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("IommuMode variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_mode_variants_distinct);
+
+fn smoke_iommu_init_error_variants_distinct() -> TestResult {
+    use crate::iommu::IommuInitError;
+    let all = [
+        IommuInitError::AlreadyInitialised,
+        IommuInitError::NoTablesParsed,
+        IommuInitError::NoIommusFound,
+        IommuInitError::DeadMmio,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("IommuInitError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_init_error_variants_distinct);
+
+fn smoke_iommu_accessors_match_state_after_reset() -> TestResult {
+    use crate::iommu::{__reset_for_test, is_active, mode, vendor, IommuMode, IommuVendor};
+    __reset_for_test();
+    // After a reset the IOMMU is reported as Disabled / None / not active.
+    if mode() != IommuMode::Disabled {
+        return TestResult::Fail("mode != Disabled after reset");
+    }
+    if vendor() != IommuVendor::None {
+        return TestResult::Fail("vendor != None after reset");
+    }
+    if is_active() {
+        return TestResult::Fail("is_active() should be false after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_accessors_match_state_after_reset);
+
+fn smoke_iommu_unit_count_zero_after_reset() -> TestResult {
+    use crate::iommu::{__reset_for_test, unit_count};
+    __reset_for_test();
+    if unit_count() != 0 {
+        return TestResult::Fail("unit_count != 0 after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_unit_count_zero_after_reset);
+
+fn smoke_iommu_force_identity_sets_active_and_identity_mode() -> TestResult {
+    use crate::iommu::{__force_identity_for_test, __reset_for_test, is_active, mode, IommuMode};
+    __reset_for_test();
+    __force_identity_for_test();
+    if mode() != IommuMode::Identity {
+        return TestResult::Fail("force_identity didn't set mode = Identity");
+    }
+    if !is_active() {
+        return TestResult::Fail("is_active() should be true after force_identity");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_force_identity_sets_active_and_identity_mode);
+
+fn smoke_iommu_caps_default_zero_after_reset() -> TestResult {
+    use crate::iommu::{__reset_for_test, caps};
+    __reset_for_test();
+    let c = caps();
+    if c.vendor != 0 || c.raw_caps_lo != 0 || c.raw_caps_hi != 0 {
+        return TestResult::Fail("caps() didn't zero after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_caps_default_zero_after_reset);
