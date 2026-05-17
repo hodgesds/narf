@@ -306,3 +306,135 @@ fn smoke_tracing_hwtrace_surface() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("tracing", smoke_tracing_hwtrace_surface);
+
+// ── deep tracing coverage ─────────────────────────────────────────
+
+fn smoke_tracing_welford_min_max_track_extremes() -> TestResult {
+    use crate::fntime::Welford;
+    let mut w = Welford::new();
+    w.add(100);
+    w.add(50);
+    w.add(200);
+    w.add(75);
+    if w.min != 50 {
+        return TestResult::Fail("min didn't track 50");
+    }
+    if w.max != 200 {
+        return TestResult::Fail("max didn't track 200");
+    }
+    if w.count != 4 {
+        return TestResult::Fail("count didn't reach 4");
+    }
+    if (w.mean - 106.25).abs() > 0.001 {
+        return TestResult::Fail("mean wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_welford_min_max_track_extremes);
+
+fn smoke_tracing_welford_sample_variance_zero_below_2() -> TestResult {
+    use crate::fntime::Welford;
+    let mut w = Welford::new();
+    if w.sample_variance() != 0.0 {
+        return TestResult::Fail("empty Welford variance != 0");
+    }
+    w.add(42);
+    if w.sample_variance() != 0.0 {
+        return TestResult::Fail("n=1 Welford variance != 0");
+    }
+    w.add(58);
+    if (w.sample_variance() - 128.0).abs() > 0.001 {
+        return TestResult::Fail("n=2 sample variance wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_welford_sample_variance_zero_below_2);
+
+fn smoke_tracing_welford_new_sentinel() -> TestResult {
+    // `Welford::new()` initialises min=MAX (sentinel so the first
+    // add(x) flips min to x). `Welford::default()` uses #[derive
+    // (Default)] which produces all-zeros — distinct semantics, so
+    // we pin both shapes.
+    use crate::fntime::Welford;
+    let w = Welford::new();
+    if w.count != 0 || w.mean != 0.0 || w.m2 != 0.0 {
+        return TestResult::Fail("Welford::new non-empty");
+    }
+    if w.min != u64::MAX {
+        return TestResult::Fail("Welford::new min != MAX (sentinel)");
+    }
+    if w.max != 0 {
+        return TestResult::Fail("Welford::new max != 0");
+    }
+    // Default() is all-zeros; this is the derived behaviour.
+    let d = Welford::default();
+    if d.count != 0 || d.mean != 0.0 || d.m2 != 0.0 || d.min != 0 || d.max != 0 {
+        return TestResult::Fail("Welford::default not all-zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_welford_new_sentinel);
+
+fn smoke_tracing_fntime_record_cycles_directly() -> TestResult {
+    use crate::fntime::FnTime;
+    static LAT: FnTime = FnTime::new("test-direct");
+    let before = LAT.welford();
+    LAT.record_cycles(1000);
+    LAT.record_cycles(2000);
+    let after = LAT.welford();
+    if after.count != before.count + 2 {
+        return TestResult::Fail("record_cycles didn't bump count by 2");
+    }
+    if after.max < 2000 {
+        return TestResult::Fail("max didn't track 2000");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_fntime_record_cycles_directly);
+
+fn smoke_tracing_fntime_name_round_trip() -> TestResult {
+    use crate::fntime::FnTime;
+    static LAT: FnTime = FnTime::new("named-fn");
+    if LAT.name() != "named-fn" {
+        return TestResult::Fail("name() didn't return the construction name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_fntime_name_round_trip);
+
+fn smoke_tracing_hwtrace_error_variants_distinct() -> TestResult {
+    use crate::hwtrace::HwTraceError;
+    let all = [
+        HwTraceError::AuthorityRevoked,
+        HwTraceError::NotImplemented,
+        HwTraceError::InvalidBuffer,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("HwTraceError variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_hwtrace_error_variants_distinct);
+
+fn smoke_tracing_hwtrace_status_variants_distinct() -> TestResult {
+    use crate::hwtrace::HwTraceStatus;
+    let all = [
+        HwTraceStatus::Idle,
+        HwTraceStatus::Running,
+        HwTraceStatus::Overflow,
+        HwTraceStatus::Error,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("HwTraceStatus variants collapsed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("tracing", smoke_tracing_hwtrace_status_variants_distinct);
