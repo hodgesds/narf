@@ -29,10 +29,10 @@
 //! the second byte of an E0 escape" flag) and a bitset of currently
 //! pressed modifier keys to stamp on every event.
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
-use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
+use narf_input::{push_key, KeyCode};
 
 /// I/O ports.
 pub const PS2_DATA: u16 = 0x60;
@@ -58,12 +58,13 @@ const CONF_KBD_DISABLE: u8 = 1 << 4;
 const CONF_KBD_TRANSLATE: u8 = 1 << 6;
 
 /// Driver state. Only one i8042 controller per system — global static.
+/// Modifier tracking lives in `narf_input` (shared across all keyboard
+/// producers); we only keep the E0-prefix latch here.
 #[derive(Debug)]
 pub struct State {
     /// True after the next byte should be interpreted as the second
     /// half of an E0 escape sequence.
     extended: AtomicBool,
-    modifiers: AtomicU16,
     initialized: AtomicBool,
 }
 
@@ -71,7 +72,6 @@ impl State {
     pub const fn new() -> Self {
         Self {
             extended: AtomicBool::new(false),
-            modifiers: AtomicU16::new(0),
             initialized: AtomicBool::new(false),
         }
     }
@@ -281,45 +281,10 @@ fn decode(byte: u8, extended: bool) -> KeyCode {
             _ => KeyCode::Unknown,
         };
     }
-    // Plain set-1 mapping. Codes 0..=70 line up 1:1 with our KeyCode
-    // numeric values by construction (see input/lib.rs).
-    if byte <= 70 {
-        // SAFETY: we constructed KeyCode so 0..=70 map to defined
-        // discriminants (Reserved..=ScrollLock).
-        return unsafe { core::mem::transmute::<u16, KeyCode>(byte as u16) };
-    }
-    KeyCode::Unknown
-}
-
-/// Apply this event's effect to the modifier bitset (for modifier
-/// keys) and return the *post-event* state. Returns the same
-/// modifier state for non-modifier keys.
-fn apply_modifiers(code: KeyCode, pressed: bool, mods: Modifiers) -> Modifiers {
-    let mut m = mods;
-    let bit = match code {
-        KeyCode::LeftShift | KeyCode::RightShift => Modifiers::SHIFT,
-        KeyCode::LeftCtrl | KeyCode::RightCtrl => Modifiers::CTRL,
-        KeyCode::LeftAlt | KeyCode::RightAlt => Modifiers::ALT,
-        KeyCode::CapsLock if pressed => {
-            m.toggle(Modifiers::CAPS_LOCK);
-            return m;
-        }
-        KeyCode::NumLock if pressed => {
-            m.toggle(Modifiers::NUM_LOCK);
-            return m;
-        }
-        KeyCode::ScrollLock if pressed => {
-            m.toggle(Modifiers::SCROLL_LOCK);
-            return m;
-        }
-        _ => return m,
-    };
-    if pressed {
-        m.insert(bit);
-    } else {
-        m.remove(bit);
-    }
-    m
+    // Plain set-1 mapping. Set-1 make codes 1..=83 match Linux evdev
+    // KEY_* values 1:1 in that range — `KeyCode::from_evdev` handles
+    // the conversion safely (no UB-transmute for invalid codes).
+    KeyCode::from_evdev(byte as u16)
 }
 
 /// IRQ-1 handler. Reads one byte from 0x60, decodes, pushes a
@@ -340,17 +305,7 @@ pub unsafe fn on_irq1() {
     let make = byte & 0x7F;
     let extended = STATE.extended.swap(false, Ordering::AcqRel);
     let code = decode(make, extended);
-
-    let prev = Modifiers::from_bits_truncate(STATE.modifiers.load(Ordering::Acquire));
-    let next = apply_modifiers(code, pressed, prev);
-    STATE.modifiers.store(next.bits(), Ordering::Release);
-
-    let ev = KeyEvent {
-        code,
-        pressed,
-        modifiers: next,
-    };
-    let _ = push_global(InputEvent::Key(ev));
+    let _ = push_key(code, pressed);
 }
 
 /// Test-only: process a synthetic byte stream through the same
@@ -367,20 +322,12 @@ pub fn feed_bytes_for_test(bytes: &[u8]) {
         let make = b & 0x7F;
         let extended = STATE.extended.swap(false, Ordering::AcqRel);
         let code = decode(make, extended);
-        let prev = Modifiers::from_bits_truncate(STATE.modifiers.load(Ordering::Acquire));
-        let next = apply_modifiers(code, pressed, prev);
-        STATE.modifiers.store(next.bits(), Ordering::Release);
-        let ev = KeyEvent {
-            code,
-            pressed,
-            modifiers: next,
-        };
-        let _ = push_global(InputEvent::Key(ev));
+        let _ = push_key(code, pressed);
     }
 }
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
     STATE.extended.store(false, Ordering::Release);
-    STATE.modifiers.store(0, Ordering::Release);
+    narf_input::__reset_modifiers_for_test();
 }

@@ -995,13 +995,17 @@ interface_resolution: 1024x768
     println!("xtask image: wrote {}", iso.display());
     let ovmf = ovmf_code_path();
     println!(
-        "  test under QEMU UEFI:  qemu-system-x86_64 -bios {} -cpu max -m 1024M \\\n\
+        "  test under QEMU UEFI:  qemu-system-x86_64 -bios {} -machine q35 -cpu max -m 1024M \\\n\
          \x20                          -cdrom {} -serial stdio -display none -no-reboot",
         ovmf.display(),
         iso.display()
     );
     println!(
-        "  -cpu max is required: the kernel uses RDTSCP / RDSEED / etc. that the\n\
+        "  -machine q35 is required: the default `pc` (i440fx) machine has no PCIe\n\
+         \x20 ECAM, only legacy CF8/CFC config space. Without an ACPI MCFG table the\n\
+         \x20 kernel skips PCI enumeration entirely and no virtio / xhci / gpu device\n\
+         \x20 probes.\n\
+         \x20 -cpu max is required: the kernel uses RDTSCP / RDSEED / etc. that the\n\
          \x20 default qemu64 model doesn't expose.\n\
          \x20 -m 1024M leaves room for the kernel image (~52 MiB at LOAD_BASE 16 MiB)\n\
          \x20 + UEFI's reservations + the 32 MiB static heap arena."

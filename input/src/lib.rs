@@ -205,6 +205,159 @@ impl KeyCode {
                 | KeyCode::ScrollLock
         )
     }
+
+    /// Decode a Linux evdev `KEY_*` code (the value the kernel hands
+    /// userspace and that virtio-input + HID drivers emit on the
+    /// wire) into a NARF `KeyCode`. Codes outside the supported set
+    /// map to `KeyCode::Unknown` rather than UB-transmuting an
+    /// invalid discriminant.
+    ///
+    /// Reference: include/uapi/linux/input-event-codes.h (Linux UAPI,
+    /// public per LICENSES/exceptions/Linux-syscall-note).
+    pub const fn from_evdev(code: u16) -> Self {
+        match code {
+            0 => KeyCode::Reserved,
+            1 => KeyCode::Escape,
+            2 => KeyCode::Key1,
+            3 => KeyCode::Key2,
+            4 => KeyCode::Key3,
+            5 => KeyCode::Key4,
+            6 => KeyCode::Key5,
+            7 => KeyCode::Key6,
+            8 => KeyCode::Key7,
+            9 => KeyCode::Key8,
+            10 => KeyCode::Key9,
+            11 => KeyCode::Key0,
+            12 => KeyCode::Minus,
+            13 => KeyCode::Equal,
+            14 => KeyCode::Backspace,
+            15 => KeyCode::Tab,
+            16 => KeyCode::Q,
+            17 => KeyCode::W,
+            18 => KeyCode::E,
+            19 => KeyCode::R,
+            20 => KeyCode::T,
+            21 => KeyCode::Y,
+            22 => KeyCode::U,
+            23 => KeyCode::I,
+            24 => KeyCode::O,
+            25 => KeyCode::P,
+            26 => KeyCode::LeftBrace,
+            27 => KeyCode::RightBrace,
+            28 => KeyCode::Enter,
+            29 => KeyCode::LeftCtrl,
+            30 => KeyCode::A,
+            31 => KeyCode::S,
+            32 => KeyCode::D,
+            33 => KeyCode::F,
+            34 => KeyCode::G,
+            35 => KeyCode::H,
+            36 => KeyCode::J,
+            37 => KeyCode::K,
+            38 => KeyCode::L,
+            39 => KeyCode::Semicolon,
+            40 => KeyCode::Apostrophe,
+            41 => KeyCode::Grave,
+            42 => KeyCode::LeftShift,
+            43 => KeyCode::Backslash,
+            44 => KeyCode::Z,
+            45 => KeyCode::X,
+            46 => KeyCode::C,
+            47 => KeyCode::V,
+            48 => KeyCode::B,
+            49 => KeyCode::N,
+            50 => KeyCode::M,
+            51 => KeyCode::Comma,
+            52 => KeyCode::Dot,
+            53 => KeyCode::Slash,
+            54 => KeyCode::RightShift,
+            55 => KeyCode::KpAsterisk,
+            56 => KeyCode::LeftAlt,
+            57 => KeyCode::Space,
+            58 => KeyCode::CapsLock,
+            59 => KeyCode::F1,
+            60 => KeyCode::F2,
+            61 => KeyCode::F3,
+            62 => KeyCode::F4,
+            63 => KeyCode::F5,
+            64 => KeyCode::F6,
+            65 => KeyCode::F7,
+            66 => KeyCode::F8,
+            67 => KeyCode::F9,
+            68 => KeyCode::F10,
+            69 => KeyCode::NumLock,
+            70 => KeyCode::ScrollLock,
+            71 => KeyCode::Kp7,
+            72 => KeyCode::Kp8,
+            73 => KeyCode::Kp9,
+            74 => KeyCode::KpMinus,
+            75 => KeyCode::Kp4,
+            76 => KeyCode::Kp5,
+            77 => KeyCode::Kp6,
+            78 => KeyCode::KpPlus,
+            79 => KeyCode::Kp1,
+            80 => KeyCode::Kp2,
+            81 => KeyCode::Kp3,
+            82 => KeyCode::Kp0,
+            83 => KeyCode::KpDot,
+            87 => KeyCode::F11,
+            88 => KeyCode::F12,
+            96 => KeyCode::KpEnter,
+            97 => KeyCode::RightCtrl,
+            98 => KeyCode::KpSlash,
+            99 => KeyCode::SysRq,
+            100 => KeyCode::RightAlt,
+            102 => KeyCode::Home,
+            103 => KeyCode::Up,
+            104 => KeyCode::PageUp,
+            105 => KeyCode::Left,
+            106 => KeyCode::Right,
+            107 => KeyCode::End,
+            108 => KeyCode::Down,
+            109 => KeyCode::PageDown,
+            110 => KeyCode::Insert,
+            111 => KeyCode::Delete,
+            119 => KeyCode::Pause,
+            125 => KeyCode::LeftMeta,
+            126 => KeyCode::RightMeta,
+            127 => KeyCode::Menu,
+            _ => KeyCode::Unknown,
+        }
+    }
+}
+
+/// Apply the effect of a press/release of `code` to a modifier
+/// bitset and return the post-event state. Shift/Ctrl/Alt/Meta
+/// follow press/release directly; CapsLock/NumLock/ScrollLock
+/// toggle on press only (release is a no-op). Non-modifier keys
+/// pass `mods` through unchanged. Pure — no global state.
+pub fn apply_modifiers(code: KeyCode, pressed: bool, mods: Modifiers) -> Modifiers {
+    let mut m = mods;
+    let bit = match code {
+        KeyCode::LeftShift | KeyCode::RightShift => Modifiers::SHIFT,
+        KeyCode::LeftCtrl | KeyCode::RightCtrl => Modifiers::CTRL,
+        KeyCode::LeftAlt | KeyCode::RightAlt => Modifiers::ALT,
+        KeyCode::LeftMeta | KeyCode::RightMeta => Modifiers::META,
+        KeyCode::CapsLock if pressed => {
+            m.toggle(Modifiers::CAPS_LOCK);
+            return m;
+        }
+        KeyCode::NumLock if pressed => {
+            m.toggle(Modifiers::NUM_LOCK);
+            return m;
+        }
+        KeyCode::ScrollLock if pressed => {
+            m.toggle(Modifiers::SCROLL_LOCK);
+            return m;
+        }
+        _ => return m,
+    };
+    if pressed {
+        m.insert(bit);
+    } else {
+        m.remove(bit);
+    }
+    m
 }
 
 bitflags_like! {
@@ -387,6 +540,65 @@ pub fn init_global_ring(capacity: usize) {
             None => *g = Some(EventRing::new(capacity)),
         }
     }
+}
+
+/// Global modifier state tracked across all keyboard producers. A
+/// shift held on i8042 stays held when virtio-input fires a letter
+/// keypress on the same host (rare, but the correct behaviour). Drivers
+/// shouldn't poke this directly — call `push_key` and let the helper
+/// advance it.
+static MODIFIER_STATE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// Current modifier bitset, sampled atomically.
+pub fn current_modifiers() -> Modifiers {
+    Modifiers::from_bits_truncate(MODIFIER_STATE.load(core::sync::atomic::Ordering::Acquire))
+}
+
+/// Advance the global modifier state by the effect of pressing /
+/// releasing `code` and return the post-event state. Drivers use
+/// this to stamp `KeyEvent::modifiers`. Called automatically by
+/// `push_key`.
+pub fn update_modifiers(code: KeyCode, pressed: bool) -> Modifiers {
+    use core::sync::atomic::Ordering;
+    // Single-writer-style CAS loop so a parallel producer doesn't
+    // overwrite a concurrent toggle.
+    loop {
+        let prev_bits = MODIFIER_STATE.load(Ordering::Acquire);
+        let prev = Modifiers::from_bits_truncate(prev_bits);
+        let next = apply_modifiers(code, pressed, prev);
+        match MODIFIER_STATE.compare_exchange(
+            prev_bits,
+            next.bits(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return next,
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Convenience for keyboard drivers: advances the global modifier
+/// state, stamps the live modifier bitset onto a fresh `KeyEvent`,
+/// and pushes it onto the global Key ring. Returns whether the push
+/// landed without drop. Equivalent to:
+/// `push_global(InputEvent::Key(KeyEvent { code, pressed,
+/// modifiers: update_modifiers(code, pressed) }))`.
+pub fn push_key(code: KeyCode, pressed: bool) -> bool {
+    let modifiers = update_modifiers(code, pressed);
+    push_global(InputEvent::Key(KeyEvent {
+        code,
+        pressed,
+        modifiers,
+    }))
+}
+
+/// Test-only: reset global modifier state to zero. Smoke tests
+/// that exercise modifier transitions call this to avoid bleed
+/// from a previous test's residual shift / capslock state.
+#[doc(hidden)]
+pub fn __reset_modifiers_for_test() {
+    MODIFIER_STATE.store(0, core::sync::atomic::Ordering::Release);
 }
 
 /// Push an event onto the appropriate per-class ring. Silently

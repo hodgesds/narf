@@ -31,7 +31,9 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
+use narf_input::{
+    push_global, push_key, InputEvent, KeyCode, PointerButtons, PointerEvent,
+};
 
 use crate::pci::{
     discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError, CC_DEVICE_FEATURE,
@@ -54,10 +56,23 @@ const EVENT_SIZE: usize = 8;
 const NUM_RX: u16 = 32;
 
 // Linux input-event-codes (subset we decode).
+//   <https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h>
+const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 
-// REL_X = 0, REL_Y = 1 (we ignore wheel for M0).
+// REL_X = 0, REL_Y = 1, REL_WHEEL = 8 (we ignore HWHEEL for M0).
+const REL_X: u16 = 0;
+const REL_Y: u16 = 1;
+const REL_WHEEL: u16 = 8;
+
+// Mouse-button BTN_* codes (input-event-codes.h §BTN_MOUSE). These
+// are EV_KEY codes that virtio-tablet / -mouse devices emit instead
+// of letter keys, so they don't round-trip through the keyboard
+// mapping — we translate them into PointerButtons directly.
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
 
 #[derive(Debug)]
 struct Queues {
@@ -83,6 +98,11 @@ pub struct VirtioInputPci {
     pub ready: bool,
     rel_dx_acc: core::sync::atomic::AtomicI32,
     rel_dy_acc: core::sync::atomic::AtomicI32,
+    /// Live button state, updated by BTN_* key events. virtio-input
+    /// reports presses + releases independently; we mirror them
+    /// into a `PointerButtons` bitset that's stamped onto each
+    /// pointer event emitted at EV_SYN.
+    buttons: core::sync::atomic::AtomicU8,
 }
 
 impl core::fmt::Debug for VirtioInputPci {
@@ -287,6 +307,7 @@ impl VirtioInputPci {
             ready: true,
             rel_dx_acc: core::sync::atomic::AtomicI32::new(0),
             rel_dy_acc: core::sync::atomic::AtomicI32::new(0),
+            buttons: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -307,8 +328,11 @@ impl VirtioInputPci {
     }
 
     /// Take the accumulated REL_X / REL_Y delta since last read.
-    /// virtio-input EV_REL events bump these; cursor consumers
-    /// poll-and-reset to convert into screen-space movement.
+    /// `drain_events` clears these at every EV_SYN boundary and
+    /// emits a consolidated `PointerEvent`; this accessor is kept
+    /// for tests + diagnostics that want to peek between SYN
+    /// frames. Production cursor consumers should pop
+    /// `PointerEvent`s from the global ring instead.
     pub fn take_rel_delta(&self) -> (i32, i32) {
         let dx = self
             .rel_dx_acc
@@ -349,31 +373,75 @@ impl VirtioInputPci {
             let code = u16::from_le_bytes([raw[2], raw[3]]);
             let value = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
 
-            if etype == EV_KEY {
-                // virtio-input EV_KEY codes match Linux KEY_* which by
-                // construction overlap NARF's KeyCode values for the
-                // basic set. Values outside the known set go to Unknown.
-                let kc = decode_key_code(code);
-                let pressed = value != 0;
-                let ev = KeyEvent {
-                    code: kc,
-                    pressed,
-                    modifiers: Modifiers::EMPTY,
-                };
-                let _ = push_global(InputEvent::Key(ev));
-                count += 1;
-            } else if etype == EV_REL {
-                // EV_REL { code: REL_X=0 / REL_Y=1, value: i32 delta }
-                let delta = value as i32;
-                match code {
-                    0 => {
-                        self.rel_dx_acc.fetch_add(delta, Ordering::Relaxed);
+            match etype {
+                EV_KEY => {
+                    let pressed = value != 0;
+                    // Mouse buttons (BTN_*) live in the EV_KEY code
+                    // space but map onto PointerButtons, not KeyCode.
+                    let btn = match code {
+                        BTN_LEFT => Some(PointerButtons::LEFT),
+                        BTN_RIGHT => Some(PointerButtons::RIGHT),
+                        BTN_MIDDLE => Some(PointerButtons::MIDDLE),
+                        _ => None,
+                    };
+                    if let Some(b) = btn {
+                        let mut buttons = PointerButtons::from_bits_truncate(
+                            self.buttons.load(Ordering::Acquire),
+                        );
+                        if pressed {
+                            buttons.insert(b);
+                        } else {
+                            buttons.remove(b);
+                        }
+                        self.buttons.store(buttons.bits(), Ordering::Release);
+                        // PointerEvent will be flushed at the next
+                        // EV_SYN with the live button bitset.
+                    } else {
+                        let kc = KeyCode::from_evdev(code);
+                        let _ = push_key(kc, pressed);
+                        count += 1;
                     }
-                    1 => {
-                        self.rel_dy_acc.fetch_add(delta, Ordering::Relaxed);
-                    }
-                    _ => {} // wheel + others — future extension
                 }
+                EV_REL => {
+                    let delta = value as i32;
+                    match code {
+                        REL_X => {
+                            self.rel_dx_acc.fetch_add(delta, Ordering::Relaxed);
+                        }
+                        REL_Y => {
+                            self.rel_dy_acc.fetch_add(delta, Ordering::Relaxed);
+                        }
+                        REL_WHEEL => {
+                            // Scroll-wheel ticks emit a Scroll event
+                            // immediately — wheels are already
+                            // semantically discrete, so there's
+                            // nothing to accumulate-until-SYN.
+                            let _ = push_global(InputEvent::Scroll(
+                                narf_input::ScrollEvent { dx: 0, dy: delta },
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                EV_SYN => {
+                    // End of an input frame. If we accumulated REL
+                    // deltas or a button-state change, emit one
+                    // consolidated PointerEvent so consumers see a
+                    // single transition rather than a flurry of
+                    // deltas that arrive as separate REL/SYN packets.
+                    let dx = self.rel_dx_acc.swap(0, Ordering::AcqRel);
+                    let dy = self.rel_dy_acc.swap(0, Ordering::AcqRel);
+                    let buttons =
+                        PointerButtons::from_bits_truncate(self.buttons.load(Ordering::Acquire));
+                    if dx != 0 || dy != 0 || buttons != PointerButtons::EMPTY {
+                        let _ = push_global(InputEvent::Pointer(PointerEvent {
+                            dx,
+                            dy,
+                            buttons,
+                        }));
+                    }
+                }
+                _ => {}
             }
 
             // Re-post the slot as a fresh receive buffer.
@@ -395,26 +463,6 @@ impl VirtioInputPci {
             }
         }
         count
-    }
-}
-
-/// Map a virtio-input EV_KEY code to NARF's `KeyCode`. The basic
-/// 0..=70 + extended cursor/modifier values overlap by construction;
-/// anything outside that lands as `Unknown`.
-fn decode_key_code(code: u16) -> KeyCode {
-    match code {
-        // 1..=70 line up with KeyCode discriminants 1..=70.
-        1..=70 => {
-            // SAFETY: range covers Reserved..=ScrollLock by construction.
-            unsafe { core::mem::transmute::<u16, KeyCode>(code) }
-        }
-        97 => KeyCode::RightCtrl,
-        100 => KeyCode::RightAlt,
-        103 => KeyCode::Up,
-        105 => KeyCode::Left,
-        106 => KeyCode::Right,
-        108 => KeyCode::Down,
-        _ => KeyCode::Unknown,
     }
 }
 
@@ -469,23 +517,69 @@ pub fn with_controller<R>(f: impl FnOnce(&VirtioInputPci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
-/// Test-only: synthesize a sequence of `(type, code, value)` triplets
-/// into the global input ring without going through the device. Used
-/// by smoke tests to exercise the decode path.
+/// Test-only: replay a sequence of `(type, code, value)` triplets
+/// through the same decode path `drain_events` uses, pushing onto
+/// the global rings. Honours EV_KEY (BTN_* → PointerButtons), EV_REL
+/// accumulators, EV_SYN PointerEvent flush, and EV_REL REL_WHEEL →
+/// ScrollEvent. Returns the count of Key events pushed.
 pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
+    use core::sync::atomic::AtomicI32;
     let mut count = 0usize;
+    let rel_dx = AtomicI32::new(0);
+    let rel_dy = AtomicI32::new(0);
+    let mut buttons = PointerButtons::EMPTY;
     for &(etype, code, value) in events {
-        if etype == EV_KEY {
-            let kc = decode_key_code(code);
-            let pressed = value != 0;
-            let ev = KeyEvent {
-                code: kc,
-                pressed,
-                modifiers: Modifiers::EMPTY,
-            };
-            if push_global(InputEvent::Key(ev)) {
-                count += 1;
+        match etype {
+            EV_KEY => {
+                let pressed = value != 0;
+                let btn = match code {
+                    BTN_LEFT => Some(PointerButtons::LEFT),
+                    BTN_RIGHT => Some(PointerButtons::RIGHT),
+                    BTN_MIDDLE => Some(PointerButtons::MIDDLE),
+                    _ => None,
+                };
+                if let Some(b) = btn {
+                    if pressed {
+                        buttons.insert(b);
+                    } else {
+                        buttons.remove(b);
+                    }
+                } else {
+                    let kc = KeyCode::from_evdev(code);
+                    let _ = push_key(kc, pressed);
+                    count += 1;
+                }
             }
+            EV_REL => {
+                let delta = value as i32;
+                match code {
+                    REL_X => {
+                        rel_dx.fetch_add(delta, Ordering::Relaxed);
+                    }
+                    REL_Y => {
+                        rel_dy.fetch_add(delta, Ordering::Relaxed);
+                    }
+                    REL_WHEEL => {
+                        let _ = push_global(InputEvent::Scroll(narf_input::ScrollEvent {
+                            dx: 0,
+                            dy: delta,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            EV_SYN => {
+                let dx = rel_dx.swap(0, Ordering::AcqRel);
+                let dy = rel_dy.swap(0, Ordering::AcqRel);
+                if dx != 0 || dy != 0 || buttons != PointerButtons::EMPTY {
+                    let _ = push_global(InputEvent::Pointer(PointerEvent {
+                        dx,
+                        dy,
+                        buttons,
+                    }));
+                }
+            }
+            _ => {}
         }
     }
     count

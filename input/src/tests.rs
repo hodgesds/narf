@@ -72,6 +72,110 @@ fn smoke_input_ring_overflow_drops_oldest() -> TestResult {
 }
 kernel_test_in!("input", smoke_input_ring_overflow_drops_oldest);
 
+fn smoke_input_from_evdev_covers_standard_codes() -> TestResult {
+    use crate::KeyCode;
+    // Spot-check the boundary cases that hand-coded ranges trip on:
+    // 0/1 (Reserved/Escape), 70/71 (last contiguous / first keypad
+    // gap), 84..=86 (Linux gap → must be Unknown not UB), 87/88 (F11/
+    // F12), 100/101 (RightAlt yes, 101=KEY_LINEFEED no), 127 (Menu),
+    // 0x110 (BTN_LEFT, not a KeyCode → Unknown).
+    let cases: &[(u16, KeyCode)] = &[
+        (0, KeyCode::Reserved),
+        (1, KeyCode::Escape),
+        (30, KeyCode::A),
+        (42, KeyCode::LeftShift),
+        (70, KeyCode::ScrollLock),
+        (71, KeyCode::Kp7),
+        (83, KeyCode::KpDot),
+        (84, KeyCode::Unknown),
+        (86, KeyCode::Unknown),
+        (87, KeyCode::F11),
+        (88, KeyCode::F12),
+        (100, KeyCode::RightAlt),
+        (101, KeyCode::Unknown),
+        (102, KeyCode::Home),
+        (111, KeyCode::Delete),
+        (125, KeyCode::LeftMeta),
+        (127, KeyCode::Menu),
+        (0x110, KeyCode::Unknown),
+        (0xFFFF, KeyCode::Unknown),
+    ];
+    for &(code, expected) in cases {
+        let got = KeyCode::from_evdev(code);
+        if got != expected {
+            return TestResult::Fail("from_evdev mapping mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_from_evdev_covers_standard_codes);
+
+fn smoke_input_apply_modifiers_shift_press_release() -> TestResult {
+    use crate::{apply_modifiers, KeyCode, Modifiers};
+    let empty = Modifiers::EMPTY;
+    let after_press = apply_modifiers(KeyCode::LeftShift, true, empty);
+    if !after_press.contains(Modifiers::SHIFT) {
+        return TestResult::Fail("shift press should set SHIFT");
+    }
+    let after_release = apply_modifiers(KeyCode::LeftShift, false, after_press);
+    if after_release.contains(Modifiers::SHIFT) {
+        return TestResult::Fail("shift release should clear SHIFT");
+    }
+    // CapsLock: toggles on press, no-op on release.
+    let after_caps_press = apply_modifiers(KeyCode::CapsLock, true, empty);
+    if !after_caps_press.contains(Modifiers::CAPS_LOCK) {
+        return TestResult::Fail("capslock press should set CAPS_LOCK");
+    }
+    let after_caps_release = apply_modifiers(KeyCode::CapsLock, false, after_caps_press);
+    if !after_caps_release.contains(Modifiers::CAPS_LOCK) {
+        return TestResult::Fail("capslock release must not clear CAPS_LOCK");
+    }
+    // Non-modifier passes through unchanged.
+    let after_letter = apply_modifiers(KeyCode::A, true, after_caps_press);
+    if after_letter != after_caps_press {
+        return TestResult::Fail("non-modifier press shouldn't alter modifier state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_apply_modifiers_shift_press_release);
+
+fn smoke_input_push_key_stamps_live_modifiers() -> TestResult {
+    use crate::{
+        __reset_modifiers_for_test, init_global_ring, pop_key, push_key, KeyCode, Modifiers,
+    };
+    init_global_ring(8);
+    __reset_modifiers_for_test();
+    // Drain anything stale.
+    while pop_key().is_some() {}
+    // Press LeftShift, then press A. The A event must carry SHIFT.
+    let _ = push_key(KeyCode::LeftShift, true);
+    let _ = push_key(KeyCode::A, true);
+    let _ = push_key(KeyCode::A, false);
+    let _ = push_key(KeyCode::LeftShift, false);
+    let _shift_press = pop_key();
+    let a_press = match pop_key() {
+        Some(k) => k,
+        None => return TestResult::Fail("A press not in ring"),
+    };
+    if a_press.code != KeyCode::A || !a_press.pressed {
+        return TestResult::Fail("A press shape wrong");
+    }
+    if !a_press.modifiers.contains(Modifiers::SHIFT) {
+        return TestResult::Fail("A press should carry SHIFT modifier");
+    }
+    let _a_release = pop_key();
+    let shift_release = match pop_key() {
+        Some(k) => k,
+        None => return TestResult::Fail("Shift release not in ring"),
+    };
+    if shift_release.modifiers.contains(Modifiers::SHIFT) {
+        return TestResult::Fail("Shift release should not carry SHIFT");
+    }
+    __reset_modifiers_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_push_key_stamps_live_modifiers);
+
 fn smoke_input_kind_default_domain() -> TestResult {
     use narf_drivers::BoundKind;
     if BoundKind::Input.default_domain() != 6 {

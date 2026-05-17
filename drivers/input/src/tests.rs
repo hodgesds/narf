@@ -188,6 +188,69 @@ fn smoke_virtio_input_decode_synthetic() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_decode_synthetic);
 
+fn smoke_virtio_input_btn_left_emits_pointer() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        InputEvent, PointerButtons, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    // EV_REL REL_X=+5, EV_REL REL_Y=-3, EV_KEY BTN_LEFT=0x110 press,
+    // EV_SYN → expect one PointerEvent(dx=5, dy=-3, LEFT).
+    let _ = feed_synthetic_events_for_test(&[
+        (2, 0, 5u32),         // EV_REL REL_X +5
+        (2, 1, (-3i32) as u32), // EV_REL REL_Y -3
+        (1, 0x110, 1),        // EV_KEY BTN_LEFT press
+        (0, 0, 0),            // EV_SYN
+    ]);
+    // After SYN, exactly one Pointer event sits in the global ring.
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 5 || p.dy != -3 {
+                return TestResult::Fail("pointer delta mismatch");
+            }
+            if !p.buttons.contains(PointerButtons::LEFT) {
+                return TestResult::Fail("LEFT button bit not set");
+            }
+        }
+        _ => return TestResult::Fail("expected one PointerEvent after SYN"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_btn_left_emits_pointer);
+
+fn smoke_virtio_input_shift_a_stamps_modifier() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        KeyCode, Modifiers, __reset_global_ring_for_test, __reset_modifiers_for_test,
+        init_global_ring, pop_key,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    __reset_modifiers_for_test();
+    // LeftShift=42 press, A=30 press, A release, LeftShift release.
+    let _ = feed_synthetic_events_for_test(&[
+        (1, 42, 1),
+        (1, 30, 1),
+        (1, 30, 0),
+        (1, 42, 0),
+    ]);
+    let _shift_press = pop_key();
+    let a_press = match pop_key() {
+        Some(k) => k,
+        None => return TestResult::Fail("A press missing"),
+    };
+    if a_press.code != KeyCode::A {
+        return TestResult::Fail("A press code wrong");
+    }
+    if !a_press.modifiers.contains(Modifiers::SHIFT) {
+        return TestResult::Fail("A press should carry SHIFT through virtio-input");
+    }
+    __reset_modifiers_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_shift_a_stamps_modifier);
+
 fn smoke_virtio_input_probed_at_boot() -> TestResult {
     use narf_drivers_virtio::input_pci;
     if input_pci::is_probed() {
