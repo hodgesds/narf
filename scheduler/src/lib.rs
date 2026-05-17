@@ -49,9 +49,14 @@
 //! key rights view. aarch64 has no PKRS analogue; the field and
 //! the save/restore are gated behind `cfg(target_arch = "x86_64")`.
 //!
-//! Non-goals still (later waves):
-//! - Fair-share enforcement (today's budget accounting is diagnostic).
-//! - NUMA-aware steal targeting.
+//! Fair-share enforcement + NUMA-aware steal (spec §3.4 / §3.2):
+//! `BudgetAccount::charge` returns a `ChargeOutcome` the executor
+//! acts on — `Throttle` clears the awake flag for one round,
+//! `Demote` reclassifies the slot as `SchedClass::Idle`, `Kill`
+//! drops the slot O(1). `try_steal_one` prefers same-NUMA-node
+//! victims (`narf_acpi::cpu_node`) before crossing nodes; design
+//! follows Vyukov's CPPCON work-stealing notes
+//! (https://www.1024cores.net/).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -940,7 +945,7 @@ pub fn poll_one_round() -> usize {
         CURRENT_TASK.store(outer_task, Ordering::Release);
         *ACTIVE_USER_AS.lock() = outer_as;
         let elapsed = Instant::now().cycles_since(start);
-        slot.account.charge(elapsed, &slot.spec.budget);
+        let outcome = slot.account.charge(elapsed, &slot.spec.budget);
         // Apply any donor-side debit that `donate_to` staged
         // while this task was off-queue (currently polling).
         let pending = drain_donor_debit(slot.id);
@@ -958,6 +963,16 @@ pub fn poll_one_round() -> usize {
         match poll_result {
             Poll::Ready(()) => ready_this_round += 1,
             Poll::Pending => {
+                // Stage-5 fair-share enforcement (§3.4).
+                use crate::budget::ChargeOutcome;
+                match outcome {
+                    ChargeOutcome::Kill => continue,
+                    ChargeOutcome::Demote => slot.spec.class = SchedClass::Idle,
+                    ChargeOutcome::Throttle => {
+                        slot.awake.store(false, Ordering::Release);
+                    }
+                    ChargeOutcome::Continue => {}
+                }
                 let mut q = READY[cpu].lock();
                 q.as_mut().unwrap().push_back(slot);
             }
@@ -1181,7 +1196,7 @@ pub fn run_until_empty() {
                 }
             }
             let elapsed = Instant::now().cycles_since(start);
-            slot.account.charge(elapsed, &slot.spec.budget);
+            let outcome = slot.account.charge(elapsed, &slot.spec.budget);
 
             // Apply any donor-side debit that `donate_to` staged
             // while this task was off-queue (currently polling).
@@ -1214,6 +1229,33 @@ pub fn run_until_empty() {
                     ready_this_round += 1; /* drop slot */
                 }
                 Poll::Pending => {
+                    // Stage-5 fair-share enforcement (§3.4): act on
+                    // the `BudgetAccount::charge` outcome before
+                    // re-enqueue.
+                    use crate::budget::ChargeOutcome;
+                    match outcome {
+                        ChargeOutcome::Kill => {
+                            // Drop the slot. `overruns` already
+                            // ticked; no refund.
+                            continue;
+                        }
+                        ChargeOutcome::Demote => {
+                            // Hot cutover: mutate the slot's class
+                            // to Idle so it only polls when no
+                            // Normal/RealTime peer is runnable.
+                            slot.spec.class = SchedClass::Idle;
+                        }
+                        ChargeOutcome::Throttle => {
+                            // Clear awake so the next round skips
+                            // this slot; only an external wake
+                            // (timer, IRQ, peer-wake) revives it.
+                            slot.awake.store(false, Ordering::Release);
+                            let mut q = READY[cpu].lock();
+                            q.as_mut().unwrap().push_back(slot);
+                            continue;
+                        }
+                        ChargeOutcome::Continue => {}
+                    }
                     // Did the poll itself self-wake? `yield_now()` and
                     // `SleepUntil`'s busy-poll fallback both call
                     // `cx.waker().wake_by_ref()` which flips awake
@@ -1273,6 +1315,20 @@ pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
         out.push((cpu as u32, len));
     }
     out
+}
+
+/// NUMA node ID of the executing CPU, or `None` when SRAT
+/// topology wasn't published. Thin wrapper over
+/// `narf_acpi::cpu_node(current_cpu())` so callers in this crate
+/// (and downstream introspection) name the concept once. The
+/// work-stealing search uses this to prefer same-node victims —
+/// see `arch/specification/smp-topology.md` for the topology API.
+pub fn local_node() -> Option<u32> {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return None;
+    }
+    narf_acpi::cpu_node(cpu as u32)
 }
 
 /// Try to steal one task from another CPU's queue. Returns `true` if

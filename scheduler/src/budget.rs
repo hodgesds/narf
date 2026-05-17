@@ -22,20 +22,21 @@
 
 use narf_capabilities::{CapKind, CapType};
 
-/// Policy for what the scheduler does when a task blows its budget.
+/// Policy for what the scheduler does when a task blows its
+/// burst quantum.
 ///
-/// Default is `Block`: the scheduler parks the task until its budget
-/// refills at the next epoch. `Degrade` keeps it running but emits a
-/// `tracing/` event so operators see the over-run. `Ignore` is
-/// diagnostic-only — the accounting still happens but nothing changes
-/// on the scheduling path. Today every policy behaves like `Ignore`
-/// in the executor; the enum is here so Stage 4 can flip behaviour
-/// without changing the public spawn API.
+/// `Throttle` (default): clear the awake flag and push the slot
+/// to the back of the queue without polling next round; only an
+/// external waker revives it. `Demote`: reclassify the task as
+/// `SchedClass::Idle` so peers in `Normal` / `RealTime` outrun
+/// it. `Kill`: drop the slot O(1) — the future's `Drop` runs
+/// from the executor. `Ignore`: accounting only.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum OverrunPolicy {
     #[default]
-    Block,
-    Degrade,
+    Throttle,
+    Demote,
+    Kill,
     Ignore,
 }
 
@@ -77,7 +78,7 @@ impl ResourceBudget {
             share_ppm,
             burst_cycles,
             deadline_cycles: None,
-            policy: OverrunPolicy::Block,
+            policy: OverrunPolicy::Throttle,
         }
     }
 }
@@ -108,6 +109,20 @@ pub struct BudgetAccount {
     pub donated_out: u64,
 }
 
+/// Outcome of `BudgetAccount::charge`. `Continue` is the common
+/// in-budget path; `Throttle` parks the task without polling next
+/// round; `Demote` shifts it to `SchedClass::Idle`; `Kill` drops
+/// the slot. The executor branches on this value in
+/// `run_until_empty`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ChargeOutcome {
+    #[default]
+    Continue,
+    Throttle,
+    Demote,
+    Kill,
+}
+
 impl BudgetAccount {
     pub const fn new() -> Self {
         Self {
@@ -119,17 +134,27 @@ impl BudgetAccount {
         }
     }
 
-    /// Charge `cycles` to this account against `budget`. Returns
-    /// `true` if the charge crossed the burst allowance.
+    /// Charge `cycles` to this account against `budget`. The
+    /// returned `ChargeOutcome` tells the executor what to do
+    /// with the slot. Bookkeeping (`polls`, `cycles_spent`,
+    /// `overruns`) updates regardless of `policy`.
     #[inline]
-    pub fn charge(&mut self, cycles: u64, budget: &ResourceBudget) -> bool {
+    pub fn charge(&mut self, cycles: u64, budget: &ResourceBudget) -> ChargeOutcome {
         self.polls = self.polls.saturating_add(1);
         self.cycles_spent = self.cycles_spent.saturating_add(cycles);
         let over = cycles > budget.burst_cycles;
         if over {
             self.overruns = self.overruns.saturating_add(1);
         }
-        over
+        if !over {
+            return ChargeOutcome::Continue;
+        }
+        match budget.policy {
+            OverrunPolicy::Ignore => ChargeOutcome::Continue,
+            OverrunPolicy::Throttle => ChargeOutcome::Throttle,
+            OverrunPolicy::Demote => ChargeOutcome::Demote,
+            OverrunPolicy::Kill => ChargeOutcome::Kill,
+        }
     }
 
     /// Apply a donation credit: bump `donated_in` and reduce

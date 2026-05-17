@@ -154,18 +154,19 @@ fn smoke_scheduler_budget_accounts_cycles() -> TestResult {
         return TestResult::Fail("unthrottled budget must default to Ignore policy");
     }
 
+    use crate::budget::ChargeOutcome;
     let mut acct = BudgetAccount::new();
     let budget = ResourceBudget::fair_share(100_000, 1_000);
     let over = acct.charge(2_000, &budget);
-    if !over {
-        return TestResult::Fail("charge exceeding burst_cycles should report over-budget");
+    if over != ChargeOutcome::Throttle {
+        return TestResult::Fail("over-burst with Throttle policy should return Throttle");
     }
     if acct.overruns != 1 || acct.polls != 1 || acct.cycles_spent != 2_000 {
         return TestResult::Fail("BudgetAccount did not accumulate correctly");
     }
     let under = acct.charge(500, &budget);
-    if under {
-        return TestResult::Fail("500 cycles inside burst should not report over-budget");
+    if under != ChargeOutcome::Continue {
+        return TestResult::Fail("500 cycles inside burst should return Continue");
     }
     if acct.overruns != 1 || acct.polls != 2 || acct.cycles_spent != 2_500 {
         return TestResult::Fail("BudgetAccount running totals drifted");
@@ -1064,8 +1065,9 @@ kernel_test_in!("scheduler", smoke_scheduler_smt_share_policy_variants_distinct)
 fn smoke_scheduler_overrun_policy_variants_distinct() -> TestResult {
     use crate::budget::OverrunPolicy;
     let all = [
-        OverrunPolicy::Block,
-        OverrunPolicy::Degrade,
+        OverrunPolicy::Throttle,
+        OverrunPolicy::Demote,
+        OverrunPolicy::Kill,
         OverrunPolicy::Ignore,
     ];
     for (i, a) in all.iter().enumerate() {
@@ -1075,8 +1077,8 @@ fn smoke_scheduler_overrun_policy_variants_distinct() -> TestResult {
             }
         }
     }
-    if OverrunPolicy::default() != OverrunPolicy::Block {
-        return TestResult::Fail("default != Block");
+    if OverrunPolicy::default() != OverrunPolicy::Throttle {
+        return TestResult::Fail("default != Throttle");
     }
     TestResult::Pass
 }
@@ -1113,29 +1115,32 @@ fn smoke_scheduler_resource_budget_fair_share_shape() -> TestResult {
     if b.burst_cycles != 50_000 {
         return TestResult::Fail("fair_share burst didn't take");
     }
-    if b.policy != OverrunPolicy::Block {
-        return TestResult::Fail("fair_share policy != Block");
+    if b.policy != OverrunPolicy::Throttle {
+        return TestResult::Fail("fair_share policy != Throttle");
     }
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_resource_budget_fair_share_shape);
 
 fn smoke_scheduler_budget_account_tracks_polls_and_cycles() -> TestResult {
-    use crate::budget::{BudgetAccount, ResourceBudget};
+    use crate::budget::{BudgetAccount, ChargeOutcome, ResourceBudget};
     let b = ResourceBudget::fair_share(500_000, 1_000);
     let mut a = BudgetAccount::new();
     let o1 = a.charge(500, &b);
     let o2 = a.charge(400, &b);
     let o3 = a.charge(900, &b);
-    if o1 || o2 || o3 {
+    if o1 != ChargeOutcome::Continue
+        || o2 != ChargeOutcome::Continue
+        || o3 != ChargeOutcome::Continue
+    {
         return TestResult::Fail("within-burst polls flagged as overrun");
     }
     if a.cycles_spent != 1_800 || a.polls != 3 || a.overruns != 0 {
         return TestResult::Fail("3 within-burst polls didn't accumulate cleanly");
     }
     let o4 = a.charge(2_000, &b);
-    if !o4 {
-        return TestResult::Fail("over-burst poll didn't surface as overrun");
+    if o4 != ChargeOutcome::Throttle {
+        return TestResult::Fail("over-burst poll with Throttle policy didn't surface Throttle");
     }
     if a.overruns != 1 {
         return TestResult::Fail("overruns didn't bump to 1");
@@ -1651,3 +1656,145 @@ fn smoke_scheduler_pkrs_no_op_on_aarch64() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("scheduler", smoke_scheduler_pkrs_no_op_on_aarch64);
+
+// ── Stage-5 fair-share enforcement + NUMA-aware steal ─────────────
+
+fn smoke_scheduler_overrun_policy_throttle_outcome() -> TestResult {
+    // Throttle policy yields ChargeOutcome::Throttle when the
+    // per-poll cycles exceed burst_cycles.
+    use crate::budget::{BudgetAccount, ChargeOutcome, OverrunPolicy, ResourceBudget};
+    let b = ResourceBudget {
+        share_ppm: 500_000,
+        burst_cycles: 100,
+        deadline_cycles: None,
+        policy: OverrunPolicy::Throttle,
+    };
+    let mut a = BudgetAccount::new();
+    if a.charge(200, &b) != ChargeOutcome::Throttle {
+        return TestResult::Fail("Throttle policy didn't return Throttle outcome");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_overrun_policy_throttle_outcome);
+
+fn smoke_scheduler_overrun_policy_demote_outcome() -> TestResult {
+    use crate::budget::{BudgetAccount, ChargeOutcome, OverrunPolicy, ResourceBudget};
+    let b = ResourceBudget {
+        share_ppm: 500_000,
+        burst_cycles: 100,
+        deadline_cycles: None,
+        policy: OverrunPolicy::Demote,
+    };
+    let mut a = BudgetAccount::new();
+    if a.charge(200, &b) != ChargeOutcome::Demote {
+        return TestResult::Fail("Demote policy didn't return Demote outcome");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_overrun_policy_demote_outcome);
+
+fn smoke_scheduler_overrun_policy_kill_outcome() -> TestResult {
+    use crate::budget::{BudgetAccount, ChargeOutcome, OverrunPolicy, ResourceBudget};
+    let b = ResourceBudget {
+        share_ppm: 500_000,
+        burst_cycles: 100,
+        deadline_cycles: None,
+        policy: OverrunPolicy::Kill,
+    };
+    let mut a = BudgetAccount::new();
+    if a.charge(200, &b) != ChargeOutcome::Kill {
+        return TestResult::Fail("Kill policy didn't return Kill outcome");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_overrun_policy_kill_outcome);
+
+fn smoke_scheduler_overrun_policy_ignore_outcome() -> TestResult {
+    use crate::budget::{BudgetAccount, ChargeOutcome, OverrunPolicy, ResourceBudget};
+    let b = ResourceBudget {
+        share_ppm: 500_000,
+        burst_cycles: 100,
+        deadline_cycles: None,
+        policy: OverrunPolicy::Ignore,
+    };
+    let mut a = BudgetAccount::new();
+    if a.charge(200, &b) != ChargeOutcome::Continue {
+        return TestResult::Fail("Ignore policy should return Continue even when over burst");
+    }
+    if a.overruns != 1 {
+        return TestResult::Fail("Ignore policy must still tick overruns");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_overrun_policy_ignore_outcome);
+
+fn smoke_scheduler_kill_policy_drops_slot() -> TestResult {
+    // A Kill-policy task with burst_cycles 0 trips on its very
+    // first poll. The executor drops the slot, so the task that
+    // marks itself ALIVE never gets a second poll. With Kill in
+    // place, the second-yield body never runs.
+    use crate::{spawn_with_spec, OverrunPolicy, ResourceBudget, TaskSpec};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static FIRST: AtomicU32 = AtomicU32::new(0);
+    static SECOND: AtomicU32 = AtomicU32::new(0);
+    FIRST.store(0, Ordering::Relaxed);
+    SECOND.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+    let mut spec = TaskSpec::unthrottled();
+    spec.budget = ResourceBudget {
+        share_ppm: 500_000,
+        burst_cycles: 0,
+        deadline_cycles: None,
+        policy: OverrunPolicy::Kill,
+    };
+    spawn_with_spec(
+        async {
+            FIRST.fetch_add(1, Ordering::Relaxed);
+            crate::yield_now().await;
+            SECOND.fetch_add(1, Ordering::Relaxed);
+        },
+        spec,
+    );
+    crate::run_until_empty();
+    if FIRST.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("task never got a first poll");
+    }
+    if SECOND.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("Kill policy didn't drop the slot — second body ran");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_kill_policy_drops_slot);
+
+fn smoke_scheduler_local_node_returns() -> TestResult {
+    // Sanity: local_node() either returns None (no SRAT in this
+    // test environment) or a sensible Some(u32). It must not
+    // panic.
+    let _ = crate::local_node();
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_local_node_returns);
+
+fn smoke_scheduler_charge_outcome_variants_distinct() -> TestResult {
+    use crate::budget::ChargeOutcome;
+    let all = [
+        ChargeOutcome::Continue,
+        ChargeOutcome::Throttle,
+        ChargeOutcome::Demote,
+        ChargeOutcome::Kill,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            if i != j && a == b {
+                return TestResult::Fail("ChargeOutcome variants collapsed");
+            }
+        }
+    }
+    if ChargeOutcome::default() != ChargeOutcome::Continue {
+        return TestResult::Fail("default ChargeOutcome != Continue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_charge_outcome_variants_distinct);
