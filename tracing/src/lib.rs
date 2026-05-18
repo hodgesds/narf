@@ -20,15 +20,16 @@
 //! - `fntime`: `FnTime` scope accumulator with Welford online mean +
 //!   variance + a log2-bucket histogram for approximate percentiles.
 //! - `sketch`: the log2-bucket `Histogram` primitive `FnTime` uses.
-//!   The spec §3.2 asks for tDigest-grade quantile accuracy — that
-//!   is deferred to Stage 4 once a NARF-wide quantile-accuracy
-//!   contract is settled.
+//!   Kept alongside the t-Digest as a lock-free, atomic-only fast
+//!   path; consumer migration to t-Digest is tracked separately.
+//! - `tdigest`: clean-room implementation of Dunning & Ertl's
+//!   t-Digest quantile sketch (arXiv:1902.04023) — ≈ 1% tail-quantile
+//!   accuracy with bounded memory, satisfying the §3.2 accuracy ask.
 //!
 //! Non-goals in this crate (later stages):
 //! - Tracer task / streaming rings (spec §3.4 — tracer domain).
 //! - `frame/` panic-path snapshot hook (the ring is callable; the
 //!   panic path wiring is deferred to the frame/ owner).
-//! - Real tDigest centroid-merge quantile sketch.
 //! - Per-CPU-sharded handler dispatch (Stage 4 hazard-pointer path).
 
 #![no_std]
@@ -43,6 +44,7 @@ pub mod dispatch;
 pub mod fntime;
 pub mod hwtrace;
 pub mod sketch;
+pub mod tdigest;
 
 pub use hwtrace::{HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
 
@@ -52,6 +54,7 @@ pub use dispatch::{
 };
 pub use fntime::{scope, FnTime, ScopeGuard, Welford};
 pub use sketch::{Histogram, HISTOGRAM_BUCKETS};
+pub use tdigest::TDigest;
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
