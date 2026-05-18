@@ -4017,3 +4017,204 @@ fn smoke_memory_unmap_region_clears_ptes() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_unmap_region_clears_ptes);
+
+// ── LZ4 codec smokes ────────────────────────────────────────────────
+
+fn smoke_lz4_identity_zeros() -> TestResult {
+    use crate::compress::test_helpers::roundtrip;
+    let input = alloc::vec![0u8; 4096];
+    match roundtrip(&input) {
+        Ok(out) if out == input => TestResult::Pass,
+        Ok(_) => TestResult::Fail("zeros round-trip mismatch"),
+        Err(_) => TestResult::Fail("zeros round-trip errored"),
+    }
+}
+kernel_test_in!("memory", smoke_lz4_identity_zeros);
+
+fn smoke_lz4_identity_alphabet() -> TestResult {
+    use crate::compress::test_helpers::roundtrip;
+    let mut input = alloc::vec::Vec::with_capacity(4096);
+    for i in 0..4096usize {
+        input.push((b'A' + (i % 26) as u8) as u8);
+    }
+    match roundtrip(&input) {
+        Ok(out) if out == input => TestResult::Pass,
+        Ok(_) => TestResult::Fail("alphabet round-trip mismatch"),
+        Err(_) => TestResult::Fail("alphabet round-trip errored"),
+    }
+}
+kernel_test_in!("memory", smoke_lz4_identity_alphabet);
+
+fn smoke_lz4_identity_pseudo_random() -> TestResult {
+    use crate::compress::test_helpers::roundtrip;
+    let mut input = alloc::vec::Vec::with_capacity(4096);
+    for i in 0..4096u32 {
+        input.push((i.wrapping_mul(0x9E37) >> 8) as u8);
+    }
+    match roundtrip(&input) {
+        Ok(out) if out == input => TestResult::Pass,
+        Ok(_) => TestResult::Fail("pseudo-random round-trip mismatch"),
+        Err(_) => TestResult::Fail("pseudo-random round-trip errored"),
+    }
+}
+kernel_test_in!("memory", smoke_lz4_identity_pseudo_random);
+
+fn smoke_lz4_identity_runs() -> TestResult {
+    // Highly compressible: 30 'A's. Verifies the byte-broadcast
+    // path (offset=1, match-len > literal-len).
+    use crate::compress::test_helpers::roundtrip;
+    let input = alloc::vec![b'A'; 30];
+    match roundtrip(&input) {
+        Ok(out) if out == input => TestResult::Pass,
+        _ => TestResult::Fail("run-length round-trip mismatch"),
+    }
+}
+kernel_test_in!("memory", smoke_lz4_identity_runs);
+
+fn smoke_lz4_output_too_small() -> TestResult {
+    use crate::compress::lz4_encode;
+    let input = alloc::vec![0u8; 4096];
+    let mut output = [0u8; 4]; // way too small
+    match lz4_encode(&input, &mut output) {
+        Err(crate::compress::CompressError::OutputTooSmall) => TestResult::Pass,
+        _ => TestResult::Fail("expected OutputTooSmall"),
+    }
+}
+kernel_test_in!("memory", smoke_lz4_output_too_small);
+
+fn smoke_lz4_decode_truncated() -> TestResult {
+    use crate::compress::{lz4_decode, lz4_encode, lz4_max_compressed_len, CompressError};
+    let input = alloc::vec![b'A'; 30];
+    let mut enc = alloc::vec![0u8; lz4_max_compressed_len(input.len())];
+    let n = match lz4_encode(&input, &mut enc) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("encode failed"),
+    };
+    if n < 4 {
+        return TestResult::Skip("encoded payload too short for truncation test");
+    }
+    let mut out = [0u8; 64];
+    match lz4_decode(&enc[..2], &mut out) {
+        Err(CompressError::MalformedInput) => TestResult::Pass,
+        Err(CompressError::OutputTooSmall) => TestResult::Pass,
+        Err(CompressError::ShortInput) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("decode of truncated input succeeded"),
+    }
+}
+kernel_test_in!("memory", smoke_lz4_decode_truncated);
+
+// ── Zpool smokes ────────────────────────────────────────────────────
+
+fn smoke_zpool_store_load_zeros() -> TestResult {
+    use crate::zpool::{Zpool, ZPAGE_SIZE};
+    let mut pool = Zpool::new();
+    let raw = [0u8; ZPAGE_SIZE];
+    let h = match pool.store(&raw) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("store(zeros) failed"),
+    };
+    let mut out = [0xFFu8; ZPAGE_SIZE];
+    if pool.load(h, &mut out).is_err() {
+        return TestResult::Fail("load(zeros) failed");
+    }
+    if out != raw {
+        return TestResult::Fail("zeros round-trip mismatch");
+    }
+    let s = pool.stats();
+    if s.stored_pages != 1 || s.raw_bytes != ZPAGE_SIZE as u64 {
+        return TestResult::Fail("zpool stats wrong");
+    }
+    if s.compressed_bytes >= s.raw_bytes {
+        return TestResult::Fail("zeros should compress smaller than raw");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_zpool_store_load_zeros);
+
+fn smoke_zpool_store_load_random() -> TestResult {
+    use crate::zpool::{Zpool, ZPAGE_SIZE};
+    let mut raw = [0u8; ZPAGE_SIZE];
+    for i in 0..ZPAGE_SIZE {
+        raw[i] = ((i as u32).wrapping_mul(0x9E37) >> 8) as u8;
+    }
+    let mut pool = Zpool::new();
+    let h = match pool.store(&raw) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("store(random) failed"),
+    };
+    let mut out = [0u8; ZPAGE_SIZE];
+    if pool.load(h, &mut out).is_err() {
+        return TestResult::Fail("load(random) failed");
+    }
+    if out != raw {
+        return TestResult::Fail("random round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_zpool_store_load_random);
+
+fn smoke_zpool_free_reuses_slots() -> TestResult {
+    use crate::zpool::{Zpool, ZPAGE_SIZE};
+    let mut pool = Zpool::new();
+    let mut handles = alloc::vec::Vec::new();
+    let mut raw = [0u8; ZPAGE_SIZE];
+    for i in 0..100u32 {
+        raw[0] = (i & 0xff) as u8;
+        raw[1] = (i >> 8) as u8;
+        match pool.store(&raw) {
+            Ok(h) => handles.push((i, h)),
+            Err(_) => return TestResult::Fail("store failed mid-loop"),
+        }
+    }
+    if pool.stats().stored_pages != 100 {
+        return TestResult::Fail("stored_pages != 100");
+    }
+    let mut kept = alloc::vec::Vec::new();
+    for (idx, (i, h)) in handles.iter().enumerate() {
+        if idx % 2 == 0 {
+            pool.free(*h);
+        } else {
+            kept.push((*i, *h));
+        }
+    }
+    if pool.stats().stored_pages != 50 {
+        return TestResult::Fail("post-free stored_pages != 50");
+    }
+    if pool.stats().eviction_count != 50 {
+        return TestResult::Fail("eviction_count != 50");
+    }
+    let mut out = [0u8; ZPAGE_SIZE];
+    for (i, h) in &kept {
+        if pool.load(*h, &mut out).is_err() {
+            return TestResult::Fail("kept-handle load failed");
+        }
+        let expected = (*i & 0xff) as u8;
+        if out[0] != expected || out[1] != ((*i >> 8) as u8) {
+            return TestResult::Fail("kept-handle content mismatch");
+        }
+        for b in &out[2..] {
+            if *b != 0 {
+                return TestResult::Fail("kept-handle tail not zero");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_zpool_free_reuses_slots);
+
+fn smoke_zpool_invalid_handle() -> TestResult {
+    use crate::zpool::{Zpool, ZpoolError, ZPAGE_SIZE};
+    let mut pool = Zpool::new();
+    let raw = [7u8; ZPAGE_SIZE];
+    let h = match pool.store(&raw) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("store failed"),
+    };
+    pool.free(h);
+    let mut out = [0u8; ZPAGE_SIZE];
+    match pool.load(h, &mut out) {
+        Err(ZpoolError::InvalidHandle) => TestResult::Pass,
+        _ => TestResult::Fail("expected InvalidHandle for freed slot"),
+    }
+}
+kernel_test_in!("memory", smoke_zpool_invalid_handle);
