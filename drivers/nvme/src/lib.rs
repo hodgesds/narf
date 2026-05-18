@@ -34,7 +34,9 @@ pub mod mi;
 mod tests;
 
 use core::future::Future;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::vec::Vec;
 use narf_block::{
     BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockOp, BlockRequest, CancelResult,
     LbaRange,
@@ -268,6 +270,20 @@ const IO_Q_DEPTH: u16 = 4;
 /// the first I/O queue is qid=1).
 const IO_QID: u16 = 1;
 
+/// Hard upper bound on the number of I/O queue pairs we ask the
+/// controller to create. Bounded by:
+///   - MSI-X table slots we want to consume up-front.
+///   - Per-queue DMA footprint: every pair burns one SQ page + one
+///     CQ page = 8 KiB, plus a per-vector waker channel.
+///   - Round-robin index math fits comfortably in a usize regardless.
+///
+/// The final granted count is `min(host_cpu_count, CAP.MQES+1,
+/// NVME_MAX_IO_QUEUE_PAIRS, controller-grant)` — see
+/// `create_io_queues_msix`. Per NVMe Base Spec 2.0c §5.27 (Set
+/// Features — Number of Queues) the controller MAY grant fewer than
+/// the host requests.
+const NVME_MAX_IO_QUEUE_PAIRS: u16 = 8;
+
 /// Hardcoded namespace id used for I/O. QEMU NVMe always exposes
 /// NSID=1 with the default settings; multi-namespace support is a
 /// follow-up.
@@ -292,10 +308,23 @@ pub struct Controller {
     /// Set after a successful `bring_up`. Holds the live admin-queue
     /// state so subsequent admin commands can reuse it.
     admin: Option<Queue>,
-    /// Set after `create_io_queue` completes. Single I/O queue pair
-    /// (qid=1) handles all read/write traffic — multi-queue lands
-    /// once the executor is ready to schedule per-CPU completions.
-    io: Option<Queue>,
+    /// Set after `create_io_queue*` completes. One entry per granted
+    /// I/O queue pair (qid = index+1). `io_queues[0]` is qid=1, the
+    /// first I/O queue. Round-robin / per-CPU dispatch picks an
+    /// index via `pick_queue`.
+    ///
+    /// NVMe Base Spec 2.0c §3.3 / §4.1.4: qid=0 is admin; I/O queues
+    /// use qid >= 1.
+    io_queues: Vec<Queue>,
+    /// One IDT vector per I/O CQ. `io_irq_vectors[i]` is the vector
+    /// MSI-X table entry `i` delivers to for completions on
+    /// `io_queues[i]`. Empty for the polled-completion path
+    /// (`create_io_queue`).
+    io_irq_vectors: Vec<u8>,
+    /// Round-robin counter used to pick the next I/O queue under
+    /// concurrent submitters (`fetch_add` per submission). Reset to
+    /// 0 when `io_queues` is repopulated. Wraps naturally.
+    next_queue: AtomicUsize,
     /// Live BAR0 mapping post-bring-up. Stored so admin commands
     /// don't have to re-map (which writes to cfg-space).
     bar0_region: Option<MmioRegion>,
@@ -307,13 +336,14 @@ pub struct Controller {
     pub lba_bytes: u32,
     /// Namespace capacity in LBAs (NSZE field of IDENTIFY NAMESPACE).
     pub nsze: u64,
-    /// Live MSI-X table set up by `create_io_queue_msix`. The table
+    /// Live MSI-X table set up by `create_io_queues_msix`. The table
     /// stays alive (no `Drop` undoes the device-side enable) for the
     /// lifetime of the controller.
     msix: Option<MsixTable>,
-    /// IDT vector allocated for I/O-queue completions, programmed
-    /// into MSI-X table entry 0. Drivers `wait_for_irq(self.irq_vector
-    /// .unwrap())` to await an I/O completion.
+    /// Back-compat single-vector accessor: same value as
+    /// `io_irq_vectors[0]` when MSI-X is wired, else `None`. Kept on
+    /// the public surface so the param-snapshot path doesn't have to
+    /// reach into a Vec.
     pub irq_vector: Option<u8>,
 }
 
@@ -434,7 +464,9 @@ impl Controller {
             caps: None,
             device: None,
             admin: None,
-            io: None,
+            io_queues: Vec::new(),
+            io_irq_vectors: Vec::new(),
+            next_queue: AtomicUsize::new(0),
             bar0_region: None,
             identify: None,
             lba_bytes: 512,
@@ -683,8 +715,11 @@ impl Controller {
             admin.submit(bar0, sqe)?;
         }
 
-        // Stash the new IoQueue. Drop replaces any prior one.
-        self.io = Some(Queue {
+        // Stash the new IoQueue. Drop replaces any prior set.
+        self.io_queues.clear();
+        self.io_irq_vectors.clear();
+        self.next_queue.store(0, Ordering::Relaxed);
+        self.io_queues.push(Queue {
             sq_buf,
             cq_buf,
             qid: IO_QID,
@@ -746,100 +781,269 @@ impl Controller {
         self.nvm_io_multipage(IoOpcode::Write as u8, lba, n_blocks, pages)
     }
 
-    /// Create the I/O queue pair with MSI-X-driven completions.
+    /// Ask the controller how many I/O submission + completion queue
+    /// pairs it will grant via Set Features — Number of Queues
+    /// (FID 0x07).
     ///
-    /// Walks the device's MSI-X capability, allocates an IDT vector
-    /// from `narf_interrupts::vector`, programs MSI-X table entry 0
-    /// to deliver that vector to the BSP, flips the global MSI-X
-    /// enable bit, then issues Create I/O CQ (`IV=0, IEN=1`) +
-    /// Create I/O SQ.
+    /// Wire-up per NVMe Base Spec 2.0c §5.27 (table for Feature
+    /// Identifier 0x07):
+    ///   - CDW10 bits[7:0]  = FID = 0x07
+    ///   - CDW11 bits[15:0] = NSQR (number of submission queues
+    ///                        requested, zero-based)
+    ///   - CDW11 bits[31:16] = NCQR (number of completion queues
+    ///                         requested, zero-based)
     ///
-    /// Returns the allocated IDT vector. Subsequent `submit_io_irq`
-    /// calls use `narf_interrupts::fire_count(vector)` (or, for
-    /// async callers, `wait_for_irq(vector)`) to detect completion.
-    pub fn create_io_queue_msix(
+    /// The controller responds with CDW0 carrying the **granted**
+    /// counts in the same layout:
+    ///   - CDW0 bits[15:0]  = NSQA (granted SQs, zero-based)
+    ///   - CDW0 bits[31:16] = NCQA (granted CQs, zero-based)
+    ///
+    /// "Zero-based" means a returned 3 == 4 queues granted. Returns
+    /// `(nsqa+1, ncqa+1)` already converted into a usable count.
+    /// `requested` is the host's desired count (1..=u16::MAX); we
+    /// encode it as `requested - 1` on the wire.
+    pub fn submit_set_features_n_queues(
         &mut self,
-        bus_dev_cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<u8, NvmeError> {
-        let device = self.device.ok_or(NvmeError::NotReady)?;
-        // 1. Walk the cap list + sniff the MSI-X table size.
-        let mut msix = enable_msix(bus_dev_cap, &device).map_err(|_| NvmeError::Msix)?;
-
-        // 2. Allocate IDT vector + MSI-X table slot 0.
-        let v = narf_interrupts::vector::alloc().map_err(|_| NvmeError::Msix)?;
-        let _ = msix.alloc_vector().ok_or(NvmeError::Msix)?;
-
-        // 3. Program MSI-X table entry 0 to deliver vector `v` to
-        //    APIC id 0 (the BSP). On aarch64 this routes through the
-        //    GIC ITS doorbell with EventID=v.
-        // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
-        // table (no other writer); we issue this write before
-        // enabling so the device can't fire stale data.
-        let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| NvmeError::Msix)?;
-
-        // 4. Flip the global MSI-X enable bit.
-        // SAFETY: cfg-space write to a known cap-list offset.
-        let _ = unsafe { msix.enable() }.map_err(|_| NvmeError::Msix)?;
-
-        self.msix = Some(msix);
-        self.irq_vector = Some(v);
-
-        // 5. Allocate IOSQ + IOCQ DMA pages. Same shape as the
-        //    polling create_io_queue, but with IEN=1 + IV=0 on the CQ.
+        requested: u16,
+    ) -> Result<(u16, u16), NvmeError> {
+        // The minimum any host should request is 1 pair; the spec
+        // allows zero-based 0 == 1 queue, so clamp up.
+        let req = requested.max(1);
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
-            .map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
-            .map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let sq_phys = sq_buf.phys_addr().raw();
-        let cq_phys = cq_buf.phys_addr().raw();
 
-        // Create I/O CQ: PC=1, IEN=1, IV=0.
         let mut sqe = Sqe::zero();
-        sqe.cdw0 = AdminOpcode::CreateCq as u32;
-        sqe.prp1 = cq_phys;
-        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = (0u32 << 16) | (1 << 1) | 1; // IV=0, IEN=1, PC=1
-                                                 // SAFETY: queue + bar live; CQ DMA fresh.
-        unsafe {
-            admin.submit(bar0, sqe)?;
-        }
+        sqe.cdw0 = AdminOpcode::SetFeatures as u32;
+        sqe.cdw10 = admin::FID_NUMBER_OF_QUEUES as u32;
+        // NSQR in low 16 bits, NCQR in high 16. Encode zero-based.
+        let zb = (req - 1) as u32;
+        sqe.cdw11 = (zb << 16) | zb;
+        // SAFETY: admin queue + BAR are live; SQE is a normal
+        // Set Features command, no host-DMA buffer required.
+        let cqe = unsafe { admin.submit(bar0, sqe)? };
 
-        // Create I/O SQ: PC=1, CQID=IO_QID, QPRIO=0.
-        let mut sqe = Sqe::zero();
-        sqe.cdw0 = AdminOpcode::CreateSq as u32;
-        sqe.prp1 = sq_phys;
-        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
-        // SAFETY: queue + bar live.
-        unsafe {
-            admin.submit(bar0, sqe)?;
-        }
-
-        self.io = Some(Queue {
-            sq_buf,
-            cq_buf,
-            qid: IO_QID,
-            depth: IO_Q_DEPTH,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: 1,
-            db_stride: admin.db_stride,
-            next_cid: 0,
-        });
-
-        Ok(v)
+        // Response CDW0 (Cqe::cmd_specific) carries the granted
+        // counts in the same low/high u16 layout (zero-based).
+        let nsqa = (cqe.cmd_specific & 0xFFFF) as u16;
+        let ncqa = ((cqe.cmd_specific >> 16) & 0xFFFF) as u16;
+        Ok((nsqa.saturating_add(1), ncqa.saturating_add(1)))
     }
 
-    /// Submit an NVM Read/Write to the I/O queue and wait for
-    /// MSI-X-delivered completion via `narf_interrupts::fire_count`.
-    /// Caller decides between `read_lba` (polled) and this for
-    /// IRQ-driven flows.
+    /// Create N I/O queue pairs with MSI-X-driven completions, one
+    /// MSI-X table entry + IDT vector per pair.
+    ///
+    /// Steps (NVMe Base Spec 2.0c):
+    ///   1. Set Features — Number of Queues (§5.27, FID 0x07) on the
+    ///      admin queue with the host's request.
+    ///   2. Compute `granted = min(requested, nsqa, ncqa, MQES+1,
+    ///      NVME_MAX_IO_QUEUE_PAIRS)`.
+    ///   3. For each queue index `i` in `0..granted`:
+    ///        - Allocate an MSI-X vector + IDT vector; program
+    ///          MSI-X table entry `i` to deliver to the BSP.
+    ///        - Allocate CQ DMA; submit Create I/O CQ (§5.2.2,
+    ///          opcode 0x05) with `qid=i+1`, `IV=i`, `IEN=1`, `PC=1`.
+    ///        - Allocate SQ DMA; submit Create I/O SQ (§5.2.1,
+    ///          opcode 0x01) with `qid=i+1`, `CQID=i+1`, `QPRIO=2`
+    ///          (Medium), `PC=1`. The host MUST create the CQ first
+    ///          (§3.3) before its associated SQ — we do that for
+    ///          each pair before moving to the next.
+    ///   4. Flip the global MSI-X enable bit.
+    ///   5. Stash each `Queue` in `io_queues`, each vector in
+    ///      `io_irq_vectors`. `io_queues[0]` is qid=1; the
+    ///      submission paths pick a queue via round-robin
+    ///      (`pick_queue`).
+    ///
+    /// Returns the number of granted I/O queue pairs.
+    pub fn create_io_queues_msix(
+        &mut self,
+        bus_dev_cap: &Cap<BusDeviceCap, Write>,
+        requested: u16,
+    ) -> Result<usize, NvmeError> {
+        let device = self.device.ok_or(NvmeError::NotReady)?;
+
+        // Clamp the request to our static + hardware bounds. CAP.MQES
+        // is zero-based, so the deepest legal queue depth is MQES+1;
+        // since we use a fixed IO_Q_DEPTH=4 the MQES check only
+        // matters if a vendor advertised <4-deep queues (no real
+        // controller does, but stay defensive). The number of
+        // *queues* doesn't run through MQES — that gates depth — so
+        // strictly we only need the static cap + cpu_count gate here.
+        let cpu_n = narf_lib::smp::cpu_count() as u16;
+        let host_cap = cpu_n.max(1).min(NVME_MAX_IO_QUEUE_PAIRS);
+        let req = requested.max(1).min(host_cap);
+
+        // ── 1. Ask the controller for `req` pairs ─────────────
+        let (nsqa, ncqa) = self.submit_set_features_n_queues(req)?;
+        // Granted count is the min of the host request, NSQA, NCQA.
+        // Storage stacks generally allocate one pair per queue
+        // (one SQ per CQ), so this is what the rest of the routine
+        // assumes.
+        let granted = req.min(nsqa).min(ncqa);
+        if granted == 0 {
+            return Err(NvmeError::Msix);
+        }
+
+        // ── 2. Discover MSI-X + alloc the table block ─────────
+        // Walk the cap list, learn the table size (≥ granted vectors
+        // — every PCIe NVMe controller advertises plenty).
+        let mut msix = enable_msix(bus_dev_cap, &device).map_err(|_| NvmeError::Msix)?;
+        if (msix.size() as u16) < granted {
+            return Err(NvmeError::Msix);
+        }
+        msix.alloc_block(granted).map_err(|_| NvmeError::Msix)?;
+
+        // ── 3. Per-queue: vector + table entry + CQ + SQ ──────
+        let mut vectors: Vec<u8> = Vec::with_capacity(granted as usize);
+        let mut queues: Vec<Queue> = Vec::with_capacity(granted as usize);
+        let admin_stride = self
+            .admin
+            .as_ref()
+            .ok_or(NvmeError::NotReady)?
+            .db_stride;
+
+        // Program all MSI-X table entries up-front + flip the
+        // global enable bit BEFORE issuing Create I/O CQ. QEMU's
+        // NVMe emulation latches the MSI-X-enabled state at
+        // Create-IO-CQ time on some code paths — programming after
+        // CC.EN=1 but before the first Create-CQ keeps the device
+        // unambiguously in "MSI-X delivery armed" mode when it
+        // first records each CQ's IV. The PCIe spec only requires
+        // "program before delivery" (i.e. before the first
+        // interrupt could fire), and the first interrupt-eligible
+        // event is the first I/O completion, well after enable().
+        for i in 0..granted {
+            let v = narf_interrupts::vector::alloc().map_err(|_| NvmeError::Msix)?;
+            // SAFETY: caller holds the BusDeviceCap; we own the
+            // MSI-X table exclusively (no concurrent writer); the
+            // table-slot index was alloc_block'd above.
+            let _ = unsafe { msix.program_vector(i, 0, v) }
+                .map_err(|_| NvmeError::Msix)?;
+            vectors.push(v);
+        }
+        // ── 4. Flip the global MSI-X enable bit ──────────────
+        // SAFETY: cfg-space write at the cached cap offset.
+        let _ = unsafe { msix.enable() }.map_err(|_| NvmeError::Msix)?;
+
+        for i in 0..granted {
+            let qid = (i + 1) as u16; // NVMe Base Spec §4.1.4: I/O qids ≥ 1
+
+            // Per pair: CQ DMA first, then admin Create CQ, then
+            // SQ DMA + Create SQ. CQ-before-SQ is required by
+            // §3.3 (and the controller will reject a Create SQ
+            // that names an unallocated CQID).
+            let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+                .map_err(|_| NvmeError::OutOfDmaMemory)?;
+            let cq_phys = cq_buf.phys_addr().raw();
+
+            {
+                // Borrow admin mutably for the submit; drop before
+                // the next per-queue iteration so push() below
+                // doesn't fight the borrow.
+                let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+                let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+
+                // Create I/O CQ (§5.2.2, opcode 0x05):
+                //   CDW10 bits[31:16] = QSIZE (zero-based)
+                //   CDW10 bits[15:0]  = QID
+                //   CDW11 bits[31:16] = IV (MSI-X table index)
+                //   CDW11 bit[1]      = IEN (interrupt enable)
+                //   CDW11 bit[0]      = PC (physically contiguous)
+                let mut sqe = Sqe::zero();
+                sqe.cdw0 = AdminOpcode::CreateCq as u32;
+                sqe.prp1 = cq_phys;
+                sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (qid as u32);
+                sqe.cdw11 = ((i as u32) << 16) | (1 << 1) | 1;
+                // SAFETY: admin queue + BAR live; CQ DMA fresh.
+                unsafe {
+                    admin.submit(bar0, sqe)?;
+                }
+            }
+
+            let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+                .map_err(|_| NvmeError::OutOfDmaMemory)?;
+            let sq_phys = sq_buf.phys_addr().raw();
+
+            {
+                let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+                let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+
+                // Create I/O SQ (§5.2.1, opcode 0x01):
+                //   CDW10 bits[31:16] = QSIZE (zero-based)
+                //   CDW10 bits[15:0]  = QID
+                //   CDW11 bits[31:16] = CQID
+                //   CDW11 bits[2:1]   = QPRIO (0 = Urgent; matches
+                //                       the priority weight the
+                //                       polled-completion path
+                //                       used and keeps round-trip
+                //                       latency dominated by the
+                //                       device, not the controller's
+                //                       internal arbiter.)
+                //   CDW11 bit[0]      = PC (physically contiguous)
+                let mut sqe = Sqe::zero();
+                sqe.cdw0 = AdminOpcode::CreateSq as u32;
+                sqe.prp1 = sq_phys;
+                sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (qid as u32);
+                sqe.cdw11 = ((qid as u32) << 16) | 1;
+                // SAFETY: admin queue + BAR live; SQ DMA fresh.
+                unsafe {
+                    admin.submit(bar0, sqe)?;
+                }
+            }
+
+            queues.push(Queue {
+                sq_buf,
+                cq_buf,
+                qid,
+                depth: IO_Q_DEPTH,
+                sq_tail: 0,
+                cq_head: 0,
+                cq_phase: 1,
+                db_stride: admin_stride,
+                next_cid: 0,
+            });
+        }
+
+        // ── 5. Publish ────────────────────────────────────────
+        self.msix = Some(msix);
+        self.irq_vector = vectors.first().copied();
+        self.io_irq_vectors = vectors;
+        self.io_queues = queues;
+        self.next_queue.store(0, Ordering::Relaxed);
+
+        Ok(granted as usize)
+    }
+
+    /// Number of live I/O queue pairs. Zero before any of the
+    /// `create_io_queue*` paths run.
+    #[inline]
+    pub fn io_queue_count(&self) -> usize {
+        self.io_queues.len()
+    }
+
+    /// Round-robin pick of an I/O queue index. Returns 0 when only
+    /// one queue exists. Unlocked / lock-free — every submission
+    /// path immediately takes the controller's lock after, so the
+    /// fetch_add isn't load-bearing for safety, just for distribution.
+    #[inline]
+    fn pick_queue(&self) -> usize {
+        let n = self.io_queues.len();
+        if n <= 1 {
+            return 0;
+        }
+        self.next_queue.fetch_add(1, Ordering::Relaxed) % n
+    }
+
+    /// Submit an NVM Read/Write to a round-robin-picked I/O queue
+    /// and wait for MSI-X-delivered completion via
+    /// `narf_interrupts::fire_count`. Caller decides between
+    /// `read_lba` (polled) and this for IRQ-driven flows.
     ///
     /// Synchronous variant: spins on `fire_count` after submitting;
     /// the underlying mechanism is the same one `wait_for_irq.await`
-    /// drives, just without an executor.
+    /// drives, just without an executor. With multi-queue wired the
+    /// queue is picked via `pick_queue` (round-robin AtomicUsize)
+    /// and the wait targets THAT queue's MSI-X vector so completion
+    /// dispatch stays per-CQ.
     pub fn submit_io_irq(
         &mut self,
         opcode: u8,
@@ -847,8 +1051,15 @@ impl Controller {
         n_blocks: u16,
         buf: &DmaBuffer,
     ) -> Result<(), NvmeError> {
-        let v = self.irq_vector.ok_or(NvmeError::Msix)?;
-        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        let qi = self.pick_queue();
+        let v = *self
+            .io_irq_vectors
+            .get(qi)
+            .ok_or(NvmeError::Msix)?;
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         if n_blocks == 0 {
             return Ok(());
@@ -934,10 +1145,12 @@ impl Controller {
     /// "kernel pauses for the entire I/O" and "kernel does
     /// other work while the device is busy".
     ///
-    /// Borrows on `self.io` / `self.bar0_region` are scoped to
-    /// the synchronous setup + completion-drain phases so the
-    /// `.await` doesn't hold a mutable borrow across the
-    /// suspension point.
+    /// Borrows on `self.io_queues[qi]` / `self.bar0_region` are
+    /// scoped to the synchronous setup + completion-drain phases
+    /// so the `.await` doesn't hold a mutable borrow across the
+    /// suspension point. The same queue index is used either side
+    /// of the await — switching queues mid-flight would corrupt
+    /// the picked queue's CQ head/phase tracking.
     pub async fn submit_io_irq_async(
         &mut self,
         opcode: u8,
@@ -945,7 +1158,20 @@ impl Controller {
         n_blocks: u16,
         buf: &DmaBuffer,
     ) -> Result<(), NvmeError> {
-        let v = self.irq_vector.ok_or(NvmeError::Msix)?;
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        // Pick a queue index up-front and keep it across the await —
+        // the same queue must be used for both the doorbell and the
+        // post-IRQ CQE drain (each CQ has its own head pointer + phase
+        // tag; routing the drain to a different queue would corrupt
+        // its state). The vector is the per-queue MSI-X entry's
+        // IDT vector so wakeups land on this CQ's task only.
+        let qi = self.pick_queue();
+        let v = *self
+            .io_irq_vectors
+            .get(qi)
+            .ok_or(NvmeError::Msix)?;
         if n_blocks == 0 {
             return Ok(());
         }
@@ -966,7 +1192,7 @@ impl Controller {
         // Submit + ring doorbell. All self-borrows released at
         // the closing brace.
         {
-            let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
             let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
             let mut sqe = Sqe::zero();
             sqe.cdw0 = opcode as u32;
@@ -994,8 +1220,9 @@ impl Controller {
         // construction (above, pre-doorbell) and now.
         let _ = wait.await;
 
-        // Drain the CQE + ring CQ-head doorbell.
-        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        // Drain the CQE + ring CQ-head doorbell on the SAME queue
+        // we submitted on.
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         // SAFETY: cq_buf is a live identity-mapped DMA page.
         let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
@@ -1026,7 +1253,11 @@ impl Controller {
         n_blocks: u16,
         buf: &DmaBuffer,
     ) -> Result<(), NvmeError> {
-        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        let qi = self.pick_queue();
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         if n_blocks == 0 {
             return Ok(());
@@ -1062,7 +1293,11 @@ impl Controller {
         n_blocks: u16,
         pages: &[PhysAddr],
     ) -> Result<(), NvmeError> {
-        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        let qi = self.pick_queue();
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         if n_blocks == 0 || pages.is_empty() {
             return Ok(());

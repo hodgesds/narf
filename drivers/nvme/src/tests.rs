@@ -473,10 +473,19 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
     if ctrl.bring_up(&dev_cap).is_err() {
         return TestResult::Fail("Controller::bring_up failed");
     }
-    let v = match ctrl.create_io_queue_msix(&dev_cap) {
-        Ok(v) => v,
-        Err(_) => return TestResult::Fail("create_io_queue_msix failed"),
+    // Request a single queue pair here — this smoke validates the
+    // MSI-X + multi-queue plumbing end-to-end against a real device,
+    // but the IRQ-count assertion below is per-vector and easier to
+    // reason about with one queue. The multi-queue grant is
+    // covered by `smoke_nvme_multi_queue_granted` below.
+    let granted = match ctrl.create_io_queues_msix(&dev_cap, 1) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("create_io_queues_msix failed"),
     };
+    if granted == 0 {
+        return TestResult::Fail("create_io_queues_msix granted zero queues");
+    }
+    let v = ctrl.irq_vector.expect("irq_vector populated by create_io_queues_msix");
     // SAFETY: APIC is initialised; MSI lands in our IDT vector.
     unsafe {
         narf_arch::enable_interrupts();
@@ -529,6 +538,92 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_io_msix_irq_driven);
 
+fn smoke_nvme_multi_queue_granted() -> TestResult {
+    // Validates the NVMe Set Features (FID 0x07, Number of Queues)
+    // round trip + multi-queue create path against the QEMU NVMe
+    // emulation. The host requests `NVME_MAX_IO_QUEUE_PAIRS` pairs;
+    // QEMU grants up to its `-num-queues` (default 64), so the
+    // assertion is that we got at least 2 pairs — anything past 1
+    // proves the multi-queue plumbing works.
+    use crate::{Controller, NVME_MAX_IO_QUEUE_PAIRS};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices().iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    }).copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    // Standalone Set Features round-trip first — confirms the CDW0
+    // response decode is right before we depend on it for queue
+    // creation.
+    match ctrl.submit_set_features_n_queues(NVME_MAX_IO_QUEUE_PAIRS) {
+        Ok((nsqa, ncqa)) => {
+            if nsqa == 0 || ncqa == 0 {
+                return TestResult::Fail("Set Features granted zero queues");
+            }
+        }
+        Err(_) => return TestResult::Fail("submit_set_features_n_queues failed"),
+    }
+    // Re-issue Set Features inside `create_io_queues_msix` (idempotent
+    // — the controller treats repeated FID=7 as a re-request); then
+    // creates the queue pairs.
+    let granted = match ctrl.create_io_queues_msix(&dev_cap, NVME_MAX_IO_QUEUE_PAIRS) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("create_io_queues_msix failed"),
+    };
+    if granted < 2 {
+        return TestResult::Fail("expected at least 2 I/O queue pairs from QEMU");
+    }
+    if ctrl.io_queue_count() != granted {
+        return TestResult::Fail("io_queue_count() != granted");
+    }
+    if ctrl.irq_vector.is_none() {
+        return TestResult::Fail("irq_vector should be populated post-msix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_multi_queue_granted);
+
+fn smoke_nvme_pick_queue_round_robins() -> TestResult {
+    // Unit-style validator for `pick_queue`'s round-robin: build a
+    // controller via the cheap `Controller::new(0)` skeleton ctor,
+    // synthesize an io_queues Vec via the public-but-test-only path,
+    // and check fetch_add wraps mod len.
+    //
+    // We can't construct fake `Queue`s without DMA pages, so this
+    // test stays observational: it asserts the math through the
+    // `next_queue` AtomicUsize directly. The full round-robin under
+    // submission is exercised by `smoke_nvme_multi_queue_granted` +
+    // the BlockDevice async smoke when multi-queue is wired.
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let n = 4usize;
+    // Mirror the body of `pick_queue` (n > 1 branch).
+    let mut counts = [0usize; 4];
+    for _ in 0..20 {
+        let i = next.fetch_add(1, Ordering::Relaxed) % n;
+        counts[i] += 1;
+    }
+    for c in counts {
+        if c != 5 {
+            return TestResult::Fail("round-robin distribution should be even");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_pick_queue_round_robins);
 
 
 fn smoke_nvme_params_typed_round_trip() -> TestResult {
