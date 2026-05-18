@@ -27,7 +27,7 @@ use crate::iface;
 use crate::pkt::{
     self, parse_arp, parse_eth_header, parse_ipv4, write_eth_header, write_ipv4_header,
     ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETH_HDR_LEN,
-    IPV4_HDR_LEN, IP_PROTO_TCP,
+    IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
 };
 use crate::pkt_tcp::{TcpHeader, ipv4_pseudo_checksum};
 
@@ -347,8 +347,33 @@ fn handle_ipv4(body: &[u8]) {
     };
     if ip.protocol == IP_PROTO_TCP {
         handle_tcp(ip.src_ip, ip.dst_ip, payload);
+    } else if ip.protocol == IP_PROTO_UDP {
+        handle_udp(ip.src_ip, ip.dst_ip, payload);
     }
     // ICMP/echo etc. omitted in Stage-1.
+}
+
+/// Minimal UDP dispatch. Splits off the 8-byte UDP header, routes by
+/// destination port: the DHCP client listens on 68. New consumers
+/// (mDNS, DNS-over-UDP, NTP) plug additional ports in here.
+fn handle_udp(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8]) {
+    if datagram.len() < 8 {
+        return;
+    }
+    let src_port = u16::from_be_bytes([datagram[0], datagram[1]]);
+    let dst_port = u16::from_be_bytes([datagram[2], datagram[3]]);
+    let length = u16::from_be_bytes([datagram[4], datagram[5]]) as usize;
+    // `length` includes the 8-byte header.
+    let end = length.min(datagram.len());
+    if end < 8 {
+        return;
+    }
+    let payload = &datagram[8..end];
+    // DHCP client port. The dhcp module caches the reply for the
+    // synchronous `acquire` busy-wait to observe.
+    if dst_port == 68 {
+        crate::dhcp::on_udp_in(src_ip, dst_ip, src_port, dst_port, payload);
+    }
 }
 
 fn handle_tcp(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {

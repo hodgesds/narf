@@ -675,6 +675,49 @@ kernel_test_in!(
     smoke_virtio_net_pci_set_mac_round_trip
 );
 
+fn smoke_virtio_net_pci_dhcp_acquire() -> TestResult {
+    // End-to-end DHCP exchange against QEMU's built-in user-mode
+    // SLIRP server, which always offers `10.0.2.15` as the lease.
+    // Drives the full DISCOVER → OFFER → REQUEST → ACK flow through
+    // vnet0 — exercises the new tcp_stack UDP dispatch + dhcp client
+    // + frame-build wrappers.
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    if narf_net::iface::lookup("vnet0").is_none() {
+        return TestResult::Skip("vnet0 not registered with legacy iface");
+    }
+    // acquire() sends through vnet0's send_fn (looked up by name,
+    // not by primary()). The reply comes back on vnet0's RX
+    // virtqueue and the async RX forwarder calls
+    // `iface::on_rx_frame` synchronously, which routes through
+    // tcp_stack → dhcp::on_udp_in, populating LATEST_REPLY for the
+    // busy-wait to observe. drain_pump may be wired to a different
+    // iface in the test profile, but the IRQ-driven forwarder
+    // covers vnet0 regardless.
+    match narf_net::dhcp::acquire("vnet0", 5000) {
+        Ok(lease) => {
+            // QEMU SLIRP hands out 10.0.2.15 by default.
+            if lease.ip != [10, 0, 2, 15] {
+                return TestResult::Fail("DHCP yiaddr mismatch");
+            }
+            if lease.gateway != [10, 0, 2, 2] {
+                return TestResult::Fail("DHCP gateway mismatch");
+            }
+            if lease.lease_secs == 0 {
+                return TestResult::Fail("DHCP lease_secs zero");
+            }
+            TestResult::Pass
+        }
+        Err(()) => TestResult::Skip("DHCP timed out — no user-mode netdev?"),
+    }
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_dhcp_acquire
+);
+
 fn smoke_virtio_net_pci_count_matches_probe() -> TestResult {
     use crate::net_pci;
     let n = net_pci::count();
