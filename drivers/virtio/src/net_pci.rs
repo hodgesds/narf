@@ -42,11 +42,28 @@ pub const VIRTIO_NET_PCI_VENDOR: u16 = 0x1AF4;
 pub const VIRTIO_NET_PCI_DEVICE: u16 = 0x1041;
 
 // virtio-net feature bits (VirtIO 1.2 §5.1.3). We negotiate the
-// subset the kernel actually reads from device-cfg.
+// subset the kernel actually reads from device-cfg / drives via
+// the control queue.
 const VIRTIO_NET_F_CSUM: u64 = 0; // device handles packet checksums
 const VIRTIO_NET_F_MTU: u64 = 3;
 const VIRTIO_NET_F_MAC: u64 = 5;
 const VIRTIO_NET_F_STATUS: u64 = 16;
+const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
+
+// virtio-net control-queue command classes + sub-commands
+// (VirtIO 1.2 §5.1.6.5). One class per logical operation group
+// (RX filter, MAC, VLAN, …); each class has a numeric command
+// space the driver fills in `virtio_net_ctrl_hdr::cmd`.
+const VIRTIO_NET_CTRL_RX: u8 = 0;
+const VIRTIO_NET_CTRL_RX_PROMISC: u8 = 0;
+const VIRTIO_NET_CTRL_RX_ALLMULTI: u8 = 1;
+
+const VIRTIO_NET_OK: u8 = 0;
+
+// Control queue is virtqueue index 2 when F_CTRL_VQ negotiated and
+// F_MQ is not. (With F_MQ it sits at index 2 * max_pairs, but we
+// don't negotiate F_MQ.)
+const CTRL_QUEUE: u16 = 2;
 
 // virtio-net config status bits.
 const VIRTIO_NET_S_LINK_UP: u16 = 1 << 0;
@@ -128,6 +145,38 @@ pub struct VirtioNetPci {
     /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
     /// the spec says treat link as always up.
     has_status: bool,
+    /// Control queue (queue 2 when `F_CTRL_VQ` negotiated and
+    /// `F_MQ` is not). `None` when the device didn't offer
+    /// `F_CTRL_VQ`. Wrapped together with its scratch buffer +
+    /// notify offset so callers can submit one command without
+    /// trampolining through multiple locks.
+    ctrl: Option<IrqSafeSpinLock<CtrlQueue>>,
+    /// Phys address of the device's PCIe config space. Used by
+    /// probe() as a per-device fingerprint so a second probe pass
+    /// against the same device (e.g. tests that reset the bus
+    /// driver-match registry + re-walk PCI) is idempotent — we
+    /// recognise the device and don't push a duplicate controller.
+    cfg_phys: u64,
+}
+
+/// Control-queue runtime state. `ctrl_buf` holds back-to-back
+/// (hdr, payload, ack) byte regions used by `submit_control`;
+/// 256 bytes is enough for a 2-byte hdr + ≤253 bytes of payload +
+/// 1 byte ack, covering every RX/MAC/VLAN command we care about
+/// today.
+#[derive(Debug)]
+struct CtrlQueue {
+    q: Virtqueue,
+    /// 4 KiB scratch page. The same page backs every submitted
+    /// command (single-flight serialised by the outer lock); the
+    /// device sees an [hdr|payload|ack] layout at fixed offsets
+    /// 0 / 16 / 256 within the page.
+    buf: DmaBuffer,
+    notify_off: u16,
+    /// Layout-buffer DMA backing the descriptor / avail / used
+    /// rings — held so the page stays allocated for the device's
+    /// lifetime.
+    _layout_buf: DmaBuffer,
 }
 
 const RX_POOL_LEN: usize = 8;
@@ -152,6 +201,10 @@ impl VirtioNetPci {
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
+        let cfg_phys = match device.kind {
+            narf_bus::BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => 0,
+        };
         // SAFETY: bounded walk over identity-mapped cfg.
         let caps: VirtioCaps = unsafe { discover(device) }?;
         // SAFETY: caller-owned device.
@@ -198,13 +251,15 @@ impl VirtioNetPci {
         let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
+        let want_ctrl_vq = feats & (1u64 << VIRTIO_NET_F_CTRL_VQ) != 0;
         // All virtio-net F_* bits we care about live in the low
-        // 32 (max is F_STATUS = 16); only F_VERSION_1 = 32 is in
+        // 32 (max is F_CTRL_VQ = 17); only F_VERSION_1 = 32 is in
         // the high half.
         let drv_lo = (1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32)
             | (1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32)
             | (1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32)
-            | (1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32);
+            | (1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32)
+            | (1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32);
         let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
         unsafe {
@@ -257,6 +312,18 @@ impl VirtioNetPci {
         };
         let (rx_layout, rx_q_buf, rx_qsize, rx_notify_off) = size_q(RX_QUEUE)?;
         let (tx_layout, tx_q_buf, tx_qsize, tx_notify_off) = size_q(TX_QUEUE)?;
+        // Control queue is queue 2 when F_CTRL_VQ was negotiated.
+        // Spec mandates the device exposes it at that index in
+        // that case; if size_q reports zero we treat it as not
+        // negotiated and skip.
+        let ctrl_setup = if want_ctrl_vq {
+            match size_q(CTRL_QUEUE) {
+                Ok(t) => Some(t),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
         // DRIVER_OK.
         // SAFETY: same.
@@ -312,6 +379,24 @@ impl VirtioNetPci {
         // Allocate the TX scratch.
         let tx_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+
+        // Build the CtrlQueue handle now that we have the layout
+        // tuple from the optional size_q call earlier.
+        let ctrl = match ctrl_setup {
+            Some((c_layout, c_layout_buf, _c_qsize, c_notify_off)) => {
+                let ctrl_buf = alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| VirtioPciError::BarMapFailed)?;
+                // SAFETY: Virtqueue::new zeros the layout regions.
+                let q = unsafe { Virtqueue::new(c_layout) };
+                Some(IrqSafeSpinLock::new(CtrlQueue {
+                    q,
+                    buf: ctrl_buf,
+                    notify_off: c_notify_off,
+                    _layout_buf: c_layout_buf,
+                }))
+            }
+            None => None,
+        };
 
         // Optional device-cfg region. Maps the same way virtio-input
         // does — if the device skipped the Device cap (rare), we
@@ -378,7 +463,15 @@ impl VirtioNetPci {
             mac,
             mtu,
             has_status: want_status,
+            ctrl,
+            cfg_phys,
         })
+    }
+
+    /// Phys address of this controller's PCIe config space. Used by
+    /// the probe-time dedupe check + diagnostics.
+    pub fn cfg_phys(&self) -> u64 {
+        self.cfg_phys
     }
 
     /// Bind the receiveq (queue 0) to a fresh MSI-X vector. After
@@ -558,6 +651,129 @@ impl VirtioNetPci {
         s & VIRTIO_NET_S_LINK_UP != 0
     }
 
+    /// `true` iff this controller negotiated F_CTRL_VQ and has a
+    /// working control queue. Callers gate `set_promisc` /
+    /// `set_allmulti` etc. on this.
+    pub fn has_ctrl_vq(&self) -> bool {
+        self.ctrl.is_some()
+    }
+
+    /// Submit one control command to virtqueue 2 and wait for the
+    /// device's 1-byte ack. The chain is [hdr, payload, ack]
+    /// (device-readable, device-readable, device-writable). Returns
+    /// the ack byte — `VIRTIO_NET_OK` (0) on success, anything else
+    /// is a device-side error.
+    ///
+    /// Single-flight per controller — the outer lock serialises
+    /// callers, so concurrent set_promisc + set_allmulti pairs are
+    /// fine but interleaving is sequential. Control commands are
+    /// rare (PHY-driven events), so no contention concern.
+    pub fn submit_control(
+        &self,
+        class: u8,
+        cmd: u8,
+        payload: &[u8],
+    ) -> Result<u8, VirtioPciError> {
+        let ctrl = self.ctrl.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        let mut g = ctrl.lock();
+        // Layout within `buf`:
+        //   0..2     hdr  (class, cmd)         device-readable
+        //   16..16+N payload                    device-readable
+        //   256..257 ack                        device-writable
+        // The 256-byte stride leaves slack for ≤240 byte payloads
+        // — covers RX_MODE (1 byte) and MAC_ADDR_SET (6 bytes)
+        // trivially. Larger payloads (MAC_TABLE_SET with many
+        // entries) will need a per-call allocation later.
+        if payload.len() > 240 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let phys = g.buf.phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; the offsets stay
+        // within the 4 KiB page allocated above.
+        unsafe {
+            core::ptr::write_volatile(phys as *mut u8, class);
+            core::ptr::write_volatile((phys + 1) as *mut u8, cmd);
+            for (i, b) in payload.iter().enumerate() {
+                core::ptr::write_volatile((phys + 16 + i as u64) as *mut u8, *b);
+            }
+            // Seed the ack byte with a sentinel so we can spot
+            // "device didn't write anything".
+            core::ptr::write_volatile((phys + 256) as *mut u8, 0xFF);
+        }
+        let descs = [
+            VirtqDesc {
+                addr: phys,
+                len: 2,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: phys + 16,
+                len: payload.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: phys + 256,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+        ];
+        let head = g
+            .q
+            .add_buffer(&descs)
+            .ok_or(VirtioPciError::QueueTooSmall)?;
+        let notify_off = (g.notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe {
+            self.notify.write16(notify_off, CTRL_QUEUE);
+        }
+        // Spin for completion while letting sleep_pumps tick.
+        let done = narf_scheduler::responsive_spin_until(
+            || matches!(g.q.poll_used(), Some((id, _)) if id == head as u32),
+            narf_time::Deadline::after_ms(1_000),
+        );
+        if !done {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        g.q.free_chain(head);
+        // SAFETY: device wrote the ack byte before publishing the
+        // used-ring entry; identity-mapped read.
+        let ack = unsafe { core::ptr::read_volatile((phys + 256) as *const u8) };
+        Ok(ack)
+    }
+
+    /// Convenience wrapper for `VIRTIO_NET_CTRL_RX_PROMISC`. Asks
+    /// the device to enable / disable promiscuous mode (deliver
+    /// every frame to RX, even those destined for other MACs).
+    /// Returns `Err` if the device didn't negotiate F_CTRL_VQ or
+    /// the ack wasn't `VIRTIO_NET_OK`.
+    pub fn set_promisc(&self, on: bool) -> Result<(), VirtioPciError> {
+        let payload = [u8::from(on)];
+        let ack =
+            self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_PROMISC, &payload)?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Convenience wrapper for `VIRTIO_NET_CTRL_RX_ALLMULTI`.
+    /// Requests delivery of every multicast frame regardless of the
+    /// MAC-filter list — useful for IPv6 NDP / mDNS consumers
+    /// without per-address filter setup.
+    pub fn set_allmulti(&self, on: bool) -> Result<(), VirtioPciError> {
+        let payload = [u8::from(on)];
+        let ack =
+            self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_ALLMULTI, &payload)?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
     /// Take ownership of one device-filled RX frame. Zero-copy:
     /// returns the actual `DmaBuffer` the device wrote into +
     /// total bytes (including the 12-byte virtio-net header).
@@ -641,11 +857,30 @@ impl VirtioNetPci {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioNetPci>> = IrqSafeSpinLock::new(None);
+/// Every bound virtio-net device. A modern host can attach more than
+/// one virtio-net controller (separate vlans, separate netdevs); the
+/// singleton-Option shape used to swallow the second probe — match
+/// the virtio-input fix and keep all bound devices.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<VirtioNetPci>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
+    // Dedupe: tests that reset the bus driver-match registry and
+    // re-walk PCI would otherwise push a second controller for
+    // the same device. Match by config-space phys address — every
+    // PCIe device has a unique one.
+    let dev_cfg = match device.kind {
+        narf_bus::BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+        _ => 0,
+    };
+    if dev_cfg != 0 {
+        let already = {
+            let g = CONTROLLERS.lock();
+            g.iter().any(|c| c.cfg_phys() == dev_cfg)
+        };
+        if already {
+            return Ok(());
+        }
     }
     narf_bus::pci::set_command(
         &cap,
@@ -656,60 +891,50 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over the device.
-    let dev = match unsafe { VirtioNetPci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { VirtioNetPci::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
-    // Best-effort MSI-X for receiveq (queue 0). Failure is fine —
-    // the polled `rx()` path stays in place.
-    {
-        let mut g = CONTROLLER.lock();
-        if let Some(c) = g.as_mut() {
-            // SAFETY: probe-time caller owns the device.
-            let _ = unsafe { c.enable_msix(&cap, &device) };
-        }
-    }
+    // SAFETY: probe-time caller owns the device. Best-effort —
+    // failure leaves the polled fallback in place inside the
+    // forwarder.
+    let _ = unsafe { dev.enable_msix(&cap, &device) };
+    let idx = {
+        let mut g = CONTROLLERS.lock();
+        let i = g.len();
+        g.push(dev);
+        i
+    };
+    let bound_name = alloc::format!("vnet{}", idx);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("vnet0"),
+        name: bound_name.clone(),
         kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(VIRTIO_NET_PCI_VENDOR),
         pci_did: Some(VIRTIO_NET_PCI_DEVICE),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
-    // Register the controller with narf_net so the TCP stack can
-    // find it as `vnet0`. Build the two SPSC rings, hand the
-    // caller-facing halves to the Interface, capture the peer
-    // halves in forwarder tasks.
-    register_net_interface();
+    // Register this specific controller's interface and spawn its
+    // forwarder pair.
+    register_net_interface(idx, bound_name);
     Ok(())
 }
 
-/// Build a `VirtioNet` from the currently-probed controller, register
-/// it with `narf_net::registry()`, and spawn the RX/TX forwarder
-/// tasks that bridge the device's virtqueues to the SPSC rings the
-/// TCP stack pops/pushes.
-fn register_net_interface() {
-    use alloc::string::ToString;
+/// Build a `VirtioNet` from the controller at `idx`, register it
+/// with `narf_net::registry()` under `name`, and spawn the RX/TX
+/// forwarder tasks scoped to that controller's index.
+fn register_net_interface(idx: usize, name: alloc::string::String) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
-    let (mac, mtu, link_up, irq_vector) = {
-        let g = CONTROLLER.lock();
-        match g.as_ref() {
-            Some(c) => (c.mac(), c.mtu(), c.link_up(), c.irq_vector),
-            None => return,
-        }
+    let (mac, mtu, link_up, irq_vector) = match with_at(idx, |c| {
+        (c.mac(), c.mtu(), c.link_up(), c.irq_vector)
+    }) {
+        Some(t) => t,
+        None => return,
     };
     let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
     let (mut rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
-    let iface = narf_net::virtio_net::VirtioNet::new(
-        "vnet0".to_string(),
-        mac,
-        mtu,
-        link_up,
-        tx_prod,
-        rx_cons,
-    );
+    let iface =
+        narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
     let authority = narf_net::bootstrap_authority();
     // Registration failure leaks the iface (returned by-value into
     // the registry would have moved it) — we constructed it above
@@ -719,12 +944,12 @@ fn register_net_interface() {
     if narf_net::registry().register(&authority, iface).is_err() {
         return;
     }
-    // RX forwarder: await the device IRQ (or fall back to a 16 ms
-    // poll), drain every available frame via rx_take (zero-copy:
-    // we get the actual device-filled DmaBuffer + total length),
-    // wrap as a Frame whose payload starts at offset 12 (past the
-    // virtio-net header) and send through rx_prod. No memcpy on
-    // the data path.
+    // RX forwarder: await this device's IRQ (or fall back to a
+    // 16 ms poll), drain every available frame via rx_take
+    // (zero-copy: we get the actual device-filled DmaBuffer +
+    // total length), wrap as a Frame whose payload starts at
+    // offset 12 (past the virtio-net header) and send through
+    // rx_prod. No memcpy on the data path.
     narf_scheduler::spawn(async move {
         const PUMP_CYCLES: u64 = 53_000_000;
         loop {
@@ -734,12 +959,9 @@ fn register_net_interface() {
                 narf_time::sleep_cycles(PUMP_CYCLES).await;
             }
             loop {
-                let taken = {
-                    let g = CONTROLLER.lock();
-                    match g.as_ref() {
-                        Some(c) => c.rx_take(),
-                        None => return,
-                    }
+                let taken = match with_at(idx, |c| c.rx_take()) {
+                    Some(t) => t,
+                    None => return, // controller vanished
                 };
                 let (buf, total_len) = match taken {
                     Some(t) => t,
@@ -762,16 +984,14 @@ fn register_net_interface() {
         }
     });
     // TX forwarder: drain the caller-facing Producer's Consumer
-    // peer, push each frame through the device's TX queue via the
-    // zero-copy tx_dma path — the payload descriptor points at
-    // the Frame's DmaBuffer directly. The 12-byte virtio-net
+    // peer, push each frame through this device's TX queue via
+    // the zero-copy tx_dma path — the payload descriptor points
+    // at the Frame's DmaBuffer directly. The 12-byte virtio-net
     // header sits in the driver-owned tx_buf scratch.
     narf_scheduler::spawn(async move {
         while let Ok(frame) = tx_cons.recv().await {
             let (buf, offset, len) = frame.into_parts_with_offset();
-            if let Some(c) = CONTROLLER.lock().as_ref() {
-                let _ = c.tx_dma(&buf, offset, len);
-            }
+            let _ = with_at(idx, |c| c.tx_dma(&buf, offset, len));
             // `buf` drops here → DmaBuffer::drop frees the page.
         }
     });
@@ -789,10 +1009,33 @@ pub fn register_pci_driver() {
 }
 
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    !CONTROLLERS.lock().is_empty()
 }
 
+/// Number of bound virtio-net devices.
+pub fn count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
+/// Run `f` against the first bound controller, if any. Use the
+/// `with_each` iterator instead when behaviour should fan out over
+/// every device.
 pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLERS.lock().first().map(f)
+}
+
+/// Run `f` against every bound controller in probe order.
+pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
+    let g = CONTROLLERS.lock();
+    for c in g.iter() {
+        f(c);
+    }
+}
+
+/// Run `f` against the controller at `idx`, if any. Per-device
+/// forwarder tasks call this every tick to drain/post on their own
+/// queues without stepping on siblings.
+pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
+    CONTROLLERS.lock().get(idx).map(f)
 }
 

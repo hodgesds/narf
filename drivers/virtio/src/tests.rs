@@ -546,6 +546,53 @@ fn smoke_virtio_net_pci_registers_iface() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_registers_iface);
 
+fn smoke_virtio_net_pci_count_matches_probe() -> TestResult {
+    use crate::net_pci;
+    let n = net_pci::count();
+    if net_pci::is_probed() {
+        if n == 0 {
+            return TestResult::Fail("is_probed() true but count() == 0");
+        }
+    } else if n != 0 {
+        return TestResult::Fail("is_probed() false but count() > 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_count_matches_probe
+);
+
+fn smoke_virtio_net_pci_ctrl_vq_set_promisc() -> TestResult {
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    let has_ctrl = net_pci::with_controller(|c| c.has_ctrl_vq()).unwrap_or(false);
+    if !has_ctrl {
+        return TestResult::Skip("device didn't negotiate F_CTRL_VQ");
+    }
+    // Enable promisc, then disable. Both must round-trip through
+    // the device with VIRTIO_NET_OK acks.
+    let on = net_pci::with_controller(|c| c.set_promisc(true)).unwrap_or(Err(
+        crate::pci::VirtioPciError::NoQueues,
+    ));
+    if on.is_err() {
+        return TestResult::Fail("promisc=on rejected");
+    }
+    let off = net_pci::with_controller(|c| c.set_promisc(false)).unwrap_or(Err(
+        crate::pci::VirtioPciError::NoQueues,
+    ));
+    if off.is_err() {
+        return TestResult::Fail("promisc=off rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_ctrl_vq_set_promisc
+);
+
 // ── virtio-rng-pci / virtio-snd-pci / virtio-balloon-pci ───────────
 
 fn smoke_virtio_rng_pci_probe() -> TestResult {
