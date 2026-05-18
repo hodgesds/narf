@@ -688,14 +688,19 @@ fn smoke_virtio_net_pci_dhcp_acquire() -> TestResult {
     if narf_net::iface::lookup("vnet0").is_none() {
         return TestResult::Skip("vnet0 not registered with legacy iface");
     }
+    // kernel-test builds don't run `boot_userspace_init`, so the
+    // `tcp_stack::init()` that normally wires
+    // `iface::install_rx_handler(rx_handler)` never fires. Without
+    // an RX handler installed, inbound DHCP OFFER frames are
+    // silently dropped by `iface::on_rx_frame` and the busy-wait
+    // inside `acquire` times out. Idempotent — production builds
+    // already called it via `cross_crate_init::install_all_hooks`.
+    narf_net::tcp_stack::init();
     // acquire() sends through vnet0's send_fn (looked up by name,
     // not by primary()). The reply comes back on vnet0's RX
-    // virtqueue and the async RX forwarder calls
-    // `iface::on_rx_frame` synchronously, which routes through
-    // tcp_stack → dhcp::on_udp_in, populating LATEST_REPLY for the
-    // busy-wait to observe. drain_pump may be wired to a different
-    // iface in the test profile, but the IRQ-driven forwarder
-    // covers vnet0 regardless.
+    // virtqueue; the busy-wait in `acquire` drains the ring via
+    // `iface::drain_pump`, which routes through tcp_stack
+    // → dhcp::on_udp_in, populating LATEST_REPLY.
     match narf_net::dhcp::acquire("vnet0", 5000) {
         Ok(lease) => {
             // QEMU SLIRP hands out 10.0.2.15 by default.
