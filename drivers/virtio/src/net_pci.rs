@@ -4,20 +4,28 @@
 //! Modern virtio-net's PCI device id is `0x1000 + 0x40 + 0x01`
 //! = 0x1041 (`0x1040 + virtio_id`, virtio_id 1 = net).
 //!
-//! Queue layout (basic, no multi-queue / no VIRTIO_NET_F_MQ):
-//!   - queue 0 = RX (receiveq).
-//!   - queue 1 = TX (transmitq).
-//!   - queue 2 = control queue (only when VIRTIO_NET_F_CTRL_VQ
-//!     negotiated; we don't request it).
+//! Queue layout (VirtIO 1.2 §5.1.2):
+//!   - queue 2N     = receiveq[N]
+//!   - queue 2N+1   = transmitq[N]
+//!   - queue 2 * max_virtqueue_pairs = controlq (when F_CTRL_VQ
+//!     negotiated; sits at fixed index 2 when F_MQ is *not*
+//!     negotiated since max_virtqueue_pairs is implicitly 1).
 //!
-//! Stage-4 cut: bring up the device, attach RX + TX virtqueues,
-//! enqueue 8 RX buffers so the device has somewhere to land
-//! incoming packets, and expose a `tx(&[u8])` that posts a single
-//! TX buffer + waits for completion. The TX path uses polled
-//! completion today; MSI-X-driven TX is structurally identical to
-//! `blk_pci::read_sector_irq` and lands in a follow-up.
+//! Multi-queue (VIRTIO_NET_F_MQ, §5.1.3.1 feature bit 22): the
+//! device advertises `max_virtqueue_pairs` (§5.1.4 u16 at device-cfg
+//! offset 8). After feature ack + DRIVER_OK we issue
+//! `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` (§5.1.6.5.5: class 4, cmd 0,
+//! 2-byte LE payload) to tell the device how many pairs to keep
+//! active. Frames still funnel into a single `narf_net::Interface`
+//! per device — MQ is a throughput optimisation, not a multi-iface
+//! fan-out — but TX submissions round-robin across the pairs so
+//! parallel callers don't serialise on a single virtqueue lock,
+//! and each RX pair gets its own forwarder.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -49,6 +57,9 @@ const VIRTIO_NET_F_MTU: u64 = 3;
 const VIRTIO_NET_F_MAC: u64 = 5;
 const VIRTIO_NET_F_STATUS: u64 = 16;
 const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
+/// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_MQ (bit 22). Device supports
+/// multi-queue with auto receive-steering across `max_virtqueue_pairs`.
+const VIRTIO_NET_F_MQ: u64 = 22;
 
 // virtio-net control-queue command classes + sub-commands
 // (VirtIO 1.2 §5.1.6.5). One class per logical operation group
@@ -58,12 +69,13 @@ const VIRTIO_NET_CTRL_RX: u8 = 0;
 const VIRTIO_NET_CTRL_RX_PROMISC: u8 = 0;
 const VIRTIO_NET_CTRL_RX_ALLMULTI: u8 = 1;
 
-const VIRTIO_NET_OK: u8 = 0;
+/// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ class.
+const VIRTIO_NET_CTRL_MQ: u8 = 4;
+/// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET.
+/// Payload is a `__virtio16` (2-byte LE) count of pairs to enable.
+const VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET: u8 = 0;
 
-// Control queue is virtqueue index 2 when F_CTRL_VQ negotiated and
-// F_MQ is not. (With F_MQ it sits at index 2 * max_pairs, but we
-// don't negotiate F_MQ.)
-const CTRL_QUEUE: u16 = 2;
+const VIRTIO_NET_OK: u8 = 0;
 
 // virtio-net config status bits.
 const VIRTIO_NET_S_LINK_UP: u16 = 1 << 0;
@@ -72,7 +84,18 @@ const VIRTIO_NET_S_LINK_UP: u16 = 1 << 0;
 // §5.1.4 — `struct virtio_net_config`).
 const CFG_MAC: u64 = 0;
 const CFG_STATUS: u64 = 6;
+/// Per §5.1.4: u16 LE, only valid when VIRTIO_NET_F_MQ negotiated.
+/// Reports the maximum number of TX/RX queue pairs the device
+/// supports. Spec guarantees 1 ≤ value ≤ 0x8000.
+const CFG_MAX_VIRTQUEUE_PAIRS: u64 = 8;
 const CFG_MTU: u64 = 10;
+
+/// Upper bound on how many queue pairs we'll actually bring up,
+/// regardless of what `max_virtqueue_pairs` reports. Keeps DMA-page
+/// + MSI-X-vector consumption bounded for absurd device-advertised
+/// counts (some emulators advertise 0x8000). 4 is enough to spread
+/// TX submission across a typical small-core machine.
+const MAX_QUEUE_PAIRS: u16 = 4;
 
 /// virtio-net header (VirtIO 1.2 §5.1.6.1). 12 bytes when
 /// VIRTIO_F_VERSION_1 is negotiated and VIRTIO_NET_F_MRG_RXBUF /
@@ -93,8 +116,38 @@ pub struct VirtioNetHdr {
 /// header + virtio-net header headroom.
 pub const MAX_FRAME: usize = 1518 + 16;
 
-const RX_QUEUE: u16 = 0;
-const TX_QUEUE: u16 = 1;
+/// Per-pair RX/TX virtqueue + descriptor-id → buffer slot table.
+/// With VIRTIO_NET_F_MQ the device exposes N of these as virtqueues
+/// 2N (RX) + 2N+1 (TX). Each pair carries its own notify offset
+/// (read once from `queue_notify_off` at bring_up) so the TX
+/// round-robin selector can fire the right notify register without
+/// re-walking the cfg space, and its own buffer slot table so RX
+/// refills land back in the right pair.
+#[derive(Debug)]
+struct QueuePair {
+    /// virtqueue index 2*N. Stored explicitly because `tx_dma` /
+    /// `rx_take` need it for the device notify write, and a Vec
+    /// position isn't necessarily the pair index after future
+    /// hot-unplug paths land.
+    rx_qidx: u16,
+    /// virtqueue index 2*N + 1.
+    tx_qidx: u16,
+    rx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
+    tx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
+    /// RX descriptor → buffer table for this pair only.
+    rx_buffers: IrqSafeSpinLock<Vec<Option<DmaBuffer>>>,
+    /// Holds DMA pages backing the desc/avail/used rings alive.
+    _rx_q_buf: DmaBuffer,
+    _tx_q_buf: DmaBuffer,
+    /// 12-byte virtio-net header scratch. Per-pair so concurrent
+    /// TX submissions on different pairs don't clobber each other's
+    /// header bytes mid-DMA.
+    tx_hdr_buf: DmaBuffer,
+    rx_qsize: u16,
+    tx_qsize: u16,
+    rx_notify_off: u16,
+    tx_notify_off: u16,
+}
 
 pub struct VirtioNetPci {
     common: VirtioRegion,
@@ -104,34 +157,24 @@ pub struct VirtioNetPci {
     /// `[0; 6]`, MTU to 1500, link assumed up in that case.
     device_cfg: Option<VirtioRegion>,
     notify_off_multiplier: u32,
-    rx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
-    tx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
-    rx_q_buf: DmaBuffer,
-    tx_q_buf: DmaBuffer,
-    /// RX descriptor → buffer table, indexed by virtqueue descriptor
-    /// head id (the value `Virtqueue::add_buffer` returns). Each slot
-    /// is `Some(buf)` while the device owns that descriptor; the
-    /// driver `take()`s the buffer in `rx_take()` to hand zero-copy
-    /// ownership to the network stack, then allocates a replacement
-    /// and refills the same head slot. Sized to `rx_qsize` so every
-    /// valid head index has a slot.
-    rx_buffers: IrqSafeSpinLock<alloc::vec::Vec<Option<DmaBuffer>>>,
-    /// TX scratch buffer. Holds the 12-byte virtio-net header that
-    /// gets chained in front of every TX descriptor; tx_dma points
-    /// the payload descriptor at the caller's DmaBuffer directly
-    /// (zero-copy from the stack-supplied page).
-    tx_buf: DmaBuffer,
-    rx_qsize: u16,
-    tx_qsize: u16,
-    rx_notify_off: u16,
-    tx_notify_off: u16,
-    /// IDT vector bound to receiveq (queue 0) when MSI-X is enabled.
-    /// `None` means polled-only completion. Consumers wait via
-    /// `narf_interrupts::wait_for_irq(v).await`.
+    /// Active RX/TX queue pairs. Always non-empty post-bring_up;
+    /// pair index 0 is the "primary" pair (still bound to MSI-X for
+    /// RX-arrival wakeups). Pairs 1..N rely on the 16 ms polling
+    /// fallback for now — per-queue MSI-X for MQ is a follow-up.
+    pairs: Vec<QueuePair>,
+    /// Round-robin TX-pair selector. `tx_dma` increments this then
+    /// mods by `pairs.len()` to pick which TX virtqueue gets the
+    /// next outbound frame. AtomicU64 to keep wraparound trivial
+    /// (overflow ~ 5 × 10^11 years at 1 Gpps); Relaxed because we
+    /// only need monotonic-ish, not coherence-with-data.
+    tx_rr: AtomicU64,
+    /// IDT vector bound to receiveq pair-0 (queue 0) when MSI-X is
+    /// enabled. `None` means polled-only completion. Consumers wait
+    /// via `narf_interrupts::wait_for_irq(v).await`.
     pub irq_vector: Option<u8>,
-    /// Per-queue MSI-X vector for TX completions. `None` =
-    /// caller hasn't called `enable_tx_msix` yet, TX uses
-    /// polled used-ring drain.
+    /// Per-queue MSI-X vector for TX completions on pair 0. `None`
+    /// = caller hasn't called `enable_tx_msix` yet, TX uses polled
+    /// used-ring drain.
     pub tx_irq_vector: Option<u8>,
     msix: Option<narf_bus::MsixTable>,
     pub ready: bool,
@@ -145,8 +188,12 @@ pub struct VirtioNetPci {
     /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
     /// the spec says treat link as always up.
     has_status: bool,
-    /// Control queue (queue 2 when `F_CTRL_VQ` negotiated and
-    /// `F_MQ` is not). `None` when the device didn't offer
+    /// Runtime control-queue index (VirtIO 1.2 §5.1.2): with F_MQ
+    /// negotiated and pairs > 1 the controlq sits at
+    /// `2 * num_pairs`; without F_MQ it sits at fixed index 2.
+    /// Stored so `submit_control` notifies the right queue.
+    ctrl_qidx: u16,
+    /// Control queue. `None` when the device didn't offer
     /// `F_CTRL_VQ`. Wrapped together with its scratch buffer +
     /// notify offset so callers can submit one command without
     /// trampolining through multiple locks.
@@ -185,8 +232,9 @@ impl core::fmt::Debug for VirtioNetPci {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VirtioNetPci")
             .field("ready", &self.ready)
-            .field("rx_qsize", &self.rx_qsize)
-            .field("tx_qsize", &self.tx_qsize)
+            .field("num_pairs", &self.pairs.len())
+            .field("rx_qsize", &self.pairs.first().map(|p| p.rx_qsize).unwrap_or(0))
+            .field("tx_qsize", &self.pairs.first().map(|p| p.tx_qsize).unwrap_or(0))
             .finish_non_exhaustive()
     }
 }
@@ -252,14 +300,20 @@ impl VirtioNetPci {
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
         let want_ctrl_vq = feats & (1u64 << VIRTIO_NET_F_CTRL_VQ) != 0;
+        // F_MQ requires F_CTRL_VQ (we can only command the device to
+        // enable a pair count through the control queue). Reject MQ
+        // when the device skipped F_CTRL_VQ — keeps the pair vector
+        // single-entry and avoids a control-queue-less code path.
+        let want_mq = (feats & (1u64 << VIRTIO_NET_F_MQ) != 0) && want_ctrl_vq;
         // All virtio-net F_* bits we care about live in the low
-        // 32 (max is F_CTRL_VQ = 17); only F_VERSION_1 = 32 is in
+        // 32 (max is F_MQ = 22); only F_VERSION_1 = 32 is in
         // the high half.
         let drv_lo = (1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32)
             | (1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32)
             | (1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32)
             | (1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32)
-            | (1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32);
+            | (1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32)
+            | (1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32);
         let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
         unsafe {
@@ -310,14 +364,67 @@ impl VirtioNetPci {
             }
             Ok((layout, buf, qsize, nof))
         };
-        let (rx_layout, rx_q_buf, rx_qsize, rx_notify_off) = size_q(RX_QUEUE)?;
-        let (tx_layout, tx_q_buf, tx_qsize, tx_notify_off) = size_q(TX_QUEUE)?;
-        // Control queue is queue 2 when F_CTRL_VQ was negotiated.
-        // Spec mandates the device exposes it at that index in
-        // that case; if size_q reports zero we treat it as not
-        // negotiated and skip.
+        // Map device-cfg now (pre-queue-setup) — we need it to
+        // peek `max_virtqueue_pairs` (§5.1.4) when F_MQ was
+        // negotiated. The same mapping is reused further down for
+        // MAC / MTU / link-status reads, so map_cap fires once.
+        let device_cfg = if let Some(cap) = caps.device_cfg.as_ref() {
+            // SAFETY: caller-owned device.
+            match unsafe { crate::pci::map_cap(device, cap) } {
+                Ok(r) => Some(r),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let mut max_pairs: u16 = 1;
+        if want_mq {
+            if let Some(r) = device_cfg.as_ref() {
+                // SAFETY: device-cfg region was just mapped; u16
+                // at offset 8 per §5.1.4.
+                let p = unsafe { r.read16(CFG_MAX_VIRTQUEUE_PAIRS) };
+                if p >= 1 {
+                    max_pairs = p.min(MAX_QUEUE_PAIRS);
+                }
+            }
+        }
+        let num_pairs: u16 = if want_mq { max_pairs.max(1) } else { 1 };
+
+        // Bring up `num_pairs` RX/TX pairs at virtqueue indices
+        // (0,1), (2,3), ..., (2N-2, 2N-1). The control queue (if
+        // F_CTRL_VQ negotiated) sits at index 2*num_pairs.
+        let mut pair_setups: Vec<(
+            VirtqueueLayout,
+            DmaBuffer,
+            u16,
+            u16,
+            VirtqueueLayout,
+            DmaBuffer,
+            u16,
+            u16,
+        )> = Vec::with_capacity(num_pairs as usize);
+        for n in 0..num_pairs {
+            let rxi = 2 * n;
+            let txi = 2 * n + 1;
+            let (rx_layout, rx_q_buf, rx_qsize, rx_notify_off) = size_q(rxi)?;
+            let (tx_layout, tx_q_buf, tx_qsize, tx_notify_off) = size_q(txi)?;
+            pair_setups.push((
+                rx_layout,
+                rx_q_buf,
+                rx_qsize,
+                rx_notify_off,
+                tx_layout,
+                tx_q_buf,
+                tx_qsize,
+                tx_notify_off,
+            ));
+        }
+        // Control queue is queue `2 * num_pairs` when F_CTRL_VQ was
+        // negotiated (§5.1.2). With F_MQ off, num_pairs == 1, so
+        // that's queue 2 — matches the legacy single-queue layout.
+        let ctrl_qidx: u16 = 2 * num_pairs;
         let ctrl_setup = if want_ctrl_vq {
-            match size_q(CTRL_QUEUE) {
+            match size_q(ctrl_qidx) {
                 Ok(t) => Some(t),
                 Err(_) => None,
             }
@@ -337,48 +444,79 @@ impl VirtioNetPci {
             );
         }
 
-        // SAFETY: Virtqueue::new wipes the layout regions; the
-        // backing pages may be recycled (alloc_frame doesn't zero).
-        let mut rx_q = unsafe { Virtqueue::new(rx_layout) };
-        // SAFETY: same.
-        let tx_q = unsafe { Virtqueue::new(tx_layout) };
+        // Build the per-pair Virtqueue instances and pre-populate
+        // each RX with RX_POOL_LEN empty buffers. Per-pair buffer
+        // tables so refills in `rx_take` find the slot they came
+        // from regardless of which pair handled the arrival.
+        let mut pairs: Vec<QueuePair> = Vec::with_capacity(num_pairs as usize);
+        for (
+            n,
+            (
+                rx_layout,
+                rx_q_buf,
+                rx_qsize,
+                rx_notify_off,
+                tx_layout,
+                tx_q_buf,
+                tx_qsize,
+                tx_notify_off,
+            ),
+        ) in pair_setups.into_iter().enumerate()
+        {
+            let rx_qidx = 2 * n as u16;
+            let tx_qidx = 2 * n as u16 + 1;
+            // SAFETY: Virtqueue::new wipes the layout regions; the
+            // backing pages may be recycled (alloc_frame doesn't zero).
+            let mut rx_q = unsafe { Virtqueue::new(rx_layout) };
+            // SAFETY: same.
+            let tx_q = unsafe { Virtqueue::new(tx_layout) };
 
-        // Pre-populate RX queue with empty buffers so the device has
-        // somewhere to land an incoming frame. The buffer table is
-        // indexed by virtqueue descriptor head id (what add_buffer
-        // returns) so rx_take can find + replace exactly the slot
-        // the device just filled, regardless of free-list order.
-        let mut rx_buffers: alloc::vec::Vec<Option<DmaBuffer>> =
-            (0..rx_qsize).map(|_| None).collect();
-        let posted = RX_POOL_LEN.min(rx_qsize as usize);
-        for _ in 0..posted {
-            let buf = alloc_coherent(4096, DomainId::DRIVER_0)
-                .map_err(|_| VirtioPciError::BarMapFailed)?;
-            let phys = buf.phys_addr().raw();
-            // One desc covering header + max frame, device-writable.
-            let descs = [VirtqDesc {
-                addr: phys,
-                len: MAX_FRAME as u32,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            }];
-            if let Some(head) = rx_q.add_buffer(&descs) {
-                rx_buffers[head as usize] = Some(buf);
+            let mut rx_buffers: Vec<Option<DmaBuffer>> = (0..rx_qsize).map(|_| None).collect();
+            let posted = RX_POOL_LEN.min(rx_qsize as usize);
+            for _ in 0..posted {
+                let buf = alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| VirtioPciError::BarMapFailed)?;
+                let phys = buf.phys_addr().raw();
+                let descs = [VirtqDesc {
+                    addr: phys,
+                    len: MAX_FRAME as u32,
+                    flags: VIRTQ_DESC_F_WRITE,
+                    next: 0,
+                }];
+                if let Some(head) = rx_q.add_buffer(&descs) {
+                    rx_buffers[head as usize] = Some(buf);
+                }
             }
-        }
 
-        // Notify device that RX has new buffers. Compute
-        // notify-register address from the captured offset.
-        let rx_off = (rx_notify_off as u64) * (notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            notify.write16(rx_off, RX_QUEUE);
-        }
+            // Kick the device about the freshly-posted RX buffers.
+            let rx_off = (rx_notify_off as u64) * (notify_off_multiplier as u64);
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped notify region.
+            unsafe {
+                notify.write16(rx_off, rx_qidx);
+            }
 
-        // Allocate the TX scratch.
-        let tx_buf =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+            // Per-pair TX header scratch. 4 KiB is overkill for 12
+            // bytes but matches the smallest DMA-coherent allocation
+            // granularity we have.
+            let tx_hdr_buf = alloc_coherent(4096, DomainId::DRIVER_0)
+                .map_err(|_| VirtioPciError::BarMapFailed)?;
+
+            pairs.push(QueuePair {
+                rx_qidx,
+                tx_qidx,
+                rx_queue: IrqSafeSpinLock::new(Some(rx_q)),
+                tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
+                rx_buffers: IrqSafeSpinLock::new(rx_buffers),
+                _rx_q_buf: rx_q_buf,
+                _tx_q_buf: tx_q_buf,
+                tx_hdr_buf,
+                rx_qsize,
+                tx_qsize,
+                rx_notify_off,
+                tx_notify_off,
+            });
+        }
 
         // Build the CtrlQueue handle now that we have the layout
         // tuple from the optional size_q call earlier.
@@ -398,18 +536,6 @@ impl VirtioNetPci {
             None => None,
         };
 
-        // Optional device-cfg region. Maps the same way virtio-input
-        // does — if the device skipped the Device cap (rare), we
-        // fall back to defaults.
-        let device_cfg = if let Some(cap) = caps.device_cfg.as_ref() {
-            // SAFETY: caller-owned device.
-            match unsafe { crate::pci::map_cap(device, cap) } {
-                Ok(r) => Some(r),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
         // Read MAC + MTU + status from device-cfg, gated on whether
         // the feature was negotiated. Spec: the corresponding field
         // is only valid when its feature was negotiated.
@@ -441,21 +567,13 @@ impl VirtioNetPci {
         // accessors don't need to re-read MMIO on every poll.
         let _ = link_up_init;
 
-        Ok(Self {
+        let mut this = Self {
             common,
             notify,
             device_cfg,
             notify_off_multiplier,
-            rx_queue: IrqSafeSpinLock::new(Some(rx_q)),
-            tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
-            rx_q_buf,
-            tx_q_buf,
-            rx_buffers: IrqSafeSpinLock::new(rx_buffers),
-            tx_buf,
-            rx_qsize,
-            tx_qsize,
-            rx_notify_off,
-            tx_notify_off,
+            pairs,
+            tx_rr: AtomicU64::new(0),
             irq_vector: None,
             tx_irq_vector: None,
             msix: None,
@@ -463,9 +581,35 @@ impl VirtioNetPci {
             mac,
             mtu,
             has_status: want_status,
+            ctrl_qidx,
             ctrl,
             cfg_phys,
-        })
+        };
+
+        // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
+        // how many queue pairs to actually use. Without this command
+        // the device defaults to a single pair even though we
+        // brought up more — frames would silently disappear from
+        // pairs 1..N. Best-effort: if the command fails (device
+        // refused, or no ctrl queue despite F_MQ being set, which
+        // shouldn't happen but isn't worth panicking over), fall
+        // back to using just pair 0.
+        if want_mq && num_pairs > 1 {
+            match this.submit_control(
+                VIRTIO_NET_CTRL_MQ,
+                VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                &num_pairs.to_le_bytes(),
+            ) {
+                Ok(VIRTIO_NET_OK) => {}
+                _ => {
+                    // Device rejected the MQ command. Truncate down
+                    // to a single pair — the extra rings stay
+                    // allocated but unused, which is fine for now.
+                    this.pairs.truncate(1);
+                }
+            }
+        }
+        Ok(this)
     }
 
     /// Phys address of this controller's PCIe config space. Used by
@@ -474,10 +618,12 @@ impl VirtioNetPci {
         self.cfg_phys
     }
 
-    /// Bind the receiveq (queue 0) to a fresh MSI-X vector. After
-    /// this call, frame-arrival is observable via
+    /// Bind the receiveq pair-0 (queue 0) to a fresh MSI-X vector.
+    /// After this call, frame-arrival on the primary pair is
+    /// observable via
     /// `narf_interrupts::wait_for_irq(self.irq_vector.unwrap())`.
-    /// The polled `rx()` path keeps working unchanged.
+    /// RX pairs 1..N rely on the 16 ms polling fallback in their
+    /// forwarders — per-queue MSI-X for the MQ case is a follow-up.
     ///
     /// # Safety
     /// Caller owns the device's BAR + cfg-space exclusively.
@@ -488,15 +634,14 @@ impl VirtioNetPci {
     ) -> Result<u8, VirtioPciError> {
         // SAFETY: caller-owns the device.
         let (v, table) =
-            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, RX_QUEUE) }?;
+            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 0) }?;
         self.irq_vector = Some(v);
         self.msix = Some(table);
         Ok(v)
     }
 
-    /// TX-queue MSI-X. Same shape as `enable_msix` but for the
-    /// TX virtqueue (queue index 1). Reuses the existing
-    /// `MsixTable` if RX MSI-X is already enabled — both
+    /// TX-queue MSI-X for pair 0 (queue index 1). Reuses the
+    /// existing `MsixTable` if RX MSI-X is already enabled — both
     /// vectors land on the same MSI-X table.
     ///
     /// # Safety
@@ -508,7 +653,7 @@ impl VirtioNetPci {
     ) -> Result<u8, VirtioPciError> {
         // SAFETY: caller-owns the device.
         let (v, table) =
-            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, TX_QUEUE) }?;
+            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 1) }?;
         self.tx_irq_vector = Some(v);
         // Replace the MSI-X table handle with the latest one
         // (enable_msix_queue allocates a fresh slot in the
@@ -516,6 +661,25 @@ impl VirtioNetPci {
         // and the new handle keeps both vectors live).
         self.msix = Some(table);
         Ok(v)
+    }
+
+    /// Number of active TX/RX queue pairs after `bring_up` (and
+    /// after the optional `VQ_PAIRS_SET` ack). Always ≥ 1.
+    pub fn num_pairs(&self) -> usize {
+        self.pairs.len()
+    }
+
+    /// Round-robin TX-pair pick. `tx_dma` calls this to spread
+    /// outbound frames across pairs without callers having to know
+    /// the pair count. Wraps via modulo — safe on overflow because
+    /// AtomicU64 wraps and modulo is unaffected by the wrap.
+    fn next_tx_pair(&self) -> usize {
+        // Relaxed: the only invariant is "two concurrent calls get
+        // different-ish indices over time". No data is published
+        // through this counter — the per-pair virtqueue lock is the
+        // real synchroniser.
+        let n = self.tx_rr.fetch_add(1, Ordering::Relaxed);
+        (n as usize) % self.pairs.len()
     }
 
     /// Transmit a frame backed by a caller-owned `DmaBuffer`.
@@ -527,6 +691,11 @@ impl VirtioNetPci {
     /// returns since the descriptor chain references its phys
     /// address.
     ///
+    /// Picks a TX pair via the round-robin selector. With
+    /// VIRTIO_NET_F_MQ negotiated and >1 pairs active, parallel
+    /// callers fan out across the device's TX virtqueues; with a
+    /// single pair the round-robin degenerates to "always pair 0".
+    ///
     /// Polled completion via `responsive_spin_until` so sleep_pumps
     /// keep advancing while the device drains.
     pub fn tx_dma(
@@ -535,6 +704,22 @@ impl VirtioNetPci {
         payload_offset: u32,
         payload_len: u32,
     ) -> Result<(), VirtioPciError> {
+        let pair_idx = self.next_tx_pair();
+        self.tx_dma_on(pair_idx, buf, payload_offset, payload_len)
+    }
+
+    /// Like `tx_dma` but submits on a specific pair. Used by the
+    /// TX forwarder (already picks the pair, doesn't need to
+    /// re-roll the round-robin) and by tests that want to exercise
+    /// a particular queue.
+    pub fn tx_dma_on(
+        &self,
+        pair_idx: usize,
+        buf: &DmaBuffer,
+        payload_offset: u32,
+        payload_len: u32,
+    ) -> Result<(), VirtioPciError> {
+        let pair = self.pairs.get(pair_idx).ok_or(VirtioPciError::NoQueues)?;
         let payload_offset = payload_offset as usize;
         let payload_len = payload_len as usize;
         if payload_len == 0 || payload_len > MAX_FRAME - 12 {
@@ -543,13 +728,11 @@ impl VirtioNetPci {
         if payload_offset.saturating_add(payload_len) > buf.len() {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        // virtio-net header lives in tx_buf at offset 0 — 12 bytes
-        // of zeros, no offload flags negotiated past F_CSUM (we
-        // don't request checksum offload on TX, just accept the
-        // feature).
-        let hdr_phys = self.tx_buf.phys_addr().raw();
+        // Per-pair header scratch keeps concurrent submissions on
+        // sibling pairs from racing on the same 12-byte region.
+        let hdr_phys = pair.tx_hdr_buf.phys_addr().raw();
         // SAFETY: identity-mapped DMA buffer; offset 0..12 within
-        // the 4 KiB tx_buf page.
+        // the 4 KiB tx_hdr_buf page.
         unsafe {
             for i in 0..12u64 {
                 core::ptr::write_volatile((hdr_phys + i) as *mut u8, 0);
@@ -572,15 +755,15 @@ impl VirtioNetPci {
             },
         ];
         let head = {
-            let mut g = self.tx_queue.lock();
+            let mut g = pair.tx_queue.lock();
             let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
             q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
         };
-        let off = (self.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
+        let off = (pair.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped.
         unsafe {
-            self.notify.write16(off, TX_QUEUE);
+            self.notify.write16(off, pair.tx_qidx);
         }
         // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
         // while waiting for the device to publish a used-ring entry.
@@ -588,7 +771,7 @@ impl VirtioNetPci {
         let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
-                    let mut g = self.tx_queue.lock();
+                    let mut g = pair.tx_queue.lock();
                     match g.as_mut() {
                         Some(q) => q.poll_used(),
                         None => {
@@ -607,18 +790,21 @@ impl VirtioNetPci {
         if !done {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let mut g = self.tx_queue.lock();
+        let mut g = pair.tx_queue.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);
         }
         Ok(())
     }
 
+    /// Queue size for the primary RX pair (pair 0). Kept as a
+    /// shorthand for tests that don't care about MQ specifics.
     pub fn rx_queue_size(&self) -> u16 {
-        self.rx_qsize
+        self.pairs.first().map(|p| p.rx_qsize).unwrap_or(0)
     }
+    /// Queue size for the primary TX pair (pair 0).
     pub fn tx_queue_size(&self) -> u16 {
-        self.tx_qsize
+        self.pairs.first().map(|p| p.tx_qsize).unwrap_or(0)
     }
 
     /// 48-bit hardware address. Zero when `VIRTIO_NET_F_MAC` wasn't
@@ -726,9 +912,11 @@ impl VirtioNetPci {
             .ok_or(VirtioPciError::QueueTooSmall)?;
         let notify_off = (g.notify_off as u64) * (self.notify_off_multiplier as u64);
         compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
+        // SAFETY: identity-mapped notify region. Notify the runtime
+        // controlq index — it shifts based on `num_pairs` when F_MQ
+        // is negotiated (§5.1.2).
         unsafe {
-            self.notify.write16(notify_off, CTRL_QUEUE);
+            self.notify.write16(notify_off, self.ctrl_qidx);
         }
         // Spin for completion while letting sleep_pumps tick.
         let done = narf_scheduler::responsive_spin_until(
@@ -774,20 +962,28 @@ impl VirtioNetPci {
         Ok(())
     }
 
-    /// Take ownership of one device-filled RX frame. Zero-copy:
-    /// returns the actual `DmaBuffer` the device wrote into +
-    /// total bytes (including the 12-byte virtio-net header).
-    /// Allocates a replacement buffer and re-posts it in the
-    /// avail ring before returning so the device always has a
+    /// Take ownership of one device-filled RX frame from pair 0.
+    /// Shorthand for `rx_take_on(0)`; kept for tests that don't
+    /// care about MQ specifics.
+    pub fn rx_take(&self) -> Option<(DmaBuffer, u32)> {
+        self.rx_take_on(0)
+    }
+
+    /// Take ownership of one device-filled RX frame from the given
+    /// pair. Zero-copy: returns the actual `DmaBuffer` the device
+    /// wrote into + total bytes (including the 12-byte virtio-net
+    /// header). Allocates a replacement buffer and re-posts it in
+    /// the avail ring before returning so the device always has a
     /// place to land the next frame.
     ///
-    /// Returns `None` if the used ring is empty or the
-    /// replacement allocation fails (in which case the original
-    /// stays in place — the device-filled buffer is not
-    /// surrendered until the refill is guaranteed).
-    pub fn rx_take(&self) -> Option<(DmaBuffer, u32)> {
+    /// Returns `None` if the pair index is out of range, the used
+    /// ring is empty, or the replacement allocation fails (in which
+    /// case the original stays in place — the device-filled buffer
+    /// is not surrendered until the refill is guaranteed).
+    pub fn rx_take_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
+        let pair = self.pairs.get(pair_idx)?;
         let elem = {
-            let mut g = self.rx_queue.lock();
+            let mut g = pair.rx_queue.lock();
             let q = g.as_mut()?;
             q.poll_used()
         };
@@ -803,17 +999,17 @@ impl VirtioNetPci {
         // descriptor chain, post the replacement, stash it under
         // its new head index.
         let original = {
-            let mut bufs = self.rx_buffers.lock();
+            let mut bufs = pair.rx_buffers.lock();
             bufs.get_mut(head as usize).and_then(|s| s.take())?
         };
         let new_head = {
-            let mut g = self.rx_queue.lock();
+            let mut g = pair.rx_queue.lock();
             let q = match g.as_mut() {
                 Some(q) => q,
                 None => {
                     // Queue vanished — return the original to its
                     // slot so we don't lose it.
-                    self.rx_buffers.lock()[head as usize] = Some(original);
+                    pair.rx_buffers.lock()[head as usize] = Some(original);
                     return None;
                 }
             };
@@ -832,24 +1028,24 @@ impl VirtioNetPci {
                     // original anyway — the stack already drained
                     // it logically.
                     drop(replacement);
-                    let off = (self.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
+                    let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
                     compiler_fence(Ordering::SeqCst);
                     // SAFETY: identity-mapped notify region.
                     unsafe {
-                        self.notify.write16(off, RX_QUEUE);
+                        self.notify.write16(off, pair.rx_qidx);
                     }
                     return Some((original, len));
                 }
             }
         };
         // Park the replacement in its slot for the next rx_take.
-        self.rx_buffers.lock()[new_head as usize] = Some(replacement);
+        pair.rx_buffers.lock()[new_head as usize] = Some(replacement);
         // Re-notify the device about the refill.
-        let off = (self.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
+        let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped notify region.
         unsafe {
-            self.notify.write16(off, RX_QUEUE);
+            self.notify.write16(off, pair.rx_qidx);
         }
         Some((original, len))
     }
@@ -922,17 +1118,33 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// Build a `VirtioNet` from the controller at `idx`, register it
 /// with `narf_net::registry()` under `name`, and spawn the RX/TX
 /// forwarder tasks scoped to that controller's index.
+///
+/// Forwarder shape with VIRTIO_NET_F_MQ:
+/// - One TX forwarder per device. Drains the iface tx_consumer once
+///   and demuxes each frame to one of N TX virtqueues via the
+///   controller's round-robin selector. Single-consumer of the
+///   `narf_ipc::Consumer<Frame>`; no lock contention on the consumer
+///   half (narf_ipc is SPSC and we hold the single S/C side).
+/// - N RX forwarders, one per pair. Each pair has its own used-ring
+///   to drain; pair 0 waits on MSI-X, pairs 1..N fall back to a
+///   16 ms poll. All N RX forwarders push into the same shared
+///   `Producer<Frame>`, behind an `Arc<IrqSafeSpinLock<...>>` —
+///   `narf_ipc::Producer` is `!Sync` so the lock is required to
+///   serialise the multiple producer halves. Push frequency is
+///   low (one short critical section per frame, no awaits held
+///   under the lock) so contention is bounded even on a 4-pair
+///   line-rate workload.
 fn register_net_interface(idx: usize, name: alloc::string::String) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
-    let (mac, mtu, link_up, irq_vector) = match with_at(idx, |c| {
-        (c.mac(), c.mtu(), c.link_up(), c.irq_vector)
+    let (mac, mtu, link_up, irq_vector, num_pairs) = match with_at(idx, |c| {
+        (c.mac(), c.mtu(), c.link_up(), c.irq_vector, c.num_pairs())
     }) {
         Some(t) => t,
         None => return,
     };
     let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
-    let (mut rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
     let iface =
         narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
     let authority = narf_net::bootstrap_authority();
@@ -944,50 +1156,92 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     if narf_net::registry().register(&authority, iface).is_err() {
         return;
     }
-    // RX forwarder: await this device's IRQ (or fall back to a
-    // 16 ms poll), drain every available frame via rx_take
-    // (zero-copy: we get the actual device-filled DmaBuffer +
-    // total length), wrap as a Frame whose payload starts at
-    // offset 12 (past the virtio-net header) and send through
-    // rx_prod. No memcpy on the data path.
-    narf_scheduler::spawn(async move {
-        const PUMP_CYCLES: u64 = 53_000_000;
-        loop {
-            if let Some(v) = irq_vector {
-                narf_interrupts::wait::wait_for_irq(v).await;
-            } else {
-                narf_time::sleep_cycles(PUMP_CYCLES).await;
-            }
+    // Wrap the rx_prod in an Arc<IrqSafeSpinLock> so all N RX
+    // forwarders can push to it. Producer is !Sync (narf_ipc SPSC);
+    // the lock serialises the N producer halves into one logical
+    // producer feeding the iface's RX ring.
+    let rx_prod = Arc::new(IrqSafeSpinLock::new(Some(rx_prod)));
+
+    // Spawn one RX forwarder per active pair.
+    for pair_idx in 0..num_pairs {
+        let rx_prod = Arc::clone(&rx_prod);
+        // Only pair 0 gets the MSI-X wakeup; pairs 1..N poll. See
+        // function-level comment for why we don't allocate per-queue
+        // MSI-X vectors yet.
+        let irq = if pair_idx == 0 { irq_vector } else { None };
+        narf_scheduler::spawn(async move {
+            const PUMP_CYCLES: u64 = 53_000_000;
             loop {
-                let taken = match with_at(idx, |c| c.rx_take()) {
-                    Some(t) => t,
-                    None => return, // controller vanished
-                };
-                let (buf, total_len) = match taken {
-                    Some(t) => t,
-                    None => break,
-                };
-                // virtio-net always prepends a 12-byte header to
-                // every RX frame. Strip it via Frame::with_offset
-                // — the bytes stay where the device wrote them.
-                let payload_len = (total_len as u32).saturating_sub(12);
-                if payload_len == 0 {
-                    // Empty frame (just header); drop it and keep
-                    // draining. `buf` frees on scope exit.
-                    continue;
+                if let Some(v) = irq {
+                    narf_interrupts::wait::wait_for_irq(v).await;
+                } else {
+                    narf_time::sleep_cycles(PUMP_CYCLES).await;
                 }
-                let frame = Frame::with_offset(buf, 12, payload_len);
-                if rx_prod.send(frame).await.is_err() {
-                    return;
+                loop {
+                    let taken = match with_at(idx, |c| c.rx_take_on(pair_idx)) {
+                        Some(t) => t,
+                        None => return, // controller vanished
+                    };
+                    let (buf, total_len) = match taken {
+                        Some(t) => t,
+                        None => break,
+                    };
+                    // virtio-net always prepends a 12-byte header to
+                    // every RX frame. Strip it via Frame::with_offset
+                    // — the bytes stay where the device wrote them.
+                    let payload_len = (total_len as u32).saturating_sub(12);
+                    if payload_len == 0 {
+                        // Empty frame (just header); drop it and keep
+                        // draining. `buf` frees on scope exit.
+                        continue;
+                    }
+                    let frame = Frame::with_offset(buf, 12, payload_len);
+                    // try_send-then-yield loop. We can't hold the
+                    // IrqSafeSpinLockGuard across an await (the guard
+                    // is !Send because it disables IRQs on lock), so
+                    // we drop the lock between full-ring retries and
+                    // yield the task to let the iface consumer drain.
+                    let mut frame_opt = Some(frame);
+                    loop {
+                        let outcome = {
+                            let mut g = rx_prod.lock();
+                            let prod = match g.as_mut() {
+                                Some(p) => p,
+                                None => return,
+                            };
+                            // try_send takes the value by-move; on
+                            // Full it hands the value back so we can
+                            // retry. Closed = consumer dropped, bail
+                            // out of this forwarder.
+                            match prod.try_send(frame_opt.take().unwrap()) {
+                                Ok(()) => Ok(()),
+                                Err(narf_ipc::TrySendError::Closed(_)) => {
+                                    *g = None;
+                                    return;
+                                }
+                                Err(narf_ipc::TrySendError::Full(f)) => {
+                                    frame_opt = Some(f);
+                                    Err(())
+                                }
+                            }
+                        };
+                        if outcome.is_ok() {
+                            break;
+                        }
+                        // Ring full — yield so the iface consumer
+                        // gets a chance to drain before we try again.
+                        narf_scheduler::yield_now().await;
+                    }
                 }
             }
-        }
-    });
-    // TX forwarder: drain the caller-facing Producer's Consumer
-    // peer, push each frame through this device's TX queue via
-    // the zero-copy tx_dma path — the payload descriptor points
-    // at the Frame's DmaBuffer directly. The 12-byte virtio-net
-    // header sits in the driver-owned tx_buf scratch.
+        });
+    }
+
+    // Single TX forwarder per device. Drains the tx_consumer once
+    // and round-robins each frame to one of the N TX virtqueues
+    // via the controller's `tx_dma` (which calls `next_tx_pair`).
+    // Zero-copy: the payload descriptor points at the Frame's
+    // DmaBuffer directly.
     narf_scheduler::spawn(async move {
         while let Ok(frame) = tx_cons.recv().await {
             let (buf, offset, len) = frame.into_parts_with_offset();

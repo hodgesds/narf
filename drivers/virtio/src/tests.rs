@@ -593,6 +593,49 @@ kernel_test_in!(
     smoke_virtio_net_pci_ctrl_vq_set_promisc
 );
 
+fn smoke_virtio_net_pci_mq_pairs_consistent() -> TestResult {
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    // After bring_up the controller should report ≥ 1 active pair.
+    // With F_MQ negotiated (qemu `-device virtio-net-pci,...,mq=on`)
+    // it should be 2..MAX_QUEUE_PAIRS; without F_MQ it's exactly 1.
+    // Either way, num_pairs > 0 and rx_take_on/tx_dma_on(0) must
+    // mirror the singleton rx_take/tx_dma behaviour.
+    let n = net_pci::with_controller(|c| c.num_pairs()).unwrap_or(0);
+    if n == 0 {
+        return TestResult::Fail("num_pairs == 0 — MQ negotiation broke bring_up");
+    }
+    // The primary-pair sizes used to be the only reported queue
+    // sizes; they should still match `rx_queue_size`/`tx_queue_size`.
+    let (rxs, txs) =
+        net_pci::with_controller(|c| (c.rx_queue_size(), c.tx_queue_size())).unwrap_or((0, 0));
+    if rxs == 0 || txs == 0 {
+        return TestResult::Fail("primary-pair queue sizes zero");
+    }
+    // tx_dma_on(0) should accept a small frame even with MQ active.
+    let mut buf = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
+        .expect("alloc tx scratch");
+    {
+        let s = buf.as_mut_slice();
+        for (i, b) in s.iter_mut().enumerate().take(64) {
+            *b = (i as u8).wrapping_mul(0x17);
+        }
+    }
+    let ok = net_pci::with_controller(|c| c.tx_dma_on(0, &buf, 0, 64))
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !ok {
+        return TestResult::Fail("tx_dma_on(0) rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_mq_pairs_consistent
+);
+
 // ── virtio-rng-pci / virtio-snd-pci / virtio-balloon-pci ───────────
 
 fn smoke_virtio_rng_pci_probe() -> TestResult {
