@@ -159,21 +159,40 @@ pub fn on_rx_frame(frame: &[u8]) {
 // task, so the spawned RX-pump task is frozen. This hook lets the
 // busy-waiter pull frames out of the NIC ring directly each
 // iteration so inbound replies actually reach the dispatch.
+//
+// Why a Vec instead of a single AtomicUsize slot: with both
+// virtio-net and e1000 attached (the standard test profile), each
+// driver registers its own drain at probe. A single-slot store
+// silently overwrites the earlier registration, so the busy-wait
+// drains only one NIC and replies arriving on the other ring
+// stall until the async forwarder gets CPU again — which never
+// happens while the syscall is parked. Fan-out per tick keeps
+// every NIC's ring serviced regardless of probe order.
 
 type DrainFn = fn() -> bool;
 
-static DRAIN_FN: AtomicUsize = AtomicUsize::new(0);
+static DRAIN_FNS: IrqSafeSpinLock<Vec<DrainFn>> = IrqSafeSpinLock::new(Vec::new());
 
 pub fn install_rx_drain(f: DrainFn) {
-    DRAIN_FN.store(f as usize, Ordering::Release);
+    let mut g = DRAIN_FNS.lock();
+    // De-dup: a driver re-probing shouldn't double-register and
+    // double-poll the same ring.
+    if !g.iter().any(|&existing| existing as usize == f as usize) {
+        g.push(f);
+    }
 }
 
-/// Drain-one-frame step. Returns true iff a frame was processed.
+/// Drain-one-frame step across every registered NIC. Returns true
+/// iff any drain produced a frame. We snapshot the fn list under
+/// the lock and release before invoking so a drain callback can
+/// safely re-enter the registry (e.g. to register another iface).
 pub fn drain_pump() -> bool {
-    let v = DRAIN_FN.load(Ordering::Acquire);
-    if v == 0 {
-        return false;
+    let fns: Vec<DrainFn> = DRAIN_FNS.lock().clone();
+    let mut any = false;
+    for f in fns {
+        if f() {
+            any = true;
+        }
     }
-    let f: DrainFn = unsafe { core::mem::transmute(v) };
-    f()
+    any
 }
