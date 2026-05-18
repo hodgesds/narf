@@ -51,8 +51,9 @@
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use narf_kernel_test::kernel_test_in;
 use narf_lib::percpu::{current_cpu, MAX_CPUS};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -138,6 +139,13 @@ unsafe impl Sync for Magazine {}
 /// Per-size-class state. Central free-list head is behind a
 /// spin-lock; the magazine array gives each CPU a fast path that
 /// doesn't touch the lock until the magazine empties or fills.
+///
+/// The `mag_hit_count` / `mag_miss_count` counters are the
+/// observability surface Bonwick & Adams (2001) §4 ("Object
+/// Caching with Per-CPU Magazines") describes as essential for
+/// validating that the magazine layer is actually pulling its
+/// weight: contention only matters when misses dominate, so
+/// the ratio is what tuning runs key on.
 struct SizeClass {
     head: IrqSafeSpinLock<Option<NonNull<FreeBlock>>>,
     /// Total blocks ever produced by this class (alloc-backed).
@@ -146,6 +154,15 @@ struct SizeClass {
     in_use: AtomicUsize,
     /// Per-CPU magazines. Indexed by `current_cpu()`.
     magazines: [Magazine; MAX_CPUS],
+    /// Number of alloc / free operations served entirely from a
+    /// per-CPU magazine (the lock-free fast path). Summed across
+    /// CPUs via `Relaxed` — readers don't need a coherent snapshot,
+    /// just a monotonic counter that survives wraparound at the
+    /// 64-bit horizon.
+    mag_hit_count: AtomicU64,
+    /// Number of alloc / free operations that missed the magazine
+    /// and had to touch the central lock (or grow a fresh frame).
+    mag_miss_count: AtomicU64,
 }
 
 impl SizeClass {
@@ -155,6 +172,8 @@ impl SizeClass {
             grown: AtomicUsize::new(0),
             in_use: AtomicUsize::new(0),
             magazines: [const { Magazine::new() }; MAX_CPUS],
+            mag_hit_count: AtomicU64::new(0),
+            mag_miss_count: AtomicU64::new(0),
         }
     }
 }
@@ -267,11 +286,15 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
     // touches its own magazine cell.
     let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
     if mag.top == 0 {
+        // Atomic path never touches the central lock, so an empty
+        // magazine is a permanent miss for this caller.
+        class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     mag.top -= 1;
     let blk = mag.stack[mag.top].take().expect("magazine top non-null");
     class.in_use.fetch_add(1, Ordering::Relaxed);
+    class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
     Some(blk.cast())
 }
 
@@ -300,11 +323,15 @@ pub unsafe fn try_dealloc_atomic(
     // SAFETY: per-CPU access invariant.
     let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
     if mag.top >= MAG_SIZE {
+        // Full magazine in atomic context — we can't drain to the
+        // central lock here, so count this as a miss for the caller.
+        class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
         return Err(AtomicDeallocFull);
     }
     mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
     mag.top += 1;
     class.in_use.fetch_sub(1, Ordering::Relaxed);
+    class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -325,8 +352,13 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         mag.top -= 1;
         let blk = mag.stack[mag.top].take().expect("magazine top non-null");
         class.in_use.fetch_add(1, Ordering::Relaxed);
+        class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
         return Ok(blk.cast());
     }
+    // Magazine empty — every path from here touches the central
+    // lock (refill) or the buddy (grow). Count once per miss event,
+    // not per block batched-in.
+    class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
 
     // SLOW PATH 1: refill the magazine from the central free list.
     // Take up to MAG_SIZE/2 blocks under one lock acquisition so
@@ -400,8 +432,11 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
         mag.top += 1;
         class.in_use.fetch_sub(1, Ordering::Relaxed);
+        class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    // Magazine full — we have to spill to the central list.
+    class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
 
     // SLOW PATH: magazine full. Flush the bottom half back to the
     // central free list, compact the top half down, then push the
@@ -472,6 +507,22 @@ pub struct ClassStats {
     pub block_size: usize,
     pub grown: usize,
     pub in_use: usize,
+    /// Alloc / free operations served from a per-CPU magazine.
+    /// Bonwick & Adams (2001) §4: the magazine layer's value
+    /// proposition is hit-count / (hit + miss); read this through
+    /// `MagazineStats` for the cross-class total.
+    pub mag_hit_count: u64,
+    /// Alloc / free operations that had to touch the central lock.
+    pub mag_miss_count: u64,
+}
+
+/// Cross-class magazine totals. Folded out of `ClassStats` for the
+/// common observability case (hit-rate dashboards don't care which
+/// size class a hit came from).
+#[derive(Copy, Clone, Debug)]
+pub struct MagazineStats {
+    pub mag_hit_count: u64,
+    pub mag_miss_count: u64,
 }
 
 /// Snapshot of all size classes + the large-alloc counter.
@@ -486,17 +537,36 @@ pub fn stats() -> SlabStats {
         block_size: 0,
         grown: 0,
         in_use: 0,
+        mag_hit_count: 0,
+        mag_miss_count: 0,
     }; N_CLASSES];
     for (i, c) in CLASSES.iter().enumerate() {
         classes[i] = ClassStats {
             block_size: class_size(i),
             grown: c.grown.load(Ordering::Relaxed),
             in_use: c.in_use.load(Ordering::Relaxed),
+            mag_hit_count: c.mag_hit_count.load(Ordering::Relaxed),
+            mag_miss_count: c.mag_miss_count.load(Ordering::Relaxed),
         };
     }
     SlabStats {
         classes,
         large_in_use: LARGE_IN_USE.load(Ordering::Relaxed),
+    }
+}
+
+/// Magazine hit / miss totals summed across every size class.
+/// O(N_CLASSES); cheap enough for periodic observability scrapes.
+pub fn magazine_stats() -> MagazineStats {
+    let mut hits: u64 = 0;
+    let mut misses: u64 = 0;
+    for c in CLASSES.iter() {
+        hits = hits.wrapping_add(c.mag_hit_count.load(Ordering::Relaxed));
+        misses = misses.wrapping_add(c.mag_miss_count.load(Ordering::Relaxed));
+    }
+    MagazineStats {
+        mag_hit_count: hits,
+        mag_miss_count: misses,
     }
 }
 
@@ -510,3 +580,321 @@ pub const fn num_classes() -> usize {
 pub const fn max_class_size() -> usize {
     class_size(N_CLASSES - 1)
 }
+
+// ───────────────────────────────────────────────────────────────────
+// Per-CPU magazine smokes.
+//
+// Tests live alongside the implementation rather than in
+// `memory/src/tests.rs` so the magazine-isolation cases can reach
+// `CLASSES[c].magazines[cpu]` directly — `current_cpu()` is the
+// only public entry point and Stage-2 hard-pins it to CPU 0, so
+// validating isolation at the `current_cpu()` level alone wouldn't
+// actually exercise the per-CPU split. Touching `magazines[other]`
+// directly here proves the data structure itself isolates state.
+// ───────────────────────────────────────────────────────────────────
+
+/// Test helper: peek at the magazine occupancy for `(class, cpu)`.
+/// Reads under the per-CPU access invariant — only safe to call
+/// from a single-threaded test harness or with external evidence
+/// that `cpu` is quiesced.
+#[doc(hidden)]
+pub fn _test_magazine_top(class_idx: usize, cpu: usize) -> usize {
+    assert!(class_idx < N_CLASSES);
+    assert!(cpu < MAX_CPUS);
+    // SAFETY: the test harness runs single-threaded with
+    // current_cpu() == 0, so peeking another CPU's slot is not
+    // concurrent with any other reader / writer.
+    let mag = unsafe { &*CLASSES[class_idx].magazines[cpu].inner.get() };
+    mag.top
+}
+
+/// Test helper: forcibly push a block into the magazine for
+/// `(class_idx, cpu)`. Used by the isolation smoke to confirm
+/// state planted on CPU N stays put while allocs flow through
+/// CPU 0's slot.
+///
+/// # Safety
+/// `ptr` must reference a free block previously vended by the same
+/// size class. Caller is responsible for not double-pushing the
+/// same block and for ensuring the slot has room (`top < MAG_SIZE`).
+#[doc(hidden)]
+pub unsafe fn _test_magazine_push(class_idx: usize, cpu: usize, ptr: NonNull<u8>) {
+    assert!(class_idx < N_CLASSES);
+    assert!(cpu < MAX_CPUS);
+    // SAFETY: per-CPU access invariant — caller guarantees the
+    // target slot is quiesced; tests run single-threaded.
+    let mag = unsafe { &mut *CLASSES[class_idx].magazines[cpu].inner.get() };
+    assert!(mag.top < MAG_SIZE);
+    mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
+    mag.top += 1;
+    // Mirror the accounting that `dealloc_class` would have done
+    // if this push had come through the public path.
+    CLASSES[class_idx]
+        .in_use
+        .fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Test: per-CPU isolation. After parking a freed block in CPU 1's
+/// magazine slot, allocations driven through the active CPU
+/// (CPU 0) must NOT pop that block — the active CPU's magazine
+/// is empty, so it has to refill from the central list. Verifies
+/// the data-structure split actually keeps state segregated.
+fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(64, 16).expect("layout");
+    let class_idx = class_for(64).expect("class");
+
+    // Allocate, then plant the resulting block into CPU 1's
+    // magazine slot. CPU 0's magazine stays untouched.
+    let stolen = match alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("seed alloc failed"),
+    };
+    let cpu1_top_before = _test_magazine_top(class_idx, 1);
+    if cpu1_top_before >= MAG_SIZE {
+        // Pre-existing test from this run already filled CPU 1's
+        // slot; skip cleanly rather than scribble over it.
+        // SAFETY: matching layout.
+        unsafe { dealloc(stolen, layout) };
+        return TestResult::Pass;
+    }
+    // SAFETY: just allocated from the same class.
+    unsafe { _test_magazine_push(class_idx, 1, stolen) };
+    let cpu1_top_after = _test_magazine_top(class_idx, 1);
+    if cpu1_top_after != cpu1_top_before + 1 {
+        return TestResult::Fail("planted block didn't land in CPU 1 slot");
+    }
+
+    // Now drain CPU 0's magazine so the next alloc is forced to
+    // touch the central list — if CPU 1's slot leaked into the
+    // active path, the planted block would come back.
+    let mut drained: alloc::vec::Vec<NonNull<u8>> = alloc::vec::Vec::new();
+    while _test_magazine_top(class_idx, 0) > 0 {
+        match alloc(layout) {
+            Ok(p) => drained.push(p),
+            Err(_) => return TestResult::Fail("drain alloc failed"),
+        }
+    }
+
+    // Allocate a fresh block. It must NOT be the one we planted
+    // in CPU 1's slot.
+    let fresh = match alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("fresh alloc failed"),
+    };
+    if fresh.as_ptr() == stolen.as_ptr() {
+        return TestResult::Fail("CPU 1's magazine bled into CPU 0's alloc path");
+    }
+    if _test_magazine_top(class_idx, 1) != cpu1_top_after {
+        return TestResult::Fail("CPU 1 slot mutated by CPU 0 alloc");
+    }
+
+    // Cleanup: free the fresh block + drained blocks.
+    // SAFETY: blocks just returned from alloc with matching layout.
+    unsafe {
+        dealloc(fresh, layout);
+        for p in drained {
+            dealloc(p, layout);
+        }
+    }
+    // Manually pop the planted block from CPU 1's slot and re-park
+    // it on the central free list. The `_test_magazine_push` helper
+    // already decremented in_use, so the block is in "free,
+    // available" accounting state — just move it from CPU 1's
+    // magazine to central.
+    // SAFETY: single-threaded test harness; CPU 1 is quiesced.
+    let class = &CLASSES[class_idx];
+    let mag = unsafe { &mut *class.magazines[1].inner.get() };
+    mag.top -= 1;
+    let blk = mag.stack[mag.top].take().expect("planted block present");
+    let mut g = class.head.lock();
+    // SAFETY: `blk` came from this slab's class; we own its bytes
+    // until pushed onto the central list.
+    unsafe { blk.as_ptr().cast::<FreeBlock>().write(FreeBlock { next: *g }) };
+    *g = Some(blk);
+    drop(g);
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_magazine_per_cpu_isolation);
+
+/// Test: magazine spill to global. Push more than `MAG_SIZE`
+/// blocks back into the per-CPU magazine in quick succession;
+/// the dealloc path must spill half to the central list and the
+/// `mag_miss_count` must advance for the spill event.
+fn smoke_slab_magazine_spill_to_global() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(128, 16).expect("layout");
+    let class_idx = class_for(128).expect("class");
+    let class = &CLASSES[class_idx];
+
+    // Drain CPU 0's magazine first so we know exactly how many
+    // free-side pushes it takes to fill + spill.
+    let mut drained: alloc::vec::Vec<NonNull<u8>> = alloc::vec::Vec::new();
+    while _test_magazine_top(class_idx, 0) > 0 {
+        match alloc(layout) {
+            Ok(p) => drained.push(p),
+            Err(_) => return TestResult::Fail("drain alloc failed"),
+        }
+    }
+
+    // Allocate more than MAG_SIZE blocks so freeing them all in
+    // a row forces at least one spill.
+    let n = MAG_SIZE + 4;
+    let mut ptrs: alloc::vec::Vec<NonNull<u8>> = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        match alloc(layout) {
+            Ok(p) => ptrs.push(p),
+            Err(_) => return TestResult::Fail("alloc failed"),
+        }
+    }
+
+    let misses_before = class.mag_miss_count.load(Ordering::Relaxed);
+    // SAFETY: layout matches the alloc.
+    unsafe {
+        for p in ptrs {
+            dealloc(p, layout);
+        }
+    }
+    let misses_after = class.mag_miss_count.load(Ordering::Relaxed);
+
+    if misses_after <= misses_before {
+        return TestResult::Fail("spill didn't bump mag_miss_count");
+    }
+    // After spill + push, CPU 0's magazine is bounded by MAG_SIZE.
+    if _test_magazine_top(class_idx, 0) > MAG_SIZE {
+        return TestResult::Fail("magazine top exceeded MAG_SIZE");
+    }
+    // SAFETY: drained vec entries are matching layout.
+    unsafe {
+        for p in drained {
+            dealloc(p, layout);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_magazine_spill_to_global);
+
+/// Test: magazine refill from global. After deliberately draining
+/// the magazine + flushing some blocks to the central list, the
+/// next alloc on an empty magazine must refill from central
+/// (not grow a fresh frame) and bump `mag_miss_count` exactly
+/// once for the refill event.
+fn smoke_slab_magazine_refill_from_global() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(256, 16).expect("layout");
+    let class_idx = class_for(256).expect("class");
+    let class = &CLASSES[class_idx];
+
+    // Step 1: produce many blocks so the central list has stock.
+    // 32 * 256 B > one page worth (16 blocks/page), so the class
+    // grows and the central list accumulates spillover.
+    let n_prime = 32;
+    let mut prime: alloc::vec::Vec<NonNull<u8>> = alloc::vec::Vec::with_capacity(n_prime);
+    for _ in 0..n_prime {
+        match alloc(layout) {
+            Ok(p) => prime.push(p),
+            Err(_) => return TestResult::Fail("prime alloc failed"),
+        }
+    }
+    // SAFETY: same layout.
+    unsafe {
+        for p in prime {
+            dealloc(p, layout);
+        }
+    }
+
+    // Step 2: drain the magazine so the next alloc forces a refill.
+    let mut drained: alloc::vec::Vec<NonNull<u8>> = alloc::vec::Vec::new();
+    while _test_magazine_top(class_idx, 0) > 0 {
+        match alloc(layout) {
+            Ok(p) => drained.push(p),
+            Err(_) => return TestResult::Fail("drain alloc failed"),
+        }
+    }
+
+    let grown_before = class.grown.load(Ordering::Relaxed);
+    let misses_before = class.mag_miss_count.load(Ordering::Relaxed);
+
+    // Step 3: one alloc on an empty magazine — must refill.
+    let p = match alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("refill alloc failed"),
+    };
+
+    let grown_after = class.grown.load(Ordering::Relaxed);
+    let misses_after = class.mag_miss_count.load(Ordering::Relaxed);
+
+    if grown_after != grown_before {
+        return TestResult::Fail("refill grew a fresh frame instead of using central stock");
+    }
+    if misses_after != misses_before + 1 {
+        return TestResult::Fail("refill should bump mag_miss_count exactly once");
+    }
+
+    // SAFETY: matching layout.
+    unsafe {
+        dealloc(p, layout);
+        for q in drained {
+            dealloc(q, layout);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_magazine_refill_from_global);
+
+/// Test: hit-rate counters advance under steady-state churn. With
+/// the magazine warm, ≥ `MAG_SIZE` consecutive alloc/free pairs of
+/// the same class should produce zero new misses and many hits.
+/// Also confirms `magazine_stats()` aggregates across classes.
+fn smoke_slab_magazine_stats_counters() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(32, 16).expect("layout");
+    let class_idx = class_for(32).expect("class");
+    let class = &CLASSES[class_idx];
+
+    // Warm the magazine: one round-trip ensures CPU 0's magazine
+    // has stock so the steady-state loop never misses.
+    let warm = match alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("warm alloc failed"),
+    };
+    // SAFETY: matching layout.
+    unsafe { dealloc(warm, layout) };
+
+    let hits_before = class.mag_hit_count.load(Ordering::Relaxed);
+    let misses_before = class.mag_miss_count.load(Ordering::Relaxed);
+    let agg_before = magazine_stats();
+
+    // Steady-state loop: alloc + free in lockstep so the magazine
+    // top oscillates between K and K+1; every operation should
+    // be a magazine hit.
+    let iters = 256;
+    for _ in 0..iters {
+        let p = match alloc(layout) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("hot alloc failed"),
+        };
+        // SAFETY: matching layout.
+        unsafe { dealloc(p, layout) };
+    }
+
+    let hits_after = class.mag_hit_count.load(Ordering::Relaxed);
+    let misses_after = class.mag_miss_count.load(Ordering::Relaxed);
+    let agg_after = magazine_stats();
+
+    let hits_delta = hits_after - hits_before;
+    let misses_delta = misses_after - misses_before;
+    if hits_delta < (iters as u64) * 2 {
+        // 2 hits per iteration (alloc + free) when steady.
+        return TestResult::Fail("hit-count didn't track steady-state churn");
+    }
+    if misses_delta != 0 {
+        return TestResult::Fail("steady-state churn produced unexpected misses");
+    }
+    // Aggregate must monotonically advance and reflect the delta.
+    if agg_after.mag_hit_count < agg_before.mag_hit_count + hits_delta {
+        return TestResult::Fail("magazine_stats() didn't aggregate per-class hits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_magazine_stats_counters);
