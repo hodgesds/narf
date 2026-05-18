@@ -75,6 +75,11 @@ const REL_WHEEL: u16 = 8;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
+const BTN_FORWARD: u16 = 0x115;
+const BTN_BACK: u16 = 0x116;
+const BTN_TASK: u16 = 0x117;
 // BTN_TOUCH is the "any finger is on the digitiser" signal. Tablets
 // emit it alongside ABS_X/ABS_Y to mark proximity / contact. We
 // don't pipe it to PointerButtons (a tap isn't a left-click);
@@ -86,6 +91,23 @@ const BTN_TOUCH: u16 = 0x14a;
 /// touchscreens cap at 10 simultaneous contacts. Higher slot
 /// indices coming off the wire are silently dropped.
 const MAX_MT_SLOTS: usize = 10;
+
+// virtio-input device-config selector codes (VirtIO 1.2 §5.8.4).
+const CFG_ID_NAME: u8 = 0x01;
+const CFG_EV_BITS: u8 = 0x11;
+const CFG_ABS_INFO: u8 = 0x12;
+
+// Device-config register offsets (within the device-cfg cap).
+const CFG_SELECT: u64 = 0x00;
+const CFG_SUBSEL: u64 = 0x01;
+const CFG_SIZE: u64 = 0x02;
+const CFG_PAYLOAD: u64 = 0x08;
+const CFG_PAYLOAD_MAX: usize = 128;
+
+/// Largest `ABS_*` axis code we track bounds for. Covers everything
+/// through the MT range (ABS_MT_TOOL_Y = 0x3D). Codes above are
+/// device-specific and rare enough to skip until needed.
+const ABS_BOUNDS_LEN: usize = 0x40;
 
 /// Per-slot state for evdev multi-touch protocol B. We mirror the
 /// axes the device writes (`ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X
@@ -106,6 +128,82 @@ struct MtSlot {
     dirty: bool,
 }
 
+/// Read the (`select`, `subsel`) device-config block. Writes the
+/// selector pair, samples `size`, and copies up to `size` bytes
+/// (capped at the 128-byte payload window) into `out`. Returns the
+/// number of bytes actually copied.
+///
+/// # Safety
+/// `region` must be a live virtio-input device-cfg mapping.
+unsafe fn read_cfg(
+    region: &crate::pci::VirtioRegion,
+    select: u8,
+    subsel: u8,
+    out: &mut [u8],
+) -> usize {
+    // SAFETY: caller-asserted; offsets within the 8-byte cfg header.
+    unsafe {
+        region.write8(CFG_SELECT, select);
+        region.write8(CFG_SUBSEL, subsel);
+    }
+    // Devices need a moment to populate the payload window. We
+    // re-read `size` to determine validity — virtio-input's contract
+    // is that `size > 0` indicates the data at `u` is valid for the
+    // current (`select`, `subsel`).
+    // SAFETY: same.
+    let size = unsafe { region.read8(CFG_SIZE) } as usize;
+    let take = size.min(CFG_PAYLOAD_MAX).min(out.len());
+    for i in 0..take {
+        // SAFETY: payload window is exactly CFG_PAYLOAD_MAX bytes.
+        out[i] = unsafe { region.read8(CFG_PAYLOAD + i as u64) };
+    }
+    take
+}
+
+/// Read the device name + per-axis bounds. Returns the (name,
+/// axis_info[]) pair. Best-effort — missing selectors leave fields
+/// empty / `None`. Called once at probe.
+///
+/// # Safety
+/// `region` must be a live virtio-input device-cfg mapping.
+unsafe fn read_device_metadata(
+    region: &crate::pci::VirtioRegion,
+) -> (alloc::string::String, [Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN]) {
+    // Name: ASCII, null-padded. Trim trailing NULs + non-printable.
+    let mut name_buf = [0u8; 128];
+    // SAFETY: caller-asserted.
+    let n = unsafe { read_cfg(region, CFG_ID_NAME, 0, &mut name_buf) };
+    let trimmed = &name_buf[..n];
+    let stop = trimmed
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(trimmed.len());
+    let name = alloc::string::String::from_utf8_lossy(&trimmed[..stop]).into_owned();
+
+    // EV_BITS for EV_ABS tells us which axes have abs-info to read.
+    let mut ev_abs_bits = [0u8; 128];
+    // SAFETY: same. EV_ABS = 3 (Linux input-event-codes.h).
+    let nbits = unsafe { read_cfg(region, CFG_EV_BITS, 3, &mut ev_abs_bits) };
+    let mut axis_info = [None; ABS_BOUNDS_LEN];
+    for axis in 0..ABS_BOUNDS_LEN {
+        let byte = axis / 8;
+        let bit = axis % 8;
+        if byte >= nbits {
+            break;
+        }
+        if (ev_abs_bits[byte] >> bit) & 1 == 0 {
+            continue;
+        }
+        let mut abs_buf = [0u8; 20];
+        // SAFETY: same.
+        let got = unsafe { read_cfg(region, CFG_ABS_INFO, axis as u8, &mut abs_buf) };
+        if got >= 20 {
+            axis_info[axis] = narf_input::AxisInfo::from_virtio_absinfo(&abs_buf);
+        }
+    }
+    (name, axis_info)
+}
+
 #[derive(Debug)]
 struct Queues {
     event_q: Virtqueue,
@@ -119,6 +217,20 @@ struct Queues {
 pub struct VirtioInputPci {
     notify: crate::pci::VirtioRegion,
     common: crate::pci::VirtioRegion,
+    /// Device-specific config region (VirtIO 1.2 §5.8.4). Holds the
+    /// `select`/`subsel`/`size` selector + 128-byte payload window.
+    /// `None` when the device didn't expose a Device cfg cap —
+    /// older QEMU builds skip it for virtio-multitouch and the
+    /// driver carries on without axis bounds in that case.
+    device_cfg: Option<crate::pci::VirtioRegion>,
+    /// Human-readable device name pulled from
+    /// `VIRTIO_INPUT_CFG_ID_NAME` at probe. Empty when the cap
+    /// wasn't present or the device left the field blank.
+    name: alloc::string::String,
+    /// Per-axis bounds. Indexed by ABS_* code; `Some` for axes the
+    /// device advertised through `VIRTIO_INPUT_CFG_ABS_INFO`. Read
+    /// once at probe — virtio-input devices don't renegotiate.
+    axis_info: [Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
     notify_off_multiplier: u32,
     queues: IrqSafeSpinLock<Option<Queues>>,
     rx_buf: DmaBuffer,
@@ -343,9 +455,31 @@ impl VirtioInputPci {
             notify.write16(off, 0);
         }
 
+        // Device-specific config region (optional). Used after
+        // DRIVER_OK so the device is in its operating state for
+        // any spec-defined config-read interactions.
+        let device_cfg = if let Some(cap) = caps.device_cfg.as_ref() {
+            // SAFETY: caller-owned device.
+            match unsafe { map_cap(device, cap) } {
+                Ok(r) => Some(r),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let (name, axis_info) = match device_cfg.as_ref() {
+            // SAFETY: device-cfg region was just mapped; read_cfg
+            // bounds-checks every offset.
+            Some(r) => unsafe { read_device_metadata(r) },
+            None => (alloc::string::String::new(), [None; ABS_BOUNDS_LEN]),
+        };
+
         Ok(Self {
             notify,
             common,
+            device_cfg,
+            name,
+            axis_info,
             notify_off_multiplier,
             queues: IrqSafeSpinLock::new(Some(Queues {
                 event_q,
@@ -379,6 +513,24 @@ impl VirtioInputPci {
         self.irq_vector = Some(v);
         self.msix = Some(table);
         Ok(v)
+    }
+
+    /// Device's reported human-readable name (e.g. "QEMU Virtio
+    /// Tablet"). Empty when the device didn't expose a Device cfg
+    /// cap or left `VIRTIO_INPUT_CFG_ID_NAME` blank.
+    pub fn device_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Bounds + filter parameters the device advertised for `axis`.
+    /// Returns `None` for axes the device doesn't expose or that
+    /// fall outside the tracked `ABS_*` range.
+    pub fn axis_info(&self, axis: u16) -> Option<narf_input::AxisInfo> {
+        let idx = axis as usize;
+        if idx >= ABS_BOUNDS_LEN {
+            return None;
+        }
+        self.axis_info[idx]
     }
 
     /// Take the accumulated REL_X / REL_Y delta since last read.
@@ -436,6 +588,11 @@ impl VirtioInputPci {
                         BTN_LEFT => Some(PointerButtons::LEFT),
                         BTN_RIGHT => Some(PointerButtons::RIGHT),
                         BTN_MIDDLE => Some(PointerButtons::MIDDLE),
+                        BTN_SIDE => Some(PointerButtons::SIDE),
+                        BTN_EXTRA => Some(PointerButtons::EXTRA),
+                        BTN_FORWARD => Some(PointerButtons::FORWARD),
+                        BTN_BACK => Some(PointerButtons::BACK),
+                        BTN_TASK => Some(PointerButtons::TASK),
                         _ => None,
                     };
                     if let Some(b) = btn {
@@ -679,6 +836,11 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                     BTN_LEFT => Some(PointerButtons::LEFT),
                     BTN_RIGHT => Some(PointerButtons::RIGHT),
                     BTN_MIDDLE => Some(PointerButtons::MIDDLE),
+                    BTN_SIDE => Some(PointerButtons::SIDE),
+                    BTN_EXTRA => Some(PointerButtons::EXTRA),
+                    BTN_FORWARD => Some(PointerButtons::FORWARD),
+                    BTN_BACK => Some(PointerButtons::BACK),
+                    BTN_TASK => Some(PointerButtons::TASK),
                     _ => None,
                 };
                 if let Some(b) = btn {

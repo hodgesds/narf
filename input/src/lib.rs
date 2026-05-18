@@ -398,10 +398,20 @@ pub struct PointerEvent {
 }
 
 bitflags_like! {
+    /// Mouse-button bitset. Bits 0..=2 are the canonical
+    /// three-button mouse; 3..=7 cover gaming-mouse / virtio-mouse
+    /// extras emitted as Linux evdev `BTN_SIDE` / `BTN_EXTRA` /
+    /// `BTN_FORWARD` / `BTN_BACK` / `BTN_TASK`. Producers that
+    /// only know LEFT/RIGHT/MIDDLE leave the high bits clear.
     pub struct PointerButtons: u8 {
-        const LEFT   = 1 << 0;
-        const RIGHT  = 1 << 1;
-        const MIDDLE = 1 << 2;
+        const LEFT    = 1 << 0;
+        const RIGHT   = 1 << 1;
+        const MIDDLE  = 1 << 2;
+        const SIDE    = 1 << 3;
+        const EXTRA   = 1 << 4;
+        const FORWARD = 1 << 5;
+        const BACK    = 1 << 6;
+        const TASK    = 1 << 7;
     }
 }
 
@@ -451,6 +461,54 @@ pub struct TouchEvent {
     pub x: i32,
     pub y: i32,
     pub pressure: i32,
+}
+
+/// Per-axis bounds + filter parameters. Drivers cache one of these
+/// per `ABS_*` axis the device exposes; consumers (tablet cursors,
+/// joystick stick mappers) use them to normalise raw
+/// `AbsoluteEvent::value` into screen / unit-circle coordinates
+/// without baking in device-specific assumptions.
+///
+/// Mirrors Linux `struct input_absinfo`, with the runtime
+/// `value` field intentionally omitted — the latest sample lives
+/// in the event stream, not in the bounds record.
+///
+/// `res` is in axis-units-per-mm (per Linux uapi); `0` means the
+/// device didn't advertise a resolution.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct AxisInfo {
+    pub min: i32,
+    pub max: i32,
+    pub fuzz: i32,
+    pub flat: i32,
+    pub res: i32,
+}
+
+impl AxisInfo {
+    /// Parse the on-wire `virtio_input_absinfo` (20 bytes, five
+    /// little-endian i32 fields in `min/max/fuzz/flat/res` order
+    /// per VirtIO 1.2 §5.8.4). Returns `None` if `bytes.len() <
+    /// 20` — every well-formed device returns exactly 20.
+    pub fn from_virtio_absinfo(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 20 {
+            return None;
+        }
+        let read = |off: usize| -> i32 {
+            i32::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+            ])
+        };
+        Some(Self {
+            min: read(0),
+            max: read(4),
+            fuzz: read(8),
+            flat: read(12),
+            res: read(16),
+        })
+    }
 }
 
 /// Linux evdev `ABS_*` axis codes (subset). Vendored from

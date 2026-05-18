@@ -372,6 +372,85 @@ fn smoke_virtio_input_btn_touch_drives_slot_zero() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_btn_touch_drives_slot_zero);
 
+fn smoke_virtio_input_extra_mouse_buttons() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        InputEvent, PointerButtons, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    // BTN_SIDE=0x113 press, BTN_BACK=0x116 press, SYN; then both
+    // release, SYN. Expect a PointerEvent with SIDE+BACK set, then
+    // one with neither.
+    let _ = feed_synthetic_events_for_test(&[
+        (1, 0x113, 1),
+        (1, 0x116, 1),
+        (0, 0, 0),
+        (1, 0x113, 0),
+        (1, 0x116, 0),
+        (0, 0, 0),
+    ]);
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if !p.buttons.contains(PointerButtons::SIDE) {
+                return TestResult::Fail("SIDE button bit not set");
+            }
+            if !p.buttons.contains(PointerButtons::BACK) {
+                return TestResult::Fail("BACK button bit not set");
+            }
+        }
+        _ => return TestResult::Fail("expected PointerEvent with SIDE+BACK"),
+    }
+    // Second SYN emits Pointer only when buttons or delta are
+    // non-empty — both buttons cleared yields no event.
+    if pop_global().is_some() {
+        return TestResult::Fail("post-release SYN should not emit PointerEvent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_extra_mouse_buttons);
+
+fn smoke_axis_info_decodes_virtio_absinfo() -> TestResult {
+    use narf_input::AxisInfo;
+    // virtio_input_absinfo: min=10, max=32767, fuzz=2, flat=3, res=11
+    // packed as five little-endian i32s.
+    let mut buf = [0u8; 20];
+    buf[0..4].copy_from_slice(&10i32.to_le_bytes());
+    buf[4..8].copy_from_slice(&32767i32.to_le_bytes());
+    buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+    buf[12..16].copy_from_slice(&3i32.to_le_bytes());
+    buf[16..20].copy_from_slice(&11i32.to_le_bytes());
+    let a = match AxisInfo::from_virtio_absinfo(&buf) {
+        Some(a) => a,
+        None => return TestResult::Fail("expected Some for 20-byte input"),
+    };
+    if a.min != 10 || a.max != 32767 || a.fuzz != 2 || a.flat != 3 || a.res != 11 {
+        return TestResult::Fail("AxisInfo field decode wrong");
+    }
+    if AxisInfo::from_virtio_absinfo(&buf[..10]).is_some() {
+        return TestResult::Fail("short buffer should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_axis_info_decodes_virtio_absinfo);
+
+fn smoke_virtio_input_device_name_populated() -> TestResult {
+    use narf_drivers_virtio::input_pci;
+    if !input_pci::is_probed() {
+        return TestResult::Skip("virtio-input not probed in this QEMU config");
+    }
+    // The default xtask test profile doesn't attach virtio-tablet
+    // (which is what carries a meaningful CFG_ID_NAME); just verify
+    // the accessor doesn't panic and that absence is reported as
+    // an empty string rather than UB-via-uninit.
+    let len = input_pci::with_controller(|c| c.device_name().len()).unwrap_or(0);
+    if len > 128 {
+        return TestResult::Fail("device_name() returned more than the 128-byte cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_device_name_populated);
+
 fn smoke_virtio_input_probed_at_boot() -> TestResult {
     use narf_drivers_virtio::input_pci;
     if input_pci::is_probed() {
