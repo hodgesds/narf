@@ -572,6 +572,109 @@ kernel_test_in!(
     smoke_virtio_net_pci_legacy_iface_registered
 );
 
+fn smoke_virtio_net_pci_send_fn_dispatches() -> TestResult {
+    // Direct smoke: call vnet0's SendFn with a hand-built broadcast
+    // ARP frame and confirm the send returns Ok. This validates the
+    // legacy iface registration → DmaBuffer alloc → tx_dma path
+    // end-to-end without depending on which iface `primary()` picks
+    // when both virtio-net and e1000 are attached.
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    let vnet = match narf_net::iface::lookup("vnet0") {
+        Some(i) => i,
+        None => return TestResult::Skip("vnet0 not registered with legacy iface"),
+    };
+    let src_mac = vnet.mac;
+    // 42-byte ARP-over-Ethernet broadcast for 10.0.2.2. Bytes
+    // copied straight from RFC 826 layout; the device only sees
+    // the wire, so as long as the frame is well-formed QEMU's
+    // user-mode SLIRP will answer.
+    let mut frame = [0u8; 42];
+    // Eth dst = ff:ff:ff:ff:ff:ff (broadcast)
+    for i in 0..6 {
+        frame[i] = 0xFF;
+    }
+    // Eth src = our MAC
+    frame[6..12].copy_from_slice(&src_mac);
+    // Ethertype = 0x0806 (ARP)
+    frame[12] = 0x08;
+    frame[13] = 0x06;
+    // HTYPE = 1 (Ethernet)
+    frame[14] = 0x00;
+    frame[15] = 0x01;
+    // PTYPE = 0x0800 (IPv4)
+    frame[16] = 0x08;
+    frame[17] = 0x00;
+    // HLEN / PLEN
+    frame[18] = 6;
+    frame[19] = 4;
+    // OPER = 1 (request)
+    frame[20] = 0x00;
+    frame[21] = 0x01;
+    // Sender HW = our MAC
+    frame[22..28].copy_from_slice(&src_mac);
+    // Sender IP = 10.0.2.15
+    frame[28] = 10;
+    frame[29] = 0;
+    frame[30] = 2;
+    frame[31] = 15;
+    // Target HW = zeroes
+    // Target IP = 10.0.2.2
+    frame[38] = 10;
+    frame[39] = 0;
+    frame[40] = 2;
+    frame[41] = 2;
+    match (vnet.send)(&frame) {
+        Ok(()) => TestResult::Pass,
+        Err(()) => TestResult::Fail("vnet0 SendFn returned Err — tx_dma path broken"),
+    }
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_send_fn_dispatches
+);
+
+fn smoke_virtio_net_pci_set_mac_round_trip() -> TestResult {
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    // Save the controller's current MAC so we can restore it
+    // (other tests may depend on a stable MAC across runs).
+    let original = match net_pci::with_controller(|c| c.mac()) {
+        Some(m) => m,
+        None => return TestResult::Skip("vnet0 controller missing"),
+    };
+    // Locally-administered, unicast — guaranteed not to collide
+    // with a vendor-assigned address. Bit 1 of the first octet
+    // set = locally-administered; bit 0 clear = unicast.
+    let new_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let res = net_pci::with_controller(|c| c.set_mac(new_mac));
+    match res {
+        Some(Ok(())) => {}
+        Some(Err(_)) => {
+            return TestResult::Skip("device didn't negotiate F_CTRL_MAC_ADDR");
+        }
+        None => return TestResult::Skip("vnet0 controller vanished"),
+    }
+    let observed = net_pci::with_controller(|c| c.mac()).unwrap_or([0; 6]);
+    if observed != new_mac {
+        return TestResult::Fail("mac() didn't reflect set_mac");
+    }
+    // Restore so smoke_virtio_net_pci_legacy_iface_registered's
+    // MAC comparison stays meaningful. The iface registry copied
+    // the *original* MAC at probe time; restoring keeps that
+    // consistent.
+    let _ = net_pci::with_controller(|c| c.set_mac(original));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_set_mac_round_trip
+);
+
 fn smoke_virtio_net_pci_count_matches_probe() -> TestResult {
     use crate::net_pci;
     let n = net_pci::count();

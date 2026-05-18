@@ -57,6 +57,9 @@ const VIRTIO_NET_F_MTU: u64 = 3;
 const VIRTIO_NET_F_MAC: u64 = 5;
 const VIRTIO_NET_F_STATUS: u64 = 16;
 const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
+/// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_CTRL_MAC_ADDR (bit 23).
+/// Required for `VIRTIO_NET_CTRL_MAC_ADDR_SET` to succeed.
+const VIRTIO_NET_F_CTRL_MAC_ADDR: u64 = 23;
 /// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_MQ (bit 22). Device supports
 /// multi-queue with auto receive-steering across `max_virtqueue_pairs`.
 const VIRTIO_NET_F_MQ: u64 = 22;
@@ -68,6 +71,14 @@ const VIRTIO_NET_F_MQ: u64 = 22;
 const VIRTIO_NET_CTRL_RX: u8 = 0;
 const VIRTIO_NET_CTRL_RX_PROMISC: u8 = 0;
 const VIRTIO_NET_CTRL_RX_ALLMULTI: u8 = 1;
+
+/// VirtIO 1.2 §5.1.6.5.2 — VIRTIO_NET_CTRL_MAC class.
+const VIRTIO_NET_CTRL_MAC: u8 = 1;
+/// `VIRTIO_NET_CTRL_MAC_ADDR_SET` (§5.1.6.5.2). 6-byte MAC
+/// payload. Only valid when the device negotiated
+/// `VIRTIO_NET_F_CTRL_MAC_ADDR` (bit 23) — otherwise the device
+/// will reject the command with `VIRTIO_NET_ERR`.
+const VIRTIO_NET_CTRL_MAC_ADDR_SET: u8 = 1;
 
 /// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ class.
 const VIRTIO_NET_CTRL_MQ: u8 = 4;
@@ -178,10 +189,16 @@ pub struct VirtioNetPci {
     pub tx_irq_vector: Option<u8>,
     msix: Option<narf_bus::MsixTable>,
     pub ready: bool,
-    /// 48-bit hardware address captured from device-cfg. Zero when
-    /// the device didn't advertise `VIRTIO_NET_F_MAC` (QEMU always
-    /// does; bare-metal NICs may not).
-    mac: [u8; 6],
+    /// 48-bit hardware address. Initial value read from device-cfg
+    /// at bring-up (zero when `VIRTIO_NET_F_MAC` wasn't advertised).
+    /// Subsequent `set_mac` calls overwrite the cache so `mac()`
+    /// reflects the live value — useful for the rare case where
+    /// the OS reassigns the address after probe.
+    mac: IrqSafeSpinLock<[u8; 6]>,
+    /// True when `VIRTIO_NET_F_CTRL_MAC_ADDR` was negotiated.
+    /// `set_mac` short-circuits with NoQueues when this is false
+    /// rather than firing a doomed CTRL_VQ command.
+    has_ctrl_mac_addr: bool,
     /// Last-read MTU from device-cfg (when `VIRTIO_NET_F_MTU`
     /// negotiated). Default 1500 otherwise.
     mtu: u32,
@@ -305,15 +322,20 @@ impl VirtioNetPci {
         // when the device skipped F_CTRL_VQ — keeps the pair vector
         // single-entry and avoids a control-queue-less code path.
         let want_mq = (feats & (1u64 << VIRTIO_NET_F_MQ) != 0) && want_ctrl_vq;
-        // All virtio-net F_* bits we care about live in the low
-        // 32 (max is F_MQ = 22); only F_VERSION_1 = 32 is in
+        // F_CTRL_MAC_ADDR gates MAC_ADDR_SET via the control queue.
+        // Same dependency as F_MQ: needs F_CTRL_VQ first.
+        let want_ctrl_mac_addr =
+            (feats & (1u64 << VIRTIO_NET_F_CTRL_MAC_ADDR) != 0) && want_ctrl_vq;
+        // virtio-net F_* bits we care about live in the low 32
+        // (max is F_CTRL_MAC_ADDR = 23); only F_VERSION_1 = 32 is in
         // the high half.
         let drv_lo = (1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32)
             | (1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32)
             | (1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32)
             | (1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32)
             | (1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32)
-            | (1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32);
+            | (1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32)
+            | (1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32);
         let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
         unsafe {
@@ -578,7 +600,8 @@ impl VirtioNetPci {
             tx_irq_vector: None,
             msix: None,
             ready: true,
-            mac,
+            mac: IrqSafeSpinLock::new(mac),
+            has_ctrl_mac_addr: want_ctrl_mac_addr,
             mtu,
             has_status: want_status,
             ctrl_qidx,
@@ -809,8 +832,31 @@ impl VirtioNetPci {
 
     /// 48-bit hardware address. Zero when `VIRTIO_NET_F_MAC` wasn't
     /// negotiated (rare; QEMU advertises a vendor-default MAC).
+    /// Reflects the latest value committed via `set_mac` if the
+    /// driver reassigned the address post-probe.
     pub fn mac(&self) -> [u8; 6] {
-        self.mac
+        *self.mac.lock()
+    }
+
+    /// Reassign the device's hardware address via
+    /// `VIRTIO_NET_CTRL_MAC_ADDR_SET` (VirtIO 1.2 §5.1.6.5.2).
+    /// Requires `VIRTIO_NET_F_CTRL_MAC_ADDR` to have been
+    /// negotiated. Updates the cached MAC on success so `mac()`
+    /// returns the new value immediately.
+    pub fn set_mac(&self, mac: [u8; 6]) -> Result<(), VirtioPciError> {
+        if !self.has_ctrl_mac_addr {
+            return Err(VirtioPciError::NoQueues);
+        }
+        let ack = self.submit_control(
+            VIRTIO_NET_CTRL_MAC,
+            VIRTIO_NET_CTRL_MAC_ADDR_SET,
+            &mac,
+        )?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        *self.mac.lock() = mac;
+        Ok(())
     }
 
     /// Negotiated MTU. Defaults to 1500 when `VIRTIO_NET_F_MTU`
