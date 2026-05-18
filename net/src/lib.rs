@@ -98,12 +98,19 @@ pub const TX_RING_N: usize = 64;
 // ── Frame ───────────────────────────────────────────────────────────
 
 /// Owned network frame handle. `len` is the *used* bytes — always
-/// `<= buf.len()` (the underlying `DmaBuffer` is page-rounded by
-/// `narf_io::alloc_coherent`). Move-semantics through rings preserves
-/// the spec's single-owner invariant: a frame buffer is owned by
-/// exactly one holder at a time.
+/// `<= buf.len() - offset` (the underlying `DmaBuffer` is page-
+/// rounded by `narf_io::alloc_coherent`). `offset` lets drivers
+/// hand back a device-filled buffer that has device-protocol bytes
+/// (e.g. the 12-byte virtio-net header) sitting at the front of
+/// the page — the consumer slices from `offset..offset+len` and
+/// never has to memmove the payload to the page start.
+///
+/// Move-semantics through rings preserves the spec's single-owner
+/// invariant: a frame buffer is owned by exactly one holder at a
+/// time.
 pub struct Frame {
     buf: DmaBuffer,
+    offset: u32,
     len: u32,
 }
 
@@ -122,15 +129,36 @@ impl fmt::Debug for Frame {
 }
 
 impl Frame {
-    /// Wrap a `DmaBuffer` into a `Frame`. `len` is clamped to the
-    /// buffer's allocated capacity so a misuse can't create a frame
-    /// claiming bytes the allocator never gave us.
+    /// Wrap a `DmaBuffer` into a `Frame` whose payload starts at
+    /// offset 0. `len` is clamped to the buffer's allocated
+    /// capacity so a misuse can't create a frame claiming bytes
+    /// the allocator never gave us.
     #[inline]
     pub fn new(buf: DmaBuffer, len: u32) -> Self {
         let cap = buf.len() as u32;
         Self {
             buf,
+            offset: 0,
             len: if len > cap { cap } else { len },
+        }
+    }
+
+    /// Wrap a `DmaBuffer` with the payload starting at `offset`
+    /// bytes into the buffer. The driver uses this on the RX side
+    /// when the device wrote a fixed-size protocol header at the
+    /// front of the page (e.g. virtio-net's 12-byte hdr) — we'd
+    /// rather not memmove the payload to offset 0 just to satisfy
+    /// a no-offset Frame. `offset + len` is clamped to the
+    /// buffer's allocated capacity.
+    #[inline]
+    pub fn with_offset(buf: DmaBuffer, offset: u32, len: u32) -> Self {
+        let cap = buf.len() as u32;
+        let off = offset.min(cap);
+        let max_len = cap.saturating_sub(off);
+        Self {
+            buf,
+            offset: off,
+            len: if len > max_len { max_len } else { len },
         }
     }
 
@@ -149,11 +177,41 @@ impl Frame {
         &self.buf
     }
 
-    /// Decompose into the underlying `DmaBuffer` + used length. The
-    /// caller takes ownership of the buffer; the frame is consumed.
+    /// Offset of the first payload byte within `buf`. Always 0 for
+    /// frames built via [`Frame::new`]; can be non-zero for frames
+    /// produced by a driver via [`Frame::with_offset`].
+    #[inline]
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Borrow the payload bytes. Honors `offset` so the slice
+    /// starts at the first payload byte rather than at the buffer
+    /// origin.
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        let off = self.offset as usize;
+        let end = off + self.len as usize;
+        &self.buf.as_slice()[off..end]
+    }
+
+    /// Decompose into the underlying `DmaBuffer` + used length.
+    /// The caller takes ownership of the buffer and `offset` is
+    /// dropped — only use this when the consumer knows the
+    /// payload starts at offset 0 in the returned buffer (true
+    /// for frames built via [`Frame::new`]).
     #[inline]
     pub fn into_parts(self) -> (DmaBuffer, u32) {
         (self.buf, self.len)
+    }
+
+    /// Decompose into the underlying `DmaBuffer` + (offset, len).
+    /// Use this when the consumer needs to honor `offset` —
+    /// typically drivers handing the buffer back to the device
+    /// for the next RX.
+    #[inline]
+    pub fn into_parts_with_offset(self) -> (DmaBuffer, u32, u32) {
+        (self.buf, self.offset, self.len)
     }
 }
 

@@ -91,10 +91,18 @@ pub struct VirtioNetPci {
     tx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
     rx_q_buf: DmaBuffer,
     tx_q_buf: DmaBuffer,
-    /// RX buffer pool — `RX_POOL_LEN` 4 KiB pages, each holds one
-    /// frame.
-    rx_pool: alloc::vec::Vec<DmaBuffer>,
-    /// TX scratch buffer. Single-flight in this Stage-4 cut.
+    /// RX descriptor → buffer table, indexed by virtqueue descriptor
+    /// head id (the value `Virtqueue::add_buffer` returns). Each slot
+    /// is `Some(buf)` while the device owns that descriptor; the
+    /// driver `take()`s the buffer in `rx_take()` to hand zero-copy
+    /// ownership to the network stack, then allocates a replacement
+    /// and refills the same head slot. Sized to `rx_qsize` so every
+    /// valid head index has a slot.
+    rx_buffers: IrqSafeSpinLock<alloc::vec::Vec<Option<DmaBuffer>>>,
+    /// TX scratch buffer. Holds the 12-byte virtio-net header that
+    /// gets chained in front of every TX descriptor; tx_dma points
+    /// the payload descriptor at the caller's DmaBuffer directly
+    /// (zero-copy from the stack-supplied page).
     tx_buf: DmaBuffer,
     rx_qsize: u16,
     tx_qsize: u16,
@@ -269,9 +277,14 @@ impl VirtioNetPci {
         let tx_q = unsafe { Virtqueue::new(tx_layout) };
 
         // Pre-populate RX queue with empty buffers so the device has
-        // somewhere to land an incoming frame.
-        let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RX_POOL_LEN);
-        for _ in 0..RX_POOL_LEN {
+        // somewhere to land an incoming frame. The buffer table is
+        // indexed by virtqueue descriptor head id (what add_buffer
+        // returns) so rx_take can find + replace exactly the slot
+        // the device just filled, regardless of free-list order.
+        let mut rx_buffers: alloc::vec::Vec<Option<DmaBuffer>> =
+            (0..rx_qsize).map(|_| None).collect();
+        let posted = RX_POOL_LEN.min(rx_qsize as usize);
+        for _ in 0..posted {
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
             let phys = buf.phys_addr().raw();
@@ -282,8 +295,9 @@ impl VirtioNetPci {
                 flags: VIRTQ_DESC_F_WRITE,
                 next: 0,
             }];
-            let _ = rx_q.add_buffer(&descs);
-            rx_pool.push(buf);
+            if let Some(head) = rx_q.add_buffer(&descs) {
+                rx_buffers[head as usize] = Some(buf);
+            }
         }
 
         // Notify device that RX has new buffers. Compute
@@ -351,7 +365,7 @@ impl VirtioNetPci {
             tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
             rx_q_buf,
             tx_q_buf,
-            rx_pool,
+            rx_buffers: IrqSafeSpinLock::new(rx_buffers),
             tx_buf,
             rx_qsize,
             tx_qsize,
@@ -411,35 +425,55 @@ impl VirtioNetPci {
         Ok(v)
     }
 
-    /// Transmit a single frame on the TX queue. Polled completion.
-    /// Frame must fit in `MAX_FRAME` minus the 12-byte virtio-net
-    /// header.
-    pub fn tx(&self, frame: &[u8]) -> Result<(), VirtioPciError> {
-        if frame.len() > MAX_FRAME - 12 {
+    /// Transmit a frame backed by a caller-owned `DmaBuffer`.
+    /// Zero-copy: the payload descriptor points at `buf` directly
+    /// — the driver never memcpys the frame body, only the 12-byte
+    /// virtio-net header stub at the front of the chain. `payload`
+    /// gives the slice of `buf` to send (offset + len within the
+    /// page); the caller must keep `buf` alive until this call
+    /// returns since the descriptor chain references its phys
+    /// address.
+    ///
+    /// Polled completion via `responsive_spin_until` so sleep_pumps
+    /// keep advancing while the device drains.
+    pub fn tx_dma(
+        &self,
+        buf: &DmaBuffer,
+        payload_offset: u32,
+        payload_len: u32,
+    ) -> Result<(), VirtioPciError> {
+        let payload_offset = payload_offset as usize;
+        let payload_len = payload_len as usize;
+        if payload_len == 0 || payload_len > MAX_FRAME - 12 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let phys = self.tx_buf.phys_addr().raw();
-        // SAFETY: identity-mapped DMA buffer.
+        if payload_offset.saturating_add(payload_len) > buf.len() {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        // virtio-net header lives in tx_buf at offset 0 — 12 bytes
+        // of zeros, no offload flags negotiated past F_CSUM (we
+        // don't request checksum offload on TX, just accept the
+        // feature).
+        let hdr_phys = self.tx_buf.phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; offset 0..12 within
+        // the 4 KiB tx_buf page.
         unsafe {
-            // Zero the virtio-net header.
-            for i in 0..12usize {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, 0);
-            }
-            for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((phys + 12 + i as u64) as *mut u8, *b);
+            for i in 0..12u64 {
+                core::ptr::write_volatile((hdr_phys + i) as *mut u8, 0);
             }
         }
+        let payload_phys = buf.phys_addr().raw() + payload_offset as u64;
         // Two descriptors: header + payload, both device-readable.
         let descs = [
             VirtqDesc {
-                addr: phys,
+                addr: hdr_phys,
                 len: 12,
                 flags: 0,
                 next: 0,
             },
             VirtqDesc {
-                addr: phys + 12,
-                len: frame.len() as u32,
+                addr: payload_phys,
+                len: payload_len as u32,
                 flags: 0,
                 next: 0,
             },
@@ -524,52 +558,76 @@ impl VirtioNetPci {
         s & VIRTIO_NET_S_LINK_UP != 0
     }
 
-    /// Drain one frame from the RX queue. Returns the number of
-    /// bytes copied into `out` (excluding the 12-byte virtio-net
-    /// header), or 0 if no frame is ready.
+    /// Take ownership of one device-filled RX frame. Zero-copy:
+    /// returns the actual `DmaBuffer` the device wrote into +
+    /// total bytes (including the 12-byte virtio-net header).
+    /// Allocates a replacement buffer and re-posts it in the
+    /// avail ring before returning so the device always has a
+    /// place to land the next frame.
     ///
-    /// Refills the RX descriptor by adding the same buffer back to
-    /// the avail ring + notifying the queue.
-    pub fn rx(&self, out: &mut [u8]) -> usize {
+    /// Returns `None` if the used ring is empty or the
+    /// replacement allocation fails (in which case the original
+    /// stays in place — the device-filled buffer is not
+    /// surrendered until the refill is guaranteed).
+    pub fn rx_take(&self) -> Option<(DmaBuffer, u32)> {
         let elem = {
             let mut g = self.rx_queue.lock();
-            let q = match g.as_mut() {
-                Some(q) => q,
-                None => return 0,
-            };
+            let q = g.as_mut()?;
             q.poll_used()
         };
-        let (id, len) = match elem {
-            Some(t) => t,
-            None => return 0,
+        let (id, len) = elem?;
+        let head = id as u16;
+        // Allocate the replacement up front. If we can't, we leave
+        // the device-filled buffer parked in its slot and return
+        // None — better than handing the stack a frame and losing
+        // the refill slot.
+        let replacement = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        let rep_phys = replacement.phys_addr().raw();
+        // Now swap: take the original out of its slot, free the
+        // descriptor chain, post the replacement, stash it under
+        // its new head index.
+        let original = {
+            let mut bufs = self.rx_buffers.lock();
+            bufs.get_mut(head as usize).and_then(|s| s.take())?
         };
-        // Find the buffer this descriptor pointed at. With one desc
-        // per frame the head id maps to rx_pool[id % RX_POOL_LEN].
-        let pool_idx = (id as usize) % self.rx_pool.len();
-        let buf = &self.rx_pool[pool_idx];
-        let phys = buf.phys_addr().raw();
-        // Skip the 12-byte virtio-net header.
-        let frame_len = (len as usize).saturating_sub(12).min(out.len());
-        // SAFETY: identity-mapped DMA buffer.
-        for i in 0..frame_len {
-            out[i] = unsafe { core::ptr::read_volatile((phys + 12 + i as u64) as *const u8) };
-        }
-        // Refill: free the chain + post the buffer back.
-        {
+        let new_head = {
             let mut g = self.rx_queue.lock();
             let q = match g.as_mut() {
                 Some(q) => q,
-                None => return frame_len,
+                None => {
+                    // Queue vanished — return the original to its
+                    // slot so we don't lose it.
+                    self.rx_buffers.lock()[head as usize] = Some(original);
+                    return None;
+                }
             };
-            q.free_chain(id as u16);
+            q.free_chain(head);
             let descs = [VirtqDesc {
-                addr: phys,
+                addr: rep_phys,
                 len: MAX_FRAME as u32,
                 flags: VIRTQ_DESC_F_WRITE,
                 next: 0,
             }];
-            let _ = q.add_buffer(&descs);
-        }
+            match q.add_buffer(&descs) {
+                Some(h) => h,
+                None => {
+                    // Refill failed: device is one descriptor down
+                    // until the next caller frees one. Return the
+                    // original anyway — the stack already drained
+                    // it logically.
+                    drop(replacement);
+                    let off = (self.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
+                    compiler_fence(Ordering::SeqCst);
+                    // SAFETY: identity-mapped notify region.
+                    unsafe {
+                        self.notify.write16(off, RX_QUEUE);
+                    }
+                    return Some((original, len));
+                }
+            }
+        };
+        // Park the replacement in its slot for the next rx_take.
+        self.rx_buffers.lock()[new_head as usize] = Some(replacement);
         // Re-notify the device about the refill.
         let off = (self.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
         compiler_fence(Ordering::SeqCst);
@@ -577,7 +635,7 @@ impl VirtioNetPci {
         unsafe {
             self.notify.write16(off, RX_QUEUE);
         }
-        frame_len
+        Some((original, len))
     }
 }
 
@@ -662,12 +720,13 @@ fn register_net_interface() {
         return;
     }
     // RX forwarder: await the device IRQ (or fall back to a 16 ms
-    // poll), drain every available frame, wrap each in a fresh
-    // DmaBuffer-backed Frame, send through rx_prod. The peer
-    // (caller-held Consumer) is what the stack pops.
+    // poll), drain every available frame via rx_take (zero-copy:
+    // we get the actual device-filled DmaBuffer + total length),
+    // wrap as a Frame whose payload starts at offset 12 (past the
+    // virtio-net header) and send through rx_prod. No memcpy on
+    // the data path.
     narf_scheduler::spawn(async move {
         const PUMP_CYCLES: u64 = 53_000_000;
-        let mut scratch = [0u8; MAX_FRAME];
         loop {
             if let Some(v) = irq_vector {
                 narf_interrupts::wait::wait_for_irq(v).await;
@@ -675,27 +734,27 @@ fn register_net_interface() {
                 narf_time::sleep_cycles(PUMP_CYCLES).await;
             }
             loop {
-                let n = {
+                let taken = {
                     let g = CONTROLLER.lock();
                     match g.as_ref() {
-                        Some(c) => c.rx(&mut scratch),
+                        Some(c) => c.rx_take(),
                         None => return,
                     }
                 };
-                if n == 0 {
-                    break;
-                }
-                let dma = match alloc_coherent(MAX_FRAME, DomainId::DRIVER_0) {
-                    Ok(b) => b,
-                    Err(_) => break,
+                let (buf, total_len) = match taken {
+                    Some(t) => t,
+                    None => break,
                 };
-                // SAFETY: alloc_coherent returns a >= MAX_FRAME
-                // buffer; `n` is bounded by `scratch.len()` =
-                // MAX_FRAME.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(scratch.as_ptr(), dma.as_mut_ptr(), n);
+                // virtio-net always prepends a 12-byte header to
+                // every RX frame. Strip it via Frame::with_offset
+                // — the bytes stay where the device wrote them.
+                let payload_len = (total_len as u32).saturating_sub(12);
+                if payload_len == 0 {
+                    // Empty frame (just header); drop it and keep
+                    // draining. `buf` frees on scope exit.
+                    continue;
                 }
-                let frame = Frame::new(dma, n as u32);
+                let frame = Frame::with_offset(buf, 12, payload_len);
                 if rx_prod.send(frame).await.is_err() {
                     return;
                 }
@@ -703,16 +762,15 @@ fn register_net_interface() {
         }
     });
     // TX forwarder: drain the caller-facing Producer's Consumer
-    // peer, push each frame through the device's TX queue. The
-    // existing tx() method blocks briefly on the used-ring drain;
-    // sleep_pumps stay alive throughout.
+    // peer, push each frame through the device's TX queue via the
+    // zero-copy tx_dma path — the payload descriptor points at
+    // the Frame's DmaBuffer directly. The 12-byte virtio-net
+    // header sits in the driver-owned tx_buf scratch.
     narf_scheduler::spawn(async move {
         while let Ok(frame) = tx_cons.recv().await {
-            let (buf, len) = frame.into_parts();
-            let len = len as usize;
-            let bytes = &buf.as_slice()[..len.min(buf.len())];
+            let (buf, offset, len) = frame.into_parts_with_offset();
             if let Some(c) = CONTROLLER.lock().as_ref() {
-                let _ = c.tx(bytes);
+                let _ = c.tx_dma(&buf, offset, len);
             }
             // `buf` drops here → DmaBuffer::drop frees the page.
         }
@@ -738,53 +796,3 @@ pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
-/// Async, IRQ-driven RX. Awaits the receiveq's MSI-X vector, then
-/// drains one frame into `out`. Falls through to the polled drain if
-/// MSI-X isn't enabled. Returns the byte count copied (0 if no frame
-/// was ready after the IRQ — caller should re-await).
-pub async fn rx_irq_async(out: &mut [u8]) -> usize {
-    let vector = {
-        let g = CONTROLLER.lock();
-        match g.as_ref() {
-            Some(c) => c.irq_vector,
-            None => return 0,
-        }
-    };
-    if let Some(v) = vector {
-        narf_interrupts::wait::wait_for_irq(v).await;
-    }
-    let g = CONTROLLER.lock();
-    let c = match g.as_ref() {
-        Some(c) => c,
-        None => return 0,
-    };
-    c.rx(out)
-}
-
-/// Async, IRQ-driven TX completion. Awaits the TX queue's
-/// MSI-X vector when configured, then drains the TX used ring.
-/// Falls through to a synchronous used-ring drain when the TX
-/// vector isn't enabled.
-///
-/// Use case: a sender that fires `tx(frame)` then needs to
-/// know "the descriptor is reclaimed; I can free the buffer"
-/// without blocking. RX-side `rx_irq_async` does the same for
-/// the receive queue.
-pub async fn tx_irq_async() {
-    let vector = {
-        let g = CONTROLLER.lock();
-        match g.as_ref() {
-            Some(c) => c.tx_irq_vector,
-            None => return,
-        }
-    };
-    if let Some(v) = vector {
-        // Construct WaitForIrq before any code that could
-        // race the IRQ — same ordering invariant as NVMe's
-        // submit_io_irq_async (drivers/nvme/lib.rs:1130).
-        let wait = narf_interrupts::wait::wait_for_irq(v);
-        let _ = wait.await;
-    }
-    // Used-ring drain happens lazily via the next tx() call;
-    // no per-IRQ work needed here today.
-}

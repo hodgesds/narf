@@ -413,15 +413,22 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
     if !net_pci::is_probed() {
         return TestResult::Fail("virtio-net-pci not probed");
     }
-    let mut frame = [0u8; 64];
-    for i in 14..64 {
-        frame[i] = (i as u8).wrapping_mul(0x3D);
+    // Build a synthetic 64-byte frame in a fresh DMA buffer and
+    // hand it to tx_dma — zero-copy: the device descriptor will
+    // point at this buffer directly.
+    let mut tx_buf = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
+        .expect("alloc tx scratch");
+    {
+        let slice = tx_buf.as_mut_slice();
+        for i in 14..64 {
+            slice[i] = (i as u8).wrapping_mul(0x3D);
+        }
     }
-    let tx_ok = net_pci::with_controller(|c| c.tx(&frame))
+    let tx_ok = net_pci::with_controller(|c| c.tx_dma(&tx_buf, 0, 64))
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !tx_ok {
-        return TestResult::Fail("virtio-net-pci tx returned Err");
+        return TestResult::Fail("virtio-net-pci tx_dma returned Err");
     }
     let qsizes =
         net_pci::with_controller(|c| (c.rx_queue_size(), c.tx_queue_size())).unwrap_or((0, 0));
@@ -453,49 +460,55 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
     if probe_all_pci(&authority).is_err() {
         return TestResult::Fail("probe_all_pci");
     }
-    let mut frame = [0u8; 42];
-    for i in 0..6 {
-        frame[i] = 0xFF;
+    let mut tx_dma = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
+        .expect("alloc arp scratch");
+    {
+        let f = tx_dma.as_mut_slice();
+        for i in 0..6 {
+            f[i] = 0xFF;
+        }
+        f[6] = 0x52;
+        f[7] = 0x54;
+        f[8] = 0x00;
+        f[9] = 0x12;
+        f[10] = 0x34;
+        f[11] = 0x57;
+        f[12] = 0x08;
+        f[13] = 0x06;
+        f[14] = 0x00;
+        f[15] = 0x01;
+        f[16] = 0x08;
+        f[17] = 0x00;
+        f[18] = 6;
+        f[19] = 4;
+        f[20] = 0x00;
+        f[21] = 0x01;
+        for i in 0..6 {
+            f[22 + i] = f[6 + i];
+        }
+        f[28] = 10;
+        f[29] = 0;
+        f[30] = 2;
+        f[31] = 15;
+        f[38] = 10;
+        f[39] = 0;
+        f[40] = 2;
+        f[41] = 2;
     }
-    frame[6] = 0x52;
-    frame[7] = 0x54;
-    frame[8] = 0x00;
-    frame[9] = 0x12;
-    frame[10] = 0x34;
-    frame[11] = 0x57;
-    frame[12] = 0x08;
-    frame[13] = 0x06;
-    frame[14] = 0x00;
-    frame[15] = 0x01;
-    frame[16] = 0x08;
-    frame[17] = 0x00;
-    frame[18] = 6;
-    frame[19] = 4;
-    frame[20] = 0x00;
-    frame[21] = 0x01;
-    for i in 0..6 {
-        frame[22 + i] = frame[6 + i];
-    }
-    frame[28] = 10;
-    frame[29] = 0;
-    frame[30] = 2;
-    frame[31] = 15;
-    frame[38] = 10;
-    frame[39] = 0;
-    frame[40] = 2;
-    frame[41] = 2;
-    if net_pci::with_controller(|c| c.tx(&frame))
+    if net_pci::with_controller(|c| c.tx_dma(&tx_dma, 0, 42))
         .map(|r| r.is_ok())
         .unwrap_or(false)
         == false
     {
-        return TestResult::Fail("virtio-net tx");
+        return TestResult::Fail("virtio-net tx_dma");
     }
-    let mut rx_buf = [0u8; 1518];
-    let mut any = 0usize;
+    // Drain one RX frame via zero-copy rx_take. `buf` would be
+    // freed on drop here; we only need to confirm the device
+    // actually published an arrival.
+    let mut any = 0u32;
     for _ in 0..2_000_000u32 {
-        let len = net_pci::with_controller(|c| c.rx(&mut rx_buf)).unwrap_or(0);
-        if len > 0 {
+        let taken = net_pci::with_controller(|c| c.rx_take()).flatten();
+        if let Some((_buf, len)) = taken {
             any = len;
             break;
         }
