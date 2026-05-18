@@ -502,6 +502,76 @@ fn smoke_virtio_input_count_matches_probe() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_count_matches_probe);
 
+fn smoke_virtio_input_gamepad_buttons_routed_to_button_ring() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        btn, __reset_global_ring_for_test, init_global_ring, pop_button, pop_key,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    // BTN_SOUTH press + release, BTN_TL2 press, BTN_DPAD_UP press.
+    // None of these should land in the key ring; all in the button ring.
+    let _ = feed_synthetic_events_for_test(&[
+        (1, btn::BTN_SOUTH, 1),
+        (1, btn::BTN_SOUTH, 0),
+        (1, btn::BTN_TL2, 1),
+        (1, btn::BTN_DPAD_UP, 1),
+    ]);
+    if pop_key().is_some() {
+        return TestResult::Fail("gamepad buttons must not appear in the key ring");
+    }
+    let cases: &[(u16, bool)] = &[
+        (btn::BTN_SOUTH, true),
+        (btn::BTN_SOUTH, false),
+        (btn::BTN_TL2, true),
+        (btn::BTN_DPAD_UP, true),
+    ];
+    for &(want_code, want_pressed) in cases {
+        match pop_button() {
+            Some(b) => {
+                if b.code != want_code || b.pressed != want_pressed {
+                    return TestResult::Fail("button event shape wrong");
+                }
+            }
+            None => return TestResult::Fail("expected button event missing"),
+        }
+    }
+    if pop_button().is_some() {
+        return TestResult::Fail("only four button events expected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_virtio_input_gamepad_buttons_routed_to_button_ring
+);
+
+fn smoke_virtio_input_sync_leds_no_panic_when_unprobed() -> TestResult {
+    // sync_leds() must be idempotent + side-effect-free for
+    // devices without LEDs. We don't synthetically construct a
+    // controller; just verify that the function exists at the
+    // narf_drivers_virtio path and behaves when called via
+    // with_each. When no controller is probed this iterates zero
+    // times — that's the assertion.
+    let mut hits = 0u32;
+    narf_drivers_virtio::input_pci::with_each(|c| {
+        c.sync_leds();
+        hits = hits.saturating_add(1);
+    });
+    let probed = narf_drivers_virtio::input_pci::is_probed();
+    if probed && hits == 0 {
+        return TestResult::Fail("with_each should iterate when probed");
+    }
+    if !probed && hits != 0 {
+        return TestResult::Fail("with_each should be empty when no devices");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_virtio_input_sync_leds_no_panic_when_unprobed
+);
+
 fn smoke_virtio_input_probed_at_boot() -> TestResult {
     use narf_drivers_virtio::input_pci;
     if input_pci::is_probed() {

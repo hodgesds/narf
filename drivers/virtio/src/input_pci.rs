@@ -32,9 +32,17 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use narf_input::{
-    abs, push_global, push_key, AbsoluteEvent, InputEvent, KeyCode, PointerButtons,
-    PointerEvent, TouchEvent,
+    abs, push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, KeyCode,
+    PointerButtons, PointerEvent, TouchEvent,
 };
+
+/// True when `code` belongs to the Linux evdev BTN_* range but
+/// isn't already routed to PointerButtons or MT-slot-0 by the
+/// caller. Used to fan EV_KEY into either Key (KeyCode), Button
+/// (gamepad / joystick / digitiser), or pointer/touch handling.
+fn is_gamepad_or_aux_btn(code: u16) -> bool {
+    (0x100..0x300).contains(&code)
+}
 
 use crate::pci::{
     discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError, CC_DEVICE_FEATURE,
@@ -102,6 +110,21 @@ const CFG_ID_NAME: u8 = 0x01;
 const CFG_EV_BITS: u8 = 0x11;
 const CFG_ABS_INFO: u8 = 0x12;
 
+/// EV_LED event type (Linux input-event-codes.h §EV_*).
+const EV_LED: u16 = 0x11;
+
+/// LED_* codes we mirror from `narf_input::current_modifiers()` —
+/// the three keyboard indicator LEDs every laptop ships with.
+const LED_NUMLOCK: u8 = 0x00;
+const LED_CAPSLOCK: u8 = 0x01;
+const LED_SCROLLLOCK: u8 = 0x02;
+
+/// statusQ scratch buffer slot count. Each LED transition writes
+/// one 8-byte event into a slot. 64 slots × 8 B = 512 bytes —
+/// fits in the single 4 KiB DMA page with room to spare. Cyclic
+/// reuse with opportunistic used-ring drain in `set_led`.
+const LED_SLOTS: u64 = 64;
+
 // Device-config register offsets (within the device-cfg cap).
 const CFG_SELECT: u64 = 0x00;
 const CFG_SUBSEL: u64 = 0x01;
@@ -165,15 +188,20 @@ unsafe fn read_cfg(
     take
 }
 
-/// Read the device name + per-axis bounds. Returns the (name,
-/// axis_info[]) pair. Best-effort — missing selectors leave fields
-/// empty / `None`. Called once at probe.
+/// Read the device name + per-axis bounds + LED bitmap. Returns
+/// the (name, axis_info[], led_bits) triple. Best-effort — missing
+/// selectors leave fields empty / `None` / `0`. Called once at
+/// probe.
 ///
 /// # Safety
 /// `region` must be a live virtio-input device-cfg mapping.
 unsafe fn read_device_metadata(
     region: &crate::pci::VirtioRegion,
-) -> (alloc::string::String, [Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN]) {
+) -> (
+    alloc::string::String,
+    [Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
+    u8,
+) {
     // Name: ASCII, null-padded. Trim trailing NULs + non-printable.
     let mut name_buf = [0u8; 128];
     // SAFETY: caller-asserted.
@@ -206,16 +234,29 @@ unsafe fn read_device_metadata(
             axis_info[axis] = narf_input::AxisInfo::from_virtio_absinfo(&abs_buf);
         }
     }
-    (name, axis_info)
+
+    // LED support: CFG_EV_BITS with subsel=EV_LED returns a
+    // bitmap of supported LED_* codes (one bit per code). For a
+    // virtio-keyboard this typically advertises NUM/CAPS/SCROLL.
+    // Mouse / tablet devices return size=0 here and we'll skip
+    // LED writes for them.
+    let mut led_buf = [0u8; 16];
+    // SAFETY: same.
+    let nled = unsafe { read_cfg(region, CFG_EV_BITS, EV_LED as u8, &mut led_buf) };
+    let led_bits = if nled == 0 { 0u8 } else { led_buf[0] };
+
+    (name, axis_info, led_bits)
 }
 
 #[derive(Debug)]
 struct Queues {
     event_q: Virtqueue,
-    /// Status queue exists for LED writes; we don't use it yet but
-    /// hold the layout so the device sees both queues enabled and
-    /// doesn't fail its sanity check.
-    _status_q: Virtqueue,
+    /// Status queue (driver→device). LED indicator writes go
+    /// through here. Devices that don't expose LED support
+    /// (mouse / tablet) still allocate the queue so the device's
+    /// sanity check passes — they just ignore the EV_LED events
+    /// or post them straight back to the used ring.
+    status_q: Virtqueue,
 }
 
 #[doc(hidden)]
@@ -258,6 +299,26 @@ pub struct VirtioInputPci {
     /// until the next slot switch. Wrapped together so the EV_SYN
     /// flush sees one consistent snapshot.
     mt: IrqSafeSpinLock<MtState>,
+    /// Buffer holding EV_LED event payloads for statusQ writes.
+    /// Sliced into `LED_SLOTS` × 8-byte cells; `led_slot_next`
+    /// cycles through them. Each set_led drains the used ring
+    /// opportunistically so the device gets a chance to ack
+    /// before we wrap.
+    led_event_buf: DmaBuffer,
+    led_slot_next: core::sync::atomic::AtomicU64,
+    /// statusQ notify offset (within the Notify cap). `None` when
+    /// the device didn't expose a usable statusQ — set_led / sync_leds
+    /// short-circuit in that case.
+    status_q_notify_off: Option<u16>,
+    /// Bitmap of LED_* codes the device advertises through
+    /// `CFG_EV_BITS(EV_LED)`. Bit N set ⇒ LED_N supported. Devices
+    /// without any LED bits skip sync_leds entirely so we don't
+    /// pollute statusQ on mouse / tablet hardware.
+    led_bits: u8,
+    /// Last-known LED bitmap we wrote. Diff'd against the live
+    /// modifier state in sync_leds so only transitions hit
+    /// statusQ.
+    last_leds: core::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug)]
@@ -386,7 +447,7 @@ impl VirtioInputPci {
         // statusQ is optional in some virtio-input devices; if max is 0
         // (or we can't allocate), skip it — eventQ alone is sufficient
         // for read-only consumers.
-        let (status_q, q1_buf) = if qmax_s > 0 {
+        let (status_q, q1_buf, status_q_notify_off) = if qmax_s > 0 {
             let mut qsize_s = 4u16.min(qmax_s);
             if !qsize_s.is_power_of_two() {
                 qsize_s = 1u16 << (15 - qsize_s.leading_zeros() as u16);
@@ -405,19 +466,29 @@ impl VirtioInputPci {
                 common.write64_split(CC_QUEUE_DRIVER, layout_s.avail_ring);
                 common.write64_split(CC_QUEUE_DEVICE, layout_s.used_ring);
                 common.write16(crate::pci::CC_QUEUE_MSIX_VECTOR, 0xFFFF);
+            }
+            // SAFETY: same.
+            let s_notify = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
+            // SAFETY: same.
+            unsafe {
                 common.write16(CC_QUEUE_ENABLE, 1);
             }
             // SAFETY: zero-initialised coherent DMA.
-            (unsafe { Virtqueue::new(layout_s) }, q1_buf)
+            (
+                unsafe { Virtqueue::new(layout_s) },
+                q1_buf,
+                Some(s_notify),
+            )
         } else {
             // Make a placeholder zero-size Virtqueue is awkward; reuse
-            // a tiny buffer + size=1 layout instead.
+            // a tiny buffer + size=1 layout instead. LED writes are
+            // disabled in this branch via status_q_notify_off = None.
             let q1_buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
             let layout_s = VirtqueueLayout::new(1, q1_buf.phys_addr().raw())
                 .ok_or(VirtioPciError::QueueTooSmall)?;
             // SAFETY: same.
-            (unsafe { Virtqueue::new(layout_s) }, q1_buf)
+            (unsafe { Virtqueue::new(layout_s) }, q1_buf, None)
         };
 
         // DRIVER_OK.
@@ -472,12 +543,18 @@ impl VirtioInputPci {
         } else {
             None
         };
-        let (name, axis_info) = match device_cfg.as_ref() {
+        let (name, axis_info, led_bits) = match device_cfg.as_ref() {
             // SAFETY: device-cfg region was just mapped; read_cfg
             // bounds-checks every offset.
             Some(r) => unsafe { read_device_metadata(r) },
-            None => (alloc::string::String::new(), [None; ABS_BOUNDS_LEN]),
+            None => (alloc::string::String::new(), [None; ABS_BOUNDS_LEN], 0u8),
         };
+
+        // Scratch buffer for outbound EV_LED events. One 4 KiB
+        // page is enough for LED_SLOTS × 8-byte events with room
+        // to spare.
+        let led_event_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
 
         Ok(Self {
             notify,
@@ -488,7 +565,7 @@ impl VirtioInputPci {
             notify_off_multiplier,
             queues: IrqSafeSpinLock::new(Some(Queues {
                 event_q,
-                _status_q: status_q,
+                status_q,
             })),
             rx_buf,
             _status_buf: q1_buf,
@@ -501,6 +578,11 @@ impl VirtioInputPci {
             rel_dy_acc: core::sync::atomic::AtomicI32::new(0),
             buttons: core::sync::atomic::AtomicU8::new(0),
             mt: IrqSafeSpinLock::new(MtState::default()),
+            led_event_buf,
+            led_slot_next: core::sync::atomic::AtomicU64::new(0),
+            status_q_notify_off,
+            led_bits,
+            last_leds: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -536,6 +618,114 @@ impl VirtioInputPci {
             return None;
         }
         self.axis_info[idx]
+    }
+
+    /// Bitmap of LED_* codes the device supports. Bit N set ⇒
+    /// LED_N can be driven through `set_led`. Used by sync_leds to
+    /// skip devices (mouse, tablet) that don't have any LEDs.
+    pub fn led_support(&self) -> u8 {
+        self.led_bits
+    }
+
+    /// Post one EV_LED event to statusQ. `led_code` is a Linux
+    /// LED_* code; `on` lights or extinguishes that indicator.
+    /// Devices that didn't expose a usable statusQ silently return
+    /// `Ok(())` — the rest of the driver shouldn't gate on LED
+    /// support.
+    pub fn set_led(&self, led_code: u8, on: bool) -> Result<(), VirtioPciError> {
+        let notify_off = match self.status_q_notify_off {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        // Pick the next 8-byte slot in led_event_buf. Cyclic wrap;
+        // 64 slots is plenty since LED transitions track human
+        // keystrokes (a few per second at most).
+        let slot = self
+            .led_slot_next
+            .fetch_add(1, Ordering::AcqRel)
+            .rem_euclid(LED_SLOTS);
+        let phys = self.led_event_buf.phys_addr().raw();
+        let off = slot.checked_mul(8).ok_or(VirtioPciError::QueueTooSmall)?;
+        // virtio_input_event { type=EV_LED, code=led_code, value=on }
+        let etype = EV_LED;
+        let code = led_code as u16;
+        let value: u32 = if on { 1 } else { 0 };
+        let mut event = [0u8; 8];
+        event[0..2].copy_from_slice(&etype.to_le_bytes());
+        event[2..4].copy_from_slice(&code.to_le_bytes());
+        event[4..8].copy_from_slice(&value.to_le_bytes());
+        // SAFETY: phys + off + 8 ≤ phys + 4096 because slot < 64.
+        unsafe {
+            core::ptr::write_volatile((phys + off) as *mut [u8; 8], event);
+        }
+        let descs = [VirtqDesc {
+            addr: phys + off,
+            len: 8,
+            flags: 0,
+            next: 0,
+        }];
+        {
+            let mut g = self.queues.lock();
+            let queues = match g.as_mut() {
+                Some(q) => q,
+                None => return Err(VirtioPciError::NoQueues),
+            };
+            // Reclaim any acked descriptors before we add. Cheap
+            // best-effort drain — keeps the descriptor table free
+            // even when LED writes happen in a tight burst.
+            while let Some((id, _)) = queues.status_q.poll_used() {
+                queues.status_q.free_chain(id as u16);
+            }
+            queues
+                .status_q
+                .add_buffer(&descs)
+                .ok_or(VirtioPciError::QueueTooSmall)?;
+        }
+        let off = (notify_off as u64) * (self.notify_off_multiplier as u64);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region. Queue 1 = statusQ.
+        unsafe {
+            self.notify.write16(off, 1);
+        }
+        Ok(())
+    }
+
+    /// Diff the live `narf_input::current_modifiers()` lock bits
+    /// against the last-known LED state and post deltas through
+    /// `set_led`. Idempotent — re-calling without a state change
+    /// touches statusQ zero times. Skipped entirely when the device
+    /// advertises no LED support.
+    pub fn sync_leds(&self) {
+        if self.led_bits == 0 {
+            return;
+        }
+        let mods = narf_input::current_modifiers();
+        let mut want = 0u8;
+        if mods.contains(narf_input::Modifiers::NUM_LOCK) {
+            want |= 1 << LED_NUMLOCK;
+        }
+        if mods.contains(narf_input::Modifiers::CAPS_LOCK) {
+            want |= 1 << LED_CAPSLOCK;
+        }
+        if mods.contains(narf_input::Modifiers::SCROLL_LOCK) {
+            want |= 1 << LED_SCROLLLOCK;
+        }
+        // Mask out LEDs the device doesn't support so we don't
+        // emit no-op events.
+        want &= self.led_bits;
+        let prev = self.last_leds.load(Ordering::Acquire);
+        let diff = prev ^ want;
+        if diff == 0 {
+            return;
+        }
+        for led in 0..8u8 {
+            if (diff >> led) & 1 == 0 {
+                continue;
+            }
+            let on = (want >> led) & 1 != 0;
+            let _ = self.set_led(led, on);
+        }
+        self.last_leds.store(want, Ordering::Release);
     }
 
     /// Take the accumulated REL_X / REL_Y delta since last read.
@@ -628,6 +818,16 @@ impl VirtioInputPci {
                             slot.tracking_id = None;
                         }
                         slot.dirty = true;
+                    } else if is_gamepad_or_aux_btn(code) {
+                        // Gamepad face / shoulder / D-pad, joystick
+                        // triggers, stylus barrel — everything that
+                        // isn't keyboard or mouse-pointer-button
+                        // shaped. Consumers compare `code` against
+                        // narf_input::btn constants.
+                        let _ = push_global(InputEvent::Button(ButtonEvent {
+                            code,
+                            pressed,
+                        }));
                     } else {
                         let kc = KeyCode::from_evdev(code);
                         let _ = push_key(kc, pressed);
@@ -842,6 +1042,13 @@ pub fn with_controller<R>(f: impl FnOnce(&VirtioInputPci) -> R) -> Option<R> {
     CONTROLLERS.lock().first().map(f)
 }
 
+/// Run `f` against the controller at `idx`, if any. Used by the
+/// per-device pump tasks so each one drains its own queue without
+/// stepping on its siblings.
+pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioInputPci) -> R) -> Option<R> {
+    CONTROLLERS.lock().get(idx).map(f)
+}
+
 /// Run `f` against every bound controller in probe order. Used by
 /// the pump task so a keyboard + tablet + mouse all get drained in
 /// one tick.
@@ -897,6 +1104,8 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                         slot.tracking_id = None;
                     }
                     slot.dirty = true;
+                } else if is_gamepad_or_aux_btn(code) {
+                    let _ = push_global(InputEvent::Button(ButtonEvent { code, pressed }));
                 } else {
                     let kc = KeyCode::from_evdev(code);
                     let _ = push_key(kc, pressed);

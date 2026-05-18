@@ -463,6 +463,84 @@ pub struct TouchEvent {
     pub pressure: i32,
 }
 
+/// Generic button event for `BTN_*` codes that aren't keyboard
+/// (`KeyCode`) or mouse-button (`PointerButtons`) shaped. Gamepad
+/// face buttons (`BTN_SOUTH/EAST/NORTH/WEST`), shoulder buttons
+/// (`BTN_TL/TR/TL2/TR2`), thumb-stick clicks, joystick triggers,
+/// stylus barrel buttons, digitiser tool-type bits — every input
+/// device that emits an EV_KEY outside the keyboard / pointer
+/// ranges funnels through this. Consumers compare `code` against
+/// constants in [`btn`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ButtonEvent {
+    pub code: u16,
+    pub pressed: bool,
+}
+
+/// Linux evdev `BTN_*` codes — gamepad + joystick + digitiser
+/// subset. Vendored from `include/uapi/linux/input-event-codes.h`
+/// (Linux UAPI, public per `LICENSES/exceptions/Linux-syscall-note`).
+///
+/// `BTN_LEFT` / `RIGHT` / `MIDDLE` / `SIDE` / `EXTRA` / `FORWARD` /
+/// `BACK` / `TASK` aren't repeated here — they're already covered
+/// by `PointerButtons` and consumers should pop `PointerEvent`s for
+/// those.
+pub mod btn {
+    // Joystick (0x120..)
+    pub const BTN_TRIGGER: u16 = 0x120;
+    pub const BTN_THUMB: u16 = 0x121;
+    pub const BTN_THUMB2: u16 = 0x122;
+    pub const BTN_TOP: u16 = 0x123;
+    pub const BTN_TOP2: u16 = 0x124;
+    pub const BTN_PINKIE: u16 = 0x125;
+    pub const BTN_BASE: u16 = 0x126;
+    pub const BTN_BASE2: u16 = 0x127;
+    pub const BTN_BASE3: u16 = 0x128;
+    pub const BTN_BASE4: u16 = 0x129;
+    pub const BTN_BASE5: u16 = 0x12A;
+    pub const BTN_BASE6: u16 = 0x12B;
+    pub const BTN_DEAD: u16 = 0x12F;
+    // Gamepad face buttons (0x130..)
+    pub const BTN_SOUTH: u16 = 0x130; // alias: BTN_A
+    pub const BTN_EAST: u16 = 0x131; // alias: BTN_B
+    pub const BTN_C: u16 = 0x132;
+    pub const BTN_NORTH: u16 = 0x133; // alias: BTN_X
+    pub const BTN_WEST: u16 = 0x134; // alias: BTN_Y
+    pub const BTN_Z: u16 = 0x135;
+    pub const BTN_TL: u16 = 0x136;
+    pub const BTN_TR: u16 = 0x137;
+    pub const BTN_TL2: u16 = 0x138;
+    pub const BTN_TR2: u16 = 0x139;
+    pub const BTN_SELECT: u16 = 0x13A;
+    pub const BTN_START: u16 = 0x13B;
+    pub const BTN_MODE: u16 = 0x13C;
+    pub const BTN_THUMBL: u16 = 0x13D;
+    pub const BTN_THUMBR: u16 = 0x13E;
+    // Digitiser (0x140..)
+    pub const BTN_TOOL_PEN: u16 = 0x140;
+    pub const BTN_TOOL_RUBBER: u16 = 0x141;
+    pub const BTN_TOOL_BRUSH: u16 = 0x142;
+    pub const BTN_TOOL_PENCIL: u16 = 0x143;
+    pub const BTN_TOOL_AIRBRUSH: u16 = 0x144;
+    pub const BTN_TOOL_FINGER: u16 = 0x145;
+    pub const BTN_TOOL_MOUSE: u16 = 0x146;
+    pub const BTN_TOOL_LENS: u16 = 0x147;
+    pub const BTN_TOOL_QUINTTAP: u16 = 0x148;
+    pub const BTN_STYLUS3: u16 = 0x149;
+    // 0x14A = BTN_TOUCH — surfaced through MT slot 0 contact, not
+    // through ButtonEvent. Listed here as a reminder.
+    pub const BTN_STYLUS: u16 = 0x14B;
+    pub const BTN_STYLUS2: u16 = 0x14C;
+    pub const BTN_TOOL_DOUBLETAP: u16 = 0x14D;
+    pub const BTN_TOOL_TRIPLETAP: u16 = 0x14E;
+    pub const BTN_TOOL_QUADTAP: u16 = 0x14F;
+    // Gamepad D-pad (0x220..)
+    pub const BTN_DPAD_UP: u16 = 0x220;
+    pub const BTN_DPAD_DOWN: u16 = 0x221;
+    pub const BTN_DPAD_LEFT: u16 = 0x222;
+    pub const BTN_DPAD_RIGHT: u16 = 0x223;
+}
+
 /// Per-axis bounds + filter parameters. Drivers cache one of these
 /// per `ABS_*` axis the device exposes; consumers (tablet cursors,
 /// joystick stick mappers) use them to normalise raw
@@ -565,6 +643,7 @@ pub enum InputEvent {
     Scroll(ScrollEvent),
     Absolute(AbsoluteEvent),
     Touch(TouchEvent),
+    Button(ButtonEvent),
     /// Raw ASCII / control byte from a character-oriented source
     /// (UART, virtio-console, ...). Producers that already speak
     /// in terms of bytes (rather than scancodes + modifiers) push
@@ -669,6 +748,7 @@ static SCROLL_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(No
 static BYTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static ABSOLUTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static TOUCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static BUTTON_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 
 fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
     match ev {
@@ -677,18 +757,20 @@ fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
         InputEvent::Scroll(_) => &SCROLL_RING,
         InputEvent::Absolute(_) => &ABSOLUTE_RING,
         InputEvent::Touch(_) => &TOUCH_RING,
+        InputEvent::Button(_) => &BUTTON_RING,
         InputEvent::AsciiByte(_) => &BYTE_RING,
     }
 }
 
 /// All per-class rings, in a stable iteration order.
-fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 6] {
+fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 7] {
     [
         &KEY_RING,
         &POINTER_RING,
         &SCROLL_RING,
         &ABSOLUTE_RING,
         &TOUCH_RING,
+        &BUTTON_RING,
         &BYTE_RING,
     ]
 }
@@ -844,6 +926,16 @@ pub fn pop_touch() -> Option<TouchEvent> {
     let ev = TOUCH_RING.lock().as_ref().and_then(|r| r.pop())?;
     if let InputEvent::Touch(t) = ev {
         Some(t)
+    } else {
+        None
+    }
+}
+
+/// Pop a Button (gamepad / joystick / digitiser BTN_*) event.
+pub fn pop_button() -> Option<ButtonEvent> {
+    let ev = BUTTON_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::Button(b) = ev {
+        Some(b)
     } else {
         None
     }

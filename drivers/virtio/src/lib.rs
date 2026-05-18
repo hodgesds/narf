@@ -102,25 +102,44 @@ pub fn register_initcalls() {
     });
 }
 
-/// Spawn the long-running virtio-input drain task. Walks every bound
-/// `VirtioInputPci` instance every 16 ms (≈ HID `bInterval` cadence)
-/// and pushes consumed event-queue entries through to
-/// `narf_input::push_global` — so the GTK keyboard / virtio-tablet
-/// pointer input lands on the same input ring the USB-HID supervisor
-/// uses.
+/// Spawn one drain task per bound `VirtioInputPci`. Each task awaits
+/// the device's MSI-X vector when available (zero-latency wake on
+/// keystroke / pointer motion), or falls back to a 16 ms polling
+/// cadence when MSI-X wasn't successfully bound. After every drain
+/// the task also calls `sync_leds()` so CapsLock / NumLock /
+/// ScrollLock toggles immediately push the matching LED indicator
+/// to the device's statusQ.
+///
+/// One task per controller (instead of a single global pump) so a
+/// busy keyboard doesn't get throttled by a quiescent tablet's
+/// sleep, and so the IRQ wait genuinely fires only on the device
+/// it's bound to.
 fn spawn_input_pump_task() {
-    narf_scheduler::spawn(async {
-        // 16 ms in TSC cycles at the typical 3.3 GHz ballpark
-        // (53 Mcyc). Auto-scales: it's a soft cadence — sleep_cycles
-        // doesn't need to land at exactly 16 ms.
-        const PUMP_CYCLES: u64 = 53_000_000;
-        loop {
-            input_pci::with_each(|c| {
-                let _ = c.drain_events();
-            });
-            narf_time::sleep_cycles(PUMP_CYCLES).await;
-        }
-    });
+    // 16 ms in TSC cycles at the typical 3.3 GHz ballpark (53 Mcyc).
+    // Used as a fallback only — IRQ-driven path doesn't burn CPU
+    // for quiescent devices.
+    const PUMP_CYCLES: u64 = 53_000_000;
+    let n = input_pci::count();
+    for idx in 0..n {
+        // Capture the device's MSI-X vector at spawn time. probe()
+        // calls enable_msix before adding the device to the
+        // controller Vec, so by the time this task runs `irq_vector`
+        // is either set or permanently None for this device.
+        let irq = input_pci::with_at(idx, |c| c.irq_vector).flatten();
+        narf_scheduler::spawn(async move {
+            loop {
+                if let Some(v) = irq {
+                    narf_interrupts::wait::wait_for_irq(v).await;
+                } else {
+                    narf_time::sleep_cycles(PUMP_CYCLES).await;
+                }
+                let _ = input_pci::with_at(idx, |c| {
+                    let _ = c.drain_events();
+                    c.sync_leds();
+                });
+            }
+        });
+    }
 }
 
 use alloc::boxed::Box;
