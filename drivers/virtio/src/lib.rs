@@ -115,7 +115,9 @@ fn spawn_input_pump_task() {
         // doesn't need to land at exactly 16 ms.
         const PUMP_CYCLES: u64 = 53_000_000;
         loop {
-            let _ = input_pci::with_controller(|c| c.drain_events());
+            input_pci::with_each(|c| {
+                let _ = c.drain_events();
+            });
             narf_time::sleep_cycles(PUMP_CYCLES).await;
         }
     });

@@ -63,9 +63,14 @@ const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 const EV_ABS: u16 = 0x03;
 
-// REL_X = 0, REL_Y = 1, REL_WHEEL = 8 (we ignore HWHEEL for M0).
+// REL_X = 0, REL_Y = 1, REL_HWHEEL = 6, REL_WHEEL = 8.
+// Linux input-event-codes.h §REL_*. REL_HWHEEL is the horizontal
+// (left/right) scroll axis that trackballs + tilt-wheel mice
+// emit; we map it to ScrollEvent.dx so consumers see the same
+// shape used by REL_WHEEL.
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
+const REL_HWHEEL: u16 = 6;
 const REL_WHEEL: u16 = 8;
 
 // Mouse-button BTN_* codes (input-event-codes.h §BTN_MOUSE). These
@@ -647,6 +652,11 @@ impl VirtioInputPci {
                                 narf_input::ScrollEvent { dx: 0, dy: delta },
                             ));
                         }
+                        REL_HWHEEL => {
+                            let _ = push_global(InputEvent::Scroll(
+                                narf_input::ScrollEvent { dx: delta, dy: 0 },
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -763,12 +773,16 @@ impl VirtioInputPci {
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioInputPci>> = IrqSafeSpinLock::new(None);
+/// Bound virtio-input devices. A modern desktop config can attach
+/// keyboard + tablet + mouse simultaneously and the dispatcher binds
+/// each one to its own controller — `Vec` rather than `Option` so
+/// the second device doesn't get silently swallowed (the prior
+/// shape returned `Ok(())` without binding when one was already
+/// installed, leaving the second card present but inert).
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<VirtioInputPci>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
     narf_bus::pci::set_command(
         &cap,
         &device,
@@ -784,9 +798,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     // SAFETY: same.
     let _ = unsafe { dev.enable_msix(&cap, &device) };
-    *CONTROLLER.lock() = Some(dev);
+    let idx = {
+        let mut g = CONTROLLERS.lock();
+        let i = g.len();
+        g.push(dev);
+        i
+    };
+    let bound_name = alloc::format!("vinput{}", idx);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("vinput0"),
+        name: bound_name,
         kind: narf_drivers::BoundKind::Input,
         pci_vid: Some(VIRTIO_INPUT_PCI_VENDOR),
         pci_did: Some(VIRTIO_INPUT_PCI_DEVICE),
@@ -807,11 +827,29 @@ pub fn register_pci_driver() {
 }
 
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    !CONTROLLERS.lock().is_empty()
 }
 
+/// Number of bound virtio-input devices.
+pub fn count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
+/// Run `f` against the first bound controller, if any. Use the
+/// `with_each` iterator instead when behaviour should fan out over
+/// every device (drain pump, MSI-X dispatch, …).
 pub fn with_controller<R>(f: impl FnOnce(&VirtioInputPci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLERS.lock().first().map(f)
+}
+
+/// Run `f` against every bound controller in probe order. Used by
+/// the pump task so a keyboard + tablet + mouse all get drained in
+/// one tick.
+pub fn with_each(mut f: impl FnMut(&VirtioInputPci)) {
+    let g = CONTROLLERS.lock();
+    for c in g.iter() {
+        f(c);
+    }
 }
 
 /// Test-only: replay a sequence of `(type, code, value)` triplets
@@ -878,6 +916,12 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                         let _ = push_global(InputEvent::Scroll(narf_input::ScrollEvent {
                             dx: 0,
                             dy: delta,
+                        }));
+                    }
+                    REL_HWHEEL => {
+                        let _ = push_global(InputEvent::Scroll(narf_input::ScrollEvent {
+                            dx: delta,
+                            dy: 0,
                         }));
                     }
                     _ => {}

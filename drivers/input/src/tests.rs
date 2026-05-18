@@ -451,6 +451,57 @@ fn smoke_virtio_input_device_name_populated() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_device_name_populated);
 
+fn smoke_virtio_input_hwheel_emits_horizontal_scroll() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        InputEvent, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    // EV_REL REL_HWHEEL=6 value=+1 → ScrollEvent{dx:+1,dy:0}.
+    // EV_REL REL_HWHEEL value=-2 → ScrollEvent{dx:-2,dy:0}.
+    let _ = feed_synthetic_events_for_test(&[
+        (2, 6, 1u32),
+        (2, 6, (-2i32) as u32),
+    ]);
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 1 || s.dy != 0 {
+                return TestResult::Fail("first HWHEEL should emit dx=+1");
+            }
+        }
+        _ => return TestResult::Fail("expected first Scroll event"),
+    }
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != -2 || s.dy != 0 {
+                return TestResult::Fail("second HWHEEL should emit dx=-2");
+            }
+        }
+        _ => return TestResult::Fail("expected second Scroll event"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_virtio_input_hwheel_emits_horizontal_scroll
+);
+
+fn smoke_virtio_input_count_matches_probe() -> TestResult {
+    use narf_drivers_virtio::input_pci;
+    // count() and is_probed() must agree — empty <=> count == 0.
+    let n = input_pci::count();
+    if input_pci::is_probed() {
+        if n == 0 {
+            return TestResult::Fail("is_probed() true but count() == 0");
+        }
+    } else if n != 0 {
+        return TestResult::Fail("is_probed() false but count() > 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_count_matches_probe);
+
 fn smoke_virtio_input_probed_at_boot() -> TestResult {
     use narf_drivers_virtio::input_pci;
     if input_pci::is_probed() {
