@@ -467,38 +467,34 @@ pub fn register_loopback_named(
     Ok(handle)
 }
 
-// ── virtio-net skeleton (Stage 4 hand-off) ──────────────────────────
+// ── virtio-net Interface impl ───────────────────────────────────────
 
-/// virtio-net placeholder.
+/// virtio-net interface, bound to a probed `drivers/virtio/net_pci`
+/// controller. The PCI driver constructs one of these after reading
+/// MAC/MTU from device-cfg, building the SPSC ring halves via
+/// `narf_ipc::channel`, registering with `net::registry()`, and
+/// spawning RX/TX forwarder tasks.
 ///
-/// Stage 4 binds this to `drivers/virtio/` proper:
-/// - `mac` is read from virtio-net config space (`drivers/virtio/`
-///   exposes the MMIO config region via `DriverEnv`).
-/// - `mtu` defaults to 1500 unless `VIRTIO_NET_F_MTU` is negotiated;
-///   then it comes from config space too.
-/// - `rx_ring` / `tx_ring` are populated by the driver framework when
-///   it sets up the device's virtqueues — the framework hands the
-///   driver a pair of `narf_ipc` halves wired to the queue indices,
-///   the driver stashes them in this struct's `Option<>` slots.
-///
-/// In Stage 3 every ring accessor is `unimplemented!()`. Tests must
-/// not exercise this path; Stage 3 functional coverage uses
-/// `Loopback`.
+/// Holds the *caller-facing* ring halves: a Producer for tx (the
+/// stack pushes frames here, the forwarder drains them and sends
+/// them to the device) and a Consumer for rx (the forwarder pushes
+/// frames received from the device here, the stack drains them).
+/// The peer halves live captured in the spawned forwarders.
 pub mod virtio_net {
     use super::*;
+    use alloc::string::String;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
-    /// virtio-net interface skeleton. The fields exist so the Stage-4
-    /// implementation can fill them in without changing the public
-    /// surface.
-    #[allow(dead_code)] // rx/tx are placeholder slots for the Stage-4 binding.
+    /// virtio-net `Interface` implementation. Construct via
+    /// `VirtioNet::new`; the PCI driver then calls
+    /// `narf_net::registry().register()` to bind the interface and
+    /// receives a `Cap<NetIface, Write>` handle for later admin
+    /// operations.
     pub struct VirtioNet {
-        name: &'static str,
+        name: String,
         mac: [u8; 6],
         mtu: u32,
-        // The actual rings are populated at driver-start time. Until
-        // then the lock holds `None`, and the trait accessors panic
-        // (any caller in Stage 3 is a bug — `Loopback` is the only
-        // functioning impl).
+        link_up: AtomicBool,
         rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
         tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     }
@@ -506,30 +502,48 @@ pub mod virtio_net {
     impl fmt::Debug for VirtioNet {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("VirtioNet")
-                .field("name", &self.name)
+                .field("name", &self.name.as_str())
+                .field("mac", &self.mac)
                 .field("mtu", &self.mtu)
-                .finish_non_exhaustive()
+                .field("link_up", &self.link_up.load(Ordering::Acquire))
+                .finish()
         }
     }
 
     impl VirtioNet {
-        /// Construct a placeholder with empty ring slots. Stage-4 will
-        /// add a `from_device(env: &DriverEnv) -> Self` constructor
-        /// that reads MAC/MTU from config space and wires the queues.
-        pub fn new(name: &'static str, mac: [u8; 6], mtu: u32) -> Self {
+        /// Build a `VirtioNet` from already-paired ring halves. The
+        /// caller (the PCI driver) keeps the *peer* halves (rx
+        /// Producer + tx Consumer) and spawns forwarder tasks that
+        /// pump device → rx Producer and tx Consumer → device.
+        pub fn new(
+            name: String,
+            mac: [u8; 6],
+            mtu: u32,
+            link_up: bool,
+            tx: Producer<Frame, TX_RING_N>,
+            rx: Consumer<Frame, RX_RING_N>,
+        ) -> Self {
             Self {
                 name,
                 mac,
                 mtu,
-                rx: IrqSafeSpinLock::new(None),
-                tx: IrqSafeSpinLock::new(None),
+                link_up: AtomicBool::new(link_up),
+                rx: IrqSafeSpinLock::new(Some(rx)),
+                tx: IrqSafeSpinLock::new(Some(tx)),
             }
+        }
+
+        /// Update the link state. Drivers call this when a PHY-state
+        /// IRQ or a periodic poll observes a transition; the
+        /// stack's `link_up()` reflects the new value immediately.
+        pub fn set_link_up(&self, up: bool) {
+            self.link_up.store(up, Ordering::Release);
         }
     }
 
     impl Interface for VirtioNet {
         fn name(&self) -> &str {
-            self.name
+            self.name.as_str()
         }
         fn mac(&self) -> [u8; 6] {
             self.mac
@@ -538,8 +552,8 @@ pub mod virtio_net {
             self.mtu
         }
         fn link_up(&self) -> bool {
-            false
-        } // Until Stage 4 binds the device.
+            self.link_up.load(Ordering::Acquire)
+        }
         fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
             &self.rx
         }

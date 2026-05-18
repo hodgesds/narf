@@ -41,6 +41,22 @@ use crate::{
 pub const VIRTIO_NET_PCI_VENDOR: u16 = 0x1AF4;
 pub const VIRTIO_NET_PCI_DEVICE: u16 = 0x1041;
 
+// virtio-net feature bits (VirtIO 1.2 §5.1.3). We negotiate the
+// subset the kernel actually reads from device-cfg.
+const VIRTIO_NET_F_CSUM: u64 = 0; // device handles packet checksums
+const VIRTIO_NET_F_MTU: u64 = 3;
+const VIRTIO_NET_F_MAC: u64 = 5;
+const VIRTIO_NET_F_STATUS: u64 = 16;
+
+// virtio-net config status bits.
+const VIRTIO_NET_S_LINK_UP: u16 = 1 << 0;
+
+// Offsets within the device-specific config region (VirtIO 1.2
+// §5.1.4 — `struct virtio_net_config`).
+const CFG_MAC: u64 = 0;
+const CFG_STATUS: u64 = 6;
+const CFG_MTU: u64 = 10;
+
 /// virtio-net header (VirtIO 1.2 §5.1.6.1). 12 bytes when
 /// VIRTIO_F_VERSION_1 is negotiated and VIRTIO_NET_F_MRG_RXBUF /
 /// VIRTIO_NET_F_HASH_REPORT are *not* — the form we use.
@@ -66,6 +82,10 @@ const TX_QUEUE: u16 = 1;
 pub struct VirtioNetPci {
     common: VirtioRegion,
     notify: VirtioRegion,
+    /// Device-specific config region. `None` when the device didn't
+    /// expose a Device cap (rare on modern QEMU); MAC defaults to
+    /// `[0; 6]`, MTU to 1500, link assumed up in that case.
+    device_cfg: Option<VirtioRegion>,
     notify_off_multiplier: u32,
     rx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
     tx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
@@ -90,6 +110,16 @@ pub struct VirtioNetPci {
     pub tx_irq_vector: Option<u8>,
     msix: Option<narf_bus::MsixTable>,
     pub ready: bool,
+    /// 48-bit hardware address captured from device-cfg. Zero when
+    /// the device didn't advertise `VIRTIO_NET_F_MAC` (QEMU always
+    /// does; bare-metal NICs may not).
+    mac: [u8; 6],
+    /// Last-read MTU from device-cfg (when `VIRTIO_NET_F_MTU`
+    /// negotiated). Default 1500 otherwise.
+    mtu: u32,
+    /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
+    /// the spec says treat link as always up.
+    has_status: bool,
 }
 
 const RX_POOL_LEN: usize = 8;
@@ -148,12 +178,32 @@ impl VirtioNetPci {
         if feats & (1u64 << VIRTIO_F_VERSION_1) == 0 {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
+        // Opportunistic negotiation: take F_MAC / F_STATUS / F_MTU
+        // / F_CSUM when the device offers them. Each is a "device
+        // tells us something" feature — accepting it just unlocks
+        // the corresponding device-cfg field. We don't yet drive
+        // the offload paths F_CSUM enables (we only checksum on
+        // RX inspection), so guests built with strict feature
+        // checks still accept the negotiation. F_MQ stays off —
+        // we use the single-queue path.
+        let want_mac = feats & (1u64 << VIRTIO_NET_F_MAC) != 0;
+        let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
+        let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
+        let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
+        // All virtio-net F_* bits we care about live in the low
+        // 32 (max is F_STATUS = 16); only F_VERSION_1 = 32 is in
+        // the high half.
+        let drv_lo = (1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32)
+            | (1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32)
+            | (1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32)
+            | (1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32);
+        let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
         unsafe {
             common.write32(CC_DRIVER_FEATURE_SELECT, 0);
-            common.write32(CC_DRIVER_FEATURE, 0);
+            common.write32(CC_DRIVER_FEATURE, drv_lo);
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
-            common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
+            common.write32(CC_DRIVER_FEATURE, drv_hi);
             common.write8(
                 CC_DEVICE_STATUS,
                 (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
@@ -249,9 +299,53 @@ impl VirtioNetPci {
         let tx_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
 
+        // Optional device-cfg region. Maps the same way virtio-input
+        // does — if the device skipped the Device cap (rare), we
+        // fall back to defaults.
+        let device_cfg = if let Some(cap) = caps.device_cfg.as_ref() {
+            // SAFETY: caller-owned device.
+            match unsafe { crate::pci::map_cap(device, cap) } {
+                Ok(r) => Some(r),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        // Read MAC + MTU + status from device-cfg, gated on whether
+        // the feature was negotiated. Spec: the corresponding field
+        // is only valid when its feature was negotiated.
+        let mut mac = [0u8; 6];
+        let mut mtu: u32 = 1500;
+        let mut link_up_init = true;
+        if let Some(r) = device_cfg.as_ref() {
+            if want_mac {
+                // SAFETY: device-cfg region was just mapped; field
+                // at offset 0..6.
+                for i in 0..6u64 {
+                    mac[i as usize] = unsafe { r.read8(CFG_MAC + i) };
+                }
+            }
+            if want_status {
+                // SAFETY: same. Status at offset 6 (u16 LE).
+                let s = unsafe { r.read16(CFG_STATUS) };
+                link_up_init = s & VIRTIO_NET_S_LINK_UP != 0;
+            }
+            if want_mtu {
+                // SAFETY: same. MTU at offset 10 (u16 LE).
+                let m = unsafe { r.read16(CFG_MTU) };
+                if m >= 64 {
+                    mtu = m as u32;
+                }
+            }
+        }
+        // Stash an initial link-state guess on the controller so
+        // accessors don't need to re-read MMIO on every poll.
+        let _ = link_up_init;
+
         Ok(Self {
             common,
             notify,
+            device_cfg,
             notify_off_multiplier,
             rx_queue: IrqSafeSpinLock::new(Some(rx_q)),
             tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
@@ -267,6 +361,9 @@ impl VirtioNetPci {
             tx_irq_vector: None,
             msix: None,
             ready: true,
+            mac,
+            mtu,
+            has_status: want_status,
         })
     }
 
@@ -397,6 +494,36 @@ impl VirtioNetPci {
         self.tx_qsize
     }
 
+    /// 48-bit hardware address. Zero when `VIRTIO_NET_F_MAC` wasn't
+    /// negotiated (rare; QEMU advertises a vendor-default MAC).
+    pub fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    /// Negotiated MTU. Defaults to 1500 when `VIRTIO_NET_F_MTU`
+    /// wasn't offered.
+    pub fn mtu(&self) -> u32 {
+        self.mtu
+    }
+
+    /// Live link state. Reads the status word from device-cfg every
+    /// call when `VIRTIO_NET_F_STATUS` was negotiated; returns
+    /// `true` unconditionally otherwise (spec: absence of the
+    /// feature means assume link up).
+    pub fn link_up(&self) -> bool {
+        if !self.has_status {
+            return true;
+        }
+        let r = match self.device_cfg.as_ref() {
+            Some(r) => r,
+            None => return true,
+        };
+        // SAFETY: device-cfg region was mapped at bring_up; field
+        // at offset 6 stays valid for the controller's lifetime.
+        let s = unsafe { r.read16(CFG_STATUS) };
+        s & VIRTIO_NET_S_LINK_UP != 0
+    }
+
     /// Drain one frame from the RX queue. Returns the number of
     /// bytes copied into `out` (excluding the 12-byte virtio-net
     /// header), or 0 if no frame is ready.
@@ -492,7 +619,104 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(VIRTIO_NET_PCI_DEVICE),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+    // Register the controller with narf_net so the TCP stack can
+    // find it as `vnet0`. Build the two SPSC rings, hand the
+    // caller-facing halves to the Interface, capture the peer
+    // halves in forwarder tasks.
+    register_net_interface();
     Ok(())
+}
+
+/// Build a `VirtioNet` from the currently-probed controller, register
+/// it with `narf_net::registry()`, and spawn the RX/TX forwarder
+/// tasks that bridge the device's virtqueues to the SPSC rings the
+/// TCP stack pops/pushes.
+fn register_net_interface() {
+    use alloc::string::ToString;
+    use narf_net::{Frame, RX_RING_N, TX_RING_N};
+
+    let (mac, mtu, link_up, irq_vector) = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(c) => (c.mac(), c.mtu(), c.link_up(), c.irq_vector),
+            None => return,
+        }
+    };
+    let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
+    let (mut rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    let iface = narf_net::virtio_net::VirtioNet::new(
+        "vnet0".to_string(),
+        mac,
+        mtu,
+        link_up,
+        tx_prod,
+        rx_cons,
+    );
+    let authority = narf_net::bootstrap_authority();
+    // Registration failure leaks the iface (returned by-value into
+    // the registry would have moved it) — we constructed it above
+    // and Registry::register consumes it on success. On failure
+    // the Vec slot stays free and the forwarders below would talk
+    // to nothing useful, so bail.
+    if narf_net::registry().register(&authority, iface).is_err() {
+        return;
+    }
+    // RX forwarder: await the device IRQ (or fall back to a 16 ms
+    // poll), drain every available frame, wrap each in a fresh
+    // DmaBuffer-backed Frame, send through rx_prod. The peer
+    // (caller-held Consumer) is what the stack pops.
+    narf_scheduler::spawn(async move {
+        const PUMP_CYCLES: u64 = 53_000_000;
+        let mut scratch = [0u8; MAX_FRAME];
+        loop {
+            if let Some(v) = irq_vector {
+                narf_interrupts::wait::wait_for_irq(v).await;
+            } else {
+                narf_time::sleep_cycles(PUMP_CYCLES).await;
+            }
+            loop {
+                let n = {
+                    let g = CONTROLLER.lock();
+                    match g.as_ref() {
+                        Some(c) => c.rx(&mut scratch),
+                        None => return,
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                let dma = match alloc_coherent(MAX_FRAME, DomainId::DRIVER_0) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                // SAFETY: alloc_coherent returns a >= MAX_FRAME
+                // buffer; `n` is bounded by `scratch.len()` =
+                // MAX_FRAME.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(scratch.as_ptr(), dma.as_mut_ptr(), n);
+                }
+                let frame = Frame::new(dma, n as u32);
+                if rx_prod.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    // TX forwarder: drain the caller-facing Producer's Consumer
+    // peer, push each frame through the device's TX queue. The
+    // existing tx() method blocks briefly on the used-ring drain;
+    // sleep_pumps stay alive throughout.
+    narf_scheduler::spawn(async move {
+        while let Ok(frame) = tx_cons.recv().await {
+            let (buf, len) = frame.into_parts();
+            let len = len as usize;
+            let bytes = &buf.as_slice()[..len.min(buf.len())];
+            if let Some(c) = CONTROLLER.lock().as_ref() {
+                let _ = c.tx(bytes);
+            }
+            // `buf` drops here → DmaBuffer::drop frees the page.
+        }
+    });
 }
 
 pub fn register_pci_driver() {

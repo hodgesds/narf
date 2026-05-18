@@ -506,6 +506,33 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_rx_arp);
 
+fn smoke_virtio_net_pci_registers_iface() -> TestResult {
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    // probe() registers a "vnet0" Interface with narf_net::registry().
+    // Confirm it's there and reports a non-default MAC + standard MTU.
+    let found = narf_net::registry().with_interface("vnet0", |iface| {
+        let mac = iface.mac();
+        let mtu = iface.mtu();
+        let link = iface.link_up();
+        // mtu defaults to 1500 when F_MTU isn't negotiated — that's
+        // still a valid pass. The MAC ought to be non-zero on QEMU
+        // (QEMU advertises a 52:54:00:XX:XX:XX vendor default).
+        let mac_ok = mac.iter().any(|&b| b != 0);
+        let mtu_ok = mtu >= 64 && mtu <= 65535;
+        (mac_ok, mtu_ok, link)
+    });
+    match found {
+        Some((true, true, _link)) => TestResult::Pass,
+        Some((false, _, _)) => TestResult::Fail("MAC is all-zero — F_MAC negotiation broken"),
+        Some((_, false, _)) => TestResult::Fail("MTU out of expected range"),
+        None => TestResult::Fail("vnet0 not registered with narf_net::registry()"),
+    }
+}
+kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_registers_iface);
+
 // ── virtio-rng-pci / virtio-snd-pci / virtio-balloon-pci ───────────
 
 fn smoke_virtio_rng_pci_probe() -> TestResult {

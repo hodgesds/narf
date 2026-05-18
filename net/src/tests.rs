@@ -191,7 +191,18 @@ fn smoke_net_stack_attach_not_implemented() -> TestResult {
     let daemon: Cap<StackDaemon, Invoke> = Cap::bootstrap();
     let req = StackAttach { iface, daemon };
 
-    let stub = crate::virtio_net::VirtioNet::new("vnet0", [0; 6], 1500);
+    use crate::{Frame, RX_RING_N, TX_RING_N};
+    use alloc::string::ToString;
+    let (tx_prod, _tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
+    let (_rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    let stub = crate::virtio_net::VirtioNet::new(
+        "vnet0".to_string(),
+        [0; 6],
+        1500,
+        true,
+        tx_prod,
+        rx_cons,
+    );
     match crate::stack::attach(&req, &stub) {
         Err(AttachError::NotImplemented) => {}
         _ => return TestResult::Fail("attach should surface NotImplemented"),
