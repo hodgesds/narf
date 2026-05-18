@@ -412,12 +412,101 @@ pub struct ScrollEvent {
     pub dy: i32,
 }
 
+/// Absolute-axis sample. Used by digitisers (virtio-tablet, touch
+/// pads), styluses, and joysticks where the device reports a
+/// position in its own coordinate space rather than a delta.
+///
+/// `axis` is the raw evdev `ABS_*` code so consumers can address
+/// any axis the device exposes, including ones we don't have
+/// named constants for yet (vendor-specific axes, second-stick
+/// extensions, etc.). The named constants under [`abs`] cover the
+/// codes a Stage-1 client most often cares about.
+///
+/// `value` is the device-reported value. Per Linux evdev semantics
+/// it's i32 — most axes are unsigned but tilt / hat / signed-range
+/// joystick axes go negative.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AbsoluteEvent {
+    pub axis: u16,
+    pub value: i32,
+}
+
+/// One contact slot of an evdev multi-touch protocol-B frame.
+///
+/// `slot` is the MT slot id (per `ABS_MT_SLOT`). `tracking_id`
+/// distinguishes generations of the same physical finger — when
+/// the driver lifts a contact it sets `tracking_id` to `None`
+/// (matching evdev's "tracking_id = -1 means slot released"
+/// convention). `x`, `y`, `pressure` are device-coordinate values
+/// from the matching `ABS_MT_POSITION_X / _Y / _PRESSURE` axes.
+///
+/// One `TouchEvent` is emitted per dirty slot at every input
+/// frame boundary (`EV_SYN`), so consumers see a self-contained
+/// snapshot per touch transition without having to reconstruct
+/// slot state themselves.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TouchEvent {
+    pub slot: u8,
+    pub tracking_id: Option<i32>,
+    pub x: i32,
+    pub y: i32,
+    pub pressure: i32,
+}
+
+/// Linux evdev `ABS_*` axis codes (subset). Vendored from
+/// `include/uapi/linux/input-event-codes.h` (Linux UAPI, public
+/// per `LICENSES/exceptions/Linux-syscall-note`). Drivers feed the
+/// raw u16; consumers compare against these.
+pub mod abs {
+    pub const ABS_X: u16 = 0x00;
+    pub const ABS_Y: u16 = 0x01;
+    pub const ABS_Z: u16 = 0x02;
+    pub const ABS_RX: u16 = 0x03;
+    pub const ABS_RY: u16 = 0x04;
+    pub const ABS_RZ: u16 = 0x05;
+    pub const ABS_THROTTLE: u16 = 0x06;
+    pub const ABS_RUDDER: u16 = 0x07;
+    pub const ABS_WHEEL: u16 = 0x08;
+    pub const ABS_GAS: u16 = 0x09;
+    pub const ABS_BRAKE: u16 = 0x0a;
+    pub const ABS_HAT0X: u16 = 0x10;
+    pub const ABS_HAT0Y: u16 = 0x11;
+    pub const ABS_HAT1X: u16 = 0x12;
+    pub const ABS_HAT1Y: u16 = 0x13;
+    pub const ABS_HAT2X: u16 = 0x14;
+    pub const ABS_HAT2Y: u16 = 0x15;
+    pub const ABS_HAT3X: u16 = 0x16;
+    pub const ABS_HAT3Y: u16 = 0x17;
+    pub const ABS_PRESSURE: u16 = 0x18;
+    pub const ABS_DISTANCE: u16 = 0x19;
+    pub const ABS_TILT_X: u16 = 0x1A;
+    pub const ABS_TILT_Y: u16 = 0x1B;
+    pub const ABS_TOOL_WIDTH: u16 = 0x1C;
+    pub const ABS_MT_SLOT: u16 = 0x2F;
+    pub const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
+    pub const ABS_MT_TOUCH_MINOR: u16 = 0x31;
+    pub const ABS_MT_WIDTH_MAJOR: u16 = 0x32;
+    pub const ABS_MT_WIDTH_MINOR: u16 = 0x33;
+    pub const ABS_MT_ORIENTATION: u16 = 0x34;
+    pub const ABS_MT_POSITION_X: u16 = 0x35;
+    pub const ABS_MT_POSITION_Y: u16 = 0x36;
+    pub const ABS_MT_TOOL_TYPE: u16 = 0x37;
+    pub const ABS_MT_BLOB_ID: u16 = 0x38;
+    pub const ABS_MT_TRACKING_ID: u16 = 0x39;
+    pub const ABS_MT_PRESSURE: u16 = 0x3A;
+    pub const ABS_MT_DISTANCE: u16 = 0x3B;
+    pub const ABS_MT_TOOL_X: u16 = 0x3C;
+    pub const ABS_MT_TOOL_Y: u16 = 0x3D;
+}
+
 /// Tagged-union of every event a driver can emit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InputEvent {
     Key(KeyEvent),
     Pointer(PointerEvent),
     Scroll(ScrollEvent),
+    Absolute(AbsoluteEvent),
+    Touch(TouchEvent),
     /// Raw ASCII / control byte from a character-oriented source
     /// (UART, virtio-console, ...). Producers that already speak
     /// in terms of bytes (rather than scancodes + modifiers) push
@@ -520,20 +609,36 @@ static KEY_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None)
 static POINTER_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static SCROLL_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static BYTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static ABSOLUTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static TOUCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 
 fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
     match ev {
         InputEvent::Key(_) => &KEY_RING,
         InputEvent::Pointer(_) => &POINTER_RING,
         InputEvent::Scroll(_) => &SCROLL_RING,
+        InputEvent::Absolute(_) => &ABSOLUTE_RING,
+        InputEvent::Touch(_) => &TOUCH_RING,
         InputEvent::AsciiByte(_) => &BYTE_RING,
     }
+}
+
+/// All per-class rings, in a stable iteration order.
+fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 6] {
+    [
+        &KEY_RING,
+        &POINTER_RING,
+        &SCROLL_RING,
+        &ABSOLUTE_RING,
+        &TOUCH_RING,
+        &BYTE_RING,
+    ]
 }
 
 /// Initialise all per-class rings. Idempotent — re-init resets
 /// existing rings rather than reconstructing.
 pub fn init_global_ring(capacity: usize) {
-    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+    for ring in all_rings() {
         let mut g = ring.lock();
         match g.as_ref() {
             Some(r) => r.__reset_for_test(),
@@ -665,12 +770,34 @@ pub fn pop_ascii_byte() -> Option<u8> {
     }
 }
 
+/// Pop an Absolute (axis sample) event. Returns `None` if empty
+/// or the ring is uninitialised.
+pub fn pop_absolute() -> Option<AbsoluteEvent> {
+    let ev = ABSOLUTE_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::Absolute(a) = ev {
+        Some(a)
+    } else {
+        None
+    }
+}
+
+/// Pop a Touch (multi-touch slot transition) event.
+pub fn pop_touch() -> Option<TouchEvent> {
+    let ev = TOUCH_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::Touch(t) = ev {
+        Some(t)
+    } else {
+        None
+    }
+}
+
 /// Generic pop — drains any non-empty ring, no ordering guarantee
 /// across classes. Kept for the boot-time diagnostic panel + a
 /// small set of tests; new consumers should use the typed
-/// variants. Order: Key → Pointer → Scroll → AsciiByte.
+/// variants. Order: Key → Pointer → Scroll → Absolute → Touch →
+/// AsciiByte.
 pub fn pop_global() -> Option<InputEvent> {
-    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+    for ring in all_rings() {
         if let Some(ev) = ring.lock().as_ref().and_then(|r| r.pop()) {
             return Some(ev);
         }
@@ -683,7 +810,7 @@ pub fn pop_global() -> Option<InputEvent> {
 pub fn global_counters() -> (u64, u64) {
     let mut pushed = 0u64;
     let mut dropped = 0u64;
-    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+    for ring in all_rings() {
         if let Some(r) = ring.lock().as_ref() {
             pushed = pushed.saturating_add(r.pushed());
             dropped = dropped.saturating_add(r.dropped());
@@ -695,7 +822,7 @@ pub fn global_counters() -> (u64, u64) {
 /// Test-only: reset every per-class ring.
 #[doc(hidden)]
 pub fn __reset_global_ring_for_test() {
-    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+    for ring in all_rings() {
         if let Some(r) = ring.lock().as_ref() {
             r.__reset_for_test();
         }

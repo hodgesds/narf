@@ -251,6 +251,127 @@ fn smoke_virtio_input_shift_a_stamps_modifier() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_shift_a_stamps_modifier);
 
+fn smoke_virtio_input_tablet_abs_xy_emits_absolute() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        abs, __reset_global_ring_for_test, init_global_ring, pop_absolute,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    // Tablet frame: ABS_X=1000, ABS_Y=2000, SYN.
+    let _ = feed_synthetic_events_for_test(&[
+        (3, abs::ABS_X, 1000),
+        (3, abs::ABS_Y, 2000),
+        (0, 0, 0), // EV_SYN
+    ]);
+    let x = match pop_absolute() {
+        Some(a) => a,
+        None => return TestResult::Fail("expected first Absolute event"),
+    };
+    if x.axis != abs::ABS_X || x.value != 1000 {
+        return TestResult::Fail("ABS_X event shape wrong");
+    }
+    let y = match pop_absolute() {
+        Some(a) => a,
+        None => return TestResult::Fail("expected second Absolute event"),
+    };
+    if y.axis != abs::ABS_Y || y.value != 2000 {
+        return TestResult::Fail("ABS_Y event shape wrong");
+    }
+    if pop_absolute().is_some() {
+        return TestResult::Fail("only two Absolute events expected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_tablet_abs_xy_emits_absolute);
+
+fn smoke_virtio_input_multitouch_slot_protocol_b() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        abs, __reset_global_ring_for_test, init_global_ring, pop_touch,
+    };
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    // Two fingers down at once:
+    //   slot 0: tracking_id 100 at (50, 60)
+    //   slot 1: tracking_id 101 at (200, 210)
+    //   SYN — expect two Touch events
+    // Then lift slot 0 (tracking_id -1) at next SYN.
+    let _ = feed_synthetic_events_for_test(&[
+        (3, abs::ABS_MT_SLOT, 0),
+        (3, abs::ABS_MT_TRACKING_ID, 100),
+        (3, abs::ABS_MT_POSITION_X, 50),
+        (3, abs::ABS_MT_POSITION_Y, 60),
+        (3, abs::ABS_MT_SLOT, 1),
+        (3, abs::ABS_MT_TRACKING_ID, 101),
+        (3, abs::ABS_MT_POSITION_X, 200),
+        (3, abs::ABS_MT_POSITION_Y, 210),
+        (0, 0, 0), // EV_SYN
+        (3, abs::ABS_MT_SLOT, 0),
+        (3, abs::ABS_MT_TRACKING_ID, (-1i32) as u32),
+        (0, 0, 0), // EV_SYN
+    ]);
+    let t0 = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected slot 0 down"),
+    };
+    if t0.slot != 0 || t0.tracking_id != Some(100) || t0.x != 50 || t0.y != 60 {
+        return TestResult::Fail("slot 0 contact shape wrong");
+    }
+    let t1 = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected slot 1 down"),
+    };
+    if t1.slot != 1 || t1.tracking_id != Some(101) || t1.x != 200 || t1.y != 210 {
+        return TestResult::Fail("slot 1 contact shape wrong");
+    }
+    let t_lift = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected slot 0 release"),
+    };
+    if t_lift.slot != 0 || t_lift.tracking_id != None {
+        return TestResult::Fail("slot 0 release shape wrong");
+    }
+    if pop_touch().is_some() {
+        return TestResult::Fail("only three Touch events expected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_virtio_input_multitouch_slot_protocol_b
+);
+
+fn smoke_virtio_input_btn_touch_drives_slot_zero() -> TestResult {
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    // BTN_TOUCH = 0x14a. Press, SYN, release, SYN.
+    let _ = feed_synthetic_events_for_test(&[
+        (1, 0x14a, 1),
+        (0, 0, 0),
+        (1, 0x14a, 0),
+        (0, 0, 0),
+    ]);
+    let down = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected BTN_TOUCH down event"),
+    };
+    if down.slot != 0 || down.tracking_id.is_none() {
+        return TestResult::Fail("BTN_TOUCH down should mark slot 0 active");
+    }
+    let up = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected BTN_TOUCH up event"),
+    };
+    if up.slot != 0 || up.tracking_id.is_some() {
+        return TestResult::Fail("BTN_TOUCH up should release slot 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_virtio_input_btn_touch_drives_slot_zero);
+
 fn smoke_virtio_input_probed_at_boot() -> TestResult {
     use narf_drivers_virtio::input_pci;
     if input_pci::is_probed() {

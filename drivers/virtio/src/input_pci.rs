@@ -32,7 +32,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use narf_input::{
-    push_global, push_key, InputEvent, KeyCode, PointerButtons, PointerEvent,
+    abs, push_global, push_key, AbsoluteEvent, InputEvent, KeyCode, PointerButtons,
+    PointerEvent, TouchEvent,
 };
 
 use crate::pci::{
@@ -60,6 +61,7 @@ const NUM_RX: u16 = 32;
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
 
 // REL_X = 0, REL_Y = 1, REL_WHEEL = 8 (we ignore HWHEEL for M0).
 const REL_X: u16 = 0;
@@ -73,6 +75,36 @@ const REL_WHEEL: u16 = 8;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
+// BTN_TOUCH is the "any finger is on the digitiser" signal. Tablets
+// emit it alongside ABS_X/ABS_Y to mark proximity / contact. We
+// don't pipe it to PointerButtons (a tap isn't a left-click);
+// consumers that care correlate it with the touch slot state.
+const BTN_TOUCH: u16 = 0x14a;
+
+/// Largest multi-touch slot we track per controller. Protocol-B
+/// devices typically advertise 5–10 slots; modern trackpads and
+/// touchscreens cap at 10 simultaneous contacts. Higher slot
+/// indices coming off the wire are silently dropped.
+const MAX_MT_SLOTS: usize = 10;
+
+/// Per-slot state for evdev multi-touch protocol B. We mirror the
+/// axes the device writes (`ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X
+/// /_Y`, `ABS_MT_PRESSURE`) into one snapshot per slot, and flip
+/// `dirty` whenever any of them changes. EV_SYN walks the array and
+/// emits a `TouchEvent` for every dirty slot, clearing the flag.
+///
+/// `tracking_id == None` represents "slot released" — the
+/// evdev convention is `tracking_id = -1` on the wire; the driver
+/// translates that to `None` once and consumers see a clean
+/// `Option<i32>` instead of a magic sentinel.
+#[derive(Copy, Clone, Default, Debug)]
+struct MtSlot {
+    tracking_id: Option<i32>,
+    x: i32,
+    y: i32,
+    pressure: i32,
+    dirty: bool,
+}
 
 #[derive(Debug)]
 struct Queues {
@@ -103,6 +135,27 @@ pub struct VirtioInputPci {
     /// into a `PointerButtons` bitset that's stamped onto each
     /// pointer event emitted at EV_SYN.
     buttons: core::sync::atomic::AtomicU8,
+    /// Multi-touch slot state (evdev protocol B). `current_slot`
+    /// is the slot selected by the most recent `ABS_MT_SLOT`; all
+    /// subsequent `ABS_MT_*` axes update `slots[current_slot]`
+    /// until the next slot switch. Wrapped together so the EV_SYN
+    /// flush sees one consistent snapshot.
+    mt: IrqSafeSpinLock<MtState>,
+}
+
+#[derive(Debug)]
+struct MtState {
+    slots: [MtSlot; MAX_MT_SLOTS],
+    current_slot: u8,
+}
+
+impl Default for MtState {
+    fn default() -> Self {
+        Self {
+            slots: [MtSlot::default(); MAX_MT_SLOTS],
+            current_slot: 0,
+        }
+    }
 }
 
 impl core::fmt::Debug for VirtioInputPci {
@@ -308,6 +361,7 @@ impl VirtioInputPci {
             rel_dx_acc: core::sync::atomic::AtomicI32::new(0),
             rel_dy_acc: core::sync::atomic::AtomicI32::new(0),
             buttons: core::sync::atomic::AtomicU8::new(0),
+            mt: IrqSafeSpinLock::new(MtState::default()),
         })
     }
 
@@ -396,6 +450,22 @@ impl VirtioInputPci {
                         self.buttons.store(buttons.bits(), Ordering::Release);
                         // PointerEvent will be flushed at the next
                         // EV_SYN with the live button bitset.
+                    } else if code == BTN_TOUCH {
+                        // BTN_TOUCH proxies finger-on-digitiser for
+                        // tablets that don't use full MT-protocol-B.
+                        // Mirror it onto slot 0 so a single-finger
+                        // tap is observable as a Touch event without
+                        // the device having to send ABS_MT_*.
+                        let mut g = self.mt.lock();
+                        let slot = &mut g.slots[0];
+                        if pressed {
+                            if slot.tracking_id.is_none() {
+                                slot.tracking_id = Some(0);
+                            }
+                        } else {
+                            slot.tracking_id = None;
+                        }
+                        slot.dirty = true;
                     } else {
                         let kc = KeyCode::from_evdev(code);
                         let _ = push_key(kc, pressed);
@@ -423,6 +493,53 @@ impl VirtioInputPci {
                         _ => {}
                     }
                 }
+                EV_ABS => {
+                    // Signed value: i32 reinterpreted from the
+                    // virtio wire's u32 field. evdev allows the
+                    // full signed range (tilt axes, sign-centred
+                    // joystick axes go negative).
+                    let signed = value as i32;
+                    if code == abs::ABS_MT_SLOT {
+                        // Switch the active slot for subsequent
+                        // ABS_MT_* axis writes. Out-of-range slots
+                        // get clamped — we don't track > MAX_MT_SLOTS.
+                        let mut g = self.mt.lock();
+                        if (signed as usize) < MAX_MT_SLOTS {
+                            g.current_slot = signed as u8;
+                        }
+                    } else if code == abs::ABS_MT_TRACKING_ID
+                        || code == abs::ABS_MT_POSITION_X
+                        || code == abs::ABS_MT_POSITION_Y
+                        || code == abs::ABS_MT_PRESSURE
+                    {
+                        let mut g = self.mt.lock();
+                        let cur = g.current_slot as usize;
+                        if cur < MAX_MT_SLOTS {
+                            let slot = &mut g.slots[cur];
+                            match code {
+                                c if c == abs::ABS_MT_TRACKING_ID => {
+                                    // evdev: -1 means "slot released".
+                                    slot.tracking_id =
+                                        if signed < 0 { None } else { Some(signed) };
+                                }
+                                c if c == abs::ABS_MT_POSITION_X => slot.x = signed,
+                                c if c == abs::ABS_MT_POSITION_Y => slot.y = signed,
+                                c if c == abs::ABS_MT_PRESSURE => slot.pressure = signed,
+                                _ => unreachable!(),
+                            }
+                            slot.dirty = true;
+                        }
+                    } else {
+                        // Non-MT absolute axis (tablet ABS_X/Y,
+                        // joystick stick, hat, tilt, pressure for
+                        // single-touch styluses, …). Push raw —
+                        // consumers track latest-per-axis themselves.
+                        let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+                            axis: code,
+                            value: signed,
+                        }));
+                    }
+                }
                 EV_SYN => {
                     // End of an input frame. If we accumulated REL
                     // deltas or a button-state change, emit one
@@ -438,6 +555,29 @@ impl VirtioInputPci {
                             dx,
                             dy,
                             buttons,
+                        }));
+                    }
+                    // Flush every dirty MT slot as one Touch event.
+                    // Pulled out under the lock so concurrent EV_ABS
+                    // arrivals don't tear a slot's snapshot.
+                    let dirty: alloc::vec::Vec<(u8, MtSlot)> = {
+                        let mut g = self.mt.lock();
+                        let mut out = alloc::vec::Vec::new();
+                        for (idx, slot) in g.slots.iter_mut().enumerate() {
+                            if slot.dirty {
+                                out.push((idx as u8, *slot));
+                                slot.dirty = false;
+                            }
+                        }
+                        out
+                    };
+                    for (slot_id, snap) in dirty {
+                        let _ = push_global(InputEvent::Touch(TouchEvent {
+                            slot: slot_id,
+                            tracking_id: snap.tracking_id,
+                            x: snap.x,
+                            y: snap.y,
+                            pressure: snap.pressure,
                         }));
                     }
                 }
@@ -519,15 +659,18 @@ pub fn with_controller<R>(f: impl FnOnce(&VirtioInputPci) -> R) -> Option<R> {
 
 /// Test-only: replay a sequence of `(type, code, value)` triplets
 /// through the same decode path `drain_events` uses, pushing onto
-/// the global rings. Honours EV_KEY (BTN_* → PointerButtons), EV_REL
-/// accumulators, EV_SYN PointerEvent flush, and EV_REL REL_WHEEL →
-/// ScrollEvent. Returns the count of Key events pushed.
+/// the global rings. Mirrors the live decode for EV_KEY (BTN_* →
+/// PointerButtons, BTN_TOUCH → slot 0 contact), EV_REL accumulators,
+/// EV_REL REL_WHEEL → ScrollEvent, EV_ABS stable axes → Absolute,
+/// EV_ABS ABS_MT_* → MT slot state, EV_SYN flushes Pointer + dirty
+/// Touch slots. Returns the count of Key events pushed.
 pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
     use core::sync::atomic::AtomicI32;
     let mut count = 0usize;
     let rel_dx = AtomicI32::new(0);
     let rel_dy = AtomicI32::new(0);
     let mut buttons = PointerButtons::EMPTY;
+    let mut mt = MtState::default();
     for &(etype, code, value) in events {
         match etype {
             EV_KEY => {
@@ -544,6 +687,16 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                     } else {
                         buttons.remove(b);
                     }
+                } else if code == BTN_TOUCH {
+                    let slot = &mut mt.slots[0];
+                    if pressed {
+                        if slot.tracking_id.is_none() {
+                            slot.tracking_id = Some(0);
+                        }
+                    } else {
+                        slot.tracking_id = None;
+                    }
+                    slot.dirty = true;
                 } else {
                     let kc = KeyCode::from_evdev(code);
                     let _ = push_key(kc, pressed);
@@ -568,6 +721,38 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                     _ => {}
                 }
             }
+            EV_ABS => {
+                let signed = value as i32;
+                if code == abs::ABS_MT_SLOT {
+                    if (signed as usize) < MAX_MT_SLOTS {
+                        mt.current_slot = signed as u8;
+                    }
+                } else if code == abs::ABS_MT_TRACKING_ID
+                    || code == abs::ABS_MT_POSITION_X
+                    || code == abs::ABS_MT_POSITION_Y
+                    || code == abs::ABS_MT_PRESSURE
+                {
+                    let cur = mt.current_slot as usize;
+                    if cur < MAX_MT_SLOTS {
+                        let slot = &mut mt.slots[cur];
+                        match code {
+                            c if c == abs::ABS_MT_TRACKING_ID => {
+                                slot.tracking_id = if signed < 0 { None } else { Some(signed) };
+                            }
+                            c if c == abs::ABS_MT_POSITION_X => slot.x = signed,
+                            c if c == abs::ABS_MT_POSITION_Y => slot.y = signed,
+                            c if c == abs::ABS_MT_PRESSURE => slot.pressure = signed,
+                            _ => unreachable!(),
+                        }
+                        slot.dirty = true;
+                    }
+                } else {
+                    let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+                        axis: code,
+                        value: signed,
+                    }));
+                }
+            }
             EV_SYN => {
                 let dx = rel_dx.swap(0, Ordering::AcqRel);
                 let dy = rel_dy.swap(0, Ordering::AcqRel);
@@ -577,6 +762,18 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                         dy,
                         buttons,
                     }));
+                }
+                for (idx, slot) in mt.slots.iter_mut().enumerate() {
+                    if slot.dirty {
+                        let _ = push_global(InputEvent::Touch(TouchEvent {
+                            slot: idx as u8,
+                            tracking_id: slot.tracking_id,
+                            x: slot.x,
+                            y: slot.y,
+                            pressure: slot.pressure,
+                        }));
+                        slot.dirty = false;
+                    }
                 }
             }
             _ => {}
