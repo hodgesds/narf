@@ -74,6 +74,23 @@ pub fn primary() -> Option<NetIfaceSnapshot> {
     })
 }
 
+/// Look up a registered interface by name. Returns `None` if the
+/// registry is empty or no entry matches. Used by tests + admin
+/// callers that need to address a specific NIC; the routing layer
+/// still picks via `primary` for outbound frames today.
+pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
+    let g = IFACES.lock();
+    let v = g.as_ref()?;
+    let e = v.iter().find(|e| e.name == name)?;
+    Some(NetIfaceSnapshot {
+        name: e.name.clone(),
+        mac: e.mac,
+        send: e.send,
+        ipv4: e.ipv4,
+        gateway: e.gateway,
+    })
+}
+
 /// Send a complete Ethernet frame through the primary iface.
 /// Returns Err if no iface is registered or the driver failed.
 pub fn send(frame: &[u8]) -> Result<(), ()> {

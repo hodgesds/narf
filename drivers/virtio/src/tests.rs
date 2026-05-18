@@ -546,6 +546,32 @@ fn smoke_virtio_net_pci_registers_iface() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_registers_iface);
 
+fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
+    // The TCP stack consumes from narf_net::iface (fn-pointer
+    // registry), not the ring-based narf_net::registry. virtio-net
+    // probe must hook itself into both so `tcp_stack::connect` /
+    // `arp_resolve` / `iface::send` actually reach the device.
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    let vnet = match narf_net::iface::lookup("vnet0") {
+        Some(i) => i,
+        None => return TestResult::Fail("vnet0 not registered with narf_net::iface"),
+    };
+    // Same MAC the controller reports — confirms the probe path
+    // copied it through (not a hardcoded placeholder).
+    let ctrl_mac = net_pci::with_controller(|c| c.mac()).unwrap_or([0; 6]);
+    if vnet.mac != ctrl_mac {
+        return TestResult::Fail("legacy iface MAC doesn't match controller mac()");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_legacy_iface_registered
+);
+
 fn smoke_virtio_net_pci_count_matches_probe() -> TestResult {
     use crate::net_pci;
     let n = net_pci::count();

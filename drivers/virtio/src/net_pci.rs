@@ -1196,6 +1196,14 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         continue;
                     }
                     let frame = Frame::with_offset(buf, 12, payload_len);
+                    // Tap: synchronously dispatch the payload through
+                    // the legacy iface RX handler. Only meaningful for
+                    // the primary controller (idx 0) — the TCP stack
+                    // installed itself there at boot. Cheap fn-pointer
+                    // call when no handler is installed.
+                    if idx == 0 {
+                        narf_net::iface::on_rx_frame(frame.payload());
+                    }
                     // try_send-then-yield loop. We can't hold the
                     // IrqSafeSpinLockGuard across an await (the guard
                     // is !Send because it disables IRQs on lock), so
@@ -1249,6 +1257,66 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
             // `buf` drops here → DmaBuffer::drop frees the page.
         }
     });
+
+    // Wire the controller into the legacy `narf_net::iface` registry
+    // (fn-pointer-based) that the TCP stack consumes via
+    // `iface::send` / `iface::on_rx_frame` / `iface::drain_pump`.
+    // Only the primary controller (idx 0) registers here — the
+    // legacy registry has one "primary iface" slot; multi-NIC
+    // routing is a Stage-2 concern.
+    if idx == 0 {
+        narf_net::iface::register("vnet0", mac, vnet0_send_fn);
+        narf_net::iface::install_rx_drain(vnet0_drain_fn);
+    }
+}
+
+/// `iface::SendFn` for the primary virtio-net controller. The TCP
+/// stack invokes this with a full Ethernet frame; we allocate a
+/// fresh DmaBuffer, memcpy the bytes in, and submit through the
+/// existing zero-copy tx_dma path. The single memcpy is on the
+/// stack-side slow path (one alloc per outbound frame); zero-copy
+/// stays in effect when the producer pushes a pre-built Frame
+/// through `tx_prod` directly.
+fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
+    if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
+        return Err(());
+    }
+    let mut buf =
+        alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| ())?;
+    {
+        let slice = buf.as_mut_slice();
+        if slice.len() < frame.len() {
+            return Err(());
+        }
+        slice[..frame.len()].copy_from_slice(frame);
+    }
+    let res = with_controller(|c| c.tx_dma(&buf, 0, frame.len() as u32));
+    match res {
+        Some(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
+    // `buf` drops at end of scope → DmaBuffer::drop frees the page.
+}
+
+/// `iface::DrainFn` — synchronous one-frame drain used by the TCP
+/// stack's `arp_resolve` busy-wait inside a syscall handler. We
+/// pull one received frame off pair 0's used ring (zero-copy via
+/// rx_take), strip the 12-byte virtio-net header, dispatch the
+/// payload through `iface::on_rx_frame`, and let the DmaBuffer
+/// drop. Returns `true` iff a frame was actually processed.
+fn vnet0_drain_fn() -> bool {
+    let taken = with_controller(|c| c.rx_take()).flatten();
+    let (buf, total_len) = match taken {
+        Some(t) => t,
+        None => return false,
+    };
+    let payload_len = (total_len as u32).saturating_sub(12);
+    if payload_len == 0 {
+        return true;
+    }
+    let end = (12 + payload_len as usize).min(buf.len());
+    narf_net::iface::on_rx_frame(&buf.as_slice()[12..end]);
+    true
 }
 
 pub fn register_pci_driver() {
