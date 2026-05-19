@@ -16,6 +16,7 @@ pub mod beacon;
 pub mod atomic_pool;
 pub mod buddy;
 pub mod compress;
+pub mod compressed_ramdisk;
 pub mod asid_alloc;
 pub mod context;
 pub mod frame;

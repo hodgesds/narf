@@ -4224,3 +4224,107 @@ fn smoke_zpool_invalid_handle() -> TestResult {
     }
 }
 kernel_test_in!("memory", smoke_zpool_invalid_handle);
+
+// ── CompressedRamDisk smokes ────────────────────────────────────────
+
+fn smoke_compressed_ramdisk_unwritten_reads_zeros() -> TestResult {
+    use crate::compressed_ramdisk::CompressedRamDisk;
+    let dev = CompressedRamDisk::new(16);
+    let mut buf = alloc::vec![0xAAu8; 4096];
+    if dev.read(0, 1, &mut buf).is_err() {
+        return TestResult::Fail("read failed");
+    }
+    if buf.iter().any(|b| *b != 0) {
+        return TestResult::Fail("unwritten LBA didn't return zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_compressed_ramdisk_unwritten_reads_zeros);
+
+fn smoke_compressed_ramdisk_write_read_roundtrip() -> TestResult {
+    use crate::compressed_ramdisk::CompressedRamDisk;
+    let dev = CompressedRamDisk::new(16);
+    let mut data = alloc::vec![0u8; 4096];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i & 0xff) as u8;
+    }
+    if dev.write(3, 1, &data).is_err() {
+        return TestResult::Fail("write failed");
+    }
+    let mut out = alloc::vec![0u8; 4096];
+    if dev.read(3, 1, &mut out).is_err() {
+        return TestResult::Fail("read failed");
+    }
+    if out != data {
+        return TestResult::Fail("write/read round-trip mismatch");
+    }
+    // Untouched LBAs still read zeros.
+    let mut zeros = alloc::vec![0xCCu8; 4096];
+    if dev.read(0, 1, &mut zeros).is_err() {
+        return TestResult::Fail("zero-LBA read failed");
+    }
+    if zeros.iter().any(|b| *b != 0) {
+        return TestResult::Fail("untouched LBA not zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_compressed_ramdisk_write_read_roundtrip);
+
+fn smoke_compressed_ramdisk_zero_writes_free_slot() -> TestResult {
+    use crate::compressed_ramdisk::CompressedRamDisk;
+    let dev = CompressedRamDisk::new(64);
+    let zero = alloc::vec![0u8; 4096];
+    for i in 0..64u64 {
+        if dev.write(i, 1, &zero).is_err() {
+            return TestResult::Fail("zero write failed");
+        }
+    }
+    let stats = dev.stats();
+    if stats.stored_pages != 0 {
+        return TestResult::Fail("zero writes shouldn't grow stored_pages");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_compressed_ramdisk_zero_writes_free_slot);
+
+fn smoke_compressed_ramdisk_compresses_repetitive() -> TestResult {
+    use crate::compressed_ramdisk::CompressedRamDisk;
+    let dev = CompressedRamDisk::new(8);
+    let mut data = alloc::vec![0u8; 4096];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 4) as u8; // highly compressible
+    }
+    for i in 0..8u64 {
+        if dev.write(i, 1, &data).is_err() {
+            return TestResult::Fail("write failed");
+        }
+    }
+    let stats = dev.stats();
+    if stats.stored_pages != 8 {
+        return TestResult::Fail("expected 8 stored pages");
+    }
+    if stats.compressed_bytes as usize >= stats.raw_bytes as usize {
+        return TestResult::Fail(
+            "compressed_bytes ≥ raw_bytes on a highly-compressible pattern",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_compressed_ramdisk_compresses_repetitive);
+
+fn smoke_compressed_ramdisk_out_of_range_rejected() -> TestResult {
+    use crate::compressed_ramdisk::{CompressedRamDisk, RamDiskError};
+    let dev = CompressedRamDisk::new(4);
+    let data = alloc::vec![0xABu8; 4096];
+    match dev.write(4, 1, &data) {
+        Err(RamDiskError::OutOfRange) => {}
+        _ => return TestResult::Fail("write past capacity should be OutOfRange"),
+    }
+    let mut out = alloc::vec![0u8; 4096];
+    match dev.read(5, 1, &mut out) {
+        Err(RamDiskError::OutOfRange) => {}
+        _ => return TestResult::Fail("read past capacity should be OutOfRange"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_compressed_ramdisk_out_of_range_rejected);
