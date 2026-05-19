@@ -284,6 +284,37 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     };
     let _ = writeln!(buf, "\n*** KERNEL PANIC ***");
     let _ = writeln!(buf, "{info}");
+    // Best-effort RBP-chain walk. Rust kernels keep frame pointers
+    // by default; each frame is `[saved_rbp, return_addr]`. Stop at
+    // null / unaligned / outside [0xffff_8000_0000_0000, 0xffff_ffff_ffff_ffff]
+    // to avoid a fault during panic.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = writeln!(buf, "  backtrace (return addresses):");
+        let mut rbp: u64;
+        // SAFETY: reading rbp is always legal at CPL=0.
+        unsafe {
+            core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nostack, preserves_flags));
+        }
+        for depth in 0..16 {
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_8000_0000_0000 {
+                break;
+            }
+            // SAFETY: rbp validated above; reading [rbp + 8] is the
+            // return address of the current frame, [rbp] is the
+            // saved rbp.
+            let (next_rbp, ret_addr): (u64, u64) = unsafe {
+                let frame = rbp as *const u64;
+                (frame.read_volatile(), frame.add(1).read_volatile())
+            };
+            let _ = writeln!(buf, "    #{depth} {ret_addr:#018x}");
+            if next_rbp <= rbp {
+                // Walk only goes deeper; loop detection.
+                break;
+            }
+            rbp = next_rbp;
+        }
+    }
     let msg = &buf.bytes[..buf.len];
 
     // Direct write to UART backend, no lock acquisition.
