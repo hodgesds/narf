@@ -83,6 +83,69 @@ GB), and the subsequent `slice::eq` call faults on the push.
   `smoke_abi_dispatch_latency_accumulates` does not fix it — the
   next-in-order test fails instead.
 
+## Further bisection (2026-05-19 follow-up)
+
+The trigger is *specific to the `narf-memory` dep edge*, not any
+dep edge:
+
+- Adding `narf-arch = { path = "../arch" }` to `narf-block`'s
+  `Cargo.toml` (also previously-transitive, same shape of new
+  explicit edge) does **not** trigger the fault. 2037 pass / 0
+  fail (1 test got shuffled to `[skip]` by the layout shift, but
+  no #GP).
+- Adding `narf-memory = { path = "../memory" }` *does* trigger
+  the fault.
+
+So the bug isn't "any dep edge shifts layout" — it's specifically
+when `narf-memory` is pulled in as an explicit edge. The two crates
+have the same transitive availability from `narf-block` (both come
+through `narf-io`), but Cargo's edge-order resolution evidently
+emits `narf-memory`'s artefacts at a different position in the link
+than `narf-arch`'s.
+
+Working theory refined: the stack-corruption signature (`String`
+`len` field reads as `0x40000f40`, all over `0x4000_0xxx` register
+soup) plus the fault path inside `<String as PartialEq<&str>>::ne`
+in the 9p test points at a stack-frame overlap, not an actual RSP
+truncation. The original RSP value (`0x010129f0`) sits in the boot
+stack range (`.boot.data` section in `frame/src/x86_64/boot.S`,
+64 KiB starting from a `LOAD_BASE + small_offset` address) which is
+normal kernel operation — the kernel never swapped to a high-half
+stack (Wave 2 deferred per `memory/src/lib.rs` comment). So
+"truncation" is the wrong frame; the right one is "stack
+re-use causes some prior frame's local to leak into the current
+frame's `String::len` slot".
+
+Reduction attempts that didn't move the needle:
+- Inserting a `narf_scheduler::run_until_empty()` at the top of the
+  faulting test (`smoke_abi_cancel_after_target_completes_is_noop`)
+  — fault persists with the same shape.
+- Disabling `smoke_abi_dispatch_latency_accumulates` entirely —
+  fault now appears at `smoke_pstate_amd_summary_formats_freq_units`-
+  next instead.
+- Setting MAG_SIZE = 1 in `memory/src/slab.rs` — explodes
+  immediately (the magazine code path assumes MAG_SIZE ≥ 2 for the
+  flush-half math); confirms that the magazine layer is reachable
+  but doesn't isolate it as cause.
+
+## Stop point
+
+CompressedRamDisk landed by sidestepping (moved into
+`narf-memory` proper without the `BlockDeviceSync` impl).
+2038 pass / 0 fail with no `narf-block → narf-memory` edge.
+
+A focused chase session should:
+1. Reproduce + run with KASAN-equivalent stack canaries (manual:
+   write a magic word at the bottom of every freshly-spawned task's
+   future Box and check it post-poll).
+2. Tag every `String::from_utf8_lossy(...).into_owned()` allocation
+   with a recognisable byte pattern via a custom alloc shim to
+   spot which allocation is being smashed.
+3. Inspect `narf-memory`'s `#[link_section]` directives — if any of
+   the new sections (compress, zpool, compressed_ramdisk) end up
+   merged into a section that has a fixed-size assumption baked
+   into a downstream crate, layout shifts can corrupt that.
+
 ## Best next-steps for whoever picks this up
 
 1. Reproduce: `python -c "open('block/Cargo.toml','a').write('\n')"`
