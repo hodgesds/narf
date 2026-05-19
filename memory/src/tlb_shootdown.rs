@@ -646,10 +646,17 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
-    // On single-CPU boot every shootdown has no peers and so should
-    // be counted as "local only". This is the IPI-reduction
-    // headline: every avoided IPI shows up as a +1 in
-    // local_only_count and a 0-bit in FILTERED_TARGETS.
+    // The IPI-reduction headline: when no peer CPU holds an
+    // affected mapping, every shootdown collapses to a local
+    // INVPCID and shows up as a +1 in local_only_count with a
+    // 0-bit in FILTERED_TARGETS. Force the online-CPU bitmap to
+    // a single CPU for the test so the filter has a non-trivial
+    // input to work with — the test runs after AP bring-up, where
+    // online_bitmap() returns multiple bits and an empty ACTIVE_AS
+    // would otherwise leave peers in the target set.
+    let online_before = narf_lib::smp::online_bitmap();
+    let count_before = narf_lib::smp::cpu_count();
+    narf_lib::smp::__reset_for_test();
     __reset_for_test();
     let before_local = local_only_count();
     let before_targets = filtered_targets();
@@ -658,6 +665,19 @@ fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
     shootdown_range(3, 0x8000, 4);
     let after_local = local_only_count();
     let after_targets = filtered_targets();
+    // Restore the real SMP topology so downstream tests see the
+    // live CPU set.
+    narf_lib::smp::set_cpu_count(count_before);
+    for bit in 0..64u32 {
+        if (online_before >> bit) & 1 != 0 {
+            // SAFETY: restoring the topology snapshot captured at
+            // the top of the test; identity remains the same CPU
+            // we observed online a few instructions ago.
+            unsafe {
+                narf_lib::smp::mark_online(bit);
+            }
+        }
+    }
     if after_local - before_local != 3 {
         return TestResult::Fail("local_only_count didn't advance by 3");
     }

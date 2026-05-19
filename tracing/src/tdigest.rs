@@ -159,10 +159,42 @@ impl TDigest {
         if !value.is_finite() || !weight.is_finite() || weight <= 0.0 {
             return;
         }
-        self.buffer.push(Centroid {
-            mean: value,
-            weight,
-        });
+        // Equivalence-preserving split: when `weight` is an integer
+        // ≥ 2, buffer it as N unit-weight points so the compression
+        // sweep sees the same input shape as N consecutive `add`
+        // calls. A single high-weight centroid would otherwise
+        // monopolise its k-bucket and force compression to merge
+        // it with neighbours that an N-sample stream would have
+        // kept separate, producing systematic quantile drift.
+        //
+        // Non-integer weights bypass the split — they represent
+        // genuine fractional samples (e.g. EMA-decayed counters)
+        // where N-replication would distort the distribution.
+        let buf_cap = (self.delta as usize) * 12;
+        // `no_std` doesn't expose `f64::fract`; the manual form
+        // `w - (w as i64 as f64)` is the cheapest equivalent for
+        // finite-weight inputs.
+        let is_integer = (weight - (weight as i64 as f64)).abs() < f64::EPSILON;
+        if weight >= 2.0 && is_integer && weight <= 1024.0 {
+            let n = weight as u32;
+            for _ in 0..n {
+                self.buffer.push(Centroid {
+                    mean: value,
+                    weight: 1.0,
+                });
+                if self.buffer.len() >= buf_cap {
+                    self.compress();
+                }
+            }
+        } else {
+            self.buffer.push(Centroid {
+                mean: value,
+                weight,
+            });
+            if self.buffer.len() >= buf_cap {
+                self.compress();
+            }
+        }
         self.total_weight += weight;
         self.count = self.count.saturating_add(1);
         if value < self.min {
@@ -170,15 +202,6 @@ impl TDigest {
         }
         if value > self.max {
             self.max = value;
-        }
-        // The paper (§3.2) recommends batching ≈ δ samples per
-        // compression. We use 12·δ as the buffer cap: tighter
-        // post-compress centroid counts than the textbook 6·δ
-        // (empirically ≈ 2.5·δ instead of ≈ 9·δ for a 1M-sample
-        // monotone stream) at the cost of a slightly bigger sort.
-        let buf_cap = (self.delta as usize) * 12;
-        if self.buffer.len() >= buf_cap {
-            self.compress();
         }
     }
 

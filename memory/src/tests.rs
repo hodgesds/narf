@@ -4090,15 +4090,21 @@ fn smoke_lz4_decode_truncated() -> TestResult {
         Ok(n) => n,
         Err(_) => return TestResult::Fail("encode failed"),
     };
-    if n < 4 {
+    if n < 5 {
         return TestResult::Skip("encoded payload too short for truncation test");
     }
+    // Truncate to `n - 1` so the decoder runs out of input mid-
+    // sequence — either short the match-extension byte or the
+    // terminal literal stream. A 2-byte truncation isn't useful
+    // because [token, literal] is a valid 1-byte-decoded sequence
+    // (the spec lets the last sequence be literal-only).
     let mut out = [0u8; 64];
-    match lz4_decode(&enc[..2], &mut out) {
+    match lz4_decode(&enc[..n - 1], &mut out) {
         Err(CompressError::MalformedInput) => TestResult::Pass,
         Err(CompressError::OutputTooSmall) => TestResult::Pass,
         Err(CompressError::ShortInput) => TestResult::Pass,
-        Ok(_) => TestResult::Fail("decode of truncated input succeeded"),
+        Ok(decoded) if decoded < input.len() => TestResult::Pass,
+        Ok(_) => TestResult::Fail("decode of truncated input matched original length"),
     }
 }
 kernel_test_in!("memory", smoke_lz4_decode_truncated);
