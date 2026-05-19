@@ -134,6 +134,112 @@ CompressedRamDisk landed by sidestepping (moved into
 `narf-memory` proper without the `BlockDeviceSync` impl).
 2038 pass / 0 fail with no `narf-block → narf-memory` edge.
 
+## 2026-05-19 — deeper trace + allocator canary tests
+
+### Sharpened fault signature
+
+With the dep edge applied, the fault rip lands inside
+`narf_ipc::SendFuture<T,_>::poll` (specialisation hash
+`a28ad706807f03a1`) at offset 0x4d. The instruction is:
+
+```
+movzbl 0xc0(%r13), %eax
+```
+
+r13 = `0xf000ff53f000ff53` — *non-canonical* x86_64 address (bit 47
+= 1 but bits 48-63 are 0xf000, not 0xffff). Reading from a non-
+canonical address is what raises #GP error 0.
+
+How r13 got that value:
+
+```
+mov 0x90(%r14), %rax   ; rax = *(r14 + 0x90)
+mov (%rax), %r13       ; r13 = *rax
+movzbl 0xc0(%r13), %eax ; FAULT
+```
+
+r14 was set to `rsi` at function entry (`mov %rsi, %r14`). In SysV
+the 2nd arg to `poll(self, cx)` is cx. So r14 *should* be cx, which
+is a small `&mut Context<'_>` (≤ 40 bytes including nightly's
+`local_waker` + `ext` fields).
+
+But the fault dump shows `r14 = 0x40000eb0`. That value can't be a
+stack address (boot kernel stack lives at `0x010xxxxx`). It looks
+like a heap-or-MMIO address inside the 1 GiB region.
+
+`*(0x40000eb0 + 0x90) = *(0x40000f40)` = some value (call it X).
+`*X = 0xf000ff53f000ff53`, the famous PC-BIOS "system services
+entry point" pattern at f000:ff53. The chain reads from MMIO /
+phys 0x40000_xxxx and gets BIOS-shaped garbage that's non-
+canonical when treated as a pointer.
+
+### What the values mean
+
+The 0x4000_0xxx register soup (`r11=0x40000c00`, `rbx=0x40000e00`,
+`r14=0x40000eb0`, `r15=0x40000eb4`, `rsi=0x40000f40`) is too
+consistent to be uninitialised stack memory. They look like
+genuine pointers into a region that happens to be MMIO/reserved
+instead of RAM. The fault dump's lowest is `0x40000c00` and
+highest is `0x40000f40` — a ~832-byte span. Could be:
+
+- Real-mode IVT or BIOS data area copied into a kernel struct
+  at boot
+- An ACPI table parsed but then over-released
+- The framebuffer "info" structure handed to us by the bootloader
+
+The kernel's identity map covers `[0, 4 GiB)`, so reads at
+0x40000xxx succeed (they hit either RAM, MMIO, or the PCI hole
+depending on QEMU's machine config). Q35 with `-m 1024M` has RAM
+up to `0x40000000`, so 0x40000xxx is *just past* RAM — it sits in
+the gap between RAM and the PCI-MMIO base.
+
+### Allocator-side canaries (2026-05-19)
+
+`memory/src/tests.rs` got five new smokes (`smoke_frame_alloc_
+returns_pointer_in_ram`, `_slab_alloc_returns_pointer_in_ram`,
+`_slab_double_alloc_distinct_pointers`, `_alloc_pages_on_
+returns_in_ram`, `_alloc_pages_on_node1_below_4gb`). All five
+pass on the clean tree, confirming the allocator path itself
+doesn't hand back addresses past the identity-map ceiling. So
+the bad `r14 = 0x40000eb0` isn't from a buddy/slab return — it's
+from somewhere upstream.
+
+### Best remaining hypotheses
+
+1. The `Producer<T>` inside SendFuture has a stale `Arc<Ring>`
+   whose data pointer was clobbered. The Arc's pointer at offset
+   0 of the Producer would be loaded via r14 → r13 → fault path.
+   Inspect how `submission_channel::<N>()` builds the Producer:
+   if anywhere along the path a value gets stored that aliases an
+   address in `[0x40000000, 0x40001000]`, that's the leak vector.
+
+2. A scheduler task's Box::pin'd future stores a borrow that
+   outlives its owner because of an incorrect lifetime. Under the
+   shifted layout, the borrowed object happens to land in the
+   reserved region and reads return BIOS garbage.
+
+3. The compiler is generating wrong code for one specific
+   inlining. Try rebuilding `narf-ipc` with
+   `opt-level=0`-only via `[profile.dev.package."narf-ipc"]
+   opt-level = 0` and see whether that moves or eliminates the
+   fault. If opt-level=0 fixes it, the bug is a miscompile or
+   relies on undefined behaviour the optimiser exposes.
+
+### Best smoke to write next
+
+A standalone test that:
+
+1. Creates `submission_channel::<4>()` + `completion_channel::<4>()`.
+2. Inspects the Producer/Consumer's internal pointers — verifies
+   they're inside the kernel heap (>= heap base, < heap end).
+3. Drops the pair without sending anything.
+4. Re-creates and re-checks 1000 times. If any iteration's
+   producer pointer is outside the heap range, the channel
+   construction has a bug.
+
+That would catch the upstream corruption without needing the
+dep-edge layout shift to reproduce.
+
 A focused chase session should:
 1. Reproduce + run with KASAN-equivalent stack canaries (manual:
    write a magic word at the bottom of every freshly-spawned task's
