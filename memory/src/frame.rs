@@ -351,7 +351,37 @@ fn alloc_below_ceiling(zone: &mut BuddyZone) -> Option<PhysFrame> {
 
 /// Allocate one 4 KiB frame, preferring `node`'s zone. Falls back
 /// to other nodes when `node`'s zone is empty.
+const INUSE_POISON: u64 = 0xDEAD_F00D_C0DE_BABE;
+
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    let f = alloc_frame_on_inner(node)?;
+    let p = f.start_address().raw();
+    if p >= LOW_RESERVED_BYTES && p < (1u64 << 32) {
+        let m0 = unsafe { core::ptr::read_volatile(p as *const u64) };
+        let m1 = unsafe { core::ptr::read_volatile((p + 8) as *const u64) };
+        if m0 == INUSE_POISON && m1 == INUSE_POISON {
+            panic!(
+                "alloc_frame_on: DOUBLE-ALLOC of frame 0x{:x} (poison still present)",
+                p
+            );
+        }
+        unsafe {
+            core::ptr::write_volatile(p as *mut u64, INUSE_POISON);
+            core::ptr::write_volatile((p + 8) as *mut u64, INUSE_POISON);
+        }
+    }
+    // Record that this phys is now OWNED (site=0 sentinel meaning
+    // "alive"). The free path overrides this with the freeing site.
+    {
+        use core::sync::atomic::Ordering;
+        let head = FREE_HISTORY_HEAD.fetch_add(1, Ordering::Relaxed) % FREE_HISTORY_LEN;
+        FREE_HISTORY[head].store(p, Ordering::Relaxed);
+        FREE_HISTORY_SITE[head].store(0xA110_C, Ordering::Relaxed);
+    }
+    Ok(f)
+}
+
+fn alloc_frame_on_inner(node: usize) -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
@@ -435,6 +465,24 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
         return;
     }
     let phys = frame.start_address().raw();
+    if phys < LOW_RESERVED_BYTES {
+        panic!(
+            "free_pages: refusing PhysFrame@0x{:x} order={} (below LOW_RESERVED)",
+            phys, order
+        );
+    }
+    // Clear the in-use poison on every frame in the block so the
+    // double-alloc detector doesn't trigger on a legit reuse.
+    if phys < (1u64 << 32) {
+        let block_pages = 1usize << order;
+        for i in 0..block_pages {
+            let p = phys + (i as u64) * PAGE_SIZE;
+            unsafe {
+                core::ptr::write_volatile(p as *mut u64, 0);
+                core::ptr::write_volatile((p + 8) as *mut u64, 0);
+            }
+        }
+    }
     let node = phys_to_node(phys);
     let mut g = ALLOC.lock();
     if !g.initialised {
@@ -454,9 +502,71 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
 /// (default for everything outside the COW path) are returned
 /// immediately as before.
 pub fn free_frame(f: PhysFrame) {
+    free_frame_tagged(f, 0)
+}
+
+/// Diagnostic ring buffer: every `free_frame_tagged` call records
+/// (frame_no, site) so the buddy double-free detector can name the
+/// PRIOR caller too. Indexed by `FREE_HISTORY_HEAD & MASK`.
+const FREE_HISTORY_LEN: usize = 1024;
+static FREE_HISTORY: [core::sync::atomic::AtomicU64; FREE_HISTORY_LEN] = {
+    const ZERO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [ZERO; FREE_HISTORY_LEN]
+};
+static FREE_HISTORY_SITE: [core::sync::atomic::AtomicU32; FREE_HISTORY_LEN] = {
+    const ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    [ZERO; FREE_HISTORY_LEN]
+};
+static FREE_HISTORY_HEAD: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn __free_history_lookup(phys: u64) -> Option<u32> {
+    use core::sync::atomic::Ordering;
+    for i in 0..FREE_HISTORY_LEN {
+        let f = FREE_HISTORY[i].load(Ordering::Relaxed);
+        if f == phys {
+            return Some(FREE_HISTORY_SITE[i].load(Ordering::Relaxed));
+        }
+    }
+    None
+}
+
+/// Tagged variant for diagnostic call-site identification during
+/// the layout-shift hunt. Each in-tree caller passes a unique
+/// `site` tag so the bad-frame panic can name the responsible path.
+#[doc(hidden)]
+pub fn free_frame_tagged(f: PhysFrame, site: u32) {
+    use core::sync::atomic::Ordering;
+    let head = FREE_HISTORY_HEAD.fetch_add(1, Ordering::Relaxed) % FREE_HISTORY_LEN;
+    FREE_HISTORY[head].store(f.start_address().raw(), Ordering::Relaxed);
+    FREE_HISTORY_SITE[head].store(site, Ordering::Relaxed);
+    // Diagnostic: returning frame 0 to the buddy is always a bug —
+    // it puts the bottom of the IVT into the free-list and the next
+    // allocation hands phys 0 out as a page-table frame. Trip
+    // loudly so the offending caller is visible in the test log.
+    if f.start_address().raw() == 0 {
+        panic!("free_frame: refusing to free PhysFrame@0 — site={}", site);
+    }
+    if f.start_address().raw() < LOW_RESERVED_BYTES {
+        panic!(
+            "free_frame: refusing to free PhysFrame@0x{:x} (below LOW_RESERVED) site={}",
+            f.start_address().raw(),
+            site
+        );
+    }
     if cow::dec_ref(f.start_address()) > 0 {
         // Other ASes still reference this frame; don't return it.
         return;
+    }
+    // Clear the in-use poison so a subsequent alloc doesn't trip
+    // the double-alloc detector.
+    let phys = f.start_address().raw();
+    if phys < (1u64 << 32) {
+        unsafe {
+            core::ptr::write_volatile(phys as *mut u64, 0);
+            core::ptr::write_volatile((phys + 8) as *mut u64, 0);
+        }
     }
     let node = phys_to_node(f.start_address().raw());
     let mut g = ALLOC.lock();

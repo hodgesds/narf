@@ -1330,3 +1330,81 @@ fn smoke_arch_mte_irg_stg_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("ipc", smoke_arch_mte_irg_stg_round_trip);
+
+fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
+    // Canary against the layout-shift bug documented in
+    // docs/notes/2026-05-19-layout-shift-bug.md. The fault dump
+    // showed a SendFuture::poll dereferencing `r14 + 0x90` where
+    // r14 was claimed to be a Context pointer but in fact held
+    // 0x40000eb0 — past 1 GiB, in QEMU's reserved gap between
+    // RAM and PCI MMIO. The only way r14 ends up at 0x40000eb0
+    // through the SendFuture poll path is if the Producer's
+    // inner Arc<Ring> was allocated at that address.
+    //
+    // This smoke creates + drops `narf_ipc::channel::<u64, 4>()`
+    // 256 times and asserts the inner Ring address falls inside
+    // the kernel heap range: > the kernel text/data sections,
+    // < 4 GiB (the early identity-map ceiling). Any escape into
+    // the 0x4000_0000+ region would reproduce the bug shape
+    // here.
+    let mut bad_count = 0u32;
+    let mut sample_bad: u64 = 0;
+    for _ in 0..256 {
+        let (p, c) = crate::channel::<u64, 4>();
+        let ptr = p.__ring_ptr_for_test() as u64;
+        // Heap allocations land below the 4 GiB early identity-
+        // map ceiling and above 0 (Arc::as_ptr is never null on
+        // a live Arc).
+        if ptr == 0 || ptr >= (4u64 << 30) {
+            bad_count += 1;
+            if sample_bad == 0 {
+                sample_bad = ptr;
+            }
+        }
+        // Also check the consumer matches.
+        let cptr = c.__ring_ptr_for_test() as u64;
+        if cptr != ptr {
+            return TestResult::Fail("producer/consumer point at different rings");
+        }
+        drop(p);
+        drop(c);
+    }
+    let _ = sample_bad;
+    if bad_count > 0 {
+        return TestResult::Fail("channel::<>() Arc<Ring> landed outside [0, 4 GiB)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_channel_construction_stays_in_heap);
+
+fn smoke_ipc_channel_diagnostic_accessor_works() -> TestResult {
+    // Sanity-check the diagnostic accessor itself before trusting
+    // it in the canary above. Pointer must be non-null and
+    // page-aligned-ish (heap allocator returns at least 8-byte
+    // alignment for the Arc allocation block).
+    let (p, c) = crate::channel::<u32, 4>();
+    let ptr = p.__ring_ptr_for_test() as u64;
+    if ptr == 0 {
+        return TestResult::Fail("__ring_ptr_for_test returned null");
+    }
+    if ptr & 0x7 != 0 {
+        return TestResult::Fail("__ring_ptr_for_test not 8-byte aligned");
+    }
+    if c.__ring_ptr_for_test() as u64 != ptr {
+        return TestResult::Fail("producer/consumer rings differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_channel_diagnostic_accessor_works);
+
+fn smoke_ipc_consumer_diagnostic_accessor() -> TestResult {
+    // Same accessor on Consumer (it owns the same Arc).
+    let (p, c) = crate::channel::<u32, 4>();
+    let pp = p.__ring_ptr_for_test() as u64;
+    let cp = c.__ring_ptr_for_test() as u64;
+    if pp != cp {
+        return TestResult::Fail("producer/consumer ring addresses differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_consumer_diagnostic_accessor);

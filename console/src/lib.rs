@@ -292,12 +292,21 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     {
         let _ = writeln!(buf, "  backtrace (return addresses):");
         let mut rbp: u64;
+        let mut rsp: u64;
         // SAFETY: reading rbp is always legal at CPL=0.
         unsafe {
             core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nostack, preserves_flags));
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
         }
+        let _ = writeln!(buf, "    rbp={:#x} rsp={:#x}", rbp, rsp);
         for depth in 0..16 {
-            if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_8000_0000_0000 {
+            // Accept either kernel high-half (post-stack-switch) or
+            // boot low-half (pre-Wave-2 stack swap) RBP values.
+            // Reject only the bogus ones: null, unaligned, or
+            // canonical-hole [0x0001_0000_0000_0000 .. 0xffff_0000_0000_0000].
+            if rbp == 0 || rbp & 0x7 != 0
+                || (rbp >= 0x0000_8000_0000_0000 && rbp < 0xffff_8000_0000_0000)
+            {
                 break;
             }
             // SAFETY: rbp validated above; reading [rbp + 8] is the

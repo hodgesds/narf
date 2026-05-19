@@ -279,6 +279,77 @@ A focused chase session should:
    the same root cause under earlier layout snapshots. The fix is
    one truncation site somewhere; both symptoms vanish together.
 
+## 2026-05-19 (afternoon) — buddy double-free found
+
+The "layout shift" framing was a red herring. The real bug is a
+**buddy double-free** in `AddressSpace::drop`: the same physical
+frame number is returned to the buddy twice from two different
+paths inside the drop sequence, which leaves it on the free list
+in a corrupted state. Subsequent allocations pop it for a new
+caller, and the prior owner's still-live use of those bytes
+(producer Arc, PML4 entry, etc.) overwrites the new caller's data
+or vice-versa. Symptoms then range across the test suite depending
+on what the second caller is doing with the frame — that's why
+the apparent victim test wandered.
+
+### Diagnostics landed in this commit
+
+- `memory/src/frame.rs`: LOW_RESERVED_BYTES guard in `free_frame`
+  and `free_pages` — refuses to put any frame below 1 MiB back
+  into the buddy. (Frames in that range are never legitimately
+  donated — see `donate_range`.) Catches one class of off-by-one.
+- `memory/src/frame.rs`: `INUSE_POISON` double-allocation
+  detector. Every `alloc_frame_on` writes 16 bytes of poison into
+  the freshly handed-out frame; the next alloc checks for the
+  pattern before returning the frame. If the buddy hands out
+  the same frame twice with no intervening free, the second
+  alloc panics. (Cannot detect double-allocations via
+  `alloc_pages_on`, which doesn't go through this path.)
+- `memory/src/frame.rs`: 1024-entry circular history of every
+  `free_frame_tagged` and `alloc_frame_on` event keyed by phys
+  address + site tag. Available to consumers via
+  `__free_history_lookup(phys)`.
+- `memory/src/buddy.rs`: `BuddyZone::free` now scans every
+  free list before push, panicking if the new block overlaps
+  an existing one. Includes a stack-text-address scan + the
+  prior site tag from the free history.
+- `console/src/lib.rs`: panic-handler RBP walk now accepts
+  both kernel-high-half (`0xffff_...`) and boot-low-half
+  (`0x010xxxxx`) RBP values so we get backtraces during
+  pre-MMU-swap panics.
+- Site tags 100/101/200/201/202/203/204 plumbed through
+  `unmap_region_pages`, `mlock` race retry, the
+  `free_user_pml4_tree` PT/PD/PDPT/PML4 frees, and the
+  PML4-alloc error path so each free has a unique caller id.
+
+### What we know now
+
+- The duplicate frame moves around (`0xb000`, `0x1d3000`,
+  `0x27dd000` depending on test order), but the bug always
+  surfaces inside a test that drops a user `AddressSpace`.
+- With site tags in place, the duplicate's prior owner is
+  `203` (the PML4 frame itself, freed last in
+  `free_user_pml4_tree`) — and the most recent allocation
+  before the panicking free is recorded as `0xA110C`
+  (the alloc sentinel), confirming the buddy re-issued the
+  frame *between* the two frees without the second caller
+  ever returning it.
+- The drop sequence is: `for r in regions { unmap_region_pages(r) }
+  → free_user_pml4_tree(self.root)`. Both paths *should* free
+  distinct frames; the panic shows them freeing the same one.
+
+### Remaining bisection step
+
+Add a `(virt, phys)` pair-print to `unmap_4kb` for every leaf it
+unmaps, and a `(slot, frame)` print to `free_user_pml4_tree` for
+every PT/PD/PDPT it walks. The duplicate `phys` value will appear
+in both transcripts — that names the region whose phys vec aliases
+a page-table frame in PML4[1]'s subtree (or whose materialize
+path wrote the page-table frame into a Region.phys[] by mistake).
+
+That's the next concrete step. See git log for the commit
+`(WIP) memory: double-free detector + tagged free_frame sites`.
+
 ## What's landed despite this
 
 - `e8f47b5`: LZ4 codec + Zpool compressed page pool, fully unit-

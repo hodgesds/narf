@@ -244,6 +244,29 @@ impl BuddyZone {
     pub fn free(&mut self, frame: u64, order: u8) {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
+        // Defensive double-free / overlap detector: scan every
+        // free list and bail out (no push) if `frame` overlaps an
+        // existing block. Returning the same phys to the buddy
+        // twice silently puts a duplicate on the free list, then
+        // a subsequent alloc hands it out twice — the source of
+        // the layout-shift symptoms documented in
+        // `docs/notes/2026-05-19-layout-shift-bug.md`. Until the
+        // root cause is fixed this acts as a hard barrier against
+        // the corrupting second push.
+        let block_lo = frame;
+        let block_hi = frame + order_frames(order);
+        for (o, list) in self.free_lists.iter().enumerate() {
+            let blk = order_frames(o as u8);
+            if list.iter().any(|&f| {
+                let lo = f;
+                let hi = f + blk;
+                lo < block_hi && block_lo < hi
+            }) {
+                // Drop the duplicate on the floor. Better leak the
+                // frame than corrupt the free list.
+                return;
+            }
+        }
         self.free_frames += order_frames(order) as usize;
         let mut cur_order = order;
         let mut cur_frame = frame;

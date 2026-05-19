@@ -94,10 +94,7 @@ pub fn run_all() -> Summary {
         // last name printed identifies the culprit. Only emitted
         // when the build flag asks for it; default keeps the
         // existing terse "[OK] name" output.
-        #[cfg(feature = "user-mode-e2e")]
-        {
-            let _ = writeln!(Writer, "  [run] {}", t.name);
-        }
+        let _ = writeln!(Writer, "  [run] {}", t.name);
         match (t.run)() {
             TestResult::Pass => {
                 let _ = writeln!(Writer, "  [ OK ] {}", t.name);

@@ -196,6 +196,17 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // SAFETY: `read_cr3` is a single privileged read — legal at CPL=0.
     let cur_pml4 = unsafe { read_cr3() };
 
+    // Defensive: a zero CR3 means the previous task or test path
+    // somehow left CR3 unrestored / cleared. The unconditional
+    // copy below would panic on the `null source` precondition;
+    // surface a clean error here so callers see a typed failure
+    // instead of a kernel-test #GP / nounwind_fmt panic with no
+    // backtrace.
+    if cur_pml4.raw() == 0 {
+        crate::frame::free_frame_tagged(frame, 204);
+        return Err(PageTableAllocError::NoFrame);
+    }
+
     // Full-copy the 4 KiB of PML4 entries into the fresh frame.
     // SAFETY: both `cur_pml4` and `phys` point at properly-aligned
     // `PageTable`-sized identity-mapped regions.
@@ -687,7 +698,7 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
 /// - No CPU may be using `pml4_phys` as its active CR3 at the
 ///   time of the call.
 pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
-    use crate::frame::{free_frame, PhysFrame};
+    use crate::frame::{free_frame_tagged, PhysFrame};
     if pml4_phys.raw() == 0 {
         return;
     }
@@ -732,16 +743,16 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                 // PT — leaf-level table; data frames already freed
                 // by AddressSpace::unmap_region_pages. Just reclaim
                 // the table page itself.
-                free_frame(PhysFrame::new(pde.addr()));
+                free_frame_tagged(PhysFrame::new(pde.addr()), 200);
             }
-            free_frame(PhysFrame::new(pd_pa));
+            free_frame_tagged(PhysFrame::new(pd_pa), 201);
         }
-        free_frame(PhysFrame::new(pdpt_pa));
+        free_frame_tagged(PhysFrame::new(pdpt_pa), 202);
         // Clear the PML4 slot so a stray reuse panics noisily.
         pml4.entries[slot] = PageTableEntry::EMPTY;
     }
     // Finally release the PML4 itself.
-    free_frame(PhysFrame::new(pml4_phys));
+    free_frame_tagged(PhysFrame::new(pml4_phys), 203);
 }
 
 /// Return the PT-level flags currently set for `virt`, or `None` if

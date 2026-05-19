@@ -273,7 +273,7 @@ impl AddressSpace {
     /// no lock during this walk on purpose — see its comment).
     #[cfg(target_arch = "x86_64")]
     unsafe fn unmap_region_pages(&self, region: &Region) {
-        use crate::frame::{free_frame, PhysFrame};
+        use crate::frame::{free_frame_tagged, PhysFrame};
         use crate::x86_64::paging::unmap_4kb;
         if self.root.as_u64() == 0 {
             return;
@@ -286,7 +286,7 @@ impl AddressSpace {
             // bookkept by `map_region`.
             match unsafe { unmap_4kb(self.root, v) } {
                 Ok(phys) => {
-                    free_frame(PhysFrame::new(phys));
+                    free_frame_tagged(PhysFrame::new(phys), 100);
                 }
                 // Already-unmapped (double munmap, or the region was
                 // partially materialised) is benign: the bookkeeping
@@ -675,7 +675,7 @@ impl AddressSpace {
                         } else {
                             // Raced with a demand fault that beat
                             // us to it — give the frame back.
-                            crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+                            crate::frame::free_frame_tagged(crate::frame::PhysFrame::new(phys), 101);
                         }
                     }
                     r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);

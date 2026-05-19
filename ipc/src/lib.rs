@@ -235,6 +235,15 @@ pub enum TrySendError<T> {
 }
 
 impl<T: Send + 'static + Retag, const N: usize> Producer<T, N> {
+    /// Diagnostic: pointer to the inner `Ring`. Useful in canary
+    /// smokes that need to verify channel construction landed the
+    /// `Arc<Ring>` allocation inside the expected heap range, not
+    /// in MMIO / reserved territory.
+    #[doc(hidden)]
+    pub fn __ring_ptr_for_test(&self) -> *const () {
+        Arc::as_ptr(&self.ring) as *const ()
+    }
+
     /// Non-blocking send. On `Full`, the message is returned to the
     /// caller so no data is silently dropped.
     pub fn try_send(&mut self, msg: T) -> Result<(), TrySendError<T>> {
@@ -367,6 +376,13 @@ pub enum RecvError {
 }
 
 impl<T: Send + 'static + Retag, const N: usize> Consumer<T, N> {
+    /// Diagnostic: pointer to the inner `Ring`. Mirror of
+    /// `Producer::__ring_ptr_for_test` on the consumer half.
+    #[doc(hidden)]
+    pub fn __ring_ptr_for_test(&self) -> *const () {
+        Arc::as_ptr(&self.ring) as *const ()
+    }
+
     /// Non-blocking peek-and-take. `None` means empty; `Closed` is
     /// only reported once the ring has drained.
     pub fn try_recv(&mut self) -> Result<Option<T>, RecvError> {
