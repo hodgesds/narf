@@ -501,6 +501,274 @@ fn smoke_frame_alloc_roundtrip() -> TestResult {
 }
 kernel_test_in!("memory", smoke_frame_alloc_roundtrip);
 
+fn smoke_frame_alloc_returns_pointer_in_ram() -> TestResult {
+    // Catches a buddy mis-init that hands back frames past the
+    // early MMU identity-map ceiling (4 GiB on x86_64).
+    // Allocations that come from above the ceiling page-fault on
+    // first access via the kernel direct-map path.
+    let usable_bytes: u64 = 4u64 << 30;
+    let mut leaked: alloc::vec::Vec<crate::PhysFrame> = alloc::vec::Vec::with_capacity(32);
+    for _ in 0..32 {
+        match crate::alloc_frame() {
+            Ok(f) => {
+                let p = f.start_address().raw();
+                if p >= usable_bytes {
+                    // Free what we took before failing so the test
+                    // doesn't leak frames on the broken path.
+                    for ff in leaked.drain(..) {
+                        crate::free_frame(ff);
+                    }
+                    crate::free_frame(f);
+                    return TestResult::Fail("alloc_frame returned address past usable RAM");
+                }
+                if p & (crate::PAGE_SIZE - 1) != 0 {
+                    for ff in leaked.drain(..) {
+                        crate::free_frame(ff);
+                    }
+                    crate::free_frame(f);
+                    return TestResult::Fail("alloc_frame returned non-page-aligned address");
+                }
+                leaked.push(f);
+            }
+            Err(crate::FrameAllocError::Uninitialised) => {
+                return TestResult::Skip("frame allocator not initialised");
+            }
+            Err(_) => {
+                for ff in leaked.drain(..) {
+                    crate::free_frame(ff);
+                }
+                return TestResult::Fail("alloc_frame failed mid-loop");
+            }
+        }
+    }
+    for f in leaked.drain(..) {
+        crate::free_frame(f);
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_frame_alloc_returns_pointer_in_ram);
+
+fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
+    // Same guarantee for the slab. Catches the case where a slab
+    // class is grown from a buddy frame past the early MMU
+    // identity-map ceiling (4 GiB) — every slab object inside
+    // that frame would then page-fault on first access.
+    use core::alloc::Layout;
+    let usable_bytes: u64 = 4u64 << 30;
+    // Cover every size class (16 .. 4096) to stress every class's
+    // grow path. Each class returns its first block from a freshly
+    // grown buddy frame after a few allocs.
+    let class_sizes = [16usize, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+    let mut held: alloc::vec::Vec<(core::ptr::NonNull<u8>, Layout)> =
+        alloc::vec::Vec::with_capacity(class_sizes.len() * 4);
+    for size in class_sizes {
+        for _ in 0..4 {
+            let layout = Layout::from_size_align(size, size.min(64)).unwrap();
+            match crate::slab::alloc(layout) {
+                Ok(p) => {
+                    let raw = p.as_ptr() as u64;
+                    if raw >= usable_bytes {
+                        for (q, ql) in held.drain(..) {
+                            unsafe {
+                                crate::slab::dealloc(q, ql);
+                            }
+                        }
+                        unsafe {
+                            crate::slab::dealloc(p, layout);
+                        }
+                        return TestResult::Fail(
+                            "slab::alloc returned address past usable RAM",
+                        );
+                    }
+                    if raw & (layout.align() as u64 - 1) != 0 {
+                        for (q, ql) in held.drain(..) {
+                            unsafe {
+                                crate::slab::dealloc(q, ql);
+                            }
+                        }
+                        unsafe {
+                            crate::slab::dealloc(p, layout);
+                        }
+                        return TestResult::Fail("slab::alloc returned misaligned");
+                    }
+                    held.push((p, layout));
+                }
+                Err(_) => {
+                    for (q, ql) in held.drain(..) {
+                        unsafe {
+                            crate::slab::dealloc(q, ql);
+                        }
+                    }
+                    return TestResult::Skip("slab::alloc failed");
+                }
+            }
+        }
+    }
+    for (p, layout) in held.drain(..) {
+        unsafe {
+            crate::slab::dealloc(p, layout);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_alloc_returns_pointer_in_ram);
+
+fn smoke_slab_double_alloc_distinct_pointers() -> TestResult {
+    // The slab must NEVER return the same pointer to two outstanding
+    // allocs. A failure here is a use-after-free or freelist
+    // corruption — exactly the shape that produces the layout-shift
+    // bug we're chasing (where struct fields read each other's
+    // bytes).
+    use core::alloc::Layout;
+    let layout = Layout::from_size_align(64, 64).unwrap();
+    let a = match crate::slab::alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Skip("slab::alloc failed"),
+    };
+    let b = match crate::slab::alloc(layout) {
+        Ok(p) => p,
+        Err(_) => {
+            unsafe {
+                crate::slab::dealloc(a, layout);
+            }
+            return TestResult::Skip("second slab::alloc failed");
+        }
+    };
+    if a.as_ptr() == b.as_ptr() {
+        unsafe {
+            crate::slab::dealloc(a, layout);
+        }
+        return TestResult::Fail("slab::alloc returned the same pointer twice");
+    }
+    unsafe {
+        crate::slab::dealloc(a, layout);
+        crate::slab::dealloc(b, layout);
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_double_alloc_distinct_pointers);
+
+#[allow(dead_code)]
+fn _smoke_slab_freed_block_zeroed_on_next_alloc() -> TestResult {
+    // After dealloc, the bytes in a returned block become "free
+    // metadata" (the slab writes a `next` pointer into the head).
+    // When the block is re-allocated, the caller has no guarantee
+    // about those bytes until they overwrite — but the slab is
+    // expected to not LEAK uninit metadata that would dereference
+    // to a wild pointer if read as one.
+    //
+    // We can't observe "uninit" directly, but we can confirm: write
+    // a recognisable pattern into the block, free, re-alloc, and
+    // check the pattern was overwritten with at least the slab's
+    // metadata (a NonNull which is non-zero). This isn't a
+    // correctness test — it's a sentinel to spot freelist
+    // overwrites.
+    use core::alloc::Layout;
+    let layout = Layout::from_size_align(64, 64).unwrap();
+    let p1 = match crate::slab::alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Skip("slab::alloc failed"),
+    };
+    // Write a known pattern. Use 0xAA to avoid collision with any
+    // realistic freelist sentinel.
+    unsafe {
+        for i in 0..64 {
+            p1.as_ptr().add(i).write(0xAA);
+        }
+    }
+    unsafe {
+        crate::slab::dealloc(p1, layout);
+    }
+    let p2 = match crate::slab::alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Skip("re-alloc failed"),
+    };
+    // If we got the same block back, the first 8 bytes should be
+    // the slab's `next` pointer (a NonNull, written when the block
+    // was pushed onto the magazine / central list). If the block
+    // is different, this test doesn't say anything strong.
+    if p1.as_ptr() == p2.as_ptr() {
+        let first8: u64 = unsafe { core::ptr::read_volatile(p2.as_ptr() as *const u64) };
+        // Slab freelist writes either a NonNull<FreeBlock> (low 48
+        // bits non-zero) or zero (last block in list). If we read
+        // 0xAAAAAA... back, the freelist didn't overwrite — that's
+        // a bug.
+        if first8 == 0xAAAAAAAAAAAAAAAA {
+            unsafe {
+                crate::slab::dealloc(p2, layout);
+            }
+            return TestResult::Fail("slab returned the freed block with caller bytes intact");
+        }
+    }
+    unsafe {
+        crate::slab::dealloc(p2, layout);
+    }
+    TestResult::Pass
+}
+// (kernel_test_in disabled — this is a sentinel/diagnostic that
+// produces false positives; the slab's correctness is exercised
+// by the round-trip + distinct-pointer tests above.)
+
+fn smoke_alloc_pages_on_returns_in_ram() -> TestResult {
+    // `alloc_pages_on(node, order)` allocates a contiguous run of
+    // pages on a specific NUMA node. Same guarantee as alloc_frame:
+    // never returns an address past usable RAM. Exercises NUMA
+    // routing — if node 1's base were mis-configured to 0x4000_0000
+    // (the QEMU PCI hole), allocations from that node would land
+    // there and a downstream dereference would fault.
+    use crate::frame::alloc_pages_on;
+    let s = crate::frame_stats();
+    let usable_bytes = (s.total as u64).saturating_mul(crate::PAGE_SIZE);
+    let pages = match alloc_pages_on(0, 0) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Skip("alloc_pages_on failed"),
+    };
+    let phys = pages.start_address().raw();
+    let ok_range = phys < usable_bytes;
+    let ok_align = phys & (crate::PAGE_SIZE - 1) == 0;
+    crate::frame::free_pages(pages, 0);
+    if !ok_range {
+        return TestResult::Fail("alloc_pages_on returned address past usable RAM");
+    }
+    if !ok_align {
+        return TestResult::Fail("alloc_pages_on returned a non-page-aligned address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_alloc_pages_on_returns_in_ram);
+
+fn smoke_alloc_pages_on_node1_below_4gb() -> TestResult {
+    // Node 1 specifically — under the boot identity map, the
+    // allocator must never hand back a frame above 4 GiB physical
+    // because nothing maps that range. The EARLY_PHYS_CEILING
+    // mechanism is supposed to enforce this. Catches a NUMA-
+    // redistribution bug where node 1's zone ends up with
+    // out-of-range frames.
+    use crate::frame::alloc_pages_on;
+    const FOUR_GB: u64 = 4u64 << 30;
+    let mut leaked = alloc::vec::Vec::with_capacity(8);
+    let mut bad_count = 0u32;
+    for _ in 0..8 {
+        match alloc_pages_on(1, 0) {
+            Ok(p) => {
+                if p.start_address().raw() >= FOUR_GB {
+                    bad_count += 1;
+                }
+                leaked.push(p);
+            }
+            Err(_) => break,
+        }
+    }
+    for p in leaked.drain(..) {
+        crate::frame::free_pages(p, 0);
+    }
+    if bad_count > 0 {
+        return TestResult::Fail("alloc_pages_on(node=1) returned a frame >= 4 GiB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_alloc_pages_on_node1_below_4gb);
+
 fn smoke_domain_primitive_trait() -> TestResult {
     // Trait-level dispatch through `arch::Domain::*`.
     use narf_arch::{DomainBackend, DomainPrimitive};
