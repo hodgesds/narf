@@ -596,3 +596,275 @@ pub fn attached_uvc_count() -> usize {
 pub fn __reset_uvc_for_test() {
     UVC_DEVICES.lock().clear();
 }
+
+// ── UVC payload header (§2.4.3.3) ──────────────────────────────────
+//
+// Every iso packet (and every bulk transfer in bulk-streaming mode)
+// starts with a UVC payload header. The first byte is the header
+// length; the second is a bit-field of frame flags. Then optionally
+// 4 bytes of Presentation Time Stamp (PTS) and 6 bytes of Source
+// Clock Reference (SCR) if their flag bits are set.
+
+/// BFH (Bit Field Header) flag bits at offset 1.
+pub mod bfh {
+    /// `FID` — Frame ID. Toggles between adjacent frames so the host
+    /// detects frame boundaries even when EOF/SOF events are missed.
+    pub const FID: u8 = 1 << 0;
+    /// `EOF` — End Of Frame on this payload.
+    pub const EOF: u8 = 1 << 1;
+    /// `PTS` — bytes 2..6 carry a 32-bit Presentation Time Stamp.
+    pub const PTS: u8 = 1 << 2;
+    /// `SCR` — 6-byte Source Clock Reference present.
+    pub const SCR: u8 = 1 << 3;
+    /// `RES` — reserved.
+    pub const RES: u8 = 1 << 4;
+    /// `STI` — Still Image marker.
+    pub const STI: u8 = 1 << 5;
+    /// `ERR` — payload contains an error (driver should drop the
+    /// current frame).
+    pub const ERR: u8 = 1 << 6;
+    /// `EOH` — End Of Header (must be set on every payload).
+    pub const EOH: u8 = 1 << 7;
+}
+
+/// Decoded UVC payload header.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UvcPayloadHeader {
+    /// Total header length in bytes (typically 2 or 12).
+    pub length: u8,
+    /// Raw BFH byte — caller masks against [`bfh`] constants.
+    pub bfh: u8,
+    /// Presentation Time Stamp if BFH.PTS set; None otherwise.
+    pub pts: Option<u32>,
+    /// Source Clock Reference if BFH.SCR set. Two values: bus-clock
+    /// at sampling (32 bits) + SOF token at sampling (16 bits).
+    pub scr: Option<(u32, u16)>,
+}
+
+impl UvcPayloadHeader {
+    /// Decode the header from a payload's prefix. Returns Err if
+    /// the buffer is too short or the header length is invalid.
+    pub fn parse(buf: &[u8]) -> Result<Self, UvcError> {
+        if buf.len() < 2 {
+            return Err(UvcError::Short);
+        }
+        let length = buf[0];
+        if length < 2 || length as usize > buf.len() {
+            return Err(UvcError::Truncated);
+        }
+        let bfh = buf[1];
+        let mut off = 2usize;
+        let pts = if bfh & bfh::PTS != 0 {
+            if length as usize - off < 4 {
+                return Err(UvcError::Truncated);
+            }
+            let v = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            Some(v)
+        } else {
+            None
+        };
+        let scr = if bfh & bfh::SCR != 0 {
+            if length as usize - off < 6 {
+                return Err(UvcError::Truncated);
+            }
+            let bus = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let sof = u16::from_le_bytes([buf[off + 4], buf[off + 5]]);
+            Some((bus, sof))
+        } else {
+            None
+        };
+        Ok(Self {
+            length,
+            bfh,
+            pts,
+            scr,
+        })
+    }
+    /// True iff the End-Of-Frame marker is set.
+    pub fn is_eof(&self) -> bool {
+        self.bfh & bfh::EOF != 0
+    }
+    /// True iff the payload reports an error and the driver should
+    /// drop the in-flight frame.
+    pub fn is_error(&self) -> bool {
+        self.bfh & bfh::ERR != 0
+    }
+    /// FID bit — toggles between frames.
+    pub fn fid(&self) -> bool {
+        self.bfh & bfh::FID != 0
+    }
+}
+
+// ── VS Probe/Commit Control (§4.3.1.1) ─────────────────────────────
+//
+// Before opening the iso stream, the host issues SET_CUR(PROBE)
+// with its desired (FormatIndex, FrameIndex, FrameInterval), reads
+// back GET_CUR(PROBE) to learn what the device accepted, then
+// SET_CUR(COMMIT) to lock in. UVC 1.0/1.1 use a 26-byte payload;
+// UVC 1.5 extends to 34 bytes.
+
+/// UVC class-specific request codes (§A.8).
+pub const VS_REQ_SET_CUR: u8 = 0x01;
+pub const VS_REQ_GET_CUR: u8 = 0x81;
+pub const VS_REQ_GET_MIN: u8 = 0x82;
+pub const VS_REQ_GET_MAX: u8 = 0x83;
+pub const VS_REQ_GET_DEF: u8 = 0x87;
+
+/// wValue for the Probe control. High byte = control selector;
+/// low byte = 0.
+pub const VS_PROBE_CONTROL: u16 = 0x0100;
+pub const VS_COMMIT_CONTROL: u16 = 0x0200;
+
+/// VS Probe/Commit Control payload (UVC 1.0/1.1 — 26 bytes).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct VsProbeCommit {
+    /// Bit-field — bit 0 = hint dwFrameInterval, etc. Caller usually
+    /// sets this to 1 to advertise "frame_interval is the one we want".
+    pub hint: u16,
+    /// `bFormatIndex` — 1-based index into the format descriptors.
+    pub format_index: u8,
+    /// `bFrameIndex` — 1-based index into the frame descriptors of
+    /// the chosen format.
+    pub frame_index: u8,
+    /// Desired interval in 100 ns units. 333_333 = 30 fps.
+    pub frame_interval: u32,
+    pub key_frame_rate: u16,
+    pub p_frame_rate: u16,
+    pub comp_quality: u16,
+    pub comp_window_size: u16,
+    pub delay: u16,
+    pub max_video_frame_size: u32,
+    pub max_payload_transfer_size: u32,
+}
+
+impl VsProbeCommit {
+    pub const LEN_V10: usize = 26;
+
+    /// Serialise into a 26-byte buffer for SET_CUR(PROBE/COMMIT).
+    pub fn encode(&self) -> [u8; Self::LEN_V10] {
+        let mut b = [0u8; Self::LEN_V10];
+        b[0..2].copy_from_slice(&self.hint.to_le_bytes());
+        b[2] = self.format_index;
+        b[3] = self.frame_index;
+        b[4..8].copy_from_slice(&self.frame_interval.to_le_bytes());
+        b[8..10].copy_from_slice(&self.key_frame_rate.to_le_bytes());
+        b[10..12].copy_from_slice(&self.p_frame_rate.to_le_bytes());
+        b[12..14].copy_from_slice(&self.comp_quality.to_le_bytes());
+        b[14..16].copy_from_slice(&self.comp_window_size.to_le_bytes());
+        b[16..18].copy_from_slice(&self.delay.to_le_bytes());
+        b[18..22].copy_from_slice(&self.max_video_frame_size.to_le_bytes());
+        b[22..26].copy_from_slice(&self.max_payload_transfer_size.to_le_bytes());
+        b
+    }
+
+    /// Parse a 26-byte GET_CUR/MIN/MAX/DEF response.
+    pub fn decode(buf: &[u8]) -> Result<Self, UvcError> {
+        if buf.len() < Self::LEN_V10 {
+            return Err(UvcError::Short);
+        }
+        Ok(Self {
+            hint: u16::from_le_bytes([buf[0], buf[1]]),
+            format_index: buf[2],
+            frame_index: buf[3],
+            frame_interval: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            key_frame_rate: u16::from_le_bytes([buf[8], buf[9]]),
+            p_frame_rate: u16::from_le_bytes([buf[10], buf[11]]),
+            comp_quality: u16::from_le_bytes([buf[12], buf[13]]),
+            comp_window_size: u16::from_le_bytes([buf[14], buf[15]]),
+            delay: u16::from_le_bytes([buf[16], buf[17]]),
+            max_video_frame_size: u32::from_le_bytes(buf[18..22].try_into().unwrap()),
+            max_payload_transfer_size: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
+        })
+    }
+}
+
+// ── Frame reassembler ──────────────────────────────────────────────
+//
+// Drives a sequence of iso payloads through the FID/EOF state
+// machine to reassemble whole frames. The xHCI iso ring delivers
+// one payload per packet; this reassembler accumulates them into
+// a single buffer and yields a complete frame on EOF.
+
+#[derive(Debug)]
+pub struct UvcFrameReassembler {
+    /// In-flight frame buffer.
+    pub buffer: Vec<u8>,
+    /// Current frame's FID bit. New frames flip this.
+    pub current_fid: bool,
+    /// True if any payload in the current frame had BFH.ERR set —
+    /// drop on EOF.
+    pub frame_errored: bool,
+    /// Sequence number incremented on each completed frame.
+    pub frames_completed: u64,
+}
+
+impl UvcFrameReassembler {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            current_fid: false,
+            frame_errored: false,
+            frames_completed: 0,
+        }
+    }
+
+    /// What the reassembler did with the just-pushed packet.
+    pub fn push(&mut self, packet: &[u8]) -> ReassemblerOutcome {
+        let hdr = match UvcPayloadHeader::parse(packet) {
+            Ok(h) => h,
+            Err(_) => return ReassemblerOutcome::Skipped,
+        };
+        let payload = &packet[hdr.length as usize..];
+        // FID flip means we're entering a new frame — drop the
+        // in-flight buffer (it never saw EOF).
+        if hdr.fid() != self.current_fid {
+            self.buffer.clear();
+            self.frame_errored = false;
+            self.current_fid = hdr.fid();
+        }
+        if hdr.is_error() {
+            self.frame_errored = true;
+        }
+        self.buffer.extend_from_slice(payload);
+        if hdr.is_eof() {
+            if self.frame_errored {
+                self.buffer.clear();
+                self.frame_errored = false;
+                ReassemblerOutcome::Errored
+            } else {
+                self.frames_completed += 1;
+                ReassemblerOutcome::FrameComplete
+            }
+        } else {
+            ReassemblerOutcome::Appended
+        }
+    }
+
+    /// Take ownership of the just-completed frame buffer, leaving
+    /// the reassembler ready for the next one.
+    pub fn take_frame(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        core::mem::swap(&mut out, &mut self.buffer);
+        out
+    }
+}
+
+impl Default for UvcFrameReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What [`UvcFrameReassembler::push`] did with a packet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReassemblerOutcome {
+    /// Packet bytes appended to the in-flight buffer; frame not done yet.
+    Appended,
+    /// EOF saw a clean frame — buffer has a full frame ready.
+    FrameComplete,
+    /// EOF saw an error somewhere — buffer was dropped.
+    Errored,
+    /// Packet header didn't parse — skipped (logged + dropped).
+    Skipped,
+}

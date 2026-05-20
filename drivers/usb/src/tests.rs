@@ -1615,3 +1615,131 @@ kernel_test_in!(
     "drivers/usb/cdc_ncm",
     smoke_usb_cdc_ncm_finder_picks_bulk_pair_under_data_iface
 );
+
+// ── drivers/usb/uvc (payload header + Probe/Commit + reassembler) ──
+
+fn smoke_usb_uvc_payload_header_decodes_pts_and_eof() -> TestResult {
+    use crate::uvc::{bfh, UvcPayloadHeader};
+    // 6-byte header: length=6, BFH = EOH|EOF|PTS, PTS=0x12345678.
+    let buf = [
+        6,
+        bfh::EOH | bfh::EOF | bfh::PTS,
+        0x78, 0x56, 0x34, 0x12,
+        // payload bytes follow — not in the header itself
+        0xAA, 0xBB,
+    ];
+    let h = match UvcPayloadHeader::parse(&buf) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("parse rejected valid header"),
+    };
+    if h.length != 6 {
+        return TestResult::Fail("length not preserved");
+    }
+    if !h.is_eof() {
+        return TestResult::Fail("EOF bit not detected");
+    }
+    if h.is_error() {
+        return TestResult::Fail("ERR falsely detected");
+    }
+    if h.pts != Some(0x1234_5678) {
+        return TestResult::Fail("PTS decode wrong");
+    }
+    if h.scr.is_some() {
+        return TestResult::Fail("SCR must be None when bit clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_payload_header_decodes_pts_and_eof);
+
+fn smoke_usb_uvc_payload_header_rejects_truncated() -> TestResult {
+    use crate::uvc::{bfh, UvcPayloadHeader, UvcError};
+    // BFH says PTS|SCR (4+6 bytes follow) but length=2 means none of
+    // those bytes are inside the declared header → Truncated.
+    let buf = [2, bfh::EOH | bfh::PTS | bfh::SCR];
+    match UvcPayloadHeader::parse(&buf) {
+        Err(UvcError::Truncated) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("PTS+SCR with length=2 must reject"),
+        Err(_) => TestResult::Fail("wrong error variant"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_payload_header_rejects_truncated
+);
+
+fn smoke_usb_uvc_probe_commit_round_trip() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    let src = VsProbeCommit {
+        hint: 0x0001,
+        format_index: 1,
+        frame_index: 3,
+        frame_interval: 333_333, // 30 fps
+        max_video_frame_size: 1280 * 720 * 2,
+        max_payload_transfer_size: 1024,
+        ..Default::default()
+    };
+    let bytes = src.encode();
+    if bytes.len() != VsProbeCommit::LEN_V10 {
+        return TestResult::Fail("encoded length wrong");
+    }
+    let back = VsProbeCommit::decode(&bytes).expect("decode");
+    if back != src {
+        return TestResult::Fail("round-trip lost fields");
+    }
+    // 30 fps confirmation: 100ns units, so 333333 ≈ 30 fps.
+    if back.frame_interval != 333_333 {
+        return TestResult::Fail("frame_interval lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_probe_commit_round_trip);
+
+fn smoke_usb_uvc_reassembler_completes_two_packet_frame() -> TestResult {
+    use crate::uvc::{bfh, ReassemblerOutcome, UvcFrameReassembler};
+    let mut r = UvcFrameReassembler::new();
+    // Packet 1: header (length=2, BFH=EOH|FID), payload = [0xAA, 0xBB].
+    let p1 = [2, bfh::EOH | bfh::FID, 0xAA, 0xBB];
+    if r.push(&p1) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("first packet must Append");
+    }
+    // Packet 2: header (length=2, BFH=EOH|FID|EOF), payload = [0xCC, 0xDD].
+    let p2 = [2, bfh::EOH | bfh::FID | bfh::EOF, 0xCC, 0xDD];
+    if r.push(&p2) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("second packet (EOF) must complete frame");
+    }
+    let frame = r.take_frame();
+    if frame != alloc::vec![0xAA, 0xBB, 0xCC, 0xDD] {
+        return TestResult::Fail("reassembled frame bytes wrong");
+    }
+    if r.frames_completed != 1 {
+        return TestResult::Fail("frames_completed must be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_reassembler_completes_two_packet_frame
+);
+
+fn smoke_usb_uvc_reassembler_drops_errored_frame() -> TestResult {
+    use crate::uvc::{bfh, ReassemblerOutcome, UvcFrameReassembler};
+    let mut r = UvcFrameReassembler::new();
+    let p1 = [2, bfh::EOH | bfh::FID, 0xAA];
+    r.push(&p1);
+    // ERR set on EOF packet → reassembler must yield Errored + empty buf.
+    let p2 = [2, bfh::EOH | bfh::FID | bfh::EOF | bfh::ERR, 0xBB];
+    if r.push(&p2) != ReassemblerOutcome::Errored {
+        return TestResult::Fail("ERR on EOF must yield Errored");
+    }
+    if !r.buffer.is_empty() {
+        return TestResult::Fail("errored frame must clear buffer");
+    }
+    if r.frames_completed != 0 {
+        return TestResult::Fail("errored frame must NOT increment counter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_reassembler_drops_errored_frame
+);
