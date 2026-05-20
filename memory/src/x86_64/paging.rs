@@ -203,9 +203,10 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // instead of a kernel-test #GP / nounwind_fmt panic with no
     // backtrace.
     if cur_pml4.raw() == 0 {
-        crate::frame::free_frame_tagged(frame, 204);
+        crate::frame::free_frame(frame);
         return Err(PageTableAllocError::NoFrame);
     }
+    crate::frame::__pagetable_register(phys.raw());
 
     // Full-copy the 4 KiB of PML4 entries into the fresh frame.
     // SAFETY: both `cur_pml4` and `phys` point at properly-aligned
@@ -245,6 +246,18 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         let user_pdpt_frame = crate::frame::alloc_frame_on(node)
             .map_err(|_| PageTableAllocError::NoFrame)?;
         let user_pdpt_phys = user_pdpt_frame.start_address();
+        // Sanity: user_pdpt phys must differ from the PML4 phys
+        // we just allocated. If alloc handed back the same frame
+        // twice the buddy is corrupt — fail loudly here so the
+        // overlap is named instead of cascading into a later
+        // double-free.
+        if user_pdpt_phys.raw() == phys.raw() {
+            panic!(
+                "new_user_pml4_on: alloc returned PML4 phys 0x{:x} twice (as user_pdpt)",
+                phys.raw()
+            );
+        }
+        crate::frame::__pagetable_register(user_pdpt_phys.raw());
         // Zero the fresh PDPT.
         // SAFETY: identity-mapped freshly-allocated frame.
         unsafe {
@@ -698,7 +711,7 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
 /// - No CPU may be using `pml4_phys` as its active CR3 at the
 ///   time of the call.
 pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
-    use crate::frame::{free_frame_tagged, PhysFrame};
+    use crate::frame::{free_frame, PhysFrame};
     if pml4_phys.raw() == 0 {
         return;
     }
@@ -719,12 +732,31 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     // `alloc_coherent` hands the freed PDPT to a driver, `memset`
     // zeros it, and the huge-page entries vanish mid-write — the
     // exact #PF that surfaced the audio probe regression.
-    for slot in [1usize] {
+    // Walk user-owned PML4 slots only:
+    //
+    // - Slot 1: the user-binary subtree, allocated by
+    //   `new_user_pml4_on` (PDPT freshly alloc'd, PDPT[1..512]
+    //   copied from kernel as HUGE_PAGE entries which we skip).
+    // - Slot 129: the MMAP_CURSOR subtree at virt 0x4080_0000_0000,
+    //   populated by `materialize`'s `ensure_next_table` when
+    //   user mmap'd regions land. The PDPT here is entirely
+    //   AS-private and reclaimable.
+    //
+    // Slot 0 (kernel low-4-GiB identity) and slots 256..512
+    // (kernel-half) are SHARED with the kernel — the
+    // `new_user_pml4_on` full-copy duplicates the kernel PDPT
+    // pointer into the user PML4, so freeing them would return
+    // the kernel's page-table pages to the buddy. NEVER walk
+    // those.
+    for &slot in &[1usize, 129usize] {
         let pml4e = pml4.entries[slot];
         if !pml4e.is_present() {
             continue;
         }
         let pdpt_pa = pml4e.addr();
+        if pdpt_pa.raw() < 0x100000 {
+            continue;
+        }
         // SAFETY: identity-reachable; PDPT is a page-table frame.
         let pdpt = unsafe { &mut *pdpt_pa.as_mut_ptr::<PageTable>() };
         for pdpt_idx in 0..512usize {
@@ -743,16 +775,20 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                 // PT — leaf-level table; data frames already freed
                 // by AddressSpace::unmap_region_pages. Just reclaim
                 // the table page itself.
-                free_frame_tagged(PhysFrame::new(pde.addr()), 200);
+                crate::frame::__pagetable_unregister(pde.addr().raw());
+                free_frame(PhysFrame::new(pde.addr()));
             }
-            free_frame_tagged(PhysFrame::new(pd_pa), 201);
+            crate::frame::__pagetable_unregister(pd_pa.raw());
+            free_frame(PhysFrame::new(pd_pa));
         }
-        free_frame_tagged(PhysFrame::new(pdpt_pa), 202);
+        crate::frame::__pagetable_unregister(pdpt_pa.raw());
+        free_frame(PhysFrame::new(pdpt_pa));
         // Clear the PML4 slot so a stray reuse panics noisily.
         pml4.entries[slot] = PageTableEntry::EMPTY;
     }
     // Finally release the PML4 itself.
-    free_frame_tagged(PhysFrame::new(pml4_phys), 203);
+    crate::frame::__pagetable_unregister(pml4_phys.raw());
+    free_frame(PhysFrame::new(pml4_phys));
 }
 
 /// Return the PT-level flags currently set for `virt`, or `None` if
@@ -860,6 +896,7 @@ unsafe fn ensure_next_table(
     }
     let frame = crate::alloc_frame().map_err(|_| MapError::FrameExhausted)?;
     let phys = frame.start_address();
+    crate::frame::__pagetable_register(phys.raw());
     // Caller promises identity-mapped reachability; the unsafe lives
     // inside PageTable::zero_at.
     PageTable::zero_at(phys.as_mut_ptr::<PageTable>());

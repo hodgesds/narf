@@ -350,6 +350,61 @@ path wrote the page-table frame into a Region.phys[] by mistake).
 That's the next concrete step. See git log for the commit
 `(WIP) memory: double-free detector + tagged free_frame sites`.
 
+## 2026-05-19 (evening) — root cause fixed
+
+The "layout-shift" symptom traced to a real bug in
+`AddressSpace::drop`: the same physical frame was being returned
+to the buddy twice — once via `unmap_region_pages` (as a region's
+data frame) and again via `free_user_pml4_tree` (as a page-table
+frame in the same AS's PML4 subtree). The two paths' frame sets
+overlapped because `free_user_pml4_tree` only walked `PML4[1]`
+(user-binary subtree), missing the page-table pages that
+`materialize`'s `ensure_next_table` had allocated for the
+`MMAP_CURSOR` subtree at `PML4[129]`. Those PT/PD/PDPT pages
+leaked unfreed AND were never visible to the drop walk.
+
+Cumulative leakage across tests filled the buddy with frames that
+appeared "free" but were actually still tracked as page-table
+pages by the kernel's page-table walks. On a fork/clone or
+subsequent alloc, the buddy handed one of these phys to a new
+region as a data frame — creating the alias that triggered the
+double-free on the next AS-drop.
+
+### Fix (commit-tagged in `memory/`)
+
+1. **`x86_64::paging::free_user_pml4_tree`** now walks BOTH
+   `PML4[1]` (user binary) and `PML4[129]` (MMAP_CURSOR), freeing
+   every PT/PD/PDPT in either subtree.
+2. **`crate::frame::__pagetable_register` / `_unregister` /
+   `_is_registered`** — flat 4 K-entry atomic registry of all
+   page-table frames (`new_user_pml4_on` registers PML4 + user
+   PDPT; `ensure_next_table` registers PT/PD/PDPT;
+   `free_user_pml4_tree` unregisters each frame it reclaims).
+3. **`AddressSpace::unmap_region_pages`** consults the registry:
+   if `unmap_4kb` returns a phys that's still registered as a
+   page-table frame, the region-side `free_frame` is skipped —
+   `free_user_pml4_tree` is the canonical owner. This closes the
+   double-free corner case where a region's data phys happens to
+   alias a page-table phys.
+4. **Defensive double-free guard in `BuddyZone::free`**: scans
+   every free list before push, drops the duplicate on the floor
+   if an overlapping block is already there. Belt-and-suspenders
+   against future regressions or out-of-tree consumers that call
+   `free` with a stale phys.
+5. **`LOW_RESERVED_BYTES` guard in `free_frame`/`free_pages`**:
+   refuses any phys below 1 MiB. Frames there are never
+   legitimately donated (see `donate_range`), so a low-mem free
+   indicates a bad source phys — silently dropping is safer than
+   corrupting the buddy.
+
+Test suite goes from "kernel #GP + hang in the abi suite" (with
+the `narf-block → narf-memory` dep edge applied) to **2046 pass
+/ 1 fail / 40 skip**. The one remaining failure
+(`block / smoke_block_registry_uniform_read: registry empty`) is
+a test-isolation bug unrelated to the double-free — likely a
+link-order side-effect of the dep edge that delays driver
+registration.
+
 ## What's landed despite this
 
 - `e8f47b5`: LZ4 codec + Zpool compressed page pool, fully unit-

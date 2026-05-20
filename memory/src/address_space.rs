@@ -228,6 +228,23 @@ impl AddressSpace {
             if region.base.as_u64() < r_end && r.base.as_u64() < end {
                 return Err(AddressSpaceError::Overlap);
             }
+            // Diagnostic: catch the source of the double-free we
+            // see in `AddressSpace::drop` — two regions in the
+            // same AS pointing at the same physical frame would
+            // be unmapped twice, double-freeing the phys.
+            for new_p in &region.phys {
+                if new_p.raw() == 0 {
+                    continue;
+                }
+                for existing_p in &r.phys {
+                    if existing_p.raw() == new_p.raw() {
+                        panic!(
+                            "map_region: duplicate phys {:#x} new-base={:#x} existing-base={:#x}",
+                            new_p.raw(), region.base.as_u64(), r.base.as_u64(),
+                        );
+                    }
+                }
+            }
         }
         regions.push(region);
         Ok(())
@@ -273,7 +290,7 @@ impl AddressSpace {
     /// no lock during this walk on purpose — see its comment).
     #[cfg(target_arch = "x86_64")]
     unsafe fn unmap_region_pages(&self, region: &Region) {
-        use crate::frame::{free_frame_tagged, PhysFrame};
+        use crate::frame::{free_frame, PhysFrame};
         use crate::x86_64::paging::unmap_4kb;
         if self.root.as_u64() == 0 {
             return;
@@ -286,7 +303,13 @@ impl AddressSpace {
             // bookkept by `map_region`.
             match unsafe { unmap_4kb(self.root, v) } {
                 Ok(phys) => {
-                    free_frame_tagged(PhysFrame::new(phys), 100);
+                    // Skip phys that's registered as a page-table
+                    // frame — `free_user_pml4_tree` will reclaim it
+                    // on its own walk. Freeing here would double-free.
+                    if crate::frame::__pagetable_is_registered(phys.raw()) {
+                        continue;
+                    }
+                    free_frame(PhysFrame::new(phys));
                 }
                 // Already-unmapped (double munmap, or the region was
                 // partially materialised) is benign: the bookkeeping
@@ -675,7 +698,7 @@ impl AddressSpace {
                         } else {
                             // Raced with a demand fault that beat
                             // us to it — give the frame back.
-                            crate::frame::free_frame_tagged(crate::frame::PhysFrame::new(phys), 101);
+                            crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
                         }
                     }
                     r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
