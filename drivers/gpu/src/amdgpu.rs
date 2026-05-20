@@ -698,6 +698,35 @@ impl AmdGpu {
         Ok(())
     }
 
+    /// Program the panel backlight to `percent` (0–100). Caller's
+    /// 0 typically lands at the panel's hardware minimum (the panel
+    /// usually won't fully extinguish even with USER_LEVEL = 0 —
+    /// the SMU brightness-floor calibration table sits between).
+    ///
+    /// Requires `set_mode` to have run first (DCN must be brought
+    /// up so PANEL_CNTL is reachable). On chips without a
+    /// discovery-resolvable DCN base, returns `UnknownAsic`.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub unsafe fn set_backlight(&mut self, percent: u8) -> Result<(), AmdgpuError> {
+        if self.mode.is_none() {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        let dcn_base = self
+            .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
+            .ok_or(AmdgpuError::UnknownAsic)?;
+        let user_level = crate::amdgpu_backlight::user_level_for_percent(percent);
+        let writes = crate::amdgpu_backlight::build_set_user_level(dcn_base, user_level);
+        // SAFETY: caller-asserted BAR5 ownership.
+        unsafe {
+            for w in &writes {
+                mm_write(&self.regs, w.addr, w.value);
+            }
+        }
+        Ok(())
+    }
+
     /// MP1 (SMU) register-window base. Reads IP discovery first;
     /// pre-discovery silicon doesn't expose SMU bring-up here.
     pub fn mp1_base(&self) -> Option<u32> {

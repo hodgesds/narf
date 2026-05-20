@@ -4388,3 +4388,112 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/initialize",
     smoke_amdgpu_initialize_rejects_without_mp1_discovery
 );
+
+// ── amdgpu/backlight ───────────────────────────────────────────────
+
+fn smoke_amdgpu_backlight_user_level_for_percent() -> TestResult {
+    use crate::amdgpu_backlight::user_level_for_percent;
+    if user_level_for_percent(0) != 0 {
+        return TestResult::Fail("0% must yield 0");
+    }
+    if user_level_for_percent(100) != 0xFFFF {
+        return TestResult::Fail("100% must yield 0xFFFF");
+    }
+    // Saturation: >100 clamps.
+    if user_level_for_percent(200) != 0xFFFF {
+        return TestResult::Fail("over-100% must clamp");
+    }
+    // 50% should land near 0x7FFF — within rounding.
+    let half = user_level_for_percent(50);
+    if !(0x7F00..=0x8100).contains(&half) {
+        return TestResult::Fail("50% out of expected band");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/backlight",
+    smoke_amdgpu_backlight_user_level_for_percent
+);
+
+fn smoke_amdgpu_backlight_init_sequence_locks_around_writes() -> TestResult {
+    use crate::amdgpu_backlight::{
+        build_backlight_init, BL_PWM_CNTL_EN, BL_PWM_CNTL_GRP1_FRAC_BL_EN, BL_PWM_CNTL_REL,
+        BL_PWM_GRP1_LOCK, BL_PWM_GRP1_REG_LOCK_REL, BL_PWM_PERIOD_200HZ_RENOIR,
+        BL_PWM_PERIOD_CNTL_REL, BL_PWM_USER_LEVEL_REL,
+    };
+    let dcn_base: u32 = 0x0008_0000;
+    let writes = match build_backlight_init(dcn_base, BL_PWM_PERIOD_200HZ_RENOIR, 0x7FFF) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("build_backlight_init failed on valid input"),
+    };
+    if writes.len() != 5 {
+        return TestResult::Fail("init must emit exactly 5 writes");
+    }
+    // First write: lock asserted.
+    if writes[0].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL
+        || writes[0].value != BL_PWM_GRP1_LOCK
+    {
+        return TestResult::Fail("first write must assert GRP1 lock");
+    }
+    // Last write: lock cleared.
+    if writes[4].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[4].value != 0 {
+        return TestResult::Fail("last write must clear GRP1 lock");
+    }
+    // Body writes (in order): period, cntl, user_level.
+    if writes[1].addr != dcn_base + BL_PWM_PERIOD_CNTL_REL
+        || writes[1].value != BL_PWM_PERIOD_200HZ_RENOIR
+    {
+        return TestResult::Fail("period write missing or wrong");
+    }
+    if writes[2].addr != dcn_base + BL_PWM_CNTL_REL
+        || writes[2].value != (BL_PWM_CNTL_EN | BL_PWM_CNTL_GRP1_FRAC_BL_EN)
+    {
+        return TestResult::Fail("CNTL write missing or wrong");
+    }
+    if writes[3].addr != dcn_base + BL_PWM_USER_LEVEL_REL || writes[3].value != 0x7FFF {
+        return TestResult::Fail("USER_LEVEL write missing or wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/backlight",
+    smoke_amdgpu_backlight_init_sequence_locks_around_writes
+);
+
+fn smoke_amdgpu_backlight_set_user_level_is_lock_write_unlock() -> TestResult {
+    use crate::amdgpu_backlight::{
+        build_set_user_level, BL_PWM_GRP1_LOCK, BL_PWM_GRP1_REG_LOCK_REL, BL_PWM_USER_LEVEL_REL,
+    };
+    let dcn_base: u32 = 0x0008_0000;
+    let writes = build_set_user_level(dcn_base, 0xABCD);
+    if writes.len() != 3 {
+        return TestResult::Fail("hot-path set must be exactly 3 writes");
+    }
+    if writes[0].value != BL_PWM_GRP1_LOCK {
+        return TestResult::Fail("first write must lock");
+    }
+    if writes[1].addr != dcn_base + BL_PWM_USER_LEVEL_REL || writes[1].value != 0xABCD {
+        return TestResult::Fail("USER_LEVEL write missing or wrong");
+    }
+    if writes[2].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[2].value != 0 {
+        return TestResult::Fail("last write must unlock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/backlight",
+    smoke_amdgpu_backlight_set_user_level_is_lock_write_unlock
+);
+
+fn smoke_amdgpu_backlight_init_rejects_period_overflow() -> TestResult {
+    use crate::amdgpu_backlight::{build_backlight_init, BacklightError};
+    // 25-bit period overflows the 24-bit field.
+    match build_backlight_init(0x0008_0000, 1u32 << 25, 0x7FFF) {
+        Err(BacklightError::PeriodOverflow) => TestResult::Pass,
+        _ => TestResult::Fail("period overflow must be rejected"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/backlight",
+    smoke_amdgpu_backlight_init_rejects_period_overflow
+);
