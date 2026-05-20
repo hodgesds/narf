@@ -75,12 +75,23 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
         return Err(SuspendError::AlreadySuspending);
     }
     PHASE.store(SuspendPhase::QuiescingDrivers as u8, Ordering::Release);
+    // Fan out to every registered device PM handler in reverse
+    // registration order. Failures here are logged but don't abort
+    // the suspend chain — we want partial progress so the resume
+    // path can roll back whatever did suspend successfully.
+    let _suspend_report = crate::device_pm::suspend_all_devices();
     PHASE.store(SuspendPhase::SyncingCache as u8, Ordering::Release);
     PHASE.store(SuspendPhase::SavingCpuState as u8, Ordering::Release);
     PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
     // Real platform suspend would happen here and not return until
     // resume. We mirror a "ping-pong through the phases without
-    // actually sleeping" behaviour so the shape exercises.
+    // actually sleeping" behaviour so the shape exercises — and
+    // run the resume fan-out so paired suspend/resume drivers
+    // observe a clean cycle even on the no-op shape.
+    PHASE.store(SuspendPhase::RestoringCpuState as u8, Ordering::Release);
+    PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
+    let _resume_report = crate::device_pm::resume_all_devices();
+    PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
     PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
     Err(SuspendError::NotImplemented)
 }

@@ -1379,3 +1379,144 @@ kernel_test_in!(
     "power/laptop_state",
     smoke_laptop_state_battery_percent_fuses_info_and_state
 );
+
+// ── power/device_pm ────────────────────────────────────────────────
+
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering as TestOrdering};
+
+static PM_SEQ: AtomicI32 = AtomicI32::new(0);
+static PM_FAIL_FLAG: AtomicUsize = AtomicUsize::new(0);
+
+fn smoke_pm_record_a_suspend() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    PM_SEQ.fetch_add(1, TestOrdering::AcqRel);
+    Ok(())
+}
+fn smoke_pm_record_a_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    PM_SEQ.fetch_add(10, TestOrdering::AcqRel);
+    Ok(())
+}
+fn smoke_pm_record_b_suspend() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    PM_SEQ.fetch_add(100, TestOrdering::AcqRel);
+    Ok(())
+}
+fn smoke_pm_record_b_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    PM_SEQ.fetch_add(1000, TestOrdering::AcqRel);
+    Ok(())
+}
+fn smoke_pm_fail_suspend() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    PM_FAIL_FLAG.fetch_add(1, TestOrdering::AcqRel);
+    Err(crate::device_pm::DeviceSuspendError::Busy)
+}
+fn smoke_pm_fail_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    Ok(())
+}
+
+fn smoke_device_pm_register_and_fanout_order() -> TestResult {
+    use crate::device_pm::{
+        device_count, register_device_pm, resume_all_devices, suspend_all_devices,
+        __reset_for_test,
+    };
+    __reset_for_test();
+    PM_SEQ.store(0, TestOrdering::Release);
+
+    // Register A first, then B.
+    register_device_pm("dev_a", smoke_pm_record_a_suspend, smoke_pm_record_a_resume);
+    register_device_pm("dev_b", smoke_pm_record_b_suspend, smoke_pm_record_b_resume);
+    if device_count() != 2 {
+        return TestResult::Fail("expected 2 registrations");
+    }
+
+    // Suspend should fire B (100) THEN A (1). Sum = 101 after suspend.
+    let s_report = suspend_all_devices();
+    if !s_report.ok() || s_report.outcomes.len() != 2 {
+        return TestResult::Fail("suspend outcomes wrong count");
+    }
+    // The first outcome in the report is the LAST-registered (B).
+    if s_report.outcomes[0].name != "dev_b" {
+        return TestResult::Fail("suspend fan-out must be reverse-registration");
+    }
+    if s_report.outcomes[1].name != "dev_a" {
+        return TestResult::Fail("suspend fan-out second-out must be dev_a");
+    }
+    let after_suspend = PM_SEQ.load(TestOrdering::Acquire);
+    if after_suspend != 101 {
+        return TestResult::Fail("suspend sum must be 101 (B=100, A=1)");
+    }
+
+    // Resume should fire A (10) THEN B (1000). Sum += 1010 → 1111.
+    let r_report = resume_all_devices();
+    if r_report.outcomes[0].name != "dev_a" {
+        return TestResult::Fail("resume fan-out must be forward-registration");
+    }
+    let after_resume = PM_SEQ.load(TestOrdering::Acquire);
+    if after_resume != 1111 {
+        return TestResult::Fail("resume sum must be 1111");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("power/device_pm", smoke_device_pm_register_and_fanout_order);
+
+fn smoke_device_pm_one_failure_doesnt_abort_chain() -> TestResult {
+    use crate::device_pm::{
+        register_device_pm, suspend_all_devices, DeviceSuspendError, __reset_for_test,
+    };
+    __reset_for_test();
+    PM_SEQ.store(0, TestOrdering::Release);
+    PM_FAIL_FLAG.store(0, TestOrdering::Release);
+
+    // Three devices: A (Ok), Fail (Busy), B (Ok). Order in the suspend
+    // fan-out (reverse): B → Fail → A.
+    register_device_pm("dev_a", smoke_pm_record_a_suspend, smoke_pm_record_a_resume);
+    register_device_pm("dev_fail", smoke_pm_fail_suspend, smoke_pm_fail_resume);
+    register_device_pm("dev_b", smoke_pm_record_b_suspend, smoke_pm_record_b_resume);
+
+    let report = suspend_all_devices();
+    if report.outcomes.len() != 3 {
+        return TestResult::Fail("expected 3 outcomes");
+    }
+    if report.failure_count != 1 {
+        return TestResult::Fail("expected exactly 1 failure");
+    }
+    if !matches!(
+        report.outcomes[1].result,
+        Err(DeviceSuspendError::Busy)
+    ) {
+        return TestResult::Fail("middle outcome must carry the Busy error");
+    }
+    // Both Ok handlers ran despite the middle failure.
+    if PM_SEQ.load(TestOrdering::Acquire) != 101 {
+        return TestResult::Fail("both Ok handlers must run despite failure");
+    }
+    if PM_FAIL_FLAG.load(TestOrdering::Acquire) != 1 {
+        return TestResult::Fail("fail handler must have been called once");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/device_pm",
+    smoke_device_pm_one_failure_doesnt_abort_chain
+);
+
+fn smoke_device_pm_re_register_replaces() -> TestResult {
+    use crate::device_pm::{
+        device_count, register_device_pm, suspend_all_devices, __reset_for_test,
+    };
+    __reset_for_test();
+    PM_SEQ.store(0, TestOrdering::Release);
+    register_device_pm("dev_a", smoke_pm_record_a_suspend, smoke_pm_record_a_resume);
+    // Re-register same name with a different (b) handler.
+    register_device_pm("dev_a", smoke_pm_record_b_suspend, smoke_pm_record_b_resume);
+    if device_count() != 1 {
+        return TestResult::Fail("re-register must not duplicate");
+    }
+    suspend_all_devices();
+    // The B-handler should have fired (sum = 100), not A's.
+    if PM_SEQ.load(TestOrdering::Acquire) != 100 {
+        return TestResult::Fail("re-register must use the new handler");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("power/device_pm", smoke_device_pm_re_register_replaces);

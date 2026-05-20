@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+pub mod device_pm;
 pub mod laptop_state;
 pub mod psci;
 pub mod suspend;
