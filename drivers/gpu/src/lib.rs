@@ -128,6 +128,7 @@ pub mod amdgpu_pptable_subtables;
 pub mod amdgpu_psp;
 pub mod amdgpu_ring;
 pub mod amdgpu_rlc;
+pub mod amdgpu_sdma;
 pub mod amdgpu_smu;
 pub mod amdgpu_ucode;
 pub mod dp_aux;

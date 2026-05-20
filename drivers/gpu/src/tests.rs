@@ -2738,3 +2738,143 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx_context_submit_ib_ring_contents
 );
+
+// ── amdgpu/sdma (ring init) ────────────────────────────────────────
+//
+// SDMA v4.0 ring bring-up sequence. The key invariants:
+// - first write disables the ring (CNTL=0) so the engine doesn't
+//   fetch against half-programmed state
+// - last write enables the ring (CNTL with RB_ENABLE set)
+// - doorbell programmed in between
+
+fn smoke_amdgpu_sdma4_ring_init_emits_canonical_order() -> TestResult {
+    use crate::amdgpu_sdma::{
+        build_sdma4_ring_init, SDMA_DOORBELL_ENABLE, SDMA_GFX_DOORBELL_OFFSET_REL,
+        SDMA_GFX_DOORBELL_REL, SDMA_GFX_RB_BASE_HI_REL, SDMA_GFX_RB_BASE_REL,
+        SDMA_GFX_RB_CNTL_REL, SDMA_GFX_RB_RPTR_ADDR_HI_REL, SDMA_GFX_RB_RPTR_ADDR_LO_REL,
+        SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE, SDMA_RB_SIZE_SHIFT,
+    };
+    let sdma_base: u32 = 0x0006_0000;
+    let ring_phys: u64 = 0x0000_0001_8000_0000; // 256-byte aligned
+    let ring_size_dw: u32 = 1024;
+    let doorbell_idx: u32 = 9;
+    let rptr_phys: u64 = 0x0000_0002_BEEF_0000;
+
+    let seq = match build_sdma4_ring_init(sdma_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("build_sdma4_ring_init errored on valid inputs");
+        }
+    };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+
+    // First write: CNTL = 0 (disable).
+    if w.first().map(|x| (x.addr, x.value)) != Some((sdma_base + SDMA_GFX_RB_CNTL_REL, 0)) {
+        return TestResult::Fail("first write must disable CNTL");
+    }
+    // Last write: CNTL with RB_ENABLE bit.
+    let last = w.last().copied();
+    let expected_cntl = (ring_size_dw.trailing_zeros() << SDMA_RB_SIZE_SHIFT)
+        | SDMA_RB_RPTR_WRITEBACK_ENABLE
+        | SDMA_RB_ENABLE;
+    if last.map(|x| (x.addr, x.value)) != Some((sdma_base + SDMA_GFX_RB_CNTL_REL, expected_cntl)) {
+        return TestResult::Fail("last write must enable ring via CNTL | RB_ENABLE");
+    }
+    // Specific writes that must appear (in any order between disable/enable):
+    let want = [
+        (sdma_base + SDMA_GFX_RB_BASE_REL, (ring_phys >> 8) as u32),
+        (sdma_base + SDMA_GFX_RB_BASE_HI_REL, (ring_phys >> 40) as u32),
+        (sdma_base + SDMA_GFX_RB_RPTR_ADDR_LO_REL, rptr_phys as u32),
+        (
+            sdma_base + SDMA_GFX_RB_RPTR_ADDR_HI_REL,
+            (rptr_phys >> 32) as u32,
+        ),
+        (
+            sdma_base + SDMA_GFX_DOORBELL_OFFSET_REL,
+            doorbell_idx << 2,
+        ),
+        (sdma_base + SDMA_GFX_DOORBELL_REL, SDMA_DOORBELL_ENABLE),
+    ];
+    for (addr, value) in want {
+        if !w.iter().any(|x| x.addr == addr && x.value == value) {
+            return TestResult::Fail("missing expected SDMA ring-init write");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma4_ring_init_emits_canonical_order
+);
+
+fn smoke_amdgpu_sdma4_ring_init_validates_inputs() -> TestResult {
+    use crate::amdgpu_sdma::{build_sdma4_ring_init, SdmaError};
+    // Non-pow2 ring size.
+    match build_sdma4_ring_init(0x0006_0000, 0x1_0000_0000, 999, 0, 0x2_0000_0000) {
+        Err(SdmaError::BadRingSize) => {}
+        _ => return TestResult::Fail("non-pow2 ring size must be rejected"),
+    }
+    // Unaligned ring phys (SDMA encodes phys >> 8).
+    match build_sdma4_ring_init(0x0006_0000, 0x1_0000_0080, 1024, 0, 0x2_0000_0000) {
+        Err(SdmaError::UnalignedRingPhys) => {}
+        _ => return TestResult::Fail("256-byte misalignment must be rejected"),
+    }
+    // Unaligned rptr writeback (must be 4-byte aligned).
+    match build_sdma4_ring_init(0x0006_0000, 0x1_0000_0000, 1024, 0, 0x2_0000_0002) {
+        Err(SdmaError::UnalignedRptrWriteback) => {}
+        _ => return TestResult::Fail("unaligned rptr-writeback must be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma4_ring_init_validates_inputs
+);
+
+fn smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable() -> TestResult {
+    use crate::amdgpu_sdma::{
+        build_sdma4_ring_init, SDMA_GFX_RB_CNTL_REL, SDMA_RB_ENABLE,
+    };
+    let sdma_base: u32 = 0x0006_0000;
+    let seq = match build_sdma4_ring_init(sdma_base, 0x1_0000_0000, 256, 3, 0x2_0000_0000) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("happy-path build failed"),
+    };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+
+    // Find the LAST CNTL write and confirm it's the only one with
+    // RB_ENABLE set. Any earlier CNTL write must be zero (disable).
+    let cntl_addr = sdma_base + SDMA_GFX_RB_CNTL_REL;
+    let mut last_idx = None;
+    let mut enable_seen_early = false;
+    for (i, x) in w.iter().enumerate() {
+        if x.addr == cntl_addr {
+            last_idx = Some(i);
+        }
+    }
+    let last_i = match last_idx {
+        Some(i) => i,
+        None => return TestResult::Fail("no CNTL write in sequence"),
+    };
+    for (i, x) in w.iter().enumerate() {
+        if i == last_i {
+            continue;
+        }
+        if x.addr == cntl_addr && (x.value & SDMA_RB_ENABLE) != 0 {
+            enable_seen_early = true;
+        }
+    }
+    if enable_seen_early {
+        return TestResult::Fail("RB_ENABLE set before the final CNTL write");
+    }
+    if (w[last_i].value & SDMA_RB_ENABLE) == 0 {
+        return TestResult::Fail("last CNTL write must set RB_ENABLE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable
+);
