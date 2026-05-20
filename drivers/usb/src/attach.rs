@@ -60,6 +60,11 @@ pub enum AttachOutcome {
     /// dongle, Arduino-style virtual COM port). Slot stays alive;
     /// entry was added to `cdc_acm::ACM_DEVICES`.
     SerialAcm,
+    /// Device bound as a USB Mass Storage (BBB BOT) device. Slot
+    /// stays alive; entry was added to `msc::MSC_DEVICES` and the
+    /// block-layer registration / partition scan runs from the
+    /// caller's hot path.
+    MassStorage,
     /// Device bound as a USB hub. Slot stays alive; entry was added
     /// to [`HUBS`] for downstream walking.
     Hub,
@@ -331,6 +336,15 @@ fn dispatch_after_address(
             {
                 return AttachOutcome::SerialAcm;
             }
+        }
+        // USB Mass Storage (BBB BOT) — bInterfaceClass=0x08,
+        // SubClass=0x06, Protocol=0x50. `find_bot_endpoints`
+        // walks the config blob; if it doesn't find an MSC
+        // interface it returns EndpointsMissing and we fall through.
+        if let Ok(_idx) = crate::msc::try_bind_msc_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ) {
+            return AttachOutcome::MassStorage;
         }
     }
     // try_bind_kbd_already_addressed disables the slot on failure,

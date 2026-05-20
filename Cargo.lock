@@ -950,6 +950,7 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

@@ -66,17 +66,12 @@ pub fn register_initcalls() {
         spawn_supervisor_task();
         InitResult::Ok
     });
-    narf_init::register(Stage::Device, "usb-mass-storage", || {
-        if !xhci::is_probed() {
-            return InitResult::NotPresent;
-        }
-        let attached = xhci::with_controller(|c| msc::enumerate_and_attach_msc(c)).unwrap_or(0);
-        if attached == 0 {
-            InitResult::NotPresent
-        } else {
-            InitResult::Ok
-        }
-    });
+    // The legacy "usb-mass-storage" Stage::Device initcall used to
+    // call msc::enumerate_and_attach_msc once. That path was a
+    // one-shot: USB sticks plugged in after boot never got bound.
+    // The HID supervisor's per-port try_attach now handles MSC via
+    // AttachOutcome::MassStorage — same retry / hot-plug semantics
+    // as keyboard and mouse. Removed cleanly per the no-shims rule.
 }
 
 /// Spawn the long-running USB HID supervisor task. Walks every
@@ -134,6 +129,7 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::Mouse
                     | AttachOutcome::Touchpad
                     | AttachOutcome::SerialAcm
+                    | AttachOutcome::MassStorage
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -204,6 +200,7 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::Mouse
                         | AttachOutcome::Touchpad
                         | AttachOutcome::SerialAcm
+                        | AttachOutcome::MassStorage
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }

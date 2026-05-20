@@ -432,9 +432,82 @@ impl MscDevice {
 // ── Hot-plug enumeration ──────────────────────────────────────────
 
 /// System-wide registry of attached USB Mass Storage devices.
-/// Populated by `enumerate_and_attach_msc`; consumed by the
+/// Populated by `enumerate_and_attach_msc` and
+/// `try_bind_msc_already_addressed`; consumed by the
 /// `block::BlockDeviceSync` adapter once one is wired up.
-static MSC_DEVICES: IrqSafeSpinLock<Vec<MscDevice>> = IrqSafeSpinLock::new(Vec::new());
+pub static MSC_DEVICES: IrqSafeSpinLock<Vec<MscDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Bind to an already-addressed device using its full configuration
+/// descriptor `cfg`. Returns the new device's index in
+/// [`MSC_DEVICES`] on success; the caller can then look it up to
+/// register block / partition entries. On failure the slot is
+/// disabled by the caller (`dispatch_after_address` handles that).
+///
+/// Caller's responsibility: the device is post-`address_device`
+/// and `cfg` is the full GET_DESCRIPTOR(CONFIG) blob (so we don't
+/// re-issue the control transfer).
+pub fn try_bind_msc_already_addressed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, MscError> {
+    let (ep_in, ep_out) = find_bot_endpoints(cfg)?;
+    // SET_CONFIGURATION before any class-specific request (USB 2.0
+    // §9.4.7). Use cfg value 1 — every MSC device the bring-up arc
+    // targets ships a single config at value 1.
+    let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
+    let mut nothing = [0u8; 0];
+    if xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .is_err()
+    {
+        return Err(MscError::EndpointsMissing);
+    }
+    xhci_dev
+        .configure_endpoints(slot_id, &[ep_in, ep_out])
+        .map_err(MscError::Xhci)?;
+    let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
+    let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
+    let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci)?;
+    let idx = {
+        let mut g = MSC_DEVICES.lock();
+        let idx = g.len();
+        g.push(dev);
+        idx
+    };
+    // Register against the block layer + scan partitions. Done
+    // inline so the post-bind state (block device visible + per-
+    // partition sub-devices registered) is established before the
+    // caller's supervisor cycle moves on. Failure here doesn't
+    // unbind the MSC device — the raw bulk-IN/OUT path still works
+    // through `with_device`; the block-layer view is best-effort.
+    register_msc_block_device(idx);
+    Ok(idx)
+}
+
+/// Register MSC_DEVICES[idx] as a block-layer device under
+/// `usb-msc{idx}` and run the partition scanner so child entries
+/// like `usb-msc0p1` appear. Name strings are heap-allocated then
+/// Box::leak'd to satisfy narf_block's `&'static str` interface;
+/// bounded by the small MSC device count.
+pub fn register_msc_block_device(idx: usize) {
+    let dev = match UsbMscBlockDevice::from_index(idx) {
+        Some(d) => d,
+        None => return,
+    };
+    let name = alloc::format!("usb-msc{}", idx);
+    let static_name: &'static str = alloc::boxed::Box::leak(name.into_boxed_str());
+    let arc: alloc::sync::Arc<dyn narf_block::BlockDeviceSync> = alloc::sync::Arc::new(dev);
+    narf_block::register_block_device(static_name, arc.clone());
+    let _ = narf_block::partition::scan_and_register_partitions(arc, static_name);
+}
 
 /// Walk every connected port on the supplied xHCI controller and
 /// try to bring up an MSC BOT device on each one. Per-port flow
@@ -528,4 +601,119 @@ pub fn with_device<R>(idx: usize, f: impl FnOnce(&MscDevice) -> R) -> Option<R> 
 #[doc(hidden)]
 pub fn __reset_msc_for_test() {
     MSC_DEVICES.lock().clear();
+}
+
+// ── BlockDeviceSync adapter ────────────────────────────────────────
+//
+// Wraps an index into MSC_DEVICES + a cached (lba_size, capacity)
+// so the BlockDeviceSync interface — which doesn't take &Xhci —
+// can still drive the per-block READ/WRITE 10 transactions. Each
+// read/write reaches back through xhci::with_controller and
+// msc::with_device for the actual transfer.
+
+/// Block-layer adapter for a bound USB MSC device. Constructed from
+/// an MSC_DEVICES index by the supervisor / boot path; registered
+/// against narf_block::register_block_device as `"usb-msc{idx}"`.
+pub struct UsbMscBlockDevice {
+    /// Index into MSC_DEVICES at registration time. MSC_DEVICES is
+    /// append-only so this stays stable for the device's lifetime.
+    idx: usize,
+    /// Cached lba_size_bytes — read from MscDevice::lba_bytes once
+    /// at construction so we don't re-enter the registry on every
+    /// `lba_size()` call.
+    lba_size: u32,
+    /// Cached capacity in LBAs.
+    capacity: u64,
+}
+
+impl core::fmt::Debug for UsbMscBlockDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UsbMscBlockDevice")
+            .field("idx", &self.idx)
+            .field("lba_size", &self.lba_size)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+impl UsbMscBlockDevice {
+    /// Wrap MSC_DEVICES[idx] as a BlockDeviceSync. Returns None if
+    /// the index isn't bound, or the device hasn't completed
+    /// READ CAPACITY(10) (lba_size == 0).
+    pub fn from_index(idx: usize) -> Option<Self> {
+        let g = MSC_DEVICES.lock();
+        let dev = g.get(idx)?;
+        if dev.lba_bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            idx,
+            lba_size: dev.lba_bytes,
+            capacity: dev.last_lba as u64 + 1,
+        })
+    }
+}
+
+impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
+    fn lba_size(&self) -> u32 {
+        self.lba_size
+    }
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        if lba.checked_add(n_blocks as u64).map_or(true, |end| end > self.capacity) {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        let lba32: u32 = lba.try_into().map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let expected = n_blocks as usize * self.lba_size as usize;
+        if out.len() < expected {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        // Reach back into the xhci controller + the bound device.
+        // The MscDevice::read_blocks call already validates the CSW.
+        let result = xhci::with_controller(|c| {
+            let g = MSC_DEVICES.lock();
+            let dev = g.get(self.idx)?;
+            Some(dev.read_blocks(c, lba32, n_blocks))
+        });
+        match result {
+            Some(Some(Ok(data))) => {
+                out[..expected].copy_from_slice(&data);
+                Ok(())
+            }
+            Some(Some(Err(_))) => Err(narf_block::BlockIoError::DriverError),
+            Some(None) | None => Err(narf_block::BlockIoError::DeviceRemoved),
+        }
+    }
+    fn write(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        data: &[u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        if lba.checked_add(n_blocks as u64).map_or(true, |end| end > self.capacity) {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        let lba32: u32 = lba.try_into().map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let expected = n_blocks as usize * self.lba_size as usize;
+        if data.len() < expected {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        let result = xhci::with_controller(|c| {
+            let g = MSC_DEVICES.lock();
+            let dev = g.get(self.idx)?;
+            Some(dev.write_blocks(c, lba32, n_blocks, &data[..expected]))
+        });
+        match result {
+            Some(Some(Ok(()))) => Ok(()),
+            Some(Some(Err(_))) => Err(narf_block::BlockIoError::DriverError),
+            Some(None) | None => Err(narf_block::BlockIoError::DeviceRemoved),
+        }
+    }
 }

@@ -28,6 +28,7 @@ narf-aml          = { path = "../../aml" }
 narf-console      = { path = "../../console" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
+narf-block        = { path = "../../block" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]
