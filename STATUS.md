@@ -32,9 +32,9 @@ asks for. Updated when observable kernel behaviour changes.
 
 | driver           | scope                                            |
 |------------------|--------------------------------------------------|
-| NVMe             | Admin queue + IDENTIFY CTRL + IDENTIFY NS + I/O queue + Read/Write + MSI-X-driven completions. |
+| NVMe             | Admin queue + IDENTIFY CTRL + IDENTIFY NS + multi I/O queue via Set Features FID 0x07 (Number of Queues) + per-CQ MSI-X vectors + round-robin submission across `io_queues: Vec<Queue>` + Read/Write. |
 | virtio-blk-pci   | Polled + IRQ-driven Read/Write. MSI-X (q0). |
-| virtio-net-pci   | RX + TX virtqueues; polled `tx`/`rx` + async `rx_irq_async` on receiveq MSI-X. |
+| virtio-net-pci   | Multi-controller registry. RX + TX virtqueues; polled `tx`/`rx` + async `rx_irq_async` on receiveq MSI-X. Zero-copy `rx_take` / `tx_dma`. VIRTIO_F_VERSION_1 + F_CTRL_VQ + F_CTRL_MAC_ADDR + F_MQ (multi-queue bring-up via MQ_VQ_PAIRS_SET on controlq). Per-queue MSI-X. `set_mac` via CTRL_VQ. Registers as `vnet0` in the legacy iface registry so the TCP stack reaches it. |
 | virtio-rng-pci   | Live requestq + polled `read_bytes(out)` entropy fetch. |
 | virtio-balloon-pci | Live inflate + deflate queues + `inflate(pfns)` / `deflate(pfns)` polled, ≤1024 PFNs / call. |
 | virtio-snd-pci   | Live controlq + tx + rx + eventq; `set_params` / `prepare` / `start` + `play_buffer` / `play_buffer_phys` PCM submit. |
@@ -45,7 +45,7 @@ asks for. Updated when observable kernel behaviour changes.
 | virtio-scsi-pci  | PCI match (1AF4:1048). Live controlq + eventq + cmdq[0]; `submit_cmd` + `submit_tmf` + REPORT LUNS helper. MSI-X (cmdq[0]). |
 | virtio-vsock-pci | PCI match (1AF4:1053). Live rx + tx + event queues; `VsockHdr` builders, `send` / `recv` / `drain_events`. MSI-X (rx). |
 | virtio-gpu-pci   | Modern + legacy match (1AF4:1050 / 1010). controlq + cursorq, 2D pipeline (`init_scanout` / `paint_solid` / `paint_test_pattern` / `flush`). MSI-X (controlQ). |
-| virtio-input-pci | PCI match (1AF4:1052). eventQ drain → `narf_input` (KEY + REL events). MSI-X (eventQ). |
+| virtio-input-pci | PCI match (1AF4:1052). Multi-controller registry. eventQ drain + statusQ output. Full event-class coverage: KEY + REL (pointer + scroll) + EV_ABS (tablet / stylus coords) + multi-touch protocol-B slot tracking + gamepad ButtonEvent + AsciiByte + modifier-state tracking + LED feedback via statusQ. IRQ-driven drain (MSI-X eventQ) + device-cfg readback. |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | ixgbe            | Intel 82599 / X540 / X550 10 GbE. PCI match + reset + EEPROM MAC + advanced TX ring + RX ring + MSI-X + `HwNic`. Live bring-up smoke skips on QEMU (no emulated 82599). |
 | igc              | Intel I225 / I226 family 2.5 GbE. Clean-room from public Intel datasheets — CTRL.RST + RAL/RAH MAC read + legacy TX/RX descriptor rings + tx/rx. MSI-X + advanced descriptors are follow-ups. |
@@ -551,9 +551,12 @@ slow path in `frame/`, cooperative-cancel state machine in `abi/`.
   per-NUMA zones, orders 0..10).
 - ~~**Slab heap**~~ — landed (`memory/src/slab.rs` with per-CPU
   magazines, hybrid bump→slab global allocator). Bootstrap arena
-  is `.bss`-backed at 8 MiB; ~750 KiB used pre-promotion on real
-  HW. See `memory/specification/heap-migration.md` for the
-  per-phase status.
+  is `.bss`-backed at 16 MiB (bumped from 8 MiB — real-HW laptops
+  with denser ACPI namespaces blew past the prior limit; ~750 KiB
+  used pre-promotion on QEMU). Per-CPU magazines carry
+  `MAG_SIZE = 16` blocks with IRQ-safe `try_alloc_atomic` /
+  `try_dealloc_atomic` fast paths + hit/miss counters. See
+  `memory/specification/heap-migration.md` for the per-phase status.
 - **`frame/` trap-prologue PKRS save**. Scaffolding only. Once the
   scheduler's context-switch save/restore needs it (Stage 3 direct
   context transfer), wire the PKRS save into the trap prologue.
@@ -1098,9 +1101,112 @@ Confirmation pass against the "any other primitives?" question:
   this path at every userspace allocation today.
 
 What's NOT in place (all post-Stage-4):
-- True demand paging (lazy frame allocation on first touch).
-- Stack-grow guard page → fresh frame on user-mode write fault.
-- Page reclaim / swap (no swap device).
 - Page coalescing in narf-libc's freelist.
-- mmap shrink-on-munmap that returns frames to the allocator.
+- mmap shrink-on-munmap that returns frames to the allocator
+  (the AS region table tracks lazy phys=0 entries correctly but
+  the frames-per-page-on-fault path doesn't shrink-back yet).
 - brk shrink that returns frames (currently a TODO).
+- File-backed mmap (anonymous-only today; libc shim rejects file
+  mmap before the syscall).
+
+What's landed since the Stage-4 close (post-deadline memory work):
+
+- **Demand paging**: `sys_mmap` is lazy — region installed with
+  `phys[i] == 0` for every page, first user-mode access faults
+  with P=0 and `AddressSpace::demand_alloc_page(vaddr)` allocs
+  the frame + installs the PTE on the spot. `materialize` skips
+  zero phys entries so the PTE stays absent until the demand
+  hit. See `memory/src/address_space.rs::demand_alloc_page`.
+- **Stack-grow guard page**: `STACK_GUARD` perms flag on a
+  one-page region directly below the user stack. First write to
+  the guard frame promotes it to R+W via `try_grow_stack`,
+  installs a fresh guard page below. POSIX-style automatic
+  stack extension.
+- **`mlock` / `munlock`**: force-back every lazy page in
+  intersecting regions and set the LOCKED flag (so a future
+  reclaim pass leaves them alone). `mlock_range` /
+  `munlock_range` in `address_space.rs`.
+- **`mprotect`**: changes region perms and walks every
+  intersecting page to rewrite the live PTE flags.
+- **COW fork**: `clone_for_fork` inc_refs every backing frame +
+  strips WRITE on both ASes; the page-fault handler runs
+  `cow_split_on_write(vaddr)` on first user-mode write —
+  allocates a private frame, memcpys, dec_refs old shared frame,
+  restores WRITE. Tracked via `frame::cow::REFCOUNTS`.
+- **Stage-1 page reclaim** (`memory/src/reclaim.rs`, 980 lines):
+  active / inactive LRU lists, `PageEntry { phys, reclaim_fn,
+  flags, age }`, `reclaim_target_pages(n)` +
+  `reclaim_sweep_pump()` + `lru_stats()` for the kernel-side
+  reclaim loop. No swap yet; entries that can't be evicted in
+  place stay pinned.
+- **LZ4 codec + Zpool compressed page pool** (`memory/src/{compress,zpool}.rs`):
+  in-memory LZ4 block-format encoder/decoder + a page pool that
+  stores 4 KiB frames compressed. Foundation for zram-style
+  compressed swap; consumer is `CompressedRamDisk` (also in the
+  memory crate) which exposes a struct-only surface today —
+  `BlockDeviceSync` impl + `narf-block` wiring is the natural
+  follow-up.
+- **TLB shootdown** with PCID-aware filtering
+  (`memory/src/tlb_shootdown.rs`): `shootdown_target_mask` +
+  `set_active_as` + `LOCAL_ONLY_COUNT` / `FILTERED_TARGETS` /
+  `BROADCAST_BUDGET` counters; INVPCID wrapper; cross-CPU IPI
+  via `narf_interrupts::install_tlb_shootdown_bridge`.
+- **Page-table-frame registry** + AS-drop double-free fix
+  (`memory/src/frame.rs` + `x86_64/paging.rs`):
+  `__pagetable_register` tracks every PML4 / user_pdpt / PT /
+  PD / PDPT page. `free_user_pml4_tree` walks both `PML4[1]`
+  (user binary) and `PML4[129]` (MMAP_CURSOR) subtrees, freeing
+  each PT/PD/PDPT. `unmap_region_pages` skips phys that's still
+  registered as a page-table frame. Closes the
+  layout-shift-bug double-free described in
+  `docs/notes/2026-05-19-layout-shift-bug.md`.
+- **`LOW_RESERVED_BYTES` guard + buddy double-free defence**:
+  `free_frame` / `free_pages` refuse phys below 1 MiB;
+  `BuddyZone::free` scans every free list and drops a push if
+  the new block overlaps an existing one. Belt-and-suspenders
+  against out-of-tree consumers calling `free` with a stale
+  phys.
+
+### Networking surface (post-Stage-4)
+
+- **DHCPv4 client** (`net/src/dhcp.rs`, 250 lines): full
+  RFC 2131 / RFC 2132 DISCOVER → OFFER → REQUEST → ACK with
+  Ethernet + IP + UDP frame builder. Validated end-to-end via
+  pcap capture against a `dnsmasq` peer.
+- **TCP stack ↔ iface plumbing**: `net::iface` now fans out
+  `drain_pump` across every registered NIC instead of single-
+  interface dispatch. `Vec<DrainFn>` registry; the kernel pump
+  walks each NIC's RX path on every tick. Closes the
+  multi-iface routing gap.
+- **virtio-net controlq**: `F_CTRL_VQ` + `F_CTRL_MAC_ADDR`
+  paired with the regular MQ negotiation (`F_MQ` → MQ_VQ_PAIRS_SET)
+  so `set_mac(addr)` and per-pair queue programming both go
+  through the controlq.
+
+### Observability (post-Stage-4)
+
+- **t-Digest quantile sketch** (`tracing/src/tdigest.rs`,
+  770 lines, clean-room from Dunning & Ertl 2019
+  arXiv:1902.04023). no_std math (asin / sqrt) implemented in
+  tree. <1% p99 accuracy on a 1M-sample uniform validation
+  smoke. Foundation for latency histograms in syscall + RX/TX
+  drain accounting.
+- **Panic-sink RBP-chain backtrace** (`console/src/lib.rs`):
+  the panic handler now walks the saved RBP chain (kernel
+  high-half and boot low-half RBPs both accepted) and dumps up
+  to 16 return addresses inline with the panic message. Cuts
+  the "panicked + no backtrace" UX during pre-MMU-swap faults.
+
+### Bug-fix landings worth noting
+
+- **AS-drop double-free**: see the memory section above. Lived
+  for several test cycles as the "layout-shift bug"; root cause
+  was `free_user_pml4_tree` only walking `PML4[1]`, leaking
+  every PT/PD/PDPT for the `MMAP_CURSOR` subtree at `PML4[129]`.
+  Cumulative leakage filled the buddy with frames it thought
+  were free but other ASes still treated as page tables, then
+  a future alloc handed one out as data — creating the alias
+  that double-freed on the next AS drop.
+- **virtio-net multi-NIC**: prior `drain_pump` only walked one
+  interface; mixed-NIC topologies dropped RX on every NIC past
+  the first.
