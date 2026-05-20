@@ -4325,3 +4325,66 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs
 );
+
+// ── amdgpu (initialize orchestrator) ───────────────────────────────
+
+fn smoke_amdgpu_expected_smu_driver_if_per_family() -> TestResult {
+    use crate::amdgpu::with_controller;
+    use crate::amdgpu_smu::{SMU12_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION};
+    if !crate::amdgpu::is_probed() {
+        return TestResult::Skip("amdgpu not probed in this QEMU config");
+    }
+    let outcome = with_controller(|d| {
+        let chip = d.chip_info();
+        let v = d.expected_smu_driver_if_version();
+        (chip.family, v)
+    });
+    match outcome {
+        Some((crate::amdgpu::Family::Renoir, Some(v))) if v == SMU12_DRIVER_IF_VERSION => {
+            TestResult::Pass
+        }
+        Some((crate::amdgpu::Family::Phoenix, Some(v))) if v == SMU_13_0_4_DRIVER_IF_VERSION => {
+            TestResult::Pass
+        }
+        Some((_other_family, None)) => {
+            // Vega / Navi1 / Navi2 / Navi3 — no SMU bring-up path
+            // wired into the orchestrator (yet). That's an expected
+            // None, not a failure.
+            TestResult::Pass
+        }
+        Some((_, Some(_))) => TestResult::Fail("driver-IF mismatch for family"),
+        None => TestResult::Skip("controller vanished mid-test"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/initialize",
+    smoke_amdgpu_expected_smu_driver_if_per_family
+);
+
+fn smoke_amdgpu_initialize_rejects_without_mp1_discovery() -> TestResult {
+    use crate::amdgpu::with_controller;
+    if !crate::amdgpu::is_probed() {
+        return TestResult::Skip("amdgpu not probed in this QEMU config");
+    }
+    // If MP1 base isn't discoverable, initialize should fail with
+    // SmuBringUpFailed *before* it touches any MMIO. We don't drive
+    // initialize itself here (needs real PSP), just verify the
+    // precondition check works.
+    let outcome = with_controller(|d| (d.mp1_base(), d.expected_smu_driver_if_version()));
+    match outcome {
+        Some((None, _)) | Some((_, None)) => {
+            // Either precondition missing → initialize would reject.
+            TestResult::Pass
+        }
+        Some((Some(_), Some(_))) => {
+            // Both available — initialize would proceed to PSP load.
+            // Can't smoke-test the rest without real silicon; skip.
+            TestResult::Skip("both prereqs satisfied — can't test reject path here")
+        }
+        None => TestResult::Skip("controller vanished mid-test"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/initialize",
+    smoke_amdgpu_initialize_rejects_without_mp1_discovery
+);

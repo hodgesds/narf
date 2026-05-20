@@ -283,6 +283,11 @@ pub enum AmdgpuError {
     FirmwareMissing,
     /// PSP firmware-load handshake didn't complete.
     FirmwareLoadFailed,
+    /// SMU bring-up failed — TestMessage echo mismatch, driver-IF
+    /// schema mismatch, or mailbox timeout. The MP1 base may be
+    /// wrong (IP discovery missing MP1) or SMU firmware never
+    /// loaded (PSP issue upstream).
+    SmuBringUpFailed,
 }
 
 // ── Driver state ───────────────────────────────────────────────────
@@ -691,6 +696,92 @@ impl AmdGpu {
 
         self.mode = Some(mode);
         Ok(())
+    }
+
+    /// MP1 (SMU) register-window base. Reads IP discovery first;
+    /// pre-discovery silicon doesn't expose SMU bring-up here.
+    pub fn mp1_base(&self) -> Option<u32> {
+        self.ip_block_base(amdgpu_discovery::HW_ID_MP1, 0)
+    }
+
+    /// SMU driver-interface schema version this driver was
+    /// compiled to talk to, per family. Renoir = SMU 12.0,
+    /// Phoenix = SMU 13.0.4. Other families don't have an SMU
+    /// bring-up path in this scaffold.
+    pub fn expected_smu_driver_if_version(&self) -> Option<u32> {
+        use crate::amdgpu_smu::{SMU12_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION};
+        match self.chip.family {
+            Family::Renoir => Some(SMU12_DRIVER_IF_VERSION),
+            Family::Phoenix => Some(SMU_13_0_4_DRIVER_IF_VERSION),
+            _ => None,
+        }
+    }
+
+    /// End-to-end post-probe init: PSP firmware load, then SMU
+    /// bring-up handshake. After this returns Ok, the chip is
+    /// "warm" — engines can be brought up and a mode set. Ring /
+    /// IH / SDMA bring-up are deferred to caller; they need DMA
+    /// buffer allocation outside this method's scope.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively. The firmware blob's phys
+    /// stays valid through the PSP handshake.
+    pub unsafe fn initialize(
+        &mut self,
+        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    ) -> Result<InitializeReport, AmdgpuError> {
+        // 1. PSP-driven firmware load (existing path — handles
+        //    SMU / GFX / SDMA / DCN microcode in one shot).
+        // SAFETY: caller-asserted BAR5 ownership.
+        unsafe { self.load_firmware(fw_authority)? };
+
+        // 2. SMU bring-up handshake. The MP1 base + expected
+        //    driver-IF version are family-specific; both must
+        //    resolve or we can't safely talk to the SMU.
+        let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
+        let expected_ifv = self
+            .expected_smu_driver_if_version()
+            .ok_or(AmdgpuError::SmuBringUpFailed)?;
+        // SAFETY: SmuRegsAdapter borrows &self.regs which is uniquely
+        // held through `&mut self`. mm_read/mm_write are unsafe
+        // because they touch MM_INDEX/MM_DATA; the adapter promises
+        // exclusivity for the duration of bring_up.
+        let smu_info = {
+            let mut adapter = SmuRegsAdapter { regs: &self.regs };
+            crate::amdgpu_smu::bring_up(&mut adapter, mp1_base, expected_ifv)
+                .map_err(|_| AmdgpuError::SmuBringUpFailed)?
+        };
+
+        Ok(InitializeReport { smu_info })
+    }
+}
+
+/// Per-initialize report — what the host learned about the chip
+/// after `AmdGpu::initialize`. The caller stashes this on the
+/// driver state for later reference (logging, ABI exposure).
+#[derive(Copy, Clone, Debug)]
+pub struct InitializeReport {
+    pub smu_info: crate::amdgpu_smu::SmuInfo,
+}
+
+/// Adapter that implements `SmuMmio` over the driver's BAR5
+/// region. Lives in the function frame of `initialize` — never
+/// outlives the &mut borrow of AmdGpu, so the unsafe MMIO
+/// access in the `read` / `write` methods is sound.
+struct SmuRegsAdapter<'a> {
+    regs: &'a MmioRegion,
+}
+
+impl<'a> crate::amdgpu_smu::SmuMmio for SmuRegsAdapter<'a> {
+    fn read(&mut self, addr: u32) -> u32 {
+        // SAFETY: adapter constructed inside `initialize` which
+        // holds &mut AmdGpu — `self.regs` is exclusively owned for
+        // the duration of the bring-up sequence.
+        unsafe { mm_read(self.regs, addr) }
+    }
+    fn write(&mut self, addr: u32, value: u32) {
+        // SAFETY: same.
+        unsafe { mm_write(self.regs, addr, value) }
     }
 }
 
