@@ -75,11 +75,15 @@ pub const PORT_POWER: u16 = 8;
 pub const PORT_LOW_SPEED: u16 = 9;
 pub const C_PORT_CONNECTION: u16 = 16;
 pub const C_PORT_ENABLE: u16 = 17;
+pub const C_PORT_SUSPEND: u16 = 18;
+pub const C_PORT_OVER_CURRENT: u16 = 19;
 pub const C_PORT_RESET: u16 = 20;
 
 // Port status word bits (§11.24.2.7.1 Table 11-15).
 pub const PSTAT_CONNECTION: u16 = 1 << 0;
 pub const PSTAT_ENABLE: u16 = 1 << 1;
+pub const PSTAT_SUSPEND: u16 = 1 << 2;
+pub const PSTAT_OVER_CURRENT: u16 = 1 << 3;
 pub const PSTAT_RESET: u16 = 1 << 4;
 /// Low Speed Device Attached (§11.24.2.7.1 bit 9). Mutually
 /// exclusive with `PSTAT_HIGH_SPEED`; both clear means full-speed.
@@ -272,6 +276,66 @@ impl UsbHub {
             return Ok(());
         }
         Err(HubError::PortResetTimeout)
+    }
+
+    /// Suspend a downstream port — host issues
+    /// `SET_FEATURE(PORT_SUSPEND)`, the hub gates D+/D- so the
+    /// attached device enters Suspend (USB 2.0 §11.5). No polling
+    /// is needed since the bit-set is fire-and-forget; the device
+    /// goes into Suspend within 3 ms of seeing the J/K bus state.
+    /// Re-issue [`port_resume`] to wake it.
+    pub fn port_suspend(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
+        let mut nothing = [0u8; 0];
+        let _ = xhci_dev.control_in(
+            self.slot_id,
+            RT_HOST_TO_DEV_CLASS_OTHER,
+            REQ_SET_FEATURE,
+            PORT_SUSPEND,
+            port as u16,
+            &mut nothing,
+        )?;
+        Ok(())
+    }
+
+    /// Resume a previously suspended downstream port. Clears
+    /// `PORT_SUSPEND` so the hub un-gates D+/D-; the device sees
+    /// the resume signaling and exits Suspend after T_RSMRCY
+    /// (~10 ms). Then acks the change bit via
+    /// `CLEAR_FEATURE(C_PORT_SUSPEND)` so the next suspend cycle
+    /// observes a fresh edge.
+    pub fn port_resume(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
+        let mut nothing = [0u8; 0];
+        let _ = xhci_dev.control_in(
+            self.slot_id,
+            RT_HOST_TO_DEV_CLASS_OTHER,
+            REQ_CLEAR_FEATURE,
+            PORT_SUSPEND,
+            port as u16,
+            &mut nothing,
+        )?;
+        let _ = xhci_dev.control_in(
+            self.slot_id,
+            RT_HOST_TO_DEV_CLASS_OTHER,
+            REQ_CLEAR_FEATURE,
+            C_PORT_SUSPEND,
+            port as u16,
+            &mut nothing,
+        );
+        Ok(())
+    }
+
+    /// True iff the downstream port is currently in Suspend state.
+    /// Reads PORT_STATUS and inspects `PSTAT_SUSPEND`.
+    pub fn port_is_suspended(&self, xhci_dev: &Xhci, port: u8) -> Result<bool, HubError> {
+        let s = self.port_status(xhci_dev, port)? as u16;
+        Ok(s & PSTAT_SUSPEND != 0)
+    }
+
+    /// Slot-id accessor — needed by the supervisor for diagnostics
+    /// and the hub-port-suspend bookkeeping (which doesn't hold a
+    /// reference to the `UsbHub` itself across IRQ wakes).
+    pub fn slot_id(&self) -> u8 {
+        self.slot_id
     }
 
     /// Returns the list of downstream ports that report a connected

@@ -225,6 +225,12 @@ fn spawn_supervisor_task() {
             let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
             let _ = xhci::with_controller(|c| hid::touchpad::pump_all(c));
             let _ = xhci::with_controller(|c| cdc_acm::pump_all(c));
+            // Power management: suspend any downstream port whose
+            // last activity is older than IDLE_SUSPEND_NS. Pumps
+            // above touch `last_activity_tick` via mark_port_activity
+            // on each completed transfer, so an actively-used keyboard
+            // never gets suspended; an idle USB stick / hub does.
+            let _ = xhci::with_controller(|c| attach::idle_suspend_pass(c));
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
             //       endpoint or a Port Status Change Event (hot-plug),

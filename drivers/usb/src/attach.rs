@@ -109,6 +109,20 @@ pub struct HubBinding {
     /// every cycle). Max 64 ports per hub fits in u64 — real hubs
     /// have ≤15 by convention.
     pub bound_downstream: u64,
+    /// Bitmask of downstream ports the host has put into Suspend
+    /// (via `UsbHub::port_suspend`). Tracked separately from
+    /// `bound_downstream` because a port can be both bound and
+    /// suspended (the device is bound but idle long enough to
+    /// be suspended for power-saving).
+    pub suspended_downstream: u64,
+    /// Per-port last-activity tick. The supervisor records the
+    /// current `narf_time` tick whenever a port's bound device
+    /// sees an interrupt-IN transfer; if (now - last) exceeds
+    /// the idle threshold, the supervisor suspends the port.
+    /// `u64::MAX` means "active right now, never let it be
+    /// suspended on the next pass" (used as a sentinel after
+    /// `port_resume`).
+    pub last_activity_tick: [u64; 64],
 }
 
 /// Global registry of bound hubs, BFS-ordered (the supervisor walks
@@ -116,6 +130,118 @@ pub struct HubBinding {
 /// tier-(N-1) hub that hosts them, so a downstream walk in registry
 /// order always processes a parent before its children).
 pub static HUBS: IrqSafeSpinLock<Vec<HubBinding>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Idle window before the supervisor suspends a downstream port,
+/// in nanoseconds. 30 seconds matches Linux's
+/// `usb.autosuspend_delay_ms` default of 2000 ms / 2 s — we pick
+/// a longer default to avoid suspend churn during typing pauses;
+/// real laptops override this via a tunable.
+pub const IDLE_SUSPEND_NS: u64 = 30 * 1_000_000_000;
+
+/// Mark a downstream port as having seen activity *now*. Called
+/// from each class driver's pump path so the supervisor's idle
+/// timer resets on each interrupt-IN / bulk transfer that
+/// completes. `parent_hub_idx` is the index into [`HUBS`] of the
+/// hub the device is attached to; `port` is the per-hub port number.
+pub fn mark_port_activity(parent_hub_idx: usize, port: u8) {
+    let now = narf_time::monotonic_ns();
+    let mut g = HUBS.lock();
+    if let Some(h) = g.get_mut(parent_hub_idx) {
+        if let Some(slot) = h.last_activity_tick.get_mut(port as usize & 63) {
+            *slot = now;
+        }
+    }
+}
+
+/// Walk every bound hub + suspend any downstream port whose last
+/// activity is older than `IDLE_SUSPEND_NS`. Called once per
+/// supervisor cycle. Suspended ports stay in `bound_downstream`
+/// (the device is still bound, just gated); the supervisor's
+/// next-resume hook (a class driver requesting a transfer) calls
+/// [`resume_port`] which clears the suspend bit on the hub side.
+pub fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
+    let now = narf_time::monotonic_ns();
+    // Snapshot under the lock, dispatch outside so control
+    // transfers (which can sleep) don't hold the registry lock.
+    let work: alloc::vec::Vec<(usize, u8)> = {
+        let g = HUBS.lock();
+        let mut out = alloc::vec::Vec::new();
+        for (idx, h) in g.iter().enumerate() {
+            let num_ports = h.hub.descriptor.num_ports.min(64);
+            for p in 1..=num_ports {
+                let bit = 1u64 << (p as u32 & 63);
+                // Only consider bound + non-suspended ports.
+                if h.bound_downstream & bit == 0 {
+                    continue;
+                }
+                if h.suspended_downstream & bit != 0 {
+                    continue;
+                }
+                let last = h.last_activity_tick[p as usize & 63];
+                if last == u64::MAX {
+                    continue;
+                }
+                if now.saturating_sub(last) >= IDLE_SUSPEND_NS {
+                    out.push((idx, p));
+                }
+            }
+        }
+        out
+    };
+    let mut suspended = 0;
+    for (idx, p) in &work {
+        let slot_id = {
+            let g = HUBS.lock();
+            g.get(*idx).map(|h| h.hub.slot_id())
+        };
+        if slot_id.is_none() {
+            continue;
+        }
+        // Issue SET_FEATURE(PORT_SUSPEND).
+        let r = {
+            let g = HUBS.lock();
+            g.get(*idx).map(|h| h.hub.port_suspend(xhci_dev, *p))
+        };
+        if matches!(r, Some(Ok(()))) {
+            let mut g = HUBS.lock();
+            if let Some(h) = g.get_mut(*idx) {
+                h.suspended_downstream |= 1u64 << (*p as u32 & 63);
+            }
+            suspended += 1;
+        }
+    }
+    suspended
+}
+
+/// Resume a previously suspended downstream port — called by a
+/// class driver before it issues the next transfer that would
+/// otherwise return NAK on a gated D+/D- pair. Idempotent:
+/// no-op if the port wasn't suspended.
+pub fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, port: u8) {
+    let bit = 1u64 << (port as u32 & 63);
+    let suspended = {
+        let g = HUBS.lock();
+        g.get(parent_hub_idx)
+            .map_or(false, |h| h.suspended_downstream & bit != 0)
+    };
+    if !suspended {
+        return;
+    }
+    // Issue CLEAR_FEATURE(PORT_SUSPEND) + ack the change bit.
+    let r = {
+        let g = HUBS.lock();
+        g.get(parent_hub_idx).map(|h| h.hub.port_resume(xhci_dev, port))
+    };
+    if matches!(r, Some(Ok(()))) {
+        let mut g = HUBS.lock();
+        if let Some(h) = g.get_mut(parent_hub_idx) {
+            h.suspended_downstream &= !bit;
+            // Sentinel value: prevent re-suspend on the very next
+            // pass — let class driver do real work first.
+            h.last_activity_tick[port as usize & 63] = u64::MAX;
+        }
+    }
+}
 
 /// Drive enumeration for a device on root-hub `port`. Returns the
 /// outcome so the supervisor can update its claimed-bitmask state.
@@ -311,6 +437,8 @@ fn dispatch_after_address(
             tier,
             root_hub_port: root_port,
             bound_downstream: 0,
+            suspended_downstream: 0,
+            last_activity_tick: [0u64; 64],
         });
         return AttachOutcome::Hub;
     }

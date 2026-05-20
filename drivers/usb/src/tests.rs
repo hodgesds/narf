@@ -1529,3 +1529,35 @@ fn smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/cdc_ncm", smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface);
+
+// ── drivers/usb/hub (port suspend constants) ───────────────────────
+
+fn smoke_usb_hub_port_suspend_constants_distinct() -> TestResult {
+    use crate::hub::{
+        C_PORT_SUSPEND, PORT_SUSPEND, PSTAT_SUSPEND,
+        C_PORT_CONNECTION, C_PORT_RESET, PORT_RESET,
+    };
+    // Distinct feature codes — silent collision would suspend
+    // when we meant to reset.
+    if PORT_SUSPEND == PORT_RESET {
+        return TestResult::Fail("PORT_SUSPEND must differ from PORT_RESET");
+    }
+    if C_PORT_SUSPEND == C_PORT_CONNECTION || C_PORT_SUSPEND == C_PORT_RESET {
+        return TestResult::Fail("C_PORT_SUSPEND must be distinct change-code");
+    }
+    // PSTAT_SUSPEND is bit 2 per USB 2.0 §11.24.2.7.1 table 11-15.
+    if PSTAT_SUSPEND != 1 << 2 {
+        return TestResult::Fail("PSTAT_SUSPEND must be bit 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_hub_port_suspend_constants_distinct);
+
+fn smoke_usb_attach_idle_suspend_threshold_is_30s() -> TestResult {
+    use crate::attach::IDLE_SUSPEND_NS;
+    if IDLE_SUSPEND_NS != 30 * 1_000_000_000 {
+        return TestResult::Fail("IDLE_SUSPEND_NS drifted from 30 s");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/attach", smoke_usb_attach_idle_suspend_threshold_is_30s);
