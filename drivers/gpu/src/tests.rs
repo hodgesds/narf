@@ -2157,3 +2157,166 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_rejects_empty_or_oversize_image
 );
+
+// ── amdgpu/smu (bring_up) ──────────────────────────────────────────
+//
+// Higher-level bring-up handshake on top of the mailbox primitive.
+// TEST_MESSAGE echo + GET_SMU_VERSION + GET_DRIVER_IF_VERSION
+// match-check. Each step needs its own scripted RESP-then-OK
+// alternation plus an ARG read-back.
+
+fn smoke_amdgpu_smu_bring_up_happy_path() -> TestResult {
+    use crate::amdgpu_smu::{
+        bring_up, MockSmu, SMU12_DRIVER_IF_VERSION, MP1_C2PMSG_ARG_REL,
+        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    // Step 1: TestMessage — handshake (idle), response OK, ARG echoes 0xDEADBEEF.
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0xDEAD_BEEF);
+    // Step 2: GetSmuVersion — handshake, OK, ARG = 0x000A_0203.
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0x000A_0203);
+    // Step 3: GetDriverIfVersion — handshake, OK, ARG = SMU12 driver-IF.
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, SMU12_DRIVER_IF_VERSION);
+
+    let info = match bring_up(&mut m, mp1_base, SMU12_DRIVER_IF_VERSION) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("bring_up errored on happy path");
+        }
+    };
+    if info.smu_version != 0x000A_0203 {
+        return TestResult::Fail("smu_version mis-cached");
+    }
+    if info.driver_if_version != SMU12_DRIVER_IF_VERSION {
+        return TestResult::Fail("driver_if_version mis-cached");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_bring_up_happy_path
+);
+
+fn smoke_amdgpu_smu_bring_up_test_message_echo_mismatch() -> TestResult {
+    use crate::amdgpu_smu::{
+        bring_up, BringUpError, MockSmu, SMU12_DRIVER_IF_VERSION,
+        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    // SMU returns the wrong echo value — bring-up must reject.
+    m.stage_read(arg, 0xBADD_C0DE);
+
+    match bring_up(&mut m, mp1_base, SMU12_DRIVER_IF_VERSION) {
+        Err(BringUpError::TestMessageEchoMismatch { sent, got })
+            if sent == 0xDEAD_BEEF && got == 0xBADD_C0DE =>
+        {
+            TestResult::Pass
+        }
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("expected TestMessageEchoMismatch")
+        }
+        Ok(_) => TestResult::Fail("bad echo silently accepted"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_bring_up_test_message_echo_mismatch
+);
+
+fn smoke_amdgpu_smu_bring_up_driver_if_mismatch_rejected() -> TestResult {
+    use crate::amdgpu_smu::{
+        bring_up, BringUpError, MockSmu, SMU12_DRIVER_IF_VERSION,
+        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    // TestMessage echoes correctly.
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0xDEAD_BEEF);
+    // GetSmuVersion succeeds.
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0x000A_0203);
+    // GetDriverIfVersion reports v0x99 — host expects SMU12 (0x0F).
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0x99);
+
+    match bring_up(&mut m, mp1_base, SMU12_DRIVER_IF_VERSION) {
+        Err(BringUpError::DriverIfMismatch(reported, expected))
+            if reported == 0x99 && expected == SMU12_DRIVER_IF_VERSION =>
+        {
+            TestResult::Pass
+        }
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("expected DriverIfMismatch(0x99, SMU12)")
+        }
+        Ok(_) => TestResult::Fail("schema mismatch silently accepted"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_bring_up_driver_if_mismatch_rejected
+);
+
+fn smoke_amdgpu_smu_bring_up_phoenix_driver_if_version() -> TestResult {
+    use crate::amdgpu_smu::{
+        bring_up, MockSmu, SMU_13_0_4_DRIVER_IF_VERSION, MP1_C2PMSG_ARG_REL,
+        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    // Same happy-path script but the host expects the Phoenix
+    // (SMU 13.0.4) driver-IF version, and the mock reports it.
+    let mut m = MockSmu::new();
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0xDEAD_BEEF);
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0x000D_0004);
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, SMU_13_0_4_DRIVER_IF_VERSION);
+
+    match bring_up(&mut m, mp1_base, SMU_13_0_4_DRIVER_IF_VERSION) {
+        Ok(info) if info.driver_if_version == SMU_13_0_4_DRIVER_IF_VERSION => TestResult::Pass,
+        Ok(other) => {
+            let _ = other;
+            TestResult::Fail("Phoenix driver-IF mis-cached")
+        }
+        Err(e) => {
+            let _ = e;
+            TestResult::Fail("Phoenix happy path failed")
+        }
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_bring_up_phoenix_driver_if_version
+);

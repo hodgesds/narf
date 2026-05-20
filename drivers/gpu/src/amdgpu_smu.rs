@@ -244,6 +244,120 @@ pub fn send_message_void<M: SmuMmio>(
     send_message(mmio, mp1_base, msg, arg).map(|_| ())
 }
 
+// ── Per-family driver-interface schema versions ────────────────────
+//
+// The SMU exposes a driver-IF schema version through
+// PPSMC_MSG_GET_DRIVER_IF_VERSION. The host driver must compile
+// against a matching ppsmc.h; a mismatch means the SMU will
+// interpret message ids and argument layouts differently than the
+// driver expects, so subsequent commands corrupt SMU state. Linux
+// rejects bring-up with -EOPNOTSUPP on mismatch (see
+// `smu_check_fw_version` in `smu_v*_0.c`); we match that posture.
+//
+// Values per Linux:
+//   smu_v12_0.h:        SMU12_DRIVER_IF_VERSION   (Renoir / Lucienne / Cezanne)
+//   smu_v13_0_4.h:      SMU_13_0_4_DRIVER_IF_VERSION (Phoenix / HawkPoint1)
+
+/// Renoir / Lucienne / Cezanne (SMU 12.0). Matches Linux
+/// `drivers/gpu/drm/amd/pm/swsmu/inc/smu_v12_0.h`.
+pub const SMU12_DRIVER_IF_VERSION: u32 = 0x0F;
+/// Phoenix HawkPoint1 / Phoenix2 (SMU 13.0.4). Matches Linux
+/// `drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu_v13_0_4.h`.
+pub const SMU_13_0_4_DRIVER_IF_VERSION: u32 = 0x07;
+
+// ── Bring-up sequence ──────────────────────────────────────────────
+
+/// Snapshot of what the host learned during SMU bring-up. Returned
+/// from `bring_up` so the caller can stash it on the driver state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SmuInfo {
+    /// SMU firmware version (BCD-packed major.minor.rev typically).
+    pub smu_version: u32,
+    /// Driver-IF schema version the SMU reports.
+    pub driver_if_version: u32,
+}
+
+/// Bring-up errors. Distinct from [`SmuError`] because these are
+/// higher-level handshake failures, not mailbox-level errors.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BringUpError {
+    /// A mailbox-level error happened during one of the bring-up
+    /// steps. The wrapped step is the first one that failed.
+    Mailbox(SmuError, BringUpStep),
+    /// `GET_DRIVER_IF_VERSION` returned a value the driver wasn't
+    /// compiled to handle. The wrapped values are
+    /// `(smu_reported, host_expected)`.
+    DriverIfMismatch(u32, u32),
+    /// `TEST_MESSAGE` didn't echo the host-supplied argument. SMU
+    /// is responsive but mis-behaving.
+    TestMessageEchoMismatch { sent: u32, got: u32 },
+}
+
+/// Which step in the bring-up sequence faulted.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BringUpStep {
+    TestMessage,
+    GetSmuVersion,
+    GetDriverIfVersion,
+}
+
+/// Canonical SMU bring-up sequence. PSP must have loaded SMU
+/// firmware before this is called; caller verifies that
+/// out-of-band.
+///
+/// Steps:
+///   1. `PPSMC_MSG_TestMessage` with a host-chosen sentinel.
+///      The SMU echoes the argument back via ARG. Confirms the
+///      mailbox is alive end-to-end before trusting any future
+///      response.
+///   2. `PPSMC_MSG_GetSmuVersion` — stash the firmware version
+///      so logs / version-coupling enforcement can use it.
+///   3. `PPSMC_MSG_GetDriverIfVersion` — verify against the
+///      schema version the host was compiled for. Mismatch fails
+///      bring-up; downstream message argument layouts are not
+///      compatible.
+///
+/// Real bring-up also programs `SetDriverDramAddr{High,Low}` so
+/// the SMU can DMA shared-state tables to host RAM, but that
+/// allocation lives in the driver core — kept out of this
+/// pure-protocol module.
+pub fn bring_up<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    expected_driver_if_version: u32,
+) -> Result<SmuInfo, BringUpError> {
+    // Step 1: TestMessage with a sentinel argument.
+    let sentinel: u32 = 0xDEAD_BEEF;
+    let echoed = send_message_get(mmio, mp1_base, PPSMC_MSG_TEST_MESSAGE, sentinel)
+        .map_err(|e| BringUpError::Mailbox(e, BringUpStep::TestMessage))?;
+    if echoed != sentinel {
+        return Err(BringUpError::TestMessageEchoMismatch {
+            sent: sentinel,
+            got: echoed,
+        });
+    }
+
+    // Step 2: GetSmuVersion.
+    let smu_version = send_message_get(mmio, mp1_base, PPSMC_MSG_GET_SMU_VERSION, 0)
+        .map_err(|e| BringUpError::Mailbox(e, BringUpStep::GetSmuVersion))?;
+
+    // Step 3: GetDriverIfVersion and check.
+    let driver_if_version =
+        send_message_get(mmio, mp1_base, PPSMC_MSG_GET_DRIVER_IF_VERSION, 0)
+            .map_err(|e| BringUpError::Mailbox(e, BringUpStep::GetDriverIfVersion))?;
+    if driver_if_version != expected_driver_if_version {
+        return Err(BringUpError::DriverIfMismatch(
+            driver_if_version,
+            expected_driver_if_version,
+        ));
+    }
+
+    Ok(SmuInfo {
+        smu_version,
+        driver_if_version,
+    })
+}
+
 pub mod test_support {
     //! Test scaffolding exposed for smokes in this crate and
     //! adjacent driver crates. Not part of the production driver
