@@ -1236,3 +1236,146 @@ fn smoke_rapl_pkg_energy_advances() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("power/rapl", smoke_rapl_pkg_energy_advances);
+
+// ── power/laptop_state ─────────────────────────────────────────────
+
+fn smoke_laptop_state_default_is_all_none() -> TestResult {
+    use crate::laptop_state::LaptopStateSnapshot;
+    let s = LaptopStateSnapshot::default();
+    if s.ac_adapter.is_some() || s.lid.is_some() {
+        return TestResult::Fail("default snapshot must have AC/lid as None");
+    }
+    if s.cpu_tdie_mc.is_some() || s.gpu_temp_mc.is_some() {
+        return TestResult::Fail("default thermal fields must be None");
+    }
+    if !s.battery_info.is_none() || !s.battery_state.is_none() {
+        return TestResult::Fail("default battery fields must be None");
+    }
+    if s.power_button_presses != 0 || s.sleep_button_presses != 0 {
+        return TestResult::Fail("default press counts must be 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/laptop_state", smoke_laptop_state_default_is_all_none);
+
+fn smoke_laptop_state_critical_low_on_battery_fires() -> TestResult {
+    use crate::laptop_state::LaptopStateSnapshot;
+    use narf_acpi::ac_adapter::AcAdapterState;
+    use narf_acpi::battery::{decode_bif, decode_bst, BatteryStatus};
+    use alloc::string::String;
+    let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+    let info = decode_bif(&ints, &strings).expect("bif");
+    let bst: [u32; 4] = [
+        BatteryStatus::DISCHARGING | BatteryStatus::CRITICAL,
+        15_000,
+        1_200,
+        10_900,
+    ];
+    let state = decode_bst(&bst).expect("bst");
+    // Discharging + critical + offline AC → critical-low fires.
+    let s = LaptopStateSnapshot {
+        ac_adapter: Some(AcAdapterState::Offline),
+        battery_info: Some(info.clone()),
+        battery_state: Some(state),
+        ..Default::default()
+    };
+    if !s.is_running_low_on_battery() {
+        return TestResult::Fail("critical low + offline AC must fire");
+    }
+    // Same critical state but AC online → must NOT fire (it's
+    // charging back up).
+    let s_online = LaptopStateSnapshot {
+        ac_adapter: Some(AcAdapterState::Online),
+        battery_info: Some(info),
+        battery_state: Some(state),
+        ..Default::default()
+    };
+    if s_online.is_running_low_on_battery() {
+        return TestResult::Fail("critical + online AC must NOT fire critical-low");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/laptop_state",
+    smoke_laptop_state_critical_low_on_battery_fires
+);
+
+fn smoke_laptop_state_any_temp_above_fuses_cpu_and_gpu() -> TestResult {
+    use crate::laptop_state::LaptopStateSnapshot;
+    // Both sensors below threshold.
+    let cold = LaptopStateSnapshot {
+        cpu_tdie_mc: Some(60_000),
+        gpu_temp_mc: Some(55_000),
+        ..Default::default()
+    };
+    if cold.any_temp_above(80_000) {
+        return TestResult::Fail("both below threshold — must not trip");
+    }
+    // GPU hot, CPU cool.
+    let gpu_hot = LaptopStateSnapshot {
+        cpu_tdie_mc: Some(60_000),
+        gpu_temp_mc: Some(95_000),
+        ..Default::default()
+    };
+    if !gpu_hot.any_temp_above(80_000) {
+        return TestResult::Fail("GPU above threshold must trip");
+    }
+    // CPU hot, GPU cool.
+    let cpu_hot = LaptopStateSnapshot {
+        cpu_tdie_mc: Some(95_000),
+        gpu_temp_mc: Some(60_000),
+        ..Default::default()
+    };
+    if !cpu_hot.any_temp_above(80_000) {
+        return TestResult::Fail("CPU above threshold must trip");
+    }
+    // Both unknown → can't trip.
+    let unknown = LaptopStateSnapshot::default();
+    if unknown.any_temp_above(0) {
+        return TestResult::Fail("unknown sensors must not trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/laptop_state",
+    smoke_laptop_state_any_temp_above_fuses_cpu_and_gpu
+);
+
+fn smoke_laptop_state_battery_percent_fuses_info_and_state() -> TestResult {
+    use crate::laptop_state::LaptopStateSnapshot;
+    use narf_acpi::battery::{decode_bif, decode_bst, BatteryStatus};
+    use alloc::string::String;
+    let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+    let info = decode_bif(&ints, &strings).expect("bif");
+    let bst: [u32; 4] = [BatteryStatus::DISCHARGING, 12_000, 24_000, 11_000]; // 50%
+    let state = decode_bst(&bst).expect("bst");
+
+    let snap = LaptopStateSnapshot {
+        battery_info: Some(info.clone()),
+        battery_state: Some(state),
+        ..Default::default()
+    };
+    match snap.battery_percent() {
+        Some(50) => {}
+        Some(other) => {
+            let _ = other;
+            return TestResult::Fail("24k/48k must yield 50%");
+        }
+        None => return TestResult::Fail("percent should be Some(50)"),
+    }
+    // With info missing, percent is None.
+    let snap_no_info = LaptopStateSnapshot {
+        battery_state: Some(state),
+        ..Default::default()
+    };
+    if snap_no_info.battery_percent().is_some() {
+        return TestResult::Fail("missing info must yield None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/laptop_state",
+    smoke_laptop_state_battery_percent_fuses_info_and_state
+);
