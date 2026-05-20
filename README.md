@@ -982,19 +982,116 @@ See [`ROADMAP.md`](./ROADMAP.md) for the stage × subsystem matrix and
 
 ## How to run
 
-```sh
-# Boot the async demo:
-cargo xtask run  --arch=x86_64
-cargo xtask run  --arch=aarch64
+### Prerequisites
 
-# Run the kernel-test harness:
+- Rust nightly (pinned by `rust-toolchain.toml` to
+  `nightly-2025-09-14` with `rust-src`, `llvm-tools`, `clippy`, and
+  `rustfmt`). `rustup` reads the pin automatically on first
+  `cargo` invocation — no manual `+nightly` needed.
+- `qemu-system-x86_64` and/or `qemu-system-aarch64` (e.g.
+  `apt install qemu-system-x86 qemu-system-arm` on Debian /
+  Ubuntu, `pacman -S qemu-full` on Arch). The aarch64 host
+  binary is needed for `--arch=aarch64`.
+- `xorriso` and `mtools` for ISO building (`apt install xorriso
+  mtools`, `pacman -S libisoburn mtools`). Only the `image` /
+  `iso-boot` / `disk-write` subcommands need these.
+- `OVMF` UEFI firmware for `iso-boot`
+  (`apt install ovmf`, `pacman -S edk2-ovmf`). Defaults to
+  `/usr/share/OVMF/OVMF_CODE.fd` paths; xtask probes a few
+  common locations.
+
+xtask cross-builds against `x86_64-unknown-none` /
+`aarch64-unknown-none` with `build-std`, then launches QEMU.
+NVMe images and the QEMU virt DTB are generated lazily into
+`target/`.
+
+### Boot under QEMU
+
+```sh
+# Async demo, serial-only (default --display=none):
+cargo xtask run --arch=x86_64
+cargo xtask run --arch=aarch64
+
+# With a graphical display window (gtk / sdl / cocoa, depending
+# on host) — useful for the framebuffer / shell:
+cargo xtask run --arch=x86_64 --display=gtk
+
+# Pick a hardware profile (default is `full` — all supported
+# devices enabled). Useful for isolating driver paths:
+cargo xtask run --arch=x86_64 --hw-profile=minimal      # serial only
+cargo xtask run --arch=x86_64 --hw-profile=virtio-only  # VirtIO + serial
+cargo xtask run --arch=x86_64 --hw-profile=legacy-only  # non-VirtIO + serial
+```
+
+### Run the kernel-test suite
+
+```sh
+# Boots a kernel build that runs every `kernel_test_in!` smoke
+# under QEMU and exits via isa-debug-exit when done. The runner
+# prints `── summary: <pass> pass, <fail> fail, <skip> skip ──`
+# on the way out.
 cargo xtask test --arch=x86_64
 cargo xtask test --arch=aarch64
 ```
 
-xtask cross-builds against `x86_64-unknown-none` / `aarch64-unknown-none`
-with `build-std`, then launches QEMU. NVMe images and the QEMU virt
-DTB are generated lazily into `target/`.
+Skips are tests that need a device QEMU doesn't emulate (e.g.
+Intel 82599); they exit cleanly without failing the run.
+
+### Build an ISO + boot it under OVMF
+
+```sh
+# Build the Limine ISO (lands at target/narf-x86_64.iso) and
+# boot it under QEMU + OVMF UEFI in one step:
+cargo xtask iso-boot --arch=x86_64
+
+# Just produce the ISO without booting:
+cargo xtask image --arch=x86_64
+
+# Boot the ISO with a graphical display + the user-mode testbin
+# running (interactive shell at the `narf>` prompt):
+cargo xtask demo --arch=x86_64 --display=gtk
+```
+
+The ISO uses Limine as the bootloader on x86_64. On aarch64
+`xtask image` produces a kernel + DTB image bootable via QEMU
+`-kernel`; no ISO is built since the aarch64 boot path is
+direct-kernel today.
+
+### Burn the ISO to a USB stick
+
+> Writes are destructive. xtask refuses to write to a device
+> that isn't USB-attached (no `/dev/sda` that's actually your
+> system disk by accident). Always double-check the device path
+> via `lsblk` first.
+
+```sh
+# Auto-detect the first USB-attached disk:
+sudo cargo xtask disk-write
+
+# Or pin a specific device:
+sudo cargo xtask disk-write --device /dev/sdX
+
+# Skip the slow full-device wipe if you know the USB has no
+# leftover bootable signatures past the ISO size:
+sudo cargo xtask disk-write --device /dev/sdX --no-wipe
+
+# Fast wipe: zero the MBR / GPT / EFI / El Torito regions only
+# (first 100 MiB + last 4 MiB), skip the middle-of-disk zero-fill.
+# Same boot-correctness as a full wipe when the USB is larger
+# than the ISO.
+sudo cargo xtask disk-write --device /dev/sdX --fast-wipe
+
+# Burn a custom ISO path:
+sudo cargo xtask disk-write --device /dev/sdX --iso path/to/narf.iso
+```
+
+After the `dd` finishes, xtask does a logical detach + re-probe
++ read-back verification so the burn is guaranteed to land on
+the USB stick's flash NAND, not the USB controller's write
+cache. The check catches the failure mode where a successful
+`dd` exit code paired with a still-default boot sector means
+the firmware has the writes buffered but they never reached
+the device.
 
 ## Where to start reading
 
