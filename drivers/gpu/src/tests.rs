@@ -2878,3 +2878,143 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable
 );
+
+// ── amdgpu/sdma (packet builder) ───────────────────────────────────
+//
+// SDMA packet construction. Tests verify the dword layout for the
+// three canonical packets — COPY linear, FENCE, NOP — and reject
+// degenerate inputs (empty / oversize copy).
+
+fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
+    use crate::amdgpu_sdma::{
+        SdmaBuilder, SDMA_OP_COPY, SDMA_SUBOP_COPY_LINEAR,
+    };
+    let mut buf = [0u32; 7];
+    let bytes_written = {
+        let mut b = SdmaBuilder::new(&mut buf);
+        let src: u64 = 0x1111_2222_3333_4400;
+        let dst: u64 = 0x5555_6666_7777_8800;
+        if b.copy_linear(src, dst, 0x4000).is_err() {
+            return TestResult::Fail("copy_linear emit failed");
+        }
+        b.bytes_written()
+    };
+    if bytes_written != 7 * 4 {
+        return TestResult::Fail("copy_linear should emit 7 dwords");
+    }
+
+    // Header: OP=COPY << 24, SUB_OP=LINEAR << 16.
+    let want_hdr = (SDMA_OP_COPY << 24) | (SDMA_SUBOP_COPY_LINEAR << 16);
+    if buf[0] != want_hdr {
+        return TestResult::Fail("copy header dword wrong");
+    }
+    // Count = bytes - 1.
+    if buf[1] != 0x4000 - 1 {
+        return TestResult::Fail("copy count must be byte_count - 1");
+    }
+    // Reserved.
+    if buf[2] != 0 {
+        return TestResult::Fail("copy reserved dword must be 0");
+    }
+    // Src lo / hi, dst lo / hi.
+    if buf[3] != 0x3333_4400 {
+        return TestResult::Fail("src lo wrong");
+    }
+    if buf[4] != 0x1111_2222 {
+        return TestResult::Fail("src hi wrong");
+    }
+    if buf[5] != 0x7777_8800 {
+        return TestResult::Fail("dst lo wrong");
+    }
+    if buf[6] != 0x5555_6666 {
+        return TestResult::Fail("dst hi wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma_packet_copy_linear_layout
+);
+
+fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
+    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_FENCE};
+    let mut buf = [0u32; 4];
+    let dst: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+    {
+        let mut b = SdmaBuilder::new(&mut buf);
+        if b.fence(dst, 42).is_err() {
+            return TestResult::Fail("fence emit failed");
+        }
+    }
+    let want_hdr = SDMA_OP_FENCE << 24;
+    if buf[0] != want_hdr {
+        return TestResult::Fail("fence header dword wrong");
+    }
+    if buf[1] != 0xCCCC_DDDD {
+        return TestResult::Fail("fence dst lo wrong");
+    }
+    if buf[2] != 0xAAAA_BBBB {
+        return TestResult::Fail("fence dst hi wrong");
+    }
+    if buf[3] != 42 {
+        return TestResult::Fail("fence value wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma_packet_fence_layout
+);
+
+fn smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy() -> TestResult {
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaPktError, SDMA_COPY_MAX_BYTES};
+    let mut buf = [0u32; 7];
+    let mut b = SdmaBuilder::new(&mut buf);
+    match b.copy_linear(0x1000, 0x2000, 0) {
+        Err(SdmaPktError::EmptyCopy) => {}
+        _ => return TestResult::Fail("zero-byte copy must be rejected"),
+    }
+    match b.copy_linear(0x1000, 0x2000, SDMA_COPY_MAX_BYTES + 1) {
+        Err(SdmaPktError::CopyTooLarge) => {}
+        _ => return TestResult::Fail("oversized copy must be rejected"),
+    }
+    if b.bytes_written() != 0 {
+        return TestResult::Fail("rejected calls must not advance pos");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy
+);
+
+fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
+    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_NOP, SDMA_OP_TRAP};
+    let mut buf = [0u32; 3];
+    {
+        let mut b = SdmaBuilder::new(&mut buf);
+        if b.nop().is_err() {
+            return TestResult::Fail("nop emit failed");
+        }
+        if b.trap(0xC0DE_F00D).is_err() {
+            return TestResult::Fail("trap emit failed");
+        }
+        if b.bytes_written() != 3 * 4 {
+            return TestResult::Fail("expected 3 dwords (nop=1 + trap=2)");
+        }
+    }
+    if buf[0] != (SDMA_OP_NOP << 24) {
+        return TestResult::Fail("NOP header wrong");
+    }
+    if buf[1] != (SDMA_OP_TRAP << 24) {
+        return TestResult::Fail("TRAP header wrong");
+    }
+    if buf[2] != 0xC0DE_F00D {
+        return TestResult::Fail("TRAP ack wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma_packet_nop_and_trap
+);

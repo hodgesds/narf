@@ -43,6 +43,29 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+// ── SDMA packet opcodes (sdma_pkt_open.h) ──────────────────────────
+//
+// Header layout: bits[31:24] = OP, bits[23:16] = SUB_OP,
+// bits[15:0] = per-OP flags.
+
+/// `SDMA_OP_NOP` — no-op padding packet.
+pub const SDMA_OP_NOP: u32 = 0x00;
+/// `SDMA_OP_COPY` — linear or tiled copy.
+pub const SDMA_OP_COPY: u32 = 0x01;
+/// `SDMA_OP_WRITE` — write immediate dwords to memory.
+pub const SDMA_OP_WRITE: u32 = 0x02;
+/// `SDMA_OP_FENCE` — write a 32-bit value to memory (fence publish).
+pub const SDMA_OP_FENCE: u32 = 0x05;
+/// `SDMA_OP_TRAP` — signal an interrupt.
+pub const SDMA_OP_TRAP: u32 = 0x06;
+/// `SDMA_OP_POLL_REGMEM` — poll register/memory until a condition.
+pub const SDMA_OP_POLL_REGMEM: u32 = 0x08;
+
+/// `SDMA_SUBOP_COPY_LINEAR` — default sub-op for `SDMA_OP_COPY`.
+pub const SDMA_SUBOP_COPY_LINEAR: u32 = 0x00;
+/// `SDMA_SUBOP_WRITE_LINEAR` — default sub-op for `SDMA_OP_WRITE`.
+pub const SDMA_SUBOP_WRITE_LINEAR: u32 = 0x00;
+
 // ── SDMA v4.0 register offsets (dword-indexed, multiply by 4 for byte) ──
 //
 // Values from sdma0/sdma0_4_0_offset.h. Relative to the SDMA
@@ -199,4 +222,117 @@ pub fn build_sdma4_ring_init(
     );
 
     Ok(seq)
+}
+
+// ── SDMA packet builder ────────────────────────────────────────────
+//
+// Mirror of [`crate::amdgpu_pm4::Pm4Builder`] for the SDMA command
+// stream. SDMA packets are pushed onto an SDMA ring (allocated +
+// brought up via build_sdma4_ring_init above), and the engine
+// fetches + executes them asynchronously from the CP. Useful for
+// host↔VRAM memcopy without burning GFX cycles.
+
+/// Errors from SDMA packet construction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SdmaPktError {
+    /// Output buffer too small for the packet being built.
+    OutOfRoom,
+    /// Linear copy byte count exceeds the SDMA per-packet limit
+    /// (the COUNT field is 22 bits on v4).
+    CopyTooLarge,
+    /// Copy byte count of zero — no-op copies don't go through
+    /// COPY; use NOP if padding is needed.
+    EmptyCopy,
+}
+
+/// SDMA packet builder. Writes 32-bit words into `out`.
+#[derive(Debug)]
+pub struct SdmaBuilder<'a> {
+    out: &'a mut [u32],
+    pos: usize,
+}
+
+/// Max bytes per SDMA_OP_COPY packet on v4 — COUNT field is 22 bits.
+pub const SDMA_COPY_MAX_BYTES: u32 = (1 << 22) - 1;
+
+impl<'a> SdmaBuilder<'a> {
+    pub fn new(out: &'a mut [u32]) -> Self {
+        Self { out, pos: 0 }
+    }
+
+    pub fn bytes_written(&self) -> usize {
+        self.pos * 4
+    }
+
+    fn push(&mut self, w: u32) -> Result<(), SdmaPktError> {
+        if self.pos >= self.out.len() {
+            return Err(SdmaPktError::OutOfRoom);
+        }
+        self.out[self.pos] = w;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn header(op: u32, sub_op: u32) -> u32 {
+        ((op & 0xFF) << 24) | ((sub_op & 0xFF) << 16)
+    }
+
+    /// `SDMA_OP_NOP` — emit one no-op header. Useful for padding
+    /// the ring before a wrap.
+    pub fn nop(&mut self) -> Result<(), SdmaPktError> {
+        self.push(Self::header(SDMA_OP_NOP, 0))
+    }
+
+    /// `SDMA_OP_COPY` linear → linear. Copies `byte_count` bytes
+    /// from `src` to `dst`. Both addresses are bus-physical and
+    /// should be 4-byte aligned (SDMA serves smaller alignments
+    /// but throughput tanks).
+    ///
+    /// Packet shape (v4): 7 dwords (header + count + reserved +
+    /// src lo/hi + dst lo/hi).
+    pub fn copy_linear(
+        &mut self,
+        src: u64,
+        dst: u64,
+        byte_count: u32,
+    ) -> Result<(), SdmaPktError> {
+        if byte_count == 0 {
+            return Err(SdmaPktError::EmptyCopy);
+        }
+        if byte_count > SDMA_COPY_MAX_BYTES {
+            return Err(SdmaPktError::CopyTooLarge);
+        }
+        self.push(Self::header(SDMA_OP_COPY, SDMA_SUBOP_COPY_LINEAR))?;
+        // COUNT is byte_count - 1 in bits[21:0].
+        self.push(byte_count - 1)?;
+        // Reserved dword (always 0 on v4).
+        self.push(0)?;
+        self.push(src as u32)?;
+        self.push((src >> 32) as u32)?;
+        self.push(dst as u32)?;
+        self.push((dst >> 32) as u32)?;
+        Ok(())
+    }
+
+    /// `SDMA_OP_FENCE` — write a 32-bit value to memory. Used to
+    /// publish a fence after a COPY completes; the SDMA engine
+    /// drains the FENCE only after preceding packets retire.
+    ///
+    /// Packet shape (v4): 4 dwords (header + dst lo + dst hi + value).
+    pub fn fence(&mut self, dst: u64, value: u32) -> Result<(), SdmaPktError> {
+        self.push(Self::header(SDMA_OP_FENCE, 0))?;
+        self.push(dst as u32)?;
+        self.push((dst >> 32) as u32)?;
+        self.push(value)?;
+        Ok(())
+    }
+
+    /// `SDMA_OP_TRAP` — signal an interrupt back to host. Argument
+    /// is passed through the ack register on real silicon (here we
+    /// just encode it). Packet shape: 2 dwords (header + ack).
+    pub fn trap(&mut self, ack: u32) -> Result<(), SdmaPktError> {
+        self.push(Self::header(SDMA_OP_TRAP, 0))?;
+        self.push(ack)?;
+        Ok(())
+    }
 }
