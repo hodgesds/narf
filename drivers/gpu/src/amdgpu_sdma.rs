@@ -150,6 +150,99 @@ impl SdmaRingInitSequence {
     }
 }
 
+// ── SDMA v6.0 (Phoenix HawkPoint1) register offsets ────────────────
+//
+// Per Linux drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c +
+// sdma/sdma_6_0_0_offset.h. Phoenix renames the per-queue
+// registers to "QUEUE0_" instead of "GFX_" and shifts most
+// offsets. Ring-init shape is identical to v4.
+
+/// `mmSDMA0_QUEUE0_RB_CNTL` (Phoenix).
+pub const SDMA6_QUEUE0_RB_CNTL_REL: u32 = 0x1F * 4;
+/// `mmSDMA0_QUEUE0_RB_BASE`.
+pub const SDMA6_QUEUE0_RB_BASE_REL: u32 = 0x20 * 4;
+/// `mmSDMA0_QUEUE0_RB_BASE_HI`.
+pub const SDMA6_QUEUE0_RB_BASE_HI_REL: u32 = 0x21 * 4;
+/// `mmSDMA0_QUEUE0_RB_RPTR`.
+pub const SDMA6_QUEUE0_RB_RPTR_REL: u32 = 0x22 * 4;
+/// `mmSDMA0_QUEUE0_RB_RPTR_HI`.
+pub const SDMA6_QUEUE0_RB_RPTR_HI_REL: u32 = 0x23 * 4;
+/// `mmSDMA0_QUEUE0_RB_WPTR`.
+pub const SDMA6_QUEUE0_RB_WPTR_REL: u32 = 0x24 * 4;
+/// `mmSDMA0_QUEUE0_RB_WPTR_HI`.
+pub const SDMA6_QUEUE0_RB_WPTR_HI_REL: u32 = 0x25 * 4;
+/// `mmSDMA0_QUEUE0_RB_RPTR_ADDR_HI`.
+pub const SDMA6_QUEUE0_RB_RPTR_ADDR_HI_REL: u32 = 0x26 * 4;
+/// `mmSDMA0_QUEUE0_RB_RPTR_ADDR_LO`.
+pub const SDMA6_QUEUE0_RB_RPTR_ADDR_LO_REL: u32 = 0x27 * 4;
+/// `mmSDMA0_QUEUE0_DOORBELL` (Phoenix).
+pub const SDMA6_QUEUE0_DOORBELL_REL: u32 = 0x2C * 4;
+/// `mmSDMA0_QUEUE0_DOORBELL_OFFSET` (Phoenix).
+pub const SDMA6_QUEUE0_DOORBELL_OFFSET_REL: u32 = 0x2D * 4;
+
+/// Build the SDMA v6.0 ring-init sequence (Phoenix HawkPoint1).
+/// Structurally identical to v4 — same disable / base / wptr_addr /
+/// reset rwptr / cntl / doorbell / enable ordering, just different
+/// per-register offsets. Reuses the v4 field encodings
+/// (`SDMA_RB_ENABLE`, `SDMA_RB_SIZE_SHIFT`,
+/// `SDMA_RB_RPTR_WRITEBACK_ENABLE`, `SDMA_DOORBELL_ENABLE`) which
+/// are stable across versions.
+pub fn build_sdma6_ring_init(
+    sdma_base: u32,
+    ring_phys: u64,
+    ring_size_dw: u32,
+    doorbell_idx: u32,
+    rptr_writeback_phys: u64,
+) -> Result<SdmaRingInitSequence, SdmaError> {
+    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+        return Err(SdmaError::BadRingSize);
+    }
+    if ring_phys & 0xFF != 0 {
+        return Err(SdmaError::UnalignedRingPhys);
+    }
+    if rptr_writeback_phys & 0x3 != 0 {
+        return Err(SdmaError::UnalignedRptrWriteback);
+    }
+    let mut seq = SdmaRingInitSequence::default();
+    seq.push(sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, 0);
+    seq.push(sdma_base + SDMA6_QUEUE0_RB_RPTR_REL, 0);
+    seq.push(sdma_base + SDMA6_QUEUE0_RB_RPTR_HI_REL, 0);
+    seq.push(sdma_base + SDMA6_QUEUE0_RB_WPTR_REL, 0);
+    seq.push(sdma_base + SDMA6_QUEUE0_RB_WPTR_HI_REL, 0);
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_RB_BASE_REL,
+        (ring_phys >> 8) as u32,
+    );
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_RB_BASE_HI_REL,
+        (ring_phys >> 40) as u32,
+    );
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_RB_RPTR_ADDR_LO_REL,
+        rptr_writeback_phys as u32,
+    );
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_RB_RPTR_ADDR_HI_REL,
+        (rptr_writeback_phys >> 32) as u32,
+    );
+    let log2_size = ring_size_dw.trailing_zeros();
+    let cntl_no_enable = (log2_size << SDMA_RB_SIZE_SHIFT) | SDMA_RB_RPTR_WRITEBACK_ENABLE;
+    seq.push(sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, cntl_no_enable);
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
+        doorbell_idx << 2,
+    );
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_DOORBELL_REL,
+        SDMA_DOORBELL_ENABLE,
+    );
+    seq.push(
+        sdma_base + SDMA6_QUEUE0_RB_CNTL_REL,
+        cntl_no_enable | SDMA_RB_ENABLE,
+    );
+    Ok(seq)
+}
+
 /// Build the SDMA v4.0 ring-init sequence. `sdma_base` is the
 /// IP-block base of one SDMA instance (SDMA0 or SDMA1 on Renoir;
 /// just SDMA0 on Phoenix v6.0 with adjusted offsets — caller

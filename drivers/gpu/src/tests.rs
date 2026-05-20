@@ -3481,3 +3481,89 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gmc",
     smoke_amdgpu_gmc_gart_default_flags_compose_correctly
 );
+
+// ── amdgpu/sdma (v6.0 Phoenix) ─────────────────────────────────────
+
+fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
+    use crate::amdgpu_sdma::{
+        build_sdma6_ring_init, SDMA6_QUEUE0_DOORBELL_OFFSET_REL, SDMA6_QUEUE0_DOORBELL_REL,
+        SDMA6_QUEUE0_RB_BASE_HI_REL, SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL,
+        SDMA_DOORBELL_ENABLE, SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE,
+        SDMA_RB_SIZE_SHIFT,
+    };
+    let sdma_base: u32 = 0x0007_0000;
+    let ring_phys: u64 = 0x0000_0001_2000_0000;
+    let ring_size_dw: u32 = 2048;
+    let doorbell_idx: u32 = 4;
+    let rptr_phys: u64 = 0x0000_0002_3000_0000;
+
+    let seq = match build_sdma6_ring_init(
+        sdma_base,
+        ring_phys,
+        ring_size_dw,
+        doorbell_idx,
+        rptr_phys,
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
+    };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+    // First write: CNTL = 0.
+    if w.first().map(|x| (x.addr, x.value)) != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, 0)) {
+        return TestResult::Fail("first write must disable CNTL");
+    }
+    // Last write: CNTL | RB_ENABLE.
+    let expected_en = (ring_size_dw.trailing_zeros() << SDMA_RB_SIZE_SHIFT)
+        | SDMA_RB_RPTR_WRITEBACK_ENABLE
+        | SDMA_RB_ENABLE;
+    if w.last().map(|x| (x.addr, x.value))
+        != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, expected_en))
+    {
+        return TestResult::Fail("last write must enable CNTL");
+    }
+    // Body writes hit the v6 QUEUE0_ namespace, NOT the v4 GFX_ namespace.
+    let want = [
+        (sdma_base + SDMA6_QUEUE0_RB_BASE_REL, (ring_phys >> 8) as u32),
+        (
+            sdma_base + SDMA6_QUEUE0_RB_BASE_HI_REL,
+            (ring_phys >> 40) as u32,
+        ),
+        (
+            sdma_base + SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
+            doorbell_idx << 2,
+        ),
+        (sdma_base + SDMA6_QUEUE0_DOORBELL_REL, SDMA_DOORBELL_ENABLE),
+    ];
+    for (addr, value) in want {
+        if !w.iter().any(|x| x.addr == addr && x.value == value) {
+            return TestResult::Fail("missing expected v6 ring-init write");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma6_ring_init_phoenix_delta
+);
+
+fn smoke_amdgpu_sdma6_uses_different_offsets_than_v4() -> TestResult {
+    use crate::amdgpu_sdma::{
+        SDMA_GFX_RB_BASE_REL, SDMA_GFX_RB_CNTL_REL, SDMA6_QUEUE0_RB_BASE_REL,
+        SDMA6_QUEUE0_RB_CNTL_REL,
+    };
+    // Ensure the Phoenix delta actually shifted offsets — if these
+    // ever drift to match v4 numerically, smokes that exercise
+    // both paths against shared register fixtures will silently
+    // collide. Pin the invariant.
+    if SDMA_GFX_RB_CNTL_REL == SDMA6_QUEUE0_RB_CNTL_REL {
+        return TestResult::Fail("v4 and v6 RB_CNTL offsets must differ");
+    }
+    if SDMA_GFX_RB_BASE_REL == SDMA6_QUEUE0_RB_BASE_REL {
+        return TestResult::Fail("v4 and v6 RB_BASE offsets must differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/sdma",
+    smoke_amdgpu_sdma6_uses_different_offsets_than_v4
+);
