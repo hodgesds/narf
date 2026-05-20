@@ -3402,3 +3402,82 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_get_max_dpm_freq_returns_arg
 );
+
+// ── amdgpu/gmc (GART PTE format) ───────────────────────────────────
+
+fn smoke_amdgpu_gmc_gart_pte_round_trip() -> TestResult {
+    use crate::amdgpu_gmc::{
+        make_pte_gfx9, parse_pte, pte_is_valid, GART_PTE_FLAGS_GTT_DEFAULT,
+        GART_PTE_PFN_SHIFT,
+    };
+    let phys: u64 = 0x0000_0000_5678_9000; // 4 KiB aligned, PFN fits 28 bits
+    let pte = match make_pte_gfx9(phys, GART_PTE_FLAGS_GTT_DEFAULT) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("make_pte rejected valid phys"),
+    };
+    // Valid bit must be set.
+    if !pte_is_valid(pte) {
+        return TestResult::Fail("PTE valid bit not set");
+    }
+    // PFN must occupy bits[39:12] of the PTE: phys >> 12 == bits[27:0] of PTE>>12.
+    let (back_phys, back_flags) = parse_pte(pte);
+    if back_phys != phys {
+        return TestResult::Fail("PTE phys round-trip lost bits");
+    }
+    if back_flags != (GART_PTE_FLAGS_GTT_DEFAULT & 0xFFF) {
+        return TestResult::Fail("PTE flag bits not preserved in low 12");
+    }
+    // Cross-check the actual bit layout: PFN exactly in bits[39:12].
+    let expected_pfn = phys >> GART_PTE_PFN_SHIFT;
+    if (pte >> GART_PTE_PFN_SHIFT) & 0x0FFF_FFFF != expected_pfn {
+        return TestResult::Fail("PFN not in bits[39:12]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gmc",
+    smoke_amdgpu_gmc_gart_pte_round_trip
+);
+
+fn smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize() -> TestResult {
+    use crate::amdgpu_gmc::{make_pte_gfx9, GartError, GART_PTE_FLAGS_GTT_DEFAULT};
+    // Unaligned phys (bottom 12 bits non-zero).
+    match make_pte_gfx9(0x1234_5678_9000 | 0x800, GART_PTE_FLAGS_GTT_DEFAULT) {
+        Err(GartError::UnalignedPhys) => {}
+        _ => return TestResult::Fail("unaligned phys must be rejected"),
+    }
+    // PFN overflow (above 1 TiB).
+    match make_pte_gfx9(1u64 << 41, GART_PTE_FLAGS_GTT_DEFAULT) {
+        Err(GartError::PfnOverflow) => {}
+        _ => return TestResult::Fail("PFN > 28 bits must be rejected on GFX9"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gmc",
+    smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize
+);
+
+fn smoke_amdgpu_gmc_gart_default_flags_compose_correctly() -> TestResult {
+    use crate::amdgpu_gmc::{
+        GART_PTE_CACHEABLE, GART_PTE_FLAGS_GTT_DEFAULT, GART_PTE_SNOOP,
+        GART_PTE_SYSTEM, GART_PTE_VALID, GART_PTE_WRITABLE,
+    };
+    let want = GART_PTE_VALID
+        | GART_PTE_SYSTEM
+        | GART_PTE_CACHEABLE
+        | GART_PTE_WRITABLE
+        | GART_PTE_SNOOP;
+    if GART_PTE_FLAGS_GTT_DEFAULT != want {
+        return TestResult::Fail("GART_PTE_FLAGS_GTT_DEFAULT composition drifted");
+    }
+    // Sanity: every bit must be in the low 12 (flag field).
+    if GART_PTE_FLAGS_GTT_DEFAULT & !0xFFF != 0 {
+        return TestResult::Fail("default flag set must fit in bits[11:0]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gmc",
+    smoke_amdgpu_gmc_gart_default_flags_compose_correctly
+);
