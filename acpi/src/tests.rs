@@ -2566,3 +2566,21 @@ kernel_test_in!(
     "acpi/battery",
     smoke_acpi_battery_percent_remaining_handles_unknown
 );
+
+// ── acpi/ac_adapter ────────────────────────────────────────────────
+
+fn smoke_acpi_ac_adapter_decode_psr_online_offline() -> TestResult {
+    use crate::ac_adapter::{decode_psr, AcAdapterState, PsrError};
+    if decode_psr(0) != Ok(AcAdapterState::Offline) {
+        return TestResult::Fail("_PSR=0 must be Offline");
+    }
+    if decode_psr(1) != Ok(AcAdapterState::Online) {
+        return TestResult::Fail("_PSR=1 must be Online");
+    }
+    match decode_psr(2) {
+        Err(PsrError::BadValue(2)) => {}
+        _ => return TestResult::Fail("_PSR=2 must be rejected as BadValue(2)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/ac_adapter", smoke_acpi_ac_adapter_decode_psr_online_offline);

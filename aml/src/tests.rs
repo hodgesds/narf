@@ -1834,3 +1834,52 @@ fn smoke_aml_evaluate_dsm_missing_method_errors() -> TestResult {
     }
 }
 kernel_test_in!("aml", smoke_aml_evaluate_dsm_missing_method_errors);
+
+// ── aml/ec_events ──────────────────────────────────────────────────
+
+fn smoke_aml_ec_events_register_and_lookup_round_trip() -> TestResult {
+    use crate::ec_events::{
+        lookup_qxx_handler, register_qxx_handler, unregister_qxx_handler, __reset_for_test,
+    };
+    __reset_for_test();
+    fn handler_42(_idx: u8) {
+        // No-op for the smoke; real handlers run a sleep-pump.
+    }
+    if lookup_qxx_handler(0x42).is_some() {
+        return TestResult::Fail("fresh registry must have no handlers");
+    }
+    register_qxx_handler(0x42, handler_42);
+    if lookup_qxx_handler(0x42) != Some(handler_42 as _) {
+        return TestResult::Fail("lookup didn't return registered handler");
+    }
+    // Registering again with a different fn replaces in place.
+    fn handler_42_v2(_idx: u8) {}
+    register_qxx_handler(0x42, handler_42_v2);
+    if lookup_qxx_handler(0x42) != Some(handler_42_v2 as _) {
+        return TestResult::Fail("re-register didn't replace prior handler");
+    }
+    unregister_qxx_handler(0x42);
+    if lookup_qxx_handler(0x42).is_some() {
+        return TestResult::Fail("unregister didn't clear slot");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("aml/ec_events", smoke_aml_ec_events_register_and_lookup_round_trip);
+
+fn smoke_aml_ec_events_drain_bails_without_configured_ec() -> TestResult {
+    use crate::ec_events::drain_ec_events;
+    // Without set_ec_ports() ever being called, ec_query returns
+    // FieldAccessError::Unsupported on first try, which makes
+    // drain_ec_events stop immediately. Critical safety property:
+    // we never spin against a missing EC.
+    let drained = drain_ec_events(100);
+    if drained != 0 {
+        return TestResult::Fail("drain must return 0 when EC isn't configured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "aml/ec_events",
+    smoke_aml_ec_events_drain_bails_without_configured_ec
+);

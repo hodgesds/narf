@@ -46,6 +46,7 @@ use narf_acpi::{AcpiError, SdtHeader};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
+pub mod ec_events;
 pub mod eval;
 pub mod gpe;
 pub mod irq_routing;

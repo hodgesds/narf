@@ -25,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod ac_adapter;
 pub mod battery;
 pub mod ioapic;
 pub mod smbios;
