@@ -2432,3 +2432,137 @@ fn smoke_acpi_ras2_short_buffer_returns_zero() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("acpi/ras2", smoke_acpi_ras2_short_buffer_returns_zero);
+
+// ── acpi/battery ───────────────────────────────────────────────────
+
+fn smoke_acpi_battery_decode_bif_mwh_secondary() -> TestResult {
+    use crate::battery::{decode_bif, BatteryTech, PowerUnit};
+    use alloc::string::String;
+    // Typical laptop _BIF: mWh units, 50_000 mWh design, 48_500 mWh
+    // last-full (slightly aged), secondary (rechargeable), 11.4 V.
+    let ints: [u32; 9] = [0, 50_000, 48_500, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [
+        String::from("NARFBAT0"),
+        String::from("SN-12345"),
+        String::from("LIon"),
+        String::from("NARF OEM"),
+    ];
+    let info = match decode_bif(&ints, &strings) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("decode_bif rejected valid _BIF"),
+    };
+    if info.power_unit != PowerUnit::MilliWatt {
+        return TestResult::Fail("power_unit must be MilliWatt for ints[0]=0");
+    }
+    if info.technology != BatteryTech::Secondary {
+        return TestResult::Fail("technology must be Secondary for ints[3]=1");
+    }
+    if info.design_capacity != 50_000 || info.last_full_capacity != 48_500 {
+        return TestResult::Fail("capacity fields not preserved");
+    }
+    if info.model_number != "NARFBAT0" || info.oem_info != "NARF OEM" {
+        return TestResult::Fail("strings not preserved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/battery", smoke_acpi_battery_decode_bif_mwh_secondary);
+
+fn smoke_acpi_battery_decode_bst_discharging_at_75_percent() -> TestResult {
+    use crate::battery::{decode_bif, decode_bst, BatteryStatus, PowerUnit};
+    use alloc::string::String;
+    // Battery info first (so percent_remaining has a denominator).
+    let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+    let info = decode_bif(&ints, &strings).expect("info decode failed");
+
+    // BST: discharging, 12_500 mW present rate, 36_000 mWh remaining
+    // (= 75% of 48_000 mWh), 11_200 mV.
+    let bst: [u32; 4] = [BatteryStatus::DISCHARGING, 12_500, 36_000, 11_200];
+    let state = match decode_bst(&bst) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("decode_bst rejected valid _BST"),
+    };
+    if !state.is_discharging() {
+        return TestResult::Fail("DISCHARGING bit not detected");
+    }
+    if state.is_critical() {
+        return TestResult::Fail("CRITICAL falsely detected");
+    }
+    if info.power_unit != PowerUnit::MilliWatt {
+        return TestResult::Fail("power_unit mismatch");
+    }
+    match state.percent_remaining(&info) {
+        Some(75) => {}
+        Some(other) => {
+            let _ = other;
+            return TestResult::Fail("percent_remaining wrong (expected 75)");
+        }
+        None => return TestResult::Fail("percent_remaining returned None"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "acpi/battery",
+    smoke_acpi_battery_decode_bst_discharging_at_75_percent
+);
+
+fn smoke_acpi_battery_decode_bst_critical_low() -> TestResult {
+    use crate::battery::{decode_bif, decode_bst, BatteryStatus};
+    use alloc::string::String;
+    let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+    let info = decode_bif(&ints, &strings).expect("info decode failed");
+    // Discharging + critical at 2_000 mWh (below design_capacity_low).
+    let bst: [u32; 4] = [
+        BatteryStatus::DISCHARGING | BatteryStatus::CRITICAL,
+        15_000,
+        2_000,
+        10_900,
+    ];
+    let state = decode_bst(&bst).expect("decode_bst failed");
+    if !state.is_critical() {
+        return TestResult::Fail("CRITICAL bit must be detected");
+    }
+    if !state.is_discharging() {
+        return TestResult::Fail("DISCHARGING bit must coexist with CRITICAL");
+    }
+    if state.percent_remaining(&info) != Some(4) {
+        return TestResult::Fail("2000/48000 should round to 4%");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/battery", smoke_acpi_battery_decode_bst_critical_low);
+
+fn smoke_acpi_battery_decode_bif_rejects_bad_power_unit() -> TestResult {
+    use crate::battery::{decode_bif, DecodeError};
+    use alloc::string::String;
+    let ints: [u32; 9] = [2, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+    match decode_bif(&ints, &strings) {
+        Err(DecodeError::BadPowerUnit) => TestResult::Pass,
+        _ => TestResult::Fail("power_unit=2 must be rejected"),
+    }
+}
+kernel_test_in!(
+    "acpi/battery",
+    smoke_acpi_battery_decode_bif_rejects_bad_power_unit
+);
+
+fn smoke_acpi_battery_percent_remaining_handles_unknown() -> TestResult {
+    use crate::battery::{decode_bif, decode_bst};
+    use alloc::string::String;
+    let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
+    let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+    let info = decode_bif(&ints, &strings).expect("info decode failed");
+    // remaining_capacity = 0xFFFFFFFF (unknown).
+    let bst: [u32; 4] = [1, 0, 0xFFFF_FFFF, 11_000];
+    let state = decode_bst(&bst).expect("bst decode failed");
+    if state.percent_remaining(&info) != None {
+        return TestResult::Fail("unknown remaining must yield None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "acpi/battery",
+    smoke_acpi_battery_percent_remaining_handles_unknown
+);

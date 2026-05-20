@@ -294,8 +294,18 @@ unsafe fn io_out(_port: u16, _width_bytes: usize, _val: u64) {}
 
 const EC_CMD_READ: u8 = 0x80;
 const EC_CMD_WRITE: u8 = 0x81;
+/// `RD_EC = 0x84` — ACPI 6.5 §12.3.5. Host asks EC "what event
+/// fired?" and the EC returns a single byte naming the _Qxx
+/// handler (e.g. 0x33 → invoke `_Q33` from the EC's AML scope).
+/// Issued from the SCI handler when SCI_EVT (bit 5 of EC status)
+/// is asserted; the AML interpreter then runs the named query.
+const EC_CMD_QUERY: u8 = 0x84;
 const EC_SC_OBF: u8 = 0x01;
 const EC_SC_IBF: u8 = 0x02;
+/// `EC_SC_SCI_EVT` (bit 5 of status) — set by the EC to signal
+/// that one or more _Qxx events are pending; cleared when the
+/// host issues EC_CMD_QUERY and drains the response.
+pub const EC_SC_SCI_EVT: u8 = 1 << 5;
 /// ACPI 6.5 §5.2.15: an EC command is bounded by T_EC (~10 ms
 /// typical); 100 ms wedge threshold.
 const EC_TIMEOUT_MS: u64 = 100;
@@ -403,6 +413,55 @@ fn ec_read_byte(_offset: u8) -> Result<u8, FieldAccessError> {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn ec_write_byte(_offset: u8, _val: u8) -> Result<(), FieldAccessError> {
+    Err(FieldAccessError::Unsupported)
+}
+
+// ── EC_QUERY (audit #4 / ACPI 6.5 §12.3.5) ─────────────────────────
+//
+// The SCI handler issues EC_CMD_QUERY when the EC asserts
+// SCI_EVT in the status byte; the EC then drains one queued
+// event from its FIFO and returns the _Qxx index. Index 0 means
+// "no events left" (driver stops draining).
+
+/// Read the EC status byte (status/command port). Caller checks
+/// `EC_SC_SCI_EVT` to decide whether to issue [`ec_query`].
+#[cfg(target_arch = "x86_64")]
+pub fn ec_status() -> Result<u8, FieldAccessError> {
+    let (_data, cmd) = match *EC_PORTS.lock() {
+        Some(p) => p,
+        None => return Err(FieldAccessError::Unsupported),
+    };
+    // SAFETY: ports owned by EC driver path.
+    Ok(unsafe { io_in(cmd, 1) } as u8)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn ec_status() -> Result<u8, FieldAccessError> {
+    Err(FieldAccessError::Unsupported)
+}
+
+/// Drain one pending _Qxx event from the EC. Returns the query
+/// code (0x00-0xFF) — the AML interpreter looks up `_Q{code:02X}`
+/// in the EC's scope and invokes it. A return value of 0 means
+/// "no more events"; the SCI handler stops draining at that point.
+#[cfg(target_arch = "x86_64")]
+pub fn ec_query() -> Result<u8, FieldAccessError> {
+    let (data, cmd) = match *EC_PORTS.lock() {
+        Some(p) => p,
+        None => return Err(FieldAccessError::Unsupported),
+    };
+    ec_wait_ibf_clear()?;
+    // SAFETY: ports owned by EC driver path.
+    unsafe {
+        io_out(cmd, 1, EC_CMD_QUERY as u64);
+    }
+    ec_wait_obf_set()?;
+    // SAFETY: same.
+    Ok(unsafe { io_in(data, 1) } as u8)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn ec_query() -> Result<u8, FieldAccessError> {
     Err(FieldAccessError::Unsupported)
 }
 
