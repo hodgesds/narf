@@ -2035,3 +2035,125 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn20_modeset_seq_contains_expected_offsets
 );
+
+// ── amdgpu/psp ─────────────────────────────────────────────────────
+//
+// PSP MP0 mailbox smokes. The real PSP firmware-load handshake
+// goes through `AmdGpu::load_firmware` which the tests can't
+// execute (needs BAR5 + a real registry blob). The protocol
+// primitive lives in `amdgpu_psp::send_command` and is testable
+// against a `MockPsp` that scripts the canonical sequence.
+
+fn smoke_amdgpu_psp_send_command_drives_canonical_sequence() -> TestResult {
+    use crate::amdgpu_psp::{
+        send_command, MockPsp, MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL,
+        MP0_C2PMSG_69_REL, PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+    };
+    let mp0_base = 0x000B_0000;
+    let lo = mp0_base + MP0_C2PMSG_64_REL;
+    let hi = mp0_base + MP0_C2PMSG_67_REL;
+    let trig = mp0_base + MP0_C2PMSG_69_REL;
+
+    let mut m = MockPsp::new();
+    // Step 4: poll — PSP reports DONE + status 0.
+    m.stage_read(lo, PSP_STATUS_DONE_BIT);
+
+    let phys: u64 = 0x1_2345_6789;
+    let size: u32 = 0x4000; // 16 KiB image
+    match send_command(&mut m, mp0_base, PSP_CMD_LOAD_IP_FW, phys, size) {
+        Ok(0) => {}
+        Ok(other) => {
+            let _ = other;
+            return TestResult::Fail("expected status 0 on happy path");
+        }
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("send_command errored on happy path");
+        }
+    }
+
+    // Captured writes (in order): phys lo, phys hi, trigger word.
+    if m.writes.len() != 3 {
+        return TestResult::Fail("expected exactly 3 mailbox writes");
+    }
+    if m.writes[0] != (lo, phys as u32) {
+        return TestResult::Fail("phys-lo write missing or wrong");
+    }
+    if m.writes[1] != (hi, (phys >> 32) as u32) {
+        return TestResult::Fail("phys-hi write missing or wrong");
+    }
+    let expect_trigger = (PSP_CMD_LOAD_IP_FW & 0xFF) | (size << 8);
+    if m.writes[2] != (trig, expect_trigger) {
+        return TestResult::Fail("trigger word missing or wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_send_command_drives_canonical_sequence
+);
+
+fn smoke_amdgpu_psp_surfaces_rejection_status() -> TestResult {
+    use crate::amdgpu_psp::{
+        send_command, MockPsp, PspError, MP0_C2PMSG_64_REL,
+        PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+    };
+    let mp0_base = 0x000B_0000;
+    let lo = mp0_base + MP0_C2PMSG_64_REL;
+
+    let mut m = MockPsp::new();
+    // PSP set DONE but with a non-zero status code (sig fail).
+    let rejected_code: u32 = 0x0000_0042;
+    m.stage_read(lo, PSP_STATUS_DONE_BIT | rejected_code);
+
+    match send_command(&mut m, mp0_base, PSP_CMD_LOAD_IP_FW, 0x1000, 0x1000) {
+        Err(PspError::Rejected(code)) if code == rejected_code => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("expected PspError::Rejected(0x42)")
+        }
+        Ok(_) => TestResult::Fail("PSP rejection silently passed"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_surfaces_rejection_status
+);
+
+fn smoke_amdgpu_psp_timeout_when_done_never_sets() -> TestResult {
+    use crate::amdgpu_psp::{send_command, MockPsp, PspError, PSP_CMD_LOAD_IP_FW};
+    // Stage nothing — mock returns 0 (DONE not set) on every read.
+    let mut m = MockPsp::new();
+    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, 0x1000) {
+        Err(PspError::Timeout) => TestResult::Pass,
+        _ => TestResult::Fail("expected PspError::Timeout when DONE never sets"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_timeout_when_done_never_sets
+);
+
+fn smoke_amdgpu_psp_rejects_empty_or_oversize_image() -> TestResult {
+    use crate::amdgpu_psp::{
+        send_command, MockPsp, PspError, PSP_CMD_LOAD_IP_FW, PSP_MAX_IMAGE_SIZE,
+    };
+    let mut m = MockPsp::new();
+    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, 0) {
+        Err(PspError::EmptyImage) => {}
+        _ => return TestResult::Fail("zero-size image must be rejected"),
+    }
+    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, PSP_MAX_IMAGE_SIZE + 1) {
+        Err(PspError::ImageTooLarge) => {}
+        _ => return TestResult::Fail("oversize image must be rejected"),
+    }
+    // Neither rejected path should have touched the mailbox.
+    if !m.writes.is_empty() {
+        return TestResult::Fail("rejected images must not write mailbox");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_rejects_empty_or_oversize_image
+);
