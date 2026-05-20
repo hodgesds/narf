@@ -2601,3 +2601,140 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring
 );
+
+// ── amdgpu/gfx (GfxContext submission API) ─────────────────────────
+//
+// The higher-level submission helper. submit_ib pushes an
+// INDIRECT_BUFFER + WRITE_DATA fence pair to the ring, returning
+// a Fence the caller can poll. Without a real CP, fence completion
+// is staged via the test-only set_fence_for_test helper.
+
+fn smoke_amdgpu_gfx_context_submit_ib_advances_fence_and_ring() -> TestResult {
+    use crate::amdgpu_gfx::GfxContext;
+
+    let mut ctx = match GfxContext::new(13) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("GfxContext::new failed"),
+    };
+    if ctx.last_fence_seq() != 0 {
+        return TestResult::Fail("fresh ctx should have last_fence_seq=0");
+    }
+    // Initially no fences have completed.
+    let probe = crate::amdgpu_gfx::Fence { seq: 1 };
+    if ctx.fence_completed(&probe) {
+        return TestResult::Fail("nothing should be complete on a fresh ctx");
+    }
+
+    // Submit one IB; verify fence seq advanced.
+    // SAFETY: smoke owns ctx exclusively.
+    let f1 = match unsafe { ctx.submit_ib(0x1_0000_0000, 64) } {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("submit_ib rejected first IB"),
+    };
+    if f1.seq != 1 {
+        return TestResult::Fail("first fence seq must be 1");
+    }
+    if ctx.last_fence_seq() != 1 {
+        return TestResult::Fail("last_fence_seq must reflect seq 1");
+    }
+
+    // Submit a second IB; verify monotonic.
+    // SAFETY: same.
+    let f2 = match unsafe { ctx.submit_ib(0x2_0000_0000, 32) } {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("submit_ib rejected second IB"),
+    };
+    if f2.seq != 2 {
+        return TestResult::Fail("second fence seq must be 2");
+    }
+
+    // Stage GPU "retiring" fence seq 1 — only f1 should be done.
+    ctx.set_fence_for_test(1);
+    if !ctx.fence_completed(&f1) {
+        return TestResult::Fail("f1 must report complete at observed=1");
+    }
+    if ctx.fence_completed(&f2) {
+        return TestResult::Fail("f2 must NOT be complete at observed=1");
+    }
+
+    // Now retire through 2; both done.
+    ctx.set_fence_for_test(2);
+    if !ctx.fence_completed(&f1) || !ctx.fence_completed(&f2) {
+        return TestResult::Fail("both fences must complete at observed=2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx_context_submit_ib_advances_fence_and_ring
+);
+
+fn smoke_amdgpu_gfx_context_submit_ib_ring_contents() -> TestResult {
+    use crate::amdgpu_gfx::GfxContext;
+
+    let mut ctx = match GfxContext::new(14) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("GfxContext::new failed"),
+    };
+    let ring_phys = ctx.ring_phys();
+    let fence_phys = ctx.fence_phys();
+
+    // SAFETY: smoke owns ctx exclusively.
+    let _ = match unsafe { ctx.submit_ib(0xABCD_0000_0000_0000, 0x80) } {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("submit_ib failed"),
+    };
+
+    // Read the first 9 dwords of the ring back and verify the
+    // packet pair: INDIRECT_BUFFER (4 dw) + WRITE_DATA (5 dw).
+    let read_dw = |i: usize| -> u32 {
+        // SAFETY: identity-mapped DMA backing, owned by ctx.
+        unsafe { core::ptr::read_volatile((ring_phys + (i * 4) as u64) as *const u32) }
+    };
+
+    // dword 0: INDIRECT_BUFFER header (opcode 0x3F).
+    if ((read_dw(0) >> 8) & 0xFF) != 0x3F {
+        return TestResult::Fail("dw0 must be INDIRECT_BUFFER header");
+    }
+    // dword 1: IB base lo.
+    if read_dw(1) != 0xABCD_0000_0000_0000_u64 as u32 {
+        return TestResult::Fail("dw1 must be IB base lo");
+    }
+    // dword 2: IB base hi.
+    if read_dw(2) != (0xABCD_0000_0000_0000_u64 >> 32) as u32 {
+        return TestResult::Fail("dw2 must be IB base hi");
+    }
+    // dword 3: IB size + VMID.
+    if read_dw(3) & 0x000F_FFFF != 0x80 {
+        return TestResult::Fail("dw3 must encode IB size 0x80");
+    }
+    // dword 4: WRITE_DATA header (opcode 0x37).
+    if ((read_dw(4) >> 8) & 0xFF) != 0x37 {
+        return TestResult::Fail("dw4 must be WRITE_DATA header");
+    }
+    // dword 5: WRITE_DATA control word — dst_sel=MEM(5)<<8, wr_confirm bit set.
+    let ctrl = read_dw(5);
+    if (ctrl >> 8) & 0xFF != 5 {
+        return TestResult::Fail("WRITE_DATA ctrl dst_sel must be MEM(5)");
+    }
+    if ctrl & (1 << 20) == 0 {
+        return TestResult::Fail("WRITE_DATA ctrl wr_confirm must be set");
+    }
+    // dword 6: fence target lo.
+    if read_dw(6) != fence_phys as u32 {
+        return TestResult::Fail("dw6 must be fence_phys lo");
+    }
+    // dword 7: fence target hi.
+    if read_dw(7) != (fence_phys >> 32) as u32 {
+        return TestResult::Fail("dw7 must be fence_phys hi");
+    }
+    // dword 8: fence value — seq 1 as u32.
+    if read_dw(8) != 1 {
+        return TestResult::Fail("dw8 must be seq value 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx_context_submit_ib_ring_contents
+);

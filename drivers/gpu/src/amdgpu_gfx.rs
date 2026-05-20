@@ -45,6 +45,12 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{compiler_fence, Ordering};
+
+use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId};
+
+use crate::amdgpu_pm4::{Pm4Builder, Pm4Error};
+use crate::amdgpu_ring::{Ring, RingError};
 
 // ── CP register offsets (GFX9, relative to GC block base) ──────────
 //
@@ -212,4 +218,171 @@ pub fn build_gfx9_ring_init(
     seq.push(gc_base + CP_ME_CNTL_REL, 0);
 
     Ok(seq)
+}
+
+// ── Indirect-buffer submission helper ──────────────────────────────
+//
+// Combines the three primitives (PM4 builder, Ring buffer, fence
+// buffer) into a single "submit this IB and tell me when it's
+// done" API that the rest of the driver uses to push GPU work.
+// The actual end-to-end completion needs the GPU to write back to
+// the fence buffer; on real silicon that fires within microseconds
+// of the IB retiring. In the test harness, fence completion is
+// staged via `set_fence_for_test`.
+
+/// One submission to GFX. Caller passes back into
+/// [`GfxContext::fence_completed`] to poll.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Fence {
+    /// Monotonic sequence number from the issuing context.
+    pub seq: u64,
+}
+
+/// Errors that can happen during IB submission.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    /// Ring rejected the packet pair (out of contiguous tail room).
+    Ring(RingError),
+    /// PM4 packet construction failed (out of staging room).
+    Pm4(Pm4Error),
+}
+
+impl From<RingError> for SubmitError {
+    fn from(e: RingError) -> Self {
+        SubmitError::Ring(e)
+    }
+}
+impl From<Pm4Error> for SubmitError {
+    fn from(e: Pm4Error) -> Self {
+        SubmitError::Pm4(e)
+    }
+}
+
+/// Per-queue GFX submission context. Owns its ring and a
+/// host-coherent fence dword. Caller is responsible for binding
+/// the ring's `phys_addr()` into the CP via
+/// [`build_gfx9_ring_init`] before the first submission lands.
+#[derive(Debug)]
+pub struct GfxContext {
+    ring: Ring,
+    /// Single DMA-coherent dword the GPU writes the most-recent
+    /// retired sequence number into via WRITE_DATA. Host polls it.
+    fence_buf: DmaBuffer,
+    /// Next sequence number to publish.
+    next_seq: u64,
+}
+
+impl GfxContext {
+    /// Allocate a fresh GFX context: ring + fence buffer.
+    pub fn new(queue_idx: u16) -> Result<Self, RingError> {
+        let ring = Ring::new(queue_idx)?;
+        // 8 bytes is enough — single u64 sequence number. Hardware
+        // requires 8-byte alignment for the WRITE_DATA target
+        // anyway, and DMA pages are 4-KiB aligned so this is fine.
+        let fence_buf =
+            alloc_coherent(8, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
+        // Zero the fence buffer so reads-before-completion return 0,
+        // not garbage.
+        // SAFETY: identity-mapped, exclusive owner.
+        unsafe {
+            core::ptr::write_volatile(fence_buf.phys_addr().raw() as *mut u64, 0);
+        }
+        Ok(Self {
+            ring,
+            fence_buf,
+            next_seq: 0,
+        })
+    }
+
+    /// Phys address of the ring's first dword — feed this into
+    /// [`build_gfx9_ring_init`].
+    pub fn ring_phys(&self) -> u64 {
+        self.ring.phys_addr()
+    }
+
+    /// Phys address of the fence-writeback buffer — feed this
+    /// into [`build_gfx9_ring_init`] as `rptr_writeback_phys`. The
+    /// CP uses the same buffer for RPTR writeback in this minimal
+    /// scaffold; production splits them.
+    pub fn fence_phys(&self) -> u64 {
+        self.fence_buf.phys_addr().raw()
+    }
+
+    /// Doorbell offset for the BAR2 doorbell write that kicks the
+    /// CP after [`submit_ib`].
+    pub fn doorbell_offset(&self) -> u64 {
+        self.ring.doorbell_offset()
+    }
+
+    /// Submit a pre-built IB (sitting somewhere in GPU-visible
+    /// memory at `ib_phys`, `ib_size_dw` dwords long) and request
+    /// the CP publish a fence when it retires.
+    ///
+    /// Layout pushed to the ring:
+    ///
+    /// ```text
+    ///   PM4 INDIRECT_BUFFER(ib_phys, ib_size_dw, vmid=0)    — 4 dw
+    ///   PM4 WRITE_DATA(fence_phys, next_seq as u32)         — 5 dw
+    /// ```
+    ///
+    /// Total: 9 dwords per submission.
+    ///
+    /// # Safety
+    /// Caller owns the ring exclusively for this call. Subsequent
+    /// submissions to the same queue must not overlap. The ring
+    /// must have been bound to the CP (`build_gfx9_ring_init`) and
+    /// the CP unhalted; otherwise the doorbell write below has no
+    /// effect (the packets sit in DRAM until bring-up).
+    pub unsafe fn submit_ib(&mut self, ib_phys: u64, ib_size_dw: u32) -> Result<Fence, SubmitError> {
+        self.next_seq += 1;
+        let seq = self.next_seq;
+
+        // Build INDIRECT_BUFFER + WRITE_DATA fence-publish packets
+        // into a staging slice. 9 dwords total.
+        let mut staging = [0u32; 9];
+        {
+            let mut b = Pm4Builder::new(&mut staging);
+            b.indirect_buffer(ib_phys, ib_size_dw, 0)?;
+            b.write_data(self.fence_phys(), seq as u32)?;
+        }
+
+        // SAFETY: caller-promised ring exclusivity.
+        unsafe {
+            self.ring.submit(&staging)?;
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        Ok(Fence { seq })
+    }
+
+    /// Has the CP retired through (or past) `fence`?
+    ///
+    /// Reads the host-coherent fence buffer; comparison is "≥" so
+    /// a later submission's completion implicitly retires earlier
+    /// fences on the same queue (per CP ordering).
+    pub fn fence_completed(&self, fence: &Fence) -> bool {
+        // SAFETY: identity-mapped DMA backing, exclusive owner.
+        let observed: u32 = unsafe {
+            core::ptr::read_volatile(self.fence_buf.phys_addr().raw() as *const u32)
+        };
+        (observed as u64) >= fence.seq
+    }
+
+    /// Most-recently-issued fence (for diagnostics).
+    pub fn last_fence_seq(&self) -> u64 {
+        self.next_seq
+    }
+}
+
+impl GfxContext {
+    /// Test scaffolding: simulate the CP retiring through `seq` by
+    /// writing the fence dword directly. Used by smokes that verify
+    /// the `fence_completed` poll without a real GPU; production
+    /// callers never reach for this (the CP writes the fence dword).
+    pub fn set_fence_for_test(&self, seq: u32) {
+        // SAFETY: identity-mapped DMA backing, exclusive owner.
+        unsafe {
+            core::ptr::write_volatile(self.fence_buf.phys_addr().raw() as *mut u32, seq);
+        }
+    }
 }
