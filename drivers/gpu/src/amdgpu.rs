@@ -74,9 +74,12 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::vec::Vec;
 use narf_driver_runtime::{
     map_bar, BusDevice, BusDeviceCap, Cap, Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
+
+use crate::amdgpu_discovery::{self, IpBlock};
 
 // ── Vendor + device ids ────────────────────────────────────────────
 
@@ -308,6 +311,12 @@ pub struct AmdGpu {
     /// Currently-programmed mode, if `set_mode` has run.
     pub mode: Option<Mode>,
     pub fw_loaded: bool,
+    /// IP blocks enumerated from the on-die discovery table (top
+    /// of VRAM, parsed at probe time). Empty when the silicon
+    /// doesn't publish a discovery blob or the read yielded
+    /// garbage (typical on QEMU / older chips); callers fall
+    /// back to the hardcoded `Family::mp0_base()` table.
+    pub ip_blocks: Vec<IpBlock>,
 }
 
 impl core::fmt::Debug for AmdGpu {
@@ -370,6 +379,18 @@ impl AmdGpu {
         // sequential pair with no side effects beyond the access.
         let vram = unsafe { read_vram_info(&regs) };
 
+        // Try to parse the on-die IP discovery table. Lives in
+        // the top `DISCOVERY_TMR_OFFSET` bytes of the VRAM
+        // aperture; reachable through the BAR0 framebuffer
+        // window. On QEMU the read yields all-ones / garbage and
+        // discovery fails closed with `BadSignature` — log and
+        // continue using the hardcoded `Family::mp0_base()`
+        // table.
+        //
+        // SAFETY: BAR0 mapped, exclusive owner; the discovery
+        // blob is read-only from the host side.
+        let ip_blocks = unsafe { read_ip_discovery(&fb_bar, &vram) };
+
         Ok(Self {
             fb_bar,
             regs,
@@ -377,7 +398,28 @@ impl AmdGpu {
             vram,
             mode: None,
             fw_loaded: false,
+            ip_blocks,
         })
+    }
+
+    /// MP0 (PSP) register-window base for this device. Prefers
+    /// the on-die discovery table (`HW_ID_MP0` instance 0),
+    /// falls back to the static `Family::mp0_base()` table for
+    /// chips that don't publish discovery (Vega, Navi1, QEMU).
+    pub fn mp0_base(&self) -> Option<u32> {
+        if let Some(b) = self.ip_block_base(amdgpu_discovery::HW_ID_MP0, 0) {
+            return Some(b);
+        }
+        self.chip.family.mp0_base()
+    }
+
+    /// Look up the canonical (index-0) MMIO base for an IP block
+    /// enumerated in the discovery table. Returns `None` when
+    /// discovery is empty (older silicon, QEMU) or the requested
+    /// `(hw_id, instance)` isn't present.
+    pub fn ip_block_base(&self, hw_id: u16, instance: u8) -> Option<u32> {
+        amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance)
+            .map(|b| b.base_addrs[0])
     }
 
     pub fn chip_info(&self) -> ChipInfo {
@@ -486,11 +528,10 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        let mp0_base = self
-            .chip
-            .family
-            .mp0_base()
-            .ok_or(AmdgpuError::FirmwareLoadFailed)?;
+        // Prefer the discovery-driven MP0 base (true for every
+        // Navi2+ / Phoenix / Strix chip); fall back to the
+        // hardcoded per-family table for Vega / Navi1.
+        let mp0_base = self.mp0_base().ok_or(AmdgpuError::FirmwareLoadFailed)?;
 
         let cap = narf_firmware::open(self.chip.fw_name, fw_authority).map_err(|e| match e {
             narf_firmware::FirmwareError::NotFound => AmdgpuError::FirmwareMissing,
@@ -651,6 +692,58 @@ unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
         0
     };
     VramInfo { base, size }
+}
+
+/// Read the on-die IP discovery blob from the top of the VRAM
+/// aperture and parse it into a flat `Vec<IpBlock>`. Returns an
+/// empty Vec on any failure (signature mismatch from QEMU
+/// garbage, truncated blob, checksum fail) — discovery is an
+/// optimisation, not a load-bearing path, so we fail soft.
+///
+/// The blob lives at `vram_size - DISCOVERY_TMR_OFFSET` per
+/// `amdgpu_discovery.c` line 332. We slurp `DISCOVERY_TMR_SIZE`
+/// bytes (or whatever fits inside the aperture, whichever is
+/// smaller) into a heap buffer so the parser sees a contiguous
+/// byte slice independent of the MMIO access width.
+///
+/// # Safety
+/// `fb_bar` must map BAR0 of an AMD GPU; the caller must hold
+/// exclusive ownership of the framebuffer aperture for the
+/// duration of the read.
+unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock> {
+    // No aperture → no discovery.
+    if vram.size < amdgpu_discovery::DISCOVERY_TMR_OFFSET {
+        return Vec::new();
+    }
+    let off_in_vram = vram.size - amdgpu_discovery::DISCOVERY_TMR_OFFSET;
+    // Cap the read at whatever the aperture actually exposes
+    // (BAR0 may be smaller than the visible VRAM on systems with
+    // a resizable BAR turned off).
+    let max = amdgpu_discovery::DISCOVERY_TMR_SIZE.min(
+        amdgpu_discovery::DISCOVERY_TMR_OFFSET as usize,
+    );
+    let mut buf = alloc::vec![0u8; max];
+    // Read in 4-byte chunks via the MMIO accessor. The BAR's
+    // size guard is enforced by `MmioRegion::read32` (returns
+    // garbage / panics on out-of-bounds depending on the
+    // runtime); we conservatively walk only `max` bytes here.
+    let mut i = 0;
+    while i + 4 <= max {
+        // SAFETY: caller-asserted ownership of BAR0; the
+        // aperture covers `[0, vram.size)` and we've bounded
+        // `off_in_vram + i` against `vram.size`.
+        let word = unsafe { fb_bar.read32(off_in_vram + i as u64) };
+        let bytes = word.to_le_bytes();
+        buf[i] = bytes[0];
+        buf[i + 1] = bytes[1];
+        buf[i + 2] = bytes[2];
+        buf[i + 3] = bytes[3];
+        i += 4;
+    }
+    match amdgpu_discovery::parse_discovery(&buf) {
+        Ok(blocks) => blocks,
+        Err(_) => Vec::new(),
+    }
 }
 
 // ── Driver-match registration ───────────────────────────────────────

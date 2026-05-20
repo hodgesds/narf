@@ -1348,3 +1348,273 @@ fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_dp_link_training_fallback_walks_ladder);
+
+// ── IP Discovery smokes ────────────────────────────────────────────
+
+/// Build a synthetic IP-discovery blob with one die enumerating
+/// two IPs (GC and MP0). Returns the bytes + the (mp0_base,
+/// gc_base) values the parser should observe.
+fn build_synthetic_discovery_blob() -> (alloc::vec::Vec<u8>, u32, u32) {
+    use crate::amdgpu_discovery as d;
+    let mut blob = alloc::vec![0u8; 0x200];
+
+    // Offsets we'll fill in below.
+    let ip_off: u16 = 0x100;
+    let die_off: u16 = 0x150;
+    let ip0_off: usize = 0x154; // GC: 8 + 1*4 = 12 bytes
+    let ip1_off: usize = 0x160; // MP0: 8 + 2*4 = 16 bytes
+    let blob_end: u16 = 0x170;
+    let ip_table_size: u16 = blob_end - ip_off;
+
+    // --- Outer binary_header ---
+    blob[0..4].copy_from_slice(&d::BINARY_SIGNATURE.to_le_bytes());
+    blob[4..6].copy_from_slice(&1u16.to_le_bytes()); // version_major
+    blob[6..8].copy_from_slice(&0u16.to_le_bytes()); // version_minor
+                                                     // binary_checksum (bytes 8..10) — leave 0, fill in last
+                                                     // binary_size (bytes 10..12)
+    blob[10..12].copy_from_slice(&blob_end.to_le_bytes());
+    // table_list[IP_DISCOVERY] at offset 12 + 0*8 = 12
+    let ip_info = 12 + d::TABLE_IP_DISCOVERY * 8;
+    blob[ip_info..ip_info + 2].copy_from_slice(&ip_off.to_le_bytes());
+    // ip checksum (ip_info+2..ip_info+4): fill in below
+    blob[ip_info + 4..ip_info + 6].copy_from_slice(&ip_table_size.to_le_bytes());
+
+    // --- IP-discovery sub-table header at ip_off ---
+    blob[ip_off as usize..ip_off as usize + 4]
+        .copy_from_slice(&d::DISCOVERY_TABLE_SIGNATURE.to_le_bytes());
+    blob[ip_off as usize + 4..ip_off as usize + 6].copy_from_slice(&4u16.to_le_bytes()); // version
+    blob[ip_off as usize + 6..ip_off as usize + 8].copy_from_slice(&ip_table_size.to_le_bytes());
+    // id (4 bytes 8..12): leave 0
+    blob[ip_off as usize + 12..ip_off as usize + 14].copy_from_slice(&1u16.to_le_bytes()); // num_dies
+                                                                                            // die_info[0]
+    blob[ip_off as usize + 14..ip_off as usize + 16].copy_from_slice(&0u16.to_le_bytes()); // die_id
+    blob[ip_off as usize + 16..ip_off as usize + 18].copy_from_slice(&die_off.to_le_bytes());
+    // die_info[1..16] and union (78..80): leave 0. base_addr_64_bit = 0.
+
+    // --- die_header at die_off ---
+    blob[die_off as usize..die_off as usize + 2].copy_from_slice(&0u16.to_le_bytes()); // die_id
+    blob[die_off as usize + 2..die_off as usize + 4].copy_from_slice(&2u16.to_le_bytes()); // num_ips
+
+    // --- IP 0: GC, instance 0, v11.0.0, base = 0xA000 ---
+    let gc_base: u32 = 0x0000_A000;
+    blob[ip0_off..ip0_off + 2].copy_from_slice(&d::HW_ID_GC.to_le_bytes());
+    blob[ip0_off + 2] = 0; // instance
+    blob[ip0_off + 3] = 1; // num_base_address
+    blob[ip0_off + 4] = 11; // major
+    blob[ip0_off + 5] = 0; // minor
+    blob[ip0_off + 6] = 0; // revision
+    blob[ip0_off + 7] = (2 << 4) | 3; // variant=2, sub_revision=3
+    blob[ip0_off + 8..ip0_off + 12].copy_from_slice(&gc_base.to_le_bytes());
+
+    // --- IP 1: MP0, instance 0, v13.0.4, 2 base addresses ---
+    let mp0_base: u32 = 0x0001_6000;
+    let mp0_base_aux: u32 = 0x0001_7000;
+    blob[ip1_off..ip1_off + 2].copy_from_slice(&d::HW_ID_MP0.to_le_bytes());
+    blob[ip1_off + 2] = 0;
+    blob[ip1_off + 3] = 2;
+    blob[ip1_off + 4] = 13;
+    blob[ip1_off + 5] = 0;
+    blob[ip1_off + 6] = 4;
+    blob[ip1_off + 7] = 0;
+    blob[ip1_off + 8..ip1_off + 12].copy_from_slice(&mp0_base.to_le_bytes());
+    blob[ip1_off + 12..ip1_off + 16].copy_from_slice(&mp0_base_aux.to_le_bytes());
+
+    // --- Checksums (sum-of-bytes, wrapping u16) ---
+    fn sum(s: &[u8]) -> u16 {
+        let mut x: u16 = 0;
+        for &b in s {
+            x = x.wrapping_add(b as u16);
+        }
+        x
+    }
+    // IP-table checksum: bytes [ip_off .. ip_off + ip_table_size).
+    let ip_csum = sum(&blob[ip_off as usize..(ip_off + ip_table_size) as usize]);
+    blob[ip_info + 2..ip_info + 4].copy_from_slice(&ip_csum.to_le_bytes());
+    // Outer checksum: bytes [10 .. blob_end) — i.e. starting at
+    // `binary_size` (just past the checksum field).
+    let outer_csum = sum(&blob[10..blob_end as usize]);
+    blob[8..10].copy_from_slice(&outer_csum.to_le_bytes());
+
+    blob.truncate(blob_end as usize);
+    (blob, mp0_base, gc_base)
+}
+
+fn smoke_amdgpu_discovery_signature_constants() -> TestResult {
+    use crate::amdgpu_discovery::{BINARY_SIGNATURE, DISCOVERY_TABLE_SIGNATURE};
+    // BINARY_SIGNATURE is the LE-encoded byte sequence 07 14 21 28.
+    if BINARY_SIGNATURE != 0x2821_1407 {
+        return TestResult::Fail("BINARY_SIGNATURE constant wrong");
+    }
+    // DISCOVERY_TABLE_SIGNATURE encodes "IPDS" as 49 50 44 53 LE.
+    if DISCOVERY_TABLE_SIGNATURE != 0x5344_5049 {
+        return TestResult::Fail("DISCOVERY_TABLE_SIGNATURE constant wrong");
+    }
+    if DISCOVERY_TABLE_SIGNATURE.to_le_bytes() != *b"IPDS" {
+        return TestResult::Fail("DISCOVERY_TABLE_SIGNATURE != IPDS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_discovery_signature_constants
+);
+
+fn smoke_amdgpu_discovery_hw_id_constants_match_linux() -> TestResult {
+    use crate::amdgpu_discovery as d;
+    // Spot-check the load-bearing HW_IDs against the values
+    // documented in Linux's `soc15_hw_ip.h`.
+    if d::HW_ID_GC != 11 {
+        return TestResult::Fail("HW_ID_GC != 11");
+    }
+    if d::HW_ID_MP0 != 255 {
+        return TestResult::Fail("HW_ID_MP0 != 255");
+    }
+    if d::HW_ID_MP1 != 1 {
+        return TestResult::Fail("HW_ID_MP1 != 1");
+    }
+    if d::HW_ID_SDMA0 != 42 {
+        return TestResult::Fail("HW_ID_SDMA0 != 42");
+    }
+    if d::HW_ID_VCN != 12 {
+        return TestResult::Fail("HW_ID_VCN != 12 (alias of UVD)");
+    }
+    if d::HW_ID_DCN != 271 {
+        return TestResult::Fail("HW_ID_DCN != 271 (DMU)");
+    }
+    if d::HW_ID_OSSSYS != 40 {
+        return TestResult::Fail("HW_ID_OSSSYS != 40");
+    }
+    if d::HW_ID_BIF != 108 {
+        return TestResult::Fail("HW_ID_BIF != 108 (NBIF)");
+    }
+    if d::HW_ID_MMHUB != 34 || d::HW_ID_ATHUB != 35 {
+        return TestResult::Fail("MMHUB/ATHUB constants");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_discovery_hw_id_constants_match_linux
+);
+
+fn smoke_amdgpu_discovery_parse_synthetic_blob() -> TestResult {
+    use crate::amdgpu_discovery::{find_ip, parse_discovery, HW_ID_GC, HW_ID_MP0};
+    let (blob, want_mp0, want_gc) = build_synthetic_discovery_blob();
+    let blocks = match parse_discovery(&blob) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("parse_discovery rejected synthetic blob");
+        }
+    };
+    if blocks.len() != 2 {
+        return TestResult::Fail("expected exactly 2 IP blocks");
+    }
+    let gc = match find_ip(&blocks, HW_ID_GC, 0) {
+        Some(b) => b,
+        None => return TestResult::Fail("HW_ID_GC missing from parse"),
+    };
+    if gc.base_addrs[0] != want_gc {
+        return TestResult::Fail("GC base_addrs[0] mis-decoded");
+    }
+    if gc.major != 11 || gc.minor != 0 || gc.revision != 0 {
+        return TestResult::Fail("GC version triple lost");
+    }
+    if gc.variant != 2 || gc.sub_revision != 3 {
+        return TestResult::Fail("GC variant/sub_revision lost");
+    }
+    if gc.num_bases != 1 {
+        return TestResult::Fail("GC num_bases != 1");
+    }
+    let mp0 = match find_ip(&blocks, HW_ID_MP0, 0) {
+        Some(b) => b,
+        None => return TestResult::Fail("HW_ID_MP0 missing from parse"),
+    };
+    if mp0.base_addrs[0] != want_mp0 {
+        return TestResult::Fail("MP0 base_addrs[0] mis-decoded");
+    }
+    if mp0.num_bases != 2 {
+        return TestResult::Fail("MP0 num_bases != 2");
+    }
+    if mp0.major != 13 || mp0.minor != 0 || mp0.revision != 4 {
+        return TestResult::Fail("MP0 version triple lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_discovery_parse_synthetic_blob
+);
+
+fn smoke_amdgpu_discovery_rejects_bad_signature() -> TestResult {
+    use crate::amdgpu_discovery::{parse_discovery, DiscoveryError};
+    // Garbage blob (all 0xFF, mimicking a QEMU read from
+    // unallocated VRAM aperture).
+    let blob = alloc::vec![0xFFu8; 0x200];
+    match parse_discovery(&blob) {
+        Err(DiscoveryError::BadSignature) => {}
+        Ok(_) => return TestResult::Fail("garbage blob accepted"),
+        Err(_) => return TestResult::Fail("expected BadSignature on 0xFF blob"),
+    }
+    // All zero (the typical QEMU shape).
+    let zeros = alloc::vec![0u8; 0x200];
+    match parse_discovery(&zeros) {
+        Err(DiscoveryError::BadSignature) => {}
+        Ok(_) => return TestResult::Fail("zero blob accepted"),
+        Err(_) => return TestResult::Fail("expected BadSignature on zero blob"),
+    }
+    // Truncated.
+    let tiny = alloc::vec![0u8; 10];
+    if !matches!(parse_discovery(&tiny), Err(DiscoveryError::Truncated)) {
+        return TestResult::Fail("expected Truncated on 10-byte blob");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_discovery_rejects_bad_signature
+);
+
+fn smoke_amdgpu_discovery_rejects_bad_outer_checksum() -> TestResult {
+    use crate::amdgpu_discovery::{parse_discovery, DiscoveryError};
+    let (mut blob, _, _) = build_synthetic_discovery_blob();
+    // Flip one byte in the IP-table region — invalidates BOTH the
+    // outer checksum (computed over [10..binary_size)) and the
+    // IP-table checksum. The outer fires first.
+    blob[0x158] ^= 0xFF;
+    match parse_discovery(&blob) {
+        Err(DiscoveryError::BadOuterChecksum) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("expected BadOuterChecksum")
+        }
+        Ok(_) => TestResult::Fail("corrupted blob accepted"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_discovery_rejects_bad_outer_checksum
+);
+
+fn smoke_amdgpu_discovery_probe_skipped_on_qemu() -> TestResult {
+    // Live-device probe smoke: on QEMU the AMD GPU isn't present
+    // so the controller is absent and discovery is necessarily
+    // empty. Skip rather than fail; on real hardware this would
+    // assert ip_blocks.len() > 0 and find HW_ID_MP0.
+    use crate::amdgpu;
+    if !amdgpu::is_probed() {
+        return TestResult::Skip("amdgpu not probed in this QEMU config");
+    }
+    amdgpu::with_controller(|d| {
+        if d.ip_blocks.is_empty() {
+            TestResult::Skip("amdgpu probed but discovery yielded no IPs (QEMU FB)")
+        } else {
+            TestResult::Pass
+        }
+    })
+    .unwrap_or(TestResult::Skip("controller vanished"))
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_discovery_probe_skipped_on_qemu
+);
