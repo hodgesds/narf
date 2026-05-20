@@ -1618,3 +1618,148 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_probe_skipped_on_qemu
 );
+
+// ── amdgpu/atom-vm ─────────────────────────────────────────────────
+//
+// Stage-9 ATOMBIOS bytecode interpreter smokes. Builds tiny
+// synthetic tables (a few MOVE / ADD / COMPARE / JUMP / EOT bytes)
+// and steps them through `amdgpu_atom_vm::execute_bytes`, validating
+// that PS / WS slots end up where Linux's `atom.c` would put them.
+
+fn smoke_amdgpu_atom_vm_move_imm_dword_into_ps() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
+
+    // op 2 = MOVE(PS), attr 0x05 (arg=IMM, align=DWORD), dst idx 0,
+    // imm dword 0x12345678 (LE: 0x78 0x56 0x34 0x12), EOT (91).
+    let code: &[u8] = &[2, 0x05, 0x00, 0x78, 0x56, 0x34, 0x12, 91];
+    let mut state = AtomState::new(8, 4);
+    let mut ps = [0u32; 1];
+    if execute_bytes(&mut state, code, &mut ps, 0).is_err() {
+        return TestResult::Fail("execute_bytes MOVE/EOT errored");
+    }
+    if ps[0] != 0x1234_5678 {
+        return TestResult::Fail("MOVE PS[0] <- IMM did not land");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_move_imm_dword_into_ps
+);
+
+fn smoke_amdgpu_atom_vm_add_into_ws() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
+
+    // MOVE(WS=op3) WS[2] <- IMM 0xAA; ADD(WS=op45) WS[2] += 0x11; EOT.
+    let code: &[u8] = &[
+        3, 0x05, 2, 0xAA, 0, 0, 0, // MOVE WS[2] <- 0xAA
+        45, 0x05, 2, 0x11, 0, 0, 0, // ADD WS[2] += 0x11
+        91, // EOT
+    ];
+    let mut state = AtomState::new(8, 4);
+    let mut ps: [u32; 1] = [0];
+    if execute_bytes(&mut state, code, &mut ps, 0).is_err() {
+        return TestResult::Fail("MOVE/ADD sequence errored");
+    }
+    if state.scratch[2] != 0xBB {
+        return TestResult::Fail("WS[2] != 0xBB after ADD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_add_into_ws
+);
+
+fn smoke_amdgpu_atom_vm_compare_jump_equal_taken() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
+
+    // Layout (matches inline_tests::compare_and_jump_equal_taken):
+    //   0: MOVE PS[0] <- IMM 0x42        (7 bytes)
+    //   7: COMPARE PS[0] vs IMM 0x42     (7 bytes)
+    //  14: JUMP_EQUAL target=25 (=local 19 + 6 header)
+    //  17,18: trap bytes
+    //  19: EOT
+    let code: &[u8] = &[
+        2, 0x05, 0, 0x42, 0, 0, 0, // MOVE PS[0] <- 0x42
+        61, 0x05, 0, 0x42, 0, 0, 0, // COMPARE PS[0] vs IMM 0x42
+        68, 25, 0, // JUMP_EQUAL → local 19
+        0x77, 0x77, // unreachable trap
+        91, // EOT
+    ];
+    let mut state = AtomState::new(8, 4);
+    let mut ps: [u32; 1] = [0];
+    if execute_bytes(&mut state, code, &mut ps, 0).is_err() {
+        return TestResult::Fail("compare/jump sequence errored");
+    }
+    if !state.cs_equal {
+        return TestResult::Fail("cs_equal not set after COMPARE eq");
+    }
+    if ps[0] != 0x42 {
+        return TestResult::Fail("PS[0] mutated unexpectedly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_compare_jump_equal_taken
+);
+
+fn smoke_amdgpu_atom_vm_bad_opcode_rejected() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_bytes, AtomError, AtomState};
+    let code: &[u8] = &[127, 91]; // 127 == ATOM_OP_CNT (out of range)
+    let mut state = AtomState::new(4, 4);
+    let mut ps: [u32; 0] = [];
+    match execute_bytes(&mut state, code, &mut ps, 0) {
+        Err(AtomError::BadOpcode(127)) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong AtomError variant"),
+        Ok(()) => TestResult::Fail("bad opcode silently accepted"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_bad_opcode_rejected
+);
+
+fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use alloc::sync::Arc;
+    use core::cell::RefCell;
+
+    // MOVE(REG=op1) REG[0x1234] <- IMM 0xDEADBEEF.
+    // attr 0x05 (arg=IMM, align=DWORD, dst_shift=0).
+    // The REG operand is a u16 register index after the imm.
+    //
+    // Per atom.c::atom_op_move, layout is:
+    //   op (u8), attr (u8), dst-operand (REG=u16), src-operand (IMM=u32)
+    let code: &[u8] = &[
+        1, 0x05, 0x34, 0x12, // MOVE REG[0x1234] ...
+        0xEF, 0xBE, 0xAD, 0xDE, // ... <- 0xDEADBEEF
+        91, // EOT
+    ];
+
+    let writes: Arc<RefCell<Vec<(u32, u32)>>> = Arc::new(RefCell::new(Vec::new()));
+    let mut state = AtomState::new(8, 4);
+    let w = writes.clone();
+    state.reg_write = Box::new(move |a, v| {
+        w.borrow_mut().push((a, v));
+    });
+    let mut ps: [u32; 0] = [];
+    if execute_bytes(&mut state, code, &mut ps, 0).is_err() {
+        return TestResult::Fail("REG MOVE errored");
+    }
+    let log = writes.borrow();
+    if log.len() != 1 {
+        return TestResult::Fail("reg_write closure not invoked exactly once");
+    }
+    if log[0] != (0x1234, 0xDEAD_BEEF) {
+        return TestResult::Fail("reg_write got wrong (addr,val)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_reg_write_via_closure
+);

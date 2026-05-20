@@ -246,4 +246,21 @@ impl<'a> Atombios<'a> {
         }
         Ok(&self.image[off..off + len])
     }
+
+    /// Strip the `ATOM_COMMON_TABLE_HEADER` (4 bytes) + the
+    /// per-table prelude (ws/ps bytes at `ATOM_CT_WS_PTR`,
+    /// `ATOM_CT_PS_PTR` = offsets 4, 5) and return the raw
+    /// bytecode body starting at `ATOM_CT_CODE_PTR` (= +6).
+    ///
+    /// This is what `amdgpu_atom_vm::execute_bytes` consumes.
+    /// Convenience helper so callers don't open-code the header
+    /// skip per Linux `atom.c::amdgpu_atom_execute_table_locked`
+    /// (lines 1232-1235).
+    pub fn cmd_table_body<'b>(&'b self, table_id: u16) -> Result<&'a [u8], AtomError> {
+        let full = self.cmd_table(table_id)?;
+        if full.len() < 6 {
+            return Err(AtomError::BadTablePointer);
+        }
+        Ok(&full[6..])
+    }
 }
