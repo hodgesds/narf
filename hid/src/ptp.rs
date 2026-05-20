@@ -420,3 +420,112 @@ fn first_usage_on_page(f: &Field, page: u16) -> Option<u16> {
     }
     None
 }
+
+/// Test-only: a spec-shaped synthetic PTP Report Descriptor blob
+/// (2 fingers + Contact Count + Scan Time + Button 1 + a
+/// Configuration TLC with Device Mode Feature). Used by sibling
+/// crates' smoke tests to exercise the PTP detect / decode /
+/// mode-set chain end-to-end without re-pasting the blob.
+#[doc(hidden)]
+pub fn __ptp_descriptor_blob() -> &'static [u8] {
+    PTP_DESCRIPTOR_BLOB
+}
+
+/// The blob; kept in a `static` rather than a module-level `const`
+/// so the `__ptp_descriptor_blob` helper can return a `&'static`
+/// slice. Same bytes as the in-crate test fixture.
+static PTP_DESCRIPTOR_BLOB: &[u8] = &[
+    // ── Touch Pad Application Collection (Input report ID 1) ────
+    0x05, 0x0D,             // Usage Page (Digitizer)
+    0x09, 0x05,             // Usage (Touch Pad)
+    0xA1, 0x01,             //   Collection (Application)
+    0x85, 0x01,             //     Report ID (1)
+    // Finger 0
+    0x09, 0x22,             //     Usage (Finger)
+    0xA1, 0x02,             //     Collection (Logical)
+    0x09, 0x42,             //       Usage (Tip Switch)
+    0x15, 0x00,             //       Logical Min (0)
+    0x25, 0x01,             //       Logical Max (1)
+    0x75, 0x01,             //       Report Size (1)
+    0x95, 0x01,             //       Report Count (1)
+    0x81, 0x02,             //       Input (Data,Var,Abs)
+    0x09, 0x51,             //       Usage (Contact ID)
+    0x25, 0x07,             //       Logical Max (7)
+    0x75, 0x03,             //       Report Size (3)
+    0x81, 0x02,             //       Input
+    0x75, 0x04,             //       Report Size (4) — padding
+    0x95, 0x01,             //       Report Count (1)
+    0x81, 0x03,             //       Input (Cnst,Var,Abs)
+    0x05, 0x01,             //       Usage Page (Generic Desktop)
+    0x09, 0x30,             //       Usage (X)
+    0x26, 0xFF, 0x7F,       //       Logical Max (0x7FFF)
+    0x75, 0x10,             //       Report Size (16)
+    0x95, 0x01,             //       Report Count (1)
+    0x81, 0x02,             //       Input
+    0x09, 0x31,             //       Usage (Y)
+    0x81, 0x02,             //       Input
+    0xC0,                   //     End Collection
+    // Finger 1 — same shape
+    0x05, 0x0D,             //     Usage Page (Digitizer)
+    0x09, 0x22,             //     Usage (Finger)
+    0xA1, 0x02,             //     Collection (Logical)
+    0x09, 0x42,             //       Usage (Tip Switch)
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x51,
+    0x25, 0x07,
+    0x75, 0x03,
+    0x81, 0x02,
+    0x75, 0x04,
+    0x95, 0x01,
+    0x81, 0x03,
+    0x05, 0x01,
+    0x09, 0x30,
+    0x26, 0xFF, 0x7F,
+    0x75, 0x10,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x31,
+    0x81, 0x02,
+    0xC0,                   //     End Collection
+    // Contact Count + Scan Time + Button 1
+    0x05, 0x0D,
+    0x09, 0x54,             //     Usage (Contact Count)
+    0x25, 0x02,             //     Logical Max (2)
+    0x75, 0x08,             //     Report Size (8)
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x56,             //     Usage (Scan Time)
+    0x27, 0xFF, 0xFF, 0x00, 0x00, // Logical Max (0xFFFF)
+    0x75, 0x10,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x05, 0x09,             //     Usage Page (Button)
+    0x09, 0x01,             //     Usage (Button 1)
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x75, 0x07,             //     padding
+    0x81, 0x03,
+    0xC0,                   //   End Collection
+    // Configuration TLC (Feature report ID 3) — Device Mode
+    0x05, 0x0D,
+    0x09, 0x0E,             // Usage (Configuration)
+    0xA1, 0x01,             // Collection (Application)
+    0x85, 0x03,             //   Report ID (3)
+    0x09, 0x22,             //   Usage (Finger)
+    0xA1, 0x02,             //   Collection (Logical)
+    0x09, 0x60,             //     Usage (Device Mode)
+    0x15, 0x00,
+    0x25, 0x0A,             //     Logical Max (10)
+    0x75, 0x08,
+    0x95, 0x01,
+    0xB1, 0x02,             //     Feature
+    0xC0,                   //   End Collection
+    0xC0,                   // End Collection
+];

@@ -792,7 +792,7 @@ mod i2c_hid_smokes {
     use crate::i2c_hid::{HidDescriptor, I2cHidDriver, I2cHidError, HID_DESC_LENGTH};
 
     #[derive(Debug)]
-    struct MockBus {
+    pub(super) struct MockBus {
         /// Pre-staged bytes the bus returns in order, one Vec per
         /// I2cOp::Read in the order they're encountered.
         canned_reads: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
@@ -801,16 +801,16 @@ mod i2c_hid_smokes {
     }
 
     impl MockBus {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 canned_reads: IrqSafeSpinLock::new(VecDeque::new()),
                 captured_writes: IrqSafeSpinLock::new(Vec::new()),
             }
         }
-        fn stage_read(&self, data: Vec<u8>) {
+        pub(super) fn stage_read(&self, data: Vec<u8>) {
             self.canned_reads.lock().push_back(data);
         }
-        fn writes(&self) -> Vec<Vec<u8>> {
+        pub(super) fn writes(&self) -> Vec<Vec<u8>> {
             self.captured_writes.lock().clone()
         }
     }
@@ -844,7 +844,7 @@ mod i2c_hid_smokes {
         }
     }
 
-    fn make_descriptor_bytes() -> Vec<u8> {
+    pub(super) fn make_descriptor_bytes() -> Vec<u8> {
         let mut buf = alloc::vec![0u8; HID_DESC_LENGTH];
         let put16 = |buf: &mut [u8], off: usize, v: u16| {
             buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -924,7 +924,7 @@ mod i2c_hid_smokes {
         smoke_i2c_hid_descriptor_rejects_wrong_major_version
     );
 
-    fn run_async<F>(fut: F) -> TestResult
+    pub(super) fn run_async<F>(fut: F) -> TestResult
     where
         F: core::future::Future<Output = TestResult> + Send + 'static,
     {
@@ -1277,5 +1277,104 @@ mod i2c_hid_bind_smokes {
     kernel_test_in!(
         "drivers/input/i2c-hid",
         smoke_ptp_pointer_no_active_contact_resets_origin
+    );
+
+    // End-to-end test of the SET_FEATURE(Device Mode = MULTI_TOUCH)
+    // wiring added to the bind layer. Parses a real PTP report
+    // descriptor, builds a PtpProfile from it, hands it to
+    // `set_ptp_multi_touch_mode` against a MockBus, and checks
+    // both the return value and the captured wire bytes.
+    fn smoke_set_ptp_multi_touch_mode_writes_set_feature() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_drivers_i2c::I2cBus;
+
+        use crate::i2c_hid::{HidDescriptor, I2cHidDriver};
+        use crate::i2c_hid_bind::{set_ptp_multi_touch_mode, PtpModeSetResult};
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
+
+        // Parse the shared PTP descriptor blob → ReportDescriptor →
+        // PtpProfile. The blob is the synthetic 2-finger fixture
+        // narf-hid uses for its own smokes.
+        let blob = narf_hid::ptp::__ptp_descriptor_blob();
+        let parsed = match narf_hid::parse(blob) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("parse(PTP_DESCRIPTOR) failed"),
+        };
+        let profile = match narf_hid::ptp::detect(&parsed) {
+            Some(p) => p,
+            None => return TestResult::Fail("PTP detect rejected the descriptor"),
+        };
+
+        // Bring up an I2cHidDriver wrapped around a MockBus. We
+        // pre-stage the descriptor read so `read_descriptor` finds
+        // the operating registers it needs.
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("descriptor read failed");
+            }
+            let result = set_ptp_multi_touch_mode(&drv, &profile).await;
+            if result != PtpModeSetResult::Set {
+                return TestResult::Fail("set_ptp_multi_touch_mode returned non-Set");
+            }
+            // Captured writes: [0] = descriptor read, [1] = the
+            // SET_FEATURE we just issued. The SET_FEATURE wire form
+            // (per Microsoft HID-over-I2C spec §7.2.3.1) is:
+            //   [cmd_addr_lo, cmd_addr_hi,
+            //    (report_type<<4) | report_id,
+            //    SET_REPORT opcode,
+            //    data_addr_lo, data_addr_hi,
+            //    total_len_lo, total_len_hi,
+            //    report_id,
+            //    body...]
+            let writes = bus_for_check.writes();
+            if writes.len() < 2 {
+                return TestResult::Fail("expected at least 2 bus writes");
+            }
+            let w = &writes[1];
+            // From make_descriptor_bytes:
+            //   wCommandRegister = 0x0005, wDataRegister = 0x0006.
+            // From the synthetic PTP descriptor:
+            //   Device Mode feature report id = 0x03.
+            if w.len() < 10 {
+                return TestResult::Fail("SET_FEATURE wire write too short");
+            }
+            if w[0] != 0x05 || w[1] != 0x00 {
+                return TestResult::Fail("cmd_register low/high bytes wrong");
+            }
+            // report_type (FEATURE=0x03) in high nibble, report_id
+            // (0x03) in low nibble → 0x33.
+            if w[2] != 0x33 {
+                return TestResult::Fail("report type+id byte wrong");
+            }
+            // SET_REPORT opcode = 0x03.
+            if w[3] != 0x03 {
+                return TestResult::Fail("SET_REPORT opcode byte wrong");
+            }
+            if w[4] != 0x06 || w[5] != 0x00 {
+                return TestResult::Fail("data_register low/high bytes wrong");
+            }
+            // Total length: 2 (prefix) + 1 (report_id) + 1 (mode body) = 4.
+            if w[6] != 0x04 || w[7] != 0x00 {
+                return TestResult::Fail("total length field wrong");
+            }
+            // The echoed report id.
+            if w[8] != 0x03 {
+                return TestResult::Fail("echoed report id wrong");
+            }
+            // The mode byte — MULTI_TOUCH = 0x03.
+            if w[9] != narf_hid::ptp::mode::MULTI_TOUCH {
+                return TestResult::Fail("mode byte != MULTI_TOUCH");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_set_ptp_multi_touch_mode_writes_set_feature
     );
 }

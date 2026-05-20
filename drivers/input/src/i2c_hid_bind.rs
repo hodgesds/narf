@@ -38,11 +38,16 @@
 //!   no GPIO IRQ is wired, yield + retry — read one input report,
 //!   decode, push.
 //!
-//! Sources (public, non-GPL only):
+//! Sources:
 //! - Microsoft "HID over I2C Protocol Specification" v1.0 — _DSM
-//!   UUID + descriptor register convention.
+//!   UUID + descriptor register convention + SET_FEATURE shape.
+//! - Microsoft "Windows Precision Touchpad Required HID Top-Level
+//!   Collections" — Device Mode Feature report wire format.
 //! - ACPI 6.5 §6.4.3.8 — `_CRS` `I2cSerialBus` and `GpioInt`
 //!   resource template encoding.
+//! - Linux `drivers/hid/hid-multitouch.c::mt_set_input_mode` —
+//!   reference for SET_FEATURE(Device Mode = MULTI_TOUCH) at
+//!   driver-probe time. Read post-relicense (GPL-2.0-or-later).
 
 extern crate alloc;
 
@@ -288,6 +293,10 @@ async fn pump_task(
         ptp.is_some(),
     );
 
+    if let Some(profile) = &ptp {
+        log_ptp_mode_set_result(&path, set_ptp_multi_touch_mode(&driver, profile).await);
+    }
+
     let max_input = driver
         .descriptor()
         .map(|d| d.w_max_input_length as usize)
@@ -448,6 +457,81 @@ fn resolve_hid_desc_register(path: &str) -> Option<u16> {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     PIN_WAKES.lock().clear();
+}
+
+/// Outcome of the PTP multi-touch mode-set request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PtpModeSetResult {
+    /// SET_FEATURE was issued and the bus accepted it. The touchpad
+    /// should now be emitting full multi-touch contact reports.
+    Set,
+    /// The PTP profile didn't expose a Device Mode feature item, so
+    /// no SET_FEATURE was issued. The device runs in whatever mode
+    /// its firmware default picks — usually legacy mouse-emulation.
+    NoDeviceMode,
+    /// SET_FEATURE write hit a bus error. The device probably stays
+    /// in mouse-emulation mode; caller may retry.
+    BusFailed(I2cHidError),
+}
+
+/// Send the Microsoft Precision Touchpad SET_FEATURE(Device Mode =
+/// MULTI_TOUCH) request that switches a PTP-capable touchpad out
+/// of legacy mouse-emulation mode and into multi-touch reporting.
+///
+/// Without this the touchpad emits a 3-byte boot-style mouse report
+/// instead of the full per-contact array — two-finger gestures /
+/// multi-touch are lost. Linux's equivalent is
+/// `drivers/hid/hid-multitouch.c::mt_set_input_mode`. Microsoft's
+/// "Windows Precision Touchpad Required HID Top-Level Collections"
+/// §3.1.6 "Device Mode Feature Report" specifies the wire format.
+///
+/// Returns `PtpModeSetResult::NoDeviceMode` when the descriptor
+/// lacks a Device Mode feature (Windows treats those as non-PTP),
+/// `Set` on success, or `BusFailed` if the SET_FEATURE write
+/// errored on the bus.
+pub async fn set_ptp_multi_touch_mode(
+    driver: &I2cHidDriver,
+    profile: &narf_hid::ptp::PtpProfile,
+) -> PtpModeSetResult {
+    let Some(buf) =
+        narf_hid::ptp::build_mode_feature_report(profile, narf_hid::ptp::mode::MULTI_TOUCH)
+    else {
+        return PtpModeSetResult::NoDeviceMode;
+    };
+    // Wire buffer is [report_id, body...]; SET_REPORT takes them as
+    // separate args.
+    let report_id = buf[0];
+    let body = &buf[1..];
+    match driver.set_feature_report(report_id, body).await {
+        Ok(()) => PtpModeSetResult::Set,
+        Err(e) => PtpModeSetResult::BusFailed(e),
+    }
+}
+
+fn log_ptp_mode_set_result(path: &str, r: PtpModeSetResult) {
+    match r {
+        PtpModeSetResult::Set => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: PTP multi-touch mode set",
+                path
+            );
+        }
+        PtpModeSetResult::NoDeviceMode => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: PTP profile lacks Device Mode feature; staying in default mode",
+                path
+            );
+        }
+        PtpModeSetResult::BusFailed(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: PTP mode-set failed ({:?}); device may stay in mouse-emulation mode",
+                path, e
+            );
+        }
+    }
 }
 
 #[doc(hidden)]
