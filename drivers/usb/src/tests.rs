@@ -1451,3 +1451,81 @@ fn smoke_xhci_sibling_port_zero_when_no_sibling() -> TestResult {
     }
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_sibling_port_zero_when_no_sibling);
+
+// ── drivers/usb/class-detection ────────────────────────────────────
+//
+// Build a minimal config descriptor with a single interface
+// descriptor carrying the target class triple, then verify each
+// class's finder picks it up. Doesn't run the full bind path
+// (that needs an Xhci instance) — just the descriptor walker.
+
+/// Build a 9-byte config header + a 9-byte interface descriptor
+/// with the given class triple.
+fn build_cfg_with_class(class: u8, subclass: u8, protocol: u8, iface_num: u8) -> alloc::vec::Vec<u8> {
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // CONFIG descriptor: 9 bytes.
+    v.extend_from_slice(&[
+        9, 0x02, // bLength, bDescriptorType=CONFIG
+        18, 0,   // wTotalLength = 18 (9 cfg + 9 iface)
+        1,       // bNumInterfaces
+        1,       // bConfigurationValue
+        0, 0xC0, 50,
+    ]);
+    // INTERFACE descriptor: 9 bytes.
+    v.extend_from_slice(&[
+        9, 0x04, // bLength, bDescriptorType=INTERFACE
+        iface_num,
+        0,       // bAlternateSetting
+        0,       // bNumEndpoints
+        class, subclass, protocol,
+        0,       // iInterface
+    ]);
+    v
+}
+
+fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
+    use crate::uac::{find_audio_control_interface, USB_AUDIO_SUBCLASS_AUDIOCONTROL, USB_CLASS_AUDIO};
+    // Audio / AudioControl on interface number 7.
+    let cfg = build_cfg_with_class(USB_CLASS_AUDIO, USB_AUDIO_SUBCLASS_AUDIOCONTROL, 0, 7);
+    if find_audio_control_interface(&cfg) != Some(7) {
+        return TestResult::Fail("AC interface not found at expected iface_num");
+    }
+    // Non-audio device → None.
+    let cfg2 = build_cfg_with_class(0x08, 0x06, 0x50, 0); // MSC
+    if find_audio_control_interface(&cfg2).is_some() {
+        return TestResult::Fail("MSC config must NOT match AC finder");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_finder_picks_audiocontrol_interface);
+
+fn smoke_usb_uvc_finder_picks_videocontrol_interface() -> TestResult {
+    use crate::uvc::{find_video_control_interface, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL};
+    let cfg = build_cfg_with_class(USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL, 0, 3);
+    if find_video_control_interface(&cfg) != Some(3) {
+        return TestResult::Fail("VC interface not found at expected iface_num");
+    }
+    // Audio config should NOT match.
+    let cfg2 = build_cfg_with_class(0x01, 0x01, 0, 0);
+    if find_video_control_interface(&cfg2).is_some() {
+        return TestResult::Fail("audio config must NOT match VC finder");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_finder_picks_videocontrol_interface);
+
+fn smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface() -> TestResult {
+    use crate::cdc::{CDC_SUBCLASS_NCM, USB_CLASS_CDC_COMM};
+    use crate::cdc_ncm::find_ncm_comm_interface;
+    let cfg = build_cfg_with_class(USB_CLASS_CDC_COMM, CDC_SUBCLASS_NCM, 0, 11);
+    if find_ncm_comm_interface(&cfg) != Some(11) {
+        return TestResult::Fail("NCM Comm interface not found");
+    }
+    // CDC-ACM (subclass 0x02) on CDC-Comm class must NOT match NCM finder.
+    let cfg2 = build_cfg_with_class(USB_CLASS_CDC_COMM, 0x02, 0x01, 0);
+    if find_ncm_comm_interface(&cfg2).is_some() {
+        return TestResult::Fail("CDC-ACM config must NOT match NCM finder");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/cdc_ncm", smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface);

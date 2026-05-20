@@ -107,6 +107,11 @@ pub enum UvcError {
     Truncated,
     NotClassSpecific,
     BadSubtype(u8),
+    /// Device's interface descriptors didn't include a Video Class
+    /// VideoControl interface — not a UVC device.
+    NotVideo,
+    /// SET_CONFIGURATION control transfer failed during bind.
+    SetConfigFailed,
 }
 
 fn check_cs(buf: &[u8], expect: u8) -> Result<(), UvcError> {
@@ -511,4 +516,83 @@ impl FormatMjpeg {
             copy_protect: buf[10] != 0,
         })
     }
+}
+
+// ── Class enumeration + bind ───────────────────────────────────────
+//
+// Minimal "is this a UVC device, and if so claim it" path. The
+// full streaming surface (iso video frame ring + MJPEG /
+// uncompressed payload decode) is a follow-up.
+
+extern crate alloc;
+
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// One bound UVC device — slot id + VideoControl interface number.
+#[derive(Copy, Clone, Debug)]
+pub struct UvcDevice {
+    pub slot_id: u8,
+    /// `bInterfaceNumber` of the VideoControl interface.
+    pub vc_iface: u8,
+}
+
+/// System-wide registry of bound UVC devices.
+pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Find the first VideoControl interface in `cfg`.
+pub fn find_video_control_interface(cfg: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        if cfg[i + 1] == 0x04 && len >= 9 {
+            let cls = cfg[i + 5];
+            let sub = cfg[i + 6];
+            if cls == USB_CLASS_VIDEO && sub == USB_VIDEO_SUBCLASS_VIDEOCONTROL {
+                return Some(cfg[i + 2]);
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+/// Bind to an already-addressed UVC device. SET_CONFIGURATION,
+/// then record the slot/interface pair.
+pub fn try_bind_video_already_addressed(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, UvcError> {
+    let vc_iface = find_video_control_interface(cfg).ok_or(UvcError::NotVideo)?;
+    let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
+    let mut nothing = [0u8; 0];
+    if xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .is_err()
+    {
+        return Err(UvcError::SetConfigFailed);
+    }
+    let mut g = UVC_DEVICES.lock();
+    let idx = g.len();
+    g.push(UvcDevice { slot_id, vc_iface });
+    Ok(idx)
+}
+
+pub fn attached_uvc_count() -> usize {
+    UVC_DEVICES.lock().len()
+}
+
+#[doc(hidden)]
+pub fn __reset_uvc_for_test() {
+    UVC_DEVICES.lock().clear();
 }

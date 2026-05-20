@@ -65,6 +65,18 @@ pub enum AttachOutcome {
     /// block-layer registration / partition scan runs from the
     /// caller's hot path.
     MassStorage,
+    /// Device bound as a USB Audio Class device (headset / mic /
+    /// USB-DAC). Slot stays alive; entry in `uac::UAC_DEVICES`.
+    /// Iso streaming path is a follow-up.
+    AudioClass,
+    /// Device bound as a USB Video Class device (webcam). Slot
+    /// stays alive; entry in `uvc::UVC_DEVICES`. Iso frame ring is
+    /// a follow-up.
+    VideoClass,
+    /// Device bound as a CDC-NCM ethernet adapter (USB-Ethernet
+    /// dongle, tethered phone). Slot stays alive; entry in
+    /// `cdc_ncm::CDC_NCM_DEVICES`. NTB TX/RX rings are a follow-up.
+    NetworkClass,
     /// Device bound as a USB hub. Slot stays alive; entry was added
     /// to [`HUBS`] for downstream walking.
     Hub,
@@ -345,6 +357,24 @@ fn dispatch_after_address(
             xhci_dev, slot_id, &cfg_blob,
         ) {
             return AttachOutcome::MassStorage;
+        }
+        // USB Audio Class — class 0x01, subclass 0x01 (AC).
+        if let Ok(_idx) = crate::uac::try_bind_audio_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ) {
+            return AttachOutcome::AudioClass;
+        }
+        // USB Video Class — class 0x0E, subclass 0x01 (VC).
+        if let Ok(_idx) = crate::uvc::try_bind_video_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ) {
+            return AttachOutcome::VideoClass;
+        }
+        // CDC-NCM ethernet — class 0x02 (Comm), subclass 0x0D.
+        if let Ok(_idx) = crate::cdc_ncm::try_bind_ncm_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ) {
+            return AttachOutcome::NetworkClass;
         }
     }
     // try_bind_kbd_already_addressed disables the slot on failure,

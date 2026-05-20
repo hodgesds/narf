@@ -338,6 +338,11 @@ pub enum NcmError {
     /// Caller asked to encode an NTB longer than 65535 bytes
     /// (the wBlockLength field width).
     NtbTooLarge,
+    /// Device's interface descriptors didn't include a CDC-Comm /
+    /// NCM (subclass 0x0D) interface — not an NCM device.
+    NotNcm,
+    /// SET_CONFIGURATION control transfer failed during bind.
+    SetConfigFailed,
 }
 
 // ── NTB encoder ──────────────────────────────────────────────────
@@ -597,4 +602,82 @@ pub mod tests {
         "drivers/usb/cdc_ncm",
         smoke_ndp16_signature_selects_crc_mode
     );
+}
+
+// ── Class enumeration + bind ───────────────────────────────────────
+//
+// Minimal "is this an NCM device, and if so claim it" path. The
+// full TX/RX surface (NCM Set-Net-Address class request + per-
+// endpoint NTB pipelines) is a follow-up.
+
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// One bound CDC-NCM device — slot id + Comm interface number.
+#[derive(Copy, Clone, Debug)]
+pub struct CdcNcmDevice {
+    pub slot_id: u8,
+    /// `bInterfaceNumber` of the CDC-Comm/NCM interface.
+    pub comm_iface: u8,
+}
+
+/// System-wide registry of bound CDC-NCM devices.
+pub static CDC_NCM_DEVICES: IrqSafeSpinLock<Vec<CdcNcmDevice>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Find the first CDC-Comm interface with subclass NCM in `cfg`.
+pub fn find_ncm_comm_interface(cfg: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        if cfg[i + 1] == 0x04 && len >= 9 {
+            let cls = cfg[i + 5];
+            let sub = cfg[i + 6];
+            if cls == crate::cdc::USB_CLASS_CDC_COMM && sub == crate::cdc::CDC_SUBCLASS_NCM {
+                return Some(cfg[i + 2]);
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+/// Bind to an already-addressed CDC-NCM device. SET_CONFIGURATION,
+/// then record the slot/interface pair.
+pub fn try_bind_ncm_already_addressed(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, NcmError> {
+    let comm_iface = find_ncm_comm_interface(cfg).ok_or(NcmError::NotNcm)?;
+    let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
+    let mut nothing = [0u8; 0];
+    if xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .is_err()
+    {
+        return Err(NcmError::SetConfigFailed);
+    }
+    let mut g = CDC_NCM_DEVICES.lock();
+    let idx = g.len();
+    g.push(CdcNcmDevice { slot_id, comm_iface });
+    Ok(idx)
+}
+
+pub fn attached_ncm_count() -> usize {
+    CDC_NCM_DEVICES.lock().len()
+}
+
+#[doc(hidden)]
+pub fn __reset_ncm_for_test() {
+    CDC_NCM_DEVICES.lock().clear();
 }

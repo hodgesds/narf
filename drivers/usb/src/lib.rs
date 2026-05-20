@@ -130,6 +130,9 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::Touchpad
                     | AttachOutcome::SerialAcm
                     | AttachOutcome::MassStorage
+                    | AttachOutcome::AudioClass
+                    | AttachOutcome::VideoClass
+                    | AttachOutcome::NetworkClass
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -201,6 +204,9 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::Touchpad
                         | AttachOutcome::SerialAcm
                         | AttachOutcome::MassStorage
+                        | AttachOutcome::AudioClass
+                        | AttachOutcome::VideoClass
+                        | AttachOutcome::NetworkClass
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }

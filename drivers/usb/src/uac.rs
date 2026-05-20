@@ -115,6 +115,11 @@ pub enum UacError {
     NotClassSpecific,
     /// Unknown / unsupported subtype.
     BadSubtype(u8),
+    /// Device's interface descriptors didn't include an Audio Class
+    /// AudioControl interface — not a UAC device.
+    NotAudio,
+    /// SET_CONFIGURATION control transfer failed during bind.
+    SetConfigFailed,
 }
 
 // ── Descriptor types ───────────────────────────────────────────────
@@ -373,4 +378,92 @@ fn check_class_specific(buf: &[u8], expect_subtype: u8) -> Result<(), UacError> 
         return Err(UacError::BadSubtype(buf[2]));
     }
     Ok(())
+}
+
+// ── Class enumeration + bind ───────────────────────────────────────
+//
+// Minimal "is this a UAC device, and if so claim it" path. The
+// full streaming surface (iso playback / capture rings) is a
+// follow-up — this commit makes the device visible in the
+// registry so it stops being logged as UnknownClass.
+
+extern crate alloc;
+
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// One bound UAC device — slot id + AudioControl interface number.
+/// The streaming-interface enumeration + iso endpoint open lives
+/// behind this once the iso path lands.
+#[derive(Copy, Clone, Debug)]
+pub struct UacDevice {
+    pub slot_id: u8,
+    /// `bInterfaceNumber` of the AudioControl interface.
+    pub ac_iface: u8,
+}
+
+/// System-wide registry of bound UAC devices.
+pub static UAC_DEVICES: IrqSafeSpinLock<Vec<UacDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Walk a configuration descriptor blob looking for the first
+/// interface whose `bInterfaceClass:SubClass` matches Audio /
+/// AudioControl (UAC's required "control" interface). Returns
+/// `bInterfaceNumber` on a match.
+pub fn find_audio_control_interface(cfg: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        // bDescriptorType 0x04 = INTERFACE; length 9.
+        if cfg[i + 1] == 0x04 && len >= 9 {
+            let cls = cfg[i + 5];
+            let sub = cfg[i + 6];
+            if cls == USB_CLASS_AUDIO && sub == USB_AUDIO_SUBCLASS_AUDIOCONTROL {
+                return Some(cfg[i + 2]);
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+/// Bind to an already-addressed UAC device. Issues SET_CONFIGURATION
+/// so the device exits Default state, then records the slot/interface
+/// pair in UAC_DEVICES. Returns the new index on success.
+pub fn try_bind_audio_already_addressed(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, UacError> {
+    let ac_iface = find_audio_control_interface(cfg).ok_or(UacError::NotAudio)?;
+    let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
+    let mut nothing = [0u8; 0];
+    if xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .is_err()
+    {
+        return Err(UacError::SetConfigFailed);
+    }
+    let mut g = UAC_DEVICES.lock();
+    let idx = g.len();
+    g.push(UacDevice { slot_id, ac_iface });
+    Ok(idx)
+}
+
+/// Number of bound UAC devices.
+pub fn attached_uac_count() -> usize {
+    UAC_DEVICES.lock().len()
+}
+
+#[doc(hidden)]
+pub fn __reset_uac_for_test() {
+    UAC_DEVICES.lock().clear();
 }
