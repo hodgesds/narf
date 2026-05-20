@@ -21,7 +21,14 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use crate::registry::{register_block_device, BlockDeviceSync};
+use crate::BlockIoError;
 
 // ── Common signatures ──────────────────────────────────────────────
 
@@ -274,4 +281,179 @@ fn decode_utf16le_name(bytes: &[u8]) -> alloc::string::String {
         .iter()
         .map(|&c| char::from_u32(c as u32).unwrap_or('\u{FFFD}'))
         .collect()
+}
+
+// ── PartitionBlockDevice + registration helper ─────────────────────
+//
+// A partition is just a contiguous LBA window onto a parent
+// block device. `PartitionBlockDevice` adds the LBA-offset
+// translation + bounds check; `scan_and_register_partitions`
+// reads LBA 0 / LBA 1 of a parent and registers a child
+// `BlockDeviceSync` for each non-empty entry.
+
+/// A sub-block-device that wraps a parent `BlockDeviceSync` plus
+/// a (start_lba, sector_count) window. read/write translate the
+/// caller-supplied LBA into parent coordinates and bounds-check
+/// against the window end.
+pub struct PartitionBlockDevice {
+    parent: Arc<dyn BlockDeviceSync>,
+    /// Start LBA on the parent device.
+    start_lba: u64,
+    /// Length of the partition in LBAs.
+    sector_count: u64,
+}
+
+impl PartitionBlockDevice {
+    /// Wrap `parent[start_lba .. start_lba + sector_count]` as a
+    /// new block device.
+    pub fn new(parent: Arc<dyn BlockDeviceSync>, start_lba: u64, sector_count: u64) -> Self {
+        Self {
+            parent,
+            start_lba,
+            sector_count,
+        }
+    }
+}
+
+impl core::fmt::Debug for PartitionBlockDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PartitionBlockDevice")
+            .field("start_lba", &self.start_lba)
+            .field("sector_count", &self.sector_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BlockDeviceSync for PartitionBlockDevice {
+    fn lba_size(&self) -> u32 {
+        self.parent.lba_size()
+    }
+    fn capacity(&self) -> u64 {
+        self.sector_count
+    }
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+        let n = n_blocks as u64;
+        if lba.checked_add(n).map_or(true, |end| end > self.sector_count) {
+            return Err(BlockIoError::OutOfRange);
+        }
+        let abs = self.start_lba + lba;
+        self.parent.read(abs, n_blocks, out)
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        let n = n_blocks as u64;
+        if lba.checked_add(n).map_or(true, |end| end > self.sector_count) {
+            return Err(BlockIoError::OutOfRange);
+        }
+        let abs = self.start_lba + lba;
+        self.parent.write(abs, n_blocks, data)
+    }
+}
+
+/// Errors during partition scanning.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScanError {
+    /// LBA 0 read failed.
+    Mbr(BlockIoError),
+    /// LBA 1 read failed.
+    Gpt(BlockIoError),
+    /// Partition entry array read failed.
+    EntriesRead(BlockIoError),
+    /// LBA 0 didn't have the MBR signature.
+    MbrSignature(MbrError),
+    /// GPT header didn't parse.
+    GptHeader(GptError),
+}
+
+/// Outcome of [`scan_and_register_partitions`] — diagnostic
+/// surface for the boot log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Names registered against the block registry (e.g.
+    /// `["nvme0p1", "nvme0p2"]`).
+    pub registered: Vec<String>,
+    /// True iff the disk was GPT (vs legacy MBR).
+    pub is_gpt: bool,
+}
+
+/// Scan a parent block device for partitions and register each
+/// as a child device under the registry, naming them
+/// `{parent_name}p{n}` (1-indexed, matching Linux convention).
+///
+/// The names are heap-allocated then `Box::leak`'d so they
+/// satisfy the registry's `&'static str` interface. Partitions
+/// live for the kernel's lifetime; the leak is bounded by the
+/// 128-entry GPT cap.
+pub fn scan_and_register_partitions(
+    parent: Arc<dyn BlockDeviceSync>,
+    parent_name: &str,
+) -> Result<ScanReport, ScanError> {
+    let lba_bytes = parent.lba_size() as usize;
+    // Read LBA 0.
+    let mut sector0 = alloc::vec![0u8; lba_bytes];
+    parent
+        .read(0, 1, &mut sector0)
+        .map_err(ScanError::Mbr)?;
+    let mbr = parse_mbr(&sector0).map_err(ScanError::MbrSignature)?;
+    let mut registered = Vec::new();
+
+    if is_gpt_protective(&mbr) {
+        // GPT path: read LBA 1 (primary header), parse, then read
+        // entries array starting at header.partition_entries_lba.
+        let mut sector1 = alloc::vec![0u8; lba_bytes];
+        parent.read(1, 1, &mut sector1).map_err(ScanError::Gpt)?;
+        let header = parse_gpt_header(&sector1).map_err(ScanError::GptHeader)?;
+
+        // Compute how many LBAs the entries array occupies.
+        let array_bytes =
+            header.num_partition_entries as usize * header.partition_entry_size as usize;
+        let array_lbas = ((array_bytes + lba_bytes - 1) / lba_bytes) as u16;
+        let mut array = alloc::vec![0u8; array_lbas as usize * lba_bytes];
+        parent
+            .read(header.partition_entries_lba, array_lbas, &mut array)
+            .map_err(ScanError::EntriesRead)?;
+
+        let entries = parse_gpt_partitions(
+            &array[..array_bytes],
+            header.partition_entry_size as usize,
+            header.num_partition_entries as usize,
+        );
+        for (idx, p) in entries.iter().enumerate() {
+            if p.is_empty() {
+                continue;
+            }
+            let name = format!("{}p{}", parent_name, idx + 1);
+            let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+            let sub = Arc::new(PartitionBlockDevice::new(
+                parent.clone(),
+                p.start_lba,
+                p.sector_count(),
+            )) as Arc<dyn BlockDeviceSync>;
+            register_block_device(static_name, sub);
+            registered.push(name);
+        }
+        Ok(ScanReport {
+            registered,
+            is_gpt: true,
+        })
+    } else {
+        // Legacy MBR path.
+        for (idx, p) in mbr.iter().enumerate() {
+            if p.kind == 0 || p.sector_count == 0 {
+                continue;
+            }
+            let name = format!("{}p{}", parent_name, idx + 1);
+            let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+            let sub = Arc::new(PartitionBlockDevice::new(
+                parent.clone(),
+                p.start_lba as u64,
+                p.sector_count as u64,
+            )) as Arc<dyn BlockDeviceSync>;
+            register_block_device(static_name, sub);
+            registered.push(name);
+        }
+        Ok(ScanReport {
+            registered,
+            is_gpt: false,
+        })
+    }
 }

@@ -1039,3 +1039,154 @@ kernel_test_in!(
     "block/partition",
     smoke_block_partition_gpt_entries_decode_names_and_lba_range
 );
+
+// ── block/partition (registration wire-up) ─────────────────────────
+
+/// A trivial `BlockDeviceSync` backed by an in-memory Vec, just
+/// enough to exercise the partition scanner round-trip.
+struct VecBlock {
+    data: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>>,
+    lba_size: u32,
+}
+
+impl crate::BlockDeviceSync for VecBlock {
+    fn lba_size(&self) -> u32 {
+        self.lba_size
+    }
+    fn capacity(&self) -> u64 {
+        let g = self.data.lock();
+        g.len() as u64 / self.lba_size as u64
+    }
+    fn read(&self, lba: u64, n: u16, out: &mut [u8]) -> Result<(), crate::BlockIoError> {
+        let g = self.data.lock();
+        let off = lba as usize * self.lba_size as usize;
+        let len = n as usize * self.lba_size as usize;
+        if off + len > g.len() || out.len() < len {
+            return Err(crate::BlockIoError::OutOfRange);
+        }
+        out[..len].copy_from_slice(&g[off..off + len]);
+        Ok(())
+    }
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), crate::BlockIoError> {
+        let mut g = self.data.lock();
+        let off = lba as usize * self.lba_size as usize;
+        let len = n as usize * self.lba_size as usize;
+        if off + len > g.len() || data.len() < len {
+            return Err(crate::BlockIoError::OutOfRange);
+        }
+        g[off..off + len].copy_from_slice(&data[..len]);
+        Ok(())
+    }
+}
+
+fn smoke_block_partition_block_device_translates_lba_and_bounds_checks() -> TestResult {
+    use crate::partition::PartitionBlockDevice;
+    use crate::BlockDeviceSync;
+    use alloc::sync::Arc;
+    // 128-LBA parent, 512-byte LBAs, first 64 KiB pre-filled with a
+    // marker pattern.
+    let mut bytes = alloc::vec![0u8; 128 * 512];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = (i & 0xFF) as u8;
+    }
+    let parent = Arc::new(VecBlock {
+        data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(bytes)),
+        lba_size: 512,
+    }) as Arc<dyn crate::BlockDeviceSync>;
+    // Sub-device starting at LBA 16, 64 LBAs long.
+    let sub = PartitionBlockDevice::new(parent, 16, 64);
+    if sub.capacity() != 64 {
+        return TestResult::Fail("partition capacity must reflect sector_count");
+    }
+    // Read LBA 0 of the partition — should give parent's LBA 16.
+    let mut buf = [0u8; 512];
+    sub.read(0, 1, &mut buf).expect("read failed");
+    // Marker pattern: byte 0 of parent LBA 16 = (16*512) & 0xFF = 0.
+    // Easier check: byte 1 = 1.
+    if buf[1] != 1 || buf[2] != 2 {
+        return TestResult::Fail("partition LBA 0 doesn't match parent LBA 16");
+    }
+    // Out-of-range read past partition end must reject before
+    // hitting the parent.
+    let mut huge = [0u8; 512];
+    if sub.read(63, 2, &mut huge).is_ok() {
+        return TestResult::Fail("read past partition end must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_block_device_translates_lba_and_bounds_checks
+);
+
+fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
+    use crate::partition::scan_and_register_partitions;
+    use alloc::sync::Arc;
+    // Build a synthetic 1024-LBA GPT disk: LBA 0 = protective MBR,
+    // LBA 1 = GPT header, LBA 2 = entries (only first 128B used).
+    let mut bytes = alloc::vec![0u8; 1024 * 512];
+    // LBA 0: protective MBR with single 0xEE entry.
+    let mbr_off = 0;
+    bytes[mbr_off + 446 + 4] = 0xEE; // kind
+    bytes[mbr_off + 446 + 8..mbr_off + 446 + 12]
+        .copy_from_slice(&1u32.to_le_bytes()); // start_lba
+    bytes[mbr_off + 510] = 0x55;
+    bytes[mbr_off + 511] = 0xAA;
+    // LBA 1: GPT header (92-byte minimal).
+    let h = 512; // byte offset of LBA 1
+    bytes[h..h + 8].copy_from_slice(b"EFI PART");
+    bytes[h + 8..h + 12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    bytes[h + 12..h + 16].copy_from_slice(&92u32.to_le_bytes());
+    bytes[h + 24..h + 32].copy_from_slice(&1u64.to_le_bytes());
+    bytes[h + 32..h + 40].copy_from_slice(&1023u64.to_le_bytes());
+    bytes[h + 40..h + 48].copy_from_slice(&34u64.to_le_bytes());
+    bytes[h + 48..h + 56].copy_from_slice(&990u64.to_le_bytes());
+    bytes[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes()); // entries LBA
+    bytes[h + 80..h + 84].copy_from_slice(&2u32.to_le_bytes()); // num entries
+    bytes[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes()); // entry size
+    // LBA 2: one non-empty entry + one empty entry.
+    let e = 1024; // byte offset of LBA 2
+    // Type GUID — Linux root GUID first 16 bytes.
+    bytes[e..e + 16].copy_from_slice(&[
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
+        0x7D, 0xE4,
+    ]);
+    bytes[e + 32..e + 40].copy_from_slice(&100u64.to_le_bytes()); // start
+    bytes[e + 40..e + 48].copy_from_slice(&199u64.to_le_bytes()); // end inclusive
+    // Second entry stays all-zero (empty).
+
+    let parent = Arc::new(VecBlock {
+        data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(bytes)),
+        lba_size: 512,
+    }) as Arc<dyn crate::BlockDeviceSync>;
+
+    use crate::registry::{
+        find_block_device, __reset_for_test, __restore_for_test, __snapshot_for_test,
+    };
+    // Snapshot + restore the registry so this test doesn't pollute it.
+    let snap = __snapshot_for_test();
+    __reset_for_test();
+
+    let outcome = scan_and_register_partitions(parent, "testdisk0");
+    let report = match outcome {
+        Ok(r) => r,
+        Err(_) => {
+            __restore_for_test(snap);
+            return TestResult::Fail("scan errored on valid GPT disk");
+        }
+    };
+    let pass = report.is_gpt
+        && report.registered == alloc::vec![alloc::string::String::from("testdisk0p1")]
+        && find_block_device("testdisk0p1").is_some();
+
+    __restore_for_test(snap);
+    if pass {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("scan didn't register the expected partition")
+    }
+}
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_scan_registers_gpt_partitions
+);
