@@ -2320,3 +2320,146 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_bring_up_phoenix_driver_if_version
 );
+
+// ── amdgpu/gfx (CP ring init) ──────────────────────────────────────
+//
+// GFX9 CP ring bring-up sequence builder. Real bring-up writes
+// every entry to BAR5 in order against the CP IP block. The
+// smokes assert the ordering invariants that matter:
+// - CP must be halted *before* base / size are programmed
+// - CP must be unhalted *last* (otherwise it fetches against
+//   half-programmed state and wedges)
+// - the per-step register writes carry the expected encodings.
+
+fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
+    use crate::amdgpu_gfx::{
+        build_gfx9_ring_init, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_REL, CP_RB0_BASE_HI_REL,
+        CP_RB0_BASE_REL, CP_RB0_CNTL_REL, CP_RB0_RPTR_ADDR_HI_REL, CP_RB0_RPTR_ADDR_REL,
+        CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL, CP_RB_DOORBELL_CONTROL_REL,
+        CP_RB_DOORBELL_EN, CP_RB_DOORBELL_OFFSET_SHIFT, CP_RB_DOORBELL_RANGE_LOWER_REL,
+        CP_RB_DOORBELL_RANGE_UPPER_REL, RPTR_WRITEBACK_COHERENT,
+    };
+    let gc_base: u32 = 0x0003_0000;
+    let ring_phys: u64 = 0x0000_0001_0000_0000;
+    let ring_size_dw: u32 = 1024;
+    let doorbell_idx: u32 = 5;
+    let rptr_phys: u64 = 0x0000_0002_DEAD_0000;
+
+    let seq = match build_gfx9_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("build_gfx9_ring_init errored on valid inputs");
+        }
+    };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+
+    // First write must be CP halt (otherwise CP fetches against
+    // an in-flux ring).
+    if w.first().map(|g| (g.addr, g.value))
+        != Some((gc_base + CP_ME_CNTL_REL, CP_ME_CNTL_HALT_ALL))
+    {
+        return TestResult::Fail("first write must halt CP via CP_ME_CNTL");
+    }
+    // Last write must be CP unhalt with all-zero.
+    if w.last().map(|g| (g.addr, g.value)) != Some((gc_base + CP_ME_CNTL_REL, 0)) {
+        return TestResult::Fail("last write must unhalt CP_ME_CNTL");
+    }
+    // Look for the key body writes in order — base lo/hi, cntl,
+    // doorbell control / lower / upper, rptr addr lo/hi.
+    let want = [
+        (gc_base + CP_RB0_WPTR_REL, 0),
+        (gc_base + CP_RB0_WPTR_HI_REL, 0),
+        (gc_base + CP_RB0_RPTR_ADDR_REL, rptr_phys as u32),
+        (
+            gc_base + CP_RB0_RPTR_ADDR_HI_REL,
+            ((rptr_phys >> 32) as u32) | RPTR_WRITEBACK_COHERENT,
+        ),
+        (gc_base + CP_RB0_BASE_REL, ring_phys as u32),
+        (gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 32) as u32),
+        (
+            gc_base + CP_RB0_CNTL_REL,
+            ring_size_dw.trailing_zeros() | (6u32 << 8),
+        ),
+        (
+            gc_base + CP_RB_DOORBELL_CONTROL_REL,
+            CP_RB_DOORBELL_EN | (doorbell_idx << CP_RB_DOORBELL_OFFSET_SHIFT),
+        ),
+        (gc_base + CP_RB_DOORBELL_RANGE_LOWER_REL, doorbell_idx),
+        (gc_base + CP_RB_DOORBELL_RANGE_UPPER_REL, doorbell_idx + 1),
+    ];
+    // Find each `want` entry in order; subsequent searches start
+    // where the prior one left off so we get an ordering check.
+    let mut cursor = 1; // skip the leading CP_ME_CNTL halt
+    for (addr, value) in want {
+        let idx = w[cursor..]
+            .iter()
+            .position(|g| g.addr == addr && g.value == value);
+        match idx {
+            Some(i) => cursor += i + 1,
+            None => {
+                return TestResult::Fail("missing expected ring-init write");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx9_ring_init_emits_canonical_order
+);
+
+fn smoke_amdgpu_gfx9_ring_init_rejects_bad_ring_size() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
+    // Non-power-of-two size — CP_RB0_CNTL can't encode it.
+    let r = build_gfx9_ring_init(0x0003_0000, 0x1_0000_0000, 1000, 0, 0x2_0000_0000);
+    match r {
+        Err(GfxError::BadRingSize) => TestResult::Pass,
+        _ => TestResult::Fail("non-pow2 ring size must be rejected"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx9_ring_init_rejects_bad_ring_size
+);
+
+fn smoke_amdgpu_gfx9_ring_init_rejects_unaligned_ring_phys() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
+    // Ring base must be 256-byte aligned (low 8 bits zero).
+    let r = build_gfx9_ring_init(
+        0x0003_0000,
+        0x1_0000_00FF,
+        1024,
+        0,
+        0x2_0000_0000,
+    );
+    match r {
+        Err(GfxError::UnalignedRingPhys) => TestResult::Pass,
+        _ => TestResult::Fail("unaligned ring phys must be rejected"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx9_ring_init_rejects_unaligned_ring_phys
+);
+
+fn smoke_amdgpu_gfx9_ring_init_rptr_writeback_alignment() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
+    // RPTR writeback target must be 8-byte aligned.
+    let r = build_gfx9_ring_init(
+        0x0003_0000,
+        0x1_0000_0000,
+        1024,
+        0,
+        0x2_0000_0001, // 1-aligned, not 8-aligned
+    );
+    match r {
+        Err(GfxError::UnalignedRptrWriteback) => TestResult::Pass,
+        _ => TestResult::Fail("unaligned rptr-writeback must be rejected"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx9_ring_init_rptr_writeback_alignment
+);

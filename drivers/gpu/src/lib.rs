@@ -120,6 +120,7 @@ pub mod amdgpu_atom_vm;
 pub mod amdgpu_atombios;
 pub mod amdgpu_dcn;
 pub mod amdgpu_discovery;
+pub mod amdgpu_gfx;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pptable;
