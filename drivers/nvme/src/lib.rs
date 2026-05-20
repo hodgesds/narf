@@ -1841,10 +1841,24 @@ pub fn probe(
     });
     // Register against the unified block-device registry so the
     // kernel can address NVMe uniformly with other storage drivers.
-    narf_block::register_block_device(
-        "nvme0",
-        alloc::sync::Arc::new(NvmeBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
-    );
+    let parent: alloc::sync::Arc<dyn narf_block::BlockDeviceSync> =
+        alloc::sync::Arc::new(NvmeBlockSync);
+    narf_block::register_block_device("nvme0", parent.clone());
+    // Read LBA 0/1, parse the partition table, and register a child
+    // BlockDeviceSync for each non-empty partition entry under names
+    // like "nvme0p1", "nvme0p2", ... Errors here are non-fatal —
+    // an unpartitioned / unformatted device still has its parent
+    // registered above; the partition scan just logs what failed.
+    match narf_block::partition::scan_and_register_partitions(parent, "nvme0") {
+        Ok(_report) => {
+            // Partition layout discovered; child devices in registry.
+            // (Boot log entry is the registry contents itself.)
+        }
+        Err(_e) => {
+            // Disk is unpartitioned or the parser couldn't decode it.
+            // `nvme0` (the parent) remains usable for whole-device I/O.
+        }
+    }
     // Record the bind in the framework's bound-driver inventory.
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("nvme0"),
