@@ -602,20 +602,37 @@ impl AmdGpu {
         Ok(())
     }
 
-    /// Program a scanout mode through DCN.
+    /// Program a scanout mode through DCN 2.0.
     ///
-    /// Stage-2 ships only the linear-scanout path: one primary
-    /// plane covering the full VRAM aperture at the requested
-    /// `Mode`. Cursor / overlay / DCC compression / multi-plane
-    /// land in Phase B (`drivers/gpu/spec.md` §1).
+    /// Path:
+    ///   1. Look up the DCN register window from the IP
+    ///      discovery table (`HW_ID_DCN` instance 0). Bail if
+    ///      discovery didn't land a DCN block — the older
+    ///      `amdgpu_offsets` registry path is reserved for
+    ///      pre-discovery silicon (Vega / Navi1) which doesn't
+    ///      ship DCN 2.0 anyway.
+    ///   2. Translate `mode.width × mode.height @ 60 Hz` to a
+    ///      `ModeTiming` via the VESA / CEA-861 table in
+    ///      `amdgpu_dcn::timing_for_mode`.
+    ///   3. Build the full DCN 2.0 modeset write sequence
+    ///      (prologue + body + epilogue) via
+    ///      `dcn20_modeset_sequence`.
+    ///   4. Execute through `execute_modeset` against BAR5's
+    ///      `MM_INDEX / MM_DATA` indexed access pair.
+    ///   5. Stash the programmed mode so the `FbScanout` impl
+    ///      reports it.
     ///
-    /// Returns `FirmwareLoadFailed` until firmware is loaded;
-    /// otherwise stashes the mode in `self.mode` for the
-    /// `AmdgpuScanout: FbScanout` impl to expose. The actual
-    /// HUBP / OPP / OTG register sequence requires per-family
-    /// DCN offsets that aren't yet sourced — this stub records
-    /// the intent so the picker integration can light up the
-    /// moment the offset tables land.
+    /// Mirrors Linux `drivers/gpu/drm/amd/display/dc/dcn20/
+    /// dcn20_hwseq.c::dcn20_enable_crtc` +
+    /// `dcn20_program_pipe`. Link training / DP-AUX wakeup are
+    /// out of scope for Stage-3; the panel is expected to be in
+    /// the firmware-programmed link state already.
+    ///
+    /// Returns `FirmwareLoadFailed` if PSP firmware hasn't been
+    /// loaded yet (DCN registers shadow against the SMU and can
+    /// glitch the display if poked pre-firmware) or
+    /// `UnknownAsic` if the requested mode isn't in the timing
+    /// table.
     ///
     /// # Safety
     /// Caller owns BAR0 + BAR5 exclusively.
@@ -623,13 +640,35 @@ impl AmdGpu {
         if !self.fw_loaded {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
-        // TODO(stage-3): DCN HUBP/OPP/OTG programming.
-        //   1. Disable scanout (HUBP_BLANK = 1).
-        //   2. Program HUBP_PRIMARY_SURFACE_ADDR = self.vram.base.
-        //   3. Program HUBP_PRIMARY_SURFACE_PITCH = mode.stride.
-        //   4. Program OPP gamma passthrough.
-        //   5. Program OTG_H_TOTAL / OTG_V_TOTAL from mode timing.
-        //   6. HUBP_BLANK = 0; assert OTG_MASTER_EN.
+
+        // Resolve DCN base via discovery. Stage-3 only programs
+        // discovery-capable silicon (Renoir+).
+        let dcn_base = self
+            .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
+            .ok_or(AmdgpuError::FirmwareLoadFailed)?;
+
+        // Translate the requested mode to a full timing. We
+        // currently honour 1920x1080 / 1366x768 / 1280x720, all
+        // @60 Hz. Anything else: bail rather than program a mode
+        // we don't have timings for.
+        let timing = crate::amdgpu_dcn::timing_for_mode(mode.width, mode.height, 60)
+            .ok_or(AmdgpuError::UnknownAsic)?;
+
+        // Build the sequence. `mode.stride` is in pixels — DCN's
+        // DCSURF_SURFACE_PITCH field also expects pixels.
+        let seq = crate::amdgpu_dcn::dcn20_modeset_sequence(
+            &timing,
+            self.vram.base,
+            mode.stride,
+            dcn_base,
+        );
+
+        // Drive the sequencer.
+        // SAFETY: caller-asserted exclusive ownership of BAR5.
+        unsafe {
+            crate::amdgpu_dcn::execute_modeset(&self.regs, &seq);
+        }
+
         self.mode = Some(mode);
         Ok(())
     }
@@ -655,7 +694,7 @@ unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
 ///
 /// # Safety
 /// Same as `mm_read`.
-unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
+pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     // SAFETY: caller-asserted ownership.
     unsafe {
         regs.write32(MM_INDEX, addr);
@@ -828,4 +867,10 @@ pub fn is_probed() -> bool {
 
 pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
+}
+
+/// `&mut` variant of `with_controller`. Used by `set_mode` and other
+/// state-mutating bring-up paths.
+pub fn with_controller_mut<R>(f: impl FnOnce(&mut AmdGpu) -> R) -> Option<R> {
+    CONTROLLER.lock().as_mut().map(f)
 }

@@ -1763,3 +1763,275 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_reg_write_via_closure
 );
+
+// ── amdgpu/smu ─────────────────────────────────────────────────────
+//
+// SMU mailbox-protocol smokes. The actual MP1 register reads
+// happen on real silicon; here we stage a mock that scripts the
+// canonical sequence (handshake → clear → arg → msg → response).
+
+fn smoke_amdgpu_smu_send_message_drives_canonical_sequence() -> TestResult {
+    use crate::amdgpu_smu::{
+        send_message, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_RESP_REL,
+        PPSMC_MSG_GET_SMU_VERSION, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    // Step 1: handshake — RESP non-zero (idle).
+    m.stage_read(resp, 1);
+    // Step 5: response — OK after our trigger write.
+    m.stage_read(resp, SMU_RESP_OK);
+    // Step 6: ARG holds the returned SMU version (e.g. 0x000A_0203).
+    m.stage_read(arg, 0x000A_0203);
+
+    let (rc, out) = match send_message(&mut m, mp1_base, PPSMC_MSG_GET_SMU_VERSION, 0) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("send_message errored on happy path");
+        }
+    };
+    if rc != SMU_RESP_OK {
+        return TestResult::Fail("expected SMU_RESP_OK");
+    }
+    if out != 0x000A_0203 {
+        return TestResult::Fail("expected ARG read-back = 0x000A_0203");
+    }
+
+    // Captured writes (in order): clear RESP, write ARG=0, write MSG=GET_SMU_VERSION.
+    if m.writes.len() != 3 {
+        return TestResult::Fail("expected exactly 3 mailbox writes");
+    }
+    if m.writes[0] != (resp, 0) {
+        return TestResult::Fail("clear-RESP write missing or out of order");
+    }
+    if m.writes[1] != (arg, 0) {
+        return TestResult::Fail("ARG write missing or out of order");
+    }
+    if m.writes[2] != (mp1_base + MP1_C2PMSG_MSG_REL, PPSMC_MSG_GET_SMU_VERSION) {
+        return TestResult::Fail("MSG-trigger write missing or wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_send_message_drives_canonical_sequence
+);
+
+fn smoke_amdgpu_smu_send_message_surfaces_smu_rejection() -> TestResult {
+    use crate::amdgpu_smu::{
+        send_message, MockSmu, SmuError, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
+        PPSMC_MSG_TEST_MESSAGE, SMU_RESP_FAIL,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    m.stage_read(resp, 1); // handshake
+    m.stage_read(resp, SMU_RESP_FAIL); // SMU rejects
+    m.stage_read(arg, 0); // ARG read-back (not reached after error)
+
+    match send_message(&mut m, mp1_base, PPSMC_MSG_TEST_MESSAGE, 0xDEADBEEF) {
+        Err(SmuError::Rejected(SMU_RESP_FAIL)) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("expected SmuError::Rejected(SMU_RESP_FAIL)")
+        }
+        Ok(_) => TestResult::Fail("SMU rejection silently passed"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_send_message_surfaces_smu_rejection
+);
+
+fn smoke_amdgpu_smu_handshake_timeout_when_resp_stays_busy() -> TestResult {
+    use crate::amdgpu_smu::{
+        send_message, MockSmu, SmuError, PPSMC_MSG_TEST_MESSAGE,
+    };
+    // Stage nothing — the mock returns 0 (busy) on every read.
+    let mut m = MockSmu::new();
+    match send_message(&mut m, 0x16000, PPSMC_MSG_TEST_MESSAGE, 0) {
+        Err(SmuError::HandshakeTimeout) => TestResult::Pass,
+        _ => TestResult::Fail("expected HandshakeTimeout on busy mock"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_handshake_timeout_when_resp_stays_busy
+);
+
+// ── amdgpu/dcn ─────────────────────────────────────────────────────
+//
+// DCN 2.0 modeset codec smokes. Exercise the discovery-driven
+// `build_modeset_from_discovery`, VESA timing table, and the
+// shape of the produced write sequence. The MMIO execute path
+// (`execute_modeset`) can only be exercised against real
+// Renoir / Cezanne silicon; these smokes run on QEMU and cover
+// everything up to the register-bus write boundary.
+
+fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
+    use crate::amdgpu_dcn::{
+        build_modeset_from_discovery, timing_for_mode,
+    };
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
+
+    let mut bases = [0u32; MAX_BASE_ADDRS];
+    bases[0] = 0x0001_2000; // synthetic DCN window base
+    let blocks = alloc::vec![IpBlock {
+        hw_id: HW_ID_DCN,
+        instance: 0,
+        major: 2,
+        minor: 0,
+        revision: 1,
+        sub_revision: 0,
+        variant: 0,
+        base_addrs: bases,
+        num_bases: 1,
+    }];
+    let timing = match timing_for_mode(1920, 1080, 60) {
+        Some(t) => t,
+        None => return TestResult::Fail("FHD@60 missing from timing table"),
+    };
+    let seq = match build_modeset_from_discovery(&blocks, &timing, 0x1000_0000, 1920) {
+        Some(s) => s,
+        None => return TestResult::Fail("discovery-driven builder returned None"),
+    };
+    if seq.is_empty() {
+        return TestResult::Fail("empty modeset sequence");
+    }
+    // The very first write must blank HUBP — the DCN 2.0 prologue
+    // requires disabling scanout before reprogramming.
+    let first = seq[0];
+    let expected_blank =
+        0x0001_2000 + crate::amdgpu_dcn::DCN20_HUBP0_REL + crate::amdgpu_dcn::DCN20_HUBP_BLANK_EN_REL;
+    if first.addr != expected_blank || first.value & crate::amdgpu_dcn::HUBP_BLANK_FORCE == 0 {
+        return TestResult::Fail("prologue should force HUBP blank first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_dcn20_build_modeset_from_discovery_produces_seq
+);
+
+fn smoke_dcn20_timing_for_1080p60_shape() -> TestResult {
+    use crate::amdgpu_dcn::timing_for_mode;
+    let t = match timing_for_mode(1920, 1080, 60) {
+        Some(t) => t,
+        None => return TestResult::Fail("1920x1080@60 must be in the table"),
+    };
+    // VESA DMT for 1920x1080@60: 148.5 MHz pixel clock, htotal
+    // 2200, vtotal 1125, hsync 2008..2052, vsync 1084..1089.
+    if t.h_active != 1920 || t.v_active != 1080 {
+        return TestResult::Fail("active dimensions wrong");
+    }
+    if t.h_total != 2200 || t.v_total != 1125 {
+        return TestResult::Fail("h/v_total wrong for FHD@60");
+    }
+    if t.pixel_clock_khz != 148_500 {
+        return TestResult::Fail("FHD@60 pixel clock not 148.5 MHz");
+    }
+    if t.h_sync_start != 2008 || t.h_sync_end != 2052 {
+        return TestResult::Fail("FHD@60 hsync window");
+    }
+    if t.v_sync_start != 1084 || t.v_sync_end != 1089 {
+        return TestResult::Fail("FHD@60 vsync window");
+    }
+    // Bogus mode rejected.
+    if timing_for_mode(640, 480, 60).is_some() {
+        return TestResult::Fail("unknown mode must surface as None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_dcn20_timing_for_1080p60_shape
+);
+
+fn smoke_dcn20_set_mode_rejects_without_fw() -> TestResult {
+    use crate::amdgpu::{with_controller_mut, AmdgpuError, Mode};
+    // Probe runs at boot. On QEMU the probe may or may not bind
+    // (depends on emulated PCI cards). Skip when not bound — we
+    // can't test the `fw_loaded == false` path without a live
+    // controller object.
+    if !crate::amdgpu::is_probed() {
+        return TestResult::Skip("amdgpu not probed in this QEMU config");
+    }
+    let outcome = with_controller_mut(|d| {
+        if d.fw_loaded {
+            return None; // can't exercise the "no fw" path
+        }
+        // SAFETY: probe gave us BAR0+BAR5 ownership; set_mode bails
+        // before any MMIO when fw_loaded is false.
+        Some(unsafe { d.set_mode(Mode { width: 1920, height: 1080, stride: 1920 }) })
+    });
+    match outcome {
+        Some(Some(Err(AmdgpuError::FirmwareLoadFailed))) => TestResult::Pass,
+        Some(Some(Ok(_))) => TestResult::Fail("set_mode should reject pre-firmware"),
+        Some(Some(Err(other))) => {
+            let _ = other;
+            TestResult::Fail("wrong AmdgpuError variant pre-firmware")
+        }
+        Some(None) => TestResult::Skip("fw already loaded — can't test pre-fw path"),
+        None => TestResult::Skip("controller vanished mid-test"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_dcn20_set_mode_rejects_without_fw
+);
+
+fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
+    use crate::amdgpu_dcn::{
+        dcn20_modeset_sequence, timing_for_mode, DCN20_HUBP0_REL,
+        DCN20_HUBP_BLANK_EN_REL, DCN20_OTG0_REL, DCN20_OTG_CONTROL_REL,
+        DCN20_OTG_H_TOTAL_REL, HUBP_BLANK_FORCE, OTG_MASTER_EN,
+    };
+    let timing = match timing_for_mode(1920, 1080, 60) {
+        Some(t) => t,
+        None => return TestResult::Fail("FHD@60 missing"),
+    };
+    let dcn_base: u32 = 0x0010_0000;
+    let seq = dcn20_modeset_sequence(&timing, 0x1000_0000, 1920, dcn_base);
+
+    let want_blank = dcn_base + DCN20_HUBP0_REL + DCN20_HUBP_BLANK_EN_REL;
+    let want_h_total = dcn_base + DCN20_OTG0_REL + DCN20_OTG_H_TOTAL_REL;
+    let want_master = dcn_base + DCN20_OTG0_REL + DCN20_OTG_CONTROL_REL;
+
+    // HUBP_BLANK must appear (twice — once forced in prologue,
+    // once cleared in epilogue).
+    let blank_forced = seq
+        .iter()
+        .any(|w| w.addr == want_blank && w.value & HUBP_BLANK_FORCE != 0);
+    let blank_cleared = seq
+        .iter()
+        .any(|w| w.addr == want_blank && w.value == 0);
+    if !blank_forced || !blank_cleared {
+        return TestResult::Fail("HUBP_BLANK_EN must be forced then cleared");
+    }
+    // OTG_H_TOTAL must appear with the value `h_total - 1`.
+    let want_h = (timing.h_total - 1) as u32;
+    if !seq.iter().any(|w| w.addr == want_h_total && w.value == want_h) {
+        return TestResult::Fail("OTG_H_TOTAL not programmed");
+    }
+    // OTG_MASTER_EN must be the last write to OTG_CONTROL.
+    let last_master = seq
+        .iter()
+        .rev()
+        .find(|w| w.addr == want_master)
+        .copied();
+    match last_master {
+        Some(w) if w.value & OTG_MASTER_EN != 0 => {}
+        _ => return TestResult::Fail("OTG_MASTER_EN must be asserted last"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_dcn20_modeset_seq_contains_expected_offsets
+);

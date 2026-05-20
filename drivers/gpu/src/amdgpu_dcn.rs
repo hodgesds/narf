@@ -63,7 +63,12 @@
 //! MMIO sequencing (disable scanout → reprogram → re-enable)
 //! lives in `amdgpu::set_mode` once this codec lands.
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
+use narf_driver_runtime::MmioRegion;
+
 use crate::amdgpu::Family;
+use crate::amdgpu_discovery::{self, IpBlock};
 use crate::amdgpu_offsets;
 
 // ── HUBP register offsets (AMD DCN1+ register reference) ─────────
@@ -282,6 +287,394 @@ pub fn build_modeset(
     });
 
     Ok(seq)
+}
+
+// ── DCN 2.0 modeset path (discovery-driven) ──────────────────────
+//
+// On Renoir / Cezanne / Lucienne (DCN 2.0.x) the IP discovery
+// table publishes a single DCN base. HUBP / OPP / OTG (OPTC) live
+// inside that one register window at fixed per-instance offsets.
+// The relative offsets below are sourced from Linux DCN 2.0
+// register maps and the public DCN reference:
+//
+//   - drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+//     (the `dcn20_enable_crtc` + `dcn20_program_pipe` sequence
+//     this module mirrors)
+//   - drivers/gpu/drm/amd/display/dc/dcn20/dcn20_optc.c
+//     (OPTC == OTG timing programming)
+//   - drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_offset.h
+//     (mmHUBP0_HUBP_BLANK_EN / mmOTG0_OTG_H_TOTAL / etc.)
+//
+// All offsets are byte addresses inside the DCN register-bus
+// window. A multi-pipe board reaches HUBP1/OTG1/etc. by adding
+// per-instance strides (`DCN20_HUBP_STRIDE` etc.) — Stage-3 only
+// programs pipe 0 (the primary plane the firmware left active).
+
+/// Stride between successive HUBP instances. Per `dcn20_resource.c`
+/// in Linux's `dc/dcn20/`, HUBP[i] sits at `HUBP0 + i *
+/// DCN20_HUBP_STRIDE`.
+pub const DCN20_HUBP_STRIDE: u32 = 0x0200;
+/// Same idea for OPP.
+pub const DCN20_OPP_STRIDE: u32 = 0x0100;
+/// Same idea for OTG (OPTC).
+pub const DCN20_OTG_STRIDE: u32 = 0x0200;
+
+/// HUBP0 byte offset from the DCN base.
+///
+/// Per `dcn_2_0_3_offset.h`: `mmHUBP0_HUBP_BLANK_EN` lives at dword
+/// 0x05C5 ⇒ byte 0x1714 from the DCN window start. The HUBP block
+/// occupies bytes `[0x1700 .. 0x1900)` for pipe 0; the `_BLANK_EN`
+/// register is at relative byte offset 0x0014.
+pub const DCN20_HUBP0_REL: u32 = 0x1700;
+
+/// OPP0 byte offset from the DCN base.
+///
+/// Per `dcn_2_0_3_offset.h`: `mmOPP_PIPE0_OPP_PIPE_CONTROL` at
+/// dword 0x06EC ⇒ byte 0x1BB0. The OPP_PIPE block occupies
+/// `[0x1B80 .. 0x1C80)` for pipe 0.
+pub const DCN20_OPP0_REL: u32 = 0x1B80;
+
+/// OTG0 (OPTC0) byte offset from the DCN base.
+///
+/// Per `dcn_2_0_3_offset.h`: `mmOTG0_OTG_H_TOTAL` at dword 0x0860 ⇒
+/// byte 0x2180. The OTG block occupies `[0x2180 .. 0x2380)` for
+/// pipe 0.
+pub const DCN20_OTG0_REL: u32 = 0x2180;
+
+// ── DCN 2.0 register offsets relative to each per-pipe block ─────
+//
+// Names + offsets transcribed from `dcn_2_0_3_offset.h`. Each is a
+// byte offset from the block base above.
+
+/// `HUBP_BLANK_EN[0]` — force the pipe blank.
+pub const DCN20_HUBP_BLANK_EN_REL: u32 = 0x0014;
+/// `HUBP_PRIMARY_SURFACE_ADDRESS` (low 32 bits).
+pub const DCN20_HUBP_PRI_ADDR_LO_REL: u32 = 0x009C;
+/// `HUBP_PRIMARY_SURFACE_ADDRESS_HIGH`.
+pub const DCN20_HUBP_PRI_ADDR_HI_REL: u32 = 0x0098;
+/// `HUBP_DCSURF_SURFACE_PITCH`. Bits[12:0] = stride in pixels - 1
+/// for the linear case Stage-3 programs.
+pub const DCN20_HUBP_SURFACE_PITCH_REL: u32 = 0x00A0;
+
+/// `OPP_PIPE_CONTROL[0]` — pipe enable.
+pub const DCN20_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
+/// `OPP_GRPH_PASSTHROUGH` — gamma-LUT passthrough; 0 = linear.
+pub const DCN20_OPP_GRPH_PASSTHROUGH_REL: u32 = 0x0034;
+
+/// `OTG_H_TOTAL`. Bits[15:0] = h_total - 1.
+pub const DCN20_OTG_H_TOTAL_REL: u32 = 0x0000;
+/// `OTG_V_TOTAL`.
+pub const DCN20_OTG_V_TOTAL_REL: u32 = 0x0010;
+/// `OTG_H_BLANK_START_END`. (end << 16) | start.
+pub const DCN20_OTG_H_BLANK_REL: u32 = 0x0008;
+/// `OTG_V_BLANK_START_END`.
+pub const DCN20_OTG_V_BLANK_REL: u32 = 0x001C;
+/// `OTG_H_SYNC_A`.
+pub const DCN20_OTG_H_SYNC_A_REL: u32 = 0x0004;
+/// `OTG_V_SYNC_A`.
+pub const DCN20_OTG_V_SYNC_A_REL: u32 = 0x0014;
+/// `OTG_INTERRUPT_CONTROL` — masked during reprogram.
+pub const DCN20_OTG_INTERRUPT_CONTROL_REL: u32 = 0x00C0;
+/// `OTG_CONTROL` — bit 0 is OTG_MASTER_EN.
+pub const DCN20_OTG_CONTROL_REL: u32 = 0x0040;
+/// `OTG_STATUS` — VBLANK reflected in bit 0 in DCN 2.0.
+pub const DCN20_OTG_STATUS_REL: u32 = 0x0080;
+/// `OTG_STATUS.OTG_VBLANK` mask.
+pub const DCN20_OTG_STATUS_VBLANK: u32 = 1 << 0;
+
+/// Full DCN 2.0 mode timing. Mirrors what Linux's
+/// `dc_crtc_timing` carries for the parts this driver programs:
+/// horizontal / vertical totals + blank + sync, plus polarities
+/// and the pixel clock.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModeTiming {
+    pub h_active: u16,
+    pub v_active: u16,
+    pub h_total: u16,
+    pub v_total: u16,
+    pub h_blank_start: u16,
+    pub h_blank_end: u16,
+    pub v_blank_start: u16,
+    pub v_blank_end: u16,
+    pub h_sync_start: u16,
+    pub h_sync_end: u16,
+    pub v_sync_start: u16,
+    pub v_sync_end: u16,
+    /// Pixel clock in kHz.
+    pub pixel_clock_khz: u32,
+    /// HSYNC polarity. `true` = active high.
+    pub h_sync_positive: bool,
+    /// VSYNC polarity.
+    pub v_sync_positive: bool,
+}
+
+impl ModeTiming {
+    /// Translate a `ModeTiming` to a `DcnTiming` for callers that
+    /// still consume the older codec. The narrow `DcnTiming` drops
+    /// pixel clock + polarity (the Stage-2 codec didn't need
+    /// either).
+    pub fn to_dcn_timing(&self) -> DcnTiming {
+        DcnTiming {
+            htotal: self.h_total,
+            vtotal: self.v_total,
+            hblank_start: self.h_blank_start,
+            hblank_end: self.h_blank_end,
+            vblank_start: self.v_blank_start,
+            vblank_end: self.v_blank_end,
+            hsync_start: self.h_sync_start,
+            hsync_end: self.h_sync_end,
+            vsync_start: self.v_sync_start,
+            vsync_end: self.v_sync_end,
+        }
+    }
+}
+
+/// VESA / CEA-861 timings for a small table of common modes.
+///
+/// Stage-3 ships a hand-table rather than a full CVT calculator;
+/// the modes covered are 1920x1080@60, 1366x768@60, and
+/// 1280x720@60 (CEA-861-F "Format 4"). Unknown
+/// `(width, height, refresh_hz)` triples return `None` and the
+/// caller falls back to leaving the firmware-programmed mode in
+/// place.
+///
+/// Numbers transcribed from:
+///   - VESA DMT (1920x1080@60: pixel clock 148.5 MHz, htotal
+///     2200, vtotal 1125)
+///   - VESA DMT (1366x768@60: 85.5 MHz, htotal 1792, vtotal 798)
+///   - CEA-861-F "Format 4" (1280x720@60: 74.25 MHz, htotal 1650,
+///     vtotal 750)
+pub fn timing_for_mode(width: u32, height: u32, refresh_hz: u32) -> Option<ModeTiming> {
+    match (width, height, refresh_hz) {
+        (1920, 1080, 60) => Some(ModeTiming {
+            h_active: 1920,
+            v_active: 1080,
+            h_total: 2200,
+            v_total: 1125,
+            h_blank_start: 1920,
+            h_blank_end: 2200,
+            v_blank_start: 1080,
+            v_blank_end: 1125,
+            h_sync_start: 2008,
+            h_sync_end: 2052,
+            v_sync_start: 1084,
+            v_sync_end: 1089,
+            pixel_clock_khz: 148_500,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        }),
+        (1366, 768, 60) => Some(ModeTiming {
+            h_active: 1366,
+            v_active: 768,
+            h_total: 1792,
+            v_total: 798,
+            h_blank_start: 1366,
+            h_blank_end: 1792,
+            v_blank_start: 768,
+            v_blank_end: 798,
+            h_sync_start: 1436,
+            h_sync_end: 1579,
+            v_sync_start: 771,
+            v_sync_end: 774,
+            pixel_clock_khz: 85_500,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        }),
+        (1280, 720, 60) => Some(ModeTiming {
+            h_active: 1280,
+            v_active: 720,
+            h_total: 1650,
+            v_total: 750,
+            h_blank_start: 1280,
+            h_blank_end: 1650,
+            v_blank_start: 720,
+            v_blank_end: 750,
+            h_sync_start: 1390,
+            h_sync_end: 1430,
+            v_sync_start: 725,
+            v_sync_end: 730,
+            pixel_clock_khz: 74_250,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        }),
+        _ => None,
+    }
+}
+
+/// DCN 2.0 modeset sequence, expressed as a flat write list.
+///
+/// Unlike the older `build_modeset` (which carved its writes into
+/// `disable / program / enable` phases), the discovery-driven
+/// builder emits one ordered `Vec<DcnWrite>` containing the full
+/// prologue + body + epilogue. The list mirrors the canonical
+/// sequence from Linux `dcn20_hwseq.c::dcn20_enable_crtc` +
+/// `dcn20_program_pipe`:
+///
+/// 1. Disable scanout: `HUBP_BLANK_EN = 1`, mask OTG interrupts,
+///    clear `OTG_CONTROL.MASTER_EN`.
+/// 2. Program HUBP surface address + pitch.
+/// 3. Program OPP gamma passthrough + enable pipe.
+/// 4. Program OTG H/V_TOTAL + H/V_BLANK + H/V_SYNC.
+/// 5. Re-enable: `HUBP_BLANK_EN = 0`, `OTG_CONTROL.MASTER_EN = 1`.
+///
+/// `dcn_base` is the DCN register window base discovered via
+/// `IpBlock.base_addrs[0]`; all writes are absolute register-bus
+/// addresses (base + per-block offset + per-register offset).
+/// `surface_addr_bytes` is the byte address of the primary plane
+/// in the MC aperture; `stride_pixels` is the row stride in
+/// pixels (the HUBP register encodes pixels - 1 in the linear
+/// case).
+pub fn dcn20_modeset_sequence(
+    timing: &ModeTiming,
+    surface_addr_bytes: u64,
+    stride_pixels: u32,
+    dcn_base: u32,
+) -> alloc::vec::Vec<DcnWrite> {
+    let mut writes = alloc::vec::Vec::with_capacity(16);
+
+    let hubp = dcn_base + DCN20_HUBP0_REL;
+    let opp = dcn_base + DCN20_OPP0_REL;
+    let otg = dcn_base + DCN20_OTG0_REL;
+
+    // 1. Disable scanout.
+    writes.push(DcnWrite {
+        addr: hubp + DCN20_HUBP_BLANK_EN_REL,
+        value: HUBP_BLANK_FORCE,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_INTERRUPT_CONTROL_REL,
+        value: 0,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_CONTROL_REL,
+        value: 0,
+    });
+
+    // 2. HUBP surface address + pitch.
+    let surf_lo = surface_addr_bytes as u32;
+    let surf_hi = (surface_addr_bytes >> 32) as u32;
+    writes.push(DcnWrite {
+        addr: hubp + DCN20_HUBP_PRI_ADDR_HI_REL,
+        value: surf_hi,
+    });
+    writes.push(DcnWrite {
+        addr: hubp + DCN20_HUBP_PRI_ADDR_LO_REL,
+        value: surf_lo,
+    });
+    // Linear-tiling pitch encodes `pixels - 1` in bits[12:0]
+    // (`DCSURF_SURFACE_PITCH.PITCH`).
+    let pitch_field = stride_pixels.saturating_sub(1) & 0x1FFF;
+    writes.push(DcnWrite {
+        addr: hubp + DCN20_HUBP_SURFACE_PITCH_REL,
+        value: pitch_field,
+    });
+
+    // 3. OPP pipe enable + linear gamma.
+    writes.push(DcnWrite {
+        addr: opp + DCN20_OPP_PIPE_CONTROL_REL,
+        value: OPP_PIPE_ENABLE,
+    });
+    writes.push(DcnWrite {
+        addr: opp + DCN20_OPP_GRPH_PASSTHROUGH_REL,
+        value: 0,
+    });
+
+    // 4. OTG timing.
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_H_TOTAL_REL,
+        value: (timing.h_total - 1) as u32,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_V_TOTAL_REL,
+        value: (timing.v_total - 1) as u32,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_H_BLANK_REL,
+        value: pack_pair(timing.h_blank_end, timing.h_blank_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_V_BLANK_REL,
+        value: pack_pair(timing.v_blank_end, timing.v_blank_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_H_SYNC_A_REL,
+        value: pack_pair(timing.h_sync_end, timing.h_sync_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_V_SYNC_A_REL,
+        value: pack_pair(timing.v_sync_end, timing.v_sync_start),
+    });
+
+    // 5. Re-enable scanout.
+    writes.push(DcnWrite {
+        addr: hubp + DCN20_HUBP_BLANK_EN_REL,
+        value: 0,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN20_OTG_CONTROL_REL,
+        value: OTG_MASTER_EN,
+    });
+
+    writes
+}
+
+/// Build a DCN 2.0 modeset write list from the IP discovery
+/// table. Returns `None` when the discovery blob does not enumerate
+/// a `HW_ID_DCN` block (older silicon / QEMU / parse failed); the
+/// caller falls back to `build_modeset` against the static
+/// `amdgpu_offsets` registry.
+pub fn build_modeset_from_discovery(
+    blocks: &[IpBlock],
+    timing: &ModeTiming,
+    surface_addr_bytes: u64,
+    stride_pixels: u32,
+) -> Option<alloc::vec::Vec<DcnWrite>> {
+    let dcn = amdgpu_discovery::find_ip(blocks, amdgpu_discovery::HW_ID_DCN, 0)?;
+    let dcn_base = dcn.base_addrs[0];
+    if dcn_base == 0 {
+        return None;
+    }
+    Some(dcn20_modeset_sequence(
+        timing,
+        surface_addr_bytes,
+        stride_pixels,
+        dcn_base,
+    ))
+}
+
+/// Execute a DCN 2.0 modeset sequence against live MMIO.
+///
+/// Walks `seq` and writes each `(addr, value)` pair through the
+/// indexed `MM_INDEX / MM_DATA` access path used by the rest of
+/// the amdgpu driver. After the sequence the caller should poll
+/// `OTG_STATUS.VBLANK` (offset `DCN20_OTG_STATUS_REL`) to confirm
+/// the timing generator latched the new mode, but this function
+/// returns once the writes have been issued — polling is the
+/// caller's responsibility because the spin needs to integrate
+/// with `responsive_spin_until` / `sleep_pump`.
+///
+/// # Safety
+/// `regs` must map BAR5 of an AMD GPU; the caller must hold
+/// exclusive ownership of the register window for the duration
+/// of the sequence (the `MM_INDEX` latch is shared with every
+/// other indexed access).
+pub unsafe fn execute_modeset(regs: &MmioRegion, seq: &[DcnWrite]) {
+    const MM_INDEX: u64 = 0x0000;
+    const MM_DATA: u64 = 0x0004;
+    for w in seq {
+        // SAFETY: caller-asserted ownership of BAR5; MM_INDEX /
+        // MM_DATA are the standard indexed-access pair documented
+        // in the AMD GPU register reference.
+        unsafe {
+            regs.write32(MM_INDEX, w.addr);
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: same.
+        unsafe {
+            regs.write32(MM_DATA, w.value);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
