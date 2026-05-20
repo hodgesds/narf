@@ -3788,3 +3788,342 @@ fn smoke_gpio_ddc_bit_bang_sequences_start_address_stop() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_gpio_ddc_bit_bang_sequences_start_address_stop);
+
+
+// ── Spec-aligned link-training smokes ───────────────────────────────
+//
+// These exercise the `train_clock_recovery`, `train_channel_equalization`,
+// and `train_link` helpers introduced for task #45. They use a shared
+// MockAuxChannel that lets each test stage how many CR/EQ polls it
+// takes for the (rate, lanes) under test to converge.
+
+fn smoke_dp_link_training_clock_recovery_converges() -> TestResult {
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
+    use crate::dp_link_training::{train_clock_recovery, LinkRate};
+
+    // Sink stages: CR_DONE after the second poll. Sink also asks
+    // for vswing=1, pe=0 on lanes 0/1 via ADJUST_REQUEST.
+    struct MockAux {
+        cr_polls: u32,
+        last_swing: u8,
+    }
+    impl AuxChannel for MockAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            match req.cmd {
+                AuxCommand::NativeWrite => {
+                    // Capture the swing the source wrote for lane 0.
+                    if req.address == 0x0_0103 && !req.data.is_empty() {
+                        self.last_swing = req.data[0] & 0x3;
+                    }
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
+                }
+                AuxCommand::NativeRead => {
+                    let v = match req.address {
+                        0x0_0202 => {
+                            self.cr_polls += 1;
+                            if self.cr_polls < 2 {
+                                0x00 // CR not done yet
+                            } else {
+                                0x11 // CR_DONE on lanes 0 and 1
+                            }
+                        }
+                        0x0_0203 => 0x00,
+                        // ADJUST_REQUEST_LANE0_1: ask for vswing=1, pe=0
+                        // on both lanes — byte = 0x11.
+                        0x0_0206 => 0x11,
+                        0x0_0207 => 0x00,
+                        _ => 0,
+                    };
+                    reply_buf[0] = 0;
+                    reply_buf[1] = v;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..2],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = MockAux {
+        cr_polls: 0,
+        last_swing: 0,
+    };
+    let vswing_pe = match train_clock_recovery(&mut aux, LinkRate::Hbr2, 2, |_| {}) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("CR phase did not converge"),
+    };
+    // After CR succeeded, the converged drive levels must reflect
+    // what the sink asked for via ADJUST_REQUEST on the first
+    // unsuccessful poll: vswing=1, pe=0 on lanes 0 and 1.
+    if vswing_pe.lanes[0].swing != 1 || vswing_pe.lanes[0].pre_emph != 0 {
+        return TestResult::Fail("lane0 vswing/pe not honored from ADJUST_REQUEST");
+    }
+    if vswing_pe.lanes[1].swing != 1 || vswing_pe.lanes[1].pre_emph != 0 {
+        return TestResult::Fail("lane1 vswing/pe not honored from ADJUST_REQUEST");
+    }
+    // And the last write to TRAINING_LANE0_SET must have carried
+    // the sink-requested swing, not whatever level-0 default.
+    if aux.last_swing != 1 {
+        return TestResult::Fail("source did not program sink-requested swing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_dp_link_training_clock_recovery_converges
+);
+
+fn smoke_dp_link_training_cr_exhaustion_returns_error() -> TestResult {
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
+    use crate::dp_link_training::{train_clock_recovery, LinkError, LinkRate};
+
+    // Sink never reports CR_DONE — every poll returns 0x00. The
+    // training loop must exhaust its 5 attempts and surface
+    // LinkError::CrFailed.
+    struct MockAux;
+    impl AuxChannel for MockAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            match req.cmd {
+                AuxCommand::NativeWrite => {
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
+                }
+                AuxCommand::NativeRead => {
+                    // ADJUST_REQUEST asks for MAX swing on every lane
+                    // → after 2 saturated retries the loop should fail.
+                    let v = match req.address {
+                        0x0_0206 => 0x33, // lane0/1 both swing=3 pe=0
+                        0x0_0207 => 0x33,
+                        _ => 0,
+                    };
+                    reply_buf[0] = 0;
+                    reply_buf[1] = v;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..2],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = MockAux;
+    match train_clock_recovery(&mut aux, LinkRate::Hbr3, 4, |_| {}) {
+        Err(LinkError::CrFailed(_)) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("CR exhaustion returned wrong LinkError variant")
+        }
+        Ok(_) => TestResult::Fail("CR converged when sink never reported CR_DONE"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_dp_link_training_cr_exhaustion_returns_error
+);
+
+fn smoke_dp_link_training_channel_eq_symbol_lock() -> TestResult {
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
+    use crate::dp_link_training::{train_channel_equalization, LinkRate, VSwingPe};
+
+    // Sink stages: CR still locked, EQ symbol-locks + interlane
+    // align on the second poll.
+    struct MockAux {
+        eq_polls: u32,
+        last_pattern: u8,
+    }
+    impl AuxChannel for MockAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            match req.cmd {
+                AuxCommand::NativeWrite => {
+                    if req.address == 0x0_0102 && !req.data.is_empty() {
+                        self.last_pattern = req.data[0];
+                    }
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
+                }
+                AuxCommand::NativeRead => {
+                    let v = match req.address {
+                        0x0_0202 => {
+                            self.eq_polls += 1;
+                            if self.eq_polls < 2 {
+                                0x11 // CR still ok but EQ not done
+                            } else {
+                                0x77 // CR + EQ + SYMBOL_LOCKED, both lanes
+                            }
+                        }
+                        0x0_0203 => 0x00,
+                        0x0_0204 => {
+                            if self.eq_polls >= 2 {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        0x0_0206 => 0x00, // no adjust requested
+                        0x0_0207 => 0x00,
+                        _ => 0,
+                    };
+                    reply_buf[0] = 0;
+                    reply_buf[1] = v;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..2],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = MockAux {
+        eq_polls: 0,
+        last_pattern: 0xFF,
+    };
+    let start = VSwingPe::default();
+    match train_channel_equalization(&mut aux, LinkRate::Hbr2, 2, start, |_| {}) {
+        Ok(_) => {}
+        Err(_) => return TestResult::Fail("EQ phase did not converge"),
+    }
+    // After success the source must have written TRAINING_PATTERN_SET
+    // = 0 to disable the pattern and enter normal operation.
+    if aux.last_pattern != 0 {
+        return TestResult::Fail("source did not disable training pattern after EQ success");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_dp_link_training_channel_eq_symbol_lock
+);
+
+fn smoke_dp_link_training_train_link_walks_fallback() -> TestResult {
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
+    use crate::dp_link_training::{train_link, LinkRate};
+
+    // Sink stages: every rate above HBR fails CR; HBR succeeds.
+    // The full train_link driver should walk HBR3 → HBR2 → HBR
+    // and return Trained at HBR / 4 lanes.
+    struct MockAux {
+        current_bw: u8,
+        cr_polls: u32,
+        eq_polls: u32,
+    }
+    impl AuxChannel for MockAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            match req.cmd {
+                AuxCommand::NativeWrite => {
+                    if req.address == 0x0_0100 && !req.data.is_empty() {
+                        self.current_bw = req.data[0];
+                        self.cr_polls = 0;
+                        self.eq_polls = 0;
+                    }
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
+                }
+                AuxCommand::NativeRead => {
+                    let ok = self.current_bw == LinkRate::Hbr as u8;
+                    let v = match req.address {
+                        0x0_0202 => {
+                            self.cr_polls += 1;
+                            if ok {
+                                if self.cr_polls < 2 {
+                                    0x00
+                                } else if self.eq_polls == 0 {
+                                    // CR done, all 4 lanes
+                                    0x11
+                                } else {
+                                    0x77
+                                }
+                            } else {
+                                0x00
+                            }
+                        }
+                        0x0_0203 => {
+                            if ok {
+                                if self.cr_polls < 2 {
+                                    0x00
+                                } else if self.eq_polls == 0 {
+                                    0x11
+                                } else {
+                                    0x77
+                                }
+                            } else {
+                                0x00
+                            }
+                        }
+                        0x0_0204 => {
+                            self.eq_polls += 1;
+                            if ok && self.eq_polls >= 2 {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        // Force MAX swing requests so failing rates
+                        // exhaust quickly via the "MAX twice" rule.
+                        0x0_0206 => 0x33,
+                        0x0_0207 => 0x33,
+                        _ => 0,
+                    };
+                    reply_buf[0] = 0;
+                    reply_buf[1] = v;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..2],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = MockAux {
+        current_bw: 0,
+        cr_polls: 0,
+        eq_polls: 0,
+    };
+    let trained = match train_link(&mut aux, LinkRate::Hbr3, 4, |_| {}) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("train_link surfaced LinkError"),
+    };
+    if trained.rate != LinkRate::Hbr {
+        return TestResult::Fail("fallback did not stop at HBR");
+    }
+    if trained.lanes != 4 {
+        return TestResult::Fail("lane count should not have been halved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_dp_link_training_train_link_walks_fallback
+);
