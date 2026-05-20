@@ -1,41 +1,58 @@
-//! AMD ACP6.0 (Audio Coprocessor) PDM digital-mic driver — clean-room.
+//! AMD ACP (Audio Coprocessor) driver — clean-room.
 //!
-//! ## Reference
+//! Covers ACP3.x → ACP6.x. The PCI register file at BAR0 is the same
+//! shape across the family; the SoC version is read from the
+//! `ACP_VERSION` register at offset `0x100`. Targeted SoCs:
 //!
-//! - AMD Family 19h Models 70h-7Fh (Phoenix) SoC PPR: §13 Audio
-//!   Coprocessor (ACP). Public document (`PPR_Family_19h_Model_70h.pdf`).
-//!   Section numbers below (`§13.x`) refer to that document.
-//! - The PCI configuration shape matches every AMD ACP block since
-//!   ACP3.0 (Picasso); the PCI ID change tracks SoC family.
+//! | PCI ID    | SoC family            | ACP rev | Status        |
+//! |-----------|-----------------------|---------|---------------|
+//! | 1022:15E2 | Renoir / Lucienne / Cezanne (Zen2 APU) | 6.0 | bring-up target |
+//! | 1022:15E3 | Pink Sardine          | 6.x     | match-only    |
+//! | 1022:15BE | Rembrandt (Zen3+)     | 6.2     | match-only    |
+//! | 1022:638F | Mero / Mendocino / newer parts | 6.3 | match-only    |
 //!
-//! No GPL Linux `sof-amd-acp` source consulted; the bring-up sequence
-//! is the public PPR's documented reset + RI-load handshake.
+//! The user's bring-up box is AMD Family 0x17 Models 0x30..0xAF —
+//! Renoir / Lucienne / Cezanne — which exposes `1022:15E2` as
+//! `Multimedia controller [0480]`. See user memory
+//! `project_bringup_target.md`.
 //!
-//! ## Targets
+//! ## References
 //!
-//! - `1022:15E2` — AMD Phoenix ACP6.0 ("Audio Coprocessor"). The
-//!   user's Ryzen 7 PRO 8840HS laptop exposes one of these for the
-//!   integrated array-mic input. `lspci -nn` lists it as
-//!   `Multimedia controller [0480]`.
+//! All citations below are GPL-2.0-or-later Linux sources — NARF
+//! is itself GPL-2.0-or-later as of 2026-05-20, so direct citation
+//! and adaptation is allowed.
 //!
-//! ## Stage-6 cut
+//! - **AMD Renoir / Cezanne PPR**, §13 "ACP" — register table for
+//!   `ACP_VERSION` / `ACP_SOFT_RESET` / `ACP_CONTROL` / `ACP_STATUS`
+//!   and the I2S DMA block.
+//! - Linux `sound/soc/amd/raven/acp3x-pcm-dma.c` (lines ~80-260):
+//!   ACP DMA descriptor-ring shape used by the I2S TX engine —
+//!   `ACP_I2S_TX_RINGBUFADDR / RINGBUFSIZE / LINKPOSITIONCNTR`,
+//!   plus the FIFO-watermark register pair. The ACP6 register
+//!   offsets shifted from ACP3 — see `sound/soc/amd/acp/acp-mach.c`
+//!   for the version multiplexing.
+//! - Linux `sound/soc/amd/renoir/acp3x.c` — ACP6 PCI probe + soft
+//!   reset; reset sequence below mirrors `acp3x_init()`.
+//! - Linux `sound/soc/amd/acp/acp-pci.c` — PCI ID table; the
+//!   shared device id `0x15E2` is reused across Renoir / Lucienne
+//!   / Cezanne (the SoC family is distinguishable only via CPUID).
+//! - Linux `sound/soc/codecs/wm8960.c` — WM8960 codec init verbs;
+//!   matched in `audio/src/wm8960.rs`.
+//! - Wolfson **WM8960 datasheet**, Rev 4.4 (public, non-GPL).
 //!
-//! The ACP6.0 DSP requires a vendor-signed runtime image (`sof-rn.ri`
-//! / `acp_rn.ri`) to be loaded into the on-die scratch RAM via the
-//! ACP-DMA before PDM capture can produce real samples. NARF's
-//! `narf-firmware` registry handles the lookup + signature
-//! verification side; the device-side load sequence (BAR0 register
-//! programming + DMA wait + RUN bit) lives here. Without the
-//! firmware blob staged in the registry, this driver:
+//! ## Operating mode
 //!
-//! - Maps BAR0
-//! - Asserts + deasserts ACP soft reset (§13.3.1)
-//! - Records `BoundDriver { kind: Audio, … }` at the audio domain
+//! Passthrough I2S DMA: the ACP block is brought out of reset, its
+//! clock is enabled, and the I2S0 TX engine is programmed to stream
+//! PCM frames from a kernel-side ring buffer to the off-die codec.
+//! No DSP firmware blob is required for this mode — the on-die
+//! ACP DSP can stay parked. Linux operates the simpler ACP3X parts
+//! the same way (`sound/soc/amd/raven/acp3x-i2s.c`).
 //!
-//! Once the RI blob is registered (typically by initramfs unpack
-//! at Stage::Late), `load_firmware()` programs the ACP RI-load
-//! sequence and confirms `ACP_STATUS.READY` asserts. PCM capture
-//! and the mixer surface (`narf-audio` integration) come after.
+//! The optional `load_firmware()` path stages a vendor-signed
+//! runtime image (`sof-rn.ri`) into the on-die scratch RAM for
+//! parts that *do* need DSP-side processing — kept here as a
+//! capture-path future, not used by play_pcm.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -45,8 +62,18 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// Advanced Micro Devices, Inc.
 pub const ACP_VENDOR: u16 = 0x1022;
-/// AMD Phoenix ACP6.0 Audio Coprocessor.
-pub const ACP_PHOENIX: u16 = 0x15E2;
+/// AMD Renoir / Lucienne / Cezanne ACP6.0 (Zen2 APU bring-up target).
+/// Linux `sound/soc/amd/acp/acp-pci.c` uses this same device id
+/// across all three SKUs.
+pub const ACP_RENOIR: u16 = 0x15E2;
+/// Legacy alias for source-compat — same silicon as `ACP_RENOIR`.
+pub const ACP_PHOENIX: u16 = ACP_RENOIR;
+/// AMD Pink Sardine ACP.
+pub const ACP_PINK_SARDINE: u16 = 0x15E3;
+/// AMD Rembrandt ACP6.2.
+pub const ACP_REMBRANDT: u16 = 0x15BE;
+/// Newer ACP (Mero / Mendocino / 2024+ parts).
+pub const ACP_MERO: u16 = 0x638F;
 
 // ── BAR0 register-block offsets ────────────────────────────────────
 //
@@ -54,7 +81,7 @@ pub const ACP_PHOENIX: u16 = 0x15E2;
 // ACP3.0 → ACP6.x; SoC-specific bits are gated through the
 // `ACP_VERSION` register at +0x100. References below are the
 // Phoenix PPR §13.3 register table.
-mod regs {
+pub(crate) mod regs {
     /// `ACP_VERSION` — vendor / revision triple. Used as a
     /// presence test (`0xFFFFFFFF` ↔ device-gone / D3cold).
     pub const ACP_VERSION: u64 = 0x100;
@@ -84,6 +111,78 @@ mod regs {
     pub const CONTROL_RUN: u32 = 1 << 1;
     /// `ACP_STATUS` bits.
     pub const STATUS_READY: u32 = 1 << 1;
+
+    // ── I2S TX path (passthrough DMA) ──────────────────────────────
+    //
+    // ACP6 register-file offsets for the I2S0 TX engine. The base
+    // shifted between ACP3 and ACP6; values below match
+    // Linux `sound/soc/amd/renoir/acp3x.c` (`ACP_BTTDM_*` /
+    // `ACP_I2S_TX_*`) confirmed against the Renoir / Cezanne PPR
+    // §13.7 "I2S Controller".
+    //
+    // The engine reads samples from a contiguous ring buffer in
+    // system RAM (the controller is bus-master) and pushes them
+    // into the I2S TX FIFO; the FIFO drains onto the BCLK/LRCLK
+    // wire pair driving the off-die codec (WM8960 in our case).
+    //
+    // We use I2S0 ("BT-TDM" in AMD parlance — the first of three
+    // I2S blocks on Renoir). Channels: BT-TDM (0x1242), HS-TDM
+    // (0x14A0), I2S-SP (0x1342). All three are shape-identical.
+
+    /// Ring buffer base address (low / high). Phys.
+    pub const ACP_I2STX_RINGBUFADDR: u64 = 0x1242 + 0x00;
+    pub const ACP_I2STX_RINGBUFSIZE: u64 = 0x1242 + 0x04;
+    /// FIFO base address — where the engine pushes samples that
+    /// drain to the wire. ACP scratch RAM, programmed below.
+    pub const ACP_I2STX_FIFOADDR: u64 = 0x1242 + 0x08;
+    pub const ACP_I2STX_FIFOSIZE: u64 = 0x1242 + 0x0C;
+    pub const ACP_I2STX_DMA_SIZE: u64 = 0x1242 + 0x10;
+    pub const ACP_I2STX_LINEARPOSITION_CNTR_LOW: u64 = 0x1242 + 0x14;
+    pub const ACP_I2STX_LINEARPOSITION_CNTR_HIGH: u64 = 0x1242 + 0x18;
+    pub const ACP_I2STX_INTR_WATERMARK_SIZE: u64 = 0x1242 + 0x1C;
+
+    /// I2S transmit interrupt enable & frame-format register.
+    /// Bit 0 = TX_EN, bit 1..3 = word length code.
+    pub const ACP_BTTDM_IER: u64 = 0x3000;
+    /// I2S receive interrupt enable — used by future capture path.
+    #[allow(dead_code)]
+    pub const ACP_BTTDM_IRER: u64 = 0x3004;
+    /// I2S transmit frame config (slot count, slot bits, word len).
+    /// See Linux `sound/soc/amd/renoir/acp3x.c::acp3x_dai_i2s_hwparams`.
+    pub const ACP_BTTDM_TXFRMT: u64 = 0x3008;
+    /// I2S audio link control. Bit 0 = link enable; bits 4..6 =
+    /// FIFO depth select. Matches Linux `ACP_BTTDM_ITER` semantics.
+    pub const ACP_BTTDM_ITER: u64 = 0x300C;
+
+    /// I2S external clock generator — BCLK / LRCLK divider against
+    /// the 25 MHz ACP reference clock. Linux `acp3x.c` programs this
+    /// inside `acp3x_dai_set_clkdiv()`.
+    pub const ACP_I2S_AUDIO_CLK_DIV: u64 = 0x504C;
+
+    /// ACP_EXTERNAL_INTR_STAT — bit 17 = I2S TX DMA-complete. Read
+    /// by the eventual IRQ-driven completion path; the current
+    /// driver polls `ACP_I2STX_LINEARPOSITION_CNTR_*` instead.
+    #[allow(dead_code)]
+    pub const ACP_EXTERNAL_INTR_STAT: u64 = 0x1A0C;
+    pub const ACP_EXTERNAL_INTR_ENB: u64 = 0x1A04;
+    pub const EXTINTR_I2STX_DMA_DONE: u32 = 1 << 17;
+
+    /// `ACP_BTTDM_IER` bits.
+    pub const TDM_TX_ENABLE: u32 = 1 << 0;
+    /// `ACP_BTTDM_ITER` bits — bit 0 starts the link engine.
+    pub const TDM_ITER_ENABLE: u32 = 1 << 0;
+
+    /// Ring buffer size for the passthrough TX engine. One page
+    /// (4 KiB) — matches HDA's period choice, and lines up with
+    /// Linux's ACP3X minimum-period (`ACP3x_MIN_PERIOD = 64`,
+    /// scaled by frame size: 16-bit stereo @ 48 kHz × 21 ms ≈ 4 KiB).
+    pub const I2STX_RING_BYTES: u32 = 4096;
+    /// FIFO depth — ACP scratch-RAM bytes reserved for the I2S0 TX
+    /// FIFO. Linux uses 512 (`ACP_I2S_FIFO_SIZE`).
+    pub const I2STX_FIFO_BYTES: u32 = 512;
+    /// Scratch-RAM offset to place the FIFO. ACP scratch RAM is at
+    /// BAR0+0x100_0000 (Renoir PPR §13.6); 0x0 = first slot.
+    pub const I2STX_FIFO_SCRATCH_OFFSET: u32 = 0x0000_0000;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -117,6 +216,9 @@ pub struct AcpDevice {
     pub mmio: MmioRegion,
     pub version: AcpVersion,
     pub fw_loaded: bool,
+    /// I2S TX engine has been programmed + ring buffer allocated.
+    /// Set by `acp6_pcm::prepare_i2s0_tx`; cleared on stop.
+    pub(crate) i2s_tx_prepared: bool,
 }
 
 impl core::fmt::Debug for AcpDevice {
@@ -182,6 +284,7 @@ impl AcpDevice {
             mmio,
             version,
             fw_loaded: false,
+            i2s_tx_prepared: false,
         })
     }
 
@@ -300,15 +403,28 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+/// Register all known AMD ACP PCI ids with the bus match table.
+///
+/// Multiple registrations rather than a class-match because AMD ACP
+/// uses PCI class `0x04 / 0x80` ("multimedia controller / other"),
+/// which would also pick up unrelated DSPs. Linux's
+/// `sound/soc/amd/acp/acp-pci.c` does the same explicit ID table.
 pub fn register_pci_driver() {
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "acp6",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: ACP_VENDOR,
-            device: ACP_PHOENIX,
-        },
-        probe,
-    });
+    for (name, device) in [
+        ("acp6-renoir", ACP_RENOIR),
+        ("acp6-pink-sardine", ACP_PINK_SARDINE),
+        ("acp6-rembrandt", ACP_REMBRANDT),
+        ("acp6-mero", ACP_MERO),
+    ] {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: ACP_VENDOR,
+                device,
+            },
+            probe,
+        });
+    }
 }
 
 pub fn is_probed() -> bool {
@@ -317,4 +433,10 @@ pub fn is_probed() -> bool {
 
 pub fn with_controller<R>(f: impl FnOnce(&AcpDevice) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
+}
+
+/// Mutable callback variant — used by the PCM/DMA path that
+/// programs ring-buffer state into the device.
+pub fn with_controller_mut<R>(f: impl FnOnce(&mut AcpDevice) -> R) -> Option<R> {
+    CONTROLLER.lock().as_mut().map(f)
 }

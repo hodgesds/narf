@@ -1,12 +1,18 @@
-//! Wolfson / Cirrus Logic WM8960 audio codec — clean-room.
+//! Wolfson / Cirrus Logic WM8960 audio codec — I2C register-write
+//! sequence builder.
 //!
-//! ## Sources (public only)
+//! ## Sources
 //!
 //! - **Cirrus Logic, "WM8960 Stereo Codec with 1W Stereo Class D
 //!   Speaker Drivers" datasheet**, Rev 4.4, 2010. Public.
 //!   <https://statics.cirrus.com/pubs/proDatasheet/WM8960_Rev_4.4.pdf>
+//! - Linux `sound/soc/codecs/wm8960.c` (GPL-2.0; freely citable
+//!   since NARF is GPL-2.0-or-later as of 2026-05-20). The init
+//!   sequence below mirrors the order in `wm8960_set_pll()` and
+//!   the regmap defaults table.
 //!
-//! No GPL / Linux source consulted.
+//! The WM8960 is the codec pairing AMD documents for ACP6 I2S
+//! reference platforms (Renoir / Cezanne dev boards).
 //!
 //! ## What this is
 //!

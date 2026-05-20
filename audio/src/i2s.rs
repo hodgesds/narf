@@ -1,12 +1,18 @@
-//! I2S (Inter-IC Sound) transport — clean-room frame-format codec.
+//! I2S (Inter-IC Sound) transport — frame-format descriptor types.
 //!
-//! ## Sources (public only)
+//! ## Sources
 //!
 //! - **Philips Semiconductors, "I2S bus specification"**, June 5,
 //!   1996. The original Philips public bus specification.
 //!   <https://web.archive.org/web/20060702004954/http://www.semiconductors.philips.com/acrobat_download/various/I2SBUS.pdf>
+//! - **Wolfson WM8960 datasheet** — codec-side I2S timing variants;
+//!   the `FrameFormat` variants map to the WM8960 R7 format field.
 //!
-//! No GPL / Linux source consulted.
+//! NARF is GPL-2.0-or-later as of 2026-05-20, so Linux's
+//! `sound/soc/codecs/wm8960.c` + `sound/soc/amd/raven/acp3x-i2s.c`
+//! are freely citable; the host-side ACP I2S programming lives in
+//! `crate::acp6_pcm` and follows Linux's encoding for the
+//! frame-format field.
 //!
 //! ## What this is
 //!
