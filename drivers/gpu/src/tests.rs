@@ -3018,3 +3018,121 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma_packet_nop_and_trap
 );
+
+// ── amdgpu/pm4 (extended packet vocabulary) ────────────────────────
+//
+// ACQUIRE_MEM (cache flush), SET_CONTEXT_REG / SET_CONFIG_REG
+// (state push), CONTEXT_CONTROL (load/shadow control).
+
+fn smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout() -> TestResult {
+    use crate::amdgpu_pm4::{Pm4Builder, ACQUIRE_FULL_SHADER_INVALIDATE};
+    let mut buf = [0u32; 7];
+    {
+        let mut b = Pm4Builder::new(&mut buf);
+        // Acquire the entire memory range; full shader invalidate.
+        if b.acquire_mem(ACQUIRE_FULL_SHADER_INVALIDATE, 0, !0u64, 4).is_err() {
+            return TestResult::Fail("acquire_mem emit failed");
+        }
+    }
+    // Header: TYPE3 (=3<<30), count-1 = 5, opcode 0x58.
+    if (buf[0] >> 30) != 3 {
+        return TestResult::Fail("acquire_mem header must be TYPE3");
+    }
+    if ((buf[0] >> 16) & 0x3FFF) != 5 {
+        return TestResult::Fail("acquire_mem count_minus_one must be 5 (6 data dwords)");
+    }
+    if ((buf[0] >> 8) & 0xFF) != 0x58 {
+        return TestResult::Fail("acquire_mem opcode must be 0x58");
+    }
+    if buf[1] != ACQUIRE_FULL_SHADER_INVALIDATE {
+        return TestResult::Fail("coher_cntl dword wrong");
+    }
+    // coher_size = !0u64
+    if buf[2] != 0xFFFF_FFFF || buf[3] != 0xFFFF_FFFF {
+        return TestResult::Fail("coher_size dwords wrong");
+    }
+    // coher_base = 0
+    if buf[4] != 0 || buf[5] != 0 {
+        return TestResult::Fail("coher_base dwords wrong");
+    }
+    if buf[6] != 4 {
+        return TestResult::Fail("poll_interval wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/pm4",
+    smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout
+);
+
+fn smoke_amdgpu_pm4_set_context_reg_layout() -> TestResult {
+    use crate::amdgpu_pm4::Pm4Builder;
+    let mut buf = [0u32; 6];
+    let vals = [0x1111_2222u32, 0x3333_4444, 0x5555_6666];
+    {
+        let mut b = Pm4Builder::new(&mut buf);
+        if b.set_context_reg(0x0123, &vals).is_err() {
+            return TestResult::Fail("set_context_reg emit failed");
+        }
+    }
+    // Header: TYPE3, count-1 = (1+3)-1 = 3, opcode 0x69.
+    if ((buf[0] >> 16) & 0x3FFF) != 3 {
+        return TestResult::Fail("set_context_reg count_minus_one wrong");
+    }
+    if ((buf[0] >> 8) & 0xFF) != 0x69 {
+        return TestResult::Fail("set_context_reg opcode wrong");
+    }
+    // reg_offset
+    if buf[1] != 0x0123 {
+        return TestResult::Fail("set_context_reg reg_offset wrong");
+    }
+    if buf[2..5] != vals {
+        return TestResult::Fail("set_context_reg values not copied in order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/pm4",
+    smoke_amdgpu_pm4_set_context_reg_layout
+);
+
+fn smoke_amdgpu_pm4_context_control_layout() -> TestResult {
+    use crate::amdgpu_pm4::Pm4Builder;
+    let mut buf = [0u32; 3];
+    {
+        let mut b = Pm4Builder::new(&mut buf);
+        if b.context_control(0x8000_0000, 0x8000_0000).is_err() {
+            return TestResult::Fail("context_control emit failed");
+        }
+    }
+    // Header: TYPE3, count-1 = 1, opcode 0x28.
+    if ((buf[0] >> 16) & 0x3FFF) != 1 {
+        return TestResult::Fail("context_control count_minus_one wrong");
+    }
+    if ((buf[0] >> 8) & 0xFF) != 0x28 {
+        return TestResult::Fail("context_control opcode wrong");
+    }
+    if buf[1] != 0x8000_0000 || buf[2] != 0x8000_0000 {
+        return TestResult::Fail("context_control data dwords wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/pm4",
+    smoke_amdgpu_pm4_context_control_layout
+);
+
+fn smoke_amdgpu_pm4_set_context_reg_rejects_empty_values() -> TestResult {
+    use crate::amdgpu_pm4::{Pm4Builder, Pm4Error};
+    let mut buf = [0u32; 4];
+    let mut b = Pm4Builder::new(&mut buf);
+    // Zero values can't be encoded — count_minus_one would underflow.
+    match b.set_context_reg(0x0100, &[]) {
+        Err(Pm4Error::BadCount) => TestResult::Pass,
+        _ => TestResult::Fail("empty values must be rejected"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/pm4",
+    smoke_amdgpu_pm4_set_context_reg_rejects_empty_values
+);
