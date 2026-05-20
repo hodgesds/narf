@@ -200,6 +200,28 @@ pub fn set_clock_range<M: SmuMmio>(
     Ok(())
 }
 
+// ── Thermal ────────────────────────────────────────────────────────
+
+/// `PPSMC_MSG_GetCurrentTemperature` — returns the GPU package
+/// temperature in tenths-of-a-degree Celsius (d°C) via ARG. The
+/// concrete ID below is the value Linux uses on Renoir; Phoenix
+/// renumbers a few SMU messages but this one is stable.
+pub const PPSMC_MSG_GET_CURRENT_TEMPERATURE: u32 = 0x36;
+
+/// Read the GPU package temperature in milli-degrees Celsius.
+/// The SMU reports tenths (d°C); we scale by 100 to land in m°C
+/// so the value composes with k10temp's reading without unit drift.
+pub fn read_gpu_temperature_millicelsius<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+) -> Result<i32, SmuError> {
+    let raw = send_message_get(mmio, mp1_base, PPSMC_MSG_GET_CURRENT_TEMPERATURE, 0)?;
+    // d°C → m°C: multiply by 100. Cast to i32 — the SMU never
+    // returns negative temps in operation but the OS surface
+    // wants a signed type for consistency with k10temp.
+    Ok((raw as i32) * 100)
+}
+
 /// Read the highest DPM-level frequency for `clk_id` (in MHz).
 pub fn get_max_dpm_freq<M: SmuMmio>(
     mmio: &mut M,

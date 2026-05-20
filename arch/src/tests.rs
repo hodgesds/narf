@@ -2030,3 +2030,74 @@ fn smoke_amd_pstate_boot_init_outcome_shape() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch", smoke_amd_pstate_boot_init_outcome_shape);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_k10temp_tctl_offset_per_family_model() -> TestResult {
+    use crate::x86_64::k10temp::{tctl_offset_for, TCTL_OFFSET_49C, TCTL_OFFSET_LAPTOP};
+    // Renoir (0x17, 0x60 — Lucienne) → laptop offset (0).
+    if tctl_offset_for(0x17, 0x60) != TCTL_OFFSET_LAPTOP {
+        return TestResult::Fail("Renoir/Lucienne must have laptop offset");
+    }
+    // Phoenix HawkPoint1 (0x19, 0x74) → laptop offset.
+    if tctl_offset_for(0x19, 0x74) != TCTL_OFFSET_LAPTOP {
+        return TestResult::Fail("Phoenix must have laptop offset");
+    }
+    // EPYC Naples (0x17, 0x00) → 49 °C.
+    if tctl_offset_for(0x17, 0x00) != TCTL_OFFSET_49C {
+        return TestResult::Fail("Naples Model 0x00 must have 49 C offset");
+    }
+    // First-gen Ryzen 1700X/1800X (Model 0x01) → 20 °C; the more
+    // specific arm must win against the 0x00..=0x0F broad arm.
+    use crate::x86_64::k10temp::TCTL_OFFSET_20C;
+    if tctl_offset_for(0x17, 0x01) != TCTL_OFFSET_20C {
+        return TestResult::Fail("first-gen Ryzen Model 0x01 must have 20 C offset");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_k10temp_tctl_offset_per_family_model);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_k10temp_decode_tdie_from_smn_raw() -> TestResult {
+    use crate::x86_64::k10temp::{decode_tdie_millicelsius, K10TempError};
+    // raw = 800 (Tctl_raw = 800 * 0.125 = 100°C) packed in bits[31:21]:
+    // 800 = 0x320; shifted left 21 → 0x6400_0000.
+    let raw_100c: u32 = 800u32 << 21;
+    let mc = decode_tdie_millicelsius(raw_100c, 0).expect("decode failed");
+    // 100 °C = 100_000 m°C. Allow a 1°C slop for shift rounding.
+    if !(99_000..=101_000).contains(&mc) {
+        return TestResult::Fail("100 °C raw must decode near 100_000 m°C");
+    }
+    // Per-part Tctl_offset of 20 °C should subtract 20_000 m°C.
+    let mc_offset = decode_tdie_millicelsius(raw_100c, 20).expect("decode failed");
+    if mc - mc_offset != 20_000 {
+        return TestResult::Fail("Tctl_offset application wrong");
+    }
+    // Bus-disconnected SMN returns 0xFFFFFFFF — error path.
+    match decode_tdie_millicelsius(0xFFFF_FFFF, 0) {
+        Err(K10TempError::NoSensor) => TestResult::Pass,
+        _ => TestResult::Fail("all-ones raw must be NoSensor"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_k10temp_decode_tdie_from_smn_raw);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_k10temp_read_tdie_drives_smn_index_write() -> TestResult {
+    use crate::x86_64::k10temp::{
+        read_tdie_millicelsius, MockSmn, SMN_ADDR_TEMP_REPORT,
+    };
+    // 70 °C → Tctl_raw = 560 → packed shift-21 = 0x4600_0000.
+    let raw_70c: u32 = 560u32 << 21;
+    let mut port = MockSmn::new(raw_70c);
+    let mc = read_tdie_millicelsius(&mut port, 0).expect("read failed");
+    if port.last_index != SMN_ADDR_TEMP_REPORT {
+        return TestResult::Fail("must write SMN_ADDR_TEMP_REPORT to INDEX");
+    }
+    if !(69_000..=71_000).contains(&mc) {
+        return TestResult::Fail("70 °C raw didn't decode near 70_000 m°C");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_k10temp_read_tdie_drives_smn_index_write);

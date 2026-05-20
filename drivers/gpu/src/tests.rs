@@ -4497,3 +4497,35 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_init_rejects_period_overflow
 );
+
+// ── amdgpu/smu (thermal) ───────────────────────────────────────────
+
+fn smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius() -> TestResult {
+    use crate::amdgpu_smu::{
+        read_gpu_temperature_millicelsius, MockSmu, MP1_C2PMSG_ARG_REL,
+        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    m.stage_read(resp, 1); // handshake idle
+    m.stage_read(resp, SMU_RESP_OK);
+    // SMU reports temperature in d°C — 612 = 61.2 °C.
+    m.stage_read(arg, 612);
+
+    let mc = match read_gpu_temperature_millicelsius(&mut m, mp1_base) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("temperature read errored on happy path"),
+    };
+    // d°C → m°C: 612 * 100 = 61_200.
+    if mc != 61_200 {
+        return TestResult::Fail("decode of d°C → m°C wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius
+);
