@@ -2584,3 +2584,76 @@ fn smoke_acpi_ac_adapter_decode_psr_online_offline() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("acpi/ac_adapter", smoke_acpi_ac_adapter_decode_psr_online_offline);
+
+// ── acpi/lid ───────────────────────────────────────────────────────
+
+fn smoke_acpi_lid_decode_closed_open_and_nonzero() -> TestResult {
+    use crate::lid::{decode_lid, LidState};
+    if decode_lid(0) != LidState::Closed {
+        return TestResult::Fail("_LID=0 must be Closed");
+    }
+    if decode_lid(1) != LidState::Open {
+        return TestResult::Fail("_LID=1 must be Open");
+    }
+    // Per spec, ANY nonzero value is "open" — not just 1.
+    if decode_lid(0xDEAD_BEEF) != LidState::Open {
+        return TestResult::Fail("any nonzero _LID must be Open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/lid", smoke_acpi_lid_decode_closed_open_and_nonzero);
+
+// ── acpi/buttons ───────────────────────────────────────────────────
+
+fn smoke_acpi_buttons_power_press_count_drain() -> TestResult {
+    use crate::buttons::{
+        drain_power_button_presses, record_power_button_press, __reset_for_test,
+    };
+    __reset_for_test();
+    record_power_button_press();
+    record_power_button_press();
+    record_power_button_press();
+    if drain_power_button_presses() != 3 {
+        return TestResult::Fail("expected 3 power presses after 3 records");
+    }
+    // Drain clears the counter.
+    if drain_power_button_presses() != 0 {
+        return TestResult::Fail("post-drain count must be 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/buttons", smoke_acpi_buttons_power_press_count_drain);
+
+fn smoke_acpi_buttons_sleep_and_power_independent() -> TestResult {
+    use crate::buttons::{
+        drain_power_button_presses, drain_sleep_button_presses, record_power_button_press,
+        record_sleep_button_press, __reset_for_test,
+    };
+    __reset_for_test();
+    record_power_button_press();
+    record_sleep_button_press();
+    record_sleep_button_press();
+    if drain_power_button_presses() != 1 {
+        return TestResult::Fail("power count must be 1");
+    }
+    if drain_sleep_button_presses() != 2 {
+        return TestResult::Fail("sleep count must be 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "acpi/buttons",
+    smoke_acpi_buttons_sleep_and_power_independent
+);
+
+fn smoke_acpi_buttons_pm1_sts_bit_positions() -> TestResult {
+    use crate::buttons::{PM1_STS_PWRBTN, PM1_STS_SLPBTN};
+    if PM1_STS_PWRBTN != 1 << 8 {
+        return TestResult::Fail("PM1_STS_PWRBTN must be bit 8");
+    }
+    if PM1_STS_SLPBTN != 1 << 9 {
+        return TestResult::Fail("PM1_STS_SLPBTN must be bit 9");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/buttons", smoke_acpi_buttons_pm1_sts_bit_positions);
