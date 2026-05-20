@@ -117,6 +117,114 @@ pub const PPSMC_MSG_POWER_DOWN_VCN: u32 = 0x19;
 /// driver reload so the next bring-up doesn't see stale state.
 pub const PPSMC_MSG_PREPARE_MP1_FOR_UNLOAD: u32 = 0x35;
 
+// ── DPM clock control messages ─────────────────────────────────────
+//
+// These messages take a packed argument:
+//   bits[31:16] = frequency in MHz (or DPM level for *_ByIndex)
+//   bits[15:0]  = clock id (PPCLK_*)
+//
+// Renoir / Phoenix share the high-level message ids below; the
+// concrete PPCLK_* enum values differ per chip and are kept in
+// the chip's PPSMC header. We expose a small set of canonical ids
+// the bring-up arc uses (GFXCLK / UCLK / DCEFCLK / SOCCLK / FCLK).
+
+/// `PPSMC_MSG_SetSoftMinByFreq` — lower bound on the DPM ladder for
+/// a clock. Argument packs (freq_mhz << 16) | clk_id.
+pub const PPSMC_MSG_SET_SOFT_MIN_BY_FREQ: u32 = 0x21;
+/// `PPSMC_MSG_SetSoftMaxByFreq` — upper bound for a clock.
+pub const PPSMC_MSG_SET_SOFT_MAX_BY_FREQ: u32 = 0x22;
+/// `PPSMC_MSG_SetHardMinByFreq` — hard lower bound (won't drop below).
+pub const PPSMC_MSG_SET_HARD_MIN_BY_FREQ: u32 = 0x23;
+/// `PPSMC_MSG_GetDpmFreqByIndex` — read the DPM-level → freq map
+/// for a clock. Argument packs (level << 16) | clk_id; result in ARG.
+pub const PPSMC_MSG_GET_DPM_FREQ_BY_INDEX: u32 = 0x24;
+/// `PPSMC_MSG_GetMaxDpmFreq` — highest DPM-level freq for a clock.
+pub const PPSMC_MSG_GET_MAX_DPM_FREQ: u32 = 0x25;
+/// `PPSMC_MSG_GetMinDpmFreq` — lowest DPM-level freq for a clock.
+pub const PPSMC_MSG_GET_MIN_DPM_FREQ: u32 = 0x26;
+
+// Canonical PPCLK_* clock ids — values match Renoir's
+// smu_v12_0_ppsmc.h. Phoenix renumbers some; callers that care
+// about the chip-specific id should look up via per-chip table.
+
+/// `PPCLK_GFXCLK` — GPU shader clock.
+pub const SMU_CLK_GFXCLK: u32 = 0;
+/// `PPCLK_VCLK` — VCN video-decode clock.
+pub const SMU_CLK_VCLK: u32 = 1;
+/// `PPCLK_DCLK` — VCN decode-only clock.
+pub const SMU_CLK_DCLK: u32 = 2;
+/// `PPCLK_ECLK` — VCN encode clock.
+pub const SMU_CLK_ECLK: u32 = 3;
+/// `PPCLK_SOCCLK` — fabric SoC clock.
+pub const SMU_CLK_SOCCLK: u32 = 4;
+/// `PPCLK_UCLK` — memory clock (DDR4 / LPDDR5).
+pub const SMU_CLK_UCLK: u32 = 5;
+/// `PPCLK_FCLK` — Infinity Fabric clock (Zen-side).
+pub const SMU_CLK_FCLK: u32 = 6;
+/// `PPCLK_DCEFCLK` — Display engine fabric clock (Vega+).
+pub const SMU_CLK_DCEFCLK: u32 = 7;
+
+/// Pack `(freq_mhz, clk_id)` into the argument format expected by
+/// the SET_*_BY_FREQ messages.
+pub fn pack_clk_arg(clk_id: u32, freq_mhz: u32) -> u32 {
+    (freq_mhz << 16) | (clk_id & 0xFFFF)
+}
+
+/// Pack `(dpm_level, clk_id)` for GET_DPM_FREQ_BY_INDEX.
+pub fn pack_dpm_arg(clk_id: u32, dpm_level: u32) -> u32 {
+    (dpm_level << 16) | (clk_id & 0xFFFF)
+}
+
+/// Convenience: program a clock's soft min/max in one shot.
+/// Internal SMU state retains the bounds across power-state
+/// transitions until the next set_clock_range call.
+pub fn set_clock_range<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    clk_id: u32,
+    min_mhz: u32,
+    max_mhz: u32,
+) -> Result<(), SmuError> {
+    send_message_void(
+        mmio,
+        mp1_base,
+        PPSMC_MSG_SET_SOFT_MIN_BY_FREQ,
+        pack_clk_arg(clk_id, min_mhz),
+    )?;
+    send_message_void(
+        mmio,
+        mp1_base,
+        PPSMC_MSG_SET_SOFT_MAX_BY_FREQ,
+        pack_clk_arg(clk_id, max_mhz),
+    )?;
+    Ok(())
+}
+
+/// Read the highest DPM-level frequency for `clk_id` (in MHz).
+pub fn get_max_dpm_freq<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    clk_id: u32,
+) -> Result<u32, SmuError> {
+    send_message_get(mmio, mp1_base, PPSMC_MSG_GET_MAX_DPM_FREQ, clk_id)
+}
+
+/// Read the DPM-level → frequency map: returns the frequency of
+/// DPM level `dpm_level` for `clk_id`.
+pub fn get_dpm_freq_by_index<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    clk_id: u32,
+    dpm_level: u32,
+) -> Result<u32, SmuError> {
+    send_message_get(
+        mmio,
+        mp1_base,
+        PPSMC_MSG_GET_DPM_FREQ_BY_INDEX,
+        pack_dpm_arg(clk_id, dpm_level),
+    )
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 /// SMU mailbox errors.

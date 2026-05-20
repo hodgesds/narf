@@ -3284,3 +3284,121 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/ih",
     smoke_amdgpu_ih_enable_strictly_after_disable
 );
+
+// ── amdgpu/smu (DPM clock control) ─────────────────────────────────
+//
+// Higher-level wrappers on top of the mailbox primitive that
+// pack the (clk_id, freq_mhz) arg format the SMU expects.
+
+fn smoke_amdgpu_smu_pack_clk_arg_layout() -> TestResult {
+    use crate::amdgpu_smu::{pack_clk_arg, pack_dpm_arg, SMU_CLK_GFXCLK, SMU_CLK_UCLK};
+    // Clock id in bits[15:0], freq in bits[31:16].
+    let a = pack_clk_arg(SMU_CLK_GFXCLK, 1900);
+    if (a & 0xFFFF) != SMU_CLK_GFXCLK || (a >> 16) != 1900 {
+        return TestResult::Fail("clk_arg layout wrong");
+    }
+    let b = pack_dpm_arg(SMU_CLK_UCLK, 3);
+    if (b & 0xFFFF) != SMU_CLK_UCLK || (b >> 16) != 3 {
+        return TestResult::Fail("dpm_arg layout wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_pack_clk_arg_layout
+);
+
+fn smoke_amdgpu_smu_set_clock_range_drives_two_messages() -> TestResult {
+    use crate::amdgpu_smu::{
+        pack_clk_arg, set_clock_range, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL,
+        MP1_C2PMSG_RESP_REL, PPSMC_MSG_SET_SOFT_MAX_BY_FREQ, PPSMC_MSG_SET_SOFT_MIN_BY_FREQ,
+        SMU_CLK_GFXCLK, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+    let msg = mp1_base + MP1_C2PMSG_MSG_REL;
+
+    let mut m = MockSmu::new();
+    // SET_SOFT_MIN: handshake, OK, arg readback (unused).
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0);
+    // SET_SOFT_MAX: handshake, OK, arg readback.
+    m.stage_read(resp, 1);
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 0);
+
+    if set_clock_range(&mut m, mp1_base, SMU_CLK_GFXCLK, 400, 1900).is_err() {
+        return TestResult::Fail("set_clock_range failed on happy path");
+    }
+
+    // Captured writes per message: clear-RESP, ARG, MSG → 3 writes.
+    // Two messages → 6 writes total.
+    if m.writes.len() != 6 {
+        return TestResult::Fail("expected 6 mailbox writes for two messages");
+    }
+    // Message-id writes should be SET_SOFT_MIN then SET_SOFT_MAX.
+    let mut msgs: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    for w in &m.writes {
+        if w.0 == msg {
+            msgs.push(w.1);
+        }
+    }
+    if msgs.len() != 2 {
+        return TestResult::Fail("expected 2 MSG-trigger writes");
+    }
+    if msgs[0] != PPSMC_MSG_SET_SOFT_MIN_BY_FREQ
+        || msgs[1] != PPSMC_MSG_SET_SOFT_MAX_BY_FREQ
+    {
+        return TestResult::Fail("MSG order should be SET_SOFT_MIN then SET_SOFT_MAX");
+    }
+    // ARG values: pack_clk_arg(GFXCLK, 400) then pack_clk_arg(GFXCLK, 1900).
+    let mut args: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    for w in &m.writes {
+        if w.0 == arg {
+            args.push(w.1);
+        }
+    }
+    if args.len() != 2 {
+        return TestResult::Fail("expected 2 ARG writes");
+    }
+    if args[0] != pack_clk_arg(SMU_CLK_GFXCLK, 400)
+        || args[1] != pack_clk_arg(SMU_CLK_GFXCLK, 1900)
+    {
+        return TestResult::Fail("ARG values wrong order/encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_set_clock_range_drives_two_messages
+);
+
+fn smoke_amdgpu_smu_get_max_dpm_freq_returns_arg() -> TestResult {
+    use crate::amdgpu_smu::{
+        get_max_dpm_freq, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
+        SMU_CLK_DCEFCLK, SMU_RESP_OK,
+    };
+    let mp1_base = 0x16000;
+    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    let mut m = MockSmu::new();
+    m.stage_read(resp, 1); // handshake
+    m.stage_read(resp, SMU_RESP_OK);
+    m.stage_read(arg, 685); // SMU reports DCEFCLK max = 685 MHz
+
+    match get_max_dpm_freq(&mut m, mp1_base, SMU_CLK_DCEFCLK) {
+        Ok(685) => TestResult::Pass,
+        Ok(other) => {
+            let _ = other;
+            TestResult::Fail("get_max_dpm_freq returned wrong value")
+        }
+        Err(_) => TestResult::Fail("get_max_dpm_freq errored on happy path"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_get_max_dpm_freq_returns_arg
+);
