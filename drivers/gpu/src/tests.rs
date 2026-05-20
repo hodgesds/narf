@@ -2463,3 +2463,141 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx9_ring_init_rptr_writeback_alignment
 );
+
+// ── amdgpu/gfx (pm4 → ring integration) ────────────────────────────
+//
+// Build a fence-publishing IB through `Pm4Builder`, push it to
+// a real `Ring`, then read back the ring DMA buffer to verify
+// the packets landed at the right wptr offsets with the right
+// dwords. The unit tests already cover Pm4Builder and Ring
+// individually; this one verifies they compose.
+
+fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
+    use crate::amdgpu_pm4::Pm4Builder;
+    use crate::amdgpu_ring::Ring;
+
+    let mut ring = match Ring::new(11) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("Ring::new failed"),
+    };
+
+    // Build a 5-dword WRITE_DATA fence-publish packet into a
+    // staging buffer. Fence target = 0x0000_3000_0001_0000, value 42.
+    let mut staging = [0u32; 5];
+    let bytes_written = {
+        let mut b = Pm4Builder::new(&mut staging);
+        if b.write_data(0x0000_3000_0001_0000, 42).is_err() {
+            return TestResult::Fail("write_data emit failed");
+        }
+        b.bytes_written()
+    };
+    if bytes_written != 5 * 4 {
+        return TestResult::Fail("write_data should emit exactly 5 dwords");
+    }
+
+    // Submit to the ring and verify wptr advanced.
+    // SAFETY: smoke owns the ring exclusively.
+    let new_wptr = match unsafe { ring.submit(&staging) } {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("ring rejected fence packet"),
+    };
+    if new_wptr != 5 {
+        return TestResult::Fail("wptr should advance by exactly 5 dwords");
+    }
+
+    // Read the ring's DMA backing back and compare to the staging
+    // dwords. Ring::submit writes byte-by-byte in-place; identical
+    // dwords should appear at the ring base.
+    let phys = ring.phys_addr();
+    for (i, &expected) in staging.iter().enumerate() {
+        // SAFETY: identity-mapped DMA-coherent page, ring is owned.
+        let got = unsafe { core::ptr::read_volatile((phys + (i * 4) as u64) as *const u32) };
+        if got != expected {
+            return TestResult::Fail("ring dword mismatch after submit");
+        }
+    }
+
+    // Header dword: TYPE3 (= 3 << 30) | (count-1=4 << 16) | (op=0x37 << 8).
+    let header = staging[0];
+    if (header >> 30) != 3 {
+        return TestResult::Fail("first dword must be PM4 TYPE3 header");
+    }
+    if ((header >> 16) & 0x3FFF) != (5 - 1) - 1 {
+        // count_minus_one = data_word_count - 1; data_word_count = 4 (= 5 dwords - header)
+        // so this should equal 3.
+        return TestResult::Fail("header count_minus_one field wrong");
+    }
+    if ((header >> 8) & 0xFF) != 0x37 {
+        return TestResult::Fail("header opcode must be WRITE_DATA (0x37)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx_pm4_write_data_lands_in_ring
+);
+
+fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
+    use crate::amdgpu_pm4::Pm4Builder;
+    use crate::amdgpu_ring::Ring;
+
+    let mut ring = match Ring::new(12) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("Ring::new failed"),
+    };
+
+    // Build a representative submission: NOP pad (1 word data), then
+    // an INDIRECT_BUFFER (4 dwords), then a WRITE_DATA fence (5 dwords).
+    // Total: 2 (nop) + 4 (ib) + 5 (write) = 11 dwords.
+    let mut staging = [0u32; 16];
+    let bytes_written = {
+        let mut b = Pm4Builder::new(&mut staging);
+        if b.nop(1).is_err() {
+            return TestResult::Fail("nop emit failed");
+        }
+        if b.indirect_buffer(0x1000_0000, 0x100, 0).is_err() {
+            return TestResult::Fail("indirect_buffer emit failed");
+        }
+        if b.write_data(0x2000_0000_0000_0000, 0x12345).is_err() {
+            return TestResult::Fail("write_data emit failed");
+        }
+        b.bytes_written()
+    };
+    if bytes_written != 11 * 4 {
+        return TestResult::Fail("composite IB should be exactly 11 dwords");
+    }
+
+    // Submit and verify wptr.
+    // SAFETY: smoke owns the ring.
+    let new_wptr = match unsafe { ring.submit(&staging[..11]) } {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("ring rejected composite IB"),
+    };
+    if new_wptr != 11 {
+        return TestResult::Fail("wptr should be 11");
+    }
+
+    // Read back. The three sub-packets should sit at offsets 0, 2, 6.
+    let phys = ring.phys_addr();
+    let read_dw = |i: usize| -> u32 {
+        // SAFETY: identity-mapped DMA backing, ring owned.
+        unsafe { core::ptr::read_volatile((phys + (i * 4) as u64) as *const u32) }
+    };
+    // NOP at offset 0: opcode 0x10 in header bits[15:8].
+    if ((read_dw(0) >> 8) & 0xFF) != 0x10 {
+        return TestResult::Fail("NOP header missing at offset 0");
+    }
+    // INDIRECT_BUFFER at offset 2: opcode 0x3F.
+    if ((read_dw(2) >> 8) & 0xFF) != 0x3F {
+        return TestResult::Fail("INDIRECT_BUFFER header missing at offset 2");
+    }
+    // WRITE_DATA at offset 6: opcode 0x37.
+    if ((read_dw(6) >> 8) & 0xFF) != 0x37 {
+        return TestResult::Fail("WRITE_DATA header missing at offset 6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring
+);
