@@ -1561,3 +1561,57 @@ fn smoke_usb_attach_idle_suspend_threshold_is_30s() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/attach", smoke_usb_attach_idle_suspend_threshold_is_30s);
+
+// ── drivers/usb/cdc_ncm (Data interface + bulk endpoints) ──────────
+
+fn smoke_usb_cdc_ncm_finder_picks_bulk_pair_under_data_iface() -> TestResult {
+    use crate::cdc::{CDC_SUBCLASS_NCM, USB_CLASS_CDC_COMM, USB_CLASS_CDC_DATA};
+    use crate::cdc_ncm::find_ncm_bulk_endpoints;
+    use crate::xhci::EndpointKind;
+    // Compose:
+    //   CONFIG (9 bytes)
+    //   COMM iface (class 0x02 sub 0x0D) — interface 0, 0 endpoints
+    //   DATA iface (class 0x0A)          — interface 1
+    //   ENDPOINT bulk OUT (ep 0x01, MPS 512)
+    //   ENDPOINT bulk IN  (ep 0x82, MPS 512)
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    v.extend_from_slice(&[9, 0x02, 23 + 9 + 9 + 7 + 7 - 36, 0, 2, 1, 0, 0xC0, 50]);
+    // Adjust wTotalLength to actual computed bytes.
+    let total = 9 + 9 + 9 + 7 + 7;
+    v[2] = (total & 0xFF) as u8;
+    v[3] = (total >> 8) as u8;
+    // COMM interface.
+    v.extend_from_slice(&[
+        9, 0x04, 0, 0, 0, USB_CLASS_CDC_COMM, CDC_SUBCLASS_NCM, 0, 0,
+    ]);
+    // DATA interface.
+    v.extend_from_slice(&[
+        9, 0x04, 1, 0, 2, USB_CLASS_CDC_DATA, 0, 0, 0,
+    ]);
+    // Bulk OUT endpoint, ep_addr=0x01, attrs=0x02 (bulk), MPS=512.
+    v.extend_from_slice(&[7, 0x05, 0x01, 0x02, 0x00, 0x02, 0]);
+    // Bulk IN endpoint, ep_addr=0x82.
+    v.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x00, 0x02, 0]);
+
+    let (iface, bulk_in, bulk_out) = match find_ncm_bulk_endpoints(&v) {
+        Some(t) => t,
+        None => return TestResult::Fail("bulk pair not found"),
+    };
+    if iface != 1 {
+        return TestResult::Fail("Data iface number wrong");
+    }
+    if bulk_in.ep_addr != 0x82 || !matches!(bulk_in.kind, EndpointKind::BulkIn) {
+        return TestResult::Fail("bulk_in not detected");
+    }
+    if bulk_out.ep_addr != 0x01 || !matches!(bulk_out.kind, EndpointKind::BulkOut) {
+        return TestResult::Fail("bulk_out not detected");
+    }
+    if bulk_in.max_packet != 512 || bulk_out.max_packet != 512 {
+        return TestResult::Fail("MPS not preserved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/cdc_ncm",
+    smoke_usb_cdc_ncm_finder_picks_bulk_pair_under_data_iface
+);

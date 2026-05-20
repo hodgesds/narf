@@ -963,6 +963,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-net",
  "narf-scheduler",
  "narf-time",
 ]

@@ -618,6 +618,16 @@ pub struct CdcNcmDevice {
     pub slot_id: u8,
     /// `bInterfaceNumber` of the CDC-Comm/NCM interface.
     pub comm_iface: u8,
+    /// `bInterfaceNumber` of the CDC-Data interface (where the
+    /// bulk endpoints live). 0xFF means "not yet enumerated".
+    pub data_iface: u8,
+    /// DCI of the bulk-IN endpoint (host→device commands +
+    /// device→host NTBs). 0 = not enumerated.
+    pub bulk_in_dci: u8,
+    /// DCI of the bulk-OUT endpoint (host→device NTBs).
+    pub bulk_out_dci: u8,
+    /// Sequence counter for outbound NTBs. Increments per send.
+    pub tx_sequence: u16,
 }
 
 /// System-wide registry of bound CDC-NCM devices.
@@ -667,10 +677,184 @@ pub fn try_bind_ncm_already_addressed(
     {
         return Err(NcmError::SetConfigFailed);
     }
-    let mut g = CDC_NCM_DEVICES.lock();
-    let idx = g.len();
-    g.push(CdcNcmDevice { slot_id, comm_iface });
+    // Find the CDC-Data interface + its bulk endpoint pair. Some
+    // composite devices interleave multiple interface descriptors;
+    // walking the cfg blob with `find_ncm_bulk_endpoints` handles
+    // that by accepting the first Data interface after the Comm
+    // interface number we resolved above.
+    let (data_iface, bulk_in_ep, bulk_out_ep) = match find_ncm_bulk_endpoints(cfg) {
+        Some(t) => t,
+        None => return Err(NcmError::NotNcm),
+    };
+    // Configure the bulk pair so the controller wires up its
+    // Transfer Rings. Mirrors the MSC bind path.
+    if xhci_dev
+        .configure_endpoints(slot_id, &[bulk_in_ep, bulk_out_ep])
+        .is_err()
+    {
+        return Err(NcmError::SetConfigFailed);
+    }
+    let bulk_in_dci = ((bulk_in_ep.ep_addr & 0x0F) * 2) + 1;
+    let bulk_out_dci = ((bulk_out_ep.ep_addr & 0x0F) * 2) + 0;
+    let idx = {
+        let mut g = CDC_NCM_DEVICES.lock();
+        let idx = g.len();
+        g.push(CdcNcmDevice {
+            slot_id,
+            comm_iface,
+            data_iface,
+            bulk_in_dci,
+            bulk_out_dci,
+            tx_sequence: 0,
+        });
+        idx
+    };
+    // Register against the net iface registry as "usb-ncm{idx}".
+    // The send_fn is a static trampoline that dispatches to
+    // CDC_NCM_DEVICES[0] — sufficient for the single-NIC bring-up
+    // arc; multi-NIC routing will swap to per-iface trampolines.
+    register_ncm_iface(idx);
     Ok(idx)
+}
+
+/// Walk the config blob for the first CDC-Data interface (class
+/// 0x0A) and return its (interface_number, bulk_in_ep, bulk_out_ep).
+pub fn find_ncm_bulk_endpoints(
+    cfg: &[u8],
+) -> Option<(u8, crate::xhci::EndpointConfig, crate::xhci::EndpointConfig)> {
+    use crate::xhci::{EndpointConfig, EndpointKind};
+    let mut i = 0;
+    let mut data_iface: Option<u8> = None;
+    let mut bulk_in: Option<EndpointConfig> = None;
+    let mut bulk_out: Option<EndpointConfig> = None;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let desc_type = cfg[i + 1];
+        if desc_type == 0x04 && len >= 9 {
+            // INTERFACE descriptor — look for CDC-Data.
+            let cls = cfg[i + 5];
+            if cls == crate::cdc::USB_CLASS_CDC_DATA {
+                data_iface = Some(cfg[i + 2]);
+                // Reset the search so we pick up THIS interface's eps.
+                bulk_in = None;
+                bulk_out = None;
+            }
+        } else if desc_type == 0x05 && data_iface.is_some() && len >= 7 {
+            // ENDPOINT under the most-recently-seen Data interface.
+            let ep_addr = cfg[i + 2];
+            let attrs = cfg[i + 3];
+            let max_packet = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]) & 0x07FF;
+            let is_in = ep_addr & 0x80 != 0;
+            // Bulk = transfer type 2 in attrs[1:0].
+            if attrs & 0x03 == 2 {
+                let kind = if is_in {
+                    EndpointKind::BulkIn
+                } else {
+                    EndpointKind::BulkOut
+                };
+                let cfg_ep = EndpointConfig {
+                    ep_addr,
+                    max_packet,
+                    kind,
+                };
+                if is_in {
+                    bulk_in = Some(cfg_ep);
+                } else {
+                    bulk_out = Some(cfg_ep);
+                }
+            }
+        }
+        i += len;
+    }
+    match (data_iface, bulk_in, bulk_out) {
+        (Some(iface), Some(i), Some(o)) => Some((iface, i, o)),
+        _ => None,
+    }
+}
+
+/// Send one Ethernet frame over the bound NCM device at `idx`.
+/// Wraps the frame in an NTB-16 (single-datagram NDP) and ships
+/// it on the bulk-OUT endpoint.
+pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
+    let (slot_id, bulk_out_dci, sequence) = {
+        let mut g = CDC_NCM_DEVICES.lock();
+        let dev = g.get_mut(idx).ok_or(NcmError::NotNcm)?;
+        let seq = dev.tx_sequence;
+        dev.tx_sequence = dev.tx_sequence.wrapping_add(1);
+        (dev.slot_id, dev.bulk_out_dci, seq)
+    };
+    let ntb = build_ntb16(sequence, &[eth_frame], /*crc*/ false)?;
+    let outcome = crate::xhci::with_controller(|c| c.bulk_out(slot_id, bulk_out_dci, &ntb));
+    match outcome {
+        Some(Ok(n)) => Ok(n),
+        Some(Err(_)) | None => Err(NcmError::Truncated),
+    }
+}
+
+/// Pull one Ethernet frame off the bound NCM device's bulk-IN
+/// endpoint. Reads an NTB into `scratch`, parses it, returns the
+/// first datagram (if any). Caller polls this periodically; on
+/// real silicon the bulk-IN ring continuously holds an NTB-sized
+/// read posted so frames stream in.
+pub fn recv_frame<'a>(
+    idx: usize,
+    scratch: &'a mut [u8],
+) -> Result<Option<&'a [u8]>, NcmError> {
+    let (slot_id, bulk_in_dci) = {
+        let g = CDC_NCM_DEVICES.lock();
+        let dev = g.get(idx).ok_or(NcmError::NotNcm)?;
+        (dev.slot_id, dev.bulk_in_dci)
+    };
+    let outcome = crate::xhci::with_controller(|c| c.bulk_in(slot_id, bulk_in_dci, scratch));
+    let n = match outcome {
+        Some(Ok(n)) => n,
+        Some(Err(_)) | None => return Err(NcmError::Truncated),
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+    let ntb = ParsedNtb::parse(&scratch[..n])?;
+    if ntb.is_empty() {
+        return Ok(None);
+    }
+    let dg = ntb.datagram(0).ok_or(NcmError::DatagramOutOfBounds)?;
+    // Re-borrow against the scratch lifetime — Ntb16 borrows
+    // immutably; the lifetime path is straightforward here because
+    // dg points into &scratch[..n].
+    let off = dg.as_ptr() as usize - scratch.as_ptr() as usize;
+    let dlen = dg.len();
+    Ok(Some(&scratch[off..off + dlen]))
+}
+
+/// Trampoline used by [`narf_net::iface`]'s `SendFn` slot. Sends
+/// via NCM device 0 (the bring-up arc binds at most one USB-NCM
+/// device). Multi-NIC routing will replace this with a per-iface
+/// closure-equivalent dispatch table.
+fn ncm_send_static_trampoline(frame: &[u8]) -> Result<(), ()> {
+    match send_frame(0, frame) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+/// Register the NCM device at `idx` as a network interface. The
+/// MAC address is resolved via GET_DESCRIPTOR(STRING, iMACAddress)
+/// in a follow-up; for now we register a placeholder MAC the
+/// stack can ARP-reply with — the device will overwrite this once
+/// the SET_NET_ADDRESS path lands.
+fn register_ncm_iface(idx: usize) {
+    let name = alloc::format!("usb-ncm{}", idx);
+    // Placeholder locally-administered MAC. Bit 1 of byte 0 = 1
+    // (LAA flag), bit 0 = 0 (unicast). Device-specific MAC takes
+    // over once GET_NET_ADDRESS lands.
+    let mac = [0x02, 0x4E, 0x41, 0x52, 0x46, idx as u8];
+    // narf_net's register() interface takes &str — we leak the
+    // String so its lifetime spans the kernel.
+    let static_name: &'static str = alloc::boxed::Box::leak(name.into_boxed_str());
+    narf_net::iface::register(static_name, mac, ncm_send_static_trampoline);
 }
 
 pub fn attached_ncm_count() -> usize {
