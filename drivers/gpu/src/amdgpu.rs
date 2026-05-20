@@ -160,18 +160,14 @@ const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
 // `MP0_C2PMSG_N = mp0_base + 0x29C + N*4`. The 0x29C offset is
 // constant; only the `mp0_base` shifts per family.
 
-const MP0_C2PMSG_REL: u32 = 0x0000_029C;
-const MP0_C2PMSG_64_REL: u32 = MP0_C2PMSG_REL + 64 * 4;
-const MP0_C2PMSG_67_REL: u32 = MP0_C2PMSG_REL + 67 * 4;
-const MP0_C2PMSG_69_REL: u32 = MP0_C2PMSG_REL + 69 * 4;
-
-/// PSP `LOAD_TA` (Trusted Application) command code. Other codes
-/// (`UNLOAD_TA`, `INVOKE_CMD`) aren't load-bearing for Stage-2.
-const PSP_CMD_LOAD_TA: u32 = 0x05;
-
-/// MP0_C2PMSG_64 status fields after LOAD_TA polling completes.
-const PSP_STATUS_DONE_BIT: u32 = 1 << 31;
-const PSP_STATUS_CODE_MASK: u32 = 0x7FFF_FFFF;
+// PSP MP0 register / command / status constants live in
+// `amdgpu_psp` (canonically named LOAD_IP_FW for the value 0x05
+// that pre-relicense scaffold mislabelled LOAD_TA). Re-export
+// the names load_firmware uses inline below.
+use crate::amdgpu_psp::{
+    MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
+    PSP_CMD_LOAD_IP_FW, PSP_STATUS_CODE_MASK, PSP_STATUS_DONE_BIT,
+};
 
 // ── Chip-info table ────────────────────────────────────────────────
 
@@ -560,7 +556,7 @@ impl AmdGpu {
             );
         }
         compiler_fence(Ordering::SeqCst);
-        let cmd = PSP_CMD_LOAD_TA | (size << 8);
+        let cmd = PSP_CMD_LOAD_IP_FW | (size << 8);
         // SAFETY: same.
         unsafe {
             mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, cmd);
