@@ -4,15 +4,25 @@ Plan for replacing the Stage-1 bump allocator (`memory/src/heap.rs`,
 `HEAP_CAPACITY` static) with the buddy + slab pair the main spec
 already calls for.
 
-## 0. Provenance — clean-room implementation
+## 0. Provenance — clean-room implementation (historical)
 
-**Mandatory invariant:** every line of code that lands as part of
-this migration is clean-room. No GPL-licensed source — and in
-particular no Linux kernel mm/ source — is read, referenced,
-ported, paraphrased, or used as a model. Same rule that produced
-`crypto/src/clean/` (SHA-256/512, ChaCha20-Poly1305, HKDF) and
-the same reasoning: NARF is MPL-2.0 and must remain
-distributable without GPL contamination concerns.
+**Historical invariant (kept for the in-tree allocators that
+already landed under it):** every line of code in
+`memory/src/{buddy,slab,heap}.rs` and the matching tests is
+clean-room. No GPL-licensed source — and in particular no Linux
+kernel mm/ source — was read, referenced, ported, paraphrased,
+or used as a model. Same rule that produced `crypto/src/clean/`
+(SHA-256/512, ChaCha20-Poly1305, HKDF).
+
+**Current license posture:** NARF is now GPL-2.0-or-later
+(2026-05-20 relicense — see commit log). Future memory-management
+work MAY consult Linux `mm/` source directly. The clean-room
+rule above is no longer mandatory; it remains an explicit choice
+the author may make for individual subsystems where they want
+algorithmic independence from the Linux implementation. Don't
+rewrite the existing clean-room files to re-derive from Linux
+— the provenance comment stays accurate as a historical
+statement.
 
 What's allowed:
 
@@ -53,35 +63,31 @@ What's allowed:
 - **Our own existing modules.** `frame.rs` API surface, capability
   patterns, `IrqSafeSpinLock` discipline.
 
-What's forbidden:
+What was forbidden under the historical rule (the rule no
+longer binds; this list is preserved so the clean-room subset
+of files stays identifiable):
 
-- Reading Linux `mm/` source for any reason. Specifically excluded:
-  - `mm/page_alloc.c`, `mm/slab.c`, `mm/slub.c`, `mm/slob.c`,
-    `mm/vmalloc.c`, `mm/page-writeback.c`, `mm/oom_kill.c`,
-    `mm/shrinker.c`, `mm/compaction.c`, `mm/memory_hotplug.c`.
-  - Anything under <https://github.com/torvalds/linux/tree/master/mm>.
-- Reading any GPLv2 / GPLv3 / LGPL allocator source.
-  - glibc malloc — LGPL.
-    <https://sourceware.org/git/?p=glibc.git;a=tree;f=malloc>
-  - musl malloc — MIT-style, but its mallocng is influenced by
-    glibc; treat with caution.
-  - OpenJDK ZGC — GPLv2 + Classpath. Avoid.
+- Reading Linux `mm/` source — `mm/page_alloc.c`, `mm/slab.c`,
+  `mm/slub.c`, `mm/slob.c`, `mm/vmalloc.c`, `mm/page-writeback.c`,
+  `mm/oom_kill.c`, `mm/shrinker.c`, `mm/compaction.c`,
+  `mm/memory_hotplug.c`, or anything under
+  <https://github.com/torvalds/linux/tree/master/mm>.
+- Reading any GPLv2 / GPLv3 / LGPL allocator source — glibc
+  malloc, musl mallocng, OpenJDK ZGC.
 - Using AI-assisted code generation that was trained on Linux
-  kernel source without explicit clean-room provenance —
-  Claude generations for this work cite only this spec, the
-  algorithm-level papers/manuals above, and the existing NARF
-  codebase.
+  kernel source without explicit clean-room provenance.
 
-Each new file (`memory/src/buddy.rs`, `slab.rs`, etc.) opens with
-a comment block stating:
+The existing `memory/src/{buddy,slab,heap}.rs` files open with a
+comment block stating:
 
 ```
 // Clean-room implementation. Algorithm refs: <papers cited>.
 // No GPL source consulted.
 ```
 
-Code review on PRs touching these files explicitly checks for
-provenance compliance.
+That comment stays accurate as a historical statement. New
+allocator work added after the 2026-05-20 relicense doesn't
+need the marker.
 
 ## 1. Current state
 

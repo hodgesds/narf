@@ -4,7 +4,7 @@ description  = "relibc-shaped libc shim for NARF user binaries (Path B)"
 version      = "0.0.0"
 edition      = "2021"
 rust-version = "1.85"
-license      = "MPL-2.0"
+license      = "GPL-2.0-or-later"
 repository   = "https://github.com/hodgesds/narf"
 
 [lib]

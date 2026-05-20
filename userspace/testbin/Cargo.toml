@@ -4,7 +4,7 @@ description  = "Minimal Rust no_std user binary run by narf-verification user-mo
 version      = "0.0.0"
 edition      = "2021"
 rust-version = "1.85"
-license      = "MPL-2.0"
+license      = "GPL-2.0-or-later"
 
 [[bin]]
 name = "narf-testbin"

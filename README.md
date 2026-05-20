@@ -1105,3 +1105,18 @@ the device.
 6. [`security-model/specification/spec.md`](./security-model/specification/spec.md)
    and [`arch/specification/spec.md`](./arch/specification/spec.md) — the
    two specs every other subsystem depends on.
+
+## License
+
+GPL-2.0-or-later. See [`LICENSE`](./LICENSE) for the full text.
+
+The license posture lets kernel code interface with and adapt
+from GPLv2-compatible projects — most importantly the Linux
+kernel, so register layouts, driver patterns, and protocol
+implementations can flow in either direction. Code that landed
+before the 2026-05-20 relicense was originally under MPL-2.0
+and was authored as clean-room (no GPL source consulted); the
+clean-room marker on files like `memory/src/{buddy,slab,heap}.rs`
+and `crypto/src/clean/*` stays accurate as a historical
+statement of provenance. New code after the relicense does not
+need to follow the clean-room rule.

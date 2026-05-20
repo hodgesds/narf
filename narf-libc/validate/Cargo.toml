@@ -4,7 +4,7 @@ description  = "Smoke binary for narf-libc — links against the relibc-shaped l
 version      = "0.0.0"
 edition      = "2021"
 rust-version = "1.85"
-license      = "MPL-2.0"
+license      = "GPL-2.0-or-later"
 
 [[bin]]
 name = "narf-libc-validate"

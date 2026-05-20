@@ -303,11 +303,12 @@ RustCrypto remains available but unaudited; drivers needing
 them mark `requires_unaudited_crypto = true` in their
 manifest and the cert chain must explicitly authorise.
 
-**Licensing:** every adopted crate is MIT- and/or Apache-2.0-
-licensed; **no GPL-derived code is pulled in or referenced**.
-That keeps the workspace (MPL-2.0) compatible with the kernel
-license posture. Crate licenses are reverified each time the
-audit baseline is bumped.
+**Licensing:** the workspace is GPL-2.0-or-later (matching the
+Linux kernel licensing posture so register layouts and driver
+references can be borrowed in either direction). Adopted
+external crates may be MIT, Apache-2.0, BSD, MPL, or GPL — any
+license that's GPLv2-compatible. Crate licenses are reverified
+each time the audit baseline is bumped.
 
 #### 9.2.1 Clean-room implementations
 
