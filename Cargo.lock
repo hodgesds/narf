@@ -812,6 +812,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-drivers-virtio",
+ "narf-edid",
  "narf-firmware",
  "narf-graphics",
  "narf-graphics-driver",

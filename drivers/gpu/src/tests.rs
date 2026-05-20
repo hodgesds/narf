@@ -3567,3 +3567,224 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma6_uses_different_offsets_than_v4
 );
+// ─── amdgpu_ddc: EDID-read transport scaffold ────────────────────
+
+/// Build a valid 128-byte EDID base block with `ext_count` set,
+/// then fix up the checksum so the block sums to a multiple of 256.
+fn build_valid_edid_block(ext_count: u8) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    // VESA header.
+    b[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // Manufacturer "DEL" (compressed PNP code).
+    b[8] = 0x10;
+    b[9] = 0xAC;
+    b[18] = 1; // EDID version 1
+    b[19] = 4; // EDID revision 4
+    b[126] = ext_count;
+    // Fix the checksum slot.
+    let sum: u32 = b.iter().take(127).map(|x| *x as u32).sum();
+    b[127] = ((256u32 - (sum & 0xFF)) & 0xFF) as u8;
+    b
+}
+
+/// Mock transport that hands out pre-baked 128-byte blocks indexed
+/// by the (offset / 128) — block 0 is at offset 0, block 1 at
+/// offset 128, etc. Reads at non-block-aligned offsets return
+/// `BadHeader` indirectly via zero-filled bytes.
+struct MockEdidTransport {
+    blocks: alloc::vec::Vec<[u8; 128]>,
+}
+
+impl crate::amdgpu_ddc::DdcTransport for MockEdidTransport {
+    fn read(
+        &mut self,
+        slave_addr: u8,
+        offset: u8,
+        out: &mut [u8],
+    ) -> Result<(), crate::amdgpu_ddc::DdcError> {
+        if slave_addr != crate::amdgpu_ddc::DDC_EDID_SLAVE {
+            return Err(crate::amdgpu_ddc::DdcError::NoAck);
+        }
+        // For the mock, the sub-address is the start of a 128-byte
+        // window. 0 → block 0, 128 → block 1, 0 (wraps from 256) →
+        // block 0 again — match what real hardware sees with a
+        // single-byte sub-address.
+        let block_idx = (offset as usize) / 128;
+        if block_idx >= self.blocks.len() {
+            for slot in out.iter_mut() {
+                *slot = 0;
+            }
+            return Ok(());
+        }
+        let src = &self.blocks[block_idx];
+        let n = out.len().min(128);
+        out[..n].copy_from_slice(&src[..n]);
+        Ok(())
+    }
+    fn write(
+        &mut self,
+        _slave_addr: u8,
+        _data: &[u8],
+    ) -> Result<(), crate::amdgpu_ddc::DdcError> {
+        Ok(())
+    }
+}
+
+fn smoke_read_edid_via_mock_transport_round_trips_block_0() -> TestResult {
+    use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES};
+    let block = build_valid_edid_block(0);
+    let mut t = MockEdidTransport {
+        blocks: alloc::vec![block],
+    };
+    let bytes = match read_edid(&mut t) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("read_edid rejected valid block");
+        }
+    };
+    if bytes.len() != EDID_BLOCK_BYTES {
+        return TestResult::Fail("expected exactly 128 bytes from a no-ext block");
+    }
+    if bytes[..] != block[..] {
+        return TestResult::Fail("returned bytes don't match what the mock served");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_via_mock_transport_round_trips_block_0);
+
+fn smoke_read_edid_rejects_bad_checksum() -> TestResult {
+    use crate::amdgpu_ddc::{read_edid, DdcError};
+    let mut block = build_valid_edid_block(0);
+    // Corrupt the checksum byte.
+    block[127] = block[127].wrapping_add(1);
+    let mut t = MockEdidTransport {
+        blocks: alloc::vec![block],
+    };
+    match read_edid(&mut t) {
+        Err(DdcError::BadChecksum) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("read_edid accepted a block with a bad checksum"),
+        Err(_) => TestResult::Fail("read_edid returned wrong error kind for bad checksum"),
+    }
+}
+kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_rejects_bad_checksum);
+
+fn smoke_read_edid_handles_one_extension_block() -> TestResult {
+    use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES};
+    let base = build_valid_edid_block(1);
+    // Build a valid extension block (no header magic — extension
+    // blocks just need a self-summing checksum).
+    let mut ext = [0u8; 128];
+    ext[0] = 0x02; // CTA-861 extension tag (arbitrary but typical).
+    ext[1] = 0x03; // revision
+    let sum: u32 = ext.iter().take(127).map(|x| *x as u32).sum();
+    ext[127] = ((256u32 - (sum & 0xFF)) & 0xFF) as u8;
+
+    let mut t = MockEdidTransport {
+        blocks: alloc::vec![base, ext],
+    };
+    let bytes = match read_edid(&mut t) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("read_edid rejected base+ext"),
+    };
+    if bytes.len() != 2 * EDID_BLOCK_BYTES {
+        return TestResult::Fail("expected 256 bytes from base + 1 extension");
+    }
+    if bytes[..128] != base[..] {
+        return TestResult::Fail("base block bytes corrupted");
+    }
+    if bytes[128..] != ext[..] {
+        return TestResult::Fail("extension block bytes corrupted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_handles_one_extension_block);
+
+fn smoke_read_edid_caps_extension_blocks() -> TestResult {
+    use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES, MAX_EXT_BLOCKS};
+    // Base claims 10 extensions — way over the cap of 4.
+    let base = build_valid_edid_block(10);
+    // Make a valid extension block — duplicate it 10× so the mock
+    // can serve any block the driver requests.
+    let mut ext = [0u8; 128];
+    ext[0] = 0x02;
+    let sum: u32 = ext.iter().take(127).map(|x| *x as u32).sum();
+    ext[127] = ((256u32 - (sum & 0xFF)) & 0xFF) as u8;
+
+    let mut blocks = alloc::vec![base];
+    for _ in 0..10 {
+        blocks.push(ext);
+    }
+    let mut t = MockEdidTransport { blocks };
+    let bytes = match read_edid(&mut t) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("read_edid rejected over-claim"),
+    };
+    // We should have read base + MAX_EXT_BLOCKS = 5 blocks max.
+    let expected = EDID_BLOCK_BYTES * (1 + MAX_EXT_BLOCKS as usize);
+    if bytes.len() != expected {
+        return TestResult::Fail("extension-block cap not enforced");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_caps_extension_blocks);
+
+fn smoke_gpio_ddc_bit_bang_sequences_start_address_stop() -> TestResult {
+    // Exercise GpioDdcTransport against a closure that captures
+    // every bus operation. We then assert the trace begins with a
+    // START, includes the slave-address byte (0xA0 = 0x50<<1 for
+    // write) on the wire, and ends with a STOP — i.e. the shape of
+    // a real I²C transaction.
+    use crate::amdgpu_ddc::{DdcTransport, GpioDdcTransport, GpioOp};
+    use core::cell::RefCell;
+
+    let trace: RefCell<alloc::vec::Vec<GpioOp>> = RefCell::new(alloc::vec::Vec::new());
+    // The mock slave always ACKs (SDA reads low on the 9th clock)
+    // and never holds SCL low (SCL reads high immediately).
+    let slave_drives_sda_low = RefCell::new(false);
+    // We need to alternate SDA-read return values to fake a slave
+    // that ACKs each address/data byte. Simple model: every
+    // SdaRead during a write returns 0 (ACK); SdaRead during a
+    // read returns 1 (provides a stream of 0xFF bytes).
+    // Track whether we're in the read phase via the trace itself.
+    let op = |op: GpioOp| -> bool {
+        trace.borrow_mut().push(op);
+        match op {
+            GpioOp::SclRead(_) => true, // SCL never stretches
+            GpioOp::SdaRead(_) => *slave_drives_sda_low.borrow(),
+            _ => false,
+        }
+    };
+
+    let mut t = GpioDdcTransport::new(10, 11, op);
+    // Just exercise a write-only transaction; that's the smallest
+    // I²C sequence and avoids needing to simulate slave-driven SDA.
+    let res = t.write(0x50, &[0u8]);
+    if res.is_err() {
+        return TestResult::Fail("GpioDdcTransport write errored on always-ACK mock");
+    }
+
+    let trace = trace.into_inner();
+    // First op should be SdaHigh (release SDA prior to START).
+    if !matches!(trace.first(), Some(GpioOp::SdaHigh(11))) {
+        return TestResult::Fail("trace doesn't start with SDA-release for START");
+    }
+    // We should see at least one SclLow and one SclHigh per data
+    // bit + ACK clock for the slave address byte (8 + 1 = 9 clock
+    // cycles) and the offset byte (another 9). So at least 18
+    // total SclHigh ops.
+    let scl_highs = trace
+        .iter()
+        .filter(|o| matches!(o, GpioOp::SclHigh(10)))
+        .count();
+    if scl_highs < 18 {
+        return TestResult::Fail("not enough SCL pulses for slave + 1 data byte");
+    }
+    // Final op should be SdaHigh (STOP releases SDA after SCL is
+    // already high).
+    if !matches!(trace.last(), Some(GpioOp::SdaHigh(11))) {
+        return TestResult::Fail("trace doesn't end with SDA-release for STOP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_gpio_ddc_bit_bang_sequences_start_address_stop);

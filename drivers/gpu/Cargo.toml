@@ -17,6 +17,7 @@ narf-capabilities    = { path = "../../capabilities" }
 narf-kernel-test     = { path = "../../verification/kernel-test" }
 narf-graphics-driver = { path = "../graphics" }
 narf-graphics        = { path = "../../graphics" }
+narf-edid            = { path = "../../edid" }
 narf-drivers-virtio  = { path = "../virtio" }
 narf-driver-runtime  = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-drivers         = { path = ".." }
