@@ -618,6 +618,187 @@ pub fn dcn20_modeset_sequence(
     writes
 }
 
+// ── DCN 3.5 modeset path (Phoenix / HawkPoint / Strix Point) ─────
+//
+// On Phoenix (RDNA 3.5 iGPU) the display IP is DCN 3.5. The
+// register block bases inside the DCN window stay where DCN 2.0
+// put them — HUBP0 anchors near `mmHUBP0_DCHUBP_CNTL`
+// (dword 0x05F3), OPP_PIPE0 anchors near
+// `regOPP_PIPE0_OPP_PIPE_CONTROL` (dword 0x188C), and OTG0
+// anchors near `regOTG0_OTG_H_TOTAL` (dword 0x1B2A) — so the
+// per-block byte offsets carry over from the DCN 2.0 transcription.
+// What shifted inside the OTG block on DCN 3.5 (per
+// `drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_5_0_offset.h`
+// vs. `dcn_2_0_0_offset.h`):
+//
+//   reg                       DCN 2.0 dword    DCN 3.5 dword
+//   OTG_V_BLANK_START_END     0x1B36           0x1B38   (+8 B)
+//   OTG_V_SYNC_A              0x1B37           0x1B39   (+8 B)
+//   OTG_CONTROL               0x1B41           0x1B43   (+8 B)
+//   OTG_INTERRUPT_CONTROL     0x1B59           0x1B5A   (+4 B)
+//
+// Programming OTG_CONTROL at the DCN 2.0 offset on Phoenix lands
+// on `OTG0_OTG_V_SYNC_A_CNTL` (dword 0x1B41 in DCN35) — silently
+// programming the wrong field instead of asserting OTG_MASTER_EN.
+// This is exactly the kind of silent collision the smokes pin.
+//
+// The Linux modeset sequence body
+// (`drivers/gpu/drm/amd/display/dc/dcn35/dcn35_resource.c` +
+// `dcn30_optc.c::optc3_program_timing` reused for DCN35) is
+// otherwise byte-for-byte the same shape as DCN20: blank HUBP →
+// reprogram surface/pitch → enable OPP pipe → write OTG timing →
+// assert OTG_MASTER_EN last.
+
+/// HUBP / OPP / OTG strides on DCN 3.5. Same per-instance stride
+/// as DCN 2.0 — the per-pipe block layouts didn't grow between
+/// the two IP versions; only the within-OTG layout shifted.
+pub const DCN35_HUBP_STRIDE: u32 = 0x0200;
+pub const DCN35_OPP_STRIDE: u32 = 0x0100;
+pub const DCN35_OTG_STRIDE: u32 = 0x0200;
+
+/// HUBP0 / OPP0 / OTG0 byte offsets from the DCN base. Inherited
+/// unchanged from DCN 2.0; verified against
+/// `dcn_3_5_0_offset.h::regHUBP0_DCHUBP_CNTL` = 0x05F3 (= byte
+/// 0x17CC, inside the [0x1700..0x1900) block).
+pub const DCN35_HUBP0_REL: u32 = 0x1700;
+pub const DCN35_OPP0_REL: u32 = 0x1B80;
+pub const DCN35_OTG0_REL: u32 = 0x2180;
+
+// ── DCN 3.5 in-block register offsets ────────────────────────────
+//
+// Byte offsets from each per-pipe block base above. HUBP / OPP
+// registers are stable across DCN20→DCN35; the OTG block has the
+// shifts called out in the table above.
+
+pub const DCN35_HUBP_BLANK_EN_REL: u32 = 0x0014;
+pub const DCN35_HUBP_PRI_ADDR_LO_REL: u32 = 0x009C;
+pub const DCN35_HUBP_PRI_ADDR_HI_REL: u32 = 0x0098;
+pub const DCN35_HUBP_SURFACE_PITCH_REL: u32 = 0x00A0;
+
+pub const DCN35_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
+pub const DCN35_OPP_GRPH_PASSTHROUGH_REL: u32 = 0x0034;
+
+pub const DCN35_OTG_H_TOTAL_REL: u32 = 0x0000;
+pub const DCN35_OTG_H_BLANK_REL: u32 = 0x0004;
+pub const DCN35_OTG_H_SYNC_A_REL: u32 = 0x0008;
+pub const DCN35_OTG_V_TOTAL_REL: u32 = 0x0014;
+/// `OTG_V_BLANK_START_END` shifted +8 B on DCN 3.5 vs DCN 2.0.
+/// DCN20 had it at dword 0x1B36 (rel 0x0030 inside the OTG block);
+/// DCN35 puts it at dword 0x1B38 (rel 0x0038).
+pub const DCN35_OTG_V_BLANK_REL: u32 = 0x0038;
+/// `OTG_V_SYNC_A` shifted +8 B (dword 0x1B39 on DCN 3.5).
+pub const DCN35_OTG_V_SYNC_A_REL: u32 = 0x003C;
+/// `OTG_INTERRUPT_CONTROL` shifted +4 B (dword 0x1B5A on DCN 3.5).
+pub const DCN35_OTG_INTERRUPT_CONTROL_REL: u32 = 0x00C4;
+/// `OTG_CONTROL` shifted +8 B (dword 0x1B43 on DCN 3.5).
+pub const DCN35_OTG_CONTROL_REL: u32 = 0x0048;
+/// `OTG_STATUS` (dword 0x1B49) — same as DCN 2.0.
+pub const DCN35_OTG_STATUS_REL: u32 = 0x0084;
+pub const DCN35_OTG_STATUS_VBLANK: u32 = 1 << 0;
+
+/// DCN 3.5 modeset sequence. Same prologue/body/epilogue shape
+/// as `dcn20_modeset_sequence`; absolute addresses fold against
+/// the DCN 3.5 per-OTG register layout so Phoenix doesn't silently
+/// land OTG_MASTER_EN on `OTG_V_SYNC_A_CNTL` (the register that
+/// sits at the DCN 2.0 OTG_CONTROL slot on DCN 3.5 hardware).
+///
+/// Linux reference: `drivers/gpu/drm/amd/display/dc/dcn35/`
+/// (uses the OPTC3 / DCN30 timing programmer, reused unchanged
+/// for DCN 3.5) together with the DCN 3.5 offset header above.
+pub fn dcn35_modeset_sequence(
+    timing: &ModeTiming,
+    surface_addr_bytes: u64,
+    stride_pixels: u32,
+    dcn_base: u32,
+) -> alloc::vec::Vec<DcnWrite> {
+    let mut writes = alloc::vec::Vec::with_capacity(16);
+
+    let hubp = dcn_base + DCN35_HUBP0_REL;
+    let opp = dcn_base + DCN35_OPP0_REL;
+    let otg = dcn_base + DCN35_OTG0_REL;
+
+    // 1. Disable scanout.
+    writes.push(DcnWrite {
+        addr: hubp + DCN35_HUBP_BLANK_EN_REL,
+        value: HUBP_BLANK_FORCE,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_INTERRUPT_CONTROL_REL,
+        value: 0,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_CONTROL_REL,
+        value: 0,
+    });
+
+    // 2. HUBP surface address + pitch.
+    let surf_lo = surface_addr_bytes as u32;
+    let surf_hi = (surface_addr_bytes >> 32) as u32;
+    writes.push(DcnWrite {
+        addr: hubp + DCN35_HUBP_PRI_ADDR_HI_REL,
+        value: surf_hi,
+    });
+    writes.push(DcnWrite {
+        addr: hubp + DCN35_HUBP_PRI_ADDR_LO_REL,
+        value: surf_lo,
+    });
+    let pitch_field = stride_pixels.saturating_sub(1) & 0x1FFF;
+    writes.push(DcnWrite {
+        addr: hubp + DCN35_HUBP_SURFACE_PITCH_REL,
+        value: pitch_field,
+    });
+
+    // 3. OPP pipe enable + linear gamma.
+    writes.push(DcnWrite {
+        addr: opp + DCN35_OPP_PIPE_CONTROL_REL,
+        value: OPP_PIPE_ENABLE,
+    });
+    writes.push(DcnWrite {
+        addr: opp + DCN35_OPP_GRPH_PASSTHROUGH_REL,
+        value: 0,
+    });
+
+    // 4. OTG timing — H/V_TOTAL, H/V_BLANK, H/V_SYNC. The V_*
+    // registers are at DCN 3.5-shifted offsets relative to DCN 2.0.
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_H_TOTAL_REL,
+        value: (timing.h_total - 1) as u32,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_V_TOTAL_REL,
+        value: (timing.v_total - 1) as u32,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_H_BLANK_REL,
+        value: pack_pair(timing.h_blank_end, timing.h_blank_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_V_BLANK_REL,
+        value: pack_pair(timing.v_blank_end, timing.v_blank_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_H_SYNC_A_REL,
+        value: pack_pair(timing.h_sync_end, timing.h_sync_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_V_SYNC_A_REL,
+        value: pack_pair(timing.v_sync_end, timing.v_sync_start),
+    });
+
+    // 5. Re-enable scanout. OTG_MASTER_EN must land on the DCN 3.5
+    // OTG_CONTROL offset (dword 0x1B43), NOT the DCN 2.0 slot.
+    writes.push(DcnWrite {
+        addr: hubp + DCN35_HUBP_BLANK_EN_REL,
+        value: 0,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN35_OTG_CONTROL_REL,
+        value: OTG_MASTER_EN,
+    });
+
+    writes
+}
+
 /// Build a DCN 2.0 modeset write list from the IP discovery
 /// table. Returns `None` when the discovery blob does not enumerate
 /// a `HW_ID_DCN` block (older silicon / QEMU / parse failed); the

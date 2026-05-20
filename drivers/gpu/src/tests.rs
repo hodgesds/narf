@@ -2036,6 +2036,103 @@ kernel_test_in!(
     smoke_dcn20_modeset_seq_contains_expected_offsets
 );
 
+fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
+    use crate::amdgpu_dcn::{
+        dcn35_modeset_sequence, timing_for_mode, DCN35_HUBP0_REL,
+        DCN35_HUBP_BLANK_EN_REL, DCN35_OTG0_REL, DCN35_OTG_CONTROL_REL,
+        DCN35_OTG_H_TOTAL_REL, DCN35_OTG_V_BLANK_REL, HUBP_BLANK_FORCE,
+        OTG_MASTER_EN,
+    };
+    let timing = match timing_for_mode(1920, 1080, 60) {
+        Some(t) => t,
+        None => return TestResult::Fail("FHD@60 missing"),
+    };
+    let dcn_base: u32 = 0x0010_0000;
+    let seq = dcn35_modeset_sequence(&timing, 0x1000_0000, 1920, dcn_base);
+
+    let want_blank = dcn_base + DCN35_HUBP0_REL + DCN35_HUBP_BLANK_EN_REL;
+    let want_h_total = dcn_base + DCN35_OTG0_REL + DCN35_OTG_H_TOTAL_REL;
+    let want_v_blank = dcn_base + DCN35_OTG0_REL + DCN35_OTG_V_BLANK_REL;
+    let want_master = dcn_base + DCN35_OTG0_REL + DCN35_OTG_CONTROL_REL;
+
+    // HUBP_BLANK_EN forced in prologue, cleared in epilogue.
+    let blank_forced = seq
+        .iter()
+        .any(|w| w.addr == want_blank && w.value & HUBP_BLANK_FORCE != 0);
+    let blank_cleared = seq
+        .iter()
+        .any(|w| w.addr == want_blank && w.value == 0);
+    if !blank_forced || !blank_cleared {
+        return TestResult::Fail("DCN35 HUBP_BLANK_EN must be forced then cleared");
+    }
+    // OTG_H_TOTAL = h_total - 1.
+    let want_h = (timing.h_total - 1) as u32;
+    if !seq.iter().any(|w| w.addr == want_h_total && w.value == want_h) {
+        return TestResult::Fail("DCN35 OTG_H_TOTAL not programmed");
+    }
+    // OTG_V_BLANK_START_END must use the DCN 3.5-shifted offset
+    // (the whole point of this path). If this constant ever drifts
+    // back to the DCN 2.0 value the test catches it.
+    if !seq.iter().any(|w| w.addr == want_v_blank) {
+        return TestResult::Fail("DCN35 OTG_V_BLANK_START_END not programmed at shifted offset");
+    }
+    // OTG_MASTER_EN must be the last write to OTG_CONTROL.
+    let last_master = seq
+        .iter()
+        .rev()
+        .find(|w| w.addr == want_master)
+        .copied();
+    match last_master {
+        Some(w) if w.value & OTG_MASTER_EN != 0 => {}
+        _ => return TestResult::Fail("DCN35 OTG_MASTER_EN must be asserted last"),
+    }
+    // Also confirm OTG_MASTER_EN is the *final* write in the
+    // sequence (epilogue ordering invariant — same as DCN 2.0).
+    let last = match seq.last() {
+        Some(w) => *w,
+        None => return TestResult::Fail("empty DCN35 sequence"),
+    };
+    if last.addr != want_master || last.value & OTG_MASTER_EN == 0 {
+        return TestResult::Fail("OTG_MASTER_EN must be the final write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_dcn35_modeset_seq_contains_expected_offsets
+);
+
+fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
+    use crate::amdgpu_dcn::{
+        DCN20_OTG_CONTROL_REL, DCN20_OTG_INTERRUPT_CONTROL_REL,
+        DCN20_OTG_V_BLANK_REL, DCN20_OTG_V_SYNC_A_REL,
+        DCN35_OTG_CONTROL_REL, DCN35_OTG_INTERRUPT_CONTROL_REL,
+        DCN35_OTG_V_BLANK_REL, DCN35_OTG_V_SYNC_A_REL,
+    };
+    // Phoenix's DCN 3.5 shifted V_BLANK / V_SYNC / OTG_CONTROL /
+    // INTERRUPT_CONTROL inside the OTG block vs DCN 2.0 (Renoir).
+    // If any of these ever drift to match the DCN 2.0 value the
+    // Phoenix path would silently program the wrong register on
+    // real hardware — pin the invariant.
+    if DCN20_OTG_V_BLANK_REL == DCN35_OTG_V_BLANK_REL {
+        return TestResult::Fail("DCN35 V_BLANK offset must differ from DCN20");
+    }
+    if DCN20_OTG_V_SYNC_A_REL == DCN35_OTG_V_SYNC_A_REL {
+        return TestResult::Fail("DCN35 V_SYNC_A offset must differ from DCN20");
+    }
+    if DCN20_OTG_CONTROL_REL == DCN35_OTG_CONTROL_REL {
+        return TestResult::Fail("DCN35 OTG_CONTROL offset must differ from DCN20");
+    }
+    if DCN20_OTG_INTERRUPT_CONTROL_REL == DCN35_OTG_INTERRUPT_CONTROL_REL {
+        return TestResult::Fail("DCN35 INTERRUPT_CONTROL offset must differ from DCN20");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_dcn35_uses_different_offsets_than_dcn20
+);
+
 // ── amdgpu/psp ─────────────────────────────────────────────────────
 //
 // PSP MP0 mailbox smokes. The real PSP firmware-load handshake

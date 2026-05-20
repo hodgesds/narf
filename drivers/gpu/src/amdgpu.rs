@@ -181,10 +181,17 @@ pub enum Family {
     Renoir,
     /// Navi 1x — RDNA1 (RX 5000-series).
     Navi1,
-    /// Navi 2x — RDNA2 (RX 6000-series, Phoenix iGPU's GFX block).
+    /// Navi 2x — RDNA2 (RX 6000-series).
     Navi2,
-    /// Navi 3x — RDNA3 (RX 7000-series, Strix iGPU's GFX block).
+    /// Navi 3x — RDNA3 (RX 7000-series desktop, Navi31/32/33).
     Navi3,
+    /// Phoenix / HawkPoint / Strix-Point — Zen4/Zen5 APUs whose
+    /// display IP is DCN 3.5 (RDNA 3.5 iGPU). Kept distinct from
+    /// `Navi3` because the DCN 3.5 modeset register layout differs
+    /// from DCN 3.2 (Navi31): OTG block has shifted V_BLANK /
+    /// V_SYNC / OTG_CONTROL / INTERRUPT_CONTROL offsets per
+    /// `drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_5_0_offset.h`.
+    Phoenix,
 }
 
 impl Family {
@@ -214,6 +221,7 @@ impl Family {
             Family::Navi2 => None,
             Family::Navi3 => None,
             Family::Renoir => None,
+            Family::Phoenix => None,
         }
     }
 }
@@ -239,9 +247,11 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         return None;
     }
     let (family, asic, fw_name) = match did {
-        PHOENIX_HAWKPOINT1 => (Family::Navi3, "phoenix", "amdgpu/phoenix.bin"),
-        PHOENIX_DISCRETE => (Family::Navi3, "phoenix", "amdgpu/phoenix.bin"),
-        STRIX_POINT => (Family::Navi3, "strix", "amdgpu/strix.bin"),
+        // Phoenix / HawkPoint / Strix all carry RDNA3.5 iGPU →
+        // DCN 3.5 display IP; they take the DCN 3.5 modeset path.
+        PHOENIX_HAWKPOINT1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin"),
+        PHOENIX_DISCRETE => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin"),
+        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin"),
         RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin"),
         CEZANNE => (Family::Renoir, "cezanne", "amdgpu/cezanne.bin"),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin"),
@@ -652,12 +662,26 @@ impl AmdGpu {
 
         // Build the sequence. `mode.stride` is in pixels — DCN's
         // DCSURF_SURFACE_PITCH field also expects pixels.
-        let seq = crate::amdgpu_dcn::dcn20_modeset_sequence(
-            &timing,
-            self.vram.base,
-            mode.stride,
-            dcn_base,
-        );
+        //
+        // Branch by family: Phoenix / HawkPoint / Strix run DCN 3.5
+        // (different OTG register layout — see `amdgpu_dcn` module
+        // header for the per-register shifts). Everything else with
+        // a discoverable DCN block today is DCN 2.0 (Renoir,
+        // Cezanne, Lucienne).
+        let seq = match self.chip.family {
+            Family::Phoenix => crate::amdgpu_dcn::dcn35_modeset_sequence(
+                &timing,
+                self.vram.base,
+                mode.stride,
+                dcn_base,
+            ),
+            _ => crate::amdgpu_dcn::dcn20_modeset_sequence(
+                &timing,
+                self.vram.base,
+                mode.stride,
+                dcn_base,
+            ),
+        };
 
         // Drive the sequencer.
         // SAFETY: caller-asserted exclusive ownership of BAR5.
