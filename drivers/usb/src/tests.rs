@@ -1743,3 +1743,107 @@ kernel_test_in!(
     "drivers/usb/uvc",
     smoke_usb_uvc_reassembler_drops_errored_frame
 );
+
+// ── drivers/usb/uac (sample rate + PCM ring) ───────────────────────
+
+fn smoke_usb_uac_encode_sampling_freq_48k() -> TestResult {
+    use crate::uac::{decode_sampling_freq, encode_sampling_freq};
+    // 48 kHz = 0x00BB80 little-endian = [0x80, 0xBB, 0x00].
+    let b = encode_sampling_freq(48_000);
+    if b != [0x80, 0xBB, 0x00] {
+        return TestResult::Fail("48k LE bytes wrong");
+    }
+    // 44.1 kHz = 0x00AC44.
+    let b = encode_sampling_freq(44_100);
+    if b != [0x44, 0xAC, 0x00] {
+        return TestResult::Fail("44.1k LE bytes wrong");
+    }
+    // Round-trip.
+    if decode_sampling_freq(&encode_sampling_freq(96_000)) != Some(96_000) {
+        return TestResult::Fail("96k round-trip wrong");
+    }
+    // Truncated buf.
+    if decode_sampling_freq(&[0u8; 2]).is_some() {
+        return TestResult::Fail("2-byte buf must yield None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_encode_sampling_freq_48k);
+
+fn smoke_usb_uac_pcm_format_audio_frame_bytes() -> TestResult {
+    use crate::uac::PcmFormat;
+    let stereo_16 = PcmFormat { channels: 2, bytes_per_sample: 2, bit_depth: 16 };
+    if stereo_16.audio_frame_bytes() != 4 {
+        return TestResult::Fail("stereo/16: 2 ch * 2 bytes = 4");
+    }
+    if stereo_16.iso_packet_bytes(48) != 4 * 48 {
+        return TestResult::Fail("iso_packet_bytes(48) wrong");
+    }
+    let five_one_24 = PcmFormat { channels: 6, bytes_per_sample: 4, bit_depth: 24 };
+    if five_one_24.audio_frame_bytes() != 24 {
+        return TestResult::Fail("5.1/24-in-32: 6 ch * 4 = 24");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_format_audio_frame_bytes);
+
+fn smoke_usb_uac_pcm_ring_push_pop_round_trip() -> TestResult {
+    use crate::uac::{PcmFormat, PcmRing};
+    let fmt = PcmFormat { channels: 2, bytes_per_sample: 2, bit_depth: 16 };
+    let mut ring = PcmRing::new(fmt, 128);
+    // Push 16 bytes (4 audio frames).
+    let in_bytes: [u8; 16] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10,
+    ];
+    ring.push(&in_bytes).expect("push");
+    if ring.filled() != 16 {
+        return TestResult::Fail("filled mismatch after push");
+    }
+    let mut out = [0u8; 16];
+    let n = ring.pop(&mut out).expect("pop");
+    if n != 16 || out != in_bytes {
+        return TestResult::Fail("pop bytes mismatch");
+    }
+    if ring.filled() != 0 {
+        return TestResult::Fail("filled must be 0 after full drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_push_pop_round_trip);
+
+fn smoke_usb_uac_pcm_ring_misaligned_rejected() -> TestResult {
+    use crate::uac::{PcmError, PcmFormat, PcmRing};
+    let fmt = PcmFormat { channels: 2, bytes_per_sample: 2, bit_depth: 16 };
+    let mut ring = PcmRing::new(fmt, 64);
+    // 5 bytes — not a multiple of 4 (audio_frame_bytes).
+    match ring.push(&[0u8; 5]) {
+        Err(PcmError::Misaligned) => {}
+        _ => return TestResult::Fail("misaligned push must reject"),
+    }
+    let mut out = [0u8; 3];
+    match ring.pop(&mut out) {
+        Err(PcmError::Misaligned) => TestResult::Pass,
+        _ => TestResult::Fail("misaligned pop must reject"),
+    }
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_misaligned_rejected);
+
+fn smoke_usb_uac_pcm_ring_wraps_around() -> TestResult {
+    use crate::uac::{PcmFormat, PcmRing};
+    let fmt = PcmFormat { channels: 1, bytes_per_sample: 2, bit_depth: 16 };
+    let mut ring = PcmRing::new(fmt, 8); // capacity = 8 bytes
+    // Fill the ring, drain it, fill again — forces head+tail wrap.
+    ring.push(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22])
+        .expect("push 1");
+    let mut tmp = [0u8; 8];
+    ring.pop(&mut tmp).expect("pop 1");
+    ring.push(&[0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA])
+        .expect("push 2 (after wrap)");
+    ring.pop(&mut tmp).expect("pop 2");
+    if tmp != [0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA] {
+        return TestResult::Fail("wrap-around bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_wraps_around);

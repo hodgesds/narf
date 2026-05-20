@@ -467,3 +467,169 @@ pub fn attached_uac_count() -> usize {
 pub fn __reset_uac_for_test() {
     UAC_DEVICES.lock().clear();
 }
+
+// ── Sample-rate class request (§5.2.2.1.2) ─────────────────────────
+//
+// UAC1 endpoints expose a SAMPLING_FREQUENCY_CONTROL the host
+// programs via class-specific SET_CUR on the endpoint:
+//
+//   bmRequestType = 0x22 (host→device, class, endpoint)
+//   bRequest = SET_CUR (0x01) or GET_CUR (0x81)
+//   wValue = (SAMPLING_FREQUENCY_CONTROL << 8) | 0
+//   wIndex = endpoint address
+//   wLength = 3
+//   data = sample rate in Hz, little-endian, 24-bit
+//
+// 48 kHz = 0x00BB80, 44.1 kHz = 0x00AC44, 96 kHz = 0x017700.
+
+/// `SET_CUR` class request code.
+pub const REQ_SET_CUR: u8 = 0x01;
+/// `GET_CUR` class request code.
+pub const REQ_GET_CUR: u8 = 0x81;
+/// Control selector for sampling-frequency endpoint control.
+pub const SAMPLING_FREQUENCY_CONTROL: u8 = 0x01;
+
+/// Encode a sampling frequency for SET_CUR data payload. UAC1
+/// uses a 24-bit little-endian integer (3 bytes).
+pub fn encode_sampling_freq(hz: u32) -> [u8; 3] {
+    [
+        (hz & 0xFF) as u8,
+        ((hz >> 8) & 0xFF) as u8,
+        ((hz >> 16) & 0xFF) as u8,
+    ]
+}
+
+/// Decode a 24-bit LE sampling frequency from a GET_CUR response.
+pub fn decode_sampling_freq(buf: &[u8]) -> Option<u32> {
+    if buf.len() < 3 {
+        return None;
+    }
+    Some((buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16))
+}
+
+// ── PCM frame ring ─────────────────────────────────────────────────
+//
+// Holds enqueued PCM samples for playback or just-captured samples
+// for record. The xHCI iso ring submits/consumes one "iso packet" of
+// N samples per service interval; this buffer queues whole packets'
+// worth of samples behind the ring.
+
+/// Format of one PCM sample as carried over the iso endpoint.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PcmFormat {
+    /// Number of channels per frame (1 = mono, 2 = stereo, 6 = 5.1).
+    pub channels: u8,
+    /// Bytes per sample per channel (2 = 16-bit, 3 = 24-bit packed,
+    /// 4 = 32-bit). UAC1 calls this `bSubframeSize`.
+    pub bytes_per_sample: u8,
+    /// Bit depth (16, 24, 32). UAC1 calls this `bBitResolution` and
+    /// it can be less than `bytes_per_sample * 8` — e.g. 24-bit
+    /// data packed into 4-byte subframes.
+    pub bit_depth: u8,
+}
+
+impl PcmFormat {
+    /// Bytes per PCM "audio frame" (= one sample on every channel).
+    pub fn audio_frame_bytes(&self) -> usize {
+        self.channels as usize * self.bytes_per_sample as usize
+    }
+
+    /// Iso-packet size in bytes for `audio_frames_per_packet` frames.
+    pub fn iso_packet_bytes(&self, audio_frames_per_packet: usize) -> usize {
+        self.audio_frame_bytes() * audio_frames_per_packet
+    }
+}
+
+/// Errors from the PCM ring layer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PcmError {
+    /// Caller asked to enqueue an audio-frame-boundary-misaligned
+    /// byte count (would split a frame across iso packets).
+    Misaligned,
+    /// Ring is full — caller should wait + retry.
+    Full,
+    /// Ring is empty.
+    Empty,
+}
+
+/// Lock-free-ish PCM byte ring. Producer writes audio-frame-
+/// aligned chunks via `push`; consumer reads same-aligned chunks
+/// via `pop`. Wrapping is by byte index, not audio-frame count.
+#[derive(Debug)]
+pub struct PcmRing {
+    pub format: PcmFormat,
+    /// Backing storage (Vec to side-step boot-time MEM init order).
+    storage: Vec<u8>,
+    head: usize, // next byte to read
+    tail: usize, // next byte to write
+    /// Filled byte count — `head + filled == tail (mod len)`.
+    filled: usize,
+}
+
+impl PcmRing {
+    /// Allocate a ring with `capacity_bytes` of storage. Capacity
+    /// is rounded UP to a multiple of `format.audio_frame_bytes()`
+    /// so push/pop are always frame-aligned.
+    pub fn new(format: PcmFormat, capacity_bytes: usize) -> Self {
+        let frame = format.audio_frame_bytes().max(1);
+        let rounded = ((capacity_bytes + frame - 1) / frame) * frame;
+        Self {
+            format,
+            storage: alloc::vec![0u8; rounded],
+            head: 0,
+            tail: 0,
+            filled: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    pub fn free(&self) -> usize {
+        self.storage.len() - self.filled
+    }
+
+    /// Push audio-frame-aligned bytes. Returns Misaligned on a
+    /// fractional-frame `data.len()`, Full when there isn't room.
+    pub fn push(&mut self, data: &[u8]) -> Result<(), PcmError> {
+        let frame = self.format.audio_frame_bytes();
+        if frame == 0 || data.len() % frame != 0 {
+            return Err(PcmError::Misaligned);
+        }
+        if data.len() > self.free() {
+            return Err(PcmError::Full);
+        }
+        let cap = self.storage.len();
+        for &b in data {
+            self.storage[self.tail] = b;
+            self.tail = (self.tail + 1) % cap;
+        }
+        self.filled += data.len();
+        Ok(())
+    }
+
+    /// Pop up to `out.len()` bytes (must be a multiple of audio-frame
+    /// bytes). Returns the number actually moved.
+    pub fn pop(&mut self, out: &mut [u8]) -> Result<usize, PcmError> {
+        let frame = self.format.audio_frame_bytes();
+        if frame == 0 || out.len() % frame != 0 {
+            return Err(PcmError::Misaligned);
+        }
+        if self.filled == 0 {
+            return Err(PcmError::Empty);
+        }
+        let n = out.len().min(self.filled);
+        let cap = self.storage.len();
+        for i in 0..n {
+            out[i] = self.storage[self.head];
+            self.head = (self.head + 1) % cap;
+        }
+        self.filled -= n;
+        Ok(n)
+    }
+}
