@@ -793,7 +793,7 @@ fn smoke_block_registry_register_find_round_trip() -> TestResult {
     // count).
     use crate::registry::{
         block_device_count, find_block_device, register_block_device, BlockDeviceSync,
-        BlockIoError, __reset_for_test,
+        BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
     };
     use alloc::sync::Arc;
 
@@ -805,34 +805,41 @@ fn smoke_block_registry_register_find_round_trip() -> TestResult {
         fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> { Ok(()) }
     }
 
+    // Save boot-time registrations so later tests (e.g.
+    // `smoke_block_registry_uniform_read`) still see nvme0 /
+    // vblk0 / sata0 after we wipe + repopulate.
+    let saved = __snapshot_for_test();
     __reset_for_test();
     if block_device_count() != 0 {
+        __restore_for_test(saved);
         return TestResult::Fail("registry not empty after reset");
     }
     register_block_device("smoke-stub-a", Arc::new(Stub));
     register_block_device("smoke-stub-b", Arc::new(Stub));
     if block_device_count() != 2 {
-        __reset_for_test();
+        __restore_for_test(saved);
         return TestResult::Fail("register didn't bump count to 2");
     }
     if find_block_device("smoke-stub-a").is_none() {
-        __reset_for_test();
+        __restore_for_test(saved);
         return TestResult::Fail("find didn't locate registered device");
     }
     if find_block_device("nonexistent").is_some() {
-        __reset_for_test();
+        __restore_for_test(saved);
         return TestResult::Fail("find returned Some for missing device");
     }
     // Re-register same name → replaces in place; count stays 2.
     register_block_device("smoke-stub-a", Arc::new(Stub));
     if block_device_count() != 2 {
-        __reset_for_test();
+        __restore_for_test(saved);
         return TestResult::Fail("re-register inflated count past 2");
     }
     __reset_for_test();
     if block_device_count() != 0 {
+        __restore_for_test(saved);
         return TestResult::Fail("reset didn't clear registry");
     }
+    __restore_for_test(saved);
     TestResult::Pass
 }
 kernel_test_in!("block", smoke_block_registry_register_find_round_trip);

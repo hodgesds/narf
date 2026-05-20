@@ -99,6 +99,23 @@ pub fn __reset_for_test() {
     REGISTRY.lock().clear();
 }
 
+/// Test-only: snapshot the current registry so a test that wipes
+/// it (e.g., `smoke_block_registry_register_find_round_trip`) can
+/// restore the boot-time entries afterwards. Without this, later
+/// tests that depend on `nvme0`/`vblk0`/`sata0` being present
+/// (registered once at boot during driver probe) see an empty
+/// registry and fail.
+#[doc(hidden)]
+pub fn __snapshot_for_test() -> Vec<RegisteredBlockDevice> {
+    REGISTRY.lock().clone()
+}
+
+/// Test-only: restore a snapshot taken by `__snapshot_for_test`.
+#[doc(hidden)]
+pub fn __restore_for_test(snap: Vec<RegisteredBlockDevice>) {
+    *REGISTRY.lock() = snap;
+}
+
 // ── Sync → Async block-device bridge ───────────────────────────────
 //
 // Filesystems consume `BlockDevice` (async); the registry stores
