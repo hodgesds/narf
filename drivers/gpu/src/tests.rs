@@ -4224,3 +4224,104 @@ kernel_test_in!(
     "drivers/gpu",
     smoke_dp_link_training_train_link_walks_fallback
 );
+
+// ── amdgpu/gfx (GFX11 Phoenix delta) ───────────────────────────────
+
+fn smoke_amdgpu_gfx11_ring_init_emits_canonical_order() -> TestResult {
+    use crate::amdgpu_gfx::{
+        build_gfx11_ring_init, CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_REL, CP_RB0_BASE_REL,
+        CP_RB0_CNTL_REL, CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_EN,
+        CP_RB_DOORBELL_OFFSET_SHIFT,
+    };
+    let gc_base: u32 = 0x0003_0000;
+    let ring_phys: u64 = 0x0000_0001_5000_0000;
+    let ring_size_dw: u32 = 2048;
+    let doorbell_idx: u32 = 8;
+    let rptr_phys: u64 = 0x0000_0002_0000_0000;
+
+    let seq = match build_gfx11_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys)
+    {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("build_gfx11_ring_init failed on valid input"),
+    };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+
+    // First write: halt via CP_GFX_CNTL (NOT CP_ME_CNTL — that's GFX9).
+    if w.first().map(|x| (x.addr, x.value))
+        != Some((gc_base + CP_GFX_CNTL_REL, CP_GFX_CNTL_HALT_ALL))
+    {
+        return TestResult::Fail("first write must halt CP via CP_GFX_CNTL");
+    }
+    // Last write: unhalt (CP_GFX_CNTL = 0).
+    if w.last().map(|x| (x.addr, x.value)) != Some((gc_base + CP_GFX_CNTL_REL, 0)) {
+        return TestResult::Fail("last write must unhalt CP_GFX_CNTL");
+    }
+    // Body writes must include base, size encoding, doorbell.
+    if !w.iter().any(|x| x.addr == gc_base + CP_RB0_BASE_REL && x.value == ring_phys as u32) {
+        return TestResult::Fail("ring base lo not programmed");
+    }
+    let expect_cntl = ring_size_dw.trailing_zeros() | (6u32 << 8);
+    if !w.iter().any(|x| x.addr == gc_base + CP_RB0_CNTL_REL && x.value == expect_cntl) {
+        return TestResult::Fail("ring size encoding wrong");
+    }
+    if !w.iter().any(|x| {
+        x.addr == gc_base + CP_RB_DOORBELL_CONTROL_REL
+            && x.value == (CP_RB_DOORBELL_EN | (doorbell_idx << CP_RB_DOORBELL_OFFSET_SHIFT))
+    }) {
+        return TestResult::Fail("doorbell control not programmed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx11_ring_init_emits_canonical_order
+);
+
+fn smoke_amdgpu_gfx11_uses_distinct_halt_register() -> TestResult {
+    use crate::amdgpu_gfx::{
+        CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_ME_HALT_GFX11, CP_GFX_CNTL_PFP_HALT_GFX11,
+        CP_GFX_CNTL_REL, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_ME_HALT, CP_ME_CNTL_PFP_HALT,
+        CP_ME_CNTL_REL,
+    };
+    // GFX11's CP_GFX_CNTL must live at a different offset from GFX9's CP_ME_CNTL.
+    if CP_GFX_CNTL_REL == CP_ME_CNTL_REL {
+        return TestResult::Fail("GFX11 CP_GFX_CNTL must differ from GFX9 CP_ME_CNTL");
+    }
+    // Halt-bit positions must differ — GFX9 uses bits {24, 26, 28};
+    // GFX11 uses bits {0, 4, 8}.
+    if CP_GFX_CNTL_PFP_HALT_GFX11 == CP_ME_CNTL_PFP_HALT
+        || CP_GFX_CNTL_ME_HALT_GFX11 == CP_ME_CNTL_ME_HALT
+    {
+        return TestResult::Fail("GFX11 halt bits must differ from GFX9");
+    }
+    // Composite masks must differ.
+    if CP_GFX_CNTL_HALT_ALL == CP_ME_CNTL_HALT_ALL {
+        return TestResult::Fail("HALT_ALL composites must differ between GFX9/GFX11");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx11_uses_distinct_halt_register
+);
+
+fn smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError};
+    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_0000, 1000, 0, 0x2_0000_0000) {
+        Err(GfxError::BadRingSize) => {}
+        _ => return TestResult::Fail("non-pow2 ring size must be rejected"),
+    }
+    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_00FF, 1024, 0, 0x2_0000_0000) {
+        Err(GfxError::UnalignedRingPhys) => {}
+        _ => return TestResult::Fail("unaligned ring phys must be rejected"),
+    }
+    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_0000, 1024, 0, 0x2_0000_0001) {
+        Err(GfxError::UnalignedRptrWriteback) => {}
+        _ => return TestResult::Fail("unaligned rptr-writeback must be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gfx",
+    smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs
+);

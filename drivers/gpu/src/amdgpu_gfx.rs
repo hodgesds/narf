@@ -102,6 +102,91 @@ pub const CP_RB_DOORBELL_EN: u32 = 1 << 30;
 /// `CP_RB_DOORBELL_CONTROL` — doorbell offset shift.
 pub const CP_RB_DOORBELL_OFFSET_SHIFT: u32 = 2;
 
+// ── CP register offsets (GFX11 — Phoenix HawkPoint1 / Strix) ───────
+//
+// Values from gc/gc_11_0_0_offset.h. Most ring registers keep the
+// same dword IDs as GFX9; the key delta is that CP_ME_CNTL is
+// replaced by CP_GFX_CNTL with reshuffled halt-bit positions.
+
+/// `mmCP_GFX_CNTL` (GFX11) — replaces CP_ME_CNTL for halt/unhalt.
+pub const CP_GFX_CNTL_REL: u32 = 0x103E * 4;
+
+// CP_GFX_CNTL halt bits — distinct positions from CP_ME_CNTL on GFX9.
+
+/// `CP_GFX_CNTL` — halt the FE (front-end fetch).
+pub const CP_GFX_CNTL_FE_HALT: u32 = 1 << 0;
+/// `CP_GFX_CNTL` — halt the PFP engine.
+pub const CP_GFX_CNTL_PFP_HALT_GFX11: u32 = 1 << 4;
+/// `CP_GFX_CNTL` — halt the ME engine.
+pub const CP_GFX_CNTL_ME_HALT_GFX11: u32 = 1 << 8;
+/// Combined: halt all GFX11 CP engines.
+pub const CP_GFX_CNTL_HALT_ALL: u32 =
+    CP_GFX_CNTL_FE_HALT | CP_GFX_CNTL_PFP_HALT_GFX11 | CP_GFX_CNTL_ME_HALT_GFX11;
+
+/// Validate the ring config + emit the CP ring-init sequence for a
+/// GFX11 device (Phoenix HawkPoint1 / Strix Point). Structurally
+/// identical to `build_gfx9_ring_init` — same disable/wptr-reset/
+/// rptr-writeback/base/size/doorbell/unhalt ordering — but the
+/// halt/unhalt writes go to mmCP_GFX_CNTL with different bit
+/// positions, and the ME_CNTL register doesn't exist on GFX11.
+/// Per Linux drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c::
+/// gfx_v11_0_cp_gfx_resume + gfx_v11_0_cp_gfx_enable.
+pub fn build_gfx11_ring_init(
+    gc_base: u32,
+    ring_phys: u64,
+    ring_size_dw: u32,
+    doorbell_idx: u32,
+    rptr_writeback_phys: u64,
+) -> Result<GfxRingInitSequence, GfxError> {
+    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+        return Err(GfxError::BadRingSize);
+    }
+    if ring_phys & 0xFF != 0 {
+        return Err(GfxError::UnalignedRingPhys);
+    }
+    if rptr_writeback_phys & 0x7 != 0 {
+        return Err(GfxError::UnalignedRptrWriteback);
+    }
+
+    let mut seq = GfxRingInitSequence::default();
+
+    // Step 1: halt the CP engines via CP_GFX_CNTL (NOT CP_ME_CNTL).
+    seq.push(gc_base + CP_GFX_CNTL_REL, CP_GFX_CNTL_HALT_ALL);
+
+    // Step 2: reset wptr.
+    seq.push(gc_base + CP_RB0_WPTR_REL, 0);
+    seq.push(gc_base + CP_RB0_WPTR_HI_REL, 0);
+
+    // Step 3: rptr writeback (same coherent-bits-OR-into-hi rule).
+    seq.push(gc_base + CP_RB0_RPTR_ADDR_REL, rptr_writeback_phys as u32);
+    seq.push(
+        gc_base + CP_RB0_RPTR_ADDR_HI_REL,
+        ((rptr_writeback_phys >> 32) as u32) | RPTR_WRITEBACK_COHERENT,
+    );
+
+    // Step 4: ring base.
+    seq.push(gc_base + CP_RB0_BASE_REL, ring_phys as u32);
+    seq.push(gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 32) as u32);
+
+    // Step 5: ring size.
+    let log2_size = ring_size_dw.trailing_zeros();
+    let blksz: u32 = 6;
+    seq.push(gc_base + CP_RB0_CNTL_REL, log2_size | (blksz << 8));
+
+    // Step 6: doorbell.
+    seq.push(
+        gc_base + CP_RB_DOORBELL_CONTROL_REL,
+        CP_RB_DOORBELL_EN | (doorbell_idx << CP_RB_DOORBELL_OFFSET_SHIFT),
+    );
+    seq.push(gc_base + CP_RB_DOORBELL_RANGE_LOWER_REL, doorbell_idx);
+    seq.push(gc_base + CP_RB_DOORBELL_RANGE_UPPER_REL, doorbell_idx + 1);
+
+    // Step 7: unhalt — clear CP_GFX_CNTL (engines start fetching).
+    seq.push(gc_base + CP_GFX_CNTL_REL, 0);
+
+    Ok(seq)
+}
+
 // ── Sequence shape ─────────────────────────────────────────────────
 
 /// Errors building the ring-init sequence.
