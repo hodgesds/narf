@@ -3136,3 +3136,151 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/pm4",
     smoke_amdgpu_pm4_set_context_reg_rejects_empty_values
 );
+
+// ── amdgpu/ih (interrupt handler ring) ─────────────────────────────
+
+fn smoke_amdgpu_ih4_ring_init_emits_canonical_order() -> TestResult {
+    use crate::amdgpu_ih::{
+        build_ih4_ring_init, IH_DOORBELL_ENABLE, IH_DOORBELL_RPTR_REL, IH_RB_BASE_HI_REL,
+        IH_RB_BASE_REL, IH_RB_CNTL_REL, IH_RB_ENABLE, IH_RB_GPU_TS_ENABLE,
+        IH_RB_OVERFLOW_CLEAR, IH_RB_SIZE_SHIFT, IH_RB_WPTR_ADDR_HI_REL,
+        IH_RB_WPTR_ADDR_LO_REL, IH_RB_WPTR_WRITEBACK_ENABLE,
+    };
+    let ih_base: u32 = 0x0009_0000;
+    let ring_phys: u64 = 0x0000_0001_4000_0000;
+    let ring_size_dw: u32 = 512;
+    let doorbell_idx: u32 = 6;
+    let wptr_phys: u64 = 0x0000_0002_1234_0000;
+
+    let seq =
+        match build_ih4_ring_init(ih_base, ring_phys, ring_size_dw, doorbell_idx, wptr_phys) {
+            Ok(s) => s,
+            Err(_) => return TestResult::Fail("build_ih4_ring_init failed on valid input"),
+        };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+
+    if w.first().map(|x| (x.addr, x.value)) != Some((ih_base + IH_RB_CNTL_REL, 0)) {
+        return TestResult::Fail("first write must disable CNTL");
+    }
+    let expected_cntl_no_en = (ring_size_dw.trailing_zeros() << IH_RB_SIZE_SHIFT)
+        | IH_RB_GPU_TS_ENABLE
+        | IH_RB_WPTR_WRITEBACK_ENABLE
+        | IH_RB_OVERFLOW_CLEAR;
+    let expected_cntl_en = expected_cntl_no_en | IH_RB_ENABLE;
+    let last = w.last().copied();
+    if last.map(|x| (x.addr, x.value)) != Some((ih_base + IH_RB_CNTL_REL, expected_cntl_en)) {
+        return TestResult::Fail("last write must enable CNTL with full mask");
+    }
+    let want = [
+        (ih_base + IH_RB_BASE_REL, (ring_phys >> 8) as u32),
+        (ih_base + IH_RB_BASE_HI_REL, (ring_phys >> 40) as u32),
+        (ih_base + IH_RB_WPTR_ADDR_LO_REL, wptr_phys as u32),
+        (ih_base + IH_RB_WPTR_ADDR_HI_REL, (wptr_phys >> 32) as u32),
+        (
+            ih_base + IH_DOORBELL_RPTR_REL,
+            IH_DOORBELL_ENABLE | (doorbell_idx << 2),
+        ),
+    ];
+    for (addr, value) in want {
+        if !w.iter().any(|x| x.addr == addr && x.value == value) {
+            return TestResult::Fail("missing expected IH init write");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ih",
+    smoke_amdgpu_ih4_ring_init_emits_canonical_order
+);
+
+fn smoke_amdgpu_ih4_validation_rejects_bad_inputs() -> TestResult {
+    use crate::amdgpu_ih::{build_ih4_ring_init, IhError};
+    match build_ih4_ring_init(0x0009_0000, 0x1_0000_0000, 999, 0, 0x2_0000_0000) {
+        Err(IhError::BadRingSize) => {}
+        _ => return TestResult::Fail("non-pow2 size must be rejected"),
+    }
+    match build_ih4_ring_init(0x0009_0000, 0x1_0000_0080, 512, 0, 0x2_0000_0000) {
+        Err(IhError::UnalignedRingPhys) => {}
+        _ => return TestResult::Fail("256-byte misalignment must be rejected"),
+    }
+    match build_ih4_ring_init(0x0009_0000, 0x1_0000_0000, 512, 0, 0x2_0000_0001) {
+        Err(IhError::UnalignedWptrWriteback) => {}
+        _ => return TestResult::Fail("unaligned writeback must be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ih",
+    smoke_amdgpu_ih4_validation_rejects_bad_inputs
+);
+
+fn smoke_amdgpu_ih_cookie_header_round_trip() -> TestResult {
+    use crate::amdgpu_ih::{IhCookieHeader, CLIENT_ID_DCN, SOURCE_ID_DCN_VBLANK};
+    // Synthesize a "DCN VBlank on controller 1" cookie header.
+    let hdr = IhCookieHeader {
+        client_id: CLIENT_ID_DCN,
+        source_id: SOURCE_ID_DCN_VBLANK,
+        ring_id: 0,
+        reserved: 0,
+    };
+    let dw = hdr.to_dword();
+    let back = IhCookieHeader::from_dword(dw);
+    if back != hdr {
+        return TestResult::Fail("cookie header round-trip mismatch");
+    }
+    if back.client_id != CLIENT_ID_DCN || back.source_id != SOURCE_ID_DCN_VBLANK {
+        return TestResult::Fail("decoded client/source ids wrong");
+    }
+    // Cross-check bit layout against the public AMD docs:
+    //   client_id in bits[7:0], source_id in [15:8].
+    if (dw & 0xFF) != CLIENT_ID_DCN as u32 {
+        return TestResult::Fail("client_id not in dw[7:0]");
+    }
+    if ((dw >> 8) & 0xFF) != SOURCE_ID_DCN_VBLANK as u32 {
+        return TestResult::Fail("source_id not in dw[15:8]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ih",
+    smoke_amdgpu_ih_cookie_header_round_trip
+);
+
+fn smoke_amdgpu_ih_enable_strictly_after_disable() -> TestResult {
+    use crate::amdgpu_ih::{
+        build_ih4_ring_init, IH_RB_CNTL_REL, IH_RB_ENABLE,
+    };
+    let ih_base: u32 = 0x0009_0000;
+    let seq = match build_ih4_ring_init(ih_base, 0x1_0000_0000, 256, 3, 0x2_0000_0000) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("happy-path build failed"),
+    };
+    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
+    let cntl_addr = ih_base + IH_RB_CNTL_REL;
+    let mut last_i = None;
+    for (i, x) in w.iter().enumerate() {
+        if x.addr == cntl_addr {
+            last_i = Some(i);
+        }
+    }
+    let li = match last_i {
+        Some(i) => i,
+        None => return TestResult::Fail("no CNTL write in sequence"),
+    };
+    for (i, x) in w.iter().enumerate() {
+        if i == li {
+            continue;
+        }
+        if x.addr == cntl_addr && (x.value & IH_RB_ENABLE) != 0 {
+            return TestResult::Fail("RB_ENABLE set before final CNTL write");
+        }
+    }
+    if (w[li].value & IH_RB_ENABLE) == 0 {
+        return TestResult::Fail("final CNTL must set RB_ENABLE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ih",
+    smoke_amdgpu_ih_enable_strictly_after_disable
+);
