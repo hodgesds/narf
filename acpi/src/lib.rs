@@ -28,6 +28,7 @@ extern crate alloc;
 pub mod ac_adapter;
 pub mod battery;
 pub mod buttons;
+pub mod fan;
 pub mod ioapic;
 pub mod lid;
 pub mod smbios;

@@ -54,6 +54,7 @@ pub mod oregion;
 pub mod prt_crs;
 pub mod resource;
 pub mod sync;
+pub mod wmi;
 
 mod tests;
 

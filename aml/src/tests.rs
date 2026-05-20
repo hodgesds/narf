@@ -1883,3 +1883,101 @@ kernel_test_in!(
     "aml/ec_events",
     smoke_aml_ec_events_drain_bails_without_configured_ec
 );
+
+// ── aml/wmi ────────────────────────────────────────────────────────
+
+fn smoke_aml_wmi_decode_wdg_single_descriptor() -> TestResult {
+    use crate::wmi::{decode_wdg, WdgError, WDG_FLAG_EVENT, WDG_FLAG_METHOD};
+    // One descriptor: GUID + object_id "AA" + count 1 + flags=Method.
+    let mut buf = alloc::vec![0u8; 20];
+    for (i, b) in buf[..16].iter_mut().enumerate() {
+        *b = i as u8; // synthetic GUID
+    }
+    buf[16] = b'A';
+    buf[17] = b'A';
+    buf[18] = 1;
+    buf[19] = WDG_FLAG_METHOD;
+    let descs = match decode_wdg(&buf) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("decode_wdg rejected valid 20-byte buffer"),
+    };
+    if descs.len() != 1 {
+        return TestResult::Fail("expected one descriptor");
+    }
+    if descs[0].object_id != [b'A', b'A'] {
+        return TestResult::Fail("object_id mismatch");
+    }
+    if descs[0].is_event() {
+        return TestResult::Fail("METHOD flag set — must NOT report as event");
+    }
+    if descs[0].method_name().as_deref() != Some("WMAA") {
+        return TestResult::Fail("expected method name WMAA");
+    }
+    // Now flip to an event flag.
+    buf[19] = WDG_FLAG_EVENT;
+    let d2 = decode_wdg(&buf).unwrap();
+    if !d2[0].is_event() {
+        return TestResult::Fail("EVENT flag must report as event");
+    }
+    if d2[0].method_name().as_deref() != Some("WEAA") {
+        return TestResult::Fail("event method name must use WE prefix");
+    }
+    // Bad-length buffer.
+    match decode_wdg(&buf[..19]) {
+        Err(WdgError::BadLength(19)) => {}
+        _ => return TestResult::Fail("19-byte buffer must be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml/wmi", smoke_aml_wmi_decode_wdg_single_descriptor);
+
+fn smoke_aml_wmi_dispatch_invokes_registered_handlers() -> TestResult {
+    use crate::wmi::{
+        dispatch_wmi_event, register_wmi_event_handler, __reset_for_test,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+    __reset_for_test();
+
+    // Two handlers for the same GUID record the notify_value
+    // they were called with, so we can verify both fire.
+    static OBSERVED_A: AtomicU64 = AtomicU64::new(0);
+    static OBSERVED_B: AtomicU64 = AtomicU64::new(0);
+    OBSERVED_A.store(0, Ordering::Release);
+    OBSERVED_B.store(0, Ordering::Release);
+
+    fn handler_a(v: u64) { OBSERVED_A.store(v, Ordering::Release); }
+    fn handler_b(v: u64) { OBSERVED_B.store(v, Ordering::Release); }
+
+    let target = [0xAAu8; 16];
+    let other = [0xBBu8; 16];
+    register_wmi_event_handler(target, handler_a);
+    register_wmi_event_handler(target, handler_b);
+    // Register a third for a DIFFERENT GUID — must NOT fire.
+    fn handler_c(_v: u64) { panic!("handler_c must not fire"); }
+    register_wmi_event_handler(other, handler_c);
+
+    let n = dispatch_wmi_event(&target, 0xC0FFEE);
+    if n != 2 {
+        return TestResult::Fail("expected 2 handlers fired");
+    }
+    if OBSERVED_A.load(Ordering::Acquire) != 0xC0FFEE {
+        return TestResult::Fail("handler_a didn't observe notify value");
+    }
+    if OBSERVED_B.load(Ordering::Acquire) != 0xC0FFEE {
+        return TestResult::Fail("handler_b didn't observe notify value");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("aml/wmi", smoke_aml_wmi_dispatch_invokes_registered_handlers);
+
+fn smoke_aml_wmi_dispatch_no_match_returns_zero() -> TestResult {
+    use crate::wmi::{dispatch_wmi_event, __reset_for_test};
+    __reset_for_test();
+    let unknown = [0x42u8; 16];
+    if dispatch_wmi_event(&unknown, 0) != 0 {
+        return TestResult::Fail("unmatched GUID must dispatch to 0 handlers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml/wmi", smoke_aml_wmi_dispatch_no_match_returns_zero);

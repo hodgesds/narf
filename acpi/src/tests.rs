@@ -2657,3 +2657,83 @@ fn smoke_acpi_buttons_pm1_sts_bit_positions() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("acpi/buttons", smoke_acpi_buttons_pm1_sts_bit_positions);
+
+// ── acpi/fan ───────────────────────────────────────────────────────
+
+fn smoke_acpi_fan_decode_fst_typical_50pct() -> TestResult {
+    use crate::fan::{decode_fst, FanDecodeError};
+    // (revision=0, control=500 → 50.0 %, speed=2400 RPM).
+    let pkg = [0u32, 500, 2400];
+    let s = match decode_fst(&pkg) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("decode_fst rejected valid 3-tuple"),
+    };
+    if s.control != 500 || s.speed_rpm != 2400 {
+        return TestResult::Fail("control/speed fields not preserved");
+    }
+    if s.control_percent() != 50 {
+        return TestResult::Fail("control_percent must round to 50");
+    }
+    if !s.has_tachometer() {
+        return TestResult::Fail("speed=2400 must register as tachometered");
+    }
+    // Short package → WrongElementCount.
+    match decode_fst(&[0u32, 500]) {
+        Err(FanDecodeError::WrongElementCount) => {}
+        _ => return TestResult::Fail("2-element package must be rejected"),
+    }
+    // Control > 1000 → OutOfRange.
+    match decode_fst(&[0u32, 1500, 2400]) {
+        Err(FanDecodeError::ControlOutOfRange(1500)) => {}
+        _ => return TestResult::Fail("control=1500 must be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/fan", smoke_acpi_fan_decode_fst_typical_50pct);
+
+fn smoke_acpi_fan_has_tachometer_handles_unknown() -> TestResult {
+    use crate::fan::decode_fst;
+    let pkg = [0u32, 750, 0xFFFF_FFFF];
+    let s = decode_fst(&pkg).expect("decode");
+    if s.has_tachometer() {
+        return TestResult::Fail("speed=0xFFFFFFFF must read as no-tachometer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/fan", smoke_acpi_fan_has_tachometer_handles_unknown);
+
+fn smoke_acpi_fan_registry_register_and_iterate() -> TestResult {
+    use crate::fan::{
+        fan_count, register_fan, registered_fans, Fan, FanRuntimeError, FanStatus,
+        __reset_for_test,
+    };
+    use alloc::sync::Arc;
+    __reset_for_test();
+    if fan_count() != 0 {
+        return TestResult::Fail("fresh registry must be empty");
+    }
+    struct StubFan;
+    impl Fan for StubFan {
+        fn name(&self) -> &'static str { "cpu_fan" }
+        fn status(&self) -> Result<FanStatus, FanRuntimeError> {
+            Ok(FanStatus { revision: 0, control: 600, speed_rpm: 3000 })
+        }
+        fn set_control(&self, c: u32) -> Result<u32, FanRuntimeError> { Ok(c) }
+    }
+    register_fan(Arc::new(StubFan));
+    if fan_count() != 1 {
+        return TestResult::Fail("post-register count must be 1");
+    }
+    let fans = registered_fans();
+    if fans[0].name() != "cpu_fan" {
+        return TestResult::Fail("registered fan name mismatch");
+    }
+    // Re-register by same name → replaces in place.
+    register_fan(Arc::new(StubFan));
+    if fan_count() != 1 {
+        return TestResult::Fail("re-register must replace, not duplicate");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("acpi/fan", smoke_acpi_fan_registry_register_and_iterate);
