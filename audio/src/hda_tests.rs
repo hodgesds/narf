@@ -109,8 +109,12 @@ fn smoke_acp6_pci_match_registered() -> TestResult {
     bus_reset();
     acp6::register_pci_driver();
     let regs = registered_pci_drivers();
+    // Multi-chip registration: agent landing for Renoir / Phoenix /
+    // Pink Sardine / Rembrandt / Mero registers one entry per chip
+    // under names "acp6-<chip>". Accept any name starting with
+    // "acp6" so future ID additions don't churn this smoke.
     let matched = regs.iter().any(|m| {
-        m.name == "acp6"
+        m.name.starts_with("acp6")
             && matches!(
                 m.kind,
                 MatchKind::VendorDevice {
