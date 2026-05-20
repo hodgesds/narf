@@ -1823,3 +1823,50 @@ fn smoke_hotplug_event_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/hotplug", smoke_hotplug_event_variants_distinct);
+
+// ── bus/pci (config save/restore) ──────────────────────────────────
+
+fn smoke_pci_save_config_shape_fits_64_byte_header() -> TestResult {
+    use crate::pci::SavedPciConfig;
+    // SavedPciConfig is a pure POD struct — its size should be
+    // comparable to the 64-byte type-0 header it captures.
+    // Caps + alignment may bump it slightly; we just sanity-check
+    // it's smaller than 96 bytes.
+    let sz = core::mem::size_of::<SavedPciConfig>();
+    if sz > 96 {
+        return TestResult::Fail("SavedPciConfig must fit in <= 96 bytes");
+    }
+    if !(40..=96).contains(&sz) {
+        return TestResult::Fail("SavedPciConfig size out of plausible band");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_save_config_shape_fits_64_byte_header);
+
+fn smoke_pci_saved_config_is_pod_and_copyable() -> TestResult {
+    use crate::pci::SavedPciConfig;
+    let a = SavedPciConfig {
+        command: 0x0407, // I/O | Mem | BM | INTx-disable
+        cache_line_size: 64,
+        latency_timer: 0,
+        bist: 0,
+        bars: [0xF000_0000, 0x0000_0000, 0xE000_0000, 0, 0, 0],
+        cardbus_cis_ptr: 0,
+        subsys_vendor: 0x1022,
+        subsys_device: 0x1234,
+        expansion_rom_bar: 0,
+        interrupt_line: 11,
+        interrupt_pin: 1,
+        min_gnt: 0,
+        max_lat: 0,
+    };
+    let b = a; // Copy
+    if a != b {
+        return TestResult::Fail("SavedPciConfig must be Copy + Eq");
+    }
+    if a.command != 0x0407 || a.bars[0] != 0xF000_0000 || a.bars[2] != 0xE000_0000 {
+        return TestResult::Fail("field round-trip lost data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pci", smoke_pci_saved_config_is_pod_and_copyable);
