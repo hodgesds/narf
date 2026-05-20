@@ -31,6 +31,7 @@ pub mod deadline;
 pub mod encrypted;
 pub mod mq;
 pub mod opal;
+pub mod partition;
 pub mod ram;
 pub mod registry;
 pub mod scsi;

@@ -882,3 +882,160 @@ fn smoke_block_error_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("block", smoke_block_error_variants_distinct);
+
+// ── block/partition (MBR + GPT) ────────────────────────────────────
+
+/// Build a valid 512-byte sector containing a single MBR entry of
+/// type `kind` covering all sectors.
+fn build_mbr_sector(kind: u8) -> [u8; 512] {
+    let mut s = [0u8; 512];
+    // Entry 0 at offset 446.
+    s[446] = 0x00; // boot_flag inactive
+    s[450] = kind;
+    s[454..458].copy_from_slice(&1u32.to_le_bytes()); // start_lba
+    s[458..462].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sector_count
+    // 0xAA55 signature.
+    s[510] = 0x55;
+    s[511] = 0xAA;
+    s
+}
+
+fn smoke_block_partition_mbr_parse_signature_and_entry() -> TestResult {
+    use crate::partition::{parse_mbr, MBR_BOOT_SIGNATURE};
+    let s = build_mbr_sector(0x83); // Linux native
+    let parts = match parse_mbr(&s) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("parse_mbr rejected valid sector"),
+    };
+    if parts[0].kind != 0x83 {
+        return TestResult::Fail("entry 0 kind wrong");
+    }
+    if parts[0].start_lba != 1 || parts[0].sector_count != 0xFFFF_FFFF {
+        return TestResult::Fail("entry 0 LBA/count wrong");
+    }
+    // Signature check: should also fail when 0xAA55 isn't there.
+    let mut bad = build_mbr_sector(0x83);
+    bad[510] = 0;
+    bad[511] = 0;
+    if parse_mbr(&bad).is_ok() {
+        return TestResult::Fail("missing signature must be rejected");
+    }
+    let _ = MBR_BOOT_SIGNATURE; // doc-link sanity
+    TestResult::Pass
+}
+kernel_test_in!("block/partition", smoke_block_partition_mbr_parse_signature_and_entry);
+
+fn smoke_block_partition_gpt_protective_detected() -> TestResult {
+    use crate::partition::{is_gpt_protective, parse_mbr};
+    // Build a sector with a single 0xEE entry covering the disk.
+    let s = build_mbr_sector(0xEE);
+    let parts = parse_mbr(&s).expect("parse_mbr failed");
+    if !is_gpt_protective(&parts) {
+        return TestResult::Fail("0xEE entry must be classified GPT-protective");
+    }
+    // A legacy MBR (Linux 0x83) must NOT be flagged protective.
+    let s2 = build_mbr_sector(0x83);
+    let parts2 = parse_mbr(&s2).expect("parse_mbr failed");
+    if is_gpt_protective(&parts2) {
+        return TestResult::Fail("0x83 entry must NOT be GPT-protective");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/partition", smoke_block_partition_gpt_protective_detected);
+
+/// Build a 92-byte minimal GPT primary header (rest of sector is
+/// zero-padding). Header fields per UEFI 2.10 §5.3.2.
+fn build_gpt_header(first_usable: u64, last_usable: u64) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    h[0..8].copy_from_slice(b"EFI PART");
+    h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // rev 1.0
+    h[12..16].copy_from_slice(&92u32.to_le_bytes()); // header_size
+    h[16..20].copy_from_slice(&0u32.to_le_bytes()); // header_crc32 (caller verifies)
+    h[24..32].copy_from_slice(&1u64.to_le_bytes()); // current_lba
+    h[32..40].copy_from_slice(&0xFFFF_FFFFu64.to_le_bytes()); // backup_lba
+    h[40..48].copy_from_slice(&first_usable.to_le_bytes());
+    h[48..56].copy_from_slice(&last_usable.to_le_bytes());
+    // disk_guid at [56..72] left zero.
+    h[72..80].copy_from_slice(&2u64.to_le_bytes()); // partition_entries_lba
+    h[80..84].copy_from_slice(&128u32.to_le_bytes()); // num_entries
+    h[84..88].copy_from_slice(&128u32.to_le_bytes()); // entry_size
+    h
+}
+
+fn smoke_block_partition_gpt_header_round_trip() -> TestResult {
+    use crate::partition::{parse_gpt_header, GPT_REVISION_1_0};
+    let raw = build_gpt_header(2048, 0xFFFF_0000);
+    let h = match parse_gpt_header(&raw) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("parse_gpt_header rejected valid header"),
+    };
+    if h.revision != GPT_REVISION_1_0 {
+        return TestResult::Fail("revision lost");
+    }
+    if h.header_size != 92 {
+        return TestResult::Fail("header_size lost");
+    }
+    if h.first_usable_lba != 2048 || h.last_usable_lba != 0xFFFF_0000 {
+        return TestResult::Fail("usable-LBA range lost");
+    }
+    if h.partition_entry_size != 128 || h.num_partition_entries != 128 {
+        return TestResult::Fail("entry-size / entry-count lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/partition", smoke_block_partition_gpt_header_round_trip);
+
+fn smoke_block_partition_gpt_header_rejects_bad_signature() -> TestResult {
+    use crate::partition::{parse_gpt_header, GptError};
+    let mut bad = build_gpt_header(2048, 0xFFFF_0000);
+    bad[0] = b'X'; // corrupt signature
+    match parse_gpt_header(&bad) {
+        Err(GptError::BadSignature) => TestResult::Pass,
+        _ => TestResult::Fail("corrupt signature must be rejected"),
+    }
+}
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_gpt_header_rejects_bad_signature
+);
+
+fn smoke_block_partition_gpt_entries_decode_names_and_lba_range() -> TestResult {
+    use crate::partition::parse_gpt_partitions;
+    // Build a single 128-byte entry. Linux root partition GUID
+    // (0FC63DAF-8483-4772-8E79-3D69D8477DE4) — first 16 bytes.
+    let mut array = alloc::vec![0u8; 256];
+    array[0..16].copy_from_slice(&[
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
+        0x7D, 0xE4,
+    ]);
+    array[32..40].copy_from_slice(&2048u64.to_le_bytes()); // start_lba
+    array[40..48].copy_from_slice(&(2048u64 + 4096 - 1).to_le_bytes()); // end_lba inclusive
+    // Name "NARFROOT" as UTF-16LE.
+    let name = "NARFROOT";
+    for (i, c) in name.chars().enumerate() {
+        let cu = c as u16;
+        array[56 + i * 2] = cu as u8;
+        array[57 + i * 2] = (cu >> 8) as u8;
+    }
+    let parts = parse_gpt_partitions(&array, 128, 2);
+    if parts.len() != 2 {
+        return TestResult::Fail("expected 2 entries (including empty trailer)");
+    }
+    if parts[0].is_empty() {
+        return TestResult::Fail("first entry must be non-empty");
+    }
+    if parts[0].start_lba != 2048 || parts[0].sector_count() != 4096 {
+        return TestResult::Fail("LBA range wrong");
+    }
+    if parts[0].name != "NARFROOT" {
+        return TestResult::Fail("name decode wrong");
+    }
+    if !parts[1].is_empty() {
+        return TestResult::Fail("second entry should be empty (all-zero type-GUID)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_gpt_entries_decode_names_and_lba_range
+);
