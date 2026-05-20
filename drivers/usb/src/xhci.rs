@@ -169,6 +169,7 @@ const TRB_CYCLE_BIT: u32 = 1 << 0;
 
 // TRB types we care about (§6.4 — Command Descriptors / TRBs).
 const TRB_TYPE_NORMAL: u32 = 1;
+const TRB_TYPE_ISOCH: u32 = 5;
 const TRB_TYPE_SETUP_STAGE: u32 = 2;
 const TRB_TYPE_DATA_STAGE: u32 = 3;
 const TRB_TYPE_STATUS_STAGE: u32 = 4;
@@ -209,6 +210,11 @@ const TRB_IDT: u32 = 1 << 6;
 /// IOC — Interrupt On Completion, bit 5 of dword3.
 const TRB_IOC: u32 = 1 << 5;
 const TRB_TC: u32 = 1 << 1; // Toggle Cycle (Link TRB only, §6.4.4.1)
+/// Iso TRB control bit (§6.4.1.3, table 6-49): Start Isochronous
+/// As Soon As Possible. The controller picks the next available
+/// frame instead of waiting for a host-specified Frame ID. Required
+/// for our use case — we don't track the device's frame counter.
+const TRB_SIA: u32 = 1 << 31;
 /// CH — Chain bit, bit 4 of dword3.
 #[allow(dead_code)]
 const TRB_CH: u32 = 1 << 4;
@@ -2917,6 +2923,156 @@ impl Xhci {
         compiler_fence(Ordering::SeqCst);
         ep.enq += 1;
         Ok(())
+    }
+
+    /// Enqueue an Isoch TRB on the slot/dci endpoint. Same ring +
+    /// link-wrap logic as `ep_enqueue_normal`; differs only in the
+    /// TRB type (5 = Isoch) and the SIA bit set so the controller
+    /// schedules in the next available frame instead of waiting
+    /// for a host-specified Frame ID. TBC/TLBPC stay 0 (single
+    /// burst, single packet per burst) — enough for the bring-up
+    /// targets that use 1-packet-per-bInterval (USB 2.0 full-speed).
+    fn ep_enqueue_isoch(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        phys: u64,
+        len: u32,
+    ) -> Result<(), XhciError> {
+        let mut g = self.devices.lock();
+        let dev = g
+            .get_mut(slot_id as usize)
+            .and_then(|s| s.as_mut())
+            .ok_or(XhciError::CmdFailed(0xFC))?;
+        let idx = (dci as usize).saturating_sub(2);
+        let ep = dev
+            .eps
+            .get_mut(idx)
+            .and_then(|s| s.as_mut())
+            .ok_or(XhciError::CmdFailed(0xFA))?;
+        // Link-wrap (mirrors the Normal path).
+        if ep.enq == CTRL_TR_TRBS - 1 {
+            let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+            let link_addr = ep.tr.phys_addr().raw() + link_off;
+            let link_d3 =
+                (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
+            // SAFETY: identity-mapped DMA, offset in-page.
+            unsafe {
+                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+            }
+            compiler_fence(Ordering::SeqCst);
+            ep.enq = 0;
+            ep.pcs ^= 1;
+        }
+        let trb_off = (ep.enq * 16) as u64;
+        let trb_addr = ep.tr.phys_addr().raw() + trb_off;
+        // Iso TRB d3:
+        //   bit 0 = cycle (matches ep.pcs)
+        //   bit 5 = IOC (interrupt on completion)
+        //   bits 10-15 = TRB Type (5 = Isoch)
+        //   bit 31 = SIA (Start Isochronous ASAP)
+        // TBC (bits 7-8), TLBPC (bits 16-19), Frame ID (bits 20-30)
+        // all stay 0.
+        let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT)
+            | TRB_IOC
+            | TRB_SIA
+            | (ep.pcs & TRB_CYCLE_BIT);
+        // SAFETY: identity-mapped DMA; offset in-page.
+        unsafe {
+            core::ptr::write_volatile(trb_addr as *mut u32, phys as u32);
+            core::ptr::write_volatile((trb_addr + 4) as *mut u32, (phys >> 32) as u32);
+            core::ptr::write_volatile((trb_addr + 8) as *mut u32, len);
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile((trb_addr + 12) as *mut u32, d3);
+        }
+        compiler_fence(Ordering::SeqCst);
+        ep.enq += 1;
+        Ok(())
+    }
+
+    /// Submit a single iso-OUT transfer (host→device, e.g. UAC PCM
+    /// playback packet). Caller's `data` is staged into the
+    /// per-endpoint persistent DMA buffer; controller picks the
+    /// next available frame and ships it. Waits for the Transfer
+    /// Event so the caller knows the packet was sent.
+    ///
+    /// For *continuous* streaming the eventual ring layer pre-stages
+    /// many iso TRBs and doesn't wait per-packet; this one-shot
+    /// variant is the building block + the path the test smokes
+    /// exercise.
+    pub fn isoch_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
+        if data.is_empty() || data.len() > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let phys = self.ep_dma_phys(slot_id, dci)?;
+        // SAFETY: identity-mapped DMA page; size bounded above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, data.len());
+        }
+        compiler_fence(Ordering::SeqCst);
+        self.ep_enqueue_isoch(slot_id, dci, phys, data.len() as u32)?;
+        self.ring_slot_doorbell(slot_id, dci as u32);
+        // Wait for the Transfer Event (slot + ep filter, same shape
+        // as bulk_out).
+        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let want_ep = (dci as u32) << 16;
+        let ev = self.await_event(|t| {
+            (t[3] & TRB_TYPE_MASK) == xfer
+                && (t[3] & 0xFF00_0000) == want_slot
+                && (t[3] & 0x001F_0000) == want_ep
+        })?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        // CC 1 = Success; CC 13 = Short Packet (acceptable on iso
+        // OUT — controller transmitted fewer bytes than requested
+        // because the device's iso budget for this frame was
+        // smaller, common on under-clocked endpoints).
+        if ccode != 1 && ccode != 13 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let residue = ev[2] & 0x00FF_FFFF;
+        Ok((data.len() as u32).saturating_sub(residue) as usize)
+    }
+
+    /// Submit a single iso-IN transfer (device→host, e.g. UVC
+    /// frame packet, UAC mic capture packet). Posts a receive
+    /// buffer + waits for the Transfer Event; returns bytes
+    /// received into `out`.
+    pub fn isoch_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
+        if out.is_empty() || out.len() > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let phys = self.ep_dma_phys(slot_id, dci)?;
+        // Zero only the prefix we'll read — stale data in the
+        // persistent buffer mustn't masquerade as device payload.
+        // SAFETY: identity-mapped DMA page; bounds-checked above.
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, out.len());
+        }
+        self.ep_enqueue_isoch(slot_id, dci, phys, out.len() as u32)?;
+        self.ring_slot_doorbell(slot_id, dci as u32);
+        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let want_ep = (dci as u32) << 16;
+        let ev = self.await_event(|t| {
+            (t[3] & TRB_TYPE_MASK) == xfer
+                && (t[3] & 0xFF00_0000) == want_slot
+                && (t[3] & 0x001F_0000) == want_ep
+        })?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 && ccode != 13 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let residue = ev[2] & 0x00FF_FFFF;
+        let xferred = (out.len() as u32).saturating_sub(residue) as usize;
+        // SAFETY: identity-mapped DMA page.
+        for i in 0..xferred.min(out.len()) {
+            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        }
+        Ok(xferred)
     }
 
     /// Issue a bulk-IN read against `slot_id` / `dci`. Allocates a

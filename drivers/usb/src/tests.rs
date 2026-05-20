@@ -1847,3 +1847,78 @@ fn smoke_usb_uac_pcm_ring_wraps_around() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_wraps_around);
+
+// ── drivers/usb/xhci (iso EP discovery + iso TRB constants) ────────
+//
+// xHCI iso TRB submission can't be unit-tested without a live
+// controller (the bulk_in / bulk_out smokes are skip-only too on
+// QEMU). The protocol-level pieces — TRB type, SIA bit, iso-EP
+// finder in the config descriptor — are testable on synthetic data.
+
+fn smoke_usb_uac_finder_picks_iso_endpoints_from_as_iface() -> TestResult {
+    use crate::uac::{
+        find_audio_streaming_iso_eps, USB_AUDIO_SUBCLASS_AUDIOSTREAMING, USB_CLASS_AUDIO,
+    };
+    // Compose a config with an AC iface (no iso EPs) + AS iface
+    // (one iso OUT for playback) + AS iface alt-1 (iso IN for mic).
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // CONFIG
+    v.extend_from_slice(&[9, 0x02, 0, 0, 3, 1, 0, 0xC0, 50]);
+    // AC iface
+    v.extend_from_slice(&[9, 0x04, 0, 0, 0, USB_CLASS_AUDIO, 0x01, 0, 0]);
+    // AS iface 1
+    v.extend_from_slice(&[9, 0x04, 1, 0, 1, USB_CLASS_AUDIO, USB_AUDIO_SUBCLASS_AUDIOSTREAMING, 0, 0]);
+    // iso OUT endpoint 0x03, attrs=0x01 (iso, asynch).
+    v.extend_from_slice(&[7, 0x05, 0x03, 0x01, 0x00, 0x01, 1]);
+    // AS iface 2 (capture)
+    v.extend_from_slice(&[9, 0x04, 2, 0, 1, USB_CLASS_AUDIO, USB_AUDIO_SUBCLASS_AUDIOSTREAMING, 0, 0]);
+    // iso IN endpoint 0x82, attrs=0x01.
+    v.extend_from_slice(&[7, 0x05, 0x82, 0x01, 0x00, 0x01, 1]);
+    let total = v.len() as u16;
+    v[2] = (total & 0xFF) as u8;
+    v[3] = (total >> 8) as u8;
+
+    let (iso_out, iso_in) = find_audio_streaming_iso_eps(&v);
+    // OUT ep 0x03 → DCI = 3*2 + 0 = 6.
+    if iso_out != 6 {
+        return TestResult::Fail("iso OUT DCI not 6");
+    }
+    // IN ep 0x82 → DCI = 2*2 + 1 = 5.
+    if iso_in != 5 {
+        return TestResult::Fail("iso IN DCI not 5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_usb_uac_finder_picks_iso_endpoints_from_as_iface);
+
+fn smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface() -> TestResult {
+    use crate::uvc::{
+        find_video_streaming_iso_in_ep, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+    };
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    v.extend_from_slice(&[9, 0x02, 0, 0, 2, 1, 0, 0xC0, 50]);
+    // VC iface
+    v.extend_from_slice(&[9, 0x04, 0, 0, 0, USB_CLASS_VIDEO, 0x01, 0, 0]);
+    // VS iface
+    v.extend_from_slice(&[9, 0x04, 1, 0, 1, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOSTREAMING, 0, 0]);
+    // iso IN endpoint 0x81.
+    v.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x04, 1]);
+    let total = v.len() as u16;
+    v[2] = (total & 0xFF) as u8;
+    v[3] = (total >> 8) as u8;
+
+    let iso_in = find_video_streaming_iso_in_ep(&v);
+    // ep 0x81 → DCI = 1*2 + 1 = 3.
+    if iso_in != 3 {
+        return TestResult::Fail("iso IN DCI not 3");
+    }
+    // A config without a VS iface → 0.
+    let mut nope: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    nope.extend_from_slice(&[9, 0x02, 18, 0, 1, 1, 0, 0xC0, 50]);
+    nope.extend_from_slice(&[9, 0x04, 0, 0, 0, 0x08, 0x06, 0x50, 0]); // MSC
+    if find_video_streaming_iso_in_ep(&nope) != 0 {
+        return TestResult::Fail("non-UVC config must yield 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface);

@@ -399,6 +399,11 @@ pub struct UacDevice {
     pub slot_id: u8,
     /// `bInterfaceNumber` of the AudioControl interface.
     pub ac_iface: u8,
+    /// DCI of the iso-OUT endpoint (playback). 0 = no playback EP
+    /// found in the descriptor.
+    pub iso_out_dci: u8,
+    /// DCI of the iso-IN endpoint (capture / microphone). 0 = none.
+    pub iso_in_dci: u8,
 }
 
 /// System-wide registry of bound UAC devices.
@@ -452,10 +457,99 @@ pub fn try_bind_audio_already_addressed(
     {
         return Err(UacError::SetConfigFailed);
     }
+    // Find iso endpoints in any AudioStreaming alt setting. May be
+    // absent (UAC AudioControl-only devices like USB volume knobs);
+    // in that case the iso DCIs stay 0.
+    let (iso_out_dci, iso_in_dci) = find_audio_streaming_iso_eps(cfg);
     let mut g = UAC_DEVICES.lock();
     let idx = g.len();
-    g.push(UacDevice { slot_id, ac_iface });
+    g.push(UacDevice {
+        slot_id,
+        ac_iface,
+        iso_out_dci,
+        iso_in_dci,
+    });
     Ok(idx)
+}
+
+/// Scan the config blob for the first AudioStreaming interface's
+/// iso endpoints. Returns (iso_out_dci, iso_in_dci) — either may
+/// be 0 if not present. Note this picks the *first* AS interface
+/// alt setting it sees — real bind would walk all alt settings
+/// + pick one matching the desired sample rate / channel count.
+pub fn find_audio_streaming_iso_eps(cfg: &[u8]) -> (u8, u8) {
+    let mut i = 0;
+    let mut in_as_iface = false;
+    let mut iso_out: u8 = 0;
+    let mut iso_in: u8 = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let desc_type = cfg[i + 1];
+        if desc_type == 0x04 && len >= 9 {
+            // INTERFACE: check AS class triple.
+            let cls = cfg[i + 5];
+            let sub = cfg[i + 6];
+            in_as_iface = cls == USB_CLASS_AUDIO
+                && sub == USB_AUDIO_SUBCLASS_AUDIOSTREAMING;
+        } else if desc_type == 0x05 && in_as_iface && len >= 7 {
+            // ENDPOINT under an AS interface — check iso (xfer type 1).
+            let ep_addr = cfg[i + 2];
+            let attrs = cfg[i + 3];
+            if attrs & 0x03 == 1 {
+                let ep_num = ep_addr & 0x0F;
+                let is_in = ep_addr & 0x80 != 0;
+                let dci = (ep_num * 2) + (if is_in { 1 } else { 0 });
+                if is_in && iso_in == 0 {
+                    iso_in = dci;
+                } else if !is_in && iso_out == 0 {
+                    iso_out = dci;
+                }
+            }
+        }
+        i += len;
+    }
+    (iso_out, iso_in)
+}
+
+/// Submit one PCM packet to the bound UAC device's iso-OUT endpoint
+/// (playback). Caller's `data` must be audio-frame-aligned per the
+/// device's PcmFormat. Returns the number of bytes actually written
+/// (may be short on an oversubscribed iso frame).
+pub fn playback_one_packet(idx: usize, data: &[u8]) -> Result<usize, UacError> {
+    let (slot_id, dci) = {
+        let g = UAC_DEVICES.lock();
+        let dev = g.get(idx).ok_or(UacError::NotAudio)?;
+        if dev.iso_out_dci == 0 {
+            return Err(UacError::NotAudio);
+        }
+        (dev.slot_id, dev.iso_out_dci)
+    };
+    let outcome = crate::xhci::with_controller(|c| c.isoch_out(slot_id, dci, data));
+    match outcome {
+        Some(Ok(n)) => Ok(n),
+        Some(Err(_)) | None => Err(UacError::SetConfigFailed),
+    }
+}
+
+/// Pull one PCM capture packet from the bound UAC device's iso-IN
+/// endpoint (microphone). Returns the byte count actually read.
+pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UacError> {
+    let (slot_id, dci) = {
+        let g = UAC_DEVICES.lock();
+        let dev = g.get(idx).ok_or(UacError::NotAudio)?;
+        if dev.iso_in_dci == 0 {
+            return Err(UacError::NotAudio);
+        }
+        (dev.slot_id, dev.iso_in_dci)
+    };
+    let outcome = crate::xhci::with_controller(|c| c.isoch_in(slot_id, dci, out));
+    match outcome {
+        Some(Ok(n)) => Ok(n),
+        Some(Err(_)) | None => Err(UacError::SetConfigFailed),
+    }
 }
 
 /// Number of bound UAC devices.

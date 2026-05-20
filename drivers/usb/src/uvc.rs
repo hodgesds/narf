@@ -534,6 +534,9 @@ pub struct UvcDevice {
     pub slot_id: u8,
     /// `bInterfaceNumber` of the VideoControl interface.
     pub vc_iface: u8,
+    /// DCI of the iso-IN endpoint (video frames device→host).
+    /// 0 = no iso IN endpoint found (bulk-streaming variant of UVC).
+    pub iso_in_dci: u8,
 }
 
 /// System-wide registry of bound UVC devices.
@@ -582,10 +585,64 @@ pub fn try_bind_video_already_addressed(
     {
         return Err(UvcError::SetConfigFailed);
     }
+    let iso_in_dci = find_video_streaming_iso_in_ep(cfg);
     let mut g = UVC_DEVICES.lock();
     let idx = g.len();
-    g.push(UvcDevice { slot_id, vc_iface });
+    g.push(UvcDevice {
+        slot_id,
+        vc_iface,
+        iso_in_dci,
+    });
     Ok(idx)
+}
+
+/// Scan the config blob for the first VideoStreaming interface's
+/// iso-IN endpoint. Returns 0 if not present (UVC bulk-streaming
+/// variant — used by some virtualised cameras).
+pub fn find_video_streaming_iso_in_ep(cfg: &[u8]) -> u8 {
+    let mut i = 0;
+    let mut in_vs_iface = false;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let desc_type = cfg[i + 1];
+        if desc_type == 0x04 && len >= 9 {
+            let cls = cfg[i + 5];
+            let sub = cfg[i + 6];
+            in_vs_iface = cls == USB_CLASS_VIDEO
+                && sub == USB_VIDEO_SUBCLASS_VIDEOSTREAMING;
+        } else if desc_type == 0x05 && in_vs_iface && len >= 7 {
+            let ep_addr = cfg[i + 2];
+            let attrs = cfg[i + 3];
+            if attrs & 0x03 == 1 && ep_addr & 0x80 != 0 {
+                let ep_num = ep_addr & 0x0F;
+                return (ep_num * 2) + 1; // IN endpoint DCI
+            }
+        }
+        i += len;
+    }
+    0
+}
+
+/// Pull one iso-IN packet (video frame fragment) from the bound
+/// UVC device. Caller feeds it into a [`UvcFrameReassembler`] to
+/// stitch payloads back into whole frames. Returns the byte count.
+pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError> {
+    let (slot_id, dci) = {
+        let g = UVC_DEVICES.lock();
+        let dev = g.get(idx).ok_or(UvcError::NotVideo)?;
+        if dev.iso_in_dci == 0 {
+            return Err(UvcError::NotVideo);
+        }
+        (dev.slot_id, dev.iso_in_dci)
+    };
+    let outcome = crate::xhci::with_controller(|c| c.isoch_in(slot_id, dci, out));
+    match outcome {
+        Some(Ok(n)) => Ok(n),
+        Some(Err(_)) | None => Err(UvcError::SetConfigFailed),
+    }
 }
 
 pub fn attached_uvc_count() -> usize {
