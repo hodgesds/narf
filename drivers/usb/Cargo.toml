@@ -30,6 +30,7 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
 narf-net          = { path = "../../net" }
+narf-power        = { path = "../../power" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]

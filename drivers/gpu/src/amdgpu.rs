@@ -960,6 +960,51 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
+    // Register against the device PM registry. AMDGPU suspend
+    // saves the current Mode so set_mode can re-program it on
+    // resume; full S3 also needs PSP TMR teardown + SMU
+    // PowerDownGfx, which the current scaffold doesn't do —
+    // registered as best-effort.
+    narf_power::device_pm::register_device_pm(
+        "amdgpu",
+        amdgpu_suspend_handler,
+        amdgpu_resume_handler,
+    );
+    Ok(())
+}
+
+/// Stash so the resume handler can re-program the same Mode the
+/// suspend handler saw. None when no mode has been programmed
+/// yet (e.g. pre-firmware-load).
+static SAVED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !is_probed() {
+        return Ok(());
+    }
+    let mode = with_controller(|d| d.current_mode());
+    if let Some(Some(m)) = mode {
+        *SAVED_MODE.lock() = Some(m);
+    }
+    Ok(())
+}
+
+fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !is_probed() {
+        return Ok(());
+    }
+    let saved = *SAVED_MODE.lock();
+    if let Some(mode) = saved {
+        // Best-effort re-program. set_mode requires fw_loaded;
+        // on S3 wake the platform restores PSP state so this
+        // typically holds. Failures fall through — the next
+        // user-driven modeset re-tries.
+        let _ = with_controller_mut(|d| {
+            // SAFETY: probe gave us BAR ownership, still held.
+            unsafe { d.set_mode(mode) }
+        });
+    }
     Ok(())
 }
 

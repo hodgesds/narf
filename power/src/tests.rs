@@ -1520,3 +1520,21 @@ fn smoke_device_pm_re_register_replaces() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/device_pm", smoke_device_pm_re_register_replaces);
+
+fn smoke_device_pm_drivers_register_at_probe_if_probed() -> TestResult {
+    use crate::device_pm::registered_devices;
+    // Drivers only register when their probe path runs — in QEMU
+    // that's xHCI (always present), NVMe (always), amdgpu (usually).
+    // The test asserts at least xhci0 registered, since QEMU always
+    // exposes an xHCI controller.
+    let snap = registered_devices();
+    let names: alloc::vec::Vec<&str> = snap.iter().map(|e| e.name.as_str()).collect();
+    if !names.iter().any(|n| *n == "xhci0") {
+        return TestResult::Skip("xhci not probed in this QEMU config");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/device_pm",
+    smoke_device_pm_drivers_register_at_probe_if_probed
+);

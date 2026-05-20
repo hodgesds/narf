@@ -494,6 +494,54 @@ impl Controller {
         self.identify.as_ref()
     }
 
+    /// Stop the controller for system suspend — clear CC.EN and
+    /// wait for CSTS.RDY=0 so any in-flight admin / IO commands
+    /// drain to a quiescent state before we lose power. Queues
+    /// stay in DRAM; `enable_for_resume` re-asserts CC.EN.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 exclusively; no concurrent submitters.
+    pub unsafe fn disable_for_suspend(&self) -> bool {
+        let bar = match &self.bar0_region {
+            Some(b) => b,
+            None => return false,
+        };
+        // SAFETY: caller-asserted ownership.
+        let cc = unsafe { bar.read32(REG_CC) };
+        // SAFETY: same.
+        unsafe {
+            bar.write32(REG_CC, cc & !CC_EN);
+        }
+        narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { bar.read32(REG_CSTS) } & CSTS_RDY == 0,
+            narf_time::Deadline::after_ms(500),
+        )
+    }
+
+    /// Re-enable the controller after system wake. Sets CC.EN
+    /// and polls CSTS.RDY=1.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 exclusively.
+    pub unsafe fn enable_for_resume(&self) -> bool {
+        let bar = match &self.bar0_region {
+            Some(b) => b,
+            None => return false,
+        };
+        // SAFETY: caller-asserted ownership.
+        let cc = unsafe { bar.read32(REG_CC) };
+        // SAFETY: same.
+        unsafe {
+            bar.write32(REG_CC, cc | CC_EN);
+        }
+        narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { bar.read32(REG_CSTS) } & CSTS_RDY != 0,
+            narf_time::Deadline::after_ms(500),
+        )
+    }
+
     /// Skeleton probe — returns `NotImplemented` when no `BusDevice`
     /// was supplied. Kept for backward compatibility with the
     /// pre-bring-up smoke; new callers go through `bring_up`.
@@ -1867,7 +1915,51 @@ pub fn probe(
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
+    // Register against the device PM registry. NVMe suspend stops
+    // the controller via CC.EN=0 (admin + I/O queues quiesce);
+    // resume re-enables CC.EN and waits for CSTS.RDY=1.
+    narf_power::device_pm::register_device_pm(
+        "nvme0",
+        nvme_suspend_handler,
+        nvme_resume_handler,
+    );
     Ok(())
+}
+
+/// NVMe suspend handler — clears CC.EN so the controller stops
+/// fetching from the admin/IO submission queues. The queues
+/// themselves stay in DRAM; resume re-enables CC.EN.
+fn nvme_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !is_probed() {
+        return Ok(());
+    }
+    let ok = with_controller(|c| {
+        // SAFETY: caller-asserted BAR exclusivity.
+        unsafe { c.disable_for_suspend() }
+    })
+    .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    }
+}
+
+/// NVMe resume handler — re-asserts CC.EN and polls CSTS.RDY.
+fn nvme_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !is_probed() {
+        return Ok(());
+    }
+    let ok = with_controller(|c| {
+        // SAFETY: same.
+        unsafe { c.enable_for_resume() }
+    })
+    .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    }
 }
 
 /// Read-only accessor for the probed controller. Returns `true` iff

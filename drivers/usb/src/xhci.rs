@@ -612,6 +612,59 @@ impl Xhci {
     /// producer/consumer cursors and clears the command-ring TRBs
     /// so the next `submit_command` sees a fresh ring matching
     /// `cmd_pcs = 1`. Defensive: every known cause of HCE in this
+    /// Halt the controller for system suspend — clear USBCMD.R/S
+    /// and wait for USBSTS.HCH. Endpoint state is preserved in DRAM;
+    /// `run_for_resume` re-asserts R/S so the controller picks
+    /// up where it left off.
+    ///
+    /// Returns true if the controller halted cleanly within the
+    /// poll budget. Real D3 handling additionally saves the
+    /// Operational + Doorbell register windows; this minimal
+    /// shape works for systems that stay in S2 / S0i3 (RAM
+    /// retains MMIO writes).
+    ///
+    /// # Safety
+    /// Caller owns BAR0 exclusively + no Transfer Rings are being
+    /// modified concurrently.
+    pub unsafe fn halt_for_suspend(&self) -> bool {
+        let mmio = &self.mmio;
+        let op_off = self.op_off;
+        // SAFETY: caller-asserted ownership.
+        let cmd = unsafe { mmio.read32(op_off + OP_USBCMD) };
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_USBCMD, cmd & !USBCMD_RS);
+        }
+        narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH != 0,
+            narf_time::Deadline::after_ms(100),
+        )
+    }
+
+    /// Resume the controller after system wake — set USBCMD.R/S
+    /// so the controller resumes fetching from Transfer Rings.
+    /// The supervisor's per-port retry loop re-attaches devices
+    /// the platform's wake firmware may have re-enumerated.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 exclusively.
+    pub unsafe fn run_for_resume(&self) -> bool {
+        let mmio = &self.mmio;
+        let op_off = self.op_off;
+        // SAFETY: caller-asserted ownership.
+        let cmd = unsafe { mmio.read32(op_off + OP_USBCMD) };
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(op_off + OP_USBCMD, cmd | USBCMD_RS);
+        }
+        narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH == 0,
+            narf_time::Deadline::after_ms(100),
+        )
+    }
+
     /// driver was fixed (CRCR/ERSTBA write order, IMAN re-write
     /// after MSI-X enable), but a transient hardware fault on real
     /// silicon could still trip HCE — recover instead of giving up.
@@ -3301,7 +3354,60 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::UsbHost.default_domain(),
     });
+    // Register against the device PM registry. xHCI suspend stops
+    // the controller; resume re-enables it and re-arms interrupts.
+    // Real D3 handling for xHCI also needs to save/restore the
+    // Operational + Doorbell register windows, which the
+    // current shape doesn't do — registered as best-effort.
+    narf_power::device_pm::register_device_pm(
+        "xhci0",
+        xhci_suspend_handler,
+        xhci_resume_handler,
+    );
     Ok(())
+}
+
+/// xHCI suspend handler — halts the controller (R/S bit cleared
+/// in USBCMD) so it stops fetching from Transfer Rings. The
+/// per-endpoint state is left in DRAM; resume re-asserts R/S.
+/// On real silicon a fuller path would also disable interrupts
+/// and snapshot Operational registers.
+fn xhci_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    // The controller may not be probed (e.g. no xHCI on the box).
+    if !is_probed() {
+        return Ok(());
+    }
+    // Halt: clear USBCMD.R/S. Use with_controller to reach the regs.
+    let halted = with_controller(|c| {
+        // SAFETY: BAR5 mapped, exclusive owner.
+        unsafe { c.halt_for_suspend() }
+    })
+    .unwrap_or(false);
+    if halted {
+        Ok(())
+    } else {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    }
+}
+
+/// xHCI resume handler — re-asserts USBCMD.R/S so the controller
+/// resumes fetching from Transfer Rings. The supervisor's
+/// per-port retry loop catches any devices that may have been
+/// re-enumerated by the platform's wake firmware.
+fn xhci_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !is_probed() {
+        return Ok(());
+    }
+    let resumed = with_controller(|c| {
+        // SAFETY: same.
+        unsafe { c.run_for_resume() }
+    })
+    .unwrap_or(false);
+    if resumed {
+        Ok(())
+    } else {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    }
 }
 
 pub fn register_pci_driver() {

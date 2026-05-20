@@ -25,6 +25,7 @@ narf-drivers      = { path = "../../drivers" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-arch         = { path = "../../arch" }
+narf-power        = { path = "../../power" }
 
 [lints]
 workspace = true

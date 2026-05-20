@@ -26,6 +26,7 @@ narf-bus             = { path = "../../bus" }
 narf-init            = { path = "../../init" }
 narf-scheduler       = { path = "../../scheduler" }
 narf-time            = { path = "../../time" }
+narf-power           = { path = "../../power" }
 
 [features]
 kernel-test = []
