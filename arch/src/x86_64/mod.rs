@@ -2,6 +2,7 @@
 
 pub mod acpi;
 pub mod amd_ga;
+pub mod amd_pstate;
 pub mod amd_vi;
 pub mod asm;
 pub mod avx10;

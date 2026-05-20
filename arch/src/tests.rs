@@ -1889,3 +1889,144 @@ fn smoke_msr_wrmsr_or_gp_round_trip_on_safe_msr() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/msr", smoke_msr_wrmsr_or_gp_round_trip_on_safe_msr);
+
+// ── amd_pstate ────────────────────────────────────────────────────
+//
+// Driver targets AMD Family 0x17 (Zen2) Models 0x30..=0xAF — real
+// hardware bring-up only. QEMU `-cpu max` doesn't match, so every
+// smoke below Skips cleanly under the kernel-test harness. On a
+// matching laptop they exercise CPUID gating, CAP1 decode, the
+// REQ packing round-trip, and the boot programming path.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_pstate_request_pack_roundtrip() -> TestResult {
+    // Pure pack/unpack — no MSR access, runs everywhere including
+    // QEMU and CI. Verifies the (min, max, des, epp) layout matches
+    // Linux amd-pstate's `amd_pstate_update_perf` packing.
+    use crate::x86_64::amd_pstate::{build_request, decode_request};
+    let v = build_request(0x10, 0xC0, 0x80, 0x40);
+    if v != ((0x10u64) | (0xC0u64 << 8) | (0x80u64 << 16) | (0x40u64 << 24)) {
+        return TestResult::Fail("build_request packing mismatch");
+    }
+    let (min, max, des, epp) = decode_request(v);
+    if (min, max, des, epp) != (0x10, 0xC0, 0x80, 0x40) {
+        return TestResult::Fail("decode_request round-trip mismatch");
+    }
+    // EPP must sit in the high byte — the canonical bit position
+    // amd-pstate userspace depends on.
+    let v_epp = build_request(0, 0, 0, 0xFF);
+    if (v_epp >> 24) & 0xFF != 0xFF {
+        return TestResult::Fail("EPP not packed into bits[31:24]");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_amd_pstate_request_pack_roundtrip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_pstate_caps_decode() -> TestResult {
+    // Pure decode of a synthetic CAP1 value matching the AMD Renoir
+    // PPR §1.5 layout. Runs everywhere — no MSR access.
+    use crate::x86_64::amd_pstate::CppcCaps;
+    // highest=0xC0, nominal=0x80, lowest_nonlinear=0x20, lowest=0x10.
+    let raw: u64 = 0x10 << 24 | 0x20 << 16 | 0x80 << 8 | 0xC0;
+    let c = CppcCaps::from_raw(raw);
+    if c.highest_perf != 0xC0 {
+        return TestResult::Fail("highest_perf decode wrong");
+    }
+    if c.nominal_perf != 0x80 {
+        return TestResult::Fail("nominal_perf decode wrong");
+    }
+    if c.lowest_nonlinear_perf != 0x20 {
+        return TestResult::Fail("lowest_nonlinear_perf decode wrong");
+    }
+    if c.lowest_perf != 0x10 {
+        return TestResult::Fail("lowest_perf decode wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_amd_pstate_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_pstate_is_zen2_gates_msr_path() -> TestResult {
+    // `is_zen2()` is the gate every public entry-point honours.
+    // On non-AMD or non-Zen2, the MSR helpers must short-circuit to
+    // `None` without ever issuing a rdmsr/wrmsr — otherwise a stray
+    // CPPC MSR read on Intel would #GP. We can't observe absence
+    // of an MSR access directly, but we can assert the documented
+    // return-shape contract.
+    use crate::x86_64::amd_pstate::{
+        amd_pstate_request, is_zen2, read_caps, read_status,
+    };
+    if !is_zen2() {
+        if read_caps().is_some() {
+            return TestResult::Fail("read_caps() returned Some on non-Zen2");
+        }
+        if read_status().is_some() {
+            return TestResult::Fail("read_status() returned Some on non-Zen2");
+        }
+        if amd_pstate_request(0, 0xFF, 0x80, 0x40).is_some() {
+            return TestResult::Fail("amd_pstate_request returned Some on non-Zen2");
+        }
+        return TestResult::Skip("not AMD Family 0x17 Model 0x30..=0xAF");
+    }
+    // Real Zen2: every helper should return Some(...) — the inner
+    // Result may still be Err if firmware locked the MSRs, which
+    // isn't a test failure.
+    if read_caps().is_none() {
+        return TestResult::Fail("read_caps() returned None on Zen2");
+    }
+    if read_status().is_none() {
+        return TestResult::Fail("read_status() returned None on Zen2");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_amd_pstate_is_zen2_gates_msr_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_pstate_boot_init_outcome_shape() -> TestResult {
+    // Exercise the full boot_init() path. On non-Zen2 we must
+    // observe NotZen2 (no MSR access happened). On Zen2 we may
+    // see Programmed / Cap1Gp / ReqGp depending on the BIOS lock
+    // state — all three are valid + non-fatal.
+    use crate::x86_64::amd_pstate::{boot_init, is_zen2, BootInitOutcome};
+    let outcome = boot_init();
+    if !is_zen2() {
+        if !matches!(outcome, BootInitOutcome::NotZen2) {
+            return TestResult::Fail("boot_init must report NotZen2 off-target");
+        }
+        return TestResult::Skip("not AMD Family 0x17 Model 0x30..=0xAF");
+    }
+    match outcome {
+        BootInitOutcome::Programmed { caps, des_perf, epp } => {
+            // Sanity-check the field choice the driver makes.
+            if des_perf != caps.nominal_perf {
+                return TestResult::Fail("des_perf must equal caps.nominal_perf");
+            }
+            if epp != crate::x86_64::amd_pstate::epp::BALANCE_PERFORMANCE {
+                return TestResult::Fail("EPP must be BALANCE_PERFORMANCE");
+            }
+            // PPR guarantees highest >= nominal >= lowest_nonlinear
+            // >= lowest, and all non-zero on shipping silicon.
+            if caps.highest_perf < caps.nominal_perf
+                || caps.nominal_perf < caps.lowest_nonlinear_perf
+                || caps.lowest_nonlinear_perf < caps.lowest_perf
+            {
+                return TestResult::Fail("CAP1 ordering invariant violated");
+            }
+            TestResult::Pass
+        }
+        BootInitOutcome::Cap1Gp | BootInitOutcome::ReqGp => {
+            // BIOS-locked MSRs are a real-world outcome — surface as
+            // Skip so the test still runs on locked-down OEM units.
+            TestResult::Skip("CPPC MSRs locked by firmware")
+        }
+        BootInitOutcome::NotZen2 => {
+            TestResult::Fail("is_zen2() said true but boot_init disagreed")
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_amd_pstate_boot_init_outcome_shape);

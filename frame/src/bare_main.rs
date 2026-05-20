@@ -1990,6 +1990,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_memory::beacon::paint(slot, color);
             }
             let _ = narf_init::print_summary(&mut console::Writer);
+
+            // AMD-specific amd-pstate active-mode bring-up. Sibling
+            // of narf_power::pstate (which handled Intel HWP /
+            // SpeedStep / AMD HwPstate during the Subsys initcall
+            // above). amd_pstate gates itself on CPUID — AMD Family
+            // 0x17 Models 0x30..=0xAF (Zen2 Renoir / Lucienne /
+            // Matisse) — so this is a clean no-op on Intel, on QEMU
+            // `-cpu max`, and on AMD parts outside the Zen2 window.
+            // Touches MSR_AMD_CPPC_CAP1 (0xC001_02B0) +
+            // MSR_AMD_CPPC_REQ (0xC001_02B1); writes use the GP-safe
+            // wrmsr_or_gp so BIOS-locked CPPC MSRs surface in the
+            // status line instead of wedging boot.
+            #[cfg(target_arch = "x86_64")]
+            {
+                use narf_arch::x86_64::amd_pstate::{boot_init, BootInitOutcome};
+                let outcome = boot_init();
+                let line = match outcome {
+                    BootInitOutcome::NotZen2 => "amd-pstate: skipped (not Zen2)",
+                    BootInitOutcome::Cap1Gp => {
+                        "amd-pstate: CAP1 #GP — firmware-locked, default left in place"
+                    }
+                    BootInitOutcome::ReqGp => {
+                        "amd-pstate: REQ #GP — firmware-locked, default left in place"
+                    }
+                    BootInitOutcome::Programmed { .. } => {
+                        "amd-pstate: programmed (min=lo_nonlin, max=hi, des=nom, EPP=bal-perf)"
+                    }
+                };
+                let _ = writeln!(console::Writer, "  {}", line);
+            }
         }
         Err(e) => {
                             narf_memory::beacon::paint(5, 0x00FF_FFFF); // WHITE: Err branch
