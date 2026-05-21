@@ -1552,6 +1552,7 @@ dependencies = [
  "narf-drivers-fs-fat",
  "narf-filesystem",
  "narf-firmware",
+ "narf-initramfs",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",

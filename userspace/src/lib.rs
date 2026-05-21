@@ -40,6 +40,7 @@ extern crate alloc;
 
 pub mod elf;
 pub mod ephemeral_port;
+pub mod init;
 pub mod fd;
 pub mod handlers;
 pub mod interp;

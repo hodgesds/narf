@@ -8199,3 +8199,39 @@ fn smoke_userspace_execve_rejects_oversized_argv_pack() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_execve_rejects_oversized_argv_pack);
+
+// ── userspace/init ─────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_init_initramfs_not_staged_yields_clear_error() -> TestResult {
+    // Without a staged initramfs (default test condition since no
+    // boot path runs install()), spawn_pid1_from_initramfs must
+    // return InitError::InitramfsNotStaged — not panic, not silent.
+    if narf_initramfs::is_staged() {
+        return TestResult::Skip("initramfs is staged in this test env");
+    }
+    // SAFETY: function is safe to call when initramfs isn't staged;
+    // bails out before any unsafe code path runs.
+    let r = unsafe { crate::init::spawn_pid1_from_initramfs("/sbin/init") };
+    match r {
+        Err(crate::init::InitError::InitramfsNotStaged) => TestResult::Pass,
+        _ => TestResult::Fail(
+            "missing initramfs must surface as InitramfsNotStaged",
+        ),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/init", smoke_init_initramfs_not_staged_yields_clear_error);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_init_file_listing_returns_none_when_not_staged() -> TestResult {
+    if narf_initramfs::is_staged() {
+        return TestResult::Skip("initramfs is staged in this test env");
+    }
+    if crate::init::initramfs_file_listing().is_some() {
+        return TestResult::Fail("listing should be None when not staged");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/init", smoke_init_file_listing_returns_none_when_not_staged);
