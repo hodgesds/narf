@@ -54,6 +54,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+pub mod regs;
+pub mod transport;
+
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 
