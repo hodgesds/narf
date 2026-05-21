@@ -2265,19 +2265,11 @@ fn run_async_demo() -> ! {
                     narf_memory::beacon::paint(43, PALETTE[(ascii_out as usize) & 7]);
                     narf_memory::beacon::paint(44, 0x00FF_FFFF); // label "K"
                     narf_memory::beacon::paint(45, PALETTE[(key_in as usize) & 7]);
-                    // Heartbeat serial line every ~5s, gated below
-                    // the 10 Hz beacon paint above so we don't
-                    // flood the console.
-                    static LAST_SERIAL: AtomicU64 = AtomicU64::new(0);
-                    const SERIAL_PERIOD: u64 = 5_000_000_000;
-                    let last_s = LAST_SERIAL.load(Ordering::Relaxed);
-                    if now.saturating_sub(last_s) >= SERIAL_PERIOD {
-                        LAST_SERIAL.store(now, Ordering::Relaxed);
-                        let _ = writeln!(
-                            console::Writer,
-                            "  heartbeat: ascii in={ascii_in} out={ascii_out} key={key_in}",
-                        );
-                    }
+                    // Serial heartbeat removed — the FB beacon
+                    // visualization above already shows liveness
+                    // (slots 41/43/45 cycle colour on each event),
+                    // so the console line was pure noise on a
+                    // healthy boot.
                 }
                 cx.waker().wake_by_ref();
                 core::task::Poll::Pending
