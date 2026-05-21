@@ -1581,3 +1581,71 @@ fn smoke_s3_wake_entry_address_resolves() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("power/suspend", smoke_s3_wake_entry_address_resolves);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_resume_context_phys_resolvable_via_cr3() -> TestResult {
+    // Read CR3, walk to resolve RESUME_CONTEXT's phys. Proves
+    // the arm_s3_resume virt→phys step actually works on this
+    // running kernel.
+    use narf_arch::x86_64::cr::read_cr3;
+    use narf_arch::x86_64::s3_resume::resume_context_static_addr;
+    use narf_memory::{x86_64::paging::translate, PhysAddr, VirtAddr};
+    // SAFETY: CPL=0 read.
+    let cr3 = unsafe { read_cr3() } & !0xFFFu64;
+    let pml4_phys = PhysAddr::new(cr3);
+    let ctx_virt = resume_context_static_addr() as u64;
+    let phys = unsafe { translate(pml4_phys, VirtAddr::new(ctx_virt)) };
+    let phys_page = match phys {
+        Some(p) => p.raw(),
+        None => return TestResult::Fail("CR3 walk couldn't resolve ResumeContext virt"),
+    };
+    // translate() returns the page-frame phys (4-KiB-aligned), not
+    // the exact byte phys; add the in-page offset for the full
+    // address. Page-frame phys being 0 is suspicious but legal if
+    // the kernel BSS happens to land at frame 0 — accept anything
+    // that translates cleanly. The strict check that follows
+    // verifies the FULL address (page + offset).
+    let full_phys = phys_page | (ctx_virt & 0xFFF);
+    if full_phys == 0 && ctx_virt != 0 {
+        return TestResult::Fail("full phys==0 but virt!=0 — broken walk");
+    }
+    if full_phys >= 0x1_0000_0000 {
+        return TestResult::Fail("ResumeContext above 4 GiB — unexpected layout");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "power/suspend",
+    smoke_s3_resume_context_phys_resolvable_via_cr3
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_wake_entry_phys_resolvable_via_cr3() -> TestResult {
+    use narf_arch::x86_64::cr::read_cr3;
+    use narf_arch::x86_64::s3_resume::s3_wake_entry;
+    use narf_memory::{x86_64::paging::translate, PhysAddr, VirtAddr};
+    // SAFETY: CPL=0 read.
+    let cr3 = unsafe { read_cr3() } & !0xFFFu64;
+    let entry_virt = s3_wake_entry as usize as u64;
+    let phys = unsafe {
+        translate(PhysAddr::new(cr3), VirtAddr::new(entry_virt))
+    };
+    let phys_page = match phys {
+        Some(p) => p.raw(),
+        None => return TestResult::Fail("CR3 walk couldn't resolve s3_wake_entry virt"),
+    };
+    let full_phys = phys_page | (entry_virt & 0xFFF);
+    if full_phys == 0 && entry_virt != 0 {
+        return TestResult::Fail("full phys==0 but virt!=0 — broken walk");
+    }
+    if full_phys >= 0x1_0000_0000 {
+        return TestResult::Fail("s3_wake_entry above 4 GiB");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "power/suspend",
+    smoke_s3_wake_entry_phys_resolvable_via_cr3
+);

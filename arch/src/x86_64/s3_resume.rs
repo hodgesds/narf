@@ -193,6 +193,20 @@ pub fn set_resume_context_phys(phys: u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// Kernel virtual address of the `RESUME_CONTEXT` static. The
+/// power crate translates this through the active page tables
+/// to a phys address it stores via [`set_resume_context_phys`].
+pub fn resume_context_static_addr() -> usize {
+    // The lock's inner ResumeContext lives at a stable offset
+    // inside RESUME_CONTEXT — the spinlock guard is a thin
+    // wrapper, so &*RESUME_CONTEXT.lock() points at it.
+    // We can't hold the lock across the resolve, so just take
+    // a raw pointer to the static itself: the inner value sits
+    // at offset 0 of an IrqSafeSpinLock with `repr(C)`.
+    &RESUME_CONTEXT as *const _ as usize
+}
+
+#[cfg(target_arch = "x86_64")]
 /// Rust continuation invoked by the asm trampoline after CR3 + GDT
 /// + IDT + RSP have been reloaded. Runs the device resume fan-out
 /// (registered handlers fire in forward registration order), then

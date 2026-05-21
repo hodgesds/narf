@@ -301,11 +301,48 @@ pub fn arm_s3_resume(
     }
     // Stash the JmpBuf where the wake continuation can find it.
     *narf_arch::x86_64::s3_resume::S3_CALLER_JMP.lock() = jmp_snapshot;
-    // Arm the FACS wake vector to point at our trampoline.
-    let entry = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
-    // SAFETY: trampoline is a `naked extern "C" fn`; its address
-    // is stable for the kernel lifetime.
-    if let Err(_) = unsafe { narf_acpi::arm_s3_waking_vector(entry) } {
+    // Resolve virt→phys via the active page tables. Both the
+    // trampoline entry AND the ResumeContext static need their
+    // phys addresses because firmware's CR3 (on wake) doesn't
+    // have the kernel high-half mapping.
+    //
+    // CR3's low 12 bits encode flags / PCID; mask them off to get
+    // the PML4 phys.
+    // SAFETY: we're on the boot CPU at CPL=0; reading CR3 is
+    // unconditionally legal.
+    let cr3 = unsafe { narf_arch::x86_64::cr::read_cr3() } & !0xFFFu64;
+    let pml4_phys = narf_memory::PhysAddr::new(cr3);
+    let entry_virt = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
+    let ctx_virt =
+        narf_arch::x86_64::s3_resume::resume_context_static_addr() as u64;
+    let entry_phys = match unsafe {
+        narf_memory::x86_64::paging::translate(
+            pml4_phys,
+            narf_memory::VirtAddr::new(entry_virt),
+        )
+    } {
+        Some(p) => p.raw() | (entry_virt & 0xFFF),
+        None => return Err(SuspendError::NotImplemented),
+    };
+    let ctx_phys = match unsafe {
+        narf_memory::x86_64::paging::translate(
+            pml4_phys,
+            narf_memory::VirtAddr::new(ctx_virt),
+        )
+    } {
+        Some(p) => p.raw() | (ctx_virt & 0xFFF),
+        None => return Err(SuspendError::NotImplemented),
+    };
+    // Stash the ctx phys so the trampoline's RIP-relative lookup
+    // can find ResumeContext post-CR3-restore. (Pre-CR3 the
+    // trampoline's RIP-relative access to RESUME_CONTEXT_PHYS
+    // itself relies on firmware's identity-mapping of low 4 GiB,
+    // which OVMF + modern AMI BIOS preserve across S3.)
+    narf_arch::x86_64::s3_resume::set_resume_context_phys(ctx_phys);
+    // SAFETY: trampoline is a `naked extern "C" fn`; its phys is
+    // stable for the kernel lifetime, and the firmware
+    // identity-maps that page through the wake handoff.
+    if let Err(_) = unsafe { narf_acpi::arm_s3_waking_vector(entry_phys) } {
         return Err(SuspendError::NotImplemented);
     }
     // Fan out device suspend handlers in reverse-registration order.
