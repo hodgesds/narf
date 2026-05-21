@@ -600,6 +600,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-compat-relibc"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-libc",
+]
+
+[[package]]
 name = "narf-compat-win"
 version = "0.0.0"
 dependencies = [
@@ -1350,6 +1358,13 @@ name = "narf-lib"
 version = "0.0.0"
 dependencies = [
  "narf-kernel-test",
+]
+
+[[package]]
+name = "narf-libc"
+version = "0.0.0"
+dependencies = [
+ "narf-user-runtime",
 ]
 
 [[package]]

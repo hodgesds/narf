@@ -1,0 +1,19 @@
+[package]
+name         = "narf-compat-relibc"
+description  = "relibc-compatibility shim — re-exports narf-libc symbols under the names Redox's relibc uses, so user binaries that build against relibc link unchanged against NARF."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_compat_relibc"
+path = "src/lib.rs"
+
+[dependencies]
+narf-libc        = { path = "../../narf-libc" }
+narf-kernel-test = { path = "../../verification/kernel-test" }
+
+[lints]
+workspace = true

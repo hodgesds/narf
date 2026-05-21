@@ -68,6 +68,7 @@ members = [
     "pwm",
     "pinctrl",
     "shmem",
+    "compat/relibc",
     "compat/win",
     "compat/win-rt",
     "firmware",
