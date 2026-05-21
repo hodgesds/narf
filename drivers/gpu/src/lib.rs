@@ -135,6 +135,7 @@ pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
 pub mod amdgpu_smu;
 pub mod amdgpu_ucode;
+pub mod amdgpu_ucode_header;
 pub mod dp_aux;
 pub mod dp_edid;
 pub mod dp_link_training;

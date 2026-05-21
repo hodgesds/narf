@@ -497,6 +497,32 @@ impl<'a> ParsedUcode<'a> {
     pub fn requires_pnvm(&self) -> bool {
         self.pnvm_version.is_some()
     }
+
+    /// Derive the PNVM sibling filename the kernel firmware
+    /// registry should resolve. Linux's `iwl_pnvm.c` builds the
+    /// name from the SKU + PNVM version embedded in the firmware
+    /// TLVs:
+    ///
+    /// ```text
+    /// iwlwifi-<sku>-<pnvm_version>.pnvm
+    /// ```
+    ///
+    /// Where `<sku>` is the same chip identity Linux uses for
+    /// the .ucode (e.g. `so-a0-gf-a0`) and `<pnvm_version>` is
+    /// the hex value from `TlvType::PnvmVersion`.
+    ///
+    /// Returns `None` for blobs that don't declare a PNVM
+    /// requirement (every gen2 chip + a few legacy gen3
+    /// firmwares).
+    pub fn pnvm_filename(&self, chip: &ChipConfig, rf: RfFamily) -> Option<String> {
+        let ver = self.pnvm_version?;
+        Some(format!(
+            "iwlwifi-{}-{}-{:x}.pnvm",
+            chip.mac.prefix(),
+            rf.prefix(),
+            ver,
+        ))
+    }
 }
 
 /// Parse an Intel iwlwifi .ucode blob.
@@ -937,5 +963,62 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_pci_match_table_registers
+    );
+
+    /// PNVM sibling filename derived from PnvmVersion TLV + chip
+    /// MAC/RF prefixes.
+    fn smoke_iwlwifi_pnvm_filename_derived_correctly() -> TestResult {
+        let chip = chip_config_for_pci_id(INTEL_VENDOR, 0x272b).expect("be200");
+        let parsed = ParsedUcode {
+            header: UcodeHeader {
+                version: 0,
+                build: 0,
+                human_readable: String::new(),
+            },
+            num_of_cpu: 2,
+            init_sections: Vec::new(),
+            rt_sections: Vec::new(),
+            fw_version: None,
+            pnvm_version: Some(0x42),
+            unknown_tlv_count: 0,
+        };
+        let name = parsed
+            .pnvm_filename(&chip, RfFamily::GfA0)
+            .expect("Some filename");
+        if name != "iwlwifi-bz-a0-gf-a0-42.pnvm" {
+            return TestResult::Fail("PNVM filename wrong");
+        }
+        TestResult::Pass
+    }
+
+    /// No PNVM required → no filename.
+    fn smoke_iwlwifi_pnvm_filename_none_when_no_version() -> TestResult {
+        let chip = chip_config_for_pci_id(INTEL_VENDOR, 0x2723).expect("ax200");
+        let parsed = ParsedUcode {
+            header: UcodeHeader {
+                version: 0,
+                build: 0,
+                human_readable: String::new(),
+            },
+            num_of_cpu: 1,
+            init_sections: Vec::new(),
+            rt_sections: Vec::new(),
+            fw_version: None,
+            pnvm_version: None,
+            unknown_tlv_count: 0,
+        };
+        if parsed.pnvm_filename(&chip, RfFamily::HrB0).is_some() {
+            return TestResult::Fail("expected None for non-PNVM blob");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_pnvm_filename_derived_correctly
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_pnvm_filename_none_when_no_version
     );
 }
