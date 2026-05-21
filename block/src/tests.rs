@@ -1317,3 +1317,35 @@ fn smoke_block_fs_detect_returns_none_for_zero_disk() -> TestResult {
     }
 }
 kernel_test_in!("block/fs_detect", smoke_block_fs_detect_returns_none_for_zero_disk);
+
+// ── block/sync_to_async ────────────────────────────────────────────
+
+fn smoke_sync_block_reports_geometry_from_inner() -> TestResult {
+    use crate::sync_to_async::SyncBlock;
+    use crate::BlockDevice;
+    use alloc::sync::Arc;
+    let payload = alloc::vec![0u8; 16 * 512];
+    let inner = Arc::new(VecBlock {
+        data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(payload)),
+        lba_size: 512,
+    }) as Arc<dyn crate::BlockDeviceSync>;
+    let bridge = SyncBlock::new(inner);
+    if bridge.logical_block_size() != 512 {
+        return TestResult::Fail("LBS not forwarded");
+    }
+    if bridge.physical_block_size() != 512 {
+        return TestResult::Fail("PBS should mirror LBS for sync devices");
+    }
+    if bridge.capacity_blocks() != 16 {
+        return TestResult::Fail("capacity_blocks not forwarded");
+    }
+    if bridge.supports(crate::BlockFeature::Flush) {
+        return TestResult::Fail("sync adapter must NOT claim Flush support");
+    }
+    if bridge.supports(crate::BlockFeature::Discard) {
+        return TestResult::Fail("sync adapter must NOT claim Discard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/sync_to_async", smoke_sync_block_reports_geometry_from_inner);
+
