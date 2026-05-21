@@ -166,8 +166,8 @@ const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
 // the names load_firmware uses inline below.
 use crate::amdgpu_psp::{
     MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
-    PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC,
-    PSP_STATUS_CODE_MASK, PSP_STATUS_DONE_BIT,
+    PSP_CMD_AUTOLOAD_RLC, PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA,
+    PSP_CMD_LOAD_TOC, PSP_STATUS_CODE_MASK, PSP_STATUS_DONE_BIT,
 };
 
 // ── Chip-info table ────────────────────────────────────────────────
@@ -263,6 +263,14 @@ pub struct FwEntry {
     pub optional: bool,
 }
 
+/// Sentinel `cmd` value flagging an entry that goes through the
+/// **SMU MP1** mailbox, not the PSP MP0 mailbox. The driver
+/// checks for this value in `load_firmware_multi` and routes the
+/// blob through `amdgpu_smu::load_pmfw` instead of
+/// `psp_dispatch_one`. Hex chosen to be visually distinct from
+/// any real PSP cmd id (which all sit ≤ 0x22).
+pub const SMU_LOAD_PMFW_MP1: u32 = 0xFF00_0001;
+
 impl FwEntry {
     const fn ip_fw(name: &'static str) -> Self {
         Self { name, cmd: PSP_CMD_LOAD_IP_FW, optional: false }
@@ -275,6 +283,12 @@ impl FwEntry {
     }
     const fn toc(name: &'static str) -> Self {
         Self { name, cmd: PSP_CMD_LOAD_TOC, optional: false }
+    }
+    /// SMU PMFW via MP1 mailbox (Phoenix-class). The `cmd` field
+    /// here is the SMU sentinel, NOT a PSP cmd id — the dispatch
+    /// loop routes accordingly.
+    const fn smu_pmfw(name: &'static str) -> Self {
+        Self { name, cmd: SMU_LOAD_PMFW_MP1, optional: false }
     }
     const fn optional(mut self) -> Self {
         self.optional = true;
@@ -296,7 +310,7 @@ impl FwEntry {
 /// PSP 14.0.1 + SDMA 6.1 + VCN 4.0.5 + SMU 14.0.1.
 static PHOENIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
-    FwEntry::ip_fw("amdgpu/smu_14_0_1.bin"),
+    FwEntry::smu_pmfw("amdgpu/smu_14_0_1.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
@@ -315,7 +329,7 @@ static PHOENIX_FW: &[FwEntry] = &[
 /// as Phoenix-equivalent until we have a real Strix bring-up.
 static STRIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_14_0_4_toc.bin"),
-    FwEntry::ip_fw("amdgpu/smu_14_0_4.bin"),
+    FwEntry::smu_pmfw("amdgpu/smu_14_0_4.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
@@ -757,6 +771,17 @@ impl AmdGpu {
         mp0_base: u32,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<bool, AmdgpuError> {
+        // SMU PMFW gets routed through MP1, not MP0. The cmd
+        // sentinel `SMU_LOAD_PMFW_MP1` flags this — Phoenix-class
+        // SMU firmware lives on disk and uploads via the SMU
+        // mailbox's `LoadMicrocode` message (smu_v14_0.c in
+        // Linux). Renoir-class lists never carry this entry.
+        if entry.cmd == SMU_LOAD_PMFW_MP1 {
+            // SAFETY: caller-asserted exclusive BAR5; same MMIO
+            // discipline as the PSP path.
+            return unsafe { self.smu_dispatch_pmfw(entry, fw_authority) };
+        }
+
         let cap = match narf_firmware::open(entry.name, fw_authority) {
             Ok(c) => c,
             Err(narf_firmware::FirmwareError::NotFound) => {
@@ -826,6 +851,59 @@ impl AmdGpu {
         Ok(true)
     }
 
+    /// Dispatch an SMU PMFW blob via the MP1 mailbox. Phoenix-class
+    /// only — `smu_v14_0.c::smu_v14_0_load_microcode` in Linux.
+    /// The blob is opened from the registry, the raw payload is
+    /// programmed into the SMU's PMFW slots, and
+    /// `PPSMC_MSG_LoadMicrocode` kicks the SMU's loader.
+    ///
+    /// Returns `Ok(true)` when the SMU acks the load, `Ok(false)`
+    /// for an absent optional blob, `Err` on hard failure. Same
+    /// surface as `psp_dispatch_one` so the multi-load loop can
+    /// call either without branching.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively. The firmware blob phys stays
+    /// valid through the SMU mailbox handshake.
+    unsafe fn smu_dispatch_pmfw(
+        &mut self,
+        entry: &FwEntry,
+        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    ) -> Result<bool, AmdgpuError> {
+        let cap = match narf_firmware::open(entry.name, fw_authority) {
+            Ok(c) => c,
+            Err(narf_firmware::FirmwareError::NotFound) => {
+                if entry.optional {
+                    return Ok(false);
+                }
+                return Err(AmdgpuError::FirmwareMissing);
+            }
+            Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
+        };
+        let view = narf_firmware::view_of(&cap)
+            .map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
+        let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
+        let phys = view.phys;
+        let size = view.bytes.len() as u32;
+
+        let mut adapter = SmuRegsAdapter { regs: &self.regs };
+        match crate::amdgpu_smu::load_pmfw(&mut adapter, mp1_base, phys, size) {
+            Ok(()) => {
+                narf_drivers::set_bound_firmware(
+                    "amdgpu",
+                    narf_drivers::BoundFirmware {
+                        blob_name: alloc::string::String::from(entry.name),
+                        sha256: view.sha256,
+                        signer: view.signer,
+                        version: None,
+                    },
+                );
+                Ok(true)
+            }
+            Err(_) => Err(AmdgpuError::FirmwareLoadFailed),
+        }
+    }
+
     /// Walk the chip's per-IP firmware list (`chip.fw_list`) and
     /// dispatch each entry through the PSP mailbox in declaration
     /// order. Falls through to the single-blob `load_firmware` when
@@ -878,6 +956,27 @@ impl AmdGpu {
                     last_optional_skip = Some(alloc::string::String::from(entry.name));
                 }
                 Err(e) => return Err(e),
+            }
+        }
+
+        // GFX11+ (Phoenix/Strix) kicks the PSP-managed RLC autoload
+        // after the IP-firmware loop. `AUTOLOAD_RLC = 0x21` is a
+        // control command (no image), so we send it via the same
+        // mailbox with size=0-style trigger — PSP recognises the
+        // command and runs its autoload state machine over the
+        // already-staged firmwares. GFX9 (Renoir family) starts
+        // RLC by MMIO kick instead, so we skip the call there.
+        if matches!(self.chip.family, Family::Phoenix) {
+            // SAFETY: caller-asserted exclusive BAR5.
+            let r = unsafe {
+                psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC)
+            };
+            if r.is_err() {
+                // Non-fatal: log via the report. RLC autoload
+                // failure means the GFX ring won't come up, but
+                // it doesn't unwind the loads above — let the
+                // caller decide.
+                return Err(AmdgpuError::FirmwareLoadFailed);
             }
         }
 
@@ -1066,6 +1165,52 @@ impl AmdGpu {
             multi_fw: Some(multi_fw),
         })
     }
+}
+
+/// Send a control-only PSP command (no firmware image — used by
+/// AUTOLOAD_RLC, BOOT_CFG queries, etc.). Same MP0 mailbox
+/// protocol as `psp_dispatch_one` but with `phys = 0`, `size = 0`,
+/// and the cmd alone in the trigger word.
+///
+/// # Safety
+/// Caller owns BAR5 exclusively (regs MMIO). `mp0_base` is the
+/// live MP0 register window for this chip.
+unsafe fn psp_send_control_command(
+    regs: &MmioRegion,
+    mp0_base: u32,
+    cmd: u32,
+) -> Result<(), AmdgpuError> {
+    // Per psp_gfx_if.h, control commands occupy the same mailbox
+    // slot family as image-load commands. Lo/hi phys slots get
+    // zero (or harmless prior contents — PSP ignores them for the
+    // commands that don't consume an image).
+    // SAFETY: caller-asserted exclusive MMIO.
+    unsafe {
+        mm_write(regs, mp0_base + MP0_C2PMSG_64_REL, 0);
+        mm_write(regs, mp0_base + MP0_C2PMSG_67_REL, 0);
+    }
+    compiler_fence(Ordering::SeqCst);
+    let trigger = cmd & 0xFF;
+    // SAFETY: same.
+    unsafe {
+        mm_write(regs, mp0_base + MP0_C2PMSG_69_REL, trigger);
+    }
+    let _ = narf_scheduler::responsive_spin_until(
+        // SAFETY: identity-mapped MMIO.
+        || unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) }
+            & PSP_STATUS_DONE_BIT
+            != 0,
+        narf_time::Deadline::after_ms(500),
+    );
+    // SAFETY: identity-mapped MMIO.
+    let last = unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) };
+    if last & PSP_STATUS_DONE_BIT == 0 {
+        return Err(AmdgpuError::FirmwareLoadFailed);
+    }
+    if last & PSP_STATUS_CODE_MASK != 0 {
+        return Err(AmdgpuError::FirmwareLoadFailed);
+    }
+    Ok(())
 }
 
 /// Per-initialize report — what the host learned about the chip

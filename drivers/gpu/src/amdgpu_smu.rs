@@ -117,6 +117,111 @@ pub const PPSMC_MSG_POWER_DOWN_VCN: u32 = 0x19;
 /// driver reload so the next bring-up doesn't see stale state.
 pub const PPSMC_MSG_PREPARE_MP1_FOR_UNLOAD: u32 = 0x35;
 
+// ── PMFW upload (Phoenix-class) ────────────────────────────────────
+//
+// SMU PMFW load on Phoenix/Strix is host-resident: the kernel
+// supplies a signed `smu_*.bin` blob and the on-die MP1 ROM
+// stages it via a two-step mailbox handshake. Renoir/Cezanne
+// keep SMU PMFW in BIOS so the host never touches the PMFW;
+// only the message API (above) is used.
+//
+// The handshake (Linux `smu_v14_0.c::smu_v14_0_load_microcode`):
+//   1. Program PMFW phys lo in `MP1_C2PMSG_64` (slot 64).
+//   2. Program PMFW phys hi in `MP1_C2PMSG_65` (slot 65).
+//   3. Program PMFW byte size in the ARG register.
+//   4. Send `PPSMC_MSG_LoadMicrocode` (0x02 on smu_v14, distinct
+//      from `GetSmuVersion` 0x02 on Renoir's smu_v12 — the same
+//      numeric id with different semantics per chip).
+//   5. Poll RESP for OK / error code.
+//
+// MP1_C2PMSG_64 / 65 sit at offset 0x29C + 64*4 / + 65*4 in the
+// MP1 register window. Slot 64 doubles as the PMFW-phys-lo input
+// + the response status when an LoadMicrocode call completes —
+// same dual-use shape as PSP's MP0_C2PMSG_64.
+
+/// MP1_C2PMSG_64 — PMFW phys-lo on input; never used for other
+/// SMU messages so collisions with `send_message_*` are
+/// structurally impossible (those use slot 90).
+pub const MP1_C2PMSG_PMFW_LO_REL: u32 = 0x29C + 64 * 4;
+/// MP1_C2PMSG_65 — PMFW phys-hi.
+pub const MP1_C2PMSG_PMFW_HI_REL: u32 = 0x29C + 65 * 4;
+
+/// `PPSMC_MSG_LoadMicrocode` — Phoenix-class only (smu_v14+).
+/// Tells the MP1 ROM to start consuming the PMFW image at the
+/// phys address just programmed. Argument = image size in bytes.
+pub const PPSMC_MSG_LOAD_MICROCODE_PHOENIX: u32 = 0x02;
+
+/// Errors specific to the PMFW upload path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PmfwError {
+    /// MP1 mailbox didn't respond within the polling window.
+    /// Indicates the SMU isn't running, the MP1 base is wrong, or
+    /// the PMFW blob is bad enough to wedge the loader.
+    Timeout,
+    /// SMU responded but reported a non-OK status code.
+    /// Codes are smu-version-specific; common are sig-fail / OOM.
+    Rejected(u32),
+    /// Image phys is 0 (caller forgot to alloc DMA-coherent),
+    /// or size is 0 / > 16 MiB (won't fit in the size field).
+    BadImage,
+}
+
+/// Upload a PMFW image via the MP1 mailbox + LoadMicrocode
+/// message. Phoenix-class chips (smu_v14+) only; Renoir-class
+/// reject the call because their MP1 expects PMFW from BIOS.
+///
+/// Pre-conditions handled by the caller:
+///   - `image_phys` must be a DMA-coherent + 4-KiB-aligned
+///     address holding the raw PMFW payload (sans NARF trailer).
+///   - `size_bytes` is the raw payload size in bytes; the trailer
+///     decode happens upstream, this function gets the unwrapped
+///     payload region only.
+pub fn load_pmfw<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    image_phys: u64,
+    size_bytes: u32,
+) -> Result<(), PmfwError> {
+    if image_phys == 0 || size_bytes == 0 || size_bytes > 16 * 1024 * 1024 {
+        return Err(PmfwError::BadImage);
+    }
+
+    // Steps 1-2: phys lo/hi into PMFW slots.
+    mmio.write(mp1_base + MP1_C2PMSG_PMFW_LO_REL, image_phys as u32);
+    mmio.write(mp1_base + MP1_C2PMSG_PMFW_HI_REL, (image_phys >> 32) as u32);
+
+    // Clear the response slot so we can distinguish "we got an
+    // answer to THIS call" from "stale OK from a previous call".
+    mmio.write(mp1_base + MP1_C2PMSG_RESP_REL, 0);
+
+    // Step 3: program the size argument.
+    mmio.write(mp1_base + MP1_C2PMSG_ARG_REL, size_bytes);
+
+    // Step 4: kick the LoadMicrocode message. This atomically
+    // triggers the SMU's PMFW state machine.
+    mmio.write(
+        mp1_base + MP1_C2PMSG_MSG_REL,
+        PPSMC_MSG_LOAD_MICROCODE_PHOENIX,
+    );
+
+    // Step 5: poll for the OK / error code. PMFW load typically
+    // completes within ~100 ms (the SMU verifies the signature
+    // and stages the image into MP1-internal SRAM before
+    // executing). Bound the spin so a wedged SMU doesn't hang
+    // the boot.
+    for _ in 0..SMU_POLL_BUDGET {
+        let resp = mmio.read(mp1_base + MP1_C2PMSG_RESP_REL);
+        if resp == 0 {
+            continue;
+        }
+        if resp == SMU_RESP_OK {
+            return Ok(());
+        }
+        return Err(PmfwError::Rejected(resp));
+    }
+    Err(PmfwError::Timeout)
+}
+
 // ── DPM clock control messages ─────────────────────────────────────
 //
 // These messages take a packed argument:
