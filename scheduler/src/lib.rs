@@ -1149,6 +1149,35 @@ pub fn run_until_empty() {
                     unsafe { narf_arch::x86_64::pks::restore(saved) };
                 }
             }
+            // Per-poll identification beacon — slot 18 cycles
+            // through 8 palette colors keyed by a global counter.
+            // When run_until_empty wedges inside one task's poll
+            // (slot 21 stuck, slot 17 dark), this slot's color
+            // tells you WHICH poll-count was the last one
+            // attempted: red(0) → orange(1) → yellow(2) →
+            // green(3) → blue(4) → cyan(5) → magenta(6) →
+            // white(7) → wraps. Combined with knowing the rough
+            // boot-order of spawn() calls (TPM init tasks
+            // first, then power-monitor, then FB stuff, then
+            // measured-boot, then heartbeat, then init/shell
+            // last), pin the wedge.
+            #[cfg(target_arch = "x86_64")]
+            {
+                use core::sync::atomic::{AtomicU64, Ordering as O};
+                static POLL_N: AtomicU64 = AtomicU64::new(0);
+                const PALETTE: [u32; 8] = [
+                    0x00FF_0000, // red 0
+                    0x00FF_8000, // orange 1
+                    0x00FF_FF00, // yellow 2
+                    0x0000_FF00, // green 3
+                    0x0000_00FF, // blue 4
+                    0x0000_FFFF, // cyan 5
+                    0x00FF_00FF, // magenta 6
+                    0x00FF_FFFF, // white 7
+                ];
+                let n = POLL_N.fetch_add(1, O::Relaxed);
+                narf_memory::beacon::paint(18, PALETTE[(n as usize) & 7]);
+            }
             let poll_result = slot.task.as_mut().poll(&mut ctx);
             CURRENT_TASK.store(0, Ordering::Release);
             *ACTIVE_USER_AS.lock() = None;
