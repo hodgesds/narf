@@ -34,12 +34,52 @@
 #![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
-use crate::x86_64::msr::{rdmsr, wrmsr};
+use crate::x86_64::cpuid::cpuid;
+use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
 
 pub const MSR_IA32_MTRRCAP: u32 = 0xFE;
 pub const MSR_IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
 const MSR_PHYSBASE_BASE: u32 = 0x200;
 const MSR_PHYSMASK_BASE: u32 = 0x201;
+
+/// CPUID-derived max-physical-address-width. Bits above this are
+/// reserved in MTRR PHYSBASE/PHYSMASK MSR writes — real silicon
+/// `#GP`s if you set them; QEMU TCG is lax. AMD APM Vol 2 §7.7.1,
+/// Intel SDM Vol 3 §12.11.4 both spell this out.
+///
+/// Default value 36 = the architectural minimum (Intel: original
+/// x86_64 required ≥ 36, AMD64 same). Real Phoenix typically
+/// reports 48; the fallback exists so we never mask too loosely.
+fn maxphyaddr() -> u8 {
+    // CPUID.80000000h:EAX → maxleaf
+    // SAFETY: leaf 0x80000000 always defined.
+    let max_ext = unsafe { cpuid(0x8000_0000, 0).0 };
+    if max_ext < 0x8000_0008 {
+        return 36;
+    }
+    // CPUID.80000008h:EAX bits[7:0] = MAXPHYADDR
+    // SAFETY: extended leaf 8 valid per max_ext check.
+    let (eax, _, _, _) = unsafe { cpuid(0x8000_0008, 0) };
+    let bits = (eax & 0xFF) as u8;
+    if bits == 0 {
+        36
+    } else {
+        bits
+    }
+}
+
+/// Mask that selects "address bits available to MTRR PHYSBASE /
+/// PHYSMASK" — bits 12..=MAXPHYADDR-1. Setting bits outside this
+/// range #GPs on real silicon.
+fn phys_addr_mask() -> u64 {
+    let bits = maxphyaddr();
+    if bits >= 64 {
+        !0xFFFu64 // shouldn't happen, but defensive
+    } else {
+        let top = (1u64 << bits).wrapping_sub(1);
+        top & !0xFFFu64
+    }
+}
 
 /// Memory type encoding (SDM §12.11.2.1 Table 12-3 / §12.11.4.1).
 #[repr(u8)]
@@ -143,7 +183,16 @@ pub unsafe fn read_variable(idx: u8) -> (u64, u64) {
 /// Program a variable range MTRR.
 ///
 /// `size_bytes` must be a power of two; `phys` must be aligned to
-/// it. The MTRR mask is `~(size - 1) & physmask` per the SDM.
+/// it. The MTRR mask is `~(size - 1) & physmask` per the SDM,
+/// where `physmask` is constrained to bits 12..=MAXPHYADDR-1 (any
+/// bit above that is reserved and will be rejected by real
+/// silicon with `#GP`).
+///
+/// Returns `Ok(())` on a successful write, `Err(())` if either
+/// the PHYSBASE or PHYSMASK write was rejected (firmware-locked
+/// MTRR, reserved-bit violation we didn't catch, etc.). Both
+/// MSRs go through `wrmsr_or_gp` so a rejection is a typed
+/// error, not a kernel-fatal #GP.
 ///
 /// This helper does **not** perform the cache-disable / WBINVD
 /// dance the SDM mandates for runtime updates to existing
@@ -154,18 +203,30 @@ pub unsafe fn read_variable(idx: u8) -> (u64, u64) {
 /// # Safety
 /// CPL = 0; `idx < cap().vcnt`; the address window must be
 /// reasonable (claimed by the device behind the BAR).
-pub unsafe fn set_variable(idx: u8, phys: u64, size_bytes: u64, mem_type: MemType) {
+pub unsafe fn set_variable(
+    idx: u8,
+    phys: u64,
+    size_bytes: u64,
+    mem_type: MemType,
+) -> Result<(), ()> {
     if !size_bytes.is_power_of_two() {
-        return;
+        return Err(());
     }
-    let mask_bits = !(size_bytes - 1) & 0x000F_FFFF_FFFF_F000;
-    let physbase = (phys & 0x000F_FFFF_FFFF_F000) | (mem_type as u64);
+    let addr_mask = phys_addr_mask();
+    let mask_bits = !(size_bytes - 1) & addr_mask;
+    let physbase = (phys & addr_mask) | (mem_type as u64);
     let physmask = mask_bits | (1 << 11); // V (valid) bit 11.
-                                          // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_PHYSBASE_BASE + 2 * idx as u32, physbase);
-        wrmsr(MSR_PHYSMASK_BASE + 2 * idx as u32, physmask);
+    // Use the probe-armed wrappers so a firmware-locked MTRR or
+    // a reserved-bit reject becomes a typed error instead of a
+    // kernel-fatal #GP — early-FB-console install path treats
+    // this as best-effort (no WC just means slow scroll).
+    if wrmsr_or_gp(MSR_PHYSBASE_BASE + 2 * idx as u32, physbase).is_err() {
+        return Err(());
     }
+    if wrmsr_or_gp(MSR_PHYSMASK_BASE + 2 * idx as u32, physmask).is_err() {
+        return Err(());
+    }
+    Ok(())
 }
 
 /// Find the first free variable MTRR slot (mask V bit clear).
@@ -198,8 +259,6 @@ pub unsafe fn set_write_combining(phys: u64, size_bytes: u64) -> Option<u8> {
     // SAFETY: caller-asserted.
     let slot = unsafe { find_free_slot() }?;
     // SAFETY: same.
-    unsafe {
-        set_variable(slot, phys, size_bytes, MemType::WriteCombining);
-    }
-    Some(slot)
+    let res = unsafe { set_variable(slot, phys, size_bytes, MemType::WriteCombining) };
+    res.ok().map(|_| slot)
 }
