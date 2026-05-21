@@ -1278,7 +1278,7 @@ fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
         });
     let iso = PathBuf::from(&iso_path);
     if !iso.exists() {
-        bail!("ISO not found at {}; run `cargo xtask iso-boot` first", iso.display());
+        bail!("ISO not found at {}; run `cargo xtask image` first", iso.display());
     }
     let iso_size = std::fs::metadata(&iso)?.len();
     println!("ISO: {} ({} MiB)", iso.display(), iso_size / 1024 / 1024);
@@ -1496,10 +1496,13 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     // without the kernel + init binaries to populate it with.
     let root = workspace_root().context("locating workspace root")?;
     let target_dir = root.join("target");
-    // Pull every artifact from the iso-boot staging directory —
-    // that's where the kernel + initramfs + Limine binaries
-    // *both* exist in a known layout, regardless of debug-vs-release
-    // and bootloader-path quirks.
+    // Pull every artifact from the `cargo xtask image` staging dir —
+    // that's where the kernel + initramfs + Limine binaries exist in
+    // a known layout, regardless of debug-vs-release and
+    // bootloader-path quirks. `xtask image` builds without launching
+    // QEMU; `xtask iso-boot` would also produce these (it calls
+    // image internally) but it boots the ISO afterwards which we
+    // don't want for a disk-burn workflow.
     let stage = target_dir.join("iso-x86_64");
     let kernel = stage.join("boot/narf-frame");
     let initramfs = stage.join("boot/initramfs.cpio");
@@ -1513,7 +1516,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     ] {
         if !p.exists() {
             bail!(
-                "{} not found at {}; run `cargo xtask iso-boot` first to \
+                "{} not found at {}; run `cargo xtask image` first to \
                  build the kernel + initramfs + Limine staging",
                 label,
                 p.display()
