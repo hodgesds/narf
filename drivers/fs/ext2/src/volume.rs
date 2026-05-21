@@ -13,6 +13,7 @@
 //! - Rusling, _The Second Extended File System: Internal Layout_.
 //! - OSDev Wiki, "Ext2": <https://wiki.osdev.org/Ext2>
 
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -26,7 +27,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use super::group_desc::GroupDesc;
 use super::inode::Inode;
-use super::superblock::Superblock;
+use super::journal;
+use super::superblock::{ExtFlavour, Superblock};
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
 /// once at `mount()` via `narf_io::register_with_cap` and is the
@@ -67,6 +69,82 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// only and never across an `await` (the lock would otherwise
     /// deadlock under cooperative async).
     io: IrqSafeSpinLock<VolumeIo>,
+    /// JBD2 read-side replay overrides — FS-block → post-replay
+    /// bytes. Populated by `Ext2Volume::mount` when an unclean
+    /// ext3+ volume is seen; consulted by `read_block` before
+    /// going to the device so RO reads observe the post-replay
+    /// state without ever touching the disk. Empty on clean
+    /// volumes and on ext2 (which has no journal).
+    journal_overrides: BTreeMap<u64, Vec<u8>>,
+}
+
+/// Free-function indirect-pointer read used by the pre-construction
+/// journal-replay path. Mirrors `Ext2Volume::read_indirect` but
+/// borrows everything directly so the async future has no implicit
+/// 'static bound from `Ext2Volume::<B>::...` qualification.
+async fn read_indirect_static<B: BlockDevice>(
+    device: &B,
+    io: &VolumeIo,
+    bs: usize,
+    block_no: u32,
+    index: u64,
+) -> Result<u32, FsError> {
+    if block_no == 0 {
+        return Ok(0);
+    }
+    if index >= (bs / 4) as u64 {
+        return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+    }
+    let mut buf = vec![0u8; bs];
+    read_byte_range_into_static(device, io, block_no as u64 * bs as u64, &mut buf).await?;
+    let off = (index as usize) * 4;
+    Ok(u32::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+    ]))
+}
+
+/// Free-function variant of `Ext2Volume::read_byte_range_into`
+/// usable from other free helpers.
+async fn read_byte_range_into_static<B: BlockDevice>(
+    device: &B,
+    io: &VolumeIo,
+    byte_off: u64,
+    dst: &mut [u8],
+) -> Result<(), FsError> {
+    let lbs = io.lbs;
+    let mut cursor = 0usize;
+    while cursor < dst.len() {
+        let abs = byte_off + cursor as u64;
+        let lba = abs / lbs as u64;
+        let in_lba = (abs % lbs as u64) as usize;
+        let want = core::cmp::min(dst.len() - cursor, lbs - in_lba);
+
+        let req = BlockRequest {
+            op: BlockOp::Read,
+            lba,
+            blocks: 1,
+            buffer: io
+                .cap
+                .derive::<Read>()
+                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+            qos: QosHint::Latency,
+            user_tag: 0,
+        };
+        let completion = device.submit(req).await;
+        completion.result.map_err(FsError::Io)?;
+
+        let buf = io
+            .buffer()
+            .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+        // SAFETY: see Ext2Volume::read_byte_range_into.
+        let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
+        dst[cursor..cursor + want].copy_from_slice(&src[in_lba..in_lba + want]);
+        cursor += want;
+    }
+    Ok(())
 }
 
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
@@ -137,6 +215,34 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             group_descs.push(gd);
         }
 
+        // ── JBD2 read-side replay ───────────────────────────────
+        //
+        // If the volume is ext3+ AND was not cleanly unmounted, walk
+        // the journal and build an override map of FS-block →
+        // post-replay bytes. For RO mounts this is sufficient — we
+        // never write to disk; later `read_block` calls consult the
+        // override before doing device I/O.
+        let mut journal_overrides: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        if superblock.flavour() != ExtFlavour::Ext2
+            && superblock.has_journal()
+            && !superblock.is_clean()
+        {
+            // Best-effort replay: failure is non-fatal for an RO
+            // mount (we just fall back to the on-disk state — same
+            // as ext2 was before journal support). The override
+            // map only narrows reads, never invents data.
+            if let Ok(map) = Self::replay_journal_at_mount(
+                &*device,
+                &io,
+                &superblock,
+                &group_descs,
+            )
+            .await
+            {
+                journal_overrides = map;
+            }
+        }
+
         Ok(Arc::new_cyclic(|self_weak| Ext2Volume {
             device,
             superblock,
@@ -144,7 +250,184 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            journal_overrides,
         }))
+    }
+
+    /// Drive `journal::replay_journal` against the on-disk journal
+    /// inode (`s_journal_inum`, typically 8). Reads journal blocks
+    /// in sequence by walking the inode's logical→physical map and
+    /// fetching one FS block at a time, eagerly into a `Vec<Vec<u8>>`
+    /// (one entry per journal-block index) so the pure-logic
+    /// `replay_journal` closure stays synchronous.
+    ///
+    /// References:
+    ///   * Linux `fs/jbd2/journal.c::jbd2_journal_get_descriptor_buffer`
+    ///     for the journal-block addressing model (logical block N of
+    ///     the journal inode → on-disk FS block via `map_block`).
+    ///   * Linux `fs/jbd2/recovery.c::do_one_pass` for the algorithm
+    ///     we implement in `journal::replay_journal`.
+    async fn replay_journal_at_mount(
+        device: &B,
+        io: &VolumeIo,
+        sb: &Superblock,
+        group_descs: &[GroupDesc],
+    ) -> Result<BTreeMap<u64, Vec<u8>>, FsError> {
+        let bs = sb.block_size() as usize;
+        let inode_no = sb.journal_inum;
+        if inode_no == 0 {
+            return Ok(BTreeMap::new());
+        }
+        // Read the journal inode directly (avoid building a temporary
+        // Ext2Volume just for this — we already have `device`,
+        // `group_descs`, and `io`).
+        let (group, index) = {
+            let zero = inode_no.checked_sub(1).ok_or(FsError::NotFound)?;
+            let g = zero / sb.inodes_per_group;
+            let i = zero % sb.inodes_per_group;
+            if (g as usize) >= group_descs.len() {
+                return Err(FsError::NotFound);
+            }
+            (g, i)
+        };
+        let gd = &group_descs[group as usize];
+        let inode_size = sb.inode_size_bytes();
+        let table_byte_off = gd.inode_table * bs as u64;
+        let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
+        let mut inode_buf = vec![0u8; 128];
+        read_byte_range_into_static::<B>(device, io, inode_byte_off, &mut inode_buf).await?;
+        let inode = Inode::parse(&inode_buf)
+            .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+
+        // Size of the journal in bytes → number of journal blocks.
+        let journal_bytes = inode.size as u64;
+        let n_blocks = (journal_bytes / bs as u64) as u32;
+        if n_blocks == 0 {
+            return Ok(BTreeMap::new());
+        }
+
+        // Eagerly fetch every journal block into memory. JBD2 journals
+        // are typically 128 MiB max; for the in-driver replay the
+        // simplicity of a flat buffer is worth the cost. We can swap
+        // to a demand-fetch closure later if needed.
+        let mut journal_image: Vec<Vec<u8>> = Vec::with_capacity(n_blocks as usize);
+        for i in 0..n_blocks {
+            let phys = Self::map_block_static(
+                device, io, sb, group_descs, &inode, i as u64,
+            )
+            .await?;
+            if phys == 0 {
+                // Sparse hole in the journal — treat as a block of
+                // zeros. The replay walker will hit a bad-magic
+                // header and stop walking forward at this point.
+                journal_image.push(vec![0u8; bs]);
+                continue;
+            }
+            let mut buf = vec![0u8; bs];
+            read_byte_range_into_static::<B>(device, io, phys * bs as u64, &mut buf).await?;
+            journal_image.push(buf);
+        }
+
+        let report = journal::replay_journal(n_blocks, |i| {
+            journal_image.get(i as usize).cloned()
+        })
+        .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
+        Ok(report.blocks_to_write)
+    }
+
+    /// Static block-map walk usable before the `Arc<Ext2Volume>`
+    /// exists. Mirrors `map_block` but takes all state by reference.
+    /// Only used during the journal-replay path at mount.
+    async fn map_block_static(
+        device: &B,
+        io: &VolumeIo,
+        sb: &Superblock,
+        _group_descs: &[GroupDesc],
+        inode: &Inode,
+        logical: u64,
+    ) -> Result<u64, FsError> {
+        if sb.uses_extents() {
+            // Mirror map_block_extents but read child blocks via
+            // the static helper.
+            use super::extent::{lookup_in_node, LookupOutcome};
+            let mut node_buf = vec![0u8; 60];
+            for (i, &b) in inode.block.iter().enumerate() {
+                node_buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+            }
+            let logical32 = if logical > u32::MAX as u64 {
+                return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+            } else {
+                logical as u32
+            };
+            let mut depth = 8u32;
+            loop {
+                match lookup_in_node(&node_buf, logical32) {
+                    LookupOutcome::Mapped {
+                        physical,
+                        is_uninitialized,
+                    } => {
+                        if is_uninitialized {
+                            return Ok(0);
+                        }
+                        return Ok(physical);
+                    }
+                    LookupOutcome::Hole => return Ok(0),
+                    LookupOutcome::Corrupt => {
+                        return Err(FsError::Io(narf_block::BlockError::IOError));
+                    }
+                    LookupOutcome::DeeperLookupRequired { child_block } => {
+                        depth = depth
+                            .checked_sub(1)
+                            .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+                        let bs = sb.block_size() as usize;
+                        let mut child = vec![0u8; bs];
+                        read_byte_range_into_static::<B>(
+                            device,
+                            io,
+                            child_block * bs as u64,
+                            &mut child,
+                        )
+                        .await?;
+                        node_buf = child;
+                    }
+                }
+            }
+        }
+        // Legacy indirect-block walk.
+        let bs = sb.block_size() as usize;
+        let p = (bs / 4) as u64;
+        let direct_max = super::inode::N_DIRECT as u64;
+        let single_max = direct_max + p;
+        let double_max = single_max + p * p;
+        let triple_max = double_max + p * p * p;
+
+        if logical < direct_max {
+            return Ok(inode.block[logical as usize] as u64);
+        }
+        if logical < single_max {
+            let idx = logical - direct_max;
+            let l1 = inode.block[super::inode::SINGLE_IND_IDX];
+            return Ok(read_indirect_static::<B>(device, io, bs, l1, idx).await? as u64);
+        }
+        if logical < double_max {
+            let l = logical - single_max;
+            let l1 = l / p;
+            let l0 = l % p;
+            let l2_block = inode.block[super::inode::DOUBLE_IND_IDX];
+            let middle = read_indirect_static::<B>(device, io, bs, l2_block, l1).await?;
+            return Ok(read_indirect_static::<B>(device, io, bs, middle, l0).await? as u64);
+        }
+        if logical < triple_max {
+            let l = logical - double_max;
+            let l2 = l / (p * p);
+            let l1 = (l / p) % p;
+            let l0 = l % p;
+            let l3_block = inode.block[super::inode::TRIPLE_IND_IDX];
+            let middle = read_indirect_static::<B>(device, io, bs, l3_block, l2).await?;
+            let leaf = read_indirect_static::<B>(device, io, bs, middle, l1).await?;
+            return Ok(read_indirect_static::<B>(device, io, bs, leaf, l0).await? as u64);
+        }
+        Err(FsError::Io(narf_block::BlockError::InvalidRange))
     }
 
     /// Filesystem block size in bytes.
@@ -161,29 +444,102 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Internally this may cost multiple device-LBA reads if the
     /// device's logical block size is smaller than the FS block
     /// size, or one partial read if larger.
+    ///
+    /// JBD2 replay override: if `block_no` is in the
+    /// `journal_overrides` map (populated at mount for unclean
+    /// ext3+ volumes), serve from memory instead of going to disk.
+    /// This is the RO-replay path — every metadata block that the
+    /// journal said should be updated is read back as its
+    /// post-replay contents without ever writing to the device.
     pub async fn read_block(&self, block_no: u64, dst: &mut [u8]) -> Result<(), FsError> {
         let bs = self.block_size();
         if dst.len() != bs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
+        if let Some(override_data) = self.journal_overrides.get(&block_no) {
+            // Override block size must match the FS block size; if
+            // a future journal carries a different blocksize we fall
+            // back to disk to avoid mis-serving truncated data.
+            if override_data.len() == bs {
+                dst.copy_from_slice(override_data);
+                return Ok(());
+            }
+        }
         let byte_off = block_no * bs as u64;
         self.read_byte_range(byte_off, dst).await
+    }
+
+    /// Number of journal-replay overrides installed at mount. Zero
+    /// on clean volumes / ext2. Used by smokes to confirm replay
+    /// fired without exposing the internal map.
+    pub fn journal_override_count(&self) -> usize {
+        self.journal_overrides.len()
     }
 
     /// Read `dst.len()` bytes starting at the device byte offset
     /// `byte_off`. Internally serialises on the volume's scratch
     /// buffer + cap.
+    ///
+    /// If the requested range falls inside one or more FS blocks
+    /// that the journal replay overrode, those bytes are served
+    /// from the in-memory override map; bytes outside overridden
+    /// blocks go to the device. This keeps RO replay correctness
+    /// for inode-table reads (which are sub-block byte ranges)
+    /// without paying the override-check cost in the device-LBA
+    /// loop.
     pub async fn read_byte_range(
         &self,
         byte_off: u64,
         dst: &mut [u8],
     ) -> Result<(), FsError> {
-        // Cap is `Copy`; LBS is small. Snapshot under the lock.
-        let (cap, lbs) = {
-            let g = self.io.lock();
-            (g.cap, g.lbs)
-        };
-        Self::read_byte_range_with(&*self.device, cap, lbs, &self.io, byte_off, dst).await
+        // Fast path — no overrides installed.
+        if self.journal_overrides.is_empty() {
+            let (cap, lbs) = {
+                let g = self.io.lock();
+                (g.cap, g.lbs)
+            };
+            return Self::read_byte_range_with(
+                &*self.device,
+                cap,
+                lbs,
+                &self.io,
+                byte_off,
+                dst,
+            )
+            .await;
+        }
+        // Walk one FS-block at a time, consulting the override map.
+        let bs = self.block_size() as u64;
+        let mut cursor = 0usize;
+        while cursor < dst.len() {
+            let abs = byte_off + cursor as u64;
+            let fs_block = abs / bs;
+            let in_block = (abs % bs) as usize;
+            let want = core::cmp::min(dst.len() - cursor, bs as usize - in_block);
+            if let Some(ov) = self.journal_overrides.get(&fs_block) {
+                if ov.len() == bs as usize {
+                    dst[cursor..cursor + want]
+                        .copy_from_slice(&ov[in_block..in_block + want]);
+                    cursor += want;
+                    continue;
+                }
+            }
+            let (cap, lbs) = {
+                let g = self.io.lock();
+                (g.cap, g.lbs)
+            };
+            Self::read_byte_range_with(
+                &*self.device,
+                cap,
+                lbs,
+                &self.io,
+                abs,
+                &mut dst[cursor..cursor + want],
+            )
+            .await?;
+            cursor += want;
+        }
+        Ok(())
     }
 
     /// Variant of `read_byte_range` usable before the `Ext2Volume`

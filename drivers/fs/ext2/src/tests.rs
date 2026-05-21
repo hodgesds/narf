@@ -775,3 +775,463 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext4_inode_block_array_serialises_as_extent_root
 );
+
+// ── JBD2 journal replay ────────────────────────────────────────────
+
+fn put_u32_be(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+fn build_journal_sb_v2(
+    block_size: u32,
+    maxlen: u32,
+    first: u32,
+    sequence: u32,
+    start: u32,
+) -> Vec<u8> {
+    use crate::journal::{block_type, JBD2_MAGIC_NUMBER};
+    let mut b = vec![0u8; block_size as usize];
+    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
+    put_u32_be(&mut b, 4, block_type::SUPERBLOCK_V2);
+    put_u32_be(&mut b, 8, 0); // h_sequence (unused on SB)
+    put_u32_be(&mut b, 12, block_size);
+    put_u32_be(&mut b, 16, maxlen);
+    put_u32_be(&mut b, 20, first);
+    put_u32_be(&mut b, 24, sequence);
+    put_u32_be(&mut b, 28, start);
+    b
+}
+
+fn smoke_jbd2_superblock_magic_and_fields() -> TestResult {
+    use crate::journal::{JournalSuperblock, JBD2_MAGIC_NUMBER};
+    let b = build_journal_sb_v2(1024, 100, 1, 42, 7);
+    let sb = match JournalSuperblock::parse(&b) {
+        Some(s) => s,
+        None => return TestResult::Fail("jbd2 sb parse failed"),
+    };
+    if sb.block_size != 1024 || sb.maxlen != 100 || sb.first != 1 {
+        return TestResult::Fail("jbd2 sb fields wrong");
+    }
+    if sb.sequence != 42 || sb.start != 7 {
+        return TestResult::Fail("jbd2 sb seq/start wrong");
+    }
+    if sb.is_clean() {
+        return TestResult::Fail("jbd2 sb with start != 0 must be unclean");
+    }
+    // Wrong magic must reject.
+    let mut bad = b.clone();
+    bad[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+    if JournalSuperblock::parse(&bad).is_some() {
+        return TestResult::Fail("bad magic must reject");
+    }
+    // Clean: start == 0.
+    let clean = build_journal_sb_v2(1024, 100, 1, 1, 0);
+    let sb = JournalSuperblock::parse(&clean).expect("parse");
+    if !sb.is_clean() {
+        return TestResult::Fail("start==0 must be clean");
+    }
+    // Confirm magic constant matches Linux's JBD2_MAGIC_NUMBER.
+    if JBD2_MAGIC_NUMBER != 0xC03B_3998 {
+        return TestResult::Fail("magic constant wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_superblock_magic_and_fields);
+
+fn smoke_jbd2_descriptor_block_decodes_two_tags() -> TestResult {
+    use crate::journal::{
+        block_type, tag_flag, DescriptorBlock, JBD2_MAGIC_NUMBER,
+    };
+    let bs = 1024usize;
+    let mut b = vec![0u8; bs];
+    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
+    put_u32_be(&mut b, 4, block_type::DESCRIPTOR);
+    put_u32_be(&mut b, 8, 5); // sequence
+    // tag 0: target=10, flags=0 — UUID follows.
+    put_u32_be(&mut b, 12, 10);
+    put_u32_be(&mut b, 16, 0);
+    // (16-byte UUID stays as zeros.)
+    // tag 1: target=20, flags=SAME_UUID|LAST_TAG.
+    let t1_off = 12 + 8 + 16;
+    put_u32_be(&mut b, t1_off, 20);
+    put_u32_be(&mut b, t1_off + 4, tag_flag::SAME_UUID | tag_flag::LAST_TAG);
+    let d = match DescriptorBlock::parse(&b) {
+        Some(d) => d,
+        None => return TestResult::Fail("descriptor parse failed"),
+    };
+    if d.tags.len() != 2 {
+        return TestResult::Fail("expected 2 tags");
+    }
+    if d.tags[0].target_block != 10 || d.tags[1].target_block != 20 {
+        return TestResult::Fail("tag target_block mismatch");
+    }
+    if !d.tags[1].is_last() {
+        return TestResult::Fail("tag1 LAST_TAG bit not seen");
+    }
+    if d.tags[1].has_uuid() {
+        return TestResult::Fail("tag1 SAME_UUID should skip UUID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_descriptor_block_decodes_two_tags);
+
+fn smoke_jbd2_commit_block_decodes() -> TestResult {
+    use crate::journal::{block_type, CommitBlock, JBD2_MAGIC_NUMBER};
+    let bs = 1024usize;
+    let mut b = vec![0u8; bs];
+    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
+    put_u32_be(&mut b, 4, block_type::COMMIT);
+    put_u32_be(&mut b, 8, 7);
+    let c = match CommitBlock::parse(&b) {
+        Some(c) => c,
+        None => return TestResult::Fail("commit parse failed"),
+    };
+    if c.header.sequence != 7 {
+        return TestResult::Fail("commit sequence mismatch");
+    }
+    // Descriptor block must not parse as commit.
+    let mut d = vec![0u8; bs];
+    put_u32_be(&mut d, 0, JBD2_MAGIC_NUMBER);
+    put_u32_be(&mut d, 4, block_type::DESCRIPTOR);
+    if CommitBlock::parse(&d).is_some() {
+        return TestResult::Fail("descriptor must not parse as commit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_commit_block_decodes);
+
+fn smoke_jbd2_revoke_block_lists_targets() -> TestResult {
+    use crate::journal::{block_type, JBD2_MAGIC_NUMBER, RevokeBlock};
+    let bs = 1024usize;
+    let mut b = vec![0u8; bs];
+    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
+    put_u32_be(&mut b, 4, block_type::REVOKE);
+    put_u32_be(&mut b, 8, 9);
+    // r_count = 12 (hdr) + 4 (count itself) + 3*4 = 28.
+    put_u32_be(&mut b, 12, 28);
+    put_u32_be(&mut b, 16, 100);
+    put_u32_be(&mut b, 20, 200);
+    put_u32_be(&mut b, 24, 300);
+    let r = match RevokeBlock::parse(&b) {
+        Some(r) => r,
+        None => return TestResult::Fail("revoke parse failed"),
+    };
+    if r.revoked.len() != 3
+        || r.revoked[0] != 100
+        || r.revoked[1] != 200
+        || r.revoked[2] != 300
+    {
+        return TestResult::Fail("revoke targets mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_revoke_block_lists_targets);
+
+fn smoke_jbd2_replay_end_to_end_one_txn() -> TestResult {
+    // Synthetic journal image. 1024-byte journal blocks.
+    //   block 0: superblock (start=1, first=1, seq=5, maxlen=8)
+    //   block 1: descriptor (seq=5, 1 tag → target FS block 42, LAST_TAG)
+    //   block 2: data block (the bytes journaled for block 42)
+    //   block 3: commit (seq=5)
+    //   block 4+: zeroed (walk terminates on bad magic)
+    use crate::journal::{
+        block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER,
+    };
+    let bs = 1024usize;
+    let mut img = vec![0u8; bs * 8];
+    let sb = build_journal_sb_v2(bs as u32, 8, 1, 5, 1);
+    img[0..bs].copy_from_slice(&sb);
+
+    // Descriptor at block 1.
+    {
+        let d = &mut img[bs..2 * bs];
+        put_u32_be(d, 0, JBD2_MAGIC_NUMBER);
+        put_u32_be(d, 4, block_type::DESCRIPTOR);
+        put_u32_be(d, 8, 5);
+        put_u32_be(d, 12, 42);
+        put_u32_be(d, 16, tag_flag::SAME_UUID | tag_flag::LAST_TAG);
+    }
+    // Data at block 2.
+    {
+        let data = &mut img[2 * bs..3 * bs];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x10);
+        }
+    }
+    // Commit at block 3.
+    {
+        let c = &mut img[3 * bs..4 * bs];
+        put_u32_be(c, 0, JBD2_MAGIC_NUMBER);
+        put_u32_be(c, 4, block_type::COMMIT);
+        put_u32_be(c, 8, 5);
+    }
+
+    let report = match replay_journal_flat(&img, bs) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("replay returned error"),
+    };
+    if report.transactions_replayed != 1 {
+        return TestResult::Fail("expected exactly 1 transaction replayed");
+    }
+    let got = match report.blocks_to_write.get(&42) {
+        Some(v) => v,
+        None => return TestResult::Fail("expected override for FS block 42"),
+    };
+    if got.len() != bs || got[0] != 0x10 || got[3] != 0x13 {
+        return TestResult::Fail("replayed data content mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_replay_end_to_end_one_txn);
+
+fn smoke_jbd2_replay_clean_journal_no_overrides() -> TestResult {
+    use crate::journal::replay_journal_flat;
+    let bs = 1024usize;
+    let mut img = vec![0u8; bs * 4];
+    let sb = build_journal_sb_v2(bs as u32, 4, 1, 1, 0); // start==0
+    img[0..bs].copy_from_slice(&sb);
+    let report = match replay_journal_flat(&img, bs) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("clean replay must not error"),
+    };
+    if report.transactions_replayed != 0 || !report.blocks_to_write.is_empty() {
+        return TestResult::Fail("clean journal must produce no overrides");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_replay_clean_journal_no_overrides);
+
+fn smoke_jbd2_replay_revoke_suppresses_target() -> TestResult {
+    // Same as the end-to-end smoke, but a revoke block at seq=5 for
+    // target 42 sits between the data block and the commit. The
+    // override map must NOT contain 42.
+    use crate::journal::{
+        block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER,
+    };
+    let bs = 1024usize;
+    let mut img = vec![0u8; bs * 8];
+    let sb = build_journal_sb_v2(bs as u32, 8, 1, 5, 1);
+    img[0..bs].copy_from_slice(&sb);
+
+    {
+        let d = &mut img[bs..2 * bs];
+        put_u32_be(d, 0, JBD2_MAGIC_NUMBER);
+        put_u32_be(d, 4, block_type::DESCRIPTOR);
+        put_u32_be(d, 8, 5);
+        put_u32_be(d, 12, 42);
+        put_u32_be(d, 16, tag_flag::SAME_UUID | tag_flag::LAST_TAG);
+    }
+    img[2 * bs..3 * bs].fill(0xAB);
+    {
+        let r = &mut img[3 * bs..4 * bs];
+        put_u32_be(r, 0, JBD2_MAGIC_NUMBER);
+        put_u32_be(r, 4, block_type::REVOKE);
+        put_u32_be(r, 8, 5);
+        put_u32_be(r, 12, 20); // 12 hdr + 4 count + 1*4 = 20
+        put_u32_be(r, 16, 42);
+    }
+    {
+        let c = &mut img[4 * bs..5 * bs];
+        put_u32_be(c, 0, JBD2_MAGIC_NUMBER);
+        put_u32_be(c, 4, block_type::COMMIT);
+        put_u32_be(c, 8, 5);
+    }
+    let report = match replay_journal_flat(&img, bs) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("replay errored"),
+    };
+    if report.blocks_to_write.contains_key(&42) {
+        return TestResult::Fail("revoked target must not appear in overrides");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_jbd2_replay_revoke_suppresses_target);
+
+// ── Volume mount with unclean journaled image installs overrides ──
+
+/// Build an ext3 (HAS_JOURNAL) image with `s_state == 0` (unclean)
+/// and a tiny in-band journal at inode 8 that replays one block.
+///
+/// The journal contains a single transaction whose descriptor tag
+/// targets block 9 (the root directory's data block) and whose data
+/// block redirects the root directory to a single-entry dir listing
+/// "REPLAYED" inode 12. The on-disk root directory (still on disk
+/// at block 9) lists "ondisk-name" — so any test that observes
+/// "REPLAYED" through `Ext2Volume` instead of "ondisk-name" has
+/// proven that read_block consulted the override map.
+fn build_ext3_unclean_image() -> Vec<u8> {
+    const BS: usize = 1024;
+    const TOTAL_BLOCKS: u32 = 128;
+    const INODES_PER_GROUP: u32 = 32;
+    const INODE_SIZE: u16 = 128;
+    const BLOCKS_PER_GROUP: u32 = 128;
+
+    let mut img = vec![0u8; BS * TOTAL_BLOCKS as usize];
+
+    // Superblock at byte 1024 — ext3-shape (HAS_JOURNAL, s_state==0).
+    let sb = &mut img[1024..2048];
+    put_u32(sb, 0, INODES_PER_GROUP);
+    put_u32(sb, 4, TOTAL_BLOCKS);
+    put_u32(sb, 20, 1);
+    put_u32(sb, 24, 0); // log_block_size = 0 → 1024
+    put_u32(sb, 32, BLOCKS_PER_GROUP);
+    put_u32(sb, 40, INODES_PER_GROUP);
+    put_u16(sb, 56, 0xEF53);
+    put_u16(sb, 58, 0); // s_state = 0 (unclean)
+    put_u32(sb, 76, 1); // rev_level = 1
+    put_u16(sb, 88, INODE_SIZE);
+    // s_feature_compat = HAS_JOURNAL (0x4).
+    put_u32(sb, 92, 0x4);
+    // s_journal_inum = 8.
+    put_u32(sb, 224, 8);
+
+    // Block group descriptor at start of block 2.
+    let gdt_off = 2 * BS;
+    put_u32(&mut img, gdt_off + 0, 3);
+    put_u32(&mut img, gdt_off + 4, 4);
+    put_u32(&mut img, gdt_off + 8, 5);
+    put_u16(&mut img, gdt_off + 12, 0);
+    put_u16(&mut img, gdt_off + 14, 0);
+    put_u16(&mut img, gdt_off + 16, 1);
+
+    // Inode table at blocks 5..=8 (4 blocks * 1024 / 128 = 32 inodes).
+    let itab_off = 5 * BS;
+
+    // Inode 2 (root dir).
+    let root_off = itab_off + 1 * INODE_SIZE as usize;
+    put_u16(&mut img, root_off + 0, 0x4000 | 0o755);
+    put_u32(&mut img, root_off + 4, BS as u32);
+    put_u32(&mut img, root_off + 28, (BS / 512) as u32);
+    put_u32(&mut img, root_off + 40, 9); // i_block[0] = 9
+
+    // Inode 8 (the journal). 16 KiB journal stored in blocks
+    // 16..=31 (16 × 1 KiB blocks).
+    let journal_size_blocks: u32 = 16;
+    let journal_start_block: u32 = 16;
+    let journal_inode_off = itab_off + 7 * INODE_SIZE as usize;
+    put_u16(&mut img, journal_inode_off + 0, 0x8000 | 0o600); // regular file
+    put_u32(
+        &mut img,
+        journal_inode_off + 4,
+        journal_size_blocks * BS as u32,
+    );
+    put_u32(
+        &mut img,
+        journal_inode_off + 28,
+        (journal_size_blocks * BS as u32) / 512,
+    );
+    // i_block[0..journal_size_blocks] map to the journal data blocks
+    // 16..(16+journal_size_blocks). Only 12 direct fit in an inode —
+    // we keep the journal short enough that 12 direct blocks cover
+    // everything we need (descriptor + data + commit live in the
+    // first 4 blocks).
+    for i in 0..core::cmp::min(journal_size_blocks, 12) {
+        put_u32(
+            &mut img,
+            journal_inode_off + 40 + (i * 4) as usize,
+            journal_start_block + i,
+        );
+    }
+
+    // ── On-disk root directory at block 9 (the STALE copy that
+    // replay must override). One entry: "ondisk" → inode 12.
+    {
+        let off = 9 * BS;
+        put_u32(&mut img, off + 0, 12);
+        put_u16(&mut img, off + 4, BS as u16);
+        img[off + 6] = b"ondisk".len() as u8;
+        img[off + 7] = ftype::REGULAR;
+        img[off + 8..off + 8 + 6].copy_from_slice(b"ondisk");
+    }
+
+    // ── Journal contents at blocks 16..=19 ────────────────────
+    // Block 16: JBD2 superblock_v2.
+    {
+        let j = &mut img[16 * BS..17 * BS];
+        let mut tmp = build_journal_sb_v2_bytes(BS as u32, 12, 1, 5, 1);
+        // Pad to BS.
+        tmp.resize(BS, 0);
+        j.copy_from_slice(&tmp);
+    }
+    // Block 17 (journal block 1): descriptor.
+    {
+        let d = &mut img[17 * BS..18 * BS];
+        put_u32_be(d, 0, crate::journal::JBD2_MAGIC_NUMBER);
+        put_u32_be(d, 4, crate::journal::block_type::DESCRIPTOR);
+        put_u32_be(d, 8, 5);
+        // tag: target FS block 9, SAME_UUID|LAST_TAG.
+        put_u32_be(d, 12, 9);
+        put_u32_be(
+            d,
+            16,
+            crate::journal::tag_flag::SAME_UUID | crate::journal::tag_flag::LAST_TAG,
+        );
+    }
+    // Block 18 (journal block 2): data — the replayed root dir.
+    {
+        let off = 18 * BS;
+        put_u32(&mut img, off + 0, 12); // inode
+        put_u16(&mut img, off + 4, BS as u16); // rec_len fills block
+        img[off + 6] = b"REPLAYED".len() as u8;
+        img[off + 7] = ftype::REGULAR;
+        img[off + 8..off + 8 + 8].copy_from_slice(b"REPLAYED");
+    }
+    // Block 19 (journal block 3): commit.
+    {
+        let c = &mut img[19 * BS..20 * BS];
+        put_u32_be(c, 0, crate::journal::JBD2_MAGIC_NUMBER);
+        put_u32_be(c, 4, crate::journal::block_type::COMMIT);
+        put_u32_be(c, 8, 5);
+    }
+
+    img
+}
+
+fn build_journal_sb_v2_bytes(
+    block_size: u32,
+    maxlen: u32,
+    first: u32,
+    sequence: u32,
+    start: u32,
+) -> Vec<u8> {
+    build_journal_sb_v2(block_size, maxlen, first, sequence, start)
+}
+
+fn smoke_ext3_unclean_mount_replays_root_dir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext3_unclean_image();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed on unclean ext3 image"),
+    };
+    // Replay should have installed at least one override for block 9.
+    if volume.journal_override_count() == 0 {
+        return TestResult::Fail(
+            "expected ≥1 journal override after unclean ext3 mount",
+        );
+    }
+    // Reading the root directory should return the JOURNAL-side
+    // entry (REPLAYED), not the on-disk stale entry (ondisk).
+    let root = volume.root();
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate_async failed"),
+    };
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    if names.iter().any(|n| *n == "ondisk") {
+        return TestResult::Fail(
+            "post-replay enumeration must NOT see the on-disk stale entry",
+        );
+    }
+    if !names.iter().any(|n| *n == "REPLAYED") {
+        return TestResult::Fail("expected REPLAYED entry from replay override");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext3_unclean_mount_replays_root_dir);

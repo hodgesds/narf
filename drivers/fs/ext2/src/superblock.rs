@@ -148,7 +148,23 @@ pub struct Superblock {
     /// `s_desc_size` (byte 254) — bytes per group descriptor. 32
     /// for ext2/3, 64 for ext4 with 64BIT. Zero on legacy SBs.
     pub desc_size: u16,
+    /// `s_state` (byte 58) — 1 = EXT2_VALID_FS (clean), 0 = unclean
+    /// (the kernel set it to zero on mount and didn't get a chance
+    /// to set it back to one before the system went away). Drives
+    /// the journal-replay decision at mount time.
+    pub state: u16,
+    /// `s_journal_inum` (byte 224, rev-1+) — inode number that
+    /// holds the journal file (typically 8). Used together with
+    /// `compat::HAS_JOURNAL` to locate the JBD2 journal for replay.
+    pub journal_inum: u32,
 }
+
+/// `s_state` value meaning "filesystem was unmounted cleanly".
+/// Linux `include/uapi/linux/ext2_fs.h::EXT2_VALID_FS`.
+pub const EXT2_VALID_FS: u16 = 0x0001;
+/// `s_state` "filesystem has errors detected". Mostly informational
+/// for the mount path — we still trigger journal replay.
+pub const EXT2_ERROR_FS: u16 = 0x0002;
 
 impl Superblock {
     /// Decode a superblock from a 1024-byte (or larger) buffer
@@ -208,6 +224,19 @@ impl Superblock {
         } else {
             0
         };
+        // s_state (byte 58) — present even on rev-0 superblocks.
+        let state = if buf.len() >= 60 {
+            u16::from_le_bytes([buf[58], buf[59]])
+        } else {
+            0
+        };
+        // s_journal_inum (byte 224) lives in the rev-1 dynamic
+        // tail. Zero on rev-0 / non-journaled volumes.
+        let journal_inum = if buf.len() >= 228 {
+            u32::from_le_bytes([buf[224], buf[225], buf[226], buf[227]])
+        } else {
+            0
+        };
 
         Some(Self {
             inodes_count,
@@ -224,7 +253,22 @@ impl Superblock {
             feature_ro_compat,
             blocks_count_hi,
             desc_size,
+            state,
+            journal_inum,
         })
+    }
+
+    /// True iff `s_state` indicates a clean unmount (== EXT2_VALID_FS).
+    /// Unclean volumes (state == 0) need journal replay before their
+    /// metadata can be trusted.
+    pub fn is_clean(&self) -> bool {
+        self.state & EXT2_VALID_FS != 0
+    }
+
+    /// True iff the volume carries a JBD2 journal (HAS_JOURNAL compat
+    /// bit set AND `s_journal_inum` is non-zero).
+    pub fn has_journal(&self) -> bool {
+        self.feature_compat & compat::HAS_JOURNAL != 0 && self.journal_inum != 0
     }
 
     /// Classify the volume's flavour. Tracks ext-family evolution:
