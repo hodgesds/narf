@@ -106,22 +106,61 @@ impl BochsDisplay {
             return Err(BochsError::BadId);
         }
 
-        // Configure mode: disable, set resolution + bpp, re-enable.
-        // VBE Dispi registers are 16-bit at 2-byte-aligned offsets.
+        // Read the current BGA state. On UEFI boot, edk2's GOP has
+        // already configured the chip to whatever mode it picked
+        // (frequently NOT 1024×768), and the bootloader handed us
+        // an FB pointer + pitch that matches *that* mode. The
+        // beacon registry + Limine framebuffer info are pinned to
+        // those dimensions; if we then overwrite BGA with our own
+        // defaults, the hardware switches resolution but every
+        // higher-level consumer keeps using the pre-overwrite
+        // stride → diagonal-shear text rendering, broken scrolling,
+        // wrong fault-handler beacon positions. Honor the firmware
+        // mode if it looks plausible.
+        //
         // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
-        unsafe {
-            mmio.write16(VBE_ENABLE, 0);
-            mmio.write16(VBE_XRES, DEFAULT_WIDTH as u16);
-            mmio.write16(VBE_YRES, DEFAULT_HEIGHT as u16);
-            mmio.write16(VBE_BPP, DEFAULT_BPP);
-            mmio.write16(VBE_VIRT_WIDTH, DEFAULT_WIDTH as u16);
-            mmio.write16(VBE_VIRT_HEIGHT, DEFAULT_HEIGHT as u16);
-            mmio.write16(VBE_ENABLE, (VBE_ENABLE_BIT | VBE_LFB_BIT) as u16);
+        let (xres, yres, bpp) = unsafe {
+            let enabled = mmio.read16(VBE_ENABLE) as u32;
+            // VBE_ENABLE_BIT set = firmware already programmed a mode.
+            // Treat as authoritative if dims look sane (non-zero, ≤4K).
+            if enabled & (VBE_ENABLE_BIT as u32) != 0 {
+                let x = mmio.read16(VBE_XRES) as u32;
+                let y = mmio.read16(VBE_YRES) as u32;
+                let b = mmio.read16(VBE_BPP) as u16;
+                if (1..=4096).contains(&x)
+                    && (1..=4096).contains(&y)
+                    && (b == 16 || b == 24 || b == 32)
+                {
+                    (x, y, b)
+                } else {
+                    (DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP)
+                }
+            } else {
+                (DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP)
+            }
+        };
+
+        // Only reprogram if the firmware didn't already configure a
+        // sensible mode. Avoids disturbing UEFI's GOP setup.
+        // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
+        if (xres, yres, bpp) == (DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP) {
+            unsafe {
+                let enabled = mmio.read16(VBE_ENABLE) as u32;
+                if enabled & (VBE_ENABLE_BIT as u32) == 0 {
+                    mmio.write16(VBE_ENABLE, 0);
+                    mmio.write16(VBE_XRES, DEFAULT_WIDTH as u16);
+                    mmio.write16(VBE_YRES, DEFAULT_HEIGHT as u16);
+                    mmio.write16(VBE_BPP, DEFAULT_BPP);
+                    mmio.write16(VBE_VIRT_WIDTH, DEFAULT_WIDTH as u16);
+                    mmio.write16(VBE_VIRT_HEIGHT, DEFAULT_HEIGHT as u16);
+                    mmio.write16(VBE_ENABLE, (VBE_ENABLE_BIT | VBE_LFB_BIT) as u16);
+                }
+            }
         }
 
         Ok(Self {
-            width: DEFAULT_WIDTH,
-            height: DEFAULT_HEIGHT,
+            width: xres,
+            height: yres,
             fb_region,
             _mmio: mmio,
         })
