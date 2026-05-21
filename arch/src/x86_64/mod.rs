@@ -37,6 +37,7 @@ pub mod movdir;
 pub mod msr;
 pub mod mtrr;
 pub mod numa;
+pub mod kernel_ctx;
 pub mod pasid;
 pub mod pat;
 pub mod pcid;
