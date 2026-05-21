@@ -140,13 +140,195 @@ pub fn captured_context() -> Option<ResumeContext> {
     }
 }
 
-/// Physical address of the s3_wake_entry stub, suitable for
-/// passing to `acpi::arm_s3_waking_vector`. Currently a stub
-/// returning 0 — the trampoline asm hasn't landed yet, and
-/// suspend() will refuse to enter the real PM1 write without an
-/// armed trampoline.
-pub fn wake_entry_phys() -> u64 {
-    0
+// ── Wake trampoline ────────────────────────────────────────────────
+//
+// Firmware jumps here on S3 wake. The CPU is in long mode (FACS v1+
+// path via XFirmwareWakingVector) but CR0/CR3/CR4 are
+// firmware-determined and the GDT/IDT are firmware's. We:
+//
+//   1. lgdt our saved kernel GDT
+//   2. lidt our saved kernel IDT
+//   3. mov cr3, our saved kernel page-table phys (re-enables our
+//      address space)
+//   4. mov rsp, our saved kernel stack pointer
+//   5. push our saved RFLAGS + popfq
+//   6. jmp to s3_wake_continuation (a normal Rust extern fn)
+//
+// The trampoline reads `RESUME_CONTEXT` via RIP-relative addressing
+// — firmware identity-maps the page containing the wake vector so
+// this access works even before our CR3 is reloaded. Production
+// would copy the trampoline + saved state into a known-identity-
+// mapped low-memory page; the current scaffold places everything in
+// the kernel image and relies on firmware preserving the kernel's
+// identity-mapped region across S3 (which OVMF / modern AMD BIOSes
+// do, but isn't guaranteed by spec).
+
+/// Phys address of the static `RESUME_CONTEXT`. Filled in by
+/// `save_resume_context` so the asm can use RIP-relative lea + add
+/// to find it without needing a long-mode `mov rip-imm32`.
+#[cfg(target_arch = "x86_64")]
+static RESUME_CONTEXT_PHYS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Post-wake hook to fan out device resume. Registered by
+/// `narf_power` at boot via [`set_resume_hook`] so this module
+/// stays dependency-free (power → arch, not the other way).
+/// Held as a raw `usize` for atomic storage; transmuted back to
+/// a function pointer at call time.
+static RESUME_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the function the wake continuation calls to run device
+/// resume fan-out. Power crate calls this from `register_initcalls`.
+pub fn set_resume_hook(hook: extern "C" fn()) {
+    RESUME_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Set the phys address the trampoline reads its saved state
+/// from. Caller resolves the phys of `RESUME_CONTEXT` (via the
+/// kernel's virt→phys map) once at boot and pins it here.
+pub fn set_resume_context_phys(phys: u64) {
+    RESUME_CONTEXT_PHYS.store(phys, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Rust continuation invoked by the asm trampoline after CR3 + GDT
+/// + IDT + RSP have been reloaded. Runs the device resume fan-out
+/// (registered handlers fire in forward registration order), then
+/// longjmps back to the suspending caller using the saved JmpBuf.
+///
+/// `arm_s3_resume` populates `S3_CALLER_JMP` via a paired `setjmp`
+/// before the PM1 write; on wake we hand-off here.
+///
+/// # Safety
+/// Reached only from the wake trampoline. RSP has been restored to
+/// the suspending thread's stack; interrupts are still off.
+#[no_mangle]
+pub unsafe extern "C" fn s3_wake_continuation() -> ! {
+    // Run the registered device-resume hook (set by `power` at
+    // boot via `set_resume_hook`). The hook can't return errors
+    // through this path — the longjmp carries only the success
+    // code; failed device-resume is logged separately.
+    let hook = RESUME_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: the hook is an `extern "C" fn() -> ()` Rust
+        // function registered before suspend was armed.
+        let f: extern "C" fn() = unsafe { core::mem::transmute(hook) };
+        f();
+    }
+    // longjmp back to the suspending caller. The caller observed
+    // r1 == 0 from setjmp pre-suspend; on this longjmp it sees
+    // r1 == 1 ("returned via wake").
+    // SAFETY: S3_CALLER_JMP was populated by arm_s3_resume's
+    // setjmp call; its saved frame is still live because the
+    // suspending thread never returned.
+    unsafe {
+        crate::x86_64::setjmp::longjmp(
+            &*S3_CALLER_JMP.lock() as *const _,
+            S3_RESUMED_SENTINEL,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// JmpBuf pre-populated by `arm_s3_resume` before suspend. The
+/// wake continuation longjmps through it to return into the
+/// suspending caller.
+pub static S3_CALLER_JMP: narf_lib::sync::IrqSafeSpinLock<crate::x86_64::setjmp::JmpBuf> =
+    narf_lib::sync::IrqSafeSpinLock::new(crate::x86_64::setjmp::JmpBuf { slots: [0u64; 8] });
+
+/// Sentinel longjmp value indicating "we returned via S3 wake".
+/// Suspend caller inspects setjmp's return for this to distinguish
+/// first-call from wake-return.
+pub const S3_RESUMED_SENTINEL: u64 = 0xA5_A5_A5_A5_5A_5A_5A_5A;
+
+#[cfg(target_arch = "x86_64")]
+/// Naked-asm wake entry. Firmware jumps here on S3 resume; the
+/// function lgdt/lidt/mov-cr3/mov-rsp/popf/jmp-to-continuation.
+///
+/// Reads `RESUME_CONTEXT_PHYS` (a static u64) via RIP-relative
+/// addressing — the static is in the kernel's `.bss` which the
+/// firmware identity-maps the wake-vector page through. On Phoenix
+/// HawkPoint1 + Renoir laptops with modern AMI BIOS the entire
+/// kernel image is identity-mapped during the wake handoff.
+///
+/// # Safety
+/// Reachable only via FACS.XFirmwareWakingVector. Caller is the
+/// platform firmware; we don't return from here (longjmp).
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn s3_wake_entry() -> ! {
+    use core::arch::naked_asm;
+    naked_asm!(
+        // Disable interrupts (firmware should have them off; belt+braces).
+        "cli",
+        // Read RESUME_CONTEXT_PHYS into rax via RIP-relative.
+        "lea rax, [rip + {ctx_phys}]",
+        "mov rax, [rax]",
+        "test rax, rax",
+        // If RESUME_CONTEXT_PHYS == 0, the trampoline wasn't armed.
+        // Halt — firmware will eventually reset the box.
+        "jz 9f",
+        // rax = phys of ResumeContext. Layout:
+        //   [+0]  cr0       [+8]  cr3
+        //   [+16] cr4       [+24] rflags
+        //   [+32] gdt_base  [+40] gdt_limit (u16)
+        //   [+48] idt_base  [+56] idt_limit (u16)
+        //   [+64] rsp
+        //
+        // We need to build the 10-byte lgdt/lidt operands on the
+        // stack — they're packed as limit:16 + base:64 = 10 bytes.
+        //
+        // Restore CR3 first so any subsequent kernel-image reads
+        // use our paging (the lgdt/lidt operands themselves come
+        // from the saved-state region which firmware identity-
+        // maps, but ResumeContext.gdt_base/idt_base point into
+        // kernel space and need our CR3 to resolve).
+        "mov rbx, [rax + 8]",
+        "mov cr3, rbx",
+        // Restore RSP so the lgdt/lidt stack pushes land in a
+        // known location (an arbitrary stack-relative push pre-
+        // CR3-restore can't be trusted).
+        "mov rsp, [rax + 64]",
+        // Build lgdt operand on the stack: push base (8 bytes) then
+        // push limit (2 bytes); lgdt expects limit at the lowest
+        // address so we push base first, then a 16-bit limit.
+        // Easiest: subtract 16 from rsp, write [rsp+0]=limit,
+        // [rsp+2]=base.
+        "sub rsp, 16",
+        "mov bx, [rax + 40]",            // gdt_limit
+        "mov [rsp], bx",
+        "mov rbx, [rax + 32]",           // gdt_base
+        "mov [rsp + 2], rbx",
+        "lgdt [rsp]",
+        // Same shape for IDT.
+        "mov bx, [rax + 56]",            // idt_limit
+        "mov [rsp], bx",
+        "mov rbx, [rax + 48]",           // idt_base
+        "mov [rsp + 2], rbx",
+        "lidt [rsp]",
+        "add rsp, 16",
+        // Restore CR0 and CR4 in case firmware cleared bits we
+        // care about (NXE, SMEP, etc — encoded in the saved CR4).
+        "mov rbx, [rax + 0]",
+        "mov cr0, rbx",
+        "mov rbx, [rax + 16]",
+        "mov cr4, rbx",
+        // Restore RFLAGS — preserves IF=0 because we cli'd above;
+        // the popfq picks up whatever the saved RFLAGS encoded.
+        "push qword ptr [rax + 24]",
+        "popfq",
+        // Jump to the Rust continuation.
+        "lea rcx, [rip + {cont}]",
+        "jmp rcx",
+        // Failure branch — RESUME_CONTEXT_PHYS was 0.
+        "9:",
+        "hlt",
+        "jmp 9b",
+        ctx_phys = sym RESUME_CONTEXT_PHYS,
+        cont = sym s3_wake_continuation,
+    );
 }
 
 #[doc(hidden)]

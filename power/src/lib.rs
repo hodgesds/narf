@@ -106,8 +106,26 @@ pub fn cpu_status_line() -> Option<alloc::string::String> {
 }
 
 /// Force-link hook.
+/// Resume hook the wake trampoline calls after CR3/GDT/IDT are
+/// restored. Runs the device-PM fan-out so drivers can re-arm
+/// their controllers before control returns to the suspending
+/// thread. Registered with the arch crate at boot so arch doesn't
+/// need a power dependency.
+extern "C" fn s3_resume_hook_entry() {
+    let _ = device_pm::resume_all_devices();
+}
+
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Hook the arch crate's S3 wake trampoline so on resume the
+    // device-PM fan-out runs from the asm continuation. Must run
+    // before any suspend() can be issued; Stage::Subsys gives us
+    // that ordering relative to driver bring-up.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "s3-resume-hook", || {
+        narf_arch::x86_64::s3_resume::set_resume_hook(s3_resume_hook_entry);
+        InitResult::Ok
+    });
     // CPU-frequency scaling bring-up. Detect HWP (Skylake+) /
     // SpeedStep (older Intel) / AMD HwPstate (Family 10h+,
     // including the Zen2/Zen3/Zen4 lines that this kernel targets

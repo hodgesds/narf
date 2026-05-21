@@ -250,6 +250,89 @@ pub fn __test_parse_s3(buf: &[u8]) -> Option<S3SlpTyp> {
     parse_s3_package(buf)
 }
 
+/// Top-level S3 orchestrator: do everything required to enter S3
+/// AND have a working resume path before we touch PM1.
+///
+/// Sequence:
+///   1. Verify `\_S3_` is decodable.
+///   2. Snapshot CPU state via `s3_resume::save_resume_context`.
+///   3. setjmp the caller frame into `S3_CALLER_JMP` — when wake
+///      happens, the trampoline → continuation → longjmp will
+///      return us here with `S3_RESUMED_SENTINEL`.
+///   4. Resolve `s3_wake_entry`'s phys + write it to FACS via
+///      `acpi::arm_s3_waking_vector`.
+///   5. Fan out device suspend handlers in reverse order.
+///   6. Issue `\_PTS(3)` then PM1 SLP_TYP|SLP_EN. CPU stops here.
+///   7. On wake, the trampoline restores GDT/IDT/CR3/RSP, runs
+///      the device-resume hook, then longjmps back to setjmp's
+///      caller with `S3_RESUMED_SENTINEL`. Step 3's branch fires;
+///      we return `Ok(())`.
+///
+/// Returns `Ok(())` on a clean suspend+resume cycle, an error
+/// from `SuspendError` otherwise. Until the trampoline arms
+/// safely (FACS_PHYS resolved, RESUME_CONTEXT_PHYS resolved),
+/// returns `NotImplemented` without touching PM1.
+#[cfg(target_arch = "x86_64")]
+pub fn arm_s3_resume(
+    cap: &Cap<Power, narf_capabilities::Invoke>,
+) -> Result<(), SuspendError> {
+    cap.invoke(NoopOp)?;
+    let slp = s3_slp_typ().ok_or(SuspendError::NotImplemented)?;
+    // Snapshot CPU state.
+    // SAFETY: caller is on the boot CPU with interrupts gated as
+    // part of the suspend phase machinery.
+    unsafe {
+        narf_arch::x86_64::s3_resume::save_resume_context();
+    }
+    // setjmp the caller. On wake we'll re-enter via longjmp with
+    // S3_RESUMED_SENTINEL.
+    let mut jmp_snapshot = narf_arch::x86_64::setjmp::JmpBuf::default();
+    // SAFETY: jmp_snapshot lives on this stack frame through the
+    // PM1 write + the wake path's longjmp.
+    let r = unsafe {
+        narf_arch::x86_64::setjmp::setjmp(&mut jmp_snapshot as *mut _)
+    };
+    if r == narf_arch::x86_64::s3_resume::S3_RESUMED_SENTINEL {
+        // We came back via the wake trampoline. Device fan-out
+        // already ran in the continuation; just unwind.
+        PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
+        PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+        return Ok(());
+    }
+    // Stash the JmpBuf where the wake continuation can find it.
+    *narf_arch::x86_64::s3_resume::S3_CALLER_JMP.lock() = jmp_snapshot;
+    // Arm the FACS wake vector to point at our trampoline.
+    let entry = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
+    // SAFETY: trampoline is a `naked extern "C" fn`; its address
+    // is stable for the kernel lifetime.
+    if let Err(_) = unsafe { narf_acpi::arm_s3_waking_vector(entry) } {
+        return Err(SuspendError::NotImplemented);
+    }
+    // Fan out device suspend handlers in reverse-registration order.
+    let _ = crate::device_pm::suspend_all_devices();
+    PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
+    // `\_PTS(3)` — platform-specific quiesce AML.
+    let _ = narf_aml::eval::evaluate_method(
+        "\\_PTS",
+        &[narf_aml::Value::Integer(3)],
+    );
+    // Refuse the real PM1 write unless explicitly armed. Until
+    // we've validated the trampoline on real silicon, this
+    // returns NotImplemented rather than putting the box into a
+    // state it can't recover from.
+    if !REAL_SLEEP_ARMED.load(Ordering::Acquire) {
+        return Err(SuspendError::NotImplemented);
+    }
+    // SAFETY: pm1_enter_sleep doesn't return on success — the
+    // CPU stops fetching when SLP_EN latches. Failure (e.g.
+    // PM1 status didn't reset) returns Err; we propagate.
+    unsafe {
+        narf_acpi::pm1_enter_sleep(slp.slp_typ_a, slp.slp_typ_b);
+    }
+    // Unreachable on success; reached only on failure.
+    Err(SuspendError::NotImplemented)
+}
+
 /// Enter S3. Calls `\_PTS(3)` and writes the SLP_TYP|SLP_EN bits to
 /// PM1A_CNT (and PM1B_CNT when present). Returns
 /// `SuspendError::NotImplemented` when the resume trampoline isn't

@@ -1538,3 +1538,46 @@ kernel_test_in!(
     "power/device_pm",
     smoke_device_pm_drivers_register_at_probe_if_probed
 );
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arm_s3_resume_refuses_without_armed_real_sleep() -> TestResult {
+    // The arm_s3_resume orchestrator must NOT issue PM1 SLP_EN
+    // unless REAL_SLEEP_ARMED is set — protects against bricking
+    // the box during smoke runs.
+    use crate::suspend::{arm_s3_resume, SuspendError, __test_reset};
+    use crate::Power;
+    use narf_capabilities::{Cap, Invoke};
+    __test_reset();
+    let cap: Cap<Power, Invoke> = Cap::bootstrap();
+    match arm_s3_resume(&cap) {
+        Err(SuspendError::NotImplemented) => TestResult::Pass,
+        Err(_) | Ok(_) => TestResult::Fail(
+            "arm_s3_resume must refuse without REAL_SLEEP_ARMED",
+        ),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "power/suspend",
+    smoke_arm_s3_resume_refuses_without_armed_real_sleep
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_wake_entry_address_resolves() -> TestResult {
+    // The asm trampoline must have a stable non-null address so
+    // arm_s3_resume can write it to FACS.XFirmwareWakingVector.
+    let entry = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
+    if entry == 0 {
+        return TestResult::Fail("s3_wake_entry resolved to NULL");
+    }
+    // Address should be in the kernel's high-half code region —
+    // canonical x86_64 kernel addresses have bit 47 (sign-extended)
+    // set. Strict bit-pattern depends on the linker layout; just
+    // check it's not in low memory.
+    if entry < 0x1_0000_0000 {
+        return TestResult::Fail("s3_wake_entry address suspiciously low");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/suspend", smoke_s3_wake_entry_address_resolves);
