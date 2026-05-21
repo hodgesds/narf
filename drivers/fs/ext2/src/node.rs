@@ -146,7 +146,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
                 }
             } else {
                 let mut blockbuf = vec![0u8; bs as usize];
-                self.volume.read_block(physical as u64, &mut blockbuf).await?;
+                self.volume.read_block(physical, &mut blockbuf).await?;
                 dst[total..total + chunk]
                     .copy_from_slice(&blockbuf[in_block..in_block + chunk]);
             }

@@ -722,3 +722,56 @@ fn smoke_ext4_group_desc_32byte_legacy_path_unchanged() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_group_desc_32byte_legacy_path_unchanged);
+
+// ── ext4 map_block dispatch ────────────────────────────────────────
+//
+// Builds an Inode whose i_block[60] region carries an extent root
+// and verifies that the extent-aware dispatch path picks the right
+// physical block. The async-mount path needs a live BlockDevice
+// which is out of scope here — the smoke exercises the pure
+// serialise → lookup_in_node loop via a tiny stub instead.
+
+fn smoke_ext4_inode_block_array_serialises_as_extent_root() -> TestResult {
+    use crate::extent::{lookup_in_node, LookupOutcome, EXT4_EXTENT_MAGIC};
+    use crate::inode::I_BLOCK_LEN;
+    // Pack an extent root (header + 1 leaf, 60 bytes total) into a
+    // [u32; 15] array as the inode loader would store i_block.
+    let mut bytes = [0u8; 60];
+    bytes[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
+    bytes[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries
+    bytes[4..6].copy_from_slice(&4u16.to_le_bytes()); // max
+    bytes[6..8].copy_from_slice(&0u16.to_le_bytes()); // depth = 0 (leaf)
+    // Leaf @ offset 12: logical=0, len=5, phys=300.
+    bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+    bytes[16..18].copy_from_slice(&5u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&0u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&300u32.to_le_bytes());
+
+    // Now stuff bytes into a [u32; 15] like the inode parser does.
+    let mut block_array = [0u32; I_BLOCK_LEN];
+    for i in 0..I_BLOCK_LEN {
+        let off = i * 4;
+        block_array[i] = u32::from_le_bytes([
+            bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
+        ]);
+    }
+    // Re-serialise back to bytes — what map_block_extents does.
+    let mut node_buf = alloc::vec![0u8; 60];
+    for (i, &b) in block_array.iter().enumerate() {
+        node_buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+    }
+    // Verify the round-trip + lookup against logical block 2.
+    match lookup_in_node(&node_buf, 2) {
+        LookupOutcome::Mapped { physical: 302, is_uninitialized: false } => {
+            TestResult::Pass
+        }
+        other => {
+            let _ = other;
+            TestResult::Fail("inode → extent-root round-trip + lookup failed")
+        }
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_inode_block_array_serialises_as_extent_root
+);

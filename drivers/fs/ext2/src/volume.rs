@@ -24,7 +24,7 @@ use narf_filesystem::{DirOps, FsError, FsInstance};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::group_desc::{GroupDesc, GROUP_DESC_SIZE};
+use super::group_desc::GroupDesc;
 use super::inode::Inode;
 use super::superblock::Superblock;
 
@@ -101,6 +101,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 return Err(FsError::Unsupported);
             }
         };
+        // Reject any volume that uses incompat features we don't
+        // implement — refusing is safer than mis-decoding. Encrypted
+        // and inline-data volumes hit this; ext2/3/4 with EXTENTS +
+        // 64BIT + FLEX_BG + FILETYPE + RECOVER pass.
+        if superblock.check_incompat_features().is_err() {
+            unregister(io.cap);
+            core::mem::forget(io);
+            return Err(FsError::Unsupported);
+        }
 
         // Block group descriptor table starts at the block after
         // the superblock. With a 1-KiB block volume that's block 2;
@@ -109,10 +118,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         //
         //     bgdt_block = s_first_data_block + 1
         //
-        // ext2 design paper, §"Block Groups".
+        // ext2 design paper, §"Block Groups". ext4 with 64BIT uses
+        // 64-byte descriptors instead of 32 — see effective_desc_size.
         let bs = superblock.block_size() as u64;
         let group_count = superblock.block_group_count() as usize;
-        let bgdt_size_bytes = (group_count * GROUP_DESC_SIZE) as u64;
+        let desc_size = superblock.effective_desc_size();
+        let bgdt_size_bytes = (group_count * desc_size) as u64;
         let bgdt_block_offset = (superblock.first_data_block + 1) as u64 * bs;
 
         let mut bgdt_bytes = vec![0u8; bgdt_size_bytes as usize];
@@ -120,8 +131,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
         let mut group_descs = Vec::with_capacity(group_count);
         for i in 0..group_count {
-            let off = i * GROUP_DESC_SIZE;
-            let gd = GroupDesc::parse(&bgdt_bytes[off..off + GROUP_DESC_SIZE])
+            let off = i * desc_size;
+            let gd = GroupDesc::parse_sized(&bgdt_bytes[off..off + desc_size], desc_size)
                 .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
             group_descs.push(gd);
         }
@@ -305,8 +316,16 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
     /// Resolve the `i`th logical block of `inode` to its physical
     /// block number. Returns `Ok(0)` for a hole (sparse file).
-    /// Reads at most three indirect blocks to follow the chain.
-    pub async fn map_block(&self, inode: &Inode, logical: u64) -> Result<u32, FsError> {
+    ///
+    /// Dispatches on the superblock's `uses_extents()` flag:
+    /// ext4-with-EXTENTS reads the i_block[60] region as an extent
+    /// tree root; ext2/3 walks the legacy 12-direct + 3-indirect
+    /// pointer chain.
+    pub async fn map_block(&self, inode: &Inode, logical: u64) -> Result<u64, FsError> {
+        if self.superblock.uses_extents() {
+            return self.map_block_extents(inode, logical).await;
+        }
+        // Legacy ext2/3 indirect-block walk.
         let p = self.pointers_per_block() as u64;
         let direct_max = super::inode::N_DIRECT as u64;
         let single_max = direct_max + p;
@@ -314,12 +333,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let triple_max = double_max + p * p * p;
 
         if logical < direct_max {
-            return Ok(inode.block[logical as usize]);
+            return Ok(inode.block[logical as usize] as u64);
         }
         if logical < single_max {
             let idx = logical - direct_max;
             let l1 = inode.block[super::inode::SINGLE_IND_IDX];
-            return self.read_indirect(l1, idx).await;
+            return Ok(self.read_indirect(l1, idx).await? as u64);
         }
         if logical < double_max {
             let l = logical - single_max;
@@ -327,7 +346,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let l0 = l % p;
             let l2_block = inode.block[super::inode::DOUBLE_IND_IDX];
             let middle = self.read_indirect(l2_block, l1).await?;
-            return self.read_indirect(middle, l0).await;
+            return Ok(self.read_indirect(middle, l0).await? as u64);
         }
         if logical < triple_max {
             let l = logical - double_max;
@@ -337,9 +356,65 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let l3_block = inode.block[super::inode::TRIPLE_IND_IDX];
             let middle = self.read_indirect(l3_block, l2).await?;
             let leaf = self.read_indirect(middle, l1).await?;
-            return self.read_indirect(leaf, l0).await;
+            return Ok(self.read_indirect(leaf, l0).await? as u64);
         }
         Err(FsError::Io(narf_block::BlockError::InvalidRange))
+    }
+
+    /// ext4 extent-tree dispatch for `map_block`. Serialises the
+    /// inode's 60-byte i_block region as the extent root and walks
+    /// the tree, fetching index-child blocks via `read_block` as
+    /// the walker descends.
+    async fn map_block_extents(
+        &self,
+        inode: &Inode,
+        logical: u64,
+    ) -> Result<u64, FsError> {
+        use super::extent::{lookup_in_node, LookupOutcome};
+        // Serialise inode.block[15] as 60 bytes (15 × u32 LE).
+        let mut node_buf = alloc::vec![0u8; 60];
+        for (i, &b) in inode.block.iter().enumerate() {
+            node_buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+        }
+        // Cap on extent-tree depth to defend against malformed
+        // volumes pointing children back at themselves. ext4 spec
+        // limits depth to 5 (root + 4 index levels); 8 is paranoid.
+        let mut depth_budget = 8u32;
+        let logical32 = if logical > u32::MAX as u64 {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        } else {
+            logical as u32
+        };
+        loop {
+            match lookup_in_node(&node_buf, logical32) {
+                LookupOutcome::Mapped {
+                    physical,
+                    is_uninitialized,
+                } => {
+                    // Uninitialized extents read as zeros — surface
+                    // them as a hole to the caller, who already
+                    // zero-fills on physical == 0.
+                    if is_uninitialized {
+                        return Ok(0);
+                    }
+                    return Ok(physical);
+                }
+                LookupOutcome::Hole => return Ok(0),
+                LookupOutcome::Corrupt => {
+                    return Err(FsError::Io(narf_block::BlockError::IOError));
+                }
+                LookupOutcome::DeeperLookupRequired { child_block } => {
+                    depth_budget = depth_budget
+                        .checked_sub(1)
+                        .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+                    // Fetch the child extent-block + retry.
+                    let bs = self.block_size();
+                    let mut child = alloc::vec![0u8; bs];
+                    self.read_block(child_block, &mut child).await?;
+                    node_buf = child;
+                }
+            }
+        }
     }
 
     /// Read pointer `index` from the indirect block `block_no`.
