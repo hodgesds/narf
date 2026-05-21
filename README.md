@@ -1093,6 +1093,48 @@ cache. The check catches the failure mode where a successful
 the firmware has the writes buffered but they never reached
 the device.
 
+### Partitioned disk install (ESP + ext4 root)
+
+The raw-ISO burn above produces a hybrid-MBR Limine image where
+the kernel reads everything from the El Torito boot catalog.
+For a real install layout — GPT with an EFI System Partition
+holding Limine + kernel + initramfs, plus a labelled ext4 root
+partition that the kernel auto-mounts on `/` via
+`root=PARTLABEL=NARF_ROOT` — use `disk-write-partitioned`:
+
+```sh
+# Stage kernel + initramfs + Limine first (builds only, no QEMU):
+cargo xtask image --arch=x86_64
+
+# Then lay down the partitioned disk:
+sudo cargo xtask disk-write-partitioned --device /dev/sdX --yes
+
+# Tunables:
+sudo cargo xtask disk-write-partitioned --device /dev/sdX \
+     --esp-size-mib 512 \
+     --root-fs ext4 \
+     --root-label NARF_ROOT \
+     --yes
+```
+
+Host-tool requirements (xtask preflights them and names the
+missing package up front):
+
+| Tool | Arch package | Debian/Ubuntu |
+| --- | --- | --- |
+| `sgdisk` | `gptfdisk` | `gdisk` |
+| `partprobe` | `parted` | `parted` |
+| `mkfs.vfat` | `dosfstools` | `dosfstools` |
+| `mkfs.ext4` / `mkfs.ext2` | `e2fsprogs` | `e2fsprogs` |
+| `lsblk` / `mount` / `umount` | `util-linux` | `util-linux` |
+
+The resulting disk boots Limine from the ESP, which loads the
+kernel with `kernel_cmdline: quiet root=PARTLABEL=<label>`. At
+mount time, the root-mount walker matches that selector against
+GPT metadata the partition scanner attached at registration —
+typo the label and the kernel falls through to the initramfs
+shell instead of mounting the wrong volume.
+
 ## Where to start reading
 
 1. [`AGENTS.md`](./AGENTS.md) — token-efficient navigation map (for AI

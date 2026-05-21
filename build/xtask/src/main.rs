@@ -1524,6 +1524,46 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
         }
     }
 
+    // Host-tool preflight. Names every missing binary up front so
+    // we don't ask for sudo, unmount the user's partitions, and
+    // then bail halfway through with a confusing "sgdisk not found"
+    // io error. `mkfs.ext2`/`mkfs.ext4` depends on which root FS
+    // they asked for — only check the one we'll actually invoke.
+    let needed: &[(&str, &str)] = &[
+        ("sgdisk", "gptfdisk (Arch) / gdisk (Debian, Fedora)"),
+        ("partprobe", "parted"),
+        ("mkfs.vfat", "dosfstools"),
+        (args.root_fs.mkfs_program(), "e2fsprogs"),
+        ("lsblk", "util-linux"),
+        ("mount", "util-linux"),
+        ("umount", "util-linux"),
+    ];
+    let mut missing: Vec<(&str, &str)> = Vec::new();
+    for (bin, pkg) in needed {
+        // `command -v` exits 0 iff the binary resolves on PATH; runs
+        // in /bin/sh so we don't depend on the user's interactive
+        // shell config. Stdout is suppressed since we only care
+        // about exit status.
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {} >/dev/null 2>&1", bin)])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !found {
+            missing.push((*bin, *pkg));
+        }
+    }
+    if !missing.is_empty() {
+        let mut msg = String::from(
+            "missing host tools required by disk-write-partitioned:\n",
+        );
+        for (bin, pkg) in &missing {
+            msg.push_str(&format!("  - {bin}  (package: {pkg})\n"));
+        }
+        msg.push_str("install these and re-run.");
+        bail!(msg);
+    }
+
     // ── 2. Confirm ────────────────────────────────────────────────
     let _ = Command::new("lsblk")
         .args(["-o", "NAME,SIZE,MODEL,TRAN,MOUNTPOINTS"])
