@@ -1617,7 +1617,12 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     // ad-hoc spelunking (XTASK_SMP=16, etc.).
     let smp = std::env::var("XTASK_SMP").unwrap_or_else(|_| "8".into());
     cmd.arg("-smp").arg(&smp);
-    cmd.arg("-m").arg("1024M");
+    // 4 GiB. Limine's high-memory allocator reads the entire
+    // initramfs in during boot; the linux-firmware-scale bundle
+    // (~90 MB amdgpu alone, ~750 MB full) overflows the 1 GiB
+    // ceiling. Override via XTASK_MEM if you need more / less.
+    let mem = std::env::var("XTASK_MEM").unwrap_or_else(|_| "4096M".into());
+    cmd.arg("-m").arg(&mem);
     cmd.arg("-cdrom").arg(&iso);
     cmd.arg("-serial").arg("stdio");
     cmd.arg("-display").arg(display);

@@ -93,6 +93,24 @@ impl Framebuffer {
         self.base
     }
 
+    /// Swap the underlying pixel-buffer base pointer in-place.
+    /// Used by the Stage::Late `fb-wc-remap` initcall after
+    /// ioremap'ing the FB at a write-combining virt — the existing
+    /// Framebuffer keeps its dimensions/stride but writes redirect
+    /// to the new WC mapping. No paint or clear happens; pre-
+    /// existing pixels at the old virt are unchanged but no longer
+    /// reached.
+    ///
+    /// # Safety
+    /// `new_base` must point at a writable mapping of at least
+    /// `stride * height * 4` bytes; the new mapping must outlive
+    /// the Framebuffer (or be replaced again before tear-down).
+    /// Caller is responsible for any TLB-flush concerns on the
+    /// old mapping; ioremap does it.
+    pub unsafe fn set_base(&mut self, new_base: *mut u32) {
+        self.base = new_base;
+    }
+
     /// Set every pixel to `p`.
     pub fn clear(&mut self, p: Pixel32) {
         for y in 0..self.height {

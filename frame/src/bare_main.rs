@@ -1913,9 +1913,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                      * any beacon write succeeds. */
                     u64::MAX,
                 );
+                // Rebase the installed FbConsole's internal
+                // Framebuffer to the WC virt. Without this the
+                // FbConsole keeps writing to the old uncached
+                // identity-mapped phys — text scroll stays
+                // glacial. The rebase is in-place, doesn't
+                // wipe scrollback, doesn't move the cursor.
+                // SAFETY: WC virt covers stride*height*4 bytes
+                // (ioremap rounded `len` to that); the mapping
+                // lives until iounmap which we never call.
+                unsafe {
+                    narf_graphics::console::rebase_installed(m.virt as *mut u32);
+                }
                 let _ = writeln!(
                     console::Writer,
-                    "  fb-wc-remap: FB ioremap'd at {:#x} ({} KiB, WC)",
+                    "  fb-wc-remap: FB ioremap'd at {:#x} ({} KiB, WC); console rebased",
                     m.virt,
                     len / 1024,
                 );

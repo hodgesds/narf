@@ -233,6 +233,31 @@ pub fn install_fb_console(c: FbConsole) {
     *GLOBAL_FB_CONSOLE.lock() = Some(c);
 }
 
+/// Rebase the installed FbConsole's underlying pixel buffer in
+/// place. Used by `frame::bare_main`'s Stage::Late
+/// `fb-wc-remap` initcall — after ioremap-WC produces a fresh
+/// write-combining virt for the framebuffer, this points the
+/// existing FbConsole at the new mapping so subsequent text
+/// writes get burst-transactioned instead of crawling through
+/// uncached MMIO. Preserves cursor position + scrollback (the
+/// pre-existing pixels at the old virt remain but are no longer
+/// reached by FbConsole).
+///
+/// No-op if no FbConsole is installed.
+///
+/// # Safety
+/// `new_base` must point at a writable mapping of at least
+/// `stride * height * 4` bytes for the active console; the new
+/// mapping must outlive the console.
+pub unsafe fn rebase_installed(new_base: *mut u32) {
+    let mut g = GLOBAL_FB_CONSOLE.lock();
+    if let Some(c) = g.as_mut() {
+        // SAFETY: forwarding caller's contract; Framebuffer's
+        // `set_base` does the same mapping-lifetime check.
+        unsafe { c.fb.set_base(new_base) };
+    }
+}
+
 /// Hook for `narf-console` / kernel-log fan-out. Bytes go through
 /// the same path as a serial write — no formatting on this side.
 pub fn write_bytes(bytes: &[u8]) {
