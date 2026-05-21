@@ -142,9 +142,13 @@ struct DiskWritePartitionedArgs {
     #[arg(long)]
     device: Option<String>,
 
-    /// ESP partition size in MiB. Holds kernel + initramfs + Limine.
-    /// 256 MiB fits the kernel + ramdisk + Limine with room to grow.
-    #[arg(long, default_value_t = 256)]
+    /// ESP partition size in MiB. Holds kernel + initramfs +
+    /// Limine. Default 1024 MiB accommodates the Linux-firmware-
+    /// scale initramfs (`xtask import-firmware` bundles 90 MB+
+    /// of amdgpu blobs alone; with iwlwifi/mt76/rtw89 +
+    /// microcode the total reaches ~750 MB on Arch). Drop to 256
+    /// for a "kernel + init/shell only" minimal-ISO build.
+    #[arg(long, default_value_t = 1024)]
     esp_size_mib: u64,
 
     /// Filesystem for the root partition.
@@ -2001,6 +2005,49 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
                 p.display()
             );
         }
+    }
+
+    // ESP capacity preflight. Sum the staged artifact sizes and
+    // compare to the user's `--esp-size-mib`. FAT32 overhead +
+    // cluster-rounding-up adds ~3% in the worst case for a few
+    // hundred files, so we check against 92% of capacity to leave
+    // headroom. Catches "default 1 GiB but you also imported
+    // 500 MB of WiFi blobs" before we trash the user's USB.
+    let mut esp_payload_bytes: u64 = 0;
+    for p in [&kernel, &initramfs, &bootx64] {
+        esp_payload_bytes += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    }
+    // Limine support dir — walk + sum.
+    fn dir_size(p: &Path) -> u64 {
+        let mut total: u64 = 0;
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                if let Ok(md) = e.metadata() {
+                    if md.is_dir() {
+                        total += dir_size(&e.path());
+                    } else {
+                        total += md.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+    esp_payload_bytes += dir_size(&limine_dir);
+
+    let esp_capacity_bytes = args.esp_size_mib * 1024 * 1024;
+    let usable_capacity = esp_capacity_bytes * 92 / 100;
+    if esp_payload_bytes > usable_capacity {
+        bail!(
+            "ESP staging ({} MiB) won't fit in --esp-size-mib={} \
+             (after ~8% FAT32 overhead = {} MiB usable). Bump \
+             --esp-size-mib or trim the initramfs (the firmware \
+             bundle is the usual culprit — drop `target/firmware/` \
+             contents to test a minimal ISO).",
+            esp_payload_bytes / (1024 * 1024),
+            args.esp_size_mib,
+            usable_capacity / (1024 * 1024),
+        );
     }
 
     // Host-tool preflight. Names every missing binary up front so
