@@ -204,6 +204,61 @@ pub fn paint_nibble(slot_idx: u32, row_idx: u32, nibble: u8, fg: u32, bg: u32) {
     }
 }
 
+/// Paint an 8×8 monochrome glyph, scaled 2×, at exact pixel
+/// coordinates `(px_x, px_y)`. The glyph format matches
+/// `narf-graphics::font8x8::lookup` output: byte `n` is row `n`
+/// (top→bottom), bit 7 is the leftmost pixel of that row.
+///
+/// `fg` painted where the glyph bit is set, `bg` elsewhere. The
+/// 2× scale (16×16 final pixels) gives enough on-screen real
+/// estate to read hex digits comfortably even on a 1920-wide
+/// FB seen from across the room. Caller-driven layout — beacon
+/// doesn't enforce any per-character spacing, just put each
+/// glyph 18 px apart (16 px char + 2 px gap) or whatever you
+/// like.
+///
+/// Lives here (rather than in graphics) so the trap handler can
+/// paint hex diagnostics without depending on the FB console
+/// being up. Same skipping-when-FB-not-registered behaviour as
+/// the rest of beacon.
+#[inline(never)]
+pub fn paint_glyph_2x_at(px_x: u32, px_y: u32, glyph: &[u8; 8], fg: u32, bg: u32) {
+    let phys = FB_PHYS.load(Ordering::Acquire);
+    if phys == 0 {
+        return;
+    }
+    let ceiling = FB_PHYS_CEILING.load(Ordering::Acquire);
+    if ceiling != 0 && phys >= ceiling {
+        return;
+    }
+    let stride = FB_STRIDE_PX.load(Ordering::Acquire) as u64;
+    let width = FB_WIDTH.load(Ordering::Acquire);
+    let height = FB_HEIGHT.load(Ordering::Acquire);
+    if px_x + 16 > width || px_y + 16 > height {
+        return;
+    }
+    let base = phys as *mut u32;
+    for row in 0..8u32 {
+        let bits = glyph[row as usize];
+        for dy in 0..2u32 {
+            let y = px_y + row * 2 + dy;
+            for col in 0..8u32 {
+                let on = (bits >> (7 - col)) & 1 != 0;
+                let color = if on { fg } else { bg };
+                for dx in 0..2u32 {
+                    let x = px_x + col * 2 + dx;
+                    let off = (y as u64) * stride + (x as u64);
+                    // SAFETY: bounds checked above; FB phys is
+                    // identity-mapped per the registrar contract.
+                    unsafe {
+                        base.add(off as usize).write_volatile(color);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Paint `value` as 16 hex nibbles, MS-first, starting at
 /// `(start_slot, row_idx)`. Adjacent bytes alternate `fg_even` /
 /// `fg_odd` so you can group nibble-pairs visually without counting
