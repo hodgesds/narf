@@ -71,11 +71,11 @@ pub const PSP_STATUS_CODE_MASK: u32 = 0x7FFF_FFFF;
 // size in pages or bytes is shifted into bits[31:8] (size << 8).
 //
 // Mapping mirrors `drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h`
-// `enum psp_gfx_cmd_id`. NARF's pre-existing scaffold used a
-// value of 0x05 for the generic "load this signed blob" path —
-// historically labelled LOAD_TA but in practice the same code
-// the Linux driver uses for LOAD_IP_FW. The constant below keeps
-// the canonical Linux name to make future readers' lookups work.
+// `enum psp_gfx_cmd_id` verbatim. **The pre-relicense scaffold
+// had LOAD_IP_FW = 0x05 wrong** — 0x05 is SETUP_TMR. The correct
+// value (and the one Linux actually sends to PSP for IP firmware
+// loads) is 0x06. Re-verified against psp_gfx_if.h on
+// torvalds/linux 6.10+ (see audit, 2026-05-21).
 
 /// `GFX_CMD_ID_LOAD_TA = 0x01` — load a Trusted Application.
 pub const PSP_CMD_LOAD_TA: u32 = 0x01;
@@ -83,17 +83,33 @@ pub const PSP_CMD_LOAD_TA: u32 = 0x01;
 pub const PSP_CMD_UNLOAD_TA: u32 = 0x02;
 /// `GFX_CMD_ID_INVOKE_CMD = 0x03` — invoke a command on a loaded TA.
 pub const PSP_CMD_INVOKE_CMD: u32 = 0x03;
-/// `GFX_CMD_ID_LOAD_ASD = 0x04` — load Authenticated Secure Driver.
+/// `GFX_CMD_ID_LOAD_ASD = 0x04` — load Authenticated Secure
+/// Driver. Used by GFX9-era APUs (Renoir/Cezanne/Green Sardine);
+/// GFX11+ uses LOAD_TOC instead.
 pub const PSP_CMD_LOAD_ASD: u32 = 0x04;
-/// `GFX_CMD_ID_LOAD_IP_FW = 0x05` — load IP-block firmware (DCN,
-/// SMU, GFX, etc). This is the generic firmware-load command
-/// every bring-up uses.
-pub const PSP_CMD_LOAD_IP_FW: u32 = 0x05;
-/// `GFX_CMD_ID_DESTROY_TMR = 0x06` — release the trusted memory region.
-pub const PSP_CMD_DESTROY_TMR: u32 = 0x06;
-/// `GFX_CMD_ID_SAVE_RESTORE = 0x07` — save/restore IP-block state
+/// `GFX_CMD_ID_SETUP_TMR = 0x05` — allocate the Trusted Memory
+/// Region for the PSP-side firmware staging area. Sent before the
+/// big IP-firmware loop.
+pub const PSP_CMD_SETUP_TMR: u32 = 0x05;
+/// `GFX_CMD_ID_LOAD_IP_FW = 0x06` — load IP-block firmware (DCN,
+/// SMU, GFX, SDMA, VCN, RLC, ...). The generic firmware-load
+/// command every bring-up step iterates.
+pub const PSP_CMD_LOAD_IP_FW: u32 = 0x06;
+/// `GFX_CMD_ID_DESTROY_TMR = 0x07` — release the trusted memory region.
+pub const PSP_CMD_DESTROY_TMR: u32 = 0x07;
+/// `GFX_CMD_ID_SAVE_RESTORE = 0x08` — save/restore IP-block state
 /// for suspend/resume.
-pub const PSP_CMD_SAVE_RESTORE: u32 = 0x07;
+pub const PSP_CMD_SAVE_RESTORE: u32 = 0x08;
+/// `GFX_CMD_ID_LOAD_TOC = 0x20` — load the firmware table-of-
+/// contents blob. GFX11+ (Phoenix / Strix); GFX9-era APUs skip.
+pub const PSP_CMD_LOAD_TOC: u32 = 0x20;
+/// `GFX_CMD_ID_AUTOLOAD_RLC = 0x21` — kick PSP-managed RLC
+/// autoload after the IP-firmware loop. GFX11+ only.
+pub const PSP_CMD_AUTOLOAD_RLC: u32 = 0x21;
+/// `GFX_CMD_ID_BOOT_CFG = 0x22` — query / set the boot
+/// configuration (RAS, secure boot enables). Optional;
+/// bring-up doesn't strictly need it.
+pub const PSP_CMD_BOOT_CFG: u32 = 0x22;
 
 /// Maximum image size encodable in the trigger word. The cmd code
 /// is in bits[7:0]; the size lives in bits[31:8] so anything

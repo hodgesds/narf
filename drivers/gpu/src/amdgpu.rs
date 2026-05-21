@@ -166,7 +166,8 @@ const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
 // the names load_firmware uses inline below.
 use crate::amdgpu_psp::{
     MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
-    PSP_CMD_LOAD_IP_FW, PSP_STATUS_CODE_MASK, PSP_STATUS_DONE_BIT,
+    PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC,
+    PSP_STATUS_CODE_MASK, PSP_STATUS_DONE_BIT,
 };
 
 // ── Chip-info table ────────────────────────────────────────────────
@@ -234,29 +235,155 @@ pub struct ChipInfo {
     pub family: Family,
     /// Display-driver short name for diagnostics (e.g. "phoenix").
     pub asic: &'static str,
-    /// Canonical firmware-blob name the kernel firmware registry
-    /// (`narf-firmware`) looks up at PSP/SMU bring-up. Stage-1
-    /// records this on the bound-driver inventory but doesn't
-    /// load the blob; Stage-2 wires the load.
+    /// Legacy single-blob firmware name. Pre-multi-IP code paths
+    /// (e.g. `load_firmware` on test mocks) still open this name.
+    /// Real silicon goes through [`fw_list`] instead.
     pub fw_name: &'static str,
+    /// Per-IP firmware enumeration. Walked in order during
+    /// `load_firmware_multi` — each entry names a registry blob
+    /// + the PSP command used to dispatch it. List comes from the
+    /// Linux amdgpu driver's `MODULE_FIRMWARE` declarations for
+    /// the matching `gc_*`, `dcn_*`, `psp_*`, `sdma_*`, `vcn_*`,
+    /// `smu_*` IP versions.
+    pub fw_list: &'static [FwEntry],
 }
+
+/// One firmware blob in a chip's bring-up sequence: its canonical
+/// registry name (matches what the kernel asks
+/// `narf_firmware::open` for) and the PSP command that delivers it.
+///
+/// `optional = true` means the firmware-load path treats `NotFound`
+/// as a warning and continues. APUs that have their SOS / SMU
+/// PMFW resident in BIOS use this so an absent blob doesn't fail
+/// bring-up.
+#[derive(Copy, Clone, Debug)]
+pub struct FwEntry {
+    pub name: &'static str,
+    pub cmd: u32,
+    pub optional: bool,
+}
+
+impl FwEntry {
+    const fn ip_fw(name: &'static str) -> Self {
+        Self { name, cmd: PSP_CMD_LOAD_IP_FW, optional: false }
+    }
+    const fn ta(name: &'static str) -> Self {
+        Self { name, cmd: PSP_CMD_LOAD_TA, optional: false }
+    }
+    const fn asd(name: &'static str) -> Self {
+        Self { name, cmd: PSP_CMD_LOAD_ASD, optional: false }
+    }
+    const fn toc(name: &'static str) -> Self {
+        Self { name, cmd: PSP_CMD_LOAD_TOC, optional: false }
+    }
+    const fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+}
+
+// ── Per-chip firmware enumerations ─────────────────────────────────
+//
+// Sourced from Linux `drivers/gpu/drm/amd/amdgpu/*_v*.c`
+// `MODULE_FIRMWARE` declarations + the load ordering in
+// `psp_load_non_psp_fw` and `psp_hw_start` (kernel 6.10+).
+//
+// Load order (both families): TOC (gfx11+) → ASD (gfx9) → SMU
+// (gfx11+; gfx9 APU SMU lives in BIOS) → IP firmwares (SDMA →
+// CP → MES → RLC → IMU → VCN → DMCUB) → TAs.
+
+/// Phoenix / Phoenix2 / HawkPoint — GFX 11.5 + DCN 3.5 +
+/// PSP 14.0.1 + SDMA 6.1 + VCN 4.0.5 + SMU 14.0.1.
+static PHOENIX_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
+    FwEntry::ip_fw("amdgpu/smu_14_0_1.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes_2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes1.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
+];
+
+/// Strix Point — GFX 11.5 same gc_11_5_0_* but with strix-suffixed
+/// PSP/SMU/DCN per Linux's `cfg/ip_versions.c`. Currently treated
+/// as Phoenix-equivalent until we have a real Strix bring-up.
+static STRIX_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/psp_14_0_4_toc.bin"),
+    FwEntry::ip_fw("amdgpu/smu_14_0_4.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes_2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes1.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_14_0_4_ta.bin"),
+];
+
+/// Renoir — GFX9, DCN 2.0, PSP 12.0. APU; SMU PMFW is BIOS-
+/// resident (no smu blob on disk). MEC carries CP_MEC1_JT in the
+/// same blob; jump-table extraction happens at parse time.
+static RENOIR_FW: &[FwEntry] = &[
+    FwEntry::asd("amdgpu/renoir_asd.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_me.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_ce.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_mec.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_sdma.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_vcn.bin"),
+    FwEntry::ip_fw("amdgpu/renoir_dmcub.bin"),
+    FwEntry::ta("amdgpu/renoir_ta.bin"),
+];
+
+/// Cezanne / Lucienne / Barcelo — "green_sardine" upstream
+/// prefix. GFX9, DCN 2.1, PSP 12.0. Adds `green_sardine_mec2`
+/// (second MEC pipe) absent from Renoir proper.
+static GREEN_SARDINE_FW: &[FwEntry] = &[
+    FwEntry::asd("amdgpu/green_sardine_asd.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_me.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_ce.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_mec.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_mec2.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_sdma.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_vcn.bin"),
+    FwEntry::ip_fw("amdgpu/green_sardine_dmcub.bin"),
+    FwEntry::ta("amdgpu/green_sardine_ta.bin"),
+];
+
+/// Empty list — placeholder for chips whose per-IP enumeration
+/// hasn't been audited yet. `load_firmware_multi` short-circuits
+/// to a single `fw_name` load when the list is empty, preserving
+/// the pre-multi-IP behaviour for those chips.
+static UNAUDITED_FW: &[FwEntry] = &[];
 
 /// Look up family + asic + firmware name for a known PCI ID.
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != AMD_VENDOR {
         return None;
     }
-    let (family, asic, fw_name) = match did {
+    let (family, asic, fw_name, fw_list) = match did {
         // Phoenix / HawkPoint / Strix all carry RDNA3.5 iGPU →
         // DCN 3.5 display IP; they take the DCN 3.5 modeset path.
-        PHOENIX_HAWKPOINT1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin"),
-        PHOENIX_DISCRETE => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin"),
-        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin"),
-        RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin"),
-        CEZANNE => (Family::Renoir, "cezanne", "amdgpu/cezanne.bin"),
-        RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin"),
-        NAVI22 => (Family::Navi2, "navi22", "amdgpu/navi22.bin"),
-        NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin"),
+        PHOENIX_HAWKPOINT1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
+        PHOENIX_DISCRETE => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
+        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", STRIX_FW),
+        RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
+        CEZANNE => (Family::Renoir, "cezanne", "amdgpu/cezanne.bin", GREEN_SARDINE_FW),
+        RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
+        NAVI22 => (Family::Navi2, "navi22", "amdgpu/navi22.bin", UNAUDITED_FW),
+        NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
         _ => return None,
     };
     Some(ChipInfo {
@@ -265,6 +392,7 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         family,
         asic,
         fw_name,
+        fw_list,
     })
 }
 
@@ -613,6 +741,154 @@ impl AmdGpu {
         Ok(())
     }
 
+    /// Dispatch one firmware blob through the PSP mailbox using
+    /// the requested command. Used by both `load_firmware_multi`
+    /// (real bring-up) and other future TA-invocation paths.
+    /// Returns `Ok(true)` when the blob loaded, `Ok(false)` when
+    /// it was absent but the entry was marked `optional`, and `Err`
+    /// on any hard failure.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively (regs MMIO) and `mp0_base` is
+    /// the live MP0 register window for this chip.
+    unsafe fn psp_dispatch_one(
+        &mut self,
+        entry: &FwEntry,
+        mp0_base: u32,
+        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    ) -> Result<bool, AmdgpuError> {
+        let cap = match narf_firmware::open(entry.name, fw_authority) {
+            Ok(c) => c,
+            Err(narf_firmware::FirmwareError::NotFound) => {
+                if entry.optional {
+                    return Ok(false);
+                }
+                return Err(AmdgpuError::FirmwareMissing);
+            }
+            Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
+        };
+        let view = narf_firmware::view_of(&cap)
+            .map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
+        let phys = view.phys;
+        let size = view.bytes.len() as u32;
+        if size == 0 || size & 0xFF00_0000 != 0 {
+            // PSP_CMD trigger word packs size into bits[31:8]; > 16 MiB
+            // doesn't fit. Real blobs cap at a few MiB so this is a
+            // guard, not a real limit.
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+
+        // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
+        // are valid register-bus addresses for this family.
+        unsafe {
+            mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
+            mm_write(&self.regs, mp0_base + MP0_C2PMSG_67_REL, (phys >> 32) as u32);
+        }
+        compiler_fence(Ordering::SeqCst);
+        let trigger = (entry.cmd & 0xFF) | (size << 8);
+        // SAFETY: same.
+        unsafe {
+            mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, trigger);
+        }
+
+        // Poll for done bit. 500 ms wedge threshold matches per-IP
+        // load latency (PSP TA-load is the slowest at ~50 ms typical).
+        let _ = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) }
+                & PSP_STATUS_DONE_BIT
+                != 0,
+            narf_time::Deadline::after_ms(500),
+        );
+        // SAFETY: identity-mapped MMIO.
+        let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
+        if last & PSP_STATUS_DONE_BIT == 0 {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        if last & PSP_STATUS_CODE_MASK != 0 {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+
+        // Record the version coupling. set_bound_firmware overwrites
+        // the previous entry per driver, so the LAST blob loaded
+        // surfaces in the inventory — which is what an operator
+        // wants (the most-recent PSP transaction's signer/sha).
+        // Full multi-blob history is a follow-up if we ever need it.
+        narf_drivers::set_bound_firmware(
+            "amdgpu",
+            narf_drivers::BoundFirmware {
+                blob_name: alloc::string::String::from(entry.name),
+                sha256: view.sha256,
+                signer: view.signer,
+                version: None,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Walk the chip's per-IP firmware list (`chip.fw_list`) and
+    /// dispatch each entry through the PSP mailbox in declaration
+    /// order. Falls through to the single-blob `load_firmware` when
+    /// the chip's list is empty (unaudited chips). Sets
+    /// `self.fw_loaded` only after the entire required set lands.
+    ///
+    /// Per-entry semantics:
+    ///   - `optional = true`  → NotFound is a warning, continue.
+    ///   - `optional = false` → NotFound bails with FirmwareMissing.
+    ///   - PSP reject / timeout always bails with FirmwareLoadFailed.
+    ///
+    /// Returns the `MultiFwReport` for diagnostics — how many
+    /// blobs loaded vs skipped, and which (if any) was the last
+    /// optional skip so an operator can correlate with what's
+    /// missing from the initramfs.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively. The firmware blob phys stays
+    /// valid through the entire PSP handshake (the cap stays alive
+    /// in scope while the per-blob mailbox sequence runs).
+    pub unsafe fn load_firmware_multi(
+        &mut self,
+        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    ) -> Result<MultiFwReport, AmdgpuError> {
+        // Fall through to the single-blob path for chips whose IP
+        // enumeration we haven't audited yet. Preserves the
+        // pre-multi-IP behaviour without forcing every PCI ID to
+        // have a populated list.
+        if self.chip.fw_list.is_empty() {
+            // SAFETY: same precondition.
+            return unsafe { self.load_firmware(fw_authority) }.map(|_| MultiFwReport {
+                loaded: 1,
+                skipped_optional: 0,
+                last_optional_skip: None,
+            });
+        }
+        let mp0_base = self.mp0_base().ok_or(AmdgpuError::FirmwareLoadFailed)?;
+
+        let mut loaded = 0usize;
+        let mut skipped_optional = 0usize;
+        let mut last_optional_skip: Option<alloc::string::String> = None;
+
+        for entry in self.chip.fw_list {
+            // SAFETY: caller-asserted exclusive BAR5; mp0_base
+            // is resolved live (not stale).
+            match unsafe { self.psp_dispatch_one(entry, mp0_base, fw_authority) } {
+                Ok(true) => loaded += 1,
+                Ok(false) => {
+                    skipped_optional += 1;
+                    last_optional_skip = Some(alloc::string::String::from(entry.name));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.fw_loaded = true;
+        Ok(MultiFwReport {
+            loaded,
+            skipped_optional,
+            last_optional_skip,
+        })
+    }
+
     /// Program a scanout mode through DCN 2.0.
     ///
     /// Path:
@@ -759,10 +1035,14 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<InitializeReport, AmdgpuError> {
-        // 1. PSP-driven firmware load (existing path — handles
-        //    SMU / GFX / SDMA / DCN microcode in one shot).
+        // 1. PSP-driven firmware load. `load_firmware_multi`
+        //    walks `chip.fw_list` — TOC, ASD, IP firmwares, TAs
+        //    in declaration order matching Linux's psp_load_non_
+        //    psp_fw + psp_hw_start. Falls through to the legacy
+        //    single-blob path on chips whose IP enumeration we
+        //    haven't audited yet.
         // SAFETY: caller-asserted BAR5 ownership.
-        unsafe { self.load_firmware(fw_authority)? };
+        let multi_fw = unsafe { self.load_firmware_multi(fw_authority) }?;
 
         // 2. SMU bring-up handshake. The MP1 base + expected
         //    driver-IF version are family-specific; both must
@@ -781,16 +1061,40 @@ impl AmdGpu {
                 .map_err(|_| AmdgpuError::SmuBringUpFailed)?
         };
 
-        Ok(InitializeReport { smu_info })
+        Ok(InitializeReport {
+            smu_info,
+            multi_fw: Some(multi_fw),
+        })
     }
 }
 
 /// Per-initialize report — what the host learned about the chip
 /// after `AmdGpu::initialize`. The caller stashes this on the
 /// driver state for later reference (logging, ABI exposure).
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct InitializeReport {
     pub smu_info: crate::amdgpu_smu::SmuInfo,
+    /// Per-IP firmware-load summary from `load_firmware_multi`.
+    /// `None` on chips that fell back to the single-blob path.
+    pub multi_fw: Option<MultiFwReport>,
+}
+
+/// Summary returned by `AmdGpu::load_firmware_multi`. The driver
+/// records this so operators can correlate boot-time logging with
+/// what actually loaded vs what was skipped because the blob
+/// wasn't in the initramfs.
+#[derive(Clone, Debug)]
+pub struct MultiFwReport {
+    /// How many blobs from `chip.fw_list` loaded successfully.
+    pub loaded: usize,
+    /// How many entries were `optional` and not present in the
+    /// firmware registry. Non-zero usually means "build a more
+    /// complete initramfs" — the chip will function but some IPs
+    /// (typically optional TAs / boot-cfg) skipped.
+    pub skipped_optional: usize,
+    /// The most recent optional blob that was skipped, for log
+    /// breadcrumbs.
+    pub last_optional_skip: Option<alloc::string::String>,
 }
 
 /// Adapter that implements `SmuMmio` over the driver's BAR5
