@@ -52,6 +52,60 @@ enum Cmd {
     /// `firmware/<name>` inside the workspace (so `xtask image`
     /// auto-bundles it into the initramfs CPIO).
     PackFirmware(PackFirmwareArgs),
+    /// Bulk-import firmware blobs from a source directory tree
+    /// (default `/lib/firmware/`) into the workspace's
+    /// `firmware/` dir. Recursively walks, decompresses `.zst`
+    /// entries on the fly (Arch's linux-firmware ships everything
+    /// zstd-compressed), and wraps each with the NARF trailer.
+    /// Result is bundled into the initramfs by `xtask image`.
+    ///
+    /// Mirrors the `linux-firmware` payload a Linux live ISO
+    /// ships — the ISO will carry firmware for any device a driver
+    /// later wants to load, without per-device hand-curation.
+    ImportFirmware(ImportFirmwareArgs),
+}
+
+#[derive(Parser, Clone)]
+struct ImportFirmwareArgs {
+    /// Source firmware directory to walk. Defaults to the system's
+    /// `/lib/firmware/` (matches Arch + Debian conventions).
+    #[arg(long, default_value = "/lib/firmware")]
+    source: String,
+
+    /// Output dir under the workspace. Each blob lands at
+    /// `<out>/<rel>` where `<rel>` is the path relative to `--source`
+    /// with any `.zst` suffix stripped. Default `target/firmware`
+    /// keeps imported blobs out of the source tree (workspace's
+    /// `firmware/` crate dir would collide) and inside `target/`
+    /// which is already gitignored.
+    #[arg(long, default_value = "target/firmware")]
+    out: String,
+
+    /// Optional vendor / subdirectory filter (e.g. `amdgpu`,
+    /// `iwlwifi`, `mt76`). Only files whose path under `--source`
+    /// starts with this prefix are imported. Use to build smaller
+    /// targeted ISOs (e.g. AMD-laptop-only).
+    #[arg(long)]
+    vendor: Option<String>,
+
+    /// Skip every file already present at the output path. Lets
+    /// you re-run import after kernel upgrades to pick up only the
+    /// newly-added blobs.
+    #[arg(long)]
+    skip_existing: bool,
+
+    /// Clear the output dir before importing. Avoids stale blobs
+    /// lingering when /lib/firmware/ drops a file across upstream
+    /// releases.
+    #[arg(long)]
+    clean: bool,
+
+    /// Limit each blob's payload to this many bytes. Defaults to
+    /// 16 MiB (PSP `LOAD_IP_FW` packs size into bits[31:8], so
+    /// anything larger is unloadable anyway). Bigger files are
+    /// skipped with a warning, not truncated.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_payload_bytes: u64,
 }
 
 #[derive(Parser, Clone)]
@@ -975,6 +1029,232 @@ fn collect_firmware_blobs(fw_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
+/// Wrap raw payload bytes with the NARF unsigned trailer. Pure
+/// function — same trailer logic as `pack_firmware_cmd` but
+/// callable from the bulk-import path without going through file
+/// I/O for each blob.
+fn wrap_firmware_trailer(payload: &[u8], version: Option<&str>) -> Vec<u8> {
+    let mut metadata: Vec<u8> = Vec::new();
+    if let Some(ver) = version {
+        let bytes = ver.as_bytes();
+        // Per signature::decode the metadata len byte is u8 (max
+        // 255). Anything longer gets silently truncated for the
+        // bulk-import path — version strings from kernel `uname -r`
+        // are well under that, and bulk-import has no human in the
+        // loop to surface "too long" warnings to.
+        let n = bytes.len().min(255);
+        metadata.push(0x01); // TLV tag: ASCII version
+        metadata.push(n as u8);
+        metadata.extend_from_slice(&bytes[..n]);
+    }
+    let mut blob = Vec::with_capacity(payload.len() + 104 + metadata.len());
+    blob.extend_from_slice(payload);
+    blob.extend_from_slice(&[0u8; 64]); // unsigned sig sentinel
+    blob.extend_from_slice(&[0u8; 32]); // unsigned signer fingerprint
+    blob.extend_from_slice(&metadata);
+    blob.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    blob.extend_from_slice(b"NRFW");
+    blob
+}
+
+/// Bulk-import firmware blobs. Walks the source tree, decompresses
+/// any `.zst` entries, wraps each with the NARF trailer, and writes
+/// the result under the workspace's `firmware/` dir so subsequent
+/// `xtask image` runs auto-bundle the lot into the initramfs CPIO.
+fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
+    let source = PathBuf::from(&args.source);
+    if !source.is_dir() {
+        bail!(
+            "source dir {} doesn't exist or isn't a directory",
+            source.display()
+        );
+    }
+    let root = workspace_root()?;
+    let out_root = root.join(&args.out);
+
+    if args.clean && out_root.exists() {
+        std::fs::remove_dir_all(&out_root)
+            .with_context(|| format!("removing {}", out_root.display()))?;
+        println!("import-firmware: cleaned {}", out_root.display());
+    }
+    std::fs::create_dir_all(&out_root)
+        .with_context(|| format!("creating {}", out_root.display()))?;
+
+    // Optional version stamp baked into each blob's trailer. Uses
+    // the host kernel's release string so post-mortem inspection
+    // (BoundFirmware.version) ties a NARF boot back to the Linux
+    // firmware drop it was sourced from.
+    let host_uname = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    let vendor_prefix: Option<PathBuf> = args.vendor.as_ref().map(PathBuf::from);
+
+    let mut imported: usize = 0;
+    let mut skipped_existing: usize = 0;
+    let mut skipped_too_big: usize = 0;
+    let mut skipped_non_blob: usize = 0;
+    let mut decomp_failed: usize = 0;
+    let mut total_payload_bytes: u64 = 0;
+
+    let mut stack: Vec<PathBuf> = vec![source.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("read_dir {}", dir.display()))?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue, // permission/IO blip on one file shouldn't kill the bulk
+            };
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                // Skip symlinks — most firmware symlinks are alias
+                // names (vendor/foo.bin -> vendor/foo-v2.bin). Each
+                // alias becomes its own entry below, and following
+                // would risk infinite loops on circular aliases.
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+
+            let rel = path
+                .strip_prefix(&source)
+                .with_context(|| {
+                    format!("strip_prefix {} vs {}", path.display(), source.display())
+                })?;
+
+            // Vendor filter: only import paths that match the
+            // requested prefix (path-component-wise, so `--vendor
+            // amdgpu` matches `amdgpu/phoenix_*` but not
+            // `amd-ucode/microcode_amd.bin` or stray `amdfoo` blobs).
+            if let Some(prefix) = &vendor_prefix {
+                if !rel.starts_with(prefix) {
+                    continue;
+                }
+            }
+
+            // Skip well-known non-firmware files. linux-firmware
+            // ships .txt licenses, WHENCE manifests, etc. — none
+            // are firmware blobs and packing them just bloats the
+            // CPIO.
+            let rel_str = rel.to_str().unwrap_or("");
+            if rel_str.ends_with(".txt")
+                || rel_str.ends_with(".md")
+                || rel_str.ends_with(".rst")
+                || rel_str.ends_with(".cfg")
+                || rel_str.contains("WHENCE")
+                || rel_str.contains("README")
+                || rel_str.contains("LICENSE")
+                || rel_str.contains("LICENCE")
+                || rel_str.contains("copyright")
+                || rel_str.starts_with(".")
+            {
+                skipped_non_blob += 1;
+                continue;
+            }
+
+            // Compute destination path. Strip `.zst` if present
+            // so the canonical registry key matches what drivers
+            // request (e.g. `amdgpu/phoenix_dmcub.bin`, not
+            // `amdgpu/phoenix_dmcub.bin.zst`).
+            let dest_rel: PathBuf = if rel_str.ends_with(".zst") {
+                PathBuf::from(&rel_str[..rel_str.len() - 4])
+            } else {
+                rel.to_path_buf()
+            };
+            let dest_path = out_root.join(&dest_rel);
+
+            if args.skip_existing && dest_path.exists() {
+                skipped_existing += 1;
+                continue;
+            }
+
+            // Read payload (decompressing on the fly if .zst).
+            let raw = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let payload: Vec<u8> = if rel_str.ends_with(".zst") {
+                match zstd::stream::decode_all(raw.as_slice()) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        decomp_failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                raw
+            };
+
+            if (payload.len() as u64) > args.max_payload_bytes {
+                skipped_too_big += 1;
+                continue;
+            }
+            if payload.is_empty() {
+                // Empty payloads fail at narf_firmware decode
+                // (signature::decode rejects blobs < 104 bytes
+                // total, but even after trailer add an empty
+                // payload trips load_firmware's size==0 check on
+                // amdgpu). Skip rather than ship a deliberately-
+                // broken blob.
+                skipped_non_blob += 1;
+                continue;
+            }
+
+            let wrapped = wrap_firmware_trailer(&payload, host_uname.as_deref());
+
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(&dest_path, &wrapped)
+                .with_context(|| format!("writing {}", dest_path.display()))?;
+            imported += 1;
+            total_payload_bytes += payload.len() as u64;
+        }
+    }
+
+    println!(
+        "import-firmware: imported {} blob(s), {} payload byte(s) total",
+        imported, total_payload_bytes
+    );
+    if skipped_existing > 0 {
+        println!("  skipped {} (already present; --skip-existing)", skipped_existing);
+    }
+    if skipped_too_big > 0 {
+        println!(
+            "  skipped {} (over --max-payload-bytes = {})",
+            skipped_too_big, args.max_payload_bytes
+        );
+    }
+    if skipped_non_blob > 0 {
+        println!(
+            "  skipped {} (license/readme/empty/non-blob files)",
+            skipped_non_blob
+        );
+    }
+    if decomp_failed > 0 {
+        println!("  zstd-decompression failed on {} file(s)", decomp_failed);
+    }
+    println!("  output dir: {}", out_root.display());
+    if host_uname.is_some() {
+        println!("  trailer version stamp: {}", host_uname.as_deref().unwrap_or(""));
+    }
+    Ok(())
+}
+
 /// Wrap a raw firmware payload with the NARF trailer + write it to
 /// disk. Reference: `firmware/src/signature.rs` — payload bytes,
 /// then a 64-byte all-zero signature, 32-byte all-zero signer
@@ -991,28 +1271,12 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
     if payload.is_empty() {
         bail!("payload {} is empty — NARF amdgpu rejects size==0", &args.payload);
     }
-
-    // Metadata: TLV records (1-byte tag + 1-byte len + value).
-    // Tag 0x01 = ASCII version string. Skipped when --version
-    // wasn't supplied so the trailer stays minimal.
-    let mut metadata: Vec<u8> = Vec::new();
     if let Some(ver) = &args.version {
-        let bytes = ver.as_bytes();
-        if bytes.len() > 255 {
-            bail!("version string too long ({} > 255)", bytes.len());
+        if ver.as_bytes().len() > 255 {
+            bail!("version string too long ({} > 255)", ver.as_bytes().len());
         }
-        metadata.push(0x01); // tag
-        metadata.push(bytes.len() as u8);
-        metadata.extend_from_slice(bytes);
     }
-
-    let mut blob: Vec<u8> = Vec::with_capacity(payload.len() + 104 + metadata.len());
-    blob.extend_from_slice(&payload);
-    blob.extend_from_slice(&[0u8; 64]); // unsigned sig sentinel
-    blob.extend_from_slice(&[0u8; 32]); // unsigned signer fingerprint
-    blob.extend_from_slice(&metadata);
-    blob.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
-    blob.extend_from_slice(b"NRFW");
+    let blob = wrap_firmware_trailer(&payload, args.version.as_deref());
 
     let out_path: PathBuf = match &args.out {
         Some(p) => PathBuf::from(p),
@@ -1107,13 +1371,16 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let shell_bytes = std::fs::read(&shell_elf)
         .with_context(|| format!("reading shell ELF at {}", shell_elf.display()))?;
 
-    // Firmware bundling: walk `firmware/` under the workspace root.
-    // Each file lands in the initramfs CPIO as `firmware/<relpath>`
-    // and the kernel's `firmware-scan-initramfs` initcall registers
-    // it under that suffix. Pack with `cargo xtask pack-firmware`
-    // — raw `/lib/firmware/amdgpu/*.bin` files won't load without
-    // the NARF trailer.
-    let fw_dir = root.join("firmware");
+    // Firmware bundling: walk `target/firmware/` (the default
+    // `xtask import-firmware --out`). Each file lands in the
+    // initramfs CPIO as `firmware/<relpath>` and the kernel's
+    // `firmware-scan-initramfs` initcall registers it under that
+    // suffix. Pack with `cargo xtask pack-firmware` for one-offs
+    // or `cargo xtask import-firmware` for a Linux-live-ISO-style
+    // bulk bundle. `firmware/` (workspace) is intentionally NOT
+    // walked — that's the narf-firmware crate dir, walking it
+    // would CPIO source files.
+    let fw_dir = root.join("target").join("firmware");
     let fw_entries = collect_firmware_blobs(&fw_dir)?;
 
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
@@ -2161,6 +2428,7 @@ fn main() -> Result<()> {
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
+        Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();

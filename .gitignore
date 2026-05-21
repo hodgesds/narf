@@ -31,3 +31,8 @@ target/
 serial.log
 qemu.log
 .claude/
+
+# Note: imported firmware blobs land at `target/firmware/` (default
+# `xtask import-firmware --out`), already covered by `target/`
+# above. The workspace `firmware/` dir is the narf-firmware crate
+# itself and stays tracked.
