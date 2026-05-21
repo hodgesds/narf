@@ -123,25 +123,38 @@ pub fn try_mount_root_with(
     let mut last_error: Option<RootMountError> = None;
     let mut saw_candidate = false;
     for entry in &devices {
-        // Selector filter: skip devices the cmdline doesn't ask for.
-        // For name-only selectors we can short-circuit here; the
-        // partition / FS-uuid selectors need extra resolution that
-        // the walker doesn't yet have, so they fall through and the
-        // post-loop check refuses if none matched.
+        // Selector filter: skip devices the cmdline doesn't ask
+        // for. ByName matches the registry-string; ByPartLabel /
+        // ByPartUuid match the GPT metadata the partition scanner
+        // attached at register_block_device_with_meta time
+        // (None = whole-disk parent or legacy-MBR partition, both
+        // never match a PARTLABEL/PARTUUID selector).
         if let Some(sel) = selector {
+            use crate::root_selector::RootSelector;
             match sel {
-                crate::root_selector::RootSelector::ByName(_) => {
+                RootSelector::ByName(_) => {
                     if !sel.matches_name(entry.name) {
                         continue;
                     }
                 }
-                // PARTLABEL / PARTUUID / UUID matchers need
-                // partition / FS-instance metadata the walker
-                // doesn't carry. Until that's threaded, treat them
-                // as "first detected" (lenient) so a misspelled
-                // selector still boots — production gating tightens
-                // when the metadata path lands.
-                _ => {}
+                RootSelector::ByPartLabel(target) => {
+                    match &entry.partition {
+                        Some(m) if &m.partlabel == target => {}
+                        _ => continue,
+                    }
+                }
+                RootSelector::ByPartUuid(target) => {
+                    match &entry.partition {
+                        Some(m) if m.partuuid.eq_ignore_ascii_case(target) => {}
+                        _ => continue,
+                    }
+                }
+                // FS-UUID needs per-FS-instance metadata we still
+                // don't carry (would need a UUID accessor on
+                // FsInstance). Lenient until that lands — the
+                // selector is parsed + visible in the boot log,
+                // walker falls through to "first detected".
+                RootSelector::ByFsUuid(_) => {}
             }
         }
         saw_candidate = true;
@@ -175,11 +188,18 @@ pub fn try_mount_root_with(
             fs_type: detect,
         });
     }
-    // If a name-only selector was given but nothing matched, surface
-    // that distinctly — silent fallback to a wrong device is worse
-    // than refusing to boot.
+    // If a strict-match selector (ByName / ByPartLabel / ByPartUuid)
+    // was given but nothing matched, surface that distinctly —
+    // silent fallback to a wrong device is worse than refusing.
+    // FS-UUID is excluded from this guard since the walker doesn't
+    // yet carry FS-uuid metadata.
     if let Some(sel) = selector {
-        if sel.is_name_only() && !saw_candidate {
+        use crate::root_selector::RootSelector;
+        let strict = matches!(
+            sel,
+            RootSelector::ByName(_) | RootSelector::ByPartLabel(_) | RootSelector::ByPartUuid(_)
+        );
+        if strict && !saw_candidate {
             return Err(RootMountError::SelectorNoMatch);
         }
     }

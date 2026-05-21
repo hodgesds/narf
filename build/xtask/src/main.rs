@@ -1496,31 +1496,29 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     // without the kernel + init binaries to populate it with.
     let root = workspace_root().context("locating workspace root")?;
     let target_dir = root.join("target");
-    let kernel = target_dir.join("x86_64-unknown-none/release/narf-frame");
-    if !kernel.exists() {
-        bail!(
-            "kernel not found at {}; run `cargo xtask iso-boot` first to \
-             build the kernel + initramfs",
-            kernel.display()
-        );
-    }
-    let initramfs = target_dir.join("iso-x86_64/boot/initramfs.cpio");
-    if !initramfs.exists() {
-        bail!(
-            "initramfs not found at {}; run `cargo xtask iso-boot` first",
-            initramfs.display()
-        );
-    }
-    // The Limine binaries live in the staged iso-x86_64 tree.
-    let limine_dir = target_dir.join("iso-x86_64/boot/limine");
-    let bootx64 = target_dir.join("iso-x86_64/EFI/BOOT/BOOTX64.EFI");
-    if !limine_dir.exists() || !bootx64.exists() {
-        bail!(
-            "Limine staging dirs missing at {} / {}; run `cargo xtask \
-             iso-boot` first",
-            limine_dir.display(),
-            bootx64.display(),
-        );
+    // Pull every artifact from the iso-boot staging directory —
+    // that's where the kernel + initramfs + Limine binaries
+    // *both* exist in a known layout, regardless of debug-vs-release
+    // and bootloader-path quirks.
+    let stage = target_dir.join("iso-x86_64");
+    let kernel = stage.join("boot/narf-frame");
+    let initramfs = stage.join("boot/initramfs.cpio");
+    let limine_dir = stage.join("boot/limine");
+    let bootx64 = stage.join("EFI/BOOT/BOOTX64.EFI");
+    for (label, p) in [
+        ("kernel", &kernel),
+        ("initramfs", &initramfs),
+        ("Limine support dir", &limine_dir),
+        ("Limine UEFI loader", &bootx64),
+    ] {
+        if !p.exists() {
+            bail!(
+                "{} not found at {}; run `cargo xtask iso-boot` first to \
+                 build the kernel + initramfs + Limine staging",
+                label,
+                p.display()
+            );
+        }
     }
 
     // ── 2. Confirm ────────────────────────────────────────────────

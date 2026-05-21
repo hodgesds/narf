@@ -1788,6 +1788,47 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_init::register(narf_init::Stage::Late, "root-mount-auto", || {
                 let auth = narf_filesystem::bootstrap_mount_authority();
 
+                // Boot ordering:
+                //   1. If the cmdline carries root=, honour it strictly:
+                //      try_mount_root picks the named partition / FS.
+                //      Refuse silent fallback when root= misses — wrong
+                //      disk + right shell is worse than a broken boot.
+                //   2. Otherwise, prefer initramfs when staged (the
+                //      ISO-on-USB path NARF has shipped with). The
+                //      initramfs always works + is small, so it's the
+                //      safe default.
+                //   3. Final fallback: walk the block registry via
+                //      try_mount_root and mount whatever ext / FAT
+                //      filesystem the fs-factory registry finds.
+                let cmdline = narf_boot::cmdline();
+                let has_root_eq = narf_filesystem::root_selector::RootSelector::from_cmdline(
+                    cmdline,
+                )
+                .is_some();
+
+                if has_root_eq {
+                    match narf_filesystem::root_mount::try_mount_root(&auth) {
+                        Ok(report) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: {:?} on {} mounted at \"/\" (cmdline root= selector)",
+                                report.fs_type, report.device_name
+                            );
+                            return narf_init::InitResult::Ok;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: cmdline root= selector failed: {:?}",
+                                e
+                            );
+                            // Fall through to initramfs/walk fallbacks
+                            // so a typoed root= still boots into a shell
+                            // rather than panicking the kernel.
+                        }
+                    }
+                }
+
                 if narf_initramfs::is_staged() {
                     match narf_initramfs::mount_at_path(&auth, "/") {
                         Ok(()) => {
@@ -1810,7 +1851,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     Ok(report) => {
                         let _ = writeln!(
                             console::Writer,
-                            "  root-mount: {:?} on {} mounted at \"/\" via fs-factory registry",
+                            "  root-mount: {:?} on {} mounted at \"/\" via fs-factory walk",
                             report.fs_type, report.device_name
                         );
                         return narf_init::InitResult::Ok;

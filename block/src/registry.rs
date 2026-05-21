@@ -45,17 +45,36 @@ pub trait BlockDeviceSync: Send + Sync {
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError>;
 }
 
+/// Optional per-partition metadata attached to a registered block
+/// device. `None` for whole-disk entries (e.g. `nvme0`); `Some` for
+/// per-partition entries the partition scanner registered
+/// (`nvme0p1`, `usb-msc0p2`, ...).
+#[derive(Clone, Debug, Default)]
+pub struct PartitionMetadata {
+    /// UTF-8 partition name decoded from the GPT entry's UTF-16LE
+    /// `partition_name` field. Empty for MBR partitions (which have
+    /// no name slot) and for whole-disk entries.
+    pub partlabel: alloc::string::String,
+    /// Per-partition GUID in canonical 8-4-4-4-12 hex. Empty for
+    /// MBR partitions (which have no GUID).
+    pub partuuid: alloc::string::String,
+}
+
 /// One registered block device.
 #[derive(Clone)]
 pub struct RegisteredBlockDevice {
     pub name: &'static str,
     pub dev: Arc<dyn BlockDeviceSync>,
+    /// GPT metadata, if this entry is a partition. `None` for
+    /// whole-disk parents and for legacy-MBR partitions.
+    pub partition: Option<PartitionMetadata>,
 }
 
 impl core::fmt::Debug for RegisteredBlockDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RegisteredBlockDevice")
             .field("name", &self.name)
+            .field("partition", &self.partition)
             .finish_non_exhaustive()
     }
 }
@@ -66,11 +85,28 @@ static REGISTRY: IrqSafeSpinLock<Vec<RegisteredBlockDevice>> = IrqSafeSpinLock::
 /// replaces the prior entry so a driver can re-bring-up itself
 /// without doubling its registry footprint.
 pub fn register_block_device(name: &'static str, dev: Arc<dyn BlockDeviceSync>) {
+    register_block_device_with_meta(name, dev, None);
+}
+
+/// Register a block device with GPT partition metadata attached.
+/// Used by the partition scanner when it walks a GPT and finds
+/// per-partition labels / GUIDs. Boot-time `root=PARTLABEL=` /
+/// `root=PARTUUID=` selectors match against this metadata.
+pub fn register_block_device_with_meta(
+    name: &'static str,
+    dev: Arc<dyn BlockDeviceSync>,
+    partition: Option<PartitionMetadata>,
+) {
     let mut g = REGISTRY.lock();
+    let entry = RegisteredBlockDevice {
+        name,
+        dev,
+        partition,
+    };
     if let Some(pos) = g.iter().position(|e| e.name == name) {
-        g[pos] = RegisteredBlockDevice { name, dev };
+        g[pos] = entry;
     } else {
-        g.push(RegisteredBlockDevice { name, dev });
+        g.push(entry);
     }
 }
 

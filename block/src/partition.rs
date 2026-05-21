@@ -27,7 +27,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::registry::{register_block_device, BlockDeviceSync};
+use crate::registry::{
+    register_block_device, register_block_device_with_meta, BlockDeviceSync, PartitionMetadata,
+};
 use crate::BlockIoError;
 
 // ── Common signatures ──────────────────────────────────────────────
@@ -263,6 +265,23 @@ pub fn parse_gpt_partitions(
     out
 }
 
+/// Format a 16-byte GPT GUID as canonical 8-4-4-4-12 hex. Per UEFI
+/// spec §A: the first 8 bytes are the little-endian
+/// Data1/Data2/Data3 fields; the last 8 are stored big-endian.
+fn format_guid(guid: &[u8; 16]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let d1 = u32::from_le_bytes([guid[0], guid[1], guid[2], guid[3]]);
+    let d2 = u16::from_le_bytes([guid[4], guid[5]]);
+    let d3 = u16::from_le_bytes([guid[6], guid[7]]);
+    let mut s = alloc::string::String::with_capacity(36);
+    let _ = write!(s, "{:08X}-{:04X}-{:04X}-", d1, d2, d3);
+    let _ = write!(s, "{:02X}{:02X}-", guid[8], guid[9]);
+    for b in &guid[10..16] {
+        let _ = write!(s, "{:02X}", b);
+    }
+    s
+}
+
 fn decode_utf16le_name(bytes: &[u8]) -> alloc::string::String {
     let mut chars: Vec<u16> = Vec::new();
     let mut i = 0;
@@ -428,7 +447,13 @@ pub fn scan_and_register_partitions(
                 p.start_lba,
                 p.sector_count(),
             )) as Arc<dyn BlockDeviceSync>;
-            register_block_device(static_name, sub);
+            // Attach GPT metadata so root=PARTLABEL=… /
+            // root=PARTUUID=… selectors match here.
+            let meta = PartitionMetadata {
+                partlabel: p.name.clone(),
+                partuuid: format_guid(&p.partition_guid),
+            };
+            register_block_device_with_meta(static_name, sub, Some(meta));
             registered.push(name);
         }
         Ok(ScanReport {
