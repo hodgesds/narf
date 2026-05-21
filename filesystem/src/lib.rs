@@ -65,6 +65,7 @@ pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
 pub mod procfs;
+pub mod root_mount;
 
 mod tests;
 pub use devfs::{install_console_signal_hook, mount_default as mount_devfs_default, DevFs};

@@ -30,6 +30,7 @@ extern crate alloc;
 pub mod deadline;
 pub mod encrypted;
 pub mod mq;
+pub mod fs_detect;
 pub mod opal;
 pub mod partition;
 pub mod ram;

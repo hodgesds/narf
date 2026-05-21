@@ -1011,3 +1011,63 @@ fn smoke_fs_filetype_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_filetype_variants_distinct);
+
+// ── filesystem/root_mount ──────────────────────────────────────────
+
+fn smoke_fs_root_mount_factory_register_lookup() -> TestResult {
+    use crate::root_mount::{
+        factory_count, lookup_factory, register_fs_factory, __reset_for_test,
+    };
+    use narf_block::fs_detect::FsType;
+    __reset_for_test();
+    if factory_count() != 0 {
+        return TestResult::Fail("fresh registry must be empty");
+    }
+    fn dummy_ext_factory(
+        _dev: alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
+    ) -> Result<alloc::sync::Arc<dyn crate::FsInstance>, crate::FsError> {
+        Err(crate::FsError::PermissionDenied)
+    }
+    register_fs_factory(FsType::Ext, dummy_ext_factory);
+    if factory_count() != 1 {
+        return TestResult::Fail("post-register count must be 1");
+    }
+    if lookup_factory(FsType::Ext).is_none() {
+        return TestResult::Fail("ext factory not found");
+    }
+    if lookup_factory(FsType::Fat).is_some() {
+        return TestResult::Fail("fat factory must not be present");
+    }
+    // Re-register replaces in place.
+    register_fs_factory(FsType::Ext, dummy_ext_factory);
+    if factory_count() != 1 {
+        return TestResult::Fail("re-register must not duplicate");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/root_mount", smoke_fs_root_mount_factory_register_lookup);
+
+fn smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry() -> TestResult {
+    use crate::root_mount::{try_mount_root, RootMountError, __reset_for_test};
+    use crate::MountPoint;
+    use narf_capabilities::{Cap, Grant};
+    __reset_for_test();
+    // No FS factories registered → walker can't find a mount even
+    // if block devices have known FS magic.
+    let auth: Cap<MountPoint, Grant> = Cap::bootstrap();
+    match try_mount_root(&auth) {
+        Err(RootMountError::NoFactory(_)) | Err(RootMountError::NoMountable) => {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("no factories must NOT yield a mount"),
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("wrong error variant")
+        }
+    }
+}
+kernel_test_in!(
+    "filesystem/root_mount",
+    smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry
+);

@@ -1190,3 +1190,130 @@ kernel_test_in!(
     "block/partition",
     smoke_block_partition_scan_registers_gpt_partitions
 );
+
+// ── block/fs_detect ────────────────────────────────────────────────
+//
+// Each smoke builds a synthetic backing-block-device whose first few
+// LBAs carry the target FS's magic + minimal valid superblock, then
+// verifies detect_filesystem picks the right FsType.
+
+fn synthetic_block(payload: alloc::vec::Vec<u8>, lba_size: u32) -> alloc::sync::Arc<dyn crate::BlockDeviceSync> {
+    use alloc::sync::Arc;
+    // Pad to a multiple of lba_size.
+    let mut padded = payload;
+    let rem = padded.len() % lba_size as usize;
+    if rem != 0 {
+        padded.resize(padded.len() + (lba_size as usize - rem), 0);
+    }
+    Arc::new(VecBlock {
+        data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(padded)),
+        lba_size,
+    }) as Arc<dyn crate::BlockDeviceSync>
+}
+
+fn smoke_block_fs_detect_ext_via_magic_at_byte_1080() -> TestResult {
+    use crate::fs_detect::{detect_filesystem, FsType};
+    // Build a 4-LBA payload (2048 bytes) and put 0xEF53 at byte 1080.
+    let mut buf = alloc::vec![0u8; 4 * 512];
+    buf[1080..1082].copy_from_slice(&0xEF53u16.to_le_bytes());
+    let dev = synthetic_block(buf, 512);
+    match detect_filesystem(&dev) {
+        Ok(Some(FsType::Ext)) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("ext magic at byte 1080 not detected")
+        }
+    }
+}
+kernel_test_in!("block/fs_detect", smoke_block_fs_detect_ext_via_magic_at_byte_1080);
+
+fn smoke_block_fs_detect_fat_via_bpb_and_signature() -> TestResult {
+    use crate::fs_detect::{detect_filesystem, FsType};
+    // Minimal valid BPB:
+    //   [11..13] bytes_per_sec = 512
+    //   [13]     sec_per_clus = 8
+    //   [16]     num_fats = 2
+    //   [510..512] signature = 0xAA55
+    let mut buf = alloc::vec![0u8; 512];
+    buf[11..13].copy_from_slice(&512u16.to_le_bytes());
+    buf[13] = 8;
+    buf[16] = 2;
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+    let dev = synthetic_block(buf, 512);
+    match detect_filesystem(&dev) {
+        Ok(Some(FsType::Fat)) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("valid BPB not detected as FAT")
+        }
+    }
+}
+kernel_test_in!("block/fs_detect", smoke_block_fs_detect_fat_via_bpb_and_signature);
+
+fn smoke_block_fs_detect_exfat_via_oem_signature() -> TestResult {
+    use crate::fs_detect::{detect_filesystem, FsType};
+    let mut buf = alloc::vec![0u8; 512];
+    // exFAT OEM name at offset 3.
+    buf[3..11].copy_from_slice(b"EXFAT   ");
+    // Also write a valid 0xAA55 signature so the FAT probe ordering
+    // doesn't matter (exFAT probe must hit first).
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+    let dev = synthetic_block(buf, 512);
+    match detect_filesystem(&dev) {
+        Ok(Some(FsType::ExFat)) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("EXFAT OEM not detected")
+        }
+    }
+}
+kernel_test_in!("block/fs_detect", smoke_block_fs_detect_exfat_via_oem_signature);
+
+fn smoke_block_fs_detect_iso9660_via_cd001() -> TestResult {
+    use crate::fs_detect::{detect_filesystem, FsType};
+    // ISO9660: "CD001" at byte 16*2048 + 1.
+    let iso_byte = 16 * 2048 + 1;
+    let mut buf = alloc::vec![0u8; iso_byte + 5];
+    buf[iso_byte..iso_byte + 5].copy_from_slice(b"CD001");
+    let dev = synthetic_block(buf, 512);
+    match detect_filesystem(&dev) {
+        Ok(Some(FsType::Iso9660)) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("CD001 at LBA 64 not detected as ISO9660")
+        }
+    }
+}
+kernel_test_in!("block/fs_detect", smoke_block_fs_detect_iso9660_via_cd001);
+
+fn smoke_block_fs_detect_squashfs_via_magic() -> TestResult {
+    use crate::fs_detect::{detect_filesystem, FsType};
+    let mut buf = alloc::vec![0u8; 512];
+    // 'hsqs' little-endian.
+    buf[0..4].copy_from_slice(&[0x68, 0x73, 0x71, 0x73]);
+    let dev = synthetic_block(buf, 512);
+    match detect_filesystem(&dev) {
+        Ok(Some(FsType::SquashFs)) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("hsqs magic not detected as squashfs")
+        }
+    }
+}
+kernel_test_in!("block/fs_detect", smoke_block_fs_detect_squashfs_via_magic);
+
+fn smoke_block_fs_detect_returns_none_for_zero_disk() -> TestResult {
+    use crate::fs_detect::detect_filesystem;
+    let buf = alloc::vec![0u8; 4 * 512];
+    let dev = synthetic_block(buf, 512);
+    match detect_filesystem(&dev) {
+        Ok(None) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("all-zero disk must yield None, not a false-positive FS")
+        }
+    }
+}
+kernel_test_in!("block/fs_detect", smoke_block_fs_detect_returns_none_for_zero_disk);
