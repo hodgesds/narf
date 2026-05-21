@@ -68,6 +68,7 @@ pub mod affinity;
 pub mod budget;
 pub mod cpu_lifecycle;
 pub mod priority;
+pub mod stackful;
 
 mod tests;
 
