@@ -1135,7 +1135,15 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     // (i440FX) machine has no PCIe ECAM, only legacy CF8/CFC PCI
     // config IO, which the kernel's bus walker doesn't drive yet.
     cmd.arg("-machine").arg("q35");
-    cmd.arg("-cpu").arg("max");
+    // CPU model. Default `max` = union of every feature QEMU can
+    // emulate. Override via XTASK_CPU to reproduce a specific real
+    // silicon: `XTASK_CPU=EPYC-Rome` matches Zen2 (Renoir / Lucienne
+    // laptop CPUID), `XTASK_CPU=EPYC-Genoa` matches Zen4 (Phoenix
+    // HawkPoint1 laptop). Lets us catch "boots in -cpu max, faults
+    // on real silicon" bugs (missing NXE / Invariant TSC / SMEP
+    // enable etc.) without the burn-and-pray loop.
+    let cpu = std::env::var("XTASK_CPU").unwrap_or_else(|_| "max".into());
+    cmd.arg("-cpu").arg(&cpu);
     // Default -smp 8 so iso-boot exercises the multi-core AP
     // bring-up path; bumping past 2 catches AP-side bugs that
     // single-socket-dual-core misses (APIC-id gaps, init-order
