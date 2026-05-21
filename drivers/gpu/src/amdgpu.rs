@@ -983,10 +983,33 @@ fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendEr
     if !is_probed() {
         return Ok(());
     }
+    // 1. Snapshot the current Mode so resume re-programs it.
     let mode = with_controller(|d| d.current_mode());
     if let Some(Some(m)) = mode {
         *SAVED_MODE.lock() = Some(m);
     }
+    // 2. Tell the SMU to power-gate GFX. PPSMC_MSG_PowerDownGfx is
+    //    stable across Renoir (SMU 12.0) and Phoenix (SMU 13.0.4)
+    //    per crate::amdgpu_smu — no-op return value, void wrapper.
+    //
+    //    The PSP TMR is intentionally NOT torn down here: it
+    //    survives S3, and tearing it down would force a full
+    //    PSP-firmware-reload on resume (which needs the cap we
+    //    haven't stashed). Modern AMI BIOSes preserve TMR across
+    //    S3 so this is the right shape for the bring-up targets.
+    let _ = with_controller(|d| {
+        let mp1_base = match d.mp1_base() {
+            Some(b) => b,
+            None => return,
+        };
+        let mut adapter = SmuRegsAdapter { regs: &d.regs };
+        let _ = crate::amdgpu_smu::send_message_void(
+            &mut adapter,
+            mp1_base,
+            crate::amdgpu_smu::PPSMC_MSG_POWER_DOWN_GFX,
+            0,
+        );
+    });
     Ok(())
 }
 
@@ -994,12 +1017,39 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     if !is_probed() {
         return Ok(());
     }
+    // 1. Re-arm SMU mailbox with a TEST_MESSAGE echo. The PSP
+    //    TMR survived S3 so SMU firmware is still loaded; we
+    //    just need to confirm the mailbox is alive before the
+    //    next bring-up step issues real commands.
+    let _ = with_controller(|d| {
+        let mp1_base = d.mp1_base()?;
+        let mut adapter = SmuRegsAdapter { regs: &d.regs };
+        crate::amdgpu_smu::send_message_get(
+            &mut adapter,
+            mp1_base,
+            crate::amdgpu_smu::PPSMC_MSG_TEST_MESSAGE,
+            0xDEAD_BEEF,
+        )
+        .ok()
+    });
+    // 2. Tell SMU to power-up GFX before DCN re-init touches
+    //    display clocks. Inverse of the PowerDownGfx above.
+    let _ = with_controller(|d| {
+        let mp1_base = d.mp1_base()?;
+        let mut adapter = SmuRegsAdapter { regs: &d.regs };
+        crate::amdgpu_smu::send_message_void(
+            &mut adapter,
+            mp1_base,
+            crate::amdgpu_smu::PPSMC_MSG_POWER_UP_GFX,
+            0,
+        )
+        .ok()
+    });
+    // 3. Re-program the saved Mode. fw_loaded survived S3 (TMR
+    //    intact). Failures fall through — the next user-driven
+    //    modeset re-tries.
     let saved = *SAVED_MODE.lock();
     if let Some(mode) = saved {
-        // Best-effort re-program. set_mode requires fw_loaded;
-        // on S3 wake the platform restores PSP state so this
-        // typically holds. Failures fall through — the next
-        // user-driven modeset re-tries.
         let _ = with_controller_mut(|d| {
             // SAFETY: probe gave us BAR ownership, still held.
             unsafe { d.set_mode(mode) }
