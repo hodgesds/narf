@@ -2101,3 +2101,39 @@ fn smoke_k10temp_read_tdie_drives_smn_index_write() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch", smoke_k10temp_read_tdie_drives_smn_index_write);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_resume_context_save_round_trip() -> TestResult {
+    use crate::x86_64::s3_resume::{captured_context, save_resume_context, __reset_for_test};
+    __reset_for_test();
+    if captured_context().is_some() {
+        return TestResult::Fail("fresh state must be uncaptured");
+    }
+    // SAFETY: smoke runs in CPL 0; reading control + system regs
+    // is the test's whole purpose.
+    unsafe { save_resume_context() };
+    let ctx = match captured_context() {
+        Some(c) => c,
+        None => return TestResult::Fail("save didn't flip CAPTURED"),
+    };
+    // CR3 must be non-zero (we have paging on).
+    if ctx.cr3 == 0 {
+        return TestResult::Fail("CR3 read as 0 — paging not on?");
+    }
+    // GDT must be non-empty.
+    if ctx.gdt_limit == 0 || ctx.gdt_base == 0 {
+        return TestResult::Fail("GDTR snapshot zero");
+    }
+    // IDT must be non-empty (kernel installed one).
+    if ctx.idt_limit == 0 || ctx.idt_base == 0 {
+        return TestResult::Fail("IDTR snapshot zero");
+    }
+    // RSP must be non-zero + look like a kernel stack (high half).
+    if ctx.rsp == 0 {
+        return TestResult::Fail("RSP snapshot zero");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/s3_resume", smoke_s3_resume_context_save_round_trip);

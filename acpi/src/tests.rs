@@ -2737,3 +2737,22 @@ fn smoke_acpi_fan_registry_register_and_iterate() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("acpi/fan", smoke_acpi_fan_registry_register_and_iterate);
+
+// ── acpi/wake-vector arming ────────────────────────────────────────
+
+fn smoke_acpi_arm_s3_waking_vector_requires_facs() -> TestResult {
+    use crate::WakeVectorError;
+    // Without a parsed FACS, arming must error.
+    // (Other tests may have populated FACS; we can't reset it
+    // cleanly mid-suite. Use a dedicated path that checks the
+    // error type when the phys is zero.)
+    // Force-clear via the test setter to phys=0 (= "not parsed").
+    crate::__test_set_facs_phys(0);
+    // FACS_PARSED stays true from earlier tests — we test the
+    // FACS_PHYS=0 path which is also a Not-Parsed signal.
+    match unsafe { crate::arm_s3_waking_vector(0x1000_0000) } {
+        Err(WakeVectorError::FacsNotParsed) => TestResult::Pass,
+        _ => TestResult::Fail("FACS phys=0 must yield FacsNotParsed"),
+    }
+}
+kernel_test_in!("acpi/wake_vector", smoke_acpi_arm_s3_waking_vector_requires_facs);

@@ -35,7 +35,7 @@ pub mod smbios;
 
 mod tests;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::percpu::MAX_CPUS;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -5176,6 +5176,10 @@ static FACS_DATA: IrqSafeSpinLock<FacsInfo> = IrqSafeSpinLock::new(FacsInfo {
     version: 0,
 });
 static FACS_PARSED: AtomicBool = AtomicBool::new(false);
+/// FACS body phys address — cached by `parse_facs` so
+/// `arm_s3_waking_vector` can write back to it without re-walking
+/// the table chain. 0 means "FACS not parsed yet".
+static FACS_PHYS: AtomicU64 = AtomicU64::new(0);
 
 fn parse_facs_body(body: &[u8]) {
     // Layout (from offset 0 of the FACS body):
@@ -5263,6 +5267,7 @@ pub unsafe fn parse_facs(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
         return Err(AcpiError::BadXsdtSignature);
     }
     parse_facs_body(body);
+    FACS_PHYS.store(facs, Ordering::Release);
     FACS_PARSED.store(true, Ordering::Release);
     Ok(())
 }
@@ -5272,6 +5277,74 @@ pub fn facs_info() -> Option<FacsInfo> {
         return None;
     }
     Some(*FACS_DATA.lock())
+}
+
+/// Errors arming the S3 firmware-waking-vector.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WakeVectorError {
+    /// FACS hasn't been parsed yet — no phys address to write to.
+    FacsNotParsed,
+    /// Caller-supplied wake-entry phys is in the high 4 GiB but
+    /// the FACS reports `Version < 1`, which means the 64-bit
+    /// `XFirmwareWakingVector` slot doesn't exist.
+    EntryAbove4GButFacsV0,
+}
+
+/// Program the FACS firmware-waking-vector(s). After S3 entry,
+/// the platform firmware jumps to this phys on resume — for
+/// modern 64-bit BIOSes this is the long-mode entry point
+/// (written to `XFirmwareWakingVector`); for legacy 32-bit
+/// BIOSes it's the real-mode entry (written to
+/// `FirmwareWakingVector`).
+///
+/// We populate both slots so the same kernel image works on
+/// either firmware. The 32-bit slot expects a phys address
+/// below 1 MiB pointing at a real-mode trampoline; the 64-bit
+/// slot accepts any address and the CPU enters in long mode.
+///
+/// FACS must have been parsed via [`parse_facs`] beforehand.
+///
+/// # Safety
+/// `entry_phys` must point at a long-mode-callable entry that
+/// is alive across S3 (not paged out, not in user memory) and
+/// that handles its own context restoration.
+pub unsafe fn arm_s3_waking_vector(entry_phys: u64) -> Result<(), WakeVectorError> {
+    let facs = FACS_PHYS.load(Ordering::Acquire);
+    if facs == 0 || !FACS_PARSED.load(Ordering::Acquire) {
+        return Err(WakeVectorError::FacsNotParsed);
+    }
+    let version = FACS_DATA.lock().version;
+    if entry_phys > 0xFFFF_FFFF && version < 1 {
+        return Err(WakeVectorError::EntryAbove4GButFacsV0);
+    }
+    // 32-bit `FirmwareWakingVector` at offset +12.
+    // SAFETY: FACS is identity-mapped at `facs`; offset within the
+    // declared layout. Write low-32 of entry; high bits ignored
+    // by 32-bit-only firmware.
+    unsafe {
+        core::ptr::write_volatile((facs + 12) as *mut u32, entry_phys as u32);
+    }
+    if version >= 1 {
+        // 64-bit `XFirmwareWakingVector` at offset +24.
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile((facs + 24) as *mut u64, entry_phys);
+        }
+    }
+    // Reflect into the parsed snapshot so facs_info() agrees with
+    // the post-arm state.
+    let mut g = FACS_DATA.lock();
+    g.firmware_waking_vector_32 = entry_phys as u32;
+    if version >= 1 {
+        g.firmware_waking_vector_64 = entry_phys;
+    }
+    Ok(())
+}
+
+/// Test-only entry point so smokes can simulate parse + arm.
+#[doc(hidden)]
+pub fn __test_set_facs_phys(phys: u64) {
+    FACS_PHYS.store(phys, Ordering::Release);
 }
 
 #[doc(hidden)]
