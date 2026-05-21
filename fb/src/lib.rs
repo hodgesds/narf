@@ -820,32 +820,25 @@ pub fn register_initcalls() {
             init_pump_writer(pump_writer);
             narf_userspace::handlers::sleep_pumps::register(fb_drain_pump);
         }
-        let task = drain_task::DrainTask::new(writer);
-        let _ = narf_scheduler::spawn(task);
+        // BRINGUP-DISABLED: the drain task busy-polls a command
+        // ring that QEMU services synchronously but real-HW MMIO
+        // doesn't. Suspected of wedging the executor before init
+        // gets polled. Re-enable once the drain loop has a real
+        // Pending-yield path.
+        let _ = writer;
+        // let task = drain_task::DrainTask::new(writer);
+        // let _ = narf_scheduler::spawn(task);
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-status-refresh", || {
         if select_active().is_none() {
             return InitResult::NotPresent;
         }
-        let cap = bootstrap_writer();
-        let writer = match FbWriter::new(cap) {
-            Ok(w) => w,
-            Err(_) => return InitResult::Error("FbWriter::new"),
-        };
-        // Refresh the status panel periodically so the diagnostic
-        // slots written by background drivers (USB enumeration,
-        // etc.) actually appear on screen. paint() is idempotent
-        // and re-rendering at ~4 Hz is invisible to users while
-        // staying current enough to catch transient failures.
-        narf_scheduler::spawn(async move {
-            loop {
-                status::paint(&writer);
-                // ~250 ms between repaints (4 Hz). Boot-time
-                // diagnostic refresh; not a hot path.
-                narf_time::sleep_cycles(800_000_000).await;
-            }
-        });
+        // BRINGUP-DISABLED: periodic status-panel repaint sleeps
+        // on `narf_time::sleep_cycles` which depends on the HPET
+        // wheel + LAPIC-timer-driven wake. On real silicon those
+        // may not deliver the way QEMU does. Suspected starving
+        // init by busy-looping if sleep never resolves.
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-cursor-pump", || {
@@ -856,17 +849,16 @@ pub fn register_initcalls() {
         // busy-wait so the pointer keeps moving while a user
         // task is parked.
         narf_userspace::handlers::sleep_pumps::register(cursor::sleep_pump_tick);
-        // Spawn the async cursor pump task. Survives because
-        // bare_main no longer re-inits the scheduler after
-        // Stage::Late (the redundant second init() that used to
-        // wipe Stage::Late spawns is gone; init() now panics on
-        // double-call so this can't silently regress).
-        let cap = bootstrap_writer();
-        let writer = match FbWriter::new(cap) {
-            Ok(w) => w,
-            Err(_) => return InitResult::Error("FbWriter::new"),
-        };
-        let _ = narf_scheduler::spawn(cursor::pump(writer));
+        // BRINGUP-DISABLED: cursor pump's pop_pointer loop reads
+        // from the input ring and re-polls. Suspected of not
+        // yielding cleanly on real silicon when the input ring
+        // stays empty for an extended period.
+        // let cap = bootstrap_writer();
+        // let writer = match FbWriter::new(cap) {
+        //     Ok(w) => w,
+        //     Err(_) => return InitResult::Error("FbWriter::new"),
+        // };
+        // let _ = narf_scheduler::spawn(cursor::pump(writer));
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {

@@ -197,25 +197,11 @@ pub fn register_initcalls() {
         }
     });
     narf_init::register(Stage::Late, "power-monitor", || {
-        narf_scheduler::spawn(async move {
-            let _ = writeln!(narf_console::Writer, "  power-monitor: starting background telemetry...");
-            loop {
-                let sources = list_sources();
-                for src in sources {
-                    let pct = src.capacity_percent();
-                    let charging = if src.is_charging() { " (charging)" } else { "" };
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  power: {} is at {}%{}",
-                        src.name(),
-                        pct,
-                        charging
-                    );
-                }
-                // Sleep for 30 seconds (assumed 1GHz clock for now).
-                narf_time::sleep_cycles(30_000_000_000).await;
-            }
-        });
+        // BRINGUP-DISABLED: sleep_cycles depends on the timer
+        // wheel waking via LAPIC tick. On real silicon the wake
+        // path may not fire, leaving this task in Pending forever
+        // OR busy-polling the sleep deadline. Re-enable once the
+        // sleep machinery is real-HW validated.
         InitResult::Ok
     });
 }
