@@ -32,6 +32,7 @@ pub mod superblock;
 pub mod group_desc;
 pub mod inode;
 pub mod dir;
+pub mod extent;
 pub mod volume;
 pub mod node;
 

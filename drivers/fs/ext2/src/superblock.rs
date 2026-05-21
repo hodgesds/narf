@@ -14,6 +14,90 @@
 
 use super::EXT2_SUPER_MAGIC;
 
+// ── Feature-flag constants (ext2/3/4 §1.1.2 in the e2fsprogs spec) ──
+
+/// `s_feature_compat` bits — we tolerate any bit set here; the
+/// driver ignores compat features it doesn't implement.
+pub mod compat {
+    pub const DIR_PREALLOC: u32 = 0x0001;
+    pub const IMAGIC_INODES: u32 = 0x0002;
+    /// HAS_JOURNAL — turns an ext2 volume into ext3.
+    pub const HAS_JOURNAL: u32 = 0x0004;
+    pub const EXT_ATTR: u32 = 0x0008;
+    pub const RESIZE_INODE: u32 = 0x0010;
+    pub const DIR_INDEX: u32 = 0x0020;
+}
+
+/// `s_feature_incompat` bits — if any unknown bit is set the
+/// driver MUST refuse to mount (per the ext4 spec contract).
+pub mod incompat {
+    pub const COMPRESSION: u32 = 0x0001;
+    pub const FILETYPE: u32 = 0x0002;
+    pub const RECOVER: u32 = 0x0004;
+    pub const JOURNAL_DEV: u32 = 0x0008;
+    pub const META_BG: u32 = 0x0010;
+    /// HAS_EXTENTS — file blocks via extent trees instead of
+    /// indirect blocks. ext4-defining.
+    pub const EXTENTS: u32 = 0x0040;
+    /// 64BIT — block counts span more than 32 bits; group
+    /// descriptors are 64 bytes.
+    pub const SIXTYFOURBIT: u32 = 0x0080;
+    pub const MMP: u32 = 0x0100;
+    pub const FLEX_BG: u32 = 0x0200;
+    pub const EA_INODE: u32 = 0x0400;
+    pub const DIRDATA: u32 = 0x1000;
+    pub const CSUM_SEED: u32 = 0x2000;
+    pub const LARGEDIR: u32 = 0x4000;
+    pub const INLINE_DATA: u32 = 0x8000;
+    pub const ENCRYPT: u32 = 0x1_0000;
+    pub const CASEFOLD: u32 = 0x2_0000;
+
+    /// What this driver actually knows how to handle. Any bit set
+    /// in the superblock that ISN'T in this mask means we refuse to
+    /// mount (the volume uses a feature we'd misinterpret).
+    pub const SUPPORTED: u32 = FILETYPE | EXTENTS | SIXTYFOURBIT | FLEX_BG | RECOVER;
+}
+
+/// `s_feature_ro_compat` bits — if any unknown bit is set the
+/// driver MUST refuse RW mounts but MAY allow RO mounts.
+pub mod ro_compat {
+    pub const SPARSE_SUPER: u32 = 0x0001;
+    pub const LARGE_FILE: u32 = 0x0002;
+    pub const BTREE_DIR: u32 = 0x0004;
+    pub const HUGE_FILE: u32 = 0x0008;
+    pub const GDT_CSUM: u32 = 0x0010;
+    pub const DIR_NLINK: u32 = 0x0020;
+    pub const EXTRA_ISIZE: u32 = 0x0040;
+    pub const QUOTA: u32 = 0x0100;
+    pub const BIGALLOC: u32 = 0x0200;
+    pub const METADATA_CSUM: u32 = 0x0400;
+    pub const READONLY: u32 = 0x1000;
+    pub const PROJECT: u32 = 0x2000;
+    pub const VERITY: u32 = 0x8000;
+}
+
+/// What flavour of the ext family a superblock represents. Driver
+/// dispatch (extent vs indirect-block reads, journal replay vs none,
+/// etc.) keys on this.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExtFlavour {
+    /// Original ext2 — no journal, indirect-block addressing.
+    Ext2,
+    /// ext2 + journaling (`HAS_JOURNAL` compat flag, no extents).
+    Ext3,
+    /// ext3 + extents (the `EXTENTS` incompat flag is set, or 64BIT,
+    /// or any other ext4-only incompat feature).
+    Ext4,
+}
+
+/// Errors during feature inspection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FeatureError {
+    /// `s_feature_incompat` has a bit set we don't recognise; the
+    /// volume uses a feature we'd misinterpret if we mounted.
+    UnsupportedIncompat(u32),
+}
+
 /// Decoded ext2 superblock — the subset of fields this driver
 /// actually uses. We deliberately do _not_ use `#[repr(C, packed)]`
 /// for the full 1024-byte super-block because we only need a dozen
@@ -46,6 +130,24 @@ pub struct Superblock {
     /// `s_inode_size` — bytes per inode. Fixed at 128 on rev-0
     /// volumes; on rev-1 the field is meaningful and may be 256+.
     pub inode_size: u16,
+    /// `s_feature_compat` (byte 92) — backwards-compatible features.
+    /// `HAS_JOURNAL` here distinguishes ext3+ from ext2.
+    pub feature_compat: u32,
+    /// `s_feature_incompat` (byte 96) — features the driver MUST
+    /// understand. Any bit outside [`incompat::SUPPORTED`] forces
+    /// us to refuse the mount.
+    pub feature_incompat: u32,
+    /// `s_feature_ro_compat` (byte 100) — bits the driver MUST
+    /// understand to write to the volume. Read-only mounts MAY
+    /// proceed when unknown bits are set.
+    pub feature_ro_compat: u32,
+    /// `s_blocks_count_hi` (byte 336, ext4 64BIT only). When the
+    /// 64BIT incompat bit is set, the effective block count is
+    /// `(blocks_count_hi << 32) | blocks_count`.
+    pub blocks_count_hi: u32,
+    /// `s_desc_size` (byte 254) — bytes per group descriptor. 32
+    /// for ext2/3, 64 for ext4 with 64BIT. Zero on legacy SBs.
+    pub desc_size: u16,
 }
 
 impl Superblock {
@@ -68,10 +170,43 @@ impl Superblock {
         let blocks_per_group = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
         let inodes_per_group = u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]);
         let rev_level = u32::from_le_bytes([buf[76], buf[77], buf[78], buf[79]]);
-        let inode_size = if rev_level >= 1 {
+        let inode_size = if rev_level >= 1 && buf.len() >= 90 {
             u16::from_le_bytes([buf[88], buf[89]])
         } else {
             128
+        };
+        // Feature flags + ext4 extensions live in the rev-1 dynamic
+        // tail of the superblock (bytes 84+). On rev-0 volumes
+        // they're all zero so reading conservatively works.
+        let feature_compat = if buf.len() >= 96 {
+            u32::from_le_bytes([buf[92], buf[93], buf[94], buf[95]])
+        } else {
+            0
+        };
+        let feature_incompat = if buf.len() >= 100 {
+            u32::from_le_bytes([buf[96], buf[97], buf[98], buf[99]])
+        } else {
+            0
+        };
+        let feature_ro_compat = if buf.len() >= 104 {
+            u32::from_le_bytes([buf[100], buf[101], buf[102], buf[103]])
+        } else {
+            0
+        };
+        let desc_size = if buf.len() >= 256 {
+            u16::from_le_bytes([buf[254], buf[255]])
+        } else {
+            0
+        };
+        // s_blocks_count_hi is in the 64-bit-only extended section
+        // (byte 336). Reading only when present + when 64BIT bit
+        // says it's meaningful.
+        let blocks_count_hi = if buf.len() >= 340
+            && feature_incompat & incompat::SIXTYFOURBIT != 0
+        {
+            u32::from_le_bytes([buf[336], buf[337], buf[338], buf[339]])
+        } else {
+            0
         };
 
         Some(Self {
@@ -84,7 +219,70 @@ impl Superblock {
             magic,
             rev_level,
             inode_size,
+            feature_compat,
+            feature_incompat,
+            feature_ro_compat,
+            blocks_count_hi,
+            desc_size,
         })
+    }
+
+    /// Classify the volume's flavour. Tracks ext-family evolution:
+    /// HAS_JOURNAL bit promotes ext2 → ext3; any ext4-only incompat
+    /// bit (EXTENTS / 64BIT / FLEX_BG / etc.) promotes further to ext4.
+    pub fn flavour(&self) -> ExtFlavour {
+        const EXT4_INCOMPAT_MASK: u32 = incompat::EXTENTS
+            | incompat::SIXTYFOURBIT
+            | incompat::FLEX_BG
+            | incompat::EA_INODE
+            | incompat::INLINE_DATA
+            | incompat::LARGEDIR;
+        if self.feature_incompat & EXT4_INCOMPAT_MASK != 0 {
+            ExtFlavour::Ext4
+        } else if self.feature_compat & compat::HAS_JOURNAL != 0 {
+            ExtFlavour::Ext3
+        } else {
+            ExtFlavour::Ext2
+        }
+    }
+
+    /// Verify the driver supports every `feature_incompat` bit set.
+    /// Returns `UnsupportedIncompat(unknown_bits)` if not.
+    /// Mount paths gate on this — refusing rather than corrupting.
+    pub fn check_incompat_features(&self) -> Result<(), FeatureError> {
+        let unknown = self.feature_incompat & !incompat::SUPPORTED;
+        if unknown != 0 {
+            return Err(FeatureError::UnsupportedIncompat(unknown));
+        }
+        Ok(())
+    }
+
+    /// True iff the volume uses extent trees (vs ext2's indirect
+    /// block pointers). Inode 0x80 i_flags carries a per-file
+    /// extents bit too, but the volume-wide
+    /// `feature_incompat::EXTENTS` is what tells the driver to even
+    /// look at the eh_magic header.
+    pub fn uses_extents(&self) -> bool {
+        self.feature_incompat & incompat::EXTENTS != 0
+    }
+
+    /// Effective 64-bit block count. On 32-bit (ext2/3) volumes the
+    /// high half is zero so this returns just `blocks_count`.
+    pub fn total_blocks(&self) -> u64 {
+        ((self.blocks_count_hi as u64) << 32) | self.blocks_count as u64
+    }
+
+    /// Effective group-descriptor size in bytes. 32 on ext2/3,
+    /// 64 on ext4 with 64BIT. Falls back to 32 when `desc_size`
+    /// is zero on a legacy superblock.
+    pub fn effective_desc_size(&self) -> usize {
+        if self.feature_incompat & incompat::SIXTYFOURBIT != 0
+            && self.desc_size >= 64
+        {
+            self.desc_size as usize
+        } else {
+            32
+        }
     }
 
     /// Block size in bytes — `1024 << s_log_block_size`. The minimum

@@ -492,3 +492,233 @@ kernel_test_in!("drivers/fs/ext2", smoke_ext2_read_partial_offset);
 fn _force_referenced() -> Vec<String> {
     Vec::new()
 }
+
+// ── ext3/4 feature detection + flavour ─────────────────────────────
+
+fn smoke_ext_flavour_classifies_ext2_ext3_ext4() -> TestResult {
+    use crate::superblock::{compat, incompat, ExtFlavour, Superblock};
+    // Build a minimal superblock buffer (rev-1, with feature fields).
+    let mut buf = alloc::vec![0u8; 512];
+    // s_magic at offset 56.
+    buf[56..58].copy_from_slice(&0xEF53u16.to_le_bytes());
+    // s_rev_level = 1 (dynamic).
+    buf[76..80].copy_from_slice(&1u32.to_le_bytes());
+    // s_inode_size = 128.
+    buf[88..90].copy_from_slice(&128u16.to_le_bytes());
+
+    // Plain ext2: all feature flags zero.
+    let sb = Superblock::parse(&buf).expect("parse");
+    if sb.flavour() != ExtFlavour::Ext2 {
+        return TestResult::Fail("zero features must classify as Ext2");
+    }
+    // ext3: HAS_JOURNAL compat bit set.
+    buf[92..96].copy_from_slice(&compat::HAS_JOURNAL.to_le_bytes());
+    let sb = Superblock::parse(&buf).expect("parse");
+    if sb.flavour() != ExtFlavour::Ext3 {
+        return TestResult::Fail("HAS_JOURNAL must classify as Ext3");
+    }
+    // ext4: EXTENTS incompat bit set.
+    buf[96..100].copy_from_slice(&incompat::EXTENTS.to_le_bytes());
+    let sb = Superblock::parse(&buf).expect("parse");
+    if sb.flavour() != ExtFlavour::Ext4 {
+        return TestResult::Fail("EXTENTS must classify as Ext4");
+    }
+    // ext4 path is sticky even with HAS_JOURNAL.
+    buf[92..96].copy_from_slice(&compat::HAS_JOURNAL.to_le_bytes());
+    let sb = Superblock::parse(&buf).expect("parse");
+    if sb.flavour() != ExtFlavour::Ext4 {
+        return TestResult::Fail("EXTENTS+HAS_JOURNAL must still be Ext4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext_flavour_classifies_ext2_ext3_ext4);
+
+fn smoke_ext_check_incompat_rejects_unknown_features() -> TestResult {
+    use crate::superblock::{incompat, FeatureError, Superblock};
+    let mut buf = alloc::vec![0u8; 512];
+    buf[56..58].copy_from_slice(&0xEF53u16.to_le_bytes());
+    buf[76..80].copy_from_slice(&1u32.to_le_bytes());
+    // ENCRYPT bit (0x10000) — driver doesn't support, must reject.
+    buf[96..100].copy_from_slice(&incompat::ENCRYPT.to_le_bytes());
+    let sb = Superblock::parse(&buf).expect("parse");
+    match sb.check_incompat_features() {
+        Err(FeatureError::UnsupportedIncompat(bits))
+            if bits & incompat::ENCRYPT != 0 =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("ENCRYPT incompat must trigger rejection"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext_check_incompat_rejects_unknown_features);
+
+fn smoke_ext_64bit_block_count_combines_lo_and_hi() -> TestResult {
+    use crate::superblock::{incompat, Superblock};
+    let mut buf = alloc::vec![0u8; 1024];
+    buf[56..58].copy_from_slice(&0xEF53u16.to_le_bytes());
+    buf[76..80].copy_from_slice(&1u32.to_le_bytes());
+    // s_blocks_count = 0x1000_0000
+    buf[4..8].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+    // s_feature_incompat = 64BIT
+    buf[96..100].copy_from_slice(&incompat::SIXTYFOURBIT.to_le_bytes());
+    // s_blocks_count_hi = 0x0000_0042 at byte 336.
+    buf[336..340].copy_from_slice(&0x0000_0042u32.to_le_bytes());
+    let sb = Superblock::parse(&buf).expect("parse");
+    let expected = (0x0000_0042u64 << 32) | 0x1000_0000u64;
+    if sb.total_blocks() != expected {
+        return TestResult::Fail("64-bit block count not assembled correctly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext_64bit_block_count_combines_lo_and_hi);
+
+// ── ext4 extent parser ─────────────────────────────────────────────
+
+fn smoke_ext4_extent_header_parse_and_leaf_translate() -> TestResult {
+    use crate::extent::{
+        lookup_in_node, ExtentHeader, ExtentLeaf, LookupOutcome, EXT4_EXTENT_MAGIC,
+    };
+    // Build a leaf node: 1 extent mapping logical [100..120) →
+    // physical [5_000..5_020).
+    let mut buf = alloc::vec![0u8; 12 + 12];
+    // Header.
+    buf[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries=1
+    buf[4..6].copy_from_slice(&4u16.to_le_bytes()); // max=4
+    buf[6..8].copy_from_slice(&0u16.to_le_bytes()); // depth=0 leaf
+    // Leaf entry.
+    buf[12..16].copy_from_slice(&100u32.to_le_bytes()); // logical=100
+    buf[16..18].copy_from_slice(&20u16.to_le_bytes()); // len=20
+    buf[18..20].copy_from_slice(&0u16.to_le_bytes()); // start_hi=0
+    buf[20..24].copy_from_slice(&5_000u32.to_le_bytes()); // start_lo=5000
+
+    let h = ExtentHeader::parse(&buf).expect("header");
+    if h.entries != 1 || h.depth != 0 {
+        return TestResult::Fail("header decode wrong");
+    }
+    let leaf = ExtentLeaf::parse(&buf[12..24]).expect("leaf");
+    if leaf.translate(110) != Some(5_010) {
+        return TestResult::Fail("translate(110) must yield 5010");
+    }
+    // Lookup-in-node: 110 → Mapped { physical: 5010 }.
+    match lookup_in_node(&buf, 110) {
+        LookupOutcome::Mapped { physical: 5_010, is_uninitialized: false } => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("lookup_in_node didn't yield Mapped(5010)");
+        }
+    }
+    // Logical 200 falls past the only extent → Hole.
+    match lookup_in_node(&buf, 200) {
+        LookupOutcome::Hole => {}
+        _ => return TestResult::Fail("past-EOF must yield Hole"),
+    }
+    // Logical 50 falls before the first extent → Hole.
+    match lookup_in_node(&buf, 50) {
+        LookupOutcome::Hole => {}
+        _ => return TestResult::Fail("pre-first-extent must yield Hole"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_header_parse_and_leaf_translate);
+
+fn smoke_ext4_extent_uninitialized_marker_propagates() -> TestResult {
+    use crate::extent::{lookup_in_node, LookupOutcome, EXT4_EXTENT_MAGIC};
+    let mut buf = alloc::vec![0u8; 24];
+    buf[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+    buf[4..6].copy_from_slice(&4u16.to_le_bytes());
+    // Leaf with high bit of len set → uninitialized.
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+    buf[16..18].copy_from_slice(&(0x8000u16 | 10u16).to_le_bytes()); // uninit, len=10
+    buf[20..24].copy_from_slice(&7_000u32.to_le_bytes());
+    match lookup_in_node(&buf, 5) {
+        LookupOutcome::Mapped { physical: 7_005, is_uninitialized: true } => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("uninit bit must propagate through Mapped"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_uninitialized_marker_propagates);
+
+fn smoke_ext4_extent_index_returns_deeper_lookup() -> TestResult {
+    use crate::extent::{lookup_in_node, LookupOutcome, EXT4_EXTENT_MAGIC};
+    // Build an INDEX node with one index pointing at child block 99.
+    let mut buf = alloc::vec![0u8; 24];
+    buf[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+    buf[4..6].copy_from_slice(&4u16.to_le_bytes());
+    buf[6..8].copy_from_slice(&1u16.to_le_bytes()); // depth=1 → index
+    // Index: logical=0, leaf=99.
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&99u32.to_le_bytes());
+    match lookup_in_node(&buf, 50) {
+        LookupOutcome::DeeperLookupRequired { child_block: 99 } => TestResult::Pass,
+        _ => TestResult::Fail("index node must yield DeeperLookupRequired"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_index_returns_deeper_lookup);
+
+fn smoke_ext4_extent_corrupt_header_yields_error() -> TestResult {
+    use crate::extent::{lookup_in_node, LookupOutcome};
+    let buf = alloc::vec![0u8; 24]; // magic == 0 — invalid
+    match lookup_in_node(&buf, 0) {
+        LookupOutcome::Corrupt => TestResult::Pass,
+        _ => TestResult::Fail("zero magic must yield Corrupt"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_corrupt_header_yields_error);
+
+// ── 64-bit group descriptors ───────────────────────────────────────
+
+fn smoke_ext4_group_desc_64byte_assembles_hi_lo_fields() -> TestResult {
+    use crate::group_desc::{GroupDesc, GROUP_DESC_SIZE_64BIT};
+    let mut buf = alloc::vec![0u8; GROUP_DESC_SIZE_64BIT];
+    // Low 32 of block_bitmap.
+    buf[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    // Low 32 of inode_bitmap.
+    buf[4..8].copy_from_slice(&0xABCD_EF01u32.to_le_bytes());
+    // Low 32 of inode_table.
+    buf[8..12].copy_from_slice(&0x0F0F_0F0Fu32.to_le_bytes());
+    // _hi fields.
+    buf[32..36].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // block_bitmap_hi
+    buf[36..40].copy_from_slice(&0x0000_0002u32.to_le_bytes()); // inode_bitmap_hi
+    buf[40..44].copy_from_slice(&0x0000_0003u32.to_le_bytes()); // inode_table_hi
+    let gd = GroupDesc::parse_sized(&buf, GROUP_DESC_SIZE_64BIT).expect("parse");
+    if gd.block_bitmap != (1u64 << 32) | 0x1234_5678 {
+        return TestResult::Fail("block_bitmap hi/lo not assembled");
+    }
+    if gd.inode_bitmap != (2u64 << 32) | 0xABCD_EF01 {
+        return TestResult::Fail("inode_bitmap hi/lo not assembled");
+    }
+    if gd.inode_table != (3u64 << 32) | 0x0F0F_0F0F {
+        return TestResult::Fail("inode_table hi/lo not assembled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_group_desc_64byte_assembles_hi_lo_fields);
+
+fn smoke_ext4_group_desc_32byte_legacy_path_unchanged() -> TestResult {
+    use crate::group_desc::GroupDesc;
+    // Same ext2-shape descriptor: 32 bytes, no _hi fields. Should
+    // decode the low 32 bits as u32 ext2 always did.
+    let mut buf = alloc::vec![0u8; 32];
+    buf[0..4].copy_from_slice(&100u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&101u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&102u32.to_le_bytes());
+    buf[12..14].copy_from_slice(&50u16.to_le_bytes());
+    buf[14..16].copy_from_slice(&60u16.to_le_bytes());
+    buf[16..18].copy_from_slice(&3u16.to_le_bytes());
+    let gd = GroupDesc::parse(&buf).expect("parse");
+    if gd.block_bitmap != 100 || gd.inode_bitmap != 101 || gd.inode_table != 102 {
+        return TestResult::Fail("ext2-shape block addresses lost");
+    }
+    if gd.free_blocks_count != 50 || gd.free_inodes_count != 60 {
+        return TestResult::Fail("counts lost");
+    }
+    if gd.used_dirs_count != 3 {
+        return TestResult::Fail("used_dirs_count lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_group_desc_32byte_legacy_path_unchanged);
