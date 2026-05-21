@@ -478,6 +478,29 @@ where
     id
 }
 
+/// Spawn a task that runs on its own dedicated kernel stack
+/// (16 KiB default). The future's `poll` is driven via
+/// `kernel_switch` instead of being called directly on the
+/// executor's stack — phase 1 of the preemptive scheduler arc
+/// per `scheduler/specification/preemption.md`.
+///
+/// On its own, this gives no preemption: a busy-loop inside the
+/// future's poll still wedges the executor. Phase 2 (timer-
+/// driven preemption) is what catches busy-loops; this entry
+/// point sets up the per-task stack the ISR needs to save state
+/// into. Migrate suspect-busy-loop kernel tasks (FB cursor pump,
+/// drain task, USB HID supervisor, etc.) from `spawn()` to this
+/// once phase 2 lands.
+///
+/// Same return + queueing semantics as `spawn()` — caller gets
+/// back a TaskId.
+pub fn spawn_stackful<F>(f: F) -> TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn(stackful::StackfulAdapter::new(f))
+}
+
 /// Shorthand: spawn a task with a budget cap + the default everywhere-
 /// affinity.
 pub fn spawn_budgeted<F>(f: F, budget: ResourceBudget, cap: Cap<CpuBudget, Spend>) -> TaskId

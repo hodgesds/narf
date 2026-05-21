@@ -312,6 +312,73 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     }
 }
 
+// ── Cooperative-executor adapter ──────────────────────────────────
+//
+// Wraps a `KernelTask` in a `Future` so the existing
+// `run_until_empty` cooperative executor can drive it without
+// any restructuring. The adapter's `poll()` allocates an
+// `exec_ctx` on the cooperative executor's stack, switches into
+// the stackful task, and forwards whatever the task returned.
+//
+// Phase 1c: this plumbing alone does NOT preempt busy-loops —
+// if the inner future busy-loops on the task's stack we still
+// wedge. Phase 2 (timer-driven preemption) is what wins; this
+// adapter sets up the structural slot the timer ISR will use to
+// find the task and save its trap-frame state into.
+
+/// Future that drives a `KernelTask` from inside the cooperative
+/// executor. Spawned via `spawn_stackful` — `Future` impl below
+/// just calls `poll_to_yield` and forwards the result.
+pub struct StackfulAdapter {
+    inner: Box<KernelTask>,
+}
+
+impl core::fmt::Debug for StackfulAdapter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StackfulAdapter")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl StackfulAdapter {
+    pub fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            inner: KernelTask::new(future),
+        }
+    }
+}
+
+impl Future for StackfulAdapter {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: `Self` is structurally pinned, but we never
+        // move `inner` (it's behind a `Box`); we re-borrow as
+        // `&mut` to call `poll_to_yield`. The exec_ctx lives on
+        // the executor's stack frame for the duration of this
+        // poll — the task switches back before `poll` returns,
+        // so exec_ctx never escapes.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let this = unsafe { self.get_unchecked_mut() };
+            let mut exec_ctx = KernelContext::default();
+            // SAFETY: single-threaded; this poll() is the only
+            // active caller of this KernelTask.
+            unsafe { this.inner.poll_to_yield(&mut exec_ctx) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64 has no kernel_ctx primitive yet — fall
+            // back to immediate completion. Phase 2 + arm64
+            // port follows the same shape.
+            Poll::Ready(())
+        }
+    }
+}
+
 // Tests are inline below — same gating as the kernel_ctx smokes.
 
 #[cfg(any(test, feature = "kernel-test"))]
