@@ -284,8 +284,17 @@ pub fn firmware_filename_ladder(chip: &ChipConfig) -> Vec<String> {
         // matches the core-numbering family.
         let mut api = chip.api_max;
         loop {
+            // Bundle prefix matches `xtask import-firmware`'s
+            // staging layout, which preserves Linux's
+            // `/lib/firmware/<vendor>/...` subdirectory under
+            // `target/firmware/`. The kernel's
+            // `firmware-scan-initramfs` initcall registers each
+            // blob under its full path-relative-to-`firmware/`,
+            // so we look up `iwlwifi/iwlwifi-...` (matching
+            // `/lib/firmware/iwlwifi/iwlwifi-...`) not just the
+            // bare filename.
             out.push(format!(
-                "iwlwifi-{}-{}-{}.ucode",
+                "iwlwifi/iwlwifi-{}-{}-{}.ucode",
                 chip.mac.prefix(),
                 rf.prefix(),
                 api,
