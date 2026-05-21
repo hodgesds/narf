@@ -302,6 +302,35 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         for slot in 0..16u32 {
             narf_memory::beacon::paint_at(slot, 4, color);
         }
+
+        // Hex diagnostics — font-free bar-height encoding so they're
+        // legible on any FB regardless of GTK scaling / panel font.
+        // Each row is 16 slots × 4-bit nibble = one u64 value MS→LS:
+        //   row 5: RIP                  (where it faulted)
+        //   row 6: CR2 (only if #PF)    (what addr it touched)
+        //   row 7: error_code           (selector / PF flags)
+        // Even bytes = bright fg colour, odd bytes = darker variant
+        // so you can group nibble-pairs into bytes visually.
+        let bg = 0x00_10_10_10; // near-black grid background
+        let (fg_e, fg_o) = match frame.vector {
+            6  => (0x00_FF_60_60, 0x00_A0_30_30), // #UD reds
+            13 => (0x00_FF_C0_60, 0x00_A0_70_30), // #GP oranges
+            14 => (0x00_FF_FF_60, 0x00_A0_A0_30), // #PF yellows
+            8  => (0x00_FF_60_FF, 0x00_A0_30_A0), // #DF magentas
+            18 => (0x00_60_60_FF, 0x00_30_30_A0), // #MC blues
+            _  => (0x00_FF_FF_FF, 0x00_80_80_80), // generic
+        };
+        narf_memory::beacon::paint_u64_hex(0, 5, frame.rip, fg_e, fg_o, bg);
+        if frame.vector == 14 {
+            let cr2: u64;
+            // SAFETY: reading CR2 at CPL=0 is always defined.
+            unsafe {
+                core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
+                options(nostack, preserves_flags));
+            }
+            narf_memory::beacon::paint_u64_hex(0, 6, cr2, fg_e, fg_o, bg);
+        }
+        narf_memory::beacon::paint_u64_hex(0, 7, frame.error_code, fg_e, fg_o, bg);
     }
     // Lock-free TrapWriter: the original faulting code may already
     // hold `CONSOLE.lock` (e.g. it faulted mid-`write_str`); a

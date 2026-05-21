@@ -155,6 +155,78 @@ pub fn paint_at(slot_idx: u32, row_idx: u32, color: u32) {
     // that wasn't the actual bug and removing it doesn't matter.
 }
 
+/// Paint a vertical bar inside slot `(slot_idx, row_idx)` whose
+/// height (1..=16 px) encodes a hex nibble. The whole 32×16 slot is
+/// cleared to `bg` first, then a 32-wide bar `nibble+1` px tall is
+/// drawn in `fg` flush against the slot's BOTTOM. Read across a row
+/// of nibble bars like a histogram: 0 = thin sliver, F = full slot.
+///
+/// Font-free by design — works on any FB the firmware handed us,
+/// regardless of console font scaling / GTK pixel-doubling /
+/// whatever else might make text unreadable on the target panel.
+#[inline(never)]
+pub fn paint_nibble(slot_idx: u32, row_idx: u32, nibble: u8, fg: u32, bg: u32) {
+    let phys = FB_PHYS.load(Ordering::Acquire);
+    if phys == 0 {
+        return;
+    }
+    let ceiling = FB_PHYS_CEILING.load(Ordering::Acquire);
+    if ceiling != 0 && phys >= ceiling {
+        return;
+    }
+    let stride = FB_STRIDE_PX.load(Ordering::Acquire) as u64;
+    let width = FB_WIDTH.load(Ordering::Acquire);
+    let height = FB_HEIGHT.load(Ordering::Acquire);
+    let slot_w: u32 = 32;
+    let slot_h: u32 = 16;
+    let gap: u32 = 4;
+    let row_pitch: u32 = slot_h + gap;
+    let x0 = slot_idx * (slot_w + gap);
+    let y0 = row_idx * row_pitch;
+    if x0 >= width || y0 >= height {
+        return;
+    }
+    let x1 = (x0 + slot_w).min(width);
+    let y1 = (y0 + slot_h).min(height);
+    let nib = (nibble & 0xF) as u32 + 1; // 1..=16, never empty
+    let bar_top = y1.saturating_sub(nib);
+    let base = phys as *mut u32;
+    for y in y0..y1 {
+        let row_color = if y >= bar_top { fg } else { bg };
+        for x in x0..x1 {
+            let off = (y as u64) * stride + (x as u64);
+            // SAFETY: bounds checked against width/height/stride above;
+            // FB is identity-mapped per registrar contract.
+            unsafe {
+                base.add(off as usize).write_volatile(row_color);
+            }
+        }
+    }
+}
+
+/// Paint `value` as 16 hex nibbles, MS-first, starting at
+/// `(start_slot, row_idx)`. Adjacent bytes alternate `fg_even` /
+/// `fg_odd` so you can group nibble-pairs visually without counting
+/// slots. Wraps `paint_nibble` for each nibble; same legibility
+/// properties.
+pub fn paint_u64_hex(
+    start_slot: u32,
+    row_idx: u32,
+    value: u64,
+    fg_even: u32,
+    fg_odd: u32,
+    bg: u32,
+) {
+    for i in 0..16u32 {
+        let shift = 60 - (i * 4);
+        let nib = ((value >> shift) & 0xF) as u8;
+        // Byte index = i/2; alternate fg per byte. So nibbles within
+        // one byte share a color, adjacent bytes contrast.
+        let fg = if (i / 2) & 1 == 0 { fg_even } else { fg_odd };
+        paint_nibble(start_slot + i, row_idx, nib, fg, bg);
+    }
+}
+
 /// Paint a colored square at horizontal slot `slot_idx` (top of FB).
 /// 32 × 16 px with 4 px gap; up to 32 slots in a 1024-px-wide FB.
 /// Skips silently if no FB is registered or the FB phys exceeds the
