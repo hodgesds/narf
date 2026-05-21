@@ -26,6 +26,8 @@ narf-drivers      = { path = "../" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-scheduler    = { path = "../../scheduler" }
+narf-console      = { path = "../../console" }
+narf-firmware     = { path = "../../firmware" }
 async-trait = "0.1"
 
 [features]
