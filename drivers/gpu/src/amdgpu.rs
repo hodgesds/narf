@@ -94,10 +94,21 @@ pub const PHOENIX_DISCRETE: u16 = 0x1681;
 pub const STRIX_POINT: u16 = 0x15BF;
 /// Raphael.
 pub const RAPHAEL: u16 = 0x164E;
-/// Cezanne.
-pub const CEZANNE: u16 = 0x13F9;
-/// Renoir.
-pub const RENOIR: u16 = 0x1638;
+/// Lucienne — Renoir refresh / low-cost variant (Ryzen 5000U some
+/// SKUs). Same GFX9 + DCN 2.0 IP set as Renoir; uses the same
+/// firmware bundle.
+pub const LUCIENNE: u16 = 0x164C;
+/// Barcelo — Cezanne refresh (Ryzen 5xx5U / 5xx5H series).
+/// Identical IP version stack to Cezanne; green_sardine firmware.
+pub const BARCELO: u16 = 0x15E7;
+/// Cezanne — Ryzen 5000/6000 mobile APUs. GFX9 + DCN 2.1
+/// (one step up from Renoir's DCN 2.0). PCI ID 0x1638 per
+/// Linux's amdgpu.
+pub const CEZANNE: u16 = 0x1638;
+/// Renoir — Ryzen 4000 mobile APUs (original Vega8/9 iGPU).
+/// GFX9 + DCN 2.0. PCI ID 0x1636 per Linux. The pre-audit
+/// constant was 0x1638 which is actually Cezanne — fixed.
+pub const RENOIR: u16 = 0x1636;
 /// Navi 22 (Radeon RX 6700/6750 family).
 pub const NAVI22: u16 = 0x73DF;
 /// Navi 31 (Radeon RX 7900 family).
@@ -395,6 +406,10 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", STRIX_FW),
         RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
         CEZANNE => (Family::Renoir, "cezanne", "amdgpu/cezanne.bin", GREEN_SARDINE_FW),
+        // Lucienne shares Renoir's GFX9 + DCN 2.0 IP set; same blobs.
+        LUCIENNE => (Family::Renoir, "lucienne", "amdgpu/renoir.bin", RENOIR_FW),
+        // Barcelo is Cezanne-refresh; green_sardine firmware.
+        BARCELO => (Family::Renoir, "barcelo", "amdgpu/green_sardine.bin", GREEN_SARDINE_FW),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
         NAVI22 => (Family::Navi2, "navi22", "amdgpu/navi22.bin", UNAUDITED_FW),
         NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
