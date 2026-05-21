@@ -2137,3 +2137,55 @@ fn smoke_s3_resume_context_save_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/s3_resume", smoke_s3_resume_context_save_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_setjmp_longjmp_round_trip() -> TestResult {
+    use crate::x86_64::setjmp::{longjmp, setjmp, JmpBuf};
+    let mut jmp = JmpBuf::default();
+    // SAFETY: jmp lives on this stack frame across both calls.
+    let r1 = unsafe { setjmp(&mut jmp as *mut _) };
+    if r1 == 0 {
+        // SAFETY: saved frame still live.
+        unsafe { longjmp(&jmp as *const _, 0xDEAD_BEEF) }
+    }
+    if r1 != 0xDEAD_BEEF {
+        return TestResult::Fail("longjmp value did not surface from setjmp");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_x86_64_setjmp_longjmp_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_setjmp_longjmp_zero_promotes_to_one() -> TestResult {
+    use crate::x86_64::setjmp::{longjmp, setjmp, JmpBuf};
+    let mut jmp = JmpBuf::default();
+    // SAFETY: same.
+    let r1 = unsafe { setjmp(&mut jmp as *mut _) };
+    if r1 == 0 {
+        // SAFETY: same. longjmp with val=0 → must surface as 1.
+        unsafe { longjmp(&jmp as *const _, 0) }
+    }
+    if r1 != 1 {
+        return TestResult::Fail("longjmp(_, 0) should surface as 1");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_x86_64_setjmp_longjmp_zero_promotes_to_one);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_setjmp_buf_layout_matches_asm() -> TestResult {
+    use crate::x86_64::setjmp::JmpBuf;
+    // The asm uses fixed offsets +0..+56 against rdi (JmpBuf*).
+    // Drift here would silently corrupt either save or restore.
+    if core::mem::size_of::<JmpBuf>() != 64 {
+        return TestResult::Fail("JmpBuf must be exactly 64 bytes (8 slots)");
+    }
+    if core::mem::align_of::<JmpBuf>() != 16 {
+        return TestResult::Fail("JmpBuf must be 16-byte aligned");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch", smoke_x86_64_setjmp_buf_layout_matches_asm);

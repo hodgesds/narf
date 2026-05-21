@@ -6,6 +6,7 @@ pub mod amd_pstate;
 pub mod amd_vi;
 pub mod k10temp;
 pub mod s3_resume;
+pub mod setjmp;
 pub mod asm;
 pub mod avx10;
 pub mod bhi;
