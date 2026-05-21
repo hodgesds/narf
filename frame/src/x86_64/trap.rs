@@ -62,6 +62,18 @@ impl core::fmt::Debug for TrapFrame {
     }
 }
 
+// Layout assertion: `narf_scheduler::stackful::TrapFrame` is a
+// re-declaration of this struct (scheduler can't depend on frame,
+// so the two are kept in sync by this assertion). Drift on
+// either side fails the build.
+const _: () = {
+    assert!(
+        core::mem::size_of::<TrapFrame>()
+            == core::mem::size_of::<narf_scheduler::stackful::TrapFrame>(),
+        "TrapFrame size must match scheduler::stackful::TrapFrame",
+    );
+};
+
 /// Render a u64 as 16 ASCII hex digits, MS→LS, on the FB at
 /// pixel-row `px_y`. Each digit takes 18 px (16 px char at 2×
 /// scale + 2 px gap). Uses `narf_graphics::font8x8` via
@@ -156,6 +168,23 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     if frame.vector >= 32 {
         if frame.vector == 32 {
             narf_interrupts::x86_64::apic::on_timer_tick();
+            // Preemption hook for stackful kernel tasks. If the
+            // LAPIC timer fired while a stackful task was
+            // running past its TSC slice, this rewrites
+            // frame.rip so the trap-exit IRET lands on the
+            // scheduler's preempt-yield stub instead of the
+            // original interrupted RIP. Cooperative tasks +
+            // user-mode traps are untouched.
+            //
+            // SAFETY: TrapFrame layout matches narf-scheduler's
+            // re-declared TrapFrame (asserted below). The hook
+            // mutates only frame.rip + frame.rflags when it
+            // fires.
+            unsafe {
+                let sched_frame_ptr = frame as *mut TrapFrame
+                    as *mut narf_scheduler::stackful::TrapFrame;
+                narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
+            }
         }
         narf_interrupts::on_irq(frame.vector as u8);
         // SAFETY: APIC is initialised before interrupts are enabled.

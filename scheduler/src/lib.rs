@@ -480,25 +480,67 @@ where
 
 /// Spawn a task that runs on its own dedicated kernel stack
 /// (16 KiB default). The future's `poll` is driven via
-/// `kernel_switch` instead of being called directly on the
-/// executor's stack — phase 1 of the preemptive scheduler arc
-/// per `scheduler/specification/preemption.md`.
+/// `kernel_switch` so the LAPIC timer ISR can preempt it on
+/// slice expiry — see `scheduler/specification/preemption.md`.
 ///
-/// On its own, this gives no preemption: a busy-loop inside the
-/// future's poll still wedges the executor. Phase 2 (timer-
-/// driven preemption) is what catches busy-loops; this entry
-/// point sets up the per-task stack the ISR needs to save state
-/// into. Migrate suspect-busy-loop kernel tasks (FB cursor pump,
+/// Phase 2 lossy preemption is now active: a kernel async task
+/// that busy-loops inside its `poll()` body gets preempted at
+/// the per-task TSC slice (default 10 ms ≈ 33 M cycles on a
+/// 3.3 GHz CPU) and the executor regains control. The future
+/// re-polls from its current heap state on next dispatch — its
+/// progress isn't lost, only the intermediate stack frames of
+/// the abandoned poll.
+///
+/// Migrate suspect-busy-loop kernel tasks (FB cursor pump,
 /// drain task, USB HID supervisor, etc.) from `spawn()` to this
-/// once phase 2 lands.
+/// to immunise the executor against their wedges.
 ///
 /// Same return + queueing semantics as `spawn()` — caller gets
-/// back a TaskId.
+/// back a TaskId. For per-task preemption tuning (slice size,
+/// opt-out via `no_preempt`), use `spawn_stackful_with_options`.
 pub fn spawn_stackful<F>(f: F) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
     spawn(stackful::StackfulAdapter::new(f))
+}
+
+/// Options for tuning a stackful task's preemption behaviour.
+#[derive(Copy, Clone, Debug)]
+pub struct StackfulOptions {
+    /// Per-task TSC slice in cycles. Default
+    /// `stackful::DEFAULT_SLICE_CYCLES` (~10 ms on 3.3 GHz Zen2).
+    pub slice_cycles: u64,
+    /// When true, the trap-handler hook skips preempting this
+    /// task. Use for drivers that hold hardware locks across an
+    /// `.await`-free region.
+    pub no_preempt: bool,
+    /// Per-task kernel stack size. Must be ≥ 4 KiB and 16-byte
+    /// aligned. Default `stackful::DEFAULT_KERNEL_STACK_BYTES`
+    /// (16 KiB).
+    pub stack_bytes: usize,
+}
+
+impl Default for StackfulOptions {
+    fn default() -> Self {
+        Self {
+            slice_cycles: stackful::DEFAULT_SLICE_CYCLES,
+            no_preempt: false,
+            stack_bytes: stackful::DEFAULT_KERNEL_STACK_BYTES,
+        }
+    }
+}
+
+/// Spawn a stackful task with explicit preemption options.
+/// Wraps `spawn_stackful` but configures the per-task slice +
+/// preempt opt-out + stack size before queuing.
+pub fn spawn_stackful_with_options<F>(f: F, opts: StackfulOptions) -> TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut adapter = stackful::StackfulAdapter::with_options(f, opts);
+    adapter.apply_options();
+    spawn(adapter)
 }
 
 /// Shorthand: spawn a task with a budget cap + the default everywhere-

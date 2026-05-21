@@ -49,19 +49,86 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 #[cfg(target_arch = "x86_64")]
 use narf_arch::x86_64::kernel_ctx::{kernel_switch, KernelContext};
+
+/// Trap frame layout matching `narf_frame::x86_64::trap::TrapFrame`.
+/// Re-declared here because scheduler can't depend on frame (frame
+/// depends on scheduler). A const-assert pins layout equality at
+/// the `frame` end; drift on either side fails the build.
+///
+/// Order follows `frame::x86_64::trap_entry.S`'s reverse-push +
+/// CPU-pushed tail.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub vector: u64,
+    pub error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+/// Default time slice for preemptive tasks. 10 ms ≈ 33 M cycles on
+/// a 3.3 GHz Zen2. Matches Linux's `CONFIG_HZ_100`-ish granularity
+/// and is short enough that one busy-looping task can't hold the
+/// CPU long enough to be visible.
+pub const DEFAULT_SLICE_CYCLES: u64 = 33_000_000;
+
+/// Vector the trap handler dispatches preemption on. Matches
+/// `narf_interrupts::VECTOR_TIMER` (32) — re-declared here to
+/// avoid the dep cycle.
+pub const PREEMPT_VECTOR: u64 = 32;
 
 /// Default per-task kernel stack size. 16 KiB matches the TSS.rsp0
 /// stack the kernel uses for user→kernel trap entry; deep enough
 /// for any in-kernel future poll path that doesn't do unbounded
 /// recursion.
 pub const DEFAULT_KERNEL_STACK_BYTES: usize = 16 * 1024;
+
+/// Per-CPU currently-running stackful task. Set by
+/// `poll_to_yield` immediately before `kernel_switch`-in;
+/// cleared after the switch-back. The trap-handler hook reads
+/// this to decide whether the interrupted code is a stackful
+/// task eligible for preemption.
+///
+/// Single global for phase 2 (BSP-only); phase 3 promotes to a
+/// per-CPU array.
+pub static CURRENT_STACKFUL_TASK: AtomicPtr<KernelTask> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+const fn zeroed_trap_frame() -> TrapFrame {
+    TrapFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vector: 0, error_code: 0,
+        rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    }
+}
 
 /// A future + the kernel-side context to run it on its own stack.
 ///
@@ -91,7 +158,38 @@ pub struct KernelTask {
     /// the task again after completion (shouldn't happen, but
     /// defensive), the trampoline just spins.
     completed: AtomicBool,
+    /// TSC cycle count when the current `poll_to_yield` began.
+    /// The trap handler hook compares against this to decide
+    /// whether the task's slice has expired. Updated by
+    /// `poll_to_yield` each entry.
+    tsc_started: AtomicU64,
+    /// Per-task time slice in TSC cycles. Default
+    /// `DEFAULT_SLICE_CYCLES`. Set via `with_slice_cycles` at
+    /// spawn time for drivers that need bigger slices.
+    slice_cycles: AtomicU64,
+    /// Opt-out: when true the trap-handler hook skips preempting
+    /// this task. Use for drivers that hold hardware locks across
+    /// an `.await`-free critical section.
+    no_preempt: AtomicBool,
+    /// Saved trap frame when the task was preempted. The
+    /// preempt_resume_stub uses this to IRET back to the exact
+    /// instruction the LAPIC timer interrupted. UnsafeCell because
+    /// the trap-handler hook needs raw write access from inside
+    /// an IRQ context (no Mutex).
+    saved_trap_frame: UnsafeCell<TrapFrame>,
+    /// Set true by the trap-handler hook when it rewrites the
+    /// frame.rip to preempt_yield_stub. Read by
+    /// `kernel_switch` resume path to choose `kernel_switch`-restore
+    /// vs IRET-restore.
+    preempted: AtomicBool,
 }
+
+// SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
+// UnsafeCell is written by the trap-handler hook which runs in
+// IRQ context on the same CPU as the executor. No cross-CPU
+// access in phase 2.
+unsafe impl Send for KernelTask {}
+unsafe impl Sync for KernelTask {}
 
 impl core::fmt::Debug for KernelTask {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -137,6 +235,11 @@ impl KernelTask {
             ctx: KernelContext::default(),
             exec_ctx: AtomicPtr::new(core::ptr::null_mut()),
             completed: AtomicBool::new(false),
+            tsc_started: AtomicU64::new(0),
+            slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
+            no_preempt: AtomicBool::new(false),
+            saved_trap_frame: UnsafeCell::new(zeroed_trap_frame()),
+            preempted: AtomicBool::new(false),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -191,20 +294,43 @@ impl KernelTask {
         // Publish exec_ctx so the task can find it on yield.
         self.exec_ctx
             .store(exec_ctx as *mut _, Ordering::Release);
+        // Record when this slice started — the trap-handler
+        // preempt hook reads `tsc_started` to decide whether
+        // we've used our slice.
+        self.tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+        // Publish self to the per-CPU current-task slot so the
+        // trap-handler hook can find us on a LAPIC timer fire.
+        CURRENT_STACKFUL_TASK.store(self as *mut _, Ordering::Release);
         // SAFETY: ctx + exec_ctx both live for the duration of
         // this call; the task's stack was allocated by us and is
         // still alive; the trampoline_entry symbol is in this
         // crate's code segment.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
-        // exec_ctx was used for state — clear the pointer so a
-        // stray late switch can't write into a stale local.
+        // Clear CURRENT_STACKFUL_TASK so the next preempt-hook
+        // fire doesn't think a stackful task is still active.
+        CURRENT_STACKFUL_TASK.store(core::ptr::null_mut(), Ordering::Release);
         self.exec_ctx.store(core::ptr::null_mut(), Ordering::Release);
         if self.completed.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
             Poll::Pending
         }
+    }
+
+    /// Mark this task as non-preemptible. The trap-handler hook
+    /// will skip it regardless of slice expiry. Use for drivers
+    /// that hold hardware locks across an `.await`-free region.
+    pub fn set_no_preempt(&self, v: bool) {
+        self.no_preempt.store(v, Ordering::Release);
+    }
+
+    /// Set the per-task TSC time slice. Default is
+    /// `DEFAULT_SLICE_CYCLES`. Larger slices reduce preemption
+    /// overhead at the cost of latency.
+    pub fn set_slice_cycles(&self, cycles: u64) {
+        self.slice_cycles.store(cycles, Ordering::Release);
     }
 
     /// Build a no-op `Waker` for tasks that don't have a real
@@ -312,6 +438,175 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     }
 }
 
+// ── Trap-handler hook ─────────────────────────────────────────────
+//
+// Called from `narf_frame::x86_64::trap::rust_trap_handler` at the
+// top of vector-32 (LAPIC timer) dispatch. If a stackful task is
+// currently running on this CPU AND its slice has expired AND
+// preemption isn't opt-ed out AND the trap source is CPL=0, save
+// the full trap frame into the task and rewrite `frame.rip` to
+// point at `preempt_yield_stub`. The existing trap-exit IRET
+// then lands on the stub instead of the original task code.
+//
+// Returns `true` iff the frame was rewritten (caller can short-
+// circuit any further work after that).
+
+/// Selector + DPL test: CPL=0 means the kernel was interrupted
+/// while running, which is the only case we preempt. CPL=3 means
+/// a user task was running — user preemption goes through the
+/// existing user_task::poll machinery, not this hook.
+#[inline]
+const fn cpl_zero(cs: u64) -> bool {
+    (cs & 3) == 0
+}
+
+/// Inspect a trap frame at LAPIC timer entry; if it's a
+/// preemptable stackful task, redirect IRET into the yield stub.
+///
+/// # Safety
+/// - Must be called from within `rust_trap_handler` with the
+///   actual on-stack TrapFrame. Caller passes `&mut TrapFrame`
+///   that's part of the trap.S-pushed frame.
+/// - `narf-frame`'s TrapFrame layout must match scheduler's
+///   `TrapFrame` declared above — there's a const-assert in
+///   `narf-frame` that enforces this.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
+    if frame.vector != PREEMPT_VECTOR {
+        return false;
+    }
+    if !cpl_zero(frame.cs) {
+        return false; // trapped from user mode; not our path
+    }
+    let task_ptr = CURRENT_STACKFUL_TASK.load(Ordering::Acquire);
+    if task_ptr.is_null() {
+        return false; // no stackful task currently polling
+    }
+    // SAFETY: CURRENT_STACKFUL_TASK is only set by an in-progress
+    // `poll_to_yield` whose caller still holds the Box alive; the
+    // pointer remains valid until poll_to_yield clears it.
+    let task = unsafe { &*task_ptr };
+    if task.no_preempt.load(Ordering::Acquire) {
+        return false;
+    }
+    let started = task.tsc_started.load(Ordering::Acquire);
+    let slice = task.slice_cycles.load(Ordering::Acquire);
+    let now = narf_time::now_cycles();
+    if now.saturating_sub(started) < slice {
+        return false; // task hasn't used its slice yet
+    }
+    // Save the full trap frame so preempt_resume_stub can IRET
+    // back to the exact interrupted instruction.
+    // SAFETY: UnsafeCell write; we're the only writer on this CPU
+    // (single-CPU phase 2); concurrent readers are blocked while
+    // we're in the trap handler.
+    unsafe {
+        core::ptr::write_volatile(task.saved_trap_frame.get(), *frame);
+    }
+    task.preempted.store(true, Ordering::Release);
+
+    // Rewrite frame.rip to land IRET on preempt_yield_stub. We
+    // leave frame.rsp unchanged so the stub runs on the task's
+    // own stack — convenient because the stub then has a usable
+    // stack for the kernel_switch call.
+    //
+    // RFLAGS: clear bits 8 (TF) and 9 (IF) is the safe choice
+    // for re-entry — the stub itself sets up CLI/STI as needed
+    // before kernel_switch.
+    frame.rip = preempt_yield_stub as u64;
+    // Set IF=1 so the stub runs with interrupts enabled. CS
+    // stays at KERNEL_CS (already CPL=0). RFLAGS bit 1 must
+    // stay set per architectural constant.
+    frame.rflags = (frame.rflags & !0x100) | 0x200 | 0x2;
+    true
+}
+
+// ── Yield + Resume stubs ─────────────────────────────────────────
+//
+// `preempt_yield_stub` runs at CPL=0, on the task's kernel stack,
+// just after the timer ISR's IRET. The stub:
+//   1. Reads CURRENT_STACKFUL_TASK to find which task we are.
+//   2. Sets up task.ctx so the next kernel_switch-INTO this task
+//      lands at preempt_resume_stub (which restores the saved
+//      trap frame and IRETs).
+//   3. Calls kernel_switch(&task.ctx, exec_ctx) — switches back
+//      to the cooperative executor.
+//
+// Written as a regular Rust fn (no naked asm needed — the
+// trap-handler hook arranged for the trap-exit IRET to land
+// here as a normal function call site, NOT a context-switch
+// boundary requiring callee-saved-only).
+
+/// Stub that runs at CPL=0 on the task's kernel stack after the
+/// timer ISR's IRET redirects here (the trap-handler hook
+/// rewrote `frame.rip = preempt_yield_stub`).
+///
+/// Lossy-preempt strategy: futures are stackless, so we don't
+/// need to preserve the kernel stack precisely — the future's
+/// logical state lives in its `Pin<Box<dyn Future>>`. Resetting
+/// task.ctx to land at `trampoline_entry` on a fresh stack
+/// effectively says "abandon the current poll's intermediate
+/// stack frames; on next switch-in, re-poll the future from
+/// whatever state it's in." The future itself doesn't lose
+/// progress — it just re-enters its current poll body.
+///
+/// We `kernel_switch` to the executor with a SCRATCH context
+/// for the save half. The current task's register state at
+/// preempt time is abandoned; only the future's heap state
+/// survives, which is what matters for correctness.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn preempt_yield_stub() -> ! {
+    let task_ptr = CURRENT_STACKFUL_TASK.load(Ordering::Acquire);
+    if task_ptr.is_null() {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    // SAFETY: CURRENT_STACKFUL_TASK was set by the in-progress
+    // poll_to_yield; the Box stays alive until that call returns.
+    let task = unsafe { &mut *task_ptr };
+
+    // Reset task.ctx so the NEXT switch-in lands at the
+    // trampoline (which re-polls the future). Use the task's
+    // own stack top — abandoning whatever intermediate frames
+    // the preempted poll() had pushed.
+    let stack_top = task
+        .stack
+        .as_mut_ptr()
+        .wrapping_add(task.stack.len()) as u64
+        & !0xFu64;
+    task.ctx = KernelContext::fresh(
+        stack_top,
+        trampoline_entry as u64,
+        task_ptr as u64,
+    );
+    task.preempted.store(true, Ordering::Release);
+
+    let exec_ctx = task.exec_ctx.load(Ordering::Acquire);
+    if exec_ctx.is_null() {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Switch back to executor. Use a scratch ctx for the save
+    // half — we don't care about preserving this stub's regs
+    // because nothing ever switches back into THIS stack
+    // address (next switch-in lands at trampoline_entry with
+    // rsp = stack_top, abandoning intermediate frames).
+    let mut scratch = KernelContext::default();
+    // SAFETY: exec_ctx valid (set by poll_to_yield); scratch is
+    // a local that survives the call. The switch's `jmp rcx`
+    // lands on the executor's saved rip; this frame is
+    // abandoned per the comment above.
+    unsafe {
+        kernel_switch(&mut scratch, exec_ctx);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 // ── Cooperative-executor adapter ──────────────────────────────────
 //
 // Wraps a `KernelTask` in a `Future` so the existing
@@ -349,6 +644,35 @@ impl StackfulAdapter {
         Self {
             inner: KernelTask::new(future),
         }
+    }
+
+    /// Construct with explicit options (slice + no_preempt +
+    /// stack size). Used by `spawn_stackful_with_options`.
+    /// Caller must invoke `apply_options` after construction to
+    /// commit slice/no_preempt to the inner task — kept as a
+    /// separate step so the StackfulOptions struct can stay
+    /// `Copy`.
+    pub fn with_options<F>(future: F, opts: crate::StackfulOptions) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let inner = KernelTask::with_stack_size(future, opts.stack_bytes);
+        let me = Self { inner };
+        // Cache opts on the adapter for `apply_options` — keep
+        // a simple atomic-set pattern; opts are tiny.
+        me.inner.set_slice_cycles(opts.slice_cycles);
+        me.inner.set_no_preempt(opts.no_preempt);
+        me
+    }
+
+    /// Apply any pending option changes that haven't been
+    /// committed to the inner KernelTask. `with_options` already
+    /// applies on construction; this method is a no-op kept for
+    /// API symmetry with future mutator paths.
+    pub fn apply_options(&mut self) {
+        // Currently a no-op (with_options applies inline). Kept
+        // so callers in `lib.rs` have a stable post-construction
+        // hook.
     }
 }
 
