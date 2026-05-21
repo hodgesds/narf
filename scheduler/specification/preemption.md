@@ -145,15 +145,71 @@ poll") still wedges (we verify that and ship phase 2 to fix).
 
 ### Phase 2 — Timer-driven preemption
 
-- LAPIC timer ISR extended:
-  - Save trap-frame GPRs into `CURRENT_TASK.ctx`.
-  - Set `CURRENT_TASK.preempted = true`.
-  - Tail-call to executor's resume point via `kernel_switch`.
-- Per-task `TSC_deadline` checked at ISR entry.
-- The executor's `kernel_switch` resumption point distinguishes "task yielded voluntarily" from "task was
-  preempted" so it can re-queue accordingly.
+The core mechanism: at IRET time, the trap handler can decide
+to "return to a different RIP" by mutating the saved RIP in the
+trap frame on the kernel stack. The LAPIC timer ISR uses this to
+redirect a preempted task's IRET into a `preempt_yield_stub` that
+runs at CPL=0 (not interrupt context) and switches back to the
+executor.
 
-Validates: the deliberate busy-loop task from phase-1 testing no longer wedges the executor.
+**Concrete steps:**
+
+1. Add `saved_trap_frame: Option<TrapFrame>` to `KernelTask`.
+   The `TrapFrame` is the existing struct that
+   `frame::x86_64::trap_entry.S` pushes — full GPRs +
+   RIP/CS/RFLAGS/RSP/SS.
+
+2. Add `CURRENT_STACKFUL_TASK: AtomicPtr<KernelTask>` (per-CPU).
+   Set by `KernelTask::poll_to_yield` before `kernel_switch`;
+   cleared after.
+
+3. In `narf-frame::x86_64::trap::rust_trap_handler`:
+   - On vector 32 (LAPIC timer) entry, if
+     `CURRENT_STACKFUL_TASK` is `Some` AND the trapped CS is the
+     kernel CS (CPL=0):
+     - Copy the trap frame into `task.saved_trap_frame`.
+     - Rewrite `trap_frame.rip` to point at `preempt_yield_stub`.
+     - Leave the rest of the trap frame untouched so IRET still
+       lands on the task's stack with sensible flags.
+
+4. `preempt_yield_stub`: a naked function that runs at CPL=0 on
+   the task's kernel stack just after the LAPIC timer ISR's
+   IRET:
+   - Read the per-CPU `CURRENT_STACKFUL_TASK` pointer.
+   - Call `kernel_switch(&task.ctx, &executor_ctx)` — but with
+     `task.ctx` pre-loaded so the NEXT switch-in lands at a
+     `preempt_resume_stub`, not at the trampoline.
+   - Setting `task.ctx.rip = preempt_resume_stub`,
+     `task.ctx.rsp = <bottom of saved trap frame>` does this:
+     when the executor later switches into the task,
+     kernel_switch's `jmp rcx` lands on preempt_resume_stub
+     with rsp pointing at the saved trap frame.
+
+5. `preempt_resume_stub`: a naked function that pops the saved
+   GPRs from the stack and IRETs to restore the preempted task
+   at its exact interrupt point.
+
+**Per-task TSC deadline + opt-in/out:**
+
+- Each `KernelTask` records `tsc_started: u64` (when its current
+  poll began). Default time slice: 10 ms (≈3.3M cycles on a
+  3.3 GHz CPU).
+- Timer ISR checks `now - tsc_started > slice`. If false, skip
+  preemption (task hasn't used its slice yet).
+- `TaskSpec::no_preempt()` marks a task as non-preemptible —
+  ISR skips it regardless of slice. For drivers that hold
+  hardware locks across an `.await`-free section.
+
+**Validates:** spawn a busy-loop task (`loop {}` with no
+`.await`); spawn a second task that prints `done`. Without
+preemption, `done` never appears. With phase 2, `done` appears
+within ~10 ms.
+
+**Out of scope for phase 2:** SMP preemption (per-CPU
+CURRENT_STACKFUL_TASK), IRQ-from-CPL=3 handling (user-task
+preemption goes through the existing user_task::poll machinery),
+nested preemption (a stackful task being preempted while it's
+already in a trap handler — ruled out by checking trap source).
 
 ### Phase 3 — TaskSpec preemption controls + per-CPU stacks
 
