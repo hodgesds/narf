@@ -1910,6 +1910,30 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         }
                     }
                 }
+
+                // FAT walk didn't find anything — consult the
+                // fs-factory registry (ext2/3/4 + future drivers
+                // register here at Stage::Subsys). try_mount_root
+                // calls detect_filesystem on each device, looks up
+                // the matching factory, and mounts. Any detected FS
+                // with a registered factory wins.
+                match narf_filesystem::root_mount::try_mount_root(&auth) {
+                    Ok(report) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  root-mount: {:?} on {} mounted at \"/\" via fs-factory registry",
+                            report.fs_type, report.device_name
+                        );
+                        return narf_init::InitResult::Ok;
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  root-mount: fs-factory walk found nothing mountable: {:?}",
+                            e
+                        );
+                    }
+                }
                 narf_init::InitResult::NotPresent
             });
 
