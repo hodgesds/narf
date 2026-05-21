@@ -1156,6 +1156,15 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     cmd.arg("-serial").arg("stdio");
     cmd.arg("-display").arg(display);
     cmd.arg("-no-reboot");
+    // USB input — xHCI + boot-protocol keyboard + absolute-pointing
+    // tablet. Q35's PS/2 IRQ delivery is flaky under non-default
+    // CPU models (e.g. XTASK_CPU=EPYC-Rome doesn't reliably fire
+    // IRQ 1/12), so attach USB input that goes through the xHCI
+    // pipeline instead. Works on every CPU model QEMU supports;
+    // exercises the same xHCI HID path real silicon will use.
+    cmd.arg("-device").arg("qemu-xhci,id=xhci0");
+    cmd.arg("-device").arg("usb-kbd,bus=xhci0.0");
+    cmd.arg("-device").arg("usb-tablet,bus=xhci0.0");
 
     if legacy {
         cmd.arg("-drive")
