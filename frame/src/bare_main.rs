@@ -332,6 +332,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_arch::x86_64::msr::enable_nxe();
         }
 
+        // PAT — program IA32_PAT so PA1 = WC (Linux convention).
+        // After this, any future PTE with PWT=1 maps that page
+        // write-combining. The early-FB-console install path
+        // doesn't use this yet (it runs before MMU rebind), but
+        // the Stage::Late `fb-wc-remap` initcall ioremaps the FB
+        // at a fresh WC virt for fast console scroll. Other
+        // drivers (GPU command rings, etc.) can also opt-in via
+        // `MmioAttrs::WriteCombining`.
+        // SAFETY: CPL=0, single-threaded boot, before any
+        // cacheable mapping spans a region we're changing.
+        let _ = unsafe { narf_arch::x86_64::pat::init_default() };
+
         // Baseline CPU validation. Reads CPUID + CR4 + EFER and
         // refuses to proceed only if a TRULY required bit is off
         // (long-mode, NX, EFER.LME/NXE, CR4.PAE). Other bits get
@@ -1835,6 +1847,77 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     backend,
                     cols,
                     rows
+                );
+                narf_init::InitResult::Ok
+            });
+
+            // FB write-combining remap. After `fb-console-install`
+            // wired the boot-time path through the early identity
+            // map (uncached MMIO — ~75 ns/pixel-write, glacial on
+            // real silicon), re-map the FB phys at a fresh kernel
+            // virt with PAT=WC. Subsequent writes coalesce into
+            // burst transactions, ~10× faster.
+            //
+            // The existing FbConsole holds a Framebuffer over the
+            // OLD (uncached) virt. We update GenericFb so future
+            // scanout consumers (cursor pump, status panel, beacon
+            // re-registration) hit WC; the running FbConsole is
+            // not re-installed (would wipe scrollback). The next
+            // boot's early-fb install would happen pre-MMU and
+            // still be uncached — only post-Stage::Late activity
+            // benefits.
+            narf_init::register(narf_init::Stage::Late, "fb-wc-remap", || {
+                use narf_memory::ioremap::{ioremap, MmioAttrs};
+                let info = match narf_fb::info() {
+                    Some(i) => i,
+                    None => return narf_init::InitResult::NotPresent,
+                };
+                // GenericFb's stride is in pixels; pitch in bytes
+                // = stride * 4 (XRGB8888). FB byte-length =
+                // height * pitch, rounded up to page granularity
+                // for ioremap.
+                let phys = match narf_fb::generic_phys() {
+                    Some(p) => p,
+                    None => return narf_init::InitResult::NotPresent,
+                };
+                let pitch_bytes = info.stride as u64 * 4;
+                let raw_len = info.height as u64 * pitch_bytes;
+                let len = (raw_len + 0xFFF) & !0xFFFu64;
+                // SAFETY: FB phys was registered by Limine/UEFI;
+                // exclusive kernel-side; the new virt is fresh
+                // vmalloc.
+                let m = match unsafe { ioremap(phys, len, MmioAttrs::WriteCombining) } {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  fb-wc-remap: ioremap-WC failed; FB writes stay uncached"
+                        );
+                        return narf_init::InitResult::Error("ioremap-WC failed");
+                    }
+                };
+                narf_fb::rebase_generic(m.virt);
+                // Re-register beacon at the WC virt. Subsequent
+                // paint() calls (cursor liveness, slot 50/52
+                // bisection beacons, etc.) burst-write instead of
+                // uncached.
+                narf_memory::beacon::register(
+                    m.virt,
+                    info.stride,
+                    info.width,
+                    info.height,
+                    /* ceiling: WC virt is in kernel half, well
+                     * above the 4 GiB identity-map cap, but
+                     * beacon ignores ceiling=0 and treats
+                     * non-zero as the bound. Pass u64::MAX so
+                     * any beacon write succeeds. */
+                    u64::MAX,
+                );
+                let _ = writeln!(
+                    console::Writer,
+                    "  fb-wc-remap: FB ioremap'd at {:#x} ({} KiB, WC)",
+                    m.virt,
+                    len / 1024,
                 );
                 narf_init::InitResult::Ok
             });

@@ -38,6 +38,7 @@ pub mod msr;
 pub mod mtrr;
 pub mod numa;
 pub mod pasid;
+pub mod pat;
 pub mod pcid;
 pub mod pebs;
 pub mod pit;

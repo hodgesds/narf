@@ -60,6 +60,12 @@ pub enum MmioAttrs {
     /// ROMs) where ordering doesn't matter and read-prefetching
     /// helps. Today's drivers all want Device.
     WriteBack,
+    /// Write-combining. Best for framebuffers + GPU command rings:
+    /// the CPU coalesces sequential writes into wide transactions,
+    /// which on real silicon is ~10× faster than uncached MMIO.
+    /// Requires PAT support + `narf_arch::x86_64::pat::init_default`
+    /// to have set PA1 = WC. PWT (bit 3) in the PTE selects PA1.
+    WriteCombining,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -109,7 +115,7 @@ pub struct IoMapping {
 /// - The active page table must be writable (i.e. we're at CPL=0
 ///   on the BSP boot path or holding the appropriate cap to
 ///   mutate kernel mappings).
-pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs) -> Result<IoMapping, IoremapError> {
+pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping, IoremapError> {
     if phys & 0xFFF != 0 {
         return Err(IoremapError::BadAlign);
     }
@@ -125,7 +131,23 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs) -> Result<IoMappin
 
     let range = vmalloc::alloc(len)?;
     let pml4_phys = unsafe { read_cr3() };
-    let flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE;
+    // Per-attr PTE flags:
+    //   Device          → NO_CACHE (PCD=1)              → PA2 = UC-
+    //   WriteBack       → no extra bits                 → PA0 = WB
+    //   WriteCombining  → WRITE_THROUGH (PWT=1)         → PA1 = WC
+    //                     (requires pat::init_default
+    //                      has been run; failure is
+    //                      silent — WC just downgrades
+    //                      to WT, which is at least
+    //                      cacheable so still faster
+    //                      than UC).
+    let flags = match attrs {
+        MmioAttrs::Device => PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE,
+        MmioAttrs::WriteBack => PtFlags::PRESENT | PtFlags::WRITABLE,
+        MmioAttrs::WriteCombining => {
+            PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::WRITE_THROUGH
+        }
+    };
 
     // Map page by page. On failure, walk back and unmap the
     // pages we did install so the address space stays clean.

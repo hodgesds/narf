@@ -316,6 +316,27 @@ pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
     *GENERIC_FB.lock() = Some(fb);
 }
 
+/// Rebase the generic-FB's base address to a remapped virt (e.g.
+/// the WC ioremap result). Preserves width/height/pitch/bpp;
+/// future `framebuffer()` calls will return a Framebuffer that
+/// writes to `new_addr` instead of the original bus-phys.
+///
+/// No-op when no GenericFb is registered. Single-threaded boot
+/// context only.
+pub fn rebase_generic(new_addr: u64) {
+    if let Some(fb) = GENERIC_FB.lock().as_mut() {
+        fb.addr = new_addr;
+    }
+}
+
+/// Original bus-phys of the generic FB, before any rebase.
+/// Returns `None` if no GenericFb is registered, or if rebase
+/// already happened (caller's responsibility to read this BEFORE
+/// calling `rebase_generic`).
+pub fn generic_phys() -> Option<u64> {
+    GENERIC_FB.lock().as_ref().map(|f| f.addr)
+}
+
 /// Backend-agnostic scanout view for the boot-provided linear FB.
 #[derive(Debug)]
 struct GenericScanout;

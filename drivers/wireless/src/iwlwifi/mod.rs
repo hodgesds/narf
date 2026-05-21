@@ -837,7 +837,7 @@ pub mod tests {
         if ladder.len() != 1 {
             return TestResult::Fail("expected exactly one AX200 candidate");
         }
-        if ladder[0] != "iwlwifi-QuZ-a0-hr-b0-100.ucode" {
+        if ladder[0] != "iwlwifi/iwlwifi-QuZ-a0-hr-b0-100.ucode" {
             return TestResult::Fail("AX200 candidate didn't match expected name");
         }
         TestResult::Pass
@@ -851,7 +851,7 @@ pub mod tests {
             return TestResult::Fail("expected 3 RFs × 3 APIs = 9 BE200 candidates");
         }
         // First candidate should be gf-a0 @ 102 (max API, first RF).
-        if ladder[0] != "iwlwifi-bz-a0-gf-a0-102.ucode" {
+        if ladder[0] != "iwlwifi/iwlwifi-bz-a0-gf-a0-102.ucode" {
             return TestResult::Fail("BE200 first candidate wrong");
         }
         TestResult::Pass
