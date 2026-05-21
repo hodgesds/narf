@@ -18,7 +18,7 @@ extern crate alloc;
 // crate's test entries. (Crates that the kernel actually uses by
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
-extern crate narf_drivers_fs_ext2 as _;
+extern crate narf_drivers_fs_ext2;
 extern crate narf_drivers_fs_fat as _;
 extern crate narf_drivers_fs_exfat as _;
 extern crate narf_drivers_fs_minix as _;
@@ -1515,6 +1515,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_usbpd::register_initcalls();
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
+            narf_drivers_fs_ext2::register_initcalls();
             narf_drivers_platform::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into

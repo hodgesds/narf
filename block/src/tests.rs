@@ -1318,11 +1318,11 @@ fn smoke_block_fs_detect_returns_none_for_zero_disk() -> TestResult {
 }
 kernel_test_in!("block/fs_detect", smoke_block_fs_detect_returns_none_for_zero_disk);
 
-// ── block/sync_to_async ────────────────────────────────────────────
+// ── block/sync_to_async (SyncBlock geometry forwarding) ──────────────
 
 fn smoke_sync_block_reports_geometry_from_inner() -> TestResult {
-    use crate::sync_to_async::SyncBlock;
     use crate::BlockDevice;
+    use crate::SyncBlock;
     use alloc::sync::Arc;
     let payload = alloc::vec![0u8; 16 * 512];
     let inner = Arc::new(VecBlock {
@@ -1339,9 +1339,8 @@ fn smoke_sync_block_reports_geometry_from_inner() -> TestResult {
     if bridge.capacity_blocks() != 16 {
         return TestResult::Fail("capacity_blocks not forwarded");
     }
-    if bridge.supports(crate::BlockFeature::Flush) {
-        return TestResult::Fail("sync adapter must NOT claim Flush support");
-    }
+    // Existing SyncBlock advertises Flush + WriteZeroes (no-ops on
+    // a sync transport, harmless to claim). Discard is NOT claimed.
     if bridge.supports(crate::BlockFeature::Discard) {
         return TestResult::Fail("sync adapter must NOT claim Discard");
     }

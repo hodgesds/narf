@@ -33,7 +33,6 @@ pub mod mq;
 pub mod fs_detect;
 pub mod opal;
 pub mod partition;
-pub mod sync_to_async;
 pub mod ram;
 pub mod registry;
 pub mod scsi;
