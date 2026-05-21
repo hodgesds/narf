@@ -39,6 +39,56 @@ enum Cmd {
     /// after a logical detach so the burn is guaranteed to land on
     /// real flash NAND (not USB-controller cache).
     DiskWrite(DiskWriteArgs),
+    /// Wipe a USB stick and lay out a partitioned NARF disk:
+    /// GPT with an ESP (FAT32) holding the kernel + Limine, and a
+    /// labelled ext4 root partition (NARF_ROOT) holding /sbin/init
+    /// + /bin/sh. Boot picks the root via `root=PARTLABEL=NARF_ROOT`
+    /// on the kernel cmdline.
+    DiskWritePartitioned(DiskWritePartitionedArgs),
+}
+
+#[derive(Parser, Clone)]
+struct DiskWritePartitionedArgs {
+    /// Block device to format (e.g. /dev/sda). Auto-detected USB
+    /// when omitted.
+    #[arg(long)]
+    device: Option<String>,
+
+    /// ESP partition size in MiB. Holds kernel + initramfs + Limine.
+    /// 256 MiB fits the kernel + ramdisk + Limine with room to grow.
+    #[arg(long, default_value_t = 256)]
+    esp_size_mib: u64,
+
+    /// Filesystem for the root partition.
+    #[arg(long, value_enum, default_value_t = RootFs::Ext4)]
+    root_fs: RootFs,
+
+    /// Partition label for the root partition. The kernel cmdline
+    /// installs `root=PARTLABEL=<label>` so this name pins boot
+    /// selection. Default "NARF_ROOT" matches the kernel's
+    /// recommended convention.
+    #[arg(long, default_value = "NARF_ROOT")]
+    root_label: String,
+
+    /// Skip the user-confirmation prompt. Use only in automation;
+    /// any wrong --device will wipe the wrong disk.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RootFs {
+    Ext2,
+    Ext4,
+}
+
+impl RootFs {
+    fn mkfs_program(self) -> &'static str {
+        match self {
+            RootFs::Ext2 => "mkfs.ext2",
+            RootFs::Ext4 => "mkfs.ext4",
+        }
+    }
 }
 
 #[derive(Parser, Clone)]
@@ -1425,6 +1475,342 @@ fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
     }
 }
 
+fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    // ── 1. Resolve device + safety checks ─────────────────────────
+    let dev = match &args.device {
+        Some(d) => d.clone(),
+        None => detect_usb_device()?,
+    };
+    println!("Target device: {}", dev);
+    if !is_usb_device(&dev)? {
+        bail!(
+            "{} is NOT a USB-attached disk. Refusing to partition. \
+             Pass --device explicitly if you really mean this.",
+            dev
+        );
+    }
+
+    // Build a NARF image first — the partition layout is useless
+    // without the kernel + init binaries to populate it with.
+    let root = workspace_root().context("locating workspace root")?;
+    let target_dir = root.join("target");
+    let kernel = target_dir.join("x86_64-unknown-none/release/narf-frame");
+    if !kernel.exists() {
+        bail!(
+            "kernel not found at {}; run `cargo xtask iso-boot` first to \
+             build the kernel + initramfs",
+            kernel.display()
+        );
+    }
+    let initramfs = target_dir.join("iso-x86_64/boot/initramfs.cpio");
+    if !initramfs.exists() {
+        bail!(
+            "initramfs not found at {}; run `cargo xtask iso-boot` first",
+            initramfs.display()
+        );
+    }
+    // The Limine binaries live in the staged iso-x86_64 tree.
+    let limine_dir = target_dir.join("iso-x86_64/boot/limine");
+    let bootx64 = target_dir.join("iso-x86_64/EFI/BOOT/BOOTX64.EFI");
+    if !limine_dir.exists() || !bootx64.exists() {
+        bail!(
+            "Limine staging dirs missing at {} / {}; run `cargo xtask \
+             iso-boot` first",
+            limine_dir.display(),
+            bootx64.display(),
+        );
+    }
+
+    // ── 2. Confirm ────────────────────────────────────────────────
+    let _ = Command::new("lsblk")
+        .args(["-o", "NAME,SIZE,MODEL,TRAN,MOUNTPOINTS"])
+        .arg(&dev)
+        .status();
+    println!(
+        "Plan: GPT layout on {}",
+        dev
+    );
+    println!("  - ESP (FAT32, {} MiB) — kernel + initramfs + Limine", args.esp_size_mib);
+    println!(
+        "  - {} ({}, rest of disk, PARTLABEL={})",
+        "narf-root",
+        args.root_fs.mkfs_program().trim_start_matches("mkfs."),
+        args.root_label
+    );
+    if !args.yes {
+        print!("This wipes EVERYTHING on {}. Proceed? [y/N] ", dev);
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            bail!("aborted");
+        }
+    }
+
+    // ── 3. Unmount + partition ───────────────────────────────────
+    // Any partition may have been auto-mounted by udisks; sweep N=1..8.
+    for n in 1..=8 {
+        let _ = Command::new("sudo")
+            .args(["umount", &format!("{}{}", dev, n)])
+            .status();
+    }
+
+    // sgdisk --zap-all blows away both protective MBR + GPT + backup
+    // GPT in one go. sgdisk -n creates partitions; -t sets type GUID
+    // (EF00 = ESP, 8300 = Linux filesystem); -c sets PARTLABEL.
+    let esp_end = format!("+{}M", args.esp_size_mib);
+    let st = Command::new("sudo")
+        .args(["sgdisk", "--zap-all", &dev])
+        .status()
+        .context("sgdisk --zap-all")?;
+    if !st.success() {
+        bail!("sgdisk --zap-all failed with {st}");
+    }
+    let st = Command::new("sudo")
+        .args([
+            "sgdisk",
+            "-n", &format!("1:0:{}", esp_end),
+            "-t", "1:EF00",
+            "-c", "1:ESP",
+            "-n", "2:0:0",
+            "-t", "2:8300",
+            "-c", &format!("2:{}", args.root_label),
+            &dev,
+        ])
+        .status()
+        .context("sgdisk partition")?;
+    if !st.success() {
+        bail!("sgdisk partition failed with {st}");
+    }
+    // Tell the kernel to re-read the partition table.
+    let _ = Command::new("sudo").args(["partprobe", &dev]).status();
+    let _ = Command::new("sync").status();
+
+    // Resolve partition device paths. /dev/sda → /dev/sda1 / /dev/sda2;
+    // /dev/nvme0n1 → /dev/nvme0n1p1 / /dev/nvme0n1p2.
+    let (esp_dev, root_dev) = partition_paths(&dev);
+    println!("  ESP:   {}", esp_dev);
+    println!("  ROOT:  {}", root_dev);
+
+    // ── 4. mkfs ──────────────────────────────────────────────────
+    let st = Command::new("sudo")
+        .args(["mkfs.vfat", "-F32", "-n", "ESP", &esp_dev])
+        .status()
+        .context("mkfs.vfat ESP")?;
+    if !st.success() {
+        bail!("mkfs.vfat failed with {st}");
+    }
+    let st = Command::new("sudo")
+        .args([
+            args.root_fs.mkfs_program(),
+            "-F", // force on a partition that just got created
+            "-L", &args.root_label,
+            &root_dev,
+        ])
+        .status()
+        .context(format!("{} on root", args.root_fs.mkfs_program()))?;
+    if !st.success() {
+        bail!("root mkfs failed with {st}");
+    }
+
+    // ── 5. Mount, populate, unmount ──────────────────────────────
+    let mnt_root = target_dir.join("disk-write-partitioned-mnt");
+    let mnt_esp = mnt_root.join("esp");
+    let mnt_fs = mnt_root.join("root");
+    let _ = std::fs::remove_dir_all(&mnt_root);
+    std::fs::create_dir_all(&mnt_esp)?;
+    std::fs::create_dir_all(&mnt_fs)?;
+
+    let st = Command::new("sudo")
+        .args(["mount", &esp_dev, mnt_esp.to_str().unwrap()])
+        .status()?;
+    if !st.success() {
+        bail!("mount ESP failed");
+    }
+    let st = Command::new("sudo")
+        .args(["mount", &root_dev, mnt_fs.to_str().unwrap()])
+        .status()?;
+    if !st.success() {
+        let _ = Command::new("sudo")
+            .args(["umount", mnt_esp.to_str().unwrap()])
+            .status();
+        bail!("mount root failed");
+    }
+
+    // ── 5a. Populate the ESP ─────────────────────────────────────
+    // Layout:
+    //   /EFI/BOOT/BOOTX64.EFI         (Limine UEFI loader)
+    //   /boot/narf-frame              (kernel)
+    //   /boot/initramfs.cpio          (init/shell CPIO; staged by kernel
+    //                                  even with a real root for early
+    //                                  fallback if root mount fails)
+    //   /boot/limine/                 (Limine support files)
+    //   /boot/limine.conf             (cmdline wires root=PARTLABEL=)
+    let mk = |sub: &str| -> Result<()> {
+        let p = mnt_esp.join(sub);
+        let st = Command::new("sudo")
+            .args(["mkdir", "-p", p.to_str().unwrap()])
+            .status()?;
+        if !st.success() {
+            bail!("mkdir {} failed", p.display());
+        }
+        Ok(())
+    };
+    mk("EFI/BOOT")?;
+    mk("boot/limine")?;
+    let cp = |src: &Path, dst_rel: &str| -> Result<()> {
+        let dst = mnt_esp.join(dst_rel);
+        let st = Command::new("sudo")
+            .args([
+                "cp",
+                src.to_str().unwrap(),
+                dst.to_str().unwrap(),
+            ])
+            .status()?;
+        if !st.success() {
+            bail!("cp {} -> {} failed", src.display(), dst.display());
+        }
+        Ok(())
+    };
+    cp(&bootx64, "EFI/BOOT/BOOTX64.EFI")?;
+    cp(&kernel, "boot/narf-frame")?;
+    cp(&initramfs, "boot/initramfs.cpio")?;
+    // Copy Limine support files (BIOS stages, etc).
+    let st = Command::new("sudo")
+        .args([
+            "sh",
+            "-c",
+            &format!(
+                "cp {}/* {}/",
+                limine_dir.display(),
+                mnt_esp.join("boot/limine").display(),
+            ),
+        ])
+        .status()?;
+    if !st.success() {
+        eprintln!("warning: Limine support-file copy reported failure (some boot modes may not work)");
+    }
+    // Limine config — same shape as the ISO's, but with `root=
+    // PARTLABEL=<label>` so the kernel's root_selector picks the
+    // ext4 partition.
+    let limine_conf = format!(
+        r#"timeout: 1
+
+/NARF
+    protocol: multiboot2
+    kernel_path: boot():/boot/narf-frame
+    kernel_cmdline: quiet root=PARTLABEL={label}
+    module_path: boot():/boot/initramfs.cpio
+    module_string: initramfs
+"#,
+        label = args.root_label,
+    );
+    write_as_root(&mnt_esp.join("boot/limine.conf"), &limine_conf)?;
+
+    // ── 5b. Populate the root filesystem ─────────────────────────
+    // Build init + shell binaries (same as iso-boot does).
+    let init_elf = build_user_binary(&root, "userspace/init", "init", "init.ld")?;
+    let shell_elf = build_user_binary(&root, "userspace/shell", "shell", "shell.ld")?;
+    mk_root_dir(&mnt_fs, "sbin")?;
+    mk_root_dir(&mnt_fs, "bin")?;
+    cp_root(&init_elf, &mnt_fs.join("sbin/init"))?;
+    cp_root(&shell_elf, &mnt_fs.join("bin/sh"))?;
+
+    // ── 6. Unmount + sync ────────────────────────────────────────
+    let _ = Command::new("sync").status();
+    let st = Command::new("sudo")
+        .args(["umount", mnt_esp.to_str().unwrap()])
+        .status()?;
+    if !st.success() {
+        eprintln!("warning: umount ESP returned {st}");
+    }
+    let st = Command::new("sudo")
+        .args(["umount", mnt_fs.to_str().unwrap()])
+        .status()?;
+    if !st.success() {
+        eprintln!("warning: umount root returned {st}");
+    }
+    let _ = Command::new("sync").status();
+
+    // ── 7. Install Limine BIOS stage for legacy boot ─────────────
+    // UEFI works via /EFI/BOOT/BOOTX64.EFI (already copied). Legacy
+    // BIOS needs a separate `limine bios-install` to write the
+    // bootloader's stage 1 + stage 2 onto the MBR + a reserved
+    // sector range. Skipped silently if `limine` isn't on PATH —
+    // UEFI-only USBs still boot.
+    let st = Command::new("sudo")
+        .args(["limine", "bios-install", &dev])
+        .status();
+    match st {
+        Ok(s) if s.success() => println!("Limine BIOS stage installed."),
+        Ok(s) => eprintln!("limine bios-install returned {s} — UEFI-only boot will still work"),
+        Err(_) => eprintln!("limine binary not on PATH — UEFI-only boot will still work"),
+    }
+
+    println!();
+    println!("✓ {} is ready. Plug into the target laptop and boot.", dev);
+    println!("  Kernel cmdline: root=PARTLABEL={}", args.root_label);
+    Ok(())
+}
+
+fn partition_paths(dev: &str) -> (String, String) {
+    // /dev/sda  → /dev/sda1 + /dev/sda2
+    // /dev/nvme0n1 → /dev/nvme0n1p1 + /dev/nvme0n1p2
+    // /dev/mmcblk0 → /dev/mmcblk0p1 + /dev/mmcblk0p2
+    let needs_p = dev
+        .chars()
+        .last()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false);
+    let sep = if needs_p { "p" } else { "" };
+    (format!("{}{}1", dev, sep), format!("{}{}2", dev, sep))
+}
+
+fn write_as_root(dst: &Path, contents: &str) -> Result<()> {
+    // Write to a temp file the build user owns, then `sudo cp` it
+    // into place.
+    let tmp = std::env::temp_dir().join(format!(
+        "narf-disk-write-{}",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, contents)?;
+    let st = Command::new("sudo")
+        .args(["cp", tmp.to_str().unwrap(), dst.to_str().unwrap()])
+        .status()?;
+    let _ = std::fs::remove_file(&tmp);
+    if !st.success() {
+        bail!("write_as_root({}) failed with {st}", dst.display());
+    }
+    Ok(())
+}
+
+fn mk_root_dir(mnt: &Path, sub: &str) -> Result<()> {
+    let p = mnt.join(sub);
+    let st = Command::new("sudo")
+        .args(["mkdir", "-p", p.to_str().unwrap()])
+        .status()?;
+    if !st.success() {
+        bail!("mkdir {} failed", p.display());
+    }
+    Ok(())
+}
+
+fn cp_root(src: &Path, dst: &Path) -> Result<()> {
+    let st = Command::new("sudo")
+        .args([
+            "cp",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        ])
+        .status()?;
+    if !st.success() {
+        bail!("cp {} -> {} failed", src.display(), dst.display());
+    }
+    Ok(())
+}
+
 /// Find the first USB-attached block device by reading lsblk.
 fn detect_usb_device() -> Result<String> {
     let out = Command::new("lsblk")
@@ -1521,6 +1907,7 @@ fn main() -> Result<()> {
             iso_boot_cmd(&args)
         }
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
+        Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();
