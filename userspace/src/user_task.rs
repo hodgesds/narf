@@ -649,6 +649,15 @@ impl core::future::Future for UserTaskFuture {
                     this.state = TaskState::Running;
                     let entry = this.process.entry.0.as_u64();
                     let rsp = this.process.stack_top.as_u64();
+                    // Bring-up beacons (real-HW hang diagnosis):
+                    //   slot 50 = about to iretq into a fresh user task
+                    //   slot 52 = re-poll after trap-return (set below)
+                    // If 50 lights but no 52 ever does, init is
+                    // running in CPL=3 without trapping (infinite
+                    // user-side loop, or stuck waiting for a kernel
+                    // IRQ the scheduler hasn't delivered).
+                    #[cfg(target_arch = "x86_64")]
+                    narf_memory::beacon::paint(50, 0x00FF_60FF); // magenta: pre-iretq
                     // SAFETY: the AS is activated and the user
                     // mappings cover entry + rsp by construction
                     // (load_user_process_with mapped them). Never
@@ -670,11 +679,15 @@ impl core::future::Future for UserTaskFuture {
                     // The AS is re-activated and the kernel state
                     // (TSS rsp0, GS) is still correct from the
                     // first entry.
+                    #[cfg(target_arch = "x86_64")]
+                    narf_memory::beacon::paint(51, 0x0060_FFFF); // cyan: pre-iretq-resume
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        narf_memory::beacon::paint(52, 0x0060_FF60); // pale green: post-trap, re-polled
 
         // Longjmp path: a hook fired, control is back on the
         // kernel-side stack. Restore the kernel's saved CR3 + zero
