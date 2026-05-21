@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr, wrmsr};
+use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
 
 pub const MSR_IA32_XSS: u32 = 0x0DA0;
 
@@ -135,15 +135,19 @@ pub unsafe fn read_xss() -> u64 {
     unsafe { rdmsr(MSR_IA32_XSS) }
 }
 
-/// Write `IA32_XSS`.
+/// Write `IA32_XSS`. Internally gates on `caps().xsaves` —
+/// IA32_XSS doesn't exist if XSAVES isn't supported, and writing
+/// it would `#GP`. Bits outside `caps().xss_supported` would also
+/// `#GP` (reserved-bit violation); `wrmsr_or_gp` catches both.
 ///
 /// # Safety
-/// CPL = 0; bits in `v` must be ⊆ `caps().xss_supported`.
+/// CPL = 0.
 pub unsafe fn write_xss(v: u64) {
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_XSS, v);
+    let c = caps();
+    if !c.xsaves {
+        return;
     }
+    let _ = wrmsr_or_gp(MSR_IA32_XSS, v & c.xss_supported);
 }
 
 /// Default boot policy: enable every "safe" user component the

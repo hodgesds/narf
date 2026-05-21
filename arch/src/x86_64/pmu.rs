@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr, wrmsr};
+use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
 
 // ── MSR map ────────────────────────────────────────────────────────
 
@@ -189,10 +189,9 @@ pub mod arch_event {
 /// # Safety
 /// CPL = 0; `idx < caps().n_general_counters`.
 pub unsafe fn program_general(idx: u8, sel: PerfEvtSel) {
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_PERFEVTSEL_BASE + idx as u32, sel.encode());
-    }
+    // wrmsr_or_gp: architectural perfmon CPUID may advertise the
+    // MSRs but the hypervisor/BIOS can lock them. Best-effort.
+    let _ = wrmsr_or_gp(MSR_IA32_PERFEVTSEL_BASE + idx as u32, sel.encode());
 }
 
 /// Read general-purpose counter `idx`.
@@ -209,10 +208,7 @@ pub unsafe fn read_general(idx: u8) -> u64 {
 /// # Safety
 /// Same as `read_general`.
 pub unsafe fn write_general(idx: u8, val: u64) {
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_PMC_BASE + idx as u32, val);
-    }
+    let _ = wrmsr_or_gp(MSR_IA32_PMC_BASE + idx as u32, val);
 }
 
 /// Read fixed counter `idx` (0 = instructions retired,
@@ -235,10 +231,7 @@ pub unsafe fn enable_fixed(idx: u8, os: bool, usr: bool) {
     let nibble = (os as u64) | ((usr as u64) << 1);
     let mask = 0xFu64 << (idx as u64 * 4);
     let new = (cur & !mask) | (nibble << (idx as u64 * 4));
-    // SAFETY: same.
-    unsafe {
-        wrmsr(MSR_PERF_FIXED_CTR_CTRL, new);
-    }
+    let _ = wrmsr_or_gp(MSR_PERF_FIXED_CTR_CTRL, new);
 }
 
 /// Atomically enable a set of counters via `IA32_PERF_GLOBAL_CTRL`.
@@ -249,10 +242,7 @@ pub unsafe fn enable_fixed(idx: u8, os: bool, usr: bool) {
 /// CPL = 0.
 pub unsafe fn enable_global(general_mask: u32, fixed_mask: u8) {
     let v = (general_mask as u64) | ((fixed_mask as u64) << 32);
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_PERF_GLOBAL_CTRL, v);
-    }
+    let _ = wrmsr_or_gp(MSR_IA32_PERF_GLOBAL_CTRL, v);
 }
 
 /// Disable every counter via `IA32_PERF_GLOBAL_CTRL = 0`.
@@ -260,10 +250,7 @@ pub unsafe fn enable_global(general_mask: u32, fixed_mask: u8) {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn disable_global() {
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_PERF_GLOBAL_CTRL, 0);
-    }
+    let _ = wrmsr_or_gp(MSR_IA32_PERF_GLOBAL_CTRL, 0);
 }
 
 /// Clear overflow-status bits via `IA32_PERF_GLOBAL_OVF_CTRL`.
@@ -272,8 +259,5 @@ pub unsafe fn disable_global() {
 /// CPL = 0.
 pub unsafe fn clear_overflow(general_mask: u32, fixed_mask: u8) {
     let v = (general_mask as u64) | ((fixed_mask as u64) << 32);
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_PERF_GLOBAL_OVF_CTRL, v);
-    }
+    let _ = wrmsr_or_gp(MSR_IA32_PERF_GLOBAL_OVF_CTRL, v);
 }

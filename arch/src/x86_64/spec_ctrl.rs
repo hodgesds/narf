@@ -28,7 +28,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr, wrmsr};
+use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
 
 pub const MSR_IA32_SPEC_CTRL: u32 = 0x48;
 pub const MSR_IA32_PRED_CMD: u32 = 0x49;
@@ -107,10 +107,13 @@ pub unsafe fn write(bits: u64) {
     if !features().ibrs && !features().stibp && !features().ssbd {
         return;
     }
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_SPEC_CTRL, bits);
-    }
+    // wrmsr_or_gp: some AMD parts report the IBRS CPUID bit
+    // but ship a microcode that rejects writes (paper-spec
+    // bit, no microarchitectural backing). Treat as best-
+    // effort — failure means the mitigation isn't actually in
+    // effect, which the boot-time spec_ctrl status surface
+    // already reflects via the IBRS-active probe.
+    let _ = wrmsr_or_gp(MSR_IA32_SPEC_CTRL, bits);
 }
 
 /// Enable IBRS + STIBP + SSBD on this CPU (best-effort; only the
@@ -150,10 +153,10 @@ pub unsafe fn ibpb() {
     if !features().ibrs {
         return;
     } // IBPB shares the IBRS CPUID bit.
-      // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
-    }
+    // wrmsr_or_gp: IBPB on some AMD parts is microcode-gated
+    // even when CPUID advertises it. Failure means no barrier
+    // is issued — best-effort.
+    let _ = wrmsr_or_gp(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
 }
 
 /// L1 data-cache flush. Used pre-VMENTER on hyperthreaded hosts
@@ -165,10 +168,9 @@ pub unsafe fn l1d_flush() {
     if !features().l1d_flush {
         return;
     }
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_FLUSH_CMD, FLUSH_CMD_L1D);
-    }
+    // wrmsr_or_gp: feature is microcode-gated even when
+    // CPUID(7,0).EDX[28] is set — best-effort.
+    let _ = wrmsr_or_gp(MSR_IA32_FLUSH_CMD, FLUSH_CMD_L1D);
 }
 
 #[doc(hidden)]

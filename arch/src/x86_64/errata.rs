@@ -34,7 +34,7 @@ unsafe fn nop_workaround() { /* marker-only entry */
 /// effect.
 unsafe fn intel_disable_tsx_rtm() {
     use crate::x86_64::cpuid::cpuid;
-    use crate::x86_64::msr::{rdmsr, wrmsr};
+    use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
     const TSX_CTRL_MSR: u32 = 0x122;
     // SAFETY: leaf 7 sub-0 valid (Stage 1 boot validation).
     let (_, _, _, edx) = unsafe { cpuid(7, 0) };
@@ -44,9 +44,11 @@ unsafe fn intel_disable_tsx_rtm() {
     // bit 0 = RTM_DISABLE, bit 1 = TSX_CPUID_CLEAR
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(TSX_CTRL_MSR) };
-    unsafe {
-        wrmsr(TSX_CTRL_MSR, v | 0b11);
-    }
+    // wrmsr_or_gp: some microcodes expose the MSR via CPUID but
+    // BIOS already wrote+locked it; the write would `#GP`. Treat
+    // as best-effort — TSX is already disabled per BIOS in that
+    // case so the workaround is moot.
+    let _ = wrmsr_or_gp(TSX_CTRL_MSR, v | 0b11);
 }
 
 /// AMD Zen 1/2 erratum: clamp DE_CFG[9].
@@ -63,13 +65,14 @@ unsafe fn intel_disable_tsx_rtm() {
 /// # Safety
 /// CPL = 0; caller has confirmed CPU is AMD Zen 1 or Zen 2.
 unsafe fn amd_de_cfg_bit9() {
-    use crate::x86_64::msr::{rdmsr, wrmsr};
+    use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
     const MSR_DE_CFG: u32 = 0xC001_1029;
-    // SAFETY: caller-asserted.
+    // SAFETY: caller-asserted (table dispatch confirms Zen1/2).
     let v = unsafe { rdmsr(MSR_DE_CFG) };
-    unsafe {
-        wrmsr(MSR_DE_CFG, v | (1 << 9));
-    }
+    // BIOS-lock case: AMD-SB-7008 says some OEM BIOSes apply the
+    // chicken bit themselves and lock the MSR. The write then
+    // `#GP`s — non-fatal, the workaround is already in place.
+    let _ = wrmsr_or_gp(MSR_DE_CFG, v | (1 << 9));
 }
 
 /// AMD Zen 4 erratum 1485: under specific micro-op queue
@@ -90,13 +93,14 @@ unsafe fn amd_de_cfg_bit9() {
 /// semantics, but we gate via the table to keep behaviour
 /// minimal.
 unsafe fn amd_zen4_erratum_1485() {
-    use crate::x86_64::msr::{rdmsr, wrmsr};
+    use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
     const MSR_DE_CFG: u32 = 0xC001_1029;
-    // SAFETY: caller-asserted.
+    // SAFETY: caller-asserted (table dispatch confirms Zen 4).
     let v = unsafe { rdmsr(MSR_DE_CFG) };
-    unsafe {
-        wrmsr(MSR_DE_CFG, v | (1 << 14));
-    }
+    // Same BIOS-lock risk as bit 9 above — Phoenix BIOSes
+    // sometimes lock DE_CFG. Failure is non-fatal; only
+    // "serialising-MSR" guarantee is degraded.
+    let _ = wrmsr_or_gp(MSR_DE_CFG, v | (1 << 14));
 }
 
 /// AMD Zen 5 marker — silicon detected, no MSR mutation. Kept

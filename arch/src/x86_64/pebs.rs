@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr, wrmsr};
+use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
 
 pub const MSR_IA32_DS_AREA: u32 = 0x600;
 pub const MSR_PEBS_ENABLE: u32 = 0x3F1;
@@ -77,6 +77,11 @@ impl PebsBuffer {
 /// # Safety
 /// CPL = 0; the DS save area is identity-mapped + persistent.
 pub unsafe fn install_ds(ds_area_phys: u64, pebs: PebsBuffer) {
+    // PEBS is Intel-only; AMD doesn't have `MSR_IA32_DS_AREA` and
+    // the write would `#GP`. Gate on the supported() probe.
+    if !supported() {
+        return;
+    }
     // Populate the PEBS portion of the DS save area (offsets
     // 0x20..0x40 per SDM §19.6.1.1).
     // SAFETY: caller-asserted DS area mapping.
@@ -89,10 +94,9 @@ pub unsafe fn install_ds(ds_area_phys: u64, pebs: PebsBuffer) {
         );
         core::ptr::write_volatile((ds_area_phys + 0x38) as *mut u64, pebs.interrupt_threshold);
     }
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_IA32_DS_AREA, ds_area_phys);
-    }
+    // wrmsr_or_gp: defense-in-depth for the case where CPUID
+    // reports DS save area present but the hypervisor masked it.
+    let _ = wrmsr_or_gp(MSR_IA32_DS_AREA, ds_area_phys);
 }
 
 /// Enable PEBS for the counters in `general_mask` (bit i = PMC i).
@@ -100,10 +104,10 @@ pub unsafe fn install_ds(ds_area_phys: u64, pebs: PebsBuffer) {
 /// # Safety
 /// CPL = 0; `install_ds` was called; PEBS supported.
 pub unsafe fn enable(general_mask: u32) {
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_PEBS_ENABLE, general_mask as u64);
+    if !supported() {
+        return;
     }
+    let _ = wrmsr_or_gp(MSR_PEBS_ENABLE, general_mask as u64);
 }
 
 /// Disable PEBS on every counter.
@@ -111,10 +115,10 @@ pub unsafe fn enable(general_mask: u32) {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn disable() {
-    // SAFETY: caller-asserted.
-    unsafe {
-        wrmsr(MSR_PEBS_ENABLE, 0);
+    if !supported() {
+        return;
     }
+    let _ = wrmsr_or_gp(MSR_PEBS_ENABLE, 0);
 }
 
 /// Current write index of the PEBS buffer (for diagnostics —
