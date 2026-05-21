@@ -45,6 +45,40 @@ enum Cmd {
     /// + /bin/sh. Boot picks the root via `root=PARTLABEL=NARF_ROOT`
     /// on the kernel cmdline.
     DiskWritePartitioned(DiskWritePartitionedArgs),
+    /// Wrap a raw firmware payload with the NARF trailer
+    /// (`firmware/specification/spec.md` §6). Produces an unsigned
+    /// blob — kernel must be built with `firmware-allow-unsigned`
+    /// for these to load. The wrapped output goes into
+    /// `firmware/<name>` inside the workspace (so `xtask image`
+    /// auto-bundles it into the initramfs CPIO).
+    PackFirmware(PackFirmwareArgs),
+}
+
+#[derive(Parser, Clone)]
+struct PackFirmwareArgs {
+    /// Canonical blob name as the kernel sees it, e.g.
+    /// `amdgpu/phoenix.bin`. This drives the on-disk path under
+    /// `firmware/` AND the registry key the driver opens with
+    /// `narf_firmware::open(name, auth)`.
+    #[arg(long)]
+    name: String,
+
+    /// Path to the raw firmware payload (what the device's
+    /// firmware loader actually consumes; e.g. an
+    /// /lib/firmware/amdgpu/*.bin file).
+    #[arg(long)]
+    payload: String,
+
+    /// Optional version string baked into the trailer metadata
+    /// (TLV tag 0x01). Surfaced in `BoundFirmware.version` so the
+    /// kernel can log "loaded vN.N" alongside the bound driver.
+    #[arg(long)]
+    version: Option<String>,
+
+    /// Output path. Defaults to `firmware/<name>` under the
+    /// workspace root so subsequent `xtask image` runs pick it up.
+    #[arg(long)]
+    out: Option<String>,
 }
 
 #[derive(Parser, Clone)]
@@ -878,6 +912,135 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
 ///   - `xorriso` on `$PATH` — produces the El-Torito ISO.
 ///   - Limine support files (`BOOTX64.EFI` for UEFI, `limine-bios.sys`
 ///     + `limine-bios-cd.bin` for the legacy BIOS path) found at
+/// Append `feature` to a comma-separated feature list if it isn't
+/// already present. Avoids the duplicate-feature warnings from
+/// downstream cargo calls when the user supplies an overlapping
+/// `--features` arg.
+fn ensure_feature(features: &mut String, feature: &str) {
+    if features.is_empty() {
+        features.push_str(feature);
+        return;
+    }
+    if features.split(',').any(|f| f.trim() == feature) {
+        return;
+    }
+    features.push(',');
+    features.push_str(feature);
+}
+
+/// Recursively walk `fw_dir` collecting every regular file. Returns
+/// `(cpio_name, bytes)` pairs where `cpio_name = "firmware/<rel>"`
+/// — the prefix the kernel's `scan_initramfs` strips when it
+/// registers entries by canonical name.
+///
+/// Empty result is fine — a build with no firmware just skips the
+/// scan + ships the same init+shell-only CPIO as before.
+fn collect_firmware_blobs(fw_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    if !fw_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![fw_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("read_dir {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(fw_dir)
+                .with_context(|| format!("strip_prefix {} vs {}", path.display(), fw_dir.display()))?;
+            let rel_str = rel
+                .to_str()
+                .ok_or_else(|| anyhow!("firmware path {} not valid UTF-8", path.display()))?
+                .replace('\\', "/");
+            let cpio_name = format!("firmware/{}", rel_str);
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading firmware blob {}", path.display()))?;
+            out.push((cpio_name, bytes));
+        }
+    }
+    // Stable order so successive builds produce byte-identical CPIO
+    // payloads when nothing in firmware/ changed (helps debugging +
+    // any future reproducibility work).
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Wrap a raw firmware payload with the NARF trailer + write it to
+/// disk. Reference: `firmware/src/signature.rs` — payload bytes,
+/// then a 64-byte all-zero signature, 32-byte all-zero signer
+/// fingerprint (the "unsigned" sentinel), metadata TLV bytes
+/// (tag 0x01 = ASCII version), 4-byte LE metadata length, then
+/// the 4-byte trailing magic `b"NRFW"`.
+///
+/// Kernel must be built with `firmware-allow-unsigned` to accept
+/// these — the `firmware-init` initcall rejects unsigned blobs
+/// otherwise.
+fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
+    let payload = std::fs::read(&args.payload)
+        .with_context(|| format!("reading payload from {}", &args.payload))?;
+    if payload.is_empty() {
+        bail!("payload {} is empty — NARF amdgpu rejects size==0", &args.payload);
+    }
+
+    // Metadata: TLV records (1-byte tag + 1-byte len + value).
+    // Tag 0x01 = ASCII version string. Skipped when --version
+    // wasn't supplied so the trailer stays minimal.
+    let mut metadata: Vec<u8> = Vec::new();
+    if let Some(ver) = &args.version {
+        let bytes = ver.as_bytes();
+        if bytes.len() > 255 {
+            bail!("version string too long ({} > 255)", bytes.len());
+        }
+        metadata.push(0x01); // tag
+        metadata.push(bytes.len() as u8);
+        metadata.extend_from_slice(bytes);
+    }
+
+    let mut blob: Vec<u8> = Vec::with_capacity(payload.len() + 104 + metadata.len());
+    blob.extend_from_slice(&payload);
+    blob.extend_from_slice(&[0u8; 64]); // unsigned sig sentinel
+    blob.extend_from_slice(&[0u8; 32]); // unsigned signer fingerprint
+    blob.extend_from_slice(&metadata);
+    blob.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    blob.extend_from_slice(b"NRFW");
+
+    let out_path: PathBuf = match &args.out {
+        Some(p) => PathBuf::from(p),
+        None => workspace_root()?.join("firmware").join(&args.name),
+    };
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating output dir {}", parent.display()))?;
+    }
+    std::fs::write(&out_path, &blob)
+        .with_context(|| format!("writing wrapped blob to {}", out_path.display()))?;
+    println!(
+        "xtask pack-firmware: wrote {} ({} payload bytes + {} trailer bytes = {} total)",
+        out_path.display(),
+        payload.len(),
+        blob.len() - payload.len(),
+        blob.len(),
+    );
+    println!(
+        "  registry key: {}  (kernel opens via `narf_firmware::open(\"{}\", auth)`)",
+        &args.name, &args.name,
+    );
+    if args.version.is_none() {
+        println!("  no --version supplied; blob's BoundFirmware.version will be None");
+    }
+    Ok(())
+}
+
 ///     `$LIMINE_PATH`, `/usr/share/limine/`, or `vendor/limine/`.
 ///   - `limine` binary (optional, only needed for BIOS install).
 fn image_cmd(args: &BuildArgs) -> Result<()> {
@@ -943,16 +1106,48 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         .with_context(|| format!("reading init ELF at {}", init_elf.display()))?;
     let shell_bytes = std::fs::read(&shell_elf)
         .with_context(|| format!("reading shell ELF at {}", shell_elf.display()))?;
-    let cpio = encode_cpio_newc(&[("init", &init_bytes), ("shell", &shell_bytes)]);
+
+    // Firmware bundling: walk `firmware/` under the workspace root.
+    // Each file lands in the initramfs CPIO as `firmware/<relpath>`
+    // and the kernel's `firmware-scan-initramfs` initcall registers
+    // it under that suffix. Pack with `cargo xtask pack-firmware`
+    // — raw `/lib/firmware/amdgpu/*.bin` files won't load without
+    // the NARF trailer.
+    let fw_dir = root.join("firmware");
+    let fw_entries = collect_firmware_blobs(&fw_dir)?;
+
+    let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
+    cpio_entries.push(("init", &init_bytes));
+    cpio_entries.push(("shell", &shell_bytes));
+    for (path, bytes) in &fw_entries {
+        cpio_entries.push((path.as_str(), bytes.as_slice()));
+    }
+    let cpio = encode_cpio_newc(&cpio_entries);
     let cpio_path = boot_dir.join("initramfs.cpio");
     std::fs::write(&cpio_path, &cpio)
         .with_context(|| format!("writing initramfs CPIO to {}", cpio_path.display()))?;
-    println!(
-        "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes)",
-        cpio.len(),
-        init_bytes.len(),
-        shell_bytes.len()
-    );
+    if fw_entries.is_empty() {
+        println!(
+            "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, no firmware)",
+            cpio.len(),
+            init_bytes.len(),
+            shell_bytes.len(),
+        );
+    } else {
+        let fw_total: usize = fw_entries.iter().map(|(_, b)| b.len()).sum();
+        println!(
+            "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, \
+             {} firmware blob(s) totalling {} bytes)",
+            cpio.len(),
+            init_bytes.len(),
+            shell_bytes.len(),
+            fw_entries.len(),
+            fw_total,
+        );
+        for (name, bytes) in &fw_entries {
+            println!("  firmware: {} ({} bytes)", name, bytes.len());
+        }
+    }
 
     // BIOS support files are nice-to-have. xorriso flags below
     // reference them; if missing, drop the BIOS-side El-Torito
@@ -1945,11 +2140,13 @@ fn main() -> Result<()> {
             // never spawns /init or /shell, which is almost never
             // what someone running `xtask image` wants — they're
             // building an ISO to actually run.
-            if args.features.is_empty() {
-                args.features = "boot-init".into();
-            } else if !args.features.contains("boot-init") {
-                args.features.push_str(",boot-init");
-            }
+            //
+            // Default-on firmware-allow-unsigned so bring-up blobs
+            // packed via `xtask pack-firmware` load. Production
+            // signed-key infrastructure isn't wired yet; until it
+            // is, the bring-up arc needs unsigned acceptance.
+            ensure_feature(&mut args.features, "boot-init");
+            ensure_feature(&mut args.features, "firmware-allow-unsigned");
             image_cmd(&args)
         }
         Cmd::IsoBoot(mut args) => {
@@ -1957,15 +2154,13 @@ fn main() -> Result<()> {
             // userspace init + shell tasks; without it the kernel
             // halts at the async-demo exit gate before reaching
             // boot_userspace_init().
-            if args.features.is_empty() {
-                args.features = "boot-init".into();
-            } else if !args.features.contains("boot-init") {
-                args.features.push_str(",boot-init");
-            }
+            ensure_feature(&mut args.features, "boot-init");
+            ensure_feature(&mut args.features, "firmware-allow-unsigned");
             iso_boot_cmd(&args)
         }
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
+        Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();
