@@ -19,7 +19,7 @@ extern crate alloc;
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
 extern crate narf_drivers_fs_ext2;
-extern crate narf_drivers_fs_fat as _;
+extern crate narf_drivers_fs_fat;
 extern crate narf_drivers_fs_exfat as _;
 extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_iso9660 as _;
@@ -1516,6 +1516,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
             narf_drivers_fs_ext2::register_initcalls();
+            narf_drivers_fs_fat::register_initcalls();
             narf_drivers_platform::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into
@@ -1764,96 +1765,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             });
 
             // Auto-mount root if a known FS lives on any probed
-            // block device. Tries the native NVMe async path first
-            // (uses the controller's polled-completion fast path)
-            // then walks `narf_block::block_devices()` (which holds
-            // every `BlockDeviceSync`-implementing driver — AHCI,
-            // RamBlockDevice, virtio-blk-as-sync) wrapped in
-            // `SyncBlock` so the FS layer's async surface is
-            // satisfied. First successful FAT mount wins; the rest
-            // skip silently.
+            // block device. Two paths, in order:
             //
-            // Most UEFI laptops carry FAT32 on the EFI System
-            // Partition + ext4/btrfs/NTFS on the data partition;
-            // FAT discovery here lights up at least the ESP. ext2
-            // / ext4 / etc. discovery lands when those FSes get
-            // matching `mount_*` helpers.
+            // 1. Initramfs (RAM-staged CPIO from the bootloader) —
+            //    tried first so a freshly-built initramfs always
+            //    beats a stale on-disk image. Used on real hardware
+            //    when there's no mountable disk yet (USB stick that
+            //    is purely an initramfs delivery vehicle), and so
+            //    userspace binaries iterate without rebuilding the
+            //    kernel.
+            //
+            // 2. fs-factory registry walk — every FS driver
+            //    (ext2/3/4, FAT, future) registers an
+            //    `Arc<dyn BlockDeviceSync> -> Arc<dyn FsInstance>`
+            //    factory at `Stage::Subsys`. `try_mount_root` walks
+            //    `narf_block::block_devices()`, runs
+            //    `detect_filesystem` on each, looks up the matching
+            //    factory, and mounts the first hit. NVMe / AHCI /
+            //    RamBlockDevice / virtio-blk-as-sync all funnel
+            //    through this one path — no driver-specific code
+            //    here.
             narf_init::register(narf_init::Stage::Late, "root-mount-auto", || {
-                use alloc::sync::Arc;
-                use core::future::Future;
-                use core::pin::Pin;
-                use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-                fn drive<F: Future>(mut fut: F) -> Option<F::Output> {
-                    unsafe fn no_clone(_: *const ()) -> RawWaker {
-                        RawWaker::new(core::ptr::null(), &VTAB)
-                    }
-                    unsafe fn no_op(_: *const ()) {}
-                    const VTAB: RawWakerVTable =
-                        RawWakerVTable::new(no_clone, no_op, no_op, no_op);
-                    // SAFETY: vtable holds null-pointer-clean stubs.
-                    let waker = unsafe {
-                        Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB))
-                    };
-                    let mut ctx = Context::from_waker(&waker);
-                    // SAFETY: stack-pinned for the duration of the loop.
-                    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-                    for _ in 0..1024 {
-                        match pinned.as_mut().poll(&mut ctx) {
-                            Poll::Ready(v) => return Some(v),
-                            Poll::Pending => continue,
-                        }
-                    }
-                    None
-                }
-
                 let auth = narf_filesystem::bootstrap_mount_authority();
-                let domain = narf_lib::id::DomainId::DRIVER_0;
 
-                // Native-async NVMe attempt first — cheaper and the
-                // common case on modern laptops.
-                if narf_drivers_nvme::is_probed() {
-                    let dev = Arc::new(narf_drivers_nvme::NvmeBlockDevice);
-                    let fut = narf_drivers_fs_fat::mount_fat(&auth, "/", dev, domain);
-                    match drive(fut) {
-                        Some(Ok(_handle)) => {
-                            let _ = writeln!(
-                                console::Writer,
-                                "  root-mount: FAT volume on nvme mounted at \"/\""
-                            );
-                            return narf_init::InitResult::Ok;
-                        }
-                        Some(Err(e)) => {
-                            let _ = writeln!(
-                                console::Writer,
-                                "  root-mount: FAT mount on nvme failed: {:?}",
-                                e
-                            );
-                        }
-                        None => {
-                            let _ = writeln!(
-                                console::Writer,
-                                "  root-mount: nvme mount future didn't settle in 1024 polls"
-                            );
-                        }
-                    }
-                }
-
-                // No-disk fallback: if the bootloader staged an
-                // initramfs (CPIO) into RAM, mount it at "/" so the
-                // boot-init flow's `try_load_from_root("init")` /
-                // `try_load_from_root("shell")` resolves against the
-                // initramfs files instead of falling through to the
-                // baked-in ELFs. This is the path used on real
-                // hardware when there's no FAT volume yet (e.g. a
-                // freshly-imaged USB stick that's purely an
-                // initramfs delivery vehicle), and it lets the
-                // userspace binaries iterate without rebuilding the
-                // kernel. Tried BEFORE the disk walk so an
-                // initramfs always wins over a stale FAT volume on
-                // disk — the on-disk image typically lags the
-                // tree's HEAD whereas the initramfs is rebuilt with
-                // every kernel image.
                 if narf_initramfs::is_staged() {
                     match narf_initramfs::mount_at_path(&auth, "/") {
                         Ok(()) => {
@@ -1872,51 +1806,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
-                // Walk every block-device-registry entry, wrap in
-                // SyncBlock, and try a FAT mount. Any device that
-                // turns out not to be FAT returns Unsupported; we
-                // skip and try the next.
-                for entry in narf_block::block_devices() {
-                    let dev = narf_block::SyncBlock::new(entry.dev.clone());
-                    let fut = narf_drivers_fs_fat::mount_fat(&auth, "/", dev, domain);
-                    match drive(fut) {
-                        Some(Ok(_handle)) => {
-                            let _ = writeln!(
-                                console::Writer,
-                                "  root-mount: FAT volume on {} mounted at \"/\"",
-                                entry.name
-                            );
-                            return narf_init::InitResult::Ok;
-                        }
-                        Some(Err(narf_filesystem::FsError::Unsupported)) => continue,
-                        Some(Err(narf_filesystem::FsError::Busy)) => {
-                            // Already mounted by an earlier attempt;
-                            // treat as success.
-                            return narf_init::InitResult::Ok;
-                        }
-                        Some(Err(e)) => {
-                            let _ = writeln!(
-                                console::Writer,
-                                "  root-mount: FAT mount on {} failed: {:?}",
-                                entry.name, e
-                            );
-                        }
-                        None => {
-                            let _ = writeln!(
-                                console::Writer,
-                                "  root-mount: {} mount future didn't settle in 1024 polls",
-                                entry.name
-                            );
-                        }
-                    }
-                }
-
-                // FAT walk didn't find anything — consult the
-                // fs-factory registry (ext2/3/4 + future drivers
-                // register here at Stage::Subsys). try_mount_root
-                // calls detect_filesystem on each device, looks up
-                // the matching factory, and mounts. Any detected FS
-                // with a registered factory wins.
                 match narf_filesystem::root_mount::try_mount_root(&auth) {
                     Ok(report) => {
                         let _ = writeln!(

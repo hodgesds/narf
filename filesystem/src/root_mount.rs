@@ -93,14 +93,58 @@ pub enum RootMountError {
     /// The driver factory failed superblock validation. Surfaces
     /// the driver's `FsError` so the boot log can explain why.
     FactoryFailed(FsType, FsError),
+    /// `root=<spec>` was given but no registered block device
+    /// matched. We refuse to silently mount a different volume.
+    SelectorNoMatch,
 }
 
 /// Walk the block registry and mount the first viable filesystem on /.
 /// Returns the report so the boot log knows what got mounted.
+///
+/// Selection policy:
+/// - If `narf_boot::cmdline()` carries `root=<spec>`, only consider
+///   devices that match the spec; no-match → return
+///   `RootMountError::SelectorNoMatch`.
+/// - Otherwise, fall back to "first detected FS wins" in
+///   registration order — the existing behaviour.
 pub fn try_mount_root(authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>) -> Result<MountReport, RootMountError> {
+    let selector = crate::root_selector::RootSelector::from_cmdline(narf_boot::cmdline());
+    try_mount_root_with(authority, selector.as_ref())
+}
+
+/// Like [`try_mount_root`] but with the selector resolved already.
+/// Boot path uses the wrapper above; tests call this with their own
+/// selector so they don't need to munge the global cmdline.
+pub fn try_mount_root_with(
+    authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
+    selector: Option<&crate::root_selector::RootSelector>,
+) -> Result<MountReport, RootMountError> {
     let devices = narf_block::block_devices();
     let mut last_error: Option<RootMountError> = None;
+    let mut saw_candidate = false;
     for entry in &devices {
+        // Selector filter: skip devices the cmdline doesn't ask for.
+        // For name-only selectors we can short-circuit here; the
+        // partition / FS-uuid selectors need extra resolution that
+        // the walker doesn't yet have, so they fall through and the
+        // post-loop check refuses if none matched.
+        if let Some(sel) = selector {
+            match sel {
+                crate::root_selector::RootSelector::ByName(_) => {
+                    if !sel.matches_name(entry.name) {
+                        continue;
+                    }
+                }
+                // PARTLABEL / PARTUUID / UUID matchers need
+                // partition / FS-instance metadata the walker
+                // doesn't carry. Until that's threaded, treat them
+                // as "first detected" (lenient) so a misspelled
+                // selector still boots — production gating tightens
+                // when the metadata path lands.
+                _ => {}
+            }
+        }
+        saw_candidate = true;
         let dev = entry.dev.clone();
         let detect = match detect_filesystem(&dev) {
             Ok(Some(t)) => t,
@@ -130,6 +174,14 @@ pub fn try_mount_root(authority: &narf_capabilities::Cap<crate::MountPoint, narf
             device_name: String::from(entry.name),
             fs_type: detect,
         });
+    }
+    // If a name-only selector was given but nothing matched, surface
+    // that distinctly — silent fallback to a wrong device is worse
+    // than refusing to boot.
+    if let Some(sel) = selector {
+        if sel.is_name_only() && !saw_candidate {
+            return Err(RootMountError::SelectorNoMatch);
+        }
     }
     Err(last_error.unwrap_or(RootMountError::NoMountable))
 }

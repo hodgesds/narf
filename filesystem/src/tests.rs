@@ -1071,3 +1071,89 @@ kernel_test_in!(
     "filesystem/root_mount",
     smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry
 );
+
+// ── filesystem/root_selector ───────────────────────────────────────
+
+fn smoke_root_selector_parses_dev_path() -> TestResult {
+    use crate::root_selector::RootSelector;
+    match RootSelector::from_cmdline("quiet root=/dev/nvme0p1 init=/sbin/init") {
+        Some(RootSelector::ByName(name)) if name == "nvme0p1" => TestResult::Pass,
+        _ => TestResult::Fail("root=/dev/nvme0p1 must yield ByName(\"nvme0p1\")"),
+    }
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_dev_path);
+
+fn smoke_root_selector_parses_bare_name() -> TestResult {
+    use crate::root_selector::RootSelector;
+    // Without /dev/ prefix — should also work.
+    match RootSelector::from_cmdline("root=usb-msc0p1") {
+        Some(RootSelector::ByName(name)) if name == "usb-msc0p1" => TestResult::Pass,
+        _ => TestResult::Fail("bare name root= must yield ByName"),
+    }
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_bare_name);
+
+fn smoke_root_selector_parses_partlabel() -> TestResult {
+    use crate::root_selector::RootSelector;
+    match RootSelector::from_cmdline("root=PARTLABEL=NARF_ROOT") {
+        Some(RootSelector::ByPartLabel(label)) if label == "NARF_ROOT" => TestResult::Pass,
+        _ => TestResult::Fail("PARTLABEL not parsed"),
+    }
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_partlabel);
+
+fn smoke_root_selector_parses_uuid_variants() -> TestResult {
+    use crate::root_selector::RootSelector;
+    let uuid = "12345678-1234-1234-1234-123456789ABC";
+    let p = alloc::format!("root=PARTUUID={}", uuid);
+    match RootSelector::from_cmdline(&p) {
+        Some(RootSelector::ByPartUuid(u)) if u == uuid => {}
+        _ => return TestResult::Fail("PARTUUID not parsed"),
+    }
+    let f = alloc::format!("root=UUID={}", uuid);
+    match RootSelector::from_cmdline(&f) {
+        Some(RootSelector::ByFsUuid(u)) if u == uuid => TestResult::Pass,
+        _ => TestResult::Fail("UUID not parsed"),
+    }
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_uuid_variants);
+
+fn smoke_root_selector_returns_none_when_absent() -> TestResult {
+    use crate::root_selector::RootSelector;
+    match RootSelector::from_cmdline("quiet noapic init=/init") {
+        None => TestResult::Pass,
+        _ => TestResult::Fail("absent root= must yield None"),
+    }
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_selector_returns_none_when_absent);
+
+fn smoke_root_selector_first_root_wins() -> TestResult {
+    use crate::root_selector::RootSelector;
+    // Multiple root=: parser takes the first.
+    match RootSelector::from_cmdline("root=/dev/a root=/dev/b") {
+        Some(RootSelector::ByName(name)) if name == "a" => TestResult::Pass,
+        _ => TestResult::Fail("first root= must win"),
+    }
+}
+kernel_test_in!("filesystem/root_selector", smoke_root_selector_first_root_wins);
+
+fn smoke_root_mount_selector_no_match_refuses() -> TestResult {
+    use crate::root_mount::{try_mount_root_with, RootMountError, __reset_for_test};
+    use crate::root_selector::RootSelector;
+    use crate::MountPoint;
+    use narf_capabilities::{Cap, Grant};
+    __reset_for_test();
+    let auth: Cap<MountPoint, Grant> = Cap::bootstrap();
+    // No registered block device named "doesnt-exist" — walker
+    // must refuse rather than fall through to a different device.
+    let sel = RootSelector::ByName(alloc::string::String::from("doesnt-exist-p1"));
+    match try_mount_root_with(&auth, Some(&sel)) {
+        Err(RootMountError::SelectorNoMatch)
+        | Err(RootMountError::NoMountable) => TestResult::Pass,
+        _ => TestResult::Fail("name-only selector miss must refuse"),
+    }
+}
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_mount_selector_no_match_refuses
+);

@@ -88,3 +88,49 @@ pub enum FatVersion {
     Fat16,
     Fat32,
 }
+
+// ── Stage::Subsys factory registration ────────────────────────────
+//
+// Wires the FAT driver into narf_filesystem::root_mount so the
+// boot path's auto-mount walker can construct a FatVolume from
+// any `Arc<dyn BlockDeviceSync>` whose BPB detect_filesystem
+// classified as `FsType::Fat`.
+//
+// Path:
+//   register_fs_factory(FsType::Fat, fat_factory)
+//   fat_factory(dev) wraps `dev` in `SyncBlock` → `BlockDevice`,
+//     then block_on's `FatVolume::mount(async_dev, domain)`.
+//
+// Shape mirrors `narf_drivers_fs_ext2::ext_factory` — keep them
+// aligned so the root-mount integration path stays uniform.
+
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "fat-fs-factory", || {
+        narf_filesystem::root_mount::register_fs_factory(
+            narf_block::fs_detect::FsType::Fat,
+            fat_factory,
+        );
+        InitResult::Ok
+    });
+}
+
+/// Factory for FsType::Fat. Wraps the sync block device in a
+/// SyncBlock bridge, then block_on's the async mount path.
+///
+/// Errors bubble up unchanged so the root-mount walker can log the
+/// reason and try the next candidate device.
+fn fat_factory(
+    dev: Arc<dyn narf_block::BlockDeviceSync>,
+) -> Result<Arc<dyn FsInstance>, FsError> {
+    use narf_block::SyncBlock;
+
+    // SyncBlock::new returns Arc<SyncBlock> — exactly the
+    // `Arc<B: BlockDevice>` shape FatVolume::mount expects.
+    let async_dev = SyncBlock::new(dev);
+    let vol = narf_scheduler::block_on(volume::FatVolume::mount(
+        async_dev,
+        DomainId::DRIVER_0,
+    ))?;
+    Ok(vol as Arc<dyn FsInstance>)
+}

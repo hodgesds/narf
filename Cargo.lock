@@ -744,10 +744,12 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-filesystem",
+ "narf-init",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
