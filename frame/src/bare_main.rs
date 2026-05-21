@@ -320,6 +320,81 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             console::Writer,
             "  idt: loaded — 32 CPU-exception vectors routed"
         );
+
+        // EFER.NXE — make PTE bit 63 mean "no execute" instead of
+        // reserved. Defensive against firmware paths (some real
+        // Phoenix/Renoir UEFI fast-paths) that skip Limine's NXE
+        // setup. Without this, every user data/stack PTE with
+        // NO_EXEC=1 triggers a reserved-bit #PF on first access
+        // (QEMU TCG is lax about this; real silicon isn't).
+        // SAFETY: CPL=0, pre-userspace, idempotent if already set.
+        unsafe {
+            narf_arch::x86_64::msr::enable_nxe();
+        }
+
+        // Baseline CPU validation. Reads CPUID + CR4 + EFER and
+        // refuses to proceed only if a TRULY required bit is off
+        // (long-mode, NX, EFER.LME/NXE, CR4.PAE). Other bits get
+        // logged + beacon-painted but don't gate boot — they're
+        // useful diagnostics, not preconditions. The narrower
+        // gate avoids halting on kernel-test QEMU profiles that
+        // don't expose Invariant TSC or some CR4 enables.
+        // SAFETY: CPL=0; validate() reads CPUID + RDMSR.
+        let cpuval = unsafe { narf_arch::x86_64::cpu_validate::validate() };
+        let fatal: Option<&'static str> = if !cpuval.long_mode {
+            Some("CPUID: Long Mode missing")
+        } else if !cpuval.nx {
+            Some("CPUID: NX missing")
+        } else if !cpuval.efer_lme_on {
+            Some("EFER.LME not enabled")
+        } else if !cpuval.efer_nxe_on {
+            Some("EFER.NXE not enabled (after enable_nxe — wrmsr was rejected?)")
+        } else if !cpuval.cr4_pae_on {
+            Some("CR4.PAE not enabled")
+        } else {
+            None
+        };
+        let _ = writeln!(
+            console::Writer,
+            "  cpu-validate: NX={} SMEP={}/{} SMAP={}/{} OSXSAVE={}/{} \
+             EFER.LME={} EFER.NXE={} CR4.PAE={} fsgsbase={} invariant_tsc={}",
+            cpuval.nx,
+            cpuval.smep, cpuval.cr4_smep_on,
+            cpuval.smap, cpuval.cr4_smap_on,
+            cpuval.xsave, cpuval.cr4_osxsave_on,
+            cpuval.efer_lme_on,
+            cpuval.efer_nxe_on,
+            cpuval.cr4_pae_on,
+            cpuval.cr4_fsgsbase_on,
+            cpuval.invariant_tsc,
+        );
+        match fatal {
+            None => {
+                // Slot 31 = baseline ok. Stays lit through the
+                // whole boot so a glance at the row confirms the
+                // gate passed.
+                narf_memory::beacon::paint(31, 0x0000FF80); // bright green
+            }
+            Some(why) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  cpu-validate: FATAL — {}", why
+                );
+                // Slot 31 = baseline fail (bright red). Halt with
+                // CLI+HLT loop so the operator sees the message
+                // + beacon instead of crashing into a userspace
+                // fault five stages later.
+                narf_memory::beacon::paint(31, 0x00FF0000); // bright red
+                #[allow(clippy::empty_loop)]
+                loop {
+                    // SAFETY: CLI + HLT at CPL=0 is the canonical
+                    // "stop here, IRQ-quiet" idle.
+                    unsafe {
+                        core::arch::asm!("cli; hlt", options(nomem, nostack));
+                    }
+                }
+            }
+        }
     }
 
     // Stage 2 feature probe. Print what the CPU supports; gate
