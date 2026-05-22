@@ -4704,3 +4704,64 @@ fn smoke_vmalloc_claimed_bytes_tracks_sum() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_vmalloc_claimed_bytes_tracks_sum);
+
+// ── AtomicPool ──────────────────────────────────────────────────────
+
+/// Lease + drop returns the item to the pool. free_count must
+/// match capacity at rest and decrement on lease.
+fn smoke_atomic_pool_lease_returns_on_drop() -> TestResult {
+    use crate::atomic_pool::AtomicPool;
+    // Box::leak to get a 'static reference — AtomicPool::try_get
+    // requires &'static self for the Pooled's pool pointer.
+    let pool: &'static AtomicPool<u64> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            AtomicPool::new(4, || 0xDEAD_BEEFu64),
+        ));
+    if pool.capacity() != 4 {
+        return TestResult::Fail("capacity mismatch");
+    }
+    if pool.free_count() != 4 {
+        return TestResult::Fail("fresh pool's free count != capacity");
+    }
+    {
+        let _a = pool.try_get().expect("first lease");
+        if pool.free_count() != 3 {
+            return TestResult::Fail("free count didn't decrement on lease");
+        }
+        let _b = pool.try_get().expect("second lease");
+        if pool.free_count() != 2 {
+            return TestResult::Fail("second lease didn't decrement further");
+        }
+    }
+    // Both Pooled have dropped — items returned.
+    if pool.free_count() != 4 {
+        return TestResult::Fail("Drop didn't restore the items to the pool");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_atomic_pool_lease_returns_on_drop);
+
+/// Exhausting the pool returns None on the next try_get; freeing
+/// any handle restores availability.
+fn smoke_atomic_pool_exhausted_returns_none() -> TestResult {
+    use crate::atomic_pool::AtomicPool;
+    let pool: &'static AtomicPool<u32> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            AtomicPool::new(2, || 42u32),
+        ));
+    let a = pool.try_get().expect("a");
+    let b = pool.try_get().expect("b");
+    if pool.try_get().is_some() {
+        return TestResult::Fail("try_get returned Some on exhausted pool");
+    }
+    drop(a);
+    let _c = pool
+        .try_get()
+        .expect("after dropping one handle, pool has space");
+    drop(b);
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_atomic_pool_exhausted_returns_none);
+
+// (deref-round-trip already covered by atomic_pool.rs's
+// smoke_atomic_pool_pooled_deref_mut_visible_next_lease.)

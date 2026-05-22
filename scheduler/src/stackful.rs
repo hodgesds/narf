@@ -2465,6 +2465,105 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// N tasks contend for AtomicPool leases; never observe a
+    /// double-lease (same item handed to two callers). Verifies
+    /// the IrqSafeSpinLock + Vec::pop hot path under interleaved
+    /// task pressure.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_atomic_pool_no_double_lease() -> TestResult {
+        use narf_memory::atomic_pool::AtomicPool;
+
+        // Each pool item carries a unique id; tasks lease,
+        // record the id, drop, repeat. If two tasks ever lease
+        // the same id at the same time, we set DOUBLE.
+        const POOL_SIZE: usize = 4;
+        const TASKS: usize = 4;
+        const ITERS: u32 = 16;
+
+        let pool: &'static AtomicPool<u32> = alloc::boxed::Box::leak(
+            alloc::boxed::Box::new(AtomicPool::new(POOL_SIZE, {
+                let mut next = 0u32;
+                move || {
+                    let id = next;
+                    next += 1;
+                    id
+                }
+            })),
+        );
+        static IN_USE: [AtomicBool; POOL_SIZE] = [
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ];
+        static DOUBLE: AtomicBool = AtomicBool::new(false);
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        for s in IN_USE.iter() {
+            s.store(false, Ordering::Release);
+        }
+        DOUBLE.store(false, Ordering::Release);
+        DONE.store(0, Ordering::Release);
+
+        struct Leaser {
+            pool: &'static AtomicPool<u32>,
+            remaining: u32,
+        }
+        impl Future for Leaser {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    DONE.fetch_add(1, Ordering::AcqRel);
+                    return Poll::Ready(());
+                }
+                let item = match self.pool.try_get() {
+                    Some(i) => i,
+                    None => {
+                        // Pool exhausted by peers; retry next round.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                };
+                let id = *item as usize;
+                if id >= POOL_SIZE {
+                    DOUBLE.store(true, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                if IN_USE[id].swap(true, Ordering::AcqRel) {
+                    // We saw IN_USE already true → another task
+                    // has this same item — double-lease bug.
+                    DOUBLE.store(true, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                // Brief use, then release.
+                IN_USE[id].store(false, Ordering::Release);
+                drop(item);
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for _ in 0..TASKS {
+            crate::spawn_stackful(Leaser {
+                pool,
+                remaining: ITERS,
+            });
+        }
+        for _ in 0..512 {
+            crate::poll_one_round();
+            if (DONE.load(Ordering::Acquire) as usize) >= TASKS {
+                break;
+            }
+        }
+        if DOUBLE.load(Ordering::Acquire) {
+            return TestResult::Fail("AtomicPool handed the same item to two concurrent leasers");
+        }
+        if (DONE.load(Ordering::Acquire) as usize) != TASKS {
+            return TestResult::Fail("pool-stress tasks didn't all finish");
+        }
+        TestResult::Pass
+    }
+
     /// Distinct task IDs across many concurrent spawns. spawn()
     /// returns a TaskId; if the allocation racy, two
     /// concurrent calls could hand out the same id. Verifies
@@ -2841,5 +2940,10 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_concurrency_timer_wheel_many_sleepers_fire
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_atomic_pool_no_double_lease
     );
 }
