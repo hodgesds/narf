@@ -22,7 +22,11 @@ pub mod wait;
 
 mod tests;
 
-pub use dispatch::{fire_count, install as install_handler, on_irq, SyncHandler, NUM_VECTORS};
+pub use dispatch::{
+    disable_irq, enable_irq, fire_count, fire_count_on_cpu, install as install_handler,
+    install_handler_named, installed_handler_names, is_masked, on_irq, remove_handler,
+    spurious_count, synchronize_irq, HandlerEntry, IrqStatus, SyncHandler, NUM_VECTORS,
+};
 pub use wait::{wait_for_irq, wait_for_irq_until, WaitForIrq};
 
 #[cfg(target_arch = "x86_64")]

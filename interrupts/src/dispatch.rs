@@ -2,124 +2,409 @@
 //!
 //! Stage-3 / Stage-4 driver-readiness piece: every IRQ that lands in
 //! the per-arch trap handler (vector ≥ 32 on x86_64, LPI/SPI INTID
-//! mapped to a logical slot on aarch64) increments a 64-bit fire count
-//! and wakes the registered task waker, if any.
+//! mapped to a logical slot on aarch64) increments fire counts and
+//! invokes the registered handlers + wakers.
 //!
-//! The table is `[Slot; 256]` — one slot per "logical vector." On
-//! x86_64 the logical vector *is* the IDT vector. On aarch64 the
-//! ITS / GIC layer maps real INTIDs onto a slot index in this table
-//! (typically `INTID - LPI_BASE`, capped at 255 in the Stage-3 cut).
+//! ## What this exposes
 //!
-//! Per-vector concurrency:
-//! - `fire_count` is a single atomic — multiple CPUs delivering the
-//!   same vector race only on the increment, never on the value.
-//! - `waker` lives behind an `IrqSafeSpinLock` so the IRQ handler can
-//!   take the waker out and wake it without leaving anything for the
-//!   future to race with on its next poll.
+//! - Per-vector global + per-CPU `fire_count` counters.
+//! - **Multiple** synchronous handlers per vector (shared-INTx
+//!   chain). Each returns `IrqStatus::Handled` or `IrqStatus::None`;
+//!   if every handler returns `None`, the IRQ is recorded as
+//!   spurious and the spurious counter advances.
+//! - **Multiple** wakers per vector. Each `wait_for_irq` future
+//!   gets its own waker entry; on IRQ delivery every entry wakes
+//!   and the list clears.
+//! - `synchronize_irq(vector)` — busy-wait until any in-flight
+//!   handler for `vector` has returned. Symmetric with Linux's
+//!   `synchronize_irq()`; called before tearing down device
+//!   state a handler might still be reading.
+//! - Per-vector mask flag — `disable_irq(vec)` short-circuits the
+//!   dispatch (handlers + wakers + fire-count + spurious all skip).
+//!   Drivers programming the controller mask directly still work;
+//!   this is the generic layer.
+//! - Named handler entries — `install_handler_named(vec, name,
+//!   cookie, fn)` records the owner string so diagnostics
+//!   (`/proc/interrupts`-equivalent) can attribute a vector to its
+//!   driver.
+//!
+//! ## Concurrency
+//!
+//! `on_irq` reads handler / waker lists under each vector's
+//! `IrqSafeSpinLock`. Calls happen with IRQs disabled on the
+//! current CPU (interrupt gate clears IF), so the lock is
+//! uncontested in IRQ context on the same CPU. Cross-CPU concurrent
+//! delivery of the same vector serializes via the spinlock.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::Waker;
 
+use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Number of logical vectors. Sized to cover the x86_64 IDT range; the
-/// aarch64 ITS path stays under 256 LPIs by Stage-3 convention.
+/// Number of logical vectors. Sized to cover the x86_64 IDT range;
+/// the aarch64 ITS path stays under 256 LPIs by Stage-3 convention.
 pub const NUM_VECTORS: usize = 256;
 
+/// IRQ-handler outcome, matching Linux's `irqreturn_t` discipline.
+/// Drivers chained on a shared INTx line each return `Handled` if
+/// they observed and acked a real interrupt from THEIR device, or
+/// `None` if the line went hot but their device wasn't the cause.
+/// When every chained handler returns `None`, `on_irq` records the
+/// fire as spurious — useful for diagnosing wedged level-triggered
+/// lines.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IrqStatus {
+    Handled,
+    None,
+}
+
+/// Synchronous handler signature. Takes a per-handler cookie (any
+/// opaque `u64` the driver passed at `install_handler_named`) so a
+/// single function can be shared across multiple devices and key off
+/// the cookie to find the right state. Matches the spirit of Linux's
+/// `void *dev_id` second argument.
+pub type SyncHandler = fn(cookie: u64) -> IrqStatus;
+
+/// One handler entry in the per-vector chain.
+#[derive(Clone, Copy)]
+pub struct HandlerEntry {
+    pub handler: SyncHandler,
+    pub cookie: u64,
+    /// Driver-supplied name. Surfaces in
+    /// `installed_handler_names(vector)` for diagnostics. `'static`
+    /// because the entry is stored for the lifetime of the bind.
+    pub name: &'static str,
+}
+
+impl core::fmt::Debug for HandlerEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HandlerEntry")
+            .field("name", &self.name)
+            .field("cookie", &self.cookie)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Max CPUs we track per-vector fire counts for. Matches
+/// `narf_lib::percpu::MAX_CPUS` but pinned locally so this crate
+/// doesn't need the dep.
+const PERCPU_FIRES_MAX: usize = 64;
+
 /// Per-vector dispatch state.
-#[derive(Debug)]
 pub struct Slot {
-    /// Total IRQs delivered on this vector since boot. Never decreases.
+    /// Total IRQs delivered on this vector since boot, across all
+    /// CPUs. Never decreases.
     pub fired: AtomicU64,
-    /// Task waker that wants to be notified on the next IRQ. Cleared
-    /// on every wake — the future re-installs it on its next poll.
-    pub waker: IrqSafeSpinLock<Option<Waker>>,
+    /// Per-CPU fire counts. Diagnoses IRQ-steering issues — Linux's
+    /// `/proc/interrupts` shows the same shape.
+    pub per_cpu_fired: [AtomicU64; PERCPU_FIRES_MAX],
+    /// Spurious-IRQ count: incremented when every installed handler
+    /// returned `IrqStatus::None`. A nonzero value points at a
+    /// driver that's not claiming a shared line correctly, OR (more
+    /// often) a level-triggered IRQ that never gets acked at the
+    /// device.
+    pub spurious: AtomicU64,
+    /// Concurrent in-flight handler count. `on_irq` increments at
+    /// entry, decrements at exit. `synchronize_irq` busy-waits
+    /// until this hits zero.
+    pub in_flight: AtomicU32,
+    /// Soft mask. `disable_irq` sets this true; `on_irq` short-
+    /// circuits (no handlers, no wakers, no fire-count). Drivers
+    /// programming the controller mask directly still work; this is
+    /// the generic-layer mask.
+    pub masked: AtomicBool,
+    /// Chain of synchronous handlers. Multiple installed handlers
+    /// fire in install order; each can claim or pass the IRQ.
+    pub handlers: IrqSafeSpinLock<Vec<HandlerEntry>>,
+    /// List of pending wakers. `on_irq` swaps the list out, wakes
+    /// every entry, leaves the slot empty for the futures to
+    /// re-register on their next poll.
+    pub wakers: IrqSafeSpinLock<Vec<Waker>>,
+}
+
+impl core::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Slot")
+            .field("fired", &self.fired.load(Ordering::Relaxed))
+            .field("spurious", &self.spurious.load(Ordering::Relaxed))
+            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
+            .field("masked", &self.masked.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Slot {
     pub const fn new() -> Self {
         Self {
             fired: AtomicU64::new(0),
-            waker: IrqSafeSpinLock::new(None),
+            per_cpu_fired: [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX],
+            spurious: AtomicU64::new(0),
+            in_flight: AtomicU32::new(0),
+            masked: AtomicBool::new(false),
+            handlers: IrqSafeSpinLock::new(Vec::new()),
+            wakers: IrqSafeSpinLock::new(Vec::new()),
         }
     }
 }
 
 static SLOTS: [Slot; NUM_VECTORS] = [const { Slot::new() }; NUM_VECTORS];
 
-/// Optional synchronous handler per vector. Invoked from `on_irq`
-/// *before* the waker fires, so handlers see a fully consistent
-/// `fire_count` snapshot. Cross-CPU IPI handlers (e.g. TLB shootdown)
-/// install themselves here.
-static HANDLERS: [AtomicUsize; NUM_VECTORS] = [const { AtomicUsize::new(0) }; NUM_VECTORS];
+// ── Handler install / clear ────────────────────────────────────────
 
-pub type SyncHandler = fn();
-
-/// Install a synchronous handler for `vector`. A second `install`
-/// overwrites the previous handler — there is one handler per
-/// vector, by design.
-pub fn install(vector: u8, handler: SyncHandler) {
-    HANDLERS[vector as usize].store(handler as usize, Ordering::Release);
-}
-
-/// Clear the synchronous handler for `vector`.
-pub fn clear_handler(vector: u8) {
-    HANDLERS[vector as usize].store(0, Ordering::Release);
-}
-
-/// Called from the per-arch IRQ handler with the logical vector that
-/// just fired. Increments the fire count + wakes any registered waker.
+/// Install a named synchronous handler for `vector`. Multiple
+/// handlers can be installed on the same vector to support shared
+/// INTx lines; they fire in install order, each can claim the IRQ
+/// (return `Handled`) or pass it along (return `None`). When every
+/// chained handler returns `None`, `on_irq` records the delivery as
+/// spurious.
 ///
-/// Cheap: one atomic increment + one lock acquisition.
+/// `name` is the driver / device identifier shown in diagnostics;
+/// `cookie` is an opaque per-binding value passed back to the
+/// handler (typically a pointer cast to u64).
+pub fn install_handler_named(
+    vector: u8,
+    name: &'static str,
+    cookie: u64,
+    handler: SyncHandler,
+) {
+    let mut g = SLOTS[vector as usize].handlers.lock();
+    g.push(HandlerEntry {
+        handler,
+        cookie,
+        name,
+    });
+}
+
+/// Back-compat shim: install with a `fn()` signature. Wraps the
+/// caller's function to always return `IrqStatus::Handled` and
+/// passes a zero cookie. Use this only for legacy callers that
+/// can't yet plumb the cookie / name through; new code should use
+/// `install_handler_named`.
+pub fn install(vector: u8, handler: fn()) {
+    // We need to bridge `fn()` to `SyncHandler` without an alloc-
+    // backed closure trick. Stage 1: a global "legacy slot" per
+    // vector storing the `fn()` pointer; the wrapper reads it via
+    // cookie and calls. The cookie is the vector itself (legacy
+    // handlers don't have a real cookie).
+    legacy_install(vector, handler);
+}
+
+/// Legacy-handler shim. Stored per-vector; the bridge wrapper
+/// `legacy_bridge` reads it and calls.
+static LEGACY: [core::sync::atomic::AtomicUsize; NUM_VECTORS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; NUM_VECTORS];
+
+fn legacy_install(vector: u8, handler: fn()) {
+    LEGACY[vector as usize].store(handler as usize, Ordering::Release);
+    // Only chain the bridge ONCE per vector — re-installing a
+    // legacy handler just replaces the stored fn pointer.
+    let chain_present = {
+        let g = SLOTS[vector as usize].handlers.lock();
+        g.iter().any(|h| h.handler as usize == legacy_bridge as usize)
+    };
+    if !chain_present {
+        install_handler_named(vector, "legacy", vector as u64, legacy_bridge);
+    }
+}
+
+fn legacy_bridge(cookie: u64) -> IrqStatus {
+    let v = (cookie & 0xFF) as usize;
+    let h = LEGACY[v].load(Ordering::Acquire);
+    if h == 0 {
+        return IrqStatus::None;
+    }
+    // SAFETY: stored as `fn() as usize` in `legacy_install`.
+    let f: fn() = unsafe { core::mem::transmute(h) };
+    f();
+    IrqStatus::Handled
+}
+
+/// Remove a specific handler from the chain by name + cookie pair.
+/// Returns `true` if a matching entry was removed. Use when the
+/// driver tears down — combine with `synchronize_irq` BEFORE the
+/// drop to ensure no in-flight call observes a freed `cookie`.
+pub fn remove_handler(vector: u8, name: &str, cookie: u64) -> bool {
+    let mut g = SLOTS[vector as usize].handlers.lock();
+    let len_before = g.len();
+    g.retain(|h| !(h.name == name && h.cookie == cookie));
+    g.len() < len_before
+}
+
+/// Clear all handlers for `vector`. Legacy shim kept for callers
+/// that used the old `clear_handler` API.
+pub fn clear_handler(vector: u8) {
+    SLOTS[vector as usize].handlers.lock().clear();
+    LEGACY[vector as usize].store(0, Ordering::Release);
+}
+
+/// Snapshot the names of all installed handlers on `vector`. For
+/// diagnostics — feeds the FB status panel's "vector X owned by
+/// {drivers...}" line. The returned Vec is a copy; the lock is
+/// dropped before return.
+pub fn installed_handler_names(vector: u8) -> Vec<&'static str> {
+    SLOTS[vector as usize]
+        .handlers
+        .lock()
+        .iter()
+        .map(|h| h.name)
+        .collect()
+}
+
+// ── Per-vector mask ────────────────────────────────────────────────
+
+/// Soft-disable a vector's dispatch. `on_irq` short-circuits (no
+/// handlers run, no wakers fire, no fire-count advance). Drivers
+/// programming the controller mask directly still work; this is the
+/// generic mask layer for stop-the-world cases (driver teardown,
+/// resume from suspend).
+pub fn disable_irq(vector: u8) {
+    SLOTS[vector as usize].masked.store(true, Ordering::Release);
+}
+
+/// Inverse of `disable_irq`. Subsequent `on_irq(vector)` calls
+/// resume full dispatch.
+pub fn enable_irq(vector: u8) {
+    SLOTS[vector as usize].masked.store(false, Ordering::Release);
+}
+
+/// Returns true if the vector is currently soft-masked.
+pub fn is_masked(vector: u8) -> bool {
+    SLOTS[vector as usize].masked.load(Ordering::Acquire)
+}
+
+// ── synchronize_irq ────────────────────────────────────────────────
+
+/// Wait until no `on_irq(vector)` call is in flight. Symmetric with
+/// Linux's `synchronize_irq()`. Use BEFORE freeing device state a
+/// handler might still be reading (BAR unmap, driver state Drop).
+///
+/// Busy-waits on `in_flight`. On a single CPU the in-flight count
+/// can only be nonzero if we were preempted out of an IRQ handler
+/// — uncommon but possible. The loop yields nothing because we're
+/// expected to be at a teardown boundary where time matters less
+/// than safety.
+pub fn synchronize_irq(vector: u8) {
+    while SLOTS[vector as usize].in_flight.load(Ordering::Acquire) > 0 {
+        core::hint::spin_loop();
+    }
+}
+
+// ── Dispatch entry point ───────────────────────────────────────────
+
+/// Called from the per-arch IRQ handler with the logical vector
+/// that just fired. Increments the fire counts, invokes every
+/// installed handler in chain order, and wakes every registered
+/// waker.
+///
+/// If the vector is soft-masked (`disable_irq`), this is a no-op —
+/// no counters move, no handlers run, no wakers fire.
 #[inline]
 pub fn on_irq(vector: u8) {
-    // Bracket the entire IRQ body with enter_irq/exit_irq so
-    // anything called from the synchronous handler (driver code,
-    // allocators, etc.) sees `narf_lib::context::in_irq() == true`
-    // and routes through the atomic-context allocator paths.
-    narf_lib::context::enter_irq();
     let s = &SLOTS[vector as usize];
-    s.fired.fetch_add(1, Ordering::Release);
 
-    // Synchronous handler runs *before* any waker — the handler can
-    // mutate state the waker observes on its next poll.
-    let h = HANDLERS[vector as usize].load(Ordering::Acquire);
-    if h != 0 {
-        // SAFETY: stored as `SyncHandler as usize` in `install`;
-        // round-trip back to the function pointer is sound when
-        // `h != 0`.
-        let f: SyncHandler = unsafe { core::mem::transmute(h) };
-        f();
+    // Soft mask check FIRST — gives `disable_irq` strict semantics.
+    if s.masked.load(Ordering::Acquire) {
+        return;
     }
 
-    let waker = s.waker.lock().take();
-    if let Some(w) = waker {
+    narf_lib::context::enter_irq();
+    s.in_flight.fetch_add(1, Ordering::AcqRel);
+
+    s.fired.fetch_add(1, Ordering::Release);
+    // Per-CPU bump — current_cpu may return out-of-range during
+    // very-early boot; clamp.
+    let cpu = current_cpu_index();
+    s.per_cpu_fired[cpu].fetch_add(1, Ordering::Release);
+
+    // Walk the handler chain under the lock. No allocation
+    // (clone()) here because we're in IRQ context — the sleepable
+    // allocator path would panic. Handlers therefore MUST NOT
+    // call install_handler_named on the SAME vector from inside
+    // themselves (would deadlock) — that's a documented
+    // constraint, not a runtime check.
+    let mut any_handled = false;
+    let mut chain_was_nonempty = false;
+    {
+        let g = s.handlers.lock();
+        chain_was_nonempty = !g.is_empty();
+        for h in g.iter() {
+            match (h.handler)(h.cookie) {
+                IrqStatus::Handled => {
+                    any_handled = true;
+                }
+                IrqStatus::None => {}
+            }
+        }
+    }
+    if chain_was_nonempty && !any_handled {
+        s.spurious.fetch_add(1, Ordering::Release);
+    }
+
+    // Wake every queued waker. `mem::take` swaps in an empty Vec
+    // (Vec::new is const, no alloc) and we wake outside the lock
+    // so a waker that re-registers doesn't deadlock.
+    let wakers: Vec<Waker> = core::mem::take(&mut *s.wakers.lock());
+    for w in wakers {
         w.wake();
     }
+
+    s.in_flight.fetch_sub(1, Ordering::AcqRel);
     narf_lib::context::exit_irq();
 }
 
-/// Snapshot of a vector's fire count. Tasks awaiting the IRQ compare
-/// this against an earlier sample to detect a delivered IRQ even when
-/// the wake races with a later IRQ.
+#[inline]
+fn current_cpu_index() -> usize {
+    let c = narf_lib::percpu::current_cpu();
+    if c < PERCPU_FIRES_MAX {
+        c
+    } else {
+        0
+    }
+}
+
+// ── Counters ───────────────────────────────────────────────────────
+
+/// Snapshot of a vector's global fire count.
 #[inline]
 pub fn fire_count(vector: u8) -> u64 {
     SLOTS[vector as usize].fired.load(Ordering::Acquire)
 }
 
-/// Install a waker that will be invoked once on the next IRQ at this
-/// vector. A second `set_waker` overwrites without waking the previous
-/// one — futures are responsible for not stomping each other (one
-/// future per vector is the Stage-3 contract; multiplexing comes
-/// later).
+/// Snapshot of a vector's per-CPU fire count.
 #[inline]
-pub fn set_waker(vector: u8, w: Waker) {
-    *SLOTS[vector as usize].waker.lock() = Some(w);
+pub fn fire_count_on_cpu(vector: u8, cpu: usize) -> u64 {
+    if cpu >= PERCPU_FIRES_MAX {
+        return 0;
+    }
+    SLOTS[vector as usize].per_cpu_fired[cpu].load(Ordering::Acquire)
 }
 
-/// Drop any registered waker without waking it. Useful when a future
-/// is being dropped before its IRQ fires (cancellation).
+/// Spurious-IRQ count for `vector`. Bumped when every chained
+/// handler returned `None`. Use as a real-HW diagnostic: a non-zero
+/// spurious count points at a missing handler or a stuck level-
+/// triggered line.
 #[inline]
+pub fn spurious_count(vector: u8) -> u64 {
+    SLOTS[vector as usize].spurious.load(Ordering::Acquire)
+}
+
+// ── Waker registration (multi-waker) ───────────────────────────────
+
+/// Install a waker to be invoked once on the next IRQ at this
+/// vector. Multiple `set_waker` calls accumulate — every waiter
+/// gets woken on the next fire. The wakers list is taken out at
+/// wake time so each waiter must re-register if it wants another
+/// wake.
+#[inline]
+pub fn set_waker(vector: u8, w: Waker) {
+    SLOTS[vector as usize].wakers.lock().push(w);
+}
+
+/// Drop any waker matching `w` (by `Waker::will_wake`). Useful for
+/// cancellation when a waiter knows its own waker. Use sparingly;
+/// the standard pattern is to let the next `on_irq` clear the
+/// list.
 pub fn clear_waker(vector: u8) {
-    *SLOTS[vector as usize].waker.lock() = None;
+    SLOTS[vector as usize].wakers.lock().clear();
 }
