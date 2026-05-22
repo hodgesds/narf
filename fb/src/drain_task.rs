@@ -59,11 +59,58 @@ pub fn drain_once(writer: &FbWriter) -> (u32, u32) {
     (ok, err)
 }
 
-/// Future shape: poll → drain → self-wake → return Pending →
-/// repeat. The self-wake (`wake_by_ref` before returning) keeps
-/// the task's awake flag set so the executor re-polls it on
-/// every round. Without it the task would park after the first
-/// poll and producer rings would fill up un-drained.
+/// Cycle period between drain passes. ~50M @ 3.3 GHz ≈ 15 ms ≈
+/// 60 Hz. Fast enough for any UI that needs to look smooth, slow
+/// enough that the drain doesn't starve init/shell on real
+/// silicon where each MMIO write costs orders of magnitude more
+/// than the equivalent QEMU emulated write. The old self-wake
+/// pattern (Pending + wake_by_ref) was the right shape for QEMU
+/// where the scheduler had plenty of slack to interleave; on
+/// real HW it starved the user tasks and they never reached the
+/// shell prompt.
+const DRAIN_PERIOD_CYCLES: u64 = 50_000_000;
+
+/// Run the FB-drain loop. Drains all registered command rings,
+/// repaints the status panel ~4 Hz, then sleeps the rest of the
+/// 60 Hz frame. Sleep is timer-driven (via narf_time's wheel) so
+/// the task DOESN'T hold the executor — init/shell run between
+/// frames the same way they'd run between any other timer-driven
+/// task.
+///
+/// This replaces the old `DrainTask: impl Future` self-wake
+/// pattern. Spawned via `narf_scheduler::spawn_stackful` so the
+/// drain loop has its own kernel stack.
+pub async fn drain_loop(writer: FbWriter) {
+    loop {
+        narf_memory::beacon::paint(22, 0x00FF_FFFF); // slot 22: poll entry
+        drain_once(&writer);
+        #[cfg(not(feature = "kernel-test"))]
+        {
+            let n = DRAIN_TICKS.load(Ordering::Relaxed);
+            let colour = if n & 1 == 0 { 0x00FF_4040 } else { 0x0040_FF40 };
+            narf_memory::beacon::paint(27, colour);
+        }
+        // Status panel repaint at ~4 Hz; gated by TSC so missed
+        // drain ticks (e.g. preempt slice) don't desync it.
+        #[cfg(not(feature = "kernel-test"))]
+        {
+            let now = narf_time::now_cycles();
+            let last = STATUS_LAST_TSC.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= STATUS_REPAINT_CYCLES {
+                STATUS_LAST_TSC.store(now, Ordering::Relaxed);
+                status::paint(&writer);
+                let n = STATUS_LAST_TSC.load(Ordering::Relaxed);
+                let colour = if (n >> 28) & 1 == 0 { 0x000080_FF } else { 0x00FF_8000 };
+                narf_memory::beacon::paint(26, colour);
+            }
+        }
+        narf_time::sleep_cycles(DRAIN_PERIOD_CYCLES).await;
+    }
+}
+
+/// Back-compat shim — kept so tests + existing call sites that
+/// construct a DrainTask continue to compile. The real spawn
+/// path uses `drain_loop` directly.
 pub struct DrainTask {
     writer: FbWriter,
 }
@@ -82,53 +129,12 @@ impl DrainTask {
 
 impl Future for DrainTask {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // Slot 22: paint UNCONDITIONALLY at poll entry, before
-        // anything else. If slot 22 doesn't paint on the laptop
-        // *with this build*, DrainTask isn't being polled at all
-        // → BSP wedged inside whatever task is ahead of DrainTask
-        // in the queue. If slot 22 paints but slot 27 (further
-        // down) doesn't, drain_once is wedging.
-        narf_memory::beacon::paint(22, 0x00FF_FFFF); // white
-        // Run one pass, then re-arm the awake flag so the
-        // executor re-polls us next round. Same pattern as
-        // narf_scheduler::yield_now — without the wake_by_ref the
-        // scheduler's `awake.swap(false)` gate parks us after one
-        // poll and the FB scanout stops advancing.
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        // Single-poll completion — this future is a legacy
+        // shape; real callers should use `drain_loop` via
+        // `spawn_stackful` directly.
         drain_once(&self.writer);
-        // Slot 27: DrainTask::poll heartbeat. Toggles colour each
-        // poll so the user sees that the executor IS polling the
-        // drain task. If 27 stays a single colour, BSP is wedged
-        // on something else (init/shell/measure-phys task).
-        #[cfg(not(feature = "kernel-test"))]
-        {
-            let n = DRAIN_TICKS.load(Ordering::Relaxed);
-            let colour = if n & 1 == 0 { 0x00FF_4040 } else { 0x0040_FF40 };
-            narf_memory::beacon::paint(27, colour);
-        }
-        // Wheel-independent status-panel refresh. Each poll reads
-        // TSC; ~250 ms apart we re-paint. Skipped under kernel-test
-        // because tests install/clear scratch scanouts and the live
-        // subsystem queries panel does (USB, I2C, AML, power) can
-        // corrupt the test scanout or read mid-reset state.
-        #[cfg(not(feature = "kernel-test"))]
-        {
-            let now = narf_time::now_cycles();
-            let last = STATUS_LAST_TSC.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= STATUS_REPAINT_CYCLES {
-                STATUS_LAST_TSC.store(now, Ordering::Relaxed);
-                status::paint(&self.writer);
-                // Slot 26: status::paint heartbeat. Toggles each
-                // repaint. If 26 changes but the panel isn't on
-                // screen, status::paint runs but its writes aren't
-                // landing (FbWriter cap issue, scanout swap, etc).
-                let n = STATUS_LAST_TSC.load(Ordering::Relaxed);
-                let colour = if (n >> 28) & 1 == 0 { 0x000080_FF } else { 0x00FF_8000 };
-                narf_memory::beacon::paint(26, colour);
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        Poll::Ready(())
     }
 }
 

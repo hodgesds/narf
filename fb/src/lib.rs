@@ -820,12 +820,17 @@ pub fn register_initcalls() {
             init_pump_writer(pump_writer);
             narf_userspace::handlers::sleep_pumps::register(fb_drain_pump);
         }
-        // Spawn the drain task as a stackful preemptive task —
-        // the LAPIC timer's preempt-from-trap hook caps any
-        // misbehaving MMIO poll at the 10 ms slice. See
-        // scheduler/specification/preemption.md.
-        let task = drain_task::DrainTask::new(writer);
-        let _ = narf_scheduler::spawn_stackful(task);
+        // Timer-driven drain loop: drains all registered FB
+        // command rings + repaints the status panel at ~60 Hz.
+        // Sleeps between frames so init/shell/driver pumps run
+        // in the gaps. Replaces the old self-wake (wake_by_ref
+        // + Pending) shape that busy-looped the executor — on
+        // QEMU the scheduler had enough slack to interleave;
+        // on real silicon where MMIO costs orders of magnitude
+        // more per write, the self-wake starved init and the
+        // shell prompt never appeared. Preempt-from-trap was
+        // capping the symptom on QEMU but couldn't on real HW.
+        let _ = narf_scheduler::spawn_stackful(drain_task::drain_loop(writer));
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-status-refresh", || {

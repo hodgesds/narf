@@ -180,9 +180,19 @@ pub fn drain_and_render(fb: &FbWriter) {
     }
 }
 
+/// Cycle period between cursor pump passes. ~50M @ 3.3 GHz ≈
+/// 15 ms ≈ 60 Hz — the cursor refresh rate any eye can
+/// distinguish. Timer-driven sleep (not `yield_now`) so other
+/// tasks (init / shell / driver pumps) get full slices between
+/// frames. The old `yield_now` pattern busy-looped on QEMU's
+/// fast scheduler interleaving and starved init on real HW
+/// where MMIO + AML walks made each drain noticeably costlier.
+const PUMP_PERIOD_CYCLES: u64 = 50_000_000;
+
 /// Cursor pump. Loops forever, pulling from the input ring + the
-/// active FB writer. Falls back to silently dropping events when
-/// no FB is up so the input ring never fills.
+/// active FB writer, then sleeping. Falls back to silently
+/// dropping events when no FB is up so the input ring never
+/// fills.
 pub async fn pump(fb: FbWriter) {
     let mut n: u64 = 0;
     loop {
@@ -194,7 +204,7 @@ pub async fn pump(fb: FbWriter) {
         let colour = if n & 1 == 0 { 0x00C040_FF } else { 0x00FF_40C0 };
         narf_memory::beacon::paint(25, colour);
         n = n.wrapping_add(1);
-        narf_scheduler::yield_now().await;
+        narf_time::sleep_cycles(PUMP_PERIOD_CYCLES).await;
     }
 }
 
