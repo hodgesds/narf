@@ -3347,6 +3347,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    IS_PROBED.store(true, core::sync::atomic::Ordering::Release);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("xhci0"),
         kind: narf_drivers::BoundKind::UsbHost,
@@ -3447,8 +3448,19 @@ pub fn register_pci_driver() {
     });
 }
 
+/// Lock-free probe-status flag. Mirrors `CONTROLLER.is_some()` —
+/// set once when probe succeeds, never cleared in production
+/// (xhci doesn't unbind today). Diagnostics MUST read this rather
+/// than locking CONTROLLER, because the USB HID supervisor holds
+/// CONTROLLER for tens of ms during port attach on real silicon
+/// and IrqSafeSpinLock disables IF on the waiter — a status-panel
+/// paint that locks CONTROLLER freezes the entire CPU until the
+/// supervisor releases.
+pub static IS_PROBED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    IS_PROBED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 pub fn with_controller<R>(f: impl FnOnce(&Xhci) -> R) -> Option<R> {
