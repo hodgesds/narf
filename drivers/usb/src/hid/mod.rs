@@ -274,7 +274,10 @@ impl BootKeyboard {
             .poll_interrupt_in(self.slot_id, self.interrupt_in_ep, &mut buf)
             .map_err(HidError::Xhci)?
         {
-            Some(_) => Ok(Some(KbdReport::from_bytes(buf))),
+            Some(_) => {
+                REPORTS_READ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                Ok(Some(KbdReport::from_bytes(buf)))
+            }
             None => Ok(None),
         }
     }
@@ -755,6 +758,7 @@ pub fn attached_keyboard_count() -> usize {
 /// keyboards, but a coarser cadence (e.g. 16 ms) is fine for a
 /// kernel pump — the device buffers state-change reports.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
+    PUMP_ALL_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut g = KEYBOARDS.lock();
     let mut total = 0usize;
     for kbd in g.iter_mut() {
@@ -764,6 +768,24 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     }
     total
 }
+
+/// Diagnostic counter: how many times `pump_all` has been called
+/// since boot. Increments on every supervisor wake (xHCI IRQ or
+/// 100 ms timeout). Surfaced in the FB status panel so a real-HW
+/// observer can tell at a glance whether the supervisor is alive
+/// — a stuck `0` means the supervisor task is wedged.
+pub static PUMP_ALL_CALLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Diagnostic counter: how many non-empty `read_report` calls
+/// have returned reports across all attached keyboards. Bumped
+/// inside `pump_once`'s read loop. A value > 0 means xHCI is
+/// delivering transfer events for the interrupt-IN endpoint;
+/// stuck at 0 with `attached_keyboard_count() > 0` means the
+/// kbd is bound but no reports are arriving (an xHCI ring /
+/// IRQ / endpoint-state issue).
+pub static REPORTS_READ: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 #[doc(hidden)]
 pub fn __reset_keyboards_for_test() {

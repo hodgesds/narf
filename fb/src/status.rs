@@ -23,7 +23,6 @@
 extern crate alloc;
 
 use alloc::format;
-use core::fmt::Write as _;
 
 use narf_graphics::Pixel32;
 
@@ -35,7 +34,7 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 7;
+const HEADER_LINES: u32 = 8;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -82,6 +81,28 @@ pub fn paint(fb: &FbWriter) {
         kbd_n,
         mouse_n,
         if crate::cursor::moves() > 0 { "ACTIVE" } else { "idle" },
+    );
+
+    // USB HID pump telemetry — three numbers tell the story:
+    //   pumps:   pump_all() call count → supervisor alive iff > 0
+    //   reports: non-empty read_report() returns → xHCI delivering iff > 0
+    //   pushes:  KeyEvents pushed to KEY_RING (i8042 + USB combined)
+    // On a working real-HW boot:
+    //   - pumps grows quickly (every supervisor wake = +1, ~10/s baseline)
+    //   - reports grows when you press a key (~2 per press for press+release)
+    //   - pushes grows in lockstep with reports (translate_diff emits 1+ per report)
+    // Common breakage signatures:
+    //   - pumps=0           → supervisor task wedged (scheduler issue)
+    //   - pumps>0 reports=0 → kbd bound but xHCI silent (IRQ / EP-state)
+    //   - reports>0 pushes=0 → translate_diff dropping events (state bug)
+    use core::sync::atomic::Ordering;
+    let usb_pumps = narf_drivers_usb::hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
+    let usb_reports = narf_drivers_usb::hid::REPORTS_READ.load(Ordering::Relaxed);
+    let usb_hid_line = format!(
+        "USB-HID: pumps={}  reports={}  key-pushes={}",
+        usb_pumps,
+        usb_reports,
+        narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed),
     );
 
     // Line 3: AML namespace + i2c-hid bind state. Tells us
@@ -189,6 +210,7 @@ pub fn paint(fb: &FbWriter) {
         pwr_line.as_str(),
         thermal_line.as_str(),
         dev_line.as_str(),
+        usb_hid_line.as_str(),
         cursor_line.as_str(),
         i8042_diag.as_str(),
     ];
