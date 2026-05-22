@@ -126,5 +126,11 @@ pub fn registered_controllers() -> Vec<alloc::sync::Arc<dyn GpioController>> {
     registry::list()
 }
 
+/// Lock-free count of registered controllers — for diagnostics that
+/// must not contend with driver-probe locks.
+pub fn registered_controller_count() -> u32 {
+    registry::REGISTERED_COUNT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

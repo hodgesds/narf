@@ -105,5 +105,13 @@ pub fn registered_buses() -> Vec<alloc::sync::Arc<dyn I2cBus>> {
     registry::list()
 }
 
+/// Lock-free count of registered buses. Diagnostics (e.g.
+/// fb::status::paint) read this instead of `registered_buses().len()`
+/// so they never block on the registry's IrqSafeSpinLock while a
+/// driver is mid-probe.
+pub fn registered_bus_count() -> u32 {
+    registry::REGISTERED_COUNT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

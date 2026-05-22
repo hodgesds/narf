@@ -740,13 +740,29 @@ fn bind_kbd_addressed_slot(
             note_attach_fail(port, AttachStep::SetProtocol, &e);
             e
         })?;
-        KEYBOARDS.lock().push(kbd);
+        {
+            let mut g = KEYBOARDS.lock();
+            g.push(kbd);
+            ATTACHED_KEYBOARD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        }
         Ok(())
 }
 
-/// Number of keyboards currently bound.
+/// Lock-free atomic count of bound keyboards. Diagnostics
+/// (fb::status::paint, panel counters) read this WITHOUT taking
+/// the KEYBOARDS lock — that lock is held by `pump_all` for the
+/// duration of every interrupt-IN read across every bound
+/// keyboard, which on real silicon can be tens of ms. Reading
+/// the lock from the diagnostic path would freeze the executor
+/// (IrqSafeSpinLock disables IF on the waiter).
+pub static ATTACHED_KEYBOARD_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Number of keyboards currently bound. Lock-free read of the
+/// atomic snapshot — kept as a `fn` for source-compat with old
+/// callers; equivalent to `ATTACHED_KEYBOARD_COUNT.load(...)`.
 pub fn attached_keyboard_count() -> usize {
-    KEYBOARDS.lock().len()
+    ATTACHED_KEYBOARD_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize
 }
 
 /// Drain one report from each attached keyboard, translating to
@@ -790,4 +806,5 @@ pub static REPORTS_READ: core::sync::atomic::AtomicU32 =
 #[doc(hidden)]
 pub fn __reset_keyboards_for_test() {
     KEYBOARDS.lock().clear();
+    ATTACHED_KEYBOARD_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }

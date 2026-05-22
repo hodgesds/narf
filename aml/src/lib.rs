@@ -257,19 +257,60 @@ pub fn node_count() -> usize {
 static BOOT_NODE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static BOOT_DEVICE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Boot-snapshot counts of devices matching the i2c-hid HIDs we
+/// care about for diagnostics: AMDI0010 / AMDI0011 / AMDI0019 /
+/// AMDI0510 (AMD FCH I2C controllers) and PNP0C50 (the standard
+/// HID-over-I2C device HID). These are computed once in
+/// `capture_boot_snapshot` so fb::status::paint can read them
+/// LOCK-FREE — the previous `find_all_devices_by_hid` × 5 path
+/// took NAMESPACE.lock 5 times AND cloned every device path,
+/// which on real silicon with 100s of AML devices was both slow
+/// and a lock-contention hazard (IrqSafeSpinLock disables IF on
+/// the waiter; the executor would freeze).
+static BOOT_AMDI001X_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static BOOT_PNP0C50_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Capture the current namespace counts as the boot-time snapshot.
 /// Idempotent — first non-zero value sticks. Boot calls this after
 /// `parse_namespace` succeeds.
 pub fn capture_boot_snapshot() {
-    let g = NAMESPACE.lock();
-    let n = g.nodes.len() as u32;
-    let d = g
-        .nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Device)
-        .count() as u32;
+    // Pull every device path under the lock in ONE pass (rather
+    // than running find_all_devices_by_hid × 5 each of which
+    // re-locks). Compute all four diagnostic counts off the snapshot.
+    let device_paths: alloc::vec::Vec<alloc::string::String> = {
+        let g = NAMESPACE.lock();
+        g.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Device)
+            .map(|n| n.path.clone())
+            .collect()
+    };
+    let n = {
+        let g = NAMESPACE.lock();
+        g.nodes.len() as u32
+    };
+    let d = device_paths.len() as u32;
+    let mut amdi_n = 0u32;
+    let mut pnp_n = 0u32;
+    for path in device_paths.iter() {
+        if let Some(hid) = device_hid(path) {
+            match hid.as_str() {
+                "AMDI0010" | "AMDI0011" | "AMDI0019" | "AMDI0510" => {
+                    amdi_n += 1;
+                }
+                "PNP0C50" => {
+                    pnp_n += 1;
+                }
+                _ => {}
+            }
+        }
+    }
     BOOT_NODE_COUNT.store(n, core::sync::atomic::Ordering::Release);
     BOOT_DEVICE_COUNT.store(d, core::sync::atomic::Ordering::Release);
+    BOOT_AMDI001X_COUNT.store(amdi_n, core::sync::atomic::Ordering::Release);
+    BOOT_PNP0C50_COUNT.store(pnp_n, core::sync::atomic::Ordering::Release);
 }
 
 /// Returns `(boot_node_count, boot_device_count)` from the snapshot
@@ -280,6 +321,20 @@ pub fn boot_snapshot() -> (u32, u32) {
         BOOT_NODE_COUNT.load(core::sync::atomic::Ordering::Acquire),
         BOOT_DEVICE_COUNT.load(core::sync::atomic::Ordering::Acquire),
     )
+}
+
+/// Lock-free boot-snapshot count of AMD FCH I2C controllers in
+/// the AML namespace. For diagnostics; equivalent to what
+/// `find_all_devices_by_hid` for each of {AMDI0010, AMDI0011,
+/// AMDI0019, AMDI0510} returned at boot, but computed ONCE under
+/// a single NAMESPACE.lock and exposed as an atomic.
+pub fn boot_amdi001x_count() -> u32 {
+    BOOT_AMDI001X_COUNT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Lock-free boot-snapshot count of PNP0C50 (HID-over-I2C) devices.
+pub fn boot_pnp0c50_count() -> u32 {
+    BOOT_PNP0C50_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Find the first node with the given canonical path

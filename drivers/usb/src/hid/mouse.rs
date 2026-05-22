@@ -398,13 +398,24 @@ fn bind_mouse_addressed_slot(
 
         let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
         let m = BootMouse::attach(xhci_dev, slot_id, iface, dci)?;
-        MICE.lock().push(m);
+        {
+            let mut g = MICE.lock();
+            g.push(m);
+            ATTACHED_MOUSE_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        }
         Ok(())
 }
 
-/// Number of mice currently bound.
+/// Lock-free count of bound mice. Same rationale as
+/// `hid::ATTACHED_KEYBOARD_COUNT` — pump_all holds MICE for the
+/// duration of every interrupt-IN read; the diagnostic path
+/// must not contend on it.
+pub static ATTACHED_MOUSE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Number of mice currently bound. Lock-free read of the snapshot.
 pub fn attached_mouse_count() -> usize {
-    MICE.lock().len()
+    ATTACHED_MOUSE_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize
 }
 
 /// Drain one report from each attached mouse. Returns total events

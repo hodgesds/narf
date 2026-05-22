@@ -34,14 +34,32 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 8;
+const HEADER_LINES: u32 = 5;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
 /// Paint the status panel into the bottom of the active FB. Best-
 /// effort — clipping handles small framebuffers; FbWriter cap
 /// failures fall through silently.
+///
+/// LOCK-FREE: every value rendered here is read from an atomic
+/// snapshot maintained by the subsystem that owns the data. No
+/// `IrqSafeSpinLock` is acquired across the paint. Rationale: a
+/// previous version (registry::list, with_controller, AML walks,
+/// power-source method calls) deadlocked on real silicon — drivers
+/// hold their registries' locks for tens of ms during MMIO, and
+/// IrqSafeSpinLock disables IF on the waiter, so the executor's
+/// entire CPU froze.
+///
+/// Trade-off: the paint shows less DETAIL than before (e.g. we
+/// drop per-battery percent, per-thermal-zone temps, xHCI
+/// connected-port count). Those need refreshable snapshots that
+/// subsystems publish; until they do, the paint omits them rather
+/// than risk wedging the system. The COUNTERS that ARE shown are
+/// the most useful diagnostic signal for input bring-up (kbd /
+/// mouse / pump / report / key-push counts).
 pub fn paint(fb: &FbWriter) {
+    use core::sync::atomic::Ordering;
     let w = fb.width();
     let h = fb.height();
     if h < PANEL_HEIGHT + PANEL_PAD * 2 || w < 200 {
@@ -58,44 +76,26 @@ pub fn paint(fb: &FbWriter) {
         Some(i) => format!("FB:        {} ({}x{})", i.name, i.width, i.height),
         None => alloc::string::String::from("FB:        none"),
     };
-    let i2c_n = narf_drivers_i2c::registered_buses().len();
-    let gpio_n = narf_drivers_gpio::registered_controllers().len();
-    // i2c-hid registry isn't exposed; infer from GPIO + I2C bus counts.
-    // Best signal: "if both >= 1 the bind pass had something to work
-    // with". For a real HID-bound count we'd need a registry on the
-    // input side; follow-up.
+
+    // All counts are atomic loads — no registry / namespace /
+    // controller locks held during paint.
+    let i2c_n = narf_drivers_i2c::registered_bus_count();
+    let gpio_n = narf_drivers_gpio::registered_controller_count();
     let xhci_up = narf_drivers_usb::xhci::is_probed();
-    let kbd_n = narf_drivers_usb::hid::attached_keyboard_count();
-    let mouse_n = narf_drivers_usb::hid::mouse::attached_mouse_count();
-    let connected_ports = if xhci_up {
-        narf_drivers_usb::xhci::with_controller(|c| c.connected_ports().len()).unwrap_or(0)
-    } else {
-        0
-    };
+    let kbd_n = narf_drivers_usb::hid::ATTACHED_KEYBOARD_COUNT.load(Ordering::Acquire);
+    let mouse_n = narf_drivers_usb::hid::mouse::ATTACHED_MOUSE_COUNT.load(Ordering::Acquire);
     let dev_line = format!(
-        "I2C: {}  GPIO: {}  xHCI: {}  ports: {}  kbd: {}  mouse: {}  cursor: {}",
+        "I2C: {}  GPIO: {}  xHCI: {}  kbd: {}  mouse: {}  cursor: {}",
         i2c_n,
         gpio_n,
         if xhci_up { "up" } else { "no" },
-        connected_ports,
         kbd_n,
         mouse_n,
         if crate::cursor::moves() > 0 { "ACTIVE" } else { "idle" },
     );
 
-    // USB HID pump telemetry — three numbers tell the story:
-    //   pumps:   pump_all() call count → supervisor alive iff > 0
-    //   reports: non-empty read_report() returns → xHCI delivering iff > 0
-    //   pushes:  KeyEvents pushed to KEY_RING (i8042 + USB combined)
-    // On a working real-HW boot:
-    //   - pumps grows quickly (every supervisor wake = +1, ~10/s baseline)
-    //   - reports grows when you press a key (~2 per press for press+release)
-    //   - pushes grows in lockstep with reports (translate_diff emits 1+ per report)
-    // Common breakage signatures:
-    //   - pumps=0           → supervisor task wedged (scheduler issue)
-    //   - pumps>0 reports=0 → kbd bound but xHCI silent (IRQ / EP-state)
-    //   - reports>0 pushes=0 → translate_diff dropping events (state bug)
-    use core::sync::atomic::Ordering;
+    // USB HID pump telemetry. All three are AtomicU32; reading
+    // them never blocks on the supervisor's pump cycle.
     let usb_pumps = narf_drivers_usb::hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
     let usb_reports = narf_drivers_usb::hid::REPORTS_READ.load(Ordering::Relaxed);
     let usb_hid_line = format!(
@@ -105,30 +105,25 @@ pub fn paint(fb: &FbWriter) {
         narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed),
     );
 
-    // Line 3: AML namespace + i2c-hid bind state. Tells us
-    // whether the touchpad path even saw its target devices.
-    let aml_node_count = narf_aml::node_count();
-    let mut amdi001x_count = 0u32;
-    for &hid in &["AMDI0010", "AMDI0019", "AMDI0510", "AMDI0011"] {
-        amdi001x_count += narf_aml::find_all_devices_by_hid(hid).len() as u32;
-    }
-    let pnp0c50_count = narf_aml::find_all_devices_by_hid("PNP0C50").len();
-    let cursor_line = format!(
+    // AML namespace + i2c-hid HID counts: ALL from the boot-time
+    // snapshot atomics. The previous version called
+    // find_all_devices_by_hid 5 times — each call took
+    // NAMESPACE.lock and cloned every device path. capture_boot_snapshot
+    // now computes these once at boot under a single lock and
+    // exposes the counts as atomics.
+    let (aml_nodes, _aml_devices) = narf_aml::boot_snapshot();
+    let amdi001x_count = narf_aml::boot_amdi001x_count();
+    let pnp0c50_count = narf_aml::boot_pnp0c50_count();
+    let i2c_hid_line = format!(
         "AML: {} nodes  AMDI001x: {}  PNP0C50: {}  cursor moves: {}",
-        aml_node_count,
+        aml_nodes,
         amdi001x_count,
         pnp0c50_count,
         crate::cursor::moves(),
     );
 
-    // Pinned i8042 status: covers init success + IRQ routing +
-    // key-push counter so the user can tell at a glance whether
-    // the kbd path is alive without scrolling klog. General
-    // utility — kept after the Renoir-specific xhci diagnostic
-    // statics were reverted (they served their purpose surfacing
-    // PORTSC bounce data and aren't worth keeping wired up).
+    // i8042 status — all atomics already.
     let i8042_diag = {
-        use core::sync::atomic::Ordering;
         let kbd_init = narf_input::I8042_KBD_INIT_OK.load(Ordering::Acquire);
         let kbd_irq = narf_input::I8042_KBD_IRQ_ROUTED.load(Ordering::Acquire);
         let kbd_pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
@@ -144,74 +139,11 @@ pub fn paint(fb: &FbWriter) {
         )
     };
 
-    // CPU power/freq mechanism — set by `power::register_initcalls`'
-    // `cpu-pstate` initcall. Falls back to a placeholder if the
-    // initcall hasn't run yet (test harness, aarch64, etc.).
-    let cpu_line = narf_power::cpu_status_line()
-        .unwrap_or_else(|| alloc::string::String::from("CPU: pstate (not initialised)"));
-
-    // Battery + AC summary from registered PowerSources. Renders
-    // each source as "<name>: <pct>%[ chg|on]" so the user can see
-    // at a glance whether acpi-battery / acpi-ac-adapter actually
-    // bound on real laptop boot.
-    let pwr_line = {
-        use narf_power::PowerSourceType;
-        let sources = narf_power::list_sources();
-        if sources.is_empty() {
-            alloc::string::String::from("PWR: (no sources)")
-        } else {
-            let mut s = alloc::string::String::from("PWR:");
-            for src in sources.iter() {
-                let pct = src.capacity_percent();
-                let suffix = match (src.source_type(), src.is_charging()) {
-                    (PowerSourceType::Battery, true) => " chg",
-                    (PowerSourceType::AcAdaptor, true) => " on",
-                    _ => "",
-                };
-                let _ = core::fmt::write(
-                    &mut s,
-                    format_args!(" {}: {}%{}", src.name(), pct, suffix),
-                );
-            }
-            s
-        }
-    };
-
-    // Thermal zones from acpi-thermal. Renders the basename of
-    // each zone path (last `.`-segment) plus current temperature
-    // in C; warm/critical states get a bracket suffix so the user
-    // can spot a hot zone without reading every digit.
-    let thermal_line = {
-        use narf_power::thermal::{zones_snapshot, ThermalState};
-        let zones = zones_snapshot();
-        if zones.is_empty() {
-            alloc::string::String::from("THERM: (no zones)")
-        } else {
-            let mut s = alloc::string::String::from("THERM:");
-            for (path, milli, state) in zones.iter() {
-                let basename = path.rsplit('.').next().unwrap_or(path.as_str());
-                let suffix = match state {
-                    ThermalState::Critical => "!CRIT",
-                    ThermalState::Warm => "!warm",
-                    ThermalState::Normal => "",
-                };
-                let _ = core::fmt::write(
-                    &mut s,
-                    format_args!(" {}: {}C{}", basename, milli / 1000, suffix),
-                );
-            }
-            s
-        }
-    };
-
     let header = [
         fb_line.as_str(),
-        cpu_line.as_str(),
-        pwr_line.as_str(),
-        thermal_line.as_str(),
         dev_line.as_str(),
         usb_hid_line.as_str(),
-        cursor_line.as_str(),
+        i2c_hid_line.as_str(),
         i8042_diag.as_str(),
     ];
     // SAFETY: cursor renderer also borrows the framebuffer without

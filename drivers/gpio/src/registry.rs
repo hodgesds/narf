@@ -2,12 +2,17 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::GpioController;
 
 static CTRLS: IrqSafeSpinLock<Vec<Arc<dyn GpioController>>> =
     IrqSafeSpinLock::new(Vec::new());
+
+/// Lock-free snapshot of the registered-controller count. Read by
+/// diagnostics without taking the CTRLS lock.
+pub static REGISTERED_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Register a controller. If another controller with the same `name()`
 /// is already present, the new one is rejected and the existing one
@@ -19,6 +24,7 @@ pub fn register_unique(c: Arc<dyn GpioController>) -> Arc<dyn GpioController> {
         return existing.clone();
     }
     g.push(c.clone());
+    REGISTERED_COUNT.store(g.len() as u32, Ordering::Release);
     c
 }
 
@@ -38,4 +44,5 @@ pub fn count() -> usize {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     CTRLS.lock().clear();
+    REGISTERED_COUNT.store(0, Ordering::Release);
 }
