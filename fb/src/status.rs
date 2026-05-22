@@ -114,12 +114,10 @@ pub fn paint(fb: &FbWriter) {
     let (aml_nodes, _aml_devices) = narf_aml::boot_snapshot();
     let amdi001x_count = narf_aml::boot_amdi001x_count();
     let pnp0c50_count = narf_aml::boot_pnp0c50_count();
+    let amdi_children = narf_aml::boot_amdi_children_count();
     let i2c_hid_line = format!(
-        "AML: {} nodes  AMDI001x: {}  PNP0C50: {}  cursor moves: {}",
-        aml_nodes,
-        amdi001x_count,
-        pnp0c50_count,
-        crate::cursor::moves(),
+        "AML: {} nodes  AMDI001x: {} (children: {})  PNP0C50: {}",
+        aml_nodes, amdi001x_count, amdi_children, pnp0c50_count,
     );
 
     // i8042 + KEY_RING traffic — all atomics already.

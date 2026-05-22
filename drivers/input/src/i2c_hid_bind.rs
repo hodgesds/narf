@@ -107,21 +107,20 @@ pub fn bind_all() -> usize {
     let mut bound = 0usize;
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    // Real-HW diagnostic: when the AMD I2C controller is present in
-    // AML but no PNP0C50/ACPI0C50 enumeration matched, dump every
-    // AMDI* controller + its direct children with _HID/_CID. Lands
-    // late in boot so it sits in the FB panel's 12-line klog tail
-    // window for the user to read.
+    // Real-HW diagnostic: dump every AMDI*/AMD0* controller + its
+    // direct children with _HID/_CID UNCONDITIONALLY. The dump
+    // (a) logs to klog so the FB panel's klog tail shows the
+    // device list, and (b) populates the AMDI-children count atom
+    // so the panel can surface "are there any I2C slaves at all"
+    // independent of klog visibility.
     let amdi_n = narf_aml::boot_amdi001x_count();
     let pnp_n = narf_aml::boot_pnp0c50_count();
-    if amdi_n > 0 && pnp_n == 0 {
-        let _ = writeln!(
-            narf_console::Writer,
-            "i2c-hid-bind: AMDI={}/PNP0C50=0 — subtree dump follows",
-            amdi_n
-        );
-        narf_aml::dump_amd_i2c_subtree();
-    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "i2c-hid-bind: AMDI={} PNP0C50={} — subtree dump follows",
+        amdi_n, pnp_n
+    );
+    narf_aml::dump_amd_i2c_subtree();
     // First pass: devices whose _HID matches directly.
     for &hid in &["PNP0C50", "ACPI0C50"] {
         for child in narf_aml::find_all_devices_by_hid(hid) {
@@ -131,16 +130,40 @@ pub fn bind_all() -> usize {
         }
     }
     // Second pass: devices whose vendor _HID isn't PNP0C50 /
-    // ACPI0C50 but whose _CID list includes one of them. Walk
-    // all devices once, test each.
+    // ACPI0C50 but whose _CID list includes one of them, OR
+    // whose _HID has a known i2c-hid touchpad/touchscreen vendor
+    // prefix. The Phoenix HawkPoint1 laptops in the bring-up
+    // target group ship touchpads with vendor _HIDs (ELANxxxx,
+    // SYNAxxxx, ETDxxxx, GDIXxxxx) — some declare PNP0C50 in
+    // _CID, but firmware bugs / minimal DSDTs sometimes omit the
+    // _CID. Whitelisting the vendor prefixes catches both cases.
+    //
+    // Risk: a vendor _HID doesn't guarantee the device speaks
+    // i2c-hid (Synaptics RMI4 has its own wire format). In
+    // practice modern laptops ship i2c-hid-compatible firmware
+    // even from these vendors; a mismatch surfaces as
+    // `read_descriptor failed` in the pump task and the pump
+    // exits cleanly without crashing the kernel.
+    const VENDOR_HID_PREFIXES: &[&str] = &[
+        "ELAN", // Elan touchpads / touchscreens
+        "SYNA", // Synaptics (most newer parts are i2c-hid)
+        "ETD",  // Elantech (alternate Elan prefix)
+        "GDIX", // Goodix touchscreens
+        "WCOM", // Wacom digitizers
+        "FTLX", // FocalTech
+    ];
     let all_devices = narf_aml::list_all_device_paths();
     for path in all_devices {
         if seen.contains(&path) {
             continue;
         }
         let cids = narf_aml::device_cids(&path);
-        let matches = cids.iter().any(|c| c == "PNP0C50" || c == "ACPI0C50");
-        if matches {
+        let cid_match = cids.iter().any(|c| c == "PNP0C50" || c == "ACPI0C50");
+        let hid_match = match narf_aml::device_hid(&path) {
+            Some(h) => VENDOR_HID_PREFIXES.iter().any(|p| h.starts_with(p)),
+            None => false,
+        };
+        if cid_match || hid_match {
             seen.insert(path.clone());
             if bind_one(&path) {
                 bound += 1;

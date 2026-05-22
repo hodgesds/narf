@@ -271,6 +271,13 @@ static BOOT_AMDI001X_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 static BOOT_PNP0C50_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+/// Number of direct AML children under any AMDI*/AMD0* I2C
+/// controller. Populated by `dump_amd_i2c_subtree`. Exposed via
+/// `boot_amdi_children_count` so the FB status panel can show "are
+/// there any devices declared under the I2C controller" without
+/// re-walking the namespace each paint.
+static BOOT_AMDI_CHILDREN_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Capture the current namespace counts as the boot-time snapshot.
 /// Idempotent — first non-zero value sticks. Boot calls this after
@@ -365,6 +372,7 @@ pub fn dump_amd_i2c_subtree() {
     use core::fmt::Write as _;
     let device_paths = list_all_device_paths();
     let mut any = false;
+    let mut total_children: u32 = 0;
     for path in device_paths.iter() {
         let h = device_hid(path);
         let is_amdi = match &h {
@@ -399,6 +407,7 @@ pub fn dump_amd_i2c_subtree() {
                 continue;
             }
             child_n += 1;
+            total_children += 1;
             let ch_hid = device_hid(cpath);
             let ch_cids = device_cids(cpath);
             let _ = writeln!(
@@ -422,6 +431,7 @@ pub fn dump_amd_i2c_subtree() {
             "  aml-i2c-subtree: no AMDI*/AMD0* controllers found in namespace",
         );
     }
+    BOOT_AMDI_CHILDREN_COUNT.store(total_children, core::sync::atomic::Ordering::Release);
 }
 
 /// Returns `(boot_node_count, boot_device_count)` from the snapshot
@@ -446,6 +456,14 @@ pub fn boot_amdi001x_count() -> u32 {
 /// Lock-free boot-snapshot count of PNP0C50 (HID-over-I2C) devices.
 pub fn boot_pnp0c50_count() -> u32 {
     BOOT_PNP0C50_COUNT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Lock-free count of direct children under any AMDI*/AMD0* I2C
+/// controller in AML. Populated by `dump_amd_i2c_subtree`. The FB
+/// status panel reads this to surface "controller has N declared
+/// I2C slaves" without re-walking the namespace each paint.
+pub fn boot_amdi_children_count() -> u32 {
+    BOOT_AMDI_CHILDREN_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Find the first node with the given canonical path
