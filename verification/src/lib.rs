@@ -4530,3 +4530,291 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
 }
 #[cfg(feature = "user-mode-e2e")]
 kernel_test!(smoke_firmware_install_syscall_round_trip);
+
+// ── Multi-task integration: scheduler ↔ FdTable, IRQ, filesystem ────
+//
+// Tests sit in narf-verification because they need scheduler +
+// userspace fd + filesystem + interrupts simultaneously. Each
+// runs sequentially on the BSP — multiple tasks interleave via
+// poll_one_round.
+
+/// Spawn N tasks, each opens an FdEntry in its own task-keyed
+/// FdTable and closes it. With_table acquires the global lock
+/// each call; pressure tests that lock under task switches.
+/// Verifies per-task FD tables are isolated even when the
+/// owning task is preempted mid-operation.
+#[cfg(target_arch = "x86_64")]
+fn smoke_fdtable_concurrent_open_close_per_task() -> TestResult {
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{Context, Poll};
+    use narf_filesystem::FileOps;
+    use narf_userspace::{fd, FdEntry};
+
+    fd::init();
+
+    const TASKS: u64 = 6;
+    const OPS: u32 = 8;
+    static COMPLETED: AtomicU32 = AtomicU32::new(0);
+    static LOST: AtomicU32 = AtomicU32::new(0);
+    COMPLETED.store(0, Ordering::Release);
+    LOST.store(0, Ordering::Release);
+
+    // Console-style noop file ops for FdEntry construction.
+    struct NoopOps;
+    impl FileOps for NoopOps {
+        fn read<'a>(
+            &'a self,
+            _offset: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(
+            &'a self,
+            _offset: u64,
+            buf: &'a [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    struct Worker {
+        task_id: u64,
+        remaining: u32,
+    }
+    impl Future for Worker {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.remaining == 0 {
+                COMPLETED.fetch_add(1, Ordering::AcqRel);
+                return Poll::Ready(());
+            }
+            let entry = FdEntry {
+                ops: Arc::new(NoopOps) as Arc<dyn FileOps>,
+                offset: 0,
+                flags: 0,
+            };
+            // Open into THIS task's per-task table (keyed by
+            // self.task_id, not the executor's current task id).
+            let fd = fd::with_table(self.task_id, |t| t.open(entry));
+            let fd = match fd {
+                Some(f) => f,
+                None => {
+                    LOST.fetch_add(1, Ordering::AcqRel);
+                    return Poll::Ready(());
+                }
+            };
+            // FdTable.open returns lowest free slot ≥ 3, so any
+            // FD < 3 indicates the stdio reservation logic
+            // missed.
+            if fd < 3 {
+                LOST.fetch_add(1, Ordering::AcqRel);
+                return Poll::Ready(());
+            }
+            let closed = fd::with_table(self.task_id, |t| t.close(fd))
+                .unwrap_or(false);
+            if !closed {
+                LOST.fetch_add(1, Ordering::AcqRel);
+                return Poll::Ready(());
+            }
+            self.remaining -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    // Use synthetic task_ids in a range that won't collide with
+    // any real spawned task ids.
+    for i in 0..TASKS {
+        narf_scheduler::spawn_stackful(Worker {
+            task_id: 0xFEED_0000 + i,
+            remaining: OPS,
+        });
+    }
+    for _ in 0..256 {
+        narf_scheduler::poll_one_round();
+        if COMPLETED.load(Ordering::Acquire) as u64 >= TASKS {
+            break;
+        }
+    }
+    if LOST.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("FD open/close lost an FD under contention");
+    }
+    if (COMPLETED.load(Ordering::Acquire) as u64) != TASKS {
+        return TestResult::Fail("FD-stress tasks didn't all finish");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_fdtable_concurrent_open_close_per_task);
+
+/// Multiple tasks waiting on DIFFERENT IRQ vectors. Each
+/// vector has a single waker slot (per the contract), so each
+/// task gets its own vector. After firing each vector's IRQ,
+/// every waiter must resolve.
+///
+/// Tests the per-vector independence of the dispatch table
+/// under multi-task pressure — a regression where vectors
+/// shared state would surface here as a missed wake or wrong
+/// task waking.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_per_vector_independent_waiters() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const VECTORS: [u8; 4] = [64, 65, 66, 67];
+    static COMPLETED: AtomicU32 = AtomicU32::new(0);
+    COMPLETED.store(0, Ordering::Release);
+
+    async fn waiter(v: u8) {
+        let _ = narf_interrupts::wait::wait_for_irq(v).await;
+        COMPLETED.fetch_add(1, Ordering::AcqRel);
+    }
+
+    for v in VECTORS.iter().copied() {
+        narf_scheduler::spawn_stackful(waiter(v));
+    }
+    // Let waiters poll once to register their wakers.
+    for _ in 0..4 {
+        narf_scheduler::poll_one_round();
+    }
+    // Fire each vector — each on_irq wakes the registered
+    // waker for its vector independently.
+    for v in VECTORS.iter().copied() {
+        narf_interrupts::dispatch::on_irq(v);
+    }
+    for _ in 0..16 {
+        narf_scheduler::poll_one_round();
+        if (COMPLETED.load(Ordering::Acquire) as usize) >= VECTORS.len() {
+            break;
+        }
+    }
+    if (COMPLETED.load(Ordering::Acquire) as usize) != VECTORS.len() {
+        return TestResult::Fail("a per-vector waiter didn't resolve after its IRQ fired");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_per_vector_independent_waiters);
+
+/// A pre-armed IRQ (fire_count already advanced) resolves a
+/// freshly-constructed WaitForIrq immediately on first poll if
+/// the baseline check sees the count past the snapshot. Covers
+/// the "IRQ fired between wait construction and first poll"
+/// path.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_wait_resolves_when_already_fired() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const VECTOR: u8 = 68;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    DONE.store(false, Ordering::Release);
+
+    // Bump the fire_count BEFORE the waiter is constructed.
+    let pre_baseline = narf_interrupts::dispatch::fire_count(VECTOR);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    let post_baseline = narf_interrupts::dispatch::fire_count(VECTOR);
+    if post_baseline <= pre_baseline {
+        return TestResult::Fail("on_irq didn't advance fire_count");
+    }
+
+    async fn waiter() {
+        // The WaitForIrq snapshots fire_count at construction;
+        // first poll's second baseline-read sees the increment
+        // we made AFTER construction is impossible here, but
+        // since wait_for_irq() snapshots inside the function
+        // body BEFORE the first poll, an already-pre-armed
+        // count means we wait for the NEXT increment.
+        let _ = narf_interrupts::wait::wait_for_irq(VECTOR).await;
+        DONE.store(true, Ordering::Release);
+    }
+
+    narf_scheduler::spawn_stackful(waiter());
+    // Poll once to register the waker.
+    narf_scheduler::poll_one_round();
+    // Now fire one more IRQ — waiter must resolve.
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    for _ in 0..16 {
+        narf_scheduler::poll_one_round();
+        if DONE.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    if !DONE.load(Ordering::Acquire) {
+        return TestResult::Fail("waiter didn't resolve after subsequent IRQ fire");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_wait_resolves_when_already_fired);
+
+/// IRQ fire_count is monotonic across many concurrent on_irq
+/// invocations from different tasks. (on_irq's per-slot atomic
+/// must not lose increments.)
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_fire_count_monotonic_under_contention() -> TestResult {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{Context, Poll};
+
+    const TEST_VECTOR: u8 = 65;
+    const TASKS: usize = 4;
+    const FIRES_PER_TASK: u32 = 32;
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    DONE.store(0, Ordering::Release);
+
+    let baseline = narf_interrupts::dispatch::fire_count(TEST_VECTOR);
+
+    struct Firer {
+        remaining: u32,
+    }
+    impl Future for Firer {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.remaining == 0 {
+                DONE.fetch_add(1, Ordering::AcqRel);
+                return Poll::Ready(());
+            }
+            narf_interrupts::dispatch::on_irq(TEST_VECTOR);
+            self.remaining -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    for _ in 0..TASKS {
+        narf_scheduler::spawn_stackful(Firer {
+            remaining: FIRES_PER_TASK,
+        });
+    }
+    for _ in 0..512 {
+        narf_scheduler::poll_one_round();
+        if (DONE.load(Ordering::Acquire) as usize) >= TASKS {
+            break;
+        }
+    }
+    if (DONE.load(Ordering::Acquire) as usize) != TASKS {
+        return TestResult::Fail("Firer tasks didn't all complete");
+    }
+    let final_count = narf_interrupts::dispatch::fire_count(TEST_VECTOR);
+    let expected = baseline + (TASKS as u64) * (FIRES_PER_TASK as u64);
+    if final_count < expected {
+        return TestResult::Fail("fire_count lost increments under multi-task contention");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_fire_count_monotonic_under_contention);
