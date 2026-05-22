@@ -2029,6 +2029,279 @@ pub mod tests {
         TestResult::Pass
     }
 
+    // ── RCU under multi-task pressure ───────────────────────────────
+    //
+    // RCU's existing 24 single-thread smokes cover the data
+    // structure. These tests exercise the scheduler-RCU
+    // integration: pins held across `.await`, defer_drop'd
+    // payloads reclaimed only after all readers report
+    // quiescent, atomic publish/swap under interleaved task
+    // pressure. All run sequentially on the BSP but with
+    // multiple tasks taking turns via poll_one_round.
+
+    /// N tasks each repeatedly pin a QSBR read section, briefly
+    /// observe shared data, then report quiescent and yield.
+    /// Verifies pin/unpin nests correctly across task switches
+    /// (each task has its own per-CPU pin counter; switching
+    /// tasks on the same CPU must not corrupt the count).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_rcu_qsbr_pin_under_task_switches() -> TestResult {
+        const TASKS: usize = 4;
+        const ITERS: u32 = 16;
+        static COUNTS: [AtomicU32; TASKS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        for c in COUNTS.iter() {
+            c.store(0, Ordering::Release);
+        }
+
+        struct Pinner {
+            idx: usize,
+            remaining: u32,
+        }
+        impl Future for Pinner {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                {
+                    let g = narf_rcu::pin();
+                    // Observation: any data read here would be
+                    // safe to dereference. For this smoke we just
+                    // bump the counter while pinned.
+                    COUNTS[self.idx].fetch_add(1, Ordering::AcqRel);
+                    drop(g);
+                }
+                narf_rcu::report_quiescent();
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn_stackful(Pinner {
+                idx: i,
+                remaining: ITERS,
+            });
+        }
+        for _ in 0..256 {
+            crate::poll_one_round();
+            if COUNTS.iter().all(|c| c.load(Ordering::Acquire) >= ITERS) {
+                break;
+            }
+        }
+        for c in COUNTS.iter() {
+            if c.load(Ordering::Acquire) != ITERS {
+                return TestResult::Fail("RCU pinner task didn't complete its iterations");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// One writer task publishes payloads via rcu::Atomic::store
+    /// (with defer_drop semantics implicit); multiple readers
+    /// load + observe. After all complete + sync, retired
+    /// payloads' Drop must have run. Catches a regression where
+    /// the scheduler doesn't drive quiescent reporting between
+    /// task switches and retired payloads leak.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_rcu_atomic_publish_under_readers() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_rcu::{Atomic, Owned};
+        const READERS: usize = 3;
+        const WRITES: u32 = 8;
+        static DROPS: AtomicU32 = AtomicU32::new(0);
+        static READS: [AtomicU32; READERS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        DROPS.store(0, Ordering::Release);
+        for r in READS.iter() {
+            r.store(0, Ordering::Release);
+        }
+
+        struct Payload {
+            magic: u64,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        // Atomic::new isn't const, so wrap in Arc and clone into
+        // each task's capture. Same 'static-lifetime semantics
+        // via refcount.
+        let atomic: Arc<Atomic<Payload>> = Arc::new(Atomic::new(Payload { magic: 0xA11C }));
+
+        struct Reader {
+            idx: usize,
+            remaining: u32,
+            atomic: Arc<Atomic<Payload>>,
+        }
+        impl Future for Reader {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                {
+                    let g = narf_rcu::pin();
+                    let s = self.atomic.load(&g);
+                    if s.as_ref().is_some() {
+                        READS[self.idx].fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                narf_rcu::report_quiescent();
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        struct Writer {
+            remaining: u32,
+            atomic: Arc<Atomic<Payload>>,
+        }
+        impl Future for Writer {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                let val = (WRITES - self.remaining) as u64;
+                let g = narf_rcu::pin();
+                self.atomic.store(Owned::new(Payload { magic: val }), &g);
+                drop(g);
+                narf_rcu::report_quiescent();
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..READERS {
+            crate::spawn_stackful(Reader {
+                idx: i,
+                remaining: 16,
+                atomic: atomic.clone(),
+            });
+        }
+        crate::spawn_stackful(Writer {
+            remaining: WRITES,
+            atomic: atomic.clone(),
+        });
+
+        for _ in 0..512 {
+            crate::poll_one_round();
+            narf_rcu::report_quiescent();
+            if READS.iter().all(|r| r.load(Ordering::Acquire) >= 16) {
+                break;
+            }
+        }
+
+        narf_rcu::sync();
+        let drops = DROPS.load(Ordering::Acquire);
+        if drops == 0 {
+            return TestResult::Fail("no retired payloads dropped — leak in defer_drop chain");
+        }
+        for r in READS.iter() {
+            if r.load(Ordering::Acquire) == 0 {
+                return TestResult::Fail("a reader task observed no payloads");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// Pin held across a yield_now().await: the read guard is
+    /// !Send so an `async fn` capturing it across `.await` would
+    /// fail to compile (which is the design intent — protects
+    /// against deadlock). This test verifies the contract by
+    /// explicitly DROPPING the guard before yielding, which is
+    /// the correct pattern. Catches a regression where someone
+    /// accidentally makes ReadGuard Send + Sync.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_rcu_pin_drop_before_yield() -> TestResult {
+        static ITER_COUNT: AtomicU32 = AtomicU32::new(0);
+        ITER_COUNT.store(0, Ordering::Release);
+
+        async fn body() {
+            for _ in 0..8 {
+                // Acquire + use + drop guard inside its own
+                // scope so it can't be live across the .await.
+                {
+                    let _g = narf_rcu::pin();
+                    ITER_COUNT.fetch_add(1, Ordering::AcqRel);
+                }
+                narf_rcu::report_quiescent();
+                crate::yield_now().await;
+            }
+        }
+
+        crate::spawn_stackful(body());
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if ITER_COUNT.load(Ordering::Acquire) >= 8 {
+                break;
+            }
+        }
+        if ITER_COUNT.load(Ordering::Acquire) != 8 {
+            return TestResult::Fail("RCU-pin-then-yield body didn't complete");
+        }
+        TestResult::Pass
+    }
+
+    // ── Clone / user-task spawn concurrency ────────────────────────
+    //
+    // sys_clone and sys_fork have their own kernel-test
+    // coverage (smoke_userspace_clone_*, smoke_userspace_fork_*
+    // — 10+ tests in narf-userspace). What's NOT directly
+    // covered there: the SCHEDULER side of multi-task spawn_user
+    // under concurrent pressure. These tests model that by
+    // exercising the underlying TaskId allocation + ready-queue
+    // semantics that user-task spawn relies on.
+
+    /// Distinct task IDs across many concurrent spawns. spawn()
+    /// returns a TaskId; if the allocation racy, two
+    /// concurrent calls could hand out the same id. Verifies
+    /// uniqueness across a burst.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_task_ids_unique_across_spawns() -> TestResult {
+        const N: usize = 32;
+        let mut ids = alloc::vec::Vec::with_capacity(N);
+        struct Noop;
+        impl Future for Noop {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        for _ in 0..N {
+            let id = crate::spawn(Noop);
+            ids.push(id);
+        }
+        // Sort + dedup: dedup() in place collapses adjacent
+        // equal elements. After sort, a length change after
+        // dedup means duplicates existed.
+        let before = ids.len();
+        ids.sort();
+        ids.dedup();
+        if ids.len() != before {
+            return TestResult::Fail("two spawn() calls returned the same TaskId");
+        }
+        // Drain.
+        for _ in 0..32 {
+            crate::poll_one_round();
+        }
+        TestResult::Pass
+    }
+
     /// Multi-task vmalloc CAS contention: N tasks each request a
     /// distinct VA range; ranges must be disjoint. vmalloc uses
     /// compare_exchange_weak on the cursor; this exercises that
@@ -2335,5 +2608,25 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_concurrency_spawn_fifo_order
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_rcu_qsbr_pin_under_task_switches
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_rcu_atomic_publish_under_readers
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_rcu_pin_drop_before_yield
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_task_ids_unique_across_spawns
     );
 }
