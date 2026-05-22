@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 narf-lib         = { path = "../lib" }
+narf-console     = { path = "../console" }
 narf-acpi        = { path = "../acpi" }
 narf-memory      = { path = "../memory" }
 narf-time        = { path = "../time" }

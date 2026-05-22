@@ -106,6 +106,22 @@ pub fn bind_all() -> usize {
     use alloc::string::String;
     let mut bound = 0usize;
     let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    // Real-HW diagnostic: when the AMD I2C controller is present in
+    // AML but no PNP0C50/ACPI0C50 enumeration matched, dump every
+    // AMDI* controller + its direct children with _HID/_CID. Lands
+    // late in boot so it sits in the FB panel's 12-line klog tail
+    // window for the user to read.
+    let amdi_n = narf_aml::boot_amdi001x_count();
+    let pnp_n = narf_aml::boot_pnp0c50_count();
+    if amdi_n > 0 && pnp_n == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "i2c-hid-bind: AMDI={}/PNP0C50=0 — subtree dump follows",
+            amdi_n
+        );
+        narf_aml::dump_amd_i2c_subtree();
+    }
     // First pass: devices whose _HID matches directly.
     for &hid in &["PNP0C50", "ACPI0C50"] {
         for child in narf_aml::find_all_devices_by_hid(hid) {

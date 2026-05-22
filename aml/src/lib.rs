@@ -346,6 +346,84 @@ pub fn capture_boot_snapshot() {
     BOOT_PNP0C50_COUNT.store(pnp_n, core::sync::atomic::Ordering::Release);
 }
 
+/// Real-HW bring-up diagnostic. Walks every AMDI* / AMD0* controller
+/// device in the AML namespace and logs each one's path + _HID + its
+/// direct children (path, _HID, _CID list). Intended to be called
+/// LATE in boot — after most other init prints — so the dump lands
+/// near the end of klog and stays visible in the FB status panel's
+/// klog tail (which only shows the trailing 12 lines).
+///
+/// When PNP0C50 / ACPI0C50 enumeration returns zero on real hardware
+/// but the controller _HID is present, this dump is the empirical
+/// answer to "what's actually attached to the I2C controller". The
+/// child's _HID/_CID tells us whether to extend i2c-hid match (a
+/// vendor _HID with PNP0C50 in _CID we don't yet handle), write a
+/// vendor driver (Elan / Synaptics RMI4), or pivot to a non-I2C
+/// input path entirely (EC-attached keyboard via Notify, vendor
+/// MMIO).
+pub fn dump_amd_i2c_subtree() {
+    use core::fmt::Write as _;
+    let device_paths = list_all_device_paths();
+    let mut any = false;
+    for path in device_paths.iter() {
+        let h = device_hid(path);
+        let is_amdi = match &h {
+            Some(s) => s.starts_with("AMDI") || s.starts_with("AMD0"),
+            None => false,
+        };
+        if !is_amdi {
+            continue;
+        }
+        if !any {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  aml-i2c-subtree: dumping AMD I2C controllers + children:",
+            );
+            any = true;
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "  aml-i2c-ctrl: {} _HID={}",
+            path,
+            h.as_deref().unwrap_or("(none)")
+        );
+        let prefix = alloc::format!("{}.", path);
+        let mut child_n = 0u32;
+        for cpath in device_paths.iter() {
+            if !cpath.starts_with(&prefix) {
+                continue;
+            }
+            // Direct children only — skip deeper descendants.
+            let rest = &cpath[prefix.len()..];
+            if rest.contains('.') {
+                continue;
+            }
+            child_n += 1;
+            let ch_hid = device_hid(cpath);
+            let ch_cids = device_cids(cpath);
+            let _ = writeln!(
+                narf_console::Writer,
+                "    child: {} _HID={} _CID={:?}",
+                cpath,
+                ch_hid.as_deref().unwrap_or("(none)"),
+                ch_cids
+            );
+        }
+        if child_n == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "    (no direct children — controller has no I2C slaves declared in AML)",
+            );
+        }
+    }
+    if !any {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  aml-i2c-subtree: no AMDI*/AMD0* controllers found in namespace",
+        );
+    }
+}
+
 /// Returns `(boot_node_count, boot_device_count)` from the snapshot
 /// taken after the first successful boot-time `parse_namespace`.
 /// Both `(0, 0)` until `capture_boot_snapshot` runs.
