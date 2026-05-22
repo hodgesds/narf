@@ -5414,3 +5414,300 @@ fn smoke_usb_xhci_is_probed_consistent_under_readers() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_usb_xhci_is_probed_consistent_under_readers);
+
+/// add_nmi_handler + on_nmi + remove_nmi_handler round-trip. NMI
+/// fires don't go through the same path as IRQs; the chain is
+/// lock-free + fixed-size. Test verifies that a registered handler
+/// is invoked on on_nmi() with its cookie, and that remove cleanly
+/// detaches.
+#[cfg(target_arch = "x86_64")]
+fn smoke_nmi_handler_install_invoke_remove() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static OBS_COOKIE: AtomicU64 = AtomicU64::new(0);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    OBS_COOKIE.store(0, Ordering::Release);
+    CALLS.store(0, Ordering::Release);
+
+    fn handler(cookie: u64) -> narf_interrupts::IrqStatus {
+        OBS_COOKIE.store(cookie, Ordering::Release);
+        CALLS.fetch_add(1, Ordering::AcqRel);
+        narf_interrupts::IrqStatus::Handled
+    }
+
+    let id = match narf_interrupts::add_nmi_handler(handler, 0xCAFE_BABE) {
+        Some(i) => i,
+        None => return TestResult::Fail("add_nmi_handler returned None — table full?"),
+    };
+
+    let before_fired = narf_interrupts::nmi_fire_count();
+    narf_interrupts::on_nmi();
+    if narf_interrupts::nmi_fire_count() != before_fired + 1 {
+        narf_interrupts::remove_nmi_handler(id);
+        return TestResult::Fail("nmi_fire_count didn't advance");
+    }
+    if OBS_COOKIE.load(Ordering::Acquire) != 0xCAFE_BABE {
+        narf_interrupts::remove_nmi_handler(id);
+        return TestResult::Fail("handler didn't see its cookie");
+    }
+    if CALLS.load(Ordering::Acquire) != 1 {
+        narf_interrupts::remove_nmi_handler(id);
+        return TestResult::Fail("handler call count wrong");
+    }
+
+    narf_interrupts::remove_nmi_handler(id);
+    // After removal, on_nmi still bumps fire_count but our handler
+    // is detached.
+    narf_interrupts::on_nmi();
+    if CALLS.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("handler ran after removal");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_nmi_handler_install_invoke_remove);
+
+/// IrqStatus::None on every chained handler bumps spurious_count
+/// for the vector. Demonstrates the shared-INTx accounting Linux
+/// uses for spurious-IRQ disable detection.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_spurious_count_advances_on_all_none() -> TestResult {
+    use core::sync::atomic::AtomicU64;
+    const VECTOR: u8 = 80;
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    CALLS.store(0, core::sync::atomic::Ordering::Release);
+
+    // Two handlers, both return None. The spurious counter should
+    // bump once per on_irq.
+    fn pass(_cookie: u64) -> narf_interrupts::IrqStatus {
+        CALLS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        narf_interrupts::IrqStatus::None
+    }
+
+    // Clean state (defensive — other tests may have touched this).
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+
+    narf_interrupts::install_handler_named(VECTOR, "test-a", 0xAAAA, pass);
+    narf_interrupts::install_handler_named(VECTOR, "test-b", 0xBBBB, pass);
+
+    let before = narf_interrupts::spurious_count(VECTOR);
+    narf_interrupts::on_irq(VECTOR);
+    if narf_interrupts::spurious_count(VECTOR) != before + 1 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("spurious_count didn't bump when every handler returned None");
+    }
+    if CALLS.load(core::sync::atomic::Ordering::Acquire) != 2 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("both handlers should have run before spurious accounting");
+    }
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_spurious_count_advances_on_all_none);
+
+/// disable_irq makes on_irq a strict no-op. enable_irq restores
+/// dispatch.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_disable_enable_round_trip() -> TestResult {
+    use core::sync::atomic::AtomicU64;
+    const VECTOR: u8 = 81;
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    CALLS.store(0, core::sync::atomic::Ordering::Release);
+
+    fn h(_cookie: u64) -> narf_interrupts::IrqStatus {
+        CALLS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        narf_interrupts::IrqStatus::Handled
+    }
+
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    narf_interrupts::install_handler_named(VECTOR, "test", 0, h);
+
+    // Enabled by default — handler fires.
+    let fire_before = narf_interrupts::fire_count(VECTOR);
+    narf_interrupts::on_irq(VECTOR);
+    if narf_interrupts::fire_count(VECTOR) != fire_before + 1 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("baseline fire didn't count");
+    }
+    if CALLS.load(core::sync::atomic::Ordering::Acquire) != 1 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("baseline handler didn't run");
+    }
+
+    // disable_irq → no-op.
+    narf_interrupts::disable_irq(VECTOR);
+    if !narf_interrupts::is_masked(VECTOR) {
+        return TestResult::Fail("is_masked didn't reflect disable");
+    }
+    let fire_after_disable = narf_interrupts::fire_count(VECTOR);
+    narf_interrupts::on_irq(VECTOR);
+    if narf_interrupts::fire_count(VECTOR) != fire_after_disable {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("on_irq advanced fire_count while masked");
+    }
+    if CALLS.load(core::sync::atomic::Ordering::Acquire) != 1 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("handler ran while masked");
+    }
+
+    // enable_irq → restored.
+    narf_interrupts::enable_irq(VECTOR);
+    narf_interrupts::on_irq(VECTOR);
+    if CALLS.load(core::sync::atomic::Ordering::Acquire) != 2 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("enable_irq didn't restore dispatch");
+    }
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_disable_enable_round_trip);
+
+/// Shared handlers fire in install order; first to return Handled
+/// stops the chain from counting spurious. Mirrors Linux's
+/// IRQF_SHARED semantics.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_shared_chain_first_handled_wins() -> TestResult {
+    use core::sync::atomic::AtomicU64;
+    const VECTOR: u8 = 82;
+    static ORDER: AtomicU64 = AtomicU64::new(0);
+    ORDER.store(0, core::sync::atomic::Ordering::Release);
+
+    fn first(_cookie: u64) -> narf_interrupts::IrqStatus {
+        // Stamp position 1 in the encoded order if not seen yet.
+        let _ = ORDER.compare_exchange(
+            0,
+            1,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+        narf_interrupts::IrqStatus::None
+    }
+    fn second(_cookie: u64) -> narf_interrupts::IrqStatus {
+        // We expect ORDER==1 here (first already ran).
+        let _ = ORDER.compare_exchange(
+            1,
+            2,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+        narf_interrupts::IrqStatus::Handled
+    }
+
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    narf_interrupts::install_handler_named(VECTOR, "first", 0, first);
+    narf_interrupts::install_handler_named(VECTOR, "second", 0, second);
+
+    let before_spurious = narf_interrupts::spurious_count(VECTOR);
+    narf_interrupts::on_irq(VECTOR);
+    if ORDER.load(core::sync::atomic::Ordering::Acquire) != 2 {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("chain didn't fire in install order");
+    }
+    if narf_interrupts::spurious_count(VECTOR) != before_spurious {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("spurious_count bumped when second handler claimed");
+    }
+
+    // installed_handler_names returns the chain.
+    let names = narf_interrupts::installed_handler_names(VECTOR);
+    if names != alloc::vec!["first", "second"] {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("installed_handler_names didn't reflect chain");
+    }
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_shared_chain_first_handled_wins);
+
+/// remove_handler detaches one entry by name+cookie. Other
+/// entries stay; chain order preserved.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_remove_handler_by_name_cookie() -> TestResult {
+    const VECTOR: u8 = 83;
+    fn h(_cookie: u64) -> narf_interrupts::IrqStatus {
+        narf_interrupts::IrqStatus::Handled
+    }
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    narf_interrupts::install_handler_named(VECTOR, "a", 1, h);
+    narf_interrupts::install_handler_named(VECTOR, "b", 2, h);
+    narf_interrupts::install_handler_named(VECTOR, "c", 3, h);
+    if !narf_interrupts::remove_handler(VECTOR, "b", 2) {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("remove_handler didn't find b/2");
+    }
+    let names = narf_interrupts::installed_handler_names(VECTOR);
+    if names != alloc::vec!["a", "c"] {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("chain order wrong after remove");
+    }
+    // Removing a non-matching name+cookie returns false.
+    if narf_interrupts::remove_handler(VECTOR, "missing", 99) {
+        narf_interrupts::dispatch::clear_handler(VECTOR);
+        return TestResult::Fail("remove_handler claimed to remove non-existent entry");
+    }
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_remove_handler_by_name_cookie);
+
+/// synchronize_irq returns immediately when in_flight is zero
+/// (the steady state outside of an active dispatch).
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_synchronize_returns_when_idle() -> TestResult {
+    const VECTOR: u8 = 84;
+    // Establish a clean state.
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    // Should return basically instantly.
+    let start = narf_time::now_cycles();
+    narf_interrupts::synchronize_irq(VECTOR);
+    let elapsed = narf_time::now_cycles().saturating_sub(start);
+    // Sanity: under 100k cycles (~30us at 3GHz) is plenty
+    // headroom for a tight spin-loop check.
+    if elapsed > 100_000 {
+        return TestResult::Fail("synchronize_irq took too long on idle vector");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_synchronize_returns_when_idle);
+
+/// Multi-waker support: two `wait_for_irq` futures both register
+/// against the same vector; both must wake when the IRQ fires.
+/// (Pre-rewrite, set_waker overwrote — the second waiter would
+/// lose its waker silently.)
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_multi_waker_both_resolve() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const VECTOR: u8 = 85;
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    DONE.store(0, Ordering::Release);
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+
+    async fn waiter() {
+        let _ = narf_interrupts::wait::wait_for_irq(VECTOR).await;
+        DONE.fetch_add(1, Ordering::AcqRel);
+    }
+    narf_scheduler::spawn_stackful(waiter());
+    narf_scheduler::spawn_stackful(waiter());
+    // Let each waiter poll once to register.
+    for _ in 0..4 {
+        narf_scheduler::poll_one_round();
+    }
+    // Fire — both should resolve.
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    for _ in 0..8 {
+        narf_scheduler::poll_one_round();
+        if DONE.load(Ordering::Acquire) >= 2 {
+            break;
+        }
+    }
+    if DONE.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("two waiters didn't both wake on a single IRQ");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_multi_waker_both_resolve);

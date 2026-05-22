@@ -408,3 +408,120 @@ pub fn set_waker(vector: u8, w: Waker) {
 pub fn clear_waker(vector: u8) {
     SLOTS[vector as usize].wakers.lock().clear();
 }
+
+// ── NMI dispatch ────────────────────────────────────────────────────
+//
+// NMIs (x86 vector 2; aarch64 has no direct equivalent) bypass the
+// normal IRQ subsystem — they're delivered with IF=0 and edge-only,
+// and the standard `on_irq` machinery is overkill plus unsafe in NMI
+// context (the spinlock guards don't compose with NMI re-entrancy).
+//
+// Instead: a tiny fixed-size table of (handler, cookie) entries that
+// `on_nmi()` walks LOCK-FREELY. Handlers run with IRQs disabled (NMI
+// hardware guarantee). The standard NMI consumers in a real-world
+// kernel are:
+//   - perf counter sample handling (PMU overflow)
+//   - hard-lockup watchdog (CPU-stuck detector)
+//   - crash-dump trigger (oops-on-NMI)
+// All of these are short, allocate nothing, and can tolerate strict
+// no-locks discipline.
+//
+// Limited to MAX_NMI_HANDLERS = 8 entries. Install is `add_nmi_handler`
+// returning an opaque id; remove is `remove_nmi_handler(id)`.
+
+const MAX_NMI_HANDLERS: usize = 8;
+
+/// NMI-handler signature — same return type as the IRQ flavour
+/// (Handled / None for spurious-NMI accounting). Caller cookie is
+/// passed through for per-binding state.
+pub type NmiHandler = fn(cookie: u64) -> IrqStatus;
+
+struct NmiSlot {
+    used: AtomicBool,
+    handler: AtomicU64,
+    cookie: AtomicU64,
+}
+
+static NMI_SLOTS: [NmiSlot; MAX_NMI_HANDLERS] = [const {
+    NmiSlot {
+        used: AtomicBool::new(false),
+        handler: AtomicU64::new(0),
+        cookie: AtomicU64::new(0),
+    }
+}; MAX_NMI_HANDLERS];
+
+static NMI_FIRED: AtomicU64 = AtomicU64::new(0);
+static NMI_SPURIOUS: AtomicU64 = AtomicU64::new(0);
+
+/// Opaque registration id returned by `add_nmi_handler`. Pass to
+/// `remove_nmi_handler` to detach.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NmiHandlerId(u8);
+
+/// Register an NMI handler. Returns the slot id on success or
+/// `None` if all MAX_NMI_HANDLERS slots are taken.
+pub fn add_nmi_handler(handler: NmiHandler, cookie: u64) -> Option<NmiHandlerId> {
+    for (i, slot) in NMI_SLOTS.iter().enumerate() {
+        if !slot.used.swap(true, Ordering::AcqRel) {
+            slot.handler.store(handler as u64, Ordering::Release);
+            slot.cookie.store(cookie, Ordering::Release);
+            return Some(NmiHandlerId(i as u8));
+        }
+    }
+    None
+}
+
+/// Remove a previously-registered NMI handler.
+pub fn remove_nmi_handler(id: NmiHandlerId) {
+    let i = id.0 as usize;
+    if i >= MAX_NMI_HANDLERS {
+        return;
+    }
+    NMI_SLOTS[i].handler.store(0, Ordering::Release);
+    NMI_SLOTS[i].cookie.store(0, Ordering::Release);
+    NMI_SLOTS[i].used.store(false, Ordering::Release);
+}
+
+/// Called from the per-arch NMI handler (x86: IDT entry 2). Walks
+/// the registered handler chain and bumps the spurious counter if
+/// none claim. Runs with IRQs disabled (NMI hardware contract).
+/// LOCK-FREE — no spinlock guards because an NMI can interrupt
+/// arbitrary code, including code holding the IRQ-side spinlocks.
+#[inline]
+pub fn on_nmi() {
+    NMI_FIRED.fetch_add(1, Ordering::Release);
+    let mut any_handled = false;
+    let mut any_present = false;
+    for slot in NMI_SLOTS.iter() {
+        if !slot.used.load(Ordering::Acquire) {
+            continue;
+        }
+        any_present = true;
+        let h_raw = slot.handler.load(Ordering::Acquire);
+        if h_raw == 0 {
+            continue;
+        }
+        let cookie = slot.cookie.load(Ordering::Acquire);
+        // SAFETY: stored as `NmiHandler as u64`; round-trip safe
+        // because both are `fn(u64) -> IrqStatus`.
+        let h: NmiHandler = unsafe { core::mem::transmute(h_raw as usize) };
+        if h(cookie) == IrqStatus::Handled {
+            any_handled = true;
+        }
+    }
+    if any_present && !any_handled {
+        NMI_SPURIOUS.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Total NMIs delivered since boot.
+#[inline]
+pub fn nmi_fire_count() -> u64 {
+    NMI_FIRED.load(Ordering::Acquire)
+}
+
+/// NMIs where no registered handler returned Handled.
+#[inline]
+pub fn nmi_spurious_count() -> u64 {
+    NMI_SPURIOUS.load(Ordering::Acquire)
+}

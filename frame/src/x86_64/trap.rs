@@ -157,6 +157,16 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // NMI (vector 2). Dispatch through the lock-free NMI handler
+    // chain (perf, watchdog, crash-trigger consumers register
+    // there). Return without falling through to the exception /
+    // panic path — unhandled NMIs should be diagnostic, not fatal.
+    // The NMI hardware contract is: edge-only, IF=0 throughout.
+    if frame.vector == 2 {
+        narf_interrupts::on_nmi();
+        return;
+    }
+
     // External IRQ path (vectors 32..=255). Dispatch through the
     // generic dispatch table (driver-registered IRQ wakers) and then
     // EOI. Vector 32 still hits the timer-tick counter directly so
