@@ -91,6 +91,119 @@ impl core::fmt::Debug for HandlerEntry {
 /// doesn't need the dep.
 const PERCPU_FIRES_MAX: usize = 64;
 
+// ── Re-entry guard ─────────────────────────────────────────────────
+//
+// Per-CPU "currently dispatching vector X" marker. `on_irq` sets
+// it before acquiring the handlers spinlock and clears it after.
+// `install_handler_named` / `remove_handler` / `clear_handler` /
+// `set_waker` / `clear_waker` check it: if a handler running on
+// the SAME CPU tries to mutate the dispatch state for the SAME
+// vector it's currently running under, panic with a clear message
+// (which is strictly better than the deadlock-on-spinlock-re-acquire
+// the old code would produce silently).
+//
+// Cross-CPU mutation is still allowed — the spinlock serialises it
+// correctly. Different-vector mutation from inside a handler is
+// also allowed (it's the SAME-vector re-entry that deadlocks). The
+// marker stores vector + 1 so 0 == "not dispatching" without
+// needing a separate AtomicBool.
+
+const NOT_DISPATCHING: u16 = 0;
+
+/// Cache-line-padded per-CPU dispatch marker. Each `DispatchSlot`
+/// occupies a full 64-byte line so CPU N's write to its slot
+/// doesn't evict CPU M's slot from M's L1 cache (false sharing).
+/// The atomic inside is single-CPU-accessed in practice — we
+/// keep the AtomicU16 rather than `Cell<u16>` only because
+/// `PerCpu`-style Sync wrappers want `Sync` cells and Cell isn't.
+/// On x86 an aligned 16-bit AtomicU16 store is a single `mov`
+/// (no lock prefix needed for Release), so the cost is the same
+/// as a plain write.
+#[repr(C, align(64))]
+struct DispatchSlot {
+    val: core::sync::atomic::AtomicU16,
+    /// Pad to a full cache line. Size = 64 - sizeof(AtomicU16) - any
+    /// alignment slack. AtomicU16 is 2 bytes; the repr(align(64))
+    /// keeps the struct exactly 64 bytes when this pad is sized
+    /// 62. (Const-checked below.)
+    _pad: [u8; 62],
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<DispatchSlot>() == 64);
+    assert!(core::mem::align_of::<DispatchSlot>() == 64);
+};
+
+/// Encoding: 0 = not dispatching; (vector + 1) = dispatching that
+/// vector. `u16` covers the 256 vectors plus the sentinel.
+static DISPATCHING_VECTOR: [DispatchSlot; PERCPU_FIRES_MAX] = [const {
+    DispatchSlot {
+        val: core::sync::atomic::AtomicU16::new(NOT_DISPATCHING),
+        _pad: [0; 62],
+    }
+}; PERCPU_FIRES_MAX];
+
+/// Panic with the standard same-vector re-entry message. Called
+/// when install_handler_named / remove_handler / clear_handler /
+/// set_waker / clear_waker is invoked from inside an on_irq
+/// dispatch for the same vector on this CPU.
+#[cold]
+#[inline(never)]
+fn panic_reentry(op: &'static str, vector: u8) -> ! {
+    panic!(
+        "narf-interrupts: {} called for vector {} from inside its own \
+         on_irq handler chain — would deadlock the dispatch spinlock. \
+         Restructure the handler to defer the mutation (queue it for the \
+         next non-IRQ context, or call from a different vector's path).",
+        op, vector
+    );
+}
+
+/// If the current CPU is already dispatching `vector`, panic. Otherwise
+/// no-op. Called by every mutator. Same-CPU check only — cross-CPU
+/// callers serialise on the spinlock normally.
+#[inline]
+fn check_no_reentry(op: &'static str, vector: u8) {
+    let cpu = current_cpu_index();
+    let cur = DISPATCHING_VECTOR[cpu].val.load(Ordering::Acquire);
+    if cur == (vector as u16) + 1 {
+        panic_reentry(op, vector);
+    }
+}
+
+/// RAII scope guard that marks this CPU as dispatching `vector`
+/// for its lifetime. Drop clears the marker, so the per-CPU state
+/// is consistent across early returns AND across panics that
+/// unwind (if/when narf gets unwinding support — today the
+/// panic_handler aborts, but the Drop still runs on regular early
+/// returns). `on_irq` constructs one of these before walking the
+/// chain; any mutator called from inside the chain on the SAME
+/// CPU + SAME vector sees the marker and panics via the
+/// `check_no_reentry` helper.
+struct DispatchGuard {
+    cpu: usize,
+}
+
+impl DispatchGuard {
+    #[inline]
+    fn new(vector: u8) -> Self {
+        let cpu = current_cpu_index();
+        DISPATCHING_VECTOR[cpu]
+            .val
+            .store((vector as u16) + 1, Ordering::Release);
+        Self { cpu }
+    }
+}
+
+impl Drop for DispatchGuard {
+    #[inline]
+    fn drop(&mut self) {
+        DISPATCHING_VECTOR[self.cpu]
+            .val
+            .store(NOT_DISPATCHING, Ordering::Release);
+    }
+}
+
 /// Per-vector dispatch state.
 pub struct Slot {
     /// Total IRQs delivered on this vector since boot, across all
@@ -168,6 +281,7 @@ pub fn install_handler_named(
     cookie: u64,
     handler: SyncHandler,
 ) {
+    check_no_reentry("install_handler_named", vector);
     let mut g = SLOTS[vector as usize].handlers.lock();
     g.push(HandlerEntry {
         handler,
@@ -225,6 +339,7 @@ fn legacy_bridge(cookie: u64) -> IrqStatus {
 /// driver tears down — combine with `synchronize_irq` BEFORE the
 /// drop to ensure no in-flight call observes a freed `cookie`.
 pub fn remove_handler(vector: u8, name: &str, cookie: u64) -> bool {
+    check_no_reentry("remove_handler", vector);
     let mut g = SLOTS[vector as usize].handlers.lock();
     let len_before = g.len();
     g.retain(|h| !(h.name == name && h.cookie == cookie));
@@ -234,6 +349,7 @@ pub fn remove_handler(vector: u8, name: &str, cookie: u64) -> bool {
 /// Clear all handlers for `vector`. Legacy shim kept for callers
 /// that used the old `clear_handler` API.
 pub fn clear_handler(vector: u8) {
+    check_no_reentry("clear_handler", vector);
     SLOTS[vector as usize].handlers.lock().clear();
     LEGACY[vector as usize].store(0, Ordering::Release);
 }
@@ -317,36 +433,49 @@ pub fn on_irq(vector: u8) {
     let cpu = current_cpu_index();
     s.per_cpu_fired[cpu].fetch_add(1, Ordering::Release);
 
-    // Walk the handler chain under the lock. No allocation
-    // (clone()) here because we're in IRQ context — the sleepable
-    // allocator path would panic. Handlers therefore MUST NOT
-    // call install_handler_named on the SAME vector from inside
-    // themselves (would deadlock) — that's a documented
-    // constraint, not a runtime check.
-    let mut any_handled = false;
-    let mut chain_was_nonempty = false;
+    // Publish the dispatch marker for the lifetime of the chain
+    // walk + waker drain. Any mutator (install_handler_named,
+    // remove_handler, set_waker, etc.) called from inside a
+    // handler on THIS CPU for THIS vector panics via
+    // `check_no_reentry`, instead of deadlocking on the spinlock
+    // re-acquire. The guard's Drop runs on every exit path —
+    // normal fall-through OR (if/when narf gets unwinding) a
+    // panic from inside a handler — so the per-CPU state stays
+    // consistent.
     {
-        let g = s.handlers.lock();
-        chain_was_nonempty = !g.is_empty();
-        for h in g.iter() {
-            match (h.handler)(h.cookie) {
-                IrqStatus::Handled => {
-                    any_handled = true;
+        let _dispatch = DispatchGuard::new(vector);
+
+        // Walk the handler chain under the lock. No allocation
+        // (clone()) here because we're in IRQ context — the
+        // sleepable allocator path would panic. Same-vector
+        // re-entry from a handler is now a clear panic via
+        // check_no_reentry rather than a silent deadlock.
+        let mut any_handled = false;
+        let chain_was_nonempty;
+        {
+            let g = s.handlers.lock();
+            chain_was_nonempty = !g.is_empty();
+            for h in g.iter() {
+                match (h.handler)(h.cookie) {
+                    IrqStatus::Handled => {
+                        any_handled = true;
+                    }
+                    IrqStatus::None => {}
                 }
-                IrqStatus::None => {}
             }
         }
-    }
-    if chain_was_nonempty && !any_handled {
-        s.spurious.fetch_add(1, Ordering::Release);
-    }
+        if chain_was_nonempty && !any_handled {
+            s.spurious.fetch_add(1, Ordering::Release);
+        }
 
-    // Wake every queued waker. `mem::take` swaps in an empty Vec
-    // (Vec::new is const, no alloc) and we wake outside the lock
-    // so a waker that re-registers doesn't deadlock.
-    let wakers: Vec<Waker> = core::mem::take(&mut *s.wakers.lock());
-    for w in wakers {
-        w.wake();
+        // Wake every queued waker. `mem::take` swaps in an empty
+        // Vec (Vec::new is const, no alloc) and we wake outside
+        // the lock so a waker that re-registers doesn't deadlock.
+        let wakers: Vec<Waker> = core::mem::take(&mut *s.wakers.lock());
+        for w in wakers {
+            w.wake();
+        }
+        // _dispatch drops here → clears the per-CPU marker.
     }
 
     s.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -398,6 +527,7 @@ pub fn spurious_count(vector: u8) -> u64 {
 /// wake.
 #[inline]
 pub fn set_waker(vector: u8, w: Waker) {
+    check_no_reentry("set_waker", vector);
     SLOTS[vector as usize].wakers.lock().push(w);
 }
 
@@ -406,6 +536,7 @@ pub fn set_waker(vector: u8, w: Waker) {
 /// the standard pattern is to let the next `on_irq` clear the
 /// list.
 pub fn clear_waker(vector: u8) {
+    check_no_reentry("clear_waker", vector);
     SLOTS[vector as usize].wakers.lock().clear();
 }
 
