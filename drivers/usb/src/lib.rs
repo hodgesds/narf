@@ -74,6 +74,16 @@ pub fn register_initcalls() {
     // as keyboard and mouse. Removed cleanly per the no-shims rule.
 }
 
+/// Liveness counter for the USB HID supervisor. Incremented at the
+/// VERY TOP of every loop iteration, before any controller lookup,
+/// any lock acquisition, any MMIO. A stuck 0 with `xhci::is_probed()
+/// == true` is conclusive evidence that the supervisor task was
+/// either (a) never enqueued, (b) enqueued on a CPU that isn't
+/// polling, or (c) preempted at every dispatch before reaching
+/// this increment. Surfaced on the FB status panel.
+pub static SUPERVISOR_TICKS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Spawn the long-running USB HID supervisor task. Walks every
 /// xHCI root-hub port the controller reports as connected, then
 /// every downstream port of every bound USB hub, attempting to
@@ -101,6 +111,7 @@ fn spawn_supervisor_task() {
         // Per-root-port consecutive-failure counter.
         let mut root_fail_count = [0u8; 128];
         loop {
+            SUPERVISOR_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // Acquire the controller handle once per loop iteration.
             // The Arc clone takes the registry lock for microseconds;
             // the rest of the iteration runs against `&*c` with no

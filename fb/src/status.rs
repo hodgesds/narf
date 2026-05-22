@@ -98,8 +98,10 @@ pub fn paint(fb: &FbWriter) {
     // them never blocks on the supervisor's pump cycle.
     let usb_pumps = narf_drivers_usb::hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
     let usb_reports = narf_drivers_usb::hid::REPORTS_READ.load(Ordering::Relaxed);
+    let supervisor_ticks = narf_drivers_usb::SUPERVISOR_TICKS.load(Ordering::Relaxed);
     let usb_hid_line = format!(
-        "USB-HID: pumps={}  reports={}  key-pushes={}",
+        "USB-HID: sup-ticks={}  pumps={}  reports={}  key-pushes={}",
+        supervisor_ticks,
         usb_pumps,
         usb_reports,
         narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed),
