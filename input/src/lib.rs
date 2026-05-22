@@ -873,6 +873,7 @@ pub fn push_global(ev: InputEvent) -> bool {
 pub fn pop_key() -> Option<KeyEvent> {
     let ev = KEY_RING.lock().as_ref().and_then(|r| r.pop())?;
     if let InputEvent::Key(k) = ev {
+        KEY_POP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some(k)
     } else {
         None
@@ -1004,6 +1005,13 @@ pub static I8042_MOUSE_INIT_OK: core::sync::atomic::AtomicBool =
 /// IRQs are firing without requiring serial. If kbd-pushes stays
 /// at 0 across keystroke attempts, IRQ 1 isn't firing.
 pub static KEY_PUSH_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Counts pop_key() successes. Distinguishes "DevConsole reads
+/// are consuming events" (pop>0) from "no consumer ever ran"
+/// (pop=0). Combined with KEY_PUSH_COUNT, tells you whether the
+/// blockage is on the producer side (no IRQ, no decode) or the
+/// consumer side (shell not reading / read returning nothing).
+pub static KEY_POP_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 /// Same shape for `AsciiByte` events (serial / UART RX). 0 means
 /// no serial bytes ever reached the input ring — useful when

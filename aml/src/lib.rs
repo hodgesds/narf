@@ -292,19 +292,52 @@ pub fn capture_boot_snapshot() {
         g.nodes.len() as u32
     };
     let d = device_paths.len() as u32;
+    // Match what Linux matches:
+    //
+    //   - I2C-over-ACPI driver: AMDI* / AMD* prefix (covers
+    //     AMDI0010, AMDI0019, AMDI0510, AMDI0020, AMD0010,
+    //     AMD0020 — Linux's i2c-designware-platdrv.c match
+    //     table, including the newer Phoenix-era 0020 IDs).
+    //
+    //   - i2c-hid driver: PNP0C50 OR ACPI0C50 in either _HID
+    //     or _CID. Vendor touchpads typically have a vendor
+    //     _HID (ELANxxxx, SYNAxxxx) plus a _CID that lists
+    //     PNP0C50 — Linux's ACPI bus matcher checks both.
+    //
+    // Sources:
+    //   drivers/hid/i2c-hid/i2c-hid-acpi.c     (HID-I2C IDs)
+    //   drivers/i2c/busses/i2c-designware-platdrv.c (AMD I2C)
+    //   drivers/acpi/bus.c::acpi_driver_match_device (_CID logic)
     let mut amdi_n = 0u32;
     let mut pnp_n = 0u32;
     for path in device_paths.iter() {
-        if let Some(hid) = device_hid(path) {
-            match hid.as_str() {
-                "AMDI0010" | "AMDI0011" | "AMDI0019" | "AMDI0510" => {
-                    amdi_n += 1;
-                }
-                "PNP0C50" => {
-                    pnp_n += 1;
-                }
-                _ => {}
+        let hid = device_hid(path);
+        let cids = device_cids(path);
+        let mut matched_amdi = false;
+        let mut matched_pnp = false;
+        let is_amd_i2c_id = |s: &str| s.starts_with("AMDI") || s.starts_with("AMD0");
+        let is_hid_i2c_id = |s: &str| s == "PNP0C50" || s == "ACPI0C50";
+        if let Some(ref h) = hid {
+            if is_amd_i2c_id(h) {
+                matched_amdi = true;
             }
+            if is_hid_i2c_id(h) {
+                matched_pnp = true;
+            }
+        }
+        for cid in cids.iter() {
+            if is_amd_i2c_id(cid) {
+                matched_amdi = true;
+            }
+            if is_hid_i2c_id(cid) {
+                matched_pnp = true;
+            }
+        }
+        if matched_amdi {
+            amdi_n += 1;
+        }
+        if matched_pnp {
+            pnp_n += 1;
         }
     }
     BOOT_NODE_COUNT.store(n, core::sync::atomic::Ordering::Release);
@@ -436,6 +469,19 @@ pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
 /// bits[15:0] + 4 hex digits in bits[31:16]). Returns `None` when
 /// the device has no `_HID`, or when the value isn't a recognised
 /// shape.
+/// Return the path of every Device node in the namespace. Used by
+/// driver bind paths that need to walk all devices to check _HID
+/// + _CID combinations (rather than searching by a single _HID).
+/// Single NAMESPACE.lock pass.
+pub fn list_all_device_paths() -> alloc::vec::Vec<alloc::string::String> {
+    let g = NAMESPACE.lock();
+    g.nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Device)
+        .map(|n| n.path.clone())
+        .collect()
+}
+
 pub fn device_hid(device_path: &str) -> Option<alloc::string::String> {
     use alloc::string::String;
     let mut hid_path = String::from(device_path);
@@ -447,6 +493,40 @@ pub fn device_hid(device_path: &str) -> Option<alloc::string::String> {
         Some(NameValue::Integer(v)) => Some(eisa_id_from_u32(*v as u32)),
         _ => None,
     }
+}
+
+/// Look up `_CID` (Compatible ID) for a device. ACPI allows
+/// `_CID` to be either a single integer/string OR a package of
+/// such — many vendor HID-over-I2C touchpads carry a vendor
+/// `_HID` (e.g. `ELAN0001`) PLUS a `_CID` listing the standard
+/// `PNP0C50` so the OS can bind it via the generic HID-I2C
+/// driver. This helper returns ALL CID strings as a Vec — empty
+/// if no `_CID` is present.
+pub fn device_cids(device_path: &str) -> alloc::vec::Vec<alloc::string::String> {
+    use alloc::string::String;
+    let mut cid_path = String::from(device_path);
+    cid_path.push_str("._CID");
+    let g = NAMESPACE.lock();
+    let node = match g.nodes.iter().find(|n| n.path == cid_path) {
+        Some(n) => n,
+        None => return alloc::vec::Vec::new(),
+    };
+    let mut out = alloc::vec::Vec::new();
+    match &node.value {
+        Some(NameValue::String(s)) => out.push(s.clone()),
+        Some(NameValue::Integer(v)) => out.push(eisa_id_from_u32(*v as u32)),
+        Some(NameValue::Package(items)) => {
+            for item in items.iter() {
+                match item {
+                    NameValue::String(s) => out.push(s.clone()),
+                    NameValue::Integer(v) => out.push(eisa_id_from_u32(*v as u32)),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Evaluate `\_S5` and return the platform's `(SLP_TYPa, SLP_TYPb)`

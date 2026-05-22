@@ -62,7 +62,16 @@ use crate::{I2cBus, I2cError, I2cOp};
 //           target this driver was written against.
 // AMDI0510: Some Zen3 SKUs (Cezanne).
 // AMDI0011: Some embedded V-series.
-const AMD_FCH_HIDS: &[&str] = &["AMDI0010", "AMDI0019", "AMDI0510", "AMDI0011"];
+// AMDI0020: Phoenix / Phoenix2 (Zen4) — added for the HawkPoint1
+//           laptop bring-up. Linux's i2c-designware-platdrv.c
+//           match table also lists this.
+// AMD0010 / AMD0020: same controllers under the legacy
+//           non-prefixed ID used by some firmware revisions.
+//           Linux matches both forms.
+const AMD_FCH_HIDS: &[&str] = &[
+    "AMDI0010", "AMDI0011", "AMDI0019", "AMDI0020", "AMDI0510",
+    "AMD0010", "AMD0020",
+];
 
 // ── DW I2C register offsets ────────────────────────────────────────
 const IC_CON: u64 = 0x00;

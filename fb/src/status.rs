@@ -122,18 +122,20 @@ pub fn paint(fb: &FbWriter) {
         crate::cursor::moves(),
     );
 
-    // i8042 status — all atomics already.
+    // i8042 + KEY_RING traffic — all atomics already.
     let i8042_diag = {
         let kbd_init = narf_input::I8042_KBD_INIT_OK.load(Ordering::Acquire);
         let kbd_irq = narf_input::I8042_KBD_IRQ_ROUTED.load(Ordering::Acquire);
         let kbd_pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
+        let kbd_pops = narf_input::KEY_POP_COUNT.load(Ordering::Relaxed);
         let ascii_pushes = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
         let ascii_pops = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
         format!(
-            "input: kbd init={}/irq={} key-push={} ascii push={}/pop={}",
+            "input: kbd init={}/irq={} key push/pop={}/{} ascii push/pop={}/{}",
             if kbd_init { "ok" } else { "FAIL" },
             if kbd_irq { "ok" } else { "FAIL" },
             kbd_pushes,
+            kbd_pops,
             ascii_pushes,
             ascii_pops,
         )

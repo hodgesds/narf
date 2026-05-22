@@ -87,15 +87,48 @@ fn on_gpio_irq(pin: u16) {
     }
 }
 
-/// Walk + bind every PNP0C50 child. Returns the number of devices
-/// that were successfully bound (driver instance constructed +
-/// pump task spawned). Devices missing their parent I2C bus, or
-/// missing `I2cSerialBus` in `_CRS` entirely, are logged + skipped.
+/// Walk + bind every HID-over-I2C device in the AML namespace.
+///
+/// Matches what Linux's `i2c-hid-acpi.c` does:
+///   - `_HID == "PNP0C50"` (legacy HID-over-I2C ID)
+///   - `_HID == "ACPI0C50"` (newer ACPI-spec ID; Phoenix-era
+///     firmware tends to use this)
+///   - Vendor `_HID` (e.g. `ELAN09BD`, `SYNA8002`) with
+///     `PNP0C50` or `ACPI0C50` in the `_CID` list — Linux's
+///     ACPI bus matcher walks both _HID and _CID; we replicate
+///     that here.
+///
+/// Returns the number of devices successfully bound. Devices
+/// missing their parent I2C bus, or missing `I2cSerialBus` in
+/// `_CRS` entirely, are logged + skipped.
 pub fn bind_all() -> usize {
+    use alloc::collections::BTreeSet;
+    use alloc::string::String;
     let mut bound = 0usize;
-    for child in narf_aml::find_all_devices_by_hid("PNP0C50") {
-        if bind_one(&child.path) {
-            bound += 1;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // First pass: devices whose _HID matches directly.
+    for &hid in &["PNP0C50", "ACPI0C50"] {
+        for child in narf_aml::find_all_devices_by_hid(hid) {
+            if seen.insert(child.path.clone()) && bind_one(&child.path) {
+                bound += 1;
+            }
+        }
+    }
+    // Second pass: devices whose vendor _HID isn't PNP0C50 /
+    // ACPI0C50 but whose _CID list includes one of them. Walk
+    // all devices once, test each.
+    let all_devices = narf_aml::list_all_device_paths();
+    for path in all_devices {
+        if seen.contains(&path) {
+            continue;
+        }
+        let cids = narf_aml::device_cids(&path);
+        let matches = cids.iter().any(|c| c == "PNP0C50" || c == "ACPI0C50");
+        if matches {
+            seen.insert(path.clone());
+            if bind_one(&path) {
+                bound += 1;
+            }
         }
     }
     bound
