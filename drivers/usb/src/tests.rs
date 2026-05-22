@@ -1922,3 +1922,138 @@ fn smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface);
+
+// ── Bring-up replication: input chain failure modes ───────────────
+//
+// These tests reproduce the failure modes we've hit on real
+// silicon ("kbd attached but no reports flowing") without needing
+// real hardware. Each isolates one signal we'd observe on the
+// status panel + verifies it behaves as documented.
+
+/// pump_all on an empty keyboard list returns 0 events without
+/// hanging or erroring. The supervisor task calls this every
+/// wake — if no kbd bound, must be a fast no-op.
+#[cfg(target_arch = "x86_64")]
+fn smoke_hid_pump_all_with_no_keyboards_is_noop() -> TestResult {
+    use crate::{hid, xhci};
+    if !xhci::is_probed() {
+        return TestResult::Skip("xhci not probed");
+    }
+    hid::__reset_keyboards_for_test();
+    let before_pumps = hid::PUMP_ALL_CALLS.load(core::sync::atomic::Ordering::Relaxed);
+    let before_reports = hid::REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
+    let n = xhci::with_controller(|c| hid::pump_all(c)).unwrap_or(0);
+    if n != 0 {
+        return TestResult::Fail("pump_all with no kbds returned non-zero events");
+    }
+    let after_pumps = hid::PUMP_ALL_CALLS.load(core::sync::atomic::Ordering::Relaxed);
+    let after_reports = hid::REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
+    if after_pumps != before_pumps + 1 {
+        return TestResult::Fail("PUMP_ALL_CALLS didn't increment on pump_all");
+    }
+    if after_reports != before_reports {
+        return TestResult::Fail("REPORTS_READ incremented with no kbds");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid", smoke_hid_pump_all_with_no_keyboards_is_noop);
+
+/// On-screen diagnostic contract: `PUMP_ALL_CALLS` advances on
+/// every supervisor wake; `REPORTS_READ` advances on every
+/// non-empty interrupt-IN read. These two counters are what the
+/// status panel exposes for real-HW bring-up diagnosis. This
+/// test pins their semantics so a refactor that drops one of
+/// the bumps fails loudly.
+#[cfg(target_arch = "x86_64")]
+fn smoke_hid_pump_counters_monotonic() -> TestResult {
+    use crate::{hid, xhci};
+    use core::sync::atomic::Ordering;
+    if !xhci::is_probed() {
+        return TestResult::Skip("xhci not probed");
+    }
+    hid::__reset_keyboards_for_test();
+    let baseline_pumps = hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
+    // Drive several pumps; each must advance the counter by 1.
+    for i in 1..=5u32 {
+        let _ = xhci::with_controller(|c| hid::pump_all(c));
+        let now = hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
+        if now != baseline_pumps + i {
+            return TestResult::Fail("PUMP_ALL_CALLS didn't advance monotonically");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid", smoke_hid_pump_counters_monotonic);
+
+/// find_boot_keyboard handles a config descriptor with NO
+/// HID-class interface (e.g., a kbd-shaped device that doesn't
+/// expose Boot subclass). Returns NoInterruptIn / NotBoot, never
+/// loops indefinitely. Catches a regression where the parser
+/// fails to advance past an unrecognised descriptor type.
+fn smoke_hid_find_boot_keyboard_no_hid_iface_terminates() -> TestResult {
+    use crate::hid::find_boot_keyboard;
+    // Config descriptor with a non-HID interface (class=0xFF
+    // Vendor-Specific). No interrupt-IN should be found.
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Config descriptor header (9 bytes).
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    // Interface descriptor (9 bytes) — vendor-specific class.
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0]);
+    // Endpoint descriptor (7 bytes) — bulk-IN.
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x02, 0x40, 0x00, 0]);
+    // Patch total length in header.
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+    match find_boot_keyboard(&cfg) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("non-HID config matched as boot keyboard"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/hid",
+    smoke_hid_find_boot_keyboard_no_hid_iface_terminates
+);
+
+/// find_boot_keyboard handles a truncated descriptor without
+/// reading past the buffer. Catches a regression where a length
+/// field of 0 would cause an infinite loop.
+fn smoke_hid_find_boot_keyboard_truncated_descriptor_terminates() -> TestResult {
+    use crate::hid::find_boot_keyboard;
+    // Header with length saying "more bytes" but buffer too short.
+    let cfg: alloc::vec::Vec<u8> = alloc::vec![9, 0x02, 64, 0, 1, 1, 0, 0xC0, 50];
+    let _ = find_boot_keyboard(&cfg);
+    // Reaching here without an infinite loop / panic is the test.
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/hid",
+    smoke_hid_find_boot_keyboard_truncated_descriptor_terminates
+);
+
+/// find_boot_keyboard returns NoInterruptIn for a kbd config
+/// that's missing an interrupt-IN endpoint. Reproduces the
+/// `port=6 step=find_boot_kbd err=NoInterruptIn` message from
+/// the user's real-HW boot — same root path.
+fn smoke_hid_find_boot_keyboard_returns_no_interrupt_in_when_missing()
+-> TestResult {
+    use crate::hid::{find_boot_keyboard, HidError};
+    // HID Boot Keyboard interface BUT no interrupt-IN endpoint.
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    // Interface descriptor: HID class (0x03), Boot subclass (0x01),
+    // Keyboard protocol (0x01).
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 0, 0x03, 0x01, 0x01, 0]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+    match find_boot_keyboard(&cfg) {
+        Err(HidError::NoInterruptIn) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("matched as keyboard without an int-IN endpoint"),
+        Err(_) => TestResult::Fail("wrong error variant for missing int-IN"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/hid",
+    smoke_hid_find_boot_keyboard_returns_no_interrupt_in_when_missing
+);
