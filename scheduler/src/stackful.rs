@@ -414,6 +414,21 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     let task = unsafe { &mut *task };
 
     loop {
+        // Diagnostic beacons for the stackful inner-poll path.
+        // Slot 52: about to poll inner future. White on first
+        // entry; toggles thereafter. If slot 52 paints but slot
+        // 53 doesn't, the inner future's poll() never returns
+        // (busy-loop or sync hang inside it) and we never reach
+        // the kernel_switch back to the executor — a classic
+        // cooperative wedge with preemption gated off.
+        // Slot 53: about to kernel_switch back to executor (post-
+        // poll). Toggles each yield. If 52 and 53 both paint,
+        // the inner poll round-trips correctly.
+        let prev_52 = STACKFUL_POLL_TICKS.fetch_add(1, Ordering::Relaxed);
+        narf_memory::beacon::paint(
+            52,
+            if prev_52 & 1 == 0 { 0x00FF_FFFF } else { 0x0080_80FF },
+        );
         // Build a Context around the executor-supplied waker. The
         // `poll_to_yield` caller stashed it in `task.current_waker`
         // immediately before kernel_switching us in. Falling back
@@ -428,6 +443,11 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         drop(waker_guard);
         let mut cx = Context::from_waker(&waker);
         let result = task.future.as_mut().poll(&mut cx);
+        let prev_53 = STACKFUL_YIELD_TICKS.fetch_add(1, Ordering::Relaxed);
+        narf_memory::beacon::paint(
+            53,
+            if prev_53 & 1 == 0 { 0x0000_FF80 } else { 0x00FF_8000 },
+        );
         match result {
             Poll::Ready(()) => {
                 task.completed.store(true, Ordering::Release);
@@ -586,6 +606,13 @@ pub fn enable_preempt_rewrite() {
 /// read by the stub to find which task to switch back from.
 /// Single-CPU phase 2; phase 3 makes this per-CPU.
 static PENDING_YIELD_TASK: AtomicPtr<KernelTask> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Counter for slot-52 beacon (pre-inner-poll heartbeat).
+/// Surfaced via toggling colour at task_body_rust each round.
+static STACKFUL_POLL_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Counter for slot-53 beacon (post-inner-poll / pre-yield).
+/// Surfaced via toggling colour after the inner future polls.
+static STACKFUL_YIELD_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ── Yield + Resume stubs ─────────────────────────────────────────
 //
