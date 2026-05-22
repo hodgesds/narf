@@ -1235,7 +1235,14 @@ impl Controller {
         // bumps fire_count, the future captures the post-IRQ
         // value as its baseline, and the await parks forever
         // waiting for a second MSI that never comes.
-        let wait = narf_interrupts::wait_for_irq(v);
+        //
+        // 30 s deadline matches Linux NVMe's default
+        // command timeout (drivers/nvme/host/nvme.c:NVME_DEFAULT_TIMEOUT).
+        // On expiry we surface CompletionTimeout so the upper
+        // layer can decide between retry / controller reset /
+        // EIO to the requestor.
+        let deadline = narf_time::Deadline::after_ms(30_000);
+        let wait = narf_interrupts::wait_for_irq_until(v, deadline);
 
         // Submit + ring doorbell. All self-borrows released at
         // the closing brace.
@@ -1263,10 +1270,16 @@ impl Controller {
             }
         }
 
-        // Park until the MSI-X completion fires. The first
-        // poll returns Ready if MSI fired between the future's
-        // construction (above, pre-doorbell) and now.
-        let _ = wait.await;
+        // Park until the MSI-X completion fires OR the 30 s
+        // deadline expires. The first poll returns Ready if MSI
+        // fired between the future's construction (above, pre-
+        // doorbell) and now.
+        match wait.await {
+            Ok(_) => {}
+            Err(_elapsed) => {
+                return Err(NvmeError::CompletionTimeout);
+            }
+        }
 
         // Drain the CQE + ring CQ-head doorbell on the SAME queue
         // we submitted on.

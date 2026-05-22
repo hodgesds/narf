@@ -1220,7 +1220,15 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
             const PUMP_CYCLES: u64 = 53_000_000;
             loop {
                 if let Some(v) = irq {
-                    narf_interrupts::wait::wait_for_irq(v).await;
+                    // 100 ms deadline mirrors the sleep_cycles
+                    // fallback period — if the MSI-X path goes
+                    // silent we re-poll the rx queue at the same
+                    // cadence the no-IRQ branch uses.
+                    let _ = narf_interrupts::wait_for_irq_until(
+                        v,
+                        narf_time::Deadline::after_ms(100),
+                    )
+                    .await;
                 } else {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
                 }

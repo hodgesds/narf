@@ -1423,9 +1423,15 @@ impl IntelHda {
         // 3. Construct the IRQ future BEFORE poking CORBWP — the
         //    future captures `fire_count(v)` as its baseline, so any
         //    IRQ that lands after this point is guaranteed to flip
-        //    it Ready on poll.
+        //    it Ready on poll. 200 ms per-verb deadline matches
+        //    Linux HDA's azx_send_cmd timeout pattern; on expiry
+        //    the loop re-checks RIRBWP (often we won the race) and
+        //    re-arms.
         loop {
-            let waiter = narf_interrupts::wait_for_irq(v);
+            let waiter = narf_interrupts::wait_for_irq_until(
+                v,
+                narf_time::Deadline::after_ms(200),
+            );
 
             // 4. Kick CORBWP — controller fetches the new verb,
             //    sends it down the link, and on the codec response

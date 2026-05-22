@@ -898,9 +898,14 @@ pub async fn rx_async(out: &mut [u8]) -> usize {
     // Construct the wait future *before* we look at the ring. The
     // future captures the current fire-count as its baseline; if an
     // RX IRQ fires while we're inside `rx_recv`, the future resolves
-    // immediately on next poll (wait_for_irq doc: "construct BEFORE
-    // the action that triggers the IRQ").
-    let waiter = narf_interrupts::wait::wait_for_irq(vector);
+    // immediately on next poll. 250 ms deadline bounds the dormancy
+    // when the device goes silent or the IRQ isn't wired right —
+    // we fall back to a polled re-drain instead of stalling
+    // forever.
+    let waiter = narf_interrupts::wait_for_irq_until(
+        vector,
+        narf_time::Deadline::after_ms(250),
+    );
     // Fast path: there might already be a frame ready (e.g. an IRQ
     // landed before we got here). Drain it without awaiting.
     if let Some(n) = with_controller(|c| {
@@ -916,7 +921,8 @@ pub async fn rx_async(out: &mut [u8]) -> usize {
         drop(waiter);
         return n;
     }
-    // Slow path: await the next RX IRQ, then drain.
+    // Slow path: await the next RX IRQ OR timeout, then drain
+    // whatever the ring has (Ok or Err: drain either way).
     let _ = waiter.await;
     with_controller(|c| c.rx_recv(out)).unwrap_or(0)
 }
@@ -935,8 +941,14 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     };
     // Construct the future first, then enqueue. If the device
     // completes before we await, the post-enqueue fire-count check
-    // inside `WaitForIrq::poll` resolves immediately.
-    let waiter = narf_interrupts::wait::wait_for_irq(vector);
+    // inside `WaitForIrq::poll` resolves immediately. 500 ms
+    // deadline bounds the wait — TX completes in microseconds
+    // normally; if it doesn't, the IRQ isn't wired right and we
+    // should bail rather than stall.
+    let waiter = narf_interrupts::wait_for_irq_until(
+        vector,
+        narf_time::Deadline::after_ms(500),
+    );
     let slot =
         match with_controller(|c| c.tx_enqueue(frame)).unwrap_or(Err(E1000Error::UnsupportedDevice))
         {
@@ -948,10 +960,16 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
         };
     // Await the pre-enqueue waiter, then loop on additional IRQs in
     // case the wake was for a different cause (e.g. RXT0) and our
-    // slot's DD bit isn't yet set.
+    // slot's DD bit isn't yet set. Each iteration has its own
+    // deadline; if we hit 5 spurious wakes the caller's higher-
+    // level timeout (sys_send, etc.) will abort us.
     let _ = waiter.await;
     while !with_controller(|c| c.tx_slot_done(slot)).unwrap_or(false) {
-        let _ = narf_interrupts::wait::wait_for_irq(vector).await;
+        let _ = narf_interrupts::wait_for_irq_until(
+            vector,
+            narf_time::Deadline::after_ms(500),
+        )
+        .await;
     }
     Ok(())
 }

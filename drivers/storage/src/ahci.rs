@@ -360,7 +360,15 @@ impl Ahci {
 
         // Construct the waiter FIRST — captures the pre-doorbell
         // fire_count baseline. Then ring CI. Then await.
-        let mut waiter = narf_interrupts::wait_for_irq(vector);
+        // Each wait is bounded by a 5 s deadline — matches Linux
+        // libata's ATA_TMOUT_INTERNAL_QUICK. On expiry we fall
+        // through the loop to re-read CI: if the command actually
+        // completed but the IRQ was lost, the read sees ci & bit
+        // == 0 and returns Ok. Otherwise loop again with a fresh
+        // baseline (bounded by the total command-level timeout
+        // the caller enforces).
+        let mut deadline = narf_time::Deadline::after_ms(5_000);
+        let mut waiter = narf_interrupts::wait_for_irq_until(vector, deadline);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -378,12 +386,13 @@ impl Ahci {
             if ci & bit == 0 {
                 return Ok(());
             }
-            // Park until the next IRQ. After wake-up, install a
-            // fresh waiter for the next iteration so we observe any
-            // IRQ that lands between this drain and the next CI
-            // read.
+            // Park until the next IRQ OR deadline. After wake-up,
+            // install a fresh waiter for the next iteration so we
+            // observe any IRQ that lands between this drain and
+            // the next CI read.
             let _ = (&mut waiter).await;
-            waiter = narf_interrupts::wait_for_irq(vector);
+            deadline = narf_time::Deadline::after_ms(5_000);
+            waiter = narf_interrupts::wait_for_irq_until(vector, deadline);
         }
     }
 

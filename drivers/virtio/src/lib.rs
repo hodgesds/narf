@@ -132,7 +132,16 @@ fn spawn_input_pump_task() {
         narf_scheduler::spawn_stackful(async move {
             loop {
                 if let Some(v) = irq {
-                    narf_interrupts::wait::wait_for_irq(v).await;
+                    // 100 ms deadline so if the IRQ stops
+                    // delivering (real-HW MSI-X misconfig), we
+                    // still re-poll the device every cycle. The
+                    // drain_events() call below works the same
+                    // whether woken by IRQ or timeout.
+                    let _ = narf_interrupts::wait_for_irq_until(
+                        v,
+                        narf_time::Deadline::after_ms(100),
+                    )
+                    .await;
                 } else {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
                 }

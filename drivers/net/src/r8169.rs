@@ -647,7 +647,17 @@ impl RtlNic {
             return Err(NicError::FrameTooLong);
         }
         let v = self.irq_vector.ok_or(NicError::MsixSetup)?;
-        let waiter = narf_interrupts::wait_for_irq(v);
+        // 500 ms TX-completion deadline. Linux r8169 uses a
+        // per-queue watchdog set via dev->watchdog_timeo (5s
+        // default); 500ms here is conservative for the per-call
+        // path. On timeout we don't return an error — the caller
+        // gets back from .await and proceeds with the assumption
+        // that OWN may not be cleared; subsequent transmit_irq
+        // calls will detect TxRingFull and back off.
+        let waiter = narf_interrupts::wait_for_irq_until(
+            v,
+            narf_time::Deadline::after_ms(500),
+        );
 
         // Stage frame into the persistent per-slot buffer (audit
         // #4); same shape as polled `transmit`, minus the OWN-clear
@@ -711,7 +721,13 @@ impl RtlNic {
     /// LinkChg-only event), and the caller should re-await.
     pub async fn receive_irq_async(&self) -> Option<alloc::vec::Vec<u8>> {
         let v = self.irq_vector?;
-        let waiter = narf_interrupts::wait_for_irq(v);
+        // 250 ms RX-wake deadline. On timeout the caller (RX pump)
+        // re-polls — same shape as Linux's NAPI poll budget /
+        // soft-IRQ fallback when the device goes idle.
+        let waiter = narf_interrupts::wait_for_irq_until(
+            v,
+            narf_time::Deadline::after_ms(250),
+        );
         // Race-free: a synchronously-delivered ROK won't be lost
         // because the waiter snapshots the fire_count before we
         // start polling.
