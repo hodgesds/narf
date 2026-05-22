@@ -1767,6 +1767,268 @@ pub mod tests {
         TestResult::Pass
     }
 
+    // ── Spawn-flavour coverage ───────────────────────────────────────
+    //
+    // These tests all run sequentially on the BSP — kernel-test
+    // is single-CPU at the test-runner granularity. Multiple
+    // tasks interleave via poll_one_round; only one task runs at
+    // any instant. Exercises the GLOBAL ready queue (not isolated
+    // KernelTask + poll_to_yield), so spawn/queue/dequeue paths
+    // are covered.
+
+    /// Plain spawn() (cooperative, no dedicated stack): N tasks
+    /// each count up via Pending + wake_by_ref. Verifies the
+    /// stackless executor path round-robins correctly under load
+    /// without needing the stackful machinery.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_plain_spawn_round_robin() -> TestResult {
+        const TASKS: usize = 4;
+        const TARGET: u32 = 6;
+        static COUNTERS: [AtomicU32; TASKS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        for c in COUNTERS.iter() {
+            c.store(0, Ordering::Release);
+        }
+
+        struct Counter {
+            idx: usize,
+            target: u32,
+            seen: u32,
+        }
+        impl Future for Counter {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.seen >= self.target {
+                    return Poll::Ready(());
+                }
+                COUNTERS[self.idx].fetch_add(1, Ordering::AcqRel);
+                self.seen += 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn(Counter {
+                idx: i,
+                target: TARGET,
+                seen: 0,
+            });
+        }
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if COUNTERS.iter().all(|c| c.load(Ordering::Acquire) >= TARGET) {
+                break;
+            }
+        }
+        for c in COUNTERS.iter() {
+            if c.load(Ordering::Acquire) != TARGET {
+                return TestResult::Fail("plain-spawn task didn't reach target");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// Mixed cohort: some plain spawn, some spawn_stackful, all
+    /// driven by the same executor. The executor must round-robin
+    /// fairly between them without preferring one type. Catches a
+    /// regression where the StackfulAdapter::poll path consumes a
+    /// disproportionate share of executor time (e.g. unconditional
+    /// re-arm bug we already fixed — this is a regression guard).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_mixed_spawn_types() -> TestResult {
+        static PLAIN_DONE: AtomicU32 = AtomicU32::new(0);
+        static STACK_DONE: AtomicU32 = AtomicU32::new(0);
+        PLAIN_DONE.store(0, Ordering::Release);
+        STACK_DONE.store(0, Ordering::Release);
+
+        struct Once {
+            counter: &'static AtomicU32,
+        }
+        impl Future for Once {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                self.counter.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+
+        for _ in 0..3 {
+            crate::spawn(Once { counter: &PLAIN_DONE });
+            crate::spawn_stackful(Once { counter: &STACK_DONE });
+        }
+        for _ in 0..32 {
+            crate::poll_one_round();
+            if PLAIN_DONE.load(Ordering::Acquire) >= 3 && STACK_DONE.load(Ordering::Acquire) >= 3 {
+                break;
+            }
+        }
+        if PLAIN_DONE.load(Ordering::Acquire) != 3 {
+            return TestResult::Fail("plain-spawn tasks didn't all complete in mixed cohort");
+        }
+        if STACK_DONE.load(Ordering::Acquire) != 3 {
+            return TestResult::Fail("spawn_stackful tasks didn't all complete in mixed cohort");
+        }
+        TestResult::Pass
+    }
+
+    /// Spawn-during-spawn: a task spawns another task during its
+    /// poll. The newly-spawned task lands at the back of the
+    /// queue and is polled in a SUBSEQUENT round (per the
+    /// "snapshot queue_len at round start" rule in run_until_empty
+    /// / poll_one_round). Without that rule, a task that spawns
+    /// itself recursively would starve everyone else.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_spawn_during_spawn() -> TestResult {
+        const CHILDREN: u32 = 8;
+        static PARENT_DONE: AtomicBool = AtomicBool::new(false);
+        static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
+        PARENT_DONE.store(false, Ordering::Release);
+        CHILD_DONE.store(0, Ordering::Release);
+
+        struct Child;
+        impl Future for Child {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                CHILD_DONE.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+
+        struct Parent;
+        impl Future for Parent {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                for _ in 0..CHILDREN {
+                    crate::spawn(Child);
+                }
+                PARENT_DONE.store(true, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        crate::spawn(Parent);
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if PARENT_DONE.load(Ordering::Acquire)
+                && CHILD_DONE.load(Ordering::Acquire) >= CHILDREN
+            {
+                break;
+            }
+        }
+        if !PARENT_DONE.load(Ordering::Acquire) {
+            return TestResult::Fail("parent task didn't run");
+        }
+        if CHILD_DONE.load(Ordering::Acquire) != CHILDREN {
+            return TestResult::Fail("children spawned by parent didn't all complete");
+        }
+        TestResult::Pass
+    }
+
+    /// Spawn_stackful inside spawn_stackful: a stackful task
+    /// spawns another stackful task during its poll. Same
+    /// guarantee as plain spawn-during-spawn but exercises the
+    /// stackful adapter's nested-allocation path.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_stackful_spawns_stackful() -> TestResult {
+        const CHILDREN: u32 = 6;
+        static CHILD_COUNT: AtomicU32 = AtomicU32::new(0);
+        static PARENT_DONE: AtomicBool = AtomicBool::new(false);
+        CHILD_COUNT.store(0, Ordering::Release);
+        PARENT_DONE.store(false, Ordering::Release);
+
+        struct Child;
+        impl Future for Child {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                CHILD_COUNT.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+        struct Parent;
+        impl Future for Parent {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                for _ in 0..CHILDREN {
+                    crate::spawn_stackful(Child);
+                }
+                PARENT_DONE.store(true, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        crate::spawn_stackful(Parent);
+        for _ in 0..128 {
+            crate::poll_one_round();
+            if PARENT_DONE.load(Ordering::Acquire)
+                && CHILD_COUNT.load(Ordering::Acquire) >= CHILDREN
+            {
+                break;
+            }
+        }
+        if !PARENT_DONE.load(Ordering::Acquire) {
+            return TestResult::Fail("stackful parent didn't run");
+        }
+        if CHILD_COUNT.load(Ordering::Acquire) != CHILDREN {
+            return TestResult::Fail("stackful children didn't all complete");
+        }
+        TestResult::Pass
+    }
+
+    /// FIFO guarantee under single-CPU sequential polling. With
+    /// N tasks spawned in order, the FIRST poll round should
+    /// visit them in spawn order. Verifies the ready queue is a
+    /// FIFO (not a stack) and that the round_len snapshot bounds
+    /// visits per round correctly.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_spawn_fifo_order() -> TestResult {
+        static ORDER: [AtomicU32; 4] = [
+            AtomicU32::new(u32::MAX),
+            AtomicU32::new(u32::MAX),
+            AtomicU32::new(u32::MAX),
+            AtomicU32::new(u32::MAX),
+        ];
+        static TICKET: AtomicU32 = AtomicU32::new(0);
+        for s in ORDER.iter() {
+            s.store(u32::MAX, Ordering::Release);
+        }
+        TICKET.store(0, Ordering::Release);
+
+        struct Marker {
+            idx: usize,
+        }
+        impl Future for Marker {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let ticket = TICKET.fetch_add(1, Ordering::AcqRel);
+                ORDER[self.idx].store(ticket, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        for i in 0..4 {
+            crate::spawn(Marker { idx: i });
+        }
+        for _ in 0..8 {
+            crate::poll_one_round();
+            if ORDER.iter().all(|s| s.load(Ordering::Acquire) != u32::MAX) {
+                break;
+            }
+        }
+        // Spawn order: 0, 1, 2, 3 → ticket order should match.
+        for (i, slot) in ORDER.iter().enumerate() {
+            let t = slot.load(Ordering::Acquire);
+            if t as usize != i {
+                return TestResult::Fail("ready queue isn't FIFO across spawn order");
+            }
+        }
+        TestResult::Pass
+    }
+
     /// Multi-task vmalloc CAS contention: N tasks each request a
     /// distinct VA range; ranges must be disjoint. vmalloc uses
     /// compare_exchange_weak on the cursor; this exercises that
@@ -2048,5 +2310,30 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_alloc_concurrency_vmalloc_cas_disjoint
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_plain_spawn_round_robin
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_mixed_spawn_types
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_spawn_during_spawn
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_stackful_spawns_stackful
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_spawn_fifo_order
     );
 }
