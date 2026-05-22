@@ -525,10 +525,21 @@ pub fn spurious_count(vector: u8) -> u64 {
 /// gets woken on the next fire. The wakers list is taken out at
 /// wake time so each waiter must re-register if it wants another
 /// wake.
+/// Install a waker for the next IRQ on `vector`. If an equivalent
+/// waker (per `Waker::will_wake`) is already queued, this is a
+/// no-op — `wait_for_irq` calls `set_waker` on every re-poll, so
+/// without the dedup the list would grow unbounded on real-HW
+/// where IRQs come slowly relative to the executor's re-poll
+/// rate. Two distinct waiters with different wakers both get
+/// pushed (that's the multi-waiter contract).
 #[inline]
 pub fn set_waker(vector: u8, w: Waker) {
     check_no_reentry("set_waker", vector);
-    SLOTS[vector as usize].wakers.lock().push(w);
+    let mut g = SLOTS[vector as usize].wakers.lock();
+    if g.iter().any(|existing| existing.will_wake(&w)) {
+        return;
+    }
+    g.push(w);
 }
 
 /// Drop any waker matching `w` (by `Waker::will_wake`). Useful for
@@ -538,6 +549,14 @@ pub fn set_waker(vector: u8, w: Waker) {
 pub fn clear_waker(vector: u8) {
     check_no_reentry("clear_waker", vector);
     SLOTS[vector as usize].wakers.lock().clear();
+}
+
+/// Diagnostic: number of distinct wakers currently queued for
+/// `vector`. Exposed for tests (set_waker dedup regression) and
+/// for the panel's per-vector dignostic line.
+#[inline]
+pub fn wakers_len(vector: u8) -> usize {
+    SLOTS[vector as usize].wakers.lock().len()
 }
 
 // ── NMI dispatch ────────────────────────────────────────────────────

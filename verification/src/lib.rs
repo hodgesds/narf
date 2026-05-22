@@ -5711,3 +5711,75 @@ fn smoke_irq_multi_waker_both_resolve() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_irq_multi_waker_both_resolve);
+
+/// Multi-waker dedup contract: a wait_for_irq future that's polled
+/// many times before the IRQ fires must not grow the slot's
+/// wakers list unboundedly. set_waker dedupes by will_wake so the
+/// list size is bounded by the number of DISTINCT waiters, not by
+/// the number of polls.
+///
+/// Regression test for a real-HW hang seen on AMD laptops: on
+/// silicon where the IRQ rate is much lower than the executor's
+/// re-poll rate, the un-deduped list grew per poll, eventually
+/// exhausting the allocator. QEMU's high virtual-IRQ rate masked
+/// the issue.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
+    use core::pin::Pin;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{Context, Poll};
+
+    const VECTOR: u8 = 90;
+    static POLLS: AtomicU32 = AtomicU32::new(0);
+    POLLS.store(0, Ordering::Release);
+
+    // A future that polls wait_for_irq repeatedly via re-poll
+    // without the IRQ ever firing. Counts the number of set_waker
+    // calls indirectly via POLLS.
+    struct PollMany {
+        remaining: u32,
+        inner: narf_interrupts::wait::WaitForIrq,
+    }
+    impl Future for PollMany {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            // Poll the WaitForIrq — it calls set_waker.
+            let inner = unsafe { Pin::new_unchecked(&mut self.inner) };
+            let _ = inner.poll(cx);
+            POLLS.fetch_add(1, Ordering::AcqRel);
+            if self.remaining == 0 {
+                return Poll::Ready(());
+            }
+            self.remaining -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    let task = PollMany {
+        remaining: 64,
+        inner: narf_interrupts::wait::wait_for_irq(VECTOR),
+    };
+    narf_scheduler::spawn_stackful(task);
+    for _ in 0..256 {
+        narf_scheduler::poll_one_round();
+        if POLLS.load(Ordering::Acquire) >= 64 {
+            break;
+        }
+    }
+    // The wakers list for VECTOR should hold at most ONE entry
+    // for this future's waker — the dedup keeps repeated polls
+    // from accumulating.
+    let len = narf_interrupts::dispatch::wakers_len(VECTOR);
+    if len > 1 {
+        return TestResult::Fail("set_waker didn't dedupe — wakers list grew unbounded");
+    }
+    // Cleanup: clear the registered waker so subsequent tests
+    // start clean. The future is still alive in the scheduler
+    // (we never fire VECTOR), but its slot will GC eventually.
+    narf_interrupts::dispatch::clear_waker(VECTOR);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_set_waker_dedupes_by_will_wake);
