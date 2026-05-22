@@ -61,6 +61,7 @@ use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTa
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
+use alloc::sync::Arc;
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// QEMU `qemu-xhci`.
@@ -3317,7 +3318,22 @@ impl Xhci {
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<Xhci>> = IrqSafeSpinLock::new(None);
+/// xHCI controller handle. Wrapped in `Arc` so callers can hold a
+/// reference to the controller WITHOUT holding the outer registry
+/// lock across MMIO, command waits, or port enumeration. The
+/// previous design (`IrqSafeSpinLock<Option<Xhci>>` + `with_controller`
+/// invoked the closure inside the lock) serialized every operation
+/// through one mutex AND disabled interrupts on the holder — port
+/// reset (~5-10 ms debounce) + enable_slot (250 ms timeout) +
+/// address_device (250 ms timeout) all ran with the lock held, so
+/// a busy supervisor cycle could pin the lock for multiple seconds
+/// and any concurrent caller (status panel, ISR, sibling pump) was
+/// blocked. Switching to Arc lets the lock cover only the brief
+/// "clone the handle" window; sub-resource serialization happens
+/// at the per-resource inner locks the `Xhci` struct already owns
+/// (`cmd_enqueue`, `cmd_pcs`, `cmd_events`, `transfer_events`,
+/// `er_dequeue`, `er_ccs`).
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Xhci>>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -3346,7 +3362,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+    *CONTROLLER.lock() = Some(Arc::new(dev));
     IS_PROBED.store(true, core::sync::atomic::Ordering::Release);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("xhci0"),
@@ -3463,8 +3479,25 @@ pub fn is_probed() -> bool {
     IS_PROBED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Get a cloned `Arc<Xhci>` handle to the bound controller, or
+/// `None` if no controller is bound. The registry lock is held
+/// ONLY for the Arc clone — never across the caller's work. Use
+/// this in preference to [`with_controller`] when the work spans
+/// multiple MMIO ops, command-completion waits, or any path that
+/// would benefit from releasing the lock between sub-steps.
+pub fn controller() -> Option<Arc<Xhci>> {
+    CONTROLLER.lock().clone()
+}
+
+/// Convenience wrapper: clone the Arc, drop the registry lock,
+/// then invoke `f`. Semantically identical to the previous
+/// closure-inside-the-lock shape from the caller's perspective,
+/// but the outer lock is no longer held during `f` — `f` can
+/// take seconds (port reset, command completion) without blocking
+/// every other caller / the ISR.
 pub fn with_controller<R>(f: impl FnOnce(&Xhci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let c = controller()?;
+    Some(f(&c))
 }
 
 /// xHCI ISR — runs in IRQ context.
@@ -3488,16 +3521,16 @@ pub fn with_controller<R>(f: impl FnOnce(&Xhci) -> R) -> Option<R> {
 /// IRQ live until the ring is empty (next-tick if we hit the
 /// per-IRQ cap).
 fn xhci_isr() {
-    // Try-lock pattern would be ideal here, but IrqSafeSpinLock
-    // is non-poisonable + non-trying. The lock is held only
-    // for short windows by Xhci submit/poll paths; collision
-    // in IRQ context is rare and safe (IRQ delivery already
-    // disabled IF). If the controller's gone, no-op.
-    let g = CONTROLLER.lock();
-    let xhci = match g.as_ref() {
+    // Brief Arc clone, then drop the registry lock — the ISR no
+    // longer races the supervisor for the outer mutex. Each
+    // demux/poll/ack step takes its own per-resource inner lock
+    // as needed; that's the right granularity for a shared
+    // controller handle.
+    let xhci = match controller() {
         Some(x) => x,
         None => return,
     };
+    let xhci = &*xhci;
     // Demux up to N events into the per-class queues so any
     // sync waiter (await_event) sees its event regardless of
     // whether the ISR or the waiter dequeued it from the ring.

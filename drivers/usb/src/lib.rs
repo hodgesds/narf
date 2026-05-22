@@ -101,19 +101,26 @@ fn spawn_supervisor_task() {
         // Per-root-port consecutive-failure counter.
         let mut root_fail_count = [0u8; 128];
         loop {
-            if !xhci::is_probed() {
-                narf_time::sleep_cycles(PUMP_CYCLES).await;
-                continue;
-            }
+            // Acquire the controller handle once per loop iteration.
+            // The Arc clone takes the registry lock for microseconds;
+            // the rest of the iteration runs against `&*c` with no
+            // outer lock held. Phase 1 / Phase 2 / pump_all calls all
+            // operate on the same `&Xhci` borrow.
+            let c = match xhci::controller() {
+                Some(c) => c,
+                None => {
+                    narf_time::sleep_cycles(PUMP_CYCLES).await;
+                    continue;
+                }
+            };
+            let c: &xhci::Xhci = &c;
             if irq_vector.is_none() {
-                irq_vector = xhci::with_controller(|c| c.irq_vector).flatten();
+                irq_vector = c.irq_vector;
             }
 
             // ── Phase 1: root-hub ports ────────────────────────────
-            let connected_root: alloc::vec::Vec<u8> = xhci::with_controller(|c| {
-                c.connected_ports().iter().map(|(p, _)| *p).collect()
-            })
-            .unwrap_or_default();
+            let connected_root: alloc::vec::Vec<u8> =
+                c.connected_ports().iter().map(|(p, _)| *p).collect();
             for &p in &connected_root {
                 let bit = 1u128 << (p as u32 & 127);
                 let pi = (p as usize) & 127;
@@ -123,10 +130,7 @@ fn spawn_supervisor_task() {
                 if root_fail_count[pi] >= MAX_PER_PORT_RETRIES {
                     continue;
                 }
-                let outcome =
-                    xhci::with_controller(|c| attach::try_attach_root(c, p)).unwrap_or(
-                        AttachOutcome::UnknownClass,
-                    );
+                let outcome = attach::try_attach_root(c, p);
                 match outcome {
                     AttachOutcome::Keyboard
                     | AttachOutcome::Mouse
@@ -170,13 +174,12 @@ fn spawn_supervisor_task() {
             for (idx, (route, tier, root_port, _hub_slot, num_ports, bound_mask)) in
                 walks.iter().enumerate()
             {
-                // Per-cycle: enumerate the hub's connected
-                // downstream ports + try to attach an unbound one.
-                let connected = xhci::with_controller(|c| {
+                let connected = {
                     let g = HUBS.lock();
-                    g.get(idx).map(|h| h.hub.connected_downstream_ports(c)).unwrap_or_default()
-                })
-                .unwrap_or_default();
+                    g.get(idx)
+                        .map(|h| h.hub.connected_downstream_ports(c))
+                        .unwrap_or_default()
+                };
                 let mut new_bound_bits: u64 = 0;
                 for &dp in &connected {
                     if (*num_ports != 0) && dp > *num_ports {
@@ -186,7 +189,7 @@ fn spawn_supervisor_task() {
                     if (bound_mask | new_bound_bits) & dpb != 0 {
                         continue;
                     }
-                    let outcome = xhci::with_controller(|c| {
+                    let outcome = {
                         let g = HUBS.lock();
                         match g.get(idx) {
                             Some(h) => attach::try_attach_via_hub(
@@ -199,8 +202,7 @@ fn spawn_supervisor_task() {
                             ),
                             None => AttachOutcome::UnknownClass,
                         }
-                    })
-                    .unwrap_or(AttachOutcome::UnknownClass);
+                    };
                     match outcome {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse
@@ -224,16 +226,16 @@ fn spawn_supervisor_task() {
                 }
             }
 
-            let _ = xhci::with_controller(|c| hid::pump_all(c));
-            let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
-            let _ = xhci::with_controller(|c| hid::touchpad::pump_all(c));
-            let _ = xhci::with_controller(|c| cdc_acm::pump_all(c));
+            hid::pump_all(c);
+            hid::mouse::pump_all(c);
+            hid::touchpad::pump_all(c);
+            cdc_acm::pump_all(c);
             // Power management: suspend any downstream port whose
             // last activity is older than IDLE_SUSPEND_NS. Pumps
             // above touch `last_activity_tick` via mark_port_activity
             // on each completed transfer, so an actively-used keyboard
             // never gets suspended; an idle USB stick / hub does.
-            let _ = xhci::with_controller(|c| attach::idle_suspend_pass(c));
+            attach::idle_suspend_pass(c);
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
             //       endpoint or a Port Status Change Event (hot-plug),
