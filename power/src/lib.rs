@@ -197,29 +197,11 @@ pub fn register_initcalls() {
         }
     });
     narf_init::register(Stage::Late, "power-monitor", || {
-        // Stackful: even if sleep_cycles wakes don't fire on
-        // real silicon, preemption rotates the executor at the
-        // 10 ms slice cap. The task may not make periodic
-        // progress (it'd spin in the kernel_switch trampoline
-        // re-polling), but init/shell aren't starved.
-        narf_scheduler::spawn_stackful(async move {
-            let _ = writeln!(narf_console::Writer, "  power-monitor: starting background telemetry...");
-            loop {
-                let sources = list_sources();
-                for src in sources {
-                    let pct = src.capacity_percent();
-                    let charging = if src.is_charging() { " (charging)" } else { "" };
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  power: {} is at {}%{}",
-                        src.name(),
-                        pct,
-                        charging
-                    );
-                }
-                narf_time::sleep_cycles(30_000_000_000).await;
-            }
-        });
+        // BRINGUP-DISABLED: sleep_cycles depends on the timer
+        // wheel waking via LAPIC tick. On real silicon the wake
+        // path may not fire, leaving this task in Pending forever
+        // OR busy-polling the sleep deadline. Re-enable once the
+        // sleep machinery is real-HW validated.
         InitResult::Ok
     });
 }
