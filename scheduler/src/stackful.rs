@@ -182,6 +182,17 @@ pub struct KernelTask {
     /// `kernel_switch` resume path to choose `kernel_switch`-restore
     /// vs IRET-restore.
     preempted: AtomicBool,
+    /// Executor-supplied waker, plumbed in by `poll_to_yield` on
+    /// each entry. `task_body_rust` builds a `Context` around this
+    /// waker so the inner future's `cx.waker().wake_by_ref()` (e.g.
+    /// from `yield_now()`) re-arms the correct executor slot. With
+    /// a no-op waker, `yield_now` quietly drops the wake call and
+    /// the slot's `awake` flag never flips back to true — the task
+    /// returns Pending and then sits dormant forever.
+    /// `IrqSafeSpinLock<Option<Waker>>` so the trap-handler hook
+    /// can read without panicking on a poisoned lock, and the
+    /// kernel-stack body can swap in a fresh waker per entry.
+    current_waker: narf_lib::sync::IrqSafeSpinLock<Option<Waker>>,
 }
 
 // SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
@@ -240,6 +251,7 @@ impl KernelTask {
             no_preempt: AtomicBool::new(false),
             saved_trap_frame: UnsafeCell::new(zeroed_trap_frame()),
             preempted: AtomicBool::new(false),
+            current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -290,7 +302,12 @@ impl KernelTask {
     pub unsafe fn poll_to_yield(
         &mut self,
         exec_ctx: &mut KernelContext,
+        waker: &Waker,
     ) -> Poll<()> {
+        // Stash the executor's waker so the inner future's
+        // `cx.waker().wake_by_ref()` (e.g. from `yield_now()`)
+        // re-arms the correct slot — see `task_body_rust`.
+        *self.current_waker.lock() = Some(waker.clone());
         // Publish exec_ctx so the task can find it on yield.
         self.exec_ctx
             .store(exec_ctx as *mut _, Ordering::Release);
@@ -397,9 +414,18 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     let task = unsafe { &mut *task };
 
     loop {
-        // Build a waker. Phase 1b uses a no-op; phase 2 binds it
-        // to the executor's per-slot `awake` flag.
-        let waker = KernelTask::no_op_waker();
+        // Build a Context around the executor-supplied waker. The
+        // `poll_to_yield` caller stashed it in `task.current_waker`
+        // immediately before kernel_switching us in. Falling back
+        // to a no-op waker if (somehow) the slot's empty — that
+        // would lose `wake_by_ref` calls but is preferable to a
+        // panic deep on a kernel stack.
+        let waker_guard = task.current_waker.lock();
+        let waker = match waker_guard.as_ref() {
+            Some(w) => w.clone(),
+            None => KernelTask::no_op_waker(),
+        };
+        drop(waker_guard);
         let mut cx = Context::from_waker(&waker);
         let result = task.future.as_mut().poll(&mut cx);
         match result {
@@ -754,23 +780,23 @@ impl Future for StackfulAdapter {
         // the executor's stack frame for the duration of this
         // poll — the task switches back before `poll` returns,
         // so exec_ctx never escapes.
+        //
+        // Pass `cx.waker()` into poll_to_yield. It plumbs through
+        // KernelTask::current_waker → the Context that
+        // task_body_rust uses to poll the inner future. That
+        // way, when the inner future does `yield_now().await`
+        // (which calls cx.waker().wake_by_ref() before returning
+        // Pending), the executor's slot.awake flag flips and we
+        // get re-polled next round. NO unconditional re-arm
+        // here — only re-arm if the inner future asks for it,
+        // otherwise busy-looping pumps would starve everyone else.
         #[cfg(target_arch = "x86_64")]
         {
             let this = unsafe { self.get_unchecked_mut() };
             let mut exec_ctx = KernelContext::default();
             // SAFETY: single-threaded; this poll() is the only
             // active caller of this KernelTask.
-            let result = unsafe { this.inner.poll_to_yield(&mut exec_ctx) };
-            if result.is_pending() {
-                // Preempt-yield doesn't carry "wait for event X"
-                // semantics — the task is willing-and-able to keep
-                // running, the timer just took its slice away. Re-
-                // arm the executor's waker so we get re-polled on
-                // the next round. Without this, the slot's `awake`
-                // flag stays false and the task sits forever.
-                cx.waker().wake_by_ref();
-            }
-            result
+            unsafe { this.inner.poll_to_yield(&mut exec_ctx, cx.waker()) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -813,8 +839,9 @@ pub mod tests {
         COUNTER.store(0, Ordering::Release);
         let mut task = KernelTask::new(TrivialFuture { counter: &COUNTER });
         let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
         // SAFETY: single-threaded test; no preemption.
-        let result = unsafe { task.poll_to_yield(&mut exec_ctx) };
+        let result = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         if result != Poll::Ready(()) {
             return TestResult::Fail("expected Ready on first poll");
         }
@@ -853,10 +880,11 @@ pub mod tests {
             counter: &COUNTER,
         });
         let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
         // First three polls should be Pending, fourth Ready.
         for expected_count in 1..=3 {
             // SAFETY: same.
-            let r = unsafe { task.poll_to_yield(&mut exec_ctx) };
+            let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
             if r != Poll::Pending {
                 return TestResult::Fail("expected Pending while counter < 4");
             }
@@ -864,7 +892,7 @@ pub mod tests {
                 return TestResult::Fail("counter mismatch on Pending iteration");
             }
         }
-        let r = unsafe { task.poll_to_yield(&mut exec_ctx) };
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         if r != Poll::Ready(()) {
             return TestResult::Fail("expected Ready after countdown");
         }
