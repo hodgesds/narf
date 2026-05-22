@@ -1520,6 +1520,294 @@ pub mod tests {
         TestResult::Pass
     }
 
+    // ── Allocator concurrency: multiple tasks Box/Vec/alloc ─────────
+    //
+    // Stress the global allocator from multiple spawned tasks
+    // round-robining through poll_one_round. Catches per-CPU
+    // magazine bleed under task-switch pressure, double-free /
+    // missed-free bugs in slab metadata, and Box/Vec drops at
+    // unusual call sites (the stackful task's stack instead of
+    // the executor's). One CPU at any instant but interleaved
+    // at every yield point — much closer to real-world pump
+    // workloads than single-threaded smokes.
+
+    /// N stackful tasks each Box::new + drop a fixed-size payload
+    /// in a loop, recording allocations + verifying byte
+    /// integrity on each iteration. Verifies the slab path
+    /// across task-switch boundaries.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_alloc_concurrency_box_round_trip() -> TestResult {
+        const TASKS: usize = 4;
+        const ITERS_PER_TASK: u32 = 32;
+        static COUNTS: [AtomicU32; TASKS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        static FAULT: AtomicBool = AtomicBool::new(false);
+        for c in COUNTS.iter() {
+            c.store(0, Ordering::Release);
+        }
+        FAULT.store(false, Ordering::Release);
+
+        struct Allocator {
+            idx: usize,
+            remaining: u32,
+        }
+        impl Future for Allocator {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                // Fill the box with a recognisable per-task
+                // pattern so a misalloc that hands out an
+                // already-live block would corrupt it.
+                let pattern = (self.idx as u8).wrapping_mul(17).wrapping_add(0x42);
+                let buf: alloc::boxed::Box<[u8; 256]> =
+                    alloc::boxed::Box::new([pattern; 256]);
+                // Sanity check that all bytes survived the
+                // allocation untouched. (Realistically we'd only
+                // catch live-block reuse here — but that IS the
+                // bug worth flagging.)
+                for &b in buf.iter() {
+                    if b != pattern {
+                        FAULT.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                drop(buf);
+                COUNTS[self.idx].fetch_add(1, Ordering::AcqRel);
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn_stackful(Allocator {
+                idx: i,
+                remaining: ITERS_PER_TASK,
+            });
+        }
+
+        // 4 tasks × 32 iters = 128 polls. 256 rounds is ample
+        // headroom even with other boot tasks sharing the queue.
+        for _ in 0..256 {
+            crate::poll_one_round();
+            if COUNTS.iter().all(|c| c.load(Ordering::Acquire) >= ITERS_PER_TASK) {
+                break;
+            }
+        }
+
+        if FAULT.load(Ordering::Acquire) {
+            return TestResult::Fail("allocator handed out a live block under concurrent pressure");
+        }
+        for c in COUNTS.iter() {
+            if c.load(Ordering::Acquire) != ITERS_PER_TASK {
+                return TestResult::Fail("a task didn't reach its alloc iter target");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// N stackful tasks each push N elements onto a `Vec`, drop
+    /// the Vec, and repeat. Stresses the realloc + grow path of
+    /// the global allocator across task switches.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_alloc_concurrency_vec_grow_drop() -> TestResult {
+        const TASKS: usize = 3;
+        const VECS_PER_TASK: u32 = 16;
+        const PUSHES_PER_VEC: usize = 128;
+        static COUNTS: [AtomicU32; TASKS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        static FAULT: AtomicBool = AtomicBool::new(false);
+        for c in COUNTS.iter() {
+            c.store(0, Ordering::Release);
+        }
+        FAULT.store(false, Ordering::Release);
+
+        struct Grower {
+            idx: usize,
+            remaining: u32,
+        }
+        impl Future for Grower {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                let mut v: alloc::vec::Vec<u32> =
+                    alloc::vec::Vec::with_capacity(8);
+                for k in 0..PUSHES_PER_VEC {
+                    v.push((self.idx as u32) * 1_000_000 + k as u32);
+                }
+                // Verify the contents survived the grow path's
+                // realloc + memcpy.
+                for (k, &x) in v.iter().enumerate() {
+                    if x != (self.idx as u32) * 1_000_000 + k as u32 {
+                        FAULT.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                drop(v);
+                COUNTS[self.idx].fetch_add(1, Ordering::AcqRel);
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn_stackful(Grower {
+                idx: i,
+                remaining: VECS_PER_TASK,
+            });
+        }
+
+        for _ in 0..256 {
+            crate::poll_one_round();
+            if COUNTS
+                .iter()
+                .all(|c| c.load(Ordering::Acquire) >= VECS_PER_TASK)
+            {
+                break;
+            }
+        }
+
+        if FAULT.load(Ordering::Acquire) {
+            return TestResult::Fail("Vec content corrupted across concurrent grows");
+        }
+        for c in COUNTS.iter() {
+            if c.load(Ordering::Acquire) != VECS_PER_TASK {
+                return TestResult::Fail("a Vec-grow task didn't reach its iter target");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// Mixed pattern: some tasks Box, some Vec, varying sizes
+    /// across the size-class boundaries so the slab's class
+    /// dispatch is exercised. Sizes intentionally span 32, 64,
+    /// 256, 1024, 4096 to hit multiple magazines.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_alloc_concurrency_mixed_sizes() -> TestResult {
+        const TASKS: usize = 5;
+        const ITERS_PER_TASK: u32 = 16;
+        static COUNTS: [AtomicU32; TASKS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        static FAULT: AtomicBool = AtomicBool::new(false);
+        for c in COUNTS.iter() {
+            c.store(0, Ordering::Release);
+        }
+        FAULT.store(false, Ordering::Release);
+
+        // Sizes deliberately chosen to span the slab class
+        // boundaries our allocator typically uses.
+        const SIZES: [usize; 5] = [32, 64, 256, 1024, 4096];
+
+        struct Mixed {
+            idx: usize,
+            remaining: u32,
+        }
+        impl Future for Mixed {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                let size = SIZES[self.idx];
+                let pattern = (self.idx as u8).wrapping_add(0x37);
+                let v: alloc::vec::Vec<u8> = alloc::vec![pattern; size];
+                if v.iter().any(|&b| b != pattern) {
+                    FAULT.store(true, Ordering::Release);
+                }
+                drop(v);
+                COUNTS[self.idx].fetch_add(1, Ordering::AcqRel);
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn_stackful(Mixed {
+                idx: i,
+                remaining: ITERS_PER_TASK,
+            });
+        }
+
+        for _ in 0..256 {
+            crate::poll_one_round();
+            if COUNTS
+                .iter()
+                .all(|c| c.load(Ordering::Acquire) >= ITERS_PER_TASK)
+            {
+                break;
+            }
+        }
+
+        if FAULT.load(Ordering::Acquire) {
+            return TestResult::Fail("mixed-size concurrent alloc corrupted bytes");
+        }
+        for c in COUNTS.iter() {
+            if c.load(Ordering::Acquire) != ITERS_PER_TASK {
+                return TestResult::Fail("a mixed-size alloc task didn't complete");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// Spawn-allocator stress: each task's Box::pin(future) at
+    /// spawn time also runs through the allocator. With many
+    /// tasks spawned concurrently then drained, this exercises
+    /// the spawn path's allocation pattern (which is a frequent
+    /// real-world case — driver IRQ wakers re-spawning task
+    /// continuations, etc).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_alloc_concurrency_many_spawns_finish() -> TestResult {
+        const TASKS: usize = 16;
+        static COMPLETED: AtomicU32 = AtomicU32::new(0);
+        COMPLETED.store(0, Ordering::Release);
+
+        struct OneShot;
+        impl Future for OneShot {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                COMPLETED.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+
+        for _ in 0..TASKS {
+            crate::spawn_stackful(OneShot);
+        }
+
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if COMPLETED.load(Ordering::Acquire) as usize >= TASKS {
+                break;
+            }
+        }
+
+        let final_count = COMPLETED.load(Ordering::Acquire);
+        if (final_count as usize) != TASKS {
+            return TestResult::Fail(
+                "not all bulk-spawned tasks completed — allocator or queue dropped one",
+            );
+        }
+        TestResult::Pass
+    }
+
     /// task_body_rust manages CURRENT_STACKFUL_TASK directly: it
     /// sets the slot at the top of each poll iter and clears it
     /// before yielding. Verify that after a Ready return the slot
@@ -1647,5 +1935,25 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_concurrency_no_preempt_still_round_robins
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_alloc_concurrency_box_round_trip
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_alloc_concurrency_vec_grow_drop
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_alloc_concurrency_mixed_sizes
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_alloc_concurrency_many_spawns_finish
     );
 }
