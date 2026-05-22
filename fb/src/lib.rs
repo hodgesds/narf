@@ -837,13 +837,17 @@ pub fn register_initcalls() {
         if select_active().is_none() {
             return InitResult::NotPresent;
         }
-        // BISECT-DISABLED: status::paint takes locks across xHCI
-        // CONTROLLER, AML namespace, I2C / GPIO / power / thermal
-        // registries. On real silicon any of those can be held by
-        // a driver mid-MMIO for tens of ms; status::paint's first
-        // call from this task at boot blocks until they all
-        // release. Re-enable after we've identified which lock
-        // chain wedges and added try_lock fallbacks.
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        narf_scheduler::spawn_stackful(async move {
+            loop {
+                status::paint(&writer);
+                narf_time::sleep_cycles(800_000_000).await;
+            }
+        });
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-cursor-pump", || {
@@ -854,10 +858,13 @@ pub fn register_initcalls() {
         // busy-wait so the pointer keeps moving while a user
         // task is parked.
         narf_userspace::handlers::sleep_pumps::register(cursor::sleep_pump_tick);
-        // BISECT-DISABLED: cursor::pump's drain_and_render reads
-        // pop_pointer which locks the input ring. Disabled in the
-        // current bisect step to isolate the wedge to a single
-        // pump.
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        // Timer-driven cursor pump (60 Hz refresh via sleep_cycles).
+        let _ = narf_scheduler::spawn_stackful(cursor::pump(writer));
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {
