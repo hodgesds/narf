@@ -316,14 +316,42 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
         _ => return TestResult::Fail("inner mount didn't win on longer prefix"),
     }
 
-    // Unmounted prefix → None.
-    if registry()
-        .resolve_absolute("/elsewhere/z", |_, _| ())
-        .is_some()
-    {
-        return TestResult::Fail("non-existent prefix should not resolve");
+    // Unmounted prefix behavior depends on whether a root mount
+    // ("/") exists in the registry. `resolve_absolute` intentionally
+    // special-cases the root mount as a fallback that matches every
+    // absolute path (the doc-comment on resolve_absolute spells
+    // this out: "Special-case "/" so the root mount always matches
+    // as the fallback option"). So `/elsewhere/z` resolves to root
+    // when root is mounted, returns None otherwise. Either is
+    // correct; the test pinned only the no-root case and was flaky
+    // depending on whether the initramfs-mount-at-boot initcall
+    // had run before this test. Assert against the actual
+    // invariant: when root is mounted, every path resolves; when
+    // it isn't, paths not covered by another mount don't.
+    let root_present = registry()
+        .list()
+        .iter()
+        .any(|p| p == "/");
+    let elsewhere_resolved = registry()
+        .resolve_absolute("/elsewhere/z", |_, rel| {
+            alloc::string::String::from(rel)
+        });
+    match (root_present, &elsewhere_resolved) {
+        (true, Some(rel)) if rel == "elsewhere/z" => {}
+        (true, _) => {
+            return TestResult::Fail(
+                "root mount present but /elsewhere/z didn't resolve to it with rel='elsewhere/z'",
+            );
+        }
+        (false, None) => {}
+        (false, Some(_)) => {
+            return TestResult::Fail(
+                "no root mount yet /elsewhere/z resolved — which mount caught it?",
+            );
+        }
     }
-    // Empty path → None.
+
+    // Empty path → None regardless of root.
     if registry().resolve_absolute("", |_, _| ()).is_some() {
         return TestResult::Fail("empty path should not resolve");
     }
