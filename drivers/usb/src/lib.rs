@@ -81,7 +81,10 @@ pub fn register_initcalls() {
 /// device. Loops pumping interrupt-IN reports onto the global
 /// input ring between wakes.
 fn spawn_supervisor_task() {
-    narf_scheduler::spawn(async {
+    // Stackful: USB HID supervisor's enumeration loop polls xHCI
+    // MMIO + per-port reset state. Preemption-capped at the
+    // default 10 ms slice so a stuck port can't starve init.
+    narf_scheduler::spawn_stackful(async {
         use crate::attach::{self, AttachOutcome, HUBS};
         const PUMP_CYCLES: u64 = 16_000_000;
         // Cap per-port enumeration attempts. After this many

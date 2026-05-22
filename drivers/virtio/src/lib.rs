@@ -126,7 +126,10 @@ fn spawn_input_pump_task() {
         // controller Vec, so by the time this task runs `irq_vector`
         // is either set or permanently None for this device.
         let irq = input_pci::with_at(idx, |c| c.irq_vector).flatten();
-        narf_scheduler::spawn(async move {
+        // Stackful: virtio-input pump awaits IRQ or sleep
+        // periodically; preemption-capped against real-HW IRQ
+        // delivery quirks.
+        narf_scheduler::spawn_stackful(async move {
             loop {
                 if let Some(v) = irq {
                     narf_interrupts::wait::wait_for_irq(v).await;

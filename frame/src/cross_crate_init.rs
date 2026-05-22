@@ -52,7 +52,12 @@ fn install_net_stack() {
         "  net: tcp_stack init; iface count = {}",
         narf_net::iface::count()
     );
-    narf_scheduler::spawn(async {
+    // Stackful: the e1000 RX pump's inner `while rx_pump_step()`
+    // could starve the executor on real silicon if the device's
+    // RX descriptor ring stays "ready" indefinitely (e.g.
+    // 0xFFFFFFFF reads on absent-device). Preemption caps it at
+    // a 10 ms slice.
+    narf_scheduler::spawn_stackful(async {
         loop {
             while narf_drivers_net::e1000::rx_pump_step() {}
             narf_scheduler::yield_now().await;

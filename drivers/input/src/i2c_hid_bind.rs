@@ -227,7 +227,8 @@ fn bind_one(path: &str) -> bool {
 
     let device_path = path.to_string();
     let driver = I2cHidDriver::new(bus, addr, hid_desc_register);
-    narf_scheduler::spawn(pump_task(device_path, driver, wake_flag, wired_irq));
+    // Stackful: per-device i2c-hid input pump.
+    narf_scheduler::spawn_stackful(pump_task(device_path, driver, wake_flag, wired_irq));
     true
 }
 

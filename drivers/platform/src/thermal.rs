@@ -55,7 +55,9 @@ pub fn init() {
 
             // 3. Start polling task for this zone.
             let path_clone = String::from(path);
-            narf_scheduler::spawn(async move {
+            // Stackful: ACPI _TMP poll loop (AML evaluation can
+            // be expensive on real silicon; preemption-capped).
+            narf_scheduler::spawn_stackful(async move {
                 loop {
                     // _TMP: Current Temperature.
                     if let Ok(v) = evaluate_method(&format!("{}.{}", path_clone, "_TMP"), &[]) {

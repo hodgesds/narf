@@ -1215,7 +1215,8 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
         // function-level comment for why we don't allocate per-queue
         // MSI-X vectors yet.
         let irq = if pair_idx == 0 { irq_vector } else { None };
-        narf_scheduler::spawn(async move {
+        // Stackful: virtio-net RX pump.
+        narf_scheduler::spawn_stackful(async move {
             const PUMP_CYCLES: u64 = 53_000_000;
             loop {
                 if let Some(v) = irq {
@@ -1296,7 +1297,8 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // via the controller's `tx_dma` (which calls `next_tx_pair`).
     // Zero-copy: the payload descriptor points at the Frame's
     // DmaBuffer directly.
-    narf_scheduler::spawn(async move {
+    // Stackful: TX forwarder.
+    narf_scheduler::spawn_stackful(async move {
         while let Ok(frame) = tx_cons.recv().await {
             let (buf, offset, len) = frame.into_parts_with_offset();
             let _ = with_at(idx, |c| c.tx_dma(&buf, offset, len));
