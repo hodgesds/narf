@@ -83,6 +83,16 @@ pub struct KernelContext {
     /// and calls the task body. For a yielded task, this is the
     /// instruction just after its `kernel_switch` call.
     pub rip: u64,
+    /// Saved RFLAGS state. Only IF (bit 9) is functionally
+    /// restored — kernel_switch uses sti/cli based on its value
+    /// before the final jmp. Other rflags bits are caller-saved
+    /// per SysV (volatile across the call boundary). Critical for
+    /// preempt-from-trap: when a stackful task is preempted out
+    /// of an IF=0 trap-handler context, the executor switched-into
+    /// must resume with IF=1. Without this, the executor would
+    /// run with IF=0 — no timer ticks, no IRQ delivery, the kernel
+    /// hangs even though it's not in any specific wait.
+    pub rflags: u64,
 }
 
 impl KernelContext {
@@ -91,6 +101,8 @@ impl KernelContext {
     /// trampoline pulls out). Stack must be at least 16-byte aligned.
     /// The first `kernel_switch` into this context will land the
     /// CPU at `entry` with `rsp = stack_top` and `r15 = arg`.
+    /// RFLAGS is initialised to IF=1 + reserved bit 1 so a freshly
+    /// resumed task runs with interrupts enabled.
     pub fn fresh(stack_top: u64, entry: u64, arg: u64) -> Self {
         Self {
             rbx: 0,
@@ -101,6 +113,8 @@ impl KernelContext {
             r15: arg,
             rsp: stack_top,
             rip: entry,
+            // IF=1 (bit 9) + reserved bit 1.
+            rflags: 0x202,
         }
     }
 }
@@ -157,6 +171,14 @@ pub unsafe extern "C" fn kernel_switch(
         // this as the target.
         "mov rax, [rsp]",
         "mov [rdi + 56], rax",
+        // Save current RFLAGS. Only the IF bit is functionally
+        // restored on the load side; other bits are caller-saved
+        // per SysV. Critical for the preempt-from-trap path where
+        // we switch out of an IF=0 trap-handler context but the
+        // executor needs to resume with IF=1.
+        "pushfq",
+        "pop rax",
+        "mov [rdi + 64], rax",
 
         // ── Restore incoming context ───────────────────────────
         //
@@ -171,13 +193,31 @@ pub unsafe extern "C" fn kernel_switch(
         // saved per SysV, free to use as scratch).
         "mov rsp, [rsi + 48]",
         "mov rcx, [rsi + 56]",
+        // Load saved RFLAGS into rdx; we'll use just the IF bit
+        // (bit 9) to decide whether to STI/CLI before the final
+        // jmp. Other rflags bits are caller-saved per SysV ABI.
+        // Use rdx (caller-saved) instead of rax so we can still
+        // zero rax for the return-value convention without
+        // clobbering the flag-setting test.
+        "mov rdx, [rsi + 64]",
         // Zero rax — convention is this fn returns 0; the side
         // resumed-into observes rax=0 in their "post-kernel_switch"
-        // continuation.
+        // continuation. Done BEFORE the IF test so the test's
+        // flag side-effect isn't clobbered by the xor.
         "xor eax, eax",
-        // Jump to the incoming context's rip. Equivalent to a `ret`
-        // on a stack where the top qword is `rip` — but we don't
-        // touch the stack to extract it, just jump directly.
+        "test rdx, 0x200",
+        "jz 2f",
+        // Incoming IF was 1: STI defers interrupt delivery by one
+        // instruction (until after the jmp), so the next code
+        // executes its first instruction with IF on but no IRQ
+        // can land between the STI and the jmp.
+        "sti",
+        "jmp rcx",
+        "2:",
+        // Incoming IF was 0: explicitly CLI (so a previously-STI
+        // caller doesn't leak IF=1 into a context that wants IF=0,
+        // e.g. resuming inside a trap handler).
+        "cli",
         "jmp rcx",
     );
 }
@@ -194,7 +234,9 @@ const _: () = {
     assert!(core::mem::offset_of!(KernelContext, r15) == 40);
     assert!(core::mem::offset_of!(KernelContext, rsp) == 48);
     assert!(core::mem::offset_of!(KernelContext, rip) == 56);
-    assert!(core::mem::size_of::<KernelContext>() == 64);
+    assert!(core::mem::offset_of!(KernelContext, rflags) == 64);
+    // Size 72 + align 16 padding → 80 bytes total.
+    assert!(core::mem::size_of::<KernelContext>() == 80);
     assert!(core::mem::align_of::<KernelContext>() == 16);
 };
 

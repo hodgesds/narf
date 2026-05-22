@@ -417,6 +417,19 @@ pub unsafe fn init_ap() {
 #[inline]
 pub fn on_timer_tick() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    // Drive the deadline wheel off the LAPIC tick instead of
+    // depending purely on HPET-IRQ delivery. On QEMU + on
+    // hardware where the HPET comparator IRQ routes cleanly,
+    // pump_irq already calls fire_due — this is just an extra
+    // wake source firing once per LAPIC tick. On real silicon
+    // where HPET IRQ doesn't deliver (or is masked behind a
+    // chipset-routing bug), the LAPIC timer is the only
+    // reliable timer source, and this keeps sleep_cycles +
+    // every SleepUntil-based primitive making forward progress.
+    // Cheap: the wheel walk is O(MAX_SLEEPERS) and runs in IRQ
+    // context with IF=0.
+    let now = narf_time::now_cycles();
+    let _ = narf_time::timer_wheel::fire_due(now);
 }
 
 /// Snapshot of how many timer IRQs have fired since boot.

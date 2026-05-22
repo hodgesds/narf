@@ -820,25 +820,32 @@ pub fn register_initcalls() {
             init_pump_writer(pump_writer);
             narf_userspace::handlers::sleep_pumps::register(fb_drain_pump);
         }
-        // BRINGUP-DISABLED: the drain task busy-polls a command
-        // ring that QEMU services synchronously but real-HW MMIO
-        // doesn't. Suspected of wedging the executor before init
-        // gets polled. Re-enable once the drain loop has a real
-        // Pending-yield path OR preempt rewrite is activated.
-        let _ = writer;
-        // let task = drain_task::DrainTask::new(writer);
-        // let _ = narf_scheduler::spawn_stackful(task);
+        // Spawn the drain task as a stackful preemptive task —
+        // the LAPIC timer's preempt-from-trap hook caps any
+        // misbehaving MMIO poll at the 10 ms slice. See
+        // scheduler/specification/preemption.md.
+        let task = drain_task::DrainTask::new(writer);
+        let _ = narf_scheduler::spawn_stackful(task);
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-status-refresh", || {
         if select_active().is_none() {
             return InitResult::NotPresent;
         }
-        // BRINGUP-DISABLED: periodic status-panel repaint sleeps
-        // on `narf_time::sleep_cycles` which depends on the HPET
-        // wheel + LAPIC-timer-driven wake. On real silicon those
-        // may not deliver the way QEMU does. Suspected starving
-        // init by busy-looping if sleep never resolves.
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        // Periodic status-panel repaint. If sleep_cycles wake
+        // doesn't fire on real silicon, the preempt-slice cap
+        // still rotates the executor back to init/shell.
+        narf_scheduler::spawn_stackful(async move {
+            loop {
+                status::paint(&writer);
+                narf_time::sleep_cycles(800_000_000).await;
+            }
+        });
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-cursor-pump", || {
@@ -849,16 +856,14 @@ pub fn register_initcalls() {
         // busy-wait so the pointer keeps moving while a user
         // task is parked.
         narf_userspace::handlers::sleep_pumps::register(cursor::sleep_pump_tick);
-        // BRINGUP-DISABLED: cursor pump's pop_pointer loop reads
-        // from the input ring and re-polls. Suspected of not
-        // yielding cleanly on real silicon when the input ring
-        // stays empty for an extended period.
-        // let cap = bootstrap_writer();
-        // let writer = match FbWriter::new(cap) {
-        //     Ok(w) => w,
-        //     Err(_) => return InitResult::Error("FbWriter::new"),
-        // };
-        // let _ = narf_scheduler::spawn_stackful(cursor::pump(writer));
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        // Cursor pump's pop_pointer drain loop runs under
+        // preempt-slice protection.
+        let _ = narf_scheduler::spawn_stackful(cursor::pump(writer));
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {

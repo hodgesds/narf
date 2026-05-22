@@ -168,28 +168,35 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     if frame.vector >= 32 {
         if frame.vector == 32 {
             narf_interrupts::x86_64::apic::on_timer_tick();
-            // Preemption hook for stackful kernel tasks. If the
-            // LAPIC timer fired while a stackful task was
-            // running past its TSC slice, this rewrites
-            // frame.rip so the trap-exit IRET lands on the
-            // scheduler's preempt-yield stub instead of the
-            // original interrupted RIP. Cooperative tasks +
-            // user-mode traps are untouched.
-            //
-            // SAFETY: TrapFrame layout matches narf-scheduler's
-            // re-declared TrapFrame (asserted below). The hook
-            // mutates only frame.rip + frame.rflags when it
-            // fires.
-            unsafe {
-                let sched_frame_ptr = frame as *mut TrapFrame
-                    as *mut narf_scheduler::stackful::TrapFrame;
-                narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
-            }
         }
         narf_interrupts::on_irq(frame.vector as u8);
         // SAFETY: APIC is initialised before interrupts are enabled.
         unsafe {
             narf_interrupts::eoi();
+        }
+        if frame.vector == 32 {
+            // Preemption hook for stackful kernel tasks. Runs AFTER
+            // EOI so that yielding to the executor doesn't leave
+            // the LAPIC's in-service bit set; subsequent timer
+            // ticks can still fire while we're switched out.
+            //
+            // try_preempt may NOT return: if a stackful task is
+            // CPU-bound past its slice, it calls kernel_switch to
+            // the executor right here. When the executor later
+            // switches back in, we resume just past the
+            // kernel_switch call, return through this fn, and
+            // common_trap's iretq restores the task at its pre-
+            // trap RIP. The trap frame on the task's kernel stack
+            // is left untouched throughout — that's the
+            // persistence mechanism.
+            //
+            // SAFETY: TrapFrame layout matches narf-scheduler's
+            // re-declared TrapFrame (asserted below).
+            unsafe {
+                let sched_frame_ptr = frame as *mut TrapFrame
+                    as *mut narf_scheduler::stackful::TrapFrame;
+                narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
+            }
         }
         return;
     }
