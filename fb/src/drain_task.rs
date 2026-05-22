@@ -90,20 +90,14 @@ pub async fn drain_loop(writer: FbWriter) {
             let colour = if n & 1 == 0 { 0x00FF_4040 } else { 0x0040_FF40 };
             narf_memory::beacon::paint(27, colour);
         }
-        // Status panel repaint at ~4 Hz; gated by TSC so missed
-        // drain ticks (e.g. preempt slice) don't desync it.
-        #[cfg(not(feature = "kernel-test"))]
-        {
-            let now = narf_time::now_cycles();
-            let last = STATUS_LAST_TSC.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= STATUS_REPAINT_CYCLES {
-                STATUS_LAST_TSC.store(now, Ordering::Relaxed);
-                status::paint(&writer);
-                let n = STATUS_LAST_TSC.load(Ordering::Relaxed);
-                let colour = if (n >> 28) & 1 == 0 { 0x000080_FF } else { 0x00FF_8000 };
-                narf_memory::beacon::paint(26, colour);
-            }
-        }
+        // NOTE: status::paint moved out to the fb-status-refresh
+        // task. status::paint takes CONTROLLER + AML + I2C + GPIO +
+        // power-source locks; on real silicon any of those can be
+        // held by a driver mid-MMIO for tens of ms. Coupling that
+        // into the drain loop blocked init/shell behind the same
+        // lock chain. Now drain_loop is purely the command-ring
+        // drain (fast, no contended locks); status::paint runs
+        // independently in fb-status-refresh on a 250 ms cadence.
         narf_time::sleep_cycles(DRAIN_PERIOD_CYCLES).await;
     }
 }
