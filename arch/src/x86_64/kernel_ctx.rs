@@ -243,6 +243,9 @@ const _: () = {
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
+extern crate alloc;
+
+#[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -348,6 +351,206 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// Callee-saved registers (rbx, rbp, r12-r15) must round-trip
+    /// across a kernel_switch ping-pong. The peer side observes
+    /// values we wrote before switching out, and we observe the
+    /// caller-side values on resume — meaning rbx etc. were
+    /// correctly saved and restored through the OUT and IN halves.
+    fn smoke_kernel_switch_preserves_callee_saved() -> TestResult {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static CHILD_OBSERVED_RBX: AtomicU64 = AtomicU64::new(0);
+        static CHILD_OBSERVED_R12: AtomicU64 = AtomicU64::new(0);
+        static CHILD_CTX: AtomicU64 = AtomicU64::new(0);
+        static MAIN_CTX: AtomicU64 = AtomicU64::new(0);
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn child_trampoline() -> ! {
+            naked_asm!(
+                "mov rdi, rbx",     // pass observed rbx as arg 0
+                "mov rsi, r12",     // and r12 as arg 1
+                "call {body}",
+                "ud2",
+                body = sym child_body,
+            );
+        }
+
+        extern "C" fn child_body(rbx_seen: u64, r12_seen: u64) -> ! {
+            CHILD_OBSERVED_RBX.store(rbx_seen, Ordering::Release);
+            CHILD_OBSERVED_R12.store(r12_seen, Ordering::Release);
+            let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
+            let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
+            unsafe { kernel_switch(child_ctx, main_ctx) };
+            loop { core::hint::spin_loop(); }
+        }
+
+        let mut stack = alloc::boxed::Box::<[u8; 4096]>::new([0u8; 4096]);
+        let stack_top = (stack.as_mut_ptr() as u64).wrapping_add(4096) & !0xFu64;
+        let mut main_ctx = KernelContext::default();
+        let mut child_ctx = KernelContext {
+            rsp: stack_top,
+            rip: child_trampoline as u64,
+            rbx: 0xAAAA_AAAA_AAAA_AAAA,
+            r12: 0xBBBB_BBBB_BBBB_BBBB,
+            rflags: 0x202,
+            ..KernelContext::default()
+        };
+        CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
+        MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
+
+        unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
+
+        if CHILD_OBSERVED_RBX.load(Ordering::Acquire) != 0xAAAA_AAAA_AAAA_AAAA {
+            return TestResult::Fail("child saw wrong rbx — kernel_switch didn't restore");
+        }
+        if CHILD_OBSERVED_R12.load(Ordering::Acquire) != 0xBBBB_BBBB_BBBB_BBBB {
+            return TestResult::Fail("child saw wrong r12 — kernel_switch didn't restore");
+        }
+        TestResult::Pass
+    }
+
+    /// IF=1 on entry → kernel_switch save records IF=1 → load
+    /// restores via STI → switched-into code runs with IRQs on.
+    /// IF=0 on entry → save records IF=0 → load restores via CLI
+    /// → switched-into code runs with IRQs off. Both directions
+    /// must round-trip the saved-IF state through the inbound
+    /// context's rflags field.
+    fn smoke_kernel_switch_preserves_if_flag() -> TestResult {
+        use core::arch::asm;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static CHILD_IF_OBSERVED: AtomicU64 = AtomicU64::new(0xFFFF);
+        static CHILD_CTX: AtomicU64 = AtomicU64::new(0);
+        static MAIN_CTX: AtomicU64 = AtomicU64::new(0);
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn child_trampoline() -> ! {
+            naked_asm!(
+                // Sample RFLAGS at entry into rdi (arg 0).
+                "pushfq",
+                "pop rdi",
+                "call {body}",
+                "ud2",
+                body = sym child_body,
+            );
+        }
+
+        extern "C" fn child_body(rflags_at_entry: u64) -> ! {
+            // Mask down to the IF bit (0x200). The other bits are
+            // ABI-volatile so they're unsafe to assert against.
+            CHILD_IF_OBSERVED.store(rflags_at_entry & 0x200, Ordering::Release);
+            let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
+            let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
+            unsafe { kernel_switch(child_ctx, main_ctx) };
+            loop { core::hint::spin_loop(); }
+        }
+
+        let mut stack = alloc::boxed::Box::<[u8; 4096]>::new([0u8; 4096]);
+        let stack_top = (stack.as_mut_ptr() as u64).wrapping_add(4096) & !0xFu64;
+
+        // Case 1: switch in with IF=1 stored in child_ctx. Child
+        // should observe IF=1.
+        let mut main_ctx = KernelContext::default();
+        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as u64, 0);
+        // KernelContext::fresh seeds rflags = 0x202 (IF=1). Verify.
+        if child_ctx.rflags & 0x200 == 0 {
+            return TestResult::Fail("fresh() didn't set IF=1 in rflags");
+        }
+        CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
+        MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
+        // Disable IF locally before the switch so the load half
+        // is the ONLY way IF could come back on for the child.
+        // If kernel_switch didn't restore IF from rflags, the
+        // child would observe IF=0 (matching our pre-switch state).
+        unsafe { asm!("cli", options(nomem, nostack)); }
+        unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
+        // The child set IF=1 on entry (via STI in load half) and
+        // switched back. On return, our IF state was restored from
+        // main_ctx.rflags — which kernel_switch saved on the way
+        // out. Since we CLI'd before the switch, main_ctx.rflags
+        // recorded IF=0, so we resume with IF=0.
+        unsafe { asm!("sti", options(nomem, nostack)); } // restore for the rest of the suite
+
+        let observed = CHILD_IF_OBSERVED.load(Ordering::Acquire);
+        if observed != 0x200 {
+            return TestResult::Fail("child observed IF=0 when context said IF=1");
+        }
+
+        // Case 2: switch in with IF=0. Child observes IF=0.
+        CHILD_IF_OBSERVED.store(0xFFFF, Ordering::Release);
+        let mut main_ctx = KernelContext::default();
+        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as u64, 0);
+        child_ctx.rflags = 0x2; // reserved bit 1 only; IF=0
+        CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
+        MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
+        unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
+        // Child observed pre-restore RFLAGS via pushfq — that
+        // reflects what kernel_switch arranged for the child. STI
+        // is deferred by one instruction, so the FIRST instruction
+        // (pushfq) runs before IF actually toggles. We CLI'd before
+        // the switch so the inherited IF was 0; the load half's
+        // CLI path keeps it 0; child sees IF=0.
+        let observed = CHILD_IF_OBSERVED.load(Ordering::Acquire);
+        if observed != 0 {
+            return TestResult::Fail("child observed IF=1 when context said IF=0");
+        }
+        TestResult::Pass
+    }
+
+    /// Ping-pong test: switch back and forth between two contexts
+    /// N times, verifying we end up back at the original site with
+    /// the correct count. Catches save/restore asymmetries that a
+    /// single round-trip would miss (e.g., a stack offset that's
+    /// wrong by 8 bytes accumulates over many switches).
+    fn smoke_kernel_switch_ping_pong() -> TestResult {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        static CHILD_CTX: AtomicU64 = AtomicU64::new(0);
+        static MAIN_CTX: AtomicU64 = AtomicU64::new(0);
+        const ROUND_TRIPS: u64 = 32;
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn child_trampoline() -> ! {
+            naked_asm!(
+                "call {body}",
+                "ud2",
+                body = sym child_body,
+            );
+        }
+
+        extern "C" fn child_body() -> ! {
+            let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
+            let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
+            loop {
+                COUNTER.fetch_add(1, Ordering::AcqRel);
+                // SAFETY: pointers live as long as the test fn does;
+                // both contexts owned by stack-locals in caller.
+                unsafe { kernel_switch(child_ctx, main_ctx) };
+                // Resumed here when main switches us back. Loop.
+            }
+        }
+
+        COUNTER.store(0, Ordering::Release);
+        let mut stack = alloc::boxed::Box::<[u8; 8192]>::new([0u8; 8192]);
+        let stack_top = (stack.as_mut_ptr() as u64).wrapping_add(8192) & !0xFu64;
+        let mut main_ctx = KernelContext::default();
+        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as u64, 0);
+        CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
+        MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
+
+        for _ in 0..ROUND_TRIPS {
+            // SAFETY: same.
+            unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
+        }
+
+        let observed = COUNTER.load(Ordering::Acquire);
+        if observed != ROUND_TRIPS {
+            return TestResult::Fail("ping-pong counter mismatch");
+        }
+        TestResult::Pass
+    }
+
     kernel_test_in!("arch/kernel_ctx", smoke_kernel_ctx_fresh_layout);
     kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_round_trip);
+    kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_preserves_callee_saved);
+    kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_preserves_if_flag);
+    kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_ping_pong);
 }

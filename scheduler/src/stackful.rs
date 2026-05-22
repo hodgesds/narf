@@ -871,6 +871,685 @@ pub mod tests {
         TestResult::Pass
     }
 
+    // ── try_preempt filter coverage ─────────────────────────────────
+    //
+    // Build a synthetic trap-frame on the test's stack with the
+    // various combinations of (vector, cs, no_preempt, slice
+    // elapsed) and verify try_preempt's return matches the rules.
+    // None of these should ever reach the kernel_switch — they
+    // should ALL early-return false. (Real switching is exercised
+    // by the round-trip test below.)
+
+    #[cfg(target_arch = "x86_64")]
+    fn zero_trap_frame() -> TrapFrame {
+        zeroed_trap_frame()
+    }
+
+    /// Wrong vector → no preempt. try_preempt is gated on vector
+    /// 32 (LAPIC timer) only; other IRQs and exceptions don't
+    /// trigger the slice check.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_try_preempt_skips_non_preempt_vector() -> TestResult {
+        let mut frame = zero_trap_frame();
+        frame.vector = 33; // anything other than 32
+        frame.cs = 0x08;   // CPL=0
+        // Doesn't matter what CURRENT_STACKFUL_TASK holds — the
+        // vector check fires first.
+        let result = unsafe { try_preempt(&mut frame) };
+        if result {
+            return TestResult::Fail("preempted on vector != 32");
+        }
+        TestResult::Pass
+    }
+
+    /// User-mode trap (CPL=3) → no preempt. User-task preemption
+    /// is the executor's job, not the stackful hook's.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_try_preempt_skips_user_mode() -> TestResult {
+        let mut frame = zero_trap_frame();
+        frame.vector = PREEMPT_VECTOR;
+        frame.cs = 0x1b; // user CS (RPL=3)
+        let result = unsafe { try_preempt(&mut frame) };
+        if result {
+            return TestResult::Fail("preempted a CPL=3 trap");
+        }
+        TestResult::Pass
+    }
+
+    /// No stackful task on this CPU → no preempt. CURRENT_STACKFUL_TASK
+    /// starts null; verify the early-return is taken cleanly.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_try_preempt_skips_when_no_task() -> TestResult {
+        let cpu = this_cpu();
+        // Belt + braces: explicitly null. Other tests may have
+        // left state behind on the same CPU's slot.
+        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+        let mut frame = zero_trap_frame();
+        frame.vector = PREEMPT_VECTOR;
+        frame.cs = 0x08;
+        let result = unsafe { try_preempt(&mut frame) };
+        if result {
+            return TestResult::Fail("preempted with no current task");
+        }
+        TestResult::Pass
+    }
+
+    /// Slice not expired → no preempt. Set tsc_started=now and
+    /// slice_cycles huge; try_preempt should observe insufficient
+    /// elapsed time and return false WITHOUT touching the wheel
+    /// or doing a kernel_switch.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_try_preempt_respects_slice_budget() -> TestResult {
+        // Build a fresh task. We only inspect the early-return path
+        // — we don't actually let try_preempt go past the budget
+        // check (the kernel_switch later would invalidate the test's
+        // assumption that try_preempt returns to it).
+        struct Forever;
+        impl Future for Forever {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let task = KernelTask::new(Forever);
+        let task_ptr = &*task as *const KernelTask as *mut KernelTask;
+        task.tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+        task.slice_cycles.store(u64::MAX / 2, Ordering::Release);
+        let cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
+
+        let mut frame = zero_trap_frame();
+        frame.vector = PREEMPT_VECTOR;
+        frame.cs = 0x08;
+        let result = unsafe { try_preempt(&mut frame) };
+
+        // Clean up before checking — keep the global pristine.
+        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+
+        if result {
+            return TestResult::Fail("preempted before slice expired");
+        }
+        TestResult::Pass
+    }
+
+    /// no_preempt opt-out → never preempt. Drivers holding HW
+    /// locks across a critical section can set this to keep the
+    /// timer from yanking the CPU away.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_try_preempt_respects_no_preempt_flag() -> TestResult {
+        struct Forever;
+        impl Future for Forever {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let task = KernelTask::new(Forever);
+        let task_ptr = &*task as *const KernelTask as *mut KernelTask;
+        task.no_preempt.store(true, Ordering::Release);
+        // Slice WOULD be expired (started ago, slice tiny) — only
+        // the no_preempt flag should save us.
+        task.tsc_started.store(0, Ordering::Release);
+        task.slice_cycles.store(1, Ordering::Release);
+        let cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
+
+        let mut frame = zero_trap_frame();
+        frame.vector = PREEMPT_VECTOR;
+        frame.cs = 0x08;
+        let result = unsafe { try_preempt(&mut frame) };
+
+        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+
+        if result {
+            return TestResult::Fail("preempted despite no_preempt=true");
+        }
+        TestResult::Pass
+    }
+
+    /// A future that keeps Pending indefinitely until a static
+    /// flag flips. Used to model a CPU-bound task that needs
+    /// preemption to yield control.
+    struct WaitOnFlag {
+        flag: &'static AtomicBool,
+        polls: &'static AtomicU32,
+    }
+    impl Future for WaitOnFlag {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.polls.fetch_add(1, Ordering::AcqRel);
+            if self.flag.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// poll_to_yield round-trip preserves task state across yields.
+    /// Polls Pending, switches back to executor, polls again, and
+    /// confirms the future's internal counter advanced — i.e., the
+    /// stackful task's state survived the round trip and reached
+    /// the inner future on each entry.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_pending_round_trips_preserve_state() -> TestResult {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static POLLS: AtomicU32 = AtomicU32::new(0);
+        FLAG.store(false, Ordering::Release);
+        POLLS.store(0, Ordering::Release);
+
+        let mut task = KernelTask::new(WaitOnFlag {
+            flag: &FLAG,
+            polls: &POLLS,
+        });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+
+        // Poll N times: should always be Pending, and counter
+        // advances one per poll.
+        for expected in 1..=8 {
+            let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+            if r != Poll::Pending {
+                return TestResult::Fail("expected Pending while flag false");
+            }
+            if POLLS.load(Ordering::Acquire) != expected {
+                return TestResult::Fail("inner future not entered on every round-trip");
+            }
+        }
+
+        // Flip the flag; next poll should return Ready.
+        FLAG.store(true, Ordering::Release);
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        if r != Poll::Ready(()) {
+            return TestResult::Fail("expected Ready after flag set");
+        }
+        TestResult::Pass
+    }
+
+    /// Verify a stackful task's stack pointer is on its OWN
+    /// allocated stack, not the executor's. Catches a regression
+    /// where someone might "optimize" by sharing the executor stack.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_runs_on_dedicated_stack() -> TestResult {
+        use core::sync::atomic::AtomicU64;
+        static TASK_RSP: AtomicU64 = AtomicU64::new(0);
+        static TASK_STACK_BASE: AtomicU64 = AtomicU64::new(0);
+        static TASK_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+        struct CaptureRsp;
+        impl Future for CaptureRsp {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let rsp: u64;
+                unsafe {
+                    core::arch::asm!("mov {0}, rsp", out(reg) rsp,
+                        options(nomem, nostack, preserves_flags));
+                }
+                TASK_RSP.store(rsp, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+        TASK_RSP.store(0, Ordering::Release);
+
+        let task = KernelTask::new(CaptureRsp);
+        // Snapshot expected stack range from the box.
+        let base = task.stack.as_ptr() as u64;
+        let top = base + task.stack.len() as u64;
+        TASK_STACK_BASE.store(base, Ordering::Release);
+        TASK_STACK_TOP.store(top, Ordering::Release);
+        let mut task = task;
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        if r != Poll::Ready(()) {
+            return TestResult::Fail("expected Ready");
+        }
+
+        let observed_rsp = TASK_RSP.load(Ordering::Acquire);
+        let base = TASK_STACK_BASE.load(Ordering::Acquire);
+        let top = TASK_STACK_TOP.load(Ordering::Acquire);
+        if observed_rsp < base || observed_rsp > top {
+            return TestResult::Fail("task rsp wasn't on the allocated stack");
+        }
+        TestResult::Pass
+    }
+
+    /// Multiple stackful tasks can be created and polled
+    /// independently in sequence, each on its own stack. Catches
+    /// state-bleed bugs between distinct KernelTask instances.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_multiple_independent_tasks() -> TestResult {
+        static COUNTER_A: AtomicU32 = AtomicU32::new(0);
+        static COUNTER_B: AtomicU32 = AtomicU32::new(0);
+        COUNTER_A.store(0, Ordering::Release);
+        COUNTER_B.store(0, Ordering::Release);
+
+        let mut task_a = KernelTask::new(TrivialFuture { counter: &COUNTER_A });
+        let mut task_b = KernelTask::new(TrivialFuture { counter: &COUNTER_B });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+
+        // Interleaved polls — each task uses its own ctx + stack.
+        let ra = unsafe { task_a.poll_to_yield(&mut exec_ctx, &waker) };
+        let rb = unsafe { task_b.poll_to_yield(&mut exec_ctx, &waker) };
+        if ra != Poll::Ready(()) || rb != Poll::Ready(()) {
+            return TestResult::Fail("one of the tasks didn't complete");
+        }
+        if COUNTER_A.load(Ordering::Acquire) != 1
+            || COUNTER_B.load(Ordering::Acquire) != 1
+        {
+            return TestResult::Fail("counters bled between tasks");
+        }
+        TestResult::Pass
+    }
+
+    /// Stack pointers of two concurrently-instantiated stackful
+    /// tasks are distinct (different allocations). Pre-empt
+    /// machinery is per-task and would corrupt state if two tasks
+    /// shared a stack.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_distinct_stacks_across_tasks() -> TestResult {
+        struct NoopReady;
+        impl Future for NoopReady {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let a = KernelTask::new(NoopReady);
+        let b = KernelTask::new(NoopReady);
+        let a_base = a.stack.as_ptr() as usize;
+        let a_top = a_base + a.stack.len();
+        let b_base = b.stack.as_ptr() as usize;
+        let b_top = b_base + b.stack.len();
+
+        // Disjoint ranges.
+        if a_top > b_base && a_base < b_top {
+            return TestResult::Fail("stacks overlap between tasks");
+        }
+        TestResult::Pass
+    }
+
+    /// `set_no_preempt` flips the flag the trap-handler hook
+    /// reads. Visible via the public observation of the task's
+    /// own state.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_no_preempt_setter_round_trips() -> TestResult {
+        struct NoopPending;
+        impl Future for NoopPending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let task = KernelTask::new(NoopPending);
+        if task.no_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("no_preempt should default false");
+        }
+        task.set_no_preempt(true);
+        if !task.no_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("set_no_preempt(true) didn't stick");
+        }
+        task.set_no_preempt(false);
+        if task.no_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("set_no_preempt(false) didn't stick");
+        }
+        TestResult::Pass
+    }
+
+    /// `set_slice_cycles` mutates the per-task slice budget.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_slice_cycles_setter_round_trips() -> TestResult {
+        struct NoopPending;
+        impl Future for NoopPending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let task = KernelTask::new(NoopPending);
+        if task.slice_cycles.load(Ordering::Acquire) != DEFAULT_SLICE_CYCLES {
+            return TestResult::Fail("default slice mismatch");
+        }
+        task.set_slice_cycles(123_456);
+        if task.slice_cycles.load(Ordering::Acquire) != 123_456 {
+            return TestResult::Fail("set_slice_cycles didn't stick");
+        }
+        TestResult::Pass
+    }
+
+    /// The executor-supplied waker is plumbed into the inner
+    /// future's Context. yield-style futures that call
+    /// `cx.waker().wake_by_ref()` need this — without it they
+    /// silently drop wakes onto the no-op fallback.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_inner_waker_is_executor_waker() -> TestResult {
+        use alloc::sync::Arc;
+        use alloc::task::Wake;
+        use core::task::Waker;
+        static OBSERVED_WAKER_DATA: AtomicU64 = AtomicU64::new(0);
+
+        struct CountingWaker {
+            wakes: AtomicU32,
+        }
+        impl Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::AcqRel);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        struct CaptureWakerData;
+        impl Future for CaptureWakerData {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                // We can't directly inspect the inner Waker's data
+                // ptr, but we CAN call wake_by_ref on it. If the
+                // executor-supplied waker plumbed through, our
+                // wake counter advances.
+                cx.waker().wake_by_ref();
+                Poll::Ready(())
+            }
+        }
+
+        let observer = Arc::new(CountingWaker {
+            wakes: AtomicU32::new(0),
+        });
+        let waker: Waker = observer.clone().into();
+        // SAFETY: u64 cast of the Arc data ptr is a stable diagnostic.
+        OBSERVED_WAKER_DATA.store(
+            Arc::as_ptr(&observer) as u64,
+            Ordering::Release,
+        );
+
+        let mut task = KernelTask::new(CaptureWakerData);
+        let mut exec_ctx = KernelContext::default();
+        let _ = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+
+        if observer.wakes.load(Ordering::Acquire) == 0 {
+            return TestResult::Fail("inner future's waker didn't reach the executor's waker");
+        }
+        TestResult::Pass
+    }
+
+    /// StackfulAdapter::with_options applies slice + no_preempt
+    /// + stack size to the inner KernelTask.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_adapter_applies_options() -> TestResult {
+        struct NoopPending;
+        impl Future for NoopPending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let opts = crate::StackfulOptions {
+            slice_cycles: 42_000_000,
+            no_preempt: true,
+            stack_bytes: 32 * 1024,
+        };
+        let adapter = StackfulAdapter::with_options(NoopPending, opts);
+        if adapter.inner.slice_cycles.load(Ordering::Acquire) != 42_000_000 {
+            return TestResult::Fail("slice_cycles not applied");
+        }
+        if !adapter.inner.no_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("no_preempt not applied");
+        }
+        if adapter.inner.stack.len() != 32 * 1024 {
+            return TestResult::Fail("stack_bytes not applied");
+        }
+        TestResult::Pass
+    }
+
+    /// StackfulOptions::default matches the publicly-documented
+    /// defaults. Drivers spawning with `..Default::default()`
+    /// need this contract.
+    fn smoke_stackful_options_defaults_match_constants() -> TestResult {
+        let opts = crate::StackfulOptions::default();
+        if opts.slice_cycles != DEFAULT_SLICE_CYCLES {
+            return TestResult::Fail("default slice_cycles drifted");
+        }
+        if opts.no_preempt {
+            return TestResult::Fail("default no_preempt should be false");
+        }
+        if opts.stack_bytes != DEFAULT_KERNEL_STACK_BYTES {
+            return TestResult::Fail("default stack_bytes drifted");
+        }
+        TestResult::Pass
+    }
+
+    /// KernelTask::with_stack_size honours the requested size and
+    /// allocates a 16-byte-aligned stack.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_kernel_task_stack_size_round_trips() -> TestResult {
+        struct NoopPending;
+        impl Future for NoopPending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        for &size in &[4096usize, 16 * 1024, 32 * 1024, 64 * 1024] {
+            let task = KernelTask::with_stack_size(NoopPending, size);
+            if task.stack.len() != size {
+                return TestResult::Fail("stack length mismatch");
+            }
+            if (task.stack.as_ptr() as usize) & 0xF != 0 {
+                return TestResult::Fail("stack base not 16-aligned");
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// `yield_now()` returns Pending + self-wake on first poll,
+    /// then Ready on the second. Core cooperative-yield primitive
+    /// every async driver depends on.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_yield_now_pending_then_ready() -> TestResult {
+        use alloc::sync::Arc;
+        use alloc::task::Wake;
+        use core::task::Waker;
+
+        struct CountingWaker {
+            wakes: AtomicU32,
+        }
+        impl Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::AcqRel);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let observer = Arc::new(CountingWaker {
+            wakes: AtomicU32::new(0),
+        });
+        let waker: Waker = observer.clone().into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut y = crate::yield_now();
+        let r1 = Pin::new(&mut y).poll(&mut cx);
+        if r1 != Poll::Pending {
+            return TestResult::Fail("first poll of yield_now should be Pending");
+        }
+        if observer.wakes.load(Ordering::Acquire) == 0 {
+            return TestResult::Fail("yield_now didn't re-arm its waker on first poll");
+        }
+        let r2 = Pin::new(&mut y).poll(&mut cx);
+        if r2 != Poll::Ready(()) {
+            return TestResult::Fail("second poll of yield_now should be Ready");
+        }
+        TestResult::Pass
+    }
+
+    /// Multi-task concurrency through the cooperative executor:
+    /// spawn N stackful tasks each counting up to M; pump
+    /// poll_one_round repeatedly; verify every task hits its
+    /// target without lost updates or cross-task interference.
+    /// Exercises the full path: spawn_stackful → executor queue
+    /// → StackfulAdapter::poll → poll_to_yield → kernel_switch
+    /// → task_body_rust → inner future → yield_now → switch back.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_multi_stackful_via_executor() -> TestResult {
+        const TASKS: usize = 4;
+        const TARGET: u32 = 5;
+        static COUNTERS: [AtomicU32; TASKS] = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+        for c in COUNTERS.iter() {
+            c.store(0, Ordering::Release);
+        }
+
+        struct Counter {
+            idx: usize,
+            target: u32,
+            seen: u32,
+        }
+        impl Future for Counter {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.seen >= self.target {
+                    return Poll::Ready(());
+                }
+                COUNTERS[self.idx].fetch_add(1, Ordering::AcqRel);
+                self.seen += 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn_stackful(Counter {
+                idx: i,
+                target: TARGET,
+                seen: 0,
+            });
+        }
+
+        // Drive the executor enough rounds that every counter
+        // reaches its target. With TASKS=4 and TARGET=5, 4*5=20
+        // poll-completions needed. poll_one_round walks every
+        // ready slot once. 64 rounds is plenty of headroom even
+        // if other boot tasks share the queue.
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if COUNTERS.iter().all(|c| c.load(Ordering::Acquire) >= TARGET) {
+                break;
+            }
+        }
+
+        for (i, c) in COUNTERS.iter().enumerate() {
+            let v = c.load(Ordering::Acquire);
+            if v != TARGET {
+                let _ = i;
+                let _ = v;
+                return TestResult::Fail(
+                    "one of the concurrent stackful tasks didn't reach its target",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+
+    /// Concurrency without preempt (no_preempt=true on every
+    /// task): tasks still round-robin via the cooperative yield
+    /// path (`yield_now().await`). Validates that the wake re-
+    /// arms the executor slot for tasks that opt out of timer
+    /// preemption.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_no_preempt_still_round_robins() -> TestResult {
+        static A: AtomicU32 = AtomicU32::new(0);
+        static B: AtomicU32 = AtomicU32::new(0);
+        A.store(0, Ordering::Release);
+        B.store(0, Ordering::Release);
+
+        struct YieldCount {
+            counter: &'static AtomicU32,
+            remaining: u32,
+        }
+        impl Future for YieldCount {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    return Poll::Ready(());
+                }
+                self.counter.fetch_add(1, Ordering::AcqRel);
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        let opts = crate::StackfulOptions {
+            no_preempt: true,
+            ..Default::default()
+        };
+        crate::spawn_stackful_with_options(
+            YieldCount {
+                counter: &A,
+                remaining: 3,
+            },
+            opts,
+        );
+        crate::spawn_stackful_with_options(
+            YieldCount {
+                counter: &B,
+                remaining: 3,
+            },
+            opts,
+        );
+
+        for _ in 0..32 {
+            crate::poll_one_round();
+            if A.load(Ordering::Acquire) >= 3 && B.load(Ordering::Acquire) >= 3 {
+                break;
+            }
+        }
+        if A.load(Ordering::Acquire) != 3 || B.load(Ordering::Acquire) != 3 {
+            return TestResult::Fail(
+                "no_preempt tasks didn't round-robin to completion via cooperative yield",
+            );
+        }
+        TestResult::Pass
+    }
+
+    /// task_body_rust manages CURRENT_STACKFUL_TASK directly: it
+    /// sets the slot at the top of each poll iter and clears it
+    /// before yielding. Verify that after a Ready return the slot
+    /// is null on this CPU.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_current_task_cleared_after_poll() -> TestResult {
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+
+        let mut task = KernelTask::new(ReadyImmediately);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        let _ = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+
+        let after = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        if !after.is_null() {
+            return TestResult::Fail(
+                "CURRENT_STACKFUL_TASK not cleared on this CPU after Ready return",
+            );
+        }
+        TestResult::Pass
+    }
+
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -880,5 +1559,93 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_multi_yield_then_complete
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_try_preempt_skips_non_preempt_vector
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/stackful", smoke_try_preempt_skips_user_mode);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_try_preempt_skips_when_no_task
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_try_preempt_respects_slice_budget
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_try_preempt_respects_no_preempt_flag
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_pending_round_trips_preserve_state
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_runs_on_dedicated_stack
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_multiple_independent_tasks
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_distinct_stacks_across_tasks
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_no_preempt_setter_round_trips
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_slice_cycles_setter_round_trips
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_inner_waker_is_executor_waker
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_current_task_cleared_after_poll
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_adapter_applies_options
+    );
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_options_defaults_match_constants
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_kernel_task_stack_size_round_trips
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/stackful", smoke_yield_now_pending_then_ready);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_multi_stackful_via_executor
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_no_preempt_still_round_robins
     );
 }
