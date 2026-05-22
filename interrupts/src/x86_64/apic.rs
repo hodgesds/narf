@@ -417,23 +417,21 @@ pub unsafe fn init_ap() {
 #[inline]
 pub fn on_timer_tick() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-    // Drive the deadline wheel off the LAPIC tick as a backup
-    // for HPET-IRQ delivery. On real silicon where the HPET
-    // comparator IRQ doesn't route reliably (or is masked
-    // behind a chipset-routing bug), the LAPIC timer is the
-    // only timer source we KNOW fires, and this keeps every
-    // SleepUntil-based primitive making forward progress.
+    // Drive the deadline wheel off the LAPIC tick unconditionally.
+    // The LAPIC timer is the only timer source we KNOW fires
+    // reliably across QEMU + every real-silicon platform we care
+    // about; HPET-IRQ delivery is unreliable on some AMD chipsets
+    // (Phoenix HawkPoint1, certain Renoir SKUs), so making
+    // sleep_cycles wakes depend on HPET means real-HW pumps go
+    // dormant.
     //
-    // Gated on `arm_callback_installed()` so the kernel-test
-    // boot's bare-wheel tests aren't disturbed by us racing
-    // their hand-crafted register/fire_due/cancel sequences.
-    // In test mode the wheel is exercised directly without
-    // an HPET arm; production boot installs the arm callback,
-    // and that's the case we want to harden.
-    if narf_time::timer_wheel::arm_callback_installed() {
-        let now = narf_time::now_cycles();
-        let _ = narf_time::timer_wheel::fire_due(now);
-    }
+    // Tests that exercise the bare wheel without an HPET arm
+    // (e.g. smoke_wheel_refresh_waker_rejects_recycled_handle)
+    // must register deadlines large enough that LAPIC drain
+    // won't fire them; `__reset_for_test` clears the wheel
+    // between operations.
+    let now = narf_time::now_cycles();
+    let _ = narf_time::timer_wheel::fire_due(now);
 }
 
 /// Snapshot of how many timer IRQs have fired since boot.
