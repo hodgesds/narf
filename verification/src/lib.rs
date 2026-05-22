@@ -4760,6 +4760,115 @@ fn smoke_irq_wait_resolves_when_already_fired() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_irq_wait_resolves_when_already_fired);
 
+/// install + clear sync handler: a registered handler fires on
+/// each on_irq for its vector; cleared, subsequent fires don't
+/// invoke it. Covers an under-tested API used by xhci_isr,
+/// HPET pump_irq, and other ISRs.
+#[cfg(target_arch = "x86_64")]
+fn smoke_irq_sync_handler_install_invoke_clear() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const VECTOR: u8 = 70;
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    FIRED.store(0, Ordering::Release);
+
+    fn handler() {
+        FIRED.fetch_add(1, Ordering::AcqRel);
+    }
+
+    // Pre-clear in case a previous test left state.
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    if FIRED.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("handler fired before install");
+    }
+
+    narf_interrupts::dispatch::install(VECTOR, handler);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    if FIRED.load(Ordering::Acquire) != 3 {
+        return TestResult::Fail("installed handler didn't fire on every on_irq");
+    }
+
+    narf_interrupts::dispatch::clear_handler(VECTOR);
+    narf_interrupts::dispatch::on_irq(VECTOR);
+    if FIRED.load(Ordering::Acquire) != 3 {
+        return TestResult::Fail("handler fired after clear");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_irq_sync_handler_install_invoke_clear);
+
+/// Burst-spawn N one-shot tasks; drain via poll_one_round; the
+/// scheduler's slot drop path must reclaim every completed
+/// task's slot. Verifies via a Drop counter on the future payload
+/// that EVERY spawned future's Drop runs after Ready — catches
+/// leak regressions where the slot drop forgets to drop the
+/// boxed future.
+#[cfg(target_arch = "x86_64")]
+fn smoke_burst_spawn_no_leaked_futures() -> TestResult {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{Context, Poll};
+
+    const TASKS: u32 = 32;
+    static CONSTRUCTED: AtomicU32 = AtomicU32::new(0);
+    static DROPPED: AtomicU32 = AtomicU32::new(0);
+    static POLLED: AtomicU32 = AtomicU32::new(0);
+    CONSTRUCTED.store(0, Ordering::Release);
+    DROPPED.store(0, Ordering::Release);
+    POLLED.store(0, Ordering::Release);
+
+    struct Counted;
+    impl Counted {
+        fn new() -> Self {
+            CONSTRUCTED.fetch_add(1, Ordering::AcqRel);
+            Counted
+        }
+    }
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPPED.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl Future for Counted {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            POLLED.fetch_add(1, Ordering::AcqRel);
+            Poll::Ready(())
+        }
+    }
+
+    for _ in 0..TASKS {
+        narf_scheduler::spawn(Counted::new());
+    }
+    for _ in 0..64 {
+        narf_scheduler::poll_one_round();
+        if POLLED.load(Ordering::Acquire) >= TASKS
+            && DROPPED.load(Ordering::Acquire) >= TASKS
+        {
+            break;
+        }
+    }
+    let polled = POLLED.load(Ordering::Acquire);
+    let dropped = DROPPED.load(Ordering::Acquire);
+    let constructed = CONSTRUCTED.load(Ordering::Acquire);
+    if polled != TASKS {
+        return TestResult::Fail("not every task's future was polled to Ready");
+    }
+    if dropped != constructed {
+        return TestResult::Fail(
+            "some Counted futures never dropped — scheduler leaked a slot",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_burst_spawn_no_leaked_futures);
+
 /// IRQ fire_count is monotonic across many concurrent on_irq
 /// invocations from different tasks. (on_irq's per-slot atomic
 /// must not lose increments.)
