@@ -2267,6 +2267,204 @@ pub mod tests {
     // exercising the underlying TaskId allocation + ready-queue
     // semantics that user-task spawn relies on.
 
+    // ── Capability primitives under multi-task pressure ────────────
+    //
+    // The 16 single-thread capability smokes cover the data
+    // structure. These probe the multi-task surface — cap
+    // bootstrap under concurrent spawn, revoke + check_live
+    // race semantics.
+
+    /// N tasks each bootstrap a fresh capability of the same
+    /// kind; verify every returned slot index is distinct.
+    /// Catches a regression where `Cap::bootstrap`'s table slot
+    /// allocation hands out the same index to two concurrent
+    /// callers.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_cap_bootstrap_unique_slots() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_capabilities::{Cap, CapKind, CapType, Write};
+        use narf_lib::sync::IrqSafeSpinLock;
+
+        struct TestObj;
+        impl CapType for TestObj {
+            const KIND: CapKind = CapKind::Endpoint;
+        }
+
+        const TASKS: usize = 8;
+        let collected: Arc<IrqSafeSpinLock<alloc::vec::Vec<u32>>> =
+            Arc::new(IrqSafeSpinLock::new(alloc::vec::Vec::new()));
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        DONE.store(0, Ordering::Release);
+
+        struct Booter {
+            collected: Arc<IrqSafeSpinLock<alloc::vec::Vec<u32>>>,
+        }
+        impl Future for Booter {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let cap: Cap<TestObj, Write> = Cap::<TestObj, Write>::bootstrap();
+                let slot_idx = cap.slot().index;
+                self.collected.lock().push(slot_idx);
+                cap.revoke();
+                DONE.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+
+        for _ in 0..TASKS {
+            crate::spawn_stackful(Booter {
+                collected: collected.clone(),
+            });
+        }
+        for _ in 0..32 {
+            crate::poll_one_round();
+            if (DONE.load(Ordering::Acquire) as usize) >= TASKS {
+                break;
+            }
+        }
+        if (DONE.load(Ordering::Acquire) as usize) != TASKS {
+            return TestResult::Fail("cap bootstrap tasks didn't all complete");
+        }
+        let mut slots = collected.lock().clone();
+        let before = slots.len();
+        slots.sort();
+        slots.dedup();
+        if slots.len() != before {
+            return TestResult::Fail("Cap::bootstrap returned duplicate slot index to two callers");
+        }
+        TestResult::Pass
+    }
+
+    /// Revoke observed by clone: spawn task A holding a Cap +
+    /// task B that revokes a clone of it. After both complete,
+    /// the original cap must report not-live (revoke bumps the
+    /// kind epoch, which invalidates every Cap of that kind).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_cap_revoke_observed_by_peer() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_capabilities::{Cap, CapKind, CapType, Write};
+        use narf_lib::sync::IrqSafeSpinLock;
+
+        struct TestObj;
+        impl CapType for TestObj {
+            const KIND: CapKind = CapKind::Endpoint;
+        }
+
+        // Build cap on this thread; share via Arc<Mutex<Option>>
+        // so the revoker can take() it (Cap::revoke consumes).
+        let cap: Cap<TestObj, Write> = Cap::<TestObj, Write>::bootstrap();
+        let cap_clone = cap; // Cap is Copy
+        let revoker_slot: Arc<IrqSafeSpinLock<Option<Cap<TestObj, Write>>>> =
+            Arc::new(IrqSafeSpinLock::new(Some(cap_clone)));
+        static LIVE_BEFORE: AtomicBool = AtomicBool::new(false);
+        static LIVE_AFTER: AtomicBool = AtomicBool::new(true);
+        static DONE_OBS: AtomicBool = AtomicBool::new(false);
+        static DONE_REV: AtomicBool = AtomicBool::new(false);
+        LIVE_BEFORE.store(false, Ordering::Release);
+        LIVE_AFTER.store(true, Ordering::Release);
+        DONE_OBS.store(false, Ordering::Release);
+        DONE_REV.store(false, Ordering::Release);
+
+        struct Observer {
+            cap: Cap<TestObj, Write>,
+        }
+        impl Future for Observer {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !DONE_REV.load(Ordering::Acquire) {
+                    if self.cap.is_live() {
+                        LIVE_BEFORE.store(true, Ordering::Release);
+                    }
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                LIVE_AFTER.store(self.cap.is_live(), Ordering::Release);
+                DONE_OBS.store(true, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        struct Revoker {
+            slot: Arc<IrqSafeSpinLock<Option<Cap<TestObj, Write>>>>,
+        }
+        impl Future for Revoker {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                if let Some(c) = self.slot.lock().take() {
+                    c.revoke();
+                }
+                DONE_REV.store(true, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        crate::spawn_stackful(Observer { cap });
+        crate::spawn_stackful(Revoker {
+            slot: revoker_slot.clone(),
+        });
+
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if DONE_OBS.load(Ordering::Acquire) && DONE_REV.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        if !LIVE_BEFORE.load(Ordering::Acquire) {
+            return TestResult::Fail("cap wasn't observed live before revoke");
+        }
+        if LIVE_AFTER.load(Ordering::Acquire) {
+            return TestResult::Fail("cap observed live AFTER revoke from peer task");
+        }
+        TestResult::Pass
+    }
+
+    // ── Timer wheel under multi-task pressure ──────────────────────
+    //
+    // The wheel has 7 single-thread tests in time/src/tests.rs
+    // (register, refresh, cancel, fire_due, generations). What's
+    // not covered: many tasks concurrently registering deadlines
+    // and the wheel handing them all distinct slots / firing
+    // them at the right time.
+
+    /// N tasks each await a short sleep_cycles + then complete.
+    /// Verifies the timer wheel can hand out distinct slots
+    /// under concurrent registration pressure and fire them on
+    /// the LAPIC-driven drain path (timer_wheel::register +
+    /// fire_due-from-on_timer_tick we added).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_concurrency_timer_wheel_many_sleepers_fire() -> TestResult {
+        const TASKS: usize = 6;
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        DONE.store(0, Ordering::Release);
+
+        async fn sleeper() {
+            // 1_000_000 cycles ≈ 300 µs on a 3.3 GHz CPU —
+            // well below the LAPIC slice but long enough to
+            // ensure the wheel actually has to fire us, not
+            // just immediately return Ready on the first poll.
+            narf_time::sleep_cycles(1_000_000).await;
+            DONE.fetch_add(1, Ordering::AcqRel);
+        }
+
+        for _ in 0..TASKS {
+            crate::spawn_stackful(sleeper());
+        }
+        // Drive enough rounds that the LAPIC tick (every
+        // ~10 ms on QEMU) fires multiple times and drains the
+        // wheel. 1024 rounds with timer_pump activity is
+        // ample.
+        for _ in 0..1024 {
+            crate::poll_one_round();
+            if (DONE.load(Ordering::Acquire) as usize) >= TASKS {
+                break;
+            }
+        }
+        if (DONE.load(Ordering::Acquire) as usize) != TASKS {
+            return TestResult::Fail("not all timer-wheel sleepers fired");
+        }
+        TestResult::Pass
+    }
+
     /// Distinct task IDs across many concurrent spawns. spawn()
     /// returns a TaskId; if the allocation racy, two
     /// concurrent calls could hand out the same id. Verifies
@@ -2628,5 +2826,20 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_concurrency_task_ids_unique_across_spawns
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_cap_bootstrap_unique_slots
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_cap_revoke_observed_by_peer
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_concurrency_timer_wheel_many_sleepers_fire
     );
 }
