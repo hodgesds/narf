@@ -84,6 +84,30 @@ pub fn register_initcalls() {
 pub static SUPERVISOR_TICKS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// Most-recent phase marker the supervisor reached inside the
+/// current loop iteration. Updated as the supervisor crosses each
+/// internal boundary. Combined with `SUPERVISOR_TICKS` this
+/// pinpoints WHERE the iteration wedges if `pumps` doesn't grow.
+///
+/// 0 = not entered yet
+/// 1 = entered loop body
+/// 2 = got Arc<Xhci> handle
+/// 3 = about to call connected_ports()
+/// 4 = connected_ports returned; about to enter Phase 1 for-loop
+/// 5 = inside Phase 1 for-loop, about to try_attach_root
+/// 6 = Phase 1 done; about to take HUBS snapshot for Phase 2
+/// 7 = Phase 2 done; about to call hid::pump_all
+/// 8 = pump_all done; about to call idle_suspend_pass
+/// 9 = about to .await wait_for_irq_until / sleep_cycles
+pub static SUPERVISOR_PHASE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Port number the supervisor is currently trying to attach (if
+/// inside try_attach_root). 0 = not in try_attach_root. Lets us
+/// see which specific port wedged when phase=5.
+pub static SUPERVISOR_ATTACHING_PORT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
 /// Spawn the long-running USB HID supervisor task. Walks every
 /// xHCI root-hub port the controller reports as connected, then
 /// every downstream port of every bound USB hub, attempting to
@@ -112,6 +136,7 @@ fn spawn_supervisor_task() {
         let mut root_fail_count = [0u8; 128];
         loop {
             SUPERVISOR_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            SUPERVISOR_PHASE.store(1, core::sync::atomic::Ordering::Relaxed);
             // Acquire the controller handle once per loop iteration.
             // The Arc clone takes the registry lock for microseconds;
             // the rest of the iteration runs against `&*c` with no
@@ -125,13 +150,16 @@ fn spawn_supervisor_task() {
                 }
             };
             let c: &xhci::Xhci = &c;
+            SUPERVISOR_PHASE.store(2, core::sync::atomic::Ordering::Relaxed);
             if irq_vector.is_none() {
                 irq_vector = c.irq_vector;
             }
 
             // ── Phase 1: root-hub ports ────────────────────────────
+            SUPERVISOR_PHASE.store(3, core::sync::atomic::Ordering::Relaxed);
             let connected_root: alloc::vec::Vec<u8> =
                 c.connected_ports().iter().map(|(p, _)| *p).collect();
+            SUPERVISOR_PHASE.store(4, core::sync::atomic::Ordering::Relaxed);
             for &p in &connected_root {
                 let bit = 1u128 << (p as u32 & 127);
                 let pi = (p as usize) & 127;
@@ -141,7 +169,10 @@ fn spawn_supervisor_task() {
                 if root_fail_count[pi] >= MAX_PER_PORT_RETRIES {
                     continue;
                 }
+                SUPERVISOR_PHASE.store(5, core::sync::atomic::Ordering::Relaxed);
+                SUPERVISOR_ATTACHING_PORT.store(p, core::sync::atomic::Ordering::Relaxed);
                 let outcome = attach::try_attach_root(c, p);
+                SUPERVISOR_ATTACHING_PORT.store(0, core::sync::atomic::Ordering::Relaxed);
                 match outcome {
                     AttachOutcome::Keyboard
                     | AttachOutcome::Mouse
@@ -162,6 +193,7 @@ fn spawn_supervisor_task() {
             }
 
             // ── Phase 2: walk every bound hub's downstream ports ───
+            SUPERVISOR_PHASE.store(6, core::sync::atomic::Ordering::Relaxed);
             // BFS ordering: HUBS append-only, so iterating linearly
             // visits a parent hub before any child it spawns this
             // cycle. Snapshot the (route, tier, root_port, hub_slot,
@@ -237,16 +269,19 @@ fn spawn_supervisor_task() {
                 }
             }
 
+            SUPERVISOR_PHASE.store(7, core::sync::atomic::Ordering::Relaxed);
             hid::pump_all(c);
             hid::mouse::pump_all(c);
             hid::touchpad::pump_all(c);
             cdc_acm::pump_all(c);
+            SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose
             // last activity is older than IDLE_SUSPEND_NS. Pumps
             // above touch `last_activity_tick` via mark_port_activity
             // on each completed transfer, so an actively-used keyboard
             // never gets suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c);
+            SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
             //       endpoint or a Port Status Change Event (hot-plug),

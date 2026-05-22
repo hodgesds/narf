@@ -99,9 +99,13 @@ pub fn paint(fb: &FbWriter) {
     let usb_pumps = narf_drivers_usb::hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
     let usb_reports = narf_drivers_usb::hid::REPORTS_READ.load(Ordering::Relaxed);
     let supervisor_ticks = narf_drivers_usb::SUPERVISOR_TICKS.load(Ordering::Relaxed);
+    let supervisor_phase = narf_drivers_usb::SUPERVISOR_PHASE.load(Ordering::Relaxed);
+    let supervisor_port = narf_drivers_usb::SUPERVISOR_ATTACHING_PORT.load(Ordering::Relaxed);
     let usb_hid_line = format!(
-        "USB-HID: sup-ticks={}  pumps={}  reports={}  key-pushes={}",
+        "USB-HID: sup-ticks={} ph={} port={}  pumps={}  reports={}  keys={}",
         supervisor_ticks,
+        supervisor_phase,
+        supervisor_port,
         usb_pumps,
         usb_reports,
         narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed),
