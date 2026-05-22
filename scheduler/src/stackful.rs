@@ -1767,6 +1767,94 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// Multi-task vmalloc CAS contention: N tasks each request a
+    /// distinct VA range; ranges must be disjoint. vmalloc uses
+    /// compare_exchange_weak on the cursor; this exercises that
+    /// path under interleaved poll pressure. (Bump-pointer
+    /// allocator: free is a no-op so this leaks VA, but the test
+    /// budget is small enough not to exhaust the 4 GiB pool.)
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_alloc_concurrency_vmalloc_cas_disjoint() -> TestResult {
+        use narf_memory::vmalloc;
+        const TASKS: usize = 4;
+        const ITERS: u32 = 8;
+        static BASES: [AtomicU64; TASKS * (ITERS as usize)] = [
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        ];
+        static COMPLETED: AtomicU32 = AtomicU32::new(0);
+        for s in BASES.iter() {
+            s.store(0, Ordering::Release);
+        }
+        COMPLETED.store(0, Ordering::Release);
+
+        struct VmStress {
+            idx: usize,
+            remaining: u32,
+        }
+        impl Future for VmStress {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.remaining == 0 {
+                    COMPLETED.fetch_add(1, Ordering::AcqRel);
+                    return Poll::Ready(());
+                }
+                let r = match vmalloc::alloc(4096) {
+                    Ok(r) => r,
+                    Err(_) => return Poll::Ready(()), // exhausted; bail
+                };
+                let iter_idx = (ITERS - self.remaining) as usize;
+                let slot = self.idx * (ITERS as usize) + iter_idx;
+                BASES[slot].store(r.base, Ordering::Release);
+                vmalloc::free(r);
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        for i in 0..TASKS {
+            crate::spawn_stackful(VmStress {
+                idx: i,
+                remaining: ITERS,
+            });
+        }
+
+        for _ in 0..256 {
+            crate::poll_one_round();
+            if COMPLETED.load(Ordering::Acquire) as usize >= TASKS {
+                break;
+            }
+        }
+        if (COMPLETED.load(Ordering::Acquire) as usize) != TASKS {
+            return TestResult::Fail("vmalloc concurrency tasks didn't all finish");
+        }
+
+        // All recorded bases must be page-aligned and pairwise
+        // distinct. The bump cursor + atomic CAS guarantee this.
+        let mut seen = alloc::vec::Vec::new();
+        for slot in BASES.iter() {
+            let b = slot.load(Ordering::Acquire);
+            if b == 0 {
+                continue; // task bailed via Exhausted; tolerated.
+            }
+            if b & 0xFFF != 0 {
+                return TestResult::Fail("vmalloc returned non-page-aligned base under contention");
+            }
+            if seen.contains(&b) {
+                return TestResult::Fail("vmalloc returned the same base to two callers");
+            }
+            seen.push(b);
+        }
+        TestResult::Pass
+    }
+
     /// Spawn-allocator stress: each task's Box::pin(future) at
     /// spawn time also runs through the allocator. With many
     /// tasks spawned concurrently then drained, this exercises
@@ -1955,5 +2043,10 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_alloc_concurrency_many_spawns_finish
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_alloc_concurrency_vmalloc_cas_disjoint
     );
 }

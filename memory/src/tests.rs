@@ -4596,3 +4596,111 @@ fn smoke_compressed_ramdisk_out_of_range_rejected() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_compressed_ramdisk_out_of_range_rejected);
+
+// ── vmalloc (bump-pointer kernel-VA allocator) ──────────────────────
+
+/// Round-trip: alloc + free returns a range with the requested
+/// page-aligned length and a high-half base. Doesn't dereference
+/// the range — vmalloc hands out unbacked VA.
+fn smoke_vmalloc_alloc_free_roundtrip() -> TestResult {
+    use crate::vmalloc;
+    let prev = vmalloc::claimed_bytes();
+    let r = match vmalloc::alloc(4096) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("alloc(4096) returned Err"),
+    };
+    if r.len != 4096 {
+        return TestResult::Fail("alloc len != requested page");
+    }
+    if r.base & 0xFFF != 0 {
+        return TestResult::Fail("alloc base not page-aligned");
+    }
+    if (r.base >> 47) != 0x1FFFF {
+        return TestResult::Fail("alloc base not canonical-high");
+    }
+    if vmalloc::claimed_bytes() != prev + 4096 {
+        return TestResult::Fail("claimed_bytes didn't track alloc");
+    }
+    vmalloc::free(r);
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_vmalloc_alloc_free_roundtrip);
+
+/// Sub-page allocations round up to a whole page.
+fn smoke_vmalloc_rounds_up_to_page() -> TestResult {
+    use crate::vmalloc;
+    let r = match vmalloc::alloc(1) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("alloc(1) returned Err"),
+    };
+    if r.len != 4096 {
+        return TestResult::Fail("sub-page didn't round up to a page");
+    }
+    vmalloc::free(r);
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_vmalloc_rounds_up_to_page);
+
+/// Zero-length request rejected with BadLen.
+fn smoke_vmalloc_zero_len_rejected() -> TestResult {
+    use crate::vmalloc::{self, VmallocError};
+    match vmalloc::alloc(0) {
+        Err(VmallocError::BadLen) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("zero-len alloc returned Ok"),
+        Err(_) => TestResult::Fail("zero-len alloc returned wrong error"),
+    }
+}
+kernel_test_in!("memory", smoke_vmalloc_zero_len_rejected);
+
+/// Sequential allocations don't overlap. The bump cursor must
+/// advance monotonically.
+fn smoke_vmalloc_sequential_allocs_disjoint() -> TestResult {
+    use crate::vmalloc;
+    let a = match vmalloc::alloc(8192) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("alloc a failed"),
+    };
+    let b = match vmalloc::alloc(4096) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("alloc b failed"),
+    };
+    let c = match vmalloc::alloc(16 * 1024) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("alloc c failed"),
+    };
+    // Pairwise disjoint check.
+    let pairs = [(a, b), (a, c), (b, c)];
+    for (x, y) in pairs {
+        let x_end = x.base + x.len;
+        let y_end = y.base + y.len;
+        if x.base < y_end && y.base < x_end {
+            return TestResult::Fail("vmalloc ranges overlap");
+        }
+    }
+    vmalloc::free(a);
+    vmalloc::free(b);
+    vmalloc::free(c);
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_vmalloc_sequential_allocs_disjoint);
+
+/// claimed_bytes tracks the sum of all rounded-up requests.
+fn smoke_vmalloc_claimed_bytes_tracks_sum() -> TestResult {
+    use crate::vmalloc;
+    let before = vmalloc::claimed_bytes();
+    let r1 = vmalloc::alloc(4096).expect("alloc 1");
+    let r2 = vmalloc::alloc(4096).expect("alloc 2");
+    let r3 = vmalloc::alloc(8192).expect("alloc 3");
+    let after = vmalloc::claimed_bytes();
+    // Expect at least 16 KiB advanced. (Other concurrent
+    // allocations from the boot path could've also advanced it,
+    // so we use >= rather than ==.)
+    if after.saturating_sub(before) < 4096 + 4096 + 8192 {
+        return TestResult::Fail("claimed_bytes didn't advance by the requested amount");
+    }
+    vmalloc::free(r1);
+    vmalloc::free(r2);
+    vmalloc::free(r3);
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_vmalloc_claimed_bytes_tracks_sum);
