@@ -334,21 +334,18 @@ impl KernelTask {
         // we've used our slice.
         self.tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
-        // Publish self to the per-CPU current-task slot so the
-        // trap-handler hook can find us on a LAPIC timer fire.
-        let cpu = this_cpu();
-        CURRENT_STACKFUL_TASK.inner[cpu].store(self as *mut _, Ordering::Release);
+        // CURRENT_STACKFUL_TASK is managed by task_body_rust
+        // (set at top of each poll iter, cleared before yield).
+        // The executor side touching it would open a race window
+        // between switch-back-from-task and the clear, during
+        // which a timer tick could mistakenly preempt the
+        // already-yielded task and overwrite its ctx.
         // SAFETY: ctx + exec_ctx both live for the duration of
         // this call; the task's stack was allocated by us and is
         // still alive; the trampoline_entry symbol is in this
         // crate's code segment.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
-        // Clear CURRENT_STACKFUL_TASK so the next preempt-hook
-        // fire doesn't think a stackful task is still active.
-        // Re-read this_cpu — on SMP we may have migrated.
-        let cpu = this_cpu();
-        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
         self.exec_ctx.store(core::ptr::null_mut(), Ordering::Release);
         if self.completed.load(Ordering::Acquire) {
             Poll::Ready(())
@@ -433,29 +430,25 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     // holds it during the switch + we get a &mut here as the only
     // active reference on this stack).
     let task = unsafe { &mut *task };
+    let task_ptr: *mut KernelTask = task as *mut _;
 
     loop {
-        // Diagnostic beacons for the stackful inner-poll path.
-        // Slot 52: about to poll inner future. White on first
-        // entry; toggles thereafter. If slot 52 paints but slot
-        // 53 doesn't, the inner future's poll() never returns
-        // (busy-loop or sync hang inside it) and we never reach
-        // the kernel_switch back to the executor — a classic
-        // cooperative wedge with preemption gated off.
-        // Slot 53: about to kernel_switch back to executor (post-
-        // poll). Toggles each yield. If 52 and 53 both paint,
-        // the inner poll round-trips correctly.
+        // Take ownership of CURRENT_STACKFUL_TASK on whatever
+        // CPU we're on. This is the ONLY place CURRENT gets
+        // set — by the task itself, while it's actually
+        // executing — so try_preempt's view of "who's running"
+        // is precise: between the .store(self) below and the
+        // .store(null) before kernel_switch, the task is on
+        // this CPU and preemptable. Outside that window
+        // CURRENT[cpu] is null and try_preempt no-ops.
+        let cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
+
         let prev_52 = STACKFUL_POLL_TICKS.fetch_add(1, Ordering::Relaxed);
         narf_memory::beacon::paint(
             52,
             if prev_52 & 1 == 0 { 0x00FF_FFFF } else { 0x0080_80FF },
         );
-        // Build a Context around the executor-supplied waker. The
-        // `poll_to_yield` caller stashed it in `task.current_waker`
-        // immediately before kernel_switching us in. Falling back
-        // to a no-op waker if (somehow) the slot's empty — that
-        // would lose `wake_by_ref` calls but is preferable to a
-        // panic deep on a kernel stack.
         let waker_guard = task.current_waker.lock();
         let waker = match waker_guard.as_ref() {
             Some(w) => w.clone(),
@@ -478,6 +471,13 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
             }
             Poll::Pending => {}
         }
+        // Clear CURRENT_STACKFUL_TASK before yielding so a
+        // timer tick landing between this clear and the
+        // kernel_switch below (or while we're switched out)
+        // doesn't preempt a task that's no longer executing.
+        // Re-read cpu in case the task migrated mid-poll.
+        let cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
         // Yield back to the executor. We pull the exec_ctx pointer
         // out atomically — the executor populated it just before
         // switching us in.
@@ -618,12 +618,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         (*task_ptr).preempted.store(true, Ordering::Release);
     }
 
-    // Clear so timer ticks during the switch-out window (we
-    // briefly have IF=1 in the load half of kernel_switch, after
-    // STI before JMP — though the inter-instruction window is
-    // closed by Intel's "STI defers one instruction" rule) don't
-    // try to preempt this task again. We'll re-publish below
-    // when we resume.
+    // Clear CURRENT so timer ticks during the switch-out window
+    // don't try to preempt a task that's no longer executing on
+    // this CPU. task_body_rust re-publishes CURRENT at the top
+    // of its next poll iter.
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
 
     // Save trap_handler's continuation into task.ctx; switch to
@@ -635,12 +633,21 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
 
     // ── Resumed here when the executor switches back into this
-    //    task. Re-publish on whichever CPU we now run on (SMP may
-    //    have migrated us between yields) and restart the slice
-    //    counter so we're measured from now.
+    //    task. Re-publish CURRENT for whichever CPU we now run
+    //    on (SMP may have migrated us between yields) and
+    //    restart the slice counter so we're measured from now.
+    //
+    // Critical: we re-publish in the preempt-resume path
+    // because the iretq below will return to the task's
+    // pre-trap RIP — NOT to task_body_rust's loop top. So
+    // task_body_rust's CURRENT.store(self) at the next iter
+    // won't run until the task cooperatively yields. Without
+    // re-publishing here, subsequent timer ticks see
+    // CURRENT=null and never preempt — the task busy-loop runs
+    // forever until it yields on its own.
     let cpu = this_cpu();
-    CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
     unsafe {
+        CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
         (*task_ptr)
             .tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
