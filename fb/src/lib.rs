@@ -837,17 +837,15 @@ pub fn register_initcalls() {
         if select_active().is_none() {
             return InitResult::NotPresent;
         }
-        let cap = bootstrap_writer();
-        let writer = match FbWriter::new(cap) {
-            Ok(w) => w,
-            Err(_) => return InitResult::Error("FbWriter::new"),
-        };
-        narf_scheduler::spawn_stackful(async move {
-            loop {
-                status::paint(&writer);
-                narf_time::sleep_cycles(800_000_000).await;
-            }
-        });
+        // BISECT-CONFIRMED: status::paint acquires multiple
+        // IrqSafeSpinLocks (xhci CONTROLLER, AML namespace, I2C/
+        // GPIO/power/thermal registries). On real HW a driver
+        // mid-MMIO can hold one of those, and IrqSafeSpinLock
+        // disables IF on the WAITER too — so the executor's
+        // entire CPU freezes (no LAPIC tick, no preempt, no
+        // task switches) until the lock releases. Stays
+        // disabled until status::paint is rewritten to read
+        // from lock-free atomic snapshots.
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-cursor-pump", || {
