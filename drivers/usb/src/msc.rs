@@ -531,7 +531,7 @@ pub async fn enumerate_and_attach_msc(xhci_dev: &Xhci) -> usize {
 }
 
 async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
-    xhci_dev.port_reset(port).map_err(MscError::Xhci)?;
+    xhci_dev.port_reset(port).await.map_err(MscError::Xhci)?;
     let speed = xhci_dev
         .port_speed(port)
         .ok_or(MscError::EndpointsMissing)?;

@@ -121,9 +121,12 @@ fn smoke_xhci_address_device_qemu() -> TestResult {
             let _ = narf_scheduler::block_on(async { c.disable_slot(stale).await });
         }
     }
-    let _post = match xhci::with_controller(|c| c.port_reset(port)) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("port_reset failed"),
+    let _post = match xhci::controller() {
+        Some(c) => match narf_scheduler::block_on(async { c.port_reset(port).await }) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("port_reset failed"),
+        },
+        None => return TestResult::Fail("xhci controller missing"),
     };
     let c = match xhci::controller() {
         Some(c) => c,

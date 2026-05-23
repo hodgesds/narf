@@ -585,7 +585,7 @@ pub async fn try_bind_kbd_already_addressed(
 }
 
 async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    xhci_dev.port_reset(port).map_err(|e| {
+    xhci_dev.port_reset(port).await.map_err(|e| {
         let err = HidError::Xhci(e);
         note_attach_fail(port, AttachStep::Reset, &err);
         err

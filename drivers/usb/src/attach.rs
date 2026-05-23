@@ -247,7 +247,7 @@ pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, po
 pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
     // port_reset → enable_slot → address_device (root-hub topology).
     // Each step runs against the controller's PORTSC register set.
-    if xhci_dev.port_reset(port).is_err() {
+    if xhci_dev.port_reset(port).await.is_err() {
         return AttachOutcome::UnknownClass;
     }
     let speed = match xhci_dev.port_speed(port) {

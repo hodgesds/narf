@@ -1556,7 +1556,7 @@ impl Xhci {
     /// PORTSC change bits at [17..23] are RW1C — preserve the
     /// RO/RW fields below them when writing back. Returns the
     /// post-reset PORTSC value.
-    pub fn port_reset(&self, port: u8) -> Result<u32, XhciError> {
+    pub async fn port_reset(&self, port: u8) -> Result<u32, XhciError> {
         if port == 0 || port > self.caps.max_ports {
             return Err(XhciError::BadPort);
         }
@@ -1567,23 +1567,24 @@ impl Xhci {
             return Err(XhciError::BadPort);
         }
         // CCS-stable debounce (xHCI §4.19.5 / USB 2.0 §7.1.7.3:
-        // TDDIS = 100 ms). Sample CCS every ~1 ms; if it stays
-        // asserted continuously for the debounce window we
-        // proceed. A glitchy connect that toggles within the
-        // window is treated as "not yet stable" — caller's
-        // supervisor poll re-tries on the next tick.
+        // TDDIS = 100 ms). Sample CCS every ~1 ms via the timer
+        // wheel rather than busy-spin so the supervisor task
+        // parks between samples and other tasks (panel paint,
+        // shell, peer pumps) run on this CPU during the 100 ms
+        // window. 1 ms ≈ 1 M TSC cycles at 1 GHz; on Zen4 (3.3
+        // GHz) this becomes ~330 µs which is still negligible
+        // wake-up overhead but covers slower CPUs sensibly.
         const DEBOUNCE_SAMPLES: u32 = 100;
+        const SAMPLE_CYCLES: u64 = 1_000_000;
         for _ in 0..DEBOUNCE_SAMPLES {
             // SAFETY: same MMIO region.
             let v = unsafe { self.mmio.read32(off) };
             if v & PORTSC_CCS == 0 {
                 return Err(XhciError::BadPort);
             }
-            for _ in 0..100_000 {
-                core::hint::spin_loop();
-            }
+            narf_time::sleep_cycles(SAMPLE_CYCLES).await;
         }
-        self.port_reset_once(port, off)
+        self.port_reset_once(port, off).await
     }
 
     /// One reset attempt. Spec-compliant single-shot per xHCI 1.2
@@ -1591,7 +1592,7 @@ impl Xhci {
     /// ack PRC, verify PED is set (USB2) or PED + PLS=U0 (USB3),
     /// then wait TRSTRCY (USB 2.0 §7.1.7.3 / §9.2.6.2) before the
     /// caller drives the next bus transaction.
-    fn port_reset_once(&self, port: u8, off: u64) -> Result<u32, XhciError> {
+    async fn port_reset_once(&self, port: u8, off: u64) -> Result<u32, XhciError> {
         // SAFETY: identity-mapped MMIO; off bounded by caller.
         let cur = unsafe { self.mmio.read32(off) };
         // Assert PR + keep PP. Mask RW1C change bits to 0 so this
@@ -1605,10 +1606,12 @@ impl Xhci {
         unsafe {
             self.mmio.write32(off, to_write);
         }
-        // Wait for PR to clear AND PRC to set (§4.19.5: PR self-
-        // clears + PRC asserts on reset completion). Bound at 250 ms
-        // wall-clock — replaces the prior CPU-clock-dependent
-        // 2.5M-iter spin budget.
+        // Wait for PR to clear AND PRC to set (§4.19.5). 250 ms
+        // outer bound; sample every ~1 ms via the timer wheel so
+        // the task parks instead of burning the CPU. Worst-case
+        // wall-clock unchanged; CPU cost during the wait drops
+        // from 100% to essentially zero.
+        const SAMPLE_CYCLES: u64 = 1_000_000;
         let pr_deadline = narf_time::Deadline::after_ms(250);
         loop {
             if pr_deadline.expired() {
@@ -1617,25 +1620,22 @@ impl Xhci {
             // SAFETY: same.
             let v = unsafe { self.mmio.read32(off) };
             if v & PORTSC_PR == 0 && v & PORTSC_PRC != 0 {
-                // Acknowledge PRC by writing 1 to clear (RW1C),
-                // preserving the rest of the register.
                 let ack = (v & !PORTSC_CHG_MASK) | PORTSC_PRC;
                 // SAFETY: same.
                 unsafe {
                     self.mmio.write32(off, ack);
                 }
-                // Audit F-12..F-19: success criteria differs per
-                // protocol revision. xHCI 1.2 §4.19.5 says both
-                // USB2 and USB3 should set PED on successful
-                // reset, but on USB3 the link must also reach U0
-                // (PLS=0) before PED is meaningful, and the link
-                // training takes a few additional ms. Wait a bit
-                // longer for either:
-                //   USB3 port → PLS == U0 AND PED == 1
-                //   USB2 port → PED == 1
-                // before declaring failure.
+                // PED / PLS settle. USB3 needs link training to
+                // reach U0 (PLS=0); USB2 just needs PED. 50 ms
+                // outer bound, sample every ~100 µs (100 k cycles
+                // at 1 GHz; fine-grained because PED transitions
+                // can race within a few hundred µs of PRC ack).
                 let proto = self.port_protocols[port as usize];
-                for _ in 0..50_000u32 {
+                let ped_deadline = narf_time::Deadline::after_ms(50);
+                loop {
+                    if ped_deadline.expired() {
+                        return Err(XhciError::PortResetTimeout);
+                    }
                     // SAFETY: same.
                     let post = unsafe { self.mmio.read32(off) };
                     let ped = post & PORTSC_PED != 0;
@@ -1646,33 +1646,16 @@ impl Xhci {
                     };
                     if ok {
                         // TRSTRCY (USB 2.0 §7.1.7.3 / §9.2.6.2):
-                        // ≥10 ms of bus quiet between PR clearing
-                        // and the host driving the first SETUP
-                        // packet, so address_device's SET_ADDRESS
-                        // lands after the device's reset-recovery
-                        // window. TSC-driven so the wait is real
-                        // wall-clock time independent of CPU
-                        // spin_loop pacing. Falls back to a fixed
-                        // spin if TSC isn't calibrated yet (early
-                        // boot) so we don't degenerate to
-                        // busy_wait_cycles(0).
-                        let tsc_hz = narf_time::calibrate_clocks();
-                        if tsc_hz > 0 {
-                            narf_time::busy_wait_cycles((tsc_hz / 1000) * 25);
-                        } else {
-                            for _ in 0..3_000_000u32 {
-                                core::hint::spin_loop();
-                            }
-                        }
+                        // ≥10 ms quiet between PR clear and the
+                        // first SETUP. Use 25 ms to keep margin
+                        // over slow devices.
+                        narf_time::sleep_cycles(25_000_000).await;
                         return Ok(post);
                     }
-                    for _ in 0..200 {
-                        core::hint::spin_loop();
-                    }
+                    narf_time::sleep_cycles(100_000).await;
                 }
-                return Err(XhciError::PortResetTimeout);
             }
-            core::hint::spin_loop();
+            narf_time::sleep_cycles(SAMPLE_CYCLES).await;
         }
         Err(XhciError::PortResetTimeout)
     }

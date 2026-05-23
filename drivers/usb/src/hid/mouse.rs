@@ -299,7 +299,7 @@ pub async fn try_bind_mouse_already_addressed(
 }
 
 async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
+    xhci_dev.port_reset(port).await.map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
     let slot_id = xhci_dev.enable_slot().await.map_err(HidError::Xhci)?;
     let res = async {
