@@ -242,8 +242,24 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
             (LVT_TIMER_PERIODIC as u32) | (timer_vector as u32),
         );
         core::ptr::write_volatile(init_ct, initial_count);
+        // Read back LVT_TIMER and stash the value. If MMIO write
+        // didn't stick (cache, mis-mapped, PAT confusion), the
+        // readback won't show the periodic bit + vector we wrote.
+        // Panel surfaces this so we can tell from outside whether
+        // the timer is genuinely armed.
+        let readback = core::ptr::read_volatile(lvt_timer as *const u32);
+        LVT_TIMER_READBACK.store(readback, core::sync::atomic::Ordering::Release);
     }
 }
+
+/// LVT_TIMER value as read back AFTER `start_timer` programmed it.
+/// 0 = start_timer never ran (or fix not in binary). Non-zero with
+/// the expected `LVT_TIMER_PERIODIC | vector` bits set means the
+/// LAPIC MMIO write took effect. Surfaced on the FB status panel
+/// to debug `tt=0` on real HW where the x2APIC fallback to xAPIC
+/// MMIO might not be reaching the LAPIC.
+pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Stop the LAPIC timer (mask the LVT entry, zero the initial count).
 ///
