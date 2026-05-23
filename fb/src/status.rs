@@ -31,9 +31,9 @@ use crate::{FbWriter, Rect};
 const PANEL_BG: Pixel32 = Pixel32(0xFF0A_1428); // dark navy
 const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// Number of klog tail lines displayed under the live-state lines.
-/// 12 fits comfortably under a 1280×800 FB while leaving room for
-/// a little headroom + padding above the panel.
-const KLOG_TAIL_LINES: usize = 12;
+/// 16 keeps recent boot output visible on a 1280×800 FB. Below
+/// that height the panel self-suppresses (line 65 guard).
+const KLOG_TAIL_LINES: usize = 16;
 const HEADER_LINES: u32 = 5;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
@@ -111,13 +111,16 @@ pub fn paint(fb: &FbWriter) {
     let supervisor_phase = narf_drivers_usb::SUPERVISOR_PHASE.load(Ordering::Relaxed);
     let supervisor_port = narf_drivers_usb::SUPERVISOR_ATTACHING_PORT.load(Ordering::Relaxed);
     let usb_hid_line = format!(
-        "USB-HID: sup-ticks={} ph={} port={}  pumps={}  reports={}  keys={}",
+        "USB-HID: sup={} ph={} port={} pumps={} cpns={} irq1={}",
         supervisor_ticks,
         supervisor_phase,
         supervisor_port,
         usb_pumps,
-        usb_reports,
-        narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed),
+        narf_time::cycles_per_ns(),
+        {
+            let v = narf_input::I8042_KBD_IRQ_VECTOR.load(Ordering::Acquire);
+            if v == 0 { 0 } else { narf_interrupts::fire_count(v) }
+        },
     );
 
     // AML namespace + i2c-hid HID counts: ALL from the boot-time
