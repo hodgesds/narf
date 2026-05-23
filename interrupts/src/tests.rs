@@ -642,8 +642,8 @@ fn smoke_dispatch_vectors_are_independent() -> TestResult {
 kernel_test_in!("interrupts", smoke_dispatch_vectors_are_independent);
 
 fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
-    // set_waker(v, w); clear_waker(v); on_irq(v) — the waker must
-    // NOT fire. Models the cancellation path when a future is
+    // set_waker(v, w); clear_waker(v, &w); on_irq(v) — the waker
+    // must NOT fire. Models the cancellation path when a future is
     // dropped before its IRQ lands.
     use core::sync::atomic::{AtomicBool, Ordering};
     use core::task::{RawWaker, RawWakerVTable, Waker};
@@ -658,8 +658,9 @@ fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
 
     WOKEN.store(false, Ordering::Release);
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let w_clone = w.clone();
     crate::dispatch::set_waker(SCRATCH_VEC_DROP_CLEARS, w);
-    crate::dispatch::clear_waker(SCRATCH_VEC_DROP_CLEARS);
+    crate::dispatch::clear_waker(SCRATCH_VEC_DROP_CLEARS, &w_clone);
     crate::on_irq(SCRATCH_VEC_DROP_CLEARS);
     if WOKEN.load(Ordering::Acquire) {
         TestResult::Fail("clear_waker didn't prevent the wake")
@@ -668,6 +669,51 @@ fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
     }
 }
 kernel_test_in!("interrupts", smoke_dispatch_clear_waker_prevents_wake);
+
+fn smoke_dispatch_clear_waker_targets_only_own() -> TestResult {
+    // Two distinct wakers registered on the same vector; clearing
+    // ONE must leave the OTHER intact and woken on the next on_irq.
+    // This is the multi-waker contract — clear_waker is targeted,
+    // not nuke-all.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    static WOKEN_A: AtomicU32 = AtomicU32::new(0);
+    static WOKEN_B: AtomicU32 = AtomicU32::new(0);
+
+    fn clone_a(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE_A) }
+    fn wake_a(_: *const ()) { WOKEN_A.fetch_add(1, Ordering::Release); }
+    fn noop_drop(_: *const ()) {}
+    static VTABLE_A: RawWakerVTable =
+        RawWakerVTable::new(clone_a, wake_a, wake_a, noop_drop);
+
+    fn clone_b(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE_B) }
+    fn wake_b(_: *const ()) { WOKEN_B.fetch_add(1, Ordering::Release); }
+    static VTABLE_B: RawWakerVTable =
+        RawWakerVTable::new(clone_b, wake_b, wake_b, noop_drop);
+
+    WOKEN_A.store(0, Ordering::Release);
+    WOKEN_B.store(0, Ordering::Release);
+
+    let w_a = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE_A)) };
+    let w_b = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE_B)) };
+    let w_a_probe = w_a.clone();
+
+    crate::dispatch::set_waker(SCRATCH_VEC_DROP_CLEARS, w_a);
+    crate::dispatch::set_waker(SCRATCH_VEC_DROP_CLEARS, w_b);
+    // Surgical removal of A only.
+    crate::dispatch::clear_waker(SCRATCH_VEC_DROP_CLEARS, &w_a_probe);
+    crate::on_irq(SCRATCH_VEC_DROP_CLEARS);
+
+    if WOKEN_A.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("cleared waker still fired");
+    }
+    if WOKEN_B.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("co-registered waker was wiped — clear_waker nuked the list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_dispatch_clear_waker_targets_only_own);
 
 // ── vector allocator extended ─────────────────────────────────────
 

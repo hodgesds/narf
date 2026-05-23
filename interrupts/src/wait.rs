@@ -19,7 +19,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 
 use crate::dispatch::{clear_waker, fire_count, set_waker};
 
@@ -29,6 +29,7 @@ pub fn wait_for_irq(vector: u8) -> WaitForIrq {
     WaitForIrq {
         vector,
         baseline: fire_count(vector),
+        waker: None,
     }
 }
 
@@ -55,12 +56,18 @@ pub fn wait_for_irq_until(
 pub struct WaitForIrq {
     vector: u8,
     baseline: u64,
+    /// Cached clone of the waker we handed to `set_waker`. Stored so
+    /// `Drop` can pass it to `clear_waker` and remove ONLY this
+    /// future's registration — leaving other tasks parked on the
+    /// same vector (shared MSI-X / level-INTx is the common case)
+    /// untouched. `None` until the first `poll`.
+    waker: Option<Waker>,
 }
 
 impl Future for WaitForIrq {
     type Output = u64;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
         let now = fire_count(self.vector);
         if now > self.baseline {
             return Poll::Ready(now);
@@ -71,7 +78,13 @@ impl Future for WaitForIrq {
         // count will exceed baseline; or (b) fire before we install
         // the waker, in which case the second read sees the bumped
         // count and we return Ready immediately.
-        set_waker(self.vector, cx.waker().clone());
+        let w = cx.waker().clone();
+        set_waker(self.vector, w.clone());
+        // Remember our waker so Drop can clear exactly this entry.
+        // `set_waker` dedups via `will_wake`, so re-polling with the
+        // same waker is idempotent on the dispatch side; the cached
+        // copy here is just so Drop has a `&Waker` to hand back.
+        self.waker = Some(w);
         let now = fire_count(self.vector);
         if now > self.baseline {
             Poll::Ready(now)
@@ -84,7 +97,11 @@ impl Future for WaitForIrq {
 impl Drop for WaitForIrq {
     fn drop(&mut self) {
         // Avoid leaving a stale waker; otherwise the next IRQ would
-        // wake a task that's no longer interested.
-        clear_waker(self.vector);
+        // wake a task that's no longer interested. Only clear OUR
+        // waker — other tasks may share this vector (shared MSI-X /
+        // level-INTx) and their wakers must survive.
+        if let Some(w) = self.waker.as_ref() {
+            clear_waker(self.vector, w);
+        }
     }
 }

@@ -542,12 +542,24 @@ pub fn set_waker(vector: u8, w: Waker) {
     g.push(w);
 }
 
-/// Drop any waker matching `w` (by `Waker::will_wake`). Useful for
-/// cancellation when a waiter knows its own waker. Use sparingly;
-/// the standard pattern is to let the next `on_irq` clear the
-/// list.
-pub fn clear_waker(vector: u8) {
+/// Drop any waker matching `target` (by `Waker::will_wake`). Used
+/// by `WaitForIrq::Drop` so a cancelled wait only removes its OWN
+/// waker — multiple tasks sharing a vector (the standard case for
+/// shared MSI-X / level-INTx) must not have each other's wakers
+/// silently wiped when one of them drops its future.
+pub fn clear_waker(vector: u8, target: &Waker) {
     check_no_reentry("clear_waker", vector);
+    let mut g = SLOTS[vector as usize].wakers.lock();
+    g.retain(|existing| !existing.will_wake(target));
+}
+
+/// Clear ALL wakers registered on `vector`. Reserved for tear-down
+/// paths where the vector itself is being released (driver unbind,
+/// per-test cleanup) — anything still parked on it is about to lose
+/// the device anyway. Routine cancellation should go through
+/// [`clear_waker`] with the caller's own waker.
+pub fn clear_all_wakers(vector: u8) {
+    check_no_reentry("clear_all_wakers", vector);
     SLOTS[vector as usize].wakers.lock().clear();
 }
 

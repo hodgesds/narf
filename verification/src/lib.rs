@@ -5775,10 +5775,10 @@ fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
     if len > 1 {
         return TestResult::Fail("set_waker didn't dedupe — wakers list grew unbounded");
     }
-    // Cleanup: clear the registered waker so subsequent tests
+    // Cleanup: clear every registered waker so subsequent tests
     // start clean. The future is still alive in the scheduler
     // (we never fire VECTOR), but its slot will GC eventually.
-    narf_interrupts::dispatch::clear_waker(VECTOR);
+    narf_interrupts::dispatch::clear_all_wakers(VECTOR);
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

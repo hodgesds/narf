@@ -552,7 +552,11 @@ impl DriverRegistry {
             match token {
                 ReclaimToken::IdtVector(v) => {
                     narf_interrupts::dispatch::clear_handler(v);
-                    narf_interrupts::dispatch::clear_waker(v);
+                    // Driver unbind: the vector itself is being
+                    // released, so every waker still parked on it
+                    // is about to lose its device. Wipe the lot via
+                    // the tear-down helper.
+                    narf_interrupts::dispatch::clear_all_wakers(v);
                     quarantine_new.push(v);
                 }
                 ReclaimToken::MmioRange { domain, va_base, len } => {
