@@ -205,17 +205,43 @@ pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
 /// # Safety
 /// `init_bsp` must have run; caller still owns IRQ masking.
 pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
-    if !X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // x2APIC MSR path.
+        // SAFETY: APIC is enabled by init_bsp.
+        unsafe {
+            wrmsr(APIC_TIMER_DIV_MSR, DIV_16);
+            wrmsr(
+                APIC_LVT_TIMER_MSR,
+                LVT_TIMER_PERIODIC | (timer_vector as u64),
+            );
+            wrmsr(APIC_TIMER_INIT_MSR, initial_count as u64);
+        }
         return;
     }
-    // SAFETY: APIC is enabled by init_bsp.
+    // xAPIC MMIO path. Phoenix HawkPoint1 / Renoir BIOSes commonly
+    // refuse the IA32_APIC_BASE.EXTD bit, so init_bsp falls back to
+    // xAPIC mode and X2APIC_ACTIVE stays false. Without this path
+    // the LAPIC timer never starts on real silicon — `tt=0` on the
+    // status panel and every wheel-based wait wedges (panel paint
+    // task, USB supervisor, etc.) because fire_due is never called.
+    //
+    // xAPIC LAPIC timer registers (Intel SDM Vol 3 §10.5.4 / AMD
+    // APM Vol 2 §16.3.6, layout identical):
+    //   0x320  LVT_TIMER       (mask bit 16, periodic bit 17, vector low 8)
+    //   0x380  TIMER_INIT_CT
+    //   0x3E0  TIMER_DIVIDE_CONF
+    let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
+    let init_ct = (XAPIC_MMIO_BASE + 0x380) as *mut u32;
+    let div_conf = (XAPIC_MMIO_BASE + 0x3E0) as *mut u32;
+    // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB) per init_bsp
+    // contract. Writes are aligned 32-bit to architected registers.
     unsafe {
-        wrmsr(APIC_TIMER_DIV_MSR, DIV_16);
-        wrmsr(
-            APIC_LVT_TIMER_MSR,
-            LVT_TIMER_PERIODIC | (timer_vector as u64),
+        core::ptr::write_volatile(div_conf, DIV_16 as u32);
+        core::ptr::write_volatile(
+            lvt_timer,
+            (LVT_TIMER_PERIODIC as u32) | (timer_vector as u32),
         );
-        wrmsr(APIC_TIMER_INIT_MSR, initial_count as u64);
+        core::ptr::write_volatile(init_ct, initial_count);
     }
 }
 
@@ -224,10 +250,21 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
 /// # Safety
 /// `init_bsp` must have run.
 pub unsafe fn stop_timer() {
-    // SAFETY: APIC is enabled.
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: APIC is enabled.
+        unsafe {
+            wrmsr(APIC_TIMER_INIT_MSR, 0);
+            wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
+        }
+        return;
+    }
+    // xAPIC MMIO path — mirror of start_timer's fallback.
+    let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
+    let init_ct = (XAPIC_MMIO_BASE + 0x380) as *mut u32;
+    // SAFETY: same as start_timer.
     unsafe {
-        wrmsr(APIC_TIMER_INIT_MSR, 0);
-        wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
+        core::ptr::write_volatile(init_ct, 0);
+        core::ptr::write_volatile(lvt_timer, LVT_MASKED as u32);
     }
 }
 
