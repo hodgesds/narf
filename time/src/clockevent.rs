@@ -164,19 +164,40 @@ pub fn register(dev: &'static dyn ClockEvent) {
 /// trap-handler fail-safe (`fire_due` on every IRQ) is the
 /// fallback in that case.
 pub fn select_primary(hz: u32, vector: u8) -> Option<&'static dyn ClockEvent> {
+    use core::fmt::Write as _;
     let snapshot: [Option<&'static dyn ClockEvent>; MAX_BACKENDS] = *REGISTRY.lock();
     for (idx, slot) in snapshot.iter().enumerate() {
         let Some(dev) = slot else { continue; };
         if !dev.supported() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  clockevent: '{}' unsupported (skipped)",
+                dev.name()
+            );
             continue;
         }
         // SAFETY: select_primary runs once at boot from BSP; no
         // other agent is touching backend MMIO.
         let arm_res = unsafe { dev.arm_periodic(hz, vector) };
-        if arm_res.is_err() {
+        if let Err(e) = arm_res {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  clockevent: '{}' arm_periodic failed: {:?}",
+                dev.name(),
+                e
+            );
             continue;
         }
+        let baseline = dev.tick_count();
         if !probe_fires(*dev) {
+            let after = dev.tick_count();
+            let _ = writeln!(
+                narf_console::Writer,
+                "  clockevent: '{}' armed but probe fired 0 ticks (was {}, now {}) — IRQ not delivered",
+                dev.name(),
+                baseline,
+                after
+            );
             // SAFETY: same.
             unsafe { dev.disarm(); }
             continue;

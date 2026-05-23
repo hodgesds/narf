@@ -1397,10 +1397,77 @@ pub fn run_until_empty() {
         }
 
         if ready_this_round == 0 {
-            // Polled some Pending tasks but nothing self-woke and
-            // nothing completed; idle until an IRQ delivers a wake.
-            narf_arch::halt_until_irq();
+            // Idle path. Conservative on real hardware: trust the
+            // wheel's deadline rather than `halt_until_irq` alone.
+            //
+            // Old behaviour: `halt_until_irq` and wait for a tick
+            // IRQ to wake us. On hardware where the tick source
+            // (LAPIC timer / HPET) doesn't actually deliver IRQs
+            // for our allocated vectors — observed on AMD Renoir
+            // 4700U: LAPIC vec 32 silently dropped, HPET via IOAPIC
+            // also dropped — every Pending task with a wheel
+            // deadline wedges forever.
+            //
+            // New behaviour: when the wheel has a pending deadline,
+            // TSC-busy-poll `fire_due` up to that deadline (waking
+            // the moment its waker's set), then loop. When the
+            // wheel is empty, halt cleanly — no work to do, an
+            // external IRQ is the only thing that can deliver new
+            // work. The CPU-busy phase is bounded by the next
+            // deadline (typically ms-scale).
+            match narf_time::timer_wheel::next_deadline_cycles() {
+                Some(deadline) => {
+                    // Bound the busy phase: spin until the deadline
+                    // passes OR an IRQ fires (interrupts are still
+                    // enabled, so any IRQ also calls fire_due via
+                    // the trap-handler fail-safe and updates the
+                    // wheel).
+                    let start = narf_time::now_cycles();
+                    while narf_time::now_cycles() < deadline {
+                        let _ = narf_time::timer_wheel::fire_due(
+                            narf_time::now_cycles(),
+                        );
+                        // Bail out if any task became ready (an
+                        // IRQ-driven wake fired during the spin).
+                        if local_ready_count(cpu) > 0 {
+                            break;
+                        }
+                        // Bound any single spin burst to ~1 ms of
+                        // TSC progression so we don't get stuck if
+                        // a deadline gets pushed back via
+                        // refresh_waker mid-spin (cpns=2 → 2M
+                        // cycles = 1 ms wall).
+                        let elapsed = narf_time::now_cycles().wrapping_sub(start);
+                        if elapsed > 2_000_000 {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
+                    // Final fire_due after the spin in case the
+                    // deadline passed in our last iteration.
+                    let _ = narf_time::timer_wheel::fire_due(
+                        narf_time::now_cycles(),
+                    );
+                }
+                None => {
+                    // Wheel empty + no ready tasks + no steal
+                    // target. Nothing the executor can do — wait
+                    // for an external IRQ to deliver new work.
+                    narf_arch::halt_until_irq();
+                }
+            }
         }
+    }
+}
+
+/// Number of slots whose `awake` flag is currently set on `cpu`.
+/// Used by the idle path to bail out of TSC busy-poll when an IRQ
+/// wakes something during the spin.
+fn local_ready_count(cpu: usize) -> usize {
+    let q = READY[cpu].lock();
+    match q.as_ref() {
+        Some(d) => d.iter().filter(|s| s.awake.load(Ordering::Acquire)).count(),
+        None => 0,
     }
 }
 
