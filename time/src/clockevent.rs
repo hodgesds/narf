@@ -22,9 +22,28 @@
 //! local timer stops in deep C-states). Phase 6 of the bring-up plan
 //! lands per-CPU + broadcast on top of this trait.
 
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
+
+/// Whether a clockevent device fires once per CPU (LAPIC) or
+/// globally (HPET, PIT, ACPI PM Timer). Drives the tick-broadcast
+/// machinery: per-CPU devices auto-tick their own CPU; shared
+/// devices iterate the broadcast mask and IPI listed CPUs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClockEventKind {
+    /// One instance per CPU; each CPU's own local timer fires its
+    /// own IRQ. Selected device is implicitly "for this CPU" only.
+    /// LAPIC timer is the canonical example.
+    PerCpu,
+    /// One physical device; can only generate one tick stream at
+    /// a time. Used as a tick-broadcast source — when a CPU's
+    /// per-CPU clockevent is broken or stops in deep C-states,
+    /// register that CPU into the broadcast mask and the shared
+    /// device IPIs it on every tick. HPET / PIT / ACPI PM-Timer
+    /// are the canonical examples.
+    Shared,
+}
 
 /// A periodic tick source. The kernel arms one of these at boot
 /// to drive the timer wheel + scheduler preemption.
@@ -65,6 +84,12 @@ pub trait ClockEvent: Sync + Send {
     /// 54.9 ms) are deprioritised by `select_primary` against
     /// higher-resolution ones (LAPIC at <1 µs).
     fn resolution_ns(&self) -> u64;
+
+    /// Per-CPU or shared. Drives the tick-broadcast machinery.
+    /// Default `Shared` — most non-LAPIC tick sources are global.
+    fn kind(&self) -> ClockEventKind {
+        ClockEventKind::Shared
+    }
 }
 
 /// Why arming failed.
@@ -176,12 +201,74 @@ pub fn primary() -> Option<&'static dyn ClockEvent> {
 /// IRQ matching [`TICK_VECTOR`] fires. Advances the timer wheel
 /// — the backend's own ISR already incremented its `tick_count`.
 ///
+/// For a `Shared` clockevent, also drives the broadcast machinery:
+/// iterates [`BROADCAST_MASK`] and invokes the broadcast sender
+/// hook (installed via [`set_broadcast_sender`]) to deliver an
+/// IPI at [`TICK_VECTOR`] to each registered CPU. This is how
+/// CPUs whose per-CPU LAPIC timer is broken (or stopped in deep
+/// C-states) still get scheduler / wheel ticks.
+///
 /// Called with IF=0 (trap context) and the backend's per-vector
 /// dispatch lock NOT held; safe to call from any IRQ handler.
 #[inline]
 pub fn on_tick() {
     let now = crate::now_cycles();
     let _ = crate::timer_wheel::fire_due(now);
+    // Broadcast to CPUs in BROADCAST_MASK if a sender's installed.
+    // No-op until SMP wires `set_broadcast_sender` + per-CPU
+    // registration. Single-CPU NARF: mask is always 0, no-op.
+    let mask = BROADCAST_MASK.load(Ordering::Acquire);
+    if mask != 0 {
+        let sender = BROADCAST_SENDER.load(Ordering::Acquire);
+        if sender != 0 {
+            let vector = TICK_VECTOR.load(Ordering::Acquire);
+            // SAFETY: sender was installed via set_broadcast_sender
+            // which takes a real `BroadcastSender` (fn-pointer
+            // typed). The transmute reverses that.
+            let f: BroadcastSender = unsafe { core::mem::transmute(sender) };
+            f(mask, vector);
+        }
+    }
+}
+
+/// Function signature for the broadcast IPI sender. Takes the
+/// CPU mask (bit N = CPU N) and the vector to deliver. Backend-
+/// specific implementation: on x86_64 x2APIC, iterates set bits,
+/// composes ICR for each, writes APIC_ICR_MSR.
+pub type BroadcastSender = fn(cpu_mask: u64, vector: u8);
+
+/// Storage for the broadcast IPI sender's fn-pointer-as-usize.
+/// 0 = not installed. Set via [`set_broadcast_sender`] from the
+/// platform init code that has access to APIC ICR writes.
+static BROADCAST_SENDER: AtomicUsize = AtomicUsize::new(0);
+
+/// CPU mask of cores that depend on tick broadcast (their own
+/// per-CPU clockevent is unreliable or unselected). Each set bit
+/// receives an IPI at [`TICK_VECTOR`] on every shared-clockevent
+/// tick. Bit N = CPU N. Up to 64 CPUs in this initial design;
+/// upsize to AtomicBitset for >64 once that's a concern.
+pub static BROADCAST_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Install the per-arch broadcast IPI sender. Called once at
+/// boot from the arch-specific init path (currently
+/// `narf_interrupts::x86_64::apic::init_bsp`'s tail when x2APIC
+/// is up).
+pub fn set_broadcast_sender(f: BroadcastSender) {
+    BROADCAST_SENDER.store(f as usize, Ordering::Release);
+}
+
+/// Register CPU `n` as needing tick broadcast. Idempotent.
+/// Future: called by per-CPU init when its local clockevent's
+/// probe fails OR when it enters a sleep state that stops its
+/// LAPIC timer.
+pub fn broadcast_register(cpu: u8) {
+    BROADCAST_MASK.fetch_or(1u64 << (cpu as u32 & 63), Ordering::Release);
+}
+
+/// Unregister CPU `n` from broadcast. Called when its local
+/// clockevent is restored / re-armed.
+pub fn broadcast_unregister(cpu: u8) {
+    BROADCAST_MASK.fetch_and(!(1u64 << (cpu as u32 & 63)), Ordering::Release);
 }
 
 /// Verification probe. Arms the device, spins ~50 ms via TSC,

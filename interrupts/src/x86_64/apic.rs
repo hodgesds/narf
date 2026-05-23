@@ -116,6 +116,10 @@ pub unsafe fn init_bsp() {
         return;
     }
     X2APIC_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+    // Wire the clockevent broadcast IPI sender so a `Shared`
+    // primary (e.g. HPET) can deliver ticks to CPUs registered
+    // in BROADCAST_MASK.
+    narf_time::clockevent::set_broadcast_sender(x2apic_broadcast);
 
     // Spurious-interrupt vector register: enable + vector 0xFF for
     // stray interrupts. Bit 8 = software enable.
@@ -318,6 +322,47 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
     fn resolution_ns(&self) -> u64 {
         // Post-divide 6.25 MHz ≈ 160 ns per tick.
         160
+    }
+
+    fn kind(&self) -> narf_time::clockevent::ClockEventKind {
+        // LAPIC timer fires PER CPU — each core has its own.
+        narf_time::clockevent::ClockEventKind::PerCpu
+    }
+}
+
+/// Broadcast IPI sender for x2APIC. Installed once at boot via
+/// `clockevent::set_broadcast_sender`. Iterates set bits in
+/// `cpu_mask`, composes an x2APIC ICR for each, writes
+/// APIC_ICR_MSR to deliver a fixed-vector IPI at `vector`.
+///
+/// ICR field layout (Intel SDM Vol 3 §10.12.10):
+///   [7:0]    Vector
+///   [10:8]   Delivery Mode (000 = Fixed)
+///   [11]     Destination Mode (0 = Physical)
+///   [14]     Level (1 = assert; 0 for INIT-deassert only)
+///   [15]     Trigger Mode (0 = edge)
+///   [19:18]  Dest Shorthand (00 = no shorthand, use [63:32])
+///   [63:32]  Destination APIC ID (x2APIC: full 32-bit)
+fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
+    if !X2APIC_ACTIVE.load(Ordering::Acquire) {
+        // xAPIC fallback not implemented yet — broadcast becomes
+        // a no-op. CPUs in the mask don't get external ticks; if
+        // their local clockevent is also dead they wedge. Future
+        // work: program ICR via MMIO at XAPIC_MMIO_BASE+0x310.
+        return;
+    }
+    let mut m = cpu_mask;
+    while m != 0 {
+        let cpu = m.trailing_zeros() as u32;
+        m &= m - 1;
+        // Fixed delivery, edge-triggered, level-assert,
+        // physical destination, no shorthand. Dest in high
+        // 32 bits (x2APIC full APIC ID).
+        let icr: u64 = (vector as u64)
+            | (1u64 << 14)             // level = assert
+            | ((cpu as u64) << 32);    // destination APIC id
+        // SAFETY: x2APIC confirmed active above.
+        unsafe { wrmsr_icr(icr); }
     }
 }
 
