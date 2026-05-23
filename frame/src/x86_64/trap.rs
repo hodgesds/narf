@@ -176,18 +176,40 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // Bypasses the probe-catch path — probes are for catching CPU
     // *exceptions* (vectors 0..=31), not asynchronous IRQs.
     if frame.vector >= 32 {
-        if frame.vector == 32 {
-            narf_interrupts::x86_64::apic::on_timer_tick();
+        // Tick-source dispatch. The clockevent registry publishes
+        // `TICK_VECTOR` when `select_primary` succeeds — that's
+        // the IRQ vector the selected backend delivers on.
+        // LAPIC: vector 32. HPET: dynamically-allocated, typically
+        // ≥48. Both flow through `on_tick` which increments the
+        // selected device's tick_count AND fires the wheel.
+        //
+        // Backward compat: if TICK_VECTOR is 0 (no backend
+        // selected — degraded mode), still treat vector 32 as the
+        // LAPIC tick on the assumption the legacy direct
+        // start_timer path is in use.
+        let tick_vector = narf_time::clockevent::TICK_VECTOR
+            .load(core::sync::atomic::Ordering::Acquire);
+        let is_tick = if tick_vector != 0 {
+            frame.vector as u8 == tick_vector
+        } else {
+            frame.vector == 32
+        };
+        if is_tick {
+            // LAPIC backend still wants its own TIMER_TICKS bump
+            // — keep the on_timer_tick call so existing
+            // diagnostics (`apic::timer_ticks()`) still work.
+            // For HPET the backend ISR handles its own counter
+            // already; double-counting LAPIC isn't a concern
+            // because tick_vector == 32 only when LAPIC is the
+            // selected backend.
+            if tick_vector == 32 || (tick_vector == 0 && frame.vector == 32) {
+                narf_interrupts::x86_64::apic::on_timer_tick();
+            }
         }
-        // Fail-safe wheel tick: any IRQ that fires advances the
-        // timer wheel. On Phoenix HawkPoint1 the LAPIC timer is
-        // armed (LVT_TIMER readback confirms periodic + vector)
-        // but IRQs at vector 32 never reach this handler — so
-        // tt stays 0 and every wheel-based wait wedges forever.
-        // Riding the wheel on whatever IRQs the platform DOES
-        // deliver (HPET, xHCI, NIC, ACPI SCI) unwedges the
-        // executor even when LAPIC-timer delivery is broken.
-        // No-op if there's nothing due.
+        // Fail-safe wheel tick: every IRQ advances the wheel.
+        // Defensive — even when a primary clockevent is selected
+        // and firing correctly, no harm done to fire_due on
+        // peer IRQs (it's a no-op when nothing is due).
         let now = narf_time::now_cycles();
         let _ = narf_time::timer_wheel::fire_due(now);
         narf_interrupts::on_irq(frame.vector as u8);
@@ -195,7 +217,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         unsafe {
             narf_interrupts::eoi();
         }
-        if frame.vector == 32 {
+        if is_tick {
             // Preemption hook for stackful kernel tasks. Runs AFTER
             // EOI so that yielding to the executor doesn't leave
             // the LAPIC's in-service bit set; subsequent timer

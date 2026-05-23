@@ -98,10 +98,29 @@ pub struct TrapFrame {
 /// CPU long enough to be visible.
 pub const DEFAULT_SLICE_CYCLES: u64 = 33_000_000;
 
-/// Vector the trap handler dispatches preemption on. Matches
-/// `narf_interrupts::VECTOR_TIMER` (32) — re-declared here to
-/// avoid the dep cycle.
+/// Default vector the trap handler dispatches preemption on.
+/// Matches `narf_interrupts::VECTOR_TIMER` (32) — re-declared
+/// here to avoid the dep cycle. With the clockevent registry
+/// (Phase 3) the actual tick vector is read at runtime from
+/// `narf_time::clockevent::TICK_VECTOR`; this constant is the
+/// fallback used when no backend has been selected yet (early
+/// boot, legacy paths).
 pub const PREEMPT_VECTOR: u64 = 32;
+
+/// Read the selected tick vector at runtime. Falls back to
+/// `PREEMPT_VECTOR` (32) when no clockevent backend has been
+/// selected yet — preserves pre-Phase-3 behaviour during early
+/// boot and on platforms where the registry isn't yet wired.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn current_preempt_vector() -> u64 {
+    let v = narf_time::clockevent::TICK_VECTOR.load(Ordering::Acquire);
+    if v == 0 {
+        PREEMPT_VECTOR
+    } else {
+        v as u64
+    }
+}
 
 /// Default per-task kernel stack size. 16 KiB matches the TSS.rsp0
 /// stack the kernel uses for user→kernel trap entry; deep enough
@@ -570,7 +589,7 @@ const fn cpl_zero(cs: u64) -> bool {
 ///   fire until the LAPIC's in-service bit clears.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
-    if frame.vector != PREEMPT_VECTOR {
+    if frame.vector != current_preempt_vector() {
         return false;
     }
     if !cpl_zero(frame.cs) {
