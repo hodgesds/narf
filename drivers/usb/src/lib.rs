@@ -134,6 +134,18 @@ fn spawn_supervisor_task() {
         let mut claimed_root: u128 = 0;
         // Per-root-port consecutive-failure counter.
         let mut root_fail_count = [0u8; 128];
+        // Cursor into the connected-ports list — try ONE port per
+        // loop iteration, then advance + pump + sleep. The earlier
+        // "for &p in &connected_root" body ran try_attach_root for
+        // every connected port BEFORE pump_all, so the first
+        // iteration on a laptop with N connected ports took N ×
+        // (~430ms port_reset + several × ~250ms command waits) =
+        // multiple seconds wall-clock with sup-ticks stuck at 1.
+        // Moving to one-port-per-iteration: sup-ticks advances
+        // visibly, pump_all runs after every port attempt, and a
+        // long-stalling port can't starve pump_all for other,
+        // already-bound devices.
+        let mut next_root_idx: usize = 0;
         loop {
             SUPERVISOR_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             SUPERVISOR_PHASE.store(1, core::sync::atomic::Ordering::Relaxed);
@@ -155,12 +167,18 @@ fn spawn_supervisor_task() {
                 irq_vector = c.irq_vector;
             }
 
-            // ── Phase 1: root-hub ports ────────────────────────────
+            // ── Phase 1: try ONE root-hub port, then move on. ──────
             SUPERVISOR_PHASE.store(3, core::sync::atomic::Ordering::Relaxed);
             let connected_root: alloc::vec::Vec<u8> =
                 c.connected_ports().iter().map(|(p, _)| *p).collect();
             SUPERVISOR_PHASE.store(4, core::sync::atomic::Ordering::Relaxed);
-            for &p in &connected_root {
+            // Find the next unbound, not-yet-burned port starting
+            // from `next_root_idx`. Wrap at end so on later passes
+            // we revisit ports whose `root_fail_count` reset.
+            let mut attempted = false;
+            for step in 0..connected_root.len() {
+                let idx = (next_root_idx + step) % connected_root.len();
+                let p = connected_root[idx];
                 let bit = 1u128 << (p as u32 & 127);
                 let pi = (p as usize) & 127;
                 if claimed_root & bit != 0 {
@@ -190,6 +208,14 @@ fn spawn_supervisor_task() {
                         root_fail_count[pi] = root_fail_count[pi].saturating_add(1);
                     }
                 }
+                next_root_idx = idx + 1;
+                attempted = true;
+                break;
+            }
+            if !attempted && !connected_root.is_empty() {
+                // All ports either bound or burned out; reset
+                // cursor so a hot-plug rescan still happens.
+                next_root_idx = 0;
             }
 
             // ── Phase 2: walk every bound hub's downstream ports ───
