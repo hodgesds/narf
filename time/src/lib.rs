@@ -358,10 +358,55 @@ pub async fn poll_bit_async<F: FnMut() -> bool>(
     }
 }
 
+/// Which calibration source produced the most-recent TSC Hz. Set
+/// by [`calibrate_clocks`] / [`calibrate_clocks_with_source`] so
+/// the early-boot console line can show *how* the platform's clock
+/// got its number, not just that it did. Real-HW bring-up wants
+/// this — a Zen4 laptop should land on `AmdPstate0`, not
+/// `HpetXcheck` (the HPET reading is unreliable on Phoenix
+/// HawkPoint1 under SMM activity).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CalibrationSource {
+    /// Cached value from a prior call.
+    Cached,
+    /// Intel CPUID 0x15 (TSC / crystal clock ratio) — most
+    /// accurate on Skylake+ with a non-zero crystal.
+    CpuId15h,
+    /// Intel CPUID 0x16 (processor base frequency, MHz). Coarser
+    /// than 0x15 (rounded to MHz) but available without the
+    /// crystal entry.
+    CpuId16h,
+    /// AMD `MSR_AMD_PSTATE_DEF_0` (`Core::X86::Msr::PStateDef`)
+    /// decode. Used on Zen2 / Zen3 / Zen4 / Zen5 where Intel
+    /// CPUID leaves are not populated.
+    AmdPstate0,
+    /// HPET cross-check (`Δtsc / Δhpet * hpet_hz`). Works on any
+    /// chipset with a functioning HPET; unreliable on some
+    /// laptops (Phoenix HawkPoint1).
+    HpetXcheck,
+    /// Every source failed — kernel is running in raw-cycle units.
+    None,
+}
+
+impl CalibrationSource {
+    /// Short human-readable name for boot-log lines.
+    pub const fn name(self) -> &'static str {
+        match self {
+            CalibrationSource::Cached => "cached",
+            CalibrationSource::CpuId15h => "cpuid-15h",
+            CalibrationSource::CpuId16h => "cpuid-16h",
+            CalibrationSource::AmdPstate0 => "amd-pstate0",
+            CalibrationSource::HpetXcheck => "hpet-xcheck",
+            CalibrationSource::None => "none",
+        }
+    }
+}
+
 /// One-shot boot-time clock calibration. Picks the best TSC-Hz
-/// estimate available — Intel CPUID 0x15 / 0x16 first, then a
-/// HPET cross-check — and pushes the resulting cycles-per-ns into
-/// the wall module so `monotonic_ns()` reports real nanoseconds
+/// estimate available — Intel CPUID 0x15 / 0x16, then AMD
+/// `MSR_AMD_PSTATE_DEF_0` for Family 0x17+, then a HPET
+/// cross-check — and pushes the resulting cycles-per-ns into the
+/// wall module so `monotonic_ns()` reports real nanoseconds
 /// instead of raw TSC ticks. Returns the chosen TSC Hz, or 0 if
 /// every source failed (in which case `cycles_per_ns` stays at 1
 /// and timing remains in raw-tick units — better than panicking).
@@ -369,43 +414,80 @@ pub async fn poll_bit_async<F: FnMut() -> bool>(
 /// HPET must already be `init`'d when this is called for the
 /// HPET fallback to fire. Idempotent: subsequent calls return the
 /// cached frequency without re-measuring.
+///
+/// Callers that want to know *which* source produced the Hz value
+/// (e.g. for a boot-log line) should call
+/// [`calibrate_clocks_with_source`] instead.
 #[cfg(target_arch = "x86_64")]
 pub fn calibrate_clocks() -> u64 {
+    calibrate_clocks_with_source().0
+}
+
+/// Variant of [`calibrate_clocks`] that also reports which path
+/// produced the Hz value. On a Zen4 laptop the expected outcome
+/// is `(non-zero, CalibrationSource::AmdPstate0)`; on a Skylake
+/// desktop `(non-zero, CalibrationSource::CpuId15h)`; on a
+/// virtualised host that masks AMD MSRs, `(non-zero,
+/// CalibrationSource::HpetXcheck)`. `(0, CalibrationSource::None)`
+/// indicates total failure — `cycles_per_ns` stays at the default
+/// `1` and `Deadline::after_ms` will fire late rather than early.
+#[cfg(target_arch = "x86_64")]
+pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     let cached = narf_arch::x86_64::tsc::frequency_hz();
     if cached != 0 {
-        return cached;
+        return (cached, CalibrationSource::Cached);
     }
-    // CPUID-driven path. When 0x15 returns a non-zero crystal
-    // frequency this is the most accurate source we have; 0x16's
-    // base-frequency-in-MHz is coarser (rounded to MHz) but still
-    // beats nominal.
-    let mut hz = narf_arch::x86_64::tsc::calibrate_via_cpuid();
-    if hz == 0 {
-        // CPUID gave us nothing — fall back to the HPET cross-check.
-        // A 100 ms window at the ~14.318 MHz HPET found on every
-        // x86_64 chipset since ICH = ~1.43M ticks; bumps to whatever
-        // the actual HPET reports if higher (some Coffee Lake parts
-        // run HPET at 24 MHz).
-        let hpet_hz = hpet::frequency_hz();
-        if hpet_hz != 0 {
-            let window = (hpet_hz / 10).max(1); // ~100 ms
-            if let Some(measured) = hpet::calibrate_tsc_via_hpet(window) {
-                narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
-                hz = measured;
-            }
+    // 1. Intel CPUID 0x15. When the leaf populates a non-zero
+    //    crystal-Hz this is the most accurate source we have.
+    let hz_15h = narf_arch::x86_64::tsc::__from_cpuid_15h();
+    if let Some(hz) = hz_15h {
+        narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
+        apply_cycles_per_ns(hz);
+        return (hz, CalibrationSource::CpuId15h);
+    }
+    // 2. Intel CPUID 0x16 (processor base frequency MHz). Coarser
+    //    but available when 0x15's crystal is zero.
+    let hz_16h = narf_arch::x86_64::tsc::__from_cpuid_16h();
+    if let Some(hz) = hz_16h {
+        narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
+        apply_cycles_per_ns(hz);
+        return (hz, CalibrationSource::CpuId16h);
+    }
+    // 3. AMD MSR_PSTATE0. Family 0x17+ doesn't populate the
+    //    Intel CPUID leaves; the P-state-0 MSR has the boost
+    //    clock, which the invariant TSC matches.
+    let hz_amd = narf_arch::x86_64::tsc::calibrate_via_amd_pstate0();
+    if hz_amd != 0 {
+        narf_arch::x86_64::tsc::set_hz_via_hpet(hz_amd);
+        apply_cycles_per_ns(hz_amd);
+        return (hz_amd, CalibrationSource::AmdPstate0);
+    }
+    // 4. HPET cross-check. A 100 ms window at the ~14.318 MHz
+    //    HPET found on every x86_64 chipset since ICH = ~1.43M
+    //    ticks; bumps to whatever the actual HPET reports if
+    //    higher (some Coffee Lake parts run HPET at 24 MHz).
+    let hpet_hz = hpet::frequency_hz();
+    if hpet_hz != 0 {
+        let window = (hpet_hz / 10).max(1); // ~100 ms
+        if let Some(measured) = hpet::calibrate_tsc_via_hpet(window) {
+            narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
+            apply_cycles_per_ns(measured);
+            return (measured, CalibrationSource::HpetXcheck);
         }
     }
-    if hz != 0 {
-        // wall::set_cycles_per_ns clamps to >= 1, so the divide in
-        // monotonic_ns is safe. Round down: a fractional Hz/ns
-        // ratio (e.g., 3.5 GHz → 3 cycles/ns) makes monotonic_ns
-        // report time slightly faster than reality, which is
-        // preferable to slightly slower (timeouts fire early
-        // rather than late).
-        let cpns = (hz / 1_000_000_000).max(1) as u32;
-        wall::set_cycles_per_ns(cpns);
-    }
-    hz
+    (0, CalibrationSource::None)
+}
+
+/// Push `hz` into the wall module as `cycles_per_ns` (clamped to
+/// ≥ 1). Rounds *down*: a fractional Hz/ns ratio (e.g. 3.5 GHz →
+/// 3 cycles/ns) makes `monotonic_ns` report time slightly faster
+/// than reality, which is preferable to slower — timeouts fire
+/// early rather than late on a system where calibration was a
+/// hair off.
+#[cfg(target_arch = "x86_64")]
+fn apply_cycles_per_ns(hz: u64) {
+    let cpns = (hz / 1_000_000_000).max(1) as u32;
+    wall::set_cycles_per_ns(cpns);
 }
 
 /// aarch64 calibrate_clocks stub. The Generic Timer's

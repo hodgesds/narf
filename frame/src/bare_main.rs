@@ -2287,13 +2287,14 @@ fn run_async_demo() -> ! {
                 let _ = writeln!(console::Writer, "  hpet: probe failed: {e:?}");
             }
         }
-        let tsc_hz = narf_time::calibrate_clocks();
+        let (tsc_hz, tsc_src) = narf_time::calibrate_clocks_with_source();
         if tsc_hz != 0 {
             let _ = writeln!(
                 console::Writer,
-                "  tsc: calibrated to {} MHz ({} cyc/ns)",
+                "  tsc: calibrated to {} MHz ({} cyc/ns) via {}",
                 tsc_hz / 1_000_000,
-                (tsc_hz / 1_000_000_000).max(1)
+                (tsc_hz / 1_000_000_000).max(1),
+                tsc_src.name(),
             );
         } else {
             let _ = writeln!(
