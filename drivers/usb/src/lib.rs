@@ -325,6 +325,19 @@ fn spawn_supervisor_task() {
             // never gets suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
+            // One-line klog trace per completed iteration so a
+            // wedged sub-await is distinguishable from "panel
+            // shows a stale read." Lands in the FB panel's klog
+            // tail; if absent, the supervisor genuinely never
+            // returns to the top of the loop.
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  usb-sup: cycle done, ticks={}",
+                    SUPERVISOR_TICKS.load(core::sync::atomic::Ordering::Relaxed),
+                );
+            }
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
             //       endpoint or a Port Status Change Event (hot-plug),
