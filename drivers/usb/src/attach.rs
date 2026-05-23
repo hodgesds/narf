@@ -159,7 +159,7 @@ pub fn mark_port_activity(parent_hub_idx: usize, port: u8) {
 /// (the device is still bound, just gated); the supervisor's
 /// next-resume hook (a class driver requesting a transfer) calls
 /// [`resume_port`] which clears the suspend bit on the hub side.
-pub fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
+pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
     let now = narf_time::monotonic_ns();
     // Snapshot under the lock, dispatch outside so control
     // transfers (which can sleep) don't hold the registry lock.
@@ -190,19 +190,17 @@ pub fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
     };
     let mut suspended = 0;
     for (idx, p) in &work {
-        let slot_id = {
+        // Snapshot the bound hub out of the registry lock so we don't
+        // hold the IrqSafeSpinLock across the .await.
+        let hub_copy: Option<crate::hub::UsbHub> = {
             let g = HUBS.lock();
-            g.get(*idx).map(|h| h.hub.slot_id())
+            g.get(*idx).map(|h| h.hub)
         };
-        if slot_id.is_none() {
-            continue;
-        }
-        // Issue SET_FEATURE(PORT_SUSPEND).
-        let r = {
-            let g = HUBS.lock();
-            g.get(*idx).map(|h| h.hub.port_suspend(xhci_dev, *p))
+        let h = match hub_copy {
+            Some(h) => h,
+            None => continue,
         };
-        if matches!(r, Some(Ok(()))) {
+        if h.port_suspend(xhci_dev, *p).await.is_ok() {
             let mut g = HUBS.lock();
             if let Some(h) = g.get_mut(*idx) {
                 h.suspended_downstream |= 1u64 << (*p as u32 & 63);
@@ -217,22 +215,22 @@ pub fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
 /// class driver before it issues the next transfer that would
 /// otherwise return NAK on a gated D+/D- pair. Idempotent:
 /// no-op if the port wasn't suspended.
-pub fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, port: u8) {
+pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, port: u8) {
     let bit = 1u64 << (port as u32 & 63);
-    let suspended = {
+    let hub_copy: Option<crate::hub::UsbHub> = {
         let g = HUBS.lock();
-        g.get(parent_hub_idx)
-            .map_or(false, |h| h.suspended_downstream & bit != 0)
+        match g.get(parent_hub_idx) {
+            Some(h) if h.suspended_downstream & bit != 0 => Some(h.hub),
+            _ => None,
+        }
     };
-    if !suspended {
-        return;
-    }
-    // Issue CLEAR_FEATURE(PORT_SUSPEND) + ack the change bit.
-    let r = {
-        let g = HUBS.lock();
-        g.get(parent_hub_idx).map(|h| h.hub.port_resume(xhci_dev, port))
+    let h = match hub_copy {
+        Some(h) => h,
+        None => return,
     };
-    if matches!(r, Some(Ok(()))) {
+    // Issue CLEAR_FEATURE(PORT_SUSPEND) + ack the change bit without
+    // holding the registry lock across the .await.
+    if h.port_resume(xhci_dev, port).await.is_ok() {
         let mut g = HUBS.lock();
         if let Some(h) = g.get_mut(parent_hub_idx) {
             h.suspended_downstream &= !bit;
@@ -246,7 +244,7 @@ pub fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, port: u8
 /// Drive enumeration for a device on root-hub `port`. Returns the
 /// outcome so the supervisor can update its claimed-bitmask state.
 /// Slot is freed on failure (UnknownClass / class-driver error).
-pub fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
+pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
     // port_reset → enable_slot → address_device (root-hub topology).
     // Each step runs against the controller's PORTSC register set.
     if xhci_dev.port_reset(port).is_err() {
@@ -256,22 +254,22 @@ pub fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
         Some(s) => s,
         None => return AttachOutcome::UnknownClass,
     };
-    let slot_id = match xhci_dev.enable_slot() {
+    let slot_id = match xhci_dev.enable_slot().await {
         Ok(s) => s,
         Err(_) => return AttachOutcome::UnknownClass,
     };
-    if xhci_dev.address_device(slot_id, port, speed).is_err() {
-        let _ = xhci_dev.disable_slot(slot_id);
+    if xhci_dev.address_device(slot_id, port, speed).await.is_err() {
+        let _ = xhci_dev.disable_slot(slot_id).await;
         return AttachOutcome::UnknownClass;
     }
-    dispatch_after_address(xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port)
+    dispatch_after_address(xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port).await
 }
 
 /// Drive enumeration for a device on `hub_port` of an already-bound
 /// `parent`. Uses the hub-class request `port_reset` + the
 /// topology-aware `address_device_with`. Returns the outcome and the
 /// caller updates `parent.bound_downstream` on success.
-pub fn try_attach_via_hub(
+pub async fn try_attach_via_hub(
     xhci_dev: &Xhci,
     parent: &UsbHub,
     parent_route: u32,
@@ -279,14 +277,14 @@ pub fn try_attach_via_hub(
     parent_root_port: u8,
     hub_port: u8,
 ) -> AttachOutcome {
-    if parent.port_reset(xhci_dev, hub_port).is_err() {
+    if parent.port_reset(xhci_dev, hub_port).await.is_err() {
         return AttachOutcome::UnknownClass;
     }
-    let speed = match parent.port_speed(xhci_dev, hub_port) {
+    let speed = match parent.port_speed(xhci_dev, hub_port).await {
         Ok(s) => s,
         Err(_) => return AttachOutcome::UnknownClass,
     };
-    let slot_id = match xhci_dev.enable_slot() {
+    let slot_id = match xhci_dev.enable_slot().await {
         Ok(s) => s,
         Err(_) => return AttachOutcome::UnknownClass,
     };
@@ -312,9 +310,10 @@ pub fn try_attach_via_hub(
     }
     if xhci_dev
         .address_device_with(slot_id, parent_root_port, speed, topology)
+        .await
         .is_err()
     {
-        let _ = xhci_dev.disable_slot(slot_id);
+        let _ = xhci_dev.disable_slot(slot_id).await;
         return AttachOutcome::UnknownClass;
     }
     dispatch_after_address(
@@ -325,12 +324,13 @@ pub fn try_attach_via_hub(
         topology.route_string,
         parent_root_port,
     )
+    .await
 }
 
 /// Free function so the dispatcher logic stays one place. `port` is
 /// the per-hub port number used purely for HID-side error logging
 /// dedup; `root_port` is the root-hub port that anchors the path.
-fn dispatch_after_address(
+async fn dispatch_after_address(
     xhci_dev: &Xhci,
     slot_id: u8,
     port: u8,
@@ -342,10 +342,10 @@ fn dispatch_after_address(
     // §9.6.1). 0x09 = Hub. 0x00 = "look at interface class" — most
     // devices go that route; we still try kbd/mouse below in that
     // case because their class lives at the interface.
-    let dev_class = match xhci_dev.get_device_descriptor(slot_id) {
+    let dev_class = match xhci_dev.get_device_descriptor(slot_id).await {
         Ok(d) => d[4],
         Err(_) => {
-            let _ = xhci_dev.disable_slot(slot_id);
+            let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
         }
     };
@@ -355,22 +355,22 @@ fn dispatch_after_address(
         // interface number (USB 2.0 §11.12.1: a hub presents
         // exactly one interface, class 0x09).
         let mut head = [0u8; 9];
-        let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head);
+        let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await;
         if n.is_err() || head.iter().take(2).all(|b| *b == 0) {
-            let _ = xhci_dev.disable_slot(slot_id);
+            let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         let total = u16::from_le_bytes([head[2], head[3]]) as usize;
         if !(9..=4096).contains(&total) {
-            let _ = xhci_dev.disable_slot(slot_id);
+            let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         let cfg_value = head[5];
         let mut full = alloc::vec![0u8; total];
-        let n2 = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full) {
+        let n2 = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await {
             Ok(n) => n,
             Err(_) => {
-                let _ = xhci_dev.disable_slot(slot_id);
+                let _ = xhci_dev.disable_slot(slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -380,7 +380,7 @@ fn dispatch_after_address(
         let iface = match hub::find_hub_interface(&full) {
             Some(i) => i,
             None => {
-                let _ = xhci_dev.disable_slot(slot_id);
+                let _ = xhci_dev.disable_slot(slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -397,15 +397,16 @@ fn dispatch_after_address(
                 0,
                 &mut nothing,
             )
+            .await
             .is_err()
         {
-            let _ = xhci_dev.disable_slot(slot_id);
+            let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
         }
-        let bound = match UsbHub::attach(xhci_dev, slot_id, iface) {
+        let bound = match UsbHub::attach(xhci_dev, slot_id, iface).await {
             Ok(b) => b,
             Err(_) => {
-                let _ = xhci_dev.disable_slot(slot_id);
+                let _ = xhci_dev.disable_slot(slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -413,7 +414,7 @@ fn dispatch_after_address(
         // controller sizes its TT-routing state for downstream
         // enumeration (xHCI 1.2 §6.2.2 dword0[26], dword1[31:24]).
         // Failure here isn't fatal — most controllers tolerate it.
-        let _ = xhci_dev.mark_as_hub(slot_id, bound.descriptor.num_ports, /*mtt*/ false);
+        let _ = xhci_dev.mark_as_hub(slot_id, bound.descriptor.num_ports, /*mtt*/ false).await;
         // Tier of THIS hub = number of 4-bit nibbles already
         // populated in `this_route`. For a tier-0 hub the route is
         // 0 and tier is 0; downstream-of-hub devices will use
@@ -447,14 +448,14 @@ fn dispatch_after_address(
     // (post-Boot HID Report-protocol). Each call frees the slot on
     // failure. The mouse / touchpad paths only run if kbd didn't
     // bind, so we don't double-disable.
-    if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed).is_ok() {
+    if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed).await.is_ok() {
         return AttachOutcome::Keyboard;
     }
     // PTP touchpad / CDC-ACM serial: both class binders consume the
     // device's full configuration descriptor. Fetch once + hand to
     // each in turn so we don't issue multiple GET_DESCRIPTOR(CONFIG)
     // round-trips.
-    if let Some(cfg_blob) = fetch_full_config(xhci_dev, slot_id) {
+    if let Some(cfg_blob) = fetch_full_config(xhci_dev, slot_id).await {
         // PTP touchpad first — HID class.
         if let Some((iface, hid_off, ep)) =
             hid::touchpad::find_hid_interface(&cfg_blob)
@@ -462,6 +463,7 @@ fn dispatch_after_address(
             if hid::touchpad::try_bind_touchpad_already_addressed(
                 xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
             )
+            .await
             .is_ok()
             {
                 return AttachOutcome::Touchpad;
@@ -472,6 +474,7 @@ fn dispatch_after_address(
             if crate::cdc_acm::try_bind_acm_already_addressed(
                 xhci_dev, slot_id, &cfg_blob, speed,
             )
+            .await
             .is_ok()
             {
                 return AttachOutcome::SerialAcm;
@@ -483,25 +486,25 @@ fn dispatch_after_address(
         // interface it returns EndpointsMissing and we fall through.
         if let Ok(_idx) = crate::msc::try_bind_msc_already_addressed(
             xhci_dev, slot_id, &cfg_blob,
-        ) {
+        ).await {
             return AttachOutcome::MassStorage;
         }
         // USB Audio Class — class 0x01, subclass 0x01 (AC).
         if let Ok(_idx) = crate::uac::try_bind_audio_already_addressed(
             xhci_dev, slot_id, &cfg_blob,
-        ) {
+        ).await {
             return AttachOutcome::AudioClass;
         }
         // USB Video Class — class 0x0E, subclass 0x01 (VC).
         if let Ok(_idx) = crate::uvc::try_bind_video_already_addressed(
             xhci_dev, slot_id, &cfg_blob,
-        ) {
+        ).await {
             return AttachOutcome::VideoClass;
         }
         // CDC-NCM ethernet — class 0x02 (Comm), subclass 0x0D.
         if let Ok(_idx) = crate::cdc_ncm::try_bind_ncm_already_addressed(
             xhci_dev, slot_id, &cfg_blob,
-        ) {
+        ).await {
             return AttachOutcome::NetworkClass;
         }
     }
@@ -518,7 +521,7 @@ fn dispatch_after_address(
     // future class-driver pass can prioritise. Reading the config
     // descriptor here is cheap (the slot is still addressed) and
     // surfaces the class triple of every interface in the log.
-    log_unknown_device_classes(xhci_dev, slot_id, port);
+    log_unknown_device_classes(xhci_dev, slot_id, port).await;
     AttachOutcome::UnknownClass
 }
 
@@ -526,15 +529,15 @@ fn dispatch_after_address(
 /// per-class binders can search it for their interface signature
 /// without re-issuing GET_DESCRIPTOR. Returns the full blob (header
 /// + interface + endpoint descriptors), or None on any error.
-fn fetch_full_config(xhci_dev: &Xhci, slot_id: u8) -> Option<alloc::vec::Vec<u8>> {
+async fn fetch_full_config(xhci_dev: &Xhci, slot_id: u8) -> Option<alloc::vec::Vec<u8>> {
     let mut head = [0u8; 9];
-    xhci_dev.get_config_descriptor(slot_id, 0, &mut head).ok()?;
+    xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await.ok()?;
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
     if !(9..=4096).contains(&total) {
         return None;
     }
     let mut full = alloc::vec![0u8; total];
-    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut full).ok()?;
+    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await.ok()?;
     if n < total {
         full.truncate(n);
     }
@@ -546,10 +549,10 @@ fn fetch_full_config(xhci_dev: &Xhci, slot_id: u8) -> Option<alloc::vec::Vec<u8>
 /// Useful for "what's on this port that we don't recognise" diagnosis
 /// on real hardware. Quiet on failure — the device is being given up
 /// on regardless.
-fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
+async fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
     use core::fmt::Write as _;
     let mut head = [0u8; 9];
-    if xhci_dev.get_config_descriptor(slot_id, 0, &mut head).is_err() {
+    if xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await.is_err() {
         return;
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
@@ -557,7 +560,7 @@ fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
         return;
     }
     let mut full = alloc::vec![0u8; total];
-    let n = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full) {
+    let n = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await {
         Ok(n) => n,
         Err(_) => return,
     };
