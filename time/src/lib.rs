@@ -470,9 +470,16 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     if hpet_hz != 0 {
         let window = (hpet_hz / 10).max(1); // ~100 ms
         if let Some(measured) = hpet::calibrate_tsc_via_hpet(window) {
-            narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
-            apply_cycles_per_ns(measured);
-            return (measured, CalibrationSource::HpetXcheck);
+            // Sanity-bound: same range as amd-pstate0. HPET on
+            // Phoenix HawkPoint1 has known SMM-induced drift that
+            // can produce wildly wrong measurements; we'd rather
+            // run with cpns=1 (waits expressed in raw cycles) than
+            // install a bogus value that breaks every Deadline.
+            if (1_000_000_000..=6_500_000_000).contains(&measured) {
+                narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
+                apply_cycles_per_ns(measured);
+                return (measured, CalibrationSource::HpetXcheck);
+            }
         }
     }
     (0, CalibrationSource::None)
@@ -486,7 +493,13 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
 /// hair off.
 #[cfg(target_arch = "x86_64")]
 fn apply_cycles_per_ns(hz: u64) {
-    let cpns = (hz / 1_000_000_000).max(1) as u32;
+    // Clamp to [1, 6] cycles/ns. Real CPUs land in [1, 6] —
+    // higher means calibration miscalibrated and `Deadline::after_ms`
+    // would produce cycle counts that put deadlines far in the
+    // future (waits appear stuck). Lower (zero) is already
+    // guarded by the .max(1).
+    let raw = (hz / 1_000_000_000).max(1) as u32;
+    let cpns = raw.min(6);
     wall::set_cycles_per_ns(cpns);
 }
 

@@ -179,7 +179,20 @@ pub fn calibrate_via_amd_pstate0() -> u64 {
     // Hz arithmetic: `(CpuFid * 200_000_000) / CpuDfsId`.
     // Both bytes ≤ 255, so the multiply fits in u64 without
     // overflow.
-    cpu_fid.saturating_mul(200_000_000) / cpu_dfs_id
+    let hz = cpu_fid.saturating_mul(200_000_000) / cpu_dfs_id;
+    // Sanity-check: real Zen2/3/4 chips fall in 1.5 GHz (mobile
+    // low-power) ... 6 GHz (top-bin desktop). Anything outside
+    // that range means the MSR layout we decoded doesn't apply
+    // to this particular silicon (firmware-locked / virtualised
+    // / future family). Return 0 so `calibrate_clocks` falls
+    // through to HPET cross-check rather than installing a
+    // wildly-wrong `cycles_per_ns`. A wrong cpns turns every
+    // `Deadline::after_ms` into either far-future cycles (waits
+    // appear stuck) or near-instant cycles (timeouts fire early).
+    if !(1_000_000_000..=6_500_000_000).contains(&hz) {
+        return 0;
+    }
+    hz
 }
 
 /// Cross-calibrate against HPET. Measures `Δtsc / Δhpet * hpet_hz`

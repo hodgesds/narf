@@ -73,8 +73,17 @@ pub fn paint(fb: &FbWriter) {
 
     let info = crate::info();
     let fb_line = match info {
-        Some(i) => format!("FB:        {} ({}x{})", i.name, i.width, i.height),
-        None => alloc::string::String::from("FB:        none"),
+        Some(i) => format!(
+            "FB: {} ({}x{})  tsc-cpns: {}",
+            i.name,
+            i.width,
+            i.height,
+            narf_time::cycles_per_ns(),
+        ),
+        None => format!(
+            "FB: none  tsc-cpns: {}",
+            narf_time::cycles_per_ns(),
+        ),
     };
 
     // All counts are atomic loads — no registry / namespace /
