@@ -134,7 +134,7 @@ impl HubDescriptor {
 }
 
 /// One bound hub.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct UsbHub {
     pub slot_id: u8,
     pub iface_num: u8,
@@ -164,7 +164,7 @@ impl UsbHub {
     /// Bind to an already-addressed USB hub slot. Issues
     /// GET_DESCRIPTOR(Hub) so `descriptor` is populated, then
     /// powers on every downstream port.
-    pub fn attach(xhci_dev: &Xhci, slot_id: u8, iface_num: u8) -> Result<Self, HubError> {
+    pub async fn attach(xhci_dev: &Xhci, slot_id: u8, iface_num: u8) -> Result<Self, HubError> {
         // GET_DESCRIPTOR(Hub) — bmRequestType 0xA0, value
         // (HUB_DESC_TYPE << 8), index 0.
         let mut desc_buf = [0u8; 16];
@@ -175,7 +175,7 @@ impl UsbHub {
             (HUB_DESC_TYPE as u16) << 8,
             0,
             &mut desc_buf,
-        )?;
+        ).await?;
         if n < 9 {
             return Err(HubError::BadDescriptor);
         }
@@ -191,7 +191,7 @@ impl UsbHub {
                 PORT_POWER,
                 p as u16,
                 &mut nothing,
-            );
+            ).await;
         }
 
         Ok(UsbHub {
@@ -202,7 +202,7 @@ impl UsbHub {
     }
 
     /// Read the 4-byte port status word for `port` (1-indexed).
-    pub fn port_status(&self, xhci_dev: &Xhci, port: u8) -> Result<u32, HubError> {
+    pub async fn port_status(&self, xhci_dev: &Xhci, port: u8) -> Result<u32, HubError> {
         let mut buf = [0u8; 4];
         xhci_dev.control_in(
             self.slot_id,
@@ -211,14 +211,14 @@ impl UsbHub {
             0,
             port as u16,
             &mut buf,
-        )?;
+        ).await?;
         Ok(u32::from_le_bytes(buf))
     }
 
     /// Drive a per-port reset on a downstream port. Sets
     /// PORT_RESET, polls PORT_STATUS until RESET clears + ENABLE
     /// asserts, then clears the C_PORT_RESET change bit.
-    pub fn port_reset(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
+    pub async fn port_reset(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
         let mut nothing = [0u8; 0];
         let _ = xhci_dev.control_in(
             self.slot_id,
@@ -227,40 +227,30 @@ impl UsbHub {
             PORT_RESET,
             port as u16,
             &mut nothing,
-        )?;
-        // responsive_spin keeps cursor/FB/serial alive across a slow
-        // hub port-reset (each outer iter drives a control_in + a
-        // ~100k-cycle settle). Status-poll error and the success
-        // capture both surface via captured locals.
-        let mut status_err: Option<HubError> = None;
-        let mut got_reset = false;
+        ).await?;
         // 100 ms wall-clock budget (USB 2.0 §11.5.1.5 TDRST max
-        // 50 ms + ~10 ms TDRSTR + headroom). Pre-conversion was
-        // 1_000 outer iters × ~100k inner spin ≈ same order.
-        let _ = narf_scheduler::responsive_spin_until(
-            || match self.port_status(xhci_dev, port) {
+        // 50 ms + ~10 ms TDRSTR + headroom). Between status polls
+        // we sleep briefly so the executor isn't pinned to one task.
+        let deadline = narf_time::Deadline::after_ms(100);
+        let mut got_reset = false;
+        loop {
+            match self.port_status(xhci_dev, port).await {
                 Ok(s) => {
                     let lo = s as u16;
                     if lo & PSTAT_RESET == 0 && lo & PSTAT_ENABLE != 0 {
                         got_reset = true;
-                        return true;
+                        break;
                     }
-                    // Per-outer-iter settle delay (matches the
-                    // pre-conversion 0..100_000 spin_loop spacing).
-                    for _ in 0..100_000 {
-                        core::hint::spin_loop();
-                    }
-                    false
                 }
-                Err(e) => {
-                    status_err = Some(e);
-                    true
-                }
-            },
-            narf_time::Deadline::after_ms(100),
-        );
-        if let Some(e) = status_err {
-            return Err(e);
+                Err(e) => return Err(e),
+            }
+            if deadline.expired() {
+                break;
+            }
+            // Park 1 ms between polls instead of burning CPU. Hub
+            // port reset is observed over a 50ms TDRST window; 1ms
+            // granularity gives ~50 polls inside the budget.
+            narf_time::sleep_cycles(1_000_000).await;
         }
         if got_reset {
             // Clear the change bit so the next reset returns a
@@ -272,7 +262,7 @@ impl UsbHub {
                 C_PORT_RESET,
                 port as u16,
                 &mut nothing,
-            );
+            ).await;
             return Ok(());
         }
         Err(HubError::PortResetTimeout)
@@ -284,7 +274,7 @@ impl UsbHub {
     /// is needed since the bit-set is fire-and-forget; the device
     /// goes into Suspend within 3 ms of seeing the J/K bus state.
     /// Re-issue [`port_resume`] to wake it.
-    pub fn port_suspend(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
+    pub async fn port_suspend(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
         let mut nothing = [0u8; 0];
         let _ = xhci_dev.control_in(
             self.slot_id,
@@ -293,7 +283,7 @@ impl UsbHub {
             PORT_SUSPEND,
             port as u16,
             &mut nothing,
-        )?;
+        ).await?;
         Ok(())
     }
 
@@ -303,7 +293,7 @@ impl UsbHub {
     /// (~10 ms). Then acks the change bit via
     /// `CLEAR_FEATURE(C_PORT_SUSPEND)` so the next suspend cycle
     /// observes a fresh edge.
-    pub fn port_resume(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
+    pub async fn port_resume(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
         let mut nothing = [0u8; 0];
         let _ = xhci_dev.control_in(
             self.slot_id,
@@ -312,7 +302,7 @@ impl UsbHub {
             PORT_SUSPEND,
             port as u16,
             &mut nothing,
-        )?;
+        ).await?;
         let _ = xhci_dev.control_in(
             self.slot_id,
             RT_HOST_TO_DEV_CLASS_OTHER,
@@ -320,14 +310,14 @@ impl UsbHub {
             C_PORT_SUSPEND,
             port as u16,
             &mut nothing,
-        );
+        ).await;
         Ok(())
     }
 
     /// True iff the downstream port is currently in Suspend state.
     /// Reads PORT_STATUS and inspects `PSTAT_SUSPEND`.
-    pub fn port_is_suspended(&self, xhci_dev: &Xhci, port: u8) -> Result<bool, HubError> {
-        let s = self.port_status(xhci_dev, port)? as u16;
+    pub async fn port_is_suspended(&self, xhci_dev: &Xhci, port: u8) -> Result<bool, HubError> {
+        let s = self.port_status(xhci_dev, port).await? as u16;
         Ok(s & PSTAT_SUSPEND != 0)
     }
 
@@ -340,10 +330,10 @@ impl UsbHub {
 
     /// Returns the list of downstream ports that report a connected
     /// device (PORT_STATUS.CONNECTION = 1).
-    pub fn connected_downstream_ports(&self, xhci_dev: &Xhci) -> Vec<u8> {
+    pub async fn connected_downstream_ports(&self, xhci_dev: &Xhci) -> Vec<u8> {
         let mut v: Vec<u8> = Vec::new();
         for p in 1..=self.descriptor.num_ports {
-            if let Ok(s) = self.port_status(xhci_dev, p) {
+            if let Ok(s) = self.port_status(xhci_dev, p).await {
                 if (s as u16) & PSTAT_CONNECTION != 0 {
                     v.push(p);
                 }
@@ -361,9 +351,9 @@ impl UsbHub {
     /// rides on top of this same encoding for the SS LinkState
     /// nibble. For Stage 1 we only resolve LS / FS / HS; SS hubs
     /// are reported as HS until link-state decoding lands.
-    pub fn port_speed(&self, xhci_dev: &Xhci, port: u8) -> Result<crate::xhci::PortSpeed, HubError> {
+    pub async fn port_speed(&self, xhci_dev: &Xhci, port: u8) -> Result<crate::xhci::PortSpeed, HubError> {
         use crate::xhci::PortSpeed;
-        let s = self.port_status(xhci_dev, port)? as u16;
+        let s = self.port_status(xhci_dev, port).await? as u16;
         if s & PSTAT_LOW_SPEED != 0 {
             Ok(PortSpeed::Low)
         } else if s & PSTAT_HIGH_SPEED != 0 {
