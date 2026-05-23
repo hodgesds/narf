@@ -354,6 +354,88 @@ impl Hpet {
         unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
     }
 
+    /// Arm comparator `n` in PERIODIC mode firing every
+    /// `period_ticks` HPET ticks on `gsi`. Returns immediately
+    /// after programming; the first IRQ fires after `period_ticks`
+    /// from the time of the call.
+    ///
+    /// Periodic mode requires `Tn_PER_INT_CAP` (per-timer
+    /// capability). Use [`Hpet::supports_periodic`] to check.
+    ///
+    /// HPET §2.3.9.2 sequence:
+    ///   1. Set TN_TYPE_CNF (periodic) + TN_VAL_SET_CNF + route
+    ///      bits + level-triggered, INT_ENB=0.
+    ///   2. Write `main_counter + period_ticks` to TIMER_COMPARATOR
+    ///      (first write sets the trigger value; TN_VAL_SET_CNF
+    ///      auto-clears).
+    ///   3. Write `period_ticks` to TIMER_COMPARATOR again (second
+    ///      write sets the increment).
+    ///   4. Clear status latch.
+    ///   5. Set TN_INT_ENB_CNF.
+    ///
+    /// # Safety
+    /// Same as [`Self::arm_oneshot_comparator`].
+    pub unsafe fn arm_periodic_comparator(&self, n: u8, gsi: u8, period_ticks: u64) {
+        let block = self.timer_block(n);
+        // SAFETY: caller-asserted live window + valid index.
+        let mut cfg = unsafe { read_u64(block + TIMER_REG_CONFIG) };
+        // Step 1: program config (still disabled until step 5).
+        cfg &= !(TN_INT_ENB_CNF
+            | TN_FSB_EN_CNF
+            | TN_INT_ROUTE_CNF_MASK);
+        cfg |= TN_TYPE_CNF_PERIODIC | TN_VAL_SET_CNF | TN_INT_TYPE_CNF;
+        if cfg & TN_SIZE_CAP == 0 {
+            cfg |= TN_32MODE_CNF;
+        }
+        cfg |= ((gsi as u64) << TN_INT_ROUTE_CNF_SHIFT) & TN_INT_ROUTE_CNF_MASK;
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+
+        // Step 2: read current main counter, write `now + period`
+        // as the first comparator value.
+        // SAFETY: same.
+        let now = unsafe { read_u64(self.base_phys + REG_MAIN_CNT) };
+        let trigger = now.wrapping_add(period_ticks);
+        let trigger_w = if cfg & TN_32MODE_CNF != 0 {
+            trigger & 0xFFFF_FFFF
+        } else {
+            trigger
+        };
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_COMPARATOR, trigger_w) };
+
+        // Step 3: write period as the increment (TN_VAL_SET_CNF
+        // already auto-cleared by step 2's write).
+        let period_w = if cfg & TN_32MODE_CNF != 0 {
+            period_ticks & 0xFFFF_FFFF
+        } else {
+            period_ticks
+        };
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_COMPARATOR, period_w) };
+
+        // Step 4: clear status latch for this timer.
+        // SAFETY: same.
+        unsafe { write_u64(self.base_phys + REG_INT_STS, 1u64 << n) };
+
+        // Step 5: enable interrupt delivery.
+        cfg |= TN_INT_ENB_CNF;
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+    }
+
+    /// True iff comparator `n` supports periodic mode
+    /// (`Tn_PER_INT_CAP`). Not all HPET timers do — the spec
+    /// guarantees only timer 0 has it on every part; others vary.
+    pub fn supports_periodic(&self, n: u8) -> bool {
+        if n >= self.caps.num_comparators {
+            return false;
+        }
+        // SAFETY: index bounded.
+        let cfg = unsafe { self.read_timer_config(n) };
+        cfg & TN_PER_INT_CAP != 0
+    }
+
     /// Disable comparator `n` (clear `Tn_INT_ENB_CNF`) and clear
     /// any pending status latch.
     ///
@@ -518,7 +600,7 @@ pub fn timer_is_64bit(n: u8) -> bool {
     }
 }
 
-/// Outcome of [`arm_oneshot`].
+/// Outcome of [`arm_oneshot`] / [`arm_periodic`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ArmError {
     /// HPET wasn't initialised.
@@ -528,6 +610,10 @@ pub enum ArmError {
     /// `gsi` is not a member of `Tn_INT_ROUTE_CAP` for this timer
     /// — the comparator can't drive that line.
     BadGsi,
+    /// Periodic-mode arm requested but `Tn_PER_INT_CAP == 0` on
+    /// this comparator. Spec guarantees periodic mode only on
+    /// timer 0; pick another comparator.
+    NoPeriodic,
 }
 
 /// Program comparator `n` for a one-shot wakeup at `deadline`
@@ -558,6 +644,69 @@ pub unsafe fn arm_oneshot(n: u8, gsi: u8, deadline: u64) -> Result<(), ArmError>
     // GSI validated against the route-cap mask.
     unsafe { h.arm_oneshot_comparator(n, gsi, deadline) };
     Ok(())
+}
+
+/// Arm comparator `n` in PERIODIC mode firing every
+/// `period_ticks` HPET ticks on `gsi`. Returns `Err` if HPET
+/// isn't initialised, `n` is out of range, `gsi` isn't in the
+/// timer's route-cap mask, or the timer doesn't support periodic
+/// mode (`Tn_PER_INT_CAP == 0`).
+///
+/// # Safety
+/// Caller asserts HPET MMIO is live and that IDT / IOAPIC
+/// plumbing for `gsi` is in place before this fires.
+pub unsafe fn arm_periodic(
+    n: u8,
+    gsi: u8,
+    period_ticks: u64,
+) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    if n >= h.caps.num_comparators {
+        return Err(ArmError::BadComparator);
+    }
+    if !h.supports_periodic(n) {
+        return Err(ArmError::NoPeriodic);
+    }
+    // SAFETY: index bounded.
+    let route_cap = unsafe { h.timer_route_cap(n) };
+    if gsi >= 32 || (route_cap & (1u32 << gsi)) == 0 {
+        return Err(ArmError::BadGsi);
+    }
+    // SAFETY: caller-asserted IDT/IOAPIC readiness; index + gsi
+    // validated.
+    unsafe { h.arm_periodic_comparator(n, gsi, period_ticks) };
+    Ok(())
+}
+
+/// Clear the level-mode status latch for comparator `n`. Must
+/// be called from the comparator's ISR before re-arming the
+/// IOAPIC line (HPET §3.2.3). Returns `Err` if HPET isn't
+/// initialised or `n` is out of range.
+///
+/// # Safety
+/// Caller asserts the HPET MMIO window is live.
+pub unsafe fn clear_status(n: u8) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    if n >= h.caps.num_comparators {
+        return Err(ArmError::BadComparator);
+    }
+    // SAFETY: index bounded; HPET MMIO live for the lock scope.
+    unsafe { h.clear_status(n) };
+    Ok(())
+}
+
+/// True iff comparator `n` supports periodic mode. Diagnostic;
+/// callers should pick the lowest-numbered timer that returns
+/// true.
+pub fn comparator_supports_periodic(n: u8) -> bool {
+    let g = HPET.lock();
+    let h = match g.as_ref() {
+        Some(h) => h,
+        None => return false,
+    };
+    h.supports_periodic(n)
 }
 
 /// Disarm comparator `n` (clear enable + status latch). Returns

@@ -184,13 +184,38 @@ pub fn on_tick() {
     let _ = crate::timer_wheel::fire_due(now);
 }
 
-/// Verification probe (Phase 2). Phase 1 stub returns `true`
-/// always — no real verification, just "the arm call returned
-/// Ok." Phase 2 will arm, spin ~50ms via TSC, check tick_count
-/// grew, and return true iff it did.
-#[inline]
-fn probe_fires(_dev: &dyn ClockEvent) -> bool {
-    true
+/// Verification probe. Arms the device, spins ~50 ms via TSC,
+/// returns true iff the device's `tick_count` grew. Distinguishes
+/// "arm_periodic returned Ok but IRQs aren't actually delivered"
+/// (Phoenix HawkPoint1 LAPIC case) from "arm worked and ticks
+/// arrive."
+///
+/// The probe runs with IRQs ENABLED — that's the whole point.
+/// `arm_periodic` must have already programmed the device, and
+/// the caller (boot path) is expected to call this AFTER
+/// `enable_interrupts`. If the probe is called before IF is set,
+/// no ticks deliver and the device fails the probe even when
+/// it's actually working — caller is responsible for ordering.
+///
+/// 50 ms at the target 100 Hz tick rate = 5 ticks expected. We
+/// require at least 1 tick to call it a pass — generous enough
+/// for slower probes / lower-Hz arms.
+fn probe_fires(dev: &dyn ClockEvent) -> bool {
+    let baseline = dev.tick_count();
+    // 50 ms TSC busy-wait. cpns may be uncalibrated at this point
+    // in boot — use a conservative cycle count that gives at
+    // least 25 ms on any plausible CPU (≥2 GHz worst case;
+    // slower CPUs wait longer, which is also fine for a probe).
+    let cpns = crate::wall::cycles_per_ns().max(1) as u64;
+    let probe_cycles = 50_000_000u64.saturating_mul(cpns);
+    let start = crate::now_cycles();
+    while crate::now_cycles().wrapping_sub(start) < probe_cycles {
+        core::hint::spin_loop();
+        if dev.tick_count() > baseline {
+            return true;
+        }
+    }
+    dev.tick_count() > baseline
 }
 
 #[doc(hidden)]

@@ -2248,14 +2248,25 @@ fn run_async_demo() -> ! {
     // interrupts visible through `timer_ticks()`.
     #[cfg(target_arch = "x86_64")]
     {
-        // Register LAPIC as a candidate tick source + ask
-        // clockevent registry to pick a working one. Phase 1: only
-        // LAPIC is registered, so the choice is forced. Phase 2
-        // registers HPET too; verification probe (Phase 2) picks
-        // whichever actually delivers ticks.
+        // Register candidate tick sources. HPET registers second
+        // so LAPIC is tried first by `select_primary` (lower
+        // resolution, simpler ISR — preferred when working).
         narf_time::clockevent::register(
             &narf_interrupts::x86_64::apic::LAPIC_CLOCKEVENT,
         );
+        narf_time::clockevent::register(
+            &narf_interrupts::x86_64::hpet_clockevent::HPET_CLOCKEVENT,
+        );
+
+        // Enable CPU-side IRQ delivery BEFORE select_primary so
+        // the probe can actually observe ticks. Without this the
+        // probe always fails (arm programs the device, but IF=0
+        // → no delivery → tick_count stuck at 0 → probe fails).
+        // SAFETY: APIC + IDT live; PIC masked.
+        unsafe {
+            narf_arch::enable_interrupts();
+        }
+
         let selected = narf_time::clockevent::select_primary(
             100, // 100 Hz tick — 10 ms period
             narf_interrupts::VECTOR_TIMER,
@@ -2264,26 +2275,23 @@ fn run_async_demo() -> ! {
             Some(dev) => {
                 let _ = writeln!(
                     console::Writer,
-                    "  clockevent: selected '{}' on vector {}",
+                    "  clockevent: selected '{}' on vector {} (probe: {} ticks)",
                     dev.name(),
-                    narf_interrupts::VECTOR_TIMER
+                    narf_interrupts::VECTOR_TIMER,
+                    dev.tick_count(),
                 );
             }
             None => {
-                // No backend worked. The trap-handler fail-safe
-                // (fire_due on every IRQ) keeps the wheel advancing
-                // off whatever IRQs the platform does deliver
-                // (xHCI, NIC, ACPI SCI, etc.). Degraded but not
-                // wedged.
+                // No backend's probe passed. The trap-handler
+                // fail-safe (fire_due on every IRQ) keeps the
+                // wheel advancing off whatever IRQs the platform
+                // does deliver (xHCI, NIC, ACPI SCI, etc.).
+                // Degraded but not wedged.
                 let _ = writeln!(
                     console::Writer,
-                    "  clockevent: NO BACKEND — degraded mode (opportunistic fire_due)"
+                    "  clockevent: NO BACKEND PASSED PROBE — degraded mode (opportunistic fire_due)"
                 );
             }
-        }
-        // SAFETY: APIC + IDT live; enable CPU-side IRQ delivery.
-        unsafe {
-            narf_arch::enable_interrupts();
         }
     }
 

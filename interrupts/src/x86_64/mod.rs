@@ -1,6 +1,7 @@
 //! x86_64 interrupt-controller backend.
 
 pub mod apic;
+pub mod hpet_clockevent;
 pub mod hpet_oneshot;
 pub mod ipi;
 pub mod timer_pump;
