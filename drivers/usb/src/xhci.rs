@@ -448,10 +448,10 @@ pub struct Xhci {
     /// is unused. Sized lazily on first `address_device` so we
     /// don't burn `MaxSlots+1` empty slots up-front.
     devices: IrqSafeSpinLock<alloc::vec::Vec<Option<Device>>>,
-    /// Demuxed event queues populated by `xhci_isr` (and by sync
+    /// Demuxed event queues populated by `xhci_isr` (and by
     /// callers when they happen to dequeue a TE not destined for
     /// them). Resolves audit findings #2 + #11: the ISR no longer
-    /// drops events on the floor + sync `await_event` reads from
+    /// drops events on the floor + `await_event` reads from
     /// the per-class queue instead of racing the ISR for the next
     /// event off the ring. Bounded depths — events overflow into
     /// `events_overflowed` which is a diagnostic counter.
@@ -1817,7 +1817,7 @@ impl Xhci {
     }
 
     /// Demux one Event Ring entry into the per-class queues. Used
-    /// by both the ISR drain and the sync `await_event` path so a
+    /// by both the ISR drain and the `await_event` path so a
     /// command/transfer event the wait isn't interested in still
     /// gets stashed for whichever waiter does want it. Returns the
     /// event so direct callers can also inspect.
@@ -1847,7 +1847,7 @@ impl Xhci {
     /// the queue between submit and await without the sync waiter
     /// timing out, because the await reads the queue (not the
     /// raw event ring directly).
-    fn await_event(
+    async fn await_event(
         &self,
         mut predicate: impl FnMut(&[u32; 4]) -> bool,
     ) -> Result<[u32; 4], XhciError> {
@@ -1871,19 +1871,9 @@ impl Xhci {
             return Ok(ev);
         }
 
-        // Bounded wall-clock wait (~250 ms). On every iteration:
-        // (a) demux any pending event off the ring into queues (also
-        // lets us catch up if the ISR fired and we're racing), then
-        // (b) re-check the queues for our match. Audit F-51: every
-        // ~4096 spins call sleep_pumps::run so the cursor / FB /
-        // serial console stay alive on a slow controller — we're
-        // run from sync init paths (initcalls, supervisor) and
-        // those paths are the *only* thing pumping the FB on
-        // single-CPU bring-up.
         let deadline = narf_time::Deadline::after_ms(250);
-        let mut i: u32 = 0;
         loop {
-            // Demux any new ring entries.
+            // Drain any new ring entries the ISR may have missed.
             while self.demux_one_event().is_some() {}
             if let Some(ev) = try_match(self, &mut predicate) {
                 return Ok(ev);
@@ -1891,18 +1881,25 @@ impl Xhci {
             if deadline.expired() {
                 return Err(XhciError::CmdTimeout);
             }
-            if i & 0xFFF == 0 {
-                narf_scheduler::sleep_pumps::run();
+            // Park until either the xHCI IRQ fires (the ISR posts an
+            // event to the queue) or a short 10ms timeout — re-poll
+            // covers the missing-IRQ case (no MSI-X / level-INTx
+            // delivery glitches) without burning CPU.
+            if let Some(v) = self.irq_vector {
+                let _ = narf_interrupts::wait_for_irq_until(
+                    v,
+                    narf_time::Deadline::after_ms(10),
+                ).await;
+            } else {
+                narf_scheduler::yield_now().await;
             }
-            core::hint::spin_loop();
-            i = i.wrapping_add(1);
         }
     }
 
     /// Issue an Enable Slot command (§4.6.3) and wait for the
     /// completion event. Returns the assigned slot id (1..=MaxSlots)
     /// on success.
-    pub fn enable_slot(&self) -> Result<u8, XhciError> {
+    pub async fn enable_slot(&self) -> Result<u8, XhciError> {
         // If the controller wedged itself (HCE), attempt a soft
         // re-init before submitting the command. HCE is RO and only
         // clears on HCRST — without recovery the doorbell write
@@ -1915,7 +1912,7 @@ impl Xhci {
         self.submit_command(0, 0, 0, trb_type)?;
         // Wait for a Command Completion Event (§6.4.2.2).
         let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)?;
+        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type).await?;
         // CCE layout (§6.4.2.2):
         //   dword0..1 = command-TRB phys addr
         //   dword2[31:24] = completion code
@@ -1936,7 +1933,7 @@ impl Xhci {
     /// failure here is logged via the returned error but the
     /// caller should ignore it because the original failure is
     /// what matters.
-    pub fn disable_slot(&self, slot_id: u8) -> Result<(), XhciError> {
+    pub async fn disable_slot(&self, slot_id: u8) -> Result<(), XhciError> {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
@@ -1946,7 +1943,7 @@ impl Xhci {
         let d3 = trb_type | ((slot_id as u32) << 24);
         self.submit_command(0, 0, 0, d3)?;
         let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)?;
+        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type).await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -1980,8 +1977,8 @@ impl Xhci {
     /// transits). Equivalent to `address_device_with(slot_id, port,
     /// speed, Topology::ROOT)` — for devices reached through one or
     /// more USB hubs use `address_device_with` directly.
-    pub fn address_device(&self, slot_id: u8, port: u8, speed: PortSpeed) -> Result<u8, XhciError> {
-        self.address_device_with(slot_id, port, speed, Topology::ROOT)
+    pub async fn address_device(&self, slot_id: u8, port: u8, speed: PortSpeed) -> Result<u8, XhciError> {
+        self.address_device_with(slot_id, port, speed, Topology::ROOT).await
     }
 
     /// Issue the Address Device command (§4.6.5) for `slot_id`,
@@ -1998,7 +1995,7 @@ impl Xhci {
     /// the per-context stride is `0x20` or `0x40` respectively, but
     /// the field layout *within* each context is identical (the
     /// 64-byte form just pads the upper half).
-    pub fn address_device_with(
+    pub async fn address_device_with(
         &self,
         slot_id: u8,
         port: u8,
@@ -2176,7 +2173,8 @@ impl Xhci {
         let dword3 = trb_type | ((slot_id as u32) << 24);
         self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -2237,7 +2235,7 @@ impl Xhci {
     ///     bit (`1<<25`).
     ///   - Slot dword1: re-stamped with Root Hub Port Number plus
     ///     Number of Ports in bits[31:24].
-    pub fn mark_as_hub(
+    pub async fn mark_as_hub(
         &self,
         slot_id: u8,
         num_ports: u8,
@@ -2289,7 +2287,8 @@ impl Xhci {
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -2298,7 +2297,7 @@ impl Xhci {
         Ok(())
     }
 
-    pub fn evaluate_context_ep0_mps(
+    pub async fn evaluate_context_ep0_mps(
         &self,
         slot_id: u8,
         new_mps: u16,
@@ -2365,7 +2364,8 @@ impl Xhci {
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -2454,7 +2454,7 @@ impl Xhci {
     /// `bm_request_type` / `b_request` / `w_value` / `w_index` /
     /// `w_length` carry the standard 8-byte SETUP packet (§9.3).
     /// `out` length must equal `w_length`.
-    pub fn control_in(
+    pub async fn control_in(
         &self,
         slot_id: u8,
         bm_request_type: u8,
@@ -2549,7 +2549,8 @@ impl Xhci {
                 (t[3] & TRB_TYPE_MASK) == xfer
                     && (t[3] & 0xFF00_0000) == want_slot
                     && (t[3] & 0x001F_0000) == want_ep
-            })?;
+            })
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         // Completion code 1 = Success, 13 = Short Packet (also OK
         // for Get Descriptor when the device-reported length is
@@ -2578,7 +2579,7 @@ impl Xhci {
     /// Event. `data` may be empty for class requests that pack
     /// everything into the SETUP packet's wValue/wIndex fields.
     /// Returns the bytes the controller acknowledged delivering.
-    pub fn control_out(
+    pub async fn control_out(
         &self,
         slot_id: u8,
         bm_request_type: u8,
@@ -2652,7 +2653,8 @@ impl Xhci {
                 (t[3] & TRB_TYPE_MASK) == xfer
                     && (t[3] & 0xFF00_0000) == want_slot
                     && (t[3] & 0x001F_0000) == want_ep
-            })?;
+            })
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 && ccode != 13 {
             return Err(XhciError::CmdFailed(ccode));
@@ -2664,7 +2666,7 @@ impl Xhci {
     /// Fetch the 18-byte USB Device Descriptor (§9.6.1) for an
     /// Addressed slot. Returns the byte-aligned descriptor — caller
     /// pulls VID/DID etc. out of fixed offsets.
-    pub fn get_device_descriptor(&self, slot_id: u8) -> Result<[u8; 18], XhciError> {
+    pub async fn get_device_descriptor(&self, slot_id: u8) -> Result<[u8; 18], XhciError> {
         let mut buf = [0u8; 18];
         let n = self.control_in(
             slot_id,
@@ -2673,7 +2675,7 @@ impl Xhci {
             (USB_DESC_TYPE_DEVICE as u16) << 8, // wValue: descriptor type | index
             0,                                  // wIndex
             &mut buf,
-        )?;
+        ).await?;
         if n < 8 {
             return Err(XhciError::CmdFailed(0xFB));
         }
@@ -2706,7 +2708,7 @@ impl Xhci {
     /// `cfg_index` (typically 0). To read the full configuration tree
     /// (interface + endpoint descriptors), call again with a buffer
     /// sized to `wTotalLength` from the header.
-    pub fn get_config_descriptor(
+    pub async fn get_config_descriptor(
         &self,
         slot_id: u8,
         cfg_idx: u8,
@@ -2722,7 +2724,7 @@ impl Xhci {
             w_value,
             0,
             out,
-        )
+        ).await
     }
 
     /// Issue Configure Endpoint (§4.6.6) for `slot_id`, programming
@@ -2735,7 +2737,7 @@ impl Xhci {
     /// every endpoint listed in `endpoints`. Stage-5 cut: caller
     /// must include EP0 (Slot Context A0) is left untouched; we
     /// only flip A bits for the endpoints they pass.
-    pub fn configure_endpoints(
+    pub async fn configure_endpoints(
         &self,
         slot_id: u8,
         endpoints: &[EndpointConfig],
@@ -2890,7 +2892,8 @@ impl Xhci {
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3057,7 +3060,7 @@ impl Xhci {
     /// many iso TRBs and doesn't wait per-packet; this one-shot
     /// variant is the building block + the path the test smokes
     /// exercise.
-    pub fn isoch_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
+    pub async fn isoch_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
@@ -3078,7 +3081,7 @@ impl Xhci {
             (t[3] & TRB_TYPE_MASK) == xfer
                 && (t[3] & 0xFF00_0000) == want_slot
                 && (t[3] & 0x001F_0000) == want_ep
-        })?;
+        }).await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         // CC 1 = Success; CC 13 = Short Packet (acceptable on iso
         // OUT — controller transmitted fewer bytes than requested
@@ -3095,7 +3098,7 @@ impl Xhci {
     /// frame packet, UAC mic capture packet). Posts a receive
     /// buffer + waits for the Transfer Event; returns bytes
     /// received into `out`.
-    pub fn isoch_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
+    pub async fn isoch_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
         if out.is_empty() || out.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
@@ -3115,7 +3118,7 @@ impl Xhci {
             (t[3] & TRB_TYPE_MASK) == xfer
                 && (t[3] & 0xFF00_0000) == want_slot
                 && (t[3] & 0x001F_0000) == want_ep
-        })?;
+        }).await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 && ccode != 13 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3133,7 +3136,7 @@ impl Xhci {
     /// single DMA scratch page (max read = 4 KiB), enqueues a
     /// Normal TRB, rings the slot doorbell, and waits for a
     /// Transfer Event. Returns bytes received.
-    pub fn bulk_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
+    pub async fn bulk_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
         if out.is_empty() || out.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
@@ -3159,7 +3162,7 @@ impl Xhci {
             (t[3] & TRB_TYPE_MASK) == xfer
                 && (t[3] & 0xFF00_0000) == want_slot
                 && (t[3] & 0x001F_0000) == want_ep
-        })?;
+        }).await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 && ccode != 13 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3285,7 +3288,7 @@ impl Xhci {
     /// bytes into a DMA scratch page, enqueues a Normal TRB,
     /// rings the slot doorbell, awaits the Transfer Event.
     /// Returns bytes acknowledged by the engine.
-    pub fn bulk_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
+    pub async fn bulk_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
@@ -3307,7 +3310,7 @@ impl Xhci {
             (t[3] & TRB_TYPE_MASK) == xfer
                 && (t[3] & 0xFF00_0000) == want_slot
                 && (t[3] & 0x001F_0000) == want_ep
-        })?;
+        }).await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3532,11 +3535,11 @@ fn xhci_isr() {
     };
     let xhci = &*xhci;
     // Demux up to N events into the per-class queues so any
-    // sync waiter (await_event) sees its event regardless of
+    // waiter (await_event) sees its event regardless of
     // whether the ISR or the waiter dequeued it from the ring.
     // Pre-fix the ISR called poll_event and dropped the result,
     // racing with await_event for the very Transfer Event the
-    // sync waiter expected — surfaced as CmdTimeout under MSI-X
+    // waiter expected — surfaced as CmdTimeout under MSI-X
     // load (audit #11).
     const MAX_DRAIN_PER_IRQ: usize = 64;
     for _ in 0..MAX_DRAIN_PER_IRQ {

@@ -79,12 +79,15 @@ fn smoke_xhci_enable_slot_command() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let r = xhci::with_controller(|c| c.enable_slot());
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return TestResult::Skip("xhci controller missing"),
+    };
+    let r = narf_scheduler::block_on(async { c.enable_slot().await });
     match r {
-        Some(Ok(slot_id)) if slot_id >= 1 => TestResult::Pass,
-        Some(Ok(_)) => TestResult::Fail("Enable Slot returned slot 0"),
-        Some(Err(_)) => TestResult::Fail("Enable Slot command failed"),
-        None => TestResult::Skip("xhci controller missing"),
+        Ok(slot_id) if slot_id >= 1 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("Enable Slot returned slot 0"),
+        Err(_) => TestResult::Fail("Enable Slot command failed"),
     }
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_enable_slot_command);
@@ -114,25 +117,31 @@ fn smoke_xhci_address_device_qemu() -> TestResult {
     // hid_kbd run starts from a clean state.
     crate::hid::__reset_keyboards_for_test();
     if let Some(Some(stale)) = xhci::with_controller(|c| c.slot_for_port(port)) {
-        let _ = xhci::with_controller(|c| c.disable_slot(stale));
+        if let Some(c) = xhci::controller() {
+            let _ = narf_scheduler::block_on(async { c.disable_slot(stale).await });
+        }
     }
     let _post = match xhci::with_controller(|c| c.port_reset(port)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("port_reset failed"),
     };
-    let slot_id = match xhci::with_controller(|c| c.enable_slot()) {
-        Some(Ok(s)) => s,
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return TestResult::Fail("xhci controller missing"),
+    };
+    let slot_id = match narf_scheduler::block_on(async { c.enable_slot().await }) {
+        Ok(s) => s,
         _ => return TestResult::Fail("enable_slot failed"),
     };
-    let r = match xhci::with_controller(|c| c.address_device(slot_id, port, speed)) {
-        Some(Ok(_)) => TestResult::Pass,
+    let r = match narf_scheduler::block_on(async { c.address_device(slot_id, port, speed).await }) {
+        Ok(_) => TestResult::Pass,
         _ => TestResult::Fail("address_device failed"),
     };
     // Release the slot so later tests (e.g. smoke_xhci_hid_kbd_first_report)
     // can re-address the same port without TRB Error "port already
     // assigned". Best-effort; the assertion is the address_device
     // result above.
-    let _ = xhci::with_controller(|c| c.disable_slot(slot_id));
+    let _ = narf_scheduler::block_on(async { c.disable_slot(slot_id).await });
     r
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_address_device_qemu);
@@ -162,8 +171,12 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
         Some(p) => p,
         None => return TestResult::Skip("no connected port"),
     };
-    let attached = xhci::with_controller(|c| hid::try_attach_keyboard_on_port(c, port).is_ok())
-        .unwrap_or(false);
+    let attached = match xhci::controller() {
+        Some(c) => narf_scheduler::block_on(async {
+            hid::try_attach_keyboard_on_port(&c, port).await.is_ok()
+        }),
+        None => false,
+    };
     if !attached {
         return TestResult::Skip("port not a HID Boot Keyboard");
     }
@@ -224,7 +237,10 @@ fn smoke_msc_attach_via_xhci_qemu() -> TestResult {
         return TestResult::Skip("xhci not probed");
     }
     msc::__reset_msc_for_test();
-    let attached = xhci::with_controller(|c| msc::enumerate_and_attach_msc(c)).unwrap_or(0);
+    let attached = match xhci::controller() {
+        Some(c) => narf_scheduler::block_on(async { msc::enumerate_and_attach_msc(&c).await }),
+        None => 0,
+    };
     if attached == 0 {
         return TestResult::Skip("no MSC device attached to xhci");
     }
