@@ -27,7 +27,8 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use narf_aml::find_device_by_hid;
+use narf_aml::find_all_devices_by_hid;
+use narf_aml::sync::register_notify_handler;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::ec::{subscribe_platform_event, PlatformEvent};
@@ -92,22 +93,41 @@ fn dispatch(button: Button) {
     }
 }
 
+/// Notify(<button>, 0x80) = press. ACPI 6.5 §9.5.
+const NOTIFY_BUTTON_PRESSED: u64 = 0x80;
+
+fn power_notify(_target: &str, value: u64) {
+    if value == NOTIFY_BUTTON_PRESSED {
+        dispatch(Button::Power);
+    }
+}
+
+fn sleep_notify(_target: &str, value: u64) {
+    if value == NOTIFY_BUTTON_PRESSED {
+        dispatch(Button::Sleep);
+    }
+}
+
 /// Discover Control-Method button devices and subscribe to the EC
 /// platform-event feed for fixed-hardware button bits.
 pub fn init() {
     let mut found = 0u32;
-    if find_device_by_hid("PNP0C0C").is_some() {
+    for dev in find_all_devices_by_hid("PNP0C0C") {
         let _ = writeln!(
             narf_console::Writer,
-            "  acpi-buttons: power-button (PNP0C0C) present"
+            "  acpi-buttons: power-button {} registered",
+            dev.path
         );
+        register_notify_handler(&dev.path, power_notify);
         found += 1;
     }
-    if find_device_by_hid("PNP0C0E").is_some() {
+    for dev in find_all_devices_by_hid("PNP0C0E") {
         let _ = writeln!(
             narf_console::Writer,
-            "  acpi-buttons: sleep-button (PNP0C0E) present"
+            "  acpi-buttons: sleep-button {} registered",
+            dev.path
         );
+        register_notify_handler(&dev.path, sleep_notify);
         found += 1;
     }
     if found == 0 {

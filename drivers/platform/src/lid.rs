@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::eval::evaluate_method;
 use narf_aml::find_all_devices_by_hid;
+use narf_aml::sync::register_notify_handler;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::ec::{subscribe_platform_event, PlatformEvent};
@@ -139,6 +140,28 @@ fn refresh_all() {
     }
 }
 
+fn lid_notify(target: &str, value: u64) {
+    // ACPI 6.5 §9.4.1: Notify(<lid>, 0x80) = state changed. Re-read
+    // the specific lid's _LID rather than refreshing all — the
+    // target tells us which device to query.
+    if value != 0x80 {
+        return;
+    }
+    let lids = LIDS.lock().clone();
+    for lid in lids {
+        if lid.path == target {
+            let (_, event) = lid.refresh();
+            if let Some(e) = event {
+                notify(e);
+            }
+            return;
+        }
+    }
+    // Path mismatch (rare — namespace canonicalisation drift). Fall
+    // back to refreshing every registered lid.
+    refresh_all();
+}
+
 /// Walk the AML namespace, register every PNP0C0D as a lid device,
 /// subscribe to the EC platform event feed. Convertible laptops
 /// list two lid devices (one per panel); we register all of them
@@ -149,6 +172,7 @@ pub fn init() {
         let lid = Arc::new(LidDevice::new(dev.path.clone()));
         // Prime the cache with the boot-time state.
         let _ = lid.refresh();
+        register_notify_handler(&dev.path, lid_notify);
         LIDS.lock().push(lid);
         count += 1;
     }
