@@ -189,7 +189,23 @@ fn spawn_supervisor_task() {
                 }
                 SUPERVISOR_PHASE.store(5, core::sync::atomic::Ordering::Relaxed);
                 SUPERVISOR_ATTACHING_PORT.store(p, core::sync::atomic::Ordering::Relaxed);
-                let outcome = attach::try_attach_root(c, p).await;
+                // Per-port hard wall-clock cap. Individual sub-awaits
+                // (port_reset, await_event, control transfers) have
+                // their own 250ms bounds, but a misbehaving port can
+                // chain enough of them that the supervisor sits on a
+                // single port for 5-10s. Wrapping the whole call in a
+                // 3s timeout guarantees forward progress: a wedged
+                // port burns its retry budget instead of stalling the
+                // whole supervisor.
+                let outcome = match narf_time::timeout(
+                    narf_time::Deadline::after_ms(3000),
+                    attach::try_attach_root(c, p),
+                )
+                .await
+                {
+                    Ok(o) => o,
+                    Err(_elapsed) => AttachOutcome::UnknownClass,
+                };
                 SUPERVISOR_ATTACHING_PORT.store(0, core::sync::atomic::Ordering::Relaxed);
                 match outcome {
                     AttachOutcome::Keyboard
