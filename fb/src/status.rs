@@ -111,11 +111,12 @@ pub fn paint(fb: &FbWriter) {
     let supervisor_phase = narf_drivers_usb::SUPERVISOR_PHASE.load(Ordering::Relaxed);
     let supervisor_port = narf_drivers_usb::SUPERVISOR_ATTACHING_PORT.load(Ordering::Relaxed);
     let usb_hid_line = format!(
-        "USB-HID: sup={} ph={} port={} yt={} pumps={} cpns={} irq1={}",
+        "USB-HID: sup={} ph={} port={} yt={} wakes={} pumps={} cpns={} irq1={}",
         supervisor_ticks,
         supervisor_phase,
         supervisor_port,
         narf_drivers_usb::YIELD_TIMEOUT_POLLS.load(Ordering::Relaxed),
+        narf_scheduler::WAKE_BY_REF_CALLS.load(Ordering::Relaxed),
         usb_pumps,
         narf_time::cycles_per_ns(),
         {
