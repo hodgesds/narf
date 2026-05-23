@@ -1861,18 +1861,19 @@ impl Xhci {
             if deadline.expired() {
                 return Err(XhciError::CmdTimeout);
             }
-            // Park until either the xHCI IRQ fires (the ISR posts an
-            // event to the queue) or a short 10ms timeout — re-poll
-            // covers the missing-IRQ case (no MSI-X / level-INTx
-            // delivery glitches) without burning CPU.
-            if let Some(v) = self.irq_vector {
-                let _ = narf_interrupts::wait_for_irq_until(
-                    v,
-                    narf_time::Deadline::after_ms(10),
-                ).await;
-            } else {
-                narf_scheduler::yield_now().await;
-            }
+            // Wheel-bypass: yield_now self-wakes via cx.waker(),
+            // bypassing timer_wheel::register entirely. The
+            // previous `wait_for_irq_until(v, after_ms(10))` was
+            // wheel-based and observed not to fire wakers for the
+            // USB supervisor task on real HW even though the same
+            // wheel works for the panel paint task — same workaround
+            // pattern as port_reset / supervisor's outer YieldTimeout.
+            // Trade-off: CPU is busier (re-polls every executor
+            // round vs. parked-then-irq), but the outer 250 ms
+            // deadline still bounds the busy phase. Other tasks
+            // make progress via 10 ms preemption.
+            narf_scheduler::yield_now().await;
+            let _ = self.irq_vector; // unused while wheel is suspect
         }
     }
 
