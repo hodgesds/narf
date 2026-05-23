@@ -344,12 +344,23 @@ impl VirtioBlkDevice {
         // doorbell write (QEMU virtio-blk does this for cached I/O).
         // Pattern mirrors `drivers/nvme/src/lib.rs::submit_io_irq` and
         // `drivers/virtio/src/blk_pci.rs::read_sector_irq_async`.
-        let waiter = self.irq_vector.map(narf_interrupts::wait_for_irq);
+        //
+        // 5-second deadline on the IRQ wait — typical virtio-blk
+        // completions land in microseconds; this is the "device
+        // wedged / lost MSI / EC quirk" fallback that keeps a dead
+        // device from parking the await forever.
+        let waiter = self.irq_vector.map(|v| {
+            narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000))
+        });
         let fut = self.submit(req);
         if let Some(w) = waiter {
-            // Await the IRQ first so we don't busy-poll the used
-            // ring. The handler is a no-op, but `on_irq` bumps
-            // `fire_count` which resolves `WaitForIrq`.
+            // Await the IRQ (or timeout) first so we don't busy-poll
+            // the used ring. The sync handler is a no-op, but
+            // `on_irq` bumps `fire_count` which resolves the
+            // inner `WaitForIrq`. On timeout we still attempt the
+            // ring drain — the request may have completed but the
+            // MSI never landed (wedged interrupt remap, EC quirk),
+            // and `self.poll()` can still surface it.
             let _ = w.await;
             // Drain the used ring + wake the per-request waker.
             self.poll();

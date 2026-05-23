@@ -881,8 +881,13 @@ impl VirtioBlkPci {
 
 /// Async, IRQ-driven 512-byte read from `sector`. Submits the
 /// request against the singleton CONTROLLER, awaits MSI-X delivery
-/// via [`narf_interrupts::wait_for_irq`], drains the used ring,
-/// and returns the device-written data.
+/// via [`narf_interrupts::wait_for_irq_until`], drains the used
+/// ring, and returns the device-written data.
+///
+/// The IRQ wait is bounded by a 5-second deadline. Typical virtio-
+/// blk completions land in microseconds; this is the "device
+/// wedged / lost MSI / EC quirk" fallback. On expiry we surface
+/// `CompletionTimeout` so the upper layer can retry or abandon.
 pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciError> {
     let vector = {
         let g = CONTROLLER.lock();
@@ -891,14 +896,21 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
     // Construct waiter BEFORE submit so a synchronously-delivered
     // MSI-X (QEMU completes virtio-blk reads inline) can't slip past
     // us — the future's baseline is the pre-submit fire_count.
-    let waiter = vector.map(narf_interrupts::wait_for_irq);
+    let waiter = vector.map(|v| {
+        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000))
+    });
     let (head, payload, status_phys, payload_phys) = {
         let g = CONTROLLER.lock();
         let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
         c.submit_read(sector)?
     };
     if let Some(w) = waiter {
-        let _ = w.await;
+        // Outer Result is the timeout (Err = Elapsed); inner is the
+        // IRQ future's own output. We only care that the IRQ fired
+        // OR that the deadline expired.
+        if w.await.is_err() {
+            return Err(VirtioPciError::CompletionTimeout);
+        }
     }
     let mut out = [0u8; 512];
     let r = {
@@ -911,20 +923,25 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
 }
 
 /// Async, IRQ-driven 512-byte write to `sector`. Mirrors
-/// [`read_sector_irq_async`] — see that doc for the protocol.
+/// [`read_sector_irq_async`] — see that doc for the protocol and
+/// the 5-second wait deadline.
 pub async fn write_sector_irq_async(sector: u64, data: [u8; 512]) -> Result<(), VirtioPciError> {
     let vector = {
         let g = CONTROLLER.lock();
         g.as_ref().ok_or(VirtioPciError::NoQueues)?.irq_vector
     };
-    let waiter = vector.map(narf_interrupts::wait_for_irq);
+    let waiter = vector.map(|v| {
+        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000))
+    });
     let (head, payload, status_phys) = {
         let g = CONTROLLER.lock();
         let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
         c.submit_write(sector, &data)?
     };
     if let Some(w) = waiter {
-        let _ = w.await;
+        if w.await.is_err() {
+            return Err(VirtioPciError::CompletionTimeout);
+        }
     }
     let r = {
         let g = CONTROLLER.lock();
