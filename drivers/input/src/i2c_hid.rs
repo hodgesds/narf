@@ -405,7 +405,10 @@ impl Driver for I2cHidDriver {
 
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
-    narf_init::register(Stage::Device, "i2c-hid-probe", || {
+    // AML walks for PNP0C50 + vendor _CID matches across a real-HW
+    // DSDT regularly take 500-2000 ms — false-positives the
+    // default budget. Bump explicitly to 3 s.
+    narf_init::register_with_budget(Stage::Device, "i2c-hid-probe", || {
         // Discovery + logging pass: enumerate every PNP0C50 child +
         // log the I2C controllers already brought up by
         // `amd-fch-i2c`. The actual driver-instance construction +
@@ -437,8 +440,8 @@ pub fn register_initcalls() {
             let _ = writeln!(narf_console::Writer, "  i2c-hid: no PNP0C50 children found");
         }
         InitResult::Ok
-    });
-    narf_init::register(Stage::Device, "i2c-hid-bind", || {
+    }, 3000);
+    narf_init::register_with_budget(Stage::Device, "i2c-hid-bind", || {
         let n = crate::i2c_hid_bind::bind_all();
         let _ = writeln!(
             narf_console::Writer,
@@ -450,7 +453,7 @@ pub fn register_initcalls() {
         } else {
             InitResult::Ok
         }
-    });
+    }, 3000);
 }
 
 /// Evaluate `<path>._CRS` and print each resource item we recognize.
