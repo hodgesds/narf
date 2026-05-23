@@ -1566,23 +1566,24 @@ impl Xhci {
         if cur & PORTSC_CCS == 0 {
             return Err(XhciError::BadPort);
         }
-        // CCS-stable debounce (xHCI §4.19.5 / USB 2.0 §7.1.7.3:
-        // TDDIS = 100 ms). Sample CCS every ~1 ms via the timer
-        // wheel rather than busy-spin so the supervisor task
-        // parks between samples and other tasks (panel paint,
-        // shell, peer pumps) run on this CPU during the 100 ms
-        // window. 1 ms ≈ 1 M TSC cycles at 1 GHz; on Zen4 (3.3
-        // GHz) this becomes ~330 µs which is still negligible
-        // wake-up overhead but covers slower CPUs sensibly.
-        const DEBOUNCE_SAMPLES: u32 = 100;
-        const SAMPLE_CYCLES: u64 = 1_000_000;
-        for _ in 0..DEBOUNCE_SAMPLES {
+        // CCS-stable debounce. Bound by raw TSC wall-clock instead
+        // of the timer wheel — yield_now() between samples uses the
+        // executor's self-wake path (sets slot.awake directly via
+        // cx.waker()) and bypasses timer_wheel::register entirely.
+        // The wheel path was suspected of failing to deliver wakes
+        // back to the USB supervisor on real HW; yield_now is the
+        // minimum-dependency wait primitive available.
+        let debounce_deadline = narf_time::Deadline::after_ms(100);
+        loop {
             // SAFETY: same MMIO region.
             let v = unsafe { self.mmio.read32(off) };
             if v & PORTSC_CCS == 0 {
                 return Err(XhciError::BadPort);
             }
-            narf_time::sleep_cycles(SAMPLE_CYCLES).await;
+            if debounce_deadline.expired() {
+                break;
+            }
+            narf_scheduler::yield_now().await;
         }
         self.port_reset_once(port, off).await
     }
@@ -1607,11 +1608,8 @@ impl Xhci {
             self.mmio.write32(off, to_write);
         }
         // Wait for PR to clear AND PRC to set (§4.19.5). 250 ms
-        // outer bound; sample every ~1 ms via the timer wheel so
-        // the task parks instead of burning the CPU. Worst-case
-        // wall-clock unchanged; CPU cost during the wait drops
-        // from 100% to essentially zero.
-        const SAMPLE_CYCLES: u64 = 1_000_000;
+        // outer bound; yield between samples via the executor's
+        // self-wake path (bypasses timer wheel).
         let pr_deadline = narf_time::Deadline::after_ms(250);
         loop {
             if pr_deadline.expired() {
@@ -1625,11 +1623,7 @@ impl Xhci {
                 unsafe {
                     self.mmio.write32(off, ack);
                 }
-                // PED / PLS settle. USB3 needs link training to
-                // reach U0 (PLS=0); USB2 just needs PED. 50 ms
-                // outer bound, sample every ~100 µs (100 k cycles
-                // at 1 GHz; fine-grained because PED transitions
-                // can race within a few hundred µs of PRC ack).
+                // PED / PLS settle. 50 ms outer bound.
                 let proto = self.port_protocols[port as usize];
                 let ped_deadline = narf_time::Deadline::after_ms(50);
                 loop {
@@ -1647,15 +1641,18 @@ impl Xhci {
                     if ok {
                         // TRSTRCY (USB 2.0 §7.1.7.3 / §9.2.6.2):
                         // ≥10 ms quiet between PR clear and the
-                        // first SETUP. Use 25 ms to keep margin
-                        // over slow devices.
-                        narf_time::sleep_cycles(25_000_000).await;
+                        // first SETUP. Spin-yield for ~25 ms via
+                        // TSC deadline (not the wheel).
+                        let recovery = narf_time::Deadline::after_ms(25);
+                        while !recovery.expired() {
+                            narf_scheduler::yield_now().await;
+                        }
                         return Ok(post);
                     }
-                    narf_time::sleep_cycles(100_000).await;
+                    narf_scheduler::yield_now().await;
                 }
             }
-            narf_time::sleep_cycles(SAMPLE_CYCLES).await;
+            narf_scheduler::yield_now().await;
         }
         Err(XhciError::PortResetTimeout)
     }
