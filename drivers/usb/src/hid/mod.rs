@@ -205,7 +205,7 @@ impl BootKeyboard {
     /// Bind a boot keyboard to an already-addressed + configured
     /// xHCI slot. Issues `Set Protocol(Boot)` so subsequent
     /// `read_report` calls return the fixed 8-byte format.
-    pub fn attach(
+    pub async fn attach(
         xhci_dev: &Xhci,
         slot_id: u8,
         interface_num: u8,
@@ -227,6 +227,7 @@ impl BootKeyboard {
                 interface_num as u16,
                 &mut nothing,
             )
+            .await
             .map_err(|_| HidError::SetProtocolFailed)?;
         // SET_IDLE(duration=0, reportID=0) — HID §7.2.4. Tells
         // the device "only send a report on state change", which
@@ -243,7 +244,7 @@ impl BootKeyboard {
             0, // (duration<<8) | reportID — both zero
             interface_num as u16,
             &mut nothing,
-        );
+        ).await;
         // Pre-arm the interrupt-IN endpoint with one Normal TRB so
         // the controller starts polling the device immediately. The
         // first state-change report from the device completes that
@@ -430,10 +431,10 @@ static KEYBOARDS: IrqSafeSpinLock<Vec<BootKeyboard>> = IrqSafeSpinLock::new(Vec:
 /// per-port failure (no connection, no HID kbd interface,
 /// command failure) is logged via the count and skipped — the
 /// next port is still tried.
-pub fn enumerate_and_attach_keyboards(xhci_dev: &Xhci) -> usize {
+pub async fn enumerate_and_attach_keyboards(xhci_dev: &Xhci) -> usize {
     let mut attached = 0usize;
     for (port, _portsc) in xhci_dev.connected_ports() {
-        if try_attach_port(xhci_dev, port).is_ok() {
+        if try_attach_port(xhci_dev, port).await.is_ok() {
             attached += 1;
         }
     }
@@ -550,8 +551,8 @@ fn note_attach_ok(port: u8) {
 /// retry loop. Returns Err on any failure (no kbd here, NotBoot,
 /// xHCI command failure) so the supervisor can decide whether to
 /// re-try (port still connected) or move on.
-pub fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    let r = try_attach_port(xhci_dev, port);
+pub async fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
+    let r = try_attach_port(xhci_dev, port).await;
     if r.is_ok() {
         note_attach_ok(port);
     }
@@ -568,22 +569,22 @@ pub fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidE
 /// disabled so the caller doesn't leak it. On success the kbd is
 /// added to the global registry and `note_attach_ok` records the
 /// port for one-shot logging.
-pub fn try_bind_kbd_already_addressed(
+pub async fn try_bind_kbd_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     port: u8,
     speed: xhci::PortSpeed,
 ) -> Result<(), HidError> {
-    let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed);
+    let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed).await;
     if r.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id);
+        let _ = xhci_dev.disable_slot(slot_id).await;
     } else {
         note_attach_ok(port);
     }
     r
 }
 
-fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
+async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(|e| {
         let err = HidError::Xhci(e);
         note_attach_fail(port, AttachStep::Reset, &err);
@@ -594,25 +595,25 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         note_attach_fail(port, AttachStep::Speed, &err);
         err
     })?;
-    let slot_id = xhci_dev.enable_slot().map_err(|e| {
+    let slot_id = xhci_dev.enable_slot().await.map_err(|e| {
         let err = HidError::Xhci(e);
         note_attach_fail(port, AttachStep::EnableSlot, &err);
         err
     })?;
-    let res = (|| -> Result<(), HidError> {
-        xhci_dev.address_device(slot_id, port, speed).map_err(|e| {
+    let res = async {
+        xhci_dev.address_device(slot_id, port, speed).await.map_err(|e| {
             let err = HidError::Xhci(e);
             note_attach_fail(port, AttachStep::AddressDevice, &err);
             err
         })?;
-        bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed)
-    })();
+        bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed).await
+    }.await;
     if res.is_err() {
         // Free the slot so a retry doesn't leak xHCI device
         // contexts. AMD Renoir's MaxSlots is typically 32 and a
         // laptop with multiple internal USB devices can burn
         // through them quickly across enumeration retries.
-        let _ = xhci_dev.disable_slot(slot_id);
+        let _ = xhci_dev.disable_slot(slot_id).await;
     }
     res
 }
@@ -623,7 +624,7 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
 /// match, configure_endpoints, SET_CONFIGURATION, SET_PROTOCOL,
 /// arm_interrupt_in, and registry push. Does NOT call disable_slot
 /// on failure — caller's cleanup_guard handles that.
-fn bind_kbd_addressed_slot(
+async fn bind_kbd_addressed_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
     port: u8,
@@ -636,7 +637,7 @@ fn bind_kbd_addressed_slot(
         // speed devices (we initially seed MPS=8 — the smallest
         // legal — and most FS devices are actually 8/16/32/64).
         // High-speed defaults to 64 already.
-        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id) {
+        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
             let mps0 = desc[7] as u16;
             // Valid Full-Speed values per USB 2.0 §9.6.1: 8/16/32/64.
             // Low-Speed must be 8. High-Speed must be 64. SuperSpeed
@@ -655,7 +656,7 @@ fn bind_kbd_addressed_slot(
                 _ => None,
             };
             if let Some(real_mps) = want {
-                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps);
+                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps).await;
             }
         }
 
@@ -664,6 +665,7 @@ fn bind_kbd_addressed_slot(
         let mut head = [0u8; 9];
         let n = xhci_dev
             .get_config_descriptor(slot_id, 0, &mut head)
+            .await
             .map_err(|e| {
                 let err = HidError::Xhci(e);
                 note_attach_fail(port, AttachStep::GetCfgHeader, &err);
@@ -689,6 +691,7 @@ fn bind_kbd_addressed_slot(
         let mut full = alloc::vec![0u8; total];
         let n2 = xhci_dev
             .get_config_descriptor(slot_id, 0, &mut full)
+            .await
             .map_err(|e| {
                 let err = HidError::Xhci(e);
                 note_attach_fail(port, AttachStep::GetCfgFull, &err);
@@ -706,7 +709,7 @@ fn bind_kbd_addressed_slot(
         // Configure the controller-side endpoint context first
         // so the device-side SET_CONFIGURATION below can drive
         // traffic through the now-running rings.
-        xhci_dev.configure_endpoints(slot_id, &[ep]).map_err(|e| {
+        xhci_dev.configure_endpoints(slot_id, &[ep]).await.map_err(|e| {
             let err = HidError::Xhci(e);
             note_attach_fail(port, AttachStep::ConfigureEndpoints, &err);
             err
@@ -728,6 +731,7 @@ fn bind_kbd_addressed_slot(
                 0,
                 &mut nothing,
             )
+            .await
             .map_err(|_| {
                 let err = HidError::SetProtocolFailed;
                 note_attach_fail(port, AttachStep::SetConfiguration, &err);
@@ -736,7 +740,7 @@ fn bind_kbd_addressed_slot(
 
         let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
         let dci = (interrupt_in_ep * 2) + 1;
-        let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci).map_err(|e| {
+        let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci).await.map_err(|e| {
             note_attach_fail(port, AttachStep::SetProtocol, &e);
             e
         })?;

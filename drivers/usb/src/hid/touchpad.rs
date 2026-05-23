@@ -182,7 +182,7 @@ pub fn report_descriptor_length(cfg: &[u8], hid_desc_off: usize) -> Option<u16> 
 /// `Err(HidError::NotBootKeyboard)` when the device's report
 /// descriptor doesn't shape like a PTP touchpad — caller's
 /// cleanup_guard handles disable_slot.
-pub fn try_bind_touchpad_already_addressed(
+pub async fn try_bind_touchpad_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     interface_num: u8,
@@ -205,6 +205,7 @@ pub fn try_bind_touchpad_already_addressed(
             interface_num as u16,
             &mut blob,
         )
+        .await
         .map_err(HidError::Xhci)?;
 
     let parsed: ReportDescriptor =
@@ -214,6 +215,7 @@ pub fn try_bind_touchpad_already_addressed(
     // Configure xHC-side endpoint context.
     xhci_dev
         .configure_endpoints(slot_id, &[ep])
+        .await
         .map_err(HidError::Xhci)?;
 
     // SET_CONFIGURATION before any class request (USB 2.0 §9.4.7) —
@@ -234,6 +236,7 @@ pub fn try_bind_touchpad_already_addressed(
             0,
             &mut nothing,
         )
+        .await
         .map_err(HidError::Xhci)?;
 
     // Enable Microsoft PTP "Mouse + Touch" mode via the Mode Feature
@@ -251,7 +254,7 @@ pub fn try_bind_touchpad_already_addressed(
             (3u16 << 8) | report_id,
             interface_num as u16,
             &mode_report[1..], // strip leading report-id byte; xHCI sends it via wValue
-        );
+        ).await;
     }
 
     let interrupt_in_ep = ep.ep_addr & 0x0F;

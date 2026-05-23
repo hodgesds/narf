@@ -142,7 +142,7 @@ impl BootMouse {
     /// Bind a boot mouse to an already-addressed + configured xHCI
     /// slot. Issues `Set Protocol(Boot)` so subsequent `read_report`
     /// calls return the fixed 3-byte format.
-    pub fn attach(
+    pub async fn attach(
         xhci_dev: &Xhci,
         slot_id: u8,
         interface_num: u8,
@@ -158,6 +158,7 @@ impl BootMouse {
                 interface_num as u16,
                 &mut nothing,
             )
+            .await
             .map_err(|_| HidError::SetProtocolFailed)?;
         // Pre-arm the interrupt-IN endpoint so the controller starts
         // polling the device. Without this no Transfer Event ever
@@ -249,10 +250,10 @@ static MICE: IrqSafeSpinLock<Vec<BootMouse>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Walk every connected port and try to bring up a HID Boot Mouse
 /// interface. Same flow as the keyboard counterpart in `hid::mod`.
-pub fn enumerate_and_attach_mice(xhci_dev: &Xhci) -> usize {
+pub async fn enumerate_and_attach_mice(xhci_dev: &Xhci) -> usize {
     let mut attached = 0usize;
     for (port, _portsc) in xhci_dev.connected_ports() {
-        if try_attach_port(xhci_dev, port).is_ok() {
+        if try_attach_port(xhci_dev, port).await.is_ok() {
             attached += 1;
         }
     }
@@ -261,8 +262,8 @@ pub fn enumerate_and_attach_mice(xhci_dev: &Xhci) -> usize {
 
 /// Public per-port attach used by the supervisor's per-port
 /// retry loop. Same shape as the keyboard variant.
-pub fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    let r = try_attach_port(xhci_dev, port);
+pub async fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
+    let r = try_attach_port(xhci_dev, port).await;
     if r.is_ok() {
         use core::fmt::Write as _;
         use core::sync::atomic::{AtomicU64, Ordering};
@@ -285,30 +286,31 @@ pub fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidErro
 /// address_device_with(_with_topology). This entry point picks up
 /// from there. On failure the slot is disabled so the caller doesn't
 /// leak it.
-pub fn try_bind_mouse_already_addressed(
+pub async fn try_bind_mouse_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
 ) -> Result<(), HidError> {
-    let r = bind_mouse_addressed_slot(xhci_dev, slot_id, speed);
+    let r = bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await;
     if r.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id);
+        let _ = xhci_dev.disable_slot(slot_id).await;
     }
     r
 }
 
-fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
+async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
-    let slot_id = xhci_dev.enable_slot().map_err(HidError::Xhci)?;
-    let res = (|| -> Result<(), HidError> {
+    let slot_id = xhci_dev.enable_slot().await.map_err(HidError::Xhci)?;
+    let res = async {
         xhci_dev
             .address_device(slot_id, port, speed)
+            .await
             .map_err(HidError::Xhci)?;
-        bind_mouse_addressed_slot(xhci_dev, slot_id, speed)
-    })();
+        bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await
+    }.await;
     if res.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id);
+        let _ = xhci_dev.disable_slot(slot_id).await;
     }
     res
 }
@@ -318,7 +320,7 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
 /// match + configure_endpoints + SET_CONFIGURATION + SET_PROTOCOL
 /// + arm_interrupt_in + registry push. No disable_slot — caller's
 /// guard handles that.
-fn bind_mouse_addressed_slot(
+async fn bind_mouse_addressed_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
@@ -326,7 +328,7 @@ fn bind_mouse_addressed_slot(
         // Refresh EP0 MPS via Evaluate Context once the device tells
         // us its real bMaxPacketSize0. Same logic as kbd path
         // (audit F-22 + F-23).
-        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id) {
+        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
             let mps0 = desc[7] as u16;
             let want = match speed {
                 crate::xhci::PortSpeed::Low | crate::xhci::PortSpeed::Full
@@ -343,13 +345,14 @@ fn bind_mouse_addressed_slot(
                 _ => None,
             };
             if let Some(real_mps) = want {
-                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps);
+                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps).await;
             }
         }
 
         let mut head = [0u8; 9];
         let n = xhci_dev
             .get_config_descriptor(slot_id, 0, &mut head)
+            .await
             .map_err(HidError::Xhci)?;
         if n < 9 {
             return Err(HidError::NoInterruptIn);
@@ -366,6 +369,7 @@ fn bind_mouse_addressed_slot(
         let mut full = alloc::vec![0u8; total];
         let n2 = xhci_dev
             .get_config_descriptor(slot_id, 0, &mut full)
+            .await
             .map_err(HidError::Xhci)?;
         if n2 < total {
             full.truncate(n2);
@@ -378,6 +382,7 @@ fn bind_mouse_addressed_slot(
         // are ready when the device starts producing reports).
         xhci_dev
             .configure_endpoints(slot_id, &[ep])
+            .await
             .map_err(HidError::Xhci)?;
 
         // SET_CONFIGURATION (audit F-62): without this the device
@@ -394,10 +399,11 @@ fn bind_mouse_addressed_slot(
                 0,
                 &mut nothing,
             )
+            .await
             .map_err(HidError::Xhci)?;
 
         let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
-        let m = BootMouse::attach(xhci_dev, slot_id, iface, dci)?;
+        let m = BootMouse::attach(xhci_dev, slot_id, iface, dci).await?;
         {
             let mut g = MICE.lock();
             g.push(m);
