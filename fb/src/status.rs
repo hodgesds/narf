@@ -110,13 +110,22 @@ pub fn paint(fb: &FbWriter) {
     let supervisor_ticks = narf_drivers_usb::SUPERVISOR_TICKS.load(Ordering::Relaxed);
     let supervisor_phase = narf_drivers_usb::SUPERVISOR_PHASE.load(Ordering::Relaxed);
     let supervisor_port = narf_drivers_usb::SUPERVISOR_ATTACHING_PORT.load(Ordering::Relaxed);
+    // Clockevent diagnostics. `primary()` returns the selected
+    // tick source (LAPIC or HPET). Its tick_count is the
+    // platform-agnostic "did the timer fire" signal — replaces
+    // the LAPIC-specific `tt=` that misled us into thinking the
+    // wheel was broken when really the LAPIC timer was just dead.
+    let (clk_name, clk_ticks) = match narf_time::clockevent::primary() {
+        Some(d) => (d.name(), d.tick_count()),
+        None => ("none", 0u64),
+    };
     let usb_hid_line = format!(
-        "USB: sup={} yt={} wakes={} tt={} lvt={:08x} cpns={} irq1={}",
+        "USB: sup={} yt={} wakes={} clk={}:{} cpns={} irq1={}",
         supervisor_ticks,
         narf_drivers_usb::YIELD_TIMEOUT_POLLS.load(Ordering::Relaxed),
         narf_scheduler::WAKE_BY_REF_CALLS.load(Ordering::Relaxed),
-        narf_interrupts::x86_64::apic::timer_ticks(),
-        narf_interrupts::x86_64::apic::LVT_TIMER_READBACK.load(Ordering::Relaxed),
+        clk_name,
+        clk_ticks,
         narf_time::cycles_per_ns(),
         {
             let v = narf_input::I8042_KBD_IRQ_VECTOR.load(Ordering::Acquire);
