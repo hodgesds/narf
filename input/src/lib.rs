@@ -1039,6 +1039,15 @@ pub static I8042_KBD_INIT_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 pub static I8042_MOUSE_INIT_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// True iff the keyboard channel acknowledged `0xF4 ENABLE_SCANNING`.
+/// `INIT_OK` says the controller is alive; `SCANNING_OK` says the
+/// keyboard itself is wired and now generating scancodes. Phoenix /
+/// Renoir EC PS/2 emulation: controller passes self-test instantly
+/// (init=ok) but keyboard reset replies take tens of ms — if the
+/// driver's init busy-spin is too short, `SCANNING_OK` stays false
+/// and the panel shows "scan=FAIL" even when "init=ok irq=routed".
+pub static I8042_KBD_SCANNING_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 /// Per-class ring activity counters — increment on every
 /// successful `push_global` so the panel can show whether kbd
 /// IRQs are firing without requiring serial. If kbd-pushes stays

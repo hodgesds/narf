@@ -130,14 +130,16 @@ pub fn paint(fb: &FbWriter) {
     let i8042_diag = {
         let kbd_init = narf_input::I8042_KBD_INIT_OK.load(Ordering::Acquire);
         let kbd_irq = narf_input::I8042_KBD_IRQ_ROUTED.load(Ordering::Acquire);
+        let kbd_scan = narf_input::I8042_KBD_SCANNING_OK.load(Ordering::Acquire);
         let kbd_pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
         let kbd_pops = narf_input::KEY_POP_COUNT.load(Ordering::Relaxed);
         let ascii_pushes = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
         let ascii_pops = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
         format!(
-            "input: kbd init={}/irq={} key push/pop={}/{} ascii push/pop={}/{}",
+            "input: kbd init={}/irq={}/scan={} key push/pop={}/{} ascii={}/{}",
             if kbd_init { "ok" } else { "FAIL" },
             if kbd_irq { "ok" } else { "FAIL" },
+            if kbd_scan { "ok" } else { "FAIL" },
             kbd_pushes,
             kbd_pops,
             ascii_pushes,

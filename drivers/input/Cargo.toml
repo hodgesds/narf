@@ -15,6 +15,7 @@ path = "src/lib.rs"
 narf-lib            = { path = "../../lib" }
 narf-input          = { path = "../../input" }
 narf-arch           = { path = "../../arch" }
+narf-time           = { path = "../../time" }
 narf-interrupts     = { path = "../../interrupts" }
 narf-acpi           = { path = "../../acpi" }
 narf-drivers        = { path = "../../drivers" }

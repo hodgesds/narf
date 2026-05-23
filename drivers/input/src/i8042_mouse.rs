@@ -55,8 +55,16 @@ const CONF_KBD_IRQ: u8 = 1 << 0;
 const CONF_AUX_IRQ: u8 = 1 << 1;
 const CONF_AUX_DIS: u8 = 1 << 5;
 
-const HOT_SPINS: u32 = 10_000;
-const COLD_SPINS: u32 = 2_000;
+/// Controller-config wait; controller commands respond in µs.
+const CONFIG_WAIT_MS: u64 = 5;
+/// Mouse-channel reply wait; see i8042.rs for the EC-latency rationale.
+/// PS/2 mouse reset also returns a 3rd "device id" byte that can
+/// arrive up to ~100 ms after BAT.
+const MOUSE_REPLY_MS: u64 = 100;
+const MOUSE_BAT_MS: u64 = 500;
+
+const MOUSE_ACK: u8 = 0xFA;
+const MOUSE_BAT_OK: u8 = 0xAA;
 
 #[derive(Debug)]
 pub struct State {
@@ -99,44 +107,33 @@ pub enum InitError {
     Timeout,
 }
 
-fn wait_input_clear() -> Result<(), InitError> {
-    for _ in 0..HOT_SPINS {
+fn deadline_cycles(ms: u64) -> u64 {
+    let cpns = narf_time::cycles_per_ns() as u64;
+    let cpms = if cpns == 0 { 1_000_000 } else { cpns * 1_000_000 };
+    narf_time::now_cycles().saturating_add(cpms.saturating_mul(ms))
+}
+
+fn wait_input_clear_ms(ms: u64) -> Result<(), InitError> {
+    let deadline = deadline_cycles(ms);
+    while narf_time::now_cycles() < deadline {
         // SAFETY: 0x64 status read.
         if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
             return Ok(());
         }
+        core::hint::spin_loop();
     }
     Err(InitError::Timeout)
 }
 
-fn wait_output() -> Result<u8, InitError> {
-    for _ in 0..HOT_SPINS {
+fn wait_output_ms(ms: u64) -> Option<u8> {
+    let deadline = deadline_cycles(ms);
+    while narf_time::now_cycles() < deadline {
         // SAFETY: 0x64 status read.
         if unsafe { inb(PS2_STATUS) } & STATUS_OUTPUT_FULL != 0 {
             // SAFETY: 0x60 data read.
-            return Ok(unsafe { inb(PS2_DATA) });
-        }
-    }
-    Err(InitError::Timeout)
-}
-
-fn wait_input_clear_short() -> bool {
-    for _ in 0..COLD_SPINS {
-        // SAFETY: status read.
-        if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
-            return true;
-        }
-    }
-    false
-}
-
-fn wait_output_short() -> Option<u8> {
-    for _ in 0..COLD_SPINS {
-        // SAFETY: status read.
-        if unsafe { inb(PS2_STATUS) } & STATUS_OUTPUT_FULL != 0 {
-            // SAFETY: data read.
             return Some(unsafe { inb(PS2_DATA) });
         }
+        core::hint::spin_loop();
     }
     None
 }
@@ -156,64 +153,84 @@ pub unsafe fn init() -> Result<(), InitError> {
     }
 
     // 1. Enable AUX channel.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: 0x64 cmd.
     unsafe {
         outb(PS2_CMD, CMD_ENABLE_AUX);
     }
 
     // 2. Update config: set AUX_IRQ, clear AUX_DIS.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
-    let mut conf = wait_output()?;
+    let mut conf = wait_output_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
     conf |= CONF_AUX_IRQ;
     conf &= !CONF_AUX_DIS;
-    conf |= CONF_KBD_IRQ; // keep KB IRQ as i8042::init left it
-    wait_input_clear()?;
+    conf |= CONF_KBD_IRQ;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_DATA, conf);
     }
 
-    // 3. Reset (best-effort).
-    let _ = wait_input_clear_short();
+    // 3. Reset + verify ACK + BAT + device-id. AUX commands ride
+    //    behind 0xD4 (WRITE_AUX) per the i8042 spec — every byte
+    //    sent to the mouse needs the prefix.
+    let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
     unsafe {
         outb(PS2_CMD, CMD_WRITE_AUX);
     }
-    let _ = wait_input_clear_short();
+    let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
     unsafe {
         outb(PS2_DATA, 0xFF);
     }
-    let _ = wait_output_short(); // ACK
-    let _ = wait_output_short(); // BAT (0xAA)
-    let _ = wait_output_short(); // device id (0x00)
+    let mut reporting_ok = wait_output_ms(MOUSE_REPLY_MS) == Some(MOUSE_ACK);
+    if reporting_ok {
+        if wait_output_ms(MOUSE_BAT_MS) != Some(MOUSE_BAT_OK) {
+            reporting_ok = false;
+        }
+        // Device id (0x00 for standard mouse) follows BAT but
+        // is informational; don't gate on it.
+        let _ = wait_output_ms(MOUSE_REPLY_MS);
+    }
 
-    // 4. Set defaults (0xF6) + enable data reporting (0xF4).
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_CMD, CMD_WRITE_AUX);
+    if reporting_ok {
+        // 4a. Set defaults (0xF6) — ACK.
+        let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        unsafe {
+            outb(PS2_CMD, CMD_WRITE_AUX);
+        }
+        let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        unsafe {
+            outb(PS2_DATA, 0xF6);
+        }
+        if wait_output_ms(MOUSE_REPLY_MS) != Some(MOUSE_ACK) {
+            reporting_ok = false;
+        }
     }
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_DATA, 0xF6);
-    }
-    let _ = wait_output_short();
 
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_CMD, CMD_WRITE_AUX);
+    if reporting_ok {
+        // 4b. Enable data reporting (0xF4) — ACK. This flips the
+        // mouse from "idle" to "actively sending packets."
+        let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        unsafe {
+            outb(PS2_CMD, CMD_WRITE_AUX);
+        }
+        let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        unsafe {
+            outb(PS2_DATA, 0xF4);
+        }
+        if wait_output_ms(MOUSE_REPLY_MS) != Some(MOUSE_ACK) {
+            reporting_ok = false;
+        }
     }
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_DATA, 0xF4);
-    }
-    let _ = wait_output_short();
 
+    let _ = reporting_ok; // tracked via STATE.initialized only; mouse
+                          // doesn't have a separate panel atom yet.
     STATE.initialized.store(true, Ordering::Release);
     Ok(())
 }

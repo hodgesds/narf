@@ -34,6 +34,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{push_key, KeyCode};
 
+/// PS/2 keyboard reply bytes (post-command).
+const KBD_ACK: u8 = 0xFA;
+const KBD_BAT_OK: u8 = 0xAA;
+
 /// I/O ports.
 pub const PS2_DATA: u16 = 0x60;
 pub const PS2_STATUS: u16 = 0x64;
@@ -88,63 +92,59 @@ pub enum InitError {
     Timeout,
 }
 
-/// Spin bound for hot-path waits (controller config, self-test).
-/// QEMU responds within a few iterations; bare metal is similar.
-const HOT_SPINS: u32 = 10_000;
-/// Spin bound for best-effort waits (keyboard reset / scancode-set
-/// programming) where the keyboard may not be wired up at all (USB-only
-/// system, virtio-keyboard front-end). Kept small so init failure
-/// doesn't add visible latency to boot.
-const COLD_SPINS: u32 = 2_000;
+/// Controller config-byte wait. The controller-side commands (read
+/// config, self-test, enable channel) respond in microseconds on
+/// real silicon — 5 ms is generous.
+const CONFIG_WAIT_MS: u64 = 5;
+/// Keyboard-side reply wait. Reset/set-scancode/enable-scanning each
+/// flow through the EC's PS/2 emulation on modern laptops, which
+/// adds milliseconds to tens of milliseconds of delay (vs. nanoseconds
+/// on QEMU). Pre-fix this was 2000 iterations of `inb 0x64` ≈ ~50 µs,
+/// which silently lost every reply on Phoenix HawkPoint1 / Renoir,
+/// so ENABLE_SCANNING was never acknowledged and the keyboard
+/// channel never started emitting scancodes. 100 ms covers the
+/// EC's worst-case ACK; the BAT byte after reset gets 500 ms per
+/// IBM PS/2 §7 ("up to 500 ms").
+const KBD_REPLY_MS: u64 = 100;
+const KBD_BAT_MS: u64 = 500;
 
-/// Block until the controller's input buffer is empty (so a subsequent
-/// command write won't be discarded).
-fn wait_input_clear() -> Result<(), InitError> {
-    for _ in 0..HOT_SPINS {
+/// Wall-time TSC deadline `ms` from now. Falls back to a 1 GHz
+/// estimate if `cycles_per_ns` returned 0 (calibration didn't run);
+/// that still yields a measurable wait — never zero.
+fn deadline_cycles(ms: u64) -> u64 {
+    let cpns = narf_time::cycles_per_ns() as u64;
+    let cpms = if cpns == 0 { 1_000_000 } else { cpns * 1_000_000 };
+    narf_time::now_cycles().saturating_add(cpms.saturating_mul(ms))
+}
+
+/// Block until the controller's input buffer is empty OR the
+/// wall-clock deadline passes. Returns `Ok` on cleared buffer.
+fn wait_input_clear_ms(ms: u64) -> Result<(), InitError> {
+    let deadline = deadline_cycles(ms);
+    while narf_time::now_cycles() < deadline {
         // SAFETY: I/O port read at CPL=0 is always defined; 0x64 is
         // the i8042 status register.
         if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
             return Ok(());
         }
+        core::hint::spin_loop();
     }
     Err(InitError::Timeout)
 }
 
-/// Block until the controller's output buffer has data; returns it.
-fn wait_output_byte() -> Result<u8, InitError> {
-    for _ in 0..HOT_SPINS {
-        // SAFETY: same as wait_input_clear.
-        if unsafe { inb(PS2_STATUS) } & STATUS_OUTPUT_FULL != 0 {
-            // SAFETY: data port at CPL=0 is always defined.
-            return Ok(unsafe { inb(PS2_DATA) });
-        }
-    }
-    Err(InitError::Timeout)
-}
-
-/// Same as `wait_output_byte` but with a smaller spin bound for
-/// best-effort steps where a missing reply just means "this
-/// keyboard isn't there" — we don't want to add boot latency
-/// hunting for a device that won't answer.
-fn wait_output_byte_short() -> Option<u8> {
-    for _ in 0..COLD_SPINS {
+/// Block until the controller's output buffer has data OR the
+/// wall-clock deadline passes; returns the byte on success.
+fn wait_output_byte_ms(ms: u64) -> Option<u8> {
+    let deadline = deadline_cycles(ms);
+    while narf_time::now_cycles() < deadline {
         // SAFETY: status read.
         if unsafe { inb(PS2_STATUS) } & STATUS_OUTPUT_FULL != 0 {
             // SAFETY: data port read.
             return Some(unsafe { inb(PS2_DATA) });
         }
+        core::hint::spin_loop();
     }
     None
-}
-
-fn wait_input_clear_short() -> bool {
-    for _ in 0..COLD_SPINS {
-        // SAFETY: status read.
-        if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
-            return true;
-        }
-    }
-    false
 }
 
 fn flush_output() {
@@ -170,12 +170,12 @@ pub unsafe fn init() -> Result<(), InitError> {
     }
 
     // 1. Disable channels so init bytes don't race with stray scancodes.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: 0x64 is the cmd port.
     unsafe {
         outb(PS2_CMD, CMD_DISABLE_KBD);
     }
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_DISABLE_AUX);
     }
@@ -184,84 +184,126 @@ pub unsafe fn init() -> Result<(), InitError> {
     flush_output();
 
     // 3. Read the config byte, clear translate + IRQs while we configure.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
-    let mut conf = wait_output_byte()?;
+    let mut conf = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
     conf &= !(CONF_KBD_TRANSLATE | CONF_KBD_IRQ | CONF_AUX_IRQ);
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_DATA, conf);
     }
 
     // 4. Self-test.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_SELF_TEST);
     }
-    let st = wait_output_byte()?;
+    let st = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
     if st != 0x55 {
         return Err(InitError::SelfTestFailed);
     }
 
     // 5. Re-enable the keyboard channel + arm IRQ 1.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_ENABLE_KBD);
     }
     // Re-read config (self-test may have reset it on some chips), set IRQ.
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
-    let mut conf2 = wait_output_byte()?;
+    let mut conf2 = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
     conf2 |= CONF_KBD_IRQ;
     conf2 &= !CONF_KBD_DISABLE;
     conf2 &= !CONF_KBD_TRANSLATE;
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
-    wait_input_clear()?;
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_DATA, conf2);
     }
 
-    // 6. Keyboard reset / scancode-set / enable scanning. ALL of
-    //    this is best-effort — a USB-only or virtio-input-only
-    //    system has no PS/2 keyboard wired to the i8042, and we
-    //    don't want to spend tens of milliseconds polling for
-    //    replies that never arrive. Use the short bounds.
-    let _ = wait_input_clear_short();
+    // 6. Keyboard reset / set scancode-set 1 / enable scanning. On
+    //    real silicon this is where the AMD Phoenix / Renoir EC's
+    //    PS/2 emulation latency matters: each ACK can take tens of
+    //    ms; the BAT byte after reset, up to 500 ms (IBM PS/2 §7).
+    //    Verify each step. ENABLE_SCANNING (0xF4) is the load-
+    //    bearing one — if its ACK doesn't arrive, the keyboard
+    //    channel never starts emitting scancodes regardless of
+    //    how IRQ1 is routed.
+    //
+    //    Controller-side init (steps 1-5) succeeding while the
+    //    keyboard channel fails is a normal outcome: USB-only or
+    //    virtio-input-only systems present an 8042 controller
+    //    that passes self-test but has no actual PS/2 keyboard
+    //    behind the kbd channel. We surface that distinction via
+    //    `I8042_KBD_SCANNING_OK`: controller-init returns Ok
+    //    either way (so the IRQ wiring is still installed for
+    //    hot-plug cases), but `scanning` reflects whether the
+    //    keyboard is genuinely live.
+    let mut scanning_ok = true;
+    let _ = wait_input_clear_ms(KBD_REPLY_MS);
     // SAFETY: data port write.
     unsafe {
         outb(PS2_DATA, 0xFF);
-    } // reset
-    let _ = wait_output_byte_short(); // ACK 0xFA
-    let _ = wait_output_byte_short(); // BAT 0xAA
-
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_DATA, 0xF0);
     }
-    let _ = wait_output_byte_short();
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_DATA, 0x01);
+    // Reset reply: ACK then BAT, or BAT alone on some keyboards.
+    // The first byte arrives within ~100 ms; the second (BAT after
+    // ACK) can take up to 500 ms.
+    match wait_output_byte_ms(KBD_REPLY_MS) {
+        Some(KBD_ACK) => {
+            match wait_output_byte_ms(KBD_BAT_MS) {
+                Some(KBD_BAT_OK) => {}
+                _ => scanning_ok = false,
+            }
+        }
+        Some(KBD_BAT_OK) => {} // reset complete in one byte
+        _ => scanning_ok = false,
     }
-    let _ = wait_output_byte_short();
 
-    let _ = wait_input_clear_short();
-    unsafe {
-        outb(PS2_DATA, 0xF4);
+    if scanning_ok {
+        // Set scancode-set 1: 0xF0 then 0x01, each ACK'd.
+        let _ = wait_input_clear_ms(KBD_REPLY_MS);
+        unsafe {
+            outb(PS2_DATA, 0xF0);
+        }
+        if wait_output_byte_ms(KBD_REPLY_MS) != Some(KBD_ACK) {
+            scanning_ok = false;
+        }
+        if scanning_ok {
+            let _ = wait_input_clear_ms(KBD_REPLY_MS);
+            unsafe {
+                outb(PS2_DATA, 0x01);
+            }
+            if wait_output_byte_ms(KBD_REPLY_MS) != Some(KBD_ACK) {
+                scanning_ok = false;
+            }
+        }
     }
-    let _ = wait_output_byte_short();
 
+    if scanning_ok {
+        // Enable scanning: 0xF4, ACK required. THIS is the bit
+        // that flips the keyboard from "reset complete, idle"
+        // to "actively sending scancodes."
+        let _ = wait_input_clear_ms(KBD_REPLY_MS);
+        unsafe {
+            outb(PS2_DATA, 0xF4);
+        }
+        if wait_output_byte_ms(KBD_REPLY_MS) != Some(KBD_ACK) {
+            scanning_ok = false;
+        }
+    }
+
+    narf_input::I8042_KBD_SCANNING_OK.store(scanning_ok, Ordering::Release);
     STATE.initialized.store(true, Ordering::Release);
     Ok(())
 }
