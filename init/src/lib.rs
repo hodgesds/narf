@@ -102,12 +102,28 @@ impl Stage {
     }
 }
 
+/// Wall-time budget every initcall gets by default. Picked
+/// generously: real-HW probes on the slowest paths (HDA codec
+/// link-up, IOMMU table walk) come in around 50–150 ms; this
+/// budget catches the firmware-quirk hangs (ACPI AML, EC
+/// handshake, GPU FW load) without false-positiving on a slow
+/// laptop. A specific initcall that *needs* more can opt in via
+/// [`register_with_budget`].
+pub const DEFAULT_BUDGET_MS: u32 = 500;
+
 /// One registered initcall.
 #[derive(Copy, Clone)]
 pub struct Initcall {
     pub stage: Stage,
     pub name: &'static str,
     pub func: InitFn,
+    /// Wall-time budget in ms. When exceeded the runtime logs a
+    /// warning but does NOT kill the initcall — NARF init runs
+    /// synchronously from the BSP, so there's no preemption to
+    /// fire (cf. discussion in `scheduler/specification`). The
+    /// warning lets bring-up bisect *which* call ate the budget,
+    /// which is the real win.
+    pub budget_ms: u32,
 }
 
 impl core::fmt::Debug for Initcall {
@@ -115,6 +131,7 @@ impl core::fmt::Debug for Initcall {
         f.debug_struct("Initcall")
             .field("stage", &self.stage)
             .field("name", &self.name)
+            .field("budget_ms", &self.budget_ms)
             .finish_non_exhaustive()
     }
 }
@@ -135,6 +152,11 @@ pub struct StageStats {
     pub max_cycles: u64,
     /// Name of the slowest single initcall, for diagnostics.
     pub max_name: &'static str,
+    /// Number of initcalls in this stage that exceeded their wall-
+    /// time budget. Non-fatal — the runtime logs and moves on —
+    /// but `bare_main` surfaces this in the boot summary so a
+    /// regression doesn't go unnoticed.
+    pub over_budget: u32,
 }
 
 /// Optional hook for emitting "init: stage X / call Y -> Z" lines.
@@ -184,6 +206,7 @@ const EMPTY_STATS: StageStats = StageStats {
     total_cycles: 0,
     max_cycles: 0,
     max_name: "",
+    over_budget: 0,
 };
 
 static REGISTRY: Registry = Registry {
@@ -200,15 +223,53 @@ static REGISTRY: Registry = Registry {
     stats: IrqSafeSpinLock::new([EMPTY_STATS; 8]),
 };
 
-/// Register an initcall under the given stage. The function will
-/// run when `run_stage(stage)` is invoked. Subsequent registrations
-/// to the same stage append; order within a stage is the
-/// registration order.
+/// Register an initcall under the given stage with the default
+/// wall-time budget ([`DEFAULT_BUDGET_MS`], 500 ms). The function
+/// will run when `run_stage(stage)` is invoked. Subsequent
+/// registrations to the same stage append; order within a stage
+/// is the registration order.
+///
+/// Use [`register_with_budget`] when an initcall is expected to
+/// be slow on purpose (firmware blob load, AML evaluation,
+/// per-CPU bring-up loop) — the watchdog is a *warning*, not a
+/// gate, but tuning the budget to the expected ceiling reduces
+/// boot-log noise.
 pub fn register(stage: Stage, name: &'static str, func: InitFn) {
+    register_with_budget(stage, name, func, DEFAULT_BUDGET_MS);
+}
+
+/// Like [`register`] but with an explicit wall-time budget. An
+/// initcall exceeding `budget_ms` on a run produces one line
+/// through the log hook:
+///   `initcall <name> (stage <S>) took Tms — over budget Bms`
+/// The runtime then moves on to the next initcall; it does NOT
+/// kill the call (NARF init is synchronous from the BSP, so
+/// there's no preemption to fire). The warning lets bring-up
+/// pinpoint *which* call ate the boot budget without the user
+/// having to bisect by hand.
+pub fn register_with_budget(stage: Stage, name: &'static str, func: InitFn, budget_ms: u32) {
     let i = stage as usize;
-    REGISTRY.stages[i]
-        .lock()
-        .push(Initcall { stage, name, func });
+    REGISTRY.stages[i].lock().push(Initcall {
+        stage,
+        name,
+        func,
+        budget_ms,
+    });
+}
+
+/// Convert a `cycles_since` delta into whole milliseconds using
+/// the wall-module calibration. Returns 0 when calibration hasn't
+/// completed (cycles_per_ns falls through to 1) AND the delta is
+/// short — the watchdog would otherwise mis-flag every call as
+/// over-budget pre-calibration.
+fn cycles_to_ms(cycles: u64) -> u64 {
+    // cycles_per_ns is u32 with a floor of 1; one Hz / 1e9.
+    // ms = cycles / (cpns * 1_000_000); guard against the
+    // degenerate "cpns = 1 because uncalibrated" case by leaving
+    // the math as-is — pre-calibration the budget check just
+    // doesn't fire usefully, which is the right behaviour.
+    let cpns = narf_time::cycles_per_ns().max(1) as u64;
+    cycles / cpns / 1_000_000
 }
 
 /// Run every initcall registered under `stage`. Each call's result
@@ -243,6 +304,29 @@ pub fn run_stage(stage: Stage) -> StageStats {
         if dt > stats.max_cycles {
             stats.max_cycles = dt;
             stats.max_name = ic.name;
+        }
+        // Wall-time budget check. Wait-and-log: NARF init runs
+        // synchronously from the BSP, so there's no preemption
+        // signal to fire on a stuck initcall. Logging the
+        // overrun lets bring-up bisect which call ate the budget;
+        // re-enabling the BISECT-DISABLED power-monitor (see
+        // `power/src/lib.rs:199`) is the canonical regression
+        // case this watchdog was wired for.
+        let took_ms = cycles_to_ms(dt);
+        if took_ms > ic.budget_ms as u64 {
+            stats.over_budget = stats.over_budget.saturating_add(1);
+            let mut buf = [0u8; 256];
+            let mut w = TruncatingWriter::new(&mut buf);
+            use core::fmt::Write;
+            let _ = write!(
+                &mut w,
+                "init: {} / {} took {}ms - over budget {}ms",
+                stage.name(),
+                ic.name,
+                took_ms,
+                ic.budget_ms,
+            );
+            log(w.as_str());
         }
         match result {
             InitResult::Ok => {
@@ -334,7 +418,7 @@ pub fn print_summary(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
     writeln!(w, "  init summary:")?;
     writeln!(
         w,
-        "    stage       calls  ok  skip  err  total_cyc      slowest"
+        "    stage       calls  ok  skip  err  ovbg  total_cyc      slowest"
     )?;
     for stage in Stage::ALL {
         let s = stats(stage);
@@ -343,12 +427,13 @@ pub fn print_summary(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         }
         writeln!(
             w,
-            "    {:8}    {:5}  {:>2}  {:>4}  {:>3}  {:>11}  {} ({} cyc)",
+            "    {:8}    {:5}  {:>2}  {:>4}  {:>3}  {:>4}  {:>11}  {} ({} cyc)",
             stage.name(),
             s.total,
             s.ok,
             s.not_present,
             s.error,
+            s.over_budget,
             s.total_cycles,
             if s.max_name.is_empty() {
                 "-"
