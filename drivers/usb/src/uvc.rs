@@ -564,7 +564,7 @@ pub fn find_video_control_interface(cfg: &[u8]) -> Option<u8> {
 
 /// Bind to an already-addressed UVC device. SET_CONFIGURATION,
 /// then record the slot/interface pair.
-pub fn try_bind_video_already_addressed(
+pub async fn try_bind_video_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
@@ -581,6 +581,7 @@ pub fn try_bind_video_already_addressed(
             0,
             &mut nothing,
         )
+        .await
         .is_err()
     {
         return Err(UvcError::SetConfigFailed);
@@ -638,10 +639,18 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError>
         }
         (dev.slot_id, dev.iso_in_dci)
     };
-    let outcome = crate::xhci::with_controller(|c| c.isoch_in(slot_id, dci, out));
+    // Sync entry-point on the UVC capture path; bridge to async
+    // isoch_in via block_on. Called from non-executor contexts.
+    let c = match crate::xhci::controller() {
+        Some(c) => c,
+        None => return Err(UvcError::SetConfigFailed),
+    };
+    let outcome = narf_scheduler::block_on(async {
+        c.isoch_in(slot_id, dci, out).await
+    });
     match outcome {
-        Some(Ok(n)) => Ok(n),
-        Some(Err(_)) | None => Err(UvcError::SetConfigFailed),
+        Ok(n) => Ok(n),
+        Err(_) => Err(UvcError::SetConfigFailed),
     }
 }
 

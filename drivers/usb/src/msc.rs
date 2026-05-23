@@ -172,7 +172,7 @@ impl MscDevice {
     /// populated. Caller must have already run
     /// `xhci.configure_endpoints` for the bulk pair returned by
     /// `find_bot_endpoints`.
-    pub fn attach(xhci: &Xhci, slot_id: u8, bulk_in: u8, bulk_out: u8) -> Result<Self, MscError> {
+    pub async fn attach(xhci: &Xhci, slot_id: u8, bulk_in: u8, bulk_out: u8) -> Result<Self, MscError> {
         let dev = MscDevice {
             slot_id,
             bulk_in,
@@ -181,7 +181,7 @@ impl MscDevice {
             last_lba: 0,
             tag: IrqSafeSpinLock::new(1),
         };
-        let cap = dev.read_capacity_10(xhci)?;
+        let cap = dev.read_capacity_10(xhci).await?;
         Ok(MscDevice {
             slot_id,
             bulk_in,
@@ -217,9 +217,9 @@ impl MscDevice {
     /// Receive + parse a 13-byte CSW (§5.2 Table 5.2). Verifies the
     /// `b'USBS'` signature and returns the bCSWStatus byte (0=ok,
     /// 1=fail, 2=phase err) and the residue.
-    fn read_csw(&self, xhci: &Xhci, expect_tag: u32) -> Result<(u8, u32), MscError> {
+    async fn read_csw(&self, xhci: &Xhci, expect_tag: u32) -> Result<(u8, u32), MscError> {
         let mut buf = [0u8; 13];
-        let n = xhci.bulk_in(self.slot_id, self.bulk_in, &mut buf)?;
+        let n = xhci.bulk_in(self.slot_id, self.bulk_in, &mut buf).await?;
         if n < 13 {
             return Err(MscError::BadCsw);
         }
@@ -234,11 +234,11 @@ impl MscDevice {
     }
 
     /// Run a SCSI command with no data stage. Used by TEST UNIT READY.
-    fn cmd_no_data(&self, xhci: &Xhci, cb: &[u8]) -> Result<(), MscError> {
+    async fn cmd_no_data(&self, xhci: &Xhci, cb: &[u8]) -> Result<(), MscError> {
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, 0, false, cb);
-        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw)?;
-        let (status, _) = self.read_csw(xhci, tag)?;
+        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
+        let (status, _) = self.read_csw(xhci, tag).await?;
         if status != 0 {
             return Err(MscError::CswStatus(status));
         }
@@ -246,12 +246,12 @@ impl MscDevice {
     }
 
     /// Run a SCSI command with a host-bound (IN) data stage.
-    fn cmd_data_in(&self, xhci: &Xhci, cb: &[u8], out: &mut [u8]) -> Result<usize, MscError> {
+    async fn cmd_data_in(&self, xhci: &Xhci, cb: &[u8], out: &mut [u8]) -> Result<usize, MscError> {
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, out.len() as u32, true, cb);
-        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw)?;
-        let n = xhci.bulk_in(self.slot_id, self.bulk_in, out)?;
-        let (status, _) = self.read_csw(xhci, tag)?;
+        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
+        let n = xhci.bulk_in(self.slot_id, self.bulk_in, out).await?;
+        let (status, _) = self.read_csw(xhci, tag).await?;
         if status != 0 {
             return Err(MscError::CswStatus(status));
         }
@@ -259,12 +259,12 @@ impl MscDevice {
     }
 
     /// Run a SCSI command with a device-bound (OUT) data stage.
-    fn cmd_data_out(&self, xhci: &Xhci, cb: &[u8], data: &[u8]) -> Result<usize, MscError> {
+    async fn cmd_data_out(&self, xhci: &Xhci, cb: &[u8], data: &[u8]) -> Result<usize, MscError> {
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, data.len() as u32, false, cb);
-        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw)?;
-        let n = xhci.bulk_out(self.slot_id, self.bulk_out, data)?;
-        let (status, _) = self.read_csw(xhci, tag)?;
+        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
+        let n = xhci.bulk_out(self.slot_id, self.bulk_out, data).await?;
+        let (status, _) = self.read_csw(xhci, tag).await?;
         if status != 0 {
             return Err(MscError::CswStatus(status));
         }
@@ -275,16 +275,16 @@ impl MscDevice {
     /// Returns `Ok(())` if the device is ready to handle media
     /// access; a CSW status of 1 means the device wants the host
     /// to call REQUEST SENSE (not implemented here — Stage-5 cut).
-    pub fn test_unit_ready(&self, xhci: &Xhci) -> Result<(), MscError> {
-        self.cmd_no_data(xhci, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0])
+    pub async fn test_unit_ready(&self, xhci: &Xhci) -> Result<(), MscError> {
+        self.cmd_no_data(xhci, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0]).await
     }
 
     /// `INQUIRY` (SPC-4 §6.5). Returns the standard 36-byte INQUIRY
     /// response (vendor / product / revision / etc.).
-    pub fn inquiry(&self, xhci: &Xhci) -> Result<[u8; 36], MscError> {
+    pub async fn inquiry(&self, xhci: &Xhci) -> Result<[u8; 36], MscError> {
         let cb = [SCSI_INQUIRY, 0, 0, 0, 36, 0];
         let mut out = [0u8; 36];
-        let n = self.cmd_data_in(xhci, &cb, &mut out)?;
+        let n = self.cmd_data_in(xhci, &cb, &mut out).await?;
         if n < 36 {
             return Err(MscError::BadLength);
         }
@@ -294,10 +294,10 @@ impl MscDevice {
     /// `READ CAPACITY(10)` (SBC-3 §5.16). Returns
     /// `(block_bytes, last_lba)` — the device's reported block size
     /// and the index of the last addressable LBA.
-    pub fn read_capacity_10(&self, xhci: &Xhci) -> Result<(u32, u32), MscError> {
+    pub async fn read_capacity_10(&self, xhci: &Xhci) -> Result<(u32, u32), MscError> {
         let cb = [SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut out = [0u8; 8];
-        let n = self.cmd_data_in(xhci, &cb, &mut out)?;
+        let n = self.cmd_data_in(xhci, &cb, &mut out).await?;
         if n < 8 {
             return Err(MscError::BadLength);
         }
@@ -309,7 +309,7 @@ impl MscDevice {
 
     /// `READ(10)` for a single block. Returns the `lba_bytes`-sized
     /// data buffer. SBC-3 §5.10.
-    pub fn read_block(&self, xhci: &Xhci, lba: u32) -> Result<Vec<u8>, MscError> {
+    pub async fn read_block(&self, xhci: &Xhci, lba: u32) -> Result<Vec<u8>, MscError> {
         if self.lba_bytes == 0 || self.lba_bytes as usize > 4096 {
             return Err(MscError::BadLength);
         }
@@ -329,7 +329,7 @@ impl MscDevice {
         ];
         let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(self.lba_bytes as usize);
         out.resize(self.lba_bytes as usize, 0);
-        let n = self.cmd_data_in(xhci, &cb, &mut out[..])?;
+        let n = self.cmd_data_in(xhci, &cb, &mut out[..]).await?;
         if n != self.lba_bytes as usize {
             return Err(MscError::BadLength);
         }
@@ -337,7 +337,7 @@ impl MscDevice {
     }
 
     /// `WRITE(10)` for a single block. SBC-3 §5.27.
-    pub fn write_block(&self, xhci: &Xhci, lba: u32, data: &[u8]) -> Result<(), MscError> {
+    pub async fn write_block(&self, xhci: &Xhci, lba: u32, data: &[u8]) -> Result<(), MscError> {
         if data.len() != self.lba_bytes as usize {
             return Err(MscError::BadLength);
         }
@@ -354,7 +354,7 @@ impl MscDevice {
             1,
             0,
         ];
-        let n = self.cmd_data_out(xhci, &cb, data)?;
+        let n = self.cmd_data_out(xhci, &cb, data).await?;
         if n != data.len() {
             return Err(MscError::BadLength);
         }
@@ -364,7 +364,7 @@ impl MscDevice {
     /// Multi-block `READ(10)`. Reads `nblocks` consecutive blocks
     /// starting at `lba`. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per
     /// call. Returns the concatenated payload.
-    pub fn read_blocks(&self, xhci: &Xhci, lba: u32, nblocks: u16) -> Result<Vec<u8>, MscError> {
+    pub async fn read_blocks(&self, xhci: &Xhci, lba: u32, nblocks: u16) -> Result<Vec<u8>, MscError> {
         if self.lba_bytes == 0 || nblocks == 0 || nblocks > MSC_MAX_BLOCKS_PER_XFER {
             return Err(MscError::BadLength);
         }
@@ -384,7 +384,7 @@ impl MscDevice {
             0,
         ];
         let mut out: Vec<u8> = alloc::vec![0u8; total];
-        let n = self.cmd_data_in(xhci, &cb, &mut out[..])?;
+        let n = self.cmd_data_in(xhci, &cb, &mut out[..]).await?;
         if n != total {
             return Err(MscError::BadLength);
         }
@@ -393,7 +393,7 @@ impl MscDevice {
 
     /// Multi-block `WRITE(10)`. Writes `nblocks` blocks starting at
     /// `lba`. `data.len()` must equal `nblocks * lba_bytes`.
-    pub fn write_blocks(
+    pub async fn write_blocks(
         &self,
         xhci: &Xhci,
         lba: u32,
@@ -421,7 +421,7 @@ impl MscDevice {
             nb[1],
             0,
         ];
-        let n = self.cmd_data_out(xhci, &cb, data)?;
+        let n = self.cmd_data_out(xhci, &cb, data).await?;
         if n != data.len() {
             return Err(MscError::BadLength);
         }
@@ -446,7 +446,7 @@ pub static MSC_DEVICES: IrqSafeSpinLock<Vec<MscDevice>> = IrqSafeSpinLock::new(V
 /// Caller's responsibility: the device is post-`address_device`
 /// and `cfg` is the full GET_DESCRIPTOR(CONFIG) blob (so we don't
 /// re-issue the control transfer).
-pub fn try_bind_msc_already_addressed(
+pub async fn try_bind_msc_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     cfg: &[u8],
@@ -466,16 +466,18 @@ pub fn try_bind_msc_already_addressed(
             0,
             &mut nothing,
         )
+        .await
         .is_err()
     {
         return Err(MscError::EndpointsMissing);
     }
     xhci_dev
         .configure_endpoints(slot_id, &[ep_in, ep_out])
+        .await
         .map_err(MscError::Xhci)?;
     let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
     let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
-    let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci)?;
+    let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await?;
     let idx = {
         let mut g = MSC_DEVICES.lock();
         let idx = g.len();
@@ -518,36 +520,37 @@ pub fn register_msc_block_device(idx: usize) {
 ///
 /// Returns the count of devices successfully attached. Per-port
 /// failures are skipped silently.
-pub fn enumerate_and_attach_msc(xhci_dev: &Xhci) -> usize {
+pub async fn enumerate_and_attach_msc(xhci_dev: &Xhci) -> usize {
     let mut attached = 0usize;
     for (port, _portsc) in xhci_dev.connected_ports() {
-        if try_attach_msc_port(xhci_dev, port).is_ok() {
+        if try_attach_msc_port(xhci_dev, port).await.is_ok() {
             attached += 1;
         }
     }
     attached
 }
 
-fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
+async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
     xhci_dev.port_reset(port).map_err(MscError::Xhci)?;
     let speed = xhci_dev
         .port_speed(port)
         .ok_or(MscError::EndpointsMissing)?;
-    let slot_id = xhci_dev.enable_slot().map_err(MscError::Xhci)?;
+    let slot_id = xhci_dev.enable_slot().await.map_err(MscError::Xhci)?;
     // Wrap the post-enable_slot enumeration so we always free the
     // controller-allocated slot if anything fails (was a leak that
     // bound port→slot until the next HCRST and tripped a later
     // Address Device on the same port with TRB Error "port already
     // assigned"). Best-effort disable_slot — the real failure code
     // is what matters.
-    let result = (|| -> Result<MscDevice, MscError> {
+    let result = async {
         xhci_dev
             .address_device(slot_id, port, speed)
+            .await
             .map_err(MscError::Xhci)?;
 
         // Read 9-byte cfg header for wTotalLength.
         let mut head = [0u8; 9];
-        let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head)?;
+        let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await?;
         if n < 9 {
             return Err(MscError::NotMsc);
         }
@@ -558,7 +561,7 @@ fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
 
         // Pull the full descriptor tree.
         let mut full = alloc::vec![0u8; total];
-        let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full)?;
+        let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await?;
         if n2 < total {
             full.truncate(n2);
         }
@@ -566,19 +569,20 @@ fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
         let (ep_in, ep_out) = find_bot_endpoints(&full)?;
         xhci_dev
             .configure_endpoints(slot_id, &[ep_in, ep_out])
+            .await
             .map_err(MscError::Xhci)?;
 
         let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
         let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
-        MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci)
-    })();
+        MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await
+    }.await;
     match result {
         Ok(dev) => {
             MSC_DEVICES.lock().push(dev);
             Ok(())
         }
         Err(e) => {
-            let _ = xhci_dev.disable_slot(slot_id);
+            let _ = xhci_dev.disable_slot(slot_id).await;
             Err(e)
         }
     }
@@ -675,20 +679,41 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         if out.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Reach back into the xhci controller + the bound device.
-        // The MscDevice::read_blocks call already validates the CSW.
-        let result = xhci::with_controller(|c| {
+        // Snapshot the (controller, device) handles outside the
+        // registry locks so we can drive the async read_blocks via
+        // block_on without holding any IrqSafeSpinLock across the
+        // .await. block_on is legal here because narf_block's
+        // BlockDeviceSync interface is called from sync contexts
+        // (boot path, FS init) that are NOT inside an executor poll.
+        let c = match xhci::controller() {
+            Some(c) => c,
+            None => return Err(narf_block::BlockIoError::DeviceRemoved),
+        };
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes) = {
             let g = MSC_DEVICES.lock();
-            let dev = g.get(self.idx)?;
-            Some(dev.read_blocks(c, lba32, n_blocks))
+            let dev = match g.get(self.idx) {
+                Some(d) => d,
+                None => return Err(narf_block::BlockIoError::DeviceRemoved),
+            };
+            (dev.slot_id, dev.bulk_in, dev.bulk_out, dev.lba_bytes)
+        };
+        let dev_snapshot = MscDevice {
+            slot_id,
+            bulk_in: bulk_in_dci,
+            bulk_out: bulk_out_dci,
+            lba_bytes,
+            last_lba: 0,
+            tag: IrqSafeSpinLock::new(1),
+        };
+        let result = narf_scheduler::block_on(async {
+            dev_snapshot.read_blocks(&c, lba32, n_blocks).await
         });
         match result {
-            Some(Some(Ok(data))) => {
+            Ok(data) => {
                 out[..expected].copy_from_slice(&data);
                 Ok(())
             }
-            Some(Some(Err(_))) => Err(narf_block::BlockIoError::DriverError),
-            Some(None) | None => Err(narf_block::BlockIoError::DeviceRemoved),
+            Err(_) => Err(narf_block::BlockIoError::DriverError),
         }
     }
     fn write(
@@ -705,15 +730,32 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let result = xhci::with_controller(|c| {
+        let c = match xhci::controller() {
+            Some(c) => c,
+            None => return Err(narf_block::BlockIoError::DeviceRemoved),
+        };
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes) = {
             let g = MSC_DEVICES.lock();
-            let dev = g.get(self.idx)?;
-            Some(dev.write_blocks(c, lba32, n_blocks, &data[..expected]))
+            let dev = match g.get(self.idx) {
+                Some(d) => d,
+                None => return Err(narf_block::BlockIoError::DeviceRemoved),
+            };
+            (dev.slot_id, dev.bulk_in, dev.bulk_out, dev.lba_bytes)
+        };
+        let dev_snapshot = MscDevice {
+            slot_id,
+            bulk_in: bulk_in_dci,
+            bulk_out: bulk_out_dci,
+            lba_bytes,
+            last_lba: 0,
+            tag: IrqSafeSpinLock::new(1),
+        };
+        let result = narf_scheduler::block_on(async {
+            dev_snapshot.write_blocks(&c, lba32, n_blocks, &data[..expected]).await
         });
         match result {
-            Some(Some(Ok(()))) => Ok(()),
-            Some(Some(Err(_))) => Err(narf_block::BlockIoError::DriverError),
-            Some(None) | None => Err(narf_block::BlockIoError::DeviceRemoved),
+            Ok(()) => Ok(()),
+            Err(_) => Err(narf_block::BlockIoError::DriverError),
         }
     }
 }

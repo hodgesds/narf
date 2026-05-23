@@ -338,7 +338,7 @@ pub fn find_acm_interfaces(
 /// `SET_CONTROL_LINE_STATE(DTR | RTS)` so the device knows the host
 /// is ready to receive bytes. Failure on any step returns Err and
 /// the caller's cleanup_guard frees the slot.
-pub fn try_bind_acm_already_addressed(
+pub async fn try_bind_acm_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     cfg: &[u8],
@@ -351,6 +351,7 @@ pub fn try_bind_acm_already_addressed(
     // Configure xHC-side endpoint contexts for the bulk pair.
     xhci_dev
         .configure_endpoints(slot_id, &[bulk_in, bulk_out])
+        .await
         .map_err(|_| CdcError::Truncated)?;
 
     // SET_CONFIGURATION before any class request (USB 2.0 §9.4.7).
@@ -368,6 +369,7 @@ pub fn try_bind_acm_already_addressed(
             0,
             &mut nothing,
         )
+        .await
         .map_err(|_| CdcError::Truncated)?;
 
     // SET_LINE_CODING(115200 8N1) — the dev-board default. PSTN 1.2
@@ -382,7 +384,7 @@ pub fn try_bind_acm_already_addressed(
         0,
         comm_iface as u16,
         &coding_bytes,
-    );
+    ).await;
 
     // SET_CONTROL_LINE_STATE(DTR | RTS) — tells the device the host
     // is present + ready to receive (PSTN 1.2 §6.3.12). On many
@@ -394,7 +396,7 @@ pub fn try_bind_acm_already_addressed(
         CTRL_DTR | CTRL_RTS,
         comm_iface as u16,
         &[],
-    );
+    ).await;
 
     // Pre-arm the bulk-IN endpoint so the controller starts polling
     // the device for bytes. Same pattern as the persistent-arm
@@ -466,13 +468,13 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 /// the number of bytes the controller acknowledged delivering.
 /// First device only for now; multi-device routing follows when a
 /// `/dev/ttyUSB0` namespace lands.
-pub fn send(xhci_dev: &Xhci, data: &[u8]) -> Result<usize, XhciError> {
+pub async fn send(xhci_dev: &Xhci, data: &[u8]) -> Result<usize, XhciError> {
     let devs: Vec<Arc<AcmDevice>> = {
         let g = ACM_DEVICES.lock();
         g.clone()
     };
     let dev = devs.first().ok_or(XhciError::CmdFailed(0xFC))?;
-    xhci_dev.bulk_out(dev.slot_id, dev.bulk_out_dci, data)
+    xhci_dev.bulk_out(dev.slot_id, dev.bulk_out_dci, data).await
 }
 
 /// Number of bound ACM devices. Test + diagnostics helper.

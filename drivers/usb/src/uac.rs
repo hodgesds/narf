@@ -436,7 +436,7 @@ pub fn find_audio_control_interface(cfg: &[u8]) -> Option<u8> {
 /// Bind to an already-addressed UAC device. Issues SET_CONFIGURATION
 /// so the device exits Default state, then records the slot/interface
 /// pair in UAC_DEVICES. Returns the new index on success.
-pub fn try_bind_audio_already_addressed(
+pub async fn try_bind_audio_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
@@ -453,6 +453,7 @@ pub fn try_bind_audio_already_addressed(
             0,
             &mut nothing,
         )
+        .await
         .is_err()
     {
         return Err(UacError::SetConfigFailed);
@@ -527,10 +528,18 @@ pub fn playback_one_packet(idx: usize, data: &[u8]) -> Result<usize, UacError> {
         }
         (dev.slot_id, dev.iso_out_dci)
     };
-    let outcome = crate::xhci::with_controller(|c| c.isoch_out(slot_id, dci, data));
+    // Sync entry-point on the UAC playback path; bridge to async
+    // isoch_out via block_on. Called from non-executor contexts.
+    let c = match crate::xhci::controller() {
+        Some(c) => c,
+        None => return Err(UacError::SetConfigFailed),
+    };
+    let outcome = narf_scheduler::block_on(async {
+        c.isoch_out(slot_id, dci, data).await
+    });
     match outcome {
-        Some(Ok(n)) => Ok(n),
-        Some(Err(_)) | None => Err(UacError::SetConfigFailed),
+        Ok(n) => Ok(n),
+        Err(_) => Err(UacError::SetConfigFailed),
     }
 }
 
@@ -545,10 +554,18 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UacError>
         }
         (dev.slot_id, dev.iso_in_dci)
     };
-    let outcome = crate::xhci::with_controller(|c| c.isoch_in(slot_id, dci, out));
+    // Sync entry-point on the UAC capture path; bridge to async
+    // isoch_in via block_on.
+    let c = match crate::xhci::controller() {
+        Some(c) => c,
+        None => return Err(UacError::SetConfigFailed),
+    };
+    let outcome = narf_scheduler::block_on(async {
+        c.isoch_in(slot_id, dci, out).await
+    });
     match outcome {
-        Some(Ok(n)) => Ok(n),
-        Some(Err(_)) | None => Err(UacError::SetConfigFailed),
+        Ok(n) => Ok(n),
+        Err(_) => Err(UacError::SetConfigFailed),
     }
 }
 

@@ -656,7 +656,7 @@ pub fn find_ncm_comm_interface(cfg: &[u8]) -> Option<u8> {
 
 /// Bind to an already-addressed CDC-NCM device. SET_CONFIGURATION,
 /// then record the slot/interface pair.
-pub fn try_bind_ncm_already_addressed(
+pub async fn try_bind_ncm_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
@@ -673,6 +673,7 @@ pub fn try_bind_ncm_already_addressed(
             0,
             &mut nothing,
         )
+        .await
         .is_err()
     {
         return Err(NcmError::SetConfigFailed);
@@ -690,6 +691,7 @@ pub fn try_bind_ncm_already_addressed(
     // Transfer Rings. Mirrors the MSC bind path.
     if xhci_dev
         .configure_endpoints(slot_id, &[bulk_in_ep, bulk_out_ep])
+        .await
         .is_err()
     {
         return Err(NcmError::SetConfigFailed);
@@ -787,10 +789,20 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
         (dev.slot_id, dev.bulk_out_dci, seq)
     };
     let ntb = build_ntb16(sequence, &[eth_frame], /*crc*/ false)?;
-    let outcome = crate::xhci::with_controller(|c| c.bulk_out(slot_id, bulk_out_dci, &ntb));
+    // The net stack's `SendFn` is sync — bridge to the now-async
+    // bulk_out via block_on. Safe here because the trampoline is
+    // called from netstack TX paths that are not themselves inside
+    // an executor poll.
+    let c = match crate::xhci::controller() {
+        Some(c) => c,
+        None => return Err(NcmError::Truncated),
+    };
+    let outcome = narf_scheduler::block_on(async move {
+        c.bulk_out(slot_id, bulk_out_dci, &ntb).await
+    });
     match outcome {
-        Some(Ok(n)) => Ok(n),
-        Some(Err(_)) | None => Err(NcmError::Truncated),
+        Ok(n) => Ok(n),
+        Err(_) => Err(NcmError::Truncated),
     }
 }
 
@@ -808,10 +820,18 @@ pub fn recv_frame<'a>(
         let dev = g.get(idx).ok_or(NcmError::NotNcm)?;
         (dev.slot_id, dev.bulk_in_dci)
     };
-    let outcome = crate::xhci::with_controller(|c| c.bulk_in(slot_id, bulk_in_dci, scratch));
+    // Sync entry-point on the net RX path; bridge to async bulk_in
+    // via block_on. Called from non-executor contexts.
+    let c = match crate::xhci::controller() {
+        Some(c) => c,
+        None => return Err(NcmError::Truncated),
+    };
+    let outcome = narf_scheduler::block_on(async {
+        c.bulk_in(slot_id, bulk_in_dci, scratch).await
+    });
     let n = match outcome {
-        Some(Ok(n)) => n,
-        Some(Err(_)) | None => return Err(NcmError::Truncated),
+        Ok(n) => n,
+        Err(_) => return Err(NcmError::Truncated),
     };
     if n == 0 {
         return Ok(None);
