@@ -377,10 +377,19 @@ pub struct AmdPstateSummary {
 ///   bits[13:8]  CpuDfsId  — divisor (8..=63)
 ///   bit [63]    PstateEn
 ///
-/// Frequency = `(CpuFid * 200) / (CpuDfsId / 8)` MHz (BKDG eq.).
-/// The result is integer-rounded. Slots with `PstateEn=0` are
-/// skipped + don't count toward `defined`.
+/// Frequency = `(CpuFid * 200 MHz) / CpuDfsId`. The 200 MHz figure
+/// is the FCH reference clock; CpuDfsId defaults to 8 (= /1 ratio).
+/// At nominal P0 on a 4 GHz Zen4: CpuFid=160, CpuDfsId=8 →
+/// 160*200/8 = 4000 MHz. The prior `(cpu_fid * 200 * 8) / cpu_dfs_id`
+/// produced 8× too-high values (off by the default divisor).
+///
+/// Uses `rdmsr_or_gp`: the PStateDef MSR range is BIOS-locked on
+/// some Zen2/Zen4 OEMs (Phoenix HawkPoint1 confirmed) and a plain
+/// rdmsr `#GP`s; the older comment that "unimplemented indices
+/// return 0 without GP" assumed the AMD K10 contract that no
+/// longer holds for Zen-family chips with security-locked MSRs.
 pub fn amd_pstate_summary() -> AmdPstateSummary {
+    use narf_arch::x86_64::msr::rdmsr_or_gp;
     if !matches!(detect(), Mechanism::AmdLegacy) {
         return AmdPstateSummary {
             defined: 0,
@@ -392,10 +401,13 @@ pub fn amd_pstate_summary() -> AmdPstateSummary {
     let mut out = String::new();
     let mut defined = 0u8;
     for i in 0..8u8 {
-        // SAFETY: CPL=0, AMD HwPstate confirmed; the def MSRs are
-        // read-only and reading any unimplemented index returns 0
-        // (PstateEn=0) without GP-fault on Family 10h+.
-        let v = unsafe { rdmsr(MSR_AMD_PSTATE_DEF_0 + i as u32) };
+        let v = match rdmsr_or_gp(MSR_AMD_PSTATE_DEF_0 + i as u32) {
+            Ok(v) => v,
+            Err(_) => return AmdPstateSummary {
+                defined: 0,
+                formatted_freqs: String::from("(BIOS-locked)"),
+            },
+        };
         if v >> 63 == 0 {
             continue;
         }
@@ -405,7 +417,7 @@ pub fn amd_pstate_summary() -> AmdPstateSummary {
         if cpu_dfs_id == 0 {
             continue;
         }
-        let mhz = (cpu_fid * 200 * 8) / cpu_dfs_id;
+        let mhz = (cpu_fid * 200) / cpu_dfs_id;
         if !out.is_empty() {
             out.push('/');
         }
