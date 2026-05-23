@@ -244,9 +244,14 @@ fn spawn_supervisor_task() {
                 // 3s timeout guarantees forward progress: a wedged
                 // port burns its retry budget instead of stalling the
                 // whole supervisor.
+                // Short per-port budget so sup-ticks advances visibly
+                // on the panel. 500 ms is enough for a healthy port
+                // (~100 ms port_reset + a few 250 ms command waits)
+                // but small enough that a wedged port can't hide
+                // forward progress.
                 let outcome = match (YieldTimeout {
                     fut: attach::try_attach_root(c, p),
-                    deadline: narf_time::Deadline::after_ms(3000),
+                    deadline: narf_time::Deadline::after_ms(500),
                 })
                 .await
                 {
