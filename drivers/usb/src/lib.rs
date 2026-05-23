@@ -74,6 +74,17 @@ pub fn register_initcalls() {
     // as keyboard and mouse. Removed cleanly per the no-shims rule.
 }
 
+/// Number of times YieldTimeout::poll was entered (across the
+/// supervisor's lifetime). Increments on every poll regardless of
+/// inner future / deadline state. Surfaced on the FB panel as
+/// `yt=N`. Three diagnostic outcomes:
+///   - yt=0   → task never polled (executor isn't scheduling it)
+///   - yt=1   → first poll happened, never re-polled (waker bug)
+///   - yt>>1  → polled many times but deadline never fires
+///              (Instant::now frozen, or stuck inner spin loop)
+pub static YIELD_TIMEOUT_POLLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Wheel-bypass timeout. Polls the inner future on every executor
 /// round and checks a TSC-driven wall-clock deadline. No
 /// `timer_wheel::register` call. Self-wakes via
@@ -105,6 +116,7 @@ impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
+        YIELD_TIMEOUT_POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: structural pin projection — `fut` is never moved
         // out, only re-pinned for the inner poll call.
         let this = unsafe { self.get_unchecked_mut() };
