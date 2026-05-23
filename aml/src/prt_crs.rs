@@ -86,24 +86,32 @@ pub fn evaluate_prt_for(device_path: &str) -> Result<Vec<PrtEntry>, BridgeError>
 /// Evaluate `<device_path>._CRS` and decode the result into a
 /// `Vec<ResourceItem>`.
 ///
-/// The method must be declared as `Method(_CRS, ...)` and must return
-/// a `Buffer` containing a valid ACPI resource template. Name objects
-/// are not evaluated; `MethodNotFound` is returned for those.
+/// Accepts both `Method(_CRS, ...)` returning a Buffer and
+/// `Name(_CRS, ResourceTemplate { ... })`. The EC, button, and lid
+/// devices almost universally use the Name form; PCIe host bridges
+/// almost universally use the Method form.
 pub fn evaluate_crs_for(device_path: &str) -> Result<Vec<ResourceItem>, BridgeError> {
     let mut path = String::from(device_path);
     path.push_str("._CRS");
-    let method_path = path;
+    let crs_path = path;
 
-    // Confirm the node exists and is a Method.
-    let node = find_node(&method_path).ok_or(BridgeError::MethodNotFound)?;
-    if node.kind != NodeKind::Method {
-        return Err(BridgeError::MethodNotFound);
-    }
+    let node = find_node(&crs_path).ok_or(BridgeError::MethodNotFound)?;
+    let value = match node.kind {
+        NodeKind::Method => evaluate_method(&crs_path, &[])?,
+        NodeKind::Name => match node.value {
+            Some(crate::NameValue::Unparsed { offset, length }) => {
+                let mut body = alloc::vec![0u8; length];
+                let n = crate::copy_aml_bytes(offset, &mut body);
+                if n < length {
+                    return Err(AmlError::Truncated.into());
+                }
+                crate::eval::decode_value(&body)?
+            }
+            _ => return Err(BridgeError::BadReturn),
+        },
+        _ => return Err(BridgeError::MethodNotFound),
+    };
 
-    // Evaluate with no arguments.
-    let value = evaluate_method(&method_path, &[])?;
-
-    // _CRS must return a Buffer containing a resource template.
     match value {
         Value::Buffer(buf) => Ok(decode_resource_template(&buf)?),
         _ => Err(BridgeError::BadReturn),

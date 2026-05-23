@@ -319,6 +319,13 @@ pub fn set_ec_ports(data: u16, cmd: u16) {
     *EC_PORTS.lock() = Some((data, cmd));
 }
 
+/// Read the EC's (data, status_cmd) port addresses. `None` when
+/// `discover_ec_ports` ran without finding two Io descriptors in
+/// the EC's _CRS (or when no PNP0C09 was present).
+pub fn ec_ports() -> Option<(u16, u16)> {
+    *EC_PORTS.lock()
+}
+
 #[cfg(target_arch = "x86_64")]
 fn ec_wait_ibf_clear() -> Result<(), FieldAccessError> {
     let (_data, cmd) = match *EC_PORTS.lock() {

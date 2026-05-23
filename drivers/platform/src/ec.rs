@@ -141,15 +141,26 @@ impl Driver for AcpiEc {
 static GLOBAL_EC: IrqSafeSpinLock<Option<AcpiEc>> = IrqSafeSpinLock::new(None);
 
 pub fn init() {
+    // Preference order:
+    //   1. ECDT (fastest, ACPI 6.5 §5.2.15 — guaranteed before namespace).
+    //   2. PNP0C09 _CRS (decoded into oregion::EC_PORTS at parse_namespace
+    //      time) plus the device's _GPE for the GPE bit.
+    //   3. Standard 0x66/0x62 ports with no GPE (last-ditch, IBM PC AT
+    //      convention; many laptops break this).
     let (ctrl, data, gpe) = if let Some(info) = narf_acpi::ecdt_info() {
         (info.control_addr as u16, info.data_addr as u16, Some(info.gpe_bit as u32))
     } else if let Some(device) = narf_aml::find_device_by_hid("PNP0C09") {
+        let (data_port, cmd_port) = match narf_aml::oregion::ec_ports() {
+            Some(p) => p,
+            None => (EC_DATA_PORT, EC_COMMAND_PORT),
+        };
+        let gpe_bit = read_ec_gpe(&device.path);
         let _ = writeln!(
             narf_console::Writer,
-            "  acpi-ec: found {} via AML, using standard ports",
-            device.path
+            "  acpi-ec: found {} via AML (data={:#x} cmd={:#x} gpe={:?})",
+            device.path, data_port, cmd_port, gpe_bit,
         );
-        (EC_COMMAND_PORT, EC_DATA_PORT, None)
+        (cmd_port, data_port, gpe_bit)
     } else {
         (EC_COMMAND_PORT, EC_DATA_PORT, None)
     };
@@ -160,6 +171,24 @@ pub fn init() {
         let _ = writeln!(narf_console::Writer, "  acpi-ec: enabled GPE {}", g);
     }
     init_sci(gpe.map(|g| g as u8));
+}
+
+/// ACPI 6.5 §12.11: every EC declares `_GPE` either as `Name(_GPE,
+/// Integer)` or `Method(_GPE, 0)`. Return the integer GPE bit
+/// number when present.
+fn read_ec_gpe(ec_path: &str) -> Option<u32> {
+    let path = alloc::format!("{}._GPE", ec_path);
+    let node = narf_aml::find_node(&path)?;
+    match node.kind {
+        narf_aml::NodeKind::Method => narf_aml::eval::evaluate_method(&path, &[])
+            .ok()
+            .map(|v| v.as_integer() as u32),
+        narf_aml::NodeKind::Name => match node.value {
+            Some(narf_aml::NameValue::Integer(v)) => Some(v as u32),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub fn with_ec<R>(f: impl FnOnce(&AcpiEc) -> R) -> Option<R> {
