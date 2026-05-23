@@ -2248,21 +2248,43 @@ fn run_async_demo() -> ! {
     // interrupts visible through `timer_ticks()`.
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: APIC is up (init_bsp ran), IDT is loaded, PIC
-        // is masked. This starts the periodic timer + unmasks CPU
-        // IRQs; from here the LAPIC timer fires vector 32 every
-        // `initial_count` LAPIC ticks, the IDT dispatches to
-        // `rust_trap_handler` which increments `timer_ticks` and
-        // EOIs.
+        // Register LAPIC as a candidate tick source + ask
+        // clockevent registry to pick a working one. Phase 1: only
+        // LAPIC is registered, so the choice is forced. Phase 2
+        // registers HPET too; verification probe (Phase 2) picks
+        // whichever actually delivers ticks.
+        narf_time::clockevent::register(
+            &narf_interrupts::x86_64::apic::LAPIC_CLOCKEVENT,
+        );
+        let selected = narf_time::clockevent::select_primary(
+            100, // 100 Hz tick — 10 ms period
+            narf_interrupts::VECTOR_TIMER,
+        );
+        match selected {
+            Some(dev) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  clockevent: selected '{}' on vector {}",
+                    dev.name(),
+                    narf_interrupts::VECTOR_TIMER
+                );
+            }
+            None => {
+                // No backend worked. The trap-handler fail-safe
+                // (fire_due on every IRQ) keeps the wheel advancing
+                // off whatever IRQs the platform does deliver
+                // (xHCI, NIC, ACPI SCI, etc.). Degraded but not
+                // wedged.
+                let _ = writeln!(
+                    console::Writer,
+                    "  clockevent: NO BACKEND — degraded mode (opportunistic fire_due)"
+                );
+            }
+        }
+        // SAFETY: APIC + IDT live; enable CPU-side IRQ delivery.
         unsafe {
-            narf_interrupts::x86_64::apic::start_timer(narf_interrupts::VECTOR_TIMER, 1_000_000);
             narf_arch::enable_interrupts();
         }
-        let _ = writeln!(
-            console::Writer,
-            "  apic: LAPIC timer live on vector {}, IRQs unmasked",
-            narf_interrupts::VECTOR_TIMER
-        );
     }
 
     // Bring up HPET (default base 0xFED00000 on every x86_64

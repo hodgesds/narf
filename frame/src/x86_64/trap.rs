@@ -179,6 +179,17 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         if frame.vector == 32 {
             narf_interrupts::x86_64::apic::on_timer_tick();
         }
+        // Fail-safe wheel tick: any IRQ that fires advances the
+        // timer wheel. On Phoenix HawkPoint1 the LAPIC timer is
+        // armed (LVT_TIMER readback confirms periodic + vector)
+        // but IRQs at vector 32 never reach this handler — so
+        // tt stays 0 and every wheel-based wait wedges forever.
+        // Riding the wheel on whatever IRQs the platform DOES
+        // deliver (HPET, xHCI, NIC, ACPI SCI) unwedges the
+        // executor even when LAPIC-timer delivery is broken.
+        // No-op if there's nothing due.
+        let now = narf_time::now_cycles();
+        let _ = narf_time::timer_wheel::fire_due(now);
         narf_interrupts::on_irq(frame.vector as u8);
         // SAFETY: APIC is initialised before interrupts are enabled.
         unsafe {

@@ -261,6 +261,69 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
 pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// `ClockEvent` adapter wrapping the LAPIC-timer primitives above.
+///
+/// LAPIC timer ticks at `(bus_freq / divider)` Hz; with DIV_16 a
+/// typical 100 MHz FSB gives ~6.25 MHz post-divide, so a desired
+/// `100 Hz` (10 ms period) maps to ~62_500 ticks.
+///
+/// Phase 1 uses a hardcoded estimate of post-divide freq (100 MHz
+/// raw / 16 = 6.25 MHz) — close enough on most platforms to deliver
+/// at least *some* ticks per second so `probe_fires` can verify.
+/// Phase 2 lands proper calibration against HPET / TSC.
+#[derive(Debug)]
+pub struct LapicClockEvent;
+
+impl narf_time::clockevent::ClockEvent for LapicClockEvent {
+    fn name(&self) -> &'static str {
+        "lapic"
+    }
+
+    fn supported(&self) -> bool {
+        // LAPIC is present on every x86_64 CPU. Either x2APIC or
+        // xAPIC paths apply; both can drive the timer.
+        true
+    }
+
+    unsafe fn arm_periodic(
+        &self,
+        hz: u32,
+        vector: u8,
+    ) -> Result<(), narf_time::clockevent::ClockEventError> {
+        if hz == 0 || hz > 100_000 {
+            return Err(narf_time::clockevent::ClockEventError::InvalidFrequency);
+        }
+        // Pre-divide estimate: 100 MHz FSB / DIV_16 = 6_250_000
+        // ticks/sec post-divide. Phase 2 replaces with calibration.
+        const POST_DIVIDE_HZ: u32 = 6_250_000;
+        let initial_count = POST_DIVIDE_HZ / hz;
+        // SAFETY: caller upholds CPL=0 + exclusive backend access.
+        unsafe {
+            start_timer(vector, initial_count);
+        }
+        Ok(())
+    }
+
+    unsafe fn disarm(&self) {
+        // SAFETY: caller upholds CPL=0 + exclusive backend access.
+        unsafe {
+            stop_timer();
+        }
+    }
+
+    fn tick_count(&self) -> u64 {
+        TIMER_TICKS.load(Ordering::Relaxed)
+    }
+
+    fn resolution_ns(&self) -> u64 {
+        // Post-divide 6.25 MHz ≈ 160 ns per tick.
+        160
+    }
+}
+
+/// Global singleton for registration with the clockevent registry.
+pub static LAPIC_CLOCKEVENT: LapicClockEvent = LapicClockEvent;
+
 /// Stop the LAPIC timer (mask the LVT entry, zero the initial count).
 ///
 /// # Safety
