@@ -74,6 +74,53 @@ pub fn register_initcalls() {
     // as keyboard and mouse. Removed cleanly per the no-shims rule.
 }
 
+/// Wheel-bypass timeout. Polls the inner future on every executor
+/// round and checks a TSC-driven wall-clock deadline. No
+/// `timer_wheel::register` call. Self-wakes via
+/// `cx.waker().wake_by_ref()` so the slot's `awake` flag is kept
+/// true through the executor's swap(false, Acquire) gate.
+///
+/// Used by the USB HID supervisor because `narf_time::timeout` /
+/// `narf_time::sleep_cycles` register with the timer wheel, and on
+/// real HW the supervisor's wheel-registered wakers were not being
+/// fired even though the panel paint task (which uses the same
+/// `sleep_cycles` primitive) was being woken correctly. Bypassing
+/// the wheel entirely localizes that bug.
+pub struct YieldTimeout<F> {
+    fut: F,
+    deadline: narf_time::Deadline,
+}
+
+impl<F> core::fmt::Debug for YieldTimeout<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("YieldTimeout")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
+    type Output = Result<F::Output, ()>;
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        // SAFETY: structural pin projection — `fut` is never moved
+        // out, only re-pinned for the inner poll call.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { core::pin::Pin::new_unchecked(&mut this.fut) };
+        match fut.poll(cx) {
+            core::task::Poll::Ready(v) => return core::task::Poll::Ready(Ok(v)),
+            core::task::Poll::Pending => {}
+        }
+        if this.deadline.expired() {
+            return core::task::Poll::Ready(Err(()));
+        }
+        cx.waker().wake_by_ref();
+        core::task::Poll::Pending
+    }
+}
+
 /// Liveness counter for the USB HID supervisor. Incremented at the
 /// VERY TOP of every loop iteration, before any controller lookup,
 /// any lock acquisition, any MMIO. A stuck 0 with `xhci::is_probed()
@@ -197,14 +244,14 @@ fn spawn_supervisor_task() {
                 // 3s timeout guarantees forward progress: a wedged
                 // port burns its retry budget instead of stalling the
                 // whole supervisor.
-                let outcome = match narf_time::timeout(
-                    narf_time::Deadline::after_ms(3000),
-                    attach::try_attach_root(c, p),
-                )
+                let outcome = match (YieldTimeout {
+                    fut: attach::try_attach_root(c, p),
+                    deadline: narf_time::Deadline::after_ms(3000),
+                })
                 .await
                 {
                     Ok(o) => o,
-                    Err(_elapsed) => AttachOutcome::UnknownClass,
+                    Err(()) => AttachOutcome::UnknownClass,
                 };
                 SUPERVISOR_ATTACHING_PORT.store(0, core::sync::atomic::Ordering::Relaxed);
                 match outcome {
@@ -338,17 +385,17 @@ fn spawn_supervisor_task() {
                     SUPERVISOR_TICKS.load(core::sync::atomic::Ordering::Relaxed),
                 );
             }
-            // Wake on either:
-            //   (a) the next xHCI IRQ — a Transfer Event for a bound
-            //       endpoint or a Port Status Change Event (hot-plug),
-            //   (b) a 100 ms wall-clock timeout — re-tries enumeration
-            //       on unattached ports + handles the case where IRQs
-            //       never fire (no MSI-X / device that never sends).
-            if let Some(v) = irq_vector {
-                let deadline = narf_time::Deadline::after_ms(100);
-                let _ = narf_interrupts::wait_for_irq_until(v, deadline).await;
-            } else {
-                narf_time::sleep_cycles(PUMP_CYCLES).await;
+            // Wheel-bypass inter-cycle delay. yield_now self-wakes
+            // and the slot is re-polled on the next round; a TSC
+            // deadline check provides the ~100 ms cadence so we
+            // don't busy-loop pump_all at full preemption speed.
+            // (The xHCI IRQ wait path was wheel-based and not firing
+            // for this task; same workaround as elsewhere in the
+            // supervisor.)
+            let _ = irq_vector; // unused while wheel is suspected
+            let pause = narf_time::Deadline::after_ms(100);
+            while !pause.expired() {
+                narf_scheduler::yield_now().await;
             }
         }
     });
