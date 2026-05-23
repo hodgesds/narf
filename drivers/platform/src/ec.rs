@@ -319,22 +319,33 @@ fn handle_gpe(gpe_num: u32) {
 }
 
 fn handle_ec_gpe() {
-    let query = with_ec(|ec| ec.query()).unwrap_or(None);
-    let query = match query {
-        Some(q) if q != 0 => q,
-        _ => return,
-    };
-    EC_QUERIES.fetch_add(1, Ordering::Release);
-    notify(PlatformEvent::EcQuery(query));
-
-    // Walk for the EC node and evaluate <EC>._Qxx. The EC's namespace
-    // path comes from the `PNP0C09` lookup. Most laptops put it at
-    // `\_SB.PCI0.LPCB.EC0` or similar — we let `find_device_by_hid`
-    // resolve it.
+    // Drain every queued event — EC firmware can stack a burst of
+    // them between SCI deliveries (e.g. user mashes Fn-volume).
+    // Bound at 16 per pass to keep the IRQ handler bounded; if more
+    // pile up, the next SCI will pick them up.
     let ec_node = narf_aml::find_device_by_hid("PNP0C09");
-    if let Some(node) = ec_node {
-        let path = format!("{}._Q{:02X}", node.path, query);
-        let _ = narf_aml::eval::evaluate_method(&path, &[]);
+    for _ in 0..16 {
+        let query = with_ec(|ec| ec.query()).unwrap_or(None);
+        let query = match query {
+            Some(q) if q != 0 => q,
+            _ => break,
+        };
+        EC_QUERIES.fetch_add(1, Ordering::Release);
+        notify(PlatformEvent::EcQuery(query));
+
+        // Run the kernel-side handler (input-ring bridge etc.)
+        // first, then the AML `_Qxx` method. Order matters: the
+        // AML method may issue further EC reads, so the Rust
+        // bridge's per-event push happens against the published
+        // EC state at SCI time.
+        if let Some(h) = narf_aml::ec_events::lookup_qxx_handler(query) {
+            h(query);
+        }
+
+        if let Some(ref node) = ec_node {
+            let path = format!("{}._Q{:02X}", node.path, query);
+            let _ = narf_aml::eval::evaluate_method(&path, &[]);
+        }
     }
 }
 

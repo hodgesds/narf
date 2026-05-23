@@ -33,6 +33,10 @@ pub mod fan;
 pub mod lid;
 #[cfg(target_arch = "x86_64")]
 pub mod buttons;
+/// EC hotkey → input-ring bridge. Lives next to the EC since
+/// it depends on the EC's `_Qxx` registry to land events.
+#[cfg(target_arch = "x86_64")]
+pub mod ec_hotkeys;
 pub mod backlight;
 
 mod tests;
@@ -79,6 +83,16 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-buttons", || {
         buttons::init();
+        InitResult::Ok
+    });
+    // EC hotkey bridge must register after acpi-ec (which installs
+    // the SCI handler) but before any code that wants to inject
+    // synthetic events for testing. Subsys order = registration
+    // order within a stage, so this is correctly placed below
+    // acpi-ec.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "acpi-ec-hotkeys", || {
+        ec_hotkeys::init();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "acpi-backlight", || {

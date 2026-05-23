@@ -950,6 +950,7 @@ dependencies = [
  "narf-console",
  "narf-drivers",
  "narf-init",
+ "narf-input",
  "narf-interrupts",
  "narf-io",
  "narf-kernel-test",

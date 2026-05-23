@@ -26,6 +26,7 @@ narf-aml          = { path = "../../aml" }
 narf-power        = { path = "../../power" }
 narf-pwm          = { path = "../../pwm" }
 narf-interrupts   = { path = "../../interrupts" }
+narf-input        = { path = "../../input" }
 narf-console      = { path = "../../console" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
