@@ -1100,6 +1100,7 @@ dependencies = [
  "narf-graphics-driver",
  "narf-init",
  "narf-input",
+ "narf-interrupts",
  "narf-ipc",
  "narf-kernel-test",
  "narf-lib",

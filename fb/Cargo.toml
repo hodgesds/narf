@@ -26,6 +26,7 @@ narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-shmem        = { path = "../shmem" }
 narf-input        = { path = "../input" }
+narf-interrupts   = { path = "../interrupts" }
 narf-drivers-i2c  = { path = "../drivers/i2c" }
 narf-drivers-gpio = { path = "../drivers/gpio" }
 narf-drivers-usb  = { path = "../drivers/usb" }

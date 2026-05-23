@@ -1048,6 +1048,18 @@ pub static I8042_MOUSE_INIT_OK: core::sync::atomic::AtomicBool =
 /// and the panel shows "scan=FAIL" even when "init=ok irq=routed".
 pub static I8042_KBD_SCANNING_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Allocated x86 IDT vector for IRQ 1 (kbd) and IRQ 12 (aux), or
+/// `0` if `install_isa_irq` was never called or failed. Surfaced
+/// publicly so the FB status panel can read
+/// `narf_interrupts::fire_count(vector)` and distinguish "IRQ
+/// fired but our handler dropped it" from "EC never raised IRQ
+/// after init." Lives in `narf-input` (the lower-level shared
+/// crate) so `narf-fb` can read it without a dependency cycle
+/// through `narf-input-driver` → `narf-fb` (cursor pump).
+pub static I8042_KBD_IRQ_VECTOR: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+pub static I8042_MOUSE_IRQ_VECTOR: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
 /// Per-class ring activity counters — increment on every
 /// successful `push_global` so the panel can show whether kbd
 /// IRQs are firing without requiring serial. If kbd-pushes stays

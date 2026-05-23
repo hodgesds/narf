@@ -142,17 +142,26 @@ pub fn paint(fb: &FbWriter) {
         let kbd_scan = narf_input::I8042_KBD_SCANNING_OK.load(Ordering::Acquire);
         let kbd_pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
         let kbd_pops = narf_input::KEY_POP_COUNT.load(Ordering::Relaxed);
-        let ascii_pushes = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
-        let ascii_pops = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
+        // IRQ1 fire count — distinguishes "EC never raised IRQ"
+        // (irq1=0, push=1 — boot leftover only) from "IRQ fires but
+        // handler drops" (irq1=N, push=1) from "fully working"
+        // (irq1=N, push=N+1).
+        let kbd_irq_vec = narf_input::I8042_KBD_IRQ_VECTOR.load(Ordering::Acquire);
+        let irq1_fires = if kbd_irq_vec == 0 {
+            0
+        } else {
+            narf_interrupts::fire_count(kbd_irq_vec)
+        };
         format!(
-            "input: kbd init={}/irq={}/scan={} key push/pop={}/{} ascii={}/{}",
+            "input: kbd init={}/irq={}/scan={} irq1-fires={} push/pop={}/{} ascii={}/{}",
             if kbd_init { "ok" } else { "FAIL" },
             if kbd_irq { "ok" } else { "FAIL" },
             if kbd_scan { "ok" } else { "FAIL" },
+            irq1_fires,
             kbd_pushes,
             kbd_pops,
-            ascii_pushes,
-            ascii_pops,
+            narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed),
+            narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed),
         )
     };
 

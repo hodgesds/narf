@@ -150,6 +150,13 @@ fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
         Err(_) => return false,
     };
     narf_interrupts::install_handler(v, handler);
+    // Stash the vector in `narf-input` so the FB panel can surface
+    // its `narf_interrupts::fire_count(vector)`.
+    match isa_irq {
+        1 => narf_input::I8042_KBD_IRQ_VECTOR.store(v, core::sync::atomic::Ordering::Release),
+        12 => narf_input::I8042_MOUSE_IRQ_VECTOR.store(v, core::sync::atomic::Ordering::Release),
+        _ => {}
+    }
     // SAFETY: vector + handler installed before the IOAPIC
     // unmasks the line.
     unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) }
