@@ -171,7 +171,7 @@ fn spawn_supervisor_task() {
                 }
                 SUPERVISOR_PHASE.store(5, core::sync::atomic::Ordering::Relaxed);
                 SUPERVISOR_ATTACHING_PORT.store(p, core::sync::atomic::Ordering::Relaxed);
-                let outcome = attach::try_attach_root(c, p);
+                let outcome = attach::try_attach_root(c, p).await;
                 SUPERVISOR_ATTACHING_PORT.store(0, core::sync::atomic::Ordering::Relaxed);
                 match outcome {
                     AttachOutcome::Keyboard
@@ -217,12 +217,19 @@ fn spawn_supervisor_task() {
             for (idx, (route, tier, root_port, _hub_slot, num_ports, bound_mask)) in
                 walks.iter().enumerate()
             {
-                let connected = {
+                // Snapshot the UsbHub copy out of the registry lock so
+                // both connected_downstream_ports() and try_attach_via_hub
+                // can run their now-async control transfers without
+                // holding an IrqSafeSpinLock across the .await.
+                let hub_copy: Option<crate::hub::UsbHub> = {
                     let g = HUBS.lock();
-                    g.get(idx)
-                        .map(|h| h.hub.connected_downstream_ports(c))
-                        .unwrap_or_default()
+                    g.get(idx).map(|h| h.hub)
                 };
+                let hub_copy = match hub_copy {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let connected = hub_copy.connected_downstream_ports(c).await;
                 let mut new_bound_bits: u64 = 0;
                 for &dp in &connected {
                     if (*num_ports != 0) && dp > *num_ports {
@@ -232,20 +239,14 @@ fn spawn_supervisor_task() {
                     if (bound_mask | new_bound_bits) & dpb != 0 {
                         continue;
                     }
-                    let outcome = {
-                        let g = HUBS.lock();
-                        match g.get(idx) {
-                            Some(h) => attach::try_attach_via_hub(
-                                c,
-                                &h.hub,
-                                *route,
-                                *tier,
-                                *root_port,
-                                dp,
-                            ),
-                            None => AttachOutcome::UnknownClass,
-                        }
-                    };
+                    let outcome = attach::try_attach_via_hub(
+                        c,
+                        &hub_copy,
+                        *route,
+                        *tier,
+                        *root_port,
+                        dp,
+                    ).await;
                     match outcome {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse
@@ -280,7 +281,7 @@ fn spawn_supervisor_task() {
             // above touch `last_activity_tick` via mark_port_activity
             // on each completed transfer, so an actively-used keyboard
             // never gets suspended; an idle USB stick / hub does.
-            attach::idle_suspend_pass(c);
+            attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
             // Wake on either:
             //   (a) the next xHCI IRQ — a Transfer Event for a bound
