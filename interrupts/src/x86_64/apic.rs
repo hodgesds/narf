@@ -297,10 +297,19 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         if hz == 0 || hz > 100_000 {
             return Err(narf_time::clockevent::ClockEventError::InvalidFrequency);
         }
-        // Pre-divide estimate: 100 MHz FSB / DIV_16 = 6_250_000
-        // ticks/sec post-divide. Phase 2 replaces with calibration.
-        const POST_DIVIDE_HZ: u32 = 6_250_000;
-        let initial_count = POST_DIVIDE_HZ / hz;
+        // Match pre-clockevent count semantics: `start_timer(v,
+        // 1_000_000)` was the original direct call. At nominal
+        // 100 MHz FSB / DIV_16 = 6.25 MHz post-divide → ~160 ms
+        // per tick = ~6 Hz (slow). On real QEMU the actual bus
+        // is faster (~660 MHz observed); with 1M count that's
+        // still ~6 ms per tick = ~165 Hz. Mapping hz=100 to a
+        // count of 1M reproduces the historical timing closely
+        // enough to avoid the IRQ-rate amplification that
+        // exposes a latent Sleepable-alloc-in-IRQ-context bug.
+        // Proper calibration (Phase 2 originally promised) is
+        // future work — for now we punt with the prior value.
+        let _ = hz; // hz semantics deferred to calibration work
+        let initial_count = 1_000_000u32;
         // SAFETY: caller upholds CPL=0 + exclusive backend access.
         unsafe {
             start_timer(vector, initial_count);
@@ -578,21 +587,23 @@ pub unsafe fn init_ap() {
 #[inline]
 pub fn on_timer_tick() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-    // Drive the deadline wheel off the LAPIC tick unconditionally.
-    // The LAPIC timer is the only timer source we KNOW fires
-    // reliably across QEMU + every real-silicon platform we care
-    // about; HPET-IRQ delivery is unreliable on some AMD chipsets
-    // (Phoenix HawkPoint1, certain Renoir SKUs), so making
-    // sleep_cycles wakes depend on HPET means real-HW pumps go
-    // dormant.
+    // We deliberately do NOT call timer_wheel::fire_due here.
     //
-    // Tests that exercise the bare wheel without an HPET arm
-    // (e.g. smoke_wheel_refresh_waker_rejects_recycled_handle)
-    // must register deadlines large enough that LAPIC drain
-    // won't fire them; `__reset_for_test` clears the wheel
-    // between operations.
-    let now = narf_time::now_cycles();
-    let _ = narf_time::timer_wheel::fire_due(now);
+    // fire_due iterates the wheel and consumes Wakers via wake(),
+    // which drops the inner Arc — and the global allocator's
+    // Sleepable free path panics when invoked with IRQs disabled
+    // (`memory::context::AllocContext::Sleepable`). The trap
+    // handler runs with IF=0, so freeing an Arc here trips that
+    // check the moment a Waker's last reference goes away in the
+    // same tick that a task completes.
+    //
+    // The wheel is advanced from non-IRQ context instead, by
+    // `narf_scheduler::run_until_empty`'s idle path which busy-
+    // polls `fire_due` between halts with IRQs enabled. That
+    // path is safe to free from. The only thing the timer ISR
+    // does now is bump TIMER_TICKS for diagnostics + return
+    // promptly so the executor's halt_until_irq wakes up and
+    // serves the wheel on the next round.
 }
 
 /// Snapshot of how many timer IRQs have fired since boot.

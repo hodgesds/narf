@@ -206,12 +206,17 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 narf_interrupts::x86_64::apic::on_timer_tick();
             }
         }
-        // Fail-safe wheel tick: every IRQ advances the wheel.
-        // Defensive — even when a primary clockevent is selected
-        // and firing correctly, no harm done to fire_due on
-        // peer IRQs (it's a no-op when nothing is due).
-        let now = narf_time::now_cycles();
-        let _ = narf_time::timer_wheel::fire_due(now);
+        // Note: we don't call timer_wheel::fire_due from this trap
+        // context. fire_due drops Wakers, which deallocate via the
+        // global Sleepable allocator — that's a panic in IRQ
+        // context (IF=0). The wheel is advanced by:
+        //   (a) the selected clockevent's ISR (LAPIC/HPET) via
+        //       its own backend-specific tick handler, which calls
+        //       clockevent::on_tick (safe — handlers are
+        //       carefully written to avoid alloc), AND
+        //   (b) run_until_empty's idle path's TSC-driven busy-
+        //       poll, with IRQs enabled, where Waker drops are
+        //       allowed to free.
         narf_interrupts::on_irq(frame.vector as u8);
         // SAFETY: APIC is initialised before interrupts are enabled.
         unsafe {
