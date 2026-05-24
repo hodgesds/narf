@@ -631,7 +631,16 @@ pub fn on_timer_tick() {
         // when the LVT_TIMER is configured for deadline mode,
         // which is the gate that set TSC_DEADLINE_PERIOD_CYCLES
         // non-zero.
+        //
+        // MFENCE before the WRMSR mirrors Linux's
+        // `weak_wrmsr_fence()` (an alt-patched MFENCE enabled
+        // specifically on TSC-deadline-capable CPUs). Intel
+        // erratum: certain Skylake-era chips reorder memory ops
+        // around the IA32_TSC_DEADLINE WRMSR; AMD APM is silent,
+        // but the fence is cheap and Linux applies it
+        // unconditionally on TSC-deadline chips.
         unsafe {
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
             wrmsr(IA32_TSC_DEADLINE, next);
         }
     }

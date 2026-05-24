@@ -96,57 +96,78 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
             return Err(ClockEventError::InvalidFrequency);
         }
 
-        // Pick the lowest-numbered comparator that (a) is NOT
-        // comparator 0 — reserved for `timer_pump`'s oneshot wheel
-        // arming, (b) supports periodic mode, and (c) has a safe
-        // GSI (>=16, outside the legacy ISA block) in its route
-        // cap. If a chipset only has comparator 0 (some QEMU
-        // models), this backend's probe fails and the caller
-        // moves on to the next clockevent.
+        // Pick the lowest-numbered comparator that's NOT
+        // comparator 0 (reserved for `timer_pump`'s oneshot wheel
+        // arming) and supports periodic mode. Prefer FSB-MSI
+        // delivery if the comparator advertises it — bypasses
+        // the IOAPIC entirely, which matches Linux's modern
+        // HPET path and works on platforms (Renoir) where the
+        // IOAPIC silently drops HPET's GSI. Fall back to IOAPIC
+        // GSI routing only if no MSI-capable comparator exists.
         let num = narf_time::hpet::num_comparators();
-        let mut chosen: Option<(u8, u8)> = None;
+        let mut chosen_msi: Option<u8> = None;
+        let mut chosen_gsi: Option<(u8, u8)> = None;
         for n in 1..num {
             if !narf_time::hpet::comparator_supports_periodic(n) {
                 continue;
             }
-            let route_cap = narf_time::hpet::timer_route_cap(n);
-            // Prefer high GSIs to avoid colliding with ISA IRQs.
-            for gsi in (16u8..32).chain(0u8..16) {
-                if route_cap & (1u32 << gsi) != 0 {
-                    chosen = Some((n, gsi));
-                    break;
+            if narf_time::hpet::comparator_supports_fsb(n) && chosen_msi.is_none() {
+                chosen_msi = Some(n);
+            }
+            if chosen_gsi.is_none() {
+                let route_cap = narf_time::hpet::timer_route_cap(n);
+                for gsi in (16u8..32).chain(0u8..16) {
+                    if route_cap & (1u32 << gsi) != 0 {
+                        chosen_gsi = Some((n, gsi));
+                        break;
+                    }
                 }
             }
-            if chosen.is_some() {
-                break;
-            }
         }
-        let (n, gsi) = chosen.ok_or(ClockEventError::NotSupported)?;
 
-        // Install ISR at the requested vector. We use the
-        // caller-supplied `vector` directly (the central
-        // `select_primary` allocates one and passes it in).
+        // Install ISR at the requested vector first — same for
+        // both delivery paths.
         crate::install_handler(vector, hpet_tick_isr);
 
-        // Program the IOAPIC redirection: GSI → vector. HPET
-        // delivers level-triggered active-high by default in
-        // periodic mode; configure to match.
+        if let Some(n) = chosen_msi {
+            // MSI delivery (modern Linux path). Construct a
+            // physical-mode fixed-delivery MSI message targeting
+            // the BSP (APIC ID 0). FED-format address; vector in
+            // the low byte of data.
+            let msi_addr = 0xFEE0_0000u32; // physical, BSP
+            let msi_data = vector as u32; // fixed, edge, vector
+            HPET_COMPARATOR.store(n, Ordering::Release);
+            HPET_TICK_VECTOR.store(vector, Ordering::Release);
+            // SAFETY: vector + handler installed; HPET MMIO live
+            // (supported() returned true above).
+            match unsafe {
+                narf_time::hpet::arm_periodic_msi(n, msi_addr, msi_data, period_ticks)
+            } {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    HPET_COMPARATOR.store(0xFF, Ordering::Release);
+                    HPET_TICK_VECTOR.store(0, Ordering::Release);
+                    // Fall through to GSI path.
+                }
+            }
+        }
+
+        // GSI fallback for HPETs without FSB capability.
+        let (n, gsi) = chosen_gsi.ok_or(ClockEventError::NotSupported)?;
         let flags = narf_acpi::ioapic::POLARITY_HIGH
             | narf_acpi::ioapic::TRIGGER_LEVEL;
-        // SAFETY: vector + handler installed above; IOAPIC code
-        // upholds its own preconditions.
+        // SAFETY: vector + handler installed; IOAPIC code upholds
+        // its own preconditions.
         let routed = unsafe {
             narf_acpi::ioapic::route_gsi_to_vector(gsi as u32, vector, 0, flags)
         };
         if !routed {
             return Err(ClockEventError::NoFreeIrq);
         }
-
         HPET_COMPARATOR.store(n, Ordering::Release);
         HPET_TICK_VECTOR.store(vector, Ordering::Release);
-
         // SAFETY: caller upholds CPL=0; IDT vector + IOAPIC route
-        // installed; HPET MMIO is live (supported() confirmed).
+        // installed; HPET MMIO is live.
         match unsafe { narf_time::hpet::arm_periodic(n, gsi, period_ticks) } {
             Ok(()) => Ok(()),
             Err(_) => {

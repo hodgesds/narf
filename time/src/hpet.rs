@@ -93,6 +93,11 @@ const REG_TIMER_BASE: u64 = 0x100;
 const REG_TIMER_STRIDE: u64 = 0x20;
 const TIMER_REG_CONFIG: u64 = 0x00;
 const TIMER_REG_COMPARATOR: u64 = 0x08;
+/// Per-timer FSB-MSI route register (HPET §2.3.6). Bits[31:0]
+/// = MSI data value (vector + delivery + trigger). Bits[63:32]
+/// = MSI address value (FED-format). Used only when
+/// `TN_FSB_EN_CNF` is set in the timer's CONFIG.
+const TIMER_REG_FSB_ROUTE: u64 = 0x10;
 
 const GEN_CONF_ENABLE_CNF: u64 = 1 << 0;
 
@@ -107,6 +112,8 @@ const TN_32MODE_CNF: u64 = 1 << 8;
 const TN_INT_ROUTE_CNF_SHIFT: u32 = 9;
 const TN_INT_ROUTE_CNF_MASK: u64 = 0x1F << TN_INT_ROUTE_CNF_SHIFT;
 const TN_FSB_EN_CNF: u64 = 1 << 14;
+/// Tn_FSB_INT_DEL_CAP (RO): timer supports FSB-MSI delivery.
+const TN_FSB_INT_DEL_CAP: u64 = 1 << 15;
 const TN_INT_ROUTE_CAP_SHIFT: u32 = 32;
 
 /// One femtosecond.
@@ -436,6 +443,103 @@ impl Hpet {
         cfg & TN_PER_INT_CAP != 0
     }
 
+    /// True iff comparator `n` supports FSB-MSI delivery
+    /// (`Tn_FSB_INT_DEL_CAP`). Modern HPETs (post-2008-ish) all
+    /// support it; legacy ICH7 / older Intel chipsets may not.
+    /// When supported, MSI delivery bypasses the IOAPIC entirely
+    /// — useful on platforms where IOAPIC routing for HPET's
+    /// GSIs is broken (e.g. Renoir).
+    pub fn supports_fsb(&self, n: u8) -> bool {
+        if n >= self.caps.num_comparators {
+            return false;
+        }
+        // SAFETY: index bounded.
+        let cfg = unsafe { self.read_timer_config(n) };
+        cfg & TN_FSB_INT_DEL_CAP != 0
+    }
+
+    /// Arm comparator `n` in periodic mode via FSB-MSI delivery.
+    /// Bypasses the IOAPIC — the timer delivers IRQs as PCI-style
+    /// MSI writes to the LAPIC, addressed via `msi_addr` (FED-
+    /// format: `0xFEE0_0000 | (apic_id << 12)` for physical-mode
+    /// fixed delivery) carrying `msi_data` (which encodes the
+    /// vector and delivery mode).
+    ///
+    /// This is the canonical modern HPET delivery path (matches
+    /// Linux's `hpet_msi_write` + `HPET_TN_FSB_CAP` flow).
+    ///
+    /// Same register-write sequence as the IOAPIC path, plus the
+    /// FSB route programming inserted between the config write
+    /// and the comparator writes (so the config's
+    /// `TN_FSB_EN_CNF` bit is already set when the FSB route is
+    /// programmed).
+    ///
+    /// # Safety
+    /// Same as [`Self::arm_periodic_comparator`]. Caller must
+    /// also ensure `supports_fsb(n)` returned true.
+    pub unsafe fn arm_periodic_msi_comparator(
+        &self,
+        n: u8,
+        msi_addr: u32,
+        msi_data: u32,
+        period_ticks: u64,
+    ) {
+        let block = self.timer_block(n);
+        // SAFETY: caller-asserted live window + valid index.
+        let mut cfg = unsafe { read_u64(block + TIMER_REG_CONFIG) };
+        cfg &= !(TN_INT_ENB_CNF | TN_INT_ROUTE_CNF_MASK | TN_INT_TYPE_CNF);
+        // Enable FSB delivery; periodic mode + SETVAL to write
+        // both the initial comparator and the period.
+        cfg |= TN_FSB_EN_CNF | TN_TYPE_CNF_PERIODIC | TN_VAL_SET_CNF;
+        if cfg & TN_SIZE_CAP == 0 {
+            cfg |= TN_32MODE_CNF;
+        }
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+
+        // FSB route: low 32 = data (vector + delivery), high 32
+        // = address (FED-format). Written as one 64-bit MMIO; some
+        // HPETs accept this, others want two 32-bit writes. The
+        // HPET spec permits 32-bit access to either half, so do
+        // 32-bit writes for compatibility.
+        // SAFETY: same.
+        unsafe {
+            let fsb_lo = (block + TIMER_REG_FSB_ROUTE) as *mut u32;
+            let fsb_hi = (block + TIMER_REG_FSB_ROUTE + 4) as *mut u32;
+            core::ptr::write_volatile(fsb_lo, msi_data);
+            core::ptr::write_volatile(fsb_hi, msi_addr);
+        }
+
+        // Double-write of comparator: absolute first, then period.
+        // SAFETY: same.
+        let now = unsafe { read_u64(self.base_phys + REG_MAIN_CNT) };
+        let trigger = now.wrapping_add(period_ticks);
+        let trigger_w = if cfg & TN_32MODE_CNF != 0 {
+            trigger & 0xFFFF_FFFF
+        } else {
+            trigger
+        };
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_COMPARATOR, trigger_w) };
+        let period_w = if cfg & TN_32MODE_CNF != 0 {
+            period_ticks & 0xFFFF_FFFF
+        } else {
+            period_ticks
+        };
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_COMPARATOR, period_w) };
+
+        // Clear status latch (MSI is edge-triggered so the latch
+        // shouldn't accumulate, but Linux clears it on init).
+        // SAFETY: same.
+        unsafe { write_u64(self.base_phys + REG_INT_STS, 1u64 << n) };
+
+        // Enable interrupt delivery.
+        cfg |= TN_INT_ENB_CNF;
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+    }
+
     /// Disable comparator `n` (clear `Tn_INT_ENB_CNF`) and clear
     /// any pending status latch.
     ///
@@ -707,6 +811,54 @@ pub fn comparator_supports_periodic(n: u8) -> bool {
         None => return false,
     };
     h.supports_periodic(n)
+}
+
+/// True iff comparator `n` supports FSB-MSI delivery. When true,
+/// callers should prefer [`arm_periodic_msi`] over the IOAPIC
+/// routing path — MSI bypasses the IOAPIC and gives a direct
+/// LAPIC delivery, which works on platforms (Renoir) where the
+/// IOAPIC silently drops HPET's GSI.
+pub fn comparator_supports_fsb(n: u8) -> bool {
+    let g = HPET.lock();
+    let h = match g.as_ref() {
+        Some(h) => h,
+        None => return false,
+    };
+    h.supports_fsb(n)
+}
+
+/// Arm comparator `n` in periodic mode with FSB-MSI delivery.
+/// `msi_addr` and `msi_data` are the standard PCI MSI message
+/// format: address typically `0xFEE0_0000 | (apic_id << 12)`,
+/// data carries vector + delivery + trigger encoding.
+///
+/// # Safety
+/// Caller asserts the HPET MMIO window is live, comparator `n`
+/// is not being used by another driver, and `comparator_supports_fsb(n)`
+/// returned true.
+pub unsafe fn arm_periodic_msi(
+    n: u8,
+    msi_addr: u32,
+    msi_data: u32,
+    period_ticks: u64,
+) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    if n >= h.caps.num_comparators {
+        return Err(ArmError::BadComparator);
+    }
+    if !h.supports_periodic(n) {
+        return Err(ArmError::NoPeriodic);
+    }
+    if !h.supports_fsb(n) {
+        return Err(ArmError::BadComparator);
+    }
+    // SAFETY: caller-asserted live window; index bounded;
+    // capability checks above.
+    unsafe { h.arm_periodic_msi_comparator(n, msi_addr, msi_data, period_ticks) };
+    // SAFETY: same.
+    unsafe { h.clear_status(n) };
+    Ok(())
 }
 
 /// Disarm comparator `n` (clear enable + status latch). Returns
