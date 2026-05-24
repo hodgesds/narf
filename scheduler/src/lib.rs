@@ -1065,6 +1065,12 @@ pub fn run_until_empty() {
     };
 
     loop {
+        // Per-round drain of IRQ-deferred wakers. Must run every
+        // round (not gated on ready_this_round == 0), because a
+        // perpetually self-waking task (supervisor with
+        // YieldTimeout) keeps ready > 0 and would otherwise
+        // starve deferred wakes forever.
+        let _ = narf_lib::deferred_wake::drain_and_wake();
         // Slot 21: run_until_empty round entry beacon. White → red
         // toggles each round. If this stays a single colour, the
         // executor never completes one round (wedged in first
