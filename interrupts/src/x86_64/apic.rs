@@ -187,9 +187,19 @@ fn apic_error_handler() {
     // SDM §11.5.3: ESR latches errors but only updates on a
     // write. Write 0, then read to drain.
     // SAFETY: APIC is live; ESR MSR is well-defined.
-    let esr = unsafe {
-        wrmsr(APIC_ESR_MSR, 0);
-        rdmsr(APIC_ESR_MSR)
+    let esr = if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        unsafe {
+            wrmsr(APIC_ESR_MSR, 0);
+            rdmsr(APIC_ESR_MSR)
+        }
+    } else {
+        // xAPIC ESR at MMIO offset 0x280.
+        // SAFETY: LAPIC MMIO identity-mapped.
+        let esr_reg = (XAPIC_MMIO_BASE + 0x280) as *mut u32;
+        unsafe {
+            core::ptr::write_volatile(esr_reg, 0);
+            core::ptr::read_volatile(esr_reg) as u64
+        }
     };
     APIC_ERROR_LATCH.fetch_or(esr, core::sync::atomic::Ordering::Relaxed);
     APIC_ERROR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -430,13 +440,25 @@ pub unsafe fn stop_timer() {
 /// Call exactly once per IRQ dispatch, from inside the handler.
 #[inline]
 pub unsafe fn eoi() {
-    if !X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    // SAFETY: APIC is initialised; EOI write has no side effect beyond
-    // unblocking the same-or-lower-priority interrupts.
-    unsafe {
-        wrmsr(APIC_EOI_MSR, 0);
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: x2APIC live; EOI MSR write clears the highest in-
+        // service register bit, unblocking same/lower-priority IRQs.
+        unsafe {
+            wrmsr(APIC_EOI_MSR, 0);
+        }
+    } else {
+        // xAPIC EOI: write zero to LAPIC MMIO offset 0xB0. Without
+        // this the in-service register stays set after the first
+        // IRQ of a given priority, blocking all further deliveries
+        // — the symptom is "first tick fires then nothing". This
+        // is the canonical mainframe Linux pattern (`native_apic_mem_eoi`).
+        //
+        // SAFETY: LAPIC MMIO identity-mapped; 32-bit aligned write
+        // to architected register has no side effect beyond ack.
+        let eoi_reg = (XAPIC_MMIO_BASE + 0x0B0) as *mut u32;
+        unsafe {
+            core::ptr::write_volatile(eoi_reg, 0);
+        }
     }
 }
 
@@ -475,12 +497,33 @@ pub unsafe fn wrmsr_icr(icr: u64) {
 
 /// Read this CPU's APIC ID via x2APIC MSR 0x802.
 ///
+/// Read the current CPU's APIC ID. Routes through the x2APIC
+/// APIC_ID MSR (0x802) when x2APIC is active, or the xAPIC MMIO
+/// register (offset 0x20, upper 8 bits) when it isn't.
+///
+/// Reading MSR 0x802 with x2APIC disabled produces a #GP — a
+/// large class of Renoir / Phoenix BIOSes refuse the
+/// IA32_APIC_BASE.EXTD bit so we end up in xAPIC mode, and the
+/// silent #GP from a bare rdmsr was masking the real LAPIC
+/// failure mode for a long time. Match Linux's read_apic_id
+/// which dispatches on the same flag.
+///
 /// # Safety
-/// x2APIC must be enabled.
+/// `init_bsp` must have run. LAPIC MMIO is identity-mapped per
+/// init_bsp contract.
 #[inline]
 pub unsafe fn apic_id() -> u32 {
-    // SAFETY: MSR 0x802 is x2APIC APIC_ID — read-only.
-    unsafe { rdmsr(0x0000_0802) as u32 }
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: MSR 0x802 is x2APIC APIC_ID — read-only.
+        unsafe { rdmsr(0x0000_0802) as u32 }
+    } else {
+        // SAFETY: LAPIC MMIO identity-mapped; reading the APIC_ID
+        // register has no side effects.
+        let id_reg = (XAPIC_MMIO_BASE + 0x20) as *const u32;
+        let raw = unsafe { core::ptr::read_volatile(id_reg) };
+        // xAPIC APIC_ID occupies bits[31:24].
+        raw >> 24
+    }
 }
 
 /// Default xAPIC MMIO base. Used as the fallback when x2APIC isn't

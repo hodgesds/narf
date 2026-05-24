@@ -279,9 +279,17 @@ impl Arch {
         let display = display.to_string();
         match self {
             Arch::X86_64 => {
+                // QEMU CPU model can be overridden to exercise the
+                // xAPIC fallback path (no x2APIC) and/or the
+                // InitialCount LAPIC arm path (no TSC-deadline) —
+                // matches Renoir's BIOS behavior where x2APIC is
+                // refused. Example:
+                //   NARF_QEMU_CPU="max,-x2apic,-tsc-deadline"
+                let cpu = std::env::var("NARF_QEMU_CPU")
+                    .unwrap_or_else(|_| "max".into());
                 let mut args = vec![
                     "-machine".into(), "q35,hmat=on".into(),
-                    "-cpu".into(),     "max".into(),
+                    "-cpu".into(),     cpu,
                     "-smp".into(),     "16,sockets=2,cores=8".into(),
                     "-m".into(),       "256M".into(),
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
