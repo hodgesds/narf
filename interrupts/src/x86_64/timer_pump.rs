@@ -158,7 +158,15 @@ fn pump_irq() {
         let _ = narf_time::hpet::disarm(0);
     }
     let now = narf_time::now_cycles();
-    let _ = narf_time::timer_wheel::fire_due(now);
+    // Use `take_due` (no wake — safe in IRQ context) and stash
+    // the wakers in a per-CPU pending-wakes queue. The wakes
+    // themselves fire from `run_until_empty`'s idle path, which
+    // runs in non-IRQ context where slab dealloc is allowed.
+    // Calling wake() here (via the old `fire_due`) panics on
+    // the alloc-context check when a wake's Arc drop is the
+    // last reference.
+    let (taken, _n) = narf_time::timer_wheel::take_due(now);
+    narf_lib::deferred_wake::push_pending(taken);
     if let Some(next) = narf_time::timer_wheel::next_deadline_cycles() {
         wheel_arm(next);
     }

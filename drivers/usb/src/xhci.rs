@@ -1311,8 +1311,20 @@ impl Xhci {
             er_ccs: IrqSafeSpinLock::new(1),
             er_dequeue: IrqSafeSpinLock::new(0),
             devices: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
-            cmd_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::new()),
-            transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::new()),
+            // Pre-allocate to MAX_DEPTH (64) so the ISR's
+            // `push_back` from `demux_one_event` never grows the
+            // VecDeque — VecDeque::push_back triggers the
+            // Sleepable allocator on growth, which panics from
+            // IRQ context. Matches the cap enforced in
+            // demux_one_event (line 1814: `if g.len() >= MAX_DEPTH
+            // { pop_front; }`). Future events recycle slots
+            // without ever realloc'ing.
+            cmd_events: IrqSafeSpinLock::new(
+                alloc::collections::VecDeque::with_capacity(64),
+            ),
+            transfer_events: IrqSafeSpinLock::new(
+                alloc::collections::VecDeque::with_capacity(64),
+            ),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
             running: true,
             msix,

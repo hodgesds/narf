@@ -244,32 +244,51 @@ pub fn refresh_waker(handle: SleepHandle, waker: Waker) -> bool {
 }
 
 /// Wake every sleeper whose deadline has passed. Returns the
-/// number woken. Designed to be called from IRQ context.
+/// number woken. Safe to call from non-IRQ context only —
+/// calls wake() on each expired Waker, which consumes it and
+/// drops the inner Arc; if that's the last reference the slab
+/// dealloc trips `is_sleepable()`'s `in_irq` check.
 ///
-/// Wakers are pulled out of the wheel and woken with the
-/// internal lock dropped, so a wake handler that immediately
-/// re-registers (e.g. periodic poll) doesn't deadlock.
+/// IRQ-context callers (timer ISRs, dispatch::on_irq's handler
+/// chain) MUST use [`take_due`] instead and call wake() AFTER
+/// exiting IRQ context.
 pub fn fire_due(now_cycles: u64) -> usize {
-    let woken = {
-        let mut w = WHEEL.lock();
-        let mut taken: [Option<Waker>; MAX_SLEEPERS] = [const { None }; MAX_SLEEPERS];
-        let mut n = 0usize;
-        for (i, slot) in w.slots.iter_mut().enumerate() {
-            if let Some(s) = slot.as_ref() {
-                if s.deadline_cycles <= now_cycles {
-                    let s = slot.take().unwrap();
-                    taken[i] = Some(s.waker);
-                    n += 1;
-                }
-            }
-        }
-        (taken, n)
-    };
-    let (taken, n) = woken;
+    let (taken, n) = take_due(now_cycles);
     for w in taken.into_iter().flatten() {
         w.wake();
     }
     n
+}
+
+/// Pull out every Waker whose deadline has passed but DO NOT
+/// call wake() on them. Caller is responsible for calling wake()
+/// outside IRQ context. Returns the (wakers, count) tuple — the
+/// fixed-size array means no heap allocation, safe in any
+/// context including from IRQ handlers.
+///
+/// Typical use from an IRQ handler:
+/// ```ignore
+/// fn isr() {
+///     let (wakers, _n) = take_due(now_cycles());
+///     // ... ack hardware, exit IRQ context ...
+///     // Then outside IRQ:
+///     for w in wakers.into_iter().flatten() { w.wake(); }
+/// }
+/// ```
+pub fn take_due(now_cycles: u64) -> ([Option<Waker>; MAX_SLEEPERS], usize) {
+    let mut w = WHEEL.lock();
+    let mut taken: [Option<Waker>; MAX_SLEEPERS] = [const { None }; MAX_SLEEPERS];
+    let mut n = 0usize;
+    for (i, slot) in w.slots.iter_mut().enumerate() {
+        if let Some(s) = slot.as_ref() {
+            if s.deadline_cycles <= now_cycles {
+                let s = slot.take().unwrap();
+                taken[i] = Some(s.waker);
+                n += 1;
+            }
+        }
+    }
+    (taken, n)
 }
 
 /// Earliest pending deadline, or `None` if the wheel is

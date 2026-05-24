@@ -1397,6 +1397,26 @@ pub fn run_until_empty() {
         }
 
         if ready_this_round == 0 {
+            // Drain any wakers that IRQ handlers stashed for
+            // deferred execution. The IRQ paths (dispatch::on_irq's
+            // vector-waker chain, timer_pump's pump_irq → wheel
+            // wakers) can't call `Waker::wake()` directly — the
+            // drop of the inner Arc can hit a Sleepable slab
+            // dealloc, which the allocator's IRQ-context check
+            // refuses. They push to the per-CPU deferred queue;
+            // we drain + wake here, in non-IRQ context. This is
+            // the load-bearing wake path for everything that
+            // depends on IRQ delivery (xHCI completions,
+            // keyboard IRQ1, HPET-driven wheel wakes).
+            let n_drained = narf_lib::deferred_wake::drain_and_wake();
+            if n_drained > 0 {
+                // A drained wake may have flipped a slot's
+                // awake flag — continue to the top of the outer
+                // loop so we re-evaluate ready_this_round on the
+                // updated state instead of falling into the
+                // halt/spin idle path.
+                continue;
+            }
             // Idle path. Conservative on real hardware: trust the
             // wheel's deadline rather than `halt_until_irq` alone.
             //

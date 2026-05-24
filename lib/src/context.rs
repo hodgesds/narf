@@ -26,6 +26,42 @@ static COUNTERS: [AtomicU32; N_CPUS] = {
     [ZERO_COUNTER; N_CPUS]
 };
 
+/// Per-CPU "currently handling IRQ vector + 1". 0 = not in IRQ.
+/// Diagnostic surface so allocator-context-check failures can
+/// identify which ISR triggered them.
+static CURRENT_IRQ_VECTOR: [AtomicU32; N_CPUS] = {
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+    [ZERO; N_CPUS]
+};
+
+/// Set when an IRQ vector enters its handler. 0 means not in IRQ.
+/// Called by `enter_irq_vector` from `dispatch::on_irq`.
+#[inline]
+pub fn set_current_irq_vector(vector: u8) {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    CURRENT_IRQ_VECTOR[cpu].store((vector as u32) + 1, Ordering::Release);
+}
+
+#[inline]
+pub fn clear_current_irq_vector() {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    CURRENT_IRQ_VECTOR[cpu].store(0, Ordering::Release);
+}
+
+/// Read the currently-handling IRQ vector on this CPU. Returns
+/// `None` if not in IRQ context. Diagnostic-only.
+#[inline]
+pub fn current_irq_vector() -> Option<u8> {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    match CURRENT_IRQ_VECTOR[cpu].load(Ordering::Acquire) {
+        0 => None,
+        v => Some((v - 1) as u8),
+    }
+}
+
 #[inline]
 fn cpu_counter() -> &'static AtomicU32 {
     let id = crate::percpu::current_cpu();

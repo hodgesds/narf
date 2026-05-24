@@ -82,10 +82,21 @@ impl AllocContext {
         match self {
             AllocContext::Sleepable => {
                 if !is_sleepable() {
+                    // Extra diagnostics for tracking which path
+                    // allocates Sleepable from IRQ context. The
+                    // in_irq counter being non-zero (depth N) means
+                    // an IRQ handler is currently running — its
+                    // allocator call needs `try_alloc_atomic` not
+                    // Sleepable. Counter > 1 means nested IRQs;
+                    // counter stuck > 0 outside of IRQ entry means
+                    // a missing `exit_irq` somewhere.
                     panic!(
                         "AllocContext::Sleepable used from IRQ context — \
-                         IRQ handler must use try_alloc_atomic (irqs_enabled={})",
+                         in_irq_depth={} irqs_enabled={} cpu={} vector={:?}",
+                        if narf_lib::context::in_irq() { 1 } else { 0 },
                         irqs_enabled(),
+                        narf_lib::percpu::current_cpu(),
+                        narf_lib::context::current_irq_vector(),
                     );
                 }
             }

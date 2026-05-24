@@ -425,6 +425,7 @@ pub fn on_irq(vector: u8) {
     }
 
     narf_lib::context::enter_irq();
+    narf_lib::context::set_current_irq_vector(vector);
     s.in_flight.fetch_add(1, Ordering::AcqRel);
 
     s.fired.fetch_add(1, Ordering::Release);
@@ -468,17 +469,19 @@ pub fn on_irq(vector: u8) {
             s.spurious.fetch_add(1, Ordering::Release);
         }
 
-        // Wake every queued waker. `mem::take` swaps in an empty
-        // Vec (Vec::new is const, no alloc) and we wake outside
-        // the lock so a waker that re-registers doesn't deadlock.
-        let wakers: Vec<Waker> = core::mem::take(&mut *s.wakers.lock());
-        for w in wakers {
-            w.wake();
-        }
+        // Drain wakers directly into the per-CPU deferred queue
+        // WITHOUT allocating any temporary container in IRQ
+        // context. `Vec::drain(..)` yields owned Wakers and
+        // empties the Vec but preserves its capacity buffer
+        // (no heap free). The drain iterator is consumed by
+        // push_pending_iter inline; the source Vec's allocation
+        // stays put under the wakers lock.
+        narf_lib::deferred_wake::push_pending_iter(s.wakers.lock().drain(..));
         // _dispatch drops here → clears the per-CPU marker.
     }
 
     s.in_flight.fetch_sub(1, Ordering::AcqRel);
+    narf_lib::context::clear_current_irq_vector();
     narf_lib::context::exit_irq();
 }
 
