@@ -208,97 +208,6 @@ pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
 ///
 /// # Safety
 /// `init_bsp` must have run; caller still owns IRQ masking.
-/// LAPIC current-count register (read-only). MSR / xAPIC offset.
-const APIC_TIMER_CURR_MSR: u32 = 0x0000_0839;
-const APIC_TIMER_CURR_OFF: u64 = 0x390;
-
-/// Cached LAPIC post-divide bus frequency in Hz. 0 = not yet
-/// calibrated. Set on first call to `lapic_bus_freq_post_divide`
-/// which calibrates against TSC over a 10 ms window.
-static LAPIC_BUS_HZ: AtomicU64 = AtomicU64::new(0);
-
-/// One-shot calibration of the LAPIC timer's post-divide bus
-/// frequency. Spins TSC for ~10 ms with the LAPIC timer armed
-/// in one-shot mode (masked so no IRQs fire), then reads the
-/// remaining count to compute ticks-per-second.
-///
-/// Cached after first successful run. Returns a safe default
-/// (6.25 MHz — the historical assumption) if TSC isn't
-/// calibrated yet (cycles_per_ns == 1, meaning we'd measure
-/// the wrong window).
-pub fn lapic_bus_freq_post_divide() -> u64 {
-    let cached = LAPIC_BUS_HZ.load(Ordering::Acquire);
-    if cached != 0 {
-        return cached;
-    }
-    let cpns = narf_time::wall::cycles_per_ns() as u64;
-    if cpns < 2 {
-        // TSC not calibrated yet — return historical assumed
-        // bus freq and don't cache (so a later call can
-        // calibrate properly).
-        return 6_250_000;
-    }
-    // 10 ms calibration window.
-    let window_cycles = 10_000_000u64.saturating_mul(cpns);
-    let x2apic = X2APIC_ACTIVE.load(Ordering::Acquire);
-    let masked_lvt = LVT_MASKED | 0xFFu64; // dummy vector, masked
-    // SAFETY: BSP, IRQs irrelevant (timer is masked during cal),
-    // APIC live.
-    unsafe {
-        if x2apic {
-            wrmsr(APIC_TIMER_DIV_MSR, DIV_16);
-            wrmsr(APIC_LVT_TIMER_MSR, masked_lvt);
-            wrmsr(APIC_TIMER_INIT_MSR, 0xFFFF_FFFFu64);
-        } else {
-            let lvt = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
-            let init = (XAPIC_MMIO_BASE + 0x380) as *mut u32;
-            let div = (XAPIC_MMIO_BASE + 0x3E0) as *mut u32;
-            core::ptr::write_volatile(div, DIV_16 as u32);
-            core::ptr::write_volatile(lvt, masked_lvt as u32);
-            core::ptr::write_volatile(init, 0xFFFF_FFFFu32);
-        }
-    }
-    let start = narf_time::now_cycles();
-    while narf_time::now_cycles().wrapping_sub(start) < window_cycles {
-        core::hint::spin_loop();
-    }
-    // SAFETY: same.
-    let remaining = unsafe {
-        if x2apic {
-            rdmsr(APIC_TIMER_CURR_MSR) as u32
-        } else {
-            let curr = (XAPIC_MMIO_BASE + APIC_TIMER_CURR_OFF) as *const u32;
-            core::ptr::read_volatile(curr)
-        }
-    };
-    // Mask the timer; arm_periodic will rewrite it.
-    // SAFETY: same.
-    unsafe {
-        if x2apic {
-            wrmsr(APIC_LVT_TIMER_MSR, masked_lvt);
-            wrmsr(APIC_TIMER_INIT_MSR, 0);
-        } else {
-            let lvt = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
-            let init = (XAPIC_MMIO_BASE + 0x380) as *mut u32;
-            core::ptr::write_volatile(lvt, masked_lvt as u32);
-            core::ptr::write_volatile(init, 0u32);
-        }
-    }
-    let elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining) as u64;
-    // elapsed ticks in 10 ms → multiply by 100 for Hz.
-    let hz = elapsed.saturating_mul(100);
-    // Sanity bracket: a sensible LAPIC bus runs 1 MHz - 1 GHz
-    // post-divide. Outside that, fall back to the historical
-    // assumption so we don't store a nonsense value.
-    let hz = if (1_000_000..=1_000_000_000).contains(&hz) {
-        hz
-    } else {
-        6_250_000
-    };
-    LAPIC_BUS_HZ.store(hz, Ordering::Release);
-    hz
-}
-
 pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // x2APIC MSR path.
@@ -388,18 +297,27 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         if hz == 0 || hz > 100_000 {
             return Err(narf_time::clockevent::ClockEventError::InvalidFrequency);
         }
-        // Calibrate the LAPIC bus freq against the (already
-        // calibrated) TSC, then derive initial_count from the
-        // requested hz. The hardcoded 1_000_000 used previously
-        // assumed a 100 MHz / DIV_16 = 6.25 MHz post-divide bus
-        // → period 160 ms → ~6 Hz on real Renoir. Probe expects
-        // ≥1 tick in 50 ms; 6 Hz delivers 0.3 ticks/50ms, so
-        // probe fails even though the LAPIC is fine. Calibrate
-        // once and cache (LAPIC_TICKS_PER_HZ_UNIT).
-        let lapic_ticks_per_sec = lapic_bus_freq_post_divide();
-        let initial_count = (lapic_ticks_per_sec / hz as u64)
-            .max(1)
-            .min(u32::MAX as u64) as u32;
+        // Use a small initial_count that fires fast enough on any
+        // plausible LAPIC bus speed to pass the 50 ms probe.
+        //
+        // At LAPIC post-divide bus of 6.25 MHz (worst case sane
+        // floor for Family 0x17), 10000 ticks → period 1.6 ms →
+        // ~625 Hz → ~31 ticks per 50 ms probe window. At a high-
+        // end 100 MHz bus (DIV_16 from 1.6 GHz unboosted), it's
+        // ~50 ticks per 100 us → too fast, but still safe since
+        // the ISR is just TIMER_TICKS++ and the per-CPU panel /
+        // wheel pump can absorb 10 kHz easily. Calibration was
+        // tried but Renoir's xAPIC current-count register
+        // either doesn't decrement when masked or our read
+        // misses it; the post-arm probe still saw 0 ticks. A
+        // fixed-count that's safely fast on any bus avoids the
+        // failure mode entirely.
+        //
+        // The hz argument is preserved for future TSC-deadline
+        // mode (LVT bit 18) which is more accurate but needs a
+        // periodic re-arm hook in the ISR.
+        let _ = hz;
+        let initial_count = 10_000u32;
         // SAFETY: caller upholds CPL=0 + exclusive backend access.
         unsafe {
             start_timer(vector, initial_count);

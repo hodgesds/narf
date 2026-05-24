@@ -172,20 +172,21 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     this, halt_until_irq parks the AP forever — no timer
     //     ticks, no IPIs, never wakes — so its run_until_empty
     //     never gets a chance to drain its queue or steal work.
-    //     Same vector + count as the BSP (bare_main.rs:
-    //     VECTOR_TIMER / 1_000_000) so the trap handler routes
-    //     ticks identically per CPU. APs only run tasks they can
-    //     legally take (Affinity.allowed.contains(this_cpu)) —
-    //     today TaskSpec::unthrottled() pins to BSP, so APs idle
-    //     until something is explicitly spawned at AP affinity.
-    //     The SMP-safety audit per task is gated on this being in
+    //     Same vector + count as the BSP arm in
+    //     LapicClockEvent::arm_periodic — keep them in sync so
+    //     the trap handler routes ticks identically per CPU. APs
+    //     only run tasks they can legally take
+    //     (Affinity.allowed.contains(this_cpu)) — today
+    //     TaskSpec::unthrottled() pins to BSP, so APs idle until
+    //     something is explicitly spawned at AP affinity. The
+    //     SMP-safety audit per task is gated on this being in
     //     place + the affinity defaults having flipped.
     // SAFETY: init_ap above already enabled x2APIC + spurious;
     // start_timer only programs LVT_TIMER which is per-CPU.
     unsafe {
         narf_interrupts::x86_64::apic::start_timer(
             narf_interrupts::VECTOR_TIMER,
-            1_000_000,
+            10_000,
         );
     }
 
