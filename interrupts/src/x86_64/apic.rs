@@ -46,8 +46,16 @@ const SIVR_ENABLE: u64 = 1 << 8;
 /// LVT Timer mode bits 17:18. `00` = one-shot, `01` = periodic,
 /// `10` = TSC-deadline.
 const LVT_TIMER_PERIODIC: u64 = 1 << 17;
+const LVT_TIMER_TSC_DEADLINE: u64 = 2 << 17;
 /// LVT bit 16: masked. Clear to unmask.
 const LVT_MASKED: u64 = 1 << 16;
+
+/// IA32_TSC_DEADLINE MSR (SDM Vol 3 §10.5.4.1). When LVT_TIMER's
+/// mode bits select TSC-deadline, writing a TSC value here arms
+/// the timer to fire when RDTSC reaches that value. Writing 0
+/// disarms. Re-arming is done from the ISR — no periodic mode in
+/// hardware, just keep writing the next deadline.
+const IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
 
 /// APIC timer divide values (documented SDM Vol 3 §10.5.4):
 ///   000 = /2, 001 = /4, 010 = /8, 011 = /16,
@@ -297,30 +305,37 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         if hz == 0 || hz > 100_000 {
             return Err(narf_time::clockevent::ClockEventError::InvalidFrequency);
         }
-        // Use a small initial_count that fires fast enough on any
-        // plausible LAPIC bus speed to pass the 50 ms probe.
+        // Prefer TSC-deadline mode (CPUID 01H ECX[24]) — modern
+        // Linux's default for x86. Avoids LAPIC bus calibration
+        // entirely: each IRQ re-arms by writing the next TSC
+        // value. Renoir / Phoenix / QEMU TCG all support it.
         //
-        // At LAPIC post-divide bus of 6.25 MHz (worst case sane
-        // floor for Family 0x17), 10000 ticks → period 1.6 ms →
-        // ~625 Hz → ~31 ticks per 50 ms probe window. At a high-
-        // end 100 MHz bus (DIV_16 from 1.6 GHz unboosted), it's
-        // ~50 ticks per 100 us → too fast, but still safe since
-        // the ISR is just TIMER_TICKS++ and the per-CPU panel /
-        // wheel pump can absorb 10 kHz easily. Calibration was
-        // tried but Renoir's xAPIC current-count register
-        // either doesn't decrement when masked or our read
-        // misses it; the post-arm probe still saw 0 ticks. A
-        // fixed-count that's safely fast on any bus avoids the
-        // failure mode entirely.
-        //
-        // The hz argument is preserved for future TSC-deadline
-        // mode (LVT bit 18) which is more accurate but needs a
-        // periodic re-arm hook in the ISR.
-        let _ = hz;
-        let initial_count = 10_000u32;
-        // SAFETY: caller upholds CPL=0 + exclusive backend access.
-        unsafe {
-            start_timer(vector, initial_count);
+        // Fallback to periodic-InitialCount with a fixed small
+        // count when TSC-deadline is unavailable (very old CPUs).
+        // SAFETY: BSP, IRQs masked at the caller (clockevent
+        // select_primary runs with IRQs disabled outside the
+        // probe window).
+        let feats = unsafe { narf_arch::x86_64::Features::probe() };
+        if feats.tsc_deadline {
+            // Period in TSC cycles for the requested IRQ rate.
+            let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
+            let period_ns = 1_000_000_000u64 / hz as u64;
+            let period_cycles = period_ns.saturating_mul(cpns).max(1);
+            // SAFETY: caller upholds exclusive LAPIC access; we
+            // gated on CPUID for TSC-deadline support.
+            unsafe {
+                start_timer_tsc_deadline(vector, period_cycles);
+            }
+        } else {
+            // Periodic-InitialCount fallback. See start_timer
+            // commentary; 10_000 is safely fast on any plausible
+            // post-divide bus speed.
+            let _ = hz;
+            let initial_count = 10_000u32;
+            // SAFETY: same.
+            unsafe {
+                start_timer(vector, initial_count);
+            }
         }
         Ok(())
     }
@@ -595,6 +610,31 @@ pub unsafe fn init_ap() {
 #[inline]
 pub fn on_timer_tick() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    // TSC-deadline mode: re-arm by writing the next deadline
+    // to MSR IA32_TSC_DEADLINE. Period is fixed at arm time;
+    // we add it to the previous deadline (not rdtsc()) to
+    // avoid drift from ISR latency. If the load returns 0,
+    // periodic-InitialCount mode is in use — nothing to do here.
+    let period = TSC_DEADLINE_PERIOD_CYCLES.load(Ordering::Relaxed);
+    if period != 0 {
+        let prev = TSC_DEADLINE_NEXT.load(Ordering::Relaxed);
+        let now = unsafe { core::arch::x86_64::_rdtsc() };
+        // If we've fallen behind (e.g. long handler), snap forward
+        // to now + period rather than slipping forever.
+        let next = if prev.wrapping_add(period) > now {
+            prev.wrapping_add(period)
+        } else {
+            now.wrapping_add(period)
+        };
+        TSC_DEADLINE_NEXT.store(next, Ordering::Relaxed);
+        // SAFETY: TSC-deadline MSR is unconditionally writable
+        // when the LVT_TIMER is configured for deadline mode,
+        // which is the gate that set TSC_DEADLINE_PERIOD_CYCLES
+        // non-zero.
+        unsafe {
+            wrmsr(IA32_TSC_DEADLINE, next);
+        }
+    }
     // We deliberately do NOT call timer_wheel::fire_due here.
     //
     // fire_due iterates the wheel and consumes Wakers via wake(),
@@ -612,6 +652,59 @@ pub fn on_timer_tick() {
     // does now is bump TIMER_TICKS for diagnostics + return
     // promptly so the executor's halt_until_irq wakes up and
     // serves the wheel on the next round.
+}
+
+/// Period (TSC cycles) between consecutive TSC-deadline IRQs.
+/// Non-zero gates the ISR's auto-rearm path; 0 means the timer
+/// is in classic periodic-InitialCount mode and the ISR does
+/// nothing extra (hardware re-loads from InitialCount).
+static TSC_DEADLINE_PERIOD_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// Last deadline written to IA32_TSC_DEADLINE. ISR computes the
+/// next deadline as `max(prev + period, now + period)` to
+/// preserve drift-free periodicity while never slipping behind
+/// the current TSC if a long handler delayed us.
+///
+/// Single value (BSP only) — when per-CPU TSC-deadline is needed,
+/// move this into a per-CPU array indexed by current_cpu().
+static TSC_DEADLINE_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Arm LAPIC TSC-deadline mode firing IRQ `timer_vector` every
+/// `period_cycles` TSC ticks. Computes the first deadline from
+/// `rdtsc() + period_cycles`, programs LVT_TIMER for deadline
+/// mode, then writes IA32_TSC_DEADLINE to arm.
+///
+/// On subsequent timer IRQs, `on_timer_tick` re-arms by writing
+/// the next deadline — TSC-deadline is one-shot in hardware,
+/// periodicity is a software construct here.
+///
+/// # Safety
+/// - `init_bsp` must have run.
+/// - CPUID 01H ECX[24] must be set (caller gates on Features).
+/// - Caller still owns IRQ masking (LVT_TIMER write is racy with
+///   in-flight IRQs of the same vector).
+pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
+    TSC_DEADLINE_PERIOD_CYCLES.store(period_cycles, Ordering::Release);
+    // SAFETY: caller upholds CPL=0 + LAPIC live.
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let first = now.wrapping_add(period_cycles);
+    TSC_DEADLINE_NEXT.store(first, Ordering::Release);
+    let lvt = LVT_TIMER_TSC_DEADLINE | (timer_vector as u64);
+    // SAFETY: APIC live; TSC-deadline support implied by caller.
+    unsafe {
+        if X2APIC_ACTIVE.load(Ordering::Acquire) {
+            wrmsr(APIC_LVT_TIMER_MSR, lvt);
+        } else {
+            let lvt_ptr = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
+            core::ptr::write_volatile(lvt_ptr, lvt as u32);
+        }
+        // SDM 10.5.4.1: a serializing MFENCE between the LVT
+        // mode write and the deadline write avoids a race where
+        // the deadline write is observed before the LVT mode
+        // change. AMD APM is silent but Intel mandates this.
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+        wrmsr(IA32_TSC_DEADLINE, first);
+    }
 }
 
 /// Snapshot of how many timer IRQs have fired since boot.

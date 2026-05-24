@@ -172,22 +172,33 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     this, halt_until_irq parks the AP forever — no timer
     //     ticks, no IPIs, never wakes — so its run_until_empty
     //     never gets a chance to drain its queue or steal work.
-    //     Same vector + count as the BSP arm in
-    //     LapicClockEvent::arm_periodic — keep them in sync so
-    //     the trap handler routes ticks identically per CPU. APs
-    //     only run tasks they can legally take
+    //     Mirror the BSP arm in LapicClockEvent::arm_periodic
+    //     (prefer TSC-deadline, fall back to fixed-count
+    //     periodic) so the trap handler routes ticks identically
+    //     per CPU. APs only run tasks they can legally take
     //     (Affinity.allowed.contains(this_cpu)) — today
     //     TaskSpec::unthrottled() pins to BSP, so APs idle until
     //     something is explicitly spawned at AP affinity. The
     //     SMP-safety audit per task is gated on this being in
     //     place + the affinity defaults having flipped.
     // SAFETY: init_ap above already enabled x2APIC + spurious;
-    // start_timer only programs LVT_TIMER which is per-CPU.
+    // LAPIC timer programming is per-CPU MSR/MMIO.
     unsafe {
-        narf_interrupts::x86_64::apic::start_timer(
-            narf_interrupts::VECTOR_TIMER,
-            10_000,
-        );
+        let feats = narf_arch::x86_64::Features::probe();
+        if feats.tsc_deadline {
+            // 100 Hz default — match BSP's arm_periodic(100, vec).
+            let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
+            let period_cycles = (10_000_000u64).saturating_mul(cpns);
+            narf_interrupts::x86_64::apic::start_timer_tsc_deadline(
+                narf_interrupts::VECTOR_TIMER,
+                period_cycles,
+            );
+        } else {
+            narf_interrupts::x86_64::apic::start_timer(
+                narf_interrupts::VECTOR_TIMER,
+                10_000,
+            );
+        }
     }
 
     // 3b. Match the BSP's domain-enforcer state on this AP. CR4 is

@@ -54,6 +54,7 @@ pub struct Features {
     pub rdrand: bool,        // leaf 1 ECX:30
     pub x2apic: bool,        // leaf 1 ECX:21
     pub apic: bool,          // leaf 1 EDX:9
+    pub tsc_deadline: bool,  // leaf 1 ECX:24 — LAPIC TSC-deadline mode
 }
 
 impl Features {
@@ -71,6 +72,7 @@ impl Features {
         f.rdrand = ecx1 & (1 << 30) != 0;
         f.x2apic = ecx1 & (1 << 21) != 0;
         f.apic = edx1 & (1 << 9) != 0;
+        f.tsc_deadline = ecx1 & (1 << 24) != 0;
 
         // Leaf 7, sub 0 — extended features.
         let (_, ebx7, ecx7, edx7) = unsafe { cpuid(0x0000_0007, 0) };
