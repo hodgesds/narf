@@ -222,7 +222,16 @@ pub unsafe fn init() -> Result<(), InitError> {
     let mut conf2 = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
     conf2 |= CONF_KBD_IRQ;
     conf2 &= !CONF_KBD_DISABLE;
-    conf2 &= !CONF_KBD_TRANSLATE;
+    // ENABLE first-port translation. The i8042 controller then
+    // translates whatever scancode set the keyboard emits (default
+    // is set 2 post-AT) into set 1 — which is what our decode()
+    // path expects (Set 1 make codes 1..=83 == Linux evdev codes
+    // 1..=83). Linux's atkbd uses this approach for the same
+    // reason. Renoir's EC silently ignores our explicit "set
+    // scancode 1" command (0xF0 0x01) below, so the keyboard
+    // emits set 2 anyway — without translation we'd see e.g.
+    // set-2 'A' = 0x1C reaching `from_evdev(28)` = Enter.
+    conf2 |= CONF_KBD_TRANSLATE;
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);

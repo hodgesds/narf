@@ -2323,7 +2323,6 @@ fn run_async_demo() -> ! {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let _ = writeln!(console::Writer, "  clockevent: registering backends...");
         // Register candidate tick sources. LAPIC first (highest
         // preference — per-CPU, low resolution_ns, no shared
         // device contention). HPET second, as fallback: it owns
@@ -2341,8 +2340,6 @@ fn run_async_demo() -> ! {
             &narf_interrupts::x86_64::hpet_clockevent::HPET_CLOCKEVENT,
         );
 
-        let _ = writeln!(console::Writer, "  clockevent: backends registered, enabling IRQs...");
-
         // Enable CPU-side IRQ delivery BEFORE select_primary so
         // the probe can actually observe ticks. Without this the
         // probe always fails (arm programs the device, but IF=0
@@ -2351,7 +2348,6 @@ fn run_async_demo() -> ! {
         unsafe {
             narf_arch::enable_interrupts();
         }
-        let _ = writeln!(console::Writer, "  clockevent: IRQs enabled, calling select_primary...");
 
         let selected = narf_time::clockevent::select_primary(
             100, // 100 Hz tick — 10 ms period
