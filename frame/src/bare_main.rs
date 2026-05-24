@@ -2259,10 +2259,45 @@ fn run_async_demo() -> ! {
         match unsafe { narf_time::hpet::init() } {
             Ok(()) => {
                 let hz = narf_time::hpet::frequency_hz();
+                let n = narf_time::hpet::num_comparators();
                 let _ = writeln!(
                     console::Writer,
-                    "  hpet: enabled @ {} MHz",
-                    hz / 1_000_000
+                    "  hpet: enabled @ {} MHz, {} comparators",
+                    hz / 1_000_000,
+                    n,
+                );
+                // Per-comparator caps — surfaces whether MSI-FSB
+                // delivery and periodic mode are actually available
+                // on this chipset. Critical diagnostic for boot
+                // failures where 'hpet armed but probe fired 0 ticks'
+                // — tells us which path was tried.
+                for i in 0..n {
+                    let periodic = narf_time::hpet::comparator_supports_periodic(i);
+                    let fsb = narf_time::hpet::comparator_supports_fsb(i);
+                    let route_cap = narf_time::hpet::timer_route_cap(i);
+                    let _ = writeln!(
+                        console::Writer,
+                        "  hpet:   comp{} periodic={} fsb={} route_cap={:#010x}",
+                        i, periodic, fsb, route_cap,
+                    );
+                }
+                // LAPIC MMIO base from IA32_APIC_BASE MSR — Linux
+                // honors BIOS relocation via this MSR rather than
+                // hardcoding 0xFEE0_0000. If our hardcoded base
+                // doesn't match, MMIO writes go nowhere and MSI
+                // delivery (targeted at 0xFEE0_0000) won't reach
+                // the LAPIC.
+                let apic_base = unsafe {
+                    narf_arch::x86_64::msr::rdmsr(0x0000_001B)
+                };
+                let lapic_phys = apic_base & 0x0000_000F_FFFF_F000;
+                let _ = writeln!(
+                    console::Writer,
+                    "  apic: IA32_APIC_BASE={:#018x} (LAPIC phys={:#010x}, en={}, extd={})",
+                    apic_base,
+                    lapic_phys,
+                    (apic_base >> 11) & 1,
+                    (apic_base >> 10) & 1,
                 );
             }
             Err(e) => {
