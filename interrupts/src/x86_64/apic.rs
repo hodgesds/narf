@@ -462,17 +462,33 @@ pub unsafe fn eoi() {
     }
 }
 
-/// Self-IPI: send an interrupt to this CPU's own LAPIC at the given
-/// vector. Uses the x2APIC Self-IPI MSR (0x83F) which takes just the
-/// vector in the low 8 bits.
+/// Self-IPI: send an interrupt to this CPU's own LAPIC at the
+/// given vector. Routes through the x2APIC Self-IPI MSR (0x83F)
+/// when x2APIC is live; otherwise uses ICR self-shorthand
+/// (delivery shorthand 01 in bits[19:18]).
 ///
 /// # Safety
-/// APIC must be in x2APIC mode.
+/// `init_bsp` must have run.
 #[inline]
 pub unsafe fn self_ipi(vector: u8) {
-    // SAFETY: MSR 0x83F is the x2APIC Self-IPI register.
-    unsafe {
-        wrmsr(0x83F, vector as u64);
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: MSR 0x83F is the x2APIC Self-IPI register.
+        unsafe {
+            wrmsr(0x83F, vector as u64);
+        }
+    } else {
+        // xAPIC self-IPI via ICR with shorthand `self`. Bits:
+        //   [19:18] = 01 (self), [14] = 1 (level assert),
+        //   [7:0]   = vector
+        let icr_low: u32 = (vector as u32) | (1 << 14) | (1 << 18);
+        // SAFETY: LAPIC MMIO identity-mapped; high half irrelevant
+        // for self-shorthand but Intel mandates writing it first.
+        unsafe {
+            let icr_hi_reg = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
+            let icr_lo_reg = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+            core::ptr::write_volatile(icr_hi_reg, 0);
+            core::ptr::write_volatile(icr_lo_reg, icr_low);
+        }
     }
 }
 
@@ -481,17 +497,42 @@ pub unsafe fn self_ipi(vector: u8) {
 /// bits carry the IPI fields (vector + delivery mode + level + etc).
 const APIC_ICR_MSR: u32 = 0x0000_0830;
 
-/// Write the x2APIC ICR with a fully-formed value. Used by the
-/// cross-CPU IPI senders that compose their own ICR fields (delivery
-/// shorthand, vector, etc).
+/// Write the ICR with a fully-formed value. Routes through x2APIC
+/// MSR 0x830 (single 64-bit write) when x2APIC is active, or
+/// through xAPIC MMIO (write high half at offset 0x310, then low
+/// half at 0x300 to trigger send) otherwise.
+///
+/// xAPIC ICR layout differs from x2APIC: dest is in high half
+/// bits[31:24] (8-bit APIC ID), with the low half carrying the
+/// IPI fields. Linux's `default_send_IPI_dest_field` does the
+/// equivalent translation.
 ///
 /// # Safety
-/// x2APIC must be enabled on this CPU.
+/// `init_bsp` must have run. LAPIC MMIO identity-mapped.
 #[inline]
 pub unsafe fn wrmsr_icr(icr: u64) {
-    // SAFETY: caller upholds the x2APIC precondition.
-    unsafe {
-        wrmsr(APIC_ICR_MSR, icr);
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: x2APIC live; single 64-bit MSR write atomically
+        // composes the ICR + sends.
+        unsafe {
+            wrmsr(APIC_ICR_MSR, icr);
+        }
+    } else {
+        // xAPIC: destination is in bits[31:24] of high half (the
+        // top byte takes the 8-bit APIC ID). Convert the x2APIC
+        // format (full 32-bit dest in bits[63:32]) to xAPIC by
+        // shifting left another 24 bits.
+        let dest_apic_id = (icr >> 32) & 0xFF;
+        let icr_high = (dest_apic_id << 24) as u32;
+        let icr_low = (icr & 0xFFFF_FFFF) as u32;
+        // SAFETY: LAPIC MMIO identity-mapped; spec mandates writing
+        // ICR_HIGH before ICR_LOW (LOW write triggers send).
+        unsafe {
+            let icr_hi_reg = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
+            let icr_lo_reg = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+            core::ptr::write_volatile(icr_hi_reg, icr_high);
+            core::ptr::write_volatile(icr_lo_reg, icr_low);
+        }
     }
 }
 
