@@ -2288,20 +2288,21 @@ fn run_async_demo() -> ! {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Register candidate tick sources. Only LAPIC for now —
-        // HPET is owned exclusively by `narf_interrupts::
-        // x86_64::timer_pump` which programs comparator 0 in
-        // oneshot mode for wheel deadlines. A periodic-mode HPET
-        // ClockEvent would race timer_pump on the same
-        // comparator. The wheel still gets HPET wakes via
-        // timer_pump's path; periodic mode would just be a
-        // redundant tick driver. When timer_pump's HPET IRQ
-        // delivery is broken (real-HW Renoir: IOAPIC silently
-        // drops HPET's GSI), the executor's TSC-driven idle path
-        // (run_until_empty's new wheel-poll spin) provides the
-        // wake guarantee instead.
+        // Register candidate tick sources. LAPIC first (highest
+        // preference — per-CPU, low resolution_ns, no shared
+        // device contention). HPET second, as fallback: it owns
+        // comparator 1+ exclusively (comparator 0 is reserved
+        // for `narf_interrupts::x86_64::timer_pump`'s oneshot
+        // wheel arming). `select_primary` calls arm_periodic +
+        // probes each in registry order, picks the first that
+        // delivers ticks. So on Renoir-style platforms where the
+        // LAPIC timer arms but never delivers IRQs, the HPET
+        // backend is the canonical Linux-style fallback.
         narf_time::clockevent::register(
             &narf_interrupts::x86_64::apic::LAPIC_CLOCKEVENT,
+        );
+        narf_time::clockevent::register(
+            &narf_interrupts::x86_64::hpet_clockevent::HPET_CLOCKEVENT,
         );
 
         // Enable CPU-side IRQ delivery BEFORE select_primary so

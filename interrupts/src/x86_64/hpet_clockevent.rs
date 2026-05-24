@@ -96,12 +96,16 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
             return Err(ClockEventError::InvalidFrequency);
         }
 
-        // Pick the lowest-numbered comparator that (a) supports
-        // periodic mode and (b) has a safe GSI (>=16, outside the
-        // legacy ISA block) in its route cap.
+        // Pick the lowest-numbered comparator that (a) is NOT
+        // comparator 0 — reserved for `timer_pump`'s oneshot wheel
+        // arming, (b) supports periodic mode, and (c) has a safe
+        // GSI (>=16, outside the legacy ISA block) in its route
+        // cap. If a chipset only has comparator 0 (some QEMU
+        // models), this backend's probe fails and the caller
+        // moves on to the next clockevent.
         let num = narf_time::hpet::num_comparators();
         let mut chosen: Option<(u8, u8)> = None;
-        for n in 0..num {
+        for n in 1..num {
             if !narf_time::hpet::comparator_supports_periodic(n) {
                 continue;
             }
