@@ -132,9 +132,19 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
         if let Some(n) = chosen_msi {
             // MSI delivery (modern Linux path). Construct a
             // physical-mode fixed-delivery MSI message targeting
-            // the BSP (APIC ID 0). FED-format address; vector in
-            // the low byte of data.
-            let msi_addr = 0xFEE0_0000u32; // physical, BSP
+            // the BSP. FED-format address: 0xFEE0_0000 |
+            // (apic_id << 12). Vector in low byte of data; high
+            // bits 0 (fixed delivery, edge-triggered, physical).
+            //
+            // BSP APIC ID is read from MADT (entry 0). Most x86
+            // BSPs have APIC ID 0 but it's not guaranteed; Linux
+            // also reads boot_cpu_data.apicid rather than
+            // hardcoding 0.
+            let bsp_apic = match narf_acpi::apic_id_at(0) {
+                Some(id) if id <= 0xFF => id,
+                _ => 0, // fallback if MADT didn't enumerate
+            };
+            let msi_addr = 0xFEE0_0000u32 | ((bsp_apic & 0xFF) << 12);
             let msi_data = vector as u32; // fixed, edge, vector
             HPET_COMPARATOR.store(n, Ordering::Release);
             HPET_TICK_VECTOR.store(vector, Ordering::Release);
