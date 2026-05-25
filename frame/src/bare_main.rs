@@ -1418,6 +1418,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         "  smp: SKIPPED via nosmp cmdline (BSP only)"
                     );
                     narf_memory::beacon::paint(16, 0x00808080); // GRAY: SMP skipped
+                    // BSP-only topology summary. Same as the SMP
+                    // path below but with no APs to count.
+                    let bsp_ty = narf_lib::percpu::cpu_type(0);
+                    let n_p = narf_lib::percpu::count_cpu_type(
+                        narf_lib::percpu::CpuType::Core,
+                    );
+                    let n_e = narf_lib::percpu::count_cpu_type(
+                        narf_lib::percpu::CpuType::Atom,
+                    );
+                    let _ = writeln!(
+                        console::Writer,
+                        "  cpu-topology: BSP={}, {} P-core(s) + {} E-core(s)",
+                        bsp_ty.as_str(),
+                        n_p,
+                        n_e
+                    );
                 } else {
                     // SAFETY: memory + LAPIC + IDT/GDT all initialised
                     // above; identity map covers 0x8000.
@@ -1429,6 +1445,34 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         started,
                         narf_lib::smp::online_count()
                     );
+
+                    // Hybrid-CPU topology summary. Counts P-cores
+                    // (Core, 0x40) and E-cores (Atom, 0x20) across
+                    // the now-online set. AMD silicon and pre-12th-
+                    // gen Intel report BSP=Unknown and zero P/E
+                    // counts — that's the correct answer for
+                    // uniform-core parts, not a regression. Intel
+                    // Alder Lake / Raptor Lake / Meteor Lake report
+                    // the real split (e.g. 12 P-cores + 4 E-cores
+                    // on a 12700K). This line is informational
+                    // only — the scheduler doesn't yet consult
+                    // cpu_type; affinity-hinting is follow-up
+                    // work.
+                    let bsp_ty = narf_lib::percpu::cpu_type(0);
+                    let n_p = narf_lib::percpu::count_cpu_type(
+                        narf_lib::percpu::CpuType::Core,
+                    );
+                    let n_e = narf_lib::percpu::count_cpu_type(
+                        narf_lib::percpu::CpuType::Atom,
+                    );
+                    let _ = writeln!(
+                        console::Writer,
+                        "  cpu-topology: BSP={}, {} P-core(s) + {} E-core(s)",
+                        bsp_ty.as_str(),
+                        n_p,
+                        n_e
+                    );
+
                     // APs idle in run_forever until work-stealing
                     // lets them pull from BSP's queue. Gated out
                     // of kernel-test because the existing smokes
