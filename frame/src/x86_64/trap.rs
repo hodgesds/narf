@@ -217,11 +217,20 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         //   (b) run_until_empty's idle path's TSC-driven busy-
         //       poll, with IRQs enabled, where Waker drops are
         //       allowed to free.
+        // Mark this CPU as inside a real trap-handler frame
+        // around the on_irq + EOI window. `dispatch::on_irq` uses
+        // this to gate "defer wake() vs wake-direct" — defer is
+        // required from a real trap (Sleepable alloc would
+        // panic), but synchronous on_irq calls from smoke tests
+        // need direct wakes (the test driver doesn't run the
+        // executor that drains the deferred queue).
+        narf_lib::context::enter_trap_handler();
         narf_interrupts::on_irq(frame.vector as u8);
         // SAFETY: APIC is initialised before interrupts are enabled.
         unsafe {
             narf_interrupts::eoi();
         }
+        narf_lib::context::exit_trap_handler();
         if is_tick {
             // Preemption hook for stackful kernel tasks. Runs AFTER
             // EOI so that yielding to the executor doesn't leave

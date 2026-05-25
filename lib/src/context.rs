@@ -97,6 +97,53 @@ pub fn in_irq() -> bool {
     cpu_counter().load(Ordering::Acquire) > 0
 }
 
+/// Per-CPU "we're inside the trap dispatcher" flag. Set by the
+/// arch trap entry (`frame::x86_64::trap::dispatch_trap` /
+/// `frame::aarch64::trap::handle_irq`) and cleared on exit.
+/// Distinct from `in_irq()`: `in_irq` is a depth counter set by
+/// the dispatch layer regardless of caller (a smoke-test that
+/// calls `on_irq` directly bumps the counter too). `in_trap_handler`
+/// is true ONLY when execution actually reached us via a CPU
+/// interrupt-gate vector — i.e. when sleepable allocator ops
+/// must be deferred.
+static IN_TRAP_HANDLER: [AtomicU32; N_CPUS] = {
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+    [ZERO; N_CPUS]
+};
+
+/// Mark this CPU as inside a real trap-handler frame. Called by
+/// the arch trap entry, NOT by `on_irq` callers.
+#[inline]
+pub fn enter_trap_handler() {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    IN_TRAP_HANDLER[cpu].fetch_add(1, Ordering::Acquire);
+}
+
+/// Mark this CPU as leaving a trap-handler frame. Saturates at 0
+/// to keep a stray `exit` from corrupting future reads.
+#[inline]
+pub fn exit_trap_handler() {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    let c = &IN_TRAP_HANDLER[cpu];
+    if c.load(Ordering::Acquire) > 0 {
+        c.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// True iff this CPU is currently inside a real trap-handler
+/// frame (entered via a CPU interrupt-gate vector). Used by
+/// `narf_interrupts::on_irq` to decide whether to defer wake
+/// calls (real trap, IF=0 implied) or wake directly (synchronous
+/// call, e.g. smoke tests).
+#[inline]
+pub fn in_trap_handler() -> bool {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    IN_TRAP_HANDLER[cpu].load(Ordering::Acquire) > 0
+}
+
 // `irqs_enabled()` and `is_sleepable()` live higher up the
 // crate stack — narf-lib can't depend on narf-arch (circular).
 // Crates that need the combined predicate compose `in_irq()`

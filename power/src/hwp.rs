@@ -209,6 +209,10 @@ fn base_frequency_hz() -> Option<u64> {
 /// ```
 pub fn intel_hwp_summary() -> HwpSummary {
     if !vendor_intel() {
+        // Silent vendor gate — AMD parts boot through this same
+        // initcall and `amd_pstate_summary` / CPPC handle them
+        // separately. Logging an Intel-flavoured "n/a" on AMD would
+        // be misleading.
         return HwpSummary::NotIntel;
     }
     let feats = HwpFeatures::probe();

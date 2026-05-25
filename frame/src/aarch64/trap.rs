@@ -88,8 +88,11 @@ pub extern "C" fn rust_aarch64_irq(_frame: &TrapFrame) {
             // Driver-registered IRQ. The dispatch table is keyed on a
             // logical 8-bit vector; for SPIs in 32..=287 and LPIs >=
             // 8192 the low byte is enough to disambiguate inside any
-            // one driver (Stage-3 contract).
+            // one driver (Stage-3 contract). Mark trap context so
+            // on_irq can defer wakes (see x86_64 trap.rs for why).
+            narf_lib::context::enter_trap_handler();
             narf_interrupts::on_irq((intid & 0xFF) as u8);
+            narf_lib::context::exit_trap_handler();
         }
     }
 

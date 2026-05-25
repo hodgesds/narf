@@ -142,6 +142,7 @@ pub mod dp_link_training;
 pub mod intel_gpu;
 pub mod intel_gpu_aux;
 pub mod intel_gpu_ddi;
+pub mod intel_gpu_modeset;
 pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
 pub mod intel_gpu_pipes;

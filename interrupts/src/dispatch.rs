@@ -469,14 +469,31 @@ pub fn on_irq(vector: u8) {
             s.spurious.fetch_add(1, Ordering::Release);
         }
 
-        // Drain wakers directly into the per-CPU deferred queue
-        // WITHOUT allocating any temporary container in IRQ
-        // context. `Vec::drain(..)` yields owned Wakers and
-        // empties the Vec but preserves its capacity buffer
-        // (no heap free). The drain iterator is consumed by
-        // push_pending_iter inline; the source Vec's allocation
-        // stays put under the wakers lock.
-        narf_lib::deferred_wake::push_pending_iter(s.wakers.lock().drain(..));
+        // Drain wakers. Two paths:
+        //
+        // 1. Real trap context (called from trap.rs via
+        //    `on_irq_from_trap`) — we MUST defer wake() calls
+        //    because `Waker::wake()` drops the inner Arc and may
+        //    trigger a sleepable allocator free, which panics in
+        //    IRQ context. The defer flag set by the trap-entry
+        //    wrapper gates this.
+        // 2. Synchronous call (smoke tests, kernel-internal
+        //    `on_irq` calls from non-trap context) — wake
+        //    directly so the caller's expectation that "after
+        //    on_irq returns, the wakers have been notified" holds.
+        //
+        // We can't use RFLAGS.IF as the discriminator because the
+        // kernel test harness runs with IRQs masked for some
+        // smokes, which would mis-identify the test path as a
+        // real trap. Explicit flag (set by trap.rs only) is the
+        // robust answer.
+        if narf_lib::context::in_trap_handler() {
+            narf_lib::deferred_wake::push_pending_iter(s.wakers.lock().drain(..));
+        } else {
+            for w in s.wakers.lock().drain(..) {
+                w.wake();
+            }
+        }
         // _dispatch drops here → clears the per-CPU marker.
     }
 
