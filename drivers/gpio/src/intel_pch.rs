@@ -430,6 +430,20 @@ fn probe_one(hid: &str, path: &str) -> usize {
         }
     };
 
+    let gsi_str = res
+        .gsi
+        .map(|g| format!("{}", g))
+        .unwrap_or_else(|| "none".into());
+    let _ = writeln!(
+        narf_console::Writer,
+        "  intel-pch-gpio: detected {} ({}) at {} communit{}, gsi={}",
+        path,
+        hid,
+        res.communities.len(),
+        if res.communities.len() == 1 { "y" } else { "ies" },
+        gsi_str,
+    );
+
     let mut registered = 0usize;
     for (idx, c) in res.communities.iter().enumerate() {
         let phys = PhysAddr::new(c.mmio_base);
@@ -457,30 +471,13 @@ fn probe_one(hid: &str, path: &str) -> usize {
         let registered_arc = crate::registry::register_unique(ctrl);
         let _ = registered_arc;
         registered += 1;
-    }
 
-    let gsi_str = res
-        .gsi
-        .map(|g| format!("{}", g))
-        .unwrap_or_else(|| "none".into());
-    let _ = writeln!(
-        narf_console::Writer,
-        "  intel-pch-gpio: detected {} ({}) at {} communit{}, gsi={}",
-        path,
-        hid,
-        res.communities.len(),
-        if res.communities.len() == 1 { "y" } else { "ies" },
-        gsi_str,
-    );
-    for (idx, c) in res.communities.iter().enumerate() {
-        let phys = PhysAddr::new(c.mmio_base);
-        let probe = unsafe { probe_community(phys, c.mmio_len) };
         match probe {
-            Some((revid, padbar, has_debounce, pin_count)) => {
+            Some((rev, pb, deb, pads)) => {
                 let _ = writeln!(
                     narf_console::Writer,
                     "    C{}: mmio={:#x}+{:#x} revid={:#x} padbar={:#x} pads={} debounce={}",
-                    idx, c.mmio_base, c.mmio_len, revid, padbar, pin_count, has_debounce,
+                    idx, c.mmio_base, c.mmio_len, rev, pb, pads, deb,
                 );
             }
             None => {
