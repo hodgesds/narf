@@ -296,6 +296,51 @@ const REG_TDT: u64 = 0x3818;
 const REG_RAL0: u64 = 0x5400;
 const REG_RAH0: u64 = 0x5404;
 
+// PCH (Lynx Point onward) — Management Engine PHY-ownership
+// handshake. The Intel ME shares the integrated PHY with the host
+// on I217/I218/I219 (`drivers/net/ethernet/intel/e1000e/ich8lan.c`
+// — `e1000_get_swflag_ich8lan` + `e1000_release_swflag_ich8lan`).
+//
+// FWSM (Firmware Status, 0x05B54) bit 15 = `FW_VALID`: ME firmware
+// is alive and may be touching the PHY. EXTCNF_CTRL (Extended
+// Configuration Control, 0x00F00) bit 5 = `SW_FLAG`: software
+// owns the PHY. The driver writes 1 to claim, reads back to confirm,
+// holds for the PHY/MAC op, then writes 0 to release. On non-ME
+// silicon FWSM reads as 0 → the dance is a no-op (this is what QEMU
+// 82540EM looks like).
+/// `E1000_FWSM` — Firmware Status (PCH parts).
+const REG_FWSM: u64 = 0x5B54;
+/// `E1000_ICH_FWSM_FW_VALID` — ME firmware valid bit.
+const ICH_FWSM_FW_VALID: u32 = 1 << 15;
+/// `E1000_EXTCNF_CTRL` — Extended Configuration Control.
+const REG_EXTCNF_CTRL: u64 = 0x0F00;
+/// `E1000_EXTCNF_CTRL_SWFLAG` — software-owns-the-PHY flag.
+const EXTCNF_CTRL_SWFLAG: u32 = 1 << 5;
+
+// EEE (Energy Efficient Ethernet) — IEEE 802.3az. On I218/I219 the
+// MAC negotiates EEE LPI with its link partner; when the partner
+// (a dock or switch ASIC) pushes aggressive EEE during init while
+// the host hasn't acknowledged capabilities, the PHY can wedge. The
+// Linux workaround in `e1000_set_eee_pchlan` clears IPCNFG.EEE bits
+// before CTRL.SLU so the partner doesn't see capabilities advertised
+// during the brief window before the driver has finished bring-up.
+// IPCNFG = 0x00E38; bit 14 = `EEE_1G_AN`, bit 12 = `EEE_100M_AN`
+// per Linux `defines.h`.
+/// `E1000_IPCNFG` — In-band Configuration (PCH parts).
+const REG_IPCNFG: u64 = 0x0E38;
+/// `E1000_IPCNFG_EEE_1G_AN` — advertise 1000BT EEE.
+const IPCNFG_EEE_1G_AN: u32 = 1 << 14;
+/// `E1000_IPCNFG_EEE_100M_AN` — advertise 100BT EEE.
+const IPCNFG_EEE_100M_AN: u32 = 1 << 12;
+/// `E1000_EEER` — Energy Efficient Ethernet Register (PCH parts).
+const REG_EEER: u64 = 0x0E30;
+/// `E1000_EEER_TX_LPI_EN` — enable TX LPI (low-power idle).
+const EEER_TX_LPI_EN: u32 = 1 << 16;
+/// `E1000_EEER_RX_LPI_EN` — enable RX LPI.
+const EEER_RX_LPI_EN: u32 = 1 << 17;
+/// `E1000_EEER_LPI_FC` — LPI frame counter.
+const EEER_LPI_FC: u32 = 1 << 18;
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6; // Set Link Up
@@ -393,6 +438,193 @@ pub enum E1000Error {
     FrameTooLong,
     /// TX descriptor never completed.
     TxTimeout,
+    /// PHY-ownership handshake (FWSM/SWFLAG) timed out — the
+    /// Management Engine never released the PHY. Bring-up gives up
+    /// rather than risk a wedged PHY register read.
+    PhyOwnershipTimeout,
+}
+
+/// `true` for PCH (I217 / I218 / I219) silicon, where the Intel ME
+/// shares the integrated PHY with the host and the FWSM-gated
+/// SWFLAG handshake is required around any PHY/MAC reconfiguration.
+/// Mirrors Linux's `mac.type >= e1000_pchlan` discriminator.
+///
+/// Pre-PCH parts (82540 / 82574L, the QEMU-emulated lineage) and
+/// the I210/I211/82576/I350 entries that came in with the Stage-1
+/// audit don't have an ME-attached PHY and return `false`.
+pub fn is_pch_part(did: u16) -> bool {
+    matches!(
+        did,
+        E1000E_DEV_I217LM
+            | E1000E_DEV_I217V
+            | E1000E_DEV_I218LM
+            | E1000E_DEV_I218V
+            | E1000E_DEV_I218LM2
+            | E1000E_DEV_I218V2
+            | E1000E_DEV_I218LM3
+            | E1000E_DEV_I218V3
+            | E1000E_DEV_I219LM
+            | E1000E_DEV_I219V
+            | E1000E_DEV_I219LM2
+            | E1000E_DEV_I219V2
+            | E1000E_DEV_I219LM3
+            | E1000E_DEV_I219LM4
+            | E1000E_DEV_I219V4
+            | E1000E_DEV_I219LM5
+            | E1000E_DEV_I219V5
+            | E1000E_DEV_I219LM6
+            | E1000E_DEV_I219V6
+            | E1000E_DEV_I219LM7
+            | E1000E_DEV_I219V7
+            | E1000E_DEV_I219LM8
+            | E1000E_DEV_I219V8
+            | E1000E_DEV_I219LM9
+            | E1000E_DEV_I219V9
+            | E1000E_DEV_I219LM10
+            | E1000E_DEV_I219V10
+            | E1000E_DEV_I219LM11
+            | E1000E_DEV_I219V11
+            | E1000E_DEV_I219LM12
+            | E1000E_DEV_I219V12
+            | E1000E_DEV_I219LM13
+            | E1000E_DEV_I219V13
+            | E1000E_DEV_I219LM14
+            | E1000E_DEV_I219V14
+            | E1000E_DEV_I219LM15
+            | E1000E_DEV_I219V15
+            | E1000E_DEV_I219LM16
+            | E1000E_DEV_I219V16
+            | E1000E_DEV_I219LM17
+            | E1000E_DEV_I219V17
+            | E1000E_DEV_I219LM18
+            | E1000E_DEV_I219V18
+            | E1000E_DEV_I219LM19
+            | E1000E_DEV_I219V19
+            | E1000E_DEV_I219LM20
+            | E1000E_DEV_I219V20
+            | E1000E_DEV_I219LM21
+            | E1000E_DEV_I219V21
+            | E1000E_DEV_I219LM22
+            | E1000E_DEV_I219V22
+            | E1000E_DEV_I219LM23
+            | E1000E_DEV_I219V23
+            | E1000E_DEV_I219LM24
+            | E1000E_DEV_I219V24
+            | E1000E_DEV_I219LM25
+            | E1000E_DEV_I219V25
+            | E1000E_DEV_I219LM27
+            | E1000E_DEV_I219V27
+            | E1000E_DEV_I219LM29
+            | E1000E_DEV_I219V29
+    )
+}
+
+/// `true` if the Management Engine firmware reports valid + active
+/// on this MAC. On non-PCH silicon and on PCH parts without ME (or
+/// with ME disabled in BIOS) FWSM reads as 0 → returns `false`.
+///
+/// Linux equivalent: `er32(FWSM) & E1000_ICH_FWSM_FW_VALID`
+/// (`drivers/net/ethernet/intel/e1000e/ich8lan.c::e1000_check_mng_mode_ich8lan`).
+fn me_is_active(mmio: &MmioRegion) -> bool {
+    // SAFETY: identity-mapped MMIO; FWSM is inside the e1000 BAR0
+    // register window on every PCH part.
+    let fwsm = unsafe { mmio.read32(REG_FWSM) };
+    (fwsm & ICH_FWSM_FW_VALID) != 0
+}
+
+/// Claim PHY ownership via the EXTCNF_CTRL.SWFLAG handshake.
+///
+/// Linux: `e1000_get_swflag_ich8lan`
+/// (`drivers/net/ethernet/intel/e1000e/ich8lan.c`). The driver
+/// writes 1 to EXTCNF_CTRL.SWFLAG, then polls for it to read back
+/// as 1 — when the ME owns the PHY it will leave the bit at 0 until
+/// it's done. Linux loops up to 10× (each iter ~10 ms with a 5 ms
+/// hold-time after acquire); we keep the same total budget. The
+/// hold-time mirrors `udelay(SW_FLAG_TIMEOUT)` in the kernel.
+///
+/// On non-ME silicon (FWSM = 0) we skip — there's nothing to
+/// handshake with. Returns `Ok` either way; `Err` only on the wedge
+/// case where the ME never releases.
+fn acquire_phy_swflag(mmio: &MmioRegion) -> Result<bool, E1000Error> {
+    if !me_is_active(mmio) {
+        // No ME — no handshake. Return "didn't take the flag" so
+        // the release path is a no-op too.
+        return Ok(false);
+    }
+    // SAFETY: identity-mapped MMIO; EXTCNF_CTRL is inside BAR0.
+    for _ in 0..10 {
+        unsafe {
+            let v = mmio.read32(REG_EXTCNF_CTRL);
+            mmio.write32(REG_EXTCNF_CTRL, v | EXTCNF_CTRL_SWFLAG);
+        }
+        // Linux uses `udelay(SW_FLAG_TIMEOUT)` = 50 µs between
+        // poll iterations. responsive_spin_until ticks sleep_pumps
+        // so a slow ME doesn't starve other kernel async tasks.
+        let got = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mmio.read32(REG_EXTCNF_CTRL) } & EXTCNF_CTRL_SWFLAG != 0,
+            narf_time::Deadline::after_ms(10),
+        );
+        if got {
+            return Ok(true);
+        }
+        // ME still hasn't released; clear our request and retry.
+        // Linux re-reads + re-writes; we mirror.
+        // SAFETY: same.
+        unsafe {
+            let v = mmio.read32(REG_EXTCNF_CTRL);
+            mmio.write32(REG_EXTCNF_CTRL, v & !EXTCNF_CTRL_SWFLAG);
+        }
+    }
+    Err(E1000Error::PhyOwnershipTimeout)
+}
+
+/// Drop PHY ownership by clearing EXTCNF_CTRL.SWFLAG.
+///
+/// Linux: `e1000_release_swflag_ich8lan`. No handshake on release;
+/// just a single write. Called paired with `acquire_phy_swflag` —
+/// the `owned` return from acquire gates whether to write at all
+/// (skips on non-ME silicon).
+fn release_phy_swflag(mmio: &MmioRegion, owned: bool) {
+    if !owned {
+        return;
+    }
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        let v = mmio.read32(REG_EXTCNF_CTRL);
+        mmio.write32(REG_EXTCNF_CTRL, v & !EXTCNF_CTRL_SWFLAG);
+    }
+}
+
+/// Disable Energy Efficient Ethernet on PCH parts.
+///
+/// Linux: `e1000_set_eee_pchlan`
+/// (`drivers/net/ethernet/intel/e1000e/ich8lan.c`). Clears the
+/// 1G/100M EEE-advertise bits in IPCNFG (0x0E38) and drains LPI
+/// state from EEER (0x0E30) so the partner can't push aggressive
+/// EEE while the driver is mid-bring-up. Without this, some I218
+/// PHYs wedge when a dock partner advertises EEE during the brief
+/// window after MAC reset but before CTRL.SLU.
+///
+/// This is the IPCNFG-side workaround tracked in
+/// `notes/intel-e1000e-igc-audit.md` §E. The full LP-ability PHY-
+/// page write lives in a follow-up (needs MDIC access, which we
+/// don't expose yet).
+fn disable_eee_pchlan(mmio: &MmioRegion) {
+    // SAFETY: identity-mapped MMIO; IPCNFG + EEER are inside BAR0
+    // on every PCH part.
+    unsafe {
+        let ipcnfg = mmio.read32(REG_IPCNFG);
+        mmio.write32(
+            REG_IPCNFG,
+            ipcnfg & !(IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN),
+        );
+        let eeer = mmio.read32(REG_EEER);
+        mmio.write32(
+            REG_EEER,
+            eeer & !(EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC),
+        );
+    }
 }
 
 /// Live e1000 controller. Holds the MMIO mapping + the TX descriptor
@@ -434,6 +666,16 @@ pub struct E1000 {
     /// or the IOAPIC GSI route). `None` means we fell back to
     /// polled-only completion.
     pub irq_vector: Option<u8>,
+    /// `true` for I217 / I218 / I219 (PCH-attached PHY where the
+    /// Intel ME can co-own the PHY register set). Determines
+    /// whether subsequent PHY/MAC reconfiguration needs to ride
+    /// the FWSM/SWFLAG handshake.
+    pub pch_part: bool,
+    /// `true` if `FWSM.FW_VALID` was set at probe — the Management
+    /// Engine firmware is alive and may be touching the PHY. False
+    /// on QEMU (no ME) and on real silicon where the ME is
+    /// disabled in BIOS.
+    pub me_active: bool,
 }
 
 impl core::fmt::Debug for E1000 {
@@ -442,6 +684,8 @@ impl core::fmt::Debug for E1000 {
             .field("mac", &self.mac)
             .field("link_up", &self.link_up)
             .field("irq_vector", &self.irq_vector)
+            .field("pch_part", &self.pch_part)
+            .field("me_active", &self.me_active)
             .finish_non_exhaustive()
     }
 }
@@ -491,6 +735,26 @@ impl E1000 {
         // SAFETY: caller owns the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| E1000Error::BarMapFailed)?;
 
+        // PCH-vs-legacy discriminator. On I217/I218/I219 the Intel
+        // Management Engine shares the integrated PHY with the host;
+        // PHY/MAC reconfiguration must ride the FWSM/SWFLAG handshake
+        // (Linux `e1000_get_swflag_ich8lan`). On the QEMU-emulated
+        // 82540EM (`pch_part = false`) this is all a no-op.
+        let pch_part = is_pch_part(device.id.device);
+        let me_active = pch_part && me_is_active(&mmio);
+
+        // 0. PCH PHY-ownership handshake. Claim PHY before reset so
+        //    we don't race the ME's PHY-config-on-reset path. Skipped
+        //    on legacy parts. We hold the SWFLAG across the whole
+        //    bring-up — Linux scopes it tighter (per PHY-register
+        //    access), but our bring-up is short and doesn't touch
+        //    PHY MDIC, so a single hold is cheaper than per-op.
+        let phy_owned = if pch_part {
+            acquire_phy_swflag(&mmio)?
+        } else {
+            false
+        };
+
         // 1. Reset (CTRL.RST = 1; cleared by hardware after reset).
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -505,6 +769,15 @@ impl E1000 {
             || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST == 0,
             narf_time::Deadline::after_ms(100),
         );
+
+        // 1b. On PCH parts, disable EEE before CTRL.SLU. Some I218
+        //    PHYs wedge when a dock partner advertises EEE during the
+        //    post-reset → pre-link-up window. Linux's `e1000_set_eee_
+        //    pchlan` does the same (clears IPCNFG.EEE_*_AN before
+        //    starting link). No-op on legacy parts.
+        if pch_part {
+            disable_eee_pchlan(&mmio);
+        }
 
         // 2. Read MAC from RAL/RAH.
         // SAFETY: identity-mapped.
@@ -666,6 +939,15 @@ impl E1000 {
             }
         }
 
+        // 10. Release PHY ownership now that bring-up is done. Linux
+        //     holds SWFLAG only for the duration of each PHY access;
+        //     we held it across the whole init for clean-room
+        //     simplicity. A no-op on legacy parts and on PCH parts
+        //     where the ME wasn't active.
+        if pch_part {
+            release_phy_swflag(&mmio, phy_owned);
+        }
+
         Ok(Self {
             mmio,
             tx_ring,
@@ -678,6 +960,8 @@ impl E1000 {
             link_up,
             _msix: msix,
             irq_vector,
+            pch_part,
+            me_active,
         })
     }
 

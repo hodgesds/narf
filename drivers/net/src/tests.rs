@@ -300,6 +300,108 @@ kernel_test_in!(
     smoke_e1000_pci_match_table_covers_modern_pch
 );
 
+fn smoke_e1000_is_pch_part_discriminator() -> TestResult {
+    // Stage-2: PCH discriminator gates the FWSM/SWFLAG PHY-ownership
+    // handshake (`acquire_phy_swflag`) and the EEE-disable workaround
+    // (`disable_eee_pchlan`). A bring-up that mis-classifies a part
+    // as PCH would block on EXTCNF_CTRL polling against a register
+    // that doesn't exist; a bring-up that mis-classifies a PCH part
+    // as legacy would skip the handshake and read garbage from the
+    // PHY when the ME is active. Both directions are smoke-checked
+    // against the canonical examples.
+    use crate::e1000;
+    // PCH-attached PHY (must return true): I217 + I218 (Lynx Point /
+    // Wildcat Point) and the full I219 series from Sunrise Point
+    // (Skylake) through Nova Lake. These match Linux's
+    // `mac.type >= e1000_pchlan` discriminator in `ich8lan.c`.
+    let must_pch: &[u16] = &[
+        e1000::E1000E_DEV_I217LM,
+        e1000::E1000E_DEV_I218LM,
+        e1000::E1000E_DEV_I219LM,
+        e1000::E1000E_DEV_I219LM8,
+        e1000::E1000E_DEV_I219LM13,
+        e1000::E1000E_DEV_I219LM16,
+        e1000::E1000E_DEV_I219LM18,  // Meteor Lake / Phoenix HawkPoint1
+        e1000::E1000E_DEV_I219LM22,
+        e1000::E1000E_DEV_I219LM29,
+    ];
+    for did in must_pch.iter().copied() {
+        if !e1000::is_pch_part(did) {
+            return TestResult::Fail("PCH part mis-classified as legacy");
+        }
+    }
+    // Legacy / QEMU-emulated parts + the igb-style I210/I211/I350 IDs
+    // we recognise for bus-probe purposes — none of these have an
+    // ME-attached PHY.
+    let must_legacy: &[u16] = &[
+        e1000::E1000_DEV_82540EM,    // QEMU -device e1000
+        e1000::E1000_DEV_82545EM,
+        e1000::E1000_DEV_82544GC,
+        e1000::E1000E_DEV_82574L,    // QEMU q35 default e1000e
+        e1000::E1000_DEV_I210_COPPER,
+        e1000::E1000_DEV_I211_COPPER,
+        e1000::E1000_DEV_82576,
+        e1000::E1000_DEV_I350_COPPER,
+    ];
+    for did in must_legacy.iter().copied() {
+        if e1000::is_pch_part(did) {
+            return TestResult::Fail("legacy part mis-classified as PCH");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/e1000",
+    smoke_e1000_is_pch_part_discriminator
+);
+
+fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
+    // QEMU's e1000/e1000e devices are pre-PCH (82540EM, 82574L)
+    // and don't expose FWSM at all. Bring-up must run the
+    // ME-detection path through `is_pch_part = false` and skip the
+    // SWFLAG handshake. The smoke validates that bring-up still
+    // succeeds (i.e. nothing in the FWSM path blocks legacy parts).
+    use crate::e1000;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_e1000 = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == e1000::E1000_VENDOR
+            && (d.id.device == e1000::E1000_DEV_82540EM
+                || d.id.device == e1000::E1000E_DEV_82574L)
+    });
+    if !has_e1000 {
+        return TestResult::Skip("no QEMU e1000-class NIC");
+    }
+    __reset_for_test();
+    e1000::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !e1000::is_probed() {
+        return TestResult::Fail("e1000 not probed");
+    }
+    // QEMU's 82540EM / 82574L must come up as a legacy part with no
+    // active ME — the FWSM dance was skipped entirely.
+    let (pch, me) = e1000::with_controller(|c| (c.pch_part, c.me_active))
+        .unwrap_or((true, true));
+    if pch {
+        return TestResult::Fail("QEMU NIC mis-classified as PCH");
+    }
+    if me {
+        return TestResult::Fail("QEMU NIC reports ME active (FWSM should be 0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/e1000",
+    smoke_e1000_qemu_fwsm_dance_is_noop
+);
+
 // ── atheros ───────────────────────────────────────────────────────
 
 fn smoke_atheros_pci_match_table() -> TestResult {
