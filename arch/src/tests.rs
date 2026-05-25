@@ -2193,3 +2193,35 @@ fn smoke_x86_64_setjmp_buf_layout_matches_asm() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch", smoke_x86_64_setjmp_buf_layout_matches_asm);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_hybrid_cpu_type_probe() -> TestResult {
+    // Exercise the CPUID 0x1A reader + the Hybrid feature bit. We
+    // can't assert a specific result — QEMU TCG, AMD silicon, and
+    // pre-12th-gen Intel all read 0 (Unknown), which is correct.
+    // The check is structural: probe doesn't fault, the byte
+    // decodes through `CpuType::from_raw`, and `features.hybrid`
+    // is consistent with leaf 0x1A actually returning a non-zero
+    // type (a non-zero CpuType implies the silicon advertised
+    // hybrid, but not the converse — Intel parts can advertise
+    // hybrid for a single uniform LP in some hypervisor configs).
+    use crate::x86_64::cpuid::{read_hybrid_cpu_type, Features};
+    use narf_lib::percpu::CpuType;
+
+    // SAFETY: CPUID is always legal at CPL=0.
+    let feats = unsafe { Features::probe() };
+    let raw = unsafe { read_hybrid_cpu_type() };
+    let ty = CpuType::from_raw(raw);
+
+    // Non-hybrid silicon must report Unknown. Hybrid-capable silicon
+    // can report any of the three (CpuType::Unknown is fine for an
+    // unrecognised future type; we don't fail it).
+    if !feats.hybrid && ty != CpuType::Unknown {
+        return TestResult::Fail(
+            "non-hybrid CPU reported non-Unknown type from leaf 0x1A",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cpuid", smoke_x86_64_hybrid_cpu_type_probe);
