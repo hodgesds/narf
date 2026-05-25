@@ -8,6 +8,22 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+// ── Diagnostic atoms for the virtio-blk irq-async failure mode ──────
+//
+// When the smoke fails with "Waker fired from OTHER vector", these
+// surface what we learned so the next session (or panel paint code)
+// can pick up where this run left off. The vector that fired the
+// Waker is in SMOKE_VIRTIO_OTHER_VEC (0xFFFF_FFFF = none), with the
+// count in SMOKE_VIRTIO_OTHER_WAKES. SMOKE_VIRTIO_V_WAKES is the
+// count for the vector the test expected (must be 0 for the
+// "OTHER vector" diagnosis to hold).
+pub static SMOKE_VIRTIO_OTHER_VEC: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xFFFF_FFFF);
+pub static SMOKE_VIRTIO_OTHER_WAKES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static SMOKE_VIRTIO_V_WAKES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 // ── virtio-blk-pci ─────────────────────────────────────────────────
 
 fn smoke_virtio_blk_pci_read_sector() -> TestResult {
@@ -258,9 +274,36 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     // Branchy diagnostic sentinel: distinct fail strings let us
     // discriminate the failure mode from the test runner output.
     if result.is_none() {
+        // Scan all vectors for wakes_invoked > 0 (excluding v).
+        // The vector whose count moved tells us which IRQ is
+        // firing the test's Waker. Used to root-cause vector-
+        // mismatch failures.
+        let wakes_on_v = narf_interrupts::wakes_invoked(v);
+        let mut other_vec: Option<u8> = None;
+        let mut other_wakes: u64 = 0;
+        for candidate in 0..=255u16 {
+            let cv = candidate as u8;
+            if cv == v {
+                continue;
+            }
+            let n = narf_interrupts::wakes_invoked(cv);
+            if n > other_wakes {
+                other_wakes = n;
+                other_vec = Some(cv);
+            }
+        }
+        SMOKE_VIRTIO_OTHER_VEC.store(
+            other_vec.map(|v| v as u32).unwrap_or(0xFFFF_FFFF),
+            core::sync::atomic::Ordering::Release,
+        );
+        SMOKE_VIRTIO_OTHER_WAKES.store(other_wakes as u32, core::sync::atomic::Ordering::Release);
+        SMOKE_VIRTIO_V_WAKES.store(wakes_on_v as u32, core::sync::atomic::Ordering::Release);
         return match (wokes, after > baseline) {
             (0, false) => TestResult::Fail("future never resolved — no IRQ delivery, fire_count unchanged"),
             (0, true) => TestResult::Fail("future never resolved — fire_count moved but waker never called"),
+            (_, false) if wakes_on_v == 0 && other_vec.is_some() => {
+                TestResult::Fail("future never resolved — Waker fired from OTHER vector (see SMOKE_VIRTIO_OTHER_VEC atom)")
+            }
             (_, false) => TestResult::Fail("future never resolved — waker fired but fire_count unchanged (vector mismatch?)"),
             (_, true) => TestResult::Fail("future never resolved — waker+fire_count both moved, but WaitForIrq.poll keeps returning Pending"),
         };

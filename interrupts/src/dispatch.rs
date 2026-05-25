@@ -234,6 +234,12 @@ pub struct Slot {
     /// every entry, leaves the slot empty for the futures to
     /// re-register on their next poll.
     pub wakers: IrqSafeSpinLock<Vec<Waker>>,
+    /// Count of wake() / wake_by_ref() invocations on registered
+    /// Wakers for this vector. Used to debug "future never resolved"
+    /// failures where the test's Waker fires but `fired` for the
+    /// expected vector doesn't move — the discrepancy points at a
+    /// stale or mis-routed Waker registration.
+    pub wakes_invoked: AtomicU64,
 }
 
 impl core::fmt::Debug for Slot {
@@ -257,6 +263,7 @@ impl Slot {
             masked: AtomicBool::new(false),
             handlers: IrqSafeSpinLock::new(Vec::new()),
             wakers: IrqSafeSpinLock::new(Vec::new()),
+            wakes_invoked: AtomicU64::new(0),
         }
     }
 }
@@ -489,18 +496,23 @@ pub fn on_irq(vector: u8) {
         // mis-identify them as real trap context.
         if narf_lib::context::in_trap_handler() {
             let g = s.wakers.lock();
+            let count = g.len();
             for w in g.iter() {
                 w.wake_by_ref();
             }
+            s.wakes_invoked.fetch_add(count as u64, Ordering::Relaxed);
             // Don't drain — wake_by_ref kept the Wakers in place.
             // Stale entries are cleaned up by `clear_waker` from
             // the future's Drop path or by the next IRQ's wake
             // (idempotent for already-completed tasks).
         } else {
             // Synchronous: drain + consume.
+            let mut count = 0u64;
             for w in s.wakers.lock().drain(..) {
                 w.wake();
+                count += 1;
             }
+            s.wakes_invoked.fetch_add(count, Ordering::Relaxed);
         }
         // _dispatch drops here → clears the per-CPU marker.
     }
@@ -535,6 +547,17 @@ pub fn fire_count_on_cpu(vector: u8, cpu: usize) -> u64 {
         return 0;
     }
     SLOTS[vector as usize].per_cpu_fired[cpu].load(Ordering::Acquire)
+}
+
+/// Snapshot of how many wake() / wake_by_ref() calls `on_irq`
+/// has issued on registered Wakers for `vector` since boot.
+/// Diagnostic: a non-zero count for a vector your test isn't
+/// waiting on, paired with a zero count for the vector it IS
+/// waiting on, points at a Waker that's mis-registered (or a
+/// stale wheel entry firing the same payload).
+#[inline]
+pub fn wakes_invoked(vector: u8) -> u64 {
+    SLOTS[vector as usize].wakes_invoked.load(Ordering::Acquire)
 }
 
 /// Spurious-IRQ count for `vector`. Bumped when every chained

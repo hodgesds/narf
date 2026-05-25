@@ -26,8 +26,8 @@ pub use dispatch::{
     add_nmi_handler, disable_irq, enable_irq, fire_count, fire_count_on_cpu,
     install as install_handler, install_handler_named, installed_handler_names, is_masked,
     nmi_fire_count, nmi_spurious_count, on_irq, on_nmi, remove_handler, remove_nmi_handler,
-    spurious_count, synchronize_irq, HandlerEntry, IrqStatus, NmiHandler, NmiHandlerId,
-    SyncHandler, NUM_VECTORS,
+    spurious_count, synchronize_irq, wakes_invoked, HandlerEntry, IrqStatus, NmiHandler,
+    NmiHandlerId, SyncHandler, NUM_VECTORS,
 };
 pub use wait::{wait_for_irq, wait_for_irq_until, WaitForIrq};
 
