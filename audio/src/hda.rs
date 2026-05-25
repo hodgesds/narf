@@ -77,6 +77,64 @@ pub const HDA_INTEL_ICH7_DEVICE: u16 = 0x27D8;
 pub const HDA_INTEL_ICH9_VENDOR: u16 = 0x8086;
 pub const HDA_INTEL_ICH9_DEVICE: u16 = 0x293E;
 
+// ── Intel PCH HDA controller PCI device ids ───────────────────────
+//
+// Every Intel PCH HDA controller speaks the standard Intel HDA
+// programming model (same BAR0 layout, CORB/RIRB, stream descriptors,
+// codec verbs) — only the PCI ID changes. The IDs below cover the
+// modern PCH era (Skylake → Meteor Lake). All share the Intel vendor
+// ID 0x8086 and the same `probe` entry as the legacy ICH path.
+//
+// Reference: Linux `sound/pci/hda/hda_intel.c` `azx_ids[]` and
+// `pci.ids`. We deliberately keep each ID in its own named constant
+// so it is grep-able and the registration site is a flat enumeration.
+
+/// Sunrise Point-LP HD Audio (Skylake / Kaby Lake PCH-LP).
+pub const HDA_INTEL_SUNRISE_POINT_LP_DEVICE: u16 = 0x9D70;
+/// Sunrise Point-LP HD Audio — variant.
+pub const HDA_INTEL_SUNRISE_POINT_LP_DEVICE_B: u16 = 0x9D71;
+
+/// Cannon Lake PCH HD Audio.
+pub const HDA_INTEL_CANNON_LAKE_DEVICE: u16 = 0xA348;
+
+/// Comet Lake HD Audio — variant A.
+pub const HDA_INTEL_COMET_LAKE_DEVICE: u16 = 0xA171;
+/// Comet Lake HD Audio — variant B.
+pub const HDA_INTEL_COMET_LAKE_DEVICE_B: u16 = 0x43C8;
+
+/// Tiger Lake PCH-LP HD Audio — variant A.
+pub const HDA_INTEL_TIGER_LAKE_LP_DEVICE: u16 = 0xA0C8;
+/// Tiger Lake PCH-LP HD Audio — variant B.
+pub const HDA_INTEL_TIGER_LAKE_LP_DEVICE_B: u16 = 0xA0C9;
+
+/// Alder Lake-P / Alder Lake-S HD Audio — variant A.
+pub const HDA_INTEL_ALDER_LAKE_DEVICE: u16 = 0x7AD0;
+/// Alder Lake-P / Alder Lake-S HD Audio — variant B.
+pub const HDA_INTEL_ALDER_LAKE_DEVICE_B: u16 = 0x51C8;
+/// Alder Lake-P / Alder Lake-S HD Audio — variant C.
+pub const HDA_INTEL_ALDER_LAKE_DEVICE_C: u16 = 0x51CD;
+
+/// Meteor Lake HD Audio.
+pub const HDA_INTEL_METEOR_LAKE_DEVICE: u16 = 0x7E28;
+
+// ── Intel iGPU display-audio PCI device ids ───────────────────────
+//
+// On Intel platforms a second HDA-class controller lives on the
+// graphics PCI function and carries HDMI / DisplayPort audio. The
+// programming model is identical to the PCH HDA controller — same
+// CORB/RIRB, same codec verbs — only the BAR layout and bus
+// location differ. We register the same `probe` entry so both lines
+// bind out of the same code path.
+
+/// Tiger Lake-H iGPU HD Audio.
+pub const HDA_INTEL_TIGER_LAKE_GFX_DEVICE: u16 = 0x4F90;
+/// Tiger Lake-H iGPU HD Audio — variant B.
+pub const HDA_INTEL_TIGER_LAKE_GFX_DEVICE_B: u16 = 0x4F92;
+/// Tiger Lake-LP iGPU HD Audio.
+pub const HDA_INTEL_TIGER_LAKE_GFX_DEVICE_C: u16 = 0x9A09;
+/// Tiger Lake-LP iGPU HD Audio — variant.
+pub const HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D: u16 = 0x9A0C;
+
 // ── Global register offsets (HDA 1.0a §3.3) ────────────────────────
 
 const REG_GCAP: u64 = 0x00;
@@ -1623,48 +1681,51 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-/// Register both supported PCI ids with the bus match table.
+/// Static `(name, vendor, device)` triples for every HDA controller
+/// PCI id we bind. The bus probe walker iterates the match table in
+/// registration order — every entry routes to the same `probe`
+/// function because the HDA programming model is identical across
+/// vendors. Per-chip behavioural quirks (when they appear) land in
+/// `VendorQuirk` lookup keyed off `(vendor, device)`, not a branch
+/// inside `probe`.
+const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
+    // AMD — Family-19h Phoenix HD Audio + Radeon HD Audio iGPU.
+    ("hda-amd-phoenix", HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE),
+    ("hda-amd-radeon", HDA_AMD_RADEON_VENDOR, HDA_AMD_RADEON_DEVICE),
+    // Intel legacy ICH HD Audio.
+    ("hda-intel-ich6", HDA_INTEL_ICH6_VENDOR, HDA_INTEL_ICH6_DEVICE),
+    ("hda-intel-ich7", HDA_INTEL_ICH7_VENDOR, HDA_INTEL_ICH7_DEVICE),
+    ("hda-intel-ich9", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ICH9_DEVICE),
+    // Intel PCH HDA (Skylake → Meteor Lake).
+    ("hda-intel-sunrise-point-lp", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_SUNRISE_POINT_LP_DEVICE),
+    ("hda-intel-sunrise-point-lp-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_SUNRISE_POINT_LP_DEVICE_B),
+    ("hda-intel-cannon-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_CANNON_LAKE_DEVICE),
+    ("hda-intel-comet-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_COMET_LAKE_DEVICE),
+    ("hda-intel-comet-lake-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_COMET_LAKE_DEVICE_B),
+    ("hda-intel-tiger-lake-lp", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_LP_DEVICE),
+    ("hda-intel-tiger-lake-lp-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_LP_DEVICE_B),
+    ("hda-intel-alder-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ALDER_LAKE_DEVICE),
+    ("hda-intel-alder-lake-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ALDER_LAKE_DEVICE_B),
+    ("hda-intel-alder-lake-c", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ALDER_LAKE_DEVICE_C),
+    ("hda-intel-meteor-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_METEOR_LAKE_DEVICE),
+    // Intel iGPU display-audio (TGL / TGL-LP graphics function).
+    ("hda-intel-tgl-gfx", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE),
+    ("hda-intel-tgl-gfx-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE_B),
+    ("hda-intel-tgl-gfx-c", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE_C),
+    ("hda-intel-tgl-gfx-d", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D),
+];
+
+/// Register every supported HDA controller PCI id with the bus match
+/// table. Every entry binds the same `probe` function — the HDA
+/// programming model is vendor-agnostic.
 pub fn register_pci_driver() {
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "hda-amd-phoenix",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: HDA_AMD_PHOENIX_VENDOR,
-            device: HDA_AMD_PHOENIX_DEVICE,
-        },
-        probe,
-    });
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "hda-amd-radeon",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: HDA_AMD_RADEON_VENDOR,
-            device: HDA_AMD_RADEON_DEVICE,
-        },
-        probe,
-    });
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "hda-intel-ich6",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: HDA_INTEL_ICH6_VENDOR,
-            device: HDA_INTEL_ICH6_DEVICE,
-        },
-        probe,
-    });
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "hda-intel-ich7",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: HDA_INTEL_ICH7_VENDOR,
-            device: HDA_INTEL_ICH7_DEVICE,
-        },
-        probe,
-    });
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "hda-intel-ich9",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: HDA_INTEL_ICH9_VENDOR,
-            device: HDA_INTEL_ICH9_DEVICE,
-        },
-        probe,
-    });
+    for &(name, vendor, device) in HDA_PCI_IDS {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice { vendor, device },
+            probe,
+        });
+    }
 }
 
 extern crate alloc;

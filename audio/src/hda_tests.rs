@@ -47,6 +47,56 @@ fn smoke_hda_match_amd_phoenix_ids() -> TestResult {
 }
 kernel_test_in!("audio/hda", smoke_hda_match_amd_phoenix_ids);
 
+fn smoke_hda_match_intel_pch_ids() -> TestResult {
+    // Register the HDA driver and verify the Intel PCH (Skylake →
+    // Meteor Lake) + Tiger Lake iGPU display-audio device IDs are all
+    // in the bus match table. Every entry must route through the same
+    // `probe` so the bring-up path is shared. No live silicon
+    // required — structural check only.
+    use crate::hda;
+    use narf_bus::driver_match::__reset_for_test as bus_reset;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    bus_reset();
+    hda::register_pci_driver();
+    let regs = registered_pci_drivers();
+    // Every Intel HDA entry uses the same vendor id 0x8086. The
+    // device-id list mirrors HDA_PCI_IDS in hda.rs — we list it
+    // explicitly here so a single drop accidentally narrowing
+    // coverage gets caught by this smoke.
+    let want_pch: &[u16] = &[
+        hda::HDA_INTEL_SUNRISE_POINT_LP_DEVICE,
+        hda::HDA_INTEL_SUNRISE_POINT_LP_DEVICE_B,
+        hda::HDA_INTEL_CANNON_LAKE_DEVICE,
+        hda::HDA_INTEL_COMET_LAKE_DEVICE,
+        hda::HDA_INTEL_COMET_LAKE_DEVICE_B,
+        hda::HDA_INTEL_TIGER_LAKE_LP_DEVICE,
+        hda::HDA_INTEL_TIGER_LAKE_LP_DEVICE_B,
+        hda::HDA_INTEL_ALDER_LAKE_DEVICE,
+        hda::HDA_INTEL_ALDER_LAKE_DEVICE_B,
+        hda::HDA_INTEL_ALDER_LAKE_DEVICE_C,
+        hda::HDA_INTEL_METEOR_LAKE_DEVICE,
+        // iGPU display-audio (graphics PCI function).
+        hda::HDA_INTEL_TIGER_LAKE_GFX_DEVICE,
+        hda::HDA_INTEL_TIGER_LAKE_GFX_DEVICE_B,
+        hda::HDA_INTEL_TIGER_LAKE_GFX_DEVICE_C,
+        hda::HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D,
+    ];
+    for &want in want_pch.iter() {
+        let found = regs.iter().any(|m| {
+            matches!(
+                m.kind,
+                MatchKind::VendorDevice { vendor, device }
+                    if vendor == hda::HDA_INTEL_ICH9_VENDOR && device == want
+            )
+        });
+        if !found {
+            return TestResult::Fail("Intel PCH HDA device id missing from match table");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", smoke_hda_match_intel_pch_ids);
+
 fn smoke_hda_corb_size_layout() -> TestResult {
     // HDA spec rev 1.0a §3.3.18 / §3.3.25: CORB and RIRB rings must
     // be 128-byte aligned. The driver allocates 4 KiB pages from
