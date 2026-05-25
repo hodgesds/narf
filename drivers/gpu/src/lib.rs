@@ -145,6 +145,7 @@ pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
 pub mod intel_gpu_pipes;
 pub mod intel_gpu_pll;
+pub mod intel_gpu_regions;
 pub mod nvidia_gpu;
 pub mod nvidia_gpu_disp;
 pub mod nvidia_gpu_falcon;
