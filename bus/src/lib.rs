@@ -74,8 +74,8 @@ pub use driver_match::{
 pub use hotplug::{dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener};
 pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};
 pub use registry::{
-    bootstrap_registry_authority, claim_device, claim_device_cap, devices, init, snapshot,
-    BusDeviceCap, BusDeviceHandle, BusRegistryCap, ClaimError,
+    append_devices, bootstrap_registry_authority, claim_device, claim_device_cap, devices, init,
+    snapshot, BusDeviceCap, BusDeviceHandle, BusRegistryCap, ClaimError,
 };
 
 /// IOMMU group id for a given device. Stage-3 stub: QEMU's default

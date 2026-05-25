@@ -209,15 +209,7 @@ fn smoke_igc_pci_match_table() -> TestResult {
     __reset_for_test();
     igc::register_pci_driver();
     let registered = registered_pci_drivers();
-    let want: &[u16] = &[
-        igc::IGC_I225_LM,
-        igc::IGC_I225_V,
-        igc::IGC_I225_IT,
-        igc::IGC_I226_LM,
-        igc::IGC_I226_V,
-        igc::IGC_I226_IT,
-    ];
-    for did in want.iter().copied() {
+    for did in igc::SUPPORTED_DEVICE_IDS.iter().copied() {
         let found = registered.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor, device,
@@ -227,9 +219,86 @@ fn smoke_igc_pci_match_table() -> TestResult {
             return TestResult::Fail("igc match entry missing");
         }
     }
+    // Spot-check a few of the most-common laptop IDs explicitly so a
+    // future refactor of `SUPPORTED_DEVICE_IDS` can't silently drop
+    // them.
+    let must_have: &[u16] = &[
+        igc::IGC_I225_LM,
+        igc::IGC_I225_V,
+        igc::IGC_I226_LM,
+        igc::IGC_I226_V,
+        igc::IGC_I226_IT,
+        igc::IGC_I225_K,
+        igc::IGC_I226_K,
+    ];
+    for did in must_have.iter().copied() {
+        let found = registered.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == igc::IGC_VENDOR && device == did)
+        });
+        if !found {
+            return TestResult::Fail("igc spot-check id missing");
+        }
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_pci_match_table);
+
+fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
+    // Structural smoke: register the e1000 driver and assert every
+    // ID in `SUPPORTED_DEVICE_IDS` is present in the bus's match
+    // table. Adds a spot-check for laptop-relevant PCH IDs so a
+    // refactor of the list can't accidentally drop the most
+    // important ones (Phoenix HawkPoint1 = I219_LM18, Alder/Raptor
+    // Lake = LM16/17/19/22/23, Meteor/Lunar = LM18/20/21).
+    use crate::e1000;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    e1000::register_pci_driver();
+    let registered = registered_pci_drivers();
+    for did in e1000::SUPPORTED_DEVICE_IDS.iter().copied() {
+        let found = registered.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == e1000::E1000_VENDOR && device == did)
+        });
+        if !found {
+            return TestResult::Fail("e1000 match entry missing");
+        }
+    }
+    // Laptop-relevant PCH SKUs: Phoenix HawkPoint1 PCH (MTP) + the
+    // common Alder / Raptor / Tiger / Meteor LOMs found on Dell /
+    // Lenovo / HP business laptops.
+    let must_have: &[u16] = &[
+        e1000::E1000E_DEV_82574L,    // QEMU q35 default
+        e1000::E1000E_DEV_I217LM,    // Haswell
+        e1000::E1000E_DEV_I218LM,    // Haswell-ULT
+        e1000::E1000E_DEV_I219LM,    // Skylake
+        e1000::E1000E_DEV_I219LM8,   // Ice Lake
+        e1000::E1000E_DEV_I219LM10,  // Comet Lake
+        e1000::E1000E_DEV_I219LM13,  // Tiger Lake
+        e1000::E1000E_DEV_I219LM16,  // Alder Lake
+        e1000::E1000E_DEV_I219LM18,  // Meteor Lake / Phoenix HawkPoint1
+        e1000::E1000E_DEV_I219LM22,  // Raptor Lake
+    ];
+    for did in must_have.iter().copied() {
+        let found = registered.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == e1000::E1000_VENDOR && device == did)
+        });
+        if !found {
+            return TestResult::Fail("e1000 spot-check PCH id missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/e1000",
+    smoke_e1000_pci_match_table_covers_modern_pch
+);
 
 // ── atheros ───────────────────────────────────────────────────────
 

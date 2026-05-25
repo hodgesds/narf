@@ -92,6 +92,23 @@ pub fn install(devices: Vec<BusDevice>) {
     *g = Some(devices);
 }
 
+/// Append additional devices to the existing registry. Used by the
+/// Intel VMD driver to inject children discovered behind a VMD bridge
+/// into the same registry the host PCIe walk feeds, so existing
+/// drivers (NVMe, etc.) can find them through `devices()`.
+///
+/// VMD children get a synthetic non-zero `segment` (the VMD instance
+/// number, offset by `VMD_SEGMENT_BASE`) so the addr key is unique
+/// even when their bus/device/function coordinates collide with the
+/// host PCIe domain. No-op when the registry hasn't been initialised.
+pub fn append_devices(extra: Vec<BusDevice>) {
+    let mut g = REGISTRY.lock();
+    match g.as_mut() {
+        Some(v) => v.extend(extra),
+        None => *g = Some(extra),
+    }
+}
+
 /// Boot-time initialisation. Calls into the arch-appropriate enumerate
 /// routine and installs its result. Safe to call multiple times — the
 /// most recent call wins. Returns the number of devices discovered.

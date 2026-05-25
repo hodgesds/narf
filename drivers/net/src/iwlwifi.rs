@@ -21,6 +21,7 @@
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 
+pub mod apm;
 pub mod csr;
 pub mod prph;
 

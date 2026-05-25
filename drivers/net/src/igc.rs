@@ -43,6 +43,15 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── PCI device IDs ──────────────────────────────────────────────────
+//
+// Mirrors Linux's `igc_pci_tbl[]` in
+// `drivers/net/ethernet/intel/igc/igc_main.c`. The I225 + I226
+// families ship in Comet Lake / Tiger Lake / Alder Lake / Raptor
+// Lake laptops as discrete 2.5G NICs and on docks; I220-V and I221-V
+// are 1G "Foxville-Lite" variants on the same silicon. Stepping
+// variants (LMVP / K / K2) appear on Intel NUC and embedded
+// platforms. BLANK_NVM IDs are the boot-time fallback when the NVM
+// hasn't been programmed (we still bind so the user can flash).
 
 pub const IGC_VENDOR: u16 = 0x8086;
 
@@ -52,12 +61,32 @@ pub const IGC_I225_LM: u16 = 0x15F2;
 pub const IGC_I225_V: u16 = 0x15F3;
 /// I225-IT (industrial-temp).
 pub const IGC_I225_IT: u16 = 0x0D9F;
+/// I225-I (server / iLM).
+pub const IGC_I225_I: u16 = 0x15F8;
+/// I220-V (1 GbE Foxville-Lite).
+pub const IGC_I220_V: u16 = 0x15F7;
+/// I225-K — NUC / embedded.
+pub const IGC_I225_K: u16 = 0x3100;
+/// I225-K2 — NUC stepping.
+pub const IGC_I225_K2: u16 = 0x3101;
+/// I225-LMVP — vPro stepping.
+pub const IGC_I225_LMVP: u16 = 0x5502;
+/// I225 blank NVM — boot fallback.
+pub const IGC_I225_BLANK_NVM: u16 = 0x15FD;
 /// I226-LM (LAN-on-motherboard).
 pub const IGC_I226_LM: u16 = 0x125B;
 /// I226-V.
 pub const IGC_I226_V: u16 = 0x125C;
 /// I226-IT.
 pub const IGC_I226_IT: u16 = 0x125D;
+/// I226-K — NUC / embedded.
+pub const IGC_I226_K: u16 = 0x3102;
+/// I226-LMVP — vPro stepping.
+pub const IGC_I226_LMVP: u16 = 0x5503;
+/// I226 blank NVM — boot fallback.
+pub const IGC_I226_BLANK_NVM: u16 = 0x125F;
+/// I221-V (1 GbE).
+pub const IGC_I221_V: u16 = 0x125E;
 
 // ── Register offsets ────────────────────────────────────────────────
 
@@ -441,15 +470,30 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+/// Every Intel device id this driver claims. Kept as a single
+/// `const` so the `register_pci_driver` loop and the match-table
+/// smoke test see the same list (no drift between code + test).
+pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
+    IGC_I225_LM,
+    IGC_I225_V,
+    IGC_I225_IT,
+    IGC_I225_I,
+    IGC_I220_V,
+    IGC_I225_K,
+    IGC_I225_K2,
+    IGC_I225_LMVP,
+    IGC_I225_BLANK_NVM,
+    IGC_I226_LM,
+    IGC_I226_V,
+    IGC_I226_IT,
+    IGC_I226_K,
+    IGC_I226_LMVP,
+    IGC_I226_BLANK_NVM,
+    IGC_I221_V,
+];
+
 pub fn register_pci_driver() {
-    for did in [
-        IGC_I225_LM,
-        IGC_I225_V,
-        IGC_I225_IT,
-        IGC_I226_LM,
-        IGC_I226_V,
-        IGC_I226_IT,
-    ] {
+    for did in SUPPORTED_DEVICE_IDS.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
@@ -466,9 +510,19 @@ fn name_for(did: u16) -> &'static str {
         IGC_I225_LM => "igc-i225-lm",
         IGC_I225_V => "igc-i225-v",
         IGC_I225_IT => "igc-i225-it",
+        IGC_I225_I => "igc-i225-i",
+        IGC_I220_V => "igc-i220-v",
+        IGC_I225_K => "igc-i225-k",
+        IGC_I225_K2 => "igc-i225-k2",
+        IGC_I225_LMVP => "igc-i225-lmvp",
+        IGC_I225_BLANK_NVM => "igc-i225-blank-nvm",
         IGC_I226_LM => "igc-i226-lm",
         IGC_I226_V => "igc-i226-v",
         IGC_I226_IT => "igc-i226-it",
+        IGC_I226_K => "igc-i226-k",
+        IGC_I226_LMVP => "igc-i226-lmvp",
+        IGC_I226_BLANK_NVM => "igc-i226-blank-nvm",
+        IGC_I221_V => "igc-i221-v",
         _ => "igc",
     }
 }

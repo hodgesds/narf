@@ -20,10 +20,11 @@ pub mod emmc;
 pub mod sd_proto;
 pub mod sdhci;
 pub mod ufs;
+pub mod vmd;
 
 mod tests;
 
-/// Stage::Subsys initcalls for this driver crate.
+/// Stage::Subsys + Stage::Device initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "ahci", || {
@@ -32,6 +33,18 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "sdhci", || {
         sdhci::register_pci_driver();
+        InitResult::Ok
+    });
+    // Intel VMD must register at Stage::Device because its probe
+    // appends children into the bus registry that the *same* PCI
+    // walk's later probes would not otherwise see. Stage::Subsys
+    // registers the match; the actual `probe_all_pci` call that
+    // binds it runs at Stage::Device per `frame::bare_main`. Putting
+    // VMD's register at Stage::Device keeps the children visible
+    // to any Stage::Late re-walk while leaving the Stage::Subsys
+    // ordering unchanged for the existing storage drivers.
+    narf_init::register(Stage::Device, "intel-vmd", || {
+        vmd::register_pci_driver_vmd();
         InitResult::Ok
     });
 }

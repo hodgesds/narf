@@ -10,8 +10,8 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    csr, prph, register_pci_driver, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211,
-    IWL_VENDOR,
+    apm, csr, prph, register_pci_driver, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210,
+    IWL_DEV_AX211, IWL_VENDOR,
 };
 
 // ── Stage 1 — PCI match table ─────────────────────────────────────

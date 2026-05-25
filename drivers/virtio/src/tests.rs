@@ -234,6 +234,7 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     let baseline = narf_interrupts::fire_count(v);
     let mut fut = alloc::boxed::Box::pin(blk_pci::read_sector_irq_async(0));
     let mut polls = 0u32;
+    let mut wokes = 0u32;
     let result = loop {
         match Pin::new(&mut fut).poll(&mut ctx) {
             Poll::Ready(r) => break Some(r),
@@ -243,6 +244,7 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
                     break None;
                 }
                 if WOKEN.swap(false, Ordering::AcqRel) {
+                    wokes += 1;
                     continue;
                 }
                 // SAFETY: IRQs disabled by precondition.
@@ -253,6 +255,16 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
         }
     };
     let after = narf_interrupts::fire_count(v);
+    // Branchy diagnostic sentinel: distinct fail strings let us
+    // discriminate the failure mode from the test runner output.
+    if result.is_none() {
+        return match (wokes, after > baseline) {
+            (0, false) => TestResult::Fail("future never resolved — no IRQ delivery, fire_count unchanged"),
+            (0, true) => TestResult::Fail("future never resolved — fire_count moved but waker never called"),
+            (_, false) => TestResult::Fail("future never resolved — waker fired but fire_count unchanged (vector mismatch?)"),
+            (_, true) => TestResult::Fail("future never resolved — waker+fire_count both moved, but WaitForIrq.poll keeps returning Pending"),
+        };
+    }
     match result {
         Some(Ok(sector)) => {
             for i in 0..512usize {

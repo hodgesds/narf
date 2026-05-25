@@ -973,6 +973,7 @@ dependencies = [
  "narf-block",
  "narf-bus",
  "narf-capabilities",
+ "narf-console",
  "narf-drivers",
  "narf-init",
  "narf-interrupts",

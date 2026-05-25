@@ -66,10 +66,26 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── PCI device IDs we recognise ─────────────────────────────────────
+//
+// The list mirrors Linux's `e1000e_pci_tbl[]` in
+// `drivers/net/ethernet/intel/e1000e/netdev.c` for the SKUs that
+// matter on modern Intel laptops + their docks: PCH-LPT (Haswell)
+// I217/I218, PCH-SPT (Skylake-H/Sunrise Point) I219_LM/V/LM2/V2,
+// PCH-CNP/CMP (Cannon/Comet Lake) LM6..LM12, PCH-ICP (Ice Lake)
+// LM8/9, PCH-TGP (Tiger Lake) LM13..LM15, PCH-ADP (Alder Lake)
+// LM16/17/19, PCH-RPL (Raptor Lake) LM22/23, PCH-MTP/LNP/ARL/PTP/NVL
+// (Meteor / Lunar / Arrow / Panther / Nova Lake) LM18/20/21/24/25/27/29.
+// All share the e1000e PHY/MAC architecture; per-PCH quirks live in
+// Linux's `ich8lan.c` and are tracked in `notes/intel-e1000e-igc-audit.md`.
+//
+// Plus a few I210/I211 entries (handled by Linux's `igb` driver) so
+// the bus probe still recognises them; full bring-up needs the
+// advanced-descriptor path that igc.rs uses for I225/I226.
 
 /// Vendor: Intel.
 pub const E1000_VENDOR: u16 = 0x8086;
 
+// 8254x / 8257x legacy + QEMU-emulated parts.
 /// Classic 82540EM (`-device e1000`).
 pub const E1000_DEV_82540EM: u16 = 0x100E;
 /// 82545EM Gigabit.
@@ -78,8 +94,178 @@ pub const E1000_DEV_82545EM: u16 = 0x100F;
 pub const E1000_DEV_82544GC: u16 = 0x100C;
 /// 82574L (used by QEMU q35 default + `-device e1000e`).
 pub const E1000E_DEV_82574L: u16 = 0x10D3;
-/// I217-LM, found on real Lenovo laptops.
+
+// PCH-LPT (Lynx Point — Haswell-era).
+/// I217-LM, found on real Lenovo laptops (Haswell).
 pub const E1000E_DEV_I217LM: u16 = 0x153A;
+/// I217-V.
+pub const E1000E_DEV_I217V: u16 = 0x153B;
+/// I218-LM (Lynx Point LP — Haswell-ULT).
+pub const E1000E_DEV_I218LM: u16 = 0x155A;
+/// I218-V.
+pub const E1000E_DEV_I218V: u16 = 0x1559;
+/// I218-LM2 (Wildcat Point).
+pub const E1000E_DEV_I218LM2: u16 = 0x15A0;
+/// I218-V2.
+pub const E1000E_DEV_I218V2: u16 = 0x15A1;
+/// I218-LM3 (Wildcat Point).
+pub const E1000E_DEV_I218LM3: u16 = 0x15A2;
+/// I218-V3.
+pub const E1000E_DEV_I218V3: u16 = 0x15A3;
+
+// PCH-SPT (Sunrise Point — Skylake-H).
+/// I219-LM (Sunrise Point — Skylake).
+pub const E1000E_DEV_I219LM: u16 = 0x156F;
+/// I219-V (Sunrise Point — Skylake).
+pub const E1000E_DEV_I219V: u16 = 0x1570;
+/// I219-LM2 (SPT-H).
+pub const E1000E_DEV_I219LM2: u16 = 0x15B7;
+/// I219-V2.
+pub const E1000E_DEV_I219V2: u16 = 0x15B8;
+/// I219-LM3 (Lewisburg PCH — Skylake-SP / X299).
+pub const E1000E_DEV_I219LM3: u16 = 0x15B9;
+/// I219-LM4 (Sunrise Point H refresh).
+pub const E1000E_DEV_I219LM4: u16 = 0x15D7;
+/// I219-V4.
+pub const E1000E_DEV_I219V4: u16 = 0x15D8;
+/// I219-LM5.
+pub const E1000E_DEV_I219LM5: u16 = 0x15E3;
+/// I219-V5.
+pub const E1000E_DEV_I219V5: u16 = 0x15D6;
+
+// PCH-CNP (Cannon Point — Coffee Lake / Cannon Lake).
+/// I219-LM6.
+pub const E1000E_DEV_I219LM6: u16 = 0x15BD;
+/// I219-V6.
+pub const E1000E_DEV_I219V6: u16 = 0x15BE;
+/// I219-LM7.
+pub const E1000E_DEV_I219LM7: u16 = 0x15BB;
+/// I219-V7.
+pub const E1000E_DEV_I219V7: u16 = 0x15BC;
+
+// PCH-ICP (Ice Point — Ice Lake).
+/// I219-LM8 (Ice Lake).
+pub const E1000E_DEV_I219LM8: u16 = 0x15DF;
+/// I219-V8.
+pub const E1000E_DEV_I219V8: u16 = 0x15E0;
+/// I219-LM9 (Ice Lake).
+pub const E1000E_DEV_I219LM9: u16 = 0x15E1;
+/// I219-V9.
+pub const E1000E_DEV_I219V9: u16 = 0x15E2;
+
+// PCH-CMP (Comet Point — Comet Lake).
+/// I219-LM10.
+pub const E1000E_DEV_I219LM10: u16 = 0x0D4E;
+/// I219-V10.
+pub const E1000E_DEV_I219V10: u16 = 0x0D4F;
+/// I219-LM11.
+pub const E1000E_DEV_I219LM11: u16 = 0x0D4C;
+/// I219-V11.
+pub const E1000E_DEV_I219V11: u16 = 0x0D4D;
+/// I219-LM12.
+pub const E1000E_DEV_I219LM12: u16 = 0x0D53;
+/// I219-V12.
+pub const E1000E_DEV_I219V12: u16 = 0x0D55;
+
+// PCH-TGP (Tiger Point — Tiger Lake).
+/// I219-LM13.
+pub const E1000E_DEV_I219LM13: u16 = 0x15FB;
+/// I219-V13.
+pub const E1000E_DEV_I219V13: u16 = 0x15FC;
+/// I219-LM14.
+pub const E1000E_DEV_I219LM14: u16 = 0x15F9;
+/// I219-V14.
+pub const E1000E_DEV_I219V14: u16 = 0x15FA;
+/// I219-LM15.
+pub const E1000E_DEV_I219LM15: u16 = 0x15F4;
+/// I219-V15.
+pub const E1000E_DEV_I219V15: u16 = 0x15F5;
+
+// PCH-ADP (Alder Point — Alder Lake) + PCH-RPL (Raptor Point).
+/// I219-LM16 (Alder Lake).
+pub const E1000E_DEV_I219LM16: u16 = 0x1A1E;
+/// I219-V16.
+pub const E1000E_DEV_I219V16: u16 = 0x1A1F;
+/// I219-LM17.
+pub const E1000E_DEV_I219LM17: u16 = 0x1A1C;
+/// I219-V17.
+pub const E1000E_DEV_I219V17: u16 = 0x1A1D;
+/// I219-LM19 (Alder Point refresh).
+pub const E1000E_DEV_I219LM19: u16 = 0x550C;
+/// I219-V19.
+pub const E1000E_DEV_I219V19: u16 = 0x550D;
+/// I219-LM22 (Raptor Lake).
+pub const E1000E_DEV_I219LM22: u16 = 0x0DC7;
+/// I219-V22.
+pub const E1000E_DEV_I219V22: u16 = 0x0DC8;
+/// I219-LM23 (Raptor Lake).
+pub const E1000E_DEV_I219LM23: u16 = 0x0DC5;
+/// I219-V23.
+pub const E1000E_DEV_I219V23: u16 = 0x0DC6;
+
+// PCH-MTP (Meteor Point — Meteor Lake / Phoenix-class PCH).
+/// I219-LM18 (Meteor Point — covers Phoenix HawkPoint1 LOM).
+pub const E1000E_DEV_I219LM18: u16 = 0x550A;
+/// I219-V18.
+pub const E1000E_DEV_I219V18: u16 = 0x550B;
+
+// PCH-LNP (Lunar Point — Lunar Lake).
+/// I219-LM20.
+pub const E1000E_DEV_I219LM20: u16 = 0x550E;
+/// I219-V20.
+pub const E1000E_DEV_I219V20: u16 = 0x550F;
+/// I219-LM21.
+pub const E1000E_DEV_I219LM21: u16 = 0x5510;
+/// I219-V21.
+pub const E1000E_DEV_I219V21: u16 = 0x5511;
+
+// PCH-ARL (Arrow Point — Arrow Lake).
+/// I219-LM24.
+pub const E1000E_DEV_I219LM24: u16 = 0x57A0;
+/// I219-V24.
+pub const E1000E_DEV_I219V24: u16 = 0x57A1;
+
+// PCH-PTP (Panther Point — Panther Lake).
+/// I219-LM25.
+pub const E1000E_DEV_I219LM25: u16 = 0x57B3;
+/// I219-V25.
+pub const E1000E_DEV_I219V25: u16 = 0x57B4;
+/// I219-LM27.
+pub const E1000E_DEV_I219LM27: u16 = 0x57B7;
+/// I219-V27.
+pub const E1000E_DEV_I219V27: u16 = 0x57B8;
+
+// PCH-NVL (Nova Lake).
+/// I219-LM29.
+pub const E1000E_DEV_I219LM29: u16 = 0x57B9;
+/// I219-V29.
+pub const E1000E_DEV_I219V29: u16 = 0x57BA;
+
+// I210 / I211 — Linux handles these via `igb`, not `e1000e`. We
+// recognise the IDs here so the bus probe binds *something*; the
+// bring-up sequence is a best-effort that may need follow-up if a
+// real I210/I211 lands on this driver (Stage-1 follow-up tracked
+// in `notes/intel-e1000e-igc-audit.md`).
+/// I210 Copper.
+pub const E1000_DEV_I210_COPPER: u16 = 0x1533;
+/// I210 Fiber.
+pub const E1000_DEV_I210_FIBER: u16 = 0x1536;
+/// I210 Serdes.
+pub const E1000_DEV_I210_SERDES: u16 = 0x1537;
+/// I210 SGMII.
+pub const E1000_DEV_I210_SGMII: u16 = 0x1538;
+/// I210 Copper flashless.
+pub const E1000_DEV_I210_COPPER_FLASHLESS: u16 = 0x157B;
+/// I210 Serdes flashless.
+pub const E1000_DEV_I210_SERDES_FLASHLESS: u16 = 0x157C;
+/// I211 Copper.
+pub const E1000_DEV_I211_COPPER: u16 = 0x1539;
+/// 82576 (used on some Lenovo ThinkPad docks via I210 PHY).
+pub const E1000_DEV_82576: u16 = 0x10C9;
+/// 82576 with NS clock.
+pub const E1000_DEV_82576_NS: u16 = 0x150A;
+/// I350 Copper (embedded server SoC).
+pub const E1000_DEV_I350_COPPER: u16 = 0x1521;
 
 // ── Register offsets ────────────────────────────────────────────────
 
@@ -844,16 +1030,106 @@ pub fn rx_pump_step() -> bool {
     true
 }
 
+/// Every Intel device id this driver claims. Kept as a single
+/// `const` so the `register_pci_driver` loop and the match-table
+/// smoke test see the same list (and additions can't drift between
+/// the two).
+pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
+    // Legacy / QEMU-emulated.
+    E1000_DEV_82540EM,
+    E1000_DEV_82545EM,
+    E1000_DEV_82544GC,
+    E1000E_DEV_82574L,
+    // PCH-LPT (Haswell).
+    E1000E_DEV_I217LM,
+    E1000E_DEV_I217V,
+    E1000E_DEV_I218LM,
+    E1000E_DEV_I218V,
+    E1000E_DEV_I218LM2,
+    E1000E_DEV_I218V2,
+    E1000E_DEV_I218LM3,
+    E1000E_DEV_I218V3,
+    // PCH-SPT (Skylake-H).
+    E1000E_DEV_I219LM,
+    E1000E_DEV_I219V,
+    E1000E_DEV_I219LM2,
+    E1000E_DEV_I219V2,
+    E1000E_DEV_I219LM3,
+    E1000E_DEV_I219LM4,
+    E1000E_DEV_I219V4,
+    E1000E_DEV_I219LM5,
+    E1000E_DEV_I219V5,
+    // PCH-CNP (Coffee / Cannon Lake).
+    E1000E_DEV_I219LM6,
+    E1000E_DEV_I219V6,
+    E1000E_DEV_I219LM7,
+    E1000E_DEV_I219V7,
+    // PCH-ICP (Ice Lake).
+    E1000E_DEV_I219LM8,
+    E1000E_DEV_I219V8,
+    E1000E_DEV_I219LM9,
+    E1000E_DEV_I219V9,
+    // PCH-CMP (Comet Lake).
+    E1000E_DEV_I219LM10,
+    E1000E_DEV_I219V10,
+    E1000E_DEV_I219LM11,
+    E1000E_DEV_I219V11,
+    E1000E_DEV_I219LM12,
+    E1000E_DEV_I219V12,
+    // PCH-TGP (Tiger Lake).
+    E1000E_DEV_I219LM13,
+    E1000E_DEV_I219V13,
+    E1000E_DEV_I219LM14,
+    E1000E_DEV_I219V14,
+    E1000E_DEV_I219LM15,
+    E1000E_DEV_I219V15,
+    // PCH-ADP (Alder Lake) + PCH-RPL (Raptor Lake).
+    E1000E_DEV_I219LM16,
+    E1000E_DEV_I219V16,
+    E1000E_DEV_I219LM17,
+    E1000E_DEV_I219V17,
+    E1000E_DEV_I219LM19,
+    E1000E_DEV_I219V19,
+    E1000E_DEV_I219LM22,
+    E1000E_DEV_I219V22,
+    E1000E_DEV_I219LM23,
+    E1000E_DEV_I219V23,
+    // PCH-MTP (Meteor Lake) — covers Phoenix HawkPoint1 PCH LOM.
+    E1000E_DEV_I219LM18,
+    E1000E_DEV_I219V18,
+    // PCH-LNP (Lunar Lake).
+    E1000E_DEV_I219LM20,
+    E1000E_DEV_I219V20,
+    E1000E_DEV_I219LM21,
+    E1000E_DEV_I219V21,
+    // PCH-ARL (Arrow Lake).
+    E1000E_DEV_I219LM24,
+    E1000E_DEV_I219V24,
+    // PCH-PTP (Panther Lake).
+    E1000E_DEV_I219LM25,
+    E1000E_DEV_I219V25,
+    E1000E_DEV_I219LM27,
+    E1000E_DEV_I219V27,
+    // PCH-NVL (Nova Lake).
+    E1000E_DEV_I219LM29,
+    E1000E_DEV_I219V29,
+    // I210 / I211 / 82576 / I350 (Linux: `igb`).
+    E1000_DEV_I210_COPPER,
+    E1000_DEV_I210_FIBER,
+    E1000_DEV_I210_SERDES,
+    E1000_DEV_I210_SGMII,
+    E1000_DEV_I210_COPPER_FLASHLESS,
+    E1000_DEV_I210_SERDES_FLASHLESS,
+    E1000_DEV_I211_COPPER,
+    E1000_DEV_82576,
+    E1000_DEV_82576_NS,
+    E1000_DEV_I350_COPPER,
+];
+
 /// Register the driver against every Intel device id we recognise.
 /// One match per id pair so each is independently maintainable.
 pub fn register_pci_driver() {
-    for did in [
-        E1000_DEV_82540EM,
-        E1000_DEV_82545EM,
-        E1000_DEV_82544GC,
-        E1000E_DEV_82574L,
-        E1000E_DEV_I217LM,
-    ] {
+    for did in SUPPORTED_DEVICE_IDS.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
@@ -871,7 +1147,86 @@ fn name_for(did: u16) -> &'static str {
         E1000_DEV_82545EM => "e1000-82545em",
         E1000_DEV_82544GC => "e1000-82544gc",
         E1000E_DEV_82574L => "e1000e-82574l",
+        // PCH-LPT.
         E1000E_DEV_I217LM => "e1000e-i217lm",
+        E1000E_DEV_I217V => "e1000e-i217v",
+        E1000E_DEV_I218LM => "e1000e-i218lm",
+        E1000E_DEV_I218V => "e1000e-i218v",
+        E1000E_DEV_I218LM2 => "e1000e-i218lm2",
+        E1000E_DEV_I218V2 => "e1000e-i218v2",
+        E1000E_DEV_I218LM3 => "e1000e-i218lm3",
+        E1000E_DEV_I218V3 => "e1000e-i218v3",
+        // PCH-SPT.
+        E1000E_DEV_I219LM => "e1000e-i219lm",
+        E1000E_DEV_I219V => "e1000e-i219v",
+        E1000E_DEV_I219LM2 => "e1000e-i219lm2",
+        E1000E_DEV_I219V2 => "e1000e-i219v2",
+        E1000E_DEV_I219LM3 => "e1000e-i219lm3",
+        E1000E_DEV_I219LM4 => "e1000e-i219lm4",
+        E1000E_DEV_I219V4 => "e1000e-i219v4",
+        E1000E_DEV_I219LM5 => "e1000e-i219lm5",
+        E1000E_DEV_I219V5 => "e1000e-i219v5",
+        // PCH-CNP.
+        E1000E_DEV_I219LM6 => "e1000e-i219lm6",
+        E1000E_DEV_I219V6 => "e1000e-i219v6",
+        E1000E_DEV_I219LM7 => "e1000e-i219lm7",
+        E1000E_DEV_I219V7 => "e1000e-i219v7",
+        // PCH-ICP.
+        E1000E_DEV_I219LM8 => "e1000e-i219lm8",
+        E1000E_DEV_I219V8 => "e1000e-i219v8",
+        E1000E_DEV_I219LM9 => "e1000e-i219lm9",
+        E1000E_DEV_I219V9 => "e1000e-i219v9",
+        // PCH-CMP.
+        E1000E_DEV_I219LM10 => "e1000e-i219lm10",
+        E1000E_DEV_I219V10 => "e1000e-i219v10",
+        E1000E_DEV_I219LM11 => "e1000e-i219lm11",
+        E1000E_DEV_I219V11 => "e1000e-i219v11",
+        E1000E_DEV_I219LM12 => "e1000e-i219lm12",
+        E1000E_DEV_I219V12 => "e1000e-i219v12",
+        // PCH-TGP.
+        E1000E_DEV_I219LM13 => "e1000e-i219lm13",
+        E1000E_DEV_I219V13 => "e1000e-i219v13",
+        E1000E_DEV_I219LM14 => "e1000e-i219lm14",
+        E1000E_DEV_I219V14 => "e1000e-i219v14",
+        E1000E_DEV_I219LM15 => "e1000e-i219lm15",
+        E1000E_DEV_I219V15 => "e1000e-i219v15",
+        // PCH-ADP / RPL.
+        E1000E_DEV_I219LM16 => "e1000e-i219lm16",
+        E1000E_DEV_I219V16 => "e1000e-i219v16",
+        E1000E_DEV_I219LM17 => "e1000e-i219lm17",
+        E1000E_DEV_I219V17 => "e1000e-i219v17",
+        E1000E_DEV_I219LM19 => "e1000e-i219lm19",
+        E1000E_DEV_I219V19 => "e1000e-i219v19",
+        E1000E_DEV_I219LM22 => "e1000e-i219lm22",
+        E1000E_DEV_I219V22 => "e1000e-i219v22",
+        E1000E_DEV_I219LM23 => "e1000e-i219lm23",
+        E1000E_DEV_I219V23 => "e1000e-i219v23",
+        // PCH-MTP / LNP / ARL / PTP / NVL.
+        E1000E_DEV_I219LM18 => "e1000e-i219lm18",
+        E1000E_DEV_I219V18 => "e1000e-i219v18",
+        E1000E_DEV_I219LM20 => "e1000e-i219lm20",
+        E1000E_DEV_I219V20 => "e1000e-i219v20",
+        E1000E_DEV_I219LM21 => "e1000e-i219lm21",
+        E1000E_DEV_I219V21 => "e1000e-i219v21",
+        E1000E_DEV_I219LM24 => "e1000e-i219lm24",
+        E1000E_DEV_I219V24 => "e1000e-i219v24",
+        E1000E_DEV_I219LM25 => "e1000e-i219lm25",
+        E1000E_DEV_I219V25 => "e1000e-i219v25",
+        E1000E_DEV_I219LM27 => "e1000e-i219lm27",
+        E1000E_DEV_I219V27 => "e1000e-i219v27",
+        E1000E_DEV_I219LM29 => "e1000e-i219lm29",
+        E1000E_DEV_I219V29 => "e1000e-i219v29",
+        // I210 / I211 / 82576 / I350.
+        E1000_DEV_I210_COPPER => "igb-i210-copper",
+        E1000_DEV_I210_FIBER => "igb-i210-fiber",
+        E1000_DEV_I210_SERDES => "igb-i210-serdes",
+        E1000_DEV_I210_SGMII => "igb-i210-sgmii",
+        E1000_DEV_I210_COPPER_FLASHLESS => "igb-i210-copper-flashless",
+        E1000_DEV_I210_SERDES_FLASHLESS => "igb-i210-serdes-flashless",
+        E1000_DEV_I211_COPPER => "igb-i211-copper",
+        E1000_DEV_82576 => "igb-82576",
+        E1000_DEV_82576_NS => "igb-82576-ns",
+        E1000_DEV_I350_COPPER => "igb-i350-copper",
         _ => "e1000",
     }
 }

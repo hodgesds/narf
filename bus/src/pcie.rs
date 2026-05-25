@@ -39,6 +39,26 @@ pub unsafe fn enumerate(ecam_base: PhysAddr) -> Vec<BusDevice> {
 /// `ecam_base + n_buses * 0x10_0000` must lie inside the kernel's
 /// identity map of MMIO-tolerant memory.
 pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
+    // SAFETY: forwarded to enumerate_segment.
+    unsafe { enumerate_segment(ecam_base, n_buses, 0) }
+}
+
+/// Walk an ECAM-shaped config window and return every discovered
+/// function tagged with the caller-supplied `segment`. Used by the
+/// Intel VMD bridge to surface children behind its BAR0 config window
+/// — the layout is identical to platform ECAM (4 KiB per function,
+/// `(bus<<20)|(dev<<15)|(fn<<12)` offset), but the children live in
+/// a private PCI domain that must not collide with the host's
+/// `segment=0` keys. VMD allocates a non-zero segment per bridge.
+///
+/// # Safety
+/// `ecam_base + n_buses * 0x10_0000` must lie inside the kernel's
+/// identity map of MMIO-tolerant memory.
+pub unsafe fn enumerate_segment(
+    ecam_base: PhysAddr,
+    n_buses: u16,
+    segment: u16,
+) -> Vec<BusDevice> {
     let mut devices = Vec::new();
 
     for bus in 0..n_buses {
@@ -46,7 +66,7 @@ pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
             // Probe function 0 first. If vendor is invalid, slot is empty.
             // If valid, the header-type bit 7 says "multi-function" —
             // if clear, fn 0 is the only function on the device.
-            let addr0 = PcieAddr::new(0, bus as u8, dev, 0);
+            let addr0 = PcieAddr::new(segment, bus as u8, dev, 0);
             let cfg0 = phys_for(ecam_base, addr0);
             // SAFETY: ecam_base + offset is inside the ECAM region per
             // the MAX_BUSES bound; reads are 4-byte aligned.
@@ -69,7 +89,7 @@ pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
             let max_fn: u8 = if multifn { 8 } else { 1 };
 
             for fn_ in 0..max_fn {
-                let addr = PcieAddr::new(0, bus as u8, dev, fn_);
+                let addr = PcieAddr::new(segment, bus as u8, dev, fn_);
                 let cfg = phys_for(ecam_base, addr);
                 // SAFETY: in-range ECAM read.
                 let vd = unsafe { ecam_read32(cfg) };
