@@ -469,27 +469,35 @@ pub fn on_irq(vector: u8) {
             s.spurious.fetch_add(1, Ordering::Release);
         }
 
-        // Drain wakers. Two paths:
+        // Wake registered futures. Two paths:
         //
-        // 1. Real trap context (called from trap.rs via
-        //    `on_irq_from_trap`) — we MUST defer wake() calls
-        //    because `Waker::wake()` drops the inner Arc and may
-        //    trigger a sleepable allocator free, which panics in
-        //    IRQ context. The defer flag set by the trap-entry
-        //    wrapper gates this.
-        // 2. Synchronous call (smoke tests, kernel-internal
-        //    `on_irq` calls from non-trap context) — wake
-        //    directly so the caller's expectation that "after
-        //    on_irq returns, the wakers have been notified" holds.
+        // 1. Real trap context (called from trap.rs which set
+        //    `in_trap_handler`) — use `wake_by_ref` so we don't
+        //    drop the Waker's Arc. Arc drops can trigger a
+        //    sleepable allocator free, which panics in IRQ
+        //    context. Wakers stay in the dispatch vec — futures
+        //    re-register on each poll and call `clear_waker` on
+        //    completion, so this doesn't leak in steady state.
+        // 2. Synchronous call (smoke tests, non-trap callers) —
+        //    drain + wake() (consume), since the caller is
+        //    allowed to allocate and expects "after on_irq
+        //    returns, the wakers have been notified".
         //
-        // We can't use RFLAGS.IF as the discriminator because the
-        // kernel test harness runs with IRQs masked for some
-        // smokes, which would mis-identify the test path as a
-        // real trap. Explicit flag (set by trap.rs only) is the
-        // robust answer.
+        // The discriminator is `in_trap_handler()`, set by the
+        // arch trap entry. We can't use RFLAGS.IF — the test
+        // harness disables IRQs for some smokes which would
+        // mis-identify them as real trap context.
         if narf_lib::context::in_trap_handler() {
-            narf_lib::deferred_wake::push_pending_iter(s.wakers.lock().drain(..));
+            let g = s.wakers.lock();
+            for w in g.iter() {
+                w.wake_by_ref();
+            }
+            // Don't drain — wake_by_ref kept the Wakers in place.
+            // Stale entries are cleaned up by `clear_waker` from
+            // the future's Drop path or by the next IRQ's wake
+            // (idempotent for already-completed tasks).
         } else {
+            // Synchronous: drain + consume.
             for w in s.wakers.lock().drain(..) {
                 w.wake();
             }
