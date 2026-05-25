@@ -44,6 +44,8 @@ use narf_driver_runtime::{
     map_bar, BusDevice, BusDeviceCap, Cap, Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
 
+use crate::intel_gpu_regions::{self, Region, RegionGeneration, RegionKind};
+
 // ── Vendor + device ids ───────────────────────────────────────────
 
 /// Intel Corporation (PCI Special Interest Group ID).
@@ -126,6 +128,19 @@ pub enum Generation {
     AlderLake,
     /// Meteor Lake — Xe-LPG (re-architected DDI + display power).
     MeteorLake,
+}
+
+impl Generation {
+    /// Map the sub-architecture to the BAR0 region-enumeration
+    /// generation. TGL / ADL / RPL share the Xe-LP MMIO map
+    /// (`RegionGeneration::Gen12`); Meteor Lake's Xe-LPG map is
+    /// out of scope for the Stage-0 enumeration.
+    pub const fn region_generation(self) -> Option<RegionGeneration> {
+        match self {
+            Generation::TigerLake | Generation::AlderLake => Some(RegionGeneration::Gen12),
+            Generation::MeteorLake => None,
+        }
+    }
 }
 
 /// What Stage-1 knows about a probed Intel iGPU.
@@ -246,6 +261,37 @@ impl IntelGpu {
 
     pub fn gmd_id(&self) -> u32 {
         self.gmd_id
+    }
+
+    /// Enumerated BAR0 register-block table for this chip's
+    /// generation, or an empty slice for generations the Stage-0
+    /// region map doesn't cover (e.g. Meteor Lake Xe-LPG, where
+    /// the MMIO layout differs).
+    ///
+    /// Adapted from i915 / Xe; see `intel_gpu_regions` for the
+    /// canonical source references.
+    pub fn regions(&self) -> &'static [Region] {
+        match self.chip.generation.region_generation() {
+            Some(gen) => intel_gpu_regions::regions_for(gen),
+            None => &[],
+        }
+    }
+
+    /// Look up the region (GT / DISPLAY / GMBUS / …) that contains
+    /// `bar0_offset`, if any.
+    pub fn region_at(&self, bar0_offset: u64) -> Option<&'static Region> {
+        self.chip
+            .generation
+            .region_generation()
+            .and_then(|gen| intel_gpu_regions::region_at(gen, bar0_offset))
+    }
+
+    /// Look up the region of a given kind.
+    pub fn region_of(&self, kind: RegionKind) -> Option<&'static Region> {
+        self.chip
+            .generation
+            .region_generation()
+            .and_then(|gen| intel_gpu_regions::region_of(gen, kind))
     }
 }
 
