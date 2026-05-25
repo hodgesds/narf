@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::amd_fch::{recognised_hids, AmdFchI2c};
+use crate::lpss::{recognised_hids as lpss_recognised_hids, __new_for_test as lpss_new_for_test};
 use crate::{registry, I2cBus, I2cError, I2cOp};
 use narf_memory::PhysAddr;
 
@@ -217,3 +218,119 @@ fn smoke_amd_fch_transfer_refuses_when_disabled() -> TestResult {
     }
 }
 kernel_test_in!("drivers-i2c", smoke_amd_fch_transfer_refuses_when_disabled);
+
+// ── Intel LPSS smokes ────────────────────────────────────────────
+//
+// Stage-0: skeleton only. The smokes assert that
+//
+//   (1) the bring-up-target Tiger Lake / Alder Lake / Raptor Lake HIDs
+//       stay in the recognised list — guarding against a future trim
+//       that silently drops the laptop touchpad bus,
+//   (2) the IC_COMP_TYPE probe accepts a real DW magic value and
+//       rejects garbage, exactly as the FCH variant does (the LPSS
+//       wrapper holds the same DW core so the magic constant is the
+//       same), and
+//   (3) the Stage-0 `transfer()` stub returns BadHardware so client
+//       drivers reach a well-defined failure path rather than a
+//       half-working bus.
+
+fn smoke_lpss_i2c_recognises_modern_intel_hids() -> TestResult {
+    // Tiger Lake / Alder Lake / Raptor Lake — the modern Intel laptop
+    // bring-up target. Guard against the list being trimmed.
+    for required in ["INT34B7", "INT34BA", "INT34C5"] {
+        if !lpss_recognised_hids().iter().any(|h| *h == required) {
+            return TestResult::Fail("required Intel LPSS HID missing from list");
+        }
+    }
+    // Older PCI-mode LPSS (Baytrail / Apollo Lake) — kept in for the
+    // long tail of Intel-laptop firmware out there.
+    for required in ["80860F41", "808622C1"] {
+        if !lpss_recognised_hids().iter().any(|h| *h == required) {
+            return TestResult::Fail("required Intel LPSS-PCI HID missing from list");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_recognises_modern_intel_hids);
+
+fn smoke_lpss_i2c_probe_rejects_bad_mmio() -> TestResult {
+    // No COMP_TYPE seed -> probe must reject with BadHardware. Same
+    // "MMIO mapping points at the wrong device" guard as the FCH
+    // variant — only the LPSS wrapper differs and the DW core's
+    // probe path is identical.
+    let (phys, len) = make_synthetic_mmio(false);
+    let drv = lpss_new_for_test("smoke-lpss-bad".to_string(), phys, len);
+    match drv.probe_component_type() {
+        Err(I2cError::BadHardware) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("LPSS probe_component_type should return BadHardware on COMP_TYPE=0")
+        }
+        Ok(()) => TestResult::Fail("LPSS probe_component_type accepted COMP_TYPE=0"),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_probe_rejects_bad_mmio);
+
+fn smoke_lpss_i2c_probe_accepts_good_mmio() -> TestResult {
+    let (phys, len) = make_synthetic_mmio(true);
+    let drv = lpss_new_for_test("smoke-lpss-good".to_string(), phys, len);
+    match drv.probe_component_type() {
+        Ok(()) => TestResult::Pass,
+        Err(_) => TestResult::Fail("LPSS probe_component_type rejected real DW magic"),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_probe_accepts_good_mmio);
+
+fn smoke_lpss_i2c_transfer_stub_returns_bad_hardware() -> TestResult {
+    // Stage-0 stub contract: transfer() returns BadHardware regardless
+    // of state. Once Stage-1 lands the real transfer state machine
+    // this test gets reworked / deleted alongside the stub — hard
+    // cutover, no compat shim. The test exists in Stage-0 to lock the
+    // contract so we notice if the stub silently changes shape.
+    narf_scheduler::__reset_queues_for_test();
+    let (phys, len) = make_synthetic_mmio(true);
+    let drv = lpss_new_for_test("smoke-lpss-transfer".to_string(), phys, len);
+    let bus: Arc<dyn I2cBus> = Arc::new(drv);
+    let result = Arc::new(core::sync::atomic::AtomicI32::new(-1));
+    let r = result.clone();
+    narf_scheduler::spawn(async move {
+        let mut buf = [0u8; 4];
+        let mut ops = [I2cOp::Read(&mut buf)];
+        let outcome = bus.transfer(0x2c, &mut ops).await;
+        let code = match outcome {
+            Err(I2cError::BadHardware) => 0,
+            Err(_) => 1,
+            Ok(()) => 2,
+        };
+        r.store(code, core::sync::atomic::Ordering::SeqCst);
+    });
+    narf_scheduler::run_until_empty();
+    match result.load(core::sync::atomic::Ordering::SeqCst) {
+        0 => TestResult::Pass,
+        1 => TestResult::Fail("LPSS Stage-0 stub returned non-BadHardware error"),
+        2 => TestResult::Fail("LPSS Stage-0 stub claimed transfer succeeded"),
+        _ => TestResult::Fail("LPSS transfer task didn't run"),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_transfer_stub_returns_bad_hardware);
+
+fn smoke_lpss_i2c_registers_into_shared_registry() -> TestResult {
+    // The whole point of Stage-0 is that an LPSS driver instance,
+    // once registered, is discoverable through the SAME registry
+    // the FCH variant uses — so i2c-hid-bind doesn't need to know
+    // which backend lives behind a given controller path.
+    registry::__reset_for_test();
+    let (phys, len) = make_synthetic_mmio(true);
+    let drv = lpss_new_for_test("\\_SB.PC00.I2C2".to_string(), phys, len);
+    let bus: Arc<dyn I2cBus> = Arc::new(drv);
+    registry::register_unique(bus.clone());
+    if registry::count() != 1 {
+        return TestResult::Fail("LPSS bus didn't land in shared registry");
+    }
+    if registry::find("\\_SB.PC00.I2C2").is_none() {
+        return TestResult::Fail("LPSS bus not findable by ACPI path");
+    }
+    registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_registers_into_shared_registry);
