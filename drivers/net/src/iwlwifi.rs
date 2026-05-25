@@ -21,6 +21,8 @@
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 
+pub mod csr;
+
 mod tests;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
