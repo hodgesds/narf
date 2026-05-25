@@ -659,3 +659,61 @@ fn smoke_id_typed_ids_ordering() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_id_typed_ids_ordering);
+
+// ── hybrid-CPU topology (Intel Alder Lake+) ───────────────────────
+
+fn smoke_percpu_cpu_type_round_trip() -> TestResult {
+    // Set / read each CpuType variant for a couple of slots and
+    // confirm the encoding round-trips through the AtomicU8 store.
+    use crate::percpu::{cpu_type, set_cpu_type, CpuType};
+    crate::percpu::__cpu_type_reset_for_test();
+
+    if cpu_type(0) != CpuType::Unknown {
+        return TestResult::Fail("fresh registry didn't read Unknown");
+    }
+
+    set_cpu_type(0, CpuType::Core);
+    set_cpu_type(1, CpuType::Atom);
+
+    if cpu_type(0) != CpuType::Core {
+        return TestResult::Fail("Core slot didn't read back");
+    }
+    if cpu_type(1) != CpuType::Atom {
+        return TestResult::Fail("Atom slot didn't read back");
+    }
+    // Out-of-range id is safe + returns Unknown.
+    if cpu_type(u32::MAX) != CpuType::Unknown {
+        return TestResult::Fail("out-of-range id should be Unknown");
+    }
+    // Clean up so other tests start from a known state.
+    crate::percpu::__cpu_type_reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_percpu_cpu_type_round_trip);
+
+fn smoke_percpu_cpu_type_from_raw() -> TestResult {
+    // Pin the raw byte → CpuType mapping against Linux's
+    // X86_CPU_TYPE_INTEL_{ATOM,CORE} defines. Drift here would
+    // silently mis-classify P-cores as Unknown on real silicon.
+    use crate::percpu::CpuType;
+    if CpuType::from_raw(0x20) != CpuType::Atom {
+        return TestResult::Fail("0x20 should decode to Atom");
+    }
+    if CpuType::from_raw(0x40) != CpuType::Core {
+        return TestResult::Fail("0x40 should decode to Core");
+    }
+    if CpuType::from_raw(0x00) != CpuType::Unknown {
+        return TestResult::Fail("0x00 should decode to Unknown");
+    }
+    if CpuType::from_raw(0xFF) != CpuType::Unknown {
+        return TestResult::Fail("unknown byte should decode to Unknown");
+    }
+    if !CpuType::Core.is_p_core() || CpuType::Atom.is_p_core() {
+        return TestResult::Fail("is_p_core predicate wrong");
+    }
+    if !CpuType::Atom.is_e_core() || CpuType::Core.is_e_core() {
+        return TestResult::Fail("is_e_core predicate wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_percpu_cpu_type_from_raw);
