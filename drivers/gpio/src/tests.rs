@@ -336,7 +336,7 @@ fn smoke_intel_pch_recognises_bringup_hids() -> TestResult {
         "INT3454", // Cannon Lake LP
         "INT3452", // Apollo Lake
     ] {
-        if !intel_recognised_hids().iter().any(|h| *h == required) {
+        if !intel_recognised_hids().contains(&required) {
             return TestResult::Fail("required Intel PCH GPIO HID missing from list");
         }
     }
@@ -458,7 +458,7 @@ fn smoke_intel_pch_stage0_gpio_ops_return_bad_hardware() -> TestResult {
     if drv.pin_count() != 128 {
         return TestResult::Fail("pin_count getter wrong");
     }
-    if drv.has_debounce() != true {
+    if !drv.has_debounce() {
         return TestResult::Fail("has_debounce getter wrong");
     }
     if drv.read_pin(0).err() != Some(GpioError::BadHardware) {
