@@ -9,7 +9,10 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::{csr, register_pci_driver, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211, IWL_VENDOR};
+use super::{
+    csr, prph, register_pci_driver, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211,
+    IWL_VENDOR,
+};
 
 // ── Stage 1 — PCI match table ─────────────────────────────────────
 
@@ -117,6 +120,61 @@ fn smoke_iwlwifi_csr_reset_bits() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_csr_reset_bits);
+
+// ── Stage 2 — PRPH indirect-access packing ────────────────────────
+
+fn smoke_iwlwifi_prph_pack_pre_ax210() -> TestResult {
+    // Pre-AX210 mask = 0x000F_FFFF; size-code (3<<24) = 0x0300_0000.
+    // pack(0x1234_5, Mask20) == 0x0301_2345.
+    let p = prph::pack_addr(0x0001_2345, prph::PrphMask::Mask20);
+    if p != 0x0301_2345 {
+        return TestResult::Fail("PRPH-20 pack value drifted");
+    }
+    // Address out of range must be truncated, never wrap into the
+    // size-code field.
+    let trunc = prph::pack_addr(0xFFFF_FFFF, prph::PrphMask::Mask20);
+    if trunc != (0x0300_0000 | 0x000F_FFFF) {
+        return TestResult::Fail("PRPH-20 mask must truncate to 20 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_prph_pack_pre_ax210);
+
+fn smoke_iwlwifi_prph_pack_ax210() -> TestResult {
+    // AX210 mask = 0x00FF_FFFF.
+    let p = prph::pack_addr(0x0012_3456, prph::PrphMask::Mask24);
+    if p != 0x0312_3456 {
+        return TestResult::Fail("PRPH-24 pack value drifted");
+    }
+    // Address beyond 24 bits truncates within the size code.
+    let trunc = prph::pack_addr(0xFFFF_FFFF, prph::PrphMask::Mask24);
+    if trunc != (0x0300_0000 | 0x00FF_FFFF) {
+        return TestResult::Fail("PRPH-24 mask must truncate to 24 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_prph_pack_ax210);
+
+fn smoke_iwlwifi_prph_apmg_offsets() -> TestResult {
+    // APMG sub-block within PRPH is at +0x3000 per iwl-prph.h.
+    if prph::APMG_BASE != 0x3000 {
+        return TestResult::Fail("APMG_BASE drifted");
+    }
+    if prph::APMG_CLK_EN_REG != 0x3004 {
+        return TestResult::Fail("APMG_CLK_EN_REG drifted");
+    }
+    if prph::APMG_PCIDEV_STT_REG != 0x3010 {
+        return TestResult::Fail("APMG_PCIDEV_STT_REG drifted");
+    }
+    if prph::APMG_CLK_VAL_DMA_CLK_RQT != 0x0000_0200 {
+        return TestResult::Fail("DMA-CLK-RQT bit drifted");
+    }
+    if prph::APMG_PCIDEV_STT_VAL_L1_ACT_DIS != 0x0000_0800 {
+        return TestResult::Fail("L1_ACT_DIS bit drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_prph_apmg_offsets);
 
 fn smoke_iwlwifi_csr_hw_rev_decode() -> TestResult {
     // From Linux: `CSR_HW_REV_TYPE(_val) = ((_val) & 0x000FFF0) >> 4`.
