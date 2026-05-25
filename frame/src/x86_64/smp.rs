@@ -144,6 +144,24 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::x86_64::cpu::set_current_cpu(id);
     }
 
+    // 1a. Record this AP's hybrid CPU type. Order matters: must
+    //     come after set_current_cpu (so the slot index is right
+    //     even if a future revision changes how the slot is
+    //     keyed) and before any code that might want to consult
+    //     CPU_TYPES[id]. CPUID leaf 0x1A is per-LP, so each AP
+    //     reads its own value — the BSP's reading wouldn't apply.
+    //     On non-hybrid silicon (AMD, pre-Alder-Lake Intel) the
+    //     leaf is undefined and reads zero, which decodes to
+    //     CpuType::Unknown.
+    // SAFETY: CPUID at CPL=0 is always legal.
+    unsafe {
+        let raw = narf_arch::x86_64::cpuid::read_hybrid_cpu_type();
+        narf_lib::percpu::set_cpu_type(
+            id,
+            narf_lib::percpu::CpuType::from_raw(raw),
+        );
+    }
+
     // 1b. Apply per-silicon errata on this AP. Same table as the
     //     BSP — chicken bits like AMD DE_CFG[9] / [14] are
     //     per-core MSRs, not core-cluster-shared, so each AP
