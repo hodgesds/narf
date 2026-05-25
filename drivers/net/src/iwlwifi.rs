@@ -229,11 +229,13 @@ pub fn probe(
     Ok(())
 }
 
-/// Register the driver against every documented AX2xx device id.
+/// Register the driver against every documented AX-class device id.
+/// Each `PciMatch` gets a DID-unique name so the registry's
+/// name-keyed deduplication doesn't collapse aliased entries.
 pub fn register_pci_driver() {
     for &did in ALL_DEV_IDS {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
-            name: name_for(did),
+            name: match_name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
                 vendor: IWL_VENDOR,
                 device: did,
@@ -243,18 +245,37 @@ pub fn register_pci_driver() {
     }
 }
 
+/// Human-facing display name (what we log + record_bound with).
+/// Several DIDs share a display name because they're the same
+/// silicon under different OEM SKUs.
 fn name_for(did: u16) -> &'static str {
     match did {
         IWL_DEV_AX200 => "iwlwifi-ax200",
-        IWL_DEV_AX201 => "iwlwifi-ax201",
-        IWL_DEV_AX201_2 => "iwlwifi-ax201",
-        IWL_DEV_AX210 => "iwlwifi-ax210",
-        IWL_DEV_AX210_2 => "iwlwifi-ax210",
-        IWL_DEV_AX211 => "iwlwifi-ax211",
-        IWL_DEV_AX211_2 => "iwlwifi-ax211",
-        IWL_DEV_AX211_3 => "iwlwifi-ax211",
+        IWL_DEV_AX201 | IWL_DEV_AX201_2 => "iwlwifi-ax201",
+        IWL_DEV_AX210 | IWL_DEV_AX210_2 => "iwlwifi-ax210",
+        IWL_DEV_AX211 | IWL_DEV_AX211_2 | IWL_DEV_AX211_3 => "iwlwifi-ax211",
         IWL_DEV_AX411 => "iwlwifi-ax411",
         IWL_DEV_KILLER_1690 => "iwlwifi-killer1690",
         _ => "iwlwifi",
+    }
+}
+
+/// Unique per-DID match name used at registration. The bus registry
+/// is keyed by `PciMatch::name` and refuses duplicates (last-write-
+/// wins) — using the display name alone would collapse aliased DIDs
+/// down to one match entry.
+fn match_name_for(did: u16) -> &'static str {
+    match did {
+        IWL_DEV_AX200 => "iwlwifi-2723",
+        IWL_DEV_AX201 => "iwlwifi-02f0",
+        IWL_DEV_AX201_2 => "iwlwifi-4df0",
+        IWL_DEV_AX210 => "iwlwifi-2725",
+        IWL_DEV_AX210_2 => "iwlwifi-7af0",
+        IWL_DEV_AX211 => "iwlwifi-51f0",
+        IWL_DEV_AX211_2 => "iwlwifi-51f1",
+        IWL_DEV_AX211_3 => "iwlwifi-7e40",
+        IWL_DEV_AX411 => "iwlwifi-54f0",
+        IWL_DEV_KILLER_1690 => "iwlwifi-5417",
+        _ => "iwlwifi-unknown",
     }
 }

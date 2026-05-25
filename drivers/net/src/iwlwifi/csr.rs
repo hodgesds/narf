@@ -267,10 +267,11 @@ pub const CSR_INI_SET_MASK: u32 = CSR_INT_BIT_FH_RX
 
 // ── HW REV decode (CSR_HW_REV) ────────────────────────────────────
 
-/// Extract the device-type field (`bits 15..4`) from `HW_REV`.
+/// Extract the device-type field (`bits 19..4`) from `HW_REV`.
+/// Mirrors Linux `CSR_HW_REV_TYPE`: `((_val) & 0x000FFF0) >> 4`.
 #[inline]
 pub const fn csr_hw_rev_type(val: u32) -> u32 {
-    (val & 0x0000_0FF0) >> 4
+    (val & 0x000F_FFF0) >> 4
 }
 
 /// Extract the step+dash field (`bits 3..0`) from `HW_REV`.
