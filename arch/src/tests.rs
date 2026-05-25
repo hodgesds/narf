@@ -1514,7 +1514,9 @@ fn smoke_arch_x86_features_default_is_all_false() -> TestResult {
     use crate::x86_64::Features;
     let d = Features::default();
     if d.nx || d.pku || d.pks || d.uipi || d.invariant_tsc
-        || d.rdseed || d.rdrand || d.x2apic || d.apic {
+        || d.rdseed || d.rdrand || d.x2apic || d.apic
+        || d.tsc_deadline || d.arat
+    {
         return TestResult::Fail("Features::default() should be all-false");
     }
     TestResult::Pass
@@ -1537,6 +1539,8 @@ fn smoke_arch_x86_features_probe_idempotent() -> TestResult {
         || f1.rdrand != f2.rdrand
         || f1.x2apic != f2.x2apic
         || f1.apic != f2.apic
+        || f1.tsc_deadline != f2.tsc_deadline
+        || f1.arat != f2.arat
     {
         return TestResult::Fail("Features::probe() not idempotent");
     }

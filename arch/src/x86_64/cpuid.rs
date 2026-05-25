@@ -55,6 +55,17 @@ pub struct Features {
     pub x2apic: bool,        // leaf 1 ECX:21
     pub apic: bool,          // leaf 1 EDX:9
     pub tsc_deadline: bool,  // leaf 1 ECX:24 — LAPIC TSC-deadline mode
+    /// Always Running APIC Timer: leaf 0x06 EAX:2.
+    ///
+    /// Intel-only feature (AMD doesn't populate CPUID 0x06 — the
+    /// "Thermal and Power Management" leaf is Intel-architected).
+    /// When set, the LAPIC timer does NOT stop in C3 or deeper
+    /// C-states. Linux uses this to (a) clear the C3STOP feature
+    /// from the LAPIC clockevent and (b) bump its rating above
+    /// HPET so the per-CPU LAPIC timer is preferred over the
+    /// global HPET as the primary clockevent on Intel ≥ Nehalem.
+    /// See `setup_APIC_timer` in `arch/x86/kernel/apic/apic.c`.
+    pub arat: bool,
 }
 
 impl Features {
@@ -88,6 +99,16 @@ impl Features {
         // Leaf 80000007h EDX:8 = Invariant TSC.
         let (_, _, _, edx_adv) = unsafe { cpuid(0x8000_0007, 0) };
         f.invariant_tsc = edx_adv & (1 << 8) != 0;
+
+        // Leaf 0x06 EAX:2 = ARAT (Always Running APIC Timer). Only
+        // populated on Intel — AMD parts return 0 for the whole
+        // "Thermal and Power Management" leaf. CPUID max guard
+        // ensures we don't read past the implemented range.
+        let (max, _, _, _) = unsafe { cpuid(0, 0) };
+        if max >= 6 {
+            let (eax6, _, _, _) = unsafe { cpuid(0x0000_0006, 0) };
+            f.arat = eax6 & (1 << 2) != 0;
+        }
 
         f
     }

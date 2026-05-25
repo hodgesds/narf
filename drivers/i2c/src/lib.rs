@@ -1,6 +1,6 @@
-//! I2C bus trait + AMD FCH controller driver.
+//! I2C bus trait + AMD FCH and Intel LPSS controller drivers.
 //!
-//! Two layers:
+//! Three layers:
 //! - `I2cBus` trait + `I2cOp` + a process-global registry of buses,
 //!   so HID-over-I2C and other client drivers can locate a bus by
 //!   name (typically the ACPI path of the controller) without
@@ -11,6 +11,12 @@
 //!   namespace for `AMDI0010 / AMDI0019 / AMDI0510 / AMDI0011`,
 //!   decodes `_CRS` for MMIO base + IRQ, and hands the resulting
 //!   driver instance to the registry.
+//! - `lpss` — Intel PCH LPSS I2C controllers (Tiger Lake / Alder Lake
+//!   / Raptor Lake and earlier). Same DW core, different ACPI HIDs
+//!   (`INT3xxx` / `80860Fxx` / `808622xx`). Stage-0 skeleton:
+//!   discovery + MMIO mapping + IC_COMP_TYPE probe + bus
+//!   registration; `transfer()` returns `BadHardware` until Stage-1
+//!   ports the FCH transfer state machine.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -20,6 +26,7 @@ extern crate alloc;
 
 pub mod amd_fch;
 pub mod gsb;
+pub mod lpss;
 pub mod registry;
 
 use alloc::boxed::Box;
@@ -78,15 +85,23 @@ pub trait I2cBus: Send + Sync + core::fmt::Debug {
 /// the sense that re-running it on hardware that's already been
 /// programmed will reprogram the registers; the registry's
 /// `register_unique` collapses duplicate controller paths.
+///
+/// The AMD FCH and Intel LPSS probes run as separate initcalls so a
+/// failure / no-match in one doesn't gate the other — the Stage-1
+/// bring-up target group has both Zen2 / Zen4 laptops (FCH path) and
+/// Intel laptops (LPSS path). Either initcall successfully registering
+/// at least one bus is enough to install the GenericSerialBus
+/// dispatcher.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "amd-fch-i2c", || {
         let n = amd_fch::probe_all();
         if n == 0 {
             // No AMD FCH I2C controllers in the namespace — quiet
-            // success on non-AMD platforms (e.g. QEMU virt) is the
-            // right behaviour, the i2c-hid initcall logs the absence
-            // when it can't find a controller for its children.
+            // success on non-AMD platforms (e.g. QEMU virt, Intel
+            // laptops) is the right behaviour, the i2c-hid initcall
+            // logs the absence when it can't find a controller for
+            // its children.
             InitResult::NotPresent
         } else {
             // Install the GenericSerialBus dispatcher so AML
@@ -94,6 +109,22 @@ pub fn register_initcalls() {
             // accesses route through the I2C registry. Audit #5
             // real impl. Idempotent — set_gsb_dispatcher just
             // overwrites the fn pointer.
+            narf_aml::oregion::set_gsb_dispatcher(gsb::dispatch);
+            InitResult::Ok
+        }
+    });
+    narf_init::register(Stage::Device, "lpss-i2c", || {
+        let n = lpss::probe_all();
+        if n == 0 {
+            // No Intel LPSS I2C controllers in the namespace — quiet
+            // success on non-Intel platforms.
+            InitResult::NotPresent
+        } else {
+            // Install the GenericSerialBus dispatcher in case the
+            // AMD initcall didn't (Intel-only platform). The
+            // dispatcher itself routes through `registry::find`
+            // regardless of which driver populated the entry, so
+            // it works for either backend.
             narf_aml::oregion::set_gsb_dispatcher(gsb::dispatch);
             InitResult::Ok
         }
