@@ -293,6 +293,15 @@ pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
 /// raw / 16 = 6.25 MHz) — close enough on most platforms to deliver
 /// at least *some* ticks per second so `probe_fires` can verify.
 /// Phase 2 lands proper calibration against HPET / TSC.
+///
+/// On Intel, the LAPIC timer stops in C3 and deeper C-states
+/// **unless** CPUID 0x06 EAX[2] (ARAT — Always Running APIC
+/// Timer) is set, in which case the timer continues running. We
+/// detect ARAT via [`narf_arch::x86_64::Features::arat`] but don't
+/// currently use the result here — Linux's optimisation is to
+/// clear the `CLOCK_EVT_FEAT_C3STOP` clockevent flag, but NARF
+/// doesn't yet enter deep C-states in the idle path, so the
+/// information is informational for diagnostics.
 #[derive(Debug)]
 pub struct LapicClockEvent;
 
@@ -362,8 +371,22 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
     }
 
     fn resolution_ns(&self) -> u64 {
-        // Post-divide 6.25 MHz ≈ 160 ns per tick.
-        160
+        // Under TSC-deadline mode the resolution IS the TSC tick
+        // (sub-nanosecond on modern Intel/AMD); resolution_ns has
+        // u64 ns granularity, so report 1 ns — Linux's
+        // lapic_clockevent_rating uses the same effective floor.
+        // Classic periodic-InitialCount mode gives post-divide
+        // 6.25 MHz on a typical 100 MHz BCLK ≈ 160 ns per tick.
+        // ARAT (Intel) doesn't change resolution, only the C3
+        // behaviour.
+        //
+        // SAFETY: CPUID is always legal at CPL=0.
+        let feats = unsafe { narf_arch::x86_64::Features::probe() };
+        if feats.tsc_deadline {
+            1
+        } else {
+            160
+        }
     }
 
     fn kind(&self) -> narf_time::clockevent::ClockEventKind {
