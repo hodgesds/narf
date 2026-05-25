@@ -15,17 +15,22 @@
 //!      Skylake+ reports the base operating frequency directly.
 //!      Less precise than 0x15 but always available when 0x15
 //!      gives a 0 crystal_hz.
-//!   3. **AMD MSR_PSTATE0** (0xC001_0064) — Family 0x17+ chips
+//!   3. **Intel MSR_PLATFORM_INFO** (0xCE) — Sandy Bridge+ Intel
+//!      parts that don't populate CPUID 0x15 (no crystal) and
+//!      report 0 from CPUID 0x16 (virtualised hosts). Encodes
+//!      the max non-turbo ratio in bits[15:8]; TSC = ratio *
+//!      100 MHz BCLK. Matches Linux `cpu_khz_from_msr()`.
+//!   4. **AMD MSR_PSTATE0** (0xC001_0064) — Family 0x17+ chips
 //!      don't populate Intel CPUID leaves 0x15 / 0x16. The
 //!      P-state-0 definition MSR encodes the P0 (boost) clock
 //!      from `CpuFid` / `CpuDfsId`; on Zen2+ the TSC is
 //!      invariant and tied to that boost clock. See
 //!      [`calibrate_via_amd_pstate0`].
-//!   4. **HPET cross-check** — measure `Δtsc / Δhpet` over a
+//!   5. **HPET cross-check** — measure `Δtsc / Δhpet` over a
 //!      short window. Works on every CPU with a working HPET,
 //!      but unreliable on Phoenix HawkPoint1 (Zen4 mobile)
 //!      where the HPET counter drifts under SMM activity.
-//!   5. Last-resort: 1 GHz nominal (matches the historical
+//!   6. Last-resort: 1 GHz nominal (matches the historical
 //!      `cycles_per_ns = 1` fallback).
 
 #![cfg(target_arch = "x86_64")]
@@ -92,6 +97,66 @@ fn from_cpuid_16h() -> Option<u64> {
         return None;
     }
     Some((mhz as u64) * 1_000_000)
+}
+
+/// Intel `MSR_PLATFORM_INFO` — bits[15:8] hold the maximum
+/// non-turbo (base) ratio; TSC on Sandy Bridge+ runs at
+/// `bclk * max_non_turbo_ratio` with BCLK = 100 MHz on every
+/// modern Intel big-core part. Linux's `cpu_khz_from_msr()` uses
+/// the same MSR for Intel TSC calibration on hosts where CPUID
+/// 0x15 / 0x16 don't carry a usable answer.
+const MSR_PLATFORM_INFO: u32 = 0x0000_00CE;
+
+/// Doc-hidden alias mirroring [`__from_cpuid_15h`] /
+/// [`__from_cpuid_16h`]; see those for the rationale.
+#[doc(hidden)]
+pub fn __from_msr_platform_info() -> Option<u64> {
+    from_msr_platform_info()
+}
+
+/// Decode Intel TSC frequency from `MSR_PLATFORM_INFO`. Returns
+/// `None` on non-Intel vendors, when the read `#GP`s (firmware-
+/// locked / virtualised), or when the encoded ratio is zero
+/// (some hosts expose the MSR but report 0).
+///
+/// Spec: Intel SDM Vol 4 §2.16 (Silvermont) / Vol 4 §2.18
+/// (Sandy Bridge "model-specific MSRs"). The MSR is present on
+/// every Intel big-core part since Nehalem; AMD has no MSR at
+/// index 0xCE, so the vendor gate below short-circuits the
+/// rdmsr before it would `#GP`.
+///
+/// BCLK = 100 MHz, matching every Intel big-core part since
+/// Nehalem (Westmere's 133 MHz variant is rare enough to leave
+/// to the CPUID 0x16 fallback). Atom SoCs that use a different
+/// BCLK populate Linux's `tsc_msr.c`-style frequency tables; we
+/// leave that to the HPET cross-check rather than hard-code a
+/// per-Atom-family decoder.
+fn from_msr_platform_info() -> Option<u64> {
+    // Vendor must be GenuineIntel. AMD has no MSR at index 0xCE —
+    // rdmsr_or_gp would catch the #GP, but the short-circuit
+    // saves the probe arm/disarm cost.
+    // SAFETY: leaf 0 is always defined.
+    let (_, ebx, ecx, edx) = unsafe { cpuid(0, 0) };
+    // "Genu" "ineI" "ntel"
+    let intel = ebx == 0x756E_6547 && edx == 0x4965_6E69 && ecx == 0x6C65_746E;
+    if !intel {
+        return None;
+    }
+    let v = match rdmsr_or_gp(MSR_PLATFORM_INFO) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let max_non_turbo_ratio = ((v >> 8) & 0xFF) as u64;
+    if max_non_turbo_ratio == 0 {
+        return None;
+    }
+    // BCLK = 100 MHz on Sandy Bridge+; TSC = ratio * BCLK.
+    let hz = max_non_turbo_ratio.saturating_mul(100_000_000);
+    // Sanity-bound: same range as amd-pstate / hpet-xcheck.
+    if !(1_000_000_000..=6_500_000_000).contains(&hz) {
+        return None;
+    }
+    Some(hz)
 }
 
 /// MSR index for AMD P-state-0 definition (`MSR_AMD_PSTATE_DEF_BASE`).

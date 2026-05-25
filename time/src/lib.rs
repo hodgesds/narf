@@ -377,6 +377,11 @@ pub enum CalibrationSource {
     /// than 0x15 (rounded to MHz) but available without the
     /// crystal entry.
     CpuId16h,
+    /// Intel `MSR_PLATFORM_INFO` (0xCE) decode. Used on Sandy
+    /// Bridge+ Intel parts where CPUID 0x15 has no crystal and
+    /// CPUID 0x16 isn't populated (some virtualised hosts).
+    /// Encodes the max non-turbo ratio; TSC = ratio * 100 MHz BCLK.
+    IntelPlatformInfo,
     /// AMD `MSR_AMD_PSTATE_DEF_0` (`Core::X86::Msr::PStateDef`)
     /// decode. Used on Zen2 / Zen3 / Zen4 / Zen5 where Intel
     /// CPUID leaves are not populated.
@@ -396,6 +401,7 @@ impl CalibrationSource {
             CalibrationSource::Cached => "cached",
             CalibrationSource::CpuId15h => "cpuid-15h",
             CalibrationSource::CpuId16h => "cpuid-16h",
+            CalibrationSource::IntelPlatformInfo => "intel-platform-info",
             CalibrationSource::AmdPstate0 => "amd-pstate0",
             CalibrationSource::HpetXcheck => "hpet-xcheck",
             CalibrationSource::None => "none",
@@ -404,8 +410,8 @@ impl CalibrationSource {
 }
 
 /// One-shot boot-time clock calibration. Picks the best TSC-Hz
-/// estimate available — Intel CPUID 0x15 / 0x16, then AMD
-/// `MSR_AMD_PSTATE_DEF_0` for Family 0x17+, then a HPET
+/// estimate available — Intel CPUID 0x15 / 0x16 / MSR_PLATFORM_INFO,
+/// then AMD `MSR_AMD_PSTATE_DEF_0` for Family 0x17+, then a HPET
 /// cross-check — and pushes the resulting cycles-per-ns into the
 /// wall module so `monotonic_ns()` reports real nanoseconds
 /// instead of raw TSC ticks. Returns the chosen TSC Hz, or 0 if
@@ -454,7 +460,19 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
         apply_cycles_per_ns(hz);
         return (hz, CalibrationSource::CpuId16h);
     }
-    // 3. AMD MSR_PSTATE0. Family 0x17+ doesn't populate the
+    // 3. Intel MSR_PLATFORM_INFO (0xCE). Sandy Bridge+ parts that
+    //    don't populate CPUID 0x15 (no crystal) or report 0 from
+    //    CPUID 0x16 (some virtualised hosts) still expose the max
+    //    non-turbo ratio here. Vendor-gated to Intel — AMD has no
+    //    MSR at that index, and the inner check short-circuits
+    //    before issuing the rdmsr.
+    let hz_msr_pi = narf_arch::x86_64::tsc::__from_msr_platform_info();
+    if let Some(hz) = hz_msr_pi {
+        narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
+        apply_cycles_per_ns(hz);
+        return (hz, CalibrationSource::IntelPlatformInfo);
+    }
+    // 4. AMD MSR_PSTATE0. Family 0x17+ doesn't populate the
     //    Intel CPUID leaves; the P-state-0 MSR has the boost
     //    clock, which the invariant TSC matches.
     let hz_amd = narf_arch::x86_64::tsc::calibrate_via_amd_pstate0();
@@ -463,7 +481,7 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
         apply_cycles_per_ns(hz_amd);
         return (hz_amd, CalibrationSource::AmdPstate0);
     }
-    // 4. HPET cross-check. A 100 ms window at the ~14.318 MHz
+    // 5. HPET cross-check. A 100 ms window at the ~14.318 MHz
     //    HPET found on every x86_64 chipset since ICH = ~1.43M
     //    ticks; bumps to whatever the actual HPET reports if
     //    higher (some Coffee Lake parts run HPET at 24 MHz).
