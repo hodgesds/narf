@@ -176,6 +176,34 @@ fn smoke_iwlwifi_prph_apmg_offsets() -> TestResult {
 }
 kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_prph_apmg_offsets);
 
+// ── Stage 2 — APM init sequence constants ─────────────────────────
+
+fn smoke_iwlwifi_apm_timeouts_sane() -> TestResult {
+    // Pre-Bz settle: Linux uses usleep_range(5000, 6000); pick 6ms.
+    if apm::APM_SW_RESET_PRE_BZ_MS == 0 || apm::APM_SW_RESET_PRE_BZ_MS > 50 {
+        return TestResult::Fail("pre-Bz reset settle outside sane range");
+    }
+    if apm::APM_SW_RESET_BZ_MS == 0 || apm::APM_SW_RESET_BZ_MS > 50 {
+        return TestResult::Fail("Bz reset settle outside sane range");
+    }
+    // Linux activate-NIC poll budget is iwl_poll_bits(...,25000) = 25 ms.
+    if apm::APM_ACTIVATE_NIC_TIMEOUT_MS != 25 {
+        return TestResult::Fail("activate-NIC timeout drifted from 25 ms");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_apm_timeouts_sane);
+
+fn smoke_iwlwifi_apm_family_default() -> TestResult {
+    // AX-class default is the pre-Bz flow (uses CSR_RESET's bit 7,
+    // polls MAC_CLOCK_READY). Bz/Be200 is a future task.
+    if apm::Family::default_for_ax() != apm::Family::Pre {
+        return TestResult::Fail("AX-class default must be Family::Pre");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_apm_family_default);
+
 fn smoke_iwlwifi_csr_hw_rev_decode() -> TestResult {
     // From Linux: `CSR_HW_REV_TYPE(_val) = ((_val) & 0x000FFF0) >> 4`.
     // Test: HW_REV = 0x_____YYx where YY is the type, x is step+dash.
