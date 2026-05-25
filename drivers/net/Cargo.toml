@@ -17,6 +17,7 @@ narf-capabilities = { path = "../../capabilities" }
 narf-io           = { path = "../../io" }
 narf-net          = { path = "../../net" }
 narf-bus          = { path = "../../bus" }
+narf-console      = { path = "../../console" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-memory       = { path = "../../memory" }
 narf-arch         = { path = "../../arch" }

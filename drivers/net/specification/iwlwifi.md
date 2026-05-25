@@ -1,11 +1,13 @@
 # iwlwifi — Specification
 
-> Status: **v0.1** (Stage 1: PCI match only — blocked beyond probe).
+> Status: **v0.2** (Stage 2: CSR map + APM init + ucode header
+> decode + probe + log; firmware-load + alive-handshake are Stage 3).
 >
-> Clean-room driver for Intel Wi-Fi 6 / 6E PCIe host controllers
-> (AX200 / AX201 / AX210 / AX211). Reference material restricted
-> to public Intel product briefs, IEEE 802.11, and PCIe capability
-> headers. **No GPL Linux iwlwifi source consulted.**
+> GPL-2.0-or-later driver for Intel Wi-Fi 6 / 6E PCIe host
+> controllers (AX200 / AX201 / AX210 / AX211 / AX411 + Killer 1690).
+> Adapted directly from Linux `drivers/net/wireless/intel/iwlwifi/`
+> source — NARF was relicensed to GPL-2.0-or-later on 2026-05-20,
+> unblocking the prior clean-room constraint.
 
 ## 1. Purpose & scope
 

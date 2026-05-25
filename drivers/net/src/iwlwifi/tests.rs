@@ -10,8 +10,9 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    apm, csr, prph, register_pci_driver, ucode, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210,
-    IWL_DEV_AX211, IWL_VENDOR,
+    apm, csr, prph, register_pci_driver, ucode, DeviceFamily, IWL_DEV_AX200, IWL_DEV_AX201,
+    IWL_DEV_AX201_2, IWL_DEV_AX210, IWL_DEV_AX210_2, IWL_DEV_AX211, IWL_DEV_AX211_2,
+    IWL_DEV_AX211_3, IWL_DEV_AX411, IWL_DEV_KILLER_1690, IWL_VENDOR,
 };
 
 extern crate alloc;
@@ -24,7 +25,20 @@ fn smoke_iwlwifi_pci_match_table() -> TestResult {
     __reset_for_test();
     register_pci_driver();
     let registered = registered_pci_drivers();
-    let want = [IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211];
+    // Stage 2 expanded the table to cover all AX-class SKUs across
+    // primary + alias DIDs from upstream `pcie/drv.c`.
+    let want = [
+        IWL_DEV_AX200,
+        IWL_DEV_AX201,
+        IWL_DEV_AX201_2,
+        IWL_DEV_AX210,
+        IWL_DEV_AX210_2,
+        IWL_DEV_AX211,
+        IWL_DEV_AX211_2,
+        IWL_DEV_AX211_3,
+        IWL_DEV_AX411,
+        IWL_DEV_KILLER_1690,
+    ];
     for did in want {
         let matched = registered.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
@@ -38,6 +52,49 @@ fn smoke_iwlwifi_pci_match_table() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_pci_match_table);
+
+fn smoke_iwlwifi_device_family_classification() -> TestResult {
+    // Family-1 (AX200/AX201) gets the 20-bit PRPH window and uses
+    // APMG. Family-2 (AX210/AX211/AX411/Killer) gets 24-bit PRPH and
+    // skips APMG.
+    if DeviceFamily::for_device(IWL_DEV_AX200) != DeviceFamily::Family1 {
+        return TestResult::Fail("AX200 should be Family1");
+    }
+    if DeviceFamily::for_device(IWL_DEV_AX201) != DeviceFamily::Family1 {
+        return TestResult::Fail("AX201 should be Family1");
+    }
+    if DeviceFamily::for_device(IWL_DEV_AX201_2) != DeviceFamily::Family1 {
+        return TestResult::Fail("AX201 alias should be Family1");
+    }
+    if DeviceFamily::for_device(IWL_DEV_AX210) != DeviceFamily::Family2 {
+        return TestResult::Fail("AX210 should be Family2");
+    }
+    if DeviceFamily::for_device(IWL_DEV_AX211) != DeviceFamily::Family2 {
+        return TestResult::Fail("AX211 should be Family2");
+    }
+    if DeviceFamily::for_device(IWL_DEV_AX411) != DeviceFamily::Family2 {
+        return TestResult::Fail("AX411 should be Family2");
+    }
+    // PRPH-mask choice follows family.
+    if DeviceFamily::Family1.prph_mask() != prph::PrphMask::Mask20 {
+        return TestResult::Fail("Family1 must use Mask20");
+    }
+    if DeviceFamily::Family2.prph_mask() != prph::PrphMask::Mask24 {
+        return TestResult::Fail("Family2 must use Mask24");
+    }
+    // APMG present on Family1 only.
+    if !DeviceFamily::Family1.apmg_supported() {
+        return TestResult::Fail("Family1 should support APMG");
+    }
+    if DeviceFamily::Family2.apmg_supported() {
+        return TestResult::Fail("Family2 should not have APMG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/iwlwifi",
+    smoke_iwlwifi_device_family_classification
+);
 
 // ── Stage 2 — CSR layout sanity ───────────────────────────────────
 
