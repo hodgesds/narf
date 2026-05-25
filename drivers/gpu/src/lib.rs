@@ -140,6 +140,7 @@ pub mod dp_aux;
 pub mod dp_edid;
 pub mod dp_link_training;
 pub mod intel_gpu;
+pub mod intel_gpu_aux;
 pub mod intel_gpu_ddi;
 pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;

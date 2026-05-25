@@ -1,8 +1,11 @@
 //! Subsystem smokes for `narf-drivers-gpio`.
 //!
-//! Synthetic MMIO backing for the AMD FCH driver — exercises the
-//! per-pin register programming, handler-table bookkeeping, and the
-//! shared ISR dispatch loop without needing a real FCH GPIO block.
+//! Synthetic MMIO backing for both drivers:
+//! - AMD FCH — exercises per-pin register programming, handler-table
+//!   bookkeeping, and the shared ISR dispatch loop.
+//! - Intel PCH (Stage-0) — exercises HID-list coverage, REVID/PADBAR
+//!   decode against a hand-rolled backing, the stub GpioController
+//!   surface, and the shared-registry integration.
 
 extern crate alloc;
 
@@ -15,6 +18,10 @@ use narf_memory::PhysAddr;
 
 use crate::amd_fch::{
     recognised_hid, AmdFchGpio, __dispatch_for_test, __reset_dispatch_for_test,
+};
+use crate::intel_pch::{
+    recognised_hids as intel_recognised_hids, IntelPchGpio, __new_for_test as intel_new_for_test,
+    __probe_community_for_test as intel_probe_community,
 };
 use crate::{registry, GpioController, GpioError, GpioIrqConfig, GpioPull};
 
@@ -287,3 +294,280 @@ kernel_test_in!(
     "drivers-gpio",
     smoke_gpio_isr_dispatch_fires_handler_and_clears_status
 );
+
+// ── Intel PCH GPIO Stage-0 smokes ──────────────────────────────────
+
+/// Build a backing buffer large enough for one Intel PCH GPIO
+/// community. Seeds REVID + PADBAR + (optionally) the GPIO HW INFO
+/// caplist entry. Returns (phys, len, padbar_offset, has_debounce,
+/// expected_pad_count).
+fn make_intel_synthetic_mmio(
+    rev: u32,
+    padbar_off: u32,
+    window_dwords: usize,
+) -> (PhysAddr, u64, u32, bool, u16) {
+    assert!(window_dwords * 4 > padbar_off as usize);
+    let buf = alloc::vec![0u32; window_dwords].into_boxed_slice();
+    let raw: &'static mut [u32] = Box::leak(buf);
+    // REVID lives at offset 0x000 — top 16 bits = revision, low 16 = 0.
+    raw[0] = (rev & 0xFFFF) << 16;
+    // CAPLIST at 0x004 → empty chain (next=0, id=0).
+    raw[1] = 0;
+    // PADBAR at 0x00C → byte offset of pad config registers.
+    raw[3] = padbar_off;
+    let phys = PhysAddr::new(raw.as_ptr() as u64);
+    let len = (window_dwords * 4) as u64;
+    let has_debounce = rev >= 0x94;
+    let pad_stride = if has_debounce { 16 } else { 8 };
+    let pad_region = len - padbar_off as u64;
+    let pad_count = (pad_region / pad_stride).min(u16::MAX as u64) as u16;
+    (phys, len, padbar_off, has_debounce, pad_count)
+}
+
+fn smoke_intel_pch_recognises_bringup_hids() -> TestResult {
+    // The bring-up target group covers Tiger Lake → Meteor Lake.
+    // Guard against the table getting trimmed for any of them.
+    for required in [
+        "INT34BB", // Tiger Lake
+        "INT3450", // Comet Lake / Cannon Lake-LP
+        "INT34C8", // Raptor Lake-S
+        "INT34C9", // Raptor Lake-P / Alder Lake-P
+        "INT37FF", // Meteor Lake
+        "INT3454", // Cannon Lake LP
+        "INT3452", // Apollo Lake
+    ] {
+        if !intel_recognised_hids().iter().any(|h| *h == required) {
+            return TestResult::Fail("required Intel PCH GPIO HID missing from list");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_intel_pch_recognises_bringup_hids);
+
+fn smoke_intel_pch_probe_decodes_revid_padbar_pads_with_debounce() -> TestResult {
+    // Tiger Lake / Alder Lake / Raptor Lake all report revisions
+    // ≥ 0x94 → 4-dword pad stride (PADCFG0/1/2 + reserved).
+    // Build a synthetic window: 4 KiB total, PADBAR=0x80 → 0xF80
+    // bytes of pad region → 248 pads.
+    let (phys, len, padbar, has_debounce, expected_pads) =
+        make_intel_synthetic_mmio(0x94, 0x80, 1024);
+    if !has_debounce {
+        return TestResult::Fail("debounce feature should be on for rev 0x94");
+    }
+    // SAFETY: synthetic backing owned for the lifetime of the test.
+    let probed = unsafe { intel_probe_community(phys, len) };
+    match probed {
+        Some((revid, pb, deb, pads)) => {
+            if revid != 0x94 {
+                return TestResult::Fail("decoded REVID wrong");
+            }
+            if pb != padbar {
+                return TestResult::Fail("decoded PADBAR wrong");
+            }
+            if !deb {
+                return TestResult::Fail("decoded debounce flag wrong");
+            }
+            if pads != expected_pads {
+                return TestResult::Fail("decoded pad count wrong");
+            }
+            TestResult::Pass
+        }
+        None => TestResult::Fail("probe rejected a healthy synthetic backing"),
+    }
+}
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_intel_pch_probe_decodes_revid_padbar_pads_with_debounce
+);
+
+fn smoke_intel_pch_probe_decodes_pads_without_debounce() -> TestResult {
+    // Older silicon (rev < 0x94) → 2-dword pad stride.
+    let (phys, len, padbar, has_debounce, expected_pads) =
+        make_intel_synthetic_mmio(0x12, 0x40, 512);
+    if has_debounce {
+        return TestResult::Fail("debounce should be off for rev 0x12");
+    }
+    // SAFETY: synthetic backing.
+    let probed = unsafe { intel_probe_community(phys, len) };
+    match probed {
+        Some((_, _, deb, pads)) => {
+            if deb {
+                return TestResult::Fail("debounce flag should be false");
+            }
+            if pads != expected_pads {
+                return TestResult::Fail("pad count wrong for non-debounce stride");
+            }
+            // Sanity: pad region = 0x800 - 0x40 = 0x7C0 = 1984
+            // bytes; stride 8 → 248 pads.
+            let _ = padbar;
+            TestResult::Pass
+        }
+        None => TestResult::Fail("probe rejected a healthy synthetic backing"),
+    }
+}
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_intel_pch_probe_decodes_pads_without_debounce
+);
+
+fn smoke_intel_pch_probe_rejects_absent_device() -> TestResult {
+    // REVID reads all-ones → device-absent sentinel. Probe must
+    // bail with None rather than registering a zombie controller.
+    let buf = alloc::vec![u32::MAX; 256].into_boxed_slice();
+    let raw: &'static mut [u32] = Box::leak(buf);
+    let phys = PhysAddr::new(raw.as_ptr() as u64);
+    // SAFETY: synthetic backing.
+    match unsafe { intel_probe_community(phys, 1024) } {
+        None => TestResult::Pass,
+        Some(_) => TestResult::Fail("probe accepted REVID=~0u"),
+    }
+}
+kernel_test_in!("drivers-gpio", smoke_intel_pch_probe_rejects_absent_device);
+
+fn smoke_intel_pch_probe_rejects_bogus_padbar() -> TestResult {
+    // PADBAR points back into the common-register area (< 0x10)
+    // → mapping is wrong. Probe must reject.
+    let buf = alloc::vec![0u32; 256].into_boxed_slice();
+    let raw: &'static mut [u32] = Box::leak(buf);
+    raw[0] = 0x0094_0000; // REVID = 0x94 (looks healthy)
+    raw[3] = 0x04; // PADBAR = 0x04 (overlaps CAPLIST → bogus)
+    let phys = PhysAddr::new(raw.as_ptr() as u64);
+    // SAFETY: synthetic backing.
+    match unsafe { intel_probe_community(phys, 1024) } {
+        None => TestResult::Pass,
+        Some(_) => TestResult::Fail("probe accepted PADBAR pointing into common regs"),
+    }
+}
+kernel_test_in!("drivers-gpio", smoke_intel_pch_probe_rejects_bogus_padbar);
+
+fn smoke_intel_pch_stage0_gpio_ops_return_bad_hardware() -> TestResult {
+    // Stage-0 contract: read_pin / set_pin / register_irq all return
+    // BadHardware. unregister_irq is a silent no-op. This locks the
+    // contract so we notice if the stub silently grows behaviour
+    // before Stage-1 lands.
+    let drv = intel_new_for_test(
+        "\\_SB.PC00.GPI0".to_string(),
+        0,
+        PhysAddr::new(0xFFC0_0000),
+        0x1000,
+        Some(0x94),
+        Some(0x80),
+        128,
+        true,
+    );
+    if drv.pin_count() != 128 {
+        return TestResult::Fail("pin_count getter wrong");
+    }
+    if drv.has_debounce() != true {
+        return TestResult::Fail("has_debounce getter wrong");
+    }
+    if drv.read_pin(0).err() != Some(GpioError::BadHardware) {
+        return TestResult::Fail("read_pin should return BadHardware in Stage-0");
+    }
+    if drv.set_pin(0, true).err() != Some(GpioError::BadHardware) {
+        return TestResult::Fail("set_pin should return BadHardware in Stage-0");
+    }
+    fn dummy(_p: u16) {}
+    let cfg = GpioIrqConfig {
+        level_triggered: false,
+        polarity: 1,
+    };
+    if drv.register_irq(0, GpioPull::Up, cfg, dummy).err() != Some(GpioError::BadHardware) {
+        return TestResult::Fail("register_irq should return BadHardware in Stage-0");
+    }
+    drv.unregister_irq(0); // no-op; just verify it doesn't panic
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_intel_pch_stage0_gpio_ops_return_bad_hardware
+);
+
+fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
+    // Two communities under the same ACPI path must get distinct
+    // registry names so i2c-hid-bind can address them separately —
+    // the per-community suffix (`.C<idx>`) keys the dedupe.
+    registry::__reset_for_test();
+    let phys = PhysAddr::new(0xFFC0_0000);
+    let a: Arc<dyn GpioController> = Arc::new(intel_new_for_test(
+        "\\_SB.PC00.GPI0".to_string(),
+        0,
+        phys,
+        0x1000,
+        Some(0x94),
+        Some(0x80),
+        128,
+        true,
+    ));
+    let b: Arc<dyn GpioController> = Arc::new(intel_new_for_test(
+        "\\_SB.PC00.GPI0".to_string(),
+        1,
+        PhysAddr::new(0xFFC0_1000),
+        0x1000,
+        Some(0x94),
+        Some(0x80),
+        128,
+        true,
+    ));
+    registry::register_unique(a.clone());
+    registry::register_unique(b.clone());
+    if registry::count() != 2 {
+        return TestResult::Fail("expected 2 distinct community entries");
+    }
+    if registry::find("\\_SB.PC00.GPI0.C0").is_none() {
+        return TestResult::Fail("community C0 not in registry");
+    }
+    if registry::find("\\_SB.PC00.GPI0.C1").is_none() {
+        return TestResult::Fail("community C1 not in registry");
+    }
+    registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_intel_pch_names_communities_uniquely);
+
+fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
+    // Whole point of Stage-0: an IntelPchGpio community, once
+    // registered, is discoverable through the SAME registry the
+    // FCH driver uses — i2c-hid-bind looks up
+    // `GpioInt::resource_source` against `registry::find` without
+    // knowing or caring which backend populated the entry.
+    registry::__reset_for_test();
+    let drv = intel_new_for_test(
+        "\\_SB.PC00.GPI3".to_string(),
+        2,
+        PhysAddr::new(0xFFC0_3000),
+        0x1000,
+        Some(0xA1),
+        Some(0xC0),
+        80,
+        true,
+    );
+    let bus: Arc<dyn GpioController> = Arc::new(drv);
+    registry::register_unique(bus.clone());
+    if registry::count() != 1 {
+        return TestResult::Fail("Intel PCH community didn't land in registry");
+    }
+    let found = registry::find("\\_SB.PC00.GPI3.C2");
+    if found.is_none() {
+        return TestResult::Fail("Intel PCH community not findable by name");
+    }
+    // Type-erase + assert it implements GpioController as expected.
+    if let Some(c) = found {
+        if c.pin_count() != 80 {
+            return TestResult::Fail("registry lookup returned wrong controller");
+        }
+    }
+    registry::__reset_for_test();
+    let _ = IntelPchGpio::new(
+        "smoke".to_string(),
+        0,
+        PhysAddr::new(0),
+        0,
+        None,
+        None,
+        0,
+        false,
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_intel_pch_registers_into_shared_registry);

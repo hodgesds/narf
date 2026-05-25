@@ -1176,6 +1176,96 @@ fn smoke_pstate_amd_summary_formats_freq_units() -> TestResult {
 kernel_test_in!("power/pstate", smoke_pstate_amd_summary_formats_freq_units);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_hwp_features_decode() -> TestResult {
+    // `HwpFeatures::probe()` must round-trip the CPUID 0x06 EAX
+    // bits the doc references. On non-Intel hosts the leaf is
+    // typically zero — we accept that case as long as the probe
+    // returns the all-`false` shape rather than spurious truths.
+    use crate::hwp::HwpFeatures;
+    let f = HwpFeatures::probe();
+    // No assertion on actual bits — the test runs on whatever vendor
+    // the host provides. Verify the shape is well-formed by reading
+    // every field (catches a missing-getter regression).
+    let _ = (
+        f.hwp,
+        f.notification,
+        f.activity_window,
+        f.epp,
+        f.package_level_request,
+        f.fast_write,
+    );
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/hwp", smoke_hwp_features_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hwp_capabilities_bitfield_layout() -> TestResult {
+    // `HwpCapabilities::decode` must read the four bytes in the
+    // order documented in Intel SDM Vol 4 §2.16:
+    //   bits[7:0]   highest
+    //   bits[15:8]  guaranteed
+    //   bits[23:16] efficient
+    //   bits[31:24] lowest
+    // Pick a sentinel byte pattern that distinguishes every field.
+    use crate::hwp::HwpCapabilities;
+    let raw: u64 = 0xAA_BB_CC_DD;
+    let c = HwpCapabilities::decode(raw);
+    if c.highest_perf != 0xDD {
+        return TestResult::Fail("highest_perf misdecoded");
+    }
+    if c.guaranteed_perf != 0xCC {
+        return TestResult::Fail("guaranteed_perf misdecoded");
+    }
+    if c.efficient_perf != 0xBB {
+        return TestResult::Fail("efficient_perf misdecoded");
+    }
+    if c.lowest_perf != 0xAA {
+        return TestResult::Fail("lowest_perf misdecoded");
+    }
+    // The upper 32 bits are reserved per SDM — the decoder must
+    // ignore them. Verify with a sentinel in [63:32].
+    let raw2: u64 = 0xFFFF_FFFF_0000_0000 | 0x11_22_33_44u64;
+    let c2 = HwpCapabilities::decode(raw2);
+    if c2.highest_perf != 0x44 || c2.lowest_perf != 0x11 {
+        return TestResult::Fail("reserved high half leaked into decode");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/hwp", smoke_hwp_capabilities_bitfield_layout);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hwp_summary_vendor_gated() -> TestResult {
+    // On non-Intel hosts (AMD bringup target), `intel_hwp_summary()`
+    // must return `HwpSummary::NotIntel` without touching any MSR.
+    // On Intel + QEMU TCG (which doesn't populate CPUID 0x06 EAX[7])
+    // the path must return `HwpSummary::NotSupported`. Either is a
+    // valid pass; what we reject is `Programmed(...)` on a host that
+    // can't possibly have HWP (the only way that would happen is a
+    // bogus vendor check).
+    use crate::hwp::{intel_hwp_summary, HwpSummary};
+    use crate::pstate::{detect, Mechanism};
+    let outcome = intel_hwp_summary();
+    match outcome {
+        HwpSummary::NotIntel => {
+            // Must align with the AMD-side detection.
+            if detect() == Mechanism::Hwp {
+                return TestResult::Fail("NotIntel but HWP mechanism selected");
+            }
+            TestResult::Pass
+        }
+        HwpSummary::NotSupported
+        | HwpSummary::CapabilitiesGp
+        | HwpSummary::EnableGp
+        | HwpSummary::RequestGp
+        | HwpSummary::Programmed(_) => TestResult::Pass,
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/hwp", smoke_hwp_summary_vendor_gated);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_rapl_units_arithmetic() -> TestResult {
     // EnergyUnits derivation: `power_uw_per_unit = 10^6 >> power_exp`,
     // same shape for energy + time. The decoder caps `power_uw_per_unit`

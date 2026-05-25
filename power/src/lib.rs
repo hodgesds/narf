@@ -46,6 +46,8 @@ pub mod watchdog;
 pub mod cppc;
 
 #[cfg(target_arch = "x86_64")]
+pub mod hwp;
+#[cfg(target_arch = "x86_64")]
 pub mod idle;
 #[cfg(target_arch = "x86_64")]
 pub mod pstate;
@@ -188,6 +190,28 @@ pub fn register_initcalls() {
         };
         let _ = writeln!(narf_console::Writer, "  cpu-pstate: {}", line);
         set_cpu_status_line(line);
+
+        // Per-vendor Stage-0 summary lines. Both calls are
+        // vendor-gated internally, so only one of them produces a
+        // log line; the other is a no-op. The AMD path is read-only
+        // (it walks `MSR_AMD_PSTATE_DEF_0..7` and formats a freq
+        // string) and is already covered by `cppc::init_or_gp` /
+        // `pstate::init_or_gp` for the actual MSR programming.
+        // The Intel path is read+write: caps read, `IA32_PM_ENABLE`
+        // set, `IA32_HWP_REQUEST` programmed with (min=lowest,
+        // max=highest, desired=0, EPP=balanced). `IA32_PM_ENABLE`
+        // is sticky, so this is idempotent on the second initcall
+        // run that happens under the kernel-test harness.
+        let _ = hwp::intel_hwp_summary();
+        let amd = pstate::amd_pstate_summary();
+        if amd.defined != 0 || !amd.formatted_freqs.is_empty() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  amd-pstate: {} slots, {}",
+                amd.defined, amd.formatted_freqs,
+            );
+        }
+
         if matches!(outcome, cppc::InitOutcome::NotSupported)
             && matches!(pstate::detect(), pstate::Mechanism::None)
         {

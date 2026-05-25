@@ -1,13 +1,20 @@
-//! GPIO controller trait + AMD FCH GPIO driver.
+//! GPIO controller trait + AMD FCH / Intel PCH GPIO drivers.
 //!
-//! Two layers:
-//! - `GpioController` trait + name-keyed registry of controllers,
-//!   so a HID-over-I2C client (or any other driver decoded from
+//! Layered design:
+//! - `GpioController` trait + name-keyed registry of controllers, so
+//!   a HID-over-I2C client (or any other driver decoded from
 //!   `_CRS::GpioInt`) can locate the parent GPIO block by ACPI path.
-//! - `amd_fch` — AMD FCH GPIO controller driver. Per pin: 32-bit
-//!   register at `pin * 4`, interrupt status / enable / level /
-//!   polarity all in that single dword. The whole block shares one
-//!   GSI, so the ISR scans pin status registers and dispatches.
+//! - `amd_fch` — AMD FCH GPIO controller driver (Zen1-Zen4 laptops).
+//!   Per pin: 32-bit register at `pin * 4`; interrupt status /
+//!   enable / level / polarity all in that single dword. The whole
+//!   block shares one GSI; the ISR scans pin status registers and
+//!   dispatches.
+//! - `intel_pch` — Intel PCH GPIO Stage-0 scaffold (Tiger Lake +
+//!   Alder Lake + Raptor Lake + Meteor Lake). Discovery only:
+//!   decodes `_CRS` `Memory32Fixed` per community, reads `REVID` /
+//!   `PADBAR`, registers the controller into the shared registry
+//!   so i2c-hid-bind can resolve a `GpioInt::resource_source`
+//!   referring to a PCH GPIO block. Pin programming is Stage-1.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -16,6 +23,7 @@
 extern crate alloc;
 
 pub mod amd_fch;
+pub mod intel_pch;
 pub mod registry;
 
 use alloc::vec::Vec;
@@ -104,15 +112,29 @@ pub trait GpioController: Send + Sync + core::fmt::Debug {
 }
 
 /// Register all known GPIO controllers. Stage::Device entry — runs
-/// once during boot. `NotPresent` on systems without an AMD FCH
-/// (most QEMU configs); the only consumer of GPIO controllers
-/// currently is the i2c-hid driver, which handles the absence
-/// gracefully via the `_CRS::GpioInt::resource_source` lookup
-/// returning None.
+/// once during boot. `NotPresent` on systems without either an AMD
+/// FCH or an Intel PCH GPIO block (most QEMU TCG configs); the
+/// only consumer of GPIO controllers today is the i2c-hid driver,
+/// which handles the absence gracefully via the `_CRS::GpioInt::
+/// resource_source` lookup returning `None`.
+///
+/// The two probes run as separate initcalls so a no-match in one
+/// doesn't gate the other — the Stage-1 bring-up target group has
+/// both AMD Zen2 / Zen4 laptops (FCH path) and Intel laptops (PCH
+/// path). Either initcall registering at least one controller is
+/// enough to let i2c-hid-bind resolve `GpioInt::resource_source`.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "amd-fch-gpio", || {
         let n = amd_fch::probe_all();
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
+    narf_init::register(Stage::Device, "intel-pch-gpio", || {
+        let n = intel_pch::probe_all();
         if n == 0 {
             InitResult::NotPresent
         } else {
