@@ -327,19 +327,29 @@ const EXTCNF_CTRL_SWFLAG: u32 = 1 << 5;
 // IPCNFG = 0x00E38; bit 14 = `EEE_1G_AN`, bit 12 = `EEE_100M_AN`
 // per Linux `defines.h`.
 /// `E1000_IPCNFG` — In-band Configuration (PCH parts).
-const REG_IPCNFG: u64 = 0x0E38;
+pub const REG_IPCNFG: u64 = 0x0E38;
 /// `E1000_IPCNFG_EEE_1G_AN` — advertise 1000BT EEE.
-const IPCNFG_EEE_1G_AN: u32 = 1 << 14;
+pub const IPCNFG_EEE_1G_AN: u32 = 1 << 14;
 /// `E1000_IPCNFG_EEE_100M_AN` — advertise 100BT EEE.
-const IPCNFG_EEE_100M_AN: u32 = 1 << 12;
+pub const IPCNFG_EEE_100M_AN: u32 = 1 << 12;
 /// `E1000_EEER` — Energy Efficient Ethernet Register (PCH parts).
-const REG_EEER: u64 = 0x0E30;
+pub const REG_EEER: u64 = 0x0E30;
 /// `E1000_EEER_TX_LPI_EN` — enable TX LPI (low-power idle).
-const EEER_TX_LPI_EN: u32 = 1 << 16;
+pub const EEER_TX_LPI_EN: u32 = 1 << 16;
 /// `E1000_EEER_RX_LPI_EN` — enable RX LPI.
-const EEER_RX_LPI_EN: u32 = 1 << 17;
+pub const EEER_RX_LPI_EN: u32 = 1 << 17;
 /// `E1000_EEER_LPI_FC` — LPI frame counter.
-const EEER_LPI_FC: u32 = 1 << 18;
+pub const EEER_LPI_FC: u32 = 1 << 18;
+
+/// Mask of IPCNFG bits cleared by `disable_eee_pchlan` — the 1G/100M
+/// EEE-advertise bits. Exposed so smokes can verify the workaround
+/// matches Linux's bit layout (`drivers/net/ethernet/intel/e1000e/
+/// defines.h`).
+pub const IPCNFG_EEE_AN_MASK: u32 = IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN;
+/// Mask of EEER bits cleared by `disable_eee_pchlan` — disables TX
+/// LPI, RX LPI, and the LPI frame counter so the PHY doesn't enter
+/// low-power-idle while the link is still negotiating.
+pub const EEER_LPI_MASK: u32 = EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC;
 
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
@@ -615,15 +625,9 @@ fn disable_eee_pchlan(mmio: &MmioRegion) {
     // on every PCH part.
     unsafe {
         let ipcnfg = mmio.read32(REG_IPCNFG);
-        mmio.write32(
-            REG_IPCNFG,
-            ipcnfg & !(IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN),
-        );
+        mmio.write32(REG_IPCNFG, ipcnfg & !IPCNFG_EEE_AN_MASK);
         let eeer = mmio.read32(REG_EEER);
-        mmio.write32(
-            REG_EEER,
-            eeer & !(EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC),
-        );
+        mmio.write32(REG_EEER, eeer & !EEER_LPI_MASK);
     }
 }
 

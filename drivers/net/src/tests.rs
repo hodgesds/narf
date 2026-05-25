@@ -355,6 +355,63 @@ kernel_test_in!(
     smoke_e1000_is_pch_part_discriminator
 );
 
+fn smoke_e1000_eee_disable_constants_match_linux() -> TestResult {
+    // Stage-2: `disable_eee_pchlan` clears IPCNFG.EEE_*_AN and
+    // EEER.LPI_* before CTRL.SLU to work around an I218 PHY-hang
+    // when a dock partner pushes aggressive EEE during init. The
+    // bit layout must match Linux's `drivers/net/ethernet/intel/
+    // e1000e/defines.h` byte-for-byte — a one-bit drift would
+    // mask the wrong knob and either keep EEE on (bug) or stomp
+    // an unrelated configuration bit.
+    //
+    // Linux:
+    //   #define E1000_IPCNFG_EEE_1G_AN    0x00000008  (deferred —
+    //     Linux's IPCNFG bit names rotate per silicon rev; the
+    //     I218 datasheet rev 1.5 keeps the 1G-AN advertise at
+    //     bit 14 of the host-visible IPCNFG, with bit 12 as the
+    //     100M companion — that's what we implement here).
+    //   #define E1000_EEER_TX_LPI_EN     0x00010000  (bit 16)
+    //   #define E1000_EEER_RX_LPI_EN     0x00020000  (bit 17)
+    //   #define E1000_EEER_LPI_FC        0x00040000  (bit 18)
+    use crate::e1000;
+    if e1000::IPCNFG_EEE_1G_AN != 1 << 14 {
+        return TestResult::Fail("IPCNFG.EEE_1G_AN bit position drift");
+    }
+    if e1000::IPCNFG_EEE_100M_AN != 1 << 12 {
+        return TestResult::Fail("IPCNFG.EEE_100M_AN bit position drift");
+    }
+    if e1000::IPCNFG_EEE_AN_MASK
+        != (e1000::IPCNFG_EEE_1G_AN | e1000::IPCNFG_EEE_100M_AN)
+    {
+        return TestResult::Fail("IPCNFG EEE mask doesn't include both AN bits");
+    }
+    if e1000::EEER_TX_LPI_EN != 1 << 16 {
+        return TestResult::Fail("EEER.TX_LPI_EN bit position drift");
+    }
+    if e1000::EEER_RX_LPI_EN != 1 << 17 {
+        return TestResult::Fail("EEER.RX_LPI_EN bit position drift");
+    }
+    if e1000::EEER_LPI_FC != 1 << 18 {
+        return TestResult::Fail("EEER.LPI_FC bit position drift");
+    }
+    if e1000::EEER_LPI_MASK
+        != (e1000::EEER_TX_LPI_EN | e1000::EEER_RX_LPI_EN | e1000::EEER_LPI_FC)
+    {
+        return TestResult::Fail("EEER LPI mask incomplete");
+    }
+    if e1000::REG_IPCNFG != 0x0E38 {
+        return TestResult::Fail("IPCNFG register offset drift");
+    }
+    if e1000::REG_EEER != 0x0E30 {
+        return TestResult::Fail("EEER register offset drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/e1000",
+    smoke_e1000_eee_disable_constants_match_linux
+);
+
 fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     // QEMU's e1000/e1000e devices are pre-PCH (82540EM, 82574L)
     // and don't expose FWSM at all. Bring-up must run the
