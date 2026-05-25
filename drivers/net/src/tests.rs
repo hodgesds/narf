@@ -245,6 +245,66 @@ fn smoke_igc_pci_match_table() -> TestResult {
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_pci_match_table);
 
+fn smoke_igc_msix_constants_match_linux() -> TestResult {
+    // Stage-2: single-vector MSI-X for igc mirrors what `igc_configure_
+    // msix` does in Linux's `drivers/net/ethernet/intel/igc/igc_main.c`
+    // — program GPIE so single-vector delivery + cause encoding agree,
+    // then enable the standard RX/TX/LSC mask in IMS. A bit-position
+    // drift between our constants and Linux's `igc_defines.h` would
+    // either silently disable IRQs (chip uses default-zero GPIE) or
+    // mis-route causes.
+    //
+    // Linux constants pinned here:
+    //   #define IGC_IMS_TXDW    0x00000001  (bit 0)
+    //   #define IGC_IMS_LSC     0x00000004  (bit 2)
+    //   #define IGC_IMS_RXDMT0  0x00000010  (bit 4)
+    //   #define IGC_IMS_RXO     0x00000040  (bit 6)
+    //   #define IGC_IMS_RXT0    0x00000080  (bit 7)
+    //   #define IGC_GPIE_NSICR  0x00000001
+    //   #define IGC_GPIE_MSIX_MODE 0x00000010
+    //   #define IGC_GPIE_EIAME  0x40000000
+    //   #define IGC_GPIE_PBA    0x80000000
+    use crate::igc;
+    if igc::IMS_TXDW != 1 << 0 {
+        return TestResult::Fail("IMS.TXDW bit position drift");
+    }
+    if igc::IMS_LSC != 1 << 2 {
+        return TestResult::Fail("IMS.LSC bit position drift");
+    }
+    if igc::IMS_RXDMT0 != 1 << 4 {
+        return TestResult::Fail("IMS.RXDMT0 bit position drift");
+    }
+    if igc::IMS_RXO != 1 << 6 {
+        return TestResult::Fail("IMS.RXO bit position drift");
+    }
+    if igc::IMS_RXT0 != 1 << 7 {
+        return TestResult::Fail("IMS.RXT0 bit position drift");
+    }
+    if igc::IMS_DEFAULT & igc::IMS_RXT0 == 0 {
+        return TestResult::Fail("default mask must include RXT0");
+    }
+    if igc::IMS_DEFAULT & igc::IMS_TXDW == 0 {
+        return TestResult::Fail("default mask must include TXDW");
+    }
+    if igc::IMS_DEFAULT & igc::IMS_LSC == 0 {
+        return TestResult::Fail("default mask must include LSC");
+    }
+    if igc::GPIE_NSICR != 1 << 0 {
+        return TestResult::Fail("GPIE.NSICR bit drift");
+    }
+    if igc::GPIE_MULTIPLE_MSIX != 1 << 4 {
+        return TestResult::Fail("GPIE.MULTIPLE_MSIX bit drift");
+    }
+    if igc::GPIE_EIAME != 1 << 30 {
+        return TestResult::Fail("GPIE.EIAME bit drift");
+    }
+    if igc::GPIE_PBA != 1 << 31 {
+        return TestResult::Fail("GPIE.PBA bit drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_msix_constants_match_linux);
+
 fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // Structural smoke: register the e1000 driver and assert every
     // ID in `SUPPORTED_DEVICE_IDS` is present in the bus's match

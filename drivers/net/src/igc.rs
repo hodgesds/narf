@@ -34,9 +34,9 @@
 //! | 0x5400  | RAL0 | Receive Address Low                  |
 //! | 0x5404  | RAH0 | Receive Address High + Address Valid |
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
@@ -92,7 +92,20 @@ pub const IGC_I221_V: u16 = 0x125E;
 
 const REG_CTRL: u64 = 0x0000;
 const REG_STATUS: u64 = 0x0008;
+/// IGC ICR — Interrupt Cause Read. Reading clears all pending cause
+/// bits (Linux `drivers/net/ethernet/intel/igc/igc_defines.h::IGC_ICR`).
+const REG_ICR: u64 = 0x00C0;
 const REG_IMS: u64 = 0x00D0;
+/// IGC IMC — Interrupt Mask Clear (write-1-to-clear).
+const REG_IMC: u64 = 0x00D8;
+/// IGC GPIE — General Purpose Interrupt Enable. Bit 4 (NSICR) +
+/// bit 31 (PBA_support) tell the chip to deliver IRQs as MSI-X
+/// rather than legacy IMS (Linux `igc_defines.h::IGC_GPIE`).
+const REG_GPIE: u64 = 0x1514;
+/// IGC IVAR_MISC — table mapping "other" causes to MSI-X vector
+/// number (Linux: `IGC_IVAR_MISC`). We pin the "other" causes to
+/// vector index 0 in single-vector MSI-X mode.
+const REG_IVAR_MISC: u64 = 0x1740;
 const REG_RCTL: u64 = 0x0100;
 const REG_TCTL: u64 = 0x0400;
 const REG_RDBAL: u64 = 0x2800;
@@ -111,6 +124,28 @@ const REG_RAH0: u64 = 0x5404;
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
+
+// IMS/ICR cause bits. Linux: `IGC_IMS_TXDW`, `IGC_IMS_LSC`,
+// `IGC_IMS_RXO`, `IGC_IMS_RXDMT0`, `IGC_IMS_RXT0` from
+// `drivers/net/ethernet/intel/igc/igc_defines.h`. Same bit positions
+// as the legacy e1000 mask — igc kept the legacy IMS register
+// layout for non-MSI-X delivery and single-vector MSI-X uses the
+// same cause encoding.
+pub const IMS_TXDW: u32 = 1 << 0;
+pub const IMS_LSC: u32 = 1 << 2;
+pub const IMS_RXO: u32 = 1 << 6;
+pub const IMS_RXDMT0: u32 = 1 << 4;
+pub const IMS_RXT0: u32 = 1 << 7;
+pub const IMS_DEFAULT: u32 = IMS_TXDW | IMS_LSC | IMS_RXO | IMS_RXDMT0 | IMS_RXT0;
+
+// GPIE bits. Single-vector MSI-X needs GPIE.NSICR set so the chip
+// stops auto-clearing the entire ICR on read (we want the "extended"
+// MSI-X cause encoding) and GPIE.MULTIPLE_MSIX set so the chip
+// honours per-cause IVAR routing.
+pub const GPIE_NSICR: u32 = 1 << 0;
+pub const GPIE_MULTIPLE_MSIX: u32 = 1 << 4;
+pub const GPIE_EIAME: u32 = 1 << 30;
+pub const GPIE_PBA: u32 = 1 << 31;
 
 // TCTL bits.
 const TCTL_EN: u32 = 1 << 1;
@@ -138,6 +173,35 @@ pub enum IgcError {
     BarMapFailed,
     ResetTimeout,
     QueueTooSmall,
+}
+
+/// MMIO base of the IRQ-attached IGC, shared with the static ISR so
+/// it can read ICR (read-to-clear per `IGC_ICR` docs) and acknowledge
+/// the device. 0 = no controller bound (handler short-circuits).
+///
+/// Single-controller invariant matches the rest of the driver:
+/// `CONTROLLER` is a single `Option<Igc>` slot below.
+static ISR_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Sync ISR: read ICR to acknowledge the device, then return. The
+/// dispatch layer (`narf_interrupts::dispatch::on_irq`) bumps the
+/// per-vector fire-count and wakes any waiter. We keep the polled
+/// `tx`/`rx` paths regardless so bring-up tests work in the no-IRQ
+/// environment.
+///
+/// MSI-X is edge-triggered and the read of ICR is a no-op for the
+/// edge case, but it's safe to issue and matches what Linux does in
+/// `igc_intr` regardless of MSI-X vs legacy delivery.
+fn igc_isr() {
+    let base = ISR_MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: `base` is the device's BAR0 phys, identity-mapped at
+    // bring-up; ICR (offset 0xC0) is inside the IGC register window.
+    unsafe {
+        let _icr = narf_arch::mmio::read32(base + REG_ICR);
+    }
 }
 
 #[repr(C)]
@@ -173,6 +237,13 @@ pub struct Igc {
     tx_tail: IrqSafeSpinLock<u16>,
     rx_head: IrqSafeSpinLock<u16>,
     pub ready: bool,
+    /// MSI-X table mapping when MSI-X is enabled. Holds the table
+    /// alive for the device lifetime; dropping it would unmap the
+    /// MSI-X BAR.
+    _msix: Option<MsixTable>,
+    /// IDT vector bound to the device's MSI-X table[0]. `None`
+    /// means we fell back to polled-only completion.
+    pub irq_vector: Option<u8>,
 }
 
 impl core::fmt::Debug for Igc {
@@ -180,6 +251,7 @@ impl core::fmt::Debug for Igc {
         f.debug_struct("Igc")
             .field("mac", &self.mac)
             .field("ready", &self.ready)
+            .field("irq_vector", &self.irq_vector)
             .finish_non_exhaustive()
     }
 }
@@ -191,7 +263,7 @@ impl Igc {
     /// Caller owns BAR0 exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, IgcError> {
         // SAFETY: caller-asserted.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IgcError::BarMapFailed)?;
@@ -217,10 +289,15 @@ impl Igc {
             return Err(IgcError::ResetTimeout);
         }
 
-        // 2. Clear interrupts + mask everything off (we're polling).
+        // 2. Mask all interrupt causes during bring-up. IMC is
+        //    write-1-to-clear (Linux: IGC_IMC); writing all-ones
+        //    leaves IMS = 0 and prevents stale IRQs while we program
+        //    the rings. Re-enabled in step 8 once MSI-X is bound.
         // SAFETY: same.
         unsafe {
-            mmio.write32(REG_IMS, 0);
+            mmio.write32(REG_IMC, !0u32);
+            // Clear any pending causes by reading ICR (read-to-clear).
+            let _ = mmio.read32(REG_ICR);
         }
 
         // 3. Set link up.
@@ -296,6 +373,50 @@ impl Igc {
             mmio.write32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2K);
         }
 
+        // 8. Try MSI-X (single vector covering all causes). Linux's
+        //    `igc_request_irq` uses MSI-X with separate per-queue
+        //    vectors; we collapse to one vector at Stage-2 (mirrors
+        //    e1000.rs's approach). Polling stays as the fallback so
+        //    bring-up tests work without an IRQ vector.
+        let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
+            Ok((tbl, v)) => (Some(tbl), Some(v)),
+            Err(_) => (None, None),
+        };
+
+        // Publish MMIO base for the static ISR before installing the
+        // handler so an early MSI-X delivery can't find a zero base.
+        if irq_vector.is_some() {
+            ISR_MMIO_BASE.store(mmio.phys.raw(), Ordering::Release);
+        }
+        if let Some(v) = irq_vector {
+            narf_interrupts::install_handler(v, igc_isr);
+        }
+
+        // 9. Program GPIE for single-vector MSI-X delivery. Linux:
+        //    `igc_configure_msix` — sets GPIE.NSICR + MULTIPLE_MSIX +
+        //    EIAME + PBA so MSI-X delivery + ICR semantics agree.
+        //    Then unmask the standard RX/TX/LSC/RXO cause set in IMS.
+        //    Skip if no IRQ vector was bound — keep "all masked" so
+        //    polled callers don't see spurious cause bits.
+        if irq_vector.is_some() {
+            // SAFETY: identity-mapped MMIO.
+            unsafe {
+                mmio.write32(
+                    REG_GPIE,
+                    GPIE_NSICR | GPIE_MULTIPLE_MSIX | GPIE_EIAME | GPIE_PBA,
+                );
+                // Route the "other" causes (link-status etc) to MSI-X
+                // table[0]. Single-vector mode pins everything at
+                // index 0. IVAR_MISC bit 7 is the valid bit for the
+                // low byte; vector index lives in bits[6:0].
+                mmio.write32(REG_IVAR_MISC, 0x0000_0080);
+                mmio.write32(REG_IMS, IMS_DEFAULT);
+            }
+            // INTX_DISABLE is already set by the probe path (igc has
+            // no INTx fallback wired — we depend on MSI-X or
+            // polling). No PCI Command write needed here.
+        }
+
         Ok(Self {
             mmio,
             mac,
@@ -306,7 +427,38 @@ impl Igc {
             tx_tail: IrqSafeSpinLock::new(0),
             rx_head: IrqSafeSpinLock::new(0),
             ready: true,
+            _msix: msix,
+            irq_vector,
         })
+    }
+
+    /// Walk the controller's MSI-X capability, allocate an IDT vector
+    /// + table slot, program slot 0 to deliver to BSP, and flip the
+    /// global MSI-X enable. Returns `(table, vector)` on success.
+    /// Failure leaves the device in polled-only mode (we don't have
+    /// an INTx fallback for igc — Linux's igc driver requires MSI-X
+    /// in modern kernels too).
+    ///
+    /// Linux equivalent: `igc_request_irq` →
+    /// `pci_enable_msix_range(adapter->pdev, ..., msix_vectors=N)`
+    /// (`drivers/net/ethernet/intel/igc/igc_main.c`).
+    fn try_enable_msix(
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<(MsixTable, u8), IgcError> {
+        let mut msix = enable_msix(cap, device).map_err(|_| IgcError::BarMapFailed)?;
+        let v = narf_interrupts::vector::alloc().map_err(|_| IgcError::BarMapFailed)?;
+        let _ = msix.alloc_vector().ok_or(IgcError::BarMapFailed)?;
+        // Deliver to APIC id 0 (BSP). On aarch64 this routes through
+        // the GIC ITS doorbell with EventID=v.
+        // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
+        // table (no other writer); we issue this write before the
+        // global enable so the device can't fire stale data.
+        let _ = unsafe { msix.program_vector(0, 0, v) }
+            .map_err(|_| IgcError::BarMapFailed)?;
+        // SAFETY: cfg-space write to a known cap-list offset.
+        let _ = unsafe { msix.enable() }.map_err(|_| IgcError::BarMapFailed)?;
+        Ok((msix, v))
     }
 
     pub fn mac(&self) -> [u8; 6] {
