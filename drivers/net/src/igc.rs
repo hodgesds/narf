@@ -120,6 +120,21 @@ const REG_TDH: u64 = 0x3810;
 const REG_TDT: u64 = 0x3818;
 const REG_RAL0: u64 = 0x5400;
 const REG_RAH0: u64 = 0x5404;
+/// IGC SRRCTL — Split-and-Replication Receive Control (per-queue).
+/// Linux: `IGC_SRRCTL(reg_idx)` = 0xC00C + 0x40 * reg_idx. The
+/// register controls the per-queue RX buffer size and descriptor
+/// format. We program queue 0 (the only one we use at Stage-2).
+const REG_SRRCTL_Q0: u64 = 0xC00C;
+/// `IGC_SRRCTL_BSIZEPKT_SHIFT` (10) — buffer-size field is in
+/// 1 KiB units, so 2 KiB → 2.
+const SRRCTL_BSIZEPKT_SHIFT: u32 = 10;
+/// `IGC_SRRCTL_BSIZEPKT_MASK` = bits[5:0]. 2 KiB → 2.
+const SRRCTL_BSIZEPKT_MASK: u32 = 0x3F;
+/// `IGC_SRRCTL_DESCTYPE_MASK` = bits[27:25].
+const SRRCTL_DESCTYPE_MASK: u32 = 0x0E00_0000;
+/// `IGC_SRRCTL_DESCTYPE_ADV_ONEBUF` (1 << 25) — advanced one-buffer
+/// descriptor format. Linux uses this for igc + igb.
+pub const SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 1 << 25;
 
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
@@ -216,16 +231,62 @@ struct LegacyTxDesc {
     special: u16,
 }
 
-#[repr(C)]
+/// Advanced RX descriptor — "read" form. This is what the driver
+/// writes to hand a buffer to the chip. The chip later overwrites
+/// the same 16-byte slot with the "write-back" form on completion.
+///
+/// Layout (Linux `union igc_adv_rx_desc::read`): packet buffer
+/// address followed by header buffer address. In single-buffer
+/// mode (`SRRCTL.DESCTYPE = ADV_ONEBUF`) `hdr_addr` is unused —
+/// must be zero so the chip's DD/EOP bits in the write-back form
+/// are visible against a known-zero baseline. The chip treats
+/// `hdr_addr` bit 0 (DD) as the "I own this descriptor" flag on
+/// rearm — driver writes 0 to hand it over.
+#[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-struct LegacyRxDesc {
-    addr: u64,
-    length: u16,
-    checksum: u16,
-    status: u8,
-    errors: u8,
-    special: u16,
+struct AdvRxDescRead {
+    /// Packet buffer DMA address.
+    pkt_addr: u64,
+    /// Header buffer DMA address — zero in single-buffer mode.
+    hdr_addr: u64,
 }
+
+/// Advanced RX descriptor — "write-back" form. The chip overwrites
+/// the slot with this on completion. Same 16 bytes as `Read`; the
+/// driver reads `status_error.DD` to know a frame arrived.
+///
+/// Layout (Linux `union igc_adv_rx_desc::wb`):
+///   lower.data       = RSS hash (when RSS is enabled) or
+///                      misc lower 32 (incl. packet-type when RSS off)
+///   lower.hi_dword   = ext-status + reserved
+///   upper.status_err = DD/EOP/checksum-ok in the low 20 bits,
+///                      VLAN tag in the upper 12 bits (this driver
+///                      ignores VLAN).
+///   upper.length     = frame length in bytes (includes CRC if
+///                      RCTL.SECRC is off).
+///   upper.vlan       = VLAN tag (untouched in our config).
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+struct AdvRxDescWb {
+    /// Lower 64 bits — RSS hash + ext-status.
+    lower: u64,
+    /// Status/error field (bits 0..19), VLAN (bits 20..31).
+    status_error: u32,
+    /// Frame length.
+    length: u16,
+    /// VLAN tag (ignored by this driver).
+    vlan: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<AdvRxDescRead>() == 16);
+const _: () = assert!(core::mem::size_of::<AdvRxDescWb>() == 16);
+
+/// Bit 0 of `AdvRxDescWb::status_error` — Descriptor Done. Set by
+/// the chip when the descriptor has been consumed and the buffer
+/// contains a frame.
+const ADV_RXD_STAT_DD: u32 = 1 << 0;
+/// Bit 1 — End of Packet.
+const ADV_RXD_STAT_EOP: u32 = 1 << 1;
 
 pub struct Igc {
     mmio: MmioRegion,
@@ -351,17 +412,29 @@ impl Igc {
             mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
         }
 
-        // 7. Initialise RX descriptors with our pre-allocated frames.
+        // 7. Initialise RX descriptors using the *advanced* descriptor
+        //    format (Linux `union igc_adv_rx_desc`). The driver hands
+        //    the chip a 16-byte "read" form (pkt_addr + hdr_addr); the
+        //    chip writes back the "wb" form (status/length) on
+        //    completion. Same 16 bytes either way — what changes is
+        //    the field layout. The chip's interpretation is selected
+        //    by SRRCTL.DESCTYPE = ADV_ONEBUF, programmed below.
+        //
+        //    Hand each descriptor a packet buffer in the read form.
+        //    hdr_addr = 0 because we run with single-buffer mode (no
+        //    header split). The chip's first write-back will clear
+        //    `pkt_addr` and overwrite the slot with the wb-form
+        //    contents.
         let rx_phys = rx_ring_buf.phys_addr().raw();
         // SAFETY: identity-mapped DMA, freshly zeroed.
         unsafe {
             for i in 0..RX_RING_LEN {
-                let desc = (rx_phys + (i * 16) as u64) as *mut LegacyRxDesc;
+                let desc = (rx_phys + (i * 16) as u64) as *mut AdvRxDescRead;
                 core::ptr::write_volatile(
                     desc,
-                    LegacyRxDesc {
-                        addr: rx_buf_pool[i].phys_addr().raw(),
-                        ..Default::default()
+                    AdvRxDescRead {
+                        pkt_addr: rx_buf_pool[i].phys_addr().raw(),
+                        hdr_addr: 0,
                     },
                 );
             }
@@ -370,6 +443,16 @@ impl Igc {
             mmio.write32(REG_RDLEN, (RX_RING_LEN * 16) as u32);
             mmio.write32(REG_RDH, 0);
             mmio.write32(REG_RDT, (RX_RING_LEN - 1) as u32);
+
+            // SRRCTL — per-queue: buffer-size = 2 KiB (2 << SHIFT),
+            // descriptor type = ADV_ONEBUF. Linux `igc_setup_srrctl`
+            // does this for each queue; we only program queue 0.
+            let mut srrctl = mmio.read32(REG_SRRCTL_Q0);
+            srrctl &= !(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
+            srrctl |= ((FRAME_SIZE as u32) >> SRRCTL_BSIZEPKT_SHIFT) & SRRCTL_BSIZEPKT_MASK;
+            srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
+            mmio.write32(REG_SRRCTL_Q0, srrctl);
+
             mmio.write32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2K);
         }
 
@@ -521,41 +604,56 @@ impl Igc {
         Ok(())
     }
 
-    /// Receive a single frame; returns the byte count copied into
-    /// `out`, or 0 if no frame is currently available.
+    /// Receive a single frame using the advanced RX descriptor
+    /// format; returns the byte count copied into `out`, or 0 if no
+    /// frame is currently available.
+    ///
+    /// The chip writes back the slot in `AdvRxDescWb` form. The DD
+    /// bit lives at `status_error & 1` — same convention as the
+    /// legacy layout, but the field is now a 32-bit `status_error`
+    /// instead of an 8-bit `status`. The length lives at offset 12
+    /// inside the descriptor (instead of offset 8 in the legacy
+    /// layout).
+    ///
+    /// After consuming the frame we re-hand the slot to the chip in
+    /// the read form (zeroing hdr_addr so DD/EOP read clean on the
+    /// next write-back).
     pub fn rx(&self, out: &mut [u8]) -> usize {
         let mut head = self.rx_head.lock();
         let idx = *head as usize;
         let ring_phys = self.rx_ring_buf.phys_addr().raw();
-        let desc_ptr = (ring_phys + (idx * 16) as u64) as *mut LegacyRxDesc;
-        // SAFETY: identity-mapped DMA.
+        let desc_ptr = (ring_phys + (idx * 16) as u64) as *mut AdvRxDescWb;
+        // SAFETY: identity-mapped DMA; idx < RX_RING_LEN.
         let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
-        // RX status DD bit (bit 0). Vendor docs reuse the e1000
-        // convention.
-        if desc.status & 0x01 == 0 {
+        if desc.status_error & ADV_RXD_STAT_DD == 0 {
             return 0;
         }
-        let len = (desc.length as usize).min(out.len());
+        let len = (desc.length as usize).min(out.len()).min(FRAME_SIZE);
         let buf_phys = self.rx_buf_pool[idx].phys_addr().raw();
         // SAFETY: identity-mapped DMA.
         for i in 0..len {
             out[i] = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
-        // Refill descriptor: clear status + length + bump tail.
-        let new_desc = LegacyRxDesc {
-            addr: buf_phys,
-            ..Default::default()
+        let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
+        // Refill: write the slot in the read form so the chip can
+        // re-use it. `hdr_addr = 0` clears the wb-form DD bit since
+        // it overlays the same 64 bits.
+        let read_form = AdvRxDescRead {
+            pkt_addr: buf_phys,
+            hdr_addr: 0,
         };
-        // SAFETY: identity-mapped DMA.
+        // SAFETY: identity-mapped DMA; AdvRxDescRead is the same 16
+        // bytes as AdvRxDescWb (the chip selects interpretation via
+        // SRRCTL.DESCTYPE).
         unsafe {
-            core::ptr::write_volatile(desc_ptr, new_desc);
+            core::ptr::write_volatile(desc_ptr as *mut AdvRxDescRead, read_form);
         }
         let next = ((idx + 1) % RX_RING_LEN) as u16;
         *head = next;
         compiler_fence(Ordering::SeqCst);
-        // SAFETY: same.
+        // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write32(REG_RDT, ((idx) % RX_RING_LEN) as u32);
+            self.mmio.write32(REG_RDT, (idx % RX_RING_LEN) as u32);
         }
         len
     }

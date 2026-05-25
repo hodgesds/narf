@@ -305,6 +305,38 @@ fn smoke_igc_msix_constants_match_linux() -> TestResult {
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_msix_constants_match_linux);
 
+fn smoke_igc_advanced_rx_descriptor_layout() -> TestResult {
+    // Stage-2: igc switched to advanced RX descriptor format
+    // (Linux `union igc_adv_rx_desc`). Same 16-byte slot; field
+    // layout differs from the legacy descriptor — `status_error`
+    // moves to offset 8 (was offset 12 in the legacy `status` byte),
+    // `length` moves to offset 12 (was offset 8 in the legacy
+    // `length` u16).
+    //
+    // The chip-driver contract that gets us into trouble if it
+    // drifts:
+    //   - SRRCTL.DESCTYPE = ADV_ONEBUF (1 << 25) — selects the
+    //     advanced descriptor format on the chip side. A driver
+    //     parsing wb-form while the chip is writing legacy-form
+    //     (or vice versa) reads garbage.
+    //   - DD bit lives at bit 0 of `status_error` (offset 8 in
+    //     the wb slot).
+    //
+    // Linux references:
+    //   #define IGC_SRRCTL_DESCTYPE_ADV_ONEBUF 0x02000000  (= 1<<25)
+    //   `union igc_adv_rx_desc::wb::upper::status_error` — bit 0 DD,
+    //     bit 1 EOP.
+    use crate::igc;
+    if igc::SRRCTL_DESCTYPE_ADV_ONEBUF != 1 << 25 {
+        return TestResult::Fail("ADV_ONEBUF must be 1<<25 per IGC datasheet §7.1.5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_advanced_rx_descriptor_layout
+);
+
 fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // Structural smoke: register the e1000 driver and assert every
     // ID in `SUPPORTED_DEVICE_IDS` is present in the bus's match
