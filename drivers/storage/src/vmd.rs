@@ -193,11 +193,12 @@ pub fn probe(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), ProbeError> {
-    // Sanity check: the match table includes a class backstop (VMD
-    // exposes class 0x010400) but the same class is also used by
-    // various ahci-RAID variants. Reject anything that isn't an
-    // Intel ID we explicitly recognise so the class backstop doesn't
-    // accidentally pick up a non-VMD RAID card.
+    // Defensive double-check: the match table only registers exact
+    // VendorDevice entries for the eight Intel VMD IDs, but a future
+    // edit might add a class backstop (VMD exposes class 0x010400
+    // which is shared by some Intel RAID controllers). Filtering
+    // again here keeps the probe behaviour stable across that kind
+    // of registry edit.
     if device.id.vendor != INTEL_VENDOR {
         return Err(ProbeError::NotForThisDriver);
     }

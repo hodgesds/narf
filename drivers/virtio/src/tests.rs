@@ -243,11 +243,43 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     // SAFETY: vtable + payload constructed above.
     let waker = unsafe { Waker::from_raw(raw) };
     let mut ctx = Context::from_waker(&waker);
+    // Install a no-op wheel arm callback IF none is set yet. In
+    // kernel-test mode `run_async_demo` isn't called, so
+    // `timer_pump::init` doesn't run → arm_callback isn't
+    // installed → SleepUntil's self-wake fallback fires on every
+    // poll (see narf_time::SleepUntil::poll). That self-wake
+    // breaks this test: the test's manual poll loop sees the
+    // self-wake-set WOKEN flag and re-polls instead of HLT'ing,
+    // so the MSI-X IRQ never gets a delivery window.
+    //
+    // The no-op callback satisfies `arm_callback_installed()`
+    // without doing anything; the wheel won't pump (no real timer
+    // backing it) but we don't need it to — the IRQ is the
+    // primary wake source, and the wheel's role here is just the
+    // 5-second safety timeout which we don't expect to expire.
+    //
+    // Skip if a real arm callback (e.g. timer_pump's wheel_arm)
+    // is already installed so we don't clobber it.
+    fn _wheel_arm_noop(_deadline_cycles: u64) {}
+    let _wheel_arm_installed_by_us =
+        if !narf_time::timer_wheel::arm_callback_installed() {
+            narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
+            true
+        } else {
+            false
+        };
     // SAFETY: enter the wait loop with IRQs DISABLED.
     unsafe {
         narf_arch::disable_interrupts();
     }
     let baseline = narf_interrupts::fire_count(v);
+    // Capture wakes_invoked baselines for every vector so we can
+    // compute deltas after the test loop. Absolute values lie
+    // across tests because prior runs leave counters non-zero.
+    let mut wakes_baseline = [0u64; 256];
+    for i in 0..256u16 {
+        wakes_baseline[i as usize] = narf_interrupts::wakes_invoked(i as u8);
+    }
     let mut fut = alloc::boxed::Box::pin(blk_pci::read_sector_irq_async(0));
     let mut polls = 0u32;
     let mut wokes = 0u32;
@@ -271,6 +303,16 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
         }
     };
     let after = narf_interrupts::fire_count(v);
+    // Restore the wheel arm-callback state — if we installed the
+    // no-op (no real callback was set), clear it now so other
+    // tests that depend on SleepUntil's self-wake fallback
+    // (`smoke_concurrency_timer_wheel_many_sleepers_fire`,
+    // `smoke_timer_pump_drives_wheel_sleep` when timer_pump
+    // isn't actually init'd) aren't affected by our temporary
+    // install.
+    if _wheel_arm_installed_by_us {
+        narf_time::timer_wheel::clear_arm_callback();
+    }
     // Branchy diagnostic sentinel: distinct fail strings let us
     // discriminate the failure mode from the test runner output.
     if result.is_none() {
@@ -278,7 +320,10 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
         // The vector whose count moved tells us which IRQ is
         // firing the test's Waker. Used to root-cause vector-
         // mismatch failures.
-        let wakes_on_v = narf_interrupts::wakes_invoked(v);
+        // Compute deltas (current - baseline). Absolute counts
+        // can be > 0 from prior tests' IRQs, which would
+        // false-positive the "wakes happened" check.
+        let wakes_on_v = narf_interrupts::wakes_invoked(v) - wakes_baseline[v as usize];
         let mut other_vec: Option<u8> = None;
         let mut other_wakes: u64 = 0;
         for candidate in 0..=255u16 {
@@ -286,7 +331,7 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
             if cv == v {
                 continue;
             }
-            let n = narf_interrupts::wakes_invoked(cv);
+            let n = narf_interrupts::wakes_invoked(cv) - wakes_baseline[cv as usize];
             if n > other_wakes {
                 other_wakes = n;
                 other_vec = Some(cv);
@@ -298,14 +343,17 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
         );
         SMOKE_VIRTIO_OTHER_WAKES.store(other_wakes as u32, core::sync::atomic::Ordering::Release);
         SMOKE_VIRTIO_V_WAKES.store(wakes_on_v as u32, core::sync::atomic::Ordering::Release);
-        return match (wokes, after > baseline) {
-            (0, false) => TestResult::Fail("future never resolved — no IRQ delivery, fire_count unchanged"),
-            (0, true) => TestResult::Fail("future never resolved — fire_count moved but waker never called"),
-            (_, false) if wakes_on_v == 0 && other_vec.is_some() => {
-                TestResult::Fail("future never resolved — Waker fired from OTHER vector (see SMOKE_VIRTIO_OTHER_VEC atom)")
-            }
-            (_, false) => TestResult::Fail("future never resolved — waker fired but fire_count unchanged (vector mismatch?)"),
-            (_, true) => TestResult::Fail("future never resolved — waker+fire_count both moved, but WaitForIrq.poll keeps returning Pending"),
+        // Branchy fail strings on the full (wokes,after>base,wakes_on_v>0,other_vec.is_some()) tuple.
+        // The test runner shows one matching string; that's enough to read
+        // off which exact failure mode we're in.
+        return match (wokes > 0, after > baseline, wakes_on_v > 0, other_vec.is_some()) {
+            (false, false, _, _) => TestResult::Fail("FAIL_A: no WOKEN ever set, fire_count unchanged"),
+            (false, true, _, _) => TestResult::Fail("FAIL_B: fire_count moved but WOKEN never set"),
+            (true, true, true, _) => TestResult::Fail("FAIL_C: WOKEN+fire_count(v)+wakes_invoked(v) all moved — WaitForIrq.poll still Pending (executor bug?)"),
+            (true, true, false, _) => TestResult::Fail("FAIL_D: WOKEN+fire_count(v) moved but wakes_invoked(v) ZERO (counter bug?)"),
+            (true, false, true, _) => TestResult::Fail("FAIL_E: WOKEN+wakes_invoked(v) moved but fire_count(v) ZERO (impossible — atomic ordering broken)"),
+            (true, false, false, true) => TestResult::Fail("FAIL_F: WOKEN+wakes_invoked(OTHER) moved, v's wakes_invoked ZERO — Waker mis-registered to wrong vector"),
+            (true, false, false, false) => TestResult::Fail("FAIL_G: WOKEN moved but no SLOTS[*].wakes_invoked counter — wake came from non-dispatch path"),
         };
     }
     match result {
@@ -410,6 +458,18 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     for i in 0..512usize {
         pattern[i] = (i as u8).wrapping_add(0x37);
     }
+    // Install no-op wheel arm callback if needed — same reasoning
+    // as smoke_virtio_blk_pci_irq_async (SleepUntil's self-wake
+    // breaks the HLT idle loop in kernel-test mode where
+    // timer_pump::init never ran).
+    fn _wheel_arm_noop(_deadline_cycles: u64) {}
+    let _wheel_arm_installed_by_us =
+        if !narf_time::timer_wheel::arm_callback_installed() {
+            narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
+            true
+        } else {
+            false
+        };
     // SAFETY: IF=0 idle pattern.
     unsafe {
         narf_arch::disable_interrupts();
@@ -420,6 +480,10 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
         &WOKEN,
     );
     let read_res = drive(blk_pci::read_sector_irq_async(1), &mut ctx, &WOKEN);
+    // Restore the wheel arm-callback state before returning.
+    if _wheel_arm_installed_by_us {
+        narf_time::timer_wheel::clear_arm_callback();
+    }
     match write_res {
         Some(Ok(())) => {}
         Some(Err(_)) => return TestResult::Fail("write_sector_irq_async returned Err"),

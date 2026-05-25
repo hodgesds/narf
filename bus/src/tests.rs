@@ -131,6 +131,108 @@ fn smoke_bus_claim_device_not_found() -> TestResult {
 }
 kernel_test_in!("bus", smoke_bus_claim_device_not_found);
 
+fn smoke_bus_append_devices_grows_registry() -> TestResult {
+    // VMD relies on append_devices: a discovered child must show
+    // up in `devices()` without clobbering anything install()'d
+    // earlier. This smoke exercises that contract with a synthetic
+    // two-step install + append.
+    use crate::registry::install;
+    use crate::{append_devices, devices, BusAddr, BusDevice, BusKind, DeviceId, PcieAddr};
+    use alloc::vec;
+    use narf_memory::PhysAddr;
+
+    let host_dev = BusDevice {
+        addr: BusAddr::Pcie(PcieAddr::new(0, 0, 1, 0)),
+        id: DeviceId {
+            vendor: 0x1234,
+            device: 0xAAAA,
+            class: 0x010400,
+        },
+        kind: BusKind::Pcie {
+            addr: PcieAddr::new(0, 0, 1, 0),
+            cfg_phys: PhysAddr::new(0xb000_1000),
+        },
+    };
+    let child_dev = BusDevice {
+        addr: BusAddr::Pcie(PcieAddr::new(0x8000, 0, 0, 0)),
+        id: DeviceId {
+            vendor: 0x144D,
+            device: 0xA80A,
+            class: 0x010802,
+        },
+        kind: BusKind::Pcie {
+            addr: PcieAddr::new(0x8000, 0, 0, 0),
+            cfg_phys: PhysAddr::new(0xfee0_0000),
+        },
+    };
+    install(vec![host_dev]);
+    let before = devices();
+    if before.len() != 1 {
+        return TestResult::Fail("install did not seed the registry");
+    }
+    append_devices(vec![child_dev]);
+    let after = devices();
+    if after.len() != 2 {
+        return TestResult::Fail("append_devices did not grow the registry");
+    }
+    // The original device must still be present (append, not replace).
+    let has_host = after.iter().any(|d| d.id.vendor == 0x1234);
+    let has_child = after.iter().any(|d| d.id.vendor == 0x144D);
+    if !has_host || !has_child {
+        return TestResult::Fail("append clobbered or dropped a device");
+    }
+    // Children must keep the synthetic segment so VMD-domain addrs
+    // don't collide with the host PCIe domain.
+    let child = after.iter().find(|d| d.id.vendor == 0x144D).unwrap();
+    if let BusAddr::Pcie(PcieAddr { segment, .. }) = child.addr {
+        if segment != 0x8000 {
+            return TestResult::Fail("child lost its synthetic segment");
+        }
+    } else {
+        return TestResult::Fail("child addr not Pcie");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_append_devices_grows_registry);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_enumerate_segment_tags_devices() -> TestResult {
+    // Walking an ECAM region with a non-zero segment must
+    // propagate that segment into every PcieAddr it yields. This
+    // smoke uses the host q35 ECAM but asks for a segment of
+    // 0x8765 so the assertion is on the segment, not on the
+    // device IDs.
+    use crate::pcie::enumerate_segment;
+    use crate::{BusAddr, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the same region the boot enumerate
+    // path uses; identity-mapped. Cap the walk at 32 buses — enough
+    // for QEMU q35 to surface the usual lineup without scanning the
+    // whole 256-bus address space.
+    let devs = unsafe {
+        enumerate_segment(crate::x86_64::ECAM_DEFAULT_BASE, 32, 0x8765)
+    };
+    if devs.is_empty() {
+        return TestResult::Skip("no devices to enumerate");
+    }
+    for d in &devs {
+        let seg = match d.addr {
+            BusAddr::Pcie(a) => a.segment,
+            _ => return TestResult::Fail("non-Pcie BusAddr from pcie walker"),
+        };
+        if seg != 0x8765 {
+            return TestResult::Fail("enumerate_segment did not tag segment");
+        }
+        if let BusKind::Pcie { addr, .. } = d.kind {
+            if addr.segment != 0x8765 {
+                return TestResult::Fail("BusKind::Pcie.addr.segment mismatch");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus", smoke_bus_enumerate_segment_tags_devices);
+
 fn smoke_bus_msix_alloc_vector() -> TestResult {
     // Exercises the MsixTable::alloc_vector arithmetic against a
     // synthetic table so the test doesn't depend on any particular
