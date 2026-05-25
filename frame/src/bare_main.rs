@@ -424,16 +424,39 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         narf_memory::beacon::paint(23, 0x00FFB347); // peach: CPUID done
         let _ = writeln!(
             console::Writer,
-            "  features: nx={} tsc_inv={} pku={} pks={} uipi={} rdseed={} rdrand={}",
+            "  features: nx={} tsc_inv={} pku={} pks={} uipi={} rdseed={} rdrand={} hybrid={}",
             feats.nx,
             feats.invariant_tsc,
             feats.pku,
             feats.pks,
             feats.uipi,
             feats.rdseed,
-            feats.rdrand
+            feats.rdrand,
+            feats.hybrid
         );
         narf_memory::beacon::paint(24, 0x0000FF80); // mint: features-writeln OK
+
+        // Record the BSP's hybrid CPU type. CPUID leaf 0x1A
+        // EAX[31:24] is per-LP — APs populate their own slots
+        // during _ap_start_rust. Gated on the Hybrid feature bit so
+        // we don't read leaf 0x1A on silicon that doesn't define
+        // it (returns zero anyway, which decodes to Unknown — the
+        // gate is purely to skip the extra CPUID for the AMD /
+        // pre-Alder-Lake common case).
+        //
+        // SAFETY: BSP logical id is 0 (TSC_AUX defaults to 0 and
+        // we don't write it on the BSP). CPUID at CPL=0 is always
+        // legal. The set_cpu_type / read_hybrid_cpu_type pair is
+        // documented as "must run on the CPU whose slot you're
+        // writing" — we're on the BSP writing slot 0.
+        let bsp_cpu_type = if feats.hybrid {
+            // SAFETY: CPUID legal at CPL=0.
+            let raw = unsafe { narf_arch::x86_64::cpuid::read_hybrid_cpu_type() };
+            narf_lib::percpu::CpuType::from_raw(raw)
+        } else {
+            narf_lib::percpu::CpuType::Unknown
+        };
+        narf_lib::percpu::set_cpu_type(0, bsp_cpu_type);
 
         // Domain-enforcer selection. PKS is the fast path (single
         // WRMSR per crossing); when it's absent — typically AMD
