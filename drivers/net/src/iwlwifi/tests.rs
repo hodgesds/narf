@@ -10,9 +10,11 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    apm, csr, prph, register_pci_driver, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210,
+    apm, csr, prph, register_pci_driver, ucode, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210,
     IWL_DEV_AX211, IWL_VENDOR,
 };
+
+extern crate alloc;
 
 // ── Stage 1 — PCI match table ─────────────────────────────────────
 
@@ -193,6 +195,157 @@ fn smoke_iwlwifi_apm_timeouts_sane() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_apm_timeouts_sane);
+
+// ── Stage 2 — ucode TLV header decode ─────────────────────────────
+
+fn smoke_iwlwifi_ucode_magic_constant() -> TestResult {
+    // Magic per Linux fw/file.h IWL_TLV_UCODE_MAGIC.
+    if ucode::IWL_TLV_UCODE_MAGIC != 0x0A4C_5749 {
+        return TestResult::Fail("ucode magic value drifted from Linux fw/file.h");
+    }
+    if ucode::TLV_HEADER_BYTES != 88 {
+        return TestResult::Fail("ucode TLV header length should be 88");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/iwlwifi", smoke_iwlwifi_ucode_magic_constant);
+
+fn smoke_iwlwifi_ucode_parse_rejects_short_blob() -> TestResult {
+    // 80 bytes is shorter than the 88-byte header — must fail with
+    // TooShort (not crash on out-of-bounds reads).
+    let blob = [0u8; 80];
+    match ucode::parse_header(&blob) {
+        Err(ucode::ParseError::TooShort) => TestResult::Pass,
+        _ => TestResult::Fail("expected TooShort error on undersized blob"),
+    }
+}
+kernel_test_in!(
+    "drivers/net/iwlwifi",
+    smoke_iwlwifi_ucode_parse_rejects_short_blob
+);
+
+fn smoke_iwlwifi_ucode_parse_rejects_bad_magic() -> TestResult {
+    let mut blob = [0u8; 96];
+    // Magic at bytes 4..8 — set to a wrong value.
+    blob[4..8].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+    match ucode::parse_header(&blob) {
+        Err(ucode::ParseError::BadMagic(0x1122_3344)) => TestResult::Pass,
+        _ => TestResult::Fail("expected BadMagic for non-magic blob"),
+    }
+}
+kernel_test_in!(
+    "drivers/net/iwlwifi",
+    smoke_iwlwifi_ucode_parse_rejects_bad_magic
+);
+
+fn smoke_iwlwifi_ucode_parse_header_minimal() -> TestResult {
+    // Hand-assemble a minimal TLV blob: header + a single SEC_RT
+    // TLV with dest_offset=0x00880000 and a 16-byte payload.
+    let payload = b"sixteen-byte-pay";
+    assert!(payload.len() == 16);
+    let tlv_len: u32 = 4 + 16; // dest_offset + payload
+    let mut blob = alloc::vec::Vec::<u8>::new();
+    blob.extend_from_slice(&0u32.to_le_bytes()); // zero
+    blob.extend_from_slice(&ucode::IWL_TLV_UCODE_MAGIC.to_le_bytes());
+    blob.extend_from_slice(b"AX210-77.ucode\0"); // human readable (15 bytes)
+    blob.extend_from_slice(&[0u8; 49]); // pad to 64 bytes
+    blob.extend_from_slice(&0x0001_0002u32.to_le_bytes()); // ver
+    blob.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // build
+    blob.extend_from_slice(&0u64.to_le_bytes()); // ignore
+    // TLV: type=19 (SecRt), len=20, payload[dest=0x00880000, "sixteen-byte-pay"]
+    blob.extend_from_slice(&19u32.to_le_bytes());
+    blob.extend_from_slice(&tlv_len.to_le_bytes());
+    blob.extend_from_slice(&0x0088_0000u32.to_le_bytes());
+    blob.extend_from_slice(payload);
+
+    let parsed = match ucode::parse_header(&blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("expected successful header parse"),
+    };
+    if parsed.header.version != 0x0001_0002 {
+        return TestResult::Fail("version mis-decoded");
+    }
+    if parsed.header.build != 0x1234_5678 {
+        return TestResult::Fail("build mis-decoded");
+    }
+    if !parsed.header.human_readable.starts_with("AX210-77.ucode") {
+        return TestResult::Fail("human-readable mis-decoded");
+    }
+    if parsed.sections.len() != 1 {
+        return TestResult::Fail("expected one section");
+    }
+    let s = &parsed.sections[0];
+    if s.kind != ucode::TlvType::SecRt {
+        return TestResult::Fail("section kind mis-decoded");
+    }
+    if s.dest_offset != 0x0088_0000 {
+        return TestResult::Fail("dest_offset mis-decoded");
+    }
+    if s.payload_len != 16 {
+        return TestResult::Fail("payload len mis-decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/iwlwifi",
+    smoke_iwlwifi_ucode_parse_header_minimal
+);
+
+fn smoke_iwlwifi_ucode_parse_rejects_truncated_tlv() -> TestResult {
+    // A TLV whose declared length runs past EOF must be rejected.
+    let mut blob = alloc::vec::Vec::<u8>::new();
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&ucode::IWL_TLV_UCODE_MAGIC.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 64]);
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&0u64.to_le_bytes());
+    // Type = SecRt(19), declared length = 100 but only 4 bytes follow.
+    blob.extend_from_slice(&19u32.to_le_bytes());
+    blob.extend_from_slice(&100u32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    match ucode::parse_header(&blob) {
+        Err(ucode::ParseError::TruncatedTlv { .. }) => TestResult::Pass,
+        _ => TestResult::Fail("expected TruncatedTlv error"),
+    }
+}
+kernel_test_in!(
+    "drivers/net/iwlwifi",
+    smoke_iwlwifi_ucode_parse_rejects_truncated_tlv
+);
+
+fn smoke_iwlwifi_ucode_metadata_tlv_counted() -> TestResult {
+    // FwVersion (type 36) is metadata, not a section — should bump
+    // the metadata counter but not append to sections.
+    let mut blob = alloc::vec::Vec::<u8>::new();
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&ucode::IWL_TLV_UCODE_MAGIC.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 64]);
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&0u64.to_le_bytes());
+    // Two FwVersion TLVs, 12 bytes each (3 × u32).
+    for _ in 0..2 {
+        blob.extend_from_slice(&36u32.to_le_bytes());
+        blob.extend_from_slice(&12u32.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 12]);
+    }
+    let parsed = match ucode::parse_header(&blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("expected successful parse"),
+    };
+    if !parsed.sections.is_empty() {
+        return TestResult::Fail("FwVersion TLVs should not produce sections");
+    }
+    if parsed.metadata_tlv_count != 2 {
+        return TestResult::Fail("expected metadata_tlv_count = 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/iwlwifi",
+    smoke_iwlwifi_ucode_metadata_tlv_counted
+);
 
 fn smoke_iwlwifi_apm_family_default() -> TestResult {
     // AX-class default is the pre-Bz flow (uses CSR_RESET's bit 7,
