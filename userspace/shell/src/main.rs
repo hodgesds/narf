@@ -1838,14 +1838,14 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let mut chunk = [0u8; 4096];
             loop {
                 let n = unsafe {
-                    libc::read(kfd, chunk.as_mut_ptr() as *mut _, chunk.len())
+                    libc::posix::read(kfd, chunk.as_mut_ptr() as *mut _, chunk.len())
                 };
                 if n <= 0 {
                     break;
                 }
                 unsafe { write_all(fd, &chunk[..n as usize]); }
             }
-            unsafe { libc::close(kfd); }
+            let _ = unsafe { libc::posix::close(kfd) };
         }
     } else if cmd == b"grep" {
         // grep PATTERN [FILE]
@@ -1890,7 +1890,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let mut llen = 0usize;
             loop {
                 let n = unsafe {
-                    libc::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len())
                 };
                 if n <= 0 {
                     break;
@@ -1920,7 +1920,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 }
             }
             if owned_fd >= 0 {
-                unsafe { libc::close(owned_fd); }
+                let _ = unsafe { libc::posix::close(owned_fd) };
             }
         }
     } else if cmd == b"exit" {
