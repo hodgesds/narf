@@ -1831,7 +1831,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // the natural end-of-output. No flags — Linux's `-T`, `-w`
         // (follow), `-l` (level filter) etc. land later.
         let mut kpath = *b"/dev/kmsg\0";
-        let kfd = unsafe { libc::open(kpath.as_mut_ptr() as *mut i8, 0) };
+        let kfd = unsafe { libc::posix::open(kpath.as_mut_ptr() as *mut i8, 0, 0) };
         if kfd < 0 {
             unsafe { write_all(fd, b"dmesg: cannot open /dev/kmsg\n"); }
         } else {
@@ -1875,7 +1875,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 }
                 pbuf[..file.len()].copy_from_slice(file);
                 let f = unsafe {
-                    libc::open(pbuf.as_mut_ptr() as *mut i8, 0)
+                    libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0)
                 };
                 if f < 0 {
                     unsafe { write_all(fd, b"grep: cannot open file\n"); }
