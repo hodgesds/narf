@@ -155,6 +155,58 @@ impl FileOps for DevZero {
     }
 }
 
+/// `/dev/kmsg` — read-only snapshot of the kernel log ring.
+///
+/// Mirrors Linux's `/dev/kmsg` (the canonical surface `dmesg` reads
+/// from). Each read returns a slice of the live klog snapshot
+/// starting at `offset` (caller-tracked, oldest-byte-first). On
+/// large logs the caller calls multiple times until the read
+/// returns 0. Writes are accepted (a no-op) so a userspace tool
+/// can pipe to `> /dev/kmsg` without erroring; the actual kmsg
+/// "inject" facility from Linux isn't implemented (write-discard).
+///
+/// The snapshot is computed PER READ — between reads, more bytes
+/// may have been recorded by `console::write_str → klog::record`.
+/// Callers wanting a stable view should fetch in a single large
+/// read; callers wanting tail-style updates can just keep reading
+/// past EOF (offset = current_len) on each iteration.
+struct DevKmsg;
+
+impl FileOps for DevKmsg {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let snap = narf_console::klog::snapshot();
+        let off = offset as usize;
+        let n = if off >= snap.len() {
+            0
+        } else {
+            let avail = snap.len() - off;
+            let n = avail.min(buf.len());
+            buf[..n].copy_from_slice(&snap[off..off + n]);
+            n
+        };
+        Box::pin(async move { Ok(n) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // Accept-and-discard so `echo foo > /dev/kmsg` doesn't error.
+        let len = buf.len();
+        Box::pin(async move { Ok(len) })
+    }
+
+    fn stat(&self) -> Stat {
+        let len = narf_console::klog::snapshot().len();
+        Stat {
+            size: len as u64,
+            blocks: ((len + 511) / 512) as u64,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o444,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 /// `/dev/console` — typed-byte stream backed by `narf_input`.
 ///
 /// Reads pull pending key-press events off `narf_input`'s global
@@ -358,6 +410,7 @@ impl DirOps for DevDir {
             "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
             "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
+            "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
             "console" | "tty" | "tty0" => {
                 Some(Arc::new(DevConsole) as Arc<dyn FileOps>)
             }
@@ -385,6 +438,7 @@ impl DirOps for DevDir {
             DirEntry { name: "zero", file_type: FileType::Special },
             DirEntry { name: "random", file_type: FileType::Special },
             DirEntry { name: "urandom", file_type: FileType::Special },
+            DirEntry { name: "kmsg", file_type: FileType::Special },
             DirEntry { name: "console", file_type: FileType::Special },
             DirEntry { name: "tty", file_type: FileType::Special },
             DirEntry { name: "tty0", file_type: FileType::Special },

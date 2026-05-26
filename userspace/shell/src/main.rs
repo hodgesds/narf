@@ -1824,6 +1824,105 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 unsafe { libc::closedir(dir); }
             }
         }
+    } else if cmd == b"dmesg" {
+        // Read the kernel log ring via /dev/kmsg. Open + read in a
+        // loop with a 4 KiB buffer; print to fd. The kmsg file
+        // returns 0 once we've read past the snapshot, which is
+        // the natural end-of-output. No flags — Linux's `-T`, `-w`
+        // (follow), `-l` (level filter) etc. land later.
+        let mut kpath = *b"/dev/kmsg\0";
+        let kfd = unsafe { libc::open(kpath.as_mut_ptr() as *mut i8, 0) };
+        if kfd < 0 {
+            unsafe { write_all(fd, b"dmesg: cannot open /dev/kmsg\n"); }
+        } else {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::read(kfd, chunk.as_mut_ptr() as *mut _, chunk.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+                unsafe { write_all(fd, &chunk[..n as usize]); }
+            }
+            unsafe { libc::close(kfd); }
+        }
+    } else if cmd == b"grep" {
+        // grep PATTERN [FILE]
+        // Reads stdin or FILE line by line; prints lines containing
+        // PATTERN (literal substring match). No regex, no flags.
+        // Adequate for piping into dmesg / ls / cat for now.
+        let args = skip_ws(rest);
+        // Find the pattern + optional file.
+        let pat_end = args
+            .iter()
+            .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+            .unwrap_or(args.len());
+        if pat_end == 0 {
+            unsafe { write_all(fd, b"grep: usage: grep PATTERN [FILE]\n"); }
+        } else {
+            let pattern = &args[..pat_end];
+            let file = trim_arg(&args[pat_end..]);
+            // Source fd: open FILE, or use stdin (fd 0) if no file.
+            let mut owned_fd: i32 = -1;
+            let src_fd = if file.is_empty() {
+                0 // stdin
+            } else {
+                let mut pbuf = [0u8; 256];
+                if file.len() + 1 >= pbuf.len() {
+                    unsafe { write_all(fd, b"grep: path too long\n"); }
+                    return true;
+                }
+                pbuf[..file.len()].copy_from_slice(file);
+                let f = unsafe {
+                    libc::open(pbuf.as_mut_ptr() as *mut i8, 0)
+                };
+                if f < 0 {
+                    unsafe { write_all(fd, b"grep: cannot open file\n"); }
+                    return true;
+                }
+                owned_fd = f;
+                f
+            };
+            // Read in chunks, scan for newlines, test each line.
+            let mut buf = [0u8; 4096];
+            let mut line = [0u8; 4096];
+            let mut llen = 0usize;
+            loop {
+                let n = unsafe {
+                    libc::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+                for &b in &buf[..n as usize] {
+                    if b == b'\n' {
+                        if line_contains(&line[..llen], pattern) {
+                            unsafe {
+                                write_all(fd, &line[..llen]);
+                                write_all(fd, NEWLINE);
+                            }
+                        }
+                        llen = 0;
+                    } else if llen < line.len() {
+                        line[llen] = b;
+                        llen += 1;
+                    }
+                    // Lines longer than the buffer get truncated;
+                    // good enough for boot-log inspection.
+                }
+            }
+            // Trailing line without \n.
+            if llen > 0 && line_contains(&line[..llen], pattern) {
+                unsafe {
+                    write_all(fd, &line[..llen]);
+                    write_all(fd, NEWLINE);
+                }
+            }
+            if owned_fd >= 0 {
+                unsafe { libc::close(owned_fd); }
+            }
+        }
     } else if cmd == b"exit" {
         return false;
     } else {
@@ -1835,6 +1934,29 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Naive literal substring search. Returns true iff `needle`
+/// appears anywhere in `haystack`. Used by `grep` to match
+/// pattern-against-line. No regex, no character classes — `grep`
+/// in NARF's shell is for boot-log filtering, not POSIX BRE
+/// compliance.
+fn line_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let last = haystack.len() - needle.len();
+    let mut i = 0usize;
+    while i <= last {
+        if &haystack[i..i + needle.len()] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Strip leading whitespace + trailing whitespace/control bytes from
