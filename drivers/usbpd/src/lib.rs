@@ -240,6 +240,15 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     );
                     narf_time::sleep_cycles(330_000_000).await;
                 }
+                PortStepOutcome::RoleSwapped(next) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  tcpm: {} power role swapped → {:?}",
+                        label, next
+                    );
+                    announced = false;
+                    narf_scheduler::yield_now().await;
+                }
             }
         }
     });

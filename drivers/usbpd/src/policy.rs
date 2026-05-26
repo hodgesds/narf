@@ -83,6 +83,9 @@ pub struct SinkPolicy {
     /// `min_voltage_mv`. Set to true for "give me as much power as I
     /// can get".
     pub prefer_high_voltage: bool,
+    /// `true` to Accept inbound PR_Swap requests; `false` to Reject.
+    /// Default off: most non-DRP sinks reject swap.
+    pub accept_pr_swap: bool,
 }
 
 impl Default for SinkPolicy {
@@ -92,6 +95,7 @@ impl Default for SinkPolicy {
             min_voltage_mv: 5000,
             op_current_ma: 3000,
             prefer_high_voltage: false,
+            accept_pr_swap: false,
         }
     }
 }
@@ -184,6 +188,10 @@ pub struct SourcePolicy {
     /// PDOs to advertise in Source_Capabilities. PDO #1 must be the
     /// 5 V Fixed PDO per §6.4.1.1 — `default()` enforces that.
     pub pdos: Vec<SourcePdo>,
+    /// `true` to Accept inbound PR_Swap requests; `false` to Reject.
+    /// Sources typically reject swap unless they are explicitly
+    /// dual-role (DRP).
+    pub accept_pr_swap: bool,
 }
 
 impl Default for SourcePolicy {
@@ -195,6 +203,7 @@ impl Default for SourcePolicy {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
             }],
+            accept_pr_swap: false,
         }
     }
 }
@@ -209,7 +218,10 @@ impl SourcePolicy {
             pdos.first(),
             Some(SourcePdo::Fixed { voltage_mv: 5000, .. })
         ));
-        Self { pdos }
+        Self {
+            pdos,
+            accept_pr_swap: false,
+        }
     }
 
     /// Decide how to react to an incoming Request RDO. Default policy
@@ -286,6 +298,7 @@ pub(crate) mod tests {
             min_voltage_mv: 5000,
             op_current_ma: 3000,
             prefer_high_voltage: true,
+            ..SinkPolicy::default()
         };
         let caps = [
             SourcePdo::Fixed {
@@ -319,6 +332,7 @@ pub(crate) mod tests {
             min_voltage_mv: 20000,
             op_current_ma: 5000,
             prefer_high_voltage: false,
+            ..SinkPolicy::default()
         };
         let caps = [SourcePdo::Fixed {
             voltage_mv: 5000,
@@ -346,6 +360,7 @@ pub(crate) mod tests {
             min_voltage_mv: 5000,
             op_current_ma: 5000, // ask for 5 A
             prefer_high_voltage: false,
+            ..SinkPolicy::default()
         };
         let caps = [SourcePdo::Fixed {
             voltage_mv: 5000,
@@ -504,4 +519,17 @@ pub(crate) mod tests {
         "drivers/usbpd/policy",
         smoke_source_policy_rejects_unknown_position
     );
+
+    fn smoke_pr_swap_knobs_default_off() -> TestResult {
+        let p = SinkPolicy::default();
+        if p.accept_pr_swap {
+            return TestResult::Fail("default sink should reject PR_Swap");
+        }
+        let q = SourcePolicy::default();
+        if q.accept_pr_swap {
+            return TestResult::Fail("default source should reject PR_Swap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usbpd/policy", smoke_pr_swap_knobs_default_off);
 }

@@ -49,7 +49,8 @@ use crate::policy::{RequestDecision, SinkPolicy, SourcePolicy};
 
 // ── Source Policy Engine state (§8.3.3.2) ──────────────────────────
 
-/// Source Policy Engine state — direct one-to-one with §8.3.3.2.
+/// Source Policy Engine state — direct one-to-one with §8.3.3.2 plus
+/// the PR_Swap (§8.3.3.4) sub-states.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SourceState {
@@ -73,6 +74,16 @@ pub enum SourceState {
     Ready = 5,
     /// SRC_HARD_RESET: send Hard Reset on the wire, then re-Startup.
     HardReset = 6,
+    /// PR_Swap_Send (§8.3.3.4.4): we initiated the swap; PR_Swap sent.
+    PrSwapSend = 7,
+    /// PR_Swap_Wait_Reply: waiting for Accept/Reject/Wait.
+    PrSwapWaitReply = 8,
+    /// PR_Swap_Transition_to_off (§8.3.3.4.6): Accept landed, turning
+    /// off Vbus before sending PS_RDY.
+    PrSwapTransitionToOff = 9,
+    /// PR_Swap_Source_off: Vbus off; we wait for the partner's PS_RDY
+    /// then complete the swap.
+    PrSwapSourceOff = 10,
 }
 
 /// Error from the source state machine.
@@ -105,6 +116,9 @@ pub enum SourceStepOutcome {
     Idle(SourceState),
     /// Contract live — sink is now drawing power.
     Ready { contract: Contract },
+    /// PR_Swap completed — this port is now a *sink*. The driving
+    /// `TcpmPort` flips its underlying engine and re-arms.
+    RoleSwappedToSink,
 }
 
 /// Source-role policy engine running on top of a TCPC.
@@ -151,6 +165,16 @@ impl SourcePort {
         v & 0x7
     }
 
+    /// Externally request a PR_Swap. Only legal from `SRC_READY`.
+    /// Returns false if the source is in another state.
+    pub fn initiate_pr_swap(&self) -> bool {
+        if self.state() != SourceState::Ready {
+            return false;
+        }
+        self.set_state(SourceState::PrSwapSend);
+        true
+    }
+
     /// Run one step. The driving task pumps this until it sees `Ready`
     /// or `Idle`.
     pub fn step(&self, cap: &Cap<UsbPd, Grant>) -> Result<SourceStepOutcome, SourceError> {
@@ -175,12 +199,16 @@ impl SourcePort {
             SourceState::SendCapabilities => self.step_send_capabilities(),
             SourceState::NegotiateCapability => self.step_negotiate(),
             SourceState::TransitionSupply => self.step_transition_supply(),
-            SourceState::Ready => Ok(SourceStepOutcome::Idle(SourceState::Ready)),
+            SourceState::Ready => self.step_ready_or_handle_inbound(),
             SourceState::HardReset => {
                 let _ = self.tcpc.hard_reset();
                 self.set_state(SourceState::Startup);
                 Ok(SourceStepOutcome::Advanced(SourceState::Startup))
             }
+            SourceState::PrSwapSend => self.step_pr_swap_send(),
+            SourceState::PrSwapWaitReply => self.step_pr_swap_wait_reply(),
+            SourceState::PrSwapTransitionToOff => self.step_pr_swap_transition_to_off(),
+            SourceState::PrSwapSourceOff => self.step_pr_swap_source_off(),
         }
     }
 
@@ -312,6 +340,130 @@ impl SourcePort {
         self.set_state(SourceState::Ready);
         Ok(SourceStepOutcome::Ready { contract })
     }
+
+    // ── Ready-state inbound handling ───────────────────────────────
+
+    /// In `SRC_READY` the partner may send PR_Swap (more inbound
+    /// messages are wired in subsequent Stage-2 commits). Drain at
+    /// most one inbound message per step; if there's nothing we idle.
+    fn step_ready_or_handle_inbound(&self) -> Result<SourceStepOutcome, SourceError> {
+        let buf = match self.tcpc.receive() {
+            Ok(b) => b,
+            Err(TcpcError::NoMessage) => return Ok(SourceStepOutcome::Idle(SourceState::Ready)),
+            Err(e) => return Err(SourceError::Tcpc(e)),
+        };
+        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        if h.num_data_objects > 0 {
+            // No data messages are handled in Ready yet — fall back
+            // to Hard Reset for safety.
+            self.set_state(SourceState::HardReset);
+            return Err(SourceError::Protocol);
+        }
+        match CtrlMsg::from_u8(h.msg_type) {
+            Some(CtrlMsg::PrSwap) => self.handle_inbound_pr_swap(),
+            Some(CtrlMsg::SoftReset) => {
+                // §6.3.13: respond with Accept then restart from
+                // Startup. The driving task observes the state hop.
+                self.send_control(CtrlMsg::Accept)?;
+                self.set_state(SourceState::Startup);
+                Ok(SourceStepOutcome::Advanced(SourceState::Startup))
+            }
+            _ => Ok(SourceStepOutcome::Idle(SourceState::Ready)),
+        }
+    }
+
+    fn send_control(&self, msg: CtrlMsg) -> Result<(), SourceError> {
+        let h = Header::control(
+            msg,
+            DataRole::Dfp,
+            PowerRole::Source,
+            SpecRev::R3_0,
+            self.next_msg_id(),
+        );
+        let frame = encode_message(h, &[]);
+        self.tcpc.transmit(&frame)?;
+        Ok(())
+    }
+
+    // ── PR_Swap — initiated by us ──────────────────────────────────
+
+    fn step_pr_swap_send(&self) -> Result<SourceStepOutcome, SourceError> {
+        self.send_control(CtrlMsg::PrSwap)?;
+        self.set_state(SourceState::PrSwapWaitReply);
+        Ok(SourceStepOutcome::Advanced(SourceState::PrSwapWaitReply))
+    }
+
+    fn step_pr_swap_wait_reply(&self) -> Result<SourceStepOutcome, SourceError> {
+        let buf = match self.tcpc.receive() {
+            Ok(b) => b,
+            Err(TcpcError::NoMessage) => {
+                return Ok(SourceStepOutcome::Idle(SourceState::PrSwapWaitReply))
+            }
+            Err(e) => return Err(SourceError::Tcpc(e)),
+        };
+        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        match CtrlMsg::from_u8(h.msg_type) {
+            Some(CtrlMsg::Accept) => {
+                self.set_state(SourceState::PrSwapTransitionToOff);
+                Ok(SourceStepOutcome::Advanced(SourceState::PrSwapTransitionToOff))
+            }
+            Some(CtrlMsg::Reject) | Some(CtrlMsg::Wait) => {
+                // Partner declined; stay sourcing.
+                self.set_state(SourceState::Ready);
+                Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+            }
+            _ => Err(SourceError::Protocol),
+        }
+    }
+
+    fn step_pr_swap_transition_to_off(&self) -> Result<SourceStepOutcome, SourceError> {
+        // §8.3.3.4.6: turn Vbus off (chip-managed) then send PS_RDY.
+        // The TCPC trait doesn't expose a Vbus enable today — Stage 2
+        // hands that to the chip-level driver. We emit PS_RDY so the
+        // partner knows our rail is down.
+        self.send_control(CtrlMsg::PsRdy)?;
+        self.set_state(SourceState::PrSwapSourceOff);
+        Ok(SourceStepOutcome::Advanced(SourceState::PrSwapSourceOff))
+    }
+
+    fn step_pr_swap_source_off(&self) -> Result<SourceStepOutcome, SourceError> {
+        // Wait for the partner's PS_RDY (they have now turned *their*
+        // rail on).
+        let buf = match self.tcpc.receive() {
+            Ok(b) => b,
+            Err(TcpcError::NoMessage) => {
+                return Ok(SourceStepOutcome::Idle(SourceState::PrSwapSourceOff))
+            }
+            Err(e) => return Err(SourceError::Tcpc(e)),
+        };
+        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::PsRdy) {
+            return Err(SourceError::Protocol);
+        }
+        // Flip CC drive to Sink. The driving task will then re-enter
+        // the engine as a sink.
+        self.tcpc.set_role(PortRole::Sink)?;
+        *self.contract.lock() = None;
+        self.set_state(SourceState::Startup);
+        Ok(SourceStepOutcome::RoleSwappedToSink)
+    }
+
+    fn handle_inbound_pr_swap(&self) -> Result<SourceStepOutcome, SourceError> {
+        // §8.3.3.4.3: the responder evaluates policy and Accepts /
+        // Rejects / Waits. On Accept the responder transitions Vbus
+        // off and then becomes a sink — same path as initiated PR_Swap
+        // from PrSwapTransitionToOff onward.
+        let accept = self.policy.lock().accept_pr_swap;
+        if accept {
+            self.send_control(CtrlMsg::Accept)?;
+            self.set_state(SourceState::PrSwapTransitionToOff);
+            Ok(SourceStepOutcome::Advanced(SourceState::PrSwapTransitionToOff))
+        } else {
+            self.send_control(CtrlMsg::Reject)?;
+            self.set_state(SourceState::Ready);
+            Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+        }
+    }
 }
 
 // ── Type-C-level attach/detach controller ──────────────────────────
@@ -347,6 +499,9 @@ pub enum PortStepOutcome {
     /// We were asked to enter BIST; the caller can stay in `Bist`
     /// until the partner clears it.
     BistEntered,
+    /// Power role just flipped — we were sourcing and are now a sink
+    /// (or vice-versa, once Stage-2's sink-side PR_Swap lands).
+    RoleSwapped(PortState),
 }
 
 /// Top-level port driver: owns one chip + both engines, picks which
@@ -463,6 +618,14 @@ impl TcpmPort {
                         PortStepOutcome::Advanced(PortState::AttachedSrc)
                     }
                     SourceStepOutcome::Idle(_) => PortStepOutcome::Idle(PortState::AttachedSrc),
+                    SourceStepOutcome::RoleSwappedToSink => {
+                        // The source completed a PR_Swap and is now
+                        // logically a sink. Move the port-level state
+                        // to AttachedSnk and let the sink engine pick
+                        // up from Unattached on the next step.
+                        self.set_state(PortState::AttachedSnk);
+                        PortStepOutcome::RoleSwapped(PortState::AttachedSnk)
+                    }
                 })
             }
             PortState::ErrorRecovery => {
@@ -486,6 +649,15 @@ impl TcpmPort {
     /// Hard Reset.
     pub fn enter_bist(&self) {
         self.set_state(PortState::Bist);
+    }
+
+    /// Ask the source engine to initiate a PR_Swap. Only legal while
+    /// the port is `AttachedSrc` with the source in `SRC_READY`.
+    pub fn initiate_pr_swap(&self) -> bool {
+        if !matches!(self.state(), PortState::AttachedSrc) {
+            return false;
+        }
+        self.source.initiate_pr_swap()
     }
 }
 
@@ -884,4 +1056,185 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usbpd/tcpm", smoke_tcpm_port_registry_round_trip);
+
+    // ── Helpers shared across Stage-2 swap/BIST tests ─────────────
+
+    /// Build a partner-originated Control message frame (the "wire" a
+    /// FakeChip would deliver to our SourcePort on `receive()`).
+    fn partner_ctrl_frame(msg: CtrlMsg) -> Vec<u8> {
+        let h = Header::control(
+            msg,
+            DataRole::Ufp,
+            PowerRole::Sink,
+            SpecRev::R3_0,
+            0,
+        );
+        encode_message(h, &[])
+    }
+
+    /// Pump steps until the source reaches `SRC_READY` or `n` steps
+    /// are consumed. Returns true if Ready was reached.
+    fn drive_to_ready(
+        port: &SourcePort,
+        chip: &FakeChip,
+        cap: &Cap<UsbPd, Grant>,
+        n: usize,
+    ) -> bool {
+        for _ in 0..n {
+            if port.state() == SourceState::Ready {
+                return true;
+            }
+            if port.state() == SourceState::NegotiateCapability {
+                chip.enqueue_rx(request_frame(1, 1500, 0));
+            }
+            let _ = port.step(cap).unwrap();
+        }
+        port.state() == SourceState::Ready
+    }
+
+    fn fresh_source_port() -> (Arc<FakeChip>, SourcePort) {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), SourcePolicy::default());
+        (chip, port)
+    }
+
+    // ── PR_Swap ───────────────────────────────────────────────────
+
+    fn smoke_pr_swap_initiated_accept_path() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        if !drive_to_ready(&port, &chip, &cap, 8) {
+            return TestResult::Fail("did not reach SRC_READY");
+        }
+        if !port.initiate_pr_swap() {
+            return TestResult::Fail("initiate_pr_swap rejected from Ready");
+        }
+        let _ = port.step(&cap).unwrap(); // PrSwapSend → emit
+        if port.state() != SourceState::PrSwapWaitReply {
+            return TestResult::Fail("PrSwapSend should advance to WaitReply");
+        }
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::PrSwap) {
+            return TestResult::Fail("last sent frame should be PrSwap");
+        }
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::Accept));
+        let _ = port.step(&cap).unwrap();
+        if port.state() != SourceState::PrSwapTransitionToOff {
+            return TestResult::Fail("Accept should advance to TransitionToOff");
+        }
+        let _ = port.step(&cap).unwrap(); // PS_RDY emitted
+        if port.state() != SourceState::PrSwapSourceOff {
+            return TestResult::Fail("TransitionToOff should advance to SourceOff");
+        }
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::PsRdy));
+        let outcome = port.step(&cap).unwrap();
+        match outcome {
+            SourceStepOutcome::RoleSwappedToSink => TestResult::Pass,
+            _ => TestResult::Fail("expected RoleSwappedToSink"),
+        }
+    }
+    kernel_test_in!("drivers/usbpd/tcpm", smoke_pr_swap_initiated_accept_path);
+
+    fn smoke_pr_swap_initiated_reject_returns_to_ready() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        port.initiate_pr_swap();
+        let _ = port.step(&cap).unwrap();
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::Reject));
+        let _ = port.step(&cap).unwrap();
+        if port.state() != SourceState::Ready {
+            return TestResult::Fail("Reject should return to Ready");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_pr_swap_initiated_reject_returns_to_ready
+    );
+
+    fn smoke_pr_swap_inbound_accepted_when_policy_on() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let mut policy = SourcePolicy::default();
+        policy.accept_pr_swap = true;
+        let port = SourcePort::new(chip.clone(), policy);
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::PrSwap));
+        let _ = port.step(&cap).unwrap();
+        if port.state() != SourceState::PrSwapTransitionToOff {
+            return TestResult::Fail("inbound PR_Swap with accept should reach TransitionToOff");
+        }
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::Accept) {
+            return TestResult::Fail("accept_pr_swap=true should send Accept");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_pr_swap_inbound_accepted_when_policy_on
+    );
+
+    fn smoke_pr_swap_inbound_rejected_by_default() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::PrSwap));
+        let _ = port.step(&cap).unwrap();
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::Reject) {
+            return TestResult::Fail("default policy should Reject PR_Swap");
+        }
+        if port.state() != SourceState::Ready {
+            return TestResult::Fail("Reject should stay in Ready");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_pr_swap_inbound_rejected_by_default
+    );
+
+    fn smoke_pr_swap_initiate_blocked_outside_ready() -> TestResult {
+        let (_chip, port) = fresh_source_port();
+        if port.initiate_pr_swap() {
+            return TestResult::Fail("PR_Swap should refuse from Startup");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_pr_swap_initiate_blocked_outside_ready
+    );
+
+    fn smoke_tcpmport_pr_swap_blocked_when_not_src() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Open,
+            cc2: CcState::Open,
+        }));
+        let port = TcpmPort::new(
+            chip,
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("test"),
+        );
+        if port.initiate_pr_swap() {
+            return TestResult::Fail("PR_Swap should refuse from Unattached");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_tcpmport_pr_swap_blocked_when_not_src
+    );
 }
