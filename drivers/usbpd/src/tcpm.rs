@@ -84,6 +84,12 @@ pub enum SourceState {
     /// PR_Swap_Source_off: Vbus off; we wait for the partner's PS_RDY
     /// then complete the swap.
     PrSwapSourceOff = 10,
+    /// DR_Swap_Send: DR_Swap sent, waiting for reply.
+    DrSwapSend = 11,
+    /// DR_Swap_Wait_Reply.
+    DrSwapWaitReply = 12,
+    /// DR_Swap_Change: Accept landed; data role just flipped.
+    DrSwapChange = 13,
 }
 
 /// Error from the source state machine.
@@ -119,6 +125,8 @@ pub enum SourceStepOutcome {
     /// PR_Swap completed — this port is now a *sink*. The driving
     /// `TcpmPort` flips its underlying engine and re-arms.
     RoleSwappedToSink,
+    /// DR_Swap completed — data role flipped.
+    DataRoleSwapped { now_dfp: bool },
 }
 
 /// Source-role policy engine running on top of a TCPC.
@@ -132,6 +140,9 @@ pub struct SourcePort {
     pending_request: IrqSafeSpinLock<Option<FixedRdo>>,
     next_msg_id: AtomicU8,
     contract: IrqSafeSpinLock<Option<Contract>>,
+    /// Current data role. Source-role typically starts DFP; flips on
+    /// every successful DR_Swap. `true` = DFP, `false` = UFP.
+    is_dfp: AtomicU8,
 }
 
 impl SourcePort {
@@ -143,6 +154,7 @@ impl SourcePort {
             pending_request: IrqSafeSpinLock::new(None),
             next_msg_id: AtomicU8::new(0),
             contract: IrqSafeSpinLock::new(None),
+            is_dfp: AtomicU8::new(1),
         }
     }
 
@@ -156,8 +168,22 @@ impl SourcePort {
         *self.contract.lock()
     }
 
+    /// True when this port is currently the DFP (Downstream-Facing
+    /// Port = USB host). Flips on every successful DR_Swap.
+    pub fn is_dfp(&self) -> bool {
+        self.is_dfp.load(Ordering::Acquire) != 0
+    }
+
     fn set_state(&self, s: SourceState) {
         self.state.store(s as u8, Ordering::Release);
+    }
+
+    fn data_role(&self) -> DataRole {
+        if self.is_dfp() {
+            DataRole::Dfp
+        } else {
+            DataRole::Ufp
+        }
     }
 
     fn next_msg_id(&self) -> u8 {
@@ -175,6 +201,15 @@ impl SourcePort {
         true
     }
 
+    /// Externally request a DR_Swap. Only legal from `SRC_READY`.
+    pub fn initiate_dr_swap(&self) -> bool {
+        if self.state() != SourceState::Ready {
+            return false;
+        }
+        self.set_state(SourceState::DrSwapSend);
+        true
+    }
+
     /// Run one step. The driving task pumps this until it sees `Ready`
     /// or `Idle`.
     pub fn step(&self, cap: &Cap<UsbPd, Grant>) -> Result<SourceStepOutcome, SourceError> {
@@ -185,6 +220,7 @@ impl SourcePort {
                 self.next_msg_id.store(0, Ordering::Release);
                 *self.pending_request.lock() = None;
                 *self.contract.lock() = None;
+                self.is_dfp.store(1, Ordering::Release);
                 self.set_state(SourceState::Discovery);
                 Ok(SourceStepOutcome::Advanced(SourceState::Discovery))
             }
@@ -209,6 +245,9 @@ impl SourcePort {
             SourceState::PrSwapWaitReply => self.step_pr_swap_wait_reply(),
             SourceState::PrSwapTransitionToOff => self.step_pr_swap_transition_to_off(),
             SourceState::PrSwapSourceOff => self.step_pr_swap_source_off(),
+            SourceState::DrSwapSend => self.step_dr_swap_send(),
+            SourceState::DrSwapWaitReply => self.step_dr_swap_wait_reply(),
+            SourceState::DrSwapChange => self.step_dr_swap_change(),
         }
     }
 
@@ -222,7 +261,7 @@ impl SourcePort {
         }
         let h = Header::data(
             DataMsg::SourceCapabilities,
-            DataRole::Dfp,
+            self.data_role(),
             PowerRole::Source,
             SpecRev::R3_0,
             self.next_msg_id(),
@@ -264,7 +303,7 @@ impl SourcePort {
         };
         let h_reply = Header::control(
             reply_ctrl,
-            DataRole::Dfp,
+            self.data_role(),
             PowerRole::Source,
             SpecRev::R3_0,
             self.next_msg_id(),
@@ -324,7 +363,7 @@ impl SourcePort {
         };
         let h = Header::control(
             CtrlMsg::PsRdy,
-            DataRole::Dfp,
+            self.data_role(),
             PowerRole::Source,
             SpecRev::R3_0,
             self.next_msg_id(),
@@ -361,6 +400,7 @@ impl SourcePort {
         }
         match CtrlMsg::from_u8(h.msg_type) {
             Some(CtrlMsg::PrSwap) => self.handle_inbound_pr_swap(),
+            Some(CtrlMsg::DrSwap) => self.handle_inbound_dr_swap(),
             Some(CtrlMsg::SoftReset) => {
                 // §6.3.13: respond with Accept then restart from
                 // Startup. The driving task observes the state hop.
@@ -375,7 +415,7 @@ impl SourcePort {
     fn send_control(&self, msg: CtrlMsg) -> Result<(), SourceError> {
         let h = Header::control(
             msg,
-            DataRole::Dfp,
+            self.data_role(),
             PowerRole::Source,
             SpecRev::R3_0,
             self.next_msg_id(),
@@ -464,6 +504,58 @@ impl SourcePort {
             Ok(SourceStepOutcome::Advanced(SourceState::Ready))
         }
     }
+
+    // ── DR_Swap ────────────────────────────────────────────────────
+
+    fn step_dr_swap_send(&self) -> Result<SourceStepOutcome, SourceError> {
+        self.send_control(CtrlMsg::DrSwap)?;
+        self.set_state(SourceState::DrSwapWaitReply);
+        Ok(SourceStepOutcome::Advanced(SourceState::DrSwapWaitReply))
+    }
+
+    fn step_dr_swap_wait_reply(&self) -> Result<SourceStepOutcome, SourceError> {
+        let buf = match self.tcpc.receive() {
+            Ok(b) => b,
+            Err(TcpcError::NoMessage) => {
+                return Ok(SourceStepOutcome::Idle(SourceState::DrSwapWaitReply))
+            }
+            Err(e) => return Err(SourceError::Tcpc(e)),
+        };
+        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        match CtrlMsg::from_u8(h.msg_type) {
+            Some(CtrlMsg::Accept) => {
+                self.set_state(SourceState::DrSwapChange);
+                Ok(SourceStepOutcome::Advanced(SourceState::DrSwapChange))
+            }
+            Some(CtrlMsg::Reject) | Some(CtrlMsg::Wait) => {
+                self.set_state(SourceState::Ready);
+                Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+            }
+            _ => Err(SourceError::Protocol),
+        }
+    }
+
+    fn step_dr_swap_change(&self) -> Result<SourceStepOutcome, SourceError> {
+        // §8.3.3.5.5: flip the data role and return to Ready.
+        let now_dfp = !self.is_dfp();
+        self.is_dfp
+            .store(if now_dfp { 1 } else { 0 }, Ordering::Release);
+        self.set_state(SourceState::Ready);
+        Ok(SourceStepOutcome::DataRoleSwapped { now_dfp })
+    }
+
+    fn handle_inbound_dr_swap(&self) -> Result<SourceStepOutcome, SourceError> {
+        let accept = self.policy.lock().accept_dr_swap;
+        if accept {
+            self.send_control(CtrlMsg::Accept)?;
+            self.set_state(SourceState::DrSwapChange);
+            Ok(SourceStepOutcome::Advanced(SourceState::DrSwapChange))
+        } else {
+            self.send_control(CtrlMsg::Reject)?;
+            self.set_state(SourceState::Ready);
+            Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+        }
+    }
 }
 
 // ── Type-C-level attach/detach controller ──────────────────────────
@@ -502,6 +594,8 @@ pub enum PortStepOutcome {
     /// Power role just flipped — we were sourcing and are now a sink
     /// (or vice-versa, once Stage-2's sink-side PR_Swap lands).
     RoleSwapped(PortState),
+    /// Data role just flipped — UFP/DFP toggled.
+    DataRoleSwapped { now_dfp: bool },
 }
 
 /// Top-level port driver: owns one chip + both engines, picks which
@@ -626,6 +720,9 @@ impl TcpmPort {
                         self.set_state(PortState::AttachedSnk);
                         PortStepOutcome::RoleSwapped(PortState::AttachedSnk)
                     }
+                    SourceStepOutcome::DataRoleSwapped { now_dfp } => {
+                        PortStepOutcome::DataRoleSwapped { now_dfp }
+                    }
                 })
             }
             PortState::ErrorRecovery => {
@@ -658,6 +755,14 @@ impl TcpmPort {
             return false;
         }
         self.source.initiate_pr_swap()
+    }
+
+    /// Ask the source engine to initiate a DR_Swap.
+    pub fn initiate_dr_swap(&self) -> bool {
+        if !matches!(self.state(), PortState::AttachedSrc) {
+            return false;
+        }
+        self.source.initiate_dr_swap()
     }
 }
 
@@ -1236,5 +1341,85 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usbpd/tcpm",
         smoke_tcpmport_pr_swap_blocked_when_not_src
+    );
+
+    // ── DR_Swap ───────────────────────────────────────────────────
+
+    fn smoke_dr_swap_initiated_accept_flips_data_role() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        let starting_dfp = port.is_dfp();
+        port.initiate_dr_swap();
+        let _ = port.step(&cap).unwrap(); // send
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::DrSwap) {
+            return TestResult::Fail("first DR_Swap step should send DrSwap");
+        }
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::Accept));
+        let _ = port.step(&cap).unwrap();
+        let outcome = port.step(&cap).unwrap();
+        match outcome {
+            SourceStepOutcome::DataRoleSwapped { now_dfp } => {
+                if now_dfp == starting_dfp {
+                    return TestResult::Fail("data role did not flip");
+                }
+                if port.is_dfp() == starting_dfp {
+                    return TestResult::Fail("is_dfp() did not update");
+                }
+                TestResult::Pass
+            }
+            _ => TestResult::Fail("expected DataRoleSwapped outcome"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_dr_swap_initiated_accept_flips_data_role
+    );
+
+    fn smoke_dr_swap_inbound_rejected_by_default() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::DrSwap));
+        let _ = port.step(&cap).unwrap();
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::Reject) {
+            return TestResult::Fail("default policy should Reject DR_Swap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_dr_swap_inbound_rejected_by_default
+    );
+
+    fn smoke_dr_swap_inbound_accept_flips_when_policy_on() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let mut policy = SourcePolicy::default();
+        policy.accept_dr_swap = true;
+        let port = SourcePort::new(chip.clone(), policy);
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        let starting_dfp = port.is_dfp();
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::DrSwap));
+        let _ = port.step(&cap).unwrap();
+        if port.state() != SourceState::DrSwapChange {
+            return TestResult::Fail("accept_dr_swap=true should reach DrSwapChange");
+        }
+        let _ = port.step(&cap).unwrap();
+        if port.is_dfp() == starting_dfp {
+            return TestResult::Fail("data role did not flip after inbound DR_Swap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_dr_swap_inbound_accept_flips_when_policy_on
     );
 }

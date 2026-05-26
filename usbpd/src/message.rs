@@ -59,6 +59,8 @@ pub enum CtrlMsg {
     PsRdy = 0x06,
     GetSourceCap = 0x07,
     GetSinkCap = 0x08,
+    /// Data Role Swap request (§6.3.9). Either port may initiate.
+    DrSwap = 0x09,
     /// Power Role Swap request (§6.3.10).
     PrSwap = 0x0A,
     Wait = 0x0C,
@@ -76,6 +78,7 @@ impl CtrlMsg {
             0x06 => CtrlMsg::PsRdy,
             0x07 => CtrlMsg::GetSourceCap,
             0x08 => CtrlMsg::GetSinkCap,
+            0x09 => CtrlMsg::DrSwap,
             0x0A => CtrlMsg::PrSwap,
             0x0C => CtrlMsg::Wait,
             0x0D => CtrlMsg::SoftReset,

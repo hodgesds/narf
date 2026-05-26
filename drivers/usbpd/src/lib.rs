@@ -249,6 +249,15 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     announced = false;
                     narf_scheduler::yield_now().await;
                 }
+                PortStepOutcome::DataRoleSwapped { now_dfp } => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  tcpm: {} data role swapped → {}",
+                        label,
+                        if now_dfp { "DFP" } else { "UFP" }
+                    );
+                    narf_scheduler::yield_now().await;
+                }
             }
         }
     });

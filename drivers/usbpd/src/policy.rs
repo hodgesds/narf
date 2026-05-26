@@ -86,6 +86,9 @@ pub struct SinkPolicy {
     /// `true` to Accept inbound PR_Swap requests; `false` to Reject.
     /// Default off: most non-DRP sinks reject swap.
     pub accept_pr_swap: bool,
+    /// `true` to Accept inbound DR_Swap requests. Default off — only
+    /// dual-role data devices flip the flag on.
+    pub accept_dr_swap: bool,
 }
 
 impl Default for SinkPolicy {
@@ -96,6 +99,7 @@ impl Default for SinkPolicy {
             op_current_ma: 3000,
             prefer_high_voltage: false,
             accept_pr_swap: false,
+            accept_dr_swap: false,
         }
     }
 }
@@ -192,6 +196,10 @@ pub struct SourcePolicy {
     /// Sources typically reject swap unless they are explicitly
     /// dual-role (DRP).
     pub accept_pr_swap: bool,
+    /// `true` to Accept inbound DR_Swap requests. Default off — the
+    /// data role swap only makes sense when both sides can flip UFP/
+    /// DFP.
+    pub accept_dr_swap: bool,
 }
 
 impl Default for SourcePolicy {
@@ -204,6 +212,7 @@ impl Default for SourcePolicy {
                 max_current_ma: 3000,
             }],
             accept_pr_swap: false,
+            accept_dr_swap: false,
         }
     }
 }
@@ -221,6 +230,7 @@ impl SourcePolicy {
         Self {
             pdos,
             accept_pr_swap: false,
+            accept_dr_swap: false,
         }
     }
 
@@ -532,4 +542,17 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usbpd/policy", smoke_pr_swap_knobs_default_off);
+
+    fn smoke_dr_swap_knobs_default_off() -> TestResult {
+        let p = SinkPolicy::default();
+        if p.accept_dr_swap {
+            return TestResult::Fail("default sink should reject DR_Swap");
+        }
+        let q = SourcePolicy::default();
+        if q.accept_dr_swap {
+            return TestResult::Fail("default source should reject DR_Swap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usbpd/policy", smoke_dr_swap_knobs_default_off);
 }
