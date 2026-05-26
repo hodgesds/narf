@@ -57,10 +57,10 @@ use crate::{I2cBus, I2cError, I2cOp};
 
 // ── ACPI HIDs we recognise ─────────────────────────────────────────
 //
-// AMDI0005: Some Zen2-era Renoir/Lucienne BIOS revisions advertise
-//           the FCH I2C controller under this HID instead of
-//           AMDI0019. Observed on real-HW Renoir 4700U bring-up
-//           (user-reported `aml-i2c-ctrl HID=AMDI0005`).
+// NOT AMDI0005: that's the AMD Power Engine Plugin (PEP) at
+//   \_SB.PEP, used for S0ix / modern standby — NOT an I2C
+//   controller. Reverted from the match list in commit 3641727
+//   after Renoir DSDT dump confirmed it.
 // AMDI0010: Zen / Zen+ / early Zen2 (Stoney through Picasso).
 // AMDI0019: Zen2 (Renoir / Lucienne) — the Zen2 laptop bring-up
 //           target this driver was written against.
@@ -73,7 +73,7 @@ use crate::{I2cBus, I2cError, I2cOp};
 //           non-prefixed ID used by some firmware revisions.
 //           Linux matches both forms.
 const AMD_FCH_HIDS: &[&str] = &[
-    "AMDI0005", "AMDI0010", "AMDI0011", "AMDI0019", "AMDI0020", "AMDI0510",
+    "AMDI0010", "AMDI0011", "AMDI0019", "AMDI0020", "AMDI0510",
     "AMD0010", "AMD0020",
 ];
 
