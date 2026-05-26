@@ -1007,3 +1007,135 @@ fn smoke_sensor_detects_ambient_light() -> TestResult {
 }
 
 kernel_test_in!("hid/sensor", smoke_sensor_detects_ambient_light);
+
+// ── Touchscreen descriptor + report decoder ──────────────────────
+
+fn smoke_touchscreen_detects_two_finger_descriptor() -> TestResult {
+    use crate::touchscreen;
+    let blob = touchscreen::__touchscreen_descriptor_blob();
+    let parsed = match parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("parse(touchscreen descriptor) failed"),
+    };
+    let profile = match touchscreen::detect(&parsed) {
+        Some(p) => p,
+        None => return TestResult::Fail("touchscreen detect should have matched"),
+    };
+    if profile.contacts_max != 2 {
+        return TestResult::Fail("expected 2 contacts max");
+    }
+    if profile.input_report_id != 1 {
+        return TestResult::Fail("expected report id 1");
+    }
+    if profile.contact_count.is_none() {
+        return TestResult::Fail("Contact Count field should have been captured");
+    }
+    if profile.x_range != (0, 0x7FFF) {
+        return TestResult::Fail("X range should mirror Logical Min/Max");
+    }
+    if profile.y_range != (0, 0x7FFF) {
+        return TestResult::Fail("Y range should mirror Logical Min/Max");
+    }
+    for c in &profile.contacts {
+        if c.contact_id.is_none() || c.x.is_none() || c.y.is_none() {
+            return TestResult::Fail("per-contact field set incomplete");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "hid/touchscreen",
+    smoke_touchscreen_detects_two_finger_descriptor
+);
+
+fn smoke_touchscreen_rejects_touchpad_descriptor() -> TestResult {
+    // The PTP blob's top-level usage is Touch Pad (0x05) — the
+    // touchscreen probe should refuse it.
+    let blob = crate::ptp::__ptp_descriptor_blob();
+    let parsed = match parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("parse failed"),
+    };
+    if crate::touchscreen::detect(&parsed).is_some() {
+        return TestResult::Fail("touchscreen::detect should not match a Touch Pad descriptor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "hid/touchscreen",
+    smoke_touchscreen_rejects_touchpad_descriptor
+);
+
+fn smoke_touchscreen_decodes_report_payload() -> TestResult {
+    use crate::touchscreen;
+    let blob = touchscreen::__touchscreen_descriptor_blob();
+    let parsed = parse(blob).expect("parse");
+    let profile = touchscreen::detect(&parsed).expect("detect");
+
+    // Hand-built wire report for the descriptor: 1-byte report id +
+    // 2 fingers × (1-byte tip+in_range+pad + 1-byte contact_id +
+    // 2-byte X + 2-byte Y) + 1-byte contact count = 1 + 12 + 1 = 14
+    // bytes.
+    let mut report = alloc::vec![0u8; 1 + 2 * (1 + 1 + 2 + 2) + 1];
+    report[0] = 1; // report id
+    // Finger 0
+    report[1] = 0b0000_0011; // tip + in_range
+    report[2] = 0x05;
+    report[3..5].copy_from_slice(&0x1234u16.to_le_bytes());
+    report[5..7].copy_from_slice(&0x5678u16.to_le_bytes());
+    // Finger 1
+    report[7] = 0b0000_0001; // tip only
+    report[8] = 0x07;
+    report[9..11].copy_from_slice(&0x0F0Fu16.to_le_bytes());
+    report[11..13].copy_from_slice(&0x00AAu16.to_le_bytes());
+    // Contact Count
+    report[13] = 2;
+
+    let decoded = match touchscreen::decode_input(&profile, &report) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("decode_input failed"),
+    };
+    if decoded.contact_count != 2 {
+        return TestResult::Fail("contact count should be 2");
+    }
+    if decoded.contacts.len() != 2 {
+        return TestResult::Fail("two contacts expected");
+    }
+    let c0 = &decoded.contacts[0];
+    if !c0.tip_switch || c0.contact_id != 0x05 || c0.x != 0x1234 || c0.y != 0x5678 {
+        return TestResult::Fail("contact 0 decode wrong");
+    }
+    if !c0.in_range {
+        return TestResult::Fail("contact 0 in_range should be true");
+    }
+    let c1 = &decoded.contacts[1];
+    if !c1.tip_switch || c1.contact_id != 0x07 || c1.x != 0x0F0F || c1.y != 0x00AA {
+        return TestResult::Fail("contact 1 decode wrong");
+    }
+    if c1.in_range {
+        return TestResult::Fail("contact 1 in_range should be false");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "hid/touchscreen",
+    smoke_touchscreen_decodes_report_payload
+);
+
+fn smoke_touchscreen_rejects_wrong_report_id() -> TestResult {
+    use crate::touchscreen;
+    let blob = touchscreen::__touchscreen_descriptor_blob();
+    let parsed = parse(blob).expect("parse");
+    let profile = touchscreen::detect(&parsed).expect("detect");
+    let mut report = alloc::vec![0u8; 32];
+    report[0] = 2; // wrong report id
+    match touchscreen::decode_input(&profile, &report) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("mismatched report id should have been rejected"),
+    }
+}
+kernel_test_in!(
+    "hid/touchscreen",
+    smoke_touchscreen_rejects_wrong_report_id
+);
+

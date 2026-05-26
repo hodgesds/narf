@@ -240,3 +240,325 @@ pub fn service_uuids_16(buf: &[u8]) -> Vec<u16> {
     }
     out
 }
+
+// ── Central role — scan + connect HCI command builders ────────────
+//
+// Vol 4 Part E §7.8.10/11/12 define the LE Central scan + connect
+// commands. The builders below produce the parameter-only bytes that
+// go after the 2-byte opcode + 1-byte length in an HCI Command.
+
+/// `Scan_Type` per §7.8.10 — 0x00 = Passive (RX only), 0x01 = Active
+/// (RX + SCAN_REQ + RX SCAN_RSP).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScanType {
+    Passive = 0x00,
+    Active = 0x01,
+}
+
+/// `Own_Address_Type` per §7.8.10/12 — 0x00 = Public, 0x01 = Random,
+/// 0x02 = Resolvable Private (fallback Public), 0x03 = Resolvable
+/// Private (fallback Random).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OwnAddressType {
+    Public = 0x00,
+    Random = 0x01,
+    ResolvablePublic = 0x02,
+    ResolvableRandom = 0x03,
+}
+
+/// `Peer_Address_Type` per §7.8.12.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PeerAddressType {
+    Public = 0x00,
+    Random = 0x01,
+}
+
+/// `Scanning_Filter_Policy` per §7.8.10. 0x00 = accept all,
+/// 0x01 = accept only those in the filter accept list, plus the
+/// extended variants 0x02 / 0x03 (RPA-aware).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScanFilterPolicy {
+    AcceptAll = 0x00,
+    AcceptListOnly = 0x01,
+    AcceptAllRpa = 0x02,
+    AcceptListOnlyRpa = 0x03,
+}
+
+/// `Initiator_Filter_Policy` per §7.8.12.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InitiatorFilterPolicy {
+    /// Connect to the peer address in `peer_address`.
+    PeerAddress = 0x00,
+    /// Connect to any device in the filter accept list.
+    AcceptList = 0x01,
+}
+
+/// LE Set Scan Parameters payload (§7.8.10).
+///
+/// `scan_interval` and `scan_window` are in units of 0.625 ms, range
+/// 0x0004..=0x4000 (2.5 ms..=10240 ms).
+#[derive(Copy, Clone, Debug)]
+pub struct ScanParameters {
+    pub scan_type: ScanType,
+    pub scan_interval: u16,
+    pub scan_window: u16,
+    pub own_address_type: OwnAddressType,
+    pub scanning_filter_policy: ScanFilterPolicy,
+}
+
+impl Default for ScanParameters {
+    fn default() -> Self {
+        // Sensible defaults for Central discovery: passive, 30 ms / 30 ms,
+        // public address, accept-all. Matches the Linux default for
+        // `hcitool lescan` minus the duplicate filter (that knob lives
+        // in Set_Scan_Enable, not Set_Scan_Parameters).
+        Self {
+            scan_type: ScanType::Passive,
+            // 0x0030 * 0.625 ms = 30 ms
+            scan_interval: 0x0030,
+            scan_window: 0x0030,
+            own_address_type: OwnAddressType::Public,
+            scanning_filter_policy: ScanFilterPolicy::AcceptAll,
+        }
+    }
+}
+
+impl ScanParameters {
+    /// Build the 7-byte parameter block for HCI_LE_Set_Scan_Parameters.
+    pub fn encode(&self) -> [u8; 7] {
+        let si = self.scan_interval.to_le_bytes();
+        let sw = self.scan_window.to_le_bytes();
+        [
+            self.scan_type as u8,
+            si[0],
+            si[1],
+            sw[0],
+            sw[1],
+            self.own_address_type as u8,
+            self.scanning_filter_policy as u8,
+        ]
+    }
+}
+
+/// LE Set Scan Enable payload (§7.8.11).
+#[derive(Copy, Clone, Debug)]
+pub struct ScanEnable {
+    pub enable: bool,
+    pub filter_duplicates: bool,
+}
+
+impl ScanEnable {
+    pub fn encode(&self) -> [u8; 2] {
+        [self.enable as u8, self.filter_duplicates as u8]
+    }
+}
+
+/// LE Create Connection payload (§7.8.12). 25 bytes on the wire.
+///
+/// `min_interval` / `max_interval` are units of 1.25 ms (range
+/// 0x0006..=0x0C80 ⇒ 7.5 ms..=4000 ms). `supervision_timeout` is
+/// units of 10 ms.
+#[derive(Copy, Clone, Debug)]
+pub struct CreateConnection {
+    pub scan_interval: u16,
+    pub scan_window: u16,
+    pub initiator_filter_policy: InitiatorFilterPolicy,
+    pub peer_address_type: PeerAddressType,
+    pub peer_address: [u8; 6],
+    pub own_address_type: OwnAddressType,
+    pub conn_interval_min: u16,
+    pub conn_interval_max: u16,
+    pub max_latency: u16,
+    pub supervision_timeout: u16,
+    pub min_ce_length: u16,
+    pub max_ce_length: u16,
+}
+
+impl CreateConnection {
+    /// Defaults for a typical Central connection to a known peer:
+    /// 30 ms scan, public-address peer, 30..50 ms connection
+    /// interval, 4 s supervision timeout.
+    pub fn to_peer(peer_address_type: PeerAddressType, peer_address: [u8; 6]) -> Self {
+        Self {
+            scan_interval: 0x0030,
+            scan_window: 0x0030,
+            initiator_filter_policy: InitiatorFilterPolicy::PeerAddress,
+            peer_address_type,
+            peer_address,
+            own_address_type: OwnAddressType::Public,
+            // 0x0018 * 1.25ms = 30ms; 0x0028 * 1.25ms = 50ms.
+            conn_interval_min: 0x0018,
+            conn_interval_max: 0x0028,
+            max_latency: 0x0000,
+            // 0x0190 * 10ms = 4000ms.
+            supervision_timeout: 0x0190,
+            min_ce_length: 0,
+            max_ce_length: 0,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; 25] {
+        let mut out = [0u8; 25];
+        out[0..2].copy_from_slice(&self.scan_interval.to_le_bytes());
+        out[2..4].copy_from_slice(&self.scan_window.to_le_bytes());
+        out[4] = self.initiator_filter_policy as u8;
+        out[5] = self.peer_address_type as u8;
+        out[6..12].copy_from_slice(&self.peer_address);
+        out[12] = self.own_address_type as u8;
+        out[13..15].copy_from_slice(&self.conn_interval_min.to_le_bytes());
+        out[15..17].copy_from_slice(&self.conn_interval_max.to_le_bytes());
+        out[17..19].copy_from_slice(&self.max_latency.to_le_bytes());
+        out[19..21].copy_from_slice(&self.supervision_timeout.to_le_bytes());
+        out[21..23].copy_from_slice(&self.min_ce_length.to_le_bytes());
+        out[23..25].copy_from_slice(&self.max_ce_length.to_le_bytes());
+        out
+    }
+}
+
+/// HCI_Disconnect (§7.1.6) parameter block. 3 bytes:
+/// `connection_handle` (2 LE) + `reason` (1).
+///
+/// The `reason` byte is one of the HCI error codes (§1.3). The host
+/// only ever picks "Remote User Terminated Connection" (0x13) for a
+/// clean teardown.
+pub fn build_disconnect(connection_handle: u16, reason: u8) -> [u8; 3] {
+    let h = (connection_handle & 0x0FFF).to_le_bytes();
+    [h[0], h[1], reason]
+}
+
+/// Standard "Remote User Terminated Connection" reason code from
+/// Vol 1 Part F §1.3 (HCI Error Code 0x13). The only value the host
+/// is permitted to use for a host-initiated disconnect.
+pub const DISCONNECT_REASON_REMOTE_USER: u8 = 0x13;
+
+// ── Central state machine ─────────────────────────────────────────
+//
+// A Central tracks its scan state + known peers. Real bring-up wires
+// this into a controller; the state machine itself is transport-free
+// so it's straightforward to unit-test.
+
+/// Phases the Central walks during discovery + connection setup.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CentralPhase {
+    /// Initial state, no scan in progress.
+    Idle,
+    /// Set_Scan_Parameters issued, awaiting Command Complete.
+    ParametersSent,
+    /// Set_Scan_Enable(enable=1) issued, controller is scanning.
+    Scanning,
+    /// Set_Scan_Enable(enable=0) issued before LE_Create_Connection.
+    ScanStopping,
+    /// LE_Create_Connection issued, awaiting LE Connection Complete.
+    Connecting,
+    /// Connection complete; controller holds the link.
+    Connected,
+}
+
+/// A discovered peer from the Central's scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredPeer {
+    pub address_type: u8,
+    pub address: [u8; 6],
+    pub last_rssi: i8,
+    pub event_type: u8,
+    pub ad_data: Vec<u8>,
+}
+
+/// Lightweight Central state machine. Pass advertising reports in,
+/// pull HCI command opcode + parameter pairs out for the controller
+/// driver to send.
+#[derive(Debug, Default)]
+pub struct Central {
+    pub phase: CentralPhase,
+    pub peers: Vec<DiscoveredPeer>,
+    pub connected_handle: Option<u16>,
+}
+
+impl Default for CentralPhase {
+    fn default() -> Self {
+        CentralPhase::Idle
+    }
+}
+
+impl Central {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a discovered peer (or refresh its `last_rssi`).
+    pub fn report_advertisement(
+        &mut self,
+        address_type: u8,
+        address: [u8; 6],
+        event_type: u8,
+        ad_data: &[u8],
+        rssi: i8,
+    ) {
+        if let Some(p) = self
+            .peers
+            .iter_mut()
+            .find(|p| p.address == address && p.address_type == address_type)
+        {
+            p.last_rssi = rssi;
+            p.event_type = event_type;
+            // Refresh AD bytes if non-empty (scan responses carry
+            // distinct AD records and should replace the latest).
+            if !ad_data.is_empty() {
+                p.ad_data = ad_data.to_vec();
+            }
+            return;
+        }
+        self.peers.push(DiscoveredPeer {
+            address_type,
+            address,
+            last_rssi: rssi,
+            event_type,
+            ad_data: ad_data.to_vec(),
+        });
+    }
+
+    /// Mark phase after the host has just emitted Set_Scan_Parameters.
+    pub fn note_parameters_sent(&mut self) {
+        self.phase = CentralPhase::ParametersSent;
+    }
+
+    /// Mark phase after the host has just emitted Set_Scan_Enable(1).
+    pub fn note_scanning(&mut self) {
+        self.phase = CentralPhase::Scanning;
+    }
+
+    /// Mark phase after the host has just emitted Set_Scan_Enable(0)
+    /// to pre-empt a connect.
+    pub fn note_scan_stopping(&mut self) {
+        self.phase = CentralPhase::ScanStopping;
+    }
+
+    /// Mark phase after the host has just emitted LE_Create_Connection.
+    pub fn note_connecting(&mut self) {
+        self.phase = CentralPhase::Connecting;
+    }
+
+    /// Apply an LE Connection Complete subevent — clears any in-flight
+    /// scan, records the connection handle, advances the state.
+    pub fn note_connection_complete(&mut self, status: u8, handle: u16) {
+        if status == 0x00 {
+            self.connected_handle = Some(handle);
+            self.phase = CentralPhase::Connected;
+        } else {
+            // Failed connect: drop back to Idle. The host can retry.
+            self.connected_handle = None;
+            self.phase = CentralPhase::Idle;
+        }
+    }
+
+    /// Apply a Disconnection Complete event — clears connection state.
+    pub fn note_disconnected(&mut self) {
+        self.connected_handle = None;
+        self.phase = CentralPhase::Idle;
+    }
+}

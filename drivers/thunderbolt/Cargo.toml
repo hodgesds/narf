@@ -1,0 +1,31 @@
+[package]
+name         = "narf-drivers-thunderbolt"
+description  = "Thunderbolt / USB4 host controller (NHI) driver. Stage-0: PCI match table + BAR0 mapping + identity register read."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_thunderbolt"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-bus          = { path = "../../bus" }
+narf-capabilities = { path = "../../capabilities" }
+narf-console      = { path = "../../console" }
+narf-drivers      = { path = "../" }
+narf-init         = { path = "../../init" }
+narf-memory       = { path = "../../memory" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+# Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't trip
+# the unexpected_cfgs lint. Gating is at the source level; the
+# harness pulls these crates regardless.
+kernel-test = []
+
+[lints]
+workspace = true

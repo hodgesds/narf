@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod i2c_hid;
 pub mod i2c_hid_bind;
+pub mod i2c_hid_touch;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]

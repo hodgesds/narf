@@ -49,6 +49,14 @@ pub mod digitizer {
     pub const IN_RANGE: u16 = 0x32;
     pub const TOUCH_VALID: u16 = 0x33;
     pub const TIP_SWITCH: u16 = 0x42;
+    /// Width of the contact bounding box (HID Usage Tables 1.4
+    /// §16). Touchscreens report this for finger-shape-aware
+    /// gesture engines; Stage-0 touchscreen decoder ignores it
+    /// but reserves the constant so a downstream pass doesn't
+    /// have to re-vendor the spec.
+    pub const WIDTH: u16 = 0x48;
+    /// Height of the contact bounding box, paired with `WIDTH`.
+    pub const HEIGHT: u16 = 0x49;
     pub const CONTACT_ID: u16 = 0x51;
     pub const CONTACT_COUNT: u16 = 0x54;
     pub const CONTACT_COUNT_MAX: u16 = 0x55;

@@ -1378,3 +1378,254 @@ mod i2c_hid_bind_smokes {
         smoke_set_ptp_multi_touch_mode_writes_set_feature
     );
 }
+
+// ── i2c-hid touchscreen pump ──────────────────────────────────────
+//
+// Smokes for the touchscreen decode → TouchEvent translation path.
+// The descriptor + report decode itself is covered in narf-hid;
+// here we exercise the slot-allocation + Down/Move/Up state
+// transitions + coordinate normalisation that the bind layer adds
+// on top of the decoder.
+
+mod i2c_hid_touch_smokes {
+    use narf_input::{
+        TouchState, __reset_global_ring_for_test, init_global_ring, pop_touch,
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use crate::i2c_hid_touch::{
+        __build_decoded_for_test, __new_state_for_test, __pump_report_for_test,
+    };
+
+    /// Manufacture a TouchscreenProfile from the canonical HID
+    /// touchscreen descriptor in narf-hid. Keeps the smokes tiny.
+    fn make_profile() -> narf_hid::touchscreen::TouchscreenProfile {
+        let blob = narf_hid::touchscreen::__touchscreen_descriptor_blob();
+        let parsed = narf_hid::parse(blob).expect("parse");
+        narf_hid::touchscreen::detect(&parsed).expect("detect")
+    }
+
+    fn smoke_touchscreen_down_move_up_lifecycle() -> TestResult {
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let profile = make_profile();
+        let mut state = __new_state_for_test();
+
+        // First report: contact id 5 down at (0x1000, 0x2000).
+        let n = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(5, true, 0x1000, 0x2000)]),
+        );
+        if n != 1 {
+            return TestResult::Fail("first report should push one event");
+        }
+        let down = match pop_touch() {
+            Some(t) => t,
+            None => return TestResult::Fail("expected Touch Down event"),
+        };
+        if down.state != TouchState::Down {
+            return TestResult::Fail("first contact must be Down");
+        }
+        if down.id != 5 || down.slot != 0 {
+            return TestResult::Fail("contact id 5 should bind to slot 0");
+        }
+
+        // Second report: same contact, moved. Expect Move.
+        let _ = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(5, true, 0x2000, 0x3000)]),
+        );
+        let mv = match pop_touch() {
+            Some(t) => t,
+            None => return TestResult::Fail("expected Touch Move event"),
+        };
+        if mv.state != TouchState::Move {
+            return TestResult::Fail("second contact must be Move");
+        }
+        if mv.id != 5 || mv.slot != 0 {
+            return TestResult::Fail("Move must reuse slot 0 for contact id 5");
+        }
+
+        // Third report: tip switch released. Expect Up.
+        let _ = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(5, false, 0x2000, 0x3000)]),
+        );
+        let up = match pop_touch() {
+            Some(t) => t,
+            None => return TestResult::Fail("expected Touch Up event"),
+        };
+        if up.state != TouchState::Up {
+            return TestResult::Fail("released contact must be Up");
+        }
+        if up.id != 5 {
+            return TestResult::Fail("Up must carry id 5");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_down_move_up_lifecycle
+    );
+
+    fn smoke_touchscreen_two_fingers_get_distinct_slots() -> TestResult {
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let profile = make_profile();
+        let mut state = __new_state_for_test();
+
+        // Two fingers down at once, contact ids 3 and 7.
+        let n = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[
+                (3, true, 0x0100, 0x0100),
+                (7, true, 0x6000, 0x6000),
+            ]),
+        );
+        if n != 2 {
+            return TestResult::Fail("two contacts down should push 2 events");
+        }
+        let t0 = pop_touch().expect("first event");
+        let t1 = pop_touch().expect("second event");
+        if t0.slot == t1.slot {
+            return TestResult::Fail("two simultaneous contacts must hold distinct slots");
+        }
+        if t0.state != TouchState::Down || t1.state != TouchState::Down {
+            return TestResult::Fail("both initial contacts must be Down");
+        }
+        let ids: alloc::vec::Vec<u16> = alloc::vec![t0.id, t1.id];
+        if !ids.contains(&3) || !ids.contains(&7) {
+            return TestResult::Fail("contact ids should be 3 and 7");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_two_fingers_get_distinct_slots
+    );
+
+    fn smoke_touchscreen_normalises_coordinates_to_u16() -> TestResult {
+        use narf_input::TouchEvent;
+        let max = TouchEvent::normalise_axis(0x7FFF, 0, 0x7FFF);
+        if max != u16::MAX {
+            return TestResult::Fail("max value should map to 0xFFFF");
+        }
+        let min = TouchEvent::normalise_axis(0, 0, 0x7FFF);
+        if min != 0 {
+            return TestResult::Fail("min value should map to 0");
+        }
+        let mid = TouchEvent::normalise_axis(0x4000, 0, 0x7FFF);
+        if !(0x7FF0..=0x8010).contains(&mid) {
+            return TestResult::Fail("midpoint should normalise to ~0x8000");
+        }
+        let high = TouchEvent::normalise_axis(0x10000, 0, 0x7FFF);
+        if high != u16::MAX {
+            return TestResult::Fail("over-range value should clamp to MAX");
+        }
+        let low = TouchEvent::normalise_axis(-100, 0, 0x7FFF);
+        if low != 0 {
+            return TestResult::Fail("under-range value should clamp to 0");
+        }
+        let degen = TouchEvent::normalise_axis(42, 100, 100);
+        if degen != 42 {
+            return TestResult::Fail("degenerate range should pass value through");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_normalises_coordinates_to_u16
+    );
+
+    fn smoke_touchscreen_slot_reused_after_release() -> TestResult {
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let profile = make_profile();
+        let mut state = __new_state_for_test();
+
+        let _ = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(42, true, 0, 0)]),
+        );
+        let _ = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(42, false, 0, 0)]),
+        );
+        let _ = pop_touch();
+        let _ = pop_touch();
+
+        let _ = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(99, true, 0, 0)]),
+        );
+        let new_touch = match pop_touch() {
+            Some(t) => t,
+            None => return TestResult::Fail("expected Touch Down for id 99"),
+        };
+        if new_touch.id != 99 || new_touch.slot != 0 {
+            return TestResult::Fail("freed slot 0 should be reused by next Down");
+        }
+        if new_touch.state != TouchState::Down {
+            return TestResult::Fail("new contact must be Down");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_slot_reused_after_release
+    );
+
+    fn smoke_touchscreen_event_lands_on_touch_ring() -> TestResult {
+        init_global_ring(8);
+        __reset_global_ring_for_test();
+        let profile = make_profile();
+        let mut state = __new_state_for_test();
+        let _ = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(1, true, 0x100, 0x200)]),
+        );
+        match pop_touch() {
+            Some(_) => TestResult::Pass,
+            None => TestResult::Fail("touch event missing from Touch ring"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_event_lands_on_touch_ring
+    );
+
+    fn smoke_touchscreen_no_event_on_unknown_release() -> TestResult {
+        // A "tip_switch=0" report for a contact id we never saw
+        // Down should NOT emit anything — there's no slot to
+        // release.
+        init_global_ring(8);
+        __reset_global_ring_for_test();
+        let profile = make_profile();
+        let mut state = __new_state_for_test();
+        let n = __pump_report_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(123, false, 0, 0)]),
+        );
+        if n != 0 {
+            return TestResult::Fail("phantom release should not produce an event");
+        }
+        if pop_touch().is_some() {
+            return TestResult::Fail("phantom release pushed an event");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_no_event_on_unknown_release
+    );
+}
+

@@ -50,6 +50,27 @@ pub const HCI_LE_READ_BUFFER_SIZE_V1: u16 = opcode(OGF_LE_CONTROLLER, 0x0002);
 pub const HCI_LE_READ_LOCAL_SUPPORTED_FEATURES: u16 = opcode(OGF_LE_CONTROLLER, 0x0003);
 pub const HCI_LE_SET_EVENT_MASK: u16 = opcode(OGF_LE_CONTROLLER, 0x0001);
 
+// ── LE Central GAP (§7.8) — scan + connect ────────────────────────
+/// HCI_LE_Set_Scan_Parameters (§7.8.10). 7-byte parameter:
+/// scan_type (1) + scan_interval (2 LE) + scan_window (2 LE) +
+/// own_address_type (1) + scanning_filter_policy (1).
+pub const HCI_LE_SET_SCAN_PARAMETERS: u16 = opcode(OGF_LE_CONTROLLER, 0x000B);
+/// HCI_LE_Set_Scan_Enable (§7.8.11). 2-byte parameter:
+/// scan_enable (1) + filter_duplicates (1).
+pub const HCI_LE_SET_SCAN_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x000C);
+/// HCI_LE_Create_Connection (§7.8.12). 25-byte parameter block.
+/// Returns Command Status (not Command Complete); the connection
+/// outcome is signalled by an LE Connection Complete subevent.
+pub const HCI_LE_CREATE_CONNECTION: u16 = opcode(OGF_LE_CONTROLLER, 0x000D);
+/// HCI_LE_Create_Connection_Cancel (§7.8.13). No parameters.
+pub const HCI_LE_CREATE_CONNECTION_CANCEL: u16 = opcode(OGF_LE_CONTROLLER, 0x000E);
+
+// ── Link Control (§7.1) — generic link teardown ───────────────────
+/// HCI_Disconnect (§7.1.6). 3-byte parameter:
+/// connection_handle (2 LE) + reason (1). Returns Command Status;
+/// completion is signalled by Disconnection Complete (§7.7.5).
+pub const HCI_DISCONNECT: u16 = opcode(OGF_LINK_CONTROL, 0x0006);
+
 #[cfg(test)]
 mod selftest {
     use super::*;
@@ -62,4 +83,12 @@ mod selftest {
     const _: () = assert!(HCI_READ_LOCAL_VERSION == 0x1001);
     // §7.4.6: OGF=0x04, OCF=0x0009 → 0x1009.
     const _: () = assert!(HCI_READ_BD_ADDR == 0x1009);
+    // §7.8.10: OGF=0x08, OCF=0x000B → 0x200B.
+    const _: () = assert!(HCI_LE_SET_SCAN_PARAMETERS == 0x200B);
+    // §7.8.11: OGF=0x08, OCF=0x000C → 0x200C.
+    const _: () = assert!(HCI_LE_SET_SCAN_ENABLE == 0x200C);
+    // §7.8.12: OGF=0x08, OCF=0x000D → 0x200D.
+    const _: () = assert!(HCI_LE_CREATE_CONNECTION == 0x200D);
+    // §7.1.6: OGF=0x01, OCF=0x0006 → 0x0406.
+    const _: () = assert!(HCI_DISCONNECT == 0x0406);
 }

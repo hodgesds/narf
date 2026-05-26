@@ -480,26 +480,108 @@ pub struct AbsoluteEvent {
     pub value: i32,
 }
 
-/// One contact slot of an evdev multi-touch protocol-B frame.
+/// Lifecycle of one multi-touch contact, encoded explicitly so
+/// consumers don't have to reconstruct it from `tracking_id`
+/// transitions. `Down` = first frame this contact appears in,
+/// `Move` = position / pressure update for an already-active
+/// contact, `Up` = release. Touchscreens and touchpads on the
+/// HID Digitizer page produce all three; the producer is
+/// responsible for tracking per-slot state to set this correctly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TouchState {
+    Down,
+    Move,
+    Up,
+}
+
+/// One contact slot of a multi-touch frame. Used by both evdev
+/// protocol-B touchpads (virtio-input) and HID Digitizer
+/// touchscreens (i2c-hid → `digitizer` page 0x0D).
 ///
-/// `slot` is the MT slot id (per `ABS_MT_SLOT`). `tracking_id`
-/// distinguishes generations of the same physical finger — when
-/// the driver lifts a contact it sets `tracking_id` to `None`
-/// (matching evdev's "tracking_id = -1 means slot released"
-/// convention). `x`, `y`, `pressure` are device-coordinate values
-/// from the matching `ABS_MT_POSITION_X / _Y / _PRESSURE` axes.
+/// `slot` is the MT slot id (per `ABS_MT_SLOT` for evdev, or the
+/// per-finger collection index for HID Digitizer). `tracking_id`
+/// distinguishes generations of the same physical finger — `None`
+/// = released (evdev `tracking_id = -1`; HID `Tip Switch` == 0).
+/// `id` is the device-reported Contact Identifier from HID
+/// Digitizer reports, or the evdev tracking-id cast to u16; the
+/// producer sets it to disambiguate fingers across reports.
+///
+/// `x`, `y`, `pressure` are device-coordinate values. Touchscreen
+/// callers can normalise them via [`TouchEvent::normalise_axis`]
+/// against the `(min, max)` of the corresponding HID Logical
+/// axes, producing a `0..=65535` fixed-point space the windowing
+/// layer can consume directly.
+///
+/// `state` is the explicit lifecycle phase (`Down` / `Move` /
+/// `Up`) — derived by the producer from per-slot history so
+/// consumers don't have to re-derive it from `tracking_id`
+/// changes.
 ///
 /// One `TouchEvent` is emitted per dirty slot at every input
-/// frame boundary (`EV_SYN`), so consumers see a self-contained
-/// snapshot per touch transition without having to reconstruct
-/// slot state themselves.
+/// frame boundary, so consumers see a self-contained snapshot
+/// per touch transition without having to reconstruct slot state
+/// themselves.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TouchEvent {
     pub slot: u8,
     pub tracking_id: Option<i32>,
+    /// Device-reported Contact Identifier (HID Digitizer usage
+    /// 0x51) or evdev tracking-id cast — zero when neither is
+    /// known. Stable across frames within one touch lifetime.
+    pub id: u16,
     pub x: i32,
     pub y: i32,
     pub pressure: i32,
+    pub state: TouchState,
+}
+
+impl TouchEvent {
+    /// Linearly remap one device-axis sample into the
+    /// `0..=65535` fixed-point space the touchscreen public
+    /// surface uses. `min` / `max` are the HID `Logical
+    /// Minimum` / `Logical Maximum` from the field descriptor
+    /// (or the evdev `AxisInfo::{min,max}` for protocol-B
+    /// digitisers). Clamps out-of-range values to the endpoints
+    /// rather than wrapping — a touchscreen reporting outside
+    /// its declared range is a firmware bug, but the rendered
+    /// cursor should track the screen edge rather than jumping.
+    ///
+    /// Returns the input value unchanged when `min == max`
+    /// (degenerate axis — keeps the call site safe to invoke
+    /// without pre-checking).
+    pub fn normalise_axis(value: i32, min: i32, max: i32) -> u16 {
+        if max <= min {
+            return value.clamp(0, u16::MAX as i32) as u16;
+        }
+        let v = value.clamp(min, max) as i64;
+        let lo = min as i64;
+        let hi = max as i64;
+        // (v - lo) / (hi - lo) * 65535, computed in i64 to
+        // avoid overflow on big logical ranges (touchscreens
+        // commonly use 0..=16383 or 0..=32767).
+        let num = (v - lo).saturating_mul(u16::MAX as i64);
+        let den = hi - lo;
+        let scaled = num / den;
+        scaled.clamp(0, u16::MAX as i64) as u16
+    }
+
+    /// Convenience over [`Self::normalise_axis`] returning both
+    /// coordinates as a `(u16, u16)` pair, mapping
+    /// `(x, x_min, x_max)` and `(y, y_min, y_max)` into the
+    /// shared `0..=65535` space.
+    pub fn normalise_xy(
+        x: i32,
+        y: i32,
+        x_min: i32,
+        x_max: i32,
+        y_min: i32,
+        y_max: i32,
+    ) -> (u16, u16) {
+        (
+            Self::normalise_axis(x, x_min, x_max),
+            Self::normalise_axis(y, y_min, y_max),
+        )
+    }
 }
 
 /// Generic button event for `BTN_*` codes that aren't keyboard

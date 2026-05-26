@@ -279,8 +279,9 @@ pub mod tests {
         ucode_bytes: u32,
     ) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; 64 + ucode_bytes as usize];
+        let total_size = buf.len() as u32;
         // Common header.
-        buf[0..4].copy_from_slice(&(buf.len() as u32).to_le_bytes()); // size_bytes
+        buf[0..4].copy_from_slice(&total_size.to_le_bytes()); // size_bytes
         buf[4..8].copy_from_slice(&(COMMON_HEADER_BYTES as u32).to_le_bytes());
         buf[8..10].copy_from_slice(&1u16.to_le_bytes()); // header_version_major
         buf[10..12].copy_from_slice(&0u16.to_le_bytes()); // header_version_minor

@@ -142,6 +142,7 @@ pub mod dp_link_training;
 pub mod intel_gpu;
 pub mod intel_gpu_aux;
 pub mod intel_gpu_ddi;
+pub mod intel_gpu_dp_bridge;
 pub mod intel_gpu_modeset;
 pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
@@ -158,7 +159,9 @@ pub mod nvidia_gpu_pmc;
 mod tests;
 
 /// Stage::Subsys initcalls — register every GPU driver with the
-/// bus match table.
+/// bus match table. Stage::Late initcalls hook DP Alt Mode →
+/// GPU bridges into the usbpd registry so a USB-C port that finishes
+/// VESA DP negotiation can hand off to the right display engine.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "amdgpu-pci", || {
@@ -171,6 +174,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "nvidia-gpu-pci", || {
         nvidia_gpu::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Late, "intel-gpu-dp-bridge", || {
+        intel_gpu_dp_bridge::register_bridge();
         InitResult::Ok
     });
 }

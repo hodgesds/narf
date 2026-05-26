@@ -1108,6 +1108,383 @@ kernel_test_in!(
     smoke_l2cap_signalling_packs_multiple_commands
 );
 
+// ── L2CAP ACL ⇄ frame wrap / dispatcher (Stage 1) ──────────────────
+
+fn smoke_l2cap_wrap_bframe_fits_single_acl_packet() -> TestResult {
+    use crate::l2cap::{wrap_frame_into_acl, BFrame, CID_ATT, PB_FIRST_FLUSHABLE};
+    let frame = BFrame::new(CID_ATT, vec![0x02, 0x17, 0x00]); // ATT Exchange_MTU_Req(23)
+    let acl = wrap_frame_into_acl(0x002A, &frame, 27, /*le=*/ true);
+    if acl.len() != 1 {
+        return TestResult::Fail("single B-frame should fit in one ACL packet");
+    }
+    if acl[0].pb_flag != PB_FIRST_FLUSHABLE {
+        return TestResult::Fail("first LE ACL packet should use PB=0b10");
+    }
+    if acl[0].handle != 0x002A {
+        return TestResult::Fail("ACL handle not preserved");
+    }
+    let raw = frame.encode();
+    if acl[0].data != raw {
+        return TestResult::Fail("ACL payload should equal encoded B-frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_wrap_bframe_fits_single_acl_packet
+);
+
+fn smoke_l2cap_wrap_bframe_fragments_across_acl_packets() -> TestResult {
+    use crate::l2cap::{
+        wrap_frame_into_acl, BFrame, CID_ATT, PB_CONTINUATION, PB_FIRST_FLUSHABLE,
+    };
+    // 100-byte payload + 4-byte L2CAP header = 104-byte frame; an MTU
+    // of 27 forces 4 ACL packets.
+    let frame = BFrame::new(CID_ATT, vec![0xAB; 100]);
+    let acl = wrap_frame_into_acl(0x0100, &frame, 27, /*le=*/ true);
+    if acl.len() != ((104 + 26) / 27) {
+        return TestResult::Fail("expected 4 ACL fragments for 104-byte frame at MTU 27");
+    }
+    if acl[0].pb_flag != PB_FIRST_FLUSHABLE {
+        return TestResult::Fail("first fragment should use PB=0b10");
+    }
+    for f in &acl[1..] {
+        if f.pb_flag != PB_CONTINUATION {
+            return TestResult::Fail("continuation fragments should use PB=0b01");
+        }
+    }
+    // Total fragment payload bytes should reconstruct the frame.
+    let mut reassembled = Vec::new();
+    for f in &acl {
+        reassembled.extend_from_slice(&f.data);
+    }
+    if reassembled != frame.encode() {
+        return TestResult::Fail("fragment reassembly differs from original encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_wrap_bframe_fragments_across_acl_packets
+);
+
+fn smoke_l2cap_dispatcher_routes_inbound_acl_to_att_cid() -> TestResult {
+    use crate::l2cap::{
+        wrap_frame_into_acl, BFrame, CidClass, Dispatcher, CID_ATT, CID_LE_SIGNALLING, CID_SMP,
+    };
+    let frame = BFrame::new(CID_ATT, vec![0x0B, 0xAA, 0xBB, 0xCC]); // ATT Read Rsp
+    let acl = wrap_frame_into_acl(0x0001, &frame, 27, /*le=*/ true);
+    let mut disp = Dispatcher::new();
+    let mut frames = Vec::new();
+    for p in &acl {
+        let f = disp.feed_acl(p.pb_flag, &p.data);
+        frames.extend(f);
+    }
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one reassembled frame");
+    }
+    if frames[0] != frame {
+        return TestResult::Fail("dispatcher's frame doesn't match the wire frame");
+    }
+    if Dispatcher::classify_cid(frames[0].cid) != CidClass::Att {
+        return TestResult::Fail("CID 0x0004 must classify as Att");
+    }
+    if Dispatcher::classify_cid(CID_LE_SIGNALLING) != CidClass::LeSignalling {
+        return TestResult::Fail("CID 0x0005 must classify as LeSignalling");
+    }
+    if Dispatcher::classify_cid(CID_SMP) != CidClass::Smp {
+        return TestResult::Fail("CID 0x0006 must classify as Smp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_dispatcher_routes_inbound_acl_to_att_cid
+);
+
+fn smoke_l2cap_dispatcher_reassembles_fragmented_acl() -> TestResult {
+    use crate::l2cap::{wrap_frame_into_acl, BFrame, Dispatcher, CID_ATT};
+    // 50-byte ATT Read Rsp value; ACL MTU 27 forces ≥3 fragments.
+    let mut payload = vec![0x0Bu8];
+    payload.extend_from_slice(&[0xA5; 49]);
+    let frame = BFrame::new(CID_ATT, payload);
+    let acl = wrap_frame_into_acl(0x0007, &frame, 27, /*le=*/ true);
+    if acl.len() < 2 {
+        return TestResult::Fail("test precondition: needs ≥2 ACL fragments");
+    }
+    let mut disp = Dispatcher::new();
+    for (i, p) in acl.iter().enumerate() {
+        let frames = disp.feed_acl(p.pb_flag, &p.data);
+        if i < acl.len() - 1 {
+            if !frames.is_empty() {
+                return TestResult::Fail("only the final fragment should complete the frame");
+            }
+        } else if frames.len() != 1 || frames[0] != frame {
+            return TestResult::Fail("final fragment did not produce the original frame");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_dispatcher_reassembles_fragmented_acl
+);
+
+// ── HCI events used by the L2CAP/connection layer (Stage 1) ────────
+
+fn smoke_hci_disconnection_complete_parse() -> TestResult {
+    use crate::event::DisconnectionComplete;
+    use crate::hci::Event;
+    let event = Event {
+        code: crate::event::EventCode::DisconnectionComplete as u8,
+        params: vec![
+            0x00,       // status
+            0x2A, 0x00, // handle = 0x002A
+            0x13,       // reason = Remote User Terminated
+        ],
+    };
+    let dc = DisconnectionComplete::parse(&event).expect("parse");
+    if dc.status != 0x00 || dc.handle != 0x002A || dc.reason != 0x13 {
+        return TestResult::Fail("DisconnectionComplete fields wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_disconnection_complete_parse);
+
+fn smoke_hci_number_of_completed_packets_parse() -> TestResult {
+    use crate::event::NumberOfCompletedPackets;
+    use crate::hci::Event;
+    // Two handles: 0x002A → 5 pkts, 0x002B → 1 pkt.
+    let event = Event {
+        code: crate::event::EventCode::NumberOfCompletedPackets as u8,
+        params: vec![
+            0x02, // num_handles
+            0x2A, 0x00, 0x05, 0x00,
+            0x2B, 0x00, 0x01, 0x00,
+        ],
+    };
+    let n = NumberOfCompletedPackets::parse(&event).expect("parse");
+    if n.entries.len() != 2 {
+        return TestResult::Fail("expected 2 (handle, count) pairs");
+    }
+    if n.entries[0] != (0x002A, 5) || n.entries[1] != (0x002B, 1) {
+        return TestResult::Fail("entries wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_number_of_completed_packets_parse);
+
+fn smoke_hci_le_connection_complete_parse() -> TestResult {
+    use crate::event::LeConnectionComplete;
+    use crate::hci::Event;
+    // 1-byte subevent (0x01) + 18-byte payload.
+    let mut p = vec![0x01u8]; // subevent
+    p.push(0x00); // status
+    p.extend_from_slice(&0x002Au16.to_le_bytes()); // handle
+    p.push(0x00); // role = Central
+    p.push(0x00); // peer address type = public
+    p.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // peer addr
+    p.extend_from_slice(&0x0018u16.to_le_bytes()); // conn interval
+    p.extend_from_slice(&0x0000u16.to_le_bytes()); // latency
+    p.extend_from_slice(&0x0190u16.to_le_bytes()); // supervision timeout
+    p.push(0x00); // clock accuracy
+    let event = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: p,
+    };
+    let cc = LeConnectionComplete::parse(&event).expect("parse");
+    if cc.status != 0x00 || cc.handle != 0x002A || cc.role != 0x00 {
+        return TestResult::Fail("LE Connection Complete fields wrong");
+    }
+    if cc.peer_address != [0x11, 0x22, 0x33, 0x44, 0x55, 0x66] {
+        return TestResult::Fail("peer address bytes wrong");
+    }
+    if cc.connection_interval != 0x0018 || cc.supervision_timeout != 0x0190 {
+        return TestResult::Fail("connection params wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_le_connection_complete_parse);
+
+fn smoke_hci_le_advertising_report_parse() -> TestResult {
+    use crate::event::parse_le_advertising_reports;
+    use crate::hci::Event;
+    // 1 report: ADV_IND from public 11:22:33:44:55:66, AD = "Flags=06",
+    // RSSI = -50.
+    let mut p = vec![
+        0x02u8, // subevent = AdvertisingReport
+        0x01,   // num_reports
+        0x00,   // event type = ADV_IND
+        0x00,   // address type = public
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+        0x03,        // data_len
+        0x02, 0x01, 0x06, // AD record: Flags=0x06
+    ];
+    p.push((-50i8) as u8);
+    let event = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: p,
+    };
+    let reports = parse_le_advertising_reports(&event).expect("parse");
+    if reports.len() != 1 {
+        return TestResult::Fail("expected 1 report");
+    }
+    let r = &reports[0];
+    if r.event_type != 0x00 || r.address_type != 0x00 {
+        return TestResult::Fail("report type / addr type wrong");
+    }
+    if r.address != [0x11, 0x22, 0x33, 0x44, 0x55, 0x66] {
+        return TestResult::Fail("address bytes wrong");
+    }
+    if r.data != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("AD bytes wrong");
+    }
+    if r.rssi != -50 {
+        return TestResult::Fail("RSSI sign wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_le_advertising_report_parse);
+
+// ── GAP Central — scan + connect command builders + state ──────────
+
+fn smoke_gap_scan_parameters_encoding() -> TestResult {
+    use crate::gap::{OwnAddressType, ScanFilterPolicy, ScanParameters, ScanType};
+    let p = ScanParameters {
+        scan_type: ScanType::Active,
+        scan_interval: 0x0030,
+        scan_window: 0x0030,
+        own_address_type: OwnAddressType::Public,
+        scanning_filter_policy: ScanFilterPolicy::AcceptAll,
+    };
+    let raw = p.encode();
+    if raw[0] != 0x01 {
+        return TestResult::Fail("scan_type should be 0x01 (Active)");
+    }
+    if u16::from_le_bytes([raw[1], raw[2]]) != 0x0030 {
+        return TestResult::Fail("scan_interval bytes wrong");
+    }
+    if u16::from_le_bytes([raw[3], raw[4]]) != 0x0030 {
+        return TestResult::Fail("scan_window bytes wrong");
+    }
+    if raw[5] != 0x00 || raw[6] != 0x00 {
+        return TestResult::Fail("address type / filter policy wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_scan_parameters_encoding);
+
+fn smoke_gap_scan_enable_encoding() -> TestResult {
+    use crate::gap::ScanEnable;
+    let e = ScanEnable {
+        enable: true,
+        filter_duplicates: true,
+    };
+    let raw = e.encode();
+    if raw != [0x01, 0x01] {
+        return TestResult::Fail("ScanEnable should be [enable=1, filter_dupes=1]");
+    }
+    let d = ScanEnable {
+        enable: false,
+        filter_duplicates: false,
+    }
+    .encode();
+    if d != [0x00, 0x00] {
+        return TestResult::Fail("ScanEnable disabled wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_scan_enable_encoding);
+
+fn smoke_gap_create_connection_encoding() -> TestResult {
+    use crate::gap::{CreateConnection, PeerAddressType};
+    let cc = CreateConnection::to_peer(
+        PeerAddressType::Random,
+        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+    );
+    let raw = cc.encode();
+    if raw.len() != 25 {
+        return TestResult::Fail("LE_Create_Connection must be 25 bytes");
+    }
+    if u16::from_le_bytes([raw[0], raw[1]]) != 0x0030 {
+        return TestResult::Fail("scan_interval wrong");
+    }
+    if raw[4] != 0x00 {
+        return TestResult::Fail("initiator filter policy should be PeerAddress");
+    }
+    if raw[5] != 0x01 {
+        return TestResult::Fail("peer address type should be Random");
+    }
+    if raw[6..12] != [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF] {
+        return TestResult::Fail("peer address bytes wrong");
+    }
+    if u16::from_le_bytes([raw[13], raw[14]]) != 0x0018 {
+        return TestResult::Fail("conn_interval_min wrong");
+    }
+    if u16::from_le_bytes([raw[19], raw[20]]) != 0x0190 {
+        return TestResult::Fail("supervision_timeout wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_create_connection_encoding);
+
+fn smoke_gap_disconnect_payload() -> TestResult {
+    use crate::gap::{build_disconnect, DISCONNECT_REASON_REMOTE_USER};
+    let raw = build_disconnect(0x0123, DISCONNECT_REASON_REMOTE_USER);
+    if raw != [0x23, 0x01, 0x13] {
+        return TestResult::Fail("Disconnect payload bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_disconnect_payload);
+
+fn smoke_gap_central_state_machine_walks_scan_connect() -> TestResult {
+    use crate::gap::{Central, CentralPhase};
+    let mut c = Central::new();
+    if c.phase != CentralPhase::Idle {
+        return TestResult::Fail("Central starts at Idle");
+    }
+    c.note_parameters_sent();
+    if c.phase != CentralPhase::ParametersSent {
+        return TestResult::Fail("phase did not advance to ParametersSent");
+    }
+    c.note_scanning();
+    if c.phase != CentralPhase::Scanning {
+        return TestResult::Fail("phase did not advance to Scanning");
+    }
+    c.report_advertisement(0, [1, 2, 3, 4, 5, 6], 0, &[0x02, 0x01, 0x06], -60);
+    if c.peers.len() != 1 || c.peers[0].last_rssi != -60 {
+        return TestResult::Fail("peer not recorded");
+    }
+    // Re-report refreshes RSSI; no duplicate.
+    c.report_advertisement(0, [1, 2, 3, 4, 5, 6], 0, &[], -40);
+    if c.peers.len() != 1 || c.peers[0].last_rssi != -40 {
+        return TestResult::Fail("re-report should refresh RSSI in place");
+    }
+    c.note_scan_stopping();
+    c.note_connecting();
+    c.note_connection_complete(0x00, 0x002A);
+    if c.phase != CentralPhase::Connected || c.connected_handle != Some(0x002A) {
+        return TestResult::Fail("connection complete handler wrong");
+    }
+    c.note_disconnected();
+    if c.phase != CentralPhase::Idle || c.connected_handle.is_some() {
+        return TestResult::Fail("disconnect should reset to Idle");
+    }
+    // Connection complete with failure status drops to Idle, not
+    // Connected.
+    c.note_connecting();
+    c.note_connection_complete(0x05, 0x002A); // Authentication failure
+    if c.phase != CentralPhase::Idle || c.connected_handle.is_some() {
+        return TestResult::Fail("failed connect should go back to Idle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_gap_central_state_machine_walks_scan_connect
+);
+
 fn smoke_transport_registry_round_trip() -> TestResult {
     crate::transport::__test_reset();
     let t = Arc::new(LoopbackTransport::new("reg"));

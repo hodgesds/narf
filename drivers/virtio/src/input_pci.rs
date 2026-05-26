@@ -147,6 +147,11 @@ const ABS_BOUNDS_LEN: usize = 0x40;
 /// evdev convention is `tracking_id = -1` on the wire; the driver
 /// translates that to `None` once and consumers see a clean
 /// `Option<i32>` instead of a magic sentinel.
+///
+/// `was_active` lets the SYN flush compute the explicit
+/// [`narf_input::TouchState`] (Down / Move / Up) the consumer
+/// surface uses — Down on `!was_active && tracking_id.is_some()`,
+/// Up on `was_active && tracking_id.is_none()`, Move otherwise.
 #[derive(Copy, Clone, Default, Debug)]
 struct MtSlot {
     tracking_id: Option<i32>,
@@ -154,6 +159,10 @@ struct MtSlot {
     y: i32,
     pressure: i32,
     dirty: bool,
+    /// Whether the slot held a live tracking id at the *previous*
+    /// SYN boundary. Used by the flush to derive Down vs Move
+    /// without re-scanning history.
+    was_active: bool,
 }
 
 /// Read the (`select`, `subsel`) device-config block. Writes the
@@ -926,25 +935,41 @@ impl VirtioInputPci {
                     }
                     // Flush every dirty MT slot as one Touch event.
                     // Pulled out under the lock so concurrent EV_ABS
-                    // arrivals don't tear a slot's snapshot.
-                    let dirty: alloc::vec::Vec<(u8, MtSlot)> = {
+                    // arrivals don't tear a slot's snapshot. Derive
+                    // the lifecycle state from per-slot `was_active`
+                    // transitions before clearing dirty.
+                    let dirty: alloc::vec::Vec<(u8, MtSlot, bool)> = {
                         let mut g = self.mt.lock();
                         let mut out = alloc::vec::Vec::new();
                         for (idx, slot) in g.slots.iter_mut().enumerate() {
                             if slot.dirty {
-                                out.push((idx as u8, *slot));
+                                let prev_active = slot.was_active;
+                                out.push((idx as u8, *slot, prev_active));
                                 slot.dirty = false;
+                                slot.was_active = slot.tracking_id.is_some();
                             }
                         }
                         out
                     };
-                    for (slot_id, snap) in dirty {
+                    for (slot_id, snap, prev_active) in dirty {
+                        let active = snap.tracking_id.is_some();
+                        let state = match (prev_active, active) {
+                            (false, true) => narf_input::TouchState::Down,
+                            (true, false) => narf_input::TouchState::Up,
+                            _ => narf_input::TouchState::Move,
+                        };
+                        let id = snap
+                            .tracking_id
+                            .map(|t| (t as u32 & 0xFFFF) as u16)
+                            .unwrap_or(0);
                         let _ = push_global(InputEvent::Touch(TouchEvent {
                             slot: slot_id,
                             tracking_id: snap.tracking_id,
+                            id,
                             x: snap.x,
                             y: snap.y,
                             pressure: snap.pressure,
+                            state,
                         }));
                     }
                 }
@@ -1180,14 +1205,28 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                 }
                 for (idx, slot) in mt.slots.iter_mut().enumerate() {
                     if slot.dirty {
+                        let prev_active = slot.was_active;
+                        let active = slot.tracking_id.is_some();
+                        let state = match (prev_active, active) {
+                            (false, true) => narf_input::TouchState::Down,
+                            (true, false) => narf_input::TouchState::Up,
+                            _ => narf_input::TouchState::Move,
+                        };
+                        let id = slot
+                            .tracking_id
+                            .map(|t| (t as u32 & 0xFFFF) as u16)
+                            .unwrap_or(0);
                         let _ = push_global(InputEvent::Touch(TouchEvent {
                             slot: idx as u8,
                             tracking_id: slot.tracking_id,
+                            id,
                             x: slot.x,
                             y: slot.y,
                             pressure: slot.pressure,
+                            state,
                         }));
                         slot.dirty = false;
+                        slot.was_active = active;
                     }
                 }
             }

@@ -37,6 +37,8 @@ narf-drivers-gpio     = { path = "../drivers/gpio" }
 narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
+narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
+narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }
 narf-drivers-fs-ext2  = { path = "../drivers/fs/ext2" }
 narf-drivers-fs-fat   = { path = "../drivers/fs/fat" }
@@ -103,6 +105,8 @@ kernel-test  = [
     "narf-pinctrl/kernel-test",
     "narf-usbpd/kernel-test",
     "narf-drivers-usbpd/kernel-test",
+    "narf-drivers-gpu/kernel-test",
+    "narf-drivers-fingerprint/kernel-test",
     "narf-wireless/kernel-test",
     "narf-drivers-wireless/kernel-test",
     "narf-accel/kernel-test",

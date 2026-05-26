@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod attach;
+pub mod btusb;
 pub mod cdc;
 pub mod ehci;
 pub mod ohci;
@@ -280,6 +281,7 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::AudioClass
                     | AttachOutcome::VideoClass
                     | AttachOutcome::NetworkClass
+                    | AttachOutcome::Bluetooth
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -362,6 +364,7 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::AudioClass
                         | AttachOutcome::VideoClass
                         | AttachOutcome::NetworkClass
+                        | AttachOutcome::Bluetooth
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }

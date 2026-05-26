@@ -70,3 +70,22 @@ impl CapType for Bluetooth {
 pub fn bootstrap_bluetooth_authority() -> Cap<Bluetooth, Grant> {
     Cap::<Bluetooth, Grant>::bootstrap()
 }
+
+/// Stage::Late initcall registration. Stage 0 just registers a
+/// per-stage placeholder so the boot summary records that the
+/// Bluetooth subsystem is wired in; the actual USB transport bind
+/// runs out of the USB host supervisor's per-port attach pass
+/// (`narf_drivers_usb::btusb::try_bind_btusb_already_addressed`).
+///
+/// Future stages will hook here to spawn an HCI event-pump task and
+/// register Bluetooth-specific syscalls.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "bluetooth-stage0", || {
+        // Stage 0: no work beyond registering the subsystem. A real
+        // controller probed by the USB supervisor will print its own
+        // `bluetooth: ... adapter` line at attach time.
+        let _ = transport::transport_count();
+        InitResult::Ok
+    });
+}

@@ -359,3 +359,145 @@ impl<'a> Iterator for SignallingIter<'a> {
         Some(cmd)
     }
 }
+
+// ── ACL ⇄ L2CAP boundary ───────────────────────────────────────────
+//
+// Outbound: a complete L2CAP B-frame is fragmented into one or more
+// ACL packets sized to the controller's ACL MTU. The first fragment
+// uses PB=0b00 (BR/EDR) or PB=0b00/0b10/0b11 (LE); a Complete-LE PDU
+// in a single ACL packet uses PB=0b11. Continuation fragments use
+// PB=0b01.
+//
+// Inbound: the Reassembler above is per-connection. The `Dispatcher`
+// below holds one Reassembler per ACL handle and dispatches the
+// frames to per-CID sinks.
+
+use crate::hci::AclData;
+
+/// PB-flag wire encoding for an outbound first fragment of a non-LE
+/// frame (PB=0b00) — first non-automatically-flushable.
+pub const PB_FIRST_NON_FLUSHABLE: u8 = 0b00;
+/// PB-flag wire encoding for outbound continuation (PB=0b01).
+pub const PB_CONTINUATION: u8 = 0b01;
+/// PB-flag wire encoding for outbound first automatically-flushable
+/// fragment (PB=0b10). LE peripheral controllers typically use this
+/// for the first ACL packet of an L2CAP PDU even when the entire PDU
+/// fits, because BLE has no per-link flush concept.
+pub const PB_FIRST_FLUSHABLE: u8 = 0b10;
+/// PB-flag wire encoding for an LE complete PDU in one ACL packet
+/// (PB=0b11).
+pub const PB_COMPLETE_LE: u8 = 0b11;
+
+/// Wrap one already-encoded B-frame (length+CID+payload) into a list
+/// of ACL packets, each ≤ `acl_mtu` bytes of data, with the right
+/// PB-flag progression. `bc_flag` is always 0 for point-to-point
+/// links (§5.4.2 broadcast flag).
+///
+/// If the entire frame fits in a single ACL packet and `le` is true,
+/// the packet uses PB=0b10 ("first automatically flushable") which is
+/// the spec-required value for LE host-to-controller traffic
+/// (Vol 4 Part E §5.4.2). For BR/EDR or fragmented LE the first
+/// packet uses PB=0b00, continuation packets PB=0b01.
+pub fn wrap_bframe_into_acl(
+    connection_handle: u16,
+    frame_bytes: &[u8],
+    acl_mtu: u16,
+    le: bool,
+) -> Vec<AclData> {
+    let mut out = Vec::new();
+    if frame_bytes.is_empty() {
+        return out;
+    }
+    let mtu = acl_mtu.max(1) as usize;
+    let mut first = true;
+    let mut idx = 0;
+    while idx < frame_bytes.len() {
+        let end = core::cmp::min(idx + mtu, frame_bytes.len());
+        let pb = if first {
+            if le {
+                PB_FIRST_FLUSHABLE
+            } else {
+                PB_FIRST_NON_FLUSHABLE
+            }
+        } else {
+            PB_CONTINUATION
+        };
+        out.push(AclData {
+            handle: connection_handle & 0x0FFF,
+            pb_flag: pb,
+            bc_flag: 0,
+            data: frame_bytes[idx..end].to_vec(),
+        });
+        first = false;
+        idx = end;
+    }
+    out
+}
+
+/// Convenience: encode a `BFrame` and wrap it into ACL packets.
+pub fn wrap_frame_into_acl(
+    connection_handle: u16,
+    frame: &BFrame,
+    acl_mtu: u16,
+    le: bool,
+) -> Vec<AclData> {
+    wrap_bframe_into_acl(connection_handle, &frame.encode(), acl_mtu, le)
+}
+
+/// Per-connection L2CAP dispatcher. Holds one `Reassembler` and
+/// surfaces reassembled `BFrame`s grouped by CID.
+///
+/// Stage 1 wires a single dispatcher per ACL handle; the host's
+/// connection table maps `(transport, handle)` → dispatcher.
+#[derive(Debug, Default)]
+pub struct Dispatcher {
+    pub reassembler: Reassembler,
+}
+
+impl Dispatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one inbound ACL packet (after the HCI ACL header has been
+    /// stripped to a `pb_flag` + `data` pair). Returns the list of
+    /// L2CAP frames that completed.
+    pub fn feed_acl(&mut self, pb_flag: u8, data: &[u8]) -> Vec<BFrame> {
+        self.reassembler.feed(PbFlag::from_bits(pb_flag), data)
+    }
+
+    /// Classify a frame by CID. The ATT fixed channel is the only one
+    /// Stage 1 routes; the rest are returned for the caller to handle
+    /// (LE signalling, SMP, dynamic channels) or drop.
+    pub fn classify_cid(cid: u16) -> CidClass {
+        match cid {
+            CID_ATT => CidClass::Att,
+            CID_LE_SIGNALLING => CidClass::LeSignalling,
+            CID_SMP => CidClass::Smp,
+            CID_SIGNALLING => CidClass::BrEdrSignalling,
+            CID_NULL => CidClass::Invalid,
+            c if (CID_DYNAMIC_LE_FIRST..=CID_DYNAMIC_LE_LAST).contains(&c) => CidClass::Dynamic,
+            c if c >= CID_DYNAMIC_BREDR_FIRST => CidClass::Dynamic,
+            _ => CidClass::Reserved,
+        }
+    }
+}
+
+/// CID classification produced by [`Dispatcher::classify_cid`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CidClass {
+    /// 0x0000 — never valid in a real frame.
+    Invalid,
+    /// 0x0001 — BR/EDR signalling channel.
+    BrEdrSignalling,
+    /// 0x0004 — Attribute Protocol (BLE).
+    Att,
+    /// 0x0005 — LE signalling channel.
+    LeSignalling,
+    /// 0x0006 — Security Manager (BLE).
+    Smp,
+    /// Dynamically-allocated CID (BR/EDR ≥0x40, LE 0x40..=0x7F).
+    Dynamic,
+    /// Spec-reserved CID we don't handle here.
+    Reserved,
+}

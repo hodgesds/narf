@@ -21,6 +21,8 @@ narf-edid            = { path = "../../edid" }
 narf-drivers-virtio  = { path = "../virtio" }
 narf-driver-runtime  = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-drivers         = { path = ".." }
+narf-drivers-usbpd   = { path = "../usbpd" }
+narf-usbpd           = { path = "../../usbpd" }
 narf-firmware        = { path = "../../firmware" }
 narf-bus             = { path = "../../bus" }
 narf-init            = { path = "../../init" }

@@ -1,0 +1,24 @@
+[package]
+name         = "narf-drivers-fingerprint"
+description  = "Fingerprint reader chip-class scaffold (Synaptics / Goodix / Validity / Elan). Stage-0 = VID/PID match table + probe + log; userspace owns the proprietary protocols."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_fingerprint"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-console      = { path = "../../console" }
+narf-init         = { path = "../../init" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true

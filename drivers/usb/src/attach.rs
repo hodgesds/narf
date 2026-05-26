@@ -77,6 +77,10 @@ pub enum AttachOutcome {
     /// dongle, tethered phone). Slot stays alive; entry in
     /// `cdc_ncm::CDC_NCM_DEVICES`. NTB TX/RX rings are a follow-up.
     NetworkClass,
+    /// Device bound as a USB Bluetooth HCI controller (class 0xE0 /
+    /// 0x01 / 0x01). Slot stays alive; entry in
+    /// `btusb::BTUSB_DEVICES`. ACL data plane is a follow-up.
+    Bluetooth,
     /// Device bound as a USB hub. Slot stays alive; entry was added
     /// to [`HUBS`] for downstream walking.
     Hub,
@@ -506,6 +510,15 @@ async fn dispatch_after_address(
             xhci_dev, slot_id, &cfg_blob,
         ).await {
             return AttachOutcome::NetworkClass;
+        }
+        // USB Bluetooth HCI — class 0xE0 / subclass 0x01 / proto 0x01.
+        // `find_bt_endpoints` walks the config blob; if no matching
+        // interface is present it returns NotBluetooth and we fall
+        // through to the unknown-class log.
+        if crate::btusb::try_bind_btusb_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ).await.is_ok() {
+            return AttachOutcome::Bluetooth;
         }
     }
     // try_bind_kbd_already_addressed disables the slot on failure,

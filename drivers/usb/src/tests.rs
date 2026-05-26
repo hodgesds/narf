@@ -2076,3 +2076,132 @@ kernel_test_in!(
     "drivers/usb/hid",
     smoke_hid_find_boot_keyboard_returns_no_interrupt_in_when_missing
 );
+
+// ── btusb ──────────────────────────────────────────────────────────
+
+/// The USB-IF Wireless Controllers class triple for a Bluetooth
+/// programming interface (Vol 4 Part B + USB-IF v1.0).
+fn smoke_btusb_class_triple_constants() -> TestResult {
+    use crate::btusb::{
+        USB_CLASS_WIRELESS, USB_PROTOCOL_BLUETOOTH, USB_SUBCLASS_RF,
+    };
+    if USB_CLASS_WIRELESS != 0xE0
+        || USB_SUBCLASS_RF != 0x01
+        || USB_PROTOCOL_BLUETOOTH != 0x01
+    {
+        return TestResult::Fail("btusb class triple drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_class_triple_constants);
+
+/// Build a synthetic Configuration Descriptor declaring a
+/// 0xE0/0x01/0x01 interface with the three required endpoints —
+/// interrupt-IN, bulk-IN, bulk-OUT — and check that `find_bt_endpoints`
+/// extracts them in the right order. Wire layout per USB 2.0
+/// §9.6.3 / §9.6.5 / §9.6.6 — the same shape btusb sees on attach.
+fn smoke_btusb_find_endpoints_minimal_descriptor() -> TestResult {
+    use crate::btusb::find_bt_endpoints;
+    use crate::xhci::EndpointKind;
+
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 3, 0xE0, 0x01, 0x01, 0]);
+    // EP1 IN, interrupt — event endpoint (mps=16, bInterval=1).
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    // EP2 IN, bulk — ACL-IN (mps=64).
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    // EP2 OUT, bulk — ACL-OUT (mps=64).
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+
+    let eps = match find_bt_endpoints(&cfg) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("find_bt_endpoints did not match"),
+    };
+    if eps.interface != 0 || eps.config_value != 1 {
+        return TestResult::Fail("interface / configValue mismatch");
+    }
+    if eps.event_in.ep_addr != 0x81
+        || !matches!(eps.event_in.kind, EndpointKind::InterruptIn)
+    {
+        return TestResult::Fail("event-IN mis-identified");
+    }
+    if eps.acl_in.ep_addr != 0x82
+        || !matches!(eps.acl_in.kind, EndpointKind::BulkIn)
+    {
+        return TestResult::Fail("ACL-IN mis-identified");
+    }
+    if eps.acl_out.ep_addr != 0x02
+        || !matches!(eps.acl_out.kind, EndpointKind::BulkOut)
+    {
+        return TestResult::Fail("ACL-OUT mis-identified");
+    }
+    if eps.event_in.max_packet != 16 || eps.acl_in.max_packet != 64 {
+        return TestResult::Fail("max-packet sizes did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/btusb",
+    smoke_btusb_find_endpoints_minimal_descriptor
+);
+
+/// A configuration descriptor with a non-Bluetooth interface (e.g.
+/// HID 0x03/0x01/0x01) must NOT match — returns `NotBluetooth`.
+fn smoke_btusb_find_endpoints_rejects_non_bluetooth_interface() -> TestResult {
+    use crate::btusb::{find_bt_endpoints, BtUsbError};
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0A]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+    match find_bt_endpoints(&cfg) {
+        Err(BtUsbError::NotBluetooth) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("matched a non-Bluetooth interface"),
+        Err(_) => TestResult::Fail("wrong error variant"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/btusb",
+    smoke_btusb_find_endpoints_rejects_non_bluetooth_interface
+);
+
+/// A Bluetooth interface missing its bulk-OUT endpoint must be
+/// rejected — Stage 0 requires all three (event-IN + bulk-IN +
+/// bulk-OUT) to build a usable transport.
+fn smoke_btusb_find_endpoints_rejects_missing_bulk_out() -> TestResult {
+    use crate::btusb::{find_bt_endpoints, BtUsbError};
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 2, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+    match find_bt_endpoints(&cfg) {
+        Err(BtUsbError::NotBluetooth) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("matched without bulk-OUT"),
+        Err(_) => TestResult::Fail("wrong error variant"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/btusb",
+    smoke_btusb_find_endpoints_rejects_missing_bulk_out
+);
+
+/// On QEMU's default TCG x86_64 there's no USB Bluetooth controller,
+/// so `attached_count` should be 0 after the supervisor's enumeration
+/// passes.
+fn smoke_btusb_no_bluetooth_on_qemu() -> TestResult {
+    if crate::btusb::attached_count() != 0 {
+        return TestResult::Fail("btusb registry should be empty on QEMU TCG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_no_bluetooth_on_qemu);

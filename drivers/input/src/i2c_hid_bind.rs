@@ -358,16 +358,23 @@ async fn pump_task(
         }
     };
     let ptp = narf_hid::ptp::detect(&parsed);
+    let touchscreen = narf_hid::touchscreen::detect(&parsed);
     let _ = writeln!(
         narf_console::Writer,
-        "  i2c-hid-pump: {}: descriptor parsed, fields={}, ptp={}",
+        "  i2c-hid-pump: {}: descriptor parsed, fields={}, ptp={}, touchscreen={}",
         path,
         parsed.fields.len(),
         ptp.is_some(),
+        touchscreen.is_some(),
     );
 
     if let Some(profile) = &ptp {
         log_ptp_mode_set_result(&path, set_ptp_multi_touch_mode(&driver, profile).await);
+    }
+
+    if let Some(ts_profile) = &touchscreen {
+        // One-line boot summary per the touchscreen Stage-0 spec.
+        crate::i2c_hid_touch::log_boot_summary(&path, ts_profile);
     }
 
     let max_input = driver
@@ -382,6 +389,9 @@ async fn pump_task(
     let mut last_x: Option<i32> = None;
     let mut last_y: Option<i32> = None;
     let mut last_button = false;
+    // Per-device touchscreen slot tracker (touchscreen path emits
+    // TouchEvent per contact with normalised coordinates).
+    let mut touch_state = crate::i2c_hid_touch::TouchPumpState::new();
 
     loop {
         if irq_wired {
@@ -413,14 +423,12 @@ async fn pump_task(
             continue;
         }
 
+        let payload = &buf[..n];
+        // Route by report id when the descriptor uses them. PTP
+        // and Touch Screen are normally distinct top-level
+        // collections with distinct report ids, so the two
+        // branches are mutually exclusive per report.
         if let Some(profile) = &ptp {
-            // The wire payload here lacks the 1-byte report-id
-            // prefix (the i2c-hid layer strips the length prefix
-            // but the report id is part of payload byte 0 already
-            // when descriptors use Report IDs — match what
-            // ptp::decode_input expects, which is "report id at
-            // byte 0 followed by body").
-            let payload = &buf[..n];
             if payload.first() == Some(&profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::ptp::decode_input(profile, payload) {
                     push_ptp_pointer(
@@ -429,6 +437,19 @@ async fn pump_task(
                         &mut last_y,
                         &mut last_button,
                     );
+                }
+                continue;
+            }
+        }
+        if let Some(ts_profile) = &touchscreen {
+            // Touchscreen descriptors with Report ID prefix every
+            // wire report with one byte; descriptors without IDs
+            // deliver bytes directly. `decode_input` accepts both.
+            if ts_profile.input_report_id == 0
+                || payload.first() == Some(&ts_profile.input_report_id)
+            {
+                if let Ok(decoded) = narf_hid::touchscreen::decode_input(ts_profile, payload) {
+                    crate::i2c_hid_touch::pump_report(ts_profile, &mut touch_state, &decoded);
                 }
             }
         }

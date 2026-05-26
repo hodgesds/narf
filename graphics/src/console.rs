@@ -12,7 +12,8 @@
 //! TTY but this isn't one yet.
 
 use core::fmt;
-use core::ptr;
+
+use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -37,6 +38,18 @@ pub struct FbConsole {
     cur_row: u32,
     pub fg: Pixel32,
     pub bg: Pixel32,
+    /// Glyph character shadow — `cols * rows` bytes, ASCII per cell.
+    /// 0x00 means "no glyph" (clear cell, background colour).
+    /// Used by `scroll_up_one_row` to avoid reading from the FB,
+    /// which is catastrophically slow on real-HW WC-mapped GPU
+    /// framebuffers (~500 KB/s reads on Renoir's iGPU FB).
+    ///
+    /// On scroll we shift this Vec up by one row in cached RAM
+    /// (~ns) and redraw the cells from the shadow to the FB
+    /// (write-only, hits the WC combine buffers, ~GB/s on iGPU).
+    /// Net effect: scroll drops from ~200 ms per line (read-bound)
+    /// to ~5 ms per line (write-bound). 5 lines/sec → ~200/sec.
+    chars: Vec<u8>,
 }
 
 impl FbConsole {
@@ -53,6 +66,8 @@ impl FbConsole {
         // state. A full `fb.clear(bg)` would wipe all of it.
         let text_h = rows * GLYPH_H;
         fb.fill_rect(0, TOP_PX_OFFSET, fb.width, text_h, bg);
+        let mut chars = Vec::new();
+        chars.resize((cols * rows) as usize, 0u8);
         Self {
             fb,
             cols,
@@ -61,6 +76,7 @@ impl FbConsole {
             cur_row: 0,
             fg,
             bg,
+            chars,
         }
     }
 
@@ -113,6 +129,10 @@ impl FbConsole {
                     let x = self.cur_col * GLYPH_W;
                     let y = TOP_PX_OFFSET + self.cur_row * GLYPH_H;
                     self.fb.fill_rect(x, y, GLYPH_W, GLYPH_H, self.bg);
+                    let idx = (self.cur_row * self.cols + self.cur_col) as usize;
+                    if let Some(c) = self.chars.get_mut(idx) {
+                        *c = 0;
+                    }
                 }
             }
             _ => {
@@ -123,6 +143,10 @@ impl FbConsole {
                 let y = TOP_PX_OFFSET + self.cur_row * GLYPH_H;
                 let g = font8x8::lookup(b);
                 self.fb.draw_glyph_8x8(x, y, &g, self.fg, self.bg);
+                let idx = (self.cur_row * self.cols + self.cur_col) as usize;
+                if let Some(c) = self.chars.get_mut(idx) {
+                    *c = b;
+                }
                 self.cur_col += 1;
             }
         }
@@ -172,41 +196,62 @@ impl FbConsole {
         }
     }
 
-    /// Memmove the visible FB content up by one glyph row, then
-    /// clear the bottom row. Operates directly on the FB pixel
-    /// buffer — no shadow. The FB's stride may exceed `width` (GPU
-    /// alignment), so we iterate rows individually rather than
-    /// memmove the whole buffer as one contiguous range.
+    /// Scroll the text region up by one glyph row. Walks the
+    /// `chars` shadow grid (cached RAM, ~ns access) instead of
+    /// reading from the FB. The previous implementation did
+    /// `ptr::copy(src, dst, width)` where both `src` and `dst`
+    /// were FB addresses — on real-HW Renoir's WC-mapped iGPU FB
+    /// those READS run at ~500 KB/s, making each scroll cost
+    /// ~200 ms (= 5 lines/sec on `ls /`).
+    ///
+    /// New algorithm:
+    ///   1. Shift `chars[cols..]` to `chars[0..]` — cached RAM,
+    ///      sub-millisecond.
+    ///   2. Zero the last row in `chars`.
+    ///   3. Redraw every cell from the shadow to the FB. Each
+    ///      cell write is a `draw_glyph_8x8` which is WRITE-only
+    ///      to the FB (WC combine buffers → ~GB/s on iGPU).
+    ///   4. Cells whose shadow byte is 0 are painted as bg
+    ///      (cleared) via a fill_rect; printable bytes go through
+    ///      the font8x8 lookup.
     fn scroll_up_one_row(&mut self) {
         if self.rows == 0 {
             return;
         }
-        let glyph_h = GLYPH_H as usize;
-        let stride = self.fb.stride as usize;
-        let width = self.fb.width as usize;
-        let top = TOP_PX_OFFSET as usize;
-        // Scroll only the text region — preserve the top
-        // TOP_PX_OFFSET px (build stripe + beacons). Move pixel
-        // rows [top + glyph_h, top + rows*glyph_h) up to
-        // [top, top + (rows-1)*glyph_h).
-        let text_pixel_rows = (self.rows * GLYPH_H) as usize;
-        // SAFETY: `self.fb.base()` is a valid pixel buffer covering
-        // at least `stride * height` u32s; the text region lives
-        // within [top, top + text_pixel_rows). Stride ≥ width keeps
-        // each row's `width` columns inside the buffer.
-        let base = self.fb.base();
-        unsafe {
-            for offset_dst in 0..text_pixel_rows.saturating_sub(glyph_h) {
-                let src_y = top + offset_dst + glyph_h;
-                let dst_y = top + offset_dst;
-                let src = base.add(src_y * stride);
-                let dst = base.add(dst_y * stride);
-                ptr::copy(src, dst, width);
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        // 1. Shift the shadow grid one row up.
+        // SAFETY: `chars` is at least `cols * rows` bytes long;
+        // copy of `(rows-1) * cols` from `cols..` to `0..` stays
+        // within bounds.
+        if rows > 1 {
+            let total = cols * rows;
+            // Use Vec methods to keep this safe + simple.
+            self.chars.copy_within(cols..total, 0);
+        }
+        // 2. Clear the last row in the shadow.
+        if let Some(last) = self.chars.get_mut(cols * (rows - 1)..cols * rows) {
+            for c in last {
+                *c = 0;
             }
         }
-        // Clear the bottom glyph row of the text region.
-        let bottom_y = TOP_PX_OFFSET + (self.rows - 1) * GLYPH_H;
-        self.fb.fill_rect(0, bottom_y, self.fb.width, GLYPH_H, self.bg);
+        // 3. Redraw the entire text region from the shadow to
+        //    the FB. This is the only path that needs to touch
+        //    FB memory; everything else is cached RAM.
+        for row in 0..rows {
+            let y = TOP_PX_OFFSET + (row as u32) * GLYPH_H;
+            for col in 0..cols {
+                let x = (col as u32) * GLYPH_W;
+                let idx = row * cols + col;
+                let b = self.chars[idx];
+                if b == 0 || b == b' ' {
+                    self.fb.fill_rect(x, y, GLYPH_W, GLYPH_H, self.bg);
+                } else {
+                    let g = font8x8::lookup(b);
+                    self.fb.draw_glyph_8x8(x, y, &g, self.fg, self.bg);
+                }
+            }
+        }
         // Cursor lands at the (now-cleared) bottom row.
         self.cur_row = self.rows - 1;
     }

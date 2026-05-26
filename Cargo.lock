@@ -586,6 +586,7 @@ name = "narf-bluetooth"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
@@ -706,6 +707,16 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-tpm",
+]
+
+[[package]]
+name = "narf-drivers-fingerprint"
+version = "0.0.0"
+dependencies = [
+ "narf-console",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
@@ -849,6 +860,7 @@ dependencies = [
  "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-usbpd",
  "narf-drivers-virtio",
  "narf-edid",
  "narf-firmware",
@@ -860,6 +872,7 @@ dependencies = [
  "narf-power",
  "narf-scheduler",
  "narf-time",
+ "narf-usbpd",
 ]
 
 [[package]]
@@ -987,6 +1000,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-thunderbolt"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-drivers",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
 name = "narf-drivers-usb"
 version = "0.0.0"
 dependencies = [
@@ -994,6 +1021,7 @@ dependencies = [
  "narf-aml",
  "narf-arch",
  "narf-block",
+ "narf-bluetooth",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
@@ -1192,6 +1220,7 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-fingerprint",
  "narf-drivers-fs-9p",
  "narf-drivers-fs-exfat",
  "narf-drivers-fs-ext2",
@@ -1207,6 +1236,7 @@ dependencies = [
  "narf-drivers-nvme",
  "narf-drivers-platform",
  "narf-drivers-storage",
+ "narf-drivers-thunderbolt",
  "narf-drivers-usb",
  "narf-drivers-usbpd",
  "narf-drivers-virtio",
@@ -1632,11 +1662,13 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-fingerprint",
  "narf-drivers-gpu",
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-platform",
  "narf-drivers-storage",
+ "narf-drivers-thunderbolt",
  "narf-drivers-usb",
  "narf-drivers-virtio",
  "narf-fb",
