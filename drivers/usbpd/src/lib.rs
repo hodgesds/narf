@@ -258,6 +258,15 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     );
                     narf_scheduler::yield_now().await;
                 }
+                PortStepOutcome::VconnSwapped { now_supplying } => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  tcpm: {} VConn swapped → {}",
+                        label,
+                        if now_supplying { "supplier" } else { "consumer" }
+                    );
+                    narf_scheduler::yield_now().await;
+                }
             }
         }
     });

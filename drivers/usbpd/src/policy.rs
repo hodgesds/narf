@@ -89,6 +89,10 @@ pub struct SinkPolicy {
     /// `true` to Accept inbound DR_Swap requests. Default off — only
     /// dual-role data devices flip the flag on.
     pub accept_dr_swap: bool,
+    /// `true` to Accept inbound VConn_Swap requests. Default off —
+    /// VConn ownership only changes when there is an active cable to
+    /// power.
+    pub accept_vconn_swap: bool,
 }
 
 impl Default for SinkPolicy {
@@ -100,6 +104,7 @@ impl Default for SinkPolicy {
             prefer_high_voltage: false,
             accept_pr_swap: false,
             accept_dr_swap: false,
+            accept_vconn_swap: false,
         }
     }
 }
@@ -200,6 +205,9 @@ pub struct SourcePolicy {
     /// data role swap only makes sense when both sides can flip UFP/
     /// DFP.
     pub accept_dr_swap: bool,
+    /// `true` to Accept inbound VConn_Swap requests. Default off —
+    /// only enabled for ports that can drive VConn (active cables).
+    pub accept_vconn_swap: bool,
 }
 
 impl Default for SourcePolicy {
@@ -213,6 +221,7 @@ impl Default for SourcePolicy {
             }],
             accept_pr_swap: false,
             accept_dr_swap: false,
+            accept_vconn_swap: false,
         }
     }
 }
@@ -231,6 +240,7 @@ impl SourcePolicy {
             pdos,
             accept_pr_swap: false,
             accept_dr_swap: false,
+            accept_vconn_swap: false,
         }
     }
 
@@ -555,4 +565,17 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usbpd/policy", smoke_dr_swap_knobs_default_off);
+
+    fn smoke_vconn_swap_knobs_default_off() -> TestResult {
+        let p = SinkPolicy::default();
+        if p.accept_vconn_swap {
+            return TestResult::Fail("default sink should reject VConn_Swap");
+        }
+        let q = SourcePolicy::default();
+        if q.accept_vconn_swap {
+            return TestResult::Fail("default source should reject VConn_Swap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usbpd/policy", smoke_vconn_swap_knobs_default_off);
 }

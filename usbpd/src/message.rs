@@ -63,6 +63,8 @@ pub enum CtrlMsg {
     DrSwap = 0x09,
     /// Power Role Swap request (§6.3.10).
     PrSwap = 0x0A,
+    /// VConn Swap request (§6.3.11).
+    VconnSwap = 0x0B,
     Wait = 0x0C,
     SoftReset = 0x0D,
 }
@@ -80,6 +82,7 @@ impl CtrlMsg {
             0x08 => CtrlMsg::GetSinkCap,
             0x09 => CtrlMsg::DrSwap,
             0x0A => CtrlMsg::PrSwap,
+            0x0B => CtrlMsg::VconnSwap,
             0x0C => CtrlMsg::Wait,
             0x0D => CtrlMsg::SoftReset,
             _ => return None,

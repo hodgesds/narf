@@ -90,6 +90,14 @@ pub enum SourceState {
     DrSwapWaitReply = 12,
     /// DR_Swap_Change: Accept landed; data role just flipped.
     DrSwapChange = 13,
+    /// VConn_Swap_Send.
+    VconnSwapSend = 14,
+    /// VConn_Swap_Wait_Reply.
+    VconnSwapWaitReply = 15,
+    /// VConn_Swap_Start: we are now the VConn supplier.
+    VconnSwapStart = 16,
+    /// VConn_Swap_Turn_off: we just released VConn.
+    VconnSwapTurnOff = 17,
 }
 
 /// Error from the source state machine.
@@ -127,6 +135,8 @@ pub enum SourceStepOutcome {
     RoleSwappedToSink,
     /// DR_Swap completed — data role flipped.
     DataRoleSwapped { now_dfp: bool },
+    /// VConn_Swap completed — our VConn-supplier flag flipped.
+    VconnSwapped { now_supplying: bool },
 }
 
 /// Source-role policy engine running on top of a TCPC.
@@ -143,6 +153,10 @@ pub struct SourcePort {
     /// Current data role. Source-role typically starts DFP; flips on
     /// every successful DR_Swap. `true` = DFP, `false` = UFP.
     is_dfp: AtomicU8,
+    /// Are we currently supplying VConn on the active CC pin? Sources
+    /// default to supplying VConn (§4.5.4); flips on every successful
+    /// VConn_Swap.
+    is_vconn_supplier: AtomicU8,
 }
 
 impl SourcePort {
@@ -155,6 +169,7 @@ impl SourcePort {
             next_msg_id: AtomicU8::new(0),
             contract: IrqSafeSpinLock::new(None),
             is_dfp: AtomicU8::new(1),
+            is_vconn_supplier: AtomicU8::new(1),
         }
     }
 
@@ -172,6 +187,12 @@ impl SourcePort {
     /// Port = USB host). Flips on every successful DR_Swap.
     pub fn is_dfp(&self) -> bool {
         self.is_dfp.load(Ordering::Acquire) != 0
+    }
+
+    /// True when this port is currently supplying VConn on the
+    /// active CC pin. Flips on every successful VConn_Swap.
+    pub fn is_vconn_supplier(&self) -> bool {
+        self.is_vconn_supplier.load(Ordering::Acquire) != 0
     }
 
     fn set_state(&self, s: SourceState) {
@@ -210,6 +231,15 @@ impl SourcePort {
         true
     }
 
+    /// Externally request a VConn_Swap. Only legal from `SRC_READY`.
+    pub fn initiate_vconn_swap(&self) -> bool {
+        if self.state() != SourceState::Ready {
+            return false;
+        }
+        self.set_state(SourceState::VconnSwapSend);
+        true
+    }
+
     /// Run one step. The driving task pumps this until it sees `Ready`
     /// or `Idle`.
     pub fn step(&self, cap: &Cap<UsbPd, Grant>) -> Result<SourceStepOutcome, SourceError> {
@@ -221,6 +251,7 @@ impl SourcePort {
                 *self.pending_request.lock() = None;
                 *self.contract.lock() = None;
                 self.is_dfp.store(1, Ordering::Release);
+                self.is_vconn_supplier.store(1, Ordering::Release);
                 self.set_state(SourceState::Discovery);
                 Ok(SourceStepOutcome::Advanced(SourceState::Discovery))
             }
@@ -248,6 +279,10 @@ impl SourcePort {
             SourceState::DrSwapSend => self.step_dr_swap_send(),
             SourceState::DrSwapWaitReply => self.step_dr_swap_wait_reply(),
             SourceState::DrSwapChange => self.step_dr_swap_change(),
+            SourceState::VconnSwapSend => self.step_vconn_swap_send(),
+            SourceState::VconnSwapWaitReply => self.step_vconn_swap_wait_reply(),
+            SourceState::VconnSwapStart => self.step_vconn_swap_start(),
+            SourceState::VconnSwapTurnOff => self.step_vconn_swap_turn_off(),
         }
     }
 
@@ -401,6 +436,7 @@ impl SourcePort {
         match CtrlMsg::from_u8(h.msg_type) {
             Some(CtrlMsg::PrSwap) => self.handle_inbound_pr_swap(),
             Some(CtrlMsg::DrSwap) => self.handle_inbound_dr_swap(),
+            Some(CtrlMsg::VconnSwap) => self.handle_inbound_vconn_swap(),
             Some(CtrlMsg::SoftReset) => {
                 // §6.3.13: respond with Accept then restart from
                 // Startup. The driving task observes the state hop.
@@ -556,6 +592,94 @@ impl SourcePort {
             Ok(SourceStepOutcome::Advanced(SourceState::Ready))
         }
     }
+
+    // ── VConn_Swap ─────────────────────────────────────────────────
+
+    fn step_vconn_swap_send(&self) -> Result<SourceStepOutcome, SourceError> {
+        self.send_control(CtrlMsg::VconnSwap)?;
+        self.set_state(SourceState::VconnSwapWaitReply);
+        Ok(SourceStepOutcome::Advanced(SourceState::VconnSwapWaitReply))
+    }
+
+    fn step_vconn_swap_wait_reply(&self) -> Result<SourceStepOutcome, SourceError> {
+        let buf = match self.tcpc.receive() {
+            Ok(b) => b,
+            Err(TcpcError::NoMessage) => {
+                return Ok(SourceStepOutcome::Idle(SourceState::VconnSwapWaitReply))
+            }
+            Err(e) => return Err(SourceError::Tcpc(e)),
+        };
+        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        match CtrlMsg::from_u8(h.msg_type) {
+            Some(CtrlMsg::Accept) => {
+                // §8.3.3.6.4: VConn-source goes to Turn_off; VConn-
+                // sink goes to Start. We pick by our current state:
+                // if we're already a supplier, we turn off; otherwise
+                // we start.
+                let next = if self.is_vconn_supplier() {
+                    SourceState::VconnSwapTurnOff
+                } else {
+                    SourceState::VconnSwapStart
+                };
+                self.set_state(next);
+                Ok(SourceStepOutcome::Advanced(next))
+            }
+            Some(CtrlMsg::Reject) | Some(CtrlMsg::Wait) => {
+                self.set_state(SourceState::Ready);
+                Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+            }
+            _ => Err(SourceError::Protocol),
+        }
+    }
+
+    fn step_vconn_swap_start(&self) -> Result<SourceStepOutcome, SourceError> {
+        // We are now the VConn supplier; emit PS_RDY so the partner
+        // can finish turning theirs off.
+        self.send_control(CtrlMsg::PsRdy)?;
+        self.is_vconn_supplier.store(1, Ordering::Release);
+        self.set_state(SourceState::Ready);
+        Ok(SourceStepOutcome::VconnSwapped {
+            now_supplying: true,
+        })
+    }
+
+    fn step_vconn_swap_turn_off(&self) -> Result<SourceStepOutcome, SourceError> {
+        // Wait for partner's PS_RDY, then release VConn.
+        let buf = match self.tcpc.receive() {
+            Ok(b) => b,
+            Err(TcpcError::NoMessage) => {
+                return Ok(SourceStepOutcome::Idle(SourceState::VconnSwapTurnOff))
+            }
+            Err(e) => return Err(SourceError::Tcpc(e)),
+        };
+        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::PsRdy) {
+            return Err(SourceError::Protocol);
+        }
+        self.is_vconn_supplier.store(0, Ordering::Release);
+        self.set_state(SourceState::Ready);
+        Ok(SourceStepOutcome::VconnSwapped {
+            now_supplying: false,
+        })
+    }
+
+    fn handle_inbound_vconn_swap(&self) -> Result<SourceStepOutcome, SourceError> {
+        let accept = self.policy.lock().accept_vconn_swap;
+        if accept {
+            self.send_control(CtrlMsg::Accept)?;
+            let next = if self.is_vconn_supplier() {
+                SourceState::VconnSwapTurnOff
+            } else {
+                SourceState::VconnSwapStart
+            };
+            self.set_state(next);
+            Ok(SourceStepOutcome::Advanced(next))
+        } else {
+            self.send_control(CtrlMsg::Reject)?;
+            self.set_state(SourceState::Ready);
+            Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+        }
+    }
 }
 
 // ── Type-C-level attach/detach controller ──────────────────────────
@@ -596,6 +720,8 @@ pub enum PortStepOutcome {
     RoleSwapped(PortState),
     /// Data role just flipped — UFP/DFP toggled.
     DataRoleSwapped { now_dfp: bool },
+    /// VConn supplier just flipped.
+    VconnSwapped { now_supplying: bool },
 }
 
 /// Top-level port driver: owns one chip + both engines, picks which
@@ -723,6 +849,9 @@ impl TcpmPort {
                     SourceStepOutcome::DataRoleSwapped { now_dfp } => {
                         PortStepOutcome::DataRoleSwapped { now_dfp }
                     }
+                    SourceStepOutcome::VconnSwapped { now_supplying } => {
+                        PortStepOutcome::VconnSwapped { now_supplying }
+                    }
                 })
             }
             PortState::ErrorRecovery => {
@@ -763,6 +892,14 @@ impl TcpmPort {
             return false;
         }
         self.source.initiate_dr_swap()
+    }
+
+    /// Ask the source engine to initiate a VConn_Swap.
+    pub fn initiate_vconn_swap(&self) -> bool {
+        if !matches!(self.state(), PortState::AttachedSrc) {
+            return false;
+        }
+        self.source.initiate_vconn_swap()
     }
 }
 
@@ -1421,5 +1558,61 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usbpd/tcpm",
         smoke_dr_swap_inbound_accept_flips_when_policy_on
+    );
+
+    // ── VConn_Swap ────────────────────────────────────────────────
+
+    fn smoke_vconn_swap_initiated_supplier_releases() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        if !port.is_vconn_supplier() {
+            return TestResult::Fail("source should default to VConn supplier");
+        }
+        port.initiate_vconn_swap();
+        let _ = port.step(&cap).unwrap();
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::VconnSwap) {
+            return TestResult::Fail("first step should emit VconnSwap");
+        }
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::Accept));
+        let _ = port.step(&cap).unwrap();
+        if port.state() != SourceState::VconnSwapTurnOff {
+            return TestResult::Fail("supplier should transition to TurnOff");
+        }
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::PsRdy));
+        let outcome = port.step(&cap).unwrap();
+        match outcome {
+            SourceStepOutcome::VconnSwapped { now_supplying: false } => {
+                if port.is_vconn_supplier() {
+                    return TestResult::Fail("is_vconn_supplier should be false");
+                }
+                TestResult::Pass
+            }
+            _ => TestResult::Fail("expected VconnSwapped { now_supplying: false }"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_vconn_swap_initiated_supplier_releases
+    );
+
+    fn smoke_vconn_swap_inbound_rejected_by_default() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::VconnSwap));
+        let _ = port.step(&cap).unwrap();
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::Reject) {
+            return TestResult::Fail("default policy should Reject VConn_Swap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_vconn_swap_inbound_rejected_by_default
     );
 }
