@@ -110,6 +110,7 @@ impl DataMsg {
         Some(match b {
             0x01 => DataMsg::SourceCapabilities,
             0x02 => DataMsg::Request,
+            0x03 => DataMsg::Bist,
             0x04 => DataMsg::SinkCapabilities,
             0x06 => DataMsg::Alert,
             0x0F => DataMsg::VendorDefined,
@@ -398,6 +399,51 @@ impl ProgrammableRdo {
             voltage_mv: ((raw >> 9) & 0x7FF) * 20,
             op_current_ma: (raw & 0x7F) * 50,
         }
+    }
+}
+
+/// BIST Mode (§6.4.3.1, table 6-31). Only the modes a normal port
+/// driver actually emits / acknowledges; the others are
+/// receiver-side-only or vendor-reserved.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BistMode {
+    /// BIST Carrier Mode 2 (§6.4.3.1): the UUT emits a continuous
+    /// carrier pattern on CC. Compliance testers use this to verify
+    /// PHY signal quality.
+    CarrierMode2 = 0x5,
+    /// BIST Test Data Mode: the UUT receives test patterns and
+    /// discards them. Compliance only.
+    TestData = 0x8,
+}
+
+impl BistMode {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0x5 => BistMode::CarrierMode2,
+            0x8 => BistMode::TestData,
+            _ => return None,
+        })
+    }
+}
+
+/// BIST Data Object (§6.4.3.1, table 6-32). Sent in the body of a
+/// BIST data message to instruct the partner which BIST sub-mode to
+/// enter. Reserved bits are zero.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BistDataObject {
+    pub mode: BistMode,
+}
+
+impl BistDataObject {
+    pub fn encode(&self) -> u32 {
+        // BIST Mode lives in bits 28..31 (§6.4.3.1).
+        (self.mode as u32 & 0xF) << 28
+    }
+
+    pub fn decode(raw: u32) -> Option<Self> {
+        let mode = BistMode::from_u8(((raw >> 28) & 0xF) as u8)?;
+        Some(Self { mode })
     }
 }
 

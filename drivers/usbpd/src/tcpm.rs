@@ -38,8 +38,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use narf_capabilities::{Cap, CapError, Grant, NoopOp};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_usbpd::message::{
-    decode_message, encode_message, CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole,
-    ProgrammableRdo, SourcePdo, SpecRev,
+    decode_message, encode_message, BistDataObject, BistMode, CtrlMsg, DataMsg, DataRole, FixedRdo,
+    Header, PowerRole, ProgrammableRdo, SourcePdo, SpecRev,
 };
 use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 use narf_usbpd::tcpm::{Contract, SinkPort, SinkState, StepOutcome};
@@ -98,6 +98,9 @@ pub enum SourceState {
     VconnSwapStart = 16,
     /// VConn_Swap_Turn_off: we just released VConn.
     VconnSwapTurnOff = 17,
+    /// BIST_Carrier_Mode (§6.4.3.1): a BIST data message was received;
+    /// we acknowledge entry. The chip-level emit is left to the TCPC.
+    BistCarrierMode = 18,
 }
 
 /// Error from the source state machine.
@@ -137,6 +140,10 @@ pub enum SourceStepOutcome {
     DataRoleSwapped { now_dfp: bool },
     /// VConn_Swap completed — our VConn-supplier flag flipped.
     VconnSwapped { now_supplying: bool },
+    /// BIST Carrier Mode 2 entered — partner asked us to emit the BIST
+    /// pattern; the TCPC chip is responsible for actually generating
+    /// it. We park here until the partner clears with a Hard Reset.
+    BistEntered,
 }
 
 /// Source-role policy engine running on top of a TCPC.
@@ -287,6 +294,7 @@ impl SourcePort {
             SourceState::VconnSwapWaitReply => self.step_vconn_swap_wait_reply(),
             SourceState::VconnSwapStart => self.step_vconn_swap_start(),
             SourceState::VconnSwapTurnOff => self.step_vconn_swap_turn_off(),
+            SourceState::BistCarrierMode => Ok(SourceStepOutcome::Idle(SourceState::BistCarrierMode)),
         }
     }
 
@@ -449,10 +457,20 @@ impl SourcePort {
             Err(TcpcError::NoMessage) => return Ok(SourceStepOutcome::Idle(SourceState::Ready)),
             Err(e) => return Err(SourceError::Tcpc(e)),
         };
-        let (h, _) = decode_message(&buf).ok_or(SourceError::Protocol)?;
+        let (h, objs) = decode_message(&buf).ok_or(SourceError::Protocol)?;
         if h.num_data_objects > 0 {
-            // No data messages are handled in Ready yet — fall back
-            // to Hard Reset for safety.
+            // BIST is the only inbound data message we handle in
+            // Ready; anything else is a protocol violation.
+            if DataMsg::from_u8(h.msg_type) == Some(DataMsg::Bist) && !objs.is_empty() {
+                if let Some(bdo) = BistDataObject::decode(objs[0]) {
+                    if matches!(bdo.mode, BistMode::CarrierMode2 | BistMode::TestData) {
+                        // §6.4.3: the UUT enters BIST and parks here
+                        // until the partner clears with a Hard Reset.
+                        self.set_state(SourceState::BistCarrierMode);
+                        return Ok(SourceStepOutcome::BistEntered);
+                    }
+                }
+            }
             self.set_state(SourceState::HardReset);
             return Err(SourceError::Protocol);
         }
@@ -875,6 +893,10 @@ impl TcpmPort {
                     SourceStepOutcome::VconnSwapped { now_supplying } => {
                         PortStepOutcome::VconnSwapped { now_supplying }
                     }
+                    SourceStepOutcome::BistEntered => {
+                        self.set_state(PortState::Bist);
+                        PortStepOutcome::BistEntered
+                    }
                 })
             }
             PortState::ErrorRecovery => {
@@ -974,7 +996,8 @@ pub(crate) mod tests {
     use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_usbpd::message::{
-        CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole, ProgrammableRdo, SpecRev,
+        BistDataObject, BistMode, CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole,
+        ProgrammableRdo, SpecRev,
     };
     use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 
@@ -1747,4 +1770,73 @@ pub(crate) mod tests {
         "drivers/usbpd/tcpm",
         smoke_pps_source_rejects_out_of_range_voltage
     );
+
+    // ── BIST ──────────────────────────────────────────────────────
+
+    fn smoke_bist_inbound_carrier_mode2_parks() -> TestResult {
+        let (chip, port) = fresh_source_port();
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = drive_to_ready(&port, &chip, &cap, 8);
+        let bdo = BistDataObject {
+            mode: BistMode::CarrierMode2,
+        };
+        chip.enqueue_rx(partner_data_frame(DataMsg::Bist, &[bdo.encode()]));
+        let outcome = port.step(&cap).unwrap();
+        match outcome {
+            SourceStepOutcome::BistEntered => {
+                if port.state() != SourceState::BistCarrierMode {
+                    return TestResult::Fail("BIST entry should park in BistCarrierMode");
+                }
+                let next = port.step(&cap).unwrap();
+                match next {
+                    SourceStepOutcome::Idle(SourceState::BistCarrierMode) => TestResult::Pass,
+                    _ => TestResult::Fail("BIST should idle after entry"),
+                }
+            }
+            _ => TestResult::Fail("expected BistEntered outcome"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_bist_inbound_carrier_mode2_parks
+    );
+
+    fn smoke_bist_tcpmport_relays_outcome() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("bist-port"),
+        );
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let _ = port.step(&cap).unwrap(); // Unattached → AttachedSrc
+        for _ in 0..6 {
+            if port.source().state() == SourceState::NegotiateCapability {
+                chip.enqueue_rx(request_frame(1, 1500, 0));
+            }
+            let _ = port.step(&cap).unwrap();
+        }
+        if port.source().state() != SourceState::Ready {
+            return TestResult::Fail("source did not reach Ready");
+        }
+        let bdo = BistDataObject {
+            mode: BistMode::CarrierMode2,
+        };
+        chip.enqueue_rx(partner_data_frame(DataMsg::Bist, &[bdo.encode()]));
+        let outcome = port.step(&cap).unwrap();
+        match outcome {
+            PortStepOutcome::BistEntered => {
+                if port.state() != PortState::Bist {
+                    return TestResult::Fail("TcpmPort should hop to Bist on BistEntered");
+                }
+                TestResult::Pass
+            }
+            _ => TestResult::Fail("expected PortStepOutcome::BistEntered"),
+        }
+    }
+    kernel_test_in!("drivers/usbpd/tcpm", smoke_bist_tcpmport_relays_outcome);
 }
