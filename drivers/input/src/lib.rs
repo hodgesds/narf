@@ -79,13 +79,19 @@ fn register_i8042_initcalls() {
         let init_ok = init_res.is_ok();
         narf_input::I8042_MOUSE_INIT_OK
             .store(init_ok, core::sync::atomic::Ordering::Release);
+        use core::fmt::Write as _;
         if !init_ok {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i8042-mouse: init=FAIL ({:?}) — no PS/2 mouse on AUX channel; \
+                 touchpad must be on a different transport (USB internal / I2C)",
+                init_res.err(),
+            );
             return InitResult::NotPresent;
         }
         let irq_ok = install_isa_irq(12, on_irq12_safe);
         narf_input::I8042_MOUSE_IRQ_ROUTED
             .store(irq_ok, core::sync::atomic::Ordering::Release);
-        use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
             "  i8042-mouse: init=ok irq12={}",
