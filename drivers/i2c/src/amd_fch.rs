@@ -492,7 +492,19 @@ struct CtrlResources {
 /// Returns None if no MMIO descriptor is present (the controller
 /// can't be driven without one).
 fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
-    let items = narf_aml::prt_crs::evaluate_crs_for(path).ok()?;
+    use core::fmt::Write;
+    let items = match narf_aml::prt_crs::evaluate_crs_for(path) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  amd-fch-i2c: {} _CRS eval failed: {:?}",
+                path, e
+            );
+            return None;
+        }
+    };
+    let n_items = items.len();
     let mut mmio: Option<(u64, u64)> = None;
     let mut gsi: Option<u32> = None;
     let mut irq_flags: u8 = 0;
@@ -528,7 +540,18 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
             _ => {}
         }
     }
-    let (mmio_base, mmio_len) = mmio?;
+    let (mmio_base, mmio_len) = match mmio {
+        Some(m) => m,
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  amd-fch-i2c: {} _CRS had {} item(s) but no memory range — \
+                 cannot map BAR",
+                path, n_items
+            );
+            return None;
+        }
+    };
     Some(CtrlResources {
         mmio_base,
         mmio_len,
@@ -542,13 +565,29 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
 /// of controllers successfully registered (zero is the normal answer
 /// on non-AMD hardware and is not an error).
 pub fn probe_all() -> usize {
+    use core::fmt::Write;
     let mut count = 0usize;
+    let mut total_found = 0usize;
     for &hid in AMD_FCH_HIDS {
         for node in narf_aml::find_all_devices_by_hid(hid) {
+            total_found += 1;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  amd-fch-i2c: probing {} (HID={})",
+                node.path, hid
+            );
             if probe_one(&node.path).is_some() {
                 count += 1;
             }
         }
+    }
+    if total_found > 0 && count == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  amd-fch-i2c: {} AMDI device(s) found in DSDT but none brought up — \
+             check _CRS decode (no memory range?) or probe failure above",
+            total_found
+        );
     }
     count
 }
