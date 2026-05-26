@@ -39,7 +39,7 @@ use narf_capabilities::{Cap, CapError, Grant, NoopOp};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_usbpd::message::{
     decode_message, encode_message, CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole,
-    SourcePdo, SpecRev,
+    ProgrammableRdo, SourcePdo, SpecRev,
 };
 use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 use narf_usbpd::tcpm::{Contract, SinkPort, SinkState, StepOutcome};
@@ -148,6 +148,8 @@ pub struct SourcePort {
     /// Most recently received Request RDO (the sink's pick), kept so
     /// `TransitionSupply` knows which PDO to lock in.
     pending_request: IrqSafeSpinLock<Option<FixedRdo>>,
+    /// Same, for PPS — held when the sink picked an APDO position.
+    pending_pps_request: IrqSafeSpinLock<Option<ProgrammableRdo>>,
     next_msg_id: AtomicU8,
     contract: IrqSafeSpinLock<Option<Contract>>,
     /// Current data role. Source-role typically starts DFP; flips on
@@ -166,6 +168,7 @@ impl SourcePort {
             policy: IrqSafeSpinLock::new(policy),
             state: AtomicU8::new(SourceState::Startup as u8),
             pending_request: IrqSafeSpinLock::new(None),
+            pending_pps_request: IrqSafeSpinLock::new(None),
             next_msg_id: AtomicU8::new(0),
             contract: IrqSafeSpinLock::new(None),
             is_dfp: AtomicU8::new(1),
@@ -249,6 +252,7 @@ impl SourcePort {
                 self.tcpc.set_role(PortRole::Source)?;
                 self.next_msg_id.store(0, Ordering::Release);
                 *self.pending_request.lock() = None;
+                *self.pending_pps_request.lock() = None;
                 *self.contract.lock() = None;
                 self.is_dfp.store(1, Ordering::Release);
                 self.is_vconn_supplier.store(1, Ordering::Release);
@@ -329,8 +333,27 @@ impl SourcePort {
             self.set_state(SourceState::HardReset);
             return Err(SourceError::Protocol);
         }
-        let rdo = FixedRdo::decode(objs[0]);
-        let decision = self.policy.lock().evaluate_request(&rdo);
+        // Pick the right RDO type by inspecting the targeted PDO.
+        // Augmented PDOs use a Programmable RDO (§6.4.2.5); everything
+        // else uses a Fixed RDO.
+        let raw = objs[0];
+        let position = ((raw >> 28) & 0x7) as u8;
+        let pdo = self
+            .policy
+            .lock()
+            .pdos
+            .get(position.checked_sub(1).map(|x| x as usize).unwrap_or(usize::MAX))
+            .copied();
+        let is_pps = matches!(pdo, Some(SourcePdo::Augmented { .. }));
+        let decision = if is_pps {
+            let prdo = ProgrammableRdo::decode(raw);
+            *self.pending_pps_request.lock() = Some(prdo);
+            self.policy.lock().evaluate_programmable_request(&prdo)
+        } else {
+            let rdo = FixedRdo::decode(raw);
+            *self.pending_request.lock() = Some(rdo);
+            self.policy.lock().evaluate_request(&rdo)
+        };
         let (reply_ctrl, next_state) = match decision {
             RequestDecision::Accept => (CtrlMsg::Accept, SourceState::TransitionSupply),
             RequestDecision::Wait => (CtrlMsg::Wait, SourceState::NegotiateCapability),
@@ -345,11 +368,11 @@ impl SourcePort {
         );
         let frame = encode_message(h_reply, &[]);
         self.tcpc.transmit(&frame)?;
-        if matches!(decision, RequestDecision::Accept) {
-            // Stash the request so TransitionSupply knows which PDO
-            // we agreed to — needed to assemble the post-PS_RDY
-            // Contract for the driving task.
-            *self.pending_request.lock() = Some(rdo);
+        if !matches!(decision, RequestDecision::Accept) {
+            // Drop the stashed request so a follow-up Negotiate
+            // doesn't see stale data.
+            *self.pending_request.lock() = None;
+            *self.pending_pps_request.lock() = None;
         }
         self.set_state(next_state);
         Ok(SourceStepOutcome::Advanced(next_state))
@@ -360,42 +383,42 @@ impl SourcePort {
         // voltage and then sends PS_RDY. We don't drive a real rail —
         // emit PS_RDY immediately, and let the chip driver decide
         // how Vbus is actually steered.
-        let pending = match *self.pending_request.lock() {
-            Some(r) => r,
-            None => {
-                // We're in TransitionSupply without a stashed request
-                // — impossible unless the state machine was poked
-                // externally. Bounce.
-                self.set_state(SourceState::HardReset);
-                return Err(SourceError::Protocol);
-            }
-        };
-        let policy = self.policy.lock().clone();
-        let pdo = policy
-            .pdos
-            .get(pending.object_position.checked_sub(1).map(|x| x as usize).unwrap_or(usize::MAX))
-            .copied()
-            .ok_or(SourceError::Protocol)?;
-        let (voltage_mv, _max_current_ma) = match pdo {
-            SourcePdo::Fixed {
-                voltage_mv,
-                max_current_ma,
-            } => (voltage_mv, max_current_ma),
-            // Stage-1 only commits Fixed contracts. Variable/PPS/
-            // Battery fall back to whatever the PDO advertises as
-            // its high-end voltage for accounting purposes.
-            SourcePdo::Variable {
-                max_voltage_mv,
-                max_current_ma,
-                ..
-            } => (max_voltage_mv, max_current_ma),
-            SourcePdo::Augmented {
-                max_voltage_mv,
-                max_current_ma,
-                ..
-            } => (max_voltage_mv, max_current_ma),
-            SourcePdo::Battery { max_voltage_mv, .. } => (max_voltage_mv, 0),
-        };
+        // PPS path first — if a Programmable RDO was stashed, the
+        // contract is built from its requested voltage.
+        let (object_position, voltage_mv, op_current_ma) =
+            if let Some(prdo) = self.pending_pps_request.lock().take() {
+                (prdo.object_position, prdo.voltage_mv, prdo.op_current_ma)
+            } else {
+                let pending = match self.pending_request.lock().take() {
+                    Some(r) => r,
+                    None => {
+                        // We're in TransitionSupply without a stashed
+                        // request — impossible unless the state
+                        // machine was poked externally. Bounce.
+                        self.set_state(SourceState::HardReset);
+                        return Err(SourceError::Protocol);
+                    }
+                };
+                let policy = self.policy.lock().clone();
+                let pdo = policy
+                    .pdos
+                    .get(
+                        pending
+                            .object_position
+                            .checked_sub(1)
+                            .map(|x| x as usize)
+                            .unwrap_or(usize::MAX),
+                    )
+                    .copied()
+                    .ok_or(SourceError::Protocol)?;
+                let voltage_mv = match pdo {
+                    SourcePdo::Fixed { voltage_mv, .. } => voltage_mv,
+                    SourcePdo::Variable { max_voltage_mv, .. } => max_voltage_mv,
+                    SourcePdo::Augmented { max_voltage_mv, .. } => max_voltage_mv,
+                    SourcePdo::Battery { max_voltage_mv, .. } => max_voltage_mv,
+                };
+                (pending.object_position, voltage_mv, pending.op_current_ma)
+            };
         let h = Header::control(
             CtrlMsg::PsRdy,
             self.data_role(),
@@ -406,9 +429,9 @@ impl SourcePort {
         let frame = encode_message(h, &[]);
         self.tcpc.transmit(&frame)?;
         let contract = Contract {
-            object_position: pending.object_position,
+            object_position,
             voltage_mv,
-            op_current_ma: pending.op_current_ma,
+            op_current_ma,
         };
         *self.contract.lock() = Some(contract);
         self.set_state(SourceState::Ready);
@@ -951,7 +974,7 @@ pub(crate) mod tests {
     use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_usbpd::message::{
-        CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole, SpecRev,
+        CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole, ProgrammableRdo, SpecRev,
     };
     use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 
@@ -1614,5 +1637,114 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usbpd/tcpm",
         smoke_vconn_swap_inbound_rejected_by_default
+    );
+
+    // ── PPS ───────────────────────────────────────────────────────
+
+    fn partner_data_frame(msg: DataMsg, objs: &[u32]) -> Vec<u8> {
+        let h = Header::data(
+            msg,
+            DataRole::Ufp,
+            PowerRole::Sink,
+            SpecRev::R3_0,
+            0,
+            objs.len() as u8,
+        );
+        encode_message(h, objs)
+    }
+
+    fn smoke_pps_source_accepts_programmable_request() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let policy = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 11000,
+                min_voltage_mv: 3300,
+                max_current_ma: 3000,
+            },
+        ]);
+        let port = SourcePort::new(chip.clone(), policy);
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        for _ in 0..3 {
+            let _ = port.step(&cap).unwrap();
+        }
+        let prdo = ProgrammableRdo {
+            object_position: 2,
+            voltage_mv: 9000,
+            op_current_ma: 2000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+        };
+        chip.enqueue_rx(partner_data_frame(DataMsg::Request, &[prdo.encode()]));
+        let _ = port.step(&cap).unwrap();
+        if port.state() != SourceState::TransitionSupply {
+            return TestResult::Fail("PPS Accept should advance to TransitionSupply");
+        }
+        let outcome = port.step(&cap).unwrap();
+        let contract = match outcome {
+            SourceStepOutcome::Ready { contract } => contract,
+            _ => return TestResult::Fail("expected Ready outcome"),
+        };
+        if contract.voltage_mv != 9000 || contract.op_current_ma != 2000 || contract.object_position != 2 {
+            return TestResult::Fail("PPS contract drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_pps_source_accepts_programmable_request
+    );
+
+    fn smoke_pps_source_rejects_out_of_range_voltage() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let policy = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 11000,
+                min_voltage_mv: 3300,
+                max_current_ma: 3000,
+            },
+        ]);
+        let port = SourcePort::new(chip.clone(), policy);
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        for _ in 0..3 {
+            let _ = port.step(&cap).unwrap();
+        }
+        let prdo = ProgrammableRdo {
+            object_position: 2,
+            voltage_mv: 20000, // out of APDO range
+            op_current_ma: 1000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+        };
+        chip.enqueue_rx(partner_data_frame(DataMsg::Request, &[prdo.encode()]));
+        let _ = port.step(&cap).unwrap();
+        let sent = chip.sent();
+        let (h, _) = decode_message(sent.last().unwrap()).unwrap();
+        if CtrlMsg::from_u8(h.msg_type) != Some(CtrlMsg::Reject) {
+            return TestResult::Fail("out-of-range PPS request should be Rejected");
+        }
+        if port.state() != SourceState::NegotiateCapability {
+            return TestResult::Fail("Reject should stay in NegotiateCapability");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_pps_source_rejects_out_of_range_voltage
     );
 }

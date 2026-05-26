@@ -359,6 +359,48 @@ impl FixedRdo {
     }
 }
 
+/// Programmable RDO (§6.4.2.5) — the sink's Request when picking a PPS
+/// (Augmented) PDO. Voltage is asked for in 20 mV steps (bits 9..19,
+/// 11 bits) and current in 50 mA steps (bits 0..6, 7 bits).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProgrammableRdo {
+    /// 1-based PDO position from the most recently received
+    /// Source_Capabilities (§6.4.2.1).
+    pub object_position: u8,
+    /// Requested output voltage in millivolts. Quantised to 20 mV.
+    pub voltage_mv: u32,
+    /// Requested operating current in milliamps. Quantised to 50 mA.
+    pub op_current_ma: u32,
+    /// `USB_Communications_Capable` per §6.4.2.4 bit 25.
+    pub usb_comms: bool,
+    /// `No_USB_Suspend` per §6.4.2.4 bit 24.
+    pub no_usb_suspend: bool,
+    /// Capability mismatch flag (§6.4.2.4 bit 26).
+    pub cap_mismatch: bool,
+}
+
+impl ProgrammableRdo {
+    pub fn encode(&self) -> u32 {
+        ((self.object_position as u32 & 0x7) << 28)
+            | ((self.cap_mismatch as u32) << 26)
+            | ((self.usb_comms as u32) << 25)
+            | ((self.no_usb_suspend as u32) << 24)
+            | (((self.voltage_mv / 20) & 0x7FF) << 9)
+            | ((self.op_current_ma / 50) & 0x7F)
+    }
+
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            object_position: ((raw >> 28) & 0x7) as u8,
+            cap_mismatch: (raw >> 26) & 0x1 != 0,
+            usb_comms: (raw >> 25) & 0x1 != 0,
+            no_usb_suspend: (raw >> 24) & 0x1 != 0,
+            voltage_mv: ((raw >> 9) & 0x7FF) * 20,
+            op_current_ma: (raw & 0x7F) * 50,
+        }
+    }
+}
+
 // ── Wire framing helpers ───────────────────────────────────────────
 
 /// Encode `(header, data_objects)` to a contiguous byte buffer in the

@@ -26,7 +26,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use narf_usbpd::message::{FixedRdo, SourcePdo};
+use narf_usbpd::message::{FixedRdo, ProgrammableRdo, SourcePdo};
 
 /// What a Sink Policy hands back from `evaluate_caps`. The Policy
 /// Engine maps this to the actual outgoing Request RDO.
@@ -44,17 +44,38 @@ pub struct SinkSelection {
     /// True when the sink is asking for *less* than its advertised
     /// requirement (Capability_Mismatch per §6.4.2.4 bit 26).
     pub cap_mismatch: bool,
+    /// True when the selected PDO is an Augmented (PPS) PDO — the
+    /// Policy Engine must build a Programmable RDO instead of a
+    /// Fixed RDO.
+    pub is_pps: bool,
 }
 
 impl SinkSelection {
-    /// Cast a selection into an RDO. Defaults to sensible flags for a
-    /// modern host (USB-Comms capable, no USB suspend).
+    /// Cast a Fixed selection into a Fixed RDO. Defaults to sensible
+    /// flags for a modern host (USB-Comms capable, no USB suspend).
+    /// Panics in debug builds if called on a PPS selection — use
+    /// [`Self::to_programmable_rdo`] instead.
     pub fn to_rdo(self) -> FixedRdo {
+        debug_assert!(!self.is_pps, "to_rdo on PPS selection — use to_programmable_rdo");
         FixedRdo {
             object_position: self.object_position,
             op_current_ma: self.op_current_ma,
             max_op_current_ma: self.op_current_ma,
             give_back: false,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: self.cap_mismatch,
+        }
+    }
+
+    /// Cast a PPS selection into a Programmable RDO. Voltage and
+    /// current are quantised by the encoder to the PPS step sizes
+    /// (20 mV / 50 mA per §6.4.2.5).
+    pub fn to_programmable_rdo(self) -> ProgrammableRdo {
+        ProgrammableRdo {
+            object_position: self.object_position,
+            voltage_mv: self.voltage_mv,
+            op_current_ma: self.op_current_ma,
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: self.cap_mismatch,
@@ -93,6 +114,15 @@ pub struct SinkPolicy {
     /// VConn ownership only changes when there is an active cable to
     /// power.
     pub accept_vconn_swap: bool,
+    /// `true` to prefer an Augmented (PPS) PDO over a Fixed PDO when
+    /// both can satisfy the request — the PPS branch picks the
+    /// programmable voltage exactly. Default off because most laptop
+    /// sinks just want 5 V.
+    pub prefer_pps: bool,
+    /// Voltage to ask for when picking a PPS PDO, in mV. Clamped at
+    /// pick-time to the PDO's advertised [min..=max] range and
+    /// quantised to the 20 mV PPS step.
+    pub pps_voltage_mv: u32,
 }
 
 impl Default for SinkPolicy {
@@ -105,6 +135,8 @@ impl Default for SinkPolicy {
             accept_pr_swap: false,
             accept_dr_swap: false,
             accept_vconn_swap: false,
+            prefer_pps: false,
+            pps_voltage_mv: 5000,
         }
     }
 }
@@ -117,9 +149,36 @@ impl SinkPolicy {
         if caps.is_empty() {
             return None;
         }
-        // Walk the Fixed PDOs collecting candidates. PPS / Battery /
-        // Variable PDOs are skipped at this stage — Stage 2 layers
-        // PPS support over the top.
+        // PPS-preferred path: scan for an Augmented PDO that covers
+        // our pps_voltage_mv. The first match wins because §6.4.1.2.6
+        // says APDOs are listed in ascending voltage order.
+        if self.prefer_pps {
+            for (i, pdo) in caps.iter().enumerate() {
+                if let SourcePdo::Augmented {
+                    max_voltage_mv,
+                    min_voltage_mv,
+                    max_current_ma,
+                } = *pdo
+                {
+                    if self.pps_voltage_mv >= min_voltage_mv
+                        && self.pps_voltage_mv <= max_voltage_mv
+                    {
+                        // Quantise to the PPS 20 mV step.
+                        let v = (self.pps_voltage_mv / 20) * 20;
+                        return Some(SinkSelection {
+                            object_position: (i + 1) as u8,
+                            voltage_mv: v,
+                            op_current_ma: self.op_current_ma.min(max_current_ma),
+                            cap_mismatch: false,
+                            is_pps: true,
+                        });
+                    }
+                }
+            }
+            // Fall through to Fixed selection if no Augmented PDO can
+            // serve us — the sink stays running rather than failing.
+        }
+        // Walk the Fixed PDOs collecting candidates.
         let mut best: Option<(u8, u32, u32)> = None; // (pos, voltage, current)
         for (i, pdo) in caps.iter().enumerate() {
             let SourcePdo::Fixed {
@@ -161,6 +220,7 @@ impl SinkPolicy {
                     voltage_mv,
                     op_current_ma: self.op_current_ma.min(max_current_ma),
                     cap_mismatch: true,
+                    is_pps: false,
                 });
             }
             // Source advertised no Fixed PDOs at all — shouldn't be
@@ -173,6 +233,7 @@ impl SinkPolicy {
             voltage_mv,
             op_current_ma: self.op_current_ma.min(max_current_ma),
             cap_mismatch: false,
+            is_pps: false,
         })
     }
 }
@@ -273,6 +334,39 @@ impl SourcePolicy {
             }
         } else {
             RequestDecision::Accept
+        }
+    }
+
+    /// Evaluate a Programmable RDO targeting one of our Augmented
+    /// (PPS) PDOs. Reject if the position isn't an APDO, the
+    /// voltage falls outside the advertised [min..=max] range, or
+    /// the current exceeds the APDO's max_current.
+    pub fn evaluate_programmable_request(&self, rdo: &ProgrammableRdo) -> RequestDecision {
+        let idx = rdo.object_position.checked_sub(1).map(|x| x as usize);
+        let pdo = match idx.and_then(|i| self.pdos.get(i)) {
+            Some(p) => *p,
+            None => return RequestDecision::Reject,
+        };
+        match pdo {
+            SourcePdo::Augmented {
+                max_voltage_mv,
+                min_voltage_mv,
+                max_current_ma,
+            } => {
+                if rdo.voltage_mv < min_voltage_mv || rdo.voltage_mv > max_voltage_mv {
+                    return RequestDecision::Reject;
+                }
+                if rdo.op_current_ma > max_current_ma {
+                    return if rdo.cap_mismatch {
+                        RequestDecision::Accept
+                    } else {
+                        RequestDecision::Reject
+                    };
+                }
+                RequestDecision::Accept
+            }
+            // Programmable RDOs only target APDOs.
+            _ => RequestDecision::Reject,
         }
     }
 }
@@ -415,6 +509,7 @@ pub(crate) mod tests {
             voltage_mv: 9000,
             op_current_ma: 2500,
             cap_mismatch: true,
+            is_pps: false,
         };
         let rdo = sel.to_rdo();
         if rdo.object_position != 2 {
@@ -578,4 +673,200 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usbpd/policy", smoke_vconn_swap_knobs_default_off);
+
+    // ── PPS ────────────────────────────────────────────────────────
+
+    fn smoke_sink_policy_pps_picks_apdo_when_preferred() -> TestResult {
+        let policy = SinkPolicy {
+            prefer_pps: true,
+            pps_voltage_mv: 9000,
+            ..SinkPolicy::default()
+        };
+        let caps = [
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 11000,
+                min_voltage_mv: 3300,
+                max_current_ma: 3000,
+            },
+        ];
+        let sel = policy.evaluate(&caps).expect("evaluate");
+        if !sel.is_pps {
+            return TestResult::Fail("prefer_pps did not select an APDO");
+        }
+        if sel.object_position != 2 {
+            return TestResult::Fail("APDO should be at position 2");
+        }
+        if sel.voltage_mv != 9000 {
+            return TestResult::Fail("PPS voltage drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_pps_picks_apdo_when_preferred
+    );
+
+    fn smoke_sink_policy_pps_quantises_voltage_to_20mv() -> TestResult {
+        let policy = SinkPolicy {
+            prefer_pps: true,
+            pps_voltage_mv: 9013, // not 20 mV aligned
+            ..SinkPolicy::default()
+        };
+        let caps = [SourcePdo::Augmented {
+            max_voltage_mv: 11000,
+            min_voltage_mv: 3300,
+            max_current_ma: 3000,
+        }];
+        let sel = policy.evaluate(&caps).expect("evaluate");
+        if sel.voltage_mv != 9000 {
+            return TestResult::Fail("PPS voltage should be quantised to 20 mV step");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_pps_quantises_voltage_to_20mv
+    );
+
+    fn smoke_sink_policy_pps_falls_back_to_fixed_when_out_of_range() -> TestResult {
+        let policy = SinkPolicy {
+            prefer_pps: true,
+            pps_voltage_mv: 20000, // out of any APDO range here
+            ..SinkPolicy::default()
+        };
+        let caps = [
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 11000,
+                min_voltage_mv: 3300,
+                max_current_ma: 3000,
+            },
+        ];
+        let sel = policy.evaluate(&caps).expect("evaluate");
+        if sel.is_pps {
+            return TestResult::Fail("out-of-range PPS should fall through to Fixed");
+        }
+        if sel.object_position != 1 || sel.voltage_mv != 5000 {
+            return TestResult::Fail("fall-through should pick Fixed 5V PDO");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_pps_falls_back_to_fixed_when_out_of_range
+    );
+
+    fn smoke_pps_selection_emits_programmable_rdo() -> TestResult {
+        let sel = SinkSelection {
+            object_position: 2,
+            voltage_mv: 9000,
+            op_current_ma: 2000,
+            cap_mismatch: false,
+            is_pps: true,
+        };
+        let rdo = sel.to_programmable_rdo();
+        if rdo.object_position != 2 {
+            return TestResult::Fail("position drift");
+        }
+        if rdo.voltage_mv != 9000 || rdo.op_current_ma != 2000 {
+            return TestResult::Fail("programmable RDO voltage/current drift");
+        }
+        let raw = rdo.encode();
+        let back = ProgrammableRdo::decode(raw);
+        if back.voltage_mv != 9000 || back.op_current_ma != 2000 || back.object_position != 2 {
+            return TestResult::Fail("ProgrammableRdo round-trip drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_pps_selection_emits_programmable_rdo
+    );
+
+    fn smoke_source_policy_accepts_programmable_request_in_range() -> TestResult {
+        let p = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 11000,
+                min_voltage_mv: 3300,
+                max_current_ma: 3000,
+            },
+        ]);
+        let rdo = ProgrammableRdo {
+            object_position: 2,
+            voltage_mv: 9000,
+            op_current_ma: 2000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+        };
+        match p.evaluate_programmable_request(&rdo) {
+            RequestDecision::Accept => TestResult::Pass,
+            _ => TestResult::Fail("in-range PPS request should be Accepted"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_accepts_programmable_request_in_range
+    );
+
+    fn smoke_source_policy_rejects_programmable_out_of_voltage_range() -> TestResult {
+        let p = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+            },
+            SourcePdo::Augmented {
+                max_voltage_mv: 11000,
+                min_voltage_mv: 3300,
+                max_current_ma: 3000,
+            },
+        ]);
+        let rdo = ProgrammableRdo {
+            object_position: 2,
+            voltage_mv: 20000,
+            op_current_ma: 1000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+        };
+        match p.evaluate_programmable_request(&rdo) {
+            RequestDecision::Reject => TestResult::Pass,
+            _ => TestResult::Fail("out-of-range PPS voltage should be Rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_rejects_programmable_out_of_voltage_range
+    );
+
+    fn smoke_source_policy_rejects_programmable_against_fixed_position() -> TestResult {
+        let p = SourcePolicy::default();
+        let rdo = ProgrammableRdo {
+            object_position: 1,
+            voltage_mv: 5000,
+            op_current_ma: 1000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+        };
+        match p.evaluate_programmable_request(&rdo) {
+            RequestDecision::Reject => TestResult::Pass,
+            _ => TestResult::Fail("ProgrammableRdo on Fixed PDO should be Rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_source_policy_rejects_programmable_against_fixed_position
+    );
 }
