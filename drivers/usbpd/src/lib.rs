@@ -30,8 +30,12 @@
 
 extern crate alloc;
 
+pub mod altmode_dp;
+pub mod dp_gpu_bridge;
 pub mod fusb302;
 pub mod i2c_bridge;
+pub mod policy;
+pub mod tcpm;
 pub mod tps65987;
 
 mod tests;
@@ -72,10 +76,15 @@ pub static PORTS: IrqSafeSpinLock<Vec<PortBinding>> =
 /// 2. **TPS65987DDH** at `0x38` (TPS65987 TRM §"Host Interface").
 ///    Vendor-ID register must read `0x0451` (TI's USB-IF VID).
 pub fn register_initcalls() {
+    use core::fmt::Write as _;
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Late, "usbpd-tcpc-probe", || {
         let buses = narf_drivers_i2c::registered_buses();
         if buses.is_empty() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  tcpm: no PD chips detected (no I²C buses registered)"
+            );
             return InitResult::NotPresent;
         }
         let mut detected = 0usize;
@@ -83,6 +92,7 @@ pub fn register_initcalls() {
             detected += probe_bus(bus);
         }
         if detected == 0 {
+            let _ = writeln!(narf_console::Writer, "  tcpm: no PD chips detected");
             InitResult::NotPresent
         } else {
             InitResult::Ok
@@ -132,99 +142,103 @@ fn probe_bus(bus: &Arc<dyn narf_drivers_i2c::I2cBus>) -> usize {
     n
 }
 
-/// Park a detected TCPC in [`PORTS`] + spawn its TCPM sink-role
-/// task. The task drives `SinkPort::step` until it reports
-/// `StepOutcome::Ready`, logs the negotiated contract, then settles
-/// into the steady-state poll loop.
+/// Park a detected TCPC in [`PORTS`], spawn the per-port TCPM task
+/// (drives both sink and source state machines based on CC
+/// orientation), and spawn a DP Alt Mode discovery task that wakes
+/// once the TCPM reaches Ready.
 fn register_port(bus_name: &str, i2c_addr: u8, tcpc: Arc<dyn Tcpc>) {
-    use narf_usbpd::tcpm::SinkPort;
-    let sink = Arc::new(SinkPort::new(tcpc.clone()));
+    let label = alloc::format!("{}@0x{:02x}", bus_name, i2c_addr);
+    // Connector id is the registry index — every USB-C receptacle
+    // owns a small stable integer for DP Alt → GPU bridge lookup.
+    let connector_idx = PORTS.lock().len() as u32;
     PORTS.lock().push(PortBinding {
         bus_name: bus_name.into(),
         i2c_addr,
-        tcpc,
+        tcpc: tcpc.clone(),
     });
-    spawn_sink_task(sink, alloc::format!("{}@0x{:02x}", bus_name, i2c_addr));
+    let port = Arc::new(tcpm::TcpmPort::new(
+        tcpc,
+        policy::SinkPolicy::default(),
+        policy::SourcePolicy::default(),
+        label.clone(),
+    ));
+    tcpm::register_port(port.clone());
+    let alt = Arc::new(altmode_dp::DpAltModePort::new(
+        port.clone(),
+        dp_gpu_bridge::ConnectorId::from_index(connector_idx),
+    ));
+    altmode_dp::register_port(alt.clone());
+    spawn_tcpm_task(port, label.clone());
+    altmode_dp::spawn_discovery_task(alt, label);
 }
 
-/// Spawn an async task that drives one TCPM sink-role state machine
-/// to a Ready contract + keeps it alive across HardResets. Cadence
-/// derived from USB-PD 3.1 §8.3 + §6.6.1: short between Advanced
-/// steps (yield only), 25 ms while Idle (matches
-/// tTypeCSinkWaitCap minimum observation), 100 ms once Ready.
-fn spawn_sink_task(sink: Arc<narf_usbpd::tcpm::SinkPort>, label: alloc::string::String) {
+/// Spawn an async task that drives one TCPM port to a Ready contract
+/// (sink *or* source, picked from CC at attach time) and keeps it
+/// alive across detach + re-attach. Cadence derived from USB-PD 3.1
+/// §8.3 + §6.6.1: short between Advanced steps (yield only), 25 ms
+/// while Idle, 100 ms once Ready.
+fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
     use core::fmt::Write as _;
-    use narf_usbpd::tcpm::{SinkState, StepOutcome};
+    use tcpm::{PortState, PortStepOutcome};
     narf_scheduler::spawn(async move {
-        // Mint the USB-PD authority cap once per task. Cap revoke
-        // surfaces as `SinkError::AuthorityRevoked` which exits
-        // the loop cleanly.
         let cap = narf_usbpd::bootstrap_usbpd_authority();
-        let mut last_logged_state = SinkState::Unattached;
-        let mut announced_contract = false;
+        let mut last_logged_state = PortState::Unattached;
+        let mut announced = false;
         loop {
-            let outcome = match sink.step(&cap) {
+            let outcome = match port.step(&cap) {
                 Ok(o) => o,
                 Err(e) => {
                     let _ = writeln!(
                         narf_console::Writer,
-                        "  usbpd: {} step failed: {:?}",
+                        "  tcpm: {} step failed: {:?}",
                         label, e
                     );
-                    if matches!(e, narf_usbpd::tcpm::SinkError::AuthorityRevoked) {
+                    if matches!(e, tcpm::SourceError::AuthorityRevoked) {
                         return;
                     }
-                    // Other errors: back off + retry. The state
-                    // machine itself handles HardReset transitions.
                     narf_time::sleep_cycles(330_000_000).await;
                     continue;
                 }
             };
-            // Surface state transitions so a real-HW boot makes
-            // negotiation phases visible in the serial log.
-            if sink.state() != last_logged_state {
-                last_logged_state = sink.state();
+            if port.state() != last_logged_state {
+                last_logged_state = port.state();
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  usbpd: {} → {:?}",
+                    "  tcpm: {} → {:?}",
                     label, last_logged_state
                 );
-                // Reset contract-announcement flag on any state
-                // exit from Ready so a re-negotiation re-announces.
-                if last_logged_state != SinkState::Ready {
-                    announced_contract = false;
+                if !matches!(
+                    last_logged_state,
+                    PortState::AttachedSnk | PortState::AttachedSrc
+                ) {
+                    announced = false;
                 }
             }
             match outcome {
-                StepOutcome::Ready { contract } => {
-                    if !announced_contract {
+                PortStepOutcome::SinkReady(c) | PortStepOutcome::SourceReady(c) => {
+                    if !announced {
                         let _ = writeln!(
                             narf_console::Writer,
-                            "  usbpd: {} contract: PDO#{} {} mV @ {} mA",
-                            label,
-                            contract.object_position,
-                            contract.voltage_mv,
-                            contract.op_current_ma
+                            "  tcpm: {} contract: PDO#{} {} mV @ {} mA",
+                            label, c.object_position, c.voltage_mv, c.op_current_ma
                         );
-                        announced_contract = true;
+                        announced = true;
                     }
-                    // Steady-state poll cadence — long enough to
-                    // not flood the I²C bus, short enough to notice
-                    // a HardReset / source re-negotiation within
-                    // ~100 ms. 330 Mcycles ≈ 100 ms at 3.3 GHz TSC.
                     narf_time::sleep_cycles(330_000_000).await;
                 }
-                StepOutcome::Idle(_) => {
-                    // 25 ms idle between Idle-state polls. PD 3.1
-                    // §6.6.1 tTypeCSinkWaitCap is 310-620 ms — we
-                    // poll faster so a CC change wakes us within
-                    // one tick. 82.5 Mcycles ≈ 25 ms at 3.3 GHz.
+                PortStepOutcome::Idle(_) => {
                     narf_time::sleep_cycles(82_500_000).await;
                 }
-                StepOutcome::Advanced(_) => {
-                    // Don't sleep — back-to-back step() until the
-                    // state machine settles into Idle/Ready.
+                PortStepOutcome::Advanced(_) => {
                     narf_scheduler::yield_now().await;
+                }
+                PortStepOutcome::BistEntered => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  tcpm: {} entered BIST",
+                        label
+                    );
+                    narf_time::sleep_cycles(330_000_000).await;
                 }
             }
         }
