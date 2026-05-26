@@ -1324,6 +1324,169 @@ impl InitramfsRoot {
     }
 }
 
+/// Strip the canonical "./" or "/" prefix a CPIO archive can
+/// emit, depending on how `find` was invoked when packing.
+fn canonicalize_cpio_name(raw: &str) -> &str {
+    let s = raw.strip_prefix("./").unwrap_or(raw);
+    s.strip_prefix('/').unwrap_or(s)
+}
+
+/// Walk every entry under `prefix` and report the immediate-child
+/// names (one path component below `prefix`), deduplicated. For
+/// each unique child, mark it as Dir if any deeper entry begins
+/// with `prefix/child/`, else File.
+///
+/// Used by both [`InitramfsRoot::iter`] and the nested
+/// `InitramfsDir` wrapper. Without this, `ls /` was returning the
+/// raw CPIO flat-namespace entries (`firmware/blah.bin`,
+/// `bin/sh`, etc.) as single dirents of `/`, which looked like a
+/// recursive walk to the caller.
+fn collect_immediate_children<'a>(
+    entries: &'a [crate::InitramfsEntry],
+    prefix: &str,
+) -> Vec<(String, FileType)> {
+    use alloc::string::ToString;
+    use alloc::collections::BTreeMap;
+    // (child, has_subentries)
+    let mut seen: BTreeMap<&'a str, bool> = BTreeMap::new();
+    for e in entries.iter() {
+        let canon = canonicalize_cpio_name(e.name);
+        let rest = if prefix.is_empty() {
+            Some(canon)
+        } else if canon == prefix {
+            None
+        } else if let Some(r) = canon.strip_prefix(prefix) {
+            r.strip_prefix('/')
+        } else {
+            None
+        };
+        let rest = match rest {
+            Some(r) if !r.is_empty() => r,
+            _ => continue,
+        };
+        let (first, tail) = match rest.find('/') {
+            Some(slash) => (&rest[..slash], &rest[slash + 1..]),
+            None => (rest, ""),
+        };
+        let has_children = !tail.is_empty()
+            || (rest == first && (e.mode & 0o170000 == 0o040000));
+        match seen.get_mut(first) {
+            Some(flag) => {
+                *flag |= has_children;
+            }
+            None => {
+                seen.insert(first, has_children);
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|(name, is_dir)| {
+            (
+                name.to_string(),
+                if is_dir { FileType::Dir } else { FileType::File },
+            )
+        })
+        .collect()
+}
+
+/// A subdirectory view onto the same CPIO entry table that
+/// `InitramfsRoot` holds, but restricted to entries under
+/// `prefix`. Returned by `InitramfsRoot::lookup_dir` and
+/// `InitramfsDir::lookup_dir` so `ls /firmware` works.
+struct InitramfsDir {
+    entries: &'static [crate::InitramfsEntry],
+    prefix: String,
+}
+
+impl fmt::Debug for InitramfsDir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitramfsDir")
+            .field("prefix", &self.prefix)
+            .field("n_entries", &self.entries.len())
+            .finish()
+    }
+}
+
+unsafe impl Send for InitramfsDir {}
+unsafe impl Sync for InitramfsDir {}
+
+impl InitramfsDir {
+    fn child_prefix(&self, name: &str) -> String {
+        if self.prefix.is_empty() {
+            String::from(name)
+        } else {
+            let mut p = self.prefix.clone();
+            p.push('/');
+            p.push_str(name);
+            p
+        }
+    }
+}
+
+impl DirOps for InitramfsDir {
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        let target = self.child_prefix(name);
+        for e in self.entries.iter() {
+            if canonicalize_cpio_name(e.name) == target {
+                return Some(Arc::new(InitramfsFile {
+                    data: e.data,
+                    mode: e.mode,
+                    mtime: e.mtime,
+                }));
+            }
+        }
+        None
+    }
+
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        let target = self.child_prefix(name);
+        // Any entry whose canonical name == target/* or == target?
+        let any_match = self.entries.iter().any(|e| {
+            let canon = canonicalize_cpio_name(e.name);
+            canon == target
+                || canon
+                    .strip_prefix(&target)
+                    .and_then(|r| r.strip_prefix('/'))
+                    .is_some()
+        });
+        if !any_match {
+            return None;
+        }
+        Some(Arc::new(InitramfsDir {
+            entries: self.entries,
+            prefix: target,
+        }))
+    }
+
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        // The hierarchical view requires owned Strings (the
+        // child-name extraction allocates). Return an empty
+        // iterator here and let the framework call `enumerate`.
+        Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
+        let all = collect_immediate_children(self.entries, &self.prefix);
+        all.into_iter().skip(cursor).take(max).collect()
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move { Ok(self.enumerate(cursor, max)) })
+    }
+}
+
 impl DirOps for InitramfsRoot {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Match either bare name ("hello") or leading-slash-stripped
@@ -1331,9 +1494,7 @@ impl DirOps for InitramfsRoot {
         // `find /` differ on the prefix; tolerating both keeps
         // archive-generation flexible.
         for e in self.entries().iter() {
-            let canonical = e.name.strip_prefix("./").unwrap_or(e.name);
-            let canonical = canonical.strip_prefix('/').unwrap_or(canonical);
-            if canonical == name {
+            if canonicalize_cpio_name(e.name) == name {
                 return Some(Arc::new(InitramfsFile {
                     data: e.data,
                     mode: e.mode,
@@ -1350,46 +1511,39 @@ impl DirOps for InitramfsRoot {
         })
     }
 
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        // A subdir exists if at least one entry's canonical name
+        // starts with `name/` or is exactly `name` (an explicit
+        // CPIO dir entry).
+        let any_match = self.entries().iter().any(|e| {
+            let canon = canonicalize_cpio_name(e.name);
+            canon == name
+                || canon.strip_prefix(name).and_then(|r| r.strip_prefix('/')).is_some()
+        });
+        if !any_match {
+            return None;
+        }
+        Some(Arc::new(InitramfsDir {
+            entries: self.entries(),
+            prefix: String::from(name),
+        }))
+    }
+
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
-            // Initramfs in Stage 3 is flat; every entry is a leaf.
-            // If we find an entry that matches and looks like a dir,
-            // we could return it? But CPIO newc usually stores dirs
-            // explicitly.
-            for e in self.entries().iter() {
-                let canonical = e.name.strip_prefix("./").unwrap_or(e.name);
-                let canonical = canonical.strip_prefix('/').unwrap_or(canonical);
-                if canonical == name && (e.mode & 0o170000 == 0o040000) {
-                     // We don't have nested DirOps for Initramfs yet.
-                     return Err(FsError::Unsupported);
-                }
-            }
-            Err(FsError::NotFound)
+            self.lookup_dir(name).ok_or(FsError::NotFound)
         })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        Box::new(self.entries().iter().map(|e| {
-            let canonical = e.name.strip_prefix("./").unwrap_or(e.name);
-            let canonical = canonical.strip_prefix('/').unwrap_or(canonical);
-            DirEntry {
-                name: canonical,
-                file_type: if e.mode & 0o170000 == 0o040000 {
-                    FileType::Dir
-                } else {
-                    FileType::File
-                },
-            }
-        }))
+        // Hierarchical iteration needs owned Strings; let
+        // `enumerate` do the work.
+        Box::new(core::iter::empty())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        use alloc::string::ToString;
-        self.iter()
-            .skip(cursor)
-            .take(max)
-            .map(|de| (de.name.to_string(), de.file_type))
-            .collect()
+        let all = collect_immediate_children(self.entries(), "");
+        all.into_iter().skip(cursor).take(max).collect()
     }
 
     fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
