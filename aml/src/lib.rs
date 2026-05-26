@@ -368,6 +368,84 @@ pub fn capture_boot_snapshot() {
 /// vendor driver (Elan / Synaptics RMI4), or pivot to a non-I2C
 /// input path entirely (EC-attached keyboard via Notify, vendor
 /// MMIO).
+/// Walk the entire AML namespace and log every device that has an
+/// `I2cSerialBus` in its `_CRS`. This is the touchpad-finder for
+/// BIOSes that don't park I2C slaves under a recognisable I2C
+/// controller HID — Renoir 4700U is the motivating case (AMDI0005
+/// is actually PEP, and the touchpad's parent I2C controller has
+/// either no `_HID` or one we don't match).
+///
+/// For each slave, log:
+///   - device path
+///   - `_HID` and `_CID` list
+///   - I2C slave address + bus speed
+///   - the `resource_source` (parent controller path) of its
+///     I2cSerialBus — that's the thing we'd need to bind in
+///     `amd_fch::probe_all` to make the slave reachable.
+///
+/// Use this to identify (a) which controller HID we're missing
+/// from `AMD_FCH_HIDS` and (b) which touchpad vendor `_HID` to
+/// add to the i2c-hid bind whitelist.
+pub fn dump_i2c_slaves() {
+    use core::fmt::Write as _;
+    use crate::resource::ResourceItem;
+    let device_paths = list_all_device_paths();
+    let mut any = false;
+    for path in device_paths.iter() {
+        let items = match crate::prt_crs::evaluate_crs_for(path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mut i2c: Option<(u16, u32, alloc::string::String)> = None;
+        for item in &items {
+            if let ResourceItem::I2cSerialBus {
+                slave_address,
+                connection_speed,
+                resource_source,
+                ..
+            } = item
+            {
+                i2c = Some((
+                    *slave_address,
+                    *connection_speed,
+                    resource_source.clone(),
+                ));
+                break;
+            }
+        }
+        let (addr, speed, src) = match i2c {
+            Some(t) => t,
+            None => continue,
+        };
+        if !any {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  aml-i2c-slaves: every device with an I2cSerialBus in _CRS:",
+            );
+            any = true;
+        }
+        let hid = device_hid(path);
+        let cids = device_cids(path);
+        let _ = writeln!(
+            narf_console::Writer,
+            "    slave: {} _HID={} _CID={:?} addr=0x{:02x} speed={} parent={}",
+            path,
+            hid.as_deref().unwrap_or("(none)"),
+            cids,
+            addr,
+            speed,
+            src,
+        );
+    }
+    if !any {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  aml-i2c-slaves: no devices with I2cSerialBus resources \
+             (touchpad not on I2C, OR _CRS decoder doesn't recognise the variant)",
+        );
+    }
+}
+
 pub fn dump_amd_i2c_subtree() {
     use core::fmt::Write as _;
     let device_paths = list_all_device_paths();

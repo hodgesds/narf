@@ -121,6 +121,14 @@ pub fn bind_all() -> usize {
         amdi_n, pnp_n
     );
     narf_aml::dump_amd_i2c_subtree();
+    // Also enumerate every device in the namespace that has an
+    // `I2cSerialBus` resource — covers touchpads / sensor hubs
+    // whose parent I2C controller doesn't have a `_HID` we
+    // recognise (Renoir 4700U: AMDI0005 is PEP, not I2C; the real
+    // I2C controller has either no `_HID` or one not in our list).
+    // The dump tells us which device is the touchpad + which
+    // controller node we need to match.
+    narf_aml::dump_i2c_slaves();
     // First pass: devices whose _HID matches directly.
     for &hid in &["PNP0C50", "ACPI0C50"] {
         for child in narf_aml::find_all_devices_by_hid(hid) {
