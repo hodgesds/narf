@@ -81,4 +81,42 @@ impl Inode {
     pub fn is_symlink(&self) -> bool {
         (self.mode & S_IFMT) == S_IFLNK
     }
+
+    /// Encode this inode into a 128-byte buffer. Only fields we
+    /// surface (mode/size/blocks/block) are written; everything else
+    /// is preserved by reading the on-disk bytes first and only
+    /// overwriting our fields. Caller should pass `buf` initialised
+    /// from `read_byte_range` and call `encode` to update.
+    pub fn encode_into(&self, buf: &mut [u8]) {
+        if buf.len() < 128 {
+            return;
+        }
+        buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.size.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.blocks.to_le_bytes());
+        for i in 0..I_BLOCK_LEN {
+            let off = 40 + i * 4;
+            buf[off..off + 4].copy_from_slice(&self.block[i].to_le_bytes());
+        }
+    }
+
+    /// Build a fresh regular-file inode.
+    pub fn new_regular(perms: u16) -> Self {
+        Self {
+            mode: S_IFREG | (perms & 0o777),
+            size: 0,
+            blocks: 0,
+            block: [0; I_BLOCK_LEN],
+        }
+    }
+
+    /// Build a fresh directory inode.
+    pub fn new_directory(perms: u16) -> Self {
+        Self {
+            mode: S_IFDIR | (perms & 0o777),
+            size: 0,
+            blocks: 0,
+            block: [0; I_BLOCK_LEN],
+        }
+    }
 }

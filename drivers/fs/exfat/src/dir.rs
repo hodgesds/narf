@@ -209,3 +209,45 @@ pub fn extract_file_name_fragment(entry: &FileNameEntry, out: &mut [u16], take: 
     out[..n].copy_from_slice(&name[..n]);
     n
 }
+
+// ── Spec §6.3.3 — SetChecksum over a directory-entry group ─────────
+
+/// Compute the §6.3.3 SetChecksum over the byte image of a primary
+/// FileDirectoryEntry plus every secondary entry. The two bytes at
+/// offsets 2 and 3 of the primary entry (the checksum field
+/// itself) are skipped — they're written back after the checksum
+/// is computed.
+///
+/// Algorithm (§6.3.3):
+///   for byte_index in 0..len:
+///     if byte_index in {2, 3}: continue
+///     checksum = ((checksum & 1) << 15) | (checksum >> 1) + byte
+pub fn set_checksum(group: &[u8]) -> u16 {
+    let mut sum: u16 = 0;
+    for (i, &b) in group.iter().enumerate() {
+        if i == 2 || i == 3 {
+            continue;
+        }
+        sum = ((sum & 1) << 15).wrapping_add(sum >> 1).wrapping_add(b as u16);
+    }
+    sum
+}
+
+/// Re-compute the SetChecksum on `group` and write it back into the
+/// primary entry's bytes 2..4 (little-endian). Used by both
+/// verification (paired with `verify_set_checksum`) and write
+/// (computing a fresh checksum after editing a group).
+pub fn finalize_set_checksum(group: &mut [u8]) {
+    let cs = set_checksum(group);
+    group[2..4].copy_from_slice(&cs.to_le_bytes());
+}
+
+/// Verify that the SetChecksum in `group[2..4]` matches the
+/// recomputation. Returns `true` iff valid.
+pub fn verify_set_checksum(group: &[u8]) -> bool {
+    if group.len() < 4 {
+        return false;
+    }
+    let stored = u16::from_le_bytes([group[2], group[3]]);
+    set_checksum(group) == stored
+}

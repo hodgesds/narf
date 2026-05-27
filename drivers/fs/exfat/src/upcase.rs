@@ -109,3 +109,20 @@ impl UpcaseTable {
         true
     }
 }
+
+/// Up-case-table checksum per §7.2.3. Treats the on-disk stream as
+/// a byte sequence and rotates-right then sums each byte:
+///
+///   checksum = ((checksum & 1) << 31) | (checksum >> 1);
+///   checksum += byte;
+///
+/// The same algorithm appears in §7.1.4 for the volume-flags
+/// checksum and is the canonical Microsoft 32-bit rotate-add. Used
+/// both for verification on mount and for re-computation on write.
+pub fn upcase_checksum(bytes: &[u8]) -> u32 {
+    let mut sum: u32 = 0;
+    for &b in bytes {
+        sum = ((sum & 1) << 31).wrapping_add(sum >> 1).wrapping_add(b as u32);
+    }
+    sum
+}

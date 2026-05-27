@@ -542,6 +542,84 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
+    /// Write `src.len()` bytes starting at device byte offset
+    /// `byte_off`. Inverse of `read_byte_range`. Note: this is a
+    /// byte-granularity write — for sub-LBA spans we read-modify-
+    /// write the enclosing sector.
+    pub async fn write_byte_range(
+        &self,
+        byte_off: u64,
+        src: &[u8],
+    ) -> Result<(), FsError> {
+        let (cap, lbs) = {
+            let g = self.io.lock();
+            (g.cap, g.lbs)
+        };
+        let mut cursor = 0usize;
+        while cursor < src.len() {
+            let abs = byte_off + cursor as u64;
+            let lba = abs / lbs as u64;
+            let in_lba = (abs % lbs as u64) as usize;
+            let want = core::cmp::min(src.len() - cursor, lbs - in_lba);
+
+            // If we're not writing a full sector, do a RMW.
+            let mut sector = alloc::vec![0u8; lbs];
+            if !(in_lba == 0 && want == lbs) {
+                Self::read_byte_range_with(
+                    &*self.device,
+                    cap,
+                    lbs,
+                    &self.io,
+                    lba * lbs as u64,
+                    &mut sector,
+                )
+                .await?;
+            }
+            sector[in_lba..in_lba + want].copy_from_slice(&src[cursor..cursor + want]);
+
+            // Stage into the DMA buffer, then issue the write.
+            {
+                let buf = self
+                    .io
+                    .lock()
+                    .buffer()
+                    .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+                // SAFETY: see read_byte_range_with. Single-CPU
+                // cooperative async means the spinlock guards the
+                // buffer bytes for the duration of the copy.
+                let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
+                dst.copy_from_slice(&sector);
+            }
+            let req = BlockRequest {
+                op: BlockOp::Write { fua: false },
+                lba,
+                blocks: 1,
+                buffer: cap
+                    .derive::<Read>()
+                    .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+                qos: QosHint::Latency,
+                user_tag: 0,
+            };
+            let completion = self.device.submit(req).await;
+            completion.result.map_err(FsError::Io)?;
+
+            cursor += want;
+        }
+        Ok(())
+    }
+
+    /// Write one filesystem block from `src`. Inverse of
+    /// `read_block`. NOTE: this writes to the device only; it does
+    /// not touch the journal-replay overrides cache (which is the
+    /// read-side replay path; writes invalidate it).
+    pub async fn write_block(&self, block_no: u64, src: &[u8]) -> Result<(), FsError> {
+        let bs = self.block_size();
+        if src.len() != bs {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        self.write_byte_range(block_no * bs as u64, src).await
+    }
+
     /// Variant of `read_byte_range` usable before the `Ext2Volume`
     /// `Arc` exists — `mount()` calls this through a `&VolumeIo`
     /// directly.
@@ -649,6 +727,405 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return None;
         }
         Some((group, index))
+    }
+
+    /// Write inode `inode_no` back to the inode table. Preserves
+    /// the rev-1+ extra-fields tail by read-modify-writing the full
+    /// `inode_size_bytes()` slot.
+    pub async fn write_inode(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+    ) -> Result<(), FsError> {
+        let (group, index) = self
+            .inode_group_and_index(inode_no)
+            .ok_or(FsError::NotFound)?;
+        let gd = &self.group_descs[group as usize];
+        let inode_size = self.superblock.inode_size_bytes();
+        let bs = self.block_size() as u64;
+        let table_byte_off = gd.inode_table as u64 * bs;
+        let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
+        let mut buf = vec![0u8; inode_size];
+        self.read_byte_range(inode_byte_off, &mut buf).await?;
+        inode.encode_into(&mut buf);
+        self.write_byte_range(inode_byte_off, &buf).await
+    }
+
+    // ── Bitmap allocator (Linux fs/ext2/balloc.c + ialloc.c) ─────
+
+    /// Scan a bitmap block for the first zero bit and set it. The
+    /// `start_block` lives in `bm_block` (FS block number); on
+    /// success returns the (zero-based) bit position. Bits 0..k are
+    /// skipped if `skip_first` is set (used to reserve bit 0 of the
+    /// inode bitmap on the first scanned block — Linux does this
+    /// implicitly because inode 0 is unused and inode 1 may be
+    /// reserved).
+    async fn alloc_in_bitmap_block(
+        &self,
+        bm_block: u64,
+        max_bits: u32,
+        skip_first: u32,
+    ) -> Result<Option<u32>, FsError> {
+        let bs = self.block_size();
+        let mut buf = vec![0u8; bs];
+        self.read_block(bm_block, &mut buf).await?;
+        let max = (max_bits as usize).min(bs * 8);
+        for bit in (skip_first as usize)..max {
+            let byte = bit / 8;
+            let bit_in_byte = bit % 8;
+            if (buf[byte] >> bit_in_byte) & 1 == 0 {
+                buf[byte] |= 1 << bit_in_byte;
+                self.write_block(bm_block, &buf).await?;
+                return Ok(Some(bit as u32));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Clear bit `bit_index` in bitmap block `bm_block`.
+    async fn free_in_bitmap_block(
+        &self,
+        bm_block: u64,
+        bit_index: u32,
+    ) -> Result<(), FsError> {
+        let bs = self.block_size();
+        let mut buf = vec![0u8; bs];
+        self.read_block(bm_block, &mut buf).await?;
+        let byte = (bit_index / 8) as usize;
+        let bit_in_byte = (bit_index % 8) as u8;
+        if byte < buf.len() {
+            buf[byte] &= !(1u8 << bit_in_byte);
+            self.write_block(bm_block, &buf).await?;
+        }
+        Ok(())
+    }
+
+    /// Allocate a free block from the volume. Walks block groups in
+    /// order, scanning each group's block bitmap. Returns the
+    /// absolute (1-based) block number of the allocated block.
+    pub async fn alloc_block(&self) -> Result<u64, FsError> {
+        let bpg = self.superblock.blocks_per_group;
+        let first_block = self.superblock.first_data_block;
+        for (gi, gd) in self.group_descs.iter().enumerate() {
+            if gd.free_blocks_count == 0 {
+                continue;
+            }
+            // ext2 block numbers are 1-based starting from
+            // first_data_block. Bit 0 of group `g`'s bitmap maps
+            // to absolute block `first_data_block + g*blocks_per_group`.
+            let group_first = first_block as u64 + gi as u64 * bpg as u64;
+            let group_last = (group_first + bpg as u64).min(self.superblock.blocks_count as u64);
+            let bits_in_group = (group_last - group_first) as u32;
+            if let Some(bit) = self
+                .alloc_in_bitmap_block(gd.block_bitmap, bits_in_group, 0)
+                .await?
+            {
+                return Ok(group_first + bit as u64);
+            }
+        }
+        Err(FsError::NoSpace)
+    }
+
+    /// Free block `block_no` (absolute 1-based).
+    pub async fn free_block(&self, block_no: u64) -> Result<(), FsError> {
+        let bpg = self.superblock.blocks_per_group as u64;
+        let first_block = self.superblock.first_data_block as u64;
+        if block_no < first_block {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let group = ((block_no - first_block) / bpg) as usize;
+        let bit = ((block_no - first_block) % bpg) as u32;
+        if group >= self.group_descs.len() {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let bm_block = self.group_descs[group].block_bitmap;
+        self.free_in_bitmap_block(bm_block, bit).await
+    }
+
+    /// Allocate a free inode. Returns the 1-based inode number.
+    pub async fn alloc_inode(&self) -> Result<u32, FsError> {
+        let ipg = self.superblock.inodes_per_group;
+        let first_reserved = self.superblock.first_ino();
+        for (gi, gd) in self.group_descs.iter().enumerate() {
+            if gd.free_inodes_count == 0 {
+                continue;
+            }
+            // Reserve first_reserved-1 bits of group 0 (matches
+            // mkfs.ext2's behaviour — bit 0 = inode 1, bit 1 = inode 2,
+            // ...). Higher groups have no reserved range.
+            let skip = if gi == 0 {
+                first_reserved.saturating_sub(1)
+            } else {
+                0
+            };
+            if let Some(bit) = self
+                .alloc_in_bitmap_block(gd.inode_bitmap, ipg, skip)
+                .await?
+            {
+                return Ok((gi as u32) * ipg + bit + 1);
+            }
+        }
+        Err(FsError::NoSpace)
+    }
+
+    /// Free inode `inode_no` (1-based).
+    pub async fn free_inode(&self, inode_no: u32) -> Result<(), FsError> {
+        if inode_no == 0 {
+            return Ok(());
+        }
+        let (group, index) = self
+            .inode_group_and_index(inode_no)
+            .ok_or(FsError::NotFound)?;
+        let bm_block = self.group_descs[group as usize].inode_bitmap;
+        self.free_in_bitmap_block(bm_block, index).await
+    }
+
+    /// Map a logical block index to a physical block, allocating
+    /// a fresh block (and intermediate indirect blocks) when the
+    /// slot is currently a hole. The inode is mutated in place;
+    /// caller persists via `write_inode`.
+    ///
+    /// Only the legacy (non-extents) path is supported on the write
+    /// side — ext4 extents trees stay read-only for now.
+    pub async fn map_block_alloc(
+        &self,
+        inode: &mut Inode,
+        logical: u64,
+    ) -> Result<u64, FsError> {
+        if self.superblock.uses_extents() {
+            // Refuse extents-tree writes — implementing a write-side
+            // walker is multi-thousand lines on top of this.
+            return Err(FsError::Unsupported);
+        }
+        let p = self.pointers_per_block() as u64;
+        let direct_max = super::inode::N_DIRECT as u64;
+        let single_max = direct_max + p;
+        let double_max = single_max + p * p;
+        let triple_max = double_max + p * p * p;
+        let bs = self.block_size();
+        if logical < direct_max {
+            let slot = &mut inode.block[logical as usize];
+            if *slot == 0 {
+                let b = self.alloc_block().await? as u32;
+                *slot = b;
+                let zeros = vec![0u8; bs];
+                self.write_block(b as u64, &zeros).await?;
+            }
+            return Ok(*slot as u64);
+        }
+        if logical < single_max {
+            let slot = &mut inode.block[super::inode::SINGLE_IND_IDX];
+            if *slot == 0 {
+                let b = self.alloc_block().await? as u32;
+                *slot = b;
+                let zeros = vec![0u8; bs];
+                self.write_block(b as u64, &zeros).await?;
+            }
+            let ind = *slot;
+            let idx = logical - direct_max;
+            return self.alloc_indirect_slot(ind as u64, idx).await;
+        }
+        if logical < double_max {
+            let slot = &mut inode.block[super::inode::DOUBLE_IND_IDX];
+            if *slot == 0 {
+                let b = self.alloc_block().await? as u32;
+                *slot = b;
+                let zeros = vec![0u8; bs];
+                self.write_block(b as u64, &zeros).await?;
+            }
+            let dbl = *slot;
+            let l = logical - single_max;
+            let l1 = l / p;
+            let l0 = l % p;
+            let mid = self.alloc_indirect_slot(dbl as u64, l1).await?;
+            return self.alloc_indirect_slot(mid, l0).await;
+        }
+        if logical < triple_max {
+            let slot = &mut inode.block[super::inode::TRIPLE_IND_IDX];
+            if *slot == 0 {
+                let b = self.alloc_block().await? as u32;
+                *slot = b;
+                let zeros = vec![0u8; bs];
+                self.write_block(b as u64, &zeros).await?;
+            }
+            let tri = *slot;
+            let l = logical - double_max;
+            let l2 = l / (p * p);
+            let l1 = (l / p) % p;
+            let l0 = l % p;
+            let mid = self.alloc_indirect_slot(tri as u64, l2).await?;
+            let leaf = self.alloc_indirect_slot(mid, l1).await?;
+            return self.alloc_indirect_slot(leaf, l0).await;
+        }
+        Err(FsError::Io(narf_block::BlockError::InvalidRange))
+    }
+
+    /// Read pointer `idx` from indirect block `ind_block`. If zero,
+    /// allocate a fresh data block, write the pointer back, and
+    /// return the new block number.
+    async fn alloc_indirect_slot(
+        &self,
+        ind_block: u64,
+        idx: u64,
+    ) -> Result<u64, FsError> {
+        let bs = self.block_size();
+        let p = self.pointers_per_block() as u64;
+        if idx >= p {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let mut buf = vec![0u8; bs];
+        self.read_block(ind_block, &mut buf).await?;
+        let off = (idx as usize) * 4;
+        let cur = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        if cur != 0 {
+            return Ok(cur as u64);
+        }
+        let new = self.alloc_block().await? as u32;
+        buf[off..off + 4].copy_from_slice(&new.to_le_bytes());
+        self.write_block(ind_block, &buf).await?;
+        let zeros = vec![0u8; bs];
+        self.write_block(new as u64, &zeros).await?;
+        Ok(new as u64)
+    }
+
+    /// Free every block an inode owns (direct + indirect + double-
+    /// + triple-indirect), zeroing the inode's `block[]` field.
+    /// Caller persists the inode.
+    pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
+        if self.superblock.uses_extents() {
+            return Err(FsError::Unsupported);
+        }
+        let bs = self.block_size();
+        let p = self.pointers_per_block() as u64;
+        for i in 0..super::inode::N_DIRECT {
+            let b = inode.block[i];
+            if b != 0 {
+                self.free_block(b as u64).await?;
+                inode.block[i] = 0;
+            }
+        }
+        // Single-indirect.
+        let single = inode.block[super::inode::SINGLE_IND_IDX];
+        if single != 0 {
+            self.free_indirect_one(single as u64, p, bs).await?;
+            self.free_block(single as u64).await?;
+            inode.block[super::inode::SINGLE_IND_IDX] = 0;
+        }
+        // Double-indirect.
+        let dbl = inode.block[super::inode::DOUBLE_IND_IDX];
+        if dbl != 0 {
+            let mut mid_buf = vec![0u8; bs];
+            self.read_block(dbl as u64, &mut mid_buf).await?;
+            for i in 0..p {
+                let off = (i as usize) * 4;
+                let mid = u32::from_le_bytes([
+                    mid_buf[off],
+                    mid_buf[off + 1],
+                    mid_buf[off + 2],
+                    mid_buf[off + 3],
+                ]);
+                if mid != 0 {
+                    self.free_indirect_one(mid as u64, p, bs).await?;
+                    self.free_block(mid as u64).await?;
+                }
+            }
+            self.free_block(dbl as u64).await?;
+            inode.block[super::inode::DOUBLE_IND_IDX] = 0;
+        }
+        // Triple-indirect.
+        let tri = inode.block[super::inode::TRIPLE_IND_IDX];
+        if tri != 0 {
+            let mut top_buf = vec![0u8; bs];
+            self.read_block(tri as u64, &mut top_buf).await?;
+            for i in 0..p {
+                let off = (i as usize) * 4;
+                let mid = u32::from_le_bytes([
+                    top_buf[off],
+                    top_buf[off + 1],
+                    top_buf[off + 2],
+                    top_buf[off + 3],
+                ]);
+                if mid != 0 {
+                    let mut mid_buf = vec![0u8; bs];
+                    self.read_block(mid as u64, &mut mid_buf).await?;
+                    for j in 0..p {
+                        let o2 = (j as usize) * 4;
+                        let leaf = u32::from_le_bytes([
+                            mid_buf[o2],
+                            mid_buf[o2 + 1],
+                            mid_buf[o2 + 2],
+                            mid_buf[o2 + 3],
+                        ]);
+                        if leaf != 0 {
+                            self.free_indirect_one(leaf as u64, p, bs).await?;
+                            self.free_block(leaf as u64).await?;
+                        }
+                    }
+                    self.free_block(mid as u64).await?;
+                }
+            }
+            self.free_block(tri as u64).await?;
+            inode.block[super::inode::TRIPLE_IND_IDX] = 0;
+        }
+        inode.size = 0;
+        inode.blocks = 0;
+        Ok(())
+    }
+
+    /// Free every pointer in a single-indirect block.
+    async fn free_indirect_one(
+        &self,
+        ind_block: u64,
+        p: u64,
+        bs: usize,
+    ) -> Result<(), FsError> {
+        let mut buf = vec![0u8; bs];
+        self.read_block(ind_block, &mut buf).await?;
+        for i in 0..p {
+            let off = (i as usize) * 4;
+            let v = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            if v != 0 {
+                self.free_block(v as u64).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `src` to `inode` starting at `offset`. Allocates blocks
+    /// as needed via `map_block_alloc`. Extends `inode.size`.
+    pub async fn write_inode_data(
+        &self,
+        inode: &mut Inode,
+        offset: u64,
+        src: &[u8],
+    ) -> Result<usize, FsError> {
+        if self.superblock.uses_extents() {
+            return Err(FsError::Unsupported);
+        }
+        let bs = self.block_size() as u64;
+        let mut total = 0usize;
+        let mut remaining = src.len();
+        let mut cur_off = offset;
+        while remaining > 0 {
+            let logical = cur_off / bs;
+            let in_block = (cur_off % bs) as usize;
+            let n = core::cmp::min(remaining, bs as usize - in_block);
+            let phys = self.map_block_alloc(inode, logical).await?;
+            // RMW the block.
+            let mut bbuf = vec![0u8; bs as usize];
+            if in_block != 0 || n != bs as usize {
+                self.read_block(phys, &mut bbuf).await?;
+            }
+            bbuf[in_block..in_block + n].copy_from_slice(&src[total..total + n]);
+            self.write_block(phys, &bbuf).await?;
+            total += n;
+            remaining -= n;
+            cur_off += n as u64;
+        }
+        if cur_off > inode.size as u64 {
+            inode.size = cur_off as u32;
+        }
+        Ok(total)
     }
 
     /// Read the on-disk inode `inode_no`.

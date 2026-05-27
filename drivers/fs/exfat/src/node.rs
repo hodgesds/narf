@@ -6,11 +6,15 @@
 //! `enumerate_async` all share the scanner. `read` honours the
 //! §7.6.5 `NoFatChain` flag for contiguous extents.
 //!
-//! Write operations (create / mkdir / unlink / rmdir / rename /
-//! truncate / write) are NOT implemented in this first cut — they
-//! all return `FsError::Unsupported`. Landing them requires the
-//! bitmap allocator and on-disk up-case checksum verification,
-//! both flagged TODO.
+//! Write operations on the node layer are intentionally deferred:
+//! `volume.rs` ships the §7.1 bitmap allocator + cluster R/W +
+//! FAT-entry edit + §6.3.3 SetChecksum + §7.2.3 up-case checksum
+//! (the foundation), but the directory-entry edit path — building
+//! a §7.4 primary + §7.6 stream + §7.7 name-fragment group and
+//! splicing it into the parent's cluster chain — is multi-thousand
+//! lines on top of the allocator and lands in a follow-up. Until
+//! then `write` / `truncate` / `create` / `mkdir` / etc. continue
+//! to return `FsError::Unsupported` from the trait default.
 //!
 //! References:
 //! - exFAT file system specification (Microsoft, 2019),
@@ -388,9 +392,12 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
     }
 
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // TODO: write path requires the bitmap allocator + the
-        // §7.4.3 SetChecksum recompute. Deferred per the first-cut
-        // scope.
+        // Bitmap allocator + SetChecksum recompute land in
+        // `volume.rs` / `dir.rs` (see `alloc_clusters`,
+        // `set_checksum`). The remaining piece — finding the parent
+        // directory's entry group for this file, recomputing its
+        // §7.4.3 SetChecksum after editing DataLength, and walking
+        // the FAT to extend the chain — is deferred to follow-up.
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 

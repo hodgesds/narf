@@ -18,6 +18,12 @@
 //!                index 1 holds `0xFFFFFFFF`.
 //!   <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
 
+/// FAT entry sentinels per §3.3, exposed as raw u32 so the write
+/// path can encode them directly.
+pub const FAT_FREE: u32 = 0x0000_0000;
+pub const FAT_END_OF_CHAIN: u32 = 0xFFFF_FFFF;
+pub const FAT_BAD_CLUSTER: u32 = 0xFFFF_FFF7;
+
 /// Decoded meaning of one 32-bit FAT entry.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FatEntry {

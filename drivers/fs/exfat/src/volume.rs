@@ -187,6 +187,41 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         Ok(())
     }
 
+    /// Write one sector (LBS bytes) from `src` to `lba`. Inverse
+    /// of `read_sector`.
+    pub async fn write_sector(&self, lba: u64, src: &[u8]) -> Result<(), FsError> {
+        let lbs = self.io.lock().lbs;
+        if src.len() != lbs {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        // Stage into the DMA buffer.
+        {
+            let buf = self
+                .io
+                .lock()
+                .buffer()
+                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+            // SAFETY: same single-CPU cooperative serialisation as
+            // read_sector.
+            let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
+            dst.copy_from_slice(src);
+        }
+        let cap = { self.io.lock().cap };
+        let req = BlockRequest {
+            op: BlockOp::Write { fua: false },
+            lba,
+            blocks: 1,
+            buffer: cap
+                .derive::<Read>()
+                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+            qos: QosHint::Latency,
+            user_tag: 0,
+        };
+        let completion = self.device.submit(req).await;
+        completion.result.map_err(FsError::Io)?;
+        Ok(())
+    }
+
     /// Pre-`Arc` variant of `read_sector` — `mount()` calls this
     /// through a `&VolumeIo` directly because the volume Arc
     /// doesn't exist yet.
@@ -463,11 +498,211 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         Ok(UpcaseTable::decompress(&bytes))
     }
 
+    // ── Bitmap allocator (§7.1) ─────────────────────────────────
+
+    /// Read one cluster from the cluster heap into `dst`.
+    /// `dst.len()` must equal `self.bytes_per_cluster`.
+    pub async fn read_cluster(&self, cluster: u32, dst: &mut [u8]) -> Result<(), FsError> {
+        if dst.len() != self.bytes_per_cluster as usize {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let lba_start = self.first_sector_of_cluster(cluster);
+        let lbs = self.bytes_per_sector as usize;
+        for s in 0..self.sectors_per_cluster as u64 {
+            let off = (s as usize) * lbs;
+            self.read_sector(lba_start + s, &mut dst[off..off + lbs])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Write one cluster from `src` to the cluster heap. Inverse of
+    /// `read_cluster`.
+    pub async fn write_cluster(&self, cluster: u32, src: &[u8]) -> Result<(), FsError> {
+        if src.len() != self.bytes_per_cluster as usize {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let lba_start = self.first_sector_of_cluster(cluster);
+        let lbs = self.bytes_per_sector as usize;
+        for s in 0..self.sectors_per_cluster as u64 {
+            let off = (s as usize) * lbs;
+            self.write_sector(lba_start + s, &src[off..off + lbs])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Write a FAT entry — used when extending a cluster chain.
+    /// §3.3: each FAT entry is a 4-byte little-endian cluster
+    /// number; `value` may be a next-cluster pointer or one of the
+    /// §3.3.1 sentinels (`FAT_END_OF_CHAIN`, `FAT_BAD_CLUSTER`).
+    pub async fn write_fat_entry(&self, cluster: u32, value: u32) -> Result<(), FsError> {
+        let (sector, byte_in_sector) =
+            fat::entry_location(self.boot.fat_offset, self.bytes_per_sector, cluster);
+        let lbs = self.io.lock().lbs;
+        let mut buf = vec![0u8; lbs];
+        self.read_sector(sector, &mut buf).await?;
+        buf[byte_in_sector..byte_in_sector + 4]
+            .copy_from_slice(&value.to_le_bytes());
+        self.write_sector(sector, &buf).await
+    }
+
+    /// Allocate `n` contiguous clusters from the §7.1 Allocation
+    /// Bitmap, mark them used, and return the starting cluster
+    /// number. Uses a first-fit scan over the bitmap stream. Sets
+    /// the new clusters' FAT entries to either `next` (chain) or
+    /// `FAT_END_OF_CHAIN` (last).
+    ///
+    /// On exFAT bit 0 of the bitmap corresponds to cluster 2 (the
+    /// first valid data cluster per §3.1.10). Returns
+    /// `FsError::NoSpace` when no run of `n` clusters is free.
+    pub async fn alloc_clusters(&self, n: u32) -> Result<u32, FsError> {
+        if n == 0 {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let (bm_first, bm_len) = self
+            .locate_bitmap()
+            .await?
+            .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+        let bytes_per_cluster = self.bytes_per_cluster as u64;
+        let cluster_count = self.boot.cluster_count;
+        // Stream the bitmap one cluster at a time.
+        let mut buf = vec![0u8; self.bytes_per_cluster as usize];
+        let mut run_start: Option<u32> = None;
+        let mut run_len: u32 = 0;
+        let mut bm_cluster = bm_first;
+        let mut bm_off: u64 = 0;
+        while bm_off < bm_len {
+            self.read_cluster(bm_cluster, &mut buf).await?;
+            let to_consume = ((bm_len - bm_off) as usize).min(buf.len());
+            for byte_idx in 0..to_consume {
+                let byte = buf[byte_idx];
+                for bit in 0..8u32 {
+                    let bit_index = (bm_off as u32 * 8) + byte_idx as u32 * 8 + bit;
+                    if bit_index >= cluster_count {
+                        break;
+                    }
+                    let cluster = bit_index + 2; // §3.1.10
+                    let used = (byte >> bit) & 1 != 0;
+                    if used {
+                        run_start = None;
+                        run_len = 0;
+                    } else {
+                        if run_start.is_none() {
+                            run_start = Some(cluster);
+                        }
+                        run_len += 1;
+                        if run_len == n {
+                            // Found enough; mark them and write back.
+                            let start = run_start.unwrap();
+                            self.set_bitmap_range(bm_first, start, n, true)
+                                .await?;
+                            // Build a chain in the FAT.
+                            for i in 0..n {
+                                let c = start + i;
+                                let v = if i + 1 == n {
+                                    fat::FAT_END_OF_CHAIN
+                                } else {
+                                    start + i + 1
+                                };
+                                self.write_fat_entry(c, v).await?;
+                            }
+                            return Ok(start);
+                        }
+                    }
+                }
+            }
+            bm_off += to_consume as u64;
+            // Step to next cluster of the bitmap chain.
+            if bm_off < bm_len {
+                match self.next_cluster(bm_cluster).await? {
+                    FatEntry::Next(c) => bm_cluster = c,
+                    _ => return Err(FsError::NoSpace),
+                }
+            }
+            let _ = bytes_per_cluster;
+        }
+        Err(FsError::NoSpace)
+    }
+
+    /// Mark a contiguous run of clusters used/free in the
+    /// allocation bitmap. The bitmap stream is treated as a flat
+    /// byte sequence indexed by `(cluster - 2)`-th bit.
+    pub async fn set_bitmap_range(
+        &self,
+        bm_first_cluster: u32,
+        start_cluster: u32,
+        n: u32,
+        used: bool,
+    ) -> Result<(), FsError> {
+        if start_cluster < 2 {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        // We do this one byte at a time across the bitmap stream;
+        // each cluster of the bitmap holds `bytes_per_cluster` bytes
+        // (=8*bytes_per_cluster bits = up to that many clusters
+        // represented).
+        let bytes_per_cluster = self.bytes_per_cluster as u64;
+        for offset in 0..n {
+            let bit_index = (start_cluster + offset - 2) as u64;
+            let byte_offset = bit_index / 8;
+            let bit_in_byte = (bit_index % 8) as u8;
+            // Locate which cluster of the bitmap stream holds the
+            // byte and at what offset within that cluster.
+            let bm_cluster_idx = byte_offset / bytes_per_cluster;
+            let off_in_cluster = (byte_offset % bytes_per_cluster) as usize;
+            // Walk the bitmap chain to the right cluster.
+            let mut current = bm_first_cluster;
+            for _ in 0..bm_cluster_idx {
+                match self.next_cluster(current).await? {
+                    FatEntry::Next(c) => current = c,
+                    _ => return Err(FsError::Io(narf_block::BlockError::IOError)),
+                }
+            }
+            let mut buf = vec![0u8; self.bytes_per_cluster as usize];
+            self.read_cluster(current, &mut buf).await?;
+            if used {
+                buf[off_in_cluster] |= 1u8 << bit_in_byte;
+            } else {
+                buf[off_in_cluster] &= !(1u8 << bit_in_byte);
+            }
+            self.write_cluster(current, &buf).await?;
+        }
+        Ok(())
+    }
+
+    /// Free a cluster chain starting at `start_cluster`. Walks the
+    /// FAT, clearing the bitmap and FAT entry of every cluster in
+    /// the chain. Idempotent on already-cleared chains.
+    pub async fn free_chain(&self, start_cluster: u32) -> Result<(), FsError> {
+        let (bm_first, _bm_len) = self
+            .locate_bitmap()
+            .await?
+            .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+        let mut current = start_cluster;
+        let mut steps = 0u32;
+        loop {
+            let next = self.next_cluster(current).await?;
+            self.set_bitmap_range(bm_first, current, 1, false).await?;
+            self.write_fat_entry(current, 0).await?;
+            match next {
+                FatEntry::Next(c) => current = c,
+                FatEntry::EndOfChain | FatEntry::Free => break,
+                FatEntry::Bad | FatEntry::Reserved(_) => break,
+            }
+            steps += 1;
+            // Cap the walk so a corrupt chain doesn't loop forever.
+            if steps > self.boot.cluster_count {
+                return Err(FsError::Io(narf_block::BlockError::IOError));
+            }
+        }
+        Ok(())
+    }
+
     /// Locate the §7.1 Allocation Bitmap directory entry by
     /// scanning the root directory. Returned as the (first_cluster,
     /// data_length) pair so callers can read the bitmap stream.
-    /// Currently unused by the read-only mount; kept for the
-    /// future write path. (TODO: bitmap-backed allocator.)
+    /// Used by the bitmap allocator above.
     pub async fn locate_bitmap(&self) -> Result<Option<(u32, u64)>, FsError> {
         let lbs = self.io.lock().lbs;
         let mut sector_buf = vec![0u8; lbs];

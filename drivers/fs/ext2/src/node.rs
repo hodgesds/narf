@@ -14,10 +14,19 @@
 //! - OSDev Wiki, "Ext2 — Inode Data Structure", "Ext2 — Directory
 //!   Entry": <https://wiki.osdev.org/Ext2>
 //!
-//! NOTE: write-side operations (create/unlink/mkdir/rmdir/rename),
-//! symlink resolution, and HTREE directory indexes are **TODO** —
-//! the read-only first cut deliberately defers them, see the crate
-//! README.
+//! Write support: `write` + `truncate` are landed on the FileOps
+//! side, backed by `volume::write_inode_data` /
+//! `volume::truncate_inode` (which sit on the §"Block Allocation"
+//! bitmap allocator — see `volume.rs::alloc_block` /
+//! `alloc_inode`). The legacy 12-direct + indirect block pointer
+//! path is implemented; ext4 extents-tree writes still return
+//! `Unsupported`.
+//!
+//! The directory-mutation surface (create / mkdir / unlink / rmdir
+//! / rename) and HTREE indexes still return `Unsupported` —
+//! splicing a new directory entry across the variable-length
+//! record format (and the §"Indexed Directories" htree case) is
+//! multi-thousand lines on top of what landed here.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -190,9 +199,25 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // TODO: write paths land alongside the bitmap allocator.
-        Box::pin(async move { Err(FsError::ReadOnly) })
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let mut inode = self.load_inode().await?;
+            if inode.is_dir() {
+                return Err(FsError::InvalidPath);
+            }
+            let inode_no = self.state.lock().inode_no;
+            let n = self
+                .volume
+                .write_inode_data(&mut inode, offset, buf)
+                .await?;
+            self.volume.write_inode(inode_no, &inode).await?;
+            // Refresh cached state.
+            let stat = Self::stat_from_inode(&self.volume, &inode);
+            let mut g = self.state.lock();
+            g.inode = Some(inode);
+            g.stat = stat;
+            Ok(n)
+        })
     }
 
     fn stat(&self) -> Stat {
@@ -206,8 +231,30 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
-    fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+    fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut inode = self.load_inode().await?;
+            if inode.is_dir() {
+                return Err(FsError::InvalidPath);
+            }
+            let inode_no = self.state.lock().inode_no;
+            if len == 0 {
+                self.volume.truncate_inode(&mut inode).await?;
+            } else if (len as u32) <= inode.size {
+                // Shrink — bookkeeping only, leaves blocks allocated
+                // past the new end. Matches the simple semantics
+                // Linux uses for non-aligned truncates.
+                inode.size = len as u32;
+            } else {
+                inode.size = len as u32;
+            }
+            self.volume.write_inode(inode_no, &inode).await?;
+            let stat = Self::stat_from_inode(&self.volume, &inode);
+            let mut g = self.state.lock();
+            g.inode = Some(inode);
+            g.stat = stat;
+            Ok(())
+        })
     }
 }
 
@@ -334,20 +381,27 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         })
     }
 
-    // Mutation surface — TODO. Read-only first cut.
+    // Directory-mutation surface. The allocator + write_inode are
+    // landed (see volume.rs), but the directory-entry splice path
+    // (insert / coalesce variable-length records, refuse if the
+    // parent's directory body would overflow a block without an
+    // htree, etc.) is deferred. Returns `Unsupported` rather than
+    // `ReadOnly` to distinguish "this code path is not yet
+    // implemented" from "this volume / medium does not accept
+    // writes".
     fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
     fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
     fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
     fn rmdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
     fn rename<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 }

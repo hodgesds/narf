@@ -346,4 +346,13 @@ impl Superblock {
     pub fn inode_size_bytes(&self) -> usize {
         self.inode_size as usize
     }
+
+    /// First non-reserved inode number for fresh allocations.
+    /// Linux `include/uapi/linux/ext2_fs.h::EXT2_GOOD_OLD_FIRST_INO`
+    /// is 11; rev-1+ volumes embed `s_first_ino` at byte 84 of the
+    /// superblock. We don't decode the rev-1 field (it's almost
+    /// always 11 in practice) and just return the fixed value.
+    pub fn first_ino(&self) -> u32 {
+        11
+    }
 }

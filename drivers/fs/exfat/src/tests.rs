@@ -541,3 +541,74 @@ fn smoke_exfat_mount_ramblock_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/exfat", smoke_exfat_mount_ramblock_round_trip);
+
+// ── Write-path scaffolding smokes ────────────────────────────────
+
+/// §6.3.3 SetChecksum is deterministic and skips bytes 2..4
+/// (the checksum field itself). Verify round-trip on a constructed
+/// 32-byte group.
+fn smoke_exfat_set_checksum_round_trip() -> TestResult {
+    use super::dir::{finalize_set_checksum, verify_set_checksum, set_checksum};
+
+    // Build a 64-byte group (one primary + one secondary entry).
+    let mut group = [0u8; 64];
+    group[0] = 0x85; // FILE entry type
+    group[1] = 1; // secondary_count
+    // Bytes 4..32 are file attributes / timestamps / reserved.
+    for i in 4..32 {
+        group[i] = i as u8;
+    }
+    // Stream extension secondary
+    group[32] = 0xC0;
+    group[33] = 0x03; // ALLOCATION_POSSIBLE | NO_FAT_CHAIN
+    for i in 34..64 {
+        group[i] = i as u8;
+    }
+    // Compute + write back.
+    finalize_set_checksum(&mut group);
+    if !verify_set_checksum(&group) {
+        return TestResult::Fail("verify after finalize must succeed");
+    }
+    // Perturb a byte that isn't part of the checksum field.
+    group[10] ^= 0x55;
+    if verify_set_checksum(&group) {
+        return TestResult::Fail("verify after perturb must fail");
+    }
+    // Re-finalize, verify passes again.
+    finalize_set_checksum(&mut group);
+    if !verify_set_checksum(&group) {
+        return TestResult::Fail("verify after re-finalize must succeed");
+    }
+    // Independent recompute matches the stored value.
+    let stored = u16::from_le_bytes([group[2], group[3]]);
+    if set_checksum(&group) != stored {
+        return TestResult::Fail("recompute must match stored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_set_checksum_round_trip);
+
+/// §7.2.3 up-case-table checksum runs on the byte image of the
+/// table stream, two bytes per code unit.
+fn smoke_exfat_upcase_checksum_known_values() -> TestResult {
+    use super::upcase::upcase_checksum;
+
+    // Empty input → 0.
+    if upcase_checksum(&[]) != 0 {
+        return TestResult::Fail("empty input must yield 0");
+    }
+    // The §7.2.3 algorithm is rotate-right-1 + add. Verify the first
+    // byte alone matches the formula: c0 = (((0 & 1) << 31) | (0 >> 1)) + 0xFE = 0xFE.
+    if upcase_checksum(&[0xFE]) != 0xFE {
+        return TestResult::Fail("single byte 0xFE must hash to 0xFE");
+    }
+    // Determinism check.
+    let bytes = b"NARF-FS smoke test bytes";
+    let a = upcase_checksum(bytes);
+    let b = upcase_checksum(bytes);
+    if a != b {
+        return TestResult::Fail("non-deterministic");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_upcase_checksum_known_values);

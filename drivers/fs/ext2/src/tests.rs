@@ -1235,3 +1235,131 @@ fn smoke_ext3_unclean_mount_replays_root_dir() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext3_unclean_mount_replays_root_dir);
+
+// ── Write smoke tests ───────────────────────────────────────────────
+
+fn smoke_ext2_write_then_read_back() -> TestResult {
+    // Open the existing file, overwrite its contents, read back.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let initial = b"original";
+    let img = build_ext2_image(initial);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let payload = b"freshly written exact-content";
+    let n = match poll_once(file.write(0, payload)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("write failed"),
+    };
+    if n != payload.len() {
+        return TestResult::Fail("short write");
+    }
+    let mut buf = [0u8; 64];
+    let m = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read failed"),
+    };
+    if m != payload.len() || &buf[..m] != payload {
+        return TestResult::Fail("read-back mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_write_then_read_back);
+
+fn smoke_ext2_truncate_to_zero_then_extend() -> TestResult {
+    // Truncate to zero, then grow via write, verify final state.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let initial = b"abcd";
+    let img = build_ext2_image(initial);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    if poll_once(file.truncate(0)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate(0) failed");
+    }
+    if file.stat().size != 0 {
+        return TestResult::Fail("size != 0 after truncate");
+    }
+    let new_payload = b"after-truncate-grow";
+    let n = match poll_once(file.write(0, new_payload)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("post-truncate write failed"),
+    };
+    if n != new_payload.len() {
+        return TestResult::Fail("short write");
+    }
+    let mut buf = [0u8; 64];
+    let m = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read failed"),
+    };
+    if m != new_payload.len() || &buf[..m] != new_payload {
+        return TestResult::Fail("read-back mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_truncate_to_zero_then_extend);
+
+fn smoke_ext2_alloc_inode_then_free_round_trip() -> TestResult {
+    // Allocator round-trip: claim an inode, free it, verify
+    // alloc returns the same slot again.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let _ = volume.root(); // touch FsInstance
+    let ino_a = match poll_once(volume.alloc_inode()) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("alloc_inode failed"),
+    };
+    if ino_a == 0 || ino_a < volume.superblock.first_ino() {
+        return TestResult::Fail("alloc_inode returned reserved ordinal");
+    }
+    if poll_once(volume.free_inode(ino_a))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("free_inode failed");
+    }
+    let ino_b = match poll_once(volume.alloc_inode()) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("alloc_inode second time failed"),
+    };
+    if ino_b != ino_a {
+        return TestResult::Fail("second alloc should reclaim the freed slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_alloc_inode_then_free_round_trip);

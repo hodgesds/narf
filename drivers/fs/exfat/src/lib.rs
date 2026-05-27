@@ -23,10 +23,17 @@
 //! - Microsoft 2019 announcement opening the exFAT specification and
 //!   patents for implementation.
 //!
-//! Scope of the first cut: read-only mount + directory walk + file
-//! read. Write paths, the bitmap allocator, and on-disk up-case
-//! checksum verification are explicitly deferred (see TODOs in
-//! `volume.rs` / `node.rs`).
+//! Scope: read-only mount + directory walk + file read on the
+//! consumption side. Write scaffolding lands in this commit —
+//! `volume.rs` exposes `write_sector` / `write_cluster` /
+//! `alloc_clusters` / `free_chain` (§7.1 bitmap allocator) and
+//! `write_fat_entry`; `dir.rs` exposes §6.3.3 `set_checksum` /
+//! `finalize_set_checksum` / `verify_set_checksum`; `upcase.rs`
+//! exposes §7.2.3 `upcase_checksum`. The directory-entry edit path
+//! (creating a §7.4 / §7.6 / §7.7 entry group, updating cluster
+//! counts on its enclosing primary, and walking the parent
+//! cluster chain for a free slot) is deferred — see the FileOps
+//! `write` / `truncate` and DirOps mutator stubs in `node.rs`.
 
 #![no_std]
 
