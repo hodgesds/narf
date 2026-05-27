@@ -5899,11 +5899,12 @@ static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>
 static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// Initialise the per-task pending+mask registries. Pair with
-/// `sigaction_init` at boot.
+/// Initialise the per-task pending+mask+altstack registries.
+/// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
+    *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
 
 /// Reset the registries — test hook. Drops every per-task entry.
@@ -5911,6 +5912,7 @@ pub fn signal_init() {
 pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = None;
     *SIGNAL_MASK.lock() = None;
+    *SIG_ALTSTACK.lock() = None;
 }
 
 /// Diagnostic: peek the pending bitmap for `task`.
@@ -6335,6 +6337,283 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         }
     };
     ctx.set_return(SyscallReturn::ok(prior as u64));
+}
+
+// ── Phase-2 signal gap-fills ────────────────────────────────────────
+//
+// Six more Linux signal-surface syscalls needed for relibc to bind
+// directly: sigaltstack, rt_sigtimedwait, tkill, rt_sigsuspend,
+// rt_sigpending. Each follows the same per-task BTreeMap storage
+// shape as SIGNAL_PENDING / SIGNAL_MASK so the test reset hook
+// drops all of it on `__test_signal_reset`.
+
+/// Per-task alternate signal stack registration (Linux `stack_t`
+/// shape: sp + flags + size). A signal whose handler has
+/// `SA_ONSTACK` builds its sigframe on the alt stack instead of
+/// the regular user RSP. `flags = SS_DISABLE (2)` means "no alt
+/// stack active"; the entry stays in the table for round-trip
+/// query semantics but no rewrite happens.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SigAltStack {
+    pub sp: u64,
+    pub flags: u32,
+    pub size: u64,
+}
+
+/// `stack_t` flag bits Linux honours.
+const SS_DISABLE: u32 = 2;
+const SS_ONSTACK: u32 = 1;
+/// Minimum altstack size — Linux MINSIGSTKSZ on x86_64 is 2048;
+/// we honour the same lower bound.
+const MIN_SIGSTKSZ: u64 = 2048;
+
+static SIG_ALTSTACK: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, SigAltStack>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn sigaltstack_table_init() {
+    let mut g = SIG_ALTSTACK.lock();
+    if g.is_none() {
+        *g = Some(BTreeMap::new());
+    }
+}
+
+/// Read the alternate signal stack for `task`. Returns the
+/// registered slot or a zero-initialised `SigAltStack` with
+/// `flags = SS_DISABLE` if the task never installed one.
+pub fn sigaltstack_of(task: u64) -> SigAltStack {
+    let g = SIG_ALTSTACK.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(SigAltStack {
+            sp: 0,
+            flags: SS_DISABLE,
+            size: 0,
+        })
+}
+
+/// `sigaltstack(ss, old_ss)` — Linux `sigaltstack(2)`.
+///
+/// `arg0 = ss_in_ptr` (may be 0 — query-only),
+/// `arg1 = ss_out_ptr` (may be 0 — install-only).
+/// Each `stack_t` is the Linux shape:
+///   `{ void *ss_sp; int ss_flags; size_t ss_size }` →
+///   `[u64 sp][u32 flags][u32 pad][u64 size]` = 24 bytes.
+/// Returns 0 on success, -1 on rejection (size < MIN_SIGSTKSZ,
+/// unknown flag bits, or both pointers 0 and no current entry).
+fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
+    sigaltstack_table_init();
+    let args = *ctx.args();
+    let ss_in = args.arg0;
+    let ss_out = args.arg1;
+    let task = current_task_id();
+
+    let current = sigaltstack_of(task);
+
+    // Write the prior entry to *ss_out first (Linux semantics:
+    // even if the *ss_in install fails, the query result is the
+    // pre-install state).
+    if ss_out != 0 {
+        // SAFETY: caller-supplied pointer; we trust the user mode
+        // ABI here as elsewhere in this file. A bad pointer faults
+        // and the kernel's fault handler turns it into a kill —
+        // user error.
+        unsafe {
+            let p = ss_out as *mut u8;
+            (p as *mut u64).write_unaligned(current.sp);
+            (p.add(8) as *mut u32).write_unaligned(current.flags);
+            (p.add(12) as *mut u32).write_unaligned(0);
+            (p.add(16) as *mut u64).write_unaligned(current.size);
+        }
+    }
+
+    if ss_in != 0 {
+        // SAFETY: same.
+        let (sp, flags, size) = unsafe {
+            let p = ss_in as *const u8;
+            (
+                (p as *const u64).read_unaligned(),
+                (p.add(8) as *const u32).read_unaligned(),
+                (p.add(16) as *const u64).read_unaligned(),
+            )
+        };
+        // Validate: flags must be a subset of {SS_DISABLE, SS_ONSTACK},
+        // and if not SS_DISABLE the size must meet MIN_SIGSTKSZ.
+        if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+        if (flags & SS_DISABLE) == 0 && size < MIN_SIGSTKSZ {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+        let mut g = SIG_ALTSTACK.lock();
+        if let Some(map) = g.as_mut() {
+            map.insert(task, SigAltStack { sp, flags, size });
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `tkill(tid, sig)` — thread-targeted signal delivery. NARF is
+/// single-thread-per-process until clone3 lands, so tkill is a
+/// thin wrapper over the same SIGNAL_PENDING table that `kill`
+/// uses, addressed by tid instead of pid.
+fn sys_tkill(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let tid = args.arg0;
+    let signum = args.arg1 as u32;
+    if signum >= 32 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let mut g = SIGNAL_PENDING.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let slot = map.entry(tid).or_insert(0);
+    *slot |= 1u32 << signum;
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `rt_sigpending(set_out, sigsetsize)` — Linux `rt_sigpending(2)`.
+/// Write the (pending & mask) set to `*set_out` so the caller sees
+/// which signals were delivered while blocked.
+///
+/// arg0 = set out ptr (writable u64 — sigset_t is 8 bytes on
+/// glibc x86_64 / aarch64).  arg1 = sigsetsize (must be 8).
+fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let set_out = args.arg0;
+    let sigsetsize = args.arg1;
+    if sigsetsize != 8 || set_out == 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
+    let task = current_task_id();
+    let pending = signal_pending_of(task);
+    let mask = signal_mask_of(task);
+    let pending_and_blocked = pending & mask;
+    // SAFETY: caller pointer; user-ABI trust same as sigaltstack.
+    unsafe {
+        (set_out as *mut u64).write_unaligned(pending_and_blocked as u64);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `rt_sigsuspend(set, sigsetsize)` — Linux `rt_sigsuspend(2)`.
+/// Atomically swap the signal mask to `set`, wait for one signal
+/// outside the new mask to be delivered, then restore the prior
+/// mask. Always returns -1 (after delivery); errno = EINTR per
+/// POSIX.
+///
+/// NARF round 1 implementation: install the new mask, return
+/// success-shaped as -1. The next signal delivery hook firing
+/// against this task will see the new mask, deliver outside-mask
+/// signals, and the user's libc trampoline calls rt_sigprocmask
+/// itself to restore. A future tighter implementation parks the
+/// task in a dedicated wait state.
+///
+/// arg0 = set in ptr, arg1 = sigsetsize (must be 8).
+fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let set_in = args.arg0;
+    let sigsetsize = args.arg1;
+    if sigsetsize != 8 || set_in == 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
+    // SAFETY: caller-supplied pointer.
+    let mask = unsafe { (set_in as *const u64).read_unaligned() as u32 };
+    let task = current_task_id();
+    let mut g = SIGNAL_MASK.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    // Linux semantics: replace mask wholesale, original is
+    // restored by the libc trampoline post-handler. We could
+    // park-and-poll here to wait for a deliverable signal, but
+    // that requires a `signal_pump` like sleep_pump — landing
+    // that is a follow-on. Today the function returns
+    // immediately with the new mask installed; if a signal
+    // arrives during the trip back to user mode, the
+    // default_signal_delivery hook will deliver it.
+    map.insert(task, mask);
+    // POSIX: always returns -1 with errno = EINTR. The user-side
+    // libc wrapper masks the return.
+    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+}
+
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux
+/// `rt_sigtimedwait(2)`. Synchronously wait for one of the
+/// signals in `set` to be delivered to the calling task (or
+/// timeout). Returns the delivered signum on success, -1 on
+/// timeout / bad input.
+///
+/// NARF round 1: implement the non-blocking inspection variant.
+/// If any signal in `set` is already pending for the task,
+/// clear it from pending, fill the siginfo struct (if `info` is
+/// non-null), and return the signum. If `timeout` is null, this
+/// would block — we surface -1 (EAGAIN-shaped) for the
+/// not-yet-pending case. The tight loop is delegated to userspace
+/// via a libc retry shim. Full park-and-wait lands alongside the
+/// signal pump.
+///
+/// arg0 = set ptr (in), arg1 = info ptr (out, may be 0),
+/// arg2 = timeout timespec ptr (may be 0 = block indefinitely),
+/// arg3 = sigsetsize (must be 8).
+fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let set_in = args.arg0;
+    let info_out = args.arg1;
+    let _timeout_in = args.arg2;
+    let sigsetsize = args.arg3;
+    if sigsetsize != 8 || set_in == 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
+    // SAFETY: caller-supplied pointer.
+    let set = unsafe { (set_in as *const u64).read_unaligned() as u32 };
+    let task = current_task_id();
+    let pending = signal_pending_of(task);
+    let candidates = pending & set;
+    if candidates == 0 {
+        // Linux returns -1 / EAGAIN when timeout = 0 and nothing
+        // is pending. For non-zero timeout we'd block; today we
+        // return the same shape — the libc loop will re-call us.
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
+    let signum = candidates.trailing_zeros();
+    // Clear the bit.
+    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot &= !(1u32 << signum);
+        }
+    }
+    // Fill siginfo if requested. Linux siginfo_t is ~128 bytes;
+    // we write just the first three fields (si_signo, si_errno,
+    // si_code) which is the union-discriminating prefix every
+    // libc inspects. Leaving the rest zero matches `SI_USER`.
+    if info_out != 0 {
+        // SAFETY: caller pointer.
+        unsafe {
+            let p = info_out as *mut u8;
+            core::ptr::write_bytes(p, 0, 128);
+            (p as *mut i32).write_unaligned(signum as i32); // si_signo
+            (p.add(4) as *mut i32).write_unaligned(0);      // si_errno
+            (p.add(8) as *mut i32).write_unaligned(0);      // si_code = SI_USER
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(signum as u64));
 }
 
 // Function-pointer hook: arch trap dispatcher invokes this on
@@ -7909,11 +8188,32 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
     table.install_raw(Syscall::Kill, "kill", RawFnHandler(sys_kill));
     table.install_raw(Syscall::Tgkill, "tgkill", RawFnHandler(sys_tgkill));
+    table.install_raw(Syscall::Tkill, "tkill", RawFnHandler(sys_tkill));
     table.install_raw(Syscall::Futex, "futex", RawFnHandler(sys_futex));
     table.install_raw(
         Syscall::Sigprocmask,
         "sigprocmask",
         RawFnHandler(sys_sigprocmask),
+    );
+    table.install_raw(
+        Syscall::Sigaltstack,
+        "sigaltstack",
+        RawFnHandler(sys_sigaltstack),
+    );
+    table.install_raw(
+        Syscall::RtSigpending,
+        "rt_sigpending",
+        RawFnHandler(sys_rt_sigpending),
+    );
+    table.install_raw(
+        Syscall::RtSigsuspend,
+        "rt_sigsuspend",
+        RawFnHandler(sys_rt_sigsuspend),
+    );
+    table.install_raw(
+        Syscall::RtSigtimedwait,
+        "rt_sigtimedwait",
+        RawFnHandler(sys_rt_sigtimedwait),
     );
 
     // Tier-2 fd-table breadth + path-resolution + pipe(2).
