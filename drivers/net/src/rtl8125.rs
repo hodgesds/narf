@@ -1,17 +1,49 @@
-//! Realtek RTL8125 / RTL8125B 2.5 Gigabit Ethernet driver — Stage-4
-//! cut. Stage 1 lands the PCI match table and the BAR0 register
-//! decoder; subsequent stages add MAC reset / MAC read and TX
-//! descriptor packing.
+//! Realtek RTL8125 / RTL8125B 2.5 Gigabit Ethernet driver — Stage-2
+//! cut: probe + reset + TX/RX rings + one MSI-X vector. No PHY-config
+//! tables yet (RTL8125 ships with a usable PHY default after reset),
+//! no EEE quirks, no jumbo, no checksum offload, no multi-queue.
 //!
-//! Clean-room: register layout sourced from Realtek's public
-//! "RTL8125 Series 2.5 Gigabit Ethernet Controller — Registers
-//! Datasheet" (Rev. 1.0). No GPL Linux `r8169_main.c` / `r8125`
-//! sources consulted.
+//! ## Reference
 //!
-//! Per the datasheet §2 the RTL8125 keeps the legacy RTL8169/8168
-//! register-layout floor (IDR0..5, CR, IMR/ISR, TCR, RCR at the same
-//! offsets) and extends it with 2.5 Gbps-specific blocks at offsets
-//! ≥ 0x100. Stage 1 only consumes the floor.
+//! - Realtek **"RTL8125 Series 2.5 Gigabit Ethernet Controller —
+//!   Registers Datasheet"** Rev. 1.0 (public). Defines the legacy
+//!   RTL8169/8168 register floor (IDR0..5, CR, TCR, RCR, RDSAR,
+//!   TNPDS at the same offsets) plus the 2.5 Gbps additions:
+//!   IntrMask_8125 (32-bit) @ 0x38, IntrStatus_8125 (32-bit) @ 0x3c,
+//!   TxPoll_8125 @ 0x90, INT_CFG0_8125 @ 0x34.
+//! - Linux **`drivers/net/ethernet/realtek/r8169_main.c`** (GPL-2.0;
+//!   NARF is GPL-2.0-or-later since 2026-05-20 so adaptation is
+//!   permitted): `enum rtl8125_registers`, `rtl_hw_start_8125_common`,
+//!   `rtl_init_rxcfg` for `RX_FETCH_DFLT_8125`, descriptor `opts1`
+//!   layout (identical to RTL8169 — `struct TxDesc`/`struct RxDesc`
+//!   remain 16 bytes with `opts1`/`opts2`/`__le64 addr`).
+//!
+//! Like the RTL8169 driver in [`crate::r8169`], the on-wire descriptor
+//! is 16 bytes — `RxDescV3`/`TxDescV3` exist only in the Linux source
+//! for a different chip (RTL8125-side "new descriptor format" is
+//! *disabled* by default and stays disabled here per the comment in
+//! `rtl_hw_start_8125_common` line 3877 of r8169_main.c).
+//!
+//! ## Differences from RTL8169 / r8169 driver
+//!
+//! 1. `IntrMask` / `IntrStatus` widen to 32 bits and move from 0x3C
+//!    / 0x3E to 0x38 / 0x3C respectively. The legacy 16-bit aliases
+//!    at 0x3C/0x3E continue to function on the 8125 silicon but
+//!    Realtek's own driver targets the 32-bit ports — we do too so
+//!    we get the new high-half interrupt sources (8125-specific
+//!    `RxRWT`/`RxRES`/`RxRUNT` in the RxStatusDesc bits).
+//! 2. `TxPoll` doorbell moves from CR-adjacent 0x38 to 0x90 to free
+//!    up the 32-bit IntrMask slot.
+//! 3. `RxConfig` (0x44) uses `RX_FETCH_DFLT_8125 = 8 << 27` for the
+//!    DMA prefetch threshold instead of the 8169's `RX128_INT_EN`
+//!    block.
+//! 4. `INT_CFG0_8125` (0x34) controls the new interrupt-aggregation
+//!    enable bit + CLKREQ gate; we leave both off, matching the 8169
+//!    no-coalescing default.
+//! 5. The MAC chip XID lives at `(TxConfig >> 20) & 0xfcf` per
+//!    `r8169_main.c:5647`; we expose `decode_xid` so a future stage
+//!    can branch on RTL8125A / RTL8125B / RTL8125D for chip-specific
+//!    PHY-config tables.
 
 #![allow(dead_code)]
 
@@ -75,12 +107,52 @@ pub(crate) const REG_RDSAR: u64 = 0xE4;
 /// MTPS — Max TX packet size (units of 128 bytes). §2.14.
 pub(crate) const REG_MTPS: u64 = 0xEC;
 
+// ── RTL8125-specific register extensions ────────────────────────────
+// Sourced from `enum rtl8125_registers` in Linux's r8169_main.c
+// (GPL-2.0-or-later, lines 427–443). The legacy 8169 register floor
+// continues to alias the old offsets; we target the new offsets
+// because Realtek's reference driver does — that keeps us in step
+// with their per-revision quirks.
+
+/// INT_CFG0_8125 — interrupt-aggregation enable + CLKREQ gate. We
+/// hold this at 0x00 to disable both: aggregation hides individual
+/// TX completions behind a timer, and CLKREQEN is owned by the
+/// ASPM path which Stage 2 doesn't enter.
+pub(crate) const REG_INT_CFG0_8125: u64 = 0x34;
+/// `INT_CFG0_ENABLE_8125` — aggregation enable. Off in Stage 2.
+pub(crate) const INT_CFG0_ENABLE_8125: u8 = 1 << 0;
+/// `INT_CFG0_CLKREQEN` — let the chip raise CLKREQ during IRQ
+/// service. Off in Stage 2 (ASPM stays disabled).
+pub(crate) const INT_CFG0_CLKREQEN: u8 = 1 << 3;
+
+/// `IntrMask_8125` — 32-bit interrupt mask. Replaces the 16-bit IMR
+/// at 0x3C for RTL8125 silicon.
+pub(crate) const REG_IMR_8125: u64 = 0x38;
+/// `IntrStatus_8125` — 32-bit interrupt status (write-1-clear).
+pub(crate) const REG_ISR_8125: u64 = 0x3C;
+
+/// INT_CFG1_8125 — secondary interrupt configuration. Reserved for
+/// future MSI-X queue mapping; Stage 2 leaves the reset value.
+pub(crate) const REG_INT_CFG1_8125: u64 = 0x7A;
+
+/// TxPoll_8125 — new TX doorbell. Moves from 0x38 (now IMR_8125)
+/// to 0x90 on the 8125. `TPPOLL_NPQ` bit (1 << 6) is unchanged.
+pub(crate) const REG_TPPOLL_8125: u64 = 0x90;
+
+/// RSS_CTRL_8125 — receive-side scaling control. Held at 0 in
+/// Stage 2 (single-queue).
+pub(crate) const REG_RSS_CTRL_8125: u64 = 0x4500;
+
+/// Q_NUM_CTRL_8125 — queue count selector. Held at 0 = single-queue.
+pub(crate) const REG_Q_NUM_CTRL_8125: u64 = 0x4800;
+
 // CR bits (§2.4).
 pub(crate) const CR_TE: u8 = 1 << 2;
 pub(crate) const CR_RE: u8 = 1 << 3;
 pub(crate) const CR_RST: u8 = 1 << 4;
 
-// TPPoll bits (§2.5).
+// TPPoll bits (§2.5). Same NPQ bit on both the legacy 0x38 doorbell
+// and the 8125-relocated 0x90 doorbell.
 pub(crate) const TPPOLL_NPQ: u8 = 1 << 6;
 
 // 9346CR (config-write lock). Bits 7:6 = EEM. 00=normal, 11=write-en.
@@ -105,6 +177,30 @@ pub(crate) const INT_TOK: u16 = 1 << 2;
 pub(crate) const INT_RDU: u16 = 1 << 4;
 pub(crate) const INT_LINKCHG: u16 = 1 << 5;
 pub(crate) const INT_TDU: u16 = 1 << 7;
+
+// RTL8125 32-bit IMR/ISR bit layout (REG_IMR_8125 / REG_ISR_8125).
+// The low 8 bits match the 16-bit alias; higher bits are 8125-only
+// (per `enum rtl_register_content` in Linux r8169_main.c lines 453–
+// 466 — same bit numbers, just promoted to 32-bit). The widened port
+// also exposes 8125-specific descriptor-status bits (RxRWT, RxRES,
+// RxRUNT, RxCRC at bits 22..19) that the legacy 16-bit ISR window
+// can't see.
+pub(crate) const INT32_ROK: u32 = 1 << 0;
+pub(crate) const INT32_RXERR: u32 = 1 << 1;
+pub(crate) const INT32_TOK: u32 = 1 << 2;
+pub(crate) const INT32_TXERR: u32 = 1 << 3;
+pub(crate) const INT32_RDU: u32 = 1 << 4;
+pub(crate) const INT32_LINKCHG: u32 = 1 << 5;
+pub(crate) const INT32_RX_FIFO_OVER: u32 = 1 << 6;
+pub(crate) const INT32_TDU: u32 = 1 << 7;
+pub(crate) const INT32_SWINT: u32 = 1 << 8;
+pub(crate) const INT32_PCS_TIMEOUT: u32 = 1 << 14;
+pub(crate) const INT32_SYS_ERR: u32 = 1 << 15;
+
+/// `RX_FETCH_DFLT_8125 = 8 << 27` — Linux's default RX-DMA prefetch
+/// threshold for the 8125 RxConfig register. See
+/// `rtl_init_rxcfg(RTL_GIGA_MAC_VER_61)` in r8169_main.c:2604–2605.
+pub(crate) const RX_FETCH_DFLT_8125: u32 = 8 << 27;
 
 // PHYStatus bits (§2.10).
 pub(crate) const PHYSTAT_LINKSTS: u8 = 1 << 1;
@@ -155,6 +251,59 @@ pub const fn mac_is_invalid(mac: [u8; 6]) -> bool {
 /// re-initialised the FIFOs + descriptor pointers.
 pub const fn cr_reset_value() -> u8 {
     CR_RST
+}
+
+// ── MAC version (XID) decode ────────────────────────────────────────
+// Linux's r8169_main.c extracts the chip XID from TxConfig:
+//   xid = (RTL_R32(tp, TxConfig) >> 20) & 0xfcf   // line 5647
+// and matches it against `rtl_chip_infos[]`. For the 8125 family the
+// XIDs are:
+//   0x609 → RTL8125A (MAC_VER_61)
+//   0x641 → RTL8125B (MAC_VER_63)
+//   0x688 → RTL8125D
+//   0x689 → RTL8125D
+//   0x68a → RTL8125K
+//   0x68b → RTL9151A
+//   0x681 → RTL8125BP (MAC_VER_66)
+// We only need to distinguish 8125A vs 8125B vs everything-else for
+// Stage 2 because the bring-up steps are 99% identical; later stages
+// branch the PHY-config table here.
+
+/// Sub-family classification. Drives the future PHY-config table
+/// pick; Stage 2 only logs the value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChipKind {
+    /// 0x609 / MAC_VER_61. Original RTL8125 silicon.
+    Rtl8125A,
+    /// 0x641 / MAC_VER_63. Refreshed RTL8125B silicon (most common
+    /// laptop variant as of 2024).
+    Rtl8125B,
+    /// 0x688/0x689 / MAC_VER_64. RTL8125D and RTL9151A close cousin.
+    Rtl8125D,
+    /// 0x681 / MAC_VER_66. RTL8125BP.
+    Rtl8125Bp,
+    /// XID didn't match any known 8125. Stage 2 still attempts
+    /// bring-up — the common path doesn't depend on the sub-rev.
+    Unknown(u32),
+}
+
+/// Extract the 12-bit chip XID from the 32-bit TxConfig (0x40) value.
+/// The mask `0xfcf` mirrors Linux's `(txconfig >> 20) & 0xfcf`.
+pub const fn decode_xid(txconfig: u32) -> u32 {
+    (txconfig >> 20) & 0xfcf
+}
+
+/// Classify an XID into `ChipKind`. Sub-revisions inside a family
+/// (e.g. RTL8125D vs RTL9151A) collapse to the same variant when the
+/// driver doesn't need to distinguish them at Stage 2.
+pub const fn chip_kind_from_xid(xid: u32) -> ChipKind {
+    match xid {
+        0x609 => ChipKind::Rtl8125A,
+        0x641 => ChipKind::Rtl8125B,
+        0x688 | 0x689 | 0x68a | 0x68b => ChipKind::Rtl8125D,
+        0x681 => ChipKind::Rtl8125Bp,
+        other => ChipKind::Unknown(other),
+    }
 }
 
 // ── TX descriptor ring layout (Stage 3) ────────────────────────────

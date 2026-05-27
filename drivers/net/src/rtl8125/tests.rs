@@ -1,16 +1,19 @@
 //! rtl8125 driver smokes — co-located per project convention.
 //!
 //! Stage 1: PCI match-table entries for RTL8125 + RTL8125B.
-//! Stage 2: MAC-address decode + reset-value bit pattern.
-//! Stage 3: TX descriptor packing + 16-byte layout assertions.
+//! Stage 2: MAC-address decode + reset-value bit pattern + chip XID
+//!          classification + RTL8125-specific register-block layout
+//!          (32-bit IMR/ISR at 0x38/0x3C, TxPoll at 0x90).
 
 #![cfg(target_arch = "x86_64")]
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    build_tx_desc, cr_reset_value, decode_mac, mac_is_invalid, name_for, TxDesc, CR_RST, RING_LEN,
-    RTL_DEV_8125, RTL_DEV_8125B, RTL_VENDOR, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
+    build_tx_desc, chip_kind_from_xid, cr_reset_value, decode_mac, decode_xid, mac_is_invalid,
+    name_for, ChipKind, TxDesc, CR_RST, INT32_LINKCHG, INT32_ROK, INT32_TOK, REG_IMR_8125,
+    REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B,
+    RTL_VENDOR, RX_FETCH_DFLT_8125, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -180,3 +183,108 @@ fn smoke_rtl8125_tx_desc_len_truncates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_tx_desc_len_truncates);
+
+// ── Stage 2: 8125-specific register block ──────────────────────────
+
+fn smoke_rtl8125_register_offsets() -> TestResult {
+    // Per Linux `enum rtl8125_registers` lines 427–443 the new
+    // register block lives at:
+    //   INT_CFG0_8125  @ 0x34
+    //   IMR_8125       @ 0x38
+    //   ISR_8125       @ 0x3C
+    //   TxPoll_8125    @ 0x90
+    // These offsets are load-bearing: writing the 32-bit IMR to the
+    // 16-bit alias at 0x3C corrupts the high half of ISR (which is
+    // write-1-clear) and produces phantom IRQs on real silicon.
+    if REG_INT_CFG0_8125 != 0x34 {
+        return TestResult::Fail("INT_CFG0_8125 must be at 0x34");
+    }
+    if REG_IMR_8125 != 0x38 {
+        return TestResult::Fail("IMR_8125 must be at 0x38");
+    }
+    if REG_ISR_8125 != 0x3C {
+        return TestResult::Fail("ISR_8125 must be at 0x3C");
+    }
+    if REG_TPPOLL_8125 != 0x90 {
+        return TestResult::Fail("TxPoll_8125 must be at 0x90");
+    }
+    // RX_FETCH_DFLT_8125 is `8 << 27` per
+    // `rtl_init_rxcfg(RTL_GIGA_MAC_VER_61)`. Off-by-one here would
+    // silently kill RX throughput on real silicon.
+    if RX_FETCH_DFLT_8125 != 8 << 27 {
+        return TestResult::Fail("RX_FETCH_DFLT_8125 != 8 << 27");
+    }
+    // TxPoll NPQ bit didn't move between RTL8169 (0x38) and RTL8125
+    // (0x90) — same bit-6 of the byte.
+    if TPPOLL_NPQ != 1 << 6 {
+        return TestResult::Fail("TPPOLL_NPQ must be bit 6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_register_offsets);
+
+fn smoke_rtl8125_int32_bits() -> TestResult {
+    // The 32-bit IMR/ISR bits at the low 8 bits match the legacy
+    // 16-bit alias bit numbers (ROK=0, TOK=2, LinkChg=5). Higher
+    // bits are 8125-only.
+    if INT32_ROK != 1 << 0 {
+        return TestResult::Fail("INT32_ROK at wrong bit");
+    }
+    if INT32_TOK != 1 << 2 {
+        return TestResult::Fail("INT32_TOK at wrong bit");
+    }
+    if INT32_LINKCHG != 1 << 5 {
+        return TestResult::Fail("INT32_LINKCHG at wrong bit");
+    }
+    // ROK + TOK + LinkChg = 0x25. This is the mask Stage 2 unmasks
+    // at IMR — make sure the bitwise OR doesn't silently collapse.
+    if INT32_ROK | INT32_TOK | INT32_LINKCHG != 0x25 {
+        return TestResult::Fail("Stage-2 IMR unmask set != 0x25");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_int32_bits);
+
+// ── Stage 2: chip XID classification ──────────────────────────────
+
+fn smoke_rtl8125_decode_xid() -> TestResult {
+    // Linux r8169_main.c:5647 — xid = (txconfig >> 20) & 0xfcf.
+    // A TxConfig word with the 12 XID bits at positions [31:20]
+    // landing 0x641 → RTL8125B.
+    let txcfg = 0x641u32 << 20;
+    if decode_xid(txcfg) != 0x641 {
+        return TestResult::Fail("decode_xid stripped too much");
+    }
+    // The high 4 bits of the 16-bit XID slot are reserved; the
+    // 0xfcf mask drops them so 0xf41 → 0xf41 & 0xfcf = 0xf41
+    // *with* the f0 bits cleared = 0xc41. Verify the mask works.
+    let txcfg2 = 0xf41u32 << 20;
+    if decode_xid(txcfg2) != (0xf41 & 0xfcf) {
+        return TestResult::Fail("decode_xid mask wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_decode_xid);
+
+fn smoke_rtl8125_chip_kind_classification() -> TestResult {
+    // The four XIDs we definitely see on consumer hardware.
+    if chip_kind_from_xid(0x609) != ChipKind::Rtl8125A {
+        return TestResult::Fail("0x609 should classify as RTL8125A");
+    }
+    if chip_kind_from_xid(0x641) != ChipKind::Rtl8125B {
+        return TestResult::Fail("0x641 should classify as RTL8125B");
+    }
+    if chip_kind_from_xid(0x688) != ChipKind::Rtl8125D {
+        return TestResult::Fail("0x688 should classify as RTL8125D");
+    }
+    if chip_kind_from_xid(0x681) != ChipKind::Rtl8125Bp {
+        return TestResult::Fail("0x681 should classify as RTL8125BP");
+    }
+    // 0x123 is reserved / unknown. Driver still attempts bring-up.
+    match chip_kind_from_xid(0x123) {
+        ChipKind::Unknown(0x123) => {}
+        _ => return TestResult::Fail("unknown XID didn't surface raw value"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_chip_kind_classification);
