@@ -726,3 +726,37 @@ fn smoke_iommu_primary_mmio_base_zero_after_reset() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io/iommu", smoke_iommu_primary_mmio_base_zero_after_reset);
+
+fn smoke_iommu_attach_detach_free_functions() -> TestResult {
+    use crate::iommu::{
+        __force_identity_for_test, __reset_for_test, attach, detach, Bdf, IommuDomain,
+    };
+    __reset_for_test();
+    __force_identity_for_test();
+    let dom = IommuDomain::new(0x33);
+    let bdf = Bdf::new(0x12, 0x05, 0x2);
+    if attach(&dom, bdf).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("attach free-fn failed");
+    }
+    if dom.device_count() != 1 {
+        __reset_for_test();
+        return TestResult::Fail("device count != 1");
+    }
+    if detach(&dom, bdf).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("detach free-fn failed");
+    }
+    if dom.device_count() != 0 {
+        __reset_for_test();
+        return TestResult::Fail("device count != 0 after detach");
+    }
+    // Double-detach must error.
+    if detach(&dom, bdf).is_ok() {
+        __reset_for_test();
+        return TestResult::Fail("double-detach should error");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_attach_detach_free_functions);

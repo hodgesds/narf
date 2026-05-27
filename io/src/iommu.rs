@@ -670,3 +670,17 @@ pub fn iommu_unmap(_bdf: Bdf, _iova: u64, _len: u64) -> Result<(), IoError> {
         IommuMode::PerDomain => Err(IoError::NotMapped),
     }
 }
+
+/// Attach `device` (PCI BDF) to `domain` — mirrors
+/// `iommu::attach(domain, device)` in the brief. Forwards to
+/// [`IommuDomain::attach`]; the free-function form is the
+/// shape drivers see when they get a domain handle from the
+/// kernel allocator.
+pub fn attach(domain: &IommuDomain, device: Bdf) -> Result<(), IoError> {
+    domain.attach(device)
+}
+
+/// Inverse of [`attach`].
+pub fn detach(domain: &IommuDomain, device: Bdf) -> Result<(), IoError> {
+    domain.detach(device)
+}
