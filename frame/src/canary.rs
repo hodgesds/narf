@@ -104,16 +104,10 @@ pub extern "C" fn __stack_chk_fail() -> ! {
     // No panic! macro here — the canary failure means the stack
     // itself is suspect; panic's own stack walk could compound the
     // damage. Just halt.
-    //
-    // SAFETY: halt_forever is always sound.
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        narf_arch::x86_64::halt_forever();
-    }
+    narf_arch::x86_64::halt_forever();
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        narf_arch::aarch64::halt_forever();
-    }
+    narf_arch::aarch64::halt_forever();
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     loop {
         core::hint::spin_loop();
