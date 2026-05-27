@@ -52,6 +52,7 @@ use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_pipes::Pipe;
+use crate::intel_gpu_pll::{combo_coeffs, encode_cfgcr0, LinkRate};
 
 // ── Power Well control register block (Tiger Lake PRM Vol. 11
 // §"Power Wells"; Linux i915 `intel_display_regs.h`) ─────────────
@@ -85,6 +86,58 @@ enum PowerWell {
     Pg2 = 1,
     #[allow(dead_code)]
     Pg3 = 2,
+}
+
+// ── DPLL enable register block (Tiger Lake PRM Vol. 11 §"DPLL Enable";
+// Linux i915 `intel_display_regs.h`) ─────────────────────────────────
+//
+// Reference: Linux drivers/gpu/drm/i915/display/intel_display_regs.h
+//   _DPLL0_ENABLE = 0x46010
+//   _DPLL1_ENABLE = 0x46014
+//   PLL_ENABLE       = bit 31
+//   PLL_LOCK         = bit 30
+//   PLL_POWER_ENABLE = bit 27
+//   PLL_POWER_STATE  = bit 26
+
+const DPLL0_ENABLE: u64 = 0x4_6010;
+const DPLL1_ENABLE: u64 = 0x4_6014;
+const PLL_ENABLE: u32 = 1 << 31;
+const PLL_LOCK: u32 = 1 << 30;
+const PLL_POWER_ENABLE: u32 = 1 << 27;
+const PLL_POWER_STATE: u32 = 1 << 26;
+
+/// DDI A maps to DPLL 0 on Gen12 Combo PHY by default. Multi-DDI
+/// arbitration via DPCLKA_CFGCR0 lands in Stage-3.
+const fn dpll_enable_off(dpll_idx: u32) -> u64 {
+    if dpll_idx == 0 {
+        DPLL0_ENABLE
+    } else {
+        DPLL1_ENABLE
+    }
+}
+
+/// Pick the lowest DP link rate that can deliver `pixel_clock_khz`
+/// pixels per second of 24-bpp RGB scanout over 4 lanes.
+///
+/// Bandwidth math: 24 bits per pixel * pixel_clock_khz kbps =
+///   `pixel_clock_khz * 24` kbps total. With 4 lanes each carrying
+///   `rate_mbps * 1000` kbps (minus 8b/10b coding overhead, so
+///   80% net), the rate must satisfy
+///   `4 * rate_mbps * 1000 * 0.8 >= pixel_clock_khz * 24`,
+///   i.e. `rate_mbps >= pixel_clock_khz * 30 / 4 / 1000`.
+///   Simplify: `rate_kbps >= pixel_clock_khz * 30 / 4`.
+fn link_rate_for_pixel_clock(pixel_clock_khz: u32) -> LinkRate {
+    // Required per-lane net rate in kbps. 30 = 24 bpp / 0.8 (8b/10b).
+    let required_kbps = (pixel_clock_khz.saturating_mul(30)) / 4;
+    if required_kbps <= 1_620_000 {
+        LinkRate::DpRbr
+    } else if required_kbps <= 2_700_000 {
+        LinkRate::DpHbr
+    } else if required_kbps <= 5_400_000 {
+        LinkRate::DpHbr2
+    } else {
+        LinkRate::DpHbr3
+    }
 }
 
 /// Display mode requested for a modeset. Subset of the fields a
@@ -393,19 +446,56 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     // ── DPLL ─────────────────────────────────────────────────
 
     /// Program a Combo PHY DPLL for the requested pixel clock.
-    /// Walks the PRM-published DPLL parameter table to find the
-    /// (DCO integer, fraction, dividers) tuple producing the
-    /// closest link-clock match. Stage 1 only handles the
-    /// common eDP rates (1.62 / 2.7 / 5.4 Gbps link clock); HBR3
-    /// (8.1 Gbps) lands in Stage 2.
+    /// Picks the lowest DP link rate that meets the bandwidth
+    /// requirement of `mode`'s 24-bpp scanout, looks up the
+    /// PRM-published Combo-PHY coefficients, programs CFGCR0/1,
+    /// and brings the DPLL up:
+    ///
+    ///   1. Power-up via PLL_POWER_ENABLE + wait for PLL_POWER_STATE.
+    ///   2. Write CFGCR0 (DCO integer + fraction) and CFGCR1 (Q/K/P
+    ///      dividers + central freq).
+    ///   3. Set PLL_ENABLE.
+    ///   4. Poll PLL_LOCK with a 1 ms cap.
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_dpll.c
+    /// (`icl_pll_power_enable`, `icl_pll_enable`).
     fn program_dpll(&mut self, mode: &Mode) -> Result<(), ModesetError> {
-        let _ = mode;
-        // TODO Stage 2: actually program DPLL_CFGCR0/1 + poll
-        // DPLL_ENABLE.locked for the 1 ms PLL-lock window.
-        // The intel_gpu_pll codec already encodes the parameter
-        // tuple; this step writes the encoded value via
-        // self.mmio.write32 at DPLL_CFGCR0[N]/CFGCR1[N] +
-        // DPLL_CTRL1 enable bit.
+        let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
+        let coeffs = match combo_coeffs(rate) {
+            Some(c) => c,
+            None => return Err(ModesetError::PllLockTimeout),
+        };
+        // DDI A → DPLL 0 (default Combo-PHY mapping). Stage-2 only
+        // exercises this; multi-DDI port arbitration via DPCLKA_CFGCR0
+        // lands when Pipe B+ comes online.
+        let dpll_idx: u32 = 0;
+        let dpll_enable = dpll_enable_off(dpll_idx);
+
+        // Step 1 — power the PLL up.
+        let cur = self.mmio.read32(dpll_enable);
+        self.mmio.write32(dpll_enable, cur | PLL_POWER_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        if !wait_bit(self.mmio, dpll_enable, PLL_POWER_STATE, true, 1_000_000) {
+            return Err(ModesetError::PllLockTimeout);
+        }
+
+        // Step 2 — CFGCR0 / CFGCR1.
+        let cfgcr0 = encode_cfgcr0(&coeffs);
+        let cfgcr0_off = crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0;
+        let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(cfgcr0_off);
+        self.mmio.write32(cfgcr0_off, cfgcr0);
+        self.mmio.write32(cfgcr1_off, coeffs.cfgcr1);
+        compiler_fence(Ordering::SeqCst);
+
+        // Step 3 — enable.
+        let cur = self.mmio.read32(dpll_enable);
+        self.mmio.write32(dpll_enable, cur | PLL_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+
+        // Step 4 — wait for lock. 1 ms cap per PRM.
+        if !wait_bit(self.mmio, dpll_enable, PLL_LOCK, true, 1_000_000) {
+            return Err(ModesetError::PllLockTimeout);
+        }
         Ok(())
     }
 
@@ -469,6 +559,34 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     fn enable_plane(&mut self) {
         // TODO Stage 2: PLANE_CTL.ENABLE bit + first-VBLANK wait.
+    }
+}
+
+/// Poll an MMIO register's `mask` bits until they assert (when
+/// `want_set` is `true`) or deassert (when `false`). Returns
+/// `true` if the condition was reached within `timeout_ns`.
+/// Used to wait for PLL_LOCK, transcoder/pipe state-active,
+/// DDI BUF_CTL idle, etc.
+fn wait_bit<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    off: u64,
+    mask: u32,
+    want_set: bool,
+    timeout_ns: u64,
+) -> bool {
+    let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
+    let budget = timeout_ns.saturating_mul(cpns);
+    let start = narf_time::now_cycles();
+    loop {
+        let v = mmio.read32(off);
+        let asserted = v & mask != 0;
+        if asserted == want_set {
+            return true;
+        }
+        if narf_time::now_cycles().wrapping_sub(start) > budget {
+            return false;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -618,5 +736,72 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_enable_pg_rejects_nonzero_pipe_b
+    );
+
+    fn smoke_link_rate_for_pixel_clock_floors() -> TestResult {
+        use super::link_rate_for_pixel_clock;
+        use crate::intel_gpu_pll::LinkRate;
+        // 1024x768@60: 65 MHz pixel — RBR is plenty.
+        if link_rate_for_pixel_clock(65_000) != LinkRate::DpRbr {
+            return TestResult::Fail("65 MHz should fit in RBR");
+        }
+        // 1920x1080@60: 148.5 MHz — still RBR (148.5*30/4 = 1113 < 1620 Mbps).
+        if link_rate_for_pixel_clock(148_500) != LinkRate::DpRbr {
+            return TestResult::Fail("148.5 MHz should fit in RBR");
+        }
+        // 2560x1440@60: ~241 MHz — needs HBR (241*30/4 = 1807 > 1620).
+        if link_rate_for_pixel_clock(241_000) != LinkRate::DpHbr {
+            return TestResult::Fail("241 MHz should require HBR");
+        }
+        // 3840x2160@60: 533 MHz — needs HBR2 (533*30/4 = 3997 > 2700).
+        if link_rate_for_pixel_clock(533_000) != LinkRate::DpHbr2 {
+            return TestResult::Fail("533 MHz should require HBR2");
+        }
+        // 4K@120 / 5K territory: ~1188 MHz — needs HBR3.
+        if link_rate_for_pixel_clock(1_188_000) != LinkRate::DpHbr3 {
+            return TestResult::Fail(">1.18 GHz should require HBR3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_link_rate_for_pixel_clock_floors
+    );
+
+    fn smoke_program_dpll_writes_cfgcr_and_polls_lock() -> TestResult {
+        let mut mmio = FakeMmio::new();
+        // Pre-set PLL_POWER_STATE + PLL_LOCK so the path completes.
+        mmio.state_offset = super::DPLL0_ENABLE;
+        mmio.state_value = super::PLL_POWER_STATE | super::PLL_LOCK;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        let mode = Mode::VESA_1024X768_60;
+        match ms.program_dpll(&mode) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = e;
+                return TestResult::Fail("program_dpll failed with lock asserted");
+            }
+        }
+        // Must have written CFGCR0 and CFGCR1.
+        let cfgcr0_writes = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
+        if cfgcr0_writes.is_empty() {
+            return TestResult::Fail("CFGCR0 not written");
+        }
+        let cfgcr1_writes = mmio.writes_to(crate::intel_gpu_pll::dpll_cfgcr1(
+            crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
+        ));
+        if cfgcr1_writes.is_empty() {
+            return TestResult::Fail("CFGCR1 not written");
+        }
+        // Must have asserted PLL_ENABLE.
+        let pll_writes = mmio.writes_to(super::DPLL0_ENABLE);
+        if !pll_writes.iter().any(|w| w & super::PLL_ENABLE != 0) {
+            return TestResult::Fail("PLL_ENABLE never set");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_dpll_writes_cfgcr_and_polls_lock
     );
 }
