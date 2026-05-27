@@ -1,0 +1,15 @@
+[package]
+name         = "narf-security"
+description  = "KSPP-style hardening aggregator: pointer redaction, capability-leak detection, posture reporting."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
+
+[lints]
+workspace = true

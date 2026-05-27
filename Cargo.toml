@@ -14,6 +14,7 @@ members = [
     "time",
     "scheduler",
     "capabilities",
+    "security",
     "ipc",
     "interrupts",
     "verification",

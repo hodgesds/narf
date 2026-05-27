@@ -18,6 +18,7 @@ extern crate alloc;
 // crate's test entries. (Crates that the kernel actually uses by
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
+extern crate narf_security as _;
 extern crate narf_drivers_fs_ext2;
 extern crate narf_drivers_fs_fat;
 extern crate narf_drivers_fs_exfat as _;
@@ -451,6 +452,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // Subsequent stack-protected functions will see a real value
         // instead of the static-init sentinel.
         canary::init_global_canary();
+
+        // Populate the global PostureReport so observability has a
+        // single source of truth for "which hardening knobs are live".
+        {
+            use core::sync::atomic::Ordering;
+            let p = &narf_security::posture::REPORT;
+            p.smep.store(smep::is_enabled(), Ordering::Release);
+            p.smap.store(smap::is_enabled(), Ordering::Release);
+            p.kpti.store(
+                match pti {
+                    kpti::Posture::Native => narf_security::posture::Posture::Native.as_byte(),
+                    kpti::Posture::Isolate => narf_security::posture::Posture::Isolate.as_byte(),
+                },
+                Ordering::Release,
+            );
+            // KASLR and canary always ran. W^X is enforced by the
+            // mmap/mprotect layer (compile-time / runtime). ro_after_init
+            // is set once we cross mark_init_complete().
+            p.kaslr.store(true, Ordering::Release);
+            p.canary.store(true, Ordering::Release);
+            p.w_xor_x.store(true, Ordering::Release);
+        }
     }
 
     // Stage 2 feature probe. Print what the CPU supports; gate
