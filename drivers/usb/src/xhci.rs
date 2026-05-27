@@ -1323,11 +1323,28 @@ impl Xhci {
         // the event ring; advance ERDP past the drained slots and
         // ack USBSTS.EINT + IMAN.IP so the first user-issued
         // command sees a clean interrupt state.
+        //
+        // Wait for EINT only — pre-fix the predicate also tripped
+        // on USBSTS.HCE (Host Controller Error), so an HCE storm
+        // during bring-up exited the settle window in microseconds
+        // and pretended the controller was happy. HCE is RO; the
+        // explicit check below treats HCE as a hard bring-up
+        // failure.
         let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
-            || unsafe { mmio.read32(op_off + OP_USBSTS) } & (USBSTS_HCE | USBSTS_EINT) != 0,
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_EINT != 0,
             narf_time::Deadline::after_ms(50),
         );
+        // SAFETY: identity-mapped MMIO.
+        let usbsts_after_settle = unsafe { mmio.read32(op_off + OP_USBSTS) };
+        if usbsts_after_settle & USBSTS_HCE != 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: HCE asserted during PP-settle (USBSTS={:#010x}); aborting bring-up",
+                usbsts_after_settle,
+            );
+            return Err(XhciError::NotReady);
+        }
         let mut drained_evs = 0usize;
         loop {
             let trb_off = (drained_evs * 16) as u64;
@@ -1342,7 +1359,11 @@ impl Xhci {
                 break;
             }
         }
-        let new_deq_phys = event_ring.phys_addr().raw() + (drained_evs as u64) * 16;
+        // ERDP must point inside the segment. If the drain consumed
+        // the whole segment, wrap to slot 0 — same path `poll_event`
+        // takes when the SW dequeue cursor crosses the segment.
+        let erdp_slot = if drained_evs >= ER_SEG_TRBS { 0 } else { drained_evs };
+        let new_deq_phys = event_ring.phys_addr().raw() + (erdp_slot as u64) * 16;
         let ir0 = rtsoff as u64 + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -1407,8 +1428,24 @@ impl Xhci {
             _scratch_pages: scratch_pages,
             cmd_pcs: IrqSafeSpinLock::new(1),
             cmd_enqueue: IrqSafeSpinLock::new(0),
-            er_ccs: IrqSafeSpinLock::new(1),
-            er_dequeue: IrqSafeSpinLock::new(0),
+            // After the boot-time drain, SW state has to match the
+            // HW ERDP we just wrote. Pre-fix the drain advanced HW
+            // ERDP past `drained_evs` slots but left `er_dequeue=0`
+            // / `er_ccs=1`, so the first `poll_event` re-read slot 0
+            // (still cycle=1 from the boot PSCE) and reported it as a
+            // valid event — turning every drained TRB into a stale
+            // duplicate. Initialise SW state from the drain count.
+            // If the drain filled the segment (rare on boot, but the
+            // loop's outer break is `drained_evs >= ER_SEG_TRBS`),
+            // wrap dequeue to 0 and flip CCS to match `poll_event`'s
+            // wrap-toggle path; otherwise CCS stays 1 because the
+            // drain only stops on the first cycle=0 slot.
+            er_ccs: IrqSafeSpinLock::new(
+                if drained_evs >= ER_SEG_TRBS { 0 } else { 1 },
+            ),
+            er_dequeue: IrqSafeSpinLock::new(
+                if drained_evs >= ER_SEG_TRBS { 0 } else { drained_evs },
+            ),
             devices: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             // Pre-allocate to MAX_DEPTH (64) so the ISR's
             // `push_back` from `demux_one_event` never grows the
