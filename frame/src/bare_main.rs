@@ -1803,21 +1803,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     // SAFETY: Single-threaded boot path, statics populated in _start_rust.
                     let (raw, info) = unsafe { (RAW_BOOT_INFO.as_ref(), BOOT_INFO.as_ref()) };
 
-                    // PCR 0: Kernel binary.
-                    extern "C" {
-                        static __kernel_start: u8;
-                        static __kernel_end: u8;
-                    }
-                    let kstart = core::ptr::addr_of!(__kernel_start) as u64;
-                    let kend = core::ptr::addr_of!(__kernel_end) as u64;
-                    if let Err(e) = measure::measure_phys(0, "kernel", kstart, kend - kstart).await
-                    {
-                        let _ = writeln!(
-                            console::Writer,
-                            "  measured-boot: PCR 0 extend failed: {:?}",
-                            e
-                        );
-                    }
+                    // PCR 0 is for FIRMWARE measurement per TCG PC Client
+                    // Platform Firmware Profile §3.3 — owned by UEFI /
+                    // coreboot, NOT by the kernel. The bootloader is what
+                    // extends our kernel hash into PCR 4 ("boot loader
+                    // code"). Kernel self-measuring into PCR 0 is wrong
+                    // and (until just now) crashed boot because the
+                    // `__kernel_start` / `__kernel_end` linker symbols
+                    // are in different address spaces — `__kernel_end =
+                    // . - KERNEL_VIRT_BASE` gives a phys-equivalent
+                    // offset, so `kend - kstart` underflows wildly when
+                    // treated as a virtual-range length. The frame
+                    // allocator (bare_main.rs:851) uses the same symbols
+                    // for their intended phys-range purpose.
 
                     // PCR 4: Bootloader handoff.
                     if let Some(r) = raw {
