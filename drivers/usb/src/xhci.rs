@@ -1896,6 +1896,20 @@ impl Xhci {
     fn demux_one_event(&self) -> Option<[u32; 4]> {
         let ev = self.poll_event()?;
         let ty = (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        // Route Port Status Change Events (xHCI 1.2 §6.4.2.3, TRB
+        // type 34) to the USB supervisor. Pre-fix the `_ =>` arm
+        // below silently dropped these so a hot-plug attach landing
+        // while the supervisor was parked never produced a wake;
+        // the user had to wait for the next 100 ms pump pause to
+        // expire before re-scanning PORTSC. Bump the counter
+        // first (so a polling consumer can detect missed events
+        // by snapshot-and-compare) then poke the registered
+        // supervisor waker.
+        if ty == TRB_TYPE_PORT_STATUS_CHANGE {
+            USB_PSCE_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
+            wake_usb_supervisor();
+            return Some(ev);
+        }
         const MAX_DEPTH: usize = 64;
         let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
             t if t == TRB_TYPE_CMD_COMPLETION => &self.cmd_events,
@@ -3570,6 +3584,59 @@ pub static IS_PROBED: core::sync::atomic::AtomicBool =
 
 pub fn is_probed() -> bool {
     IS_PROBED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Monotonic counter of Port Status Change Events (TRB Type 34 —
+/// xHCI 1.2 §6.4.2.3) the demux has observed. The USB supervisor
+/// uses the high watermark to notice "something changed on a root
+/// hub port" without polling PORTSC on every iteration. Bumped
+/// from `demux_one_event`; consumers compare against a snapshot.
+///
+/// Pre-fix the demux dropped PSCE on the floor (`_ =>` arm), so a
+/// hot-plug attach landing while the supervisor was parked never
+/// woke anything — the user had to wait for the next 100 ms pump
+/// pause to expire. With the counter in place the supervisor can
+/// also `wake_by_ref` the cached waker (see `USB_SUPERVISOR_WAKER`)
+/// for an immediate re-poll.
+pub static USB_PSCE_EVENTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Optional supervisor waker. The USB supervisor registers its
+/// `core::task::Waker` via [`register_supervisor_waker`]; the xHCI
+/// ISR / demux calls `wake_by_ref` on it whenever a Port Status
+/// Change Event lands. Stored behind an `IrqSafeSpinLock` so the
+/// ISR (which preempts the supervisor) can install/observe it
+/// without racing.
+///
+/// Semantics: the slot holds at most one waker. A new
+/// `register_supervisor_waker` replaces the previous occupant —
+/// matches `core::task::Waker::will_wake` dedup behaviour but
+/// without the lookup, since we only ever have one supervisor.
+static USB_SUPERVISOR_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install the USB supervisor's waker so the xHCI demux can poke
+/// it on a Port Status Change Event. Replaces any previously
+/// installed waker. Pass `cx.waker().clone()` from the supervisor's
+/// poll path; the slot caches it across yields.
+pub fn register_supervisor_waker(w: core::task::Waker) {
+    let mut g = USB_SUPERVISOR_WAKER.lock();
+    *g = Some(w);
+}
+
+/// Internal: wake the supervisor if a waker is registered.
+/// Called from the ISR / demux path on PSCE. Drops the lock
+/// before invoking `wake_by_ref` to keep IRQ-context work bounded
+/// — the waker only flips the per-task awake flag, but doing it
+/// outside the lock keeps the lock-hold-time predictable.
+fn wake_usb_supervisor() {
+    let w = {
+        let g = USB_SUPERVISOR_WAKER.lock();
+        g.clone()
+    };
+    if let Some(w) = w {
+        w.wake_by_ref();
+    }
 }
 
 /// Get a cloned `Arc<Xhci>` handle to the bound controller, or
