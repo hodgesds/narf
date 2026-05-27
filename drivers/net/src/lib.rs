@@ -32,6 +32,7 @@ extern crate alloc;
 
 pub mod atheros;
 pub mod e1000;
+pub mod forcedeth;
 pub mod igc;
 pub mod iwlwifi;
 pub mod ixgbe;
@@ -99,6 +100,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "vmxnet3", || {
         vmxnet3::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "forcedeth", || {
+        forcedeth::register_pci_driver();
         InitResult::Ok
     });
 }
