@@ -39,33 +39,10 @@ fn smoke_r8169_pci_probe() -> TestResult {
 kernel_test_in!("drivers/net/r8169", smoke_r8169_pci_probe);
 
 // ── qcnfa765 ───────────────────────────────────────────────────────
-
-fn smoke_qcnfa765_pci_probe() -> TestResult {
-    // Structural smoke: register the QCNFA765 driver and assert
-    // its PCI match entry (0x17CB:0x1103) is in the bus's match
-    // table. Live wire-up only fires on hosts with the silicon.
-    use crate::qcnfa765;
-    use narf_bus::driver_match::__reset_for_test;
-    use narf_bus::{registered_pci_drivers, MatchKind};
-    __reset_for_test();
-    qcnfa765::register_pci_driver();
-    let registered = registered_pci_drivers();
-    let matched = registered.iter().any(|m| {
-        m.name == "qcnfa765"
-            && matches!(
-                m.kind,
-                MatchKind::VendorDevice {
-                    vendor: qcnfa765::QCN_VENDOR,
-                    device: qcnfa765::QCNFA765_DEV,
-                }
-            )
-    });
-    if !matched {
-        return TestResult::Fail("qcnfa765 PCI match table entry missing");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/net/qcnfa765", smoke_qcnfa765_pci_probe);
+//
+// (moved to drivers/wireless/ as part of the wireless consolidation
+// during the iwlwifi Stage-3 wave. Smoke retired here; the wireless
+// crate carries the equivalent registry-table check now.)
 
 // ── e1000 ──────────────────────────────────────────────────────────
 

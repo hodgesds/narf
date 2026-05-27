@@ -34,10 +34,8 @@ pub mod atheros;
 pub mod e1000;
 pub mod forcedeth;
 pub mod igc;
-pub mod iwlwifi;
 pub mod ixgbe;
 pub mod mlx5;
-pub mod qcnfa765;
 pub mod r8169;
 pub mod rtl8125;
 pub mod rtl8139;
@@ -66,10 +64,6 @@ pub fn register_initcalls() {
         rtl8125::register_pci_driver();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "qcnfa765", || {
-        qcnfa765::register_pci_driver();
-        InitResult::Ok
-    });
     narf_init::register(Stage::Subsys, "mlx5", || {
         mlx5::register_pci_driver();
         InitResult::Ok
@@ -84,10 +78,6 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "rtl8139", || {
         rtl8139::register_pci_driver();
-        InitResult::Ok
-    });
-    narf_init::register(Stage::Subsys, "iwlwifi", || {
-        iwlwifi::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "atheros", || {
@@ -123,8 +113,6 @@ pub enum NicModel {
     RealtekRtl8139,
     /// Realtek RTL8168 / RTL8111 — modern PCIe Gigabit family.
     RealtekRtl8168,
-    /// Qualcomm QCNFA765 / WCN6855 — WiFi 6E PCIe host, MHI-based.
-    QcnfaQcnfa765,
 }
 
 impl NicModel {
@@ -139,7 +127,6 @@ impl NicModel {
             NicModel::MellanoxMlx5 => (0x15B3, 0x1013),
             NicModel::RealtekRtl8139 => (0x10EC, 0x8139),
             NicModel::RealtekRtl8168 => (0x10EC, 0x8168),
-            NicModel::QcnfaQcnfa765 => (0x17CB, 0x1103),
         }
     }
 }
