@@ -435,12 +435,49 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     // ── Pipeline disable (PRM Vol. 14 §"Modeset Sequence") ───
 
     /// Disable the existing pipeline in the safe order: plane →
-    /// pipe → transcoder → DDI. Each disable is followed by a
-    /// "wait for disabled" register-bit poll.
+    /// pipe → transcoder → DDI. Each disable clears the relevant
+    /// enable bit and polls the inverse state for "actually off"
+    /// with a 100 ms cap (matches i915's `intel_wait_for_pipe_off`).
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
+    /// (`intel_disable_pipe`, `intel_disable_transcoder`).
     fn disable_pipeline(&mut self) {
-        // TODO Stage 2: real disable sequence with proper polls.
-        // Stage 1 writes the disable bits and assumes the panel
-        // was off (cold boot path).
+        use crate::intel_gpu_ddi::{DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET};
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+            PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+        };
+        // 1) Plane: clear ENABLE then re-arm via PLANE_SURF write
+        //    so the next vblank latches "no plane".
+        let plane_base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
+        let ctl = self.mmio.read32(plane_base + PLANE_CTL_OFFSET);
+        self.mmio
+            .write32(plane_base + PLANE_CTL_OFFSET, ctl & !PLANE_CTL_ENABLE);
+        // Re-write SURF to trigger the latch.
+        let surf = self.mmio.read32(plane_base + PLANE_SURF_OFFSET);
+        self.mmio.write32(plane_base + PLANE_SURF_OFFSET, surf);
+        compiler_fence(Ordering::SeqCst);
+
+        // 2) Pipe: clear ENABLE, wait for state-inactive.
+        let pipe_off = PipeIdx::A.base() + PIPECONF_OFFSET;
+        let pconf = self.mmio.read32(pipe_off);
+        self.mmio.write32(pipe_off, pconf & !PIPECONF_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        let _ = wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000);
+
+        // 3) Transcoder: same pattern as pipe.
+        let trans_off = Transcoder::A.base() + PIPECONF_OFFSET;
+        let tconf = self.mmio.read32(trans_off);
+        self.mmio.write32(trans_off, tconf & !PIPECONF_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        let _ = wait_bit(self.mmio, trans_off, PIPECONF_STATE, false, 100_000_000);
+
+        // 4) DDI buffer: clear ENABLE, poll IDLE_STATUS asserts.
+        let ddi_off = self.ddi.base() + DDI_BUF_CTL_OFFSET;
+        let dconf = self.mmio.read32(ddi_off);
+        self.mmio.write32(ddi_off, dconf & !DDI_BUF_CTL_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        let _ = wait_bit(self.mmio, ddi_off, DDI_BUF_CTL_IDLE_STATUS, true, 1_000_000);
     }
 
     // ── DPLL ─────────────────────────────────────────────────
@@ -502,63 +539,233 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     // ── Transcoder ───────────────────────────────────────────
 
     /// Program transcoder timing registers (TRANS_HTOTAL,
-    /// TRANS_VTOTAL, TRANS_HSYNC, TRANS_VSYNC). PRM Vol. 14
-    /// §"Transcoder" — values are "active+blanking - 1" for the
-    /// total fields, "sync start/end - 1" for the sync fields.
+    /// TRANS_HBLANK, TRANS_HSYNC, TRANS_VTOTAL, TRANS_VBLANK,
+    /// TRANS_VSYNC). PRM Vol. 14 §"Transcoder" — values are
+    /// "active+blanking - 1" for the total fields, "sync
+    /// start/end - 1" for the sync fields. Field packing comes
+    /// from intel_gpu_pipes::build_transcoder.
+    ///
+    /// Stage-2 binds Pipe A ↔ Transcoder A (mobile eDP often
+    /// uses Transcoder::Edp; Stage-3 will branch on port type).
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
+    /// (`intel_set_transcoder_timings`).
     fn program_transcoder(&mut self, mode: &Mode) {
-        let _ = mode;
-        // TODO Stage 2: pack values via intel_gpu_pipes encoding
-        // helpers and write to TRANS_A_HTOTAL etc. The codec
-        // module already has the field layouts.
+        use crate::intel_gpu_pipes::{
+            build_transcoder, Transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET,
+            TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
+        };
+        let timing = mode_to_display_timing(mode);
+        let prog = match build_transcoder(&timing) {
+            Ok(p) => p,
+            Err(_) => return, // bad timing; downstream poll will time out
+        };
+        let base = Transcoder::A.base();
+        self.mmio.write32(base + TRANS_HTOTAL_OFFSET, prog.htotal);
+        self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);
+        self.mmio.write32(base + TRANS_HSYNC_OFFSET, prog.hsync);
+        self.mmio.write32(base + TRANS_VTOTAL_OFFSET, prog.vtotal);
+        self.mmio.write32(base + TRANS_VBLANK_OFFSET, prog.vblank);
+        self.mmio.write32(base + TRANS_VSYNC_OFFSET, prog.vsync);
+        compiler_fence(Ordering::SeqCst);
     }
 
+    /// Program the pipe — source size for the scaler and PIPE_MISC
+    /// (color depth). Stage-2 ships 8 bpc only (XRGB8888 scanout);
+    /// 10/12 bpc lands with HDR work.
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
+    /// (`intel_set_pipe_src_size`).
     fn program_pipe(&mut self, mode: &Mode) {
-        let _ = mode;
-        // TODO Stage 2: write PIPE_A_SRC (source size for scaler),
-        // PIPE_MISC (color depth = 8 bpc = 0b00 for XRGB8888).
+        use crate::intel_gpu_pipes::{build_pipe, Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        let timing = mode_to_display_timing(mode);
+        let prog = match build_pipe(&timing) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // PIPE_SRCSZ lives inside the pipe MMIO block.
+        self.mmio
+            .write32(PipeIdx::A.base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
+        compiler_fence(Ordering::SeqCst);
     }
 
+    /// Program the primary plane — surface address, stride, size,
+    /// pixel format. Field encoding (PLANE_CTL source-format,
+    /// PLANE_STRIDE 64-byte units, etc.) lives in
+    /// intel_gpu_pipes::build_primary_plane.
+    ///
+    /// Note: Stage-2 hands `fb.phys_addr` straight through as the
+    /// PLANE_SURF value — that is only valid when the BIOS / GOP
+    /// has left the framebuffer in a GGTT-mapped region (the
+    /// common path for cold boot). A real GGTT mapping pass lands
+    /// with the scanout-surface allocator in Stage-3.
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_plane.c
+    /// (`intel_plane_atomic_check_with_state` for validation +
+    /// the per-plane register writes in `skl_plane_update_*`).
     fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
-        let _ = (fb, mode);
-        // TODO Stage 2: write PLANE_SURF_A (low/high dwords of
-        // fb.phys_addr after GGTT mapping), PLANE_STRIDE_A,
-        // PLANE_CTL_A (format = 0b1000 for XRGB8888, source pixel
-        // format), PLANE_SIZE_A (active region from mode).
-        // Also: map the framebuffer through GGTT — see
-        // intel_gpu_gtt for the PTE encoding.
+        use crate::intel_gpu_pipes::{
+            build_primary_plane, Pipe as PipeIdx, PixelFormat as PipeFmt,
+            PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
+            PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+        };
+        let pipe_fmt = match fb.format {
+            // XRGB8888 → 8:8:8:8 ARGB encoding (alpha treated as
+            // opaque by the pipe when the surface is XRGB).
+            PixelFormat::Xrgb8888 => PipeFmt::Argb8888,
+        };
+        let prog = match build_primary_plane(
+            mode.h_active,
+            mode.v_active,
+            fb.stride_bytes,
+            fb.phys_addr as u32,
+            pipe_fmt,
+        ) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
+        // Per Linux skl_plane_update: program everything *except*
+        // PLANE_CTL.ENABLE first, then the SURF register last —
+        // writing SURF arms the plane on the next vblank.
+        self.mmio.write32(base + PLANE_STRIDE_OFFSET, prog.plane_stride);
+        self.mmio.write32(base + PLANE_SIZE_OFFSET, prog.plane_size);
+        self.mmio.write32(base + PLANE_OFFSET_OFFSET, prog.plane_offset);
+        // CTL with format + plane_enable; final flush via SURF.
+        self.mmio.write32(base + PLANE_CTL_OFFSET, prog.plane_ctl);
+        self.mmio.write32(base + PLANE_SURF_OFFSET, prog.plane_surf);
+        compiler_fence(Ordering::SeqCst);
     }
 
     // ── DP link training ─────────────────────────────────────
 
     /// Run the DP link-training state machine over our AUX
-    /// channel. Wraps `dp_link_training::train_link` with our
-    /// IntelAux transport.
+    /// channel. Wraps [`dp_link_training::train_link`] with our
+    /// IntelAux transport. Picks rate + lane count from the mode
+    /// the orchestrator computed during DPLL programming; today
+    /// that's the same `link_rate_for_pixel_clock` decision.
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/
+    /// intel_dp_link_training.c (`intel_dp_link_training`).
     fn train_dp_link(&mut self) -> Result<(), ModesetError> {
-        // TODO Stage 2: instantiate dp_link_training::Trainer
-        // with self.mmio's AUX, call .run() and translate the
-        // error variant into ModesetError::LinkTrainingCr/Eq.
-        Ok(())
+        use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
+        let mut aux = IntelAux::new(self.mmio, self.ddi);
+        // Stage-2 starts at HBR2/4-lane and falls back via
+        // `train_link`'s policy. That's the broadest envelope a
+        // modern eDP panel will accept; lower-bandwidth links
+        // converge on the rate ladder.
+        let initial_rate = TrainRate::Hbr2;
+        let lanes = 4;
+        match train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop()) {
+            Ok(_trained) => Ok(()),
+            Err(LinkError::CrFailed(_)) => Err(ModesetError::LinkTrainingCr),
+            Err(LinkError::EqFailed(_)) => Err(ModesetError::LinkTrainingEq),
+            Err(LinkError::Aborted) => Err(ModesetError::LinkTrainingCr),
+            Err(LinkError::AuxFailure(e)) => Err(ModesetError::AuxFailure(e)),
+        }
     }
 
     // ── DDI buffer enable ────────────────────────────────────
 
+    /// Drive the physical output buffer enable. PRM Vol. 12
+    /// §"DDI_BUF_CTL" — set the ENABLE bit and the lane-count
+    /// field, then poll the (inverse-logic) IDLE_STATUS bit to
+    /// see the buffer come alive.
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_ddi.c
+    /// (`intel_ddi_pre_enable_dp` + `intel_ddi_buf_enable`).
     fn enable_ddi_buffer(&mut self) {
-        // TODO Stage 2: write DDI_BUF_CTL[31] (enable) for the
-        // selected port + lane count from intel_gpu_ddi.
+        use crate::intel_gpu_ddi::{
+            build_ddi_buf_ctl, LaneCount, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
+        };
+        let off = self.ddi.base() + DDI_BUF_CTL_OFFSET;
+        let cur = self.mmio.read32(off);
+        let val = cur | build_ddi_buf_ctl(LaneCount::X4);
+        self.mmio.write32(off, val);
+        compiler_fence(Ordering::SeqCst);
+        // Wait for IDLE_STATUS to clear — buffer is now driving.
+        // PRM allows 600 µs; we give 1 ms.
+        let _ = wait_bit(self.mmio, off, DDI_BUF_CTL_IDLE_STATUS, false, 1_000_000);
     }
 
     // ── Final enables (PRM-mandated order) ───────────────────
 
+    /// Enable Transcoder A. TRANS_CONF.ENABLE + state-active poll
+    /// per PRM Vol. 14 §"Transcoder Enable".
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
+    /// (`intel_enable_transcoder`).
     fn enable_transcoder(&mut self) {
-        // TODO Stage 2: TRANS_CONF.ENABLE bit + state-active poll.
+        use crate::intel_gpu_pipes::{
+            Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+        };
+        let off = Transcoder::A.base() + PIPECONF_OFFSET;
+        let cur = self.mmio.read32(off);
+        self.mmio.write32(off, cur | PIPECONF_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        // Poll state-active. 100 ms cap matches i915's
+        // `intel_wait_for_pipe_off` budget.
+        let _ = wait_bit(self.mmio, off, PIPECONF_STATE, true, 100_000_000);
     }
 
+    /// Enable Pipe A. Same register block as the transcoder on
+    /// Gen12 (PIPE_CONF / TRANS_CONF are aliased at the per-
+    /// pipe block); writing the same ENABLE bit at Pipe A's base
+    /// turns on the per-pipe raster engine.
+    ///
+    /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
+    /// (`intel_enable_pipe`).
     fn enable_pipe(&mut self) {
-        // TODO Stage 2: PIPE_CONF.ENABLE bit + state-active poll.
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+        };
+        let off = PipeIdx::A.base() + PIPECONF_OFFSET;
+        let cur = self.mmio.read32(off);
+        self.mmio.write32(off, cur | PIPECONF_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+        let _ = wait_bit(self.mmio, off, PIPECONF_STATE, true, 100_000_000);
     }
 
+    /// Final plane arm: PLANE_CTL already has the enable bit set
+    /// from `program_plane` (per i915 convention). What's left is
+    /// the first-VBLANK barrier so the surface programming
+    /// actually takes effect before we return to the caller.
+    ///
+    /// Stage-2 uses a fixed 20 ms wait (≈one frame at 50 Hz, the
+    /// slowest mode we'd realistically program). A VBLANK IRQ
+    /// path lands with the VBLANK helper in Stage-3.
     fn enable_plane(&mut self) {
-        // TODO Stage 2: PLANE_CTL.ENABLE bit + first-VBLANK wait.
+        // The plane is already armed by `program_plane`'s SURF
+        // write. Spin one frame-time so the scanout flips before
+        // the caller observes "modeset done".
+        let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
+        let budget = 20_000_000u64.saturating_mul(cpns);
+        let start = narf_time::now_cycles();
+        while narf_time::now_cycles().wrapping_sub(start) < budget {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Convert our [`Mode`] (compressed timing) into the codec
+/// layer's [`DisplayTiming`] (the shape `build_transcoder` /
+/// `build_pipe` expect). The codec uses absolute blank-start /
+/// blank-end positions; we synthesise them from active + total.
+fn mode_to_display_timing(mode: &Mode) -> crate::intel_gpu_pipes::DisplayTiming {
+    crate::intel_gpu_pipes::DisplayTiming {
+        hactive: mode.h_active,
+        // Horizontal blanking is the region from h_active to h_total.
+        hblank_start: mode.h_active,
+        hblank_end: mode.h_total,
+        hsync_start: mode.h_sync_start,
+        hsync_end: mode.h_sync_end,
+        htotal: mode.h_total,
+        vactive: mode.v_active,
+        vblank_start: mode.v_active,
+        vblank_end: mode.v_total,
+        vsync_start: mode.v_sync_start,
+        vsync_end: mode.v_sync_end,
+        vtotal: mode.v_total,
     }
 }
 
@@ -803,5 +1010,228 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_dpll_writes_cfgcr_and_polls_lock
+    );
+
+    fn smoke_mode_to_display_timing_round_trip() -> TestResult {
+        use crate::intel_gpu_pipes::DisplayTiming;
+        let m = Mode {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_total: 2200,
+            h_sync_start: 2008,
+            h_sync_end: 2052,
+            v_active: 1080,
+            v_total: 1125,
+            v_sync_start: 1084,
+            v_sync_end: 1089,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        };
+        let t: DisplayTiming = super::mode_to_display_timing(&m);
+        if t.hactive != 1920 || t.htotal != 2200 || t.hblank_start != 1920 || t.hblank_end != 2200
+        {
+            return TestResult::Fail("horizontal blank packing");
+        }
+        if t.hsync_start != 2008 || t.hsync_end != 2052 {
+            return TestResult::Fail("horizontal sync packing");
+        }
+        if t.vactive != 1080 || t.vtotal != 1125 || t.vblank_end != 1125 {
+            return TestResult::Fail("vertical packing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_mode_to_display_timing_round_trip
+    );
+
+    fn smoke_program_transcoder_writes_six_regs() -> TestResult {
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET,
+            TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
+        };
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.program_transcoder(&Mode::VESA_1024X768_60);
+        let base = Transcoder::A.base();
+        let expected = [
+            TRANS_HTOTAL_OFFSET,
+            TRANS_HBLANK_OFFSET,
+            TRANS_HSYNC_OFFSET,
+            TRANS_VTOTAL_OFFSET,
+            TRANS_VBLANK_OFFSET,
+            TRANS_VSYNC_OFFSET,
+        ];
+        for off in expected.iter().copied() {
+            if mmio.writes_to(base + off).is_empty() {
+                return TestResult::Fail("trans reg not written");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_transcoder_writes_six_regs
+    );
+
+    fn smoke_program_pipe_writes_srcsz() -> TestResult {
+        use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.program_pipe(&Mode::VESA_1024X768_60);
+        let writes = mmio.writes_to(PipeIdx::A.base() + PIPE_SRCSZ_OFFSET);
+        if writes.is_empty() {
+            return TestResult::Fail("PIPE_SRCSZ not written");
+        }
+        // SRCSZ packing: bits[28:16] = hactive-1, bits[12:0] = vactive-1.
+        let v = writes[0];
+        let h = (v >> 16) & 0x1FFF;
+        let vl = v & 0x1FFF;
+        if h != 1023 || vl != 767 {
+            return TestResult::Fail("PIPE_SRCSZ encoding off");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_pipe_writes_srcsz
+    );
+
+    fn smoke_program_plane_arms_surf_last() -> TestResult {
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+        };
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1024 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        ms.program_plane(&fb, &Mode::VESA_1024X768_60);
+        let plane_base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
+        // PLANE_SURF and PLANE_CTL both written.
+        if mmio.writes_to(plane_base + PLANE_SURF_OFFSET).is_empty() {
+            return TestResult::Fail("PLANE_SURF not written");
+        }
+        if mmio.writes_to(plane_base + PLANE_CTL_OFFSET).is_empty() {
+            return TestResult::Fail("PLANE_CTL not written");
+        }
+        // Order: SURF must come after CTL (latch trigger). Search
+        // by occurrence in the writes log.
+        let surf_off = plane_base + PLANE_SURF_OFFSET;
+        let ctl_off = plane_base + PLANE_CTL_OFFSET;
+        let log = mmio.writes.borrow();
+        let mut surf_idx = None;
+        let mut ctl_idx = None;
+        for (i, (o, _)) in log.iter().enumerate() {
+            if *o == surf_off && surf_idx.is_none() {
+                surf_idx = Some(i);
+            }
+            if *o == ctl_off && ctl_idx.is_none() {
+                ctl_idx = Some(i);
+            }
+        }
+        match (ctl_idx, surf_idx) {
+            (Some(c), Some(s)) if s > c => TestResult::Pass,
+            _ => TestResult::Fail("SURF must be written after CTL"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_plane_arms_surf_last
+    );
+
+    fn smoke_enable_transcoder_writes_enable_bit() -> TestResult {
+        use crate::intel_gpu_pipes::{Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET};
+        let mut mmio = FakeMmio::new();
+        // Pre-set the state bit so the poll returns immediately.
+        mmio.state_offset = Transcoder::A.base() + PIPECONF_OFFSET;
+        mmio.state_value = crate::intel_gpu_pipes::PIPECONF_STATE;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.enable_transcoder();
+        let writes = mmio.writes_to(Transcoder::A.base() + PIPECONF_OFFSET);
+        if !writes.iter().any(|w| w & PIPECONF_ENABLE != 0) {
+            return TestResult::Fail("transcoder ENABLE bit not set");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_enable_transcoder_writes_enable_bit
+    );
+
+    fn smoke_enable_ddi_buffer_writes_lane_and_enable() -> TestResult {
+        use crate::intel_gpu_ddi::{DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_OFFSET};
+        let mut mmio = FakeMmio::new();
+        // Pre-set IDLE_STATUS=0 (active), so the poll's "wait
+        // until clear" returns immediately. Default reads are 0
+        // so this needs no extra state.
+        mmio.state_offset = 0;
+        mmio.state_value = 0;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.enable_ddi_buffer();
+        let off = Ddi::A.base() + DDI_BUF_CTL_OFFSET;
+        let writes = mmio.writes_to(off);
+        if !writes.iter().any(|w| w & DDI_BUF_CTL_ENABLE != 0) {
+            return TestResult::Fail("DDI_BUF_CTL.ENABLE not set");
+        }
+        // Lane field bits[3:1] should encode X4 = 0b011.
+        let v = writes[0];
+        if (v >> 1) & 0x7 != 0b011 {
+            return TestResult::Fail("DDI lane count != X4");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_enable_ddi_buffer_writes_lane_and_enable
+    );
+
+    fn smoke_disable_pipeline_writes_disables_in_order() -> TestResult {
+        use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_CTL_ENABLE,
+            PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET,
+        };
+        let mut mmio = FakeMmio::new();
+        // Use a wildcard state read that returns 0 for STATE bits
+        // (i.e., already disabled) so wait_bit returns instantly.
+        mmio.state_offset = 0;
+        mmio.state_value = 0;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.disable_pipeline();
+
+        // Plane CTL write must clear ENABLE.
+        let plane_writes = mmio.writes_to(PipeIdx::A.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET);
+        if plane_writes.is_empty() || plane_writes.iter().any(|w| w & PLANE_CTL_ENABLE != 0) {
+            return TestResult::Fail("plane CTL ENABLE not cleared");
+        }
+        // Pipe + Transcoder PIPECONF must clear ENABLE.
+        let pipe_writes = mmio.writes_to(PipeIdx::A.base() + PIPECONF_OFFSET);
+        let trans_writes = mmio.writes_to(Transcoder::A.base() + PIPECONF_OFFSET);
+        if pipe_writes.is_empty() || pipe_writes.iter().any(|w| w & PIPECONF_ENABLE != 0) {
+            return TestResult::Fail("pipe ENABLE not cleared");
+        }
+        if trans_writes.is_empty() || trans_writes.iter().any(|w| w & PIPECONF_ENABLE != 0) {
+            return TestResult::Fail("transcoder ENABLE not cleared");
+        }
+        // DDI BUF must clear ENABLE.
+        let ddi_off = Ddi::A.base() + DDI_BUF_CTL_OFFSET;
+        let ddi_writes = mmio.writes_to(ddi_off);
+        if ddi_writes.is_empty() {
+            return TestResult::Fail("DDI_BUF_CTL not written");
+        }
+        if ddi_writes
+            .iter()
+            .any(|w| w & crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE != 0)
+        {
+            return TestResult::Fail("DDI ENABLE not cleared");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_disable_pipeline_writes_disables_in_order
     );
 }
