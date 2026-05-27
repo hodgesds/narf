@@ -227,6 +227,243 @@ fn smoke_microcode_vendor_detect() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/microcode", smoke_microcode_vendor_detect);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_header_roundtrip() -> TestResult {
+    use crate::x86_64::microcode::{IntelUcodeHeader, INTEL_HEADER_LEN};
+    // Build a synthetic 48-byte header + 2000-byte body whose
+    // checksum sums to zero. header_version=1, loader_revision=1.
+    let mut blob = [0u8; 2048];
+    // header[0..4] = header_version (1)
+    blob[0] = 1;
+    // header[20..24] = loader_revision (1)
+    blob[20] = 1;
+    // total_size = 0 → effective 2048 (48 + 2000 default body).
+    // data_size = 0 → effective 2000.
+    // checksum field at [16..20]: pick a value that makes the
+    // dword-sum over the whole 2048-byte blob equal zero. After
+    // setting all other fields, sum and negate.
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 4 <= 2048 {
+        let dw = u32::from_le_bytes([blob[i], blob[i + 1], blob[i + 2], blob[i + 3]]);
+        sum = sum.wrapping_add(dw);
+        i += 4;
+    }
+    let checksum = 0u32.wrapping_sub(sum);
+    blob[16..20].copy_from_slice(&checksum.to_le_bytes());
+    let h = match IntelUcodeHeader::decode(&blob) {
+        Some(h) => h,
+        None => return TestResult::Fail("decode failed"),
+    };
+    if h.header_version != 1 || h.loader_revision != 1 {
+        return TestResult::Fail("header fields didn't round-trip");
+    }
+    if h.effective_total_size() != 2048 {
+        return TestResult::Fail("effective_total_size != 2048");
+    }
+    if h.effective_data_size() != 2000 {
+        return TestResult::Fail("effective_data_size != 2000");
+    }
+    if h.validate(&blob).is_err() {
+        return TestResult::Fail("validate rejected a well-formed blob");
+    }
+    let _ = INTEL_HEADER_LEN;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_intel_header_roundtrip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_header_reject_bad_version() -> TestResult {
+    use crate::x86_64::microcode::IntelUcodeHeader;
+    let mut blob = [0u8; 2048];
+    // header_version = 2 → reject
+    blob[0] = 2;
+    blob[20] = 1;
+    let h = match IntelUcodeHeader::decode(&blob) {
+        Some(h) => h,
+        None => return TestResult::Fail("decode unexpectedly failed"),
+    };
+    match h.validate(&blob) {
+        Err(crate::x86_64::microcode::UcodeError::BadHeader) => TestResult::Pass,
+        _ => TestResult::Fail("validate accepted header_version != 1"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_bad_version);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_fms_decode_renoir_phoenix() -> TestResult {
+    use crate::x86_64::microcode::FamilyModelStepping;
+    // Renoir / Lucienne — Family 17h, Model 60h, Stepping 1.
+    // Per AMD's CPUID encoding rules (base_family == 0xF):
+    //   base_family = 0xF, ext_family = 0x8 → family = 0x17
+    //   base_model = 0x0, ext_model = 0x6 → model = 0x60
+    //   stepping = 0x1 → CPUID(1).EAX = 0x0086_0F01.
+    let fms = FamilyModelStepping::from_raw(0x0086_0F01);
+    if fms.family != 0x17 || fms.model != 0x60 || fms.stepping != 1 {
+        return TestResult::Fail("Renoir FMS decode mismatch");
+    }
+    // Phoenix / HawkPoint1 — Family 19h, Model 74h, Stepping 1.
+    //   base_family = 0xF, ext_family = 0xA → family = 0x19
+    //   base_model = 0x4, ext_model = 0x7 → model = 0x74
+    //   stepping = 0x1 → CPUID(1).EAX = 0x00A7_0F41.
+    let fms = FamilyModelStepping::from_raw(0x00A7_0F41);
+    if fms.family != 0x19 || fms.model != 0x74 || fms.stepping != 1 {
+        return TestResult::Fail("Phoenix FMS decode mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_fms_decode_renoir_phoenix);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_filename_derivation() -> TestResult {
+    use crate::x86_64::microcode::FamilyModelStepping;
+    // Intel Comet Lake — Family 06h, Model A6h, Stepping 1.
+    //   base_family = 0x6, ext_family = 0 → family = 0x6
+    //   base_model = 0x6, ext_model = 0xA → model = 0xA6
+    //   stepping = 0x1 → CPUID(1).EAX = 0x000A_0661.
+    let fms = FamilyModelStepping::from_raw(0x000A_0661);
+    let name = fms.intel_filename();
+    if &name != b"06-A6-01" {
+        return TestResult::Fail("intel_filename mismatch for CometLake");
+    }
+    // Intel Tiger Lake — Family 06h, Model 8Ch, Stepping 1.
+    //   base_model = 0xC, ext_model = 0x8 → model = 0x8C
+    //   stepping = 0x1 → CPUID(1).EAX = 0x0008_06C1.
+    let fms = FamilyModelStepping::from_raw(0x0008_06C1);
+    let name = fms.intel_filename();
+    if &name != b"06-8C-01" {
+        return TestResult::Fail("intel_filename mismatch for TigerLake");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_intel_filename_derivation);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_amd_family_tag() -> TestResult {
+    use crate::x86_64::microcode::FamilyModelStepping;
+    // Zen2 Renoir — Family 17h.
+    let fms = FamilyModelStepping::from_raw(0x0086_0F01);
+    if &fms.amd_family_tag() != b"17h" {
+        return TestResult::Fail("Renoir family tag mismatch");
+    }
+    // Zen4 Phoenix — Family 19h.
+    let fms = FamilyModelStepping::from_raw(0x00A7_0F41);
+    if &fms.amd_family_tag() != b"19h" {
+        return TestResult::Fail("Phoenix family tag mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_amd_family_tag);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_amd_container_decode() -> TestResult {
+    use crate::x86_64::microcode::{
+        amd_find_equiv, amd_find_patch, AmdContainerHeader, AMD_CONTAINER_MAGIC,
+        AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN, AMD_PATCH_SECTION_HDR_LEN,
+        AMD_PATCH_SECTION_TYPE,
+    };
+    // Build a minimal AMD container with one equiv entry pointing
+    // to one patch section.
+    // Layout:
+    //   [0..4]   magic = 0x00414D44
+    //   [4..8]   equiv_table_type = 1
+    //   [8..12]  equiv_table_len = 32 (one real entry + null terminator)
+    //   [12..28] equiv entry: installed_cpu=0x00870F10, equiv_cpu=0x8310
+    //   [28..44] null terminator entry (zero installed_cpu/equiv_cpu)
+    //   [44..48] section_type = 1
+    //   [48..52] section_size = 64 (just the patch header, no body)
+    //   [52..116] patch header with processor_rev_id = 0x8310
+    let mut blob = [0u8; 116];
+    blob[0..4].copy_from_slice(&AMD_CONTAINER_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&AMD_EQUIV_TYPE.to_le_bytes());
+    blob[8..12].copy_from_slice(&32u32.to_le_bytes());
+    // Equiv entry #1.
+    blob[12..16].copy_from_slice(&0x0086_0F01u32.to_le_bytes()); // installed_cpu (Renoir)
+    blob[24..26].copy_from_slice(&0x8310u16.to_le_bytes());      // equiv_cpu
+    // Equiv entry #2 = all-zero terminator (already zero).
+    // Patch section header.
+    blob[44..48].copy_from_slice(&AMD_PATCH_SECTION_TYPE.to_le_bytes());
+    blob[48..52].copy_from_slice(&(AMD_PATCH_HDR_LEN as u32).to_le_bytes());
+    // Patch header: processor_rev_id at offset 24..26.
+    blob[52 + 24..52 + 26].copy_from_slice(&0x8310u16.to_le_bytes());
+
+    // Container decode + validate.
+    let hdr = match AmdContainerHeader::decode(&blob) {
+        Some(h) => h,
+        None => return TestResult::Fail("container decode failed"),
+    };
+    if hdr.validate().is_err() {
+        return TestResult::Fail("container validate rejected good blob");
+    }
+    // Lookup.
+    let equiv = match amd_find_equiv(&blob, 0x0086_0F01) {
+        Some(e) => e,
+        None => return TestResult::Fail("amd_find_equiv missed installed_cpu"),
+    };
+    if equiv != 0x8310 {
+        return TestResult::Fail("equiv code mismatch");
+    }
+    let patch = match amd_find_patch(&blob, equiv) {
+        Some(p) => p,
+        None => return TestResult::Fail("amd_find_patch missed the section"),
+    };
+    if patch.len() != AMD_PATCH_HDR_LEN {
+        return TestResult::Fail("patch body length wrong");
+    }
+    // CPUID we don't have an entry for → None.
+    if amd_find_equiv(&blob, 0x0000_DEAD).is_some() {
+        return TestResult::Fail("amd_find_equiv accepted an unknown CPUID");
+    }
+    let _ = AMD_PATCH_SECTION_HDR_LEN;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_amd_container_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_applied_revision_tracker() -> TestResult {
+    use crate::x86_64::microcode;
+    microcode::__reset_applied_revision_for_test();
+    if microcode::applied_revision() != 0 {
+        return TestResult::Fail("reset didn't clear applied_revision");
+    }
+    // We can't fake-apply at this layer without an MSR mock; just
+    // make sure the accessor compiles + reset is idempotent.
+    microcode::__reset_applied_revision_for_test();
+    if microcode::applied_revision() != 0 {
+        return TestResult::Fail("second reset diverged");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_applied_revision_tracker);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_cpu_signature_matches_ident() -> TestResult {
+    use crate::x86_64::ident;
+    use crate::x86_64::microcode;
+    // Both reads come from CPUID(1).EAX; if the wrappers diverge
+    // we've miswired one of them.
+    let id = ident::read();
+    let sig = microcode::cpu_signature();
+    if id.signature != sig {
+        return TestResult::Fail("microcode::cpu_signature differs from ident::read");
+    }
+    // FMS decoder agreement, too.
+    let fms = microcode::FamilyModelStepping::from_raw(sig);
+    if fms.family != id.family || fms.model != id.model || fms.stepping != id.stepping {
+        return TestResult::Fail("FMS decode disagrees with ident::read");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_cpu_signature_matches_ident);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_psci_version() -> TestResult {
     use crate::aarch64::psci;
@@ -2225,3 +2462,201 @@ fn smoke_x86_64_hybrid_cpu_type_probe() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/cpuid", smoke_x86_64_hybrid_cpu_type_probe);
+
+// ── AMD-Vi DTE + command-ring + dev-table-base encoders ──────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_dte_identity_bit_positions() -> TestResult {
+    use crate::x86_64::amd_vi::{
+        DeviceTableEntry, DTE_HOST_PT_MASK, DTE_IR, DTE_IW, DTE_MODE_4_LEVEL,
+        DTE_MODE_SHIFT, DTE_TV, DTE_V, PERM_READ, PERM_WRITE,
+    };
+    let pt_root: u64 = 0xDEAD_F000; // page-aligned
+    let dte = DeviceTableEntry::identity(0x42, pt_root, PERM_READ | PERM_WRITE);
+    if !dte.is_valid() {
+        return TestResult::Fail("V bit not set on identity DTE");
+    }
+    if dte.domain_id() != 0x42 {
+        return TestResult::Fail("DomainID not encoded into data[1]");
+    }
+    if dte.page_table_root() != pt_root {
+        return TestResult::Fail("page-table root mask wrong");
+    }
+    if dte.walk_mode() != DTE_MODE_4_LEVEL {
+        return TestResult::Fail("walk mode != 4-level");
+    }
+    // Bit positions per Linux DTE_FLAG_V / TV / IR / IW.
+    let d0 = dte.data[0];
+    if d0 & DTE_V == 0 || d0 & DTE_TV == 0 || d0 & DTE_IR == 0 || d0 & DTE_IW == 0 {
+        return TestResult::Fail("V/TV/IR/IW bit drift");
+    }
+    if (d0 & DTE_HOST_PT_MASK) != pt_root {
+        return TestResult::Fail("page-table mask conflated with flag bits");
+    }
+    if (d0 >> DTE_MODE_SHIFT) & 0b111 != DTE_MODE_4_LEVEL {
+        return TestResult::Fail("walk mode bit position drift");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_dte_identity_bit_positions);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_dte_passthrough_no_pt() -> TestResult {
+    use crate::x86_64::amd_vi::{DeviceTableEntry, DTE_HOST_PT_MASK, DTE_TV};
+    let dte = DeviceTableEntry::passthrough(0x7);
+    if !dte.is_valid() {
+        return TestResult::Fail("passthrough DTE not valid");
+    }
+    if dte.data[0] & DTE_TV != 0 {
+        return TestResult::Fail("passthrough must clear TV");
+    }
+    if dte.data[0] & DTE_HOST_PT_MASK != 0 {
+        return TestResult::Fail("passthrough must have zero pt root");
+    }
+    if dte.walk_mode() != 0 {
+        return TestResult::Fail("passthrough walk mode != 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_dte_passthrough_no_pt);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_dte_with_irte() -> TestResult {
+    use crate::x86_64::amd_vi::{DeviceTableEntry, DTE_IRTE_PTR_MASK, DTE_IV};
+    let irte_root: u64 = 0x1234_5040; // 128-byte aligned within mask
+    let dte = DeviceTableEntry::passthrough(1).with_irte(irte_root);
+    if dte.data[2] & DTE_IV == 0 {
+        return TestResult::Fail("IV bit not set");
+    }
+    if dte.data[2] & DTE_IRTE_PTR_MASK != irte_root & DTE_IRTE_PTR_MASK {
+        return TestResult::Fail("IRTE root mask drifted");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_dte_with_irte);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_cmd_invalidate_devtab_opcode() -> TestResult {
+    use crate::x86_64::amd_vi::{IommuCmd, CMD_INV_DEV_ENTRY};
+    let cmd = IommuCmd::invalidate_devtab(0x0123);
+    if cmd.opcode() != CMD_INV_DEV_ENTRY {
+        return TestResult::Fail("opcode != CMD_INV_DEV_ENTRY");
+    }
+    // BDF lives in data[0].
+    if cmd.data[0] != 0x0123 {
+        return TestResult::Fail("BDF not encoded into data[0]");
+    }
+    if cmd.data[2] != 0 || cmd.data[3] != 0 {
+        return TestResult::Fail("INV_DEV_ENTRY upper lanes must be zero");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_cmd_invalidate_devtab_opcode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_cmd_completion_wait_token_round_trip() -> TestResult {
+    use crate::x86_64::amd_vi::{IommuCmd, CMD_COMPL_WAIT, CMD_COMPL_WAIT_STORE_MASK};
+    let sem: u64 = 0x1_2345_6FF8;
+    let tok: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    let cmd = IommuCmd::completion_wait(sem, tok);
+    if cmd.opcode() != CMD_COMPL_WAIT {
+        return TestResult::Fail("completion_wait opcode drift");
+    }
+    if cmd.data[0] & CMD_COMPL_WAIT_STORE_MASK == 0 {
+        return TestResult::Fail("store bit not set");
+    }
+    let stored_sem_lo = cmd.data[0] & 0xFFFF_FFF8;
+    if stored_sem_lo != (sem as u32 & 0xFFFF_FFF8) {
+        return TestResult::Fail("sem low dword drift");
+    }
+    if cmd.data[1] & 0x0FFF_FFFF != (sem >> 32) as u32 & 0x0FFF_FFFF {
+        return TestResult::Fail("sem high dword drift");
+    }
+    let lo = cmd.data[2] as u64;
+    let hi = (cmd.data[3] as u64) << 32;
+    if (hi | lo) != tok {
+        return TestResult::Fail("token round-trip mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_cmd_completion_wait_token_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_cmd_invalidate_pages_all() -> TestResult {
+    use crate::x86_64::amd_vi::{
+        IommuCmd, CMD_INV_ALL_PAGES_ADDRESS, CMD_INV_IOMMU_PAGES,
+        CMD_INV_IOMMU_PAGES_PDE_MASK, CMD_INV_IOMMU_PAGES_SIZE_MASK,
+    };
+    let cmd = IommuCmd::invalidate_pages(0x55, 0, true);
+    if cmd.opcode() != CMD_INV_IOMMU_PAGES {
+        return TestResult::Fail("invalidate_pages opcode drift");
+    }
+    if cmd.data[1] & 0xFFFF != 0x55 {
+        return TestResult::Fail("domain id not in data[1] low 16 bits");
+    }
+    if cmd.data[2] & CMD_INV_IOMMU_PAGES_PDE_MASK == 0 {
+        return TestResult::Fail("PDE flush bit not set");
+    }
+    if cmd.data[2] & CMD_INV_IOMMU_PAGES_SIZE_MASK == 0 {
+        return TestResult::Fail("size bit not set on all-pages flush");
+    }
+    let addr =
+        ((cmd.data[3] as u64) << 32) | ((cmd.data[2] as u64) & 0xFFFF_FFF0);
+    let want = CMD_INV_ALL_PAGES_ADDRESS & 0xFFFF_FFFF_FFFF_FFF0;
+    if addr != want {
+        return TestResult::Fail("all-pages sentinel address drifted");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_cmd_invalidate_pages_all);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_dev_table_base_encode_decode() -> TestResult {
+    use crate::x86_64::amd_vi::{decode_dev_table_base, encode_dev_table_base};
+    // Standard 256 KiB device table at a page-aligned addr.
+    let phys: u64 = 0x0000_0001_0000_0000;
+    let bytes: u64 = 256 * 1024;
+    let reg = encode_dev_table_base(phys, bytes);
+    let (got_phys, got_bytes) = decode_dev_table_base(reg);
+    if got_phys != phys {
+        return TestResult::Fail("dev-table phys round-trip mismatch");
+    }
+    if got_bytes != bytes {
+        return TestResult::Fail("dev-table size round-trip mismatch");
+    }
+    // Size field is (bytes >> 12) - 1.
+    let size_field = reg & 0x1FF;
+    if size_field != (bytes >> 12) - 1 {
+        return TestResult::Fail("size field encoding drift");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_dev_table_base_encode_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_irte_remap_round_trip() -> TestResult {
+    use crate::x86_64::amd_vi::{Irte, IRTE_REMAP_INTCTL_MASK, IRTE_REMAP_INTCTL};
+    let irte = Irte::remap(0x33, 0x4);
+    if !irte.is_valid() {
+        return TestResult::Fail("IRTE valid bit not set");
+    }
+    if irte.vector() != 0x33 {
+        return TestResult::Fail("IRTE vector round-trip mismatch");
+    }
+    if irte.dest_id() != 0x4 {
+        return TestResult::Fail("IRTE dest_id round-trip mismatch");
+    }
+    if irte.raw & IRTE_REMAP_INTCTL_MASK != IRTE_REMAP_INTCTL {
+        return TestResult::Fail("IntCtl != remap (2)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_irte_remap_round_trip);
