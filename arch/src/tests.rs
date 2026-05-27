@@ -3302,3 +3302,28 @@ fn smoke_amd_vi_walk_iopt_resolves_iova() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/amd_vi", smoke_amd_vi_walk_iopt_resolves_iova);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_irte_remap_round_trip() -> TestResult {
+    use crate::x86_64::vtd::VtdIrte;
+    let irte = VtdIrte::remap(0x21, 0x3, 0x0123);
+    if !irte.is_present() {
+        return TestResult::Fail("present bit not set");
+    }
+    if irte.vector() != 0x21 {
+        return TestResult::Fail("vector round-trip mismatch");
+    }
+    if irte.dest_id() != 0x3 {
+        return TestResult::Fail("dest_id round-trip mismatch");
+    }
+    if irte.source_id() != 0x0123 {
+        return TestResult::Fail("source_id round-trip mismatch");
+    }
+    // SVT field at high[18..20] should be 1 (SID-match).
+    if (irte.high >> 18) & 0x3 != 1 {
+        return TestResult::Fail("SVT not 1");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_irte_remap_round_trip);

@@ -312,6 +312,73 @@ pub const fn decode_iqa(iqa: u64) -> (u64, u8, bool) {
     (base, qs, wide)
 }
 
+// ── Intel VT-d Interrupt Remapping Table Entry (§5.1) ────────────
+//
+// Each IRTE is 128 bits, two u64 lanes. We model just the remap
+// variant (no posted-interrupt support).
+//
+//   low (qw0):
+//     [0]      Present
+//     [1]      Fault-Processing Disable
+//     [2]      Destination Mode (0=physical, 1=logical)
+//     [3]      Redirection Hint
+//     [4]      Trigger Mode (0=edge, 1=level)
+//     [5..8]   Delivery Mode (000=fixed, 001=lowest-prio, 010=SMI, 100=NMI, 101=INIT, 111=ExtINT)
+//     [8..12]  Available (SW)
+//     [16..24] Vector
+//     [32..64] Destination ID (xAPIC ID or x2APIC)
+//   high (qw1):
+//     [0..16]  Source ID (BDF the interrupt comes from)
+//     [16..18] SQ (source-id queue mask)
+//     [18..20] SVT (source-validation type)
+
+pub const VTD_IRTE_PRESENT: u64 = 1 << 0;
+pub const VTD_IRTE_FPD: u64 = 1 << 1;
+pub const VTD_IRTE_DEST_LOGICAL: u64 = 1 << 2;
+pub const VTD_IRTE_REDIRECT_HINT: u64 = 1 << 3;
+pub const VTD_IRTE_TRIGGER_LEVEL: u64 = 1 << 4;
+pub const VTD_IRTE_DLVRY_FIXED: u64 = 0 << 5;
+pub const VTD_IRTE_DLVRY_LOW_PRIO: u64 = 1 << 5;
+pub const VTD_IRTE_DLVRY_NMI: u64 = 4 << 5;
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VtdIrte {
+    pub low: u64,
+    pub high: u64,
+}
+
+impl VtdIrte {
+    /// Build a remap IRTE — fixed delivery, physical dest_mode,
+    /// edge-triggered. `sid` is the originating PCI BDF (for SVT
+    /// source-validation).
+    pub const fn remap(vector: u8, dest_id: u32, sid: u16) -> Self {
+        let low = VTD_IRTE_PRESENT
+            | VTD_IRTE_DLVRY_FIXED
+            | ((vector as u64) << 16)
+            | ((dest_id as u64) << 32);
+        // SVT=1: validate source = SID match. SQ=0: no mask.
+        let high = (sid as u64) | (1 << 18);
+        VtdIrte { low, high }
+    }
+
+    pub const fn is_present(&self) -> bool {
+        (self.low & VTD_IRTE_PRESENT) != 0
+    }
+
+    pub const fn vector(&self) -> u8 {
+        ((self.low >> 16) & 0xFF) as u8
+    }
+
+    pub const fn dest_id(&self) -> u32 {
+        ((self.low >> 32) & 0xFFFF_FFFF) as u32
+    }
+
+    pub const fn source_id(&self) -> u16 {
+        (self.high & 0xFFFF) as u16
+    }
+}
+
 // ── In-memory walker (host-side) ─────────────────────────────────
 //
 // `walk_slpt` resolves an IOVA against a software-built 4-level
