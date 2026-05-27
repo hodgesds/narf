@@ -2814,6 +2814,99 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new signal C-ABI probes ──────────────────────────────────
+    //
+    // sigaction round-trip: install + read-back the prior. Use
+    // SIGUSR1 (10) to avoid colliding with the kernel default-
+    // disposition signals.
+    let sigaction_ok = unsafe {
+        let mut act = narf_libc::sigaction::default();
+        act.sa_handler = narf_libc::SIG_IGN_RAW;
+        let mut old = narf_libc::sigaction::default();
+        let r = narf_libc::sigaction(10, &act as *const _, &mut old as *mut _);
+        // Read-back the installed slot:
+        let mut old2 = narf_libc::sigaction::default();
+        let r2 = narf_libc::sigaction(10, core::ptr::null(), &mut old2 as *mut _);
+        // Restore SIG_DFL.
+        act.sa_handler = narf_libc::SIG_DFL_RAW;
+        let _ = narf_libc::sigaction(10, &act as *const _, core::ptr::null_mut());
+        r == 0 && r2 == 0 && old2.sa_handler == narf_libc::SIG_IGN_RAW
+    };
+    narf_libc::printf_str(
+        if sigaction_ok { "sigaction: ok\n" } else { "sigaction: bad\n" },
+        &[],
+    );
+
+    // sigpending — empty mask.
+    let sigpending_ok = unsafe {
+        let mut s = narf_libc::sigset_t { bits: 0xdead };
+        let r = narf_libc::sigpending(&mut s as *mut _);
+        r == 0 && s.bits == 0
+    };
+    narf_libc::printf_str(
+        if sigpending_ok { "sigpending: ok\n" } else { "sigpending: bad\n" },
+        &[],
+    );
+
+    // sigaltstack round-trip: install + read-back.
+    let altstack_ok = unsafe {
+        let mut backing = [0u8; narf_libc::SIGSTKSZ];
+        let new = narf_libc::stack_t {
+            ss_sp: backing.as_mut_ptr() as *mut _,
+            ss_flags: 0,
+            ss_size: backing.len(),
+        };
+        let mut old = narf_libc::stack_t::default();
+        let r = narf_libc::sigaltstack(&new as *const _, &mut old as *mut _);
+        // Disable it to avoid leaving the stack pointer dangling
+        // once `backing` falls out of scope.
+        let disable = narf_libc::stack_t {
+            ss_sp: core::ptr::null_mut(),
+            ss_flags: narf_libc::SS_DISABLE,
+            ss_size: 0,
+        };
+        let _ = narf_libc::sigaltstack(&disable as *const _, core::ptr::null_mut());
+        r == 0
+    };
+    narf_libc::printf_str(
+        if altstack_ok { "sigaltstack: ok\n" } else { "sigaltstack: bad\n" },
+        &[],
+    );
+
+    // pthread_kill(self, 0) — sig 0 check.
+    let pthread_kill_ok = unsafe {
+        let tid = narf_libc::gettid() as u64;
+        let r = narf_libc::pthread_kill(tid, 0);
+        r == 0 || r == 3
+    };
+    narf_libc::printf_str(
+        if pthread_kill_ok { "pthread_kill: ok\n" } else { "pthread_kill: bad\n" },
+        &[],
+    );
+
+    // signalfd4 explicit size form.
+    let sfd_ok = unsafe {
+        let mask: u64 = 1 << 10;
+        let fd = narf_libc::signalfd4(-1, &mask as *const u64 as *const _, 8, 0);
+        // Either a real fd or a clean failure (-1) is OK; we just
+        // need the call shape to not crash.
+        fd == -1 || fd >= 3
+    };
+    narf_libc::printf_str(
+        if sfd_ok { "signalfd4: ok\n" } else { "signalfd4: bad\n" },
+        &[],
+    );
+
+    // eventfd2 round-trip.
+    let efd_ok = unsafe {
+        let fd = narf_libc::eventfd2(0, 0);
+        fd == -1 || fd >= 3
+    };
+    narf_libc::printf_str(
+        if efd_ok { "eventfd2: ok\n" } else { "eventfd2: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

@@ -131,11 +131,12 @@ pub use locale::{
     RADIXCHAR, T_FMT, T_FMT_AMPM, THOUSEP,
 };
 pub use poll::{
-    epoll_create, epoll_create1, epoll_ctl, epoll_event, epoll_wait, eventfd, fd_set,
-    itimerspec, pollfd, poll, select, signalfd, timerfd_create, timerfd_gettime,
-    timerfd_settime, timeval_select, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT,
-    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, FD_CLR, FD_ISSET, FD_SET, FD_SETSIZE,
-    FD_ZERO, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, POLLRDHUP,
+    epoll_create, epoll_create1, epoll_ctl, epoll_event, epoll_wait, eventfd,
+    eventfd2, fd_set, itimerspec, pollfd, poll, select, signalfd, signalfd4,
+    timerfd_create, timerfd_gettime, timerfd_settime, timeval_select, EPOLLERR,
+    EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
+    FD_CLR, FD_ISSET, FD_SET, FD_SETSIZE, FD_ZERO, POLLERR, POLLHUP, POLLIN,
+    POLLNVAL, POLLOUT, POLLPRI, POLLRDHUP,
 };
 pub use path::{
     basename, closedir, dirent, dirname, fnmatch, opendir, readdir, rewinddir,
@@ -222,7 +223,11 @@ pub use regex::{
     REG_NOTBOL, REG_NOTEOL,
 };
 pub use signal::{
-    kill, raise, signal, sighandler_t,
+    kill, pause, pthread_kill, pthread_sigmask, raise, sigaction, sigaltstack,
+    sighandler_t, signal, sigpending, sigprocmask, sigset_t, siginfo_t,
+    sigsuspend, sigtimedwait, sigwait, sigwaitinfo, stack_t,
+    MINSIGSTKSZ, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_ONSTACK,
+    SA_RESETHAND, SA_RESTART, SA_SIGINFO, SIGSTKSZ, SS_DISABLE, SS_ONSTACK,
     SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
     SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGTERM,
 };

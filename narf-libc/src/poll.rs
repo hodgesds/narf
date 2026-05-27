@@ -389,6 +389,39 @@ pub unsafe extern "C" fn signalfd(
     r
 }
 
+/// `signalfd4(fd, mask, sizemask, flags)` — Linux explicit-size
+/// variant (the SYS_SIGNALFD wire ABI). musl/glibc both keep
+/// signalfd() as a wrapper that passes 8 for sizemask. We expose
+/// the explicit form so a consumer can call it directly.
+///
+/// Reference: musl `src/signal/signalfd.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn signalfd4(
+    fd:       c_int,
+    mask:     *const c_void,
+    sizemask: usize,
+    flags:    c_int,
+) -> c_int {
+    let r = narf_user_runtime::signalfd(
+        fd,
+        mask as *const u64,
+        sizemask,
+        flags as u32,
+    );
+    if r < 0 { crate::errno::set_errno(22); }
+    r
+}
+
+/// `eventfd2(initval, flags)` — Linux explicit-flags variant. The
+/// glibc `eventfd()` wrapper passes 0 for flags; eventfd2 lets the
+/// caller pass EFD_CLOEXEC / EFD_NONBLOCK / EFD_SEMAPHORE through.
+///
+/// Reference: musl `src/linux/eventfd.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn eventfd2(initval: u32, flags: c_int) -> c_int {
+    narf_user_runtime::eventfd(initval as u64, flags as u32)
+}
+
 // ── POSIX timers (timer_create / settime / gettime / delete) ────
 
 /// `timer_t` — opaque handle. Internally an index into a small

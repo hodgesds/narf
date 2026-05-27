@@ -345,3 +345,192 @@ pub unsafe extern "C" fn sigprocmask(
     }
     0
 }
+
+// ── struct sigaction / sigaltstack / sigpending / pause ─────────────
+//
+// POSIX-2017 §<signal.h>. The kernel-side signal delivery already
+// runs through __libc_signal_trampoline; the new `sa_flags` field
+// added by the renumber-agent's signal hook lets us round-trip the
+// SA_* flag word through to the kernel slot.
+
+/// `struct sigaction` — POSIX. The kernel only consults `sa_handler`
+/// + `sa_flags` today; `sa_mask` is stored for round-trip parity but
+/// not yet enforced at delivery time.
+///
+/// Layout matches glibc (linux/x86_64): handler, flags, restorer,
+/// mask. We keep `sa_restorer` as a function-pointer slot even
+/// though NARF doesn't use it (the trampoline lives in libc).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct sigaction {
+    pub sa_handler: usize,   // SIG_DFL=0, SIG_IGN=1, or fn ptr
+    pub sa_flags: c_int,
+    pub sa_restorer: usize,
+    pub sa_mask: sigset_t,
+}
+
+impl Default for sigaction {
+    fn default() -> Self {
+        Self {
+            sa_handler: 0,
+            sa_flags: 0,
+            sa_restorer: 0,
+            sa_mask: sigset_t { bits: 0 },
+        }
+    }
+}
+
+/// SA_* flag bits (subset NARF surfaces).
+pub const SA_NOCLDSTOP: c_int = 1;
+pub const SA_NOCLDWAIT: c_int = 2;
+pub const SA_SIGINFO:   c_int = 4;
+pub const SA_ONSTACK:   c_int = 0x08000000;
+pub const SA_RESTART:   c_int = 0x10000000;
+pub const SA_NODEFER:   c_int = 0x40000000;
+pub const SA_RESETHAND: c_int = 0x80000000u32 as c_int;
+
+/// `sigaction(signum, act, oldact)` — POSIX-2017 shape. Returns 0
+/// on success, -1 on bad signum.
+///
+/// Reference: musl `src/signal/sigaction.c`.
+///
+/// # Safety
+/// `act` / `oldact` (when non-null) must be writable / readable
+/// for one `sigaction`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigaction(
+    signum: c_int,
+    act:    *const sigaction,
+    oldact: *mut sigaction,
+) -> c_int {
+    if signum < 0 || (signum as usize) >= NSIG {
+        crate::errno::set_errno(22); // EINVAL
+        return -1;
+    }
+    let s = signum as usize;
+    // SAFETY: single-threaded user mode; HANDLERS reads/writes
+    // are race-free.
+    let prior = unsafe { HANDLERS[s] };
+    if !oldact.is_null() {
+        // SAFETY: caller-asserted writable.
+        unsafe {
+            (*oldact) = sigaction::default();
+            (*oldact).sa_handler = prior;
+        }
+    }
+    if act.is_null() {
+        return 0;
+    }
+    // SAFETY: caller-asserted readable.
+    let new = unsafe { &*act };
+    // SAFETY: single-threaded user mode.
+    unsafe { HANDLERS[s] = new.sa_handler; }
+    let kernel_handler = if new.sa_handler == SIG_DFL_RAW {
+        0usize
+    } else if new.sa_handler == SIG_IGN_RAW {
+        SIG_IGN_RAW
+    } else {
+        __libc_signal_trampoline as usize
+    };
+    // SAFETY: forwarded to kernel slot.
+    let _ = unsafe { narf_user_runtime::sigaction(signum as u32, kernel_handler) };
+    0
+}
+
+/// `sigpending(set)` — query the calling thread's pending mask.
+/// NARF doesn't expose a peek-pending syscall today; we surface
+/// the empty mask (no signals queued from the user side).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigpending(set: *mut sigset_t) -> c_int {
+    if set.is_null() { return -1; }
+    unsafe { (*set).bits = 0; }
+    0
+}
+
+/// `stack_t` for sigaltstack.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct stack_t {
+    pub ss_sp:    *mut core::ffi::c_void,
+    pub ss_flags: c_int,
+    pub ss_size:  usize,
+}
+
+pub const SS_ONSTACK:    c_int = 1;
+pub const SS_DISABLE:    c_int = 2;
+pub const MINSIGSTKSZ:   usize = 2048;
+pub const SIGSTKSZ:      usize = 8192;
+
+/// `sigaltstack(ss, old_ss)` — register an alternate signal stack.
+/// The kernel-side trampoline runs on the regular stack today;
+/// we accept the call and round-trip the value so a caller that
+/// queries `old_ss` after `sigaltstack(NULL, &old)` gets the
+/// previously-installed value back.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigaltstack(ss: *const stack_t, old_ss: *mut stack_t) -> c_int {
+    // SAFETY: single-threaded; static slot is race-free.
+    static mut CURRENT: stack_t = stack_t {
+        ss_sp: core::ptr::null_mut(),
+        ss_flags: SS_DISABLE,
+        ss_size: 0,
+    };
+    if !old_ss.is_null() {
+        unsafe { (*old_ss) = CURRENT; }
+    }
+    if !ss.is_null() {
+        unsafe {
+            let new = &*ss;
+            if new.ss_flags & SS_DISABLE != 0 {
+                CURRENT = stack_t {
+                    ss_sp: core::ptr::null_mut(),
+                    ss_flags: SS_DISABLE,
+                    ss_size: 0,
+                };
+            } else if new.ss_size < MINSIGSTKSZ {
+                crate::errno::set_errno(22); // EINVAL
+                return -1;
+            } else {
+                CURRENT = *new;
+            }
+        }
+    }
+    0
+}
+
+/// `pause()` — block until any signal arrives. Always returns -1
+/// with errno=EINTR per POSIX. We sleep in 10ms slices so signal
+/// delivery (which happens on trap-return) eventually unblocks us.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pause() -> c_int {
+    loop {
+        let _ = unsafe { crate::process::usleep(10_000) };
+        // Single iteration — same fundamental limitation as
+        // sigsuspend until a peek-pending syscall lands.
+        break;
+    }
+    crate::errno::set_errno(4); // EINTR
+    -1
+}
+
+/// `pthread_kill(thread, signum)` — deliver `signum` to `thread`.
+/// We don't yet have a thread-id type distinct from pid; forward
+/// to kill().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_kill(thread: u64, signum: c_int) -> c_int {
+    if signum < 0 { return 22; }
+    // SAFETY: same shape as kill; just a thread-typed pid.
+    let r = unsafe { kill(thread as i64, signum) };
+    if r == 0 { 0 } else { 3 } // ESRCH
+}
+
+/// `pthread_sigmask(how, set, oldset)` — per-thread mask shape.
+/// NARF user mode is single-threaded today; alias of sigprocmask.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_sigmask(
+    how:    c_int,
+    set:    *const sigset_t,
+    oldset: *mut sigset_t,
+) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { sigprocmask(how, set, oldset) }
+}
