@@ -518,6 +518,105 @@ impl FormatMjpeg {
     }
 }
 
+/// VS_FRAME_MJPEG (§3.1.2 of UVC 1.5 MJPEG Payload companion spec).
+///
+/// Identical structure to VS_FRAME_UNCOMPRESSED but tagged with
+/// subtype 0x07. Fixed 26 bytes + 4 × bFrameIntervalType (discrete)
+/// or 12 bytes (continuous, type = 0).
+///
+/// Linux equivalent: `uvc_parse_format()` in drivers/media/usb/uvc/uvc_driver.c
+/// handles both UNCOMPRESSED and MJPEG frame descriptors with the same
+/// 26-byte fixed-header parse (uvc_frame_desc layout).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameMjpeg {
+    pub frame_index: u8,
+    pub capabilities: u8,
+    pub width: u16,
+    pub height: u16,
+    pub min_bitrate: u32,
+    pub max_bitrate: u32,
+    pub max_video_frame_buffer_size: u32,
+    pub default_frame_interval: u32,
+    /// Discrete frame intervals in 100 ns units. Empty when
+    /// `continuous_min/max/step` is set (interval_type = 0).
+    pub frame_intervals: Vec<u32>,
+    pub continuous_min: Option<u32>,
+    pub continuous_max: Option<u32>,
+    pub continuous_step: Option<u32>,
+}
+
+impl FrameMjpeg {
+    pub fn parse(buf: &[u8]) -> Result<Self, UvcError> {
+        check_cs(buf, VS_FRAME_MJPEG)?;
+        if buf.len() < 26 {
+            return Err(UvcError::Short);
+        }
+        let frame_index = buf[3];
+        let capabilities = buf[4];
+        let width = u16::from_le_bytes([buf[5], buf[6]]);
+        let height = u16::from_le_bytes([buf[7], buf[8]]);
+        let min_bitrate = u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]);
+        let max_bitrate = u32::from_le_bytes([buf[13], buf[14], buf[15], buf[16]]);
+        let max_video_frame_buffer_size = u32::from_le_bytes([buf[17], buf[18], buf[19], buf[20]]);
+        let default_frame_interval = u32::from_le_bytes([buf[21], buf[22], buf[23], buf[24]]);
+        let interval_type = buf[25];
+        let body = &buf[26..];
+        if interval_type == 0 {
+            if body.len() < 12 {
+                return Err(UvcError::Truncated);
+            }
+            let cmin = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let cmax = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            let cstep = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            Ok(Self {
+                frame_index,
+                capabilities,
+                width,
+                height,
+                min_bitrate,
+                max_bitrate,
+                max_video_frame_buffer_size,
+                default_frame_interval,
+                frame_intervals: Vec::new(),
+                continuous_min: Some(cmin),
+                continuous_max: Some(cmax),
+                continuous_step: Some(cstep),
+            })
+        } else {
+            let need = (interval_type as usize) * 4;
+            if body.len() < need {
+                return Err(UvcError::Truncated);
+            }
+            let mut intervals = Vec::with_capacity(interval_type as usize);
+            for chunk in body[..need].chunks_exact(4) {
+                intervals.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            Ok(Self {
+                frame_index,
+                capabilities,
+                width,
+                height,
+                min_bitrate,
+                max_bitrate,
+                max_video_frame_buffer_size,
+                default_frame_interval,
+                frame_intervals: intervals,
+                continuous_min: None,
+                continuous_max: None,
+                continuous_step: None,
+            })
+        }
+    }
+
+    /// Convenience: convert a 100 ns interval to frames per second.
+    pub fn fps_from_interval(interval_100ns: u32) -> u32 {
+        if interval_100ns == 0 {
+            return 0;
+        }
+        10_000_000 / interval_100ns
+    }
+}
+
 // ── Class enumeration + bind ───────────────────────────────────────
 //
 // Minimal "is this a UVC device, and if so claim it" path. The
@@ -595,6 +694,21 @@ pub async fn try_bind_video_already_addressed(
         iso_in_dci,
     });
     Ok(idx)
+}
+
+/// Canonical public entry-point for UVC device bind (alias for
+/// [`try_bind_video_already_addressed`]). Spec-name per UVC §4.2:
+/// "already addressed" = slot is assigned, SET_CONFIGURATION not yet
+/// issued. Returns the device index into [`UVC_DEVICES`].
+///
+/// Stage-1 milestone: bind + descriptor parse succeeds, iso streaming
+/// not yet opened (requires SET_INTERFACE on the alt-setting).
+pub async fn try_bind_uvc_already_addressed(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, UvcError> {
+    try_bind_video_already_addressed(xhci_dev, slot_id, cfg).await
 }
 
 /// Scan the config blob for the first VideoStreaming interface's

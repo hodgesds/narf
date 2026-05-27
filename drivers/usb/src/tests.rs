@@ -890,6 +890,83 @@ fn smoke_uvc_format_mjpeg_decodes_default_frame_index() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_format_mjpeg_decodes_default_frame_index);
 
+fn smoke_uvc_frame_mjpeg_720p30_discrete() -> TestResult {
+    use crate::uvc::FrameMjpeg;
+    // VS_FRAME_MJPEG with 1 discrete interval (30 fps).
+    // bLength=30, CS_INTERFACE(0x24), subtype=0x07(VS_FRAME_MJPEG),
+    // bFrameIndex=1, capabilities=0, wWidth=1280 LE, wHeight=720 LE,
+    // dwMinBitRate, dwMaxBitRate, dwMaxVideoFrameBufferSize (MJPEG
+    // frames are compressed, size estimate = W*H),
+    // dwDefaultFrameInterval=333333 (30 fps, 100 ns units),
+    // bFrameIntervalType=1 (1 discrete entry),
+    // dwFrameInterval[0]=333333.
+    let mut buf = alloc::vec![30u8, 0x24, 0x07, 1, 0];
+    buf.extend_from_slice(&1280u16.to_le_bytes());
+    buf.extend_from_slice(&720u16.to_le_bytes());
+    buf.extend_from_slice(&40_000_000u32.to_le_bytes()); // min bitrate
+    buf.extend_from_slice(&40_000_000u32.to_le_bytes()); // max bitrate
+    buf.extend_from_slice(&(1280u32 * 720).to_le_bytes()); // max frame buf (MJPEG compressed)
+    buf.extend_from_slice(&333_333u32.to_le_bytes()); // default interval
+    buf.push(1); // 1 discrete interval
+    buf.extend_from_slice(&333_333u32.to_le_bytes());
+
+    let f = FrameMjpeg::parse(&buf).expect("parse FrameMjpeg");
+    if f.width != 1280 || f.height != 720 {
+        return TestResult::Fail("720p resolution lost");
+    }
+    if f.frame_index != 1 {
+        return TestResult::Fail("frame_index lost");
+    }
+    if f.frame_intervals != alloc::vec![333_333u32] {
+        return TestResult::Fail("frame interval list wrong");
+    }
+    if FrameMjpeg::fps_from_interval(f.frame_intervals[0]) != 30 {
+        return TestResult::Fail("fps_from_interval should yield 30");
+    }
+    if f.continuous_min.is_some() || f.continuous_max.is_some() {
+        return TestResult::Fail("continuous range must be None for discrete type");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_frame_mjpeg_720p30_discrete);
+
+fn smoke_uvc_frame_mjpeg_continuous_range() -> TestResult {
+    use crate::uvc::FrameMjpeg;
+    // VS_FRAME_MJPEG with continuous range (type = 0, 12 bytes after hdr).
+    // bLength=38, CS_INTERFACE(0x24), subtype=0x07, bFrameIndex=2,
+    // capabilities=0, wWidth=640, wHeight=480,
+    // min/max bitrate, max frame size, default=333333,
+    // bFrameIntervalType=0 (continuous),
+    // min=166667 (60 fps), max=1000000 (10 fps), step=166667.
+    let mut buf = alloc::vec![38u8, 0x24, 0x07, 2, 0];
+    buf.extend_from_slice(&640u16.to_le_bytes());
+    buf.extend_from_slice(&480u16.to_le_bytes());
+    buf.extend_from_slice(&10_000_000u32.to_le_bytes());
+    buf.extend_from_slice(&10_000_000u32.to_le_bytes());
+    buf.extend_from_slice(&(640u32 * 480).to_le_bytes());
+    buf.extend_from_slice(&333_333u32.to_le_bytes()); // default
+    buf.push(0); // continuous
+    buf.extend_from_slice(&166_667u32.to_le_bytes()); // min (60 fps)
+    buf.extend_from_slice(&1_000_000u32.to_le_bytes()); // max (10 fps)
+    buf.extend_from_slice(&166_667u32.to_le_bytes()); // step
+
+    let f = FrameMjpeg::parse(&buf).expect("parse continuous FrameMjpeg");
+    if f.continuous_min != Some(166_667) {
+        return TestResult::Fail("continuous_min lost");
+    }
+    if f.continuous_max != Some(1_000_000) {
+        return TestResult::Fail("continuous_max lost");
+    }
+    if f.continuous_step != Some(166_667) {
+        return TestResult::Fail("continuous_step lost");
+    }
+    if !f.frame_intervals.is_empty() {
+        return TestResult::Fail("discrete intervals must be empty for continuous type");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_frame_mjpeg_continuous_range);
+
 // ── UVC stream payload header smokes ───────────────────────────────
 
 fn smoke_uvc_stream_header_round_trip_no_optional_fields() -> TestResult {
