@@ -867,9 +867,11 @@ kernel_test_in!("abi", smoke_abi_submission_inline_words_constant);
 
 fn smoke_abi_file_op_kind_wire_pins() -> TestResult {
     use crate::FileOpKind;
-    // Numeric values mirror narf_userspace::Syscall discriminants;
-    // pin them so a future renumber of the syscall table breaks
-    // this test before it silently breaks the io_uring bridge.
+    // Closed enum — these are abi-internal io_uring-bridge tags, not
+    // syscall numbers (those are per-arch now; the kernel-side
+    // bridge translates). Pin the wire values so a careless edit to
+    // `FileOpKind` would break this test before silently breaking
+    // the bridge.
     let pairs = [
         (FileOpKind::Open, 110u8),
         (FileOpKind::Read, 111),

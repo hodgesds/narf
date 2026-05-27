@@ -181,9 +181,14 @@ impl<'a> CancelCtx<'a> {
 // Boot wires `narf_userspace::handlers::abi_file_op_bridge` here;
 // without it the dispatcher returns `InvalidOp`.
 
-/// Numeric tag of the syscall the bridge is being asked to perform.
-/// Mirrors `narf_userspace::Syscall::*` discriminants but kept
-/// arch-neutral here (abi/ can't depend on userspace).
+/// Numeric tag of the file op the bridge is being asked to
+/// perform. Closed enum — these are abi-internal wire tags for the
+/// io_uring-shaped dispatcher, not user-visible syscall numbers.
+/// (The kernel-side bridge translates each tag to the platform's
+/// `narf_userspace::Syscall::*.raw()` syscall number at dispatch.)
+/// abi/ stays arch-neutral and can't depend on userspace, so these
+/// stay pinned here rather than re-using the per-arch
+/// `LINUX_TABLE` numbers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileOpKind {
     Open = 110,
