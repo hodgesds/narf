@@ -23,12 +23,17 @@
 //! Acquire/Release so future MT support won't have to revisit the
 //! ordering questions.
 //!
-//! Coalescing: not implemented. Adjacent free chunks remain split.
-//! TODO: coalesce on free (requires either sorted-by-address
-//! insertion or a footer that lets us find the predecessor in O(1)).
-//! Without coalescing, churn that allocates many sizes and frees in
-//! a different order will fragment. Acceptable for the validate
-//! probe; revisit when a real workload shows up.
+//! Coalescing: implemented inline on `free`. Each `push_free` walks
+//! the free list once looking for an immediate neighbour (forward
+//! merge: list-node's start == freed-chunk's end; backward merge:
+//! list-node's end == freed-chunk's start) and absorbs it before
+//! parking the chunk on the head. After a single match the function
+//! tail-recurses so the just-grown chunk can pick up a second-step
+//! neighbour. O(n) per free in the worst case, n = free-list depth;
+//! acceptable here because n stays small under narf-libc's typical
+//! workload. Reference: musl's `mallocng/free.c` does the same
+//! direction-aware merge but uses an in-band footer for O(1) lookup;
+//! glibc's `__libc_free` walks via `unlink2()` on the bins.
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -109,74 +114,74 @@ fn page_round_up(n: usize) -> usize {
 /// `chunk` must point to a valid `Chunk` header with `size`
 /// initialised. The chunk must not already be on the free list.
 unsafe fn push_free(chunk: *mut Chunk) {
-    // SAFETY: invariant — chunk.size was set by caller.
-    let chunk_size = unsafe { (*chunk).size };
-    let chunk_end = (chunk as usize).wrapping_add(chunk_size);
+    // Iterative coalesce: each pass either grows `chunk` and rescans,
+    // or finds no neighbour and parks the chunk on the head. Loop is
+    // used in place of tail-recursion so a long chain of adjacent
+    // chunks doesn't stack-overflow on free.
+    let mut chunk = chunk;
+    'outer: loop {
+        // SAFETY: invariant — chunk.size was set by caller.
+        let chunk_size = unsafe { (*chunk).size };
+        let chunk_end = (chunk as usize).wrapping_add(chunk_size);
 
-    // First pass: scan for adjacent neighbours and coalesce in
-    // place.
-    let mut prev: *mut Chunk = ptr::null_mut();
-    let mut cur = FREE_LIST.load(Ordering::Acquire);
-    while !cur.is_null() {
-        // SAFETY: list invariant.
-        let cur_size = unsafe { (*cur).size };
-        // SAFETY: same.
-        let cur_next = unsafe { (*cur).next };
-        let cur_end = (cur as usize).wrapping_add(cur_size);
+        let mut prev: *mut Chunk = ptr::null_mut();
+        let mut cur = FREE_LIST.load(Ordering::Acquire);
+        while !cur.is_null() {
+            // SAFETY: list invariant — every list pointer is a valid Chunk.
+            let cur_size = unsafe { (*cur).size };
+            // SAFETY: same.
+            let cur_next = unsafe { (*cur).next };
+            let cur_end = (cur as usize).wrapping_add(cur_size);
 
-        if cur as usize == chunk_end {
-            // Forward merge: cur sits immediately after chunk.
-            // Unlink cur from the list, grow chunk by cur.size.
-            if prev.is_null() {
-                FREE_LIST.store(cur_next, Ordering::Release);
-            } else {
-                // SAFETY: prev was deref'd already.
-                unsafe { (*prev).next = cur_next; }
+            if cur as usize == chunk_end {
+                // Forward merge: cur sits immediately after chunk.
+                // Unlink cur from the list, grow chunk by cur.size.
+                if prev.is_null() {
+                    FREE_LIST.store(cur_next, Ordering::Release);
+                } else {
+                    // SAFETY: prev was deref'd already.
+                    unsafe { (*prev).next = cur_next; }
+                }
+                // SAFETY: chunk is caller-owned.
+                unsafe { (*chunk).size = chunk_size + cur_size; }
+                // Rescan: chunk grew and might now coalesce with
+                // another neighbour further along the list.
+                continue 'outer;
             }
-            // SAFETY: chunk is caller-owned.
-            unsafe { (*chunk).size = chunk_size + cur_size; }
-            // Restart the scan since chunk grew and might now
-            // coalesce with another neighbour.
-            return unsafe { push_free(chunk) };
+
+            if chunk as usize == cur_end {
+                // Backward merge: chunk sits immediately after cur.
+                // Grow cur by chunk.size — chunk's storage becomes
+                // part of cur. Detach cur from the list so the next
+                // pass treats it as the fresh chunk.
+                // SAFETY: cur was deref'd already.
+                unsafe { (*cur).size = cur_size + chunk_size; }
+                if prev.is_null() {
+                    FREE_LIST.store(cur_next, Ordering::Release);
+                } else {
+                    // SAFETY: prev was deref'd already.
+                    unsafe { (*prev).next = cur_next; }
+                }
+                chunk = cur;
+                continue 'outer;
+            }
+
+            prev = cur;
+            cur = cur_next;
         }
 
-        if chunk as usize == cur_end {
-            // Backward merge: chunk sits immediately after cur.
-            // Grow cur by chunk.size — chunk's storage becomes
-            // part of cur, no list mutation needed since cur is
-            // already on the list.
-            // SAFETY: cur was deref'd already.
-            unsafe { (*cur).size = cur_size + chunk_size; }
-            // Re-run push for the (now grown) cur to catch a
-            // second-step forward merge with a neighbour just
-            // after the original chunk.
-            // Detach cur first so push_free below sees a fresh
-            // chunk to slot back in.
-            if prev.is_null() {
-                FREE_LIST.store(cur_next, Ordering::Release);
-            } else {
-                // SAFETY: prev was deref'd already.
-                unsafe { (*prev).next = cur_next; }
+        // No coalescing match this pass — park `chunk` on the head.
+        // Single-threaded NARF user mode + atomic head for future MT.
+        loop {
+            let head = FREE_LIST.load(Ordering::Acquire);
+            // SAFETY: `chunk` is caller-owned; writing `next` is fine.
+            unsafe { (*chunk).next = head; }
+            if FREE_LIST
+                .compare_exchange(head, chunk, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
             }
-            return unsafe { push_free(cur) };
-        }
-
-        prev = cur;
-        cur = cur_next;
-    }
-
-    // No coalescing match — push `chunk` onto the head as before.
-    // Single-threaded: load → write next → store. The CAS loop is
-    // cheap insurance for a future MT runtime.
-    loop {
-        let head = FREE_LIST.load(Ordering::Acquire);
-        // SAFETY: `chunk` is caller-owned; writing `next` is fine.
-        unsafe { (*chunk).next = head; }
-        if FREE_LIST
-            .compare_exchange(head, chunk, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return;
         }
     }
 }
@@ -314,7 +319,9 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
 /// have come from a prior `malloc` / `realloc` / `calloc` returned
 /// by this allocator — passing arbitrary pointers is UB.
 ///
-/// Does NOT coalesce — see the file-level TODO.
+/// Coalescing: forward and backward merge with immediately-adjacent
+/// free chunks happens inline in [`push_free`], so a free/malloc
+/// churn over the same address span won't fragment the free list.
 ///
 /// # Safety
 /// `ptr` must be either null or a pointer previously returned from

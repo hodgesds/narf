@@ -77,11 +77,22 @@ pub struct FieldInfo {
     pub bit_length: u64,
     /// ACPI access-type: 0=AnyAcc 1=ByteAcc 2=WordAcc 3=DWordAcc 4=QWordAcc
     pub access_kind: u8,
+    /// ACPI UpdateRule (FieldFlags bits 5..=6):
+    ///   0 = Preserve     (read-modify-write, default)
+    ///   1 = WriteAsOnes  (unmodified bits = 1)
+    ///   2 = WriteAsZeros (unmodified bits = 0)
+    pub update_rule: u8,
     /// `Some` when this field belongs to an IndexField (audit
     /// #7 full impl). Reads write the field's byte offset to the
     /// index register, then read the data register; writes write
     /// the offset then the value.
     pub index_field: Option<IndexFieldRef>,
+    /// `Some` when this field belongs to a BankField. Each access
+    /// first writes `bank_value` to the bank-selector register so
+    /// that the parent region exposes the right bank window
+    /// (ACPI 6.5 §19.6.8). Without this pre-write reads/writes
+    /// land in whichever bank firmware happened to leave selected.
+    pub bank_field: Option<BankFieldRef>,
 }
 
 /// Index/data register pair for an IndexField member.
@@ -89,6 +100,19 @@ pub struct FieldInfo {
 pub struct IndexFieldRef {
     pub index_reg_path: String,
     pub data_reg_path: String,
+}
+
+/// Bank-selector reference for a BankField member. Mirrors
+/// ACPICA `ACPI_FIELD_INFO::Bank{RegisterObj,Value}` — before
+/// each access the interpreter writes `bank_value` to the named
+/// bank field to select the addressed bank window within the
+/// parent OpRegion. See ACPICA `exfldio.c:AcpiExSetupRegion`.
+#[derive(Clone, Debug)]
+pub struct BankFieldRef {
+    /// Absolute path of the bank-selector field.
+    pub bank_reg_path: String,
+    /// Constant value written before each access.
+    pub bank_value: u64,
 }
 
 /// Errors from `read_field`.
@@ -648,6 +672,14 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
         };
         return Ok(raw & mask);
     }
+    // BankField: select the right bank window before access.
+    // ACPICA `exfldio.c:AcpiExSetupRegion` writes the bank value
+    // to the bank-selector field whenever the field info carries
+    // a non-NULL BankRegisterObj. We mirror that here. Errors are
+    // ignored so a flaky bank-write doesn't break the read.
+    if let Some(ref bf) = fi.bank_field {
+        let _ = write_field(&bf.bank_reg_path, bf.bank_value);
+    }
     let region = region_for(&fi.region_path).ok_or(FieldAccessError::NoRegion)?;
     let access_bytes = access_unit_bytes(fi.access_kind);
     let access_bits = (access_bytes * 8) as u64;
@@ -696,6 +728,10 @@ pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
         write_field(&idx.index_reg_path, byte_off)?;
         return write_field(&idx.data_reg_path, value);
     }
+    // BankField pre-write — see read_field for rationale.
+    if let Some(ref bf) = fi.bank_field {
+        let _ = write_field(&bf.bank_reg_path, bf.bank_value);
+    }
     let region = region_for(&fi.region_path).ok_or(FieldAccessError::NoRegion)?;
     let access_bytes = access_unit_bytes(fi.access_kind);
     let access_bits = (access_bytes * 8) as u64;
@@ -726,14 +762,35 @@ pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
         };
         let slice_val = (masked_val >> slice_lo_bit.saturating_sub(bit_in_unit)) & ((1u64 << slice_width) - 1);
         let new_bits = (slice_val << in_unit_bit) & unit_mask;
-        // Update policy: AML field-flags update_rule (we don't
-        // currently parse it; default is Preserve = RMW). Always
-        // RMW unless writing the entire access unit.
+        // Apply UpdateRule to bits in this access unit that do NOT
+        // belong to the field. ACPI 6.5 §19.6.31 / ACPICA
+        // `exfldio.c:AcpiExFieldDatumIo`:
+        //   Preserve(0)     — keep existing bits (RMW).
+        //   WriteAsOnes(1)  — set non-field bits to 1.
+        //   WriteAsZeros(2) — set non-field bits to 0.
         let final_unit = if slice_width >= access_bits {
+            // Field fully covers the access unit — no RMW needed
+            // regardless of update rule.
             new_bits
         } else {
-            let cur = read_unit(&region, unit_byte_offset, access_bytes)?;
-            (cur & !unit_mask) | new_bits
+            match fi.update_rule {
+                // WriteAsOnes — non-field bits all 1.
+                1 => {
+                    let unit_max = if access_bits >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << access_bits) - 1
+                    };
+                    (!unit_mask & unit_max) | new_bits
+                }
+                // WriteAsZeros — non-field bits all 0.
+                2 => new_bits,
+                // Preserve (0) and any reserved value: RMW.
+                _ => {
+                    let cur = read_unit(&region, unit_byte_offset, access_bytes)?;
+                    (cur & !unit_mask) | new_bits
+                }
+            }
         };
         write_unit(&region, unit_byte_offset, access_bytes, final_unit)?;
     }
@@ -980,22 +1037,50 @@ pub(crate) fn parse_index_field_body(
     )
 }
 
-/// Same as parse_index_field_body but for BankField — currently
-/// no bank-switch driving (the bank value gets written to the
-/// bank register at registration time only). Most platforms use
-/// IndexField; BankField is rare. TODO: pre-write the bank
-/// register before each access to actually switch banks.
+/// Parse a BankField body. Format (ACPI 6.5 §20.2.5.2):
+///   PkgLength  RegionName  BankName  BankValue(TermArg)
+///   FieldFlags(u8)  FieldList…
+///
+/// Each inner field is registered with a [`BankFieldRef`] so
+/// `read_field` / `write_field` issue the bank-selector write
+/// before the actual access. Mirrors ACPICA's
+/// `AcpiDsCreateField` → `AcpiExPrepFieldValue` chain that
+/// stashes BankObj/BankValue alongside RegionObj.
 pub(crate) fn parse_bank_field_body(
     p: &mut Parser<'_>,
     parent: &str,
     pkg_end: usize,
 ) -> Result<(), AmlError> {
     let region_name = read_name_string(p, parent)?;
-    let _bank_reg = read_name_string(p, parent)?;
-    // skip bank-value TermArg via the eval helper.
-    let _ = crate::eval::skip_term_arg(p.buf, &mut p.pos);
+    let bank_name = read_name_string(p, parent)?;
+    // Decode the bank-value TermArg. Most DSDTs use a flat integer
+    // literal here; complex expressions decode to 0 (best-effort,
+    // matches existing OpRegion offset/length parsing).
+    let bank_value = {
+        let pre = p.pos;
+        let decoded = crate::eval::decode_value(&p.buf[pre..pkg_end])
+            .ok()
+            .map(|v| match v {
+                crate::Value::Integer(n) => n,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        let _ = crate::eval::skip_term_arg(p.buf, &mut p.pos);
+        decoded
+    };
     let region_path = full_path(region_name, parent);
-    parse_field_list(p, parent, &region_path, pkg_end, None)
+    let bank_reg_path = full_path(bank_name, parent);
+    parse_field_list_full(
+        p,
+        parent,
+        &region_path,
+        pkg_end,
+        None,
+        Some(BankFieldRef {
+            bank_reg_path,
+            bank_value,
+        }),
+    )
 }
 
 /// Backwards-compat shim — old callers used this name.
@@ -1014,10 +1099,22 @@ fn parse_field_list(
     pkg_end: usize,
     index_field: Option<IndexFieldRef>,
 ) -> Result<(), AmlError> {
+    parse_field_list_full(p, parent, region_path, pkg_end, index_field, None)
+}
+
+fn parse_field_list_full(
+    p: &mut Parser<'_>,
+    parent: &str,
+    region_path: &str,
+    pkg_end: usize,
+    index_field: Option<IndexFieldRef>,
+    bank_field: Option<BankFieldRef>,
+) -> Result<(), AmlError> {
     // FieldFlags: bits 0..=3 = access type, bit 4 = lock rule,
     //             bits 5..=6 = update rule.
     let flags = p.read_u8()?;
-    let access_kind = flags & 0x0F;
+    let mut access_kind = flags & 0x0F;
+    let update_rule = (flags >> 5) & 0x03;
 
     let mut bit_cursor: u64 = 0;
 
@@ -1065,7 +1162,9 @@ fn parse_field_list(
                     bit_offset: bit_cursor,
                     bit_length: bit_len,
                     access_kind,
+                    update_rule,
                     index_field: index_field.clone(),
+                    bank_field: bank_field.clone(),
                 });
                 bit_cursor += bit_len;
             }
@@ -1075,18 +1174,32 @@ fn parse_field_list(
                 bit_cursor += gap;
             }
             // AccessField: 0x01 + AccessType(1) + AccessAttrib(1).
+            // ACPI 6.5 §20.2.5.2: switches the access type for
+            // every subsequent NamedField in this list until
+            // another AccessField appears. AccessType byte
+            // layout: bits 0..=3 = access type, bits 6..=7 =
+            // update rule (we keep the list-level update_rule).
             0x01 => {
-                // Silently consume; access_kind update not implemented yet.
-                p.skip(2)?;
+                let access_byte = p.read_u8()?;
+                let _attrib = p.read_u8()?; // AccessAttrib (serial-bus buf size hints)
+                access_kind = access_byte & 0x0F;
             }
-            // ConnectField: 0x02 + NameString — skip.
+            // ConnectField: 0x02 + NameString.
+            // Names a connection-resource buffer (GPIO / I2C /
+            // SPI descriptor) for serial-bus / GPIO regions. Our
+            // SystemMemory / IO / EC / PciConfig paths don't
+            // consult it; serial-bus regions resolve the parent
+            // device's _CRS via `gsb_dispatch` directly. Consume
+            // the name to keep the cursor aligned.
             0x02 => {
-                // Skip the NameString operand: peek and skip past it.
                 let _ = read_name_string(p, parent)?;
             }
             // ExtendedAccessField: 0x03 + AccessType + AccessAttrib + AccessLength.
             0x03 => {
-                p.skip(3)?;
+                let access_byte = p.read_u8()?;
+                let _attrib = p.read_u8()?;
+                let _access_len = p.read_u8()?;
+                access_kind = access_byte & 0x0F;
             }
             // Anything else: bail gracefully.
             _ => {

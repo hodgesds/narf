@@ -947,6 +947,232 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_oregion_pci_config_resolves);
 
+fn smoke_aml_oregion_bank_field_writes_selector() -> TestResult {
+    // BankField test: declare a SystemMemory region over a u64
+    // backing buffer, a regular Field exposing the first byte as
+    // the bank-selector "BSEL", then a BankField(BREG, BSEL,
+    // 0x42) exposing the second byte as "BFLD". Reading or
+    // writing BFLD must pre-write 0x42 to BSEL — verified by
+    // inspecting the buffer after the access.
+    use alloc::boxed::Box;
+
+    crate::__reset_for_test();
+    crate::oregion::__reset_for_test();
+
+    let buf: Box<[u64; 1]> = Box::new([0u64]);
+    let addr = &buf[0] as *const u64 as u64;
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    // OpRegion(BREG, SystemMemory, addr, 8)
+    body.push(0x5B);
+    body.push(0x80);
+    body.extend_from_slice(b"BREG");
+    body.push(0x00); // SystemMemory
+    body.push(0x0E);
+    body.extend_from_slice(&addr.to_le_bytes());
+    body.push(0x0A);
+    body.push(0x08); // length 8
+
+    // Field(BREG, ByteAcc, NoLock, Preserve) { BSEL, 8 }
+    //   content = 4(NameSeg) + 1(flags) + 5(BSEL + pkglen) = 10
+    //   total   = 11 = 0x0B
+    body.push(0x5B);
+    body.push(0x81);
+    body.push(0x0B);
+    body.extend_from_slice(b"BREG");
+    body.push(0x01); // ByteAcc, NoLock, Preserve
+    body.extend_from_slice(b"BSEL");
+    body.push(0x08); // 8 bits
+
+    // BankField(BREG, BSEL, 0x42, ByteAcc, NoLock, Preserve) { 8 (gap), BFLD, 8 }
+    //   header = 4(BREG) + 4(BSEL) + 2(BytePrefix 0x42) + 1(flags) = 11
+    //   body   = 1(0x00 reserved) + 1(gap pkglen=8) + 5(BFLD + pkglen) = 7
+    //   content = 11 + 7 = 18; total = 19 = 0x13
+    body.push(0x5B);
+    body.push(0x87);
+    body.push(0x13);
+    body.extend_from_slice(b"BREG");
+    body.extend_from_slice(b"BSEL");
+    body.push(0x0A); // BytePrefix
+    body.push(0x42); // bank value
+    body.push(0x01); // ByteAcc, NoLock, Preserve
+    body.push(0x00); // ReservedField
+    body.push(0x08); // 8-bit gap (skip byte 0, which BSEL also lives in)
+    body.extend_from_slice(b"BFLD");
+    body.push(0x08); // 8 bits
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+
+    // Sanity: both fields registered.
+    if crate::oregion::field_for("\\BSEL").is_none() {
+        return TestResult::Fail("BSEL not registered");
+    }
+    let bfld = match crate::oregion::field_for("\\BFLD") {
+        Some(f) => f,
+        None => return TestResult::Fail("BFLD not registered"),
+    };
+    let bank_ref = match bfld.bank_field.as_ref() {
+        Some(b) => b,
+        None => return TestResult::Fail("BFLD missing BankFieldRef"),
+    };
+    if bank_ref.bank_value != 0x42 {
+        return TestResult::Fail("BFLD bank_value mismatch");
+    }
+    if bank_ref.bank_reg_path != "\\BSEL" {
+        return TestResult::Fail("BFLD bank_reg_path mismatch");
+    }
+
+    // Trigger a write through BFLD; the bank-selector pre-write
+    // should land 0x42 in byte 0 of the backing buffer.
+    if crate::oregion::write_field("\\BFLD", 0xA5).is_err() {
+        return TestResult::Fail("write_field BFLD returned Err");
+    }
+
+    let raw = buf[0];
+    drop(buf);
+
+    let sel_byte = (raw & 0xff) as u8;
+    let fld_byte = ((raw >> 8) & 0xff) as u8;
+
+    if sel_byte != 0x42 {
+        return TestResult::Fail("BSEL byte was not 0x42 after BFLD write");
+    }
+    if fld_byte != 0xA5 {
+        return TestResult::Fail("BFLD byte mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_oregion_bank_field_writes_selector);
+
+fn smoke_aml_oregion_update_rule_write_as_ones() -> TestResult {
+    // UpdateRule = WriteAsOnes (1): writing a 4-bit field in the
+    // middle of a byte should leave the other 4 bits set to 1.
+    // We declare a SystemMemory region holding 0x00, then a
+    // 4-bit field "UFLD" at bit offset 2 inside byte 0. After
+    // write_field(\UFLD, 0xA), byte 0 must read back as
+    //   bits 0-1: 1 1 (from WriteAsOnes)
+    //   bits 2-5: 0xA (1010)
+    //   bits 6-7: 1 1 (from WriteAsOnes)
+    // = 0b11_1010_11 = 0xEB.
+    use alloc::boxed::Box;
+
+    crate::__reset_for_test();
+    crate::oregion::__reset_for_test();
+
+    let buf: Box<[u64; 1]> = Box::new([0u64]);
+    let addr = &buf[0] as *const u64 as u64;
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // OpRegion(URGN, SystemMemory, addr, 8)
+    body.push(0x5B);
+    body.push(0x80);
+    body.extend_from_slice(b"URGN");
+    body.push(0x00);
+    body.push(0x0E);
+    body.extend_from_slice(&addr.to_le_bytes());
+    body.push(0x0A);
+    body.push(0x08);
+
+    // Field(URGN, ByteAcc, NoLock, WriteAsOnes) { ResField(2), UFLD, 4 }
+    // FieldFlags = ByteAcc(1) | (WriteAsOnes(1) << 5) = 0x21
+    // content = 4(URGN) + 1(flags) + 1(0x00 reserved) + 1(pkglen=2) + 5(UFLD + pkglen) = 12
+    // total   = 13 = 0x0D
+    body.push(0x5B);
+    body.push(0x81);
+    body.push(0x0D);
+    body.extend_from_slice(b"URGN");
+    body.push(0x21);
+    body.push(0x00);
+    body.push(0x02); // 2-bit gap
+    body.extend_from_slice(b"UFLD");
+    body.push(0x04); // 4 bits
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    let ufld = match crate::oregion::field_for("\\UFLD") {
+        Some(f) => f,
+        None => return TestResult::Fail("UFLD not registered"),
+    };
+    if ufld.update_rule != 1 {
+        return TestResult::Fail("UFLD update_rule not WriteAsOnes");
+    }
+
+    if crate::oregion::write_field("\\UFLD", 0xA).is_err() {
+        return TestResult::Fail("write_field UFLD returned Err");
+    }
+    let raw = buf[0];
+    drop(buf);
+    let byte0 = (raw & 0xff) as u8;
+    if byte0 != 0xEB {
+        return TestResult::Fail("UFLD WriteAsOnes byte0 mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_oregion_update_rule_write_as_ones);
+
+fn smoke_aml_oregion_update_rule_write_as_zeros() -> TestResult {
+    // UpdateRule = WriteAsZeros (2): writing a 4-bit field in
+    // the middle of a 0xFF byte should clear the surrounding
+    // bits to 0.
+    use alloc::boxed::Box;
+
+    crate::__reset_for_test();
+    crate::oregion::__reset_for_test();
+
+    let buf: Box<[u64; 1]> = Box::new([0xFFu64]);
+    let addr = &buf[0] as *const u64 as u64;
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0x5B);
+    body.push(0x80);
+    body.extend_from_slice(b"ZRGN");
+    body.push(0x00);
+    body.push(0x0E);
+    body.extend_from_slice(&addr.to_le_bytes());
+    body.push(0x0A);
+    body.push(0x08);
+
+    // Field(ZRGN, ByteAcc, NoLock, WriteAsZeros) { ResField(2), ZFLD, 4 }
+    // FieldFlags = 1 | (2<<5) = 0x41
+    body.push(0x5B);
+    body.push(0x81);
+    body.push(0x0D);
+    body.extend_from_slice(b"ZRGN");
+    body.push(0x41);
+    body.push(0x00);
+    body.push(0x02);
+    body.extend_from_slice(b"ZFLD");
+    body.push(0x04);
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    let zfld = match crate::oregion::field_for("\\ZFLD") {
+        Some(f) => f,
+        None => return TestResult::Fail("ZFLD not registered"),
+    };
+    if zfld.update_rule != 2 {
+        return TestResult::Fail("ZFLD update_rule not WriteAsZeros");
+    }
+
+    if crate::oregion::write_field("\\ZFLD", 0xA).is_err() {
+        return TestResult::Fail("write_field ZFLD returned Err");
+    }
+    let raw = buf[0];
+    drop(buf);
+    let byte0 = (raw & 0xff) as u8;
+    // Expected: only bits 2-5 set = 0xA shifted left 2 = 0b00_1010_00 = 0x28
+    if byte0 != 0x28 {
+        return TestResult::Fail("ZFLD WriteAsZeros byte0 mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_oregion_update_rule_write_as_zeros);
+
 // ── AML sync smoke tests ──────────────────────────────────────────────────────
 //
 // These tests add synthetic Mutex/Event/Method nodes to the global namespace
