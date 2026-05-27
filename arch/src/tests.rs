@@ -592,6 +592,41 @@ fn smoke_microcode_amd_resolve_misses_wrong_cpu() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/microcode", smoke_microcode_amd_resolve_misses_wrong_cpu);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_errata_table_has_patched_in_field() -> TestResult {
+    use crate::x86_64::errata;
+    // Every table entry carries a `patched_in` u32. At least one
+    // AMD entry should have a non-zero `patched_in` (Zenbleed) —
+    // verifies the field is wired through, not just declared.
+    let mut found = false;
+    for e in errata::TABLE {
+        if e.patched_in != 0 {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return TestResult::Fail("no errata entry carries a patched_in revision");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/errata", smoke_errata_table_has_patched_in_field);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_errata_entries_matching_current_cpu_runs() -> TestResult {
+    use crate::x86_64::errata;
+    // The query path should not crash; the result depends on host
+    // silicon, so just verify it runs + counts are within bounds.
+    let (_names, n) = errata::entries_matching_current_cpu();
+    if n > 8 {
+        return TestResult::Fail("entries count overflowed fixed-size buffer");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/errata", smoke_errata_entries_matching_current_cpu_runs);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_psci_version() -> TestResult {
     use crate::aarch64::psci;
@@ -2788,3 +2823,192 @@ fn smoke_amd_vi_irte_remap_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/amd_vi", smoke_amd_vi_irte_remap_round_trip);
+
+// ── Intel VT-d root / context / page-table / QI encoders ─────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_root_entry_layout() -> TestResult {
+    use crate::x86_64::vtd::{RootEntry, ROOT_PRESENT, ROOT_CTX_PTR_MASK};
+    let ctx_phys: u64 = 0x0000_0001_F000_0000;
+    let root = RootEntry::present(ctx_phys);
+    if !root.is_present() {
+        return TestResult::Fail("root entry not present");
+    }
+    if root.context_ptr() != ctx_phys {
+        return TestResult::Fail("context pointer round-trip mismatch");
+    }
+    if root.lo & ROOT_PRESENT == 0 {
+        return TestResult::Fail("present bit not at bit 0");
+    }
+    if root.lo & ROOT_CTX_PTR_MASK != ctx_phys & ROOT_CTX_PTR_MASK {
+        return TestResult::Fail("ctx ptr mask drift");
+    }
+    if root.hi != 0 {
+        return TestResult::Fail("legacy mode hi must be 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_root_entry_layout);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_context_entry_legacy() -> TestResult {
+    use crate::x86_64::vtd::{
+        ContextEntry, CTX_AW_48BIT, CTX_PRESENT, CTX_TT_LEGACY,
+    };
+    let slpt: u64 = 0x0000_0000_1234_5000;
+    let did: u16 = 0x77;
+    let ctx = ContextEntry::legacy(slpt, did, CTX_AW_48BIT);
+    if !ctx.is_present() {
+        return TestResult::Fail("context not present");
+    }
+    if ctx.translation_type() != CTX_TT_LEGACY {
+        return TestResult::Fail("TT != legacy");
+    }
+    if ctx.address_space_root() != slpt {
+        return TestResult::Fail("ASR round-trip mismatch");
+    }
+    if ctx.address_width() != CTX_AW_48BIT {
+        return TestResult::Fail("AGAW round-trip mismatch");
+    }
+    if ctx.domain_id() != did {
+        return TestResult::Fail("DID round-trip mismatch");
+    }
+    if ctx.lo & CTX_PRESENT == 0 {
+        return TestResult::Fail("present bit position drift");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_context_entry_legacy);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_sl_pte_leaf_perms() -> TestResult {
+    use crate::x86_64::vtd::{
+        sl_pte_addr, sl_pte_leaf, sl_pte_present, SL_PTE_READ, SL_PTE_WRITE,
+    };
+    let phys: u64 = 0x0000_0000_DEAD_B000;
+    let rw = sl_pte_leaf(phys, true, true);
+    if !sl_pte_present(rw) {
+        return TestResult::Fail("RW PTE not present");
+    }
+    if sl_pte_addr(rw) != phys {
+        return TestResult::Fail("addr round-trip mismatch");
+    }
+    if rw & (SL_PTE_READ | SL_PTE_WRITE) != (SL_PTE_READ | SL_PTE_WRITE) {
+        return TestResult::Fail("R+W bits not set");
+    }
+    let ro = sl_pte_leaf(phys, true, false);
+    if ro & SL_PTE_WRITE != 0 {
+        return TestResult::Fail("read-only PTE has W set");
+    }
+    let none = sl_pte_leaf(phys, false, false);
+    if sl_pte_present(none) {
+        return TestResult::Fail("no-perms PTE reports present");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_sl_pte_leaf_perms);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_iova_level_index() -> TestResult {
+    use crate::x86_64::vtd::iova_level_index;
+    // 4-level walk, 9-bit indices, 12-bit page offset:
+    //   IOVA = [ L4 9 | L3 9 | L2 9 | L1 9 | offset 12 ]
+    let iova: u64 = (0x123 << 39) | (0x055 << 30) | (0x0AA << 21) | (0x1FF << 12);
+    if iova_level_index(iova, 4) != 0x123 {
+        return TestResult::Fail("L4 index decode wrong");
+    }
+    if iova_level_index(iova, 3) != 0x055 {
+        return TestResult::Fail("L3 index decode wrong");
+    }
+    if iova_level_index(iova, 2) != 0x0AA {
+        return TestResult::Fail("L2 index decode wrong");
+    }
+    if iova_level_index(iova, 1) != 0x1FF {
+        return TestResult::Fail("L1 index decode wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_iova_level_index);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_qi_desc_iotlb_domain_inv() -> TestResult {
+    use crate::x86_64::vtd::{QiDesc, QI_GRAN_DOMAIN, QI_IOTLB_TYPE};
+    let desc = QiDesc::iotlb_inv(QI_GRAN_DOMAIN, 0x42, 0);
+    if desc.ty() != QI_IOTLB_TYPE {
+        return TestResult::Fail("desc type != IOTLB");
+    }
+    if desc.gran() != QI_GRAN_DOMAIN {
+        return TestResult::Fail("desc gran != domain-selective");
+    }
+    if desc.domain_id() != 0x42 {
+        return TestResult::Fail("desc DID round-trip mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_qi_desc_iotlb_domain_inv);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_qi_desc_cc_global_inv() -> TestResult {
+    use crate::x86_64::vtd::{QiDesc, QI_CC_TYPE, QI_GRAN_GLOBAL};
+    let desc = QiDesc::cc_inv(QI_GRAN_GLOBAL, 0, 0);
+    if desc.ty() != QI_CC_TYPE {
+        return TestResult::Fail("desc type != CC");
+    }
+    if desc.gran() != QI_GRAN_GLOBAL {
+        return TestResult::Fail("desc gran != global");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_qi_desc_cc_global_inv);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_iqa_register_encoding() -> TestResult {
+    use crate::x86_64::vtd::{decode_iqa, encode_iqa};
+    let base: u64 = 0x0000_0001_5000_0000;
+    let reg = encode_iqa(base, 2, false);
+    let (got_base, got_qs, got_wide) = decode_iqa(reg);
+    if got_base != base {
+        return TestResult::Fail("IQA base round-trip mismatch");
+    }
+    if got_qs != 2 {
+        return TestResult::Fail("IQA QS round-trip mismatch");
+    }
+    if got_wide {
+        return TestResult::Fail("IQA DW should be 0 for 128-bit descs");
+    }
+    let wide_reg = encode_iqa(base, 0, true);
+    let (_, _, w2) = decode_iqa(wide_reg);
+    if !w2 {
+        return TestResult::Fail("IQA DW bit not set when wide=true");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_iqa_register_encoding);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_context_passthrough() -> TestResult {
+    use crate::x86_64::vtd::{ContextEntry, CTX_TT_PASSTHROUGH};
+    let ctx = ContextEntry::passthrough(0x9);
+    if !ctx.is_present() {
+        return TestResult::Fail("passthrough not present");
+    }
+    if ctx.translation_type() != CTX_TT_PASSTHROUGH {
+        return TestResult::Fail("TT != passthrough");
+    }
+    if ctx.address_space_root() != 0 {
+        return TestResult::Fail("passthrough ASR must be 0");
+    }
+    if ctx.domain_id() != 0x9 {
+        return TestResult::Fail("DID round-trip mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_context_passthrough);

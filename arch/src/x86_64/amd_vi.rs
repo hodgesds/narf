@@ -1,6 +1,11 @@
-//! AMD-Vi IOMMU register layout + caps decode.
+//! AMD-Vi IOMMU register layout + caps decode + DTE / command-ring
+//! encoders.
 //!
-//! Spec: `arch/specification/iommu-interconnect.md` §2.
+//! Spec: `arch/specification/iommu-interconnect.md` §2; AMD IOMMU
+//! Specification rev 3.10 (Pub 48882). Bit positions cross-checked
+//! against Linux `drivers/iommu/amd/amd_iommu_types.h` and
+//! `drivers/iommu/amd/iommu.c` (GPL-2.0-or-later — see project
+//! relicense note 2026-05-20).
 
 #![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
@@ -13,6 +18,10 @@ pub const AMD_VI_EVT_LOG_BASE: usize = 0x10;
 pub const AMD_VI_CTRL: usize = 0x18;
 pub const AMD_VI_EXT_FEATURES: usize = 0x30;
 pub const AMD_VI_PPR_LOG_BASE: usize = 0x40;
+pub const AMD_VI_CMD_HEAD: usize = 0x2000;
+pub const AMD_VI_CMD_TAIL: usize = 0x2008;
+pub const AMD_VI_EVT_HEAD: usize = 0x2010;
+pub const AMD_VI_EVT_TAIL: usize = 0x2018;
 
 pub const CTRL_IOMMUEN: u64 = 1 << 0;
 pub const CTRL_HTTUNEN: u64 = 1 << 1;
@@ -29,6 +38,301 @@ pub const EFR_NXSUP: u64 = 1 << 4;
 pub const EFR_GTSUP: u64 = 1 << 5;
 pub const EFR_IASUP: u64 = 1 << 7;
 pub const EFR_GASUP: u64 = 1 << 8;
+
+// ── Device Table Entry layout (AMD IOMMU spec §2.2.2.1) ──────────
+//
+// A DTE is a 256-bit (32-byte) packed structure; the device table
+// is a contiguous array indexed by `BDF` (bus<<8 | dev<<3 | fn).
+// We split it into four 64-bit lanes here to match Linux's
+// `struct dev_table_entry { u64 data[4]; }`.
+//
+// data[0] layout (low → high):
+//   [0]      V        Valid — entry is in use.
+//   [1]      TV       Translation Valid — page-table root is live.
+//   [2..7]   reserved
+//   [7..8]   HAD      Host Access Dirty.
+//   [9..12]  MODE     Page-table walk depth (0 = passthrough, 4 = 4-level).
+//   [12..52] HOST_PT  Page-table root, page-aligned.
+//   [52]     PPR      PPR enabled.
+//   [54]     GIOV     Guest I/O virtualisation.
+//   [55]     GV       Guest valid (SVM).
+//   [56..58] GLX      Guest CR3 levels.
+//   [61]     IR       Read access permitted.
+//   [62]     IW       Write access permitted.
+//
+// data[1] layout:
+//   [0..16]  DomainID
+//   [32..42] reserved flag bits (IOTLB enable, etc.)
+//
+// data[2]: IRTE pointer + IV (IRTE-Valid) at bit 0; bits 6..52 are
+// the IRTE root, bit-aligned per DTE_IRQ_PHYS_ADDR_MASK.
+//
+// data[3]: reserved for nested-paging / extended use cases.
+
+pub const DTE_V: u64 = 1 << 0;
+pub const DTE_TV: u64 = 1 << 1;
+pub const DTE_HAD: u64 = 0b11 << 7;
+pub const DTE_MODE_SHIFT: u32 = 9;
+pub const DTE_MODE_MASK: u64 = 0b111 << DTE_MODE_SHIFT;
+pub const DTE_HOST_PT_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+pub const DTE_PPR: u64 = 1 << 52;
+pub const DTE_GIOV: u64 = 1 << 54;
+pub const DTE_GV: u64 = 1 << 55;
+pub const DTE_GLX_SHIFT: u32 = 56;
+pub const DTE_GLX_MASK: u64 = 0b11 << DTE_GLX_SHIFT;
+pub const DTE_IR: u64 = 1 << 61;
+pub const DTE_IW: u64 = 1 << 62;
+pub const DTE_DOMID_MASK: u64 = 0xFFFF;
+
+// data[2] flags
+pub const DTE_IV: u64 = 1 << 0; // IRTE valid
+pub const DTE_IRTE_PTR_MASK: u64 = 0x000F_FFFF_FFFF_FFC0; // [6..52]
+
+// Page-table walk-mode encodings (§2.2.3 Table 6).
+pub const DTE_MODE_PASSTHROUGH: u64 = 0;
+pub const DTE_MODE_1_LEVEL: u64 = 1;
+pub const DTE_MODE_2_LEVEL: u64 = 2;
+pub const DTE_MODE_3_LEVEL: u64 = 3;
+pub const DTE_MODE_4_LEVEL: u64 = 4;
+pub const DTE_MODE_5_LEVEL: u64 = 5;
+pub const DTE_MODE_6_LEVEL: u64 = 6;
+
+/// Permission bits used by [`iommu_map_perms`].
+pub const PERM_READ: u8 = 0b01;
+pub const PERM_WRITE: u8 = 0b10;
+
+/// AMD-Vi Device-Table Entry. 32 bytes laid out as four little-
+/// endian u64 lanes; Linux uses the same shape (`struct
+/// dev_table_entry`). The IOMMU walks this every DMA so the layout
+/// is rigidly architectural — every field is bit-precise per
+/// §2.2.2.1.
+#[repr(C, align(32))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceTableEntry {
+    pub data: [u64; 4],
+}
+
+impl DeviceTableEntry {
+    /// Build a fully-valid DTE pointing at a 4-level host page-table
+    /// root with `domain_id`, the given perms (`PERM_READ`,
+    /// `PERM_WRITE`), and a 4-level walk.
+    ///
+    /// Mirrors the `set_dte_entry` path Linux runs after attaching a
+    /// dmar_domain to a device. The page-table root must be
+    /// page-aligned (4 KiB) and < 2^52.
+    pub const fn identity(domain_id: u16, pt_root: u64, perms: u8) -> Self {
+        let mut data = [0u64; 4];
+        let mut d0: u64 = DTE_V | DTE_TV;
+        d0 |= DTE_MODE_4_LEVEL << DTE_MODE_SHIFT;
+        d0 |= pt_root & DTE_HOST_PT_MASK;
+        if perms & PERM_READ != 0 {
+            d0 |= DTE_IR;
+        }
+        if perms & PERM_WRITE != 0 {
+            d0 |= DTE_IW;
+        }
+        data[0] = d0;
+        data[1] = (domain_id as u64) & DTE_DOMID_MASK;
+        DeviceTableEntry { data }
+    }
+
+    /// Passthrough DTE — no translation, no page-table walk. Used
+    /// when the device hangs off the identity domain (current
+    /// `IommuMode::Identity`).
+    pub const fn passthrough(domain_id: u16) -> Self {
+        let mut data = [0u64; 4];
+        data[0] = DTE_V | (DTE_MODE_PASSTHROUGH << DTE_MODE_SHIFT) | DTE_IR | DTE_IW;
+        data[1] = (domain_id as u64) & DTE_DOMID_MASK;
+        DeviceTableEntry { data }
+    }
+
+    /// Attach an interrupt-remapping table to this DTE. `irte_root`
+    /// must be 128-byte aligned per §2.2.5.1.
+    pub const fn with_irte(mut self, irte_root: u64) -> Self {
+        self.data[2] = (irte_root & DTE_IRTE_PTR_MASK) | DTE_IV;
+        self
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        (self.data[0] & DTE_V) != 0
+    }
+
+    pub const fn page_table_root(&self) -> u64 {
+        self.data[0] & DTE_HOST_PT_MASK
+    }
+
+    pub const fn domain_id(&self) -> u16 {
+        (self.data[1] & DTE_DOMID_MASK) as u16
+    }
+
+    pub const fn walk_mode(&self) -> u64 {
+        (self.data[0] & DTE_MODE_MASK) >> DTE_MODE_SHIFT
+    }
+}
+
+// ── Command-ring encoders (AMD IOMMU spec §2.4) ──────────────────
+//
+// Each command is 128 bits — Linux models it as `u32 data[4]`. The
+// opcode lives in `data[1] >> 28` (`CMD_SET_TYPE`). We use `u32`
+// lanes here for the same reason: the spec talks bit-positions in
+// dword-relative terms.
+
+pub const CMD_COMPL_WAIT: u32 = 0x01;
+pub const CMD_INV_DEV_ENTRY: u32 = 0x02;
+pub const CMD_INV_IOMMU_PAGES: u32 = 0x03;
+pub const CMD_INV_IOTLB_PAGES: u32 = 0x04;
+pub const CMD_INV_IRT: u32 = 0x05;
+pub const CMD_COMPLETE_PPR: u32 = 0x07;
+pub const CMD_INV_ALL: u32 = 0x08;
+
+pub const CMD_COMPL_WAIT_STORE_MASK: u32 = 0x01;
+pub const CMD_COMPL_WAIT_INT_MASK: u32 = 0x02;
+pub const CMD_INV_IOMMU_PAGES_SIZE_MASK: u32 = 0x01;
+pub const CMD_INV_IOMMU_PAGES_PDE_MASK: u32 = 0x02;
+pub const CMD_INV_ALL_PAGES_ADDRESS: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+
+/// IOMMU command — 16 bytes, four u32 lanes per the AMD spec.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IommuCmd {
+    pub data: [u32; 4],
+}
+
+impl IommuCmd {
+    const fn empty() -> Self {
+        IommuCmd { data: [0; 4] }
+    }
+
+    #[inline]
+    const fn set_type(mut self, op: u32) -> Self {
+        self.data[1] |= op << 28;
+        self
+    }
+
+    /// Build a `COMPLETION_WAIT` command. Linux's
+    /// `build_completion_wait` — writes a 64-bit token to `sem_paddr`
+    /// when the IOMMU drains the queue.
+    pub const fn completion_wait(sem_paddr: u64, token: u64) -> Self {
+        let mut cmd = IommuCmd::empty();
+        cmd.data[0] = (sem_paddr as u32) | CMD_COMPL_WAIT_STORE_MASK;
+        cmd.data[1] = (sem_paddr >> 32) as u32;
+        cmd.data[2] = token as u32;
+        cmd.data[3] = (token >> 32) as u32;
+        cmd.set_type(CMD_COMPL_WAIT)
+    }
+
+    /// Build a `INVALIDATE_DEVTAB_ENTRY` for the given BDF. Mirrors
+    /// Linux's `build_inv_dte`.
+    pub const fn invalidate_devtab(bdf: u16) -> Self {
+        let mut cmd = IommuCmd::empty();
+        cmd.data[0] = bdf as u32;
+        cmd.set_type(CMD_INV_DEV_ENTRY)
+    }
+
+    /// Build a `INVALIDATE_IOMMU_PAGES` command. `address` is the
+    /// IOVA range start; when `all` is set, the entire address
+    /// space for `domain_id` is flushed.
+    pub const fn invalidate_pages(domain_id: u16, address: u64, all: bool) -> Self {
+        let mut cmd = IommuCmd::empty();
+        let inv_addr = if all {
+            CMD_INV_ALL_PAGES_ADDRESS
+        } else {
+            address & 0xFFFF_FFFF_FFFF_F000
+        };
+        cmd.data[1] = domain_id as u32;
+        cmd.data[2] = (inv_addr as u32) | CMD_INV_IOMMU_PAGES_PDE_MASK;
+        if all {
+            cmd.data[2] |= CMD_INV_IOMMU_PAGES_SIZE_MASK;
+        }
+        cmd.data[3] = (inv_addr >> 32) as u32;
+        cmd.set_type(CMD_INV_IOMMU_PAGES)
+    }
+
+    /// `INVALIDATE_ALL` — single-command IOTLB + DTE flush.
+    pub const fn invalidate_all() -> Self {
+        IommuCmd::empty().set_type(CMD_INV_ALL)
+    }
+
+    #[inline]
+    pub const fn opcode(&self) -> u32 {
+        self.data[1] >> 28
+    }
+}
+
+// ── Interrupt Remapping Table Entry (§2.2.5) ─────────────────────
+//
+// A 64-bit IRTE remaps a single MSI vector. Linux's `struct irte`
+// for AMD; we encode the basic Remap variant (1024-entry table)
+// here — the 4 KiB variant adds an extra dword that we don't need
+// for boot bring-up.
+//
+// Layout (low → high):
+//   [0]      Valid
+//   [1]      NoMapEn
+//   [2..5]   IntCtl  (00=APIC, 01=fixed, 10=remap)
+//   [5]      SuppressIOPF
+//   [6..11]  Destination Mode + APIC
+//   [16..24] Vector
+//   [24..32] Destination ID (xAPIC)
+pub const IRTE_VALID: u64 = 1 << 0;
+pub const IRTE_NO_MAP: u64 = 1 << 1;
+pub const IRTE_REMAP_INTCTL: u64 = 2 << 60;
+pub const IRTE_REMAP_INTCTL_MASK: u64 = 0x3 << 60;
+
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Irte {
+    pub raw: u64,
+}
+
+impl Irte {
+    /// Build a remap IRTE that retargets an interrupt at `vector` to
+    /// CPU `dest_id` with the IntCtl=remap encoding.
+    pub const fn remap(vector: u8, dest_id: u8) -> Self {
+        let raw = IRTE_VALID
+            | IRTE_REMAP_INTCTL
+            | ((vector as u64) << 16)
+            | ((dest_id as u64) << 24);
+        Irte { raw }
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        (self.raw & IRTE_VALID) != 0
+    }
+
+    pub const fn vector(&self) -> u8 {
+        ((self.raw >> 16) & 0xFF) as u8
+    }
+
+    pub const fn dest_id(&self) -> u8 {
+        ((self.raw >> 24) & 0xFF) as u8
+    }
+}
+
+// ── Device-table size encoding ───────────────────────────────────
+//
+// MMIO DEV_TABLE_BASE register at offset 0x00 packs:
+//   [0..12]   Size = (entries / 256) - 1, i.e. dev_table_size / 4K - 1
+//   [12..52]  Physical address (page-aligned)
+//
+// The standard table size is 64 KiB × 4 = 256 KiB → 8192 DTEs ×
+// 32 B; that covers the entire 16-bit BDF space.
+
+/// Encode the value to write into the AMD-Vi `DEV_TAB_BASE` MMIO
+/// register: `(phys | size_field)` where `size_field` is
+/// `(table_size_bytes >> 12) - 1`.
+pub const fn encode_dev_table_base(phys: u64, table_size_bytes: u64) -> u64 {
+    let size_field = (table_size_bytes >> 12).saturating_sub(1);
+    (phys & 0x000F_FFFF_FFFF_F000) | (size_field & 0x1FF)
+}
+
+/// Inverse — extract page-aligned base and table-size-in-bytes.
+pub const fn decode_dev_table_base(reg: u64) -> (u64, u64) {
+    let phys = reg & 0x000F_FFFF_FFFF_F000;
+    let size_field = reg & 0x1FF;
+    let bytes = (size_field + 1) << 12;
+    (phys, bytes)
+}
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AmdViCaps {
