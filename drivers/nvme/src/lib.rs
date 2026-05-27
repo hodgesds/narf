@@ -1061,6 +1061,237 @@ impl Controller {
         Ok(granted as usize)
     }
 
+    // ── Admin: Get Features ───────────────────────────────────────────
+
+    /// Get Features (§5.11, opcode 0x0A). Returns `CQE.cmd_specific`
+    /// on success, which carries the current feature value.
+    ///
+    /// `sel`: 0=Current, 1=Default, 2=Saved, 3=Supported Caps.
+    ///
+    /// Linux ref: drivers/nvme/host/admin-cmd.c:nvme_get_features
+    pub fn get_features(&mut self, fid: u8, sel: u8) -> Result<u32, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = AdminOpcode::GetFeatures as u32;
+        sqe.cdw10 = ((sel as u32 & 0x07) << 8) | (fid as u32);
+        // SAFETY: admin queue + BAR live; no host-DMA buffer required.
+        let cqe = unsafe { admin.submit(bar0, sqe)? };
+        Ok(cqe.cmd_specific)
+    }
+
+    // ── Admin: Set Features (power management, async event config) ────
+
+    /// Set Features — Power Management (FID 0x02, §5.31).
+    /// `ps` = desired power state (0 = full performance).
+    /// Returns `CQE.cmd_specific` on success.
+    pub fn set_features_power_management(&mut self, ps: u8) -> Result<u32, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = AdminOpcode::SetFeatures as u32;
+        sqe.cdw10 = admin::FID_POWER_MANAGEMENT as u32;
+        sqe.cdw11 = ps as u32 & 0x1F;
+        // SAFETY: same.
+        let cqe = unsafe { admin.submit(bar0, sqe)? };
+        Ok(cqe.cmd_specific)
+    }
+
+    /// Set Features — Async Event Configuration (FID 0x0B, §5.31).
+    /// `aec` is the event enable bitmap per spec table 295.
+    pub fn set_features_async_event_config(&mut self, aec: u32) -> Result<u32, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = AdminOpcode::SetFeatures as u32;
+        sqe.cdw10 = admin::FID_ASYNC_EVENT_CONFIG as u32;
+        sqe.cdw11 = aec;
+        // SAFETY: same.
+        let cqe = unsafe { admin.submit(bar0, sqe)? };
+        Ok(cqe.cmd_specific)
+    }
+
+    // ── Admin: Identify Namespace List + enumeration ──────────────────
+
+    /// Identify Active Namespace List (CNS=0x02). Fills up to 1024
+    /// 32-bit NSIDs into `out`, returning the count placed. NSIDs are
+    /// sorted ascending; a zero entry marks the end of the list.
+    ///
+    /// Callers drive enumeration by calling repeatedly with
+    /// `start_nsid = last_nsid_returned` until the list is shorter
+    /// than 1024 entries or the last entry is 0.
+    ///
+    /// Linux ref: drivers/nvme/host/core.c:nvme_identify_ns_list
+    pub fn identify_ns_list(
+        &mut self,
+        start_nsid: u32,
+        out: &mut [u32],
+    ) -> Result<usize, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = AdminOpcode::Identify as u32;
+        sqe.nsid = start_nsid;
+        sqe.prp1 = buf.phys_addr().raw();
+        sqe.cdw10 = admin::CNS_NAMESPACE_LIST as u32;
+        // SAFETY: admin queue + BAR live; buf is a fresh DMA page.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
+        // Parse: up to 1024 NSIDs, LE u32 each. A zero terminates.
+        let base = buf.phys_addr().raw() as *const u32;
+        let cap = out.len().min(1024);
+        let mut n = 0;
+        for i in 0..cap {
+            // SAFETY: 4 KiB / 4 bytes = 1024 entries, all in-bounds.
+            let nsid = unsafe { core::ptr::read_volatile(base.add(i)) };
+            if nsid == 0 {
+                break;
+            }
+            out[n] = nsid;
+            n += 1;
+        }
+        drop(buf);
+        Ok(n)
+    }
+
+    /// Enumerate all active namespaces: call `identify_ns_list` in a
+    /// loop collecting every page of up to 1024 NSIDs, returning the
+    /// full NSID vector. Caps at 1024 total NSIDs (adequate for any
+    /// real consumer / enterprise drive; production drives rarely
+    /// exceed 32).
+    ///
+    /// Linux ref: drivers/nvme/host/core.c:nvme_scan_ns_list
+    pub fn enumerate_namespaces(&mut self) -> Result<Vec<u32>, NvmeError> {
+        let mut nsids: Vec<u32> = Vec::new();
+        let mut start: u32 = 0;
+        let mut page_buf = [0u32; 1024];
+        loop {
+            let n = self.identify_ns_list(start, &mut page_buf)?;
+            if n == 0 {
+                break;
+            }
+            nsids.extend_from_slice(&page_buf[..n]);
+            if n < 1024 || nsids.len() >= 1024 {
+                break;
+            }
+            start = *nsids.last().unwrap_or(&0);
+        }
+        Ok(nsids)
+    }
+
+    // ── Admin: Identify Namespace (typed) ─────────────────────────────
+
+    /// Identify Namespace (CNS=0x00) and decode the full typed
+    /// `IdentifyNamespaceData`. Supplements the minimal
+    /// `(nsze, lba_bytes)` path in `bring_up`.
+    ///
+    /// Linux ref: drivers/nvme/host/core.c:nvme_identify_ns
+    pub fn identify_namespace_typed(
+        &mut self,
+        nsid: u32,
+    ) -> Result<admin::IdentifyNamespaceData, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = AdminOpcode::Identify as u32;
+        sqe.nsid = nsid;
+        sqe.prp1 = buf.phys_addr().raw();
+        sqe.cdw10 = admin::CNS_NAMESPACE as u32;
+        // SAFETY: admin queue + BAR live.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
+        // Read the 4 KiB response into a slice and parse.
+        let base = buf.phys_addr().raw() as *const u8;
+        let mut raw = alloc::vec![0u8; 4096];
+        // SAFETY: 4 KiB DMA buffer, identity-mapped.
+        for i in 0..4096usize {
+            raw[i] = unsafe { core::ptr::read_volatile(base.add(i)) };
+        }
+        drop(buf);
+        admin::IdentifyNamespaceData::parse(&raw)
+            .ok_or(NvmeError::CommandFailed { cmd: 0x06, status: 0 })
+    }
+
+    // ── Admin: Async Event Request (AER) ──────────────────────────────
+
+    /// Post `count` Async Event Request commands into the admin queue.
+    /// Per NVMe Base Spec 2.0c §5.2 the host should maintain at least
+    /// AERL+1 in-flight AER slots (spec recommends ≥4). This call
+    /// posts up to `count` AERs in a single burst; completions will
+    /// arrive asynchronously — the caller is responsible for draining
+    /// the admin CQ and reposting after each completion.
+    ///
+    /// In NARF's polled-admin-queue model the AER slots are posted
+    /// then immediately retrieved with `wait_cqe`; this is a smoke-
+    /// testable structural path — production use lives in an async
+    /// task that parks on `wait_for_irq` once MSI-X is wired.
+    ///
+    /// Linux ref: drivers/nvme/host/core.c:nvme_queue_async_events
+    pub fn post_aer_commands(&mut self, count: u8) -> Result<(), NvmeError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+
+        // ADMIN_Q_DEPTH is 4; posting more AERs than free slots would
+        // deadlock the polled path. Cap at depth - 1 so there's always
+        // room for a non-AER admin command to slip through.
+        let cap = (ADMIN_Q_DEPTH - 1).min(count as u16) as u8;
+        for _ in 0..cap {
+            let mut sqe = Sqe::zero();
+            sqe.cdw0 = AdminOpcode::AsyncEventRequest as u32;
+            // Ring the doorbell but do NOT wait for completion here —
+            // AERs complete only when an async event fires. We post
+            // the SQE into the ring directly, advancing sq_tail, and
+            // let the controller hold the slot open.
+            let cid = admin.next_cid;
+            admin.next_cid = admin.next_cid.wrapping_add(1);
+            sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+            // SAFETY: admin queue is page-aligned; sq_tail < depth.
+            unsafe {
+                write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
+            }
+            admin.sq_tail = (admin.sq_tail + 1) % admin.depth;
+            // SAFETY: identity-mapped MMIO doorbell.
+            unsafe {
+                bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
+            }
+        }
+        Ok(())
+    }
+
+    // ── Admin: Format NVM ─────────────────────────────────────────────
+
+    /// Format NVM (§5.4, opcode 0x80). Reformats `nsid` with LBA format
+    /// index `lbaf` and secure-erase setting `ses` (use
+    /// `admin::SES_NO_SECURE_ERASE` for normal format).
+    ///
+    /// This is a long-running admin command — NVMe controllers can
+    /// take seconds to minutes to complete a format. The polled-CQ
+    /// path has a 30 s wall-clock deadline (generous for QEMU).
+    ///
+    /// Linux ref: drivers/nvme/host/ioctl.c:nvme_format_ns
+    pub fn format_nvm(&mut self, nsid: u32, lbaf: u8, ses: u8) -> Result<(), NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = admin::OPC_FORMAT_NVM as u32;
+        sqe.nsid = nsid;
+        sqe.cdw10 = ((ses as u32) & 0x07) << 9 | ((lbaf as u32) & 0x0F);
+        // SAFETY: admin queue + BAR live; Format NVM has no host-DMA.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
+        Ok(())
+    }
+
     /// Number of live I/O queue pairs. Zero before any of the
     /// `create_io_queue*` paths run.
     #[inline]

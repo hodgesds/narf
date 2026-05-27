@@ -128,6 +128,12 @@ impl AdminSqe {
         }
     }
 
+    /// Fluent builder helper: set the command ID.
+    pub fn with_cid(mut self, cid: u16) -> Self {
+        self.cid = cid;
+        self
+    }
+
     /// Encode CDW0 from the (opcode, fuse, psdt, cid) field set per
     /// §3.3.3 Figure 79: CDW0 is `cid<<16 | psdt<<14 | fuse<<8 | opcode`.
     pub fn cdw0(self) -> u32 {
@@ -290,6 +296,356 @@ pub fn set_features_number_of_queues(cid: u16, nsqr: u16, ncqr: u16) -> AdminSqe
         cdw10: FID_NUMBER_OF_QUEUES as u32,
         cdw11,
         ..Default::default()
+    }
+}
+
+/// Identify Namespace List (CNS=0x02). Returns up to 1024 NSIDs
+/// (4 KiB buffer, 4 bytes per NSID) of active namespaces with NSID
+/// > `start_nsid`. Per NVMe Base Spec 2.0c §5.17 (table 143):
+///   - CNS=0x02 → Active Namespace ID list
+///   - NSID field carries the start-NSID filter (returns NSIDs > filter)
+pub fn identify_namespace_list(cid: u16, start_nsid: u32, prp1: u64) -> AdminSqe {
+    AdminSqe {
+        opcode: OPC_IDENTIFY,
+        cid,
+        nsid: start_nsid,
+        prp1,
+        cdw10: CNS_NAMESPACE_LIST as u32,
+        ..Default::default()
+    }
+}
+
+/// Get Features (§5.11, opcode 0x0A). Returns the current value of
+/// feature `fid`. `sel` selects which setting to return:
+///   - 0x00 = Current (what the controller is using)
+///   - 0x01 = Default (factory default)
+///   - 0x02 = Saved
+///   - 0x03 = Supported Capabilities
+///
+/// Linux ref: drivers/nvme/host/admin-cmd.c:nvme_get_features
+pub fn get_features(cid: u16, fid: u8, sel: u8) -> AdminSqe {
+    let cdw10 = ((sel as u32 & 0x07) << 8) | (fid as u32);
+    AdminSqe {
+        opcode: OPC_GET_FEATURES,
+        cid,
+        cdw10,
+        ..Default::default()
+    }
+}
+
+/// Set Features — Power Management (FID 0x02, §5.31). `ps` is the
+/// desired power state (0 = full performance). `wh` is the workload
+/// hint (0 = no hint; values 1..7 are vendor-specific).
+///
+/// Linux ref: drivers/nvme/host/admin-cmd.c, nvme_set_features
+pub fn set_features_power_management(cid: u16, ps: u8, wh: u8) -> AdminSqe {
+    let cdw11 = ((wh as u32 & 0x07) << 5) | (ps as u32 & 0x1F);
+    AdminSqe {
+        opcode: OPC_SET_FEATURES,
+        cid,
+        cdw10: FID_POWER_MANAGEMENT as u32,
+        cdw11,
+        ..Default::default()
+    }
+}
+
+/// Set Features — Async Event Configuration (FID 0x0B, §5.31).
+/// `aec` is the AEC bitmap (NVMe 2.0c §5.31 table table 295):
+///   - bit 0  = SMART / Health Critical Warnings
+///   - bit 1  = Namespace Attribute Changed
+///   - bit 2  = Firmware Activation Starting
+///   - bit 3  = Telemetry Log Changed
+///   - bit 5  = Endurance Group Event Aggregation
+///
+/// Linux ref: drivers/nvme/host/core.c:nvme_configure_aen
+pub fn set_features_async_event_config(cid: u16, aec: u32) -> AdminSqe {
+    AdminSqe {
+        opcode: OPC_SET_FEATURES,
+        cid,
+        cdw10: FID_ASYNC_EVENT_CONFIG as u32,
+        cdw11: aec,
+        ..Default::default()
+    }
+}
+
+/// Async Event Request (§5.2, opcode 0x0C). No CDW fields beyond the
+/// standard header. Submission posts an outstanding request slot; the
+/// completion arrives only when an async event fires. Per spec
+/// recommendation, the host keeps ≥4 outstanding AERs at all times.
+///
+/// Completion CDW0 bits (from CQE.cmd_specific):
+///   - bits[2:0]  = Async Event Type
+///                  0x00 = Error status
+///                  0x01 = SMART / Health status
+///                  0x02 = Notice
+///                  0x06 = NVM Command Set specific
+///   - bits[15:8] = Async Event Information (event-type specific)
+///   - bits[31:24] = Log Page Identifier (which log to read for detail)
+///
+/// Linux ref: drivers/nvme/host/core.c:nvme_async_event
+pub fn async_event_request(cid: u16) -> AdminSqe {
+    AdminSqe::new(OPC_ASYNC_EVENT_REQUEST).with_cid(cid)
+}
+
+// ── Identify Controller typed decoder ──────────────────────────────
+
+/// Typed, fully-decoded IDENTIFY CONTROLLER data structure.
+///
+/// Layout per NVMe Base Spec 2.0c §5.17.2.1 (table 111).
+/// Only fields needed for bring-up + diagnostics are named here;
+/// the 4 KiB buffer is not kept — callers decode into this struct
+/// then drop the DMA buffer.
+///
+/// Linux ref: drivers/nvme/host/nvme.h:nvme_id_ctrl
+#[derive(Clone, Debug)]
+pub struct IdentifyControllerData {
+    /// Vendor ID (bytes 0..1).
+    pub vid: u16,
+    /// Subsystem Vendor ID (bytes 2..3).
+    pub ssvid: u16,
+    /// Serial Number, ASCII space-padded, 20 bytes (bytes 4..23).
+    pub sn: [u8; 20],
+    /// Model Number, ASCII space-padded, 40 bytes (bytes 24..63).
+    pub mn: [u8; 40],
+    /// Firmware Revision, ASCII space-padded, 8 bytes (bytes 64..71).
+    pub fr: [u8; 8],
+    /// Maximum Data Transfer Size — log2 pages, 0 = no limit (byte 77).
+    pub mdts: u8,
+    /// Controller ID (bytes 78..79).
+    pub cntlid: u16,
+    /// Optional Admin Command Support bitmap (bytes 260..261).
+    /// Bit 0 = Security Send/Receive; bit 1 = Format NVM; bit 2 = FW Activate.
+    pub oacs: u16,
+    /// Abort Command Limit (byte 262): max concurrent aborts - 1.
+    pub acl: u8,
+    /// Asynchronous Event Request Limit (byte 263): max in-flight AERs - 1.
+    pub aerl: u8,
+    /// Firmware Updates (byte 264): slot count + activation sans reset.
+    pub frmw: u8,
+    /// Number of Power States Supported (byte 295): zero-based count.
+    pub npss: u8,
+    /// SQ Entry Size (byte 512): bits[3:0]=min, bits[7:4]=max (log2).
+    pub sqes: u8,
+    /// CQ Entry Size (byte 513).
+    pub cqes: u8,
+    /// Maximum Outstanding Commands (bytes 514..515).
+    pub maxcmd: u16,
+    /// Number of Namespaces (bytes 516..519).
+    pub nn: u32,
+}
+
+impl IdentifyControllerData {
+    /// Decode a 4-KiB IDENTIFY CONTROLLER buffer.
+    ///
+    /// Returns `None` if `buf` is shorter than the minimum 520 bytes
+    /// needed to reach the `nn` field at offset 516.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 520 {
+            return None;
+        }
+        let mut sn = [0u8; 20];
+        let mut mn = [0u8; 40];
+        let mut fr = [0u8; 8];
+        sn.copy_from_slice(&buf[4..24]);
+        mn.copy_from_slice(&buf[24..64]);
+        fr.copy_from_slice(&buf[64..72]);
+        Some(Self {
+            vid: u16::from_le_bytes([buf[0], buf[1]]),
+            ssvid: u16::from_le_bytes([buf[2], buf[3]]),
+            sn,
+            mn,
+            fr,
+            mdts: buf[77],
+            cntlid: u16::from_le_bytes([buf[78], buf[79]]),
+            oacs: u16::from_le_bytes([buf[260], buf[261]]),
+            acl: buf[262],
+            aerl: buf[263],
+            frmw: buf[264],
+            npss: buf[295],
+            sqes: buf[512],
+            cqes: buf[513],
+            maxcmd: u16::from_le_bytes([buf[514], buf[515]]),
+            nn: u32::from_le_bytes([buf[516], buf[517], buf[518], buf[519]]),
+        })
+    }
+
+    /// True if the controller advertises Format NVM support (OACS bit 1).
+    pub fn supports_format_nvm(&self) -> bool {
+        (self.oacs & (1 << 1)) != 0
+    }
+}
+
+/// Encode a minimal IDENTIFY CONTROLLER response buffer for testing.
+/// Fields not present in `IdentifyControllerData` remain zero.
+pub fn encode_identify_controller(d: &IdentifyControllerData) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; 4096];
+    buf[0..2].copy_from_slice(&d.vid.to_le_bytes());
+    buf[2..4].copy_from_slice(&d.ssvid.to_le_bytes());
+    buf[4..24].copy_from_slice(&d.sn);
+    buf[24..64].copy_from_slice(&d.mn);
+    buf[64..72].copy_from_slice(&d.fr);
+    buf[77] = d.mdts;
+    buf[78..80].copy_from_slice(&d.cntlid.to_le_bytes());
+    buf[260..262].copy_from_slice(&d.oacs.to_le_bytes());
+    buf[262] = d.acl;
+    buf[263] = d.aerl;
+    buf[264] = d.frmw;
+    buf[295] = d.npss;
+    buf[512] = d.sqes;
+    buf[513] = d.cqes;
+    buf[514..516].copy_from_slice(&d.maxcmd.to_le_bytes());
+    buf[516..520].copy_from_slice(&d.nn.to_le_bytes());
+    buf
+}
+
+// ── Identify Namespace typed decoder ───────────────────────────────
+
+/// One LBA Format entry from the IDENTIFY NAMESPACE LBAF table.
+///
+/// Each entry is 4 bytes at offset `128 + index * 4`.
+/// Layout per NVMe Base Spec 2.0c §5.17.2.1 table 114:
+///   - bits[15:0]  = LBADS metadata size in bytes (MS)
+///   - bits[23:16] = LBADS: log2(LBA data size in bytes)
+///   - bits[25:24] = Relative Performance (0=best)
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LbaFormat {
+    /// Metadata size in bytes for this format (often 0).
+    pub ms: u16,
+    /// log2 of the LBA data size in bytes; data_size = 1 << lbads.
+    pub lbads: u8,
+    /// Relative performance: 0=best, 3=degraded.
+    pub rp: u8,
+}
+
+impl LbaFormat {
+    /// LBA data size in bytes for this format.
+    pub fn lba_bytes(&self) -> u32 {
+        if self.lbads == 0 {
+            512
+        } else {
+            1u32 << self.lbads
+        }
+    }
+}
+
+/// Typed IDENTIFY NAMESPACE data structure.
+///
+/// Layout per NVMe Base Spec 2.0c §5.17.2.1 table 114.
+///
+/// Linux ref: drivers/nvme/host/nvme.h:nvme_id_ns
+#[derive(Clone, Debug, Default)]
+pub struct IdentifyNamespaceData {
+    /// Namespace Size: total capacity in LBAs (bytes 0..7).
+    pub nsze: u64,
+    /// Namespace Capacity: max usable LBAs at once (bytes 8..15).
+    pub ncap: u64,
+    /// Namespace Utilization: currently allocated LBAs (bytes 16..23).
+    pub nuse: u64,
+    /// Namespace Features (byte 24): bit 0 = thin provisioning.
+    pub nsfeat: u8,
+    /// Number of LBA Formats (byte 25): number of LBAF entries - 1.
+    pub nlbaf: u8,
+    /// Formatted LBA Size (byte 26): bits[3:0] = current LBAF index.
+    pub flbas: u8,
+    /// Metadata Capabilities (byte 27).
+    pub mc: u8,
+    /// Data Protection Capabilities (byte 28).
+    pub dpc: u8,
+    /// Data Protection Type Settings (byte 29).
+    pub dps: u8,
+    /// LBA Format table, up to 16 entries (bytes 128..191).
+    pub lbaf: [LbaFormat; 16],
+}
+
+impl IdentifyNamespaceData {
+    /// Decode a 4-KiB IDENTIFY NAMESPACE buffer.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 192 {
+            return None;
+        }
+        let nsze = u64::from_le_bytes(buf[0..8].try_into().ok()?);
+        let ncap = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+        let nuse = u64::from_le_bytes(buf[16..24].try_into().ok()?);
+        let nlbaf = buf[25];
+        let count = (nlbaf as usize + 1).min(16);
+        let mut lbaf = [LbaFormat::default(); 16];
+        for i in 0..count {
+            let off = 128 + i * 4;
+            let ms = u16::from_le_bytes([buf[off], buf[off + 1]]);
+            let lbads = buf[off + 2];
+            let rp = buf[off + 3] & 0x03;
+            lbaf[i] = LbaFormat { ms, lbads, rp };
+        }
+        Some(Self {
+            nsze,
+            ncap,
+            nuse,
+            nsfeat: buf[24],
+            nlbaf,
+            flbas: buf[26],
+            mc: buf[27],
+            dpc: buf[28],
+            dps: buf[29],
+            lbaf,
+        })
+    }
+
+    /// The currently-active LBA format index (FLBAS bits[3:0]).
+    pub fn active_lbaf_index(&self) -> usize {
+        (self.flbas & 0x0F) as usize
+    }
+
+    /// LBA size in bytes for the currently-active format.
+    pub fn lba_bytes(&self) -> u32 {
+        self.lbaf[self.active_lbaf_index()].lba_bytes()
+    }
+}
+
+/// Encode a minimal IDENTIFY NAMESPACE response buffer for testing.
+pub fn encode_identify_namespace(d: &IdentifyNamespaceData) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; 4096];
+    buf[0..8].copy_from_slice(&d.nsze.to_le_bytes());
+    buf[8..16].copy_from_slice(&d.ncap.to_le_bytes());
+    buf[16..24].copy_from_slice(&d.nuse.to_le_bytes());
+    buf[24] = d.nsfeat;
+    buf[25] = d.nlbaf;
+    buf[26] = d.flbas;
+    buf[27] = d.mc;
+    buf[28] = d.dpc;
+    buf[29] = d.dps;
+    for i in 0..16 {
+        let off = 128 + i * 4;
+        buf[off..off + 2].copy_from_slice(&d.lbaf[i].ms.to_le_bytes());
+        buf[off + 2] = d.lbaf[i].lbads;
+        buf[off + 3] = d.lbaf[i].rp & 0x03;
+    }
+    buf
+}
+
+/// Decoded Async Event completion CDW0 (from CQE.cmd_specific).
+///
+/// Layout per NVMe Base Spec 2.0c §5.2 table 80:
+///   - bits[2:0]   = Async Event Type
+///   - bits[15:8]  = Async Event Information
+///   - bits[31:24] = Log Page Identifier
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AsyncEventCompletion {
+    /// Event type: 0=error, 1=SMART/health, 2=notice, 6=NVM-cmd-set.
+    pub event_type: u8,
+    /// Event-type–specific information byte.
+    pub event_info: u8,
+    /// Log Page Identifier — caller should issue Get Log Page for detail.
+    pub log_page_id: u8,
+}
+
+impl AsyncEventCompletion {
+    /// Decode from `CQE.cmd_specific`.
+    pub fn from_cdw0(cdw0: u32) -> Self {
+        Self {
+            event_type: (cdw0 & 0x07) as u8,
+            event_info: ((cdw0 >> 8) & 0xFF) as u8,
+            log_page_id: ((cdw0 >> 24) & 0xFF) as u8,
+        }
     }
 }
 
