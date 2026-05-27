@@ -265,6 +265,266 @@ pub fn aer_msi_number(root_err_sts: u32) -> u8 {
     ((root_err_sts & ROOT_ERR_STS_MSI_NUMBER) >> 27) as u8
 }
 
+// ── AER mask configuration ────────────────────────────────────────
+//
+// Linux drivers/pci/pcie/aer.c aer_enable_rootport() masks Advisory
+// Non-Fatal (bit 13 of CE Mask) because it fires constantly on
+// some hardware and carries no actionable information. Everything
+// else is unmasked so the root port captures it for logging.
+//
+// Default severe UE bits are: DLP | Surprise Down |
+// Flow Control Protocol Error | Receiver Overflow | Malformed TLP |
+// Uncorrectable Internal Error — per PCIe spec §7.8.4.4 reset values.
+
+/// Default correctable-error mask: Advisory Non-Fatal suppressed,
+/// all others reported. PCIe §7.8.4.6.
+pub const DEFAULT_CE_MASK: u32 = ce::ADVISORY_NON_FATAL;
+
+/// Default uncorrectable-error mask: all zero (report everything).
+pub const DEFAULT_UE_MASK: u32 = 0;
+
+/// Default uncorrectable-error severity: the spec-mandated set of
+/// link-fatal errors. Adapts from PCIe 6.0 §7.8.4.4 Table 7-75.
+pub const DEFAULT_UE_SEVERITY: u32 = ue::DATA_LINK_PROTOCOL_ERROR
+    | ue::SURPRISE_DOWN_ERROR
+    | ue::FLOW_CONTROL_PROTOCOL_ERROR
+    | ue::RECEIVER_OVERFLOW
+    | ue::MALFORMED_TLP
+    | ue::UNCORRECTABLE_INTERNAL_ERROR;
+
+/// Apply the default AER masks + severity to a device's AER cap.
+///
+/// Writes the correctable mask, uncorrectable mask, and uncorrectable
+/// severity registers in one sequential burst. Returns `false` if the
+/// device has no AER capability (skip silently); `true` if programmed.
+///
+/// # Safety
+/// `cfg_phys` must be a live, 4 KiB-mapped PCIe config page;
+/// `aer_off` must be the offset returned by `find_aer_cap_offset`.
+/// Caller owns the device exclusively during the write window.
+pub unsafe fn configure_aer_defaults(cfg_phys: u64, aer_off: u16) {
+    // SAFETY: caller-asserted.
+    unsafe {
+        // Correctable Mask — suppress Advisory Non-Fatal.
+        core::ptr::write_volatile(
+            (cfg_phys + aer_off as u64 + regs::CORRECTABLE_ERROR_MASK as u64) as *mut u32,
+            DEFAULT_CE_MASK,
+        );
+        // Uncorrectable Mask — report all.
+        core::ptr::write_volatile(
+            (cfg_phys + aer_off as u64 + regs::UNCORRECTABLE_ERROR_MASK as u64) as *mut u32,
+            DEFAULT_UE_MASK,
+        );
+        // Severity — fatal classification per spec defaults.
+        core::ptr::write_volatile(
+            (cfg_phys + aer_off as u64 + regs::UNCORRECTABLE_ERROR_SEVERITY as u64) as *mut u32,
+            DEFAULT_UE_SEVERITY,
+        );
+    }
+}
+
+/// Enable root-error reporting on a Root Port's AER capability.
+/// Sets all three reporting-enable bits in Root Error Command so
+/// the root port forwards correctable, non-fatal, and fatal AER
+/// messages to the BIOS / OS.
+///
+/// # Safety
+/// Same as `configure_aer_defaults`.
+pub unsafe fn enable_root_error_reporting(cfg_phys: u64, aer_off: u16) {
+    // SAFETY: caller-asserted.
+    unsafe {
+        let cmd = root_cmd::CORRECTABLE_ERROR_REPORTING_ENABLE
+            | root_cmd::NON_FATAL_ERROR_REPORTING_ENABLE
+            | root_cmd::FATAL_ERROR_REPORTING_ENABLE;
+        core::ptr::write_volatile(
+            (cfg_phys + aer_off as u64 + regs::ROOT_ERROR_COMMAND as u64) as *mut u32,
+            cmd,
+        );
+    }
+}
+
+// ── Root Error Status aggregation ────────────────────────────────
+//
+// A root port's Root Error Status (AER cap +0x30, PCIe §7.8.4.9)
+// aggregates error messages from downstream. The register is RW1C:
+// reading the value and writing the same value back clears the bits.
+// The Error Source Identification register (AER cap +0x34) holds the
+// Requester ID of the first offending device.
+
+/// Decoded Root Error Status snapshot. Suitable for passing to an
+/// AER dispatcher or logging path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RootErrorStatus {
+    /// Raw Root Error Status register value (before clearing).
+    pub raw: u32,
+    /// Correctable error(s) received.
+    pub corr_received: bool,
+    /// Multiple correctable errors received.
+    pub multi_corr: bool,
+    /// Fatal or non-fatal error message received.
+    pub fatal_nonfatal_received: bool,
+    /// Multiple fatal/non-fatal errors received.
+    pub multi_fatal_nonfatal: bool,
+    /// The first uncorrectable error was Fatal (vs Non-Fatal).
+    pub first_ue_fatal: bool,
+    /// Specific non-fatal error messages pending.
+    pub nonfatal_pending: bool,
+    /// Specific fatal error messages pending.
+    pub fatal_pending: bool,
+    /// AER MSI interrupt vector number (bits[31:27]).
+    pub aer_int_number: u8,
+}
+
+impl RootErrorStatus {
+    /// Decode a raw Root Error Status DWORD.
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            raw,
+            corr_received: raw & root_sts::ERR_COR_RECEIVED != 0,
+            multi_corr: raw & root_sts::MULTIPLE_ERR_COR_RECEIVED != 0,
+            fatal_nonfatal_received: raw & root_sts::ERR_FATAL_NONFATAL_RECEIVED != 0,
+            multi_fatal_nonfatal: raw & root_sts::MULTIPLE_ERR_FATAL_NONFATAL_RECEIVED != 0,
+            first_ue_fatal: raw & root_sts::FIRST_UNCORRECTABLE_FATAL != 0,
+            nonfatal_pending: raw & root_sts::NON_FATAL_ERROR_MESSAGES_RECEIVED != 0,
+            fatal_pending: raw & root_sts::FATAL_ERROR_MESSAGES_RECEIVED != 0,
+            aer_int_number: ((raw & root_sts::AER_INT_NUMBER_MASK) >> 27) as u8,
+        }
+    }
+
+    /// `true` if any error is pending (correctable, non-fatal, or fatal).
+    pub fn any_error(&self) -> bool {
+        self.corr_received || self.fatal_nonfatal_received
+    }
+
+    /// Classify the highest-priority pending error as `UeSeverity`.
+    /// Fatal > NonFatal > Correctable > None.
+    pub fn ue_severity(&self) -> UeSeverity {
+        if self.fatal_nonfatal_received && self.first_ue_fatal {
+            UeSeverity::Severe
+        } else if self.fatal_nonfatal_received {
+            UeSeverity::NonFatal
+        } else if self.corr_received {
+            UeSeverity::None // correctable — not an UE
+        } else {
+            UeSeverity::None
+        }
+    }
+}
+
+/// Read Root Error Status and clear it (RW1C). Returns the snapshot
+/// before the clear. If the root port has no AER cap this returns
+/// `None` (safe to call on any device — the walker will skip it).
+///
+/// Reference: Linux drivers/pci/pcie/aer.c get_e_source().
+///
+/// # Safety
+/// `cfg_phys` live 4 KiB PCIe config; `aer_off` from walker.
+pub unsafe fn read_and_clear_root_error_status(cfg_phys: u64, aer_off: u16) -> RootErrorStatus {
+    // SAFETY: caller assertion.
+    let raw = unsafe {
+        core::ptr::read_volatile(
+            (cfg_phys + aer_off as u64 + regs::ROOT_ERROR_STATUS as u64) as *const u32,
+        )
+    };
+    // Clear by writing back the latched bits (RW1C).
+    if raw != 0 {
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(
+                (cfg_phys + aer_off as u64 + regs::ROOT_ERROR_STATUS as u64) as *mut u32,
+                raw,
+            );
+        }
+    }
+    RootErrorStatus::decode(raw)
+}
+
+// ── DPC capability detection ──────────────────────────────────────
+//
+// DPC (Downstream Port Containment, PCIe §7.9.14) is an extended
+// capability (ID 0x001D). When DPC triggers it freezes the link
+// below the port — preventing AER storms from propagating upstream.
+// Detection here is read-only; actuation (re-enabling the link after
+// recovery) is a follow-up.
+//
+// Reference: Linux drivers/pci/pcie/dpc.c dpc_probe().
+
+/// DPC Extended Capability ID.
+pub const DPC_CAP_ID: u16 = 0x001D;
+
+/// Minimal decoded DPC capability — just the features the port
+/// advertises. Written once during port init; consulted by the AER
+/// ISR to decide whether a link containment notification is expected.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DpcCapability {
+    /// Raw DPC Capability register (16-bit, at DPC cap +0x04).
+    pub raw: u16,
+    /// Whether RP Extensions are supported (RP PIO logging).
+    pub rp_extensions: bool,
+    /// Whether Poisoned TLP Egress Blocking is supported.
+    pub ptlp_egress_blocking: bool,
+    /// Whether Software Triggering is supported.
+    pub sw_triggering: bool,
+    /// DL_Active ERR_COR Signaling supported.
+    pub dl_active_err_cor: bool,
+    /// DPC Interrupt Message Number (5-bit MSI vector, bits[4:0]).
+    pub int_msg_number: u8,
+}
+
+impl DpcCapability {
+    /// Decode the DPC Capability register (PCIe 6.0 §7.9.14.2).
+    pub fn decode(raw: u16) -> Self {
+        Self {
+            raw,
+            rp_extensions: raw & (1 << 5) != 0,
+            ptlp_egress_blocking: raw & (1 << 6) != 0,
+            sw_triggering: raw & (1 << 7) != 0,
+            dl_active_err_cor: raw & (1 << 12) != 0,
+            int_msg_number: (raw & 0x1F) as u8,
+        }
+    }
+}
+
+/// Walk the device's extended cap list to find the DPC capability.
+/// Returns `None` for devices without DPC (most endpoints).
+///
+/// Detection only — no register writes. Suitable for the AER init
+/// path and diagnostic dumps.
+///
+/// # Safety
+/// `cfg_phys` must point at a live 4 KiB PCIe config page.
+pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
+    // Walk the extended cap list from 0x100.
+    let mut off: u16 = 0x100;
+    for _ in 0..256 {
+        if off == 0 || off < 0x100 || off >= 0x1000 {
+            return None;
+        }
+        // SAFETY: caller-asserted; offset bounded.
+        let hdr = unsafe {
+            core::ptr::read_volatile((cfg_phys + off as u64) as *const u32)
+        };
+        if hdr == 0 || hdr == 0xFFFF_FFFF {
+            return None;
+        }
+        let cap_id = (hdr & 0xFFFF) as u16;
+        let next = ((hdr >> 20) & 0xFFF) as u16;
+        if cap_id == DPC_CAP_ID {
+            // DPC Capability register is at cap_off + 0x04 (16-bit).
+            // SAFETY: same.
+            let dpc_raw = unsafe {
+                core::ptr::read_volatile((cfg_phys + off as u64 + 0x04) as *const u16)
+            };
+            return Some(DpcCapability::decode(dpc_raw));
+        }
+        if next == 0 {
+            return None;
+        }
+        off = next;
+    }
+    None
+}
+
 // ── Boot-time enable hook ─────────────────────────────────────────
 
 /// Diagnostic counters — bumped by the AER MSI handler. Exported
@@ -275,6 +535,8 @@ pub static AER_NONFATAL_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static AER_CORRECTABLE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+
 
 /// AER ISR — runs in IRQ context. Reads Root Error Status from
 /// every root port that carries an AER cap, increments the
