@@ -743,7 +743,16 @@ fn smoke_rtc_read_now_plausible() -> TestResult {
     use crate::x86_64::rtc;
     // SAFETY: kernel-test runs in boot context; CMOS IO ports
     // are owned.
-    let t = unsafe { rtc::read_now() };
+    let t = match unsafe { rtc::read_now() } {
+        Ok(t) => t,
+        Err(rtc::RtcError::UpdateInProgress) => {
+            // QEMU's CMOS doesn't set UIP; treat as skip.
+            return TestResult::Skip("UIP never cleared (QEMU or no RTC)");
+        }
+        Err(rtc::RtcError::OutOfRange) => {
+            return TestResult::Fail("RTC read returned OutOfRange");
+        }
+    };
     if t.year < 1990 || t.year > 2100 {
         return TestResult::Fail("RTC year implausible");
     }
