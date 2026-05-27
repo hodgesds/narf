@@ -6643,6 +6643,19 @@ pub fn signal_delivery_hook() -> Option<SignalDeliveryHook> {
 /// signal, look up its handler, ask the trap context to rewrite
 /// itself to deliver. Fast path — when nothing's pending it
 /// takes a single lock + a single bitmap read and returns.
+///
+/// SA flag handling:
+/// - SA_NODEFER (0x4000_0000): if set, don't auto-block the
+///   delivered signal during handler execution. Default Linux
+///   behaviour adds the delivered signal to the mask for the
+///   duration of the handler; SA_NODEFER opts out so the handler
+///   can recursively re-enter on the same signal (used by stack
+///   traces, dump-and-die handlers).
+/// - SA_RESETHAND (0x8000_0000): clear the handler after delivery
+///   so the next occurrence falls through to the default action.
+/// - SA_ONSTACK / SA_SIGINFO / SA_RESTART: passed through to the
+///   arch `deliver_signal` via the SigAction struct — landing
+///   gradually as the arch hooks gain the corresponding pieces.
 pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
     if !ctx.returning_to_user() {
         return;
@@ -6670,11 +6683,11 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
         return;
     }
     let signum = deliverable.trailing_zeros();
-    let handler = match sigaction_lookup(task, signum as usize) {
-        Some(h) => h,
+    let action = match sigaction_lookup_full(task, signum as usize) {
+        Some(a) => a,
         None => return,
     };
-    if !ctx.deliver_signal(handler, signum) {
+    if !ctx.deliver_signal(action.handler, signum) {
         return;
     }
     // Clear only after the rewrite succeeded — a failed
@@ -6683,6 +6696,23 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
     if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
         if let Some(slot) = map.get_mut(&task) {
             *slot &= !(1u32 << signum);
+        }
+    }
+    // SA_NODEFER: skip the auto-block. Default: add the delivered
+    // signal to the mask so the handler runs without re-entrancy.
+    if (action.flags & SA_NODEFER) == 0 {
+        if let Some(map) = SIGNAL_MASK.lock().as_mut() {
+            let slot = map.entry(task).or_insert(0);
+            *slot |= 1u32 << signum;
+        }
+    }
+    // SA_RESETHAND: one-shot — clear the handler so the next
+    // occurrence falls through to the default action.
+    if (action.flags & SA_RESETHAND) != 0 {
+        if let Some(map) = SIGACTION_TABLE.lock().as_mut() {
+            if let Some(slots) = map.get_mut(&task) {
+                slots[signum as usize] = None;
+            }
         }
     }
 }
@@ -6797,8 +6827,25 @@ pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> b
 
 const NSIG: usize = 32;
 
+/// Linux `sa_flags` bits NARF honours.
+pub const SA_NODEFER: u32 = 0x40_00_00_00;
+pub const SA_RESTART: u32 = 0x10_00_00_00;
+pub const SA_SIGINFO: u32 = 0x00_00_00_04;
+pub const SA_ONSTACK: u32 = 0x08_00_00_00;
+pub const SA_RESETHAND: u32 = 0x80_00_00_00;
+
+/// Per-task per-signal action: (handler_vaddr, sa_flags). Stored
+/// as a single struct so a single atomic write covers both fields.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SigAction {
+    /// User vaddr of the handler. `None` slot ⇒ no handler installed.
+    pub handler: u64,
+    /// Linux `sa_flags` (SA_*).
+    pub flags: u32,
+}
+
 static SIGACTION_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<BTreeMap<u64, [Option<u64>; NSIG]>>,
+    Option<BTreeMap<u64, [Option<SigAction>; NSIG]>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task sigaction registry. Boot calls this once
@@ -6826,8 +6873,16 @@ pub fn __test_sigaction_reset() {
     *SIGACTION_TABLE.lock() = None;
 }
 
-/// Diagnostic: peek the recorded handler for `(task, signum)`.
+/// Diagnostic: peek the recorded handler vaddr for `(task, signum)`.
+/// Returns `None` if no handler is registered.
 pub fn sigaction_lookup(task: u64, signum: usize) -> Option<u64> {
+    sigaction_lookup_full(task, signum).map(|a| a.handler)
+}
+
+/// Diagnostic: peek the full `SigAction` for `(task, signum)` —
+/// handler + flags. Used by the signal delivery path to know
+/// whether to honour SA_ONSTACK / SA_SIGINFO / SA_NODEFER.
+pub fn sigaction_lookup_full(task: u64, signum: usize) -> Option<SigAction> {
     let g = SIGACTION_TABLE.lock();
     let map = g.as_ref()?;
     let slots = map.get(&task)?;
@@ -7886,11 +7941,27 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
 
+/// `sigaction(signum, handler, old_out_ptr, flags)` —
+/// NARF-shaped sigaction surface (a Linux `rt_sigaction` is a
+/// 4-arg `(sig, act, oact, sigsetsize)` over a `struct sigaction`;
+/// we flatten the struct into registers for fewer copies).
+///
+/// arg0 = signum,
+/// arg1 = handler vaddr (0 = clear),
+/// arg2 = old_out_ptr (optional, may be 0; receives prior handler
+///        vaddr — 8 bytes — for Linux's `oldact->sa_handler`),
+/// arg3 = `sa_flags` (SA_*). Honoured: SA_SIGINFO, SA_RESTART,
+///        SA_ONSTACK, SA_NODEFER, SA_RESETHAND. Unknown bits stored
+///        but no action taken.
+///
+/// Older 3-arg callers (arg3 = 0) get flags = 0 as before — the
+/// new arg slot is back-compatible.
 fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
     let new_handler = args.arg1;
     let old_out = args.arg2;
+    let flags = args.arg3 as u32;
     if signum >= NSIG {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -7911,7 +7982,7 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
         slots[signum] = if new_handler == 0 {
             None
         } else {
-            Some(new_handler)
+            Some(SigAction { handler: new_handler, flags })
         };
         prior
     };
@@ -7922,7 +7993,10 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
         // into the user's own handler, not ours.
         if old_out & 0x7 == 0 {
             unsafe {
-                core::ptr::write_volatile(old_out as *mut u64, prior.unwrap_or(0));
+                core::ptr::write_volatile(
+                    old_out as *mut u64,
+                    prior.map(|a| a.handler).unwrap_or(0),
+                );
             }
         }
     }

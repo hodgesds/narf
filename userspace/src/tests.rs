@@ -8800,6 +8800,190 @@ fn smoke_userspace_sigaltstack_query_only_keeps_prior_install() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_sigaltstack_query_only_keeps_prior_install);
 
+fn smoke_userspace_sigaction_flags_stored_and_recovered() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF700);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::sigaction_init();
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Install handler 0xDEAD with flags = SA_SIGINFO | SA_RESTART.
+    let flags = crate::handlers::SA_SIGINFO | crate::handlers::SA_RESTART;
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs {
+            arg0: 10,        // signum = SIGUSR1
+            arg1: 0xDEAD,    // handler
+            arg2: 0,         // old_out null
+            arg3: flags as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    let saved = crate::handlers::sigaction_lookup_full(0xF700, 10);
+    __test_clear_global();
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    match saved {
+        Some(a) if a.handler == 0xDEAD && a.flags == flags => TestResult::Pass,
+        Some(a) => {
+            let _ = a;
+            TestResult::Fail("sigaction flags were not stored")
+        }
+        None => TestResult::Fail("sigaction did not install handler"),
+    }
+}
+kernel_test_in!("userspace", smoke_userspace_sigaction_flags_stored_and_recovered);
+
+fn smoke_userspace_sa_nodefer_skips_auto_block() -> TestResult {
+    use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF800);
+    static DELIVERED_SIG: AtomicU32 = AtomicU32::new(0);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::sigaction_init();
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Variant A — handler with SA_NODEFER set. Deliver: mask
+    // afterwards must NOT have the signal blocked.
+    let mut act = SigGapCtx {
+        args: SyscallArgs {
+            arg0: 10,
+            arg1: 0xC0DE,
+            arg2: 0,
+            arg3: crate::handlers::SA_NODEFER as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut act);
+    // Kill self with SIGUSR1.
+    let mut k = SigGapCtx {
+        args: SyscallArgs { arg0: 0xF800, arg1: 10, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+
+    // FakeCtx that pretends to return to user — drives delivery.
+    struct UserBoundCtx { signum: u32 }
+    impl TrapContext for UserBoundCtx {
+        fn args(&self) -> &SyscallArgs {
+            static DUMMY: SyscallArgs = SyscallArgs {
+                arg0: 0, arg1: 0, arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            };
+            &DUMMY
+        }
+        fn set_return(&mut self, _: SyscallReturn) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+        fn returning_to_user(&self) -> bool { true }
+        fn deliver_signal(&mut self, _vaddr: u64, signum: u32) -> bool {
+            DELIVERED_SIG.store(signum, Ordering::Release);
+            true
+        }
+    }
+    let mut ctx = UserBoundCtx { signum: 0 };
+    DELIVERED_SIG.store(0, Ordering::Release);
+    crate::handlers::default_signal_delivery(&mut ctx);
+    let _ = ctx;
+
+    let mask_after = crate::handlers::signal_mask_of(0xF800);
+    let delivered = DELIVERED_SIG.load(Ordering::Acquire);
+    __test_clear_global();
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    if delivered != 10 {
+        return TestResult::Fail("delivery hook did not fire");
+    }
+    if mask_after & (1 << 10) != 0 {
+        return TestResult::Fail("SA_NODEFER should NOT auto-block the signal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_sa_nodefer_skips_auto_block);
+
+fn smoke_userspace_default_delivery_auto_blocks_without_nodefer() -> TestResult {
+    use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF900);
+    static DELIVERED_SIG: AtomicU32 = AtomicU32::new(0);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::sigaction_init();
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut act = SigGapCtx {
+        args: SyscallArgs {
+            arg0: 11,
+            arg1: 0xC0DE,
+            arg2: 0,
+            arg3: 0, // no SA_NODEFER
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut act);
+    let mut k = SigGapCtx {
+        args: SyscallArgs { arg0: 0xF900, arg1: 11, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+
+    struct UserBoundCtx;
+    impl TrapContext for UserBoundCtx {
+        fn args(&self) -> &SyscallArgs {
+            static DUMMY: SyscallArgs = SyscallArgs {
+                arg0: 0, arg1: 0, arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            };
+            &DUMMY
+        }
+        fn set_return(&mut self, _: SyscallReturn) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+        fn returning_to_user(&self) -> bool { true }
+        fn deliver_signal(&mut self, _vaddr: u64, signum: u32) -> bool {
+            DELIVERED_SIG.store(signum, Ordering::Release);
+            true
+        }
+    }
+    let mut ctx = UserBoundCtx;
+    DELIVERED_SIG.store(0, Ordering::Release);
+    crate::handlers::default_signal_delivery(&mut ctx);
+
+    let mask_after = crate::handlers::signal_mask_of(0xF900);
+    let delivered = DELIVERED_SIG.load(Ordering::Acquire);
+    __test_clear_global();
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    if delivered != 11 {
+        return TestResult::Fail("delivery hook did not fire");
+    }
+    if mask_after & (1 << 11) == 0 {
+        return TestResult::Fail("default delivery should auto-block the signal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_default_delivery_auto_blocks_without_nodefer);
+
 fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use crate::{install_core_syscalls, install_global, install_task_id_lookup,
