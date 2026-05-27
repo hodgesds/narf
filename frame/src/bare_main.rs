@@ -1837,14 +1837,55 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         }
                     }
 
-                    // PCR 9: Initramfs.
+                    // PCR 5: Kernel command-line. Extends with the
+                    // EV_IPL_PARTITION_DATA tag so userspace attestation
+                    // tools can byte-match against the boot-cmdline.
+                    if let Some(i) = info {
+                        if let Err(e) = measure::measure_cmdline(i.cmdline).await {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: PCR 5 cmdline extend failed: {:?}",
+                                e
+                            );
+                        }
+                    }
+
+                    // PCR 6: Initramfs. PC Client Spec recommends PCR 6
+                    // for OEM-specific boot artifacts; the Linux IMA +
+                    // measurement convention also lands the initramfs
+                    // there. The bootloader-supplied region is identity-
+                    // mapped at this point.
                     if let Some(r) = info.and_then(|i| i.initramfs) {
-                        if let Err(e) =
-                            measure::measure_phys(9, "initramfs", r.start.raw(), r.len).await
+                        // SAFETY: BootInfo::initramfs is the bootloader-
+                        // staged identity-mapped initramfs region.
+                        let res = unsafe {
+                            measure::measure_initramfs(r.start.raw(), r.len).await
+                        };
+                        if let Err(e) = res {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: PCR 6 initramfs extend failed: {:?}",
+                                e
+                            );
+                        }
+                    }
+
+                    // PCR 9: Driver-firmware blobs. Walk the registry's
+                    // snapshot at this point and extend a per-blob entry
+                    // (path, hash, length). Subsequent hot-installs
+                    // extend incrementally as they land.
+                    for ident in narf_firmware::snapshot() {
+                        if let Err(e) = measure::measure_firmware_blob(
+                            ident.name,
+                            &ident.sha256,
+                            ident.size as u64,
+                        )
+                        .await
                         {
                             let _ = writeln!(
                                 console::Writer,
-                                "  measured-boot: PCR 9 extend failed: {:?}",
+                                "  measured-boot: PCR 9 firmware extend failed for {}: {:?}",
+                                ident.name,
                                 e
                             );
                         }
@@ -1871,6 +1912,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         console::Writer,
                         "  measured-boot: {} components anchored in hardware",
                         log.len()
+                    );
+                    let _ = writeln!(
+                        console::Writer,
+                        "  measured-boot: secure-boot enabled={}",
+                        secure_boot::enabled()
                     );
                 });
                 narf_init::InitResult::Ok
