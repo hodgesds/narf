@@ -144,6 +144,71 @@ pub unsafe extern "C" fn madvise(_addr: *mut c_void, _len: usize, _advice: c_int
     0
 }
 
+/// `brk(end_data_segment)` — Linux brk(2). Sets the program-break
+/// to the requested address (or queries it when `end == NULL`).
+/// Returns 0 on success, -1 + errno=ENOMEM on failure. The current
+/// break is also reflected back through [`sbrk`].
+///
+/// Reference: musl `src/internal/syscall.h::__syscall_brk`.
+///
+/// # Safety
+/// Pure value op; the kernel owns brk-region accounting.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brk(end: *mut c_void) -> c_int {
+    let r = narf_user_runtime::brk(end as usize);
+    if r == 0 {
+        crate::errno::set_errno(12); // ENOMEM
+        -1
+    } else {
+        0
+    }
+}
+
+/// `sbrk(increment)` — POSIX shape. Returns the previous program-
+/// break address on success, `(void*) -1` on failure. `sbrk(0)`
+/// queries the current break without moving it.
+///
+/// Reference: musl `src/legacy/sbrk.c`.
+///
+/// # Safety
+/// Pure value op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sbrk(increment: isize) -> *mut c_void {
+    // Query first.
+    let cur = narf_user_runtime::brk(0);
+    if cur == 0 {
+        crate::errno::set_errno(12);
+        return !0usize as *mut c_void;
+    }
+    if increment == 0 {
+        return cur as *mut c_void;
+    }
+    let new = (cur as isize).wrapping_add(increment) as usize;
+    let r = narf_user_runtime::brk(new);
+    if r == 0 || r < new {
+        crate::errno::set_errno(12);
+        return !0usize as *mut c_void;
+    }
+    cur as *mut c_void
+}
+
+/// `mremap(old_addr, old_len, new_len, flags, [new_addr])` —
+/// Linux mremap(2). NARF doesn't support in-place mapping
+/// resize today; surface ENOMEM so callers fall back to
+/// alloc+copy+munmap.
+///
+/// Reference: musl `src/mman/mremap.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mremap(
+    _old_addr: *mut c_void,
+    _old_len: usize,
+    _new_len: usize,
+    _flags: c_int,
+) -> *mut c_void {
+    crate::errno::set_errno(12); // ENOMEM
+    !0usize as *mut c_void
+}
+
 // ── <sys/utsname.h> ─────────────────────────────────────────────────
 
 const UTS_FIELD: usize = 65;

@@ -2783,6 +2783,37 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new memory C-ABI probes ──────────────────────────────────
+    //
+    // sbrk(0) returns the current break. sbrk(N) advances by N and
+    // returns the OLD break — so a follow-up sbrk(0) > prior.
+    let sbrk_ok = unsafe {
+        let a = narf_libc::sbrk(0) as usize;
+        let b = narf_libc::sbrk(0) as usize;
+        // sbrk(0) is idempotent — back-to-back returns must match.
+        a != 0 && a != usize::MAX && a == b
+    };
+    narf_libc::printf_str(
+        if sbrk_ok { "sbrk: ok\n" } else { "sbrk: bad\n" },
+        &[],
+    );
+
+    // mremap should return MAP_FAILED (-1 cast); contract is just
+    // that it does not crash.
+    let mremap_ok = unsafe {
+        let p = narf_libc::mremap(
+            core::ptr::null_mut(),
+            0,
+            4096,
+            0,
+        );
+        p as usize == usize::MAX
+    };
+    narf_libc::printf_str(
+        if mremap_ok { "mremap: ok\n" } else { "mremap: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
