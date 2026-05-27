@@ -285,6 +285,95 @@ pub fn enumerate() -> Vec<ThermalZone> {
         .collect()
 }
 
+// ── Bridge to the generic `crate::thermal` registry ─────────────────
+//
+// `crate::thermal` is the unified cooling-policy surface (sensor +
+// warn/crit + subscribe + StepPolicy). ACPI zones discovered here
+// register into that registry so fan / CPU-throttle / NVMe-temp
+// consumers see one cohesive zone list instead of two siloed views.
+//
+// Mapping rules (the trip-point precedence at `classify()` decides):
+//   crit_milli  ← _CRT  (fall back to _HOT, else i32::MAX)
+//   warn_milli  ← _PSV  (fall back to _AC0, else crit_milli/2)
+// Zones with no sensor (`_TMP` MethodMissing) are skipped — the
+// generic registry doesn't represent abstract zones.
+
+use crate::thermal as generic;
+use alloc::vec::Vec as AVec;
+use narf_capabilities::{Cap, Grant};
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// Map of (acpi-path → generic registry id) held for the lifetime of
+/// the boot. Used by `sample_all()` to push fresh `_TMP` readings.
+static BRIDGE: IrqSafeSpinLock<AVec<(String, u32)>> = IrqSafeSpinLock::new(AVec::new());
+
+/// Discover every ACPI Thermal Zone, register it with the generic
+/// `crate::thermal` registry, and remember the (path → id) mapping so
+/// `sample_all` can push live `_TMP` readings later.
+///
+/// Returns the number of zones registered. Idempotent — call once at
+/// Stage::Late or whenever the namespace is stable; a second call
+/// after the bridge is populated re-walks but does NOT double-register
+/// existing paths.
+pub fn register_with_generic_registry(
+    cap: &Cap<generic::Thermal, Grant>,
+) -> usize {
+    let mut bridge = BRIDGE.lock();
+    let mut newly_registered = 0usize;
+    for zone in enumerate() {
+        if bridge.iter().any(|(p, _)| *p == zone.path) {
+            continue;
+        }
+        // Skip sensorless zones — generic registry assumes a temperature
+        // can always be reported, and ACPI zones that exist purely to
+        // host trip-points without a `_TMP` aren't useful to cooling
+        // policy.
+        if zone.temperature_c_milli().is_err() {
+            continue;
+        }
+        let trips = zone.trip_points();
+        let crit_milli = trips
+            .critical_milli_c
+            .or(trips.hot_milli_c)
+            .unwrap_or(i32::MAX);
+        let warn_milli = trips
+            .passive_milli_c
+            .or(trips.active_milli_c[0])
+            .unwrap_or_else(|| crit_milli / 2);
+        if let Ok(id) = generic::register_zone(cap, &zone.path, warn_milli, crit_milli) {
+            bridge.push((zone.path.clone(), id));
+            newly_registered += 1;
+        }
+    }
+    newly_registered
+}
+
+/// Walk every bridged zone, read its current `_TMP`, and push the
+/// reading into the generic registry. Returns the count of successful
+/// samples. Sensor-offline zones are quietly skipped (the registry
+/// keeps its last reading rather than poisoning the average).
+///
+/// Call from a periodic pump — Linux's thermal core polls at ~1 Hz;
+/// match that or slower to keep AML eval cost off the critical path.
+pub fn sample_all() -> usize {
+    let mut succeeded = 0usize;
+    for (path, id) in BRIDGE.lock().iter() {
+        let zone = ThermalZone { path: path.clone() };
+        if let Ok(milli_c) = zone.temperature_c_milli() {
+            if generic::record_temp(*id, milli_c).is_ok() {
+                succeeded += 1;
+            }
+        }
+    }
+    succeeded
+}
+
+#[cfg(test)]
+#[doc(hidden)]
+pub fn __test_clear_bridge() {
+    BRIDGE.lock().clear();
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 mod tests {
