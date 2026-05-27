@@ -49,6 +49,7 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
+mod canary;
 mod cross_crate_init;
 mod measure;
 mod secure_boot;
@@ -408,6 +409,48 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
             }
         }
+    }
+
+    // PaX-style security init — runs before any user-mode entry and
+    // before the first task spawn. Order is sensitive: SMEP/SMAP both
+    // depend on CR4 being writable (CPL=0, post-paging), KPTI detect
+    // depends on CPUID + IA32_ARCH_CAPABILITIES, canary depends on the
+    // RDRAND/RDSEED probe. Doing it here (post cpu_validate, pre
+    // Features::probe / domain bring-up) gives all of those a stable
+    // foundation. Per security-hardening doctrine: do not gate behind
+    // a runtime knob — SMEP/SMAP are mandatory floors.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_arch::x86_64::{kpti, smap, smep};
+
+        // SMEP — fault on instruction fetch from a U=1 page at CPL=0.
+        // No-op if CPU doesn't advertise; otherwise flip CR4.20.
+        if smep::supported() {
+            // SAFETY: SMEP supported; flipping CR4.20 has no other
+            // prerequisite at CPL=0 post-paging.
+            unsafe { smep::enable(); }
+        }
+        // SMAP — fault on data access to a U=1 page from CPL=0 outside
+        // an EFLAGS.AC bracket. Same shape.
+        if smap::supported() {
+            // SAFETY: SMAP supported; CR4.21 flip is benign here.
+            unsafe { smap::enable(); }
+        }
+        // KPTI detect — Renoir + Phoenix come back Posture::Native and
+        // we skip the dual-CR3 dance entirely. Log the decision once.
+        let pti = kpti::detect();
+        let _ = writeln!(
+            console::Writer,
+            "  hardening: SMEP={} SMAP={} KPTI={:?}",
+            smep::is_enabled(),
+            smap::is_enabled(),
+            pti,
+        );
+
+        // Initialise the global stack canary from RDRAND/RDSEED.
+        // Subsequent stack-protected functions will see a real value
+        // instead of the static-init sentinel.
+        canary::init_global_canary();
     }
 
     // Stage 2 feature probe. Print what the CPU supports; gate
