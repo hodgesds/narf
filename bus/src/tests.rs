@@ -1972,3 +1972,249 @@ fn smoke_pci_saved_config_is_pod_and_copyable() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/pci", smoke_pci_saved_config_is_pod_and_copyable);
+
+// ── SlotCaps + Hotplug power-control smokes ───────────────────────
+//
+// These exercise the new SlotCaps decoder, presence-detect debounce
+// constant, and SlotPolicy helpers added in this session.
+
+fn smoke_slot_caps_bit_positions() -> TestResult {
+    // Every single-bit slot_cap constant must be a power of two and
+    // sit at the position documented in PCIe 6.0 §7.5.3.9.
+    use crate::hotplug::slot_cap;
+    let single_bits = [
+        slot_cap::ATTENTION_BUTTON,
+        slot_cap::POWER_CONTROLLER,
+        slot_cap::MRL_SENSOR,
+        slot_cap::ATTENTION_INDICATOR,
+        slot_cap::POWER_INDICATOR,
+        slot_cap::HOT_PLUG_SURPRISE,
+        slot_cap::HOT_PLUG_CAPABLE,
+        slot_cap::ELECTROMECHANICAL_INTERLOCK,
+        slot_cap::NO_COMMAND_COMPLETED,
+    ];
+    for b in &single_bits {
+        if b.count_ones() != 1 {
+            return TestResult::Fail("slot_cap single-bit constant is not a power of two");
+        }
+    }
+    if slot_cap::ATTENTION_BUTTON != 1 << 0 {
+        return TestResult::Fail("ATTENTION_BUTTON must be bit 0");
+    }
+    if slot_cap::POWER_CONTROLLER != 1 << 1 {
+        return TestResult::Fail("POWER_CONTROLLER must be bit 1");
+    }
+    if slot_cap::HOT_PLUG_CAPABLE != 1 << 6 {
+        return TestResult::Fail("HOT_PLUG_CAPABLE must be bit 6");
+    }
+    if slot_cap::NO_COMMAND_COMPLETED != 1 << 18 {
+        return TestResult::Fail("NO_COMMAND_COMPLETED must be bit 18");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_slot_caps_bit_positions);
+
+fn smoke_slot_caps_decode_round_trip() -> TestResult {
+    // Encode POWER_CONTROLLER | HOT_PLUG_CAPABLE | NO_COMMAND_COMPLETED
+    // and slot_number=0x42, then verify all fields are decoded.
+    use crate::hotplug::{slot_cap, SlotCaps};
+    let slot_num: u32 = 0x42;
+    let raw: u32 = slot_cap::POWER_CONTROLLER
+        | slot_cap::HOT_PLUG_CAPABLE
+        | slot_cap::NO_COMMAND_COMPLETED
+        | (slot_num << slot_cap::PHYSICAL_SLOT_NUM_SHIFT);
+    let caps = SlotCaps::decode(raw);
+    if !caps.power_ctrl {
+        return TestResult::Fail("power_ctrl not decoded");
+    }
+    if !caps.hp_capable {
+        return TestResult::Fail("hp_capable not decoded");
+    }
+    if !caps.no_cmd_complete {
+        return TestResult::Fail("no_cmd_complete not decoded");
+    }
+    if caps.attn_button || caps.mrl_sensor || caps.attn_indicator || caps.hp_surprise {
+        return TestResult::Fail("spurious bits set in decoded SlotCaps");
+    }
+    if caps.slot_number != 0x42 {
+        return TestResult::Fail("slot_number decoded incorrectly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_slot_caps_decode_round_trip);
+
+fn smoke_presence_detect_debounce_in_range() -> TestResult {
+    // PCIe CEM §2.6.2 minimum is 50 ms; practical ceiling is 500 ms.
+    use crate::hotplug::PRESENCE_DETECT_DEBOUNCE_MS;
+    if PRESENCE_DETECT_DEBOUNCE_MS < 50 {
+        return TestResult::Fail("debounce below spec minimum of 50 ms");
+    }
+    if PRESENCE_DETECT_DEBOUNCE_MS > 500 {
+        return TestResult::Fail("debounce unreasonably large (> 500 ms)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_presence_detect_debounce_in_range);
+
+fn smoke_slot_policy_from_caps() -> TestResult {
+    // SlotPolicy correctly inherits power-ctrl flag from SlotCaps.
+    use crate::hotplug::{slot_cap, SlotCaps, SlotPolicy};
+    let with_pwr = SlotCaps::decode(
+        slot_cap::HOT_PLUG_CAPABLE | slot_cap::POWER_CONTROLLER,
+    );
+    let p = SlotPolicy::from_caps(0xDEAD_0000, 0x70, &with_pwr);
+    if !p.has_power_ctrl {
+        return TestResult::Fail("has_power_ctrl not propagated");
+    }
+    let without_pwr = SlotCaps::decode(slot_cap::HOT_PLUG_CAPABLE);
+    let p2 = SlotPolicy::from_caps(0xDEAD_0000, 0x70, &without_pwr);
+    if p2.has_power_ctrl {
+        return TestResult::Fail("has_power_ctrl spuriously set when not in caps");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/hotplug", smoke_slot_policy_from_caps);
+
+// ── AER capability discovery + mask config smokes ─────────────────
+//
+// These exercise the new pcie_aer functions: synthetic AER cap
+// discovery, UE status RW1C semantics, Root Error Status aggregation,
+// DPC capability decode, and default mask constants.
+
+fn smoke_aer_cap_discovery_synthetic() -> TestResult {
+    // Build a synthetic 4 KiB config space with two extended caps:
+    //   0x100: dummy (ID=0xABCD, next=0x140)
+    //   0x140: AER  (ID=0x0001, next=0x000)
+    // Verify find_aer_cap_offset returns 0x140.
+    use crate::pcie_aer::find_aer_cap_offset;
+    let mut space = alloc::vec![0u32; 1024]; // 4096 bytes
+    space[0x100 / 4] = 0xABCDu32 | (1 << 16) | (0x140u32 << 20);
+    space[0x140 / 4] = 0x0001u32 | (2 << 16) | (0u32 << 20);
+    let cfg_phys = space.as_ptr() as u64;
+    // SAFETY: `space` is a live heap allocation; walk is read-only;
+    // all pointer arithmetic stays within the 4096-byte Vec.
+    let result = unsafe { find_aer_cap_offset(cfg_phys) };
+    match result {
+        Some(0x140) => TestResult::Pass,
+        Some(_) => TestResult::Fail("AER cap found at wrong offset in synthetic space"),
+        None => TestResult::Fail("find_aer_cap_offset returned None on synthetic AER space"),
+    }
+}
+kernel_test_in!("bus/hotplug", smoke_aer_cap_discovery_synthetic);
+
+fn smoke_ue_status_rw1c_severity_semantics() -> TestResult {
+    // classify_uncorrectable must correctly interpret the three scenarios:
+    // status & severity != 0 → Severe; status != 0, no overlap → NonFatal;
+    // status == 0 → None.
+    use crate::pcie_aer::{classify_uncorrectable, ue, UeSeverity};
+    // DLP in both → Severe.
+    if classify_uncorrectable(ue::DATA_LINK_PROTOCOL_ERROR, ue::DATA_LINK_PROTOCOL_ERROR)
+        != UeSeverity::Severe
+    {
+        return TestResult::Fail("DLP in status+severity should be Severe");
+    }
+    // DLP in status only → NonFatal.
+    if classify_uncorrectable(ue::DATA_LINK_PROTOCOL_ERROR, 0) != UeSeverity::NonFatal {
+        return TestResult::Fail("DLP in status only should be NonFatal");
+    }
+    // status = 0 → None.
+    if classify_uncorrectable(0, ue::DATA_LINK_PROTOCOL_ERROR) != UeSeverity::None {
+        return TestResult::Fail("zero status should be None");
+    }
+    // Multiple bits, one severe → Severe.
+    let status = ue::POISONED_TLP | ue::COMPLETION_TIMEOUT;
+    if classify_uncorrectable(status, ue::POISONED_TLP) != UeSeverity::Severe {
+        return TestResult::Fail("mixed status with one severe bit should be Severe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_ue_status_rw1c_severity_semantics);
+
+fn smoke_root_error_status_aggregation() -> TestResult {
+    // RootErrorStatus::decode correctly extracts each field and
+    // ue_severity() classifies Fatal vs NonFatal correctly.
+    use crate::pcie_aer::{root_sts, RootErrorStatus, UeSeverity};
+    // Correctable only.
+    let corr = RootErrorStatus::decode(root_sts::ERR_COR_RECEIVED);
+    if !corr.corr_received || corr.fatal_nonfatal_received {
+        return TestResult::Fail("corr_received wrong");
+    }
+    if !corr.any_error() {
+        return TestResult::Fail("any_error should be true for correctable");
+    }
+    // Fatal UE (FIRST_UNCORRECTABLE_FATAL set).
+    let fatal = RootErrorStatus::decode(
+        root_sts::ERR_FATAL_NONFATAL_RECEIVED | root_sts::FIRST_UNCORRECTABLE_FATAL,
+    );
+    if !fatal.fatal_nonfatal_received || !fatal.first_ue_fatal {
+        return TestResult::Fail("fatal fields not decoded");
+    }
+    if fatal.ue_severity() != UeSeverity::Severe {
+        return TestResult::Fail("fatal UE should be Severe");
+    }
+    // Non-fatal UE (ERR_FATAL_NONFATAL but FIRST_UE_FATAL clear).
+    let nf = RootErrorStatus::decode(root_sts::ERR_FATAL_NONFATAL_RECEIVED);
+    if nf.ue_severity() != UeSeverity::NonFatal {
+        return TestResult::Fail("non-fatal UE should be NonFatal");
+    }
+    // MSI vector extraction.
+    if RootErrorStatus::decode(5u32 << 27).aer_int_number != 5 {
+        return TestResult::Fail("aer_int_number decoded wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_root_error_status_aggregation);
+
+fn smoke_dpc_capability_decode() -> TestResult {
+    // DpcCapability::decode correctly parses int_msg_number and feature bits.
+    use crate::pcie_aer::DpcCapability;
+    // int_msg_number=3, rp_extensions, sw_triggering.
+    let raw: u16 = 3 | (1 << 5) | (1 << 7);
+    let cap = DpcCapability::decode(raw);
+    if cap.int_msg_number != 3 {
+        return TestResult::Fail("int_msg_number wrong");
+    }
+    if !cap.rp_extensions {
+        return TestResult::Fail("rp_extensions not decoded");
+    }
+    if cap.ptlp_egress_blocking {
+        return TestResult::Fail("ptlp_egress_blocking spuriously set");
+    }
+    if !cap.sw_triggering {
+        return TestResult::Fail("sw_triggering not decoded");
+    }
+    if cap.raw != raw {
+        return TestResult::Fail("raw field not stored");
+    }
+    // Zero raw → all false / zero.
+    let none = DpcCapability::decode(0);
+    if none.rp_extensions || none.sw_triggering || none.int_msg_number != 0 {
+        return TestResult::Fail("zero raw should decode to all-false");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_dpc_capability_decode);
+
+fn smoke_default_aer_masks_correct() -> TestResult {
+    // DEFAULT_CE_MASK must suppress Advisory Non-Fatal only;
+    // DEFAULT_UE_MASK must be zero; DEFAULT_UE_SEVERITY must
+    // include every spec-mandated link-fatal bit.
+    use crate::pcie_aer::{ce, ue, DEFAULT_CE_MASK, DEFAULT_UE_MASK, DEFAULT_UE_SEVERITY};
+    if DEFAULT_CE_MASK != ce::ADVISORY_NON_FATAL {
+        return TestResult::Fail("DEFAULT_CE_MASK should be ADVISORY_NON_FATAL only");
+    }
+    if DEFAULT_UE_MASK != 0 {
+        return TestResult::Fail("DEFAULT_UE_MASK should be 0");
+    }
+    let required = ue::DATA_LINK_PROTOCOL_ERROR
+        | ue::SURPRISE_DOWN_ERROR
+        | ue::FLOW_CONTROL_PROTOCOL_ERROR
+        | ue::RECEIVER_OVERFLOW
+        | ue::MALFORMED_TLP
+        | ue::UNCORRECTABLE_INTERNAL_ERROR;
+    if DEFAULT_UE_SEVERITY & required != required {
+        return TestResult::Fail("DEFAULT_UE_SEVERITY missing spec-mandated fatal bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_default_aer_masks_correct);
