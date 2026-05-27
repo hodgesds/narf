@@ -10,12 +10,16 @@ use crate::hci::Event;
 #[repr(u8)]
 pub enum EventCode {
     InquiryComplete = 0x01,
+    InquiryResult = 0x02,
     ConnectionComplete = 0x03,
     DisconnectionComplete = 0x05,
+    AuthenticationComplete = 0x06,
+    EncryptionChange = 0x08,
     CommandComplete = 0x0E,
     CommandStatus = 0x0F,
     HardwareError = 0x10,
     NumberOfCompletedPackets = 0x13,
+    SyncConnectionComplete = 0x2C,
     LeMeta = 0x3E,
     VendorSpecific = 0xFF,
 }
@@ -24,12 +28,16 @@ impl EventCode {
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {
             0x01 => Some(Self::InquiryComplete),
+            0x02 => Some(Self::InquiryResult),
             0x03 => Some(Self::ConnectionComplete),
             0x05 => Some(Self::DisconnectionComplete),
+            0x06 => Some(Self::AuthenticationComplete),
+            0x08 => Some(Self::EncryptionChange),
             0x0E => Some(Self::CommandComplete),
             0x0F => Some(Self::CommandStatus),
             0x10 => Some(Self::HardwareError),
             0x13 => Some(Self::NumberOfCompletedPackets),
+            0x2C => Some(Self::SyncConnectionComplete),
             0x3E => Some(Self::LeMeta),
             0xFF => Some(Self::VendorSpecific),
             _ => None,
@@ -322,4 +330,115 @@ pub fn parse_le_advertising_reports(event: &Event) -> Option<alloc::vec::Vec<LeA
         });
     }
     Some(out)
+}
+
+// ── Stage 2: Classic BR/EDR event decoders ─────────────────────────
+// Ref: net/bluetooth/hci_event.c — hci_inquiry_result_evt,
+// hci_conn_complete_evt, hci_auth_complete_evt,
+// hci_encrypt_change_evt, hci_sync_conn_complete_evt.
+
+/// One device returned inside an `HCI_Inquiry_Result` event (§7.7.2).
+/// Each entry is 14 bytes: BD_ADDR(6)+PSRM(1)+Rsvd(2)+CoD(3)+ClkOff(2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InquiryResultEntry {
+    pub bd_addr: [u8; 6],
+    pub page_scan_repetition_mode: u8,
+    pub class_of_device: [u8; 3],
+    pub clock_offset: u16,
+}
+
+pub fn parse_inquiry_results(event: &Event) -> Option<alloc::vec::Vec<InquiryResultEntry>> {
+    if event.code != EventCode::InquiryResult as u8 {
+        return None;
+    }
+    let p = &event.params;
+    if p.is_empty() { return None; }
+    let n = p[0] as usize;
+    if p.len() < 1 + n * 14 { return None; }
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    for i in 0..n {
+        let base = 1 + i * 14;
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[base..base + 6]);
+        let psrm = p[base + 6];
+        let mut cod = [0u8; 3];
+        cod.copy_from_slice(&p[base + 9..base + 12]);
+        let clk = u16::from_le_bytes([p[base + 12], p[base + 13]]);
+        out.push(InquiryResultEntry { bd_addr: addr, page_scan_repetition_mode: psrm,
+                                      class_of_device: cod, clock_offset: clk });
+    }
+    Some(out)
+}
+
+/// Decoded `HCI_Connection_Complete` event (§7.7.3) — classic BR/EDR.
+/// Layout: Status(1) Handle_LE(2) BD_ADDR(6) Link_Type(1) Enc(1) = 11 bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ClassicConnectionComplete {
+    pub status: u8,
+    pub handle: u16,
+    pub bd_addr: [u8; 6],
+    pub link_type: u8,
+    pub encryption_enabled: u8,
+}
+impl ClassicConnectionComplete {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::ConnectionComplete as u8 { return None; }
+        let p = &event.params;
+        if p.len() < 11 { return None; }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[3..9]);
+        Some(Self { status: p[0],
+                    handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+                    bd_addr: addr, link_type: p[9], encryption_enabled: p[10] })
+    }
+}
+
+/// Decoded `HCI_Authentication_Complete` event (§7.7.6).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticationComplete { pub status: u8, pub handle: u16 }
+impl AuthenticationComplete {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::AuthenticationComplete as u8 { return None; }
+        let p = &event.params;
+        if p.len() < 3 { return None; }
+        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF })
+    }
+}
+
+/// Decoded `HCI_Encryption_Change` event v1 (§7.7.8).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EncryptionChangeV1 { pub status: u8, pub handle: u16, pub encryption_enabled: u8 }
+impl EncryptionChangeV1 {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::EncryptionChange as u8 { return None; }
+        let p = &event.params;
+        if p.len() < 4 { return None; }
+        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+                    encryption_enabled: p[3] })
+    }
+}
+
+/// Decoded `HCI_Synchronous_Connection_Complete` event (§7.7.35).
+/// Layout: Status(1) Handle(2) BD_ADDR(6) Link_Type(1) TX_Interval(1)
+///         ReTx_Window(1) Rx_Len(2) Tx_Len(2) Air_Mode(1) = 17 bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SyncConnectionComplete {
+    pub status: u8, pub handle: u16, pub bd_addr: [u8; 6],
+    pub link_type: u8, pub transmission_interval: u8, pub retransmission_window: u8,
+    pub rx_packet_length: u16, pub tx_packet_length: u16, pub air_mode: u8,
+}
+impl SyncConnectionComplete {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::SyncConnectionComplete as u8 { return None; }
+        let p = &event.params;
+        if p.len() < 17 { return None; }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[3..9]);
+        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+                    bd_addr: addr, link_type: p[9], transmission_interval: p[10],
+                    retransmission_window: p[11],
+                    rx_packet_length: u16::from_le_bytes([p[12], p[13]]),
+                    tx_packet_length: u16::from_le_bytes([p[14], p[15]]),
+                    air_mode: p[16] })
+    }
 }
