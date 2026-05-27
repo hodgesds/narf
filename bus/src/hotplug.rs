@@ -210,16 +210,51 @@ pub mod pcie_cap {
     pub const SLOT_STATUS: u16 = 0x1A;
 }
 
-/// Slot Capabilities bits we care about.
+/// Slot Capabilities bits (PCIe 6.0 §7.5.3.9 Table 7-25).
+/// All bits are read-only; the hardware asserts what it supports
+/// at power-on and software cannot change them.
 pub mod slot_cap {
+    /// Attention Button Present (bit 0).
+    pub const ATTENTION_BUTTON: u32 = 1 << 0;
+    /// Power Controller Present (bit 1). When set, software may
+    /// turn slot power on/off via the Slot Control register.
+    pub const POWER_CONTROLLER: u32 = 1 << 1;
+    /// MRL Sensor Present (bit 2). Manually-operated Retention
+    /// Latch sensor for safe extraction.
+    pub const MRL_SENSOR: u32 = 1 << 2;
+    /// Attention Indicator Present (bit 3).
+    pub const ATTENTION_INDICATOR: u32 = 1 << 3;
+    /// Power Indicator Present (bit 4). LED that follows the
+    /// power-controller state.
+    pub const POWER_INDICATOR: u32 = 1 << 4;
+    /// Hot-Plug Surprise (bit 5). Indicates the device can be
+    /// removed without operator intervention — requires firmware
+    /// / OS support for surprise removal.
+    pub const HOT_PLUG_SURPRISE: u32 = 1 << 5;
     /// HotPlugCapable — set when the slot can generate hot-plug
     /// events (typically root ports + downstream switch ports).
     pub const HOT_PLUG_CAPABLE: u32 = 1 << 6;
+    /// Slot Power Limit Value (bits[14:7], 8 bits). Encoded
+    /// power limit value; see §7.5.3.9 for the unit scale.
+    pub const SLOT_POWER_LIMIT_VALUE_MASK: u32 = 0x7F80;
+    pub const SLOT_POWER_LIMIT_VALUE_SHIFT: u32 = 7;
+    /// Slot Power Limit Scale (bits[16:15]).
+    pub const SLOT_POWER_LIMIT_SCALE_MASK: u32 = 0x0001_8000;
+    pub const SLOT_POWER_LIMIT_SCALE_SHIFT: u32 = 15;
+    /// Electromechanical Interlock Present (bit 17).
+    pub const ELECTROMECHANICAL_INTERLOCK: u32 = 1 << 17;
+    /// No Command Completed Support (bit 18). When set, the slot
+    /// does not assert Command Completed after a write to Slot
+    /// Control; software must not wait for it.
+    pub const NO_COMMAND_COMPLETED: u32 = 1 << 18;
+    /// Physical Slot Number (bits[31:19], 13 bits).
+    pub const PHYSICAL_SLOT_NUM_MASK: u32 = 0xFFF8_0000;
+    pub const PHYSICAL_SLOT_NUM_SHIFT: u32 = 19;
 }
 
 /// Slot Control / Slot Status bit positions (same layout for
 /// both — Control enables the events, Status reports them
-/// W1C-style).
+/// W1C-style). PCIe 6.0 §7.5.3.10 (Control) / §7.5.3.11 (Status).
 pub mod slot_bits {
     pub const ATTENTION_BUTTON_PRESSED: u16 = 1 << 0;
     pub const POWER_FAULT_DETECTED: u16 = 1 << 1;
@@ -230,6 +265,104 @@ pub mod slot_bits {
     /// generation. Per-event enable bits 0..4 only fire when
     /// this is also set.
     pub const HOT_PLUG_INTERRUPT_ENABLE: u16 = 1 << 5;
+    /// Data Link Layer State Changed Enable (bit 12 of Control /
+    /// bit 8 of Status). When set in Control, fires an interrupt
+    /// when the DL layer goes active / inactive.
+    pub const DATA_LINK_STATE_CHANGED_ENABLE: u16 = 1 << 12;
+}
+
+/// Slot Control power-control bits (PCIe 6.0 §7.5.3.10).
+/// These are two-bit fields in the 16-bit Slot Control register,
+/// each encoding Off/Blink/On for an indicator LED, or
+/// On/Off for the power controller.
+pub mod slot_ctrl {
+    /// Attention Indicator Control (bits[7:6]):
+    ///   00 = reserved, 01 = On, 10 = Blink, 11 = Off.
+    pub const ATTN_IND_MASK: u16 = 0x00C0;
+    pub const ATTN_IND_ON: u16 = 0x0040;
+    pub const ATTN_IND_BLINK: u16 = 0x0080;
+    pub const ATTN_IND_OFF: u16 = 0x00C0;
+
+    /// Power Indicator Control (bits[9:8]):
+    ///   00 = reserved, 01 = On, 10 = Blink, 11 = Off.
+    pub const PWR_IND_MASK: u16 = 0x0300;
+    pub const PWR_IND_ON: u16 = 0x0100;
+    pub const PWR_IND_BLINK: u16 = 0x0200;
+    pub const PWR_IND_OFF: u16 = 0x0300;
+
+    /// Power Controller Control (bit 10):
+    ///   0 = power on, 1 = power off.
+    /// Only meaningful when `slot_cap::POWER_CONTROLLER` is set.
+    pub const POWER_CONTROLLER_OFF: u16 = 1 << 10;
+
+    /// Electromechanical Interlock Control (bit 11):
+    ///   Write 1 to toggle the latch (open ↔ closed).
+    pub const EMI_CONTROL: u16 = 1 << 11;
+}
+
+/// Slot Status presence-detect state bit (bit 6 of Slot Status,
+/// §7.5.3.11). This is a *read-only* state bit, not W1C — it
+/// reflects the current hardware state after a PDC transition.
+pub const SLOT_STATUS_PRESENCE_DETECT_STATE: u16 = 1 << 6;
+
+/// Slot Status MRL sensor state bit (bit 5, read-only).
+pub const SLOT_STATUS_MRL_SENSOR_STATE: u16 = 1 << 5;
+
+/// Presence-detect debounce window — 100 ms per PCIe CEM §2.6.2.
+/// Real hardware may need a shorter window (≥50 ms is spec minimum)
+/// but 100 ms is the conventional safe value matched by Linux
+/// pciehp_core.c `BLINKTIME_MIN_MS`. The value is in milliseconds
+/// and must be interpreted by whichever delay primitive the caller
+/// has available (TSC spin, timer callback, etc.).
+pub const PRESENCE_DETECT_DEBOUNCE_MS: u64 = 100;
+
+/// Decoded Slot Capabilities register. All fields are RO at runtime;
+/// this struct is built once per hot-plug-capable port during init and
+/// then consulted by the hotplug ISR + power-control path.
+///
+/// Reference: Linux `drivers/pci/hotplug/pciehp_hpc.c` pcie_get_device_status.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SlotCaps {
+    /// Attention Button is wired on this slot.
+    pub attn_button: bool,
+    /// Slot has a software-controlled power controller.
+    pub power_ctrl: bool,
+    /// MRL (Manual Retention Latch) sensor present.
+    pub mrl_sensor: bool,
+    /// Attention Indicator LED present.
+    pub attn_indicator: bool,
+    /// Power Indicator LED present.
+    pub pwr_indicator: bool,
+    /// Surprise-removal capable (device can disappear without notice).
+    pub hp_surprise: bool,
+    /// This slot is hot-plug capable (generates PDC events).
+    pub hp_capable: bool,
+    /// No Command Completed support — do not wait for CC after
+    /// writing Slot Control.
+    pub no_cmd_complete: bool,
+    /// Electromechanical Interlock present.
+    pub emi_present: bool,
+    /// Physical Slot Number (13-bit).
+    pub slot_number: u16,
+}
+
+impl SlotCaps {
+    /// Decode a raw Slot Capabilities DWORD (PCIe 6.0 §7.5.3.9).
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            attn_button: raw & slot_cap::ATTENTION_BUTTON != 0,
+            power_ctrl: raw & slot_cap::POWER_CONTROLLER != 0,
+            mrl_sensor: raw & slot_cap::MRL_SENSOR != 0,
+            attn_indicator: raw & slot_cap::ATTENTION_INDICATOR != 0,
+            pwr_indicator: raw & slot_cap::POWER_INDICATOR != 0,
+            hp_surprise: raw & slot_cap::HOT_PLUG_SURPRISE != 0,
+            hp_capable: raw & slot_cap::HOT_PLUG_CAPABLE != 0,
+            no_cmd_complete: raw & slot_cap::NO_COMMAND_COMPLETED != 0,
+            emi_present: raw & slot_cap::ELECTROMECHANICAL_INTERLOCK != 0,
+            slot_number: ((raw & slot_cap::PHYSICAL_SLOT_NUM_MASK)
+                >> slot_cap::PHYSICAL_SLOT_NUM_SHIFT) as u16,
+        }
+    }
 }
 
 /// Walk the device's standard PCI cap list and return the
@@ -384,3 +517,141 @@ pub fn hotplug_isr() {
 /// it observes a presence-detect change. Diagnostic.
 pub static HOTPLUG_EVENT_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+// ── Power control ──────────────────────────────────────────────────
+//
+// PCIe Slot Control bit 10 (POWER_CONTROLLER_OFF): 0 = on, 1 = off.
+// Only ports with SlotCaps.POWER_CONTROLLER should exercise these
+// helpers. Ref: Linux pciehp_hpc.c pciehp_set_power_state().
+
+/// Assert slot power on by clearing the Power Controller bit in
+/// Slot Control. Has no effect on slots without a power controller
+/// (`slot_cap::POWER_CONTROLLER` not set).
+///
+/// Optionally sets the Power Indicator to Blink while power ramps,
+/// then On. The indicator transition here is immediate (no delay);
+/// callers that want the blink period must re-call after the delay.
+///
+/// # Safety
+/// Caller-asserted live config space + valid PCIe cap offset
+/// + caller owns the device exclusively.
+pub unsafe fn slot_power_on(cfg_phys: u64, pcie_off: u8) {
+    // SAFETY: caller assertion.
+    unsafe {
+        let addr = (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CONTROL as u64) as *mut u16;
+        let cur = core::ptr::read_volatile(addr as *const u16);
+        // Clear POWER_CONTROLLER_OFF (bit 10) to turn power on.
+        // Set Power Indicator to On (bits[9:8] = 0b01).
+        let new = (cur & !slot_ctrl::POWER_CONTROLLER_OFF & !slot_ctrl::PWR_IND_MASK)
+            | slot_ctrl::PWR_IND_ON;
+        core::ptr::write_volatile(addr, new);
+    }
+}
+
+/// Assert slot power off by setting the Power Controller bit in
+/// Slot Control, and set the Power Indicator to Off.
+///
+/// # Safety
+/// Same as `slot_power_on`.
+pub unsafe fn slot_power_off(cfg_phys: u64, pcie_off: u8) {
+    // SAFETY: caller assertion.
+    unsafe {
+        let addr = (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CONTROL as u64) as *mut u16;
+        let cur = core::ptr::read_volatile(addr as *const u16);
+        // Set POWER_CONTROLLER_OFF (bit 10) to cut power.
+        // Set Power Indicator to Off (bits[9:8] = 0b11).
+        let new = (cur | slot_ctrl::POWER_CONTROLLER_OFF)
+            & !slot_ctrl::PWR_IND_MASK
+            | slot_ctrl::PWR_IND_OFF;
+        core::ptr::write_volatile(addr, new);
+    }
+}
+
+/// Read the current Presence Detect State from Slot Status (bit 6,
+/// read-only — not the W1C PDC event bit). Returns `true` when a
+/// device is electrically present in the slot.
+///
+/// # Safety
+/// Caller-asserted live config space + valid PCIe cap offset.
+pub unsafe fn slot_presence_detected(cfg_phys: u64, pcie_off: u8) -> bool {
+    // SAFETY: caller assertion.
+    let sts = unsafe {
+        core::ptr::read_volatile(
+            (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64) as *const u16,
+        )
+    };
+    sts & SLOT_STATUS_PRESENCE_DETECT_STATE != 0
+}
+
+// ── Insert / Remove path (soft model) ─────────────────────────────
+//
+// The full hardware path (Hot Reset → Config-space scan → driver
+// probe) requires the IRQ + delay infrastructure from Stage-4.
+// These helpers encode the *policy* decisions so the ISR can call
+// them once those primitives are available.
+//
+// Insert path (Linux pciehp_hpc.c pciehp_check_presence):
+//   1. Wait PRESENCE_DETECT_DEBOUNCE_MS for signal to stabilise.
+//   2. Re-read Slot Status — bail if PDState already went away.
+//   3. If slot has POWER_CONTROLLER: call slot_power_on().
+//   4. Dispatch HotplugEvent::Attach to listeners.
+//   (Re-enumeration of the bus segment happens in DefaultDispatcher.)
+//
+// Remove path:
+//   1. Dispatch HotplugEvent::Detach immediately (device is gone).
+//   2. If slot has POWER_CONTROLLER: call slot_power_off().
+//   3. Listeners tear down driver state / BAR mappings.
+
+/// Policy record for a single hot-plug port. Built from `SlotCaps`
+/// during port initialisation; consulted by the ISR on every event.
+#[derive(Copy, Clone, Debug)]
+pub struct SlotPolicy {
+    /// Config space physical address.
+    pub cfg_phys: u64,
+    /// Byte offset of the PCIe capability in config space.
+    pub pcie_cap_off: u8,
+    /// Whether software may control slot power.
+    pub has_power_ctrl: bool,
+}
+
+impl SlotPolicy {
+    /// Build a `SlotPolicy` from a `SlotCaps` + physical cfg address.
+    pub fn from_caps(cfg_phys: u64, pcie_cap_off: u8, caps: &SlotCaps) -> Self {
+        Self {
+            cfg_phys,
+            pcie_cap_off,
+            has_power_ctrl: caps.power_ctrl,
+        }
+    }
+
+    /// Execute the insert policy: power on (if supported) and
+    /// dispatch Attach. The caller is responsible for the debounce
+    /// delay before calling this function.
+    ///
+    /// `addr` and `device_id` identify the slot's bus address and
+    /// the newly-inserted device's identity.
+    ///
+    /// # Safety
+    /// Caller-asserted live config space; called after debounce.
+    pub unsafe fn on_insert(&self, addr: crate::addr::BusAddr, device_id: crate::device::DeviceId) {
+        if self.has_power_ctrl {
+            // SAFETY: caller assertion; config space is live.
+            unsafe { slot_power_on(self.cfg_phys, self.pcie_cap_off) };
+        }
+        dispatch_event(HotplugEvent::Attach { addr, device_id });
+    }
+
+    /// Execute the remove policy: dispatch Detach and power off
+    /// (if supported).
+    ///
+    /// # Safety
+    /// Caller-asserted live config space.
+    pub unsafe fn on_remove(&self, addr: crate::addr::BusAddr) {
+        dispatch_event(HotplugEvent::Detach { addr });
+        if self.has_power_ctrl {
+            // SAFETY: caller assertion.
+            unsafe { slot_power_off(self.cfg_phys, self.pcie_cap_off) };
+        }
+    }
+}
+
