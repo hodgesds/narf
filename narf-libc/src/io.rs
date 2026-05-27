@@ -17,8 +17,12 @@
 //! / precision / length / conversion grammar. Length modifiers
 //! (`hh / h / l / ll / j / z / t / L`) are accepted and ignored —
 //! [`Arg`] is already 64-bit so the integer payload doesn't change
-//! shape. The `*` width and `.*` precision forms are TODO (would
-//! require an extra Arg slot per `*`).
+//! shape. The `*` (dynamic width) and `.*` (dynamic precision)
+//! forms each consume one extra [`Arg::Int`] slot before the
+//! value slot, per C99 §7.19.6.1 ¶5: "An argument shall be of
+//! type int (a negative width is interpreted as a `-` flag
+//! followed by a positive width; a negative precision is taken
+//! as if no precision were specified)."
 //!
 //! Unknown conversions fall through verbatim (we emit `%` + the
 //! offending byte), matching the conventional "leak the format
@@ -139,6 +143,13 @@ struct FmtSpec {
     precision: Option<usize>,
     /// Conversion-specific: `%X` flips hex digits to upper case.
     upper_hex: bool,
+    /// `*` was seen in place of an integer width literal. The
+    /// format walker consumes one extra [`Arg::Int`] slot to fill
+    /// the width before reading the value's own slot.
+    dyn_width: bool,
+    /// `.*` was seen for the precision. Same Arg-consumption rule
+    /// as [`Self::dyn_width`].
+    dyn_precision: bool,
 }
 
 /// Returns `(spec, conv_byte, bytes_after_conv)` if a complete
@@ -163,37 +174,51 @@ fn parse_spec(bytes: &[u8]) -> Option<(FmtSpec, u8, usize)> {
         i += 1;
     }
 
-    // Width: decimal digits. `*` is documented TODO — we just stop
-    // at it (the conversion below will see `*` as the conv and
-    // fall through to the unknown-conv path).
-    let mut width: usize = 0;
-    let mut had_width = false;
-    while let Some(&b) = bytes.get(i) {
-        if b.is_ascii_digit() {
-            width = width.saturating_mul(10).saturating_add((b - b'0') as usize);
-            had_width = true;
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    if had_width {
-        spec.width = Some(width);
-    }
-
-    // Precision: `.` then optional digits (absent digits == 0).
-    if bytes.get(i) == Some(&b'.') {
+    // Width: decimal digits, or `*` for a dynamic width read from
+    // an [`Arg::Int`] slot. C99 §7.19.6.1 ¶5: a negative width is
+    // interpreted as `-` flag + positive abs, which we resolve in
+    // the format walker once the Arg is in hand.
+    if bytes.get(i) == Some(&b'*') {
+        spec.dyn_width = true;
         i += 1;
-        let mut prec: usize = 0;
+    } else {
+        let mut width: usize = 0;
+        let mut had_width = false;
         while let Some(&b) = bytes.get(i) {
             if b.is_ascii_digit() {
-                prec = prec.saturating_mul(10).saturating_add((b - b'0') as usize);
+                width = width.saturating_mul(10).saturating_add((b - b'0') as usize);
+                had_width = true;
                 i += 1;
             } else {
                 break;
             }
         }
-        spec.precision = Some(prec);
+        if had_width {
+            spec.width = Some(width);
+        }
+    }
+
+    // Precision: `.` then optional digits (absent digits == 0), or
+    // `.*` for a dynamic precision read from an [`Arg::Int`] slot.
+    // C99 §7.19.6.1 ¶5: a negative precision is taken as if no
+    // precision were specified — the walker handles that branch.
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        if bytes.get(i) == Some(&b'*') {
+            spec.dyn_precision = true;
+            i += 1;
+        } else {
+            let mut prec: usize = 0;
+            while let Some(&b) = bytes.get(i) {
+                if b.is_ascii_digit() {
+                    prec = prec.saturating_mul(10).saturating_add((b - b'0') as usize);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            spec.precision = Some(prec);
+        }
     }
 
     // Length modifiers: accept and ignore. Arg is already 64-bit
@@ -522,7 +547,7 @@ fn vformat(sink: &mut Sink<'_>, fmt: &str, args: &[Arg<'_>]) -> usize {
 
         // bytes[0] is '%'. parse_spec returns None on truncation,
         // in which case we emit the trailing '%' literally.
-        let (spec, conv, consumed) = match parse_spec(bytes) {
+        let (mut spec, conv, consumed) = match parse_spec(bytes) {
             Some(s) => s,
             None => {
                 emitted += sink.write(b"%");
@@ -530,6 +555,33 @@ fn vformat(sink: &mut Sink<'_>, fmt: &str, args: &[Arg<'_>]) -> usize {
             }
         };
         bytes = &bytes[consumed..];
+
+        // Resolve `*` / `.*` from Arg::Int slots, consumed before
+        // the conversion's own arg. Order in the argument list per
+        // C99 §7.19.6.1 ¶5 is: width-arg, precision-arg, value-arg.
+        if spec.dyn_width {
+            if let Some(Arg::Int(w)) = args.get(arg_idx) {
+                if *w < 0 {
+                    // Negative dynamic width == `-` flag + |w|.
+                    spec.left_justify = true;
+                    spec.width = Some(w.unsigned_abs() as usize);
+                } else {
+                    spec.width = Some(*w as usize);
+                }
+            }
+            arg_idx += 1;
+        }
+        if spec.dyn_precision {
+            if let Some(Arg::Int(p)) = args.get(arg_idx) {
+                if *p < 0 {
+                    // Negative dynamic precision == "no precision".
+                    spec.precision = None;
+                } else {
+                    spec.precision = Some(*p as usize);
+                }
+            }
+            arg_idx += 1;
+        }
 
         match conv {
             b'%' => {
@@ -846,3 +898,4 @@ impl core::fmt::Write for FdWriter {
         Ok(())
     }
 }
+
