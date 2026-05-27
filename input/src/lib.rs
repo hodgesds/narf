@@ -1142,6 +1142,16 @@ pub static I8042_KBD_IRQ_VECTOR: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 pub static I8042_MOUSE_IRQ_VECTOR: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
+/// IRQ-12 bump count + completed-packet count from
+/// `drivers/input/src/i8042_mouse.rs::on_irq12`. Use to
+/// diagnose "touchpad isn't moving the cursor": if IRQs stay 0,
+/// the controller never fires (re-check AUX init / IRQ routing).
+/// If IRQs grow but packets stay 0, packets are getting dropped
+/// by the sync-bit guard (re-sync issue).
+pub static I8042_MOUSE_IRQ_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static I8042_MOUSE_PACKET_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 /// Per-class ring activity counters — increment on every
 /// successful `push_global` so the panel can show whether kbd
 /// IRQs are firing without requiring serial. If kbd-pushes stays

@@ -244,6 +244,24 @@ pub unsafe fn init() -> Result<(), InitError> {
 pub unsafe fn on_irq12() {
     // SAFETY: 0x60 data port read.
     let byte = unsafe { inb(PS2_DATA) };
+    let irqs = narf_input::I8042_MOUSE_IRQ_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    // Log every 64 IRQs and at IRQ 1 — the user can grep
+    // /dev/kmsg to see if PS/2 mouse activity is reaching the
+    // ISR. Logging from inside on_irq12 is acceptable because
+    // klog's IrqSafeSpinLock is disjoint from the console
+    // backend's lock (see klog::record).
+    if irqs == 1 || irqs % 64 == 0 {
+        use core::fmt::Write as _;
+        let pkts = narf_input::I8042_MOUSE_PACKET_COUNT
+            .load(Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i8042-mouse: irqs={} packets={}",
+            irqs, pkts
+        );
+    }
 
     let phase = STATE.phase.load(Ordering::Acquire);
     if phase == 0 && (byte & 0x08) == 0 {
@@ -281,6 +299,8 @@ pub unsafe fn on_irq12() {
 
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
     STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
+    narf_input::I8042_MOUSE_PACKET_COUNT
+        .fetch_add(1, Ordering::Relaxed);
 
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
 }
