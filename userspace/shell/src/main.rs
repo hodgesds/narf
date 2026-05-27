@@ -1927,24 +1927,45 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let mut buf = [0u8; 4096];
             let mut line = [0u8; 4096];
             let mut llen = 0usize;
-            let mut prev_printed = [0u8; 4096];
-            let mut prev_len = 0usize;
+            // Full-output dedup ring. `-u` now keeps a fixed-size
+            // window of recently-emitted lines (256 entries × 256
+            // bytes ≈ 64 KiB on the stack — fits cleanly in the
+            // shell's stack frame). Cheaper than a hash set, fast
+            // enough for boot-log dumps that are O(thousands) of
+            // lines. When the ring fills, oldest entries get
+            // displaced.
+            const DEDUP_CAP: usize = 256;
+            const DEDUP_LEN: usize = 256;
+            let mut seen = [[0u8; DEDUP_LEN]; DEDUP_CAP];
+            let mut seen_lens = [0usize; DEDUP_CAP];
+            let mut seen_count = 0usize;
+            let mut seen_next = 0usize;
             let emit = |fd: i32,
                         line: &[u8],
-                        prev_printed: &mut [u8; 4096],
-                        prev_len: &mut usize|
+                        seen: &mut [[u8; DEDUP_LEN]; DEDUP_CAP],
+                        seen_lens: &mut [usize; DEDUP_CAP],
+                        seen_count: &mut usize,
+                        seen_next: &mut usize|
              -> () {
-                if unique && line.len() == *prev_len && &prev_printed[..*prev_len] == line {
-                    return;
+                if unique {
+                    let n = line.len().min(DEDUP_LEN);
+                    // Linear-scan the populated entries.
+                    for i in 0..*seen_count {
+                        if seen_lens[i] == n && seen[i][..n] == line[..n] {
+                            return;
+                        }
+                    }
+                    // Record (overwriting oldest if full).
+                    seen[*seen_next][..n].copy_from_slice(&line[..n]);
+                    seen_lens[*seen_next] = n;
+                    *seen_next = (*seen_next + 1) % DEDUP_CAP;
+                    if *seen_count < DEDUP_CAP {
+                        *seen_count += 1;
+                    }
                 }
                 unsafe {
                     write_all(fd, line);
                     write_all(fd, NEWLINE);
-                }
-                if unique {
-                    let n = line.len().min(prev_printed.len());
-                    prev_printed[..n].copy_from_slice(&line[..n]);
-                    *prev_len = n;
                 }
             };
             let test = |line_bytes: &[u8]| -> bool {
@@ -1966,7 +1987,14 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 for &b in &buf[..n as usize] {
                     if b == b'\n' {
                         if test(&line[..llen]) {
-                            emit(fd, &line[..llen], &mut prev_printed, &mut prev_len);
+                            emit(
+                                fd,
+                                &line[..llen],
+                                &mut seen,
+                                &mut seen_lens,
+                                &mut seen_count,
+                                &mut seen_next,
+                            );
                         }
                         llen = 0;
                     } else if llen < line.len() {
@@ -1976,7 +2004,14 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 }
             }
             if llen > 0 && test(&line[..llen]) {
-                emit(fd, &line[..llen], &mut prev_printed, &mut prev_len);
+                emit(
+                    fd,
+                    &line[..llen],
+                    &mut seen,
+                    &mut seen_lens,
+                    &mut seen_count,
+                    &mut seen_next,
+                );
             }
             if owned_fd >= 0 {
                 let _ = unsafe { libc::posix::close(owned_fd) };
