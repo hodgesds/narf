@@ -30,7 +30,7 @@
 //! - ACPI 6.5: §5.2.21.1 (DMAR), §5.2.31 (IVRS).
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -97,6 +97,9 @@ struct IommuState {
     /// (e.g. one per NUMA node on multi-socket Intel boxes).
     /// We only program the first one in this pass.
     units: AtomicU8,
+    /// Primary IOMMU unit's MMIO base address (from the first
+    /// IVRS/DMAR entry). 0 until [`init`] succeeds.
+    primary_mmio_base: AtomicU64,
 }
 
 static STATE: IommuState = IommuState {
@@ -111,6 +114,7 @@ static STATE: IommuState = IommuState {
         interrupt_remap: false,
     }),
     units: AtomicU8::new(0),
+    primary_mmio_base: AtomicU64::new(0),
 };
 
 /// Why [`init`] gave up.
@@ -209,6 +213,9 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
     *STATE.caps.lock() = effective_caps;
     STATE.vendor.store(vendor as u8, Ordering::Release);
     STATE.units.store(n_units, Ordering::Release);
+    STATE
+        .primary_mmio_base
+        .store(mmio_base, Ordering::Release);
     *STATE.mode.lock() = IommuMode::Identity;
 
     Ok(IommuMode::Identity)
@@ -250,6 +257,15 @@ pub fn caps() -> IommuCaps {
 #[inline]
 pub fn unit_count() -> u8 {
     STATE.units.load(Ordering::Acquire)
+}
+
+/// MMIO base of the primary (first-enumerated) IOMMU unit. Returns
+/// 0 when [`init`] hasn't run, the IOMMU isn't present, or `init`
+/// failed. Boot diagnostics use this to print where the IOMMU
+/// register block lives.
+#[inline]
+pub fn primary_mmio_base() -> u64 {
+    STATE.primary_mmio_base.load(Ordering::Acquire)
 }
 
 /// Translate a host-physical address into an IOVA the device
@@ -406,6 +422,7 @@ pub fn __reset_for_test() {
     STATE.initialised.store(false, Ordering::Release);
     STATE.vendor.store(0, Ordering::Release);
     STATE.units.store(0, Ordering::Release);
+    STATE.primary_mmio_base.store(0, Ordering::Release);
     *STATE.mode.lock() = IommuMode::Disabled;
     *STATE.caps.lock() = IommuCaps::default();
 }

@@ -712,3 +712,17 @@ fn smoke_iommu_mode_resolution_priority() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io/iommu", smoke_iommu_mode_resolution_priority);
+
+fn smoke_iommu_primary_mmio_base_zero_after_reset() -> TestResult {
+    // primary_mmio_base must zero after reset and reflect the
+    // IOMMU's MMIO when init succeeds. We can only assert the
+    // zero half from tests; the live half is covered by the boot
+    // path's diagnostic print.
+    use crate::iommu::{__reset_for_test, primary_mmio_base};
+    __reset_for_test();
+    if primary_mmio_base() != 0 {
+        return TestResult::Fail("primary_mmio_base() != 0 after reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_primary_mmio_base_zero_after_reset);
