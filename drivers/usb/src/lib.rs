@@ -33,6 +33,24 @@ pub fn register_initcalls() {
         xhci::register_pci_driver();
         InitResult::Ok
     });
+    // EHCI / OHCI / UHCI structural binding — Stage-0 probe paths
+    // that map BARs + log + return ProbeError::Other("not
+    // implemented"). Renoir / Phoenix don't carry these silicon
+    // blocks (everything's xHCI) but the registrations let
+    // expansion cards / desktop boards / future SoCs get a
+    // recognised log line instead of an "unbound device" trace.
+    narf_init::register(Stage::Subsys, "ehci", || {
+        ehci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "ohci", || {
+        ohci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "uhci", || {
+        uhci::register_pci_driver();
+        InitResult::Ok
+    });
     // Stage::Device runs after Stage::Subsys, so the xHCI controller
     // (probed by the bus walker once `register_pci_driver` runs) is
     // up by the time this fires. If no xHCI is present, skip.
@@ -186,15 +204,36 @@ fn spawn_supervisor_task() {
         // consecutive failures (typically all PortResetTimeout on a
         // dead USB3 port the rate-matching hub has internally
         // routed elsewhere, OR a port whose attached device doesn't
-        // match any class driver we have), give up to stop burning
-        // cycles + log noise.
+        // match any class driver we have), back off — but never
+        // permanently. A port stuck in Polling for a while can
+        // recover (cable wiggle, dock re-energise, hub re-train),
+        // so the supervisor checks PORTSC.PLS each iteration: a
+        // transition to U0 (link active, 0x0) clears the fail
+        // counter so enumeration retries the now-healthy port.
+        // Without this a port that fails 8 reset attempts during
+        // a power-glitch is dead until reboot.
+        //
+        // Linux's equivalent flow lives in `drivers/usb/core/hub.c`:
+        // `hub_port_connect_change` re-runs `hub_port_init` every
+        // time the connect-status bit toggles. We don't have
+        // PORTSC-change interrupts wired up cleanly today, so we
+        // poll PORTSC.PLS each supervisor cycle as a near-equivalent.
         const MAX_PER_PORT_RETRIES: u8 = 8;
+        /// PORTSC.PLS shift (bits 5..8 — xHCI 1.2 §5.4.8 Table 5-27).
+        const PORTSC_PLS_SHIFT: u32 = 5;
+        const PORTSC_PLS_MASK: u32 = 0xF << PORTSC_PLS_SHIFT;
+        /// PORTSC.PLS encoding for U0 — link active, ready to transfer.
+        const PORTSC_PLS_U0: u32 = 0x0;
         let mut irq_vector: Option<u8> = None;
         // Per-root-port claimed mask: 1 = something is bound to
         // that port and we don't need to re-try.
         let mut claimed_root: u128 = 0;
         // Per-root-port consecutive-failure counter.
         let mut root_fail_count = [0u8; 128];
+        // Per-root-port last-observed PLS encoding. Sentinel value
+        // 0xFF means "not yet sampled" so the first sample doesn't
+        // trip a spurious "PLS changed" reset.
+        let mut last_pls = [0xFFu8; 128];
         // Cursor into the connected-ports list — try ONE port per
         // loop iteration, then advance + pump + sleep. The earlier
         // "for &p in &connected_root" body ran try_attach_root for
@@ -233,6 +272,39 @@ fn spawn_supervisor_task() {
             let connected_root: alloc::vec::Vec<u8> =
                 c.connected_ports().iter().map(|(p, _)| *p).collect();
             SUPERVISOR_PHASE.store(4, core::sync::atomic::Ordering::Relaxed);
+            // PLS-transition decay pass: for every connected port,
+            // sample PORTSC.PLS. If it transitioned into U0 (link
+            // active) since we last looked, clear the per-port fail
+            // counter so the now-healthy port gets a fresh round of
+            // enumeration attempts. Without this, a transient
+            // failure (port in Polling for too long, cable wiggle
+            // mid-reset, dock re-energise) permanently burned the
+            // port out at 8 retries.
+            for &p in connected_root.iter() {
+                let pi = (p as usize) & 127;
+                if let Some(v) = c.portsc(p) {
+                    let pls = ((v & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT) as u8;
+                    let prev = last_pls[pi];
+                    if prev != 0xFF
+                        && prev != pls
+                        && pls == PORTSC_PLS_U0 as u8
+                        && root_fail_count[pi] != 0
+                    {
+                        // Port just came alive after being stuck.
+                        // Wipe the fail counter so the enumeration
+                        // retry loop picks it up again. Log so a
+                        // real-HW boot makes the recovery visible.
+                        use core::fmt::Write as _;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  usb-supervisor: port {} PLS {:x}→U0, retry budget reset",
+                            p, prev
+                        );
+                        root_fail_count[pi] = 0;
+                    }
+                    last_pls[pi] = pls;
+                }
+            }
             // Find the next unbound, not-yet-burned port starting
             // from `next_root_idx`. Wrap at end so on later passes
             // we revisit ports whose `root_fail_count` reset.
