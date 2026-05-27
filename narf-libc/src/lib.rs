@@ -199,10 +199,11 @@ pub use pthread::{
     MAIN_THREAD, PTHREAD_BARRIER_SERIAL_THREAD, PTHREAD_ONCE_INIT,
 };
 pub use process::{
-    abort, atexit, execv, execve, execvp, exit, fork, getegid, geteuid, getgid,
-    getpgid, getpgrp, getpid, getppid, getpriority, getsid, gettid, getuid,
-    nice, prctl, setgid, setpgid, setpriority, setsid, setuid, sleep, usleep,
-    vfork, wait, waitpid, _exit, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
+    abort, atexit, clone, execv, execve, execvp, exit, fork, getegid, geteuid,
+    getgid, getpgid, getpgrp, getpid, getppid, getpriority, getsid, gettid,
+    getuid, nice, prctl, setgid, setpgid, setpriority, setsid, setuid, sleep,
+    tgkill, tkill, usleep, vfork, wait, wait4, waitpid, _Exit, _exit,
+    PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
     PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_SET_DUMPABLE,
     PR_SET_NAME, PR_SET_NO_NEW_PRIVS,
 };

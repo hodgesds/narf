@@ -723,3 +723,104 @@ pub unsafe extern "C" fn unshare(flags: u32) -> i32 {
         }
     }
 }
+
+// ── `_Exit` / `wait4` / `tgkill` / `clone` ─────────────────────────
+//
+// C11 / POSIX-2008 / Linux extensions.
+
+/// C11 `_Exit(status)` — like `_exit` but explicitly skips
+/// atexit handlers. Identical implementation under our model
+/// (`_exit` already doesn't walk the atexit chain).
+///
+/// Reference: musl `src/exit/_Exit.c`.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn _Exit(code: i32) -> ! {
+    // SAFETY: forwarded; never returns.
+    unsafe { _exit(code) }
+}
+
+/// `wait4(pid, status, options, rusage)` — Linux/BSD extended wait.
+/// `rusage` is currently ignored (NARF doesn't track per-task
+/// resource usage on exit). Returns the reaped pid, 0 on
+/// WNOHANG-with-no-exited-child, -1 + ECHILD on no children.
+///
+/// Reference: glibc `sysdeps/unix/sysv/linux/wait4.c`.
+///
+/// # Safety
+/// `status` / `rusage` (when non-null) must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wait4(
+    pid: i32,
+    status: *mut i32,
+    options: i32,
+    rusage: *mut crate::sys::rusage,
+) -> i32 {
+    let r = unsafe {
+        narf_user_runtime::wait4(
+            pid as i64,
+            status,
+            options as u32,
+            rusage as *mut _,
+        )
+    };
+    match r {
+        Ok(reaped) => reaped as i32,
+        Err(()) => {
+            crate::errno::set_errno(ECHILD);
+            -1
+        }
+    }
+}
+
+/// `tgkill(tgid, tid, signum)` — Linux per-thread signal delivery.
+/// Forwards to the kernel SYS_TGKILL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tgkill(tgid: i32, tid: i32, signum: i32) -> i32 {
+    if signum < 0 { return -1; }
+    let r = narf_user_runtime::tgkill(tgid as i64, tid as u64, signum as u32);
+    if r != 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    0
+}
+
+/// `tkill(tid, signum)` — Linux deprecated single-thread kill.
+/// Implemented as `tgkill(-1, tid, signum)` per kernel docs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tkill(tid: i32, signum: i32) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { tgkill(-1, tid, signum) }
+}
+
+/// `clone(fn, stack, flags, arg, ...)` — Linux clone(2). The
+/// canonical glibc shape is `int clone(int (*fn)(void *), void
+/// *stack, int flags, void *arg, ...)`. We honour the four-arg
+/// form; trailing arguments (`ptid`, `tls`, `ctid`) are ignored
+/// today.
+///
+/// Reference: glibc `sysdeps/unix/sysv/linux/x86_64/clone.S`.
+///
+/// # Safety
+/// `entry_fn` must remain alive for the new thread's lifetime;
+/// `stack` must point to the top of a writable stack.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clone(
+    entry_fn: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> i32>,
+    stack: *mut core::ffi::c_void,
+    _flags: i32,
+    arg: *mut core::ffi::c_void,
+) -> i32 {
+    let entry = match entry_fn {
+        Some(f) => f as usize as u64,
+        None => return -1,
+    };
+    match narf_user_runtime::clone(entry, stack as u64, arg as u64, 0) {
+        Ok(tid) => tid as i32,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}

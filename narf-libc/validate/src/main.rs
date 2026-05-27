@@ -2741,6 +2741,48 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new process-control C-ABI probes ─────────────────────────
+    //
+    // wait4(-1, ..., WNOHANG=1, NULL) with no children must surface
+    // -1 with errno=ECHILD (10). Tests the C-ABI shape end-to-end.
+    let wait4_ok = unsafe {
+        let mut status: i32 = 0;
+        let r = narf_libc::wait4(-1, &mut status as *mut i32, 1, core::ptr::null_mut());
+        r == -1 && narf_libc::errno() == 10
+    };
+    narf_libc::printf_str(
+        if wait4_ok { "wait4: ok\n" } else { "wait4: bad\n" },
+        &[],
+    );
+
+    // tkill(self, 0) with signum=0 should be a no-op success or
+    // structured failure — kernel sees `signum=0` as "check
+    // existence" today. The C-ABI shape is the load-bearing piece.
+    let tkill_ok = unsafe {
+        let pid = narf_libc::getpid();
+        let r = narf_libc::tkill(pid, 0);
+        r == 0 || r == -1
+    };
+    narf_libc::printf_str(
+        if tkill_ok { "tkill: ok\n" } else { "tkill: bad\n" },
+        &[],
+    );
+
+    // clone(NULL, ...) — entry NULL must return -1 without crashing.
+    let clone_ok = unsafe {
+        let r = narf_libc::clone(
+            None,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+        );
+        r == -1
+    };
+    narf_libc::printf_str(
+        if clone_ok { "clone: ok\n" } else { "clone: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
