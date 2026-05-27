@@ -464,6 +464,134 @@ fn smoke_microcode_cpu_signature_matches_ident() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/microcode", smoke_microcode_cpu_signature_matches_ident);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_blob_filename_for_current_cpu() -> TestResult {
+    use crate::x86_64::microcode;
+    let mut buf = [0u8; 40];
+    let n = match microcode::blob_filename_for_current_cpu(&mut buf) {
+        Some(n) => n,
+        None => return TestResult::Fail("blob_filename_for_current_cpu returned None"),
+    };
+    let name = &buf[..n];
+    match microcode::vendor() {
+        microcode::Vendor::Intel => {
+            // "intel-ucode/" prefix + 8 ASCII bytes.
+            if !name.starts_with(b"intel-ucode/") {
+                return TestResult::Fail("intel name missing prefix");
+            }
+            if name.len() != b"intel-ucode/".len() + 8 {
+                return TestResult::Fail("intel name wrong length");
+            }
+        }
+        microcode::Vendor::Amd => {
+            if !name.starts_with(b"amd-ucode/microcode_amd_fam") {
+                return TestResult::Fail("amd name missing prefix");
+            }
+            if !name.ends_with(b".bin") {
+                return TestResult::Fail("amd name missing .bin suffix");
+            }
+        }
+        microcode::Vendor::Unknown => {
+            return TestResult::Fail("unknown vendor on x86_64");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_blob_filename_for_current_cpu);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_blob_filename_buffer_too_small() -> TestResult {
+    use crate::x86_64::microcode;
+    // 4 bytes isn't enough for any vendor.
+    let mut buf = [0u8; 4];
+    if microcode::blob_filename_for_current_cpu(&mut buf).is_some() {
+        return TestResult::Fail("accepted undersized buffer");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_blob_filename_buffer_too_small);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_resolve_rejects_short_blob() -> TestResult {
+    use crate::x86_64::microcode::{self, UcodeError};
+    // Empty + tiny blobs reject without touching MSRs.
+    let empty = [];
+    match microcode::resolve_for_current_cpu(&empty) {
+        Err(UcodeError::TooShort)
+        | Err(UcodeError::SignatureMismatch)
+        | Err(UcodeError::BadHeader)
+        | Err(UcodeError::UnknownVendor) => TestResult::Pass,
+        _ => TestResult::Fail("empty blob accepted"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_resolve_rejects_short_blob);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_amd_resolve_picks_patch() -> TestResult {
+    use crate::x86_64::microcode::{
+        self, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN,
+        AMD_PATCH_SECTION_TYPE,
+    };
+    // Only meaningful on AMD hosts; skip on Intel.
+    if microcode::vendor() != microcode::Vendor::Amd {
+        return TestResult::Skip("AMD-only");
+    }
+    let sig = microcode::cpu_signature();
+    let mut blob = [0u8; 116];
+    blob[0..4].copy_from_slice(&AMD_CONTAINER_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&AMD_EQUIV_TYPE.to_le_bytes());
+    blob[8..12].copy_from_slice(&32u32.to_le_bytes());
+    blob[12..16].copy_from_slice(&sig.to_le_bytes()); // installed_cpu = running CPU
+    blob[24..26].copy_from_slice(&0x4242u16.to_le_bytes()); // equiv_cpu
+    // (entry #2 = all-zero terminator)
+    blob[44..48].copy_from_slice(&AMD_PATCH_SECTION_TYPE.to_le_bytes());
+    blob[48..52].copy_from_slice(&(AMD_PATCH_HDR_LEN as u32).to_le_bytes());
+    blob[52 + 24..52 + 26].copy_from_slice(&0x4242u16.to_le_bytes());
+
+    match microcode::resolve_for_current_cpu(&blob) {
+        Ok(patch) => {
+            if patch.len() != AMD_PATCH_HDR_LEN {
+                return TestResult::Fail("resolved AMD patch wrong length");
+            }
+            TestResult::Pass
+        }
+        Err(_) => TestResult::Fail("resolve_for_current_cpu rejected matching blob"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_amd_resolve_picks_patch);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_amd_resolve_misses_wrong_cpu() -> TestResult {
+    use crate::x86_64::microcode::{
+        self, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN,
+        AMD_PATCH_SECTION_TYPE, UcodeError,
+    };
+    if microcode::vendor() != microcode::Vendor::Amd {
+        return TestResult::Skip("AMD-only");
+    }
+    // Build a container that doesn't include our CPUID.
+    let mut blob = [0u8; 116];
+    blob[0..4].copy_from_slice(&AMD_CONTAINER_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&AMD_EQUIV_TYPE.to_le_bytes());
+    blob[8..12].copy_from_slice(&32u32.to_le_bytes());
+    blob[12..16].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // not us
+    blob[24..26].copy_from_slice(&0x4242u16.to_le_bytes());
+    blob[44..48].copy_from_slice(&AMD_PATCH_SECTION_TYPE.to_le_bytes());
+    blob[48..52].copy_from_slice(&(AMD_PATCH_HDR_LEN as u32).to_le_bytes());
+    blob[52 + 24..52 + 26].copy_from_slice(&0x4242u16.to_le_bytes());
+
+    match microcode::resolve_for_current_cpu(&blob) {
+        Err(UcodeError::SignatureMismatch) => TestResult::Pass,
+        _ => TestResult::Fail("accepted blob that doesn't cover this CPU"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_amd_resolve_misses_wrong_cpu);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_psci_version() -> TestResult {
     use crate::aarch64::psci;

@@ -666,3 +666,114 @@ pub fn applied_revision() -> u32 {
 pub fn __reset_applied_revision_for_test() {
     APPLIED_REVISION.store(0, Ordering::Release);
 }
+
+/// Derive the canonical firmware-registry name for the running
+/// CPU's microcode container.
+///
+/// - Intel:  `"intel-ucode/06-A6-01"`-style. 8-byte FMS triple
+///   under the `intel-ucode/` directory the registry mirrors from
+///   Linux's `linux-firmware` package.
+/// - AMD:    `"amd-ucode/microcode_amd_fam17h.bin"`-style. Family-
+///   wide container; the equiv-table walker picks the right patch
+///   inside it.
+///
+/// Output is written into the caller-supplied byte buffer (kept
+/// stack-allocated to avoid pulling `alloc` into this module);
+/// returns the length actually written, or `None` if the buffer
+/// is too small or the vendor isn't supported.
+///
+/// Buffer must hold at least 40 bytes — the longest name we emit
+/// (`"amd-ucode/microcode_amd_famFFh.bin"` = 34 bytes; 40 leaves
+/// slack for future family widths).
+pub fn blob_filename_for_current_cpu(out: &mut [u8]) -> Option<usize> {
+    let fms = FamilyModelStepping::current();
+    match vendor() {
+        Vendor::Intel => {
+            const PREFIX: &[u8] = b"intel-ucode/";
+            let name = fms.intel_filename();
+            let total = PREFIX.len() + name.len();
+            if out.len() < total {
+                return None;
+            }
+            out[..PREFIX.len()].copy_from_slice(PREFIX);
+            out[PREFIX.len()..total].copy_from_slice(&name);
+            Some(total)
+        }
+        Vendor::Amd => {
+            const PREFIX: &[u8] = b"amd-ucode/microcode_amd_fam";
+            const SUFFIX: &[u8] = b".bin";
+            let tag = fms.amd_family_tag();
+            let total = PREFIX.len() + tag.len() + SUFFIX.len();
+            if out.len() < total {
+                return None;
+            }
+            out[..PREFIX.len()].copy_from_slice(PREFIX);
+            out[PREFIX.len()..PREFIX.len() + tag.len()].copy_from_slice(&tag);
+            out[PREFIX.len() + tag.len()..total].copy_from_slice(SUFFIX);
+            Some(total)
+        }
+        Vendor::Unknown => None,
+    }
+}
+
+/// Resolve the on-disk blob bytes to the per-CPU patch this
+/// silicon needs.
+///
+/// For Intel the input is the FMS-specific blob already
+/// (per-signature file in `intel-ucode/`); the function only
+/// validates the header + checksum.
+///
+/// For AMD the input is the family-wide container; the function
+/// walks the equiv-table for our CPUID, finds the matching patch
+/// section, and returns the per-patch slice.
+///
+/// Returns `Err(SignatureMismatch)` when the blob exists but
+/// doesn't carry a patch for our silicon, `Err(BadHeader)` when
+/// the bytes are malformed.
+pub fn resolve_for_current_cpu(blob: &[u8]) -> Result<&[u8], UcodeError> {
+    match vendor() {
+        Vendor::Intel => {
+            let hdr = IntelUcodeHeader::decode(blob).ok_or(UcodeError::TooShort)?;
+            hdr.validate(blob)?;
+            if !hdr.matches_signature(cpu_signature()) {
+                return Err(UcodeError::SignatureMismatch);
+            }
+            let total = hdr.effective_total_size() as usize;
+            Ok(&blob[..total])
+        }
+        Vendor::Amd => {
+            let sig = cpu_signature();
+            let equiv = amd_find_equiv(blob, sig).ok_or(UcodeError::SignatureMismatch)?;
+            amd_find_patch(blob, equiv).ok_or(UcodeError::SignatureMismatch)
+        }
+        Vendor::Unknown => Err(UcodeError::UnknownVendor),
+    }
+}
+
+/// Boot-time + per-AP entry point.
+///
+/// Resolves the right per-CPU patch out of the caller-supplied
+/// container blob, applies it via the vendor-specific MSR, and
+/// confirms the revision moved. The caller (boot path on the BSP;
+/// AP startup stub on every AP) has already fetched the container
+/// from the firmware registry.
+///
+/// Returns the post-apply revision on success. Failure cases:
+/// - `Err(UnknownVendor)`     — non-Intel/AMD silicon
+/// - `Err(SignatureMismatch)` — blob doesn't cover this CPU
+/// - `Err(BadHeader)`         — malformed bytes
+/// - `Err(LoaderLocked)`      — BIOS locked the loader MSR
+/// - `Err(NoRevisionChange)`  — patch applied but rev didn't
+///   advance (blob was already the current rev, or wrong subspec)
+///
+/// # Safety
+/// CPL = 0 and the running CPU is the one the patch should target
+/// (the caller is the BSP for the BSP-side call and the AP itself
+/// for the per-AP call — never one CPU applying on another's
+/// behalf, since the patch loader is per-core).
+pub unsafe fn apply_for_current_cpu(container: &[u8]) -> Result<u32, UcodeError> {
+    let patch = resolve_for_current_cpu(container)?;
+    // SAFETY: caller-asserted CPL=0; `resolve_for_current_cpu`
+    // confirmed the patch matches our silicon.
+    unsafe { apply(patch) }
+}
