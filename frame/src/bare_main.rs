@@ -1114,6 +1114,34 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 );
                             }
                         }
+                        // FACS — Firmware ACPI Control Structure.
+                        // Reached via FADT.firmware_ctrl /
+                        // X_FirmwareCtrl. Required for S3 suspend so
+                        // `arm_s3_waking_vector` has a phys to write
+                        // the resume vector into. Absence is normal
+                        // on hypervisor-only platforms that don't
+                        // expose S-state firmware (QEMU `-machine pc`
+                        // for example).
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_facs(p) } {
+                            Ok(()) => {
+                                if let Some(fi) = narf_acpi::facs_info() {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  acpi: FACS parsed (v{}, hw-sig {:#x})",
+                                        fi.version,
+                                        fi.hardware_signature,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: FACS parse skipped: {:?}",
+                                    e
+                                );
+                            }
+                        }
                         // SAFETY: same.
                         match unsafe { narf_acpi::parse_hmat(p) } {
                             Ok(n) => {

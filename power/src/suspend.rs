@@ -46,9 +46,19 @@ pub enum SuspendPhase {
 /// Errors from the suspend surface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SuspendError {
+    /// Cap epoch check failed — caller's authority was revoked.
     AuthorityRevoked,
+    /// Platform doesn't support S3 (no `\_S3_`, no usable PM1A_CNT),
+    /// or the system is in test-mode and the real PM1 write is
+    /// gated off pending bring-up validation. Today's production
+    /// boots return this until [`__test_arm_real_sleep`] is flipped.
     NotImplemented,
+    /// A suspend transition is already in progress on this CPU.
     AlreadySuspending,
+    /// Pre-PM1 setup failed — usually a missing FACS or an
+    /// unresolved virt→phys translation for the trampoline. The
+    /// chipset has not been touched; resume fan-out has already
+    /// run.
     Aborted,
 }
 
@@ -62,10 +72,18 @@ impl From<CapError> for SuspendError {
 /// from a signal handler / interrupt without grabbing a lock.
 static PHASE: AtomicU8 = AtomicU8::new(SuspendPhase::Idle as u8);
 
-/// Request a system-wide suspend. Returns `NotImplemented` until
-/// the platform primitives land — but *does* walk the phase
-/// progression up to `PlatformOff` so subscribers can observe the
-/// handoff shape.
+/// Request a system-wide suspend. Walks the phase progression
+/// through to `PlatformOff`; on platforms where S3 is supported
+/// (`s3_supported() == true`) and the resume trampoline has been
+/// armed (`__test_arm_real_sleep` or future production gate),
+/// delegates to [`arm_s3_resume`] which writes the FACS waking
+/// vector and issues the PM1 sleep transition. Otherwise the
+/// function walks the phases for subscribers, runs the resume
+/// fan-out so paired drivers observe a clean cycle, and returns
+/// `NotImplemented`.
+///
+/// Returns `Ok(())` only after a full suspend → resume cycle on
+/// platforms with armed S3.
 pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
     cap.invoke(NoopOp)?;
     let prev = PHASE.swap(SuspendPhase::FreezingUserspace as u8, Ordering::AcqRel);
@@ -83,11 +101,42 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
     PHASE.store(SuspendPhase::SyncingCache as u8, Ordering::Release);
     PHASE.store(SuspendPhase::SavingCpuState as u8, Ordering::Release);
     PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
-    // Real platform suspend would happen here and not return until
-    // resume. We mirror a "ping-pong through the phases without
-    // actually sleeping" behaviour so the shape exercises — and
-    // run the resume fan-out so paired suspend/resume drivers
-    // observe a clean cycle even on the no-op shape.
+
+    // Real platform suspend, when armed and supported. The
+    // arm_s3_resume() path saves CPU state, programs the FACS
+    // waking vector, fans out device suspend, and writes PM1
+    // SLP_TYP|SLP_EN. It only returns when the wake trampoline +
+    // longjmp bring control back here.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if s3_supported() && REAL_SLEEP_ARMED.load(Ordering::Acquire) {
+            match arm_s3_resume(cap) {
+                Ok(()) => {
+                    PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
+                    let _ = crate::device_pm::resume_all_devices();
+                    PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
+                    PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // arm_s3_resume failed before PM1 — fall through
+                    // to the ping-pong unwind so phase observers see
+                    // a clean return-to-Idle.
+                    PHASE.store(SuspendPhase::RestoringCpuState as u8, Ordering::Release);
+                    PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
+                    let _ = crate::device_pm::resume_all_devices();
+                    PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
+                    PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Unarmed / unsupported path: mirror a "ping-pong through the
+    // phases without actually sleeping" so the shape exercises and
+    // paired suspend/resume drivers observe a clean cycle on
+    // hypervisors that don't expose S3.
     PHASE.store(SuspendPhase::RestoringCpuState as u8, Ordering::Release);
     PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
     let _resume_report = crate::device_pm::resume_all_devices();
@@ -322,7 +371,7 @@ pub fn arm_s3_resume(
         )
     } {
         Some(p) => p.raw() | (entry_virt & 0xFFF),
-        None => return Err(SuspendError::NotImplemented),
+        None => return Err(SuspendError::Aborted),
     };
     let ctx_phys = match unsafe {
         narf_memory::x86_64::paging::translate(
@@ -331,7 +380,7 @@ pub fn arm_s3_resume(
         )
     } {
         Some(p) => p.raw() | (ctx_virt & 0xFFF),
-        None => return Err(SuspendError::NotImplemented),
+        None => return Err(SuspendError::Aborted),
     };
     // Stash the ctx phys so the trampoline's RIP-relative lookup
     // can find ResumeContext post-CR3-restore. (Pre-CR3 the
@@ -342,8 +391,11 @@ pub fn arm_s3_resume(
     // SAFETY: trampoline is a `naked extern "C" fn`; its phys is
     // stable for the kernel lifetime, and the firmware
     // identity-maps that page through the wake handoff.
-    if let Err(_) = unsafe { narf_acpi::arm_s3_waking_vector(entry_phys) } {
-        return Err(SuspendError::NotImplemented);
+    if unsafe { narf_acpi::arm_s3_waking_vector(entry_phys) }.is_err() {
+        // FACS hasn't been parsed (no `\_S3_` chain on this
+        // platform) or the entry phys is >4 GiB on a FACS v0
+        // firmware. Either way, we can't wake — refuse to sleep.
+        return Err(SuspendError::Aborted);
     }
     // Fan out device suspend handlers in reverse-registration order.
     let _ = crate::device_pm::suspend_all_devices();

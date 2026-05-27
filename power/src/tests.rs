@@ -309,6 +309,85 @@ fn smoke_s3_enter_refuses_without_arm() -> TestResult {
 }
 kernel_test_in!("power/suspend", smoke_s3_enter_refuses_without_arm);
 
+fn smoke_s3_arm_resume_refuses_without_s3() -> TestResult {
+    // arm_s3_resume should fail closed when the platform doesn't
+    // expose `\_S3_` (single-namespace QEMU `-kernel` boot). The
+    // function must return without touching PM1 or arming a wake
+    // vector, regardless of whether REAL_SLEEP_ARMED is set.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::{suspend, Power};
+        use narf_capabilities::{Cap, Invoke};
+
+        suspend::__test_reset();
+        let cap: Cap<Power, Invoke> = Cap::bootstrap();
+        match suspend::arm_s3_resume(&cap) {
+            Err(suspend::SuspendError::NotImplemented)
+            | Err(suspend::SuspendError::Aborted) => {}
+            Err(suspend::SuspendError::AuthorityRevoked) => {
+                return TestResult::Fail("live cap was rejected as revoked");
+            }
+            Err(_) => return TestResult::Fail("unexpected error variant"),
+            Ok(_) => return TestResult::Fail("arm_s3_resume accepted with no \\_S3_"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", smoke_s3_arm_resume_refuses_without_s3);
+
+fn smoke_s3_suspend_unarmed_walks_phases() -> TestResult {
+    // On a platform where S3 isn't armed, suspend() must:
+    //   - return NotImplemented
+    //   - leave PHASE back at Idle
+    //   - run resume fan-out so paired drivers see a clean cycle
+    use crate::{suspend, Power, SuspendPhase};
+    use narf_capabilities::{Cap, Invoke};
+
+    suspend::__test_reset();
+    let cap: Cap<Power, Invoke> = Cap::bootstrap();
+    match suspend::suspend(&cap) {
+        Err(suspend::SuspendError::NotImplemented) => {}
+        _ => return TestResult::Fail("suspend should surface NotImplemented unarmed"),
+    }
+    if suspend::current_phase() != SuspendPhase::Idle {
+        return TestResult::Fail("phase did not return to Idle after unarmed suspend");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", smoke_s3_suspend_unarmed_walks_phases);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_resume_context_save_captures_cr3() -> TestResult {
+    // save_resume_context() captures CR0/CR3/CR4/GDTR/IDTR/RSP.
+    // After a save, captured_context() should report Some(_) with
+    // a non-zero CR3 (kernel-test runs at CPL=0 with a live PML4).
+    use narf_arch::x86_64::s3_resume;
+
+    s3_resume::__reset_for_test();
+    // SAFETY: kernel-test harness runs on the boot CPU at CPL=0;
+    // reading CR3/CR0/CR4 + sgdt/sidt is unconditionally legal.
+    unsafe {
+        s3_resume::save_resume_context();
+    }
+    let ctx = match s3_resume::captured_context() {
+        Some(c) => c,
+        None => return TestResult::Fail("captured_context returned None after save"),
+    };
+    if ctx.cr3 == 0 {
+        return TestResult::Fail("captured CR3 was zero");
+    }
+    if ctx.rsp == 0 {
+        return TestResult::Fail("captured RSP was zero");
+    }
+    if ctx.gdt_limit == 0 {
+        return TestResult::Fail("captured GDT limit was zero — sgdt didn't fire");
+    }
+    s3_resume::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/suspend", smoke_s3_resume_context_save_captures_cr3);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pstate_detect_mechanism() -> TestResult {
     use crate::pstate;
