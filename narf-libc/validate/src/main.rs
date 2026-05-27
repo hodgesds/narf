@@ -2918,6 +2918,38 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new time C-ABI probes ────────────────────────────────────
+    //
+    // nanosleep(1us). Tiny enough not to dominate test runtime.
+    let nano_ok = unsafe {
+        let req = narf_libc::timespec { tv_sec: 0, tv_nsec: 1_000 };
+        narf_libc::nanosleep(&req as *const _, core::ptr::null_mut()) == 0
+    };
+    narf_libc::printf_str(
+        if nano_ok { "nanosleep: ok\n" } else { "nanosleep: bad\n" },
+        &[],
+    );
+
+    // clock_getres — 1ns nominal.
+    let res_ok = unsafe {
+        let mut res = narf_libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        narf_libc::clock_getres(0, &mut res as *mut _) == 0 && res.tv_nsec == 1
+    };
+    narf_libc::printf_str(
+        if res_ok { "clock_getres: ok\n" } else { "clock_getres: bad\n" },
+        &[],
+    );
+
+    // clock_nanosleep(1us, relative).
+    let cn_ok = unsafe {
+        let req = narf_libc::timespec { tv_sec: 0, tv_nsec: 1_000 };
+        narf_libc::clock_nanosleep(1, 0, &req as *const _, core::ptr::null_mut()) == 0
+    };
+    narf_libc::printf_str(
+        if cn_ok { "clock_nanosleep: ok\n" } else { "clock_nanosleep: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

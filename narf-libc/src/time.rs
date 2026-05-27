@@ -550,3 +550,93 @@ pub unsafe extern "C" fn gettimeofday(
     }
     0
 }
+
+/// `nanosleep(*const timespec, *mut timespec)` — POSIX. Suspends
+/// the calling task for the timespec interval. `rem`, when non-
+/// null, is populated with the remaining time on interrupt (we
+/// don't yet surface signal-interrupted sleeps; rem stays zeroed).
+///
+/// Reference: musl `src/time/nanosleep.c`.
+///
+/// # Safety
+/// `req` must point to a valid `timespec`. `rem`, when non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> i32 {
+    if req.is_null() { return -1; }
+    // SAFETY: caller asserts `req` is readable.
+    let r = unsafe { *req };
+    if r.tv_sec < 0 || r.tv_nsec < 0 || r.tv_nsec >= 1_000_000_000 {
+        crate::errno::set_errno(22); // EINVAL
+        return -1;
+    }
+    let ns = (r.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(r.tv_nsec as u64);
+    let res = narf_user_runtime::nanosleep(ns);
+    if !rem.is_null() {
+        // SAFETY: caller-asserted writable.
+        unsafe { *rem = timespec { tv_sec: 0, tv_nsec: 0 }; }
+    }
+    res
+}
+
+/// `clock_getres(clk_id, *mut timespec)` — POSIX. Reports the
+/// resolution of the named clock. NARF clocks advance per the TSC
+/// frequency; we report 1 ns as the nominal resolution (the
+/// granularity callers should expect).
+///
+/// # Safety
+/// `res`, when non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clock_getres(_clk_id: i32, res: *mut timespec) -> i32 {
+    if !res.is_null() {
+        // SAFETY: caller-asserted writable.
+        unsafe { *res = timespec { tv_sec: 0, tv_nsec: 1 }; }
+    }
+    0
+}
+
+/// `clock_nanosleep(clk_id, flags, *req, *rem)` — POSIX absolute /
+/// relative sleep on a named clock. Today we honour the relative
+/// form (flags == 0) and forward to nanosleep; the absolute form
+/// (`TIMER_ABSTIME = 1`) is computed as `(req - now)`.
+///
+/// Reference: musl `src/time/clock_nanosleep.c`.
+///
+/// # Safety
+/// `req` must be readable; `rem`, when non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clock_nanosleep(
+    clk_id: i32,
+    flags:  i32,
+    req:    *const timespec,
+    rem:    *mut timespec,
+) -> i32 {
+    if req.is_null() { return 22; }
+    // SAFETY: caller-asserted readable timespec.
+    let r = unsafe { *req };
+    if r.tv_sec < 0 || r.tv_nsec < 0 || r.tv_nsec >= 1_000_000_000 {
+        return 22; // EINVAL
+    }
+    let target_ns = (r.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(r.tv_nsec as u64);
+    let sleep_ns = if flags == 1 {
+        // TIMER_ABSTIME — compute the delta against the current
+        // clock reading.
+        let (sec, nsec) = narf_user_runtime::clock_gettime(clk_id as u32);
+        let now = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64);
+        target_ns.saturating_sub(now)
+    } else {
+        target_ns
+    };
+    let res = narf_user_runtime::nanosleep(sleep_ns);
+    if !rem.is_null() {
+        // SAFETY: caller-asserted writable.
+        unsafe { *rem = timespec { tv_sec: 0, tv_nsec: 0 }; }
+    }
+    if res == 0 { 0 } else { 4 } // EINTR on interrupt
+}

@@ -246,9 +246,10 @@ pub use stdlib::{
     sscanf_ints, strtol, strtoul, RAND_MAX,
 };
 pub use time::{
-    asctime, clock, clock_gettime, clock_settime, ctime, difftime, gettimeofday,
-    gmtime, gmtime_r, localtime, localtime_r, mktime, settimeofday, strftime,
-    time, times, timespec, timeval, tm, tms,
+    asctime, clock, clock_getres, clock_gettime, clock_nanosleep, clock_settime,
+    ctime, difftime, gettimeofday, gmtime, gmtime_r, localtime, localtime_r,
+    mktime, nanosleep, settimeofday, strftime, time, times, timespec, timeval,
+    tm, tms,
 };
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper
