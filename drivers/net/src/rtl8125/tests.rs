@@ -10,10 +10,11 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    build_tx_desc, chip_kind_from_xid, cr_reset_value, decode_mac, decode_xid, mac_is_invalid,
-    name_for, ChipKind, TxDesc, CR_RST, INT32_LINKCHG, INT32_ROK, INT32_TOK, REG_IMR_8125,
-    REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B,
-    RTL_VENDOR, RX_FETCH_DFLT_8125, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
+    build_rx_desc, build_tx_desc, chip_kind_from_xid, cr_reset_value, decode_mac, decode_xid,
+    mac_is_invalid, name_for, ChipKind, TxDesc, CR_RST, INT32_LINKCHG, INT32_ROK, INT32_TOK,
+    REG_IMR_8125, REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125,
+    RTL_DEV_8125B, RTL_VENDOR, RXD_EOR_LOCAL, RXD_LEN_MASK_LOCAL, RXD_OWN_LOCAL, RX_BUF_LEN,
+    RX_FETCH_DFLT_8125, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -288,3 +289,108 @@ fn smoke_rtl8125_chip_kind_classification() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_chip_kind_classification);
+
+// ── Stage 2: RX descriptor ring round-trip ────────────────────────
+//
+// FakeMmio isn't useful here — the on-wire RX descriptor IS the data
+// the chip DMAs to. These tests use a real `[TxDesc; RING_LEN]` page
+// (the RX and TX descriptors share the 16-byte shape per
+// `rtl_hw_start_8125_common` line 3877 of Linux r8169_main.c which
+// holds the "new descriptor format" *disabled*) and exercise the
+// pure-data side of the prepare → consume cycle.
+
+fn smoke_rtl8125_build_rx_desc_round_trip() -> TestResult {
+    // Mid-ring slot 13 carrying a 2 KiB buffer (the Stage-2 default
+    // RX_BUF_LEN). OWN must be set, length must round-trip.
+    let d = build_rx_desc(13, 0xCAFE_BABE_DEAD_BEEFu64, RX_BUF_LEN as u32);
+    if d.flags_len & RXD_OWN_LOCAL == 0 {
+        return TestResult::Fail("OWN not set on prepared RX desc");
+    }
+    if d.flags_len & RXD_LEN_MASK_LOCAL != RX_BUF_LEN as u32 {
+        return TestResult::Fail("RX buffer length not preserved");
+    }
+    if d.flags_len & RXD_EOR_LOCAL != 0 {
+        return TestResult::Fail("mid-ring slot wrongly carries EOR");
+    }
+    if d.vlan != 0 {
+        return TestResult::Fail("vlan not zero");
+    }
+    if d.addr_lo != 0xDEAD_BEEF {
+        return TestResult::Fail("addr_lo wrong");
+    }
+    if d.addr_hi != 0xCAFE_BABE {
+        return TestResult::Fail("addr_hi wrong");
+    }
+
+    // Last slot must set EOR so the chip's ring pointer wraps.
+    let last = build_rx_desc(RING_LEN - 1, 0xABCD_0000_1234_0000u64, RX_BUF_LEN as u32);
+    if last.flags_len & RXD_EOR_LOCAL == 0 {
+        return TestResult::Fail("RING_LEN-1 slot missing EOR");
+    }
+    // EOR set must not corrupt the length field.
+    if last.flags_len & RXD_LEN_MASK_LOCAL != RX_BUF_LEN as u32 {
+        return TestResult::Fail("EOR set leaked into length field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8125",
+    smoke_rtl8125_build_rx_desc_round_trip
+);
+
+fn smoke_rtl8125_rx_ring_populate() -> TestResult {
+    // Mirror what `bring_up` does at step 6b: pre-fill an RX ring
+    // with one descriptor per slot, each pointing at a distinct
+    // phys-addr cookie. The ring is host-side memory here so we use
+    // an `alloc::vec::Vec` instead of `alloc_coherent`; the layout
+    // is what matters.
+    let mut ring: alloc::vec::Vec<TxDesc> = alloc::vec::Vec::with_capacity(RING_LEN);
+    for i in 0..RING_LEN {
+        // Make each phys-addr a unique sentinel so a misaligned
+        // store to the wrong slot surfaces.
+        let cookie = 0x1000_0000u64 | ((i as u64) << 4);
+        ring.push(build_rx_desc(i, cookie, RX_BUF_LEN as u32));
+    }
+    // Every slot must be NIC-owned (OWN=1) after prepare.
+    for (i, d) in ring.iter().enumerate() {
+        if d.flags_len & RXD_OWN_LOCAL == 0 {
+            return TestResult::Fail("OWN missing on a prepared RX slot");
+        }
+        // Only the last slot may carry EOR.
+        let has_eor = d.flags_len & RXD_EOR_LOCAL != 0;
+        if i == RING_LEN - 1 {
+            if !has_eor {
+                return TestResult::Fail("last slot missing EOR");
+            }
+        } else if has_eor {
+            return TestResult::Fail("mid slot carries EOR");
+        }
+        // Phys cookies must be at their assigned slot — catches a
+        // build_rx_desc swap of word2/word3.
+        let want_lo = (0x1000_0000u64 | ((i as u64) << 4)) as u32;
+        let want_hi = ((0x1000_0000u64 | ((i as u64) << 4)) >> 32) as u32;
+        if d.addr_lo != want_lo || d.addr_hi != want_hi {
+            return TestResult::Fail("phys address split landed on wrong slot");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_rx_ring_populate);
+
+fn smoke_rtl8125_rx_buf_len_fits_mask() -> TestResult {
+    // RX_BUF_LEN must fit inside the 14-bit RXD length field. A
+    // larger value would silently corrupt the OWN/EOR/LS bits when
+    // OR'd into word0.
+    if RX_BUF_LEN as u32 > RXD_LEN_MASK_LOCAL {
+        return TestResult::Fail("RX_BUF_LEN overflows 14-bit RXD length");
+    }
+    // The 14-bit ceiling for the length field is 0x3FFF = 16383
+    // bytes; the 8125 supports up to 16 KiB - 1 jumbo frames per
+    // Linux's `R8169_RX_BUF_SIZE` = `(SZ_16K - 1)`. Stage 2 picks
+    // 2 KiB — plenty of headroom.
+    if RXD_LEN_MASK_LOCAL != 0x3FFF {
+        return TestResult::Fail("RXD_LEN_MASK should be 14-bit (0x3FFF)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_rx_buf_len_fits_mask);
