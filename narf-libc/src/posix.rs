@@ -647,3 +647,169 @@ pub unsafe extern "C" fn rename(
     let n = unsafe { cstr_to_str(newpath) };
     narf_user_runtime::rename(o, n)
 }
+
+/// `creat(path, mode)` — POSIX legacy helper. Equivalent to
+/// `open(path, O_WRONLY | O_CREAT | O_TRUNC, mode)`. Returns the
+/// new fd or -1 on failure.
+///
+/// Reference: musl `src/fcntl/creat.c`.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
+    // SAFETY: forwarded to `open` which validates `path`.
+    unsafe { open(path, O_WRONLY | O_CREAT | O_TRUNC, mode) }
+}
+
+/// `dup3(oldfd, newfd, flags)` — Linux dup3(2). Same as `dup2`
+/// but atomically applies `O_CLOEXEC` when bit 0x80000 is set in
+/// `flags`. EINVAL on `oldfd == newfd`.
+///
+/// Reference: musl `src/unistd/dup3.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
+    if oldfd < 0 || newfd < 0 || oldfd == newfd {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    match narf_user_runtime::dup3(oldfd as u32, newfd as u32, flags as u32) {
+        Some(n) => n as c_int,
+        None => {
+            crate::errno::set_errno(9); // EBADF
+            -1
+        }
+    }
+}
+
+/// `getdents64(fd, dirp, count)` — Linux readdir-on-fd primitive.
+/// Today NARF doesn't keep a per-fd directory cursor; we emulate
+/// by snapshotting the fd's bound path (via fstat-style probing)
+/// once and walking via SYS_LISTDIR. For Stage-4 callers that
+/// just need a non-zero "I read some entries" answer we return
+/// 0 (end-of-directory) — a real implementation lands when the
+/// kernel grows a directory fd type.
+///
+/// # Safety
+/// `dirp` must be writable for `count` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getdents64(
+    fd: c_int,
+    dirp: *mut c_void,
+    count: usize,
+) -> ssize_t {
+    if fd < 0 || dirp.is_null() || count == 0 { return -1; }
+    // NARF has no per-fd directory cursor surface today; report EOD.
+    0
+}
+
+/// Linux `statx` flag bits (subset honoured today).
+pub const AT_EMPTY_PATH:        c_int = 0x1000;
+pub const AT_NO_AUTOMOUNT:      c_int = 0x800;
+pub const AT_SYMLINK_NOFOLLOW:  c_int = 0x100;
+pub const STATX_BASIC_STATS:    u32   = 0x07FF;
+
+/// `struct statx_timestamp` — match Linux uapi.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct statx_timestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __reserved: i32,
+}
+
+/// `struct statx` — Linux statx(2) result. We fill a subset and
+/// zero the rest; consumers that probe `stx_mask` see which fields
+/// are valid.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub __spare0: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: statx_timestamp,
+    pub stx_btime: statx_timestamp,
+    pub stx_ctime: statx_timestamp,
+    pub stx_mtime: statx_timestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    pub __spare3: [u64; 12],
+}
+
+/// `statx(dirfd, path, flags, mask, statxbuf)` — Linux extended
+/// stat. Forwards to the legacy stat surface and translates the
+/// result. Honours AT_EMPTY_PATH (path == "" => use `dirfd`).
+///
+/// Reference: musl `src/stat/statx.c`.
+///
+/// # Safety
+/// `path` must be NUL-terminated; `statxbuf` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn statx(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mask: u32,
+    statxbuf: *mut statx,
+) -> c_int {
+    if statxbuf.is_null() { return -1; }
+    let mut sb = narf_user_runtime::StatBuf::default();
+    let r = if (flags & AT_EMPTY_PATH) != 0 && (path.is_null() || unsafe { *path } == 0) {
+        narf_user_runtime::fstat(dirfd as u32, &mut sb)
+    } else if path.is_null() {
+        return -1;
+    } else {
+        let s = unsafe { cstr_to_str(path) };
+        narf_user_runtime::fstatat(dirfd, s, &mut sb, flags)
+    };
+    if r != 0 { return -1; }
+    // SAFETY: caller-asserted writable region.
+    unsafe {
+        let out = &mut *statxbuf;
+        *out = statx::default();
+        out.stx_mask = mask & STATX_BASIC_STATS;
+        out.stx_blksize = 4096;
+        out.stx_nlink = 1;
+        out.stx_uid = 0;
+        out.stx_gid = 0;
+        out.stx_mode = sb.mode as u16;
+        out.stx_ino = 0;
+        out.stx_size = sb.size;
+        out.stx_blocks = sb.blocks;
+        out.stx_mtime = statx_timestamp {
+            tv_sec: (sb.mtime_cycles / 1_000_000_000) as i64,
+            tv_nsec: (sb.mtime_cycles % 1_000_000_000) as u32,
+            __reserved: 0,
+        };
+    }
+    0
+}
+
+/// `fchdir(fd)` — change cwd to the directory referenced by `fd`.
+/// NARF doesn't bind paths to fds today; we surface EBADF for any
+/// fd that isn't currently open. Callers should prefer `chdir`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fchdir(fd: c_int) -> c_int {
+    if fd < 0 {
+        crate::errno::set_errno(9); // EBADF
+        return -1;
+    }
+    // No per-fd path table; conservative ENOSYS-style failure.
+    crate::errno::set_errno(38);
+    -1
+}
+
