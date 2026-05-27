@@ -264,7 +264,8 @@ pub use stdio::{
 };
 pub use string::{
     memchr, memcmp, memcpy, memmem, memmove, memset, strcasecmp, strcat, strchr,
-    strcmp, strcoll, strcpy, strcspn, strdup, strlen, strncasecmp, strncmp, strncpy,
-    strndup, strnlen, strpbrk, strrchr, strspn, strstr, strtok_r, strxfrm,
-    __memcpy_chk, __memmove_chk, __memset_chk, __strcpy_chk,
+    strcmp, strcoll, strcpy, strcspn, strdup, strerror_r, strlen, strncasecmp,
+    strncat, strncmp, strncpy, strndup, strnlen, strpbrk, strrchr, strspn,
+    strstr, strtok, strtok_r, strxfrm, __memcpy_chk, __memmove_chk,
+    __memset_chk, __strcpy_chk,
 };

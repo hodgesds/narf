@@ -800,3 +800,89 @@ pub unsafe extern "C" fn strtok_r(
     }
     token
 }
+
+/// Static saveptr backing the non-reentrant `strtok`. Single-threaded
+/// user mode keeps this race-free; threading will need to migrate
+/// callers to `strtok_r`.
+static mut STRTOK_SAVEPTR: *mut u8 = core::ptr::null_mut();
+
+/// `strtok(s, delim)` — POSIX non-reentrant tokeniser. Maintains a
+/// static save-pointer between calls. Use [`strtok_r`] in any code
+/// that may run from multiple threads.
+///
+/// Reference: musl `src/string/strtok.c`.
+///
+/// # Safety
+/// On the first call `s` must be writable and NUL-terminated;
+/// `delim` must be NUL-terminated. Subsequent calls pass NULL for
+/// `s` to continue tokenising the saved string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtok(s: *mut u8, delim: *const u8) -> *mut u8 {
+    // SAFETY: forwarded; STRTOK_SAVEPTR access is race-free under
+    // the single-threaded user-mode invariant.
+    unsafe { strtok_r(s, delim, &raw mut STRTOK_SAVEPTR) }
+}
+
+/// `strncat(dst, src, n)` — append at most `n` bytes from NUL-
+/// terminated `src` onto NUL-terminated `dst`, then NUL-terminate.
+/// Returns `dst`.
+///
+/// Reference: musl `src/string/strncat.c`.
+///
+/// # Safety
+/// `dst` must have room for `strlen(dst) + min(strlen(src), n) + 1`
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strncat(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract.
+    unsafe {
+        // Walk to dst's NUL.
+        let mut d = 0usize;
+        while *dst.add(d) != 0 { d += 1; }
+        let mut i = 0usize;
+        while i < n {
+            let c = *src.add(i);
+            if c == 0 { break; }
+            *dst.add(d + i) = c;
+            i += 1;
+        }
+        *dst.add(d + i) = 0;
+    }
+    dst
+}
+
+/// `strerror_r(errnum, buf, buflen)` — POSIX/XSI thread-safe form.
+/// Returns 0 on success and writes the message into `buf`; returns
+/// ERANGE (34) on a too-small buffer.
+///
+/// Reference: musl `src/string/strerror_r.c`.
+///
+/// # Safety
+/// `buf` must be writable for `buflen` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strerror_r(errnum: i32, buf: *mut u8, buflen: usize) -> i32 {
+    if buf.is_null() || buflen == 0 { return 22; } // EINVAL
+    // SAFETY: forwarded to crate::errno::strerror — returns a
+    // pointer to a static NUL-terminated byte array.
+    let src = unsafe { crate::errno::strerror(errnum) };
+    // Walk to find length.
+    let mut len = 0usize;
+    while unsafe { *src.add(len) } != 0 { len += 1; }
+    // Need len + 1 for NUL.
+    if len + 1 > buflen {
+        // Copy what fits, NUL-terminate, return ERANGE.
+        let copy = buflen - 1;
+        // SAFETY: bounded copy.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, buf, copy);
+            *buf.add(copy) = 0;
+        }
+        return 34; // ERANGE
+    }
+    // SAFETY: bounded copy + NUL.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, buf, len);
+        *buf.add(len) = 0;
+    }
+    0
+}

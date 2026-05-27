@@ -2950,6 +2950,45 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new string C-ABI probes ──────────────────────────────────
+    //
+    // strtok over an "a,b,c" split. Two calls — first returns "a",
+    // second returns "b".
+    let strtok_ok = unsafe {
+        let mut buf = *b"a,b,c\0";
+        let delim = b",\0".as_ptr();
+        let t1 = narf_libc::strtok(buf.as_mut_ptr(), delim);
+        let t2 = narf_libc::strtok(core::ptr::null_mut(), delim);
+        !t1.is_null() && *t1 == b'a' && !t2.is_null() && *t2 == b'b'
+    };
+    narf_libc::printf_str(
+        if strtok_ok { "strtok: ok\n" } else { "strtok: bad\n" },
+        &[],
+    );
+
+    // strncat: append "world" capped to 3 onto "hi ".
+    let strncat_ok = unsafe {
+        let mut buf = [0u8; 16];
+        buf[0] = b'h'; buf[1] = b'i'; buf[2] = b' '; buf[3] = 0;
+        narf_libc::strncat(buf.as_mut_ptr(), b"world\0".as_ptr(), 3);
+        &buf[..7] == b"hi wor\0"
+    };
+    narf_libc::printf_str(
+        if strncat_ok { "strncat: ok\n" } else { "strncat: bad\n" },
+        &[],
+    );
+
+    // strerror_r over EINVAL=22.
+    let serr_ok = unsafe {
+        let mut buf = [0u8; 64];
+        let r = narf_libc::strerror_r(22, buf.as_mut_ptr(), buf.len());
+        r == 0 && buf[0] != 0
+    };
+    narf_libc::printf_str(
+        if serr_ok { "strerror_r: ok\n" } else { "strerror_r: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
