@@ -11,10 +11,11 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
     build_rx_desc, build_tx_desc, chip_kind_from_xid, cr_reset_value, decode_mac, decode_xid,
-    mac_is_invalid, name_for, ChipKind, TxDesc, CR_RST, INT32_LINKCHG, INT32_ROK, INT32_TOK,
-    REG_IMR_8125, REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125,
-    RTL_DEV_8125B, RTL_VENDOR, RXD_EOR_LOCAL, RXD_LEN_MASK_LOCAL, RXD_OWN_LOCAL, RX_BUF_LEN,
-    RX_FETCH_DFLT_8125, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
+    mac_is_invalid, name_for, ChipKind, PhyStatus, TxDesc, CR_RST, INT32_LINKCHG, INT32_ROK,
+    INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, REG_IMR_8125,
+    REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B,
+    RTL_VENDOR, RXD_EOR_LOCAL, RXD_LEN_MASK_LOCAL, RXD_OWN_LOCAL, RX_BUF_LEN, RX_FETCH_DFLT_8125,
+    TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -394,3 +395,38 @@ fn smoke_rtl8125_rx_buf_len_fits_mask() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_rx_buf_len_fits_mask);
+
+// ── Stage 2: PHYStatus decode ─────────────────────────────────────
+
+fn smoke_rtl8125_phystat_decode() -> TestResult {
+    // 1000bpsF + LinkStatus + FullDup — what a 1G or 2.5G live link
+    // reports (2.5G surfaces as 1000bpsF in PHYStatus; the real speed
+    // comes from PHYAR-side registers).
+    let ps = PhyStatus::parse(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF);
+    if !ps.link_up {
+        return TestResult::Fail("LinkSts bit not decoded");
+    }
+    if !ps.full_duplex {
+        return TestResult::Fail("FullDup bit not decoded");
+    }
+    if !ps.speed_1000m {
+        return TestResult::Fail("1000bpsF bit not decoded");
+    }
+    if ps.speed_100m || ps.speed_10m {
+        return TestResult::Fail("Spurious 10/100M flag set");
+    }
+    if ps.speed_label() != "1000M-or-2.5G" {
+        return TestResult::Fail("speed_label wrong for 1G/2.5G");
+    }
+
+    // Link down — every speed bit should read false.
+    let down = PhyStatus::parse(0);
+    if down.link_up {
+        return TestResult::Fail("link_up set on zero PHYStatus");
+    }
+    if down.speed_label() != "down" {
+        return TestResult::Fail("speed_label not 'down' on zero status");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_phystat_decode);

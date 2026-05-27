@@ -203,7 +203,73 @@ pub(crate) const INT32_SYS_ERR: u32 = 1 << 15;
 pub(crate) const RX_FETCH_DFLT_8125: u32 = 8 << 27;
 
 // PHYStatus bits (§2.10).
+// Bit layout per Linux `enum rtl_register_content` lines 557–565:
+//   bit 7  TBI_Enable
+//   bit 6  TxFlowCtrl
+//   bit 5  RxFlowCtrl
+//   bit 4  _1000bpsF
+//   bit 3  _100bps
+//   bit 2  _10bps
+//   bit 1  LinkStatus
+//   bit 0  FullDup
+// RTL8125 negotiates 2.5 Gbps via PHY registers; the PHYStatus
+// register only surfaces up to gigabit. A 2.5G link reads as
+// "_1000bpsF | LinkStatus" here — the driver consults the PHY
+// (via PHYAR) to learn the real speed once the link is up.
 pub(crate) const PHYSTAT_LINKSTS: u8 = 1 << 1;
+pub(crate) const PHYSTAT_FULLDUP: u8 = 1 << 0;
+pub(crate) const PHYSTAT_10BPS: u8 = 1 << 2;
+pub(crate) const PHYSTAT_100BPS: u8 = 1 << 3;
+pub(crate) const PHYSTAT_1000BPSF: u8 = 1 << 4;
+pub(crate) const PHYSTAT_RXFLOWCTRL: u8 = 1 << 5;
+pub(crate) const PHYSTAT_TXFLOWCTRL: u8 = 1 << 6;
+
+/// Decoded PHYStatus register. The RTL8125 PHYStatus mirrors the
+/// 8169 layout — 2.5 Gbps negotiations surface as 1000bpsF here,
+/// with the real speed available via PHY-register access. Stage 2
+/// captures the byte-level info; speed-decoding lives in a future
+/// PHY-config commit.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhyStatus {
+    pub link_up: bool,
+    pub full_duplex: bool,
+    pub speed_1000m: bool,
+    pub speed_100m: bool,
+    pub speed_10m: bool,
+    pub rx_flow_control: bool,
+    pub tx_flow_control: bool,
+}
+
+impl PhyStatus {
+    /// Decode the PHYStatus byte returned by `mmio.read8(REG_PHYSTAT)`.
+    pub const fn parse(byte: u8) -> Self {
+        Self {
+            link_up: byte & PHYSTAT_LINKSTS != 0,
+            full_duplex: byte & PHYSTAT_FULLDUP != 0,
+            speed_10m: byte & PHYSTAT_10BPS != 0,
+            speed_100m: byte & PHYSTAT_100BPS != 0,
+            speed_1000m: byte & PHYSTAT_1000BPSF != 0,
+            rx_flow_control: byte & PHYSTAT_RXFLOWCTRL != 0,
+            tx_flow_control: byte & PHYSTAT_TXFLOWCTRL != 0,
+        }
+    }
+
+    /// Best-guess link speed string. "2.5G" requires a separate
+    /// PHY-register read (a 2.5 Gbps link surfaces as "1000Mbps" in
+    /// PHYStatus); the driver caller is expected to upgrade the
+    /// label after talking to the PHY directly.
+    pub const fn speed_label(&self) -> &'static str {
+        if self.speed_1000m {
+            "1000M-or-2.5G"
+        } else if self.speed_100m {
+            "100M"
+        } else if self.speed_10m {
+            "10M"
+        } else {
+            "down"
+        }
+    }
+}
 
 // ── MAC reset / MAC-address decode ──────────────────────────────────
 // Stage 2: pure-data helpers. The live `bring_up` path lands later;
