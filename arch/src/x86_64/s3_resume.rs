@@ -350,3 +350,179 @@ pub fn __reset_for_test() {
     CAPTURED.store(false, Ordering::Release);
     *RESUME_CONTEXT.lock() = ResumeContext::default();
 }
+
+// ── LAPIC state save/restore ────────────────────────────────────────
+//
+// The LAPIC loses all its LVT programming + TPR + SVR across S3 on
+// most silicon. On wake the firmware leaves the LAPIC in a
+// freshly-reset state (LVTs masked, SVR cleared). Without explicit
+// restore, timer ticks never resume, ICR-driven IPIs never
+// dispatch, and the spurious-interrupt vector falls back to 0xFF
+// pointing into uninitialised IDT.
+//
+// We snapshot the registers Linux saves in
+// `arch/x86/kernel/apic/apic.c::lapic_suspend`:
+//
+//   - LVT_TIMER (0x320 / MSR 0x832)
+//   - LVT_THERMAL (0x330 / MSR 0x833)
+//   - LVT_PERFMON (0x340 / MSR 0x834)
+//   - LVT_LINT0 (0x350 / MSR 0x835)
+//   - LVT_LINT1 (0x360 / MSR 0x836)
+//   - LVT_ERROR (0x370 / MSR 0x837)
+//   - LVT_CMCI  (0x2F0 / MSR 0x82F)
+//   - TPR       (0x080 / MSR 0x808)
+//   - SVR       (0x0F0 / MSR 0x80F)
+//   - TIMER_INIT_COUNT (0x380 / MSR 0x838)
+//   - TIMER_DIVIDE_CFG (0x3E0 / MSR 0x83E)
+
+/// Captured LAPIC state at suspend time.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct LapicSavedState {
+    pub lvt_timer: u32,
+    pub lvt_thermal: u32,
+    pub lvt_perfmon: u32,
+    pub lvt_lint0: u32,
+    pub lvt_lint1: u32,
+    pub lvt_error: u32,
+    pub lvt_cmci: u32,
+    pub tpr: u32,
+    pub svr: u32,
+    pub timer_init_count: u32,
+    pub timer_divide: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+static LAPIC_STATE: narf_lib::sync::IrqSafeSpinLock<LapicSavedState> =
+    narf_lib::sync::IrqSafeSpinLock::new(LapicSavedState {
+        lvt_timer: 0,
+        lvt_thermal: 0,
+        lvt_perfmon: 0,
+        lvt_lint0: 0,
+        lvt_lint1: 0,
+        lvt_error: 0,
+        lvt_cmci: 0,
+        tpr: 0,
+        svr: 0,
+        timer_init_count: 0,
+        timer_divide: 0,
+    });
+
+#[cfg(target_arch = "x86_64")]
+static LAPIC_STATE_CAPTURED: AtomicBool = AtomicBool::new(false);
+
+// x2APIC MSR layout. Same constants as `interrupts/x86_64/apic.rs`
+// but local to this module to avoid the back-edge dep (arch can
+// not depend on interrupts).
+#[cfg(target_arch = "x86_64")]
+mod x2apic_msr {
+    pub const TPR: u32 = 0x0000_0808;
+    pub const SVR: u32 = 0x0000_080F;
+    pub const LVT_CMCI: u32 = 0x0000_082F;
+    pub const LVT_TIMER: u32 = 0x0000_0832;
+    pub const LVT_THERMAL: u32 = 0x0000_0833;
+    pub const LVT_PERFMON: u32 = 0x0000_0834;
+    pub const LVT_LINT0: u32 = 0x0000_0835;
+    pub const LVT_LINT1: u32 = 0x0000_0836;
+    pub const LVT_ERROR: u32 = 0x0000_0837;
+    pub const TIMER_INIT: u32 = 0x0000_0838;
+    pub const TIMER_DIVIDE: u32 = 0x0000_083E;
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Snapshot the LAPIC's restorable state.  Reads x2APIC MSRs; caller
+/// must have x2APIC live (BSP init done) before this is invoked.
+///
+/// # Safety
+/// CPL=0; x2APIC active.
+pub unsafe fn save_lapic_state() {
+    use crate::x86_64::msr::rdmsr_or_gp;
+    // rdmsr_or_gp is safe — if the MSR is not implemented we get
+    // 0 back instead of #GP. x2APIC MSRs are valid only when
+    // X2APIC enable is on; on TCG / hypervisors where x2APIC isn't
+    // live the rdmsr_or_gp surfaces 0 and the restore is a no-op
+    // of the same value.
+    let s = LapicSavedState {
+        lvt_timer: rdmsr_or_gp(x2apic_msr::LVT_TIMER).unwrap_or(0) as u32,
+        lvt_thermal: rdmsr_or_gp(x2apic_msr::LVT_THERMAL).unwrap_or(0) as u32,
+        lvt_perfmon: rdmsr_or_gp(x2apic_msr::LVT_PERFMON).unwrap_or(0) as u32,
+        lvt_lint0: rdmsr_or_gp(x2apic_msr::LVT_LINT0).unwrap_or(0) as u32,
+        lvt_lint1: rdmsr_or_gp(x2apic_msr::LVT_LINT1).unwrap_or(0) as u32,
+        lvt_error: rdmsr_or_gp(x2apic_msr::LVT_ERROR).unwrap_or(0) as u32,
+        lvt_cmci: rdmsr_or_gp(x2apic_msr::LVT_CMCI).unwrap_or(0) as u32,
+        tpr: rdmsr_or_gp(x2apic_msr::TPR).unwrap_or(0) as u32,
+        svr: rdmsr_or_gp(x2apic_msr::SVR).unwrap_or(0) as u32,
+        timer_init_count: rdmsr_or_gp(x2apic_msr::TIMER_INIT).unwrap_or(0) as u32,
+        timer_divide: rdmsr_or_gp(x2apic_msr::TIMER_DIVIDE).unwrap_or(0) as u32,
+    };
+    *LAPIC_STATE.lock() = s;
+    LAPIC_STATE_CAPTURED.store(true, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Re-program the LAPIC from the saved state. Order matters:
+/// SVR is restored last so the APIC software-enable bit lights
+/// up only after the LVT vectors have valid targets. Mirrors
+/// Linux `lapic_resume` in `arch/x86/kernel/apic/apic.c`.
+///
+/// # Safety
+/// CPL=0; x2APIC active.
+pub unsafe fn restore_lapic_state() {
+    if !LAPIC_STATE_CAPTURED.load(Ordering::Acquire) {
+        return;
+    }
+    let s = *LAPIC_STATE.lock();
+    use crate::x86_64::msr::wrmsr_or_gp;
+    // wrmsr_or_gp swallows #GP if the MSR is missing — we're
+    // writing back values we read at save time (or zeros for
+    // never-implemented MSRs), so it's always safe.
+    // Divide configuration first — timer init count is meaningless
+    // without the divide.
+    let _ = wrmsr_or_gp(x2apic_msr::TIMER_DIVIDE, s.timer_divide as u64);
+    // LVTs (masked-bit preserved from save).
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_TIMER, s.lvt_timer as u64);
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_THERMAL, s.lvt_thermal as u64);
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_PERFMON, s.lvt_perfmon as u64);
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_LINT0, s.lvt_lint0 as u64);
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_LINT1, s.lvt_lint1 as u64);
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_ERROR, s.lvt_error as u64);
+    let _ = wrmsr_or_gp(x2apic_msr::LVT_CMCI, s.lvt_cmci as u64);
+    // TPR can be restored at any point — controls vector
+    // priority threshold, no global enable bit.
+    let _ = wrmsr_or_gp(x2apic_msr::TPR, s.tpr as u64);
+    // Timer init count — if it was running periodic, this re-
+    // arms it. Writing 0 disarms; we write whatever was saved.
+    let _ = wrmsr_or_gp(x2apic_msr::TIMER_INIT, s.timer_init_count as u64);
+    // SVR LAST — sets APIC software-enable bit 8, which is what
+    // ungates dispatch. Restoring before LVTs were programmed
+    // would leak stale vectors.
+    let _ = wrmsr_or_gp(x2apic_msr::SVR, s.svr as u64);
+}
+
+/// Snapshot accessor for diagnostics / smokes.
+#[cfg(target_arch = "x86_64")]
+pub fn captured_lapic_state() -> Option<LapicSavedState> {
+    if LAPIC_STATE_CAPTURED.load(Ordering::Acquire) {
+        Some(*LAPIC_STATE.lock())
+    } else {
+        None
+    }
+}
+
+/// Test-only LAPIC state injection — kernel-test runs in
+/// environments (TCG without x2APIC, virtualised hosts) where
+/// reading x2APIC MSRs returns zero, so the round-trip smoke
+/// needs to install a known state directly.
+#[doc(hidden)]
+#[cfg(target_arch = "x86_64")]
+pub fn __test_inject_lapic_state(s: LapicSavedState) {
+    *LAPIC_STATE.lock() = s;
+    LAPIC_STATE_CAPTURED.store(true, Ordering::Release);
+}
+
+#[doc(hidden)]
+#[cfg(target_arch = "x86_64")]
+pub fn __reset_lapic_for_test() {
+    LAPIC_STATE_CAPTURED.store(false, Ordering::Release);
+    *LAPIC_STATE.lock() = LapicSavedState::default();
+}

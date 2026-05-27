@@ -1,5 +1,18 @@
 //! Suspend-to-RAM / resume — Stage-4 structural shape.
 //!
+//! # PCIe device save/restore
+//!
+//! PCIe endpoints lose their BAR programming + Command register
+//! state across S3 / D3hot — firmware brings the link back up in
+//! a clean state but the OS-set BARs are gone. Drivers integrate
+//! via the [`crate::device_pm::DevicePmOps`] trait, holding their
+//! per-device [`narf_bus::pci::SavedPciConfig`] snapshot inside
+//! the trait impl. On suspend: call `bus::pci::save_config(cap,
+//! dev)` and stash the result; on resume: pass the stashed snapshot
+//! back via `bus::pci::restore_config`. Order matters — the cfg
+//! restore writes BARs first, then the Command register last so
+//! the device doesn't decode MMIO before its BARs are programmed.
+//!
 //! Spec: `power/specification/spec.md` (Stage-4 suspend-to-RAM
 //! (S3 / PSCI)). System-wide suspend follows a fixed phase order:
 //!
@@ -22,7 +35,7 @@
 //! the actual sleep transition unless `__test_arm_real_sleep()` has
 //! been called (kernel-test harness only).
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use narf_capabilities::{Cap, CapError, NoopOp};
 
@@ -98,6 +111,9 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
     // the suspend chain — we want partial progress so the resume
     // path can roll back whatever did suspend successfully.
     let _suspend_report = crate::device_pm::suspend_all_devices();
+    // Blank the framebuffer + park the console hook so the FB
+    // driver can repaint cleanly on resume.
+    invoke_fb_suspend();
     PHASE.store(SuspendPhase::SyncingCache as u8, Ordering::Release);
     PHASE.store(SuspendPhase::SavingCpuState as u8, Ordering::Release);
     PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
@@ -107,13 +123,27 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
     // waking vector, fans out device suspend, and writes PM1
     // SLP_TYP|SLP_EN. It only returns when the wake trampoline +
     // longjmp bring control back here.
+    //
+    // Two routes both gate the PM1 write:
+    //   - `REAL_SLEEP_ARMED` — kernel-test harness back-door.
+    //   - `PRODUCTION_S3_ENABLED` — user opt-in after on-silicon
+    //     validation (either via `enable_production_s3()` or
+    //     via the `S3_VALIDATED` boot-cmdline token).
+    //
+    // Either flag set authorises entering arm_s3_resume(); the
+    // inner check inside arm_s3_resume() then validates the
+    // dynamic side (resume vectors resolved, FACS armable).
     #[cfg(target_arch = "x86_64")]
     {
-        if s3_supported() && REAL_SLEEP_ARMED.load(Ordering::Acquire) {
+        let armed = REAL_SLEEP_ARMED.load(Ordering::Acquire)
+            || PRODUCTION_S3_ENABLED.load(Ordering::Acquire);
+        if s3_supported() && armed {
             match arm_s3_resume(cap) {
                 Ok(()) => {
                     PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
                     let _ = crate::device_pm::resume_all_devices();
+                    invoke_fb_resume();
+                    restore_irq_masks();
                     PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
                     PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
                     return Ok(());
@@ -125,6 +155,8 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
                     PHASE.store(SuspendPhase::RestoringCpuState as u8, Ordering::Release);
                     PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
                     let _ = crate::device_pm::resume_all_devices();
+                    invoke_fb_resume();
+                    restore_irq_masks();
                     PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
                     PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
                     return Err(e);
@@ -140,6 +172,7 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
     PHASE.store(SuspendPhase::RestoringCpuState as u8, Ordering::Release);
     PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
     let _resume_report = crate::device_pm::resume_all_devices();
+    invoke_fb_resume();
     PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
     PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
     Err(SuspendError::NotImplemented)
@@ -158,6 +191,7 @@ pub fn current_phase() -> SuspendPhase {
 pub fn __test_reset() {
     PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
     REAL_SLEEP_ARMED.store(false, Ordering::Release);
+    PRODUCTION_S3_ENABLED.store(false, Ordering::Release);
 }
 
 // ── ACPI S3 platform primitive (x86_64) ─────────────────────────────
@@ -292,6 +326,138 @@ pub fn __test_arm_real_sleep() {
     REAL_SLEEP_ARMED.store(true, Ordering::Release);
 }
 
+// ── Production S3 opt-in gate ───────────────────────────────────────
+//
+// `__test_arm_real_sleep` is the test-harness back-door — it goes
+// straight to PM1 SLP_EN, which is the dangerous path until the
+// resume trampoline has been validated on real silicon. To let
+// userspace turn S3 on after they've manually verified the resume
+// chain works on their box, we expose a separate
+// `enable_production_s3()` gate. It does NOT flip the same flag
+// the test harness uses; it sets `PRODUCTION_S3_ENABLED`, which
+// the production suspend() path checks as a *separate* condition
+// from REAL_SLEEP_ARMED.
+//
+// Default: off. Userspace opt-in only after on-silicon validation.
+// There's also an env / cmdline path: a `S3_VALIDATED` boot
+// argument flips it at init time. Either route enables the
+// production code path; both can co-exist.
+
+static PRODUCTION_S3_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Userspace opt-in: enable the production S3 path after on-
+/// silicon validation has confirmed the resume trampoline works.
+/// Returns the previous value so callers can detect double-arms.
+///
+/// Cap-gated on the same `Cap<Power, narf_capabilities::Invoke>`
+/// that drives the `suspend()` entry point. Revoking the cap will
+/// not auto-disable — call [`disable_production_s3`] explicitly.
+pub fn enable_production_s3(
+    cap: &Cap<Power, narf_capabilities::Invoke>,
+) -> Result<bool, SuspendError> {
+    cap.invoke(NoopOp)?;
+    let prev = PRODUCTION_S3_ENABLED.swap(true, Ordering::AcqRel);
+    Ok(prev)
+}
+
+/// Userspace turn-off. Symmetric with [`enable_production_s3`].
+pub fn disable_production_s3(
+    cap: &Cap<Power, narf_capabilities::Invoke>,
+) -> Result<bool, SuspendError> {
+    cap.invoke(NoopOp)?;
+    let prev = PRODUCTION_S3_ENABLED.swap(false, Ordering::AcqRel);
+    Ok(prev)
+}
+
+/// Query whether the production S3 gate is open. Lock-free read.
+pub fn production_s3_enabled() -> bool {
+    PRODUCTION_S3_ENABLED.load(Ordering::Acquire)
+}
+
+/// Boot-time flip from a kernel cmdline / env entry. Looks for the
+/// magic string `S3_VALIDATED` in the input — the cmdline parser
+/// calls this once after parse. No cap-check because it runs in
+/// the boot-time TCB before user authorities exist.
+pub fn boot_apply_s3_validated_flag(boot_cmdline: &str) -> bool {
+    if boot_cmdline.contains("S3_VALIDATED") {
+        PRODUCTION_S3_ENABLED.store(true, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
+#[doc(hidden)]
+pub fn __test_reset_production_s3() {
+    PRODUCTION_S3_ENABLED.store(false, Ordering::Release);
+}
+
+// ── Console / FB blank hook ─────────────────────────────────────────
+//
+// On S3 entry the framebuffer driver must blank its scanout +
+// detach the kernel console from the FB hook so a post-resume
+// repaint can come from the saved framebuffer rather than half-
+// painted glyphs left over from pre-suspend prints. Mirrors
+// Linux's `drivers/video/fbdev/core/fbcon.c::fbcon_suspend` shape
+// where the FB driver registers a per-class suspend/resume pair
+// against the PM subsystem.
+//
+// `power/` itself can't reach into the FB — it would create a
+// circular dep (graphics already depends on power for the runtime
+// PM trait). Instead we expose two hook slots the graphics
+// subsystem registers at boot.
+
+use core::sync::atomic::AtomicUsize;
+
+static FB_SUSPEND_HOOK: AtomicUsize = AtomicUsize::new(0);
+static FB_RESUME_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Type of the FB suspend / resume hook the graphics layer
+/// installs. No args, no errors — the FB driver does its own
+/// internal state-machine and either succeeds or logs.
+pub type FbPmHook = extern "C" fn();
+
+/// Install the FB suspend + resume hook pair. Idempotent.
+/// Graphics-layer boot calls this after `set_fb_hook` succeeds.
+pub fn set_fb_pm_hooks(suspend: FbPmHook, resume: FbPmHook) {
+    FB_SUSPEND_HOOK.store(suspend as usize, Ordering::Release);
+    FB_RESUME_HOOK.store(resume as usize, Ordering::Release);
+}
+
+/// Run the FB suspend hook if installed. Called by the suspend
+/// phase machinery after device fan-out but before the PM1 write.
+pub fn invoke_fb_suspend() {
+    let h = FB_SUSPEND_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: hook was a valid `extern "C" fn` when registered.
+        let f: FbPmHook = unsafe { core::mem::transmute(h) };
+        f();
+    }
+}
+
+/// Run the FB resume hook if installed. Called by the resume
+/// fan-out after device_pm::resume_all_devices().
+pub fn invoke_fb_resume() {
+    let h = FB_RESUME_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: hook was a valid `extern "C" fn` when registered.
+        let f: FbPmHook = unsafe { core::mem::transmute(h) };
+        f();
+    }
+}
+
+/// Whether the FB hook pair is installed. Diagnostic.
+pub fn fb_pm_hooks_installed() -> bool {
+    FB_SUSPEND_HOOK.load(Ordering::Acquire) != 0
+        && FB_RESUME_HOOK.load(Ordering::Acquire) != 0
+}
+
+#[doc(hidden)]
+pub fn __test_reset_fb_pm_hooks() {
+    FB_SUSPEND_HOOK.store(0, Ordering::Release);
+    FB_RESUME_HOOK.store(0, Ordering::Release);
+}
+
 /// Test helper: parse a `\_S3_` package body. Used by the smoke test
 /// to exercise the package-byte decoder without a live AML namespace.
 #[doc(hidden)]
@@ -332,7 +498,20 @@ pub fn arm_s3_resume(
     // part of the suspend phase machinery.
     unsafe {
         narf_arch::x86_64::s3_resume::save_resume_context();
+        // Save the LAPIC LVTs / TPR / SVR / timer state so the
+        // resume hook can restore them before drivers start
+        // expecting timer ticks.
+        narf_arch::x86_64::s3_resume::save_lapic_state();
     }
+    // Stamp the pre-suspend TSC so the resume hook can detect a
+    // backwards jump and propagate to the timekeeping subsystem.
+    snapshot_tsc_pre_suspend();
+    // Snapshot every IRQ vector's pre-suspend mask state and
+    // mask everything except the wake-source allowlist. Today
+    // the allowlist is empty (we don't yet know which vectors
+    // PMC.WAKE_STS routes wake events to); when the platform
+    // driver decodes WAKE_STS we pass them in here.
+    let _ = snapshot_and_mask_irqs(&[]);
     // setjmp the caller. On wake we'll re-enter via longjmp with
     // S3_RESUMED_SENTINEL.
     let mut jmp_snapshot = narf_arch::x86_64::setjmp::JmpBuf::default();
@@ -408,8 +587,12 @@ pub fn arm_s3_resume(
     // Refuse the real PM1 write unless explicitly armed. Until
     // we've validated the trampoline on real silicon, this
     // returns NotImplemented rather than putting the box into a
-    // state it can't recover from.
-    if !REAL_SLEEP_ARMED.load(Ordering::Acquire) {
+    // state it can't recover from. Either the test back-door
+    // (REAL_SLEEP_ARMED) or the production opt-in
+    // (PRODUCTION_S3_ENABLED) authorises the PM1 write.
+    if !REAL_SLEEP_ARMED.load(Ordering::Acquire)
+        && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire)
+    {
         return Err(SuspendError::NotImplemented);
     }
     // SAFETY: pm1_enter_sleep doesn't return on success — the
@@ -440,8 +623,11 @@ pub fn s3_enter(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspe
     );
 
     // Without a real-mode resume trampoline the system would never
-    // come back. Refuse to enter unless explicitly armed.
-    if !REAL_SLEEP_ARMED.load(Ordering::Acquire) {
+    // come back. Refuse to enter unless explicitly armed via either
+    // the test back-door or the production opt-in.
+    if !REAL_SLEEP_ARMED.load(Ordering::Acquire)
+        && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire)
+    {
         return Err(SuspendError::NotImplemented);
     }
 
@@ -453,4 +639,190 @@ pub fn s3_enter(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspe
         narf_acpi::pm1_enter_sleep(slp.slp_typ_a, slp.slp_typ_b);
     }
     Ok(())
+}
+
+// ── IRQ-source mask snapshot ────────────────────────────────────────
+//
+// On S3 entry every IRQ vector except wake-sources must be soft-
+// masked so a spurious controller IRQ between PM1 SLP_EN latch and
+// the actual sleep entry doesn't wake the system. On resume we
+// restore each vector's prior mask state from the snapshot.
+//
+// Wake-sources are identified by `PMC.WAKE_STS` on AMD SoCs (the
+// platform tells the OS which lines latched during sleep); on
+// Intel they live in GPE blocks. We don't poll them here — the
+// platform driver does — but we keep them unmasked through the
+// snapshot/restore so when wake fires the LAPIC routes them to
+// dispatch.
+//
+// Reference: Linux `kernel/irq/pm.c::suspend_device_irqs`.
+
+/// Snapshot of the soft-mask state of every IRQ vector. Packed as
+/// 4 × 64-bit words covering vectors 0..=255. Vectors 0..=31 are
+/// CPU exceptions; we still snapshot them for parity but they're
+/// never soft-maskable on real silicon (the kernel doesn't disable
+/// exception delivery).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IrqMaskSnapshot {
+    pub words: [u64; 4],
+}
+
+impl IrqMaskSnapshot {
+    /// True if vector `v` was masked at snapshot time.
+    pub fn is_masked(&self, v: u8) -> bool {
+        let (w, b) = ((v >> 6) as usize, v & 63);
+        (self.words[w] >> b) & 1 == 1
+    }
+
+    /// Set the mask bit for vector `v`.
+    pub fn set(&mut self, v: u8, masked: bool) {
+        let (w, b) = ((v >> 6) as usize, v & 63);
+        if masked {
+            self.words[w] |= 1u64 << b;
+        } else {
+            self.words[w] &= !(1u64 << b);
+        }
+    }
+}
+
+/// Stored across suspend → resume so the resume-fan-out can put
+/// each vector back into its pre-suspend mask state.
+static IRQ_MASK_SAVED: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static IRQ_MASK_HAS_SNAPSHOT: AtomicBool = AtomicBool::new(false);
+
+/// Walk the IRQ dispatch table, snapshot every vector's mask state,
+/// and soft-mask every vector outside the wake-source allowlist.
+/// Returns the encoded snapshot for diagnostic / smoke use; the
+/// kernel also stashes a copy in static storage for the resume
+/// path to consume.
+///
+/// `wake_sources` is the set of vectors that must stay unmasked
+/// across suspend (PMC wake lines, RTC alarm, lid switch). Empty
+/// means "mask everything except non-maskable exceptions".
+pub fn snapshot_and_mask_irqs(wake_sources: &[u8]) -> IrqMaskSnapshot {
+    let mut snap = IrqMaskSnapshot::default();
+    // Vectors 32..=255 are IRQs (vectors 0..=31 are CPU
+    // exceptions — not soft-maskable).
+    for v in 32u8..=255u8 {
+        if narf_interrupts::is_masked(v) {
+            snap.set(v, true);
+        }
+        if !wake_sources.contains(&v) {
+            narf_interrupts::disable_irq(v);
+        }
+    }
+    // Stash for the resume fan-out.
+    for (i, w) in snap.words.iter().enumerate() {
+        IRQ_MASK_SAVED[i].store(*w, Ordering::Release);
+    }
+    IRQ_MASK_HAS_SNAPSHOT.store(true, Ordering::Release);
+    snap
+}
+
+/// Restore every vector's mask state from the snapshot taken by
+/// [`snapshot_and_mask_irqs`]. Called from the resume fan-out
+/// (post wake trampoline, post device_pm::resume_all_devices).
+/// No-op if no snapshot is recorded.
+pub fn restore_irq_masks() {
+    if !IRQ_MASK_HAS_SNAPSHOT.load(Ordering::Acquire) {
+        return;
+    }
+    let snap = IrqMaskSnapshot {
+        words: [
+            IRQ_MASK_SAVED[0].load(Ordering::Acquire),
+            IRQ_MASK_SAVED[1].load(Ordering::Acquire),
+            IRQ_MASK_SAVED[2].load(Ordering::Acquire),
+            IRQ_MASK_SAVED[3].load(Ordering::Acquire),
+        ],
+    };
+    for v in 32u8..=255u8 {
+        if snap.is_masked(v) {
+            narf_interrupts::disable_irq(v);
+        } else {
+            narf_interrupts::enable_irq(v);
+        }
+    }
+    IRQ_MASK_HAS_SNAPSHOT.store(false, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn __test_reset_irq_snapshot() {
+    for w in IRQ_MASK_SAVED.iter() {
+        w.store(0, Ordering::Release);
+    }
+    IRQ_MASK_HAS_SNAPSHOT.store(false, Ordering::Release);
+}
+
+// ── TSC handling across S3 ──────────────────────────────────────────
+//
+// On most x86 silicon the TSC stops counting in S3 and resets on
+// wake. Reads taken before suspend will be larger than reads taken
+// after — that's a "backwards jump" relative to the kernel's wall-
+// clock view. Linux marks the post-resume wall clock backwards-
+// jump as expected (`clocksource_resume` + `tk_setup_internals`);
+// we do the same here.
+//
+// The TSC re-calibration is the timekeeping subsystem's job
+// (`narf_time::calibrate_clocks_with_source` via HPET cross-check);
+// this module only records the pre-suspend TSC reading and
+// exposes a "did we jump back?" predicate for diagnostics.
+
+#[cfg(target_arch = "x86_64")]
+static TSC_PRE_SUSPEND: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static TSC_BACKWARD_JUMP_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Snapshot the TSC just before SLP_EN latches. Stored for the
+/// resume path to compare against — if the post-resume TSC is
+/// less than the pre-suspend value, we record a backwards jump
+/// (expected; not an error).
+#[cfg(target_arch = "x86_64")]
+pub fn snapshot_tsc_pre_suspend() {
+    let v = narf_arch::x86_64::tsc::rdtsc();
+    TSC_PRE_SUSPEND.store(v, Ordering::Release);
+}
+
+/// Compare the post-resume TSC against the pre-suspend snapshot.
+/// Returns `true` if the TSC went backwards (typical S3 wake on
+/// silicon that resets the TSC across sleep). Calling without a
+/// prior snapshot returns `false`.
+#[cfg(target_arch = "x86_64")]
+pub fn check_tsc_post_resume() -> bool {
+    let pre = TSC_PRE_SUSPEND.load(Ordering::Acquire);
+    if pre == 0 {
+        return false;
+    }
+    let now = narf_arch::x86_64::tsc::rdtsc();
+    let jumped_back = now < pre;
+    TSC_BACKWARD_JUMP_DETECTED.store(jumped_back, Ordering::Release);
+    jumped_back
+}
+
+/// Whether the most recent resume detected a TSC backwards jump.
+/// Diagnostic accessor for the boot log / a future
+/// `/proc/suspend-stats` surface.
+#[cfg(target_arch = "x86_64")]
+pub fn tsc_backward_jump_detected() -> bool {
+    TSC_BACKWARD_JUMP_DETECTED.load(Ordering::Acquire)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_reset_tsc_snapshot() {
+    TSC_PRE_SUSPEND.store(0, Ordering::Release);
+    TSC_BACKWARD_JUMP_DETECTED.store(false, Ordering::Release);
+}
+
+/// Test-only: inject a synthetic pre-suspend TSC value so the
+/// backwards-jump detector can be exercised without an actual
+/// sleep cycle. Production callers use [`snapshot_tsc_pre_suspend`].
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_inject_pre_suspend_tsc(value: u64) {
+    TSC_PRE_SUSPEND.store(value, Ordering::Release);
 }

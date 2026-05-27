@@ -1871,3 +1871,398 @@ fn smoke_device_pm_ops_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/suspend", smoke_device_pm_ops_round_trip);
+
+// ── PCI config save/restore integration shape ──────────────────────
+
+fn smoke_pci_config_save_restore_round_trip_via_ops() -> TestResult {
+    // Exercise the integration shape a real PCIe driver uses:
+    // a `DevicePmOps` impl that snapshots its config-space struct
+    // on suspend and reapplies it on resume. Hits the device_pm
+    // fan-out so we also validate the registry path.
+    //
+    // The actual cfg-space helpers (bus::pci::save_config /
+    // restore_config) are tested in `bus/pci` smokes; here we
+    // verify the wrapper integrates with power's device_pm
+    // registry. We model the cfg-space with an in-memory shadow.
+    use crate::device_pm::{
+        register_device_pm_ops, resume_all_devices, suspend_all_devices, DevicePmError,
+        DevicePmOps, __reset_for_test,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    __reset_for_test();
+
+    // Model "live" cfg-space + the saved snapshot. On suspend
+    // we copy live into saved; on resume we copy saved back to
+    // live (the BAR bits are what real silicon loses across S3).
+    #[derive(Default, Copy, Clone, PartialEq, Eq)]
+    struct FakeCfg {
+        command: u16,
+        bar0: u32,
+        bar1: u32,
+    }
+    struct FakePcieDriver {
+        live: IrqSafeSpinLock<FakeCfg>,
+        saved: IrqSafeSpinLock<Option<FakeCfg>>,
+        // The "device" clears its cfg on suspend, simulating
+        // a real D3hot transition where BAR programming is lost.
+        clear_on_suspend: AtomicBool,
+        // Counters so we can assert each callback fired exactly once.
+        suspends: AtomicU32,
+        resumes: AtomicU32,
+    }
+    impl DevicePmOps for FakePcieDriver {
+        fn suspend(&self) -> Result<(), DevicePmError> {
+            self.suspends.fetch_add(1, Ordering::SeqCst);
+            // Snapshot before the "device" clears.
+            let snap = *self.live.lock();
+            *self.saved.lock() = Some(snap);
+            if self.clear_on_suspend.load(Ordering::SeqCst) {
+                *self.live.lock() = FakeCfg::default();
+            }
+            Ok(())
+        }
+        fn resume(&self) -> Result<(), DevicePmError> {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            // Re-apply the saved cfg.
+            if let Some(snap) = *self.saved.lock() {
+                *self.live.lock() = snap;
+            }
+            Ok(())
+        }
+    }
+    let drv = Arc::new(FakePcieDriver {
+        live: IrqSafeSpinLock::new(FakeCfg {
+            command: 0x0007, // MEM|BUS_MASTER|IO
+            bar0: 0xFEDC_0000,
+            bar1: 0x0000_0001,
+        }),
+        saved: IrqSafeSpinLock::new(None),
+        clear_on_suspend: AtomicBool::new(true),
+        suspends: AtomicU32::new(0),
+        resumes: AtomicU32::new(0),
+    });
+    let original = *drv.live.lock();
+
+    register_device_pm_ops("fake-pcie", drv.clone());
+
+    let _ = suspend_all_devices();
+    if drv.suspends.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("PCIe driver suspend didn't fire exactly once");
+    }
+    // Post-suspend, "device" should have lost its cfg.
+    if *drv.live.lock() == original {
+        return TestResult::Fail("clear_on_suspend didn't take effect");
+    }
+    let _ = resume_all_devices();
+    if drv.resumes.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("PCIe driver resume didn't fire exactly once");
+    }
+    // Resume must restore the original cfg byte-for-byte.
+    if *drv.live.lock() != original {
+        return TestResult::Fail("PCIe cfg did not round-trip across suspend/resume");
+    }
+
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/suspend",
+    smoke_pci_config_save_restore_round_trip_via_ops
+);
+
+// ── IRQ-mask snapshot encoder ──────────────────────────────────────
+
+fn smoke_irq_mask_snapshot_encoder() -> TestResult {
+    use crate::suspend::IrqMaskSnapshot;
+
+    // Bit-pack encoder over the [0..=255] vector range. Walking a
+    // handful of representative vectors and checking pack/unpack
+    // covers the layout invariants the suspend snapshot relies on.
+    let mut s = IrqMaskSnapshot::default();
+    if s.is_masked(0) {
+        return TestResult::Fail("default snapshot was not all-zero");
+    }
+
+    // Vector 0 → word 0 bit 0.
+    s.set(0, true);
+    if !s.is_masked(0) {
+        return TestResult::Fail("vector 0 didn't set");
+    }
+    if s.words[0] != 1u64 {
+        return TestResult::Fail("vector 0 packed to wrong bit");
+    }
+
+    // Vector 63 → word 0 bit 63 (highest bit of first word).
+    s.set(63, true);
+    if !s.is_masked(63) {
+        return TestResult::Fail("vector 63 didn't set");
+    }
+    if s.words[0] & (1u64 << 63) == 0 {
+        return TestResult::Fail("vector 63 didn't land in word 0 bit 63");
+    }
+
+    // Vector 64 → word 1 bit 0.
+    s.set(64, true);
+    if !s.is_masked(64) {
+        return TestResult::Fail("vector 64 didn't set");
+    }
+    if s.words[1] != 1u64 {
+        return TestResult::Fail("vector 64 didn't land in word 1 bit 0");
+    }
+
+    // Vector 255 → word 3 bit 63.
+    s.set(255, true);
+    if !s.is_masked(255) {
+        return TestResult::Fail("vector 255 didn't set");
+    }
+    if s.words[3] & (1u64 << 63) == 0 {
+        return TestResult::Fail("vector 255 didn't land in word 3 bit 63");
+    }
+
+    // Clearing should toggle back.
+    s.set(0, false);
+    if s.is_masked(0) {
+        return TestResult::Fail("clearing vector 0 didn't take effect");
+    }
+
+    // All other set bits should survive the clear.
+    if !s.is_masked(63) || !s.is_masked(64) || !s.is_masked(255) {
+        return TestResult::Fail("clearing v0 disturbed other vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", smoke_irq_mask_snapshot_encoder);
+
+// ── TSC backwards-jump detection ───────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_tsc_backwards_jump_detection() -> TestResult {
+    use crate::suspend::{
+        __test_inject_pre_suspend_tsc, __test_reset_tsc_snapshot, check_tsc_post_resume,
+        snapshot_tsc_pre_suspend, tsc_backward_jump_detected,
+    };
+
+    __test_reset_tsc_snapshot();
+
+    // Default: no snapshot → no jump detected.
+    if check_tsc_post_resume() {
+        return TestResult::Fail("backwards-jump fired with no snapshot armed");
+    }
+    if tsc_backward_jump_detected() {
+        return TestResult::Fail("flag was true after reset");
+    }
+
+    // Snapshot current TSC then immediately compare — TSC always
+    // advances on real silicon between two RDTSC reads, so this
+    // should NOT signal a jump.
+    snapshot_tsc_pre_suspend();
+    if check_tsc_post_resume() {
+        return TestResult::Fail("monotonic TSC reported a backwards jump");
+    }
+
+    // Inject a synthetic future TSC value as if pre-suspend was a
+    // huge future time — comparing against the current RDTSC will
+    // then show a "backwards jump" (simulates the S3 reset case).
+    __test_inject_pre_suspend_tsc(u64::MAX - 1000);
+    if !check_tsc_post_resume() {
+        return TestResult::Fail("synthetic backwards jump wasn't detected");
+    }
+    if !tsc_backward_jump_detected() {
+        return TestResult::Fail("backward_jump_detected flag didn't latch");
+    }
+
+    __test_reset_tsc_snapshot();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/suspend", smoke_tsc_backwards_jump_detection);
+
+// ── LAPIC LVT save/restore round-trip ──────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_lapic_save_restore_round_trip() -> TestResult {
+    use narf_arch::x86_64::s3_resume::{
+        __reset_lapic_for_test, __test_inject_lapic_state, captured_lapic_state, LapicSavedState,
+    };
+
+    __reset_lapic_for_test();
+
+    // Reset state — no snapshot.
+    if captured_lapic_state().is_some() {
+        return TestResult::Fail("LAPIC state captured before save");
+    }
+
+    // Inject a known shape and verify it round-trips through the
+    // accessor. (The actual MSR program-back is exercised on real
+    // silicon during S3; here we cover the encoder + storage
+    // layer, since reading x2APIC MSRs from kernel-test is host-
+    // dependent.)
+    let golden = LapicSavedState {
+        lvt_timer: 0x0001_0020,
+        lvt_thermal: 0x0001_0030,
+        lvt_perfmon: 0x0001_0040,
+        lvt_lint0: 0x0001_0700,
+        lvt_lint1: 0x0001_0400,
+        lvt_error: 0x0001_00FE,
+        lvt_cmci: 0x0001_00F0,
+        tpr: 0x10,
+        svr: 0x1FF,
+        timer_init_count: 0x0010_0000,
+        timer_divide: 0x3,
+    };
+    __test_inject_lapic_state(golden);
+
+    let got = match captured_lapic_state() {
+        Some(s) => s,
+        None => return TestResult::Fail("injected state did not register as captured"),
+    };
+    if got != golden {
+        return TestResult::Fail("LAPIC saved state did not round-trip byte-for-byte");
+    }
+
+    __reset_lapic_for_test();
+    if captured_lapic_state().is_some() {
+        return TestResult::Fail("reset_for_test left LAPIC snapshot armed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/suspend", smoke_lapic_save_restore_round_trip);
+
+// ── Production S3 opt-in sentinel ──────────────────────────────────
+
+fn smoke_production_s3_sentinel_default_off_opt_in_flip() -> TestResult {
+    use crate::suspend::{
+        __test_reset, __test_reset_production_s3, boot_apply_s3_validated_flag,
+        disable_production_s3, enable_production_s3, production_s3_enabled,
+    };
+    use crate::Power;
+    use narf_capabilities::{Cap, Invoke};
+
+    __test_reset();
+    __test_reset_production_s3();
+
+    // Default must be off — production S3 is gated until userspace
+    // explicitly opts in after on-silicon validation.
+    if production_s3_enabled() {
+        return TestResult::Fail("production S3 was on by default");
+    }
+
+    // Cap-gated opt-in flips the sentinel.
+    let cap: Cap<Power, Invoke> = Cap::bootstrap();
+    match enable_production_s3(&cap) {
+        Ok(prev) => {
+            if prev {
+                return TestResult::Fail("enable returned prev=true on first call");
+            }
+        }
+        Err(_) => return TestResult::Fail("enable rejected a live cap"),
+    }
+    if !production_s3_enabled() {
+        return TestResult::Fail("enable didn't flip the sentinel");
+    }
+
+    // Disable should return prev=true on the second call.
+    match disable_production_s3(&cap) {
+        Ok(prev) => {
+            if !prev {
+                return TestResult::Fail("disable didn't observe prior enable");
+            }
+        }
+        Err(_) => return TestResult::Fail("disable rejected a live cap"),
+    }
+    if production_s3_enabled() {
+        return TestResult::Fail("disable didn't clear the sentinel");
+    }
+
+    // Revoked cap is refused.
+    let cap2: Cap<Power, Invoke> = Cap::bootstrap();
+    cap2.revoke();
+    if enable_production_s3(&cap2).is_ok() {
+        return TestResult::Fail("revoked cap was accepted by enable");
+    }
+
+    // Boot-cmdline path: the magic token sets the flag without a
+    // cap (it runs pre-cap-creation).
+    __test_reset_production_s3();
+    if boot_apply_s3_validated_flag("ro console=ttyS0 S3_VALIDATED quiet") != true {
+        return TestResult::Fail("cmdline scan didn't find S3_VALIDATED");
+    }
+    if !production_s3_enabled() {
+        return TestResult::Fail("cmdline scan didn't flip the sentinel");
+    }
+
+    // A cmdline without the token doesn't flip it.
+    __test_reset_production_s3();
+    if boot_apply_s3_validated_flag("ro console=ttyS0 quiet") {
+        return TestResult::Fail("cmdline scan reported true without the token");
+    }
+    if production_s3_enabled() {
+        return TestResult::Fail("cmdline-less scan flipped the sentinel");
+    }
+
+    __test_reset_production_s3();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/suspend",
+    smoke_production_s3_sentinel_default_off_opt_in_flip
+);
+
+// ── FB suspend / resume hook fan-out ───────────────────────────────
+
+fn smoke_fb_pm_hooks_fire_on_phase_pingpong() -> TestResult {
+    use crate::suspend::{
+        __test_reset_fb_pm_hooks, fb_pm_hooks_installed, invoke_fb_resume, invoke_fb_suspend,
+        set_fb_pm_hooks,
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __test_reset_fb_pm_hooks();
+    if fb_pm_hooks_installed() {
+        return TestResult::Fail("FB PM hooks were installed at reset");
+    }
+
+    // Hook counters live in a static so the `extern "C" fn`
+    // signature can reach them without captures.
+    static SUSPENDS: AtomicU32 = AtomicU32::new(0);
+    static RESUMES: AtomicU32 = AtomicU32::new(0);
+    SUSPENDS.store(0, Ordering::Release);
+    RESUMES.store(0, Ordering::Release);
+    extern "C" fn fb_sus() {
+        SUSPENDS.fetch_add(1, Ordering::SeqCst);
+    }
+    extern "C" fn fb_res() {
+        RESUMES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    set_fb_pm_hooks(fb_sus, fb_res);
+    if !fb_pm_hooks_installed() {
+        return TestResult::Fail("hooks didn't register as installed");
+    }
+
+    invoke_fb_suspend();
+    invoke_fb_resume();
+    if SUSPENDS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("FB suspend hook didn't fire");
+    }
+    if RESUMES.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("FB resume hook didn't fire");
+    }
+
+    __test_reset_fb_pm_hooks();
+    if fb_pm_hooks_installed() {
+        return TestResult::Fail("reset didn't clear FB hooks");
+    }
+    // After reset the hook is a no-op (no panic, no state change).
+    invoke_fb_suspend();
+    invoke_fb_resume();
+    if SUSPENDS.load(Ordering::SeqCst) != 1 || RESUMES.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("reset hooks still fired");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", smoke_fb_pm_hooks_fire_on_phase_pingpong);

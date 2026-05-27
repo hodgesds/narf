@@ -118,8 +118,29 @@ pub fn cpu_status_line() -> Option<alloc::string::String> {
 /// their controllers before control returns to the suspending
 /// thread. Registered with the arch crate at boot so arch doesn't
 /// need a power dependency.
+///
+/// Order matters: LAPIC LVTs restored first (so the timer / IPIs
+/// can dispatch when interrupts come back), then device_pm fan-
+/// out (drivers re-program their controllers, MSI-X tables, etc.),
+/// then IRQ mask restore (re-apply pre-suspend masks for each
+/// vector), then the FB resume hook (repaint the framebuffer).
 extern "C" fn s3_resume_hook_entry() {
+    // SAFETY: wake continuation runs at CPL=0 on the boot CPU with
+    // interrupts gated; restore_lapic_state is a no-op if no
+    // snapshot was armed (so this is safe to call on machines
+    // that bypassed S3 via the test back-door).
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        narf_arch::x86_64::s3_resume::restore_lapic_state();
+    }
     let _ = device_pm::resume_all_devices();
+    suspend::restore_irq_masks();
+    suspend::invoke_fb_resume();
+    // Check for TSC backwards-jump and latch the diagnostic flag.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = suspend::check_tsc_post_resume();
+    }
 }
 
 pub fn register_initcalls() {
