@@ -4765,3 +4765,70 @@ kernel_test_in!("memory", smoke_atomic_pool_exhausted_returns_none);
 
 // (deref-round-trip already covered by atomic_pool.rs's
 // smoke_atomic_pool_pooled_deref_mut_visible_next_lease.)
+
+// ── W^X enforcement smokes ────────────────────────────────────────────
+
+fn smoke_wx_rejects_writable_executable_mmap() -> TestResult {
+    use crate::address_space::RegionPerms;
+    use crate::wx::{check_mmap_perms, WxCheck};
+    let wx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
+    if check_mmap_perms(wx) != WxCheck::DenyWX {
+        return TestResult::Fail("mmap accepted PROT_WRITE | PROT_EXEC");
+    }
+    // Sanity: RX and RW should still be Allow.
+    let rx = RegionPerms::READ | RegionPerms::EXEC;
+    let rw = RegionPerms::READ | RegionPerms::WRITE;
+    if check_mmap_perms(rx) != WxCheck::Allow {
+        return TestResult::Fail("mmap rejected legitimate RX");
+    }
+    if check_mmap_perms(rw) != WxCheck::Allow {
+        return TestResult::Fail("mmap rejected legitimate RW");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/wx", smoke_wx_rejects_writable_executable_mmap);
+
+fn smoke_wx_mprotect_rw_to_rx_needs_cap() -> TestResult {
+    use crate::address_space::RegionPerms;
+    use crate::wx::{classify_mprotect, WxTransition};
+    let rw = RegionPerms::READ | RegionPerms::WRITE;
+    let rx = RegionPerms::READ | RegionPerms::EXEC;
+    // RW -> RX is the JIT codegen flip; requires CAP_JIT.
+    if classify_mprotect(rw, rx) != WxTransition::NeedsCapJit {
+        return TestResult::Fail("RW->RX did not require CAP_JIT");
+    }
+    // RX -> RW is allowed (drop X, never both at once).
+    if classify_mprotect(rx, rw) != WxTransition::Allow {
+        return TestResult::Fail("RX->RW unexpectedly required cap");
+    }
+    // RX -> RWX is absolutely refused (the "self-modifying live code"
+    // shape PaX rejects).
+    let rwx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
+    if classify_mprotect(rx, rwx) != WxTransition::DenyXtoWX {
+        return TestResult::Fail("RX->RWX was not absolutely refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/wx", smoke_wx_mprotect_rw_to_rx_needs_cap);
+
+fn smoke_wx_classify_helpers() -> TestResult {
+    use crate::address_space::RegionPerms;
+    use crate::wx::{is_jit_buffer, is_jit_code};
+    let rw = RegionPerms::READ | RegionPerms::WRITE;
+    let rx = RegionPerms::READ | RegionPerms::EXEC;
+    let ro = RegionPerms::READ;
+    if !is_jit_buffer(rw) {
+        return TestResult::Fail("RW not classified as JIT buffer");
+    }
+    if is_jit_buffer(rx) {
+        return TestResult::Fail("RX wrongly classified as JIT buffer");
+    }
+    if !is_jit_code(rx) {
+        return TestResult::Fail("RX not classified as JIT code");
+    }
+    if is_jit_code(ro) {
+        return TestResult::Fail("RO wrongly classified as JIT code");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/wx", smoke_wx_classify_helpers);

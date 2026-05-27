@@ -29,6 +29,7 @@ pub mod zpool;
 pub mod spd5;
 pub mod tlb_shootdown;
 pub mod vmalloc;
+pub mod wx;
 
 mod tests;
 
