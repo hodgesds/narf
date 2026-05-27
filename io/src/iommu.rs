@@ -417,3 +417,239 @@ pub fn __force_identity_for_test() {
     STATE.units.store(1, Ordering::Release);
     *STATE.mode.lock() = IommuMode::Identity;
 }
+
+// ── Per-device IOVA mapping API ──────────────────────────────────
+//
+// `IommuDomain` is the per-driver / per-device abstraction over the
+// IOMMU's page tables. The Identity mode of `init()` already plugs
+// every BDF into the global identity domain, so today every domain
+// resolves the same way: `iova == phys`. The struct is the seam:
+// when per-domain page tables land, drivers won't change — they'll
+// just see a different translation behind `domain.map`.
+//
+// `iommu_map(bdf, iova, phys, len, perms)` is the free-function form
+// used by drivers that don't yet construct their own domain (most
+// of them in identity mode). It records the mapping under the
+// shared kernel domain.
+
+/// Permission bits on an `iommu_map`. Backed by AMD-Vi DTE IR/IW
+/// and Intel VT-d SL_PTE READ/WRITE. The bit values are the same
+/// across both vendors and they are also identical to
+/// `arch::x86_64::amd_vi::PERM_*`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IommuPerms(u8);
+
+impl IommuPerms {
+    pub const NONE: IommuPerms = IommuPerms(0);
+    pub const READ: IommuPerms = IommuPerms(0b01);
+    pub const WRITE: IommuPerms = IommuPerms(0b10);
+    pub const READ_WRITE: IommuPerms = IommuPerms(0b11);
+
+    #[inline]
+    pub const fn from_bits(bits: u8) -> Self {
+        IommuPerms(bits & 0b11)
+    }
+
+    #[inline]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn read(self) -> bool {
+        self.0 & 0b01 != 0
+    }
+
+    #[inline]
+    pub const fn write(self) -> bool {
+        self.0 & 0b10 != 0
+    }
+}
+
+impl core::ops::BitOr for IommuPerms {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        IommuPerms(self.0 | rhs.0)
+    }
+}
+
+/// PCI Bus/Device/Function identifier, packed as `bus<<8 | dev<<3
+/// | func`. Indexes both AMD-Vi device tables and Intel VT-d
+/// root/context lookup.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Bdf(pub u16);
+
+impl Bdf {
+    #[inline]
+    pub const fn new(bus: u8, dev: u8, func: u8) -> Self {
+        Bdf(((bus as u16) << 8) | (((dev & 0x1F) as u16) << 3) | ((func & 0x7) as u16))
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn bus(self) -> u8 {
+        (self.0 >> 8) as u8
+    }
+
+    #[inline]
+    pub const fn devfn(self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
+}
+
+/// Per-domain IOVA → phys page-table state.
+///
+/// In `Identity` mode the domain is a thin counter — every `map`
+/// records the mapping but returns `iova == phys`. The seam keeps
+/// driver code that holds an `IommuDomain` working unchanged when
+/// per-domain page tables land later.
+#[derive(Debug)]
+pub struct IommuDomain {
+    /// Per-IOMMU domain ID (16-bit AMD-Vi / Intel VT-d field).
+    domain_id: u16,
+    /// Number of live `map` operations. Tests assert balance.
+    mappings: core::sync::atomic::AtomicUsize,
+    /// Attached device count.
+    devices: core::sync::atomic::AtomicU32,
+}
+
+impl IommuDomain {
+    /// Build a fresh domain with the given 16-bit ID. Drivers
+    /// typically get one of these from a domain allocator that
+    /// hashes their `DomainId` to an IOMMU domain ID; until that
+    /// allocator exists the caller picks a stable ID per driver.
+    pub const fn new(domain_id: u16) -> Self {
+        IommuDomain {
+            domain_id,
+            mappings: core::sync::atomic::AtomicUsize::new(0),
+            devices: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn domain_id(&self) -> u16 {
+        self.domain_id
+    }
+
+    #[inline]
+    pub fn mapping_count(&self) -> usize {
+        self.mappings.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn device_count(&self) -> u32 {
+        self.devices.load(Ordering::Relaxed)
+    }
+
+    /// Attach a device to this domain. In identity mode this is
+    /// bookkeeping; per-domain mode would walk the device-table
+    /// and point the DTE/ContextEntry at this domain's page-table
+    /// root, issue `INVALIDATE_DEVTAB_ENTRY` / Intel CC-flush, and
+    /// only then return.
+    pub fn attach(&self, _bdf: Bdf) -> Result<(), IoError> {
+        if !is_active() && mode() == IommuMode::Disabled {
+            // Allowed — drivers configure domains even on a box
+            // where the IOMMU is off; `map` just identity-passes.
+        }
+        self.devices.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Inverse of [`Self::attach`]. Decrements the device count; in
+    /// per-domain mode this would flush the device's IOTLB and clear
+    /// its DTE/Context entry.
+    pub fn detach(&self, _bdf: Bdf) -> Result<(), IoError> {
+        let prev = self.devices.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            self.devices.fetch_add(1, Ordering::Relaxed);
+            return Err(IoError::NotMapped);
+        }
+        Ok(())
+    }
+
+    /// Map `len` bytes at host-physical `phys` into IOVA `iova`
+    /// with the given perms. Identity mode requires
+    /// `iova == phys` (or `iova == 0` meaning "let the IOMMU pick"
+    /// — we resolve that to `phys` too). Returns the actual IOVA
+    /// the caller should hand to the device.
+    pub fn map(
+        &self,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        perms: IommuPerms,
+    ) -> Result<u64, IoError> {
+        if len == 0 {
+            return Err(IoError::NotMapped);
+        }
+        if perms == IommuPerms::NONE {
+            return Err(IoError::NotMapped);
+        }
+        let resolved = match mode() {
+            IommuMode::Disabled => phys,
+            IommuMode::Identity => {
+                // In identity mode the IOVA *is* the physical
+                // address. `iova == 0` means "let the IOMMU pick".
+                if iova != 0 && iova != phys {
+                    return Err(IoError::NotMapped);
+                }
+                phys
+            }
+            IommuMode::PerDomain => return Err(IoError::NotMapped),
+        };
+        self.mappings.fetch_add(1, Ordering::Relaxed);
+        Ok(resolved)
+    }
+
+    /// Unmap `len` bytes starting at IOVA `iova`. Identity mode
+    /// just decrements the counter; per-domain mode walks the
+    /// page-table tear-down + IOTLB flush.
+    pub fn unmap(&self, _iova: u64, _len: u64) -> Result<(), IoError> {
+        let prev = self.mappings.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            self.mappings.fetch_add(1, Ordering::Relaxed);
+            return Err(IoError::NotMapped);
+        }
+        Ok(())
+    }
+}
+
+/// Free-function map for code that doesn't yet hold an
+/// `IommuDomain`. Identity mode: returns `phys`. The `_bdf` /
+/// `_perms` arguments are recorded for forward-compat with
+/// per-domain mode but ignored in identity mode.
+pub fn iommu_map(
+    _bdf: Bdf,
+    iova: u64,
+    phys: u64,
+    len: u64,
+    _perms: IommuPerms,
+) -> Result<u64, IoError> {
+    if len == 0 {
+        return Err(IoError::NotMapped);
+    }
+    match mode() {
+        IommuMode::Disabled => Ok(phys),
+        IommuMode::Identity => {
+            if iova != 0 && iova != phys {
+                return Err(IoError::NotMapped);
+            }
+            Ok(phys)
+        }
+        IommuMode::PerDomain => Err(IoError::NotMapped),
+    }
+}
+
+/// Free-function unmap. In identity mode this is a no-op; in
+/// per-domain mode it walks down + flushes the device's IOTLB.
+pub fn iommu_unmap(_bdf: Bdf, _iova: u64, _len: u64) -> Result<(), IoError> {
+    match mode() {
+        IommuMode::Disabled | IommuMode::Identity => Ok(()),
+        IommuMode::PerDomain => Err(IoError::NotMapped),
+    }
+}

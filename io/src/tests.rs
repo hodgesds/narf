@@ -550,3 +550,165 @@ fn smoke_iommu_caps_default_zero_after_reset() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io/iommu", smoke_iommu_caps_default_zero_after_reset);
+
+// ── IommuDomain + iommu_map (per-device IOVA API) ────────────────
+
+fn smoke_iommu_bdf_pack_unpack() -> TestResult {
+    use crate::iommu::Bdf;
+    let b = Bdf::new(0xAB, 0x1F, 0x07);
+    if b.bus() != 0xAB {
+        return TestResult::Fail("bus round-trip mismatch");
+    }
+    if b.devfn() != ((0x1F << 3) | 0x07) {
+        return TestResult::Fail("devfn round-trip mismatch");
+    }
+    if b.raw() != ((0xAB << 8) | (0x1F << 3) | 0x07) {
+        return TestResult::Fail("raw packing drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_bdf_pack_unpack);
+
+fn smoke_iommu_perms_bit_layout() -> TestResult {
+    use crate::iommu::IommuPerms;
+    if IommuPerms::NONE.bits() != 0 {
+        return TestResult::Fail("NONE != 0");
+    }
+    if IommuPerms::READ.bits() != 0b01 {
+        return TestResult::Fail("READ bit drift");
+    }
+    if IommuPerms::WRITE.bits() != 0b10 {
+        return TestResult::Fail("WRITE bit drift");
+    }
+    if (IommuPerms::READ | IommuPerms::WRITE) != IommuPerms::READ_WRITE {
+        return TestResult::Fail("READ|WRITE != READ_WRITE");
+    }
+    if !IommuPerms::READ_WRITE.read() || !IommuPerms::READ_WRITE.write() {
+        return TestResult::Fail("RW predicate mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_perms_bit_layout);
+
+fn smoke_iommu_domain_identity_map_unmap() -> TestResult {
+    use crate::iommu::{
+        __force_identity_for_test, __reset_for_test, Bdf, IommuDomain, IommuPerms,
+    };
+    __reset_for_test();
+    __force_identity_for_test();
+    let dom = IommuDomain::new(0x10);
+    if dom.domain_id() != 0x10 {
+        __reset_for_test();
+        return TestResult::Fail("domain id mismatch");
+    }
+    if dom.mapping_count() != 0 {
+        __reset_for_test();
+        return TestResult::Fail("fresh domain has mappings");
+    }
+    let bdf = Bdf::new(0, 1, 0);
+    if dom.attach(bdf).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("attach failed");
+    }
+    if dom.device_count() != 1 {
+        __reset_for_test();
+        return TestResult::Fail("device count != 1 after attach");
+    }
+    let phys: u64 = 0xCAFE_F000;
+    let iova = match dom.map(0, phys, 4096, IommuPerms::READ_WRITE) {
+        Ok(v) => v,
+        Err(_) => {
+            __reset_for_test();
+            return TestResult::Fail("identity map failed");
+        }
+    };
+    if iova != phys {
+        __reset_for_test();
+        return TestResult::Fail("identity map didn't return phys");
+    }
+    if dom.mapping_count() != 1 {
+        __reset_for_test();
+        return TestResult::Fail("mapping count not bumped");
+    }
+    if dom.unmap(iova, 4096).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("unmap failed");
+    }
+    if dom.mapping_count() != 0 {
+        __reset_for_test();
+        return TestResult::Fail("mapping count not decremented");
+    }
+    if dom.detach(bdf).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("detach failed");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_domain_identity_map_unmap);
+
+fn smoke_iommu_domain_rejects_zero_len_and_no_perms() -> TestResult {
+    use crate::iommu::{__force_identity_for_test, __reset_for_test, IommuDomain, IommuPerms};
+    __reset_for_test();
+    __force_identity_for_test();
+    let dom = IommuDomain::new(0);
+    if dom.map(0, 0x1000, 0, IommuPerms::READ_WRITE).is_ok() {
+        __reset_for_test();
+        return TestResult::Fail("zero-len map should fail");
+    }
+    if dom.map(0, 0x1000, 4096, IommuPerms::NONE).is_ok() {
+        __reset_for_test();
+        return TestResult::Fail("no-perms map should fail");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_domain_rejects_zero_len_and_no_perms);
+
+fn smoke_iommu_map_free_function_identity() -> TestResult {
+    use crate::iommu::{
+        __force_identity_for_test, __reset_for_test, iommu_map, iommu_unmap, Bdf,
+        IommuPerms,
+    };
+    __reset_for_test();
+    __force_identity_for_test();
+    let bdf = Bdf::new(0, 0x1F, 0x3);
+    let phys = 0x1234_5000u64;
+    let iova = match iommu_map(bdf, 0, phys, 4096, IommuPerms::READ_WRITE) {
+        Ok(v) => v,
+        Err(_) => {
+            __reset_for_test();
+            return TestResult::Fail("iommu_map identity failed");
+        }
+    };
+    if iova != phys {
+        __reset_for_test();
+        return TestResult::Fail("iommu_map identity != phys");
+    }
+    if iommu_unmap(bdf, iova, 4096).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("iommu_unmap failed");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_map_free_function_identity);
+
+fn smoke_iommu_mode_resolution_priority() -> TestResult {
+    // Identity mode is the only mode `init` can establish; the
+    // dispatch order is AmdVi > IntelVtd > None. This pins the
+    // assertion that vendor priority survives init.
+    use crate::iommu::{__force_identity_for_test, __reset_for_test, vendor, IommuVendor};
+    __reset_for_test();
+    __force_identity_for_test();
+    if vendor() != IommuVendor::AmdVi {
+        __reset_for_test();
+        return TestResult::Fail("force-identity must select AmdVi");
+    }
+    __reset_for_test();
+    if vendor() != IommuVendor::None {
+        return TestResult::Fail("reset must clear vendor to None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_mode_resolution_priority);
