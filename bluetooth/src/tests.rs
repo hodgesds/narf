@@ -2547,3 +2547,290 @@ fn smoke_btusb_hci_command_setup_packet_shape() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/usb-transport", smoke_btusb_hci_command_setup_packet_shape);
+
+// ── Stage 2 smokes ──────────────────────────────────────────────────
+//
+// Six smokes covering: Inquiry cmd encode, Inquiry Result decode,
+// Classic Connection Complete decode, SSP cmd shape, SCO setup,
+// btusb→HCI cmd_queue dispatch.
+
+/// Smoke 1 — HCI_Inquiry command encodes LAP + length + num_responses
+/// per §7.1.1. Vol 4 Part E table 7.1 wire layout: 5-byte params.
+fn smoke_classic_inquiry_cmd_encode() -> TestResult {
+    use crate::classic::{build_inquiry, decode_inquiry_params, GIAC};
+    use crate::opcode::HCI_INQUIRY;
+
+    let cmd = build_inquiry(GIAC, 0x08, 0); // 8 × 1.28 s = 10.24 s, unlimited devices.
+    if cmd.opcode != HCI_INQUIRY {
+        return TestResult::Fail("opcode should be HCI_INQUIRY (0x0401)");
+    }
+    if cmd.params.len() != 5 {
+        return TestResult::Fail("HCI_Inquiry must have exactly 5 parameter bytes");
+    }
+    // Verify GIAC = 0x33 0x8B 0x9E (LE on the wire).
+    let (lap, len, num) = match decode_inquiry_params(&cmd) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_inquiry_params returned None"),
+    };
+    if lap != GIAC {
+        return TestResult::Fail("LAP field not GIAC");
+    }
+    if len != 0x08 {
+        return TestResult::Fail("inquiry length field wrong");
+    }
+    if num != 0 {
+        return TestResult::Fail("num_responses field wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/classic", smoke_classic_inquiry_cmd_encode);
+
+/// Smoke 2 — HCI_Inquiry_Result event decodes BD_ADDR + CoD +
+/// clock_offset per §7.7.2. One synthetic response.
+fn smoke_classic_inquiry_result_decode() -> TestResult {
+    use crate::event::{parse_inquiry_results, EventCode};
+    use crate::hci::Event;
+
+    // Construct a 1-response Inquiry Result event.
+    // Layout: Num(1) + [ BD_ADDR(6) PSRM(1) Rsvd(2) CoD(3) ClkOff(2) ] = 15 bytes.
+    let bd_addr = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let cod = [0x04, 0x04, 0x20]; // Laptop, Audio.
+    let clk_off = 0x1234u16;
+    let mut params = vec![0x01u8]; // Num_Responses = 1.
+    params.extend_from_slice(&bd_addr);
+    params.push(0x01); // PSRM = R1.
+    params.extend_from_slice(&[0x00, 0x00]); // Reserved.
+    params.extend_from_slice(&cod);
+    params.push((clk_off & 0xFF) as u8);
+    params.push((clk_off >> 8) as u8);
+
+    let event = Event {
+        code: EventCode::InquiryResult as u8,
+        params,
+    };
+
+    let results = match parse_inquiry_results(&event) {
+        Some(r) => r,
+        None => return TestResult::Fail("parse_inquiry_results returned None"),
+    };
+    if results.len() != 1 {
+        return TestResult::Fail("expected 1 inquiry result");
+    }
+    if results[0].bd_addr != bd_addr {
+        return TestResult::Fail("BD_ADDR mismatch");
+    }
+    if results[0].class_of_device != cod {
+        return TestResult::Fail("CoD mismatch");
+    }
+    if results[0].clock_offset != clk_off {
+        return TestResult::Fail("clock_offset mismatch");
+    }
+    if results[0].page_scan_repetition_mode != 0x01 {
+        return TestResult::Fail("PSRM mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/classic", smoke_classic_inquiry_result_decode);
+
+/// Smoke 3 — HCI_Connection_Complete event (classic BR/EDR) decodes
+/// status, handle, BD_ADDR, link_type, encryption per §7.7.3.
+fn smoke_classic_connection_complete_decode() -> TestResult {
+    use crate::event::{ClassicConnectionComplete, EventCode};
+    use crate::hci::Event;
+
+    let bd_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let handle = 0x0042u16;
+    // Layout: Status(1) Handle_LE(2) BD_ADDR(6) Link_Type(1) Enc(1) = 11 bytes.
+    let mut params = vec![0x00u8]; // Status OK.
+    params.push((handle & 0xFF) as u8);
+    params.push((handle >> 8) as u8);
+    params.extend_from_slice(&bd_addr);
+    params.push(0x01); // ACL link type.
+    params.push(0x01); // Encryption enabled.
+
+    let event = Event {
+        code: EventCode::ConnectionComplete as u8,
+        params,
+    };
+
+    let cc = match ClassicConnectionComplete::parse(&event) {
+        Some(c) => c,
+        None => return TestResult::Fail("ClassicConnectionComplete::parse returned None"),
+    };
+    if cc.status != 0x00 {
+        return TestResult::Fail("status not OK");
+    }
+    if cc.handle != handle {
+        return TestResult::Fail("handle mismatch");
+    }
+    if cc.bd_addr != bd_addr {
+        return TestResult::Fail("BD_ADDR mismatch");
+    }
+    if cc.link_type != 0x01 {
+        return TestResult::Fail("link_type should be ACL (1)");
+    }
+    if cc.encryption_enabled != 0x01 {
+        return TestResult::Fail("encryption_enabled should be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/classic", smoke_classic_connection_complete_decode);
+
+/// Smoke 4 — SSP IO_Capability_Request_Reply shapes correctly.
+/// §7.1.29: 9-byte parameter block — BD_ADDR(6) + IO_Cap(1) + OOB(1) + AuthReq(1).
+fn smoke_ssp_io_capability_request_reply_shape() -> TestResult {
+    use crate::classic::{build_io_capability_reply, AuthRequirements, ClassicIoCap};
+    use crate::opcode::HCI_IO_CAPABILITY_REQUEST_REPLY;
+
+    let bd_addr = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let cmd = build_io_capability_reply(
+        bd_addr,
+        ClassicIoCap::DisplayYesNo,
+        false,
+        AuthRequirements::GeneralBondingMitm,
+    );
+
+    if cmd.opcode != HCI_IO_CAPABILITY_REQUEST_REPLY {
+        return TestResult::Fail("opcode mismatch");
+    }
+    if cmd.params.len() != 9 {
+        return TestResult::Fail("IO_Cap_Reply must have exactly 9 parameter bytes");
+    }
+    // BD_ADDR at params[0..6].
+    if cmd.params[0..6] != bd_addr {
+        return TestResult::Fail("BD_ADDR not at params[0..6]");
+    }
+    // IO_Capability at params[6].
+    if cmd.params[6] != ClassicIoCap::DisplayYesNo as u8 {
+        return TestResult::Fail("IO_Capability byte wrong");
+    }
+    // OOB_Data_Present at params[7].
+    if cmd.params[7] != 0x00 {
+        return TestResult::Fail("OOB_Data_Present should be 0");
+    }
+    // Authentication_Requirements at params[8].
+    if cmd.params[8] != AuthRequirements::GeneralBondingMitm as u8 {
+        return TestResult::Fail("Authentication_Requirements byte wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/classic", smoke_ssp_io_capability_request_reply_shape);
+
+/// Smoke 5 — HCI_Setup_Synchronous_Connection encodes correctly.
+/// §7.1.26: 17-byte parameter block. Verify handle + bandwidth fields.
+fn smoke_sco_setup_synchronous_connection_encode() -> TestResult {
+    use crate::classic::{
+        build_setup_synchronous_connection, SCO_BANDWIDTH_8KHZ, SCO_VOICE_SETTING_CVSD,
+        ESCO_PACKET_TYPES_ALL,
+    };
+    use crate::opcode::HCI_SETUP_SYNCHRONOUS_CONNECTION;
+
+    let handle = 0x0042u16;
+    let cmd = build_setup_synchronous_connection(
+        handle,
+        SCO_BANDWIDTH_8KHZ,
+        SCO_BANDWIDTH_8KHZ,
+        7,   // max_latency in ms
+        SCO_VOICE_SETTING_CVSD,
+        0xFF, // retransmission_effort = don't care
+        ESCO_PACKET_TYPES_ALL,
+    );
+
+    if cmd.opcode != HCI_SETUP_SYNCHRONOUS_CONNECTION {
+        return TestResult::Fail("opcode should be HCI_SETUP_SYNCHRONOUS_CONNECTION");
+    }
+    if cmd.params.len() != 17 {
+        return TestResult::Fail("Setup_Sync_Connection must have 17 parameter bytes");
+    }
+    // Handle at params[0..2] LE.
+    let got_handle = u16::from_le_bytes([cmd.params[0], cmd.params[1]]);
+    if got_handle != handle {
+        return TestResult::Fail("handle encoding wrong");
+    }
+    // Transmit bandwidth at params[2..6] LE (8000 = 0x1F40).
+    let got_bw = u32::from_le_bytes([cmd.params[2], cmd.params[3], cmd.params[4], cmd.params[5]]);
+    if got_bw != SCO_BANDWIDTH_8KHZ {
+        return TestResult::Fail("transmit bandwidth encoding wrong");
+    }
+    // Voice setting at params[12..14].
+    let got_voice = u16::from_le_bytes([cmd.params[12], cmd.params[13]]);
+    if got_voice != SCO_VOICE_SETTING_CVSD {
+        return TestResult::Fail("voice_setting encoding wrong");
+    }
+    // Packet type at params[15..17].
+    let got_pkt = u16::from_le_bytes([cmd.params[15], cmd.params[16]]);
+    if got_pkt != ESCO_PACKET_TYPES_ALL {
+        return TestResult::Fail("packet_type encoding wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/classic", smoke_sco_setup_synchronous_connection_encode);
+
+/// Smoke 6 — HCI command queue credit model: enqueue, drain on
+/// command-complete, and re-drain pending entries. Mirrors the flow
+/// in `net/bluetooth/hci_core.c` — `hci_cmd_work` / credit tracking.
+fn smoke_btusb_hci_cmd_queue_dispatch() -> TestResult {
+    use crate::cmd_queue::CmdQueue;
+    use crate::hci::Command;
+    use crate::opcode::{HCI_INQUIRY, HCI_RESET, HCI_SET_EVENT_MASK};
+    use crate::transport::LoopbackTransport;
+
+    let lt = LoopbackTransport::new("cmd-queue-test");
+    let q = CmdQueue::new();
+
+    // Initial credit = 1 (spec default §4.4.1). First command should
+    // be sent immediately.
+    q.enqueue(Command::new(HCI_RESET), &lt).expect("enqueue");
+    let sent = lt.sent_commands();
+    if sent.len() != 1 {
+        return TestResult::Fail("first command should be sent immediately (credit=1)");
+    }
+    if sent[0].opcode != HCI_RESET {
+        return TestResult::Fail("wrong opcode sent first");
+    }
+    // Credit should now be 0 — second command must queue.
+    if q.credits() != 0 {
+        return TestResult::Fail("credit should be 0 after first send");
+    }
+    if q.pending_len() != 0 {
+        return TestResult::Fail("pending queue should be empty before second enqueue");
+    }
+    q.enqueue(Command::new(HCI_SET_EVENT_MASK), &lt).expect("enqueue2");
+    if q.pending_len() != 1 {
+        return TestResult::Fail("second command should be pending (no credits)");
+    }
+
+    // Simulate Command_Complete for HCI_RESET granting 2 credits.
+    q.notify_complete(HCI_RESET, 2);
+    if q.credits() != 2 {
+        return TestResult::Fail("credits should be 2 after notify_complete");
+    }
+
+    // Drain should flush the pending command.
+    let flushed = q.drain(&lt).expect("drain");
+    if flushed != 1 {
+        return TestResult::Fail("drain should have flushed 1 pending command");
+    }
+    let sent2 = lt.sent_commands();
+    if sent2.len() != 2 {
+        return TestResult::Fail("transport should have received 2 commands total");
+    }
+    if sent2[1].opcode != HCI_SET_EVENT_MASK {
+        return TestResult::Fail("second command should be HCI_SET_EVENT_MASK");
+    }
+    // Credit consumed by drain: 2 - 1 = 1.
+    if q.credits() != 1 {
+        return TestResult::Fail("credit should be 1 after drain");
+    }
+
+    // Enqueue another command — should be sent immediately (credit=1).
+    q.enqueue(Command::new(HCI_INQUIRY), &lt).expect("enqueue3");
+    if q.pending_len() != 0 {
+        return TestResult::Fail("HCI_INQUIRY should have been sent immediately");
+    }
+    if q.credits() != 0 {
+        return TestResult::Fail("credit should be 0 after third enqueue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_btusb_hci_cmd_queue_dispatch);
