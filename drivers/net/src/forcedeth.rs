@@ -907,12 +907,30 @@ pub fn register_pci_driver() {
 }
 
 fn name_for(did: u16) -> &'static str {
+    // Per-device-id name so `narf_bus::register_pci_driver`'s "idempotent
+    // on name" clause doesn't collapse multiple match entries onto a
+    // single slot. The register call replaces any prior entry of the
+    // same name, so grouping IDs (e.g. "forcedeth-mcp55" for both
+    // 0x0372 and 0x0373) would silently keep only the last one.
     match did {
-        NV_DEV_MCP55_1 | NV_DEV_MCP55_2 => "forcedeth-mcp55",
-        NV_DEV_MCP65_1 | NV_DEV_MCP65_2 | NV_DEV_MCP65_3 | NV_DEV_MCP65_4 => "forcedeth-mcp65",
-        NV_DEV_MCP67_1 | NV_DEV_MCP67_2 | NV_DEV_MCP67_3 | NV_DEV_MCP67_4 => "forcedeth-mcp67",
-        NV_DEV_MCP73_1 | NV_DEV_MCP73_2 | NV_DEV_MCP73_3 | NV_DEV_MCP73_4 => "forcedeth-mcp73",
-        NV_DEV_MCP77_1 | NV_DEV_MCP77_2 | NV_DEV_MCP77_3 | NV_DEV_MCP77_4 => "forcedeth-mcp77",
+        NV_DEV_MCP55_1 => "forcedeth-mcp55-1",
+        NV_DEV_MCP55_2 => "forcedeth-mcp55-2",
+        NV_DEV_MCP65_1 => "forcedeth-mcp65-1",
+        NV_DEV_MCP65_2 => "forcedeth-mcp65-2",
+        NV_DEV_MCP65_3 => "forcedeth-mcp65-3",
+        NV_DEV_MCP65_4 => "forcedeth-mcp65-4",
+        NV_DEV_MCP67_1 => "forcedeth-mcp67-1",
+        NV_DEV_MCP67_2 => "forcedeth-mcp67-2",
+        NV_DEV_MCP67_3 => "forcedeth-mcp67-3",
+        NV_DEV_MCP67_4 => "forcedeth-mcp67-4",
+        NV_DEV_MCP73_1 => "forcedeth-mcp73-1",
+        NV_DEV_MCP73_2 => "forcedeth-mcp73-2",
+        NV_DEV_MCP73_3 => "forcedeth-mcp73-3",
+        NV_DEV_MCP73_4 => "forcedeth-mcp73-4",
+        NV_DEV_MCP77_1 => "forcedeth-mcp77-1",
+        NV_DEV_MCP77_2 => "forcedeth-mcp77-2",
+        NV_DEV_MCP77_3 => "forcedeth-mcp77-3",
+        NV_DEV_MCP77_4 => "forcedeth-mcp77-4",
         _ => "forcedeth",
     }
 }
