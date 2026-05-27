@@ -204,18 +204,59 @@ impl IntelDpBridge {
     }
 }
 
-/// One-shot EDID readback over AUX. On any error we return `None`
-/// and let the modeset orchestrator's hard-coded fallback path
-/// decide. Eventually the EDID parser hands us a preferred timing
-/// descriptor; until that lands as `narf-graphics::edid` glue, we
-/// just exercise the AUX transport on real hardware.
+/// One-shot EDID readback over AUX. Parses the panel's base block,
+/// extracts the preferred detailed-timing descriptor (offset 0x36
+/// — VESA E-EDID 1.4 §3.10), and converts to our [`Mode`].
+///
+/// Returns `None` on any failure (AUX unreachable, bad header,
+/// checksum mismatch, no preferred timing in the descriptor slot)
+/// — the modeset orchestrator's fallback path picks up.
+///
+/// Reference: Linux `drivers/gpu/drm/drm_edid.c::drm_edid_block_valid`
+/// (header/checksum) + `drm_mode_detailed` (descriptor → drm_mode
+/// conversion). VESA E-EDID 1.4 §3.10 (Detailed Timing Descriptor).
 fn read_preferred_mode_via_aux<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Option<Mode> {
     let mut aux = IntelAux::new(mmio, ddi);
     let mut buf = [0u8; 128];
-    let _ = read_panel_edid(&mut aux, &mut buf);
-    // TODO: parse `buf` into a Mode once narf-graphics::edid exposes
-    //       a `preferred_timing()` helper.
-    None
+    let edid = read_panel_edid(&mut aux, &mut buf).ok()?;
+    let dt = edid.preferred_timing().ok()?;
+    Some(detailed_timing_to_mode(&dt))
+}
+
+/// Convert a VESA E-EDID detailed-timing descriptor to our [`Mode`].
+///
+/// EDID descriptor field layout vs. our `Mode`:
+///   `h_active`     → `h_active`
+///   `h_blanking`   → `h_total = h_active + h_blanking`
+///   `h_sync_offset`→ `h_sync_start = h_active + h_sync_offset` (front porch)
+///   `h_sync_width` → `h_sync_end = h_sync_start + h_sync_width`
+/// (Same shape for the V channel.)
+///
+/// Sync polarity isn't exposed by the parser yet (byte 17 of the
+/// 18-byte detailed-timing descriptor encodes it for digital
+/// separate-sync displays — VESA E-EDID 1.4 §3.10.3.6). Default
+/// to active-high which is by far the most common for DP/HDMI;
+/// the eventual VBT / panel-feature-flags parse can override.
+pub(crate) fn detailed_timing_to_mode(dt: &narf_graphics::edid::DetailedTiming) -> Mode {
+    let h_total = dt.h_active.saturating_add(dt.h_blanking);
+    let v_total = dt.v_active.saturating_add(dt.v_blanking);
+    let h_sync_start = dt.h_active.saturating_add(dt.h_sync_offset);
+    let h_sync_end = h_sync_start.saturating_add(dt.h_sync_width);
+    let v_sync_start = dt.v_active.saturating_add(dt.v_sync_offset);
+    let v_sync_end = v_sync_start.saturating_add(dt.v_sync_width);
+    Mode {
+        pixel_clock_khz: dt.pixel_clock_khz,
+        h_active: dt.h_active,
+        h_total,
+        h_sync_start,
+        h_sync_end,
+        v_active: dt.v_active,
+        v_total,
+        v_sync_start,
+        v_sync_end,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    }
 }
 
 /// Placeholder framebuffer for the modeset call. The modeset
@@ -336,5 +377,73 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dp_bridge",
         smoke_bridge_rejects_out_of_range_connector_even_when_probed
+    );
+
+    fn smoke_detailed_timing_to_mode_round_trip() -> TestResult {
+        // 1920x1080 @ 60 Hz CVT-ish: pixel_clock 148.5 MHz,
+        // h_active 1920, h_blanking 280, h_sync_offset 88, h_sync_width 44.
+        let dt = narf_graphics::edid::DetailedTiming {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_blanking: 280,
+            v_active: 1080,
+            v_blanking: 45,
+            h_sync_offset: 88,
+            h_sync_width: 44,
+            v_sync_offset: 4,
+            v_sync_width: 5,
+        };
+        let mode = super::detailed_timing_to_mode(&dt);
+        if mode.h_active != 1920 || mode.v_active != 1080 {
+            return TestResult::Fail("active not preserved");
+        }
+        if mode.h_total != 1920 + 280 {
+            return TestResult::Fail("h_total = h_active + h_blanking");
+        }
+        if mode.v_total != 1080 + 45 {
+            return TestResult::Fail("v_total = v_active + v_blanking");
+        }
+        if mode.h_sync_start != 1920 + 88 {
+            return TestResult::Fail("h_sync_start = h_active + h_sync_offset");
+        }
+        if mode.h_sync_end != 1920 + 88 + 44 {
+            return TestResult::Fail("h_sync_end = h_sync_start + h_sync_width");
+        }
+        if mode.v_sync_start != 1080 + 4 || mode.v_sync_end != 1080 + 4 + 5 {
+            return TestResult::Fail("vertical sync packing");
+        }
+        if mode.pixel_clock_khz != 148_500 {
+            return TestResult::Fail("pixel clock lost");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp_bridge",
+        smoke_detailed_timing_to_mode_round_trip
+    );
+
+    fn smoke_detailed_timing_saturates_overflow() -> TestResult {
+        // Synthetic descriptor with h_active near u16::MAX —
+        // h_total must saturate rather than wrap.
+        let dt = narf_graphics::edid::DetailedTiming {
+            pixel_clock_khz: 1,
+            h_active: u16::MAX - 10,
+            h_blanking: 100,
+            v_active: 10,
+            v_blanking: 1,
+            h_sync_offset: 5,
+            h_sync_width: 5,
+            v_sync_offset: 0,
+            v_sync_width: 0,
+        };
+        let mode = super::detailed_timing_to_mode(&dt);
+        if mode.h_total != u16::MAX {
+            return TestResult::Fail("h_total should saturate at u16::MAX");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp_bridge",
+        smoke_detailed_timing_saturates_overflow
     );
 }
