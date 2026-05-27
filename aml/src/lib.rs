@@ -446,6 +446,35 @@ pub fn dump_i2c_slaves() {
     }
 }
 
+/// Log every device in the AML namespace with its `_HID` and
+/// `_CID` list. Used for full namespace audits when we don't know
+/// the touchpad / sensor / accelerometer HID upfront — `grep`
+/// the boot log for the line tagged with the vendor we suspect.
+///
+/// Format: `aml-dev: <path> _HID=<hid> _CID=<list>`. Devices with
+/// no `_HID` are still emitted so the parent chain to a leaf
+/// device is visible.
+pub fn dump_all_devices() {
+    use core::fmt::Write as _;
+    let device_paths = list_all_device_paths();
+    let _ = writeln!(
+        narf_console::Writer,
+        "  aml-dev-dump: {} device(s) in namespace:",
+        device_paths.len()
+    );
+    for path in device_paths.iter() {
+        let hid = device_hid(path);
+        let cids = device_cids(path);
+        let _ = writeln!(
+            narf_console::Writer,
+            "  aml-dev: {} _HID={} _CID={:?}",
+            path,
+            hid.as_deref().unwrap_or(""),
+            cids
+        );
+    }
+}
+
 pub fn dump_amd_i2c_subtree() {
     use core::fmt::Write as _;
     let device_paths = list_all_device_paths();

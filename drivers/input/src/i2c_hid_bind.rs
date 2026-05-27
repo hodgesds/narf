@@ -129,6 +129,12 @@ pub fn bind_all() -> usize {
     // The dump tells us which device is the touchpad + which
     // controller node we need to match.
     narf_aml::dump_i2c_slaves();
+    // Full namespace dump — every device with its _HID/_CID.
+    // Used to identify touchpads / fingerprint readers / sensor
+    // hubs by vendor _HID prefix (ELAN, SYNA, GDIX, WCOM, etc.)
+    // when their parent doesn't have a recognisable controller
+    // HID. Verbose but it's one-shot at boot.
+    narf_aml::dump_all_devices();
     // First pass: devices whose _HID matches directly.
     for &hid in &["PNP0C50", "ACPI0C50"] {
         for child in narf_aml::find_all_devices_by_hid(hid) {
