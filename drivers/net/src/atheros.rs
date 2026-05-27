@@ -1,111 +1,762 @@
-//! Atheros AR9xxx / AR93xx Wi-Fi (clean-room).
+//! Atheros AR81xx (atl1c) Gigabit Ethernet driver.
 //!
-//! References (public-only):
-//! - **AR9285 Single-Chip 802.11n Single-Stream Solution** —
-//!   Atheros product brief and PCI Configuration Programming Guide.
-//!   Published by Atheros Communications before the Qualcomm
-//!   acquisition; PCI IDs taken from these documents.
-//! - **AR9170 USB 802.11n Reference Design** — Atheros publishes
-//!   the USB-side register layout for the AR9170, used in early
-//!   "Otus" reference dongles.
-//! - **IEEE Std 802.11-2020** — frame layout the MAC speaks.
-//!   <https://standards.ieee.org/ieee/802.11/7028/>
+//! Covers the Attansic / Atheros L1c / L2c family that ships on a
+//! wide swathe of consumer laptops (Acer, Asus, MSI, Gigabyte) — the
+//! same chip Linux's `drivers/net/ethernet/atheros/atl1c/` services.
+//! The hard cutover replaces the prior AR9xxx-Wi-Fi stub that lived
+//! at this module path; clean-room re-targeted at the wired NIC for
+//! Stage-4 net bring-up.
 //!
-//! No GPL Linux `drivers/net/wireless/ath/` or vendor SDK source
-//! consulted. The protocol-layer code (frame builders, MLME state)
-//! lives in `narf-wireless`; this module is the silicon-bring-up
-//! skeleton: PCI/USB match tables, register-block layout, MAC
-//! reset sequence, IRQ-enable bring-up.
+//! ## Reference
 //!
-//! ## Stage-1 scope
+//! Linux `drivers/net/ethernet/atheros/atl1c/atl1c_hw.h` +
+//! `atl1c_hw.c` + `atl1c_main.c` (GPL-2.0). NARF is GPL-2.0-or-later
+//! since 2026-05-20 so direct register adaptation is in-license.
 //!
-//! - PCI vendor / device pairs for the AR928x family.
-//! - USB vendor / device pairs for the AR9170 reference dongle.
-//! - Register-block constants for the AR9285 PCIe MAC bring-up
-//!   (RESET_CONTROL, OBS, PCIE_PHY etc., taken from the public
-//!   Atheros HAL register-name list).
+//! ### Register surface (subset used here)
 //!
-//! What's deferred (needs additional public docs or a clean-room
-//! derivation that's out of scope today):
+//! | offset | name              | description                              |
+//! |--------|-------------------|------------------------------------------|
+//! | 0x1400 | MASTER_CTRL       | Master reset, clock select               |
+//! | 0x1480 | MAC_CTRL          | MAC config — RX/TX enable, duplex, FC    |
+//! | 0x1488 | MAC_STA_ADDR_HI   | Station address high 16 bits             |
+//! | 0x148C | MAC_STA_ADDR_LO   | Station address low 32 bits              |
+//! | 0x1414 | MDIO_CTRL         | MII PHY register access                  |
+//! | 0x144C | TWSI_CTRL         | EEPROM I2C bus control                   |
+//! | 0x15F8 | TPD_RING_HEAD     | TX (Packet-Descriptor) ring base lo32    |
+//! | 0x15D0 | RFD_RING_HEAD     | RFD (free-buffer) ring base lo32         |
+//! | 0x15F0 | RRS_RING_HEAD     | RRS (return-status) ring base lo32       |
+//! | 0x1600 | IMR               | Interrupt Mask                           |
+//! | 0x1604 | ISR               | Interrupt Status                         |
 //!
-//! - Baseband / radio calibration tables — Atheros publishes the
-//!   register names but the calibration *data* is per-card EEPROM.
-//! - DMA descriptor encoding.
-//! - Firmware image format for AR9170 USB.
+//! ### Ring design
+//!
+//! `atl1c` uses a **split-RX** design that's unusual for cheap-NIC
+//! silicon: the host posts free buffers via the RFD ring; the NIC
+//! reports completed frames via the RRS ring (which references back
+//! into the RFD slot). The TX side is a single TPD ring.
+//!
+//! Stage-2 bring-up here implements TPD (TX) + RFD + RRS (RX) and an
+//! IRQ-mask + ISR write-1-clear pattern. EEPROM read for the
+//! permanent MAC mirrors `atl1c_get_permanent_address` (TWSI CMD =
+//! 0x1, polled until DONE bit clears).
 
 #![allow(dead_code)]
 
-use narf_bus::{BusDevice, BusDeviceCap};
-use narf_capabilities::{Cap, Write};
+use core::sync::atomic::{compiler_fence, Ordering};
 
-// ── PCI device IDs (public Atheros docs) ──────────────────────────
+use narf_driver_runtime::{
+    alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
+    Lock as IrqSafeSpinLock, MmioRegion, Write,
+};
 
-pub const ATH_VENDOR_ATHEROS: u16 = 0x168C;
+// ── PCI ids ─────────────────────────────────────────────────────────
 
-/// AR9285 — single-chip 802.11n PCIe (laptop minicard).
-pub const ATH_DEV_AR9285: u16 = 0x002B;
-/// AR9287 — 2x2 802.11n PCIe.
-pub const ATH_DEV_AR9287: u16 = 0x002E;
-/// AR9280 — 2x2 802.11n PCIe.
-pub const ATH_DEV_AR9280: u16 = 0x0029;
+/// Vendor: Atheros Communications (Attansic legacy ids share this).
+pub const ATL_VENDOR: u16 = 0x1969;
 
-const PCI_DEV_IDS: &[u16] = &[ATH_DEV_AR9285, ATH_DEV_AR9287, ATH_DEV_AR9280];
+/// L1c — AR8131 Gigabit (PCIe).
+pub const ATL_DEV_AR8131: u16 = 0x1063;
+/// L2c — AR8132 Fast Ethernet (PCIe).
+pub const ATL_DEV_AR8132: u16 = 0x1062;
+/// L1d — AR8151 v2.
+pub const ATL_DEV_AR8151_V2: u16 = 0x1083;
+/// L1d — AR8151 (rev 1).
+pub const ATL_DEV_AR8151: u16 = 0x1090;
+/// L2c — AR8152.
+pub const ATL_DEV_AR8152: u16 = 0x1091;
+/// L1e — AR8161 Gigabit.
+pub const ATL_DEV_AR8161: u16 = 0x2060;
+/// L2e — AR8162 Fast Ethernet.
+pub const ATL_DEV_AR8162: u16 = 0x2062;
+/// L1f — AR8171 Gigabit (newer revision).
+pub const ATL_DEV_AR8171: u16 = 0x10A1;
 
-// ── USB device IDs (AR9170 reference dongles) ─────────────────────
+/// Full PCI match table. Mirrors the subset of Linux's
+/// `atl1c_pci_tbl[]` that ships on consumer laptops.
+pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
+    ATL_DEV_AR8131,
+    ATL_DEV_AR8132,
+    ATL_DEV_AR8151_V2,
+    ATL_DEV_AR8151,
+    ATL_DEV_AR8152,
+    ATL_DEV_AR8161,
+    ATL_DEV_AR8162,
+    ATL_DEV_AR8171,
+];
 
-pub const AR9170_USB_VENDOR_ATHEROS: u16 = 0x0CF3;
-pub const AR9170_USB_DEV_REFERENCE: u16 = 0x9170;
-pub const AR9170_USB_VENDOR_NETGEAR: u16 = 0x0846;
-pub const AR9170_USB_DEV_NETGEAR_WNDA3100: u16 = 0x9010;
+// ── Register offsets (atl1c_hw.h) ───────────────────────────────────
 
-// ── AR9285 MAC register block (public Atheros register names) ─────
-//
-// The public Atheros register-name list groups MAC registers around
-// 0x4000 (MAC_CTL), 0x8000 (DMA), 0xA000 (PHY), 0xB000 (analog).
-// We only need the bring-up subset: reset, sleep wake, IRQ enable.
+const REG_MASTER_CTRL: u64 = 0x1400;
+const REG_MDIO_CTRL: u64 = 0x1414;
+const REG_TWSI_CTRL: u64 = 0x144C;
+const REG_MAC_CTRL: u64 = 0x1480;
+const REG_MAC_STA_ADDR_HI: u64 = 0x1488;
+const REG_MAC_STA_ADDR_LO: u64 = 0x148C;
+const REG_RFD_RING_HEAD: u64 = 0x15D0;
+const REG_RFD_RING_HEAD_HI: u64 = 0x15D4;
+const REG_RFD_BUFFER_SIZE: u64 = 0x15D8;
+const REG_RRS_RING_HEAD: u64 = 0x15F0;
+const REG_TPD_RING_HEAD: u64 = 0x15F8;
+const REG_TPD_RING_HEAD_HI: u64 = 0x15FC;
+const REG_RING_COUNT: u64 = 0x1600;
+const REG_IMR: u64 = 0x1604;
+const REG_ISR: u64 = 0x1608;
 
-pub const REG_MAC_RESET_CONTROL: u32 = 0x4000;
-pub const REG_MAC_RESET_STATUS: u32 = 0x4004;
-pub const REG_MAC_OBS_BUS: u32 = 0x4008;
+// ── MASTER_CTRL bits ────────────────────────────────────────────────
 
-pub const REG_MAC_SLEEP_CONTROL: u32 = 0x4040;
-pub const REG_MAC_SLEEP_STATUS: u32 = 0x4044;
+/// Bit 0: software master reset — self-clearing after the chip
+/// finishes re-arming its internal FIFOs. Mirrors
+/// `MASTER_CTRL_SOFT_RST` in `atl1c_hw.h`.
+pub const MASTER_CTRL_SOFT_RST: u32 = 1 << 0;
+/// Bit 12: MTimer enable. Stage-2 leaves this off (drives the on-die
+/// hardware coalesce timer); polled / IRQ pumps don't need it.
+pub const MASTER_CTRL_MTIMER_EN: u32 = 1 << 12;
 
-pub const REG_INTR_ENABLE: u32 = 0x4010;
-pub const REG_INTR_STATUS: u32 = 0x4014;
-pub const REG_INTR_MASK: u32 = 0x4018;
-pub const REG_INTR_CLEAR: u32 = 0x401C;
+// ── MAC_CTRL bits ───────────────────────────────────────────────────
 
-// MAC_RESET_CONTROL bits.
-pub const MAC_RESET_RTC_RESET: u32 = 1 << 0;
-pub const MAC_RESET_WARM_RESET: u32 = 1 << 1;
-pub const MAC_RESET_COLD_RESET: u32 = 1 << 2;
+pub const MAC_CTRL_TX_EN: u32 = 1 << 0;
+pub const MAC_CTRL_RX_EN: u32 = 1 << 1;
+pub const MAC_CTRL_TX_FLOW: u32 = 1 << 2;
+pub const MAC_CTRL_RX_FLOW: u32 = 1 << 3;
+pub const MAC_CTRL_LOOPBACK: u32 = 1 << 4;
+pub const MAC_CTRL_DUPLEX: u32 = 1 << 5;
+pub const MAC_CTRL_ADD_CRC: u32 = 1 << 6;
+pub const MAC_CTRL_PAD: u32 = 1 << 7;
+/// Speed select: bits[21:20] = 0b10 → 1000 Mbit, 0b01 → 100 Mbit.
+pub const MAC_CTRL_SPEED_SHIFT: u32 = 20;
+pub const MAC_CTRL_SPEED_1000: u32 = 0b10 << MAC_CTRL_SPEED_SHIFT;
+pub const MAC_CTRL_SPEED_100: u32 = 0b01 << MAC_CTRL_SPEED_SHIFT;
+pub const MAC_CTRL_BC_EN: u32 = 1 << 26;
+pub const MAC_CTRL_MC_EN: u32 = 1 << 25;
+pub const MAC_CTRL_PROMIS_EN: u32 = 1 << 15;
 
-// INTR_ENABLE bits.
-pub const INTR_RXOK: u32 = 1 << 0;
-pub const INTR_RXERR: u32 = 1 << 1;
-pub const INTR_RXEOL: u32 = 1 << 2;
-pub const INTR_TXOK: u32 = 1 << 6;
-pub const INTR_TXERR: u32 = 1 << 7;
-pub const INTR_FATAL: u32 = 1 << 24;
-pub const INTR_GLOBAL: u32 = 1 << 31;
+// ── MDIO_CTRL bits (PHY access) ─────────────────────────────────────
 
-// MAC sleep / wake.
-pub const SLEEP_FORCE_WAKE: u32 = 1 << 0;
-pub const SLEEP_FORCE_SLEEP: u32 = 1 << 1;
+/// Bits[15:0] = data.
+/// Bits[20:16] = register address (Clause 22).
+/// Bit 21 = read=1 / write=0 in `atl1c` notation.
+/// Bit 30 = start command.
+/// Bit 31 = busy (clears when access completes).
+pub const MDIO_DATA_MASK: u32 = 0xFFFF;
+pub const MDIO_REG_SHIFT: u32 = 16;
+pub const MDIO_OP_READ: u32 = 1 << 21;
+pub const MDIO_START: u32 = 1 << 30;
+pub const MDIO_BUSY: u32 = 1 << 31;
 
-// ── Driver match registration ─────────────────────────────────────
+/// MII Clause-22 standard register addresses (same as `rtl_phy`).
+pub const MII_BMCR: u8 = 0x00;
+pub const MII_BMSR: u8 = 0x01;
 
-/// Stage-1 PCI probe. Records the device in the bound-driver
-/// registry so the boot inventory shows the part was matched, but
-/// does not touch BAR0 — the MAC bring-up sequence (cold reset →
-/// wake → IRQ enable) is the next stage and lands once the
-/// `narf-wireless` MLME framework can consume the resulting RX
-/// path.
+/// BMSR.LINK_STATUS — bit 2 (sticky-low; read twice for a current
+/// reading per IEEE 802.3 §22.2.4.2).
+pub const BMSR_LINK_STATUS: u16 = 1 << 2;
+/// BMSR.AUTONEG_COMPLETE — bit 5.
+pub const BMSR_AUTONEG_COMPLETE: u16 = 1 << 5;
+
+// ── TWSI / EEPROM bits ──────────────────────────────────────────────
+
+/// SW LD START — kicks the on-die EEPROM loader at the address in
+/// bits[15:8]. Self-clears when done. Mirrors `TWSI_CTRL_LD_START` in
+/// `atl1c_hw.h`.
+pub const TWSI_CTRL_LD_START: u32 = 1 << 11;
+pub const TWSI_CTRL_LD_SLV_ADDR_SHIFT: u32 = 8;
+pub const TWSI_CTRL_LD_SLV_ADDR_MASK: u32 = 0x07 << TWSI_CTRL_LD_SLV_ADDR_SHIFT;
+/// Bit indicating SW loader is currently active.
+pub const TWSI_CTRL_LD_EXIST: u32 = 1 << 23;
+
+// ── IMR / ISR bits ──────────────────────────────────────────────────
+
+pub const INT_SMB: u32 = 1 << 0;
+pub const INT_TX_PKT: u32 = 1 << 1;
+pub const INT_RX_PKT0: u32 = 1 << 2;
+pub const INT_TX_DMA: u32 = 1 << 3;
+pub const INT_RX_DMA: u32 = 1 << 4;
+pub const INT_GPHY: u32 = 1 << 7;
+pub const INT_PHY_LINKDOWN: u32 = 1 << 8;
+pub const INT_PCIE_LNKDOWN: u32 = 1 << 30;
+pub const INT_DIS_INT: u32 = 1 << 31;
+
+/// Default IRQ mask used by Stage-2 RX/TX pumps.
+pub const fn default_intr_mask() -> u32 {
+    INT_TX_PKT | INT_RX_PKT0 | INT_GPHY | INT_PHY_LINKDOWN
+}
+
+// ── Descriptor in-memory shapes ─────────────────────────────────────
+
+/// TX packet descriptor (TPD) — 16 bytes. Per `atl1c_main.c`'s
+/// `struct atl1c_tpd_desc`, the first u32 carries length + control
+/// flags; the next two carry the 64-bit buffer address; the last
+/// u32 carries VLAN tags + extended flags. Stage-2 only uses the
+/// length + EOP/SOP + OWN bits.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+struct Tpd {
+    /// Bits[15:0] = buffer length.
+    /// Bit 16 = SOP (start of packet).
+    /// Bit 17 = EOP (end of packet).
+    /// Bit 31 = OWN (host-owned=0, NIC-owned=1).
+    word0: u32,
+    /// VLAN + checksum-offload flags. Stage-2 leaves zero.
+    word1: u32,
+    addr_lo: u32,
+    addr_hi: u32,
+}
+const _: () = assert!(core::mem::size_of::<Tpd>() == 16);
+
+/// RFD (free-buffer) descriptor — 8 bytes. Host posts the physical
+/// address of a 2 KiB buffer; the NIC drains DMA into it and reports
+/// completion via the matching RRS slot. Per `atl1c_main.c`'s
+/// `struct atl1c_rx_free_desc`.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default)]
+struct Rfd {
+    addr_lo: u32,
+    addr_hi: u32,
+}
+const _: () = assert!(core::mem::size_of::<Rfd>() == 8);
+
+/// RRS (return-status) descriptor — 16 bytes. Per
+/// `struct atl1c_recv_ret_status`:
+///   word0: hash low
+///   word1: hash high
+///   word2: bits[31] OWN, bits[19:0] frame length, bits[27:20] = RFD slot
+///   word3: per-frame status (error / vlan / csum)
+/// Stage-2 only consults `word2`'s OWN + length + RFD-slot fields.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+struct Rrs {
+    word0: u32,
+    word1: u32,
+    word2: u32,
+    word3: u32,
+}
+const _: () = assert!(core::mem::size_of::<Rrs>() == 16);
+
+/// RRS.word2 bit layout.
+pub const RRS_OWN: u32 = 1 << 31;
+/// Frame length lives in bits[19:0].
+pub const RRS_LEN_MASK: u32 = 0x000F_FFFF;
+/// RFD index lives in bits[27:20].
+pub const RRS_RFD_INDEX_SHIFT: u32 = 20;
+pub const RRS_RFD_INDEX_MASK: u32 = 0xFF << RRS_RFD_INDEX_SHIFT;
+
+/// TPD.word0 bit layout.
+pub const TPD_LEN_MASK: u32 = 0xFFFF;
+pub const TPD_SOP: u32 = 1 << 16;
+pub const TPD_EOP: u32 = 1 << 17;
+pub const TPD_OWN: u32 = 1 << 31;
+
+// ── Sizing constants ────────────────────────────────────────────────
+
+/// TX ring depth. atl1c caps each ring at 1024; 256 is plenty for
+/// Stage-2 and matches the r8169 sizing.
+pub const TPD_RING_LEN: usize = 256;
+/// RFD ring length. atl1c requires RFD count == RRS count.
+pub const RFD_RING_LEN: usize = 256;
+/// RRS ring length — paired with RFD 1:1.
+pub const RRS_RING_LEN: usize = 256;
+
+/// RX buffer size — 2 KiB per slot, programmed into REG_RFD_BUFFER_SIZE.
+pub const RX_BUF_LEN: usize = 2048;
+
+const TPD_RING_BYTES: usize = TPD_RING_LEN * 16;
+const RFD_RING_BYTES: usize = RFD_RING_LEN * 8;
+const RRS_RING_BYTES: usize = RRS_RING_LEN * 16;
+
+// ── Errors ──────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NicError {
+    BarMapFailed,
+    NoMemory,
+    ResetTimeout,
+    FrameTooLong,
+    TxRingFull,
+    TxTimeout,
+    EepromTimeout,
+}
+
+// ── Driver state ────────────────────────────────────────────────────
+
+/// A live AR81xx (atl1c) controller. Holds the MMIO mapping, the
+/// TPD + RFD + RRS rings, and the RX buffer pool.
+pub struct AtlNic {
+    mmio: MmioRegion,
+    tpd_ring: DmaBuffer,
+    tpd_pool: alloc::vec::Vec<DmaBuffer>,
+    tpd_head: IrqSafeSpinLock<u32>,
+    rfd_ring: DmaBuffer,
+    rfd_pool: alloc::vec::Vec<DmaBuffer>,
+    rrs_ring: DmaBuffer,
+    rrs_head: IrqSafeSpinLock<u32>,
+    pub mac: [u8; 6],
+    pub link_up: bool,
+    pub speed_1000: bool,
+    pub duplex_full: bool,
+}
+
+impl core::fmt::Debug for AtlNic {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AtlNic")
+            .field("mac", &self.mac)
+            .field("link_up", &self.link_up)
+            .field("speed_1000", &self.speed_1000)
+            .field("duplex_full", &self.duplex_full)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AtlNic {
+    /// Bring up the controller. Sequence mirrors
+    /// `atl1c_reset_mac` + `atl1c_configure` in Linux's `atl1c_main.c`:
+    /// 1. Software master reset; poll `MASTER_CTRL_SOFT_RST` low.
+    /// 2. Read MAC from `MAC_STA_ADDR_{HI,LO}` (loaded from EEPROM
+    ///    by the chip's on-die loader at power-on).
+    /// 3. Allocate + program TPD / RFD / RRS rings.
+    /// 4. Enable MAC (RX + TX, broadcast / multicast accept).
+    /// 5. Snapshot PHY BMSR for link state.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg windows exclusively.
+    pub unsafe fn bring_up(
+        device: &BusDevice,
+        _cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<Self, NicError> {
+        // BAR0 carries the operational register block.
+        // SAFETY: caller-asserted exclusive ownership.
+        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| NicError::BarMapFailed)?;
+
+        // 1. Software reset. Linux pulls `MASTER_CTRL_SOFT_RST` and
+        //    waits up to ~50 µs (`AT_HW_MAX_IDLE_DELAY = 10` * 50 µs);
+        //    we use the responsive_spin_until pump with a 100 ms cap.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            mmio.write32(REG_MASTER_CTRL, MASTER_CTRL_SOFT_RST);
+        }
+        let cleared = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { mmio.read32(REG_MASTER_CTRL) } & MASTER_CTRL_SOFT_RST == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !cleared {
+            return Err(NicError::ResetTimeout);
+        }
+
+        // 2. Read MAC station address. The chip's loader populates
+        //    these registers from EEPROM during PCIe bring-up;
+        //    `atl1c_get_permanent_address` reads them directly with
+        //    no further action needed (TWSI dance is only required
+        //    when the loader is disabled; we assume EEPROM-present).
+        // SAFETY: same.
+        let hi = unsafe { mmio.read32(REG_MAC_STA_ADDR_HI) };
+        // SAFETY: same.
+        let lo = unsafe { mmio.read32(REG_MAC_STA_ADDR_LO) };
+        let mac = [
+            ((hi >> 8) & 0xFF) as u8,
+            (hi & 0xFF) as u8,
+            ((lo >> 24) & 0xFF) as u8,
+            ((lo >> 16) & 0xFF) as u8,
+            ((lo >> 8) & 0xFF) as u8,
+            (lo & 0xFF) as u8,
+        ];
+
+        // 3. Allocate rings + RX buffer pool. `alloc_coherent` returns
+        //    zeroed pages — every TPD/RRS descriptor starts host-owned
+        //    (OWN=0), which is what we want until we publish work /
+        //    until the NIC fills an RRS slot.
+        let tpd_ring =
+            alloc_coherent(TPD_RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+        let rfd_ring =
+            alloc_coherent(RFD_RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+        let rrs_ring =
+            alloc_coherent(RRS_RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+
+        let mut tpd_pool: alloc::vec::Vec<DmaBuffer> =
+            alloc::vec::Vec::with_capacity(TPD_RING_LEN);
+        for _ in 0..TPD_RING_LEN {
+            tpd_pool.push(
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+            );
+        }
+        let mut rfd_pool: alloc::vec::Vec<DmaBuffer> =
+            alloc::vec::Vec::with_capacity(RFD_RING_LEN);
+        for _ in 0..RFD_RING_LEN {
+            rfd_pool.push(
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+            );
+        }
+
+        // 4a. Pre-fill RFD ring: each slot points at its pooled
+        //     buffer. NIC consumes the RFD ring left-to-right; the
+        //     RRS ring reports back which RFD slot was used.
+        let rfd_phys = rfd_ring.phys_addr().raw();
+        for i in 0..RFD_RING_LEN {
+            let buf_phys = rfd_pool[i].phys_addr().raw();
+            let d = Rfd {
+                addr_lo: buf_phys as u32,
+                addr_hi: (buf_phys >> 32) as u32,
+            };
+            // SAFETY: identity-mapped DMA page; i < RFD_RING_LEN.
+            unsafe {
+                core::ptr::write_volatile((rfd_phys + (i * 8) as u64) as *mut Rfd, d);
+            }
+        }
+
+        // 4b. Program ring bases. The low 32 bits land at the *HEAD
+        //     offset; the high 32 bits at HEAD_HI. The chip's high-32
+        //     of the RFD/RRS bases is shared (a single common DMA
+        //     window); we program it on TPD_RING_HEAD_HI.
+        let tpd_phys = tpd_ring.phys_addr().raw();
+        let rrs_phys = rrs_ring.phys_addr().raw();
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            mmio.write32(REG_TPD_RING_HEAD, tpd_phys as u32);
+            mmio.write32(REG_TPD_RING_HEAD_HI, (tpd_phys >> 32) as u32);
+            mmio.write32(REG_RFD_RING_HEAD, rfd_phys as u32);
+            mmio.write32(REG_RFD_RING_HEAD_HI, (rfd_phys >> 32) as u32);
+            mmio.write32(REG_RRS_RING_HEAD, rrs_phys as u32);
+            // Ring depth — packed: bits[31:16] = RFD len, bits[15:0] = TPD len.
+            let counts = ((RFD_RING_LEN as u32) << 16) | (TPD_RING_LEN as u32);
+            mmio.write32(REG_RING_COUNT, counts);
+            // Per-slot RX buffer size (no per-descriptor field on this chip).
+            mmio.write32(REG_RFD_BUFFER_SIZE, RX_BUF_LEN as u32);
+        }
+
+        // 5. MAC config: enable TX + RX, accept broadcast +
+        //    multicast, append CRC + pad shorts, default to 1G FD.
+        //    Speed bits are resolved against the PHY auto-neg state
+        //    in a follow-up; the chip handles MAC-PHY speed switch
+        //    autonomously on the AR8131 family.
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(
+                REG_MAC_CTRL,
+                MAC_CTRL_TX_EN
+                    | MAC_CTRL_RX_EN
+                    | MAC_CTRL_DUPLEX
+                    | MAC_CTRL_ADD_CRC
+                    | MAC_CTRL_PAD
+                    | MAC_CTRL_BC_EN
+                    | MAC_CTRL_MC_EN
+                    | MAC_CTRL_SPEED_1000,
+            );
+        }
+
+        // 6. Mask all IRQs at IMR for now; write-1-clear ISR.
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(REG_IMR, 0);
+            mmio.write32(REG_ISR, 0xFFFF_FFFF);
+        }
+
+        // 7. PHY snapshot — read BMSR. IEEE 802.3 §22.2.4.2 says the
+        //    LinkStatus bit is *latched low* so the first read after
+        //    a reset may report no link even on a live cable; we
+        //    capture whatever the PHY currently says and let the
+        //    link-watch path re-poll.
+        let bmsr = unsafe { read_phy(&mmio, MII_BMSR) }.unwrap_or(0);
+        let link_up = bmsr & BMSR_LINK_STATUS != 0;
+        let an_complete = bmsr & BMSR_AUTONEG_COMPLETE != 0;
+
+        Ok(Self {
+            mmio,
+            tpd_ring,
+            tpd_pool,
+            tpd_head: IrqSafeSpinLock::new(0),
+            rfd_ring,
+            rfd_pool,
+            rrs_ring,
+            rrs_head: IrqSafeSpinLock::new(0),
+            mac,
+            link_up,
+            speed_1000: an_complete,
+            duplex_full: true,
+        })
+    }
+
+    /// Transmit a single Ethernet frame. Polled completion.
+    pub fn transmit(&self, frame: &[u8]) -> Result<(), NicError> {
+        if frame.is_empty() || frame.len() > 1518 {
+            return Err(NicError::FrameTooLong);
+        }
+        let mut head_g = self.tpd_head.lock();
+        let slot = (*head_g) as usize % TPD_RING_LEN;
+        let buf_phys = self.tpd_pool[slot].phys_addr().raw();
+
+        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
+        unsafe {
+            for (i, b) in frame.iter().enumerate() {
+                core::ptr::write_volatile((buf_phys + i as u64) as *mut u8, *b);
+            }
+        }
+
+        let ring_phys = self.tpd_ring.phys_addr().raw();
+        let desc_addr = ring_phys + (slot * 16) as u64;
+
+        // SAFETY: identity-mapped DMA ring; slot < TPD_RING_LEN.
+        let cur = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        if cur & TPD_OWN != 0 {
+            return Err(NicError::TxRingFull);
+        }
+
+        let w0 = (frame.len() as u32 & TPD_LEN_MASK) | TPD_SOP | TPD_EOP | TPD_OWN;
+        let d = Tpd {
+            word0: w0,
+            word1: 0,
+            addr_lo: buf_phys as u32,
+            addr_hi: (buf_phys >> 32) as u32,
+        };
+        // Publish addr/vlan first, then OWN — same fence discipline
+        // as the r8169 path.
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            core::ptr::write_volatile((desc_addr + 4) as *mut u32, d.word1);
+            core::ptr::write_volatile((desc_addr + 8) as *mut u32, d.addr_lo);
+            core::ptr::write_volatile((desc_addr + 12) as *mut u32, d.addr_hi);
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(desc_addr as *mut u32, d.word0);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        // Doorbell: bump the TPD producer index via REG_RING_COUNT's
+        // upper 16 bits would be wrong — the chip auto-prefetches as
+        // soon as OWN flips. No software doorbell needed on this part.
+
+        *head_g = (*head_g + 1) % (TPD_RING_LEN as u32);
+        drop(head_g);
+
+        // Poll for OWN → 0. responsive_spin_until ticks sleep_pumps.
+        let owned = narf_scheduler::responsive_spin_until(
+            // SAFETY: same.
+            || unsafe { core::ptr::read_volatile(desc_addr as *const u32) } & TPD_OWN == 0,
+            narf_time::Deadline::after_ms(250),
+        );
+        if !owned {
+            return Err(NicError::TxTimeout);
+        }
+        Ok(())
+    }
+
+    /// Drain one received frame from the RRS ring.  Returns `Some` if
+    /// a descriptor is ready, `None` if the head is still NIC-owned.
+    pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        let mut head_g = self.rrs_head.lock();
+        let slot = (*head_g) as usize % RRS_RING_LEN;
+        let ring_phys = self.rrs_ring.phys_addr().raw();
+        let desc_addr = ring_phys + (slot * 16) as u64;
+
+        // SAFETY: identity-mapped DMA ring.
+        let word2 = unsafe { core::ptr::read_volatile((desc_addr + 8) as *const u32) };
+        // NIC writes OWN=1 when it has populated the slot.
+        if word2 & RRS_OWN == 0 {
+            return None;
+        }
+
+        let len = (word2 & RRS_LEN_MASK) as usize;
+        let rfd_slot = ((word2 & RRS_RFD_INDEX_MASK) >> RRS_RFD_INDEX_SHIFT) as usize;
+        if rfd_slot >= RFD_RING_LEN {
+            // Bad descriptor — clear OWN to recycle and skip.
+            // SAFETY: same.
+            unsafe {
+                core::ptr::write_volatile((desc_addr + 8) as *mut u32, 0);
+            }
+            *head_g = (*head_g + 1) % (RRS_RING_LEN as u32);
+            return None;
+        }
+        let buf_phys = self.rfd_pool[rfd_slot].phys_addr().raw();
+
+        let copy_len = len.min(RX_BUF_LEN);
+        let mut out = alloc::vec::Vec::with_capacity(copy_len);
+        // SAFETY: identity-mapped DMA buffer.
+        for i in 0..copy_len {
+            out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+        }
+
+        // Rearm: clear OWN on RRS slot — the matching RFD slot
+        // remains pre-armed (NIC tracks its own RFD consumer cursor).
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile((desc_addr + 8) as *mut u32, 0);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        *head_g = (*head_g + 1) % (RRS_RING_LEN as u32);
+        Some(out)
+    }
+
+    /// Enable RX-pkt + TX-pkt IRQs at IMR.
+    pub fn enable_irqs(&self) {
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IMR, default_intr_mask());
+        }
+    }
+
+    /// Drain + write-1-clear the ISR.
+    pub fn ack_isr(&self) -> u32 {
+        // SAFETY: identity-mapped MMIO.
+        let s = unsafe { self.mmio.read32(REG_ISR) };
+        // SAFETY: same.
+        unsafe {
+            self.mmio.write32(REG_ISR, s);
+        }
+        s
+    }
+
+    /// Re-evaluate link state by reading BMSR.
+    pub fn refresh_link_state(&mut self) -> bool {
+        // SAFETY: same.
+        let bmsr = unsafe { read_phy(&self.mmio, MII_BMSR) }.unwrap_or(0);
+        self.link_up = bmsr & BMSR_LINK_STATUS != 0;
+        self.link_up
+    }
+
+    /// Read a PHY register over MDIO.
+    pub fn phy_read(&self, reg: u8) -> Result<u16, NicError> {
+        // SAFETY: identity-mapped MMIO.
+        unsafe { read_phy(&self.mmio, reg) }
+    }
+}
+
+// ── PHY MDIO helper ─────────────────────────────────────────────────
+
+/// Issue a Clause-22 read against the PHY through MDIO_CTRL.  Mirrors
+/// `atl1c_read_phy` — set REG_ADDR + READ + START, poll BUSY low.
+///
+/// # Safety
+/// Caller must own the device's MMIO BAR.
+unsafe fn read_phy(mmio: &MmioRegion, reg: u8) -> Result<u16, NicError> {
+    let cmd = ((reg as u32) << MDIO_REG_SHIFT) | MDIO_OP_READ | MDIO_START;
+    // SAFETY: caller-asserted ownership.
+    unsafe {
+        mmio.write32(REG_MDIO_CTRL, cmd);
+    }
+    let done = narf_scheduler::responsive_spin_until(
+        // SAFETY: same.
+        || unsafe { mmio.read32(REG_MDIO_CTRL) } & MDIO_BUSY == 0,
+        narf_time::Deadline::after_ms(50),
+    );
+    if !done {
+        return Err(NicError::ResetTimeout);
+    }
+    // SAFETY: same.
+    let v = unsafe { mmio.read32(REG_MDIO_CTRL) };
+    Ok((v & MDIO_DATA_MASK) as u16)
+}
+
+// ── EEPROM read helper (Linux atl1c_get_permanent_address) ──────────
+
+/// Issue the EEPROM software loader and return the readback MAC.
+///
+/// On boards where the chip's auto-load fails to populate
+/// MAC_STA_ADDR_{HI,LO}, Linux falls back to firing the TWSI bus
+/// software loader (`TWSI_CTRL_LD_START`) which re-runs the I2C
+/// EEPROM sequence. The loader self-clears the START bit when done.
+///
+/// # Safety
+/// Caller must own the device's MMIO BAR.
+pub unsafe fn eeprom_reload_mac(mmio: &MmioRegion) -> Result<[u8; 6], NicError> {
+    // SAFETY: caller-asserted ownership.
+    let prev = unsafe { mmio.read32(REG_TWSI_CTRL) };
+    // SAFETY: same.
+    unsafe {
+        mmio.write32(REG_TWSI_CTRL, prev | TWSI_CTRL_LD_START);
+    }
+    let done = narf_scheduler::responsive_spin_until(
+        // SAFETY: same.
+        || unsafe { mmio.read32(REG_TWSI_CTRL) } & TWSI_CTRL_LD_START == 0,
+        narf_time::Deadline::after_ms(100),
+    );
+    if !done {
+        return Err(NicError::EepromTimeout);
+    }
+    // SAFETY: same.
+    let hi = unsafe { mmio.read32(REG_MAC_STA_ADDR_HI) };
+    // SAFETY: same.
+    let lo = unsafe { mmio.read32(REG_MAC_STA_ADDR_LO) };
+    Ok([
+        ((hi >> 8) & 0xFF) as u8,
+        (hi & 0xFF) as u8,
+        ((lo >> 24) & 0xFF) as u8,
+        ((lo >> 16) & 0xFF) as u8,
+        ((lo >> 8) & 0xFF) as u8,
+        (lo & 0xFF) as u8,
+    ])
+}
+
+// ── Bring-up helpers used by smoke tests ────────────────────────────
+
+/// Compose the MAC_CTRL value used during Stage-2 bring-up: TX + RX
+/// enabled, broadcast + multicast accepted, default speed = 1G FD.
+pub const fn default_mac_ctrl_value() -> u32 {
+    MAC_CTRL_TX_EN
+        | MAC_CTRL_RX_EN
+        | MAC_CTRL_DUPLEX
+        | MAC_CTRL_ADD_CRC
+        | MAC_CTRL_PAD
+        | MAC_CTRL_BC_EN
+        | MAC_CTRL_MC_EN
+        | MAC_CTRL_SPEED_1000
+}
+
+/// Compose the MASTER_CTRL reset value — pure SOFT_RST bit; clock-
+/// select bits are auto-restored by the chip on reset clear.
+pub const fn master_reset_value() -> u32 {
+    MASTER_CTRL_SOFT_RST
+}
+
+/// Decode a hypothetical EEPROM-byte tuple into a MAC address. The
+/// EEPROM layout writes the station address big-endian across two
+/// 32-bit cells: HI in bytes[1:0] (low 16 of the MAC), LO in bytes
+/// [3:0] (high 32 of the MAC, byte-reversed). This helper exposes
+/// the decode logic so the EEPROM-read smoke can validate it without
+/// hardware in the loop.
+pub const fn mac_from_sta_addr(hi: u32, lo: u32) -> [u8; 6] {
+    [
+        ((hi >> 8) & 0xFF) as u8,
+        (hi & 0xFF) as u8,
+        ((lo >> 24) & 0xFF) as u8,
+        ((lo >> 16) & 0xFF) as u8,
+        ((lo >> 8) & 0xFF) as u8,
+        (lo & 0xFF) as u8,
+    ]
+}
+
+// ── Driver-match registration ───────────────────────────────────────
+
+static CONTROLLER: IrqSafeSpinLock<Option<AtlNic>> = IrqSafeSpinLock::new(None);
+
+/// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
+/// returns `Ok(())` when the controller is already brought up.
 pub fn probe(
     device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
+    cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
+    // MEM_SPACE + BUS_MASTER are both required — the chip DMAs the
+    // descriptor rings + frame buffers and we map BAR0 as MMIO.
+    narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+
+    // SAFETY: caller-authority over the device for the duration of
+    // bring_up.
+    let dev = match unsafe { AtlNic::bring_up(&device, &cap) } {
+        Ok(d) => d,
+        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+    };
+    *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -116,13 +767,13 @@ pub fn probe(
     Ok(())
 }
 
-/// Register the driver against every documented AR928x device id.
+/// Register the driver against every documented AR81xx device id.
 pub fn register_pci_driver() {
-    for &did in PCI_DEV_IDS {
+    for &did in SUPPORTED_DEVICE_IDS {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
-                vendor: ATH_VENDOR_ATHEROS,
+                vendor: ATL_VENDOR,
                 device: did,
             },
             probe,
@@ -132,25 +783,29 @@ pub fn register_pci_driver() {
 
 fn name_for(did: u16) -> &'static str {
     match did {
-        ATH_DEV_AR9285 => "atheros-ar9285",
-        ATH_DEV_AR9287 => "atheros-ar9287",
-        ATH_DEV_AR9280 => "atheros-ar9280",
-        _ => "atheros",
+        ATL_DEV_AR8131 => "atl1c-ar8131",
+        ATL_DEV_AR8132 => "atl1c-ar8132",
+        ATL_DEV_AR8151 => "atl1c-ar8151",
+        ATL_DEV_AR8151_V2 => "atl1c-ar8151-v2",
+        ATL_DEV_AR8152 => "atl1c-ar8152",
+        ATL_DEV_AR8161 => "atl1c-ar8161",
+        ATL_DEV_AR8162 => "atl1c-ar8162",
+        ATL_DEV_AR8171 => "atl1c-ar8171",
+        _ => "atl1c",
     }
 }
 
-// ── MAC bring-up helpers ──────────────────────────────────────────
-
-/// Compose the MAC_RESET_CONTROL value for a cold reset of the
-/// MAC, baseband, and analog blocks. The reset is self-clearing
-/// after the documented `tRESET` settle time.
-pub const fn mac_cold_reset_value() -> u32 {
-    MAC_RESET_RTC_RESET | MAC_RESET_COLD_RESET
+/// `true` once `probe` has installed a controller.
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
 }
 
-/// Compose the INTR_ENABLE bitmap for a normal data-path: RX-OK,
-/// RX errors (so we observe drops), TX-OK, TX errors, and the
-/// global enable bit.
-pub const fn default_intr_enable_value() -> u32 {
-    INTR_RXOK | INTR_RXERR | INTR_RXEOL | INTR_TXOK | INTR_TXERR | INTR_FATAL | INTR_GLOBAL
+/// Test-side accessor: run `f` against the probed controller.
+pub fn with_controller<R>(f: impl FnOnce(&AtlNic) -> R) -> Option<R> {
+    CONTROLLER.lock().as_ref().map(f)
+}
+
+/// Mutable accessor.
+pub fn with_controller_mut<R>(f: impl FnOnce(&mut AtlNic) -> R) -> Option<R> {
+    CONTROLLER.lock().as_mut().map(f)
 }

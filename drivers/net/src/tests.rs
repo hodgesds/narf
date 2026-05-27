@@ -551,61 +551,221 @@ kernel_test_in!(
     smoke_e1000_qemu_fwsm_dance_is_noop
 );
 
-// ── atheros ───────────────────────────────────────────────────────
+// ── atheros (atl1c — AR81xx Gigabit Ethernet) ─────────────────────
+//
+// Hard cutover from the previous AR9xxx Wi-Fi stub: the atheros
+// module now drives the wired NIC family (AR8131 / AR8161 / etc.)
+// per `drivers/net/ethernet/atheros/atl1c/` in Linux.
 
-fn smoke_atheros_pci_match_table() -> TestResult {
+fn smoke_atl1c_pci_match_table() -> TestResult {
     use crate::atheros;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
     __reset_for_test();
     atheros::register_pci_driver();
     let registered = registered_pci_drivers();
-    let want: &[u16] = &[
-        atheros::ATH_DEV_AR9285,
-        atheros::ATH_DEV_AR9287,
-        atheros::ATH_DEV_AR9280,
-    ];
-    for did in want.iter().copied() {
+    for did in atheros::SUPPORTED_DEVICE_IDS.iter().copied() {
         let found = registered.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor, device,
-            } if vendor == atheros::ATH_VENDOR_ATHEROS && device == did)
+            } if vendor == atheros::ATL_VENDOR && device == did)
         });
         if !found {
-            return TestResult::Fail("atheros match entry missing");
+            return TestResult::Fail("atl1c match entry missing");
+        }
+    }
+    // Spot-check the common consumer-laptop ids: AR8131 (Acer / Asus
+    // 2010-era), AR8161 (modern PCIe Gigabit), AR8151 / AR8152
+    // (HP / Lenovo low-power laptops).
+    let must_have: &[u16] = &[
+        atheros::ATL_DEV_AR8131,
+        atheros::ATL_DEV_AR8161,
+        atheros::ATL_DEV_AR8151,
+        atheros::ATL_DEV_AR8152,
+    ];
+    for did in must_have.iter().copied() {
+        let found = registered.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == atheros::ATL_VENDOR && device == did)
+        });
+        if !found {
+            return TestResult::Fail("atl1c spot-check id missing");
         }
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/atheros", smoke_atheros_pci_match_table);
+kernel_test_in!("drivers/net/atheros", smoke_atl1c_pci_match_table);
 
-fn smoke_atheros_reset_value_includes_cold_and_rtc() -> TestResult {
-    use crate::atheros::{mac_cold_reset_value, MAC_RESET_COLD_RESET, MAC_RESET_RTC_RESET};
-    let v = mac_cold_reset_value();
-    if v & MAC_RESET_COLD_RESET == 0 {
-        return TestResult::Fail("cold reset bit missing");
+fn smoke_atl1c_master_reset_value() -> TestResult {
+    // MASTER_CTRL.SOFT_RST lives at bit 0 in `atl1c_hw.h`. A drift
+    // would either fail to reset the chip (silently brick bring-up)
+    // or hit an unrelated bit (toggle clock-select mid-bring-up).
+    use crate::atheros::{master_reset_value, MASTER_CTRL_SOFT_RST};
+    let v = master_reset_value();
+    if v & MASTER_CTRL_SOFT_RST == 0 {
+        return TestResult::Fail("MASTER_CTRL.SOFT_RST missing from reset value");
     }
-    if v & MAC_RESET_RTC_RESET == 0 {
-        return TestResult::Fail("RTC reset bit missing");
+    if MASTER_CTRL_SOFT_RST != 1 << 0 {
+        return TestResult::Fail("MASTER_CTRL.SOFT_RST bit position drift vs atl1c_hw.h");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/atheros", smoke_atheros_reset_value_includes_cold_and_rtc);
+kernel_test_in!("drivers/net/atheros", smoke_atl1c_master_reset_value);
 
-fn smoke_atheros_default_intr_enable_includes_global() -> TestResult {
-    use crate::atheros::{default_intr_enable_value, INTR_GLOBAL, INTR_RXOK, INTR_TXOK};
-    let v = default_intr_enable_value();
-    if v & INTR_GLOBAL == 0 {
-        return TestResult::Fail("global IRQ enable bit missing");
+fn smoke_atl1c_default_mac_ctrl_enables_rx_tx() -> TestResult {
+    // Bring-up programs MAC_CTRL with RX + TX + CRC-append + pad +
+    // broadcast + multicast + speed=1G. Bit-position drift on the
+    // speed field is the most common source of "link reports up but
+    // no frames flow" — pin it here.
+    use crate::atheros::{
+        default_mac_ctrl_value, MAC_CTRL_BC_EN, MAC_CTRL_MC_EN, MAC_CTRL_RX_EN, MAC_CTRL_SPEED_1000,
+        MAC_CTRL_TX_EN,
+    };
+    let v = default_mac_ctrl_value();
+    if v & MAC_CTRL_RX_EN == 0 {
+        return TestResult::Fail("RX_EN missing from default MAC_CTRL");
     }
-    if v & INTR_RXOK == 0 || v & INTR_TXOK == 0 {
-        return TestResult::Fail("RX-OK / TX-OK should be on by default");
+    if v & MAC_CTRL_TX_EN == 0 {
+        return TestResult::Fail("TX_EN missing from default MAC_CTRL");
+    }
+    if v & MAC_CTRL_BC_EN == 0 || v & MAC_CTRL_MC_EN == 0 {
+        return TestResult::Fail("BC/MC accept missing from default MAC_CTRL");
+    }
+    if v & MAC_CTRL_SPEED_1000 == 0 {
+        return TestResult::Fail("default speed should be 1G");
+    }
+    if MAC_CTRL_RX_EN != 1 << 1 {
+        return TestResult::Fail("MAC_CTRL.RX_EN bit position drift vs atl1c_hw.h");
+    }
+    if MAC_CTRL_TX_EN != 1 << 0 {
+        return TestResult::Fail("MAC_CTRL.TX_EN bit position drift vs atl1c_hw.h");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/net/atheros",
-    smoke_atheros_default_intr_enable_includes_global
+    smoke_atl1c_default_mac_ctrl_enables_rx_tx
+);
+
+fn smoke_atl1c_eeprom_mac_decode_round_trip() -> TestResult {
+    // `mac_from_sta_addr` decodes the EEPROM-loaded MAC_STA_ADDR_{HI,
+    // LO} registers into a 6-byte MAC. atl1c_main.c assembles the
+    // MAC in the order [HI byte1, HI byte0, LO byte3..0]. A wrong
+    // shift here would surface as a MAC like `[00, AA, BB, CC, DD,
+    // EE]` getting transposed at probe — test pins the byte order.
+    use crate::atheros::mac_from_sta_addr;
+    // Hypothetical EEPROM-stored MAC 11:22:33:44:55:66.
+    //   HI = 0x0000_1122  (byte1 = 0x11, byte0 = 0x22)
+    //   LO = 0x3344_5566  (byte3..0 = 0x33 .. 0x66)
+    let mac = mac_from_sta_addr(0x0000_1122, 0x3344_5566);
+    if mac != [0x11, 0x22, 0x33, 0x44, 0x55, 0x66] {
+        return TestResult::Fail("EEPROM MAC decode produced wrong byte order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/atheros",
+    smoke_atl1c_eeprom_mac_decode_round_trip
+);
+
+fn smoke_atl1c_rrs_field_layout_matches_linux() -> TestResult {
+    // `atl1c_main.c`'s recv-ret-status word2 layout pins:
+    //   bit 31 = OWN
+    //   bits[19:0] = frame length
+    //   bits[27:20] = RFD slot index
+    // A drift in any of these would either miss frames (wrong OWN
+    // probe) or read garbage (wrong slot index → wrong RFD buffer).
+    use crate::atheros::{RRS_LEN_MASK, RRS_OWN, RRS_RFD_INDEX_MASK, RRS_RFD_INDEX_SHIFT};
+    if RRS_OWN != 1 << 31 {
+        return TestResult::Fail("RRS.OWN bit position drift");
+    }
+    if RRS_LEN_MASK != 0x000F_FFFF {
+        return TestResult::Fail("RRS length mask drift (should be bits[19:0])");
+    }
+    if RRS_RFD_INDEX_SHIFT != 20 {
+        return TestResult::Fail("RRS RFD index shift drift (should be 20)");
+    }
+    if RRS_RFD_INDEX_MASK != 0xFF << 20 {
+        return TestResult::Fail("RRS RFD index mask drift");
+    }
+    // Synthesise a chip-returned descriptor and decode it: frame of
+    // 1500 bytes, came from RFD slot 42.
+    let synth = RRS_OWN | (42u32 << RRS_RFD_INDEX_SHIFT) | 1500u32;
+    if synth & RRS_OWN == 0 {
+        return TestResult::Fail("synthesised OWN bit didn't survive composition");
+    }
+    if (synth & RRS_LEN_MASK) != 1500 {
+        return TestResult::Fail("length decode mismatch");
+    }
+    if ((synth & RRS_RFD_INDEX_MASK) >> RRS_RFD_INDEX_SHIFT) != 42 {
+        return TestResult::Fail("RFD index decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/atheros",
+    smoke_atl1c_rrs_field_layout_matches_linux
+);
+
+fn smoke_atl1c_tpd_field_layout() -> TestResult {
+    // TPD word0 layout pin: length in bits[15:0], SOP at bit 16, EOP
+    // at bit 17, OWN at bit 31. A single-segment frame must set both
+    // SOP + EOP + OWN.
+    use crate::atheros::{TPD_EOP, TPD_LEN_MASK, TPD_OWN, TPD_SOP};
+    if TPD_LEN_MASK != 0xFFFF {
+        return TestResult::Fail("TPD length mask should be bits[15:0]");
+    }
+    if TPD_SOP != 1 << 16 {
+        return TestResult::Fail("TPD.SOP bit drift");
+    }
+    if TPD_EOP != 1 << 17 {
+        return TestResult::Fail("TPD.EOP bit drift");
+    }
+    if TPD_OWN != 1 << 31 {
+        return TestResult::Fail("TPD.OWN bit drift");
+    }
+    // Build a synthetic 64-byte frame command and decode.
+    let w0 = 64u32 | TPD_SOP | TPD_EOP | TPD_OWN;
+    if (w0 & TPD_LEN_MASK) != 64 {
+        return TestResult::Fail("length round-trip failed");
+    }
+    if w0 & TPD_SOP == 0 || w0 & TPD_EOP == 0 || w0 & TPD_OWN == 0 {
+        return TestResult::Fail("SOP/EOP/OWN not preserved through compose");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/atheros", smoke_atl1c_tpd_field_layout);
+
+fn smoke_atl1c_default_intr_mask_includes_rx_tx() -> TestResult {
+    // The default IRQ mask must include RX_PKT0 + TX_PKT (we drive
+    // bring-up off frame-arrival / frame-complete events) and GPHY +
+    // PHY_LINKDOWN (link-state change). A drift here would manifest
+    // as a NIC that probes cleanly but never wakes the RX pump.
+    use crate::atheros::{
+        default_intr_mask, INT_GPHY, INT_PHY_LINKDOWN, INT_RX_PKT0, INT_TX_PKT,
+    };
+    let m = default_intr_mask();
+    if m & INT_RX_PKT0 == 0 {
+        return TestResult::Fail("INT.RX_PKT0 missing from default mask");
+    }
+    if m & INT_TX_PKT == 0 {
+        return TestResult::Fail("INT.TX_PKT missing from default mask");
+    }
+    if m & INT_GPHY == 0 || m & INT_PHY_LINKDOWN == 0 {
+        return TestResult::Fail("link-state IRQs missing from default mask");
+    }
+    if INT_RX_PKT0 != 1 << 2 {
+        return TestResult::Fail("INT.RX_PKT0 bit position drift");
+    }
+    if INT_TX_PKT != 1 << 1 {
+        return TestResult::Fail("INT.TX_PKT bit position drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/atheros",
+    smoke_atl1c_default_intr_mask_includes_rx_tx
 );
 
 // ── Realtek PHY / RX descriptor smokes ─────────────────────────────
