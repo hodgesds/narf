@@ -51,6 +51,41 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_pipes::Pipe;
+
+// ── Power Well control register block (Tiger Lake PRM Vol. 11
+// §"Power Wells"; Linux i915 `intel_display_regs.h`) ─────────────
+//
+// Reference: Linux `drivers/gpu/drm/i915/display/intel_display_regs.h`
+//   #define HSW_PWR_WELL_CTL2      _MMIO(0x45404)
+//   #define HSW_PWR_WELL_CTL_REQ(idx)   (0x2 << ((idx) * 2))
+//   #define HSW_PWR_WELL_CTL_STATE(idx) (0x1 << ((idx) * 2))
+//
+// PG indices on Gen12 (per `ICL_PW_CTL_IDX_PW_N`):
+//   PG1 = 0, PG2 = 1, PG3 = 2, PG4 = 3, PG5 = 4.
+// The DRIVER source uses `HSW_PWR_WELL_CTL2`.
+
+/// DRIVER source's power-well control register.
+const PWR_WELL_CTL2: u64 = 0x4_5404;
+
+/// Compute the REQUEST bit for a given power-well index.
+const fn pwr_well_req(pw_idx: u32) -> u32 {
+    0x2 << (pw_idx * 2)
+}
+/// Compute the STATE (granted) bit for a given power-well index.
+const fn pwr_well_state(pw_idx: u32) -> u32 {
+    0x1 << (pw_idx * 2)
+}
+
+/// Power-well index — must match `ICL_PW_CTL_IDX_PW_*` numbering.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+enum PowerWell {
+    Pg1 = 0,
+    Pg2 = 1,
+    #[allow(dead_code)]
+    Pg3 = 2,
+}
 
 /// Display mode requested for a modeset. Subset of the fields a
 /// full DRM-style `display_mode` carries; for Stage 1 we just
@@ -228,9 +263,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.program_dpll(&mode)?;
 
         // Step 5: enable per-pipe power well (PG2 for Pipe A).
-        // TODO Stage 2: real PG2 sequencing — for now PG1 covers
-        // pipe-A on TGL/ADL since it always-on at boot.
-        // self.enable_pipe_power_well(Pipe::A)?;
+        // Stage-2: real PG2 sequencing via HSW_PWR_WELL_CTL2,
+        // mirroring i915's `hsw_set_power_well`.
+        self.enable_pipe_power_well(Pipe::A)?;
 
         // Step 6: program transcoder timing. PRM Vol. 14 §"TRANS_*"
         // — HTOTAL / VTOTAL / HSYNC / VSYNC registers.
@@ -286,31 +321,55 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     // ── Power wells ──────────────────────────────────────────
 
-    /// Enable Power Well 1. PRM Vol. 11 §"Power Wells" — write
-    /// `PWR_WELL_CTL2[PG1_REQUEST]`, poll `PG1_STATE` for assert,
-    /// 1 ms grant timeout. PG1 is the "everything except top-of-
-    /// die" well — must be on before any display register write.
-    ///
-    /// On most TGL/ADL parts PG1 is already on at boot (post-VBT
-    /// init from firmware). We re-issue the request idempotently
-    /// — the controller no-ops a request for an already-granted
-    /// well.
+    /// Enable PG1 (always-required well). Convenience wrapper.
     fn enable_pg1(&mut self) -> Result<(), ModesetError> {
-        const PWR_WELL_CTL2: u64 = 0x4_5404;
-        const PG1_REQUEST: u32 = 1 << 28;
-        const PG1_STATE: u32 = 1 << 29;
-        // Idempotent request.
+        self.enable_power_well(PowerWell::Pg1)
+    }
+
+    /// Enable the per-pipe power well (PG2 for Pipe A on Gen12).
+    /// Required before any pipe / plane / transcoder programming.
+    ///
+    /// Reference: Linux `drivers/gpu/drm/i915/display/
+    /// intel_display_power_well.c::hsw_set_power_well` — issues
+    /// the REQUEST bit in `HSW_PWR_WELL_CTL2` and polls the STATE
+    /// bit for grant. Default enable timeout is 1 ms.
+    fn enable_pipe_power_well(&mut self, pipe: Pipe) -> Result<(), ModesetError> {
+        // On Gen12, Pipe A always lives under PG2. Pipe B+ require
+        // PG3 sequencing the orchestrator doesn't currently enable
+        // — Stage-2 restricts itself to Pipe A. A non-A pipe
+        // surfaces as PowerWellTimeout so callers see a clean error.
+        let pw = match pipe {
+            Pipe::A => PowerWell::Pg2,
+            _ => return Err(ModesetError::PowerWellTimeout),
+        };
+        self.enable_power_well(pw)
+    }
+
+    /// Drive one PG enable transaction. Idempotent: re-issuing
+    /// REQUEST for a granted well is a no-op per the PRM.
+    ///
+    /// Reference: Linux i915 `hsw_set_power_well`:
+    ///   1. Set REQUEST bit in HSW_PWR_WELL_CTL2.
+    ///   2. Wait for STATE bit assert.
+    /// Default grant timeout per i915 is 1 ms (`enable_timeout`).
+    fn enable_power_well(&mut self, pw: PowerWell) -> Result<(), ModesetError> {
+        let idx = pw as u32;
+        let req = pwr_well_req(idx);
+        let state = pwr_well_state(idx);
+        // Idempotent request — set REQUEST bit without disturbing
+        // the other 7 power-well slots in the DRIVER register.
         let cur = self.mmio.read32(PWR_WELL_CTL2);
-        self.mmio.write32(PWR_WELL_CTL2, cur | PG1_REQUEST);
+        self.mmio.write32(PWR_WELL_CTL2, cur | req);
         compiler_fence(Ordering::SeqCst);
-        // Poll for grant. 1 ms cap — PRM says "must complete
-        // within 100 µs" but we give 10× for slow firmware.
+        // Poll for grant. 1 ms cap matches i915's default
+        // `enable_timeout`. The PRM says "must complete within
+        // 100 µs"; 10× headroom absorbs slow firmware.
         let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
         let budget = 1_000_000u64.saturating_mul(cpns);
         let start = narf_time::now_cycles();
         loop {
             let s = self.mmio.read32(PWR_WELL_CTL2);
-            if s & PG1_STATE != 0 {
+            if s & state != 0 {
                 return Ok(());
             }
             if narf_time::now_cycles().wrapping_sub(start) > budget {

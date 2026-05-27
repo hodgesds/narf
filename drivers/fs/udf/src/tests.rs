@@ -705,3 +705,62 @@ fn smoke_udf_mount_ramblock_round_trip() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/udf", smoke_udf_mount_ramblock_round_trip);
+
+/// UDF in NARF is intentionally read-only — see
+/// `node::UdfNode::write` for the spec rationale. Every mutating
+/// operation must surface `FsError::ReadOnly` (NOT `Unsupported`).
+fn smoke_udf_write_paths_are_read_only() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::UdfVolume;
+
+    let (img, _payload) = build_udf_image();
+    let device = RamBlockDevice::from_image(SECTOR_SIZE as u32, img);
+    let volume = match poll_once(UdfVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let file = match poll_once(root.lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup TEST.TXT failed"),
+    };
+    match poll_once(file.write(0, b"x")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("write must yield ReadOnly"),
+    }
+    match poll_once(file.truncate(0)) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("truncate must yield ReadOnly"),
+    }
+    match poll_once(root.unlink("TEST.TXT")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("unlink must yield ReadOnly"),
+    }
+    match poll_once(root.create("new.txt")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("create must yield ReadOnly"),
+    }
+    match poll_once(root.mkdir("newdir")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("mkdir must yield ReadOnly"),
+    }
+    match poll_once(root.rmdir("newdir")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("rmdir must yield ReadOnly"),
+    }
+    match poll_once(root.symlink("link", "TEST.TXT")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("symlink must yield ReadOnly"),
+    }
+    match poll_once(root.rename("TEST.TXT", "NEW.TXT")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("rename must yield ReadOnly"),
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/udf", smoke_udf_write_paths_are_read_only);

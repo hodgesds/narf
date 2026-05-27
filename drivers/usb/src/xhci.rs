@@ -1698,7 +1698,19 @@ impl Xhci {
             // SAFETY: same.
             let v = unsafe { self.mmio.read32(off) };
             if v & PORTSC_PR == 0 && v & PORTSC_PRC != 0 {
-                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_PRC;
+                // Ack PRC + CSC together. CSC (RW1C, bit 17) latches
+                // on the connect that triggered this reset; leaving
+                // it asserted livelocks a level-triggered INTx
+                // routing forever because every IMAN.IP write
+                // immediately re-asserts (xHCI 1.2 §5.4.8 + Linux
+                // `drivers/usb/host/xhci-hub.c:xhci_clear_port_change_bit`,
+                // which W1Cs every change bit it observes set). PEC
+                // gets the same treatment in case the port toggled
+                // PED across the reset.
+                let ack = (v & !PORTSC_CHG_MASK)
+                    | PORTSC_PRC
+                    | PORTSC_CSC
+                    | PORTSC_PEC;
                 // SAFETY: same.
                 unsafe {
                     self.mmio.write32(off, ack);

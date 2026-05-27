@@ -266,6 +266,17 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
         })
     }
 
+    /// Intentionally read-only. UDF in NARF is shaped around the
+    /// DVD-Video / Blu-ray consumption case where the medium is
+    /// authored offline by mkudffs/UDFCT. Implementing writes
+    /// against the OSTA UDF 2.60 specification requires the full
+    /// Space Bitmap Descriptor (ECMA-167 §4/14.12) + Unallocated
+    /// Space Entry handling + tagged-block CRC re-computation
+    /// (§3/7.2) — a multi-thousand-line surface that the bring-up
+    /// targets (Zen2 + Phoenix HawkPoint1) do not require. Surface
+    /// `ReadOnly` rather than the trait-default `Unsupported` so
+    /// callers can tell "this medium does not accept writes" from
+    /// "this driver has not implemented writes yet."
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
@@ -274,6 +285,7 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
         self.state.lock().stat
     }
 
+    /// Intentionally read-only. See `write` for the spec citations.
     fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
@@ -364,7 +376,35 @@ impl<B: BlockDevice + 'static> DirOps for UdfNode<B> {
         })
     }
 
-    // Mutating ops inherit `FsError::Unsupported`.
+    // Intentionally read-only — see the `write` docstring on
+    // FileOps for the spec rationale. We override every mutating
+    // directory operation to surface `ReadOnly` rather than the
+    // trait-default `Unsupported` so callers can distinguish "the
+    // medium does not accept writes" from "this driver has not
+    // implemented writes yet."
+    fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn rmdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn symlink<'a>(&'a self, _name: &'a str, _target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn rename<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
 }
 
 // ── Directory scan ─────────────────────────────────────────────────

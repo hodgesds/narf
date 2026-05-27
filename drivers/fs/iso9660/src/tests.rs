@@ -352,3 +352,72 @@ kernel_test_in!(
     "drivers/fs/iso9660",
     smoke_iso9660_mount_ramblock_round_trip
 );
+
+/// ECMA-119 §6.1: ISO 9660 is non-rewritable. Every mutating
+/// operation must surface `FsError::ReadOnly` (NOT `Unsupported`)
+/// so callers can tell the difference between "this medium does
+/// not accept writes" and "this driver has not implemented writes
+/// yet."
+fn smoke_iso9660_write_paths_are_read_only() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Iso9660Volume;
+
+    let (img, _payload) = build_iso9660_image();
+    let device = RamBlockDevice::from_image(SECTOR_SIZE as u32, img);
+    let volume = match poll_once(Iso9660Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    // FileOps::write
+    let file = match poll_once(root.lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup TEST.TXT failed"),
+    };
+    match poll_once(file.write(0, b"x")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("write must yield ReadOnly"),
+    }
+
+    // FileOps::truncate
+    match poll_once(file.truncate(0)) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("truncate must yield ReadOnly"),
+    }
+
+    // DirOps mutators
+    match poll_once(root.unlink("TEST.TXT")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("unlink must yield ReadOnly"),
+    }
+    match poll_once(root.create("new.txt")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("create must yield ReadOnly"),
+    }
+    match poll_once(root.mkdir("newdir")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("mkdir must yield ReadOnly"),
+    }
+    match poll_once(root.rmdir("newdir")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("rmdir must yield ReadOnly"),
+    }
+    match poll_once(root.symlink("link", "TEST.TXT")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("symlink must yield ReadOnly"),
+    }
+    match poll_once(root.rename("TEST.TXT", "NEW.TXT")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        _ => return TestResult::Fail("rename must yield ReadOnly"),
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/iso9660",
+    smoke_iso9660_write_paths_are_read_only
+);
