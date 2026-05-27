@@ -1848,205 +1848,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let _ = unsafe { libc::posix::close(kfd) };
         }
     } else if cmd == b"grep" {
-        // grep [-i] [-v] [-u] [-m N] PATTERN [FILE]
-        //   -i    case-insensitive match
-        //   -v    invert (print lines NOT containing PATTERN)
-        //   -u    deduplicate output (256-line rolling set)
-        //   -m N  stop after N matching lines
-        // Reads stdin or FILE; literal substring match, no regex.
-        let mut s = skip_ws(rest);
-        let mut case_insensitive = false;
-        let mut invert = false;
-        let mut unique = false;
-        let mut max_count: usize = usize::MAX;
-        loop {
-            if s.starts_with(b"-m") {
-                // -m N (with space) or -mN
-                let mut num = &s[2..];
-                if num.starts_with(b" ") || num.starts_with(b"\t") {
-                    num = skip_ws(num);
-                }
-                let num_end = num
-                    .iter()
-                    .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
-                    .unwrap_or(num.len());
-                let parsed: usize = num[..num_end].iter().fold(0usize, |acc, &b| {
-                    if b.is_ascii_digit() {
-                        acc * 10 + (b - b'0') as usize
-                    } else {
-                        acc
-                    }
-                });
-                if parsed > 0 {
-                    max_count = parsed;
-                }
-                s = skip_ws(&num[num_end..]);
-                continue;
-            }
-            if s.starts_with(b"-") && s.len() >= 2 {
-                let flag_end = s
-                    .iter()
-                    .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
-                    .unwrap_or(s.len());
-                let flag_chars = &s[1..flag_end];
-                let mut all_known = true;
-                let mut tmp_i = case_insensitive;
-                let mut tmp_v = invert;
-                let mut tmp_u = unique;
-                for &c in flag_chars {
-                    match c {
-                        b'i' => tmp_i = true,
-                        b'v' => tmp_v = true,
-                        b'u' => tmp_u = true,
-                        _ => { all_known = false; break; }
-                    }
-                }
-                if !all_known || flag_chars.is_empty() {
-                    break;
-                }
-                case_insensitive = tmp_i;
-                invert = tmp_v;
-                unique = tmp_u;
-                s = skip_ws(&s[flag_end..]);
-            } else {
-                break;
-            }
-        }
-        let pat_end = s
-            .iter()
-            .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
-            .unwrap_or(s.len());
-        if pat_end == 0 {
-            unsafe { write_all(fd, b"grep: usage: grep [-i] [-v] [-u] PATTERN [FILE]\n"); }
-        } else {
-            let pattern_raw = &s[..pat_end];
-            // For -i we lowercase the pattern once up front and
-            // each line on compare.
-            let mut pattern_buf = [0u8; 256];
-            let pattern_len = pattern_raw.len().min(pattern_buf.len());
-            for i in 0..pattern_len {
-                let b = pattern_raw[i];
-                pattern_buf[i] = if case_insensitive { ascii_lower(b) } else { b };
-            }
-            let pattern = &pattern_buf[..pattern_len];
-            let file = trim_arg(&s[pat_end..]);
-            let mut owned_fd: i32 = -1;
-            let src_fd = if file.is_empty() {
-                0
-            } else {
-                let mut pbuf = [0u8; 256];
-                if file.len() + 1 >= pbuf.len() {
-                    unsafe { write_all(fd, b"grep: path too long\n"); }
-                    return true;
-                }
-                pbuf[..file.len()].copy_from_slice(file);
-                let f = unsafe { libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0) };
-                if f < 0 {
-                    unsafe { write_all(fd, b"grep: cannot open file\n"); }
-                    return true;
-                }
-                owned_fd = f;
-                f
-            };
-            let mut buf = [0u8; 4096];
-            let mut line = [0u8; 4096];
-            let mut llen = 0usize;
-            // Full-output dedup ring. `-u` now keeps a fixed-size
-            // window of recently-emitted lines (256 entries × 256
-            // bytes ≈ 64 KiB on the stack — fits cleanly in the
-            // shell's stack frame). Cheaper than a hash set, fast
-            // enough for boot-log dumps that are O(thousands) of
-            // lines. When the ring fills, oldest entries get
-            // displaced.
-            const DEDUP_CAP: usize = 256;
-            const DEDUP_LEN: usize = 256;
-            let mut seen = [[0u8; DEDUP_LEN]; DEDUP_CAP];
-            let mut seen_lens = [0usize; DEDUP_CAP];
-            let mut seen_count = 0usize;
-            let mut seen_next = 0usize;
-            let emit = |fd: i32,
-                        line: &[u8],
-                        seen: &mut [[u8; DEDUP_LEN]; DEDUP_CAP],
-                        seen_lens: &mut [usize; DEDUP_CAP],
-                        seen_count: &mut usize,
-                        seen_next: &mut usize|
-             -> () {
-                if unique {
-                    let n = line.len().min(DEDUP_LEN);
-                    // Linear-scan the populated entries.
-                    for i in 0..*seen_count {
-                        if seen_lens[i] == n && seen[i][..n] == line[..n] {
-                            return;
-                        }
-                    }
-                    // Record (overwriting oldest if full).
-                    seen[*seen_next][..n].copy_from_slice(&line[..n]);
-                    seen_lens[*seen_next] = n;
-                    *seen_next = (*seen_next + 1) % DEDUP_CAP;
-                    if *seen_count < DEDUP_CAP {
-                        *seen_count += 1;
-                    }
-                }
-                unsafe {
-                    write_all(fd, line);
-                    write_all(fd, NEWLINE);
-                }
-            };
-            let test = |line_bytes: &[u8]| -> bool {
-                let hit = if case_insensitive {
-                    let mut lower = [0u8; 4096];
-                    let n = line_bytes.len().min(lower.len());
-                    for i in 0..n {
-                        lower[i] = ascii_lower(line_bytes[i]);
-                    }
-                    line_contains(&lower[..n], pattern)
-                } else {
-                    line_contains(line_bytes, pattern)
-                };
-                if invert { !hit } else { hit }
-            };
-            let mut matched: usize = 0;
-            'outer: loop {
-                let n = unsafe { libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n <= 0 { break; }
-                for &b in &buf[..n as usize] {
-                    if b == b'\n' {
-                        if test(&line[..llen]) {
-                            emit(
-                                fd,
-                                &line[..llen],
-                                &mut seen,
-                                &mut seen_lens,
-                                &mut seen_count,
-                                &mut seen_next,
-                            );
-                            matched += 1;
-                            if matched >= max_count {
-                                llen = 0;
-                                break 'outer;
-                            }
-                        }
-                        llen = 0;
-                    } else if llen < line.len() {
-                        line[llen] = b;
-                        llen += 1;
-                    }
-                }
-            }
-            if llen > 0 && matched < max_count && test(&line[..llen]) {
-                emit(
-                    fd,
-                    &line[..llen],
-                    &mut seen,
-                    &mut seen_lens,
-                    &mut seen_count,
-                    &mut seen_next,
-                );
-            }
-            if owned_fd >= 0 {
-                let _ = unsafe { libc::posix::close(owned_fd) };
-            }
-        }
+        run_grep(fd, rest);
     } else if cmd == b"head" {
         // head [-n N] [FILE] — print first N lines of FILE or stdin.
         // Default N = 10.
@@ -2139,6 +1941,183 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// `grep [-i] [-v] [-m N] PATTERN [FILE]` — line-oriented literal
+/// substring search. Reads stdin (fd 0) or FILE; prints lines
+/// matching (or not matching, with `-v`) the literal PATTERN.
+///
+/// Flags are parsed left-to-right; combined short flags like
+/// `-iv` work, `-m N` (or `-mN`) caps output to N matches.
+///
+/// Implementation note: previously this was a closures-with-
+/// mutable-state mess that buried bugs. Rewritten flat — one
+/// function, no closures, line buffer + read loop only.
+fn run_grep(fd: i32, rest: &[u8]) {
+    // Parse flags.
+    let mut s = skip_ws(rest);
+    let mut ci = false;
+    let mut inv = false;
+    let mut max_count: usize = usize::MAX;
+    loop {
+        if s.starts_with(b"-m") {
+            let after_m = &s[2..];
+            let after_m = skip_ws_or_self(after_m);
+            let num_end = after_m
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+                .unwrap_or(after_m.len());
+            let mut n = 0usize;
+            for &b in &after_m[..num_end] {
+                if b.is_ascii_digit() {
+                    n = n * 10 + (b - b'0') as usize;
+                }
+            }
+            if n > 0 {
+                max_count = n;
+            }
+            s = skip_ws(&after_m[num_end..]);
+            continue;
+        }
+        if s.starts_with(b"-") && s.len() >= 2 && s[1] != b' ' && s[1] != b'\t' {
+            let flag_end = s
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+                .unwrap_or(s.len());
+            let mut ok = true;
+            for &c in &s[1..flag_end] {
+                match c {
+                    b'i' => ci = true,
+                    b'v' => inv = true,
+                    _ => { ok = false; break; }
+                }
+            }
+            if !ok {
+                break;
+            }
+            s = skip_ws(&s[flag_end..]);
+            continue;
+        }
+        break;
+    }
+    // Pattern + optional file.
+    let pat_end = s
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+        .unwrap_or(s.len());
+    if pat_end == 0 {
+        unsafe { write_all(fd, b"grep: usage: grep [-i] [-v] [-m N] PATTERN [FILE]\n"); }
+        return;
+    }
+    let pattern_raw = &s[..pat_end];
+    let mut pat = [0u8; 256];
+    let pat_len = pattern_raw.len().min(pat.len());
+    for i in 0..pat_len {
+        pat[i] = if ci { ascii_lower(pattern_raw[i]) } else { pattern_raw[i] };
+    }
+    let pattern = &pat[..pat_len];
+    let file = trim_arg(&s[pat_end..]);
+    let mut owned: i32 = -1;
+    let src = if file.is_empty() {
+        0i32
+    } else {
+        let mut pbuf = [0u8; 256];
+        if file.len() + 1 >= pbuf.len() {
+            unsafe { write_all(fd, b"grep: path too long\n"); }
+            return;
+        }
+        pbuf[..file.len()].copy_from_slice(file);
+        let f = unsafe { libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0) };
+        if f < 0 {
+            unsafe { write_all(fd, b"grep: cannot open file\n"); }
+            return;
+        }
+        owned = f;
+        f
+    };
+    // Line-by-line scan.
+    let mut buf = [0u8; 4096];
+    let mut line = [0u8; 4096];
+    let mut llen: usize = 0;
+    let mut matched: usize = 0;
+    let mut done = false;
+    while !done {
+        let n = unsafe { libc::posix::read(src, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        for i in 0..n as usize {
+            let b = buf[i];
+            if b == b'\n' {
+                // Test the assembled line.
+                let mut hit;
+                if ci {
+                    let mut lower = [0u8; 4096];
+                    for j in 0..llen {
+                        lower[j] = ascii_lower(line[j]);
+                    }
+                    hit = line_contains(&lower[..llen], pattern);
+                } else {
+                    hit = line_contains(&line[..llen], pattern);
+                }
+                if inv {
+                    hit = !hit;
+                }
+                if hit {
+                    unsafe {
+                        write_all(fd, &line[..llen]);
+                        write_all(fd, NEWLINE);
+                    }
+                    matched += 1;
+                    if matched >= max_count {
+                        done = true;
+                        break;
+                    }
+                }
+                llen = 0;
+            } else if llen < line.len() {
+                line[llen] = b;
+                llen += 1;
+            }
+            // overflow drops byte until newline — intentional
+        }
+    }
+    // Trailing line without \n.
+    if !done && llen > 0 && matched < max_count {
+        let mut hit;
+        if ci {
+            let mut lower = [0u8; 4096];
+            for j in 0..llen {
+                lower[j] = ascii_lower(line[j]);
+            }
+            hit = line_contains(&lower[..llen], pattern);
+        } else {
+            hit = line_contains(&line[..llen], pattern);
+        }
+        if inv {
+            hit = !hit;
+        }
+        if hit {
+            unsafe {
+                write_all(fd, &line[..llen]);
+                write_all(fd, NEWLINE);
+            }
+        }
+    }
+    if owned >= 0 {
+        let _ = unsafe { libc::posix::close(owned) };
+    }
+}
+
+/// `skip_ws` but only advances if there IS leading whitespace,
+/// otherwise returns the input unchanged. Used by `-m N` parsing
+/// where the `N` arg may be glued (`-mN`) or separated (`-m N`).
+fn skip_ws_or_self(s: &[u8]) -> &[u8] {
+    if s.starts_with(b" ") || s.starts_with(b"\t") {
+        skip_ws(s)
+    } else {
+        s
+    }
 }
 
 /// ASCII case-fold: A..Z → a..z, everything else passes through.
