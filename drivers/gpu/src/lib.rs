@@ -112,6 +112,7 @@ pub enum GpuError {
 
 pub mod amdgpu;
 pub mod amdgpu_atom_dcn;
+pub mod backlight;
 pub mod amdgpu_atom_displayobj;
 pub mod amdgpu_atom_encoder_caps;
 pub mod amdgpu_atom_fwinfo;
@@ -178,6 +179,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Late, "intel-gpu-dp-bridge", || {
         intel_gpu_dp_bridge::register_bridge();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Device, "gpu-backlight", || {
+        backlight::init_backlight_initcall();
         InitResult::Ok
     });
 }
