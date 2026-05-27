@@ -1,0 +1,384 @@
+//! ACPI Thermal Zones (`PNP0C0F` / `ThermalZone` namespace nodes).
+//!
+//! Spec: ACPI 6.5 §11 (Thermal Management).
+//!   <https://uefi.org/specs/ACPI/>
+//!
+//! Adapted from Linux's `drivers/thermal/` (GPL-2.0-or-later) and
+//! `drivers/acpi/thermal.c`. NARF is GPL-2.0-or-later since
+//! 2026-05-20.
+//!
+//! # Layering vs `power/src/thermal.rs`
+//!
+//! `power::thermal` (sibling module) provides the **generic** thermal
+//! registry: a generic `ThermalZone` with milli-degree-C readings,
+//! subscriber callbacks, and active-cooling step policies. Drivers
+//! (ACPI, intel-coretemp, k10temp, ...) all feed into it.
+//!
+//! This module is the **ACPI-specific** view: walking
+//! `NodeKind::ThermalZone` and the `PNP0C0F` HID, evaluating `_TMP`,
+//! `_PSV`, `_CRT`, `_HOT`, `_TC1`, `_TC2`, `_AC0..9` — the typed
+//! ACPI trip-point table that `acpi_thermal.c` builds in Linux.
+//!
+//! Filename diverges from the brief's `thermal.rs` because that name
+//! is already taken by the generic registry; the brief's intent
+//! ("ACPI thermal module under `power/`") is honoured.
+//!
+//! # Units
+//!
+//! Per ACPI 6.5 §11.4, every temperature object returns **tenths of
+//! Kelvin (deciKelvin)**. `temperature_c_milli()` converts to
+//! millidegrees Celsius so it composes with the generic
+//! `power::thermal::record_temp` surface (which already speaks
+//! milli-C). Callers that want plain Celsius read the milli value and
+//! divide by 1000.
+//!
+//! `_TC1` and `_TC2` (passive cooling coefficients) are unit-free
+//! integers and are returned raw.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use narf_aml::eval::evaluate_method;
+use narf_aml::{find_all_devices_by_hid, for_each_node_of_kind, NodeKind};
+
+/// One ACPI Thermal Zone. Cheap to clone (just the path).
+///
+/// The path is the FULL namespace path the AML interpreter knows the
+/// zone by — e.g. `"\\_TZ.TZ00"` or `"\\_SB.PCI0.LPCB.EC0.TZ00"`. All
+/// trip-point method invocations are computed as `<path>.<method>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThermalZone {
+    pub path: String,
+}
+
+/// Trip points reported by a Thermal Zone, in millidegrees Celsius.
+///
+/// `None` means the zone doesn't expose that trip. ACPI 6.5 §11.4
+/// makes all trip points optional; the zone is still useful with
+/// just `_TMP` (it lets the OS read temperature, but provides no
+/// thresholds for action). The cooling governor decides what to do
+/// when missing trip points leave a band unbounded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThermalTripPoints {
+    /// `_CRT`: Critical temperature (system must shut down). Top of
+    /// the priority order; if `_CRT` is reached, no other trip
+    /// matters.
+    pub critical_milli_c: Option<i32>,
+    /// `_HOT`: System hot (above which the OS should hibernate or
+    /// otherwise preserve user state). Optional; many laptops omit
+    /// `_HOT` and only expose `_CRT`.
+    pub hot_milli_c: Option<i32>,
+    /// `_PSV`: Passive cooling trip. Above this, the OS should
+    /// throttle CPU / GPU clocks rather than spin up fans.
+    pub passive_milli_c: Option<i32>,
+    /// `_AC0`..=`_AC9`: Active cooling trips. Index N drives fan
+    /// level N (lower N = more aggressive cooling, per ACPI 6.5
+    /// §11.4.5). `None` slots are zones with fewer than N+1 levels.
+    pub active_milli_c: [Option<i32>; 10],
+    /// `_TC1`: Passive cooling thermal-constant 1. Unit-free integer
+    /// per ACPI 6.5 §11.4.13 (passive cooling formula coefficient).
+    pub tc1: Option<u64>,
+    /// `_TC2`: Passive cooling thermal-constant 2. Same shape as
+    /// `_TC1`.
+    pub tc2: Option<u64>,
+}
+
+/// Errors from a `ThermalZone` query.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ThermalError {
+    /// Required method (`_TMP` typically) is absent from the zone.
+    MethodMissing,
+    /// `_TMP` returned 0 or 0xFFFF_FFFF — sensor offline. The Linux
+    /// thermal core treats this the same way: drop the sample, don't
+    /// poison the running average.
+    SensorOffline,
+}
+
+/// Highest-priority trip point a given temperature has crossed.
+/// Precedence per ACPI 6.5 §11.4: Critical > Hot > Passive > Active.
+/// Active sub-orders by index (AC0 highest urgency to AC9 lowest);
+/// within Active we report the deepest one crossed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ActiveTrip {
+    None,
+    /// `_ACx`: index 0..=9, where 0 is the most aggressive cooling
+    /// level (also the lowest temperature threshold among the
+    /// declared `_ACx` set on a sane firmware).
+    Active(u8),
+    /// Above `_PSV`.
+    Passive,
+    /// Above `_HOT`.
+    Hot,
+    /// Above `_CRT`. System should shut down.
+    Critical,
+}
+
+impl ThermalZone {
+    /// Evaluate `<path>._TMP` and return the current temperature in
+    /// millidegrees Celsius. ACPI returns tenths of Kelvin; we
+    /// convert.
+    pub fn temperature_c_milli(&self) -> Result<i32, ThermalError> {
+        let mut method = self.path.clone();
+        method.push_str("._TMP");
+        let v = evaluate_method(&method, &[]).map_err(|_| ThermalError::MethodMissing)?;
+        let dk = v.as_integer();
+        // ACPI uses 0xFFFF_FFFF as the sensor-offline sentinel; some
+        // firmware reports 0 (absolute zero) when the sensor isn't
+        // wired up. Both are nonsense values.
+        if dk == 0 || dk == 0xFFFF_FFFF {
+            return Err(ThermalError::SensorOffline);
+        }
+        Ok(decik_to_milli_c(dk))
+    }
+
+    /// Convenience: temperature in integer Celsius, truncating
+    /// toward negative infinity. Useful for diagnostics where one
+    /// degree of precision is plenty.
+    pub fn temperature_c(&self) -> Result<i32, ThermalError> {
+        self.temperature_c_milli().map(|m| m / 1000)
+    }
+
+    /// Read all trip points from this zone in one shot. Missing
+    /// methods are returned as `None`; never errors.
+    pub fn trip_points(&self) -> ThermalTripPoints {
+        let mut tp = ThermalTripPoints::default();
+        tp.critical_milli_c = self.read_dk_milli("_CRT");
+        tp.hot_milli_c = self.read_dk_milli("_HOT");
+        tp.passive_milli_c = self.read_dk_milli("_PSV");
+        for i in 0..10 {
+            // Method names are `_AC0` .. `_AC9`; assemble cheaply.
+            let mut name = [0u8; 4];
+            name[0] = b'_';
+            name[1] = b'A';
+            name[2] = b'C';
+            name[3] = b'0' + i as u8;
+            // SAFETY: bytes 0..=9 are all valid ASCII.
+            let s = core::str::from_utf8(&name).unwrap();
+            tp.active_milli_c[i] = self.read_dk_milli(s);
+        }
+        tp.tc1 = self.read_int("_TC1");
+        tp.tc2 = self.read_int("_TC2");
+        tp
+    }
+
+    /// Helper: read a method that returns deciKelvin, convert to
+    /// milli-C. `None` if the method is missing or returned a value
+    /// that doesn't make sense as a temperature.
+    fn read_dk_milli(&self, leaf: &str) -> Option<i32> {
+        let mut method = self.path.clone();
+        method.push('.');
+        method.push_str(leaf);
+        let v = evaluate_method(&method, &[]).ok()?;
+        let dk = v.as_integer();
+        // Same sentinel-rejection as `_TMP`. A 0 deciK trip point is
+        // nonsense (would mean "throttle below absolute zero").
+        if dk == 0 || dk == 0xFFFF_FFFF {
+            return None;
+        }
+        Some(decik_to_milli_c(dk))
+    }
+
+    /// Helper: read a method that returns a plain integer.
+    fn read_int(&self, leaf: &str) -> Option<u64> {
+        let mut method = self.path.clone();
+        method.push('.');
+        method.push_str(leaf);
+        let v = evaluate_method(&method, &[]).ok()?;
+        let i = v.as_integer();
+        if i == 0xFFFF_FFFF {
+            None
+        } else {
+            Some(i)
+        }
+    }
+}
+
+/// Convert deciKelvin (tenths of a degree Kelvin, ACPI's native unit)
+/// to millidegrees Celsius. The +/- 273.15 K offset becomes 273_150
+/// milli-C.
+///
+/// Examples (from a Renoir 4700U DSDT):
+///   3132 deciK = 313.2 K = 40.05 C = 40_050 milli-C
+///   3732 deciK = 373.2 K = 100.05 C = 100_050 milli-C  (typical _CRT)
+#[inline]
+pub fn decik_to_milli_c(deci_k: u64) -> i32 {
+    // T_milli_c = T_dk * 100 - 273_150
+    // (multiplications are u64, then we cast to i32 once we've
+    // subtracted the offset.)
+    let scaled = deci_k.saturating_mul(100) as i64;
+    (scaled - 273_150) as i32
+}
+
+/// Reverse of [`decik_to_milli_c`] — for test ergonomics.
+#[inline]
+pub fn milli_c_to_decik(milli_c: i32) -> u64 {
+    let k = (milli_c as i64) + 273_150;
+    if k <= 0 {
+        return 0;
+    }
+    (k as u64) / 100
+}
+
+/// Apply ACPI 6.5 §11.4 trip-point precedence to a given temperature
+/// (in milli-C) against a trip-point set. Returns the highest-priority
+/// trip the temperature has reached or exceeded.
+///
+/// Precedence (highest to lowest):
+///   1. Critical (`_CRT`)
+///   2. Hot (`_HOT`)
+///   3. Passive (`_PSV`)
+///   4. Active (`_ACx`) — among declared `_ACx`, the **deepest** one
+///      whose threshold the temperature has crossed wins. ACPI 6.5
+///      §11.4.5: `_AC0` is the **highest-numbered cooling level**
+///      (most aggressive fan speed), so among `_AC0..9` the one with
+///      the **lowest** index whose threshold we crossed wins. We
+///      report the index in the returned `Active(N)`.
+pub fn classify(milli_c: i32, trips: &ThermalTripPoints) -> ActiveTrip {
+    if let Some(crit) = trips.critical_milli_c {
+        if milli_c >= crit {
+            return ActiveTrip::Critical;
+        }
+    }
+    if let Some(hot) = trips.hot_milli_c {
+        if milli_c >= hot {
+            return ActiveTrip::Hot;
+        }
+    }
+    if let Some(psv) = trips.passive_milli_c {
+        if milli_c >= psv {
+            return ActiveTrip::Passive;
+        }
+    }
+    // ACPI §11.4.5: _AC0 is most aggressive cooling. Conventionally
+    // _AC0 > _AC1 > ... > _AC9 by temperature, so scan low index
+    // first; the first one we exceed is the most-aggressive crossed.
+    for i in 0..10 {
+        if let Some(t) = trips.active_milli_c[i] {
+            if milli_c >= t {
+                return ActiveTrip::Active(i as u8);
+            }
+        }
+    }
+    ActiveTrip::None
+}
+
+/// Enumerate every ACPI Thermal Zone in the namespace. Combines two
+/// sources: `NodeKind::ThermalZone` (the AML keyword-declared zones)
+/// and `find_all_devices_by_hid("PNP0C0F")` (the device-tree form).
+/// Deduplicated by path.
+pub fn enumerate() -> Vec<ThermalZone> {
+    let mut paths: Vec<String> = Vec::new();
+    for_each_node_of_kind(NodeKind::ThermalZone, |n| {
+        paths.push(n.path.clone());
+    });
+    for node in find_all_devices_by_hid("PNP0C0F") {
+        // Skip duplicates — a zone CAN have both forms (one declares
+        // a ThermalZone(...) block, the other declares a Device(...)
+        // with HID=PNP0C0F that contains the same methods).
+        if !paths.iter().any(|p| *p == node.path) {
+            paths.push(node.path);
+        }
+    }
+    paths
+        .into_iter()
+        .map(|path| ThermalZone { path })
+        .collect()
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_acpi_thermal_decik_round_trip() -> TestResult {
+        // 313.2 K = 40.05 C → 40_050 milli-C
+        if decik_to_milli_c(3132) != 40_050 {
+            return TestResult::Fail("3132 deciK should convert to 40_050 milli-C");
+        }
+        // 373.2 K = 100.05 C → 100_050 milli-C (typical _CRT)
+        if decik_to_milli_c(3732) != 100_050 {
+            return TestResult::Fail("3732 deciK should convert to 100_050 milli-C");
+        }
+        // 2731 deciK = 273.1 K = -0.05 C → -50 milli-C
+        if decik_to_milli_c(2731) != -50 {
+            return TestResult::Fail("2731 deciK should convert to -50 milli-C");
+        }
+        // Round-trip: milli_c → decik → milli_c. Lossy (100 milli-C
+        // per deciK) but should round to within 99 milli-C.
+        let m = 40_050i32;
+        let back = decik_to_milli_c(milli_c_to_decik(m));
+        if (back - m).abs() > 100 {
+            return TestResult::Fail("milli_c round-trip drifted > 100 milli-C");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_decik_round_trip);
+
+    fn smoke_acpi_thermal_classify_precedence_critical_wins() -> TestResult {
+        // Trips: _CRT=100 C, _HOT=95 C, _PSV=85 C, _AC0=75 C, _AC1=65 C.
+        // The classifier must report Critical when t >= _CRT, even
+        // though every lower trip is also crossed.
+        let mut trips = ThermalTripPoints::default();
+        trips.critical_milli_c = Some(100_000);
+        trips.hot_milli_c = Some(95_000);
+        trips.passive_milli_c = Some(85_000);
+        trips.active_milli_c[0] = Some(75_000);
+        trips.active_milli_c[1] = Some(65_000);
+
+        if classify(105_000, &trips) != ActiveTrip::Critical {
+            return TestResult::Fail("105 C with _CRT=100 should be Critical");
+        }
+        if classify(97_000, &trips) != ActiveTrip::Hot {
+            return TestResult::Fail("97 C with _HOT=95 should be Hot (not Passive/Active)");
+        }
+        if classify(87_000, &trips) != ActiveTrip::Passive {
+            return TestResult::Fail("87 C with _PSV=85 should be Passive");
+        }
+        // 77 C — exceeds _AC0 (75) but not _PSV. Should pick the
+        // most-aggressive crossed _ACx = _AC0.
+        match classify(77_000, &trips) {
+            ActiveTrip::Active(0) => {}
+            other => {
+                let _ = other;
+                return TestResult::Fail("77 C should classify as Active(0)");
+            }
+        }
+        // 70 C — exceeds _AC1 only.
+        match classify(70_000, &trips) {
+            ActiveTrip::Active(1) => {}
+            _ => return TestResult::Fail("70 C should classify as Active(1)"),
+        }
+        // 50 C — below everything.
+        if classify(50_000, &trips) != ActiveTrip::None {
+            return TestResult::Fail("50 C with all trips above should be None");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "power/acpi_thermal",
+        smoke_acpi_thermal_classify_precedence_critical_wins
+    );
+
+    fn smoke_acpi_thermal_classify_sparse_trips() -> TestResult {
+        // Many real-world DSDTs only export _CRT + _TMP. Confirm the
+        // classifier handles unbounded ranges gracefully.
+        let mut trips = ThermalTripPoints::default();
+        trips.critical_milli_c = Some(100_000);
+        // No _HOT / _PSV / _AC*.
+
+        if classify(99_999, &trips) != ActiveTrip::None {
+            return TestResult::Fail("99.999 C with only _CRT=100 should be None");
+        }
+        if classify(100_000, &trips) != ActiveTrip::Critical {
+            return TestResult::Fail("100 C at _CRT boundary should be Critical");
+        }
+        // No trips at all → always None.
+        let empty = ThermalTripPoints::default();
+        if classify(150_000, &empty) != ActiveTrip::None {
+            return TestResult::Fail("150 C with no trips should be None (sensor still streams)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_classify_sparse_trips);
+}
