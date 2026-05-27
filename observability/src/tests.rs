@@ -301,13 +301,15 @@ fn smoke_obs_gdb_packet_checksum() -> TestResult {
 }
 kernel_test_in!("observability", smoke_obs_gdb_packet_checksum);
 
-fn smoke_obs_gdb_attach_not_implemented() -> TestResult {
+fn smoke_obs_gdb_attach_legacy_no_transport() -> TestResult {
+    // Legacy no-transport `attach` shim still returns NotImplemented:
+    // the real entry point is now `run_session` / `attach_com1`.
     use narf_capabilities::{Cap, Invoke};
     use crate::{gdb, Debugger, GdbError};
     let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
     match gdb::attach(&cap) {
         Err(GdbError::NotImplemented) => {}
-        _ => return TestResult::Fail("attach should return NotImplemented pending arch backend"),
+        _ => return TestResult::Fail("legacy attach should still surface NotImplemented"),
     }
     cap.revoke();
     match gdb::attach(&cap) {
@@ -316,7 +318,179 @@ fn smoke_obs_gdb_attach_not_implemented() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("observability", smoke_obs_gdb_attach_not_implemented);
+kernel_test_in!("observability", smoke_obs_gdb_attach_legacy_no_transport);
+
+fn smoke_obs_gdb_handshake_qsupported_then_halt() -> TestResult {
+    // Host sends `qSupported:multiprocess+` then `?`. We expect:
+    //   - `+` ack on the qSupported, then `$PacketSize=400#<sum>` reply
+    //   - `+` ack on `?`, then `$S05#<sum>` reply (SigTrap)
+    use crate::{gdb, ArchRegs, Debugger};
+    use narf_capabilities::{Cap, Invoke};
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    let mut transport = gdb::VecTransport::new();
+    transport.push_packet("qSupported:multiprocess+");
+    transport.push_packet("?");
+    transport.push_packet("c"); // sentinel so run_session returns
+    let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+    if gdb::run_session(&cap, &mut transport, &mut session).is_err() {
+        return TestResult::Fail("run_session returned Err on clean handshake");
+    }
+    let out = transport.outbound_str();
+    if !out.contains("+$PacketSize=400#") {
+        return TestResult::Fail("missing qSupported reply with PacketSize advertisement");
+    }
+    if !out.contains("$S05#") {
+        return TestResult::Fail("halt-reason reply did not encode SigTrap");
+    }
+    if session.packets_handled < 3 {
+        return TestResult::Fail("dispatcher did not advance packets_handled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_handshake_qsupported_then_halt);
+
+fn smoke_obs_gdb_read_regs_packs_archregs() -> TestResult {
+    use crate::{gdb, ArchRegs, Debugger};
+    use narf_capabilities::{Cap, Invoke};
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    let mut transport = gdb::VecTransport::new();
+    transport.push_packet("g");
+    transport.push_packet("c");
+    #[cfg(target_arch = "x86_64")]
+    let regs = ArchRegs {
+        rax: 0xCAFE_BABE,
+        rbx: 0xDEAD_BEEF,
+        rip: 0x1234_5678,
+        rflags: 0x202,
+        cs: 0x08,
+        ss: 0x10,
+        ..Default::default()
+    };
+    #[cfg(target_arch = "aarch64")]
+    let regs = {
+        let mut r = ArchRegs::default();
+        r.pc = 0x1234_5678;
+        r
+    };
+
+    let mut session = gdb::GdbSession::new(regs, gdb::HaltReason::SigTrap);
+    if gdb::run_session(&cap, &mut transport, &mut session).is_err() {
+        return TestResult::Fail("run_session returned Err");
+    }
+    let out = transport.outbound_str();
+    // x86_64: rax is the first 8 bytes (16 hex chars) of the `g`
+    // reply, encoded little-endian.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !out.contains("$bebafeca00000000") {
+            return TestResult::Fail("rax not packed little-endian at head of g reply");
+        }
+        if !out.contains("efbeadde00000000") {
+            return TestResult::Fail("rbx not packed correctly");
+        }
+    }
+    let _ = out;
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_read_regs_packs_archregs);
+
+fn smoke_obs_gdb_read_mem_via_test_shim() -> TestResult {
+    use crate::{gdb, ArchRegs, Debugger};
+    use narf_capabilities::{Cap, Invoke};
+
+    fn fake_peek(addr: u64, len: u32) -> Option<alloc::vec::Vec<u8>> {
+        if addr == 0xCAFE_BABE && len == 4 {
+            return Some(alloc::vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        }
+        None
+    }
+    fn fake_poke(_addr: u64, _bytes: &[u8]) -> bool {
+        true
+    }
+    gdb::__test_install_memory(fake_peek, fake_poke);
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    let mut transport = gdb::VecTransport::new();
+    transport.push_packet("mcafebabe,4");
+    transport.push_packet("c");
+    let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+    let res = gdb::run_session(&cap, &mut transport, &mut session);
+    gdb::__test_clear_memory();
+    if res.is_err() {
+        return TestResult::Fail("run_session returned Err");
+    }
+    let out = transport.outbound_str();
+    if !out.contains("$deadbeef#") {
+        return TestResult::Fail("m reply did not contain the synthetic memory hex");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_read_mem_via_test_shim);
+
+fn smoke_obs_gdb_step_returns_from_session() -> TestResult {
+    use crate::{gdb, ArchRegs, Debugger};
+    use narf_capabilities::{Cap, Invoke};
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    let mut transport = gdb::VecTransport::new();
+    transport.push_packet("s");
+    let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+    if gdb::run_session(&cap, &mut transport, &mut session).is_err() {
+        return TestResult::Fail("run_session returned Err on `s`");
+    }
+    let out = transport.outbound_str();
+    if !out.contains("$S05#") {
+        return TestResult::Fail("step reply did not encode SigTrap signal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_step_returns_from_session);
+
+fn smoke_obs_gdb_run_session_revoked_cap() -> TestResult {
+    use crate::{gdb, ArchRegs, Debugger, GdbError};
+    use narf_capabilities::{Cap, Invoke};
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    cap.revoke();
+    let mut transport = gdb::VecTransport::new();
+    let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+    match gdb::run_session(&cap, &mut transport, &mut session) {
+        Err(GdbError::AuthorityRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked Debugger cap was not rejected"),
+    }
+}
+kernel_test_in!("observability", smoke_obs_gdb_run_session_revoked_cap);
+
+fn smoke_obs_gdb_parse_command_dispatch() -> TestResult {
+    use crate::gdb::{parse_command, GdbCommand, GdbError};
+    if !matches!(parse_command("?"), Ok(GdbCommand::HaltReason)) {
+        return TestResult::Fail("? did not parse as HaltReason");
+    }
+    if !matches!(parse_command("g"), Ok(GdbCommand::ReadRegs)) {
+        return TestResult::Fail("g did not parse as ReadRegs");
+    }
+    if !matches!(parse_command("mABCD,4"), Ok(GdbCommand::ReadMem { addr: 0xABCD, len: 4 })) {
+        return TestResult::Fail("m did not parse addr+len in hex");
+    }
+    if !matches!(parse_command("c1000"), Ok(GdbCommand::Continue { addr: Some(0x1000) })) {
+        return TestResult::Fail("c<addr> did not parse continue with address");
+    }
+    if !matches!(parse_command("s"), Ok(GdbCommand::Step { addr: None })) {
+        return TestResult::Fail("bare s did not parse Step{None}");
+    }
+    match parse_command("qSupported:multiprocess+") {
+        Ok(GdbCommand::QSupported(ref s)) if s == "multiprocess+" => {}
+        _ => return TestResult::Fail("qSupported did not parse feature list"),
+    }
+    // Unrecognised query → Unsupported.
+    if !matches!(parse_command("qOther"), Err(GdbError::Unsupported)) {
+        return TestResult::Fail("unknown q query was not Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_parse_command_dispatch);
 
 fn smoke_obs_peek_provider_registration() -> TestResult {
     use alloc::vec::Vec;

@@ -42,7 +42,7 @@ pub mod peek;
 
 mod tests;
 
-pub use gdb::{GdbCommand, GdbError, GdbPacket};
+pub use gdb::{GdbCommand, GdbError, GdbPacket, GdbSession, GdbTransport, HaltReason, VecTransport};
 pub use peek::{MetricSample, MetricValue, PeekError, Provider};
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
