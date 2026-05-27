@@ -1,20 +1,20 @@
 //! Per-crate smoke tests for `narf-firmware-fw-cfg`.
 //!
 //! Tests register via `narf_kernel_test::kernel_test_in!` so the
-//! runner groups output under `firmware/fw_cfg`. x86_64-only — the
-//! aarch64 MMIO port is a TODO.
-
-#![cfg(target_arch = "x86_64")]
+//! runner groups output under `firmware/fw_cfg`. Most live probes
+//! are x86_64-only because QEMU's `-M virt` aarch64 build needs an
+//! explicit `set_mmio_base` call from a DTB walker that doesn't
+//! exist yet in tests. The pure-codec checks build on either arch.
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::{
-    decode_file_entry, find, is_present, read_directory, read_string, FwCfgFile, FILE_ENTRY_SIZE,
-    FILE_NAME_LEN, MAGIC,
-};
+#[cfg(target_arch = "x86_64")]
+use crate::{find, is_present, read_directory, read_string};
+use crate::{decode_file_entry, FwCfgFile, FILE_ENTRY_SIZE, FILE_NAME_LEN, MAGIC};
 
 // 1. Live presence — QEMU always exposes fw_cfg under `cargo xtask
 //    test`. Skip cleanly on bare-metal / non-QEMU runs.
+#[cfg(target_arch = "x86_64")]
 fn smoke_fw_cfg_signature_detected() -> TestResult {
     if !is_present() {
         return TestResult::Skip("fw_cfg absent");
@@ -26,10 +26,12 @@ fn smoke_fw_cfg_signature_detected() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_signature_detected);
 
 // 2. Live directory parse — read FW_CFG_FILE_DIR and assert at least
 //    one canonical entry name decodes to printable ASCII.
+#[cfg(target_arch = "x86_64")]
 fn smoke_fw_cfg_file_directory_parses() -> TestResult {
     if !is_present() {
         return TestResult::Skip("fw_cfg absent");
@@ -57,12 +59,14 @@ fn smoke_fw_cfg_file_directory_parses() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_file_directory_parses);
 
 // 3. Live read — find a well-known QEMU entry. `etc/boot-fail-wait`
 //    is set on every q35/pc default, so its absence is itself a
 //    diagnosis (skip rather than fail). Reading it via `read_string`
 //    exercises select → stream-read → strip-NUL.
+#[cfg(target_arch = "x86_64")]
 fn smoke_fw_cfg_read_string_well_known() -> TestResult {
     if !is_present() {
         return TestResult::Skip("fw_cfg absent");
@@ -85,6 +89,7 @@ fn smoke_fw_cfg_read_string_well_known() -> TestResult {
     }
     TestResult::Skip("no well-known entry found")
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_read_string_well_known);
 
 // 4. Pure-data — synthesise a 64-byte directory entry and confirm
@@ -135,3 +140,65 @@ fn smoke_fw_cfg_magic_constant() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_magic_constant);
+
+// 6. aarch64 MMIO — base register defaults to zero (absent) and
+//    set_mmio_base round-trips. With base=0 the device is treated
+//    as not-present: select / read_bytes no-op, is_present returns
+//    false. Without QEMU's DTB the live MMIO probe can't run, so
+//    we verify the wiring instead.
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_fw_cfg_mmio_base_round_trip() -> TestResult {
+    use crate::{is_present, mmio_base, set_mmio_base};
+
+    // Capture and reset.
+    let saved = mmio_base();
+    set_mmio_base(0);
+    if mmio_base() != 0 {
+        set_mmio_base(saved);
+        return TestResult::Fail("clear-to-zero didn't stick");
+    }
+    if is_present() {
+        set_mmio_base(saved);
+        return TestResult::Fail("base=0 must report not-present");
+    }
+
+    // Round-trip a non-zero base. We don't dereference it (would
+    // page-fault in tests), only the atomic read-back.
+    set_mmio_base(0x0900_2000);
+    if mmio_base() != 0x0900_2000 {
+        set_mmio_base(saved);
+        return TestResult::Fail("base read-back wrong");
+    }
+
+    // Restore.
+    set_mmio_base(saved);
+    TestResult::Pass
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_mmio_base_round_trip);
+
+// 7. aarch64 MMIO selector encoding — the QEMU MMIO selector is
+//    big-endian on the wire even on a little-endian host. The
+//    select() implementation must to_be() the value before writing.
+//    We validate the conversion logic without touching real MMIO.
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_fw_cfg_mmio_selector_is_big_endian() -> TestResult {
+    // 0x0019 (FW_CFG_FILE_DIR) host-LE = 0x19 0x00; BE = 0x00 0x19.
+    let key = crate::FW_CFG_FILE_DIR;
+    let be = key.to_be();
+    let bytes = be.to_ne_bytes();
+    if bytes != [0x00, 0x19] {
+        return TestResult::Fail("FILE_DIR didn't BE-swap correctly");
+    }
+    // Signature 0x0000 swaps to itself.
+    let sig_be = crate::FW_CFG_SIGNATURE.to_be();
+    if sig_be != 0 {
+        return TestResult::Fail("FW_CFG_SIGNATURE BE form drifted");
+    }
+    TestResult::Pass
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!(
+    "firmware/fw_cfg",
+    smoke_fw_cfg_mmio_selector_is_big_endian
+);

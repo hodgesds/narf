@@ -7,12 +7,23 @@
 //! §3) is not implemented; byte-stream read off the data port suffices
 //! for `bootorder` / `cmdline` / `etc/*` / `opt/*` entries.
 //!
-//! aarch64 MMIO support is a TODO — the interface there is a
-//! DTB-discovered MMIO window (`qemu,fw-cfg` compatible string) and we
-//! don't need it yet.
+//! aarch64 path uses the MMIO interface (spec §2 / §3.1 "MMIO
+//! Interface"). The device-tree binding is `qemu,fw-cfg-mmio` with a
+//! single `reg` entry exposing the data + selector registers:
+//!
+//! ```text
+//!   offset 0x00..0x08   data register   (read 8/16/32/64-bit, native LE)
+//!   offset 0x08..0x0A   selector reg    (write 16-bit, BIG-ENDIAN)
+//! ```
+//!
+//! On `qemu-system-aarch64 -M virt` the window sits at physical
+//! 0x0900_2000 (QEMU `hw/arm/virt.c::VIRT_FW_CFG`). The DTB walk that
+//! supplies this base in production lives in `init/`; bring-up calls
+//! [`set_mmio_base`] explicitly. The selector is **big-endian on
+//! MMIO** even though the x86 PIO selector is host-LE — see the
+//! `qemu_fw_cfg_register_mmio` source for the byte-order conversion.
 
 #![no_std]
-#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
@@ -21,6 +32,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(not(target_arch = "x86_64"))]
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -33,6 +46,19 @@ use narf_arch::x86_64::io_port::{inb, outw};
 pub const SELECTOR_PORT: u16 = 0x510;
 /// x86_64 data port (8-bit read). Spec §2.
 pub const DATA_PORT: u16 = 0x511;
+
+/// aarch64 MMIO offset of the data register. Spec §3.1 / QEMU
+/// `hw/nvram/fw_cfg.c::fw_cfg_data_mem_ops`.
+pub const MMIO_OFFSET_DATA: u64 = 0x00;
+/// aarch64 MMIO offset of the 16-bit selector register. Spec §3.1 /
+/// QEMU `hw/nvram/fw_cfg.c::fw_cfg_ctl_mem_ops`. **Big-endian writes**.
+pub const MMIO_OFFSET_SELECTOR: u64 = 0x08;
+/// QEMU `-M virt` default base for the fw_cfg MMIO window
+/// (`hw/arm/virt.c::a15memmap[VIRT_FW_CFG]`). Bring-up uses this when
+/// no DTB is present yet; production builds set the base via
+/// [`set_mmio_base`] after a DTB walk.
+#[cfg(not(target_arch = "x86_64"))]
+pub const MMIO_BASE_DEFAULT: u64 = 0x0900_2000;
 
 /// Selector key — signature. Spec §4 "FW_CFG_SIGNATURE = 0x0000".
 pub const FW_CFG_SIGNATURE: u16 = 0x0000;
@@ -91,9 +117,50 @@ pub fn select(key: u16) {
     }
 }
 
+/// MMIO base register address. `0` means "not configured" — bring-up
+/// calls [`set_mmio_base`] before any access. Atomic so the late-init
+/// race against a parallel `is_present` probe doesn't tear the read.
+#[cfg(not(target_arch = "x86_64"))]
+static MMIO_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Override the aarch64 MMIO base. Called by the DTB walker once it
+/// has located a node with `compatible = "qemu,fw-cfg-mmio"`. Passing
+/// `0` disables the device (acts as not-present). A `0` base address
+/// would alias the null page; the [`select`] / [`read_bytes`] paths
+/// no-op when the base is zero, matching the x86_64 "absent" path.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_mmio_base(base: u64) {
+    MMIO_BASE.store(base, Ordering::Release);
+}
+
+/// Read the configured MMIO base. Useful for diagnostics + tests.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn mmio_base() -> u64 {
+    MMIO_BASE.load(Ordering::Acquire)
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-pub fn select(_key: u16) { /* aarch64 MMIO TODO */
+pub fn select(key: u16) {
+    let base = MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // QEMU's MMIO selector is **big-endian** even on little-endian
+    // hosts. `hw/nvram/fw_cfg.c::fw_cfg_ctl_mem_ops` uses
+    // `.endianness = DEVICE_BIG_ENDIAN`, so a host-LE store of `key`
+    // would land in the device byte-swapped. Emit the BE form.
+    let be = key.to_be();
+    // SAFETY: MMIO_BASE was supplied by the bring-up path from the
+    // DTB walker (or the default QEMU virt base) and points at a
+    // valid 16-byte device window. The selector register is at
+    // offset 8 and accepts 16-bit writes.
+    unsafe {
+        core::ptr::write_volatile(
+            (base + MMIO_OFFSET_SELECTOR) as *mut u16,
+            be,
+        );
+    }
 }
 
 /// Stream-read `buf.len()` bytes from the data port. Spec §2: each
@@ -107,25 +174,42 @@ pub fn read_bytes(buf: &mut [u8]) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn read_bytes(_buf: &mut [u8]) { /* aarch64 MMIO TODO */
+pub fn read_bytes(buf: &mut [u8]) {
+    let base = MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        // Behave like the x86_64 "no fw_cfg" path: leave buffer
+        // untouched. Callers check is_present() before relying on
+        // the bytes anyway.
+        return;
+    }
+    // QEMU's MMIO data path accepts 8/16/32/64-bit reads; the value
+    // returned advances the internal cursor by the access width. We
+    // pick byte reads to mirror the x86_64 PIO path verbatim and
+    // sidestep alignment questions for `buf` that isn't 8-aligned.
+    let data_reg = (base + MMIO_OFFSET_DATA) as *const u8;
+    for b in buf.iter_mut() {
+        // SAFETY: same MMIO window as select(); 8-bit volatile read.
+        *b = unsafe { core::ptr::read_volatile(data_reg) };
+    }
 }
 
 // ── presence + directory ───────────────────────────────────────────
 
 /// `true` if writing `FW_CFG_SIGNATURE` and reading 4 bytes returns
-/// the `MAGIC`. Spec §4.
+/// the `MAGIC`. Spec §4. On aarch64 the MMIO base must have been
+/// supplied via [`set_mmio_base`] first; absent that, the probe
+/// silently reports "not present".
 pub fn is_present() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        select(FW_CFG_SIGNATURE);
-        let mut sig = [0u8; 4];
-        read_bytes(&mut sig);
-        sig == MAGIC
-    }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        false
+        if MMIO_BASE.load(Ordering::Acquire) == 0 {
+            return false;
+        }
     }
+    select(FW_CFG_SIGNATURE);
+    let mut sig = [0u8; 4];
+    read_bytes(&mut sig);
+    sig == MAGIC
 }
 
 /// Decode a single 64-byte directory entry per spec §4.
