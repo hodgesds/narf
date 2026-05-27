@@ -43,12 +43,21 @@ pub struct DevicePmEntry {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceSuspendError {
     /// Handler returned an error specific to its driver.
+    /// Used by `nvme` (controller didn't acknowledge the shutdown
+    /// notification) and `xhci` (Run/Stop bit didn't latch).
     DriverError,
     /// Device is in a state that doesn't allow suspending right now
     /// (active uninterruptible transfer, firmware mid-load, etc.).
+    /// Used by the test harness to validate per-device-failure
+    /// aggregation; no production driver returns this yet.
     Busy,
     /// Driver doesn't support suspend yet — fall through to S0i3 /
-    /// freeze without touching this device.
+    /// freeze without touching this device. Scaffolding for drivers
+    /// that need to opt out of S3 quiesce; not used today (all
+    /// registered drivers — nvme, xhci, amdgpu — implement real
+    /// suspend/resume). Kept so the fan-out aggregator's caller can
+    /// pattern-match on the full set without churning the variant
+    /// list when the first opt-out driver lands.
     NotImplemented,
 }
 
