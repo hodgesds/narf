@@ -289,3 +289,103 @@ pub fn make_frame_list_pointing_to(qh_addr: u32) -> Vec<u32> {
     let v = FrameListPtr::make(qh_addr, true).0;
     alloc::vec![v; 1024]
 }
+
+// ── PCI bind glue ───────────────────────────────────────────────
+//
+// UHCI controllers identify on PCI as base class 0x0C (Serial
+// Bus), subclass 0x03 (USB), prog-if 0x00 (USB 1.1, Universal HCI).
+// UHCI is Intel's legacy USB-1.1 controller — it predates EHCI by
+// several years and uses **I/O port** registers rather than MMIO,
+// which means BAR4 (UHCI Design Guide §2 — "PCI configuration
+// space, Base Address Register #4") rather than BAR0.
+//
+// Renoir and Phoenix laptops carry no UHCI silicon (AMD never
+// shipped UHCI; their chipsets used OHCI for USB-1.1). The probe
+// scaffolding lives here so a board with a discrete UHCI block
+// (an Intel ICH-family chipset, a PCIe USB-1.1 expansion card)
+// still gets a log line. Live bring-up — outb/inb against the
+// USBCMD/PORTSC ports, frame-list management — is intentionally
+// deferred. The probe just reads the I/O BAR base and logs.
+
+/// PCI base class for "Serial Bus Controllers".
+const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
+/// PCI subclass under Serial Bus for "USB".
+const PCI_SUBCLASS_USB: u8 = 0x03;
+/// PCI prog-if for UHCI under USB.
+const PCI_PROGIF_UHCI: u8 = 0x00;
+
+/// UHCI registers live in I/O port space; the BAR slot per the
+/// UHCI Design Guide §2 is BAR4 (offset 0x20 in cfg space).
+const UHCI_BAR_INDEX: u8 = 4;
+
+pub fn probe(
+    device: narf_bus::BusDevice,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    let class = ((device.id.class >> 16) & 0xFF) as u8;
+    let subclass = ((device.id.class >> 8) & 0xFF) as u8;
+    let prog_if = (device.id.class & 0xFF) as u8;
+    if class != PCI_CLASS_SERIAL_BUS
+        || subclass != PCI_SUBCLASS_USB
+        || prog_if != PCI_PROGIF_UHCI
+    {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    // UHCI needs IO_SPACE + BUS_MASTER + INTX_DISABLE — the legacy
+    // controller signals interrupts via INTx by default, so we
+    // mask them at the PCI Command register and the (eventual)
+    // live driver will manage them itself.
+    let _ = narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::IO_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    );
+    // UHCI BAR4 is an I/O-port BAR — `map_bar` rejects those, so
+    // go through `read_bar` directly.
+    // SAFETY: caller-authority + exclusive cfg-window claim
+    // (probe path; bus walker holds the lock).
+    let bar = match unsafe { narf_bus::read_bar(&device, UHCI_BAR_INDEX) } {
+        Ok(b) => b,
+        Err(_) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  uhci: BAR{} read failed for {:04x}:{:04x}",
+                UHCI_BAR_INDEX, device.id.vendor, device.id.device
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+    };
+    if !matches!(bar.kind, narf_bus::BarKind::Io) {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  uhci: BAR{} not an I/O port BAR (kind={:?})",
+            UHCI_BAR_INDEX, bar.kind
+        );
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  uhci: probed {:04x}:{:04x} I/O base=0x{:x} (not implemented)",
+        device.id.vendor,
+        device.id.device,
+        bar.phys.raw(),
+    );
+    Err(narf_bus::ProbeError::Other("uhci: not implemented"))
+}
+
+pub fn register_pci_driver() {
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "uhci-class",
+        kind: narf_bus::MatchKind::ClassFull {
+            class: PCI_CLASS_SERIAL_BUS,
+            subclass: PCI_SUBCLASS_USB,
+            prog_if: PCI_PROGIF_UHCI,
+        },
+        probe,
+    });
+}

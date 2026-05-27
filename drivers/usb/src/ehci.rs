@@ -587,3 +587,108 @@ pub fn dump_completed_qtds(
     }
     out
 }
+
+// ── PCI bind glue ───────────────────────────────────────────────
+//
+// EHCI controllers identify on PCI as base class 0x0C (Serial Bus),
+// subclass 0x03 (USB), prog-if 0x20 (USB 2.0). Renoir / Phoenix
+// laptops don't ship a separate EHCI block — the SoC chipsets carry
+// xHCI only — but EHCI is common on older desktop boards and PCIe
+// USB-2.0 expansion cards, so the structural binding lands here to
+// keep the dispatcher uniform across host-controller types.
+//
+// Full bring-up (async schedule, periodic schedule, port reset,
+// transfer execution) is intentionally out of scope this pass. The
+// probe maps the BAR, decodes capability registers, logs a one-line
+// summary, and returns `ProbeError::Other("ehci: not implemented")`
+// so the bus walker continues without binding.
+
+/// PCI base class for "Serial Bus Controllers" (USB lives here).
+const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
+/// PCI subclass under Serial Bus for "USB".
+const PCI_SUBCLASS_USB: u8 = 0x03;
+/// PCI prog-if for EHCI under USB (USB 2.0 host).
+const PCI_PROGIF_EHCI: u8 = 0x20;
+
+/// PCI BAR0 carries the EHCI MMIO window (Memory-BAR per §2.1).
+const EHCI_BAR_INDEX: u8 = 0;
+
+pub fn probe(
+    device: narf_bus::BusDevice,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    let class = ((device.id.class >> 16) & 0xFF) as u8;
+    let subclass = ((device.id.class >> 8) & 0xFF) as u8;
+    let prog_if = (device.id.class & 0xFF) as u8;
+    if class != PCI_CLASS_SERIAL_BUS
+        || subclass != PCI_SUBCLASS_USB
+        || prog_if != PCI_PROGIF_EHCI
+    {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    // Bring the controller's MMIO + bus-master enable bits up so the
+    // (future) live-driver path doesn't have to repeat this work.
+    // Stage-0 still maps the BAR + decodes the cap registers so a
+    // real-HW boot logs which EHCI silicon is present even when the
+    // live driver isn't wired up yet.
+    let _ = narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    );
+    // SAFETY: caller-authority. BAR0 is a 32- or 64-bit Memory BAR.
+    let mmio = match unsafe { narf_bus::map_bar(&device, EHCI_BAR_INDEX) } {
+        Ok(m) => m,
+        Err(_) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ehci: BAR{} map failed for {:04x}:{:04x}",
+                EHCI_BAR_INDEX, device.id.vendor, device.id.device
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+    };
+    let mut head = [0u8; 16];
+    let len = head.len().min(mmio.len as usize);
+    // SAFETY: BAR-backed MMIO region, exclusively claimed.
+    unsafe {
+        for (i, b) in head.iter_mut().take(len).enumerate() {
+            *b = mmio.read8(i as u64);
+        }
+    }
+    if let Some(regs) = CapabilityRegs::decode(&head) {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ehci: probed {:04x}:{:04x} v{:04x} n_ports={} cap_len={} (not implemented)",
+            device.id.vendor,
+            device.id.device,
+            regs.hci_version,
+            regs.hcs_params.n_ports(),
+            regs.cap_length,
+        );
+    } else {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ehci: probed {:04x}:{:04x} (capreg decode failed)",
+            device.id.vendor, device.id.device
+        );
+    }
+    Err(narf_bus::ProbeError::Other("ehci: not implemented"))
+}
+
+pub fn register_pci_driver() {
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "ehci-class",
+        kind: narf_bus::MatchKind::ClassFull {
+            class: PCI_CLASS_SERIAL_BUS,
+            subclass: PCI_SUBCLASS_USB,
+            prog_if: PCI_PROGIF_EHCI,
+        },
+        probe,
+    });
+}

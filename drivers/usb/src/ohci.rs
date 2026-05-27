@@ -423,3 +423,98 @@ pub fn hcca_interrupt_eds(blob: &[u8]) -> Option<Vec<u32>> {
     }
     Some(out)
 }
+
+// ── PCI bind glue ───────────────────────────────────────────────
+//
+// OHCI controllers identify on PCI as base class 0x0C (Serial Bus),
+// subclass 0x03 (USB), prog-if 0x10 (USB 1.1, OpenHCI). Renoir /
+// Phoenix laptops don't carry OHCI silicon (Intel chipsets used
+// UHCI for full-speed; AMD chipsets bridged to OHCI but their
+// Stage-3+ designs collapsed everything into xHCI). The probe
+// scaffolding lives here so a board with a discrete OHCI block (a
+// PCIe USB-1.1 expansion card, an ARM SoC integrating an OHCI
+// alongside an xHCI for the legacy companion role) still gets a
+// log line.
+//
+// Full bring-up — endpoint descriptor / transfer descriptor list
+// walking, HCCA programming, root-hub port reset — is intentionally
+// deferred. The probe maps the BAR, decodes HcRevision, logs, and
+// returns `ProbeError::Other("ohci: not implemented")`.
+
+/// PCI base class for "Serial Bus Controllers".
+const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
+/// PCI subclass under Serial Bus for "USB".
+const PCI_SUBCLASS_USB: u8 = 0x03;
+/// PCI prog-if for OHCI under USB.
+const PCI_PROGIF_OHCI: u8 = 0x10;
+
+/// OHCI MMIO lives in BAR0 (Memory BAR per §7.1 — "the host
+/// controller's operational registers are mapped into PCI
+/// memory space").
+const OHCI_BAR_INDEX: u8 = 0;
+
+pub fn probe(
+    device: narf_bus::BusDevice,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    let class = ((device.id.class >> 16) & 0xFF) as u8;
+    let subclass = ((device.id.class >> 8) & 0xFF) as u8;
+    let prog_if = (device.id.class & 0xFF) as u8;
+    if class != PCI_CLASS_SERIAL_BUS
+        || subclass != PCI_SUBCLASS_USB
+        || prog_if != PCI_PROGIF_OHCI
+    {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    let _ = narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    );
+    // SAFETY: caller-authority. BAR0 is the OHCI operational-
+    // register window.
+    let mmio = match unsafe { narf_bus::map_bar(&device, OHCI_BAR_INDEX) } {
+        Ok(m) => m,
+        Err(_) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ohci: BAR{} map failed for {:04x}:{:04x}",
+                OHCI_BAR_INDEX, device.id.vendor, device.id.device
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+    };
+    // HcRevision lives at register offset 0x00 — low 8 bits carry
+    // the BCD spec revision (§7.1.1, "Revision number of the HCI
+    // specification implemented by the HC"). 0x10 = OHCI 1.0a.
+    let revision = if mmio.len >= 4 {
+        // SAFETY: BAR-backed MMIO, 4 bytes in range.
+        unsafe { mmio.read32(0) }
+    } else {
+        0
+    };
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ohci: probed {:04x}:{:04x} HcRevision=0x{:02x} (not implemented)",
+        device.id.vendor,
+        device.id.device,
+        revision & 0xFF,
+    );
+    Err(narf_bus::ProbeError::Other("ohci: not implemented"))
+}
+
+pub fn register_pci_driver() {
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "ohci-class",
+        kind: narf_bus::MatchKind::ClassFull {
+            class: PCI_CLASS_SERIAL_BUS,
+            subclass: PCI_SUBCLASS_USB,
+            prog_if: PCI_PROGIF_OHCI,
+        },
+        probe,
+    });
+}
