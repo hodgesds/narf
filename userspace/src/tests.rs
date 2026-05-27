@@ -7,7 +7,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::AddressSpace;
 
 use crate::syscall::{
-    kernel_syscall_entry, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
 use crate::{
     install_address_space_lookup, install_core_syscalls, install_global,
@@ -81,7 +81,7 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     };
 
     // Syscall::Clone == 56; dispatch as the trap entry would.
-    kernel_syscall_entry(56, &mut ctx);
+    kernel_syscall_entry(Syscall::Clone.raw(), &mut ctx);
 
     let ret = match ctx.ret {
         Some(r) => r,
@@ -133,7 +133,7 @@ fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
             },
             ret: None,
         };
-        kernel_syscall_entry(56, &mut ctx);
+        kernel_syscall_entry(Syscall::Clone.raw(), &mut ctx);
         let r = match ctx.ret {
             Some(r) => r,
             None => return TestResult::Fail("no return set"),
@@ -185,15 +185,41 @@ kernel_test_in!("userspace", smoke_userspace_install_core_syscalls_fills_table);
 fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
     use crate::{Syscall, SyscallTable};
 
-    // Pinned numbers.
-    if Syscall::Submit.raw() != 100 || Syscall::Bootstrap.raw() != 101 {
-        return TestResult::Fail("syscall numbers drifted");
+    // Linux ABI numbering (per-arch).
+    //
+    // x86_64: numbers per `arch/x86/entry/syscalls/syscall_64.tbl`.
+    // aarch64: numbers per `include/uapi/asm-generic/unistd.h`.
+    // NARF extensions: 0x4000+ shared on every arch.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if Syscall::Read.raw() != 0 || Syscall::Write.raw() != 1 {
+            return TestResult::Fail("x86_64 read/write numbers drifted");
+        }
+        if Syscall::from_raw(0) != Some(Syscall::Read) {
+            return TestResult::Fail("from_raw(0) != Read");
+        }
+        if Syscall::from_raw(2) != Some(Syscall::OpenFile) {
+            return TestResult::Fail("from_raw(2) != OpenFile");
+        }
     }
-    if Syscall::from_raw(110) != Some(Syscall::OpenFile) {
-        return TestResult::Fail("from_raw(110) did not match OpenFile");
+    #[cfg(target_arch = "aarch64")]
+    {
+        if Syscall::Read.raw() != 63 || Syscall::Write.raw() != 64 {
+            return TestResult::Fail("aarch64 read/write numbers drifted");
+        }
+        if Syscall::from_raw(56) != Some(Syscall::Openat) {
+            return TestResult::Fail("from_raw(56) != Openat");
+        }
     }
-    if Syscall::from_raw(999).is_some() {
-        return TestResult::Fail("from_raw(999) should be None");
+    // NARF-only syscalls live in 0x4000+ regardless of arch.
+    if Syscall::Submit.raw() & 0xFF00 != 0x4000 {
+        return TestResult::Fail("Submit not in NARF range");
+    }
+    if Syscall::Bootstrap.raw() & 0xFF00 != 0x4000 {
+        return TestResult::Fail("Bootstrap not in NARF range");
+    }
+    if Syscall::from_raw(0xDEADBEEF).is_some() {
+        return TestResult::Fail("from_raw(0xDEADBEEF) should be None");
     }
 
     let mut t = SyscallTable::new();
@@ -7155,7 +7181,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
     };
-    kernel_syscall_entry(57, &mut ctx);
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
 
     let ret = match ctx.ret {
         Some(r) => r,
@@ -7322,7 +7348,7 @@ fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
     };
-    kernel_syscall_entry(57, &mut ctx);
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
 
     let ret = match ctx.ret {
         Some(r) => r,
@@ -7429,7 +7455,7 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
         ret: None,
         snapshot: parent_snapshot,
     };
-    kernel_syscall_entry(57, &mut ctx);
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
 
     let ret = match ctx.ret {
         Some(r) => r,
@@ -7536,7 +7562,7 @@ fn smoke_userspace_execve_rejects_short_elf() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     let r = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
@@ -7569,7 +7595,7 @@ fn smoke_userspace_execve_rejects_null_ptr() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     let r = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
@@ -7602,7 +7628,7 @@ fn smoke_userspace_execve_rejects_oversized_elf() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     let r = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
@@ -7644,7 +7670,7 @@ fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult 
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     let r = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
@@ -7700,7 +7726,7 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
             },
             ret: None,
         };
-        kernel_syscall_entry(56, &mut ctx);
+        kernel_syscall_entry(Syscall::Clone.raw(), &mut ctx);
         match ctx.ret {
             Some(r) if r.status == SyscallReturn::OK && r.value != 0 => Some(r.value),
             _ => None,
@@ -7768,7 +7794,7 @@ fn smoke_userspace_clone_rejects_without_address_space() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(56, &mut ctx);
+    kernel_syscall_entry(Syscall::Clone.raw(), &mut ctx);
     let ret = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
@@ -7839,7 +7865,7 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
     };
-    kernel_syscall_entry(57, &mut ctx);
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
     let child_tid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
@@ -7923,7 +7949,7 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
     };
-    kernel_syscall_entry(57, &mut ctx);
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
     let child_tid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
@@ -7969,7 +7995,7 @@ fn smoke_userspace_fork_multiple_distinct_address_spaces() -> TestResult {
             args: SyscallArgs::default(),
             ret: None,
         };
-        kernel_syscall_entry(57, &mut ctx);
+        kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
         match ctx.ret {
             Some(r) if r.status == SyscallReturn::OK && r.value != 0 => Some(r.value),
             _ => None,
@@ -8046,7 +8072,7 @@ fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     // Handler returns invalid_op without a polling user-task ctx,
     // but the load + comm publication runs before that bail-out.
 
@@ -8098,7 +8124,7 @@ fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
 
     let pid = FAKE_TID.load(Ordering::Relaxed);
     let recorded = crate::handlers::proc_argv_of(pid);
@@ -8145,7 +8171,7 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     let r = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
@@ -8185,7 +8211,7 @@ fn smoke_userspace_execve_rejects_oversized_argv_pack() -> TestResult {
         },
         ret: None,
     };
-    kernel_syscall_entry(179, &mut ctx);
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     let r = match ctx.ret {
         Some(r) => r,
         None => return TestResult::Fail("no return"),

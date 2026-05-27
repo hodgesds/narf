@@ -40,128 +40,301 @@ pub mod shmem;
 
 // ── Syscall numbers ────────────────────────────────────────────────
 //
-// Mirror of `narf_userspace::syscall::Syscall`. NARF reserves 100+
-// to avoid collisions with Linux conventions during dual-target
-// development with relibc. If the kernel-side enum gains numbers,
-// add them here too.
+// Per-arch Linux ABI numbering: x86_64 follows
+// `arch/x86/entry/syscalls/syscall_64.tbl`; aarch64 follows the
+// Generic ABI in `include/uapi/asm-generic/unistd.h`. NARF-only
+// syscalls (no Linux equivalent — ring submission, cap bootstrap,
+// FB/shmem handles, firmware install) share a single `0x4000+`
+// range on every arch. These mirror `narf_userspace::syscall::Syscall`
+// per-arch; the kernel side is the source of truth, this is the
+// no-dep user-side view.
 
-pub const SYS_SUBMIT: u64 = 100;
-pub const SYS_BOOTSTRAP: u64 = 101;
-pub const SYS_WAIT_COMPL: u64 = 102;
-pub const SYS_EXIT_TASK: u64 = 103;
-pub const SYS_YIELD: u64 = 104;
-pub const SYS_SLEEP: u64 = 105;
-pub const SYS_OPEN: u64 = 110;
-pub const SYS_READ: u64 = 111;
-pub const SYS_WRITE: u64 = 112;
-pub const SYS_CLOSE: u64 = 113;
-// Tier-2 fd-table breadth + path resolution + pipe (115..=117 reserved).
-pub const SYS_GETRANDOM: u64 = 200;
-pub const SYS_READLINK: u64 = 193;
-pub const SYS_SYMLINK: u64 = 194;
-pub const SYS_LISTDIR: u64 = 195;
-pub const SYS_GETDENTS64: u64 = 196;
-pub const SYS_STAT: u64 = 115;
-pub const SYS_LSTAT: u64 = 133;
-pub const SYS_FSTAT: u64 = 116;
-pub const SYS_PIPE: u64 = 117;
-pub const SYS_MMAP: u64 = 120;
-pub const SYS_MUNMAP: u64 = 121;
-pub const SYS_MPROTECT: u64 = 172;
-pub const SYS_MLOCK: u64 = 173;
-pub const SYS_MUNLOCK: u64 = 174;
-pub const SYS_EXECVE: u64 = 179;
-pub const SYS_WAIT4: u64 = 181;
-pub const SYS_MOUNT: u64 = 182;
-pub const SYS_UMOUNT2: u64 = 183;
-pub const SYS_STATFS: u64 = 184;
-pub const SYS_FSTATFS: u64 = 185;
-pub const SYS_UNSHARE: u64 = 186;
-pub const SYS_FB_CONNECT: u64 = 240;
-pub const SYS_FB_INFO: u64 = 241;
-pub const SYS_FB_RING_MAP: u64 = 242;
-pub const SYS_FB_FLUSH_WAIT: u64 = 243;
-pub const SYS_FB_DISCONNECT: u64 = 244;
-pub const SYS_SHMEM_CREATE: u64 = 250;
-pub const SYS_SHMEM_MAP: u64 = 251;
-pub const SYS_SHMEM_DESTROY: u64 = 252;
-pub const SYS_RING_KICK: u64 = 130;
-pub const SYS_GETPID: u64 = 140;
-pub const SYS_GETPPID: u64 = 141;
-pub const SYS_GETUID: u64 = 142;
-pub const SYS_GETGID: u64 = 143;
-pub const SYS_SETUID: u64 = 144;
-pub const SYS_SETGID: u64 = 145;
-pub const SYS_GETPGID: u64 = 224;
-pub const SYS_SETPGID: u64 = 225;
-pub const SYS_GETSID: u64 = 226;
-pub const SYS_SETSID: u64 = 227;
-pub const SYS_FTRUNCATE: u64 = 118;
-pub const SYS_TRUNCATE: u64 = 132;
-pub const SYS_PREAD64: u64 = 119;
-pub const SYS_PWRITE64: u64 = 122;
-pub const SYS_FSYNC: u64 = 123;
-pub const SYS_FDATASYNC: u64 = 124;
-pub const SYS_PIPE2: u64 = 125;
-pub const SYS_FALLOCATE: u64 = 126;
-pub const SYS_COPY_FILE_RANGE: u64 = 127;
-pub const SYS_MEMFD_CREATE: u64 = 128;
-pub const SYS_FCHMOD: u64 = 129;
-pub const SYS_FCHOWN: u64 = 131;
-pub const SYS_FCHMODAT: u64 = 134;
-pub const SYS_FCHOWNAT: u64 = 135;
-pub const SYS_FACCESSAT: u64 = 136;
-pub const SYS_OPENAT: u64 = 137;
-pub const SYS_NEWFSTATAT: u64 = 138;
-pub const SYS_UNLINKAT: u64 = 139;
-pub const SYS_MKDIRAT: u64 = 228;
-pub const SYS_RENAMEAT: u64 = 229;
-pub const SYS_SYMLINKAT: u64 = 230;
-pub const SYS_READLINKAT: u64 = 231;
-pub const SYS_ACCESS: u64 = 232;
-pub const SYS_CHMOD: u64 = 233;
-pub const SYS_CHOWN: u64 = 234;
-pub const SYS_GETHOSTNAME: u64 = 146;
-pub const SYS_SETHOSTNAME: u64 = 147;
-pub const SYS_GETRLIMIT: u64 = 148;
-pub const SYS_SETRLIMIT: u64 = 149;
-pub const SYS_PRLIMIT64: u64 = 178;
-pub const SYS_UMASK: u64 = 155;
-pub const SYS_GETPRIORITY: u64 = 156;
-pub const SYS_GETCPU: u64 = 165;
-pub const SYS_SCHED_GETAFFINITY: u64 = 166;
-pub const SYS_SCHED_SETAFFINITY: u64 = 167;
-pub const SYS_SCHED_GET_PRIORITY_MAX: u64 = 220;
-pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 221;
-pub const SYS_SCHED_GETPARAM: u64 = 222;
-pub const SYS_SCHED_SETPARAM: u64 = 223;
-pub const SYS_GETTID: u64 = 168;
-pub const SYS_PRCTL: u64 = 169;
-pub const SYS_TGKILL: u64 = 175;
-pub const SYS_FUTEX: u64 = 177;
-pub const SYS_SETPRIORITY: u64 = 157;
-pub const SYS_TIMES: u64 = 158;
-pub const SYS_GETRUSAGE: u64 = 159;
-pub const SYS_BRK: u64 = 150;
-pub const SYS_CLOCK_GETTIME: u64 = 151;
-pub const SYS_CLOCK_SETTIME: u64 = 176;
-pub const SYS_SIGACTION: u64 = 152;
-pub const SYS_KILL: u64 = 153;
-pub const SYS_SIGPROCMASK: u64 = 154;
-// Dup family + fcntl (160..=163 reserved).
-pub const SYS_DUP: u64 = 160;
-pub const SYS_DUP2: u64 = 161;
-pub const SYS_DUP3: u64 = 162;
-pub const SYS_FCNTL: u64 = 163;
-// Cwd state (170/171).
-pub const SYS_CHDIR: u64 = 170;
-pub const SYS_GETCWD: u64 = 171;
+// NARF-only extensions (shared across arches).
+pub const SYS_SUBMIT: u64 = 0x4000;
+pub const SYS_BOOTSTRAP: u64 = 0x4001;
+pub const SYS_WAIT_COMPL: u64 = 0x4002;
+pub const SYS_RING_KICK: u64 = 0x4003;
+pub const SYS_FB_CONNECT: u64 = 0x4010;
+pub const SYS_FB_INFO: u64 = 0x4011;
+pub const SYS_FB_RING_MAP: u64 = 0x4012;
+pub const SYS_FB_FLUSH_WAIT: u64 = 0x4013;
+pub const SYS_FB_DISCONNECT: u64 = 0x4014;
+pub const SYS_SHMEM_CREATE: u64 = 0x4020;
+pub const SYS_SHMEM_MAP: u64 = 0x4021;
+pub const SYS_SHMEM_DESTROY: u64 = 0x4022;
+pub const SYS_FIRMWARE_INSTALL: u64 = 0x4030;
+pub const SYS_SOCK_REGISTER_BUF: u64 = 0x4040;
+pub const SYS_SOCK_SEND_ZC: u64 = 0x4041;
+pub const SYS_TCGETATTR: u64 = 0x4050;
+pub const SYS_TCSETATTR: u64 = 0x4051;
+pub const SYS_GETHOSTNAME: u64 = 0x4052;
+pub const SYS_LISTDIR: u64 = 0x4053;
 
-pub const SYS_LSEEK: u64 = 164;
-pub const SYS_UNLINK: u64 = 180;
-pub const SYS_MKDIR: u64 = 190;
-pub const SYS_RMDIR: u64 = 191;
-pub const SYS_RENAME: u64 = 192;
+// ── x86_64 Linux ABI ─────────────────────────────────────────────
+#[cfg(target_arch = "x86_64")]
+mod arch_syscalls {
+    pub const SYS_READ: u64 = 0;
+    pub const SYS_WRITE: u64 = 1;
+    pub const SYS_OPEN: u64 = 2;
+    pub const SYS_CLOSE: u64 = 3;
+    pub const SYS_STAT: u64 = 4;
+    pub const SYS_FSTAT: u64 = 5;
+    pub const SYS_LSTAT: u64 = 6;
+    pub const SYS_POLL: u64 = 7;
+    pub const SYS_LSEEK: u64 = 8;
+    pub const SYS_MMAP: u64 = 9;
+    pub const SYS_MPROTECT: u64 = 10;
+    pub const SYS_MUNMAP: u64 = 11;
+    pub const SYS_BRK: u64 = 12;
+    pub const SYS_SIGACTION: u64 = 13;
+    pub const SYS_SIGPROCMASK: u64 = 14;
+    pub const SYS_SIGRETURN: u64 = 15;
+    pub const SYS_PREAD64: u64 = 17;
+    pub const SYS_PWRITE64: u64 = 18;
+    pub const SYS_ACCESS: u64 = 21;
+    pub const SYS_PIPE: u64 = 22;
+    pub const SYS_YIELD: u64 = 24;
+    pub const SYS_DUP: u64 = 32;
+    pub const SYS_DUP2: u64 = 33;
+    pub const SYS_SLEEP: u64 = 35;
+    pub const SYS_GETPID: u64 = 39;
+    pub const SYS_SOCKET: u64 = 41;
+    pub const SYS_CONNECT: u64 = 42;
+    pub const SYS_ACCEPT: u64 = 43;
+    pub const SYS_SOCKET_SEND: u64 = 44;
+    pub const SYS_SOCKET_RECV: u64 = 45;
+    pub const SYS_SHUTDOWN: u64 = 48;
+    pub const SYS_BIND: u64 = 49;
+    pub const SYS_LISTEN: u64 = 50;
+    pub const SYS_SETSOCKOPT: u64 = 54;
+    pub const SYS_GETSOCKOPT: u64 = 55;
+    pub const SYS_CLONE: u64 = 56;
+    pub const SYS_FORK: u64 = 57;
+    pub const SYS_EXECVE: u64 = 59;
+    pub const SYS_EXIT_TASK: u64 = 60;
+    pub const SYS_WAIT4: u64 = 61;
+    pub const SYS_KILL: u64 = 62;
+    pub const SYS_FCNTL: u64 = 72;
+    pub const SYS_FLOCK: u64 = 73;
+    pub const SYS_FSYNC: u64 = 74;
+    pub const SYS_FDATASYNC: u64 = 75;
+    pub const SYS_TRUNCATE: u64 = 76;
+    pub const SYS_FTRUNCATE: u64 = 77;
+    pub const SYS_GETCWD: u64 = 79;
+    pub const SYS_CHDIR: u64 = 80;
+    pub const SYS_RENAME: u64 = 82;
+    pub const SYS_MKDIR: u64 = 83;
+    pub const SYS_RMDIR: u64 = 84;
+    pub const SYS_UNLINK: u64 = 87;
+    pub const SYS_SYMLINK: u64 = 88;
+    pub const SYS_READLINK: u64 = 89;
+    pub const SYS_CHMOD: u64 = 90;
+    pub const SYS_FCHMOD: u64 = 91;
+    pub const SYS_CHOWN: u64 = 92;
+    pub const SYS_FCHOWN: u64 = 93;
+    pub const SYS_UMASK: u64 = 95;
+    pub const SYS_GETRLIMIT: u64 = 97;
+    pub const SYS_GETRUSAGE: u64 = 98;
+    pub const SYS_TIMES: u64 = 100;
+    pub const SYS_GETUID: u64 = 102;
+    pub const SYS_GETGID: u64 = 104;
+    pub const SYS_SETUID: u64 = 105;
+    pub const SYS_SETGID: u64 = 106;
+    pub const SYS_SETPGID: u64 = 109;
+    pub const SYS_GETPPID: u64 = 110;
+    pub const SYS_SETSID: u64 = 112;
+    pub const SYS_GETPGID: u64 = 121;
+    pub const SYS_GETSID: u64 = 124;
+    pub const SYS_RT_SIGPENDING: u64 = 127;
+    pub const SYS_RT_SIGTIMEDWAIT: u64 = 128;
+    pub const SYS_RT_SIGSUSPEND: u64 = 130;
+    pub const SYS_SIGALTSTACK: u64 = 131;
+    pub const SYS_STATFS: u64 = 137;
+    pub const SYS_FSTATFS: u64 = 138;
+    pub const SYS_GETPRIORITY: u64 = 140;
+    pub const SYS_SETPRIORITY: u64 = 141;
+    pub const SYS_SCHED_SETPARAM: u64 = 142;
+    pub const SYS_SCHED_GETPARAM: u64 = 143;
+    pub const SYS_SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 147;
+    pub const SYS_MLOCK: u64 = 149;
+    pub const SYS_MUNLOCK: u64 = 150;
+    pub const SYS_PRCTL: u64 = 157;
+    pub const SYS_SETRLIMIT: u64 = 160;
+    pub const SYS_MOUNT: u64 = 165;
+    pub const SYS_UMOUNT2: u64 = 166;
+    pub const SYS_SETHOSTNAME: u64 = 170;
+    pub const SYS_GETTID: u64 = 186;
+    pub const SYS_TKILL: u64 = 200;
+    pub const SYS_FUTEX: u64 = 202;
+    pub const SYS_SCHED_SETAFFINITY: u64 = 203;
+    pub const SYS_SCHED_GETAFFINITY: u64 = 204;
+    pub const SYS_EPOLL_CREATE: u64 = 213;
+    pub const SYS_GETDENTS64: u64 = 217;
+    pub const SYS_CLOCK_SETTIME: u64 = 227;
+    pub const SYS_CLOCK_GETTIME: u64 = 228;
+    pub const SYS_EPOLL_WAIT: u64 = 232;
+    pub const SYS_EPOLL_CTL: u64 = 233;
+    pub const SYS_TGKILL: u64 = 234;
+    pub const SYS_OPENAT: u64 = 257;
+    pub const SYS_MKDIRAT: u64 = 258;
+    pub const SYS_FCHOWNAT: u64 = 260;
+    pub const SYS_NEWFSTATAT: u64 = 262;
+    pub const SYS_UNLINKAT: u64 = 263;
+    pub const SYS_RENAMEAT: u64 = 264;
+    pub const SYS_SYMLINKAT: u64 = 266;
+    pub const SYS_READLINKAT: u64 = 267;
+    pub const SYS_FCHMODAT: u64 = 268;
+    pub const SYS_FACCESSAT: u64 = 269;
+    pub const SYS_UNSHARE: u64 = 272;
+    pub const SYS_SIGNALFD: u64 = 282;
+    pub const SYS_TIMERFD_CREATE: u64 = 283;
+    pub const SYS_EVENTFD: u64 = 284;
+    pub const SYS_FALLOCATE: u64 = 285;
+    pub const SYS_TIMERFD_SETTIME: u64 = 286;
+    pub const SYS_DUP3: u64 = 292;
+    pub const SYS_PIPE2: u64 = 293;
+    pub const SYS_PRLIMIT64: u64 = 302;
+    pub const SYS_GETCPU: u64 = 309;
+    pub const SYS_GETRANDOM: u64 = 318;
+    pub const SYS_MEMFD_CREATE: u64 = 319;
+    pub const SYS_COPY_FILE_RANGE: u64 = 326;
+}
+
+// ── aarch64 Generic-ABI ──────────────────────────────────────────
+#[cfg(target_arch = "aarch64")]
+mod arch_syscalls {
+    pub const SYS_GETCWD: u64 = 17;
+    pub const SYS_EVENTFD: u64 = 19;
+    pub const SYS_EPOLL_CREATE: u64 = 20;
+    pub const SYS_EPOLL_CTL: u64 = 21;
+    pub const SYS_EPOLL_WAIT: u64 = 22;
+    pub const SYS_DUP: u64 = 23;
+    pub const SYS_DUP3: u64 = 24;
+    pub const SYS_DUP2: u64 = 24;        // aarch64 has no separate dup2
+    pub const SYS_FCNTL: u64 = 25;
+    pub const SYS_FLOCK: u64 = 32;
+    pub const SYS_MKDIRAT: u64 = 34;
+    pub const SYS_UNLINKAT: u64 = 35;
+    pub const SYS_SYMLINKAT: u64 = 36;
+    pub const SYS_RENAMEAT: u64 = 38;
+    pub const SYS_UMOUNT2: u64 = 39;
+    pub const SYS_MOUNT: u64 = 40;
+    pub const SYS_STATFS: u64 = 43;
+    pub const SYS_FSTATFS: u64 = 44;
+    pub const SYS_FALLOCATE: u64 = 47;
+    pub const SYS_FACCESSAT: u64 = 48;
+    pub const SYS_CHDIR: u64 = 49;
+    pub const SYS_FCHMOD: u64 = 52;
+    pub const SYS_FCHMODAT: u64 = 53;
+    pub const SYS_FCHOWNAT: u64 = 54;
+    pub const SYS_FCHOWN: u64 = 55;
+    pub const SYS_OPENAT: u64 = 56;
+    pub const SYS_OPEN: u64 = 56;        // legacy open → openat
+    pub const SYS_CLOSE: u64 = 57;
+    pub const SYS_PIPE2: u64 = 59;
+    pub const SYS_PIPE: u64 = 59;        // legacy pipe → pipe2
+    pub const SYS_GETDENTS64: u64 = 61;
+    pub const SYS_LSEEK: u64 = 62;
+    pub const SYS_READ: u64 = 63;
+    pub const SYS_WRITE: u64 = 64;
+    pub const SYS_PREAD64: u64 = 67;
+    pub const SYS_PWRITE64: u64 = 68;
+    pub const SYS_POLL: u64 = 73;        // ppoll
+    pub const SYS_SIGNALFD: u64 = 74;
+    pub const SYS_READLINKAT: u64 = 78;
+    pub const SYS_NEWFSTATAT: u64 = 79;
+    pub const SYS_FSTAT: u64 = 80;
+    pub const SYS_STAT: u64 = 79;        // legacy stat → newfstatat
+    pub const SYS_LSTAT: u64 = 79;
+    pub const SYS_FSYNC: u64 = 82;
+    pub const SYS_FDATASYNC: u64 = 83;
+    pub const SYS_TIMERFD_CREATE: u64 = 85;
+    pub const SYS_TIMERFD_SETTIME: u64 = 86;
+    pub const SYS_EXIT_TASK: u64 = 93;
+    pub const SYS_UNSHARE: u64 = 97;
+    pub const SYS_FUTEX: u64 = 98;
+    pub const SYS_SLEEP: u64 = 101;
+    pub const SYS_CLOCK_SETTIME: u64 = 112;
+    pub const SYS_CLOCK_GETTIME: u64 = 113;
+    pub const SYS_SCHED_SETPARAM: u64 = 118;
+    pub const SYS_SCHED_GETPARAM: u64 = 121;
+    pub const SYS_SCHED_SETAFFINITY: u64 = 122;
+    pub const SYS_SCHED_GETAFFINITY: u64 = 123;
+    pub const SYS_YIELD: u64 = 124;
+    pub const SYS_SCHED_GET_PRIORITY_MAX: u64 = 125;
+    pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 126;
+    pub const SYS_KILL: u64 = 129;
+    pub const SYS_TKILL: u64 = 130;
+    pub const SYS_TGKILL: u64 = 131;
+    pub const SYS_SIGALTSTACK: u64 = 132;
+    pub const SYS_RT_SIGSUSPEND: u64 = 133;
+    pub const SYS_SIGACTION: u64 = 134;
+    pub const SYS_SIGPROCMASK: u64 = 135;
+    pub const SYS_RT_SIGPENDING: u64 = 136;
+    pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
+    pub const SYS_SIGRETURN: u64 = 139;
+    pub const SYS_SETPRIORITY: u64 = 140;
+    pub const SYS_GETPRIORITY: u64 = 141;
+    pub const SYS_SETGID: u64 = 144;
+    pub const SYS_SETUID: u64 = 146;
+    pub const SYS_TIMES: u64 = 153;
+    pub const SYS_SETPGID: u64 = 154;
+    pub const SYS_GETPGID: u64 = 155;
+    pub const SYS_GETSID: u64 = 156;
+    pub const SYS_SETSID: u64 = 157;
+    pub const SYS_SETHOSTNAME: u64 = 161;
+    pub const SYS_GETRLIMIT: u64 = 163;
+    pub const SYS_SETRLIMIT: u64 = 164;
+    pub const SYS_GETRUSAGE: u64 = 165;
+    pub const SYS_UMASK: u64 = 166;
+    pub const SYS_PRCTL: u64 = 167;
+    pub const SYS_GETCPU: u64 = 168;
+    pub const SYS_GETPID: u64 = 172;
+    pub const SYS_GETPPID: u64 = 173;
+    pub const SYS_GETUID: u64 = 174;
+    pub const SYS_GETGID: u64 = 176;
+    pub const SYS_GETTID: u64 = 178;
+    pub const SYS_SOCKET: u64 = 198;
+    pub const SYS_BIND: u64 = 200;
+    pub const SYS_LISTEN: u64 = 201;
+    pub const SYS_ACCEPT: u64 = 202;
+    pub const SYS_CONNECT: u64 = 203;
+    pub const SYS_SOCKET_SEND: u64 = 206;
+    pub const SYS_SOCKET_RECV: u64 = 207;
+    pub const SYS_SETSOCKOPT: u64 = 208;
+    pub const SYS_GETSOCKOPT: u64 = 209;
+    pub const SYS_SHUTDOWN: u64 = 210;
+    pub const SYS_BRK: u64 = 214;
+    pub const SYS_MUNMAP: u64 = 215;
+    pub const SYS_CLONE: u64 = 220;
+    pub const SYS_FORK: u64 = 220;       // aarch64 has no separate fork
+    pub const SYS_EXECVE: u64 = 221;
+    pub const SYS_MMAP: u64 = 222;
+    pub const SYS_MPROTECT: u64 = 226;
+    pub const SYS_MLOCK: u64 = 228;
+    pub const SYS_MUNLOCK: u64 = 229;
+    pub const SYS_WAIT4: u64 = 260;
+    pub const SYS_PRLIMIT64: u64 = 261;
+    pub const SYS_GETRANDOM: u64 = 278;
+    pub const SYS_MEMFD_CREATE: u64 = 279;
+    pub const SYS_COPY_FILE_RANGE: u64 = 285;
+    pub const SYS_ACCESS: u64 = 48;      // aarch64: legacy access → faccessat
+    pub const SYS_UNLINK: u64 = 35;      // legacy unlink → unlinkat
+    pub const SYS_RENAME: u64 = 38;      // legacy rename → renameat
+    pub const SYS_MKDIR: u64 = 34;       // legacy mkdir → mkdirat
+    pub const SYS_RMDIR: u64 = 35;       // legacy rmdir → unlinkat (with AT_REMOVEDIR)
+    pub const SYS_SYMLINK: u64 = 36;     // legacy symlink → symlinkat
+    pub const SYS_READLINK: u64 = 78;    // legacy readlink → readlinkat
+    pub const SYS_CHMOD: u64 = 53;       // legacy chmod → fchmodat
+    pub const SYS_CHOWN: u64 = 54;       // legacy chown → fchownat
+    pub const SYS_TRUNCATE: u64 = 45;    // aarch64 has truncate at 45
+    pub const SYS_FTRUNCATE: u64 = 46;
+}
+
+// Re-export per-arch numbers so the rest of this crate can refer
+// to them by the generic name.
+pub use arch_syscalls::*;
 
 /// `fcntl` command constants — match Linux numbering for the subset
 /// NARF supports today (FD_CLOEXEC + the file-flag query/set pair).
@@ -735,7 +908,7 @@ pub fn futex_wake(uaddr: u64, n: u32) -> i64 {
 /// builds on this; raw `clone(2)` is the kernel-level escape hatch.
 #[inline]
 pub fn clone(entry: u64, stack_top: u64, arg: u64, fs_base: u64) -> Result<u64, ()> {
-    // SAFETY: SYS_CLONE = 56; signature (entry, stack, arg, fs).
+    // SAFETY: signature (entry, stack, arg, fs).
     let r = unsafe { syscall4(SYS_CLONE, entry, stack_top, arg, fs_base) };
     if r == !0u64 || r == ((-1i64) as u64) {
         Err(())
@@ -743,8 +916,6 @@ pub fn clone(entry: u64, stack_top: u64, arg: u64, fs_base: u64) -> Result<u64, 
         Ok(r)
     }
 }
-
-pub const SYS_CLONE: u64 = 56;
 
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Linux futex(2).
 /// Stage-4 NARF honours only FUTEX_WAIT (0) and FUTEX_WAKE (1)
@@ -1360,28 +1531,12 @@ pub unsafe fn syscall3_raw(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     unsafe { syscall3(num, a0, a1, a2) }
 }
 
-pub const SYS_SIGRETURN: u64 = 187;
-
-pub const SYS_SOCKET: u64 = 197;
-pub const SYS_BIND: u64 = 198;
-pub const SYS_LISTEN: u64 = 199;
-pub const SYS_ACCEPT: u64 = 201;
-pub const SYS_CONNECT: u64 = 202;
-pub const SYS_SOCKET_SEND: u64 = 203;
-pub const SYS_SOCKET_RECV: u64 = 204;
-pub const SYS_SHUTDOWN: u64 = 205;
-pub const SYS_GETSOCKOPT: u64 = 206;
-pub const SYS_SETSOCKOPT: u64 = 207;
-pub const SYS_SOCK_REGISTER_BUF: u64 = 208;
-pub const SYS_SOCK_SEND_ZC: u64 = 209;
-pub const SYS_POLL: u64 = 210;
-pub const SYS_EPOLL_CREATE: u64 = 211;
-pub const SYS_EPOLL_CTL: u64 = 212;
-pub const SYS_EPOLL_WAIT: u64 = 213;
-pub const SYS_EVENTFD: u64 = 214;
-pub const SYS_TIMERFD_CREATE: u64 = 215;
-pub const SYS_TIMERFD_SETTIME: u64 = 216;
-pub const SYS_SIGNALFD: u64 = 217;
+// SYS_SOCKET, SYS_BIND, SYS_LISTEN, SYS_ACCEPT, SYS_CONNECT,
+// SYS_SOCKET_SEND, SYS_SOCKET_RECV, SYS_SHUTDOWN, SYS_GETSOCKOPT,
+// SYS_SETSOCKOPT, SYS_POLL, SYS_EPOLL_*, SYS_EVENTFD, SYS_TIMERFD_*,
+// SYS_SIGNALFD, SYS_SIGRETURN are defined per-arch in `arch_syscalls`
+// (re-exported above). SYS_SOCK_REGISTER_BUF / SYS_SOCK_SEND_ZC are
+// in the NARF-extension shared block.
 
 /// `poll(pollfds, n, timeout_ms)`. Returns the number of fds with
 /// ready events, 0 on timeout, -1 on error.
