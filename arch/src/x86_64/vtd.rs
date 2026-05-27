@@ -522,3 +522,55 @@ pub unsafe fn write_rtaddr(reg_base: usize, paddr: u64) {
         w64(reg_base, VTD_RTADDR, paddr);
     }
 }
+
+/// Enable translation (`GCMD.TE`). Must be paired with a prior
+/// `SRTP` (Set-Root-Table-Pointer) flip and a wait for `GSTS.RTPS`
+/// before flipping `TE`. The caller is responsible for that
+/// sequencing — Linux's `iommu_enable` walks it.
+///
+/// # Safety
+/// `reg_base` is the engine's MMIO mapping.
+pub unsafe fn enable_translation(reg_base: usize) {
+    // SAFETY: caller-asserted.
+    let gsts = unsafe { read_gsts(reg_base) };
+    unsafe {
+        write_gcmd(reg_base, gsts | GCMD_TE);
+    }
+}
+
+/// Set the root-table base + arm SRTP, then return without waiting
+/// for `GSTS.RTPS`. Caller polls separately.
+///
+/// # Safety
+/// See [`enable_translation`]. `root_phys` must be a 4 KiB-aligned
+/// physical address pointing at a 256-entry root table.
+pub unsafe fn set_root_table(reg_base: usize, root_phys: u64) {
+    // SAFETY: caller-asserted.
+    unsafe {
+        write_rtaddr(reg_base, root_phys);
+        let gsts = read_gsts(reg_base);
+        write_gcmd(reg_base, gsts | GCMD_SRTP);
+    }
+}
+
+/// Push a 128-bit QI descriptor at the given tail offset in an
+/// in-RAM invalidation queue. Returns the new tail offset (caller
+/// writes it into `MMIO[IQT]`).
+///
+/// # Safety
+/// `queue_virt` is the kernel-mapped virtual address of the
+/// invalidation queue (same buffer whose phys is in the IQA
+/// register). `tail` must be in-range.
+pub unsafe fn push_qi_desc(
+    queue_virt: *mut QiDesc,
+    tail: u32,
+    desc: QiDesc,
+    queue_bytes: u32,
+) -> u32 {
+    let slot_idx = (tail / 16) as usize;
+    // SAFETY: caller-asserted.
+    unsafe {
+        write_volatile(queue_virt.add(slot_idx), desc);
+    }
+    (tail + 16) & (queue_bytes - 1)
+}

@@ -3327,3 +3327,62 @@ fn smoke_vtd_irte_remap_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/vtd", smoke_vtd_irte_remap_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_push_command_to_ram_ring() -> TestResult {
+    // Exercise push_command against a host-RAM-backed ring (no
+    // MMIO) and confirm the entry lands at slot 0, tail advances
+    // to 16, and a second push lands at slot 1.
+    use crate::x86_64::amd_vi::{push_command, IommuCmd};
+    let mut ring: [IommuCmd; 4] = [IommuCmd::default(); 4]; // 64 B
+    let bytes: u32 = 64;
+    let cmd_a = IommuCmd::invalidate_devtab(0xABCD);
+    let cmd_b = IommuCmd::invalidate_all();
+    // SAFETY: ring is host-owned RAM in this test.
+    let mut tail = unsafe { push_command(ring.as_mut_ptr(), 0, cmd_a, bytes) };
+    if tail != 16 {
+        return TestResult::Fail("tail did not advance to 16");
+    }
+    if ring[0] != cmd_a {
+        return TestResult::Fail("slot 0 didn't get cmd_a");
+    }
+    // SAFETY: same.
+    tail = unsafe { push_command(ring.as_mut_ptr(), tail, cmd_b, bytes) };
+    if tail != 32 {
+        return TestResult::Fail("tail did not advance to 32");
+    }
+    if ring[1] != cmd_b {
+        return TestResult::Fail("slot 1 didn't get cmd_b");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_push_command_to_ram_ring);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_push_qi_desc_to_ram_queue() -> TestResult {
+    use crate::x86_64::vtd::{push_qi_desc, QiDesc, QI_GRAN_GLOBAL};
+    let mut queue: [QiDesc; 4] = [QiDesc::default(); 4];
+    let bytes: u32 = 64;
+    let desc = QiDesc::cc_inv(QI_GRAN_GLOBAL, 0, 0);
+    // SAFETY: queue is host-owned RAM in this test.
+    let tail = unsafe { push_qi_desc(queue.as_mut_ptr(), 0, desc, bytes) };
+    if tail != 16 {
+        return TestResult::Fail("tail did not advance to 16");
+    }
+    if queue[0] != desc {
+        return TestResult::Fail("slot 0 didn't get desc");
+    }
+    // Wrap: push 3 more, the 4th should land back at slot 0.
+    // SAFETY: same.
+    let mut t = tail;
+    for _ in 0..3 {
+        t = unsafe { push_qi_desc(queue.as_mut_ptr(), t, desc, bytes) };
+    }
+    if t != 0 {
+        return TestResult::Fail("tail did not wrap to 0 after 4 pushes");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_push_qi_desc_to_ram_queue);

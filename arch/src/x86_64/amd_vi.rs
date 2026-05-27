@@ -557,3 +557,69 @@ pub unsafe fn write_ctrl(reg_base: usize, value: u64) {
         w64(reg_base, AMD_VI_CTRL, value);
     }
 }
+
+/// Program `MMIO[DEV_TAB_BASE]`. `phys` is the physical address of
+/// the device table (page-aligned, 32 B/entry, 256 KiB total for
+/// the standard 8K-BDF table), `bytes` is the total table size.
+///
+/// # Safety
+/// `reg_base` is the AMD-Vi engine's MMIO mapping; the table at
+/// `phys` must be allocated, page-aligned, and have lifetime that
+/// outlives the IOMMU's use of it.
+pub unsafe fn program_dev_table_base(reg_base: usize, phys: u64, bytes: u64) {
+    let value = encode_dev_table_base(phys, bytes);
+    // SAFETY: caller-asserted.
+    unsafe {
+        w64(reg_base, AMD_VI_DEV_TAB_BASE, value);
+    }
+}
+
+/// Program `MMIO[CMD_BUF_BASE]` with a 512-entry (8 KiB) ring at
+/// `phys`. The size field is fixed at `0x9` matching Linux.
+///
+/// # Safety
+/// See [`program_dev_table_base`].
+pub unsafe fn program_cmd_buf_base(reg_base: usize, phys: u64) {
+    let value = encode_cmd_buf_base(phys);
+    // SAFETY: caller-asserted.
+    unsafe {
+        w64(reg_base, AMD_VI_CMD_BUF_BASE, value);
+    }
+}
+
+/// Program `MMIO[EVT_LOG_BASE]` with a 512-entry (8 KiB) event
+/// log at `phys`.
+///
+/// # Safety
+/// See [`program_dev_table_base`].
+pub unsafe fn program_evt_log_base(reg_base: usize, phys: u64) {
+    let value = encode_evt_log_base(phys);
+    // SAFETY: caller-asserted.
+    unsafe {
+        w64(reg_base, AMD_VI_EVT_LOG_BASE, value);
+    }
+}
+
+/// Push a single command onto the in-RAM command ring at offset
+/// `tail`. Returns the new tail offset. The caller is responsible
+/// for writing `tail` back into `MMIO[CMD_TAIL]` to hand the
+/// command to hardware. `ring_bytes` should be 8192 for the
+/// standard 512-entry ring.
+///
+/// # Safety
+/// `ring_virt` must point at the kernel-mapped virtual address of
+/// the command buffer (the same buffer whose phys was given to
+/// `program_cmd_buf_base`). `tail` must be in-range.
+pub unsafe fn push_command(
+    ring_virt: *mut IommuCmd,
+    tail: u32,
+    cmd: IommuCmd,
+    ring_bytes: u32,
+) -> u32 {
+    let slot_idx = (tail / 16) as usize;
+    // SAFETY: caller-asserted.
+    unsafe {
+        write_volatile(ring_virt.add(slot_idx), cmd);
+    }
+    advance_ring_tail(tail, 1, ring_bytes)
+}
