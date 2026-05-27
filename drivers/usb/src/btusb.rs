@@ -349,9 +349,30 @@ impl HciTransport for UsbHciTransport {
     }
 
     fn recv_acl(&self) -> Result<Option<Vec<u8>>, TransportError> {
-        // Stage 0 has no ACL data plane; Stage 1+ wires bulk-IN.
-        Ok(None)
+        // Stage 2: pull an ACL packet from the bulk-IN endpoint.
+        // Uses block_on(bulk_in) — only call from a non-executor
+        // kernel thread (ACL pump task). Ref: btusb_bulk_in() in
+        // drivers/bluetooth/btusb.c.
+        let xhci = self.xhci()?;
+        let mut buf = [0u8; 1024];
+        match narf_scheduler::block_on(xhci.bulk_in(self.slot_id, self.acl_in_dci, &mut buf)) {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(buf[..n].to_vec())),
+            Err(_) => Ok(None),
+        }
     }
+
+    fn send_sco(&self, data: &[u8]) -> Result<(), TransportError> {
+        // SCO/eSCO: fall back to bulk-OUT until dedicated isoch
+        // endpoint tracking lands (Stage 3+).
+        let xhci = self.xhci()?;
+        narf_scheduler::block_on(xhci.bulk_out(self.slot_id, self.acl_out_dci, data))
+            .map_err(|_| TransportError::Transient)?;
+        Ok(())
+    }
+
+    // recv_sco uses the default no-op implementation — dedicated isoch
+    // IN endpoint tracking is a Stage 3+ concern.
 
     fn name(&self) -> &'static str {
         "usb"
