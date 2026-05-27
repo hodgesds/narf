@@ -2657,14 +2657,17 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
         })
         .ok();
 
-    // Hand-assembled user program (21 bytes):
-    //   mov rax, 105           ; Syscall::Sleep.raw()
-    //   movabs rdi, 0xBADC0FFEE0DDF00D
-    //   int 0x80
-    //   jmp $
+    // Hand-assembled user program:
+    //   mov rax, <Sleep.raw()>      ; 7 bytes (REX.W + C7 C0 + imm32)
+    //   movabs rdi, 0xBADC0FFEE0DDF00D ; 10 bytes (REX.W + BF + imm64)
+    //   int 0x80                    ; 2 bytes
+    //   jmp $                       ; 2 bytes
+    let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code_bytes: [u8; 21] = [
-        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00, 0x48, 0xBF, 0x0D, 0xF0, 0xDD, 0xE0, 0xFE, 0x0F,
-        0xDC, 0xBA, 0xCD, 0x80, 0xEB, 0xFE,
+        0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3],
+        0x48, 0xBF, 0x0D, 0xF0, 0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA,
+        0xCD, 0x80,
+        0xEB, 0xFE,
     ];
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -2884,17 +2887,19 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         })
         .ok();
 
-    // Hand-assembled user program (40 bytes):
-    //   mov rax, 104           ; Syscall::Yield
+    // Hand-assembled user program:
+    //   mov rax, <Yield.raw()> ; Syscall::Yield
     //   int 0x80               ; (yield — kernel saves state, resumes)
-    //   mov rax, 105           ; Syscall::Sleep
+    //   mov rax, <Sleep.raw()> ; Syscall::Sleep
     //   movabs rdi, 0xCAFEBABEDEADBEEF
     //   int 0x80               ; (handler captures magic + longjmps)
     //   jmp $
+    let yield_n = Syscall::Yield.raw().to_le_bytes();
+    let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code_bytes: [u8; 30] = [
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104
+        0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
         0xCD, 0x80, // int 0x80
-        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00, // mov rax, 105
+        0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], // mov rax, Sleep
         0x48, 0xBF, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE,
         0xCA, // movabs rdi, 0xCAFEBABEDEADBEEF
         0xCD, 0x80, // int 0x80
@@ -2939,7 +2944,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         clear_current_user_task, install_current_user_task, install_exit_hook, install_global,
-        install_yield_hook, syscall::__test_clear_global, SyscallTable, UserTaskCtx,
+        install_yield_hook, syscall::__test_clear_global, Syscall, SyscallTable, UserTaskCtx,
         EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
     };
 
@@ -3030,10 +3035,12 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
             phys: alloc::vec![stack_frame],
         })
         .ok();
+    let yield_n = Syscall::Yield.raw().to_le_bytes();
+    let exit_n = Syscall::ExitTask.raw().to_le_bytes();
     let code_bytes: [u8; 20] = [
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104 (Yield)
+        0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
         0xCD, 0x80, // int 0x80
-        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00, // mov rax, 103 (ExitTask)
+        0x48, 0xC7, 0xC0, exit_n[0], exit_n[1], exit_n[2], exit_n[3], // mov rax, ExitTask
         0xCD, 0x80, // int 0x80
         0xEB, 0xFE, // jmp $
     ];
@@ -3124,7 +3131,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_core_syscalls, install_global, install_user_task_hooks,
-        syscall::__test_clear_global, SyscallTable, UserProcess, UserTaskFuture,
+        syscall::__test_clear_global, Syscall, SyscallTable, UserProcess, UserTaskFuture,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
@@ -3181,10 +3188,12 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         .ok();
     // mov rax, 104 ; int 0x80 ; mov rax, 103 ; int 0x80 ; jmp $
     // First int 0x80 goes Yielded → re-poll → second int 0x80 Exited.
+    let yield_n = Syscall::Yield.raw().to_le_bytes();
+    let exit_n = Syscall::ExitTask.raw().to_le_bytes();
     let code_bytes: [u8; 20] = [
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104 (Yield)
+        0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
         0xCD, 0x80, // int 0x80
-        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00, // mov rax, 103 (ExitTask)
+        0x48, 0xC7, 0xC0, exit_n[0], exit_n[1], exit_n[2], exit_n[3], // mov rax, ExitTask
         0xCD, 0x80, // int 0x80
         0xEB, 0xFE, // jmp $
     ];
@@ -3491,18 +3500,20 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     // FS-segment-override prefix is `0x64` (Intel SDM Vol. 2A §2.1.1
     // — `0x65` is GS, easy to mis-paste). Hand-assembled:
     //   64 48 8B 3C 25 00 00 00 00   mov rdi, qword ptr fs:[0]
-    //   48 C7 C0 68 00 00 00          mov rax, 104              ; Syscall::Yield
+    //   48 C7 C0 <Yield>            mov rax, Syscall::Yield.raw()
     //   CD 80                         int 0x80
     //   64 48 8B 3C 25 E0 FF FF FF    mov rdi, qword ptr fs:[-32]
-    //   48 C7 C0 69 00 00 00          mov rax, 105              ; Syscall::Sleep
+    //   48 C7 C0 <Sleep>            mov rax, Syscall::Sleep.raw()
     //   CD 80                         int 0x80
     //   EB FE                         jmp $
+    let yield_n = Syscall::Yield.raw().to_le_bytes();
+    let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code: [u8; 38] = [
         0x64, 0x48, 0x8B, 0x3C, 0x25, 0x00, 0x00, 0x00, 0x00, // mov rdi, fs:[0]
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104
+        0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
         0xCD, 0x80, // int 0x80
         0x64, 0x48, 0x8B, 0x3C, 0x25, 0xE0, 0xFF, 0xFF, 0xFF, // mov rdi, fs:[-32]
-        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00, // mov rax, 105
+        0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], // mov rax, Sleep
         0xCD, 0x80, // int 0x80
         0xEB, 0xFE, // jmp $ (unreached)
     ];
