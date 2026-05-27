@@ -3087,6 +3087,62 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new misc-utility C-ABI probes ────────────────────────────
+    //
+    // atoll, strtoll, strtoull, strtod, strtof.
+    let atoll_ok = unsafe {
+        narf_libc::atoll(b"-9876543210\0".as_ptr() as *const i8) == -9876543210
+    };
+    narf_libc::printf_str(
+        if atoll_ok { "atoll: ok\n" } else { "atoll: bad\n" },
+        &[],
+    );
+
+    let strtoll_ok = unsafe {
+        let mut end: *mut i8 = core::ptr::null_mut();
+        let v = narf_libc::strtoll(
+            b"100abc\0".as_ptr() as *const i8,
+            &mut end as *mut _,
+            10,
+        );
+        v == 100 && !end.is_null() && *end == b'a' as i8
+    };
+    narf_libc::printf_str(
+        if strtoll_ok { "strtoll: ok\n" } else { "strtoll: bad\n" },
+        &[],
+    );
+
+    let strtoull_ok = unsafe {
+        let v = narf_libc::strtoull(
+            b"0xff\0".as_ptr() as *const i8,
+            core::ptr::null_mut(),
+            0,
+        );
+        v == 0xff
+    };
+    narf_libc::printf_str(
+        if strtoull_ok { "strtoull: ok\n" } else { "strtoull: bad\n" },
+        &[],
+    );
+
+    let strtod_ok = unsafe {
+        let v = narf_libc::strtod(b"3.14e2\0".as_ptr() as *const i8, core::ptr::null_mut());
+        v > 313.99 && v < 314.01
+    };
+    narf_libc::printf_str(
+        if strtod_ok { "strtod: ok\n" } else { "strtod: bad\n" },
+        &[],
+    );
+
+    let strtof_ok = unsafe {
+        let v = narf_libc::strtof(b"-1.5\0".as_ptr() as *const i8, core::ptr::null_mut());
+        v > -1.51 && v < -1.49
+    };
+    narf_libc::printf_str(
+        if strtof_ok { "strtof: ok\n" } else { "strtof: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

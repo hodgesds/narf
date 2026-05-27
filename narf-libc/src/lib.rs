@@ -243,8 +243,9 @@ pub use socket_extra::{
     MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, SCM_CREDENTIALS, SCM_RIGHTS,
 };
 pub use stdlib::{
-    abs, atoi, atol, bsearch, div, div_t, labs, ldiv, ldiv_t, qsort, rand, srand,
-    sscanf_ints, strtol, strtoul, RAND_MAX,
+    abs, atoi, atol, atoll, bsearch, div, div_t, labs, ldiv, ldiv_t, qsort,
+    rand, srand, sscanf_ints, strtod, strtof, strtol, strtoll, strtoul,
+    strtoull, RAND_MAX,
 };
 pub use time::{
     asctime, clock, clock_getres, clock_gettime, clock_nanosleep, clock_settime,

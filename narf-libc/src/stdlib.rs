@@ -228,6 +228,143 @@ pub unsafe extern "C" fn atol(nptr: *const c_char) -> c_long {
     unsafe { strtol(nptr, core::ptr::null_mut(), 10) }
 }
 
+/// `atoll(*const char)` — `strtoll(s, NULL, 10)`. C99 `long long`
+/// form. On a 64-bit target this aliases [`atol`] result-wise.
+///
+/// # Safety
+/// See [`strtol`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atoll(nptr: *const c_char) -> i64 {
+    // SAFETY: caller contract.
+    unsafe { strtol(nptr, core::ptr::null_mut(), 10) }
+}
+
+/// `strtoll(nptr, endptr, base)` — C99 `long long` parse. Aliases
+/// [`strtol`] under the 64-bit `c_long`.
+///
+/// # Safety
+/// See [`strtol`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtoll(
+    nptr:   *const c_char,
+    endptr: *mut *mut c_char,
+    base:   c_int,
+) -> i64 {
+    // SAFETY: forwarded.
+    unsafe { strtol(nptr, endptr, base) }
+}
+
+/// `strtoull(nptr, endptr, base)` — C99 `unsigned long long` parse.
+/// Aliases [`strtoul`] under the 64-bit `c_ulong`.
+///
+/// # Safety
+/// See [`strtoul`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtoull(
+    nptr:   *const c_char,
+    endptr: *mut *mut c_char,
+    base:   c_int,
+) -> u64 {
+    // SAFETY: forwarded.
+    unsafe { strtoul(nptr, endptr, base) }
+}
+
+/// Minimal `strtod(nptr, endptr)` — parse a leading decimal float.
+/// Honours optional sign, integer part, fractional part, and a
+/// `[eE][+-]?digits` exponent. No hex-float, no INF / NAN tokens
+/// (a real implementation lives in `core::str::FromStr<f64>` but
+/// we can't `unwrap` a `&str` cleanly across a raw pointer without
+/// re-validating UTF-8).
+///
+/// Reference: musl `src/stdlib/strtod.c` — full musl form parses
+/// hex floats and special tokens too; this is the subset NARF
+/// consumers reach for.
+///
+/// # Safety
+/// `nptr` must be a valid NUL-terminated C string. `endptr`, when
+/// non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtod(
+    nptr:   *const c_char,
+    endptr: *mut *mut c_char,
+) -> f64 {
+    if nptr.is_null() { return 0.0; }
+    // SAFETY: caller contract — walk bytes until invalid.
+    let mut p = nptr as *const u8;
+    // Skip whitespace.
+    unsafe {
+        while *p != 0 && matches!(*p, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            p = p.add(1);
+        }
+    }
+    // Sign.
+    let sign: f64 = match unsafe { *p } {
+        b'+' => { unsafe { p = p.add(1); } 1.0 }
+        b'-' => { unsafe { p = p.add(1); } -1.0 }
+        _ => 1.0,
+    };
+    let mut value = 0.0f64;
+    let mut any = false;
+    // Integer part.
+    unsafe {
+        while *p >= b'0' && *p <= b'9' {
+            value = value * 10.0 + (*p - b'0') as f64;
+            p = p.add(1);
+            any = true;
+        }
+        // Fractional part.
+        if *p == b'.' {
+            p = p.add(1);
+            let mut scale = 0.1f64;
+            while *p >= b'0' && *p <= b'9' {
+                value += (*p - b'0') as f64 * scale;
+                scale *= 0.1;
+                p = p.add(1);
+                any = true;
+            }
+        }
+        // Exponent.
+        if any && (*p == b'e' || *p == b'E') {
+            p = p.add(1);
+            let esign: i32 = match *p {
+                b'+' => { p = p.add(1); 1 }
+                b'-' => { p = p.add(1); -1 }
+                _ => 1,
+            };
+            let mut exp_val = 0i32;
+            while *p >= b'0' && *p <= b'9' {
+                exp_val = exp_val.saturating_mul(10).saturating_add((*p - b'0') as i32);
+                p = p.add(1);
+            }
+            let exp_val = esign * exp_val;
+            let mut mult = 1.0f64;
+            let abs_e = exp_val.unsigned_abs();
+            for _ in 0..abs_e { mult *= 10.0; }
+            if exp_val < 0 { value /= mult; } else { value *= mult; }
+        }
+    }
+    if !endptr.is_null() {
+        // SAFETY: caller-asserted writable.
+        unsafe { *endptr = p as *mut c_char; }
+    }
+    if !any { return 0.0; }
+    sign * value
+}
+
+/// `strtof(nptr, endptr)` — C99 `float` form. Forwards to
+/// [`strtod`] and narrows.
+///
+/// # Safety
+/// See [`strtod`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtof(
+    nptr:   *const c_char,
+    endptr: *mut *mut c_char,
+) -> f32 {
+    // SAFETY: forwarded.
+    unsafe { strtod(nptr, endptr) as f32 }
+}
+
 /// C-shaped comparator: `int (*cmp)(const void *a, const void *b)`.
 pub type cmp_fn = unsafe extern "C" fn(*const c_void, *const c_void) -> c_int;
 
