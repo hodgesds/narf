@@ -132,9 +132,11 @@ fn on_irq12_safe() {
 fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
     let mut overrides = [narf_acpi::IsaOverride::default(); narf_acpi::MAX_ISA_OVERRIDES];
     let n = narf_acpi::copy_isa_overrides(&mut overrides);
-    let (gsi, flags) = overrides[..n]
+    let matched_override = overrides[..n]
         .iter()
         .find(|ov| ov.bus == 0 && ov.source == isa_irq)
+        .copied();
+    let (gsi, flags) = matched_override
         .map(|ov| {
             // ACPI 6.5 §5.2.12.5 flag decode (bus default for
             // ISA = active-high edge).
@@ -152,6 +154,21 @@ fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
             isa_irq as u32,
             narf_acpi::ioapic::POLARITY_HIGH | narf_acpi::ioapic::TRIGGER_EDGE,
         ));
+    // Surface the ISA override + final GSI/flags so a missed
+    // override (or a wrong-polarity / wrong-trigger default) shows
+    // up in dmesg. Critical for diagnosing "init=ok irqN=routed
+    // but IRQ never fires" — the routing might be writing a bit
+    // pattern the chipset rejects.
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  isa-irq: ISA{} → GSI{} flags=POL{} TRIG{} (override={})",
+        isa_irq,
+        gsi,
+        if flags & narf_acpi::ioapic::POLARITY_LOW != 0 { "LOW" } else { "HIGH" },
+        if flags & narf_acpi::ioapic::TRIGGER_LEVEL != 0 { "LEVEL" } else { "EDGE" },
+        if matched_override.is_some() { "MADT" } else { "default" },
+    );
     let v = match narf_interrupts::vector::alloc() {
         Ok(v) => v,
         Err(_) => return false,
