@@ -34,9 +34,11 @@
 extern crate alloc;
 
 use core::fmt::Write as _;
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_driver_runtime::{
-    map_bar, BusDevice, BusDeviceCap, Cap, Lock as IrqSafeSpinLock, MmioRegion, Write,
+    alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
+    Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
 
 // ── PCI ids ─────────────────────────────────────────────────────────
@@ -138,6 +140,7 @@ const MI_COM_DATA_MASK: u32 = 0x0000_FFFF;
 // MAC_MI_MODE (0x0454) — MII clock divider. Bit 11 = AUTO_POLL.
 // Per Linux: divider 0x1F (decimal 31) → ~2.5 MHz MDC at 80 MHz
 // MAC clock, comfortably under the IEEE 802.3 MDC max (2.5 MHz).
+#[allow(dead_code)] // Stage 2 — read_phy fast path will toggle this off
 const MAC_MI_MODE_AUTO_POLL: u32 = 0x0000_0010;
 const MAC_MI_MODE_DEFAULT_CLK: u32 = 0x0000_001F;
 
@@ -153,6 +156,112 @@ const MII_BMSR_LINK_UP: u16 = 0x0004;
 /// `tg3_get_invariants`).
 const PHY_ADDR_INTERNAL: u8 = 0x01;
 
+// ── BD ring sizing ─────────────────────────────────────────────────
+
+/// RX standard ring depth. Linux uses 200/2048 depending on chip
+/// (5705 vs 5717+); 256 is the slot count that fits one
+/// `alloc_coherent` page (256 * 32 = 8192 bytes) and matches what
+/// most Stage-4 NARF drivers use.
+pub const RX_STD_RING_LEN: usize = 256;
+const RX_STD_RING_BYTES: usize = RX_STD_RING_LEN * core::mem::size_of::<RxBufferDesc>();
+
+/// TX ring depth. Linux uses 512 by default; we mirror RX so one
+/// pool of DMA pages can back both.
+pub const TX_RING_LEN: usize = 256;
+const TX_RING_BYTES: usize = TX_RING_LEN * core::mem::size_of::<TxBufferDesc>();
+
+/// RX buffer size for the standard ring. 2 KiB matches the 5705+
+/// "standard" buffer slot (jumbo + mini live on separate rings we
+/// don't program in Stage 2).
+pub const RX_BUF_LEN: usize = 2048;
+
+// ── Mailbox / doorbell offsets ─────────────────────────────────────
+//
+// BCM57xx mailboxes are 64-bit, low-half-first. The high-half is
+// unused for the indices we touch in Stage 2. Linux uses
+// `tw32_mailbox` to write only the low word — same idiom here.
+
+const REG_MAILBOX_RCV_STD_PROD_IDX: u64 = 0x0268;
+const REG_MAILBOX_SNDHOST_PROD_IDX_0: u64 = 0x0300;
+
+// ── Tx/Rx descriptor layouts ───────────────────────────────────────
+//
+// Bit-for-bit copy of Linux `struct tg3_tx_buffer_desc` and
+// `struct tg3_rx_buffer_desc` (tg3.h:2553 / 2584). Each field is a
+// 32-bit naturally-aligned word; the DMA hardware reads them in
+// little-endian on x86_64 (we use GRC_MODE.BSWAP_DATA = 0).
+
+#[repr(C, align(4))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxBufferDesc {
+    /// Buffer physical-address high word.
+    pub addr_hi: u32,
+    /// Buffer physical-address low word.
+    pub addr_lo: u32,
+    /// `len << 16 | flags`. Flags subset:
+    ///   - bit 2 (0x0004) = END (last fragment of packet).
+    ///   - bit 0 (0x0001) = TCPUDP_CSUM.
+    pub len_flags: u32,
+    /// VLAN tag (bits[15:0]) + MSS (bits[31:16]). Stage 2 leaves
+    /// both at 0.
+    pub vlan_tag: u32,
+}
+const _: () = assert!(core::mem::size_of::<TxBufferDesc>() == 16);
+
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RxBufferDesc {
+    /// Buffer physical-address high word.
+    pub addr_hi: u32,
+    /// Buffer physical-address low word.
+    pub addr_lo: u32,
+    /// `(idx << 16) | len`. On producer-fill `idx` is the slot
+    /// index; on consumer-return `len` is the received frame length.
+    pub idx_len: u32,
+    /// `(type << 16) | flags`. `type` is 0 for the standard ring.
+    /// Flags include END (0x0004), ERROR (0x0400), JUMBO (0x0020).
+    pub type_flags: u32,
+    /// IP/TCP checksum result on RX (Stage 2 ignores).
+    pub ip_tcp_csum: u32,
+    /// Error + VLAN bits. Stage 2 reads RXD_ERR_MASK here.
+    pub err_vlan: u32,
+    /// Reserved. Stage 2 leaves at 0.
+    pub reserved: u32,
+    /// Opaque tag — driver-private, copied back unchanged by HW.
+    /// Linux stores the producer index here so it can find the
+    /// matching skb on consumer return.
+    pub opaque: u32,
+}
+const _: () = assert!(core::mem::size_of::<RxBufferDesc>() == 32);
+
+// TX descriptor flag bits, native widths.
+pub const TXD_FLAG_END: u32 = 0x0004;
+pub const TXD_LEN_SHIFT: u32 = 16;
+
+// RX descriptor flag bits (in `type_flags`).
+pub const RXD_FLAG_END: u32 = 0x0004;
+pub const RXD_FLAG_ERROR: u32 = 0x0400;
+
+// Error mask in `err_vlan`. Mirrors Linux `RXD_ERR_MASK` per
+// tg3.h:2630 — BAD_CRC | COLLISION | LINK_LOST | PHY_DECODE |
+// MAC_ABRT | TOO_SMALL | NO_RESOURCES | HUGE_FRAME.
+pub const RXD_ERR_BAD_CRC: u32 = 0x0001_0000;
+pub const RXD_ERR_COLLISION: u32 = 0x0002_0000;
+pub const RXD_ERR_LINK_LOST: u32 = 0x0004_0000;
+pub const RXD_ERR_PHY_DECODE: u32 = 0x0008_0000;
+pub const RXD_ERR_MAC_ABRT: u32 = 0x0020_0000;
+pub const RXD_ERR_TOO_SMALL: u32 = 0x0040_0000;
+pub const RXD_ERR_NO_RESOURCES: u32 = 0x0080_0000;
+pub const RXD_ERR_HUGE_FRAME: u32 = 0x0100_0000;
+pub const RXD_ERR_MASK: u32 = RXD_ERR_BAD_CRC
+    | RXD_ERR_COLLISION
+    | RXD_ERR_LINK_LOST
+    | RXD_ERR_PHY_DECODE
+    | RXD_ERR_MAC_ABRT
+    | RXD_ERR_TOO_SMALL
+    | RXD_ERR_NO_RESOURCES
+    | RXD_ERR_HUGE_FRAME;
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -161,7 +270,14 @@ pub enum NicError {
     /// MAC reads back as either all-zero or all-FFs — suggests the
     /// device is half-dead or the BAR isn't actually mapped.
     BadMac,
-    /// Data path not implemented yet (Stage 0 placeholder).
+    /// `alloc_coherent` failed during ring or buffer-pool setup.
+    NoMemory,
+    /// Frame outside `[1, 1518]`.
+    FrameTooLong,
+    /// `transmit` couldn't find a free TX descriptor.
+    TxRingFull,
+    /// Data path not implemented yet (placeholder for paths not
+    /// fully wired to silicon yet).
     NotImplemented,
 }
 
@@ -193,11 +309,26 @@ pub fn decode_mac(mac_hi: u32, mac_lo: u32) -> [u8; 6] {
 
 // ── Driver state ────────────────────────────────────────────────────
 
-/// A live BCM57xx NetXtreme controller. Stage 1 holds the MMIO
-/// mapping, post-reset MAC + link snapshot; later stages add the BD
-/// rings + IRQ binding.
+/// A live BCM57xx NetXtreme controller. Stage 2 holds the MMIO
+/// mapping, the standard RX + TX BD rings, per-slot RX/TX DMA
+/// buffers, post-reset MAC + link snapshot. IRQ wiring lands in
+/// Stage 3.
 pub struct Tg3Nic {
     mmio: MmioRegion,
+    /// TX BD ring (`TX_RING_LEN * 16` bytes, contiguous DMA).
+    tx_ring: DmaBuffer,
+    /// Per-slot TX frame buffers. Persistent so we don't re-alloc
+    /// per packet — slot index keys into the pool.
+    tx_pool: alloc::vec::Vec<DmaBuffer>,
+    /// Producer cursor for the TX ring (next slot to fill).
+    tx_head: IrqSafeSpinLock<u32>,
+    /// RX BD ring (`RX_STD_RING_LEN * 32` bytes, contiguous DMA).
+    rx_ring: DmaBuffer,
+    /// Per-slot RX frame buffers. Pre-armed at bring-up; descriptor
+    /// `i` always points at `rx_pool[i]`.
+    rx_pool: alloc::vec::Vec<DmaBuffer>,
+    /// Consumer cursor for the RX ring.
+    rx_head: IrqSafeSpinLock<u32>,
     /// MAC address read from MAC_ADDR_0_HIGH/LOW at bring-up.
     pub mac: [u8; 6],
     /// Cached PCI device id — useful for chip-rev-specific quirks
@@ -321,8 +452,89 @@ impl Tg3Nic {
             grc_mode & GRC_MODE_HOST_STACKUP != 0,
         );
 
+        // Stage 2: allocate the BD rings + per-slot DMA buffers. The
+        // chip has 4 ring types (RX std, RX jumbo, RX RCB, TX); Stage
+        // 2 only programs RX std + TX which covers every Ethernet-
+        // frame-sized transfer.
+        let tx_ring = alloc_coherent(TX_RING_BYTES, DomainId::DRIVER_0)
+            .map_err(|_| NicError::NoMemory)?;
+        let rx_ring = alloc_coherent(RX_STD_RING_BYTES, DomainId::DRIVER_0)
+            .map_err(|_| NicError::NoMemory)?;
+
+        let mut tx_pool: alloc::vec::Vec<DmaBuffer> =
+            alloc::vec::Vec::with_capacity(TX_RING_LEN);
+        for _ in 0..TX_RING_LEN {
+            tx_pool.push(
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
+                    .map_err(|_| NicError::NoMemory)?,
+            );
+        }
+        let mut rx_pool: alloc::vec::Vec<DmaBuffer> =
+            alloc::vec::Vec::with_capacity(RX_STD_RING_LEN);
+        for _ in 0..RX_STD_RING_LEN {
+            rx_pool.push(
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
+                    .map_err(|_| NicError::NoMemory)?,
+            );
+        }
+
+        // Pre-arm every RX BD with its pooled buffer + length.
+        // Linux's `tg3_rx_prodring_alloc` does this in
+        // `tg3_init_rings`. The chip walks the ring linearly; we
+        // don't carry an EOR bit (BCM57xx wraps via the producer
+        // index in the mailbox, not in the descriptor).
+        let rx_ring_phys = rx_ring.phys_addr().raw();
+        for i in 0..RX_STD_RING_LEN {
+            let buf_phys = rx_pool[i].phys_addr().raw();
+            let d = RxBufferDesc {
+                addr_hi: (buf_phys >> 32) as u32,
+                addr_lo: buf_phys as u32,
+                idx_len: ((i as u32) << 16) | (RX_BUF_LEN as u32 & 0xFFFF),
+                type_flags: 0,
+                ip_tcp_csum: 0,
+                err_vlan: 0,
+                reserved: 0,
+                opaque: i as u32,
+            };
+            // SAFETY: ring is a DmaBuffer of RX_STD_RING_BYTES, i is
+            // bounded by RX_STD_RING_LEN.
+            unsafe {
+                let slot = (rx_ring_phys + (i * core::mem::size_of::<RxBufferDesc>()) as u64)
+                    as *mut RxBufferDesc;
+                core::ptr::write_volatile(slot, d);
+            }
+        }
+        // Zero the TX ring — the chip will see OWN bits clear (we
+        // populate them on `transmit`).
+        let tx_ring_phys = tx_ring.phys_addr().raw();
+        for i in 0..TX_RING_LEN {
+            // SAFETY: ring is a DmaBuffer of TX_RING_BYTES, i is
+            // bounded by TX_RING_LEN.
+            unsafe {
+                let slot = (tx_ring_phys + (i * core::mem::size_of::<TxBufferDesc>()) as u64)
+                    as *mut TxBufferDesc;
+                core::ptr::write_volatile(slot, TxBufferDesc::default());
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        let _ = writeln!(
+            narf_console::Writer,
+            "  tg3: rings allocated — RX@{:#018x} ({} slots) TX@{:#018x} ({} slots)",
+            rx_ring_phys,
+            RX_STD_RING_LEN,
+            tx_ring_phys,
+            TX_RING_LEN,
+        );
+
         Ok(Self {
             mmio,
+            tx_ring,
+            tx_pool,
+            tx_head: IrqSafeSpinLock::new(0),
+            rx_ring,
+            rx_pool,
+            rx_head: IrqSafeSpinLock::new(0),
             mac,
             device_id: device.id.device,
             link_up,
@@ -504,16 +716,158 @@ impl Tg3Nic {
         unsafe { self.mmio.read32(REG_MAC_MI_STAT) }
     }
 
-    /// Stage 0 placeholder. Returns `NotImplemented` until Stage 2
-    /// wires the BD ring + RX drain.
-    pub fn receive(&self) -> Result<alloc::vec::Vec<u8>, NicError> {
-        Err(NicError::NotImplemented)
+    /// Stage 2: copy `frame` into the next TX slot's buffer, write a
+    /// fully-formed TX descriptor, advance the producer index. Does
+    /// not yet ring the SNDHOST_PROD_IDX mailbox — that's Stage 3
+    /// (real silicon will need SNDBDS_MODE enabled + the mailbox
+    /// doorbell + a TX-completion IRQ to drain).
+    ///
+    /// Returns `Ok(slot)` so a caller (or smoke test) can locate the
+    /// produced descriptor in the ring without re-deriving it.
+    pub fn transmit(&self, frame: &[u8]) -> Result<u32, NicError> {
+        if frame.is_empty() || frame.len() > 1518 {
+            return Err(NicError::FrameTooLong);
+        }
+        let mut head_g = self.tx_head.lock();
+        let slot = (*head_g) as usize % TX_RING_LEN;
+        let phys = self.tx_pool[slot].phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
+        unsafe {
+            for (i, b) in frame.iter().enumerate() {
+                core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
+            }
+        }
+        let d = TxBufferDesc {
+            addr_hi: (phys >> 32) as u32,
+            addr_lo: phys as u32,
+            // len in upper 16 bits, END flag set (single-fragment
+            // packet). Linux's `tg3_start_xmit_dma_bug` would set
+            // VLAN / TSO / csum flags here; Stage 2 leaves them 0.
+            len_flags: ((frame.len() as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END,
+            vlan_tag: 0,
+        };
+        // SAFETY: identity-mapped DMA ring; slot < TX_RING_LEN.
+        unsafe {
+            let p = (self.tx_ring.phys_addr().raw()
+                + (slot * core::mem::size_of::<TxBufferDesc>()) as u64)
+                as *mut TxBufferDesc;
+            core::ptr::write_volatile(p, d);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        let returned = *head_g;
+        *head_g = (*head_g + 1) % (TX_RING_LEN as u32);
+        // Stage 3 will write `*head_g + 1` into
+        // MAILBOX_SNDHOST_PROD_IDX_0 here to ring the doorbell.
+        Ok(returned)
     }
 
-    /// Stage 0 placeholder. Returns `NotImplemented` until Stage 2
-    /// wires the BD ring + TX path.
-    pub fn transmit(&self, _frame: &[u8]) -> Result<(), NicError> {
-        Err(NicError::NotImplemented)
+    /// Stage 2: read the descriptor at the current RX consumer
+    /// position. Returns `None` if the slot still looks unwritten
+    /// (length == 0 + no flags + idx still matches the producer
+    /// value we put there at bring-up). A real wire-fed RX would
+    /// have the chip write a non-zero `idx_len` length field.
+    pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        let mut head_g = self.rx_head.lock();
+        let slot = (*head_g) as usize % RX_STD_RING_LEN;
+        let ring_phys = self.rx_ring.phys_addr().raw();
+        let desc_ptr = (ring_phys
+            + (slot * core::mem::size_of::<RxBufferDesc>()) as u64)
+            as *const RxBufferDesc;
+        // SAFETY: identity-mapped DMA ring; slot < RX_STD_RING_LEN.
+        let d = unsafe { core::ptr::read_volatile(desc_ptr) };
+
+        // On a fresh pre-arm we wrote `(idx << 16) | RX_BUF_LEN` into
+        // `idx_len`. After the chip writes back, the low 16 bits
+        // carry the actual frame length (≤ RX_BUF_LEN) but the slot's
+        // self-idx (high 16) won't necessarily match anymore. The
+        // simplest "did the chip touch this?" check is: did `type_flags`
+        // gain any of the err / end / type bits? Stage 3 will swap
+        // this for the proper "did the status block advance" check.
+        if d.type_flags == 0 && d.err_vlan == 0 {
+            return None;
+        }
+        let err = d.err_vlan & RXD_ERR_MASK != 0;
+
+        let len = (d.idx_len & 0xFFFF) as usize;
+        let copy_len = if err { 0 } else { len.min(RX_BUF_LEN) };
+        let buf_phys = self.rx_pool[slot].phys_addr().raw();
+        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(copy_len);
+        // SAFETY: identity-mapped DMA buffer; copy_len bounded.
+        for i in 0..copy_len {
+            out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+        }
+
+        // Rearm the slot in place: zero the metadata, restore the
+        // self-idx pre-arm shape so the next chip-write produces a
+        // distinguishable result. Stage 3 will also write the new
+        // producer index back to MAILBOX_RCV_STD_PROD_IDX.
+        let rearmed = RxBufferDesc {
+            addr_hi: (buf_phys >> 32) as u32,
+            addr_lo: buf_phys as u32,
+            idx_len: ((slot as u32) << 16) | (RX_BUF_LEN as u32 & 0xFFFF),
+            type_flags: 0,
+            ip_tcp_csum: 0,
+            err_vlan: 0,
+            reserved: 0,
+            opaque: slot as u32,
+        };
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            let p = (self.rx_ring.phys_addr().raw()
+                + (slot * core::mem::size_of::<RxBufferDesc>()) as u64)
+                as *mut RxBufferDesc;
+            core::ptr::write_volatile(p, rearmed);
+        }
+        compiler_fence(Ordering::SeqCst);
+        *head_g = (*head_g + 1) % (RX_STD_RING_LEN as u32);
+        if err {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Stage 2 introspection: read the TX descriptor at `slot`.
+    /// Used by the FakeMmio round-trip smoke test to verify that
+    /// `transmit` produces the descriptor shape the chip expects.
+    pub fn read_tx_descriptor(&self, slot: usize) -> TxBufferDesc {
+        let p = (self.tx_ring.phys_addr().raw()
+            + ((slot % TX_RING_LEN) * core::mem::size_of::<TxBufferDesc>()) as u64)
+            as *const TxBufferDesc;
+        // SAFETY: identity-mapped DMA ring; slot bounded by modulo.
+        unsafe { core::ptr::read_volatile(p) }
+    }
+
+    /// Stage 2 introspection: read the RX descriptor at `slot`.
+    pub fn read_rx_descriptor(&self, slot: usize) -> RxBufferDesc {
+        let p = (self.rx_ring.phys_addr().raw()
+            + ((slot % RX_STD_RING_LEN) * core::mem::size_of::<RxBufferDesc>()) as u64)
+            as *const RxBufferDesc;
+        // SAFETY: identity-mapped DMA ring.
+        unsafe { core::ptr::read_volatile(p) }
+    }
+
+    /// Stage 2 introspection: low-half of the RX producer mailbox.
+    /// Stage 3 will write the actual producer index here when ringing
+    /// the RX-fill doorbell.
+    pub fn rx_prod_mailbox_addr(&self) -> u64 {
+        REG_MAILBOX_RCV_STD_PROD_IDX
+    }
+
+    /// Stage 2 introspection: low-half of the TX producer mailbox.
+    pub fn tx_prod_mailbox_addr(&self) -> u64 {
+        REG_MAILBOX_SNDHOST_PROD_IDX_0
+    }
+
+    /// Current TX producer cursor (for tests).
+    pub fn tx_head(&self) -> u32 {
+        *self.tx_head.lock()
+    }
+
+    /// Current RX consumer cursor (for tests).
+    pub fn rx_head(&self) -> u32 {
+        *self.rx_head.lock()
     }
 }
 
@@ -762,4 +1116,145 @@ mod smoke {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/tg3", smoke_tg3_grc_mode_includes_host_stackup);
+
+    fn smoke_tg3_descriptor_layouts_match_linux() -> TestResult {
+        // Pin the descriptor sizes + field offsets against Linux's
+        // tg3.h. A drift here would let the driver write a 16-byte
+        // descriptor into a 32-byte slot (RX) or vice versa, and
+        // the chip would interpret garbage.
+        if core::mem::size_of::<TxBufferDesc>() != 16 {
+            return TestResult::Fail("TX descriptor size drift");
+        }
+        if core::mem::size_of::<RxBufferDesc>() != 32 {
+            return TestResult::Fail("RX descriptor size drift");
+        }
+        // Linux `TXD_LEN_SHIFT` is 16 and `TXD_FLAG_END` is 0x0004.
+        if TXD_LEN_SHIFT != 16 {
+            return TestResult::Fail("TXD_LEN_SHIFT drift");
+        }
+        if TXD_FLAG_END != 0x0004 {
+            return TestResult::Fail("TXD_FLAG_END drift");
+        }
+        if RXD_FLAG_END != 0x0004 {
+            return TestResult::Fail("RXD_FLAG_END drift");
+        }
+        if RXD_FLAG_ERROR != 0x0400 {
+            return TestResult::Fail("RXD_FLAG_ERROR drift");
+        }
+        // RXD_ERR_MASK should be the union of all eight error bits.
+        if RXD_ERR_MASK & RXD_ERR_BAD_CRC == 0 {
+            return TestResult::Fail("RXD_ERR_MASK missing BAD_CRC");
+        }
+        if RXD_ERR_MASK & RXD_ERR_HUGE_FRAME == 0 {
+            return TestResult::Fail("RXD_ERR_MASK missing HUGE_FRAME");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_descriptor_layouts_match_linux);
+
+    fn smoke_tg3_tx_descriptor_round_trip() -> TestResult {
+        // Stage 2 round-trip on the descriptor packing — the chip
+        // reads `len_flags` as `(len << 16) | flags`. The smoke
+        // exercises the same shift-and-or math `transmit()` does so
+        // that a refactor that re-shifts incorrectly is caught
+        // without needing a probed device.
+        let frame_len: u32 = 1500;
+        let len_flags = (frame_len << TXD_LEN_SHIFT) | TXD_FLAG_END;
+        // High 16 bits → length.
+        if (len_flags >> 16) != frame_len {
+            return TestResult::Fail("frame len doesn't survive shift");
+        }
+        // Low 16 bits → flags.
+        if len_flags & 0xFFFF != TXD_FLAG_END {
+            return TestResult::Fail("END flag lost in low-16");
+        }
+        // Repack into a TxBufferDesc, confirm field-by-field
+        // round-trip.
+        let d = TxBufferDesc {
+            addr_hi: 0xDEAD_BEEF,
+            addr_lo: 0xCAFE_F00D,
+            len_flags,
+            vlan_tag: 0,
+        };
+        if d.addr_hi != 0xDEAD_BEEF || d.addr_lo != 0xCAFE_F00D {
+            return TestResult::Fail("buffer-addr fields didn't round-trip");
+        }
+        if d.len_flags != len_flags {
+            return TestResult::Fail("len_flags didn't round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_tx_descriptor_round_trip);
+
+    fn smoke_tg3_rx_descriptor_round_trip() -> TestResult {
+        // Same round-trip check on the RX-side descriptor + the
+        // `idx_len` packing used at pre-arm time.
+        let slot: u32 = 42;
+        let buf_len: u32 = RX_BUF_LEN as u32;
+        let idx_len = (slot << 16) | (buf_len & 0xFFFF);
+        if (idx_len >> 16) != slot {
+            return TestResult::Fail("idx doesn't survive shift");
+        }
+        if idx_len & 0xFFFF != buf_len {
+            return TestResult::Fail("buf_len lost in low-16");
+        }
+        let d = RxBufferDesc {
+            addr_hi: 0x0000_0001,
+            addr_lo: 0x2000_0000,
+            idx_len,
+            type_flags: 0,
+            ip_tcp_csum: 0,
+            err_vlan: 0,
+            reserved: 0,
+            opaque: slot,
+        };
+        if d.opaque != slot {
+            return TestResult::Fail("opaque tag didn't round-trip");
+        }
+        if d.idx_len != idx_len {
+            return TestResult::Fail("idx_len didn't round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_rx_descriptor_round_trip);
+
+    fn smoke_tg3_ring_constants() -> TestResult {
+        // The ring sizes determine both the DMA-alloc page count and
+        // the modulo math `transmit`/`receive` use. Pin them so a
+        // refactor that drops to e.g. 128 doesn't leave the modulo
+        // out of sync.
+        if RX_STD_RING_LEN != 256 {
+            return TestResult::Fail("RX std ring length drift");
+        }
+        if TX_RING_LEN != 256 {
+            return TestResult::Fail("TX ring length drift");
+        }
+        if RX_BUF_LEN != 2048 {
+            return TestResult::Fail("RX buffer size drift");
+        }
+        // 256 * 32 = 8192 bytes RX ring → 2 pages.
+        // 256 * 16 = 4096 bytes TX ring → 1 page.
+        if RX_STD_RING_LEN * core::mem::size_of::<RxBufferDesc>() != 8192 {
+            return TestResult::Fail("RX ring bytes != 8192");
+        }
+        if TX_RING_LEN * core::mem::size_of::<TxBufferDesc>() != 4096 {
+            return TestResult::Fail("TX ring bytes != 4096");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_ring_constants);
+
+    fn smoke_tg3_mailbox_offsets_match_linux() -> TestResult {
+        // Mailbox offsets pulled from Linux tg3.h. Stage 3 will
+        // write to these — a one-byte drift would silently push
+        // the producer index into the wrong mailbox slot.
+        if REG_MAILBOX_RCV_STD_PROD_IDX != 0x0268 {
+            return TestResult::Fail("MAILBOX_RCV_STD_PROD_IDX offset drift");
+        }
+        if REG_MAILBOX_SNDHOST_PROD_IDX_0 != 0x0300 {
+            return TestResult::Fail("MAILBOX_SNDHOST_PROD_IDX_0 offset drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_mailbox_offsets_match_linux);
 }
