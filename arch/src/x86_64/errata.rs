@@ -21,6 +21,12 @@ pub struct Errata {
     pub model_hi: u16,
     pub stepping_mask: u32,
     pub apply: unsafe fn(),
+    /// Microcode revision at which the silicon bug is fixed by
+    /// vendor patch. `apply_for_current_cpu` suppresses the
+    /// workaround when `microcode::applied_revision() >= patched_in`.
+    /// Set to `0` for errata that aren't fixed by microcode (the
+    /// gate then never triggers — workaround always runs).
+    pub patched_in: u32,
 }
 
 unsafe fn nop_workaround() { /* marker-only entry */
@@ -133,6 +139,10 @@ pub const TABLE: &[Errata] = &[
         model_hi: 0x55, // Skylake-X / SKL-SP
         stepping_mask: 0xFFFF_FFFF,
         apply: intel_disable_tsx_rtm,
+        // TSX-async-abort fix landed in SKL-SP microcode rev
+        // 0x2006a08 (Intel SA-00270); below that we still mask
+        // RTM via the workaround.
+        patched_in: 0x0200_6A08,
     },
     Errata {
         name: "amd-zen1-1474",
@@ -142,6 +152,9 @@ pub const TABLE: &[Errata] = &[
         model_hi: 0x2F,
         stepping_mask: 0xFFFF_FFFF,
         apply: amd_de_cfg_bit9,
+        // No AMD microcode fix for erratum 1474 — DE_CFG[9] is the
+        // permanent workaround. Keep gate off so it always runs.
+        patched_in: 0,
     },
     // Zen 2 (Family 0x17, Models 0x30-0xAF — Rome / Renoir /
     // Matisse). Zenbleed (CVE-2023-20593): same DE_CFG[9] bit
@@ -154,6 +167,9 @@ pub const TABLE: &[Errata] = &[
         model_hi: 0xAF,
         stepping_mask: 0xFFFF_FFFF,
         apply: amd_de_cfg_bit9,
+        // AMD-SB-7008: microcode 0x0830107A (Zen2 client) fully
+        // mitigates Zenbleed; chicken-bit only needed below that.
+        patched_in: 0x0830_107A,
     },
     // Zen 4 (Family 0x19, Models 0x60-0x7F — Phoenix / Phoenix2
     // / Ryzen 7040 / 8000 series APUs). Erratum 1485:
@@ -167,6 +183,9 @@ pub const TABLE: &[Errata] = &[
         model_hi: 0x7F,
         stepping_mask: 0xFFFF_FFFF,
         apply: amd_zen4_erratum_1485,
+        // Erratum 1485 has no published microcode fix — the
+        // DE_CFG[14] chicken bit is the documented workaround.
+        patched_in: 0,
     },
     // Zen 5 (Family 0x1A — Granite Ridge / Strix Point / Turin).
     // Detection marker only; populates the apply log so a Zen 5
@@ -180,6 +199,7 @@ pub const TABLE: &[Errata] = &[
         model_hi: 0xFF,
         stepping_mask: 0xFFFF_FFFF,
         apply: amd_zen5_detection_marker,
+        patched_in: 0,
     },
     Errata {
         name: "marker-noop",
@@ -189,6 +209,7 @@ pub const TABLE: &[Errata] = &[
         model_hi: 0xFFFF,
         stepping_mask: 0,
         apply: nop_workaround,
+        patched_in: 0,
     },
 ];
 
@@ -202,11 +223,19 @@ pub fn table() -> &'static [Errata] {
 /// alloc into this module. Idempotent — safe to call once per
 /// AP.
 ///
+/// Suppresses workarounds whose `patched_in` revision has already
+/// been applied through the microcode loader — `apply_for_current_cpu`
+/// should be called AFTER the microcode load so the gate reflects
+/// the running patch level. When called before microcode load
+/// (or on a CPU where the loader couldn't apply), every workaround
+/// runs unconditionally.
+///
 /// # Safety
 /// CPL = 0; the per-entry `apply` functions are themselves safe
 /// to call (they gate on CPUID).
 pub unsafe fn apply_for_current_cpu() -> ([&'static str; 8], usize) {
     let me = ident::read();
+    let ucode_rev = crate::x86_64::microcode::applied_revision();
     let mut out: [&'static str; 8] = [""; 8];
     let mut n = 0usize;
     for e in TABLE {
@@ -222,9 +251,43 @@ pub unsafe fn apply_for_current_cpu() -> ([&'static str; 8], usize) {
         if e.stepping_mask & (1u32 << me.stepping) == 0 {
             continue;
         }
+        // Microcode-fixed: vendor patch covers this silicon bug at
+        // the running revision; skip the workaround.
+        if e.patched_in != 0 && ucode_rev >= e.patched_in {
+            continue;
+        }
         // SAFETY: caller-asserted; per-entry SAFETY notes apply.
         unsafe {
             (e.apply)();
+        }
+        if n < out.len() {
+            out[n] = e.name;
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// Slice of entries that match `(vendor, family, model, stepping)`,
+/// independent of the microcode-rev gate. Used by the boot log to
+/// surface "this silicon has matching errata" before the loader
+/// has decided whether the workaround actually runs.
+pub fn entries_matching_current_cpu() -> ([&'static str; 8], usize) {
+    let me = ident::read();
+    let mut out: [&'static str; 8] = [""; 8];
+    let mut n = 0usize;
+    for e in TABLE {
+        if e.vendor != me.vendor {
+            continue;
+        }
+        if e.family != me.family {
+            continue;
+        }
+        if me.model < e.model_lo || me.model > e.model_hi {
+            continue;
+        }
+        if e.stepping_mask & (1u32 << me.stepping) == 0 {
+            continue;
         }
         if n < out.len() {
             out[n] = e.name;
