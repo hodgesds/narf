@@ -127,6 +127,15 @@ pub const VERB_SET_POWER_STATE: u16 = 0x705;
 pub const VERB_GET_EAPD_BTL: u16 = 0xF0C;
 /// Set EAPD / BTL Enable. Payload bit 1 = EAPD enable.
 pub const VERB_SET_EAPD_BTL: u16 = 0x70C;
+/// 4-bit-major "Set Amp Gain/Mute" prefix (HDA §7.3.3.7). The high
+/// byte of the 16-bit amp-gain payload lives in the low byte of this
+/// 12-bit prefix's payload-slot; the low byte of the amp-gain payload
+/// goes through the standard 8-bit payload argument. Callers compose
+/// the actual verb-id as `VERB_SET_AMP_GAIN_MUTE_PREFIX | (high_byte
+/// as u16)`.
+pub const VERB_SET_AMP_GAIN_MUTE_PREFIX: u16 = 0x300;
+/// 4-bit-major "Get Amp Gain/Mute" prefix (HDA §7.3.3.7).
+pub const VERB_GET_AMP_GAIN_MUTE_PREFIX: u16 = 0xB00;
 
 /// Get-Parameter sub-codes (HDA Spec §7.3.4). OR with
 /// [`VERB_GET_PARAMETER`] is *not* how this is used: the codec
