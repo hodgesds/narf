@@ -117,6 +117,23 @@ impl File {
             owns_fd: false,
         }
     }
+
+    /// Construct a `File` wrapping a kernel fd the caller already
+    /// opened — `fdopen` shape. The new FILE owns the fd; `fclose`
+    /// will route through `close()`.
+    pub const fn for_owned_fd(fd: u32) -> Self {
+        Self {
+            fd,
+            rbuf: None,
+            rbuf_pos: 0,
+            rbuf_end: 0,
+            wbuf: None,
+            wbuf_len: 0,
+            eof: false,
+            err: 0,
+            owns_fd: true,
+        }
+    }
 }
 
 // ── Static stdin / stdout / stderr ───────────────────────────────────

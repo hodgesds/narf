@@ -64,6 +64,7 @@ pub mod signal;
 pub mod socket_extra;
 pub mod startup;
 pub mod stdio;
+pub mod stdio_c;
 pub mod stdlib;
 pub mod string;
 pub mod time;
@@ -261,6 +262,13 @@ pub use stdio::{
     clearerr, fclose, feof, ferror, fflush, fgetc, fgets, fopen, fputc, fputs, fread,
     fseek, ftell, fwrite, getc, getchar, perror, putc, putchar, puts, rewind, setbuf,
     setvbuf, stderr, stdin, stdout, ungetc, File, _IOFBF, _IOLBF, _IONBF,
+};
+// C-ABI veneer. Same function names exported under `extern "C"` so a
+// C consumer links against the canonical POSIX shape; the Rust-shape
+// helpers above stay reachable in-tree under the `stdio::` path.
+pub use stdio_c::{
+    fdopen, fileno, fprintf, init_std_streams, printf, snprintf, sprintf,
+    __libc_stderr, __libc_stdin, __libc_stdout,
 };
 pub use string::{
     memchr, memcmp, memcpy, memmem, memmove, memset, strcasecmp, strcat, strchr,

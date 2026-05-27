@@ -57,6 +57,13 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
     // SAFETY: write-once during single-threaded startup.
     unsafe { init_environ(envp) };
 
+    // Wire the C-ABI stdin/stdout/stderr globals so a consumer that
+    // links `extern FILE *stdin, *stdout, *stderr;` sees the same
+    // FILE* slots the Rust-shape accessors return.
+    //
+    // SAFETY: same single-threaded-startup invariant.
+    unsafe { crate::stdio_c::init_std_streams() };
+
     // SAFETY: `main` is the consumer-supplied `extern "C" fn`
     // declared in `lib.rs`. It is the bin's responsibility to
     // honour the C ABI (we declared it `extern "C"`).
