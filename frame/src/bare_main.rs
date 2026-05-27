@@ -51,6 +51,7 @@ pub mod aarch64;
 
 mod cross_crate_init;
 mod measure;
+mod secure_boot;
 
 /// Called from the arch-specific boot stub once the CPU is in a state
 /// capable of executing Rust: stack set up, appropriate privilege level,
