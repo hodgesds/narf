@@ -1274,12 +1274,34 @@ impl Xhci {
             }
         }
         // xHCI §4.19.4: after asserting PP, give the chipset time
-        // to bring VBUS up + detect any attached device. 20 ms
-        // covers the spec-mandated TRSTRCY + a margin for SS
-        // descriptor probe by the controller.
+        // to bring VBUS up + detect any attached device. AMD FCH
+        // rate-matching hubs (Renoir / Phoenix) take 50-100 ms
+        // before CCS asserts on a populated port; the 20 ms budget
+        // we used pre-fix caught nothing on real silicon. Poll
+        // PORTSC.CCS across every port up to a 150 ms wall-clock
+        // bound; exit as soon as any port reports CCS=1, or hit
+        // the full window when nothing is attached.
+        //
+        // Reference: Linux `drivers/usb/host/xhci-hub.c`'s
+        // `xhci_hub_control` PORT_RESET path which debounces port
+        // status reads against a similar window before reporting
+        // GetPortStatus.
         let _ = narf_scheduler::responsive_spin_until(
-            || false,
-            narf_time::Deadline::after_ms(20),
+            || {
+                for port in 1..=max_ports {
+                    let port_off = op_off
+                        + OP_PORTSC_BASE
+                        + ((port as u64 - 1) * PORT_REGS_STRIDE);
+                    // SAFETY: identity-mapped MMIO; port range
+                    // bounded by HCSPARAMS1.MaxPorts.
+                    let v = unsafe { mmio.read32(port_off) };
+                    if v & PORTSC_CCS != 0 {
+                        return true;
+                    }
+                }
+                false
+            },
+            narf_time::Deadline::after_ms(150),
         );
         // Log per-port post-PP state so dmesg shows which root-hub
         // ports actually saw VBUS + a device. Distinguishes
