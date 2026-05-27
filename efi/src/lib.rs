@@ -41,6 +41,7 @@
 extern crate alloc;
 
 pub mod reset;
+pub mod runtime;
 pub mod system_table;
 pub mod time;
 pub mod variable;
