@@ -4894,3 +4894,53 @@ fn smoke_kaslr_tsc_mix_advances() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/kaslr", smoke_kaslr_tsc_mix_advances);
+
+// ── ro_after_init smokes ──────────────────────────────────────────────
+
+fn smoke_ro_after_init_rw_before_latch() -> TestResult {
+    use crate::ro_after_init::{is_init_complete, mark_init_complete, RoCell, _reset_for_test};
+    _reset_for_test();
+    let cell = RoCell::new(42u32);
+    if *cell.get() != 42 {
+        return TestResult::Fail("RoCell::new did not store the initial value");
+    }
+    if is_init_complete() {
+        return TestResult::Fail("init_complete latched before mark_init_complete");
+    }
+    // SAFETY: pre-init phase by virtue of `_reset_for_test`.
+    unsafe {
+        cell.set(123);
+    }
+    if *cell.get() != 123 {
+        return TestResult::Fail("RoCell::set didn't update before init latch");
+    }
+    mark_init_complete();
+    if !is_init_complete() {
+        return TestResult::Fail("mark_init_complete didn't latch");
+    }
+    // Re-arm for other tests.
+    _reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory/ro_after_init", smoke_ro_after_init_rw_before_latch);
+
+fn smoke_ro_after_init_latch_observability() -> TestResult {
+    use crate::ro_after_init::{is_init_complete, mark_init_complete, _reset_for_test};
+    _reset_for_test();
+    if is_init_complete() {
+        return TestResult::Fail("reset did not clear the latch");
+    }
+    mark_init_complete();
+    if !is_init_complete() {
+        return TestResult::Fail("mark_init_complete didn't propagate");
+    }
+    // Idempotency: a second mark_init_complete should still leave the
+    // latch set without panic or weirdness.
+    mark_init_complete();
+    if !is_init_complete() {
+        return TestResult::Fail("idempotent mark_init_complete unlatched");
+    }
+    _reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory/ro_after_init", smoke_ro_after_init_latch_observability);

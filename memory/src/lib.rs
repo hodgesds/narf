@@ -25,6 +25,7 @@ pub mod hugepage;
 pub mod kaslr;
 pub mod per_domain_root;
 pub mod reclaim;
+pub mod ro_after_init;
 pub mod slab;
 pub mod zpool;
 pub mod spd5;
