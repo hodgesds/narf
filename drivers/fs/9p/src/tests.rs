@@ -427,3 +427,101 @@ kernel_test_in!(
     "drivers/fs/9p",
     smoke_9p_loopback_multiple_files_enumerate_in_order
 );
+
+// ── Write-path smokes (Twrite / Rwrite) ─────────────────────────
+
+fn smoke_9p_write_then_read_back() -> TestResult {
+    // Round-trip a Twrite + Tread through the loopback transport.
+    let transport = LoopbackTransport::new(&[("greet", b"initial-content")]);
+    let t: Arc<dyn crate::session::Transport> = transport.clone();
+    let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.lookup_async("greet")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup greet failed"),
+    };
+    let payload = b"hello from Twrite";
+    let n = match poll_once(file.write(0, payload)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("write failed"),
+    };
+    if n != payload.len() {
+        return TestResult::Fail("short write");
+    }
+    let mut buf = [0u8; 64];
+    let m = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read failed"),
+    };
+    if &buf[..m] != payload {
+        return TestResult::Fail("read-back mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/9p", smoke_9p_write_then_read_back);
+
+fn smoke_9p_write_at_offset_extends_file() -> TestResult {
+    // Write past the current end of file; the server should
+    // extend the file body to cover the gap (zeros) + new data.
+    let transport = LoopbackTransport::new(&[("greet", b"abc")]);
+    let t: Arc<dyn crate::session::Transport> = transport.clone();
+    let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.lookup_async("greet")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let n = match poll_once(file.write(10, b"xyz")) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("write at offset failed"),
+    };
+    if n != 3 {
+        return TestResult::Fail("short write");
+    }
+    let mut buf = [0u8; 32];
+    let m = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read failed"),
+    };
+    if m != 13 || &buf[..3] != b"abc" || &buf[10..13] != b"xyz" {
+        return TestResult::Fail("post-write contents wrong");
+    }
+    // Bytes 3..10 should be zero-filled.
+    if buf[3..10].iter().any(|&b| b != 0) {
+        return TestResult::Fail("gap not zero-filled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/9p", smoke_9p_write_at_offset_extends_file);
+
+fn smoke_9p_write_count_matches_request() -> TestResult {
+    // The Rwrite count field is the bytes-written value the client
+    // surfaces from FileOps::write.
+    let transport = LoopbackTransport::new(&[("greet", b"")]);
+    let t: Arc<dyn crate::session::Transport> = transport.clone();
+    let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.lookup_async("greet")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let payload = b"exact-12-byt";
+    let n = match poll_once(file.write(0, payload)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("write failed"),
+    };
+    if n != payload.len() {
+        return TestResult::Fail("expected n == payload.len()");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/9p", smoke_9p_write_count_matches_request);

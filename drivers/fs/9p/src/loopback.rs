@@ -291,9 +291,15 @@ impl LoopbackTransport {
             MsgType::Topen => {
                 let fid = r.read_u32()?;
                 let mode = r.read_u8()?;
-                if mode & 0x0F != super::message::oflag::READ {
+                // Accept READ, WRITE, and RDWR — we accept writes
+                // for the write-path smoke tests.
+                let m = mode & 0x0F;
+                if m != super::message::oflag::READ
+                    && m != super::message::oflag::WRITE
+                    && m != super::message::oflag::RDWR
+                {
                     drop(inner);
-                    return rerror(tag, "loopback is read-only");
+                    return rerror(tag, "unsupported open mode");
                 }
                 let st = match inner.fids.get_mut(&fid) {
                     Some(s) => s,
@@ -314,6 +320,44 @@ impl LoopbackTransport {
                     // iounit = 0: server has no preferred unit, client
                     // may use up to msize. (open(5))
                     w.write_u32(0)
+                })
+            }
+            MsgType::Twrite => {
+                let fid = r.read_u32()?;
+                let offset = r.read_u64()? as usize;
+                let count = r.read_u32()? as usize;
+                let mut data = Vec::with_capacity(count);
+                for _ in 0..count {
+                    data.push(r.read_u8()?);
+                }
+                let st = match inner.fids.get(&fid).copied() {
+                    Some(s) => s,
+                    None => {
+                        drop(inner);
+                        return rerror(tag, "unknown fid");
+                    }
+                };
+                if !st.opened {
+                    drop(inner);
+                    return rerror(tag, "fid not open");
+                }
+                let idx = match st.child {
+                    Some(i) => i,
+                    None => {
+                        drop(inner);
+                        return rerror(tag, "write to directory");
+                    }
+                };
+                // Extend file body to cover the write window.
+                let file = &mut inner.files[idx];
+                let new_end = offset + count;
+                if file.data.len() < new_end {
+                    file.data.resize(new_end, 0);
+                }
+                file.data[offset..new_end].copy_from_slice(&data);
+                drop(inner);
+                frame_message(self.cap(), MsgType::Rwrite, tag, |w| {
+                    w.write_u32(count as u32)
                 })
             }
             MsgType::Tread => {

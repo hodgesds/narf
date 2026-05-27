@@ -469,6 +469,28 @@ pub fn encode_tread(w: &mut WireWrite, fid: u32, offset: u64, count: u32) -> Res
     w.write_u32(count)
 }
 
+/// Twrite body: `fid[4] offset[8] count[4] data[count]`. write(5).
+pub fn encode_twrite(
+    w: &mut WireWrite,
+    fid: u32,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), DecodeError> {
+    let count = data.len() as u32;
+    w.write_u32(fid)?;
+    w.write_u64(offset)?;
+    w.write_u32(count)?;
+    for &b in data {
+        w.write_u8(b)?;
+    }
+    Ok(())
+}
+
+/// Rwrite body decode: `count[4]` — bytes written.
+pub fn decode_rwrite(r: &mut WireRead) -> Result<u32, DecodeError> {
+    r.read_u32()
+}
+
 /// Tclunk body: `fid[4]`.
 pub fn encode_tclunk(w: &mut WireWrite, fid: u32) -> Result<(), DecodeError> {
     w.write_u32(fid)

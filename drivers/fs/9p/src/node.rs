@@ -16,8 +16,9 @@ use narf_filesystem::{
 };
 
 use super::message::{
-    decode_header, decode_rerror, decode_rread, decode_rwalk, encode_tclunk, encode_topen,
-    encode_tread, encode_tstat, encode_twalk, oflag, qtype, MsgType, P9Stat, Qid, WireRead,
+    decode_header, decode_rerror, decode_rread, decode_rwalk, decode_rwrite, encode_tclunk,
+    encode_topen, encode_tread, encode_tstat, encode_twalk, encode_twrite, oflag, qtype,
+    MsgType, P9Stat, Qid, WireRead,
 };
 use super::session::{frame_message, P9Session, Transport};
 
@@ -141,6 +142,34 @@ impl NinepNode {
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
             MsgType::Ropen => Ok(()),
+            MsgType::Rerror => {
+                let _ = decode_rerror(&mut r);
+                Err(FsError::Io(narf_block::BlockError::IOError))
+            }
+            _ => Err(FsError::Io(narf_block::BlockError::IOError)),
+        }
+    }
+
+    async fn twrite(
+        &self,
+        fid: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, FsError> {
+        let tag = self.session.alloc_tag();
+        let req = frame_message(self.session.msize(), MsgType::Twrite, tag, |w| {
+            encode_twrite(w, fid, offset, data)
+        })
+        .map_err(Self::map_err)?;
+        let reply = self
+            .transport
+            .rpc(&req)
+            .await
+            .map_err(Self::map_err)?;
+        let mut r = WireRead::new(&reply);
+        let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
+        match mt {
+            MsgType::Rwrite => decode_rwrite(&mut r).map_err(Self::map_err),
             MsgType::Rerror => {
                 let _ = decode_rerror(&mut r);
                 Err(FsError::Io(narf_block::BlockError::IOError))
@@ -297,8 +326,31 @@ impl FileOps for NinepNode {
         })
     }
 
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            // open(5)-then-write: best-effort re-open for WRITE.
+            // The loopback ignores re-open; a real server returns
+            // Rerror on a fid that was opened READ which we collapse
+            // to a transient IO error so the caller can re-walk.
+            let _ = self.topen(self.fid, oflag::WRITE).await;
+            // Cap the per-message payload at the server's msize
+            // minus the Twrite fixed-header overhead (11 bytes:
+            // size[4] type[1] tag[2] fid[4]) per write(5).
+            let max_per_msg =
+                (self.session.msize().saturating_sub(23)).max(1) as usize;
+            let mut total = 0usize;
+            while total < buf.len() {
+                let n = core::cmp::min(buf.len() - total, max_per_msg);
+                let written = self
+                    .twrite(self.fid, offset + total as u64, &buf[total..total + n])
+                    .await? as usize;
+                if written == 0 {
+                    break;
+                }
+                total += written;
+            }
+            Ok(total)
+        })
     }
 
     fn stat(&self) -> Stat {
