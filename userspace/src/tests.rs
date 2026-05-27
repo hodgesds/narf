@@ -8261,3 +8261,572 @@ fn smoke_init_file_listing_returns_none_when_not_staged() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/init", smoke_init_file_listing_returns_none_when_not_staged);
+
+// ── Phase-2 signal gap-fill smokes ─────────────────────────────────
+//
+// One smoke per new syscall (sigaltstack install + query, tkill +
+// tgkill TID targeting, rt_sigpending pending-and-blocked filter,
+// rt_sigsuspend mask round-trip, rt_sigtimedwait delivery + timeout
+// paths). All use the FakeCtx pattern shared with the existing
+// signal smokes.
+
+struct SigGapCtx {
+    args: SyscallArgs,
+    ret: Option<SyscallReturn>,
+}
+impl TrapContext for SigGapCtx {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, r: SyscallReturn) {
+        self.ret = Some(r);
+    }
+    fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+        false
+    }
+}
+
+fn smoke_userspace_sigaltstack_install_and_query() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0x5A_57_AC_C0);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // First call: query-only — expect SS_DISABLE.
+    #[repr(C)]
+    #[derive(Copy, Clone, Default, Debug)]
+    struct StackT {
+        sp: u64,
+        flags: u32,
+        _pad: u32,
+        size: u64,
+    }
+    let mut out = StackT::default();
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: &mut out as *mut StackT as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaltstack.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        crate::handlers::__test_signal_reset();
+        return TestResult::Fail("query-only sigaltstack did not Ok");
+    }
+    if out.flags != 2 /* SS_DISABLE */ {
+        __test_clear_global();
+        crate::handlers::__test_signal_reset();
+        return TestResult::Fail("query-only sigaltstack should report SS_DISABLE");
+    }
+
+    // Install: sp = 0xABCDEF00, size = 4096, flags = 0.
+    let install = StackT { sp: 0xABCD_EF00, flags: 0, _pad: 0, size: 4096 };
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs {
+            arg0: &install as *const StackT as u64,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaltstack.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        crate::handlers::__test_signal_reset();
+        return TestResult::Fail("install sigaltstack did not Ok");
+    }
+
+    // Re-query — expect the values just installed.
+    let mut out2 = StackT::default();
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: &mut out2 as *mut StackT as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaltstack.raw(), &mut ctx);
+    let ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK);
+    let match_ = out2.sp == 0xABCD_EF00 && out2.flags == 0 && out2.size == 4096;
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if ok && match_ { TestResult::Pass } else { TestResult::Fail("re-query did not match install") }
+}
+kernel_test_in!("userspace", smoke_userspace_sigaltstack_install_and_query);
+
+fn smoke_userspace_sigaltstack_rejects_too_small() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0x5A_57_AC_C1);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    #[repr(C)]
+    struct StackT { sp: u64, flags: u32, _pad: u32, size: u64 }
+    let install = StackT { sp: 0x1000, flags: 0, _pad: 0, size: 100 /* < MIN_SIGSTKSZ */ };
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs { arg0: &install as *const StackT as u64, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaltstack.raw(), &mut ctx);
+    let r = ctx.ret.unwrap_or(SyscallReturn::invalid_op());
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    // -1 (0xFFFF_FFFF_FFFF_FFFF) on rejection.
+    if r.status == SyscallReturn::OK && r.value == (-1i64 as u64) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("undersized altstack should be rejected")
+    }
+}
+kernel_test_in!("userspace", smoke_userspace_sigaltstack_rejects_too_small);
+
+fn smoke_userspace_tkill_targets_specific_tid() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xAAAA);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // tkill TID=0xBBBB with signum=10 (SIGUSR1).
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs { arg0: 0xBBBB, arg1: 10, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Tkill.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        crate::handlers::__test_signal_reset();
+        return TestResult::Fail("tkill did not Ok");
+    }
+    let pending_target = crate::handlers::signal_pending_of(0xBBBB);
+    let pending_caller = crate::handlers::signal_pending_of(0xAAAA);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if pending_target & (1 << 10) == 0 {
+        return TestResult::Fail("tkill did not set target's pending bit");
+    }
+    if pending_caller != 0 {
+        return TestResult::Fail("tkill bled to caller TID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_tkill_targets_specific_tid);
+
+fn smoke_userspace_tgkill_routes_via_tid() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xCCCC);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // tgkill TGID=0xCCCC TID=0xDDDD SIG=15 (SIGTERM).
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs { arg0: 0xCCCC, arg1: 0xDDDD, arg2: 15, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Tgkill.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        crate::handlers::__test_signal_reset();
+        return TestResult::Fail("tgkill did not Ok");
+    }
+    // Target is the TID, NOT the TGID.
+    let pending_tid = crate::handlers::signal_pending_of(0xDDDD);
+    let pending_tgid = crate::handlers::signal_pending_of(0xCCCC);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if pending_tid & (1 << 15) == 0 {
+        return TestResult::Fail("tgkill did not set TID's pending bit");
+    }
+    if pending_tgid != 0 {
+        return TestResult::Fail("tgkill bled to TGID (which is not the target)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_tgkill_routes_via_tid);
+
+fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xEEEE);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Mark SIGUSR1 (10) + SIGTERM (15) pending, mask only SIGUSR1.
+    // rt_sigpending must return pending & mask = SIGUSR1 only.
+    let mut k = SigGapCtx {
+        args: SyscallArgs { arg0: 0xEEEE, arg1: 10, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+    let mut k = SigGapCtx {
+        args: SyscallArgs { arg0: 0xEEEE, arg1: 15, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+    // sigprocmask BLOCK SIGUSR1.
+    let mut m = SigGapCtx {
+        args: SyscallArgs { arg0: 0 /* SIG_BLOCK */, arg1: 1 << 10, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigprocmask.raw(), &mut m);
+
+    let mut out: u64 = 0;
+    let mut q = SigGapCtx {
+        args: SyscallArgs { arg0: &mut out as *mut u64 as u64, arg1: 8, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RtSigpending.raw(), &mut q);
+    let ok = matches!(q.ret, Some(r) if r.status == SyscallReturn::OK);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if !ok { return TestResult::Fail("rt_sigpending did not Ok"); }
+    // pending = {10, 15}; mask = {10}; pending & mask = {10}.
+    if out != (1u64 << 10) {
+        return TestResult::Fail("rt_sigpending should report only blocked-and-pending bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_rt_sigpending_filters_by_mask);
+
+fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF000);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Pre-install a mask of 0x0F via sigprocmask SETMASK.
+    let mut m = SigGapCtx {
+        args: SyscallArgs { arg0: 2 /* SIG_SETMASK */, arg1: 0x0F, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigprocmask.raw(), &mut m);
+
+    // rt_sigsuspend with set = 0xF0; mask must become 0xF0.
+    let new_set: u64 = 0xF0;
+    let mut s = SigGapCtx {
+        args: SyscallArgs {
+            arg0: &new_set as *const u64 as u64,
+            arg1: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RtSigsuspend.raw(), &mut s);
+    // POSIX: rt_sigsuspend returns -1 always.
+    let returned_minus_one = matches!(s.ret, Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64 as u64));
+    let mask_after = crate::handlers::signal_mask_of(0xF000);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if !returned_minus_one {
+        return TestResult::Fail("rt_sigsuspend must return -1 (EINTR)");
+    }
+    if mask_after != 0xF0 {
+        return TestResult::Fail("rt_sigsuspend did not replace mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_rt_sigsuspend_replaces_mask);
+
+fn smoke_userspace_rt_sigtimedwait_returns_pending_signal() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF100);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Make SIGUSR2 (12) pending on the calling task.
+    let mut k = SigGapCtx {
+        args: SyscallArgs { arg0: 0xF100, arg1: 12, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+
+    // rt_sigtimedwait waiting for SIGUSR2 should return 12.
+    let set_in: u64 = 1u64 << 12;
+    let mut siginfo = [0u8; 128];
+    let mut w = SigGapCtx {
+        args: SyscallArgs {
+            arg0: &set_in as *const u64 as u64,
+            arg1: siginfo.as_mut_ptr() as u64,
+            arg2: 0, // null timeout
+            arg3: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RtSigtimedwait.raw(), &mut w);
+    let r = w.ret.unwrap_or(SyscallReturn::invalid_op());
+    let pending_after = crate::handlers::signal_pending_of(0xF100);
+    let signo_in_info = i32::from_le_bytes([siginfo[0], siginfo[1], siginfo[2], siginfo[3]]);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if r.status != SyscallReturn::OK || r.value != 12 {
+        return TestResult::Fail("rt_sigtimedwait should return the signum");
+    }
+    if pending_after & (1 << 12) != 0 {
+        return TestResult::Fail("rt_sigtimedwait must clear the pending bit");
+    }
+    if signo_in_info != 12 {
+        return TestResult::Fail("rt_sigtimedwait should fill siginfo.si_signo");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_rt_sigtimedwait_returns_pending_signal);
+
+fn smoke_userspace_rt_sigtimedwait_no_pending_returns_minus_one() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF200);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Nothing pending. Waiting on SIGUSR1 must return -1 with no
+    // siginfo filled.
+    let set_in: u64 = 1u64 << 10;
+    let mut w = SigGapCtx {
+        args: SyscallArgs {
+            arg0: &set_in as *const u64 as u64,
+            arg1: 0, // info_out null
+            arg2: 0, // null timeout
+            arg3: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RtSigtimedwait.raw(), &mut w);
+    let r = w.ret.unwrap_or(SyscallReturn::invalid_op());
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if r.status == SyscallReturn::OK && r.value == (-1i64 as u64) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("rt_sigtimedwait must return -1 when none pending")
+    }
+}
+kernel_test_in!("userspace", smoke_userspace_rt_sigtimedwait_no_pending_returns_minus_one);
+
+fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF300);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Make signals 5, 10, 15 pending. Wait on {5, 15}. Should
+    // return 5 (the lowest match).
+    for s in [5u64, 10, 15] {
+        let mut k = SigGapCtx {
+            args: SyscallArgs { arg0: 0xF300, arg1: s, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+    }
+    let set_in: u64 = (1u64 << 5) | (1u64 << 15);
+    let mut w = SigGapCtx {
+        args: SyscallArgs {
+            arg0: &set_in as *const u64 as u64,
+            arg1: 0,
+            arg2: 0,
+            arg3: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RtSigtimedwait.raw(), &mut w);
+    let r = w.ret.unwrap_or(SyscallReturn::invalid_op());
+    let pending_after = crate::handlers::signal_pending_of(0xF300);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if r.status != SyscallReturn::OK || r.value != 5 {
+        return TestResult::Fail("rt_sigtimedwait must pick the lowest matching signum");
+    }
+    // 5 cleared; 10 + 15 still pending.
+    let want = (1u32 << 10) | (1u32 << 15);
+    if pending_after != want {
+        return TestResult::Fail("rt_sigtimedwait must clear only the returned signum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_rt_sigtimedwait_picks_lowest_match);
+
+fn smoke_userspace_rt_sigpending_zero_when_nothing_blocked() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF400);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Pending SIGUSR1 but no mask. rt_sigpending must report 0.
+    let mut k = SigGapCtx {
+        args: SyscallArgs { arg0: 0xF400, arg1: 10, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
+    let mut out: u64 = 0xDEADBEEF;
+    let mut q = SigGapCtx {
+        args: SyscallArgs { arg0: &mut out as *mut u64 as u64, arg1: 8, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RtSigpending.raw(), &mut q);
+    let ok = matches!(q.ret, Some(r) if r.status == SyscallReturn::OK);
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if !ok { return TestResult::Fail("rt_sigpending did not Ok"); }
+    if out != 0 {
+        return TestResult::Fail("rt_sigpending must report 0 with empty mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_rt_sigpending_zero_when_nothing_blocked);
+
+fn smoke_userspace_sigaltstack_query_only_keeps_prior_install() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF500);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    #[repr(C)]
+    struct StackT { sp: u64, flags: u32, _pad: u32, size: u64 }
+    let install = StackT { sp: 0xDEAD_F000, flags: 0, _pad: 0, size: 8192 };
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs { arg0: &install as *const StackT as u64, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaltstack.raw(), &mut ctx);
+
+    // Two query-onlys in a row — both must return the install
+    // values, not 0/SS_DISABLE.
+    for _ in 0..2 {
+        let mut out = StackT { sp: 0, flags: 0xFFFF_FFFF, _pad: 0, size: 0 };
+        let mut ctx = SigGapCtx {
+            args: SyscallArgs { arg0: 0, arg1: &mut out as *mut StackT as u64, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Sigaltstack.raw(), &mut ctx);
+        if out.sp != 0xDEAD_F000 || out.size != 8192 {
+            __test_clear_global();
+            crate::handlers::__test_signal_reset();
+            return TestResult::Fail("query-only must not alter prior install");
+        }
+    }
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_sigaltstack_query_only_keeps_prior_install);
+
+fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::{install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xF600);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    crate::handlers::signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // signum = 32 (NSIG) must be rejected.
+    let mut ctx = SigGapCtx {
+        args: SyscallArgs { arg0: 0xBEEF, arg1: 32, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Tkill.raw(), &mut ctx);
+    let r = ctx.ret.unwrap_or(SyscallReturn::ok(0));
+    __test_clear_global();
+    crate::handlers::__test_signal_reset();
+    if r == SyscallReturn::invalid_op() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("signum 32 must be rejected")
+    }
+}
+kernel_test_in!("userspace", smoke_userspace_tkill_signum_out_of_range_rejected);
