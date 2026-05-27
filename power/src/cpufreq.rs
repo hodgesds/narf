@@ -662,8 +662,7 @@ pub fn __force_backend_for_test(b: Backend) {
 
 // ── Smoke tests ────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "kernel-test"))]
-mod tests {
+mod smoke_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
