@@ -1848,25 +1848,67 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let _ = unsafe { libc::posix::close(kfd) };
         }
     } else if cmd == b"grep" {
-        // grep PATTERN [FILE]
-        // Reads stdin or FILE line by line; prints lines containing
-        // PATTERN (literal substring match). No regex, no flags.
-        // Adequate for piping into dmesg / ls / cat for now.
-        let args = skip_ws(rest);
-        // Find the pattern + optional file.
-        let pat_end = args
+        // grep [-i] [-v] [-u] PATTERN [FILE]
+        //   -i  case-insensitive match
+        //   -v  invert (print lines NOT containing PATTERN)
+        //   -u  unique: skip consecutive duplicate matching lines
+        //       (covers periodic-log spam like `i8042-mouse: irqs=N`)
+        // Reads stdin or FILE; literal substring match, no regex.
+        let mut s = skip_ws(rest);
+        let mut case_insensitive = false;
+        let mut invert = false;
+        let mut unique = false;
+        loop {
+            if s.starts_with(b"-") && s.len() >= 2 {
+                let flag_end = s
+                    .iter()
+                    .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+                    .unwrap_or(s.len());
+                let flag_chars = &s[1..flag_end];
+                let mut all_known = true;
+                let mut tmp_i = case_insensitive;
+                let mut tmp_v = invert;
+                let mut tmp_u = unique;
+                for &c in flag_chars {
+                    match c {
+                        b'i' => tmp_i = true,
+                        b'v' => tmp_v = true,
+                        b'u' => tmp_u = true,
+                        _ => { all_known = false; break; }
+                    }
+                }
+                if !all_known || flag_chars.is_empty() {
+                    break;
+                }
+                case_insensitive = tmp_i;
+                invert = tmp_v;
+                unique = tmp_u;
+                s = skip_ws(&s[flag_end..]);
+            } else {
+                break;
+            }
+        }
+        let pat_end = s
             .iter()
             .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
-            .unwrap_or(args.len());
+            .unwrap_or(s.len());
         if pat_end == 0 {
-            unsafe { write_all(fd, b"grep: usage: grep PATTERN [FILE]\n"); }
+            unsafe { write_all(fd, b"grep: usage: grep [-i] [-v] [-u] PATTERN [FILE]\n"); }
         } else {
-            let pattern = &args[..pat_end];
-            let file = trim_arg(&args[pat_end..]);
-            // Source fd: open FILE, or use stdin (fd 0) if no file.
+            let pattern_raw = &s[..pat_end];
+            // For -i we lowercase the pattern once up front and
+            // each line on compare.
+            let mut pattern_buf = [0u8; 256];
+            let pattern_len = pattern_raw.len().min(pattern_buf.len());
+            for i in 0..pattern_len {
+                let b = pattern_raw[i];
+                pattern_buf[i] = if case_insensitive { ascii_lower(b) } else { b };
+            }
+            let pattern = &pattern_buf[..pattern_len];
+            let file = trim_arg(&s[pat_end..]);
             let mut owned_fd: i32 = -1;
             let src_fd = if file.is_empty() {
-                0 // stdin
+                0
             } else {
                 let mut pbuf = [0u8; 256];
                 if file.len() + 1 >= pbuf.len() {
@@ -1874,9 +1916,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                     return true;
                 }
                 pbuf[..file.len()].copy_from_slice(file);
-                let f = unsafe {
-                    libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0)
-                };
+                let f = unsafe { libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0) };
                 if f < 0 {
                     unsafe { write_all(fd, b"grep: cannot open file\n"); }
                     return true;
@@ -1884,40 +1924,59 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 owned_fd = f;
                 f
             };
-            // Read in chunks, scan for newlines, test each line.
             let mut buf = [0u8; 4096];
             let mut line = [0u8; 4096];
             let mut llen = 0usize;
-            loop {
-                let n = unsafe {
-                    libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len())
-                };
-                if n <= 0 {
-                    break;
+            let mut prev_printed = [0u8; 4096];
+            let mut prev_len = 0usize;
+            let emit = |fd: i32,
+                        line: &[u8],
+                        prev_printed: &mut [u8; 4096],
+                        prev_len: &mut usize|
+             -> () {
+                if unique && line.len() == *prev_len && &prev_printed[..*prev_len] == line {
+                    return;
                 }
+                unsafe {
+                    write_all(fd, line);
+                    write_all(fd, NEWLINE);
+                }
+                if unique {
+                    let n = line.len().min(prev_printed.len());
+                    prev_printed[..n].copy_from_slice(&line[..n]);
+                    *prev_len = n;
+                }
+            };
+            let test = |line_bytes: &[u8]| -> bool {
+                let hit = if case_insensitive {
+                    let mut lower = [0u8; 4096];
+                    let n = line_bytes.len().min(lower.len());
+                    for i in 0..n {
+                        lower[i] = ascii_lower(line_bytes[i]);
+                    }
+                    line_contains(&lower[..n], pattern)
+                } else {
+                    line_contains(line_bytes, pattern)
+                };
+                if invert { !hit } else { hit }
+            };
+            loop {
+                let n = unsafe { libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 { break; }
                 for &b in &buf[..n as usize] {
                     if b == b'\n' {
-                        if line_contains(&line[..llen], pattern) {
-                            unsafe {
-                                write_all(fd, &line[..llen]);
-                                write_all(fd, NEWLINE);
-                            }
+                        if test(&line[..llen]) {
+                            emit(fd, &line[..llen], &mut prev_printed, &mut prev_len);
                         }
                         llen = 0;
                     } else if llen < line.len() {
                         line[llen] = b;
                         llen += 1;
                     }
-                    // Lines longer than the buffer get truncated;
-                    // good enough for boot-log inspection.
                 }
             }
-            // Trailing line without \n.
-            if llen > 0 && line_contains(&line[..llen], pattern) {
-                unsafe {
-                    write_all(fd, &line[..llen]);
-                    write_all(fd, NEWLINE);
-                }
+            if llen > 0 && test(&line[..llen]) {
+                emit(fd, &line[..llen], &mut prev_printed, &mut prev_len);
             }
             if owned_fd >= 0 {
                 let _ = unsafe { libc::posix::close(owned_fd) };
@@ -1934,6 +1993,17 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// ASCII case-fold: A..Z → a..z, everything else passes through.
+/// Used by `grep -i` to normalise both pattern and line bytes
+/// before comparing. No Unicode case-folding.
+fn ascii_lower(b: u8) -> u8 {
+    if b.is_ascii_uppercase() {
+        b + 32
+    } else {
+        b
+    }
 }
 
 /// Naive literal substring search. Returns true iff `needle`
