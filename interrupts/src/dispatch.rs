@@ -413,6 +413,13 @@ pub fn synchronize_irq(vector: u8) {
     }
 }
 
+/// Snapshot of how many `on_irq(vector)` calls are mid-dispatch.
+/// Exposed for verification — production callers should use
+/// [`synchronize_irq`] which encodes the busy-wait semantic.
+pub fn in_flight(vector: u8) -> u32 {
+    SLOTS[vector as usize].in_flight.load(Ordering::Acquire)
+}
+
 // ── Dispatch entry point ───────────────────────────────────────────
 
 /// Called from the per-arch IRQ handler with the logical vector
