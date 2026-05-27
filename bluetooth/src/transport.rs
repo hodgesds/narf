@@ -16,6 +16,12 @@
 //!
 //! USB-IF class identifier per "USB Class Definitions for Wireless
 //! Controllers" v1.0: class 0xE0, subclass 0x01, protocol 0x01.
+//!
+//! Stage 2: `HciTransport` gains optional `send_sco` / `recv_sco`
+//! with default no-op implementations so existing transports don't
+//! need updates. Linux reference: `drivers/bluetooth/btusb.c` —
+//! `btusb_send_frame` dispatches on packet-type indicator byte to
+//! select control/bulk/isoch endpoint.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -46,6 +52,11 @@ pub enum TransportError {
 }
 
 /// HCI transport interface. One instance per Bluetooth controller.
+///
+/// Stage 2 extends the trait with optional `send_sco` / `recv_sco`
+/// so the SCO audio channel can be pumped independently of the ACL
+/// data plane. Default implementations return `Ok(())` / `Ok(None)`
+/// so transports that don't yet support SCO compile without changes.
 pub trait HciTransport: Send + Sync + Debug {
     /// Submit a Command packet (the 0x01 indicator is added by the
     /// transport when needed; on USB the indicator is implicit in the
@@ -61,6 +72,18 @@ pub trait HciTransport: Send + Sync + Debug {
 
     /// Pull pending ACL data. Returns `None` when no data is ready.
     fn recv_acl(&self) -> Result<Option<Vec<u8>>, TransportError>;
+
+    /// Submit a Synchronous Data (SCO/eSCO) packet.
+    /// Default: no-op (transports without SCO ignore this).
+    fn send_sco(&self, _data: &[u8]) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    /// Pull pending Synchronous Data. Returns `None` when no data
+    /// is ready. Default: always None.
+    fn recv_sco(&self) -> Result<Option<Vec<u8>>, TransportError> {
+        Ok(None)
+    }
 
     /// Stable transport name for diagnostics ("usb", "uart-115200",
     /// "vhci-test").
@@ -148,6 +171,8 @@ impl HciTransport for LoopbackTransport {
         Ok(None)
     }
 
+    // send_sco / recv_sco use the default no-op implementations from
+    // the trait — the loopback transport doesn't need SCO.
     fn name(&self) -> &'static str {
         self.name
     }

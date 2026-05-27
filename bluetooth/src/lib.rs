@@ -10,7 +10,8 @@
 //! - USB Class Definitions for Wireless Controllers v1.0, USB-IF
 //!   (class 0xE0, subclass 0x01, protocol 0x01).
 //!
-//! No GPL / Linux Bluetooth source consulted.
+//! GPL Linux Bluetooth source (`net/bluetooth/`) consulted per NARF
+//! 2026-05-20 relicense to GPL-2.0-or-later.
 //!
 //! ## Surface
 //!
@@ -22,9 +23,9 @@
 //! - [`controller`] — bring-up state machine (Reset → Read Local
 //!   Version → Read BD_ADDR → Set Event Mask). Drives a transport
 //!   through the mandatory init dance described in Vol 4 Part E §3.
-//!
-//! No data-plane work yet (L2CAP/ATT/GATT/SMP); those land as
-//! separate crates so per-protocol cap-typing stays tight.
+//! - [`classic`] — classic BR/EDR command builders (Inquiry,
+//!   Create_Connection, SSP IO-capability exchange, SCO setup).
+//! - [`cmd_queue`] — HCI command queue with credit-flow tracking.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -34,6 +35,8 @@ extern crate alloc;
 
 pub mod att;
 pub mod avdtp;
+pub mod classic;
+pub mod cmd_queue;
 pub mod controller;
 pub mod event;
 pub mod gap;
