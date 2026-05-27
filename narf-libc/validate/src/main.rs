@@ -3048,6 +3048,45 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new env C-ABI probes ─────────────────────────────────────
+    //
+    // setenv("PROBE", "1", 1) then getenv("PROBE") returns the value.
+    let setenv_ok = unsafe {
+        let r = narf_libc::setenv(
+            b"PROBE\0".as_ptr(),
+            b"1\0".as_ptr(),
+            1,
+        );
+        let v = narf_libc::getenv(b"PROBE".as_ptr(), 5);
+        r == 0 && !v.is_null() && *v == b'1'
+    };
+    narf_libc::printf_str(
+        if setenv_ok { "setenv: ok\n" } else { "setenv: bad\n" },
+        &[],
+    );
+
+    // unsetenv("PROBE") then getenv returns NULL.
+    let unsetenv_ok = unsafe {
+        let r = narf_libc::unsetenv(b"PROBE\0".as_ptr());
+        let v = narf_libc::getenv(b"PROBE".as_ptr(), 5);
+        r == 0 && v.is_null()
+    };
+    narf_libc::printf_str(
+        if unsetenv_ok { "unsetenv: ok\n" } else { "unsetenv: bad\n" },
+        &[],
+    );
+
+    // putenv: same semantics via the "NAME=VALUE" string form.
+    let putenv_ok = unsafe {
+        let r = narf_libc::putenv(b"PUT=here\0".as_ptr());
+        let v = narf_libc::getenv(b"PUT".as_ptr(), 3);
+        r == 0 && !v.is_null() && *v == b'h'
+    };
+    narf_libc::printf_str(
+        if putenv_ok { "putenv: ok\n" } else { "putenv: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
