@@ -181,10 +181,15 @@ mod user_rt {
         NoCap,
     }
 
-    /// Allocate a DMA-coherent buffer. Stub — the userspace impl
-    /// crates a `narf_user_driver_runtime::dma_alloc` syscall.
+    /// Allocate a DMA-coherent buffer. Stub: the production path is
+    /// a cap-mediated syscall in `narf-user-driver-runtime` (future
+    /// companion crate) that mints a shared kernel page IOMMU-pinned
+    /// for the calling driver's `DomainId`. Without that crate
+    /// linked the stub returns `NoCap` so a userspace driver fails
+    /// loudly at the call site rather than silently producing a
+    /// bogus pointer. Until the companion crate ships, hardware
+    /// drivers must link the `kernel` feature instead.
     pub fn alloc_coherent(_size: usize, _domain: DomainId) -> Result<DmaBuffer, DmaError> {
-        // TODO: cap-mediated syscall in narf-user-driver-runtime.
         Err(DmaError::NoCap)
     }
 
@@ -225,22 +230,49 @@ mod user_rt {
     /// IRQ-vector subscription. Userspace impl: each vector maps to
     /// an IPC endpoint cap; the kernel signals it on IRQ delivery.
     /// Returned future resolves on the next signal.
+    ///
+    /// Design — production path will be:
+    ///   1. `wait_for_irq(vec)` looks up the IPC endpoint cap
+    ///      pre-minted for `vec` (one cap per vector per driver,
+    ///      stashed in a thread-local registry by `bind_irq`).
+    ///   2. The returned `IrqWaiter` is wired to the endpoint's
+    ///      receive queue: poll registers the waker; an IRQ
+    ///      delivers a single zero-byte message that flips the
+    ///      ready flag and wakes the waker.
+    ///   3. Future resolves with `()` so the driver can re-enter
+    ///      its service loop.
+    ///
+    /// This is implemented in `narf-user-driver-runtime` (future
+    /// crate); the stub here exposes the type surface plus waker
+    /// registration so a driver crate compiles either way. With
+    /// no companion crate linked the future stays pending forever
+    /// — the kernel feature is the live path until then.
     #[derive(Debug)]
     pub struct IrqWaiter {
         _vec: u8,
+        /// Cached waker so a future `narf-user-driver-runtime`
+        /// callback can resolve us without a fresh `Context`.
+        /// `None` until the first `poll`.
+        waker: Option<core::task::Waker>,
     }
     impl core::future::Future for IrqWaiter {
         type Output = ();
         fn poll(
-            self: core::pin::Pin<&mut Self>,
-            _cx: &mut core::task::Context<'_>,
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<()> {
-            // TODO: poll the IPC endpoint via the user-side runtime.
+            // Register the waker eagerly. A future
+            // `narf-user-driver-runtime::on_irq(vec)` callback can
+            // pluck this and wake us. Today the callback isn't
+            // wired so the future stays Pending — that's the
+            // intended Stub behaviour (no `Err` path; the driver
+            // crate is supposed to link the kernel feature).
+            self.waker = Some(cx.waker().clone());
             core::task::Poll::Pending
         }
     }
     pub fn wait_for_irq(vec: u8) -> IrqWaiter {
-        IrqWaiter { _vec: vec }
+        IrqWaiter { _vec: vec, waker: None }
     }
 
     /// Domain id — same shape as the kernel-side type, just
