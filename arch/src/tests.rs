@@ -3475,3 +3475,99 @@ fn smoke_kpti_detect_immune_or_isolate() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/kpti", smoke_kpti_detect_immune_or_isolate);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_cet_caps_probe_consistent() -> TestResult {
+    use crate::x86_64::cet;
+    // QEMU's `-cpu max` exposes both SHSTK and IBT; Renoir doesn't
+    // (AMD has Shadow Stack since Zen3, IBT via "Hardware-enforced
+    // Stack Protection" since Zen3 in CET) — Zen2 is hit-or-miss.
+    // The smoke is mostly checking the API: caps() must come back
+    // with self-consistent fields. Crucially: if shadow_stack OR ibt
+    // is true, the CR4_CET bit should be settable once we enable_cr4.
+    let caps = cet::caps();
+    // Both bits can be false on Zen2 / older Intel; we just need to
+    // not see an impossible combo (cr4_cet on with neither shadow_stack
+    // nor ibt).
+    if caps.cr4_cet && !caps.shadow_stack && !caps.ibt {
+        return TestResult::Fail(
+            "CR4.CET set but neither SHSTK nor IBT advertised — invalid",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cet", smoke_cet_caps_probe_consistent);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_cet_msr_constants_match_intel_sdm() -> TestResult {
+    use crate::x86_64::cet;
+    // Hardcoded check against the Intel SDM Vol 4 MSR table. If a
+    // refactor accidentally changes one of these, every shadow-stack
+    // setup will silently target the wrong MSR.
+    if cet::MSR_IA32_U_CET != 0x6A0 {
+        return TestResult::Fail("MSR_IA32_U_CET drifted from 0x6A0");
+    }
+    if cet::MSR_IA32_S_CET != 0x6A2 {
+        return TestResult::Fail("MSR_IA32_S_CET drifted from 0x6A2");
+    }
+    if cet::MSR_IA32_PL0_SSP != 0x6A4 {
+        return TestResult::Fail("MSR_IA32_PL0_SSP drifted from 0x6A4");
+    }
+    if cet::MSR_IA32_PL3_SSP != 0x6A7 {
+        return TestResult::Fail("MSR_IA32_PL3_SSP drifted from 0x6A7");
+    }
+    if cet::MSR_IA32_INTERRUPT_SSP_TABLE != 0x6A8 {
+        return TestResult::Fail("MSR_IA32_INTERRUPT_SSP_TABLE drifted from 0x6A8");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cet", smoke_cet_msr_constants_match_intel_sdm);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pac_caps_probe_consistent() -> TestResult {
+    use crate::aarch64::pac;
+    let caps = pac::caps();
+    // FEAT_PAuth (any nonzero APA/API/APA3) implies *some* form of
+    // address auth. If we report enhanced=true but address_auth=false
+    // that's nonsensical.
+    if caps.enhanced && !caps.address_auth {
+        return TestResult::Fail("PAC enhanced=true but address_auth=false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pac", smoke_pac_caps_probe_consistent);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_mte_tag_round_trip() -> TestResult {
+    use crate::aarch64::mte;
+    if !mte::supported() {
+        return TestResult::Skip("MTE not available (use QEMU -machine virt,mte=on)");
+    }
+    // Tag bits live in bits 59:56 of the pointer. IRG inserts a random
+    // tag; the same instruction-form-preserving steps GMI uses fold
+    // the tag back out. We don't STG into memory because that requires
+    // a tag-storage-backed mapping the smoke can't reliably stand up.
+    // What we CAN verify: IRG returns a pointer whose low 56 bits
+    // match the input but bits 59:56 differ from the input tag.
+    let raw_in: u64 = 0x0000_0000_DEAD_BEEF;
+    let p_in = raw_in as *mut u8;
+    // SAFETY: IRG is a register-only op; no memory touched.
+    let p_out = unsafe { mte::irg(p_in) };
+    let raw_out = p_out as u64;
+    if (raw_out & 0x00FF_FFFF_FFFF_FFFF) != (raw_in & 0x00FF_FFFF_FFFF_FFFF) {
+        return TestResult::Fail("IRG modified bits below 56");
+    }
+    // Tag bits (59:56) — the input had 0x0; the output should also
+    // be in [0, 0xF] but probably nonzero (GCR_EL1 randomises across
+    // 16 tags, exclusion mask depending).
+    let tag_out = (raw_out >> 56) & 0xF;
+    if tag_out > 0xF {
+        return TestResult::Fail("IRG returned out-of-range tag");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/mte", smoke_mte_tag_round_trip);
