@@ -60,6 +60,11 @@ pub(crate) const HID_REQ_SET_PROTOCOL: u8 = 0x0B;
 pub(crate) const HID_REQ_SET_IDLE: u8 = 0x0A;
 /// Boot protocol value (vs. 1 = Report Protocol).
 pub(crate) const HID_BOOT_PROTOCOL: u16 = 0;
+/// Report protocol value — the device emits its full report-descriptor-
+/// shaped reports (HID §7.2.6). Required for Precision Touchpads, which
+/// otherwise stay in Boot Mouse mode and emit 3-byte boot-mouse reports
+/// regardless of the descriptor we walked.
+pub(crate) const HID_REPORT_PROTOCOL: u16 = 1;
 // Standard request code (USB 2.0 §9.4 table 9-4) for
 // SET_CONFIGURATION. Standard requests other than this aren't
 // needed in this driver, so we don't pull in a full enum.

@@ -239,6 +239,47 @@ pub async fn try_bind_touchpad_already_addressed(
         .await
         .map_err(HidError::Xhci)?;
 
+    // SET_PROTOCOL(Report) — HID §7.2.6.
+    //
+    // Synaptics / Elan / most Precision Touchpads advertise the Boot
+    // interface (bInterfaceSubClass=1, bInterfaceProtocol=2) for BIOS
+    // compat AND ship powered-up in Boot Mouse protocol. Without an
+    // explicit SET_PROTOCOL(REPORT=1) the device keeps emitting 3-byte
+    // boot-mouse reports — and `ptp::decode_input` rejects every report
+    // because `report[0]` won't match the descriptor-walked input
+    // report-id. The Feature SET_REPORT below would succeed but be
+    // ignored: silent enumeration failure, no PTP events ever surface.
+    // Linux usbhid does this implicitly at attach for non-boot ifaces;
+    // we do it explicitly here. Reference: Linux `drivers/hid/usbhid/
+    // usbhid.c:usbhid_start_interrupt_in_default`.
+    xhci_dev
+        .control_in(
+            slot_id,
+            RT_HOST_TO_DEV_CLASS_IFACE,
+            crate::hid::HID_REQ_SET_PROTOCOL,
+            crate::hid::HID_REPORT_PROTOCOL,
+            interface_num as u16,
+            &mut nothing,
+        )
+        .await
+        .map_err(HidError::Xhci)?;
+
+    // SET_IDLE(0, 0) — "report on state change only". Some Synaptics
+    // firmware silently suppresses reports until SET_IDLE has been
+    // issued at least once. Failure is non-fatal (devices that don't
+    // implement it STALL; SET_PROTOCOL above was the load-bearing
+    // call). Mirrors `BootKeyboard::attach`.
+    let _ = xhci_dev
+        .control_in(
+            slot_id,
+            RT_HOST_TO_DEV_CLASS_IFACE,
+            crate::hid::HID_REQ_SET_IDLE,
+            0,
+            interface_num as u16,
+            &mut nothing,
+        )
+        .await;
+
     // Enable Microsoft PTP "Mouse + Touch" mode via the Mode Feature
     // Report. The mode value is 3 per the MS PTP guide. Failure is
     // non-fatal (some devices STALL the request and fall back to
