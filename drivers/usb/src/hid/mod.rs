@@ -70,6 +70,7 @@ pub(crate) const HID_REPORT_PROTOCOL: u16 = 1;
 // needed in this driver, so we don't pull in a full enum.
 pub(crate) const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
+pub mod consumer;
 pub mod mouse;
 pub mod touchpad;
 

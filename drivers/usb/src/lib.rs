@@ -349,6 +349,7 @@ fn spawn_supervisor_task() {
                     AttachOutcome::Keyboard
                     | AttachOutcome::Mouse
                     | AttachOutcome::Touchpad
+                    | AttachOutcome::ConsumerControl
                     | AttachOutcome::SerialAcm
                     | AttachOutcome::MassStorage
                     | AttachOutcome::AudioClass
@@ -433,6 +434,7 @@ fn spawn_supervisor_task() {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse
                         | AttachOutcome::Touchpad
+                        | AttachOutcome::ConsumerControl
                         | AttachOutcome::SerialAcm
                         | AttachOutcome::MassStorage
                         | AttachOutcome::AudioClass

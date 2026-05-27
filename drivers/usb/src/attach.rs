@@ -56,6 +56,10 @@ pub enum AttachOutcome {
     /// Device bound as a HID Precision Touchpad (PTP). Slot stays
     /// alive; entry was added to `hid::touchpad::TOUCHPADS`.
     Touchpad,
+    /// Device bound as a HID Consumer Control interface (Usage Page
+    /// 0x0C: volume, media transport, brightness, sleep). Slot stays
+    /// alive; entry added to `hid::consumer::CONSUMER_DEVICES`.
+    ConsumerControl,
     /// Device bound as a CDC-ACM serial adaptor (USB-to-serial
     /// dongle, Arduino-style virtual COM port). Slot stays alive;
     /// entry was added to `cdc_acm::ACM_DEVICES`.
@@ -492,6 +496,19 @@ async fn dispatch_after_address(
             {
                 return AttachOutcome::Touchpad;
             }
+        }
+        // HID Consumer Control — Usage Page 0x0C (volume / media /
+        // brightness). Runs after touchpad (same HID class, different
+        // report-descriptor shape) and before Boot Mouse (protocol 2)
+        // because consumer interfaces present protocol=0 and would
+        // look like a non-boot HID device to the mouse scanner.
+        if hid::consumer::try_bind_consumer_already_addressed(
+            xhci_dev, slot_id, 0, &cfg_blob,
+        )
+        .await
+        .is_ok()
+        {
+            return AttachOutcome::ConsumerControl;
         }
         // HID Boot Mouse — class 0x03 / subclass 0x01 / protocol
         // 0x02. Runs after touchpad so a PTP-capable touchpad isn't
