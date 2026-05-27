@@ -803,13 +803,17 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Allocate a free block from the volume. Walks block groups in
     /// order, scanning each group's block bitmap. Returns the
     /// absolute (1-based) block number of the allocated block.
+    ///
+    /// The on-disk `bg_free_blocks_count` is treated as a hint only
+    /// — we still scan the bitmap when the count is zero, because
+    /// the in-memory snapshot reflects mount-time state and we
+    /// don't update the descriptor cache on every alloc. Linux does
+    /// the same (`ext2_new_blocks` re-scans rather than trusting
+    /// the descriptor) for robustness against unclean mounts.
     pub async fn alloc_block(&self) -> Result<u64, FsError> {
         let bpg = self.superblock.blocks_per_group;
         let first_block = self.superblock.first_data_block;
         for (gi, gd) in self.group_descs.iter().enumerate() {
-            if gd.free_blocks_count == 0 {
-                continue;
-            }
             // ext2 block numbers are 1-based starting from
             // first_data_block. Bit 0 of group `g`'s bitmap maps
             // to absolute block `first_data_block + g*blocks_per_group`.
@@ -843,13 +847,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     }
 
     /// Allocate a free inode. Returns the 1-based inode number.
+    /// Treats `bg_free_inodes_count` as a hint (see `alloc_block`).
     pub async fn alloc_inode(&self) -> Result<u32, FsError> {
         let ipg = self.superblock.inodes_per_group;
         let first_reserved = self.superblock.first_ino();
         for (gi, gd) in self.group_descs.iter().enumerate() {
-            if gd.free_inodes_count == 0 {
-                continue;
-            }
             // Reserve first_reserved-1 bits of group 0 (matches
             // mkfs.ext2's behaviour — bit 0 = inode 1, bit 1 = inode 2,
             // ...). Higher groups have no reserved range.
