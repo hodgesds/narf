@@ -393,6 +393,71 @@ pub const fn decode_evt_log_base(reg: u64) -> (u64, u64) {
     (phys, size_field)
 }
 
+// ── AMD-Vi I/O Page Table Entry (spec §2.2.3) ────────────────────
+//
+// AMD-Vi page tables are a 4-level (or 5-level with 5-level paging
+// enabled) walk that very closely mirrors x86_64 host paging. PTEs
+// are 64 bits and laid out as:
+//
+//   [0]      IR  Read permission
+//   [1]      IW  Write permission
+//   [9..12]  Next-level / page-size pointer
+//   [12..52] Page frame (when leaf) or next-level table base
+//   [60]     FC  Forced coherent
+//   [61]     IR-on-IO
+//   [62]     IW-on-IO
+//
+// We model just the boot bring-up subset: Present (IR|IW), R/W,
+// addr mask. Identical mask to host PTEs.
+
+pub const PTE_IR: u64 = 1 << 0;
+pub const PTE_IW: u64 = 1 << 1;
+pub const PTE_PRESENT_MASK: u64 = PTE_IR | PTE_IW;
+pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000; // PM_ADDR_MASK
+pub const PTE_NEXT_LEVEL_SHIFT: u32 = 9;
+pub const PTE_NEXT_LEVEL_MASK: u64 = 0b111 << PTE_NEXT_LEVEL_SHIFT;
+
+/// Build a leaf PTE (next-level=0 ⇒ this is a 4 KiB frame).
+pub const fn pte_leaf(phys: u64, read: bool, write: bool) -> u64 {
+    let mut v = phys & PTE_ADDR_MASK;
+    if read {
+        v |= PTE_IR;
+    }
+    if write {
+        v |= PTE_IW;
+    }
+    v
+}
+
+/// Build a non-leaf PTE pointing at a next-level table base. The
+/// AMD walker decodes the next-level field at bits 9..12 — set it
+/// to the next level (1..6) to continue the walk.
+pub const fn pte_next(next_table: u64, next_level: u8) -> u64 {
+    (next_table & PTE_ADDR_MASK)
+        | PTE_IR
+        | PTE_IW
+        | (((next_level & 0x7) as u64) << PTE_NEXT_LEVEL_SHIFT)
+}
+
+pub const fn pte_present(pte: u64) -> bool {
+    (pte & PTE_PRESENT_MASK) != 0
+}
+
+pub const fn pte_addr(pte: u64) -> u64 {
+    pte & PTE_ADDR_MASK
+}
+
+pub const fn pte_next_level(pte: u64) -> u8 {
+    ((pte & PTE_NEXT_LEVEL_MASK) >> PTE_NEXT_LEVEL_SHIFT) as u8
+}
+
+/// Compute the 9-bit per-level index of `iova` for a 4-level walk.
+/// Level 4 is the top (PML4-equivalent), 1 is the leaf.
+pub const fn pte_level_index(iova: u64, level: u32) -> usize {
+    let shift = 12 + 9 * (level - 1);
+    ((iova >> shift) & 0x1FF) as usize
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AmdViCaps {
     pub iommu_enabled: bool,

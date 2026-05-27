@@ -312,6 +312,66 @@ pub const fn decode_iqa(iqa: u64) -> (u64, u8, bool) {
     (base, qs, wide)
 }
 
+// ── In-memory walker (host-side) ─────────────────────────────────
+//
+// `walk_slpt` resolves an IOVA against a software-built 4-level
+// second-level page-table. Used at test time against a FakeMmio
+// page-table to verify the per-level shift / mask arithmetic
+// matches what real silicon would do — the walk arithmetic is the
+// only piece of the per-domain backend the hardware can't help
+// debug.
+//
+// Layout assumption: each level is a 512-entry array of u64; the
+// caller supplies a closure that turns a phys → &[u64; 512]. The
+// closure shape lets `walk_slpt` work against either real RAM
+// (via the kernel's identity map) or a Vec-of-arrays in tests.
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WalkResult {
+    /// Walk completed; the IOVA maps to `phys` (4 KiB-aligned) +
+    /// the offset within the page.
+    Mapped { phys: u64, offset: u64 },
+    /// Walk stopped at the given level because the entry was not
+    /// present. `level=4..1`.
+    NotPresent { level: u32 },
+}
+
+/// Walk a 4-level second-level page-table built in host memory.
+///
+/// `root_ptr` is the L4 table phys (or a test-supplied opaque); the
+/// `fetch` closure resolves any table phys into a `[u64; 512]`
+/// slice (`SL_PTE` array).
+///
+/// Tests use this to confirm the per-level shift / mask split
+/// matches `iova_level_index` without ever touching real silicon.
+pub fn walk_slpt<F>(root_table: &[u64; 512], iova: u64, mut fetch: F) -> WalkResult
+where
+    F: FnMut(u64) -> Option<[u64; 512]>,
+{
+    let mut current = root_table[iova_level_index(iova, 4)];
+    let mut level = 4u32;
+    while level > 1 {
+        if !sl_pte_present(current) {
+            return WalkResult::NotPresent { level };
+        }
+        let next_phys = sl_pte_addr(current);
+        let next_table = match fetch(next_phys) {
+            Some(t) => t,
+            None => return WalkResult::NotPresent { level: level - 1 },
+        };
+        let next_idx = iova_level_index(iova, level - 1);
+        current = next_table[next_idx];
+        level -= 1;
+    }
+    if !sl_pte_present(current) {
+        return WalkResult::NotPresent { level: 1 };
+    }
+    WalkResult::Mapped {
+        phys: sl_pte_addr(current),
+        offset: iova & (VTD_PAGE_SIZE - 1),
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VtdCaps {
     pub version_major: u8,

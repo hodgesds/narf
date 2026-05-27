@@ -3122,3 +3122,137 @@ fn smoke_amd_vi_evt_log_base_encoding() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/amd_vi", smoke_amd_vi_evt_log_base_encoding);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_pte_leaf_perms() -> TestResult {
+    use crate::x86_64::amd_vi::{pte_addr, pte_leaf, pte_present, PTE_IR, PTE_IW};
+    let phys: u64 = 0xDEAD_F000;
+    let rw = pte_leaf(phys, true, true);
+    if !pte_present(rw) {
+        return TestResult::Fail("RW PTE not present");
+    }
+    if pte_addr(rw) != phys {
+        return TestResult::Fail("addr round-trip mismatch");
+    }
+    if rw & (PTE_IR | PTE_IW) != (PTE_IR | PTE_IW) {
+        return TestResult::Fail("IR + IW bits not set");
+    }
+    let ro = pte_leaf(phys, true, false);
+    if ro & PTE_IW != 0 {
+        return TestResult::Fail("R-only PTE has IW set");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_pte_leaf_perms);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_pte_next_level_encoding() -> TestResult {
+    use crate::x86_64::amd_vi::{
+        pte_addr, pte_next, pte_next_level, pte_present, PTE_NEXT_LEVEL_SHIFT,
+    };
+    let table: u64 = 0x1234_5000;
+    let pte = pte_next(table, 3);
+    if !pte_present(pte) {
+        return TestResult::Fail("non-leaf PTE must be present (IR|IW)");
+    }
+    if pte_addr(pte) != table {
+        return TestResult::Fail("next-table phys round-trip mismatch");
+    }
+    if pte_next_level(pte) != 3 {
+        return TestResult::Fail("next-level field round-trip mismatch");
+    }
+    if (pte >> PTE_NEXT_LEVEL_SHIFT) & 0x7 != 3 {
+        return TestResult::Fail("next-level bit position drift");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_pte_next_level_encoding);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_pte_level_index_round_trip() -> TestResult {
+    use crate::x86_64::amd_vi::pte_level_index;
+    let iova: u64 = (0x055 << 39) | (0x011 << 30) | (0x0F1 << 21) | (0x123 << 12);
+    if pte_level_index(iova, 4) != 0x055 {
+        return TestResult::Fail("L4 idx wrong");
+    }
+    if pte_level_index(iova, 3) != 0x011 {
+        return TestResult::Fail("L3 idx wrong");
+    }
+    if pte_level_index(iova, 2) != 0x0F1 {
+        return TestResult::Fail("L2 idx wrong");
+    }
+    if pte_level_index(iova, 1) != 0x123 {
+        return TestResult::Fail("L1 idx wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_pte_level_index_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_walk_slpt_resolves_iova() -> TestResult {
+    // Build a fake 4-level VT-d page table in host memory that
+    // maps IOVA 0xCAFE_F123 → phys 0xBEEF_F000, then walk it.
+    // This exercises the per-level shift math without touching
+    // any silicon.
+    use crate::x86_64::vtd::{
+        iova_level_index, sl_pte_leaf, sl_pte_next, walk_slpt, WalkResult,
+    };
+
+    // Distinct sentinel phys for L3, L2, L1, leaf.
+    const L3_PHYS: u64 = 0x0010_0000;
+    const L2_PHYS: u64 = 0x0010_1000;
+    const L1_PHYS: u64 = 0x0010_2000;
+    const LEAF_PHYS: u64 = 0xBEEF_F000;
+
+    let iova: u64 = 0xCAFE_F123;
+
+    let mut root = [0u64; 512];
+    let mut l3 = [0u64; 512];
+    let mut l2 = [0u64; 512];
+    let mut l1 = [0u64; 512];
+
+    root[iova_level_index(iova, 4)] = sl_pte_next(L3_PHYS);
+    l3[iova_level_index(iova, 3)] = sl_pte_next(L2_PHYS);
+    l2[iova_level_index(iova, 2)] = sl_pte_next(L1_PHYS);
+    l1[iova_level_index(iova, 1)] = sl_pte_leaf(LEAF_PHYS, true, true);
+
+    let result = walk_slpt(&root, iova, |phys| match phys {
+        L3_PHYS => Some(l3),
+        L2_PHYS => Some(l2),
+        L1_PHYS => Some(l1),
+        _ => None,
+    });
+    match result {
+        WalkResult::Mapped { phys, offset } => {
+            if phys != LEAF_PHYS {
+                return TestResult::Fail("walker resolved wrong phys");
+            }
+            if offset != (iova & 0xFFF) {
+                return TestResult::Fail("walker mishandled page offset");
+            }
+            TestResult::Pass
+        }
+        WalkResult::NotPresent { level } => {
+            let _ = level;
+            TestResult::Fail("walker reported NotPresent on a complete table")
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_walk_slpt_resolves_iova);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_walk_slpt_unmapped_iova() -> TestResult {
+    use crate::x86_64::vtd::{walk_slpt, WalkResult};
+    let root = [0u64; 512];
+    let result = walk_slpt(&root, 0xABCD_E000, |_| None);
+    if !matches!(result, WalkResult::NotPresent { level: 4 }) {
+        return TestResult::Fail("empty root should NotPresent at L4");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_walk_slpt_unmapped_iova);
