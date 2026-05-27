@@ -85,10 +85,18 @@ pub(crate) const REG_TNPDS: u64 = 0x20;
 pub(crate) const REG_CR: u64 = 0x37;
 /// TPPoll — TX priority polling doorbell. §2.5.
 pub(crate) const REG_TPPOLL: u64 = 0x38;
-/// IMR — interrupt mask (16-bit legacy alias; RTL8125 also exposes a
-/// 32-bit mirror at 0xF0). §2.6.
+/// IMR — interrupt mask (16-bit legacy alias). §2.6.
+///
+/// Kept for documentation: the RTL8125's interrupt block is at the
+/// 32-bit [`REG_IMR_8125`] (0x38) / [`REG_ISR_8125`] (0x3C) ports.
+/// The legacy 16-bit alias at 0x3C/0x3E overlaps the low half of
+/// the 32-bit ISR — writing it from a Stage-2 driver would clobber
+/// the high-half status bits. Stage 2 uses the 32-bit ports
+/// exclusively.
 pub(crate) const REG_IMR: u64 = 0x3C;
 /// ISR — interrupt status (write-1-clear, 16-bit legacy alias). §2.6.
+/// See [`REG_ISR_8125`] for the 32-bit 8125 register (same offset,
+/// different width).
 pub(crate) const REG_ISR: u64 = 0x3E;
 /// TCR — TX configuration. §2.7.
 pub(crate) const REG_TCR: u64 = 0x40;
