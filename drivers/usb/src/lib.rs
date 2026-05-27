@@ -21,6 +21,7 @@ pub mod msc;
 pub mod uac;
 pub mod uvc;
 pub mod uvc_stream;
+pub mod wbdi;
 pub mod xhci;
 
 mod tests;
@@ -282,6 +283,7 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::VideoClass
                     | AttachOutcome::NetworkClass
                     | AttachOutcome::Bluetooth
+                    | AttachOutcome::WbdiFingerprint
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -365,6 +367,7 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::VideoClass
                         | AttachOutcome::NetworkClass
                         | AttachOutcome::Bluetooth
+                        | AttachOutcome::WbdiFingerprint
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }

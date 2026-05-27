@@ -84,6 +84,14 @@ pub enum AttachOutcome {
     /// Device bound as a USB hub. Slot stays alive; entry was added
     /// to [`HUBS`] for downstream walking.
     Hub,
+    /// Device recognised as a Windows Biometric Device Interface
+    /// (WBDI) fingerprint reader via MS OS 2.0 Compatible-ID
+    /// descriptor (compatible_id="WINUSB", sub_compatible_id="WBDI").
+    /// Slot stays alive; recogniser logs the match for a future
+    /// userland driver. Vendor command codec is intentionally NOT
+    /// implemented clean-room (Goodix / Synaptics-Validity / ELAN
+    /// formats are libfprint-derived).
+    WbdiFingerprint,
     /// We addressed the device but couldn't bind a class driver
     /// (unknown class, or a class driver we don't have). The slot
     /// has been disabled to free it for re-use.
@@ -448,19 +456,31 @@ async fn dispatch_after_address(
         return AttachOutcome::Hub;
     }
 
-    // Not a hub — try HID Boot Keyboard first, then PTP touchpad
-    // (post-Boot HID Report-protocol). Each call frees the slot on
-    // failure. The mouse / touchpad paths only run if kbd didn't
-    // bind, so we don't double-disable.
+    // Not a hub — run the class-probe cascade. The dispatcher owns
+    // slot lifecycle: each class binder is called with the same
+    // already-addressed `slot_id` and MUST NOT call `disable_slot`
+    // internally on failure. Only after every fallback has returned
+    // UnknownClass do we disable_slot here (the terminal-mismatch
+    // path). Linux pattern: `drivers/usb/core/hub.c::usb_new_device`
+    // → `usb_set_configuration` → per-driver probe; the device
+    // remains addressed until the dispatcher gives up.
+    //
+    // Order: HID Boot Keyboard (fast device-descriptor-only path) →
+    // PTP touchpad → HID Boot Mouse → CDC-ACM → MSC → UAC → UVC →
+    // CDC-NCM → btusb → WBDI fingerprint. Keyboard and mouse use
+    // class-at-interface match; the rest fingerprint via the config
+    // descriptor blob.
     if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed).await.is_ok() {
         return AttachOutcome::Keyboard;
     }
-    // PTP touchpad / CDC-ACM serial: both class binders consume the
-    // device's full configuration descriptor. Fetch once + hand to
-    // each in turn so we don't issue multiple GET_DESCRIPTOR(CONFIG)
-    // round-trips.
+    // PTP touchpad / CDC-ACM serial / MSC / UAC / UVC / CDC-NCM /
+    // btusb / mouse: every binder downstream consumes the device's
+    // full configuration descriptor. Fetch once + hand to each in
+    // turn so we don't issue multiple GET_DESCRIPTOR(CONFIG) round-
+    // trips.
     if let Some(cfg_blob) = fetch_full_config(xhci_dev, slot_id).await {
-        // PTP touchpad first — HID class.
+        // PTP touchpad first — HID class with Report descriptor
+        // shape matching a precision-touchpad device.
         if let Some((iface, hid_off, ep)) =
             hid::touchpad::find_hid_interface(&cfg_blob)
         {
@@ -471,6 +491,20 @@ async fn dispatch_after_address(
             .is_ok()
             {
                 return AttachOutcome::Touchpad;
+            }
+        }
+        // HID Boot Mouse — class 0x03 / subclass 0x01 / protocol
+        // 0x02. Runs after touchpad so a PTP-capable touchpad isn't
+        // demoted to a boot mouse, but before CDC-ACM so a USB mouse
+        // isn't misclassified as a serial dongle.
+        if mouse::find_boot_mouse(&cfg_blob).is_ok() {
+            if mouse::try_bind_mouse_already_addressed(
+                xhci_dev, slot_id, speed,
+            )
+            .await
+            .is_ok()
+            {
+                return AttachOutcome::Mouse;
             }
         }
         // CDC-ACM serial — Comm + Data interface pair.
@@ -520,21 +554,27 @@ async fn dispatch_after_address(
         ).await.is_ok() {
             return AttachOutcome::Bluetooth;
         }
+        // WBDI fingerprint reader — Microsoft Biometric Device
+        // Interface, identified by an MS OS 2.0 Compatible-ID
+        // descriptor of "WINBIO". Last in the cascade because the
+        // wire-up here is intentionally non-fatal: a positive WBDI
+        // sniff records the device for a future userland driver
+        // but doesn't seize the slot beyond logging.
+        if crate::wbdi::try_bind_wbdi_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ).await.is_ok() {
+            return AttachOutcome::WbdiFingerprint;
+        }
     }
-    // try_bind_kbd_already_addressed disables the slot on failure,
-    // so we need to re-enable + re-address for the mouse attempt.
-    // For now, treat as UnknownClass — a real laptop mouse will
-    // come up on the next supervisor cycle as a fresh attach where
-    // the kbd attempt fails fast and the mouse attempt picks it up
-    // (same shape as the existing root-hub path with kbd_fail_count
-    // → mouse fallback). This keeps the recursion logic simple.
-    let _ = mouse::try_bind_mouse_already_addressed; // silences unused
 
-    // UnknownClass: log what we DID see at the interface level so a
-    // future class-driver pass can prioritise. Reading the config
-    // descriptor here is cheap (the slot is still addressed) and
-    // surfaces the class triple of every interface in the log.
+    // Terminal mismatch: every class probe returned UnknownClass.
+    // Free the slot here, in the dispatcher, so the next port-reset
+    // / enable-slot pair on this port doesn't trip the controller's
+    // "port already assigned" Slot Context conflict. Log what the
+    // device's interface descriptors looked like so a future class-
+    // driver pass has a starting point.
     log_unknown_device_classes(xhci_dev, slot_id, port).await;
+    let _ = xhci_dev.disable_slot(slot_id).await;
     AttachOutcome::UnknownClass
 }
 

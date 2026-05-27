@@ -565,10 +565,23 @@ pub async fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<()
 /// This entry point picks up from there: GET_DESCRIPTOR + refresh
 /// EP0 MPS + class match + bind. `port` is the hub's downstream
 /// port number (used purely for log dedup / failure attribution —
-/// not for any xHCI register access). On failure the slot is
-/// disabled so the caller doesn't leak it. On success the kbd is
-/// added to the global registry and `note_attach_ok` records the
-/// port for one-shot logging.
+/// not for any xHCI register access). On success the kbd is added
+/// to the global registry and `note_attach_ok` records the port
+/// for one-shot logging.
+///
+/// **Slot lifecycle**: this function does NOT call `disable_slot`
+/// on failure. The dispatcher in `attach::dispatch_after_address`
+/// owns slot lifecycle and only frees the slot once *every* class-
+/// probe fallback has run and returned `UnknownClass`. Pattern
+/// modeled on Linux's `usb_set_configuration` flow (configure →
+/// enumerate → bind, free only on terminal mismatch — see
+/// `drivers/usb/core/hub.c::usb_new_device`).
+///
+/// Previously this freed the slot internally on failure; subsequent
+/// touchpad / CDC-ACM / MSC / UAC / UVC / CDC-NCM / btusb probes
+/// then reused the same freed `slot_id`, and every control transfer
+/// on it failed with a stale-slot CC — so only kbd and hub could
+/// ever attach. Removed cleanly per the no-shims rule.
 pub async fn try_bind_kbd_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -576,9 +589,7 @@ pub async fn try_bind_kbd_already_addressed(
     speed: xhci::PortSpeed,
 ) -> Result<(), HidError> {
     let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed).await;
-    if r.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id).await;
-    } else {
+    if r.is_ok() {
         note_attach_ok(port);
     }
     r

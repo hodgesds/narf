@@ -284,18 +284,19 @@ pub async fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), H
 /// Hub-downstream mouse attach: caller has already issued port_reset
 /// (on the hub's downstream port), enable_slot, and
 /// address_device_with(_with_topology). This entry point picks up
-/// from there. On failure the slot is disabled so the caller doesn't
-/// leak it.
+/// from there.
+///
+/// **Slot lifecycle**: does NOT call `disable_slot` on failure. The
+/// dispatcher in `attach::dispatch_after_address` owns slot lifecycle
+/// and frees the slot only when *every* class-probe fallback has run
+/// and returned UnknownClass. Linux pattern: see
+/// `drivers/usb/core/hub.c::usb_new_device`.
 pub async fn try_bind_mouse_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
 ) -> Result<(), HidError> {
-    let r = bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await;
-    if r.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id).await;
-    }
-    r
+    bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await
 }
 
 async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
