@@ -842,6 +842,37 @@ impl Xhci {
         // SAFETY: same.
         let hcc1 = unsafe { mmio.read32(CAP_HCCPARAMS1) };
         let csz_64byte = (hcc1 & (1 << 2)) != 0;
+        // HCCPARAMS1.AC64 (bit 0): 1 = 64-bit DMA addresses supported,
+        // 0 = controller can only consume <4 GiB phys addrs. The
+        // driver hands the controller `alloc_coherent` buffers
+        // straight from `DomainId::DRIVER_0`, which does NOT cap to
+        // 32-bit on a 64-bit kernel; if AC64=0 the controller would
+        // truncate the high 32 bits of any DCBAA/Command-Ring/ERST
+        // pointer and corrupt arbitrary DRAM. Renoir + Phoenix are
+        // AC64=1 (verified on the bring-up laptops); refuse bring-up
+        // on AC64=0 hardware so the failure is loud rather than
+        // silent corruption. xHCI 1.2 §5.3.6 + Linux
+        // `drivers/usb/host/xhci.c:xhci_gen_setup` rejects AC64=0
+        // when DMA mask can't be 32-bit-only.
+        use core::fmt::Write as _;
+        let ac64 = (hcc1 & 0x1) != 0;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  xhci: HCCPARAMS1={:#010x} AC64={} CSZ={}",
+            hcc1,
+            ac64 as u32,
+            csz_64byte as u32,
+        );
+        if !ac64 {
+            // Hard fail. The alternative (filtering alloc_coherent to
+            // <4 GiB) needs a DMA-pool plumbing pass that doesn't
+            // exist yet; keeping the failure mode predictable here.
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: AC64=0 — controller can't address 64-bit DMA, refusing bring-up",
+            );
+            return Err(XhciError::NotReady);
+        }
 
         // ── Extended Capabilities walk ─────────────────────────────
         // HCCPARAMS1[31:16] holds xECP, the offset to the first
