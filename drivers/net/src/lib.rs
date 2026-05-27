@@ -41,6 +41,7 @@ pub mod r8169;
 pub mod rtl8125;
 pub mod rtl8139;
 pub mod rtl_phy;
+pub mod tg3;
 
 // Per-driver smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the
@@ -89,6 +90,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "atheros", || {
         atheros::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "tg3", || {
+        tg3::register_pci_driver();
         InitResult::Ok
     });
 }
