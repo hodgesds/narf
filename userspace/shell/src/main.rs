@@ -1848,17 +1848,41 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let _ = unsafe { libc::posix::close(kfd) };
         }
     } else if cmd == b"grep" {
-        // grep [-i] [-v] [-u] PATTERN [FILE]
-        //   -i  case-insensitive match
-        //   -v  invert (print lines NOT containing PATTERN)
-        //   -u  unique: skip consecutive duplicate matching lines
-        //       (covers periodic-log spam like `i8042-mouse: irqs=N`)
+        // grep [-i] [-v] [-u] [-m N] PATTERN [FILE]
+        //   -i    case-insensitive match
+        //   -v    invert (print lines NOT containing PATTERN)
+        //   -u    deduplicate output (256-line rolling set)
+        //   -m N  stop after N matching lines
         // Reads stdin or FILE; literal substring match, no regex.
         let mut s = skip_ws(rest);
         let mut case_insensitive = false;
         let mut invert = false;
         let mut unique = false;
+        let mut max_count: usize = usize::MAX;
         loop {
+            if s.starts_with(b"-m") {
+                // -m N (with space) or -mN
+                let mut num = &s[2..];
+                if num.starts_with(b" ") || num.starts_with(b"\t") {
+                    num = skip_ws(num);
+                }
+                let num_end = num
+                    .iter()
+                    .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+                    .unwrap_or(num.len());
+                let parsed: usize = num[..num_end].iter().fold(0usize, |acc, &b| {
+                    if b.is_ascii_digit() {
+                        acc * 10 + (b - b'0') as usize
+                    } else {
+                        acc
+                    }
+                });
+                if parsed > 0 {
+                    max_count = parsed;
+                }
+                s = skip_ws(&num[num_end..]);
+                continue;
+            }
             if s.starts_with(b"-") && s.len() >= 2 {
                 let flag_end = s
                     .iter()
@@ -1981,7 +2005,8 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 };
                 if invert { !hit } else { hit }
             };
-            loop {
+            let mut matched: usize = 0;
+            'outer: loop {
                 let n = unsafe { libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n <= 0 { break; }
                 for &b in &buf[..n as usize] {
@@ -1995,6 +2020,11 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                                 &mut seen_count,
                                 &mut seen_next,
                             );
+                            matched += 1;
+                            if matched >= max_count {
+                                llen = 0;
+                                break 'outer;
+                            }
                         }
                         llen = 0;
                     } else if llen < line.len() {
@@ -2003,7 +2033,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                     }
                 }
             }
-            if llen > 0 && test(&line[..llen]) {
+            if llen > 0 && matched < max_count && test(&line[..llen]) {
                 emit(
                     fd,
                     &line[..llen],
@@ -2016,6 +2046,87 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             if owned_fd >= 0 {
                 let _ = unsafe { libc::posix::close(owned_fd) };
             }
+        }
+    } else if cmd == b"head" {
+        // head [-n N] [FILE] — print first N lines of FILE or stdin.
+        // Default N = 10.
+        let mut s = skip_ws(rest);
+        let mut limit: usize = 10;
+        if s.starts_with(b"-n") {
+            // Either "-n10" or "-n 10".
+            let mut num = &s[2..];
+            if num.starts_with(b" ") || num.starts_with(b"\t") {
+                num = skip_ws(num);
+            }
+            let num_end = num
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+                .unwrap_or(num.len());
+            let parsed: usize = num[..num_end]
+                .iter()
+                .fold(0usize, |acc, &b| {
+                    if b.is_ascii_digit() {
+                        acc * 10 + (b - b'0') as usize
+                    } else {
+                        acc
+                    }
+                });
+            if parsed > 0 {
+                limit = parsed;
+            }
+            s = skip_ws(&num[num_end..]);
+        }
+        let file = trim_arg(s);
+        let mut owned_fd: i32 = -1;
+        let src_fd = if file.is_empty() {
+            0
+        } else {
+            let mut pbuf = [0u8; 256];
+            if file.len() + 1 >= pbuf.len() {
+                unsafe { write_all(fd, b"head: path too long\n"); }
+                return true;
+            }
+            pbuf[..file.len()].copy_from_slice(file);
+            let f = unsafe { libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0) };
+            if f < 0 {
+                unsafe { write_all(fd, b"head: cannot open file\n"); }
+                return true;
+            }
+            owned_fd = f;
+            f
+        };
+        let mut buf = [0u8; 4096];
+        let mut line = [0u8; 4096];
+        let mut llen = 0usize;
+        let mut emitted = 0usize;
+        'outer: loop {
+            let n = unsafe { libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 { break; }
+            for &b in &buf[..n as usize] {
+                if b == b'\n' {
+                    unsafe {
+                        write_all(fd, &line[..llen]);
+                        write_all(fd, NEWLINE);
+                    }
+                    emitted += 1;
+                    llen = 0;
+                    if emitted >= limit {
+                        break 'outer;
+                    }
+                } else if llen < line.len() {
+                    line[llen] = b;
+                    llen += 1;
+                }
+            }
+        }
+        if emitted < limit && llen > 0 {
+            unsafe {
+                write_all(fd, &line[..llen]);
+                write_all(fd, NEWLINE);
+            }
+        }
+        if owned_fd >= 0 {
+            let _ = unsafe { libc::posix::close(owned_fd) };
         }
     } else if cmd == b"exit" {
         return false;
