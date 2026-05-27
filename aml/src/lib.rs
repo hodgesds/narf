@@ -46,6 +46,8 @@ use narf_acpi::{AcpiError, SdtHeader};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
+pub mod buttons;
+pub mod ec;
 pub mod ec_events;
 pub mod eval;
 pub mod gpe;
@@ -882,6 +884,7 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     // notify_reg_handlers because _REG(EmbeddedCtl, 1) on the
     // EC device may immediately trigger field accesses.
     crate::eval::discover_ec_ports();
+    crate::ec::register_initcalls();
     // Audit #18: notify every device that owns an OpRegion that
     // its region-space is now "connected". Required by ACPI 6.5
     // §6.5.4 before any field read; EC + GenericSerialBus drivers
@@ -895,6 +898,13 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     // a device's _CRS. Devices without _PR0 are presumed
     // always-on (no-op).
     crate::eval::power_on_all_devices();
+    // Wire ACPI fixed-hardware events (lid + power + sleep button):
+    // walk the namespace for PNP0C0D / PNP0C0C / PNP0C0E devices,
+    // register Notify(0x80) handlers, and seed the initial lid
+    // state from `_LID`. Best-effort — desktops without a lid
+    // simply contribute no devices and `current_lid_state()`
+    // stays `None`.
+    let _ = crate::buttons::init();
     Ok(total)
 }
 
