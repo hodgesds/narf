@@ -43,13 +43,15 @@ pub mod cmd {
     pub const INTX_DISABLE: u16 = 1 << 10;
 }
 
-/// Errors from `set_command` / `read_command`.
+/// Errors from `set_command` / `read_command` / `pm_d3hot_cycle`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PciError {
     /// Caller's cap epoch was revoked.
     AuthorityRevoked,
     /// Device isn't a PCIe transport (e.g. virtio-mmio).
     NotPcie,
+    /// Device does not advertise the requested capability (e.g. PM).
+    CapNotPresent,
 }
 
 impl From<narf_capabilities::CapError> for PciError {
@@ -110,6 +112,72 @@ pub fn clear_command(
         cfg_write16(cfg, COMMAND_OFFSET, new);
     }
     Ok(new)
+}
+
+/// PCI capability ID for Power Management (PCI Bus PM Interface
+/// Spec rev 1.2 §3.2.1).
+const PM_CAP_ID: u8 = 0x01;
+/// Offset from the PM cap header to the PMCSR (Power Management
+/// Control / Status) register. PMCSR is 16 bits; bits [1:0] are the
+/// PowerState field (00=D0, 01=D1, 10=D2, 11=D3hot).
+const PM_PMCSR_OFFSET: u64 = 0x04;
+const PM_PMCSR_STATE_MASK: u16 = 0x3;
+const PM_STATE_D0: u16 = 0;
+const PM_STATE_D3HOT: u16 = 3;
+
+/// Drive the device through a D3hot → D0 power-state cycle via its
+/// PCI Power-Management capability. Used to clear sticky / latched
+/// state on controllers whose soft-reset path doesn't recover from
+/// every error mode — notably AMD FCH SDHCI, where SRST_ALL won't
+/// self-clear from a DATA-line-stuck state without first cycling the
+/// PM state (see Linux `drivers/mmc/host/sdhci-pci-core.c:
+/// amd_sdhci_reset`).
+///
+/// This is D3hot, not D3cold — the link stays up, no _PS3/_PS0
+/// ACPI methods are invoked, and config-space state survives. The
+/// PCI PM spec §5.4 requires a 10 ms settle after each PMCSR write
+/// before next config access.
+///
+/// Returns `Err(CapNotPresent)` if the device has no PM cap (very
+/// unusual on PCIe — every endpoint must advertise it per PCIe
+/// §7.5.2).
+pub fn pm_d3hot_cycle(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<(), PciError> {
+    cap.check_live()?;
+    // SAFETY: walking the cap-list on identity-mapped PCIe ECAM.
+    let pm_off = match unsafe { crate::pci_cap::find_cap(device, PM_CAP_ID) } {
+        Ok(Some(off)) => off,
+        _ => return Err(PciError::CapNotPresent),
+    };
+    let pmcsr_off = pm_off + PM_PMCSR_OFFSET;
+    let cfg = pcie_cfg_phys(device)?;
+
+    // SAFETY: caller owns the device; PMCSR is a 2-byte aligned
+    // register inside the PM capability block.
+    let cur = unsafe { cfg_read16(cfg, pmcsr_off) };
+    // Enter D3hot.
+    // SAFETY: same.
+    unsafe {
+        cfg_write16(cfg, pmcsr_off, (cur & !PM_PMCSR_STATE_MASK) | PM_STATE_D3HOT);
+    }
+    // PCI PM Spec §5.4: 10 ms minimum before next config access.
+    let _ = narf_scheduler::responsive_spin_until(
+        || false,
+        narf_time::Deadline::after_ms(10),
+    );
+    // Return to D0. The PowerState field is RW; bits 15..2 are
+    // preserved so we don't clobber PME enable / data / status.
+    // SAFETY: same.
+    unsafe {
+        cfg_write16(cfg, pmcsr_off, cur & !PM_PMCSR_STATE_MASK);
+    }
+    let _ = narf_scheduler::responsive_spin_until(
+        || false,
+        narf_time::Deadline::after_ms(10),
+    );
+    Ok(())
 }
 
 #[inline]

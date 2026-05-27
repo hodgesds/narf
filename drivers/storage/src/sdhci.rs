@@ -195,7 +195,7 @@ impl Sdhci {
     /// Caller owns BAR0 exclusively for the duration of init.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, SdhciError> {
         // SAFETY: caller-asserted.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| SdhciError::BarMapFailed)?;
@@ -203,6 +203,35 @@ impl Sdhci {
             mmio,
             card: IrqSafeSpinLock::new(None),
         };
+
+        // AMD FCH SDHCI quirk: on Renoir / Phoenix / older FCH parts
+        // (1022:7906 / 1022:1611 / 1022:1612 / 1022:14CC / 1022:14E7
+        // and friends), SRST_ALL does NOT self-clear from certain
+        // sticky DATA-line states. The controller hangs the bring-up
+        // path with a ResetTimeout. Linux works around this in
+        // `drivers/mmc/host/sdhci-pci-core.c:amd_sdhci_reset` with a
+        // full PCI power-state cycle BEFORE the soft reset — we do
+        // the same here, scoped to AMD vendor.
+        //
+        // D3hot is sufficient; D3cold (which Linux uses) would need
+        // ACPI _PS3/_PS0 power-resource manipulation that NARF
+        // doesn't wire today. D3hot clears the controller's volatile
+        // state without dropping the link, and is enough on the AMD
+        // FCH parts in practice.
+        if device.id.vendor == 0x1022 {
+            // Power-cycle errors are non-fatal — fall through to the
+            // soft-reset attempt regardless. The user-visible signal
+            // is "no PM cap" (CapNotPresent), which can happen on
+            // QEMU's emulated SDHCI.
+            if let Err(e) = narf_bus::pci::pm_d3hot_cycle(cap, device) {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: AMD pre-reset PM cycle skipped: {:?}",
+                    e,
+                );
+            }
+        }
 
         // 1. Software reset — Reset All (§3.6).
         // SAFETY: identity-mapped MMIO.
@@ -571,6 +600,7 @@ impl Sdhci {
 static CONTROLLER: IrqSafeSpinLock<Option<Sdhci>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    use core::fmt::Write as _;
     // Class match catches all of class 0x08 (system peripheral).
     // Filter to subclass 0x05 (SD host controller) here.
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
@@ -591,7 +621,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: caller-authority over BAR0.
     let dev = match unsafe { Sdhci::bring_up(&device, &cap) } {
         Ok(d) => d,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+        Err(e) => {
+            // Surface the specific bring-up failure mode so a real-HW
+            // "BadDevice" trace tells us whether it's BAR map / reset
+            // timeout / etc. instead of the generic bus log line.
+            let _ = writeln!(
+                narf_console::Writer,
+                "  sdhci: {:04x}:{:04x} bring_up failed: {:?}",
+                device.id.vendor,
+                device.id.device,
+                e,
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
