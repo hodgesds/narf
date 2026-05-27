@@ -293,6 +293,52 @@ fn smoke_microcode_intel_header_reject_bad_version() -> TestResult {
 kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_bad_version);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_header_reject_bad_checksum() -> TestResult {
+    use crate::x86_64::microcode::{IntelUcodeHeader, UcodeError};
+    // Same well-formed 2048-byte layout but with checksum left at
+    // zero — the dword-sum is non-zero and validate must reject.
+    let mut blob = [0u8; 2048];
+    blob[0] = 1; // header_version
+    blob[20] = 1; // loader_revision
+    // Stuff a non-zero dword somewhere to guarantee the sum is
+    // non-zero regardless of platform.
+    blob[36] = 0xDE;
+    blob[37] = 0xAD;
+    blob[38] = 0xBE;
+    blob[39] = 0xEF;
+    let h = match IntelUcodeHeader::decode(&blob) {
+        Some(h) => h,
+        None => return TestResult::Fail("decode unexpectedly failed"),
+    };
+    match h.validate(&blob) {
+        Err(UcodeError::BadHeader) => TestResult::Pass,
+        _ => TestResult::Fail("validate accepted blob with bad checksum"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_bad_checksum);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_header_reject_unaligned_total() -> TestResult {
+    use crate::x86_64::microcode::{IntelUcodeHeader, UcodeError};
+    let mut blob = [0u8; 2048];
+    blob[0] = 1; // header_version
+    blob[20] = 1; // loader_revision
+    // total_size not a multiple of 4 → reject.
+    blob[32..36].copy_from_slice(&123u32.to_le_bytes());
+    let h = match IntelUcodeHeader::decode(&blob) {
+        Some(h) => h,
+        None => return TestResult::Fail("decode unexpectedly failed"),
+    };
+    match h.validate(&blob) {
+        Err(UcodeError::BadHeader) | Err(UcodeError::TooShort) => TestResult::Pass,
+        _ => TestResult::Fail("validate accepted blob with mis-aligned total_size"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_unaligned_total);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_microcode_fms_decode_renoir_phoenix() -> TestResult {
     use crate::x86_64::microcode::FamilyModelStepping;
     // Renoir / Lucienne — Family 17h, Model 60h, Stepping 1.
