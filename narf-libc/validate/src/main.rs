@@ -2907,6 +2907,17 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── new socket C-ABI probes ──────────────────────────────────
+    //
+    // accept4 symbol must link — calling it on an invalid fd would
+    // spin-park inside the underlying accept() retry loop. The
+    // address-load proves the C-ABI shape resolved.
+    let accept4_ok = (narf_libc::accept4 as usize) != 0;
+    narf_libc::printf_str(
+        if accept4_ok { "accept4: ok\n" } else { "accept4: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

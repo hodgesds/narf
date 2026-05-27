@@ -342,6 +342,26 @@ pub unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
     r
 }
 
+/// `accept4(fd, addr, addrlen, flags)` — Linux accept4(2). Same
+/// as accept but applies SOCK_CLOEXEC / SOCK_NONBLOCK from `flags`
+/// atomically to the new fd. Today the underlying accept doesn't
+/// expose the per-fd flag word; the flags are accepted and ignored.
+///
+/// Reference: musl `src/network/accept4.c`.
+///
+/// # Safety
+/// As [`accept`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn accept4(
+    fd:    c_int,
+    addr:  *mut sockaddr,
+    len:   *mut socklen_t,
+    _flags: c_int,
+) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { accept(fd, addr, len) }
+}
+
 /// `send(fd, *buf, len, flags)` — `sendto(fd, buf, len, flags, NULL, 0)`.
 ///
 /// # Safety
