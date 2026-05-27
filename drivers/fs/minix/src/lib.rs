@@ -32,8 +32,10 @@
 //!   consulted; not relied upon as the sole source for any
 //!   field.
 //!
-//! Read-only first cut. Writes / symlinks / the bitmap allocator are
-//! deferred — see TODO comments in `volume.rs` and `node.rs`.
+//! Write support: bitmap allocator + write paths (create / mkdir /
+//! unlink / rmdir / symlink / rename / write / truncate). See
+//! `volume.rs` for the allocator implementation and `node.rs` for
+//! the per-op routing. Reference: Linux `fs/minix/bitmap.c`.
 
 #![no_std]
 

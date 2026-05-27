@@ -57,4 +57,44 @@ impl DirEntry {
         }
         out
     }
+
+    /// Encode this entry into `buf[offset..]`. Caller must reserve
+    /// at least `name_len.entry_size()` bytes.
+    pub fn encode(&self, name_len: NameLen, buf: &mut [u8], offset: usize) {
+        let n = name_len.bytes();
+        let total = name_len.entry_size();
+        let slice = &mut buf[offset..offset + total];
+        for b in slice.iter_mut() {
+            *b = 0;
+        }
+        slice[0..2].copy_from_slice(&self.ino.to_le_bytes());
+        let nb = self.name.as_bytes();
+        let copy_n = core::cmp::min(nb.len(), n);
+        slice[2..2 + copy_n].copy_from_slice(&nb[..copy_n]);
+    }
+}
+
+/// Write a zero entry at `buf[offset..]`. Used by `unlink` /
+/// `rmdir` to mark a directory slot unused without compacting.
+pub fn clear_entry(name_len: NameLen, buf: &mut [u8], offset: usize) {
+    let total = name_len.entry_size();
+    for b in &mut buf[offset..offset + total] {
+        *b = 0;
+    }
+}
+
+/// Find the offset of `name`'s entry inside `buf`, or `None` if
+/// absent.
+pub fn find_entry(name_len: NameLen, buf: &[u8], name: &str) -> Option<usize> {
+    let entry_sz = name_len.entry_size();
+    let mut off = 0;
+    while off + entry_sz <= buf.len() {
+        if let Some(e) = DirEntry::decode(name_len, buf, off) {
+            if e.name == name {
+                return Some(off);
+            }
+        }
+        off += entry_sz;
+    }
+    None
 }

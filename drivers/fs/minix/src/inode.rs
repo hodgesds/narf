@@ -134,4 +134,95 @@ impl Inode {
     pub fn is_symlink(&self) -> bool {
         self.mode & mode::IFMT == mode::IFLNK
     }
+
+    /// Encode this inode into the on-disk format at `buf[offset..]`.
+    /// Inverse of `decode`. Caller must reserve at least the inode-
+    /// size bytes (V1 = 32, V2/V3 = 64).
+    pub fn encode(&self, version: MinixVersion, buf: &mut [u8], offset: usize) {
+        match version {
+            MinixVersion::V1 => self.encode_v1(buf, offset),
+            MinixVersion::V2 | MinixVersion::V3 => self.encode_v2(buf, offset),
+        }
+    }
+
+    fn encode_v1(&self, buf: &mut [u8], offset: usize) {
+        let s = &mut buf[offset..offset + 32];
+        s[0..2].copy_from_slice(&self.mode.to_le_bytes());
+        s[2..4].copy_from_slice(&self.uid.to_le_bytes());
+        s[4..8].copy_from_slice(&self.size.to_le_bytes());
+        s[8..12].copy_from_slice(&self.mtime.to_le_bytes());
+        s[12] = self.gid as u8;
+        s[13] = self.nlinks as u8;
+        // V1 only persists 9 zone slots (7 direct + 1 IND + 1 DBL).
+        for i in 0..9 {
+            let z16 = self.zones[i] as u16;
+            s[14 + i * 2..14 + i * 2 + 2].copy_from_slice(&z16.to_le_bytes());
+        }
+    }
+
+    fn encode_v2(&self, buf: &mut [u8], offset: usize) {
+        let s = &mut buf[offset..offset + 64];
+        // Zero the V2 layout first so reserved slots are stable.
+        for b in s.iter_mut() {
+            *b = 0;
+        }
+        s[0..2].copy_from_slice(&self.mode.to_le_bytes());
+        s[2..4].copy_from_slice(&self.nlinks.to_le_bytes());
+        s[4..6].copy_from_slice(&self.uid.to_le_bytes());
+        s[6..8].copy_from_slice(&self.gid.to_le_bytes());
+        s[8..12].copy_from_slice(&self.size.to_le_bytes());
+        // _atime (12..16) left zero — we don't track atime.
+        s[16..20].copy_from_slice(&self.mtime.to_le_bytes());
+        // _ctime (20..24) — Linux mirrors mtime when ctime is not
+        // independently tracked. Matches mkfs.minix output on quiet
+        // mounts.
+        s[20..24].copy_from_slice(&self.mtime.to_le_bytes());
+        for i in 0..10 {
+            s[24 + i * 4..24 + i * 4 + 4]
+                .copy_from_slice(&self.zones[i].to_le_bytes());
+        }
+    }
+
+    /// Build a fresh regular-file inode. `mode_bits` are the low 9
+    /// POSIX bits; `IFREG` is OR'd in here.
+    pub fn new_regular(mode_bits: u16, mtime: u32) -> Self {
+        Self {
+            mode: mode::IFREG | (mode_bits & 0o777),
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime,
+            zones: [0; 10],
+        }
+    }
+
+    /// Build a fresh directory inode. `nlinks` starts at 2 (self +
+    /// `.` reference back to itself) per Tanenbaum §5.
+    pub fn new_directory(mode_bits: u16, mtime: u32) -> Self {
+        Self {
+            mode: mode::IFDIR | (mode_bits & 0o777),
+            nlinks: 2,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime,
+            zones: [0; 10],
+        }
+    }
+
+    /// Build a fresh symlink inode. Body is the textual target,
+    /// written via `write_file` (MINIX inlines short symlinks in
+    /// `zones[0]` but treating them as regular files works too).
+    pub fn new_symlink(mtime: u32) -> Self {
+        Self {
+            mode: mode::IFLNK | 0o777,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime,
+            zones: [0; 10],
+        }
+    }
 }

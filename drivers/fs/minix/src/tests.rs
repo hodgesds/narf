@@ -381,3 +381,127 @@ fn smoke_minix_mount_ramblock_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/minix", smoke_minix_mount_ramblock_round_trip);
+
+// ── Write smoke tests ───────────────────────────────────────────────
+
+/// Build a fresh V3 image with enough room for write-path exercise.
+/// `n_zones` (32) gives ~28 free data zones — plenty for a couple
+/// of small files + directories.
+fn build_minix3_image_writable() -> Vec<u8> {
+    build_minix3_image(b"")
+}
+
+fn smoke_minix_write_then_read_back() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    // Existing hi.txt file: write data into it, read back.
+    let file = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let payload = b"freshly written data";
+    let n = match poll_once(file.write(0, payload)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("write failed"),
+    };
+    if n != payload.len() {
+        return TestResult::Fail("short write");
+    }
+    let mut buf = [0u8; 64];
+    let m = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read failed"),
+    };
+    if m != payload.len() || &buf[..m] != payload {
+        return TestResult::Fail("read-back mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_write_then_read_back);
+
+fn smoke_minix_create_file_then_delete() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    // Create a new file.
+    let _new_file = match poll_once(root.create("new.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    // Look it up.
+    if poll_once(root.lookup_async("new.txt"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("created file not found on lookup");
+    }
+    // Unlink.
+    if poll_once(root.unlink("new.txt")).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("unlink failed");
+    }
+    // Lookup must now miss.
+    match poll_once(root.lookup_async("new.txt")) {
+        Some(Err(FsError::NotFound)) => {}
+        _ => return TestResult::Fail("unlinked file still resolves"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_create_file_then_delete);
+
+fn smoke_minix_mkdir_then_rmdir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    if poll_once(root.mkdir("sub")).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("mkdir failed");
+    }
+    if poll_once(root.lookup_dir_async("sub"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("created dir not found");
+    }
+    if poll_once(root.rmdir("sub")).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("rmdir failed");
+    }
+    match poll_once(root.lookup_async("sub")) {
+        Some(Err(FsError::NotFound)) => {}
+        _ => return TestResult::Fail("rmdir'd dir still resolves"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_mkdir_then_rmdir);

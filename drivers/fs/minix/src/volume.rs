@@ -17,7 +17,12 @@
 //! `mount()` and reused for every read. `Cap::bootstrap` is never
 //! called from a per-call hot path (project memo).
 //!
-//! TODO: write paths + bitmap allocator.
+//! Write support: see `alloc_inode` / `alloc_zone` / `write_inode` /
+//! `write_block` — bitmap allocator + dirty-write paths, sufficient
+//! to land `create`, `mkdir`, `unlink`, `rmdir`, `write`, `truncate`.
+//! Bitmap walking matches Linux `fs/minix/bitmap.c`'s find-first-zero
+//! scan; the on-disk format is the same byte-level layout Tanenbaum
+//! describes.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -152,6 +157,87 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         // clone; MINIX serialises sector ops via the outer spinlock.
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
         dst.copy_from_slice(src);
+        Ok(())
+    }
+
+    /// Write one device sector (LBS bytes) from `src`. Inverse of
+    /// `read_sector`. `src.len()` must equal LBS.
+    pub async fn write_sector(&self, lba: u64, src: &[u8]) -> Result<(), FsError> {
+        let lbs = self.io.lock().lbs;
+        if src.len() != lbs {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        // Stage the bytes into the DMA scratch buffer first.
+        {
+            let buf = self
+                .io
+                .lock()
+                .buffer()
+                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+            // SAFETY: see `read_sector`. The cap → registry resolve
+            // guarantees the buffer is alive; the spinlock serialises
+            // ops, so no concurrent user.
+            let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
+            dst.copy_from_slice(src);
+        }
+        let cap = { self.io.lock().cap };
+        let req = BlockRequest {
+            op: BlockOp::Write { fua: false },
+            lba,
+            blocks: 1,
+            buffer: cap
+                .derive::<Read>()
+                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+            qos: QosHint::Latency,
+            user_tag: 0,
+        };
+        let completion = self.device.submit(req).await;
+        completion.result.map_err(FsError::Io)?;
+        Ok(())
+    }
+
+    /// Write one MINIX *block* from `src`. Inverse of `read_block`.
+    pub async fn write_block(&self, block_no: u32, src: &[u8]) -> Result<(), FsError> {
+        let bs = self.sb.block_size as usize;
+        if src.len() != bs {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let lbs = self.io.lock().lbs;
+        let start_lba = block_no as u64 * bs as u64 / lbs as u64;
+        if bs >= lbs {
+            let n = bs / lbs;
+            for i in 0..n {
+                let offset = i * lbs;
+                self.write_sector(start_lba + i as u64, &src[offset..offset + lbs])
+                    .await?;
+            }
+        } else {
+            // MINIX block smaller than LBS — read-modify-write the
+            // enclosing device sector.
+            let mut sector = vec![0u8; lbs];
+            self.read_sector(start_lba, &mut sector).await?;
+            let off_in_sector = (block_no as usize * bs) % lbs;
+            sector[off_in_sector..off_in_sector + bs].copy_from_slice(src);
+            self.write_sector(start_lba, &sector).await?;
+        }
+        Ok(())
+    }
+
+    /// Write one MINIX zone from `src`. Inverse of `read_zone`.
+    pub async fn write_zone(&self, zone_no: u32, src: &[u8]) -> Result<(), FsError> {
+        let zs = self.sb.zone_size() as usize;
+        if src.len() != zs {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let blocks_per_zone = (1u32 << self.sb.log_zone_size as u32) as usize;
+        let bs = self.sb.block_size as usize;
+        for i in 0..blocks_per_zone {
+            let block = zone_no
+                .checked_mul(blocks_per_zone as u32)
+                .and_then(|b| b.checked_add(i as u32))
+                .ok_or(FsError::Io(narf_block::BlockError::InvalidRange))?;
+            self.write_block(block, &src[i * bs..(i + 1) * bs]).await?;
+        }
         Ok(())
     }
 
@@ -368,6 +454,403 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let n = self.read_file(inode, 0, &mut out).await?;
         out.truncate(n);
         Ok(out)
+    }
+
+    // ── Write paths ─────────────────────────────────────────────
+
+    /// Write inode `ino` (1-based) back into the inode table.
+    pub async fn write_inode(
+        &self,
+        ino: u32,
+        inode: &super::inode::Inode,
+    ) -> Result<(), FsError> {
+        let (block, off_in_block) = self
+            .sb
+            .inode_location(ino)
+            .ok_or(FsError::NotFound)?;
+        let bs = self.sb.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        self.read_block(block, &mut buf).await?;
+        inode.encode(self.sb.version, &mut buf, off_in_block as usize);
+        self.write_block(block, &buf).await
+    }
+
+    /// Bitmap-allocator helper (Linux `fs/minix/bitmap.c`
+    /// `minix_find_first_zero_bit` equivalent).
+    ///
+    /// Scans a bitmap region (`start_block` for `n_blocks`) for the
+    /// first zero bit, sets it, writes the block back, and returns
+    /// the (1-based) ordinal of the bit. Returns `FsError::NoSpace`
+    /// when every bit is set.
+    ///
+    /// Bit 0 of the bitmap is reserved (Tanenbaum §5: bitmap counts
+    /// from 1 so inode/zone 0 is always "free", which collapses on
+    /// the convention "inode 0 / zone 0 means absent"). The MINIX
+    /// `mkfs` initialises bit 0 = 1 for that reason; we honour it on
+    /// allocation by skipping bit 0 of the first bitmap block.
+    async fn alloc_bitmap_bit(
+        &self,
+        start_block: u32,
+        n_blocks: u32,
+        max_ordinal: u32,
+    ) -> Result<u32, FsError> {
+        let bs = self.sb.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        for blk in 0..n_blocks {
+            self.read_block(start_block + blk, &mut buf).await?;
+            for (byte_idx, byte) in buf.iter_mut().enumerate() {
+                if *byte == 0xFF {
+                    continue;
+                }
+                for bit in 0..8u32 {
+                    if *byte & (1 << bit) != 0 {
+                        continue;
+                    }
+                    let ordinal =
+                        blk * (bs as u32 * 8) + byte_idx as u32 * 8 + bit;
+                    if ordinal == 0 {
+                        // Reserved per MINIX convention.
+                        continue;
+                    }
+                    if ordinal > max_ordinal {
+                        return Err(FsError::NoSpace);
+                    }
+                    *byte |= 1 << bit;
+                    self.write_block(start_block + blk, &buf).await?;
+                    return Ok(ordinal);
+                }
+            }
+        }
+        Err(FsError::NoSpace)
+    }
+
+    /// Bitmap-free helper. Clears the bit corresponding to `ordinal`
+    /// in the bitmap region. Idempotent at the byte level; if the bit
+    /// was already clear we still write the (unchanged) block back.
+    async fn free_bitmap_bit(
+        &self,
+        start_block: u32,
+        n_blocks: u32,
+        ordinal: u32,
+    ) -> Result<(), FsError> {
+        let bs = self.sb.block_size as usize;
+        let bits_per_block = (bs * 8) as u32;
+        let blk_offset = ordinal / bits_per_block;
+        if blk_offset >= n_blocks {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let bit_within = ordinal % bits_per_block;
+        let byte_idx = (bit_within / 8) as usize;
+        let bit_idx = bit_within % 8;
+        let mut buf = vec![0u8; bs];
+        let blk = start_block + blk_offset;
+        self.read_block(blk, &mut buf).await?;
+        buf[byte_idx] &= !(1u8 << bit_idx);
+        self.write_block(blk, &buf).await
+    }
+
+    /// Allocate a fresh inode. Returns the (1-based) inode number.
+    pub async fn alloc_inode(&self) -> Result<u32, FsError> {
+        let imap_start = self.sb.imap_first_block();
+        let n = self.sb.imap_blocks;
+        self.alloc_bitmap_bit(imap_start, n, self.sb.ninodes).await
+    }
+
+    /// Free inode `ino`.
+    pub async fn free_inode(&self, ino: u32) -> Result<(), FsError> {
+        let imap_start = self.sb.imap_first_block();
+        let n = self.sb.imap_blocks;
+        self.free_bitmap_bit(imap_start, n, ino).await
+    }
+
+    /// Allocate a fresh zone. Returns the absolute zone number.
+    /// Tanenbaum §5: the zone bitmap is indexed from
+    /// `first_data_zone` (bit 0 of the zmap → zone
+    /// `first_data_zone`). We expose the absolute zone number so
+    /// the inode `zones[]` field can be filled directly.
+    pub async fn alloc_zone(&self) -> Result<u32, FsError> {
+        let zmap_start = self.sb.zmap_first_block();
+        let n = self.sb.zmap_blocks;
+        // Max bitmap ordinal = data zones available.
+        let max_data_zones = self
+            .sb
+            .nzones
+            .saturating_sub(self.sb.first_data_zone)
+            .saturating_add(1);
+        let ordinal = self.alloc_bitmap_bit(zmap_start, n, max_data_zones).await?;
+        // Bit `k` → absolute zone `first_data_zone + k - 1` (the
+        // "-1" because the bitmap counts from bit 1, with bit 0
+        // reserved per convention).
+        let abs = self
+            .sb
+            .first_data_zone
+            .checked_add(ordinal - 1)
+            .ok_or(FsError::NoSpace)?;
+        Ok(abs)
+    }
+
+    /// Free zone `zone_no` (absolute zone number).
+    pub async fn free_zone(&self, zone_no: u32) -> Result<(), FsError> {
+        let zmap_start = self.sb.zmap_first_block();
+        let n = self.sb.zmap_blocks;
+        if zone_no < self.sb.first_data_zone {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let ordinal = zone_no - self.sb.first_data_zone + 1;
+        self.free_bitmap_bit(zmap_start, n, ordinal).await
+    }
+
+    /// Map a file's block-in-file → absolute zone, allocating
+    /// zones (and indirect-block pointers) as needed. Used by
+    /// `write_file` so writes that extend the file or fill holes
+    /// can route data into freshly-allocated zones.
+    ///
+    /// The `inode` reference is updated in place. The caller is
+    /// responsible for persisting the inode via `write_inode`.
+    pub async fn map_block_alloc(
+        &self,
+        inode: &mut super::inode::Inode,
+        block_in_file: u32,
+    ) -> Result<u32, FsError> {
+        use super::inode::{DBL_SLOT, DIRECT_ZONES, IND_SLOT, TRI_SLOT};
+        let zpb = self.sb.zone_ptrs_per_block();
+        let direct = DIRECT_ZONES as u32;
+        if block_in_file < direct {
+            if inode.zones[block_in_file as usize] == 0 {
+                let z = self.alloc_zone().await?;
+                inode.zones[block_in_file as usize] = z;
+                // Zero-fill the freshly-allocated zone.
+                let zs = self.sb.zone_size() as usize;
+                let zeros = vec![0u8; zs];
+                self.write_zone(z, &zeros).await?;
+            }
+            return Ok(inode.zones[block_in_file as usize]);
+        }
+        let mut idx = block_in_file - direct;
+        if idx < zpb {
+            if inode.zones[IND_SLOT] == 0 {
+                let z = self.alloc_zone().await?;
+                inode.zones[IND_SLOT] = z;
+                let zs = self.sb.zone_size() as usize;
+                let zeros = vec![0u8; zs];
+                self.write_zone(z, &zeros).await?;
+            }
+            return self.alloc_indirect(inode.zones[IND_SLOT], idx).await;
+        }
+        idx -= zpb;
+        if idx < zpb * zpb {
+            if inode.zones[DBL_SLOT] == 0 {
+                let z = self.alloc_zone().await?;
+                inode.zones[DBL_SLOT] = z;
+                let zs = self.sb.zone_size() as usize;
+                let zeros = vec![0u8; zs];
+                self.write_zone(z, &zeros).await?;
+            }
+            let outer = idx / zpb;
+            let inner = idx % zpb;
+            let mid_slot = self.alloc_indirect(inode.zones[DBL_SLOT], outer).await?;
+            return self.alloc_indirect(mid_slot, inner).await;
+        }
+        idx -= zpb * zpb;
+        if matches!(self.sb.version, super::MinixVersion::V1) {
+            return Err(FsError::NoSpace);
+        }
+        if inode.zones[TRI_SLOT] == 0 {
+            let z = self.alloc_zone().await?;
+            inode.zones[TRI_SLOT] = z;
+            let zs = self.sb.zone_size() as usize;
+            let zeros = vec![0u8; zs];
+            self.write_zone(z, &zeros).await?;
+        }
+        let outer = idx / (zpb * zpb);
+        let mid_idx = (idx / zpb) % zpb;
+        let inner = idx % zpb;
+        let mid = self.alloc_indirect(inode.zones[TRI_SLOT], outer).await?;
+        let inner_blk = self.alloc_indirect(mid, mid_idx).await?;
+        self.alloc_indirect(inner_blk, inner).await
+    }
+
+    /// Helper: read/alloc/write one zone pointer at `idx` in
+    /// indirect block `block_no`. If the slot is zero, allocates a
+    /// fresh zone and writes the pointer back. Returns the resolved
+    /// zone number.
+    async fn alloc_indirect(&self, block_no: u32, idx: u32) -> Result<u32, FsError> {
+        let bs = self.sb.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        self.read_block(block_no, &mut buf).await?;
+        let zps = self.sb.zone_ptr_size();
+        let off = idx as usize * zps;
+        if off + zps > bs {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let cur = match self.sb.version {
+            super::MinixVersion::V1 => {
+                u16::from_le_bytes([buf[off], buf[off + 1]]) as u32
+            }
+            super::MinixVersion::V2 | super::MinixVersion::V3 => u32::from_le_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+            ]),
+        };
+        if cur != 0 {
+            return Ok(cur);
+        }
+        let z = self.alloc_zone().await?;
+        match self.sb.version {
+            super::MinixVersion::V1 => {
+                let bytes = (z as u16).to_le_bytes();
+                buf[off..off + 2].copy_from_slice(&bytes);
+            }
+            super::MinixVersion::V2 | super::MinixVersion::V3 => {
+                buf[off..off + 4].copy_from_slice(&z.to_le_bytes());
+            }
+        }
+        self.write_block(block_no, &buf).await?;
+        // Zero-fill the freshly-allocated zone (it may be used as a
+        // data zone or another indirect block).
+        let zs = self.sb.zone_size() as usize;
+        let zeros = vec![0u8; zs];
+        self.write_zone(z, &zeros).await?;
+        Ok(z)
+    }
+
+    /// Free every zone an inode owns (direct + indirect) and zero
+    /// the inode's `zones[]` field. Used by `unlink` / `rmdir` /
+    /// `truncate(0)`.
+    pub async fn truncate_inode(
+        &self,
+        inode: &mut super::inode::Inode,
+    ) -> Result<(), FsError> {
+        use super::inode::{DBL_SLOT, DIRECT_ZONES, IND_SLOT, TRI_SLOT};
+        let zpb = self.sb.zone_ptrs_per_block();
+
+        for i in 0..DIRECT_ZONES {
+            let z = inode.zones[i];
+            if z != 0 {
+                self.free_zone(z).await?;
+                inode.zones[i] = 0;
+            }
+        }
+        // Single-indirect.
+        let ind = inode.zones[IND_SLOT];
+        if ind != 0 {
+            self.free_indirect_one(ind, zpb).await?;
+            self.free_zone(ind).await?;
+            inode.zones[IND_SLOT] = 0;
+        }
+        // Double-indirect.
+        let dbl = inode.zones[DBL_SLOT];
+        if dbl != 0 {
+            let bs = self.sb.block_size as usize;
+            let mut buf = vec![0u8; bs];
+            self.read_block(dbl, &mut buf).await?;
+            for i in 0..zpb {
+                let inner = self.read_indirect_slot(&buf, i);
+                if inner != 0 {
+                    self.free_indirect_one(inner, zpb).await?;
+                    self.free_zone(inner).await?;
+                }
+            }
+            self.free_zone(dbl).await?;
+            inode.zones[DBL_SLOT] = 0;
+        }
+        // Triple-indirect.
+        if !matches!(self.sb.version, super::MinixVersion::V1) {
+            let tri = inode.zones[TRI_SLOT];
+            if tri != 0 {
+                let bs = self.sb.block_size as usize;
+                let mut buf = vec![0u8; bs];
+                self.read_block(tri, &mut buf).await?;
+                for i in 0..zpb {
+                    let mid = self.read_indirect_slot(&buf, i);
+                    if mid != 0 {
+                        let mut mbuf = vec![0u8; bs];
+                        self.read_block(mid, &mut mbuf).await?;
+                        for j in 0..zpb {
+                            let inner = self.read_indirect_slot(&mbuf, j);
+                            if inner != 0 {
+                                self.free_indirect_one(inner, zpb).await?;
+                                self.free_zone(inner).await?;
+                            }
+                        }
+                        self.free_zone(mid).await?;
+                    }
+                }
+                self.free_zone(tri).await?;
+                inode.zones[TRI_SLOT] = 0;
+            }
+        }
+        inode.size = 0;
+        Ok(())
+    }
+
+    /// Free every zone listed in a single-indirect block (does not
+    /// free the indirect block itself — caller does that).
+    async fn free_indirect_one(&self, block_no: u32, zpb: u32) -> Result<(), FsError> {
+        let bs = self.sb.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        self.read_block(block_no, &mut buf).await?;
+        for i in 0..zpb {
+            let z = self.read_indirect_slot(&buf, i);
+            if z != 0 {
+                self.free_zone(z).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_indirect_slot(&self, buf: &[u8], idx: u32) -> u32 {
+        let zps = self.sb.zone_ptr_size();
+        let off = idx as usize * zps;
+        match self.sb.version {
+            super::MinixVersion::V1 => {
+                u16::from_le_bytes([buf[off], buf[off + 1]]) as u32
+            }
+            super::MinixVersion::V2 | super::MinixVersion::V3 => u32::from_le_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+            ]),
+        }
+    }
+
+    /// Write `src` to `inode` starting at `offset`, allocating
+    /// zones as needed. Extends the inode's `size` to cover the new
+    /// data. Caller is responsible for persisting the inode.
+    pub async fn write_file(
+        &self,
+        inode: &mut super::inode::Inode,
+        offset: u64,
+        src: &[u8],
+    ) -> Result<usize, FsError> {
+        let zs = self.sb.zone_size() as u64;
+        let mut total = 0usize;
+        let mut remaining = src.len();
+        let mut cur_off = offset;
+        while remaining > 0 {
+            let block_in_file = (cur_off / zs) as u32;
+            let zone_offset = (cur_off % zs) as usize;
+            let n = core::cmp::min(remaining, zs as usize - zone_offset);
+            let zone_no = self.map_block_alloc(inode, block_in_file).await?;
+            // Read-modify-write the zone unless we're rewriting the whole thing.
+            let mut zbuf = vec![0u8; zs as usize];
+            if zone_offset != 0 || n != zs as usize {
+                self.read_zone(zone_no, &mut zbuf).await?;
+            }
+            zbuf[zone_offset..zone_offset + n]
+                .copy_from_slice(&src[total..total + n]);
+            self.write_zone(zone_no, &zbuf).await?;
+            total += n;
+            remaining -= n;
+            cur_off += n as u64;
+        }
+        if cur_off > inode.size as u64 {
+            inode.size = cur_off as u32;
+        }
+        Ok(total)
     }
 
     // Helper used during mount(), before the volume Arc exists.
