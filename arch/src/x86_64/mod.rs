@@ -28,6 +28,7 @@ pub mod invlpgb;
 pub mod io_port;
 pub mod ir;
 pub mod keylocker;
+pub mod kpti;
 pub mod lam;
 pub mod lass;
 pub mod lbr;

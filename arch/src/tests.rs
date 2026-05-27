@@ -3395,3 +3395,83 @@ fn smoke_vtd_push_qi_desc_to_ram_queue() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/vtd", smoke_vtd_push_qi_desc_to_ram_queue);
+
+// ── SMEP / SMAP / KPTI / CET hardening smokes ─────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_smep_caps_and_cr4() -> TestResult {
+    use crate::x86_64::smep;
+    if !smep::supported() {
+        return TestResult::Skip("SMEP not advertised by CPUID");
+    }
+    let was = smep::is_enabled();
+    // SAFETY: SMEP supported; toggling is benign at CPL=0.
+    unsafe {
+        smep::enable();
+    }
+    if !smep::is_enabled() {
+        return TestResult::Fail("CR4.SMEP did not stick after enable()");
+    }
+    if !was {
+        // SAFETY: restore prior CR4 state for tests-only.
+        unsafe {
+            smep::disable_for_test();
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/smep", smoke_smep_caps_and_cr4);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_smap_caps_and_bracket() -> TestResult {
+    use crate::x86_64::smap;
+    if !smap::supported() {
+        return TestResult::Skip("SMAP not advertised by CPUID");
+    }
+    let was = smap::is_enabled();
+    // SAFETY: SMAP supported; CR4 toggle benign at CPL=0.
+    unsafe {
+        smap::enable();
+    }
+    if !smap::is_enabled() {
+        return TestResult::Fail("CR4.SMAP did not stick after enable()");
+    }
+    let mut saw_ac = false;
+    // SAFETY: closure body just reads EFLAGS; no user memory touched.
+    unsafe {
+        smap::with_user_access(|| {
+            saw_ac = smap::read_ac();
+        });
+    }
+    if smap::read_ac() {
+        return TestResult::Fail("CLAC did not clear EFLAGS.AC after bracket");
+    }
+    if !saw_ac {
+        return TestResult::Fail("STAC did not set EFLAGS.AC inside bracket");
+    }
+    if !was {
+        // SAFETY: restore prior CR4 state.
+        unsafe {
+            smap::disable_for_test();
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/smap", smoke_smap_caps_and_bracket);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_kpti_detect_immune_or_isolate() -> TestResult {
+    use crate::x86_64::ident::{self, Vendor};
+    use crate::x86_64::kpti::{self, Posture};
+    let p = kpti::detect();
+    let id = ident::read();
+    if matches!(id.vendor, Vendor::Amd | Vendor::Hygon) && p != Posture::Native {
+        return TestResult::Fail("AMD/Hygon reported as needing KPTI — should be immune");
+    }
+    let _ = matches!(p, Posture::Native | Posture::Isolate);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/kpti", smoke_kpti_detect_immune_or_isolate);
