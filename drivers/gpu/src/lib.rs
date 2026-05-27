@@ -110,6 +110,8 @@ pub enum GpuError {
     InvalidSubmission,
 }
 
+pub mod dmabuf;
+pub mod drm;
 pub mod amdgpu;
 pub mod amdgpu_atom_dcn;
 pub mod backlight;

@@ -1,0 +1,347 @@
+//! DRM card — one logical GPU as seen by userspace.
+//!
+//! In Linux this lives in `drivers/gpu/drm/drm_drv.c` and
+//! `drivers/gpu/drm/drm_mode_config.c`.  A `Card` groups:
+//!
+//! - **Connectors** — physical output ports (eDP, HDMI, DP, VGA).
+//! - **Encoders** — signal conversion hardware (TMDS, LVDS, DAC).
+//! - **CRTCs** — programmable display timing controllers.
+//! - **GEM handle table** — per-card buffer-object registry.
+//! - **Driver name** — reported back by DRM_IOCTL_VERSION.
+//!
+//! The `Card` struct is cheap to store in a `static` spin-lock because
+//! it owns all state by value (no heap pointers from global statics).
+//!
+//! ## Linux references
+//!
+//! - `struct drm_device` in `include/drm/drm_device.h`.
+//! - `struct drm_mode_config` in `include/drm/drm_mode_config.h`.
+//! - `struct drm_connector` in `include/drm/drm_connector.h`.
+//! - `struct drm_crtc` in `include/drm/drm_crtc.h`.
+
+use alloc::vec::Vec;
+use super::gem::GemTable;
+
+// ── Connector ──────────────────────────────────────────────────────────
+
+/// Physical connector type.
+///
+/// Linux: `DRM_MODE_CONNECTOR_*` defines in `include/uapi/drm/drm_mode.h`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConnectorType {
+    Unknown    = 0,
+    Vga        = 1,
+    Dvii       = 2,
+    Dvid       = 3,
+    Dvia       = 4,
+    Composite  = 5,
+    Svideo     = 6,
+    Lvds       = 7,
+    Component  = 8,
+    NinePinDin = 9,
+    DisplayPort = 10,
+    HdmiA      = 11,
+    HdmiB      = 12,
+    Tv         = 13,
+    Edp        = 14,
+    Virtual    = 15,
+    Dsi        = 16,
+    Dpi        = 17,
+    Writeback  = 18,
+    Spi        = 19,
+    Usb        = 20,
+}
+
+/// Physical link status of a connector.
+///
+/// Linux: `DRM_MODE_CONNECTOR_Connected` etc.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConnectorStatus {
+    Connected    = 1,
+    Disconnected = 2,
+    Unknown      = 3,
+}
+
+/// A physical display output port.
+///
+/// Linux analogue: `struct drm_connector`.
+#[derive(Clone, Debug)]
+pub struct Connector {
+    /// Connector index within the card (0-based).
+    pub id: u32,
+    /// Physical connector type.
+    pub connector_type: ConnectorType,
+    /// Type-within-type index (e.g. second HDMI port = 1).
+    pub connector_type_id: u32,
+    /// Current link status.
+    pub status: ConnectorStatus,
+    /// Encoder currently driving this connector (index into `Card::encoders`).
+    pub encoder_id: Option<u32>,
+    /// Supported display modes (populated by EDID read / driver probe).
+    pub modes: Vec<crate::Mode>,
+}
+
+// ── Encoder ────────────────────────────────────────────────────────────
+
+/// Encoder type.
+///
+/// Linux: `DRM_MODE_ENCODER_*` in `include/uapi/drm/drm_mode.h`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EncoderType {
+    None  = 0,
+    Dac   = 1,
+    Tmds  = 2,
+    Lvds  = 3,
+    Tvdac = 4,
+    Virtual = 5,
+    Dsi   = 6,
+    Dpmst = 7,
+    Dpi   = 8,
+}
+
+/// Signal-conversion block between a CRTC and a connector.
+///
+/// Linux analogue: `struct drm_encoder`.
+#[derive(Clone, Debug)]
+pub struct Encoder {
+    /// Encoder index within the card (0-based).
+    pub id: u32,
+    /// Encoder type.
+    pub encoder_type: EncoderType,
+    /// Bitmask of CRTCs this encoder can be attached to.
+    pub possible_crtcs: u32,
+    /// Bitmask of other encoders this can clone with.
+    pub possible_clones: u32,
+    /// Currently attached CRTC index.
+    pub crtc_id: Option<u32>,
+}
+
+// ── CRTC ───────────────────────────────────────────────────────────────
+
+/// Programmable display timing controller.
+///
+/// Linux analogue: `struct drm_crtc`.
+#[derive(Clone, Debug)]
+pub struct Crtc {
+    /// CRTC index within the card (0-based).
+    pub id: u32,
+    /// Currently programmed display mode (None = disabled).
+    pub mode: Option<crate::Mode>,
+    /// Whether the CRTC is currently active.
+    pub enabled: bool,
+    /// GEM handle of the framebuffer currently scanned out (None = blank).
+    pub primary_fb: Option<u32>,
+    /// X/Y offset of the primary plane within the framebuffer.
+    pub x: u32,
+    pub y: u32,
+}
+
+// ── Framebuffer ────────────────────────────────────────────────────────
+
+/// Colour encoding (pixel format).
+///
+/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PixelFormat {
+    Xrgb8888 = 0x3438_5258, // "XR24" little-endian
+    Argb8888 = 0x3438_3241, // "AR24"
+    Rgb565   = 0x3631_5247, // "RG16"
+}
+
+/// Kernel-side framebuffer descriptor (result of ADDFB2).
+///
+/// Linux analogue: `struct drm_framebuffer`.
+#[derive(Clone, Debug)]
+pub struct Framebuffer {
+    /// Per-card framebuffer id (assigned by ADDFB2).
+    pub id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Pixel format.
+    pub format: PixelFormat,
+    /// Byte pitch of the primary plane.
+    pub pitch: u32,
+    /// GEM handle of the backing buffer object.
+    pub gem_handle: u32,
+}
+
+// ── Card ───────────────────────────────────────────────────────────────
+
+/// Errors from card operations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CardError {
+    /// No CRTC with the given id.
+    UnknownCrtc,
+    /// No connector with the given id.
+    UnknownConnector,
+    /// No encoder with the given id.
+    UnknownEncoder,
+    /// No framebuffer with the given id.
+    UnknownFb,
+    /// Framebuffer ID already in use.
+    FbIdCollision,
+    /// The pixel format code is not recognised.
+    UnknownFormat,
+    /// GEM handle does not exist.
+    BadGemHandle,
+    /// Invalid dimensions (zero width or height).
+    InvalidDimensions,
+    /// Maximum number of framebuffers reached.
+    TooManyFbs,
+}
+
+/// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
+///
+/// Linux analogue: `struct drm_device` + `drm_mode_config`.
+///
+/// The `Card` is intentionally `Clone`-able (all fields are `Clone`)
+/// so it can live behind a spin-lock and be copied out for inspection
+/// without holding the lock.
+#[derive(Debug)]
+pub struct Card {
+    /// Human-readable driver name (e.g. `"narf-i915"` or `"narf-amdgpu"`).
+    pub driver_name: &'static str,
+    /// Driver version triple.
+    pub version: (u32, u32, u32),
+    /// Description string for DRM_IOCTL_VERSION.
+    pub driver_desc: &'static str,
+    /// Connectors — one entry per physical output port.
+    pub connectors: Vec<Connector>,
+    /// Encoders.
+    pub encoders: Vec<Encoder>,
+    /// CRTCs.
+    pub crtcs: Vec<Crtc>,
+    /// Registered framebuffers (created by ADDFB2, removed by RMFB).
+    pub framebuffers: Vec<Framebuffer>,
+    /// Next framebuffer id to assign.
+    pub(crate) next_fb_id: u32,
+    /// GEM object table for this card.
+    pub gem: GemTable,
+}
+
+impl Card {
+    /// Construct a new card with the given driver identity.
+    pub fn new(
+        driver_name: &'static str,
+        driver_desc: &'static str,
+        version: (u32, u32, u32),
+    ) -> Self {
+        Card {
+            driver_name,
+            version,
+            driver_desc,
+            connectors: Vec::new(),
+            encoders: Vec::new(),
+            crtcs: Vec::new(),
+            framebuffers: Vec::new(),
+            next_fb_id: 1,
+            gem: GemTable::new(),
+        }
+    }
+
+    // ── Connector / CRTC getters ──────────────────────────────────────
+
+    /// All CRTC ids on this card.
+    pub fn crtc_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.crtcs.iter().map(|c| c.id)
+    }
+
+    /// All connector ids on this card.
+    pub fn connector_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.connectors.iter().map(|c| c.id)
+    }
+
+    /// All encoder ids on this card.
+    pub fn encoder_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.encoders.iter().map(|e| e.id)
+    }
+
+    /// Look up a connector by id.
+    pub fn connector(&self, id: u32) -> Result<&Connector, CardError> {
+        self.connectors
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or(CardError::UnknownConnector)
+    }
+
+    /// Look up a CRTC by id.
+    pub fn crtc(&self, id: u32) -> Result<&Crtc, CardError> {
+        self.crtcs
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or(CardError::UnknownCrtc)
+    }
+
+    // ── ADDFB2 / RMFB ────────────────────────────────────────────────
+
+    /// Register a new framebuffer backed by an existing GEM handle.
+    ///
+    /// Returns the assigned framebuffer id.
+    ///
+    /// Linux equivalent: `drm_mode_addfb2` in
+    /// `drivers/gpu/drm/drm_framebuffer.c`.
+    pub fn addfb2(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: u32,
+        pitch: u32,
+        gem_handle: u32,
+    ) -> Result<u32, CardError> {
+        if width == 0 || height == 0 {
+            return Err(CardError::InvalidDimensions);
+        }
+        // Validate GEM handle exists.
+        if self.gem.lookup(gem_handle).is_none() {
+            return Err(CardError::BadGemHandle);
+        }
+        // Validate pixel format.
+        let format = match format {
+            0x3438_5258 => PixelFormat::Xrgb8888,
+            0x3438_3241 => PixelFormat::Argb8888,
+            0x3631_5247 => PixelFormat::Rgb565,
+            _ => return Err(CardError::UnknownFormat),
+        };
+        if self.framebuffers.len() >= 4096 {
+            return Err(CardError::TooManyFbs);
+        }
+        let id = self.next_fb_id;
+        self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+        self.framebuffers.push(Framebuffer {
+            id,
+            width,
+            height,
+            format,
+            pitch,
+            gem_handle,
+        });
+        Ok(id)
+    }
+
+    /// Remove a previously registered framebuffer.
+    ///
+    /// Linux equivalent: `drm_mode_rmfb`.
+    pub fn rmfb(&mut self, fb_id: u32) -> Result<(), CardError> {
+        let pos = self
+            .framebuffers
+            .iter()
+            .position(|fb| fb.id == fb_id)
+            .ok_or(CardError::UnknownFb)?;
+        self.framebuffers.swap_remove(pos);
+        Ok(())
+    }
+
+    /// Look up a framebuffer by id.
+    pub fn framebuffer(&self, fb_id: u32) -> Result<&Framebuffer, CardError> {
+        self.framebuffers
+            .iter()
+            .find(|fb| fb.id == fb_id)
+            .ok_or(CardError::UnknownFb)
+    }
+}

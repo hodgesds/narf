@@ -4529,3 +4529,274 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius
 );
+
+// ── DMA-buf smokes ────────────────────────────────────────────────────
+
+/// No-op ops vtable used by all dma-buf tests.
+struct NullOps;
+impl crate::dmabuf::DmaBufOps for NullOps {
+    fn map_kernel(&self, _p: u64, _l: usize) -> Result<*mut u8, crate::dmabuf::DmaBufError> {
+        Err(crate::dmabuf::DmaBufError::MapUnsupported)
+    }
+    fn unmap_kernel(&self, _v: *mut u8, _l: usize) {}
+    fn attach(&self, _p: u64, _l: usize, _k: u64) -> Result<(), crate::dmabuf::DmaBufError> {
+        Ok(())
+    }
+    fn detach(&self, _p: u64, _l: usize, _k: u64) {}
+    fn release(&self, _p: u64, _l: usize) {}
+}
+static NULL_OPS: NullOps = NullOps;
+
+fn smoke_dmabuf_export_import_clone() -> TestResult {
+    use crate::dmabuf::{export, import};
+    let buf = match export(0x1000_0000, 4096, &NULL_OPS) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("export failed"),
+    };
+    if buf.phys() != 0x1000_0000 { return TestResult::Fail("phys wrong"); }
+    if buf.len() != 4096 { return TestResult::Fail("len wrong"); }
+    let imp = import(&buf);
+    if imp.phys() != buf.phys() { return TestResult::Fail("import phys mismatch"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_export_import_clone);
+
+fn smoke_dmabuf_attach_detach_refcount() -> TestResult {
+    use crate::dmabuf::export;
+    let buf = match export(0x2000_0000, 8192, &NULL_OPS) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("export failed"),
+    };
+    if buf.attach_count() != 0 { return TestResult::Fail("initial count != 0"); }
+    if buf.attach(0xAAAA).is_err() { return TestResult::Fail("attach A failed"); }
+    if buf.attach_count() != 1 { return TestResult::Fail("count != 1 after A"); }
+    if buf.attach(0xBBBB).is_err() { return TestResult::Fail("attach B failed"); }
+    if buf.attach_count() != 2 { return TestResult::Fail("count != 2 after B"); }
+    buf.detach(0xAAAA);
+    if buf.attach_count() != 1 { return TestResult::Fail("count != 1 after detach A"); }
+    buf.detach(0xBBBB);
+    if buf.attach_count() != 0 { return TestResult::Fail("count != 0 after both detach"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_attach_detach_refcount);
+
+fn smoke_dmabuf_zero_len_rejected() -> TestResult {
+    use crate::dmabuf::{export, DmaBufError};
+    match export(0x3000_0000, 0, &NULL_OPS) {
+        Err(DmaBufError::InvalidAllocation) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("zero-len export should fail"),
+        Err(_) => TestResult::Fail("wrong error from zero-len export"),
+    }
+}
+kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_zero_len_rejected);
+
+fn smoke_dmabuf_two_driver_export_import() -> TestResult {
+    use crate::dmabuf::{export, import};
+    let a = match export(0x4000_0000, 0x10_0000, &NULL_OPS) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("driver A export failed"),
+    };
+    let b = import(&a);
+    if b.attach(0xDEAD).is_err() { return TestResult::Fail("driver B attach failed"); }
+    if a.attach_count() != 1 { return TestResult::Fail("shared count not visible via A"); }
+    b.detach(0xDEAD);
+    if a.attach_count() != 0 { return TestResult::Fail("shared count not decremented via B"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_two_driver_export_import);
+
+// ── GEM smokes ────────────────────────────────────────────────────────
+
+fn smoke_gem_alloc_free_roundtrip() -> TestResult {
+    use crate::drm::gem::GemTable;
+    let mut t = GemTable::new();
+    let h1 = match t.alloc(0x1000, 4096) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("first alloc failed"),
+    };
+    let h2 = match t.alloc(0x2000, 8192) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("second alloc failed"),
+    };
+    if h1 == h2 { return TestResult::Fail("duplicate handles"); }
+    if t.len() != 2 { return TestResult::Fail("len != 2 after 2 allocs"); }
+    t.free(h1).unwrap();
+    if t.len() != 1 { return TestResult::Fail("len != 1 after one free"); }
+    t.free(h2).unwrap();
+    if !t.is_empty() { return TestResult::Fail("not empty after freeing both"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_gem_alloc_free_roundtrip);
+
+fn smoke_gem_lookup() -> TestResult {
+    use crate::drm::gem::GemTable;
+    let mut t = GemTable::new();
+    let h = match t.alloc(0xDEAD_0000, 0x1000) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("alloc failed"),
+    };
+    match t.lookup(h) {
+        None => return TestResult::Fail("lookup None for live handle"),
+        Some(obj) => {
+            if obj.phys != 0xDEAD_0000 { return TestResult::Fail("phys wrong"); }
+            if obj.size != 0x1000 { return TestResult::Fail("size wrong"); }
+        }
+    }
+    t.free(h).unwrap();
+    if t.lookup(h).is_some() { return TestResult::Fail("lookup Some after free"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_gem_lookup);
+
+// ── DRM ioctl smokes ──────────────────────────────────────────────────
+
+fn make_test_card_for_ioctl() -> crate::drm::card::Card {
+    use crate::drm::card::{
+        Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+    };
+    let mut card = Card::new("narf-test", "NARF test GPU driver", (0, 1, 0));
+    card.connectors.push(Connector {
+        id: 1,
+        connector_type: ConnectorType::Edp,
+        connector_type_id: 0,
+        status: ConnectorStatus::Connected,
+        encoder_id: Some(1),
+        modes: alloc::vec![crate::Mode::FHD_60],
+    });
+    card.encoders.push(Encoder {
+        id: 1,
+        encoder_type: EncoderType::Tmds,
+        possible_crtcs: 0x1,
+        possible_clones: 0x0,
+        crtc_id: Some(1),
+    });
+    card.crtcs.push(Crtc {
+        id: 1,
+        mode: Some(crate::Mode::FHD_60),
+        enabled: true,
+        primary_fb: None,
+        x: 0,
+        y: 0,
+    });
+    card
+}
+
+fn smoke_drm_ioctl_version() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    let mut card = make_test_card_for_ioctl();
+    match dispatch(&mut card, 0x00, &[]) {
+        Ok(DrmIoctlResult::Version(v)) => {
+            if v.version_major != 0 || v.version_minor != 1 {
+                return TestResult::Fail("version fields wrong");
+            }
+            if !v.name.starts_with(b"narf-test") {
+                return TestResult::Fail("driver name missing from VERSION");
+            }
+        }
+        Ok(_) => return TestResult::Fail("wrong result type for VERSION"),
+        Err(_) => return TestResult::Fail("DRM_IOCTL_VERSION failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_version);
+
+fn smoke_drm_ioctl_getresources_shape() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    let mut card = make_test_card_for_ioctl();
+    match dispatch(&mut card, 0xA0, &[]) {
+        Ok(DrmIoctlResult::GetResources(r)) => {
+            if r.count_crtcs != 1 { return TestResult::Fail("count_crtcs != 1"); }
+            if r.count_connectors != 1 { return TestResult::Fail("count_connectors != 1"); }
+            if r.count_encoders != 1 { return TestResult::Fail("count_encoders != 1"); }
+            if r.max_width < 1920 { return TestResult::Fail("max_width < 1920"); }
+        }
+        Ok(_) => return TestResult::Fail("wrong result for GETRESOURCES"),
+        Err(_) => return TestResult::Fail("GETRESOURCES failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_getresources_shape);
+
+fn smoke_drm_ioctl_getconnector_decode() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    let mut card = make_test_card_for_ioctl();
+    let arg = 1u32.to_le_bytes();
+    match dispatch(&mut card, 0xA7, &arg) {
+        Ok(DrmIoctlResult::GetConnector(info, modes)) => {
+            if info.connector_id != 1 { return TestResult::Fail("connector_id not echoed"); }
+            if info.connector_type != 14 { return TestResult::Fail("type != eDP(14)"); }
+            if info.connection != 1 { return TestResult::Fail("not Connected"); }
+            if modes.len() != 1 { return TestResult::Fail("expected 1 mode"); }
+            if modes[0].hdisplay != 1920 || modes[0].vdisplay != 1080 {
+                return TestResult::Fail("mode res wrong");
+            }
+        }
+        Ok(_) => return TestResult::Fail("wrong result for GETCONNECTOR"),
+        Err(_) => return TestResult::Fail("GETCONNECTOR failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_getconnector_decode);
+
+fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    let mut card = make_test_card_for_ioctl();
+    let gem_handle = match card.gem.alloc(0x8000_0000, 1920 * 1080 * 4) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("GEM alloc failed"),
+    };
+    let mut arg = [0u8; 68];
+    arg[4..8].copy_from_slice(&1920u32.to_le_bytes());
+    arg[8..12].copy_from_slice(&1080u32.to_le_bytes());
+    arg[12..16].copy_from_slice(&0x3438_5258u32.to_le_bytes()); // XRGB8888
+    arg[20..24].copy_from_slice(&gem_handle.to_le_bytes());
+    arg[36..40].copy_from_slice(&(1920u32 * 4).to_le_bytes());
+    let fb_id = match dispatch(&mut card, 0xB8, &arg) {
+        Ok(DrmIoctlResult::AddFb2(id)) => id,
+        Ok(_) => return TestResult::Fail("ADDFB2 wrong result type"),
+        Err(_) => return TestResult::Fail("ADDFB2 failed"),
+    };
+    if fb_id == 0 { return TestResult::Fail("fb_id is zero"); }
+    if card.framebuffers.len() != 1 { return TestResult::Fail("fb count != 1 after ADDFB2"); }
+    match card.framebuffer(fb_id) {
+        Ok(fb) => {
+            if fb.width != 1920 || fb.height != 1080 {
+                return TestResult::Fail("FB dimensions wrong");
+            }
+        }
+        Err(_) => return TestResult::Fail("fb lookup by id failed"),
+    }
+    let rmfb_arg = fb_id.to_le_bytes();
+    match dispatch(&mut card, 0xA8, &rmfb_arg) {
+        Ok(DrmIoctlResult::RmFb) => {}
+        Ok(_) => return TestResult::Fail("RMFB wrong type"),
+        Err(_) => return TestResult::Fail("RMFB failed"),
+    }
+    if !card.framebuffers.is_empty() {
+        return TestResult::Fail("fbs not empty after RMFB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_addfb2_rmfb_roundtrip);
+
+fn smoke_drm_getcap_shape() -> TestResult {
+    use crate::drm::ioctl::{dispatch, drm_cap, DrmIoctlResult};
+    let mut card = make_test_card_for_ioctl();
+    let mut arg = [0u8; 16];
+    arg[0..8].copy_from_slice(&drm_cap::TIMESTAMP_MONOTONIC.to_le_bytes());
+    match dispatch(&mut card, 0x0C, &arg) {
+        Ok(DrmIoctlResult::GetCap(cap)) => {
+            if cap.value != 1 { return TestResult::Fail("TIMESTAMP_MONOTONIC != 1"); }
+        }
+        _ => return TestResult::Fail("GET_CAP TIMESTAMP_MONOTONIC failed"),
+    }
+    arg[0..8].copy_from_slice(&drm_cap::PRIME.to_le_bytes());
+    match dispatch(&mut card, 0x0C, &arg) {
+        Ok(DrmIoctlResult::GetCap(cap)) => {
+            if cap.value != 0 { return TestResult::Fail("PRIME should be 0 (deferred)"); }
+        }
+        _ => return TestResult::Fail("GET_CAP PRIME failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_getcap_shape);
