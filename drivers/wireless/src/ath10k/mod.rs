@@ -21,17 +21,24 @@
 //!   6. Receives a "ready" WMI event, then starts behaving as a
 //!      normal Wi-Fi NIC over HTT.
 //!
-//! ## Stage 0 (this commit)
+//! ## Stage 0 (prior commit)
 //!
 //! - PCI match table (vendor 0x168c + Ubiquiti rebadge).
 //! - BAR0 mapping.
 //! - `SOC_GLOBAL_RESET_ADDRESS` soft-reset.
 //! - `SOC_CHIP_ID` readback + decoded `(hw_rev, chip_id, rev)`
 //!   logging.
-//! - "Firmware required at /firmware/ath10k/<NAME>/" hint.
 //!
-//! CE ring setup, HTC handshake, and WMI dispatch land in
-//! follow-up commits.
+//! ## Stage 1 (this commit)
+//!
+//! - Copy-Engine (CE) descriptor + ring-config structs.
+//! - `program_src_ring` / `program_dst_ring` / `halt_pipe`
+//!   register-programming helpers, abstracted over a mockable
+//!   `Ath10kMmio` trait so the CE setup code is unit-testable.
+//! - Default per-pipe configuration table mirroring Linux's
+//!   `host_ce_config_wlan`.
+//!
+//! HTC handshake and WMI dispatch land in the Stage 2 follow-up.
 //!
 //! ## References (Linux v6.10, ISC-licensed — NARF is
 //! GPL-2.0-or-later post 2026-05-20, so direct adaptation is in-
@@ -46,6 +53,7 @@
 
 extern crate alloc;
 
+pub mod ce;
 pub mod hw;
 pub mod pci;
 
