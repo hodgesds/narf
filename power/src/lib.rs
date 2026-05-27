@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+pub mod ac;
 pub mod acpi_thermal;
 pub mod battery;
 pub mod device_pm;
