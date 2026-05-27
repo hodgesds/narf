@@ -13,13 +13,26 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+use core::convert::TryInto;
+
 use super::ce::{
     self, validate, Ath10kMmio, CeDesc, CeDesc64, PipeDefault, RingConfig,
     DEFAULT_PIPE_CONFIG,
 };
+use super::htc::{
+    build_connect_service, build_setup_complete, decode_htc_hdr, encode_htc_hdr,
+    parse_connect_service_response, run_handshake, svc, ConnectStatus,
+    ConnectServiceResponse, HandshakeError, HtcHdr, MessageId, SVC_ID_HTT_DATA_MSG,
+    SVC_ID_WMI_CONTROL,
+};
 use super::hw::*;
 use super::hw::ce_off;
 use super::pci::{name_for, register_pci_driver};
+use super::wmi::{
+    build_pdev_set_param, decode_event, decode_wmi_hdr, encode_wmi_hdr, EventFrame, WmiCmdHdr,
+    WmiCmdId, WmiError, WmiEventId,
+};
+use alloc::vec;
 
 // ── PCI match table ────────────────────────────────────────────────
 
@@ -427,3 +440,224 @@ fn smoke_ath10k_ce_desc_sizes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath10k/ce", smoke_ath10k_ce_desc_sizes);
+
+// ── Stage 2: HTC frame codec ───────────────────────────────────────
+
+fn smoke_ath10k_htc_hdr_round_trip() -> TestResult {
+    let h = HtcHdr::tx(7, 0x1234, 0x55);
+    let mut buf = [0u8; 16];
+    if encode_htc_hdr(&h, &mut buf).is_err() {
+        return TestResult::Fail("encode_htc_hdr failed");
+    }
+    let dec = match decode_htc_hdr(&buf) {
+        Ok(d) => d,
+        Err(()) => return TestResult::Fail("decode_htc_hdr failed"),
+    };
+    if dec.eid != 7 {
+        return TestResult::Fail("eid round-trip wrong");
+    }
+    if dec.len != 0x1234 {
+        return TestResult::Fail("len round-trip wrong");
+    }
+    if dec.control_byte1 != 0x55 {
+        return TestResult::Fail("seq_no/control_byte1 round-trip wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htc",
+    smoke_ath10k_htc_hdr_round_trip
+);
+
+fn smoke_ath10k_htc_hdr_decode_short_rejects() -> TestResult {
+    let buf = [0u8; 4];
+    if decode_htc_hdr(&buf).is_ok() {
+        return TestResult::Fail("decode_htc_hdr accepted short buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htc",
+    smoke_ath10k_htc_hdr_decode_short_rejects
+);
+
+fn smoke_ath10k_htc_connect_service_round_trip() -> TestResult {
+    let body = build_connect_service(SVC_ID_WMI_CONTROL, 0);
+    // First 2 bytes = MessageId::ConnectService = 2.
+    let msg_id = u16::from_le_bytes([body[0], body[1]]);
+    if MessageId::from_raw(msg_id) != Some(MessageId::ConnectService) {
+        return TestResult::Fail("connect_service msg_id wrong");
+    }
+    let svc_id = u16::from_le_bytes([body[2], body[3]]);
+    if svc_id != SVC_ID_WMI_CONTROL {
+        return TestResult::Fail("connect_service svc_id wrong");
+    }
+
+    // Build a synthetic response: msg_id=3, svc_id, status=0, eid=1, max_msg=0x800.
+    let mut resp = [0u8; 8];
+    resp[0..2].copy_from_slice(&(MessageId::ConnectServiceResponse as u16).to_le_bytes());
+    resp[2..4].copy_from_slice(&SVC_ID_WMI_CONTROL.to_le_bytes());
+    resp[4] = ConnectStatus::Success as u8;
+    resp[5] = 1;
+    resp[6..8].copy_from_slice(&0x0800u16.to_le_bytes());
+
+    let parsed = match parse_connect_service_response(&resp) {
+        Ok(p) => p,
+        Err(()) => return TestResult::Fail("parse_connect_service_response failed"),
+    };
+    let expect = ConnectServiceResponse {
+        service_id: SVC_ID_WMI_CONTROL,
+        status: ConnectStatus::Success,
+        endpoint_id: 1,
+        max_msg_size: 0x0800,
+    };
+    if parsed != expect {
+        return TestResult::Fail("parse_connect_service_response payload wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htc",
+    smoke_ath10k_htc_connect_service_round_trip
+);
+
+fn smoke_ath10k_htc_service_id_packing() -> TestResult {
+    if svc(1, 0) != SVC_ID_WMI_CONTROL {
+        return TestResult::Fail("WMI svc id packing wrong");
+    }
+    if svc(3, 0) != SVC_ID_HTT_DATA_MSG {
+        return TestResult::Fail("HTT data msg svc id packing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htc",
+    smoke_ath10k_htc_service_id_packing
+);
+
+fn smoke_ath10k_htc_setup_complete_encodes_flags() -> TestResult {
+    let with = build_setup_complete(true);
+    let without = build_setup_complete(false);
+    if u16::from_le_bytes([with[0], with[1]]) != MessageId::SetupCompleteEx as u16 {
+        return TestResult::Fail("setup-complete msg_id wrong");
+    }
+    let flags_with = u32::from_le_bytes(with[4..8].try_into().unwrap());
+    let flags_without = u32::from_le_bytes(without[4..8].try_into().unwrap());
+    if flags_with == 0 {
+        return TestResult::Fail("rx_bundle_en=true should set flags bit");
+    }
+    if flags_without != 0 {
+        return TestResult::Fail("rx_bundle_en=false should clear flags");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htc",
+    smoke_ath10k_htc_setup_complete_encodes_flags
+);
+
+fn smoke_ath10k_htc_run_handshake_stub_returns_not_implemented() -> TestResult {
+    match run_handshake() {
+        Err(HandshakeError::NotImplemented) => TestResult::Pass,
+        _ => TestResult::Fail("Stage-2 handshake should return NotImplemented"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htc",
+    smoke_ath10k_htc_run_handshake_stub_returns_not_implemented
+);
+
+// ── Stage 2: WMI codec ─────────────────────────────────────────────
+
+fn smoke_ath10k_wmi_hdr_round_trip() -> TestResult {
+    let hdr = WmiCmdHdr::new(WmiCmdId::Init as u32);
+    let mut buf = [0u8; 8];
+    if encode_wmi_hdr(&hdr, &mut buf).is_err() {
+        return TestResult::Fail("encode_wmi_hdr failed");
+    }
+    let dec = match decode_wmi_hdr(&buf) {
+        Ok(d) => d,
+        Err(()) => return TestResult::Fail("decode_wmi_hdr failed"),
+    };
+    if dec.cmd_id() != WmiCmdId::Init as u32 {
+        return TestResult::Fail("cmd_id round-trip wrong");
+    }
+    if dec.plt_priv() != 0 {
+        return TestResult::Fail("host should leave plt_priv = 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_hdr_round_trip
+);
+
+fn smoke_ath10k_wmi_cmd_id_masking() -> TestResult {
+    let synth = WmiCmdHdr {
+        cmd_id_and_priv: 0xAABB_CCCC,
+    };
+    if synth.cmd_id() != 0x00BB_CCCC {
+        return TestResult::Fail("cmd_id mask leaks into priv field");
+    }
+    if synth.plt_priv() != 0xAA {
+        return TestResult::Fail("plt_priv decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_cmd_id_masking
+);
+
+fn smoke_ath10k_wmi_build_pdev_set_param_layout() -> TestResult {
+    let frame = build_pdev_set_param(0xDEAD, 0xBEEF);
+    if frame.len() != 4 + 4 + 4 {
+        return TestResult::Fail("frame size wrong (hdr + param_id + param_value)");
+    }
+    let hdr = decode_wmi_hdr(&frame[..4]).expect("decode hdr");
+    if hdr.cmd_id() != WmiCmdId::PdevSetParam as u32 {
+        return TestResult::Fail("cmd_id mismatch");
+    }
+    let param_id = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+    let param_value = u32::from_le_bytes(frame[8..12].try_into().unwrap());
+    if param_id != 0xDEAD || param_value != 0xBEEF {
+        return TestResult::Fail("payload round-trip wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_build_pdev_set_param_layout
+);
+
+fn smoke_ath10k_wmi_event_decode_classifies_ready() -> TestResult {
+    let mut frame = vec![0u8; 4];
+    frame[0..4].copy_from_slice(&(WmiEventId::Ready as u32).to_le_bytes());
+    frame.extend_from_slice(&[0u8; 8]);
+    let ev: EventFrame<'_> = match decode_event(&frame) {
+        Ok(e) => e,
+        Err(()) => return TestResult::Fail("decode_event failed"),
+    };
+    if ev.event_id != WmiEventId::Ready {
+        return TestResult::Fail("event id classification wrong");
+    }
+    if ev.payload.len() != 8 {
+        return TestResult::Fail("payload length wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_event_decode_classifies_ready
+);
+
+fn smoke_ath10k_wmi_send_stub_returns_not_implemented() -> TestResult {
+    match super::wmi::wmi_send(&[0u8; 4]) {
+        Err(WmiError::NotImplemented) => TestResult::Pass,
+        _ => TestResult::Fail("Stage-2 wmi_send should return NotImplemented"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_send_stub_returns_not_implemented
+);

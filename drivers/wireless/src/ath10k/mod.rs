@@ -29,7 +29,7 @@
 //! - `SOC_CHIP_ID` readback + decoded `(hw_rev, chip_id, rev)`
 //!   logging.
 //!
-//! ## Stage 1 (this commit)
+//! ## Stage 1 (prior commit)
 //!
 //! - Copy-Engine (CE) descriptor + ring-config structs.
 //! - `program_src_ring` / `program_dst_ring` / `halt_pipe`
@@ -38,7 +38,17 @@
 //! - Default per-pipe configuration table mirroring Linux's
 //!   `host_ce_config_wlan`.
 //!
-//! HTC handshake and WMI dispatch land in the Stage 2 follow-up.
+//! ## Stage 2 (this commit)
+//!
+//! - HTC frame builder/parser (8-byte header + ConnectService /
+//!   SetupComplete bodies).
+//! - WMI command-id codec (24-bit cmd_id + 8-bit plt_priv).
+//! - WMI Encoder for command-frame assembly; EventFrame decoder for
+//!   firmware → host responses.
+//! - `run_handshake` / `wmi_send` return `Err(NotImplemented)`
+//!   because NARF doesn't yet ship the ath10k firmware blob —
+//!   Stage 3 wires those entry points through to the real CE
+//!   pipes.
 //!
 //! ## References (Linux v6.10, ISC-licensed — NARF is
 //! GPL-2.0-or-later post 2026-05-20, so direct adaptation is in-
@@ -54,8 +64,10 @@
 extern crate alloc;
 
 pub mod ce;
+pub mod htc;
 pub mod hw;
 pub mod pci;
+pub mod wmi;
 
 pub use hw::{HwRev, ALL_PCI_MATCHES, ATHEROS_VENDOR, UBNT_VENDOR};
 pub use pci::{name_for, probe, register_pci_driver, Ath10kDevice, ProbeError};
