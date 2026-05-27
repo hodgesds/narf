@@ -419,23 +419,73 @@ mod tests {
 
     fn smoke_tpm_response_parser_rejects_short_buf() -> TestResult {
         use crate::commands::ResponseParser;
-        use crate::types::TpmError;
+        use crate::types::{TpmError, TpmRc};
         // < 10 bytes → BadResponse.
         match ResponseParser::new(&[0u8; 9]) {
             Err(TpmError::BadResponse) => {}
             _ => return TestResult::Fail("short buf didn't surface BadResponse"),
         }
-        // Non-zero RC → HardwareError.
+        // Non-zero RC → Rc(TpmRc::Failure) — TPM_RC_FAILURE = 0x101
+        // maps to the typed Failure category per TCG Part 2 §6.6.
         let mut buf = [0u8; 10];
         buf[2..6].copy_from_slice(&10u32.to_be_bytes()); // size
         buf[6..10].copy_from_slice(&0x101u32.to_be_bytes()); // RC = TPM_RC_FAILURE
         match ResponseParser::new(&buf) {
-            Err(TpmError::HardwareError) => {}
-            _ => return TestResult::Fail("non-zero RC didn't surface HardwareError"),
+            Err(TpmError::Rc(TpmRc::Failure)) => {}
+            _ => return TestResult::Fail("TPM_RC_FAILURE didn't map to Rc(Failure)"),
         }
         TestResult::Pass
     }
     kernel_test_in!("tpm/commands", smoke_tpm_response_parser_rejects_short_buf);
+
+    fn smoke_tpm_rc_categorises_common_codes() -> TestResult {
+        use crate::types::TpmRc;
+        // VER1 codes from TCG Part 2 §6.6, table 16.
+        if TpmRc::from_rc(0x100) != TpmRc::Initialize {
+            return TestResult::Fail("0x100 ≠ Initialize");
+        }
+        if TpmRc::from_rc(0x101) != TpmRc::Failure {
+            return TestResult::Fail("0x101 ≠ Failure");
+        }
+        if TpmRc::from_rc(0x120) != TpmRc::Disabled {
+            return TestResult::Fail("0x120 ≠ Disabled");
+        }
+        if TpmRc::from_rc(0x922) != TpmRc::Retry {
+            return TestResult::Fail("0x922 ≠ Retry");
+        }
+        if TpmRc::from_rc(0x921) != TpmRc::Lockout {
+            return TestResult::Fail("0x921 ≠ Lockout");
+        }
+        if TpmRc::from_rc(0x920) != TpmRc::NvRate {
+            return TestResult::Fail("0x920 ≠ NvRate");
+        }
+        if TpmRc::from_rc(0x923) != TpmRc::NvUnavailable {
+            return TestResult::Fail("0x923 ≠ NvUnavailable");
+        }
+        if TpmRc::from_rc(0x01E) != TpmRc::BadTag {
+            return TestResult::Fail("0x01E ≠ BadTag");
+        }
+        // FMT1 codes — base error in bits 0..5, format bit (7) set.
+        // TPM_RC_VALUE base = 0x04 ⇒ encoded with parameter index 1
+        // as 0x0184 (bit 7 = 0x80, bit 8 = 0x100 selects param 1).
+        if TpmRc::from_rc(0x184) != TpmRc::Value {
+            return TestResult::Fail("FMT1 0x184 ≠ Value");
+        }
+        // TPM_RC_HANDLE base = 0x0B ⇒ 0x18B etc.
+        if TpmRc::from_rc(0x18B) != TpmRc::Handle {
+            return TestResult::Fail("FMT1 0x18B ≠ Handle");
+        }
+        if TpmRc::from_rc(0x195) != TpmRc::Size {
+            return TestResult::Fail("FMT1 0x195 ≠ Size");
+        }
+        // Unrecognised codes fall through to Other(raw).
+        match TpmRc::from_rc(0x7FF) {
+            TpmRc::Other(0x7FF) => {}
+            _ => return TestResult::Fail("unknown VER1 didn't fall through to Other"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/commands", smoke_tpm_rc_categorises_common_codes);
 
     fn smoke_tpm_response_parser_get_random_decodes_tail() -> TestResult {
         use crate::commands::ResponseParser;
@@ -490,7 +540,7 @@ mod tests {
     kernel_test_in!("tpm/types", smoke_tpm_types_pcr_set_contains_walks_full_range);
 
     fn smoke_tpm_error_variants_distinct() -> TestResult {
-        use crate::types::TpmError;
+        use crate::types::{TpmError, TpmRc};
         let all = [
             TpmError::NotPresent,
             TpmError::LocalityTimeout,
@@ -500,6 +550,7 @@ mod tests {
             TpmError::InvalidArgs,
             TpmError::Denied,
             TpmError::HardwareError,
+            TpmError::Rc(TpmRc::Failure),
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {

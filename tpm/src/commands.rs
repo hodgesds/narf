@@ -4,7 +4,7 @@
 //! Clean-room implementation following the wire format (§5.6).
 //!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 
-use crate::types::TpmError;
+use crate::types::{TpmError, TpmRc};
 use alloc::vec::Vec;
 
 pub const TPM_ST_NO_SESSIONS: u16 = 0x8001;
@@ -104,8 +104,12 @@ impl<'a> ResponseParser<'a> {
         }
         let rc = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
         if rc != 0 {
-            // TODO: Map TPM2 error codes (RC) to TpmError
-            return Err(TpmError::HardwareError);
+            // Map TPM2 response codes to a typed category per TCG
+            // Part 2 §6.6 / Part 1 §39.4. Surfacing the decoded
+            // `TpmRc` lets callers distinguish "retry me" (Retry /
+            // NvRate) from "fatal" (Failure) without re-decoding
+            // the wire bits.
+            return Err(TpmError::Rc(TpmRc::from_rc(rc)));
         }
         Ok(Self { buf })
     }
