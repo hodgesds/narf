@@ -3058,3 +3058,67 @@ fn smoke_vtd_context_passthrough() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/vtd", smoke_vtd_context_passthrough);
+
+// ── AMD-Vi cmd-buffer / event-log register encoding ──────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_cmd_buf_base_encoding() -> TestResult {
+    use crate::x86_64::amd_vi::{
+        decode_cmd_buf_base, encode_cmd_buf_base, CMD_BUF_SIZE_SHIFT,
+    };
+    let phys: u64 = 0x0000_0001_5000_0000;
+    let reg = encode_cmd_buf_base(phys);
+    let (got_phys, size_field) = decode_cmd_buf_base(reg);
+    if got_phys != phys {
+        return TestResult::Fail("cmd_buf phys round-trip mismatch");
+    }
+    if size_field != 0x9 {
+        return TestResult::Fail("size field != 0x9 (512 entries)");
+    }
+    // Size field must live at bits 56..60.
+    if (reg >> CMD_BUF_SIZE_SHIFT) & 0xF != 0x9 {
+        return TestResult::Fail("size field not at bits 56..60");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_cmd_buf_base_encoding);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_ring_tail_wraps() -> TestResult {
+    use crate::x86_64::amd_vi::advance_ring_tail;
+    // 8 KiB ring, push 511 entries: should land at offset 8176.
+    // Push one more: should wrap to 0.
+    let bytes: u32 = 8192;
+    let mut tail: u32 = 0;
+    for _ in 0..511 {
+        tail = advance_ring_tail(tail, 1, bytes);
+    }
+    if tail != 511 * 16 {
+        return TestResult::Fail("tail before wrap != 511*16");
+    }
+    tail = advance_ring_tail(tail, 1, bytes);
+    if tail != 0 {
+        return TestResult::Fail("tail did not wrap on 512th entry");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_ring_tail_wraps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_evt_log_base_encoding() -> TestResult {
+    use crate::x86_64::amd_vi::{decode_evt_log_base, encode_evt_log_base};
+    let phys: u64 = 0x0000_0001_8000_0000;
+    let reg = encode_evt_log_base(phys);
+    let (got_phys, size_field) = decode_evt_log_base(reg);
+    if got_phys != phys {
+        return TestResult::Fail("evt-log phys round-trip mismatch");
+    }
+    if size_field != 0x9 {
+        return TestResult::Fail("evt-log size != 0x9");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_evt_log_base_encoding);

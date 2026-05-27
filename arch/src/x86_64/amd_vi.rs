@@ -334,6 +334,65 @@ pub const fn decode_dev_table_base(reg: u64) -> (u64, u64) {
     (phys, bytes)
 }
 
+// ── Command buffer ring (AMD IOMMU spec §2.4.1) ──────────────────
+//
+// MMIO `CMD_BUF_BASE_OFFSET` (0x08) layout:
+//   [0..12]   reserved
+//   [12..52]  Command buffer base (page-aligned)
+//   [56..60]  Size field — Linux uses 0x9 (512 entries, 8 KiB ring)
+//
+// `CMD_HEAD` (0x2000) is the hardware-owned head; software writes
+// `CMD_TAIL` (0x2008) to push a new command. The ring is empty
+// when head == tail.
+
+pub const CMD_BUF_SIZE_SHIFT: u32 = 56;
+pub const CMD_BUF_SIZE_512: u64 = 0x9 << CMD_BUF_SIZE_SHIFT;
+pub const CMD_BUF_ENTRIES_512: usize = 512;
+pub const CMD_BUF_BYTES_512: usize = 8192; // 512 * 16 B
+
+/// Encode the value for `MMIO[CMD_BUF_BASE]`. Standard 512-entry
+/// ring (`size=0x9`) — Linux's default.
+pub const fn encode_cmd_buf_base(phys: u64) -> u64 {
+    (phys & 0x000F_FFFF_FFFF_F000) | CMD_BUF_SIZE_512
+}
+
+/// Inverse of [`encode_cmd_buf_base`].
+pub const fn decode_cmd_buf_base(reg: u64) -> (u64, u64) {
+    let phys = reg & 0x000F_FFFF_FFFF_F000;
+    let size_field = (reg >> CMD_BUF_SIZE_SHIFT) & 0xF;
+    (phys, size_field)
+}
+
+/// Encode the next tail offset for a `wrap`-sized ring. The
+/// hardware ignores bits below 4 (each command is 16 bytes),
+/// `Linux MMIO_CMD_HEAD_MASK` is `GENMASK_ULL(18, 4)`.
+pub const fn advance_ring_tail(tail: u32, count: u32, ring_bytes: u32) -> u32 {
+    // ring_bytes must be a power of two; entries are 16 B each.
+    (tail + count * 16) & (ring_bytes - 1)
+}
+
+// ── Event log ring (AMD IOMMU spec §2.4.2) ───────────────────────
+//
+// Same shape as the command ring — 16-byte entries written by
+// hardware when a fault, DTE-mismatch, IOTLB issue, etc. fires.
+//
+// MMIO `EVT_LOG_BASE_OFFSET` (0x10) packs the same way as
+// `CMD_BUF_BASE_OFFSET` (size at [56..60], base at [12..52]).
+
+pub const EVT_LOG_SIZE_SHIFT: u32 = 56;
+pub const EVT_LOG_SIZE_512: u64 = 0x9 << EVT_LOG_SIZE_SHIFT;
+pub const EVT_LOG_BYTES_512: usize = 8192;
+
+pub const fn encode_evt_log_base(phys: u64) -> u64 {
+    (phys & 0x000F_FFFF_FFFF_F000) | EVT_LOG_SIZE_512
+}
+
+pub const fn decode_evt_log_base(reg: u64) -> (u64, u64) {
+    let phys = reg & 0x000F_FFFF_FFFF_F000;
+    let size_field = (reg >> EVT_LOG_SIZE_SHIFT) & 0xF;
+    (phys, size_field)
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AmdViCaps {
     pub iommu_enabled: bool,
