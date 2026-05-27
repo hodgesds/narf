@@ -3403,14 +3403,31 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
-    // The class-match backstop catches all USB controllers; reject
-    // non-xHCI prog-ifs here so we don't try to drive an EHCI
-    // controller's BAR layout as xHCI. PCI class triple is
-    // (class << 16) | (subclass << 8) | prog_if.
+    // The class-match backstop matches *every* device with PCI
+    // base class 0x0C (Serial Bus) — that includes SMBus
+    // (subclass 0x05, e.g. AMD FCH 1022:790b), CAN, GPIB, IPMI,
+    // etc., not just USB host controllers. Reject anything that
+    // isn't specifically USB-xHCI here so we don't try to drive
+    // a non-USB device's BAR as xHCI MMIO.
+    //
+    // Exception: the explicit (vendor, device) match arms above
+    // bind by ID without consulting class, so QEMU's xhci-pci
+    // model (which sometimes reports class=0) still binds.
+    // PCI class triple is (class << 16) | (subclass << 8) | prog_if.
     let class = ((device.id.class >> 16) & 0xFF) as u8;
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     let prog_if = (device.id.class & 0xFF) as u8;
-    if class == PCI_CLASS_SERIAL_BUS && subclass == PCI_SUBCLASS_USB && prog_if != PCI_PROGIF_XHCI {
+    let is_xhci_class =
+        class == PCI_CLASS_SERIAL_BUS && subclass == PCI_SUBCLASS_USB && prog_if == PCI_PROGIF_XHCI;
+    let is_explicit_match = matches!(
+        (device.id.vendor, device.id.device),
+        (QEMU_XHCI_VENDOR, QEMU_XHCI_DEVICE)
+            | (AMD_VENDOR, AMD_PHX_15B9)
+            | (AMD_VENDOR, AMD_PHX_15BA)
+            | (AMD_VENDOR, AMD_PHX_15C0)
+            | (AMD_VENDOR, AMD_PHX_15C1),
+    );
+    if !is_xhci_class && !is_explicit_match {
         return Err(narf_bus::ProbeError::BadDevice);
     }
     narf_bus::pci::set_command(

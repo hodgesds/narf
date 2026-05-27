@@ -2000,16 +2000,30 @@ fn run_grep(fd: i32, rest: &[u8]) {
         }
         break;
     }
-    // Pattern + optional file.
-    let pat_end = s
-        .iter()
-        .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
-        .unwrap_or(s.len());
-    if pat_end == 0 {
+    // Pattern + optional file. Honour "..." / '...' so a
+    // multi-word pattern survives the shell's whitespace split
+    // (the shell itself doesn't strip quotes — grep does).
+    let (pattern_raw, pat_end) = if !s.is_empty() && (s[0] == b'"' || s[0] == b'\'') {
+        let quote = s[0];
+        let inner = &s[1..];
+        match inner.iter().position(|&b| b == quote) {
+            Some(close) => (&inner[..close], close + 2),
+            None => {
+                unsafe { write_all(fd, b"grep: unterminated quote\n"); }
+                return;
+            }
+        }
+    } else {
+        let end = s
+            .iter()
+            .position(|&b| b == b' ' || b == b'\t' || b < 0x20)
+            .unwrap_or(s.len());
+        (&s[..end], end)
+    };
+    if pat_end == 0 || pattern_raw.is_empty() {
         unsafe { write_all(fd, b"grep: usage: grep [-i] [-v] [-m N] PATTERN [FILE]\n"); }
         return;
     }
-    let pattern_raw = &s[..pat_end];
     let mut pat = [0u8; 256];
     let pat_len = pattern_raw.len().min(pat.len());
     for i in 0..pat_len {
