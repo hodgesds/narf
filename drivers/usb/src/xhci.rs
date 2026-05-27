@@ -1218,6 +1218,74 @@ impl Xhci {
         if !running {
             return Err(XhciError::StartFailed);
         }
+        // Power every root-hub port. HCCPARAMS1.PPC (bit 3) = 1
+        // means port power is software-controlled — ports come up
+        // unpowered and SW must write PORTSC.PP=1 before any device
+        // will report a connection (xHCI 1.2 §4.19.4). On AMD FCH
+        // xHCI (1022:1639 on Renoir / similar on Phoenix) PPC=1,
+        // which is why this Renoir laptop's xHCI saw zero connected
+        // devices despite the BAR mapping correctly.
+        //
+        // Write PP=1 unconditionally — when PPC=0 it's a no-op
+        // (the bit is RO-as-set). Mask off the change-status
+        // (RW1C) bits so we don't accidentally clear them.
+        for port in 1..=max_ports {
+            let port_off = op_off
+                + OP_PORTSC_BASE
+                + ((port as u64 - 1) * PORT_REGS_STRIDE);
+            // SAFETY: identity-mapped MMIO; port range bounded by
+            // HCSPARAMS1.MaxPorts.
+            let cur = unsafe { mmio.read32(port_off) };
+            let to_write = (cur & !PORTSC_CHG_MASK) | PORTSC_PP;
+            // SAFETY: same.
+            unsafe {
+                mmio.write32(port_off, to_write);
+            }
+        }
+        // xHCI §4.19.4: after asserting PP, give the chipset time
+        // to bring VBUS up + detect any attached device. 20 ms
+        // covers the spec-mandated TRSTRCY + a margin for SS
+        // descriptor probe by the controller.
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ms(20),
+        );
+        // Log per-port post-PP state so dmesg shows which root-hub
+        // ports actually saw VBUS + a device. Distinguishes
+        // "PP never asserted" from "PP asserted but nothing
+        // attached" — the latter is the Renoir+internal-touchpad
+        // hypothesis (TP wired to an internal port that should
+        // come up CCS=1 once powered).
+        use core::fmt::Write as _;
+        let mut connected = 0u32;
+        for port in 1..=max_ports {
+            let port_off = op_off
+                + OP_PORTSC_BASE
+                + ((port as u64 - 1) * PORT_REGS_STRIDE);
+            // SAFETY: same — bounded by MaxPorts.
+            let v = unsafe { mmio.read32(port_off) };
+            let pp = (v & PORTSC_PP) != 0;
+            let ccs = (v & PORTSC_CCS) != 0;
+            let pls = (v & PORTSC_PLS_MASK) >> 5;
+            if ccs {
+                connected += 1;
+            }
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: port {} pp={} ccs={} pls={} portsc={:#010x}",
+                port,
+                pp as u32,
+                ccs as u32,
+                pls,
+                v,
+            );
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "  xhci: {} of {} root-hub port(s) connected after PP=1",
+            connected,
+            max_ports,
+        );
         // Drain any boot-time PORT_STATUS_CHANGE events the
         // controller posts on the RS-edge (one per port that came
         // up with CCS=1). Brief settle, then a cycle-bit walk over
