@@ -113,6 +113,9 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
         })
     }
 
+    /// ECMA-119 §6.1: ISO 9660 volumes are non-rewritable — the
+    /// medium is authored offline by mkisofs/xorriso. `write`
+    /// always fails with `ReadOnly`.
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
@@ -121,6 +124,8 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
         self.state.lock().stat
     }
 
+    /// ECMA-119 §6.1 — see `write`. ISO 9660 file extents are
+    /// fixed at authoring time.
     fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
@@ -213,10 +218,34 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
         })
     }
 
-    // All mutating methods inherit the trait defaults
-    // (`FsError::Unsupported`); ISO 9660 is read-only on principle
-    // (the on-disc layout is authored offline by mkisofs/xorriso),
-    // so we do not surface `unlink` / `create` / `mkdir` / etc.
+    // ECMA-119 §6.1: ISO 9660 volumes are non-rewritable. We
+    // override every mutating directory operation to surface
+    // `ReadOnly` rather than the trait-default `Unsupported`, so
+    // callers can distinguish "this medium does not accept writes"
+    // from "this driver has not implemented writes yet."
+    fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn rmdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn symlink<'a>(&'a self, _name: &'a str, _target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn rename<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
 }
 
 // ── Directory scan ─────────────────────────────────────────────────
