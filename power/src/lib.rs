@@ -46,6 +46,8 @@ pub mod watchdog;
 pub mod cppc;
 
 #[cfg(target_arch = "x86_64")]
+pub mod cpufreq;
+#[cfg(target_arch = "x86_64")]
 pub mod hwp;
 #[cfg(target_arch = "x86_64")]
 pub mod idle;
@@ -226,6 +228,19 @@ pub fn register_initcalls() {
         // which can be slow or hang. Disabled in the current
         // bisect step to isolate the wedge.
         InitResult::Ok
+    });
+    // CPUFreq governor bring-up. Runs after `cpu-pstate` (Stage::Subsys)
+    // so the one-shot HWP/CPPC capabilities + initial request are
+    // already programmed; this lights up the periodic governor that
+    // re-writes `desired_perf` based on per-CPU utilisation.
+    // `enable()` is GP-safe (rdmsr_or_gp / wrmsr_or_gp under the
+    // hood) so a BIOS-locked MSR returns `Err(CapabilitiesGp)` /
+    // `Err(RequestGp)` instead of wedging boot.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Late, "cpufreq-init", || match cpufreq::enable() {
+        Ok(()) => InitResult::Ok,
+        Err(cpufreq::CpuFreqError::NoBackend) => InitResult::NotPresent,
+        Err(_) => InitResult::Ok,
     });
 }
 
