@@ -3256,3 +3256,49 @@ fn smoke_vtd_walk_slpt_unmapped_iova() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/vtd", smoke_vtd_walk_slpt_unmapped_iova);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_walk_iopt_resolves_iova() -> TestResult {
+    // Build a 4-level AMD-Vi I/O page table that maps a known
+    // IOVA to a known phys. Confirm the walker resolves it.
+    use crate::x86_64::amd_vi::{
+        pte_leaf, pte_level_index, pte_next, walk_iopt, AmdViWalkResult,
+    };
+    const L3: u64 = 0x0020_0000;
+    const L2: u64 = 0x0020_1000;
+    const L1: u64 = 0x0020_2000;
+    const LEAF: u64 = 0xF00D_F000;
+    let iova: u64 = 0xC0DE_F456;
+
+    let mut root = [0u64; 512];
+    let mut l3 = [0u64; 512];
+    let mut l2 = [0u64; 512];
+    let mut l1 = [0u64; 512];
+    root[pte_level_index(iova, 4)] = pte_next(L3, 3);
+    l3[pte_level_index(iova, 3)] = pte_next(L2, 2);
+    l2[pte_level_index(iova, 2)] = pte_next(L1, 1);
+    l1[pte_level_index(iova, 1)] = pte_leaf(LEAF, true, true);
+
+    let result = walk_iopt(&root, iova, |phys| match phys {
+        L3 => Some(l3),
+        L2 => Some(l2),
+        L1 => Some(l1),
+        _ => None,
+    });
+    match result {
+        AmdViWalkResult::Mapped { phys, offset } => {
+            if phys != LEAF {
+                return TestResult::Fail("walker resolved wrong phys");
+            }
+            if offset != (iova & 0xFFF) {
+                return TestResult::Fail("walker mishandled offset");
+            }
+            TestResult::Pass
+        }
+        AmdViWalkResult::NotPresent { .. } => {
+            TestResult::Fail("walker reported NotPresent on a complete table")
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_walk_iopt_resolves_iova);

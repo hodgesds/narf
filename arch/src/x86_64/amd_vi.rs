@@ -458,6 +458,47 @@ pub const fn pte_level_index(iova: u64, level: u32) -> usize {
     ((iova >> shift) & 0x1FF) as usize
 }
 
+// ── AMD-Vi I/O page-table walker ─────────────────────────────────
+//
+// Same shape as the VT-d walker. Returns the resolved phys or the
+// level at which a not-present PTE terminated the walk. Used at
+// test time to confirm the per-level shift math against a
+// synthetic table.
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AmdViWalkResult {
+    Mapped { phys: u64, offset: u64 },
+    NotPresent { level: u32 },
+}
+
+pub fn walk_iopt<F>(root_table: &[u64; 512], iova: u64, mut fetch: F) -> AmdViWalkResult
+where
+    F: FnMut(u64) -> Option<[u64; 512]>,
+{
+    let mut current = root_table[pte_level_index(iova, 4)];
+    let mut level = 4u32;
+    while level > 1 {
+        if !pte_present(current) {
+            return AmdViWalkResult::NotPresent { level };
+        }
+        let next_phys = pte_addr(current);
+        let next_table = match fetch(next_phys) {
+            Some(t) => t,
+            None => return AmdViWalkResult::NotPresent { level: level - 1 },
+        };
+        let next_idx = pte_level_index(iova, level - 1);
+        current = next_table[next_idx];
+        level -= 1;
+    }
+    if !pte_present(current) {
+        return AmdViWalkResult::NotPresent { level: 1 };
+    }
+    AmdViWalkResult::Mapped {
+        phys: pte_addr(current),
+        offset: iova & 0xFFF,
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AmdViCaps {
     pub iommu_enabled: bool,
