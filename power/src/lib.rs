@@ -232,6 +232,40 @@ pub fn register_initcalls() {
         // bisect step to isolate the wedge.
         InitResult::Ok
     });
+    // ACPI battery / thermal-zone / AC adapter discovery. These walk
+    // the AML namespace for typed §10 / §11 devices and log what they
+    // find — they do NOT poll the live methods on the boot path,
+    // because real-silicon EC reads via the AML interpreter can be
+    // slow / hangy (see the power-monitor BISECT-DISABLED comment
+    // above). The platform-driver layer (`drivers/platform/{ac,
+    // battery,thermal}.rs`) sets up the polling tasks.
+    narf_init::register(Stage::Late, "acpi-battery-enum", || {
+        let n = battery::enumerate().len();
+        let _ = writeln!(narf_console::Writer, "  acpi-battery-enum: {} device(s)", n);
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
+    narf_init::register(Stage::Late, "acpi-thermal-enum", || {
+        let n = acpi_thermal::enumerate().len();
+        let _ = writeln!(narf_console::Writer, "  acpi-thermal-enum: {} zone(s)", n);
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
+    narf_init::register(Stage::Late, "acpi-ac-enum", || {
+        let n = ac::enumerate().len();
+        let _ = writeln!(narf_console::Writer, "  acpi-ac-enum: {} adapter(s)", n);
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
     // CPUFreq governor bring-up. Runs after `cpu-pstate` (Stage::Subsys)
     // so the one-shot HWP/CPPC capabilities + initial request are
     // already programmed; this lights up the periodic governor that
