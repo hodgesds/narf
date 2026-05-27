@@ -856,12 +856,38 @@ fn read_unit(
             byte_offset_in_region,
             GsbOp::Read { width },
         )),
-        // Other rare spaces stubbed to 0 so AML flows through.
+        // SystemCmos: x86 legacy CMOS RAM behind ports 0x70/0x71
+        // (index/data). The region's byte offset IS the CMOS
+        // index — AML never sees the underlying port pair.
+        // ACPI 6.5 §5.5.2.4.4 / Linux drivers/acpi/acpi_extlog.c
+        // for the dispatch shape.
+        RegionSpace::SystemCmos => Ok(cmos_read(byte_offset_in_region, width)),
+        // PciBarTarget: address space behind a PCI BAR. We do
+        // not currently resolve the parent device's BAR window
+        // (would need to walk _ADR → enumerate PCI cfg space
+        // → read BAR0..5 → bridge translate). Linux's
+        // drivers/acpi/acpi_lpss.c is the canonical implementor
+        // for the few platforms that actually expose this space
+        // (Intel LPSS UART / I2C / SPI). Stub to 0 until those
+        // drivers land. Returning 0 (vs Unsupported) keeps AML
+        // methods that touch BAR-backed fields running rather
+        // than aborting.
+        RegionSpace::PciBarTarget => Ok(0),
+        // Other rare spaces stubbed to 0 so AML flows through:
+        //   GeneralPurposeIO — would need GPIO controller driver
+        //                      that registers per-pin handlers.
+        //   SmBus           — would need SMBus host adapter.
+        //   Ipmi            — would need BMC / KCS interface.
+        //   Pcc             — would need Platform Communication
+        //                     Channel subspace handler.
+        // None of these are exercised by current bring-up
+        // targets (Zen2 Renoir + Phoenix HawkPoint1).
         RegionSpace::GeneralPurposeIO
         | RegionSpace::SmBus
         | RegionSpace::Ipmi
         | RegionSpace::Pcc => Ok(0),
-        _ => Err(FieldAccessError::Unsupported),
+        // Unknown / vendor-specific region kinds (RegionSpace 0x80..0xFF).
+        RegionSpace::Other(_) => Err(FieldAccessError::Unsupported),
     }
 }
 
@@ -917,13 +943,81 @@ fn write_unit(
             );
             Ok(())
         }
+        // SystemCmos write — see read_unit for the dispatch
+        // shape. AML region offset IS the CMOS index.
+        RegionSpace::SystemCmos => {
+            cmos_write(byte_offset_in_region, width, val);
+            Ok(())
+        }
+        // PciBarTarget write — see read_unit for rationale.
+        RegionSpace::PciBarTarget => Ok(()),
+        // See read_unit for the per-space rationale for the
+        // stubs below.
         RegionSpace::GeneralPurposeIO
         | RegionSpace::SmBus
         | RegionSpace::Ipmi
         | RegionSpace::Pcc => Ok(()),
-        _ => Err(FieldAccessError::Unsupported),
+        RegionSpace::Other(_) => Err(FieldAccessError::Unsupported),
     }
 }
+
+// ── SystemCmos accessor ────────────────────────────────────────────
+//
+// Index/data port pair: writing the byte to 0x70 selects an
+// internal location; the next read or write of 0x71 hits that
+// location. NMI-disable bit (0x80) lives in the high bit of the
+// index port — we preserve whatever value firmware had set so
+// that AML's typical usage (read register N, modify, write)
+// doesn't flip the NMI-mask state. Reference: Linux
+// `arch/x86/kernel/rtc.c` and IBM PC AT spec.
+
+#[cfg(target_arch = "x86_64")]
+const CMOS_INDEX_PORT: u16 = 0x70;
+#[cfg(target_arch = "x86_64")]
+const CMOS_DATA_PORT: u16 = 0x71;
+
+#[cfg(target_arch = "x86_64")]
+fn cmos_read(offset: u64, width: usize) -> u64 {
+    let mut acc = 0u64;
+    for i in 0..width.min(8) {
+        let idx = (offset + i as u64) as u8;
+        // SAFETY: 0x70/0x71 are the legacy CMOS port pair, owned
+        // by the firmware-CMOS handler (this code). NMI-disable
+        // bit (0x80) on the index port is preserved by reading
+        // back the current value and OR'ing in the new index.
+        unsafe {
+            let cur_idx = io_in(CMOS_INDEX_PORT, 1) as u8;
+            let nmi_bit = cur_idx & 0x80;
+            io_out(CMOS_INDEX_PORT, 1, (nmi_bit | (idx & 0x7F)) as u64);
+            let b = io_in(CMOS_DATA_PORT, 1) as u8;
+            acc |= (b as u64) << (i * 8);
+        }
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cmos_write(offset: u64, width: usize, val: u64) {
+    for i in 0..width.min(8) {
+        let idx = (offset + i as u64) as u8;
+        let b = ((val >> (i * 8)) & 0xff) as u8;
+        // SAFETY: same as cmos_read.
+        unsafe {
+            let cur_idx = io_in(CMOS_INDEX_PORT, 1) as u8;
+            let nmi_bit = cur_idx & 0x80;
+            io_out(CMOS_INDEX_PORT, 1, (nmi_bit | (idx & 0x7F)) as u64);
+            io_out(CMOS_DATA_PORT, 1, b as u64);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cmos_read(_offset: u64, _width: usize) -> u64 {
+    0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cmos_write(_offset: u64, _width: usize, _val: u64) {}
 
 // ── Test reset ────────────────────────────────────────────────────────────────
 
