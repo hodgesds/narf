@@ -485,10 +485,138 @@ fn validate_framebuffer(fb: &Framebuffer) -> Result<(), ModesetError> {
     Ok(())
 }
 
-#[cfg(test)]
-mod _doc {
-    //! Module-level docs and self-checks. Real kernel-side smokes
-    //! live in `crate::tests` per project convention; this block
-    //! exists so `cargo doc` builds the orchestrator's API
-    //! surface as a coherent unit.
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    //! Stage-2 smokes for the orchestrator. A `FakeMmio` records
+    //! writes and serves canned reads so each step can be driven
+    //! to completion without a real BAR.
+
+    extern crate alloc;
+
+    use super::*;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// Mock MMIO window. Records every write and returns canned
+    /// reads keyed by offset (default 0).
+    #[derive(Debug)]
+    pub struct FakeMmio {
+        pub writes: RefCell<Vec<(u64, u32)>>,
+        pub reads: RefCell<Vec<(u64, u32)>>,
+        /// When set, every read of `state_offset` returns
+        /// `state_value` OR'd onto whatever is in `reads`.
+        pub state_offset: u64,
+        pub state_value: u32,
+    }
+
+    impl FakeMmio {
+        pub fn new() -> Self {
+            Self {
+                writes: RefCell::new(Vec::new()),
+                reads: RefCell::new(Vec::new()),
+                state_offset: 0,
+                state_value: 0,
+            }
+        }
+        pub fn set_read(&self, off: u64, val: u32) {
+            self.reads.borrow_mut().push((off, val));
+        }
+        pub fn writes_to(&self, off: u64) -> Vec<u32> {
+            self.writes
+                .borrow()
+                .iter()
+                .filter(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
+                .collect()
+        }
+    }
+
+    impl MmioWindow for FakeMmio {
+        fn read32(&self, off: u64) -> u32 {
+            let mut v = 0u32;
+            for (o, val) in self.reads.borrow().iter() {
+                if *o == off {
+                    v = *val;
+                }
+            }
+            if off == self.state_offset {
+                v |= self.state_value;
+            }
+            v
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.writes.borrow_mut().push((off, val));
+        }
+    }
+
+    fn smoke_pwr_well_req_state_bits_match_i915() -> TestResult {
+        // PG1 (idx=0) — request bit 1, state bit 0.
+        if super::pwr_well_req(0) != 0x2 {
+            return TestResult::Fail("PG1 REQ bit");
+        }
+        if super::pwr_well_state(0) != 0x1 {
+            return TestResult::Fail("PG1 STATE bit");
+        }
+        // PG2 (idx=1) — request bit 3, state bit 2.
+        if super::pwr_well_req(1) != 0x8 {
+            return TestResult::Fail("PG2 REQ bit");
+        }
+        if super::pwr_well_state(1) != 0x4 {
+            return TestResult::Fail("PG2 STATE bit");
+        }
+        // PG3 (idx=2) — request bit 5, state bit 4.
+        if super::pwr_well_req(2) != 0x20 {
+            return TestResult::Fail("PG3 REQ bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_pwr_well_req_state_bits_match_i915
+    );
+
+    fn smoke_enable_pg2_polls_and_writes_request() -> TestResult {
+        let mut mmio = FakeMmio::new();
+        // Pre-set PG2 STATE so the poll returns immediately.
+        mmio.state_offset = super::PWR_WELL_CTL2;
+        mmio.state_value = super::pwr_well_state(super::PowerWell::Pg2 as u32);
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        match ms.enable_pipe_power_well(Pipe::A) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = e;
+                return TestResult::Fail("PG2 enable returned error with state asserted");
+            }
+        }
+        let writes = mmio.writes_to(super::PWR_WELL_CTL2);
+        if writes.is_empty() {
+            return TestResult::Fail("no CTL2 write observed");
+        }
+        let req = super::pwr_well_req(super::PowerWell::Pg2 as u32);
+        if writes.iter().all(|w| (w & req) == 0) {
+            return TestResult::Fail("PG2 REQUEST bit never set");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_enable_pg2_polls_and_writes_request
+    );
+
+    fn smoke_enable_pg_rejects_nonzero_pipe_b() -> TestResult {
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        match ms.enable_pipe_power_well(Pipe::B) {
+            Err(ModesetError::PowerWellTimeout) => TestResult::Pass,
+            other => {
+                let _ = other;
+                TestResult::Fail("Pipe B should require Stage-3 PG3 work")
+            }
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_enable_pg_rejects_nonzero_pipe_b
+    );
 }
