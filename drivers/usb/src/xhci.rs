@@ -1267,7 +1267,14 @@ impl Xhci {
             // SAFETY: identity-mapped MMIO; port range bounded by
             // HCSPARAMS1.MaxPorts.
             let cur = unsafe { mmio.read32(port_off) };
-            let to_write = (cur & !PORTSC_CHG_MASK) | PORTSC_PP;
+            // Mask change bits AND PED so the PP-set write doesn't
+            // double as an accidental "port enabled" write. PED
+            // (bit 1) is RW1C; writing 1 disables the port — the
+            // pre-fix expression left PED unmasked, so any port the
+            // controller already enabled would be torn down by the
+            // very write that was supposed to power it. Matches the
+            // PORTSC write hygiene in `port_reset_once`.
+            let to_write = ((cur & !PORTSC_CHG_MASK) & !PORTSC_PED) | PORTSC_PP;
             // SAFETY: same.
             unsafe {
                 mmio.write32(port_off, to_write);
