@@ -21,7 +21,9 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Suspend / resume handler signature. Driver-supplied,
@@ -29,12 +31,58 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// statics for the work.
 pub type PmFn = fn() -> Result<(), DeviceSuspendError>;
 
-/// One driver's suspend/resume handlers.
-#[derive(Clone, Debug)]
+/// Trait variant of the per-device suspend/resume hooks. Drivers
+/// whose suspend/resume needs to carry per-device state (saved
+/// PCI config, MMIO snapshot, controller-specific shadow regs)
+/// implement this and register via [`register_device_pm_ops`].
+///
+/// The trait mirrors Linux's `struct dev_pm_ops` (`.suspend` and
+/// `.resume` callbacks; see `drivers/base/power/main.c::dpm_suspend_start`),
+/// minus the freeze/poweroff/restore quartet — NARF only supports
+/// the S3 "suspend → resume" pair today. When hibernate (S4) lands
+/// we extend this with `freeze` / `thaw` / `poweroff` / `restore`.
+///
+/// Object-safe: `Arc<dyn DevicePmOps>` is what the registry holds.
+/// Handlers run on the boot CPU with interrupts gated — they MUST
+/// NOT schedule, sleep on the scheduler, or call back into power.
+pub trait DevicePmOps: Send + Sync {
+    /// Quiesce the device. Called in reverse-registration order
+    /// during S3 entry. Failures don't abort the suspend chain —
+    /// the aggregator counts them.
+    fn suspend(&self) -> Result<(), DevicePmError>;
+    /// Re-arm the device. Called in forward-registration order
+    /// from the wake continuation.
+    fn resume(&self) -> Result<(), DevicePmError>;
+}
+
+/// Error variants returned from a `DevicePmOps` callback. Alias
+/// of [`DeviceSuspendError`] kept distinct so trait impls don't
+/// have to import the suspend-fan-out type when only registering
+/// device PM. They're identical at the wire level.
+pub type DevicePmError = DeviceSuspendError;
+
+/// One driver's suspend/resume handlers. Either the fn-pointer
+/// pair OR the trait object is populated; the fan-out picks
+/// whichever is present (trait wins if both are set — should
+/// never happen in practice because `register_device_pm` and
+/// `register_device_pm_ops` are dispatched on `name`).
+#[derive(Clone)]
 pub struct DevicePmEntry {
     pub name: String,
     pub suspend: PmFn,
     pub resume: PmFn,
+    /// Trait-object form. When present, takes precedence over
+    /// the fn-pointer fields above.
+    pub ops: Option<Arc<dyn DevicePmOps>>,
+}
+
+impl fmt::Debug for DevicePmEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DevicePmEntry")
+            .field("name", &self.name)
+            .field("has_ops", &self.ops.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// What can go wrong inside a per-device suspend/resume callback.
@@ -74,6 +122,38 @@ pub fn register_device_pm(name: &str, suspend: PmFn, resume: PmFn) {
         name: String::from(name),
         suspend,
         resume,
+        ops: None,
+    };
+    if let Some(slot) = g.iter_mut().find(|e| e.name == name) {
+        *slot = entry;
+    } else {
+        g.push(entry);
+    }
+}
+
+/// Register a driver via the [`DevicePmOps`] trait object. Used
+/// when the driver needs to carry per-device state across
+/// suspend/resume (e.g. a saved PCI config snapshot, an MMIO
+/// shadow, a controller queue depth). Idempotent on `name`.
+///
+/// The trait object is stored as `Arc<dyn DevicePmOps>`; the
+/// fan-out clones a fresh `Arc` before invoking the callback so
+/// the registry lock isn't held across the device call.
+pub fn register_device_pm_ops(name: &str, ops: Arc<dyn DevicePmOps>) {
+    let mut g = REGISTRY.lock();
+    // Stub fn-pointers that should never be called — the trait
+    // takes precedence in the fan-out.
+    fn unreachable_suspend() -> Result<(), DeviceSuspendError> {
+        Err(DeviceSuspendError::DriverError)
+    }
+    fn unreachable_resume() -> Result<(), DeviceSuspendError> {
+        Err(DeviceSuspendError::DriverError)
+    }
+    let entry = DevicePmEntry {
+        name: String::from(name),
+        suspend: unreachable_suspend,
+        resume: unreachable_resume,
+        ops: Some(ops),
     };
     if let Some(slot) = g.iter_mut().find(|e| e.name == name) {
         *slot = entry;
@@ -125,7 +205,11 @@ pub fn suspend_all_devices() -> FanoutReport {
     let mut outcomes = Vec::with_capacity(snap.len());
     let mut failure_count = 0;
     for entry in snap.iter().rev() {
-        let result = (entry.suspend)();
+        let result = if let Some(ops) = entry.ops.as_ref() {
+            ops.suspend()
+        } else {
+            (entry.suspend)()
+        };
         if result.is_err() {
             failure_count += 1;
         }
@@ -147,7 +231,11 @@ pub fn resume_all_devices() -> FanoutReport {
     let mut outcomes = Vec::with_capacity(snap.len());
     let mut failure_count = 0;
     for entry in snap.iter() {
-        let result = (entry.resume)();
+        let result = if let Some(ops) = entry.ops.as_ref() {
+            ops.resume()
+        } else {
+            (entry.resume)()
+        };
         if result.is_err() {
             failure_count += 1;
         }

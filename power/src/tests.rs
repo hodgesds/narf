@@ -1818,3 +1818,56 @@ kernel_test_in!(
     "power/suspend",
     smoke_s3_wake_entry_phys_resolvable_via_cr3
 );
+
+// ── DevicePmOps trait round-trip ────────────────────────────────────
+
+fn smoke_device_pm_ops_round_trip() -> TestResult {
+    use crate::device_pm::{
+        register_device_pm_ops, resume_all_devices, suspend_all_devices, DevicePmError,
+        DevicePmOps, __reset_for_test,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __reset_for_test();
+
+    struct FakeDriver {
+        // Bit 0 set after suspend, bit 1 set after resume.
+        // A clean cycle leaves this at 0b11.
+        state: AtomicU32,
+    }
+    impl DevicePmOps for FakeDriver {
+        fn suspend(&self) -> Result<(), DevicePmError> {
+            self.state.fetch_or(0b01, Ordering::SeqCst);
+            Ok(())
+        }
+        fn resume(&self) -> Result<(), DevicePmError> {
+            self.state.fetch_or(0b10, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let drv = Arc::new(FakeDriver {
+        state: AtomicU32::new(0),
+    });
+    register_device_pm_ops("fake-driver", drv.clone());
+
+    let s = suspend_all_devices();
+    if !s.ok() {
+        return TestResult::Fail("trait-backed suspend reported a failure");
+    }
+    if drv.state.load(Ordering::SeqCst) & 0b01 == 0 {
+        return TestResult::Fail("trait suspend callback didn't fire");
+    }
+
+    let r = resume_all_devices();
+    if !r.ok() {
+        return TestResult::Fail("trait-backed resume reported a failure");
+    }
+    if drv.state.load(Ordering::SeqCst) != 0b11 {
+        return TestResult::Fail("trait resume callback didn't fire");
+    }
+
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", smoke_device_pm_ops_round_trip);
