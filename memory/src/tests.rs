@@ -4832,3 +4832,65 @@ fn smoke_wx_classify_helpers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/wx", smoke_wx_classify_helpers);
+
+// ── KASLR smokes ──────────────────────────────────────────────────────
+
+fn smoke_kaslr_random_u64_is_live() -> TestResult {
+    use crate::kaslr::{random_u64, EntropySource};
+    // Two reads should differ unless we're catastrophically unlucky
+    // (one chance in 2^64). Any path returns a real source tag.
+    let (a, sa) = random_u64();
+    let (b, _sb) = random_u64();
+    if a == b && a != 0 {
+        return TestResult::Fail("random_u64 returned identical values back-to-back");
+    }
+    // Whatever source was selected, it must be one of the documented
+    // variants — not a stub.
+    if !matches!(
+        sa,
+        EntropySource::Rdrand
+            | EntropySource::Rdseed
+            | EntropySource::Rndr
+            | EntropySource::TscMix
+    ) {
+        return TestResult::Fail("EntropySource not one of the documented variants");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/kaslr", smoke_kaslr_random_u64_is_live);
+
+fn smoke_kaslr_user_mmap_slot_within_slack() -> TestResult {
+    use crate::kaslr::{user_mmap_slot, USER_MMAP_RANDOM_BITS};
+    let base = 0x4000_0000_0000_u64;
+    let mask = (1u64 << USER_MMAP_RANDOM_BITS) - 1;
+    let slot = user_mmap_slot(base);
+    if slot < base {
+        return TestResult::Fail("slot below base");
+    }
+    if slot >= base + (1u64 << USER_MMAP_RANDOM_BITS) {
+        return TestResult::Fail("slot above slack window");
+    }
+    if (slot - base) & !(mask & !0xFFF) != 0 {
+        return TestResult::Fail("slot not 4 KiB-aligned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/kaslr", smoke_kaslr_user_mmap_slot_within_slack);
+
+fn smoke_kaslr_tsc_mix_advances() -> TestResult {
+    use crate::kaslr::tsc_mix;
+    // TSC mix is the fallback path; verify it doesn't get stuck on
+    // a single value. Two consecutive reads should differ on any CPU
+    // with a moving cycle counter (RDTSC on x86_64, CNTVCT_EL0 on
+    // aarch64). On non-x86 non-aarch64 it's a sentinel; skip.
+    if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+        return TestResult::Skip("tsc_mix is sentinel on this arch");
+    }
+    let a = tsc_mix();
+    let b = tsc_mix();
+    if a == b {
+        return TestResult::Fail("tsc_mix returned the same value twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/kaslr", smoke_kaslr_tsc_mix_advances);

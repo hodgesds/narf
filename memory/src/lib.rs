@@ -22,6 +22,7 @@ pub mod context;
 pub mod frame;
 pub mod heap;
 pub mod hugepage;
+pub mod kaslr;
 pub mod per_domain_root;
 pub mod reclaim;
 pub mod slab;
