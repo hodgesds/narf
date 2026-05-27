@@ -177,8 +177,17 @@ fn register_port(bus_name: &str, i2c_addr: u8, tcpc: Arc<dyn Tcpc>) {
 /// alive across detach + re-attach. Cadence derived from USB-PD 3.1
 /// §8.3 + §6.6.1: short between Advanced steps (yield only), 25 ms
 /// while Idle, 100 ms once Ready.
+///
+/// Sleeps are calibrated wall-clock via `narf_time::Deadline`. The
+/// previous incarnation used `sleep_cycles(330_000_000)` etc. which
+/// assumed a ~3.3 GHz TSC — on Renoir 4700U (2.0 GHz) that came out as
+/// 165 ms and on Phoenix HawkPoint1 (4.6 GHz) as 72 ms, so the cadence
+/// drifted by >2x across our two bring-up targets. Same bug class as
+/// the LAPIC initial_count note: hard-coded cycle counts read as
+/// timing bugs on real silicon.
 fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
     use core::fmt::Write as _;
+    use narf_time::{Deadline, SleepUntil};
     use tcpm::{PortState, PortStepOutcome};
     narf_scheduler::spawn(async move {
         let cap = narf_usbpd::bootstrap_usbpd_authority();
@@ -196,7 +205,7 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     if matches!(e, tcpm::SourceError::AuthorityRevoked) {
                         return;
                     }
-                    narf_time::sleep_cycles(330_000_000).await;
+                    SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
                     continue;
                 }
             };
@@ -224,10 +233,10 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                         );
                         announced = true;
                     }
-                    narf_time::sleep_cycles(330_000_000).await;
+                    SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
                 }
                 PortStepOutcome::Idle(_) => {
-                    narf_time::sleep_cycles(82_500_000).await;
+                    SleepUntil::new(Deadline::after_ms(25).as_instant()).await;
                 }
                 PortStepOutcome::Advanced(_) => {
                     narf_scheduler::yield_now().await;
@@ -238,7 +247,7 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                         "  tcpm: {} entered BIST",
                         label
                     );
-                    narf_time::sleep_cycles(330_000_000).await;
+                    SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
                 }
                 PortStepOutcome::RoleSwapped(next) => {
                     let _ = writeln!(

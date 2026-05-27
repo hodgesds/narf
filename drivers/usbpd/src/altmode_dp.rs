@@ -317,8 +317,14 @@ pub fn __test_reset() {
 
 /// Spawn the DP Alt Mode discovery task for one port. Polls the
 /// state machine until it reaches Active / Failed.
+///
+/// Sleeps are calibrated wall-clock via `narf_time::Deadline`. The
+/// previous incarnation used `sleep_cycles(330_000_000)` etc. which
+/// assumed a ~3.3 GHz TSC — on Renoir 4700U (2.0 GHz) that came out as
+/// 165 ms and on Phoenix HawkPoint1 (4.6 GHz) as 72 ms.
 pub fn spawn_discovery_task(p: Arc<DpAltModePort>, label: String) {
     use core::fmt::Write as _;
+    use narf_time::{Deadline, SleepUntil};
     narf_scheduler::spawn(async move {
         let cap = narf_usbpd::bootstrap_usbpd_authority();
         loop {
@@ -326,7 +332,7 @@ pub fn spawn_discovery_task(p: Arc<DpAltModePort>, label: String) {
                 Ok(DpAltStep::Active(_)) => {
                     // Steady-state: just idle. A future HPD-IRQ handler
                     // will re-poke us to re-discover.
-                    narf_time::sleep_cycles(330_000_000).await;
+                    SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
                 }
                 Ok(DpAltStep::Failed) => {
                     let _ = writeln!(
@@ -338,7 +344,7 @@ pub fn spawn_discovery_task(p: Arc<DpAltModePort>, label: String) {
                 }
                 Ok(DpAltStep::NotReady) => {
                     // Wait for the underlying TCPM port to reach Ready.
-                    narf_time::sleep_cycles(82_500_000).await; // 25 ms
+                    SleepUntil::new(Deadline::after_ms(25).as_instant()).await;
                 }
                 Ok(DpAltStep::Advanced(_)) => {
                     narf_scheduler::yield_now().await;
@@ -352,7 +358,7 @@ pub fn spawn_discovery_task(p: Arc<DpAltModePort>, label: String) {
                     if matches!(e, DpAltError::AuthorityRevoked) {
                         return;
                     }
-                    narf_time::sleep_cycles(330_000_000).await;
+                    SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
                 }
             }
         }
