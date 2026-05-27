@@ -88,6 +88,14 @@ narf-verification    = { path = "../verification", optional = true }
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
 idt-selftest = []
+# Full-boot smoke: exercise the real init flow (not the kernel-test
+# harness), then ACPI-shutdown cleanly via `narf_arch::exit_kernel(0)`
+# at a "boot ready" milestone. Lets `cargo xtask boot-smoke` watch for
+# panic markers + a natural QEMU exit instead of having to kill the
+# child after a wall-clock timeout. Mutually exclusive with
+# `kernel-test` (kernel-test takes the test harness path; boot-smoke
+# takes the real init path).
+boot-smoke = []
 # Forward narf-firmware's `firmware-allow-unsigned` so bring-up
 # initramfs blobs packed with `xtask pack-firmware` (all-zero
 # signature sentinel) actually load. Production builds disable

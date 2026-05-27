@@ -2359,8 +2359,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         narf_verification::run_all_and_exit();
     }
 
+    // Boot-smoke: real init flow + clean ACPI/isa-debug-exit shutdown.
+    // Drains queued async tasks (including measured-boot) for ~2 s so
+    // the boot log surfaces, then exits via the same port 0xF4 path
+    // the test harness uses. The xtask `boot-smoke` subcommand waits
+    // for QEMU to exit naturally + checks stdout for panic markers,
+    // rather than killing the child after a wall-clock timeout.
+    #[cfg(feature = "boot-smoke")]
+    {
+        let _ = writeln!(console::Writer, "  boot-smoke: draining tasks...");
+        // Same async-runtime spin pattern as run_async_demo, capped
+        // at ~2 seconds so the boot log is fully emitted.
+        let deadline = narf_time::Deadline::after_ms(2_000);
+        narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
+        let _ = writeln!(console::Writer, "  boot-smoke: clean exit");
+        // SAFETY: exit_kernel never returns; this is the only post-
+        // boot action we're authorised to take.
+        unsafe {
+            narf_arch::exit_kernel(0);
+        }
+    }
+
     // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
-    #[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
+    #[cfg(not(any(feature = "kernel-test", feature = "boot-smoke", feature = "idt-selftest")))]
     run_async_demo()
 }
 

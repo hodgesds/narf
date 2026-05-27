@@ -5,8 +5,9 @@
 // `cargo xtask test  --arch=aarch64`             — boot + run kernel tests
 // `cargo xtask image --arch=x86_64 --bootloader=limine` — bootable ISO
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -26,6 +27,12 @@ enum Cmd {
     Run(BuildArgs),
     /// Cross-compile and run kernel tests under QEMU.
     Test(BuildArgs),
+    /// Cross-compile and boot under QEMU as a real init pass (no
+    /// kernel-test feature), parsing serial output for panic markers
+    /// and known success markers. Catches regressions that smoke
+    /// tests miss because smokes exercise modules in isolation
+    /// rather than the full boot flow.
+    BootSmoke(BuildArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
     /// Build the bootable Limine ISO and boot it under QEMU + OVMF.
@@ -966,6 +973,124 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
             bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
         }
     }
+    Ok(())
+}
+
+/// Boot the kernel under QEMU *without* the `kernel-test` feature
+/// (i.e. the real init flow), capture stdout line-by-line, and check
+/// for panic markers + known success markers. This catches regressions
+/// that the per-module smokes can't — e.g. the `bare_main.rs:1813`
+/// PCR-0 self-measure that panicked at boot but passed every unit test
+/// because the broken code path only runs in the late-boot async task.
+///
+/// Success criteria: all expected markers seen within the timeout, no
+/// panic marker observed.
+/// Failure: any panic marker, OR timeout without all success markers.
+fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    // Force the `boot-smoke` feature on so the kernel triggers a clean
+    // ACPI / isa-debug-exit shutdown after the real init flow drains.
+    // Same pattern as the kernel-test harness — no kill-after-timeout
+    // race; QEMU exits naturally on success or stays alive on hang.
+    let mut args = args.clone();
+    ensure_feature(&mut args.features, "boot-smoke");
+
+    let root = workspace_root()?;
+    let out_dir = cargo_build(&args, &root)?;
+
+    let kernel = out_dir.join(&args.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+
+    let qemu = args.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    println!("xtask boot-smoke: launching {} {}", qemu, kernel.display());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    // Panic markers — any one of these in stdout triggers failure
+    // even if QEMU then exits cleanly.
+    let panic_markers: &[&str] = &[
+        "*** KERNEL PANIC ***",
+        "panicked at",
+        "double fault",
+        "general protection",
+        "kernel page fault",
+        "unsafe precondition",
+    ];
+
+    let secs = std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(90);
+
+    // Stream stdout to terminal and accumulate any panic markers.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
+    let reader_handle = std::thread::spawn(move || -> Option<String> {
+        let reader = BufReader::new(stdout);
+        let mut panic_line = None;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            println!("{line}");
+            if panic_line.is_none()
+                && panic_markers.iter().any(|m| line.contains(m))
+            {
+                panic_line = Some(line);
+            }
+        }
+        panic_line
+    });
+
+    // Wait for QEMU to exit naturally (kernel calls exit_kernel),
+    // OR force-kill on timeout.
+    let exit = child.wait_timeout(Duration::from_secs(secs))?;
+    let panic_line = reader_handle.join().ok().flatten();
+
+    let status = match exit {
+        Some(s) => s,
+        None => {
+            child.kill()?;
+            child.wait()?;
+            if let Some(p) = panic_line {
+                bail!(
+                    "xtask boot-smoke: panic before clean exit — '{}'",
+                    p
+                );
+            }
+            bail!(
+                "xtask boot-smoke: kernel did not call exit_kernel within {}s — possible hang in real init flow",
+                secs
+            );
+        }
+    };
+
+    if let Some(p) = panic_line {
+        bail!("xtask boot-smoke: kernel panic during boot — '{}'", p);
+    }
+    // `isa-debug-exit` exits QEMU with `(code << 1) | 1`. Kernel
+    // passes 0 on success → QEMU exit code 1.
+    if !matches!(status.code(), Some(1)) {
+        bail!(
+            "xtask boot-smoke: QEMU exited with non-success status {:?} (expected 1 from isa-debug-exit code=0)",
+            status.code()
+        );
+    }
+    println!("xtask boot-smoke: kernel cleanly exited via isa-debug-exit, no panic markers");
     Ok(())
 }
 
@@ -2454,13 +2579,27 @@ fn main() -> Result<()> {
         }
         Cmd::Run(args) => run_cmd(&args),
         Cmd::Test(mut args) => {
-            if args.features.is_empty() {
-                args.features = "kernel-test".into();
-            } else if !args.features.contains("kernel-test") {
-                args.features.push_str(",kernel-test");
+            // Phase 1: kernel-test feature on, run all in-kernel smokes.
+            let mut smoke_args = args.clone();
+            if smoke_args.features.is_empty() {
+                smoke_args.features = "kernel-test".into();
+            } else if !smoke_args.features.contains("kernel-test") {
+                smoke_args.features.push_str(",kernel-test");
             }
-            run_cmd(&args)
+            run_cmd(&smoke_args)?;
+            // Phase 2: boot-smoke without kernel-test. Catches
+            // regressions that smokes miss because they exercise modules
+            // in isolation, not the full init flow. Strip the
+            // kernel-test feature explicitly so the real init runs.
+            args.features = args
+                .features
+                .split(',')
+                .filter(|f| !f.is_empty() && *f != "kernel-test")
+                .collect::<Vec<_>>()
+                .join(",");
+            boot_smoke_cmd(&args)
         }
+        Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::Image(mut args) => {
             // Default-on boot-init for parity with `iso-boot`. An
             // image without it boots to the async-demo loop and
