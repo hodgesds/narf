@@ -5129,11 +5129,19 @@ fn sys_getcwd(ctx: &mut dyn TrapContext) {
 // to query. The per-task break starts at a fixed default well above
 // the mmap cursor (`MMAP_CURSOR` starts at 0x4080..) and below the
 // user stack (`DEFAULT_USER_STACK_BASE = 0x7FFF_FFFC_0000`). Growing
-// the heap allocates frames + maps them R+W; shrinking is a Stage-4
-// TODO — we just lower the recorded break without unmapping so the
-// physical pages leak until the task exits. POSIX brk's failure
-// contract is "return the unchanged break", so allocation/mapping
-// failure is silent: we just hand back the current value.
+// the heap allocates frames + maps them R+W. Shrinking walks the
+// per-grow Region list and calls `unmap_region` on every Region whose
+// base falls in [new_break_aligned, cur_aligned) — the PTE walk inside
+// `unmap_region` frees each physical page back to the allocator, so a
+// task that drops back to its base on `brk(0)` doesn't leak pages
+// until exit. Regions that straddle `new_break` are left intact
+// (partial unmap would need a region-split primitive). POSIX brk's
+// failure contract is "return the unchanged break", so allocation /
+// mapping failure is silent: we just hand back the current value.
+// Reference: Linux `mm/mmap.c:do_munmap` does the same "find the
+// VMAs covered by the range and unmap them" walk; the partial-VMA
+// case there is handled by `__split_vma` which NARF will add when a
+// real workload demands it.
 
 /// Default per-task heap base. Far enough from the mmap cursor and
 /// the user stack to leave room for both to grow without colliding
