@@ -612,3 +612,142 @@ fn smoke_exfat_upcase_checksum_known_values() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/exfat", smoke_exfat_upcase_checksum_known_values);
+
+// ── §6.3.2 SetChecksum on multi-entry groups ─────────────────────
+//
+// Per MS exFAT spec §6.3.2 the algorithm is:
+//   checksum = ((checksum & 1) << 15) | (checksum >> 1)
+//   checksum = (checksum + byte) & 0xFFFF
+// applied to every byte in the set except bytes 2 and 3 of the first
+// (primary) entry (the checksum field itself).
+//
+// The test vectors below are self-validating: `finalize_set_checksum`
+// writes the computed value into bytes 2..4 of the primary entry; we
+// then recompute with `set_checksum` and compare the stored and live
+// values. A 3-entry set (primary + stream + one name slot) and a
+// 5-entry set (primary + stream + three name slots) exercise different
+// total byte counts.
+
+/// Helper: advance the MS §6.3.2 checksum state by one byte.
+fn exfat_checksum_step(acc: u16, b: u8) -> u16 {
+    let rotated = ((acc & 1) << 15) | (acc >> 1);
+    rotated.wrapping_add(b as u16)
+}
+
+/// Reference implementation of §6.3.2 set checksum over a byte slice,
+/// skipping bytes 2 and 3 of the first entry. Used to cross-check the
+/// production `set_checksum` in dir.rs.
+fn ref_set_checksum(group: &[u8]) -> u16 {
+    let mut acc: u16 = 0;
+    for (i, &b) in group.iter().enumerate() {
+        if i == 2 || i == 3 {
+            continue;
+        }
+        acc = exfat_checksum_step(acc, b);
+    }
+    acc
+}
+
+fn smoke_exfat_set_checksum_3entry_set() -> TestResult {
+    // 3-entry set: FileDirectory (0x85) + StreamExtension (0xC0) +
+    // FileName (0xC1). 3 × 32 = 96 bytes total.
+    // Spec §7.4 — primary entry first; secondary_count = 2.
+    use super::dir::{finalize_set_checksum, recompute_set_checksum, verify_set_checksum, set_checksum};
+
+    let mut group = [0u8; 96];
+    // Primary: FileDirectory.
+    group[0] = 0x85; // type
+    group[1] = 2;    // SecondaryCount = 2
+    // bytes 2..4 are the checksum field — left as zero initially.
+    // FileAttributes = ARCHIVE (0x0020).
+    group[4] = 0x20;
+    group[5] = 0x00;
+    // Stream Extension.
+    group[32] = 0xC0; // type
+    group[33] = 0x03; // GeneralSecondaryFlags
+    group[35] = 5;    // NameLength = 5
+    // FileName slot.
+    group[64] = 0xC1; // type
+    // First 5 UTF-16 chars of name "HELLO" packed LE.
+    let hello: &[u16] = &[b'H' as u16, b'E' as u16, b'L' as u16, b'L' as u16, b'O' as u16];
+    for (i, &cu) in hello.iter().enumerate() {
+        let bytes = cu.to_le_bytes();
+        group[66 + i * 2] = bytes[0];
+        group[66 + i * 2 + 1] = bytes[1];
+    }
+
+    // Compute expected checksum via the reference implementation.
+    let expected = ref_set_checksum(&group);
+
+    // Production path: finalize + verify.
+    finalize_set_checksum(&mut group);
+    let stored = u16::from_le_bytes([group[2], group[3]]);
+    if stored != expected {
+        return TestResult::Fail("finalize_set_checksum: stored != reference for 3-entry set");
+    }
+    if !verify_set_checksum(&group) {
+        return TestResult::Fail("verify_set_checksum failed after finalize on 3-entry set");
+    }
+    if set_checksum(&group) != stored {
+        return TestResult::Fail("set_checksum recompute != stored for 3-entry set");
+    }
+
+    // recompute_set_checksum is equivalent to finalize_set_checksum.
+    group[10] ^= 0x7F; // perturb a payload byte
+    recompute_set_checksum(&mut group);
+    if !verify_set_checksum(&group) {
+        return TestResult::Fail("verify_set_checksum failed after recompute_set_checksum");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_set_checksum_3entry_set);
+
+fn smoke_exfat_set_checksum_5entry_set() -> TestResult {
+    // 5-entry set: FileDirectory (0x85) + StreamExtension (0xC0) +
+    // three FileName entries (0xC1). 5 × 32 = 160 bytes total.
+    // SecondaryCount = 4 (1 stream + 3 name slots).
+    use super::dir::{finalize_set_checksum, recompute_set_checksum, verify_set_checksum, set_checksum};
+
+    let mut group = [0u8; 160];
+    group[0] = 0x85; // primary type
+    group[1] = 4;    // SecondaryCount = 4
+    group[4] = 0x20; // FileAttributes = ARCHIVE
+    group[32] = 0xC0; // stream extension
+    group[33] = 0x01; // ALLOCATION_POSSIBLE
+    group[35] = 40;   // NameLength = 40 (3 × 15 = 45 > 40 — fills 2 full + partial slot)
+    // Three FileName entries.
+    group[64]  = 0xC1;
+    group[96]  = 0xC1;
+    group[128] = 0xC1;
+    // Fill each name slot with a distinct repeating pattern.
+    for i in 0..15usize {
+        let bytes = ((0x41u16 + i as u16) & 0xFF).to_le_bytes();
+        group[66  + i * 2] = bytes[0]; // first slot: A..O
+        group[98  + i * 2] = bytes[0].wrapping_add(0x10); // second: Q..
+        group[130 + i * 2] = bytes[0].wrapping_add(0x20); // third: a..
+    }
+
+    let expected = ref_set_checksum(&group);
+    finalize_set_checksum(&mut group);
+    let stored = u16::from_le_bytes([group[2], group[3]]);
+    if stored != expected {
+        return TestResult::Fail("finalize_set_checksum: stored != reference for 5-entry set");
+    }
+    if !verify_set_checksum(&group) {
+        return TestResult::Fail("verify_set_checksum failed after finalize on 5-entry set");
+    }
+    if set_checksum(&group) != stored {
+        return TestResult::Fail("set_checksum recompute != stored for 5-entry set");
+    }
+
+    // Perturb + recompute via the canonical name.
+    group[80] ^= 0xAA;
+    recompute_set_checksum(&mut group);
+    if !verify_set_checksum(&group) {
+        return TestResult::Fail("verify_set_checksum failed after recompute_set_checksum on 5-entry");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_set_checksum_5entry_set);

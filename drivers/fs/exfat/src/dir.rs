@@ -251,3 +251,20 @@ pub fn verify_set_checksum(group: &[u8]) -> bool {
     let stored = u16::from_le_bytes([group[2], group[3]]);
     set_checksum(group) == stored
 }
+
+/// Re-compute and write back the SetChecksum for a directory-entry
+/// group that has been modified. Equivalent to [`finalize_set_checksum`];
+/// exposed under this name so dir-mutation callers have a clearly
+/// named entry point for "I've changed a secondary entry, now fix up
+/// the primary's checksum field."
+///
+/// Per MS exFAT spec §6.3.2 / §7.4.3 the checksum is stored at
+/// bytes 2..4 (little-endian) of the first (primary) entry.
+///
+/// # Panics
+/// Panics if `set.len() < 4` — the minimum size for a group with a
+/// primary entry is 32 bytes (one entry), but the caller must supply
+/// at least 4 bytes for the checksum field to exist.
+pub fn recompute_set_checksum(set: &mut [u8]) {
+    finalize_set_checksum(set);
+}
