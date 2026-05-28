@@ -29,6 +29,8 @@
 
 #![allow(dead_code)]
 
+extern crate alloc;
+
 use crate::chip::ChipFamily;
 
 // ── Register offsets ─────────────────────────────────────────────
@@ -175,5 +177,154 @@ impl IntrSource {
             IntrSource::Pmu => 1 << 21,
             IntrSource::Gsp => 1 << 28,
         }
+    }
+
+    /// All sources, in canonical walk order. Cite gk104.c's
+    /// `gk104_mc_intrs[]` for the same ordering — high-priority
+    /// (DISP, FIFO) first, then per-engine, then subsystems.
+    pub const fn all() -> &'static [IntrSource] {
+        &[
+            IntrSource::Display,
+            IntrSource::Fifo,
+            IntrSource::Graphics,
+            IntrSource::CopyEngine0,
+            IntrSource::CopyEngine1,
+            IntrSource::CopyEngine2,
+            IntrSource::Sec,
+            IntrSource::Pmu,
+            IntrSource::Gsp,
+        ]
+    }
+
+    /// Per-engine interrupt-status register inside BAR0 for this
+    /// source. This is the second-level register the IH walker
+    /// touches after PMC_INTR_0 reports the top-level bit. Cite
+    /// per-engine `dev_*.ref.txt`.
+    pub const fn engine_status_offset(self) -> Option<u64> {
+        match self {
+            IntrSource::Fifo => Some(crate::fifo::PFIFO_INTR_0),
+            IntrSource::Graphics => Some(crate::gr::PGRAPH_INTR),
+            IntrSource::Display => Some(0x0061_0024),
+            IntrSource::CopyEngine0 => Some(0x0010_4140),
+            IntrSource::CopyEngine1 => Some(0x0010_4540),
+            IntrSource::CopyEngine2 => Some(0x0010_4940),
+            IntrSource::Pmu => Some(0x0010_A008),
+            IntrSource::Sec => Some(0x0084_0008),
+            IntrSource::Gsp => Some(0x0011_0008),
+        }
+    }
+
+    /// Per-engine interrupt-enable register. Same offset table as
+    /// `engine_status_offset` but with a +4 displacement, matching
+    /// every NV register pair convention (status + 0, enable + 4).
+    pub const fn engine_enable_offset(self) -> Option<u64> {
+        match self.engine_status_offset() {
+            Some(off) => Some(off + 4),
+            None => None,
+        }
+    }
+}
+
+// ── IH cookie decode walker ──────────────────────────────────────
+//
+// Cite `nvkm/subdev/mc/base.c` + `nv04_mc_intr_pending` +
+// `gk104_mc_intrs[]` for the walking shape: read PMC_INTR_0,
+// produce one cookie per asserted bit, route to per-engine
+// `engine_status_offset()` for the sub-tree decode.
+
+/// One decoded interrupt cookie — the IH walker produces a vector
+/// of these per PMC_INTR_0 sample.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IntrCookie {
+    /// Which top-level source asserted.
+    pub source: IntrSource,
+    /// The raw PMC_INTR_0 bit that fired.
+    pub intr0_bit: u32,
+    /// Per-engine sub-tree status value (read from the
+    /// `engine_status_offset` register). 0 = none observed; the
+    /// walker stores the live value so the per-engine bottom-half
+    /// can inspect it without re-reading.
+    pub engine_status: u32,
+}
+
+impl IntrCookie {
+    /// Construct a cookie for a single source.
+    pub const fn new(source: IntrSource, engine_status: u32) -> Self {
+        Self {
+            source,
+            intr0_bit: source.intr0_bit(),
+            engine_status,
+        }
+    }
+}
+
+/// Walk a synthetic `PMC_INTR_0` + per-engine status table. Produces
+/// one cookie per asserted source bit, in declaration order. The
+/// caller supplies the per-engine status pre-read (so the walker is
+/// hermetic / live-MMIO-free for tests). Mirrors `nvkm_mc_intr`'s
+/// bit-walk; the `intr_pending` reader populates `intr->stat[]` for
+/// us in real silicon.
+pub fn walk_intr0(
+    pmc_intr_0: u32,
+    engine_status: impl Fn(IntrSource) -> u32,
+) -> alloc::vec::Vec<IntrCookie> {
+    let mut out = alloc::vec::Vec::new();
+    for s in IntrSource::all().iter().copied() {
+        if pmc_intr_0 & s.intr0_bit() != 0 {
+            out.push(IntrCookie::new(s, engine_status(s)));
+        }
+    }
+    out
+}
+
+/// Top-level intr-walker, live MMIO variant. Reads PMC_INTR_0 then
+/// each per-engine status register, packs them into cookies.
+///
+/// # Safety
+/// `bar0` is the kernel-mapped BAR0 view of the card. Caller has
+/// exclusive access (typically an IRQ top-half).
+pub unsafe fn read_live_intr0(
+    bar0: &narf_driver_runtime::MmioRegion,
+) -> alloc::vec::Vec<IntrCookie> {
+    // SAFETY: caller's responsibility.
+    let top = unsafe { bar0.read32(PMC_INTR_0) };
+    walk_intr0(top, |src| {
+        // SAFETY: same.
+        match src.engine_status_offset() {
+            Some(off) => unsafe { bar0.read32(off) },
+            None => 0,
+        }
+    })
+}
+
+/// Mask a single interrupt source at the top level. Cite
+/// `nv04_mc_intr_unarm`'s write to `0x000140` (= PMC_INTR_EN_0).
+///
+/// # Safety
+/// `bar0` is the kernel-mapped BAR0 view; caller has exclusive
+/// access to the intr-enable register.
+pub unsafe fn mask_intr_source(
+    bar0: &narf_driver_runtime::MmioRegion,
+    source: IntrSource,
+) {
+    // SAFETY: caller's responsibility.
+    unsafe {
+        let cur = bar0.read32(PMC_INTR_EN_0);
+        bar0.write32(PMC_INTR_EN_0, cur & !source.intr0_bit());
+    }
+}
+
+/// Unmask a single interrupt source.
+///
+/// # Safety
+/// Same.
+pub unsafe fn unmask_intr_source(
+    bar0: &narf_driver_runtime::MmioRegion,
+    source: IntrSource,
+) {
+    // SAFETY: caller's responsibility.
+    unsafe {
+        let cur = bar0.read32(PMC_INTR_EN_0);
+        bar0.write32(PMC_INTR_EN_0, cur | source.intr0_bit());
     }
 }

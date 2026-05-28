@@ -1652,6 +1652,124 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// IH (interrupt-handler) cookie-decode walker (item 5)
+// ────────────────────────────────────────────────────────────────
+
+use crate::mc::{walk_intr0, IntrCookie};
+
+fn smoke_mc_intr_all_sources_cover_every_top_level_bit() -> TestResult {
+    let all = IntrSource::all();
+    let mut union = 0u32;
+    for s in all.iter().copied() {
+        let bit = s.intr0_bit();
+        if bit == 0 {
+            return TestResult::Fail("each source must have a bit");
+        }
+        if union & bit != 0 {
+            return TestResult::Fail("source bit overlap in IntrSource::all()");
+        }
+        union |= bit;
+    }
+    // Sanity: at least 6 distinct sources covered.
+    if union.count_ones() < 6 {
+        return TestResult::Fail("expected ≥6 top-level interrupt sources");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_mc_intr_all_sources_cover_every_top_level_bit
+);
+
+fn smoke_mc_walk_intr0_produces_one_cookie_per_bit() -> TestResult {
+    // Synthetic PMC_INTR_0 with DISP + FIFO + GR set.
+    let intr0 = IntrSource::Display.intr0_bit()
+        | IntrSource::Fifo.intr0_bit()
+        | IntrSource::Graphics.intr0_bit();
+    let cookies = walk_intr0(intr0, |src| match src {
+        IntrSource::Display => 0xDEAD,
+        IntrSource::Fifo => 0xBEEF,
+        IntrSource::Graphics => 0x1234,
+        _ => 0,
+    });
+    if cookies.len() != 3 {
+        return TestResult::Fail("expected 3 cookies for 3 asserted bits");
+    }
+    // First in declaration order is DISP.
+    if cookies[0].source != IntrSource::Display {
+        return TestResult::Fail("DISP cookie should come first per IntrSource::all order");
+    }
+    if cookies[0].engine_status != 0xDEAD {
+        return TestResult::Fail("DISP engine_status should propagate");
+    }
+    if cookies[0].intr0_bit != IntrSource::Display.intr0_bit() {
+        return TestResult::Fail("DISP intr0_bit must be carried in cookie");
+    }
+    // Second is FIFO.
+    if cookies[1].source != IntrSource::Fifo {
+        return TestResult::Fail("FIFO second");
+    }
+    if cookies[1].engine_status != 0xBEEF {
+        return TestResult::Fail("FIFO engine_status propagate");
+    }
+    if cookies[2].source != IntrSource::Graphics {
+        return TestResult::Fail("GR third");
+    }
+    // Empty PMC_INTR_0 → empty cookie list.
+    let empty = walk_intr0(0, |_| 0);
+    if !empty.is_empty() {
+        return TestResult::Fail("intr0=0 must produce no cookies");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_mc_walk_intr0_produces_one_cookie_per_bit
+);
+
+fn smoke_mc_engine_status_offsets_match_dev_refs() -> TestResult {
+    // FIFO sub-tree status @ PFIFO_INTR_0 (0x2100).
+    if IntrSource::Fifo.engine_status_offset() != Some(crate::fifo::PFIFO_INTR_0) {
+        return TestResult::Fail("FIFO status offset");
+    }
+    // GR sub-tree status @ PGRAPH_INTR (0x400100).
+    if IntrSource::Graphics.engine_status_offset() != Some(crate::gr::PGRAPH_INTR) {
+        return TestResult::Fail("GR status offset");
+    }
+    // Each source must have a +4 enable register.
+    for s in IntrSource::all().iter().copied() {
+        let st = s.engine_status_offset();
+        let en = s.engine_enable_offset();
+        if st.is_none() || en.is_none() {
+            return TestResult::Fail("status + enable must be defined");
+        }
+        if en.unwrap() - st.unwrap() != 4 {
+            return TestResult::Fail("enable register is status + 4");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_mc_engine_status_offsets_match_dev_refs
+);
+
+fn smoke_mc_intr_cookie_construct_carries_fields() -> TestResult {
+    let c = IntrCookie::new(IntrSource::Pmu, 0xCAFE_F00D);
+    if c.source != IntrSource::Pmu {
+        return TestResult::Fail("source field");
+    }
+    if c.intr0_bit != IntrSource::Pmu.intr0_bit() {
+        return TestResult::Fail("intr0_bit field");
+    }
+    if c.engine_status != 0xCAFE_F00D {
+        return TestResult::Fail("engine_status field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/mc", smoke_mc_intr_cookie_construct_carries_fields);
+
+// ────────────────────────────────────────────────────────────────
 // NVDEC submission (item 3)
 // ────────────────────────────────────────────────────────────────
 
