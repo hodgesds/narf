@@ -33,6 +33,7 @@ extern crate alloc;
 
 pub mod acp6;
 pub mod acp6_bdl;
+pub mod acp6_codec_link;
 pub mod acp6_pcm;
 pub mod codec;
 pub mod hda;
