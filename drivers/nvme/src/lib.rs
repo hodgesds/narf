@@ -1909,35 +1909,55 @@ fn nvme_submit_blocking(
     let total_bytes = (blocks as usize)
         .checked_mul(lba_bytes)
         .ok_or(BlockError::InvalidRange)?;
-    // Single-PRP path: one 4-KiB page. Larger transfers require the
-    // PRP-list shape (CDW7 = phys of u64 array of page-aligned
-    // entries). Reject cleanly so the filesystem can split / fall
-    // back to the sync path.
-    if total_bytes > 4096 {
-        return Err(BlockError::InvalidRange);
-    }
     if buffer.len() < total_bytes {
         return Err(BlockError::InvalidRange);
     }
 
+    // Build a page list from the DmaBuffer's contiguous physical
+    // memory. `alloc_coherent` returns physically-contiguous frames
+    // (the frame allocator's contract), so we can compute page
+    // addresses by stepping at PAGE_SIZE increments from the base.
+    //
+    // Single-page (≤ 4096 B): use read_lba / write_lba directly.
+    // Multi-page (> 4096 B): decompose into PhysAddr slices and
+    // use read_lba_pages / write_lba_pages (PRP1+PRP2 or PRP-list).
+    let base_phys = buffer.phys_addr();
+    let n_pages = total_bytes.div_ceil(PAGE_SIZE as usize);
+
     let mut g = CONTROLLER.lock();
     let ctrl = g.as_mut().ok_or(BlockError::DeviceRemoved)?;
-    match req.op {
-        BlockOp::Read => ctrl
-            .read_lba(req.lba, blocks, &buffer)
-            .map_err(map_nvme_err),
-        BlockOp::Write { fua: _ } => ctrl
-            .write_lba(req.lba, blocks, &buffer)
-            .map_err(map_nvme_err),
-        BlockOp::WriteZeroes => {
-            // Dataset-management Write Zeroes (opcode 0x08) isn't
-            // wired yet; emulate by writing the buffer's content
-            // (caller is expected to have zeroed it). Honest about
-            // not fast-pathing.
-            ctrl.write_lba(req.lba, blocks, &buffer)
-                .map_err(map_nvme_err)
+
+    if n_pages == 1 {
+        // Fast-path: single PRP, no allocation.
+        match req.op {
+            BlockOp::Read => ctrl
+                .read_lba(req.lba, blocks, &buffer)
+                .map_err(map_nvme_err),
+            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => ctrl
+                .write_lba(req.lba, blocks, &buffer)
+                .map_err(map_nvme_err),
+            BlockOp::Trim => Ok(()),
         }
-        BlockOp::Trim => Ok(()),
+    } else {
+        // Multi-page: build a page-address Vec then dispatch through
+        // the PRP-list path.
+        // Cap at MAX_PRP_LIST_ENTRIES + 1 (PRP1 + 511 list entries).
+        if n_pages > 512 {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut pages: Vec<PhysAddr> = Vec::with_capacity(n_pages);
+        for i in 0..n_pages {
+            pages.push(PhysAddr::new(base_phys.raw() + (i as u64) * PAGE_SIZE));
+        }
+        match req.op {
+            BlockOp::Read => ctrl
+                .read_lba_pages(req.lba, blocks, &pages)
+                .map_err(map_nvme_err),
+            BlockOp::Write { fua: _ } | BlockOp::WriteZeroes => ctrl
+                .write_lba_pages(req.lba, blocks, &pages)
+                .map_err(map_nvme_err),
+            BlockOp::Trim => Ok(()),
+        }
     }
 }
 
