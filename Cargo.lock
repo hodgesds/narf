@@ -980,6 +980,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-psp"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-storage"
 version = "0.0.0"
 dependencies = [
@@ -1237,6 +1245,7 @@ dependencies = [
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-platform",
+ "narf-drivers-psp",
  "narf-drivers-storage",
  "narf-drivers-thunderbolt",
  "narf-drivers-usb",

@@ -50,6 +50,7 @@ members = [
     "drivers/gpio",
     "drivers/i3c",
     "drivers/gpu",
+    "drivers/psp",
     "drivers/storage",
     "drivers/usb",
     "drivers/usbpd",
