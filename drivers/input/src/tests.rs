@@ -1627,5 +1627,312 @@ mod i2c_hid_touch_smokes {
         "drivers/input/i2c-hid",
         smoke_touchscreen_no_event_on_unknown_release
     );
+
+    // ── Pen / stylus pump ─────────────────────────────────────────
+    //
+    // Exercises `pump_pen_report` — the bridge between
+    // `narf_hid::pen::DecodedPen` and the Button + Absolute rings.
+
+    fn smoke_pen_in_range_emits_btn_tool_pen_and_abs_xy() -> TestResult {
+        use narf_input::{abs, btn, __reset_global_ring_for_test, init_global_ring,
+                         pop_absolute, pop_button};
+        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
+                                   __pump_pen_for_test};
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut state = __new_pen_state_for_test();
+
+        // Hover (in_range=true, tip=false). Expect BTN_TOOL_PEN=1
+        // and an ABS_X + ABS_Y.
+        let pen = __build_pen_for_test(true, false, false, false, 0x1000, 0x2000, None);
+        let n = __pump_pen_for_test(&mut state, &pen);
+        if n < 3 {
+            return TestResult::Fail("hover should emit at least 3 events");
+        }
+        match pop_button() {
+            Some(b) => {
+                if b.code != btn::BTN_TOOL_PEN || !b.pressed {
+                    return TestResult::Fail("expected BTN_TOOL_PEN pressed");
+                }
+            }
+            None => return TestResult::Fail("no button event for hover"),
+        }
+        let ax = match pop_absolute() {
+            Some(a) => a,
+            None => return TestResult::Fail("no ABS_X event for hover"),
+        };
+        if ax.axis != abs::ABS_X || ax.value != 0x1000 {
+            return TestResult::Fail("ABS_X shape wrong");
+        }
+        let ay = match pop_absolute() {
+            Some(a) => a,
+            None => return TestResult::Fail("no ABS_Y event for hover"),
+        };
+        if ay.axis != abs::ABS_Y || ay.value != 0x2000 {
+            return TestResult::Fail("ABS_Y shape wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_pen_in_range_emits_btn_tool_pen_and_abs_xy
+    );
+
+    fn smoke_pen_tip_down_emits_btn_stylus_and_pressure() -> TestResult {
+        use narf_input::{abs, btn, __reset_global_ring_for_test, init_global_ring,
+                         pop_absolute, pop_button};
+        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
+                                   __pump_pen_for_test};
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut state = __new_pen_state_for_test();
+
+        // Hover first so in_range state is set.
+        let hover = __build_pen_for_test(true, false, false, false, 0, 0, None);
+        let _ = __pump_pen_for_test(&mut state, &hover);
+        // Drain the hover events.
+        while pop_button().is_some() {}
+        while pop_absolute().is_some() {}
+
+        // Tip down with pressure 512.
+        let tip_down = __build_pen_for_test(true, true, false, false, 100, 200, Some(512));
+        let _ = __pump_pen_for_test(&mut state, &tip_down);
+
+        // Expect BTN_STYLUS=true (tip), then ABS_X, ABS_Y, ABS_PRESSURE.
+        match pop_button() {
+            Some(b) if b.code == btn::BTN_STYLUS && b.pressed => {}
+            _ => return TestResult::Fail("expected BTN_STYLUS pressed"),
+        }
+        let found_pressure = {
+            let mut found = false;
+            for _ in 0..4 {
+                if let Some(a) = pop_absolute() {
+                    if a.axis == abs::ABS_PRESSURE && a.value == 512 {
+                        found = true;
+                    }
+                }
+            }
+            found
+        };
+        if !found_pressure {
+            return TestResult::Fail("ABS_PRESSURE(512) not emitted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_pen_tip_down_emits_btn_stylus_and_pressure
+    );
+
+    fn smoke_pen_eraser_emits_btn_tool_rubber() -> TestResult {
+        use narf_input::{btn, __reset_global_ring_for_test, init_global_ring, pop_button};
+        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
+                                   __pump_pen_for_test};
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut state = __new_pen_state_for_test();
+
+        // Eraser end (eraser=true, in_range=true).
+        let eraser = __build_pen_for_test(true, false, true, false, 0, 0, None);
+        let _ = __pump_pen_for_test(&mut state, &eraser);
+
+        // First button event must be BTN_TOOL_RUBBER pressed.
+        match pop_button() {
+            Some(b) => {
+                if b.code != btn::BTN_TOOL_RUBBER || !b.pressed {
+                    return TestResult::Fail("expected BTN_TOOL_RUBBER pressed");
+                }
+            }
+            None => return TestResult::Fail("no button event for eraser hover"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_pen_eraser_emits_btn_tool_rubber
+    );
+
+    fn smoke_pen_leave_range_releases_tool() -> TestResult {
+        use narf_input::{btn, __reset_global_ring_for_test, init_global_ring, pop_button};
+        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
+                                   __pump_pen_for_test};
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut state = __new_pen_state_for_test();
+
+        // Hover in.
+        let hover = __build_pen_for_test(true, false, false, false, 0, 0, None);
+        let _ = __pump_pen_for_test(&mut state, &hover);
+        while pop_button().is_some() {}
+
+        // Hover out: BTN_TOOL_PEN released.
+        let out = __build_pen_for_test(false, false, false, false, 0, 0, None);
+        let _ = __pump_pen_for_test(&mut state, &out);
+        match pop_button() {
+            Some(b) => {
+                if b.code != btn::BTN_TOOL_PEN || b.pressed {
+                    return TestResult::Fail("expected BTN_TOOL_PEN released");
+                }
+            }
+            None => return TestResult::Fail("no button event for pen-out"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_pen_leave_range_releases_tool
+    );
+
+    // ── End-to-end FakeI2cHid bind ───────────────────────────────
+    //
+    // Builds a MockBus, stages a full HID descriptor + touchscreen
+    // report-descriptor read, plus one synthetic 2-finger touchscreen
+    // input report, and verifies that TouchEvents land on the ring.
+    // This exercises the entire decode chain without real hardware.
+
+    fn smoke_fake_i2c_hid_touchscreen_end_to_end() -> TestResult {
+        use alloc::sync::Arc;
+        use narf_drivers_i2c::I2cBus;
+        use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
+        use crate::i2c_hid::{I2cHidDriver, POWER_ON};
+
+        // ── Build the report-descriptor blob ─────────────────────
+        // Re-use the canonical 2-finger touchscreen blob from narf-hid.
+        let report_desc_blob = narf_hid::touchscreen::__touchscreen_descriptor_blob();
+
+        // ── Build a synthetic 2-finger input report ───────────────
+        // Report structure (from the blob):
+        //   Byte 0: Report ID (1)
+        //   Per finger 0:
+        //     Byte 1 bits[0..1]: tip_switch (1 bit) + in_range (1 bit)
+        //     Byte 1 bits[2..7]: padding (6 bits)
+        //     Byte 2: contact_id (8 bits)
+        //     Bytes 3-4: X (16-bit LE)
+        //     Bytes 5-6: Y (16-bit LE)
+        //   Per finger 1:
+        //     Byte 7 bits[0..1]: tip_switch + in_range
+        //     Byte 7 bits[2..7]: padding
+        //     Byte 8: contact_id
+        //     Bytes 9-10: X
+        //     Bytes 11-12: Y
+        //   Byte 13: contact_count (8 bits)
+        //
+        // Finger 0: tip+in_range=0b11, id=1, X=0x1000, Y=0x2000
+        // Finger 1: tip+in_range=0b11, id=2, X=0x5000, Y=0x6000
+        // contact_count=2
+        let input_report: alloc::vec::Vec<u8> = alloc::vec![
+            0x01,               // Report ID
+            0b0000_0011,        // F0: tip=1, in_range=1, pad=000000
+            0x01,               // F0: contact_id = 1
+            0x00, 0x10,         // F0: X = 0x1000
+            0x00, 0x20,         // F0: Y = 0x2000
+            0b0000_0011,        // F1: tip=1, in_range=1, pad=000000
+            0x02,               // F1: contact_id = 2
+            0x00, 0x50,         // F1: X = 0x5000
+            0x00, 0x60,         // F1: Y = 0x6000
+            0x02,               // contact_count = 2
+        ];
+
+        // ── Wire up the MockBus ───────────────────────────────────
+        // Reads staged in order:
+        //  1. HID descriptor (for read_descriptor)
+        //  2. Report descriptor blob (for read_report_descriptor)
+        //  3. Input report (for read_input_report in the pump loop)
+        let bus = Arc::new(MockBus::new());
+
+        // HID descriptor: set wReportDescLength to actual blob length,
+        // wMaxInputLength large enough to hold input_report + 2-byte len prefix.
+        let mut hid_desc = make_descriptor_bytes();
+        let put16 = |buf: &mut [u8], off: usize, v: u16| {
+            buf[off..off+2].copy_from_slice(&v.to_le_bytes());
+        };
+        put16(&mut hid_desc, 4, report_desc_blob.len() as u16); // wReportDescLength
+        put16(&mut hid_desc, 10, input_report.len() as u16 + 2); // wMaxInputLength
+        // Call sequence in the test:
+        //   read_descriptor() → reads HID descriptor
+        //   reset()           → WRITE cmd, then polls input register (reads 2-byte len)
+        //   set_power(ON)     → WRITE only, no read
+        //   read_report_descriptor() → reads report descriptor bytes
+        //   read_input_report() → reads length-prefixed input report
+
+        // (1) HID descriptor — 30 bytes, no prefix.
+        bus.stage_read(hid_desc);
+
+        // (2) RESET sentinel — driver polls input register for len==0 or 2.
+        bus.stage_read(alloc::vec![0u8; 2]);
+
+        // (3) Report descriptor — driver reads exactly wReportDescLength bytes directly.
+        bus.stage_read(report_desc_blob.to_vec());
+
+        // (4) Input report — length-prefixed; first 2 bytes = total length.
+        let total_len = input_report.len() as u16 + 2;
+        let max_len = total_len as usize;
+        let mut framed = alloc::vec![0u8; max_len];
+        framed[0..2].copy_from_slice(&total_len.to_le_bytes());
+        framed[2..2 + input_report.len()].copy_from_slice(&input_report);
+        bus.stage_read(framed);
+
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x10, 0x0001);
+
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("HID descriptor read failed");
+            }
+            if drv.reset().await.is_err() {
+                return TestResult::Fail("RESET failed");
+            }
+            if drv.set_power(POWER_ON).await.is_err() {
+                return TestResult::Fail("SET_POWER(ON) failed");
+            }
+            let rd_blob = match drv.read_report_descriptor().await {
+                Ok(b) => b,
+                Err(_) => return TestResult::Fail("read_report_descriptor failed"),
+            };
+            let parsed = match narf_hid::parse(&rd_blob) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("narf_hid::parse failed"),
+            };
+            let ts_profile = match narf_hid::touchscreen::detect(&parsed) {
+                Some(p) => p,
+                None => return TestResult::Fail("touchscreen detect rejected descriptor"),
+            };
+            // Read the one staged input report.
+            let mut buf = alloc::vec![0u8; 64];
+            let n = match drv.read_input_report(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return TestResult::Fail("read_input_report failed"),
+            };
+            if n == 0 {
+                return TestResult::Fail("input report returned 0 bytes");
+            }
+            // Decode and pump.
+            let payload = &buf[..n];
+            let decoded = match narf_hid::touchscreen::decode_input(&ts_profile, payload) {
+                Ok(d) => d,
+                Err(_) => return TestResult::Fail("decode_input failed"),
+            };
+            let mut touch_state = crate::i2c_hid_touch::TouchPumpState::new();
+            let pushed = crate::i2c_hid_touch::pump_report(&ts_profile, &mut touch_state, &decoded);
+            if pushed < 1 {
+                return TestResult::Fail("pump_report pushed 0 events");
+            }
+            // Verify at least one TouchEvent landed with Down state.
+            match pop_touch() {
+                Some(t) if t.state == TouchState::Down => {}
+                Some(_) => return TestResult::Fail("expected Down on first contact"),
+                None => return TestResult::Fail("no TouchEvent in ring after pump"),
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_fake_i2c_hid_touchscreen_end_to_end
+    );
 }
 
