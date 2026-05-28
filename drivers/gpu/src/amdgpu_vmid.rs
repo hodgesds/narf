@@ -283,6 +283,36 @@ impl VmidPool {
         self.user_bound_count() >= (LAST_USER_VMID - FIRST_USER_VMID + 1) as usize
     }
 
+    /// Bind a PASID and program the silicon to back the VMID.
+    ///
+    /// Combines [`VmidPool::bind`] (logical pool allocation) with
+    /// `amdgpu_vmhub_regs::write_vmid_pt_base` (the MMIO writes
+    /// that make the GPU walk the new page table). On real
+    /// silicon callers go through this entry; `bind` alone
+    /// remains useful for tests + scheduling.
+    ///
+    /// `regs` is the per-(family, hub) layout from
+    /// `amdgpu_vmhub_regs::regs_for`. Aborts if the page-table
+    /// programming fails — the slot remains live in the pool
+    /// either way (`bind` doesn't roll back on MMIO error; the
+    /// next submission against the PASID will re-bind).
+    pub fn bind_and_program<M: crate::amdgpu_vmhub_regs::VmHubMmio>(
+        &mut self,
+        pasid: Pasid,
+        page_table_root_phys: u64,
+        mmio: &mut M,
+        regs: &crate::amdgpu_vmhub_regs::VmHubRegs,
+    ) -> Result<u8, VmidError> {
+        let vmid = self.bind(pasid, page_table_root_phys)?;
+        crate::amdgpu_vmhub_regs::write_vmid_pt_base(
+            mmio,
+            regs,
+            vmid,
+            page_table_root_phys,
+        );
+        Ok(vmid)
+    }
+
     /// Pin a specific user VMID for the kernel's own use (e.g.
     /// a privileged context). Reserves it from the LRU pool.
     /// Idempotent.
@@ -478,6 +508,30 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_vmhub_distinct_pools);
+
+    fn smoke_bind_and_program_writes_mmio() -> TestResult {
+        use crate::amdgpu_vmhub_regs::{test_support::MockVmHubMmio, GFXHUB_V3_0};
+        let mut p = VmidPool::new(VmHub::Gfx);
+        let mut mmio = MockVmHubMmio::new();
+        let vmid = p
+            .bind_and_program(42, 0xCAFE_0000, &mut mmio, &GFXHUB_V3_0)
+            .expect("bind+program");
+        if vmid == 0 {
+            return TestResult::Fail("got kernel VMID for user PASID");
+        }
+        // 2 writes: lo + hi PT base.
+        if mmio.writes.len() != 2 {
+            return TestResult::Fail("expected 2 MMIO writes from bind+program");
+        }
+        // The lo register write should match the per-VMID stride.
+        let want_lo = (GFXHUB_V3_0.ctx0_pt_base_lo + (vmid as u32) * GFXHUB_V3_0.ctx_addr_distance)
+            << 2;
+        if mmio.writes[0].0 != want_lo {
+            return TestResult::Fail("lo register offset wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_bind_and_program_writes_mmio);
 
     fn smoke_vmidstate_pasid_accessor() -> TestResult {
         let s = VmidState::Bound {
