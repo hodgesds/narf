@@ -60,6 +60,7 @@ pub mod regs;
 pub mod rx;
 pub mod transport;
 pub mod tx;
+pub mod wpa;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

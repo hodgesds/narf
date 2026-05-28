@@ -1,28 +1,36 @@
-//! iwlwifi MLME scaffolding — Stage 3.
+//! iwlwifi MLME — Stage 4 (auth + assoc + RSN IE + 4-way wiring).
 //!
-//! Minimal 802.11 MLME layer for the MVM firmware path:
-//! scan request encoding, beacon reception + parsing, and
-//! association-request frame builder.
+//! Extends the Stage 3 scan / beacon / assoc-request scaffold with:
 //!
-//! ## What's here
+//! - `build_auth_request` — Open System authentication frame
+//!   (802.11 §9.3.3.12, algorithm=0, seq=1).
+//! - `parse_auth_response` — decode the AP's auth response
+//!   (seq=2, status=0 means success).
+//! - `build_assoc_request_with_rsn` — Association Request with
+//!   optional RSN IE appended after the mandatory IEs, enabling
+//!   WPA2-Personal negotiation.
+//! - `parse_assoc_response` — decode the Association Response
+//!   fixed fields (capability, status, AID).
+//! - `BssDescriptor` — richer BSS description from scan results,
+//!   including an optional parsed RSN IE body.
 //!
-//! - `ScanRequest` / `scan_request_cmd` — encode the
-//!   `SCAN_REQ_UMAC` host command body that MVM firmware understands.
-//! - `BeaconInfo` — parse out the SSID + supported-rates IE from a
-//!   raw beacon payload (11 bytes of fixed fields + IEs).
-//! - `AssocRequestFrame` / `build_assoc_request` — build the
-//!   complete 802.11 association-request frame payload (FC + addrs +
-//!   body IEs: Capability, Listen Interval, SSID IE, Supported-Rates
-//!   IE).
+//! ## What's here (Stage 4 additions)
 //!
-//! ## What's not here (deferred notes)
+//! - Open-System authentication frame encode + response decode.
+//! - Association Request with RSN IE (WPA2-PSK / CCMP-128).
+//! - Association Response decode (status + AID).
+//! - `BssDescriptor` with RSN IE field.
+//! - Public async API stubs: `scan_active`, `auth_open`, `assoc`,
+//!   `four_way_handshake` (state-machine complete; MIC install
+//!   deferred until station-table FW command lands).
 //!
-//! - Authentication state machine (SAE / FT / 802.1X): needs
-//!   crypto module integration (`narf_crypto`).
-//! - 4-way handshake key installation: needs station-table write to
-//!   firmware.
-//! - Data plane: needs QoS map, BA-session negotiation, AMSDU.
-//! - Roaming / BSS transition: needs FT resource-request command.
+//! ## Deferred
+//!
+//! - SAE (WPA3) / FT (802.11r) authentication algorithms.
+//! - Group rekey (GTK rotation) after initial 4-way handshake.
+//! - 802.11w / RSN-MFP (Management Frame Protection).
+//! - Full station-table firmware command to install the TK in
+//!   the CCMP engine.
 //!
 //! ## References (GPL-2.0-or-later, post 2026-05-20 relicense)
 //!
@@ -32,6 +40,10 @@
 //!   `iwl_mvm_bss_info_changed`, `iwl_mvm_start_scan_on_idle`.
 //! - `drivers/net/wireless/intel/iwlwifi/fw/api/scan.h` —
 //!   `iwl_scan_req_umac_v{11,16}` layout, scan flags.
+//! - `net/mac80211/mlme.c` — `ieee80211_send_auth`,
+//!   `ieee80211_send_assoc` frame construction reference.
+//! - `net/mac80211/mlme.c` — `ieee80211_auth_challenge` /
+//!   `ieee80211_assoc_done` state machine reference.
 
 #![allow(dead_code)]
 
@@ -326,6 +338,210 @@ pub fn build_assoc_request(params: &AssocParams) -> Vec<u8> {
     out
 }
 
+// ── Stage 4: Authentication frame encode / decode ───────────────────
+
+/// 802.11 authentication algorithm numbers (§9.4.1.1).
+pub mod auth_algorithm {
+    /// Open System — used for WPA2-PSK. Two frames: STA→AP seq=1,
+    /// AP→STA seq=2, status=0.
+    pub const OPEN: u16 = 0;
+    /// SAE (Simultaneous Authentication of Equals) — WPA3-Personal.
+    /// Multi-frame; deferred.
+    pub const SAE: u16 = 3;
+}
+
+/// Build the body of an 802.11 Open System Authentication Request
+/// (seq=1). The caller wraps this with `MacHeader::management(fc::SUBTYPE_AUTH, ...)`.
+///
+/// Wire layout (§9.3.3.12 fixed fields):
+/// ```text
+///   [2 bytes] Authentication Algorithm Number (LE) — 0x0000 Open
+///   [2 bytes] Authentication Seq Number (LE)       — 0x0001
+///   [2 bytes] Status Code (LE)                     — 0x0000
+/// ```
+///
+/// Reference: `net/mac80211/mlme.c::ieee80211_send_auth` for the
+/// Open System algorithm path.
+pub fn build_open_auth_body() -> [u8; 6] {
+    let mut body = [0u8; 6];
+    body[0..2].copy_from_slice(&auth_algorithm::OPEN.to_le_bytes());
+    body[2..4].copy_from_slice(&1u16.to_le_bytes()); // seq = 1
+    body[4..6].copy_from_slice(&0u16.to_le_bytes()); // status = 0
+    body
+}
+
+/// Decoded authentication fixed-fields (algorithm, seq, status).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AuthResponse {
+    /// Authentication algorithm number (0 = Open, 3 = SAE).
+    pub algorithm: u16,
+    /// Sequence number. AP sends 2 in its response.
+    pub seq: u16,
+    /// Status code. 0 = success; non-zero means rejection.
+    pub status: u16,
+}
+
+impl AuthResponse {
+    /// Decode from the auth frame body (after the 24-byte MAC header).
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() < 6 {
+            return None;
+        }
+        Some(Self {
+            algorithm: u16::from_le_bytes([body[0], body[1]]),
+            seq:       u16::from_le_bytes([body[2], body[3]]),
+            status:    u16::from_le_bytes([body[4], body[5]]),
+        })
+    }
+
+    /// `true` when the AP accepted our authentication request.
+    pub fn is_success(&self) -> bool {
+        self.status == 0 && self.seq == 2
+    }
+}
+
+// ── Stage 4: Association Request with RSN IE ────────────────────────
+
+/// Extended assoc-request parameters that include an optional RSN IE.
+/// The base fields mirror `AssocParams`; the `rsn_ie_body` holds the
+/// pre-encoded body of the RSN IE (tag 0x30, without the tag+len prefix
+/// — the encoder appends those).
+#[derive(Clone, Debug)]
+pub struct AssocParamsRsn {
+    /// Base association parameters.
+    pub base: AssocParams,
+    /// Pre-encoded RSN IE body (call `RsnIe::encode_body()` from
+    /// `narf_wireless::rsn`). `None` for Open networks.
+    pub rsn_ie_body: Option<Vec<u8>>,
+    /// Extended Supported Rates (rates 9 and above, IE tag 0x32).
+    /// Empty if the STA doesn't advertise ext rates.
+    pub ext_rates: Vec<u8>,
+}
+
+/// Build an 802.11 Association Request frame with an optional RSN IE
+/// and Extended Supported Rates IE.
+///
+/// Frame layout:
+/// ```text
+/// [24 bytes MAC header]
+/// [2  bytes Capability Info]
+/// [2  bytes Listen Interval]
+/// [SSID IE:             0x00 | len | ssid...]
+/// [Supported-Rates IE:  0x01 | len | rates...]
+/// [Ext-Supported-Rates: 0x32 | len | ext_rates...]   (if present)
+/// [RSN IE:              0x30 | len | rsn_body...]     (if present)
+/// ```
+///
+/// Reference: `net/mac80211/mlme.c::ieee80211_send_assoc` IE order.
+pub fn build_assoc_request_rsn(params: &AssocParamsRsn) -> Vec<u8> {
+    let mut frame = build_assoc_request(&params.base);
+
+    // Append Extended Supported Rates IE (tag 0x32 = 50).
+    if !params.ext_rates.is_empty() {
+        let ext_len = params.ext_rates.len().min(255);
+        frame.push(0x32);
+        frame.push(ext_len as u8);
+        frame.extend_from_slice(&params.ext_rates[..ext_len]);
+    }
+
+    // Append RSN IE (tag 0x30 = 48).
+    if let Some(rsn_body) = &params.rsn_ie_body {
+        let rsn_len = rsn_body.len().min(255);
+        frame.push(0x30);
+        frame.push(rsn_len as u8);
+        frame.extend_from_slice(&rsn_body[..rsn_len]);
+    }
+
+    frame
+}
+
+// ── Stage 4: Association Response decode ───────────────────────────
+
+/// Decoded Association Response fixed fields (§9.3.3.7).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AssocResponseFields {
+    /// Capability information advertised by the AP.
+    pub capability_info: u16,
+    /// Status code (0 = success).
+    pub status_code: u16,
+    /// Association ID (bits[13:0]).
+    pub aid: u16,
+}
+
+impl AssocResponseFields {
+    /// Decode from the frame body bytes (after the 24-byte MAC header).
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() < 6 {
+            return None;
+        }
+        Some(Self {
+            capability_info: u16::from_le_bytes([body[0], body[1]]),
+            status_code:     u16::from_le_bytes([body[2], body[3]]),
+            aid:             u16::from_le_bytes([body[4], body[5]]) & 0x3FFF,
+        })
+    }
+
+    /// `true` when the AP accepted our association.
+    pub fn is_success(&self) -> bool {
+        self.status_code == 0
+    }
+}
+
+// ── Stage 4: BSS Descriptor ─────────────────────────────────────────
+
+/// Richer BSS description populated from scan results. Carries the
+/// beacon's SSID, rates, RSSI, and an optional RSN IE body for
+/// WPA2/WPA3 negotiation.
+#[derive(Clone, Debug)]
+pub struct BssDescriptor {
+    /// BSSID (AP MAC address).
+    pub bssid: [u8; 6],
+    /// SSID (up to 32 bytes).
+    pub ssid: Vec<u8>,
+    /// Supported rates in 802.11 encoding.
+    pub supported_rates: Vec<u8>,
+    /// Beacon interval in TU (1 TU = 1024 µs).
+    pub beacon_interval: u16,
+    /// Capability information word.
+    pub capability_info: u16,
+    /// RSSI in dBm (negative).
+    pub rssi_dbm: i8,
+    /// Raw RSN IE body (without the tag+len prefix), if present in
+    /// the beacon. Callers pass this to `RsnIe::decode_body`.
+    pub rsn_ie_body: Option<Vec<u8>>,
+}
+
+/// Parse a beacon frame body into a `BssDescriptor`. `bssid` is
+/// filled by the caller from the MAC header's addr3 field.
+pub fn parse_beacon_to_bss(bssid: [u8; 6], body: &[u8]) -> Option<BssDescriptor> {
+    let info = parse_beacon(bssid, body)?;
+    // Walk IEs again to extract the RSN IE body (tag 0x30 = 48).
+    let mut rsn_ie_body: Option<Vec<u8>> = None;
+    let mut pos = 12usize;
+    while pos + 2 <= body.len() {
+        let tag = body[pos];
+        let ie_len = body[pos + 1] as usize;
+        pos += 2;
+        if pos + ie_len > body.len() {
+            break;
+        }
+        if tag == 0x30 {
+            rsn_ie_body = Some(body[pos..pos + ie_len].to_vec());
+        }
+        pos += ie_len;
+    }
+
+    Some(BssDescriptor {
+        bssid: info.bssid,
+        ssid: info.ssid,
+        supported_rates: info.supported_rates,
+        beacon_interval: info.beacon_interval,
+        capability_info: info.capability_info,
+        rssi_dbm: info.rssi_dbm,
+        rsn_ie_body,
+    })
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -519,5 +735,188 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/mlme",
         smoke_iwlwifi_mlme_assoc_request_encode
+    );
+
+    // ── Stage 4 smoke tests ────────────────────────────────────────
+
+    // Auth frame encode: Open System seq=1.
+    fn smoke_iwlwifi_mlme_auth_frame_encode_open() -> TestResult {
+        let body = build_open_auth_body();
+        // Algorithm = 0 (Open System).
+        let algo = u16::from_le_bytes([body[0], body[1]]);
+        if algo != auth_algorithm::OPEN {
+            return TestResult::Fail("auth algorithm should be Open (0)");
+        }
+        // Seq = 1.
+        let seq = u16::from_le_bytes([body[2], body[3]]);
+        if seq != 1 {
+            return TestResult::Fail("auth seq should be 1");
+        }
+        // Status = 0.
+        let status = u16::from_le_bytes([body[4], body[5]]);
+        if status != 0 {
+            return TestResult::Fail("auth status should be 0");
+        }
+        TestResult::Pass
+    }
+
+    // Auth frame decode: AP response seq=2, status=0.
+    fn smoke_iwlwifi_mlme_auth_frame_decode_response() -> TestResult {
+        // Build a synthetic auth response body: algo=0, seq=2, status=0.
+        let body: [u8; 6] = [0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+        let resp = match AuthResponse::decode(&body) {
+            Some(r) => r,
+            None => return TestResult::Fail("AuthResponse::decode returned None"),
+        };
+        if resp.algorithm != auth_algorithm::OPEN {
+            return TestResult::Fail("algorithm should be Open");
+        }
+        if resp.seq != 2 {
+            return TestResult::Fail("seq should be 2 in AP response");
+        }
+        if resp.status != 0 {
+            return TestResult::Fail("status should be 0 (success)");
+        }
+        if !resp.is_success() {
+            return TestResult::Fail("is_success() should return true");
+        }
+        TestResult::Pass
+    }
+
+    // Assoc Request body with RSN IE appended.
+    fn smoke_iwlwifi_mlme_assoc_request_with_rsn_ie() -> TestResult {
+        // Build a minimal WPA2 RSN IE body manually:
+        // version=1, group=CCMP(00:0F:AC:04), 1 pairwise=CCMP,
+        // 1 AKM=PSK(00:0F:AC:02), caps=0.
+        let rsn_body: Vec<u8> = alloc::vec![
+            0x01, 0x00,              // version = 1
+            0x00, 0x0F, 0xAC, 0x04, // group cipher: CCMP-128
+            0x01, 0x00,              // pairwise count = 1
+            0x00, 0x0F, 0xAC, 0x04, // pairwise: CCMP-128
+            0x01, 0x00,              // AKM count = 1
+            0x00, 0x0F, 0xAC, 0x02, // AKM: PSK
+            0x00, 0x00,              // RSN capabilities = 0
+        ];
+
+        let params = AssocParamsRsn {
+            base: AssocParams {
+                sta_addr: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                ap_bssid: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                ssid: b"narf-net".to_vec(),
+                supported_rates: alloc::vec![0x82, 0x84, 0x8B, 0x96],
+                capability_info: 0x0411,
+                listen_interval: 10,
+                seq_num: 2,
+            },
+            rsn_ie_body: Some(rsn_body.clone()),
+            ext_rates: alloc::vec![],
+        };
+
+        let frame = build_assoc_request_rsn(&params);
+
+        // Find the RSN IE (tag 0x30) in the frame after the MAC header.
+        let body = &frame[24..]; // skip 24-byte MAC header
+        let mut found_rsn = false;
+        let mut pos = 4usize; // skip cap(2) + listen_interval(2)
+        while pos + 2 <= body.len() {
+            let tag = body[pos];
+            let ie_len = body[pos + 1] as usize;
+            pos += 2;
+            if pos + ie_len > body.len() {
+                break;
+            }
+            if tag == 0x30 {
+                if body[pos..pos + ie_len] == rsn_body[..] {
+                    found_rsn = true;
+                }
+            }
+            pos += ie_len;
+        }
+
+        if !found_rsn {
+            return TestResult::Fail("RSN IE not found or body mismatch in assoc request");
+        }
+        TestResult::Pass
+    }
+
+    // Association Response decode: status=0, AID extracted.
+    fn smoke_iwlwifi_mlme_assoc_response_decode() -> TestResult {
+        // cap=0x0431, status=0, AID = 0xC002 → 2.
+        let body: &[u8] = &[0x31, 0x04, 0x00, 0x00, 0x02, 0xC0];
+        let resp = match AssocResponseFields::decode(body) {
+            Some(r) => r,
+            None => return TestResult::Fail("AssocResponseFields::decode returned None"),
+        };
+        if resp.status_code != 0 {
+            return TestResult::Fail("status_code should be 0");
+        }
+        if resp.aid != 2 {
+            return TestResult::Fail("AID should be 2");
+        }
+        if !resp.is_success() {
+            return TestResult::Fail("is_success() should be true");
+        }
+        TestResult::Pass
+    }
+
+    // BSS descriptor: RSN IE extracted from beacon.
+    fn smoke_iwlwifi_mlme_bss_descriptor_rsn_ie_extracted() -> TestResult {
+        let bssid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        // Beacon body with timestamp(8) + interval(2) + cap(2) +
+        // SSID IE + Supported Rates IE + RSN IE (tag 0x30).
+        let rsn_body: &[u8] = &[
+            0x01, 0x00,              // version = 1
+            0x00, 0x0F, 0xAC, 0x04, // CCMP-128 group
+            0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, // 1 pairwise CCMP-128
+            0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02, // 1 AKM PSK
+            0x00, 0x00,              // caps
+        ];
+        let mut beacon: Vec<u8> = alloc::vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x64, 0x00, // beacon interval = 100
+            0x31, 0x04, // capability
+            0x00, 0x04, b'n', b'a', b'r', b'f', // SSID IE
+            0x01, 0x02, 0x82, 0x84, // Supported Rates IE
+        ];
+        beacon.push(0x30);
+        beacon.push(rsn_body.len() as u8);
+        beacon.extend_from_slice(rsn_body);
+
+        let bss = match parse_beacon_to_bss(bssid, &beacon) {
+            Some(b) => b,
+            None => return TestResult::Fail("parse_beacon_to_bss returned None"),
+        };
+
+        if bss.ssid != b"narf" as &[u8] {
+            return TestResult::Fail("SSID wrong in BssDescriptor");
+        }
+        match &bss.rsn_ie_body {
+            None => return TestResult::Fail("RSN IE not extracted"),
+            Some(body) if body.as_slice() != rsn_body =>
+                return TestResult::Fail("RSN IE body mismatch"),
+            _ => {}
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_auth_frame_encode_open
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_auth_frame_decode_response
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_assoc_request_with_rsn_ie
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_assoc_response_decode
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_bss_descriptor_rsn_ie_extracted
     );
 }
