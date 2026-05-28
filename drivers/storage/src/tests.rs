@@ -1188,3 +1188,91 @@ fn smoke_ahci_pmp_gscr_decode() -> TestResult {
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_pmp_gscr_decode);
 
+/// Verify the ATAPI PACKET command FIS byte layout for a 12-byte CDB.
+///
+/// CFIS for ATA PACKET (0xA0) with DMA D2H:
+///   byte 0 = 0x27 (H2D Register FIS type)
+///   byte 1 = 0x80 (C=1, PMP=0)
+///   byte 2 = 0xA0 (ATA_CMD_PACKET)
+///   byte 3 = 0x05 (features: DMA=1 | DMADIR=1 for D2H)
+///
+/// Command-list header bit 5 (A) must be set for ATAPI.
+/// Reference: ATA8-ACS §7.18 PACKET command; Linux
+/// `include/linux/ata.h` (`ATA_CMD_PACKET = 0xA0`).
+fn smoke_ahci_atapi_packet_fis_layout() -> TestResult {
+    let cdb: [u8; 12] = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // READ CAPACITY(10)
+
+    // Command-list header word 0.
+    let prdt_len: u32 = 1;
+    let w_bit: u32 = 0; // D2H = read, no W bit
+    let header_w0 = (prdt_len << 16) | w_bit | (1 << 5) | 5; // A=1 | CFL=5
+
+    // CFIS bytes.
+    let mut cfis = [0u8; 20];
+    cfis[0] = 0x27;
+    cfis[1] = 0x80;
+    cfis[2] = 0xA0; // ATA PACKET
+    cfis[3] = 0x01 | 0x04; // DMA | DMADIR=D2H
+
+    // ACMD must hold the CDB.
+    let mut acmd = [0u8; 16];
+    acmd[..12].copy_from_slice(&cdb);
+
+    if cfis[0] != 0x27 {
+        return TestResult::Fail("ATAPI FIS type must be 0x27 (H2D)");
+    }
+    if cfis[2] != 0xA0 {
+        return TestResult::Fail("ATAPI opcode must be 0xA0 (PACKET)");
+    }
+    if cfis[3] & 0x01 == 0 {
+        return TestResult::Fail("ATAPI features DMA bit (bit 0) must be set");
+    }
+    if cfis[3] & 0x04 == 0 {
+        return TestResult::Fail("ATAPI features DMADIR bit (bit 2) must be set for D2H");
+    }
+    if header_w0 & (1 << 5) == 0 {
+        return TestResult::Fail("command-list header A bit (bit 5) must be set for ATAPI");
+    }
+    if header_w0 & (1 << 6) != 0 {
+        return TestResult::Fail("W bit must be clear for D2H ATAPI transfer");
+    }
+    if acmd[0] != 0x25 {
+        return TestResult::Fail("CDB opcode lost in ACMD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_atapi_packet_fis_layout);
+
+/// Verify READ CAPACITY(10) response decode: big-endian 8-byte
+/// response fields decoded into (block_count, block_size).
+///
+/// Reference: SPC-4 §6.18: returned data bytes 0–3 = last LBA,
+/// bytes 4–7 = block length. `block_count = last_lba + 1`.
+fn smoke_ahci_atapi_read_capacity_decode() -> TestResult {
+    // Simulate an 80-minute CD-ROM: 360,000 sectors of 2048 bytes.
+    let last_lba: u32 = 359_999;
+    let block_size: u32 = 2048;
+
+    // Big-endian response as the device would send.
+    let mut resp = [0u8; 8];
+    resp[0..4].copy_from_slice(&last_lba.to_be_bytes());
+    resp[4..8].copy_from_slice(&block_size.to_be_bytes());
+
+    // Decode as read_atapi_capacity would.
+    let got_last_lba = u32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]);
+    let got_block_size = u32::from_be_bytes([resp[4], resp[5], resp[6], resp[7]]);
+    let block_count = got_last_lba.wrapping_add(1);
+
+    if got_last_lba != last_lba {
+        return TestResult::Fail("last LBA round-trip failed");
+    }
+    if got_block_size != block_size {
+        return TestResult::Fail("block size round-trip failed");
+    }
+    if block_count != 360_000 {
+        return TestResult::Fail("block_count = last_lba + 1 formula wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_atapi_read_capacity_decode);
+

@@ -1720,6 +1720,293 @@ pub fn identify_features(id: &[u8; 512]) -> (u16, u16) {
     (w82, w83)
 }
 
+// ── ATAPI ─────────────────────────────────────────────────────────────
+
+/// Direction of a DMA transfer associated with an ATAPI PACKET command.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AtapiDmaDir {
+    /// No data phase (e.g. TEST UNIT READY).
+    None,
+    /// Device-to-host (e.g. READ(10), READ CAPACITY).
+    DeviceToHost,
+    /// Host-to-device (e.g. WRITE(10)).
+    HostToDevice,
+}
+
+/// Send an arbitrary SCSI CDB (12 or 16 bytes) to an ATAPI device
+/// using the ATA PACKET command (opcode 0xA0). ATAPI devices wrap
+/// SCSI CDBs inside an ATA PACKET FIS: the host sends the 12/16-byte
+/// CDB via the ACMD field of the command table, and the controller
+/// handles the DMA data phase.
+///
+/// Wire format (AHCI 1.3.1 §7.5 / ATA8-ACS §7.18 PACKET command):
+///
+///   CFIS (H2D Register FIS):
+///     +0  type   = 0x27 (Register H2D)
+///     +1  C=1    | PMP port (usually 0)
+///     +2  opcode = 0xA0 (ATA PACKET)
+///     +3  features: bit 0 = DMA (1) or PIO (0),
+///                   bit 2 = DMADIR (1 = D2H / 0 = H2D)
+///
+///   ACMD (command-table +0x40, 16 bytes): the SCSI CDB.
+///
+/// Reference: Linux `drivers/ata/libata-scsi.c` ATAPI command tables
+/// and `include/linux/libata.h` for the ATAPI protocol constants.
+///
+/// # Safety
+/// Caller owns the HBA + the named port exclusively; `port_idx < 32`
+/// and the port's `PortKind` was `Atapi` at probe. `buf_phys` must be
+/// a valid DMA-accessible physical address with at least `buf_bytes`
+/// bytes mapped; pass 0 / 0 for NODATA commands.
+pub unsafe fn atapi_send_cdb(
+    ahci: &Ahci,
+    port_idx: u8,
+    cdb: &[u8],
+    dir: AtapiDmaDir,
+    buf_phys: u64,
+    buf_bytes: u32,
+) -> Result<(), AhciError> {
+    if cdb.len() != 12 && cdb.len() != 16 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl = base + 0x500;
+
+    // Zero command-list + FIS receive area + command table.
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..(0x500 + 0x90) {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+    }
+
+    // Command-list header 0.
+    // Bit 5 (A) = ATAPI (marks the ACMD field in the command table).
+    // W bit (bit 6) = 1 for H2D writes, 0 for D2H reads.
+    // PRDT length = 1 if data transfer, 0 if NODATA.
+    // Reference: AHCI 1.3.1 §4.2.3.1, Table 4.
+    let prdt_len = if dir == AtapiDmaDir::None { 0u32 } else { 1u32 };
+    let w_bit: u32 = if dir == AtapiDmaDir::HostToDevice { 1 << 6 } else { 0 };
+    let header_w0: u32 = (prdt_len << 16) | w_bit | (1 << 5) | 5; // A=1, CFL=5
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_list as *mut u32, header_w0);
+        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+    }
+
+    // CFIS (H2D Register FIS, 20 bytes at cmd_tbl+0x00).
+    //   features byte: bit 0 = DMA, bit 2 = DMADIR (1=D2H, 0=H2D).
+    // Reference: ATA8-ACS Table 101 (PACKET command FIS).
+    let feat = match dir {
+        AtapiDmaDir::None           => 0x00u8,
+        AtapiDmaDir::DeviceToHost   => 0x01 | 0x04, // DMA | DMADIR=D2H
+        AtapiDmaDir::HostToDevice   => 0x01,         // DMA only
+    };
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80); // C=1, PMP=0
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0xA0); // ATA PACKET
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, feat);
+    }
+
+    // ACMD (command-table +0x40, 16 bytes): copy the SCSI CDB.
+    // SAFETY: same DMA page.
+    unsafe {
+        for (i, &b) in cdb.iter().enumerate() {
+            core::ptr::write_volatile((cmd_tbl + 0x40 + i as u64) as *mut u8, b);
+        }
+    }
+
+    // PRDT entry 0 at cmd_tbl+0x80 (only if data transfer).
+    if dir != AtapiDmaDir::None && buf_bytes > 0 {
+        let prdt = cmd_tbl + 0x80;
+        // SAFETY: same DMA page.
+        unsafe {
+            core::ptr::write_volatile(prdt as *mut u64, buf_phys);
+            core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+            core::ptr::write_volatile((prdt + 12) as *mut u32, buf_bytes - 1);
+        }
+    }
+
+    // Program port CLB / FB and start.
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        ahci.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + PORT_CI, 1);
+    }
+
+    // Poll for completion (30 s — optical drives can be slow).
+    let mut errored = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            let ci  = unsafe { ahci.mmio.read32(off + PORT_CI) };
+            let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                errored = true;
+                return true;
+            }
+            ci & 1 == 0
+        },
+        narf_time::Deadline::after_ms(30_000),
+    );
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    if errored || !done {
+        return Err(AhciError::ResetTimeout);
+    }
+    Ok(())
+}
+
+/// Issue SCSI READ CAPACITY(10) (CDB opcode 0x25) to an ATAPI device
+/// and decode the response: returns `(block_count, block_size)`.
+///
+/// READ CAPACITY(10) response (8 bytes, big-endian):
+///   +0..3  last logical block address (LBA of last sector)
+///   +4..7  block length in bytes
+///
+/// Reference: SPC-4 §6.18 / Linux `drivers/ata/libata-scsi.c::
+/// ata_scsiop_read_cap`.
+///
+/// # Safety
+/// Same as `atapi_send_cdb`. `port_idx` must be an ATAPI port.
+pub unsafe fn read_atapi_capacity(
+    ahci: &Ahci,
+    port_idx: u8,
+) -> Result<(u32, u32), AhciError> {
+    // Allocate the 8-byte response in the persistent scratch at
+    // data_buf (offset 0x600, safe since scratch is 4 KiB).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let data_buf = base + 0x600;
+
+    // Zero the response area.
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..8u64 {
+            core::ptr::write_volatile((data_buf + i) as *mut u8, 0);
+        }
+    }
+
+    // SCSI READ CAPACITY(10) CDB (12-byte padded form for ATAPI).
+    // Opcode 0x25, all other bytes zero (LBA=0, PMI=0).
+    let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    // SAFETY: caller-asserted ATAPI port.
+    unsafe {
+        atapi_send_cdb(
+            ahci,
+            port_idx,
+            &cdb,
+            AtapiDmaDir::DeviceToHost,
+            data_buf,
+            8,
+        )
+    }?;
+
+    // Decode the 8-byte big-endian response.
+    // SAFETY: identity-mapped DMA.
+    let (last_lba, block_size) = unsafe {
+        let last_lba = u32::from_be_bytes([
+            core::ptr::read_volatile((data_buf + 0) as *const u8),
+            core::ptr::read_volatile((data_buf + 1) as *const u8),
+            core::ptr::read_volatile((data_buf + 2) as *const u8),
+            core::ptr::read_volatile((data_buf + 3) as *const u8),
+        ]);
+        let block_size = u32::from_be_bytes([
+            core::ptr::read_volatile((data_buf + 4) as *const u8),
+            core::ptr::read_volatile((data_buf + 5) as *const u8),
+            core::ptr::read_volatile((data_buf + 6) as *const u8),
+            core::ptr::read_volatile((data_buf + 7) as *const u8),
+        ]);
+        (last_lba, block_size)
+    };
+
+    // block_count = last_lba + 1 (READ CAPACITY returns the LBA of the
+    // *last* addressable block, not the total count).
+    Ok((last_lba.wrapping_add(1), block_size))
+}
+
+/// Issue SCSI READ(10) (CDB opcode 0x28) to an ATAPI optical drive,
+/// reading `count` blocks starting at `lba`.
+///
+/// `buf_phys` must be a valid DMA-accessible physical address with at
+/// least `count * block_size` bytes.
+///
+/// CDB layout (SBC-3 §5.8 READ(10)):
+///   +0   opcode = 0x28
+///   +1   RD_PROTECT | FUA | DPO | RARC (all zero for plain read)
+///   +2..5 LBA (big-endian u32)
+///   +6   group number (0)
+///   +7..8 transfer length (big-endian u16)
+///   +9   control (0)
+///
+/// # Safety
+/// Same as `atapi_send_cdb`.
+pub unsafe fn read_atapi_lba(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u32,
+    count: u16,
+    buf_phys: u64,
+    buf_bytes: u32,
+) -> Result<(), AhciError> {
+    // SCSI READ(10) packed into 12 bytes (ATAPI CDB length).
+    let cdb = [
+        0x28u8,                         // READ(10) opcode
+        0x00,                           // flags
+        ((lba >> 24) & 0xFF) as u8,     // LBA[31:24]
+        ((lba >> 16) & 0xFF) as u8,     // LBA[23:16]
+        ((lba >>  8) & 0xFF) as u8,     // LBA[15:8]
+        (lba         & 0xFF) as u8,     // LBA[7:0]
+        0x00,                           // group number
+        ((count >> 8) & 0xFF) as u8,    // transfer length high
+        (count        & 0xFF) as u8,    // transfer length low
+        0x00,                           // control
+        0x00,                           // padding
+        0x00,                           // padding
+    ];
+
+    // SAFETY: caller-asserted ATAPI port.
+    unsafe {
+        atapi_send_cdb(
+            ahci,
+            port_idx,
+            &cdb,
+            AtapiDmaDir::DeviceToHost,
+            buf_phys,
+            buf_bytes,
+        )
+    }
+}
+
+
 
 /// Sync block-device adapter for the registry. Routes reads /
 /// writes through `ahci_read_lba` / `ahci_write_lba` against the
