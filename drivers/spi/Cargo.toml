@@ -1,0 +1,30 @@
+[package]
+name         = "narf-drivers-spi"
+description  = "SPI bus trait + AMD FCH (V1/V2/HID2) and Intel LPSS controller drivers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_spi"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-memory       = { path = "../../memory" }
+narf-arch         = { path = "../../arch" }
+narf-aml          = { path = "../../aml" }
+narf-acpi         = { path = "../../acpi" }
+narf-init         = { path = "../../init" }
+narf-console      = { path = "../../console" }
+narf-interrupts   = { path = "../../interrupts" }
+narf-scheduler    = { path = "../../scheduler" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
