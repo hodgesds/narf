@@ -585,6 +585,7 @@ dependencies = [
 name = "narf-bluetooth"
 version = "0.0.0"
 dependencies = [
+ "narf-audio",
  "narf-capabilities",
  "narf-init",
  "narf-kernel-test",
@@ -1112,6 +1113,7 @@ dependencies = [
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1787,6 +1789,7 @@ dependencies = [
  "bitflags",
  "futures",
  "narf-capabilities",
+ "narf-crypto",
  "narf-drivers",
  "narf-io",
  "narf-ipc",
