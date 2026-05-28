@@ -37,6 +37,7 @@ pub mod tpm;
 // spec.md` §9.2.1 for the licensing posture and reference table.
 pub mod aead;
 pub mod chacha20;
+pub mod cmac_aes128;
 pub mod curve25519;
 pub mod ed25519;
 pub mod hkdf;
