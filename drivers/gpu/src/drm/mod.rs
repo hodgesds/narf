@@ -22,15 +22,27 @@
 //!
 //! ## Deferred
 //!
-//! - DRM render nodes (`/dev/dri/renderD*`).
-//! - GPU command-buffer scheduler + syncobj.
-//! - Atomic KMS (DRM_MODE_ATOMIC_COMMIT).
-//! - PRIME fd handoff (DRM ↔ dma-buf fd bridge).
+//! - DRM leases (sub-master delegation).
+//! - syncobj timelines beyond binary signal/wait.
+//! - AMD/NV-specific scheduler hardware integration (these slot in
+//!   under the [`scheduler::Sched`] front-end as JobPayload backends).
 
 pub mod card;
 pub mod gem;
 pub mod ioctl;
+pub mod render_node;
+pub mod atomic;
+pub mod syncobj;
+pub mod scheduler;
+pub mod prime;
 
 pub use card::{Card, CardError, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder};
 pub use gem::{GemError, GemHandle, GemObject};
 pub use ioctl::{dispatch, DrmIoctlError, IoctlCmd};
+pub use render_node::{
+    check_permission, DrmFileCtx, DrmMinor, IoctlFlags, MinorType, PermError,
+};
+pub use atomic::{AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
+pub use syncobj::{BinaryFence, DmaFence, SyncError, SyncObj, SyncObjTable};
+pub use scheduler::{Job, JobFence, JobPayload, Sched, SchedContext, SchedError};
+pub use prime::{PrimeError, PrimeTable};

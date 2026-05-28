@@ -26,6 +26,7 @@
 //! - `include/uapi/drm/drm_mode.h` — all mode-setting wire structs.
 
 use super::card::{Card, CardError, ConnectorType};
+use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 
 // ── Ioctl command codes ────────────────────────────────────────────────
 
@@ -73,11 +74,22 @@ pub enum DrmIoctlError {
     Card(CardError),
     /// Connector id not found.
     UnknownConnector,
+    /// Permission denied per render-node / DRM_AUTH / DRM_MASTER gate.
+    ///
+    /// Linux: `-EACCES` returned from `drm_ioctl_permit`
+    /// (`drivers/gpu/drm/drm_ioctl.c`).
+    PermissionDenied(PermError),
 }
 
 impl From<CardError> for DrmIoctlError {
     fn from(e: CardError) -> Self {
         DrmIoctlError::Card(e)
+    }
+}
+
+impl From<PermError> for DrmIoctlError {
+    fn from(e: PermError) -> Self {
+        DrmIoctlError::PermissionDenied(e)
     }
 }
 
@@ -241,20 +253,29 @@ pub enum DrmIoctlResult {
     GetPlaneRes { count_planes: u32 },
 }
 
-/// Dispatch a DRM ioctl against `card`.
+/// Dispatch a DRM ioctl against `card` for the calling `ctx`.
 ///
 /// `cmd` is the ioctl number (lower 8 bits used).
 /// `arg` is the ioctl argument — an opaque byte buffer whose layout
 /// is determined by `cmd`.
+/// `ctx` carries the per-fd identity (render-node vs primary,
+/// auth/master/root status); permission is checked before dispatch.
 ///
 /// Returns a typed result or an error.
 ///
-/// Linux equivalent: `drm_ioctl()` in `drivers/gpu/drm/drm_ioctl.c`.
+/// Linux equivalent: `drm_ioctl()` in `drivers/gpu/drm/drm_ioctl.c`
+/// (which calls `drm_ioctl_permit` first, then the per-ioctl func).
 pub fn dispatch(
     card: &mut Card,
     cmd: u32,
     arg: &[u8],
+    ctx: &DrmFileCtx,
 ) -> Result<DrmIoctlResult, DrmIoctlError> {
+    // Permission gate — mirrors drm_ioctl.c::drm_ioctl_permit.
+    // Unknown commands skip the gate and fall through to UnknownCmd.
+    if let Some(flags) = ioctl_flags(cmd) {
+        check_permission(flags, ctx)?;
+    }
     match IoctlCmd::from_raw(cmd) {
         IoctlCmd::Version => handle_version(card),
         IoctlCmd::GetCap  => handle_get_cap(arg),

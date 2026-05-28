@@ -43,6 +43,14 @@ pub mod backlight;
 pub mod amd_aoac;
 /// AMD ASF (Alert Standard Format) transport scaffold.
 pub mod amd_asf;
+/// Vendor WMI hotkey dispatch — Dell, HP, and Lenovo laptop Fn-key
+/// events delivered through ACPI WMI event GUIDs.
+/// Must init after `narf-aml` WMI GUID enumeration (Stage::Subsys,
+/// ordered after the ACPI namespace walk). Runs on any arch where
+/// WMI-capable firmware is present; currently only x86_64 laptops
+/// expose PNP0C14 WMI devices so gate it accordingly.
+#[cfg(target_arch = "x86_64")]
+pub mod wmi_vendors;
 
 mod tests;
 
@@ -112,6 +120,14 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "amd-aoac", || {
         // Best-effort: silently skip on non-AMD or unrecognised silicon.
         let _ = amd_aoac::init();
+        InitResult::Ok
+    });
+    // WMI vendor dispatch must run after the AML namespace walk +
+    // WMI GUID enumeration. Best-effort: on non-laptop or non-WMI
+    // systems `init()` returns UnknownVendor and we skip silently.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "wmi-vendors", || {
+        let _ = wmi_vendors::init();
         InitResult::Ok
     });
 }

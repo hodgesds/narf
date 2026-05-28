@@ -565,3 +565,236 @@ kernel_test_in!(
     "drivers/platform/amd_asf",
     smoke_asf_message_header_encode
 );
+
+// ── WMI vendors ────────────────────────────────────────────────────
+
+/// Dell event-payload decoder — Fn-key id table.
+/// Verifies the core decode_dell_event() paths used at runtime.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wmi_vendors_dell_event_decoder() -> TestResult {
+    use crate::wmi_vendors::{decode_dell_event, DellEvent};
+
+    // Mute (audio) key: type=0x0000, code=0x0109.
+    // Reference: dell-wmi-base.c `KE_KEY, 0x0109, { KEY_MUTE }`.
+    // Layout: word[0]=len, word[1]=event_type, word[2]=code.
+    let buf_mute: [u8; 6] = [
+        2, 0,       // word[0] = len=2 (2 extra words after this)
+        0x00, 0x00, // word[1] = event_type 0x0000
+        0x09, 0x01, // word[2] = code 0x0109
+    ];
+    match decode_dell_event(&buf_mute) {
+        Some(DellEvent::FnFunctionKey { id: 0x0109 }) => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("dell audio-mute code 0x0109 not decoded as FnFunctionKey");
+        }
+    }
+
+    // Mic-mute: code 0x0150 — always decoded as MicMute regardless of type.
+    // Reference: dell-wmi-base.c `KE_KEY, 0x0150, { KEY_MICMUTE }`.
+    let buf_micmute: [u8; 6] = [
+        2, 0,
+        0x10, 0x00, // event_type 0x0010
+        0x50, 0x01, // code 0x0150
+    ];
+    match decode_dell_event(&buf_micmute) {
+        Some(DellEvent::MicMute) => {}
+        _ => return TestResult::Fail("dell mic-mute code 0x0150 not decoded as MicMute"),
+    }
+
+    // Brightness down: type=0x0010, code=0x0057.
+    // Reference: dell-wmi-base.c `KE_KEY, 0x57, { KEY_BRIGHTNESSDOWN }`.
+    let buf_bright: [u8; 6] = [
+        2, 0,
+        0x10, 0x00, // event_type 0x0010
+        0x57, 0x00, // code 0x0057
+    ];
+    match decode_dell_event(&buf_bright) {
+        Some(DellEvent::FnFunctionKey { id: 0x0057 }) => {}
+        _ => return TestResult::Fail("dell brightness-down code 0x0057 not decoded"),
+    }
+
+    // Tablet-mode: type=0x0011, code=0xe070.
+    // Reference: dell-wmi-base.c line 447 — SW_TABLET_MODE, !buffer[0].
+    let buf_tablet: [u8; 8] = [
+        3, 0,       // len=3
+        0x11, 0x00, // event_type 0x0011
+        0x70, 0xe0, // code 0xe070
+        0x00, 0x00, // word[3] = 0 → entering tablet mode (on=true)
+    ];
+    match decode_dell_event(&buf_tablet) {
+        Some(DellEvent::TabletMode { on: true }) => {}
+        _ => return TestResult::Fail("dell tablet-mode entry not decoded"),
+    }
+
+    // Truncated payload should return None.
+    match decode_dell_event(&[0x02, 0x00]) {
+        None => {}
+        _ => return TestResult::Fail("truncated dell payload should return None"),
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/wmi_vendors",
+    smoke_wmi_vendors_dell_event_decoder
+);
+
+/// HP event-payload decoder — event id and data parsing.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wmi_vendors_hp_event_decoder() -> TestResult {
+    use crate::wmi_vendors::{decode_hp_event, HpEvent};
+
+    // HPWMI_WIRELESS (0x05): 8-byte payload.
+    // Reference: hp-wmi.c `case HPWMI_WIRELESS`.
+    let buf_wireless: [u8; 8] = [
+        0x05, 0x00, 0x00, 0x00, // event_id = 5
+        0x00, 0x00, 0x00, 0x00, // event_data = 0
+    ];
+    match decode_hp_event(&buf_wireless) {
+        Some(HpEvent::WlanToggle) => {}
+        _ => return TestResult::Fail("HP wireless event not decoded as WlanToggle"),
+    }
+
+    // HPWMI_BEZEL_BUTTON (0x04) with key_code 0x270 (mic mute).
+    // Reference: hp-wmi.c keymap `{ KE_KEY, 0x270, { KEY_MICMUTE } }`.
+    let buf_bezel: [u8; 8] = [
+        0x04, 0x00, 0x00, 0x00, // event_id = 4 (BEZEL_BUTTON)
+        0x70, 0x02, 0x00, 0x00, // event_data = 0x270
+    ];
+    match decode_hp_event(&buf_bezel) {
+        Some(HpEvent::BezelButton { key_code: 0x270 }) => {}
+        _ => return TestResult::Fail("HP bezel button key_code 0x270 not decoded"),
+    }
+
+    // 16-byte payload: event_data is at offset 8, not offset 4.
+    // Reference: hp-wmi.c lines 1102–1105.
+    let mut buf16 = [0u8; 16];
+    buf16[0] = 0x04; // event_id = HPWMI_BEZEL_BUTTON
+    buf16[8] = 0x03; // event_data at offset 8 = 0x03 (BrightnessDown)
+    match decode_hp_event(&buf16) {
+        Some(HpEvent::BezelButton { key_code: 0x03 }) => {}
+        _ => return TestResult::Fail("HP 16-byte payload: event_data not read from offset 8"),
+    }
+
+    // Camera toggle open (event_data 0xfe).
+    let buf_cam: [u8; 8] = [
+        0x1A, 0x00, 0x00, 0x00, // event_id = 0x1A (CAMERA_TOGGLE)
+        0xfe, 0x00, 0x00, 0x00, // event_data = 0xfe
+    ];
+    match decode_hp_event(&buf_cam) {
+        Some(HpEvent::CameraToggle { open: true }) => {}
+        _ => return TestResult::Fail("HP camera open (0xfe) not decoded"),
+    }
+
+    // Truncated payload → None.
+    match decode_hp_event(&[0x04, 0x00, 0x00]) {
+        None => {}
+        _ => return TestResult::Fail("HP truncated payload should return None"),
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/wmi_vendors",
+    smoke_wmi_vendors_hp_event_decoder
+);
+
+/// Lenovo tablet-mode toggle decoder (YMC GUID).
+/// Reference: ymc.c sparse keymap — 0x01=laptop, 0x02–0x04=tablet.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wmi_vendors_lenovo_tablet_mode() -> TestResult {
+    use crate::wmi_vendors::{decode_lenovo_ymc_event, LenovoEvent};
+
+    // Code 0x01 → laptop mode (on=false).
+    let buf_laptop = 1u32.to_le_bytes();
+    match decode_lenovo_ymc_event(&buf_laptop) {
+        Some(LenovoEvent::TabletMode { on: false }) => {}
+        _ => return TestResult::Fail("Lenovo YMC 0x01 should decode as TabletMode{on:false}"),
+    }
+
+    // Code 0x02 → tablet mode (on=true).
+    let buf_tablet = 2u32.to_le_bytes();
+    match decode_lenovo_ymc_event(&buf_tablet) {
+        Some(LenovoEvent::TabletMode { on: true }) => {}
+        _ => return TestResult::Fail("Lenovo YMC 0x02 should decode as TabletMode{on:true}"),
+    }
+
+    // Code 0x03 (tent mode) → tablet (on=true).
+    let buf_tent = 3u32.to_le_bytes();
+    match decode_lenovo_ymc_event(&buf_tent) {
+        Some(LenovoEvent::TabletMode { on: true }) => {}
+        _ => return TestResult::Fail("Lenovo YMC 0x03 (tent) should be TabletMode{on:true}"),
+    }
+
+    // Code 0x04 (stand mode) → tablet (on=true).
+    let buf_stand = 4u32.to_le_bytes();
+    match decode_lenovo_ymc_event(&buf_stand) {
+        Some(LenovoEvent::TabletMode { on: true }) => {}
+        _ => return TestResult::Fail("Lenovo YMC 0x04 (stand) should be TabletMode{on:true}"),
+    }
+
+    // Unknown code.
+    let buf_unknown = 0xFFu32.to_le_bytes();
+    match decode_lenovo_ymc_event(&buf_unknown) {
+        Some(LenovoEvent::Unknown { raw: 0xFF }) => {}
+        _ => return TestResult::Fail("Lenovo YMC unknown code should produce LenovoEvent::Unknown"),
+    }
+
+    // Truncated.
+    match decode_lenovo_ymc_event(&[0x01]) {
+        None => {}
+        _ => return TestResult::Fail("Lenovo YMC truncated payload should return None"),
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/wmi_vendors",
+    smoke_wmi_vendors_lenovo_tablet_mode
+);
+
+/// Vendor detection: guid_str_to_bytes parses known GUIDs and
+/// init() returns UnknownVendor when no vendor GUID is in the registry.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wmi_vendors_detection_no_guid() -> TestResult {
+    use crate::wmi_vendors::{__test_reset, guid_str_to_bytes, init, WmiVendorError};
+
+    // guid_str_to_bytes must round-trip for the five known GUIDs.
+    let guids = [
+        "8D9DDCBC-A997-11DA-B012-B622A1EF5492",
+        "9DBB5994-A997-11DA-B012-B622A1EF5492",
+        "95F24279-4D7B-4334-9387-ACCDC67EF61C",
+        "5FB7F034-2C63-45E9-BE91-3D44E2C707E4",
+        "21494638-4391-4287-94B2-DDF09FE4A7AA",
+        "06129D99-6083-4164-81AD-F092F9D773A6",
+    ];
+    for g in guids {
+        if guid_str_to_bytes(g).is_none() {
+            return TestResult::Fail("guid_str_to_bytes returned None for a known GUID");
+        }
+    }
+
+    // Malformed GUID.
+    if guid_str_to_bytes("not-a-guid").is_some() {
+        return TestResult::Fail("guid_str_to_bytes accepted a malformed string");
+    }
+
+    // With an empty WMI registry (no enumerate_guids call) init()
+    // should return NoGuids.
+    __test_reset();
+    match init() {
+        Err(WmiVendorError::NoGuids) => {}
+        _ => return TestResult::Fail("init() should return NoGuids when GUID registry is empty"),
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/wmi_vendors",
+    smoke_wmi_vendors_detection_no_guid
+);

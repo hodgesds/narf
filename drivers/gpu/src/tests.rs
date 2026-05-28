@@ -4683,8 +4683,10 @@ fn make_test_card_for_ioctl() -> crate::drm::card::Card {
 
 fn smoke_drm_ioctl_version() -> TestResult {
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
     let mut card = make_test_card_for_ioctl();
-    match dispatch(&mut card, 0x00, &[]) {
+    let ctx = DrmFileCtx::primary_master();
+    match dispatch(&mut card, 0x00, &[], &ctx) {
         Ok(DrmIoctlResult::Version(v)) => {
             if v.version_major != 0 || v.version_minor != 1 {
                 return TestResult::Fail("version fields wrong");
@@ -4702,8 +4704,10 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_version);
 
 fn smoke_drm_ioctl_getresources_shape() -> TestResult {
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
     let mut card = make_test_card_for_ioctl();
-    match dispatch(&mut card, 0xA0, &[]) {
+    let ctx = DrmFileCtx::primary_master();
+    match dispatch(&mut card, 0xA0, &[], &ctx) {
         Ok(DrmIoctlResult::GetResources(r)) => {
             if r.count_crtcs != 1 { return TestResult::Fail("count_crtcs != 1"); }
             if r.count_connectors != 1 { return TestResult::Fail("count_connectors != 1"); }
@@ -4719,9 +4723,11 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_getresources_shape);
 
 fn smoke_drm_ioctl_getconnector_decode() -> TestResult {
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
     let mut card = make_test_card_for_ioctl();
+    let ctx = DrmFileCtx::primary_master();
     let arg = 1u32.to_le_bytes();
-    match dispatch(&mut card, 0xA7, &arg) {
+    match dispatch(&mut card, 0xA7, &arg, &ctx) {
         Ok(DrmIoctlResult::GetConnector(info, modes)) => {
             if info.connector_id != 1 { return TestResult::Fail("connector_id not echoed"); }
             if info.connector_type != 14 { return TestResult::Fail("type != eDP(14)"); }
@@ -4740,7 +4746,9 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_getconnector_decode);
 
 fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
     let mut card = make_test_card_for_ioctl();
+    let ctx = DrmFileCtx::primary_master();
     let gem_handle = match card.gem.alloc(0x8000_0000, 1920 * 1080 * 4) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("GEM alloc failed"),
@@ -4751,7 +4759,7 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
     arg[12..16].copy_from_slice(&0x3438_5258u32.to_le_bytes()); // XRGB8888
     arg[20..24].copy_from_slice(&gem_handle.to_le_bytes());
     arg[36..40].copy_from_slice(&(1920u32 * 4).to_le_bytes());
-    let fb_id = match dispatch(&mut card, 0xB8, &arg) {
+    let fb_id = match dispatch(&mut card, 0xB8, &arg, &ctx) {
         Ok(DrmIoctlResult::AddFb2(id)) => id,
         Ok(_) => return TestResult::Fail("ADDFB2 wrong result type"),
         Err(_) => return TestResult::Fail("ADDFB2 failed"),
@@ -4767,7 +4775,7 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
         Err(_) => return TestResult::Fail("fb lookup by id failed"),
     }
     let rmfb_arg = fb_id.to_le_bytes();
-    match dispatch(&mut card, 0xA8, &rmfb_arg) {
+    match dispatch(&mut card, 0xA8, &rmfb_arg, &ctx) {
         Ok(DrmIoctlResult::RmFb) => {}
         Ok(_) => return TestResult::Fail("RMFB wrong type"),
         Err(_) => return TestResult::Fail("RMFB failed"),
@@ -4781,17 +4789,19 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_addfb2_rmfb_roundtrip);
 
 fn smoke_drm_getcap_shape() -> TestResult {
     use crate::drm::ioctl::{dispatch, drm_cap, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
     let mut card = make_test_card_for_ioctl();
+    let ctx = DrmFileCtx::primary_master();
     let mut arg = [0u8; 16];
     arg[0..8].copy_from_slice(&drm_cap::TIMESTAMP_MONOTONIC.to_le_bytes());
-    match dispatch(&mut card, 0x0C, &arg) {
+    match dispatch(&mut card, 0x0C, &arg, &ctx) {
         Ok(DrmIoctlResult::GetCap(cap)) => {
             if cap.value != 1 { return TestResult::Fail("TIMESTAMP_MONOTONIC != 1"); }
         }
         _ => return TestResult::Fail("GET_CAP TIMESTAMP_MONOTONIC failed"),
     }
     arg[0..8].copy_from_slice(&drm_cap::PRIME.to_le_bytes());
-    match dispatch(&mut card, 0x0C, &arg) {
+    match dispatch(&mut card, 0x0C, &arg, &ctx) {
         Ok(DrmIoctlResult::GetCap(cap)) => {
             if cap.value != 0 { return TestResult::Fail("PRIME should be 0 (deferred)"); }
         }
@@ -4800,6 +4810,93 @@ fn smoke_drm_getcap_shape() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_getcap_shape);
+
+// ── DRM render-node permission split ──────────────────────────────────
+
+fn smoke_drm_render_node_devpath() -> TestResult {
+    use crate::drm::card::Card;
+    use crate::drm::render_node::MinorType;
+    let primary = Card::primary_node(0);
+    let render = Card::render_node(0);
+    if primary.kind != MinorType::Primary { return TestResult::Fail("primary kind"); }
+    if render.kind != MinorType::Render { return TestResult::Fail("render kind"); }
+    if primary.index != 0 { return TestResult::Fail("primary index != 0"); }
+    if render.index != 128 { return TestResult::Fail("render index != 128"); }
+    let (p_prefix, p_idx) = primary.dev_path_parts();
+    let (r_prefix, r_idx) = render.dev_path_parts();
+    if p_prefix != "card" || p_idx != 0 { return TestResult::Fail("primary path"); }
+    if r_prefix != "renderD" || r_idx != 128 { return TestResult::Fail("render path"); }
+    // Card index 3 should give /dev/dri/card3 and /dev/dri/renderD131.
+    let r3 = Card::render_node(3);
+    if r3.index != 131 { return TestResult::Fail("renderD131 for card3"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_render_node_devpath);
+
+fn smoke_drm_render_node_perm_split() -> TestResult {
+    // Verify a render-node fd is rejected from DRM_MASTER ioctls but
+    // allowed for VERSION / GET_CAP / PRIME / SYNCOBJ. Mirrors
+    // drivers/gpu/drm/drm_ioctl.c::drm_ioctl_permit.
+    use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult};
+    use crate::drm::render_node::{DrmFileCtx, PermError};
+    let mut card = make_test_card_for_ioctl();
+    let render = DrmFileCtx::render_client();
+
+    // VERSION (RENDER_ALLOW) — should succeed.
+    match dispatch(&mut card, 0x00, &[], &render) {
+        Ok(DrmIoctlResult::Version(_)) => {}
+        _ => return TestResult::Fail("render-node VERSION should succeed"),
+    }
+
+    // GETRESOURCES (DRM_AUTH but no RENDER_ALLOW) — render clients are
+    // implicitly authenticated, so the auth check passes, but the
+    // !render_allow + is_render_client gate fires. Linux returns
+    // -EACCES; we surface RenderDenied.
+    match dispatch(&mut card, 0xA0, &[], &render) {
+        Err(DrmIoctlError::PermissionDenied(PermError::RenderDenied)) => {}
+        Ok(_) => return TestResult::Fail("render-node GETRESOURCES should be denied"),
+        Err(_) => return TestResult::Fail("render-node GETRESOURCES wrong error"),
+    }
+
+    // ADDFB2 (DRM_MASTER) — denied for render clients (NotMaster *or*
+    // RenderDenied; we set master-only without render_allow so the
+    // render_allow gate fires first).
+    let arg = [0u8; 68];
+    match dispatch(&mut card, 0xB8, &arg, &render) {
+        Err(DrmIoctlError::PermissionDenied(_)) => {}
+        _ => return TestResult::Fail("render-node ADDFB2 should be denied"),
+    }
+
+    // GET_CAP (RENDER_ALLOW) — should succeed.
+    let mut cap_arg = [0u8; 16];
+    cap_arg[0..8].copy_from_slice(&6u64.to_le_bytes()); // TIMESTAMP_MONOTONIC
+    match dispatch(&mut card, 0x0C, &cap_arg, &render) {
+        Ok(DrmIoctlResult::GetCap(_)) => {}
+        _ => return TestResult::Fail("render-node GET_CAP should succeed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_render_node_perm_split);
+
+fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
+    // A primary-node fd that is authenticated but NOT master must be
+    // blocked from DRM_MASTER ioctls (ADDFB2).
+    use crate::drm::ioctl::{dispatch, DrmIoctlError};
+    use crate::drm::render_node::{DrmFileCtx, MinorType, PermError};
+    let mut card = make_test_card_for_ioctl();
+    let authed = DrmFileCtx {
+        minor: MinorType::Primary,
+        authenticated: true,
+        is_master: false,
+        is_root: false,
+    };
+    let arg = [0u8; 68];
+    match dispatch(&mut card, 0xB8, &arg, &authed) {
+        Err(DrmIoctlError::PermissionDenied(PermError::NotMaster)) => TestResult::Pass,
+        _ => TestResult::Fail("authed non-master ADDFB2 should be NotMaster"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_perm_master_only_blocks_authed);
 
 // ── amdgpu/smu v12+v13 opcode tables ───────────────────────────────
 //
