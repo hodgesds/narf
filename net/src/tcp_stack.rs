@@ -50,6 +50,13 @@ fn arp_insert(ip: [u8; 4], mac: [u8; 6]) {
     m.insert(ip, mac);
 }
 
+/// Public shim so `arp::arp_insert_from_rx` can populate the legacy
+/// BTreeMap cache alongside the new LRU cache without a circular dep.
+#[doc(hidden)]
+pub fn __arp_insert_legacy(ip: [u8; 4], mac: [u8; 6]) {
+    arp_insert(ip, mac);
+}
+
 /// Send an ARP request for `target_ip`. Returns Err if no iface
 /// is registered.
 pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {

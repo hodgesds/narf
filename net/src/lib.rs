@@ -48,6 +48,8 @@ pub mod http;
 pub mod http2;
 pub mod mqtt;
 pub mod dhcp;
+pub mod arp;
+pub mod ipv4;
 pub mod pkt;
 pub mod pkt_dhcp;
 pub mod pkt_coap;
