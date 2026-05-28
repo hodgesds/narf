@@ -372,7 +372,7 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
 // yet exposed) and refuse if false.
 
 use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
+use rand_core::{RngCore, SeedableRng};
 
 /// Construct a per-task RNG. Stage 3 seeds from the monotonic cycle
 /// counter; Stage 4 must replace the seed source with the arch HW
@@ -391,6 +391,15 @@ pub fn per_task_rng() -> ChaCha20Rng {
     seed[16..24].copy_from_slice(&c0.wrapping_mul(0x100000001B3).to_le_bytes());
     seed[24..32].copy_from_slice(&c1.wrapping_mul(0xCBF29CE484222325).to_le_bytes());
     ChaCha20Rng::from_seed(seed)
+}
+
+/// Fill `out` with bytes from `per_task_rng()`. Lets downstream
+/// crates (e.g. `narf-wireless` for SAE nonces) pull entropy
+/// without taking a `rand_core` direct dependency. Same caveats
+/// apply as `per_task_rng`: the seed quality issue is open until
+/// the arch HW entropy path lands.
+pub fn fill_random_bytes(out: &mut [u8]) {
+    per_task_rng().fill_bytes(out);
 }
 
 // ── SecureRing skeleton ──────────────────────────────────────────────
