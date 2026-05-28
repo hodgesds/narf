@@ -24,6 +24,7 @@ use narf_driver_runtime::DomainId;
 use narf_filesystem::{DirOps, FsError, FsInstance};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_time::now_wall;
 
 use super::group_desc::GroupDesc;
 use super::inode::Inode;
@@ -1271,6 +1272,23 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             buf[off + 2],
             buf[off + 3],
         ]))
+    }
+}
+
+impl<B: BlockDevice + 'static> Ext2Volume<B> {
+    /// Return the current wall-clock time as a `u32` seconds-since-epoch
+    /// value suitable for ext2's 32-bit timestamp fields. Returns `0`
+    /// when the clock has not been calibrated (pre-epoch or uninitialised).
+    ///
+    /// Ref: Linux `fs/ext4/inode.c::ext4_current_time` pattern —
+    /// read `ktime_get_real_seconds()`, clamp to `u32`, store in
+    /// `i_mtime` / `i_ctime`.
+    pub(crate) fn now_secs() -> u32 {
+        let w = now_wall();
+        if w.secs <= 0 {
+            return 0;
+        }
+        w.secs.min(u32::MAX as i64) as u32
     }
 }
 
