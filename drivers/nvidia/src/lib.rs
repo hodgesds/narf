@@ -38,6 +38,7 @@ pub mod bar;
 pub mod ce;
 pub mod chip;
 pub mod disp;
+pub mod dp;
 pub mod falcon;
 pub mod fb;
 pub mod fifo;
@@ -46,6 +47,7 @@ pub mod mc;
 pub mod mmu;
 pub mod pci;
 pub mod pmu;
+pub mod vbios;
 
 mod tests;
 
