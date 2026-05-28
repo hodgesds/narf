@@ -22,6 +22,7 @@ narf-init            = { path = "../../init" }
 narf-edid            = { path = "../../edid" }
 narf-graphics        = { path = "../../graphics" }
 narf-firmware        = { path = "../../firmware" }
+narf-crypto          = { path = "../../crypto" }
 
 [features]
 kernel-test = []

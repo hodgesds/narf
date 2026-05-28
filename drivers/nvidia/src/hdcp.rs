@@ -240,3 +240,171 @@ impl HdcpSec2SubCmd {
         self as u32
     }
 }
+
+// ── In-kernel HDCP crypto path ───────────────────────────────────────
+//
+// Prior agents wired the `Sec2Cmd::HdcpKx` dispatch table and called
+// out that the actual AES / SHA / HMAC / RSA crypto was missing
+// because we don't want to depend on signed SEC2 firmware just to
+// authenticate a display on the open driver path. NARF's crypto crate
+// now ships the primitives (`narf_crypto::hdcp`, `narf_crypto::aes_ctr`,
+// `narf_crypto::rsaes_oaep`); this section wires them into the per-link
+// state.
+//
+// The sub-commands above remain a useful abstraction for *signed*
+// HDCP paths (where the host still wants firmware to sign on its
+// behalf for HDCP-2.3 robustness rules). We expose a *parallel*
+// in-kernel handler so the driver can pick which to use per chip-gen
+// — and so the SEC2 dispatch can call back into the in-kernel routines
+// when the firmware blob is unavailable.
+
+use narf_crypto::hdcp as nc_hdcp;
+use narf_crypto::rsaes_oaep;
+
+/// Per-link derived material that lives next to `HdcpContext` once
+/// AKE_Send_Cert has been received. Computed in-kernel by
+/// `compute_kd_for_link` — feeds the H' / L' verify paths.
+#[derive(Clone, Debug, Default)]
+pub struct HdcpKeys {
+    /// kd = dkey0 || dkey1 — 256-bit derived key from km, rn (§2.7).
+    pub kd: [u8; 32],
+    /// kh = HMAC-SHA256(kd, "kh")[..16] — pairing-info wrap key.
+    pub kh: [u8; 16],
+}
+
+impl HdcpKeys {
+    /// Derive kd + kh from the current context's km + rn. Call after
+    /// AKE_No_Stored_km has been built (so km is set) and after LC_Init
+    /// has chosen rn.
+    pub fn derive(km: &[u8; HDCP_KM_LEN], rn: &[u8; HDCP_RN_LEN]) -> Self {
+        let kd = nc_hdcp::derive_kd(km, rn);
+        let kh = nc_hdcp::derive_kh(&kd);
+        Self { kd, kh }
+    }
+}
+
+/// Errors surfaced by the in-kernel HDCP crypto handler.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HdcpCryptoError {
+    /// RSAES-OAEP encrypt of km failed (e.g. message too long — should
+    /// never fire for a 16-byte km).
+    KmWrap,
+    /// H' did not match the value the host recomputed.
+    HPrimeMismatch,
+    /// L' did not match the value the host recomputed.
+    LPrimeMismatch,
+}
+
+/// Build the `E_kpubrx(km)` payload that sits inside AKE_No_Stored_km.
+/// The receiver's public-key modulus (`n_be`) and the host-generated
+/// 32-byte OAEP seed come from the caller (SEC2's random source for
+/// the seed; the cert-rx payload for `n_be`).
+pub fn wrap_km_for_ake_no_stored(
+    n_be: &[u8; rsaes_oaep::RSA_3072_LEN],
+    seed: &[u8; rsaes_oaep::SHA256_HASH_LEN],
+    km: &[u8; HDCP_KM_LEN],
+) -> Result<[u8; rsaes_oaep::RSA_3072_LEN], HdcpCryptoError> {
+    rsaes_oaep::rsaes_oaep_sha256_encrypt(
+        n_be,
+        rsaes_oaep::HDCP_RSA_PUB_EXP_F4,
+        seed,
+        km,
+        b"", // HDCP uses an empty label.
+    )
+    .map_err(|_| HdcpCryptoError::KmWrap)
+}
+
+/// Verify the AKE_Send_H_prime message. The host recomputes H' from
+/// the link's kd, the rtx it sent in AKE_Init, and the RxCaps / TxCaps
+/// exchanged earlier; returns Ok if the receiver's H' matches.
+pub fn verify_ake_send_h_prime(
+    keys: &HdcpKeys,
+    ctx: &HdcpContext,
+    presented_h_prime: &[u8; nc_hdcp::HDCP_MIC_LEN],
+) -> Result<(), HdcpCryptoError> {
+    if !nc_hdcp::verify_h_prime(
+        &keys.kd,
+        &ctx.rtx,
+        &ctx.rx_caps,
+        &ctx.tx_caps,
+        presented_h_prime,
+    ) {
+        return Err(HdcpCryptoError::HPrimeMismatch);
+    }
+    Ok(())
+}
+
+/// Verify the LC_Send_L_prime message. Receiver-side rrx + host-side rn
+/// drive the recomputation per §2.3.
+pub fn verify_lc_send_l_prime(
+    keys: &HdcpKeys,
+    ctx: &HdcpContext,
+    presented_l_prime: &[u8; nc_hdcp::HDCP_MIC_LEN],
+) -> Result<(), HdcpCryptoError> {
+    if !nc_hdcp::verify_l_prime(&keys.kd, &ctx.rrx, &ctx.rn, presented_l_prime) {
+        return Err(HdcpCryptoError::LPrimeMismatch);
+    }
+    Ok(())
+}
+
+/// Build SKE_Send_Eks payload: `E_dkey_ks` (CTR-wrapped ks) + riv.
+/// `kd_low16` is the lower half of kd per §2.7 (the bytes that drive
+/// the CTR keystream); `riv` is the 64-bit IV the host sends, generated
+/// fresh per session.
+pub fn build_ske_send_eks(
+    keys: &HdcpKeys,
+    riv: &[u8; HDCP_RIV_LEN],
+    ks: &[u8; HDCP_KS_LEN],
+) -> ([u8; HDCP_EDKEY_KS_LEN], [u8; HDCP_RIV_LEN]) {
+    let mut kd_low16 = [0u8; 16];
+    kd_low16.copy_from_slice(&keys.kd[..16]);
+    let e_dkey_ks = nc_hdcp::wrap_ks_ctr(&kd_low16, riv, ks);
+    (e_dkey_ks, *riv)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod nvidia_hdcp_crypto_tests {
+    use super::*;
+
+    #[test]
+    fn verify_h_prime_round_trip() {
+        let km = [0xAAu8; HDCP_KM_LEN];
+        let rn = [0xBBu8; HDCP_RN_LEN];
+        let keys = HdcpKeys::derive(&km, &rn);
+
+        let mut ctx = HdcpContext::new();
+        ctx.rtx = [0x11u8; HDCP_RTX_LEN];
+        ctx.rx_caps = [0x02, 0, 0];
+        ctx.tx_caps = [0x02, 0, 0];
+
+        // Compute H' as the receiver would, then verify host-side.
+        let h = nc_hdcp::compute_h_prime(&keys.kd, &ctx.rtx, &ctx.rx_caps, &ctx.tx_caps);
+        assert!(verify_ake_send_h_prime(&keys, &ctx, &h).is_ok());
+
+        let mut bad_h = h;
+        bad_h[0] ^= 0x01;
+        assert_eq!(
+            verify_ake_send_h_prime(&keys, &ctx, &bad_h),
+            Err(HdcpCryptoError::HPrimeMismatch)
+        );
+    }
+
+    #[test]
+    fn build_ske_send_eks_round_trip() {
+        let km = [0xCCu8; HDCP_KM_LEN];
+        let rn = [0xDDu8; HDCP_RN_LEN];
+        let keys = HdcpKeys::derive(&km, &rn);
+        let riv = [0xEEu8; HDCP_RIV_LEN];
+        let ks = [0xFFu8; HDCP_KS_LEN];
+
+        let (e_dkey_ks, out_riv) = build_ske_send_eks(&keys, &riv, &ks);
+        assert_eq!(out_riv, riv);
+        // CTR-unwrap with the same key+iv recovers ks.
+        let mut kd_low16 = [0u8; 16];
+        kd_low16.copy_from_slice(&keys.kd[..16]);
+        let recovered = nc_hdcp::wrap_ks_ctr(&kd_low16, &riv, &e_dkey_ks);
+        assert_eq!(recovered, ks);
+    }
+}
