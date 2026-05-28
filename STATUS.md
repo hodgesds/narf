@@ -186,7 +186,9 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI UEFI        | UEFI ACPI Data Table — `UefiTableInfo { identifier, data_offset }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §5. |
 | SMBIOS / DMI     | Entry-point-agnostic structure-stream parser. **Full SMBIOS 3.x type coverage** — Types 0..46 decoded into per-type accessors (`copy_*` / `*_info`), plus 5/6/10 walked-but-deprecated, 126 counted, 127 terminating. 47 distinct decoder functions; full-dispatch coverage smoke pushes one of every supported type and confirms each accessor surfaces it. Spec: `firmware/smbios/specification/spec.md`. |
 | FDT / DTB v17    | Pure-byte-slice parser — header validate (FDT magic + version), memory-reserve map decode, struct-block walker that calls back per node with a depth-tracked `Path` + `PropIter` (FDT_BEGIN/END/PROP/NOP/END tokens). Convenience helpers `chosen_bootargs(blob)` and `copy_memory_ranges(blob, …)` ride on top. Spec: `firmware/fdt/specification/spec.md`. |
-| iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
+| iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX210 family). **Stage 3 (ALIVE)** — APM init + firmware load (Gen2 DMA / Gen3 IML) + ALIVE handshake. All AX-class families reach functional firmware state. |
+| ath11k           | Qualcomm Wi-Fi 6E (QCA6390 / WCN6855). **Stage 2 (M0)** — MHI state machine + BHI firmware loading (amss.bin). Reaches Mission Mode (M0). |
+| rtw88            | Realtek Wi-Fi 5 (RTL8822C). **Stage 2 (FW Load)** — Power-on sequence + IDDMA firmware loading via BAR2. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
 | USB HID keyboard | Hot-plug enumeration → Set Protocol(Boot) → interrupt-IN polling → HID Usage 0x07 → `narf_input::KeyCode` press/release diffing, 8-modifier tracking, roll-over filter, feeding the global `InputEvent` ring. |
@@ -1182,6 +1184,13 @@ What's landed since the Stage-4 close (post-deadline memory work):
   paired with the regular MQ negotiation (`F_MQ` → MQ_VQ_PAIRS_SET)
   so `set_mac(addr)` and per-pair queue programming both go
   through the controlq.
+- **Wireless Driver Bring-up (May 2026)**: Following relicensing
+  to GPL-2.0, the Intel (`iwlwifi`), Qualcomm (`ath11k`), and
+  Realtek (`rtw88`) drivers were consolidated into `drivers/wireless/`
+  and advanced to functional bring-up states. `iwlwifi` reached
+  the **ALIVE** state (firmware running); `ath11k` and `rtw88`
+  reached the **Firmware Loaded** state (M0 / MCU-ready).
+
 
 ### Observability (post-Stage-4)
 

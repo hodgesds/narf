@@ -1,10 +1,21 @@
 # drivers/wireless — Specification
 
-> Status: **v0.1** (Stage 4 design draft).
+> Status: **v0.2** (Stage 4 design lock).
 >
 > Framework for wireless drivers in the NARF ecosystem. Extends
 > `drivers/spec` and `wireless/spec` to define the operational
 > boundary for 802.11 hardware.
+
+## 0. Bring-up Status (May 2026)
+
+The following drivers have been advanced to functional bring-up
+states following the May 2026 relicensing to GPL-2.0:
+
+| Driver | Generation | Status | Mechanism |
+| :--- | :--- | :--- | :--- |
+| **iwlwifi** | Wi-Fi 6/6E | **Stage 3** (ALIVE) | Gen2/3 DMA, ALIVE handshake |
+| **ath11k** | Wi-Fi 6E | **Stage 2** (M0) | MHI State Machine, BHI AMSS load |
+| **rtw88** | Wi-Fi 5 | **Stage 2** (FW Load) | RTL8822C IDDMA, MCU handshake |
 
 ## 1. Purpose & scope
 

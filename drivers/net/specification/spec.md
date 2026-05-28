@@ -70,6 +70,9 @@ driver (candidate: Intel E1000 or IGC as the simplest starting point) in Stage 4
 together. E1000 covers QEMU compat + ancient hardware test
 beds; IGC is modern Intel client NICs (Tiger Lake+).
 
+**iwlwifi and ath11k** are moved to `drivers/wireless` as of
+Stage 3 bring-up.
+
 MLX5 / ConnectX-class is deferred to Stage 5+ when fast-path
 networking has a concrete consumer demanding RDMA / GPUDirect
 features. The fast-path infrastructure (`net/spec` §8.4) is

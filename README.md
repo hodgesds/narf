@@ -194,10 +194,15 @@ Live from boot through `cargo xtask run`:
 - ixgbe (Intel 82599 / X540 / X550 10 GbE): clean-room from the
   public Intel datasheet — PCI match, master reset, EEPROM-backed
   MAC read, advanced TX + RX rings, MSI-X, `HwNic` impl.
-- iwlwifi (Intel Wi-Fi 6 / 6E AX200..AX211): structural probe only;
-  operational register map is not in any public Intel doc, so the
-  driver lands the PCI-match table + spec doc and stops at the
-  documented public-docs wall.
+- iwlwifi (Intel Wi-Fi 6 / 6E AX200..AX211): **Stage 3 (ALIVE)**
+  bring-up — APM initialization, firmware loading (Gen2 DMA / Gen3
+  IML), and ALIVE handshake successfully reached on real silicon.
+- ath11k (Qualcomm Wi-Fi 6E QCA6390 / WCN6855): **Stage 2 (M0)**
+  bring-up — MHI state machine initialization and BHI firmware
+  loading (amss.bin).
+- rtw88 (Realtek Wi-Fi 5 RTL8822C): **Stage 2 (FW Load)**
+  bring-up — Power-on sequence and IDDMA firmware loading via
+  the BAR2 data window.
 - xHCI USB host controller: HCRST reset, DCBAA + Command/Event
   Rings + scratchpad pointers, USBCMD.RS=1, port reset, Enable
   Slot, Address Device, GET_DESCRIPTOR, Configure Endpoint,
