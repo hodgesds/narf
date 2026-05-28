@@ -122,6 +122,7 @@ pub mod amdgpu_atom_gpiopin;
 pub mod amdgpu_atom_vm;
 pub mod amdgpu_atombios;
 pub mod amdgpu_backlight;
+pub mod amdgpu_dc;
 pub mod amdgpu_dcn;
 pub mod amdgpu_ddc;
 pub mod amdgpu_discovery;
