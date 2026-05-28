@@ -1347,7 +1347,7 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
     // End-to-end PRP-list (>2 pages) write+read round trip.
     //
     // Allocates three independent 4-KiB DMA pages and writes 24 LBAs
-    // (12 KiB) at LBA 2048, then reads them back. The three-page
+    // (12 KiB) at LBA 1536, then reads them back. The three-page
     // transfer exercises the `pages.len() > 2` branch in
     // `nvm_io_multipage`: PRP1=pages[0], PRP2=phys of a freshly
     // allocated PRP-list page that holds pages[1] and pages[2] as
@@ -1412,9 +1412,10 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
         }
     }
     let pages = [page_a.phys_addr(), page_b.phys_addr(), page_c.phys_addr()];
-    // Write 24 LBAs (12 KiB) at LBA 2048 to avoid clobbering the
-    // single-page + two-page smokes' sectors.
-    if ctrl.write_lba_pages(2048, 24, &pages).is_err() {
+    // Write 24 LBAs (12 KiB) at LBA 1536, well clear of the
+    // single-page (LBA 0) and two-page (LBA 1024, 16 blocks) smokes
+    // and within the 2048-sector QEMU test image (1536+24=1560 ≤ 2048).
+    if ctrl.write_lba_pages(1536, 24, &pages).is_err() {
         return TestResult::Fail("write_lba_pages (3 pages) failed");
     }
     // Zero all three pages, then read back.
@@ -1428,7 +1429,7 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
             core::ptr::write_volatile(pc.add(i), 0);
         }
     }
-    if ctrl.read_lba_pages(2048, 24, &pages).is_err() {
+    if ctrl.read_lba_pages(1536, 24, &pages).is_err() {
         return TestResult::Fail("read_lba_pages (3 pages) failed");
     }
     for i in 0..4096usize {
