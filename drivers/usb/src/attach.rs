@@ -524,9 +524,10 @@ async fn dispatch_after_address(
                 return AttachOutcome::Mouse;
             }
         }
-        // CDC-ACM serial — Comm + Data interface pair.
+        // CDC-ACM serial — Comm + Data interface pair (bare or
+        // IAD-led composite).
         if crate::cdc_acm::find_acm_interfaces(&cfg_blob).is_some() {
-            if crate::cdc_acm::try_bind_acm_already_addressed(
+            if crate::cdc_acm::try_bind_cdc_acm_already_addressed(
                 xhci_dev, slot_id, &cfg_blob, speed,
             )
             .await

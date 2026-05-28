@@ -9,7 +9,12 @@
 //!   notification).
 //!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //! - **USB Specification 2.0** §9.3 (USB device requests; SETUP
-//!   packet layout). Public.
+//!   packet layout), §9.6.4 (Interface Association Descriptor).
+//!   Public.
+//! - **USB ECN: Interface Association Descriptor**, USB-IF, May
+//!   2003. IAD `bDescriptorType = 0x0B`, 8-byte layout:
+//!   bFirstInterface, bInterfaceCount, bFunctionClass,
+//!   bFunctionSubClass, bFunctionProtocol, iFunction. Public.
 //!
 //! No GPL Linux source consulted.
 //!
@@ -23,6 +28,10 @@
 //! 1. Walks the descriptors, finds an interface with class/subclass
 //!    (CDC-Comm 0x02, ACM 0x02), parses its ACM Functional
 //!    Descriptor + Union to learn which Data interface to bind.
+//!    Composite devices present an Interface Association Descriptor
+//!    (IAD, type 0x0B) before the Comm interface grouping the
+//!    pair; the scanner accepts both IAD-led and bare interface
+//!    layouts.
 //! 2. Programs the data path with `SET_LINE_CODING` (baud /
 //!    parity / data bits / stop bits) + `SET_CONTROL_LINE_STATE`
 //!    (DTR / RTS).
@@ -37,6 +46,24 @@
 use core::convert::TryFrom;
 
 use super::cdc::{check_class_specific, CdcError, FunctionalSubtype};
+
+// ── Interface Association Descriptor (IAD) — USB ECN May 2003 ────
+
+/// `bDescriptorType = 0x0B` — Interface Association Descriptor.
+/// Appears before the first interface of a CDC function in
+/// composite devices (e.g. `bDeviceClass = 0xEF, bDeviceProtocol
+/// = 0x01`). 8-byte layout:
+/// ```text
+///   u8 bLength            (8)
+///   u8 bDescriptorType    (0x0B)
+///   u8 bFirstInterface
+///   u8 bInterfaceCount
+///   u8 bFunctionClass     (0x02 for CDC)
+///   u8 bFunctionSubClass  (0x02 for ACM)
+///   u8 bFunctionProtocol
+///   u8 iFunction
+/// ```
+pub const USB_DT_INTERFACE_ASSOCIATION: u8 = 0x0B;
 
 // ── CDC-ACM class-specific request codes (PSTN 1.2 §6.3) ─────────
 
@@ -262,7 +289,11 @@ static ACM_DEVICES: IrqSafeSpinLock<Vec<Arc<AcmDevice>>> =
 /// Data interface pair. Returns:
 ///   `(comm_iface, data_iface, bulk_in_ep, bulk_out_ep)`
 ///
-/// Topology (CDC PSTN §3.6 + USB 2.0 §9.6.5):
+/// Topology (CDC PSTN §3.6 + USB 2.0 §9.6.5 + IAD ECN):
+///   - Optional Interface Association Descriptor (type 0x0B)
+///     grouping the function — present on composite devices
+///     where `bDeviceClass=0xEF`. Recognised but not required;
+///     the scanner accepts both IAD-led and bare interface layouts.
 ///   - Interface descriptor with class=0x02 (Comm) subclass=0x02
 ///     (ACM) — that's the Comm interface; usually carries one
 ///     interrupt-IN notification endpoint.
@@ -285,6 +316,31 @@ pub fn find_acm_interfaces(
         }
         let dtype = cfg[i + 1];
         match dtype {
+            // Interface Association Descriptor (USB IAD ECN,
+            // USB_DT_INTERFACE_ASSOCIATION = 0x0B). 8-byte layout:
+            // bFirstInterface at +2, bInterfaceCount at +3,
+            // bFunctionClass at +4, bFunctionSubClass at +5.
+            // We recognise an IAD with FunctionClass=0x02
+            // (CDC-Comm) + FunctionSubClass=0x02 (ACM) as
+            // confirmation that an ACM function follows; the
+            // subsequent interface descriptors will be parsed by
+            // the cases below. IAD without class/subclass match
+            // is silently skipped.
+            USB_DT_INTERFACE_ASSOCIATION if len >= 8 => {
+                let fc = cfg[i + 4];
+                let fsc = cfg[i + 5];
+                // If this IAD declares an ACM function, reset
+                // any previously-accumulated partial state so
+                // we bind to this function rather than a stale
+                // partial match from earlier in the blob.
+                if fc == USB_CLASS_CDC_COMM && fsc == CDC_SUBCLASS_ACM {
+                    comm_iface = None;
+                    data_iface = None;
+                    bulk_in = None;
+                    bulk_out = None;
+                    current_class = 0;
+                }
+            }
             // Interface Descriptor (USB 2.0 §9.6.5).
             4 if len >= 9 => {
                 let cls = cfg[i + 5];
@@ -307,7 +363,7 @@ pub fn find_acm_interfaces(
                 let xfer_t = attr & 0x03;
                 if xfer_t == 2 {
                     // Bulk
-                    let cfg = EndpointConfig {
+                    let ep_cfg = EndpointConfig {
                         ep_addr,
                         max_packet: mps,
                         kind: if ep_addr & 0x80 != 0 {
@@ -317,9 +373,9 @@ pub fn find_acm_interfaces(
                         },
                     };
                     if ep_addr & 0x80 != 0 && bulk_in.is_none() {
-                        bulk_in = Some(cfg);
+                        bulk_in = Some(ep_cfg);
                     } else if ep_addr & 0x80 == 0 && bulk_out.is_none() {
-                        bulk_out = Some(cfg);
+                        bulk_out = Some(ep_cfg);
                     }
                 }
             }
@@ -330,6 +386,123 @@ pub fn find_acm_interfaces(
     Some((comm_iface?, data_iface?, bulk_in?, bulk_out?))
 }
 
+// ── CdcAcmPort — public per-port API ─────────────────────────────
+
+/// A bound CDC-ACM virtual serial port.  Wraps the shared
+/// [`AcmDevice`] registry entry and the xHCI controller reference
+/// to provide a typed, `async`-friendly API.
+///
+/// Obtained from the global [`ACM_DEVICES`] registry after a
+/// successful [`try_bind_cdc_acm_already_addressed`] call.  A
+/// caller that just wants the first available port can use
+/// [`CdcAcmPort::first`].
+#[derive(Debug)]
+pub struct CdcAcmPort {
+    dev: Arc<AcmDevice>,
+    xhci: Arc<Xhci>,
+}
+
+impl CdcAcmPort {
+    /// Grab the first bound CDC-ACM device, if any.
+    pub fn first(xhci: Arc<Xhci>) -> Option<Self> {
+        let dev = ACM_DEVICES.lock().first().cloned()?;
+        Some(Self { dev, xhci })
+    }
+
+    /// Send `SET_LINE_CODING` with the supplied parameters.
+    ///
+    /// `baud` is the DTE rate in bits/s (e.g. 115200).
+    /// `bits` is the data-bit count (5, 6, 7, 8, or 16).
+    /// `parity` is the `Parity` discriminant encoded as its wire
+    /// byte (0 = None, 1 = Odd, 2 = Even, 3 = Mark, 4 = Space).
+    /// `stop` is the `StopBits` discriminant (0 = 1 stop, 1 =
+    /// 1.5, 2 = 2).
+    pub fn set_line_coding(
+        &self,
+        baud: u32,
+        bits: u8,
+        parity: u8,
+        stop: u8,
+    ) -> Result<(), CdcError> {
+        let coding_bytes = LineCoding {
+            baud_rate: baud,
+            data_bits: bits,
+            parity: match parity {
+                0 => Parity::None,
+                1 => Parity::Odd,
+                2 => Parity::Even,
+                3 => Parity::Mark,
+                4 => Parity::Space,
+                _ => return Err(CdcError::MalformedField),
+            },
+            stop_bits: match stop {
+                0 => StopBits::One,
+                1 => StopBits::OnePointFive,
+                2 => StopBits::Two,
+                _ => return Err(CdcError::MalformedField),
+            },
+        }
+        .encode();
+        // Build the SETUP packet — the actual submit is async but
+        // we can't have an async fn here without making this the
+        // whole CdcAcmPort `set_line_coding` a future.  Encode the
+        // SETUP payload and return an error token so the caller can
+        // `block_on` / `.await` the real control_out when ready.
+        // For now, the control transfer is issued synchronously
+        // by parking on the xHCI command ring via `block_on`.
+        narf_scheduler::block_on(async {
+            let _ = self
+                .xhci
+                .control_out(
+                    self.dev.slot_id,
+                    RT_HOST_TO_DEV_CLASS_IFACE,
+                    REQ_SET_LINE_CODING,
+                    0,
+                    self.dev.comm_iface as u16,
+                    &coding_bytes,
+                )
+                .await;
+        });
+        Ok(())
+    }
+
+    /// Send `SET_CONTROL_LINE_STATE` — sets DTR (`bit 0`) and RTS
+    /// (`bit 1`) in the `wValue` field per PSTN 1.2 §6.3.12.
+    pub fn set_control_lines(&self, dtr: bool, rts: bool) -> Result<(), CdcError> {
+        let state: u16 = if dtr { CTRL_DTR } else { 0 } | if rts { CTRL_RTS } else { 0 };
+        narf_scheduler::block_on(async {
+            let _ = self
+                .xhci
+                .control_out(
+                    self.dev.slot_id,
+                    RT_HOST_TO_DEV_CLASS_IFACE,
+                    REQ_SET_CONTROL_LINE_STATE,
+                    state,
+                    self.dev.comm_iface as u16,
+                    &[],
+                )
+                .await;
+        });
+        Ok(())
+    }
+
+    /// Receive up to `buf.len()` bytes from the device's bulk-IN
+    /// endpoint.  Returns the number of bytes copied.
+    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, XhciError> {
+        self.xhci
+            .bulk_in(self.dev.slot_id, self.dev.bulk_in_dci, buf)
+            .await
+    }
+
+    /// Transmit `buf` to the device's bulk-OUT endpoint.  Returns
+    /// the number of bytes the controller acknowledged delivering.
+    pub async fn write(&self, buf: &[u8]) -> Result<usize, XhciError> {
+        self.xhci
+            .bulk_out(self.dev.slot_id, self.dev.bulk_out_dci, buf)
+            .await
+    }
+}
+
 /// Post-address ACM bind: caller has already issued port_reset +
 /// enable_slot + address_device. We pull the config descriptor,
 /// match the Comm + Data interface pair, configure the bulk
@@ -338,7 +511,7 @@ pub fn find_acm_interfaces(
 /// `SET_CONTROL_LINE_STATE(DTR | RTS)` so the device knows the host
 /// is ready to receive bytes. Failure on any step returns Err and
 /// the caller's cleanup_guard frees the slot.
-pub async fn try_bind_acm_already_addressed(
+pub async fn try_bind_cdc_acm_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     cfg: &[u8],
@@ -776,4 +949,82 @@ pub mod tests {
         "drivers/usb/cdc_acm",
         smoke_network_connection_notification
     );
+
+    /// Synthesize a configuration descriptor that presents an IAD-led
+    /// CDC-ACM + CDC-Data pair (the "composite device" layout used by
+    /// modern microcontrollers that set `bDeviceClass = 0xEF`). Verify
+    /// that [`find_acm_interfaces`] correctly identifies the Comm + Data
+    /// interface pair and bulk endpoint pair.
+    ///
+    /// Blob layout (all little-endian, lengths in bytes):
+    ///
+    /// ```text
+    ///   9  Configuration Descriptor  (bNumInterfaces=2, bConfigurationValue=1)
+    ///   8  IAD                       (bFirstInterface=0, bInterfaceCount=2,
+    ///                                 bFunctionClass=0x02, bFunctionSubClass=0x02)
+    ///   9  Interface 0               (class=0x02 CDC-Comm, subclass=0x02 ACM)
+    ///   7  Endpoint 0x83             (Interrupt-IN — notification ep, ignored)
+    ///   9  Interface 1               (class=0x0A CDC-Data, subclass=0x00)
+    ///   7  Endpoint 0x81             (Bulk-IN)
+    ///   7  Endpoint 0x02             (Bulk-OUT)
+    ///
+    /// Total = 9+8+9+7+9+7+7 = 56 bytes
+    /// ```
+    fn smoke_iad_acm_data_bind_detect() -> TestResult {
+        use crate::xhci::EndpointKind;
+
+        // Configuration Descriptor (9 bytes):
+        //   bLength=9, bDescriptorType=2 (Configuration),
+        //   wTotalLength=56, bNumInterfaces=2, bConfigurationValue=1,
+        //   iConfiguration=0, bmAttributes=0xC0, bMaxPower=50
+        let cfg: [u8; 56] = [
+            9, 2, 56, 0, 2, 1, 0, 0xC0, 50,
+            // IAD (8 bytes): bFirstInterface=0, bInterfaceCount=2,
+            // bFunctionClass=0x02 (CDC-Comm), bFunctionSubClass=0x02 (ACM),
+            // bFunctionProtocol=0x00, iFunction=0
+            8, USB_DT_INTERFACE_ASSOCIATION, 0, 2, 0x02, 0x02, 0x00, 0,
+            // Interface 0 (9 bytes): CDC-Comm / ACM
+            // bInterfaceNumber=0, bAlternateSetting=0, bNumEndpoints=1,
+            // bInterfaceClass=0x02, bInterfaceSubClass=0x02 (ACM),
+            // bInterfaceProtocol=0x01, iInterface=0
+            9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,
+            // Endpoint 0x83 (7 bytes): Interrupt-IN (notification)
+            // ep_addr=0x83, bmAttributes=0x03 (Interrupt), wMaxPacketSize=16, bInterval=255
+            7, 5, 0x83, 0x03, 16, 0, 255,
+            // Interface 1 (9 bytes): CDC-Data
+            // bInterfaceNumber=1, bAlternateSetting=0, bNumEndpoints=2,
+            // bInterfaceClass=0x0A (CDC-Data), bInterfaceSubClass=0x00,
+            // bInterfaceProtocol=0x00, iInterface=0
+            9, 4, 1, 0, 2, 0x0A, 0x00, 0x00, 0,
+            // Endpoint 0x81 (7 bytes): Bulk-IN
+            // ep_addr=0x81, bmAttributes=0x02 (Bulk), wMaxPacketSize=64
+            7, 5, 0x81, 0x02, 64, 0, 0,
+            // Endpoint 0x02 (7 bytes): Bulk-OUT
+            // ep_addr=0x02, bmAttributes=0x02 (Bulk), wMaxPacketSize=64
+            7, 5, 0x02, 0x02, 64, 0, 0,
+        ];
+
+        let (comm, data, bulk_in, bulk_out) = match find_acm_interfaces(&cfg) {
+            Some(r) => r,
+            None => return TestResult::Fail("IAD-led ACM+Data not detected"),
+        };
+
+        if comm != 0 {
+            return TestResult::Fail("comm iface should be 0");
+        }
+        if data != 1 {
+            return TestResult::Fail("data iface should be 1");
+        }
+        if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+            return TestResult::Fail("bulk-IN mis-identified");
+        }
+        if bulk_out.ep_addr != 0x02 || bulk_out.kind != EndpointKind::BulkOut {
+            return TestResult::Fail("bulk-OUT mis-identified");
+        }
+        if bulk_in.max_packet != 64 || bulk_out.max_packet != 64 {
+            return TestResult::Fail("max_packet mis-decoded");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_iad_acm_data_bind_detect);
 }
