@@ -43,6 +43,8 @@ pub mod falcon;
 pub mod fb;
 pub mod fifo;
 pub mod gr;
+pub mod gsp;
+pub mod hpd;
 pub mod mc;
 pub mod mmu;
 pub mod pci;

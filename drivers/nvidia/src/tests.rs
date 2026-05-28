@@ -945,3 +945,164 @@ fn smoke_dp_dpcd_address_constants_match_spec() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/dp", smoke_dp_dpcd_address_constants_match_spec);
+
+// ────────────────────────────────────────────────────────────────
+// HPD debouncer
+// ────────────────────────────────────────────────────────────────
+
+use crate::hpd::{HpdDebouncer, HpdEvent, HpdOutcome, HpdSource, HpdState};
+
+fn smoke_hpd_idle_connect_starts_debouncing() -> TestResult {
+    let mut d = HpdDebouncer::new(HpdSource(0), 100);
+    if d.state != HpdState::Idle {
+        return TestResult::Fail("initial state must be Idle");
+    }
+    let outcome = d.handle(HpdEvent::Connect, 1000);
+    if outcome != HpdOutcome::Stable {
+        return TestResult::Fail("Idle → Connect should not fire BecameConnected yet");
+    }
+    if d.state != HpdState::Debouncing {
+        return TestResult::Fail("Connect must arm Debouncing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/hpd", smoke_hpd_idle_connect_starts_debouncing);
+
+fn smoke_hpd_debounce_window_expires_to_connected() -> TestResult {
+    let mut d = HpdDebouncer::new(HpdSource(1), 100);
+    d.handle(HpdEvent::Connect, 0);
+    // Half-way through the window: still Stable.
+    if d.poll(50) != HpdOutcome::Stable {
+        return TestResult::Fail("Halfway through window should be Stable");
+    }
+    if d.state != HpdState::Debouncing {
+        return TestResult::Fail("Halfway through window state remains Debouncing");
+    }
+    // Window expired: BecameConnected.
+    if d.poll(101) != HpdOutcome::BecameConnected {
+        return TestResult::Fail("Window expired should fire BecameConnected");
+    }
+    if d.state != HpdState::Connected {
+        return TestResult::Fail("After firing, state should be Connected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/hpd", smoke_hpd_debounce_window_expires_to_connected);
+
+fn smoke_hpd_bouncy_connect_disconnect_drops_to_idle() -> TestResult {
+    let mut d = HpdDebouncer::new(HpdSource(2), 100);
+    d.handle(HpdEvent::Connect, 0);
+    let o = d.handle(HpdEvent::Disconnect, 30);
+    if o != HpdOutcome::Stable {
+        return TestResult::Fail("Bouncy disconnect should be Stable");
+    }
+    if d.state != HpdState::Idle {
+        return TestResult::Fail("Bounce must roll back to Idle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/hpd",
+    smoke_hpd_bouncy_connect_disconnect_drops_to_idle
+);
+
+fn smoke_hpd_disconnect_from_connected_fires_becamedisconnected() -> TestResult {
+    let mut d = HpdDebouncer::new(HpdSource(3), 100);
+    d.handle(HpdEvent::Connect, 0);
+    let _ = d.poll(200);
+    if d.state != HpdState::Connected {
+        return TestResult::Fail("preconditioning to Connected");
+    }
+    let o = d.handle(HpdEvent::Disconnect, 1000);
+    if o != HpdOutcome::BecameDisconnected {
+        return TestResult::Fail("Connected → Disconnect must fire BecameDisconnected");
+    }
+    if d.state != HpdState::Idle {
+        return TestResult::Fail("Disconnect resets to Idle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/hpd",
+    smoke_hpd_disconnect_from_connected_fires_becamedisconnected
+);
+
+fn smoke_hpd_short_pulse_when_connected_emits_shortpulse() -> TestResult {
+    let mut d = HpdDebouncer::new(HpdSource(4), 50);
+    d.handle(HpdEvent::Connect, 0);
+    let _ = d.poll(100);
+    let o = d.handle(HpdEvent::ShortPulse, 500);
+    if o != HpdOutcome::ShortPulse {
+        return TestResult::Fail("ShortPulse on Connected must emit ShortPulse");
+    }
+    if d.state != HpdState::Connected {
+        return TestResult::Fail("ShortPulse does not transition state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/hpd",
+    smoke_hpd_short_pulse_when_connected_emits_shortpulse
+);
+
+// ────────────────────────────────────────────────────────────────
+// GSP (Turing+)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gsp::{Gsp, GspRpcFn, GspRpcRing, FBIF_OFFSET, WPR2_HI_SCRATCH};
+
+fn smoke_gsp_present_only_on_turing_plus() -> TestResult {
+    if !Gsp::family_has_gsp(ChipFamily::Turing) {
+        return TestResult::Fail("Turing has GSP");
+    }
+    if !Gsp::family_has_gsp(ChipFamily::Ampere) {
+        return TestResult::Fail("Ampere has GSP");
+    }
+    if !Gsp::family_has_gsp(ChipFamily::Ada) {
+        return TestResult::Fail("Ada has GSP");
+    }
+    if Gsp::family_has_gsp(ChipFamily::Pascal) {
+        return TestResult::Fail("Pascal does NOT have GSP");
+    }
+    if Gsp::family_has_gsp(ChipFamily::Maxwell) {
+        return TestResult::Fail("Maxwell does NOT have GSP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_present_only_on_turing_plus);
+
+fn smoke_gsp_register_constants_pinned() -> TestResult {
+    if WPR2_HI_SCRATCH != 0x001F_A828 {
+        return TestResult::Fail("WPR2_HI_SCRATCH offset must match tu102.c line 0x1fa828");
+    }
+    if FBIF_OFFSET != 0x0000_0600 {
+        return TestResult::Fail("FBIF offset wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_register_constants_pinned);
+
+fn smoke_gsp_rpc_ring_empty_full_invariants() -> TestResult {
+    let mut r = GspRpcRing::new(0x1000_0000, 4096);
+    if !r.is_empty() {
+        return TestResult::Fail("fresh ring must be empty");
+    }
+    if r.is_full(64) {
+        return TestResult::Fail("fresh ring is not full");
+    }
+    // Wrap-around full check: wptr just before rptr.
+    r.wptr = 4096 - 64;
+    r.rptr = 4096 - 128;
+    if r.is_empty() {
+        return TestResult::Fail("filled ring is not empty");
+    }
+    // RPC function-id table — Nop is 0x0001, AllocRoot is 0x0003.
+    if GspRpcFn::Nop as u32 != 0x0001 {
+        return TestResult::Fail("Nop RPC fn id mismatches Nouveau");
+    }
+    if GspRpcFn::AllocRoot as u32 != 0x0003 {
+        return TestResult::Fail("AllocRoot RPC fn id mismatches Nouveau");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_ring_empty_full_invariants);
