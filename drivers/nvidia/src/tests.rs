@@ -1652,6 +1652,81 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// Live VBLANK + page-flip (item 14)
+// ────────────────────────────────────────────────────────────────
+
+use crate::flip::stage_flip;
+
+fn smoke_flip_stage_flip_writes_offset_and_update() -> TestResult {
+    let mut buf = [0u8; 32];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_flip(&mut pb, 0, 0x1234_5600).unwrap();
+        pb.len()
+    };
+    // 2 blocks, 1 word each → 8 + 8 = 16 bytes.
+    if pb_len != 16 {
+        return TestResult::Fail("flip should emit 16 bytes");
+    }
+    // First data word: HEAD_SET_OFFSET data = fb_offset_bytes >> 8.
+    let off = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if off != (0x1234_5600u32 >> 8) {
+        return TestResult::Fail("OFFSET data should be fb_phys >> 8");
+    }
+    // Second block: UPDATE method.
+    let hdr_upd = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    use crate::disp::nv50::NV507D_UPDATE;
+    if hdr_upd & 0xFFFF != NV507D_UPDATE as u32 {
+        return TestResult::Fail("second block should be UPDATE");
+    }
+    if (hdr_upd >> 16) & 0x1FFF != 1 {
+        return TestResult::Fail("UPDATE has 1 data word");
+    }
+    let upd_data = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if upd_data != 0 {
+        return TestResult::Fail("interlock should be 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/flip",
+    smoke_flip_stage_flip_writes_offset_and_update
+);
+
+fn smoke_flip_queue_present_then_vblank_round_trip() -> TestResult {
+    let q = FlipQueue::new();
+    let r = FlipRequest {
+        fb_phys: 0x4000_0000,
+        pitch: 1920 * 4,
+        format: 0x4,
+        seqno: 0xDEAD_BEEF_0042,
+    };
+    if !q.enqueue(&r) {
+        return TestResult::Fail("first enqueue should succeed");
+    }
+    // Second enqueue rejected.
+    if q.enqueue(&r) {
+        return TestResult::Fail("second enqueue should be rejected");
+    }
+    // on_vblank pops the request.
+    match q.on_vblank(100) {
+        Some(s) if s == r.seqno => {}
+        _ => return TestResult::Fail("on_vblank should return enqueued seqno"),
+    }
+    if q.has_pending() {
+        return TestResult::Fail("queue empty after VBLANK fire");
+    }
+    if q.vblank_counter() != 100 {
+        return TestResult::Fail("vblank counter advanced");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/flip",
+    smoke_flip_queue_present_then_vblank_round_trip
+);
+
+// ────────────────────────────────────────────────────────────────
 // BIOS connector-table parse (item 13)
 // ────────────────────────────────────────────────────────────────
 

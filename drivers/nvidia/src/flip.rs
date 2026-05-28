@@ -102,3 +102,139 @@ pub const HEAD_INTR_VBLANK: u32 = 1 << 4;
 pub const HEAD_INTR_STATUS: u64 = 0x0000_0090;
 /// HEAD IRQ-enable register offset within a HEAD block.
 pub const HEAD_INTR_ENABLE: u64 = 0x0000_0094;
+
+// ── Live page-flip helpers (item 14) ─────────────────────────────
+//
+// Cite `dispnv50/wndw.c::nv50_wndw_atomic_update` + `core507d.c::
+// core507d_update`. The flip pushes a HEAD_SET_OFFSET update on the
+// disp-core channel, then kicks the disp doorbell, which makes the
+// new scanout pointer live on the next VBLANK boundary.
+//
+// We expose:
+// - `stage_flip` — stage the offset write + UPDATE method into a
+//   pushbuffer.
+// - `kick_flip` — write the new PUT pointer to the channel MMIO.
+// - `drain_completed` — VBLANK IRQ handler entrypoint; drains the
+//   pending request, returning the seqno (or None when no flip was
+//   queued for this VBLANK).
+//
+// `present_now` is the convenience that wraps stage_flip + kick.
+
+/// Stage a flip: HEAD_SET_OFFSET + UPDATE. Cite
+/// `dispnv50/head507d.c::head507d_core_set` for the OFFSET write
+/// shape (`fb_offset_bytes >> 8`).
+pub fn stage_flip(
+    pb: &mut crate::pb::PbBuilder<'_>,
+    head: u8,
+    fb_phys: u64,
+) -> Result<(), crate::pb::PbError> {
+    use crate::disp::nv50::{head_method, NV507D_HEAD_SET_OFFSET, NV507D_UPDATE};
+    // 1. Programme the new scanout offset.
+    pb.write_inc(
+        head_method(NV507D_HEAD_SET_OFFSET, head),
+        &[(fb_phys >> 8) as u32],
+    )?;
+    // 2. UPDATE method, interlock = 0.
+    pb.write_inc(NV507D_UPDATE, &[0])?;
+    Ok(())
+}
+
+/// Ring the disp doorbell to make the just-staged flip live.
+/// Cite `dispnv50/disp.c::nv50_dmac_kick`.
+///
+/// # Safety
+/// `chan_mmio` is the disp-core channel user-MMIO window.
+/// `put_byte_offset` is the byte position of the next free word
+/// in the channel pushbuffer (i.e. the value the host wants the
+/// hardware's GET pointer to chase up to).
+pub unsafe fn kick_flip(
+    chan_mmio: &narf_driver_runtime::MmioRegion,
+    put_byte_offset: u32,
+) {
+    // SAFETY: caller's responsibility.
+    unsafe {
+        crate::disp::nv50::doorbell_kick(chan_mmio, put_byte_offset);
+    }
+}
+
+/// Convenience: stage + kick. `pb_byte_base` is the byte offset
+/// within the channel's circular pushbuffer where this flip's
+/// methods start; `pb_byte_base + pb.len()` is the new PUT.
+///
+/// # Safety
+/// As for `kick_flip` plus exclusive access to `pb`.
+pub unsafe fn present_now(
+    chan_mmio: &narf_driver_runtime::MmioRegion,
+    pb: &mut crate::pb::PbBuilder<'_>,
+    pb_byte_base: u32,
+    head: u8,
+    fb_phys: u64,
+) -> Result<u32, crate::pb::PbError> {
+    stage_flip(pb, head, fb_phys)?;
+    let put = pb_byte_base + pb.len() as u32;
+    // SAFETY: caller's responsibility.
+    unsafe {
+        kick_flip(chan_mmio, put);
+    }
+    Ok(put)
+}
+
+impl FlipQueue {
+    /// IRQ handler entry. Reads the HEAD VBLANK status bit; if set,
+    /// drains the pending flip and returns its seqno + the new
+    /// VBLANK counter.
+    ///
+    /// # Safety
+    /// `bar0` is the kernel-mapped BAR0 view; `head_offset` is the
+    /// HEAD base (per `disp::nv50::head_base(i)`). Exclusive access.
+    pub unsafe fn drain_completed(
+        &self,
+        bar0: &narf_driver_runtime::MmioRegion,
+        head_offset: u64,
+        frame_counter: u64,
+    ) -> Option<u64> {
+        // SAFETY: caller's responsibility.
+        let intr_status = unsafe { bar0.read32(head_offset + HEAD_INTR_STATUS) };
+        if intr_status & HEAD_INTR_VBLANK == 0 {
+            return None;
+        }
+        // Acknowledge the IRQ by writing the same bit back.
+        // SAFETY: same.
+        unsafe {
+            bar0.write32(head_offset + HEAD_INTR_STATUS, HEAD_INTR_VBLANK);
+        }
+        self.on_vblank(frame_counter)
+    }
+
+    /// Enable VBLANK IRQ on the specified HEAD.
+    ///
+    /// # Safety
+    /// `bar0` is the BAR0 view; `head_offset` is the HEAD base.
+    pub unsafe fn enable_vblank(
+        &self,
+        bar0: &narf_driver_runtime::MmioRegion,
+        head_offset: u64,
+    ) {
+        // SAFETY: caller's responsibility.
+        unsafe {
+            let en = bar0.read32(head_offset + HEAD_INTR_ENABLE);
+            bar0.write32(head_offset + HEAD_INTR_ENABLE, en | HEAD_INTR_VBLANK);
+        }
+    }
+
+    /// Disable VBLANK IRQ.
+    ///
+    /// # Safety
+    /// Same.
+    pub unsafe fn disable_vblank(
+        &self,
+        bar0: &narf_driver_runtime::MmioRegion,
+        head_offset: u64,
+    ) {
+        // SAFETY: caller's responsibility.
+        unsafe {
+            let en = bar0.read32(head_offset + HEAD_INTR_ENABLE);
+            bar0.write32(head_offset + HEAD_INTR_ENABLE, en & !HEAD_INTR_VBLANK);
+        }
+    }
+}
