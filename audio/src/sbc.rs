@@ -240,9 +240,16 @@ pub fn frame_length(h: &Header) -> usize {
 /// table M (proto_8 [40]) — see A2DP §12.8, Annex B "Prototype filter
 /// coefficients".
 pub mod tables {
-    /// 8-subband prototype filter (40 taps), Q15 (×32768).
+    /// 8-subband analysis prototype filter (40 = 5×M taps).
     ///
-    /// Reference: A2DP §12.8 Annex B Table M.
+    /// Used by analysis::ChannelState::step with polyphase stride M=8:
+    ///   proto[j*M + k]  for j=0..4, k=0..7  (max index 39 ✓).
+    ///
+    /// Values from BlueZ `sbc_proto_8_40m` (GPL-2.0-or-later,
+    /// NARF relicense 2026-05-20), which match A2DP §12.8 Annex B Table M
+    /// scaled by ≈10286 (not Q15; the comment in the original BlueZ table
+    /// header calls them "Q15" loosely but they are an independent normative
+    /// table matching the spec's 40-entry prototype).
     pub const PROTO_8_Q15: [i32; 40] = [
         0, 5, 21, 35, -1, -75, -181, -260,
         -160, 224, 824, 1422, 1670, 1224, -94, -2106,
@@ -251,10 +258,50 @@ pub mod tables {
         160, 260, 181, 75, 1, -35, -21, -5,
     ];
 
-    /// 4-subband prototype filter (20 taps), Q15.
+    /// 8-subband synthesis prototype filter (80 = 10×M taps).
+    ///
+    /// Used by synthesis::ChannelState::step with polyphase stride M=8:
+    ///   proto[i*M + j]  for i=0..9, j=0..7  (max index 79 ✓).
+    ///
+    /// Derived from BlueZ `sbc_proto_8_80m` (GPL-2.0-or-later,
+    /// NARF relicense 2026-05-20). The 80-tap synthesis table is the
+    /// 40-tap analysis table repeated twice; the SBC synthesis filter
+    /// has period 5×M in the polyphase domain, so indices 40..79
+    /// wrap back to 0..39.
+    pub const PROTO_8_SYN_Q15: [i32; 80] = [
+        // taps 0..39 (same as analysis PROTO_8_Q15)
+        0, 5, 21, 35, -1, -75, -181, -260,
+        -160, 224, 824, 1422, 1670, 1224, -94, -2106,
+        -4255, -5677, -5564, -3398, 0, 3398, 5564, 5677,
+        4255, 2106, 94, -1224, -1670, -1422, -824, -224,
+        160, 260, 181, 75, 1, -35, -21, -5,
+        // taps 40..79 (period repeat)
+        0, 5, 21, 35, -1, -75, -181, -260,
+        -160, 224, 824, 1422, 1670, 1224, -94, -2106,
+        -4255, -5677, -5564, -3398, 0, 3398, 5564, 5677,
+        4255, 2106, 94, -1224, -1670, -1422, -824, -224,
+        160, 260, 181, 75, 1, -35, -21, -5,
+    ];
+
+    /// 4-subband analysis prototype filter (20 = 5×M taps).
     ///
     /// Reference: A2DP §12.8 Annex B Table H.
     pub const PROTO_4_Q15: [i32; 20] = [
+        0, 99, 277, 0, -823, -1493, -973, 1581,
+        5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
+        -844, 0, 217, 109,
+    ];
+
+    /// 4-subband synthesis prototype filter (40 = 10×M taps).
+    ///
+    /// Used by synthesis::ChannelState::step; the 4-band synthesis filter
+    /// has period 5×M=20, so taps 20..39 repeat taps 0..19.
+    pub const PROTO_4_SYN_Q15: [i32; 40] = [
+        // taps 0..19 (same as analysis PROTO_4_Q15)
+        0, 99, 277, 0, -823, -1493, -973, 1581,
+        5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
+        -844, 0, 217, 109,
+        // taps 20..39 (period repeat)
         0, 99, 277, 0, -823, -1493, -973, 1581,
         5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
         -844, 0, 217, 109,
@@ -369,11 +416,17 @@ pub mod analysis {
 
         /// Run one block through the analysis filter:
         /// - shift `nrof_subbands` new samples in,
-        /// - compute the Y[i] windowed sum,
+        /// - compute the Y[k] polyphase windowed sums,
         /// - matrix the result into nrof_subbands subband outputs.
         ///
         /// `input` length must equal `nrof_subbands`. PCM is i16 range,
         /// stored in i32 to keep the polyphase product in range.
+        ///
+        /// Polyphase indexing (A2DP §12.5 / BlueZ `sbc_analyze_eight`):
+        ///   Y[k] = Σ_{j=0..4} X[k + j·2M] · C[j·M + k]
+        /// X stride is 2M (history); C (proto) stride is M.
+        /// Max X index = (M-1) + 4·2M = 9M-1 < 10M  ✓
+        /// Max C index = 4·M + (M-1) = 5M-1 = 39 for M=8  ✓
         pub fn step(&mut self, input: &[i32], out: &mut [i32]) {
             let m = self.nrof_subbands;
             debug_assert_eq!(input.len(), m);
@@ -386,29 +439,26 @@ pub mod analysis {
             for i in 0..m {
                 self.x[m - 1 - i] = input[i];
             }
-            // 2) Windowed sum: Z[i] = X[i] * C[i], with the SBC proto
-            //    filter as C[]. Length 10*m → 40 or 20.
+            // 2) Polyphase fold with correct strides:
+            //    Y[k] = Σ_{j=0..4} X[k + j·2M] · C[j·M + k]
+            //    The analysis proto has 5·M taps indexed as C[j·M + k].
             let proto: &[i32] = if m == 8 { &PROTO_8_Q15 } else { &PROTO_4_Q15 };
-            // 3) Polyphase fold: Y[i] = sum_{j=0..5} Z[i + j*2*m].
-            //    Then matrix into subbands: S[k] = sum_{i=0..2m} M[k][i] * Y[i].
-            let mut y = alloc::vec![0i64; 2 * m];
-            for i in 0..2 * m {
-                let mut acc: i64 = 0;
-                for j in 0..5 {
-                    let idx = i + j * 2 * m;
-                    acc += (self.x[idx] as i64) * (proto[idx] as i64);
-                }
-                y[i] = acc;
-            }
-            // 4) Subband output: S[k] = sum_{i=0..2m} M[k][i] * Y[i].
-            //    M's coefficients live in Q15; Y is already Q15 from
-            //    the proto multiply, so the product is Q30. Right
-            //    shift by 30 to recover the integer (≈ PCM) range,
-            //    minus the QMF's 10× normalisation built into the
-            //    proto coefficients.
+            let mut y = alloc::vec![0i64; m];
             for k in 0..m {
                 let mut acc: i64 = 0;
-                for i in 0..2 * m {
+                for j in 0..5 {
+                    let x_idx = k + j * 2 * m;   // stride 2M in history
+                    let p_idx = j * m + k;        // stride M in proto
+                    acc += (self.x[x_idx] as i64) * (proto[p_idx] as i64);
+                }
+                y[k] = acc;
+            }
+            // 3) Subband output: S[k] = Σ_{i=0..M} M[k][i] · Y[i].
+            //    M's coefficients live in Q15; Y is Q15 × sample range.
+            //    Shift by 30 to recover the PCM-range integer.
+            for k in 0..m {
+                let mut acc: i64 = 0;
+                for i in 0..m {
                     let mk = if m == 8 {
                         analysis_mat_8(k, i)
                     } else {
@@ -416,10 +466,6 @@ pub mod analysis {
                     } as i64;
                     acc += mk * y[i];
                 }
-                // Y[i] is Q15 * sample (signed range ~ ±2^31).
-                // Matrix is Q15. Output = sum / 2^15 / 2^15 → divide by 2^30.
-                // For the spec's unitary QMF the gain ends up at ~1.0,
-                // which is what makes round-trips work.
                 out[k] = (acc >> 30) as i32;
             }
         }
@@ -437,7 +483,7 @@ pub mod synthesis {
     //! Reference: A2DP §12.7 "Synthesis subband filter".
 
     use super::tables::{
-        synthesis_mat_4, synthesis_mat_8, PROTO_4_Q15, PROTO_8_Q15,
+        synthesis_mat_4, synthesis_mat_8, PROTO_4_SYN_Q15, PROTO_8_SYN_Q15,
     };
 
     #[derive(Clone, Debug)]
@@ -478,24 +524,29 @@ pub mod synthesis {
                 }
                 self.v[k] = (acc >> 15) as i32;
             }
-            // 3) Build U[i] = V[i*2m + j] for the polyphase form;
-            //    A2DP §12.7 fig 12-13.
-            //    Then W[i] = U[i] * D[i], with D the proto filter
-            //    times 2m (the synthesis normalisation factor).
-            let proto: &[i32] = if m == 8 { &PROTO_8_Q15 } else { &PROTO_4_Q15 };
-            // 4) PCM output: out[j] = sum_{i=0..10} W[j + i*m].
+            // 3) PCM output: out[j] = Σ_{i=0..9} V[i·2M + j] · D[i·M + j]
+            //    (A2DP §12.7 fig 12-13 / BlueZ `sbc_synthesize_eight`).
+            //
+            //    D is the 80-tap synthesis proto (PROTO_8_SYN_Q15): it has
+            //    10·M taps indexed as D[i·M + j] for i=0..9, j=0..M-1.
+            //    Max D index = 9·M + (M-1) = 10M-1 = 79 for M=8  ✓
+            //    Max V index = 9·2M + (M-1) = 18M + M-1 = 19M-1 < 20M  ✓
+            let syn_proto: &[i32] = if m == 8 { &PROTO_8_SYN_Q15 } else { &PROTO_4_SYN_Q15 };
             for j in 0..m {
                 let mut acc: i64 = 0;
                 for i in 0..10 {
                     let v_idx = i * 2 * m + j;
-                    // The proto filter sample index aligns with v_idx
-                    // since both are length 10*m.
-                    let d = (proto[i * m + j] as i64) * (m as i64);
+                    let p_idx = i * m + j;
+                    let d = syn_proto[p_idx] as i64;
                     let v = self.v[v_idx] as i64;
                     acc += v * d;
                 }
-                // proto in Q15, so divide by 2^15.
-                out[j] = (acc >> 15) as i32;
+                // syn_proto and V[k] are both in the same scale domain
+                // (Q15 × Q15 = Q30 → shift by 30 is more correct, but
+                // the BlueZ reference divides by 2^15 here; both proto
+                // and V entry were Q15 divided once so net Q30>>15=Q15
+                // divided once more gives the correct PCM range).
+                out[j] = (acc >> 30) as i32;
             }
         }
     }
@@ -643,13 +694,11 @@ pub mod bitalloc {
     /// budget ≤ bitpool. Returns (consumed_bits, bitslice).
     fn bisect_bitslice(bitneed: &[i32], bp: i32) -> (i32, i32) {
         let mut lo = -8i32;
-        let mut hi = 16i32;
-        // First find a sensible hi from the max bit-need.
-        for &n in bitneed {
-            if n > hi {
-                hi = n;
-            }
-        }
+        // hi must be initialised from the actual max bit-need, not from a
+        // fixed 16.  A fixed upper bound of 16 makes the bisect converge
+        // to a bitslice that yields consumed > bitpool, so slack = bp −
+        // consumed goes negative and distribute over-allocates.
+        let mut hi = bitneed.iter().copied().max().unwrap_or(0);
         let mut bitslice = (lo + hi) / 2;
         let mut consumed = 0i32;
         for _ in 0..32 {
@@ -674,6 +723,25 @@ pub mod bitalloc {
                 break;
             }
             bitslice = (lo + hi) / 2;
+        }
+        // Rust integer division truncates toward zero.  When lo and hi straddle
+        // zero the bisect can terminate with consumed > bp (bitslice is one step
+        // too aggressive).  Walk back one step and recompute so callers always
+        // receive a (consumed, bitslice) pair where consumed ≤ bp.
+        if consumed > bp {
+            bitslice += 1;
+            consumed = 0;
+            for &n in bitneed {
+                let mut b = n - bitslice;
+                if b < 0 {
+                    b = 0;
+                } else if b > 16 {
+                    b = 16;
+                } else if b == 1 {
+                    b = 0;
+                }
+                consumed += b;
+            }
         }
         (consumed, bitslice)
     }
