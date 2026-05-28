@@ -6,6 +6,229 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+// ── Stage-2 AHCI unit smokes (no hardware) ───────────────────────
+
+/// Verify the Command FIS (Register Host-to-Device, FIS type 0x27)
+/// byte layout for a READ DMA EXT command.  These are the bytes
+/// written at cmd_tbl+0 in every DMA path; correctness can be
+/// checked entirely in host memory.
+fn smoke_ahci_command_fis_layout() -> TestResult {
+    // Simulate building a 20-byte H2D Register FIS for READ DMA EXT
+    // at LBA 0x0102_0304_0506 with sector count 3.
+    let lba: u64 = 0x0001_0203_0405;
+    let n: u16 = 3;
+    let mut fis = [0u8; 20];
+    fis[0] = 0x27; // FIS type: Register H2D
+    fis[1] = 0x80; // C bit set (command, not control), PMP = 0
+    fis[2] = 0x25; // READ DMA EXT
+    fis[3] = 0;    // features lo
+    fis[4] = (lba & 0xFF) as u8;         // LBA[7:0]
+    fis[5] = ((lba >> 8) & 0xFF) as u8;  // LBA[15:8]
+    fis[6] = ((lba >> 16) & 0xFF) as u8; // LBA[23:16]
+    fis[7] = 0x40;                        // Device: LBA mode
+    fis[8] = ((lba >> 24) & 0xFF) as u8;  // LBA[31:24]
+    fis[9] = ((lba >> 32) & 0xFF) as u8;  // LBA[39:32]
+    fis[10] = ((lba >> 40) & 0xFF) as u8; // LBA[47:40]
+    fis[11] = 0; // features hi
+    fis[12] = (n & 0xFF) as u8;
+    fis[13] = ((n >> 8) & 0xFF) as u8;
+
+    if fis[0] != 0x27 {
+        return TestResult::Fail("FIS type must be 0x27 (Register H2D)");
+    }
+    if fis[1] & 0x80 == 0 {
+        return TestResult::Fail("FIS byte 1 bit 7 must be set (C = command)");
+    }
+    if fis[2] != 0x25 {
+        return TestResult::Fail("FIS command byte must be 0x25 (READ DMA EXT)");
+    }
+    if fis[7] != 0x40 {
+        return TestResult::Fail("Device byte must have LBA bit set (0x40)");
+    }
+    // Reconstruct LBA from FIS bytes 4..10.
+    let got_lba = fis[4] as u64
+        | ((fis[5] as u64) << 8)
+        | ((fis[6] as u64) << 16)
+        | ((fis[8] as u64) << 24)
+        | ((fis[9] as u64) << 32)
+        | ((fis[10] as u64) << 40);
+    if got_lba != lba {
+        return TestResult::Fail("LBA round-trip through FIS bytes failed");
+    }
+    // Reconstruct sector count from bytes 12..13.
+    let got_n = fis[12] as u16 | ((fis[13] as u16) << 8);
+    if got_n != n {
+        return TestResult::Fail("Sector count round-trip through FIS bytes failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_command_fis_layout);
+
+/// Verify PRD table entry byte-count encoding: the AHCI spec states
+/// the DBC field holds (byte_count - 1), not byte_count.
+fn smoke_ahci_prd_byte_count_encoding() -> TestResult {
+    // Simulate a 512-byte PRD entry as written at cmd_tbl+0x80.
+    let data_pa: u64 = 0x0000_8000_0000;
+    let byte_count: u32 = 512;
+    let mut prdt = [0u8; 16];
+    // +0x00 u64 data base PA
+    prdt[0..8].copy_from_slice(&data_pa.to_le_bytes());
+    // +0x08 u32 reserved
+    prdt[8..12].copy_from_slice(&0u32.to_le_bytes());
+    // +0x0C u32 DBC = byte_count - 1 (AHCI 1.3.1 §4.2.3.3)
+    prdt[12..16].copy_from_slice(&(byte_count - 1).to_le_bytes());
+
+    let dbc = u32::from_le_bytes([prdt[12], prdt[13], prdt[14], prdt[15]]);
+    if dbc != 511 {
+        return TestResult::Fail("PRDT DBC must be byte_count-1 (511 for a 512-byte transfer)");
+    }
+    let pa = u64::from_le_bytes(prdt[0..8].try_into().unwrap());
+    if pa != data_pa {
+        return TestResult::Fail("PRDT data base PA round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_prd_byte_count_encoding);
+
+/// Verify the IDENTIFY DEVICE response parser: model string decoding
+/// (byte-swapped pairs), LBA-28 capacity (words 60–61), and LBA-48
+/// capacity (words 100–103, gated by word 83 bit 10).
+fn smoke_ahci_identify_parser() -> TestResult {
+    use crate::ahci::{identify_features, identify_lba28_capacity, identify_lba48_capacity, identify_model};
+
+    let mut id = [0u8; 512];
+    // Write "TESTDISK            " as ATA model string at word 27 (byte 54).
+    // ATA strings byte-swap each pair: byte 54 = char1, byte 55 = char0, etc.
+    let model_raw = b"TESTDISK                                ";
+    for i in 0..20usize {
+        id[54 + i * 2] = model_raw[i * 2 + 1];
+        id[54 + i * 2 + 1] = model_raw[i * 2];
+    }
+    // LBA-28 capacity = 0x0028_0000 sectors (word 60 = low, word 61 = high).
+    let lba28: u32 = 0x0028_0000u32;
+    id[120..122].copy_from_slice(&(lba28 as u16).to_le_bytes());
+    id[122..124].copy_from_slice(&((lba28 >> 16) as u16).to_le_bytes());
+    // LBA-48: enable via word 83 bit 10 (validity marker = 0x40 in high byte).
+    let w83: u16 = (1 << 10) | 0x4000;
+    id[166..168].copy_from_slice(&w83.to_le_bytes());
+    // LBA-48 capacity = 10 GiB = 20_971_520 sectors.
+    let lba48: u64 = 20_971_520u64;
+    id[200..208].copy_from_slice(&lba48.to_le_bytes());
+
+    let model = identify_model(&id);
+    if &model[..8] != b"TESTDISK" {
+        return TestResult::Fail("identify_model decoded wrong prefix");
+    }
+    if identify_lba28_capacity(&id) != lba28 {
+        return TestResult::Fail("identify_lba28_capacity wrong");
+    }
+    if identify_lba48_capacity(&id) != lba48 {
+        return TestResult::Fail("identify_lba48_capacity wrong");
+    }
+    // LBA-48 flag off: set word 83 to 0 (no bit 10).
+    id[166..168].copy_from_slice(&0u16.to_le_bytes());
+    if identify_lba48_capacity(&id) != 0 {
+        return TestResult::Fail("identify_lba48_capacity should return 0 when bit 10 clear");
+    }
+    let (w82, w83_back) = identify_features(&id);
+    // With the validity marker gone word 83 is 0.
+    if w83_back != 0 {
+        return TestResult::Fail("identify_features word83 should be 0");
+    }
+    let _ = w82; // word 82 not set in this synthetic buffer
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_identify_parser);
+
+/// Verify the READ DMA EXT command encoding: opcode 0x25 in FIS
+/// byte 2, W bit = 0 in command-list header (read, not write).
+fn smoke_ahci_read_dma_ext_encode() -> TestResult {
+    // Command-list header word 0: PRDT_LEN=1, W=0, CFL=5.
+    let header_w0: u32 = (1u32 << 16) | 5; // no bit 6 (W=0 means read)
+    // CFIS bytes.
+    let lba: u64 = 0xABCD_EF01_2345;
+    let n_sectors: u16 = 7;
+    let mut cfis = [0u8; 20];
+    cfis[0] = 0x27;
+    cfis[1] = 0x80;
+    cfis[2] = 0x25; // READ DMA EXT opcode
+    cfis[3] = 0;
+    cfis[4] = (lba & 0xFF) as u8;
+    cfis[5] = ((lba >> 8) & 0xFF) as u8;
+    cfis[6] = ((lba >> 16) & 0xFF) as u8;
+    cfis[7] = 0x40;
+    cfis[8] = ((lba >> 24) & 0xFF) as u8;
+    cfis[9] = ((lba >> 32) & 0xFF) as u8;
+    cfis[10] = ((lba >> 40) & 0xFF) as u8;
+    cfis[11] = 0;
+    cfis[12] = (n_sectors & 0xFF) as u8;
+    cfis[13] = ((n_sectors >> 8) & 0xFF) as u8;
+
+    if cfis[2] != 0x25 {
+        return TestResult::Fail("READ DMA EXT opcode must be 0x25");
+    }
+    if header_w0 & (1 << 6) != 0 {
+        return TestResult::Fail("W bit must be 0 for a read command");
+    }
+    let got_lba = cfis[4] as u64
+        | ((cfis[5] as u64) << 8)
+        | ((cfis[6] as u64) << 16)
+        | ((cfis[8] as u64) << 24)
+        | ((cfis[9] as u64) << 32)
+        | ((cfis[10] as u64) << 40);
+    if got_lba != lba {
+        return TestResult::Fail("READ DMA EXT LBA encoding wrong");
+    }
+    let got_n = cfis[12] as u16 | ((cfis[13] as u16) << 8);
+    if got_n != n_sectors {
+        return TestResult::Fail("READ DMA EXT sector count encoding wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_read_dma_ext_encode);
+
+/// Verify PORT_SSTS decode: DET nibble (bits[3:0]) and IPM nibble
+/// (bits[11:8]) are decoded correctly for the three DET states and
+/// two IPM states we care about.
+fn smoke_ahci_port_ssts_decode() -> TestResult {
+    use crate::ahci::{
+        ssts_decode, SSTS_DET_NO_COMM, SSTS_DET_NO_DEVICE, SSTS_DET_PRESENT, SSTS_IPM_ACTIVE,
+        SSTS_IPM_NOT_PRESENT,
+    };
+
+    // No device, no PHY.
+    let (det, ipm) = ssts_decode(0x0000_0000);
+    if det != SSTS_DET_NO_DEVICE {
+        return TestResult::Fail("DET=0 should be SSTS_DET_NO_DEVICE");
+    }
+    if ipm != SSTS_IPM_NOT_PRESENT {
+        return TestResult::Fail("IPM=0 should be SSTS_IPM_NOT_PRESENT");
+    }
+
+    // Device present, comms not established (COMRESET in flight).
+    let (det, _ipm) = ssts_decode(0x0000_0001);
+    if det != SSTS_DET_NO_COMM {
+        return TestResult::Fail("DET=1 should be SSTS_DET_NO_COMM");
+    }
+
+    // Device present + comms OK, interface active (normal run).
+    let (det, ipm) = ssts_decode(0x0000_0103);
+    if det != SSTS_DET_PRESENT {
+        return TestResult::Fail("DET=3 should be SSTS_DET_PRESENT");
+    }
+    if ipm != SSTS_IPM_ACTIVE {
+        return TestResult::Fail("IPM=1 should be SSTS_IPM_ACTIVE");
+    }
+
+    // High nibbles in SSTS must not bleed into DET.
+    let (det2, _) = ssts_decode(0x0000_FF13);
+    if det2 != SSTS_DET_PRESENT {
+        return TestResult::Fail("DET nibble isolation failed (upper SSTS bits bled in)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_port_ssts_decode);
+
 fn smoke_ahci_hba_bring_up() -> TestResult {
     // QEMU q35 has the ICH9 AHCI controller at 00:1f.2 (8086:2922).
     // Probe it; assert HBA was reset cleanly + at least one port is

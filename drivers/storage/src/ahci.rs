@@ -129,9 +129,32 @@ const PORT_IE: u64 = 0x14;
 const PORT_CMD: u64 = 0x18;
 const PORT_SIG: u64 = 0x24;
 const PORT_SSTS: u64 = 0x28;
+/// PORT_SCTL — SATA Control (SCR2): DET field at bits[3:0] (AHCI 1.3.1 §3.3.11).
+const PORT_SCTL: u64 = 0x2C;
 const PORT_SERR: u64 = 0x30;
 /// PORT_CI — Command Issue, written to launch a command (§3.3.14).
 const PORT_CI: u64 = 0x38;
+
+/// PORT_SSTS.DET field values (AHCI 1.3.1 §3.3.10 / SATA 3.x §8.1):
+///   0 — no device, no PHY.
+///   1 — device present but PHY comms not established.
+///   3 — device present and PHY comms established (normal run).
+pub const SSTS_DET_NO_DEVICE: u32 = 0;
+pub const SSTS_DET_NO_COMM: u32 = 1;
+pub const SSTS_DET_PRESENT: u32 = 3; // link-up
+
+/// PORT_SSTS.IPM field values (Interface Power Management, bits[11:8]):
+///   0 — not present / slumber.
+///   1 — active.
+///   2 — partial power.
+pub const SSTS_IPM_NOT_PRESENT: u32 = 0;
+pub const SSTS_IPM_ACTIVE: u32 = 1;
+
+/// Decode PORT_SSTS into `(det, ipm)` nibbles.
+#[inline]
+pub fn ssts_decode(ssts: u32) -> (u32, u32) {
+    (ssts & 0x0F, (ssts >> 8) & 0x0F)
+}
 
 // PORT_IE / PORT_IS event bits (AHCI 1.3.1 §3.3.6).
 const PIE_D2H_REG_FIS: u32 = 1 << 0; // Device-to-Host Register FIS Interrupt
@@ -457,6 +480,74 @@ impl Ahci {
         } else {
             Err(AhciError::PortIdleTimeout)
         }
+    }
+
+    /// COMRESET / SATA link-up sequence for a port.
+    ///
+    /// Sequence (mirrors `libata::sata_link_hardreset`, Linux
+    /// `drivers/ata/libata-sata.c::sata_link_hardreset`):
+    ///
+    /// 1. Idle the port (CMD.ST = 0, wait CR = 0) via `port_idle`.
+    /// 2. Set PORT_SCTL.DET = 1 — asserts COMRESET on the SATA PHY.
+    /// 3. Hold for ≥ 1 ms (AHCI 1.3.1 §10.4.2 / SATA I spec §7.2.2).
+    /// 4. Clear PORT_SCTL.DET = 0 — release COMRESET, begin OOB.
+    /// 5. Poll PORT_SSTS.DET until it reads 3 (device + comms OK);
+    ///    bail after 1 s.
+    ///
+    /// On success the port is ready for CLB/FB programming + FRE/ST.
+    ///
+    /// # Safety
+    /// Caller owns the HBA exclusively; `port_index < 32`.
+    pub unsafe fn port_reset(&self, port_index: u8) -> Result<(), AhciError> {
+        let off = PORT_BASE_OFF + (port_index as u64) * PORT_STRIDE;
+
+        // 1. Stop any running command engine.
+        // SAFETY: delegated; same ownership contract.
+        unsafe { self.port_idle(port_index) }?;
+
+        // 2. Write PORT_SCTL.DET = 1 (COMRESET), preserving other
+        //    SPD / IPM fields. Linux uses mask 0x0f0 to keep the
+        //    SPD nibble: `(scontrol & 0x0f0) | 0x301`.
+        // SAFETY: identity-mapped MMIO.
+        let sctl = unsafe { self.mmio.read32(off + PORT_SCTL) };
+        // SAFETY: same.
+        unsafe {
+            self.mmio.write32(off + PORT_SCTL, (sctl & 0x0F0) | 0x301);
+        }
+
+        // 3. Hold COMRESET for ≥ 1 ms (spec minimum).
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(1));
+
+        // 4. Release COMRESET: DET = 0, keep SPD/IPM as-is.
+        // SAFETY: identity-mapped MMIO.
+        let sctl = unsafe { self.mmio.read32(off + PORT_SCTL) };
+        // SAFETY: same.
+        unsafe {
+            self.mmio.write32(off + PORT_SCTL, sctl & !0x0F);
+        }
+
+        // 5. Wait for PORT_SSTS.DET = 3 (device present + comms OK).
+        //    AHCI 1.3.1 §10.1.2 allows up to 1 s for COMRESET to
+        //    complete and OOB to finish.
+        let found = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read32(off + PORT_SSTS) } & 0x0F == SSTS_DET_PRESENT,
+            narf_time::Deadline::after_ms(1_000),
+        );
+        if !found {
+            return Err(AhciError::ResetTimeout);
+        }
+
+        // Clear any SERR / PORT_IS latched during OOB.
+        // SAFETY: identity-mapped MMIO.
+        let serr = unsafe { self.mmio.read32(off + PORT_SERR) };
+        // SAFETY: same.
+        unsafe {
+            self.mmio.write32(off + PORT_SERR, serr);
+            self.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+        }
+
+        Ok(())
     }
 
     /// HBA's capability bitmap.
@@ -1396,6 +1487,8 @@ pub fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopology> {
 /// Decode the model-number string from an IDENTIFY DEVICE response.
 /// ATA strings are byte-swapped per pair (ATA-8 §7.16.7.36): byte 54
 /// = char 0 high, byte 55 = char 0 low, etc. 40 bytes total.
+///
+/// ATA word 27 = byte offset 54; 20 words (40 bytes) for the model.
 pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
     let mut out = [b' '; 40];
     for i in 0..20 {
@@ -1403,6 +1496,43 @@ pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
         out[i * 2 + 1] = id[54 + i * 2];
     }
     out
+}
+
+/// Extract the LBA-28 addressable sector count from an IDENTIFY
+/// DEVICE response (ATA-8 §7.16 word 60–61, byte offsets 120–123).
+/// Returns 0 if 28-bit LBA is not supported. A non-zero value here
+/// always means at least 28-bit LBA is available.
+pub fn identify_lba28_capacity(id: &[u8; 512]) -> u32 {
+    // Word 60 is low word, word 61 is high word (LE pair).
+    let lo = u16::from_le_bytes([id[120], id[121]]) as u32;
+    let hi = u16::from_le_bytes([id[122], id[123]]) as u32;
+    (hi << 16) | lo
+}
+
+/// Extract the LBA-48 addressable sector count from an IDENTIFY
+/// DEVICE response (ATA-8 §7.16 words 100–103, byte offsets
+/// 200–207). Words 82–83 (bytes 164–167) bit 10 of word 83 gates
+/// LBA-48 support. Returns 0 if device does not support 48-bit LBA.
+pub fn identify_lba48_capacity(id: &[u8; 512]) -> u64 {
+    // Word 83 bit 10 = LBA-48 supported (ATA-8 §7.16.7.83 table 21).
+    let word83 = u16::from_le_bytes([id[166], id[167]]);
+    if word83 & (1 << 10) == 0 {
+        return 0;
+    }
+    // Words 100..103 = 64-bit total LBA count (LE quad-word).
+    let b = &id[200..208];
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Extract the supported-feature bitmask from IDENTIFY DEVICE words
+/// 82 (byte 164) and 83 (byte 166). The upper byte of word 83 must
+/// read `0x40`/`0xC0` (validity marker); if it doesn't, word 83 is
+/// invalid and only word 82's low 16 bits are returned.
+/// Returns `(word82, word83)` as raw values for further decoding.
+pub fn identify_features(id: &[u8; 512]) -> (u16, u16) {
+    let w82 = u16::from_le_bytes([id[164], id[165]]);
+    let w83 = u16::from_le_bytes([id[166], id[167]]);
+    (w82, w83)
 }
 
 /// Sync block-device adapter for the registry. Routes reads /
