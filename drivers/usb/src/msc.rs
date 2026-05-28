@@ -20,14 +20,17 @@
 //!      data stage — TEST UNIT READY, etc.).
 //!   3. **CSW** (Command Status Wrapper, 13 bytes, `bulk-IN`).
 //!
-//! ## Stage-5 cut
+//! ## Implemented command set
 //!
-//! - INQUIRY (5 bytes) → INQUIRY data (36 bytes)
-//! - READ CAPACITY(10) → 8 bytes (last LBA + block size)
-//! - READ(10) / WRITE(10) for a single 512-byte block
+//! - TEST UNIT READY (0x00) — probe readiness
+//! - REQUEST SENSE (0x03) — 18-byte fixed-format sense on error
+//! - INQUIRY (0x12) — vendor / product / revision
+//! - START STOP UNIT (0x1B) — spin up / down / eject
+//! - READ CAPACITY(10) (0x25) — last LBA + block size
+//! - READ(10) (0x28) / WRITE(10) (0x2A) — single and multi-block
 //!
-//! Multi-block transfers, error recovery (Reset Recovery, §5.3),
-//! and the LUN > 0 path are still follow-ups.
+//! Multi-LUN (LUN > 0), Reset Recovery (§5.3), and UAS (USB
+//! Attached SCSI) are deferred.
 
 use alloc::vec::Vec;
 
@@ -56,10 +59,58 @@ const CBW_FLAG_IN: u8 = 0x80;
 
 /// SCSI opcodes we issue.
 const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_REQUEST_SENSE: u8 = 0x03;
 const SCSI_INQUIRY: u8 = 0x12;
+const SCSI_START_STOP_UNIT: u8 = 0x1B;
 const SCSI_READ_CAPACITY_10: u8 = 0x25;
 const SCSI_READ_10: u8 = 0x28;
 const SCSI_WRITE_10: u8 = 0x2A;
+
+/// Decoded standard INQUIRY response (SPC-4 §6.5 Table 82).
+/// Vendor (8 bytes), product (16 bytes), and revision (4 bytes)
+/// are space-padded ASCII in the wire format; we trim trailing
+/// whitespace before storing them here.
+#[derive(Clone, Debug)]
+pub struct InquiryData {
+    /// Peripheral Device Type (bits[4:0] of byte 0; 0 = Direct Access).
+    pub peripheral_type: u8,
+    /// Removable Medium Bit (bit 7 of byte 1).
+    pub removable: bool,
+    /// Vendor identification string (at most 8 printable ASCII chars).
+    pub vendor: alloc::string::String,
+    /// Product identification string (at most 16 printable ASCII chars).
+    pub product: alloc::string::String,
+    /// Product revision level (at most 4 printable ASCII chars).
+    pub revision: alloc::string::String,
+}
+
+impl InquiryData {
+    /// Decode a 36-byte standard INQUIRY response buffer. Returns
+    /// `None` if the buffer is shorter than 36 bytes.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 36 {
+            return None;
+        }
+        let peripheral_type = buf[0] & 0x1F;
+        let removable = buf[1] & 0x80 != 0;
+        let vendor = alloc::string::String::from(
+            core::str::from_utf8(&buf[8..16]).unwrap_or("").trim_end(),
+        );
+        let product = alloc::string::String::from(
+            core::str::from_utf8(&buf[16..32]).unwrap_or("").trim_end(),
+        );
+        let revision = alloc::string::String::from(
+            core::str::from_utf8(&buf[32..36]).unwrap_or("").trim_end(),
+        );
+        Some(InquiryData {
+            peripheral_type,
+            removable,
+            vendor,
+            product,
+            revision,
+        })
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MscError {
@@ -274,9 +325,40 @@ impl MscDevice {
     /// `TEST UNIT READY` (SBC-3 §5.34). 6-byte command, no data.
     /// Returns `Ok(())` if the device is ready to handle media
     /// access; a CSW status of 1 means the device wants the host
-    /// to call REQUEST SENSE (not implemented here — Stage-5 cut).
+    /// to call REQUEST SENSE.
     pub async fn test_unit_ready(&self, xhci: &Xhci) -> Result<(), MscError> {
         self.cmd_no_data(xhci, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0]).await
+    }
+
+    /// `REQUEST SENSE` (SPC-4 §6.28). Returns a fixed-format sense
+    /// buffer (18 bytes). Use when TEST UNIT READY / any SCSI command
+    /// returns CSW status 1 (Failed) — the sense data carries the
+    /// SENSE KEY, ASC, and ASCQ that describe the error. Callers
+    /// interested in CHECK CONDITION detail should call this next.
+    pub async fn request_sense(&self, xhci: &Xhci) -> Result<[u8; 18], MscError> {
+        // ALLOCATION LENGTH = 18 (fixed-format sense, SPC-4 Table 26).
+        let cb = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
+        let mut out = [0u8; 18];
+        let n = self.cmd_data_in(xhci, &cb, &mut out).await?;
+        if n < 18 {
+            return Err(MscError::BadLength);
+        }
+        Ok(out)
+    }
+
+    /// `START STOP UNIT` (SBC-3 §5.25). `start=true` spins the medium
+    /// up; `start=false` spins it down / ejects (LOEJ=1 in the CDB)
+    /// when `eject=true`. Typical USB-stick eject: `start=false,
+    /// eject=true`.
+    pub async fn start_stop_unit(
+        &self,
+        xhci: &Xhci,
+        start: bool,
+        eject: bool,
+    ) -> Result<(), MscError> {
+        // CDB byte 4: LOEJ bit (bit 1) + START bit (bit 0).
+        let flags: u8 = if eject { 0x02 } else { 0x00 } | if start { 0x01 } else { 0x00 };
+        self.cmd_no_data(xhci, &[SCSI_START_STOP_UNIT, 0, 0, 0, flags, 0]).await
     }
 
     /// `INQUIRY` (SPC-4 §6.5). Returns the standard 36-byte INQUIRY
@@ -605,6 +687,87 @@ pub fn with_device<R>(idx: usize, f: impl FnOnce(&MscDevice) -> R) -> Option<R> 
 #[doc(hidden)]
 pub fn __reset_msc_for_test() {
     MSC_DEVICES.lock().clear();
+}
+
+// ── Protocol codec helpers (pub for unit tests) ────────────────────
+
+/// Encode a 31-byte CBW (§5.1 Table 5.1).
+///
+/// `tag` identifies this transaction and is echoed back in the CSW.
+/// `data_len` is the expected transfer length in bytes.  `is_in` sets
+/// bit 7 of `bmCBWFlags` (1 = data flows from device to host).
+/// `cb` is the SCSI command descriptor block; at most 16 bytes are
+/// copied into `CBWCB[16]`.
+pub fn encode_cbw(tag: u32, data_len: u32, is_in: bool, cb: &[u8]) -> [u8; 31] {
+    let mut out = [0u8; 31];
+    out[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
+    out[4..8].copy_from_slice(&tag.to_le_bytes());
+    out[8..12].copy_from_slice(&data_len.to_le_bytes());
+    out[12] = if is_in { CBW_FLAG_IN } else { 0 };
+    out[13] = 0; // bCBWLUN
+    out[14] = (cb.len() as u8) & 0x1F; // bCBWCBLength (low 5 bits)
+    let n = cb.len().min(16);
+    out[15..15 + n].copy_from_slice(&cb[..n]);
+    out
+}
+
+/// Decoded fields of a 13-byte CSW (§5.2 Table 5.2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CswFields {
+    /// Echo of the CBW `dCBWTag`.
+    pub tag: u32,
+    /// Difference between `dCBWDataTransferLength` and the actual
+    /// bytes transferred.
+    pub residue: u32,
+    /// 0 = Command Passed, 1 = Command Failed, 2 = Phase Error.
+    pub status: u8,
+}
+
+/// Decode a 13-byte CSW buffer. Returns `None` if the buffer is
+/// shorter than 13 bytes or the `dCSWSignature` (`b'USBS'`) doesn't
+/// match. The caller still needs to verify `tag` echoes the CBW tag.
+pub fn decode_csw(buf: &[u8]) -> Option<CswFields> {
+    if buf.len() < 13 {
+        return None;
+    }
+    let sig = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if sig != CSW_SIGNATURE {
+        return None;
+    }
+    let tag = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let residue = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let status = buf[12];
+    Some(CswFields { tag, residue, status })
+}
+
+/// Encode a READ(10) CDB (SBC-3 §5.10). Returns the 10-byte
+/// command descriptor block. `lba` and `nblocks` are big-endian
+/// in the wire format.
+pub fn encode_read10(lba: u32, nblocks: u16) -> [u8; 10] {
+    let lba_be = lba.to_be_bytes();
+    let nb = nblocks.to_be_bytes();
+    [0x28, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0]
+}
+
+/// Encode a WRITE(10) CDB (SBC-3 §5.27). Returns the 10-byte
+/// command descriptor block. `lba` and `nblocks` are big-endian.
+pub fn encode_write10(lba: u32, nblocks: u16) -> [u8; 10] {
+    let lba_be = lba.to_be_bytes();
+    let nb = nblocks.to_be_bytes();
+    [0x2A, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0]
+}
+
+/// Decode a READ CAPACITY(10) response buffer (SBC-3 Table 56).
+/// Returns `(block_size_bytes, last_lba)`.  Both fields are
+/// big-endian on the wire. Returns `None` if `buf` is shorter
+/// than 8 bytes.
+pub fn decode_read_capacity10(buf: &[u8]) -> Option<(u32, u32)> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let block_size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    Some((block_size, last_lba))
 }
 
 // ── BlockDeviceSync adapter ────────────────────────────────────────
