@@ -48,7 +48,6 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::hkdf::hmac_sha256;
 use crate::sha256::Sha256;
 
 /// RSA-3072 modulus length in bytes.
@@ -436,18 +435,6 @@ pub fn rsaes_oaep_sha256_decrypt_for_test(
     let em_limbs = pow_mod_limbs(&c_limbs, &d_limbs, &n_limbs);
     let em = limbs_to_be_bytes(&em_limbs);
     oaep_decode(em, label)
-}
-
-// Re-export the HMAC for the HDCP module (avoid a circular dep on hkdf).
-pub use crate::hkdf::hmac_sha256 as _hmac_sha256_for_hdcp;
-
-// Keep `hmac_sha256` reachable for tests at this module path too —
-// it's not used here but exists in the crate.
-#[allow(unused_imports)]
-use crate as _crate_self;
-#[allow(dead_code)]
-fn _link_hmac_sha256(k: &[u8], d: &[u8]) -> [u8; 32] {
-    hmac_sha256(k, d)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
