@@ -163,3 +163,256 @@ pub const fn enc_head_sync_start(mode: &crate::disp::Mode) -> u32 {
 pub const fn enc_head_sync_end(mode: &crate::disp::Mode) -> u32 {
     (mode.h_sync_end as u32) | ((mode.v_sync_end as u32) << 16)
 }
+
+// ── NV507D method ids (per-HEAD) ────────────────────────────────
+//
+// Cite `/home/daniel/git/linux/drivers/gpu/drm/nouveau/include/
+// nvhw/class/cl507d.h`. Each HEAD has a 0x400 stride; the base
+// method below is the HEAD(0) offset.
+
+/// NV507D::UPDATE method — kicks the just-staged HEAD state.
+pub const NV507D_UPDATE: u16 = 0x0080;
+/// NV507D::HEAD_SET_PIXEL_CLOCK(0) — pixel clock + clock mode.
+pub const NV507D_HEAD_SET_PIXEL_CLOCK: u16 = 0x0804;
+/// NV507D::HEAD_SET_CONTROL(0) — interlace + scanout structure.
+pub const NV507D_HEAD_SET_CONTROL: u16 = 0x0808;
+/// NV507D::HEAD_SET_OVERSCAN_COLOR(0).
+pub const NV507D_HEAD_SET_OVERSCAN_COLOR: u16 = 0x0810;
+/// NV507D::HEAD_SET_RASTER_SIZE(0) — htotal + vtotal.
+pub const NV507D_HEAD_SET_RASTER_SIZE: u16 = 0x0814;
+/// NV507D::HEAD_SET_RASTER_SYNC_END(0).
+pub const NV507D_HEAD_SET_RASTER_SYNC_END: u16 = 0x0818;
+/// NV507D::HEAD_SET_RASTER_BLANK_END(0).
+pub const NV507D_HEAD_SET_RASTER_BLANK_END: u16 = 0x081C;
+/// NV507D::HEAD_SET_RASTER_BLANK_START(0).
+pub const NV507D_HEAD_SET_RASTER_BLANK_START: u16 = 0x0820;
+/// NV507D::HEAD_SET_OFFSET(0,0) — scanout origin.
+pub const NV507D_HEAD_SET_OFFSET: u16 = 0x0860;
+/// NV507D::HEAD_SET_CONTEXT_DMA_ISO(0) — scanout DMA-handle.
+pub const NV507D_HEAD_SET_CONTEXT_DMA_ISO: u16 = 0x0874;
+
+/// HEAD method stride: each HEAD's method base is `BASE + 0x400 * i`.
+pub const NV507D_HEAD_STRIDE: u16 = 0x0400;
+
+/// Compute the method id for `method` on HEAD `i`.
+pub const fn head_method(base: u16, i: u8) -> u16 {
+    base + (i as u16) * NV507D_HEAD_STRIDE
+}
+
+// ── PIXEL_CLOCK field encoding ───────────────────────────────────
+
+/// PIXEL_CLOCK.MODE = CLK_CUSTOM (value 0x2 in bits[23:22]). Cite
+/// `cl507d.h::NV507D_HEAD_SET_PIXEL_CLOCK_MODE_CLK_CUSTOM`.
+pub const PIXEL_CLOCK_MODE_CLK_CUSTOM: u32 = 0x2 << 22;
+
+/// Encode `HEAD_SET_PIXEL_CLOCK`. Layout:
+/// - bits[21:0]:   FREQUENCY (kHz)
+/// - bits[23:22]:  MODE (CLK_25 / CLK_28 / CLK_CUSTOM)
+/// - bit [24]:     ADJ1000DIV1001
+/// - bit [25]:     NOT_DRIVER
+pub const fn enc_pixel_clock(khz: u32, custom: bool, ntsc_adj: bool) -> u32 {
+    let mut v = khz & 0x003F_FFFF;
+    if custom {
+        v |= PIXEL_CLOCK_MODE_CLK_CUSTOM;
+    }
+    if ntsc_adj {
+        v |= 1 << 24;
+    }
+    v
+}
+
+/// Encode `HEAD_SET_RASTER_SIZE`. Width in bits[14:0], height in
+/// bits[30:16].
+pub const fn enc_raster_size(w: u16, h: u16) -> u32 {
+    ((w as u32) & 0x7FFF) | (((h as u32) & 0x7FFF) << 16)
+}
+
+/// Encode `HEAD_SET_RASTER_SYNC_END`. X=hsync_end, Y=vsync_end.
+pub const fn enc_raster_sync_end(x: u16, y: u16) -> u32 {
+    ((x as u32) & 0x7FFF) | (((y as u32) & 0x7FFF) << 16)
+}
+
+/// Encode `HEAD_SET_RASTER_BLANK_END`. X=h_active_start,
+/// Y=v_active_start.
+pub const fn enc_raster_blank_end(x: u16, y: u16) -> u32 {
+    ((x as u32) & 0x7FFF) | (((y as u32) & 0x7FFF) << 16)
+}
+
+/// Encode `HEAD_SET_RASTER_BLANK_START`. X=h_blank_start,
+/// Y=v_blank_start.
+pub const fn enc_raster_blank_start(x: u16, y: u16) -> u32 {
+    ((x as u32) & 0x7FFF) | (((y as u32) & 0x7FFF) << 16)
+}
+
+// ── Disp channel doorbell ────────────────────────────────────────
+//
+// Cite `dispnv50/disp.c::nv50_dmac_kick` — the host stages methods
+// in the channel's circular pushbuffer, then writes PUT at offset 0
+// of the channel-user MMIO window. The hardware fetches between
+// GET (offset 0x4) and PUT and dispatches each method/data pair.
+//
+// On Maxwell+/Pascal/Volta these channels live in the dispclass
+// user window mapped via the channel handle; on Turing+ the same
+// shape is preserved (NV507C / NVC37C etc inherit PUT at offset 0).
+
+/// PUT pointer offset (within the disp channel user-MMIO window).
+pub const DISP_CHAN_PUT: u64 = 0x0000_0000;
+/// GET pointer offset (within the disp channel user-MMIO window).
+pub const DISP_CHAN_GET: u64 = 0x0000_0004;
+
+/// Convert a host pushbuffer offset (in bytes) to the raw PUT
+/// register value. PUT_PTR occupies bits[11:2] (per cl507c.h); the
+/// field-value is the word index, so the raw register reads back
+/// `byte_offset & 0xFFC` — i.e. the byte offset clamped into the
+/// PUT-pointer field. Cite `cl507c.h::NV507C_PUT_PTR` (bits[11:2]).
+pub const fn put_value(byte_offset: u32) -> u32 {
+    byte_offset & 0x0000_0FFC
+}
+
+/// Ring the doorbell — write the new PUT pointer to the channel
+/// user-MMIO window. Caller has already staged the methods into the
+/// VRAM-backed pushbuffer.
+///
+/// # Safety
+/// `chan_mmio` is the channel's user-MMIO window (kernel-mapped via
+/// `MmioRegion`). `byte_offset` must be a multiple of 4 and lie
+/// within the pushbuffer the GPU is configured to read.
+pub unsafe fn doorbell_kick(
+    chan_mmio: &narf_driver_runtime::MmioRegion,
+    byte_offset: u32,
+) {
+    let v = put_value(byte_offset);
+    // SAFETY: caller's responsibility.
+    unsafe {
+        chan_mmio.write32(DISP_CHAN_PUT, v);
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+// ── Live mode-set sequence (HEAD `i`) ────────────────────────────
+//
+// Mirrors `dispnv50/head507d.c::head507d_mode` — the canonical NV50
+// mode-set: PIXEL_CLOCK + CONTROL + OVERSCAN + RASTER_SIZE +
+// SYNC_END + BLANK_END + BLANK_START block, followed by UPDATE on
+// the disp core. Stage 2 wires this to live MMIO via a `PbBuilder`.
+//
+// Why one big method block? NV507D coalesces increments — every
+// data word after the first auto-increments the method id by 4,
+// so a single PUSH_MTHD/data*N block writes consecutive HEAD
+// registers in one fetch.
+
+/// HEAD_SET_CONTROL value for progressive (non-interlaced).
+pub const HEAD_CONTROL_PROGRESSIVE: u32 = 0;
+/// HEAD_SET_CONTROL value for interlaced.
+pub const HEAD_CONTROL_INTERLACED: u32 = 1;
+
+/// Stage the head507d-style mode-set into the pushbuffer. Returns
+/// the byte offset of the next free slot in the pushbuffer (so the
+/// caller can do a doorbell kick or follow-up with UPDATE).
+///
+/// Cite `head507d_mode` in dispnv50/head507d.c — the staging order
+/// is PIXEL_CLOCK / CONTROL, then OVERSCAN_COLOR / RASTER_SIZE /
+/// SYNC_END / BLANK_END / BLANK_START as a single inc-method block.
+pub fn stage_head_mode(
+    pb: &mut crate::pb::PbBuilder<'_>,
+    head: u8,
+    mode: &crate::disp::Mode,
+) -> Result<(), crate::pb::PbError> {
+    let pixel_clock = enc_pixel_clock(mode.clock_khz, true, false);
+    let control = if mode.flags.interlaced {
+        HEAD_CONTROL_INTERLACED
+    } else {
+        HEAD_CONTROL_PROGRESSIVE
+    };
+    // First block: PIXEL_CLOCK then CONTROL (consecutive 0x0804 +
+    // 0x0808).
+    pb.write_inc(
+        head_method(NV507D_HEAD_SET_PIXEL_CLOCK, head),
+        &[pixel_clock, control],
+    )?;
+    // Second block: OVERSCAN_COLOR (0) then RASTER_SIZE +
+    // SYNC_END + BLANK_END + BLANK_START — five consecutive words
+    // starting at OVERSCAN_COLOR.
+    pb.write_inc(
+        head_method(NV507D_HEAD_SET_OVERSCAN_COLOR, head),
+        &[
+            0, // OVERSCAN_COLOR — black
+            enc_raster_size(mode.h_total, mode.v_total),
+            enc_raster_sync_end(mode.h_sync_end, mode.v_sync_end),
+            enc_raster_blank_end(mode.h_total - mode.h_display, mode.v_total - mode.v_display),
+            enc_raster_blank_start(mode.h_sync_end, mode.v_sync_end),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Stage HEAD scanout bind: `HEAD_SET_OFFSET` + `HEAD_SET_CONTEXT_DMA_ISO`.
+/// `fb_offset_bytes` is the VRAM byte offset of the framebuffer;
+/// NV507D stores it as `offset >> 8` per `head507d_core_set`.
+pub fn stage_head_scanout(
+    pb: &mut crate::pb::PbBuilder<'_>,
+    head: u8,
+    fb_offset_bytes: u64,
+    dma_handle: u32,
+) -> Result<(), crate::pb::PbError> {
+    pb.write_inc(
+        head_method(NV507D_HEAD_SET_OFFSET, head),
+        &[(fb_offset_bytes >> 8) as u32],
+    )?;
+    pb.write_inc(
+        head_method(NV507D_HEAD_SET_CONTEXT_DMA_ISO, head),
+        &[dma_handle],
+    )?;
+    Ok(())
+}
+
+/// Stage the disp-core UPDATE that retires the just-staged HEAD
+/// state. Cite `core507d_update` in dispnv50/core507d.c.
+pub fn stage_update(
+    pb: &mut crate::pb::PbBuilder<'_>,
+    interlock: u32,
+) -> Result<(), crate::pb::PbError> {
+    pb.write_inc(NV507D_UPDATE, &[interlock])
+}
+
+/// Full mode-set commit: stage the mode + scanout bind + UPDATE into
+/// `pb`, then ring the disp doorbell with the new PUT pointer.
+///
+/// `chan_mmio` is the disp-core channel's user-MMIO window. The
+/// pushbuffer (`pb`) is assumed to be backed by VRAM the GPU is
+/// configured to read; the returned `Ok` indicates the doorbell has
+/// been kicked and the GPU should latch the new mode on the next
+/// scanout boundary.
+///
+/// # Safety
+/// `chan_mmio` is mapped + owned exclusively. `pb_byte_base` is the
+/// byte offset within the channel's circular pushbuffer where the
+/// just-staged commands start; the GPU's GET pointer must be ≤
+/// `pb_byte_base` when this is called.
+pub unsafe fn live_commit_head_mode(
+    chan_mmio: &narf_driver_runtime::MmioRegion,
+    pb: &mut crate::pb::PbBuilder<'_>,
+    pb_byte_base: u32,
+    head: u8,
+    mode: &crate::disp::Mode,
+    fb_offset_bytes: u64,
+    dma_handle: u32,
+) -> Result<u32, crate::pb::PbError> {
+    let start = pb.len();
+    stage_head_mode(pb, head, mode)?;
+    stage_head_scanout(pb, head, fb_offset_bytes, dma_handle)?;
+    stage_update(pb, 0)?;
+    let end_byte_off = pb_byte_base
+        .saturating_add((pb.len() - start) as u32)
+        .saturating_add(pb_byte_base.checked_sub(pb_byte_base).unwrap_or(0));
+    // The doorbell consumer is the byte position of the *next free
+    // word*, not the start. The hardware fetches GET..PUT so PUT
+    // must be the byte offset past the last staged word.
+    let put_offset = pb_byte_base + pb.len() as u32;
+    // SAFETY: caller's responsibility.
+    unsafe {
+        doorbell_kick(chan_mmio, put_offset);
+    }
+    let _ = end_byte_off;
+    Ok(put_offset)
+}

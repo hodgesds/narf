@@ -1652,6 +1652,273 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// Live mode-set commit (item 1)
+// ────────────────────────────────────────────────────────────────
+
+use crate::disp::nv50::{
+    doorbell_kick, enc_pixel_clock, enc_raster_blank_end, enc_raster_blank_start, enc_raster_size,
+    enc_raster_sync_end, head_method, put_value, stage_head_mode, stage_head_scanout, stage_update,
+    DISP_CHAN_GET, DISP_CHAN_PUT, HEAD_CONTROL_INTERLACED, HEAD_CONTROL_PROGRESSIVE,
+    NV507D_HEAD_SET_CONTEXT_DMA_ISO, NV507D_HEAD_SET_CONTROL, NV507D_HEAD_SET_OFFSET,
+    NV507D_HEAD_SET_OVERSCAN_COLOR, NV507D_HEAD_SET_PIXEL_CLOCK, NV507D_HEAD_SET_RASTER_BLANK_END,
+    NV507D_HEAD_SET_RASTER_BLANK_START, NV507D_HEAD_SET_RASTER_SIZE,
+    NV507D_HEAD_SET_RASTER_SYNC_END, NV507D_HEAD_STRIDE, NV507D_UPDATE,
+    PIXEL_CLOCK_MODE_CLK_CUSTOM,
+};
+fn smoke_disp_nv507d_method_addresses_match_cl507d_h() -> TestResult {
+    // Method ids from
+    // include/nvhw/class/cl507d.h. Pin them so a future change to
+    // the const table is caught at test time.
+    if NV507D_UPDATE != 0x0080 {
+        return TestResult::Fail("NV507D::UPDATE method should be 0x80");
+    }
+    if NV507D_HEAD_SET_PIXEL_CLOCK != 0x0804 {
+        return TestResult::Fail("NV507D::HEAD_SET_PIXEL_CLOCK(0) should be 0x804");
+    }
+    if NV507D_HEAD_SET_CONTROL != 0x0808 {
+        return TestResult::Fail("NV507D::HEAD_SET_CONTROL(0) should be 0x808");
+    }
+    if NV507D_HEAD_SET_OVERSCAN_COLOR != 0x0810 {
+        return TestResult::Fail("NV507D::HEAD_SET_OVERSCAN_COLOR(0) should be 0x810");
+    }
+    if NV507D_HEAD_SET_RASTER_SIZE != 0x0814 {
+        return TestResult::Fail("HEAD_SET_RASTER_SIZE(0) should be 0x814");
+    }
+    if NV507D_HEAD_SET_RASTER_SYNC_END != 0x0818 {
+        return TestResult::Fail("HEAD_SET_RASTER_SYNC_END(0) should be 0x818");
+    }
+    if NV507D_HEAD_SET_RASTER_BLANK_END != 0x081C {
+        return TestResult::Fail("HEAD_SET_RASTER_BLANK_END(0) should be 0x81C");
+    }
+    if NV507D_HEAD_SET_RASTER_BLANK_START != 0x0820 {
+        return TestResult::Fail("HEAD_SET_RASTER_BLANK_START(0) should be 0x820");
+    }
+    if NV507D_HEAD_SET_OFFSET != 0x0860 {
+        return TestResult::Fail("HEAD_SET_OFFSET(0,0) should be 0x860");
+    }
+    if NV507D_HEAD_SET_CONTEXT_DMA_ISO != 0x0874 {
+        return TestResult::Fail("HEAD_SET_CONTEXT_DMA_ISO(0) should be 0x874");
+    }
+    if NV507D_HEAD_STRIDE != 0x0400 {
+        return TestResult::Fail("HEAD stride must be 0x400");
+    }
+    // Per-HEAD computation: HEAD(1) PIXEL_CLOCK = 0x804 + 0x400 = 0xC04.
+    if head_method(NV507D_HEAD_SET_PIXEL_CLOCK, 1) != 0x0C04 {
+        return TestResult::Fail("head_method(PIXEL_CLOCK, 1) mismatched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_nv507d_method_addresses_match_cl507d_h
+);
+
+fn smoke_disp_pixel_clock_field_encoding() -> TestResult {
+    // 148500 kHz (1080p60 pixel clock) with custom mode.
+    let v = enc_pixel_clock(148_500, true, false);
+    if v & 0x003F_FFFF != 148_500 {
+        return TestResult::Fail("FREQUENCY field bits[21:0] wrong");
+    }
+    if v & PIXEL_CLOCK_MODE_CLK_CUSTOM == 0 {
+        return TestResult::Fail("CLK_CUSTOM mode bits should be set");
+    }
+    if v & (1 << 24) != 0 {
+        return TestResult::Fail("ADJ1000DIV1001 should be off");
+    }
+    // ntsc adjust.
+    let v2 = enc_pixel_clock(27_000, false, true);
+    if v2 & (1 << 24) == 0 {
+        return TestResult::Fail("ADJ1000DIV1001 should be on");
+    }
+    if v2 & PIXEL_CLOCK_MODE_CLK_CUSTOM != 0 {
+        return TestResult::Fail("CLK_CUSTOM should be off when custom=false");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/disp", smoke_disp_pixel_clock_field_encoding);
+
+fn smoke_disp_raster_size_sync_blank_packing() -> TestResult {
+    // 1080p timings: htotal=2200, vtotal=1125.
+    let v = enc_raster_size(2200, 1125);
+    if v & 0x7FFF != 2200 {
+        return TestResult::Fail("WIDTH bits[14:0] wrong");
+    }
+    if (v >> 16) & 0x7FFF != 1125 {
+        return TestResult::Fail("HEIGHT bits[30:16] wrong");
+    }
+    let s = enc_raster_sync_end(2052, 1089);
+    if s & 0x7FFF != 2052 || (s >> 16) & 0x7FFF != 1089 {
+        return TestResult::Fail("sync_end packing wrong");
+    }
+    let be = enc_raster_blank_end(280, 45);
+    if be & 0x7FFF != 280 || (be >> 16) & 0x7FFF != 45 {
+        return TestResult::Fail("blank_end packing wrong");
+    }
+    let bs = enc_raster_blank_start(2052, 1089);
+    if bs & 0x7FFF != 2052 || (bs >> 16) & 0x7FFF != 1089 {
+        return TestResult::Fail("blank_start packing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_raster_size_sync_blank_packing
+);
+
+fn smoke_disp_stage_head_mode_writes_two_blocks() -> TestResult {
+    let mut buf = [0u8; 128];
+    let m = Mode {
+        clock_khz: 148500,
+        h_display: 1920,
+        h_sync_start: 2008,
+        h_sync_end: 2052,
+        h_total: 2200,
+        v_display: 1080,
+        v_sync_start: 1084,
+        v_sync_end: 1089,
+        v_total: 1125,
+        flags: ModeFlags::default(),
+    };
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_head_mode(&mut pb, 0, &m).unwrap();
+        pb.len()
+    };
+    // Two PUSH_MTHD blocks: first block has 2 data words (PIXEL_CLOCK + CONTROL),
+    // second has 5 (OVERSCAN_COLOR + 4 raster words). Per header-shape that's
+    // 4 + 2*4 + 4 + 5*4 = 36 bytes.
+    if pb_len != 36 {
+        return TestResult::Fail("stage_head_mode should write 36 bytes (2 + 5 data + 2 hdrs)");
+    }
+    // Verify first header word's method id.
+    let hdr0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if hdr0 & 0xFFFF != NV507D_HEAD_SET_PIXEL_CLOCK as u32 {
+        return TestResult::Fail("first header method should be PIXEL_CLOCK(0)");
+    }
+    if (hdr0 >> 16) & 0x1FFF != 2 {
+        return TestResult::Fail("first header size should be 2 words");
+    }
+    // Second header word.
+    let hdr1 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if hdr1 & 0xFFFF != NV507D_HEAD_SET_OVERSCAN_COLOR as u32 {
+        return TestResult::Fail("second header method should be OVERSCAN_COLOR(0)");
+    }
+    if (hdr1 >> 16) & 0x1FFF != 5 {
+        return TestResult::Fail("second header size should be 5 words");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_stage_head_mode_writes_two_blocks
+);
+
+fn smoke_disp_stage_head_scanout_and_update() -> TestResult {
+    let mut buf = [0u8; 64];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_head_scanout(&mut pb, 0, 0x1234_5600, 0xCAFEC0DE).unwrap();
+        let after_scanout = pb.len();
+        if after_scanout != 16 {
+            return TestResult::Fail("scanout stage should be 16 bytes");
+        }
+        stage_update(&mut pb, 0).unwrap();
+        pb.len()
+    };
+    // 2 PUSH_MTHD blocks each with 1 data word for scanout (16 bytes),
+    // then UPDATE adds 8 bytes (hdr + 1 data) = 24 total.
+    if pb_len != 16 + 8 {
+        return TestResult::Fail("UPDATE adds 8 bytes (hdr + 1 data)");
+    }
+    let data0 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if data0 != (0x1234_5600u32 >> 8) {
+        return TestResult::Fail("OFFSET should be fb_offset_bytes >> 8");
+    }
+    let hdr_upd = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    if hdr_upd & 0xFFFF != NV507D_UPDATE as u32 {
+        return TestResult::Fail("UPDATE method id wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_stage_head_scanout_and_update
+);
+
+fn smoke_disp_put_pointer_encoding_matches_cl507c() -> TestResult {
+    // Per cl507c.h::NV507C_PUT_PTR (bits[11:2]) the byte offset is
+    // shifted right by 2 to yield the word index.
+    if put_value(0) != 0 {
+        return TestResult::Fail("0 → 0");
+    }
+    if put_value(4) != 4 {
+        return TestResult::Fail("byte=4 → PUT[2]=1 → 0x4");
+    }
+    if put_value(64) != 64 {
+        return TestResult::Fail("byte=64 → PUT[7]=16 → 0x40");
+    }
+    // Mask out non-word bits.
+    if put_value(0xFFFF_FFFF) & 0x3 != 0 {
+        return TestResult::Fail("bottom 2 bits must always be zero");
+    }
+    if DISP_CHAN_PUT != 0 || DISP_CHAN_GET != 4 {
+        return TestResult::Fail("PUT at offset 0, GET at offset 4");
+    }
+    // The encoder must clamp into the [11:2] field range.
+    if put_value(0xFFFF_FFFF) > 0x0FFF {
+        return TestResult::Fail("PUT must stay inside bits[11:2]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_put_pointer_encoding_matches_cl507c
+);
+
+fn smoke_disp_head_control_interlace_bit_pin() -> TestResult {
+    if HEAD_CONTROL_PROGRESSIVE != 0 {
+        return TestResult::Fail("progressive should be 0");
+    }
+    if HEAD_CONTROL_INTERLACED != 1 {
+        return TestResult::Fail("interlaced should be 1");
+    }
+    // stage_head_mode must propagate the flag.
+    let mut buf = [0u8; 64];
+    let m = Mode {
+        clock_khz: 27_000,
+        h_display: 720,
+        h_sync_start: 736,
+        h_sync_end: 798,
+        h_total: 858,
+        v_display: 480,
+        v_sync_start: 484,
+        v_sync_end: 488,
+        v_total: 525,
+        flags: ModeFlags {
+            hsync_positive: true,
+            vsync_positive: true,
+            interlaced: true,
+            double_scan: false,
+        },
+    };
+    {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_head_mode(&mut pb, 0, &m).unwrap();
+    }
+    // The CONTROL data word is the second word in the first
+    // PUSH_MTHD block (after PIXEL_CLOCK). That's bytes 8..12.
+    let ctrl = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if ctrl != HEAD_CONTROL_INTERLACED {
+        return TestResult::Fail("interlaced flag should produce CONTROL=1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_head_control_interlace_bit_pin
+);
+
+// ────────────────────────────────────────────────────────────────
 // Multi-GPU controller list (item 6)
 // ────────────────────────────────────────────────────────────────
 
