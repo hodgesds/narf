@@ -572,19 +572,26 @@ pub mod test_support {
     //! Mock MMIO for unit tests. Not part of the production driver surface.
     //!
     //! `MockPsp` maintains a register map (`regs`) and a write log.
-    //! Tests pre-populate the register map with expected read values
-    //! (e.g. staging `PSP_CMDRESP_RESP` in the CMDRESP register to
-    //! simulate an idle/complete mailbox) and verify the write log after
-    //! calling the function under test.
+    //! CMDRESP registers use a FIFO queue (`resp_queue`) so that
+    //! successive reads return staged values in order, correctly
+    //! simulating the idle-then-done two-poll sequence that
+    //! `mailbox_command` performs.
 
     use super::*;
     use alloc::collections::BTreeMap;
+    use alloc::collections::VecDeque;
 
-    /// Simple mock: `regs` maps byte-offset → value, `writes` logs
-    /// every write as `(offset, value)`.
+    /// Mock MMIO.
+    ///
+    /// - `regs`: flat register map for non-CMDRESP registers.
+    /// - `resp_queue`: per-CMDRESP-offset FIFO; each staged value is
+    ///   dequeued on read, so successive reads return values in the
+    ///   order they were staged.
+    /// - `writes`: log of every write as `(offset, value)`.
     #[derive(Debug, Default)]
     pub struct MockPsp {
         pub regs: BTreeMap<u32, u32>,
+        pub resp_queue: BTreeMap<u32, VecDeque<u32>>,
         pub writes: Vec<(u32, u32)>,
     }
 
@@ -592,43 +599,69 @@ pub mod test_support {
         pub fn new() -> Self {
             Self::default()
         }
-        /// Pre-set a register value so reads return it.
+        /// Pre-set a non-CMDRESP register value so reads return it.
         pub fn set_reg(&mut self, off: u32, val: u32) {
-            self.regs.insert(off, val);
+            if off == CMDRESP_REG_V1 || off == CMDRESP_REG_V2 {
+                self.resp_queue.entry(off).or_default().push_back(val);
+            } else {
+                self.regs.insert(off, val);
+            }
         }
         /// Stage the mailbox as IDLE (RESP=1, STS=0) so the initial
         /// poll-for-idle in `mailbox_command` passes immediately.
         pub fn stage_idle(&mut self, variant: PspHwVariant) {
-            self.set_reg(variant.cmdresp_reg(), PSP_CMDRESP_RESP);
+            self.resp_queue
+                .entry(variant.cmdresp_reg())
+                .or_default()
+                .push_back(PSP_CMDRESP_RESP);
         }
         /// Stage the mailbox as DONE (RESP=1, STS=0) for the second poll
-        /// (post-trigger). Call `stage_idle` for the pre-trigger poll,
-        /// then this for the post-trigger poll.
+        /// (post-trigger). Call `stage_idle` first, then this.
         pub fn stage_done_ok(&mut self, variant: PspHwVariant) {
-            self.set_reg(variant.cmdresp_reg(), PSP_CMDRESP_RESP);
+            self.resp_queue
+                .entry(variant.cmdresp_reg())
+                .or_default()
+                .push_back(PSP_CMDRESP_RESP);
         }
         /// Stage the mailbox to respond with `sts` in STS field + RESP=1.
         pub fn stage_done_err(&mut self, variant: PspHwVariant, sts: u16) {
-            self.set_reg(
-                variant.cmdresp_reg(),
-                PSP_CMDRESP_RESP | (sts as u32),
-            );
+            self.resp_queue
+                .entry(variant.cmdresp_reg())
+                .or_default()
+                .push_back(PSP_CMDRESP_RESP | (sts as u32));
         }
     }
 
     impl PspMmio for MockPsp {
         fn read(&mut self, off: u32) -> u32 {
-            // Reading the CMDRESP register pops its value so that
-            // successive reads simulate idle-then-done.
+            // CMDRESP registers dequeue the next staged value; returns 0
+            // (no RESP bit) when the queue is exhausted — simulates the
+            // PSP not yet responding (poll will eventually time out).
             if off == CMDRESP_REG_V1 || off == CMDRESP_REG_V2 {
-                self.regs.remove(&off).unwrap_or(0)
+                self.resp_queue
+                    .get_mut(&off)
+                    .and_then(|q| q.pop_front())
+                    .unwrap_or(0)
             } else {
                 self.regs.get(&off).copied().unwrap_or(0)
             }
         }
         fn write(&mut self, off: u32, val: u32) {
             self.writes.push((off, val));
-            self.regs.insert(off, val);
+            // Writes to CMDRESP clear the queue (the trigger write clears
+            // RESP) and re-enqueue the written value so the next poll
+            // sees it — unless a staged response is already waiting.
+            if off == CMDRESP_REG_V1 || off == CMDRESP_REG_V2 {
+                // Only insert the written value if no staged response is
+                // queued; a pre-staged response represents the PSP reply
+                // and must not be clobbered by the trigger write.
+                let q = self.resp_queue.entry(off).or_default();
+                if q.is_empty() {
+                    q.push_back(val);
+                }
+            } else {
+                self.regs.insert(off, val);
+            }
         }
     }
 }
