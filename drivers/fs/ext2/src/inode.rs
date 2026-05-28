@@ -36,6 +36,10 @@ pub struct Inode {
     pub size: u32,
     /// `i_blocks` — count of 512-byte sectors held by the file.
     pub blocks: u32,
+    /// `i_links_count` (offset 26). Hard-link refcount. mkdir bumps
+    /// the parent to 2 (the "." entry of the new child counts as a
+    /// link back to the parent). rmdir / unlink decrement.
+    pub links_count: u16,
     /// `i_block[15]` — block pointers (12 direct + 3 indirect tiers).
     pub block: [u32; I_BLOCK_LEN],
 }
@@ -51,6 +55,7 @@ impl Inode {
         }
         let mode = u16::from_le_bytes([buf[0], buf[1]]);
         let size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let links_count = u16::from_le_bytes([buf[26], buf[27]]);
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let mut block = [0u32; I_BLOCK_LEN];
         for i in 0..I_BLOCK_LEN {
@@ -66,6 +71,7 @@ impl Inode {
             mode,
             size,
             blocks,
+            links_count,
             block,
         })
     }
@@ -83,8 +89,8 @@ impl Inode {
     }
 
     /// Encode this inode into a 128-byte buffer. Only fields we
-    /// surface (mode/size/blocks/block) are written; everything else
-    /// is preserved by reading the on-disk bytes first and only
+    /// surface (mode/size/links/blocks/block) are written; everything
+    /// else is preserved by reading the on-disk bytes first and only
     /// overwriting our fields. Caller should pass `buf` initialised
     /// from `read_byte_range` and call `encode` to update.
     pub fn encode_into(&self, buf: &mut [u8]) {
@@ -93,6 +99,7 @@ impl Inode {
         }
         buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
         buf[4..8].copy_from_slice(&self.size.to_le_bytes());
+        buf[26..28].copy_from_slice(&self.links_count.to_le_bytes());
         buf[28..32].copy_from_slice(&self.blocks.to_le_bytes());
         for i in 0..I_BLOCK_LEN {
             let off = 40 + i * 4;
@@ -106,6 +113,7 @@ impl Inode {
             mode: S_IFREG | (perms & 0o777),
             size: 0,
             blocks: 0,
+            links_count: 1,
             block: [0; I_BLOCK_LEN],
         }
     }
@@ -116,6 +124,22 @@ impl Inode {
             mode: S_IFDIR | (perms & 0o777),
             size: 0,
             blocks: 0,
+            // Fresh dir has links_count = 2 ("." back-link + parent's
+            // dirent). The parent gets bumped separately for "..".
+            links_count: 2,
+            block: [0; I_BLOCK_LEN],
+        }
+    }
+
+    /// Build a fresh symlink inode. Caller fills size + block[] for
+    /// fast-symlinks (target stored inline in block[]) or allocates
+    /// a data block for slow symlinks.
+    pub fn new_symlink(perms: u16) -> Self {
+        Self {
+            mode: S_IFLNK | (perms & 0o777),
+            size: 0,
+            blocks: 0,
+            links_count: 1,
             block: [0; I_BLOCK_LEN],
         }
     }

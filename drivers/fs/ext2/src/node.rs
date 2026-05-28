@@ -22,11 +22,11 @@
 //! path is implemented; ext4 extents-tree writes still return
 //! `Unsupported`.
 //!
-//! The directory-mutation surface (create / mkdir / unlink / rmdir
-//! / rename) and HTREE indexes still return `Unsupported` —
-//! splicing a new directory entry across the variable-length
-//! record format (and the §"Indexed Directories" htree case) is
-//! multi-thousand lines on top of what landed here.
+//! Directory-mutation surface (create / mkdir / unlink / rmdir /
+//! rename / symlink) is implemented in `dir_mut.rs` and dispatched
+//! through here. HTREE read decoding lives in `htree.rs`; HTREE
+//! write (leaf split + rebalance on insert) is deferred — new
+//! dirents land at the tail via the linear walker.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -381,27 +381,68 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         })
     }
 
-    // Directory-mutation surface. The allocator + write_inode are
-    // landed (see volume.rs), but the directory-entry splice path
-    // (insert / coalesce variable-length records, refuse if the
-    // parent's directory body would overflow a block without an
-    // htree, etc.) is deferred. Returns `Unsupported` rather than
-    // `ReadOnly` to distinguish "this code path is not yet
-    // implemented" from "this volume / medium does not accept
-    // writes".
-    fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    // Directory-mutation surface — wired through to the
+    // `dir_mut::dir_*` helpers on `Ext2Volume`. Each method:
+    //   * resolves this node's parent-inode number,
+    //   * dispatches to the volume operation,
+    //   * returns a fresh handle for create/mkdir/symlink.
+    fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let parent_ino = self.state.lock().inode_no;
+            let new_ino = self
+                .volume
+                .dir_create_regular(parent_ino, name.as_bytes(), 0o644)
+                .await?;
+            let target = self.volume.read_inode(new_ino).await?;
+            let stat = Self::stat_from_inode(&self.volume, &target);
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat))
+                as Arc<dyn FileOps>)
+        })
     }
-    fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            let parent_ino = self.state.lock().inode_no;
+            let new_ino = self
+                .volume
+                .dir_create_directory(parent_ino, name.as_bytes(), 0o755)
+                .await?;
+            let target = self.volume.read_inode(new_ino).await?;
+            let stat = Self::stat_from_inode(&self.volume, &target);
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat))
+                as Arc<dyn DirOps>)
+        })
     }
-    fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let parent_ino = self.state.lock().inode_no;
+            self.volume.dir_unlink(parent_ino, name.as_bytes()).await
+        })
     }
-    fn rmdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let parent_ino = self.state.lock().inode_no;
+            self.volume.dir_rmdir(parent_ino, name.as_bytes()).await
+        })
     }
-    fn rename<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let parent_ino = self.state.lock().inode_no;
+            self.volume
+                .dir_rename(parent_ino, old_name.as_bytes(), parent_ino, new_name.as_bytes())
+                .await
+        })
+    }
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let parent_ino = self.state.lock().inode_no;
+            let new_ino = self
+                .volume
+                .dir_create_symlink(parent_ino, name.as_bytes(), target.as_bytes())
+                .await?;
+            let target_inode = self.volume.read_inode(new_ino).await?;
+            let stat = Self::stat_from_inode(&self.volume, &target_inode);
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat))
+                as Arc<dyn FileOps>)
+        })
     }
 }
