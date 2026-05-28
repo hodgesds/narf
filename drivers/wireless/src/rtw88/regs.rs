@@ -22,6 +22,41 @@
 
 #![allow(dead_code)]
 
+// ── MCU / Firmware control ─────────────────────────────────────────
+
+/// `REG_MCUFW_CTRL` — MCU firmware control + status. `reg.h` ~L80.
+pub const REG_MCUFW_CTRL: u64 = 0x0080;
+
+/// `FW_READY` bits — mask of (INIT_RDY | DW_RDY | IMEM_DW_OK | DMEM_DW_OK | CHKSUM_OK).
+/// Linux: `(BIT_FW_INIT_RDY | BIT_FW_DW_RDY | BIT_IMEM_DW_OK | BIT_DMEM_DW_OK | BIT_CHECK_SUM_OK)`.
+pub const FW_READY_MASK: u32 = (1 << 15) | (1 << 14) | (1 << 5) | (1 << 3) | (1 << 4) | (1 << 6);
+
+/// `BIT_MCUFWDL_EN` — bit 0 of `REG_MCUFW_CTRL`. Enables MCU firmware download.
+pub const BIT_MCUFWDL_EN: u32 = 1 << 0;
+
+// ── IDDMA (Internal Direct DMA) ────────────────────────────────────
+
+/// `REG_DDMA_CH0SA` — IDDMA Channel 0 Source Address. `reg.h` ~L1200.
+pub const REG_DDMA_CH0SA: u64 = 0x1200;
+/// `REG_DDMA_CH0DA` — IDDMA Channel 0 Destination Address. `reg.h` ~L1204.
+pub const REG_DDMA_CH0DA: u64 = 0x1204;
+/// `REG_DDMA_CH0CTRL` — IDDMA Channel 0 Control. `reg.h` ~L1208.
+pub const REG_DDMA_CH0CTRL: u64 = 0x1208;
+
+/// `BIT_DDMACH0_OWN` — bit 31 of `REG_DDMA_CH0CTRL`. Host-owned (0) vs HW-owned (1).
+pub const BIT_DDMACH0_OWN: u32 = 1 << 31;
+/// `BIT_DDMACH0_CHKSUM_EN` — bit 29 of `REG_DDMA_CH0CTRL`. Enable checksum.
+pub const BIT_DDMACH0_CHKSUM_EN: u32 = 1 << 29;
+/// `BIT_MASK_DDMACH0_DLEN` — mask for transfer length in `REG_DDMA_CH0CTRL`.
+pub const BIT_MASK_DDMACH0_DLEN: u32 = 0x0007FFFF;
+
+/// `OCPBASE_TXBUF_88XX` — On-chip TX buffer base address. Used as DDMA source.
+pub const OCPBASE_TXBUF_88XX: u32 = 0x18780000;
+/// `OCPBASE_IMEM_88XX` — On-chip Instruction memory base address.
+pub const OCPBASE_IMEM_88XX: u32 = 0x00000000;
+/// `OCPBASE_DMEM_88XX` — On-chip Data memory base address.
+pub const OCPBASE_DMEM_88XX: u32 = 0x00200000;
+
 // ── PCI device IDs (vendor 0x10EC = Realtek Semi.) ─────────────────
 //
 // Per Linux `drivers/net/wireless/realtek/rtw88/pci.c::rtw_pci_id_table`

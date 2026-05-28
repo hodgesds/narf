@@ -157,6 +157,26 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
     // SAFETY: BAR0 mapped, power-on done.
     let mac = unsafe { efuse::read_mac(&mmio_bar0) }.map_err(ProbeError::Efuse)?;
 
+    // ── Stage 2: Firmware load ──
+    let auth = match narf_firmware::trusted_loader_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        match unsafe {
+            super::fw::download_firmware(&mmio_bar0, mmio_bar2.as_ref(), device.id.device, &auth)
+        } {
+            Ok(()) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "  rtw88: firmware loaded successfully");
+            }
+            Err(e) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "  rtw88: firmware load failed: {:?}", e);
+            }
+        }
+    }
+
     Ok(Rtw88Device {
         mmio_bar0,
         mmio_bar2,

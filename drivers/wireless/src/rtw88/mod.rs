@@ -43,6 +43,7 @@
 extern crate alloc;
 
 pub mod efuse;
+pub mod fw;
 pub mod pci;
 pub mod power;
 pub mod regs;
