@@ -115,6 +115,7 @@ pub const ENGINE_XTS_AES_128: u8 = 1;
 pub const ENGINE_SHA: u8 = 3;
 pub const ENGINE_RSA: u8 = 4;
 pub const ENGINE_PASSTHRU: u8 = 5;
+pub const ENGINE_ECC: u8 = 6; // CCP_ENGINE_ECC
 
 // ── Memory type selectors (CCP_MEMTYPE_*, ccp-dev.h) ──────────────────
 
@@ -379,6 +380,388 @@ pub enum CcpError {
     BadIv,
     /// Key supplied does not match the declared mode.
     BadKey,
+    /// Caller-supplied key/modulus/exponent exceeds maximum supported size.
+    InvalidKeySize,
+    /// No LSB slot is available (pool exhausted).
+    LsbExhausted,
+    /// ECC input parameter is out of range or missing.
+    BadEccParam,
+}
+
+// ── LSB (Local Storage Block) allocator ──────────────────────────────
+//
+// CCP v5: 8 LSBs × 16 items × 32 bytes per item.
+// Linux constants: MAX_LSB_CNT=8, LSB_SIZE=16, LSB_ITEM_SIZE=32.
+// Reference: ccp_lsb_alloc / ccp_lsb_free in ccp-dev-v5.c (GPL-2.0-or-later).
+//
+// NARF uses a flat 128-slot bitmap rather than Linux's per-queue private/shared
+// split.  Slot n maps to hardware byte address n * LSB_ITEM_BYTES.
+
+/// Number of LSB banks (MAX_LSB_CNT in Linux ccp-dev.h).
+pub const LSB_COUNT: usize = 8;
+/// Items per LSB bank (LSB_SIZE).
+pub const LSB_ITEMS_PER_BANK: usize = 16;
+/// Byte size of one LSB slot (LSB_ITEM_SIZE).
+pub const LSB_ITEM_BYTES: u32 = 32;
+/// Total 32-byte slots across all LSBs.
+pub const LSB_TOTAL_SLOTS: usize = LSB_COUNT * LSB_ITEMS_PER_BANK; // 128
+
+/// Flat 128-slot bitmap allocator over the CCP LSB address space.
+///
+/// Each allocated unit is one 32-byte slot.  Hardware byte address of
+/// slot `n` is `n * LSB_ITEM_BYTES`.  The struct is `no_std`-compatible
+/// with no heap allocation.
+#[derive(Debug)]
+pub struct LsbPool {
+    /// 128-bit bitmap packed into two u64: bit i set means slot i is in use.
+    map: [u64; 2],
+}
+
+impl LsbPool {
+    /// Create an empty pool (all 128 slots free).
+    pub const fn new() -> Self {
+        LsbPool { map: [0u64; 2] }
+    }
+
+    /// Allocate one 32-byte slot.  Returns `Some(slot_index)` or `None`.
+    pub fn alloc(&mut self) -> Option<u32> {
+        for word in 0..2usize {
+            let w = self.map[word];
+            if w != u64::MAX {
+                let bit = w.trailing_ones() as usize;
+                self.map[word] |= 1u64 << bit;
+                return Some((word * 64 + bit) as u32);
+            }
+        }
+        None
+    }
+
+    /// Free a previously allocated slot.
+    pub fn free(&mut self, slot: u32) {
+        let slot = slot as usize;
+        if slot >= LSB_TOTAL_SLOTS {
+            return;
+        }
+        self.map[slot / 64] &= !(1u64 << (slot % 64));
+    }
+
+    /// Return `true` if `slot` is currently allocated.
+    pub fn is_allocated(&self, slot: u32) -> bool {
+        let slot = slot as usize;
+        if slot >= LSB_TOTAL_SLOTS {
+            return false;
+        }
+        (self.map[slot / 64] >> (slot % 64)) & 1 == 1
+    }
+
+    /// Number of free slots remaining.
+    pub fn free_count(&self) -> u32 {
+        let used: u32 = self.map.iter().map(|w| w.count_ones()).sum();
+        LSB_TOTAL_SLOTS as u32 - used
+    }
+}
+
+// ── Passthru descriptor (system memory → LSB) ────────────────────────
+//
+// Linux: ccp5_perform_passthru in ccp-dev-v5.c (GPL-2.0-or-later).
+// Copies up to LSB_ITEM_BYTES bytes from DMA to one LSB slot.
+
+/// Encode the PASSTHRU function word.
+/// Linux union ccp_function .pt: bits[1:0]=byteswap, bits[4:2]=bitwise.
+/// NOOP values: byteswap=0, bitwise=0.
+#[inline]
+pub fn passthru_function(byteswap: u8, bitwise: u8) -> u16 {
+    ((byteswap as u16) & 0x3) | (((bitwise as u16) & 0x7) << 2)
+}
+
+/// Submit a PASSTHRU descriptor to copy data from system memory into LSB.
+///
+/// `byte_count` must be > 0 and <= `LSB_ITEM_BYTES` (32).
+/// `lsb_slot` is a slot index; hardware address = `lsb_slot * 32`.
+pub fn passthru_to_lsb<M: CcpMmio>(
+    mmio: &mut M,
+    src_phys: u64,
+    lsb_slot: u32,
+    byte_count: u32,
+    queue_ring: &mut [u32; 128],
+    tail_idx: &mut u32,
+    ring_phys: u64,
+) -> Result<(), CcpError> {
+    if byte_count == 0 || byte_count > LSB_ITEM_BYTES {
+        return Err(CcpError::InvalidKeySize);
+    }
+    let dst_addr = (lsb_slot * LSB_ITEM_BYTES) as u64;
+    let mut desc = Desc::new();
+    desc.set_engine(ENGINE_PASSTHRU);
+    desc.set_function(passthru_function(0, 0));
+    desc.set_ioc(true);
+    desc.set_eom(true);
+    desc.set_length(byte_count);
+    desc.set_src(src_phys, MEMTYPE_SYSTEM);
+    desc.set_dst(dst_addr, MEMTYPE_SB);
+    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+}
+
+// ── RSA constants and function encoder ───────────────────────────────
+//
+// Reference: ccp_run_rsa_cmd + ccp5_perform_rsa in Linux
+// drivers/crypto/ccp/{ccp-ops.c,ccp-dev-v5.c} (GPL-2.0-or-later).
+//
+// CCP v5 RSA function field (union ccp_function .rsa, bits[14:0]):
+//   bits[2:0]  = mode (0 = MODEXP, only supported mode)
+//   bits[14:3] = (key_size_bits + 7) / 8  [modulus byte count]
+//
+// Buffer sizing:
+//   o_len = 32 * ceil(key_bits / 256)     [output / modulus / exp buf]
+//   i_len = 2 * o_len                     [src = [mod | msg], both LE]
+
+/// RSA mode: modular exponentiation (only mode on CCP hardware).
+pub const RSA_MODE_MODEXP: u16 = 0;
+
+/// Maximum RSA key size in bits supported by CCP v5 (CCP5_RSA_MAX_WIDTH=16384).
+pub const RSA_MAX_BITS: u32 = 16384;
+
+/// Round key_size_bits up to a 256-bit (32-byte) boundary; return byte count.
+/// Matches Linux: `o_len = 32 * ((rsa->key_size + 255) / 256)`.
+#[inline]
+pub fn rsa_o_len(key_size_bits: u32) -> u32 {
+    32 * ((key_size_bits + 255) / 256)
+}
+
+/// Encode the RSA function word for a given key size.
+/// Matches Linux: `CCP_RSA_SIZE(&function) = (op->u.rsa.mod_size + 7) >> 3`.
+#[inline]
+pub fn rsa_function(key_size_bits: u32) -> u16 {
+    let byte_len = (key_size_bits + 7) / 8;
+    RSA_MODE_MODEXP | ((byte_len as u16) << 3)
+}
+
+// ── RSA public API ────────────────────────────────────────────────────
+
+/// Submit a CCP_ENGINE_RSA modular-exponentiation descriptor.
+///
+/// The caller must pre-fill three DMA-coherent buffers:
+/// - `src_phys`  : `i_len = 2*o_len` bytes — `[LE_modulus | LE_message]`
+/// - `dst_phys`  : `o_len` bytes — result written here by hardware
+/// - `exp_phys`  : `o_len` bytes — little-endian exponent
+///
+/// Big-endian → little-endian reversal must be performed by the caller.
+/// On success the hardware writes the result to `dst_phys`.
+pub fn rsa_modexp_submit<M: CcpMmio>(
+    mmio: &mut M,
+    key_size_bits: u32,
+    src_phys: u64,
+    dst_phys: u64,
+    exp_phys: u64,
+    queue_ring: &mut [u32; 128],
+    tail_idx: &mut u32,
+    ring_phys: u64,
+) -> Result<(), CcpError> {
+    if key_size_bits == 0 || key_size_bits > RSA_MAX_BITS {
+        return Err(CcpError::InvalidKeySize);
+    }
+    let o_len = rsa_o_len(key_size_bits);
+    let i_len = o_len * 2;
+    let func = rsa_function(key_size_bits);
+    let mut desc = Desc::new();
+    desc.set_engine(ENGINE_RSA);
+    desc.set_function(func);
+    desc.set_ioc(true);
+    desc.set_init(false);
+    desc.set_eom(true);
+    desc.set_length(i_len);
+    desc.set_src(src_phys, MEMTYPE_SYSTEM);
+    desc.set_dst(dst_phys, MEMTYPE_SYSTEM);
+    desc.set_key(exp_phys, MEMTYPE_SYSTEM);
+    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+}
+
+// ── ECC constants ─────────────────────────────────────────────────────
+//
+// Reference: ccp.h enum ccp_ecc_function, ccp-dev.h CCP_ECC_*, and
+// ccp_run_ecc_pm_cmd + ccp5_perform_ecc in Linux
+// drivers/crypto/ccp/{ccp-ops.c,ccp-dev-v5.c} (GPL-2.0-or-later).
+//
+// CCP ECC function codes live in union ccp_function .ecc.mode bits[2:0]:
+//   MMUL=0, MADD=1, MINV=2, PADD=3, PMUL=4, PDBL=5
+//
+// PMUL (point multiplication) is used for ECDH scalar * base-point.
+//
+// PMUL input buffer (CCP_ECC_SRC_BUF_SIZE=448 = 7 * 64):
+//   slot 0: modulus p     (48 bytes LE in 64-byte slot)
+//   slot 1: P.x           (48 bytes LE in 64-byte slot)
+//   slot 2: P.y           (48 bytes LE in 64-byte slot)
+//   slot 3: P.z = 0x01   (1 byte at offset 0, rest zero)
+//   slot 4: domain_a      (48 bytes LE in 64-byte slot)
+//   slot 5: scalar k      (48 bytes LE in 64-byte slot)
+//   slot 6: (zero padding)
+//
+// PMUL output buffer (CCP_ECC_DST_BUF_SIZE=192 = 3 * 64):
+//   slot 0: R.x (LE)
+//   slot 1: R.y (LE)
+//   slot 2: flags — CCP_ECC_RESULT_SUCCESS (0x0001) at byte offset 60
+
+/// ECC function code: point multiplication (ECDH compute-shared-secret).
+pub const ECC_FUNC_PMUL: u16 = 4; // CCP_ECC_FUNCTION_PMUL_384BIT
+/// ECC function code: point addition.
+pub const ECC_FUNC_PADD: u16 = 3; // CCP_ECC_FUNCTION_PADD_384BIT
+/// ECC function code: point doubling.
+pub const ECC_FUNC_PDBL: u16 = 5; // CCP_ECC_FUNCTION_PDBL_384BIT
+/// ECC function code: modular multiplication.
+pub const ECC_FUNC_MMUL: u16 = 0; // CCP_ECC_FUNCTION_MMUL_384BIT
+/// ECC function code: modular addition.
+pub const ECC_FUNC_MADD: u16 = 1; // CCP_ECC_FUNCTION_MADD_384BIT
+/// ECC function code: modular inverse.
+pub const ECC_FUNC_MINV: u16 = 2; // CCP_ECC_FUNCTION_MINV_384BIT
+
+/// Bytes per ECC operand slot (CCP_ECC_OPERAND_SIZE=64).
+pub const ECC_OPERAND_SIZE: usize = 64;
+/// Total source buffer size for ECC point operations (CCP_ECC_SRC_BUF_SIZE=448).
+pub const ECC_SRC_BUF_SIZE: usize = 448;
+/// Total destination buffer size for ECC point operations (CCP_ECC_DST_BUF_SIZE=192).
+pub const ECC_DST_BUF_SIZE: usize = 192;
+/// Byte offset of the 16-bit result-flags field in the dst buffer (CCP_ECC_RESULT_OFFSET=60).
+pub const ECC_RESULT_OFFSET: usize = 60;
+/// Result flag bit: operation succeeded (CCP_ECC_RESULT_SUCCESS=0x0001).
+pub const ECC_RESULT_SUCCESS: u16 = 0x0001;
+/// Maximum ECC field size in bytes — 384 bits (CCP_ECC_MODULUS_BYTES=48).
+pub const ECC_MODULUS_BYTES: usize = 48;
+
+/// Encode the ECC function field (bits[2:0] = mode).
+#[inline]
+pub fn ecc_function(mode: u16) -> u16 {
+    mode & 0x7
+}
+
+// ── ECC public API ────────────────────────────────────────────────────
+
+/// Submit a CCP_ENGINE_ECC point-operation descriptor.
+///
+/// `ecc_mode` is one of `ECC_FUNC_PMUL`, `ECC_FUNC_PADD`, etc.
+/// `src_phys` points to a 448-byte input buffer (pre-built by caller).
+/// `dst_phys` points to a 192-byte output buffer.
+pub fn ecc_point_op_submit<M: CcpMmio>(
+    mmio: &mut M,
+    ecc_mode: u16,
+    src_phys: u64,
+    src_len: u32,
+    dst_phys: u64,
+    queue_ring: &mut [u32; 128],
+    tail_idx: &mut u32,
+    ring_phys: u64,
+) -> Result<(), CcpError> {
+    let func = ecc_function(ecc_mode);
+    let mut desc = Desc::new();
+    desc.set_engine(ENGINE_ECC);
+    desc.set_function(func);
+    desc.set_ioc(true);
+    desc.set_init(false);
+    desc.set_eom(true);
+    desc.set_length(src_len);
+    desc.set_src(src_phys, MEMTYPE_SYSTEM);
+    desc.set_dst(dst_phys, MEMTYPE_SYSTEM);
+    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+}
+
+// ── NIST P-256 / P-384 curve parameters (FIPS 186-4) ─────────────────
+
+/// NIST P-256 prime p (big-endian).
+pub const P256_P_BE: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// NIST P-256 curve parameter a = p - 3 (big-endian).
+pub const P256_A_BE: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc,
+];
+
+/// NIST P-384 prime p (big-endian).
+pub const P384_P_BE: [u8; 48] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// NIST P-384 curve parameter a (big-endian).
+pub const P384_A_BE: [u8; 48] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xfc,
+];
+
+// ── ECC buffer helpers ────────────────────────────────────────────────
+
+/// Copy a big-endian slice into a 64-byte LE operand slot, zero-padded.
+fn write_ecc_operand_le(buf: &mut [u8; ECC_OPERAND_SIZE], src_be: &[u8]) {
+    buf.fill(0);
+    let n = src_be.len().min(ECC_MODULUS_BYTES);
+    for (i, &b) in src_be[..n].iter().rev().enumerate() {
+        buf[i] = b;
+    }
+}
+
+/// Build the 448-byte PMUL source buffer for an ECC point multiplication.
+///
+/// All operands are supplied big-endian and converted to LE internally.
+/// Layout: `[p | P.x | P.y | P.z=1 | domain_a | scalar_k | padding]`
+pub fn build_ecc_pmul_src(
+    p_be: &[u8],
+    px_be: &[u8],
+    py_be: &[u8],
+    a_be: &[u8],
+    k_be: &[u8],
+) -> [u8; ECC_SRC_BUF_SIZE] {
+    let mut buf = [0u8; ECC_SRC_BUF_SIZE];
+    macro_rules! put {
+        ($idx:expr, $src:expr) => {{
+            let mut slot = [0u8; ECC_OPERAND_SIZE];
+            write_ecc_operand_le(&mut slot, $src);
+            buf[$idx * ECC_OPERAND_SIZE..($idx + 1) * ECC_OPERAND_SIZE]
+                .copy_from_slice(&slot);
+        }};
+    }
+    put!(0, p_be);
+    put!(1, px_be);
+    put!(2, py_be);
+    buf[3 * ECC_OPERAND_SIZE] = 0x01; // P.z = 1 (affine projective)
+    put!(4, a_be);
+    put!(5, k_be);
+    // slot 6 stays zero (padding)
+    buf
+}
+
+/// Extract X and Y coordinates from a 192-byte ECC result buffer.
+///
+/// Returns `(x_le[64], y_le[64])` where each is hardware LE.
+/// Caller reverses bytes to obtain big-endian coordinates.
+pub fn parse_ecc_pmul_dst(
+    dst: &[u8; ECC_DST_BUF_SIZE],
+) -> ([u8; ECC_OPERAND_SIZE], [u8; ECC_OPERAND_SIZE]) {
+    let mut x = [0u8; ECC_OPERAND_SIZE];
+    let mut y = [0u8; ECC_OPERAND_SIZE];
+    x.copy_from_slice(&dst[0..ECC_OPERAND_SIZE]);
+    y.copy_from_slice(&dst[ECC_OPERAND_SIZE..2 * ECC_OPERAND_SIZE]);
+    (x, y)
+}
+
+/// Check the ECC result flags at byte offset 60 of the 192-byte dst buffer.
+/// Returns `true` if bit 0 (CCP_ECC_RESULT_SUCCESS) is set.
+pub fn ecc_result_ok(dst: &[u8; ECC_DST_BUF_SIZE]) -> bool {
+    let flags =
+        (dst[ECC_RESULT_OFFSET] as u16) | ((dst[ECC_RESULT_OFFSET + 1] as u16) << 8);
+    (flags & ECC_RESULT_SUCCESS) != 0
 }
 
 // ── Simple blocking submit ────────────────────────────────────────────
@@ -1029,3 +1412,272 @@ fn smoke_ccp_sha_function_encoding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/crypto", smoke_ccp_sha_function_encoding);
+
+// ── New smokes 8-12: LSB allocator, RSA, ECC ─────────────────────────
+
+/// Smoke 8: LSB allocator alloc + free round-trip.
+fn smoke_ccp_lsb_alloc_free() -> TestResult {
+    let mut pool = LsbPool::new();
+
+    if pool.free_count() != LSB_TOTAL_SLOTS as u32 {
+        return TestResult::Fail("LsbPool should start with all slots free");
+    }
+
+    let s0 = match pool.alloc() {
+        Some(s) => s,
+        None => return TestResult::Fail("first alloc should succeed"),
+    };
+    if s0 != 0 {
+        return TestResult::Fail("first allocated slot should be 0");
+    }
+    if !pool.is_allocated(0) {
+        return TestResult::Fail("slot 0 should report allocated after alloc");
+    }
+    if pool.free_count() != LSB_TOTAL_SLOTS as u32 - 1 {
+        return TestResult::Fail("free_count should decrease by 1 after alloc");
+    }
+
+    let s1 = match pool.alloc() {
+        Some(s) => s,
+        None => return TestResult::Fail("second alloc should succeed"),
+    };
+    if s1 != 1 {
+        return TestResult::Fail("second allocated slot should be 1");
+    }
+
+    pool.free(s0);
+    if pool.is_allocated(0) {
+        return TestResult::Fail("slot 0 should be free after free()");
+    }
+
+    let s0b = match pool.alloc() {
+        Some(s) => s,
+        None => return TestResult::Fail("re-alloc after free should succeed"),
+    };
+    if s0b != 0 {
+        return TestResult::Fail("re-alloc should return previously freed slot 0");
+    }
+
+    let mut slots = alloc::vec![s0b, s1];
+    for _ in 2..LSB_TOTAL_SLOTS {
+        match pool.alloc() {
+            Some(s) => slots.push(s),
+            None => return TestResult::Fail("pool exhausted before all 128 slots allocated"),
+        }
+    }
+    if pool.free_count() != 0 {
+        return TestResult::Fail("pool should be empty after allocating all slots");
+    }
+    if pool.alloc().is_some() {
+        return TestResult::Fail("alloc on exhausted pool should return None");
+    }
+
+    for s in &slots {
+        pool.free(*s);
+    }
+    if pool.free_count() != LSB_TOTAL_SLOTS as u32 {
+        return TestResult::Fail("pool should be full again after freeing all slots");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/crypto", smoke_ccp_lsb_alloc_free);
+
+/// Smoke 9: RSA descriptor encoding — function = MODEXP, correct sizes.
+fn smoke_ccp_rsa_descriptor_encoding() -> TestResult {
+    // RSA-2048: o_len = 256, i_len = 512
+    let o_len_2048 = rsa_o_len(2048);
+    if o_len_2048 != 256 {
+        return TestResult::Fail("RSA-2048 o_len should be 256");
+    }
+    let i_len_2048 = o_len_2048 * 2;
+    if i_len_2048 != 512 {
+        return TestResult::Fail("RSA-2048 i_len should be 512");
+    }
+
+    // RSA-3072: o_len = 384
+    let o_len_3072 = rsa_o_len(3072);
+    if o_len_3072 != 384 {
+        return TestResult::Fail("RSA-3072 o_len should be 384");
+    }
+
+    // rsa_function(2048): byte_len=(2048+7)/8=256; func = 0|(256<<3) = 2048
+    let f2048 = rsa_function(2048);
+    let mode = f2048 & 0x7;
+    let size = (f2048 >> 3) & 0xFFF;
+    if mode != RSA_MODE_MODEXP {
+        return TestResult::Fail("RSA function mode bits should be MODEXP (0)");
+    }
+    if size != 256 {
+        return TestResult::Fail("RSA-2048 function size field should be 256");
+    }
+
+    // Build a descriptor and verify fields.
+    let mut desc = Desc::new();
+    desc.set_engine(ENGINE_RSA);
+    desc.set_function(f2048);
+    desc.set_ioc(true);
+    desc.set_eom(true);
+    desc.set_length(512);
+    desc.set_src(0xABCD_0000u64, MEMTYPE_SYSTEM);
+    desc.set_dst(0xDEF0_0000u64, MEMTYPE_SYSTEM);
+    desc.set_key(0x1234_5678u64, MEMTYPE_SYSTEM);
+
+    if desc.engine() != ENGINE_RSA {
+        return TestResult::Fail("RSA descriptor engine field wrong");
+    }
+    if desc.function() != f2048 {
+        return TestResult::Fail("RSA descriptor function field wrong");
+    }
+    if desc.length() != 512 {
+        return TestResult::Fail("RSA descriptor length field wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/crypto", smoke_ccp_rsa_descriptor_encoding);
+
+/// Smoke 10: ECC descriptor encoding — engine=ECC, function=PMUL.
+fn smoke_ccp_ecc_descriptor_encoding() -> TestResult {
+    let f = ecc_function(ECC_FUNC_PMUL);
+    if f != 4 {
+        return TestResult::Fail("ECC PMUL function code should be 4");
+    }
+    let f_padd = ecc_function(ECC_FUNC_PADD);
+    if f_padd != 3 {
+        return TestResult::Fail("ECC PADD function code should be 3");
+    }
+
+    let mut desc = Desc::new();
+    desc.set_engine(ENGINE_ECC);
+    desc.set_function(f);
+    desc.set_ioc(true);
+    desc.set_eom(true);
+    desc.set_length(ECC_SRC_BUF_SIZE as u32);
+    desc.set_src(0x1000_0000u64, MEMTYPE_SYSTEM);
+    desc.set_dst(0x2000_0000u64, MEMTYPE_SYSTEM);
+
+    if desc.engine() != ENGINE_ECC {
+        return TestResult::Fail("ECC descriptor engine field wrong");
+    }
+    if desc.function() != ECC_FUNC_PMUL {
+        return TestResult::Fail("ECC descriptor function field wrong");
+    }
+    if desc.length() != ECC_SRC_BUF_SIZE as u32 {
+        return TestResult::Fail("ECC descriptor length field wrong");
+    }
+    if desc.dst_mem() != MEMTYPE_SYSTEM {
+        return TestResult::Fail("ECC descriptor dst_mem should be MEMTYPE_SYSTEM");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/crypto", smoke_ccp_ecc_descriptor_encoding);
+
+/// Smoke 11: RSA round-trip on FakeMmio — descriptor bytes verified.
+fn smoke_ccp_rsa_fake_mmio_round_trip() -> TestResult {
+    use test_support::FakeMmio;
+
+    let mut mmio = FakeMmio::new();
+    mmio.queue_int_response(0, INT_COMPLETION);
+
+    let mut ring = [0u32; 128];
+    let mut tail = 0u32;
+
+    let res = rsa_modexp_submit(
+        &mut mmio, 2048, 0x4000, 0x5000, 0x6000,
+        &mut ring, &mut tail, 0,
+    );
+    if res.is_err() {
+        return TestResult::Fail("rsa_modexp_submit returned error on FakeMmio");
+    }
+    if tail != 1 {
+        return TestResult::Fail("tail should advance to 1 after RSA submit");
+    }
+
+    // Verify descriptor at ring slot 0.
+    let engine = ((ring[0] >> 20) & 0xF) as u8;
+    if engine != ENGINE_RSA {
+        return TestResult::Fail("ring descriptor engine should be ENGINE_RSA");
+    }
+    // function: mode=0 (MODEXP), size=256 at bits[14:3] -> raw=256<<3=2048
+    let func = ((ring[0] >> 5) & 0x7FFF) as u16;
+    let rsa_size = (func >> 3) & 0xFFF;
+    if rsa_size != 256 {
+        return TestResult::Fail("RSA descriptor size field should be 256 for 2048-bit key");
+    }
+    if ring[1] != 512 {
+        return TestResult::Fail("RSA descriptor length (dw1) should be 512");
+    }
+    if ring[2] != 0x4000 {
+        return TestResult::Fail("RSA descriptor src_lo should be 0x4000");
+    }
+    if ring[4] != 0x5000 {
+        return TestResult::Fail("RSA descriptor dst_lo should be 0x5000");
+    }
+    if ring[6] != 0x6000 {
+        return TestResult::Fail("RSA descriptor key_lo should be 0x6000");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/crypto", smoke_ccp_rsa_fake_mmio_round_trip);
+
+/// Smoke 12: ECDH P-256 PMUL on FakeMmio — descriptor bytes + buffer layout.
+fn smoke_ccp_ecdh_fake_mmio_descriptor() -> TestResult {
+    use test_support::FakeMmio;
+
+    let mut mmio = FakeMmio::new();
+    mmio.queue_int_response(0, INT_COMPLETION);
+
+    let mut ring = [0u32; 128];
+    let mut tail = 0u32;
+
+    // Build P-256 PMUL source buffer from dummy inputs.
+    let private_key = [0x42u8; 32];
+    let peer_x = [0x11u8; 32];
+    let peer_y = [0x22u8; 32];
+    let src_buf = build_ecc_pmul_src(&P256_P_BE, &peer_x, &peer_y, &P256_A_BE, &private_key);
+
+    // P.z byte at offset 3*64=192 must be 0x01.
+    if src_buf[3 * ECC_OPERAND_SIZE] != 0x01 {
+        return TestResult::Fail("P.z byte should be 0x01 at offset 192");
+    }
+    // First byte of LE modulus slot = last byte of P256_P_BE = 0xFF.
+    if src_buf[0] != 0xFF {
+        return TestResult::Fail("first byte of LE modulus should be 0xFF");
+    }
+
+    let res = ecc_point_op_submit(
+        &mut mmio, ECC_FUNC_PMUL, 0x8000, ECC_SRC_BUF_SIZE as u32, 0x9000,
+        &mut ring, &mut tail, 0,
+    );
+    if res.is_err() {
+        return TestResult::Fail("ecc_point_op_submit returned error on FakeMmio");
+    }
+    if tail != 1 {
+        return TestResult::Fail("tail should advance to 1 after ECC submit");
+    }
+
+    // Verify descriptor at ring slot 0.
+    let engine = ((ring[0] >> 20) & 0xF) as u8;
+    if engine != ENGINE_ECC {
+        return TestResult::Fail("ring descriptor engine should be ENGINE_ECC");
+    }
+    let func = ((ring[0] >> 5) & 0x7FFF) as u16;
+    if func != ECC_FUNC_PMUL {
+        return TestResult::Fail("ECC descriptor function should be ECC_FUNC_PMUL (4)");
+    }
+    if ring[1] != ECC_SRC_BUF_SIZE as u32 {
+        return TestResult::Fail("ECC descriptor length should be 448");
+    }
+    if ring[2] != 0x8000 {
+        return TestResult::Fail("ECC descriptor src_lo should be 0x8000");
+    }
+    if ring[4] != 0x9000 {
+        return TestResult::Fail("ECC descriptor dst_lo should be 0x9000");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/crypto", smoke_ccp_ecdh_fake_mmio_descriptor);
