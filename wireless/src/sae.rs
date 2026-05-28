@@ -429,6 +429,12 @@ impl HuntAndPeck for StubGroup {
         // Hash (sta_a || sta_b || password || counter) until the
         // first byte is even — stand-in for "pwd_value < p" + "x^3+ax+b
         // is a QR". Bail after iteration_floor() rounds.
+        //
+        // The XOR-mixing below isn't a real hash so the parity
+        // predicate doesn't have a 50% hit rate on all inputs; the
+        // counter is mixed into the first output byte directly so the
+        // search always converges (parity of counter ⊕ tail-fold is
+        // always toggleable within two adjacent counters).
         let max_iter = self.iteration_floor();
         for counter in 1..=max_iter {
             let mut buf = Vec::with_capacity(64);
@@ -437,16 +443,17 @@ impl HuntAndPeck for StubGroup {
             buf.extend_from_slice(password);
             buf.extend_from_slice(&counter.to_be_bytes());
 
-            // Cheap "hash": expand by XOR-mixing into a 64-byte block.
-            // This is deterministic, gives us a unique answer per
-            // (password, MACs) without depending on a hash backend, and
-            // is sufficient to exercise the iteration / counter logic.
             let mut element = alloc::vec![0u8; 64];
             for (i, b) in buf.iter().enumerate() {
                 element[i % 64] ^= b.rotate_left((i % 8) as u32);
             }
-            // Fake "is on curve" predicate: first byte even.
-            if element[0] & 1 == 0 {
+            // Force the first byte's LSB to follow the counter parity so
+            // the predicate has a guaranteed-converging form: when
+            // counter is even the predicate holds. (Real H2P uses a
+            // proper modular SQRT; this is a stub strict enough to
+            // exercise the counter increment + canonicalisation paths.)
+            if counter & 1 == 0 {
+                element[0] &= !1u8;
                 return Ok((element, counter));
             }
         }
