@@ -70,17 +70,29 @@ pub trait TrapContext {
         false
     }
 
-    /// Rewrite the trap frame to deliver `handler_vaddr` with
-    /// `signum` to user mode. Pushes a synthetic `[saved_rip,
-    /// signum]` pair onto the user's RSP so the handler can
-    /// `ret` back into the trapped code, sets the first SysV
-    /// integer-arg register to `signum`, and points the trap
-    /// frame's instruction pointer at `handler_vaddr`.
+    /// Rewrite the trap frame to deliver the signal described by
+    /// `params` to user mode. The arch pushes a frame (SigContext
+    /// for 1-arg handlers, `siginfo_t + ucontext_t` for SA_SIGINFO
+    /// handlers) onto the user stack (or altstack if SA_ONSTACK +
+    /// a non-disabled altstack is supplied), sets the SysV
+    /// integer-arg registers (RDI = signum always; RSI = &siginfo,
+    /// RDX = &ucontext for SA_SIGINFO), and points the trap
+    /// frame's instruction pointer at `params.handler`.
+    ///
+    /// SA_RESTART: when `params.flags & SA_RESTART != 0` AND the
+    /// outer trap is a restartable syscall (caller signals this
+    /// via `params.restartable_syscall`), the arch rewinds the
+    /// SAVED RIP (the one that sigreturn restores, not the live
+    /// `frame.rip` which gets overwritten with the handler) by
+    /// the architecturally-defined syscall-instruction length —
+    /// 2 bytes on x86_64 (both `int 0x80` (`CD 80`) and `syscall`
+    /// (`0F 05`)) — so that on handler return, the syscall
+    /// re-executes.
     ///
     /// Default: returns `false` — arches without a delivery
     /// implementation skip the rewrite, leaving the frame
     /// untouched. x86_64 overrides.
-    fn deliver_signal(&mut self, _handler_vaddr: u64, _signum: u32) -> bool {
+    fn deliver_signal(&mut self, _params: &SigDeliveryParams) -> bool {
         false
     }
 
@@ -119,6 +131,75 @@ pub trait TrapContext {
     fn redirect_to_user(&mut self, _entry_rip: u64, _entry_rsp: u64) -> bool {
         false
     }
+}
+
+// ── Signal-delivery params ──────────────────────────────────────────
+//
+// Arch-neutral bundle for `TrapContext::deliver_signal`. Carries the
+// per-`SigAction` flags + a snapshot of the per-task altstack +
+// whether the outer trap is a restartable syscall trap (so SA_RESTART
+// can rewind the syscall-instruction RIP).
+//
+// Lives here rather than in `handlers.rs` because `narf-frame` (which
+// holds the arch trap impls) doesn't depend on `narf-userspace`'s
+// handler internals — only on the `TrapContext` trait surface and
+// the structs the trait method takes.
+
+/// Linux `sa_flags` bits NARF interprets at delivery time.
+/// `SA_SIGINFO`, `SA_RESTART`, `SA_ONSTACK` are honoured by the arch
+/// `deliver_signal` impl. `SA_NODEFER` and `SA_RESETHAND` are
+/// post-delivery bookkeeping owned by the signal-hook layer.
+///
+/// Wire values match Linux `<asm-generic/signal.h>` (the same values
+/// the relibc shim writes when calling `sigaction(2)`).
+pub const SA_SIGINFO: u32 = 0x00_00_00_04;
+pub const SA_ONSTACK: u32 = 0x08_00_00_00;
+pub const SA_RESTART: u32 = 0x10_00_00_00;
+pub const SA_NODEFER: u32 = 0x40_00_00_00;
+pub const SA_RESETHAND: u32 = 0x80_00_00_00;
+
+/// Per-call signal-delivery parameters. Built by the signal-delivery
+/// hook from the looked-up `SigAction` + the per-task altstack +
+/// trap context, then passed to the arch `deliver_signal`.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SigDeliveryParams {
+    /// User vaddr of the handler the kernel jumps to on iretq.
+    /// For `SA_SIGINFO` handlers this is the 3-arg
+    /// `void(int, siginfo_t *, void *)` shape; otherwise the
+    /// classical 1-arg `void(int)` shape.
+    pub handler: u64,
+    /// Signal number (`SIGSEGV`, `SIGUSR1`, ...). Delivered as the
+    /// SysV first integer arg (RDI on x86_64).
+    pub signum: u32,
+    /// `sa_flags` bits from the matching `SigAction`. The arch
+    /// inspects `SA_SIGINFO` / `SA_ONSTACK` / `SA_RESTART`; the
+    /// post-delivery bits (`SA_NODEFER`, `SA_RESETHAND`) are read
+    /// by the hook layer, not the arch.
+    pub flags: u32,
+    /// Base of the configured altstack, or 0 if no altstack is
+    /// installed or `SS_DISABLE` is set. The arch ignores this
+    /// field unless `flags & SA_ONSTACK != 0`.
+    pub altstack_sp: u64,
+    /// Size in bytes of the configured altstack. The arch lays
+    /// the sigframe at `altstack_sp + altstack_size - sizeof
+    /// sigframe` so the stack grows down into it.
+    pub altstack_size: u64,
+    /// `true` when the outer trap is an int 0x80 / syscall trap
+    /// whose syscall number is in the restartable set. The arch
+    /// rewinds the saved-RIP by the syscall-instruction length
+    /// when `flags & SA_RESTART != 0 && restartable_syscall`.
+    pub restartable_syscall: bool,
+    /// `si_code` for the synthesised `siginfo_t` when
+    /// `SA_SIGINFO` is set. Async signals (kill/tkill) use
+    /// `SI_USER = 0`; sync signals (#GP, #PF) use a CPU-specific
+    /// `SEGV_MAPERR`/`SEGV_ACCERR`/`ILL_ILLOPC`/etc. The arch
+    /// stamps this verbatim into the user-visible siginfo
+    /// without further interpretation.
+    pub si_code: i32,
+    /// `si_addr` (faulting address) for synchronous signals.
+    /// 0 for async signals where it has no meaning. The arch
+    /// only writes this when `SA_SIGINFO` is set.
+    pub si_addr: u64,
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────

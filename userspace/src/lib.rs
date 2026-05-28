@@ -85,8 +85,9 @@ pub use process::{
 };
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain, syscall_number, syscall_pack,
-    syscall_version, FnHandler, RawFnHandler, RawSyscallHandler, Syscall, SyscallArgs,
-    SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext, SYS_NUMBER_MASK,
+    syscall_version, FnHandler, RawFnHandler, RawSyscallHandler, SigDeliveryParams, Syscall,
+    SyscallArgs, SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext,
+    SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_SIGINFO, SYS_NUMBER_MASK,
     SYS_VERSION_MASK, SYS_VERSION_SHIFT,
 };
 #[cfg(target_arch = "x86_64")]

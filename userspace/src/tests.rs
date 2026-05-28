@@ -1001,8 +1001,8 @@ fn smoke_userspace_signal_delivery() -> TestResult {
         fn returning_to_user(&self) -> bool {
             self.going_to_user
         }
-        fn deliver_signal(&mut self, h: u64, s: u32) -> bool {
-            self.delivered = Some((h, s));
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.delivered = Some((p.handler, p.signum));
             true
         }
     }
@@ -1064,7 +1064,7 @@ fn smoke_userspace_signal_delivery() -> TestResult {
         delivered: None,
         going_to_user: true,
     };
-    default_signal_delivery(&mut ctx);
+    default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
     let delivered = ctx.delivered;
     let pending_after = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
 
@@ -1321,8 +1321,8 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
-        fn deliver_signal(&mut self, h: u64, s: u32) -> bool {
-            self.delivered = Some((h, s));
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.delivered = Some((p.handler, p.signum));
             true
         }
     }
@@ -8891,14 +8891,14 @@ fn smoke_userspace_sa_nodefer_skips_auto_block() -> TestResult {
         fn set_return(&mut self, _: SyscallReturn) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
         fn returning_to_user(&self) -> bool { true }
-        fn deliver_signal(&mut self, _vaddr: u64, signum: u32) -> bool {
-            DELIVERED_SIG.store(signum, Ordering::Release);
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            DELIVERED_SIG.store(p.signum, Ordering::Release);
             true
         }
     }
     let mut ctx = UserBoundCtx { signum: 0 };
     DELIVERED_SIG.store(0, Ordering::Release);
-    crate::handlers::default_signal_delivery(&mut ctx);
+    crate::handlers::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
     let _ = ctx;
 
     let mask_after = crate::handlers::signal_mask_of(0xF800);
@@ -8960,14 +8960,14 @@ fn smoke_userspace_default_delivery_auto_blocks_without_nodefer() -> TestResult 
         fn set_return(&mut self, _: SyscallReturn) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
         fn returning_to_user(&self) -> bool { true }
-        fn deliver_signal(&mut self, _vaddr: u64, signum: u32) -> bool {
-            DELIVERED_SIG.store(signum, Ordering::Release);
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            DELIVERED_SIG.store(p.signum, Ordering::Release);
             true
         }
     }
     let mut ctx = UserBoundCtx;
     DELIVERED_SIG.store(0, Ordering::Release);
-    crate::handlers::default_signal_delivery(&mut ctx);
+    crate::handlers::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
 
     let mask_after = crate::handlers::signal_mask_of(0xF900);
     let delivered = DELIVERED_SIG.load(Ordering::Acquire);

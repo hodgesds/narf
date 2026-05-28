@@ -29,7 +29,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
-use crate::{fd, RawFnHandler, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext};
+use crate::{fd, RawFnHandler, SigDeliveryParams, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext};
 
 // ── Current-task lookup shim ───────────────────────────────────────
 //
@@ -6617,11 +6617,16 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
 }
 
 // Function-pointer hook: arch trap dispatcher invokes this on
-// every int-0x80 trap-return that's heading back to user mode,
-// just before the asm tail iretq's. Same shape as
-// `install_address_space_lookup` so the trap path doesn't need
-// a direct dep on this crate's signal internals.
-type SignalDeliveryHook = fn(&mut dyn TrapContext);
+// every int-0x80 / syscall trap-return that's heading back to
+// user mode, just before the asm tail iretq's. The arch passes
+// the raw syscall number the user trapped on so SA_RESTART can
+// consult the restartable-syscall table; a non-syscall caller
+// (e.g. a future trap-after-IRQ delivery point) would pass
+// `SYSCALL_NUM_NONE` and the restart path would short-circuit.
+//
+// Same shape as `install_address_space_lookup` so the trap path
+// doesn't need a direct dep on this crate's signal internals.
+type SignalDeliveryHook = fn(&mut dyn TrapContext, u32);
 
 static SIGNAL_DELIVERY_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SignalDeliveryHook>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -6639,10 +6644,97 @@ pub fn signal_delivery_hook() -> Option<SignalDeliveryHook> {
     *SIGNAL_DELIVERY_HOOK.lock()
 }
 
+/// Sentinel passed by callers that aren't on a syscall trap path.
+/// Today only int 0x80 invokes the hook, but the constant exists
+/// so future call sites (e.g. on-IRQ delivery) can reach the hook
+/// without faking a syscall number — `is_restartable_syscall`
+/// short-circuits to `false` on this value.
+pub const SYSCALL_NUM_NONE: u32 = u32::MAX;
+
+/// Subset of syscalls that observe Linux's "automatic restart on
+/// SA_RESTART" semantics. POSIX-2017 §2.4 lists the not-restartable
+/// set (the timeout/sleep/wait family); everything outside that set
+/// is restartable when SA_RESTART is set.
+///
+/// NARF round 1: most syscalls are non-blocking today, so the
+/// "interrupted by signal" return only fires from the explicitly
+/// blocking ones. Of those, the timeout family is NOT restarted;
+/// the rest ARE.
+///
+/// Returns `true` if the named syscall is in the "auto-restart on
+/// SA_RESTART" set. The check is keyed on `Syscall::from_raw` so a
+/// versioned wire number (top byte = version) still resolves to the
+/// canonical syscall.
+fn is_restartable_syscall(raw: u32) -> bool {
+    if raw == SYSCALL_NUM_NONE {
+        return false;
+    }
+    // Strip the version byte (top 8 bits) — restartability is a
+    // property of the canonical syscall, not its versioned variant.
+    let canonical = crate::syscall::syscall_number(raw);
+    let n = match crate::syscall::Syscall::from_raw(canonical) {
+        Some(s) => s,
+        None => return false,
+    };
+    // Linux: signal-targeted timeout variants (nanosleep,
+    // clock_nanosleep, rt_sigtimedwait, rt_sigsuspend, poll/
+    // epoll_wait with a timeout, ...) are NEVER auto-restarted
+    // regardless of SA_RESTART. The kernel returns
+    // ERESTART_RESTARTBLOCK / EINTR and the user sees the
+    // abbreviated sleep. See arch/x86/kernel/signal.c
+    // §handle_signal.
+    !matches!(
+        n,
+        crate::syscall::Syscall::Sleep
+            | crate::syscall::Syscall::RtSigtimedwait
+            | crate::syscall::Syscall::RtSigsuspend
+            | crate::syscall::Syscall::Poll
+            | crate::syscall::Syscall::EpollWait
+    )
+}
+
+/// Build the `SigDeliveryParams` for `(task, action, signum,
+/// syscall_no)`. Consults the per-task altstack registry + the
+/// restartable-syscall table so the arch `deliver_signal` impl
+/// has every signal-delivery decision pre-computed.
+fn build_delivery_params(
+    task: u64,
+    action: SigAction,
+    signum: u32,
+    syscall_no: u32,
+    si_code: i32,
+    si_addr: u64,
+) -> SigDeliveryParams {
+    // Altstack: only honour if SA_ONSTACK is set AND the slot is
+    // installed AND it's not SS_DISABLE. A misconfigured altstack
+    // (size below MIN_SIGSTKSZ) was already rejected at install
+    // time by `sys_sigaltstack`.
+    let altstack = sigaltstack_of(task);
+    let altstack_valid = (action.flags & SA_ONSTACK) != 0
+        && (altstack.flags & SS_DISABLE) == 0
+        && altstack.sp != 0
+        && altstack.size != 0;
+    SigDeliveryParams {
+        handler: action.handler,
+        signum,
+        flags: action.flags,
+        altstack_sp: if altstack_valid { altstack.sp } else { 0 },
+        altstack_size: if altstack_valid { altstack.size } else { 0 },
+        restartable_syscall: is_restartable_syscall(syscall_no),
+        si_code,
+        si_addr,
+    }
+}
+
 /// Default delivery hook: pick the lowest pending unmasked
 /// signal, look up its handler, ask the trap context to rewrite
 /// itself to deliver. Fast path — when nothing's pending it
 /// takes a single lock + a single bitmap read and returns.
+///
+/// `syscall_no` is the raw wire number of the syscall the trap
+/// is returning from (or `SYSCALL_NUM_NONE` if the hook is being
+/// driven from a non-syscall path). Consulted only for the
+/// `SA_RESTART` decision.
 ///
 /// SA flag handling:
 /// - SA_NODEFER (0x4000_0000): if set, don't auto-block the
@@ -6654,9 +6746,11 @@ pub fn signal_delivery_hook() -> Option<SignalDeliveryHook> {
 /// - SA_RESETHAND (0x8000_0000): clear the handler after delivery
 ///   so the next occurrence falls through to the default action.
 /// - SA_ONSTACK / SA_SIGINFO / SA_RESTART: passed through to the
-///   arch `deliver_signal` via the SigAction struct — landing
-///   gradually as the arch hooks gain the corresponding pieces.
-pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
+///   arch `deliver_signal` via the `SigDeliveryParams` so the
+///   arch can lay out the frame on the altstack (SA_ONSTACK),
+///   push the 3-arg siginfo_t+ucontext frame (SA_SIGINFO), and
+///   rewind RIP for re-execution (SA_RESTART).
+pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) {
     if !ctx.returning_to_user() {
         return;
     }
@@ -6687,7 +6781,9 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
         Some(a) => a,
         None => return,
     };
-    if !ctx.deliver_signal(action.handler, signum) {
+    // Async signals: si_code = SI_USER (0), si_addr = 0.
+    let params = build_delivery_params(task, action, signum, syscall_no, 0, 0);
+    if !ctx.deliver_signal(&params) {
         return;
     }
     // Clear only after the rewrite succeeded — a failed
@@ -6803,17 +6899,62 @@ pub fn sync_signal_hook() -> Option<SyncSignalHook> {
 /// panic surface, which is the right behaviour: a userland that
 /// hasn't installed a handler for SIGSEGV genuinely deserves
 /// the kernel-side crash dump.
+///
+/// SA_RESTART is intentionally a no-op on this path: a CPU
+/// exception is not a syscall trap (`restartable_syscall =
+/// false`), so the arch never rewinds RIP. SA_ONSTACK and
+/// SA_SIGINFO are honoured the same way as the async path.
+///
+/// For SA_SIGINFO synchronous signals, the arch stamps an
+/// architecture-specific `si_code` and the faulting address into
+/// the user-visible `siginfo_t`. Mapping per
+/// `arch/x86/include/uapi/asm/siginfo.h`:
+///   #PF (vector 14) → SIGSEGV, si_code = SEGV_ACCERR (2) /
+///                                 SEGV_MAPERR (1) depending on
+///                                 PF error-code bit 0 (present).
+///                                 si_addr = CR2.
+///   #GP (13)        → SIGSEGV, si_code = SI_KERNEL (0x80),
+///                                 si_addr = 0.
+///   #UD (6)         → SIGILL,  si_code = ILL_ILLOPC (1),
+///                                 si_addr = trapping RIP.
+///   #AC (17)        → SIGBUS,  si_code = BUS_ADRALN (1),
+///                                 si_addr = trapping RIP.
+///   #DE/#OF         → SIGFPE,  si_code = FPE_INTDIV (1) for #DE,
+///                                            FPE_INTOVF (2) for #OF,
+///                                 si_addr = trapping RIP.
+///   #BP (3)         → SIGTRAP, si_code = TRAP_BRKPT (1),
+///                                 si_addr = trapping RIP.
 pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> bool {
     let signum = match vector_to_signum(vector) {
         Some(s) => s,
         None => return false,
     };
     let task = current_task_id();
-    let handler = match sigaction_lookup(task, signum as usize) {
-        Some(h) => h,
+    let action = match sigaction_lookup_full(task, signum as usize) {
+        Some(a) => a,
         None => return false,
     };
-    ctx.deliver_signal(handler, signum)
+    // Best-effort si_code + si_addr. NARF's sync hook doesn't have
+    // direct access to CR2 (the arch trap path didn't forward it),
+    // so SEGV uses SI_KERNEL and SIGILL/etc. all report si_addr = 0.
+    // When the arch trap gains a `vector + payload` shape (#PF can
+    // carry CR2, others can carry RIP), this code is the call site
+    // that will start populating si_addr properly.
+    let (si_code, si_addr) = match vector {
+        14 => (2 /* SEGV_ACCERR */, 0),
+        13 => (0x80 /* SI_KERNEL */, 0),
+        6 => (1 /* ILL_ILLOPC */, 0),
+        17 => (1 /* BUS_ADRALN */, 0),
+        0 => (1 /* FPE_INTDIV */, 0),
+        4 => (2 /* FPE_INTOVF */, 0),
+        3 => (1 /* TRAP_BRKPT */, 0),
+        _ => (0, 0),
+    };
+    // Synchronous: not a syscall trap, so restartable_syscall =
+    // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
+    let params =
+        build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr);
+    ctx.deliver_signal(&params)
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────
