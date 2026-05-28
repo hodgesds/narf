@@ -253,6 +253,12 @@ pub struct ComputeQueue {
     /// Bound VMID, if known.
     pub vmid: Option<u8>,
     pub mapped: bool,
+    /// Per-queue priority — used by the round-robin scheduler.
+    pub priority: ComputePriority,
+    /// CWSR save area + ctl stack layout. `None` if the queue is
+    /// non-preemptible (legacy compute path); `Some` after
+    /// `attach_cwsr` programs the MQD.
+    pub cwsr: Option<CwsrMqdFields>,
 }
 
 /// KIQ scheduler — owns the queue pool + brings up / tears down
@@ -324,10 +330,30 @@ impl KiqScheduler {
             mqd_phys,
             vmid: None,
             mapped: true,
+            priority: ComputePriority::default(),
+            cwsr: None,
         };
         let idx = self.queues.len();
         self.queues.push(cq);
         Ok(idx)
+    }
+
+    /// Attach a CWSR save area to an already-mapped queue. The MQD
+    /// must be updated separately (the driver-glue layer writes the
+    /// `cp_hqd_ctx_save_*` fields into the MQD memory).
+    pub fn attach_cwsr(&mut self, idx: usize, fields: CwsrMqdFields) -> Result<(), ComputeError> {
+        let q = self.queues.get_mut(idx).ok_or(ComputeError::NoSuchQueue)?;
+        q.cwsr = Some(fields);
+        Ok(())
+    }
+
+    /// Set a queue's priority. Affects [`next_queue_at_priority`]
+    /// + [`build_set_priority`] (which produces the MES PM4 packet
+    /// to push the new priority to the hardware scheduler).
+    pub fn set_priority(&mut self, idx: usize, priority: ComputePriority) -> Result<(), ComputeError> {
+        let q = self.queues.get_mut(idx).ok_or(ComputeError::NoSuchQueue)?;
+        q.priority = priority;
+        Ok(())
     }
 
     /// Unmap a queue by scheduler index.
@@ -347,6 +373,153 @@ impl KiqScheduler {
     /// Currently-mapped queue count.
     pub fn mapped_count(&self) -> usize {
         self.queues.iter().filter(|q| q.mapped).count()
+    }
+
+    /// Pick the next queue to schedule under a round-robin policy
+    /// among queues at the given priority level. Returns `None` if
+    /// no mapped queue matches the priority.
+    pub fn next_queue_at_priority(
+        &self,
+        priority: ComputePriority,
+        start: usize,
+    ) -> Option<usize> {
+        let n = self.queues.len();
+        if n == 0 {
+            return None;
+        }
+        for offset in 0..n {
+            let i = (start + offset) % n;
+            let q = &self.queues[i];
+            if q.mapped && q.priority == priority {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+// ── Compute Wave Save/Restore (CWSR) ───────────────────────────────
+//
+// CWSR is the mechanism the GPU uses to preempt a long-running
+// compute kernel mid-wavefront. When the kernel-mode scheduler
+// signals a preemption, a per-wave trap handler saves the wave's
+// VGPRs / SGPRs / scratch ring state into a kernel-owned save area
+// addressed by `CP_HQD_CTX_SAVE_BASE_ADDR_LO/HI` and
+// `CP_HQD_CTX_SAVE_SIZE`.  When the queue is rescheduled the trap
+// handler restores from the same area.
+//
+// MQD fields per Linux v10_compute_mqd / v11_compute_mqd:
+//   cp_hqd_persistent_state |= QSWITCH_MODE bit
+//   cp_hqd_ctx_save_base_addr_lo/hi = ctx_save area phys
+//   cp_hqd_ctx_save_size            = area size in bytes
+//   cp_hqd_cntl_stack_size          = ctl_stack size in bytes
+//   cp_hqd_cntl_stack_offset        = ctl_stack_size (offset = size
+//                                       because ctl stack is at the
+//                                       *top* of the save area)
+//   cp_hqd_wg_state_offset          = ctl_stack_size (same reason)
+//
+// References:
+//   - Linux drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v10.c:120-148
+//   - Linux drivers/gpu/drm/amd/amdkfd/cwsr_trap_handler_gfx10.asm
+//     (the actual on-GPU shader that does the save/restore).
+
+/// CWSR-related fields a kernel-mode driver writes into the MQD.
+/// These are the *host-side* shape — the actual MQD layout is per-
+/// generation, but every modern compute MQD carries these fields.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CwsrMqdFields {
+    /// `cp_hqd_ctx_save_base_addr_{lo,hi}` — phys of the save area.
+    pub ctx_save_base_phys: u64,
+    /// `cp_hqd_ctx_save_size` — bytes.
+    pub ctx_save_size: u32,
+    /// `cp_hqd_cntl_stack_size` / `_offset` — bytes.
+    pub ctl_stack_size: u32,
+    /// `cp_hqd_wg_state_offset` — bytes (equals `ctl_stack_size`).
+    pub wg_state_offset: u32,
+    /// `cp_hqd_persistent_state.QSWITCH_MODE` bit set on the MQD.
+    pub persistent_state_qswitch: bool,
+}
+
+/// Errors building CWSR fields.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CwsrError {
+    /// Save area phys not 4 KiB aligned.
+    BadSaveAreaAlignment,
+    /// Save area too small for ctl stack + working area.
+    SaveAreaTooSmall,
+    /// Ctl stack size larger than save area.
+    CtlStackTooLarge,
+}
+
+/// Build the CWSR MQD field set. `ctl_stack_size` is the upper
+/// part of the save area reserved for the trap handler's control
+/// stack; the lower part holds the VGPR/SGPR/scratch state.
+///
+/// Mirrors the field assignment in `kfd_mqd_manager_v10.c::init_mqd`
+/// (line 132-143). The trap-handler layout puts the control stack
+/// at the top, so its offset equals the size.
+pub fn build_cwsr_fields(
+    ctx_save_base_phys: u64,
+    ctx_save_size: u32,
+    ctl_stack_size: u32,
+) -> Result<CwsrMqdFields, CwsrError> {
+    if ctx_save_base_phys & 0xFFF != 0 {
+        return Err(CwsrError::BadSaveAreaAlignment);
+    }
+    // Minimum: at least 64 KiB of state + the ctl stack.
+    const MIN_STATE_BYTES: u32 = 64 * 1024;
+    if ctx_save_size < ctl_stack_size + MIN_STATE_BYTES {
+        return Err(CwsrError::SaveAreaTooSmall);
+    }
+    if ctl_stack_size > ctx_save_size {
+        return Err(CwsrError::CtlStackTooLarge);
+    }
+    Ok(CwsrMqdFields {
+        ctx_save_base_phys,
+        ctx_save_size,
+        ctl_stack_size,
+        wg_state_offset: ctl_stack_size,
+        persistent_state_qswitch: true,
+    })
+}
+
+/// Per-queue compute priority. Matches `MES_AMD_PRIORITY_LEVEL`.
+/// Used by the round-robin scheduler in `KiqScheduler::next_queue_at_priority`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ComputePriority {
+    Low,
+    Normal,
+    Medium,
+    High,
+    Realtime,
+}
+
+impl Default for ComputePriority {
+    fn default() -> Self {
+        ComputePriority::Normal
+    }
+}
+
+/// Extend [`ComputeQueue`] with CWSR + priority via an associated
+/// state struct. Kept separate so the existing [`ComputeQueue`]
+/// surface is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueScheduleState {
+    pub priority: ComputePriority,
+    /// `Some` if the queue has a CWSR save area allocated.
+    pub cwsr: Option<CwsrMqdFields>,
+    /// `true` while a preemption is being driven (between
+    /// PREEMPT_QUEUE PM4 and the matching IH cookie).
+    pub preempting: bool,
+}
+
+impl Default for QueueScheduleState {
+    fn default() -> Self {
+        Self {
+            priority: ComputePriority::Normal,
+            cwsr: None,
+            preempting: false,
+        }
     }
 }
 
@@ -532,4 +705,97 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_ring_kind_engine_me);
+
+    // ── CWSR + priority ───────────────────────────────────────
+
+    fn smoke_cwsr_fields_rejects_misalignment() -> TestResult {
+        // 4KiB-misaligned save area is invalid.
+        match build_cwsr_fields(0x1001, 0x80000, 0x4000) {
+            Err(CwsrError::BadSaveAreaAlignment) => {}
+            _ => return TestResult::Fail("misalignment not flagged"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_cwsr_fields_rejects_misalignment);
+
+    fn smoke_cwsr_fields_rejects_undersized_save_area() -> TestResult {
+        // Save area only big enough for ctl stack — no room for state.
+        match build_cwsr_fields(0x1000, 0x8000, 0x8000) {
+            Err(CwsrError::SaveAreaTooSmall) => {}
+            _ => return TestResult::Fail("undersized save area not flagged"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_cwsr_fields_rejects_undersized_save_area);
+
+    fn smoke_cwsr_fields_layout_correct() -> TestResult {
+        let f = build_cwsr_fields(0x10_0000, 0x10_0000, 0x4000).expect("cwsr");
+        if f.ctx_save_base_phys != 0x10_0000 {
+            return TestResult::Fail("base phys wrong");
+        }
+        if f.ctl_stack_size != 0x4000 {
+            return TestResult::Fail("ctl stack size wrong");
+        }
+        if f.wg_state_offset != 0x4000 {
+            return TestResult::Fail("wg_state_offset must equal ctl stack size");
+        }
+        if !f.persistent_state_qswitch {
+            return TestResult::Fail("QSWITCH bit not set");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_cwsr_fields_layout_correct);
+
+    fn smoke_attach_cwsr_to_mapped_queue() -> TestResult {
+        let mut sched = KiqScheduler::new();
+        sched.mark_initialised(0xFF);
+        let idx = sched
+            .map_queue(1, 0, 1, 0x100, 0xCAFE_0000)
+            .expect("map");
+        let fields = build_cwsr_fields(0x10_0000, 0x10_0000, 0x4000).expect("cwsr");
+        sched.attach_cwsr(idx, fields).expect("attach");
+        if sched.queues[idx].cwsr.is_none() {
+            return TestResult::Fail("CWSR not attached");
+        }
+        // Attaching to a missing queue rejects.
+        match sched.attach_cwsr(99, fields) {
+            Err(ComputeError::NoSuchQueue) => {}
+            _ => return TestResult::Fail("bogus idx not rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_attach_cwsr_to_mapped_queue);
+
+    fn smoke_set_priority_round_robin() -> TestResult {
+        let mut sched = KiqScheduler::new();
+        sched.mark_initialised(0xFF);
+        let q0 = sched.map_queue(1, 0, 0, 0x100, 0x1000).expect("q0");
+        let q1 = sched.map_queue(1, 0, 1, 0x200, 0x2000).expect("q1");
+        let q2 = sched.map_queue(1, 0, 2, 0x300, 0x3000).expect("q2");
+        sched.set_priority(q0, ComputePriority::High).expect("p0");
+        sched.set_priority(q1, ComputePriority::Normal).expect("p1");
+        sched.set_priority(q2, ComputePriority::High).expect("p2");
+        // Iterate at High priority — should pick q0 then q2.
+        let pick0 = sched
+            .next_queue_at_priority(ComputePriority::High, 0)
+            .expect("pick0");
+        if pick0 != q0 {
+            return TestResult::Fail("first high-prio pick wrong");
+        }
+        let pick1 = sched
+            .next_queue_at_priority(ComputePriority::High, pick0 + 1)
+            .expect("pick1");
+        if pick1 != q2 {
+            return TestResult::Fail("second high-prio pick should wrap to q2");
+        }
+        // No realtime queues yet.
+        if sched
+            .next_queue_at_priority(ComputePriority::Realtime, 0)
+            .is_some()
+        {
+            return TestResult::Fail("realtime should be empty");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_set_priority_round_robin);
 }
