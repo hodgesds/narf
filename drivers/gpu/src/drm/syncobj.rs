@@ -326,8 +326,10 @@ impl SyncObjTable {
         if wait_all && all_signalled() {
             return Ok(ids[ids.len() - 1]);
         }
-        if let Some(id) = first_signalled() {
-            return Ok(id);
+        if !wait_all {
+            if let Some(id) = first_signalled() {
+                return Ok(id);
+            }
         }
         Err(SyncError::Timeout)
     }
