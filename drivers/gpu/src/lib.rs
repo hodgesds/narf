@@ -134,6 +134,7 @@ pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;
 pub mod amdgpu_ih;
 pub mod amdgpu_modeset;
+pub mod amdgpu_mst;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pageflip;
 pub mod amdgpu_pm4;
