@@ -36,11 +36,18 @@ use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 pub enum IoctlCmd {
     Version         = 0x00,
     GetCap          = 0x0C,
+    PrimeHandleToFd = 0x2D,
+    PrimeFdToHandle = 0x2E,
     ModeGetResources = 0xA0,
     ModeGetConnector = 0xA7,
     ModeRmFb        = 0xA8,
     ModeAddFb2      = 0xB8,
     ModeGetPlaneRes = 0xB5,
+    ModeAtomic      = 0xBC,
+    SyncobjCreate   = 0xBF,
+    SyncobjDestroy  = 0xC0,
+    SyncobjWait     = 0xC3,
+    SyncobjSignal   = 0xC5,
     /// Unrecognised ioctl — returned as an error.
     Unknown         = 0xFF,
 }
@@ -51,11 +58,18 @@ impl IoctlCmd {
         match raw & 0xFF {
             0x00 => IoctlCmd::Version,
             0x0C => IoctlCmd::GetCap,
+            0x2D => IoctlCmd::PrimeHandleToFd,
+            0x2E => IoctlCmd::PrimeFdToHandle,
             0xA0 => IoctlCmd::ModeGetResources,
             0xA7 => IoctlCmd::ModeGetConnector,
             0xA8 => IoctlCmd::ModeRmFb,
             0xB8 => IoctlCmd::ModeAddFb2,
             0xB5 => IoctlCmd::ModeGetPlaneRes,
+            0xBC => IoctlCmd::ModeAtomic,
+            0xBF => IoctlCmd::SyncobjCreate,
+            0xC0 => IoctlCmd::SyncobjDestroy,
+            0xC3 => IoctlCmd::SyncobjWait,
+            0xC5 => IoctlCmd::SyncobjSignal,
             _    => IoctlCmd::Unknown,
         }
     }
@@ -284,6 +298,17 @@ pub fn dispatch(
         IoctlCmd::ModeAddFb2 => handle_addfb2(card, arg),
         IoctlCmd::ModeRmFb   => handle_rmfb(card, arg),
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(card),
+        // Atomic / syncobj / prime ioctls are dispatched via the
+        // higher-level entry points in their own modules (the per-fd
+        // tables don't live on `Card`); the dispatcher just returns
+        // UnknownCmd for now so callers route them explicitly.
+        IoctlCmd::ModeAtomic
+        | IoctlCmd::SyncobjCreate
+        | IoctlCmd::SyncobjDestroy
+        | IoctlCmd::SyncobjWait
+        | IoctlCmd::SyncobjSignal
+        | IoctlCmd::PrimeHandleToFd
+        | IoctlCmd::PrimeFdToHandle => Err(DrmIoctlError::UnknownCmd),
         IoctlCmd::Unknown => Err(DrmIoctlError::UnknownCmd),
     }
 }
