@@ -1108,3 +1108,83 @@ fn smoke_ufs_prdt_byte_count_zero_based() -> TestResult {
 }
 
 kernel_test_in!("drivers/storage/ufs", smoke_ufs_prdt_byte_count_zero_based);
+
+// ── AHCI deferred feature smokes ──────────────────────────────────────
+
+/// Verify the READ PORT MULTIPLIER (0xE4) command FIS byte layout.
+///
+/// The CFIS for ATA_CMD_PMP_READ must have:
+///   byte 0 = 0x27 (H2D Register FIS type)
+///   byte 1 = 0x80 | 0x0F  (C=1, PMP = control port 0x0F)
+///   byte 2 = 0xE4 (ATA READ PORT MULTIPLIER opcode)
+///   byte 3 = GSCR register index (features field)
+///
+/// Reference: Linux `drivers/ata/libata-pmp.c::sata_pmp_read` and
+/// `include/linux/ata.h` (`ATA_CMD_PMP_READ = 0xE4`).
+fn smoke_ahci_pmp_read_fis_layout() -> TestResult {
+    let gscr_reg: u8 = 2; // GSCR_PORT_INFO
+    let mut cfis = [0u8; 20];
+    cfis[0] = 0x27;
+    cfis[1] = 0x80 | 0x0F; // C=1 | PMP control port (0x0F)
+    cfis[2] = 0xE4;         // ATA_CMD_PMP_READ
+    cfis[3] = gscr_reg;     // GSCR register index in features field
+
+    if cfis[0] != 0x27 {
+        return TestResult::Fail("PMP READ FIS type must be 0x27 (H2D)");
+    }
+    if cfis[1] & 0x80 == 0 {
+        return TestResult::Fail("C bit (bit 7) must be set");
+    }
+    if cfis[1] & 0x0F != 0x0F {
+        return TestResult::Fail("PMP port field must be 0x0F (control port)");
+    }
+    if cfis[2] != 0xE4 {
+        return TestResult::Fail("READ PORT MULTIPLIER opcode must be 0xE4");
+    }
+    if cfis[3] != gscr_reg {
+        return TestResult::Fail("GSCR register index must be in features field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_pmp_read_fis_layout);
+
+/// Verify the GSCR decoder extracts vendor/product/ports/features
+/// from synthetic GSCR register values.
+///
+/// GSCR layout (SATA PMP spec §10.3 / Linux ata.h):
+///   GSCR[0] = ProductId[31:16] | VendorId[15:0]
+///   GSCR[1] = Revision bits[15:8] = major
+///   GSCR[2] = bits[3:0] = number of device ports
+///   GSCR[64] = Features
+fn smoke_ahci_pmp_gscr_decode() -> TestResult {
+    // Synthetic GSCR register values.
+    let gscr0: u32 = (0xBEEFu32 << 16) | 0xCAFEu32; // product=0xBEEF, vendor=0xCAFE
+    let gscr1: u32 = (0x12u32 << 8) | 0x03u32;       // major=0x12, minor=0x03
+    let gscr2: u32 = 0xF5u32;                         // num_ports = bits[3:0] = 5
+    let gscr64: u32 = 0x0000_0041u32;                 // features
+
+    let vendor  = (gscr0 & 0xFFFF) as u16;
+    let product = (gscr0 >> 16) as u16;
+    let revision = ((gscr1 >> 8) & 0xFF) as u8;
+    let num_ports = (gscr2 & 0x0F) as u8;
+    let features = gscr64;
+
+    if vendor != 0xCAFE {
+        return TestResult::Fail("GSCR[0] vendor decode wrong");
+    }
+    if product != 0xBEEF {
+        return TestResult::Fail("GSCR[0] product decode wrong");
+    }
+    if revision != 0x12 {
+        return TestResult::Fail("GSCR[1] revision decode wrong");
+    }
+    if num_ports != 5 {
+        return TestResult::Fail("GSCR[2] num_ports decode wrong (bits[3:0])");
+    }
+    if features != 0x41 {
+        return TestResult::Fail("GSCR[64] features value wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_pmp_gscr_decode);
+

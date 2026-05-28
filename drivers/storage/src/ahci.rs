@@ -1463,24 +1463,209 @@ pub struct PmpTopology {
     pub vendor: u16,
     /// Port-multiplier product id (GSCR[0] high half).
     pub product: u16,
+    /// PMP revision byte (GSCR[1] bits[15:8]).
+    pub revision: u8,
+    /// Raw GSCR[64] Features register.
+    pub features: u32,
+}
+
+// ── PMP GSCR indices (SATA 3.x PMP spec §10.3 / Linux ata.h) ────────
+/// GSCR[0] = ProductId in high 16 bits, VendorId in low 16 bits.
+const GSCR_PROD_ID: u8 = 0;
+/// GSCR[1] = Revision: bits[15:8] = major, bits[7:0] = minor.
+const GSCR_REV: u8 = 1;
+/// GSCR[2] = Port Info: bits[3:0] = number of device ports.
+const GSCR_PORT_INFO: u8 = 2;
+/// GSCR[64] = Features (optional capability flags).
+const GSCR_FEAT: u8 = 64;
+
+/// PMP control port address — READ PORT MULTIPLIER commands that
+/// target the PMP's own register set use port-address 0x0F.
+/// Reference: SATA Port Multiplier Spec §6.2.2.
+const PMP_CTRL_PORT: u8 = 0x0F;
+
+/// Issue one READ PORT MULTIPLIER command (ATA opcode 0xE4) to read
+/// GSCR register `reg` from the PMP behind `port_idx`. Returns the
+/// 32-bit register value.
+///
+/// Wire format (SATA PMP spec §6.2 / ATA8-ACS §7.43):
+///
+///   CFIS (H2D Register FIS):
+///     +0  type   = 0x27 (Register H2D)
+///     +1  C=1    | PMP port = 0x0F (control port)
+///     +2  opcode = 0xE4 (READ PORT MULTIPLIER)
+///     +3  features = GSCR register index
+///     +12 sector-count = 0 (NODATA)
+///
+///   Response (D2H):
+///     nsect  = val[7:0]
+///     lbal   = val[15:8]
+///     lbam   = val[23:16]
+///     lbah   = val[31:24]
+///
+/// Reference: Linux `drivers/ata/libata-pmp.c::sata_pmp_read`, which
+/// sets `tf.feature = reg; tf.device = link->pmp` and reads back
+/// `tf.nsect | tf.lbal<<8 | tf.lbam<<16 | tf.lbah<<24`.
+///
+/// # Safety
+/// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
+pub unsafe fn pmp_read_gscr(
+    ahci: &Ahci,
+    port_idx: u8,
+    reg: u8,
+) -> Result<u32, AhciError> {
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+
+    // Stop port if running.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    // Use the persistent scratch at the same layout as identify_device
+    // (cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500, data_buf@0x600).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl = base + 0x500;
+
+    // Zero the used range.
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..(0x500 + 64) {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+    }
+
+    // Command-list header 0: PRDT length = 0 (NODATA), CFL = 5.
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_list as *mut u32, 5); // PRDT_LEN=0, CFL=5
+        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+    }
+
+    // CFIS: H2D Register FIS for READ PORT MULTIPLIER (0xE4).
+    //   +0  type = 0x27
+    //   +1  C=1 | PMP_port = 0x0F  → 0x80 | 0x0F = 0x8F
+    //   +2  command = 0xE4
+    //   +3  features = GSCR register index
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80 | PMP_CTRL_PORT);
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0xE4);
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, reg);
+    }
+
+    // Program port CLB / FB.
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        ahci.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x38, 1); // issue slot 0
+    }
+
+    // Poll for completion (5 s; NODATA round-trips in microseconds).
+    let mut errored = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            let ci = unsafe { ahci.mmio.read32(off + PORT_CI) };
+            let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                errored = true;
+                return true;
+            }
+            ci & 1 == 0
+        },
+        narf_time::Deadline::after_ms(5_000),
+    );
+    if errored || !done {
+        let _ = unsafe { ahci.port_idle(port_idx) };
+        return Err(AhciError::ResetTimeout);
+    }
+
+    // The D2H Register FIS is deposited at fis_recv + 0x40 (D2H FIS
+    // area in the received FIS structure, AHCI 1.3.1 §4.2.1.3).
+    // Bytes at the D2H FIS:
+    //   +0  type (0x34)
+    //   +1  misc
+    //   +2  status
+    //   +3  error
+    //   +4  LBA[7:0]   = nsect
+    //   +5  LBA[15:8]  = lbal
+    //   +6  LBA[23:16] = lbam
+    //   +8  LBA[31:24] = lbah
+    // For READ PORT MULTIPLIER the returned value occupies:
+    //   nsect = val[7:0], lbal = val[15:8], lbam = val[23:16],
+    //   lbah = val[31:24].  Reference: Linux libata-pmp.c line 57.
+    let d2h = fis_recv + 0x40;
+    let val = unsafe {
+        let nsect = core::ptr::read_volatile((d2h + 4) as *const u8) as u32;
+        let lbal  = core::ptr::read_volatile((d2h + 5) as *const u8) as u32;
+        let lbam  = core::ptr::read_volatile((d2h + 6) as *const u8) as u32;
+        let lbah  = core::ptr::read_volatile((d2h + 8) as *const u8) as u32;
+        nsect | (lbal << 8) | (lbam << 16) | (lbah << 24)
+    };
+
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    Ok(val)
 }
 
 /// Discover the topology behind a PMP-attached port. Returns `None`
 /// if the port wasn't a PMP at probe.
 ///
-/// Stage-4 cut: the actual GSCR readback uses READ PORT MULTIPLIER
-/// (ATA 0xE4) which targets the PMP control port (PMP port = 0x0F).
-/// Until that command lands, this returns a topology placeholder
-/// `(num_ports = 0)` so callers can branch on PMP presence.
-pub fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopology> {
+/// Issues READ PORT MULTIPLIER (ATA 0xE4) commands to read GSCR[0]
+/// (ProductId/VendorId), GSCR[1] (Revision), GSCR[2] (Port count),
+/// and GSCR[64] (Features). Topology is reported regardless of
+/// whether all GSCR reads succeed — partial failures yield zeroed
+/// fields.
+///
+/// Reference: Linux `drivers/ata/libata-pmp.c::sata_pmp_read_gscr`
+/// which reads registers {0,1,2,32,33,64,96} on attach.
+///
+/// # Safety
+/// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
+pub unsafe fn discover_pmp_topology(
+    ahci: &Ahci,
+    port_idx: u8,
+) -> Option<PmpTopology> {
     let info = ahci.ports.iter().find(|p| p.index == port_idx)?;
     if info.kind != PortKind::Pmp {
         return None;
     }
+
+    // GSCR[0] = ProductId[31:16] | VendorId[15:0]
+    let prod_id = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_PROD_ID) }.unwrap_or(0);
+    // GSCR[1] = Revision
+    let rev_raw = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_REV) }.unwrap_or(0);
+    // GSCR[2] = bits[3:0] = number of device ports
+    let port_info = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_PORT_INFO) }.unwrap_or(0);
+    // GSCR[64] = Features
+    let features = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_FEAT) }.unwrap_or(0);
+
     Some(PmpTopology {
-        num_ports: 0,
-        vendor: 0,
-        product: 0,
+        vendor: (prod_id & 0xFFFF) as u16,
+        product: (prod_id >> 16) as u16,
+        // Revision major byte: bits[15:8] per Linux ata.h sata_pmp_gscr_rev macro.
+        revision: ((rev_raw >> 8) & 0xFF) as u8,
+        // bits[3:0] = number of device ports.
+        num_ports: (port_info & 0x0F) as u8,
+        features,
     })
 }
 
@@ -1534,6 +1719,7 @@ pub fn identify_features(id: &[u8; 512]) -> (u16, u16) {
     let w83 = u16::from_le_bytes([id[166], id[167]]);
     (w82, w83)
 }
+
 
 /// Sync block-device adapter for the registry. Routes reads /
 /// writes through `ahci_read_lba` / `ahci_write_lba` against the
