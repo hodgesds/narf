@@ -4800,3 +4800,272 @@ fn smoke_drm_getcap_shape() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_getcap_shape);
+
+// ── amdgpu/smu v12+v13 opcode tables ───────────────────────────────
+//
+// Verify per-version opcode lookup correctness, the SmuVersion
+// detection path, SmuFwVersion decode, and the version-dispatched
+// public API against a FakeMmio mock.
+
+fn smoke_amdgpu_smu_v12_opcode_table_spot_checks() -> TestResult {
+    // Confirm that the SMU12 opcode table returns the expected numeric
+    // ids for a representative subset of canonical messages.
+    // Sources: smu_v12_0_ppsmc.h + renoir_ppt.c::renoir_message_map.
+    use crate::amdgpu_smu::PpsmcMsg;
+    use crate::amdgpu_smu_v12;
+
+    // TestMessage = 0x01, GetSmuVersion = 0x02, GetDriverIfVersion = 0x03.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::TestMessage) != Some(0x01) {
+        return TestResult::Fail("V12 TestMessage id != 0x01");
+    }
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::GetSmuVersion) != Some(0x02) {
+        return TestResult::Fail("V12 GetSmuVersion id != 0x02");
+    }
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::GetDriverIfVersion) != Some(0x03) {
+        return TestResult::Fail("V12 GetDriverIfVersion id != 0x03");
+    }
+    // GetGfxclkFrequency = 0x2A, GetFclkFrequency = 0x2B.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::GetGfxclkFrequency) != Some(0x2A) {
+        return TestResult::Fail("V12 GetGfxclkFrequency id != 0x2A");
+    }
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::GetFclkFrequency) != Some(0x2B) {
+        return TestResult::Fail("V12 GetFclkFrequency id != 0x2B");
+    }
+    // SetSoftMaxGfxClk = 0x30, SetHardMinGfxClk = 0x31.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::SetSoftMaxGfxClk) != Some(0x30) {
+        return TestResult::Fail("V12 SetSoftMaxGfxClk id != 0x30");
+    }
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::SetHardMinGfxClk) != Some(0x31) {
+        return TestResult::Fail("V12 SetHardMinGfxClk id != 0x31");
+    }
+    // SetSoftMinGfxclk doesn't exist on SMU12.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::SetSoftMinGfxclk) != None {
+        return TestResult::Fail("V12 SetSoftMinGfxclk should be None");
+    }
+    // PrepareMp1ForUnload doesn't exist on SMU12.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::PrepareMp1ForUnload) != None {
+        return TestResult::Fail("V12 PrepareMp1ForUnload should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_v12_opcode_table_spot_checks
+);
+
+fn smoke_amdgpu_smu_v13_opcode_table_spot_checks() -> TestResult {
+    // Confirm that the SMU13.0.4 opcode table returns the expected
+    // numeric ids.
+    // Source: smu_v13_0_4_ppsmc.h + smu_v13_0_4_ppt.c::message_map.
+    use crate::amdgpu_smu::PpsmcMsg;
+    use crate::amdgpu_smu_v13;
+
+    // TestMessage = 0x01 (same as V12).
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::TestMessage) != Some(0x01) {
+        return TestResult::Fail("V13 TestMessage id != 0x01");
+    }
+    // GetSmuVersion maps to GetPmfwVersion = 0x02 on SMU13.
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::GetSmuVersion) != Some(0x02) {
+        return TestResult::Fail("V13 GetSmuVersion (GetPmfwVersion) id != 0x02");
+    }
+    // GetDriverIfVersion = 0x03.
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::GetDriverIfVersion) != Some(0x03) {
+        return TestResult::Fail("V13 GetDriverIfVersion id != 0x03");
+    }
+    // GetGfxclkFrequency = 0x17, GetFclkFrequency = 0x18.
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::GetGfxclkFrequency) != Some(0x17) {
+        return TestResult::Fail("V13 GetGfxclkFrequency id != 0x17");
+    }
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::GetFclkFrequency) != Some(0x18) {
+        return TestResult::Fail("V13 GetFclkFrequency id != 0x18");
+    }
+    // SetSoftMinGfxclk = 0x09 (exists on V13, absent on V12).
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::SetSoftMinGfxclk) != Some(0x09) {
+        return TestResult::Fail("V13 SetSoftMinGfxclk id != 0x09");
+    }
+    // AllowGfxOff = 0x19, DisallowGfxOff = 0x1A.
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::AllowGfxOff) != Some(0x19) {
+        return TestResult::Fail("V13 AllowGfxOff id != 0x19");
+    }
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::DisallowGfxOff) != Some(0x1A) {
+        return TestResult::Fail("V13 DisallowGfxOff id != 0x1A");
+    }
+    // PrepareMp1ForUnload = 0x0C (exists on V13).
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::PrepareMp1ForUnload) != Some(0x0C) {
+        return TestResult::Fail("V13 PrepareMp1ForUnload id != 0x0C");
+    }
+    // PowerUpGfx absent on V13 (handled via GfxOff control).
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::PowerUpGfx) != None {
+        return TestResult::Fail("V13 PowerUpGfx should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_v13_opcode_table_spot_checks
+);
+
+fn smoke_amdgpu_smu_version_detect_from_driver_if() -> TestResult {
+    // Verify that SmuVersion::from_driver_if maps the correct
+    // driver-IF constants to the right enum variant.
+    use crate::amdgpu_smu::{SmuVersion, SMU12_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION};
+
+    // SMU12 (Renoir) driver-IF = 0x0F.
+    match SmuVersion::from_driver_if(SMU12_DRIVER_IF_VERSION) {
+        Some(SmuVersion::V12) => {}
+        _ => return TestResult::Fail("SMU12 driver-IF should map to V12"),
+    }
+    // SMU13.0.4 (Phoenix) driver-IF = 0x07.
+    match SmuVersion::from_driver_if(SMU_13_0_4_DRIVER_IF_VERSION) {
+        Some(SmuVersion::V13) => {}
+        _ => return TestResult::Fail("SMU13.0.4 driver-IF should map to V13"),
+    }
+    // Unknown value → None.
+    if SmuVersion::from_driver_if(0x42).is_some() {
+        return TestResult::Fail("unknown driver-IF should return None");
+    }
+    if SmuVersion::from_driver_if(0).is_some() {
+        return TestResult::Fail("zero driver-IF should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_version_detect_from_driver_if
+);
+
+fn smoke_amdgpu_smu_fw_version_decode() -> TestResult {
+    // SmuFwVersion::from_raw should decode the BCD-packed word into
+    // separate major/minor/revision fields.
+    use crate::amdgpu_smu::SmuFwVersion;
+
+    // Simulate a V13 PMFW version: major=0x00, minor=0x0D, rev=0x04
+    // packed as 0x000D_0400 (as returned by GetPmfwVersion on Phoenix).
+    let raw = 0x000D_0400u32;
+    let v = SmuFwVersion::from_raw(raw);
+    if v.major != 0x00 {
+        return TestResult::Fail("major decode wrong (0x000D_0400)");
+    }
+    if v.minor != 0x0D {
+        return TestResult::Fail("minor decode wrong (0x000D_0400)");
+    }
+    if v.revision != 0x04 {
+        return TestResult::Fail("revision decode wrong (0x000D_0400)");
+    }
+    if v.raw != raw {
+        return TestResult::Fail("raw field not preserved");
+    }
+
+    // Simulate a V12 SMU version: 0x000A_0203 (major=0, minor=0x0A,
+    // rev=0x02 — this is what the bring_up smoke uses).
+    let raw2 = 0x000A_0203u32;
+    let v2 = SmuFwVersion::from_raw(raw2);
+    if v2.minor != 0x0A {
+        return TestResult::Fail("minor decode wrong (0x000A_0203)");
+    }
+    if v2.revision != 0x02 {
+        return TestResult::Fail("revision decode wrong (0x000A_0203)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_fw_version_decode
+);
+
+fn smoke_amdgpu_smu_get_clock_mhz_end_to_end() -> TestResult {
+    // End-to-end mock: write msg → simulate response → read result.
+    // Tests the `get_clock_mhz` public API via a FakeMmio that
+    // scripts the exact canonical mailbox sequence.
+    use crate::amdgpu_smu::{
+        get_clock_mhz, ClockDomain, MockSmu, SmuVersion,
+        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+    };
+    use crate::amdgpu_smu_v13::V13_MSG_GET_GFXCLK;
+
+    let mp1_base: u32 = 0x1_6000;
+    let resp_off = mp1_base + MP1_C2PMSG_RESP_REL;
+    let arg_off = mp1_base + MP1_C2PMSG_ARG_REL;
+
+    // Script: handshake idle, response OK, ARG = 2400 MHz (GFXCLK).
+    let mut m = MockSmu::new();
+    m.stage_read(resp_off, 1);           // step 1: RESP non-zero (idle)
+    m.stage_read(resp_off, SMU_RESP_OK); // step 5: SMU responds OK
+    m.stage_read(arg_off, 2400);         // step 6: ARG holds frequency
+
+    let mhz = match get_clock_mhz(&mut m, mp1_base, SmuVersion::V13, ClockDomain::Gfxclk) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("get_clock_mhz errored on happy path");
+        }
+    };
+    if mhz != 2400 {
+        return TestResult::Fail("returned MHz != 2400");
+    }
+    // The MSG register must have been written with the V13 GFXCLK id.
+    let msg_write = m.writes.iter().find(|(off, _)| *off == mp1_base + MP1_C2PMSG_MSG_REL);
+    match msg_write {
+        Some((_, id)) if *id == V13_MSG_GET_GFXCLK => {}
+        Some((_, id)) => {
+            let _ = id;
+            return TestResult::Fail("MSG register holds wrong message id");
+        }
+        None => return TestResult::Fail("MSG register never written"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_get_clock_mhz_end_to_end
+);
+
+fn smoke_amdgpu_smu_v12_v13_opcodes_differ_where_expected() -> TestResult {
+    // Structural: confirm that the key messages that differ between
+    // V12 and V13 actually carry distinct numeric ids. If they ever
+    // accidentally converge the version-dispatch would become a no-op
+    // on those messages.
+    use crate::amdgpu_smu::PpsmcMsg;
+    use crate::amdgpu_smu_v12;
+    use crate::amdgpu_smu_v13;
+
+    // GetGfxclkFrequency: V12=0x2A, V13=0x17 — must differ.
+    let v12_gfx = amdgpu_smu_v12::msg_id(PpsmcMsg::GetGfxclkFrequency);
+    let v13_gfx = amdgpu_smu_v13::msg_id(PpsmcMsg::GetGfxclkFrequency);
+    if v12_gfx == v13_gfx {
+        return TestResult::Fail("GetGfxclkFrequency ids must differ V12 vs V13");
+    }
+
+    // GetFclkFrequency: V12=0x2B, V13=0x18 — must differ.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::GetFclkFrequency)
+        == amdgpu_smu_v13::msg_id(PpsmcMsg::GetFclkFrequency)
+    {
+        return TestResult::Fail("GetFclkFrequency ids must differ V12 vs V13");
+    }
+
+    // AllowGfxOff: V12=0x07, V13=0x19 — must differ.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::AllowGfxOff)
+        == amdgpu_smu_v13::msg_id(PpsmcMsg::AllowGfxOff)
+    {
+        return TestResult::Fail("AllowGfxOff ids must differ V12 vs V13");
+    }
+
+    // TestMessage: both are 0x01 — must be equal.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::TestMessage)
+        != amdgpu_smu_v13::msg_id(PpsmcMsg::TestMessage)
+    {
+        return TestResult::Fail("TestMessage must be 0x01 on both V12 and V13");
+    }
+
+    // GetDriverIfVersion: both 0x03 — must be equal.
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::GetDriverIfVersion)
+        != amdgpu_smu_v13::msg_id(PpsmcMsg::GetDriverIfVersion)
+    {
+        return TestResult::Fail("GetDriverIfVersion must be 0x03 on both versions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_v12_v13_opcodes_differ_where_expected
+);
