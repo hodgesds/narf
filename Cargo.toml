@@ -85,6 +85,7 @@ members = [
     "drivers/fs/fat",
     "drivers/fs/exfat",
     "drivers/fs/ext2",
+    "drivers/fs/ext4",
     "drivers/fs/minix",
     "drivers/fs/iso9660",
     "drivers/fs/udf",

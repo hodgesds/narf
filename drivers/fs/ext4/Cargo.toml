@@ -1,0 +1,38 @@
+[package]
+name         = "narf-drivers-fs-ext4"
+description  = "ext4 filesystem driver (extent trees + JBD2 journal). Specialised companion to drivers/fs/ext2."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_fs_ext4"
+path = "src/lib.rs"
+
+# ext4 is the ext-family's flagship layout (extent trees, JBD2 journal,
+# 64-bit, FLEX_BG). The on-disk types live in `drivers/fs/ext2/` —
+# that crate already carries ext4-aware decoders because it was
+# written to grow ext2 → ext3 → ext4 along the feature-flag axis. This
+# crate re-exports those types behind ext4-flavour names and layers
+# the ext4-specific contract (must have EXTENTS, must validate
+# extent-tree on every inode) on top.
+[dependencies]
+narf-lib              = { path = "../../../lib" }
+narf-arch             = { path = "../../../arch" }
+narf-drivers          = { path = "../../" }
+narf-driver-runtime   = { path = "../../runtime" }
+narf-capabilities     = { path = "../../../capabilities" }
+narf-memory           = { path = "../../../memory" }
+narf-block            = { path = "../../../block" }
+narf-filesystem       = { path = "../../../filesystem" }
+narf-io               = { path = "../../../io" }
+narf-init             = { path = "../../../init" }
+narf-scheduler        = { path = "../../../scheduler" }
+narf-time             = { path = "../../../time" }
+narf-drivers-fs-ext2  = { path = "../ext2" }
+narf-kernel-test      = { path = "../../../verification/kernel-test" }
+
+[lints]
+workspace = true
