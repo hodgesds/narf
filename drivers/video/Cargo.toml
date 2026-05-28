@@ -1,0 +1,29 @@
+[package]
+name         = "narf-drivers-video"
+description  = "Camera ISP driver scaffold — Intel IPU3/IPU6 + AMD MP2 ISP (Stage-0/1)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_video"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib             = { path = "../../lib" }
+narf-capabilities    = { path = "../../capabilities" }
+narf-kernel-test     = { path = "../../verification/kernel-test" }
+narf-driver-runtime  = { path = "../runtime", default-features = false, features = ["kernel"] }
+narf-drivers         = { path = ".." }
+narf-bus             = { path = "../../bus" }
+narf-init            = { path = "../../init" }
+narf-drivers-i2c     = { path = "../i2c" }
+narf-console         = { path = "../../console" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
