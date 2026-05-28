@@ -327,6 +327,109 @@ fn mid(max: u8) -> u8 {
     max / 2
 }
 
+// ── PPSMC dispatch (live SMU mailbox push) ─────────────────────────
+//
+// After Dpm::apply_inputs returns the target (domain, level) list,
+// the driver must push:
+//   1. PPSMC_MSG_SetWorkloadMask(workload_mask)
+//   2. PPSMC_MSG_SetMinDeepSleepDcefclk(target_dcefclk_min)
+//   3. PPSMC_MSG_SetSoftMinByFreq / SetSoftMaxByFreq per clock domain.
+//
+// The SMU mailbox protocol is in amdgpu_smu.rs; here we model the
+// per-message dispatch + the param-encoding rules.
+//
+// Per Linux Phoenix uses SMU v13_0_4 — message IDs from
+// pmfw_if/smu_v13_0_0_ppsmc.h (lines 67-80):
+//   PPSMC_MSG_SetSoftMinByFreq           = 0x19
+//   PPSMC_MSG_SetSoftMaxByFreq           = 0x1A
+//   PPSMC_MSG_SetHardMinByFreq           = 0x1B
+//   PPSMC_MSG_SetHardMaxByFreq           = 0x1C
+//   PPSMC_MSG_SetWorkloadMask            = 0x24
+//   PPSMC_MSG_SetMinDeepSleepDcefclk     = 0x24 (Renoir = rv_ppsmc.h)
+
+pub const PPSMC_MSG_SET_SOFT_MIN_BY_FREQ: u32 = 0x19;
+pub const PPSMC_MSG_SET_SOFT_MAX_BY_FREQ: u32 = 0x1A;
+pub const PPSMC_MSG_SET_HARD_MIN_BY_FREQ: u32 = 0x1B;
+pub const PPSMC_MSG_SET_HARD_MAX_BY_FREQ: u32 = 0x1C;
+pub const PPSMC_MSG_SET_WORKLOAD_MASK: u32 = 0x24;
+pub const PPSMC_MSG_SET_MIN_DEEP_SLEEP_DCEFCLK: u32 = 0x24;
+
+/// Encode a SetSoftMin/MaxByFreq param. High byte = clock-domain
+/// ID per SMU13 driver-IF; low 3 bytes = frequency in MHz.
+///
+/// Per `pm/swsmu/smu13/smu_v13_0.c::smu_cmn_send_msg_with_param`
+/// and the SMU13 driver-IF table.
+pub fn encode_freq_param(domain_id: u8, freq_mhz: u32) -> u32 {
+    ((domain_id as u32) << 24) | (freq_mhz & 0x00FF_FFFF)
+}
+
+/// SMU13 per-domain clock IDs (smu_v13_0 driver-IF). One byte each.
+pub fn smu13_domain_id(d: ClockDomain) -> u8 {
+    match d {
+        ClockDomain::Gfxclk => 0,
+        ClockDomain::Socclk => 1,
+        ClockDomain::Uclk => 2,
+        ClockDomain::Fclk => 3,
+        ClockDomain::Vclk => 4,
+        ClockDomain::Dclk => 5,
+    }
+}
+
+/// One PPSMC message produced by the dispatch path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PpsmcMessage {
+    pub msg: u32,
+    pub param: u32,
+}
+
+/// Build the full sequence of PPSMC messages needed to push the
+/// outcome of `Dpm::apply_inputs` to the SMU mailbox. Caller writes
+/// each in turn via the SMU mailbox driver.
+///
+/// Sequence:
+///   1. SetWorkloadMask — tells the SMU which workload hint to use
+///      for residency-based clock scaling.
+///   2. SetSoftMinByFreq + SetSoftMaxByFreq per domain — clamps
+///      the SMU's DPM controller to the kernel's chosen range.
+pub fn build_ppsmc_dispatch(
+    workload_mask: u32,
+    targets: &[(ClockDomain, u32)],
+) -> Vec<PpsmcMessage> {
+    let mut msgs = Vec::with_capacity(1 + targets.len() * 2);
+    msgs.push(PpsmcMessage {
+        msg: PPSMC_MSG_SET_WORKLOAD_MASK,
+        param: workload_mask,
+    });
+    for (domain, freq_mhz) in targets {
+        let domain_id = smu13_domain_id(*domain);
+        let param = encode_freq_param(domain_id, *freq_mhz);
+        msgs.push(PpsmcMessage {
+            msg: PPSMC_MSG_SET_SOFT_MIN_BY_FREQ,
+            param,
+        });
+        msgs.push(PpsmcMessage {
+            msg: PPSMC_MSG_SET_SOFT_MAX_BY_FREQ,
+            param,
+        });
+    }
+    msgs
+}
+
+/// Convenience: convert the `Vec<(ClockDomain, u8)>` returned by
+/// `Dpm::apply_inputs` into MHz targets by indexing into each
+/// domain's level table.
+pub fn targets_to_freqs(dpm: &Dpm, targets: &[(ClockDomain, u8)]) -> Vec<(ClockDomain, u32)> {
+    let mut out = Vec::with_capacity(targets.len());
+    for (domain, level) in targets {
+        if let Some(tbl) = dpm.table(*domain) {
+            if let Some(mhz) = tbl.levels.get(*level as usize) {
+                out.push((*domain, *mhz));
+            }
+        }
+    }
+    out
+}
+
 // ── Smoke tests ──────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -548,4 +651,96 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_dpm_auto_drifts_to_recommended);
+
+    // ── PPSMC dispatch ─────────────────────────────────────────
+
+    fn smoke_encode_freq_param_packs_domain_and_freq() -> TestResult {
+        // GFXCLK domain id = 0, 2400 MHz.
+        let p = encode_freq_param(0, 2400);
+        if p & 0xFF_FFFF != 2400 {
+            return TestResult::Fail("freq nibble wrong");
+        }
+        if p >> 24 != 0 {
+            return TestResult::Fail("domain id wrong");
+        }
+        // SOCCLK domain id = 1, 1200 MHz.
+        let p = encode_freq_param(1, 1200);
+        if p >> 24 != 1 {
+            return TestResult::Fail("socclk id wrong");
+        }
+        if p & 0xFF_FFFF != 1200 {
+            return TestResult::Fail("socclk freq wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_encode_freq_param_packs_domain_and_freq);
+
+    fn smoke_build_ppsmc_dispatch_workload_first() -> TestResult {
+        let msgs = build_ppsmc_dispatch(
+            0x100,
+            &[(ClockDomain::Gfxclk, 2400), (ClockDomain::Uclk, 3200)],
+        );
+        // 1 workload-mask + 2 domains × 2 (min + max) = 5 msgs.
+        if msgs.len() != 5 {
+            return TestResult::Fail("expected 5 msgs");
+        }
+        if msgs[0].msg != PPSMC_MSG_SET_WORKLOAD_MASK || msgs[0].param != 0x100 {
+            return TestResult::Fail("workload mask not first");
+        }
+        // After workload: per-domain MIN then MAX.
+        if msgs[1].msg != PPSMC_MSG_SET_SOFT_MIN_BY_FREQ {
+            return TestResult::Fail("not SOFT_MIN first per-domain");
+        }
+        if msgs[2].msg != PPSMC_MSG_SET_SOFT_MAX_BY_FREQ {
+            return TestResult::Fail("not SOFT_MAX after MIN");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_build_ppsmc_dispatch_workload_first);
+
+    fn smoke_targets_to_freqs_indexes_level_table() -> TestResult {
+        let mut dpm = Dpm::new();
+        dpm.register_table(DpmTable::new(
+            ClockDomain::Gfxclk,
+            alloc::vec![200, 600, 1200, 2400],
+        ));
+        let targets = alloc::vec![(ClockDomain::Gfxclk, 3)];
+        let freqs = targets_to_freqs(&dpm, &targets);
+        if freqs.len() != 1 || freqs[0].1 != 2400 {
+            return TestResult::Fail("level 3 should index to 2400 MHz");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_targets_to_freqs_indexes_level_table);
+
+    fn smoke_dpm_full_dispatch_pipeline() -> TestResult {
+        // Full chain: apply_inputs → targets_to_freqs → build_ppsmc_dispatch.
+        let mut dpm = Dpm::new();
+        dpm.register_table(DpmTable::new(
+            ClockDomain::Gfxclk,
+            alloc::vec![200, 1200, 2400],
+        ));
+        dpm.register_table(DpmTable::new(ClockDomain::Uclk, alloc::vec![800, 3200]));
+        dpm.set_level(PerfLevel::High);
+        let inputs = DpmInputs {
+            gfx_busy_pct: 95,
+            ..Default::default()
+        };
+        let targets = dpm.apply_inputs(inputs);
+        let freqs = targets_to_freqs(&dpm, &targets);
+        let msgs = build_ppsmc_dispatch(0, &freqs);
+        // Expect WORKLOAD + (MIN+MAX) per domain.
+        if msgs.len() != 1 + freqs.len() * 2 {
+            return TestResult::Fail("dispatch msg count off");
+        }
+        // GFX should be at level max=2 → 2400 MHz.
+        let gfx_msg = msgs.iter().find(|m| {
+            m.msg == PPSMC_MSG_SET_SOFT_MAX_BY_FREQ && m.param & 0xFF_FFFF == 2400
+        });
+        if gfx_msg.is_none() {
+            return TestResult::Fail("no SOFT_MAX for GFX at 2400");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_dpm_full_dispatch_pipeline);
 }
