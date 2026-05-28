@@ -90,3 +90,107 @@ pub struct GrTopology {
     pub tpc_per_gpc: u8,
     pub rop_count: u8,
 }
+
+// ── GR class method ids (item 11) ────────────────────────────────
+//
+// Cite Nouveau's `nvhw/class/` headers; the methods below are stable
+// across MAXWELL_A / PASCAL_A / VOLTA_A / TURING_A / AMPERE_A.
+//
+// MAXWELL_A class entry is `0xb097`. To bind a class to a subchannel
+// the host pushes a `SET_OBJECT` method (id 0x0) whose data word is
+// the class id; subsequent methods in that subchannel are dispatched
+// to the bound class.
+
+/// SET_OBJECT method id — bind class to subchannel.
+pub const GR_SET_OBJECT: u16 = 0x0000;
+/// NO_OPERATION method id (NV90C0 / NV9097) — used as ring filler.
+pub const GR_NO_OPERATION: u16 = 0x0100;
+/// CLEAR_REPORT_VALUE — reset perf counters (Maxwell+).
+pub const GR_CLEAR_REPORT_VALUE: u16 = 0x0024;
+/// CLEAR_BUFFERS — clear the bound render target. Cite
+/// `nvhw/class/cl9097.h::NV9097_CLEAR_SURFACE` family. We expose
+/// the umbrella method id; the data word's fields say which buffers
+/// to clear.
+pub const GR_CLEAR_BUFFERS: u16 = 0x0674;
+/// SET_VIEWPORT_HORIZONTAL — viewport x/width.
+pub const GR_SET_VIEWPORT_HORIZONTAL: u16 = 0x0a00;
+/// SET_VIEWPORT_VERTICAL — viewport y/height.
+pub const GR_SET_VIEWPORT_VERTICAL: u16 = 0x0a04;
+/// SET_COLOR_TARGET_A_LOWER — render target address (low 32 bits).
+pub const GR_SET_COLOR_TARGET_A_LOWER: u16 = 0x0800;
+/// SET_COLOR_TARGET_A_UPPER — render target address (high 32 bits).
+pub const GR_SET_COLOR_TARGET_A_UPPER: u16 = 0x0804;
+/// SET_COLOR_TARGET_A_WIDTH — render target width in px.
+pub const GR_SET_COLOR_TARGET_A_WIDTH: u16 = 0x0808;
+/// SET_COLOR_TARGET_A_HEIGHT — render target height in px.
+pub const GR_SET_COLOR_TARGET_A_HEIGHT: u16 = 0x080C;
+/// SET_COLOR_TARGET_A_FORMAT — render target format code.
+pub const GR_SET_COLOR_TARGET_A_FORMAT: u16 = 0x0810;
+/// SET_CLEAR_COLOR_R — clear-color R component (float).
+pub const GR_SET_CLEAR_COLOR_R: u16 = 0x0820;
+/// SET_CLEAR_COLOR_G — clear-color G component.
+pub const GR_SET_CLEAR_COLOR_G: u16 = 0x0824;
+/// SET_CLEAR_COLOR_B — clear-color B component.
+pub const GR_SET_CLEAR_COLOR_B: u16 = 0x0828;
+/// SET_CLEAR_COLOR_A — clear-color A component.
+pub const GR_SET_CLEAR_COLOR_A: u16 = 0x082C;
+
+/// GR submission subchannel — by convention 0 on Maxwell+. Cite
+/// `nvhw/class/cl906f.h::NV906F_DMA_METHOD_SUBCHANNEL`.
+pub const GR_SUBCHANNEL: u16 = 0;
+
+/// Color-buffer format code for BGRA8888 (the format the disp
+/// engine + fb console use). Cite `nvhw/class/cl9097.h`.
+pub const GR_FORMAT_A8R8G8B8: u32 = 0xCF;
+
+/// Default CLEAR_BUFFERS payload — clear color buffer A.
+/// Bits[3:0] = TARGET (0 = A), bit 4 = R, bit 5 = G, bit 6 = B,
+/// bit 7 = A, bit 8 = depth, bit 9 = stencil. Cite cl9097.h
+/// `NV9097_CLEAR_SURFACE_*`.
+pub const GR_CLEAR_BUFFERS_COLOR_RGBA: u32 = 0xF0;
+
+/// Stage a "bind GR class + clear-screen" pushbuffer batch into
+/// `pb`. Designed for first-triangle-equivalent bring-up: program
+/// the render target, set the clear colour, and run CLEAR_BUFFERS.
+/// The colour values are IEEE-754 floats stored as raw u32.
+///
+/// Cite Nouveau's `nv50_fbcon_fillrect` family for the same shape
+/// — the cleared FB then drives the disp scanout. The data words
+/// mirror those used by the Mesa Nouveau gallium driver when it
+/// emits a colour clear.
+pub fn stage_clear_screen(
+    pb: &mut crate::pb::PbBuilder<'_>,
+    class_id: u32,
+    fb_phys: u64,
+    width: u16,
+    height: u16,
+    clear_color_rgba: [u32; 4],
+) -> Result<(), crate::pb::PbError> {
+    // Bind the class to subchannel 0.
+    pb.write_inc(GR_SET_OBJECT, &[class_id])?;
+    // Programme the color target (5 consecutive words starting at
+    // SET_COLOR_TARGET_A_LOWER).
+    pb.write_inc(
+        GR_SET_COLOR_TARGET_A_LOWER,
+        &[
+            (fb_phys & 0xFFFF_FFFF) as u32,
+            (fb_phys >> 32) as u32,
+            width as u32,
+            height as u32,
+            GR_FORMAT_A8R8G8B8,
+        ],
+    )?;
+    // Programme clear color (4 consecutive words starting at
+    // SET_CLEAR_COLOR_R).
+    pb.write_inc(GR_SET_CLEAR_COLOR_R, &clear_color_rgba)?;
+    // Fire CLEAR_BUFFERS.
+    pb.write_inc(GR_CLEAR_BUFFERS, &[GR_CLEAR_BUFFERS_COLOR_RGBA])?;
+    Ok(())
+}
+
+/// Stage a no-op ring filler that keeps the GR channel alive
+/// between submissions. Used for synchronization round-trips while
+/// waiting on a fence.
+pub fn stage_ring_noop(pb: &mut crate::pb::PbBuilder<'_>) -> Result<(), crate::pb::PbError> {
+    pb.write_inc(GR_NO_OPERATION, &[0])
+}

@@ -98,3 +98,65 @@ pub const CE_LINE_COUNT: u16 = 0x041C;
 /// LAUNCH_DMA flag bits (subset).
 pub const CE_FLAGS_BLOCKING: u32 = 1 << 8;
 pub const CE_FLAGS_PIPELINED: u32 = 1 << 9;
+/// LAUNCH_DMA.DATA_TRANSFER_TYPE — pipelined transfer.
+pub const CE_FLAGS_TRANSFER_PIPELINED: u32 = 0 << 7;
+/// LAUNCH_DMA.DATA_TRANSFER_TYPE — non-pipelined transfer.
+pub const CE_FLAGS_TRANSFER_NON_PIPELINED: u32 = 1 << 7;
+/// LAUNCH_DMA.SRC_MEMORY_LAYOUT = PITCH (line copy).
+pub const CE_FLAGS_SRC_PITCH: u32 = 0 << 0;
+/// LAUNCH_DMA.SRC_MEMORY_LAYOUT = BLOCKLINEAR (tiled copy).
+pub const CE_FLAGS_SRC_BLOCKLINEAR: u32 = 1 << 0;
+/// LAUNCH_DMA.DST_MEMORY_LAYOUT = PITCH.
+pub const CE_FLAGS_DST_PITCH: u32 = 0 << 1;
+/// LAUNCH_DMA.DST_MEMORY_LAYOUT = BLOCKLINEAR.
+pub const CE_FLAGS_DST_BLOCKLINEAR: u32 = 1 << 1;
+/// LAUNCH_DMA.MULTI_LINE_ENABLE.
+pub const CE_FLAGS_MULTI_LINE_ENABLE: u32 = 1 << 2;
+/// LAUNCH_DMA.FLUSH_ENABLE — fence + flush at end of copy.
+pub const CE_FLAGS_FLUSH_ENABLE: u32 = 1 << 26;
+
+/// CE subchannel — convention 4 on Maxwell+. Cite
+/// `dev_pfifo.ref.txt::NV_PFIFO_DMA_SUBCHANNEL`.
+pub const CE_SUBCHANNEL: u16 = 4;
+
+/// Stage a CE-class binding (SET_OBJECT) + LAUNCH_DMA copy into the
+/// pushbuffer. The pattern: bind class, write src/dst, length +
+/// count, LAUNCH_DMA. Cite `include/nvhw/class/cl90b5.h::*` for
+/// the per-method bit positions.
+pub fn stage_ce_copy(
+    pb: &mut crate::pb::PbBuilder<'_>,
+    class_id: u32,
+    desc: &CopyDesc,
+) -> Result<(), crate::pb::PbError> {
+    // Bind the CE class to its subchannel (the GR engine maps this
+    // through `cl906f_subchannel`).
+    pb.write_inc(crate::gr::GR_SET_OBJECT, &[class_id])?;
+    // Inc-write block at OFFSET_IN_UPPER, 4 words: src high/low,
+    // dst high/low.
+    pb.write_inc(
+        CE_OFFSET_IN_UPPER,
+        &[
+            (desc.src >> 32) as u32,
+            (desc.src & 0xFFFF_FFFF) as u32,
+            (desc.dst >> 32) as u32,
+            (desc.dst & 0xFFFF_FFFF) as u32,
+        ],
+    )?;
+    // Inc-write block at LINE_LENGTH_IN, 2 words: line length,
+    // line count.
+    pb.write_inc(CE_LINE_LENGTH_IN, &[desc.line_length, desc.line_count])?;
+    // Fire LAUNCH_DMA with the caller-supplied flags.
+    pb.write_inc(CE_LAUNCH_DMA, &[desc.flags])?;
+    Ok(())
+}
+
+/// Default LAUNCH_DMA flags for a typical sysmem→VRAM single-line
+/// copy: pitch layout on both sides, non-pipelined for predictable
+/// completion, multi-line enabled, blocking finish. Cite
+/// `nvkm/engine/ce/gv100.c` for the same flag bundle.
+pub const CE_FLAGS_DEFAULT: u32 = CE_FLAGS_BLOCKING
+    | CE_FLAGS_TRANSFER_NON_PIPELINED
+    | CE_FLAGS_SRC_PITCH
+    | CE_FLAGS_DST_PITCH
+    | CE_FLAGS_MULTI_LINE_ENABLE
+    | CE_FLAGS_FLUSH_ENABLE;

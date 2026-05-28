@@ -1652,6 +1652,202 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// GR engine clear-screen submission (item 11)
+// ────────────────────────────────────────────────────────────────
+
+use crate::gr::{
+    stage_clear_screen, stage_ring_noop, GR_CLEAR_BUFFERS, GR_CLEAR_BUFFERS_COLOR_RGBA,
+    GR_FORMAT_A8R8G8B8, GR_NO_OPERATION, GR_SET_CLEAR_COLOR_R, GR_SET_COLOR_TARGET_A_LOWER,
+    GR_SET_OBJECT, GR_SUBCHANNEL,
+};
+
+fn smoke_gr_method_ids_match_nvhw_cl9097() -> TestResult {
+    // Pin GR method ids — these are stable Fermi → Ada per cl9097.h.
+    if GR_SET_OBJECT != 0x0000 {
+        return TestResult::Fail("SET_OBJECT at method 0");
+    }
+    if GR_NO_OPERATION != 0x0100 {
+        return TestResult::Fail("NO_OPERATION at 0x100");
+    }
+    if GR_CLEAR_BUFFERS != 0x0674 {
+        return TestResult::Fail("CLEAR_BUFFERS at 0x674");
+    }
+    if GR_SET_COLOR_TARGET_A_LOWER != 0x0800 {
+        return TestResult::Fail("SET_COLOR_TARGET_A_LOWER at 0x800");
+    }
+    if GR_SET_CLEAR_COLOR_R != 0x0820 {
+        return TestResult::Fail("SET_CLEAR_COLOR_R at 0x820");
+    }
+    if GR_FORMAT_A8R8G8B8 != 0xCF {
+        return TestResult::Fail("A8R8G8B8 format code = 0xCF");
+    }
+    if GR_SUBCHANNEL != 0 {
+        return TestResult::Fail("GR subchannel = 0");
+    }
+    if GR_CLEAR_BUFFERS_COLOR_RGBA != 0xF0 {
+        return TestResult::Fail("Clear-RGBA flag = 0xF0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/gr", smoke_gr_method_ids_match_nvhw_cl9097);
+
+fn smoke_gr_stage_clear_screen_emits_4_blocks() -> TestResult {
+    let mut buf = [0u8; 128];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_clear_screen(
+            &mut pb,
+            crate::gr::MAXWELL_A,
+            0x4000_0000_DEAD_BEEF,
+            1920,
+            1080,
+            // White, full alpha.
+            [0x3F80_0000, 0x3F80_0000, 0x3F80_0000, 0x3F80_0000],
+        )
+        .unwrap();
+        pb.len()
+    };
+    // 4 PUSH_MTHD blocks: SET_OBJECT (1 data), color-target (5),
+    // clear-color (4), CLEAR_BUFFERS (1). Bytes = 4 headers * 4 +
+    // (1+5+4+1) * 4 = 16 + 44 = 60.
+    if pb_len != 60 {
+        return TestResult::Fail("clear-screen should be 60 bytes");
+    }
+    // First block header is SET_OBJECT, 1 word.
+    let hdr0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if hdr0 & 0xFFFF != GR_SET_OBJECT as u32 {
+        return TestResult::Fail("first block SET_OBJECT");
+    }
+    if (hdr0 >> 16) & 0x1FFF != 1 {
+        return TestResult::Fail("SET_OBJECT block size 1");
+    }
+    // Data word 0 is class id.
+    let class = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if class != crate::gr::MAXWELL_A {
+        return TestResult::Fail("bound class should be MAXWELL_A");
+    }
+    // Second block header is SET_COLOR_TARGET_A_LOWER, 5 words.
+    let hdr1 = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if hdr1 & 0xFFFF != GR_SET_COLOR_TARGET_A_LOWER as u32 {
+        return TestResult::Fail("second block should be color-target");
+    }
+    if (hdr1 >> 16) & 0x1FFF != 5 {
+        return TestResult::Fail("color-target block size 5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gr",
+    smoke_gr_stage_clear_screen_emits_4_blocks
+);
+
+fn smoke_gr_stage_ring_noop_minimal_byte_count() -> TestResult {
+    let mut buf = [0u8; 16];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_ring_noop(&mut pb).unwrap();
+        pb.len()
+    };
+    if pb_len != 8 {
+        return TestResult::Fail("NO_OPERATION should emit 8 bytes (hdr + 0)");
+    }
+    let hdr = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if hdr & 0xFFFF != GR_NO_OPERATION as u32 {
+        return TestResult::Fail("ring-noop method id wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/gr",
+    smoke_gr_stage_ring_noop_minimal_byte_count
+);
+
+// ────────────────────────────────────────────────────────────────
+// CE async DMA submission (item 12)
+// ────────────────────────────────────────────────────────────────
+
+use crate::ce::{
+    stage_ce_copy, CopyDesc, CE_FLAGS_BLOCKING, CE_FLAGS_DEFAULT, CE_FLAGS_DST_PITCH,
+    CE_FLAGS_FLUSH_ENABLE, CE_FLAGS_MULTI_LINE_ENABLE, CE_FLAGS_SRC_PITCH,
+    CE_FLAGS_TRANSFER_NON_PIPELINED, CE_SUBCHANNEL,
+};
+
+fn smoke_ce_launch_dma_flag_bits_pinned() -> TestResult {
+    if CE_FLAGS_BLOCKING != 1 << 8 {
+        return TestResult::Fail("BLOCKING at bit 8");
+    }
+    if CE_FLAGS_MULTI_LINE_ENABLE != 1 << 2 {
+        return TestResult::Fail("MULTI_LINE_ENABLE at bit 2");
+    }
+    if CE_FLAGS_FLUSH_ENABLE != 1 << 26 {
+        return TestResult::Fail("FLUSH_ENABLE at bit 26");
+    }
+    if CE_FLAGS_SRC_PITCH != 0 {
+        return TestResult::Fail("SRC_PITCH = 0");
+    }
+    if CE_FLAGS_DST_PITCH != 0 {
+        return TestResult::Fail("DST_PITCH = 0");
+    }
+    if CE_FLAGS_TRANSFER_NON_PIPELINED != 1 << 7 {
+        return TestResult::Fail("TRANSFER_NON_PIPELINED at bit 7");
+    }
+    if CE_SUBCHANNEL != 4 {
+        return TestResult::Fail("CE subchannel by convention 4");
+    }
+    // Default bundle must contain BLOCKING + NONPIPE + FLUSH +
+    // MULTILINE.
+    if CE_FLAGS_DEFAULT & CE_FLAGS_BLOCKING == 0 {
+        return TestResult::Fail("DEFAULT should include BLOCKING");
+    }
+    if CE_FLAGS_DEFAULT & CE_FLAGS_MULTI_LINE_ENABLE == 0 {
+        return TestResult::Fail("DEFAULT should include MULTI_LINE");
+    }
+    if CE_FLAGS_DEFAULT & CE_FLAGS_FLUSH_ENABLE == 0 {
+        return TestResult::Fail("DEFAULT should include FLUSH");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/ce", smoke_ce_launch_dma_flag_bits_pinned);
+
+fn smoke_ce_stage_copy_emits_4_blocks_with_class_bind() -> TestResult {
+    let mut buf = [0u8; 128];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        let desc = CopyDesc {
+            src: 0x1234_5678_DEAD_BEEF,
+            dst: 0x8000_0000_FEEDF00D,
+            line_length: 0x1000,
+            line_count: 32,
+            flags: CE_FLAGS_DEFAULT,
+        };
+        stage_ce_copy(&mut pb, crate::ce::MAXWELL_DMA_COPY_A, &desc).unwrap();
+        pb.len()
+    };
+    // 4 blocks: SET_OBJECT (1), OFFSET_IN_UPPER (4),
+    // LINE_LENGTH_IN (2), LAUNCH_DMA (1). Bytes:
+    // 4+4 + 4+16 + 4+8 + 4+4 = 48.
+    if pb_len != 48 {
+        return TestResult::Fail("CE copy should emit 48 bytes");
+    }
+    // Verify the SET_OBJECT block sets MAXWELL_DMA_COPY_A.
+    let class = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if class != crate::ce::MAXWELL_DMA_COPY_A {
+        return TestResult::Fail("bound class should be MAXWELL_DMA_COPY_A");
+    }
+    // The 4-word src/dst block follows the SET_OBJECT block. Header at
+    // offset 8.
+    let hdr1 = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if (hdr1 >> 16) & 0x1FFF != 4 {
+        return TestResult::Fail("src/dst block size 4 words");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/ce",
+    smoke_ce_stage_copy_emits_4_blocks_with_class_bind
+);
+
+// ────────────────────────────────────────────────────────────────
 // Live AUX transfer loop (item 2)
 // ────────────────────────────────────────────────────────────────
 
