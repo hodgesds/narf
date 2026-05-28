@@ -11,6 +11,7 @@ pub mod caps;
 pub mod ccmp;
 pub mod eapol;
 pub mod iface;
+pub mod mfp;
 pub mod mlme;
 pub mod reg;
 pub mod rsn;
