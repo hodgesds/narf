@@ -462,7 +462,9 @@ pub mod tests {
     // ── Smoke: TxQueue enqueue advances write_ptr ──────────────────
 
     fn smoke_iwlwifi_tx_queue_enqueue_advances_wptr() -> TestResult {
-        let mut q = TxQueue::new(0, core::ptr::null_mut());
+        let mut ring: alloc::vec::Vec<Tfd> =
+            (0..TX_RING_SIZE).map(|_| Tfd::default()).collect();
+        let mut q = TxQueue::new(0, ring.as_mut_ptr());
         let tfd = Tfd::default();
         let slot = q.enqueue(tfd);
         if slot != 0 {
