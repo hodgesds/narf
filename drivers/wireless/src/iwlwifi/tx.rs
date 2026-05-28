@@ -80,6 +80,26 @@ pub mod tx_flags {
     pub const TX_CMD_FLG_QOS: u32 = 1 << 8;
 }
 
+/// `sec_ctl` field values (from `TX_CMD_SEC_*` in `fw/api/tx.h`).
+///
+/// Written into `IwlTxCmd::sec_ctl` to enable hardware CCMP/TKIP
+/// encryption on outgoing data frames after the PTK is installed.
+pub mod sec_ctl {
+    /// No encryption.
+    pub const NO_ENC: u8 = 0x00;
+    /// WEP encryption (legacy only).
+    pub const WEP: u8 = 0x01;
+    /// CCMP-128 (WPA2) hardware encryption. Set after PTK install.
+    pub const CCM: u8 = 0x02;
+    /// TKIP encryption (WPA1 legacy).
+    pub const TKIP: u8 = 0x03;
+    /// GCMP encryption (WPA3).
+    pub const GCMP: u8 = 0x05;
+    /// Use the key from the firmware key table (non-WEP keys).
+    /// Must be OR'd with the algorithm byte.
+    pub const KEY_FROM_TABLE: u8 = 0x10;
+}
+
 /// `iwl_tx_cmd` — the per-TFD header the MVM firmware expects.
 /// Layout sourced from `fw/api/tx.h`. We expose the fields used
 /// by management-frame TX; data-frame extras (aggregation start,
@@ -124,6 +144,28 @@ impl IwlTxCmd {
             rate_n_flags: 0x4001, // OFDM-6 Mbps, 20 MHz, no HT/VHT
             sta_id,
             sec_ctl: 0,
+            initial_rate_index: 0,
+            reserved: 0,
+            aid: 0,
+            _pad: 0,
+        }
+    }
+
+    /// Build a data-frame TX command with CCMP-128 encryption enabled.
+    ///
+    /// Sets `sec_ctl = CCM | KEY_FROM_TABLE` so the firmware CCMP
+    /// engine picks the key from the slot installed via `ADD_STA_KEY`.
+    ///
+    /// Reference: `mvm/tx.c::iwl_mvm_set_tx_cmd` (sec_ctl path) +
+    /// `fw/api/tx.h` TX_CMD_SEC_CCM / TX_CMD_SEC_KEY_FROM_TABLE.
+    pub fn for_data_ccmp(frame_len: u16, sta_id: u8) -> Self {
+        Self {
+            len: frame_len,
+            offload_assist: 0,
+            tx_flags: tx_flags::TX_CMD_FLG_QOS,
+            rate_n_flags: 0x4001,
+            sta_id,
+            sec_ctl: sec_ctl::CCM | sec_ctl::KEY_FROM_TABLE,
             initial_rate_index: 0,
             reserved: 0,
             aid: 0,
@@ -505,9 +547,33 @@ pub mod tests {
         TestResult::Pass
     }
 
+    // ── Smoke: data-frame TX command with CCMP crypto flags ───────
+
+    fn smoke_iwlwifi_tx_cmd_ccmp_sec_ctl() -> TestResult {
+        let cmd = IwlTxCmd::for_data_ccmp(1500, 0);
+        // sec_ctl must have CCM algorithm + KEY_FROM_TABLE.
+        let expected = sec_ctl::CCM | sec_ctl::KEY_FROM_TABLE;
+        if cmd.sec_ctl != expected {
+            return TestResult::Fail("sec_ctl wrong for CCMP data frame");
+        }
+        // QoS flag must be set (data frame).
+        if cmd.tx_flags & tx_flags::TX_CMD_FLG_QOS == 0 {
+            return TestResult::Fail("QoS flag not set for data frame");
+        }
+        // SEQ_CTL must NOT be set for data frames.
+        if cmd.tx_flags & tx_flags::TX_CMD_FLG_SEQ_CTL != 0 {
+            return TestResult::Fail("SEQ_CTL should not be set for data frame");
+        }
+        if cmd.len != 1500 {
+            return TestResult::Fail("len wrong for CCMP data frame");
+        }
+        TestResult::Pass
+    }
+
     kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_cmd_builder);
     kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_doorbell_write);
     kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tfd_push_and_overflow_guard);
     kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_queue_enqueue_advances_wptr);
     kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_mac_header_management_build);
+    kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_cmd_ccmp_sec_ctl);
 }
