@@ -339,4 +339,57 @@ impl A2dpSource {
     pub fn on_started(&mut self) {
         self.state = SourceState::Streaming;
     }
+
+    /// Encode one PCM block into an SBC frame, ready for AVDTP push.
+    ///
+    /// Bridge into `narf_audio::sbc`: maps the negotiated A2DP SBC
+    /// capability bits (frequency / channel mode / blocks / subbands /
+    /// allocation / bitpool) into an `sbc::Header` and runs the
+    /// encoder over `pcm`. Caller is responsible for prepending the
+    /// RTP / AVDTP media payload header before writing to L2CAP.
+    ///
+    /// Reference: A2DP 1.4 §4.6.5 "Source role behaviour while in
+    /// streaming state" — PCM frames in, SBC media bytes out.
+    pub fn encode_pcm(&mut self, pcm: &[i16]) -> Option<alloc::vec::Vec<u8>> {
+        if self.state != SourceState::Streaming { return None; }
+        let cfg = self.config?;
+        let h = narf_audio::sbc::Header {
+            sampling_frequency: avdtp_freq_to_sbc(cfg.frequency)?,
+            blocks: avdtp_blocks_to_sbc(cfg.block_length)?,
+            channel_mode: avdtp_chan_to_sbc(cfg.channel_mode)?,
+            allocation_method: if cfg.allocation == SBC_ALLOC_SNR { 1 } else { 0 },
+            subbands: if cfg.subbands == SBC_SUBBANDS_8 { 1 } else { 0 },
+            bitpool: cfg.max_bitpool,
+            crc: 0,
+        };
+        let mut enc = narf_audio::sbc::Sbc::new(h);
+        let mut buf = alloc::vec![0u8; enc.frame_bytes()];
+        enc.encode(pcm, &mut buf).ok()?;
+        Some(buf)
+    }
+}
+
+/// AVDTP frequency bit → SBC frequency code (0..3).
+fn avdtp_freq_to_sbc(f: u8) -> Option<u8> {
+    match f {
+        SBC_FREQ_16000 => Some(0), SBC_FREQ_32000 => Some(1),
+        SBC_FREQ_44100 => Some(2), SBC_FREQ_48000 => Some(3),
+        _ => None,
+    }
+}
+/// AVDTP block-length bit → SBC blocks code (0..3).
+fn avdtp_blocks_to_sbc(b: u8) -> Option<u8> {
+    match b {
+        SBC_BLOCK_4 => Some(0), SBC_BLOCK_8 => Some(1),
+        SBC_BLOCK_12 => Some(2), SBC_BLOCK_16 => Some(3),
+        _ => None,
+    }
+}
+/// AVDTP channel-mode bit → SBC channel_mode code (0..3).
+fn avdtp_chan_to_sbc(c: u8) -> Option<u8> {
+    match c {
+        SBC_CHAN_MONO => Some(0), SBC_CHAN_DUAL => Some(1),
+        SBC_CHAN_STEREO => Some(2), SBC_CHAN_JOINT_STEREO => Some(3),
+        _ => None,
+    }
 }

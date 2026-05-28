@@ -3318,3 +3318,61 @@ kernel_test_in!(
     "bluetooth/profiles",
     smoke_profiles_a2dp_source_stream_start_state_machine
 );
+
+/// A2DP source streaming → SBC encoder bridge. Drives an A2dpSource
+/// directly into the Streaming state (without the AVDTP handshake)
+/// and verifies `encode_pcm` produces a syncword-prefixed SBC frame
+/// whose length matches the A2DP §12.9 formula for the negotiated
+/// configuration. Confirms the codec bridge — the integration point
+/// for the actual audio path — is wired correctly.
+fn smoke_profiles_a2dp_source_sbc_encode_streaming() -> TestResult {
+    use crate::avdtp::{
+        SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
+        SBC_FREQ_44100, SBC_SUBBANDS_8, SbcCapability,
+    };
+    use crate::profiles::a2dp::{A2dpSource, SourceState};
+
+    let mut src = A2dpSource::new();
+    // Pre-seed the source state to Streaming without doing the
+    // full AVDTP handshake (which is exercised by the previous test).
+    src.config = Some(SbcCapability {
+        frequency: SBC_FREQ_44100,
+        channel_mode: SBC_CHAN_JOINT_STEREO,
+        block_length: SBC_BLOCK_16,
+        subbands: SBC_SUBBANDS_8,
+        allocation: SBC_ALLOC_LOUDNESS,
+        min_bitpool: 2,
+        max_bitpool: 53,
+    });
+    src.state = SourceState::Streaming;
+
+    // 16 blocks × 8 subbands × 2 channels = 256 i16 samples.
+    let pcm: alloc::vec::Vec<i16> = (0..(16 * 8 * 2))
+        .map(|i| ((i as i32 * 256) - 32768) as i16)
+        .collect();
+    let frame = match src.encode_pcm(&pcm) {
+        Some(f) => f,
+        None => return TestResult::Fail("encode_pcm returned None in Streaming"),
+    };
+    if frame.is_empty() {
+        return TestResult::Fail("encode_pcm produced empty frame");
+    }
+    if frame[0] != 0x9C {
+        return TestResult::Fail("encode_pcm frame missing SBC syncword");
+    }
+    // Expected length for 44.1k joint stereo 16 blocks 8 sb bitpool 53.
+    if frame.len() != 119 {
+        return TestResult::Fail("encode_pcm wrong frame length");
+    }
+    // A2DP MTU sanity: a 119-byte SBC frame fits well within an
+    // L2CAP MTU of 895 (A2DP minimum).
+    if frame.len() > 895 {
+        return TestResult::Fail("frame larger than A2DP min MTU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_a2dp_source_sbc_encode_streaming
+);
+

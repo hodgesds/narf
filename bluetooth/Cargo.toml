@@ -17,6 +17,7 @@ narf-capabilities = { path = "../capabilities" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-init         = { path = "../init" }
+narf-audio        = { path = "../audio" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
