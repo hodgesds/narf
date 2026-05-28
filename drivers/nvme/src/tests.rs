@@ -1640,3 +1640,239 @@ fn smoke_nvme_per_queue_lock_count_matches() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_per_queue_lock_count_matches);
+
+// ── Security Send / Security Receive / Opal Discovery smokes ───────
+//
+// NVMe Base 2.0c §5.25 (Security Send, opcode 0x81) and §5.26
+// (Security Receive, opcode 0x82).  TCG Opal SSC v2.02 §3.1.1 for
+// the L0 Discovery 0 wire format.
+//
+// Linux GPL-2.0-or-later refs:
+//   drivers/nvme/host/core.c:nvme_sec_submit (CDW10/CDW11 encoding)
+//   block/sed-opal.c:opal_discovery0_end (L0 discovery walk)
+//   block/opal_proto.h (d0_header, d0_features, d0_locking_features)
+
+fn smoke_security_send_sqe_encoding() -> TestResult {
+    // Verify Security Send (opcode 0x81) SQE CDW10 / CDW11 layout.
+    //
+    // NVMe Base 2.0c §5.25, table 226:
+    //   CDW10[31:24] = SECP, CDW10[23:8] = SPSP, CDW10[7:0] = reserved
+    //   CDW11        = TL (Transfer Length in bytes)
+    //
+    // Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit:
+    //   cmd.common.cdw10 = cpu_to_le32(((u32)secp)<<24 | ((u32)spsp)<<8)
+    //   cmd.common.cdw11 = cpu_to_le32(len)
+    use crate::admin::{security_send, OPC_SECURITY_SEND, SECP_TCG_OPAL, SPSP_L0_DISCOVERY};
+
+    let sqe = security_send(
+        0,
+        SECP_TCG_OPAL,
+        SPSP_L0_DISCOVERY,
+        512,
+        0xDEAD_BEEF_0000_0000,
+    );
+
+    if sqe.opcode != OPC_SECURITY_SEND {
+        return TestResult::Fail("Security Send opcode must be 0x81");
+    }
+    let secp_enc = ((sqe.cdw10 >> 24) & 0xFF) as u8;
+    if secp_enc != SECP_TCG_OPAL {
+        return TestResult::Fail("SECP must be in CDW10[31:24]");
+    }
+    let spsp_enc = ((sqe.cdw10 >> 8) & 0xFFFF) as u16;
+    if spsp_enc != SPSP_L0_DISCOVERY {
+        return TestResult::Fail("SPSP must be in CDW10[23:8]");
+    }
+    if (sqe.cdw10 & 0xFF) != 0 {
+        return TestResult::Fail("CDW10[7:0] must be zero (reserved)");
+    }
+    if sqe.cdw11 != 512 {
+        return TestResult::Fail("CDW11 must carry transfer length");
+    }
+    if sqe.prp1 != 0xDEAD_BEEF_0000_0000 {
+        return TestResult::Fail("PRP1 must carry the DMA buffer address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_security_send_sqe_encoding);
+
+fn smoke_security_receive_sqe_encoding() -> TestResult {
+    // Verify Security Receive (opcode 0x82) SQE CDW10 / CDW11 layout.
+    //
+    // NVMe Base 2.0c §5.26: same CDW shape as Security Send; CDW11 carries
+    // AL (Allocation Length) instead of TL.
+    //
+    // Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit
+    use crate::admin::{security_receive, OPC_SECURITY_RECEIVE, SECP_TCG_OPAL, SPSP_L0_DISCOVERY};
+
+    let al: u32 = 2048;
+    let sqe = security_receive(
+        1,
+        SECP_TCG_OPAL,
+        SPSP_L0_DISCOVERY,
+        al,
+        0xCAFE_F000_0000_0000,
+    );
+
+    if sqe.opcode != OPC_SECURITY_RECEIVE {
+        return TestResult::Fail("Security Receive opcode must be 0x82");
+    }
+    let secp_enc = ((sqe.cdw10 >> 24) & 0xFF) as u8;
+    if secp_enc != SECP_TCG_OPAL {
+        return TestResult::Fail("SECP must be in CDW10[31:24]");
+    }
+    let spsp_enc = ((sqe.cdw10 >> 8) & 0xFFFF) as u16;
+    if spsp_enc != SPSP_L0_DISCOVERY {
+        return TestResult::Fail("SPSP must be in CDW10[23:8]");
+    }
+    if (sqe.cdw10 & 0xFF) != 0 {
+        return TestResult::Fail("CDW10[7:0] must be zero (reserved)");
+    }
+    if sqe.cdw11 != al {
+        return TestResult::Fail("CDW11 must carry allocation length");
+    }
+    if sqe.prp1 != 0xCAFE_F000_0000_0000 {
+        return TestResult::Fail("PRP1 must carry the DMA buffer address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_security_receive_sqe_encoding);
+
+fn smoke_opal_discovery_header_decode() -> TestResult {
+    // Decode an L0 Discovery 0 buffer built from a known TCG test vector.
+    // Covers FC_TPER (0x0001), FC_LOCKING (0x0002), FC_OPALV200 (0x0203)
+    // — the minimum set Opal 2.00 drives must advertise.
+    //
+    // FCodes and feature byte layouts from TCG Opal SSC v2.02 §3.1.1 /
+    // TCG Storage Architecture Core Spec v2.01 §3.3.5.
+    //
+    // Linux ref (GPL-2.0-or-later):
+    //   block/sed-opal.c:opal_discovery0_end,
+    //   block/opal_proto.h:d0_header / d0_tper_features / d0_locking_features
+    use crate::admin::{
+        encode_opal_discovery, OpalDiscovery, FC_LOCKING, FC_OPALV200, FC_TPER,
+    };
+
+    // TPer features byte: sync=bit0, async=bit1 => 0x03.
+    let tper_feat: &[u8] = &[
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // Locking features byte: LockingSupported=bit0|LockingEnabled=bit1|Locked=bit2 => 0x07.
+    let locking_feat: &[u8] = &[
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // Opal v2.00: baseComID=0x0008 (BE u16), numComIDs=0x0001 (BE u16).
+    let opalv200_feat: &[u8] = &[
+        0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let features: &[(u16, &[u8])] = &[
+        (FC_TPER, tper_feat),
+        (FC_LOCKING, locking_feat),
+        (FC_OPALV200, opalv200_feat),
+    ];
+    let buf = encode_opal_discovery(1, features);
+    let disc = match OpalDiscovery::parse(&buf) {
+        Some(d) => d,
+        None => return TestResult::Fail("OpalDiscovery::parse returned None"),
+    };
+
+    if disc.revision != 1 {
+        return TestResult::Fail("discovery revision should be 1");
+    }
+    if !disc.tper_supported {
+        return TestResult::Fail("FC_TPER descriptor not found");
+    }
+    if !disc.tper_sync {
+        return TestResult::Fail("TPer sync bit (feat[0] bit 0) should be set");
+    }
+    if !disc.tper_async {
+        return TestResult::Fail("TPer async bit (feat[0] bit 1) should be set");
+    }
+    if !disc.locking_supported {
+        return TestResult::Fail("FC_LOCKING descriptor not found");
+    }
+    if !disc.locking_enabled {
+        return TestResult::Fail("LockingEnabled bit should be set");
+    }
+    if !disc.locked {
+        return TestResult::Fail("Locked bit should be set");
+    }
+    if disc.opal_v200_base_comid != 0x0008 {
+        return TestResult::Fail("FC_OPALV200 baseComID should be 0x0008");
+    }
+    if disc.opal_v200_num_comids != 0x0001 {
+        return TestResult::Fail("FC_OPALV200 numComIDs should be 0x0001");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_opal_discovery_header_decode);
+
+fn smoke_security_send_receive_round_trip_qemu() -> TestResult {
+    // End-to-end Security Send + Security Receive against QEMU NVMe.
+    //
+    // Most QEMU builds lack OPAL support and will reject the command
+    // with CommandFailed; those cases Skip rather than Fail.
+    //
+    // Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit
+    use crate::{Controller, NvmeError};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices()
+        .iter()
+        .find(|d| {
+            matches!(d.kind, BusKind::Pcie { .. })
+                && d.id.vendor == 0x1B36
+                && d.id.device == 0x0010
+        })
+        .copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+
+    let payload = alloc::vec![0u8; 512];
+    match ctrl.security_send(
+        crate::admin::SECP_TCG_OPAL,
+        crate::admin::SPSP_L0_DISCOVERY,
+        &payload,
+    ) {
+        Ok(()) => {}
+        Err(NvmeError::CommandFailed { .. }) => {
+            return TestResult::Skip(
+                "QEMU NVMe rejected Security Send (no OPAL support)",
+            );
+        }
+        Err(_) => return TestResult::Fail("security_send returned unexpected error"),
+    }
+
+    let mut recv_buf = alloc::vec![0u8; 512];
+    match ctrl.security_receive(
+        crate::admin::SECP_TCG_OPAL,
+        crate::admin::SPSP_L0_DISCOVERY,
+        &mut recv_buf,
+    ) {
+        Ok(n) => {
+            if n == 0 {
+                return TestResult::Fail("security_receive returned 0 bytes");
+            }
+        }
+        Err(NvmeError::CommandFailed { .. }) => {
+            return TestResult::Skip("QEMU NVMe rejected Security Receive");
+        }
+        Err(_) => return TestResult::Fail("security_receive returned unexpected error"),
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_security_send_receive_round_trip_qemu);

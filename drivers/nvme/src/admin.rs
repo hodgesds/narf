@@ -718,3 +718,259 @@ pub fn encode_smart_log(s: SmartLog) -> Vec<u8> {
     buf[176..184].copy_from_slice(&s.media_errors.to_le_bytes());
     buf
 }
+
+// ── Security Send / Security Receive (NVMe Base 2.0c §5.25 / §5.26) ──
+
+/// TCG Security Protocol identifiers (SECP field, CDW10 bits[31:24]).
+///
+/// NVMe Base 2.0c §5.25 table 226; TCG Storage Architecture Core Spec v2.01
+/// table of Security Protocol assignments.
+pub const SECP_DISCOVERY: u8 = 0x00; // Security Protocol Information
+pub const SECP_TCG_OPAL: u8 = 0x01; // TCG Opal SSC (and other TCG SSCs)
+pub const SECP_TCG_STORAGE: u8 = 0xEA; // TCG Storage Architecture
+
+/// SPSP value for TCG Level 0 Discovery (SECP=0x01, SPSP=0x0001).
+///
+/// Issuing Security Receive with SECP=SECP_TCG_OPAL and SPSP=SPSP_L0_DISCOVERY
+/// fetches the Level 0 Discovery 0 response enumerating supported TCG features.
+///
+/// Linux ref (GPL-2.0-or-later): block/sed-opal.c:opal_discovery0_step
+pub const SPSP_L0_DISCOVERY: u16 = 0x0001;
+
+/// Build a Security Send SQE (opcode 0x81, NVMe Base 2.0c §5.25).
+///
+/// CDW10 encoding (§5.25 table 226):
+///   - bits[31:24] = SECP (Security Protocol)
+///   - bits[23:8]  = SPSP (Security Protocol Specific)
+///   - bits[7:0]   = reserved/zero
+///
+/// CDW11 = TL (Transfer Length in bytes of the payload).
+/// PRP1 points to the DMA buffer carrying the protocol payload.
+///
+/// Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit —
+/// `cmd.common.cdw10 = cpu_to_le32(((u32)secp) << 24 | ((u32)spsp) << 8);`
+/// `cmd.common.cdw11 = cpu_to_le32(len);`
+pub fn security_send(cid: u16, secp: u8, spsp: u16, tl: u32, prp1: u64) -> AdminSqe {
+    let cdw10 = ((secp as u32) << 24) | ((spsp as u32) << 8);
+    AdminSqe {
+        opcode: OPC_SECURITY_SEND,
+        cid,
+        prp1,
+        cdw10,
+        cdw11: tl,
+        ..Default::default()
+    }
+}
+
+/// Build a Security Receive SQE (opcode 0x82, NVMe Base 2.0c §5.26).
+///
+/// CDW10 / CDW11 shape identical to Security Send; the data buffer direction
+/// is reversed — the controller fills it rather than reading from it.
+/// CDW11 carries AL (Allocation Length) — max bytes the host accepts.
+///
+/// Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit
+pub fn security_receive(cid: u16, secp: u8, spsp: u16, al: u32, prp1: u64) -> AdminSqe {
+    let cdw10 = ((secp as u32) << 24) | ((spsp as u32) << 8);
+    AdminSqe {
+        opcode: OPC_SECURITY_RECEIVE,
+        cid,
+        prp1,
+        cdw10,
+        cdw11: al,
+        ..Default::default()
+    }
+}
+
+// ── TCG Opal Level 0 Discovery decoder ──────────────────────────────────
+
+/// Feature code constants from TCG Storage Architecture Core Spec v2.01.
+///
+/// Linux ref (GPL-2.0-or-later): block/opal_proto.h
+pub const FC_TPER: u16 = 0x0001;
+pub const FC_LOCKING: u16 = 0x0002;
+pub const FC_GEOMETRY: u16 = 0x0003;
+pub const FC_ENTERPRISE: u16 = 0x0100;
+pub const FC_OPALV100: u16 = 0x0200;
+pub const FC_SINGLEUSER: u16 = 0x0201;
+pub const FC_DATASTORE: u16 = 0x0202;
+pub const FC_OPALV200: u16 = 0x0203;
+
+/// Decoded TCG Opal Level 0 Discovery 0 response.
+///
+/// Returned by `Controller::discover_opal` after issuing Security Receive
+/// (SECP=0x01, SPSP=0x0001). Covers the feature descriptors defined in
+/// TCG Opal SSC v2.02 §3.1.1 and TCG Storage Architecture Core Spec
+/// v2.01 §3.3.5.
+///
+/// Linux ref (GPL-2.0-or-later): block/sed-opal.c:opal_discovery0_end,
+/// block/opal_proto.h:d0_header / d0_locking_features / d0_tper_features.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpalDiscovery {
+    /// Revision from the L0 Discovery header (big-endian u32 at byte 4).
+    /// Value 1 per Opal SSC v2.00.100.
+    pub revision: u32,
+
+    /// True if TPer feature descriptor (FC_TPER=0x0001) was found.
+    pub tper_supported: bool,
+
+    /// True if the TPer supports sync operation (TPer features byte bit 0).
+    pub tper_sync: bool,
+
+    /// True if TPer supports async operation (bit 1).
+    pub tper_async: bool,
+
+    /// True if the Locking feature descriptor (FC_LOCKING=0x0002) was found.
+    pub locking_supported: bool,
+
+    /// True if locking is currently enabled (Locking features byte bit 1).
+    pub locking_enabled: bool,
+
+    /// True if the media is currently locked (bit 2).
+    pub locked: bool,
+
+    /// True if MBR shadowing is enabled (bit 4).
+    pub mbr_enabled: bool,
+
+    /// True if MBR Done flag is set (bit 5).
+    pub mbr_done: bool,
+
+    /// True if Single-User Mode feature descriptor (FC_SINGLEUSER=0x0201) was found.
+    pub single_user_mode: bool,
+
+    /// Base ComID from the Opal v2.00 feature descriptor (big-endian u16).
+    /// Zero if FC_OPALV200 was not present.
+    pub opal_v200_base_comid: u16,
+
+    /// Number of ComIDs from the Opal v2.00 descriptor.
+    pub opal_v200_num_comids: u16,
+
+    /// Base ComID from the Opal v1.00 feature descriptor (fallback).
+    pub opal_v100_base_comid: u16,
+}
+
+impl OpalDiscovery {
+    /// Parse the TCG Level 0 Discovery 0 buffer returned by Security Receive
+    /// (SECP=0x01, SPSP=0x0001).
+    ///
+    /// Wire layout (all multi-byte fields big-endian per TCG spec):
+    ///
+    /// ```text
+    ///   Offset  Size  Field
+    ///   0       4     Length (bytes after the length field)
+    ///   4       4     Revision (shall be 1)
+    ///   8..48   40    Reserved / vendor-specific
+    ///   48+     var   Feature Descriptors:
+    ///                   +0  2  Feature Code (BE u16)
+    ///                   +2  1  Version|Reserved nibbles
+    ///                   +3  1  Length of feature data
+    ///                   +4  N  Feature data (BE, feature-specific)
+    /// ```
+    ///
+    /// Returns `None` if `buf` is too short to hold the header.
+    ///
+    /// Linux ref (GPL-2.0-or-later): block/sed-opal.c:opal_discovery0_end
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 8 {
+            return None;
+        }
+        // Length field = byte count after the 4-byte length field itself.
+        let hdr_length = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let revision = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        // Descriptor region: starts at byte 48 (after the 48-byte header),
+        // ends at byte 4 + hdr_length. Clamp to actual buffer length.
+        const HDR_SIZE: usize = 48;
+        let end = (4 + hdr_length).min(buf.len());
+        if end < HDR_SIZE {
+            return Some(OpalDiscovery {
+                revision,
+                ..Default::default()
+            });
+        }
+
+        let mut disc = OpalDiscovery {
+            revision,
+            ..Default::default()
+        };
+
+        let mut pos = HDR_SIZE;
+        while pos + 4 <= end {
+            let code = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let feat_len = buf[pos + 3] as usize;
+            let feat_start = pos + 4;
+            let feat_end = feat_start + feat_len;
+            if feat_end > end {
+                break; // truncated descriptor
+            }
+            let feat = &buf[feat_start..feat_end];
+
+            match code {
+                FC_TPER => {
+                    // supported_features byte: bit 0 = sync, bit 1 = async.
+                    disc.tper_supported = true;
+                    if !feat.is_empty() {
+                        disc.tper_sync = (feat[0] & (1 << 0)) != 0;
+                        disc.tper_async = (feat[0] & (1 << 1)) != 0;
+                    }
+                }
+                FC_LOCKING => {
+                    // supported_features: bit 0=LockingSupported, bit 1=LockingEnabled,
+                    // bit 2=Locked, bit 4=MBREnabled, bit 5=MBRDone.
+                    disc.locking_supported = true;
+                    if !feat.is_empty() {
+                        disc.locking_enabled = (feat[0] & (1 << 1)) != 0;
+                        disc.locked = (feat[0] & (1 << 2)) != 0;
+                        disc.mbr_enabled = (feat[0] & (1 << 4)) != 0;
+                        disc.mbr_done = (feat[0] & (1 << 5)) != 0;
+                    }
+                }
+                FC_SINGLEUSER => {
+                    disc.single_user_mode = true;
+                }
+                FC_OPALV100 => {
+                    if feat.len() >= 2 {
+                        disc.opal_v100_base_comid = u16::from_be_bytes([feat[0], feat[1]]);
+                    }
+                }
+                FC_OPALV200 => {
+                    // baseComID at feat[0..2], numComIDs at feat[2..4].
+                    if feat.len() >= 4 {
+                        disc.opal_v200_base_comid = u16::from_be_bytes([feat[0], feat[1]]);
+                        disc.opal_v200_num_comids = u16::from_be_bytes([feat[2], feat[3]]);
+                    }
+                }
+                // FC_GEOMETRY, FC_ENTERPRISE, FC_DATASTORE, vendor 0xBFFF..=0xFFFF: ignore.
+                _ => {}
+            }
+
+            pos = feat_end;
+        }
+
+        Some(disc)
+    }
+}
+
+/// Build a minimal Level 0 Discovery 0 response buffer for testing.
+///
+/// Produces a valid TCG wire format buffer from `(feature_code, feature_data)`
+/// pairs. Suitable for feeding to `OpalDiscovery::parse`.
+pub fn encode_opal_discovery(revision: u32, features: &[(u16, &[u8])]) -> Vec<u8> {
+    let desc_bytes: usize = features.iter().map(|(_, d)| 4 + d.len()).sum();
+    // Length field = bytes after itself = 44 (rest of header) + desc_bytes.
+    let hdr_length: u32 = (44 + desc_bytes) as u32;
+    let total = 4 + hdr_length as usize;
+    let mut buf = alloc::vec![0u8; total];
+    buf[0..4].copy_from_slice(&hdr_length.to_be_bytes());
+    buf[4..8].copy_from_slice(&revision.to_be_bytes());
+    // Bytes 8..48 reserved / vendor-specific — remain zero.
+    let mut pos = 48usize;
+    for (code, data) in features {
+        buf[pos] = ((code >> 8) & 0xFF) as u8;
+        buf[pos + 1] = (code & 0xFF) as u8;
+        buf[pos + 2] = 0x10; // version=1, reserved nibble=0
+        buf[pos + 3] = data.len() as u8;
+        buf[pos + 4..pos + 4 + data.len()].copy_from_slice(data);
+        pos += 4 + data.len();
+    }
+    buf
+}

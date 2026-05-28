@@ -1415,6 +1415,120 @@ impl Controller {
         Ok(())
     }
 
+    // ── Admin: Security Send (opcode 0x81) ───────────────────────────────
+
+    /// Security Send (NVMe Base 2.0c §5.25, opcode 0x81).
+    ///
+    /// Transfers `data` to the device via the protocol identified by `secp`
+    /// (Security Protocol) and `spsp` (Protocol-Specific). The primary use
+    /// is TCG Opal session traffic (`secp = 0x01`).
+    ///
+    /// CDW10 bits[31:24] = SECP, bits[23:8] = SPSP, bits[7:0] = reserved.
+    /// CDW11 = TL (transfer length in bytes = `data.len()`).
+    ///
+    /// Linux ref (GPL-2.0-or-later):
+    ///   drivers/nvme/host/core.c:nvme_sec_submit
+    pub fn security_send(&mut self, secp: u8, spsp: u16, data: &[u8]) -> Result<(), NvmeError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let tl = data.len() as u32;
+        let buf = alloc_coherent(data.len(), DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        // SAFETY: identity-mapped DMA buffer; exclusively owned here.
+        unsafe {
+            let base = buf.phys_addr().raw() as *mut u8;
+            for (i, &b) in data.iter().enumerate() {
+                core::ptr::write_volatile(base.add(i), b);
+            }
+        }
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let sqe = build_security_sqe(
+            admin::OPC_SECURITY_SEND,
+            secp,
+            spsp,
+            tl,
+            buf.phys_addr().raw(),
+        );
+        // SAFETY: admin queue + BAR live; DMA buffer valid for submit duration.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
+        drop(buf);
+        Ok(())
+    }
+
+    // ── Admin: Security Receive (opcode 0x82) ────────────────────────────
+
+    /// Security Receive (NVMe Base 2.0c §5.26, opcode 0x82).
+    ///
+    /// Requests up to `buf.len()` bytes of security protocol data from the
+    /// device into `buf`. Returns the number of bytes written.
+    ///
+    /// CDW10 bits[31:24] = SECP, bits[23:8] = SPSP, bits[7:0] = reserved.
+    /// CDW11 = AL (allocation length = `buf.len()`).
+    ///
+    /// Linux ref (GPL-2.0-or-later):
+    ///   drivers/nvme/host/core.c:nvme_sec_submit
+    pub fn security_receive(
+        &mut self,
+        secp: u8,
+        spsp: u16,
+        buf: &mut [u8],
+    ) -> Result<usize, NvmeError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let al = buf.len() as u32;
+        let dma = alloc_coherent(buf.len(), DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let sqe = build_security_sqe(
+            admin::OPC_SECURITY_RECEIVE,
+            secp,
+            spsp,
+            al,
+            dma.phys_addr().raw(),
+        );
+        // SAFETY: admin queue + BAR live; DMA buffer valid for submit duration.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
+        // Copy DMA buffer into caller's slice.
+        // SAFETY: identity-mapped DMA page; buf.len() == al.
+        unsafe {
+            let base = dma.phys_addr().raw() as *const u8;
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile(base.add(i));
+            }
+        }
+        drop(dma);
+        Ok(buf.len())
+    }
+
+    // ── Admin: TCG Opal Level 0 Discovery ────────────────────────────────
+
+    /// TCG Opal Level 0 Discovery (Opal SSC §3.1.1).
+    ///
+    /// Issues `Security Receive(SECP=0x01, SPSP=0x0001)` and decodes the L0
+    /// Discovery 0 response into an `OpalDiscovery` struct.
+    ///
+    /// Linux ref (GPL-2.0-or-later):
+    ///   block/sed-opal.c:opal_discovery0_end,
+    ///   block/opal_proto.h (d0_header / d0_features layout).
+    pub fn discover_opal(&mut self) -> Result<admin::OpalDiscovery, NvmeError> {
+        const L0_DISC_BUF: usize = 512;
+        let mut raw = alloc::vec![0u8; L0_DISC_BUF];
+        let n =
+            self.security_receive(admin::SECP_TCG_OPAL, admin::SPSP_L0_DISCOVERY, &mut raw)?;
+        admin::OpalDiscovery::parse(&raw[..n]).ok_or(NvmeError::CommandFailed {
+            cmd: admin::OPC_SECURITY_RECEIVE,
+            status: 0,
+        })
+    }
+
     /// Number of live I/O queue pairs. Zero before any of the
     /// `create_io_queue*` paths run.
     #[inline]
@@ -1932,6 +2046,24 @@ unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
     let lbads = unsafe { core::ptr::read_volatile(base.add(lbaf_off + 2)) };
     let lba_bytes: u32 = if lbads == 0 { 512 } else { 1u32 << lbads };
     (nsze, lba_bytes)
+}
+
+/// Build a Security Send or Security Receive SQE.
+///
+/// CDW10 bits[31:24] = SECP, bits[23:8] = SPSP (NVMe Base 2.0c §5.25/§5.26).
+/// CDW11 = TL / AL (transfer / allocation length in bytes).
+///
+/// Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit:
+///   `cmd.common.cdw10 = cpu_to_le32(((u32)secp) << 24 | ((u32)spsp) << 8);`
+///   `cmd.common.cdw11 = cpu_to_le32(len);`
+#[inline]
+fn build_security_sqe(opcode: u8, secp: u8, spsp: u16, len: u32, prp1: u64) -> Sqe {
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = opcode as u32;
+    sqe.prp1 = prp1;
+    sqe.cdw10 = ((secp as u32) << 24) | ((spsp as u32) << 8);
+    sqe.cdw11 = len;
+    sqe
 }
 
 /// Async `BlockDevice` adapter for the singleton NVMe controller.
