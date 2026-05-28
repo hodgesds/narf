@@ -942,6 +942,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-nfc"
+version = "0.0.0"
+dependencies = [
+ "narf-console",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-nvme"
 version = "0.0.0"
 dependencies = [

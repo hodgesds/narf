@@ -1,0 +1,24 @@
+[package]
+name         = "narf-drivers-nfc"
+description  = "NFC subsystem scaffold: NCI 1.0 core types, NfcTransport trait, NXP PN553 I2C vendor driver. Stage-0 only — HCI/PN544, NDEF, P2P, secure element are deferred."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_nfc"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-console      = { path = "../../console" }
+narf-init         = { path = "../../init" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
