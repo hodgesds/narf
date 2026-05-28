@@ -593,6 +593,257 @@ pub fn bring_up<M: SmuMmio>(
     })
 }
 
+// ── Version detection ───────────────────────────────────────────────
+
+/// Which SMU firmware generation is running on this chip.
+///
+/// The version is detected at bring-up by inspecting the
+/// `driver_if_version` returned by `PPSMC_MSG_GetDriverIfVersion`.
+/// Each family has a distinct expected constant (see
+/// `SMU12_DRIVER_IF_VERSION` and `SMU_13_0_4_DRIVER_IF_VERSION`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SmuVersion {
+    /// SMU 12.0 — Renoir / Lucienne / Cezanne (Family 0x17).
+    V12,
+    /// SMU 13.0.4 — Phoenix / HawkPoint1 (Family 0x1A, 1002:1900).
+    V13,
+}
+
+impl SmuVersion {
+    /// Identify the SMU generation from a `driver_if_version` value
+    /// as reported by `PPSMC_MSG_GetDriverIfVersion`. Returns `None`
+    /// if the version is not one NARF currently handles.
+    pub fn from_driver_if(driver_if: u32) -> Option<Self> {
+        if driver_if == SMU12_DRIVER_IF_VERSION {
+            Some(SmuVersion::V12)
+        } else if driver_if == SMU_13_0_4_DRIVER_IF_VERSION {
+            Some(SmuVersion::V13)
+        } else {
+            None
+        }
+    }
+}
+
+// ── Canonical message enum ──────────────────────────────────────────
+
+/// Canonical SMU messages that NARF exposes, independent of the
+/// per-version numeric id. Each variant maps to a different u32
+/// opcode on SMU12 vs SMU13 — the per-version modules hold the
+/// lookup tables.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PpsmcMsg {
+    TestMessage,
+    GetSmuVersion,
+    GetDriverIfVersion,
+    GetGfxclkFrequency,
+    GetFclkFrequency,
+    SetSoftMinGfxclk,
+    SetSoftMaxGfxClk,
+    SetHardMinGfxClk,
+    SetSoftMinFclk,
+    SetSoftMaxFclk,
+    SetHardMinFclk,
+    SetSoftMinSocclk,
+    SetSoftMaxSocclk,
+    AllowGfxOff,
+    DisallowGfxOff,
+    PrepareMp1ForUnload,
+    PowerUpGfx,
+    SetDriverDramAddrHigh,
+    SetDriverDramAddrLow,
+    TransferTableSmu2Dram,
+    TransferTableDram2Smu,
+}
+
+// ── Clock domain enum ───────────────────────────────────────────────
+
+/// Clock domains queryable / constrainable via the SMU mailbox.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClockDomain {
+    /// GFX shader clock.
+    Gfxclk,
+    /// Fabric clock (Infinity Fabric).
+    Fclk,
+    /// SoC / fabric SoC clock.
+    Socclk,
+    /// Unified memory controller clock (DDR / LPDDR).
+    Uclk,
+    /// VCN video clock.
+    Vclk,
+    /// VCN decode clock.
+    Dclk,
+}
+
+// ── SMU firmware version struct ─────────────────────────────────────
+
+/// Decoded SMU firmware version.
+///
+/// The SMU encodes its version in a single 32-bit word:
+///   bits[31:24] = major
+///   bits[23:16] = minor
+///   bits[15:8]  = revision
+///   bits[7:0]   = reserved / build
+///
+/// Linux references: `smu_v12_0.c` / `smu_v13_0_4_ppt.c` — the raw
+/// `smc_fw_version` field is read-back as-is; the BCD decode is
+/// display-only in Linux. We store and surface the raw word too.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SmuFwVersion {
+    /// Major version (bits 31:24).
+    pub major: u8,
+    /// Minor version (bits 23:16).
+    pub minor: u8,
+    /// Revision (bits 15:8).
+    pub revision: u8,
+    /// Raw packed u32 as returned by GetSmuVersion / GetPmfwVersion.
+    pub raw: u32,
+}
+
+impl SmuFwVersion {
+    /// Decode from the raw 32-bit register value returned by
+    /// `PPSMC_MSG_GetSmuVersion` / `PPSMC_MSG_GetPmfwVersion`.
+    pub fn from_raw(raw: u32) -> Self {
+        SmuFwVersion {
+            major: (raw >> 24) as u8,
+            minor: (raw >> 16) as u8,
+            revision: (raw >> 8) as u8,
+            raw,
+        }
+    }
+}
+
+// ── Version-dispatched public API ───────────────────────────────────
+
+/// Detect the SMU generation by querying the driver-IF version.
+///
+/// Sends `GetDriverIfVersion` and maps the returned value to a
+/// [`SmuVersion`] variant. Returns `None` if the version is
+/// unrecognised (e.g. older Vega-class hardware).
+///
+/// The caller is responsible for ensuring the SMU mailbox is alive
+/// (PSP has loaded the firmware) before calling this; use
+/// `bring_up` for a full handshake.
+pub fn detect_version<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+) -> Option<SmuVersion> {
+    let driver_if = send_message_get(mmio, mp1_base, PPSMC_MSG_GET_DRIVER_IF_VERSION, 0).ok()?;
+    SmuVersion::from_driver_if(driver_if)
+}
+
+/// Translate a canonical [`PpsmcMsg`] to the numeric id for the
+/// given `version` and dispatch it to the SMU. Returns the ARG
+/// register read-back on success.
+///
+/// Returns `SmuError::Rejected` with a synthetic code of 0xFE
+/// (`SMU_RESP_UNKNOWN_CMD`) if the message is unsupported on this
+/// version.
+pub fn send_msg<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    version: SmuVersion,
+    msg: PpsmcMsg,
+    arg: u32,
+) -> Result<u32, SmuError> {
+    use crate::amdgpu_smu_v12;
+    use crate::amdgpu_smu_v13;
+    let id = match version {
+        SmuVersion::V12 => amdgpu_smu_v12::msg_id(msg),
+        SmuVersion::V13 => amdgpu_smu_v13::msg_id(msg),
+    };
+    match id {
+        Some(id) => send_message_get(mmio, mp1_base, id, arg),
+        None => Err(SmuError::Rejected(SMU_RESP_UNKNOWN_CMD)),
+    }
+}
+
+/// Read the SMU firmware version as a decoded [`SmuFwVersion`].
+pub fn get_fw_version<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    version: SmuVersion,
+) -> Result<SmuFwVersion, SmuError> {
+    let raw = send_msg(mmio, mp1_base, version, PpsmcMsg::GetSmuVersion, 0)?;
+    Ok(SmuFwVersion::from_raw(raw))
+}
+
+/// Read the GPU temperature in milli-degrees Celsius.
+///
+/// The SMU reports temperature in tenths-of-a-degree (d°C) via the
+/// `GetCurrentTemperature` message. We scale by 100 to land in m°C
+/// so the value composes with k10temp readings without unit drift.
+///
+/// NOTE: this uses the existing raw `PPSMC_MSG_GET_CURRENT_TEMPERATURE`
+/// constant (0x36) which is stable across SMU12 and SMU13. If future
+/// silicon renumbers it, promote it into the per-version tables.
+pub fn get_temperature_milli_c<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+) -> Result<i32, SmuError> {
+    read_gpu_temperature_millicelsius(mmio, mp1_base)
+}
+
+/// Read the current clock frequency for `domain` in MHz.
+///
+/// Dispatches the appropriate per-version GET message. Returns
+/// `SmuError::Rejected(SMU_RESP_UNKNOWN_CMD)` for domains that must
+/// be read via the shared-state-table path (SOCCLK, UCLK, VCLK, DCLK
+/// on both versions).
+pub fn get_clock_mhz<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    version: SmuVersion,
+    domain: ClockDomain,
+) -> Result<u32, SmuError> {
+    use crate::amdgpu_smu_v12;
+    use crate::amdgpu_smu_v13;
+    let id = match version {
+        SmuVersion::V12 => amdgpu_smu_v12::get_current_clk_msg(domain),
+        SmuVersion::V13 => amdgpu_smu_v13::get_current_clk_msg(domain),
+    };
+    match id {
+        Some(id) => send_message_get(mmio, mp1_base, id, 0),
+        None => Err(SmuError::Rejected(SMU_RESP_UNKNOWN_CMD)),
+    }
+}
+
+/// Set a P-state constraint on `domain`.
+///
+/// Programs both the soft-min and soft-max for the clock domain. Pass
+/// `None` for either bound to leave it unchanged.
+///
+/// Dispatches version-specific messages. Logs both steps; if the
+/// first (min) succeeds but the second (max) fails, the min constraint
+/// is already committed to the SMU — the caller owns recovery.
+pub fn set_clock_constraint<M: SmuMmio>(
+    mmio: &mut M,
+    mp1_base: u32,
+    version: SmuVersion,
+    domain: ClockDomain,
+    min_mhz: Option<u32>,
+    max_mhz: Option<u32>,
+) -> Result<(), SmuError> {
+    use crate::amdgpu_smu_v12;
+    use crate::amdgpu_smu_v13;
+    let (min_id, max_id) = {
+        let pair = match version {
+            SmuVersion::V12 => amdgpu_smu_v12::set_range_msgs(domain),
+            SmuVersion::V13 => amdgpu_smu_v13::set_range_msgs(domain),
+        };
+        match pair {
+            Some(p) => p,
+            None => return Err(SmuError::Rejected(SMU_RESP_UNKNOWN_CMD)),
+        }
+    };
+    if let Some(min) = min_mhz {
+        send_message_void(mmio, mp1_base, min_id, min)?;
+    }
+    if let Some(max) = max_mhz {
+        send_message_void(mmio, mp1_base, max_id, max)?;
+    }
+    Ok(())
+}
+
 pub mod test_support {
     //! Test scaffolding exposed for smokes in this crate and
     //! adjacent driver crates. Not part of the production driver

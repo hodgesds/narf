@@ -137,6 +137,8 @@ pub mod amdgpu_ring;
 pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
 pub mod amdgpu_smu;
+pub mod amdgpu_smu_v12;
+pub mod amdgpu_smu_v13;
 pub mod amdgpu_ucode;
 pub mod amdgpu_ucode_header;
 pub mod dp_aux;
