@@ -74,6 +74,11 @@ pub const REQ_SET_MAX_DATAGRAM_SIZE: u8 = 0x88;
 pub const REQ_GET_CRC_MODE: u8 = 0x89;
 pub const REQ_SET_CRC_MODE: u8 = 0x8A;
 
+// ── SET_ETHERNET_PACKET_FILTER request code (CDC 1.2 §6.2.4) ──────
+/// Request code for `SET_ETHERNET_PACKET_FILTER` (class request,
+/// wIndex=interface, wValue=filter bitmap). NCM 1.0 §6.2.
+pub const REQ_SET_PACKET_FILTER: u8 = 0x43;
+
 // ── NTB signatures (NCM 1.0 §3.2.1) ──────────────────────────────
 
 /// `NTH16` signature — "NCMH" little-endian.
@@ -83,6 +88,140 @@ pub const NTH32_SIGNATURE: u32 = 0x686D_636E;
 /// `NDP16` signature — "NCM0" (no CRC) or "NCM1" (CRC).
 pub const NDP16_SIGNATURE_NO_CRC: u32 = 0x304D_434E;
 pub const NDP16_SIGNATURE_CRC: u32 = 0x314D_434E;
+
+// ── GET_NTB_PARAMETERS response (NCM 1.0 §6.2.1) ─────────────────
+
+/// Decoded `GET_NTB_PARAMETERS` response — 28 bytes, little-endian.
+///
+/// ```text
+///   u16 wLength                    (28)
+///   u16 bmNtbFormatsSupported      (bit 0 = NTB-16, bit 1 = NTB-32)
+///   u32 dwNtbInMaxSize             (max host→device NTB in bytes)
+///   u16 wNdpInDivisor
+///   u16 wNdpInPayloadRemainder
+///   u16 wNdpInAlignment
+///   u16 wPadding1
+///   u32 dwNtbOutMaxSize            (max device→host NTB in bytes)
+///   u16 wNdpOutDivisor
+///   u16 wNdpOutPayloadRemainder
+///   u16 wNdpOutAlignment
+///   u16 wNtbOutMaxDatagrams
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NtbParameters {
+    /// `bmNtbFormatsSupported`: bit 0 = NTB-16 supported, bit 1 = NTB-32.
+    pub formats_supported: u16,
+    /// Maximum size of an IN NTB (host → device). Used to clamp
+    /// outbound NTB size — never send more than this.
+    pub ntb_in_max_size: u32,
+    /// Alignment divisor for datagram payloads in IN NTBs.
+    pub ndp_in_divisor: u16,
+    /// Payload-remainder for IN NTB alignment.
+    pub ndp_in_payload_remainder: u16,
+    /// Alignment of the NDP within an IN NTB.
+    pub ndp_in_alignment: u16,
+    /// Maximum size of an OUT NTB (device → host).
+    pub ntb_out_max_size: u32,
+    /// Alignment divisor for datagram payloads in OUT NTBs.
+    pub ndp_out_divisor: u16,
+    /// Payload-remainder for OUT NTB alignment.
+    pub ndp_out_payload_remainder: u16,
+    /// Alignment of the NDP within an OUT NTB.
+    pub ndp_out_alignment: u16,
+    /// Maximum number of datagrams in a single OUT NTB (0 = no
+    /// device limit — host should apply its own cap).
+    pub ntb_out_max_datagrams: u16,
+}
+
+impl NtbParameters {
+    /// Minimum wire length per spec (NCM 1.0 §6.2.1).
+    pub const WIRE_LEN: usize = 28;
+
+    /// Decode from the 28-byte GET_NTB_PARAMETERS response buffer.
+    pub fn decode(buf: &[u8]) -> Result<Self, NcmError> {
+        if buf.len() < Self::WIRE_LEN {
+            return Err(NcmError::Truncated);
+        }
+        let wlen = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        if wlen < Self::WIRE_LEN {
+            return Err(NcmError::BadFieldLength);
+        }
+        Ok(Self {
+            formats_supported: u16::from_le_bytes([buf[2], buf[3]]),
+            ntb_in_max_size: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            ndp_in_divisor: u16::from_le_bytes([buf[8], buf[9]]),
+            ndp_in_payload_remainder: u16::from_le_bytes([buf[10], buf[11]]),
+            ndp_in_alignment: u16::from_le_bytes([buf[12], buf[13]]),
+            // buf[14..15] = wPadding1 — ignored
+            ntb_out_max_size: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            ndp_out_divisor: u16::from_le_bytes([buf[20], buf[21]]),
+            ndp_out_payload_remainder: u16::from_le_bytes([buf[22], buf[23]]),
+            ndp_out_alignment: u16::from_le_bytes([buf[24], buf[25]]),
+            ntb_out_max_datagrams: u16::from_le_bytes([buf[26], buf[27]]),
+        })
+    }
+
+    /// True if the device supports NTB-32 format (bit 1 of
+    /// `bmNtbFormatsSupported`).
+    pub fn supports_ntb32(&self) -> bool {
+        self.formats_supported & 0x02 != 0
+    }
+}
+
+// ── SET_ETHERNET_PACKET_FILTER bitmap (CDC 1.2 §6.2.4) ───────────
+
+/// Packet-filter bitmap for `SET_ETHERNET_PACKET_FILTER`.
+///
+/// Sent as `wValue` in the class-specific control request
+/// `SET_ETHERNET_PACKET_FILTER` (request code 0x43). The device
+/// uses the bitmap to configure its Ethernet-level receive filter.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PacketFilter {
+    /// PROMISCUOUS — receive all packets regardless of destination.
+    pub promiscuous: bool,
+    /// ALL_MULTICAST — receive all multicast frames without filter.
+    pub all_multicast: bool,
+    /// DIRECTED — receive unicast frames addressed to this MAC.
+    pub directed: bool,
+    /// BROADCAST — receive broadcast frames.
+    pub broadcast: bool,
+    /// MULTICAST — receive multicast frames matching the filter.
+    pub multicast: bool,
+}
+
+impl PacketFilter {
+    /// Typical "normal" filter: directed + broadcast + multicast.
+    pub const NORMAL: Self = Self {
+        promiscuous: false,
+        all_multicast: false,
+        directed: true,
+        broadcast: true,
+        multicast: true,
+    };
+
+    /// Encode as the `wValue` u16 for the class control request.
+    pub fn encode(&self) -> u16 {
+        let mut v: u16 = 0;
+        if self.promiscuous { v |= 1 << 0; }
+        if self.all_multicast { v |= 1 << 1; }
+        if self.directed { v |= 1 << 2; }
+        if self.broadcast { v |= 1 << 3; }
+        if self.multicast { v |= 1 << 4; }
+        v
+    }
+
+    /// Decode a `wValue` bitmap from the device (or for round-trip
+    /// testing).
+    pub fn decode(v: u16) -> Self {
+        Self {
+            promiscuous: v & (1 << 0) != 0,
+            all_multicast: v & (1 << 1) != 0,
+            directed: v & (1 << 2) != 0,
+            broadcast: v & (1 << 3) != 0,
+            multicast: v & (1 << 4) != 0,
+        }
+    }
+}
 
 // ── NCM Functional Descriptor (NCM 1.0 §7.1) ─────────────────────
 
@@ -602,6 +741,84 @@ pub mod tests {
         "drivers/usb/cdc_ncm",
         smoke_ndp16_signature_selects_crc_mode
     );
+
+    fn smoke_ntb_parameters_decode() -> TestResult {
+        // Synthesise a 28-byte GET_NTB_PARAMETERS response.
+        // wLength=28, bmNtbFormatsSupported=0x0003 (NTB-16 + NTB-32),
+        // dwNtbInMaxSize=65536, wNdpInDivisor=4, wNdpInRemainder=0,
+        // wNdpInAlignment=4, wPadding1=0, dwNtbOutMaxSize=16384,
+        // wNdpOutDivisor=4, wNdpOutRemainder=0, wNdpOutAlignment=4,
+        // wNtbOutMaxDatagrams=40.
+        #[rustfmt::skip]
+        let raw: [u8; 28] = [
+            28, 0,          // wLength = 28
+            0x03, 0x00,     // bmNtbFormatsSupported = 0x0003
+            0x00, 0x00, 0x01, 0x00, // dwNtbInMaxSize = 65536
+            0x04, 0x00,     // wNdpInDivisor = 4
+            0x00, 0x00,     // wNdpInPayloadRemainder = 0
+            0x04, 0x00,     // wNdpInAlignment = 4
+            0x00, 0x00,     // wPadding1 = 0
+            0x00, 0x40, 0x00, 0x00, // dwNtbOutMaxSize = 16384
+            0x04, 0x00,     // wNdpOutDivisor = 4
+            0x00, 0x00,     // wNdpOutPayloadRemainder = 0
+            0x04, 0x00,     // wNdpOutAlignment = 4
+            0x28, 0x00,     // wNtbOutMaxDatagrams = 40
+        ];
+        let p = match NtbParameters::decode(&raw) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("clean NTB parameters rejected"),
+        };
+        if p.ntb_in_max_size != 65536 {
+            return TestResult::Fail("ntb_in_max_size wrong");
+        }
+        if p.ntb_out_max_size != 16384 {
+            return TestResult::Fail("ntb_out_max_size wrong");
+        }
+        if p.ntb_out_max_datagrams != 40 {
+            return TestResult::Fail("ntb_out_max_datagrams wrong");
+        }
+        if !p.supports_ntb32() {
+            return TestResult::Fail("NTB-32 support bit not set");
+        }
+        // Truncated input must be rejected.
+        match NtbParameters::decode(&raw[..10]) {
+            Err(NcmError::Truncated) => {}
+            _ => return TestResult::Fail("truncated input not rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ntb_parameters_decode);
+
+    fn smoke_set_packet_filter_encode() -> TestResult {
+        // NORMAL filter = directed | broadcast | multicast = bits 2|3|4
+        let normal = PacketFilter::NORMAL;
+        let encoded = normal.encode();
+        if encoded != 0x001C {
+            // 0b0001_1100 = 28
+            return TestResult::Fail("NORMAL filter bitmap wrong");
+        }
+        // Promiscuous only → bit 0.
+        let promisc = PacketFilter {
+            promiscuous: true,
+            ..Default::default()
+        };
+        if promisc.encode() != 0x0001 {
+            return TestResult::Fail("promiscuous-only filter wrong");
+        }
+        // Round-trip: encode → decode → encode.
+        let rt = PacketFilter::decode(encoded);
+        if rt.encode() != encoded {
+            return TestResult::Fail("round-trip failed");
+        }
+        if !rt.directed || !rt.broadcast || !rt.multicast {
+            return TestResult::Fail("NORMAL bits lost on decode");
+        }
+        if rt.promiscuous || rt.all_multicast {
+            return TestResult::Fail("extra bits set on decode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_set_packet_filter_encode);
 }
 
 // ── Class enumeration + bind ───────────────────────────────────────
@@ -884,4 +1101,70 @@ pub fn attached_ncm_count() -> usize {
 #[doc(hidden)]
 pub fn __reset_ncm_for_test() {
     CDC_NCM_DEVICES.lock().clear();
+}
+
+// ── Public API alias (spec §"Public API") ────────────────────────
+
+/// Public-facing bind entry point — alias to
+/// [`try_bind_ncm_already_addressed`] using the spec-mandated name.
+///
+/// Accepts an already-addressed `slot_id` and a full configuration
+/// descriptor blob `cfg`. If the device has a CDC-Comm/NCM interface
+/// (class 0x02 / subclass 0x0D) the driver claims it, issues
+/// `SET_CONFIGURATION`, wires up the bulk-IN/OUT pair, and registers
+/// the device with the net-iface registry under `usb-ncmN`.
+///
+/// Returns the index into [`CDC_NCM_DEVICES`] on success, or
+/// [`NcmError`] if the device is not NCM or configuration fails.
+#[inline]
+pub async fn try_bind_cdc_ncm_already_addressed(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, NcmError> {
+    try_bind_ncm_already_addressed(xhci_dev, slot_id, cfg).await
+}
+
+// ── CdcNcmIface — logical per-device interface handle ────────────
+
+/// Logical handle to a bound CDC-NCM device exposed to the rest of
+/// the kernel as a narf-net `NetIfaceEntry`-compatible face.
+///
+/// After [`try_bind_cdc_ncm_already_addressed`] succeeds, callers
+/// can borrow a `CdcNcmIface` via [`CdcNcmIface::from_idx`] to send
+/// or receive Ethernet frames without going through the static
+/// trampoline used during bring-up.
+#[derive(Copy, Clone, Debug)]
+pub struct CdcNcmIface {
+    /// Index into [`CDC_NCM_DEVICES`].
+    pub idx: usize,
+    /// Locally-administered placeholder MAC (until `GET_NET_ADDRESS`
+    /// populates the real one).
+    pub mac: [u8; 6],
+}
+
+impl CdcNcmIface {
+    /// Construct from a bound-device index. Returns `None` if `idx`
+    /// is out of range.
+    pub fn from_idx(idx: usize) -> Option<Self> {
+        let g = CDC_NCM_DEVICES.lock();
+        g.get(idx)?;
+        let mac = [0x02, 0x4E, 0x41, 0x52, 0x46, idx as u8];
+        Some(Self { idx, mac })
+    }
+
+    /// Send `eth_frame` via the bound NCM device. Wraps the frame
+    /// in a single-datagram NTB-16 and ships it on bulk-OUT.
+    pub fn send(&self, eth_frame: &[u8]) -> Result<usize, NcmError> {
+        send_frame(self.idx, eth_frame)
+    }
+
+    /// Receive the next Ethernet frame off the bulk-IN endpoint.
+    /// `scratch` must be at least as large as the device's max IN-NTB
+    /// size (typically 16 KiB; see [`NtbParameters::ntb_in_max_size`]).
+    /// Returns the datagram slice (borrowed from `scratch`) or `None`
+    /// if the transfer was empty.
+    pub fn recv<'a>(&self, scratch: &'a mut [u8]) -> Result<Option<&'a [u8]>, NcmError> {
+        recv_frame(self.idx, scratch)
+    }
 }
