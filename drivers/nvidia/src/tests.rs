@@ -1652,6 +1652,266 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// NVDEC submission (item 3)
+// ────────────────────────────────────────────────────────────────
+
+use crate::nvdec::{
+    nvdec_class_for, nvdec_falcon_base, nvdec_firmware_for, nvdec_instance_count,
+    stage_nvdec_decode, stage_nvdec_semaphore_release, NvdecCodec, NVDEC_APPID_AV1, NVDEC_APPID_H264,
+    NVDEC_APPID_HEVC, NVDEC_APPID_VP9, NVDEC_CLASS_ADA_A, NVDEC_CLASS_AMPERE_A,
+    NVDEC_CLASS_MAXWELL_A, NVDEC_CLASS_PASCAL_A, NVDEC_CLASS_TURING_A, NVDEC_CLASS_VOLTA_A,
+    NVDEC_EXECUTE, NVDEC_EXECUTE_NOTIFY_ON, NVDEC_SEMAPHORE_A, NVDEC_SET_APPLICATION_ID,
+    NVDEC_SET_CONTROL_PARAMS,
+};
+
+fn smoke_nvdec_class_table_unique_per_family() -> TestResult {
+    let classes = [
+        nvdec_class_for(ChipFamily::Maxwell).unwrap_or(0),
+        nvdec_class_for(ChipFamily::Pascal).unwrap_or(0),
+        nvdec_class_for(ChipFamily::Volta).unwrap_or(0),
+        nvdec_class_for(ChipFamily::Turing).unwrap_or(0),
+        nvdec_class_for(ChipFamily::Ampere).unwrap_or(0),
+        nvdec_class_for(ChipFamily::Ada).unwrap_or(0),
+    ];
+    for i in 0..classes.len() {
+        if classes[i] == 0 {
+            return TestResult::Fail("NVDEC class must exist for every supported family");
+        }
+        for j in (i + 1)..classes.len() {
+            if classes[i] == classes[j] {
+                return TestResult::Fail("duplicate NVDEC class across families");
+            }
+        }
+    }
+    if nvdec_class_for(ChipFamily::Maxwell) != Some(NVDEC_CLASS_MAXWELL_A) {
+        return TestResult::Fail("Maxwell NVDEC class wrong");
+    }
+    if nvdec_class_for(ChipFamily::Pascal) != Some(NVDEC_CLASS_PASCAL_A) {
+        return TestResult::Fail("Pascal NVDEC class wrong");
+    }
+    if nvdec_class_for(ChipFamily::Volta) != Some(NVDEC_CLASS_VOLTA_A) {
+        return TestResult::Fail("Volta NVDEC class wrong");
+    }
+    if nvdec_class_for(ChipFamily::Turing) != Some(NVDEC_CLASS_TURING_A) {
+        return TestResult::Fail("Turing NVDEC class wrong");
+    }
+    if nvdec_class_for(ChipFamily::Ampere) != Some(NVDEC_CLASS_AMPERE_A) {
+        return TestResult::Fail("Ampere NVDEC class wrong");
+    }
+    if nvdec_class_for(ChipFamily::Ada) != Some(NVDEC_CLASS_ADA_A) {
+        return TestResult::Fail("Ada NVDEC class wrong");
+    }
+    if nvdec_instance_count(ChipFamily::Ada) < 1 {
+        return TestResult::Fail("Ada must have at least 1 NVDEC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/nvdec", smoke_nvdec_class_table_unique_per_family);
+
+fn smoke_nvdec_method_ids_and_appids_pinned() -> TestResult {
+    if NVDEC_SET_APPLICATION_ID != 0x0100 {
+        return TestResult::Fail("SET_APPLICATION_ID at 0x100");
+    }
+    if NVDEC_SET_CONTROL_PARAMS != 0x0108 {
+        return TestResult::Fail("SET_CONTROL_PARAMS at 0x108");
+    }
+    if NVDEC_EXECUTE != 0x0300 {
+        return TestResult::Fail("EXECUTE at 0x300");
+    }
+    if NVDEC_SEMAPHORE_A != 0x0400 {
+        return TestResult::Fail("SEMAPHORE_A at 0x400");
+    }
+    if NVDEC_EXECUTE_NOTIFY_ON != 1 {
+        return TestResult::Fail("EXECUTE NOTIFY bit 0");
+    }
+    if NVDEC_APPID_H264 != 3 {
+        return TestResult::Fail("H264 APP_ID=3");
+    }
+    if NVDEC_APPID_HEVC != 7 {
+        return TestResult::Fail("HEVC APP_ID=7");
+    }
+    if NVDEC_APPID_VP9 != 8 {
+        return TestResult::Fail("VP9 APP_ID=8");
+    }
+    if NVDEC_APPID_AV1 != 9 {
+        return TestResult::Fail("AV1 APP_ID=9");
+    }
+    if NvdecCodec::H264.app_id() != NVDEC_APPID_H264 {
+        return TestResult::Fail("codec→app_id round trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/nvdec", smoke_nvdec_method_ids_and_appids_pinned);
+
+fn smoke_nvdec_stage_decode_and_semaphore_bytes() -> TestResult {
+    let mut buf = [0u8; 128];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_nvdec_decode(
+            &mut pb,
+            NVDEC_CLASS_TURING_A,
+            NvdecCodec::H264,
+            0x4000_0000,
+            0xCAFE_F00D,
+            42,
+        )
+        .unwrap();
+        stage_nvdec_semaphore_release(&mut pb, 0x9999_AAAA_BBBB_CCCC, 0x1234_5678).unwrap();
+        pb.len()
+    };
+    // 4 decode blocks + 1 sem block:
+    //   SET_OBJECT       (1 data) → 8 bytes
+    //   SET_APPLICATION_ID (1)    → 8 bytes
+    //   SET_CONTROL_PARAMS (4)    → 20 bytes
+    //   EXECUTE          (1 data) → 8 bytes
+    //   SEMAPHORE_A      (4 data) → 20 bytes
+    // = 8+8+20+8+20 = 64 bytes.
+    if pb_len != 64 {
+        return TestResult::Fail("decode + sem release should be 64 bytes");
+    }
+    // SET_APPLICATION_ID data word should be H264 app id (3).
+    let app_data = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if app_data != NVDEC_APPID_H264 {
+        return TestResult::Fail("SET_APPLICATION_ID data should be H264");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/nvdec",
+    smoke_nvdec_stage_decode_and_semaphore_bytes
+);
+
+fn smoke_nvdec_firmware_request_naming() -> TestResult {
+    let r = nvdec_firmware_for(NvdecCodec::H264);
+    if r.image_path != "nvidia/nvdec/h264.bin" {
+        return TestResult::Fail("h264 fw path");
+    }
+    if r.video_codec != NvdecCodec::H264 {
+        return TestResult::Fail("codec field roundtrip");
+    }
+    if nvdec_firmware_for(NvdecCodec::Hevc).image_path != "nvidia/nvdec/hevc.bin" {
+        return TestResult::Fail("hevc fw path");
+    }
+    if nvdec_firmware_for(NvdecCodec::Av1).image_path != "nvidia/nvdec/av1.bin" {
+        return TestResult::Fail("av1 fw path");
+    }
+    // Falcon base sanity: NVDEC0 at FALCON_BASE_NVDEC0, NVDEC1 at +0x4000.
+    if nvdec_falcon_base(0) != crate::falcon::FALCON_BASE_NVDEC0 {
+        return TestResult::Fail("NVDEC0 Falcon base wrong");
+    }
+    if nvdec_falcon_base(1) != crate::falcon::FALCON_BASE_NVDEC0 + 0x4000 {
+        return TestResult::Fail("NVDEC1 Falcon base stride");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/nvdec", smoke_nvdec_firmware_request_naming);
+
+// ────────────────────────────────────────────────────────────────
+// NVENC submission (item 4)
+// ────────────────────────────────────────────────────────────────
+
+use crate::nvenc::{
+    nvenc_class_for, nvenc_falcon_base, nvenc_firmware_for, nvenc_instance_count,
+    stage_nvenc_encode, NvencCodec, NVENC_APPID_AV1, NVENC_APPID_H264, NVENC_APPID_HEVC,
+    NVENC_CLASS_ADA_A, NVENC_CLASS_AMPERE_A, NVENC_CLASS_MAXWELL_A, NVENC_CLASS_PASCAL_A,
+    NVENC_CLASS_TURING_A, NVENC_CLASS_VOLTA_A, NVENC_EXECUTE, NVENC_SET_APPLICATION_ID,
+};
+
+fn smoke_nvenc_class_table_unique_per_family() -> TestResult {
+    let classes = [
+        nvenc_class_for(ChipFamily::Maxwell).unwrap_or(0),
+        nvenc_class_for(ChipFamily::Pascal).unwrap_or(0),
+        nvenc_class_for(ChipFamily::Volta).unwrap_or(0),
+        nvenc_class_for(ChipFamily::Turing).unwrap_or(0),
+        nvenc_class_for(ChipFamily::Ampere).unwrap_or(0),
+        nvenc_class_for(ChipFamily::Ada).unwrap_or(0),
+    ];
+    for i in 0..classes.len() {
+        if classes[i] == 0 {
+            return TestResult::Fail("NVENC class must exist for every supported family");
+        }
+        for j in (i + 1)..classes.len() {
+            if classes[i] == classes[j] {
+                return TestResult::Fail("duplicate NVENC class across families");
+            }
+        }
+    }
+    if nvenc_class_for(ChipFamily::Maxwell) != Some(NVENC_CLASS_MAXWELL_A) {
+        return TestResult::Fail("Maxwell NVENC class wrong");
+    }
+    if nvenc_class_for(ChipFamily::Pascal) != Some(NVENC_CLASS_PASCAL_A) {
+        return TestResult::Fail("Pascal NVENC class wrong");
+    }
+    if nvenc_class_for(ChipFamily::Ada) != Some(NVENC_CLASS_ADA_A) {
+        return TestResult::Fail("Ada NVENC class wrong");
+    }
+    if nvenc_instance_count(ChipFamily::Ada) < 1 {
+        return TestResult::Fail("Ada must have at least 1 NVENC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/nvenc", smoke_nvenc_class_table_unique_per_family);
+
+fn smoke_nvenc_method_ids_and_appids_pinned() -> TestResult {
+    if NVENC_SET_APPLICATION_ID != 0x0100 {
+        return TestResult::Fail("SET_APPLICATION_ID");
+    }
+    if NVENC_EXECUTE != 0x0300 {
+        return TestResult::Fail("EXECUTE");
+    }
+    if NVENC_APPID_H264 != 3 || NVENC_APPID_HEVC != 7 || NVENC_APPID_AV1 != 9 {
+        return TestResult::Fail("APP_ID values");
+    }
+    if NvencCodec::H264.app_id() != NVENC_APPID_H264 {
+        return TestResult::Fail("codec → app_id");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/nvenc", smoke_nvenc_method_ids_and_appids_pinned);
+
+fn smoke_nvenc_stage_encode_byte_count_and_class() -> TestResult {
+    let mut buf = [0u8; 64];
+    let pb_len = {
+        let mut pb = PbBuilder::new(&mut buf);
+        stage_nvenc_encode(
+            &mut pb,
+            NVENC_CLASS_TURING_A,
+            NvencCodec::Hevc,
+            0x4000_0000,
+            0xABCD,
+        )
+        .unwrap();
+        pb.len()
+    };
+    // Blocks: SET_OBJECT (1) → 8, SET_APPLICATION_ID (1) → 8,
+    // SET_CONTROL_PARAMS (2) → 12, EXECUTE (1) → 8. = 36 bytes.
+    if pb_len != 36 {
+        return TestResult::Fail("encode submission should be 36 bytes");
+    }
+    let class = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if class != NVENC_CLASS_TURING_A {
+        return TestResult::Fail("bound class should be TURING_NVENC_A");
+    }
+    let appid = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if appid != NVENC_APPID_HEVC {
+        return TestResult::Fail("APP_ID data should be HEVC");
+    }
+    // Firmware path lookups + Falcon base.
+    let fwh = nvenc_firmware_for(NvencCodec::H264);
+    if fwh.image_path != "nvidia/nvenc/h264.bin" {
+        return TestResult::Fail("h264 enc fw path");
+    }
+    if nvenc_falcon_base(0) != crate::falcon::FALCON_BASE_NVENC0 {
+        return TestResult::Fail("NVENC0 Falcon base");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/nvenc",
+    smoke_nvenc_stage_encode_byte_count_and_class
+);
+
+// ────────────────────────────────────────────────────────────────
 // GR engine clear-screen submission (item 11)
 // ────────────────────────────────────────────────────────────────
 
