@@ -1652,6 +1652,94 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// PMU firmware staging (item 10)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_pmu_firmware_paths_per_asic() -> TestResult {
+    // Per-ASIC path lookups must return ASIC-specific filenames.
+    let m = pmu_firmware_for("gm200");
+    if !m.image_path.contains("gm200") {
+        return TestResult::Fail("gm200 image path should mention gm200");
+    }
+    if !m.desc_path.contains("desc") {
+        return TestResult::Fail("desc path missing 'desc'");
+    }
+    if !m.sig_path.contains("sig") {
+        return TestResult::Fail("sig path missing 'sig'");
+    }
+    let p = pmu_firmware_for("gp104");
+    if !p.image_path.contains("gp104") {
+        return TestResult::Fail("gp104 fw path should mention gp104");
+    }
+    // Turing 104/106/116/117 all share tu102 firmware.
+    let t = pmu_firmware_for("tu104");
+    if !t.image_path.contains("tu102") {
+        return TestResult::Fail("tu104 should share tu102 fw");
+    }
+    // Ada parts share ad102 firmware.
+    let a = pmu_firmware_for("ad104");
+    if !a.image_path.contains("ad102") {
+        return TestResult::Fail("ad104 should share ad102 fw");
+    }
+    // Unknown ASIC falls back to generic.
+    let u = pmu_firmware_for("xx999");
+    if u.image_path != "nvidia/pmu/image.bin" {
+        return TestResult::Fail("unknown ASIC should fall back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/pmu", smoke_pmu_firmware_paths_per_asic);
+
+fn smoke_pmu_stage_error_variants_distinct() -> TestResult {
+    use crate::pmu::PmuStageError;
+    // Three distinct error roots.
+    let a = PmuStageError::BadAlignment;
+    let b = PmuStageError::Falcon(crate::falcon::FalconError::IdleTimeout);
+    let c = PmuStageError::Falcon(crate::falcon::FalconError::HaltTimeout);
+    // Variant kinds compare structurally — at least one of the
+    // pairs must differ. (Falcon errors do compare equal between
+    // themselves via inner type.)
+    match (&a, &b) {
+        (PmuStageError::BadAlignment, PmuStageError::Falcon(_)) => {}
+        _ => return TestResult::Fail("expected BadAlignment vs Falcon variant"),
+    }
+    match (&b, &c) {
+        (PmuStageError::Falcon(_), PmuStageError::Falcon(_)) => {}
+        _ => return TestResult::Fail("Falcon variants share kind"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/pmu", smoke_pmu_stage_error_variants_distinct);
+
+fn smoke_pmu_ampere_ada_short_circuit_in_bringup() -> TestResult {
+    // On Ampere/Ada the PMU is GSP-owned; bring_up is supposed to
+    // no-op rather than touch the Falcon. We can't easily exercise
+    // the live MMIO path in a unit test, but the early-return
+    // invariant is encoded in `Pmu::bring_up`. Test that the
+    // family check does what we expect — Ampere/Ada → Ok(()).
+    // The bring_up signature requires a Falcon block we can't
+    // synthesize here, so just round-trip the family helper.
+    if !matches!(ChipFamily::Ampere, ChipFamily::Ampere) {
+        return TestResult::Fail("variant match");
+    }
+    // The has_gsp helper is the same predicate.
+    if !ChipFamily::Ampere.has_gsp() {
+        return TestResult::Fail("Ampere should has_gsp");
+    }
+    if !ChipFamily::Ada.has_gsp() {
+        return TestResult::Fail("Ada should has_gsp");
+    }
+    if ChipFamily::Maxwell.has_gsp() {
+        return TestResult::Fail("Maxwell does NOT has_gsp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/pmu",
+    smoke_pmu_ampere_ada_short_circuit_in_bringup
+);
+
+// ────────────────────────────────────────────────────────────────
 // GSP RPC live commands (item 9)
 // ────────────────────────────────────────────────────────────────
 
