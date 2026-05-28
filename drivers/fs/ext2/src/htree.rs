@@ -39,10 +39,10 @@
 //! - Linux `include/uapi/linux/ext4_fs.h::DX_HASH_*` constants.
 //!
 //! Stage 1 (this file): decode the root + walk to a leaf block, then
-//! hand off to the linear walker in `dir`. Stage 2 (leaf splitting on
-//! insert) is deferred — write paths fall through the existing
-//! `dir_mut::dir_insert` which extends the directory as a flat
-//! sequence of blocks.
+//! hand off to the linear walker in `dir`. Stage 2 (write path, this
+//! file): `htree_split_leaf` — when `dir_mut::dir_insert` finds a
+//! full HTREE leaf, this splits it into two blocks and updates the
+//! parent index node. Mirrors Linux `fs/ext4/namei.c::do_split`.
 
 /// Hash function discriminator (matches Linux `DX_HASH_*`).
 pub mod hash_version {
@@ -346,6 +346,242 @@ pub fn name_hash(name: &[u8], hash_version: u8, seed: &[u32; 4]) -> DirHash {
             DirHash { hash: 0, minor: 0 }
         }
     }
+}
+
+// ── HTREE write path: leaf-split ───────────────────────────────────
+//
+// When `dir_insert` finds that an HTREE leaf block is full, it calls
+// `htree_split_leaf` which:
+//   1. Collects all live dirents from the old block (with their hashes).
+//   2. Sorts them by hash.
+//   3. Walks from the end accumulating byte-size until ~50 % of the
+//      block is filled — those entries go to the new block.
+//   4. Repacks old and new blocks.
+//   5. Returns the split-hash and both block bodies so the caller can
+//      allocate a new physical block and update the index node.
+//
+// Ref: Linux `fs/ext4/namei.c::do_split` (GPL-2.0).
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+/// Error from the split path.
+#[derive(Debug)]
+pub enum SplitError {
+    /// Index node already at capacity — caller must grow the tree.
+    IndexFull,
+    /// Block data is structurally corrupt.
+    Corrupt,
+}
+
+/// A single live dirent captured from a leaf block, paired with the
+/// hash of the entry name (so the sort is stable without re-hashing).
+#[derive(Clone, Debug)]
+pub struct LeafEntry {
+    pub hash: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Serialise one dirent into a byte vector. The record length in the
+/// bytes is set to the minimum aligned length; the caller that repacks
+/// the block is responsible for adjusting the last entry's `rec_len`
+/// to reach the end of the block.
+fn pack_dirent(inode: u32, name: &[u8], file_type: u8) -> Vec<u8> {
+    let name_len = name.len() as u8;
+    let aligned = ((name_len as usize + 8 + 3) & !3) as u16;
+    let mut v = vec![0u8; aligned as usize];
+    v[0..4].copy_from_slice(&inode.to_le_bytes());
+    v[4..6].copy_from_slice(&aligned.to_le_bytes());
+    v[6] = name_len;
+    v[7] = file_type;
+    v[8..8 + name_len as usize].copy_from_slice(name);
+    v
+}
+
+/// Walk every dirent in `block`, hash each name, and return a
+/// `Vec<LeafEntry>` sorted ascending by hash. Skips deleted entries
+/// (inode == 0). Returns `Err(SplitError::Corrupt)` on malformed
+/// record lengths.
+pub fn collect_sorted_leaf_entries(
+    block: &[u8],
+    hash_version: u8,
+    seed: &[u32; 4],
+) -> Result<Vec<LeafEntry>, SplitError> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= block.len() {
+        let inode = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
+        let name_len = block[off + 6] as usize;
+        let file_type = block[off + 7];
+        if rec_len < 8 || off + rec_len > block.len() {
+            return Err(SplitError::Corrupt);
+        }
+        if inode != 0 && name_len > 0 {
+            let name = &block[off + 8..off + 8 + name_len];
+            let h = name_hash(name, hash_version, seed);
+            let bytes = pack_dirent(inode, name, file_type);
+            out.push(LeafEntry { hash: h.hash, bytes });
+        }
+        off += rec_len;
+    }
+    // Stable sort by hash — entries with equal hashes keep
+    // their relative order (matches Linux `dx_sort_map`'s intent).
+    out.sort_by_key(|e| e.hash);
+    Ok(out)
+}
+
+/// Write `entries` back into `block`, tightly packed. The last
+/// entry's `rec_len` is extended to the end of the block. Returns
+/// `Err` if the packed entries don't fit.
+pub fn repack_leaf_block(block: &mut [u8], entries: &[LeafEntry]) -> Result<(), SplitError> {
+    let bs = block.len();
+    // Measure total needed space.
+    let needed: usize = entries.iter().map(|e| e.bytes.len()).sum();
+    if needed > bs {
+        return Err(SplitError::Corrupt);
+    }
+    // Zero the block then write entries.
+    for b in block.iter_mut() {
+        *b = 0;
+    }
+    let mut pos = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        let len = e.bytes.len();
+        block[pos..pos + len].copy_from_slice(&e.bytes);
+        if i + 1 == entries.len() {
+            // Stretch the last entry to fill the block.
+            let final_rec_len = (bs - pos) as u16;
+            block[pos + 4..pos + 6].copy_from_slice(&final_rec_len.to_le_bytes());
+        }
+        pos += len;
+    }
+    Ok(())
+}
+
+/// Insert a new `(hash, block_no)` pair into an htree index node.
+/// The entries array begins at `entries_off` inside `node_buf`. The
+/// `(count, limit)` header lives at `head_off`. Both are byte offsets
+/// into `node_buf`. Returns `Err(SplitError::IndexFull)` when the
+/// node is at capacity.
+pub fn index_node_insert_entry(
+    node_buf: &mut [u8],
+    head_off: usize,
+    entries_off: usize,
+    hash: u32,
+    block_no: u32,
+) -> Result<(), SplitError> {
+    if node_buf.len() < entries_off + 8 {
+        return Err(SplitError::Corrupt);
+    }
+    let limit = u16::from_le_bytes([node_buf[head_off], node_buf[head_off + 1]]) as usize;
+    let count = u16::from_le_bytes([node_buf[head_off + 2], node_buf[head_off + 3]]) as usize;
+    if count >= limit {
+        return Err(SplitError::IndexFull);
+    }
+    // Find insertion position (entries are sorted by hash; entry 0
+    // has no hash — it's the catch-all bucket so we skip it).
+    let mut insert_at = count; // default: append
+    for i in 1..count {
+        let off = entries_off + i * 8;
+        let h = u32::from_le_bytes([
+            node_buf[off],
+            node_buf[off + 1],
+            node_buf[off + 2],
+            node_buf[off + 3],
+        ]);
+        if hash < h {
+            insert_at = i;
+            break;
+        }
+    }
+    // Shift entries from `insert_at` to `count` one slot right.
+    let src_start = entries_off + insert_at * 8;
+    let src_end = entries_off + count * 8;
+    node_buf.copy_within(src_start..src_end, src_start + 8);
+    // Write the new entry.
+    let off = entries_off + insert_at * 8;
+    node_buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
+    node_buf[off + 4..off + 8].copy_from_slice(&block_no.to_le_bytes());
+    // Bump count.
+    let new_count = (count + 1) as u16;
+    node_buf[head_off + 2..head_off + 4].copy_from_slice(&new_count.to_le_bytes());
+    Ok(())
+}
+
+/// Result of a successful leaf-split.
+#[derive(Debug)]
+pub struct SplitResult {
+    /// Repacked old block (lower-hash half).
+    pub old_block_data: Vec<u8>,
+    /// Repacked new block (upper-hash half).
+    pub new_block_data: Vec<u8>,
+    /// The boundary hash — the smallest hash that moved to the new
+    /// block. This value goes into the new index-node entry.
+    pub split_hash: u32,
+}
+
+/// Split a full HTREE leaf block into two. Mirrors Linux
+/// `fs/ext4/namei.c::do_split`.
+///
+/// * `block_data` — the full leaf block to split (blocksize bytes).
+/// * `hash_version` / `seed` — from the directory's `DxRoot`.
+///
+/// Returns `SplitResult` with both repacked halves and the
+/// `split_hash` boundary, or `SplitError::Corrupt` if the block
+/// cannot be decoded.
+pub fn htree_split_leaf(
+    block_data: &[u8],
+    hash_version: u8,
+    seed: &[u32; 4],
+) -> Result<SplitResult, SplitError> {
+    let bs = block_data.len();
+    let entries = collect_sorted_leaf_entries(block_data, hash_version, seed)?;
+    let count = entries.len();
+    if count < 2 {
+        // Nothing to split — caller should extend linearly.
+        return Err(SplitError::Corrupt);
+    }
+
+    // Walk from the end accumulating byte sizes until we exceed half
+    // the block.  The split point is the first entry that would push
+    // the running total past bs/2. This mirrors Linux's loop over
+    // `map[i].size / 2 > blocksize / 2`.
+    let half = bs / 2;
+    let mut size = 0usize;
+    let mut move_count = 0usize;
+    for i in (0..count).rev() {
+        let entry_size = entries[i].bytes.len();
+        if size + entry_size / 2 > half {
+            break;
+        }
+        size += entry_size;
+        move_count += 1;
+    }
+    // If all sizes summed under half, split by count.
+    let split = if move_count == 0 || move_count >= count {
+        count / 2
+    } else {
+        count - move_count
+    };
+    // split must be at least 1 and at most count-1.
+    let split = split.clamp(1, count - 1);
+
+    let split_hash = entries[split].hash;
+
+    let lower = &entries[..split];
+    let upper = &entries[split..];
+
+    let mut old_block = vec![0u8; bs];
+    let mut new_block = vec![0u8; bs];
+    repack_leaf_block(&mut old_block, lower)?;
+    repack_leaf_block(&mut new_block, upper)?;
+
+    Ok(SplitResult {
+        old_block_data: old_block,
+        new_block_data: new_block,
+        split_hash,
+    })
 }
 
 #[cfg(test)]
