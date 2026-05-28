@@ -125,6 +125,26 @@ pub fn probe(
 
     let did = dev.device_id;
     let hw_rev = dev.hw_rev;
+    
+    // ── Stage 2: MHI initialization ──
+    let auth = match narf_firmware::trusted_loader_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        match unsafe { crate::ath11k::mhi::mhi_init(&dev.mmio_bar0, did, &auth) } {
+            Ok(()) => {
+                let _ = writeln!(narf_console::Writer, "  ath11k: MHI Mission Mode (M0) reached");
+            }
+            Err(e) => {
+                let _ = writeln!(narf_console::Writer, "  ath11k: MHI initialization failed: {:?}", e);
+                // We don't fail probe here yet so the log stays visible
+            }
+        }
+    } else {
+        let _ = writeln!(narf_console::Writer, "  ath11k: no firmware authority — skipping MHI start");
+    }
+
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {

@@ -24,9 +24,150 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 
-// ── MHI register offsets (within BAR0) ─────────────────────────────
+use narf_bus::MmioRegion;
+use narf_capabilities::{Cap, Read};
+use narf_firmware::FirmwareRegistry;
+
+use crate::ath11k::pci::{read_via_window, write_via_window, ProbeError};
+
+// ── MHI initialization ─────────────────────────────────────────────
+
+/// Initialize the MHI controller and load the AMSS firmware.
+/// Advances the chip to Mission Mode (M0).
+pub unsafe fn mhi_init(
+    mmio: &MmioRegion,
+    did: u16,
+    auth: &Cap<FirmwareRegistry, Read>,
+) -> Result<(), ProbeError> {
+    // 1. Reset the MHI controller.
+    unsafe { write_via_window(mmio, MHICTRL, MHICTRL_RESET_MASK) };
+
+    // 2. Poll MHISTATUS until READY bit (bit 0) is set.
+    // Linux uses a 2-second timeout for this.
+    let mut ready = false;
+    for _ in 0..2000 {
+        let status = unsafe { read_via_window(mmio, MHISTATUS) };
+        if status & 0x1 != 0 {
+            ready = true;
+            break;
+        }
+        if status == 0xFFFF_FFFF {
+            return Err(ProbeError::LinkDown);
+        }
+        narf_scheduler::sleep_pumps::run(); // Cooperative yield
+    }
+    if !ready {
+        return Err(ProbeError::LtssmFailed); // Use LtssmFailed as a proxy for MHI timeout
+    }
+
+    // 3. Load the AMSS firmware via BHI.
+    load_amss_firmware(mmio, did, auth)?;
+
+    // 4. Set MHI state to M0.
+    let mut ctrl = unsafe { read_via_window(mmio, MHICTRL) };
+    ctrl &= !MHICTRL_MHISTATE_MASK;
+    ctrl |= MHI_STATE_M0 << MHICTRL_MHISTATE_SHIFT;
+    unsafe { write_via_window(mmio, MHICTRL, ctrl) };
+
+    // 5. Poll MHISTATUS until state is M0 (bits 15:8 == 2).
+    let mut m0_reached = false;
+    for _ in 0..2000 {
+        let status = unsafe { read_via_window(mmio, MHISTATUS) };
+        let state = (status >> 8) & 0xFF;
+        if state == MHI_STATE_M0 {
+            m0_reached = true;
+            break;
+        }
+        narf_scheduler::sleep_pumps::run();
+    }
+    if !m0_reached {
+        return Err(ProbeError::NotImplemented); // M0 handshake failed
+    }
+
+    Ok(())
+}
+
+/// Load the AMSS firmware blob into the chip via the BHI.
+fn load_amss_firmware(
+    mmio: &MmioRegion,
+    did: u16,
+    auth: &Cap<FirmwareRegistry, Read>,
+) -> Result<(), ProbeError> {
+    // Determine the firmware path based on the device ID.
+    // QCA6390 -> ath11k/QCA6390/hw2.0/amss.bin
+    // WCN6855 -> ath11k/WCN6855/hw2.0/amss.bin
+    let chip_prefix = match did {
+        crate::ath11k::hw::ATH11K_DEV_QCA6390 => "QCA6390/hw2.0",
+        crate::ath11k::hw::ATH11K_DEV_WCN6855 | crate::ath11k::hw::ATH11K_DEV_QCA2066 => {
+            "WCN6855/hw2.0"
+        }
+        crate::ath11k::hw::ATH11K_DEV_QCN9074 => "QCN9074/hw1.0",
+        crate::ath11k::hw::ATH11K_DEV_WCN7850 => "WCN7850/hw2.0",
+        _ => "QCA6390/hw2.0",
+    };
+    let fw_name = format!("ath11k/{}/amss.bin", chip_prefix);
+
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath11k: loading firmware {}",
+        fw_name
+    );
+
+    let cap = narf_firmware::open(&fw_name, auth).map_err(|_| ProbeError::NotImplemented)?;
+    let view = narf_firmware::view_of(&cap).map_err(|_| ProbeError::NotImplemented)?;
+
+    // Allocate a DMA-coherent buffer and copy the firmware.
+    // ath11k firmware blobs are typically 1-2 MiB.
+    let mut dma_buf = narf_io::alloc_coherent(view.bytes.len(), narf_lib::id::DomainId::DRIVER_0)
+        .map_err(|_| ProbeError::Bar0MapFailed)?;
+    dma_buf.as_mut_slice().copy_from_slice(view.bytes);
+
+    let phys = dma_buf.phys_addr().as_u64();
+    let size = view.bytes.len() as u32;
+
+    // Read the BHI offset from BAR0+0x28.
+    let bhi_off = unsafe { read_via_window(mmio, BHIOFF) };
+
+    // Program BHI registers.
+    unsafe {
+        write_via_window(mmio, bhi_off + BHI_IMGADDR_LOW, phys as u32);
+        write_via_window(mmio, bhi_off + BHI_IMGADDR_HIGH, (phys >> 32) as u32);
+        write_via_window(mmio, bhi_off + BHI_IMGSIZE, size);
+        // Doorbell trigger (sequence 1).
+        write_via_window(mmio, bhi_off + BHI_IMGTXDB, 1);
+    }
+
+    // Poll BHI_STATUS for SUCCESS.
+    let mut success = false;
+    for _ in 0..5000 {
+        let status = unsafe { read_via_window(mmio, bhi_off + BHI_STATUS) };
+        if status == BHI_STATUS_SUCCESS {
+            success = true;
+            break;
+        }
+        if status == BHI_STATUS_ERROR {
+            return Err(ProbeError::NotImplemented);
+        }
+        narf_scheduler::sleep_pumps::run();
+    }
+
+    if !success {
+        return Err(ProbeError::NotImplemented);
+    }
+
+    // Keep the DMA buffer alive until M0 is reached (or beyond if needed).
+    // For this bring-up stage, we'll just let it leak if successful or
+    // we can find a better place to store it.
+    core::mem::forget(dma_buf);
+
+    Ok(())
+}
+
+// ── MHI state machine ──────────────────────────────────────────────
 //
 // The MHI register block sits at a chip-specific offset inside
 // BAR0. For QCA6390 / QCN9074 / WCN6855 it's the BAR0 base + the
@@ -34,7 +175,24 @@ use alloc::vec::Vec;
 
 pub const MHISTATUS: u32 = 0x48;
 pub const MHICTRL: u32 = 0x38;
+pub const MHICFG: u32 = 0x10;
+pub const BHIOFF: u32 = 0x28;
+
 pub const MHICTRL_RESET_MASK: u32 = 0x2;
+pub const MHICTRL_MHISTATE_MASK: u32 = 0x0000_FF00;
+pub const MHICTRL_MHISTATE_SHIFT: u32 = 8;
+pub const MHI_STATE_M0: u32 = 0x2;
+
+// BHI relative offsets (to the value in BHIOFF)
+pub const BHI_IMGADDR_LOW: u32 = 0x08;
+pub const BHI_IMGADDR_HIGH: u32 = 0x0c;
+pub const BHI_IMGSIZE: u32 = 0x10;
+pub const BHI_IMGTXDB: u32 = 0x18;
+pub const BHI_EXECENV: u32 = 0x28;
+pub const BHI_STATUS: u32 = 0x2c;
+
+pub const BHI_STATUS_SUCCESS: u32 = 2;
+pub const BHI_STATUS_ERROR: u32 = 3;
 
 pub const PCIE_TXVECDB: u32 = 0x360;
 pub const PCIE_TXVECSTATUS: u32 = 0x368;
