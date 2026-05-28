@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::task::Waker;
 use narf_capabilities::{CapKind, CapType};
@@ -10,7 +11,9 @@ use narf_capabilities::{CapKind, CapType};
 pub mod registry;
 pub mod types;
 
-pub use types::{I3cError, I3cOp, IbiPayload};
+pub use types::{
+    CccDest, CommonCommandCode, I3cDevice, I3cError, I3cOp, IbiPayload,
+};
 
 /// A specialized capability for I3C operations.
 #[derive(Debug)]
@@ -33,10 +36,44 @@ impl CapType for I3cCapType {
 }
 
 /// A specialized I3C bus interface.
+///
+/// Implementors handle low-level frame construction; callers use the
+/// higher-level `ccc()` and `enter_daa()` helpers instead of crafting
+/// raw `I3cOp` sequences.
+///
+/// Spec ref: I3C Basic rev 1.1 §5.
+/// Linux ref: include/linux/i3c/master.h i3c_master_controller_ops.
 #[async_trait]
 pub trait I3cBus: Send + Sync {
-    /// Performs a transfer to/from a specific target device.
+    /// Performs a raw SDR transfer to/from a specific target device.
     async fn transfer(&self, addr: u8, ops: &mut [I3cOp]) -> Result<(), I3cError>;
+
+    /// Sends a Common Command Code to the bus.
+    ///
+    /// Broadcast CCCs use address `0x7E` (I3C reserved); directed CCCs
+    /// address the `dest` field.  The `payload` slice is sent after the
+    /// opcode for write-type CCCs; for read-type CCCs the caller passes
+    /// a zero-length slice and inspects the return payload out-of-band
+    /// (Stage 3 extension point).
+    ///
+    /// Linux ref: drivers/i3c/master/dw-i3c-master.c
+    ///            dw_i3c_master_send_ccc_cmd()
+    async fn ccc(
+        &self,
+        ccc: CommonCommandCode,
+        dest: CccDest,
+        payload: &[u8],
+    ) -> Result<(), I3cError>;
+
+    /// Dynamic Address Assignment procedure (ENTDAA).
+    ///
+    /// Issues RSTDAA then ENTDAA as per I3C spec rev 1.1 §5.1.9.3.
+    /// Returns the list of devices that responded and were assigned
+    /// a dynamic address.
+    ///
+    /// Linux ref: drivers/i3c/master/dw-i3c-master.c
+    ///            dw_i3c_master_daa()
+    async fn enter_daa(&self) -> Result<Vec<I3cDevice>, I3cError>;
 
     /// Registers an async waker for an In-Band Interrupt (IBI).
     fn register_ibi_waker(&self, addr: u8, waker: Waker);
@@ -60,6 +97,8 @@ mod tests {
 
     struct MockI3c {
         transfers: IrqSafeSpinLock<Vec<u8>>,
+        /// Last CCC sent: (opcode, dest_addr_or_0xFF_for_broadcast, payload_byte_0).
+        last_ccc: IrqSafeSpinLock<Option<(u8, u8, u8)>>,
     }
 
     #[async_trait]
@@ -79,15 +118,41 @@ mod tests {
             Ok(())
         }
 
+        async fn ccc(
+            &self,
+            ccc: CommonCommandCode,
+            dest: CccDest,
+            payload: &[u8],
+        ) -> Result<(), I3cError> {
+            let dest_byte = match dest {
+                CccDest::Broadcast => 0xFF,
+                CccDest::Address(a) => a,
+            };
+            let p0 = payload.first().copied().unwrap_or(0);
+            *self.last_ccc.lock() = Some((ccc.opcode(), dest_byte, p0));
+            Ok(())
+        }
+
+        async fn enter_daa(&self) -> Result<Vec<I3cDevice>, I3cError> {
+            // Synthetic DAA: return one fake device.
+            let raw: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xC4, 0x11];
+            Ok(alloc::vec![I3cDevice::from_daa_response(&raw, 0x08)])
+        }
+
         fn register_ibi_waker(&self, _addr: u8, _waker: Waker) {}
         fn unregister_ibi_waker(&self, _addr: u8) {}
     }
 
+    fn make_mock() -> Arc<MockI3c> {
+        Arc::new(MockI3c {
+            transfers: IrqSafeSpinLock::new(Vec::new()),
+            last_ccc: IrqSafeSpinLock::new(None),
+        })
+    }
+
     fn smoke_i3c_transfer() -> TestResult {
         narf_scheduler::__reset_queues_for_test();
-        let mock = Arc::new(MockI3c {
-            transfers: IrqSafeSpinLock::new(Vec::new()),
-        });
+        let mock = make_mock();
         let success = Arc::new(core::sync::atomic::AtomicU32::new(0));
 
         let m = mock.clone();
@@ -148,18 +213,14 @@ mod tests {
         // Write tail landed in `transfers` while the Read buf was
         // populated.
         narf_scheduler::__reset_queues_for_test();
-        let mock = Arc::new(MockI3c {
-            transfers: IrqSafeSpinLock::new(Vec::new()),
-        });
+        let mock = make_mock();
         let ok = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let m = mock.clone();
         let o = ok.clone();
         narf_scheduler::spawn(async move {
             let mut rbuf = [0u8; 3];
             let mut ops = [I3cOp::Write(&[0xAB, 0xCD]), I3cOp::Read(&mut rbuf)];
-            if m.transfer(0x42, &mut ops).await.is_ok()
-                && rbuf == [0x55, 0x55, 0x55]
-            {
+            if m.transfer(0x42, &mut ops).await.is_ok() && rbuf == [0x55, 0x55, 0x55] {
                 o.store(true, core::sync::atomic::Ordering::SeqCst);
             }
         });
@@ -190,4 +251,117 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("i3c", smoke_i3c_ibi_payload_field_round_trip);
+
+    // ── CCC opcode encoding smoke ──────────────────────────────────
+    // Verifies the exact wire values mandated by I3C spec rev 1.1
+    // Table 11 and Linux include/linux/i3c/ccc.h.
+    fn smoke_i3c_ccc_opcode_encoding() -> TestResult {
+        let cases: &[(CommonCommandCode, u8, bool)] = &[
+            (CommonCommandCode::EnecBc, 0x00, false),
+            (CommonCommandCode::DisecBc, 0x01, false),
+            (CommonCommandCode::RstdaaBc, 0x06, false),
+            (CommonCommandCode::Entdaa, 0x07, false),
+            (CommonCommandCode::SetmwlBc, 0x09, false),
+            (CommonCommandCode::SetmrlBc, 0x0A, false),
+            (CommonCommandCode::EnecDir, 0x80, true),
+            (CommonCommandCode::DisecDir, 0x81, true),
+            (CommonCommandCode::Setdasa, 0x87, true),
+            (CommonCommandCode::Getpid, 0x8D, true),
+            (CommonCommandCode::Getbcr, 0x8E, true),
+            (CommonCommandCode::Getdcr, 0x8F, true),
+        ];
+        for &(ccc, expected_opcode, expected_directed) in cases {
+            if ccc.opcode() != expected_opcode {
+                return TestResult::Fail("CCC opcode mismatch");
+            }
+            if ccc.is_directed() != expected_directed {
+                return TestResult::Fail("CCC directed flag mismatch");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_ccc_opcode_encoding);
+
+    // ── CCC dispatch smoke — mock receives correct opcode ──────────
+    fn smoke_i3c_ccc_dispatch_via_mock() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = make_mock();
+        let ok = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let m = mock.clone();
+        let o = ok.clone();
+        narf_scheduler::spawn(async move {
+            // Broadcast DISEC with payload 0x01 (disable SIR events).
+            let r = m
+                .ccc(CommonCommandCode::DisecBc, CccDest::Broadcast, &[0x01])
+                .await;
+            if r.is_ok() {
+                o.store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if !ok.load(core::sync::atomic::Ordering::SeqCst) {
+            return TestResult::Fail("ccc() returned error");
+        }
+        let recorded = mock.last_ccc.lock();
+        match *recorded {
+            Some((op, dest, p0)) => {
+                if op != CommonCommandCode::DisecBc.opcode() {
+                    return TestResult::Fail("wrong CCC opcode recorded");
+                }
+                if dest != 0xFF {
+                    return TestResult::Fail("wrong CCC dest recorded");
+                }
+                if p0 != 0x01 {
+                    return TestResult::Fail("wrong CCC payload byte recorded");
+                }
+            }
+            None => return TestResult::Fail("no CCC recorded"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_ccc_dispatch_via_mock);
+
+    // ── DAA payload decode smoke ───────────────────────────────────
+    // Verifies I3cDevice::from_daa_response() per spec rev 1.1 §5.1.9.3.
+    fn smoke_i3c_daa_payload_decode() -> TestResult {
+        // Construct a synthetic 8-byte DAA response.
+        // PID = 0xAABBCCDDEEFF (big-endian bytes 0-5)
+        // BCR = 0xC4, DCR = 0x11
+        let raw: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0xC4, 0x11];
+        let dev = I3cDevice::from_daa_response(&raw, 0x42);
+        if dev.pid != 0x00AABBCCDDEEFF {
+            return TestResult::Fail("DAA PID decode wrong");
+        }
+        if dev.bcr != 0xC4 {
+            return TestResult::Fail("DAA BCR decode wrong");
+        }
+        if dev.dcr != 0x11 {
+            return TestResult::Fail("DAA DCR decode wrong");
+        }
+        if dev.dynamic_addr != 0x42 {
+            return TestResult::Fail("DAA dynamic_addr wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_daa_payload_decode);
+
+    // ── enter_daa returns device list from mock ────────────────────
+    fn smoke_i3c_enter_daa_returns_devices() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = make_mock();
+        let count = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let m = mock.clone();
+        let c = count.clone();
+        narf_scheduler::spawn(async move {
+            if let Ok(devs) = m.enter_daa().await {
+                c.store(devs.len(), core::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if count.load(core::sync::atomic::Ordering::SeqCst) != 1 {
+            return TestResult::Fail("enter_daa did not return 1 device");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_enter_daa_returns_devices);
 }
