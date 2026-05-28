@@ -56,6 +56,7 @@ narf-graphics-driver = { path = "../drivers/graphics" }
 narf-drivers-gpu     = { path = "../drivers/gpu" }
 narf-drivers-nvidia  = { path = "../drivers/nvidia" }
 narf-drivers-psp     = { path = "../drivers/psp" }
+narf-drivers-crypto  = { path = "../drivers/crypto" }
 narf-init            = { path = "../init" }
 narf-fb              = { path = "../fb" }
 narf-audio           = { path = "../audio" }

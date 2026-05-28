@@ -31,6 +31,7 @@ extern crate narf_efi as _;
 extern crate narf_hid as _;
 extern crate narf_pinctrl as _;
 extern crate narf_drivers_psp as _;
+extern crate narf_drivers_crypto as _;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
