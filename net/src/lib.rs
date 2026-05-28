@@ -196,6 +196,17 @@ impl Frame {
         &self.buf.as_slice()[off..end]
     }
 
+    /// Mutably borrow the payload bytes. Same slice as [`Self::payload`]
+    /// but grants write access. Drivers use this on the RX path to
+    /// copy received bytes into the frame before handing it to the
+    /// IPC ring.
+    #[inline]
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        let off = self.offset as usize;
+        let end = off + self.len as usize;
+        &mut self.buf.as_mut_slice()[off..end]
+    }
+
     /// Decompose into the underlying `DmaBuffer` + used length.
     /// The caller takes ownership of the buffer and `offset` is
     /// dropped — only use this when the consumer knows the
@@ -387,6 +398,24 @@ impl Registry {
 /// actually registers interfaces.
 pub fn bootstrap_authority() -> Cap<NetIface, Grant> {
     Cap::<NetIface, Grant>::bootstrap()
+}
+
+/// Trusted network authority — a Grant cap minted once at boot and
+/// stored here for the driver-registration path.
+static TRUSTED_NET_AUTHORITY: IrqSafeSpinLock<Option<Cap<NetIface, Grant>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install the trusted network authority. TCB-only.
+pub fn install_trusted_net_authority(cap: Cap<NetIface, Grant>) {
+    let mut g = TRUSTED_NET_AUTHORITY.lock();
+    if g.is_none() {
+        *g = Some(cap);
+    }
+}
+
+/// Retrieve the trusted network authority.
+pub fn trusted_net_authority() -> Option<Cap<NetIface, Grant>> {
+    TRUSTED_NET_AUTHORITY.lock().as_ref().cloned()
 }
 
 // ── Loopback ────────────────────────────────────────────────────────
