@@ -1652,6 +1652,182 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// DP MST topology + payload bandwidth (item 7)
+// ────────────────────────────────────────────────────────────────
+
+use crate::mst::{
+    encode_sideband_header, slots_for_pbn, MstBranch, MstTopology, SidebandHeader, SidebandReq,
+    VcpiTable, DPCD_MSTM_CAP, DPCD_MSTM_CTRL, DPCD_PAYLOAD_ALLOCATE_COUNT,
+    DPCD_PAYLOAD_ALLOCATE_SET, DPCD_PAYLOAD_ALLOCATE_START, DPCD_PAYLOAD_TABLE_STATUS,
+    DPCD_VC_PAYLOAD_ID_SLOT_1, MSTM_CAP_MST, MSTM_CTRL_MST_EN, MSTM_CTRL_UP_REQ_EN,
+    VCPI_SLOT_COUNT,
+};
+
+fn smoke_mst_dpcd_address_constants_match_dp_spec() -> TestResult {
+    if DPCD_MSTM_CAP != 0x0021 {
+        return TestResult::Fail("MSTM_CAP at 0x21");
+    }
+    if DPCD_MSTM_CTRL != 0x0111 {
+        return TestResult::Fail("MSTM_CTRL at 0x111");
+    }
+    if DPCD_PAYLOAD_ALLOCATE_SET != 0x01C0 {
+        return TestResult::Fail("PAYLOAD_ALLOCATE_SET at 0x1C0");
+    }
+    if DPCD_PAYLOAD_ALLOCATE_START != 0x01C1 {
+        return TestResult::Fail("PAYLOAD_ALLOCATE_START at 0x1C1");
+    }
+    if DPCD_PAYLOAD_ALLOCATE_COUNT != 0x01C2 {
+        return TestResult::Fail("PAYLOAD_ALLOCATE_COUNT at 0x1C2");
+    }
+    if DPCD_PAYLOAD_TABLE_STATUS != 0x02C0 {
+        return TestResult::Fail("PAYLOAD_TABLE_STATUS at 0x2C0");
+    }
+    if DPCD_VC_PAYLOAD_ID_SLOT_1 != 0x02C1 {
+        return TestResult::Fail("VC_PAYLOAD_ID_SLOT_1 at 0x2C1");
+    }
+    if MSTM_CTRL_MST_EN != 1 {
+        return TestResult::Fail("MST_EN bit 0");
+    }
+    if MSTM_CTRL_UP_REQ_EN != 2 {
+        return TestResult::Fail("UP_REQ_EN bit 1");
+    }
+    if MSTM_CAP_MST != 1 {
+        return TestResult::Fail("MST_CAP bit 0");
+    }
+    if VCPI_SLOT_COUNT != 64 {
+        return TestResult::Fail("64 time slots");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/mst", smoke_mst_dpcd_address_constants_match_dp_spec);
+
+fn smoke_mst_sideband_header_encoding_roundtrip() -> TestResult {
+    // Simple 1-hop LINK_ADDRESS request at port 3.
+    let mut lcr = [0u8; 15];
+    lcr[0] = 3;
+    let h = SidebandHeader::new(SidebandReq::LinkAddress, 1, lcr);
+    let bytes = encode_sideband_header(&h);
+    // Header byte 0: lct=1 in high nibble → 0x10.
+    if bytes[0] >> 4 != 1 {
+        return TestResult::Fail("LCT field in byte 0 high nibble");
+    }
+    // Final byte = req code (LinkAddress = 0x01).
+    let last = bytes[bytes.len() - 1];
+    if last & 0x1F != SidebandReq::LinkAddress.code() {
+        return TestResult::Fail("trailing byte should carry req code");
+    }
+    // ResourceStatus header has request code 0x13.
+    if SidebandReq::ResourceStatusNotify.code() != 0x13 {
+        return TestResult::Fail("ResourceStatusNotify = 0x13");
+    }
+    if SidebandReq::ClearPayloadIdTable.code() != 0x14 {
+        return TestResult::Fail("ClearPayloadIdTable = 0x14");
+    }
+    // Sideband code 0x21 for REMOTE_DPCD_WRITE per DP spec.
+    if SidebandReq::RemoteDpcdWrite.code() != 0x21 {
+        return TestResult::Fail("RemoteDpcdWrite = 0x21");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mst",
+    smoke_mst_sideband_header_encoding_roundtrip
+);
+
+fn smoke_mst_vcpi_table_allocate_and_release() -> TestResult {
+    let mut t = VcpiTable::empty();
+    if t.free_count() != 63 {
+        return TestResult::Fail("empty table should report 63 free slots");
+    }
+    // Allocate VCPI 1, 8 slots.
+    let s1 = t.allocate(1, 8).expect("8-slot allocation should fit");
+    if s1 != 1 {
+        return TestResult::Fail("first allocation should start at slot 1");
+    }
+    if t.free_count() != 55 {
+        return TestResult::Fail("free should drop to 55");
+    }
+    // Allocate VCPI 2, 4 slots.
+    let s2 = t.allocate(2, 4).expect("4-slot allocation");
+    if s2 != 9 {
+        return TestResult::Fail("second allocation should follow first run");
+    }
+    // Lookup
+    let v1 = t.lookup(1).expect("VCPI 1 should be allocated");
+    if v1.start_slot != 1 || v1.slot_count != 8 {
+        return TestResult::Fail("VCPI 1 lookup wrong");
+    }
+    // Release
+    let freed = t.release(1);
+    if freed != 8 {
+        return TestResult::Fail("release VCPI 1 should free 8 slots");
+    }
+    if t.lookup(1).is_some() {
+        return TestResult::Fail("after release VCPI 1 should be gone");
+    }
+    // Reject VCPI 0 and VCPI > 63.
+    if t.allocate(0, 4).is_some() {
+        return TestResult::Fail("VCPI 0 is reserved");
+    }
+    if t.allocate(64, 4).is_some() {
+        return TestResult::Fail("VCPI 64 is out of range");
+    }
+    // Empty / zero-slot reject.
+    if t.allocate(5, 0).is_some() {
+        return TestResult::Fail("0-slot allocation rejected");
+    }
+    // Over-capacity reject.
+    if VcpiTable::empty().allocate(5, 64).is_some() {
+        return TestResult::Fail("64 slots > capacity 63");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/mst", smoke_mst_vcpi_table_allocate_and_release);
+
+fn smoke_mst_pbn_to_slot_conversion() -> TestResult {
+    // 64 PBN → 1 slot (exact).
+    if slots_for_pbn(64) != 1 {
+        return TestResult::Fail("64 PBN = 1 slot");
+    }
+    if slots_for_pbn(65) != 2 {
+        return TestResult::Fail("65 PBN ceils to 2 slots");
+    }
+    if slots_for_pbn(0) != 0 {
+        return TestResult::Fail("0 PBN = 0 slots");
+    }
+    // Over-allocation clamps to 63 slots.
+    if slots_for_pbn(99999) != 63 {
+        return TestResult::Fail("huge PBN clamps to 63 slots");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/mst", smoke_mst_pbn_to_slot_conversion);
+
+fn smoke_mst_topology_tracks_branches() -> TestResult {
+    let mut topo = MstTopology::new();
+    let mut root = MstBranch::new(alloc::vec::Vec::new(), 4, [0xAB; 16]);
+    root.set_sink(0);
+    root.set_sink(1);
+    topo.add_branch(root);
+    // One sub-branch hanging off port 2.
+    let mut sub = MstBranch::new(alloc::vec![2], 3, [0xCD; 16]);
+    sub.set_sink(0);
+    sub.set_sink(1);
+    sub.set_sink(2);
+    topo.add_branch(sub);
+    if topo.sink_count() != 5 {
+        return TestResult::Fail("5 sinks across root + sub");
+    }
+    // find_branch_mut on the empty LCR returns root.
+    let root_ref = topo.find_branch_mut(&[]).expect("root should be findable");
+    if root_ref.port_count != 4 {
+        return TestResult::Fail("root port count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/mst", smoke_mst_topology_tracks_branches);
+
+// ────────────────────────────────────────────────────────────────
 // IH (interrupt-handler) cookie-decode walker (item 5)
 // ────────────────────────────────────────────────────────────────
 

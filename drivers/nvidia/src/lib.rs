@@ -51,6 +51,7 @@ pub mod hpd;
 pub mod kms;
 pub mod mc;
 pub mod mmu;
+pub mod mst;
 pub mod nvdec;
 pub mod nvenc;
 pub mod pb;
