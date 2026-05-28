@@ -1,7 +1,7 @@
 # iwlwifi — Specification
 
-> Status: **v0.3** (Stage 3 complete: CSR map + APM init + ucode
-> header decode + firmware-load + ALIVE handshake).
+> Status: **v0.4** (Stage 4 baseline: Interface traits + background
+> pumps + hardware ring initialization + scan scaffold).
 >
 > GPL-2.0-or-later driver for Intel Wi-Fi 6 / 6E PCIe host
 > controllers (AX200 / AX201 / AX210 / AX211 / AX411 + Killer 1690).
@@ -10,8 +10,9 @@
 
 ## 1. Purpose & scope
 
-**Owns:** Bring-up of Intel AX2xx-class Wi-Fi 6 / 6E radios
-attached over PCIe. Advanced through Stage 3 (ALIVE state).
+**Owns:** Bring-up and operational control of Intel AX2xx-class
+radios. Implements `narf_net::Interface` and
+`narf_wireless::WirelessNetIface`.
 
 **Does NOT own (any stage):** mac80211-equivalent stack,
 802.11 frame parsing/building (lives in `narf_net`), regulatory
@@ -27,13 +28,18 @@ interrupt masking, and gating firmware loading.
 Indirect access via `HBUS_TARG_PRPH_WADDR` / `_RDAT` / `_WDAT`.
 Reaches the internal peripheral register file.
 
-### 2.3 Firmware Loading
-- **Gen2 (AX200/AX201)**: Uses the FH (Flow Handler) DMA
-  engine to push ucode sections to device SRAM.
-- **Gen3 (AX210/AX211/AX411)**: Uses Context Info V2 + IML
-  (Intermediate Microcode Loader) for ROM-assisted boot.
+### 2.3 DMA Rings
+- **RX**: Single descriptor ring (RXB) mapped in coherent host
+  RAM. Drain is managed by the `iwl_rx_pump` task.
+- **TX**: Multiple scheduler rings. Queue 0 used for management
+  commands and background `iwl_tx_pump`.
 
-### 2.4 ALIVE Handshake
+### 2.4 Host Commands (HCMD)
+Communication with the firmware uses a Group-Command-Version
+addressing scheme. Commands (e.g., `SCAN_REQ_UMAC`) are enqueued
+as TFDs with a specific command header.
+
+### 2.5 ALIVE Handshake
 The driver polls for the `ALIVE` notification (Status `0xCAFE`)
 after releasing the device CPU. Reached successfully on all
 supported families.
@@ -43,8 +49,9 @@ supported families.
 - **Stage 1**: PCI match table.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
 - **Stage 3**: Firmware loading (Gen2/Gen3) + ALIVE handshake.
-- **Stage 4 (Planned)**: Scan, associate, and key installation.
-- **Stage 5 (Planned)**: TX/RX fast path integration.
+- **Stage 4**: Interface traits, IPC ring integration, background
+  RX/TX pumps, and scan/association skeletons.
+- **Stage 5 (Planned)**: Full 802.11 data path + scan parsing.
 
 ## 4. References
 
