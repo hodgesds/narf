@@ -710,6 +710,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-crypto"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-fingerprint"
 version = "0.0.0"
 dependencies = [
@@ -1035,6 +1043,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-filesystem",
  "narf-hid",
  "narf-init",
  "narf-input",
@@ -1062,6 +1071,21 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-usbpd",
+]
+
+[[package]]
+name = "narf-drivers-video"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-i2c",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]

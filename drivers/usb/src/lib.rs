@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod attach;
 pub mod btusb;
+pub mod ccid;
 pub mod cdc;
 pub mod ehci;
 pub mod ohci;
@@ -15,6 +16,7 @@ pub mod uhci;
 pub mod cdc_acm;
 pub mod cdc_ncm;
 pub mod dfu;
+pub mod fingerprint;
 pub mod hid;
 pub mod hub;
 pub mod msc;
@@ -357,6 +359,8 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::NetworkClass
                     | AttachOutcome::Bluetooth
                     | AttachOutcome::WbdiFingerprint
+                    | AttachOutcome::Fingerprint
+                    | AttachOutcome::CcidReader
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -442,6 +446,8 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::NetworkClass
                         | AttachOutcome::Bluetooth
                         | AttachOutcome::WbdiFingerprint
+                        | AttachOutcome::Fingerprint
+                        | AttachOutcome::CcidReader
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }

@@ -38,6 +38,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::fingerprint;
 use crate::hid;
 use crate::hid::mouse;
 use crate::hub::{self, UsbHub, HUB_INTERFACE_CLASS};
@@ -96,6 +97,14 @@ pub enum AttachOutcome {
     /// implemented clean-room (Goodix / Synaptics-Validity / ELAN
     /// formats are libfprint-derived).
     WbdiFingerprint,
+    /// Device matched the explicit USB VID/PID fingerprint table
+    /// (Synaptics, Goodix, ELAN). Slot stays alive; endpoints
+    /// configured. Vendor command protocol is userspace-only.
+    Fingerprint,
+    /// Device bound as a USB CCID smart-card reader (class 0x0B /
+    /// subclass 0x00 / protocol 0x00). Slot stays alive; entry in
+    /// `ccid::CCID_READERS`. PC/SC daemon attaches via /dev/ccid0.
+    CcidReader,
     /// We addressed the device but couldn't bind a class driver
     /// (unknown class, or a class driver we don't have). The slot
     /// has been disabled to free it for re-use.
@@ -358,8 +367,15 @@ async fn dispatch_after_address(
     // §9.6.1). 0x09 = Hub. 0x00 = "look at interface class" — most
     // devices go that route; we still try kbd/mouse below in that
     // case because their class lives at the interface.
-    let dev_class = match xhci_dev.get_device_descriptor(slot_id).await {
-        Ok(d) => d[4],
+    // Also capture idVendor (+8) and idProduct (+10) for explicit
+    // VID/PID matches (fingerprint readers with vendor class 0xFF
+    // that don't advertise MS OS 2.0 WBDI descriptors).
+    let (dev_class, dev_vid, dev_pid) = match xhci_dev.get_device_descriptor(slot_id).await {
+        Ok(d) => {
+            let vid = u16::from_le_bytes([d[8], d[9]]);
+            let pid = u16::from_le_bytes([d[10], d[11]]);
+            (d[4], vid, pid)
+        }
         Err(_) => {
             let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
@@ -572,6 +588,26 @@ async fn dispatch_after_address(
         ).await.is_ok() {
             return AttachOutcome::Bluetooth;
         }
+        // Explicit USB-ID fingerprint match — Synaptics, Goodix, ELAN.
+        // Runs before the WBDI cascade because many of these devices
+        // expose vendor class 0xFF but omit the MS OS 2.0 descriptor,
+        // so the WBDI recogniser would never fire for them. At most
+        // ~10 lines per the scope spec.
+        if fingerprint::classify_vid_pid(dev_vid, dev_pid).is_some() {
+            if fingerprint::try_bind_fingerprint_already_addressed(
+                xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
+            ).await.is_ok() {
+                return AttachOutcome::Fingerprint;
+            }
+        }
+        // USB CCID smart-card reader — class 0x0B / subclass 0x00 /
+        // protocol 0x00. `find_ccid_interface` walks the config blob;
+        // returns NotCcid if not present.
+        if crate::ccid::try_bind_ccid_already_addressed(
+            xhci_dev, slot_id, &cfg_blob,
+        ).await.is_ok() {
+            return AttachOutcome::CcidReader;
+        }
         // WBDI fingerprint reader — Microsoft Biometric Device
         // Interface, identified by an MS OS 2.0 Compatible-ID
         // descriptor of "WINBIO". Last in the cascade because the
@@ -660,6 +696,7 @@ async fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
                 (0x0E, 0x02) => "UVC-VideoStreaming",
                 (0x0E, _) => "Video",
                 (0x01, _) => "Audio",
+                (0x0B, _) => "CCID",
                 (0xE0, 0x01) => "USB-Bluetooth",
                 (0xFE, 0x01) => "DFU",
                 (0xFF, _) => "Vendor",

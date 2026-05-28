@@ -23,6 +23,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
@@ -201,6 +202,66 @@ impl FileOps for DevKmsg {
             mode: Mode {
                 file_type: FileType::Special,
                 perms: 0o444,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
+// ── /dev/fp0 ─────────────────────────────────────────────────────────
+
+/// Optional `FileOps` delegate for `/dev/fp0`. Installed by the USB
+/// fingerprint driver when a reader is bound. Reads/writes from
+/// `/dev/fp0` route to the raw bulk/interrupt-IN endpoint of the
+/// device.
+///
+/// Stored as a global so the USB crate can register the node without a
+/// direct dependency between devfs and the USB crate.
+static FP_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
+
+/// Register (or replace) the `/dev/fp0` file node.  Called by the USB
+/// fingerprint driver after a device is successfully bound.
+pub fn register_fp(node: Arc<dyn FileOps>) {
+    *FP_NODE.lock() = Some(node);
+}
+
+/// Unregister the `/dev/fp0` node (device detached).
+pub fn unregister_fp() {
+    *FP_NODE.lock() = None;
+}
+
+/// `/dev/fp0` — proxy to whatever `Arc<dyn FileOps>` the USB
+/// fingerprint driver installed.
+struct DevFp;
+
+impl FileOps for DevFp {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let node = FP_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.read(offset, buf).await,
+                None => Err(FsError::Io(narf_block::BlockError::IOError)),
+            }
+        })
+    }
+
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let node = FP_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.write(offset, buf).await,
+                None => Err(FsError::Io(narf_block::BlockError::IOError)),
+            }
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o660,
             },
             mtime_cycles: 0,
         }
@@ -414,6 +475,7 @@ impl DirOps for DevDir {
             "console" | "tty" | "tty0" => {
                 Some(Arc::new(DevConsole) as Arc<dyn FileOps>)
             }
+            "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
             _ => None,
         }
     }
@@ -442,6 +504,7 @@ impl DirOps for DevDir {
             DirEntry { name: "console", file_type: FileType::Special },
             DirEntry { name: "tty", file_type: FileType::Special },
             DirEntry { name: "tty0", file_type: FileType::Special },
+            DirEntry { name: "fp0", file_type: FileType::Special },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -455,6 +518,7 @@ impl DirOps for DevDir {
             ("console", FileType::Special),
             ("tty", FileType::Special),
             ("tty0", FileType::Special),
+            ("fp0", FileType::Special),
         ];
         entries
             .iter()

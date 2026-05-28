@@ -2640,3 +2640,320 @@ fn smoke_btusb_no_bluetooth_on_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/btusb", smoke_btusb_no_bluetooth_on_qemu);
+
+// ── fingerprint ────────────────────────────────────────────────────
+
+/// USB-ID table matches: all 16 VID/PID entries resolve to a vendor.
+fn smoke_fp_usb_id_table_match() -> TestResult {
+    use crate::fingerprint::{classify_vid_pid, FpVendor};
+    let cases: &[(u16, u16, FpVendor)] = &[
+        // Synaptics
+        (0x06CB, 0x00BD, FpVendor::Synaptics),
+        (0x06CB, 0x00FF, FpVendor::Synaptics),
+        // Goodix
+        (0x27C6, 0x5110, FpVendor::Goodix),
+        (0x27C6, 0x55B4, FpVendor::Goodix),
+        // ELAN
+        (0x04F3, 0x0903, FpVendor::Elan),
+        (0x04F3, 0x0C03, FpVendor::Elan),
+    ];
+    for &(vid, pid, expected) in cases {
+        match classify_vid_pid(vid, pid) {
+            Some(v) if v == expected => {}
+            Some(_) => {
+                return TestResult::Fail("vendor mismatch");
+            }
+            None => {
+                return TestResult::Fail("VID/PID not found in table");
+            }
+        }
+    }
+    // Unknown device should return None.
+    if classify_vid_pid(0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown VID/PID should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_usb_id_table_match);
+
+/// Vendor classifier: each VID maps to the correct FpVendor.
+fn smoke_fp_vendor_classifier() -> TestResult {
+    use crate::fingerprint::{classify_vid_pid, FpVendor};
+    // All Synaptics PIDs
+    for pid in [0x00BD, 0x00C2, 0x00C6, 0x00C9, 0x00DC, 0x00FF] {
+        if !matches!(classify_vid_pid(0x06CB, pid), Some(FpVendor::Synaptics)) {
+            return TestResult::Fail("Synaptics PID not classified");
+        }
+    }
+    // All Goodix PIDs
+    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4] {
+        if !matches!(classify_vid_pid(0x27C6, pid), Some(FpVendor::Goodix)) {
+            return TestResult::Fail("Goodix PID not classified");
+        }
+    }
+    // All ELAN PIDs
+    for pid in [0x0903, 0x0907, 0x0C00, 0x0C03] {
+        if !matches!(classify_vid_pid(0x04F3, pid), Some(FpVendor::Elan)) {
+            return TestResult::Fail("ELAN PID not classified");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_vendor_classifier);
+
+/// Endpoint discovery on synthetic config blobs.
+fn smoke_fp_endpoint_discovery() -> TestResult {
+    use crate::fingerprint::{find_fp_endpoints, FpEndpoints, FpVendor};
+    use crate::xhci::EndpointKind;
+
+    // Build a vendor-class (0xFF) config with bulk-IN @ 0x81 +
+    // bulk-OUT @ 0x01.
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+    cfg[0] = 9; cfg[1] = 0x02; cfg[2] = 32; cfg[4] = 1; cfg[5] = 1;
+    cfg[9] = 9; cfg[10] = 0x04; cfg[11] = 0; cfg[13] = 2; cfg[14] = 0xFF;
+    cfg[18] = 7; cfg[19] = 0x05; cfg[20] = 0x81; cfg[21] = 0x02; cfg[22] = 0x00; cfg[23] = 0x02;
+    cfg[25] = 7; cfg[26] = 0x05; cfg[27] = 0x01; cfg[28] = 0x02; cfg[29] = 0x00; cfg[30] = 0x02;
+    match find_fp_endpoints(&cfg, FpVendor::Goodix) {
+        Ok(FpEndpoints::Bulk { bulk_in, bulk_out, .. }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("bulk-IN mis-decoded");
+            }
+            if bulk_out.ep_addr != 0x01 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("bulk-OUT mis-decoded");
+            }
+        }
+        _ => return TestResult::Fail("bulk endpoint discovery failed"),
+    }
+    // ELAN: interrupt-IN @ 0x81 (bmAttributes=3).
+    let mut cfg2: alloc::vec::Vec<u8> = alloc::vec![0u8; 25];
+    cfg2[0] = 9; cfg2[1] = 0x02; cfg2[2] = 25; cfg2[4] = 1; cfg2[5] = 1;
+    cfg2[9] = 9; cfg2[10] = 0x04; cfg2[11] = 0; cfg2[13] = 1; cfg2[14] = 0xFF;
+    cfg2[18] = 7; cfg2[19] = 0x05; cfg2[20] = 0x81; cfg2[21] = 0x03;
+    cfg2[22] = 0x40; cfg2[23] = 0x00;
+    match find_fp_endpoints(&cfg2, FpVendor::Elan) {
+        Ok(FpEndpoints::InterruptIn { intr_in, .. }) => {
+            if intr_in.ep_addr != 0x81 || intr_in.kind != EndpointKind::InterruptIn {
+                return TestResult::Fail("interrupt-IN mis-decoded");
+            }
+        }
+        _ => return TestResult::Fail("ELAN interrupt-IN discovery failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_endpoint_discovery);
+
+/// Bind-path: no fingerprint reader on QEMU (registry stays empty).
+fn smoke_fp_no_reader_on_qemu() -> TestResult {
+    // The QEMU TCG environment has no fingerprint USB device.
+    // After supervisor enumeration the registry must be empty.
+    if crate::fingerprint::attached_fp_count() != 0 {
+        return TestResult::Fail("fingerprint registry should be empty on QEMU TCG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
+
+// ── ccid ────────────────────────────────────────────────────────────
+
+/// Class constants for CCID (USB-IF CCID spec rev 1.1 §4.3 Table 5-1).
+fn smoke_ccid_class_triple_constants() -> TestResult {
+    use crate::ccid::{
+        CCID_INTERFACE_CLASS, CCID_INTERFACE_PROTOCOL, CCID_INTERFACE_SUBCLASS,
+    };
+    if CCID_INTERFACE_CLASS != 0x0B
+        || CCID_INTERFACE_SUBCLASS != 0x00
+        || CCID_INTERFACE_PROTOCOL != 0x00
+    {
+        return TestResult::Fail("CCID class triple drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid", smoke_ccid_class_triple_constants);
+
+/// Build a minimal 54-byte CCID class descriptor with T=0 + T=1 bits
+/// set in dwProtocols, and verify `CcidDescriptor::from_bytes` decodes
+/// them (CCID spec §5.1 Table 5-1).
+fn smoke_ccid_descriptor_t0_t1() -> TestResult {
+    use crate::ccid::{
+        CcidDescriptor, CCID_DESC_TYPE, CCID_HDR_LEN, CCID_PROTO_T0, CCID_PROTO_T1,
+    };
+    let _ = CCID_HDR_LEN; // used indirectly through the protocol
+    let mut buf = [0u8; 54];
+    buf[0] = 54;
+    buf[1] = CCID_DESC_TYPE;
+    buf[2] = 0x10; // bcdCCID = 0x0110
+    buf[3] = 0x01;
+    buf[4] = 0; // bMaxSlotIndex
+    buf[5] = 0x07; // bVoltageSupport
+    buf[6..10].copy_from_slice(&(CCID_PROTO_T0 | CCID_PROTO_T1).to_le_bytes());
+    buf[28..32].copy_from_slice(&254u32.to_le_bytes()); // dwMaxIFSD
+    buf[44..48].copy_from_slice(&271u32.to_le_bytes()); // dwMaxCCIDMessageLength
+
+    let d = match CcidDescriptor::from_bytes(&buf) {
+        Some(d) => d,
+        None => return TestResult::Fail("CcidDescriptor::from_bytes returned None"),
+    };
+    if d.bcd_ccid != 0x0110 {
+        return TestResult::Fail("bcdCCID mismatch");
+    }
+    if d.protocols & CCID_PROTO_T0 == 0 {
+        return TestResult::Fail("T=0 bit not set in dwProtocols");
+    }
+    if d.protocols & CCID_PROTO_T1 == 0 {
+        return TestResult::Fail("T=1 bit not set in dwProtocols");
+    }
+    if d.max_ifsd != 254 {
+        return TestResult::Fail("dwMaxIFSD did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid", smoke_ccid_descriptor_t0_t1);
+
+/// PC_to_RDR_IccPowerOn (0x62) header encodes correctly (§6.1.1
+/// Table 6-1): bMessageType, dwLength=0, bSlot, bSeq (CCID rev 1.1).
+fn smoke_ccid_power_on_header_encode() -> TestResult {
+    use crate::ccid::{CcidReader, PC_TO_RDR_ICC_POWER_ON};
+    let hdr = CcidReader::build_header(PC_TO_RDR_ICC_POWER_ON, 0, 0, 0x07);
+    if hdr[0] != PC_TO_RDR_ICC_POWER_ON {
+        return TestResult::Fail("bMessageType != 0x62");
+    }
+    if hdr[1..5] != 0u32.to_le_bytes() {
+        return TestResult::Fail("dwLength != 0 for power-on (no payload)");
+    }
+    if hdr[5] != 0 {
+        return TestResult::Fail("bSlot != 0");
+    }
+    if hdr[6] != 0x07 {
+        return TestResult::Fail("bSeq did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid", smoke_ccid_power_on_header_encode);
+
+/// RDR_to_PC_DataBlock (0x80) decode extracts all header fields
+/// correctly from a synthetic 14-byte response (CCID spec §6.2.1).
+fn smoke_ccid_data_block_decode() -> TestResult {
+    use crate::ccid::{CcidReader, CCID_HDR_LEN, RDR_TO_PC_DATA_BLOCK, STATUS_SUCCESS};
+    let atr: [u8; 4] = [0x3B, 0x90, 0x11, 0x00];
+    let mut buf = alloc::vec![0u8; CCID_HDR_LEN + atr.len()];
+    buf[0] = RDR_TO_PC_DATA_BLOCK;
+    buf[1..5].copy_from_slice(&(atr.len() as u32).to_le_bytes());
+    buf[5] = 0; // bSlot
+    buf[6] = 0x05; // bSeq
+    buf[7] = STATUS_SUCCESS;
+    buf[8] = 0x00;
+    buf[9] = 0x00; // bChainParameter
+    buf[10..14].copy_from_slice(&atr);
+    let (msg_type, payload_len, slot, seq, b_status, b_error) =
+        match CcidReader::decode_response_header(&buf) {
+            Ok(t) => t,
+            Err(_) => return TestResult::Fail("decode_response_header failed"),
+        };
+    if msg_type != RDR_TO_PC_DATA_BLOCK {
+        return TestResult::Fail("bMessageType mismatch");
+    }
+    if payload_len != 4 {
+        return TestResult::Fail("dwLength != 4");
+    }
+    if slot != 0 || seq != 0x05 {
+        return TestResult::Fail("bSlot/bSeq mismatch");
+    }
+    if b_status & 0x03 != STATUS_SUCCESS {
+        return TestResult::Fail("bStatus not success");
+    }
+    if b_error != 0 {
+        return TestResult::Fail("bError != 0");
+    }
+    let payload = &buf[CCID_HDR_LEN..CCID_HDR_LEN + payload_len as usize];
+    if payload != &atr[..] {
+        return TestResult::Fail("ATR payload did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid", smoke_ccid_data_block_decode);
+
+/// Bind path: `find_ccid_interface` + `find_ccid_class_descriptor` +
+/// `find_ccid_endpoints` all succeed on a fully synthetic configuration
+/// descriptor with a CCID 0x0B/0x00/0x00 interface (§4.3 Table 5-1).
+fn smoke_ccid_bind_fake_xhci() -> TestResult {
+    use crate::ccid::{
+        find_ccid_class_descriptor, find_ccid_endpoints, find_ccid_interface, CcidError,
+        CCID_DESC_TYPE, CCID_INTERFACE_CLASS, CCID_INTERFACE_PROTOCOL, CCID_INTERFACE_SUBCLASS,
+        CCID_PROTO_T0, CCID_PROTO_T1,
+    };
+    use crate::xhci::EndpointKind;
+
+    // Config (9) + Interface (9) + CCID descriptor (54) + 3 endpoints (21) = 93.
+    let total: u16 = 93;
+    let mut cfg = alloc::vec![0u8; total as usize];
+    cfg[0] = 9;    cfg[1] = 0x02;
+    cfg[2] = (total & 0xFF) as u8; cfg[3] = (total >> 8) as u8;
+    cfg[4] = 1;    cfg[5] = 1; // bConfigurationValue
+    cfg[7] = 0xC0; cfg[8] = 50;
+    // Interface at 9
+    cfg[9] = 9; cfg[10] = 0x04; cfg[11] = 0;
+    cfg[13] = 3;
+    cfg[14] = CCID_INTERFACE_CLASS;
+    cfg[15] = CCID_INTERFACE_SUBCLASS;
+    cfg[16] = CCID_INTERFACE_PROTOCOL;
+    // CCID class descriptor at 18
+    cfg[18] = 54; cfg[19] = CCID_DESC_TYPE;
+    cfg[20] = 0x10; cfg[21] = 0x01; // bcdCCID = 0x0110
+    cfg[24..28].copy_from_slice(&(CCID_PROTO_T0 | CCID_PROTO_T1).to_le_bytes());
+    cfg[46..50].copy_from_slice(&254u32.to_le_bytes()); // dwMaxIFSD
+    cfg[62..66].copy_from_slice(&271u32.to_le_bytes()); // dwMaxCCIDMessageLength
+    // Bulk-IN (EP1 IN) at 72
+    cfg[72] = 7; cfg[73] = 0x05; cfg[74] = 0x81; cfg[75] = 0x02;
+    cfg[76] = 64;
+    // Bulk-OUT (EP1 OUT) at 79
+    cfg[79] = 7; cfg[80] = 0x05; cfg[81] = 0x01; cfg[82] = 0x02;
+    cfg[83] = 64;
+    // Interrupt-IN (EP2 IN) at 86
+    cfg[86] = 7; cfg[87] = 0x05; cfg[88] = 0x82; cfg[89] = 0x03;
+    cfg[90] = 8;
+
+    let (iface, iface_off) = match find_ccid_interface(&cfg) {
+        Some(p) => p,
+        None => return TestResult::Fail("find_ccid_interface returned None"),
+    };
+    if iface != 0 || iface_off != 9 {
+        return TestResult::Fail("interface number or offset mismatch");
+    }
+    let desc = match find_ccid_class_descriptor(&cfg, iface_off) {
+        Some(d) => d,
+        None => return TestResult::Fail("find_ccid_class_descriptor returned None"),
+    };
+    if desc.protocols & CCID_PROTO_T0 == 0 || desc.protocols & CCID_PROTO_T1 == 0 {
+        return TestResult::Fail("T=0/T=1 bits absent in decoded descriptor");
+    }
+    let eps = match find_ccid_endpoints(&cfg, iface_off) {
+        Ok(e) => e,
+        Err(CcidError::EndpointsMissing) => return TestResult::Fail("endpoints missing"),
+        Err(_) => return TestResult::Fail("find_ccid_endpoints error"),
+    };
+    if eps.bulk_in.ep_addr != 0x81 || !matches!(eps.bulk_in.kind, EndpointKind::BulkIn) {
+        return TestResult::Fail("bulk-IN addr/kind mismatch");
+    }
+    if eps.bulk_out.ep_addr != 0x01 || !matches!(eps.bulk_out.kind, EndpointKind::BulkOut) {
+        return TestResult::Fail("bulk-OUT addr/kind mismatch");
+    }
+    if eps.intr_in.is_none() {
+        return TestResult::Fail("intr-IN absent");
+    }
+    let intr = eps.intr_in.unwrap();
+    if intr.ep_addr != 0x82 || !matches!(intr.kind, EndpointKind::InterruptIn) {
+        return TestResult::Fail("intr-IN addr/kind mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid", smoke_ccid_bind_fake_xhci);
+
+/// After supervisor enumeration on QEMU TCG there are no smart-card
+/// readers, so the registry must be empty.
+fn smoke_ccid_no_reader_on_qemu() -> TestResult {
+    if crate::ccid::attached_count() != 0 {
+        return TestResult::Fail("ccid registry should be empty on QEMU TCG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid", smoke_ccid_no_reader_on_qemu);

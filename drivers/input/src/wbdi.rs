@@ -169,6 +169,29 @@ pub fn parse_descriptor_set(blob: &[u8]) -> Result<(SetHeader, Vec<CompatibleId>
 pub const COMPATIBLE_ID_WINUSB: &[u8; 8] = b"WINUSB\0\0";
 pub const SUB_COMPATIBLE_ID_WBDI: &[u8; 8] = b"WBDI\0\0\0\0";
 
+/// USB VID/PID pairs for well-known fingerprint readers that may use
+/// vendor class 0xFF without an MS OS 2.0 WBDI compatible-ID
+/// descriptor. Mirrors the explicit table in
+/// `narf_drivers_usb::fingerprint`.
+///
+/// Sources: libfprint device tables (Goodix, Synaptics-Validity, ELAN).
+pub const KNOWN_FP_IDS: &[(u16, u16)] = &[
+    // Synaptics / Validity
+    (0x06CB, 0x00BD), (0x06CB, 0x00C2), (0x06CB, 0x00C6),
+    (0x06CB, 0x00C9), (0x06CB, 0x00DC), (0x06CB, 0x00FF),
+    // Goodix
+    (0x27C6, 0x5110), (0x27C6, 0x5117), (0x27C6, 0x530C),
+    (0x27C6, 0x533C), (0x27C6, 0x5395), (0x27C6, 0x55B4),
+    // ELAN
+    (0x04F3, 0x0903), (0x04F3, 0x0907), (0x04F3, 0x0C00), (0x04F3, 0x0C03),
+];
+
+/// `true` iff the (vid, pid) is a known fingerprint reader, regardless
+/// of whether it advertises WBDI via MS OS 2.0.
+pub fn is_known_fingerprint_vid_pid(vid: u16, pid: u16) -> bool {
+    KNOWN_FP_IDS.iter().any(|&(v, p)| v == vid && p == pid)
+}
+
 /// `true` iff the descriptor set names the device a WBDI sensor.
 pub fn is_wbdi(blob: &[u8]) -> bool {
     match parse_descriptor_set(blob) {

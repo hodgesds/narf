@@ -32,6 +32,7 @@ narf-block        = { path = "../../block" }
 narf-net          = { path = "../../net" }
 narf-bluetooth    = { path = "../../bluetooth" }
 narf-power        = { path = "../../power" }
+narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]
