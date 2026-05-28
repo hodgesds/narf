@@ -417,13 +417,16 @@ pub fn send_allocate_payload<A: MstAux>(
     if vcpi == 0 || vcpi > 63 {
         return Err(MstStreamError::BadVcpi);
     }
-    let mut body = alloc::vec::Vec::with_capacity(8 + branch_rad.len());
+    // Body layout per DP MST spec §2.11.5.3:
+    //   [LCT | RAD bytes... | VCPI | PBN]
+    // PBN is encoded as a single payload byte (low byte; high byte is
+    // always 0 for practical bandwidths and is omitted by the branch).
+    let mut body = alloc::vec::Vec::with_capacity(3 + branch_rad.len());
     body.push(branch_lct);
     for r in branch_rad {
         body.push(*r);
     }
     body.push(vcpi);
-    body.push((pbn >> 8) as u8);
     body.push((pbn & 0xFF) as u8);
     let _resp = aux.sb_message(MST_SB_ALLOCATE_PAYLOAD, &body);
     Ok(())

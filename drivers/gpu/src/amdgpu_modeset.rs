@@ -324,6 +324,10 @@ impl KmsState {
         for crtc in &mut self.crtcs {
             if crtc.state == CrtcState::Inactive {
                 let pipe = crtc.pipe;
+                // Mark the pipe as claimed so subsequent pick_crtc
+                // calls see it as unavailable until set_status resets
+                // it to Inactive on disconnect.
+                crtc.state = CrtcState::Programmed;
                 // Re-borrow the connector mutably (split borrow
                 // since `crtc` was holding self.crtcs).
                 if let Some(c) = self.connectors.get_mut(connector_idx as usize) {
