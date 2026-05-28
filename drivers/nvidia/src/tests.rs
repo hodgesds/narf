@@ -1652,6 +1652,121 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// Live AUX transfer loop (item 2)
+// ────────────────────────────────────────────────────────────────
+
+use crate::disp::nv50::{
+    aux_chan_regs, aux_ctrl_bits, AuxAction, AuxLoop, AuxReply,
+};
+
+fn smoke_aux_reply_nibble_decode_matches_dp_spec() -> TestResult {
+    // VESA DP 1.4 §3.4.1: reply codes 0/1/2 (native) and 4/5/6
+    // (I²C).
+    if AuxReply::from_nibble(0x0) != AuxReply::Ack {
+        return TestResult::Fail("0x0 → Ack");
+    }
+    if AuxReply::from_nibble(0x1) != AuxReply::Nack {
+        return TestResult::Fail("0x1 → Nack");
+    }
+    if AuxReply::from_nibble(0x2) != AuxReply::Defer {
+        return TestResult::Fail("0x2 → Defer");
+    }
+    if AuxReply::from_nibble(0x4) != AuxReply::I2cAck {
+        return TestResult::Fail("0x4 → I2cAck");
+    }
+    if AuxReply::from_nibble(0x5) != AuxReply::I2cNack {
+        return TestResult::Fail("0x5 → I2cNack");
+    }
+    if AuxReply::from_nibble(0x6) != AuxReply::I2cDefer {
+        return TestResult::Fail("0x6 → I2cDefer");
+    }
+    if AuxReply::from_nibble(0xF) != AuxReply::Timeout {
+        return TestResult::Fail("0xF → synthetic Timeout");
+    }
+    if AuxReply::from_nibble(0x3) != AuxReply::Unknown(0x3) {
+        return TestResult::Fail("Reserved 0x3 → Unknown(3)");
+    }
+    if !AuxReply::Ack.is_ok() || !AuxReply::I2cAck.is_ok() {
+        return TestResult::Fail("Ack / I2cAck must be is_ok");
+    }
+    if !AuxReply::Defer.should_retry() || !AuxReply::I2cDefer.should_retry() {
+        return TestResult::Fail("DEFER nibbles must request retry");
+    }
+    if AuxReply::Nack.should_retry() {
+        return TestResult::Fail("NACK must NOT request retry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/disp", smoke_aux_reply_nibble_decode_matches_dp_spec);
+
+fn smoke_aux_loop_retries_then_exhausts() -> TestResult {
+    // 32 DEFER replies in a row → 32 backoffs, 33rd → ExhaustedRetries.
+    let mut lp = AuxLoop::new();
+    for _ in 0..32 {
+        let act = lp.step(AuxReply::Defer);
+        match act {
+            AuxAction::Backoff(400) => {}
+            other => {
+                let _ = other;
+                return TestResult::Fail("32 first defers must yield Backoff(400)");
+            }
+        }
+    }
+    match lp.step(AuxReply::Defer) {
+        AuxAction::ExhaustedRetries => {}
+        _ => return TestResult::Fail("33rd defer must yield ExhaustedRetries"),
+    }
+    // Ack short-circuits.
+    let mut lp = AuxLoop::new();
+    if lp.step(AuxReply::Ack) != AuxAction::Done {
+        return TestResult::Fail("Ack → Done");
+    }
+    // Nack is FatalNack.
+    if AuxLoop::new().step(AuxReply::Nack) != AuxAction::FatalNack {
+        return TestResult::Fail("Nack → FatalNack");
+    }
+    // Timeout propagates.
+    if AuxLoop::new().step(AuxReply::Timeout) != AuxAction::Timeout {
+        return TestResult::Fail("Timeout reply → AuxAction::Timeout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/disp", smoke_aux_loop_retries_then_exhausts);
+
+fn smoke_aux_chan_registers_match_g94_layout() -> TestResult {
+    // Pinned register offsets from g94_i2c_aux_xfer.
+    if aux_chan_regs::CTRL != 0x00E4E4 {
+        return TestResult::Fail("AUX CTRL register at 0xE4E4");
+    }
+    if aux_chan_regs::STAT != 0x00E4E8 {
+        return TestResult::Fail("AUX STAT register at 0xE4E8");
+    }
+    if aux_chan_regs::ADDR != 0x00E4E0 {
+        return TestResult::Fail("AUX ADDR register at 0xE4E0");
+    }
+    if aux_chan_regs::DATA_WR != 0x00E4C0 {
+        return TestResult::Fail("AUX DATA_WR at 0xE4C0");
+    }
+    if aux_chan_regs::DATA_RD != 0x00E4D0 {
+        return TestResult::Fail("AUX DATA_RD at 0xE4D0");
+    }
+    if aux_chan_regs::CH_STRIDE != 0x50 {
+        return TestResult::Fail("AUX channel stride 0x50");
+    }
+    if aux_ctrl_bits::RESET != 0x8000_0000 {
+        return TestResult::Fail("RESET bit at 0x80000000");
+    }
+    if aux_ctrl_bits::TRANSACT != 0x0001_0000 {
+        return TestResult::Fail("TRANSACT bit at 0x00010000");
+    }
+    if aux_ctrl_bits::IDLE_MASK != 0x0301_0000 {
+        return TestResult::Fail("IDLE_MASK 0x03010000");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/disp", smoke_aux_chan_registers_match_g94_layout);
+
+// ────────────────────────────────────────────────────────────────
 // Live mode-set commit (item 1)
 // ────────────────────────────────────────────────────────────────
 

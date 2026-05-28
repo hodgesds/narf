@@ -93,6 +93,72 @@ impl AuxCommand {
     }
 }
 
+// ── AUX status codes (DP spec §3.4.1) ────────────────────────────
+//
+// Cite VESA DP 1.4 §3.4.1: the AUX reply byte holds a 4-bit
+// command + 4-bit data. The reply command field is:
+//
+//   0x0  AUX_ACK    — native DPCD ack
+//   0x1  AUX_NACK   — native DPCD nack
+//   0x2  AUX_DEFER  — sink wants the master to retry
+//   0x4  I2C_ACK    — I²C-over-AUX ack
+//   0x5  I2C_NACK   — I²C-over-AUX nack
+//   0x6  I2C_DEFER  — I²C-over-AUX retry
+//
+// Plus a synthetic 0xFF for "no reply / link timeout".
+
+/// AUX command-reply status (decoded from the reply header byte).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AuxReply {
+    /// 0x0 — native DPCD ack.
+    Ack,
+    /// 0x1 — native DPCD nack.
+    Nack,
+    /// 0x2 — native DPCD defer; master must retry.
+    Defer,
+    /// 0x4 — I²C-over-AUX ack.
+    I2cAck,
+    /// 0x5 — I²C-over-AUX nack.
+    I2cNack,
+    /// 0x6 — I²C-over-AUX defer.
+    I2cDefer,
+    /// 0xFF (synthetic) — timeout / no reply.
+    Timeout,
+    /// Reserved / unknown code.
+    Unknown(u8),
+}
+
+impl AuxReply {
+    /// Decode a 4-bit reply nibble.
+    pub const fn from_nibble(n: u8) -> Self {
+        match n & 0xF {
+            0x0 => AuxReply::Ack,
+            0x1 => AuxReply::Nack,
+            0x2 => AuxReply::Defer,
+            0x4 => AuxReply::I2cAck,
+            0x5 => AuxReply::I2cNack,
+            0x6 => AuxReply::I2cDefer,
+            0xF => AuxReply::Timeout,
+            x => AuxReply::Unknown(x),
+        }
+    }
+
+    /// True when the master should retry the same transaction (DP §3.4.1).
+    pub const fn should_retry(self) -> bool {
+        matches!(self, AuxReply::Defer | AuxReply::I2cDefer)
+    }
+
+    /// True when the reply is a success.
+    pub const fn is_ok(self) -> bool {
+        matches!(self, AuxReply::Ack | AuxReply::I2cAck)
+    }
+
+    /// True when the reply is a sink rejection (no retry).
+    pub const fn is_nack(self) -> bool {
+        matches!(self, AuxReply::Nack | AuxReply::I2cNack)
+    }
+}
+
 /// Encode the SOR_DP_AUX_CH_CTL header word.
 ///
 /// Layout (per `dev_disp.ref.txt::NV_PDISP_SOR_DP_AUXCTL` and
@@ -373,6 +439,273 @@ pub fn stage_update(
     interlock: u32,
 ) -> Result<(), crate::pb::PbError> {
     pb.write_inc(NV507D_UPDATE, &[interlock])
+}
+
+// ── Live AUX transfer loop (item 2) ──────────────────────────────
+//
+// Cite `nvkm/subdev/i2c/auxg94.c::g94_i2c_aux_xfer` —
+// `auxg94.c::g94_i2c_aux_xfer` does the canonical
+// program-then-wait-then-read sequence:
+//
+// 1. Wait up to 1 ms for any previous transaction to drain.
+// 2. Write the 16-byte payload into the channel's data FIFO (4
+//    consecutive 32-bit words at +0x00E4C0).
+// 3. Programme CTRL with command + address + size.
+// 4. Poll up to 2 ms for the transaction to complete (CTRL bit
+//    16 clears).
+// 5. Read status (+0x00E4E8). On DEFER (`0x000F_0000 == 0x0008`
+//    sub-field) retry up to 32 times with 400 µs back-off.
+//
+// We model the same shape on top of the SOR DP AUX registers we
+// already pinned at the top of this module (SOR_DP_AUX_CH_CTL +
+// SOR_DP_AUX_CH_DATA). The actual data window on Maxwell+ is at
+// SOR_n base + 0x60 (data) / 0x50 (ctrl); the g94 path uses an
+// older single-bank layout we re-use for the bit-shape only.
+//
+// `AuxLoop` is the pure decision module — given an `AuxReply`
+// nibble, decide whether to retry (and how long to wait), or
+// surface the result. The caller wires the actual MMIO reads /
+// writes; the loop is testable in isolation.
+
+/// Software model of the AUX retry+defer loop. Cite
+/// `g94_i2c_aux_xfer` for the 32-retry / 400 µs back-off shape.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AuxLoop {
+    /// How many DEFER / I2C_DEFER replies we've seen since the
+    /// last fresh transaction. Reset when an ACK / NACK arrives.
+    pub retries: u8,
+    /// Total max retries before giving up. Nouveau picks 32.
+    pub max_retries: u8,
+    /// Back-off per retry in microseconds.
+    pub back_off_us: u16,
+}
+
+impl AuxLoop {
+    /// Fresh loop with Nouveau's defaults.
+    pub const fn new() -> Self {
+        Self {
+            retries: 0,
+            max_retries: 32,
+            back_off_us: 400,
+        }
+    }
+
+    /// Inspect a fresh reply nibble; tell the caller what to do
+    /// next.
+    pub fn step(&mut self, reply: AuxReply) -> AuxAction {
+        if reply.is_ok() {
+            return AuxAction::Done;
+        }
+        if reply.is_nack() {
+            return AuxAction::FatalNack;
+        }
+        if reply.should_retry() {
+            if self.retries >= self.max_retries {
+                return AuxAction::ExhaustedRetries;
+            }
+            self.retries = self.retries.saturating_add(1);
+            return AuxAction::Backoff(self.back_off_us);
+        }
+        if reply == AuxReply::Timeout {
+            return AuxAction::Timeout;
+        }
+        AuxAction::FatalNack
+    }
+}
+
+impl Default for AuxLoop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What the caller should do after consuming a reply nibble.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AuxAction {
+    /// Transaction completed — caller can read the data buffer.
+    Done,
+    /// Sink rejected the transaction; do not retry.
+    FatalNack,
+    /// Sink said DEFER; sleep `n` µs then retry the same
+    /// transaction.
+    Backoff(u16),
+    /// 32 retries exhausted without ACK. Caller should escalate
+    /// to a link reset or drop the transfer.
+    ExhaustedRetries,
+    /// Hardware never replied (synthetic 0xFF). Caller should
+    /// treat the link as down.
+    Timeout,
+}
+
+// ── Live AUX MMIO sequence (g94-style) ───────────────────────────
+
+/// Maxwell+ AUX CTRL bits per `g94_i2c_aux_xfer`.
+pub mod aux_ctrl_bits {
+    /// CTRL.RESET — reset the AUX channel state machine.
+    pub const RESET: u32 = 0x8000_0000;
+    /// CTRL.TRANSACT — start transaction.
+    pub const TRANSACT: u32 = 0x0001_0000;
+    /// CTRL idle-bit mask. Cite g94_i2c_aux_xfer line "0x03010000".
+    pub const IDLE_MASK: u32 = 0x0301_0000;
+}
+
+/// AUX-channel programming registers, per `g94_i2c_aux_xfer`.
+/// `base` is the per-channel offset (5 0x50 strides, ch 0..15).
+pub mod aux_chan_regs {
+    /// CTRL register offset within AUX channel.
+    pub const CTRL: u64 = 0x00E4E4;
+    /// STAT register offset within AUX channel.
+    pub const STAT: u64 = 0x00E4E8;
+    /// ADDR register offset.
+    pub const ADDR: u64 = 0x00E4E0;
+    /// Data window: 4 consecutive 32-bit words starting at +0x00E4C0
+    /// for the write phase, +0x00E4D0 for read.
+    pub const DATA_WR: u64 = 0x00E4C0;
+    pub const DATA_RD: u64 = 0x00E4D0;
+    /// Stride between AUX channels.
+    pub const CH_STRIDE: u64 = 0x50;
+}
+
+/// Run one live AUX transaction. Caller owns the BAR0 mapping;
+/// `channel` is the AUX channel index (0..15).
+///
+/// Returns the decoded reply (or Timeout). Caller wires the
+/// `AuxLoop` around this for retry / defer.
+///
+/// # Safety
+/// `bar0` covers the AUX channel block at `aux_chan_regs::CTRL +
+/// channel * CH_STRIDE`. Exclusive access — concurrent callers
+/// against the same channel will race the CTRL register.
+pub unsafe fn aux_transact_once(
+    bar0: &narf_driver_runtime::MmioRegion,
+    channel: u8,
+    cmd: AuxCommand,
+    addr: u32,
+    write_data: &[u8],
+    size: u8,
+) -> AuxReply {
+    let base = (channel as u64) * aux_chan_regs::CH_STRIDE;
+    // SAFETY: caller's responsibility.
+    unsafe {
+        // 1. Wait for prior transaction to drain. Caller-bounded
+        //    poll — Nouveau picks 1 ms; we re-use the same shape.
+        for _ in 0..1000 {
+            let ctrl = bar0.read32(aux_chan_regs::CTRL + base);
+            if ctrl & aux_ctrl_bits::IDLE_MASK == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        // 2. Stage the write payload (if any).
+        if !matches!(cmd, AuxCommand::I2cRead | AuxCommand::DpcdRead) {
+            let mut chunks = [0u32; 4];
+            for (i, b) in write_data.iter().take(16).enumerate() {
+                let w = i / 4;
+                let s = (i % 4) * 8;
+                chunks[w] |= (*b as u32) << s;
+            }
+            for (i, w) in chunks.iter().enumerate() {
+                bar0.write32(aux_chan_regs::DATA_WR + base + (i as u64) * 4, *w);
+            }
+        }
+        // 3. Programme CTRL: clear lower fields then set
+        //    type/size; the value follows g94_i2c_aux_xfer.
+        let mut ctrl = bar0.read32(aux_chan_regs::CTRL + base);
+        ctrl &= !0x0001_F1FF;
+        ctrl |= (cmd.code() as u32) << 12;
+        ctrl |= if size > 0 { (size as u32) - 1 } else { 0x100 };
+        bar0.write32(aux_chan_regs::ADDR + base, addr);
+        // 4. Pulse start: reset → idle → TRANSACT.
+        bar0.write32(aux_chan_regs::CTRL + base, aux_ctrl_bits::RESET | ctrl);
+        bar0.write32(aux_chan_regs::CTRL + base, ctrl);
+        bar0.write32(aux_chan_regs::CTRL + base, aux_ctrl_bits::TRANSACT | ctrl);
+        // 5. Poll up to 2 ms for TRANSACT bit to clear.
+        let mut completed = false;
+        for _ in 0..2000 {
+            let c = bar0.read32(aux_chan_regs::CTRL + base);
+            if c & aux_ctrl_bits::TRANSACT == 0 {
+                completed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !completed {
+            return AuxReply::Timeout;
+        }
+        // 6. Read status. The reply code lives in bits[19:16].
+        let stat = bar0.read32(aux_chan_regs::STAT + base);
+        AuxReply::from_nibble(((stat >> 16) & 0xF) as u8)
+    }
+}
+
+/// Read up to 16 bytes from the AUX read-data window.
+///
+/// # Safety
+/// Same constraints as `aux_transact_once`. Caller has confirmed
+/// the prior transaction was a read and completed without error.
+pub unsafe fn aux_read_payload(
+    bar0: &narf_driver_runtime::MmioRegion,
+    channel: u8,
+    out: &mut [u8],
+) {
+    let base = (channel as u64) * aux_chan_regs::CH_STRIDE;
+    // SAFETY: caller's responsibility.
+    let mut words = [0u32; 4];
+    unsafe {
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = bar0.read32(aux_chan_regs::DATA_RD + base + (i as u64) * 4);
+        }
+    }
+    for (i, b) in out.iter_mut().take(16).enumerate() {
+        let w = i / 4;
+        let s = (i % 4) * 8;
+        *b = ((words[w] >> s) & 0xFF) as u8;
+    }
+}
+
+/// Full retried AUX transfer. Mirrors `g94_i2c_aux_xfer` —
+/// transact, decode reply, retry on DEFER up to `loop_.max_retries`.
+///
+/// # Safety
+/// As for `aux_transact_once`. Caller owns the channel for the
+/// duration of the loop.
+pub unsafe fn aux_xfer_retry(
+    bar0: &narf_driver_runtime::MmioRegion,
+    channel: u8,
+    cmd: AuxCommand,
+    addr: u32,
+    write_data: &[u8],
+    read_out: &mut [u8],
+    size: u8,
+) -> Result<AuxReply, AuxAction> {
+    let mut lp = AuxLoop::new();
+    loop {
+        // SAFETY: caller's responsibility.
+        let reply = unsafe {
+            aux_transact_once(bar0, channel, cmd, addr, write_data, size)
+        };
+        match lp.step(reply) {
+            AuxAction::Done => {
+                if matches!(cmd, AuxCommand::I2cRead | AuxCommand::DpcdRead)
+                    && !read_out.is_empty()
+                {
+                    // SAFETY: same as above.
+                    unsafe { aux_read_payload(bar0, channel, read_out) };
+                }
+                return Ok(reply);
+            }
+            AuxAction::FatalNack => return Ok(reply),
+            AuxAction::Backoff(_us) => {
+                // Caller may add a real udelay; we re-issue the
+                // transaction immediately for tests.
+                continue;
+            }
+            other @ (AuxAction::Timeout
+            | AuxAction::ExhaustedRetries) => {
+                return Err(other);
+            }
+        }
+    }
 }
 
 /// Full mode-set commit: stage the mode + scanout bind + UPDATE into

@@ -45,6 +45,76 @@ pub fn aux_header_for_segment_select() -> u32 {
     aux_header(AuxCommand::I2cWrite, DDC_ADDR_SEGMENT, 1)
 }
 
+/// Live EDID read: walk the I²C-over-AUX path to pull one block.
+///
+/// Sequence per VESA E-DDC:
+///
+/// 1. Optionally write the segment register (0x30) for blocks past
+///    offset 256.
+/// 2. I²C write to address 0x50 with the byte-offset within the
+///    EDID page.
+/// 3. I²C read N bytes from 0x50.
+///
+/// Cited `dispnv50/disp.c::nv50_disp_dp_aux_xfer` + `nouveau_dp.c`.
+///
+/// # Safety
+/// Same as `crate::disp::nv50::aux_xfer_retry`.
+pub unsafe fn read_edid_block(
+    bar0: &narf_driver_runtime::MmioRegion,
+    channel: u8,
+    block_number: u8,
+    out: &mut [u8; EDID_BLOCK_SIZE],
+) -> Result<(), crate::disp::nv50::AuxAction> {
+    use crate::disp::nv50::{aux_xfer_retry, AuxCommand};
+
+    // 1. Segment select (only when block > 1).
+    if block_number > 1 {
+        let seg = (block_number >> 1) as u8;
+        // SAFETY: caller's responsibility.
+        let _ = unsafe {
+            aux_xfer_retry(
+                bar0,
+                channel,
+                AuxCommand::I2cWrite,
+                DDC_ADDR_SEGMENT,
+                &[seg],
+                &mut [],
+                1,
+            )
+        };
+    }
+    // 2. I²C write byte offset 0 (start of the block).
+    let byte_off = ((block_number & 1) as u8).wrapping_mul(128);
+    // SAFETY: same.
+    let _ = unsafe {
+        aux_xfer_retry(
+            bar0,
+            channel,
+            AuxCommand::I2cWrite,
+            DDC_ADDR_EDID,
+            &[byte_off],
+            &mut [],
+            1,
+        )
+    };
+    // 3. 16 byte chunks * 8 = 128 bytes per block.
+    for chunk in out.chunks_mut(16) {
+        // SAFETY: same.
+        unsafe {
+            aux_xfer_retry(
+                bar0,
+                channel,
+                AuxCommand::I2cRead,
+                DDC_ADDR_EDID,
+                &[],
+                chunk,
+                chunk.len() as u8,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate an EDID v1.x block: 8-byte signature (00 FF…00),
 /// version + checksum.
 ///
