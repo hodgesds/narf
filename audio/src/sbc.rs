@@ -49,7 +49,6 @@
 extern crate alloc;
 
 use alloc::vec;
-use alloc::vec::Vec;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
