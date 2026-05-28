@@ -144,8 +144,8 @@ impl EncoderType {
     pub const fn from_dcb(t: u8) -> Self {
         match t {
             0x00 => EncoderType::Crt,
-            0x01 => EncoderType::Tmds,
-            0x02 => EncoderType::Lvds,
+            0x01 => EncoderType::Lvds,
+            0x02 => EncoderType::Tmds,
             0x03 => EncoderType::DisplayPort,
             0x06 => EncoderType::Hdmi,
             0x07 => EncoderType::Edp,
