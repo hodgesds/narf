@@ -1,0 +1,19 @@
+[package]
+name         = "narf-drivers-crypto"
+description  = "AMD CCP (Crypto Co-Processor) v5 driver — AES/SHA command queues for Renoir + Phoenix HawkPoint1."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_crypto"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[lints]
+workspace = true

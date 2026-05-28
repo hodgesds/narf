@@ -51,6 +51,7 @@ members = [
     "drivers/i3c",
     "drivers/gpu",
     "drivers/psp",
+    "drivers/crypto",
     "drivers/storage",
     "drivers/usb",
     "drivers/usbpd",
@@ -87,6 +88,7 @@ members = [
     "drivers/fs/iso9660",
     "drivers/fs/udf",
     "drivers/fs/9p",
+    "drivers/video",
 ]
 # narf-testbin / userspace/init / userspace/shell are built out-of-
 # line by verification's build.rs (and by xtask's iso-boot path)
