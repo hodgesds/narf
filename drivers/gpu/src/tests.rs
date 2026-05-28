@@ -4898,6 +4898,128 @@ fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_perm_master_only_blocks_authed);
 
+// ── DRM syncobj smokes ────────────────────────────────────────────────
+
+fn smoke_drm_syncobj_create_destroy_roundtrip() -> TestResult {
+    use crate::drm::syncobj::{SyncObjTable, SYNCOBJ_CREATE_SIGNALED};
+    let mut tbl = SyncObjTable::new();
+    let unsig = match tbl.create(0) { Ok(h) => h, Err(_) => return TestResult::Fail("create(0) failed") };
+    let sig   = match tbl.create(SYNCOBJ_CREATE_SIGNALED) { Ok(h) => h, Err(_) => return TestResult::Fail("create(SIG) failed") };
+    if unsig == sig { return TestResult::Fail("duplicate ids"); }
+    if tbl.len() != 2 { return TestResult::Fail("len != 2 after 2 creates"); }
+    let so = match tbl.get(unsig) { Ok(o) => o, Err(_) => return TestResult::Fail("get unsig") };
+    if so.is_signalled() { return TestResult::Fail("unsig should not be signalled"); }
+    let so = match tbl.get(sig) { Ok(o) => o, Err(_) => return TestResult::Fail("get sig") };
+    if !so.is_signalled() { return TestResult::Fail("sig should be signalled"); }
+    tbl.destroy(unsig).unwrap();
+    tbl.destroy(sig).unwrap();
+    if !tbl.is_empty() { return TestResult::Fail("not empty after destroying both"); }
+    if let Ok(_) = tbl.get(unsig) { return TestResult::Fail("get after destroy should fail"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_create_destroy_roundtrip);
+
+fn smoke_drm_syncobj_wait_timeout() -> TestResult {
+    // An unsignalled syncobj must time out per Linux's -ETIME.
+    use crate::drm::syncobj::{SyncError, SyncObjTable, SYNCOBJ_WAIT_FLAGS_WAIT_ALL};
+    let mut tbl = SyncObjTable::new();
+    let h = match tbl.create(0) { Ok(h) => h, Err(_) => return TestResult::Fail("create") };
+    // Bind a fresh (unsignalled) binary fence so wait can see it.
+    let f = crate::drm::syncobj::BinaryFence::new();
+    tbl.get_mut(h).unwrap().replace_fence(f);
+    let ids = [h];
+    match tbl.wait_handles(&ids, 1_000, SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
+        Err(SyncError::Timeout) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("wait should have timed out"),
+        Err(_) => TestResult::Fail("wait returned wrong error"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_wait_timeout);
+
+fn smoke_drm_syncobj_signal_then_wait() -> TestResult {
+    // Signal first, then wait should return Ok immediately.
+    use crate::drm::syncobj::{SyncObjTable, SYNCOBJ_WAIT_FLAGS_WAIT_ALL};
+    let mut tbl = SyncObjTable::new();
+    let h = match tbl.create(0) { Ok(h) => h, Err(_) => return TestResult::Fail("create") };
+    tbl.get_mut(h).unwrap().replace_fence(crate::drm::syncobj::BinaryFence::new());
+    let ids = [h];
+    tbl.signal_handles(&ids).unwrap();
+    if !tbl.get(h).unwrap().is_signalled() {
+        return TestResult::Fail("not signalled after signal_handles");
+    }
+    match tbl.wait_handles(&ids, 1_000_000, SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
+        Ok(_) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wait after signal should succeed"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_signal_then_wait);
+
+fn smoke_drm_syncobj_wait_first_vs_all() -> TestResult {
+    // WAIT_ALL == 0: returns on first signalled handle; signalling
+    // only one of three should satisfy wait.
+    use crate::drm::syncobj::SyncObjTable;
+    let mut tbl = SyncObjTable::new();
+    let a = tbl.create(0).unwrap();
+    let b = tbl.create(0).unwrap();
+    let c = tbl.create(0).unwrap();
+    for &h in &[a, b, c] {
+        tbl.get_mut(h).unwrap().replace_fence(crate::drm::syncobj::BinaryFence::new());
+    }
+    tbl.signal_handles(&[b]).unwrap();
+    let ids = [a, b, c];
+    // wait_any (flags=0)
+    let first = match tbl.wait_handles(&ids, 1_000_000, 0) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("wait_any should succeed when one is signalled"),
+    };
+    if first != b { return TestResult::Fail("wait_any returned wrong id"); }
+    // wait_all should time out since a,c are not signalled.
+    match tbl.wait_handles(&ids, 1_000, 1 /* WAIT_ALL */) {
+        Err(crate::drm::syncobj::SyncError::Timeout) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("wait_all should time out (a,c unsignalled)"),
+        Err(_) => TestResult::Fail("wait_all wrong error"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_wait_first_vs_all);
+
+fn smoke_drm_syncobj_signal_unbound_attaches_fence() -> TestResult {
+    // signal_handles on a syncobj with no fence binds a signalled
+    // binary fence — Linux's drm_syncobj_assign_null_handle behaviour.
+    use crate::drm::syncobj::SyncObjTable;
+    let mut tbl = SyncObjTable::new();
+    let h = tbl.create(0).unwrap();
+    if tbl.get(h).unwrap().fence.is_some() {
+        return TestResult::Fail("new syncobj should have no fence");
+    }
+    tbl.signal_handles(&[h]).unwrap();
+    if tbl.get(h).unwrap().fence.is_none() {
+        return TestResult::Fail("signal should bind a fence");
+    }
+    if !tbl.get(h).unwrap().is_signalled() {
+        return TestResult::Fail("bound fence must be signalled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_signal_unbound_attaches_fence);
+
+fn smoke_drm_syncobj_reset_clears_fence() -> TestResult {
+    use crate::drm::syncobj::{SyncObjTable, SYNCOBJ_CREATE_SIGNALED};
+    let mut tbl = SyncObjTable::new();
+    let h = tbl.create(SYNCOBJ_CREATE_SIGNALED).unwrap();
+    if !tbl.get(h).unwrap().is_signalled() {
+        return TestResult::Fail("SIG create should be signalled");
+    }
+    tbl.reset_handles(&[h]).unwrap();
+    if tbl.get(h).unwrap().fence.is_some() {
+        return TestResult::Fail("reset should clear fence");
+    }
+    if tbl.get(h).unwrap().is_signalled() {
+        return TestResult::Fail("post-reset cannot be signalled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_reset_clears_fence);
+
 // ── amdgpu/smu v12+v13 opcode tables ───────────────────────────────
 //
 // Verify per-version opcode lookup correctness, the SmuVersion
