@@ -42,6 +42,7 @@ pub mod chacha20;
 pub mod cmac_aes128;
 pub mod curve25519;
 pub mod ed25519;
+pub mod hdcp;
 pub mod hkdf;
 pub mod p256;
 pub mod pbkdf2_sha1;
