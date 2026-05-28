@@ -27,8 +27,8 @@ use crate::disp::nv50::{
     PDISP_SOR_STRIDE,
 };
 use crate::disp::{
-    decode_dcb_entry, dispclass_for, EncoderType, Mode, ModeFlags, AD102_DISP, GA102_DISP,
-    GM200_DISP, GP102_DISP, GV100_DISP, TU102_DISP,
+    decode_dcb_entry, dispclass_for, DcbEntry, EncoderType, Mode, ModeFlags, AD102_DISP,
+    GA102_DISP, GM200_DISP, GP102_DISP, GV100_DISP, TU102_DISP,
 };
 use crate::fb::{ram_type_for_family, FbConfig, RamType};
 use crate::fifo::{channel_cap_for, pb_header, PbType, USERD_GP_GET, USERD_GP_PUT, USERD_SIZE};
@@ -1106,3 +1106,183 @@ fn smoke_gsp_rpc_ring_empty_full_invariants() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_ring_empty_full_invariants);
+
+// ────────────────────────────────────────────────────────────────
+// KMS — connector enumeration + CRTC picking
+// ────────────────────────────────────────────────────────────────
+
+use crate::kms::{
+    build_path, driveable, enumerate_dcb, lookup_connector_type, pick_crtc, EnumeratedPath,
+    MAX_DCB_ENTRIES,
+};
+
+fn smoke_kms_enumerate_dcb_walks_multiple_entries() -> TestResult {
+    // Two valid entries + one 0xFFFF sentinel.
+    let mut raw = [0u8; 24];
+    // Entry 0: HDMI encoder (6) + i2c=1 + heads=1 + conn=3 +
+    // OR=1.
+    let e0: u32 = 6 | (1 << 4) | (1 << 8) | (3 << 12) | (1 << 24);
+    raw[0..4].copy_from_slice(&e0.to_le_bytes());
+    // Entry 1: DP encoder (3) + i2c=2 + heads=3 + conn=4 + OR=2.
+    let e1: u32 = 3 | (2 << 4) | (3 << 8) | (4 << 12) | (2 << 24);
+    raw[8..12].copy_from_slice(&e1.to_le_bytes());
+    // Entry 2: sentinel.
+    raw[16..20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    let paths = enumerate_dcb(&raw);
+    if paths.len() != 2 {
+        return TestResult::Fail("should enumerate exactly two non-sentinel entries");
+    }
+    if paths[0].entry.encoder_type != EncoderType::Hdmi {
+        return TestResult::Fail("entry 0 should be HDMI");
+    }
+    if paths[1].entry.encoder_type != EncoderType::DisplayPort {
+        return TestResult::Fail("entry 1 should be DP");
+    }
+    if paths[1].valid_crtcs != 0x3 {
+        return TestResult::Fail("DP entry heads bitmask 0b11");
+    }
+    if MAX_DCB_ENTRIES < 2 {
+        return TestResult::Fail("MAX_DCB_ENTRIES too small");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/kms",
+    smoke_kms_enumerate_dcb_walks_multiple_entries
+);
+
+fn smoke_kms_pick_crtc_intersects_valid_and_available() -> TestResult {
+    // Path supports CRTCs 0 + 1; 0 is unavailable, 1 is free.
+    let p = EnumeratedPath {
+        dcb_index: 0,
+        entry: DcbEntry {
+            encoder_type: EncoderType::Hdmi,
+            connector_index: 3,
+            or: 1,
+            i2c_index: 0,
+            heads: 0b11,
+        },
+        valid_crtcs: 0b11,
+    };
+    match pick_crtc(&p, 0b10) {
+        Some(1) => {}
+        _ => return TestResult::Fail("should pick CRTC 1"),
+    }
+    if pick_crtc(&p, 0).is_some() {
+        return TestResult::Fail("no available CRTCs → None");
+    }
+    if pick_crtc(&p, 0b100).is_some() {
+        return TestResult::Fail("no overlap → None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/kms",
+    smoke_kms_pick_crtc_intersects_valid_and_available
+);
+
+fn smoke_kms_driveable_filters_external_and_unknown() -> TestResult {
+    let paths = [
+        EnumeratedPath {
+            dcb_index: 0,
+            entry: DcbEntry {
+                encoder_type: EncoderType::DisplayPort,
+                connector_index: 4,
+                or: 0,
+                i2c_index: 0,
+                heads: 0x1,
+            },
+            valid_crtcs: 0x1,
+        },
+        EnumeratedPath {
+            dcb_index: 1,
+            entry: DcbEntry {
+                encoder_type: EncoderType::External,
+                connector_index: 0,
+                or: 0,
+                i2c_index: 0,
+                heads: 0,
+            },
+            valid_crtcs: 0,
+        },
+        EnumeratedPath {
+            dcb_index: 2,
+            entry: DcbEntry {
+                encoder_type: EncoderType::Unknown(0xFF),
+                connector_index: 0,
+                or: 0,
+                i2c_index: 0,
+                heads: 0,
+            },
+            valid_crtcs: 0,
+        },
+    ];
+    let out = driveable(&paths);
+    if out.len() != 1 {
+        return TestResult::Fail("only the DP entry survives the filter");
+    }
+    if out[0].entry.encoder_type != EncoderType::DisplayPort {
+        return TestResult::Fail("DP entry must remain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/kms",
+    smoke_kms_driveable_filters_external_and_unknown
+);
+
+fn smoke_kms_build_path_carries_ids() -> TestResult {
+    let p = EnumeratedPath {
+        dcb_index: 3,
+        entry: DcbEntry {
+            encoder_type: EncoderType::Hdmi,
+            connector_index: 3,
+            or: 2,
+            i2c_index: 1,
+            heads: 0x1,
+        },
+        valid_crtcs: 0x1,
+    };
+    let path = build_path(&p, 0);
+    if path.connector_id != 3 {
+        return TestResult::Fail("connector_id should be DCB index");
+    }
+    if path.encoder_id != 2 {
+        return TestResult::Fail("encoder_id should be the OR field");
+    }
+    if path.crtc_id != 0 {
+        return TestResult::Fail("crtc_id should be the picked index");
+    }
+    if path.encoder_type != EncoderType::Hdmi {
+        return TestResult::Fail("encoder_type propagates");
+    }
+    // Lookup table sanity: index 4/5 → DP, index 6 → eDP.
+    if lookup_connector_type(4) != crate::disp::ConnectorType::DisplayPort {
+        return TestResult::Fail("connector index 4 should be DisplayPort");
+    }
+    if lookup_connector_type(6) != crate::disp::ConnectorType::Edp {
+        return TestResult::Fail("connector index 6 should be Edp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/kms", smoke_kms_build_path_carries_ids);
+
+// ────────────────────────────────────────────────────────────────
+// SEC2
+// ────────────────────────────────────────────────────────────────
+
+use crate::sec2::Sec2Cmd;
+
+fn smoke_sec2_cmd_ids_pinned() -> TestResult {
+    if Sec2Cmd::LoadFw as u32 != 0x0001 {
+        return TestResult::Fail("LoadFw cmd id");
+    }
+    if Sec2Cmd::BootWpr2 as u32 != 0x0002 {
+        return TestResult::Fail("BootWpr2 cmd id");
+    }
+    if Sec2Cmd::HdcpKx as u32 != 0x0010 {
+        return TestResult::Fail("HdcpKx cmd id");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/sec2", smoke_sec2_cmd_ids_pinned);

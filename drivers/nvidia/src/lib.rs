@@ -45,10 +45,12 @@ pub mod fifo;
 pub mod gr;
 pub mod gsp;
 pub mod hpd;
+pub mod kms;
 pub mod mc;
 pub mod mmu;
 pub mod pci;
 pub mod pmu;
+pub mod sec2;
 pub mod vbios;
 
 mod tests;
