@@ -110,13 +110,14 @@ pub fn build_path(p: &EnumeratedPath, crtc_id: u8) -> DisplayPath {
 }
 
 /// Resolve the connector-type byte from the BIOS connector table.
-/// Stage 2: returns a synthetic guess from the index — real
-/// driver will read the connector table out of the BIOS image.
+/// Synthetic fallback retained for callers that don't have a BIOS
+/// image (or are running before the BIOS parser walked the table).
+/// Real driver path is `lookup_connector_type_from_bios`.
 /// Cite `nvkm/subdev/bios/conn.c::nvbios_connEp`.
 pub fn lookup_connector_type(idx: u8) -> ConnectorType {
-    // Naive mapping while the connector-table parse is a
-    // follow-up; values match common DCB indices seen in
-    // captures of Maxwell+ VBIOSes.
+    // Naive mapping used when the BIOS table isn't yet available;
+    // values match common DCB indices seen in captures of Maxwell+
+    // VBIOSes.
     match idx {
         0 => ConnectorType::Vga,
         1 | 2 => ConnectorType::DviI,
@@ -125,5 +126,27 @@ pub fn lookup_connector_type(idx: u8) -> ConnectorType {
         6 => ConnectorType::Edp,
         7 => ConnectorType::Lvds,
         n => ConnectorType::Unknown(n),
+    }
+}
+
+/// Resolve the connector type from the actual BIOS connector table.
+/// Walks the DCB connector table via `vbios::connector_entry` and
+/// maps the type byte through `ConnectorType::from_dcb`.
+///
+/// `image` is the NVIDIA image inside the option ROM; `dcb_off` is
+/// the offset of the DCB table within that image (returned by
+/// `vbios::dcb_table_offset`).
+pub fn lookup_connector_type_from_bios(
+    image: &[u8],
+    dcb_off: u16,
+    idx: u8,
+) -> ConnectorType {
+    let conn_off = match crate::vbios::connector_table_offset(image, dcb_off) {
+        Some(o) => o,
+        None => return lookup_connector_type(idx),
+    };
+    match crate::vbios::connector_entry(image, conn_off, idx) {
+        Some(e) => ConnectorType::from_dcb(e.conn_type),
+        None => lookup_connector_type(idx),
     }
 }

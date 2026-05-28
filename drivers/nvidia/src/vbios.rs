@@ -188,3 +188,123 @@ pub struct DcbHeader {
     pub entry_count: u8,
     pub entry_size: u8,
 }
+
+// ── Connector-table parse (item 13) ──────────────────────────────
+//
+// Cite `nvkm/subdev/bios/conn.c`:
+//   `nvbios_connTe` (table find): the connector-table pointer
+//   lives at DCB+0x14 (DCB v3.0+).
+//   `nvbios_connEp` (entry parse): per-entry layout = type, location,
+//   hpd, dp, di, sr, lcdid.
+
+/// Offset (inside DCB) of the LE16 connector-table pointer. Cite
+/// `nvbios_connTe` — `nvbios_rd16(bios, dcb + 0x14)`.
+pub const DCB_CONN_TABLE_PTR_OFFSET: usize = 0x14;
+
+/// Read the connector-table pointer from a DCB header. Returns the
+/// byte offset (within the BIOS image) of the connector table, or
+/// `None` when the DCB version doesn't support it.
+pub fn connector_table_offset(image: &[u8], dcb_off: u16) -> Option<u16> {
+    let p = dcb_off as usize + DCB_CONN_TABLE_PTR_OFFSET;
+    if p + 2 > image.len() {
+        return None;
+    }
+    let v = u16::from_le_bytes([image[p], image[p + 1]]);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Connector-table header (per `nvbios_connTe`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ConnTableHeader {
+    pub version: u8,
+    pub header_len: u8,
+    pub entry_count: u8,
+    pub entry_size: u8,
+}
+
+/// Decoded connector-entry. Cite `nvbios_connEp`'s `nvbios_connE`
+/// struct.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorEntry {
+    /// Connector-type byte (matches `disp::ConnectorType::from_dcb`).
+    pub conn_type: u8,
+    /// Physical location code (0..15).
+    pub location: u8,
+    /// HPD GPIO line.
+    pub hpd_gpio: u8,
+    /// DP port-mux selector.
+    pub dp_mux: u8,
+    /// Digital interface (DI) — eDP / DP / HDMI mux.
+    pub di: u8,
+    /// Display port "side-band reserved" bit.
+    pub sr: bool,
+    /// LCD id (panel index for LVDS / eDP).
+    pub lcd_id: u8,
+}
+
+/// Parse the connector-table header.
+pub fn connector_table_header(image: &[u8], off: u16) -> Option<ConnTableHeader> {
+    let p = off as usize;
+    if p + 4 > image.len() {
+        return None;
+    }
+    let version = image[p];
+    if version != 0x30 && version != 0x40 {
+        return None;
+    }
+    Some(ConnTableHeader {
+        version,
+        header_len: image[p + 1],
+        entry_count: image[p + 2],
+        entry_size: image[p + 3],
+    })
+}
+
+/// Decode the connector entry at `index` from a connector table at
+/// byte offset `off`. Returns `None` when index is out of range,
+/// the table version is unsupported, or the entry data falls outside
+/// the image.
+///
+/// Cite `nvbios_connEp` — the bit-layout we mirror.
+pub fn connector_entry(
+    image: &[u8],
+    off: u16,
+    index: u8,
+) -> Option<ConnectorEntry> {
+    let hdr = connector_table_header(image, off)?;
+    if index >= hdr.entry_count {
+        return None;
+    }
+    let entry_start = off as usize
+        + hdr.header_len as usize
+        + (index as usize) * (hdr.entry_size as usize);
+    if entry_start + hdr.entry_size as usize > image.len() {
+        return None;
+    }
+    let b0 = image[entry_start];
+    let b1 = image[entry_start + 1];
+    let mut entry = ConnectorEntry {
+        conn_type: b0,
+        location: b1 & 0x0F,
+        hpd_gpio: (b1 & 0x30) >> 4,
+        dp_mux: (b1 & 0xC0) >> 6,
+        di: 0,
+        sr: false,
+        lcd_id: 0,
+    };
+    if hdr.entry_size >= 4 {
+        let b2 = image[entry_start + 2];
+        let b3 = image[entry_start + 3];
+        entry.hpd_gpio |= (b2 & 0x03) << 2;
+        entry.dp_mux |= b2 & 0x0C;
+        entry.di = (b2 & 0xF0) >> 4;
+        entry.hpd_gpio |= (b3 & 0x07) << 4;
+        entry.sr = b3 & 0x08 != 0;
+        entry.lcd_id = (b3 & 0x70) >> 4;
+    }
+    Some(entry)
+}

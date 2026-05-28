@@ -1652,6 +1652,160 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// BIOS connector-table parse (item 13)
+// ────────────────────────────────────────────────────────────────
+
+use crate::vbios::{
+    connector_entry, connector_table_header, connector_table_offset, ConnTableHeader,
+    ConnectorEntry, DCB_CONN_TABLE_PTR_OFFSET,
+};
+
+fn smoke_vbios_connector_table_pointer_decode() -> TestResult {
+    if DCB_CONN_TABLE_PTR_OFFSET != 0x14 {
+        return TestResult::Fail("connector-table ptr at DCB+0x14");
+    }
+    // Build a synthetic image with a DCB header at 0x80 + a conn
+    // pointer at 0x80+0x14 = 0x94 pointing to 0x100.
+    let mut image = [0u8; 256];
+    image[0x80] = 0x41;
+    image[0x81] = 0x20;
+    image[0x82] = 0x04;
+    image[0x83] = 0x08;
+    image[0x94..0x96].copy_from_slice(&0x0100u16.to_le_bytes());
+    let v = connector_table_offset(&image, 0x80);
+    if v != Some(0x100) {
+        return TestResult::Fail("connector-table pointer should be 0x100");
+    }
+    // Zero pointer → None.
+    image[0x94] = 0;
+    image[0x95] = 0;
+    if connector_table_offset(&image, 0x80).is_some() {
+        return TestResult::Fail("zero pointer should yield None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_connector_table_pointer_decode
+);
+
+fn smoke_vbios_connector_table_header_parses_v40() -> TestResult {
+    let mut image = [0u8; 256];
+    // Conn table at 0x40.
+    image[0x40] = 0x40; // version 4.0
+    image[0x41] = 4; // header length
+    image[0x42] = 3; // entry count
+    image[0x43] = 4; // entry size
+    let h = connector_table_header(&image, 0x40).expect("should parse");
+    if h.version != 0x40 {
+        return TestResult::Fail("version 4.0");
+    }
+    if h.entry_count != 3 {
+        return TestResult::Fail("entry count 3");
+    }
+    if h.entry_size != 4 {
+        return TestResult::Fail("entry size 4");
+    }
+    // Bad version → None.
+    image[0x40] = 0x99;
+    if connector_table_header(&image, 0x40).is_some() {
+        return TestResult::Fail("0x99 version should not parse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_connector_table_header_parses_v40
+);
+
+fn smoke_vbios_connector_entry_decode_per_connEp() -> TestResult {
+    let mut image = [0u8; 256];
+    // Connector table at 0x80, 1 entry, 4 bytes.
+    image[0x80] = 0x40;
+    image[0x81] = 4;
+    image[0x82] = 1;
+    image[0x83] = 4;
+    // Entry at 0x84:
+    //   byte 0 = 0x46 (DisplayPort connector type)
+    //   byte 1 = 0x07 (location=7, hpd_gpio bits[3:0]=0, dp_mux=0)
+    //   byte 2 = 0x21 (hpd_gpio[3:2]=0b01, dp_mux[3:2]=0b00, di=0x2)
+    //   byte 3 = 0x08 (sr=1 at bit 3, lcdid=0, hpd_gpio[6:4]=0)
+    image[0x84] = 0x46;
+    image[0x85] = 0x07;
+    image[0x86] = 0x21;
+    image[0x87] = 0x08;
+    let e = connector_entry(&image, 0x80, 0).expect("should decode");
+    if e.conn_type != 0x46 {
+        return TestResult::Fail("conn_type byte");
+    }
+    if e.location != 7 {
+        return TestResult::Fail("location nibble");
+    }
+    // hpd_gpio = ((0x07 & 0x30) >> 4) | ((0x21 & 0x03) << 2) |
+    //            ((0x80 & 0x07) << 4) = 0 | 4 | 0 = 4.
+    if e.hpd_gpio != 4 {
+        return TestResult::Fail("hpd_gpio bit reassembly");
+    }
+    if e.di != 2 {
+        return TestResult::Fail("di field");
+    }
+    if !e.sr {
+        return TestResult::Fail("sr bit");
+    }
+    // out-of-range index returns None.
+    if connector_entry(&image, 0x80, 5).is_some() {
+        return TestResult::Fail("index 5 should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_connector_entry_decode_per_connEp
+);
+
+fn smoke_kms_lookup_connector_type_from_bios() -> TestResult {
+    // Build a complete image: DCB at 0x80 with conn table pointer
+    // at 0x94 → 0x100; conn table at 0x100 with one DisplayPort
+    // entry.
+    let mut image = [0u8; 512];
+    image[0x80] = 0x41;
+    image[0x81] = 0x20;
+    image[0x82] = 0x04;
+    image[0x83] = 0x08;
+    image[0x94..0x96].copy_from_slice(&0x0100u16.to_le_bytes());
+    image[0x100] = 0x40;
+    image[0x101] = 4;
+    image[0x102] = 1;
+    image[0x103] = 4;
+    image[0x104] = 0x46; // DisplayPort connector
+    let t = crate::kms::lookup_connector_type_from_bios(&image, 0x80, 0);
+    if t != crate::disp::ConnectorType::DisplayPort {
+        return TestResult::Fail("connector type should be DisplayPort");
+    }
+    // Out-of-range falls back to synthetic.
+    let t2 = crate::kms::lookup_connector_type_from_bios(&image, 0x80, 9);
+    // Index 9 with no entry falls back to synthetic: Unknown(9).
+    if t2 != crate::disp::ConnectorType::Unknown(9) {
+        return TestResult::Fail("out-of-range should fall back to synthetic Unknown");
+    }
+    // No conn pointer → synthetic fallback (still index-based).
+    let mut image2 = [0u8; 256];
+    image2[0x80] = 0x41;
+    image2[0x81] = 0x20;
+    image2[0x82] = 0x04;
+    image2[0x83] = 0x08;
+    let t3 = crate::kms::lookup_connector_type_from_bios(&image2, 0x80, 4);
+    if t3 != crate::disp::ConnectorType::DisplayPort {
+        return TestResult::Fail("no conn pointer → synthetic index 4 = DP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/kms",
+    smoke_kms_lookup_connector_type_from_bios
+);
+
+// ────────────────────────────────────────────────────────────────
 // PMU firmware staging (item 10)
 // ────────────────────────────────────────────────────────────────
 
