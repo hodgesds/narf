@@ -924,6 +924,7 @@ dependencies = [
  "narf-init",
  "narf-interrupts",
  "narf-io",
+ "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
@@ -1089,6 +1090,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-firmware",
+ "narf-init",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
@@ -1270,6 +1272,7 @@ dependencies = [
  "narf-pwm",
  "narf-scheduler",
  "narf-scmi",
+ "narf-security",
  "narf-shmem",
  "narf-spdm",
  "narf-time",
@@ -1549,6 +1552,14 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
+]
+
+[[package]]
+name = "narf-security"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
