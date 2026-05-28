@@ -42,6 +42,7 @@ narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }
 narf-drivers-fs-ext2  = { path = "../drivers/fs/ext2" }
+narf-drivers-fs-ext4  = { path = "../drivers/fs/ext4" }
 narf-drivers-fs-fat   = { path = "../drivers/fs/fat" }
 narf-drivers-fs-exfat = { path = "../drivers/fs/exfat" }
 narf-drivers-fs-minix = { path = "../drivers/fs/minix" }
