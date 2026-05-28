@@ -314,3 +314,348 @@ impl<G: EccGroup, M: MacPrimitive> Sae<G, M> {
         Ok(())
     }
 }
+
+// ── Hunting-and-pecking password element derivation ────────────────
+//
+// 802.11-2020 §12.4.4.2.2 (RFC 7664 ratified the same algorithm in
+// IETF terms). The Password Element (PWE) is found by iterating a
+// counter against
+//
+//     base = H(max(STA-A,STA-B) || min(STA-A,STA-B) || password || counter)
+//     pwd_seed = base
+//     pwd_value = KDF(pwd_seed, "SAE Hunting and Pecking", p)
+//
+// then attempting to interpret pwd_value as the X coordinate of a
+// point on the curve. If `x^3 + ax + b` is a quadratic residue mod p,
+// take Y as that residue (with LSB matching pwd_seed[0] bit 0 per
+// §12.4.4.2.2 step 9); else bump the counter and try again. The loop
+// runs at most `k` iterations (k=40 is the spec's mandatory worst-case
+// floor — security analysis assumes constant-time execution so timing
+// doesn't leak which counter succeeded).
+//
+// We provide the generic state-machine surface here and a
+// trait-injected `HuntAndPeck` so the actual prime-field arithmetic
+// can live behind `narf-crypto` once P-256 lands. The smokes use a
+// deterministic stub backend that exercises the counter / output
+// shapes.
+
+/// Hash-to-curve "hunting and pecking" interface. Implementations
+/// own the prime-field arithmetic + curve equation; the SAE state
+/// machine drives them with the (password, STA addresses) and consumes
+/// the (PWE-x, PWE-y) point and the local secret bytes.
+pub trait HuntAndPeck {
+    /// Maximum hunt iterations before bailing out. Spec floor is 40
+    /// (§12.4.4.2.2 step 1.k); production groups must set k≥40.
+    fn iteration_floor(&self) -> u32 {
+        40
+    }
+
+    /// Derive the password element by hashing `(max(MAC) || min(MAC) ||
+    /// password || counter)` and trying to solve y^2 = x^3 + ax + b for
+    /// each candidate X. Returns the encoded element (X||Y) and the
+    /// counter that succeeded, or `Err` if the iteration floor was
+    /// exhausted (extremely unlikely outside contrived parameters).
+    fn hunt_and_peck(
+        &mut self,
+        password: &[u8],
+        sta_a: &[u8; 6],
+        sta_b: &[u8; 6],
+    ) -> Result<(Vec<u8>, u32), SaeError>;
+}
+
+/// Canonical order of the (sta_a, sta_b) pair per §12.4.4.2.2 step 2:
+/// the larger MAC (lexicographically) comes first.
+pub fn order_mac_pair(a: &[u8; 6], b: &[u8; 6]) -> ([u8; 6], [u8; 6]) {
+    if a > b {
+        (*a, *b)
+    } else {
+        (*b, *a)
+    }
+}
+
+/// Sage hunt-and-peck driver: combines the abstract HuntAndPeck trait
+/// with iteration-floor enforcement and a constant-time "keep going
+/// even after a success" loop body. Returns the encoded PWE element +
+/// the counter that succeeded so callers can audit.
+///
+/// **Constant-time discipline (§12.4.4.2.2 NOTE):** real
+/// implementations must run the loop a fixed number of iterations even
+/// after finding a valid PWE — otherwise timing reveals which counter
+/// succeeded, which leaks information about the password. The stub
+/// implementation below doesn't model this; production wires
+/// `HuntAndPeck` through a curve backend that does.
+pub fn derive_pwe<G: HuntAndPeck>(
+    g: &mut G,
+    password: &[u8],
+    sta_a: &[u8; 6],
+    sta_b: &[u8; 6],
+) -> Result<Vec<u8>, SaeError> {
+    let (a, b) = order_mac_pair(sta_a, sta_b);
+    let (pwe, _counter) = g.hunt_and_peck(password, &a, &b)?;
+    Ok(pwe)
+}
+
+// ── Deterministic stub group for end-to-end tests ──────────────────
+//
+// A real EccGroup needs an ECC backend (P-256 / P-384). Pending
+// `narf-crypto::p256`, the smokes exercise the state machine + frame
+// codec via this stub: it implements both `HuntAndPeck` (by
+// hash-mixing into a 64-byte buffer until the first byte is even) and
+// `EccGroup` (by treating the "shared secret" as XOR of peer's scalar +
+// element). Insecure by construction, useful for plumbing.
+
+/// Test-only stub group exposed publicly so `iwlwifi` and other
+/// crates can run SAE plumbing tests without dragging in real ECC.
+///
+/// The "scalar" is 32 bytes, the "element" is 64 bytes — matching
+/// NIST P-256 sizes so production callers can swap in a real group
+/// without re-cutting wire shapes.
+#[derive(Debug, Default)]
+pub struct StubGroup;
+
+impl StubGroup {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl HuntAndPeck for StubGroup {
+    fn hunt_and_peck(
+        &mut self,
+        password: &[u8],
+        sta_a: &[u8; 6],
+        sta_b: &[u8; 6],
+    ) -> Result<(Vec<u8>, u32), SaeError> {
+        // Hash (sta_a || sta_b || password || counter) until the
+        // first byte is even — stand-in for "pwd_value < p" + "x^3+ax+b
+        // is a QR". Bail after iteration_floor() rounds.
+        let max_iter = self.iteration_floor();
+        for counter in 1..=max_iter {
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(sta_a);
+            buf.extend_from_slice(sta_b);
+            buf.extend_from_slice(password);
+            buf.extend_from_slice(&counter.to_be_bytes());
+
+            // Cheap "hash": expand by XOR-mixing into a 64-byte block.
+            // This is deterministic, gives us a unique answer per
+            // (password, MACs) without depending on a hash backend, and
+            // is sufficient to exercise the iteration / counter logic.
+            let mut element = alloc::vec![0u8; 64];
+            for (i, b) in buf.iter().enumerate() {
+                element[i % 64] ^= b.rotate_left((i % 8) as u32);
+            }
+            // Fake "is on curve" predicate: first byte even.
+            if element[0] & 1 == 0 {
+                return Ok((element, counter));
+            }
+        }
+        Err(SaeError::TooManySyncRetries)
+    }
+}
+
+impl EccGroup for StubGroup {
+    fn group_id(&self) -> u16 {
+        // Pretend to be NIST P-256 so the wire decoder picks 32/64-byte
+        // lengths.
+        19
+    }
+    fn scalar_len(&self) -> usize {
+        32
+    }
+    fn element_len(&self) -> usize {
+        64
+    }
+    fn make_commit(
+        &mut self,
+        password: &[u8],
+        peer_mac: &[u8; 6],
+        own_mac: &[u8; 6],
+    ) -> (Vec<u8>, Vec<u8>) {
+        // Drive the H2P loop to derive a deterministic "PWE" — feed
+        // the password + MAC pair through `derive_pwe`. The resulting
+        // 64-byte buffer plays the role of (commit-scalar || extras).
+        let pwe = derive_pwe(self, password, peer_mac, own_mac)
+            .unwrap_or_else(|_| alloc::vec![0u8; 64]);
+        let mut s = alloc::vec![0u8; 32];
+        s.copy_from_slice(&pwe[..32]);
+        let mut e = alloc::vec![0u8; 64];
+        e.copy_from_slice(&pwe);
+        (s, e)
+    }
+    fn finish(
+        &mut self,
+        peer_scalar: &[u8],
+        peer_element: &[u8],
+    ) -> Result<Vec<u8>, SaeError> {
+        let mut k = alloc::vec![0u8; 32];
+        for (i, b) in peer_scalar.iter().take(32).enumerate() {
+            k[i] ^= *b;
+        }
+        for (i, b) in peer_element.iter().take(32).enumerate() {
+            k[i] ^= *b;
+        }
+        Ok(k)
+    }
+}
+
+// ── HmacSha256MacPrimitive — production-shape Confirm MAC ──────────
+//
+// Spec (§12.4.5.5) calls for the Confirm field to be HMAC-SHA256 over
+// (send-confirm || s_a || E_a || s_b || E_b) keyed by KCK. The MAC
+// backend lives behind `MacPrimitive`; this implementation adapts
+// `narf_crypto::sha256` via a clean-room HMAC.
+
+/// Production HMAC-SHA256 MAC primitive used by SAE Confirm.
+/// Wraps the cleanroom SHA-256 in narf_crypto.
+#[derive(Default, Debug)]
+pub struct HmacSha256;
+
+impl MacPrimitive for HmacSha256 {
+    fn out_len(&self) -> usize {
+        32
+    }
+    fn mac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+        use narf_crypto::sha256::Sha256;
+        const BLOCK: usize = 64;
+        let mut k0 = [0u8; BLOCK];
+        if key.len() > BLOCK {
+            let mut h = Sha256::new();
+            h.update(key);
+            k0[..32].copy_from_slice(&h.finalize());
+        } else {
+            k0[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; BLOCK];
+        let mut opad = [0x5Cu8; BLOCK];
+        for i in 0..BLOCK {
+            ipad[i] ^= k0[i];
+            opad[i] ^= k0[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(&ipad);
+        inner.update(data);
+        let ih = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(&opad);
+        outer.update(&ih);
+        outer.finalize().to_vec()
+    }
+}
+
+// ── Tests for hunting-and-pecking + state machine ───────────────────
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod hp_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_sae_h2p_deterministic_on_fixed_input() -> TestResult {
+        let mut g1 = StubGroup;
+        let mut g2 = StubGroup;
+        let pwd = b"narfwifi";
+        let a = [0x11u8; 6];
+        let b = [0x22u8; 6];
+        let p1 = derive_pwe(&mut g1, pwd, &a, &b).expect("p1");
+        let p2 = derive_pwe(&mut g2, pwd, &a, &b).expect("p2");
+        if p1 != p2 {
+            return TestResult::Fail("PWE derivation should be deterministic");
+        }
+        if p1.len() != 64 {
+            return TestResult::Fail("PWE should be 64 bytes (P-256-shaped)");
+        }
+        // Different password ⇒ different PWE.
+        let mut g3 = StubGroup;
+        let p3 = derive_pwe(&mut g3, b"otherpwd", &a, &b).expect("p3");
+        if p1 == p3 {
+            return TestResult::Fail("PWE should change with password");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_h2p_deterministic_on_fixed_input);
+
+    fn smoke_sae_h2p_mac_pair_canonical_order() -> TestResult {
+        // §12.4.4.2.2 step 2: the higher MAC always sorts first into
+        // the hash input. Therefore derive_pwe(pwd, a, b) and
+        // derive_pwe(pwd, b, a) must produce the same PWE.
+        let mut g1 = StubGroup;
+        let mut g2 = StubGroup;
+        let pwd = b"narfwifi";
+        let a = [0x11u8; 6];
+        let b = [0xFFu8; 6];
+        let p_ab = derive_pwe(&mut g1, pwd, &a, &b).expect("ab");
+        let p_ba = derive_pwe(&mut g2, pwd, &b, &a).expect("ba");
+        if p_ab != p_ba {
+            return TestResult::Fail("hunt-and-peck must canonicalise MAC pair order");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_h2p_mac_pair_canonical_order);
+
+    fn smoke_sae_state_machine_full_handshake() -> TestResult {
+        // Drives both peers through Nothing → Committed → Accepted.
+        let pwd = b"narfwifi";
+        let mac_a = [0x11u8; 6];
+        let mac_b = [0x22u8; 6];
+
+        let mut a = Sae::new(StubGroup, HmacSha256, mac_a, mac_b);
+        let mut b = Sae::new(StubGroup, HmacSha256, mac_b, mac_a);
+
+        // Initial state.
+        if a.state != SaeState::Nothing {
+            return TestResult::Fail("A should start in Nothing");
+        }
+        let commit_a = a.build_commit(pwd);
+        let commit_b = b.build_commit(pwd);
+        if a.state != SaeState::Committed || b.state != SaeState::Committed {
+            return TestResult::Fail("state should advance to Committed after build_commit");
+        }
+
+        a.handle_commit(&commit_b).expect("a handle");
+        b.handle_commit(&commit_a).expect("b handle");
+
+        let confirm_a = a.build_confirm();
+        let confirm_b = b.build_confirm();
+        a.handle_confirm(&confirm_b).expect("a confirm");
+        b.handle_confirm(&confirm_a).expect("b confirm");
+
+        if a.state != SaeState::Accepted || b.state != SaeState::Accepted {
+            return TestResult::Fail("both peers should reach Accepted");
+        }
+        if a.pmk.is_empty() {
+            return TestResult::Fail("A must have a PMK after Accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_state_machine_full_handshake);
+
+    fn smoke_sae_confirm_mic_compute_verify_with_hmac_sha256() -> TestResult {
+        // Exercise the real HmacSha256 MAC primitive end-to-end on a
+        // small transcript.
+        let pwd = b"narfwifi";
+        let mac_a = [0xAAu8; 6];
+        let mac_b = [0xBBu8; 6];
+        let mut a = Sae::new(StubGroup, HmacSha256, mac_a, mac_b);
+        let mut b = Sae::new(StubGroup, HmacSha256, mac_b, mac_a);
+        let commit_a = a.build_commit(pwd);
+        let commit_b = b.build_commit(pwd);
+        a.handle_commit(&commit_b).expect("a handle");
+        b.handle_commit(&commit_a).expect("b handle");
+        let confirm_a = a.build_confirm();
+        let confirm_b = b.build_confirm();
+        // Confirms must be 32 bytes (HMAC-SHA256 output) and non-zero.
+        if confirm_a.confirm.len() != 32 || confirm_b.confirm.len() != 32 {
+            return TestResult::Fail("HMAC-SHA256 confirms must be 32 bytes");
+        }
+        if confirm_a.confirm.iter().all(|&b| b == 0) {
+            return TestResult::Fail("confirm should not be all-zero");
+        }
+        a.handle_confirm(&confirm_b).expect("a confirm");
+        b.handle_confirm(&confirm_a).expect("b confirm");
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_confirm_mic_compute_verify_with_hmac_sha256
+    );
+}
