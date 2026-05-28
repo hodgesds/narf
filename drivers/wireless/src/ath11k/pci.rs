@@ -26,9 +26,21 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use narf_wireless::{
+    AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessIfaceInfo,
+    WirelessNetIface,
+};
 
 use super::hw::{self, name_for, refine_hw_rev, ChipInfo, HwRev, ALL_DEV_IDS, QCOM_VENDOR};
 
@@ -58,6 +70,67 @@ pub struct Ath11kDevice {
     pub hw_rev: HwRev,
     /// PCI device id we matched on.
     pub device_id: u16,
+    pub mac_addr: [u8; 6],
+    pub link_up: AtomicBool,
+    pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+}
+
+impl Interface for Ath11kDevice {
+    fn name(&self) -> &str {
+        "wlan1"
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac_addr
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.link_up.load(Ordering::Acquire)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ring
+    }
+}
+
+#[async_trait::async_trait]
+impl WirelessNetIface for Ath11kDevice {
+    fn get_wireless_info(&self) -> WirelessIfaceInfo {
+        WirelessIfaceInfo {
+            base_name: self.name().into(),
+            base_mac: self.mac(),
+            bands: alloc::vec![],
+            modes: narf_wireless::iface::WirelessModes::STATION,
+            hw_caps: narf_wireless::iface::HwCaps {
+                ht_supported: true,
+                vht_supported: true,
+                he_supported: true,
+                eht_supported: false,
+            },
+        }
+    }
+
+    async fn scan(&self, _req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    async fn associate(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
+        self.link_up.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.link_up.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
+        Ok(())
+    }
 }
 
 impl core::fmt::Debug for Ath11kDevice {
@@ -145,13 +218,48 @@ pub fn probe(
         let _ = writeln!(narf_console::Writer, "  ath11k: no firmware authority — skipping MHI start");
     }
 
-    *CONTROLLER.lock() = Some(dev);
+    // ── Stage 3: Interface registration ──
+    let mac_addr = [0x00, 0x16, 0xEA, 0x11, 0x11, 0x11]; // TODO: Read from HW
+    
+    // Initialize IPC rings.
+    let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
+
+    let device_id = dev.device_id;
+    let chip = dev.chip;
+    let hw_rev = dev.hw_rev;
+
+    let device = Arc::new(Ath11kDevice {
+        mmio_bar0: dev.mmio_bar0,
+        chip,
+        hw_rev,
+        device_id,
+        mac_addr,
+        link_up: AtomicBool::new(false),
+        rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+        tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+    });
+
+    narf_wireless::registry::register(device.clone());
+
+    // TODO: Spawn pumps for ath11k
+    
+    *CONTROLLER.lock() = Some(Ath11kDevice {
+        mmio_bar0: device.mmio_bar0.clone(),
+        chip: device.chip,
+        hw_rev: device.hw_rev,
+        device_id: device.device_id,
+        mac_addr: device.mac_addr,
+        link_up: AtomicBool::new(device.link_up.load(Ordering::Acquire)),
+        rx_ring: IrqSafeSpinLock::new(None), // Controller static doesn't need rings
+        tx_ring: IrqSafeSpinLock::new(None),
+    });
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(did)),
         kind: narf_drivers::BoundKind::Net,
-        pci_vid: Some(device.id.vendor),
-        pci_did: Some(device.id.device),
+        pci_vid: Some(QCOM_VENDOR),
+        pci_did: Some(device_id),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
@@ -193,6 +301,10 @@ pub unsafe fn bring_up(device: &BusDevice, chip: ChipInfo) -> Result<Ath11kDevic
         chip,
         hw_rev,
         device_id: chip.did,
+        mac_addr: [0; 6],
+        link_up: AtomicBool::new(false),
+        rx_ring: IrqSafeSpinLock::new(None),
+        tx_ring: IrqSafeSpinLock::new(None),
     })
 }
 

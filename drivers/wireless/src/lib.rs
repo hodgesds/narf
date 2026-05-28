@@ -11,14 +11,40 @@ pub mod mt7921;
 pub mod rtw88;
 pub mod rtw89;
 
+use narf_init::{InitResult, Stage};
+
 pub fn register_initcalls() {
     // Register wireless drivers with the bus dispatcher.
-    iwlwifi::register();
-    mt7921::register();
-    cyw43439::register();
-    rtw88::register();
-    rtw89::register();
-    brcmfmac::register();
-    ath11k::register();
-    ath10k::register();
+    narf_init::register(Stage::Subsys, "iwlwifi", || {
+        iwlwifi::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "mt7921", || {
+        mt7921::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "cyw43439", || {
+        cyw43439::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtw88", || {
+        rtw88::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtw89", || {
+        rtw89::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "brcmfmac", || {
+        brcmfmac::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "ath11k", || {
+        ath11k::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "ath10k", || {
+        ath10k::register();
+        InitResult::Ok
+    });
 }

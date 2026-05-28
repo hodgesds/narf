@@ -61,10 +61,298 @@ pub mod rx;
 pub mod transport;
 pub mod tx;
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Poll, Waker};
+
+use crate::iwlwifi::transport::IwlMmio;
+use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_io::DmaBuffer;
+use narf_ipc::{channel, Consumer, Producer};
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use narf_wireless::{
+    AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessIfaceInfo,
+    WirelessNetIface,
+};
 
 pub const INTEL_VENDOR: u16 = 0x8086;
+
+// ── IwlDevice ──────────────────────────────────────────────────────
+
+pub struct IwlDevice {
+    mmio: MmioRegion,
+    chip: ChipConfig,
+    mac_addr: [u8; 6],
+    link_up: AtomicBool,
+    rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    bss_list: IrqSafeSpinLock<Vec<BssInfo>>,
+    scan_in_progress: AtomicBool,
+
+    rx_q: IrqSafeSpinLock<rx::RxQueue>,
+    tx_q0: IrqSafeSpinLock<tx::TxQueue>,
+    rx_ring_dma: DmaBuffer,
+    tx_ring_dma: Vec<DmaBuffer>,
+    rx_buffers: Vec<DmaBuffer>,
+    scan_waker: IrqSafeSpinLock<Option<Waker>>,
+}
+
+unsafe impl Send for IwlDevice {}
+unsafe impl Sync for IwlDevice {}
+
+impl IwlDevice {
+    pub fn new(
+        mmio: MmioRegion,
+        chip: ChipConfig,
+        mac_addr: [u8; 6],
+        rx_q: rx::RxQueue,
+        tx_q0: tx::TxQueue,
+        rx_ring_dma: DmaBuffer,
+        tx_ring_dma: Vec<DmaBuffer>,
+        rx_buffers: Vec<DmaBuffer>,
+    ) -> Self {
+        Self {
+            mmio,
+            chip,
+            mac_addr,
+            link_up: AtomicBool::new(false),
+            rx_ring: IrqSafeSpinLock::new(None),
+            tx_ring: IrqSafeSpinLock::new(None),
+            bss_list: IrqSafeSpinLock::new(Vec::new()),
+            scan_in_progress: AtomicBool::new(false),
+            rx_q: IrqSafeSpinLock::new(rx_q),
+            tx_q0: IrqSafeSpinLock::new(tx_q0),
+            rx_ring_dma,
+            tx_ring_dma,
+            rx_buffers,
+            scan_waker: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+impl core::fmt::Debug for IwlDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IwlDevice")
+            .field("chip", &self.chip.display_name)
+            .field("mac", &self.mac_addr)
+            .field("link_up", &self.link_up.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl Interface for IwlDevice {
+    fn name(&self) -> &str {
+        "wlan0" // TODO: dynamic naming
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac_addr
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.link_up.load(Ordering::Acquire)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ring
+    }
+}
+
+#[async_trait::async_trait]
+impl WirelessNetIface for IwlDevice {
+    fn get_wireless_info(&self) -> WirelessIfaceInfo {
+        WirelessIfaceInfo {
+            base_name: self.name().into(),
+            base_mac: self.mac(),
+            bands: alloc::vec![], // TODO: populate from chip config
+            modes: narf_wireless::iface::WirelessModes::STATION,
+            hw_caps: narf_wireless::iface::HwCaps {
+                ht_supported: true,
+                vht_supported: self.chip.generation == Generation::Gen2
+                    || self.chip.generation == Generation::Gen3,
+                he_supported: self.chip.generation == Generation::Gen2
+                    || self.chip.generation == Generation::Gen3,
+                eht_supported: self.chip.did == 0x272b, // BE200
+            },
+        }
+    }
+
+    async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        if self.scan_in_progress.swap(true, Ordering::SeqCst) {
+            return Err(WirelessError::Busy);
+        }
+
+        self.bss_list.lock().clear();
+
+        // 1. Build and send SCAN_REQ_UMAC command.
+        // Map narf_wireless::ScanRequest to iwlwifi::mlme::ScanRequest.
+        let mut channels = Vec::new();
+        for ch in req.channels {
+            channels.push(mlme::ScanChannel {
+                channel_num: ch as u8,
+                flags: mlme::scan_channel_flags::ACTIVE,
+                dwell_time_ms_min: 10,
+                dwell_time_ms_max: 60,
+            });
+        }
+        let mut ssids = Vec::new();
+        for ssid in req.ssids {
+            ssids.push(mlme::ScanSsid::from_bytes(&ssid));
+        }
+
+        let iwl_req = mlme::ScanRequest {
+            channels,
+            ssids,
+            passive: !req.active,
+            rand_mac: false,
+        };
+
+        let _cmd_body = mlme::scan_request_cmd(&iwl_req);
+        
+        {
+            let mut _tx_q = self.tx_q0.lock();
+            let mut _mmio = IwlMmioImpl(self.mmio);
+            
+            // TODO: Actually send the command.
+        }
+
+        // 2. Wait for SCAN_COMPLETE_UMAC notification via the pump.
+        core::future::poll_fn(|cx| {
+            if !self.scan_in_progress.load(Ordering::Acquire) {
+                core::task::Poll::Ready(())
+            } else {
+                *self.scan_waker.lock() = Some(cx.waker().clone());
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+
+        Ok(self.bss_list.lock().clone())
+    }
+
+    async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        let _ = writeln!(narf_console::Writer, "  iwlwifi: associating to {:?}", req.ssid);
+        
+        // TODO: Build and send association frame.
+        // TODO: Wait for association response.
+        
+        self.link_up.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.link_up.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
+        Ok(())
+    }
+}
+
+fn spawn_pumps(
+    device: Arc<IwlDevice>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        iwl_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        iwl_tx_pump(d2, tx_cons).await;
+    });
+}
+
+struct IwlRxHandler {
+    device: Arc<IwlDevice>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+}
+
+impl rx::RxHandler for IwlRxHandler {
+    fn handle(&mut self, kind: rx::RxKind, hdr: rx::RxPacketHeader, payload: &[u8]) {
+        match kind {
+            rx::RxKind::Alive => {
+                let _ = writeln!(narf_console::Writer, "  iwlwifi: firmware alive notification");
+            }
+            rx::RxKind::ScanComplete => {
+                self.device.scan_in_progress.store(false, Ordering::Release);
+                if let Some(waker) = self.device.scan_waker.lock().take() {
+                    waker.wake();
+                }
+                let _ = writeln!(narf_console::Writer, "  iwlwifi: scan complete");
+            }
+            rx::RxKind::RxMpdu => {
+                // If scan is in progress, check for beacons/probe-resps.
+                if self.device.scan_in_progress.load(Ordering::Acquire) {
+                    // TODO: Parse beacon and update bss_list
+                }
+                // Push to network stack.
+                // TODO: Allocate a Frame and copy payload
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>) {
+    let _ = writeln!(narf_console::Writer, "  iwlwifi: RX pump started");
+    
+    let mut handler = IwlRxHandler {
+        device: device.clone(),
+        rx_prod,
+    };
+
+    loop {
+        {
+            let mut rx_q = device.rx_q.lock();
+            let mut mmio = IwlMmioImpl(device.mmio);
+            let wptr = mmio.read(rx::CSR_FH_RSCSR_CHNL0_STTS_WPTR_REG);
+            
+            rx::drain_rx_queue(
+                &mut rx_q,
+                wptr as usize,
+                |slot| {
+                    // Return slice of the DMA buffer for this slot.
+                    device.rx_buffers[slot].as_slice()
+                },
+                &mut handler,
+            );
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    let _ = writeln!(narf_console::Writer, "  iwlwifi: TX pump started");
+    
+    while let Ok(frame) = tx_cons.recv().await {
+        let mut tx_q = device.tx_q0.lock();
+        let mut mmio = IwlMmioImpl(device.mmio);
+
+        // 1. Build IwlTxCmd.
+        let _cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF); // Broadcast station for now
+        
+        // 2. Build TFD.
+        let mut tfd = tx::Tfd::default();
+        // Section 0: the command itself (header).
+        // For simplicity, we'll just push the frame buffer.
+        tfd.push_seg(frame.buf().phys_addr().as_u64() + frame.offset() as u64, frame.len() as u16);
+        
+        // 3. Enqueue and kick.
+        let slot = tx_q.enqueue(tfd);
+        tx::tx_doorbell(&mut mmio, 0, slot);
+    }
+}
 
 // ── MMIO implementation ────────────────────────────────────────────
 
@@ -797,10 +1085,81 @@ pub fn probe(
                     let _ = writeln!(narf_console::Writer, "  iwlwifi: ALIVE handshake successful");
                 }
                 Err(e) => {
-                    let _ = writeln!(narf_console::Writer, "  iwlwifi: firmware load failed: {:?}", e);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  iwlwifi: firmware load failed: {:?}",
+                        e
+                    );
                     return Err(narf_bus::ProbeError::Other("Firmware load failed"));
                 }
             }
+
+            // 4. Hardware Initialization (RX/TX rings).
+            
+            // Allocate RX ring memory.
+            let rx_ring_mem = narf_io::alloc_coherent(
+                rx::RX_RING_SIZE * core::mem::size_of::<rx::RxDescriptor>(),
+                narf_lib::id::DomainId::DRIVER_0,
+            )
+            .map_err(|_| narf_bus::ProbeError::Other("RX ring alloc failed"))?;
+
+            // Allocate RX buffers.
+            let mut rx_buffers = Vec::with_capacity(rx::RX_RING_SIZE);
+            for _ in 0..rx::RX_RING_SIZE {
+                let buf = narf_io::alloc_coherent(rx::RXB_SIZE, narf_lib::id::DomainId::DRIVER_0)
+                    .map_err(|_| narf_bus::ProbeError::Other("RX buffer alloc failed"))?;
+                rx_buffers.push(buf);
+            }
+
+            // Fill RX descriptors.
+            let rx_descs = rx_ring_mem.as_mut_ptr() as *mut rx::RxDescriptor;
+            for i in 0..rx::RX_RING_SIZE {
+                unsafe {
+                    (*rx_descs.add(i)).host_phys = rx_buffers[i].phys_addr().as_u64();
+                }
+            }
+
+            // Allocate TX ring memory (queue 0).
+            let tx_ring0_mem = narf_io::alloc_coherent(
+                tx::TX_RING_SIZE * core::mem::size_of::<tx::Tfd>(),
+                narf_lib::id::DomainId::DRIVER_0,
+            )
+            .map_err(|_| narf_bus::ProbeError::Other("TX ring alloc failed"))?;
+
+            // Program hardware RX registers.
+            mmio.write(rx::CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG, rx_ring_mem.phys_addr().as_u64() as u32);
+            mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx::RX_RING_SIZE - 1) as u32);
+
+            // 5. Instantiate and register the device.
+            // TODO: Read real MAC from hardware/firmware.
+            let mac_addr = [0x00, 0x16, 0xEA, 0x12, 0x34, 0x56];
+            
+            let rx_q = rx::RxQueue::new(rx_descs, rx_ring_mem.phys_addr().as_u64());
+            let tx_q0 = tx::TxQueue::new(0, tx_ring0_mem.as_mut_ptr() as *mut tx::Tfd);
+
+            let device = Arc::new(IwlDevice::new(
+                mmio_region,
+                chip,
+                mac_addr,
+                rx_q,
+                tx_q0,
+                rx_ring_mem,
+                alloc::vec![tx_ring0_mem],
+                rx_buffers,
+            ));
+
+            // Initialize IPC rings.
+            let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+            let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+            *device.rx_ring.lock() = Some(rx_cons);
+            *device.tx_ring.lock() = Some(tx_prod);
+
+            // Register with the wireless subsystem.
+            narf_wireless::registry::register(device.clone());
+
+            // 6. Spawn data pumps.
+            spawn_pumps(device, rx_prod, tx_cons);
         }
         Err(e) => {
             let _ = writeln!(

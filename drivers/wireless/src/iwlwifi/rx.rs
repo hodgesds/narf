@@ -159,8 +159,8 @@ pub struct RxDescriptor {
 /// that region and filling `descriptors_phys`.
 #[derive(Debug)]
 pub struct RxQueue {
-    /// Host-side copy of the descriptor ring.
-    pub descriptors: Vec<RxDescriptor>,
+    /// Host-side virtual address of the descriptor ring.
+    pub descriptors: *mut RxDescriptor,
     /// Host physical address of `descriptors[0]`. Written to
     /// `CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG` during init.
     pub descriptors_phys: u64,
@@ -172,13 +172,12 @@ pub struct RxQueue {
     pub write_ptr: usize,
 }
 
+unsafe impl Send for RxQueue {}
+unsafe impl Sync for RxQueue {}
+
 impl RxQueue {
     /// Create a new RX queue with `RX_RING_SIZE` empty descriptors.
-    pub fn new(descriptors_phys: u64) -> Self {
-        let mut descriptors = Vec::with_capacity(RX_RING_SIZE);
-        for _ in 0..RX_RING_SIZE {
-            descriptors.push(RxDescriptor::default());
-        }
+    pub fn new(descriptors: *mut RxDescriptor, descriptors_phys: u64) -> Self {
         Self {
             descriptors,
             descriptors_phys,
@@ -251,7 +250,7 @@ pub trait RxHandler {
 /// `CSR_FH_RSCSR_CHNL0_STTS_WPTR_REG` immediately before calling
 /// this function (passed in rather than read here so the function is
 /// testable without live MMIO).
-pub fn drain_rx_queue<H, F>(
+pub fn drain_rx_queue<'a, H, F>(
     rxq: &mut RxQueue,
     mmio_wptr: usize,
     mut rxb_data: F,
@@ -259,7 +258,7 @@ pub fn drain_rx_queue<H, F>(
 )
 where
     H: RxHandler,
-    F: FnMut(usize) -> &'static [u8],
+    F: FnMut(usize) -> &'a [u8],
 {
     rxq.write_ptr = mmio_wptr & RX_RING_MASK;
 
@@ -299,7 +298,7 @@ pub mod tests {
             0xFE, 0xCA, 0x00, 0x00,
         ];
 
-        let mut rxq = RxQueue::new(0xDEAD_BEEF);
+        let mut rxq = RxQueue::new(core::ptr::null_mut(), 0);
         // Pretend slot 0's buffer is filled (wptr advances to 1).
         let mmio_wptr = 1;
 
@@ -424,7 +423,7 @@ pub mod tests {
     // ── Smoke: drain does nothing when ring is empty ───────────────
 
     fn smoke_iwlwifi_rx_drain_noop_when_empty() -> TestResult {
-        let mut rxq = RxQueue::new(0x0);
+        let mut rxq = RxQueue::new(core::ptr::null_mut(), 0);
         let mut called = 0u32;
 
         struct Counter<'a>(&'a mut u32);

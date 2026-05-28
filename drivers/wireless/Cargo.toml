@@ -28,6 +28,7 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-console      = { path = "../../console" }
 narf-firmware     = { path = "../../firmware" }
+narf-init         = { path = "../../init" }
 async-trait = "0.1"
 
 [features]

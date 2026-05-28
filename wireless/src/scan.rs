@@ -10,6 +10,7 @@ pub struct ScanResult {
     pub bss_list: Vec<BssInfo>,
 }
 
+#[derive(Debug, Clone)]
 pub struct BssInfo {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,

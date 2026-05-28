@@ -16,9 +16,23 @@
 
 #![allow(dead_code)]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use narf_wireless::{
+    AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessIfaceInfo,
+    WirelessNetIface,
+};
 
 use super::efuse;
 use super::power;
@@ -34,6 +48,66 @@ pub struct Rtw88Device {
     /// PCI device id we matched on — controls per-chip quirks in
     /// follow-up commits. Today it just feeds `name_for`.
     pub device_id: u16,
+    pub link_up: AtomicBool,
+    pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+}
+
+impl Interface for Rtw88Device {
+    fn name(&self) -> &str {
+        "wlan2"
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.link_up.load(Ordering::Acquire)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ring
+    }
+}
+
+#[async_trait::async_trait]
+impl WirelessNetIface for Rtw88Device {
+    fn get_wireless_info(&self) -> WirelessIfaceInfo {
+        WirelessIfaceInfo {
+            base_name: self.name().into(),
+            base_mac: self.mac(),
+            bands: alloc::vec![],
+            modes: narf_wireless::iface::WirelessModes::STATION,
+            hw_caps: narf_wireless::iface::HwCaps {
+                ht_supported: true,
+                vht_supported: true,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+
+    async fn scan(&self, _req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    async fn associate(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
+        self.link_up.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.link_up.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
+        Ok(())
+    }
 }
 
 impl core::fmt::Debug for Rtw88Device {
@@ -177,11 +251,30 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
         }
     }
 
+    // Initialize IPC rings.
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+    let device_obj = Arc::new(Rtw88Device {
+        mmio_bar0: mmio_bar0.clone(),
+        mmio_bar2: mmio_bar2.clone(),
+        mac,
+        device_id: device.id.device,
+        link_up: AtomicBool::new(false),
+        rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+        tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+    });
+
+    narf_wireless::registry::register(device_obj.clone());
+
     Ok(Rtw88Device {
         mmio_bar0,
         mmio_bar2,
         mac,
         device_id: device.id.device,
+        link_up: AtomicBool::new(false),
+        rx_ring: IrqSafeSpinLock::new(None),
+        tx_ring: IrqSafeSpinLock::new(None),
     })
 }
 

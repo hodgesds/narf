@@ -285,16 +285,15 @@ pub struct TxQueue {
     pub write_ptr: usize,
     /// Ring read-pointer (last index the device acknowledged).
     pub read_ptr: usize,
-    /// Shadow TFD ring in host RAM.
-    pub tfds: Vec<Tfd>,
+    /// Virtual address of the TFD ring in host RAM.
+    pub tfds: *mut Tfd,
 }
 
+unsafe impl Send for TxQueue {}
+unsafe impl Sync for TxQueue {}
+
 impl TxQueue {
-    pub fn new(queue_id: u8) -> Self {
-        let mut tfds = Vec::with_capacity(TX_RING_SIZE);
-        for _ in 0..TX_RING_SIZE {
-            tfds.push(Tfd::default());
-        }
+    pub fn new(queue_id: u8, tfds: *mut Tfd) -> Self {
         Self { queue_id, write_ptr: 0, read_ptr: 0, tfds }
     }
 
@@ -302,7 +301,9 @@ impl TxQueue {
     /// Returns the slot index where the TFD was placed.
     pub fn enqueue(&mut self, tfd: Tfd) -> usize {
         let slot = self.write_ptr;
-        self.tfds[slot] = tfd;
+        unsafe {
+            *self.tfds.add(slot) = tfd;
+        }
         self.write_ptr = (self.write_ptr + 1) & TX_RING_MASK;
         slot
     }
@@ -461,7 +462,7 @@ pub mod tests {
     // ── Smoke: TxQueue enqueue advances write_ptr ──────────────────
 
     fn smoke_iwlwifi_tx_queue_enqueue_advances_wptr() -> TestResult {
-        let mut q = TxQueue::new(0);
+        let mut q = TxQueue::new(0, core::ptr::null_mut());
         let tfd = Tfd::default();
         let slot = q.enqueue(tfd);
         if slot != 0 {
