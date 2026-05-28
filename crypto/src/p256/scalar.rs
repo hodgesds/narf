@@ -109,8 +109,22 @@ impl Scalar {
     /// `(self + other) mod n`.
     pub fn add(&self, other: &Self) -> Self {
         let (sum, carry) = add4(self.0, other.0);
+        if carry {
+            // The full 257-bit sum is `(2^256 | sum)`. Since
+            // `2^256 = N + (2^256 − N)` and `2^256 − N` is a small
+            // positive value, reducing mod N gives
+            //   `(2^256 + sum) − N`  ==  `sum + (2^256 − N)`
+            // which equals `sum.wrapping_sub(N)` in 256-bit
+            // unsigned arithmetic. We must NOT call sub_unchecked
+            // here because that path corrects an underflow by adding
+            // N back, which would undo the wraparound and leave the
+            // result in the wrong residue class.
+            let (reduced, _borrow) = sub4(sum, ORDER_N);
+            return Self(reduced);
+        }
+        // No 257th bit. If sum >= N, fall through and subtract once.
         let mut s = Self(sum);
-        if carry || s.cmp_n() != Ordering::Less {
+        if s.cmp_n() != Ordering::Less {
             s = s.sub_unchecked(&Self(ORDER_N));
         }
         s
