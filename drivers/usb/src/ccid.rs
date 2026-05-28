@@ -1,4 +1,4 @@
-//! USB CCID (Chip Card Interface Device) class driver — Stage 0.
+//! USB CCID (Chip Card Interface Device) class driver.
 //!
 //! ## References
 //!
@@ -8,16 +8,17 @@
 //!   <https://www.usb.org/document-library/smart-card-ccid-version-11>
 //!   (Section numbers below cite this document unless noted.)
 //! - **ISO/IEC 7816** — Identification cards, integrated circuit cards.
-//!   ATR encoding (§T.3.1), T=0 / T=1 framing (T=0: §ISO 7816-3,
-//!   T=1: §ISO 7816-4). T=0/T=1 framing is handled by userspace
-//!   (PC/SC daemon / libccid); the kernel driver only exposes the bulk
-//!   endpoints.
+//!   ATR encoding (§T.3.1), T=0 / T=1 framing:
+//!   - T=0: ISO/IEC 7816-3:2006 §10 — character-oriented protocol.
+//!   - T=1: ISO/IEC 7816-3:2006 §11 — block-oriented protocol.
+//!   Framing is handled by the kernel-side `ccid::t0` and `ccid::t1`
+//!   sub-modules (see `send_apdu_t0` / `send_apdu_t1`).
 //! - **Linux `drivers/usb/class/usbtmc.c`** — GPL-2.0; consulted for
 //!   bulk-endpoint configuration pattern (per NARF 2026-05-20 relicense
 //!   to GPL-2.0-or-later). We mirror the endpoint-discovery shape but
 //!   adapt it to the CCID class.
 //!
-//! ## Stage 0 scope
+//! ## Scope
 //!
 //! 1. Recognise interface (class=0x0B / subclass=0x00 / protocol=0x00).
 //! 2. Parse the 54-byte class-specific CCID descriptor (§5.1,
@@ -27,18 +28,21 @@
 //!    from the configuration descriptor.
 //! 4. Configure those endpoints + issue SET_CONFIGURATION.
 //! 5. Expose `power_on` / `power_off` / `send_apdu` against the
-//!    addressed slot. T=0/T=1 framing is handled by userspace; the
-//!    kernel driver wraps raw APDU bytes in `PC_to_RDR_XfrBlock` and
-//!    unwraps `RDR_to_PC_DataBlock` responses.
-//! 6. Register a `/dev/ccid0` cdev that the PC/SC daemon consumes.
+//!    addressed slot. Raw-transport path wraps APDU bytes in
+//!    `PC_to_RDR_XfrBlock` and unwraps `RDR_to_PC_DataBlock`.
+//! 6. `send_apdu_t0` / `send_apdu_t1` provide T=0/T=1 framing so
+//!    userspace (pcsc-lite / libccid) doesn't need to deal with CCID
+//!    bulk-transport quirks directly.
 //!
 //! ## Out of scope (deferred)
 //!
-//! - T=0 / T=1 protocol-side framing (chaining, error-recovery) —
-//!   handled entirely by userspace libccid / pcsc-lite.
 //! - Secure PIN-entry via CCID `PC_to_RDR_Secure` (0x69) — requires
 //!   PIN-pad hardware and a separate threat model review.
 //! - Extended APDU reassembly beyond the single-block XfrBlock path.
+//! - T=15 / global-interface parameter negotiation, PPS — default-good.
+
+pub mod t0;
+pub mod t1;
 
 extern crate alloc;
 
@@ -424,28 +428,27 @@ impl CcidReader {
         Ok(())
     }
 
-    /// Send an APDU to slot `slot` via `PC_to_RDR_XfrBlock` (§6.1.4)
-    /// and return the response from `RDR_to_PC_DataBlock` (§6.2.1).
+    /// Send raw payload bytes via `PC_to_RDR_XfrBlock` (§6.1.4) and
+    /// return the `RDR_to_PC_DataBlock` (§6.2.1) response payload.
     ///
-    /// T=0 / T=1 protocol-side framing (chaining, error recovery) is
-    /// handled by userspace; this function wraps the raw APDU bytes
-    /// directly and returns the ICC's raw response.
-    pub async fn send_apdu(
+    /// Internal transport primitive. Called by `send_apdu`,
+    /// `send_apdu_t0`, and `send_apdu_t1`.
+    ///
+    /// bBWI (+7) = 0 (device default). wLevelParameter (+8..+9) = 0
+    /// (single APDU, no chaining; CCID spec rev 1.1 §6.1.4 Table 6-7).
+    async fn xfr_block_raw(
         &self,
         xhci_dev: &Xhci,
         slot: u8,
-        apdu: &[u8],
+        payload: &[u8],
     ) -> Result<Vec<u8>, CcidError> {
         let seq = self.next_seq(slot);
-        let payload_len = apdu.len() as u32;
-        let mut msg = alloc::vec![0u8; CCID_HDR_LEN + apdu.len()];
+        let payload_len = payload.len() as u32;
+        let mut msg = alloc::vec![0u8; CCID_HDR_LEN + payload.len()];
         msg[..CCID_HDR_LEN].copy_from_slice(
             &Self::build_header(PC_TO_RDR_XFR_BLOCK, payload_len, slot, seq)
         );
-        // bBWI (block-waiting integer multiplier, §6.1.4 Table 6-7)
-        // +7 = 0 (use device default).
-        // wLevelParameter +8..+9 = 0 (single APDU, no chaining).
-        msg[CCID_HDR_LEN..].copy_from_slice(apdu);
+        msg[CCID_HDR_LEN..].copy_from_slice(payload);
         xhci_dev
             .bulk_out(self.slot_id, self.bulk_out_dci(), &msg)
             .await
@@ -473,6 +476,151 @@ impl CcidReader {
         }
         let end = CCID_HDR_LEN + payload_len.min(n.saturating_sub(CCID_HDR_LEN));
         Ok(resp[CCID_HDR_LEN..end].to_vec())
+    }
+
+    /// Send an APDU to slot `slot` via `PC_to_RDR_XfrBlock` (§6.1.4)
+    /// and return the response from `RDR_to_PC_DataBlock` (§6.2.1).
+    ///
+    /// Wraps raw APDU bytes without protocol framing. Use
+    /// `send_apdu_t0` / `send_apdu_t1` for fully-framed exchanges.
+    pub async fn send_apdu(
+        &self,
+        xhci_dev: &Xhci,
+        slot: u8,
+        apdu: &[u8],
+    ) -> Result<Vec<u8>, CcidError> {
+        self.xfr_block_raw(xhci_dev, slot, apdu).await
+    }
+
+    // ── T=0 public API ────────────────────────────────────────────────
+
+    /// Send a T=0 APDU to `slot`, handling GET_RESPONSE chaining
+    /// (SW1=0x61 per ISO 7816-3 §10.3.3) automatically.
+    ///
+    /// Returns the full response payload with SW1:SW2 appended as the
+    /// final 2 bytes. All DATA bytes from chained GET_RESPONSE calls
+    /// are concatenated before the status word.
+    ///
+    /// ## References
+    ///
+    /// - ISO/IEC 7816-3:2006 §10.3.3 — T=0 GET_RESPONSE procedure.
+    /// - USB CCID spec rev 1.1 §6.1.4 / §6.2.1 — XfrBlock transport.
+    pub async fn send_apdu_t0(
+        &self,
+        xhci_dev: &Xhci,
+        slot: u8,
+        apdu: &t0::T0Apdu,
+    ) -> Result<Vec<u8>, CcidError> {
+        let cla = apdu.cla();
+        let mut raw_resp = self.xfr_block_raw(xhci_dev, slot, apdu.as_bytes()).await?;
+
+        let mut collected: Vec<u8> = Vec::new();
+        let mut iters = 0usize;
+
+        loop {
+            let (data, sw1, sw2) = t0::decode_response(&raw_resp)?;
+            collected.extend_from_slice(data);
+
+            if sw1 != t0::SW1_GET_RESPONSE || iters >= t0::MAX_GET_RESPONSE_ITERS {
+                collected.push(sw1);
+                collected.push(sw2);
+                return Ok(collected);
+            }
+
+            // SW1 = 0x61 → more data; issue GET_RESPONSE(Le=SW2).
+            let gr = t0::build_get_response(cla, sw2);
+            raw_resp = self.xfr_block_raw(xhci_dev, slot, gr.as_bytes()).await?;
+            iters += 1;
+        }
+    }
+
+    // ── T=1 public API ────────────────────────────────────────────────
+
+    /// Send a complete APDU over T=1 to `slot`.
+    ///
+    /// Wraps the APDU in a single I-block and handles R-block / S-block
+    /// responses per ISO 7816-3 §11.6:
+    ///
+    /// - **I-block**: normal card response — return INF bytes.
+    /// - **R-block NAK**: retransmit the I-block (up to 3 times).
+    /// - **S(WTX request)**: respond S(WTX response) and re-poll.
+    /// - **S(IFS request)**: respond S(IFS response) and re-poll.
+    /// - **S(RESYNCH response)**: reset sequence numbers and retransmit.
+    ///
+    /// Returns `CcidError::ResponseTooLong` if `apdu` exceeds 254 bytes
+    /// (ISO 7816-3 §11.3.1.1 — single-block INF limit).
+    ///
+    /// ## References
+    ///
+    /// - ISO/IEC 7816-3:2006 §11.6 — T=1 block-exchange procedure.
+    /// - USB CCID spec rev 1.1 §6.1.4 — XfrBlock for T=1.
+    pub async fn send_apdu_t1(
+        &self,
+        xhci_dev: &Xhci,
+        slot: u8,
+        apdu: &[u8],
+    ) -> Result<Vec<u8>, CcidError> {
+        if apdu.len() > 254 {
+            return Err(CcidError::ResponseTooLong);
+        }
+
+        let mut seq = t1::T1SeqState::default();
+        const MAX_RETRIES: usize = 3;
+        let mut retries = 0usize;
+
+        let ns = seq.next_ns();
+        let send_block = t1::T1Block::i_block(ns, apdu);
+        let mut current_wire = send_block.encode()?;
+
+        loop {
+            let resp_raw = self.xfr_block_raw(xhci_dev, slot, &current_wire).await?;
+            let block = t1::T1Block::decode(&resp_raw)
+                .map_err(|_| CcidError::BadResponse)?;
+
+            if block.is_iblock() {
+                seq.advance_nr();
+                return Ok(block.inf);
+            }
+
+            if block.is_rblock() {
+                if !block.r_error() {
+                    // R(ACK): single-block success.
+                    return Ok(block.inf);
+                }
+                // R(NAK): retransmit.
+                if retries >= MAX_RETRIES {
+                    return Err(CcidError::Transfer);
+                }
+                retries += 1;
+                continue; // current_wire unchanged
+            }
+
+            if block.is_sblock() {
+                match block.pcb {
+                    t1::PCB_SBLOCK_WTX_REQ => {
+                        let mult = block.inf.first().copied().unwrap_or(1);
+                        current_wire = t1::T1Block::s_wtx_response(mult).encode()?;
+                    }
+                    t1::PCB_SBLOCK_IFS_REQ => {
+                        let ifsd = block.inf.first().copied().unwrap_or(254);
+                        current_wire = t1::T1Block::s_ifs_response(ifsd).encode()?;
+                    }
+                    t1::PCB_SBLOCK_RESYNCH_RESP => {
+                        if retries >= MAX_RETRIES {
+                            return Err(CcidError::Transfer);
+                        }
+                        retries += 1;
+                        seq.reset();
+                        let ns2 = seq.next_ns();
+                        current_wire = t1::T1Block::i_block(ns2, apdu).encode()?;
+                    }
+                    _ => return Err(CcidError::BadResponse),
+                }
+                continue;
+            }
+
+            return Err(CcidError::BadResponse);
+        }
     }
 }
 
