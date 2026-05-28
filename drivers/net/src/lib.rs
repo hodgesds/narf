@@ -172,6 +172,10 @@ pub struct NicDescriptor {
     pub flags: u16,
 }
 
+use narf_ipc::{Consumer, Producer};
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
+
 /// Per-chipset driver trait. `name` / `mac` / `mtu` / `link_up`
 /// cover the `narf_net::Interface` surface; `model` / `caps` /
 /// `ring_capacity` are Stage-4 introspection used by test harnesses
@@ -184,4 +188,25 @@ pub trait HwNic: Send + Sync + 'static {
     fn model(&self) -> NicModel;
     fn caps(&self) -> NicCaps;
     fn ring_capacity(&self) -> usize;
+
+    /// RX consumer half.
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>;
+    /// TX producer half.
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>;
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NicError {
+    BarMapFailed,
+    NoMemory,
+    /// Frame outside [1, 1518].
+    FrameTooLong,
+    /// `transmit` couldn't find a free TX descriptor.
+    TxRingFull,
+    /// `transmit` polled too long for OWN to clear.
+    TxTimeout,
+    /// MSI-X table couldn't be brought up.
+    MsixSetup,
+    /// Generic or catch-all error.
+    Other(&'static str),
 }

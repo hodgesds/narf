@@ -7,12 +7,15 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 mod tests;
 
@@ -196,6 +199,8 @@ pub enum IxgbeError {
     TxTimeout,
     /// MSI-X capability not present / could not be enabled.
     MsixUnavailable,
+    /// Catch-all.
+    Other(&'static str),
 }
 
 // ── Driver state ───────────────────────────────────────────────────
@@ -224,6 +229,8 @@ pub struct Ixgbe {
     pub did: u16,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
 impl core::fmt::Debug for Ixgbe {
@@ -248,7 +255,7 @@ impl Ixgbe {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Self, IxgbeError> {
+    ) -> Result<Arc<Self>, IxgbeError> {
         // SAFETY: caller-authority over the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IxgbeError::BarMapFailed)?;
 
@@ -390,7 +397,10 @@ impl Ixgbe {
         let links = unsafe { mmio.read32(REG_LINKS) };
         let link_up = links & LINKS_UP != 0;
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let ixgbe = Arc::new(Self {
             mmio,
             tx_ring,
             tx_pool,
@@ -402,7 +412,14 @@ impl Ixgbe {
             link_up,
             did: device.id.device,
             msix: None,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(ixgbe.clone(), rx_prod, tx_cons);
+
+        Ok(ixgbe)
     }
 
     /// Read the EERD-decoded MAC bytes (Stage 2 surface).
@@ -558,6 +575,27 @@ impl Ixgbe {
 
 // ── HwNic impl (Stage 6) ───────────────────────────────────────────
 
+impl narf_net::Interface for Ixgbe {
+    fn name(&self) -> &str {
+        name_for(self.did)
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.link_up
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ipc_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ipc_ring
+    }
+}
+
 impl crate::HwNic for Ixgbe {
     fn name(&self) -> &'static str {
         name_for(self.did)
@@ -579,6 +617,58 @@ impl crate::HwNic for Ixgbe {
     }
     fn ring_capacity(&self) -> usize {
         TX_RING_LEN
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ipc_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ipc_ring
+    }
+}
+
+// ── IxgbeNic: lightweight ZST for narf-net registry ───────────────
+//
+// The full `Ixgbe` struct owns MMIO + DMA rings and can't be cloned.
+// `IxgbeNic` is a zero-sized sentinel that delegates to the module-level
+// `CONTROLLER` static, following the same pattern as `Rtl8139Nic`.
+
+#[derive(Debug)]
+pub struct IxgbeNic;
+
+impl narf_net::Interface for IxgbeNic {
+    fn name(&self) -> &str {
+        with_controller(|c| name_for(c.did)).unwrap_or("ixgbe")
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
     }
 }
 
@@ -640,7 +730,7 @@ fn read_mac_from_rar(mmio: &MmioRegion) -> [u8; 6] {
 
 // ── PCI registration ───────────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Ixgbe>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Ixgbe>>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -654,12 +744,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+
     // SAFETY: caller-authority over the device.
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
     let dev = match unsafe { Ixgbe::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+
+    {
+        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Ixgbe) };
+        *d.rx_ipc_ring.lock() = Some(rx_cons);
+        *d.tx_ipc_ring.lock() = Some(tx_prod);
+    }
+
+    *CONTROLLER.lock() = Some(dev.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -667,8 +769,60 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, IxgbeNic);
+    }
+
+    // Spawn pumps
+    spawn_pumps(dev, rx_prod, tx_cons);
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<Ixgbe>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        ixgbe_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        ixgbe_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = device.rx_recv(&mut buf);
+        if n > 0 {
+            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, n as u32);
+            frame.payload_mut().copy_from_slice(&buf[..n]);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+
+async fn ixgbe_tx_pump(device: Arc<Ixgbe>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.tx(frame.payload());
+    }
+}
+
+
 
 pub fn register_pci_driver() {
     for did in ALL_DEV_IDS {
@@ -698,9 +852,9 @@ pub fn is_probed() -> bool {
 }
 
 pub fn with_controller<R>(f: impl FnOnce(&Ixgbe) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
 
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut Ixgbe) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("Ixgbe static has multiple owners")))
 }

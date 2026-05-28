@@ -45,6 +45,9 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -294,7 +297,14 @@ pub struct AtlNic {
     pub link_up: bool,
     pub speed_1000: bool,
     pub duplex_full: bool,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for AtlNic {}
+unsafe impl Sync for AtlNic {}
 
 impl core::fmt::Debug for AtlNic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -459,7 +469,10 @@ impl AtlNic {
         let link_up = bmsr & BMSR_LINK_STATUS != 0;
         let an_complete = bmsr & BMSR_AUTONEG_COMPLETE != 0;
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let atl = Arc::new(Self {
             mmio,
             tpd_ring,
             tpd_pool,
@@ -472,7 +485,14 @@ impl AtlNic {
             link_up,
             speed_1000: an_complete,
             duplex_full: true,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(atl.clone(), rx_prod, tx_cons);
+
+        Ok(Arc::try_unwrap(atl).map_err(|_| NicError::NoMemory)?)
     }
 
     /// Transmit a single Ethernet frame. Polled completion.
@@ -728,7 +748,7 @@ pub const fn mac_from_sta_addr(hi: u32, lo: u32) -> [u8; 6] {
 
 // ── Driver-match registration ───────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<AtlNic>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<AtlNic>>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
@@ -752,11 +772,22 @@ pub fn probe(
 
     // SAFETY: caller-authority over the device for the duration of
     // bring_up.
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
     let dev = match unsafe { AtlNic::bring_up(&device, &cap) } {
-        Ok(d) => d,
+        Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+
+    {
+        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut AtlNic) };
+        *d.rx_ipc_ring.lock() = Some(rx_cons);
+        *d.tx_ipc_ring.lock() = Some(tx_prod);
+    }
+
+    *CONTROLLER.lock() = Some(dev.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -764,8 +795,58 @@ pub fn probe(
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, AtlHwNic);
+    }
+
+    // Spawn pumps
+    spawn_pumps(dev, rx_prod, tx_cons);
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<AtlNic>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        atheros_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        atheros_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn atheros_rx_pump(device: Arc<AtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    loop {
+        if let Some(pkt) = device.receive() {
+            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, pkt.len() as u32);
+            frame.payload_mut().copy_from_slice(&pkt);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn atheros_tx_pump(device: Arc<AtlNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.transmit(frame.payload());
+    }
+}
+
+
+
 
 /// Register the driver against every documented AR81xx device id.
 pub fn register_pci_driver() {
@@ -796,16 +877,98 @@ fn name_for(did: u16) -> &'static str {
 }
 
 /// `true` once `probe` has installed a controller.
+#[derive(Debug)]
+pub struct AtlHwNic;
+
+impl narf_net::Interface for AtlHwNic {
+    fn name(&self) -> &str {
+        "eth7"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
+impl crate::HwNic for AtlHwNic {
+    fn name(&self) -> &'static str {
+        "eth7" // TODO: dynamic naming
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::IntelIgb // TODO: Add Atheros to NicModel
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::NONE
+    }
+    fn ring_capacity(&self) -> usize {
+        1 << 8
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
 /// Test-side accessor: run `f` against the probed controller.
 pub fn with_controller<R>(f: impl FnOnce(&AtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
 
 /// Mutable accessor.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut AtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("AtlNic static has multiple owners")))
 }

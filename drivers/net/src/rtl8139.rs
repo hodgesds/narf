@@ -28,11 +28,14 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 // ── PCI device IDs ──────────────────────────────────────────────────
 
@@ -90,6 +93,8 @@ pub enum Rtl8139Error {
     QueueTooSmall,
     /// All four TX buffers are owned by the chip.
     TxBusy,
+    /// Catch-all.
+    Other(&'static str),
 }
 
 pub struct Rtl8139 {
@@ -102,7 +107,14 @@ pub struct Rtl8139 {
     /// Round-robin index for the next TX descriptor.
     tx_index: IrqSafeSpinLock<usize>,
     pub ready: bool,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for Rtl8139 {}
+unsafe impl Sync for Rtl8139 {}
 
 impl core::fmt::Debug for Rtl8139 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -121,6 +133,8 @@ impl Rtl8139 {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
+        rx_cons: Consumer<Frame, RX_RING_N>,
+        tx_prod: Producer<Frame, TX_RING_N>,
     ) -> Result<Self, Rtl8139Error> {
         // SAFETY: caller-asserted. RTL8139 advertises both BAR0
         // (IO) and BAR1 (MMIO); MMIO is more portable + cross-arch
@@ -214,7 +228,10 @@ impl Rtl8139 {
             mmio.write8(REG_CR, CR_TE | CR_RE);
         }
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let rtl = Arc::new(Self {
             mmio,
             mac,
             rx_ring,
@@ -222,7 +239,11 @@ impl Rtl8139 {
             rx_offset: IrqSafeSpinLock::new(0),
             tx_index: IrqSafeSpinLock::new(0),
             ready: true,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        Ok(Arc::try_unwrap(rtl).map_err(|_| Rtl8139Error::Other("Arc unwrap failed"))?)
     }
 
     pub fn mac(&self) -> [u8; 6] {
@@ -345,12 +366,47 @@ impl Rtl8139 {
 #[derive(Debug)]
 pub struct Rtl8139Nic;
 
+impl narf_net::Interface for Rtl8139Nic {
+    fn name(&self) -> &str {
+        "rtl8139"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up()).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
 impl crate::HwNic for Rtl8139Nic {
     fn name(&self) -> &'static str {
         "rtl8139"
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac()).unwrap_or([0; 6])
+        with_controller(|c| c.mac).unwrap_or([0; 6])
     }
     fn mtu(&self) -> u32 {
         1500
@@ -367,11 +423,17 @@ impl crate::HwNic for Rtl8139Nic {
     fn ring_capacity(&self) -> usize {
         TX_BUF_COUNT
     }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        <Self as narf_net::Interface>::rx_ring(self)
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        <Self as narf_net::Interface>::tx_ring(self)
+    }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Rtl8139>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtl8139>>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -385,12 +447,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
     // SAFETY: caller-authority.
-    let dev = match unsafe { Rtl8139::bring_up(&device, &cap) } {
-        Ok(d) => d,
+    let dev = match unsafe { Rtl8139::bring_up(&device, &cap, rx_cons, tx_prod) } {
+        Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+    *CONTROLLER.lock() = Some(dev.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("rtl8139"),
         kind: narf_drivers::BoundKind::Net,
@@ -398,8 +465,59 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(RTL8139_DEVICE),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, Rtl8139Nic);
+    }
+
+    // Spawn pumps
+    spawn_pumps(dev, rx_prod, tx_cons);
+
     Ok(())
 }
+
+
+fn spawn_pumps(
+    device: Arc<Rtl8139>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        rtl8139_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        rtl8139_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn rtl8139_rx_pump(device: Arc<Rtl8139>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = device.rx(&mut buf);
+        if n > 0 {
+            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, n as u32);
+            frame.payload_mut().copy_from_slice(&buf[..n]);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn rtl8139_tx_pump(device: Arc<Rtl8139>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.tx(frame.payload());
+    }
+}
+
 
 pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -417,5 +535,5 @@ pub fn is_probed() -> bool {
 }
 
 pub fn with_controller<R>(f: impl FnOnce(&Rtl8139) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }

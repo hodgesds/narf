@@ -495,6 +495,9 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -512,6 +515,8 @@ pub enum NicError {
     TxTimeout,
     /// MSI-X table couldn't be brought up.
     MsixSetup,
+    /// Catch-all.
+    Other(&'static str),
 }
 
 /// A live RTL8125 / RTL8125B 2.5 GbE controller. Holds the MMIO
@@ -549,7 +554,14 @@ pub struct RtlNic {
     /// Live MSI-X table — kept alive so the device's MSI-X enable
     /// stays sticky.
     msix: Option<narf_bus::MsixTable>,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for RtlNic {}
+unsafe impl Sync for RtlNic {}
 
 impl core::fmt::Debug for RtlNic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -751,7 +763,10 @@ impl RtlNic {
             mmio.write8(REG_9346CR, EEM_NORMAL);
         }
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let rtl = Arc::new(Self {
             mmio,
             tx_ring,
             tx_pool,
@@ -764,7 +779,14 @@ impl RtlNic {
             link_up,
             irq_vector: None,
             msix: None,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(rtl.clone(), rx_prod, tx_cons);
+
+        Ok(Arc::try_unwrap(rtl).map_err(|_| NicError::NoMemory)?)
     }
 
     /// Bring up MSI-X with a single vector wired to MSI-X table
@@ -965,7 +987,7 @@ impl RtlNic {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<RtlNic>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<RtlNic>>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
@@ -988,11 +1010,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller-authority over the device for the duration of
     // bring_up.
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
-        Ok(d) => d,
+        Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+
+    {
+        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut RtlNic) };
+        *d.rx_ipc_ring.lock() = Some(rx_cons);
+        *d.tx_ipc_ring.lock() = Some(tx_prod);
+    }
+
+    *CONTROLLER.lock() = Some(dev.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("rtl8125"),
         kind: narf_drivers::BoundKind::Net,
@@ -1000,8 +1033,58 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, Rtl8125Nic);
+    }
+
+    // Spawn pumps
+    spawn_pumps(dev, rx_prod, tx_cons);
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<RtlNic>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        rtl8125_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        rtl8125_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn rtl8125_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    loop {
+        if let Some(pkt) = device.receive() {
+            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, pkt.len() as u32);
+            frame.payload_mut().copy_from_slice(&pkt);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+
+async fn rtl8125_tx_pump(device: Arc<RtlNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.transmit(frame.payload());
+    }
+}
+
+
 
 /// Register a PCI match-table entry per supported device id. Realtek
 /// keeps the IDs distinct between RTL8125 and RTL8125B even though
@@ -1020,17 +1103,85 @@ pub fn register_pci_driver() {
 }
 
 /// `true` once `probe` has installed a controller.
+#[derive(Debug)]
+pub struct Rtl8125Nic;
+
+impl narf_net::Interface for Rtl8125Nic {
+    fn name(&self) -> &str {
+        "rtl8125"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
+impl crate::HwNic for Rtl8125Nic {
+    fn name(&self) -> &'static str {
+        "rtl8125"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::RealtekRtl8168
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::NONE
+    }
+    fn ring_capacity(&self) -> usize {
+        RING_LEN
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        <Self as narf_net::Interface>::rx_ring(self)
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        <Self as narf_net::Interface>::tx_ring(self)
+    }
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
 /// Test-side accessor: run `f` against the probed controller.
 pub fn with_controller<R>(f: impl FnOnce(&RtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
 
 /// Mutable accessor — used by tests that want to switch on MSI-X
 /// after probe.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
 }

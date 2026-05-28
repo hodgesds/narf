@@ -22,11 +22,14 @@
 use core::fmt;
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 use alloc::vec::Vec;
 
@@ -199,7 +202,7 @@ pub fn is_initializing(raw: &[u8; INIT_SEGMENT_LEN]) -> bool {
 
 // ── Driver state ───────────────────────────────────────────────────
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mlx5Error {
     BarMapFailed,
     InitTimeout,
@@ -213,6 +216,10 @@ pub enum Mlx5Error {
     CmdBuild(CmdError),
     /// Stage 3: firmware completed the CQE with a non-OK status.
     CmdFailed(CmdError),
+    /// Memory allocation failed.
+    NoMemory,
+    /// Catch-all.
+    Other(&'static str),
     /// Stage 7: caller-supplied EQ parameters were invalid.
     EqBuild(eq::EqError),
     /// Stage 8: caller-supplied CQ parameters were invalid.
@@ -232,6 +239,32 @@ pub enum Mlx5Error {
     MkeyBuild(mkey::MkeyError),
     /// Stage 14: caller-supplied RQT parameters were invalid.
     RqtBuild(steering::RqtError),
+}
+
+impl narf_net::Interface for Mlx5Hca {
+    fn name(&self) -> &str {
+        "mlx5"
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.nic_state().mac
+    }
+    fn mtu(&self) -> u32 {
+        let m = self.nic_state().mtu;
+        if m == 0 {
+            1500
+        } else {
+            m
+        }
+    }
+    fn link_up(&self) -> bool {
+        self.nic_state().link_up
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ipc_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ipc_ring
+    }
 }
 
 /// Stage 7 + 15: live-EQ bookkeeping. Holds the FW-assigned
@@ -331,7 +364,14 @@ pub struct Mlx5Hca {
     uar_base: u64,
     /// Stage 12: cached MAC + MTU from the last `QUERY_NIC_VPORT_CONTEXT`.
     nic_state: IrqSafeSpinLock<NicCachedState>,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for Mlx5Hca {}
+unsafe impl Sync for Mlx5Hca {}
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NicCachedState {
@@ -418,7 +458,10 @@ impl Mlx5Hca {
         let cmdq_phys = cmdq.phys_addr().raw();
         program_cmdq_registers(&mmio, cmdq_phys, STAGE3_CMDQ_LOG_SIZE);
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let hca = Arc::new(Self {
             mmio,
             segment,
             cmdq,
@@ -431,7 +474,14 @@ impl Mlx5Hca {
             qps: IrqSafeSpinLock::new(Vec::new()),
             uar_base: UAR_BASE_DEFAULT,
             nic_state: IrqSafeSpinLock::new(NicCachedState::default()),
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(hca.clone(), rx_prod, tx_cons);
+
+        Ok(Arc::try_unwrap(hca).map_err(|_| Mlx5Error::NoMemory)?)
     }
 
     /// Stage 12: refresh the cached MAC + MTU off the live HCA.
@@ -457,14 +507,14 @@ impl Mlx5Hca {
     /// re-runs the NOP and overwrites the stored result.
     pub fn run_nop_selftest(&mut self) -> Result<(), Mlx5Error> {
         let r = self.issue_command_inline(CmdOp::Nop, 0, &[]).map(|_| ());
-        self.nop_selftest = Some(r);
+        self.nop_selftest = Some(r.clone());
         r
     }
 
     /// Latest stored NOP self-test outcome, or `None` if it was
     /// never run.
     pub fn nop_selftest(&self) -> Option<Result<(), Mlx5Error>> {
-        self.nop_selftest
+        self.nop_selftest.clone()
     }
 
     /// Issue an inline-mode command (≤8 B input, ≤8 B output) to slot
@@ -1346,8 +1396,50 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, Mlx5NetIface);
+    }
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<Mlx5Hca>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        mlx5_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        mlx5_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn mlx5_rx_pump(_device: Arc<Mlx5Hca>, mut _rx_prod: Producer<Frame, RX_RING_N>) {
+    // TODO: implement mlx5 RX path (Stage 15+)
+    loop {
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn mlx5_tx_pump(_device: Arc<Mlx5Hca>, mut _tx_cons: Consumer<Frame, TX_RING_N>) {
+    // TODO: implement mlx5 TX path (Stage 15+)
+    loop {
+        narf_scheduler::yield_now().await;
+    }
+}
+
+
 
 /// Register the driver against every ConnectX-4..6 device id we
 /// recognise. One match per id pair so each is independently
@@ -1386,6 +1478,56 @@ pub fn with_controller<R>(f: impl FnOnce(&Mlx5Hca) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
+// ── Mlx5NetIface: lightweight ZST for narf-net registry ───────────
+//
+// `Mlx5Hca` owns firmware objects and can't be cloned cheaply.
+// `Mlx5NetIface` is a zero-sized sentinel that delegates to the
+// module-level `CONTROLLER` static, following the `Rtl8139Nic` pattern.
+
+#[derive(Debug)]
+pub struct Mlx5NetIface;
+
+impl narf_net::Interface for Mlx5NetIface {
+    fn name(&self) -> &str {
+        "mlx5"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.nic_state().mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        with_controller(|c| {
+            let m = c.nic_state().mtu;
+            if m == 0 { 1500 } else { m }
+        })
+        .unwrap_or(1500)
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.nic_state().link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
 // ── Stage 12: HwNic trait impl ─────────────────────────────────────
 
 impl crate::HwNic for Mlx5Hca {
@@ -1414,5 +1556,12 @@ impl crate::HwNic for Mlx5Hca {
     }
     fn ring_capacity(&self) -> usize {
         1 << 8
+    }
+
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx_ipc_ring
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx_ipc_ring
     }
 }

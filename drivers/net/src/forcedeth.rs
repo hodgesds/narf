@@ -94,6 +94,9 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -391,7 +394,14 @@ pub struct ForcedethNic {
     /// Linux carries this in `np->txrxctl_bits` so every write to
     /// REG_TX_RX_CONTROL can OR in the persistent state.
     txrxctl_bits: u32,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for ForcedethNic {}
+unsafe impl Sync for ForcedethNic {}
 
 impl core::fmt::Debug for ForcedethNic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -628,7 +638,10 @@ impl ForcedethNic {
             mmio.write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
         }
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let nic = Arc::new(Self {
             mmio,
             tx_ring,
             tx_pool,
@@ -640,7 +653,14 @@ impl ForcedethNic {
             link_up,
             phy_addr,
             txrxctl_bits,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(nic.clone(), rx_prod, tx_cons);
+
+        Ok(Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)?)
     }
 
     /// Transmit a single Ethernet frame, polled. Frame must be in
@@ -852,7 +872,7 @@ fn mii_rw(
 
 // ── Driver-match registration ───────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<ForcedethNic>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<ForcedethNic>>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent.
 pub fn probe(
@@ -877,11 +897,22 @@ pub fn probe(
 
     // SAFETY: caller-authority over the device for the duration of
     // bring_up.
-    let dev = match unsafe { ForcedethNic::bring_up(&device, &cap) } {
-        Ok(d) => d,
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+    let nic = match unsafe { ForcedethNic::bring_up(&device, &cap) } {
+        Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+
+    {
+        let d = unsafe { &mut *(Arc::as_ptr(&nic) as *mut ForcedethNic) };
+        *d.rx_ipc_ring.lock() = Some(rx_cons);
+        *d.tx_ipc_ring.lock() = Some(tx_prod);
+    }
+
+    *CONTROLLER.lock() = Some(nic.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -889,8 +920,58 @@ pub fn probe(
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, ForcedethHwNic);
+    }
+
+    // Spawn pumps
+    spawn_pumps(nic, rx_prod, tx_cons);
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<ForcedethNic>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        forcedeth_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        forcedeth_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    loop {
+        if let Some(pkt) = device.receive() {
+            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, pkt.len() as u32);
+            frame.payload_mut().copy_from_slice(&pkt);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+
+async fn forcedeth_tx_pump(device: Arc<ForcedethNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.transmit(frame.payload());
+    }
+}
+
+
 
 /// Register the driver against every supported nForce device id.
 pub fn register_pci_driver() {
@@ -936,19 +1017,101 @@ fn name_for(did: u16) -> &'static str {
 }
 
 /// `true` once `probe` has installed a controller.
+#[derive(Debug)]
+pub struct ForcedethHwNic;
+
+impl narf_net::Interface for ForcedethHwNic {
+    fn name(&self) -> &str {
+        "eth6"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
+impl crate::HwNic for ForcedethHwNic {
+    fn name(&self) -> &'static str {
+        "eth6" // TODO: dynamic naming
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::IntelIgb // TODO: Add Forcedeth to NicModel
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::NONE
+    }
+    fn ring_capacity(&self) -> usize {
+        RING_LEN as usize
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
 /// Test-side accessor: run `f` against the probed controller.
 pub fn with_controller<R>(f: impl FnOnce(&ForcedethNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
 
 /// Mutable accessor — used by tests that need to drive PHY state
 /// refresh.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut ForcedethNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("ForcedethNic static has multiple owners")))
 }
 
 // ── Smoke tests ─────────────────────────────────────────────────────

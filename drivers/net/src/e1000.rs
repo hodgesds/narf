@@ -59,11 +59,14 @@
 
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
+use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 // ── PCI device IDs we recognise ─────────────────────────────────────
 //
@@ -452,6 +455,8 @@ pub enum E1000Error {
     /// Management Engine never released the PHY. Bring-up gives up
     /// rather than risk a wedged PHY register read.
     PhyOwnershipTimeout,
+    /// Catch-all.
+    Other(&'static str),
 }
 
 /// `true` for PCH (I217 / I218 / I219) silicon, where the Intel ME
@@ -680,7 +685,14 @@ pub struct E1000 {
     /// on QEMU (no ME) and on real silicon where the ME is
     /// disabled in BIOS.
     pub me_active: bool,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for E1000 {}
+unsafe impl Sync for E1000 {}
 
 impl core::fmt::Debug for E1000 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -952,7 +964,10 @@ impl E1000 {
             release_phy_swflag(&mmio, phy_owned);
         }
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let e1000 = Arc::new(Self {
             mmio,
             tx_ring,
             tx_pool,
@@ -966,7 +981,14 @@ impl E1000 {
             irq_vector,
             pch_part,
             me_active,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(e1000.clone(), rx_prod, tx_cons);
+
+        Ok(Arc::try_unwrap(e1000).map_err(|_| E1000Error::Other("Arc unwrap failed"))?)
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT
@@ -1249,7 +1271,7 @@ impl E1000 {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<E1000>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<E1000>>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -1267,11 +1289,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over device.
     let dev = match unsafe { E1000::bring_up(&device, &cap) } {
-        Ok(d) => d,
+        Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    let mac = dev.mac;
-    *CONTROLLER.lock() = Some(dev);
+    *CONTROLLER.lock() = Some(dev.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -1285,10 +1307,60 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // frames off the NIC ring directly while spinning, since the
     // spawned RX-pump task can't run while a syscall is parked
     // in `responsive_spin_until`.
-    narf_net::iface::register("eth0", mac, e1000_send_frame);
+    narf_net::iface::register("eth0", dev.mac, e1000_send_frame);
     narf_net::iface::install_rx_drain(rx_pump_step);
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, E1000Nic);
+    }
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<E1000>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        e1000_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        e1000_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = device.rx_recv(&mut buf);
+        if n > 0 {
+            // Push to network stack.
+            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, n as u32);
+            frame.payload_mut().copy_from_slice(&buf[..n]);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn e1000_tx_pump(device: Arc<E1000>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.tx(frame.payload());
+    }
+}
+
+
+
 
 /// SendFn registered with `narf_net::iface` at probe time. Routes
 /// the kernel-side TCP stack's outbound frames through E1000::tx.
@@ -1519,12 +1591,80 @@ fn name_for(did: u16) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+pub struct E1000Nic;
+
+impl narf_net::Interface for E1000Nic {
+    fn name(&self) -> &str {
+        "eth0"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
+impl crate::HwNic for E1000Nic {
+    fn name(&self) -> &'static str {
+        "eth0"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::IntelE1000
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM
+    }
+    fn ring_capacity(&self) -> usize {
+        RX_RING_LEN
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        <Self as narf_net::Interface>::rx_ring(self)
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        <Self as narf_net::Interface>::tx_ring(self)
+    }
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
 pub fn with_controller<R>(f: impl FnOnce(&E1000) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
 
 /// IRQ-driven RX. Constructs the `wait_for_irq` future *before*

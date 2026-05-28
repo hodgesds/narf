@@ -36,11 +36,14 @@
 
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
+use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
@@ -188,6 +191,8 @@ pub enum IgcError {
     BarMapFailed,
     ResetTimeout,
     QueueTooSmall,
+    /// Catch-all.
+    Other(&'static str),
 }
 
 /// MMIO base of the IRQ-attached IGC, shared with the static ISR so
@@ -305,6 +310,8 @@ pub struct Igc {
     /// IDT vector bound to the device's MSI-X table[0]. `None`
     /// means we fell back to polled-only completion.
     pub irq_vector: Option<u8>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
 impl core::fmt::Debug for Igc {
@@ -325,7 +332,7 @@ impl Igc {
     pub unsafe fn bring_up(
         device: &BusDevice,
         cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Self, IgcError> {
+    ) -> Result<Arc<Self>, IgcError> {
         // SAFETY: caller-asserted.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IgcError::BarMapFailed)?;
 
@@ -500,7 +507,10 @@ impl Igc {
             // polling). No PCI Command write needed here.
         }
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let igc = Arc::new(Self {
             mmio,
             mac,
             tx_ring_buf,
@@ -512,7 +522,14 @@ impl Igc {
             ready: true,
             _msix: msix,
             irq_vector,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(igc.clone(), rx_prod, tx_cons);
+
+        Ok(igc)
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT vector
@@ -664,6 +681,41 @@ impl Igc {
 #[derive(Debug)]
 pub struct IgcNic;
 
+impl narf_net::Interface for IgcNic {
+    fn name(&self) -> &str {
+        "igc"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac()).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up()).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
 impl crate::HwNic for IgcNic {
     fn name(&self) -> &'static str {
         "igc"
@@ -681,16 +733,22 @@ impl crate::HwNic for IgcNic {
         crate::NicModel::IntelIgb
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::NONE
+        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM
     }
     fn ring_capacity(&self) -> usize {
         TX_RING_LEN
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        <Self as narf_net::Interface>::rx_ring(self)
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        <Self as narf_net::Interface>::tx_ring(self)
     }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Igc>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Igc>>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -717,6 +775,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, IgcNic);
+    }
+
     Ok(())
 }
 
@@ -782,5 +850,41 @@ pub fn is_probed() -> bool {
 }
 
 pub fn with_controller<R>(f: impl FnOnce(&Igc) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
+}
+
+fn spawn_pumps(
+    device: Arc<Igc>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        igc_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        igc_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = device.rx(&mut buf);
+        if n > 0 {
+            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, n as u32);
+            frame.payload_mut().copy_from_slice(&buf[..n]);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+async fn igc_tx_pump(device: Arc<Igc>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.tx(frame.payload());
+    }
 }

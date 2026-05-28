@@ -15,6 +15,7 @@ path = "src/lib.rs"
 narf-lib          = { path = "../../lib" }
 narf-capabilities = { path = "../../capabilities" }
 narf-io           = { path = "../../io" }
+narf-ipc          = { path = "../../ipc" }
 narf-net          = { path = "../../net" }
 narf-bus          = { path = "../../bus" }
 narf-console      = { path = "../../console" }

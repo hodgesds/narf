@@ -36,6 +36,9 @@ extern crate alloc;
 use core::fmt::Write as _;
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -341,7 +344,14 @@ pub struct Tg3Nic {
     /// True iff `tg3_chip_reset` ran (Stage 1+). Used by tests that
     /// want to detect "Stage-0 fallback" probe paths.
     pub reset_done: bool,
+
+    // IPC integration
+    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+
+unsafe impl Send for Tg3Nic {}
+unsafe impl Sync for Tg3Nic {}
 
 impl core::fmt::Debug for Tg3Nic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -527,7 +537,10 @@ impl Tg3Nic {
             TX_RING_LEN,
         );
 
-        Ok(Self {
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
+        let tg3 = Arc::new(Self {
             mmio,
             tx_ring,
             tx_pool,
@@ -539,7 +552,14 @@ impl Tg3Nic {
             device_id: device.id.device,
             link_up,
             reset_done,
-        })
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        });
+
+        // Spawn pumps
+        spawn_pumps(tg3.clone(), rx_prod, tx_cons);
+
+        Ok(Arc::try_unwrap(tg3).map_err(|_| NicError::NoMemory)?)
     }
 
     /// Perform the BCM57xx chip reset sequence — `GRC_MISC_CFG.CORECLK_RESET`
@@ -873,7 +893,7 @@ impl Tg3Nic {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Tg3Nic>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Tg3Nic>>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
@@ -893,11 +913,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: caller-authority over the device.
+    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+
     let dev = match unsafe { Tg3Nic::bring_up(&device, &cap) } {
-        Ok(d) => d,
+        Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+
+    {
+        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Tg3Nic) };
+        *d.rx_ipc_ring.lock() = Some(rx_cons);
+        *d.tx_ipc_ring.lock() = Some(tx_prod);
+    }
+
+    *CONTROLLER.lock() = Some(dev.clone());
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -905,8 +936,58 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Stage-4 registry (cap-gated)
+    let auth = match narf_net::trusted_net_authority() {
+        Some(a) => a.derive().ok(),
+        None => None,
+    };
+    if let Some(auth) = auth {
+        let _ = narf_net::registry().register(&auth, Tg3HwNic);
+    }
+
+    // Spawn pumps
+    spawn_pumps(dev, rx_prod, tx_cons);
+
     Ok(())
 }
+
+fn spawn_pumps(
+    device: Arc<Tg3Nic>,
+    rx_prod: Producer<Frame, RX_RING_N>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+) {
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        tg3_rx_pump(d1, rx_prod).await;
+    });
+
+    let d2 = device;
+    narf_scheduler::spawn(async move {
+        tg3_tx_pump(d2, tx_cons).await;
+    });
+}
+
+async fn tg3_rx_pump(device: Arc<Tg3Nic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    loop {
+        if let Some(pkt) = device.receive() {
+            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let mut frame = Frame::new(dma_buf, pkt.len() as u32);
+            frame.payload_mut().copy_from_slice(&pkt);
+            let _ = rx_prod.send(frame).await;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+
+async fn tg3_tx_pump(device: Arc<Tg3Nic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        let _ = device.transmit(frame.payload());
+    }
+}
+
+
 
 /// Register the driver against every Broadcom device id we recognise.
 /// Each match carries a unique name (driver re-registration is
@@ -957,13 +1038,95 @@ fn name_for(did: u16) -> &'static str {
 }
 
 /// `true` once `probe` has installed a controller.
+#[derive(Debug)]
+pub struct Tg3HwNic;
+
+impl narf_net::Interface for Tg3HwNic {
+    fn name(&self) -> &str {
+        "eth4"
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
+impl crate::HwNic for Tg3HwNic {
+    fn name(&self) -> &'static str {
+        "eth4" // TODO: dynamic naming
+    }
+    fn mac(&self) -> [u8; 6] {
+        with_controller(|c| c.mac).unwrap_or([0; 6])
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::IntelIgb // TODO: Add BroadcomTg3 to NicModel
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::NONE
+    }
+    fn ring_capacity(&self) -> usize {
+        TX_RING_LEN
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.rx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        with_controller(|c| {
+            let mut r = RING.lock();
+            if r.is_none() {
+                *r = c.tx_ipc_ring.lock().take();
+            }
+        });
+        &RING
+    }
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
 /// Test-side accessor: run `f` against the probed controller.
 pub fn with_controller<R>(f: impl FnOnce(&Tg3Nic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
 
 // ── Smoke tests ────────────────────────────────────────────────────
