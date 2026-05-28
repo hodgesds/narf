@@ -1286,3 +1286,143 @@ fn smoke_sec2_cmd_ids_pinned() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvidia/sec2", smoke_sec2_cmd_ids_pinned);
+
+// ────────────────────────────────────────────────────────────────
+// Fence — monotonic completion tracking
+// ────────────────────────────────────────────────────────────────
+
+use crate::fence::{
+    Fence, SEMAPHOREA, SEMAPHOREB, SEMAPHOREC, SEMAPHORED, SEMAPHORED_ACQUIRE_GEQ,
+    SEMAPHORED_RELEASE,
+};
+
+fn smoke_fence_seqno_allocates_monotonically() -> TestResult {
+    let f = Fence::new(0x1000_0000);
+    let a = f.alloc_seqno();
+    let b = f.alloc_seqno();
+    let c = f.alloc_seqno();
+    if a >= b || b >= c {
+        return TestResult::Fail("seqno must monotonically increase");
+    }
+    if a != 1 || b != 2 || c != 3 {
+        return TestResult::Fail("first seqnos should be 1, 2, 3");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/fence", smoke_fence_seqno_allocates_monotonically);
+
+fn smoke_fence_observe_signalled_monotonic_max() -> TestResult {
+    let f = Fence::new(0);
+    let _ = f.alloc_seqno(); // 1
+    let _ = f.alloc_seqno(); // 2
+    f.observe_signalled(2);
+    if !f.is_signalled(1) || !f.is_signalled(2) {
+        return TestResult::Fail("1 and 2 should be signalled");
+    }
+    if f.is_signalled(3) {
+        return TestResult::Fail("3 should not be signalled yet");
+    }
+    // Out-of-order delivery: observing a lower seqno must not
+    // regress the watermark.
+    f.observe_signalled(1);
+    if !f.is_signalled(2) {
+        return TestResult::Fail("watermark cannot regress");
+    }
+    if f.highwater() != 2 {
+        return TestResult::Fail("highwater stays at 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/fence",
+    smoke_fence_observe_signalled_monotonic_max
+);
+
+fn smoke_fence_semaphore_method_offsets_match_class_header() -> TestResult {
+    if SEMAPHOREA != 0x0010 {
+        return TestResult::Fail("SEMAPHOREA at method 0x10");
+    }
+    if SEMAPHOREB != 0x0014 {
+        return TestResult::Fail("SEMAPHOREB at method 0x14");
+    }
+    if SEMAPHOREC != 0x0018 {
+        return TestResult::Fail("SEMAPHOREC at method 0x18");
+    }
+    if SEMAPHORED != 0x001C {
+        return TestResult::Fail("SEMAPHORED at method 0x1C");
+    }
+    if SEMAPHORED_RELEASE != 1 {
+        return TestResult::Fail("RELEASE opcode = 1");
+    }
+    if SEMAPHORED_ACQUIRE_GEQ != 4 {
+        return TestResult::Fail("ACQUIRE_GEQ opcode = 4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/fence",
+    smoke_fence_semaphore_method_offsets_match_class_header
+);
+
+// ────────────────────────────────────────────────────────────────
+// Flip — page flipping + VBLANK
+// ────────────────────────────────────────────────────────────────
+
+use crate::flip::{FlipQueue, FlipRequest, HEAD_INTR_STATUS, HEAD_INTR_VBLANK};
+
+fn smoke_flip_enqueue_dequeue_round_trip() -> TestResult {
+    let q = FlipQueue::new();
+    if q.has_pending() {
+        return TestResult::Fail("fresh queue must not be pending");
+    }
+    let r = FlipRequest {
+        fb_phys: 0x2000_0000,
+        pitch: 1920 * 4,
+        format: 0x4,
+        seqno: 0x1234_5678_9ABC_DEF0,
+    };
+    if !q.enqueue(&r) {
+        return TestResult::Fail("first enqueue must succeed");
+    }
+    if !q.has_pending() {
+        return TestResult::Fail("queue has a pending flip");
+    }
+    let r2 = FlipRequest {
+        fb_phys: 0x3000_0000,
+        pitch: 1920 * 4,
+        format: 0x4,
+        seqno: 0xDEAD_BEEF_F00D_BEEF,
+    };
+    if q.enqueue(&r2) {
+        return TestResult::Fail("second enqueue must reject while pending");
+    }
+    match q.on_vblank(42) {
+        Some(s) if s == 0x1234_5678_9ABC_DEF0 => {}
+        _ => return TestResult::Fail("on_vblank should return enqueued seqno"),
+    }
+    if q.vblank_counter() != 42 {
+        return TestResult::Fail("vblank_counter should advance");
+    }
+    if q.has_pending() {
+        return TestResult::Fail("queue should be drained");
+    }
+    if q.on_vblank(43).is_some() {
+        return TestResult::Fail("idle VBLANK should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/flip", smoke_flip_enqueue_dequeue_round_trip);
+
+fn smoke_flip_head_vblank_interrupt_bit_layout() -> TestResult {
+    if HEAD_INTR_VBLANK != 1 << 4 {
+        return TestResult::Fail("VBLANK bit at position 4");
+    }
+    if HEAD_INTR_STATUS != 0x0000_0090 {
+        return TestResult::Fail("HEAD IRQ status offset 0x90");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/flip",
+    smoke_flip_head_vblank_interrupt_bit_layout
+);
