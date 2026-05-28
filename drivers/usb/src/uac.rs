@@ -618,6 +618,69 @@ pub fn decode_sampling_freq(buf: &[u8]) -> Option<u32> {
     Some((buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16))
 }
 
+// ── Feature Unit control requests (§5.2.2.4) ───────────────────────
+//
+// The host programs Feature Unit controls (volume, mute, bass, …)
+// via class-specific requests on the AC interface:
+//
+//   bmRequestType = 0x21 (host→device, class, interface)
+//   bRequest = SET_CUR (0x01) / GET_CUR (0x81) / GET_MIN (0x82) / GET_MAX (0x83)
+//   wValue = (ControlSelector << 8) | LogicalChannelNumber
+//   wIndex = (FeatureUnitID << 8) | InterfaceNumber
+//   wLength = 1 (mute) or 2 (volume / bass / treble)
+//
+// Volume is a signed 16-bit fixed-point value in 1/256 dB units
+// (UAC1 §5.2.2.4.3). Mute is a single byte: 0 = unmuted, 1 = muted.
+
+/// Feature Unit control selector codes (§A.10.2).
+pub const FU_CS_MUTE: u8 = 0x01;
+pub const FU_CS_VOLUME: u8 = 0x02;
+pub const FU_CS_BASS: u8 = 0x03;
+pub const FU_CS_MID: u8 = 0x04;
+pub const FU_CS_TREBLE: u8 = 0x05;
+
+/// Logical channel number 0 = master; 1..=N = per-channel.
+pub const CHANNEL_MASTER: u8 = 0x00;
+
+/// Encode the `wValue` field for a Feature Unit control request:
+/// `(control_selector << 8) | channel`.
+pub const fn fu_wvalue(cs: u8, channel: u8) -> u16 {
+    ((cs as u16) << 8) | (channel as u16)
+}
+
+/// Encode the `wIndex` field: `(feature_unit_id << 8) | iface_number`.
+pub const fn fu_windex(unit_id: u8, iface: u8) -> u16 {
+    ((unit_id as u16) << 8) | (iface as u16)
+}
+
+/// Encode a volume SET_CUR data payload (2-byte signed LE).
+///
+/// `db_256` is the desired volume in 1/256 dB units (UAC1 §5.2.2.4.3).
+/// For example −6 dB = −1536 (i.e. −6 × 256). The silent minimum
+/// reported by GET_MIN is typically 0x8000 (= −128 dB) and 0x0000 is
+/// 0 dB (unity gain); headsets often top out at 0x0000.
+pub fn encode_volume(db_256: i16) -> [u8; 2] {
+    (db_256 as u16).to_le_bytes()
+}
+
+/// Decode a volume GET_CUR / GET_MIN / GET_MAX response (2-byte LE).
+pub fn decode_volume(buf: &[u8]) -> Option<i16> {
+    if buf.len() < 2 {
+        return None;
+    }
+    Some(i16::from_le_bytes([buf[0], buf[1]]))
+}
+
+/// Encode a mute SET_CUR payload. `mute = true` silences the channel.
+pub fn encode_mute(mute: bool) -> [u8; 1] {
+    [mute as u8]
+}
+
+/// Decode a mute GET_CUR response. Returns `None` if buf is empty.
+pub fn decode_mute(buf: &[u8]) -> Option<bool> {
+    buf.first().map(|&b| b != 0)
+}
+
 // ── PCM frame ring ─────────────────────────────────────────────────
 //
 // Holds enqueued PCM samples for playback or just-captured samples

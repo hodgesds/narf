@@ -258,6 +258,237 @@ fn smoke_msc_attach_via_xhci_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_attach_via_xhci_qemu);
 
+// ── MSC BBB protocol codec unit tests ──────────────────────────────
+
+/// CBW encode round-trip: encode a READ(10) CBW and verify every
+/// field at the byte level (dCBWSignature, dCBWTag,
+/// dCBWDataTransferLength, bmCBWFlags direction bit, bCBWCBLength,
+/// and CBWCB bytes).
+fn smoke_msc_cbw_encode_round_trip() -> TestResult {
+    use crate::msc::{encode_cbw, CBW_SIGNATURE};
+
+    // READ(10) on LBA 0x01020304, 3 blocks of 512 bytes each.
+    let cb: [u8; 10] = [0x28, 0, 0x01, 0x02, 0x03, 0x04, 0, 0x00, 0x03, 0];
+    let tag: u32 = 0xDEAD_BEEF;
+    let data_len: u32 = 3 * 512;
+    let cbw = encode_cbw(tag, data_len, true, &cb);
+
+    let sig = u32::from_le_bytes([cbw[0], cbw[1], cbw[2], cbw[3]]);
+    if sig != CBW_SIGNATURE {
+        return TestResult::Fail("dCBWSignature wrong");
+    }
+    let got_tag = u32::from_le_bytes([cbw[4], cbw[5], cbw[6], cbw[7]]);
+    if got_tag != tag {
+        return TestResult::Fail("dCBWTag mismatch");
+    }
+    let got_len = u32::from_le_bytes([cbw[8], cbw[9], cbw[10], cbw[11]]);
+    if got_len != data_len {
+        return TestResult::Fail("dCBWDataTransferLength mismatch");
+    }
+    if cbw[12] & 0x80 == 0 {
+        return TestResult::Fail("bmCBWFlags IN bit not set");
+    }
+    if cbw[13] != 0 {
+        return TestResult::Fail("bCBWLUN non-zero");
+    }
+    if cbw[14] != 10 {
+        return TestResult::Fail("bCBWCBLength wrong");
+    }
+    if cbw[15..25] != cb[..] {
+        return TestResult::Fail("CBWCB contents wrong");
+    }
+    if cbw[25..31].iter().any(|b| *b != 0) {
+        return TestResult::Fail("CBW trailing bytes non-zero");
+    }
+    // OUT direction: bmCBWFlags bit 7 must be clear.
+    let cbw_out = encode_cbw(1, 512, false, &cb);
+    if cbw_out[12] & 0x80 != 0 {
+        return TestResult::Fail("bmCBWFlags OUT direction bit set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_cbw_encode_round_trip);
+
+/// CSW decode: good (0), failed (1), and phase-error (2) statuses all
+/// decode correctly; a bad signature and a truncated buffer are
+/// both rejected.
+fn smoke_msc_csw_decode_variants() -> TestResult {
+    use crate::msc::{decode_csw, CSW_SIGNATURE};
+
+    let make_csw = |tag: u32, residue: u32, status: u8| -> [u8; 13] {
+        let mut buf = [0u8; 13];
+        buf[0..4].copy_from_slice(&CSW_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&tag.to_le_bytes());
+        buf[8..12].copy_from_slice(&residue.to_le_bytes());
+        buf[12] = status;
+        buf
+    };
+
+    // Good status
+    let csw_ok = make_csw(42, 0, 0);
+    let f = match decode_csw(&csw_ok) {
+        Some(f) => f,
+        None => return TestResult::Fail("decode_csw rejected good CSW"),
+    };
+    if f.tag != 42 || f.residue != 0 || f.status != 0 {
+        return TestResult::Fail("good CSW field mismatch");
+    }
+
+    // Failed status with non-zero residue
+    let csw_fail = make_csw(99, 512, 1);
+    let f = match decode_csw(&csw_fail) {
+        Some(f) => f,
+        None => return TestResult::Fail("decode_csw rejected fail CSW"),
+    };
+    if f.status != 1 || f.residue != 512 || f.tag != 99 {
+        return TestResult::Fail("failed CSW field mismatch");
+    }
+
+    // Phase error status
+    let csw_phase = make_csw(7, 0, 2);
+    let f = match decode_csw(&csw_phase) {
+        Some(f) => f,
+        None => return TestResult::Fail("decode_csw rejected phase-error CSW"),
+    };
+    if f.status != 2 {
+        return TestResult::Fail("phase-error status byte wrong");
+    }
+
+    // Bad signature must return None
+    let mut bad_sig = make_csw(1, 0, 0);
+    bad_sig[0] ^= 0xFF;
+    if decode_csw(&bad_sig).is_some() {
+        return TestResult::Fail("decode_csw accepted bad signature");
+    }
+
+    // Truncated buffer must return None
+    if decode_csw(&csw_ok[..12]).is_some() {
+        return TestResult::Fail("decode_csw accepted 12-byte buffer");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_csw_decode_variants);
+
+/// INQUIRY response decoder: space-padded vendor/product/revision
+/// fields are trimmed; peripheral type and removable bit are correct.
+fn smoke_msc_inquiry_response_decode() -> TestResult {
+    use crate::msc::InquiryData;
+
+    let mut buf = [0x20u8; 36]; // fill with spaces (ASCII)
+    buf[0] = 0x00; // direct-access peripheral type, non-removable flag
+    buf[1] = 0x80; // RMB = 1 (removable)
+    buf[2] = 0x06; // VERSION
+    buf[3] = 0x02; // response data format
+    buf[4] = 0x1F; // additional length
+    buf[8..16].copy_from_slice(b"SanDisk ");
+    buf[16..32].copy_from_slice(b"Ultra USB 3.0   ");
+    buf[32..36].copy_from_slice(b"1.00");
+
+    let d = match InquiryData::from_bytes(&buf) {
+        Some(d) => d,
+        None => return TestResult::Fail("InquiryData::from_bytes returned None"),
+    };
+    if d.peripheral_type != 0 {
+        return TestResult::Fail("peripheral_type wrong");
+    }
+    if !d.removable {
+        return TestResult::Fail("removable bit not set");
+    }
+    if d.vendor != "SanDisk" {
+        return TestResult::Fail("vendor string mismatch");
+    }
+    if d.product != "Ultra USB 3.0" {
+        return TestResult::Fail("product string mismatch");
+    }
+    if d.revision != "1.00" {
+        return TestResult::Fail("revision string mismatch");
+    }
+    // Short buffer must return None
+    if InquiryData::from_bytes(&buf[..35]).is_some() {
+        return TestResult::Fail("InquiryData accepted 35-byte buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_inquiry_response_decode);
+
+/// READ CAPACITY(10) decoder: big-endian last_lba and block_size are
+/// decoded correctly; short buffers are rejected.
+fn smoke_msc_read_capacity10_decode() -> TestResult {
+    use crate::msc::decode_read_capacity10;
+
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
+    buf[4..8].copy_from_slice(&512u32.to_be_bytes());
+    let (block_size, last_lba) = match decode_read_capacity10(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_read_capacity10 returned None"),
+    };
+    if block_size != 512 {
+        return TestResult::Fail("block_size wrong");
+    }
+    if last_lba != 0x00FF_FFFF {
+        return TestResult::Fail("last_lba wrong");
+    }
+
+    // 4096-byte blocks
+    let mut buf2 = [0u8; 8];
+    buf2[0..4].copy_from_slice(&0x001F_FFFFu32.to_be_bytes());
+    buf2[4..8].copy_from_slice(&4096u32.to_be_bytes());
+    let (bs2, lba2) = match decode_read_capacity10(&buf2) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_read_capacity10 failed 4K case"),
+    };
+    if bs2 != 4096 || lba2 != 0x001F_FFFF {
+        return TestResult::Fail("4K block-size decode wrong");
+    }
+
+    // Short buffer must return None
+    if decode_read_capacity10(&buf[..7]).is_some() {
+        return TestResult::Fail("decode_read_capacity10 accepted 7-byte buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_read_capacity10_decode);
+
+/// READ(10) and WRITE(10) CDB encoder: opcode, big-endian LBA, and
+/// big-endian transfer-length are in the correct CDB byte positions.
+fn smoke_msc_read_write10_encoder() -> TestResult {
+    use crate::msc::{encode_read10, encode_write10};
+
+    // READ(10) on LBA 0x0102_0304, 7 blocks.
+    let r = encode_read10(0x0102_0304, 7);
+    if r[0] != 0x28 {
+        return TestResult::Fail("READ(10) opcode wrong");
+    }
+    if r[2..6] != [0x01, 0x02, 0x03, 0x04] {
+        return TestResult::Fail("READ(10) LBA bytes wrong");
+    }
+    if r[7..9] != [0x00, 0x07] {
+        return TestResult::Fail("READ(10) nblocks bytes wrong");
+    }
+
+    // WRITE(10) on LBA 0xDEAD_BEEF, 1 block.
+    let w = encode_write10(0xDEAD_BEEF, 1);
+    if w[0] != 0x2A {
+        return TestResult::Fail("WRITE(10) opcode wrong");
+    }
+    if w[2..6] != [0xDE, 0xAD, 0xBE, 0xEF] {
+        return TestResult::Fail("WRITE(10) LBA bytes wrong");
+    }
+    if w[7..9] != [0x00, 0x01] {
+        return TestResult::Fail("WRITE(10) nblocks bytes wrong");
+    }
+
+    // Maximum transfer length 0xFFFF must not overflow.
+    let r_max = encode_read10(0, 0xFFFF);
+    if r_max[7..9] != [0xFF, 0xFF] {
+        return TestResult::Fail("READ(10) max nblocks overflow");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_read_write10_encoder);
+
 // ── HID class-driver descriptor parser + report decode ─────────────
 
 fn smoke_hid_boot_keyboard_parse() -> TestResult {
@@ -1943,6 +2174,133 @@ fn smoke_usb_uac_pcm_ring_wraps_around() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_wraps_around);
+
+// ── UAC1 required smokes (5 per spec) ─────────────────────────────
+//
+// These five tests directly exercise the five coverage points mandated
+// by the USB Audio Class 1.0 driver spec:
+//   1. AC_HEADER decode         (smoke_uac_ac_header_decodes_collection above)
+//   2. INPUT_TERMINAL headphone terminal type
+//   3. FEATURE_UNIT control bitmap (smoke_uac_feature_unit_decodes_per_channel_controls above)
+//   4. FORMAT_TYPE_I 24-bit / 48 kHz / 2-channel
+//   5. Volume SET_CUR / GET_CUR encoder (Feature Unit volume request encoding)
+
+fn smoke_uac_input_terminal_headphone() -> TestResult {
+    use crate::uac::{InputTerminal, TERMINAL_HEADPHONES};
+    // 12 bytes: bLength=12, CS_INTERFACE, INPUT_TERMINAL,
+    // bTerminalID=3, wTerminalType=0x0302 (headphones),
+    // bAssocTerminal=0, bNrChannels=2, wChannelConfig=0x0003,
+    // iChannelNames=0, iTerminal=0
+    let buf = [12u8, 0x24, 0x02, 3, 0x02, 0x03, 0, 2, 0x03, 0x00, 0, 0];
+    let t = InputTerminal::parse(&buf).expect("parse");
+    if t.terminal_type != TERMINAL_HEADPHONES {
+        return TestResult::Fail("headphone terminal type should be 0x0302");
+    }
+    if t.terminal_id != 3 {
+        return TestResult::Fail("terminal_id mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_input_terminal_headphone);
+
+fn smoke_uac_format_type_i_24bit_48k_stereo() -> TestResult {
+    use crate::uac::{FormatTypeI, FORMAT_TYPE_I};
+    // 24-bit / 48 kHz / 2-channel — a typical USB DAC or headset.
+    // bLength=11, CS_INTERFACE, FORMAT_TYPE, bFormatType=TYPE_I,
+    // bNrChannels=2, bSubframeSize=3 (24-bit packed in 3 bytes),
+    // bBitResolution=24, bSamFreqType=1 (discrete),
+    // tSamFreq[0] = 48000 Hz LE 24-bit.
+    let mut buf = alloc::vec![11u8, 0x24, 0x02, FORMAT_TYPE_I, 2, 3, 24, 1];
+    let hz: u32 = 48_000;
+    buf.push((hz & 0xFF) as u8);
+    buf.push(((hz >> 8) & 0xFF) as u8);
+    buf.push(((hz >> 16) & 0xFF) as u8);
+    let f = FormatTypeI::parse(&buf).expect("parse");
+    if f.nr_channels != 2 {
+        return TestResult::Fail("nr_channels should be 2");
+    }
+    if f.subframe_size != 3 {
+        return TestResult::Fail("subframe_size should be 3 (24-bit packed)");
+    }
+    if f.bit_resolution != 24 {
+        return TestResult::Fail("bit_resolution should be 24");
+    }
+    if f.sample_rates != alloc::vec![48_000u32] {
+        return TestResult::Fail("sample_rate should be [48000]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_format_type_i_24bit_48k_stereo);
+
+fn smoke_uac_volume_set_cur_get_cur_encode_decode() -> TestResult {
+    use crate::uac::{
+        decode_mute, decode_volume, encode_mute, encode_volume,
+        fu_windex, fu_wvalue, FU_CS_VOLUME, FU_CS_MUTE, CHANNEL_MASTER,
+        REQ_SET_CUR, REQ_GET_CUR,
+    };
+
+    // ── request-code round-trip ──────────────────────────────────────
+    if REQ_SET_CUR != 0x01 {
+        return TestResult::Fail("SET_CUR must be 0x01 (UAC1 §A.9)");
+    }
+    if REQ_GET_CUR != 0x81 {
+        return TestResult::Fail("GET_CUR must be 0x81 (UAC1 §A.9)");
+    }
+
+    // ── wValue / wIndex helpers ──────────────────────────────────────
+    // Feature unit 4, iface 0, volume master channel.
+    let wv = fu_wvalue(FU_CS_VOLUME, CHANNEL_MASTER);
+    if wv != ((FU_CS_VOLUME as u16) << 8) {
+        return TestResult::Fail("fu_wvalue encoding wrong");
+    }
+    let wi = fu_windex(4, 0);
+    if wi != (4u16 << 8) {
+        return TestResult::Fail("fu_windex encoding wrong");
+    }
+
+    // ── volume SET_CUR payload: −6 dB = −1536 in 1/256 dB units ────
+    let vol_bytes = encode_volume(-1536i16);
+    // −1536 = 0xFA00 LE → [0x00, 0xFA]
+    if vol_bytes != [0x00, 0xFA] {
+        return TestResult::Fail("encode_volume(-1536) LE bytes wrong");
+    }
+    // round-trip
+    match decode_volume(&vol_bytes) {
+        Some(-1536) => {}
+        _ => return TestResult::Fail("decode_volume round-trip for -6 dB failed"),
+    }
+
+    // ── 0 dB = 0 ────────────────────────────────────────────────────
+    let unity = encode_volume(0);
+    if unity != [0x00, 0x00] {
+        return TestResult::Fail("0 dB should encode to [0x00, 0x00]");
+    }
+
+    // ── mute encode/decode ───────────────────────────────────────────
+    let _ = fu_wvalue(FU_CS_MUTE, CHANNEL_MASTER); // reachability
+    if encode_mute(true) != [1u8] {
+        return TestResult::Fail("mute=true must encode to [1]");
+    }
+    if encode_mute(false) != [0u8] {
+        return TestResult::Fail("mute=false must encode to [0]");
+    }
+    if decode_mute(&[1u8]) != Some(true) {
+        return TestResult::Fail("decode_mute([1]) should be Some(true)");
+    }
+    if decode_mute(&[0u8]) != Some(false) {
+        return TestResult::Fail("decode_mute([0]) should be Some(false)");
+    }
+    if decode_mute(&[]).is_some() {
+        return TestResult::Fail("decode_mute([]) must be None");
+    }
+    // truncated volume
+    if decode_volume(&[0u8]).is_some() {
+        return TestResult::Fail("decode_volume([0]) 1-byte buf must be None");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_volume_set_cur_get_cur_encode_decode);
 
 // ── drivers/usb/xhci (iso EP discovery + iso TRB constants) ────────
 //
