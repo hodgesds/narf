@@ -37,8 +37,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use narf_hid::pen::DecodedPen;
 use narf_hid::touchscreen::{DecodedTouchContact, DecodedTouchReport, TouchscreenProfile};
-use narf_input::{push_global, InputEvent, TouchEvent, TouchState};
+use narf_input::{abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent, TouchEvent, TouchState};
 
 /// Maximum simultaneously tracked contacts. Modern touchscreens
 /// ship 5- or 10-finger panels; capping at 10 here costs only
@@ -205,6 +206,126 @@ fn push_touch_event(
     }));
 }
 
+/// Per-device pen state carried between reports.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct PenPumpState {
+    /// Last known in-range state — lets us emit a single
+    /// BTN_TOOL_PEN=0 transition when the pen leaves hover
+    /// range rather than spamming it every report.
+    in_range: bool,
+    /// Last tip state — same dedup logic.
+    tip: bool,
+    /// Last eraser state.
+    eraser: bool,
+}
+
+/// Translate one decoded pen report into the kernel event stream.
+///
+/// Emits:
+/// - `ButtonEvent(BTN_TOOL_PEN, 1)` on in-range entry / `(0)` on exit.
+/// - `ButtonEvent(BTN_TOOL_RUBBER, 1/0)` on eraser transitions.
+/// - `ButtonEvent(BTN_STYLUS, 1/0)` on barrel-button transitions.
+/// - `ButtonEvent(BTN_STYLUS2, 1/0)` on secondary-barrel transitions.
+/// - `AbsoluteEvent(ABS_X)` + `AbsoluteEvent(ABS_Y)` when in range.
+/// - `AbsoluteEvent(ABS_PRESSURE)` when the tip is down and the
+///   profile advertised a pressure field.
+///
+/// Returns the number of events pushed. Reference:
+/// `linux/drivers/hid/hid-input.c` pen/stylus EV_KEY + EV_ABS mapping.
+pub fn pump_pen_report(state: &mut PenPumpState, pen: &DecodedPen) -> usize {
+    let mut pushed = 0usize;
+
+    // BTN_TOOL_PEN / BTN_TOOL_RUBBER — emit only on transition.
+    if pen.in_range != state.in_range || pen.eraser != state.eraser {
+        if pen.in_range {
+            // Tool type: eraser when Invert or Eraser bit set;
+            // otherwise pen tip. Transition: announce new tool type.
+            let tool = if pen.eraser || pen.invert {
+                btn::BTN_TOOL_RUBBER
+            } else {
+                btn::BTN_TOOL_PEN
+            };
+            let _ = push_global(InputEvent::Button(ButtonEvent { code: tool, pressed: true }));
+            pushed += 1;
+            // If the old tool was the other type, release it.
+            if state.in_range {
+                let old_tool = if state.eraser {
+                    btn::BTN_TOOL_RUBBER
+                } else {
+                    btn::BTN_TOOL_PEN
+                };
+                if old_tool != tool {
+                    let _ = push_global(InputEvent::Button(ButtonEvent {
+                        code: old_tool,
+                        pressed: false,
+                    }));
+                    pushed += 1;
+                }
+            }
+        } else {
+            // Pen left range — release whichever tool was active.
+            let old_tool = if state.eraser {
+                btn::BTN_TOOL_RUBBER
+            } else {
+                btn::BTN_TOOL_PEN
+            };
+            let _ = push_global(InputEvent::Button(ButtonEvent {
+                code: old_tool,
+                pressed: false,
+            }));
+            pushed += 1;
+        }
+        state.in_range = pen.in_range;
+        state.eraser = pen.eraser || pen.invert;
+    }
+
+    // Emit X + Y whenever in range.
+    if pen.in_range {
+        let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+            axis: abs::ABS_X,
+            value: pen.x,
+        }));
+        let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+            axis: abs::ABS_Y,
+            value: pen.y,
+        }));
+        pushed += 2;
+    }
+
+    // BTN_TOUCH (expressed as BTN_STYLUS for digitiser tip per
+    // Linux `hid-input.c` mapping): emit on tip transition.
+    if pen.tip != state.tip {
+        let _ = push_global(InputEvent::Button(ButtonEvent {
+            code: btn::BTN_STYLUS,
+            pressed: pen.tip,
+        }));
+        pushed += 1;
+        state.tip = pen.tip;
+    }
+
+    // Barrel (side) button → BTN_STYLUS2.
+    if pen.barrel_button {
+        let _ = push_global(InputEvent::Button(ButtonEvent {
+            code: btn::BTN_STYLUS2,
+            pressed: true,
+        }));
+        pushed += 1;
+    }
+
+    // Pressure — only when tip is down.
+    if pen.tip {
+        if let Some(p) = pen.pressure {
+            let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+                axis: abs::ABS_PRESSURE,
+                value: p,
+            }));
+            pushed += 1;
+        }
+    }
+
+    pushed
+}
+
 /// Log a one-line boot summary describing the touchscreen
 /// profile we just bound, matching the format the task spec
 /// asks for. Called once per device after the descriptor is
@@ -268,4 +389,42 @@ pub fn __build_decoded_for_test(contacts: &[(u8, bool, i32, i32)]) -> DecodedTou
 #[allow(dead_code)]
 fn _force_string_use(s: String) -> String {
     s
+}
+
+#[doc(hidden)]
+pub fn __pump_pen_for_test(state: &mut PenPumpState, pen: &DecodedPen) -> usize {
+    pump_pen_report(state, pen)
+}
+
+#[doc(hidden)]
+pub fn __new_pen_state_for_test() -> PenPumpState {
+    PenPumpState::default()
+}
+
+/// Build a synthetic [`DecodedPen`] for smoke tests.
+/// `(in_range, tip, eraser, barrel, x, y, pressure)`
+#[doc(hidden)]
+pub fn __build_pen_for_test(
+    in_range: bool,
+    tip: bool,
+    eraser: bool,
+    barrel: bool,
+    x: i32,
+    y: i32,
+    pressure: Option<i32>,
+) -> DecodedPen {
+    DecodedPen {
+        in_range,
+        tip,
+        eraser,
+        invert: false,
+        barrel_button: barrel,
+        secondary_barrel_button: false,
+        x,
+        y,
+        pressure,
+        x_tilt_deg: None,
+        y_tilt_deg: None,
+        twist: None,
+    }
 }

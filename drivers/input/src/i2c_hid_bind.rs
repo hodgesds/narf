@@ -373,13 +373,15 @@ async fn pump_task(
     };
     let ptp = narf_hid::ptp::detect(&parsed);
     let touchscreen = narf_hid::touchscreen::detect(&parsed);
+    let pen = narf_hid::pen::detect(&parsed);
     let _ = writeln!(
         narf_console::Writer,
-        "  i2c-hid-pump: {}: descriptor parsed, fields={}, ptp={}, touchscreen={}",
+        "  i2c-hid-pump: {}: descriptor parsed, fields={}, ptp={}, touchscreen={}, pen={}",
         path,
         parsed.fields.len(),
         ptp.is_some(),
         touchscreen.is_some(),
+        pen.is_some(),
     );
 
     if let Some(profile) = &ptp {
@@ -389,6 +391,14 @@ async fn pump_task(
     if let Some(ts_profile) = &touchscreen {
         // One-line boot summary per the touchscreen Stage-0 spec.
         crate::i2c_hid_touch::log_boot_summary(&path, ts_profile);
+    }
+
+    if pen.is_some() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i2c-hid-pump: {}: pen/stylus digitizer detected",
+            path
+        );
     }
 
     let max_input = driver
@@ -406,6 +416,8 @@ async fn pump_task(
     // Per-device touchscreen slot tracker (touchscreen path emits
     // TouchEvent per contact with normalised coordinates).
     let mut touch_state = crate::i2c_hid_touch::TouchPumpState::new();
+    // Per-device pen/stylus state tracker.
+    let mut pen_state = crate::i2c_hid_touch::PenPumpState::default();
 
     loop {
         if irq_wired {
@@ -464,6 +476,16 @@ async fn pump_task(
             {
                 if let Ok(decoded) = narf_hid::touchscreen::decode_input(ts_profile, payload) {
                     crate::i2c_hid_touch::pump_report(ts_profile, &mut touch_state, &decoded);
+                }
+                continue;
+            }
+        }
+        if let Some(pen_profile) = &pen {
+            // Pen report IDs are always non-zero for spec-compliant
+            // devices; the decode rejects mismatched IDs for us.
+            if payload.first() == Some(&pen_profile.input_report_id) {
+                if let Ok(decoded) = narf_hid::pen::decode_input(pen_profile, payload) {
+                    crate::i2c_hid_touch::pump_pen_report(&mut pen_state, &decoded);
                 }
             }
         }
