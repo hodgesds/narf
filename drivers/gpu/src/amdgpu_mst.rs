@@ -314,6 +314,191 @@ impl Topology {
     }
 }
 
+// ── DPCD payload-table commit (live stream activation) ────────────
+//
+// After PayloadTable::allocate reserves a VCPI, the host must:
+//   1. Write the per-VCPI time-slot count into DPCD PAYLOAD_TABLE
+//      registers 0x1C0-0x1FF (PAYLOAD_ALLOCATE_SET + START_TIME_SLOT
+//      + TIME_SLOT_COUNT).
+//   2. Poll DPCD 0x2C0 (PAYLOAD_TABLE_UPDATE_STATUS) for the
+//      VCPI_PAYLOAD_TABLE_UPDATED bit.
+//   3. Send the ALLOCATE_PAYLOAD MST sideband message over AUX to
+//      the branch+sink pair so the branch updates its own table.
+//   4. Send the ENABLE_STREAM SB message — flips the branch from
+//      "VCPI reserved" → "VCPI carrying real pixels".
+//
+// References (post 2026-05-20 GPL relicense):
+//   - drivers/gpu/drm/display/drm_dp_mst_topology.c (drm_dp_mst_*
+//     primitives — the canonical commit flow)
+//   - drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_mst.c
+//   - include/drm/display/drm_dp.h:778-987 (DPCD addresses)
+
+/// DPCD addresses for the per-VCPI commit registers.
+pub const DPCD_PAYLOAD_ALLOCATE_SET: u16 = 0x01C0;
+pub const DPCD_PAYLOAD_ALLOCATE_START_TIME_SLOT: u16 = 0x01C1;
+pub const DPCD_PAYLOAD_ALLOCATE_TIME_SLOT_COUNT: u16 = 0x01C2;
+pub const DPCD_PAYLOAD_TABLE_UPDATE_STATUS: u16 = 0x02C0;
+
+/// Status bit in DPCD 0x2C0 — set by the branch when our commit
+/// has reached it. Cleared by writing 1 back.
+pub const PAYLOAD_TABLE_UPDATED_BIT: u8 = 1 << 0;
+
+/// MST sideband message opcodes (subset).
+/// Per VESA DP MST spec.
+pub const MST_SB_ALLOCATE_PAYLOAD: u8 = 0x10;
+pub const MST_SB_ENABLE_STREAM: u8 = 0x12;
+pub const MST_SB_REMOTE_DPCD_READ: u8 = 0x20;
+pub const MST_SB_REMOTE_DPCD_WRITE: u8 = 0x21;
+
+/// Trait for the host driver's AUX channel. Same shape as the
+/// existing dp_aux module's transport.
+pub trait MstAux {
+    /// Write `value` to DPCD `addr`. Returns the ack byte.
+    fn dpcd_write_u8(&mut self, addr: u16, value: u8) -> u8;
+    /// Read a DPCD byte.
+    fn dpcd_read_u8(&mut self, addr: u16) -> u8;
+    /// Issue an MST sideband message (already packetised + checksummed).
+    /// Returns the response payload.
+    fn sb_message(&mut self, opcode: u8, body: &[u8]) -> alloc::vec::Vec<u8>;
+}
+
+/// Poll cap for the PAYLOAD_TABLE_UPDATE_STATUS bit.
+pub const PAYLOAD_TABLE_POLL_BUDGET: u32 = 100_000;
+
+/// Commit a payload-table change to silicon + sink. Sequence
+/// adapted from `drm_dp_mst_topology.c::drm_dp_mst_update_payload_part1`.
+///
+/// `start_time_slot` is the first VCPI time slot index in the
+/// link's 64-slot MTPH frame. `time_slot_count` is the number of
+/// consecutive slots the VCPI owns (proportional to pbn).
+pub fn commit_payload_to_sink<A: MstAux>(
+    aux: &mut A,
+    vcpi: u8,
+    start_time_slot: u8,
+    time_slot_count: u8,
+) -> Result<(), MstStreamError> {
+    if vcpi == 0 || vcpi > 63 {
+        return Err(MstStreamError::BadVcpi);
+    }
+    // Step 1: write the per-VCPI assignment to DPCD.
+    aux.dpcd_write_u8(DPCD_PAYLOAD_ALLOCATE_SET, vcpi);
+    aux.dpcd_write_u8(DPCD_PAYLOAD_ALLOCATE_START_TIME_SLOT, start_time_slot);
+    aux.dpcd_write_u8(DPCD_PAYLOAD_ALLOCATE_TIME_SLOT_COUNT, time_slot_count);
+
+    // Step 2: poll for the branch to ack the update.
+    let mut i = 0u32;
+    loop {
+        let s = aux.dpcd_read_u8(DPCD_PAYLOAD_TABLE_UPDATE_STATUS);
+        if s & PAYLOAD_TABLE_UPDATED_BIT != 0 {
+            // Clear the status bit by writing 1 back (W1C semantics).
+            aux.dpcd_write_u8(
+                DPCD_PAYLOAD_TABLE_UPDATE_STATUS,
+                PAYLOAD_TABLE_UPDATED_BIT,
+            );
+            break;
+        }
+        i += 1;
+        if i >= PAYLOAD_TABLE_POLL_BUDGET {
+            return Err(MstStreamError::CommitTimeout);
+        }
+    }
+    Ok(())
+}
+
+/// Send the ALLOCATE_PAYLOAD MST sideband message — tells the
+/// branch+leaf chain about the new VCPI's bandwidth + lct/rad.
+pub fn send_allocate_payload<A: MstAux>(
+    aux: &mut A,
+    vcpi: u8,
+    pbn: u16,
+    branch_lct: u8,
+    branch_rad: &[u8],
+) -> Result<(), MstStreamError> {
+    if vcpi == 0 || vcpi > 63 {
+        return Err(MstStreamError::BadVcpi);
+    }
+    let mut body = alloc::vec::Vec::with_capacity(8 + branch_rad.len());
+    body.push(branch_lct);
+    for r in branch_rad {
+        body.push(*r);
+    }
+    body.push(vcpi);
+    body.push((pbn >> 8) as u8);
+    body.push((pbn & 0xFF) as u8);
+    let _resp = aux.sb_message(MST_SB_ALLOCATE_PAYLOAD, &body);
+    Ok(())
+}
+
+/// Send the ENABLE_STREAM MST sideband message — flips the
+/// per-VCPI carrying state on the branch. Must follow a successful
+/// ALLOCATE_PAYLOAD + commit_payload_to_sink.
+pub fn send_enable_stream<A: MstAux>(
+    aux: &mut A,
+    vcpi: u8,
+    branch_lct: u8,
+    branch_rad: &[u8],
+) -> Result<(), MstStreamError> {
+    if vcpi == 0 || vcpi > 63 {
+        return Err(MstStreamError::BadVcpi);
+    }
+    let mut body = alloc::vec::Vec::with_capacity(4 + branch_rad.len());
+    body.push(branch_lct);
+    for r in branch_rad {
+        body.push(*r);
+    }
+    body.push(vcpi);
+    let _resp = aux.sb_message(MST_SB_ENABLE_STREAM, &body);
+    Ok(())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MstStreamError {
+    BadVcpi,
+    CommitTimeout,
+}
+
+/// Full live activation: VCPI alloc (from PayloadTable) → DPCD
+/// commit → sideband ALLOCATE_PAYLOAD → sideband ENABLE_STREAM.
+pub fn activate_stream<A: MstAux>(
+    aux: &mut A,
+    table: &mut PayloadTable,
+    branch_guid: Guid,
+    branch_lct: u8,
+    branch_rad: &[u8],
+    sink_port: u8,
+    pbn: u16,
+    start_time_slot: u8,
+) -> Result<u8, MstStreamErrorOrAlloc> {
+    let vcpi = table.allocate(branch_guid, sink_port, pbn)?;
+    // Time slot count = pbn / link rate per slot. The PayloadTable's
+    // link_pbn is split into 64 slots; one slot = link_pbn / 64.
+    let slots_per_pbn = if table.link_pbn != 0 {
+        (pbn as u32 * 64 + (table.link_pbn as u32 - 1)) / (table.link_pbn as u32)
+    } else {
+        0
+    };
+    commit_payload_to_sink(aux, vcpi, start_time_slot, slots_per_pbn as u8)?;
+    send_allocate_payload(aux, vcpi, pbn, branch_lct, branch_rad)?;
+    send_enable_stream(aux, vcpi, branch_lct, branch_rad)?;
+    Ok(vcpi)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MstStreamErrorOrAlloc {
+    Stream(MstStreamError),
+    Alloc(MstError),
+}
+impl From<MstError> for MstStreamErrorOrAlloc {
+    fn from(e: MstError) -> Self {
+        MstStreamErrorOrAlloc::Alloc(e)
+    }
+}
+impl From<MstStreamError> for MstStreamErrorOrAlloc {
+    fn from(e: MstStreamError) -> Self {
+        MstStreamErrorOrAlloc::Stream(e)
+    }
+}
+
 // ── Smoke tests ──────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -520,4 +705,128 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_sideband_opcode_values);
+
+    // ── Live stream activation ────────────────────────────────
+
+    struct MockMstAux {
+        dpcd_writes: Vec<(u16, u8)>,
+        sb_messages: Vec<(u8, Vec<u8>)>,
+        /// After N reads, return PAYLOAD_TABLE_UPDATED_BIT.
+        poll_count: u32,
+    }
+    impl MstAux for MockMstAux {
+        fn dpcd_write_u8(&mut self, addr: u16, value: u8) -> u8 {
+            self.dpcd_writes.push((addr, value));
+            0
+        }
+        fn dpcd_read_u8(&mut self, addr: u16) -> u8 {
+            if addr == DPCD_PAYLOAD_TABLE_UPDATE_STATUS {
+                self.poll_count += 1;
+                if self.poll_count >= 2 {
+                    return PAYLOAD_TABLE_UPDATED_BIT;
+                }
+            }
+            0
+        }
+        fn sb_message(&mut self, opcode: u8, body: &[u8]) -> Vec<u8> {
+            self.sb_messages.push((opcode, body.to_vec()));
+            Vec::new()
+        }
+    }
+
+    fn smoke_commit_payload_writes_three_dpcd_regs() -> TestResult {
+        let mut aux = MockMstAux {
+            dpcd_writes: Vec::new(),
+            sb_messages: Vec::new(),
+            poll_count: 0,
+        };
+        commit_payload_to_sink(&mut aux, 5, 10, 8).expect("commit");
+        // 3 DPCD writes for SET / START / COUNT + 1 W1C clear.
+        if aux.dpcd_writes.len() != 4 {
+            return TestResult::Fail("expected 4 DPCD writes");
+        }
+        if aux.dpcd_writes[0] != (DPCD_PAYLOAD_ALLOCATE_SET, 5) {
+            return TestResult::Fail("VCPI write wrong");
+        }
+        if aux.dpcd_writes[1] != (DPCD_PAYLOAD_ALLOCATE_START_TIME_SLOT, 10) {
+            return TestResult::Fail("start slot wrong");
+        }
+        if aux.dpcd_writes[2] != (DPCD_PAYLOAD_ALLOCATE_TIME_SLOT_COUNT, 8) {
+            return TestResult::Fail("slot count wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_commit_payload_writes_three_dpcd_regs);
+
+    fn smoke_commit_payload_rejects_bad_vcpi() -> TestResult {
+        let mut aux = MockMstAux {
+            dpcd_writes: Vec::new(),
+            sb_messages: Vec::new(),
+            poll_count: 0,
+        };
+        if commit_payload_to_sink(&mut aux, 0, 0, 0) != Err(MstStreamError::BadVcpi) {
+            return TestResult::Fail("VCPI 0 not rejected");
+        }
+        if commit_payload_to_sink(&mut aux, 64, 0, 0) != Err(MstStreamError::BadVcpi) {
+            return TestResult::Fail("VCPI 64 not rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_commit_payload_rejects_bad_vcpi);
+
+    fn smoke_send_allocate_payload_carries_rad() -> TestResult {
+        let mut aux = MockMstAux {
+            dpcd_writes: Vec::new(),
+            sb_messages: Vec::new(),
+            poll_count: 0,
+        };
+        send_allocate_payload(&mut aux, 7, 0x40, 2, &[0x11, 0x22]).expect("send");
+        if aux.sb_messages.len() != 1 {
+            return TestResult::Fail("expected 1 SB message");
+        }
+        let (op, body) = &aux.sb_messages[0];
+        if *op != MST_SB_ALLOCATE_PAYLOAD {
+            return TestResult::Fail("wrong opcode");
+        }
+        // body: [lct=2, rad bytes, vcpi=7, pbn_hi=0, pbn_lo=0x40].
+        if body.len() != 5 {
+            return TestResult::Fail("body wrong length");
+        }
+        if body[0] != 2 || body[1] != 0x11 || body[2] != 0x22 || body[3] != 7 {
+            return TestResult::Fail("body bytes wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_send_allocate_payload_carries_rad);
+
+    fn smoke_activate_stream_end_to_end() -> TestResult {
+        let mut aux = MockMstAux {
+            dpcd_writes: Vec::new(),
+            sb_messages: Vec::new(),
+            poll_count: 0,
+        };
+        let mut table = PayloadTable::new(64);
+        let guid = Guid([0xAA; 16]);
+        let vcpi = activate_stream(&mut aux, &mut table, guid, 2, &[0x11], 0, 32, 0)
+            .expect("activate");
+        if vcpi == 0 {
+            return TestResult::Fail("vcpi 0");
+        }
+        // 2 SB messages — ALLOCATE_PAYLOAD + ENABLE_STREAM.
+        if aux.sb_messages.len() != 2 {
+            return TestResult::Fail("expected 2 SB msgs");
+        }
+        if aux.sb_messages[0].0 != MST_SB_ALLOCATE_PAYLOAD {
+            return TestResult::Fail("1st SB not ALLOC");
+        }
+        if aux.sb_messages[1].0 != MST_SB_ENABLE_STREAM {
+            return TestResult::Fail("2nd SB not ENABLE");
+        }
+        // PayloadTable updated.
+        if table.allocations.len() != 1 {
+            return TestResult::Fail("table not updated");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_activate_stream_end_to_end);
 }
