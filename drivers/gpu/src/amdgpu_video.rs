@@ -171,6 +171,12 @@ impl Codec {
 /// pool sized for AV1 + reuse.
 pub const MAX_REF_FRAMES: usize = 16;
 
+/// VCN can drive up to 8K input frames (encode + decode). H.264
+/// caps at 4K, HEVC at 8K, AV1 at 8K — per spec. We pin the
+/// driver max here to flag silly inputs in `EncodeSession::new`.
+pub const MAX_PIC_WIDTH: u32 = 8192;
+pub const MAX_PIC_HEIGHT: u32 = 4320;
+
 /// One reference-frame slot in the DPB (Decoded Picture Buffer).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RefFrameSlot {
@@ -227,6 +233,13 @@ pub enum VideoError {
     BadAlignment,
     /// IP block isn't present on this family (VCN-less SoC).
     NoVcn,
+    /// Encode session got a reserved (zero) handle.
+    BadHandle,
+    /// Encode dimensions out of legal range or zero.
+    BadDimensions,
+    /// Encode ring has no room for the packet — caller must
+    /// drain (via IH cookie + drain()) before pushing more.
+    RingFull,
 }
 
 impl DecodeSession {
@@ -379,6 +392,403 @@ fn codec_word_for(c: Codec) -> u32 {
     }
 }
 
+// ── VCN encoder session ───────────────────────────────────────────
+//
+// The encode path uses the same Falcon firmware as decode but a
+// disjoint submission class. The encode ring (UVD_RB / VCN_ENC) is
+// a separate write-pointer register from the decode ring; it carries
+// PACKET_TYPE messages with the `VCN_ENC_CMD_*` opcodes:
+//
+//   VCN_ENC_CMD_NO_OP      = 0x00
+//   VCN_ENC_CMD_END        = 0x01   end-of-IB sentinel
+//   VCN_ENC_CMD_IB         = 0x02   indirect-buffer chain
+//   VCN_ENC_CMD_FENCE      = 0x03   write fence + value at addr
+//   VCN_ENC_CMD_TRAP       = 0x04   raise interrupt
+//   VCN_ENC_CMD_REG_WRITE  = 0x0B   write a UVD/VCN MMIO reg from ring
+//   VCN_ENC_CMD_REG_WAIT   = 0x0C   poll a UVD/VCN MMIO reg from ring
+//
+// References:
+//   - Linux drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h:60-66 (opcodes)
+//   - Linux drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c:923-980
+//     (amdgpu_vcn_enc_get_create_msg — the firmware session-init IB)
+//   - Linux drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c:1768-1798
+//     (vcn_v4_0_unified_ring_{get,set}_wptr)
+
+pub const VCN_ENC_CMD_NO_OP: u32 = 0x0000_0000;
+pub const VCN_ENC_CMD_END: u32 = 0x0000_0001;
+pub const VCN_ENC_CMD_IB: u32 = 0x0000_0002;
+pub const VCN_ENC_CMD_FENCE: u32 = 0x0000_0003;
+pub const VCN_ENC_CMD_TRAP: u32 = 0x0000_0004;
+pub const VCN_ENC_CMD_REG_WRITE: u32 = 0x0000_000B;
+pub const VCN_ENC_CMD_REG_WAIT: u32 = 0x0000_000C;
+
+/// One encode session: codec, dimensions, rate-control state, +
+/// firmware-side handle the kernel obtained from CREATE_MSG.
+#[derive(Clone, Debug)]
+pub struct EncodeSession {
+    pub ip: VcnVersion,
+    pub codec: Codec,
+    pub width: u32,
+    pub height: u32,
+    /// Target bitrate in bits per second (rate-control hint).
+    pub bitrate_bps: u32,
+    /// Firmware session handle. Assigned by the kernel before
+    /// CREATE_MSG. The IB sent to the firmware echoes this back as
+    /// `*ib_ptr[2]` (handle field).
+    pub handle: u32,
+    /// Next host-sequence to embed in a fence packet.
+    next_seq: u64,
+    /// In-flight encode packets (host hasn't yet seen the matching
+    /// retire IH cookie).
+    pub in_flight: u32,
+    /// Whether the unified ring (decode+encode on the same ring)
+    /// is in use (vcn_v4+) vs separate ring_enc[0] / ring_dec.
+    pub unified_ring: bool,
+}
+
+impl EncodeSession {
+    pub fn new(
+        ip: VcnVersion,
+        codec: Codec,
+        width: u32,
+        height: u32,
+        bitrate_bps: u32,
+        handle: u32,
+    ) -> Result<Self, VideoError> {
+        if !ip.supports_encode(codec) {
+            return Err(VideoError::UnsupportedCodec);
+        }
+        if width == 0 || height == 0 || width > MAX_PIC_WIDTH || height > MAX_PIC_HEIGHT {
+            return Err(VideoError::BadDimensions);
+        }
+        if handle == 0 {
+            // Linux uses handles starting at 1; 0 is reserved.
+            return Err(VideoError::BadHandle);
+        }
+        // vcn_v4+ uses a unified queue (one ring for both dec + enc).
+        let unified_ring = matches!(ip, VcnVersion::V4_0_5);
+        Ok(Self {
+            ip,
+            codec,
+            width,
+            height,
+            bitrate_bps,
+            handle,
+            next_seq: 1,
+            in_flight: 0,
+            unified_ring,
+        })
+    }
+
+    fn allocate_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        s
+    }
+}
+
+/// Build the encode session-create IB. This is the first IB the
+/// kernel sends after firmware bring-up; the firmware allocates
+/// per-session state keyed by `handle` and signals success via the
+/// fence packet at the end.
+///
+/// Adapted from `amdgpu_vcn.c::amdgpu_vcn_enc_get_create_msg`
+/// (lines 923-980). Layout per Linux on a unified-queue VCN:
+///
+/// ```text
+///   header: 0x18 0x00000001  ← session info
+///   handle, addr_hi, addr_lo, 0
+///   header: 0x14 0x00000002  ← task info
+///   0x1c, 0, 0
+///   header: 0x08 0x08000001  ← op initialize
+///   (padding to ib_size_dw)
+/// ```
+///
+/// When `with_checksum` is true the IB is wrapped in unified-ring
+/// header + checksum bytes (vcn_v4+); the wrapper here just keeps
+/// the dword layout faithful to Linux's IB construction.
+pub fn build_encode_create_msg(
+    session: &mut EncodeSession,
+    feedback_phys: u64,
+) -> Result<EncodePacket, VideoError> {
+    if !session.ip.supports_encode(session.codec) {
+        return Err(VideoError::UnsupportedCodec);
+    }
+    if feedback_phys & 0xF != 0 {
+        return Err(VideoError::BadAlignment);
+    }
+    let mut dws: Vec<u32> = Vec::with_capacity(16);
+    // session-info block (6 dws).
+    dws.push(0x0000_0018);
+    dws.push(0x0000_0001);
+    dws.push(session.handle);
+    dws.push((feedback_phys >> 32) as u32);
+    dws.push(feedback_phys as u32);
+    dws.push(0);
+    // task-info block (5 dws).
+    dws.push(0x0000_0014);
+    dws.push(0x0000_0002);
+    dws.push(0x0000_001c);
+    dws.push(0);
+    dws.push(0);
+    // op-initialize block (2 dws).
+    dws.push(0x0000_0008);
+    dws.push(0x0800_0001);
+    // Pad to 16 dws (Linux's `ib_size_dw = 16` baseline).
+    while dws.len() < 16 {
+        dws.push(0);
+    }
+    let seq = session.allocate_seq();
+    session.in_flight += 1;
+    Ok(EncodePacket {
+        dws,
+        seq,
+        kind: EncodePacketKind::Create,
+    })
+}
+
+/// Build an encode-frame IB. Carries the input raw frame phys
+/// addr, target bitstream output, and rate-control parameters.
+///
+/// Layout adapted from `vcn_v4_0_enc_ring_emit_ib` /
+/// `amdgpu_vcn_enc_get_destroy_msg` patterns — this is the
+/// "encode one frame" subcommand the firmware accepts after a
+/// successful CREATE_MSG. The dword shape here is the kernel-mode
+/// host layout; the firmware's internal packet layout is opaque.
+pub fn build_encode_frame_packet(
+    session: &mut EncodeSession,
+    raw_input_phys: u64,
+    output_phys: u64,
+    output_max_size: u32,
+) -> Result<EncodePacket, VideoError> {
+    if !session.ip.supports_encode(session.codec) {
+        return Err(VideoError::UnsupportedCodec);
+    }
+    if raw_input_phys & 0xF != 0 || output_phys & 0xF != 0 {
+        return Err(VideoError::BadAlignment);
+    }
+    if output_max_size == 0 {
+        return Err(VideoError::BadDimensions);
+    }
+    let seq = session.allocate_seq();
+    let codec_word = codec_word_for(session.codec);
+    let mut dws = Vec::with_capacity(14);
+    // session-info echo so the firmware can route the packet.
+    dws.push(0x0000_0018);
+    dws.push(session.handle);
+    dws.push(codec_word);
+    dws.push(session.width);
+    dws.push(session.height);
+    dws.push(session.bitrate_bps);
+    // Input frame.
+    dws.push(raw_input_phys as u32);
+    dws.push((raw_input_phys >> 32) as u32);
+    // Output buffer.
+    dws.push(output_phys as u32);
+    dws.push((output_phys >> 32) as u32);
+    dws.push(output_max_size);
+    // Op tag — encode_frame = 0x0800_0002.
+    dws.push(0x0800_0002);
+    // Fence dword pair — VCN_ENC_CMD_FENCE writes `seq` to a host
+    // sysmem address. Caller fills the wptr-side fence target in a
+    // separate envelope; we just record `seq` for completion match.
+    dws.push(VCN_ENC_CMD_FENCE);
+    dws.push(seq as u32);
+    session.in_flight += 1;
+    Ok(EncodePacket {
+        dws,
+        seq,
+        kind: EncodePacketKind::Frame,
+    })
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EncodePacketKind {
+    Create,
+    Frame,
+    Destroy,
+}
+
+/// Built encode packet ready for the encode ring.
+#[derive(Clone, Debug)]
+pub struct EncodePacket {
+    pub dws: Vec<u32>,
+    pub seq: u64,
+    pub kind: EncodePacketKind,
+}
+
+/// Retire one encode packet. The IH dispatch matched `seq` so
+/// the in-flight count drops by one.
+pub fn retire_encode(session: &mut EncodeSession, _seq: u64) {
+    if session.in_flight > 0 {
+        session.in_flight -= 1;
+    }
+}
+
+/// Build an encode session-destroy IB. Required before tearing
+/// down the session so the firmware can release its per-session
+/// state. The packet is a minimal sentinel pointing at the
+/// session's handle + the op-destroy code.
+pub fn build_encode_destroy_msg(
+    session: &mut EncodeSession,
+) -> Result<EncodePacket, VideoError> {
+    if !session.ip.supports_encode(session.codec) {
+        return Err(VideoError::UnsupportedCodec);
+    }
+    let mut dws = Vec::with_capacity(8);
+    dws.push(0x0000_0018);
+    dws.push(0x0000_0001);
+    dws.push(session.handle);
+    dws.push(0);
+    dws.push(0);
+    dws.push(0x0000_0008);
+    dws.push(0x0800_0003); // op destroy
+    dws.push(VCN_ENC_CMD_END);
+    let seq = session.allocate_seq();
+    session.in_flight += 1;
+    Ok(EncodePacket {
+        dws,
+        seq,
+        kind: EncodePacketKind::Destroy,
+    })
+}
+
+// ── VCN encode ring (UVD_RB) ───────────────────────────────────────
+//
+// The encode ring is a circular buffer in GPU-visible sysmem; the
+// driver writes packets at `wptr` and the firmware advances `rptr`.
+// Hardware-side the `UVD_RB_WPTR` register holds the host-committed
+// wptr; doorbell mode replaces it with a doorbell write that the
+// FW polls.
+
+/// Encode ring registers — offsets relative to the VCN0 IP block
+/// base. Multiple rings exist (`UVD_RB_WPTR` .. `UVD_RB_WPTR4`);
+/// the unified-queue VCNs (v4+) use ring 0 for both decode + encode.
+pub const VCN_ENC_RING_RPTR_REL: u32 = 0x0;
+pub const VCN_ENC_RING_WPTR_REL: u32 = 0x4;
+pub const VCN_ENC_RING_BASE_LO_REL: u32 = 0x8;
+pub const VCN_ENC_RING_BASE_HI_REL: u32 = 0xC;
+pub const VCN_ENC_RING_SIZE_REL: u32 = 0x10;
+
+/// One encode ring. Tracks the (rptr, wptr) head-tail pair the
+/// firmware reads; the driver mirrors them in CPU memory so it
+/// can wake-from-interrupt without re-reading MMIO.
+#[derive(Clone, Debug)]
+pub struct EncodeRing {
+    /// Base GPU phys of the ring buffer (4 KiB aligned).
+    pub ring_base_phys: u64,
+    /// Ring size in bytes (must be power of two).
+    pub ring_size_bytes: u32,
+    /// Mirror of UVD_RB_WPTR in dwords.
+    pub wptr_dw: u32,
+    /// Mirror of UVD_RB_RPTR in dwords.
+    pub rptr_dw: u32,
+    /// `true` when doorbell mode is set up (UVD writes to a
+    /// per-ring doorbell page instead of the host writing
+    /// UVD_RB_WPTR).
+    pub use_doorbell: bool,
+}
+
+impl EncodeRing {
+    pub fn new(ring_base_phys: u64, ring_size_bytes: u32) -> Result<Self, VideoError> {
+        if ring_base_phys & 0xFFF != 0 {
+            return Err(VideoError::BadAlignment);
+        }
+        if ring_size_bytes == 0 || !ring_size_bytes.is_power_of_two() {
+            return Err(VideoError::BadDimensions);
+        }
+        Ok(Self {
+            ring_base_phys,
+            ring_size_bytes,
+            wptr_dw: 0,
+            rptr_dw: 0,
+            use_doorbell: false,
+        })
+    }
+
+    /// Count of in-flight ring dwords (committed by host, not yet
+    /// drained by firmware).
+    pub fn in_flight_dw(&self) -> u32 {
+        let mask = (self.ring_size_bytes / 4) - 1;
+        self.wptr_dw.wrapping_sub(self.rptr_dw) & mask
+    }
+
+    /// Push a packet to the ring buffer (host-visible mirror).
+    /// Real silicon writes the dwords into the ring's GPU phys
+    /// page; this mirror tracks the wptr advance for tests.
+    pub fn push(&mut self, packet: &EncodePacket) -> Result<(), VideoError> {
+        let need = packet.dws.len() as u32;
+        let mask = (self.ring_size_bytes / 4) - 1;
+        let free = mask.wrapping_sub(self.in_flight_dw());
+        if need > free {
+            return Err(VideoError::RingFull);
+        }
+        self.wptr_dw = self.wptr_dw.wrapping_add(need) & mask;
+        Ok(())
+    }
+
+    /// Mark `n_dw` dwords as drained — caller does this after the
+    /// firmware bumps UVD_RB_RPTR (visible via an IH cookie + an
+    /// RB_RPTR re-read).
+    pub fn drain(&mut self, n_dw: u32) {
+        let mask = (self.ring_size_bytes / 4) - 1;
+        self.rptr_dw = self.rptr_dw.wrapping_add(n_dw) & mask;
+    }
+}
+
+/// MMIO trait for the encode ring — same pattern as the PSP +
+/// VMHUB Mmio traits.
+pub trait VcnEncMmio {
+    fn read(&mut self, vcn_base_plus_offset: u32) -> u32;
+    fn write(&mut self, vcn_base_plus_offset: u32, value: u32);
+}
+
+/// Set up the encode ring registers — programs UVD_RB_BASE_LO/HI
+/// + UVD_RB_SIZE so the firmware reads packets from the right
+/// place. Adapted from `vcn_v4_0.c::vcn_v4_0_pause_dpg_mode`
+/// register-init block (around line 1100-1108).
+pub fn setup_encode_ring_regs<M: VcnEncMmio>(
+    mmio: &mut M,
+    vcn_base: u32,
+    ring: &EncodeRing,
+) {
+    mmio.write(
+        vcn_base + VCN_ENC_RING_BASE_LO_REL,
+        ring.ring_base_phys as u32,
+    );
+    mmio.write(
+        vcn_base + VCN_ENC_RING_BASE_HI_REL,
+        (ring.ring_base_phys >> 32) as u32,
+    );
+    mmio.write(vcn_base + VCN_ENC_RING_SIZE_REL, ring.ring_size_bytes);
+    // Reset rptr/wptr to 0 — firmware reads from there.
+    mmio.write(vcn_base + VCN_ENC_RING_RPTR_REL, 0);
+    mmio.write(vcn_base + VCN_ENC_RING_WPTR_REL, 0);
+}
+
+/// Commit the encode ring's wptr to silicon. Mirrors
+/// `vcn_v4_0.c::vcn_v4_0_unified_ring_set_wptr` (line 1785-1798).
+pub fn commit_encode_wptr<M: VcnEncMmio>(
+    mmio: &mut M,
+    vcn_base: u32,
+    ring: &EncodeRing,
+) {
+    mmio.write(vcn_base + VCN_ENC_RING_WPTR_REL, ring.wptr_dw);
+}
+
+/// Read the firmware's current rptr — mirrors
+/// `vcn_v4_0_unified_ring_get_wptr` but for the rptr-side. The
+/// host calls this on an IH dispatch to figure out how many
+/// dwords are now drainable.
+pub fn read_encode_rptr<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32) -> u32 {
+    mmio.read(vcn_base + VCN_ENC_RING_RPTR_REL)
+}
+
+// Add error variant for the encode-ring path.
+//
+// VideoError already has `BadAlignment`, `BadDimensions`,
+// `DpbFull`, `UnsupportedCodec`. We need `BadHandle` + `RingFull`.
+
 // ── Smoke tests ──────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -529,4 +939,210 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_decode_packet_rejects_misaligned);
+
+    // ── Encode-path smokes ─────────────────────────────────────
+
+    /// Mock MMIO that just records every write + responds 0 to every read.
+    struct MockVcnMmio {
+        writes: Vec<(u32, u32)>,
+    }
+    impl VcnEncMmio for MockVcnMmio {
+        fn read(&mut self, _off: u32) -> u32 {
+            0
+        }
+        fn write(&mut self, off: u32, val: u32) {
+            self.writes.push((off, val));
+        }
+    }
+
+    fn smoke_encode_session_rejects_av1_on_renoir() -> TestResult {
+        match EncodeSession::new(VcnVersion::V2_0, Codec::Av1, 1920, 1080, 5_000_000, 1) {
+            Err(VideoError::UnsupportedCodec) => {}
+            _ => return TestResult::Fail("Renoir AV1 enc must reject"),
+        }
+        // Phoenix + AV1 succeeds.
+        if EncodeSession::new(VcnVersion::V4_0_5, Codec::Av1, 1920, 1080, 5_000_000, 1).is_err() {
+            return TestResult::Fail("Phoenix AV1 enc must succeed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_encode_session_rejects_av1_on_renoir);
+
+    fn smoke_encode_session_rejects_zero_handle() -> TestResult {
+        match EncodeSession::new(VcnVersion::V4_0_5, Codec::H264, 1920, 1080, 5_000_000, 0) {
+            Err(VideoError::BadHandle) => {}
+            _ => return TestResult::Fail("handle 0 must be rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_encode_session_rejects_zero_handle);
+
+    fn smoke_build_encode_create_msg_layout() -> TestResult {
+        let mut s = EncodeSession::new(VcnVersion::V4_0_5, Codec::H264, 1920, 1080, 5_000_000, 42)
+            .expect("session");
+        let p = build_encode_create_msg(&mut s, 0x1000_0000).expect("create");
+        if p.dws.len() != 16 {
+            return TestResult::Fail("create msg should be 16 dws");
+        }
+        // dw[2] is the session handle.
+        if p.dws[2] != 42 {
+            return TestResult::Fail("handle not echoed");
+        }
+        // dw[0] is the session-info length header.
+        if p.dws[0] != 0x0000_0018 {
+            return TestResult::Fail("session info header wrong");
+        }
+        if p.kind != EncodePacketKind::Create {
+            return TestResult::Fail("packet kind wrong");
+        }
+        if s.in_flight != 1 {
+            return TestResult::Fail("in_flight not bumped");
+        }
+        retire_encode(&mut s, p.seq);
+        if s.in_flight != 0 {
+            return TestResult::Fail("in_flight not drained");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_build_encode_create_msg_layout);
+
+    fn smoke_build_encode_frame_packet_layout() -> TestResult {
+        let mut s = EncodeSession::new(VcnVersion::V4_0_5, Codec::Hevc, 3840, 2160, 25_000_000, 7)
+            .expect("session");
+        let p = build_encode_frame_packet(&mut s, 0xCAFE_0000, 0xBEEF_0000, 0x10_0000)
+            .expect("frame");
+        // dw[1] = handle, dw[2] = codec word, dw[3] = width, dw[4] = height.
+        if p.dws[1] != 7 {
+            return TestResult::Fail("handle wrong");
+        }
+        if p.dws[2] != 0x02 {
+            return TestResult::Fail("HEVC codec word wrong");
+        }
+        if p.dws[3] != 3840 || p.dws[4] != 2160 {
+            return TestResult::Fail("dims wrong");
+        }
+        // Last dword pair must be the fence cmd.
+        let n = p.dws.len();
+        if p.dws[n - 2] != VCN_ENC_CMD_FENCE {
+            return TestResult::Fail("missing fence cmd");
+        }
+        if p.kind != EncodePacketKind::Frame {
+            return TestResult::Fail("packet kind wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_build_encode_frame_packet_layout);
+
+    fn smoke_encode_frame_rejects_misaligned() -> TestResult {
+        let mut s = EncodeSession::new(VcnVersion::V4_0_5, Codec::H264, 1920, 1080, 5_000_000, 1)
+            .expect("session");
+        match build_encode_frame_packet(&mut s, 0xCAFE_0001, 0xBEEF_0000, 1024) {
+            Err(VideoError::BadAlignment) => {}
+            _ => return TestResult::Fail("misaligned input not rejected"),
+        }
+        match build_encode_frame_packet(&mut s, 0xCAFE_0000, 0xBEEF_0001, 1024) {
+            Err(VideoError::BadAlignment) => {}
+            _ => return TestResult::Fail("misaligned output not rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_encode_frame_rejects_misaligned);
+
+    fn smoke_encode_ring_push_advances_wptr() -> TestResult {
+        let mut r = EncodeRing::new(0x10_0000, 4096).expect("ring");
+        if r.in_flight_dw() != 0 {
+            return TestResult::Fail("ring not empty at init");
+        }
+        let mut s = EncodeSession::new(VcnVersion::V4_0_5, Codec::H264, 1280, 720, 1_000_000, 1)
+            .expect("session");
+        let p = build_encode_create_msg(&mut s, 0x2000_0000).expect("create");
+        r.push(&p).expect("push");
+        if r.in_flight_dw() != 16 {
+            return TestResult::Fail("in_flight after push");
+        }
+        r.drain(16);
+        if r.in_flight_dw() != 0 {
+            return TestResult::Fail("drained back to 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_encode_ring_push_advances_wptr);
+
+    fn smoke_encode_ring_full_rejects() -> TestResult {
+        // Ring of 8 dwords (32 bytes). Push 7-dword packets twice
+        // — second must fail (mask = 7).
+        let mut r = EncodeRing::new(0x10_0000, 32).expect("ring");
+        let pkt = EncodePacket {
+            dws: alloc::vec![0; 6],
+            seq: 1,
+            kind: EncodePacketKind::Frame,
+        };
+        r.push(&pkt).expect("first push");
+        // Now in_flight = 6, free = 7-6 = 1. A 2-dw packet fails.
+        let pkt2 = EncodePacket {
+            dws: alloc::vec![0; 2],
+            seq: 2,
+            kind: EncodePacketKind::Frame,
+        };
+        match r.push(&pkt2) {
+            Err(VideoError::RingFull) => {}
+            _ => return TestResult::Fail("ring-full not flagged"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_encode_ring_full_rejects);
+
+    fn smoke_setup_encode_ring_writes_regs() -> TestResult {
+        let mut m = MockVcnMmio { writes: alloc::vec![] };
+        let r = EncodeRing::new(0xDEAD_0000, 4096).expect("ring");
+        setup_encode_ring_regs(&mut m, 0x100, &r);
+        // 5 writes: BASE_LO, BASE_HI, SIZE, RPTR=0, WPTR=0.
+        if m.writes.len() != 5 {
+            return TestResult::Fail("expected 5 ring-setup writes");
+        }
+        if m.writes[0] != (0x100 + VCN_ENC_RING_BASE_LO_REL, 0xDEAD_0000) {
+            return TestResult::Fail("base lo wrong");
+        }
+        if m.writes[2] != (0x100 + VCN_ENC_RING_SIZE_REL, 4096) {
+            return TestResult::Fail("size wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_setup_encode_ring_writes_regs);
+
+    fn smoke_commit_encode_wptr_writes_uvd_rb_wptr() -> TestResult {
+        let mut m = MockVcnMmio { writes: alloc::vec![] };
+        let mut r = EncodeRing::new(0xDEAD_0000, 4096).expect("ring");
+        r.wptr_dw = 0x42;
+        commit_encode_wptr(&mut m, 0x100, &r);
+        if m.writes.len() != 1 {
+            return TestResult::Fail("expected 1 wptr write");
+        }
+        if m.writes[0] != (0x100 + VCN_ENC_RING_WPTR_REL, 0x42) {
+            return TestResult::Fail("wptr write wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_commit_encode_wptr_writes_uvd_rb_wptr);
+
+    fn smoke_build_encode_destroy_msg_layout() -> TestResult {
+        let mut s = EncodeSession::new(VcnVersion::V4_0_5, Codec::H264, 1920, 1080, 5_000_000, 99)
+            .expect("session");
+        let p = build_encode_destroy_msg(&mut s).expect("destroy");
+        // dw[2] = handle, dw[6] = op-destroy, last = END sentinel.
+        if p.dws[2] != 99 {
+            return TestResult::Fail("destroy handle wrong");
+        }
+        if p.dws[6] != 0x0800_0003 {
+            return TestResult::Fail("destroy op wrong");
+        }
+        if *p.dws.last().unwrap() != VCN_ENC_CMD_END {
+            return TestResult::Fail("END sentinel missing");
+        }
+        if p.kind != EncodePacketKind::Destroy {
+            return TestResult::Fail("packet kind wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_build_encode_destroy_msg_layout);
 }
