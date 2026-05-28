@@ -69,23 +69,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(out)
     }
 
-    /// Write one directory data block back to disk. Walks the parent's
-    /// block pointer chain; allocates a fresh data block if `logical`
-    /// is currently a hole. Caller must persist any inode mutations.
-    async fn write_dir_block(
-        &self,
-        parent_inode: &mut Inode,
-        logical: u64,
-        block: &[u8],
-    ) -> Result<(), FsError> {
-        let bs = self.block_size();
-        if block.len() != bs {
-            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
-        }
-        let phys = self.map_block_alloc(parent_inode, logical).await?;
-        self.write_block(phys, block).await
-    }
-
     /// Look up `name` in `parent_inode`, returning `(inode_no,
     /// file_type)`. Returns `NotFound` if the name is absent.
     pub(crate) async fn dir_lookup(
@@ -500,7 +483,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             new_parent.links_count = new_parent.links_count.saturating_add(1);
             self.write_inode(new_parent_inode_no, &new_parent).await?;
             // Rewrite target's ".." to point at the new parent.
-            let mut target = self.read_inode(target_ino).await?;
+            let target = self.read_inode(target_ino).await?;
             let bs = self.block_size();
             // ".." is the second entry in the first block.
             let phys = self.map_block(&target, 0).await?;

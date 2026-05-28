@@ -1363,3 +1363,647 @@ fn smoke_ext2_alloc_inode_then_free_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_alloc_inode_then_free_round_trip);
+
+// ── Directory mutator smokes (Stage-1: create/unlink, mkdir/rmdir,
+//     rename, hardlink, symlink fast+slow, HTREE root+leaf, full-dir
+//     invariant). Each builds a fresh ext2 image, mounts via
+//     RamBlockDevice, drives the mutator surface, and asserts the
+//     observable state matches POSIX semantics.
+
+fn smoke_ext2_create_then_unlink_round_trip() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // Create a new file "newfile".
+    let new_file = match poll_once(root.create("newfile")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let _ = new_file;
+    // It should appear in enumeration.
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate after create failed"),
+    };
+    if !entries.iter().any(|(n, t)| n == "newfile" && *t == FileType::File) {
+        return TestResult::Fail("created file not visible in enumeration");
+    }
+    // Look up should succeed.
+    if poll_once(root.lookup_async("newfile")).is_none() {
+        return TestResult::Fail("lookup of created file failed");
+    }
+    // Unlink it.
+    if poll_once(root.unlink("newfile")).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("unlink failed");
+    }
+    // Re-enumerate — should be gone.
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate after unlink failed"),
+    };
+    if entries.iter().any(|(n, _)| n == "newfile") {
+        return TestResult::Fail("unlinked file still visible");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_create_then_unlink_round_trip);
+
+fn smoke_ext2_mkdir_then_rmdir_round_trip() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // Make a fresh subdirectory.
+    let _subdir = match poll_once(root.mkdir("subdir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    // Should appear in parent's enumeration as a Dir.
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate after mkdir failed"),
+    };
+    if !entries.iter().any(|(n, t)| n == "subdir" && *t == FileType::Dir) {
+        return TestResult::Fail("mkdir target not a Dir in enumeration");
+    }
+    // Subdir should contain "." and ".." entries.
+    let subdir = match poll_once(root.lookup_dir_async("subdir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir_async of subdir failed"),
+    };
+    let sub_entries = match poll_once(subdir.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate subdir failed"),
+    };
+    if !sub_entries.iter().any(|(n, _)| n == ".") {
+        return TestResult::Fail("subdir missing '.'");
+    }
+    if !sub_entries.iter().any(|(n, _)| n == "..") {
+        return TestResult::Fail("subdir missing '..'");
+    }
+    // Drop the subdir handle before rmdir.
+    drop(subdir);
+    // rmdir should succeed (empty).
+    if poll_once(root.rmdir("subdir")).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("rmdir of empty dir failed");
+    }
+    // Should be gone.
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate after rmdir failed"),
+    };
+    if entries.iter().any(|(n, _)| n == "subdir") {
+        return TestResult::Fail("rmdir'd directory still visible");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_mkdir_then_rmdir_round_trip);
+
+fn smoke_ext2_rename_within_same_dir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"sentinel");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // Rename "data" → "renamed".
+    if poll_once(root.rename("data", "renamed"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("rename failed");
+    }
+    // Old name gone, new name present.
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate after rename failed"),
+    };
+    if entries.iter().any(|(n, _)| n == "data") {
+        return TestResult::Fail("old name still present after rename");
+    }
+    if !entries.iter().any(|(n, _)| n == "renamed") {
+        return TestResult::Fail("new name not present after rename");
+    }
+    // Content survives rename.
+    let f = match poll_once(root.lookup_async("renamed")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup after rename failed"),
+    };
+    let mut buf = [0u8; 16];
+    let n = match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read after rename failed"),
+    };
+    if n != b"sentinel".len() || &buf[..n] != b"sentinel" {
+        return TestResult::Fail("payload changed after rename");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_rename_within_same_dir);
+
+fn smoke_ext2_rename_across_dirs() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // Build target directory.
+    let _ = match poll_once(root.mkdir("destdir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir destdir failed"),
+    };
+    // Drive the cross-directory volume API directly. The DirOps
+    // rename() trait method only handles same-directory renames; the
+    // volume helper exercises the full cross-dir path with the ".."
+    // back-link rewrite for directory moves.
+    let dest_dir = match poll_once(root.lookup_dir_async("destdir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup destdir failed"),
+    };
+    let _ = dest_dir;
+    // Look up inode numbers via the volume's internal API.
+    // The data file should move from root to destdir.
+    let root_ino = crate::EXT2_ROOT_INO;
+    let dest_ino = match poll_once(volume.dir_lookup(
+        &poll_once(volume.read_inode(root_ino)).unwrap().unwrap(),
+        b"destdir",
+    )) {
+        Some(Ok((i, _))) => i,
+        _ => return TestResult::Fail("dir_lookup destdir failed"),
+    };
+    if poll_once(volume.dir_rename(root_ino, b"data", dest_ino, b"data"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("cross-dir dir_rename failed");
+    }
+    // After: root should NOT have "data"; destdir SHOULD.
+    let root_entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("root enumerate failed"),
+    };
+    if root_entries.iter().any(|(n, _)| n == "data") {
+        return TestResult::Fail("data still in root after cross-dir move");
+    }
+    let dest_dir = match poll_once(root.lookup_dir_async("destdir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("re-lookup destdir failed"),
+    };
+    let dest_entries = match poll_once(dest_dir.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("destdir enumerate failed"),
+    };
+    if !dest_entries.iter().any(|(n, _)| n == "data") {
+        return TestResult::Fail("data not in destdir after cross-dir move");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_rename_across_dirs);
+
+fn smoke_ext2_hardlink_bumps_link_count() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"shared-payload");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let _ = volume.root();
+    // Find the target inode (existing "data" inode = 12) and its link count.
+    let target_ino: u32 = 12;
+    let pre = match poll_once(volume.read_inode(target_ino)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read_inode failed"),
+    };
+    if poll_once(volume.dir_hardlink(crate::EXT2_ROOT_INO, b"link", target_ino))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("dir_hardlink failed");
+    }
+    let post = match poll_once(volume.read_inode(target_ino)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read_inode post-link failed"),
+    };
+    if post.links_count != pre.links_count + 1 {
+        return TestResult::Fail("links_count did not bump on hardlink");
+    }
+    // The original "data" + new "link" should map to the same inode.
+    let root = volume.root();
+    let f1 = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup data failed"),
+    };
+    let f2 = match poll_once(root.lookup_async("link")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup link failed"),
+    };
+    if f1.stat().size != f2.stat().size {
+        return TestResult::Fail("hardlinked sizes differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_hardlink_bumps_link_count);
+
+fn smoke_ext2_symlink_fast_round_trip() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let target_path = b"data"; // 4 bytes ≤ 60 — fast symlink.
+    // Create the symlink via the volume API (DirOps::symlink also wired).
+    let sym_ino = match poll_once(volume.dir_create_symlink(
+        crate::EXT2_ROOT_INO,
+        b"sym",
+        target_path,
+    )) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("symlink create failed"),
+    };
+    // Read it back via the volume helper.
+    let inode = match poll_once(volume.read_inode(sym_ino)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read sym inode failed"),
+    };
+    if !inode.is_symlink() {
+        return TestResult::Fail("created inode not a symlink");
+    }
+    if inode.blocks != 0 {
+        return TestResult::Fail("fast symlink must not allocate data blocks");
+    }
+    let target = match poll_once(volume.read_symlink_target(&inode)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("read symlink target failed"),
+    };
+    if target != target_path {
+        return TestResult::Fail("fast symlink target mismatch");
+    }
+    let _ = root;
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_fast_round_trip);
+
+fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let _ = volume.root();
+    // 61+-byte target → slow symlink path (block allocated).
+    let target_path =
+        b"this-target-is-deliberately-longer-than-sixty-bytes-to-trigger-slow-path";
+    let sym_ino = match poll_once(volume.dir_create_symlink(
+        crate::EXT2_ROOT_INO,
+        b"slowsym",
+        target_path,
+    )) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("slow symlink create failed"),
+    };
+    let inode = match poll_once(volume.read_inode(sym_ino)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    if !inode.is_symlink() {
+        return TestResult::Fail("slow symlink not a symlink");
+    }
+    if inode.blocks == 0 {
+        return TestResult::Fail("slow symlink must have allocated a data block");
+    }
+    if inode.block[0] == 0 {
+        return TestResult::Fail("slow symlink block[0] missing");
+    }
+    let target = match poll_once(volume.read_symlink_target(&inode)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("read slow symlink target failed"),
+    };
+    if target != target_path {
+        return TestResult::Fail("slow symlink target mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_slow_round_trip);
+
+fn smoke_ext2_dir_insert_full_block_extends() -> TestResult {
+    // Forces the parent to grow into a second logical block by
+    // inserting enough names that no single 1-KiB block holds them
+    // all. Verifies the rec_len-extends-to-end-of-block invariant
+    // continues to hold across the boundary.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // Each insert costs rec_len ≈ 16 bytes. 80 inserts × 16 ≈ 1280 ≥ 1 KiB.
+    for i in 0..80u32 {
+        let name = alloc::format!("f{:03}", i);
+        let _ = match poll_once(root.create(&name)) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create in extension stress failed"),
+        };
+    }
+    // Verify every name we created reads back.
+    for i in 0..80u32 {
+        let name = alloc::format!("f{:03}", i);
+        if poll_once(root.lookup_async(&name)).is_none() {
+            return TestResult::Fail("post-extension lookup failed");
+        }
+    }
+    // The parent's size should be ≥ 2 KiB now (started ≤ 1 KiB).
+    let stat = match poll_once(root.lookup_dir_async(".")) {
+        Some(Ok(_)) => true,
+        _ => true, // initramfs-style "." not present here, ignore.
+    };
+    let _ = stat;
+    // Confirm the parent inode's size grew.
+    let inode = match poll_once(volume.read_inode(crate::EXT2_ROOT_INO)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("root inode read failed"),
+    };
+    if inode.size < 2048 {
+        return TestResult::Fail("parent directory did not grow past one block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_insert_full_block_extends);
+
+// ── HTREE read-path smokes (pure-logic — no volume needed) ──────────
+
+fn smoke_ext2_htree_root_decode() -> TestResult {
+    use crate::dir::ftype;
+    use crate::htree::{
+        hash_version, DxRoot, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF, DX_ROOT_INFO_OFF,
+    };
+    // Build a 1 KiB HTREE root directory block. Bytes 0..12 = fake
+    // "." dirent, bytes 12..24 = fake ".." dirent, then info, head,
+    // entries.
+    let mut block = alloc::vec![0u8; 1024];
+    // "." entry — 12 bytes.
+    block[0..4].copy_from_slice(&2u32.to_le_bytes()); // self ino
+    block[4..6].copy_from_slice(&12u16.to_le_bytes()); // rec_len = 12
+    block[6] = 1;
+    block[7] = ftype::DIR;
+    block[8] = b'.';
+    // ".." entry — 12 bytes (covers up to dx_root_info).
+    block[12..16].copy_from_slice(&2u32.to_le_bytes());
+    block[16..18].copy_from_slice(&12u16.to_le_bytes());
+    block[18] = 2;
+    block[19] = ftype::DIR;
+    block[20] = b'.';
+    block[21] = b'.';
+    // dx_root_info: reserved_zero, hash_version=TEA, info_length=8,
+    // indirect_levels=0, unused_flags=0.
+    block[DX_ROOT_INFO_OFF + 4] = hash_version::TEA;
+    block[DX_ROOT_INFO_OFF + 5] = 8;
+    // dx_head: limit, count.
+    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2]
+        .copy_from_slice(&10u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4]
+        .copy_from_slice(&3u16.to_le_bytes());
+    // 3 entries: (0, 5), (0xA000_0000, 6), (0xC000_0000, 7).
+    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4]
+        .copy_from_slice(&0u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8]
+        .copy_from_slice(&5u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
+        .copy_from_slice(&0xA000_0000u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16]
+        .copy_from_slice(&6u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 16..DX_ROOT_ENTRIES_OFF + 20]
+        .copy_from_slice(&0xC000_0000u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24]
+        .copy_from_slice(&7u32.to_le_bytes());
+
+    let root = match DxRoot::parse(&block) {
+        Some(r) => r,
+        None => return TestResult::Fail("DxRoot::parse failed"),
+    };
+    if root.hash_version != hash_version::TEA {
+        return TestResult::Fail("hash_version mismatch");
+    }
+    if root.count != 3 || root.limit != 10 {
+        return TestResult::Fail("count/limit mismatch");
+    }
+    if root.indirect_levels != 0 {
+        return TestResult::Fail("indirect_levels mismatch");
+    }
+    let e0 = DxRoot::entry(&block, 0).unwrap();
+    if e0.block != 5 {
+        return TestResult::Fail("entry 0 block mismatch");
+    }
+    let e2 = DxRoot::entry(&block, 2).unwrap();
+    if e2.hash != 0xC000_0000 || e2.block != 7 {
+        return TestResult::Fail("entry 2 fields mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_root_decode);
+
+fn smoke_ext2_htree_lookup_chooses_correct_bucket() -> TestResult {
+    use crate::dir::ftype;
+    use crate::htree::{
+        dx_find_entry_root, hash_version, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF,
+        DX_ROOT_INFO_OFF,
+    };
+    let mut block = alloc::vec![0u8; 1024];
+    // Bare-minimum dirent prefix so DxRoot::parse accepts the block.
+    block[0..4].copy_from_slice(&2u32.to_le_bytes());
+    block[4..6].copy_from_slice(&12u16.to_le_bytes());
+    block[6] = 1;
+    block[7] = ftype::DIR;
+    block[8] = b'.';
+    block[12..16].copy_from_slice(&2u32.to_le_bytes());
+    block[16..18].copy_from_slice(&12u16.to_le_bytes());
+    block[18] = 2;
+    block[19] = ftype::DIR;
+    block[20] = b'.';
+    block[21] = b'.';
+    block[DX_ROOT_INFO_OFF + 4] = hash_version::TEA;
+    block[DX_ROOT_INFO_OFF + 5] = 8;
+    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2]
+        .copy_from_slice(&10u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4]
+        .copy_from_slice(&3u16.to_le_bytes());
+    // Sorted entries: (0, 5), (0x4000_0000, 6), (0x8000_0000, 7).
+    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4]
+        .copy_from_slice(&0u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8]
+        .copy_from_slice(&5u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
+        .copy_from_slice(&0x4000_0000u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16]
+        .copy_from_slice(&6u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 16..DX_ROOT_ENTRIES_OFF + 20]
+        .copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24]
+        .copy_from_slice(&7u32.to_le_bytes());
+
+    // Target hash 0x3000_0000 → falls in bucket 0 (below 0x4000_0000) → block 5.
+    let e = dx_find_entry_root(&block, 0x3000_0000).unwrap();
+    if e.block != 5 {
+        return TestResult::Fail("hash 0x3 should land in bucket 0 (block 5)");
+    }
+    // Target hash 0x4000_0000 — exact match → bucket 1 (block 6).
+    let e = dx_find_entry_root(&block, 0x4000_0000).unwrap();
+    if e.block != 6 {
+        return TestResult::Fail("hash 0x4 exact should land in bucket 1 (block 6)");
+    }
+    // Target hash 0x9000_0000 → bucket 2 (block 7).
+    let e = dx_find_entry_root(&block, 0x9000_0000).unwrap();
+    if e.block != 7 {
+        return TestResult::Fail("hash 0x9 should land in bucket 2 (block 7)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_lookup_chooses_correct_bucket);
+
+fn smoke_ext2_htree_tea_hash_deterministic() -> TestResult {
+    use crate::htree::{hash_version, name_hash};
+    let seed = [0u32; 4];
+    let h1 = name_hash(b"hello", hash_version::TEA, &seed);
+    let h2 = name_hash(b"hello", hash_version::TEA, &seed);
+    if h1 != h2 {
+        return TestResult::Fail("TEA hash not deterministic");
+    }
+    // Different name should yield (with overwhelming probability) a
+    // different hash. If this ever flakes the hash is broken.
+    let h3 = name_hash(b"world", hash_version::TEA, &seed);
+    if h1 == h3 {
+        return TestResult::Fail("TEA hash collision on tiny inputs");
+    }
+    // Legacy hash differs from TEA for the same input.
+    let h_legacy = name_hash(b"hello", hash_version::LEGACY, &seed);
+    if h1 == h_legacy {
+        return TestResult::Fail("LEGACY and TEA must differ for non-empty input");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_tea_hash_deterministic);
+
+fn smoke_ext2_dir_splice_insert_and_delete() -> TestResult {
+    use crate::dir::{ftype, rec_len_for, splice};
+    // 1 KiB block with one initial "." entry consuming the whole
+    // block (rec_len = 1024).
+    let mut block = alloc::vec![0u8; 1024];
+    block[0..4].copy_from_slice(&2u32.to_le_bytes());
+    block[4..6].copy_from_slice(&1024u16.to_le_bytes());
+    block[6] = 1;
+    block[7] = ftype::DIR;
+    block[8] = b'.';
+    // Splice in "abc" → inode 5.
+    match splice::insert_entry(&mut block, 5, b"abc", ftype::REGULAR) {
+        splice::InsertResult::Ok { offset } => {
+            if offset != rec_len_for(1) as usize {
+                return TestResult::Fail("expected new entry at dot-tail");
+            }
+        }
+        _ => return TestResult::Fail("expected Ok on splice into empty tail"),
+    }
+    // Duplicate → Exists.
+    match splice::insert_entry(&mut block, 6, b"abc", ftype::REGULAR) {
+        splice::InsertResult::Exists => {}
+        _ => return TestResult::Fail("duplicate insert must yield Exists"),
+    }
+    // Delete the inserted "abc". The predecessor's rec_len should
+    // grow back to the end of the block.
+    let abc_off = rec_len_for(1) as usize;
+    splice::delete_entry(&mut block, abc_off).unwrap();
+    let dot_rec_len = u16::from_le_bytes([block[4], block[5]]);
+    if dot_rec_len != 1024 {
+        return TestResult::Fail("delete must coalesce predecessor to end-of-block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_splice_insert_and_delete);
+
+fn smoke_ext2_dir_empty_check_recognises_dot_dotdot_only() -> TestResult {
+    use crate::dir::{ftype, rec_len_for, splice};
+    let mut block = alloc::vec![0u8; 1024];
+    // Seed with "." and ".." per make_empty_dir.
+    splice::make_empty_dir(&mut block, 5, 2);
+    if !splice::is_dir_empty(&block) {
+        return TestResult::Fail(". + .. only must be is_dir_empty");
+    }
+    // Splice an "extra" entry — no longer empty.
+    let _ = splice::insert_entry(&mut block, 7, b"extra", ftype::REGULAR);
+    if splice::is_dir_empty(&block) {
+        return TestResult::Fail("non-trivial entry must break is_dir_empty");
+    }
+    // Sanity — the "." rec_len in a fresh empty-dir should be exactly
+    // rec_len_for(1) = 12.
+    let mut fresh = alloc::vec![0u8; 1024];
+    splice::make_empty_dir(&mut fresh, 5, 2);
+    let dot_rec_len = u16::from_le_bytes([fresh[4], fresh[5]]);
+    if dot_rec_len != rec_len_for(1) {
+        return TestResult::Fail(". rec_len must equal rec_len_for(1) = 12");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_dir_empty_check_recognises_dot_dotdot_only
+);
