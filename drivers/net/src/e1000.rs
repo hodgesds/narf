@@ -747,7 +747,7 @@ impl E1000 {
     pub unsafe fn bring_up(
         device: &BusDevice,
         cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Self, E1000Error> {
+    ) -> Result<(Self, Producer<Frame, RX_RING_N>, Consumer<Frame, TX_RING_N>), E1000Error> {
         // SAFETY: caller owns the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| E1000Error::BarMapFailed)?;
 
@@ -967,7 +967,7 @@ impl E1000 {
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
-        let e1000 = Arc::new(Self {
+        let e1000 = Self {
             mmio,
             tx_ring,
             tx_pool,
@@ -983,12 +983,13 @@ impl E1000 {
             me_active,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
-        });
+        };
 
-        // Spawn pumps
-        spawn_pumps(e1000.clone(), rx_prod, tx_cons);
-
-        Ok(Arc::try_unwrap(e1000).map_err(|_| E1000Error::Other("Arc unwrap failed"))?)
+        // Pump tasks are spawned by the caller (probe) once it has
+        // wrapped self in Arc — spawning here would prevent bring_up
+        // from returning Self because the Arc clones inside spawn_pumps
+        // keep the refcount above 1, making Arc::try_unwrap fail.
+        Ok((e1000, rx_prod, tx_cons))
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT
@@ -1288,11 +1289,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over device.
-    let dev = match unsafe { E1000::bring_up(&device, &cap) } {
-        Ok(d) => Arc::new(d),
+    let (dev_inner, rx_prod, tx_cons) = match unsafe { E1000::bring_up(&device, &cap) } {
+        Ok(t) => t,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    let dev = Arc::new(dev_inner);
     *CONTROLLER.lock() = Some(dev.clone());
+    spawn_pumps(dev.clone(), rx_prod, tx_cons);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
