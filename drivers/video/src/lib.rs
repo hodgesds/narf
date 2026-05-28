@@ -46,6 +46,11 @@ pub mod amd_mp2_isp;
 // ── MIPI-CSI sensor interface ───────────────────────────────────────
 pub mod sensor;
 
+// ── Per-sensor drivers ──────────────────────────────────────────────
+pub mod ov01a1s;
+pub mod ov02c10;
+pub mod ov05c10;
+
 mod tests;
 
 // ── V4L2-compatible buffer-queue types ─────────────────────────────

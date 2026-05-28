@@ -21,6 +21,7 @@ narf-bus             = { path = "../../bus" }
 narf-init            = { path = "../../init" }
 narf-drivers-i2c     = { path = "../i2c" }
 narf-console         = { path = "../../console" }
+narf-scheduler       = { path = "../../scheduler" }
 
 [features]
 kernel-test = []

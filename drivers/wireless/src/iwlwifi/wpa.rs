@@ -138,7 +138,10 @@ impl Sha1 {
 // ── HMAC-SHA1 (RFC 2104 §2) ─────────────────────────────────────────
 
 /// HMAC-SHA1. Returns the 20-byte MAC.
+///
 /// Key longer than 64 bytes is pre-hashed per RFC 2104 §2.
+/// Used both by the 4-way handshake PRF and by the group-rekey
+/// MIC validation path (`rekey::group_rekey_handle_m1`).
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     // Key normalisation.
     let mut k = [0u8; 64];

@@ -266,3 +266,161 @@ fn smoke_sensor_info_descriptors() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/video", smoke_sensor_info_descriptors);
+
+// ── Smoke 7: OV01A1S chip-ID constant + init table ───────────────────
+
+/// OV01A1S: chip-ID, I2C address, and init table sanity.
+///
+/// The synthetic I2C bus is not needed here — we verify the static
+/// constants and table lengths that the driver uses at probe time.
+fn smoke_ov01a1s_chip_id_and_table() -> TestResult {
+    use crate::ov01a1s;
+
+    // I2C address must be 0x60 (OmniVision OV01A1S datasheet).
+    if ov01a1s::I2C_ADDR != 0x60 {
+        return TestResult::Fail("OV01A1S I2C addr should be 0x60");
+    }
+
+    // Chip-ID register at 0x300A (OV01A1S = ov01a10 in Linux; same silicon).
+    if ov01a1s::CHIP_ID_REG != 0x300A {
+        return TestResult::Fail("OV01A1S chip-ID reg should be 0x300A");
+    }
+
+    // Expected 24-bit chip-ID.
+    if ov01a1s::CHIP_ID != 0x56_01_41 {
+        return TestResult::Fail("OV01A1S chip-ID should be 0x560141");
+    }
+
+    // Global init table must be non-empty and contain the stream-ctrl
+    // register 0x3002 (first entry in Linux's ov01a10_global_setting).
+    if ov01a1s::GLOBAL_INIT_TABLE.is_empty() {
+        return TestResult::Fail("OV01A1S global init table is empty");
+    }
+    let has_0x3002 = ov01a1s::GLOBAL_INIT_TABLE.iter().any(|&(r, _)| r == 0x3002);
+    if !has_0x3002 {
+        return TestResult::Fail("OV01A1S init table missing reg 0x3002");
+    }
+
+    // PLL table must contain the system reset entry 0x0103.
+    let has_reset = ov01a1s::MIPI_PLL_TABLE.iter().any(|&(r, _)| r == 0x0103);
+    if !has_reset {
+        return TestResult::Fail("OV01A1S PLL table missing 0x0103 reset");
+    }
+
+    // MIPI config: 1-lane 400 MHz (confirmed by Linux ov01a10.c).
+    if ov01a1s::MIPI.num_data_lanes != 1 {
+        return TestResult::Fail("OV01A1S should use 1 MIPI lane");
+    }
+    if ov01a1s::MIPI.link_freq_hz != 400_000_000 {
+        return TestResult::Fail("OV01A1S link freq should be 400 MHz");
+    }
+
+    // SensorDriver::info() matches the static INFO descriptor.
+    let drv = ov01a1s::Ov01a1s;
+    let info = crate::sensor::SensorDriver::info(&drv);
+    if info.i2c_addr != 0x60 {
+        return TestResult::Fail("Ov01a1s::info i2c_addr wrong");
+    }
+    if info.max_width != 1280 || info.max_height != 800 {
+        return TestResult::Fail("Ov01a1s::info resolution wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video", smoke_ov01a1s_chip_id_and_table);
+
+// ── Smoke 8: OV02C10 register-init table length ───────────────────────
+
+/// OV02C10: init table length sanity + 2-lane supplement table presence.
+fn smoke_ov02c10_init_table_length() -> TestResult {
+    use crate::ov02c10;
+
+    // I2C address 0x36 (Linux ov02c10.c OV02C10_CHIP_ID / I2C address).
+    if ov02c10::I2C_ADDR != 0x36 {
+        return TestResult::Fail("OV02C10 I2C addr should be 0x36");
+    }
+
+    // Chip-ID 0x5602 (Linux ov02c10.c: OV02C10_CHIP_ID = 0x5602).
+    if ov02c10::CHIP_ID != 0x5602 {
+        return TestResult::Fail("OV02C10 chip-ID should be 0x5602");
+    }
+
+    // Base init table: ported from sensor_1928x1092_30fps_setting; the
+    // Linux table has 101 entries, our port should have ≥ 80.
+    let base_len = ov02c10::INIT_1928X1092_TABLE.len();
+    if base_len < 80 {
+        return TestResult::Fail("OV02C10 base init table too short (< 80)");
+    }
+
+    // The table must include the window-size registers 0x3808/0x3809.
+    let has_width_hi = ov02c10::INIT_1928X1092_TABLE.iter().any(|&(r, _)| r == 0x3808);
+    let has_width_lo = ov02c10::INIT_1928X1092_TABLE.iter().any(|&(r, _)| r == 0x3809);
+    if !has_width_hi || !has_width_lo {
+        return TestResult::Fail("OV02C10 init table missing output-size regs");
+    }
+
+    // 2-lane supplement table must be non-empty.
+    if ov02c10::LANE2_SUPP_TABLE.is_empty() {
+        return TestResult::Fail("OV02C10 2-lane table is empty");
+    }
+
+    // MIPI config: 2 lanes, 400 MHz.
+    if ov02c10::MIPI.num_data_lanes != 2 {
+        return TestResult::Fail("OV02C10 should use 2 MIPI lanes");
+    }
+    if ov02c10::MIPI.link_freq_hz != 400_000_000 {
+        return TestResult::Fail("OV02C10 link freq should be 400 MHz");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video", smoke_ov02c10_init_table_length);
+
+// ── Smoke 9: OV05C10 MIPI lane count + link frequency ────────────────
+
+/// OV05C10: MIPI lane count, link frequency, and resolution metadata.
+fn smoke_ov05c10_mipi_lane_count_and_link_freq() -> TestResult {
+    use crate::ov05c10;
+
+    // I2C address 0x10.
+    if ov05c10::I2C_ADDR != 0x10 {
+        return TestResult::Fail("OV05C10 I2C addr should be 0x10");
+    }
+
+    // 2 data lanes (matches ipu-bridge.c IPU_SENSOR_CONFIG for "OVTI05C1").
+    if ov05c10::MIPI.num_data_lanes != 2 {
+        return TestResult::Fail("OV05C10 should use 2 MIPI lanes");
+    }
+
+    // Link frequency 480 MHz (ipu-bridge.c: 480000000).
+    if ov05c10::MIPI.link_freq_hz != 480_000_000 {
+        return TestResult::Fail("OV05C10 link freq should be 480 MHz");
+    }
+
+    // Full-resolution: 2592×1944 (5 MP OmniVision sensor).
+    if ov05c10::INFO.max_width != 2592 {
+        return TestResult::Fail("OV05C10 width should be 2592");
+    }
+    if ov05c10::INFO.max_height != 1944 {
+        return TestResult::Fail("OV05C10 height should be 1944");
+    }
+
+    // Global init table must have ≥ 40 entries.
+    if ov05c10::GLOBAL_INIT_TABLE.len() < 40 {
+        return TestResult::Fail("OV05C10 init table too short");
+    }
+
+    // Table must contain the system-reset entry 0x0103.
+    let has_reset = ov05c10::GLOBAL_INIT_TABLE.iter().any(|&(r, _)| r == 0x0103);
+    if !has_reset {
+        return TestResult::Fail("OV05C10 init table missing 0x0103 reset");
+    }
+
+    // Chip-ID 0x5C10.
+    if ov05c10::CHIP_ID != 0x5C10 {
+        return TestResult::Fail("OV05C10 chip-ID should be 0x5C10");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video", smoke_ov05c10_mipi_lane_count_and_link_freq);

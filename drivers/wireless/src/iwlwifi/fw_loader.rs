@@ -605,6 +605,26 @@ pub mod tests {
         }
     }
 
+    // ── Smoke: DMA-coherent alloc returns valid phys address ──────
+
+    /// Verify that `DmaAllocatorImpl::alloc_coherent` returns a
+    /// non-null virtual pointer and a non-zero physical address.
+    /// This exercises the production `narf_io::alloc_coherent` path
+    /// that `load_firmware_gen2 / gen3` depend on.
+    fn smoke_iwlwifi_dma_coherent_alloc_returns_phys() -> TestResult {
+        let mut alloc = DmaAllocatorImpl::new();
+        let (vptr, phys) = alloc.alloc_coherent(4096);
+        if vptr.is_null() {
+            return TestResult::Fail("DmaAllocatorImpl returned null vptr");
+        }
+        if phys == 0 {
+            return TestResult::Fail("DmaAllocatorImpl returned zero phys address");
+        }
+        // Verify we can write into the buffer without fault.
+        unsafe { vptr.write_bytes(0xAB, 4096); }
+        TestResult::Pass
+    }
+
     kernel_test_in!(
         "drivers/wireless/iwlwifi/fw_loader",
         smoke_iwlwifi_fw_header_decode
@@ -624,5 +644,9 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/fw_loader",
         smoke_iwlwifi_fw_load_gen3_no_iml_returns_error
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/fw_loader",
+        smoke_iwlwifi_dma_coherent_alloc_returns_phys
     );
 }
