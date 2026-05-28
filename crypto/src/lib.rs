@@ -40,6 +40,7 @@ pub mod chacha20;
 pub mod curve25519;
 pub mod ed25519;
 pub mod hkdf;
+pub mod pbkdf2_sha1;
 pub mod poly1305;
 pub mod sha256;
 pub mod sha512;
