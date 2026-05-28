@@ -588,7 +588,7 @@ fn smoke_dp_aux_header_field_packing() -> TestResult {
     if (h >> 8) & 0x000F_FFFF != 0 {
         return TestResult::Fail("AUX address field should be zero");
     }
-    if (h >> 25) & 0x7F != 0 {
+    if (h >> 28) & 0xF != 0 {
         return TestResult::Fail("AUX size field should be 0 for 1-byte read");
     }
     // Write DPCD register 0x102 (training pattern), 1 byte.
@@ -598,6 +598,14 @@ fn smoke_dp_aux_header_field_packing() -> TestResult {
     }
     if (h2 >> 8) & 0x000F_FFFF != 0x102 {
         return TestResult::Fail("AUX address packing");
+    }
+    // Larger payload: 16 bytes → size-minus-1 = 15.
+    let h3 = aux_header(AuxCommand::I2cRead, 0x50, 16);
+    if (h3 >> 28) & 0xF != 15 {
+        return TestResult::Fail("16-byte read should pack size-1 = 15");
+    }
+    if (h3 >> 8) & 0x000F_FFFF != 0x50 {
+        return TestResult::Fail("16-byte read address should still be 0x50");
     }
     TestResult::Pass
 }
@@ -1425,4 +1433,220 @@ fn smoke_flip_head_vblank_interrupt_bit_layout() -> TestResult {
 kernel_test_in!(
     "drivers/nvidia/flip",
     smoke_flip_head_vblank_interrupt_bit_layout
+);
+
+// ────────────────────────────────────────────────────────────────
+// Pushbuffer assembly
+// ────────────────────────────────────────────────────────────────
+
+use crate::ce::{
+    CE_LINE_COUNT, CE_LINE_LENGTH_IN, CE_OFFSET_IN_LOWER, CE_OFFSET_IN_UPPER,
+    CE_OFFSET_OUT_LOWER, CE_OFFSET_OUT_UPPER,
+};
+use crate::pb::{append_fence_release, PbBuilder, PbError};
+
+fn smoke_pb_builder_writes_method_then_data_words() -> TestResult {
+    let mut buf = [0u8; 64];
+    let mut pb = PbBuilder::new(&mut buf);
+    if !pb.is_empty() {
+        return TestResult::Fail("fresh PbBuilder is empty");
+    }
+    // Inc-write to CE_OFFSET_IN_UPPER, 2 words.
+    pb.write_inc(CE_OFFSET_IN_UPPER, &[0xAAAA_AAAA, 0xBBBB_BBBB])
+        .unwrap();
+    if pb.len() != 12 {
+        return TestResult::Fail("Should have written header + 2 data = 12 bytes");
+    }
+    // Decode the header back: method = CE_OFFSET_IN_UPPER (0x400),
+    // size = 2, type = Inc (1).
+    let hdr = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if hdr & 0xFFFF != CE_OFFSET_IN_UPPER as u32 {
+        return TestResult::Fail("method low-16 in header word");
+    }
+    if (hdr >> 16) & 0x1FFF != 2 {
+        return TestResult::Fail("size field");
+    }
+    if (hdr >> 29) & 0x7 != 1 {
+        return TestResult::Fail("Inc type");
+    }
+    // Data word 0 = 0xAAAAAAAA, data word 1 = 0xBBBBBBBB.
+    let w0 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let w1 = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if w0 != 0xAAAA_AAAA || w1 != 0xBBBB_BBBB {
+        return TestResult::Fail("data words");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/pb",
+    smoke_pb_builder_writes_method_then_data_words
+);
+
+fn smoke_pb_builder_rejects_overflow() -> TestResult {
+    let mut buf = [0u8; 12];
+    let mut pb = PbBuilder::new(&mut buf);
+    // Header + 2 words = 12 bytes — fits.
+    pb.write_inc(CE_OFFSET_IN_UPPER, &[0, 0]).unwrap();
+    // Next write would overflow.
+    match pb.write_inc(CE_OFFSET_OUT_UPPER, &[0]) {
+        Err(PbError::BufferFull) => TestResult::Pass,
+        _ => TestResult::Fail("overflow should yield BufferFull"),
+    }
+}
+kernel_test_in!("drivers/nvidia/pb", smoke_pb_builder_rejects_overflow);
+
+fn smoke_pb_ce_copy_descriptor_full_assembly() -> TestResult {
+    // Build a complete CE copy pushbuffer: src/dst 64b, line
+    // length + count, LAUNCH_DMA.
+    let mut buf = [0u8; 128];
+    let mut pb = PbBuilder::new(&mut buf);
+    let src: u64 = 0x1234_5678_9ABC_DEF0;
+    let dst: u64 = 0x4000_0000_FACE_B00C;
+    pb.write_inc(
+        CE_OFFSET_IN_UPPER,
+        &[(src >> 32) as u32, (src & 0xFFFF_FFFF) as u32],
+    )
+    .unwrap();
+    pb.write_inc(
+        CE_OFFSET_OUT_UPPER,
+        &[(dst >> 32) as u32, (dst & 0xFFFF_FFFF) as u32],
+    )
+    .unwrap();
+    pb.write_inc(CE_LINE_LENGTH_IN, &[4096]).unwrap();
+    pb.write_inc(CE_LINE_COUNT, &[1]).unwrap();
+    pb.write_inc(CE_LAUNCH_DMA, &[crate::ce::CE_FLAGS_BLOCKING])
+        .unwrap();
+    // Bytes written: 5 headers (4 each) + 2+2+1+1+1 data (4 each) = 20+28 = 48.
+    if pb.len() != 48 {
+        return TestResult::Fail("expected total 48 bytes for full CE copy descriptor");
+    }
+    // Verify CE_OFFSET_IN_LOWER / CE_OFFSET_OUT_LOWER constants
+    // are consistent with the upper/+4 placement.
+    if CE_OFFSET_IN_LOWER != CE_OFFSET_IN_UPPER + 4 {
+        return TestResult::Fail("CE_OFFSET_IN_LOWER must follow UPPER by 4");
+    }
+    if CE_OFFSET_OUT_LOWER != CE_OFFSET_OUT_UPPER + 4 {
+        return TestResult::Fail("CE_OFFSET_OUT_LOWER must follow UPPER by 4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/pb",
+    smoke_pb_ce_copy_descriptor_full_assembly
+);
+
+fn smoke_pb_append_fence_release_emits_four_word_block() -> TestResult {
+    let mut buf = [0u8; 32];
+    let mut pb = PbBuilder::new(&mut buf);
+    let sem: u64 = 0x9999_8888_7777_6666;
+    let seq: u32 = 0xCAFE_F00D;
+    append_fence_release(&mut pb, sem, seq).unwrap();
+    // Header (4) + 4 data words = 20 bytes total.
+    if pb.len() != 20 {
+        return TestResult::Fail("fence release block should be 20 bytes");
+    }
+    let w_high = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let w_low = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let w_payload = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let w_op = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    if w_high != ((sem >> 32) as u32) {
+        return TestResult::Fail("SEMAPHOREA word should be high-half of address");
+    }
+    if w_low != (sem as u32) {
+        return TestResult::Fail("SEMAPHOREB word should be low-half of address");
+    }
+    if w_payload != seq {
+        return TestResult::Fail("SEMAPHOREC word should be payload");
+    }
+    if w_op != 1 {
+        return TestResult::Fail("SEMAPHORED word should be RELEASE (1)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/pb",
+    smoke_pb_append_fence_release_emits_four_word_block
+);
+
+// ────────────────────────────────────────────────────────────────
+// EDID-over-AUX
+// ────────────────────────────────────────────────────────────────
+
+use crate::edid_aux::{
+    aux_header_for_edid_read, aux_header_for_segment_select, validate_block, DDC_ADDR_EDID,
+    DDC_ADDR_SEGMENT, EDID_BLOCK_SIZE,
+};
+
+fn smoke_edid_aux_addresses_and_block_size() -> TestResult {
+    if DDC_ADDR_EDID != 0x50 {
+        return TestResult::Fail("EDID at I²C addr 0x50");
+    }
+    if DDC_ADDR_SEGMENT != 0x30 {
+        return TestResult::Fail("E-EDID segment register at 0x30");
+    }
+    if EDID_BLOCK_SIZE != 128 {
+        return TestResult::Fail("EDID block size is 128 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/edid_aux",
+    smoke_edid_aux_addresses_and_block_size
+);
+
+fn smoke_edid_aux_read_header_packs_correctly() -> TestResult {
+    let h = aux_header_for_edid_read(0, 16);
+    // Low nibble = I2cRead (1).
+    if h & 0xF != 1 {
+        return TestResult::Fail("AUX command should be I2cRead");
+    }
+    if (h >> 8) & 0x000F_FFFF != DDC_ADDR_EDID {
+        return TestResult::Fail("address field should be 0x50");
+    }
+    // size 16 → size-minus-1 = 15, packed in bits[31:28].
+    if (h >> 28) & 0xF != 15 {
+        return TestResult::Fail("size field should be 15");
+    }
+    let s = aux_header_for_segment_select();
+    if s & 0xF != 0 {
+        return TestResult::Fail("segment-select uses I2cWrite (0)");
+    }
+    if (s >> 8) & 0x000F_FFFF != DDC_ADDR_SEGMENT {
+        return TestResult::Fail("segment register at 0x30");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/edid_aux",
+    smoke_edid_aux_read_header_packs_correctly
+);
+
+fn smoke_edid_block_signature_and_checksum_validation() -> TestResult {
+    let mut block = [0u8; EDID_BLOCK_SIZE];
+    // Valid header.
+    block[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // Make the last byte the checksum so the sum is zero mod 256.
+    let mut sum: u8 = 0;
+    for b in block[..127].iter() {
+        sum = sum.wrapping_add(*b);
+    }
+    block[127] = 0u8.wrapping_sub(sum);
+    if validate_block(&block).is_err() {
+        return TestResult::Fail("valid EDID block must pass validation");
+    }
+    // Break the checksum.
+    block[127] = block[127].wrapping_add(1);
+    if validate_block(&block).is_ok() {
+        return TestResult::Fail("corrupt checksum must be detected");
+    }
+    // Break the signature.
+    block[0] = 0xAA;
+    if validate_block(&block).is_ok() {
+        return TestResult::Fail("bad signature must be detected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/edid_aux",
+    smoke_edid_block_signature_and_checksum_validation
 );

@@ -95,16 +95,20 @@ impl AuxCommand {
 
 /// Encode the SOR_DP_AUX_CH_CTL header word.
 ///
-/// Layout (per nvkm/engine/disp/outp.c::g94_sor_dp_aux_xfer):
+/// Layout (per `dev_disp.ref.txt::NV_PDISP_SOR_DP_AUXCTL` and
+/// `nvkm/engine/disp/outp.c`):
 ///
-///   bits[3:0]   command (DPCD r/w, I²C r/w)
-///   bits[7:4]   reserved
-///   bits[24:8]  20-bit address
-///   bits[31:25] payload size - 1 (bytes 1..16)
+/// ```text
+///   bits[3:0]    command (DPCD r/w, I²C r/w)
+///   bits[7:4]    reserved
+///   bits[27:8]   20-bit address (only [15:0] used for I²C; 20 bits
+///                for native DPCD which is the wider space)
+///   bits[31:28]  payload-size-minus-1 (1..16 bytes → 0..15)
+/// ```
 pub const fn aux_header(cmd: AuxCommand, addr: u32, size: u8) -> u32 {
     let c = (cmd.code() as u32) & 0xF;
     let a = (addr & 0x000F_FFFF) << 8;
-    let s = ((size.saturating_sub(1) as u32) & 0x7F) << 25;
+    let s = ((size.saturating_sub(1) as u32) & 0xF) << 28;
     c | a | s
 }
 
