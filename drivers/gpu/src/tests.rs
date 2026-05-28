@@ -4803,7 +4803,8 @@ fn smoke_drm_getcap_shape() -> TestResult {
     arg[0..8].copy_from_slice(&drm_cap::PRIME.to_le_bytes());
     match dispatch(&mut card, 0x0C, &arg, &ctx) {
         Ok(DrmIoctlResult::GetCap(cap)) => {
-            if cap.value != 0 { return TestResult::Fail("PRIME should be 0 (deferred)"); }
+            // EXPORT(1) | IMPORT(2) = 3 — both implemented via PrimeTable.
+            if cap.value != 3 { return TestResult::Fail("PRIME should be 3 (EXPORT|IMPORT)"); }
         }
         _ => return TestResult::Fail("GET_CAP PRIME failed"),
     }
@@ -5235,6 +5236,73 @@ fn smoke_drm_sched_drain_runs_all() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_drain_runs_all);
+
+// ── DRM PRIME fd-handoff smokes ───────────────────────────────────────
+
+fn smoke_drm_prime_handle_fd_handle_roundtrip() -> TestResult {
+    use crate::dmabuf::export;
+    use crate::drm::prime::{PrimeError, PrimeTable};
+    let buf = export(0x4000_0000, 4096, &NULL_OPS).expect("export");
+    let mut tbl = PrimeTable::new();
+    let handle: u32 = 0x42;
+    let fd = tbl.handle_to_fd(handle, buf.clone()).expect("handle_to_fd");
+    if fd < 4096 { return TestResult::Fail("fd should be >= 4096"); }
+    let recovered = tbl.fd_to_handle(fd).expect("fd_to_handle");
+    if recovered != handle { return TestResult::Fail("handle didn't round-trip"); }
+    // Second export of the same handle reuses the fd (cache hit).
+    let fd2 = tbl.handle_to_fd(handle, buf.clone()).expect("handle_to_fd repeat");
+    if fd2 != fd { return TestResult::Fail("repeat handle_to_fd should reuse fd"); }
+    // Bad fd is rejected.
+    if !matches!(tbl.fd_to_handle(123), Err(PrimeError::BadFd)) {
+        return TestResult::Fail("fd < 4096 should be BadFd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_prime_handle_fd_handle_roundtrip);
+
+fn smoke_drm_prime_cross_table_import() -> TestResult {
+    // Exporter (driver A) hands an fd to importer (driver B). Both
+    // tables reach the same dma_buf physical address — i.e. the
+    // userspace cross-driver zero-copy fast path.
+    use crate::dmabuf::export;
+    use crate::drm::prime::PrimeTable;
+    let buf = export(0x5000_0000, 8192, &NULL_OPS).expect("export");
+    let mut tbl_a = PrimeTable::new();
+    let mut tbl_b = PrimeTable::new();
+    let handle_a: u32 = 1;
+    let fd = tbl_a.handle_to_fd(handle_a, buf.clone()).expect("A export");
+    // Importer recovers the dma_buf from the fd (here directly via
+    // exporter's cache; in the kernel this goes through the global fd
+    // table).
+    let buf_b = tbl_a.fd_to_buf(fd).expect("recover buf").clone();
+    let handle_b: u32 = 99;
+    tbl_b.import_binding(fd, handle_b, buf_b.clone()).expect("B import");
+    if tbl_b.fd_to_handle(fd).expect("B fd_to_handle") != handle_b {
+        return TestResult::Fail("imported handle wrong");
+    }
+    if tbl_b.fd_to_buf(fd).expect("B fd_to_buf").phys() != buf.phys() {
+        return TestResult::Fail("imported dma_buf phys mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_prime_cross_table_import);
+
+fn smoke_drm_prime_drop_handle_clears_binding() -> TestResult {
+    use crate::dmabuf::export;
+    use crate::drm::prime::{PrimeError, PrimeTable};
+    let buf = export(0x6000_0000, 4096, &NULL_OPS).expect("export");
+    let mut tbl = PrimeTable::new();
+    let fd = tbl.handle_to_fd(1, buf.clone()).expect("export");
+    if tbl.len() != 1 { return TestResult::Fail("len after export"); }
+    tbl.drop_handle(1).expect("drop");
+    if !tbl.is_empty() { return TestResult::Fail("table not empty after drop"); }
+    // Subsequent fd lookup must miss.
+    if !matches!(tbl.fd_to_handle(fd), Err(PrimeError::NotFound)) {
+        return TestResult::Fail("fd should be NotFound after drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_prime_drop_handle_clears_binding);
 
 // ── amdgpu/smu v12+v13 opcode tables ───────────────────────────────
 //

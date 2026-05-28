@@ -47,4 +47,4 @@ pub use syncobj::{BinaryFence, DmaFence, SyncError, SyncObj, SyncObjTable};
 pub use scheduler::{
     Job, JobFence, JobPayload, NoopPayload, Priority, Sched, SchedContext, SchedError,
 };
-pub use prime::{PrimeError, PrimeTable};
+pub use prime::{DrmPrimeHandle, PrimeBinding, PrimeError, PrimeTable};

@@ -334,7 +334,13 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
     let capability = u64::from_le_bytes(arg[0..8].try_into().unwrap());
     let value = match capability {
         drm_cap::DUMB_BUFFER          => 0u64,  // no dumb-buffer alloc yet
-        drm_cap::PRIME                => 0,     // deferred
+        // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
+        // supported via drm/prime.rs PrimeTable.
+        drm_cap::PRIME                => 3,
+        // SYNCOBJ (timeline=0) — drm/syncobj.rs implements binary
+        // syncobjs; timelines are deferred.
+        drm_cap::SYNCOBJ              => 1,
+        drm_cap::SYNCOBJ_TIMELINE     => 0,
         drm_cap::TIMESTAMP_MONOTONIC  => 1,
         drm_cap::ADDFB2_MODIFIERS     => 0,     // no format modifiers yet
         drm_cap::CURSOR_WIDTH         => 64,
