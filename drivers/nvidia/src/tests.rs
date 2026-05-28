@@ -1650,3 +1650,81 @@ kernel_test_in!(
     "drivers/nvidia/edid_aux",
     smoke_edid_block_signature_and_checksum_validation
 );
+
+// ────────────────────────────────────────────────────────────────
+// Multi-GPU controller list (item 6)
+// ────────────────────────────────────────────────────────────────
+
+fn smoke_pci_controller_list_starts_empty() -> TestResult {
+    crate::pci::__reset_for_test();
+    if crate::pci::is_probed() {
+        return TestResult::Fail("freshly-reset controller list must be empty");
+    }
+    if crate::pci::card_count() != 0 {
+        return TestResult::Fail("card_count() must be 0 after reset");
+    }
+    if crate::pci::card_indices().len() != 0 {
+        return TestResult::Fail("card_indices() must be empty after reset");
+    }
+    if crate::pci::card_arc(0).is_some() {
+        return TestResult::Fail("card_arc on empty list returns None");
+    }
+    if crate::pci::with_card(0, |_| ()).is_some() {
+        return TestResult::Fail("with_card on empty list returns None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/pci", smoke_pci_controller_list_starts_empty);
+
+fn smoke_pci_controller_list_api_surface_exists() -> TestResult {
+    // Verify the new multi-card API surface compiles + answers
+    // consistently on an empty list. Real card-bringup happens in
+    // QEMU/bare-metal integration tests; this is a compile-time
+    // pin for the public API plus the boot-time helpers.
+    crate::pci::__reset_for_test();
+    let _ = crate::pci::is_probed();
+    let _ = crate::pci::card_count();
+    let v = crate::pci::card_indices();
+    if !v.is_empty() {
+        return TestResult::Fail("indices vec should be empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/pci",
+    smoke_pci_controller_list_api_surface_exists
+);
+
+fn smoke_pcie_recovery_callback_vote_table() -> TestResult {
+    use narf_bus::pcie_recovery::{ErrorCallback, PciErrSeverity, PciErsResult};
+    use crate::pcie_recovery::CardRecovery;
+    let r = CardRecovery::new(0, narf_bus::BusAddr::Pcie(narf_bus::addr::PcieAddr::new(0, 0, 0, 0)));
+    // Correctable + NonFatal vote CanRecover; Fatal needs reset.
+    if r.error_detected(PciErrSeverity::Correctable) != PciErsResult::CanRecover {
+        return TestResult::Fail("Correctable must yield CanRecover");
+    }
+    if r.error_detected(PciErrSeverity::NonFatal) != PciErsResult::CanRecover {
+        return TestResult::Fail("NonFatal must yield CanRecover");
+    }
+    if r.error_detected(PciErrSeverity::Fatal) != PciErsResult::NeedReset {
+        return TestResult::Fail("Fatal must yield NeedReset");
+    }
+    // Three calls observed via the counter.
+    if r.error_detected_count.load(core::sync::atomic::Ordering::SeqCst) != 3 {
+        return TestResult::Fail("error_detected counter must reach 3");
+    }
+    // slot_reset on a card-not-in-list returns Disconnect.
+    crate::pci::__reset_for_test();
+    if r.slot_reset() != PciErsResult::Disconnect {
+        return TestResult::Fail("unregistered card → Disconnect");
+    }
+    r.resume();
+    if r.resume_count.load(core::sync::atomic::Ordering::SeqCst) != 1 {
+        return TestResult::Fail("resume counter must increment");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/pcie_recovery",
+    smoke_pcie_recovery_callback_vote_table
+);

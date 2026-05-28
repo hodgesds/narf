@@ -53,6 +53,7 @@ pub mod mc;
 pub mod mmu;
 pub mod pb;
 pub mod pci;
+pub mod pcie_recovery;
 pub mod pmu;
 pub mod sec2;
 pub mod vbios;

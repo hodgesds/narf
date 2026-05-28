@@ -27,7 +27,9 @@
 //!   to PRAMIN; on Turing+ the GSP/Falcons use it as their
 //!   firmware DMA target.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 
 use narf_driver_runtime::{
     map_bar, BusDevice, BusDeviceCap, Cap, Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -70,6 +72,15 @@ pub struct NvidiaDevice {
     pub regs: MmioRegion,
     pub bar1: MmioRegion,
     pub bar3: Option<MmioRegion>,
+    /// Stable per-card index. Assigned monotonically by `probe`; used
+    /// by upper layers to refer to a specific card without holding a
+    /// raw `Arc<NvidiaCard>`. Mirrors Nouveau's `drm_dev_register`
+    /// dev->primary->index.
+    pub card_index: u32,
+    /// PCI device descriptor — needed by tear-down + AER recovery so
+    /// `bus::pcie_recovery::register_error_callback` can be re-called
+    /// after a slot reset.
+    pub bus_device: BusDevice,
 }
 
 impl NvidiaDevice {
@@ -86,6 +97,7 @@ impl NvidiaDevice {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
+        card_index: u32,
     ) -> Result<Self, ProbeError> {
         if device.id.vendor != NVIDIA_VENDOR {
             return Err(ProbeError::NotNvidia);
@@ -135,30 +147,47 @@ impl NvidiaDevice {
             regs,
             bar1,
             bar3,
+            card_index,
+            bus_device: *device,
         })
     }
 }
 
-// ── One-controller-per-board ────────────────────────────────────
+// ── One-controller-per-board (multi-card) ───────────────────────
 //
-// NARF's bus layer drives `probe()` per matched device. The
-// driver state goes into a global to mirror the singleton shape
-// most of the kernel's bound drivers use. Multi-GPU systems will
-// want a Vec<NvidiaDevice> here; that's a follow-up.
+// NARF's bus layer drives `probe()` per matched device. Each call
+// to `probe` allocates a fresh card and pushes it onto the global
+// list. Upper layers reach into the list by card index.
+//
+// Cited Nouveau: `drm_dev_register` allocates a fresh dev per
+// matched PCI function, and `nouveau_drm_device_init` keys all
+// per-card state off `drm->dev->primary->index`.
 
-static CONTROLLER: IrqSafeSpinLock<Option<NvidiaDevice>> = IrqSafeSpinLock::new(None);
+/// One owned card. `Arc` so callers can keep a handle independent
+/// of the list mutex.
+pub type NvidiaCard = NvidiaDevice;
+
+static CONTROLLER: IrqSafeSpinLock<Vec<Arc<NvidiaCard>>> = IrqSafeSpinLock::new(Vec::new());
+static NEXT_CARD_INDEX: AtomicU32 = AtomicU32::new(0);
 
 /// `nvkm_device_pci_new` analogue. Called once per PCI match.
+/// Multi-card: every successful probe pushes a fresh card onto the
+/// global list.
 pub fn probe(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        // Single-GPU singleton today.
-        return Ok(());
-    }
     if device.id.vendor != NVIDIA_VENDOR {
         return Err(narf_bus::ProbeError::BadDevice);
+    }
+    // Refuse duplicate enumeration of the same PCI function (the
+    // bus layer can hit a vendor match and a class match for the
+    // same device). Keyed by BusAddr.
+    {
+        let list = CONTROLLER.lock();
+        if list.iter().any(|c| c.bus_device.addr == device.addr) {
+            return Ok(());
+        }
     }
     // Turn on memory + bus-mastering. Nouveau does this in
     // `pci_enable_device`; we set the bits explicitly through the
@@ -171,12 +200,19 @@ pub fn probe(
             | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let card_index = NEXT_CARD_INDEX.fetch_add(1, Ordering::SeqCst);
     // SAFETY: caller-authority on the BusDevice + cap.
-    let dev = match unsafe { NvidiaDevice::bring_up(&device, &cap) } {
+    let dev = match unsafe { NvidiaDevice::bring_up(&device, &cap, card_index) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+    let card = Arc::new(dev);
+
+    // Register PCIe-AER recovery for this card. Stage 1 callback;
+    // pieces of the driver flesh it out further down.
+    crate::pcie_recovery::register_for_card(&card);
+
+    CONTROLLER.lock().push(card);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("nvidia"),
         kind: narf_drivers::BoundKind::Graphics,
@@ -211,12 +247,49 @@ pub fn register_pci_driver() {
     });
 }
 
-/// `true` if a board has been mounted by the driver.
+/// `true` if at least one board has been mounted by the driver.
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    !CONTROLLER.lock().is_empty()
 }
 
-/// Borrow the controller state.
+/// Number of bound cards.
+pub fn card_count() -> usize {
+    CONTROLLER.lock().len()
+}
+
+/// Borrow the first bound card, if any. Convenience that mirrors the
+/// pre-Stage-6 single-controller API; new code should prefer
+/// `with_card`.
 pub fn with_controller<R>(f: impl FnOnce(&NvidiaDevice) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    CONTROLLER.lock().first().map(|c| f(c.as_ref()))
+}
+
+/// Borrow a specific bound card by index. `None` if no card with
+/// that index exists (either out-of-range or unbound).
+pub fn with_card<R>(index: u32, f: impl FnOnce(&NvidiaDevice) -> R) -> Option<R> {
+    let list = CONTROLLER.lock();
+    list.iter()
+        .find(|c| c.card_index == index)
+        .map(|c| f(c.as_ref()))
+}
+
+/// Clone an `Arc<NvidiaCard>` so the caller can keep a handle past
+/// the list mutex (e.g. for an IRQ handler or AER callback).
+pub fn card_arc(index: u32) -> Option<Arc<NvidiaCard>> {
+    let list = CONTROLLER.lock();
+    list.iter().find(|c| c.card_index == index).cloned()
+}
+
+/// Snapshot the list of currently bound card indices.
+pub fn card_indices() -> Vec<u32> {
+    CONTROLLER.lock().iter().map(|c| c.card_index).collect()
+}
+
+/// Test helper — wipe the bound-cards list. Production driver code
+/// never calls this; the unit tests build the list, then peel it
+/// down to keep hermetic per-test state.
+#[doc(hidden)]
+pub fn __reset_for_test() {
+    CONTROLLER.lock().clear();
+    NEXT_CARD_INDEX.store(0, Ordering::SeqCst);
 }
