@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod hid_sensor;
 pub mod i2c_hid;
 pub mod i2c_hid_bind;
 pub mod i2c_hid_touch;
