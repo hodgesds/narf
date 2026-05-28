@@ -308,4 +308,68 @@ mod tests {
         }
     }
     kernel_test_in!("wireless/mfp", smoke_mfp_verify_rejects_replay);
+
+    // End-to-end: PSK → PMK → 4-way → install MFP IGTK.
+    //
+    // Threads the full WPA2-Personal path:
+    //   1. PBKDF2-SHA1(passphrase, SSID, 4096, 32) ⇒ PMK
+    //   2. PRF(PMK, ANonce, SNonce, AA, SA) ⇒ PTK (KCK/KEK/TK)
+    //   3. Use the KEK conceptually to wrap an IGTK, then install it
+    //      into the MFP key store; verify a round-trip MMIE protection.
+    //
+    // Steps 1 & 2 already have dedicated smokes covering the spec
+    // vectors; this test stitches them with step 3 to assert the
+    // wiring is consistent at the surface level.
+    fn smoke_mfp_e2e_psk_pmk_4way_install_igtk() -> TestResult {
+        use crate::eapol::derive_ptk;
+        use narf_crypto::pbkdf2_sha1::wpa2_pmk;
+
+        // (1) PSK → PMK.
+        let pmk = wpa2_pmk(b"narfwifi-passphrase", b"NarfNet");
+        if pmk.iter().all(|&b| b == 0) {
+            return TestResult::Fail("PMK is all-zero");
+        }
+        // (2) PTK from PMK + nonces + addresses. Use the cleanroom
+        // HMAC-SHA1 from iwlwifi/wpa.rs by going through the same
+        // primitive — here we register a stub so the test doesn't
+        // need the driver crate. Production wires the HMAC-SHA1
+        // from iwlwifi/wpa::HmacSha1.
+        struct LocalHmacSha1;
+        impl crate::eapol::HmacPrimitive for LocalHmacSha1 {
+            fn out_len(&self) -> usize {
+                20
+            }
+            fn mac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+                narf_crypto::pbkdf2_sha1::hmac_sha1(key, data).to_vec()
+            }
+        }
+        let aa = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let sa = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let anonce = [0x11u8; 32];
+        let snonce = [0x22u8; 32];
+        let ptk = derive_ptk(&LocalHmacSha1, &pmk, &aa, &sa, &anonce, &snonce, 16);
+        if ptk.tk.len() != 16 || ptk.kek.iter().all(|&b| b == 0) {
+            return TestResult::Fail("PTK derivation produced empty TK/KEK");
+        }
+
+        // (3) Install an IGTK and run a protect/verify cycle. (KEK is
+        // conceptually used to unwrap the IGTK from M3's Key Data; here
+        // we treat it as already-unwrapped IGTK bytes.)
+        let mut igtk_key = [0u8; 16];
+        igtk_key.copy_from_slice(&ptk.tk);
+        let mut store = MfpKeyStore::new();
+        store.install_active(igtk_key, 4).expect("install IGTK");
+
+        // Mirror tx-side IGTK for the round-trip.
+        let mut tx_igtk = Igtk::install(igtk_key, 4).expect("tx igtk");
+        let hdr = make_hdr();
+        let mut body: Vec<u8> = alloc::vec![0x07, 0x01, 0xCA, 0xFE];
+        protect_outbound(&mut tx_igtk, &hdr, &mut body).expect("protect");
+        let original = verify_inbound(&mut store, &hdr, &body).expect("verify");
+        if original != [0x07, 0x01, 0xCA, 0xFE] {
+            return TestResult::Fail("E2E MMIE verify lost original body");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mfp", smoke_mfp_e2e_psk_pmk_4way_install_igtk);
 }
