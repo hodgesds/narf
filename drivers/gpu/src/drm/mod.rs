@@ -44,5 +44,7 @@ pub use render_node::{
 };
 pub use atomic::{AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
 pub use syncobj::{BinaryFence, DmaFence, SyncError, SyncObj, SyncObjTable};
-pub use scheduler::{Job, JobFence, JobPayload, Sched, SchedContext, SchedError};
+pub use scheduler::{
+    Job, JobFence, JobPayload, NoopPayload, Priority, Sched, SchedContext, SchedError,
+};
 pub use prime::{PrimeError, PrimeTable};

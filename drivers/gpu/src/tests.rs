@@ -5020,6 +5020,222 @@ fn smoke_drm_syncobj_reset_clears_fence() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_reset_clears_fence);
 
+// ── DRM atomic modeset smokes ─────────────────────────────────────────
+
+fn make_test_card_for_atomic() -> crate::drm::card::Card {
+    use crate::drm::card::{Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType};
+    let mut card = Card::new("narf-test", "atomic", (0, 1, 0));
+    card.connectors.push(Connector {
+        id: 1, connector_type: ConnectorType::Edp, connector_type_id: 0,
+        status: ConnectorStatus::Connected, encoder_id: Some(1),
+        modes: alloc::vec![crate::Mode::FHD_60],
+    });
+    card.encoders.push(Encoder {
+        id: 1, encoder_type: EncoderType::Tmds,
+        possible_crtcs: 0x1, possible_clones: 0x0, crtc_id: Some(1),
+    });
+    card.crtcs.push(Crtc { id: 1, mode: None, enabled: false, primary_fb: None, x: 0, y: 0 });
+    let gh = card.gem.alloc(0x4000_0000, 1920 * 1080 * 4).unwrap();
+    card.addfb2(1920, 1080, 0x3438_5258, 1920 * 4, gh).unwrap();
+    card
+}
+
+fn smoke_drm_atomic_state_encode_decode() -> TestResult {
+    use crate::drm::atomic::{AtomicState, ConnectorState, CrtcState, PlaneState};
+    let mut st = AtomicState::default();
+    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
+    st.connectors.push(ConnectorState { id: 1, crtc_id: Some(1) });
+    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    if st.crtcs.len() != 1 || st.connectors.len() != 1 || st.planes.len() != 1 {
+        return TestResult::Fail("state shape");
+    }
+    if !st.crtcs[0].needs_modeset() {
+        return TestResult::Fail("CRTC with mode_changed must need modeset");
+    }
+    let cloned = st.clone();
+    if cloned.crtcs[0].mode != st.crtcs[0].mode {
+        return TestResult::Fail("clone mode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_state_encode_decode);
+
+fn smoke_drm_atomic_check_then_commit_happy() -> TestResult {
+    use crate::drm::atomic::{AtomicCheckPolicy, AtomicState, ConnectorState, CrtcState, PlaneState};
+    let mut card = make_test_card_for_atomic();
+    let mut st = AtomicState::default();
+    st.allow_modeset = true;
+    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
+    st.connectors.push(ConnectorState { id: 1, crtc_id: Some(1) });
+    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    let policy = AtomicCheckPolicy::default();
+    if st.core_check(&card, &policy).is_err() {
+        return TestResult::Fail("core_check should pass");
+    }
+    if !st.checked { return TestResult::Fail("state.checked not set after success"); }
+    if st.core_commit(&mut card).is_err() {
+        return TestResult::Fail("core_commit failed");
+    }
+    if !card.crtcs[0].enabled { return TestResult::Fail("CRTC not enabled after commit"); }
+    if card.crtcs[0].primary_fb != Some(1) {
+        return TestResult::Fail("primary_fb not bound after commit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_check_then_commit_happy);
+
+fn smoke_drm_atomic_check_rejects_overbandwidth() -> TestResult {
+    use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
+    let card = make_test_card_for_atomic();
+    let mut st = AtomicState::default();
+    st.allow_modeset = true;
+    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
+    st.connectors.push(ConnectorState { id: 1, crtc_id: Some(1) });
+    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    st.planes.push(PlaneState { id: 2, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    let mut policy = AtomicCheckPolicy::default();
+    policy.max_pixel_budget = 2_000_000;
+    match st.core_check(&card, &policy) {
+        Err(AtomicError::OverBandwidth) => TestResult::Pass,
+        Ok(_)  => TestResult::Fail("over-budget commit should be rejected"),
+        Err(_) => TestResult::Fail("wrong error for over-budget"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_check_rejects_overbandwidth);
+
+fn smoke_drm_atomic_modeset_gate() -> TestResult {
+    use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, CrtcState};
+    let card = make_test_card_for_atomic();
+    let mut st = AtomicState::default();
+    st.allow_modeset = false;
+    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
+    let policy = AtomicCheckPolicy::default();
+    match st.core_check(&card, &policy) {
+        Err(AtomicError::ModesetNotAllowed) => TestResult::Pass,
+        Ok(_)  => TestResult::Fail("page-flip modeset must be rejected"),
+        Err(_) => TestResult::Fail("wrong error for modeset-not-allowed"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_modeset_gate);
+
+fn smoke_drm_atomic_plane_fb_crtc_pair() -> TestResult {
+    use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, PlaneState};
+    let card = make_test_card_for_atomic();
+    let mut st = AtomicState::default();
+    st.allow_modeset = true;
+    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: None, crtc_w: 1920, crtc_h: 1080, ..Default::default() });
+    let policy = AtomicCheckPolicy::default();
+    match st.core_check(&card, &policy) {
+        Err(AtomicError::PlaneFbCrtcMismatch) => TestResult::Pass,
+        Ok(_)  => TestResult::Fail("crtc-without-fb should be rejected"),
+        Err(_) => TestResult::Fail("wrong error for fb/crtc mismatch"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_plane_fb_crtc_pair);
+
+fn smoke_drm_atomic_commit_before_check_errs() -> TestResult {
+    use crate::drm::atomic::{AtomicError, AtomicState};
+    let mut card = make_test_card_for_atomic();
+    let st = AtomicState::default();
+    match st.core_commit(&mut card) {
+        Err(AtomicError::NotChecked) => TestResult::Pass,
+        _ => TestResult::Fail("commit before check should error"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_commit_before_check_errs);
+
+// ── DRM GPU scheduler smokes ──────────────────────────────────────────
+
+fn smoke_drm_sched_context_add_remove() -> TestResult {
+    use crate::drm::scheduler::{Priority, Sched, SchedError};
+    let mut sched = Sched::new();
+    let a = sched.add_context(Priority::Normal);
+    let b = sched.add_context(Priority::High);
+    if a == b { return TestResult::Fail("duplicate context ids"); }
+    if sched.contexts.len() != 2 { return TestResult::Fail("len != 2 after 2 adds"); }
+    sched.remove_context(a).unwrap();
+    if sched.contexts.len() != 1 { return TestResult::Fail("len != 1 after one remove"); }
+    match sched.remove_context(a) {
+        Err(SchedError::NoContext) => {}
+        _ => return TestResult::Fail("removing missing ctx should err"),
+    }
+    sched.remove_context(b).unwrap();
+    if !sched.contexts.is_empty() { return TestResult::Fail("not empty after both"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_context_add_remove);
+
+fn smoke_drm_sched_submit_runs_payload() -> TestResult {
+    use crate::drm::scheduler::{NoopPayload, Priority, Sched};
+    let mut sched = Sched::new();
+    let ctx = sched.add_context(Priority::Normal);
+    let fence = sched.submit(ctx, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload))
+        .expect("submit");
+    if crate::drm::syncobj::DmaFence::is_signalled(fence.as_ref()) {
+        return TestResult::Fail("job fence cannot be signalled before tick");
+    }
+    let ran = sched.tick().expect("tick");
+    if ran != ctx { return TestResult::Fail("wrong ctx ran"); }
+    if !crate::drm::syncobj::DmaFence::is_signalled(fence.as_ref()) {
+        return TestResult::Fail("fence not signalled after tick");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_submit_runs_payload);
+
+fn smoke_drm_sched_dependency_blocks_run() -> TestResult {
+    use crate::drm::scheduler::{NoopPayload, Priority, Sched};
+    use crate::drm::syncobj::DmaFence;
+    let mut sched = Sched::new();
+    let ctx = sched.add_context(Priority::Normal);
+    let f_a = sched.submit(ctx, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let dep: alloc::sync::Arc<dyn DmaFence> = f_a.clone();
+    let f_b = sched.submit(ctx, alloc::vec![dep], alloc::boxed::Box::new(NoopPayload)).unwrap();
+    // First tick: A runs (no deps). Once f_a signals, B becomes ready.
+    sched.tick().expect("A should run");
+    if !DmaFence::is_signalled(f_a.as_ref()) { return TestResult::Fail("A not signalled"); }
+    sched.tick().expect("B should run");
+    if !DmaFence::is_signalled(f_b.as_ref()) { return TestResult::Fail("B not signalled"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_dependency_blocks_run);
+
+fn smoke_drm_sched_priority_picks_high_first() -> TestResult {
+    use crate::drm::scheduler::{NoopPayload, Priority, Sched};
+    let mut sched = Sched::new();
+    let low = sched.add_context(Priority::Low);
+    let hi  = sched.add_context(Priority::High);
+    let _f_low_1 = sched.submit(low, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let _f_low_2 = sched.submit(low, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let _f_hi    = sched.submit(hi,  alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let first = sched.tick().expect("tick 1");
+    if first != hi {
+        return TestResult::Fail("High-priority context should run first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_priority_picks_high_first);
+
+fn smoke_drm_sched_drain_runs_all() -> TestResult {
+    use crate::drm::scheduler::{NoopPayload, Priority, Sched};
+    let mut sched = Sched::new();
+    let c = sched.add_context(Priority::Normal);
+    let mut fences = alloc::vec::Vec::new();
+    for _ in 0..5 {
+        fences.push(sched.submit(c, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap());
+    }
+    let n = sched.drain();
+    if n != 5 { return TestResult::Fail("drain count wrong"); }
+    if sched.pending() != 0 { return TestResult::Fail("pending != 0 after drain"); }
+    for f in &fences {
+        if !crate::drm::syncobj::DmaFence::is_signalled(f.as_ref()) {
+            return TestResult::Fail("not all fences signalled after drain");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_drain_runs_all);
+
 // ── amdgpu/smu v12+v13 opcode tables ───────────────────────────────
 //
 // Verify per-version opcode lookup correctness, the SmuVersion
