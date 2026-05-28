@@ -953,6 +953,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-nvidia"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-edid",
+ "narf-firmware",
+ "narf-graphics",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-nvme"
 version = "0.0.0"
 dependencies = [
@@ -1303,6 +1319,7 @@ dependencies = [
  "narf-drivers-i2c",
  "narf-drivers-i3c",
  "narf-drivers-net",
+ "narf-drivers-nvidia",
  "narf-drivers-nvme",
  "narf-drivers-platform",
  "narf-drivers-psp",

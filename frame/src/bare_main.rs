@@ -1789,6 +1789,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             });
             narf_graphics_driver::register_initcalls();
             narf_drivers_gpu::register_initcalls();
+            narf_drivers_nvidia::register_initcalls();
             narf_input_driver::register_initcalls();
             narf_fb::register_initcalls();
             narf_audio::register_initcalls();

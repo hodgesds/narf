@@ -1,0 +1,30 @@
+[package]
+name         = "narf-drivers-nvidia"
+description  = "Full NVIDIA GPU driver — Maxwell through Ada Lovelace. Clean-room scaffold rooted at Nouveau (GPL-2.0)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_nvidia"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib             = { path = "../../lib" }
+narf-capabilities    = { path = "../../capabilities" }
+narf-kernel-test     = { path = "../../verification/kernel-test" }
+narf-driver-runtime  = { path = "../runtime", default-features = false, features = ["kernel"] }
+narf-drivers         = { path = ".." }
+narf-bus             = { path = "../../bus" }
+narf-init            = { path = "../../init" }
+narf-edid            = { path = "../../edid" }
+narf-graphics        = { path = "../../graphics" }
+narf-firmware        = { path = "../../firmware" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
