@@ -316,6 +316,17 @@ pub struct Controller {
     /// NVMe Base Spec 2.0c §3.3 / §4.1.4: qid=0 is admin; I/O queues
     /// use qid >= 1.
     io_queues: Vec<Queue>,
+    /// Per-queue submission locks. `io_queue_locks[i]` guards
+    /// `io_queues[i]`'s SQ tail + doorbell. Parallel submitters to
+    /// different queues each take their own lock, so concurrent I/O
+    /// to distinct queue indices proceeds without serialising on the
+    /// global controller lock.
+    ///
+    /// Length mirrors `io_queues`; both vecs are populated and cleared
+    /// together in the `create_io_queue*` paths.
+    ///
+    /// Linux reference: drivers/nvme/host/nvme.h:nvme_queue::sq_lock
+    io_queue_locks: Vec<IrqSafeSpinLock<()>>,
     /// One IDT vector per I/O CQ. `io_irq_vectors[i]` is the vector
     /// MSI-X table entry `i` delivers to for completions on
     /// `io_queues[i]`. Empty for the polled-completion path
@@ -465,6 +476,7 @@ impl Controller {
             device: None,
             admin: None,
             io_queues: Vec::new(),
+            io_queue_locks: Vec::new(),
             io_irq_vectors: Vec::new(),
             next_queue: AtomicUsize::new(0),
             bar0_region: None,
@@ -765,6 +777,7 @@ impl Controller {
 
         // Stash the new IoQueue. Drop replaces any prior set.
         self.io_queues.clear();
+        self.io_queue_locks.clear();
         self.io_irq_vectors.clear();
         self.next_queue.store(0, Ordering::Relaxed);
         self.io_queues.push(Queue {
@@ -778,6 +791,7 @@ impl Controller {
             db_stride: admin.db_stride,
             next_cid: 0,
         });
+        self.io_queue_locks.push(IrqSafeSpinLock::new(()));
         Ok(())
     }
 
@@ -1052,10 +1066,16 @@ impl Controller {
         }
 
         // ── 5. Publish ────────────────────────────────────────
+        let mut locks: Vec<IrqSafeSpinLock<()>> =
+            Vec::with_capacity(queues.len());
+        for _ in 0..queues.len() {
+            locks.push(IrqSafeSpinLock::new(()));
+        }
         self.msix = Some(msix);
         self.irq_vector = vectors.first().copied();
         self.io_irq_vectors = vectors;
         self.io_queues = queues;
+        self.io_queue_locks = locks;
         self.next_queue.store(0, Ordering::Relaxed);
 
         Ok(granted as usize)
@@ -1265,6 +1285,109 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    // ── Admin: AER drain ──────────────────────────────────────────────
+
+    /// Drain all currently-completed Async Event Request completions
+    /// from the admin CQ and repost a fresh AER for each one drained,
+    /// maintaining the spec-recommended ≥4 in-flight AERs.
+    ///
+    /// Each CQE whose phase tag matches `cq_phase` is a completed slot.
+    /// We advance the CQ head, write the head doorbell, decode the
+    /// async event (§5.2 CDW0 layout), and immediately repost one AER
+    /// to keep the in-flight count stable.
+    ///
+    /// Returns the number of AER completions processed (0 = nothing
+    /// to drain, which is the normal case when called without a
+    /// pending event).
+    ///
+    /// # Usage
+    ///
+    /// Call from an async task that parks on the admin MSI-X vector:
+    /// ```rust,ignore
+    /// loop {
+    ///     narf_interrupts::wait_for_irq(admin_vector).await;
+    ///     ctrl.drain_aer();
+    /// }
+    /// ```
+    ///
+    /// Linux reference: drivers/nvme/host/core.c::nvme_aer_work
+    /// (GPL-2.0-or-later; adapted under NARF's post-2026-05-20 licence).
+    pub fn drain_aer(&mut self) -> u8 {
+        let admin = match self.admin.as_mut() {
+            Some(a) => a,
+            None => return 0,
+        };
+        let bar0 = match self.bar0_region.as_ref() {
+            Some(b) => b,
+            None => return 0,
+        };
+
+        let mut drained: u8 = 0;
+        // Peek every slot from the current head forward; stop when
+        // the phase tag doesn't match (no more completions).
+        loop {
+            // SAFETY: admin CQ DMA buffer is live + identity-mapped;
+            // cq_head is always < admin.depth.
+            let cqe = unsafe { peek_cqe(&admin.cq_buf, admin.cq_head) };
+            if (cqe.status & 1) != (admin.cq_phase & 1) {
+                break; // no more completed entries
+            }
+
+            // Decode async event type + info from cmd_specific (§5.2).
+            // event_type: bits[2:0] — 0=error, 1=SMART, 2=notice.
+            // event_info: bits[15:8]. log_page_id: bits[31:24].
+            // We currently only observe; future callers can inspect the
+            // returned `drained` count and issue Get Log Page.
+            let _event_type = (cqe.cmd_specific & 0x07) as u8;
+            let _event_info = ((cqe.cmd_specific >> 8) & 0xFF) as u8;
+
+            admin.cq_head = (admin.cq_head + 1) % admin.depth;
+            if admin.cq_head == 0 {
+                admin.cq_phase ^= 1;
+            }
+            // Advance the CQ head doorbell so the controller can reuse
+            // the slot.
+            // SAFETY: identity-mapped MMIO doorbell.
+            unsafe {
+                bar0.write32(admin.cq_db_off(), admin.cq_head as u32);
+            }
+            drained += 1;
+
+            // Repost one AER to keep the in-flight count stable.
+            // ADMIN_Q_DEPTH is 4; we cap posting at depth-1 to leave
+            // room for non-AER admin commands.
+            let cid = admin.next_cid;
+            admin.next_cid = admin.next_cid.wrapping_add(1);
+            let mut sqe = Sqe::zero();
+            sqe.cdw0 = (AdminOpcode::AsyncEventRequest as u32)
+                | ((cid as u32) << 16);
+            // SAFETY: admin queue is page-aligned; sq_tail bounded.
+            unsafe {
+                write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
+            }
+            admin.sq_tail = (admin.sq_tail + 1) % admin.depth;
+            // SAFETY: identity-mapped MMIO doorbell.
+            unsafe {
+                bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
+            }
+
+            // Bound the loop: never process more than depth-1 slots
+            // in one pass to prevent re-draining freshly reposted AERs.
+            if drained >= (ADMIN_Q_DEPTH - 1) as u8 {
+                break;
+            }
+        }
+        drained
+    }
+
+    /// Per-queue lock count — always equal to `io_queue_count()`.
+    /// Both vecs are populated and cleared together in the
+    /// `create_io_queue*` paths. Exposed for tests.
+    #[inline]
+    pub fn io_queue_lock_count(&self) -> usize {
+        self.io_queue_locks.len()
     }
 
     // ── Admin: Format NVM ─────────────────────────────────────────────

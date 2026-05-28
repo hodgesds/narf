@@ -1561,3 +1561,82 @@ fn smoke_nvme_completion_phase_tag_unit() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_completion_phase_tag_unit);
+
+// ── AER drain + per-queue lock smokes ─────────────────────────────
+//
+// The AER drain smoke validates that `drain_aer` returns 0 on a
+// controller without any queued completions (post-bring-up, before
+// any async events have fired). The per-queue lock smoke confirms
+// that `io_queue_lock_count()` == `io_queue_count()` after queue
+// creation, proving the two vecs are kept in sync.
+
+fn smoke_nvme_aer_drain_dispatch() -> TestResult {
+    // After bring-up, before any async events, drain_aer must return
+    // 0 — the admin CQ has no pending completions with the right
+    // phase tag. If it returns > 0, something is unexpectedly present
+    // in the admin CQ, which is a structural error in the bring-up.
+    use crate::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices().iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    }).copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    // After a clean bring-up the admin CQ has no pending AER completions.
+    // drain_aer should return 0. If it returns non-zero, the admin CQ
+    // contains stale/unexpected completions — a bring-up bug.
+    let drained = ctrl.drain_aer();
+    if drained != 0 {
+        return TestResult::Fail("drain_aer returned non-zero after clean bring-up");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_aer_drain_dispatch);
+
+fn smoke_nvme_per_queue_lock_count_matches() -> TestResult {
+    // After `create_io_queue`, `io_queue_lock_count()` must equal
+    // `io_queue_count()`. Both vecs are populated together; this
+    // verifies the lock vec was not forgotten.
+    use crate::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices().iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    }).copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if ctrl.create_io_queue().is_err() {
+        return TestResult::Fail("Controller::create_io_queue failed");
+    }
+    if ctrl.io_queue_count() != ctrl.io_queue_lock_count() {
+        return TestResult::Fail("io_queue_lock_count != io_queue_count after create_io_queue");
+    }
+    if ctrl.io_queue_count() == 0 {
+        return TestResult::Fail("io_queue_count should be > 0 after create_io_queue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_per_queue_lock_count_matches);
