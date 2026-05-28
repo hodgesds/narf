@@ -47,6 +47,7 @@ pub mod fifo;
 pub mod flip;
 pub mod gr;
 pub mod gsp;
+pub mod hdcp;
 pub mod hpd;
 pub mod kms;
 pub mod mc;

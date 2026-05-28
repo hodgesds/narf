@@ -1652,6 +1652,179 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
+// HDCP 2.x key exchange (item 8)
+// ────────────────────────────────────────────────────────────────
+
+use crate::hdcp::{
+    HdcpContext, HdcpEvent, HdcpSec2SubCmd, HdcpState, HDCP_KM_LEN, HDCP_MSG_AKE_INIT,
+    HDCP_MSG_AKE_NO_STORED_KM, HDCP_MSG_AKE_SEND_CERT, HDCP_MSG_AKE_SEND_H_PRIME,
+    HDCP_MSG_AKE_STORED_KM, HDCP_MSG_LC_INIT, HDCP_MSG_LC_SEND_L_PRIME, HDCP_MSG_SKE_SEND_EKS,
+    HDCP_RRX_LEN, HDCP_RTX_LEN, HDCP_RN_LEN,
+};
+
+fn smoke_hdcp_message_ids_match_dcp_spec() -> TestResult {
+    // HDCP 2.3 spec §2.2.
+    if HDCP_MSG_AKE_INIT != 2 {
+        return TestResult::Fail("AKE_Init = 2");
+    }
+    if HDCP_MSG_AKE_SEND_CERT != 3 {
+        return TestResult::Fail("AKE_Send_Cert = 3");
+    }
+    if HDCP_MSG_AKE_NO_STORED_KM != 4 {
+        return TestResult::Fail("AKE_No_Stored_km = 4");
+    }
+    if HDCP_MSG_AKE_STORED_KM != 5 {
+        return TestResult::Fail("AKE_Stored_km = 5");
+    }
+    if HDCP_MSG_AKE_SEND_H_PRIME != 7 {
+        return TestResult::Fail("AKE_Send_H_prime = 7");
+    }
+    if HDCP_MSG_LC_INIT != 9 {
+        return TestResult::Fail("LC_Init = 9");
+    }
+    if HDCP_MSG_LC_SEND_L_PRIME != 10 {
+        return TestResult::Fail("LC_Send_L_prime = 10");
+    }
+    if HDCP_MSG_SKE_SEND_EKS != 11 {
+        return TestResult::Fail("SKE_Send_Eks = 11");
+    }
+    if HDCP_RTX_LEN != 8 {
+        return TestResult::Fail("rtx is 8 bytes");
+    }
+    if HDCP_RRX_LEN != 8 {
+        return TestResult::Fail("rrx is 8 bytes");
+    }
+    if HDCP_KM_LEN != 16 {
+        return TestResult::Fail("km is 128 bits");
+    }
+    if HDCP_RN_LEN != 8 {
+        return TestResult::Fail("rn is 8 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/hdcp", smoke_hdcp_message_ids_match_dcp_spec);
+
+fn smoke_hdcp_state_machine_happy_path() -> TestResult {
+    let mut ctx = HdcpContext::new();
+    if ctx.state != HdcpState::Idle {
+        return TestResult::Fail("fresh state is Idle");
+    }
+    // 1. Start → send AKE_Init.
+    let m1 = ctx.step(HdcpEvent::Start);
+    if m1 != Some(HDCP_MSG_AKE_INIT) {
+        return TestResult::Fail("Start should request AKE_Init");
+    }
+    if ctx.state != HdcpState::AkeInitSent {
+        return TestResult::Fail("after Start, AkeInitSent");
+    }
+    // 2. ReceivedCert → request AKE_No_Stored_km.
+    let m2 = ctx.step(HdcpEvent::ReceivedCert(
+        [0x02, 0, 0],
+        [1, 2, 3, 4, 5, 6, 7, 8],
+    ));
+    if m2 != Some(HDCP_MSG_AKE_NO_STORED_KM) {
+        return TestResult::Fail("ReceivedCert without stored km → AKE_No_Stored_km");
+    }
+    if ctx.state != HdcpState::AkeCertValidated {
+        return TestResult::Fail("after ReceivedCert, AkeCertValidated");
+    }
+    if ctx.rx_caps[0] != 0x02 {
+        return TestResult::Fail("rx_caps must propagate");
+    }
+    if ctx.rrx[0] != 1 {
+        return TestResult::Fail("rrx must propagate");
+    }
+    // 3. SentKm → no message (we're waiting on the sink now).
+    if ctx.step(HdcpEvent::SentKm).is_some() {
+        return TestResult::Fail("SentKm does not request another message");
+    }
+    if ctx.state != HdcpState::AkeNoStoredKmSent {
+        return TestResult::Fail("after SentKm, AkeNoStoredKmSent");
+    }
+    // 4. HPrimeVerified → request LC_Init.
+    let m3 = ctx.step(HdcpEvent::HPrimeVerified);
+    if m3 != Some(HDCP_MSG_LC_INIT) {
+        return TestResult::Fail("HPrimeVerified → LC_Init");
+    }
+    // 5. SentLcInit → no msg.
+    if ctx.step(HdcpEvent::SentLcInit).is_some() {
+        return TestResult::Fail("SentLcInit no msg");
+    }
+    // 6. LPrimeVerified → SKE_Send_Eks.
+    let m4 = ctx.step(HdcpEvent::LPrimeVerified);
+    if m4 != Some(HDCP_MSG_SKE_SEND_EKS) {
+        return TestResult::Fail("LPrimeVerified → SKE_Send_Eks");
+    }
+    // 7. SentEks → Authenticated.
+    let m5 = ctx.step(HdcpEvent::SentEks);
+    if m5.is_some() {
+        return TestResult::Fail("after SentEks no further message");
+    }
+    if ctx.state != HdcpState::Authenticated {
+        return TestResult::Fail("final state Authenticated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/hdcp", smoke_hdcp_state_machine_happy_path);
+
+fn smoke_hdcp_failure_event_transitions_to_failed() -> TestResult {
+    let mut ctx = HdcpContext::new();
+    ctx.step(HdcpEvent::Start);
+    let _ = ctx.step(HdcpEvent::Failure);
+    if ctx.state != HdcpState::Failed {
+        return TestResult::Fail("Failure event must end in Failed state");
+    }
+    // Further events stay Failed.
+    ctx.step(HdcpEvent::Start);
+    if ctx.state != HdcpState::Failed {
+        return TestResult::Fail("Failed is sticky");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/hdcp",
+    smoke_hdcp_failure_event_transitions_to_failed
+);
+
+fn smoke_hdcp_stored_km_path_selects_ake_stored_km() -> TestResult {
+    let mut ctx = HdcpContext::new();
+    ctx.use_stored_km = true;
+    ctx.step(HdcpEvent::Start);
+    let m = ctx.step(HdcpEvent::ReceivedCert([0; 3], [0; 8]));
+    if m != Some(HDCP_MSG_AKE_STORED_KM) {
+        return TestResult::Fail("stored km path → AKE_Stored_km");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/hdcp",
+    smoke_hdcp_stored_km_path_selects_ake_stored_km
+);
+
+fn smoke_hdcp_sec2_subcmd_codes_pinned() -> TestResult {
+    if HdcpSec2SubCmd::GenAkeInit.code() != 0x01 {
+        return TestResult::Fail("GenAkeInit=1");
+    }
+    if HdcpSec2SubCmd::VerifyCert.code() != 0x02 {
+        return TestResult::Fail("VerifyCert=2");
+    }
+    if HdcpSec2SubCmd::EncryptKm.code() != 0x03 {
+        return TestResult::Fail("EncryptKm=3");
+    }
+    if HdcpSec2SubCmd::VerifyHPrime.code() != 0x04 {
+        return TestResult::Fail("VerifyHPrime=4");
+    }
+    if HdcpSec2SubCmd::VerifyLPrime.code() != 0x06 {
+        return TestResult::Fail("VerifyLPrime=6");
+    }
+    if HdcpSec2SubCmd::EncryptKs.code() != 0x07 {
+        return TestResult::Fail("EncryptKs=7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/hdcp", smoke_hdcp_sec2_subcmd_codes_pinned);
+
+// ────────────────────────────────────────────────────────────────
 // DP MST topology + payload bandwidth (item 7)
 // ────────────────────────────────────────────────────────────────
 
