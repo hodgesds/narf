@@ -39,6 +39,7 @@ pub mod codec;
 pub mod hda;
 pub mod hda_codec;
 pub mod i2s;
+pub mod msbc;
 pub mod realtek_alc;
 pub mod sbc;
 pub mod wm8960;

@@ -41,6 +41,93 @@ use crate::hfp::{
     parse_at, AtForm,
 };
 
+use narf_audio::msbc::{Msbc, MSBC_FRAME_BYTES, MSBC_PCM_SAMPLES};
+
+// ── ScoStream — SCO audio encode/decode with codec dispatch ──────────
+
+/// Error from [`ScoStream`] encode/decode operations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScoStreamError {
+    /// Output buffer too small.
+    OutputTooSmall,
+    /// Input PCM length mismatch.
+    BadInputLength,
+    /// Codec-specific decode error (CRC, sync, …).
+    CodecError,
+    /// Codec is CVSD — mSBC path not active.
+    NotMsbc,
+}
+
+/// Active SCO audio stream.  Dispatches PCM ↔ SCO-bytes encoding
+/// through either CVSD (pass-through) or mSBC depending on which
+/// codec was negotiated during SLC establishment.
+///
+/// HFP 1.8 §11.1: mSBC frames are 57 bytes per 7.5 ms SCO interval.
+/// CVSD is a transparent air-coding; no frame-level codec is applied
+/// here — the HCI voice-setting selects it at the controller.
+///
+/// Reference: HFP 1.8 §4.11 / §11.1 / BlueZ `audio/hfp.c`
+/// (GPL-2.0-or-later, NARF relicense 2026-05-20).
+#[derive(Debug)]
+pub struct ScoStream {
+    /// Codec negotiated for this SCO connection.
+    pub codec: u8,
+    /// mSBC codec state (valid only when `codec == CODEC_MSBC`).
+    msbc: Msbc,
+}
+
+impl ScoStream {
+    /// Create a new SCO stream for the given negotiated codec.
+    pub fn new(codec: u8) -> Self {
+        Self { codec, msbc: Msbc::new() }
+    }
+
+    /// Encode 60 mono i16 PCM samples (16 kHz) into a 57-byte mSBC frame.
+    ///
+    /// Returns [`ScoStreamError::NotMsbc`] when the negotiated codec is
+    /// CVSD — CVSD samples are delivered transparently by the HCI layer.
+    pub fn encode_pcm(
+        &mut self,
+        pcm: &[i16],
+        out: &mut [u8],
+    ) -> Result<usize, ScoStreamError> {
+        match self.codec {
+            CODEC_MSBC => {
+                if out.len() < MSBC_FRAME_BYTES {
+                    return Err(ScoStreamError::OutputTooSmall);
+                }
+                if pcm.len() != MSBC_PCM_SAMPLES {
+                    return Err(ScoStreamError::BadInputLength);
+                }
+                self.msbc.encode(pcm, out).map_err(|_| ScoStreamError::CodecError)
+            }
+            _ => Err(ScoStreamError::NotMsbc),
+        }
+    }
+
+    /// Decode a 57-byte mSBC SCO packet into 60 mono i16 PCM samples.
+    ///
+    /// Returns [`ScoStreamError::NotMsbc`] when codec is CVSD.
+    pub fn decode_sco(
+        &mut self,
+        sco: &[u8],
+        pcm: &mut [i16],
+    ) -> Result<usize, ScoStreamError> {
+        match self.codec {
+            CODEC_MSBC => {
+                if sco.len() < MSBC_FRAME_BYTES {
+                    return Err(ScoStreamError::OutputTooSmall);
+                }
+                if pcm.len() < MSBC_PCM_SAMPLES {
+                    return Err(ScoStreamError::OutputTooSmall);
+                }
+                self.msbc.decode(sco, pcm).map_err(|_| ScoStreamError::CodecError)
+            }
+            _ => Err(ScoStreamError::NotMsbc),
+        }
+    }
+}
+
 // ── SCO codec identifiers (HFP §4.34 / Assigned Numbers) ─────────────
 
 /// SCO codec ID: CVSD (narrow-band, 8 kHz).  Mandatory.
