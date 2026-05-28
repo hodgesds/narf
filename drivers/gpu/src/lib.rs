@@ -139,6 +139,7 @@ pub mod amdgpu_modeset;
 pub mod amdgpu_mst;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pageflip;
+pub mod amdgpu_pcie_recovery;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pptable;
 pub mod amdgpu_pptable_subtables;
