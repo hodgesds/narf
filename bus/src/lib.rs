@@ -44,6 +44,7 @@ pub mod msi;
 pub mod msix;
 pub mod pci;
 pub mod pcie_aer;
+pub mod pcie_dpc;
 pub mod pcie_recovery;
 pub mod pci_cap;
 pub mod pci_cap_ext;
