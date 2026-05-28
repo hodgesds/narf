@@ -2957,3 +2957,222 @@ fn smoke_ccid_no_reader_on_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/ccid", smoke_ccid_no_reader_on_qemu);
+
+// ── ccid/t0 — T=0 framing ────────────────────────────────────────────
+
+/// T=0 Case 1 APDU encodes to exactly 4 bytes (CLA INS P1 P2).
+/// ISO 7816-4 §5.3.1.
+fn smoke_ccid_t0_case1_encode() -> TestResult {
+    use crate::ccid::t0::T0Apdu;
+    let apdu = T0Apdu::build_case1(0x00, 0xA4, 0x04, 0x00);
+    let b = apdu.as_bytes();
+    if b != &[0x00, 0xA4, 0x04, 0x00] {
+        return TestResult::Fail("T=0 Case 1 byte sequence mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t0", smoke_ccid_t0_case1_encode);
+
+/// T=0 Case 2 APDU encodes to 5 bytes (CLA INS P1 P2 Le).
+/// ISO 7816-4 §5.3.2.
+fn smoke_ccid_t0_case2_encode() -> TestResult {
+    use crate::ccid::t0::T0Apdu;
+    let apdu = T0Apdu::build_case2(0x00, 0xCA, 0x00, 0x6E, 0xFF);
+    let b = apdu.as_bytes();
+    if b.len() != 5 || b[4] != 0xFF {
+        return TestResult::Fail("T=0 Case 2 encoding wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t0", smoke_ccid_t0_case2_encode);
+
+/// T=0 Case 3 APDU encodes to 5 + Lc bytes (CLA INS P1 P2 Lc DATA).
+/// ISO 7816-4 §5.3.3.
+fn smoke_ccid_t0_case3_encode() -> TestResult {
+    use crate::ccid::t0::T0Apdu;
+    let data = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
+    let apdu = match T0Apdu::build_case3(0x00, 0xA4, 0x04, 0x00, &data) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("build_case3 failed"),
+    };
+    let b = apdu.as_bytes();
+    if b.len() != 5 + data.len() {
+        return TestResult::Fail("T=0 Case 3 wrong length");
+    }
+    if b[4] != data.len() as u8 {
+        return TestResult::Fail("Lc field mismatch");
+    }
+    if &b[5..] != &data[..] {
+        return TestResult::Fail("DATA field mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t0", smoke_ccid_t0_case3_encode);
+
+/// T=0 Case 4 APDU encodes to 6 + Lc bytes (CLA INS P1 P2 Lc DATA Le).
+/// ISO 7816-4 §5.3.4.
+fn smoke_ccid_t0_case4_encode() -> TestResult {
+    use crate::ccid::t0::T0Apdu;
+    let data = [0x01, 0x02];
+    let apdu = match T0Apdu::build_case4(0x80, 0xE0, 0x00, 0x00, &data, 0x08) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("build_case4 failed"),
+    };
+    let b = apdu.as_bytes();
+    let want: &[u8] = &[0x80, 0xE0, 0x00, 0x00, 0x02, 0x01, 0x02, 0x08];
+    if b != want {
+        return TestResult::Fail("T=0 Case 4 byte sequence mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t0", smoke_ccid_t0_case4_encode);
+
+/// T=0 GET_RESPONSE chaining: SW1=0x61, SW2=0x08 → GET_RESPONSE APDU
+/// = CLA(echo) 0xC0 0x00 0x00 Le=0x08. ISO 7816-3 §10.3.3.
+fn smoke_ccid_t0_get_response_chaining() -> TestResult {
+    use crate::ccid::t0::{build_get_response, decode_response, SW1_GET_RESPONSE};
+    let card_resp = [0x61u8, 0x08];
+    let (data, sw1, sw2) = match decode_response(&card_resp) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("decode_response failed"),
+    };
+    if data != &[] {
+        return TestResult::Fail("no data bytes before SW");
+    }
+    if sw1 != SW1_GET_RESPONSE {
+        return TestResult::Fail("SW1 != 0x61");
+    }
+    let gr = build_get_response(0x00, sw2);
+    let b = gr.as_bytes();
+    if b != &[0x00, 0xC0, 0x00, 0x00, 0x08] {
+        return TestResult::Fail("GET_RESPONSE APDU bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t0", smoke_ccid_t0_get_response_chaining);
+
+// ── ccid/t1 — T=1 framing ────────────────────────────────────────────
+
+/// T=1 I-block with N(S)=0: PCB=0x00, LRC covers NAD+PCB+LEN+INF.
+/// ISO 7816-3 §11.3.2 / §11.3.3.
+fn smoke_ccid_t1_iblock_lrc() -> TestResult {
+    use crate::ccid::t1::{T1Block, lrc_check};
+    let block = T1Block::i_block(0, &[0xDE, 0xAD]);
+    let wire = match block.encode() {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("encode failed"),
+    };
+    if wire[0] != 0x00 {
+        return TestResult::Fail("NAD != 0x00");
+    }
+    if wire[1] != 0x00 {
+        return TestResult::Fail("PCB for I(NS=0) != 0x00");
+    }
+    if wire[2] != 2 {
+        return TestResult::Fail("LEN != 2");
+    }
+    if lrc_check(&wire) != 0x00 {
+        return TestResult::Fail("LRC of whole block != 0x00");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_iblock_lrc);
+
+/// T=1 R-block ACK (N(R)=0) encodes to PCB=0x80, no INF.
+/// ISO 7816-3 §11.6.2.2 / Table 16.
+fn smoke_ccid_t1_rblock_ack_nak() -> TestResult {
+    use crate::ccid::t1::{T1Block, lrc_check};
+    let ack = T1Block::r_block_ack(0);
+    if !ack.is_rblock() {
+        return TestResult::Fail("r_block_ack should be an R-block");
+    }
+    if ack.r_error() {
+        return TestResult::Fail("ACK must not have error bit set");
+    }
+    let w = match ack.encode() {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("encode ack failed"),
+    };
+    if w[1] != 0x80 {
+        return TestResult::Fail("ACK PCB != 0x80");
+    }
+    if lrc_check(&w) != 0x00 {
+        return TestResult::Fail("ACK LRC invalid");
+    }
+    let nak = T1Block::r_block_nak(1);
+    if !nak.r_error() {
+        return TestResult::Fail("NAK must have error bit set");
+    }
+    let wn = match nak.encode() {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("encode nak failed"),
+    };
+    if wn[1] != 0x91 {
+        return TestResult::Fail("NAK PCB != 0x91");
+    }
+    if lrc_check(&wn) != 0x00 {
+        return TestResult::Fail("NAK LRC invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_rblock_ack_nak);
+
+/// T=1 S(IFS request) encodes to PCB=0xC1 with one-byte INF=ifsd.
+/// ISO 7816-3 §11.6.3.1.
+fn smoke_ccid_t1_sblock_ifs_request() -> TestResult {
+    use crate::ccid::t1::{T1Block, lrc_check, PCB_SBLOCK_IFS_REQ};
+    let block = T1Block::s_ifs_request(0xFE);
+    if !block.is_sblock() {
+        return TestResult::Fail("IFS block should be S-block");
+    }
+    if block.pcb != PCB_SBLOCK_IFS_REQ {
+        return TestResult::Fail("IFS request PCB != 0xC1");
+    }
+    let wire = match block.encode() {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("encode failed"),
+    };
+    if wire[1] != 0xC1 {
+        return TestResult::Fail("wire PCB != 0xC1");
+    }
+    if wire[2] != 1 {
+        return TestResult::Fail("LEN must be 1");
+    }
+    if wire[3] != 0xFE {
+        return TestResult::Fail("IFSD value mismatch");
+    }
+    if lrc_check(&wire) != 0x00 {
+        return TestResult::Fail("LRC invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_sblock_ifs_request);
+
+/// T=1 I-block sequence numbers wrap: 0 → 1 → 0.
+/// ISO 7816-3 §11.6.1 — N(S) alternates between 0 and 1.
+fn smoke_ccid_t1_sequence_number_wrap() -> TestResult {
+    use crate::ccid::t1::T1SeqState;
+    let mut state = T1SeqState::default();
+    if state.next_ns() != 0 {
+        return TestResult::Fail("first N(S) must be 0");
+    }
+    if state.next_ns() != 1 {
+        return TestResult::Fail("second N(S) must be 1");
+    }
+    if state.next_ns() != 0 {
+        return TestResult::Fail("third N(S) must wrap to 0");
+    }
+    if state.current_nr() != 0 {
+        return TestResult::Fail("N(R) must start at 0");
+    }
+    state.advance_nr();
+    if state.current_nr() != 1 {
+        return TestResult::Fail("N(R) after advance must be 1");
+    }
+    state.advance_nr();
+    if state.current_nr() != 0 {
+        return TestResult::Fail("N(R) must wrap to 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_sequence_number_wrap);
