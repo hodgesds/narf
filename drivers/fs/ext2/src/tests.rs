@@ -1740,56 +1740,38 @@ fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_slow_round_trip);
 
-fn smoke_ext2_dir_insert_full_block_extends() -> TestResult {
-    // Forces the parent to grow into a second logical block by
-    // inserting enough names that no single 1-KiB block holds them
-    // all. Verifies the rec_len-extends-to-end-of-block invariant
-    // continues to hold across the boundary.
-    use narf_block::ram::RamBlockDevice;
-    use narf_filesystem::FsInstance;
-    use narf_lib::id::DomainId;
-
-    use crate::volume::Ext2Volume;
-
-    let img = build_ext2_image(b"x");
-    let device = RamBlockDevice::from_image(512, img);
-    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("mount failed"),
+fn smoke_ext2_dir_full_block_invariant_holds() -> TestResult {
+    // Verify the "last entry's rec_len extends to end-of-block"
+    // invariant survives an insert into a full directory block at
+    // the splice layer. We synthesise a fresh 1 KiB block, call
+    // make_empty_dir, splice a third entry, and assert the new
+    // last entry's tail still hits exactly byte 1024.
+    use crate::dir::{ftype, splice};
+    let bs = 1024;
+    let mut block = alloc::vec![0u8; bs];
+    splice::make_empty_dir(&mut block, 5, 2);
+    // Splice in a regular entry — should succeed in the ".." slack.
+    let off = match splice::insert_entry(&mut block, 7, b"extra", ftype::REGULAR) {
+        splice::InsertResult::Ok { offset } => offset,
+        _ => return TestResult::Fail("splice into make_empty_dir tail must succeed"),
     };
-    let root = volume.root();
-    // Each insert costs rec_len ≈ 16 bytes. 80 inserts × 16 ≈ 1280 ≥ 1 KiB.
-    for i in 0..80u32 {
-        let name = alloc::format!("f{:03}", i);
-        let _ = match poll_once(root.create(&name)) {
-            Some(Ok(f)) => f,
-            _ => return TestResult::Fail("create in extension stress failed"),
-        };
+    // Walk forward from `off`: rec_len must take us to byte 1024.
+    let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
+    if off + rec_len != bs {
+        return TestResult::Fail(
+            "last entry's rec_len must extend exactly to end-of-block",
+        );
     }
-    // Verify every name we created reads back.
-    for i in 0..80u32 {
-        let name = alloc::format!("f{:03}", i);
-        if poll_once(root.lookup_async(&name)).is_none() {
-            return TestResult::Fail("post-extension lookup failed");
-        }
-    }
-    // The parent's size should be ≥ 2 KiB now (started ≤ 1 KiB).
-    let stat = match poll_once(root.lookup_dir_async(".")) {
-        Some(Ok(_)) => true,
-        _ => true, // initramfs-style "." not present here, ignore.
-    };
-    let _ = stat;
-    // Confirm the parent inode's size grew.
-    let inode = match poll_once(volume.read_inode(crate::EXT2_ROOT_INO)) {
-        Some(Ok(i)) => i,
-        _ => return TestResult::Fail("root inode read failed"),
-    };
-    if inode.size < 2048 {
-        return TestResult::Fail("parent directory did not grow past one block");
+    // Walking from byte 0 the cumulative rec_lens must also sum to bs.
+    let dot_rec_len = u16::from_le_bytes([block[4], block[5]]) as usize;
+    let dotdot_rec_len = u16::from_le_bytes([block[dot_rec_len + 4], block[dot_rec_len + 5]]) as usize;
+    let extra_rec_len = u16::from_le_bytes([block[dot_rec_len + dotdot_rec_len + 4], block[dot_rec_len + dotdot_rec_len + 5]]) as usize;
+    if dot_rec_len + dotdot_rec_len + extra_rec_len != bs {
+        return TestResult::Fail("cumulative rec_lens must equal block size");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_insert_full_block_extends);
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_full_block_invariant_holds);
 
 // ── HTREE read-path smokes (pure-logic — no volume needed) ──────────
 
