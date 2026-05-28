@@ -128,6 +128,7 @@ pub mod amdgpu_discovery;
 pub mod amdgpu_gfx;
 pub mod amdgpu_gmc;
 pub mod amdgpu_ih;
+pub mod amdgpu_modeset;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pptable;
