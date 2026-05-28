@@ -190,6 +190,83 @@ impl Fp {
         result
     }
 
+    /// Modular square root via Tonelli's shortcut for p ≡ 3 mod 4.
+    /// P-256's prime satisfies that condition (p mod 4 = 3), so any
+    /// quadratic residue `a` has `sqrt(a) = a^((p+1)/4) mod p`.
+    ///
+    /// The caller is responsible for checking that `self` is a
+    /// quadratic residue via `is_quadratic_residue` first; this
+    /// routine returns garbage on non-residues. Used by SAE
+    /// hunting-and-pecking (RFC 7664 §3.2.1 step 17).
+    pub fn sqrt(&self) -> Self {
+        // (p + 1) / 4 in little-endian limbs.
+        // p = FFFFFFFF00000001 0000000000000000 00000000FFFFFFFF FFFFFFFFFFFFFFFF
+        // p+1 = FFFFFFFF00000001 0000000000000000 00000000FFFFFFFF FFFFFFFF00000000... no:
+        // p[0] = FFFFFFFFFFFFFFFF → p+1 sets [0]=0, carries into [1].
+        // p[1] = 00000000FFFFFFFF → +1 → 100000000.
+        // ...etc. To compute (p+1)/4 directly we shift bits right by 2.
+        // p+1 = 2^256 - 2^224 + 2^192 + 2^96.
+        // (p+1)/4 = 2^254 - 2^222 + 2^190 + 2^94.
+        // In limbs (LE):
+        //   limb0 = 2^94 within first 64 bits? No — 94 > 64. So:
+        //     bit 94 = limb1 bit (94-64)=30 → limb1 = 1<<30 = 0x4000_0000.
+        //   bit 190 = limb2 bit 62 = 0x4000_0000_0000_0000.
+        //   −2^222: bit 222 = limb3 bit (222-192)=30 → subtract from
+        //     2^254 = limb3 bit 62. So limb3 = (1<<62) - (1<<30) =
+        //     0x3FFF_FFFF_C000_0000.
+        let exp: [u64; 4] = [
+            0,
+            0x0000_0000_4000_0000,
+            0x4000_0000_0000_0000,
+            0x3FFF_FFFF_C000_0000,
+        ];
+        self.pow(&exp)
+    }
+
+    /// Test whether `self` is a quadratic residue mod p (i.e. has a
+    /// square root). Computes the Legendre symbol via Euler's
+    /// criterion: `a^((p-1)/2) mod p` is 1 if QR, p-1 if non-QR,
+    /// 0 if a == 0. Used by SAE hunting-and-pecking.
+    pub fn is_quadratic_residue(&self) -> bool {
+        if self.is_zero() {
+            return true; // 0 = 0^2 conventionally accepted as a QR.
+        }
+        // (p - 1) / 2 = 2^255 - 2^223 + 2^191 + 2^95 - 1, derived
+        // analogously to (p+1)/4 above.
+        // p-1: subtract 1 from p[0].
+        // (p-1)/2: shift right by 1.
+        //   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+        //   p-1 = 2^256 - 2^224 + 2^192 + 2^96 - 2
+        //   (p-1)/2 = 2^255 - 2^223 + 2^191 + 2^95 - 1.
+        // Limbs (LE):
+        //   bit 95: limb1 bit 31 = 0x8000_0000.
+        //   bit 191: limb2 bit 63 = 0x8000_0000_0000_0000.
+        //   −2^223 at limb3 bit 31, +2^255 at limb3 bit 63 →
+        //     limb3 = (1<<63) - (1<<31) = 0x7FFF_FFFF_8000_0000.
+        //   −1 at the LSB → limb0 = 0xFFFF_FFFF_FFFF_FFFF gets the
+        //     borrow from the bit-95 term... actually simpler:
+        //   (p-1)/2 in hex (BE per FIPS):
+        //     7FFFFFFF80000000 0000000000000000 00000000800000000 ... no.
+        // Let's just compute it: take p, subtract 1, then right-shift 1 bit.
+        let mut e = P;
+        e[0] = e[0].wrapping_sub(1);
+        // Right shift by 1.
+        let mut shifted = [0u64; 4];
+        let mut carry: u64 = 0;
+        for i in (0..4).rev() {
+            let new_carry = e[i] & 1;
+            shifted[i] = (e[i] >> 1) | (carry << 63);
+            carry = new_carry;
+        }
+        let r = self.pow(&shifted);
+        r == Self::ONE
+    }
+
+    /// Return the least-significant bit of the canonical representative.
+    pub fn lsb(&self) -> u8 {
+        (self.0[0] & 1) as u8
+    }
+
     /// Conditional swap with `other` when `swap` is 1. No-op when 0.
     /// Constant-time over the swap mask.
     pub fn cswap(&mut self, other: &mut Self, swap: u64) {
@@ -472,6 +549,44 @@ pub mod fp_tests {
         TestResult::Pass
     }
     kernel_test_in!("crypto/p256", smoke_p256_fp_invert_identity);
+
+    fn smoke_p256_fp_sqrt_of_square() -> TestResult {
+        // For any a in [1, p), a^2 is a QR with sqrt equal to a or p-a.
+        let a = Fp::from_limbs([0x1234, 0, 0, 0]);
+        let a_sq = a.square();
+        if !a_sq.is_quadratic_residue() {
+            return TestResult::Fail("a^2 should be a QR");
+        }
+        let s = a_sq.sqrt();
+        if s.square() != a_sq {
+            return TestResult::Fail("sqrt(a^2)^2 != a^2");
+        }
+        // And the sqrt should be either a or p-a.
+        if s != a && s != a.neg() {
+            return TestResult::Fail("sqrt(a^2) is not a or -a");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("crypto/p256", smoke_p256_fp_sqrt_of_square);
+
+    fn smoke_p256_fp_qr_lsb_consistency() -> TestResult {
+        // Spec consistency: 1 is a QR (sqrt = 1), 2 may or may not be.
+        if !Fp::ONE.is_quadratic_residue() {
+            return TestResult::Fail("1 should be a QR");
+        }
+        if Fp::ONE.sqrt() != Fp::ONE {
+            return TestResult::Fail("sqrt(1) should be 1");
+        }
+        // lsb of 1 is 1.
+        if Fp::ONE.lsb() != 1 {
+            return TestResult::Fail("LSB(1) should be 1");
+        }
+        if Fp::ZERO.lsb() != 0 {
+            return TestResult::Fail("LSB(0) should be 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("crypto/p256", smoke_p256_fp_qr_lsb_consistency);
 
     fn smoke_p256_fp_bytes_roundtrip() -> TestResult {
         // 1 in big-endian bytes is 0x00..0x01.
