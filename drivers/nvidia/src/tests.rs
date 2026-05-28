@@ -724,8 +724,8 @@ kernel_test_in!("drivers/nvidia/ce", smoke_ce_class_and_instance_count_per_famil
 // ────────────────────────────────────────────────────────────────
 
 use crate::vbios::{
-    dcb_header, dcb_table_offset, find_nv_image, parse_image_at, ROM_SIG_NV, ROM_SIG_PCI,
-    PCIR_TYPE_NV,
+    dcb_header, dcb_table_offset, find_nv_image, parse_image_at, DCB_V30_MAGIC, ROM_SIG_NV,
+    ROM_SIG_PCI, PCIR_TYPE_NV,
 };
 
 fn smoke_vbios_parse_pci_option_rom_header() -> TestResult {
@@ -820,6 +820,152 @@ fn smoke_vbios_nv_modern_signature_accepted() -> TestResult {
     }
 }
 kernel_test_in!("drivers/nvidia/vbios", smoke_vbios_nv_modern_signature_accepted);
+
+// ────────────────────────────────────────────────────────────────
+// DCB v3.0 — Kepler / early Pascal / some Fermi
+// ────────────────────────────────────────────────────────────────
+//
+// Reference: /home/daniel/git/linux/drivers/gpu/drm/nouveau/
+//   nvkm/subdev/bios/dcb.c::dcb_table (v3.0 branch) +
+//   dcb_outp_parse (*ver >= 0x20 branch).
+
+use crate::disp::{decode_dcb_entry_v30, decode_dcb_entry_versioned};
+use crate::kms::enumerate_dcb_versioned;
+
+fn smoke_dcb_v30_header_signature_and_version() -> TestResult {
+    // Build a synthetic DCB v3.0 header at offset 0x80.
+    //   dcb+0x00  version  = 0x30
+    //   dcb+0x01  hdr_len  = 0x0A
+    //   dcb+0x02  cnt      = 0x03
+    //   dcb+0x03  ent_size = 0x08
+    //   dcb+0x06..0x09 = DCB_V30_MAGIC (0x4edcbdcb, LE)
+    // Cite dcb_table: `nvbios_rd32(bios, dcb + 6) == 0x4edcbdcb`.
+    let mut image = [0u8; 256];
+    image[0x36..0x38].copy_from_slice(&0x80u16.to_le_bytes());
+    image[0x80] = 0x30; // version
+    image[0x81] = 0x0A; // header_len
+    image[0x82] = 0x03; // entry_count
+    image[0x83] = 0x08; // entry_size
+    image[0x86..0x8A].copy_from_slice(&DCB_V30_MAGIC.to_le_bytes());
+    match dcb_table_offset(&image) {
+        Some(0x80) => {}
+        _ => return TestResult::Fail("DCB v3.0 pointer at 0x36 should yield 0x80"),
+    }
+    let h = match dcb_header(&image, 0x80) {
+        Some(h) => h,
+        None => return TestResult::Fail("dcb_header should accept v3.0 with magic"),
+    };
+    if h.version != 0x30 {
+        return TestResult::Fail("version should be 0x30");
+    }
+    if h.entry_count != 3 {
+        return TestResult::Fail("entry_count should be 3");
+    }
+    if h.entry_size != 8 {
+        return TestResult::Fail("entry_size should be 8");
+    }
+    // Wrong magic should fail.
+    image[0x86..0x8A].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+    if dcb_header(&image, 0x80).is_some() {
+        return TestResult::Fail("wrong magic should cause dcb_header to return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_dcb_v30_header_signature_and_version
+);
+
+fn smoke_dcb_v30_entry_bit_layout() -> TestResult {
+    // DCB v3.0 entries use the same 32-bit identification word as
+    // v4.x. Bit layout per dcb_outp_parse (*ver >= 0x20):
+    //   bits  3:0  type (encoder)
+    //   bits  7:4  i2c_index
+    //   bits 11:8  heads bitmask
+    //   bits 15:12 connector index
+    //   bits 27:24 or (output resource)
+    //
+    // Encode: TMDS (type=2), i2c=3, heads=0x2, connector=5, OR=2.
+    let head_word: u32 = 2 | (3 << 4) | (0x2 << 8) | (5 << 12) | (2 << 24);
+    let mut raw = [0u8; 8];
+    raw[0..4].copy_from_slice(&head_word.to_le_bytes());
+    let entry = match decode_dcb_entry_v30(&raw) {
+        Some(e) => e,
+        None => return TestResult::Fail("v3.0 entry decode should succeed"),
+    };
+    if entry.encoder_type != EncoderType::Tmds {
+        return TestResult::Fail("encoder type should be TMDS (2)");
+    }
+    if entry.i2c_index != 3 {
+        return TestResult::Fail("i2c_index should be 3");
+    }
+    if entry.heads != 0x2 {
+        return TestResult::Fail("heads bitmask should be 0x2");
+    }
+    if entry.connector_index != 5 {
+        return TestResult::Fail("connector_index should be 5");
+    }
+    if entry.or != 2 {
+        return TestResult::Fail("OR should be 2");
+    }
+    // Sentinel 0xFFFFFFFF must yield None.
+    let mut raw_ff = [0u8; 8];
+    raw_ff[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    if decode_dcb_entry_v30(&raw_ff).is_some() {
+        return TestResult::Fail("0xFFFFFFFF sentinel must yield None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/disp", smoke_dcb_v30_entry_bit_layout);
+
+fn smoke_dcb_mixed_version_table_routing() -> TestResult {
+    // Older firmware sometimes writes a v3.0-layout table even when
+    // the DCB header says v3.0, while newer firmware uses v4.x.
+    // enumerate_dcb_versioned must route correctly in both cases.
+    //
+    // We verify version routing via decode_dcb_entry_versioned:
+    //   - version 0x30 → v3.0 decoder (8-byte entry, no conf word)
+    //   - version 0x40 → v4.x decoder (same first-word, conf at +4)
+    // Both decoders share the same identification-word bit layout so
+    // the same entry bytes decode identically; what matters is that
+    // unsupported versions return None.
+    //
+    // Build a 2-entry raw table:
+    //   Entry 0: CRT (type=0), i2c=0, heads=1, conn=0, OR=0.
+    //   Entry 1: DP  (type=3), i2c=2, heads=3, conn=4, OR=1.
+    let e0: u32 = 0 | (0 << 4) | (1 << 8) | (0 << 12) | (0 << 24);
+    let e1: u32 = 3 | (2 << 4) | (3 << 8) | (4 << 12) | (1 << 24);
+    let mut raw = [0u8; 16];
+    raw[0..4].copy_from_slice(&e0.to_le_bytes());
+    raw[8..12].copy_from_slice(&e1.to_le_bytes());
+
+    // Walk with version 0x30 (v3.0).
+    let paths_v30 = enumerate_dcb_versioned(&raw, 0x30);
+    if paths_v30.len() != 2 {
+        return TestResult::Fail("v3.0 walk should yield 2 entries");
+    }
+    if paths_v30[0].entry.encoder_type != EncoderType::Crt {
+        return TestResult::Fail("v3.0 entry 0 should be CRT");
+    }
+    if paths_v30[1].entry.encoder_type != EncoderType::DisplayPort {
+        return TestResult::Fail("v3.0 entry 1 should be DisplayPort");
+    }
+
+    // Walk with version 0x40 (v4.x) — same bytes, same result.
+    let paths_v40 = enumerate_dcb_versioned(&raw, 0x40);
+    if paths_v40.len() != 2 {
+        return TestResult::Fail("v4.0 walk should yield 2 entries");
+    }
+
+    // Unknown version → decode_dcb_entry_versioned must yield None
+    // for every entry, so the walk produces 0 paths.
+    let paths_unk = enumerate_dcb_versioned(&raw, 0x20);
+    if !paths_unk.is_empty() {
+        return TestResult::Fail("unsupported version should produce no entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/kms", smoke_dcb_mixed_version_table_routing);
 
 // ────────────────────────────────────────────────────────────────
 // DP link training

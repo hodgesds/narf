@@ -183,30 +183,31 @@ impl ConnectorType {
     }
 }
 
-/// Decode an 8-byte DCB v4.0 entry. Layout from
-/// `nvkm/subdev/bios/dcb.c::dcb_outp_parse` (`raw` is the
-/// `outp` slice in the BIOS image).
+/// Decode the common 32-bit identification word shared by all DCB
+/// versions >= 2.0. Cite `nvkm/subdev/bios/dcb.c::dcb_outp_parse`
+/// (`*ver >= 0x20` branch):
 ///
-/// Returns `None` if the entry has the "no-output" sentinel
-/// (`0x00000000` or `0xffffffff` head field — both seen in the
-/// wild per `dcb_outp_foreach`).
-pub fn decode_dcb_entry(raw: &[u8; 8]) -> Option<DcbEntry> {
-    let head_word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    if head_word == 0xFFFF_FFFF || head_word == 0x0000_0000 {
+/// ```text
+///   bits  3:0   type        (encoder)
+///   bits  7:4   i2c_index
+///   bits 11:8   heads bitmask
+///   bits 15:12  connector index
+///   bits 19:16  bus
+///   bits 21:20  location
+///   bits 27:24  or (output resource)
+/// ```
+///
+/// Returns `None` on the "no-output" sentinels `0x0000_0000` and
+/// `0xffff_ffff` (cite `dcb_outp_foreach`).
+fn decode_dcb_head_word(w: u32) -> Option<DcbEntry> {
+    if w == 0xFFFF_FFFF || w == 0x0000_0000 {
         return None;
     }
-    // DCB v4 packing per `dcb_outp_parse`:
-    //   bits[3:0]    type (encoder)
-    //   bits[7:4]    i2c index
-    //   bits[11:8]   heads bitmask
-    //   bits[15:12]  connector index
-    //   bits[19:16]  bus
-    //   bits[27:24]  or (output resource)
-    let encoder_type = EncoderType::from_dcb((head_word & 0x0F) as u8);
-    let i2c_index = ((head_word >> 4) & 0x0F) as u8;
-    let heads = ((head_word >> 8) & 0x0F) as u8;
-    let connector_index = ((head_word >> 12) & 0x0F) as u8;
-    let or = ((head_word >> 24) & 0x0F) as u8;
+    let encoder_type = EncoderType::from_dcb((w & 0x0F) as u8);
+    let i2c_index = ((w >> 4) & 0x0F) as u8;
+    let heads = ((w >> 8) & 0x0F) as u8;
+    let connector_index = ((w >> 12) & 0x0F) as u8;
+    let or = ((w >> 24) & 0x0F) as u8;
     Some(DcbEntry {
         encoder_type,
         connector_index,
@@ -214,6 +215,50 @@ pub fn decode_dcb_entry(raw: &[u8; 8]) -> Option<DcbEntry> {
         i2c_index,
         heads,
     })
+}
+
+/// Decode an 8-byte DCB v4.0 entry. The second 32-bit word
+/// (`conf`, at bytes[4..8]) carries per-type link configuration
+/// (DP link rate/lane count, SOR dual-link select, etc.) but we
+/// don't decode it here — the first word is sufficient for KMS
+/// connector enumeration. Cite
+/// `nvkm/subdev/bios/dcb.c::dcb_outp_parse`.
+///
+/// Returns `None` if the entry is the "no-output" sentinel.
+pub fn decode_dcb_entry(raw: &[u8; 8]) -> Option<DcbEntry> {
+    let head_word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    decode_dcb_head_word(head_word)
+}
+
+/// Decode an 8-byte DCB v3.0 entry. DCB v3.0 (version 0x30..0x3f)
+/// uses the same 32-bit identification word layout as v4.x but its
+/// entries are only 8 bytes total — there is no second `conf` word
+/// with per-type link configuration. Cite
+/// `nvkm/subdev/bios/dcb.c::dcb_outp_parse` (`*ver >= 0x20`
+/// branch, which covers v3.0).
+///
+/// Kepler / early Pascal / some Fermi VBIOSes use v3.0.
+///
+/// Returns `None` if the entry is the "no-output" sentinel.
+pub fn decode_dcb_entry_v30(raw: &[u8; 8]) -> Option<DcbEntry> {
+    let head_word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    decode_dcb_head_word(head_word)
+}
+
+/// Version-routing DCB entry decoder. Dispatches to the v3.0 or
+/// v4.x decoder based on the `version` byte from the DCB header.
+///
+/// - `0x30..0x3f` → [`decode_dcb_entry_v30`] (Kepler / early Pascal)
+/// - `0x40..0x41` → [`decode_dcb_entry`] (Maxwell+)
+///
+/// Returns `None` for an unsupported version or a sentinel entry.
+/// Cite `nvkm/subdev/bios/dcb.c::dcb_outp_parse`.
+pub fn decode_dcb_entry_versioned(raw: &[u8; 8], version: u8) -> Option<DcbEntry> {
+    match version {
+        0x30..=0x3F => decode_dcb_entry_v30(raw),
+        0x40..=0x41 => decode_dcb_entry(raw),
+        _ => None,
+    }
 }
 
 // ── KMS scaffolding ──────────────────────────────────────────────

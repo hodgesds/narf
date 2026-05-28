@@ -151,27 +151,51 @@ pub fn dcb_table_offset(image: &[u8]) -> Option<u16> {
     Some(off)
 }
 
+/// Magic signature in DCB v3.0 header at `dcb+6` (LE32).
+/// Cite `nvkm/subdev/bios/dcb.c::dcb_table`:
+///   `nvbios_rd32(bios, dcb + 6) == 0x4edcbdcb`.
+pub const DCB_V30_MAGIC: u32 = 0x4edcbdcb;
+
 /// Parse the DCB header at `image[off..]`. Returns
 /// `(version, header_len, entry_count, entry_size)` per
-/// `dcb_table` (DCB v3.0+).
+/// `dcb_table`.
+///
+/// Supports DCB v3.0 (version 0x30..0x3f) and v4.x (version
+/// 0x40..0x41). For v3.0 the header MUST carry the magic
+/// `0x4edcbdcb` at `dcb+6`; for v4.x there is no magic check
+/// here (the BIT table already validated the image). Cite
+/// `nvkm/subdev/bios/dcb.c::dcb_table`.
 pub fn dcb_header(image: &[u8], off: u16) -> Option<DcbHeader> {
     let p = off as usize;
-    if p + 6 > image.len() {
+    if p + 4 > image.len() {
         return None;
     }
     let version = image[p];
-    if version < 0x20 || version >= 0x42 {
+    if version >= 0x42 {
         return None;
     }
-    // DCB v3.0+ packs the header at the start of the table:
-    //   +0x00  version
-    //   +0x01  header_length
-    //   +0x02  entry_count
-    //   +0x03  entry_length
-    //   +0x04..0x07  signature "PCIR"-like marker (some versions)
     let header_len = image[p + 1];
     let entry_count = image[p + 2];
     let entry_size = image[p + 3];
+
+    if version >= 0x30 && version < 0x40 {
+        // DCB v3.0: magic at dcb+6 (10 bytes minimum).
+        if p + 10 > image.len() {
+            return None;
+        }
+        let magic = u32::from_le_bytes([
+            image[p + 6],
+            image[p + 7],
+            image[p + 8],
+            image[p + 9],
+        ]);
+        if magic != DCB_V30_MAGIC {
+            return None;
+        }
+    } else if version < 0x30 {
+        // DCB v2.x and older: not supported.
+        return None;
+    }
     Some(DcbHeader {
         version,
         header_len,

@@ -23,7 +23,10 @@
 
 use alloc::vec::Vec;
 
-use crate::disp::{decode_dcb_entry, ConnectorType, DcbEntry, DisplayPath, EncoderType};
+use crate::disp::{
+    decode_dcb_entry, decode_dcb_entry_versioned, ConnectorType, DcbEntry, DisplayPath,
+    EncoderType,
+};
 
 /// One enumerated display path — connector + encoder + the
 /// candidate CRTC indices it can drive.
@@ -40,9 +43,28 @@ pub struct EnumeratedPath {
 /// observed max on Maxwell+ (typically 4-6 outputs).
 pub const MAX_DCB_ENTRIES: u8 = 16;
 
-/// Walk a slice of 8-byte DCB entries. Bytes outside `entries..`
-/// are ignored. Returns the live entries in order; skips sentinels.
+/// Walk a slice of 8-byte DCB entries using the v4.x decoder.
+/// Bytes outside `entries..` are ignored. Returns the live entries
+/// in order; skips sentinels.
+///
+/// For Kepler / early Pascal chips with DCB v3.0 VBIOSes use
+/// [`enumerate_dcb_versioned`] instead.
 pub fn enumerate_dcb(raw: &[u8]) -> Vec<EnumeratedPath> {
+    enumerate_dcb_versioned(raw, 0x40)
+}
+
+/// Walk a slice of 8-byte DCB entries with explicit version routing.
+/// The `version` byte comes from [`vbios::dcb_header`]'s
+/// `DcbHeader::version` field.
+///
+/// Supported versions:
+/// - `0x30..=0x3F` — DCB v3.0 (Kepler / early Pascal / some Fermi)
+/// - `0x40..=0x41` — DCB v4.x (Maxwell+)
+///
+/// Entries that fail `decode_dcb_entry_versioned` (sentinels or
+/// unsupported version) are skipped. Cite
+/// `nvkm/subdev/bios/dcb.c::dcb_outp_foreach`.
+pub fn enumerate_dcb_versioned(raw: &[u8], version: u8) -> Vec<EnumeratedPath> {
     let mut out = Vec::new();
     let n = raw.len() / 8;
     for i in 0..n.min(MAX_DCB_ENTRIES as usize) {
@@ -57,7 +79,7 @@ pub fn enumerate_dcb(raw: &[u8]) -> Vec<EnumeratedPath> {
             raw[off + 6],
             raw[off + 7],
         ];
-        if let Some(entry) = decode_dcb_entry(&arr) {
+        if let Some(entry) = decode_dcb_entry_versioned(&arr, version) {
             out.push(EnumeratedPath {
                 dcb_index: i as u8,
                 valid_crtcs: entry.heads,
