@@ -2218,3 +2218,398 @@ fn smoke_default_aer_masks_correct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/pcie_aer", smoke_default_aer_masks_correct);
+
+// ── AER recovery / DPC smokes ─────────────────────────────────────
+
+fn smoke_recovery_merge_result_lattice() -> TestResult {
+    // merge_result must implement the Linux err.c lattice: NoAerDriver
+    // absorbs, None passes-through, CanRecover/Recovered yield to the
+    // new vote, Disconnect only upgrades to NeedReset.
+    use crate::pcie_recovery::{merge_result, PciErsResult};
+    if merge_result(PciErsResult::CanRecover, PciErsResult::NoAerDriver)
+        != PciErsResult::NoAerDriver
+    {
+        return TestResult::Fail("NoAerDriver should absorb");
+    }
+    if merge_result(PciErsResult::Recovered, PciErsResult::None) != PciErsResult::Recovered {
+        return TestResult::Fail("None should pass through");
+    }
+    if merge_result(PciErsResult::CanRecover, PciErsResult::NeedReset)
+        != PciErsResult::NeedReset
+    {
+        return TestResult::Fail("CanRecover -> NeedReset");
+    }
+    if merge_result(PciErsResult::Disconnect, PciErsResult::NeedReset)
+        != PciErsResult::NeedReset
+    {
+        return TestResult::Fail("Disconnect upgrades to NeedReset");
+    }
+    if merge_result(PciErsResult::Disconnect, PciErsResult::Recovered)
+        != PciErsResult::Disconnect
+    {
+        return TestResult::Fail("Disconnect should not downgrade to Recovered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_recovery_merge_result_lattice);
+
+fn smoke_aer_error_detected_to_resume() -> TestResult {
+    // FakeDriver records the lifecycle: error_detected (CanRecover)
+    // → mmio_enabled (Recovered) → resume. No slot_reset because the
+    // vote stayed CanRecover.
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::pcie_recovery::{
+        __clear_error_callbacks, do_recovery, register_error_callback, ErrorCallback,
+        PciChannelState, PciErrSeverity, PciErsResult, RecoveryOutcome, ResetResult,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __clear_error_callbacks();
+
+    struct FakeDriver {
+        seq: AtomicU32,
+    }
+    impl ErrorCallback for FakeDriver {
+        fn error_detected(&self, _s: PciErrSeverity) -> PciErsResult {
+            // Encode call index into the low byte of seq.
+            self.seq.fetch_or(0x01, Ordering::Relaxed);
+            PciErsResult::CanRecover
+        }
+        fn mmio_enabled(&self) -> PciErsResult {
+            self.seq.fetch_or(0x02, Ordering::Relaxed);
+            PciErsResult::Recovered
+        }
+        fn slot_reset(&self) -> PciErsResult {
+            self.seq.fetch_or(0x04, Ordering::Relaxed);
+            PciErsResult::Recovered
+        }
+        fn resume(&self) {
+            self.seq.fetch_or(0x08, Ordering::Relaxed);
+        }
+    }
+    let drv = Arc::new(FakeDriver {
+        seq: AtomicU32::new(0),
+    });
+    let bdf = BusAddr::Pcie(PcieAddr::new(0, 1, 2, 3));
+    register_error_callback(bdf, drv.clone());
+    let mut reset_fired = false;
+    let outcome = do_recovery(
+        &[bdf],
+        PciErrSeverity::NonFatal,
+        PciChannelState::Normal,
+        &mut || {
+            reset_fired = true;
+            ResetResult::Recovered
+        },
+    );
+    __clear_error_callbacks();
+    if outcome != RecoveryOutcome::Recovered {
+        return TestResult::Fail("non-fatal recovery should succeed");
+    }
+    let seq = drv.seq.load(Ordering::Relaxed);
+    // error_detected (0x01) + mmio_enabled (0x02) + resume (0x08).
+    // slot_reset (0x04) MUST NOT fire on a CanRecover path.
+    if seq & 0x01 == 0 {
+        return TestResult::Fail("error_detected did not fire");
+    }
+    if seq & 0x02 == 0 {
+        return TestResult::Fail("mmio_enabled did not fire");
+    }
+    if seq & 0x04 != 0 {
+        return TestResult::Fail("slot_reset fired on CanRecover path");
+    }
+    if seq & 0x08 == 0 {
+        return TestResult::Fail("resume did not fire");
+    }
+    if reset_fired {
+        return TestResult::Fail("reset_fn fired on CanRecover path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_error_detected_to_resume);
+
+fn smoke_aer_fatal_escalation_path() -> TestResult {
+    // Driver votes NeedReset → reset_fn fires → slot_reset broadcast
+    // → resume. Verifies the full Frozen-path lifecycle plus the
+    // platform reset callback.
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::pcie_recovery::{
+        __clear_error_callbacks, do_recovery, register_error_callback, ErrorCallback,
+        PciChannelState, PciErrSeverity, PciErsResult, RecoveryOutcome, ResetResult,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __clear_error_callbacks();
+
+    struct ResetWantingDriver {
+        seq: AtomicU32,
+    }
+    impl ErrorCallback for ResetWantingDriver {
+        fn error_detected(&self, s: PciErrSeverity) -> PciErsResult {
+            self.seq.fetch_or(0x01, Ordering::Relaxed);
+            if s == PciErrSeverity::Fatal {
+                PciErsResult::NeedReset
+            } else {
+                PciErsResult::CanRecover
+            }
+        }
+        fn mmio_enabled(&self) -> PciErsResult {
+            self.seq.fetch_or(0x02, Ordering::Relaxed);
+            PciErsResult::Recovered
+        }
+        fn slot_reset(&self) -> PciErsResult {
+            self.seq.fetch_or(0x04, Ordering::Relaxed);
+            PciErsResult::Recovered
+        }
+        fn resume(&self) {
+            self.seq.fetch_or(0x08, Ordering::Relaxed);
+        }
+    }
+    let drv = Arc::new(ResetWantingDriver {
+        seq: AtomicU32::new(0),
+    });
+    let bdf = BusAddr::Pcie(PcieAddr::new(0, 4, 5, 6));
+    register_error_callback(bdf, drv.clone());
+    let mut reset_count = 0u32;
+    let outcome = do_recovery(
+        &[bdf],
+        PciErrSeverity::Fatal,
+        PciChannelState::Frozen,
+        &mut || {
+            reset_count += 1;
+            ResetResult::Recovered
+        },
+    );
+    __clear_error_callbacks();
+    if outcome != RecoveryOutcome::Recovered {
+        return TestResult::Fail("fatal recovery should succeed");
+    }
+    if reset_count != 1 {
+        return TestResult::Fail("reset_fn should fire exactly once");
+    }
+    let seq = drv.seq.load(Ordering::Relaxed);
+    if seq & 0x01 == 0 {
+        return TestResult::Fail("error_detected did not fire");
+    }
+    if seq & 0x04 == 0 {
+        return TestResult::Fail("slot_reset did not fire on fatal path");
+    }
+    if seq & 0x08 == 0 {
+        return TestResult::Fail("resume did not fire");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_fatal_escalation_path);
+
+fn smoke_aer_isr_aggregates_counters() -> TestResult {
+    // Drive the ISR over the live ECAM. We can't inject AER events in
+    // QEMU, but we CAN assert that the ISR walks without panicking and
+    // that the counters are monotonic (i.e. the W1C write doesn't
+    // corrupt them).
+    use crate::pcie_aer::{
+        aer_isr, AER_CORRECTABLE_COUNT, AER_FATAL_COUNT, AER_NONFATAL_COUNT,
+    };
+    use core::sync::atomic::Ordering;
+    // Snapshot counters, run ISR, verify no decrease.
+    let c0 = AER_CORRECTABLE_COUNT.load(Ordering::Relaxed);
+    let n0 = AER_NONFATAL_COUNT.load(Ordering::Relaxed);
+    let f0 = AER_FATAL_COUNT.load(Ordering::Relaxed);
+    aer_isr();
+    let c1 = AER_CORRECTABLE_COUNT.load(Ordering::Relaxed);
+    let n1 = AER_NONFATAL_COUNT.load(Ordering::Relaxed);
+    let f1 = AER_FATAL_COUNT.load(Ordering::Relaxed);
+    if c1 < c0 || n1 < n0 || f1 < f0 {
+        return TestResult::Fail("AER counters must be monotonic");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_aer_isr_aggregates_counters);
+
+fn smoke_dpc_status_decode_and_rw1c() -> TestResult {
+    // DpcStatus decoder + the implied RW1C semantics: TRIGGERED +
+    // INTERRUPT are RW1C, REASON is RO, RP_BUSY is RO. We exercise
+    // the decoder against the spec-shaped bit fields.
+    use crate::pcie_dpc::{sts, DpcReason, DpcStatus};
+    // Fatal reason, TRIGGERED + INTERRUPT, RP_BUSY clear.
+    let raw = sts::TRIGGERED | sts::INTERRUPT | sts::REASON_FE;
+    let snap = DpcStatus::decode(raw);
+    if !snap.triggered {
+        return TestResult::Fail("triggered bit not decoded");
+    }
+    if !snap.interrupt {
+        return TestResult::Fail("interrupt bit not decoded");
+    }
+    if snap.rp_busy {
+        return TestResult::Fail("rp_busy spuriously set");
+    }
+    if snap.reason != DpcReason::Fatal {
+        return TestResult::Fail("reason should be Fatal");
+    }
+    // RW1C semantic check via the constant: writing the same bits
+    // back should clear them — that's what the ISR does. We verify
+    // the bit definitions match the PCIe spec.
+    if sts::TRIGGERED != 1 << 0 {
+        return TestResult::Fail("TRIGGERED bit position");
+    }
+    if sts::INTERRUPT != 1 << 3 {
+        return TestResult::Fail("INTERRUPT bit position");
+    }
+    // Verify DL Protocol Error / RP PIO classification.
+    let rp_pio = sts::REASON_EXT | sts::REASON_EXT_RP_PIO | sts::TRIGGERED;
+    let dl = DpcStatus::decode(rp_pio);
+    if dl.reason != DpcReason::RpPioError {
+        return TestResult::Fail("RP PIO error reason classification");
+    }
+    if !dl.is_dl_protocol_error() {
+        return TestResult::Fail("RP PIO should be treated as DL protocol");
+    }
+    // Software trigger.
+    let sw = DpcStatus::decode(sts::REASON_EXT | sts::REASON_EXT_SW | sts::TRIGGERED);
+    if sw.reason != DpcReason::SoftwareTrigger {
+        return TestResult::Fail("SW trigger reason classification");
+    }
+    if sw.is_dl_protocol_error() {
+        return TestResult::Fail("SW trigger should not be DL protocol");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_dpc", smoke_dpc_status_decode_and_rw1c);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_dpc_capability_presence_detect() -> TestResult {
+    // Walk every PCIe device and run find_dpc_cap_offset. QEMU q35
+    // root ports may or may not expose DPC depending on the machine
+    // type; the test just verifies the walker terminates on every
+    // device without faulting and without aliasing a non-DPC cap as
+    // DPC.
+    use crate::pcie_dpc::find_dpc_cap_offset;
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{devices, BusKind};
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    for d in devs.iter() {
+        let cfg_phys = match d.kind {
+            BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => continue,
+        };
+        // SAFETY: live ECAM; walker is read-only + bounded.
+        let off = unsafe { find_dpc_cap_offset(cfg_phys) };
+        if let Some(o) = off {
+            if o < 0x100 || o >= 0x1000 {
+                return TestResult::Fail("DPC cap offset out of range");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus/pcie_dpc", smoke_dpc_capability_presence_detect);
+
+fn smoke_link_retrain_wait_loop_completes() -> TestResult {
+    // Drive retrain_link against a fake register pair that toggles
+    // DLL_ACTIVE after a few polls — verifies the wait loop sees
+    // DLL_ACTIVE + !LINK_TRAINING and returns true.
+    use crate::pcie_aer::{link_sts, retrain_link};
+    use core::cell::Cell;
+    let polls = Cell::new(0u32);
+    let last_ctl = Cell::new(0xFFFFu16);
+    let mut read_status = || -> u16 {
+        let n = polls.get();
+        polls.set(n + 1);
+        // Simulate the link coming back on the 3rd poll.
+        if n < 3 {
+            link_sts::LINK_TRAINING
+        } else {
+            link_sts::DLL_ACTIVE
+        }
+    };
+    let mut write_ctrl = |v: u16| {
+        last_ctl.set(v);
+    };
+    let mut settle = || {};
+    let ok = retrain_link(&mut read_status, &mut write_ctrl, &mut settle, 32);
+    if !ok {
+        return TestResult::Fail("retrain_link should return true once DLL_ACTIVE");
+    }
+    // last write should have been 0 (re-enable), not LINK_DISABLE.
+    if last_ctl.get() & crate::pcie_aer::link_ctrl::LINK_DISABLE != 0 {
+        return TestResult::Fail("final write should clear LINK_DISABLE");
+    }
+    // Timeout path: poll always returns LINK_TRAINING.
+    let polls2 = Cell::new(0u32);
+    let mut never_ready = || -> u16 {
+        polls2.set(polls2.get() + 1);
+        link_sts::LINK_TRAINING
+    };
+    let mut write2 = |_v: u16| {};
+    let mut settle2 = || {};
+    let timed_out = retrain_link(&mut never_ready, &mut write2, &mut settle2, 5);
+    if timed_out {
+        return TestResult::Fail("retrain_link should return false on timeout");
+    }
+    if polls2.get() != 5 {
+        return TestResult::Fail("timeout path should poll timeout_polls times");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_link_retrain_wait_loop_completes);
+
+fn smoke_recovery_no_driver_blocks_subtree() -> TestResult {
+    // Subtree with one registered and one un-registered device. The
+    // un-registered device's NoAerDriver vote must poison the whole
+    // recovery — slot_reset should never fire.
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::pcie_recovery::{
+        __clear_error_callbacks, do_recovery, register_error_callback, ErrorCallback,
+        PciChannelState, PciErrSeverity, PciErsResult, RecoveryOutcome, ResetResult,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __clear_error_callbacks();
+
+    struct GoodDriver {
+        slot_reset_calls: AtomicU32,
+    }
+    impl ErrorCallback for GoodDriver {
+        fn error_detected(&self, _s: PciErrSeverity) -> PciErsResult {
+            PciErsResult::CanRecover
+        }
+        fn slot_reset(&self) -> PciErsResult {
+            self.slot_reset_calls.fetch_add(1, Ordering::Relaxed);
+            PciErsResult::Recovered
+        }
+        fn resume(&self) {}
+    }
+    let drv = Arc::new(GoodDriver {
+        slot_reset_calls: AtomicU32::new(0),
+    });
+    let known = BusAddr::Pcie(PcieAddr::new(0, 7, 8, 9));
+    let unknown = BusAddr::Pcie(PcieAddr::new(0, 7, 10, 0));
+    register_error_callback(known, drv.clone());
+
+    let mut reset_fired = 0u32;
+    let outcome = do_recovery(
+        &[known, unknown],
+        PciErrSeverity::Fatal,
+        PciChannelState::Frozen,
+        &mut || {
+            reset_fired += 1;
+            ResetResult::Recovered
+        },
+    );
+    __clear_error_callbacks();
+    if outcome != RecoveryOutcome::NoDriver {
+        return TestResult::Fail("missing driver must yield NoDriver");
+    }
+    if reset_fired != 0 {
+        return TestResult::Fail("reset_fn must not fire when NoDriver");
+    }
+    if drv.slot_reset_calls.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("slot_reset must not fire when NoDriver");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/pcie_aer", smoke_recovery_no_driver_blocks_subtree);
