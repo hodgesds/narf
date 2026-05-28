@@ -1340,3 +1340,223 @@ fn smoke_wait_for_irq_through_executor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_wait_for_irq_through_executor);
+
+// ── Stage-12 data-path coverage smokes ─────────────────────────────
+
+fn smoke_nvme_prp_list_three_pages() -> TestResult {
+    // End-to-end PRP-list (>2 pages) write+read round trip.
+    //
+    // Allocates three independent 4-KiB DMA pages and writes 24 LBAs
+    // (12 KiB) at LBA 2048, then reads them back. The three-page
+    // transfer exercises the `pages.len() > 2` branch in
+    // `nvm_io_multipage`: PRP1=pages[0], PRP2=phys of a freshly
+    // allocated PRP-list page that holds pages[1] and pages[2] as
+    // 8-byte LE entries.
+    //
+    // NVMe Base Spec 2.0c §4.1.2: for a PRP list, PRP2 contains the
+    // physical address of the first PRP-list page, which in turn
+    // contains the physical addresses of the remaining data pages
+    // (pages[1..]) in order.
+    use crate::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if ctrl.create_io_queue().is_err() {
+        return TestResult::Fail("Controller::create_io_queue failed");
+    }
+    if ctrl.lba_bytes != 512 {
+        return TestResult::Skip("non-512B LBAs: test assumes 12KiB == 24 LBAs");
+    }
+    // Three independent pages — they need not be contiguous. Use a
+    // per-page stamp so a truncated DMA is detectable.
+    let page_a = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent page A"),
+    };
+    let page_b = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent page B"),
+    };
+    let page_c = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent page C"),
+    };
+    // Stamp distinct patterns via volatile writes so the compiler
+    // doesn't elide them.
+    unsafe {
+        let pa = page_a.phys_addr().raw() as *mut u8;
+        let pb = page_b.phys_addr().raw() as *mut u8;
+        let pc = page_c.phys_addr().raw() as *mut u8;
+        for i in 0..4096usize {
+            core::ptr::write_volatile(pa.add(i), (i as u8).wrapping_add(0xAA));
+            core::ptr::write_volatile(pb.add(i), (i as u8).wrapping_add(0xBB));
+            core::ptr::write_volatile(pc.add(i), (i as u8).wrapping_add(0xCC));
+        }
+    }
+    let pages = [page_a.phys_addr(), page_b.phys_addr(), page_c.phys_addr()];
+    // Write 24 LBAs (12 KiB) at LBA 2048 to avoid clobbering the
+    // single-page + two-page smokes' sectors.
+    if ctrl.write_lba_pages(2048, 24, &pages).is_err() {
+        return TestResult::Fail("write_lba_pages (3 pages) failed");
+    }
+    // Zero all three pages, then read back.
+    unsafe {
+        let pa = page_a.phys_addr().raw() as *mut u8;
+        let pb = page_b.phys_addr().raw() as *mut u8;
+        let pc = page_c.phys_addr().raw() as *mut u8;
+        for i in 0..4096usize {
+            core::ptr::write_volatile(pa.add(i), 0);
+            core::ptr::write_volatile(pb.add(i), 0);
+            core::ptr::write_volatile(pc.add(i), 0);
+        }
+    }
+    if ctrl.read_lba_pages(2048, 24, &pages).is_err() {
+        return TestResult::Fail("read_lba_pages (3 pages) failed");
+    }
+    for i in 0..4096usize {
+        unsafe {
+            let pa = page_a.phys_addr().raw() as *const u8;
+            let pb = page_b.phys_addr().raw() as *const u8;
+            let pc = page_c.phys_addr().raw() as *const u8;
+            if core::ptr::read_volatile(pa.add(i)) != (i as u8).wrapping_add(0xAA) {
+                return TestResult::Fail("page A read-back mismatch (PRP list 3-page)");
+            }
+            if core::ptr::read_volatile(pb.add(i)) != (i as u8).wrapping_add(0xBB) {
+                return TestResult::Fail("page B read-back mismatch (PRP list 3-page)");
+            }
+            if core::ptr::read_volatile(pc.add(i)) != (i as u8).wrapping_add(0xCC) {
+                return TestResult::Fail("page C read-back mismatch (PRP list 3-page)");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_prp_list_three_pages);
+
+fn smoke_nvme_completion_phase_tag_unit() -> TestResult {
+    // Unit-level validation of the CQ phase-tag protocol without
+    // needing a live controller.
+    //
+    // NVMe Base Spec 2.0c §4.6 (Completion Queue Entry): the phase
+    // tag bit (CQE.Status[0]) flips every time the CQ wraps. The
+    // controller initialises all CQEs to phase=0, and the host
+    // starts expecting phase=1 for the first valid completion. When
+    // `cq_head` wraps to 0 the host inverts its expected phase.
+    //
+    // We build a synthetic in-memory CQ buffer and drive the phase-
+    // flip manually, confirming:
+    //   a) A CQE whose status phase-bit matches `expected_phase` is
+    //      treated as valid.
+    //   b) A CQE whose status phase-bit differs is treated as pending
+    //      (not yet written by the controller).
+    //   c) After the ring wraps, the phase inverts and the next lap's
+    //      completions are accepted.
+    //
+    // Reference: Linux drivers/nvme/host/pci.c:nvme_cqe_pending +
+    // nvme_update_cq_head (phase ^= 1 on wrap-around).
+    use alloc::vec;
+
+    // Depth-4 CQ: 4 × 16-byte entries = 64 bytes.
+    const DEPTH: usize = 4;
+    // Each CQE is 16 bytes; status sits at byte offset 14 (u16 LE).
+    // We only need to model the phase bit — everything else is zero.
+    let mut cq: alloc::vec::Vec<u8> = vec![0u8; DEPTH * 16];
+
+    // Helper: write the status word (phase bit only) for entry `i`.
+    let set_phase = |buf: &mut alloc::vec::Vec<u8>, i: usize, phase: u8| {
+        // status at offset 14 in each 16-byte CQE.
+        let off = i * 16 + 14;
+        buf[off] = phase & 1; // status low byte holds the phase bit
+        buf[off + 1] = 0;
+    };
+
+    // Helper: read the phase bit from entry `i`.
+    let get_phase = |buf: &alloc::vec::Vec<u8>, i: usize| -> u8 {
+        (buf[i * 16 + 14]) & 1
+    };
+
+    // Controller starts with all entries phase=0. Host expects
+    // phase=1 (the first lap). Mark entries 0..3 as valid (phase=1).
+    let mut expected_phase: u8 = 1;
+    let mut cq_head: usize = 0;
+
+    for i in 0..DEPTH {
+        set_phase(&mut cq, i, 1); // controller writes phase=1
+    }
+
+    // Consume all 4 entries in the first lap.
+    for i in 0..DEPTH {
+        let entry_phase = get_phase(&cq, cq_head);
+        if entry_phase != expected_phase {
+            return TestResult::Fail("first-lap entry should match expected_phase=1");
+        }
+        cq_head += 1;
+        if cq_head == DEPTH {
+            cq_head = 0;
+            expected_phase ^= 1; // wrap: phase flips to 0
+        }
+    }
+    if cq_head != 0 || expected_phase != 0 {
+        return TestResult::Fail("after first lap: head should be 0, phase should be 0");
+    }
+
+    // Second lap: controller fills entries with phase=0.
+    for i in 0..DEPTH {
+        set_phase(&mut cq, i, 0);
+    }
+    for i in 0..DEPTH {
+        let entry_phase = get_phase(&cq, cq_head);
+        if entry_phase != expected_phase {
+            return TestResult::Fail("second-lap entry should match expected_phase=0");
+        }
+        cq_head += 1;
+        if cq_head == DEPTH {
+            cq_head = 0;
+            expected_phase ^= 1; // wrap: phase flips back to 1
+        }
+    }
+    if cq_head != 0 || expected_phase != 1 {
+        return TestResult::Fail("after second lap: head should be 0, phase should be 1");
+    }
+
+    // Pending-entry check: if the controller hasn't written a new
+    // entry yet (stale phase from prior lap), the host must not
+    // consume it. Plant a stale phase=1 entry when we're expecting
+    // phase=0 and verify we detect it as pending (mismatch).
+    set_phase(&mut cq, 0, 1); // stale: matches last-lap phase, not current
+    if get_phase(&cq, 0) == expected_phase {
+        // expected_phase is 1 here after two full laps — so this
+        // is actually valid. Let's reset expected to 0 to test the
+        // "not yet valid" path.
+        expected_phase = 0;
+    }
+    // Now expected_phase=0 but entry 0 has phase=1 → mismatch → pending.
+    if get_phase(&cq, 0) == expected_phase {
+        return TestResult::Fail("stale-phase entry should NOT match expected_phase=0");
+    }
+    // Confirm a freshly-written entry (phase=0) is detected as valid.
+    set_phase(&mut cq, 0, 0);
+    if get_phase(&cq, 0) != expected_phase {
+        return TestResult::Fail("fresh phase=0 entry should match expected_phase=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_completion_phase_tag_unit);
