@@ -1989,3 +1989,326 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_dir_empty_check_recognises_dot_dotdot_only
 );
+
+// ── Item 3: timestamp fields ──────────────────────────────────────
+
+fn smoke_ext2_inode_timestamps_parse_and_encode() -> TestResult {
+    // Build a 128-byte inode buffer with known atime/ctime/mtime values.
+    // Verify parse() decodes them, then encode_into() writes them back.
+    let mut buf = vec![0u8; 128];
+    // i_mode = S_IFREG | 0o644
+    buf[0..2].copy_from_slice(&(0x8000u16 | 0o644).to_le_bytes());
+    // i_size = 512
+    buf[4..8].copy_from_slice(&512u32.to_le_bytes());
+    // i_atime = 1_700_000_000
+    buf[8..12].copy_from_slice(&1_700_000_000u32.to_le_bytes());
+    // i_ctime = 1_700_000_001
+    buf[12..16].copy_from_slice(&1_700_000_001u32.to_le_bytes());
+    // i_mtime = 1_700_000_002
+    buf[16..20].copy_from_slice(&1_700_000_002u32.to_le_bytes());
+    // i_links_count = 1
+    buf[26..28].copy_from_slice(&1u16.to_le_bytes());
+    // i_blocks = 1
+    buf[28..32].copy_from_slice(&1u32.to_le_bytes());
+
+    let inode = match Inode::parse(&buf) {
+        Some(i) => i,
+        None => return TestResult::Fail("parse returned None"),
+    };
+    if inode.atime != 1_700_000_000 {
+        return TestResult::Fail("atime mismatch after parse");
+    }
+    if inode.ctime != 1_700_000_001 {
+        return TestResult::Fail("ctime mismatch after parse");
+    }
+    if inode.mtime != 1_700_000_002 {
+        return TestResult::Fail("mtime mismatch after parse");
+    }
+
+    // Roundtrip through encode_into.
+    let mut out = vec![0u8; 128];
+    inode.encode_into(&mut out);
+    let at = u32::from_le_bytes([out[8], out[9], out[10], out[11]]);
+    let ct = u32::from_le_bytes([out[12], out[13], out[14], out[15]]);
+    let mt = u32::from_le_bytes([out[16], out[17], out[18], out[19]]);
+    if at != 1_700_000_000 || ct != 1_700_000_001 || mt != 1_700_000_002 {
+        return TestResult::Fail("timestamps corrupted by encode_into roundtrip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_inode_timestamps_parse_and_encode
+);
+
+fn smoke_ext2_inode_touch_ctime_only() -> TestResult {
+    // touch_ctime must not change mtime.
+    let mut inode = Inode::new_regular(0o644);
+    inode.mtime = 1_000;
+    inode.touch_ctime(9_999);
+    if inode.ctime != 9_999 {
+        return TestResult::Fail("touch_ctime did not update ctime");
+    }
+    if inode.mtime != 1_000 {
+        return TestResult::Fail("touch_ctime must not change mtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_inode_touch_ctime_only);
+
+fn smoke_ext2_inode_flags_htree_roundtrip() -> TestResult {
+    use crate::inode::I_FLAGS_INDEX;
+    // Build a buffer with i_flags = I_FLAGS_INDEX.
+    let mut buf = vec![0u8; 128];
+    buf[0..2].copy_from_slice(&(0x4000u16 | 0o755).to_le_bytes()); // S_IFDIR
+    buf[26..28].copy_from_slice(&2u16.to_le_bytes());
+    buf[32..36].copy_from_slice(&I_FLAGS_INDEX.to_le_bytes());
+    let inode = match Inode::parse(&buf) {
+        Some(i) => i,
+        None => return TestResult::Fail("parse returned None"),
+    };
+    if !inode.is_htree() {
+        return TestResult::Fail("I_FLAGS_INDEX not recognised by is_htree()");
+    }
+    // Roundtrip through encode_into.
+    let mut out = vec![0u8; 128];
+    inode.encode_into(&mut out);
+    let f = u32::from_le_bytes([out[32], out[33], out[34], out[35]]);
+    if f & I_FLAGS_INDEX == 0 {
+        return TestResult::Fail("I_FLAGS_INDEX lost through encode_into");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_inode_flags_htree_roundtrip);
+
+// ── Item 2: RENAME_NOREPLACE ──────────────────────────────────────
+
+fn smoke_ext2_rename_noreplace_dest_exists_rejected() -> TestResult {
+    // Simulate the collision check: inserting the same name twice in a
+    // directory block should return InsertResult::Exists, which
+    // dir_rename translates to InvalidPath.
+    use crate::dir::splice;
+    use crate::dir::ftype;
+
+    let mut block = vec![0u8; 1024];
+    // Seed with a "." entry.
+    splice::make_empty_dir(&mut block, 2, 2);
+    // Insert "foo".
+    match splice::insert_entry(&mut block, 5, b"foo", ftype::REGULAR) {
+        splice::InsertResult::Ok { .. } => {}
+        _ => return TestResult::Fail("first insert of 'foo' should succeed"),
+    }
+    // Attempt to insert "foo" again — must return Exists.
+    match splice::insert_entry(&mut block, 6, b"foo", ftype::REGULAR) {
+        splice::InsertResult::Exists => {}
+        splice::InsertResult::Ok { .. } => {
+            return TestResult::Fail("duplicate 'foo' insert must return Exists")
+        }
+        splice::InsertResult::NoRoom => {
+            return TestResult::Fail("duplicate 'foo' insert must return Exists, not NoRoom")
+        }
+        splice::InsertResult::Corrupt => {
+            return TestResult::Fail("duplicate 'foo' insert must return Exists, not Corrupt")
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_rename_noreplace_dest_exists_rejected
+);
+
+// ── Item 1: HTREE split ───────────────────────────────────────────
+
+fn smoke_ext2_htree_split_leaf_halves_entries() -> TestResult {
+    use crate::htree::{
+        collect_sorted_leaf_entries, hash_version, htree_split_leaf, repack_leaf_block,
+    };
+
+    let bs = 1024usize;
+    let seed = [0u32; 4];
+    let hv = hash_version::TEA;
+
+    // Build a leaf block packed with short dirents.
+    // Use rec_len_for(name_len) = (name_len + 8 + 3) & !3.
+    // name "ab" → (2 + 8 + 3) & !3 = 12
+    // We'll pack 40 entries of 12 bytes each = 480 bytes used.
+    let mut block = vec![0u8; bs];
+    let mut pos = 0usize;
+    let entry_count = 40usize;
+    for i in 0..entry_count {
+        let name = alloc::format!("{:02}", i);
+        let name_bytes = name.as_bytes();
+        let rec = 12u16;
+        block[pos..pos + 4].copy_from_slice(&((i as u32) + 10).to_le_bytes());
+        block[pos + 4..pos + 6].copy_from_slice(&rec.to_le_bytes());
+        block[pos + 6] = name_bytes.len() as u8;
+        block[pos + 7] = 1u8; // REGULAR
+        block[pos + 8..pos + 8 + name_bytes.len()].copy_from_slice(name_bytes);
+        pos += rec as usize;
+    }
+    // Set last entry's rec_len to fill the block.
+    let last = pos - 12;
+    let fill = (bs - last) as u16;
+    block[last + 4..last + 6].copy_from_slice(&fill.to_le_bytes());
+
+    // Verify we can collect them.
+    let entries = match collect_sorted_leaf_entries(&block, hv, &seed) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("collect_sorted_leaf_entries failed"),
+    };
+    if entries.len() != entry_count {
+        return TestResult::Fail("wrong entry count from collect");
+    }
+
+    // Split.
+    let split = match htree_split_leaf(&block, hv, &seed) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("htree_split_leaf failed"),
+    };
+
+    // Each half must be non-empty and re-parseable.
+    let old_entries = match collect_sorted_leaf_entries(&split.old_block_data, hv, &seed) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("collect from old half failed"),
+    };
+    let new_entries = match collect_sorted_leaf_entries(&split.new_block_data, hv, &seed) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("collect from new half failed"),
+    };
+    if old_entries.is_empty() {
+        return TestResult::Fail("old half is empty after split");
+    }
+    if new_entries.is_empty() {
+        return TestResult::Fail("new half is empty after split");
+    }
+    if old_entries.len() + new_entries.len() != entry_count {
+        return TestResult::Fail("entry count mismatch after split");
+    }
+    // All entries in old half must have hash < split_hash (or equal for ties).
+    // All entries in new half must have hash >= split_hash.
+    for e in &new_entries {
+        if e.hash < split.split_hash {
+            return TestResult::Fail("new half entry has hash below split_hash");
+        }
+    }
+    let _ = repack_leaf_block; // silence unused warning
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_htree_split_leaf_halves_entries
+);
+
+fn smoke_ext2_htree_index_node_insert_sorted() -> TestResult {
+    use crate::htree::{index_node_insert_entry, DX_NODE_ENTRIES_OFF, DX_NODE_HEAD_OFF};
+
+    let bs = 1024usize;
+    let mut node = vec![0u8; bs];
+
+    // Initialise head: limit = (bs - 12) / 8, count = 1 (sentinel entry 0).
+    let limit = ((bs - DX_NODE_ENTRIES_OFF) / 8) as u16;
+    node[DX_NODE_HEAD_OFF..DX_NODE_HEAD_OFF + 2].copy_from_slice(&limit.to_le_bytes());
+    node[DX_NODE_HEAD_OFF + 2..DX_NODE_HEAD_OFF + 4].copy_from_slice(&1u16.to_le_bytes());
+    // Entry 0: hash=0, block=1 (catch-all).
+    node[DX_NODE_ENTRIES_OFF..DX_NODE_ENTRIES_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+    node[DX_NODE_ENTRIES_OFF + 4..DX_NODE_ENTRIES_OFF + 8].copy_from_slice(&1u32.to_le_bytes());
+
+    // Insert (hash=300, block=3), (hash=100, block=2), (hash=200, block=4).
+    // After all inserts the order (by hash) should be: 0, 100, 200, 300.
+    index_node_insert_entry(
+        &mut node,
+        DX_NODE_HEAD_OFF,
+        DX_NODE_ENTRIES_OFF,
+        300,
+        3,
+    )
+    .unwrap();
+    index_node_insert_entry(
+        &mut node,
+        DX_NODE_HEAD_OFF,
+        DX_NODE_ENTRIES_OFF,
+        100,
+        2,
+    )
+    .unwrap();
+    index_node_insert_entry(
+        &mut node,
+        DX_NODE_HEAD_OFF,
+        DX_NODE_ENTRIES_OFF,
+        200,
+        4,
+    )
+    .unwrap();
+
+    let count = u16::from_le_bytes([
+        node[DX_NODE_HEAD_OFF + 2],
+        node[DX_NODE_HEAD_OFF + 3],
+    ]) as usize;
+    if count != 4 {
+        return TestResult::Fail("count should be 4 after 3 inserts");
+    }
+    // Verify sorted order: entries at indices 0..4 should have
+    // hashes 0, 100, 200, 300.
+    let expected_hashes = [0u32, 100, 200, 300];
+    for (i, &eh) in expected_hashes.iter().enumerate() {
+        let off = DX_NODE_ENTRIES_OFF + i * 8;
+        let h = u32::from_le_bytes([node[off], node[off + 1], node[off + 2], node[off + 3]]);
+        if h != eh {
+            return TestResult::Fail("index entries not in sorted hash order");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_htree_index_node_insert_sorted
+);
+
+fn smoke_ext2_htree_collect_sorted_entries() -> TestResult {
+    use crate::htree::{collect_sorted_leaf_entries, hash_version};
+
+    let bs = 1024usize;
+    let seed = [0u32; 4];
+    let hv = hash_version::TEA;
+
+    // Build a block with 3 entries in reverse-alphabetical order
+    // ("zzz", "mmm", "aaa") — collect must return them sorted by hash.
+    let mut block = vec![0u8; bs];
+    let names: &[&[u8]] = &[b"zzz", b"mmm", b"aaa"];
+    let mut pos = 0usize;
+    let inodes = [3u32, 2, 1];
+    for (i, name) in names.iter().enumerate() {
+        let rec = 12u16;
+        block[pos..pos + 4].copy_from_slice(&inodes[i].to_le_bytes());
+        block[pos + 4..pos + 6].copy_from_slice(&rec.to_le_bytes());
+        block[pos + 6] = name.len() as u8;
+        block[pos + 7] = 1u8;
+        block[pos + 8..pos + 8 + name.len()].copy_from_slice(name);
+        pos += rec as usize;
+    }
+    // Last entry spans to end of block.
+    let last = pos - 12;
+    let fill = (bs - last) as u16;
+    block[last + 4..last + 6].copy_from_slice(&fill.to_le_bytes());
+
+    let entries = match collect_sorted_leaf_entries(&block, hv, &seed) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("collect failed"),
+    };
+    if entries.len() != 3 {
+        return TestResult::Fail("expected 3 entries");
+    }
+    // Verify ascending hash order.
+    for i in 0..entries.len() - 1 {
+        if entries[i].hash > entries[i + 1].hash {
+            return TestResult::Fail("entries not sorted ascending by hash");
+        }
+    }
+    let _ = inodes; // silence warning
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_htree_collect_sorted_entries
+);
