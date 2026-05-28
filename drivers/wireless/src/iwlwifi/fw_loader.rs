@@ -39,6 +39,8 @@ use super::transport::{
 use super::{ParsedUcode, Generation, ChipConfig};
 use super::transport::IML_SECTION_SENTINEL;
 
+use narf_io;
+
 // ── Error ──────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -78,6 +80,35 @@ pub trait DmaAllocator {
     /// until the device finishes consuming it (caller's
     /// responsibility to track lifetime).
     fn alloc_coherent(&mut self, size: usize) -> (*mut u8, u64);
+}
+
+/// Production implementation of `DmaAllocator`. Uses `narf_io::alloc_coherent`
+/// and tracks the `DmaBuffer` objects in a `Vec` to ensure they stay live
+/// until the loader or its caller is done with them.
+pub struct DmaAllocatorImpl {
+    buffers: Vec<narf_io::DmaBuffer>,
+}
+
+impl DmaAllocatorImpl {
+    pub fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+        }
+    }
+}
+
+impl DmaAllocator for DmaAllocatorImpl {
+    fn alloc_coherent(&mut self, size: usize) -> (*mut u8, u64) {
+        // narf_io::alloc_coherent returns a DmaBuffer that automatically
+        // frees its PhysFrame on drop. We store it in our `buffers` Vec
+        // to keep it alive.
+        let buf = narf_io::alloc_coherent(size, narf_lib::id::DomainId::DRIVER_0)
+            .expect("iwlwifi: failed to allocate coherent DMA memory");
+        let ptr = buf.as_mut_ptr();
+        let phys = buf.phys_addr().as_u64();
+        self.buffers.push(buf);
+        (ptr, phys)
+    }
 }
 
 // ── gen2 orchestrator ───────────────────────────────────────────────

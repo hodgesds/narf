@@ -61,10 +61,23 @@ pub mod rx;
 pub mod transport;
 pub mod tx;
 
-use narf_bus::{BusDevice, BusDeviceCap};
+use narf_bus::{map_bar, BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 
 pub const INTEL_VENDOR: u16 = 0x8086;
+
+// ── MMIO implementation ────────────────────────────────────────────
+
+struct IwlMmioImpl(narf_bus::MmioRegion);
+
+impl transport::IwlMmio for IwlMmioImpl {
+    fn read(&mut self, offset: u32) -> u32 {
+        unsafe { self.0.read32(offset as u64) }
+    }
+    fn write(&mut self, offset: u32, value: u32) {
+        unsafe { self.0.write32(offset as u64, value) }
+    }
+}
 
 // ── Per-chip configuration table ───────────────────────────────────
 
@@ -759,6 +772,35 @@ pub fn probe(
                      load not yet wired"
                 );
             }
+
+            // ── Hardware bring-up ──
+
+            // 1. Map BAR0.
+            let mmio_region = unsafe { map_bar(&device, 0) }.map_err(|_| {
+                let _ = writeln!(narf_console::Writer, "  iwlwifi: BAR0 map failed");
+                narf_bus::ProbeError::Other("BAR0 map failed")
+            })?;
+            let mut mmio = IwlMmioImpl(mmio_region);
+
+            // 2. APM Init (clocks + reset prologue).
+            transport::apm_init(&mut mmio).map_err(|e| {
+                let _ = writeln!(narf_console::Writer, "  iwlwifi: APM init failed: {:?}", e);
+                narf_bus::ProbeError::Other("APM init failed")
+            })?;
+
+            // 3. Firmware load + ALIVE handshake.
+            let mut allocator = fw_loader::DmaAllocatorImpl::new();
+            let mut alive = transport::PollingAliveSink::new(mmio_region);
+
+            match fw_loader::load_firmware(&mut mmio, &chip, &parsed, &mut allocator, &mut alive) {
+                Ok(()) => {
+                    let _ = writeln!(narf_console::Writer, "  iwlwifi: ALIVE handshake successful");
+                }
+                Err(e) => {
+                    let _ = writeln!(narf_console::Writer, "  iwlwifi: firmware load failed: {:?}", e);
+                    return Err(narf_bus::ProbeError::Other("Firmware load failed"));
+                }
+            }
         }
         Err(e) => {
             let _ = writeln!(
@@ -768,9 +810,6 @@ pub fn probe(
             );
         }
     }
-
-    // TODO: hardware bring-up (gen2 FH DMA / gen3 IML+ctxt_info) +
-    // ALIVE handshake. Documented in module preamble.
 
     Ok(())
 }
