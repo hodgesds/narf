@@ -20,6 +20,21 @@ pub struct IbiPayload {
     pub data: alloc::vec::Vec<u8>,
 }
 
+/// Handler registered by a device driver for In-Band Interrupts.
+///
+/// The IBI mechanism lets a slave assert an interrupt to the master by
+/// pulling SDA low at the start of an address phase.  The master then
+/// reads the mandatory data byte (MDB) and any additional payload bytes.
+///
+/// I3C spec rev 1.1 §5.1.6; Linux include/linux/i3c/master.h
+/// `i3c_ibi_setup` / `i3c_master_controller_ops::enable_ibi`.
+pub trait IbiHandler: Send + Sync {
+    /// Called by the ISR drain loop when an IBI arrives from the registered
+    /// device.  `payload` is the mandatory data byte (MDB) followed by any
+    /// additional payload bytes captured from the IBI ring.
+    fn on_ibi(&self, payload: &[u8]);
+}
+
 // ── Common Command Codes (CCCs) ────────────────────────────────────
 //
 // Opcodes follow the I3C Basic Spec rev 1.1, Table 11 and the Linux
@@ -74,6 +89,27 @@ pub enum CommonCommandCode {
     Getdcr = 0x8F,
     /// Get Device Status (0x90, directed)
     Getstatus = 0x90,
+
+    // ── HDR Entry CCCs (broadcast, bit 7 = 0) ──────────────────
+    //
+    // ENTHDR(n) = 0x20 + n (broadcast).  I3C spec rev 1.1 §5.2.3
+    // and Linux include/linux/i3c/ccc.h I3C_CCC_ENTHDR(x).
+    //
+    // ENTHDR0 = Enter HDR-DDR mode.   Opcode 0x20.
+    // ENTHDR1 = Enter HDR-TSL mode.   Opcode 0x21.
+    // ENTHDR2 = Enter HDR-TSP mode.   Opcode 0x22.
+    //
+    // All ENTHDR CCCs are broadcast-only (no directed form).
+
+    /// Enter HDR-DDR mode — broadcast (0x20)
+    /// I3C spec §5.2.3; Linux I3C_CCC_ENTHDR(0).
+    Enthdr0 = 0x20,
+    /// Enter HDR-TSL mode — broadcast (0x21)
+    /// I3C spec §5.2.4; Linux I3C_CCC_ENTHDR(1).
+    Enthdr1 = 0x21,
+    /// Enter HDR-TSP mode — broadcast (0x22)
+    /// I3C spec §5.2.5; Linux I3C_CCC_ENTHDR(2).
+    Enthdr2 = 0x22,
 }
 
 impl CommonCommandCode {

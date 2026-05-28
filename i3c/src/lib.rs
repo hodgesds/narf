@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::task::Waker;
@@ -12,7 +13,7 @@ pub mod registry;
 pub mod types;
 
 pub use types::{
-    CccDest, CommonCommandCode, I3cDevice, I3cError, I3cOp, IbiPayload,
+    CccDest, CommonCommandCode, I3cDevice, I3cError, I3cOp, IbiHandler, IbiPayload,
 };
 
 /// A specialized capability for I3C operations.
@@ -75,11 +76,44 @@ pub trait I3cBus: Send + Sync {
     ///            dw_i3c_master_daa()
     async fn enter_daa(&self) -> Result<Vec<I3cDevice>, I3cError>;
 
+    /// HDR-DDR write to a target device.
+    ///
+    /// Broadcasts ENTHDR0 to place the bus in HDR-DDR mode, then sends
+    /// a DDR command token (address + R/W=0 + command code) followed by
+    /// the data words.  Each word is 16 bits; DDR clocks both edges so
+    /// the raw bit rate doubles vs SDR at the same clock frequency.
+    ///
+    /// I3C spec rev 1.1 §5.2.3; Linux dw-i3c-master.c COMMAND_PORT_SPEED.
+    async fn hdr_ddr_write(&self, addr: u8, command: u8, data: &[u16])
+        -> Result<(), I3cError>;
+
+    /// HDR-DDR read from a target device.
+    ///
+    /// Like `hdr_ddr_write` but sets the R/W bit in the command token
+    /// and reads back the data words from the bus.
+    ///
+    /// I3C spec rev 1.1 §5.2.3.
+    async fn hdr_ddr_read(&self, addr: u8, command: u8, data: &mut [u16])
+        -> Result<(), I3cError>;
+
     /// Registers an async waker for an In-Band Interrupt (IBI).
     fn register_ibi_waker(&self, addr: u8, waker: Waker);
 
     /// Unregisters an async waker.
     fn unregister_ibi_waker(&self, addr: u8);
+
+    /// Register a handler invoked when the named slave device fires an IBI.
+    ///
+    /// Sends ENEC (directed, enable SIR events) to `dev_addr`, then stores
+    /// `handler` so the ISR/drain loop can call `on_ibi()` when the IBI
+    /// ring has data for that address.
+    ///
+    /// I3C spec rev 1.1 §5.1.6; Linux i3c_master_enable_ibi().
+    async fn register_ibi_handler(
+        &self,
+        dev_addr: u8,
+        handler: Arc<dyn IbiHandler>,
+    ) -> Result<(), I3cError>;
 }
 
 /// Force-link hook.
@@ -139,8 +173,37 @@ mod tests {
             Ok(alloc::vec![I3cDevice::from_daa_response(&raw, 0x08)])
         }
 
+        async fn hdr_ddr_write(
+            &self,
+            _addr: u8,
+            _command: u8,
+            _data: &[u16],
+        ) -> Result<(), I3cError> {
+            Ok(())
+        }
+
+        async fn hdr_ddr_read(
+            &self,
+            _addr: u8,
+            _command: u8,
+            data: &mut [u16],
+        ) -> Result<(), I3cError> {
+            for w in data.iter_mut() {
+                *w = 0xA55A;
+            }
+            Ok(())
+        }
+
         fn register_ibi_waker(&self, _addr: u8, _waker: Waker) {}
         fn unregister_ibi_waker(&self, _addr: u8) {}
+
+        async fn register_ibi_handler(
+            &self,
+            _dev_addr: u8,
+            _handler: Arc<dyn IbiHandler>,
+        ) -> Result<(), I3cError> {
+            Ok(())
+        }
     }
 
     fn make_mock() -> Arc<MockI3c> {
@@ -281,6 +344,58 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("i3c", smoke_i3c_ccc_opcode_encoding);
+
+    // ── ENTHDR CCC opcode encoding smoke ──────────────────────────
+    // ENTHDR(n) = 0x20 + n (broadcast).  I3C spec rev 1.1 §5.2.3.
+    // Linux: include/linux/i3c/ccc.h I3C_CCC_ENTHDR(x) = 0x20 + x.
+    fn smoke_i3c_enthdr_ccc_encoding() -> TestResult {
+        if CommonCommandCode::Enthdr0.opcode() != 0x20 {
+            return TestResult::Fail("ENTHDR0 opcode should be 0x20");
+        }
+        if CommonCommandCode::Enthdr1.opcode() != 0x21 {
+            return TestResult::Fail("ENTHDR1 opcode should be 0x21");
+        }
+        if CommonCommandCode::Enthdr2.opcode() != 0x22 {
+            return TestResult::Fail("ENTHDR2 opcode should be 0x22");
+        }
+        // All ENTHDR CCCs are broadcast (bit 7 = 0).
+        if CommonCommandCode::Enthdr0.is_directed() {
+            return TestResult::Fail("ENTHDR0 must be broadcast (bit 7 = 0)");
+        }
+        if CommonCommandCode::Enthdr1.is_directed() {
+            return TestResult::Fail("ENTHDR1 must be broadcast (bit 7 = 0)");
+        }
+        if CommonCommandCode::Enthdr2.is_directed() {
+            return TestResult::Fail("ENTHDR2 must be broadcast (bit 7 = 0)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("i3c", smoke_i3c_enthdr_ccc_encoding);
+
+    // ── HDR-DDR read mock round-trip ──────────────────────────────
+    fn smoke_i3c_hdr_ddr_read_via_mock() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = make_mock();
+        let ok = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let m = mock.clone();
+        let o = ok.clone();
+        narf_scheduler::spawn(async move {
+            let mut words = [0u16; 4];
+            if m.hdr_ddr_read(0x08, 0x01, &mut words).await.is_ok()
+                && words[0] == 0xA55A
+                && words[3] == 0xA55A
+            {
+                o.store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if ok.load(core::sync::atomic::Ordering::SeqCst) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("hdr_ddr_read mock round-trip failed")
+        }
+    }
+    kernel_test_in!("i3c", smoke_i3c_hdr_ddr_read_via_mock);
 
     // ── CCC dispatch smoke — mock receives correct opcode ──────────
     fn smoke_i3c_ccc_dispatch_via_mock() -> TestResult {

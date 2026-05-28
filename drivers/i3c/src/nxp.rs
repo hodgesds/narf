@@ -28,7 +28,7 @@ use core::task::Waker;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
-use narf_i3c::{registry, CccDest, CommonCommandCode, I3cBus, I3cDevice, I3cError, I3cOp};
+use narf_i3c::{registry, CccDest, CommonCommandCode, I3cBus, I3cDevice, I3cError, I3cOp, IbiHandler};
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── NXP I3C Register Offsets ───────────────────────────────────────
@@ -48,6 +48,7 @@ const MCTRL_REQUEST_NONE: u32 = 0x0;
 const MCTRL_REQUEST_SDR_MSG: u32 = 0x1; // SDR private message
 const MCTRL_REQUEST_SDR_BC_CCC: u32 = 0x3; // Broadcast CCC
 const MCTRL_REQUEST_SDR_DIR_CCC: u32 = 0x4; // Directed (addressed) CCC
+const MCTRL_REQUEST_DDR_MSG: u32 = 0x2; // HDR-DDR private message
 const MCTRL_REQUEST_DAA: u32 = 0x7; // Process DAA (ENTDAA)
 
 // MCTRL.TYPE field (bits [5:4]) — only I3C mode used at Stage 2.
@@ -325,6 +326,80 @@ impl I3cBus for NxpI3c {
         if addr < 128 {
             self.ibi_wakers.lock()[addr as usize] = None;
         }
+    }
+
+    /// HDR-DDR write — NXP controller uses MCTRL.REQUEST = 0x2 (DDR_MSG).
+    ///
+    /// On the NXP I3C controller, HDR-DDR is triggered by setting
+    /// MCTRL.REQUEST = DDR_MSG (0x2).  The controller internally handles
+    /// the ENTHDR0 broadcast and DDR framing.  Data words are written
+    /// byte-by-byte to MWDATAB (LSB then MSB per word).
+    ///
+    /// I3C spec rev 1.1 §5.2.3; NXP i.MX 93 RM §I3C_MCTRL.
+    async fn hdr_ddr_write(
+        &self,
+        addr: u8,
+        _command: u8,
+        data: &[u16],
+    ) -> Result<(), I3cError> {
+        self.flush_fifos();
+        for &w in data {
+            unsafe {
+                self.mmio.write32(REG_MWDATAB, (w & 0xFF) as u32);
+                self.mmio.write32(REG_MWDATAB, (w >> 8) as u32);
+            }
+        }
+        unsafe {
+            self.mmio.write32(
+                REG_MCTRL,
+                MCTRL_REQUEST_DDR_MSG | MCTRL_TYPE_I3C | mctrl_addr(addr),
+            );
+        }
+        self.wait_complete().await
+    }
+
+    /// HDR-DDR read — NXP controller.
+    ///
+    /// Triggers DDR_MSG request with the read direction; then drains
+    /// MRDATAB byte pairs into the output word slice.
+    async fn hdr_ddr_read(
+        &self,
+        addr: u8,
+        _command: u8,
+        data: &mut [u16],
+    ) -> Result<(), I3cError> {
+        self.flush_fifos();
+        unsafe {
+            self.mmio.write32(
+                REG_MCTRL,
+                MCTRL_REQUEST_DDR_MSG | MCTRL_TYPE_I3C | mctrl_addr(addr),
+            );
+        }
+        self.wait_complete().await?;
+        for w in data.iter_mut() {
+            let lo = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
+            let hi = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
+            *w = (lo as u16) | ((hi as u16) << 8);
+        }
+        Ok(())
+    }
+
+    /// Register an IBI handler for a slave device (NXP controller).
+    ///
+    /// Sends ENEC directed to `dev_addr` with SIR events enabled.
+    /// I3C spec §5.1.6; Linux i3c_master_enable_ibi().
+    async fn register_ibi_handler(
+        &self,
+        dev_addr: u8,
+        _handler: Arc<dyn IbiHandler>,
+    ) -> Result<(), I3cError> {
+        const I3C_CCC_EVENT_SIR: u8 = 1 << 0;
+        self.ccc(
+            CommonCommandCode::EnecDir,
+            CccDest::Address(dev_addr),
+            &[I3C_CCC_EVENT_SIR],
+        )
+        .await
     }
 }
 
