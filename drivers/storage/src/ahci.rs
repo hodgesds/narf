@@ -2006,7 +2006,119 @@ pub unsafe fn read_atapi_lba(
     }
 }
 
+// ── Hot-plug / hot-unplug ──────────────────────────────────────────────
 
+/// PORT_IS bit 22 — PHYRDY change interrupt status (W1C).
+/// AHCI 1.3.1 §3.3.5 Table 11: "PhyRdy Change Status" is bit 22.
+pub const PORT_IS_PHYRDY: u32 = 1 << 22;
+
+/// PORT_IE bit 22 — PHYRDY change interrupt enable.
+pub const PORT_IE_PHYRDY: u32 = 1 << 22;
+
+/// SERR bit 16 — PHY Ready change (N bit, "PHY RDY Changed").
+/// Set by the SATA PHY when the link transitions between present and
+/// absent (both directions). W1C. Reference: Linux ata.h
+/// `SERR_PHYRDY_CHG = (1 << 16)`.
+pub const SERR_PHYRDY_CHG: u32 = 1 << 16;
+
+/// Hot-plug state for a single port.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PortLinkState {
+    /// No device; PHY link is down.
+    Disconnected,
+    /// Device present, PHY link established.
+    Connected {
+        /// Detected device kind after re-IDENTIFY.
+        kind: PortKind,
+    },
+}
+
+/// Enable the PHYRDY interrupt on a port by setting PORT_IE bit 22.
+///
+/// Call once at bring-up and again after each handled PHYRDY event
+/// so the next link transition can fire. Not set by the ISR itself
+/// to avoid re-enabling before the link state settles.
+///
+/// # Safety
+/// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
+pub unsafe fn port_enable_phyrdy_irq(ahci: &Ahci, port_idx: u8) {
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+    // SAFETY: identity-mapped MMIO.
+    let ie = unsafe { ahci.mmio.read32(off + PORT_IE) };
+    // SAFETY: same.
+    unsafe {
+        ahci.mmio.write32(off + PORT_IE, ie | PORT_IE_PHYRDY);
+    }
+}
+
+/// Handle a PHYRDY change event on `port_idx`.
+///
+/// Reads PORT_SSTS.DET to decide link direction:
+///
+/// - **DET = 3** (link-up): clears SERR, issues COMRESET via
+///   `port_reset`, re-reads PORT_SIG + PORT_SSTS, returns
+///   `PortLinkState::Connected { kind }`.
+/// - **DET != 3** (link-down): clears PORT_IS, re-enables PHYRDY IRQ,
+///   returns `PortLinkState::Disconnected`.
+///
+/// The caller is responsible for updating its port-state table and
+/// registering / deregistering the `BlockDevice` instance.
+///
+/// Reference: Linux `drivers/ata/libahci.c::ahci_handle_port_interrupt`
+/// (PHYRDY dispatch) and `libata-eh.c::ata_eh_handle_dev_fail`
+/// (hot-unplug teardown).
+///
+/// # Safety
+/// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
+pub unsafe fn handle_phyrdy_change(
+    ahci: &Ahci,
+    port_idx: u8,
+) -> PortLinkState {
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+
+    // Clear the PHYRDY SERR.N bit (W1C) so the PHY can re-latch the
+    // next event. Reference: AHCI 1.3.1 §3.3.12.
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + PORT_SERR, SERR_PHYRDY_CHG);
+    }
+
+    // Read PORT_SSTS to determine link direction.
+    // SAFETY: same.
+    let ssts = unsafe { ahci.mmio.read32(off + PORT_SSTS) };
+    let (det, _ipm) = ssts_decode(ssts);
+
+    if det != SSTS_DET_PRESENT {
+        // Link-down — device removed or cable unplugged.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            ahci.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+        }
+        // SAFETY: same.
+        unsafe { port_enable_phyrdy_irq(ahci, port_idx) };
+        return PortLinkState::Disconnected;
+    }
+
+    // Link-up — run COMRESET + re-read signature.
+    let kind = match unsafe { ahci.port_reset(port_idx) } {
+        Err(_) => {
+            unsafe { port_enable_phyrdy_irq(ahci, port_idx) };
+            return PortLinkState::Disconnected;
+        }
+        Ok(()) => {
+            // Read new signature from PORT_SIG / PORT_SSTS.
+            let sig   = unsafe { ahci.mmio.read32(off + PORT_SIG) };
+            let ssts2 = unsafe { ahci.mmio.read32(off + PORT_SSTS) };
+            PortKind::from_sig(sig, ssts2)
+        }
+    };
+
+    // Re-enable PHYRDY interrupt for the next event.
+    // SAFETY: identity-mapped MMIO.
+    unsafe { port_enable_phyrdy_irq(ahci, port_idx) };
+
+    PortLinkState::Connected { kind }
+}
 
 /// Sync block-device adapter for the registry. Routes reads /
 /// writes through `ahci_read_lba` / `ahci_write_lba` against the

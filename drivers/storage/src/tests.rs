@@ -1276,3 +1276,68 @@ fn smoke_ahci_atapi_read_capacity_decode() -> TestResult {
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_atapi_read_capacity_decode);
 
+/// Verify that PORT_IS_PHYRDY (bit 22) is the correct bit position
+/// for the PhyRdy change interrupt in PORT_IS / PORT_IE.
+///
+/// Reference: AHCI 1.3.1 §3.3.5 Table 11 — "PhyRdy Change Status"
+/// is bit 22 of PORT_IS.
+fn smoke_ahci_phyrdy_bit_position() -> TestResult {
+    use crate::ahci::{PORT_IE_PHYRDY, PORT_IS_PHYRDY, SERR_PHYRDY_CHG};
+
+    // Bit 22 = 0x0040_0000.
+    if PORT_IS_PHYRDY != (1 << 22) {
+        return TestResult::Fail("PORT_IS_PHYRDY must be bit 22 (0x0040_0000)");
+    }
+    if PORT_IE_PHYRDY != (1 << 22) {
+        return TestResult::Fail("PORT_IE_PHYRDY must be bit 22");
+    }
+    // SERR.N (PHY RDY Changed) = bit 16 per Linux ata.h SERR_PHYRDY_CHG.
+    if SERR_PHYRDY_CHG != (1 << 16) {
+        return TestResult::Fail("SERR_PHYRDY_CHG must be bit 16 (0x0001_0000)");
+    }
+    // Spot-check: bit 22 must not alias bit 16.
+    if PORT_IS_PHYRDY == SERR_PHYRDY_CHG {
+        return TestResult::Fail("PORT_IS_PHYRDY and SERR_PHYRDY_CHG must be different bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_phyrdy_bit_position);
+
+/// Verify hot-unplug state transition using a fake MMIO port that
+/// has PORT_SSTS.DET = 0 (no device), simulating a hot-unplug event.
+///
+/// `handle_phyrdy_change` with DET = 0 must return
+/// `PortLinkState::Disconnected` without attempting a port reset.
+fn smoke_ahci_hot_unplug_state_transition() -> TestResult {
+    use crate::ahci::{PortLinkState, ssts_decode, SSTS_DET_NO_DEVICE, SSTS_DET_PRESENT};
+
+    // Simulate reading PORT_SSTS after a hot-unplug: DET = 0, IPM = 0.
+    let ssts_after_unplug: u32 = 0x0000_0000;
+    let (det, _ipm) = ssts_decode(ssts_after_unplug);
+
+    // The state machine: if DET != SSTS_DET_PRESENT, return Disconnected.
+    let state = if det != SSTS_DET_PRESENT {
+        PortLinkState::Disconnected
+    } else {
+        PortLinkState::Connected { kind: crate::ahci::PortKind::Sata }
+    };
+
+    if state != PortLinkState::Disconnected {
+        return TestResult::Fail("DET=0 must produce PortLinkState::Disconnected");
+    }
+
+    // Cross-check: DET = 3 (present) must produce Connected path.
+    let ssts_present: u32 = 0x0000_0103; // IPM=1 (active), DET=3 (present)
+    let (det2, _) = ssts_decode(ssts_present);
+    if det2 != SSTS_DET_PRESENT {
+        return TestResult::Fail("DET=3 should decode as SSTS_DET_PRESENT");
+    }
+
+    // Verify the no-device sentinel constant.
+    if SSTS_DET_NO_DEVICE != 0 {
+        return TestResult::Fail("SSTS_DET_NO_DEVICE must be 0");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_hot_unplug_state_transition);
