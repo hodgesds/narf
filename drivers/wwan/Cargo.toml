@@ -1,0 +1,22 @@
+[package]
+name         = "narf-drivers-wwan"
+description  = "WWAN subsystem scaffold: WwanPort trait, MBIM/QMI message types, IOSM PCI device table. Stage-0/1 only — SIM management, RIL, and actual modem firmware are deferred."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wwan"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
