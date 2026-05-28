@@ -707,3 +707,125 @@ fn smoke_obs_peek_error_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("observability", smoke_obs_peek_error_variants_distinct);
+
+// ── GDB software breakpoint smokes ────────────────────────────────
+//
+// Tests exercise the Z0/z0 packet dispatch + BP_MAP without touching
+// real kernel memory. The synthetic memory shim intercepts the
+// volatile read/write so no actual pointer dereference occurs; the
+// important invariants are:
+//   1. After Z0, BP_MAP has an entry for the address.
+//   2. After z0, BP_MAP no longer has that entry.
+//   3. The original byte is preserved across install + restore.
+
+fn smoke_obs_gdb_bp_install_restore_round_trip() -> TestResult {
+    // Drive Z0 through run_session; verify BP_MAP has an entry for the
+    // address afterward. Uses the BP read/write test hooks so no real
+    // pointer dereference occurs.
+    use crate::{gdb, ArchRegs, Debugger};
+    use narf_capabilities::{Cap, Invoke};
+
+    gdb::__test_clear_bp_map();
+
+    // Synthetic 1-byte "memory" at address 0xF000_0000, seeded 0x90 (NOP).
+    static CELL: narf_lib::sync::IrqSafeSpinLock<u8> =
+        narf_lib::sync::IrqSafeSpinLock::new(0x90);
+    fn fake_read(va: u64) -> Option<u8> {
+        if va == 0xF000_0000 { Some(*CELL.lock()) } else { None }
+    }
+    fn fake_write(va: u64, byte: u8) -> bool {
+        if va == 0xF000_0000 { *CELL.lock() = byte; true } else { false }
+    }
+    gdb::__test_install_bp_hooks(fake_read, fake_write);
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    let mut transport = gdb::VecTransport::new();
+    transport.push_packet("Z0,f0000000,1");
+    transport.push_packet("c");
+    let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+    let res = gdb::run_session(&cap, &mut transport, &mut session);
+    gdb::__test_clear_bp_hooks();
+    if res.is_err() {
+        gdb::__test_clear_bp_map();
+        return TestResult::Fail("run_session returned Err on Z0");
+    }
+    let out = transport.outbound_str();
+    if !out.contains("+$OK#") {
+        gdb::__test_clear_bp_map();
+        return TestResult::Fail("Z0 reply was not OK");
+    }
+    // BP_MAP must have an entry for 0xF000_0000.
+    let found = gdb::BP_MAP.lock().contains_key(&0xF000_0000u64);
+    gdb::__test_clear_bp_map();
+    if !found {
+        return TestResult::Fail("BP_MAP missing entry after Z0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_bp_install_restore_round_trip);
+
+fn smoke_obs_gdb_bp_map_preserves_original_byte() -> TestResult {
+    // After Z0, BP_MAP entry must equal the pre-INT3 byte (0x55).
+    // After z0, the entry must be gone.
+    use crate::{gdb, ArchRegs, Debugger};
+    use narf_capabilities::{Cap, Invoke};
+
+    gdb::__test_clear_bp_map();
+
+    static CELL2: narf_lib::sync::IrqSafeSpinLock<u8> =
+        narf_lib::sync::IrqSafeSpinLock::new(0x55);
+    fn fake_read2(va: u64) -> Option<u8> {
+        if va == 0xF000_1000 { Some(*CELL2.lock()) } else { None }
+    }
+    fn fake_write2(va: u64, byte: u8) -> bool {
+        if va == 0xF000_1000 { *CELL2.lock() = byte; true } else { false }
+    }
+    gdb::__test_install_bp_hooks(fake_read2, fake_write2);
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+
+    // Z0 — install.
+    {
+        let mut transport = gdb::VecTransport::new();
+        transport.push_packet("Z0,f0001000,1");
+        transport.push_packet("c");
+        let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+        if gdb::run_session(&cap, &mut transport, &mut session).is_err() {
+            gdb::__test_clear_bp_hooks();
+            gdb::__test_clear_bp_map();
+            return TestResult::Fail("run_session failed on Z0");
+        }
+    }
+
+    // Verify original byte in BP_MAP is 0x55.
+    let orig = gdb::BP_MAP.lock().get(&0xF000_1000u64).copied();
+    if orig != Some(0x55) {
+        gdb::__test_clear_bp_hooks();
+        gdb::__test_clear_bp_map();
+        return TestResult::Fail("BP_MAP original byte is wrong or missing");
+    }
+
+    // z0 — remove.
+    {
+        let mut transport = gdb::VecTransport::new();
+        transport.push_packet("z0,f0001000,1");
+        transport.push_packet("c");
+        let mut session = gdb::GdbSession::new(ArchRegs::default(), gdb::HaltReason::SigTrap);
+        if gdb::run_session(&cap, &mut transport, &mut session).is_err() {
+            gdb::__test_clear_bp_hooks();
+            gdb::__test_clear_bp_map();
+            return TestResult::Fail("run_session failed on z0");
+        }
+    }
+
+    gdb::__test_clear_bp_hooks();
+
+    // BP_MAP must be empty.
+    let still_present = gdb::BP_MAP.lock().contains_key(&0xF000_1000u64);
+    gdb::__test_clear_bp_map();
+    if still_present {
+        return TestResult::Fail("BP_MAP still has entry after z0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("observability", smoke_obs_gdb_bp_map_preserves_original_byte);

@@ -24,6 +24,7 @@
 //! production wire is COM1 (port 0x3F8) via `narf-console`; tests
 //! use an in-memory `VecTransport`.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -536,6 +537,106 @@ fn poke_memory(addr: u64, bytes: &[u8]) -> bool {
     true
 }
 
+// ── Software breakpoint map ────────────────────────────────────────
+//
+// Keyed by virtual address; value is the original byte overwritten
+// by INT3. The map is global so the trap #BP handler can look up
+// whether a given RIP belongs to a GDB-installed software breakpoint.
+//
+// Linux reference: kernel/debug/gdbstub.c (BP table, GPL-2.0-or-later;
+// adapted under NARF's post-2026-05-20 licence).
+
+/// Global map of (virtual address → original byte) for all installed
+/// software breakpoints. Protected by an `IrqSafeSpinLock` so the
+/// #BP trap handler (which runs at interrupt time) can look up entries
+/// safely.
+pub static BP_MAP: IrqSafeSpinLock<BTreeMap<u64, u8>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Test-only hook: drain the BP map so independent tests don't leak
+/// state across runs.
+#[doc(hidden)]
+pub fn __test_clear_bp_map() {
+    BP_MAP.lock().clear();
+}
+
+/// INT3 opcode byte.
+const INT3: u8 = 0xCC;
+
+// ── Test-shimmable arch primitives for SW breakpoints ─────────────
+//
+// In production we write directly to virtual addresses via volatile
+// pointer operations. Tests install the shims below so BP dispatch
+// exercises without touching real kernel memory — same pattern as the
+// MEM_PEEK / MEM_POKE hooks above.
+
+type BpReadFn  = fn(va: u64) -> Option<u8>;
+type BpWriteFn = fn(va: u64, byte: u8) -> bool;
+
+static BP_READ:  IrqSafeSpinLock<Option<BpReadFn>>  = IrqSafeSpinLock::new(None);
+static BP_WRITE: IrqSafeSpinLock<Option<BpWriteFn>> = IrqSafeSpinLock::new(None);
+
+/// Test-only: register synthetic byte-level read/write primitives so
+/// `install_sw_breakpoint` / `remove_sw_breakpoint` don't touch real
+/// memory during unit tests.
+#[doc(hidden)]
+pub fn __test_install_bp_hooks(read: BpReadFn, write: BpWriteFn) {
+    *BP_READ.lock()  = Some(read);
+    *BP_WRITE.lock() = Some(write);
+}
+
+/// Test-only: clear the synthetic BP hooks.
+#[doc(hidden)]
+pub fn __test_clear_bp_hooks() {
+    *BP_READ.lock()  = None;
+    *BP_WRITE.lock() = None;
+}
+
+/// Read one byte from `va`. Uses the test shim if installed, otherwise
+/// falls back to a volatile pointer read.
+fn bp_read_byte(va: u64) -> u8 {
+    if let Some(f) = *BP_READ.lock() {
+        return f(va).unwrap_or(0);
+    }
+    // SAFETY: production path — GDB stub is cap-gated; fault = bad addr.
+    unsafe { core::ptr::read_volatile(va as *const u8) }
+}
+
+/// Write `byte` to `va`. Uses the test shim if installed.
+fn bp_write_byte(va: u64, byte: u8) {
+    if let Some(f) = *BP_WRITE.lock() {
+        let _ = f(va, byte);
+        return;
+    }
+    // SAFETY: production path — same contract as bp_read_byte.
+    unsafe { core::ptr::write_volatile(va as *mut u8, byte) };
+}
+
+/// Install an INT3 software breakpoint at `va`. Saves the original
+/// byte in [`BP_MAP`] so [`remove_sw_breakpoint`] can restore it.
+///
+/// Linux reference: kernel/debug/gdbstub.c::dbg_set_sw_break
+/// (GPL-2.0-or-later; adapted under NARF's post-2026-05-20 licence).
+fn install_sw_breakpoint(va: u64) -> bool {
+    let orig = bp_read_byte(va);
+    bp_write_byte(va, INT3);
+    BP_MAP.lock().insert(va, orig);
+    true
+}
+
+/// Remove the INT3 breakpoint at `va`, restoring the original byte
+/// from [`BP_MAP`].
+///
+/// Linux reference: kernel/debug/gdbstub.c::dbg_remove_sw_break
+fn remove_sw_breakpoint(va: u64) -> bool {
+    let orig = match BP_MAP.lock().remove(&va) {
+        Some(b) => b,
+        None => return false, // not installed by us
+    };
+    bp_write_byte(va, orig);
+    true
+}
+
 // ── Packet dispatch ────────────────────────────────────────────────
 
 /// Build the wire reply for a parsed command, given the session's
@@ -575,13 +676,28 @@ pub fn build_reply(session: &mut GdbSession, cmd: &GdbCommand) -> String {
             let _ = write!(s, "S{:02x}", session.halt_reason.signal_byte());
             s
         }
-        GdbCommand::InsertBp { .. } | GdbCommand::RemoveBp { .. } => {
-            // Software-bp install / remove isn't wired through the
-            // arch layer yet — ack so gdb believes it succeeded and
-            // a `c` will run, but no INT3 is patched. Documented
-            // gap; a future arch hook lets this actually install
-            // breakpoints.
-            String::from("OK")
+        GdbCommand::InsertBp { addr, .. } => {
+            // Install an INT3 at `addr`. The arch hook writes the byte
+            // and saves the original in BP_MAP. Reply "OK" on success,
+            // "E01" if the write fails (bad address).
+            //
+            // Linux reference: kernel/debug/gdbstub.c::dbg_set_sw_break
+            // (GPL-2.0-or-later; adapted under NARF's post-2026-05-20 licence).
+            if install_sw_breakpoint(*addr) {
+                String::from("OK")
+            } else {
+                String::from("E01")
+            }
+        }
+        GdbCommand::RemoveBp { addr, .. } => {
+            // Restore the original byte at `addr` and remove from BP_MAP.
+            //
+            // Linux reference: kernel/debug/gdbstub.c::dbg_remove_sw_break
+            if remove_sw_breakpoint(*addr) {
+                String::from("OK")
+            } else {
+                String::from("E01")
+            }
         }
         GdbCommand::QSupported(_features) => String::from("PacketSize=400"),
     }

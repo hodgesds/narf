@@ -4,6 +4,7 @@ core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("trap_entry.S"));
 core::arch::global_asm!(include_str!("ap_trampoline.S"));
 
+pub mod breakpoint;
 pub mod gdt;
 pub mod idt;
 pub mod percpu;
