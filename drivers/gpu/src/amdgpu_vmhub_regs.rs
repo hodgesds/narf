@@ -354,6 +354,53 @@ pub enum TlbInvalidateError {
 /// invalidate is fast at idle but can stall while engines drain).
 pub const TLB_POLL_BUDGET: u32 = 1_000_000;
 
+// ── Cross-hub broadcast ────────────────────────────────────────────
+
+/// Issue a TLB invalidate for `vmid` across **all** hubs the family
+/// has. On Renoir + Phoenix that's GFXHUB + MMHUB. Per
+/// `gmc_v11_0.c::gmc_v11_0_flush_gpu_tlb`, the driver has to walk
+/// every hub on a PT-change so the GPU doesn't accidentally serve
+/// a stale mapping from another engine.
+///
+/// `mmio_gfx` and `mmio_mm` are the per-hub mmio impls; they're
+/// distinct because the per-hub BAR offsets resolve to different
+/// dword-shifted byte addresses inside the BAR5 window.
+pub fn broadcast_invalidate_tlb<MG: VmHubMmio, MM: VmHubMmio>(
+    mmio_gfx: &mut MG,
+    regs_gfx: &VmHubRegs,
+    mmio_mm: &mut MM,
+    regs_mm: &VmHubRegs,
+    vmid: u8,
+    flush_type: u8,
+) -> Result<(), TlbInvalidateError> {
+    write_invalidate_tlb(mmio_gfx, regs_gfx, vmid, flush_type)?;
+    write_invalidate_tlb(mmio_mm, regs_mm, vmid, flush_type)?;
+    Ok(())
+}
+
+/// Issue a TLB invalidate on every engine of every hub. Used after
+/// changing a VMID's page-table root — all in-flight translations
+/// for that VMID need to drop.
+///
+/// In production silicon there are up to 18 invalidate engines per
+/// hub (eng0 = host, eng1-17 = HW clients). For the bring-up arc
+/// we issue against eng0 — the host-owned engine — which is enough
+/// for the page-table-bind path. A future optimisation could issue
+/// to each engine in parallel and mask their _ACK bits.
+pub fn invalidate_vmid_full<MG: VmHubMmio, MM: VmHubMmio>(
+    mmio_gfx: &mut MG,
+    regs_gfx: &VmHubRegs,
+    mmio_mm: &mut MM,
+    regs_mm: &VmHubRegs,
+    vmid: u8,
+) -> Result<(), TlbInvalidateError> {
+    // flush_type 0 = range invalidate (clears the VMID's PT entries
+    // from the TLB). flush_type 2 = ALL2 — heavier-weight, used for
+    // full bring-up. Linux's gmc_v11_0_flush_gpu_tlb defaults to
+    // type 0 for runtime invalidates.
+    broadcast_invalidate_tlb(mmio_gfx, regs_gfx, mmio_mm, regs_mm, vmid, 0)
+}
+
 // ── Test support ───────────────────────────────────────────────────
 
 pub mod test_support {
@@ -532,4 +579,39 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_invalidate_tlb_bad_vmid_rejected);
+
+    fn smoke_broadcast_invalidate_writes_both_hubs() -> TestResult {
+        let mut g = MockVmHubMmio::new();
+        let mut m = MockVmHubMmio::new();
+        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 5));
+        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 5));
+        broadcast_invalidate_tlb(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 5, 0)
+            .expect("broadcast");
+        if !g.writes.iter().any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2) {
+            return TestResult::Fail("GFX hub not written");
+        }
+        if !m.writes.iter().any(|(off, _)| *off == MMHUB_V3_0.inv_eng0_req << 2) {
+            return TestResult::Fail("MM hub not written");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_broadcast_invalidate_writes_both_hubs);
+
+    fn smoke_invalidate_vmid_full_uses_range_flush_type() -> TestResult {
+        let mut g = MockVmHubMmio::new();
+        let mut m = MockVmHubMmio::new();
+        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 3));
+        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 3));
+        invalidate_vmid_full(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 3).expect("full");
+        // The REQ word's flush_type field is bits[7:4]; we passed
+        // 0 for range — check the field is 0 in the first write
+        // to GFX hub's REQ register.
+        let req_off = GFXHUB_V3_0.inv_eng0_req << 2;
+        let req_write = g.writes.iter().find(|(off, _)| *off == req_off).unwrap();
+        if (req_write.1 >> 4) & 0xF != 0 {
+            return TestResult::Fail("flush_type not 0 (range)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_invalidate_vmid_full_uses_range_flush_type);
 }
