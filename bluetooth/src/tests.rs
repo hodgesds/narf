@@ -2834,3 +2834,487 @@ fn smoke_btusb_hci_cmd_queue_dispatch() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/hci", smoke_btusb_hci_cmd_queue_dispatch);
+
+// ── profiles/avdtp: session state machine ─────────────────────────
+
+/// Smoke 1: AVDTP Discover request encoder.
+///
+/// Verifies that [`crate::profiles::avdtp::Session::discover`] emits a
+/// correctly-formed Discover command (transaction label preserved,
+/// SID = SID_DISCOVER, message type = Command).
+fn smoke_profiles_avdtp_discover_request_encoder() -> TestResult {
+    use crate::avdtp::{MSG_COMMAND, PKT_SINGLE, SID_DISCOVER};
+    use crate::profiles::avdtp::Session;
+
+    let mut session = Session::new(/*int_seid=*/ 1);
+    let bytes = session.discover();
+
+    if bytes.len() != 2 {
+        return TestResult::Fail("Discover command = 2 bytes (header only)");
+    }
+    // byte 0: txn(4) | PKT_SINGLE(2) | MSG_COMMAND(2)
+    let packet_type = (bytes[0] >> 2) & 0x03;
+    let message_type = bytes[0] & 0x03;
+    if packet_type != PKT_SINGLE {
+        return TestResult::Fail("packet type must be SINGLE");
+    }
+    if message_type != MSG_COMMAND {
+        return TestResult::Fail("message type must be COMMAND");
+    }
+    if bytes[1] != SID_DISCOVER {
+        return TestResult::Fail("SID must be SID_DISCOVER (0x01)");
+    }
+    // Transaction label must be in range 0..=15.
+    let txn = (bytes[0] >> 4) & 0x0F;
+    if txn > 15 {
+        return TestResult::Fail("transaction label out of range");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_avdtp_discover_request_encoder
+);
+
+/// Smoke 2: AVDTP Get Capabilities decoder — SBC codec-info bit
+/// positions (A2DP §4.3.2 table 4.1).
+///
+/// Synthesises a Get Capabilities Accept payload containing a Media
+/// Codec service descriptor for SBC and verifies that
+/// [`crate::avdtp::SbcCapability::decode`] extracts each field at the
+/// correct bit position.
+fn smoke_profiles_avdtp_get_capabilities_sbc_bit_positions() -> TestResult {
+    use crate::avdtp::{
+        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
+        SBC_CHAN_STEREO, SBC_FREQ_44100, SBC_FREQ_48000, SBC_SUBBANDS_8,
+    };
+
+    // A2DP §4.3.2 table 4.1:
+    //   byte 0:  bits[7..4] = sampling frequency, bits[3..0] = channel mode
+    //   byte 1:  bits[7..4] = block length, bits[3..2] = subbands, bits[1..0] = alloc method
+    //   byte 2:  min bitpool
+    //   byte 3:  max bitpool
+    let raw: [u8; 4] = [
+        SBC_FREQ_48000 | SBC_FREQ_44100 | SBC_CHAN_JOINT_STEREO | SBC_CHAN_STEREO,
+        SBC_BLOCK_16 | SBC_SUBBANDS_8 | SBC_ALLOC_LOUDNESS | SBC_ALLOC_SNR,
+        2,  // min bitpool
+        53, // max bitpool
+    ];
+
+    let cap = SbcCapability::decode(&raw).expect("decode");
+
+    if cap.frequency & SBC_FREQ_48000 == 0 {
+        return TestResult::Fail("SBC_FREQ_48000 bit must be in bits[7..4] of byte 0");
+    }
+    if cap.frequency & SBC_FREQ_44100 == 0 {
+        return TestResult::Fail("SBC_FREQ_44100 bit must be in bits[7..4] of byte 0");
+    }
+    if cap.channel_mode & SBC_CHAN_JOINT_STEREO == 0 {
+        return TestResult::Fail("SBC_CHAN_JOINT_STEREO bit must be in bits[3..0] of byte 0");
+    }
+    if cap.block_length & SBC_BLOCK_16 == 0 {
+        return TestResult::Fail("SBC_BLOCK_16 bit must be in bits[7..4] of byte 1");
+    }
+    if cap.subbands & SBC_SUBBANDS_8 == 0 {
+        return TestResult::Fail("SBC_SUBBANDS_8 bit must be in bits[3..2] of byte 1");
+    }
+    if cap.allocation & SBC_ALLOC_LOUDNESS == 0 {
+        return TestResult::Fail("SBC_ALLOC_LOUDNESS bit must be in bits[1..0] of byte 1");
+    }
+    if cap.min_bitpool != 2 || cap.max_bitpool != 53 {
+        return TestResult::Fail("bitpool range decoding wrong");
+    }
+
+    // Round-trip must be lossless.
+    let re = cap.encode();
+    if re != raw {
+        return TestResult::Fail("SBC capability encode/decode round-trip lost bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_avdtp_get_capabilities_sbc_bit_positions
+);
+
+// ── profiles/a2dp: SBC negotiation ────────────────────────────────
+
+/// Smoke 3: SBC capability negotiation — intersect SEP tables.
+///
+/// Tests [`crate::profiles::a2dp::negotiate_sbc`] against three
+/// scenarios: happy path, no-common-frequency, and no-common-bitpool.
+fn smoke_profiles_a2dp_sbc_negotiate_intersects_tables() -> TestResult {
+    use crate::avdtp::{
+        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
+        SBC_FREQ_44100, SBC_FREQ_48000, SBC_SUBBANDS_8,
+    };
+    use crate::profiles::a2dp::{negotiate_sbc, NegotiateResult, LOCAL_SBC_SOURCE_CAPS};
+
+    // ── Happy path: remote offers 44.1 kHz only ──────────────────────
+    let remote = SbcCapability {
+        frequency: SBC_FREQ_44100,
+        channel_mode: SBC_CHAN_JOINT_STEREO,
+        block_length: SBC_BLOCK_16,
+        subbands: SBC_SUBBANDS_8,
+        allocation: SBC_ALLOC_LOUDNESS,
+        min_bitpool: 2,
+        max_bitpool: 53,
+    };
+    let cfg = match negotiate_sbc(&LOCAL_SBC_SOURCE_CAPS, &remote) {
+        NegotiateResult::Ok(c) => c,
+        other => {
+            let _ = other;
+            return TestResult::Fail("happy-path negotiation should succeed");
+        }
+    };
+    // Local prefers 48000 but only 44100 available → 44100.
+    if cfg.frequency != SBC_FREQ_44100 {
+        return TestResult::Fail("negotiated frequency should be 44100 when remote only offers it");
+    }
+    if cfg.channel_mode != SBC_CHAN_JOINT_STEREO {
+        return TestResult::Fail("negotiated channel mode should be Joint Stereo");
+    }
+    if cfg.min_bitpool != 2 || cfg.max_bitpool != 53 {
+        return TestResult::Fail("negotiated bitpool range should be 2..=53");
+    }
+
+    // ── No common frequency ──────────────────────────────────────────
+    let remote_no_freq = SbcCapability {
+        frequency: 0x00, // no bits set
+        ..remote
+    };
+    if negotiate_sbc(&LOCAL_SBC_SOURCE_CAPS, &remote_no_freq)
+        != NegotiateResult::NoCommonFrequency
+    {
+        return TestResult::Fail("should return NoCommonFrequency when bitmask is empty");
+    }
+
+    // ── Bitpool ranges don't overlap ─────────────────────────────────
+    let remote_high_bitpool = SbcCapability {
+        min_bitpool: 60,
+        max_bitpool: 100,
+        ..remote
+    };
+    // local max = 53 < remote min = 60 → no overlap.
+    if negotiate_sbc(&LOCAL_SBC_SOURCE_CAPS, &remote_high_bitpool)
+        != NegotiateResult::NoCommonBitpool
+    {
+        return TestResult::Fail("should return NoCommonBitpool when ranges don't overlap");
+    }
+
+    // ── Remote offers 48 kHz: should win over 44.1 by preference ─────
+    let remote_48 = SbcCapability {
+        frequency: SBC_FREQ_48000 | SBC_FREQ_44100,
+        ..remote
+    };
+    let cfg48 = match negotiate_sbc(&LOCAL_SBC_SOURCE_CAPS, &remote_48) {
+        NegotiateResult::Ok(c) => c,
+        _ => return TestResult::Fail("48+44 negotiation should succeed"),
+    };
+    if cfg48.frequency != SBC_FREQ_48000 {
+        return TestResult::Fail("48000 should be preferred over 44100 when both available");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_a2dp_sbc_negotiate_intersects_tables
+);
+
+// ── profiles/hfp: AT command parser ───────────────────────────────
+
+/// Smoke 4: HFP AT command parser — classify all mandatory HFP commands.
+///
+/// Tests [`crate::profiles::hfp::classify_at`] against the HFP 1.8
+/// mandatory AT commands that both HF and AG must support.
+fn smoke_profiles_hfp_at_command_parser() -> TestResult {
+    use crate::profiles::hfp::{classify_at, HfpCommand};
+
+    // AT+BRSF=<n>
+    let cmd = classify_at("AT+BRSF=144\r");
+    if cmd != HfpCommand::Brsf(144) {
+        return TestResult::Fail("AT+BRSF=144 should classify as Brsf(144)");
+    }
+
+    // AT+CIND=?
+    let cmd = classify_at("AT+CIND=?\r");
+    if cmd != HfpCommand::CindTest {
+        return TestResult::Fail("AT+CIND=? should classify as CindTest");
+    }
+
+    // AT+CIND?
+    let cmd = classify_at("AT+CIND?\r");
+    if cmd != HfpCommand::CindRead {
+        return TestResult::Fail("AT+CIND? should classify as CindRead");
+    }
+
+    // AT+CMER=3,0,0,1
+    let cmd = classify_at("AT+CMER=3,0,0,1\r");
+    if cmd != HfpCommand::Cmer {
+        return TestResult::Fail("AT+CMER=3,0,0,1 should classify as Cmer");
+    }
+
+    // AT+CHLD=?
+    let cmd = classify_at("AT+CHLD=?\r");
+    if cmd != HfpCommand::ChldTest {
+        return TestResult::Fail("AT+CHLD=? should classify as ChldTest");
+    }
+
+    // ATA — answer
+    let cmd = classify_at("ATA\r");
+    if cmd != HfpCommand::Answer {
+        return TestResult::Fail("ATA should classify as Answer");
+    }
+
+    // AT+CHUP — hangup
+    let cmd = classify_at("AT+CHUP\r");
+    if cmd != HfpCommand::Hangup {
+        return TestResult::Fail("AT+CHUP should classify as Hangup");
+    }
+
+    // AT+BAC=1,2 — available codecs (codec negotiation)
+    let cmd = classify_at("AT+BAC=1,2\r");
+    if cmd != HfpCommand::Bac(alloc::vec![1, 2]) {
+        return TestResult::Fail("AT+BAC=1,2 should classify as Bac([1,2])");
+    }
+
+    // AT+BCS=2 — codec connection confirm (mSBC)
+    let cmd = classify_at("AT+BCS=2\r");
+    if cmd != HfpCommand::Bcs(2) {
+        return TestResult::Fail("AT+BCS=2 should classify as Bcs(2)");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_hfp_at_command_parser
+);
+
+// ── profiles/hfp: SCO setup ────────────────────────────────────────
+
+/// Smoke 5: HFP SCO setup — parameter selection for CVSD and mSBC.
+///
+/// Verifies that [`crate::profiles::hfp::sco_params_for_codec`]
+/// returns the correct bandwidth and voice-setting values as specified
+/// in HFP 1.8 §4.11 and Core spec §6.12.
+fn smoke_profiles_hfp_sco_setup_parameters() -> TestResult {
+    use crate::profiles::hfp::{sco_params_for_codec, CODEC_CVSD, CODEC_MSBC};
+
+    // ── CVSD narrow-band ─────────────────────────────────────────────
+    let cvsd = sco_params_for_codec(CODEC_CVSD).expect("CVSD params must be defined");
+    // HFP §4.11 + Core §6.12: 8 kHz PCM, CVSD air coding.
+    if cvsd.tx_bandwidth != 8_000 {
+        return TestResult::Fail("CVSD tx_bandwidth must be 8000 B/s");
+    }
+    if cvsd.rx_bandwidth != 8_000 {
+        return TestResult::Fail("CVSD rx_bandwidth must be 8000 B/s");
+    }
+    // Voice setting 0x0060: input coding = Linear PCM (bits[1..0]=00),
+    // input data format = 2's complement (bits[3..2]=00), sample size=16
+    // (bit 5=1), air coding = CVSD (bits[9..8] via bits[7..6]=01 for
+    // some representations) — 0x0060 is the canonical "16-bit linear PCM
+    // + CVSD" value from the HFP 1.8 reference table.
+    if cvsd.voice_setting != 0x0060 {
+        return TestResult::Fail("CVSD voice setting must be 0x0060");
+    }
+
+    // ── mSBC wide-band ───────────────────────────────────────────────
+    let msbc = sco_params_for_codec(CODEC_MSBC).expect("mSBC params must be defined");
+    // mSBC: transparent data mode (0x0063).
+    if msbc.voice_setting != 0x0063 {
+        return TestResult::Fail("mSBC voice setting must be 0x0063 (transparent)");
+    }
+    // mSBC max_latency per HFP 1.8 table 5.10.
+    if msbc.max_latency != 0x000D {
+        return TestResult::Fail("mSBC max_latency must be 13 ms (0x000D)");
+    }
+
+    // ── Unknown codec ────────────────────────────────────────────────
+    if sco_params_for_codec(0xFF).is_some() {
+        return TestResult::Fail("unknown codec ID must return None");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_hfp_sco_setup_parameters
+);
+
+// ── profiles/a2dp: stream-start state machine ─────────────────────
+
+/// Smoke 6: A2DP source role — stream-start state machine.
+///
+/// Walks [`crate::profiles::a2dp::A2dpSource`] through the full
+/// stream-start procedure using a stub AVDTP session, verifying that
+/// each state transition is correct and that the final state is
+/// `Streaming`.
+fn smoke_profiles_a2dp_source_stream_start_state_machine() -> TestResult {
+    use crate::avdtp::{
+        Header, SbcCapability, SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
+        SBC_FREQ_48000, SBC_SUBBANDS_8, SEP_TYPE_SINK, MEDIA_AUDIO,
+        MSG_RESPONSE_ACCEPT, PKT_SINGLE, SID_DISCOVER, SID_GET_CAPABILITIES,
+        SID_SET_CONFIGURATION, SID_OPEN, SID_START, StreamEndPoint,
+    };
+    use crate::profiles::a2dp::{A2dpSource, SourceState};
+    use crate::profiles::avdtp::{Session, SessionState};
+
+    let mut session = Session::new(/*int_seid=*/ 1);
+    let mut src = A2dpSource::new();
+
+    // ── Step 1: connect → Discover ───────────────────────────────────
+    let disc_bytes = src.on_connected(&mut session);
+    if src.state != SourceState::Discovering {
+        return TestResult::Fail("should be Discovering after on_connected");
+    }
+    // Verify the discover command has the correct SID.
+    if disc_bytes[1] != SID_DISCOVER {
+        return TestResult::Fail("on_connected should emit a Discover command");
+    }
+
+    // Extract the transaction label from the discover command.
+    let disc_txn = (disc_bytes[0] >> 4) & 0x0F;
+
+    // ── Step 2: feed Discover Accept with one Sink SEP ───────────────
+    let sink_sep = StreamEndPoint {
+        seid: 0x02,
+        in_use: false,
+        media_type: MEDIA_AUDIO,
+        tsep: SEP_TYPE_SINK,
+    };
+    let mut disc_rsp = Header {
+        transaction: disc_txn,
+        packet_type: PKT_SINGLE,
+        message_type: MSG_RESPONSE_ACCEPT,
+        signal_id: SID_DISCOVER,
+    }
+    .encode()
+    .to_vec();
+    disc_rsp.extend_from_slice(&sink_sep.encode());
+
+    session.feed(&disc_rsp).expect("feed discover rsp");
+    if session.state != SessionState::Configuring {
+        return TestResult::Fail("session should be Configuring after Discover Accept");
+    }
+    if session.remote_seps.len() != 1 {
+        return TestResult::Fail("one SEP should have been parsed from Discover Accept");
+    }
+
+    // ── Step 3: on_discovered → Get Capabilities ─────────────────────
+    let getcaps_bytes = src
+        .on_discovered(&mut session)
+        .expect("on_discovered should pick the Sink SEP");
+    if src.state != SourceState::AwaitingCaps {
+        return TestResult::Fail("should be AwaitingCaps after on_discovered");
+    }
+    if getcaps_bytes[1] != SID_GET_CAPABILITIES {
+        return TestResult::Fail("on_discovered should emit a Get Capabilities command");
+    }
+
+    let getcaps_txn = (getcaps_bytes[0] >> 4) & 0x0F;
+
+    // ── Step 4: feed Get Capabilities Accept ─────────────────────────
+    let getcaps_rsp = Header {
+        transaction: getcaps_txn,
+        packet_type: PKT_SINGLE,
+        message_type: MSG_RESPONSE_ACCEPT,
+        signal_id: SID_GET_CAPABILITIES,
+    }
+    .encode()
+    .to_vec();
+    session.feed(&getcaps_rsp).expect("feed getcaps rsp");
+    if session.state != SessionState::Configuring {
+        return TestResult::Fail("session should return to Configuring after GetCaps");
+    }
+
+    // ── Step 5: on_caps → Set Configuration ──────────────────────────
+    let remote_caps = SbcCapability {
+        frequency: SBC_FREQ_48000,
+        channel_mode: SBC_CHAN_JOINT_STEREO,
+        block_length: SBC_BLOCK_16,
+        subbands: SBC_SUBBANDS_8,
+        allocation: SBC_ALLOC_LOUDNESS,
+        min_bitpool: 2,
+        max_bitpool: 53,
+    };
+    let setcfg_bytes = src
+        .on_caps(&mut session, &remote_caps)
+        .expect("on_caps should succeed");
+    if src.config.is_none() {
+        return TestResult::Fail("config should be set after on_caps");
+    }
+    if setcfg_bytes[1] != SID_SET_CONFIGURATION {
+        return TestResult::Fail("on_caps should emit a Set Configuration command");
+    }
+
+    let setcfg_txn = (setcfg_bytes[0] >> 4) & 0x0F;
+
+    // ── Step 6: feed Set Configuration Accept → Open ─────────────────
+    let setcfg_rsp = Header {
+        transaction: setcfg_txn,
+        packet_type: PKT_SINGLE,
+        message_type: MSG_RESPONSE_ACCEPT,
+        signal_id: SID_SET_CONFIGURATION,
+    }
+    .encode()
+    .to_vec();
+    session.feed(&setcfg_rsp).expect("feed setcfg rsp");
+    if session.state != SessionState::Configured {
+        return TestResult::Fail("session should be Configured after SetConfig Accept");
+    }
+
+    let open_bytes = src.on_configured(&mut session);
+    if open_bytes[1] != SID_OPEN {
+        return TestResult::Fail("on_configured should emit an Open command");
+    }
+
+    let open_txn = (open_bytes[0] >> 4) & 0x0F;
+
+    // ── Step 7: feed Open Accept → Start ─────────────────────────────
+    let open_rsp = Header {
+        transaction: open_txn,
+        packet_type: PKT_SINGLE,
+        message_type: MSG_RESPONSE_ACCEPT,
+        signal_id: SID_OPEN,
+    }
+    .encode()
+    .to_vec();
+    session.feed(&open_rsp).expect("feed open rsp");
+    if session.state != SessionState::Open {
+        return TestResult::Fail("session should be Open after Open Accept");
+    }
+
+    let start_bytes = src.on_opened(&mut session);
+    if start_bytes[1] != SID_START {
+        return TestResult::Fail("on_opened should emit a Start command");
+    }
+
+    let start_txn = (start_bytes[0] >> 4) & 0x0F;
+
+    // ── Step 8: feed Start Accept → Streaming ────────────────────────
+    let start_rsp = Header {
+        transaction: start_txn,
+        packet_type: PKT_SINGLE,
+        message_type: MSG_RESPONSE_ACCEPT,
+        signal_id: SID_START,
+    }
+    .encode()
+    .to_vec();
+    session.feed(&start_rsp).expect("feed start rsp");
+    if session.state != SessionState::Streaming {
+        return TestResult::Fail("session should be Streaming after Start Accept");
+    }
+
+    src.on_started();
+    if src.state != SourceState::Streaming {
+        return TestResult::Fail("A2dpSource should be Streaming after on_started");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/profiles",
+    smoke_profiles_a2dp_source_stream_start_state_machine
+);

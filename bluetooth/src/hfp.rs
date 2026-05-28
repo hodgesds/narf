@@ -246,6 +246,10 @@ pub fn ring_unsolicited() -> String {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+pub fn push_decimal_pub(out: &mut String, v: u64) {
+    push_decimal(out, v);
+}
+
 fn push_decimal(out: &mut String, mut v: u64) {
     if v == 0 {
         out.push('0');

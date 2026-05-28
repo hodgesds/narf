@@ -35,6 +35,7 @@ extern crate alloc;
 
 pub mod att;
 pub mod avdtp;
+pub mod profiles;
 pub mod classic;
 pub mod cmd_queue;
 pub mod controller;
