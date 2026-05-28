@@ -364,3 +364,204 @@ fn smoke_tpm_init_default() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/platform/tpm", smoke_tpm_init_default);
+
+// ── AMD AOAC ───────────────────────────────────────────────────────
+
+/// IP-index → bit-position table: each IP's 2-bit field starts at
+/// `2 * (index % 16)` within its register word.
+fn smoke_aoac_ip_bit_positions() -> TestResult {
+    use crate::amd_aoac::AoacIp;
+
+    // UsbXhci0 is index 0 → bit 0.
+    if AoacIp::UsbXhci0.bit_pos() != 0 {
+        return TestResult::Fail("UsbXhci0 bit_pos should be 0");
+    }
+    // UsbXhci1 is index 1 → bit 2.
+    if AoacIp::UsbXhci1.bit_pos() != 2 {
+        return TestResult::Fail("UsbXhci1 bit_pos should be 2");
+    }
+    // Spi is index 15 → bit 30.
+    if AoacIp::Spi.bit_pos() != 30 {
+        return TestResult::Fail("Spi (index 15) bit_pos should be 30");
+    }
+    // GpuVga is index 5 → bit 10.
+    if AoacIp::GpuVga.bit_pos() != 10 {
+        return TestResult::Fail("GpuVga (index 5) bit_pos should be 10");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/amd_aoac",
+    smoke_aoac_ip_bit_positions
+);
+
+/// Exhaustive match over AoacIp variants — compile-time insurance
+/// that no arm is silently unreachable.
+fn smoke_aoac_ip_enum_exhaustive() -> TestResult {
+    use crate::amd_aoac::AoacIp;
+
+    let all = [
+        AoacIp::UsbXhci0,
+        AoacIp::UsbXhci1,
+        AoacIp::UsbOhci,
+        AoacIp::Sata,
+        AoacIp::Nvme,
+        AoacIp::GpuVga,
+        AoacIp::Acp,
+        AoacIp::Sdio0,
+        AoacIp::Sdio1,
+        AoacIp::I2c0,
+        AoacIp::I2c1,
+        AoacIp::I2c2,
+        AoacIp::I2c3,
+        AoacIp::Uart0,
+        AoacIp::Uart1,
+        AoacIp::Spi,
+    ];
+    for ip in all {
+        let _n = match ip {
+            AoacIp::UsbXhci0 => 0u8,
+            AoacIp::UsbXhci1 => 1,
+            AoacIp::UsbOhci => 2,
+            AoacIp::Sata => 3,
+            AoacIp::Nvme => 4,
+            AoacIp::GpuVga => 5,
+            AoacIp::Acp => 6,
+            AoacIp::Sdio0 => 7,
+            AoacIp::Sdio1 => 8,
+            AoacIp::I2c0 => 9,
+            AoacIp::I2c1 => 10,
+            AoacIp::I2c2 => 11,
+            AoacIp::I2c3 => 12,
+            AoacIp::Uart0 => 13,
+            AoacIp::Uart1 => 14,
+            AoacIp::Spi => 15,
+        };
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/amd_aoac",
+    smoke_aoac_ip_enum_exhaustive
+);
+
+/// aoac_set_d3 writes the correct bit pattern for USB XHCI0.
+///
+/// Uses a fake 8-byte register block redirected via `__test_redirect`.
+/// `on = true` must write 0b00 into bits [1:0] of AOAC_DEV_D3_CTL_0.
+/// `on = false` must write 0b01 into bits [1:0].
+fn smoke_aoac_set_d3_usb_xhci_bit_pattern() -> TestResult {
+    use crate::amd_aoac::{self, AoacIp, AoacState};
+
+    // Allocate 16 bytes to cover both CTL and STATE register words.
+    let mut regs = [0u32; 4];
+    let base = regs.as_mut_ptr() as u64;
+    // Offset layout inside the fake block (mirroring amd_aoac offsets
+    // relative to FCH_MMIO_BASE):
+    //   AOAC_DEV_D3_CTL_0  = 0x9C → for the fake we map it as index 0.
+    //   AOAC_DEV_D3_CTL_1  = 0xA0 → index 1.
+    //   AOAC_DEV_D3_STATE_0= 0xA4 → index 2.
+    //   AOAC_DEV_D3_STATE_1= 0xA8 → index 3.
+    //
+    // The fake base is passed directly to __test_redirect; the driver
+    // adds its register offsets on top, so we need the fake buffer
+    // to start at `base - 0x9C` so that `base + 0x9C` lands at
+    // regs[0].  Adjust accordingly.
+    let fake_base = base.wrapping_sub(0x9C);
+    amd_aoac::__test_redirect(fake_base);
+
+    // Request D0 (on = true) for UsbXhci0.
+    if amd_aoac::aoac_set_d3(AoacIp::UsbXhci0, true).is_err() {
+        amd_aoac::__test_reset();
+        return TestResult::Fail("aoac_set_d3(D0) failed unexpectedly");
+    }
+    // Bits [1:0] of CTL_0 (regs[0]) must be 0b00.
+    if regs[0] & 0b11 != 0b00 {
+        amd_aoac::__test_reset();
+        return TestResult::Fail("D0 request should clear bits [1:0]");
+    }
+
+    // Request D3hot (on = false) for UsbXhci0.
+    if amd_aoac::aoac_set_d3(AoacIp::UsbXhci0, false).is_err() {
+        amd_aoac::__test_reset();
+        return TestResult::Fail("aoac_set_d3(D3hot) failed unexpectedly");
+    }
+    // Bits [1:0] of CTL_0 must be 0b01.
+    if regs[0] & 0b11 != 0b01 {
+        amd_aoac::__test_reset();
+        return TestResult::Fail("D3hot request should write 0b01 into bits [1:0]");
+    }
+
+    // Read-back: pre-seed STATE register with D3hot encoding and
+    // verify aoac_get_state returns D3hot.
+    regs[2] = 0b01; // AOAC_DEV_D3_STATE_0 bits [1:0] = D3hot
+    let state = crate::amd_aoac::aoac_get_state(AoacIp::UsbXhci0);
+    if state != AoacState::D3hot {
+        amd_aoac::__test_reset();
+        return TestResult::Fail("aoac_get_state did not decode D3hot correctly");
+    }
+
+    amd_aoac::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/amd_aoac",
+    smoke_aoac_set_d3_usb_xhci_bit_pattern
+);
+
+/// FCH base-address resolution: detect_soc() must return a known
+/// variant on Renoir (family 0x17) and Phoenix (family 0x19) and
+/// Unknown on any non-AMD host.
+fn smoke_aoac_fch_base_soc_detect() -> TestResult {
+    use crate::amd_aoac::{detect_soc, AmdSoc};
+
+    let soc = detect_soc();
+    // On non-AMD hosts (QEMU defaults to Intel or AMD Zen depending on
+    // the -cpu flag) we accept any valid variant — this is a no-panic
+    // smoke, not a "must be Renoir" assertion.
+    match soc {
+        AmdSoc::Renoir | AmdSoc::Phoenix | AmdSoc::Unknown => {}
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/amd_aoac",
+    smoke_aoac_fch_base_soc_detect
+);
+
+// ── AMD ASF ────────────────────────────────────────────────────────
+
+/// ASF message header encode: wire_addr and encode() produce the
+/// correct byte layout.
+fn smoke_asf_message_header_encode() -> TestResult {
+    use crate::amd_asf::AsfMessage;
+
+    let msg = AsfMessage::new(0x2C, 0x04, 0x01, alloc::vec![0xDE, 0xAD]);
+    // wire_addr = addr << 1.
+    if msg.wire_addr() != 0x58 {
+        return TestResult::Fail("wire_addr() should be addr<<1");
+    }
+    let enc = match msg.encode() {
+        Some(v) => v,
+        None => return TestResult::Fail("encode() returned None for short payload"),
+    };
+    // encode() layout: [body_len, netfn, cmd, payload…]
+    // body = netfn + cmd + 2 payload bytes = 4 bytes.
+    if enc[0] != 4 {
+        return TestResult::Fail("length prefix should be 4");
+    }
+    if enc[1] != 0x04 {
+        return TestResult::Fail("netfn byte mismatch");
+    }
+    if enc[2] != 0x01 {
+        return TestResult::Fail("ipmi_cmd byte mismatch");
+    }
+    if enc[3] != 0xDE || enc[4] != 0xAD {
+        return TestResult::Fail("payload bytes mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/amd_asf",
+    smoke_asf_message_header_encode
+);

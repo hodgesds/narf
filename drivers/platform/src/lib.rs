@@ -38,6 +38,11 @@ pub mod buttons;
 #[cfg(target_arch = "x86_64")]
 pub mod ec_hotkeys;
 pub mod backlight;
+/// AMD AOAC (Always-On / Modern-Standby D-state control), x86-64 only.
+#[cfg(target_arch = "x86_64")]
+pub mod amd_aoac;
+/// AMD ASF (Alert Standard Format) transport scaffold.
+pub mod amd_asf;
 
 mod tests;
 
@@ -97,6 +102,16 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "acpi-backlight", || {
         backlight::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "amd-asf", || {
+        amd_asf::init();
+        InitResult::Ok
+    });
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "amd-aoac", || {
+        // Best-effort: silently skip on non-AMD or unrecognised silicon.
+        let _ = amd_aoac::init();
         InitResult::Ok
     });
 }
