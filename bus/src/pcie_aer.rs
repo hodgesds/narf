@@ -1,12 +1,15 @@
-//! PCIe Advanced Error Reporting (AER) — clean-room.
+//! PCIe Advanced Error Reporting (AER).
 //!
-//! ## Sources (public only)
+//! ## Sources
 //!
 //! - **PCI Express Base Specification, Revision 6.0**, PCI-SIG —
-//!   §7.8.4 "Advanced Error Reporting Capability".
+//!   §7.8.4 "Advanced Error Reporting Capability", §6.2 "Error
+//!   Reporting and Recovery", §6.2.10.2 "Link Retraining".
 //!   <https://pcisig.com/specifications>
-//!
-//! No GPL / Linux source consulted.
+//! - **Linux**, `drivers/pci/pcie/aer.c` (`aer_isr_one_error`,
+//!   `aer_enable_rootport`, `get_e_source`) + `drivers/pci/pcie/
+//!   err.c` (`pcie_do_recovery`), GPL-2.0-or-later. Cited per the
+//!   GPL relicense of the narf tree (2026-05-20).
 //!
 //! ## What this is
 //!
@@ -548,6 +551,11 @@ pub static AER_CORRECTABLE_COUNT: core::sync::atomic::AtomicU64 =
 /// blocks today, so the ISR re-walks the bus device list each
 /// fire. Acceptable because AER fires rarely (errors are by
 /// definition exceptional).
+///
+/// Per-port aggregation: each root port returns its decoded
+/// [`RootErrorStatus`] snapshot plus the Error Source ID (BDF of
+/// the offending downstream device). Caller routes recovery via
+/// [`crate::pcie_recovery::do_recovery`] using this aggregation.
 pub fn aer_isr() {
     use core::sync::atomic::Ordering;
     use crate::devices;
@@ -575,11 +583,14 @@ pub fn aer_isr() {
             AER_CORRECTABLE_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         if sts & root_sts::ERR_FATAL_NONFATAL_RECEIVED != 0 {
-            // Differentiate fatal vs non-fatal by reading the
-            // uncorrectable severity from the source device's
-            // AER block — out of scope for the ISR. Bump
-            // non-fatal here; future refinement can split.
-            AER_NONFATAL_COUNT.fetch_add(1, Ordering::Relaxed);
+            // Differentiate fatal vs non-fatal via FIRST_UE_FATAL.
+            // The ISR doesn't drive recovery; aer_collect_events()
+            // walks again with full classification.
+            if sts & root_sts::FIRST_UNCORRECTABLE_FATAL != 0 {
+                AER_FATAL_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                AER_NONFATAL_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // Clear the consumed status bits (W1C).
         if sts != 0 {
@@ -592,4 +603,273 @@ pub fn aer_isr() {
             }
         }
     }
+}
+
+// ── AER event aggregation (post-ISR walk) ──────────────────────────
+//
+// Linux's `aer_isr_one_error()` runs after the ISR latches state and
+// produces a per-event record (severity + source BDF) that drives
+// `pcie_do_recovery`. We surface the same shape so the caller can
+// route per-port events through the recovery state machine without
+// the bus crate having to know about drivers.
+
+/// One AER event as seen from a root port. Suitable for driving
+/// `pcie_recovery::do_recovery`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AerEvent {
+    /// Severity of the reported error.
+    pub severity: UeSeverity,
+    /// BDF (raw Requester ID format: bus[15:8], device[7:3],
+    /// function[2:0]) of the device that originated the error.
+    pub source_id: u16,
+    /// Latched Uncorrectable Status bits (or 0 if this event is
+    /// a Correctable record).
+    pub ue_status: u32,
+    /// Latched Correctable Status bits (or 0 if this is a UE event).
+    pub ce_status: u32,
+}
+
+/// Walk every PCIe device, examine its AER block, and return one
+/// `AerEvent` per port that has a non-empty status. Clears the
+/// latched status as it goes (RW1C).
+///
+/// Linux equivalent: the body of `aer_isr_one_error()` together with
+/// `aer_get_device_error_info()`. The bus-walking front of
+/// `pcie_do_recovery()` consumes our output.
+///
+/// # Safety
+/// Each device's `cfg_phys` is identity-mapped ECAM (asserted by the
+/// enumeration step in `bus::init`).
+pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
+    use crate::devices;
+    let mut events = alloc::vec::Vec::new();
+    for d in devices().iter() {
+        let cfg_phys = match d.kind {
+            crate::BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => continue,
+        };
+        // SAFETY: caller-asserted live ECAM.
+        let aer = match unsafe { find_aer_cap_offset(cfg_phys) } {
+            Some(o) => o as u64,
+            None => continue,
+        };
+        // SAFETY: AER block is 0x40 bytes inside the same page.
+        let root_sts_raw = unsafe {
+            core::ptr::read_volatile(
+                (cfg_phys + aer + regs::ROOT_ERROR_STATUS as u64) as *const u32,
+            )
+        };
+        let root_sts = RootErrorStatus::decode(root_sts_raw);
+        if !root_sts.any_error() {
+            // Also collect on endpoints that latched UE without
+            // forwarding upstream (Correctable autosurveyed).
+            // SAFETY: same.
+            let ue = unsafe {
+                core::ptr::read_volatile(
+                    (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64)
+                        as *const u32,
+                )
+            };
+            let ce = unsafe {
+                core::ptr::read_volatile(
+                    (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64)
+                        as *const u32,
+                )
+            };
+            if ue == 0 && ce == 0 {
+                continue;
+            }
+            // SAFETY: same.
+            let sev = unsafe {
+                core::ptr::read_volatile(
+                    (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_SEVERITY as u64)
+                        as *const u32,
+                )
+            };
+            let severity = classify_uncorrectable(ue, sev);
+            // RW1C the latched status.
+            if ue != 0 {
+                // SAFETY: same.
+                unsafe {
+                    core::ptr::write_volatile(
+                        (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64)
+                            as *mut u32,
+                        ue,
+                    );
+                }
+            }
+            if ce != 0 {
+                // SAFETY: same.
+                unsafe {
+                    core::ptr::write_volatile(
+                        (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64)
+                            as *mut u32,
+                        ce,
+                    );
+                }
+            }
+            events.push(AerEvent {
+                severity,
+                source_id: device_requester_id(d),
+                ue_status: ue,
+                ce_status: ce,
+            });
+            continue;
+        }
+        // Root port path — read Error Source ID, then decode by
+        // severity from the source device's UE Severity. The Source
+        // ID register at AER+0x34 holds the Requester ID of the first
+        // offending downstream device.
+        // SAFETY: same.
+        let source_id = unsafe {
+            core::ptr::read_volatile(
+                (cfg_phys + aer + regs::ERROR_SOURCE_IDENTIFICATION as u64)
+                    as *const u32,
+            )
+        };
+        let severity = root_sts.ue_severity();
+        // RW1C the root status.
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(
+                (cfg_phys + aer + regs::ROOT_ERROR_STATUS as u64) as *mut u32,
+                root_sts_raw,
+            );
+        }
+        events.push(AerEvent {
+            severity,
+            source_id: (source_id & 0xFFFF) as u16,
+            ue_status: 0,
+            ce_status: 0,
+        });
+    }
+    events
+}
+
+/// Convert a `BusDevice`'s PCIe address into a 16-bit Requester ID:
+/// `bus[15:8] | device[7:3] | function[2:0]`. Matches the encoding in
+/// the AER Error Source ID register and DPC Source ID.
+fn device_requester_id(d: &crate::BusDevice) -> u16 {
+    match d.kind {
+        crate::BusKind::Pcie { addr, .. } => {
+            ((addr.bus as u16) << 8)
+                | ((addr.device as u16 & 0x1F) << 3)
+                | (addr.function as u16 & 0x07)
+        }
+        _ => 0,
+    }
+}
+
+// ── Link control / retraining ─────────────────────────────────────
+//
+// Fatal AER recoveries require a full link reset: disable the link
+// via Link Control bit 4 (LINK_DISABLE), wait the spec-mandated
+// settle window, re-enable, then poll Link Status for DLL_ACTIVE.
+// Spec: PCIe Base 6.0 §7.5.3.7 (Link Control / Link Status) and
+// §6.2.10.2 (post-error link retraining).
+//
+// Linux equivalent: `pcie_failed_link_retrain()` /
+// `pcie_wait_for_link()` in drivers/pci/pcie/aer.c + pci.c.
+
+/// PCI Express capability register offsets (relative to the PCI
+/// Express cap header at `cap_offset`). Mirrors `pci_express.rs`.
+pub mod pcie_cap {
+    pub const LINK_CONTROL: u16 = 0x10;
+    pub const LINK_STATUS: u16 = 0x12;
+}
+
+/// Link Control bits we care about.
+pub mod link_ctrl {
+    /// `Link Disable` — bit 4. Setting drops the link to L_DOWN.
+    pub const LINK_DISABLE: u16 = 1 << 4;
+    /// `Retrain Link` — bit 5. SW asks the LTSSM to retrain.
+    pub const RETRAIN: u16 = 1 << 5;
+}
+
+/// Link Status bits.
+pub mod link_sts {
+    /// `Link Training` — bit 11. Set while LTSSM is in Recovery.
+    pub const LINK_TRAINING: u16 = 1 << 11;
+    /// `Data Link Layer Link Active` — bit 13. Set when DLLP
+    /// exchange is up.
+    pub const DLL_ACTIVE: u16 = 1 << 13;
+}
+
+/// Drive the link-disable / link-enable / DLL_ACTIVE wait sequence
+/// against a caller-supplied register accessor. The accessor lets
+/// the smoke harness wire up a `FakeMmio` and the real driver wire
+/// up the live PCI Express cap.
+///
+/// Steps (PCIe Base 6.0 §6.2.10.2):
+///   1. Set LinkControl.LINK_DISABLE = 1.
+///   2. Wait `settle_us` microseconds (≥ 50 ms typical; PCIe spec
+///      mandates ≥ 50 ms LinkDown hold time for ER_FATAL recovery).
+///   3. Clear LINK_DISABLE.
+///   4. Poll LinkStatus until LINK_TRAINING == 0 AND DLL_ACTIVE == 1,
+///      or `timeout_polls` iterations elapse.
+///
+/// Returns `true` if the link came back; `false` if the wait
+/// loop expired (subtree should be marked disconnected).
+pub fn retrain_link<R, W>(
+    read_link_status: &mut R,
+    write_link_ctrl: &mut W,
+    settle_step: &mut dyn FnMut(),
+    timeout_polls: u32,
+) -> bool
+where
+    R: FnMut() -> u16,
+    W: FnMut(u16),
+{
+    // 1. Drop the link.
+    write_link_ctrl(link_ctrl::LINK_DISABLE);
+    // 2. Hold the disable for the caller-controlled settle.
+    settle_step();
+    // 3. Re-enable.
+    write_link_ctrl(0);
+    // 4. Wait for DLL_ACTIVE & !LINK_TRAINING.
+    for _ in 0..timeout_polls {
+        let s = read_link_status();
+        let active = s & link_sts::DLL_ACTIVE != 0;
+        let training = s & link_sts::LINK_TRAINING != 0;
+        if active && !training {
+            return true;
+        }
+        settle_step();
+    }
+    false
+}
+
+/// Convenience driver of [`retrain_link`] against a live PCIe device.
+///
+/// `cfg_phys` is the device's 4 KiB ECAM page; `pcie_cap_off` is the
+/// offset (within that page) of the PCI Express capability header.
+/// `settle_step` ticks the scheduler / sleep pump between polls so
+/// the screen stays alive.
+///
+/// # Safety
+/// `cfg_phys + pcie_cap_off + 0x14` must be a live PCIe config slot.
+pub unsafe fn retrain_link_live(
+    cfg_phys: u64,
+    pcie_cap_off: u16,
+    settle_step: &mut dyn FnMut(),
+    timeout_polls: u32,
+) -> bool {
+    let lnk_ctl_ptr =
+        (cfg_phys + pcie_cap_off as u64 + pcie_cap::LINK_CONTROL as u64) as *mut u16;
+    let lnk_sts_ptr =
+        (cfg_phys + pcie_cap_off as u64 + pcie_cap::LINK_STATUS as u64) as *const u16;
+    let mut read_status = || -> u16 {
+        // SAFETY: caller-asserted live PCIe config; aligned 16-bit.
+        unsafe { core::ptr::read_volatile(lnk_sts_ptr) }
+    };
+    let mut write_ctrl = |v: u16| {
+        // SAFETY: same. Read-modify-write to preserve unrelated bits
+        // (ASPM, RCB, etc.) — only LINK_DISABLE is toggled here.
+        unsafe {
+            let cur = core::ptr::read_volatile(lnk_ctl_ptr as *const u16);
+            let new = (cur & !link_ctrl::LINK_DISABLE) | (v & link_ctrl::LINK_DISABLE);
+            core::ptr::write_volatile(lnk_ctl_ptr, new);
+        }
+    };
+    retrain_link(&mut read_status, &mut write_ctrl, settle_step, timeout_polls)
 }
