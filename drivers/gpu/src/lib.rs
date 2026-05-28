@@ -143,6 +143,7 @@ pub mod amdgpu_pm4;
 pub mod amdgpu_pptable;
 pub mod amdgpu_pptable_subtables;
 pub mod amdgpu_psp;
+pub mod amdgpu_reset;
 pub mod amdgpu_ring;
 pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
