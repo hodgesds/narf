@@ -1200,6 +1200,194 @@ kernel_test_in!(
     smoke_brcmfmac_hostrdy_db1_value
 );
 
+// ── Stage-8: fweh event decode + EAPOL 4-way handshake ───────────────
+
+fn smoke_brcmfmac_fweh_link_up_decode() -> TestResult {
+    use super::fweh::{
+        EventMsg, BRCMF_E_LINK, BRCMF_EVENT_MSG_LINK, EVENT_BE_OFFSET, EVENT_ENVELOPE_SIZE,
+    };
+    let mut buf = [0u8; EVENT_ENVELOPE_SIZE + 16];
+    // Fill the BE event_msg fields at offset EVENT_BE_OFFSET.
+    let s = EVENT_BE_OFFSET;
+    // version=1
+    buf[s..s + 2].copy_from_slice(&1u16.to_be_bytes());
+    // flags = LINK (= 1)
+    buf[s + 2..s + 4].copy_from_slice(&BRCMF_EVENT_MSG_LINK.to_be_bytes());
+    // event_code = BRCMF_E_LINK (16)
+    buf[s + 4..s + 8].copy_from_slice(&BRCMF_E_LINK.to_be_bytes());
+    // status / reason / auth_type / datalen all zero.
+    // addr at +24..30 = AP MAC
+    buf[s + 24..s + 30].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    // ifidx/bsscfgidx at +46/+47
+    buf[s + 46] = 0;
+    buf[s + 47] = 0;
+
+    let evt = match EventMsg::parse(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("EventMsg::parse returned None"),
+    };
+    if !evt.is_link_up() {
+        return TestResult::Fail("is_link_up() should be true");
+    }
+    if evt.event_code != BRCMF_E_LINK {
+        return TestResult::Fail("event_code != BRCMF_E_LINK");
+    }
+    if evt.addr != [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF] {
+        return TestResult::Fail("addr decoded incorrectly");
+    }
+    // Now flip the LINK flag to test the down path.
+    buf[s + 2..s + 4].copy_from_slice(&0u16.to_be_bytes());
+    let evt_down = EventMsg::parse(&buf).unwrap();
+    if !evt_down.is_link_down() {
+        return TestResult::Fail("is_link_down() should be true with flags=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fweh_link_up_decode
+);
+
+fn smoke_brcmfmac_fweh_assoc_decode() -> TestResult {
+    use super::fweh::{
+        EventMsg, BRCMF_E_ASSOC, BRCMF_E_STATUS_SUCCESS, EVENT_BE_OFFSET, EVENT_ENVELOPE_SIZE,
+    };
+    let mut buf = [0u8; EVENT_ENVELOPE_SIZE];
+    let s = EVENT_BE_OFFSET;
+    buf[s + 4..s + 8].copy_from_slice(&BRCMF_E_ASSOC.to_be_bytes());
+    buf[s + 8..s + 12].copy_from_slice(&BRCMF_E_STATUS_SUCCESS.to_be_bytes());
+    let evt = EventMsg::parse(&buf).unwrap();
+    if !evt.is_assoc_success() {
+        return TestResult::Fail("is_assoc_success() should be true");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fweh_assoc_decode
+);
+
+fn smoke_brcmfmac_fweh_psk_sup_done() -> TestResult {
+    use super::fweh::{
+        EventMsg, BRCMF_E_PSK_SUP, BRCMF_E_STATUS_FWSUP_COMPLETED, EVENT_BE_OFFSET,
+        EVENT_ENVELOPE_SIZE,
+    };
+    let mut buf = [0u8; EVENT_ENVELOPE_SIZE];
+    let s = EVENT_BE_OFFSET;
+    buf[s + 4..s + 8].copy_from_slice(&BRCMF_E_PSK_SUP.to_be_bytes());
+    buf[s + 8..s + 12].copy_from_slice(&BRCMF_E_STATUS_FWSUP_COMPLETED.to_be_bytes());
+    let evt = EventMsg::parse(&buf).unwrap();
+    if !evt.is_psk_supplicant_done() {
+        return TestResult::Fail("PSK_SUP completion not recognised");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fweh_psk_sup_done
+);
+
+fn smoke_brcmfmac_fweh_event_msg_too_short() -> TestResult {
+    use super::fweh::{EventMsg, EVENT_ENVELOPE_SIZE};
+    // Truncated buffer must reject.
+    let buf = [0u8; EVENT_ENVELOPE_SIZE - 1];
+    if EventMsg::parse(&buf).is_some() {
+        return TestResult::Fail("parse should reject short buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fweh_event_msg_too_short
+);
+
+fn smoke_brcmfmac_eapol_m2_build() -> TestResult {
+    use super::fweh::{
+        build_m2, EAPOL_KEY_FRAME_FIXED_SIZE, EAPOL_TYPE_KEY, EAPOL_VERSION, ETH_P_PAE,
+        KEY_DESCRIPTOR_RSN, KEY_INFO_KEY_MIC, KEY_INFO_PAIRWISE,
+    };
+    let ap_mac = [0xA0u8, 0xB1, 0xC2, 0xD3, 0xE4, 0xF5];
+    let sta_mac = [0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let snonce = [0xABu8; 32];
+    let rsn_ie = b"\x30\x14\x01\x00\x00\x0F\xAC\x04\x01\x00\x00\x0F\xAC\x04\x01\x00\x00\x0F\xAC\x02\x00\x00";
+    let m2 = build_m2(ap_mac, sta_mac, snonce, 1, rsn_ie);
+    let mut buf = [0u8; EAPOL_KEY_FRAME_FIXED_SIZE + 32];
+    let n = match m2.encode(&mut buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("M2 encode returned None"),
+    };
+    if n != EAPOL_KEY_FRAME_FIXED_SIZE + rsn_ie.len() {
+        return TestResult::Fail("M2 encode wrong total length");
+    }
+    // ethhdr — dst=AP MAC, src=STA MAC.
+    if buf[..6] != ap_mac {
+        return TestResult::Fail("M2 ethhdr dst MAC wrong");
+    }
+    if buf[6..12] != sta_mac {
+        return TestResult::Fail("M2 ethhdr src MAC wrong");
+    }
+    if buf[12..14] != ETH_P_PAE.to_be_bytes() {
+        return TestResult::Fail("M2 ethertype wrong (should be 0x888E)");
+    }
+    // EAPOL header.
+    if buf[14] != EAPOL_VERSION {
+        return TestResult::Fail("EAPOL version wrong");
+    }
+    if buf[15] != EAPOL_TYPE_KEY {
+        return TestResult::Fail("EAPOL type wrong (should be 3 = Key)");
+    }
+    // Body length = 95 + 22 (RSN IE) = 117.
+    let body_len = u16::from_be_bytes([buf[16], buf[17]]);
+    if body_len as usize != 95 + rsn_ie.len() {
+        return TestResult::Fail("EAPOL body_len mismatch");
+    }
+    // Key descriptor type 2 (RSN).
+    if buf[18] != KEY_DESCRIPTOR_RSN {
+        return TestResult::Fail("Key descriptor not RSN");
+    }
+    // Key info has PAIRWISE + KEY_MIC + version=2.
+    let key_info = u16::from_be_bytes([buf[19], buf[20]]);
+    if key_info & KEY_INFO_PAIRWISE == 0 {
+        return TestResult::Fail("M2 missing PAIRWISE bit");
+    }
+    if key_info & KEY_INFO_KEY_MIC == 0 {
+        return TestResult::Fail("M2 missing KEY_MIC bit");
+    }
+    // Replay counter (BE) at byte 23..31.
+    let replay = u64::from_be_bytes([
+        buf[23], buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30],
+    ]);
+    if replay != 1 {
+        return TestResult::Fail("M2 replay counter mismatch");
+    }
+    // SNonce starts at byte 31, runs 32 bytes.
+    for &b in &buf[31..63] {
+        if b != 0xAB {
+            return TestResult::Fail("M2 SNonce bytes mismatched");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_eapol_m2_build);
+
+fn smoke_brcmfmac_eapol_m4_secure_bit() -> TestResult {
+    use super::fweh::{build_m4, EAPOL_KEY_FRAME_FIXED_SIZE, KEY_INFO_SECURE};
+    let ap_mac = [0u8; 6];
+    let sta_mac = [0u8; 6];
+    let m4 = build_m4(ap_mac, sta_mac, 5);
+    let mut buf = [0u8; EAPOL_KEY_FRAME_FIXED_SIZE];
+    let _ = m4.encode(&mut buf).unwrap();
+    let key_info = u16::from_be_bytes([buf[19], buf[20]]);
+    if key_info & KEY_INFO_SECURE == 0 {
+        return TestResult::Fail("M4 should have SECURE bit set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_eapol_m4_secure_bit
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");
