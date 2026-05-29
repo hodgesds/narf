@@ -61,21 +61,39 @@
 extern crate alloc;
 
 pub mod devfs;
+pub mod devfs_block;
+pub mod devfs_input;
+pub mod devfs_misc;
+pub mod devfs_pty;
 pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
 pub mod procfs;
 pub mod root_mount;
 pub mod root_selector;
+pub mod sysfs;
+pub mod uevent;
 
 mod tests;
+mod devfs_block_tests;
+mod devfs_pty_tests;
 pub use devfs::{install_console_signal_hook, mount_default as mount_devfs_default, DevFs};
+pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
 pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
+pub use sysfs::{
+    class_device_register, class_register, kobject_add_attr, kobject_add_bin_attr,
+    kobject_emit_uevent, install_net_snapshot_hook, AttrShow, BinAttrRead, Kobject,
+    NetIfaceInfo, SysFs, SysKobjDir,
+};
+pub use uevent::{
+    emit as emit_uevent, emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv,
+    UeventReader,
+};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -1620,12 +1638,13 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     // /proc — synthetic per-process and system-wide read-only views.
-    // /sys — Linux-shaped device-attribute tree; today an empty memfs
-    // root that drivers can populate later.
+    // /sys — kobject hierarchy; replaces the old empty MemFs stub with
+    //         the real SysFs and pre-populates block/net/kernel subtrees.
     narf_init::register(Stage::Fs, "procfs-mount", || {
         let auth = bootstrap_mount_authority();
         let _ = registry().mount(&auth, "/proc", procfs::ProcFs);
-        let _ = registry().mount(&auth, "/sys", MemFs::new("sysfs"));
+        let _ = registry().mount(&auth, "/sys", sysfs::SysFs::new());
+        sysfs::populate_all();
         InitResult::Ok
     });
 }

@@ -469,13 +469,30 @@ impl DirOps for DevDir {
         match name {
             "null" => Some(Arc::new(DevNull) as Arc<dyn FileOps>),
             "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
+            "full" => Some(Arc::new(crate::devfs_misc::DevFull) as Arc<dyn FileOps>),
             "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
             "console" | "tty" | "tty0" => {
                 Some(Arc::new(DevConsole) as Arc<dyn FileOps>)
             }
+            "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
+            // Dynamic: query the block-device registry after static names miss.
+            // Covers registered names like "nvme0", "sata0p1", "vblk0", etc.
+            _ => crate::devfs_block::lookup_block_file(name),
+        }
+    }
+
+    /// Look up a subdirectory.
+    /// - `/dev/pts`   → `DevPts` (pseudoterminal slave nodes)
+    /// - `/dev/disk`  → `DevDiskDir` (by-label / by-partuuid lookups)
+    /// - `/dev/input` → `DevInputDir` (evdev event nodes, Wave 12 bridge)
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        match name {
+            "pts"   => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
+            "disk"  => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
+            "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
             _ => None,
         }
     }
@@ -486,52 +503,71 @@ impl DirOps for DevDir {
         })
     }
 
-    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
-            // DevFs root has no subdirectories.
-            Err(FsError::NotFound)
+            self.lookup_dir(name).ok_or(FsError::NotFound)
         })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // Names are `&'static str` literals — fine for DirEntry.
+        // Static entries only — dynamic block-device names don't
+        // satisfy `&'static str` so they don't appear here; use
+        // `enumerate()` for a full readdir listing.
         const ENTRIES: &[DirEntry] = &[
-            DirEntry { name: "null", file_type: FileType::Special },
-            DirEntry { name: "zero", file_type: FileType::Special },
-            DirEntry { name: "random", file_type: FileType::Special },
+            DirEntry { name: "null",    file_type: FileType::Special },
+            DirEntry { name: "zero",    file_type: FileType::Special },
+            DirEntry { name: "full",    file_type: FileType::Special },
+            DirEntry { name: "random",  file_type: FileType::Special },
             DirEntry { name: "urandom", file_type: FileType::Special },
-            DirEntry { name: "kmsg", file_type: FileType::Special },
+            DirEntry { name: "kmsg",    file_type: FileType::Special },
             DirEntry { name: "console", file_type: FileType::Special },
-            DirEntry { name: "tty", file_type: FileType::Special },
-            DirEntry { name: "tty0", file_type: FileType::Special },
-            DirEntry { name: "fp0", file_type: FileType::Special },
+            DirEntry { name: "tty",     file_type: FileType::Special },
+            DirEntry { name: "tty0",    file_type: FileType::Special },
+            DirEntry { name: "ptmx",    file_type: FileType::Special },
+            DirEntry { name: "fp0",     file_type: FileType::Special },
+            DirEntry { name: "pts",     file_type: FileType::Dir },
+            DirEntry { name: "disk",    file_type: FileType::Dir },
         ];
         Box::new(ENTRIES.iter().copied())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        let entries = [
-            ("null", FileType::Special),
-            ("zero", FileType::Special),
-            ("random", FileType::Special),
+        // Static entries plus all registered block devices. Block
+        // devices that share a name with a static entry are skipped
+        // (static entry wins, matching Linux's static-node precedence).
+        let static_entries: &[(&str, FileType)] = &[
+            ("null",    FileType::Special),
+            ("zero",    FileType::Special),
+            ("full",    FileType::Special),
+            ("random",  FileType::Special),
             ("urandom", FileType::Special),
             ("console", FileType::Special),
-            ("tty", FileType::Special),
-            ("tty0", FileType::Special),
-            ("fp0", FileType::Special),
+            ("tty",     FileType::Special),
+            ("tty0",    FileType::Special),
+            ("ptmx",    FileType::Special),
+            ("fp0",     FileType::Special),
+            ("pts",     FileType::Dir),
+            ("disk",    FileType::Dir),
         ];
-        entries
+        let static_names: Vec<String> = static_entries.iter().map(|(n, _)| (*n).into()).collect();
+        let block_extras: Vec<(String, FileType)> =
+            crate::devfs_block::enumerate_block_devices()
+                .into_iter()
+                .filter(|(name, _)| !static_names.iter().any(|s| s == name))
+                .collect();
+
+        static_entries
             .iter()
+            .map(|(n, t)| ((*n).into(), *t))
+            .chain(block_extras)
             .skip(cursor)
             .take(max)
-            .map(|(n, t)| ((*n).into(), *t))
             .collect()
     }
 
     fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
-        Box::pin(async move {
-            Ok(self.enumerate(cursor, max))
-        })
+        let v = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(v) })
     }
 }
 
