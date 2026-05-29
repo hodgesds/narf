@@ -547,6 +547,22 @@ impl Vmxnet3Nic {
         if status != 0 {
             return Err(Vmxnet3Error::ActivateFailed);
         }
+
+        // Re-enable interrupts: clear VMXNET3_IC_DISABLE_ALL from
+        // intrCtrl in DriverShared.devRead.intrConf.
+        // Linux: vmxnet3_activate_dev() → vmxnet3_enable_all_intrs():
+        //   shared->devRead.intrConf.intrCtrl &=
+        //       cpu_to_le32(~VMXNET3_IC_DISABLE_ALL);
+        // Must happen after ACTIVATE_DEV so the device sees the
+        // updated intrCtrl on its next shared-memory read.
+        let shared_ptr = self.shared.phys_addr().raw() as *mut Vmxnet3DriverShared;
+        // SAFETY: identity-mapped DMA; shared struct lifetime ≥ self.
+        unsafe {
+            let ctrl = (*shared_ptr).devRead.intrConf.intrCtrl;
+            (*shared_ptr).devRead.intrConf.intrCtrl =
+                (u32::from_le(ctrl) & !VMXNET3_IC_DISABLE_ALL).to_le();
+        }
+        compiler_fence(Ordering::SeqCst);
         Ok(())
     }
 }
