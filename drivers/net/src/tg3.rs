@@ -38,7 +38,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
 use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
+use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -778,7 +778,7 @@ impl Tg3Nic {
     ///
     /// Returns `Ok(slot)` so a caller (or smoke test) can locate the
     /// produced descriptor in the ring without re-deriving it.
-    pub fn transmit(&self, frame: &[u8]) -> Result<u32, NicError> {
+    pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<u32, NicError> {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -791,14 +791,18 @@ impl Tg3Nic {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
             }
         }
-        let d = TxBufferDesc {
-            addr_hi: (phys >> 32) as u32,
-            addr_lo: phys as u32,
-            // len in upper 16 bits, END flag set (single-fragment
-            // packet). Linux's `tg3_start_xmit_dma_bug` would set
-            // VLAN / TSO / csum flags here; Stage 2 leaves them 0.
-            len_flags: ((frame.len() as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END,
-            vlan_tag: 0,
+        // Select descriptor format based on offload request.
+        let d = if let Some(mss) = meta.tso_mss {
+            TxBufferDesc::with_tso((phys >> 32) as u32, phys as u32, frame.len() as u16, mss)
+        } else if meta.csum_l4.is_some() {
+            TxBufferDesc::with_csum((phys >> 32) as u32, phys as u32, frame.len() as u16)
+        } else {
+            TxBufferDesc {
+                addr_hi: (phys >> 32) as u32,
+                addr_lo: phys as u32,
+                len_flags: ((frame.len() as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END,
+                vlan_tag: 0,
+            }
         };
         // SAFETY: identity-mapped DMA ring; slot < TX_RING_LEN.
         unsafe {
@@ -1017,7 +1021,7 @@ async fn tg3_rx_pump(device: Arc<Tg3Nic>, mut rx_prod: Producer<Frame, RX_RING_N
 
 async fn tg3_tx_pump(device: Arc<Tg3Nic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.transmit(frame.payload());
+        let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
 }
 

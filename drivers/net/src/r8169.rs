@@ -51,7 +51,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
 use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
+use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 // Driver-runtime abstraction — same import shape works for the
 // kernel runtime (`feature = "kernel"`, default) and a future
 // userspace runtime (`feature = "userspace"`). See
@@ -592,7 +592,7 @@ impl RtlNic {
     /// the slot's OWN bit until the NIC clears it. Frame must be in
     /// `[1, 1518]` bytes (no jumbo); the chip pads frames < 64 bytes
     /// itself per §6.1.
-    pub fn transmit(&self, frame: &[u8]) -> Result<(), NicError> {
+    pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -618,18 +618,19 @@ impl RtlNic {
             return Err(NicError::TxRingFull);
         }
 
-        // Fill in the descriptor. FS+LS = single-segment packet.
-        // EOR set on the very last slot in the ring so the NIC's
-        // internal pointer wraps to slot 0.
-        let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & 0xFFFF);
-        if slot == RING_LEN - 1 {
-            flags |= TXD_EOR;
-        }
-        let d = Desc {
-            flags_len: flags,
-            vlan: 0,
-            addr_lo: phys as u32,
-            addr_hi: (phys >> 32) as u32,
+        // Select descriptor format based on offload request.
+        let d = if let Some(mss) = meta.tso_mss {
+            let mut d = Desc::tx_with_tso(phys as u32, (phys >> 32) as u32, frame.len() as u16, mss);
+            if slot == RING_LEN - 1 { d.flags_len |= TXD_EOR; }
+            d
+        } else if meta.csum_l4.is_some() {
+            let mut d = Desc::tx_with_csum(phys as u32, (phys >> 32) as u32, frame.len() as u16);
+            if slot == RING_LEN - 1 { d.flags_len |= TXD_EOR; }
+            d
+        } else {
+            let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & 0xFFFF);
+            if slot == RING_LEN - 1 { flags |= TXD_EOR; }
+            Desc { flags_len: flags, vlan: 0, addr_lo: phys as u32, addr_hi: (phys >> 32) as u32 }
         };
         // The NIC sees OWN=1 once we publish word0; the addr/len
         // fields must already be visible. Order: write addr/vlan/
@@ -969,7 +970,7 @@ async fn r8169_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING
 
 async fn r8169_tx_pump(device: Arc<RtlNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.transmit(frame.payload());
+        let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
 }
 

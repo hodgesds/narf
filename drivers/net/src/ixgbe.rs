@@ -15,7 +15,7 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
+use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 
 mod tests;
 
@@ -532,7 +532,7 @@ impl Ixgbe {
     }
 
     /// Transmit a single frame, polling the descriptor's DD bit.
-    pub fn tx(&self, frame: &[u8]) -> Result<(), IxgbeError> {
+    pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(IxgbeError::FrameTooLong);
         }
@@ -548,11 +548,17 @@ impl Ixgbe {
         }
         let ring_phys = self.tx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
-        let desc = AdvTxDesc {
-            addr: phys,
-            cmd_type_len: AdvTxDesc::ctrl_word(frame.len() as u16),
-            // PAYLEN field at bits [31:14] of olinfo (§7.2.3.2.4).
-            olinfo: (frame.len() as u32) << 14,
+        let desc = if let Some(mss) = meta.tso_mss {
+            AdvTxDesc::with_tso(phys, frame.len() as u16, mss)
+        } else if meta.csum_l4.is_some() {
+            AdvTxDesc::with_csum(phys, frame.len() as u16)
+        } else {
+            AdvTxDesc {
+                addr: phys,
+                cmd_type_len: AdvTxDesc::ctrl_word(frame.len() as u16),
+                // PAYLEN field at bits [31:14] of olinfo (§7.2.3.2.4).
+                olinfo: (frame.len() as u32) << 14,
+            }
         };
         // SAFETY: identity-mapped DMA ring.
         unsafe {
@@ -922,7 +928,7 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_
 
 async fn ixgbe_tx_pump(device: Arc<Ixgbe>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.tx(frame.payload());
+        let _ = device.tx(frame.payload(), &TxMeta::plain());
     }
 }
 

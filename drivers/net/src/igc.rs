@@ -43,7 +43,7 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
+use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
@@ -719,7 +719,7 @@ impl Igc {
 
     /// Transmit a single Ethernet frame. Polls the descriptor's
     /// Done bit. Frame must fit in `FRAME_SIZE`.
-    pub fn tx(&self, frame: &[u8]) -> Result<(), IgcError> {
+    pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IgcError> {
         if frame.is_empty() || frame.len() > FRAME_SIZE {
             return Err(IgcError::QueueTooSmall);
         }
@@ -733,18 +733,38 @@ impl Igc {
         let mut tail = self.tx_tail.lock();
         let idx = *tail as usize;
         let ring_phys = self.tx_ring_buf.phys_addr().raw();
-        let desc = (ring_phys + (idx * 16) as u64) as *mut LegacyTxDesc;
-        // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
-        unsafe {
-            core::ptr::write_volatile(
-                desc,
-                LegacyTxDesc {
-                    addr: buf_phys,
-                    length: frame.len() as u16,
-                    cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
-                    ..Default::default()
-                },
-            );
+        let desc_addr = ring_phys + (idx * 16) as u64;
+        // Select descriptor type based on offload request.
+        if let Some(mss) = meta.tso_mss {
+            // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    desc_addr as *mut AdvTxDataDesc,
+                    AdvTxDataDesc::with_tso(buf_phys, frame.len() as u16, mss),
+                );
+            }
+        } else if meta.csum_l4.is_some() {
+            // SAFETY: same.
+            unsafe {
+                core::ptr::write_volatile(
+                    desc_addr as *mut AdvTxDataDesc,
+                    AdvTxDataDesc::with_csum(buf_phys, frame.len() as u16),
+                );
+            }
+        } else {
+            let desc = desc_addr as *mut LegacyTxDesc;
+            // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    desc,
+                    LegacyTxDesc {
+                        addr: buf_phys,
+                        length: frame.len() as u16,
+                        cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                        ..Default::default()
+                    },
+                );
+            }
         }
         let next = ((idx + 1) % TX_RING_LEN) as u16;
         compiler_fence(Ordering::SeqCst);
@@ -757,7 +777,7 @@ impl Igc {
         // congestion stall on a single packet.
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile((desc as *const u8).add(12)) } & TXD_STAT_DD != 0,
+            || unsafe { core::ptr::read_volatile((desc_addr as *const u8).add(12)) } & TXD_STAT_DD != 0,
             narf_time::Deadline::after_ms(250),
         );
         if !done {
@@ -1031,6 +1051,6 @@ async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) 
 
 async fn igc_tx_pump(device: Arc<Igc>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.tx(frame.payload());
+        let _ = device.tx(frame.payload(), &TxMeta::plain());
     }
 }
