@@ -777,6 +777,27 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-fs-ext4"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-block",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-fs-ext2",
+ "narf-filesystem",
+ "narf-init",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -958,6 +979,7 @@ version = "0.0.0"
 dependencies = [
  "narf-bus",
  "narf-capabilities",
+ "narf-crypto",
  "narf-driver-runtime",
  "narf-drivers",
  "narf-edid",
@@ -1020,6 +1042,23 @@ version = "0.0.0"
 dependencies = [
  "narf-kernel-test",
  "narf-lib",
+]
+
+[[package]]
+name = "narf-drivers-sdio"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
@@ -1165,6 +1204,8 @@ dependencies = [
  "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-sdio",
+ "narf-drivers-usb",
  "narf-firmware",
  "narf-init",
  "narf-interrupts",
@@ -1306,10 +1347,12 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-crypto",
  "narf-drivers-fingerprint",
  "narf-drivers-fs-9p",
  "narf-drivers-fs-exfat",
  "narf-drivers-fs-ext2",
+ "narf-drivers-fs-ext4",
  "narf-drivers-fs-fat",
  "narf-drivers-fs-iso9660",
  "narf-drivers-fs-minix",
@@ -1442,6 +1485,8 @@ dependencies = [
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
