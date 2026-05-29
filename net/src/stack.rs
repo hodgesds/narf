@@ -22,8 +22,11 @@
 //! dispatch wiring; this module lets every consumer agree on the
 //! wire shape.
 
+use alloc::sync::Arc;
+
 use narf_capabilities::{Cap, CapKind, CapType, Invoke, Write};
 
+use crate::bypass::xdp::XdpSocket;
 use crate::{Interface, NetIface};
 
 /// Cap-type marker for per-interface admin authority.
@@ -71,21 +74,23 @@ pub enum AttachError {
     DaemonCapRevoked,
     IfaceCapRevoked,
     InterfaceBusy,
-    NotImplemented,
 }
 
-/// Attach a stack daemon to `iface`. Stage-4 structural — returns
-/// `NotImplemented` until `abi/` grows a `StackAttach` opcode and
-/// the kernel-side bootstrap is written.
+/// Attach a stack daemon to `iface`. Verifies both caps, registers
+/// the daemon's pre-created XDP socket as the whole-NIC owner of
+/// the iface in the bypass classifier, and returns a fresh
+/// AdminCap.
+///
+/// `socket` is the XdpSocket the daemon built earlier via
+/// `XdpSocket::create(umem)` (so the daemon already holds the
+/// user-side halves of the four rings). After this call returns,
+/// every inbound frame from `iface_object` is routed to the daemon's
+/// RX ring via the classifier and the kernel TCP/IP stack sees
+/// nothing from that iface.
 pub fn attach(
     req: &StackAttach,
-    _iface_object: &dyn Interface,
+    iface_object: &dyn Interface,
+    socket: Arc<XdpSocket>,
 ) -> Result<StackAttachReply, AttachError> {
-    req.iface
-        .check_live()
-        .map_err(|_| AttachError::IfaceCapRevoked)?;
-    req.daemon
-        .check_live()
-        .map_err(|_| AttachError::DaemonCapRevoked)?;
-    Err(AttachError::NotImplemented)
+    crate::bypass::daemon_attach::attach(req, iface_object, socket)
 }
