@@ -65,7 +65,8 @@ pub const OCR_FUNC_COUNT_MASK: u32  = 0x7000_0000;
 // ── CMD52 argument builder ─────────────────────────────────────────────
 /// Build the 32-bit CMD52 argument word.
 ///
-/// ```
+/// Bit layout (SDIO Simplified Spec §5.1 Figure 5-1):
+/// ```text
 /// 31    | 30-28 | 27  | 26 | 25-9  | 8 | 7-0
 /// RW/RD | FN    | RAW | 0  | ADDR  | 0 | DATA
 /// ```
@@ -83,7 +84,8 @@ pub const fn cmd52_arg(write: bool, func: u8, raw: bool, addr: u32, data: u8) ->
 // ── CMD53 argument builder ─────────────────────────────────────────────
 /// Build the 32-bit CMD53 argument word.
 ///
-/// ```
+/// Bit layout (SDIO Simplified Spec §5.3 Figure 5-3):
+/// ```text
 /// 31    | 30-28 | 27    | 26   | 25-9 | 8-0
 /// RW/RD | FN    | BLOCK | INCR | ADDR | COUNT
 /// ```
