@@ -1569,6 +1569,182 @@ kernel_test_in!(
     smoke_brcmfmac_disconnect_drives_disassoc_then_link_down
 );
 
+// ── Stage-10: bus bring-up planner ─────────────────────────────────────
+
+fn smoke_brcmfmac_bus_plan_common_rings() -> TestResult {
+    use super::bus::plan_common_rings;
+    use super::msgbuf::{
+        D2H_MSGRING_CONTROL_COMPLETE, D2H_MSGRING_RX_COMPLETE, D2H_MSGRING_TX_COMPLETE,
+        H2D_MSGRING_CONTROL_SUBMIT, H2D_MSGRING_RXPOST_SUBMIT,
+        D2H_MSGRING_TX_COMPLETE_ITEMSIZE_PRE_V7, D2H_MSGRING_TX_COMPLETE_ITEMSIZE,
+        D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7, D2H_MSGRING_RX_COMPLETE_ITEMSIZE,
+        H2D_MSGRING_CONTROL_SUBMIT_ITEMSIZE, H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE,
+    };
+    // v7 (pre_v7=false) plan: TX/RX complete pick the larger 24/40
+    // item sizes.
+    let plan = plan_common_rings(false);
+    if plan[0].id != H2D_MSGRING_CONTROL_SUBMIT
+        || plan[0].item_len != H2D_MSGRING_CONTROL_SUBMIT_ITEMSIZE
+        || !plan[0].is_h2d
+    {
+        return TestResult::Fail("plan[0] H2D control-submit mismatch");
+    }
+    if plan[1].id != H2D_MSGRING_RXPOST_SUBMIT
+        || plan[1].item_len != H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE
+        || !plan[1].is_h2d
+    {
+        return TestResult::Fail("plan[1] H2D rxpost-submit mismatch");
+    }
+    if plan[2].id != D2H_MSGRING_CONTROL_COMPLETE || plan[2].is_h2d {
+        return TestResult::Fail("plan[2] D2H control-complete mismatch");
+    }
+    if plan[3].id != D2H_MSGRING_TX_COMPLETE
+        || plan[3].item_len != D2H_MSGRING_TX_COMPLETE_ITEMSIZE
+    {
+        return TestResult::Fail("plan[3] D2H tx-complete v7 size wrong");
+    }
+    if plan[4].id != D2H_MSGRING_RX_COMPLETE
+        || plan[4].item_len != D2H_MSGRING_RX_COMPLETE_ITEMSIZE
+    {
+        return TestResult::Fail("plan[4] D2H rx-complete v7 size wrong");
+    }
+    // Pre-v7 plan should swap TX/RX complete to the smaller sizes.
+    let plan_old = plan_common_rings(true);
+    if plan_old[3].item_len != D2H_MSGRING_TX_COMPLETE_ITEMSIZE_PRE_V7 {
+        return TestResult::Fail("pre-v7 TX-complete should be 16-byte");
+    }
+    if plan_old[4].item_len != D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7 {
+        return TestResult::Fail("pre-v7 RX-complete should be 32-byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_bus_plan_common_rings
+);
+
+fn smoke_brcmfmac_bus_idx_buffer_layout() -> TestResult {
+    use super::bus::{idx_addr_table, idx_buffer_size};
+    // With 5 submission + 3 completion rings + 2-byte indices, the
+    // buffer holds 8 × 2 × 2 = 32 bytes.
+    if idx_buffer_size(5, 3, 2) != 32 {
+        return TestResult::Fail("idx buffer size wrong");
+    }
+    // With 4-byte indices the buffer doubles.
+    if idx_buffer_size(5, 3, 4) != 64 {
+        return TestResult::Fail("idx buffer size wrong for u32 indices");
+    }
+    // Table: 5 (= 2 H2D + 3 D2H) entries, 2-byte stride.
+    let table = idx_addr_table(0x1000_0000, 5, 3, 2);
+    if table.len() != 5 {
+        return TestResult::Fail("idx_addr_table should have 5 entries");
+    }
+    // H2D ring 0: W idx at base, R idx at base + 5×2 = base+10.
+    if table[0].0 != 0x1000_0000 || table[0].1 != 0x1000_0000 + 10 {
+        return TestResult::Fail("H2D ring 0 idx pair wrong");
+    }
+    // H2D ring 1: stride from ring 0.
+    if table[1].0 != 0x1000_0000 + 2 || table[1].1 != 0x1000_0000 + 12 {
+        return TestResult::Fail("H2D ring 1 idx pair wrong");
+    }
+    // D2H ring 0 (= entry 2): starts after H2D ring R-bases.
+    let d2h_w_base = 0x1000_0000 + 5 * 2 + 5 * 2; // h2d_w + h2d_r
+    if table[2].0 != d2h_w_base {
+        return TestResult::Fail("D2H ring 0 W idx wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_bus_idx_buffer_layout
+);
+
+fn smoke_brcmfmac_bus_ring_mem_entry_round_trip() -> TestResult {
+    use super::bus::{decode_ring_mem_entry, encode_ring_mem_entry};
+    let bytes = encode_ring_mem_entry(64, 63, 0x0000_0000_4000_0000);
+    let (mi, li, ba) = match decode_ring_mem_entry(&bytes) {
+        Some(t) => t,
+        None => return TestResult::Fail("decode_ring_mem_entry returned None"),
+    };
+    if mi != 64 || li != 63 || ba != 0x0000_0000_4000_0000 {
+        return TestResult::Fail("ring_mem_entry round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_bus_ring_mem_entry_round_trip
+);
+
+fn smoke_brcmfmac_bus_preflight_happy() -> TestResult {
+    use super::bus::preflight;
+    use super::firmware::{FW_RAMSIZE_MAGIC, FW_RAMSIZE_OFFSET};
+    use super::shared::{
+        SHARED_FLAG_DMA_INDEX, SHARED_FLAG_HOSTRDY_DB1, RINGINFO_SIZE,
+    };
+    // Build a fake firmware blob with the SMAR magic.
+    let mut fw_blob = alloc::vec![0u8; FW_RAMSIZE_OFFSET + 8 + 1024];
+    fw_blob[FW_RAMSIZE_OFFSET..FW_RAMSIZE_OFFSET + 4]
+        .copy_from_slice(&FW_RAMSIZE_MAGIC.to_le_bytes());
+    fw_blob[FW_RAMSIZE_OFFSET + 4..FW_RAMSIZE_OFFSET + 8]
+        .copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    // Fake NVRAM.
+    let nvram = b"boardrev=0x1101\nrxchain=3\n";
+    // Fake SharedInfo at version 6.
+    let mut shared = alloc::vec![0u8; 96];
+    let flags: u32 = 6 | SHARED_FLAG_DMA_INDEX | SHARED_FLAG_HOSTRDY_DB1;
+    shared[0..4].copy_from_slice(&flags.to_le_bytes());
+    shared[48..52].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+    // Fake RingInfo with max_flowrings=5, sub=5, comp=3.
+    let mut ri = alloc::vec![0u8; RINGINFO_SIZE];
+    ri[0..4].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    ri[52..54].copy_from_slice(&5u16.to_le_bytes());
+    ri[54..56].copy_from_slice(&5u16.to_le_bytes());
+    ri[56..58].copy_from_slice(&3u16.to_le_bytes());
+
+    let (sh, ring_info, plan) = match preflight(&fw_blob, nvram, &shared, &ri) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("preflight returned Err on valid inputs"),
+    };
+    if sh.version != 6 {
+        return TestResult::Fail("preflight shared version wrong");
+    }
+    if ring_info.max_flowrings != 5 {
+        return TestResult::Fail("preflight ring_info max_flowrings wrong");
+    }
+    if plan.len() != 5 {
+        return TestResult::Fail("preflight plan should have 5 entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_bus_preflight_happy
+);
+
+fn smoke_brcmfmac_bus_preflight_rejects_too_many_flowrings() -> TestResult {
+    use super::bus::{preflight, BringUpError};
+    use super::shared::RINGINFO_SIZE;
+    let fw_blob = alloc::vec![0u8; 256];
+    let nvram = b"foo=1\n";
+    let mut shared = alloc::vec![0u8; 96];
+    shared[0..4].copy_from_slice(&6u32.to_le_bytes());
+    shared[48..52].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+    let mut ri = alloc::vec![0u8; RINGINFO_SIZE];
+    // 1024 flowrings — way over the 512 cap.
+    ri[52..54].copy_from_slice(&1024u16.to_le_bytes());
+    ri[54..56].copy_from_slice(&1024u16.to_le_bytes());
+    ri[56..58].copy_from_slice(&3u16.to_le_bytes());
+    match preflight(&fw_blob, nvram, &shared, &ri) {
+        Err(BringUpError::TooManyFlowrings) => TestResult::Pass,
+        _ => TestResult::Fail("preflight should reject >512 flowrings"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_bus_preflight_rejects_too_many_flowrings
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");

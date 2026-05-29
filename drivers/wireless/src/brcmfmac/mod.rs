@@ -50,6 +50,7 @@
 
 extern crate alloc;
 
+pub mod bus;
 pub mod cfg80211;
 pub mod connect;
 pub mod firmware;
