@@ -9014,3 +9014,680 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     }
 }
 kernel_test_in!("userspace", smoke_userspace_tkill_signum_out_of_range_rejected);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// poll / select / pselect6 / epoll smoke tests
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Test fixture: `ReadyFile` — a `FileOps` whose readiness mask is
+// controlled by an `AtomicU32`. Tests install it as an fd, then call
+// poll/epoll and verify the returned masks.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrd};
+
+struct ReadyFile(AtomicU32);
+
+impl core::fmt::Debug for ReadyFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ReadyFile({})", self.0.load(AtomicOrd::Relaxed))
+    }
+}
+
+impl narf_filesystem::FileOps for ReadyFile {
+    fn read<'a>(&'a self, _off: u64, _buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(
+        &'a self,
+        _off: u64,
+        buf: &'a [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        let n = buf.len();
+        alloc::boxed::Box::pin(async move { Ok(n) })
+    }
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+    fn poll_readiness(&self) -> u32 {
+        self.0.load(AtomicOrd::Relaxed)
+    }
+}
+
+/// Install `ReadyFile` at a fresh fd under `task_id`.
+/// Returns the fd number.
+fn install_ready_file(task_id: u64, mask: u32) -> u32 {
+    crate::fd::with_table(task_id, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: Arc::new(ReadyFile(AtomicU32::new(mask))),
+            offset: 0,
+            flags: 0,
+        })
+    })
+    .unwrap()
+}
+
+/// Common test setup: reset global state, install task-id lookup, build
+/// syscall table. Returns task id.
+fn setup_poll_test() -> u64 {
+    crate::syscall::__test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
+    crate::handlers::init_per_task_state();
+    crate::epoll::__test_reset();
+
+    const TASK: u64 = 0xFACE_CAFE;
+    static POLL_TASK: AtomicU64 = AtomicU64::new(TASK);
+    fn task_lu() -> u64 { POLL_TASK.load(AtomicOrd::Relaxed) }
+    crate::install_task_id_lookup(task_lu);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    TASK
+}
+
+// ── Helper: fire a syscall via StubCtx ───────────────────────────────
+
+fn call(syscall: Syscall, args: SyscallArgs) -> SyscallReturn {
+    let mut ctx = StubCtx { args, ret: None };
+    kernel_syscall_entry(syscall.raw(), &mut ctx);
+    ctx.ret.unwrap_or(SyscallReturn::invalid_op())
+}
+
+// ── Poll tests (≥ 6) ─────────────────────────────────────────────────
+
+/// poll: 1 fd, 0 timeout, data ready → returns 1
+fn smoke_poll_one_fd_ready_returns_one() -> TestResult {
+    let task = setup_poll_test();
+    let fd = install_ready_file(task, narf_filesystem::POLL_IN);
+
+    // pollfd: { fd=fd, events=POLLIN, revents=0 }
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+
+    let r = call(Syscall::Poll, SyscallArgs {
+        arg0: pfd.as_ptr() as u64,
+        arg1: 1,
+        arg2: 0, // timeout_ms = 0 = nonblock
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("poll returned non-OK status");
+    }
+    if r.value != 1 {
+        return TestResult::Fail("poll should return 1 for one ready fd");
+    }
+    // Check revents was written.
+    let revents = u16::from_ne_bytes([pfd[6], pfd[7]]);
+    if revents == 0 {
+        return TestResult::Fail("poll did not write revents");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_one_fd_ready_returns_one);
+
+/// poll: 1 fd, 0 timeout, no data → returns 0 immediately
+fn smoke_poll_one_fd_not_ready_returns_zero() -> TestResult {
+    let task = setup_poll_test();
+    let fd = install_ready_file(task, 0); // not ready
+
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+
+    let r = call(Syscall::Poll, SyscallArgs {
+        arg0: pfd.as_ptr() as u64,
+        arg1: 1,
+        arg2: 0, // nonblock
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("poll returned non-OK");
+    }
+    if r.value != 0 {
+        return TestResult::Fail("poll should return 0 when fd is not ready (nonblocking)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_one_fd_not_ready_returns_zero);
+
+/// poll: invalid fd gives POLLNVAL in revents, returns 1
+fn smoke_poll_invalid_fd_returns_pollnval() -> TestResult {
+    let _task = setup_poll_test();
+
+    let mut pfd: [u8; 8] = [0; 8];
+    let bad_fd: i32 = 9999;
+    pfd[..4].copy_from_slice(&bad_fd.to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+
+    let r = call(Syscall::Poll, SyscallArgs {
+        arg0: pfd.as_ptr() as u64,
+        arg1: 1,
+        arg2: 0,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("poll returned non-OK");
+    }
+    if r.value != 1 {
+        return TestResult::Fail("invalid fd: poll should count as one event (POLLNVAL)");
+    }
+    let revents = u16::from_ne_bytes([pfd[6], pfd[7]]);
+    if (revents as u32 & narf_filesystem::POLL_NVAL) == 0 {
+        return TestResult::Fail("POLLNVAL must be set for closed fd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_invalid_fd_returns_pollnval);
+
+/// poll: POLLHUP signalled when closed-pipe end is ready
+fn smoke_poll_pollhup_on_closed_read_end() -> TestResult {
+    let task = setup_poll_test();
+    // Simulate a half-closed pipe: the read end has POLL_HUP set.
+    let fd = install_ready_file(task, narf_filesystem::POLL_HUP);
+
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    // We ask for POLL_IN but should get POLL_HUP even without asking.
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+
+    let r = call(Syscall::Poll, SyscallArgs {
+        arg0: pfd.as_ptr() as u64,
+        arg1: 1,
+        arg2: 0,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value == 0 {
+        return TestResult::Fail("poll should notice POLL_HUP");
+    }
+    let revents = u16::from_ne_bytes([pfd[6], pfd[7]]);
+    if (revents as u32 & narf_filesystem::POLL_HUP) == 0 {
+        return TestResult::Fail("POLL_HUP must appear in revents");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_pollhup_on_closed_read_end);
+
+/// poll: nfds=0, timeout=0 → returns 0 immediately (no fds, no spin)
+fn smoke_poll_zero_fds_returns_zero() -> TestResult {
+    let _task = setup_poll_test();
+    let r = call(Syscall::Poll, SyscallArgs {
+        arg0: 1, // non-null but irrelevant
+        arg1: 0, // nfds=0
+        arg2: 0, // timeout=0
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("poll with nfds=0 should return Ok(0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_zero_fds_returns_zero);
+
+/// poll: multiple fds, only some ready → correct count
+fn smoke_poll_multiple_fds_partial_ready() -> TestResult {
+    let task = setup_poll_test();
+    let fd_ready  = install_ready_file(task, narf_filesystem::POLL_IN);
+    let fd_notready = install_ready_file(task, 0);
+
+    let mut pfds: [u8; 16] = [0; 16];
+    pfds[..4].copy_from_slice(&(fd_ready as i32).to_ne_bytes());
+    pfds[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+    pfds[8..12].copy_from_slice(&(fd_notready as i32).to_ne_bytes());
+    pfds[12..14].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+
+    let r = call(Syscall::Poll, SyscallArgs {
+        arg0: pfds.as_ptr() as u64,
+        arg1: 2,
+        arg2: 0,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("poll returned non-OK");
+    }
+    if r.value != 1 {
+        return TestResult::Fail("poll: only 1 of 2 fds is ready, should return 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_multiple_fds_partial_ready);
+
+// ── select tests (≥ 3) ───────────────────────────────────────────────
+
+/// select: 3 fds in readfds, only 1 is ready → only that bit set in output
+fn smoke_select_readfds_partial_ready() -> TestResult {
+    let task = setup_poll_test();
+    let fd_ready = install_ready_file(task, narf_filesystem::POLL_IN);
+    let fd_a     = install_ready_file(task, 0);
+    let fd_b     = install_ready_file(task, 0);
+
+    let nfds = (fd_ready.max(fd_a).max(fd_b) + 1) as usize;
+    let mut rfds = [0u8; 128];
+    // Set all three bits in readfds.
+    rfds[fd_ready as usize / 8] |= 1 << (fd_ready % 8);
+    rfds[fd_a     as usize / 8] |= 1 << (fd_a     % 8);
+    rfds[fd_b     as usize / 8] |= 1 << (fd_b     % 8);
+    // timeval = 0 → nonblock
+    let tv: [i64; 2] = [0, 0];
+
+    let r = call(Syscall::Select, SyscallArgs {
+        arg0: nfds as u64,
+        arg1: rfds.as_mut_ptr() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: tv.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("select returned non-OK");
+    }
+    if r.value != 1 {
+        return TestResult::Fail("select: only 1 of 3 fds is ready");
+    }
+    // Check the ready bit is set.
+    let bit_ready = (rfds[fd_ready as usize / 8] >> (fd_ready % 8)) & 1;
+    let bit_a     = (rfds[fd_a     as usize / 8] >> (fd_a     % 8)) & 1;
+    let bit_b     = (rfds[fd_b     as usize / 8] >> (fd_b     % 8)) & 1;
+    if bit_ready == 0 {
+        return TestResult::Fail("select: ready fd bit not set in output readfds");
+    }
+    if bit_a != 0 || bit_b != 0 {
+        return TestResult::Fail("select: non-ready fd bits should be clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_select_readfds_partial_ready);
+
+/// pselect6: sigmask pointer accepted (silently ignored)
+fn smoke_pselect6_sigmask_accepted() -> TestResult {
+    let task = setup_poll_test();
+    let fd_ready = install_ready_file(task, narf_filesystem::POLL_IN);
+    let nfds = (fd_ready + 1) as usize;
+    let mut rfds = [0u8; 128];
+    rfds[fd_ready as usize / 8] |= 1 << (fd_ready % 8);
+    // ts = {0, 0} → nonblock
+    let ts: [i64; 2] = [0, 0];
+    // Fake sigmask pair: { ptr=1, size=8 } — non-null but content ignored.
+    let sigmask_pair: [u64; 2] = [1, 8];
+
+    let r = call(Syscall::Pselect6, SyscallArgs {
+        arg0: nfds as u64,
+        arg1: rfds.as_mut_ptr() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: ts.as_ptr() as u64,
+        arg5: sigmask_pair.as_ptr() as u64,
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("pselect6 returned non-OK");
+    }
+    if r.value == (!0u64) {
+        return TestResult::Fail("pselect6 returned -1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_pselect6_sigmask_accepted);
+
+/// select: no fds ready, timeout=0 → returns 0
+fn smoke_select_no_ready_returns_zero() -> TestResult {
+    let task = setup_poll_test();
+    let fd = install_ready_file(task, 0); // not ready
+    let nfds = (fd + 1) as usize;
+    let mut rfds = [0u8; 128];
+    rfds[fd as usize / 8] |= 1 << (fd % 8);
+    let tv: [i64; 2] = [0, 0]; // nonblock
+
+    let r = call(Syscall::Select, SyscallArgs {
+        arg0: nfds as u64,
+        arg1: rfds.as_mut_ptr() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: tv.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("select with no ready fds + timeout=0 should return 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_select_no_ready_returns_zero);
+
+// ── epoll tests (≥ 7) ───────────────────────────────────────────────
+
+/// epoll_create1 returns a valid fd; close succeeds
+fn smoke_epoll_create1_returns_valid_fd() -> TestResult {
+    let task = setup_poll_test();
+
+    let r = call(Syscall::EpollCreate, SyscallArgs {
+        arg0: 0, // no flags
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("epoll_create1 returned non-OK");
+    }
+    let epfd = r.value as u32;
+    if epfd == (!0u32) {
+        return TestResult::Fail("epoll_create1 returned -1");
+    }
+    // Verify the fd exists in the table by trying to close it.
+    let closed = crate::fd::with_table(task, |t| t.close(epfd)).unwrap_or(false);
+    if !closed {
+        return TestResult::Fail("epoll_create1 fd not in fd table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_create1_returns_valid_fd);
+
+/// epoll_ctl ADD then DEL — item removed from interest set
+fn smoke_epoll_ctl_add_then_del() -> TestResult {
+    let task = setup_poll_test();
+
+    // Create epoll fd.
+    let r = call(Syscall::EpollCreate, SyscallArgs { arg0: 0, ..SyscallArgs::default() });
+    if r.status != SyscallReturn::OK { return TestResult::Fail("epoll_create1 failed"); }
+    let epfd = r.value as u32;
+
+    // Install a watched fd.
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+
+    // epoll_event = { events: EPOLLIN, data: 0xABCD }
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&(crate::epoll::EPOLLIN).to_ne_bytes());
+    ev[4..12].copy_from_slice(&0xABCD_u64.to_ne_bytes());
+
+    // ADD
+    let r = call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+        arg2: watched as u64,
+        arg3: ev.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("epoll_ctl ADD failed");
+    }
+
+    // DEL
+    let r = call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_DEL as u64,
+        arg2: watched as u64,
+        arg3: 0,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("epoll_ctl DEL failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_ctl_add_then_del);
+
+/// epoll_wait: 0 timeout, no ready items → returns 0
+fn smoke_epoll_wait_no_ready_returns_zero() -> TestResult {
+    let task = setup_poll_test();
+
+    let epfd_r = call(Syscall::EpollCreate, SyscallArgs { arg0: 0, ..SyscallArgs::default() });
+    if epfd_r.status != SyscallReturn::OK { return TestResult::Fail("create failed"); }
+    let epfd = epfd_r.value as u32;
+
+    let watched = install_ready_file(task, 0); // NOT ready
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    ev[4..12].copy_from_slice(&42u64.to_ne_bytes());
+
+    call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+        arg2: watched as u64,
+        arg3: ev.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+
+    let mut out_ev = [0u8; 12 * 16];
+    let r = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 16,
+        arg3: 0, // timeout=0 → nonblock
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("epoll_wait should return 0 when no fd is ready");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_wait_no_ready_returns_zero);
+
+/// epoll_wait: 0 timeout, 1 ready → returns 1 with correct .data
+fn smoke_epoll_wait_one_ready_returns_one() -> TestResult {
+    let task = setup_poll_test();
+
+    let epfd_r = call(Syscall::EpollCreate, SyscallArgs { arg0: 0, ..SyscallArgs::default() });
+    if epfd_r.status != SyscallReturn::OK { return TestResult::Fail("create failed"); }
+    let epfd = epfd_r.value as u32;
+
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    const USERDATA: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    ev[4..12].copy_from_slice(&USERDATA.to_ne_bytes());
+
+    call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+        arg2: watched as u64,
+        arg3: ev.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+
+    let mut out_ev = [0u8; 12];
+    let r = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 1,
+        arg3: 0, // nonblock
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail("epoll_wait: ready fd should return 1 event");
+    }
+    let data = u64::from_ne_bytes(out_ev[4..12].try_into().unwrap_or([0; 8]));
+    if data != USERDATA {
+        return TestResult::Fail("epoll_wait: returned wrong .data value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_wait_one_ready_returns_one);
+
+/// EPOLLET edge-triggered: first wake delivered; same-state call returns 0
+fn smoke_epoll_epollet_edge_triggered() -> TestResult {
+    let task = setup_poll_test();
+
+    let epfd_r = call(Syscall::EpollCreate, SyscallArgs { arg0: 0, ..SyscallArgs::default() });
+    if epfd_r.status != SyscallReturn::OK { return TestResult::Fail("create failed"); }
+    let epfd = epfd_r.value as u32;
+
+    // Start as ready (POLL_IN) but add with EPOLLET + fresh last_mask=0.
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    let mut ev = [0u8; 12];
+    let flags = crate::epoll::EPOLLIN | crate::epoll::EPOLLET;
+    ev[..4].copy_from_slice(&flags.to_ne_bytes());
+    ev[4..12].copy_from_slice(&1u64.to_ne_bytes());
+
+    call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+        arg2: watched as u64,
+        arg3: ev.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+
+    let mut out_ev = [0u8; 12];
+    // First wait: last_mask was 0, current is POLL_IN → transition → deliver.
+    let r1 = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 1,
+        arg3: 0,
+        ..SyscallArgs::default()
+    });
+
+    // Second wait: last_mask now == POLL_IN → no transition → should return 0.
+    let r2 = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 1,
+        arg3: 0,
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+
+    if r1.status != SyscallReturn::OK || r1.value != 1 {
+        return TestResult::Fail("EPOLLET: first wake should be delivered");
+    }
+    if r2.status != SyscallReturn::OK || r2.value != 0 {
+        return TestResult::Fail("EPOLLET: second same-state poll should return 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_epollet_edge_triggered);
+
+/// EPOLLONESHOT: fires once; re-arm via MOD; fires again
+fn smoke_epoll_oneshot_fires_once_rearm_fires_again() -> TestResult {
+    let task = setup_poll_test();
+
+    let epfd_r = call(Syscall::EpollCreate, SyscallArgs { arg0: 0, ..SyscallArgs::default() });
+    if epfd_r.status != SyscallReturn::OK { return TestResult::Fail("create failed"); }
+    let epfd = epfd_r.value as u32;
+
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    let mut ev = [0u8; 12];
+    let flags = crate::epoll::EPOLLIN | crate::epoll::EPOLLONESHOT;
+    ev[..4].copy_from_slice(&flags.to_ne_bytes());
+    ev[4..12].copy_from_slice(&77u64.to_ne_bytes());
+
+    call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+        arg2: watched as u64,
+        arg3: ev.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+
+    let mut out_ev = [0u8; 12];
+    // First wait: oneshot fires.
+    let r1 = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64, arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 1, arg3: 0, ..SyscallArgs::default()
+    });
+    // Second wait: should return 0 (disarmed).
+    let r2 = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64, arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 1, arg3: 0, ..SyscallArgs::default()
+    });
+
+    // Re-arm via MOD.
+    let flags2 = crate::epoll::EPOLLIN | crate::epoll::EPOLLONESHOT;
+    let mut ev2 = [0u8; 12];
+    ev2[..4].copy_from_slice(&flags2.to_ne_bytes());
+    ev2[4..12].copy_from_slice(&77u64.to_ne_bytes());
+    call(Syscall::EpollCtl, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: crate::epoll::EPOLL_CTL_MOD as u64,
+        arg2: watched as u64,
+        arg3: ev2.as_ptr() as u64,
+        ..SyscallArgs::default()
+    });
+
+    // Third wait: fires again after re-arm.
+    let r3 = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64, arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 1, arg3: 0, ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+
+    if r1.status != SyscallReturn::OK || r1.value != 1 {
+        return TestResult::Fail("EPOLLONESHOT: first fire failed");
+    }
+    if r2.value != 0 {
+        return TestResult::Fail("EPOLLONESHOT: should be disarmed after first fire");
+    }
+    if r3.value != 1 {
+        return TestResult::Fail("EPOLLONESHOT: should fire again after MOD re-arm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_oneshot_fires_once_rearm_fires_again);
+
+/// 1000 fds in one epoll set, 1 becomes ready → wait returns exactly 1
+fn smoke_epoll_1000_fds_one_ready() -> TestResult {
+    let task = setup_poll_test();
+
+    let epfd_r = call(Syscall::EpollCreate, SyscallArgs { arg0: 0, ..SyscallArgs::default() });
+    if epfd_r.status != SyscallReturn::OK { return TestResult::Fail("create failed"); }
+    let epfd = epfd_r.value as u32;
+
+    // Install 999 not-ready fds + 1 ready one.
+    let mut ev = [0u8; 12];
+    let mut ready_fd = 0i32;
+    const TOTAL: usize = 1000;
+    const READY_IDX: usize = 500;
+    for i in 0..TOTAL {
+        let mask = if i == READY_IDX { narf_filesystem::POLL_IN } else { 0 };
+        let fd = install_ready_file(task, mask);
+        if i == READY_IDX { ready_fd = fd as i32; }
+        ev.fill(0);
+        ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+        ev[4..12].copy_from_slice(&(fd as u64).to_ne_bytes());
+        call(Syscall::EpollCtl, SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: fd as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        });
+    }
+
+    let mut out_ev = [0u8; 12 * 16]; // room for 16 results
+    let r = call(Syscall::EpollWait, SyscallArgs {
+        arg0: epfd as u64,
+        arg1: out_ev.as_mut_ptr() as u64,
+        arg2: 16,
+        arg3: 0, // nonblock
+        ..SyscallArgs::default()
+    });
+    crate::syscall::__test_clear_global();
+
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("epoll_wait failed");
+    }
+    if r.value != 1 {
+        return TestResult::Fail("1000 fds: only 1 should be returned as ready");
+    }
+    // Verify the returned data matches the ready fd.
+    let data = u64::from_ne_bytes(out_ev[4..12].try_into().unwrap_or([0; 8]));
+    if data != ready_fd as u64 {
+        return TestResult::Fail("1000 fds: returned wrong fd data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_1000_fds_one_ready);
