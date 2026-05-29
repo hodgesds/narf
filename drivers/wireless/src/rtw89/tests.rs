@@ -16,6 +16,10 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::phy_table::{
+    pd, pp, pw, tx_pwr_clamp, PhyEntry, PhyOp, TxPwrByRate, BB_RF_BOOTSTRAP_TABLE,
+    TXPWR_BYRATE_TABLE_SIZE,
+};
 use super::fwdl::{
     detect_version, packet_count, parse_auto, parse_v0, parse_v1, FwSection, FwdlPacketIter,
     FWDL_SECTION_CHKSUM_LEN, FWDL_SECTION_MAX_NUM, FWDL_SECTION_PER_PKT_LEN, FW_HDR_V0_BASE_SIZE,
@@ -1041,6 +1045,85 @@ fn smoke_rtw89_fwdl_packet_segment() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_packet_segment);
+
+// ── Stage-8: PHY/RF init-table walker + TX power clamps ───────────
+
+fn smoke_rtw89_phy_entry_helpers() -> TestResult {
+    let w = pw(0x1000, 0xDEAD_BEEF, 0xFFFF_FFFF);
+    if w.op != PhyOp::Write || w.reg != 0x1000 {
+        return TestResult::Fail("pw() helper drift");
+    }
+    let p = pp(0x2000, 0x00000001, 0x00000001);
+    if p.op != PhyOp::Poll {
+        return TestResult::Fail("pp() helper drift");
+    }
+    let d = pd(500);
+    if d.op != PhyOp::Delay || d.delay_us != 500 {
+        return TestResult::Fail("pd() helper drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_phy_entry_helpers);
+
+fn smoke_rtw89_phy_bootstrap_table_shape() -> TestResult {
+    // The BB/RF bootstrap snippet must have ≥ 3 entries (WLRF write +
+    // PHYREG_SET write + settle delay).
+    if BB_RF_BOOTSTRAP_TABLE.len() < 3 {
+        return TestResult::Fail("BB_RF_BOOTSTRAP_TABLE too short");
+    }
+    // First write targets WLRF.
+    let first = BB_RF_BOOTSTRAP_TABLE[0];
+    if first.op != PhyOp::Write {
+        return TestResult::Fail("First entry not Write");
+    }
+    if first.reg != super::mac_init::R_AX_WLRF_CTRL {
+        return TestResult::Fail("First entry not at WLRF_CTRL");
+    }
+    // The last entry should be a Delay.
+    let last = BB_RF_BOOTSTRAP_TABLE[BB_RF_BOOTSTRAP_TABLE.len() - 1];
+    if last.op != PhyOp::Delay {
+        return TestResult::Fail("Last entry not Delay");
+    }
+    if last.delay_us == 0 {
+        return TestResult::Fail("Delay entry has 0 us");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_phy_bootstrap_table_shape);
+
+fn smoke_rtw89_txpwr_clamp() -> TestResult {
+    let envelope = TxPwrByRate { rate_idx: 0, max_pwr_q1: 60 }; // +30.0 dBm
+    // Target above envelope.
+    if tx_pwr_clamp(100, envelope) != 60 {
+        return TestResult::Fail("upper clamp wrong");
+    }
+    // Target below envelope.
+    if tx_pwr_clamp(-100, envelope) != -60 {
+        return TestResult::Fail("lower clamp wrong");
+    }
+    // Target inside envelope — unchanged.
+    if tx_pwr_clamp(40, envelope) != 40 {
+        return TestResult::Fail("inside-envelope value clipped");
+    }
+    // Boundary cases.
+    if tx_pwr_clamp(60, envelope) != 60 {
+        return TestResult::Fail("at-max should pass through");
+    }
+    if tx_pwr_clamp(-60, envelope) != -60 {
+        return TestResult::Fail("at-min should pass through");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_txpwr_clamp);
+
+fn smoke_rtw89_txpwr_table_size() -> TestResult {
+    // AX byrate table: 12 MCS × 3 mode × 4 BW = 144 entries.
+    if TXPWR_BYRATE_TABLE_SIZE != 144 {
+        return TestResult::Fail("TXPWR table size != 144");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_txpwr_table_size);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //

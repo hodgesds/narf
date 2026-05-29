@@ -66,6 +66,7 @@ pub mod mac;
 pub mod mac_init;
 pub mod pci;
 pub mod phy;
+pub mod phy_table;
 pub mod txrx;
 
 pub use mac::{ChipId, ChipGeneration, MacError};
