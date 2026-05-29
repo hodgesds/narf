@@ -44,15 +44,22 @@
 
 extern crate alloc;
 
+pub mod btcoex;
+pub mod channel;
+pub mod dma;
 pub mod efuse;
 pub mod fw;
 pub mod h2c;
+pub mod irq;
 pub mod mac;
 pub mod pci;
 pub mod phy;
 pub mod power;
 pub mod regs;
 pub mod rf;
+pub mod rx;
+pub mod tx;
+pub mod vht;
 
 pub mod rtl8188ee;
 pub mod rtl8192ce;
