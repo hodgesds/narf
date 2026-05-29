@@ -42,7 +42,9 @@
 
 extern crate alloc;
 
+pub mod cmd;
 pub mod dma;
+pub mod fwdl;
 pub mod mac;
 pub mod mcu;
 pub mod pci;

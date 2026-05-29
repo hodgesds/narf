@@ -297,6 +297,41 @@ impl Ring {
         debug_assert!(self.depth > 0);
         self.hw_idx = idx % self.depth;
     }
+
+    /// Park a per-frame DmaBuffer in the ring's buffer pool at the
+    /// given slot. Grows the pool with sentinel zero-len buffers if
+    /// `slot` is past the current pool length.
+    ///
+    /// Used by the live TX path (`txrx::submit_tx_frame`) to keep the
+    /// frame's memory alive until the firmware reaps the descriptor.
+    pub fn set_tx_buffer(&mut self, slot: usize, buf: DmaBuffer) {
+        while self.buffers.len() <= slot {
+            // We can't construct a "null" DmaBuffer in safe Rust, so
+            // we push a 0-len placeholder allocation. This costs one
+            // page per ring slot — at the bring-up baseline (16
+            // entries) that's 64 KiB across all rings, acceptable.
+            let placeholder = narf_io::alloc_coherent(64, narf_lib::id::DomainId::DRIVER_0)
+                .expect("dma placeholder alloc");
+            self.buffers.push(placeholder);
+        }
+        // Swap-in: dropping the old buffer frees its page via Drop.
+        self.buffers[slot] = buf;
+    }
+
+    /// Take the DmaBuffer back out of the pool at `slot`, returning
+    /// `None` if the slot was never filled.
+    ///
+    /// The returned buffer is dropped by the caller. Used by
+    /// `txrx::reap_tx` after the firmware marks a descriptor done.
+    pub fn take_tx_buffer(&mut self, slot: usize) -> Option<DmaBuffer> {
+        if slot >= self.buffers.len() {
+            return None;
+        }
+        // Swap with a placeholder so the Vec retains its slots.
+        let placeholder = narf_io::alloc_coherent(64, narf_lib::id::DomainId::DRIVER_0).ok()?;
+        let old = core::mem::replace(&mut self.buffers[slot], placeholder);
+        Some(old)
+    }
 }
 
 // ── Allocation ────────────────────────────────────────────────────

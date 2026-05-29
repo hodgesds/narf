@@ -315,3 +315,218 @@ pub fn encode_sta_rec_update(wlan_idx: u16, out: &mut [u8]) -> Option<()> {
 }
 
 use core::convert::TryInto;
+
+// ── Stage-13/14: live TX submit + RX drain (uses dma::Ring) ──────
+
+use super::dma::{
+    ring_dma_index, ring_doorbell, Mt76Desc, Ring, RingRegs, MT76_DESC_SIZE,
+    MT_DMA_CTL_BURST, MT_DMA_CTL_DMA_DONE, MT_DMA_CTL_LAST_SEC0, MT_DMA_CTL_SD_LEN0_MASK,
+    MT_DMA_CTL_SD_LEN0_SHIFT,
+};
+use narf_bus::MmioRegion;
+use narf_io::DmaBuffer;
+
+/// Errors raised by the live TX/RX submit + drain paths.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TxRxError {
+    /// TX ring is full — caller should retry after the next drain.
+    RingFull,
+    /// Frame is too large for one descriptor (> SD_LEN0 max =
+    /// `MT_DMA_CTL_SD_LEN0_MASK`).
+    FrameTooBig,
+    /// Encoded TXD was too short to be valid (programmer bug).
+    BadTxd,
+    /// The frame's DMA buffer alloc failed.
+    BufferAllocFailed,
+}
+
+/// Submit one frame to the given TX ring. Builds a TXD prefix into a
+/// per-frame DmaBuffer, copies the payload behind it, points the
+/// next free descriptor at the buffer, and bumps the host pointer
+/// + doorbell.
+///
+/// The caller has already called `program_ring` for this ring's
+/// MMIO offsets, so the engine knows where the descriptor table
+/// lives.
+///
+/// # Safety
+/// `mmio` is the live BAR0 region; caller owns the device.
+pub unsafe fn submit_tx_frame(
+    mmio: &MmioRegion,
+    ring: &mut Ring,
+    regs: RingRegs,
+    info: &TxdInfo,
+    payload: &[u8],
+) -> Result<(), TxRxError> {
+    let total_len = TXD_SIZE + payload.len();
+    let max_sd_len = (MT_DMA_CTL_SD_LEN0_MASK >> MT_DMA_CTL_SD_LEN0_SHIFT) as usize;
+    if total_len > max_sd_len {
+        return Err(TxRxError::FrameTooBig);
+    }
+
+    // Detect full ring before we mutate anything: (cpu_idx + 1) %
+    // depth would catch up to hw_idx.
+    let depth = ring.depth();
+    let next_cpu = (ring.cpu_idx() + 1) % depth;
+    if next_cpu == ring.hw_idx() {
+        return Err(TxRxError::RingFull);
+    }
+
+    // Allocate a coherent buffer for this frame. The descriptor's
+    // buf0 will point at it, so it stays live until the next time
+    // this slot is reused (reap_tx).
+    let mut buf = narf_io::alloc_coherent(total_len.max(64), narf_lib::id::DomainId::DRIVER_0)
+        .map_err(|_| TxRxError::BufferAllocFailed)?;
+    let phys = buf.phys_addr().as_u64();
+    {
+        let bytes = buf.as_mut_slice();
+        // Encode the TXD at the head of the buffer.
+        if encode_txd(info, &mut bytes[..TXD_SIZE]).is_none() {
+            return Err(TxRxError::BadTxd);
+        }
+        bytes[TXD_SIZE..TXD_SIZE + payload.len()].copy_from_slice(payload);
+    }
+
+    // Find the next free descriptor.
+    let slot = ring.cpu_idx();
+    {
+        let descs = ring.descriptors_mut();
+        let d = &mut descs[slot];
+        d.buf0 = phys as u32;
+        d.buf1 = ((phys >> 32) as u32) & 0x0F;
+        d.ctrl = ((total_len as u32) << MT_DMA_CTL_SD_LEN0_SHIFT) & MT_DMA_CTL_SD_LEN0_MASK
+            | MT_DMA_CTL_LAST_SEC0
+            | MT_DMA_CTL_BURST;
+        d.info = 0;
+    }
+    // Stash the buffer in the ring so it lives until reaped.
+    // We grow the pool to match the ring depth lazily.
+    // The caller's `Ring` keeps the buffers in `ring.buffers`.
+    // Use a Vec push — slot index == buffers.len() for the first
+    // pass, and subsequent submits reuse the same DmaBuffer slot
+    // by replacing it. For the baseline we just append; Stage-14's
+    // reap-tx swaps in place.
+    //
+    // Since we can't directly index into `ring.buffers` mutably
+    // (the API only returns &[DmaBuffer]), we expose a setter.
+    ring.set_tx_buffer(slot, buf);
+
+    // Advance CPU pointer and ring the doorbell.
+    ring.set_cpu_idx(next_cpu);
+    // SAFETY: BAR0 mapped + owned per `# Safety`.
+    unsafe { ring_doorbell(mmio, regs, ring.cpu_idx() as u32) };
+    Ok(())
+}
+
+/// Drain the RX ring: walk descriptors from `hw_idx` forward, decode
+/// each completed frame (DMA_DONE bit set), invoke `f` with the
+/// payload bytes, then re-arm the descriptor and bump the host
+/// pointer + doorbell.
+///
+/// Returns the number of frames drained.
+///
+/// # Safety
+/// BAR0 mapped + owned.
+pub unsafe fn drain_rx(
+    mmio: &MmioRegion,
+    ring: &mut Ring,
+    regs: RingRegs,
+    mut f: impl FnMut(&[u8], RxdInfo),
+) -> usize {
+    // SAFETY: BAR0 mapped + owned.
+    let new_hw = unsafe { ring_dma_index(mmio, regs) } as usize;
+    let depth = ring.depth();
+    if depth == 0 {
+        return 0;
+    }
+    let new_hw = new_hw % depth;
+
+    let mut drained = 0usize;
+    let mut idx = ring.hw_idx();
+    while idx != new_hw {
+        // Read the descriptor and the per-entry buffer.
+        let (ctrl, _buf0, _buf1) = {
+            let descs = ring.descriptors();
+            let d = descs[idx];
+            (d.ctrl, d.buf0, d.buf1)
+        };
+        // Skip descriptors the HW didn't mark done (shouldn't happen
+        // if `new_hw` is fresh).
+        if (ctrl & MT_DMA_CTL_DMA_DONE) == 0 {
+            break;
+        }
+        // The per-entry buffer carries the RXD prefix + payload.
+        let bufs = ring.buffers();
+        let buf = &bufs[idx];
+        let bytes = buf.as_slice();
+        // Decode the RXD.
+        let decoded = match decode_rxd(bytes) {
+            Some(r) => r,
+            None => {
+                // Move on; drop the malformed frame.
+                idx = (idx + 1) % depth;
+                continue;
+            }
+        };
+        let len = decoded.frame_len as usize;
+        let frame_end = (RXD_BASE_SIZE + len).min(bytes.len());
+        let payload = &bytes[RXD_BASE_SIZE..frame_end];
+        f(payload, decoded);
+
+        // Re-arm: clear DMA_DONE so the engine knows the descriptor
+        // is available again.
+        {
+            let descs = ring.descriptors_mut();
+            descs[idx].ctrl &= !MT_DMA_CTL_DMA_DONE;
+        }
+        drained += 1;
+        idx = (idx + 1) % depth;
+    }
+    ring.set_hw_idx(new_hw);
+    // Re-arm the doorbell: CPU pointer moves to wherever HW just was
+    // (one full lap behind, modulo depth).
+    let new_cpu = if new_hw == 0 { depth - 1 } else { new_hw - 1 };
+    ring.set_cpu_idx(new_cpu);
+    // SAFETY: BAR0 mapped + owned.
+    unsafe { ring_doorbell(mmio, regs, new_cpu as u32) };
+    drained
+}
+
+/// Reap completed TX descriptors: walk from `hw_idx` forward, free
+/// each `DmaBuffer` whose descriptor's `DMA_DONE` bit is set, and
+/// move the cached HW pointer.
+///
+/// # Safety
+/// BAR0 mapped + owned.
+pub unsafe fn reap_tx(mmio: &MmioRegion, ring: &mut Ring, regs: RingRegs) -> usize {
+    // SAFETY: BAR0 mapped + owned.
+    let new_hw = unsafe { ring_dma_index(mmio, regs) } as usize;
+    let depth = ring.depth();
+    if depth == 0 {
+        return 0;
+    }
+    let new_hw = new_hw % depth;
+
+    let mut reaped = 0usize;
+    let mut idx = ring.hw_idx();
+    while idx != new_hw {
+        let done = {
+            let descs = ring.descriptors();
+            descs[idx].ctrl & MT_DMA_CTL_DMA_DONE != 0
+        };
+        if !done {
+            break;
+        }
+        // Drop the per-slot buffer. `take_tx_buffer` removes the
+        // DmaBuffer from the ring and frees it via Drop.
+        let _ = ring.take_tx_buffer(idx);
+        {
+            let descs = ring.descriptors_mut();
+            descs[idx].ctrl &= !MT_DMA_CTL_DMA_DONE;
+        }
+        reaped += 1;
+        idx = (idx + 1) % depth;
+    }
+    ring.set_hw_idx(new_hw);
+    reaped
+}
