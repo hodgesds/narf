@@ -26,7 +26,7 @@ use narf_scheduler::narf_time;
 use crate::iface;
 use crate::pkt::{
     self, parse_arp, parse_eth_header, parse_ipv4, write_eth_header, write_ipv4_header,
-    ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETH_HDR_LEN,
+    ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_IPV6, ETH_HDR_LEN,
     IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
 };
 use crate::pkt_tcp::{TcpHeader, ipv4_pseudo_checksum};
@@ -320,6 +320,16 @@ pub fn rx_handler(frame: &[u8]) {
     match eth.ethertype {
         ETHERTYPE_ARP => handle_arp(body),
         ETHERTYPE_IPV4 => handle_ipv4(body),
+        ETHERTYPE_IPV6 => {
+            // Dispatch via the IPv6 stack. Iface name is taken from
+            // primary() — Stage-1 has at most one NIC, multi-NIC
+            // dispatch lands when the driver layer surfaces the
+            // ingress port.
+            let iface_name = iface::primary()
+                .map(|s| s.name)
+                .unwrap_or_else(|| alloc::string::String::from("eth0"));
+            let _ = crate::ipv6_stack::rx_frame(&iface_name, body);
+        }
         _ => {}
     }
 }

@@ -12,6 +12,7 @@
 pub const ETH_HDR_LEN: usize = 14;
 pub const ETHERTYPE_ARP: u16 = 0x0806;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
+pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 
 /// Build an Ethernet header at `out[0..14]`. Returns the byte
 /// slice extending past the header so callers can write the

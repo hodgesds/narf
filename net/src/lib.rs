@@ -44,6 +44,7 @@
 
 extern crate alloc;
 
+pub mod bypass;
 pub mod http;
 pub mod http2;
 pub mod mqtt;
@@ -66,6 +67,9 @@ pub mod pkt_tcp;
 pub mod pkt_tftp;
 pub mod pkt_udp;
 pub mod iface;
+pub mod ipv6;
+pub mod ipv6_stack;
+pub mod netfilter;
 pub mod stack;
 pub mod stun;
 pub mod tcp_stack;
