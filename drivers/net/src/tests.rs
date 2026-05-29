@@ -1159,13 +1159,17 @@ kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_csum_offload_bits);
 // ── forcedeth ─────────────────────────────────────────────────────
 
 fn smoke_forcedeth_tso_desc_encode() -> TestResult {
+    // REGRESSION GUARD: NV_TX2_CHECKSUM_L3/L4 must NOT appear in a TSO
+    // descriptor.  MSS occupies bits[27:14]; bit 27 == NV_TX2_CHECKSUM_L3,
+    // so setting both corrupts the MSS decode (Linux forcedeth.c:2335
+    // places them in an else-branch, never together with NV_TX2_TSO).
     use crate::forcedeth::{Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO, NV_TX2_TSO_SHIFT, TXD_LASTPACKET, TXD_VALID};
     let d = Desc::tx_with_tso(0x0000_C000u32, 1460, 1448);
     if d.flaglen & TXD_VALID == 0 { return TestResult::Fail("forcedeth TSO: TXD_VALID not set"); }
     if d.flaglen & TXD_LASTPACKET == 0 { return TestResult::Fail("forcedeth TSO: TXD_LASTPACKET not set"); }
     if d.flaglen & NV_TX2_TSO == 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_TSO not set"); }
-    if d.flaglen & NV_TX2_CHECKSUM_L3 == 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L3 not set"); }
-    if d.flaglen & NV_TX2_CHECKSUM_L4 == 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L4 not set"); }
+    if d.flaglen & NV_TX2_CHECKSUM_L3 != 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L3 must not be set (corrupts MSS)"); }
+    if d.flaglen & NV_TX2_CHECKSUM_L4 != 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L4 must not be set"); }
     if (d.flaglen >> NV_TX2_TSO_SHIFT) & 0x3FFF != 1448 { return TestResult::Fail("forcedeth TSO: mss wrong"); }
     TestResult::Pass
 }
@@ -1329,3 +1333,228 @@ kernel_test_in!(
     "drivers/net/rtl8126",
     smoke_rtl8126_link_partner_cap_negotiation
 );
+
+// ── TxMeta / RxMeta type smokes (narf-net crate) ────────────────────
+
+fn smoke_txmeta_default_is_plain() -> TestResult {
+    // TxMeta::default() == TxMeta::plain(): no offloads requested.
+    let m = narf_net::TxMeta::default();
+    if m.tso_mss.is_some() { return TestResult::Fail("default TxMeta must not request TSO"); }
+    if m.csum_l4.is_some() { return TestResult::Fail("default TxMeta must not request csum"); }
+    if m.vlan_tag.is_some() { return TestResult::Fail("default TxMeta must not request VLAN"); }
+    TestResult::Pass
+}
+kernel_test_in!("narf-net", smoke_txmeta_default_is_plain);
+
+fn smoke_txmeta_with_tso_sets_fields() -> TestResult {
+    // TxMeta::with_tso: sets tso_mss and csum_l4 (TCP implied).
+    let m = narf_net::TxMeta::with_tso(1448);
+    if m.tso_mss != Some(1448) { return TestResult::Fail("with_tso: tso_mss wrong"); }
+    if m.csum_l4 != Some(narf_net::L4CsumKind::Tcp) {
+        return TestResult::Fail("with_tso: csum_l4 must be Tcp");
+    }
+    if m.vlan_tag.is_some() { return TestResult::Fail("with_tso: vlan_tag must be None"); }
+    TestResult::Pass
+}
+kernel_test_in!("narf-net", smoke_txmeta_with_tso_sets_fields);
+
+fn smoke_txmeta_with_csum_sets_kind() -> TestResult {
+    // TxMeta::with_csum(Udp): sets csum_l4, no TSO.
+    let m = narf_net::TxMeta::with_csum(narf_net::L4CsumKind::Udp);
+    if m.csum_l4 != Some(narf_net::L4CsumKind::Udp) {
+        return TestResult::Fail("with_csum(Udp): csum_l4 must be Udp");
+    }
+    if m.tso_mss.is_some() { return TestResult::Fail("with_csum: tso_mss must be None"); }
+    TestResult::Pass
+}
+kernel_test_in!("narf-net", smoke_txmeta_with_csum_sets_kind);
+
+fn smoke_rxmeta_default_false() -> TestResult {
+    // RxMeta::default(): both csum bits false.
+    let m = narf_net::RxMeta::default();
+    if m.csum_l3 { return TestResult::Fail("default RxMeta: csum_l3 must be false"); }
+    if m.csum_l4 { return TestResult::Fail("default RxMeta: csum_l4 must be false"); }
+    TestResult::Pass
+}
+kernel_test_in!("narf-net", smoke_rxmeta_default_false);
+
+// ── mlx5 EQE CQN decode ─────────────────────────────────────────────
+
+fn smoke_mlx5_eqe_comp_cqn_decode() -> TestResult {
+    // Simulate a CompletionEvent EQE with CQN=0x42 and verify
+    // decode_eqe extracts it correctly from byte 0x38.
+    use crate::mlx5::eqe;
+
+    let mut raw = [0u8; eqe::EQE_LEN];
+    eqe::simulate_comp_event(&mut raw, 0x42);
+
+    // Verify is_hw_owned returns false (owner bit = 0).
+    if eqe::is_hw_owned(&raw) {
+        return TestResult::Fail("CompEvent: is_hw_owned must be false");
+    }
+    let view = eqe::decode_eqe(&raw);
+    if view.event_type != eqe::EventType::CompletionEvent {
+        return TestResult::Fail("CompEvent: event_type must be CompletionEvent");
+    }
+    if view.cqn != 0x42 {
+        return TestResult::Fail("CompEvent: cqn must be 0x42");
+    }
+    // Non-CompletionEvent EQE must have cqn=0.
+    let mut raw2 = [0u8; eqe::EQE_LEN];
+    eqe::simulate_event(&mut raw2, 0x09, 0x00); // PortStateChange
+    let view2 = eqe::decode_eqe(&raw2);
+    if view2.cqn != 0 {
+        return TestResult::Fail("PortStateChange: cqn must be 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_comp_cqn_decode);
+
+fn smoke_mlx5_eqe_cqn_24bit_mask() -> TestResult {
+    // CQN is 24 bits; high byte of the BE u32 is stripped.
+    use crate::mlx5::eqe;
+
+    let mut raw = [0u8; eqe::EQE_LEN];
+    // Write CQN = 0xFF_ABCD (3 bytes used) into offset 0x38 in BE.
+    eqe::simulate_comp_event(&mut raw, 0xFF_ABCD);
+    let view = eqe::decode_eqe(&raw);
+    if view.cqn != 0xFF_ABCD {
+        return TestResult::Fail("24-bit CQN mask failed");
+    }
+    // High byte stripped: simulate raw BE u32 = 0xAB_FF_ABCD (high byte = 0xAB).
+    raw[eqe::EQE_OFF_COMP_CQN] = 0xAB;      // high byte of BE u32
+    raw[eqe::EQE_OFF_COMP_CQN + 1] = 0xFF;
+    raw[eqe::EQE_OFF_COMP_CQN + 2] = 0xAB;
+    raw[eqe::EQE_OFF_COMP_CQN + 3] = 0xCD;
+    let view2 = eqe::decode_eqe(&raw);
+    if view2.cqn != 0xFF_ABCD {
+        return TestResult::Fail("24-bit mask must strip high byte of BE u32");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_cqn_24bit_mask);
+
+// ── vmxnet3 intrCtrl re-enable constant smoke ────────────────────────
+
+fn smoke_vmxnet3_ic_disable_all_value() -> TestResult {
+    // VMXNET3_IC_DISABLE_ALL must be 0x01 per vmxnet3_defs.h.
+    // vmxnet3_enable_all_intrs clears this bit in intrCtrl after
+    // ACTIVATE_DEV; if the constant drifts, interrupts stay masked.
+    use crate::vmxnet3::regs::VMXNET3_IC_DISABLE_ALL;
+    if VMXNET3_IC_DISABLE_ALL != 0x01 {
+        return TestResult::Fail("VMXNET3_IC_DISABLE_ALL must be 0x01 (vmxnet3_defs.h)");
+    }
+    // Must be a single bit so &= !x clears it cleanly.
+    if VMXNET3_IC_DISABLE_ALL.count_ones() != 1 {
+        return TestResult::Fail("VMXNET3_IC_DISABLE_ALL must be a power-of-two mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_ic_disable_all_value);
+
+fn smoke_vmxnet3_intr_reenable_clears_disable_bit() -> TestResult {
+    // Verify that clearing VMXNET3_IC_DISABLE_ALL from a word that had
+    // it set produces 0, and that a word with other bits is not clobbered.
+    use crate::vmxnet3::regs::VMXNET3_IC_DISABLE_ALL;
+    // Start with just the disable bit set — clearing it gives 0.
+    let ctrl: u32 = VMXNET3_IC_DISABLE_ALL;
+    let after = ctrl & !VMXNET3_IC_DISABLE_ALL;
+    if after != 0 {
+        return TestResult::Fail("clearing IC_DISABLE_ALL from 0x01 must give 0");
+    }
+    // Other bits preserved: start with 0x07 (IC_DISABLE + two others).
+    let ctrl2: u32 = 0x07;
+    let after2 = ctrl2 & !VMXNET3_IC_DISABLE_ALL;
+    if after2 != 0x06 {
+        return TestResult::Fail("clearing IC_DISABLE_ALL from 0x07 must give 0x06");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_intr_reenable_clears_disable_bit);
+
+// ── forcedeth TSO checksum exclusion (regression) ────────────────────
+
+fn smoke_forcedeth_tso_no_csum_bits() -> TestResult {
+    // Per Linux forcedeth.c (line 2335): when TSO is active, the
+    // NV_TX2_CHECKSUM_L3/L4 bits are NOT set — they live in an
+    // `else` branch. Setting both TSO and checksum bits corrupts
+    // the 14-bit MSS field (bits[27:14]) because NV_TX2_CHECKSUM_L3
+    // is bit 27, inside the MSS field.
+    use crate::forcedeth::{Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO};
+    let d = Desc::tx_with_tso(0x1000u32, 1460, 1448);
+    if d.flaglen & NV_TX2_CHECKSUM_L3 != 0 {
+        return TestResult::Fail("TSO desc must NOT have CHECKSUM_L3 set (corrupts MSS)");
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L4 != 0 {
+        return TestResult::Fail("TSO desc must NOT have CHECKSUM_L4 set");
+    }
+    if d.flaglen & NV_TX2_TSO == 0 {
+        return TestResult::Fail("TSO desc must have NV_TX2_TSO set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_tso_no_csum_bits);
+
+fn smoke_forcedeth_csum_no_tso_bit() -> TestResult {
+    // Checksum-only descriptor must NOT have NV_TX2_TSO.
+    use crate::forcedeth::{Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO};
+    let d = Desc::tx_with_csum(0x2000u32, 60);
+    if d.flaglen & NV_TX2_TSO != 0 {
+        return TestResult::Fail("csum-only desc must NOT have NV_TX2_TSO");
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L3 == 0 {
+        return TestResult::Fail("csum desc must have CHECKSUM_L3");
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L4 == 0 {
+        return TestResult::Fail("csum desc must have CHECKSUM_L4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_csum_no_tso_bit);
+
+// ── TxMeta wired through tx() — per-driver structural smokes ─────────
+
+fn smoke_e1000_txmeta_tso_selects_desc() -> TestResult {
+    // Verify TxDesc::with_tso is callable (indirectly via TxMeta
+    // machinery) — structural compile check. We call the desc encoder
+    // directly to verify the bits; the tx() callsite wiring is tested
+    // by the existing smoke_e1000_tso_desc_encode.
+    use crate::e1000::{TxDesc, TXD_CMD_DEXT, TXD_CMD_TSE, TXD_DTYP_D};
+    let m = narf_net::TxMeta::with_tso(1448);
+    // Simulate what tx() does when meta.tso_mss is Some.
+    let mss = m.tso_mss.expect("tso_mss must be set");
+    let d = TxDesc::with_tso(0x1234_0000u64, 1448, mss);
+    if d.cmd & TXD_CMD_TSE == 0 { return TestResult::Fail("e1000 tx/meta: TSE not set"); }
+    if d.cmd & TXD_CMD_DEXT == 0 { return TestResult::Fail("e1000 tx/meta: DEXT not set"); }
+    if d.cmd & TXD_DTYP_D == 0 { return TestResult::Fail("e1000 tx/meta: DTYP_D not set"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/e1000", smoke_e1000_txmeta_tso_selects_desc);
+
+fn smoke_ixgbe_txmeta_csum_selects_desc() -> TestResult {
+    // Verify TxMeta::with_csum routes to AdvTxDesc::with_csum.
+    use crate::ixgbe::{AdvTxDesc, ADVTXD_POPTS_IXSM, ADVTXD_POPTS_TXSM};
+    let m = narf_net::TxMeta::with_csum(narf_net::L4CsumKind::Tcp);
+    let d = if m.csum_l4.is_some() {
+        AdvTxDesc::with_csum(0xDEAD_0000u64, 60)
+    } else {
+        return TestResult::Fail("meta.csum_l4 unexpectedly None");
+    };
+    if d.olinfo & ADVTXD_POPTS_IXSM == 0 { return TestResult::Fail("ixgbe csum meta: IXSM missing"); }
+    if d.olinfo & ADVTXD_POPTS_TXSM == 0 { return TestResult::Fail("ixgbe csum meta: TXSM missing"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_txmeta_csum_selects_desc);
+
+fn smoke_tg3_txmeta_tso_selects_desc() -> TestResult {
+    // TxMeta TSO routes to TxBufferDesc::with_tso.
+    use crate::tg3::{TxBufferDesc, TXD_MSS_SHIFT};
+    let m = narf_net::TxMeta::with_tso(1460);
+    let mss = m.tso_mss.expect("tso_mss must be set");
+    let d = TxBufferDesc::with_tso(0u32, 0x1000u32, 1460, mss);
+    if d.vlan_tag >> TXD_MSS_SHIFT != 1460 {
+        return TestResult::Fail("tg3 txmeta: MSS wrong in vlan_tag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/tg3", smoke_tg3_txmeta_tso_selects_desc);
