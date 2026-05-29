@@ -17,7 +17,7 @@ use super::mac::*;
 use super::pci::{name_for, register_pci_driver};
 use super::phy::PhyError;
 use super::txrx::{
-    decode_rxd, encode_h2c_header, encode_rxd_for_test, encode_txd, RxdInfo, TxwdInfo,
+    decode_rxd, encode_h2c_header, encode_rxd_for_test, encode_txwd as encode_txd, RxdInfo, TxwdInfo,
     H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL, H2C_HEADER_LEN, H2C_HDR_REC_ACK,
     TXWD_BODY0_CHANNEL_MASK, TXWD_BODY0_WD_INFO_EN, TXWD_BODY2_MACID_MASK,
     TXWD_BODY2_QSEL_MASK, TXWD_BODY2_TXPKT_SIZE_MASK, TXWD_BODY_SIZE,

@@ -8,6 +8,8 @@ pub mod brcmfmac;
 pub mod cyw43439;
 pub mod iwlwifi;
 pub mod mt7921;
+pub mod rtl8xxxu;
+pub mod rtlwifi;
 pub mod rtw88;
 pub mod rtw89;
 
@@ -25,6 +27,14 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "cyw43439", || {
         cyw43439::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtl8xxxu", || {
+        rtl8xxxu::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtlwifi", || {
+        rtlwifi::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "rtw88", || {
