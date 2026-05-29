@@ -95,6 +95,24 @@ pub fn register_initcalls() {
         spawn_supervisor_task();
         InitResult::Ok
     });
+    // Stage::Subsys banner for the HID vendor quirk tables (Apple /
+    // Microsoft / Logitech DJ + HID++). These modules don't bind
+    // their own xHCI / interrupt-IN endpoints — they hang off the
+    // standard HID supervisor's per-port attach via VID/PID lookups
+    // into their device tables. The initcall just emits a one-line
+    // klog banner so a real-HW boot makes the vendor coverage
+    // visible.
+    narf_init::register(Stage::Subsys, "usb-hid-vendor-quirks", || {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  usb-hid-vendor: apple={} ms={} logi-recv={} (HID++ table-driven)",
+            hid::apple::APPLE_DEVICES.len(),
+            hid::microsoft::MICROSOFT_DEVICES.len(),
+            hid::logitech_dj::LOGITECH_RECEIVERS.len(),
+        );
+        InitResult::Ok
+    });
     // The legacy "usb-mass-storage" Stage::Device initcall used to
     // call msc::enumerate_and_attach_msc once. That path was a
     // one-shot: USB sticks plugged in after boot never got bound.
