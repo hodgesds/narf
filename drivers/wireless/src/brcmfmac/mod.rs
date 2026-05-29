@@ -54,6 +54,7 @@ pub mod cfg80211;
 pub mod fwil;
 pub mod msgbuf;
 pub mod pcie;
+pub mod shared;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 

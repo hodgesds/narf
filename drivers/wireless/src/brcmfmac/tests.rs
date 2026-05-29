@@ -833,6 +833,141 @@ kernel_test_in!(
     smoke_brcmfmac_fwil_join_params_encode
 );
 
+// ── Stage-5: PCIe shared-RAM layout decode ─────────────────────────────
+
+fn smoke_brcmfmac_shared_info_decode_v6() -> TestResult {
+    use super::shared::{
+        SharedInfo, DEF_MAX_RXBUFPOST, SHARED_FLAG_DMA_INDEX, SHARED_FLAG_HOSTRDY_DB1,
+    };
+    // Build a synthetic shared-info block: version 6, DMA-indices on,
+    // HOSTRDY-DB1 on, max_rxbufpost = 96, rx_dataoffset = 36 bytes.
+    let flags: u32 = 6 | SHARED_FLAG_DMA_INDEX | SHARED_FLAG_HOSTRDY_DB1;
+    let mut buf = [0u8; 96];
+    buf[0..4].copy_from_slice(&flags.to_le_bytes());
+    buf[20..24].copy_from_slice(&0xDEAD_C0DEu32.to_le_bytes());
+    buf[34..36].copy_from_slice(&96u16.to_le_bytes());
+    buf[36..40].copy_from_slice(&36u32.to_le_bytes());
+    buf[40..44].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    buf[44..48].copy_from_slice(&0x0001_0004u32.to_le_bytes());
+    buf[48..52].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+
+    let parsed = match SharedInfo::parse(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("SharedInfo::parse returned None"),
+    };
+    if parsed.version != 6 {
+        return TestResult::Fail("SharedInfo version mismatch");
+    }
+    if parsed.max_rxbufpost != 96 {
+        return TestResult::Fail("SharedInfo max_rxbufpost mismatch");
+    }
+    if parsed.rx_dataoffset != 36 {
+        return TestResult::Fail("SharedInfo rx_dataoffset mismatch");
+    }
+    if parsed.htod_mb_data_addr != 0x0001_0000 {
+        return TestResult::Fail("htod_mb_data_addr mismatch");
+    }
+    if parsed.ring_info_addr != 0x0002_0000 {
+        return TestResult::Fail("ring_info_addr mismatch");
+    }
+    if !parsed.uses_dma_indices() {
+        return TestResult::Fail("uses_dma_indices() should be true");
+    }
+    if !parsed.hostrdy_db1() {
+        return TestResult::Fail("hostrdy_db1() should be true");
+    }
+    if parsed.pre_v7() != true {
+        return TestResult::Fail("v6 firmware is pre_v7()");
+    }
+    buf[34..36].copy_from_slice(&0u16.to_le_bytes());
+    let saturated = SharedInfo::parse(&buf).unwrap();
+    if saturated.max_rxbufpost != DEF_MAX_RXBUFPOST {
+        return TestResult::Fail("max_rxbufpost 0 should saturate to default 255");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_shared_info_decode_v6
+);
+
+fn smoke_brcmfmac_shared_info_rejects_bad_version() -> TestResult {
+    use super::shared::SharedInfo;
+    let mut buf = [0u8; 96];
+    buf[0..4].copy_from_slice(&99u32.to_le_bytes());
+    if SharedInfo::parse(&buf).is_some() {
+        return TestResult::Fail("version 99 should be rejected");
+    }
+    buf[0..4].copy_from_slice(&4u32.to_le_bytes());
+    if SharedInfo::parse(&buf).is_some() {
+        return TestResult::Fail("version 4 should be rejected");
+    }
+    if SharedInfo::parse(&[0u8; 8]).is_some() {
+        return TestResult::Fail("short buffer should be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_shared_info_rejects_bad_version
+);
+
+fn smoke_brcmfmac_ring_info_decode() -> TestResult {
+    use super::shared::{RingInfo, RINGINFO_SIZE};
+    let mut buf = [0u8; RINGINFO_SIZE];
+    buf[0..4].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&0x00FFu32.to_le_bytes());
+    buf[8..12].copy_from_slice(&0x0100u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0x0101u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&0x0102u32.to_le_bytes());
+    buf[52..54].copy_from_slice(&5u16.to_le_bytes());
+    buf[54..56].copy_from_slice(&5u16.to_le_bytes());
+    buf[56..58].copy_from_slice(&3u16.to_le_bytes());
+
+    let info = match RingInfo::parse(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("RingInfo::parse returned None"),
+    };
+    if info.ringmem != 0x0040_0000 {
+        return TestResult::Fail("ringmem TCM addr mismatch");
+    }
+    if info.max_flowrings != 5 || info.max_submissionrings != 5 || info.max_completionrings != 3 {
+        return TestResult::Fail("ring counts mismatch");
+    }
+    if RingInfo::parse(&buf[..RINGINFO_SIZE - 1]).is_some() {
+        return TestResult::Fail("RingInfo::parse on too-small buffer should fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_ring_info_decode);
+
+fn smoke_brcmfmac_ring_mem_entry_decode() -> TestResult {
+    use super::shared::{RingMemEntry, RING_MEM_SZ};
+    let mut buf = [0u8; RING_MEM_SZ as usize];
+    buf[4..6].copy_from_slice(&64u16.to_le_bytes());
+    buf[6..8].copy_from_slice(&63u16.to_le_bytes());
+    buf[8..16].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+
+    let e = match RingMemEntry::parse(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("RingMemEntry::parse returned None"),
+    };
+    if e.max_item != 64 {
+        return TestResult::Fail("ring mem max_item mismatch");
+    }
+    if e.len_items != 63 {
+        return TestResult::Fail("ring mem len_items mismatch");
+    }
+    if e.base_addr != 0xDEAD_BEEF_CAFE_BABE {
+        return TestResult::Fail("ring mem base_addr mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_ring_mem_entry_decode
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");
