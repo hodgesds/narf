@@ -34,7 +34,7 @@ use crate::arp_cache;
 use crate::iface;
 use crate::pkt::{
     self, parse_arp, parse_eth_header, parse_ipv4, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ETH_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
+    ETHERTYPE_IPV4, ETH_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
 };
 
 pub use crate::tcp::core::{
@@ -152,18 +152,55 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
 }
 
 fn handle_ipv4(body: &[u8]) {
+    // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
+    //
+    // Copy the L3 packet into a mutable scratch buffer so hooks
+    // (conntrack, NAT, filter) can rewrite addresses / ports in
+    // place. If PRE_ROUTING returns Drop the packet is dropped here;
+    // otherwise we continue with the (possibly mutated) packet. For
+    // a locally-destined packet we then dispatch LOCAL_IN before
+    // handing to the L4 receiver.
+    //
+    // Matches Linux's NF_HOOK call from `ip_rcv_core()` →
+    // `ip_rcv_finish()` in `net/ipv4/ip_input.c`.
+    if body.len() < crate::netfilter::IPV4_MIN_HDR_LEN {
+        return;
+    }
+    let mut scratch: alloc::vec::Vec<u8> = body.to_vec();
+    {
+        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
+            crate::netfilter::HookPoint::PreRouting,
+            "", "", &mut scratch,
+        );
+        if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
+            return;
+        }
+    }
+    {
+        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
+            crate::netfilter::HookPoint::LocalIn,
+            "", "", &mut scratch,
+        );
+        if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
+            return;
+        }
+    }
+    let body = &scratch[..];
     let (ip, payload) = match parse_ipv4(body) {
         Some(t) => t,
         None => return,
     };
+    // TTL is at byte offset 8 in the raw IPv4 header.
+    let ttl = if body.len() >= 9 { body[8] } else { 64 };
     match ip.protocol {
         IP_PROTO_TCP => crate::tcp::core::handle_segment(ip.src_ip, ip.dst_ip, payload),
-        IP_PROTO_UDP => handle_udp(ip.src_ip, ip.dst_ip, payload),
+        IP_PROTO_UDP => handle_udp(ip.src_ip, ip.dst_ip, payload, ttl),
+        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx(ip.src_ip, ip.dst_ip, payload),
         _ => {}
     }
 }
 
-fn handle_udp(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8]) {
+fn handle_udp(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     if datagram.len() < 8 {
         return;
     }
@@ -175,6 +212,9 @@ fn handle_udp(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8]) {
         return;
     }
     let payload = &datagram[8..end];
+    // Deliver to registered UDP sockets (udp_sock layer).
+    crate::udp_sock::deliver(src_ip, dst_ip, datagram, ttl);
+    // Legacy per-protocol consumers.
     if dst_port == 68 {
         crate::dhcp::on_udp_in(src_ip, dst_ip, src_port, dst_port, payload);
     }
