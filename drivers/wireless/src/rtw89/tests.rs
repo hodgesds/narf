@@ -16,6 +16,12 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::btc::{
+    build_btc_set_cmd, encode_cxhdr, encode_cxhdr_v7, make_btc_ctrl_h2c, make_btc_init_h2c,
+    make_btc_run_h2c, make_btc_set_h2c, BTFC_FW_EVENT, BTFC_GET, BTFC_SET, CXDRVINFO_CTRL,
+    CXDRVINFO_INIT, CXDRVINFO_ROLE, CXDRVINFO_RUN, CXDRVINFO_SCAN, CXDRVINFO_TRX, CXHDR_LEN,
+    CXHDR_V7_LEN, SET_DRV_INFO, SET_REPORT_EN,
+};
 use super::chan::{
     freq_to_band_chan, Band, JoinInfo, DEFAULT_BAND, DEFAULT_CHAN, DEFAULT_FREQ_MHZ,
     JOININFO_W0_BAND, JOININFO_W0_ISHESTA, JOININFO_W0_MACID_MASK, JOININFO_W0_NET_TYPE_SHIFT,
@@ -1273,6 +1279,150 @@ fn smoke_rtw89_freq_to_band_chan() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_freq_to_band_chan);
+
+// ── Stage-10: BT-coex H2C ──────────────────────────────────────────
+
+fn smoke_rtw89_btc_class_constants() -> TestResult {
+    if BTFC_SET != 0x10 {
+        return TestResult::Fail("BTFC_SET drift");
+    }
+    if BTFC_GET != 0x11 {
+        return TestResult::Fail("BTFC_GET drift");
+    }
+    if BTFC_FW_EVENT != 0x12 {
+        return TestResult::Fail("BTFC_FW_EVENT drift");
+    }
+    // CXDRVINFO sub-types pinned vs fw.h:2379.
+    if CXDRVINFO_INIT != 0 {
+        return TestResult::Fail("INIT drift");
+    }
+    if CXDRVINFO_ROLE != 1 {
+        return TestResult::Fail("ROLE drift");
+    }
+    if CXDRVINFO_RUN != 5 {
+        return TestResult::Fail("RUN drift");
+    }
+    if CXDRVINFO_CTRL != 6 {
+        return TestResult::Fail("CTRL drift");
+    }
+    if CXDRVINFO_SCAN != 7 {
+        return TestResult::Fail("SCAN drift");
+    }
+    if CXDRVINFO_TRX != 8 {
+        return TestResult::Fail("TRX drift");
+    }
+    // SET sub-commands.
+    if SET_REPORT_EN != 0 {
+        return TestResult::Fail("SET_REPORT_EN drift");
+    }
+    if SET_DRV_INFO != 5 {
+        return TestResult::Fail("SET_DRV_INFO drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_btc_class_constants);
+
+fn smoke_rtw89_btc_cxhdr_encode() -> TestResult {
+    let mut buf = [0u8; 4];
+    if encode_cxhdr(0x42, 16, &mut buf).is_none() {
+        return TestResult::Fail("encode_cxhdr None");
+    }
+    if buf[0] != 0x42 {
+        return TestResult::Fail("cxhdr type wrong");
+    }
+    if buf[1] != 16 {
+        return TestResult::Fail("cxhdr len wrong");
+    }
+    if CXHDR_LEN != 2 {
+        return TestResult::Fail("CXHDR_LEN drift");
+    }
+    // v7 encoder: 3 bytes (type, ver, len).
+    let mut v7 = [0u8; 4];
+    if encode_cxhdr_v7(0x55, 7, 32, &mut v7).is_none() {
+        return TestResult::Fail("encode_cxhdr_v7 None");
+    }
+    if v7[0] != 0x55 || v7[1] != 7 || v7[2] != 32 {
+        return TestResult::Fail("v7 cxhdr wrong");
+    }
+    if CXHDR_V7_LEN != 3 {
+        return TestResult::Fail("CXHDR_V7_LEN drift");
+    }
+    // Tiny buffer.
+    let mut t = [0u8; 1];
+    if encode_cxhdr(0, 0, &mut t).is_some() {
+        return TestResult::Fail("accepted 1-byte cxhdr buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_btc_cxhdr_encode);
+
+fn smoke_rtw89_btc_prebuilt_helpers() -> TestResult {
+    // INIT should request done_ack.
+    let h = make_btc_init_h2c(0);
+    if !h.done_ack {
+        return TestResult::Fail("INIT not done_ack");
+    }
+    if h.func != CXDRVINFO_INIT {
+        return TestResult::Fail("INIT wrong func");
+    }
+    // CTRL no ack by default.
+    let h = make_btc_ctrl_h2c(0);
+    if h.done_ack {
+        return TestResult::Fail("CTRL should not done_ack");
+    }
+    // RUN should done_ack.
+    let h = make_btc_run_h2c(0);
+    if !h.done_ack {
+        return TestResult::Fail("RUN not done_ack");
+    }
+    // make_btc_set_h2c uses BTFC_SET class.
+    let h = make_btc_set_h2c(CXDRVINFO_SCAN, 0);
+    if h.class != BTFC_SET {
+        return TestResult::Fail("SET class wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_btc_prebuilt_helpers);
+
+fn smoke_rtw89_btc_full_cmd_build() -> TestResult {
+    // Build a complete CTRL command with a 4-byte payload.
+    let payload = [0x10, 0x20, 0x30, 0x40];
+    let mut buf = [0u8; 64];
+    let total = match build_btc_set_cmd(CXDRVINFO_CTRL, 5, &payload, &mut buf) {
+        Some(n) => n,
+        None => return TestResult::Fail("build_btc_set_cmd None"),
+    };
+    // H2C header 8 + CXHDR 2 + payload 4 = 14.
+    if total != 14 {
+        return TestResult::Fail("btc total length wrong");
+    }
+    // H2C header dword 0: cat=OUTSRC (2), class=BTFC_SET (0x10).
+    let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if dw0 & 0x3 != 2 {
+        return TestResult::Fail("btc cat not OUTSRC");
+    }
+    if (dw0 >> 2) & 0x3F != BTFC_SET as u32 {
+        return TestResult::Fail("btc class not SET");
+    }
+    // CXHDR follows at buf[8..10].
+    if buf[8] != CXDRVINFO_CTRL {
+        return TestResult::Fail("CXHDR type not CTRL");
+    }
+    if buf[9] != 4 {
+        return TestResult::Fail("CXHDR len not 4");
+    }
+    // Payload at buf[10..14].
+    if buf[10..14] != payload {
+        return TestResult::Fail("btc payload mis-placed");
+    }
+    // Too-small output buffer.
+    let mut tiny = [0u8; 4];
+    if build_btc_set_cmd(CXDRVINFO_CTRL, 5, &payload, &mut tiny).is_some() {
+        return TestResult::Fail("accepted tiny buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_btc_full_cmd_build);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //
