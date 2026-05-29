@@ -374,3 +374,511 @@ fn smoke_rtl8xxxu_chip_family_from_usb_id() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_chip_family_from_usb_id);
+
+// ── 9. phy_tables sentinel + apply-loop semantics ──────────────────
+
+fn smoke_rtl8xxxu_phy_tables_apply_loops() -> TestResult {
+    use super::phy_tables::{
+        MacRow, PhyRow, RfRow,
+        apply_mac_table, apply_phy_table, apply_rf_table,
+        live_rows_mac, live_rows_phy, live_rows_rf,
+    };
+
+    // Sentinel detection.
+    if !MacRow::SENTINEL.is_sentinel() {
+        return TestResult::Fail("MacRow::SENTINEL not is_sentinel");
+    }
+    if !RfRow::SENTINEL.is_sentinel() {
+        return TestResult::Fail("RfRow::SENTINEL not is_sentinel");
+    }
+
+    // MAC apply-loop: 3 rows + sentinel.
+    let mac_table: &[MacRow] = &[
+        MacRow { reg: 0x100, val: 0x11 },
+        MacRow { reg: 0x101, val: 0x22 },
+        MacRow { reg: 0x102, val: 0x33 },
+        MacRow::SENTINEL,
+        // Sentinel should stop the loop — these rows must not be applied.
+        MacRow { reg: 0x900, val: 0xFF },
+    ];
+    if live_rows_mac(mac_table) != 3 {
+        return TestResult::Fail("MAC live_rows != 3");
+    }
+    let mut count = 0usize;
+    let n = apply_mac_table(mac_table, |_r, _v| count += 1);
+    if n != 3 || count != 3 {
+        return TestResult::Fail("apply_mac_table call count wrong");
+    }
+
+    // PHY apply-loop: 2 rows + sentinel.
+    let phy_table: &[PhyRow] = &[
+        PhyRow { reg: 0x800, val: 0xDEADBEEF },
+        PhyRow { reg: 0x804, val: 0xCAFEBABE },
+        PhyRow::SENTINEL,
+    ];
+    if live_rows_phy(phy_table) != 2 {
+        return TestResult::Fail("PHY live_rows != 2");
+    }
+    let mut sum = 0u64;
+    let n2 = apply_phy_table(phy_table, |r, v| sum += (r as u64) + (v as u64));
+    if n2 != 2 {
+        return TestResult::Fail("apply_phy_table count wrong");
+    }
+    let expected = 0x800u64 + 0xDEADBEEFu64 + 0x804u64 + 0xCAFEBABEu64;
+    if sum != expected {
+        return TestResult::Fail("apply_phy_table sum wrong");
+    }
+
+    // RF apply-loop: 4 rows + sentinel.
+    let rf_table: &[RfRow] = &[
+        RfRow { reg: 0x00, val: 0x00030000 },
+        RfRow { reg: 0x18, val: 0x00000407 },
+        RfRow { reg: 0x1E, val: 0x00080009 },
+        RfRow { reg: 0x1F, val: 0x00000880 },
+        RfRow::SENTINEL,
+    ];
+    if live_rows_rf(rf_table) != 4 {
+        return TestResult::Fail("RF live_rows != 4");
+    }
+    let mut rcount = 0usize;
+    let n3 = apply_rf_table(rf_table, |_r, _v| rcount += 1);
+    if n3 != 4 || rcount != 4 {
+        return TestResult::Fail("apply_rf_table count wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_phy_tables_apply_loops);
+
+// ── 10. 8188EU per-chip integration ────────────────────────────────
+
+fn smoke_rtl8xxxu_8188eu_per_chip() -> TestResult {
+    use super::rtl8188e;
+
+    // Row-count constants — match Linux 8188e.c.
+    if rtl8188e::N_MAC_ROWS != 83 {
+        return TestResult::Fail("8188e N_MAC_ROWS != 83");
+    }
+    if rtl8188e::N_PHY_ROWS != 195 {
+        return TestResult::Fail("8188e N_PHY_ROWS != 195");
+    }
+    if rtl8188e::N_AGC_ROWS != 130 {
+        return TestResult::Fail("8188e N_AGC_ROWS != 130");
+    }
+    if rtl8188e::N_RF_A_ROWS != 80 {
+        return TestResult::Fail("8188e N_RF_A_ROWS != 80");
+    }
+    if rtl8188e::NUM_RF_PATHS != 1 {
+        return TestResult::Fail("8188e is 1T1R");
+    }
+
+    // IQK shape.
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
+                   rtl8188e::IQK_PATH_A_STEP_COUNT];
+    let n = rtl8188e::build_iqk_path_a_sequence(&mut iqk);
+    if n != 7 {
+        return TestResult::Fail("8188e IQK step count != 7");
+    }
+    if rtl8188e::IQK_RETRY != 2 {
+        return TestResult::Fail("8188e IQK_RETRY != 2");
+    }
+    if rtl8188e::IQK_ITERATIONS != 3 {
+        return TestResult::Fail("8188e IQK_ITERATIONS != 3");
+    }
+    // Pass predicate: clean inputs pass.
+    if !rtl8188e::iqk_passed(0, 0, 0) {
+        return TestResult::Fail("8188e iqk_passed(0,0,0) should pass");
+    }
+    // Reject fingerprint should fail.
+    if rtl8188e::iqk_passed(0, 0x01420000, 0) {
+        return TestResult::Fail("8188e iqk_passed should reject E94 fingerprint");
+    }
+    if rtl8188e::iqk_passed(rtl8188e::IQK_PASS_BIT_EAC, 0, 0) {
+        return TestResult::Fail("8188e iqk_passed should reject EAC bit 28");
+    }
+
+    // Channel range 2.4 GHz only.
+    if !rtl8188e::channel_valid(1) || !rtl8188e::channel_valid(14) {
+        return TestResult::Fail("8188e channel 1 and 14 should be valid");
+    }
+    if rtl8188e::channel_valid(36) {
+        return TestResult::Fail("8188e ch 36 (5G) should NOT be valid");
+    }
+
+    // Channel set: 1 LSSI write.
+    let cs = rtl8188e::channel_set_writes_8188e(6);
+    if cs.len() != 1 {
+        return TestResult::Fail("8188e channel set should emit 1 write");
+    }
+
+    // init_mac / init_phy / init_rf with empty tables: should be 0 ops.
+    let mut count = 0usize;
+    let _ = rtl8188e::init_mac(|_r, _v| count += 1);
+    let _ = rtl8188e::init_phy(|_r, _v| count += 1);
+    let _ = rtl8188e::init_rf(|_r, _v| count += 1);
+    if count != 0 {
+        return TestResult::Fail("8188e empty tables should not invoke writer");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8188eu_per_chip);
+
+// ── 11. 8192EU per-chip integration ────────────────────────────────
+
+fn smoke_rtl8xxxu_8192eu_per_chip() -> TestResult {
+    use super::rtl8192e;
+
+    if rtl8192e::N_MAC_ROWS != 99 {
+        return TestResult::Fail("8192e N_MAC_ROWS != 99");
+    }
+    if rtl8192e::N_PHY_ROWS != 260 {
+        return TestResult::Fail("8192e N_PHY_ROWS != 260");
+    }
+    if rtl8192e::N_AGC_STD_ROWS != 135 {
+        return TestResult::Fail("8192e N_AGC_STD_ROWS != 135");
+    }
+    if rtl8192e::N_RF_A_ROWS != 155 {
+        return TestResult::Fail("8192e N_RF_A_ROWS != 155");
+    }
+    if rtl8192e::N_RF_B_ROWS != 140 {
+        return TestResult::Fail("8192e N_RF_B_ROWS != 140");
+    }
+    if rtl8192e::NUM_RF_PATHS != 2 {
+        return TestResult::Fail("8192e is 2T2R");
+    }
+    if rtl8192e::LC_CAL_PATH_COUNT != 2 {
+        return TestResult::Fail("8192e LC cal both paths");
+    }
+
+    // IQK both paths.
+    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 };
+                     rtl8192e::IQK_PATH_A_STEP_COUNT];
+    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 };
+                     rtl8192e::IQK_PATH_B_STEP_COUNT];
+    if rtl8192e::build_iqk_path_a_sequence(&mut iqk_a) != 8 {
+        return TestResult::Fail("8192e IQK_A step count != 8");
+    }
+    if rtl8192e::build_iqk_path_b_sequence(&mut iqk_b) != 8 {
+        return TestResult::Fail("8192e IQK_B step count != 8");
+    }
+
+    // Dual-path channel set.
+    let cs = rtl8192e::channel_set_writes_8192e(11);
+    if cs.len() != 2 {
+        return TestResult::Fail("8192e channel set should emit 2 writes (A+B)");
+    }
+
+    if !rtl8192e::channel_valid(6) {
+        return TestResult::Fail("8192e ch 6 valid");
+    }
+    if rtl8192e::channel_valid(36) {
+        return TestResult::Fail("8192e is 2.4 GHz only");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8192eu_per_chip);
+
+// ── 12. 8723BU per-chip integration ────────────────────────────────
+
+fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
+    use super::rtl8723b;
+
+    if rtl8723b::N_MAC_ROWS != 95 {
+        return TestResult::Fail("8723b N_MAC_ROWS != 95");
+    }
+    if rtl8723b::N_PHY_ROWS != 200 {
+        return TestResult::Fail("8723b N_PHY_ROWS != 200");
+    }
+    if rtl8723b::N_RF_A_ROWS != 155 {
+        return TestResult::Fail("8723b N_RF_A_ROWS != 155");
+    }
+    if rtl8723b::NUM_RF_PATHS != 1 {
+        return TestResult::Fail("8723b is 1T1R");
+    }
+
+    // IQK shape — gen2 has 10 steps.
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
+                   rtl8723b::IQK_PATH_A_STEP_COUNT];
+    if rtl8723b::build_iqk_path_a_sequence(&mut iqk) != 10 {
+        return TestResult::Fail("8723b IQK step count != 10");
+    }
+
+    // LC-cal sequence: pre, mid, post writes (3 entries).
+    let lc = rtl8723b::lc_calibrate_sequence_8723b();
+    if lc.len() != 3 {
+        return TestResult::Fail("8723b LC cal != 3 writes");
+    }
+    if lc[0].0 != 0xB0 || lc[2].0 != 0xB0 {
+        return TestResult::Fail("8723b LC cal pre/post should target RF reg 0xB0");
+    }
+    if rtl8723b::LC_CAL_HOLD_MS != 200 {
+        return TestResult::Fail("8723b LC cal hold should be 200 ms");
+    }
+    if rtl8723b::LC_CAL_INIT_VAL != 0xDFBE0 {
+        return TestResult::Fail("8723b LC init val mismatch");
+    }
+    if rtl8723b::LC_CAL_FINAL_VAL != 0xDFFE0 {
+        return TestResult::Fail("8723b LC final val mismatch");
+    }
+
+    // 2.4 GHz only.
+    if !rtl8723b::channel_valid(6) {
+        return TestResult::Fail("8723b ch 6 valid");
+    }
+    if rtl8723b::channel_valid(36) {
+        return TestResult::Fail("8723b is 2.4 GHz only");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8723bu_per_chip);
+
+// ── 13. 8723BU BT coex decision matrix ─────────────────────────────
+
+fn smoke_rtl8xxxu_8723bu_bt_coex() -> TestResult {
+    use super::btcoex::{
+        Bt8723b1AntStatus, BtLinkProfile, coex_table_write_for_type, coex_type_for_state,
+        REG_BT_COEX_TABLE1, REG_BT_COEX_TABLE2, REG_BT_COEX_TABLE3, REG_BT_COEX_TABLE4,
+    };
+
+    // Coex register addresses.
+    if REG_BT_COEX_TABLE1 != 0x06C0 { return TestResult::Fail("table1 addr"); }
+    if REG_BT_COEX_TABLE2 != 0x06C4 { return TestResult::Fail("table2 addr"); }
+    if REG_BT_COEX_TABLE3 != 0x06C8 { return TestResult::Fail("table3 addr"); }
+    if REG_BT_COEX_TABLE4 != 0x06CC { return TestResult::Fail("table4 addr"); }
+
+    // Decision matrix: idle -> type 0, inq -> type 2, sco -> type 7.
+    let p = BtLinkProfile::default();
+    if coex_type_for_state(Bt8723b1AntStatus::NonConnectedIdle, p) != 0 {
+        return TestResult::Fail("NonConnectedIdle should be type 0");
+    }
+    if coex_type_for_state(Bt8723b1AntStatus::ConnectedIdle, p) != 0 {
+        return TestResult::Fail("ConnectedIdle should be type 0");
+    }
+    if coex_type_for_state(Bt8723b1AntStatus::InqPage, p) != 2 {
+        return TestResult::Fail("InqPage should be type 2");
+    }
+    if coex_type_for_state(Bt8723b1AntStatus::ScoBusy, p) != 7 {
+        return TestResult::Fail("ScoBusy should be type 7");
+    }
+    if coex_type_for_state(Bt8723b1AntStatus::AclScoBusy, p) != 7 {
+        return TestResult::Fail("AclScoBusy should be type 7");
+    }
+
+    // ACL busy + a2dp-only -> type 5.
+    let p_a2dp = BtLinkProfile { has_a2dp: true, a2dp_only: true, ..Default::default() };
+    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_a2dp) != 5 {
+        return TestResult::Fail("AclBusy + a2dp_only should be type 5");
+    }
+    // ACL busy + hid-only -> type 4.
+    let p_hid = BtLinkProfile { has_hid: true, hid_only: true, ..Default::default() };
+    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_hid) != 4 {
+        return TestResult::Fail("AclBusy + hid_only should be type 4");
+    }
+    // ACL busy + hid + a2dp -> type 6.
+    let p_hid_a2dp = BtLinkProfile {
+        has_hid: true, has_a2dp: true, ..Default::default()
+    };
+    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_hid_a2dp) != 6 {
+        return TestResult::Fail("AclBusy + hid+a2dp should be type 6");
+    }
+    // ACL busy + nothing -> type 3.
+    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p) != 3 {
+        return TestResult::Fail("AclBusy default should be type 3");
+    }
+
+    // CoexTableWrite: table4 always 0x03 per Linux.
+    for ct in 0..=7u8 {
+        let w = coex_table_write_for_type(ct);
+        if w.table4 != 0x03 {
+            return TestResult::Fail("coex_table4 should always be 0x03");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8723bu_bt_coex);
+
+// ── 14. 8821CU per-chip integration + 5 GHz ────────────────────────
+
+fn smoke_rtl8xxxu_8821cu_per_chip() -> TestResult {
+    use super::rtl8821c;
+
+    if rtl8821c::N_PHY_ROWS != 480 {
+        return TestResult::Fail("8821c N_PHY_ROWS != 480");
+    }
+    if rtl8821c::N_RF_A_ROWS != 230 {
+        return TestResult::Fail("8821c N_RF_A_ROWS != 230");
+    }
+    if rtl8821c::NUM_RF_PATHS != 1 {
+        return TestResult::Fail("8821c is 1T1R");
+    }
+
+    // 5 GHz support.
+    if !rtl8821c::channel_valid(36) {
+        return TestResult::Fail("8821c ch 36 should be valid (5G)");
+    }
+    if !rtl8821c::channel_valid(149) {
+        return TestResult::Fail("8821c ch 149 should be valid (5G UNII-3)");
+    }
+    if !rtl8821c::channel_is_5ghz(36) {
+        return TestResult::Fail("ch 36 is_5ghz");
+    }
+    if rtl8821c::channel_is_5ghz(6) {
+        return TestResult::Fail("ch 6 is_5ghz should be false");
+    }
+
+    // Channel 36 = 5180 MHz (bring-up brief target).
+    if rtl8821c::channel_freq_mhz_8821c(36) != 5180 {
+        return TestResult::Fail("ch 36 must decode to 5180 MHz");
+    }
+    if rtl8821c::channel_freq_mhz_8821c(6) != 2437 {
+        return TestResult::Fail("ch 6 must decode to 2437 MHz");
+    }
+
+    // 5 GHz channel set: 2 writes (band-switch + LSSI).
+    let cs5 = rtl8821c::channel_set_writes_8821c(36);
+    if cs5.len() != 2 {
+        return TestResult::Fail("8821c 5GHz channel set: 2 writes (band+LSSI)");
+    }
+    // 2.4 GHz channel set: 1 write (LSSI only).
+    let cs2 = rtl8821c::channel_set_writes_8821c(6);
+    if cs2.len() != 1 {
+        return TestResult::Fail("8821c 2.4GHz channel set: 1 write");
+    }
+
+    // IQK shape.
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
+                   rtl8821c::IQK_PATH_A_STEP_COUNT];
+    if rtl8821c::build_iqk_path_a_sequence(&mut iqk) != 12 {
+        return TestResult::Fail("8821c IQK step count != 12");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8821cu_per_chip);
+
+// ── 15. 8822BU per-chip integration + 5 GHz + dual-path ────────────
+
+fn smoke_rtl8xxxu_8822bu_per_chip() -> TestResult {
+    use super::rtl8822b;
+
+    if rtl8822b::N_PHY_ROWS != 520 {
+        return TestResult::Fail("8822b N_PHY_ROWS != 520");
+    }
+    if rtl8822b::N_RF_A_ROWS != 245 || rtl8822b::N_RF_B_ROWS != 245 {
+        return TestResult::Fail("8822b N_RF_*_ROWS != 245");
+    }
+    if rtl8822b::NUM_RF_PATHS != 2 {
+        return TestResult::Fail("8822b is 2T2R");
+    }
+    if rtl8822b::LC_CAL_PATH_COUNT != 2 {
+        return TestResult::Fail("8822b LC cal both paths");
+    }
+
+    // 5 GHz support and ch 36 = 5180.
+    if !rtl8822b::channel_valid(36) {
+        return TestResult::Fail("8822b ch 36 valid");
+    }
+    if rtl8822b::channel_freq_mhz_8822b(36) != 5180 {
+        return TestResult::Fail("8822b ch 36 must be 5180 MHz");
+    }
+    if rtl8822b::channel_freq_mhz_8822b(149) != 5745 {
+        return TestResult::Fail("8822b ch 149 must be 5745 MHz");
+    }
+
+    // 5 GHz channel set: band hint + path A + path B = 3 writes.
+    let cs5 = rtl8822b::channel_set_writes_8822b(36);
+    if cs5.len() != 3 {
+        return TestResult::Fail("8822b 5GHz channel set: 3 writes (band+A+B)");
+    }
+    // 2.4 GHz channel set: path A + path B = 2 writes.
+    let cs2 = rtl8822b::channel_set_writes_8822b(6);
+    if cs2.len() != 2 {
+        return TestResult::Fail("8822b 2.4GHz channel set: 2 writes (A+B)");
+    }
+
+    // IQK both paths — 14 steps each.
+    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 };
+                     rtl8822b::IQK_PATH_A_STEP_COUNT];
+    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 };
+                     rtl8822b::IQK_PATH_B_STEP_COUNT];
+    if rtl8822b::build_iqk_path_a_sequence(&mut iqk_a) != 14 {
+        return TestResult::Fail("8822b IQK_A != 14");
+    }
+    if rtl8822b::build_iqk_path_b_sequence(&mut iqk_b) != 14 {
+        return TestResult::Fail("8822b IQK_B != 14");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8822bu_per_chip);
+
+// ── 16. Channel-set 5180 MHz coverage (8821CU + 8822BU) ────────────
+
+fn smoke_rtl8xxxu_channel_5180_mhz() -> TestResult {
+    use super::phy::channel_freq_mhz;
+    // Shared decoder covers all chips' 2.4 + 5 GHz.
+    if channel_freq_mhz(36) != 5180 {
+        return TestResult::Fail("shared channel_freq_mhz(36) != 5180");
+    }
+    // Verify per-chip decoders agree with shared for ch 36.
+    if super::rtl8821c::channel_freq_mhz_8821c(36) != channel_freq_mhz(36) {
+        return TestResult::Fail("8821c ch36 mismatch");
+    }
+    if super::rtl8822b::channel_freq_mhz_8822b(36) != channel_freq_mhz(36) {
+        return TestResult::Fail("8822b ch36 mismatch");
+    }
+    // 2484 MHz (ch 14, Japan).
+    if channel_freq_mhz(14) != 2484 {
+        return TestResult::Fail("ch 14 != 2484 MHz");
+    }
+    // 5825 MHz (ch 165, UNII-3 top).
+    if channel_freq_mhz(165) != 5825 {
+        return TestResult::Fail("ch 165 != 5825 MHz");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_channel_5180_mhz);
+
+// ── 17. Shared IQ preamble + LC cal sequence shape ─────────────────
+
+fn smoke_rtl8xxxu_iqk_lc_shapes() -> TestResult {
+    use super::phy::{
+        IQK_PREAMBLE_GEN1, IQK_POLL_MAX, IQK_RESTORE_GEN1,
+        lc_calibrate_rf_writes, lssi_encode,
+    };
+
+    // Gen1 IQK preamble should be non-empty.
+    if IQK_PREAMBLE_GEN1.is_empty() {
+        return TestResult::Fail("IQK preamble empty");
+    }
+    if IQK_RESTORE_GEN1.is_empty() {
+        return TestResult::Fail("IQK restore empty");
+    }
+    if IQK_POLL_MAX < 10 {
+        return TestResult::Fail("IQK_POLL_MAX too small");
+    }
+
+    // LC cal: 3 RF writes (per Linux gen1 lc-cal sequence).
+    let lc = lc_calibrate_rf_writes();
+    if lc.len() != 3 {
+        return TestResult::Fail("lc_calibrate_rf_writes != 3");
+    }
+
+    // LSSI encode: 5-bit addr + 20-bit data layout.
+    let w = lssi_encode(0x18, 0xFFFFF);
+    // Bits 24..20 should hold addr (0x18 & 0x1F).
+    if (w >> 20) & 0x1F != 0x18 {
+        return TestResult::Fail("lssi_encode addr bits wrong");
+    }
+    if w & 0xFFFFF != 0xFFFFF {
+        return TestResult::Fail("lssi_encode data bits wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_iqk_lc_shapes);
