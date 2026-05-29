@@ -1936,3 +1936,225 @@ mod i2c_hid_touch_smokes {
     );
 }
 
+// ─── RMI4 core protocol smoke tests ────────────────────────────────
+//
+// Cover the function decoders our hid-rmi / future smbus-rmi
+// drivers chain through. Each smoke uses synthetic byte streams
+// modelled on the public Synaptics RMI4 application notes; no
+// real silicon required.
+
+fn smoke_rmi4_pdt_three_function_walk() -> TestResult {
+    use crate::rmi4_core::{
+        find_function, walk_pdt_page, Rmi4Transport, TransportError, F01_DEVICE_CONTROL,
+        F11_2D_TOUCHPAD, F30_GPIO_LED, PDT_ENTRY_SIZE, PDT_LAST_SLOT_OFFSET,
+    };
+
+    // Fake transport: a 256-byte page with three PDT entries laid
+    // out at offsets PDT_LAST_SLOT_OFFSET, -6, -12 respectively
+    // (F01, F11, F30) and a 0x00 terminator at -18.
+    struct FakePage {
+        bytes: [u8; 256],
+    }
+    impl Rmi4Transport for FakePage {
+        fn read_block(&mut self, addr: u16, dst: &mut [u8]) -> Result<(), TransportError> {
+            let lo = (addr & 0xFF) as usize;
+            if lo + dst.len() > self.bytes.len() {
+                return Err(TransportError::Short);
+            }
+            dst.copy_from_slice(&self.bytes[lo..lo + dst.len()]);
+            Ok(())
+        }
+        fn write_block(&mut self, _addr: u16, _src: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    let mut page = FakePage { bytes: [0u8; 256] };
+    let last = PDT_LAST_SLOT_OFFSET as usize;
+    // F01 entry at PDT_LAST_SLOT_OFFSET.
+    page.bytes[last] = 0x10;     // query base
+    page.bytes[last + 1] = 0x20; // command base
+    page.bytes[last + 2] = 0x30; // control base
+    page.bytes[last + 3] = 0x40; // data base
+    page.bytes[last + 4] = 0x01; // 1 IRQ source, version 0
+    page.bytes[last + 5] = F01_DEVICE_CONTROL;
+    // F11 entry at PDT_LAST_SLOT_OFFSET - 6.
+    let s2 = last - PDT_ENTRY_SIZE;
+    page.bytes[s2] = 0x50;
+    page.bytes[s2 + 1] = 0x60;
+    page.bytes[s2 + 2] = 0x70;
+    page.bytes[s2 + 3] = 0x80;
+    page.bytes[s2 + 4] = 0x02;
+    page.bytes[s2 + 5] = F11_2D_TOUCHPAD;
+    // F30 entry at PDT_LAST_SLOT_OFFSET - 12.
+    let s3 = last - 2 * PDT_ENTRY_SIZE;
+    page.bytes[s3] = 0x90;
+    page.bytes[s3 + 1] = 0xA0;
+    page.bytes[s3 + 2] = 0xB0;
+    page.bytes[s3 + 3] = 0xC0;
+    page.bytes[s3 + 4] = 0x01;
+    page.bytes[s3 + 5] = F30_GPIO_LED;
+    // Terminator (function_number = 0) at the next slot.
+    page.bytes[s3 - PDT_ENTRY_SIZE + 5] = 0x00;
+
+    let table = match walk_pdt_page(&mut page, 0) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("walk_pdt_page returned Err"),
+    };
+    if table.len() != 3 {
+        return TestResult::Fail("expected exactly three PDT entries");
+    }
+    let f01 = match find_function(&table, F01_DEVICE_CONTROL) {
+        Some(e) => e,
+        None => return TestResult::Fail("F01 missing from walk"),
+    };
+    if f01.query_base != 0x10 || f01.data_base != 0x40 {
+        return TestResult::Fail("F01 base register decode wrong");
+    }
+    if find_function(&table, F11_2D_TOUCHPAD).is_none() {
+        return TestResult::Fail("F11 missing from walk");
+    }
+    if find_function(&table, F30_GPIO_LED).is_none() {
+        return TestResult::Fail("F30 missing from walk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/rmi4", smoke_rmi4_pdt_three_function_walk);
+
+fn smoke_rmi4_f01_product_info_decode() -> TestResult {
+    use crate::rmi4_core::{F01ProductInfo, RMI_MANUFACTURER_SYNAPTICS};
+    // 11 query bytes: manuf=1, props=0x10, firmware=0x1234 (LE), date 24/05/29,
+    // tester=0x4242, serial=0xCAFE.
+    let buf = [
+        RMI_MANUFACTURER_SYNAPTICS,
+        0x10,
+        0x34,
+        0x12,
+        24,
+        5,
+        29,
+        0x42,
+        0x42,
+        0xCA,
+        0xFE,
+    ];
+    let p = match F01ProductInfo::decode(&buf) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("decode short"),
+    };
+    if !p.is_synaptics() {
+        return TestResult::Fail("expected Synaptics manuf");
+    }
+    if p.firmware_id != 0x1234 {
+        return TestResult::Fail("firmware id");
+    }
+    if p.year != 24 || p.month != 5 || p.day != 29 {
+        return TestResult::Fail("date");
+    }
+    if p.tester_id != 0x4242 || p.serial != 0xCAFE {
+        return TestResult::Fail("tester/serial");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/rmi4", smoke_rmi4_f01_product_info_decode);
+
+fn smoke_rmi4_f11_finger_decode() -> TestResult {
+    use narf_input::rmi4::{Finger, TouchpadReport};
+    // One finger active. state-byte 0b01 → state=01 (present accurate)
+    // for finger 0. Finger record: x_hi=0x12, y_hi=0x34, packed_lo=0x56
+    // (x_lo=5, y_lo=6), w_x=7, w_y=8 → x = (0x12<<4)|5 = 0x125,
+    // y = (0x34<<4)|6 = 0x346.
+    let mut buf = [0u8; 1 + Finger::REPORT_SIZE];
+    buf[0] = 0b01;
+    buf[1] = 0x12;
+    buf[2] = 0x34;
+    buf[3] = 0x56;
+    buf[4] = 7;
+    buf[5] = 8;
+    let rep = match TouchpadReport::parse(&buf, 1) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("parse"),
+    };
+    let f = rep.fingers[0];
+    if !f.present {
+        return TestResult::Fail("expected present");
+    }
+    if f.x != 0x125 || f.y != 0x346 {
+        return TestResult::Fail("position decode");
+    }
+    if f.w_x != 7 || f.w_y != 8 {
+        return TestResult::Fail("width decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/rmi4", smoke_rmi4_f11_finger_decode);
+
+fn smoke_rmi4_f12_object_decode() -> TestResult {
+    use crate::rmi4_core::{decode_f12_data1, f12_object, F12_OBJECT_SIZE};
+    // Two objects: one FINGER, one PALM. Each 8 bytes.
+    let mut buf = [0u8; 2 * F12_OBJECT_SIZE];
+    // Finger at x=0x0123, y=0x0456, z=0x80, wx=4, wy=5
+    buf[0] = f12_object::FINGER;
+    buf[1] = 0x23;
+    buf[2] = 0x01;
+    buf[3] = 0x56;
+    buf[4] = 0x04;
+    buf[5] = 0x80;
+    buf[6] = 4;
+    buf[7] = 5;
+    // Palm at slot 1
+    buf[8] = f12_object::PALM;
+    buf[9] = 0xAA;
+    buf[10] = 0x0A;
+    buf[11] = 0xBB;
+    buf[12] = 0x0B;
+    buf[13] = 0xFF;
+    buf[14] = 30;
+    buf[15] = 30;
+
+    let objs = match decode_f12_data1(&buf, 2) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("decode_f12_data1"),
+    };
+    if objs.len() != 2 {
+        return TestResult::Fail("expected 2 objects");
+    }
+    if !objs[0].is_touching_finger() {
+        return TestResult::Fail("first object must be touching finger");
+    }
+    if objs[0].x != 0x0123 || objs[0].y != 0x0456 {
+        return TestResult::Fail("finger pos wrong");
+    }
+    if objs[1].object_type != f12_object::PALM {
+        return TestResult::Fail("second object must be palm");
+    }
+    if objs[1].is_touching_finger() {
+        return TestResult::Fail("palm must not be a touching finger");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/rmi4", smoke_rmi4_f12_object_decode);
+
+fn smoke_rmi4_f30_button_bitmap_to_btn_codes() -> TestResult {
+    use crate::rmi4_core::{classic_clickpad_buttons, decode_f30_buttons};
+    // 3 GPIOs, lines 0 and 2 low (left + middle pressed). Active-low
+    // polarity → bitmap = 0b101.
+    let data = [0b1111_1010];
+    let bm = match decode_f30_buttons(&data, 3) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("decode_f30_buttons"),
+    };
+    if bm != 0b101 {
+        return TestResult::Fail("bitmap polarity inversion wrong");
+    }
+    let (l, r, m) = classic_clickpad_buttons(bm);
+    if !l || r || !m {
+        return TestResult::Fail("classic mapping wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/rmi4",
+    smoke_rmi4_f30_button_bitmap_to_btn_codes
+);
+
