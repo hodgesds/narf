@@ -39,7 +39,13 @@
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
-use narf_input::{push_global, InputEvent, PointerButtons, PointerEvent};
+use narf_input::{
+    evdev::{dispatch_rel_to_node, key, rel, DeviceCaps, DeviceNode, ROUTER},
+    push_global, InputEvent, PointerButtons, PointerEvent,
+};
+
+extern crate alloc;
+use alloc::sync::Arc;
 
 use crate::i8042::{PS2_CMD, PS2_DATA, PS2_STATUS};
 
@@ -91,6 +97,14 @@ impl State {
 }
 
 pub static STATE: State = State::new();
+
+/// Evdev device node for the PS/2 mouse. Registered in `init()`.
+static MOUSE_EVDEV_NODE: narf_lib::sync::IrqSafeSpinLock<Option<Arc<DeviceNode>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Raw pointer cache for lock-free IRQ access.
+static MOUSE_NODE_PTR: core::sync::atomic::AtomicPtr<DeviceNode> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 pub fn take_rel_delta() -> (i32, i32) {
     let dx = STATE.rel_dx_acc.swap(0, Ordering::AcqRel);
@@ -232,7 +246,24 @@ pub unsafe fn init() -> Result<(), InitError> {
     let _ = reporting_ok; // tracked via STATE.initialized only; mouse
                           // doesn't have a separate panel atom yet.
     STATE.initialized.store(true, Ordering::Release);
+
+    // Register the PS/2 mouse as an evdev device.
+    let mut caps = DeviceCaps::new();
+    caps.add_rel(rel::REL_X);
+    caps.add_rel(rel::REL_Y);
+    caps.add_key(key::BTN_LEFT);
+    caps.add_key(key::BTN_RIGHT);
+    caps.add_key(key::BTN_MIDDLE);
+    let (_dev_id, node_arc) = ROUTER.register_device(caps);
+    MOUSE_NODE_PTR.store(Arc::as_ptr(&node_arc) as *mut DeviceNode, Ordering::Release);
+    *MOUSE_EVDEV_NODE.lock() = Some(node_arc);
+
     Ok(())
+}
+
+/// Return the evdev `DeviceNode` for the PS/2 mouse if registered.
+pub fn mouse_evdev_node() -> Option<Arc<DeviceNode>> {
+    MOUSE_EVDEV_NODE.lock().clone()
 }
 
 /// IRQ-12 handler. Reads one byte from 0x60, advances the 3-byte
@@ -302,7 +333,16 @@ pub unsafe fn on_irq12() {
     narf_input::I8042_MOUSE_PACKET_COUNT
         .fetch_add(1, Ordering::Relaxed);
 
+    // Legacy global ring (for cursor pump / FB status panel).
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
+
+    // Evdev routing.
+    // SAFETY: pointer written once in init() before IRQs armed; Arc kept alive.
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if !raw.is_null() {
+        let node_ref: &DeviceNode = unsafe { &*raw };
+        dispatch_rel_to_node(node_ref, dx, dy);
+    }
 }
 
 #[doc(hidden)]
@@ -346,4 +386,11 @@ pub fn feed_byte_for_test(byte: u8) {
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
     STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
+    // Evdev routing (also from test feed path).
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if !raw.is_null() {
+        // SAFETY: see on_irq12.
+        let node_ref: &DeviceNode = unsafe { &*raw };
+        dispatch_rel_to_node(node_ref, dx, dy);
+    }
 }

@@ -32,7 +32,13 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
-use narf_input::{push_key, KeyCode};
+use narf_input::{
+    evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceNode, ROUTER},
+    push_key, KeyCode,
+};
+
+extern crate alloc;
+use alloc::sync::Arc;
 
 /// PS/2 keyboard reply bytes (post-command).
 const KBD_ACK: u8 = 0xFA;
@@ -83,6 +89,16 @@ impl State {
 
 /// Singleton driver state.
 pub static STATE: State = State::new();
+
+/// Evdev `DeviceNode` for the i8042 keyboard. Registered in `init()`.
+static KBD_EVDEV_NODE: narf_lib::sync::IrqSafeSpinLock<Option<Arc<DeviceNode>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Cached raw pointer to the DeviceNode for lock-free IRQ access.
+/// Written once in `init()` after Arc is stored; read-only thereafter.
+/// SAFETY: Arc kept alive by KBD_EVDEV_NODE + ROUTER for device lifetime.
+static KBD_NODE_PTR: core::sync::atomic::AtomicPtr<DeviceNode> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Errors from `init`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -314,7 +330,27 @@ pub unsafe fn init() -> Result<(), InitError> {
 
     narf_input::I8042_KBD_SCANNING_OK.store(scanning_ok, Ordering::Release);
     STATE.initialized.store(true, Ordering::Release);
+
+    // Register the i8042 keyboard as an evdev device.
+    let mut caps = DeviceCaps::new();
+    // Full scancode-set-1 range (codes 1..=127) + extended set.
+    for c in 1u16..=127 {
+        caps.add_key(c);
+    }
+    for c in [97u16, 100, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126, 127] {
+        caps.add_key(c);
+    }
+    let _ = key::KEY_A; // ensure import is used
+    let (_dev_id, node_arc) = ROUTER.register_device(caps);
+    KBD_NODE_PTR.store(Arc::as_ptr(&node_arc) as *mut DeviceNode, Ordering::Release);
+    *KBD_EVDEV_NODE.lock() = Some(node_arc);
+
     Ok(())
+}
+
+/// Return the evdev `DeviceNode` for the i8042 keyboard if registered.
+pub fn kbd_evdev_node() -> Option<Arc<DeviceNode>> {
+    KBD_EVDEV_NODE.lock().clone()
 }
 
 /// Translate a single scancode-set-1 make/break byte (without the
@@ -356,13 +392,23 @@ pub unsafe fn on_irq1() {
     let make = byte & 0x7F;
     let extended = STATE.extended.swap(false, Ordering::AcqRel);
     let code = decode(make, extended);
+    // Legacy global ring (for FB status panel / console consumer).
     let _ = push_key(code, pressed);
+
+    // Evdev routing — dispatch to the per-device node if registered.
+    // SAFETY: pointer written once in init() before IRQs armed; Arc
+    // kept alive by KBD_EVDEV_NODE + ROUTER for device lifetime.
+    let raw = KBD_NODE_PTR.load(Ordering::Acquire);
+    if !raw.is_null() {
+        let node_ref: &DeviceNode = unsafe { &*raw };
+        dispatch_key_to_node(node_ref, code as u16, pressed);
+    }
 }
 
 /// Test-only: process a synthetic byte stream through the same
 /// decode + modifier pipeline the IRQ handler uses, without
 /// touching the I/O ports. Each pushed event also lands in the
-/// global ring so consumers can be exercised end-to-end.
+/// global ring AND the evdev node.
 pub fn feed_bytes_for_test(bytes: &[u8]) {
     for &b in bytes {
         if b == 0xE0 {
@@ -374,6 +420,12 @@ pub fn feed_bytes_for_test(bytes: &[u8]) {
         let extended = STATE.extended.swap(false, Ordering::AcqRel);
         let code = decode(make, extended);
         let _ = push_key(code, pressed);
+        let raw = KBD_NODE_PTR.load(Ordering::Acquire);
+        if !raw.is_null() {
+            // SAFETY: same as on_irq1.
+            let node_ref: &DeviceNode = unsafe { &*raw };
+            dispatch_key_to_node(node_ref, code as u16, pressed);
+        }
     }
 }
 
