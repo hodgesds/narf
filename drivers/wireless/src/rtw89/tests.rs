@@ -16,6 +16,13 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::chan::{
+    freq_to_band_chan, Band, JoinInfo, DEFAULT_BAND, DEFAULT_CHAN, DEFAULT_FREQ_MHZ,
+    JOININFO_W0_BAND, JOININFO_W0_ISHESTA, JOININFO_W0_MACID_MASK, JOININFO_W0_NET_TYPE_SHIFT,
+    JOININFO_W0_OP, JOININFO_W0_PORT_ID_SHIFT, JOININFO_W0_SELF_ROLE_SHIFT, JOININFO_W0_WIFI_ROLE_SHIFT,
+    NET_TYPE_AP_MODE, NET_TYPE_INFRA, NET_TYPE_NO_LINK, SELF_ROLE_CLIENT, SELF_ROLE_NONE,
+    WIFI_ROLE_STATION,
+};
 use super::phy_table::{
     pd, pp, pw, tx_pwr_clamp, PhyEntry, PhyOp, TxPwrByRate, BB_RF_BOOTSTRAP_TABLE,
     TXPWR_BYRATE_TABLE_SIZE,
@@ -1124,6 +1131,148 @@ fn smoke_rtw89_txpwr_table_size() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_txpwr_table_size);
+
+// ── Stage-9: Channel set + JOININFO encoder ────────────────────────
+
+fn smoke_rtw89_joininfo_constants() -> TestResult {
+    // Pin field masks from fw.h:1815..1827.
+    if JOININFO_W0_MACID_MASK != 0xFF {
+        return TestResult::Fail("MACID mask drift");
+    }
+    if JOININFO_W0_OP != 1 << 8 {
+        return TestResult::Fail("OP bit drift");
+    }
+    if JOININFO_W0_BAND != 1 << 9 {
+        return TestResult::Fail("BAND bit drift");
+    }
+    if JOININFO_W0_ISHESTA != 1 << 13 {
+        return TestResult::Fail("ISHESTA bit drift");
+    }
+    if JOININFO_W0_PORT_ID_SHIFT != 21 {
+        return TestResult::Fail("PORT_ID shift drift");
+    }
+    if JOININFO_W0_NET_TYPE_SHIFT != 24 {
+        return TestResult::Fail("NET_TYPE shift drift");
+    }
+    if JOININFO_W0_WIFI_ROLE_SHIFT != 26 {
+        return TestResult::Fail("WIFI_ROLE shift drift");
+    }
+    if JOININFO_W0_SELF_ROLE_SHIFT != 30 {
+        return TestResult::Fail("SELF_ROLE shift drift");
+    }
+    // Net-type enum.
+    if NET_TYPE_NO_LINK != 0 || NET_TYPE_INFRA != 2 || NET_TYPE_AP_MODE != 3 {
+        return TestResult::Fail("NET_TYPE values drift");
+    }
+    // Wi-Fi role / Self role values.
+    if WIFI_ROLE_STATION != 0 || SELF_ROLE_NONE != 0 || SELF_ROLE_CLIENT != 1 {
+        return TestResult::Fail("role enum drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_joininfo_constants);
+
+fn smoke_rtw89_joininfo_for_assoc() -> TestResult {
+    let info = JoinInfo::for_assoc(5);
+    let w0 = info.encode_w0();
+    // MAC id 5 in low byte.
+    if w0 & 0xFF != 5 {
+        return TestResult::Fail("MAC id mis-encoded");
+    }
+    // OP bit must be 0 (it's an assoc).
+    if w0 & JOININFO_W0_OP != 0 {
+        return TestResult::Fail("OP bit set on assoc");
+    }
+    // ISHESTA must be set.
+    if w0 & JOININFO_W0_ISHESTA == 0 {
+        return TestResult::Fail("ISHESTA not set on 11ax assoc");
+    }
+    // NET_TYPE = INFRA in bits[25:24] = 0b10.
+    let net = (w0 >> JOININFO_W0_NET_TYPE_SHIFT) & 0x3;
+    if net != NET_TYPE_INFRA as u32 {
+        return TestResult::Fail("NET_TYPE not INFRA");
+    }
+    // SELF_ROLE = CLIENT in bits[31:30] = 0b01.
+    let sr = (w0 >> JOININFO_W0_SELF_ROLE_SHIFT) & 0x3;
+    if sr != SELF_ROLE_CLIENT as u32 {
+        return TestResult::Fail("SELF_ROLE not CLIENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_joininfo_for_assoc);
+
+fn smoke_rtw89_joininfo_for_disconnect() -> TestResult {
+    let info = JoinInfo::for_disconnect(7);
+    let w0 = info.encode_w0();
+    if w0 & 0xFF != 7 {
+        return TestResult::Fail("MAC id mis-encoded on disc");
+    }
+    // OP bit must be set.
+    if w0 & JOININFO_W0_OP == 0 {
+        return TestResult::Fail("OP bit not set on disc");
+    }
+    // NET_TYPE = NO_LINK (0).
+    let net = (w0 >> JOININFO_W0_NET_TYPE_SHIFT) & 0x3;
+    if net != NET_TYPE_NO_LINK as u32 {
+        return TestResult::Fail("NET_TYPE not NO_LINK on disc");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_joininfo_for_disconnect);
+
+fn smoke_rtw89_joininfo_into_bytes() -> TestResult {
+    let info = JoinInfo::for_assoc(0x42);
+    let mut buf = [0u8; 8];
+    if info.encode_into(&mut buf).is_none() {
+        return TestResult::Fail("encode_into None");
+    }
+    // Re-decode the dword.
+    let decoded = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if decoded != info.encode_w0() {
+        return TestResult::Fail("encode_into not round-trip");
+    }
+    // Refuse a too-small buffer.
+    let mut tiny = [0u8; 2];
+    if info.encode_into(&mut tiny).is_some() {
+        return TestResult::Fail("accepted 2-byte buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_joininfo_into_bytes);
+
+fn smoke_rtw89_freq_to_band_chan() -> TestResult {
+    // 2.4 GHz: 2412 = ch1, 2462 = ch11, 2484 = ch14.
+    if freq_to_band_chan(2412) != Some((Band::G24, 1)) {
+        return TestResult::Fail("2412 not ch1");
+    }
+    if freq_to_band_chan(2462) != Some((Band::G24, 11)) {
+        return TestResult::Fail("2462 not ch11");
+    }
+    if freq_to_band_chan(2484) != Some((Band::G24, 14)) {
+        return TestResult::Fail("2484 not ch14");
+    }
+    // 5 GHz: 5180 = ch36, 5825 = ch165.
+    if freq_to_band_chan(5180) != Some((Band::G5, 36)) {
+        return TestResult::Fail("5180 not ch36");
+    }
+    if freq_to_band_chan(5825) != Some((Band::G5, 165)) {
+        return TestResult::Fail("5825 not ch165");
+    }
+    // 6 GHz: 5955 = ch1.
+    if freq_to_band_chan(5955) != Some((Band::G6, 1)) {
+        return TestResult::Fail("5955 not ch1 (G6)");
+    }
+    // Garbage freq.
+    if freq_to_band_chan(3000).is_some() {
+        return TestResult::Fail("3000 should be invalid");
+    }
+    // Defaults.
+    if DEFAULT_FREQ_MHZ != 5180 || DEFAULT_BAND != Band::G5 || DEFAULT_CHAN != 36 {
+        return TestResult::Fail("default channel drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_freq_to_band_chan);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //
