@@ -16,6 +16,15 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::h2c::{
+    make_fwhdr_dl_h2c, make_joininfo_h2c, make_log_cfg_h2c, make_ofld_cfg_h2c,
+    make_ra_macidcfg_h2c, make_scanofld_h2c, H2cBuilder, H2cSeqAllocator,
+    H2C_CAT_CTL_DRV_GEN, H2C_CAT_MAC as H2C_CAT_MAC_H2C, H2C_CAT_OUTSRC, H2C_CAT_TEST,
+    H2C_CL_FW_INFO, H2C_CL_MAC_FR_EXCHG, H2C_CL_MAC_FWDL as H2C_CL_MAC_FWDL_H2C,
+    H2C_CL_MAC_FW_OFLD, H2C_CL_MAC_MEDIA_RPT, H2C_CL_OUTSRC_RA, H2C_CL_OUTSRC_RF_FW_RFK,
+    H2C_FUNC_MAC_BCN_UPD, H2C_FUNC_MAC_JOININFO, H2C_FUNC_OFLD_CFG, H2C_FUNC_OUTSRC_RA_MACIDCFG,
+    H2C_FUNC_SCANOFLD, H2C_FUNC_SCANOFLD_BE,
+};
 use super::mac_init::{
     QtaMode, B_AX_CMAC_DMA_EN, B_AX_CMAC_EN, B_AX_DLE_DMAC_EN, B_AX_DMAC_FUNC_EN,
     B_AX_DMAC_MIX_EN, B_AX_DMAC_PKT_IN_EN, B_AX_HCI_RXDMA_EN, B_AX_HCI_TXDMA_EN, B_AX_PHYINTF_EN,
@@ -715,6 +724,166 @@ fn smoke_rtw89_mac_init_qta_mode_enum() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_qta_mode_enum);
+
+// ── Stage-6: H2C dispatch ──────────────────────────────────────────
+
+fn smoke_rtw89_h2c_category_values() -> TestResult {
+    // Pin all three real categories against fw.h:4505..4694.
+    if H2C_CAT_TEST != 0x0 {
+        return TestResult::Fail("H2C_CAT_TEST not 0x0");
+    }
+    if H2C_CAT_MAC_H2C != 0x1 {
+        return TestResult::Fail("H2C_CAT_MAC not 0x1");
+    }
+    if H2C_CAT_OUTSRC != 0x2 {
+        return TestResult::Fail("H2C_CAT_OUTSRC not 0x2");
+    }
+    // Driver-only sentinel must be outside the 2-bit cat field width.
+    if H2C_CAT_CTL_DRV_GEN <= H2C_CAT_OUTSRC {
+        return TestResult::Fail("H2C_CAT_CTL_DRV_GEN clashes with real cat");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_category_values);
+
+fn smoke_rtw89_h2c_class_pins() -> TestResult {
+    // MAC classes.
+    if H2C_CL_FW_INFO != 0x0 {
+        return TestResult::Fail("FW_INFO class drift");
+    }
+    if H2C_CL_MAC_FWDL_H2C != 0x3 {
+        return TestResult::Fail("FWDL class drift");
+    }
+    if H2C_CL_MAC_FR_EXCHG != 0x5 {
+        return TestResult::Fail("FR_EXCHG class drift");
+    }
+    if H2C_CL_MAC_MEDIA_RPT != 0x8 {
+        return TestResult::Fail("MEDIA_RPT class drift");
+    }
+    if H2C_CL_MAC_FW_OFLD != 0x9 {
+        return TestResult::Fail("FW_OFLD class drift");
+    }
+    // OUTSRC classes.
+    if H2C_CL_OUTSRC_RA != 0x1 {
+        return TestResult::Fail("OUTSRC RA class drift");
+    }
+    if H2C_CL_OUTSRC_RF_FW_RFK != 0xB {
+        return TestResult::Fail("OUTSRC RFK class drift");
+    }
+    // Frame-exchange functions.
+    if H2C_FUNC_MAC_BCN_UPD != 0x5 {
+        return TestResult::Fail("BCN_UPD function drift");
+    }
+    if H2C_FUNC_MAC_JOININFO != 0x0 {
+        return TestResult::Fail("JOININFO function drift");
+    }
+    if H2C_FUNC_OFLD_CFG != 0x14 {
+        return TestResult::Fail("OFLD_CFG function drift");
+    }
+    if H2C_FUNC_SCANOFLD != 0x17 {
+        return TestResult::Fail("SCANOFLD function drift");
+    }
+    if H2C_FUNC_SCANOFLD_BE != 0x2C {
+        return TestResult::Fail("SCANOFLD_BE function drift");
+    }
+    if H2C_FUNC_OUTSRC_RA_MACIDCFG != 0x0 {
+        return TestResult::Fail("RA_MACIDCFG function drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_class_pins);
+
+fn smoke_rtw89_h2c_builder() -> TestResult {
+    // Build a JOININFO H2C with a 16-byte payload.
+    let payload = [0xAAu8; 16];
+    let mut buf = [0u8; 64];
+    let h = make_joininfo_h2c(42);
+    let total = match h.build(&payload, &mut buf) {
+        Some(n) => n,
+        None => return TestResult::Fail("H2cBuilder::build returned None"),
+    };
+    // 8 byte header + 16 byte payload.
+    if total != 24 {
+        return TestResult::Fail("H2C builder produced wrong total length");
+    }
+    // Decode dword 0 of the header.
+    let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if dw0 & 0x3 != H2C_CAT_MAC_H2C as u32 {
+        return TestResult::Fail("H2C builder didn't encode cat=MAC");
+    }
+    // SEQ in bits 31-24 should be 42.
+    if (dw0 >> 24) & 0xFF != 42 {
+        return TestResult::Fail("H2C builder didn't encode seq");
+    }
+    // Payload must be at offset 8.
+    if buf[8..24] != payload {
+        return TestResult::Fail("H2C builder mis-placed payload");
+    }
+    // Tiny buffer should refuse.
+    let mut small = [0u8; 4];
+    if h.build(&payload, &mut small).is_some() {
+        return TestResult::Fail("H2C builder accepted undersized buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_builder);
+
+fn smoke_rtw89_h2c_seq_allocator() -> TestResult {
+    let a = H2cSeqAllocator::new();
+    let s0 = a.next();
+    let s1 = a.next();
+    let s2 = a.next();
+    if s0 != 0 || s1 != 1 || s2 != 2 {
+        return TestResult::Fail("H2C seq allocator didn't return 0,1,2");
+    }
+    // Burn through to test wrap.
+    for _ in 0..253 {
+        let _ = a.next();
+    }
+    let wrap = a.next();
+    // After 256 calls total, next should be 0 again (wrap).
+    if wrap != 0 {
+        return TestResult::Fail("H2C seq allocator didn't wrap at 256");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_seq_allocator);
+
+fn smoke_rtw89_h2c_prebuilt_helpers() -> TestResult {
+    // LOG_CFG: MAC category, FW_INFO class.
+    let h = make_log_cfg_h2c(0);
+    if h.cat != H2C_CAT_MAC_H2C || h.class != H2C_CL_FW_INFO {
+        return TestResult::Fail("LOG_CFG H2C wrong target");
+    }
+    // OFLD_CFG: MAC + FW_OFLD + OFLD_CFG, done_ack on.
+    let h = make_ofld_cfg_h2c(1);
+    if h.func != H2C_FUNC_OFLD_CFG || !h.done_ack {
+        return TestResult::Fail("OFLD_CFG H2C wrong setup");
+    }
+    // JOININFO: done_ack must be on (driver needs to know assoc landed).
+    let h = make_joininfo_h2c(2);
+    if !h.done_ack {
+        return TestResult::Fail("JOININFO H2C should request done_ack");
+    }
+    // RA_MACIDCFG: OUTSRC category.
+    let h = make_ra_macidcfg_h2c(3);
+    if h.cat != H2C_CAT_OUTSRC {
+        return TestResult::Fail("RA_MACIDCFG should be OUTSRC");
+    }
+    // SCANOFLD AX vs BE.
+    let h_ax = make_scanofld_h2c(4, false);
+    let h_be = make_scanofld_h2c(4, true);
+    if h_ax.func != H2C_FUNC_SCANOFLD || h_be.func != H2C_FUNC_SCANOFLD_BE {
+        return TestResult::Fail("SCANOFLD AX/BE dispatch wrong");
+    }
+    // FWHDR_DL: MAC + FWDL.
+    let h = make_fwhdr_dl_h2c(5);
+    if h.cat != H2C_CAT_MAC_H2C || h.class != H2C_CL_MAC_FWDL_H2C {
+        return TestResult::Fail("FWHDR_DL H2C wrong setup");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_prebuilt_helpers);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //
