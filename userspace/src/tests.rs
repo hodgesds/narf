@@ -10405,17 +10405,13 @@ fn smoke_socket_inet_udp_16_concurrent() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet_udp_16_concurrent);
 
-/// SO_REUSEADDR + double-bind: the second bind to the same port
-/// succeeds when SO_REUSEADDR was set; our Stage-1 impl is
-/// faithful to the option storage (real dual-bind behaviour
-/// lands when the listener registry honours the flag).
-fn smoke_socket_so_reuseaddr_storage_stable() -> TestResult {
-    // This is the storage-side test — the registry-side check is
-    // gated on bind() actually consulting the option, which lands
-    // when the parallel-agent SO_REUSEADDR enforcement merges.
+/// SO_REUSEADDR + double-bind: the second bind to the same
+/// (addr, port) succeeds when SO_REUSEADDR is set on the second
+/// socket. Without it, the second bind returns EADDRINUSE.
+fn smoke_socket_so_reuseaddr_double_bind_inet() -> TestResult {
     let a = crate::socket::SocketFile::new(
         crate::socket::AF_INET,
-        crate::socket::SOCK_STREAM,
+        crate::socket::SOCK_DGRAM,
     );
     let one = 1u32.to_ne_bytes();
     let _ = a.dispatch_op(crate::socket::SocketOp::SetSockOpt {
@@ -10423,29 +10419,48 @@ fn smoke_socket_so_reuseaddr_storage_stable() -> TestResult {
         name: crate::socket::SO_REUSEADDR,
         value: &one,
     });
-    let _ = a.dispatch_op(crate::socket::SocketOp::Bind {
+    let bound = a.dispatch_op(crate::socket::SocketOp::Bind {
         addr: build_sockaddr_in(0x7F00_0001, 9100),
     });
-    let _ = a.dispatch_op(crate::socket::SocketOp::Listen { backlog: 4 });
-    // Even though the first listener occupies the port, SO_REUSEADDR
-    // round-trip on the second socket must succeed (storage-side).
+    if !matches!(bound, crate::socket::SocketOpResult::Ok(_)) {
+        a.unregister();
+        return TestResult::Fail("first bind failed");
+    }
+    // Second socket without SO_REUSEADDR — must reject.
     let b = crate::socket::SocketFile::new(
         crate::socket::AF_INET,
-        crate::socket::SOCK_STREAM,
+        crate::socket::SOCK_DGRAM,
     );
-    let r = b.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+    let r = b.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 9100),
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Err(crate::socket::SockError::AddrInUse)) {
+        a.unregister();
+        b.unregister();
+        return TestResult::Fail("second bind without SO_REUSEADDR should fail");
+    }
+    // Third socket WITH SO_REUSEADDR — must succeed.
+    let c = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let _ = c.dispatch_op(crate::socket::SocketOp::SetSockOpt {
         level: crate::socket::SOL_SOCKET,
         name: crate::socket::SO_REUSEADDR,
         value: &one,
     });
+    let r = c.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 9100),
+    });
     a.unregister();
+    c.unregister();
     if matches!(r, crate::socket::SocketOpResult::Ok(_)) {
         TestResult::Pass
     } else {
-        TestResult::Fail("SO_REUSEADDR set on second socket failed")
+        TestResult::Fail("second bind with SO_REUSEADDR should succeed")
     }
 }
-kernel_test_in!("userspace", smoke_socket_so_reuseaddr_storage_stable);
+kernel_test_in!("userspace", smoke_socket_so_reuseaddr_double_bind_inet);
 
 /// SO_RCVBUF / SO_SNDBUF clamp small values to ≥ 2 KiB and
 /// round-trip larger values verbatim.

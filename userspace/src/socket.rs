@@ -1297,9 +1297,15 @@ impl SocketFile {
                 match &*state {
                     SocketState::Fresh => {
                         let key = (ip, port);
+                        let reuseaddr = self.options.lock().reuseaddr;
                         let mut listeners = INET_LISTENERS.lock();
                         let map = listeners.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(&key) {
+                        // SO_REUSEADDR (Linux): permit double-bind to
+                        // the same (addr, port) when the option is
+                        // set. Linux ref: net/ipv4/inet_connection_sock.c
+                        // inet_csk_bind_conflict() — `reuse` short-
+                        // circuits the conflict check.
+                        if map.contains_key(&key) && !reuseaddr {
                             return SocketOpResult::Err(SockError::AddrInUse);
                         }
                         *state = SocketState::InetListener {
@@ -1480,9 +1486,10 @@ impl SocketFile {
                 let mut state = self.state.lock();
                 match &*state {
                     SocketState::Fresh => {
+                        let reuseaddr = self.options.lock().reuseaddr;
                         let mut bound = INET_DGRAM_BOUND.lock();
                         let map = bound.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(&(ip, port)) {
+                        if map.contains_key(&(ip, port)) && !reuseaddr {
                             return SocketOpResult::Err(SockError::AddrInUse);
                         }
                         *state = SocketState::InetDgram {
