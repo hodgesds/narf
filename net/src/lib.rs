@@ -662,3 +662,63 @@ pub mod virtio_net {
 pub fn rights_bits<R: Rights>() -> u32 {
     R::BITS
 }
+
+// ── TX/RX metadata ──────────────────────────────────────────────────
+
+/// L4 checksum offload kind. Passed in `TxMeta::csum_l4` to tell the
+/// driver which L4 checksum to compute in hardware.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum L4CsumKind {
+    /// Compute a TCP checksum.
+    Tcp,
+    /// Compute a UDP checksum.
+    Udp,
+}
+
+/// Per-frame transmit metadata. Drivers read this alongside the
+/// `Frame` to know which hardware offloads to request.
+///
+/// All fields are `Option`; `None` means "no offload requested". The
+/// driver applies whichever the hardware supports and ignores the rest.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct TxMeta {
+    /// L4 checksum offload. `None` = no offload.
+    pub csum_l4: Option<L4CsumKind>,
+    /// TCP Segmentation Offload: maximum segment size in bytes.
+    /// When `Some`, implies L3 + L4 checksum offload as well.
+    /// `None` = no TSO.
+    pub tso_mss: Option<u16>,
+    /// 802.1Q VLAN tag to insert (12-bit VID + 3-bit PCP + CFI).
+    /// `None` = no VLAN insertion.
+    pub vlan_tag: Option<u16>,
+}
+
+impl TxMeta {
+    /// Convenience: a plain data frame with no offloads.
+    pub const fn plain() -> Self {
+        Self { csum_l4: None, tso_mss: None, vlan_tag: None }
+    }
+
+    /// Convenience: request L4 checksum offload only.
+    pub const fn with_csum(kind: L4CsumKind) -> Self {
+        Self { csum_l4: Some(kind), tso_mss: None, vlan_tag: None }
+    }
+
+    /// Convenience: request TSO (implies TCP checksum offload).
+    pub const fn with_tso(mss: u16) -> Self {
+        Self { csum_l4: Some(L4CsumKind::Tcp), tso_mss: Some(mss), vlan_tag: None }
+    }
+}
+
+/// Per-frame receive metadata. Drivers populate this from the
+/// completion descriptor so consumers know which offloads the
+/// hardware already verified.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RxMeta {
+    /// `true` if the hardware verified the IP (L3) header checksum
+    /// and found it valid.
+    pub csum_l3: bool,
+    /// `true` if the hardware verified the L4 (TCP/UDP) checksum
+    /// and found it valid.
+    pub csum_l4: bool,
+}
