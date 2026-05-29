@@ -16,6 +16,12 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::fwdl::{
+    detect_version, packet_count, parse_auto, parse_v0, parse_v1, FwSection, FwdlPacketIter,
+    FWDL_SECTION_CHKSUM_LEN, FWDL_SECTION_MAX_NUM, FWDL_SECTION_PER_PKT_LEN, FW_HDR_V0_BASE_SIZE,
+    FW_HDR_V0_SECTION_SIZE, FW_HDR_V1_BASE_SIZE, FW_HDR_V1_SECTION_SIZE, FW_TYPE_BBMCU0,
+    FW_TYPE_LOGFMT, FW_TYPE_NORMAL, FW_TYPE_WOWLAN,
+};
 use super::h2c::{
     make_fwhdr_dl_h2c, make_joininfo_h2c, make_log_cfg_h2c, make_ofld_cfg_h2c,
     make_ra_macidcfg_h2c, make_scanofld_h2c, H2cBuilder, H2cSeqAllocator,
@@ -884,6 +890,157 @@ fn smoke_rtw89_h2c_prebuilt_helpers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_prebuilt_helpers);
+
+// ── Stage-7: FW downloader (header parser + packet segmentation) ──
+
+fn smoke_rtw89_fwdl_constants() -> TestResult {
+    if FW_TYPE_NORMAL != 1 { return TestResult::Fail("FW_TYPE_NORMAL drift"); }
+    if FW_TYPE_WOWLAN != 3 { return TestResult::Fail("FW_TYPE_WOWLAN drift"); }
+    if FW_TYPE_BBMCU0 != 64 { return TestResult::Fail("FW_TYPE_BBMCU0 drift"); }
+    if FW_TYPE_LOGFMT != 255 { return TestResult::Fail("FW_TYPE_LOGFMT drift"); }
+    if FWDL_SECTION_PER_PKT_LEN != 2020 { return TestResult::Fail("PER_PKT_LEN drift"); }
+    if FWDL_SECTION_CHKSUM_LEN != 8 { return TestResult::Fail("CHKSUM_LEN drift"); }
+    if FWDL_SECTION_MAX_NUM != 10 { return TestResult::Fail("MAX_NUM drift"); }
+    if FW_HDR_V0_BASE_SIZE != 32 { return TestResult::Fail("v0 base hdr"); }
+    if FW_HDR_V0_SECTION_SIZE != 12 { return TestResult::Fail("v0 section"); }
+    if FW_HDR_V1_BASE_SIZE != 48 { return TestResult::Fail("v1 base hdr"); }
+    if FW_HDR_V1_SECTION_SIZE != 16 { return TestResult::Fail("v1 section"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_constants);
+
+fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
+    let section_num = 1u32;
+    let mut blob = alloc::vec::Vec::new();
+    let mut hdr = [0u32; 8];
+    hdr[1] = 0x0001_0002;
+    hdr[6] = section_num << 8;
+    hdr[7] = 0;
+    for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
+    let sw0 = 0x0000_1000u32;
+    let sw1 = (1u32 << 24) | 512u32;
+    let sw2 = 0u32;
+    blob.extend_from_slice(&sw0.to_le_bytes());
+    blob.extend_from_slice(&sw1.to_le_bytes());
+    blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend(core::iter::repeat(0xABu8).take(512));
+
+    let mut sections = [FwSection {
+        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+    }; FWDL_SECTION_MAX_NUM];
+    let h = match parse_v0(&blob, &mut sections) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("v0 parse failed"),
+    };
+    if h.section_num != 1 { return TestResult::Fail("section_num"); }
+    if h.fw_major != 2 || h.fw_minor != 1 { return TestResult::Fail("major/minor"); }
+    if h.version != 0 { return TestResult::Fail("version"); }
+    if h.hdr_len != 44 { return TestResult::Fail("hdr_len"); }
+    let s = &sections[0];
+    if s.kind != 1 { return TestResult::Fail("section type"); }
+    if s.dladdr != 0x1000 { return TestResult::Fail("dladdr"); }
+    if s.len != 512 { return TestResult::Fail("section len"); }
+    if s.payload_off != 44 { return TestResult::Fail("payload_off"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v0_parse);
+
+fn smoke_rtw89_fwdl_v0_chksum() -> TestResult {
+    let mut blob = alloc::vec::Vec::new();
+    let hdr = [0u32, 0, 0, 0, 0, 0, 1u32 << 8, 0];
+    for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
+    let sw0 = 0u32;
+    let sw1 = (1u32 << 24) | (1u32 << 28) | 1000u32;
+    let sw2 = 0u32;
+    blob.extend_from_slice(&sw0.to_le_bytes());
+    blob.extend_from_slice(&sw1.to_le_bytes());
+    blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend(core::iter::repeat(0x55u8).take(1008));
+
+    let mut sections = [FwSection {
+        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+    }; FWDL_SECTION_MAX_NUM];
+    let _ = match parse_v0(&blob, &mut sections) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("v0+chksum parse failed"),
+    };
+    let s = &sections[0];
+    if !s.chksum { return TestResult::Fail("chksum bit"); }
+    if s.len != 1008 { return TestResult::Fail("len did not add 8"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v0_chksum);
+
+fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
+    let mut blob = alloc::vec::Vec::new();
+    let mut hdr = [0u32; 12];
+    hdr[1] = 0x0405;
+    hdr[3] = 1u32 << 24;
+    hdr[6] = 1u32 << 8;
+    hdr[7] = 0;
+    for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
+    let sw0 = 0x4000_0000u32;
+    let sw1 = (64u32 << 24) | 256u32;
+    let sw2 = 0u32;
+    let sw3 = 0u32;
+    blob.extend_from_slice(&sw0.to_le_bytes());
+    blob.extend_from_slice(&sw1.to_le_bytes());
+    blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend_from_slice(&sw3.to_le_bytes());
+    blob.extend(core::iter::repeat(0xCDu8).take(256));
+
+    let mut sections = [FwSection {
+        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+    }; FWDL_SECTION_MAX_NUM];
+    let h = match parse_v1(&blob, &mut sections) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("v1 parse failed"),
+    };
+    if h.version != 1 { return TestResult::Fail("v1 version"); }
+    if h.section_num != 1 { return TestResult::Fail("v1 section_num"); }
+    if h.fw_major != 5 || h.fw_minor != 4 { return TestResult::Fail("v1 major/minor"); }
+    let s = &sections[0];
+    if s.kind != 64 { return TestResult::Fail("v1 BBMCU0"); }
+    if s.dladdr != 0x4000_0000 { return TestResult::Fail("v1 dladdr"); }
+    if s.len != 256 { return TestResult::Fail("v1 section len"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v1_parse);
+
+fn smoke_rtw89_fwdl_auto_detect() -> TestResult {
+    let mut v0 = alloc::vec::Vec::new();
+    let hdr0 = [0u32; 8];
+    for w in hdr0.iter() { v0.extend_from_slice(&w.to_le_bytes()); }
+    if detect_version(&v0).map_err(|_| ()) != Ok(0) { return TestResult::Fail("v0 detect"); }
+    let mut v1 = alloc::vec::Vec::new();
+    let mut hdr1 = [0u32; 12];
+    hdr1[3] = 1 << 24;
+    for w in hdr1.iter() { v1.extend_from_slice(&w.to_le_bytes()); }
+    if detect_version(&v1).map_err(|_| ()) != Ok(1) { return TestResult::Fail("v1 detect"); }
+    let mut sections = [FwSection {
+        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+    }; FWDL_SECTION_MAX_NUM];
+    let _ = parse_auto(&v1, &mut sections);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_auto_detect);
+
+fn smoke_rtw89_fwdl_packet_segment() -> TestResult {
+    let mut iter = FwdlPacketIter::new(5060, FWDL_SECTION_PER_PKT_LEN);
+    let p0 = iter.next().expect("p0");
+    if p0.section_off != 0 || p0.len != 2020 || p0.is_last { return TestResult::Fail("pkt0"); }
+    let p1 = iter.next().expect("p1");
+    if p1.section_off != 2020 || p1.len != 2020 || p1.is_last { return TestResult::Fail("pkt1"); }
+    let p2 = iter.next().expect("p2");
+    if p2.section_off != 4040 || p2.len != 1020 || !p2.is_last { return TestResult::Fail("pkt2"); }
+    if iter.next().is_some() { return TestResult::Fail("extra pkt"); }
+    if packet_count(5060, 2020) != 3 { return TestResult::Fail("count(5060,2020)"); }
+    if packet_count(2020, 2020) != 1 { return TestResult::Fail("exact"); }
+    if packet_count(0, 2020) != 0 { return TestResult::Fail("zero"); }
+    if packet_count(5060, 0) != 3 { return TestResult::Fail("default fallback"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_packet_segment);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //
