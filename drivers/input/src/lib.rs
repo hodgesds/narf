@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod hid_elan;
 pub mod hid_mt_features;
 pub mod hid_multitouch;
 pub mod hid_rmi;
@@ -58,6 +59,12 @@ pub fn register_initcalls() {
     // `hid_rmi::RMI_DEVICE_TABLE` and `match_device()` when it
     // sees a Synaptics VID at enumeration time.
     hid_rmi::register_initcalls();
+
+    // hid-elan — banner + device-id table load. Used by the i2c-HID
+    // and USB-HID transports to recognise Elan touchpads with
+    // vendor-specific report formats (HP Pavilion X2, Toshiba Click,
+    // and a slice of Lenovo/Acer/MSI laptops).
+    hid_elan::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();

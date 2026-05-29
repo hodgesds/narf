@@ -2811,4 +2811,230 @@ fn smoke_hid_rmi_attn_report_decode() -> TestResult {
 }
 kernel_test_in!("drivers/input/hid-rmi", smoke_hid_rmi_attn_report_decode);
 
+// ─── hid-elan touchpad smoke tests ─────────────────────────────────
+
+fn smoke_hid_elan_absolute_mode_feature_encode() -> TestResult {
+    use crate::hid_elan::{encode_absolute_mode_feature, ELAN_FEATURE_REPORT};
+    let buf = encode_absolute_mode_feature();
+    // Linux `elan_start_multitouch` writes:
+    //   [0x0D, 0x00, 0x03, 0x21, 0x00]
+    if buf != [0x0D, 0x00, 0x03, 0x21, 0x00] {
+        return TestResult::Fail("absolute mode magic bytes wrong");
+    }
+    if buf[0] != ELAN_FEATURE_REPORT {
+        return TestResult::Fail("leading byte must be ELAN_FEATURE_REPORT (0x0D)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_absolute_mode_feature_encode
+);
+
+fn smoke_hid_elan_device_id_table_at_least_five() -> TestResult {
+    use crate::hid_elan::{
+        match_device, ElanBus, ElanQuirks, ELAN_DEVICE_TABLE, USB_DEVICE_ID_HP_X2,
+        USB_DEVICE_ID_HP_X2_10_COVER, USB_DEVICE_ID_TOSHIBA_CLICK_L9W, USB_VENDOR_ID_ELAN,
+    };
+    if ELAN_DEVICE_TABLE.len() < 5 {
+        return TestResult::Fail("expected ≥5 entries in ELAN_DEVICE_TABLE");
+    }
+    // HP Pavilion X2 must carry HAS_LED + USB bus.
+    match match_device(USB_VENDOR_ID_ELAN, USB_DEVICE_ID_HP_X2) {
+        Some(m) => {
+            if !m.quirks.contains(ElanQuirks::HAS_LED) {
+                return TestResult::Fail("HP X2 missing HAS_LED");
+            }
+            if m.bus != ElanBus::Usb {
+                return TestResult::Fail("HP X2 must be on Usb bus");
+            }
+        }
+        None => return TestResult::Fail("HP X2 not in table"),
+    }
+    match match_device(USB_VENDOR_ID_ELAN, USB_DEVICE_ID_HP_X2_10_COVER) {
+        Some(m) => {
+            if !m.quirks.contains(ElanQuirks::HAS_LED) {
+                return TestResult::Fail("HP X2 cover missing HAS_LED");
+            }
+        }
+        None => return TestResult::Fail("HP X2 cover not in table"),
+    }
+    // Toshiba Click L9W must be I2cHid (Linux marks it
+    // HID_I2C_DEVICE explicitly).
+    match match_device(USB_VENDOR_ID_ELAN, USB_DEVICE_ID_TOSHIBA_CLICK_L9W) {
+        Some(m) => {
+            if m.bus != ElanBus::I2cHid {
+                return TestResult::Fail("Toshiba Click L9W must be on I2cHid bus");
+            }
+        }
+        None => return TestResult::Fail("Toshiba Click L9W not in table"),
+    }
+    // Unknown VID returns None.
+    if match_device(0xDEAD, 0xBEEF).is_some() {
+        return TestResult::Fail("unknown vid/pid must not match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_device_id_table_at_least_five
+);
+
+fn smoke_hid_elan_param_query_round_trip() -> TestResult {
+    use crate::hid_elan::{
+        decode_param_response_le16, encode_param_query, param, ELAN_FEATURE_REPORT,
+    };
+    // SET phase encodes the param code at byte 3.
+    let q = encode_param_query(param::MAX_X);
+    if q != [ELAN_FEATURE_REPORT, 0x05, 0x03, param::MAX_X, 0x01] {
+        return TestResult::Fail("param query body wrong");
+    }
+    // GET response simulates max_x = 0x1234.
+    let resp = [ELAN_FEATURE_REPORT, 0x05, 0x03, 0x34, 0x12];
+    let v = match decode_param_response_le16(&resp) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_param_response_le16 returned None"),
+    };
+    if v != 0x1234 {
+        return TestResult::Fail("LE16 decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_param_query_round_trip
+);
+
+fn smoke_hid_elan_finger_decode_inverts_y() -> TestResult {
+    use crate::hid_elan::ElanFinger;
+    // data layout for one finger record (Linux `elan_report_mt_slot`):
+    //   byte 0: X[12..9] in bits 7..4, Y[12..10] in bits 2..0
+    //   byte 1: X[8..1]
+    //   byte 2: Y[8..1]
+    //   byte 3: width nibble pair (sx low / sy high)
+    //   byte 4: pressure
+    //
+    // Choose X = (0x1<<8)|0xAB = 0x1AB, Y_raw = (0x2<<8)|0x34 = 0x234,
+    // max_y = 0x500 → reported y = 0x500 - 0x234 = 0x2CC.
+    let data = [
+        0x12, // X hi nibble 1, Y high 2 bits = 010
+        0xAB, // X lo
+        0x34, // Y lo
+        0x45, // wx=5 wy=4
+        0x80, // pressure 128
+    ];
+    let f = match ElanFinger::decode(&data, 0x500) {
+        Some(f) => f,
+        None => return TestResult::Fail("decode None on valid 5-byte slice"),
+    };
+    if !f.present {
+        return TestResult::Fail("present should be true");
+    }
+    if f.x != 0x1AB {
+        return TestResult::Fail("X decode wrong");
+    }
+    if f.y != 0x2CC {
+        return TestResult::Fail("Y inversion wrong");
+    }
+    if f.pressure != 0x80 {
+        return TestResult::Fail("pressure");
+    }
+    if f.w_x != 5 || f.w_y != 4 {
+        return TestResult::Fail("width nibbles");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_finger_decode_inverts_y
+);
+
+fn smoke_hid_elan_mute_led_feature_encode() -> TestResult {
+    use crate::hid_elan::{encode_mute_led, ELAN_LED_REPORT_SIZE, ELAN_MUTE_LED_REPORT};
+    let on = encode_mute_led(true);
+    let off = encode_mute_led(false);
+    if on.len() != ELAN_LED_REPORT_SIZE || off.len() != ELAN_LED_REPORT_SIZE {
+        return TestResult::Fail("LED body must be ELAN_LED_REPORT_SIZE");
+    }
+    if on[0] != ELAN_MUTE_LED_REPORT || off[0] != ELAN_MUTE_LED_REPORT {
+        return TestResult::Fail("leading byte must be 0xBC");
+    }
+    if on[1] != 0x02 || off[1] != 0x02 {
+        return TestResult::Fail("byte 1 must be 0x02");
+    }
+    if on[2] != 1 {
+        return TestResult::Fail("ON state must set byte 2 = 1");
+    }
+    if off[2] != 0 {
+        return TestResult::Fail("OFF state must clear byte 2");
+    }
+    // Trailing bytes zero.
+    for &b in &on[3..] {
+        if b != 0 {
+            return TestResult::Fail("trailing pad must be 0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_mute_led_feature_encode
+);
+
+fn smoke_hid_elan_resolution_convert() -> TestResult {
+    use crate::hid_elan::convert_resolution;
+    // Linux: (val * 10 + 790) * 10 / 254.
+    // val=0 → 790 * 10 / 254 = 7900 / 254 = 31.
+    if convert_resolution(0) != 31 {
+        return TestResult::Fail("resolution(0) must be 31 dots/mm");
+    }
+    // val=10 → (100+790)*10/254 = 8900/254 = 35.
+    if convert_resolution(10) != 35 {
+        return TestResult::Fail("resolution(10) must be 35");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/hid-elan", smoke_hid_elan_resolution_convert);
+
+fn smoke_hid_elan_usb_single_finger_report() -> TestResult {
+    use crate::hid_elan::{ElanReport, ELAN_INPUT_REPORT_SIZE, ELAN_SINGLE_FINGER};
+    // 8-byte single-finger USB report with finger 0 active + clickpad
+    // button pressed.
+    let mut buf = [0u8; ELAN_INPUT_REPORT_SIZE];
+    buf[0] = ELAN_SINGLE_FINGER;
+    buf[1] = 0;
+    // bit 3 → finger 0 active, bit 0 → BTN_LEFT
+    buf[2] = (1 << 3) | 0x01;
+    // Finger payload starts at buf[3].
+    buf[3] = 0x12;
+    buf[4] = 0xAB;
+    buf[5] = 0x34;
+    buf[6] = 0x00;
+    buf[7] = 0x80;
+    let r = match ElanReport::decode_usb_single_finger(&buf, 0x500) {
+        Some(r) => r,
+        None => return TestResult::Fail("decode_usb_single_finger rejected"),
+    };
+    if !r.btn_left {
+        return TestResult::Fail("BTN_LEFT bit not set");
+    }
+    if r.fingers.len() != 5 {
+        return TestResult::Fail("expected 5 finger slots");
+    }
+    if !r.fingers[0].present {
+        return TestResult::Fail("finger 0 should be present");
+    }
+    for i in 1..5 {
+        if r.fingers[i].present {
+            return TestResult::Fail("higher-slot fingers must be absent");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_usb_single_finger_report
+);
+
+
 
