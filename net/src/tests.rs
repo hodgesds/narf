@@ -5935,3 +5935,1144 @@ fn smoke_arp_gratuitous_does_not_panic() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/arp_cache", smoke_arp_gratuitous_does_not_panic);
+
+// ── Production-grade TCP smokes ──────────────────────────────────
+//
+// These tests exercise the rebuilt tcp/ submodule stack: state
+// machine, retransmit/RTO, CUBIC, SACK, options, socket buffers,
+// reassembly, persist/keepalive timers.
+
+fn smoke_tcp_state_predicates() -> TestResult {
+    use crate::tcp::state_machine::TcpState;
+    if !TcpState::Established.can_recv_data() {
+        return TestResult::Fail("ESTABLISHED should receive data");
+    }
+    if !TcpState::Established.can_send_data() {
+        return TestResult::Fail("ESTABLISHED should send data");
+    }
+    if !TcpState::CloseWait.can_send_data() {
+        return TestResult::Fail("CLOSE-WAIT should still send (app drain)");
+    }
+    if TcpState::CloseWait.can_recv_data() {
+        return TestResult::Fail("CLOSE-WAIT shouldn't queue further inbound data");
+    }
+    if !TcpState::FinWait1.closes_via_timewait() {
+        return TestResult::Fail("FIN-WAIT-1 closes via TIME-WAIT");
+    }
+    if !TcpState::Established.is_synchronised() {
+        return TestResult::Fail("ESTABLISHED is synchronised");
+    }
+    if TcpState::Listen.is_synchronised() {
+        return TestResult::Fail("LISTEN is NOT synchronised");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_state_predicates);
+
+fn smoke_tcp_rtt_first_sample_seeds() -> TestResult {
+    use crate::tcp::retransmit::RttEstimator;
+    let mut e = RttEstimator::new();
+    e.sample(100_000_000); // 100 ms
+    if !e.valid {
+        return TestResult::Fail("first sample should set valid");
+    }
+    if e.srtt_ns != 100_000_000 {
+        return TestResult::Fail("SRTT should = R on first measurement");
+    }
+    if e.rttvar_ns != 50_000_000 {
+        return TestResult::Fail("RTTVAR should = R/2 on first measurement");
+    }
+    if e.current_rto() != 300_000_000 {
+        return TestResult::Fail("RTO = SRTT + 4*RTTVAR = 300ms on first sample");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_rtt_first_sample_seeds);
+
+fn smoke_tcp_rto_clamps_to_floor() -> TestResult {
+    use crate::tcp::retransmit::{RttEstimator, RTO_MIN_NS};
+    let mut e = RttEstimator::new();
+    e.sample(100); // ~ns, well below floor
+    if e.current_rto() < RTO_MIN_NS {
+        return TestResult::Fail("RTO must clamp to >= 200ms");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_rto_clamps_to_floor);
+
+fn smoke_tcp_rto_doubles_on_backoff() -> TestResult {
+    use crate::tcp::retransmit::RttEstimator;
+    let mut e = RttEstimator::new();
+    e.sample(100_000_000);
+    let initial = e.current_rto();
+    e.back_off();
+    let one = e.current_rto();
+    if one < initial {
+        return TestResult::Fail("first back-off shouldn't shrink RTO");
+    }
+    e.back_off();
+    let two = e.current_rto();
+    if two < one {
+        return TestResult::Fail("second back-off should grow RTO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_rto_doubles_on_backoff);
+
+fn smoke_tcp_rto_gives_up_after_seven() -> TestResult {
+    use crate::tcp::retransmit::{RttEstimator, MAX_RETRANSMITS};
+    let mut e = RttEstimator::new();
+    for _ in 0..MAX_RETRANSMITS {
+        if !e.back_off() {
+            return TestResult::Fail("back_off shouldn't give up before MAX_RETRANSMITS");
+        }
+    }
+    if e.back_off() {
+        return TestResult::Fail("back_off must return false after MAX_RETRANSMITS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_rto_gives_up_after_seven);
+
+fn smoke_tcp_cong_starts_with_iw10() -> TestResult {
+    use crate::tcp::congestion::{CongAlg, CongestionState};
+    let c = CongestionState::new(CongAlg::Cubic, 1460);
+    if c.cwnd != 14_600 {
+        return TestResult::Fail("IW10 initial cwnd should be 10 x MSS");
+    }
+    if c.ssthresh != u32::MAX {
+        return TestResult::Fail("initial ssthresh should be unbounded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_cong_starts_with_iw10);
+
+fn smoke_tcp_cong_slow_start_grows_per_ack() -> TestResult {
+    use crate::tcp::congestion::{CongAlg, CongestionState};
+    let mut c = CongestionState::new(CongAlg::Reno, 1000);
+    c.cwnd = 1000;
+    c.on_ack(1000, 0);
+    c.on_ack(1000, 0);
+    if c.cwnd != 3000 {
+        return TestResult::Fail("slow-start should grow cwnd by MSS per ACK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_cong_slow_start_grows_per_ack);
+
+fn smoke_tcp_cong_fast_recovery_halves_cwnd() -> TestResult {
+    use crate::tcp::congestion::{CongAlg, CongestionState};
+    let mut c = CongestionState::new(CongAlg::Reno, 1000);
+    c.cwnd = 10_000;
+    c.ssthresh = u32::MAX;
+    c.enter_fast_recovery(50_000, 0, 1);
+    if c.ssthresh != 5000 {
+        return TestResult::Fail("ssthresh should be cwnd/2 = 5000");
+    }
+    if c.cwnd != 8000 {
+        return TestResult::Fail("cwnd should be ssthresh + 3*MSS = 8000");
+    }
+    if !c.in_recovery {
+        return TestResult::Fail("in_recovery should be set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_cong_fast_recovery_halves_cwnd);
+
+fn smoke_tcp_cong_three_dup_acks_trigger_retransmit() -> TestResult {
+    use crate::tcp::congestion::{CongAlg, CongestionState};
+    let mut c = CongestionState::new(CongAlg::Reno, 1000);
+    if c.on_dup_ack() {
+        return TestResult::Fail("1st dup ack should not trigger");
+    }
+    if c.on_dup_ack() {
+        return TestResult::Fail("2nd dup ack should not trigger");
+    }
+    if !c.on_dup_ack() {
+        return TestResult::Fail("3rd dup ack must trigger fast retransmit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_cong_three_dup_acks_trigger_retransmit);
+
+fn smoke_tcp_cong_rto_resets_cwnd() -> TestResult {
+    use crate::tcp::congestion::{CongAlg, CongestionState};
+    let mut c = CongestionState::new(CongAlg::Cubic, 1000);
+    c.cwnd = 20_000;
+    c.enter_rto(20_000, 0, 1);
+    if c.cwnd != 1000 {
+        return TestResult::Fail("RTO should reset cwnd to 1 MSS");
+    }
+    if c.ssthresh < 2000 {
+        return TestResult::Fail("ssthresh should be >= 2*MSS after RTO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_cong_rto_resets_cwnd);
+
+fn smoke_tcp_cubic_grows_after_loss() -> TestResult {
+    use crate::tcp::congestion::{CongAlg, CongestionState};
+    let mut c = CongestionState::new(CongAlg::Cubic, 1000);
+    c.cwnd = 10_000;
+    c.ssthresh = 5_000;
+    c.enter_fast_recovery(100_000, 0, 1);
+    c.in_recovery = false;
+    c.cwnd = c.ssthresh;
+    let initial = c.cwnd;
+    for i in 0..50 {
+        c.on_ack(c.mss, i * 100_000_000);
+    }
+    if c.cwnd < initial {
+        return TestResult::Fail("CUBIC should grow cwnd above ssthresh");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_cubic_grows_after_loss);
+
+fn smoke_tcp_sack_encode_decode_round_trip() -> TestResult {
+    use crate::tcp::sack::{decode_blocks, encode_blocks, SackBlock};
+    let blocks = alloc::vec![
+        SackBlock { left: 1000, right: 2000 },
+        SackBlock { left: 3000, right: 3500 },
+        SackBlock { left: 5000, right: 7000 },
+    ];
+    let encoded = encode_blocks(&blocks);
+    if encoded.len() != 24 {
+        return TestResult::Fail("3 blocks * 8 bytes = 24");
+    }
+    let decoded = decode_blocks(&encoded);
+    if decoded != blocks {
+        return TestResult::Fail("SACK blocks must round-trip exactly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sack_encode_decode_round_trip);
+
+fn smoke_tcp_sack_encode_caps_at_four() -> TestResult {
+    use crate::tcp::sack::{encode_blocks, SackBlock};
+    let blocks = alloc::vec![
+        SackBlock { left: 1, right: 2 },
+        SackBlock { left: 3, right: 4 },
+        SackBlock { left: 5, right: 6 },
+        SackBlock { left: 7, right: 8 },
+        SackBlock { left: 9, right: 10 },
+    ];
+    let e = encode_blocks(&blocks);
+    if e.len() != 32 {
+        return TestResult::Fail("encode must cap at 4 blocks (32 bytes)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sack_encode_caps_at_four);
+
+fn smoke_tcp_sack_book_merges_adjacent() -> TestResult {
+    use crate::tcp::sack::{SackBlock, SackBook};
+    let mut b = SackBook::new();
+    b.add_range(1000, 2000);
+    b.add_range(2000, 3000);
+    if b.blocks().len() != 1 {
+        return TestResult::Fail("adjacent ranges must merge into one block");
+    }
+    if b.blocks()[0] != (SackBlock { left: 1000, right: 3000 }) {
+        return TestResult::Fail("merged block has the wrong extent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sack_book_merges_adjacent);
+
+fn smoke_tcp_sack_book_keeps_mru_order() -> TestResult {
+    use crate::tcp::sack::SackBook;
+    let mut b = SackBook::new();
+    b.add_range(1000, 2000);
+    b.add_range(5000, 6000);
+    if b.blocks()[0].left != 5000 || b.blocks()[1].left != 1000 {
+        return TestResult::Fail("first block should be the MRU range");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sack_book_keeps_mru_order);
+
+fn smoke_tcp_sack_scoreboard_blocks_retx() -> TestResult {
+    use crate::tcp::sack::{SackBlock, SenderScoreboard};
+    let mut s = SenderScoreboard::new();
+    s.update_from(&[SackBlock { left: 100, right: 200 }]);
+    if !s.is_sacked(150) {
+        return TestResult::Fail("scoreboard should report 150 as SACKed");
+    }
+    if s.is_sacked(50) {
+        return TestResult::Fail("scoreboard should not report 50 as SACKed");
+    }
+    s.prune_below(250);
+    if !s.blocks.is_empty() {
+        return TestResult::Fail("prune_below should remove fully-covered ranges");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sack_scoreboard_blocks_retx);
+
+fn smoke_tcp_options_parse_finds_all() -> TestResult {
+    use crate::tcp::options::{encode_syn_options, ParsedOptions};
+    let opts = encode_syn_options(1460, 7, 0xDEADBEEF, 0);
+    let parsed = ParsedOptions::parse(&opts);
+    if parsed.mss != Some(1460) {
+        return TestResult::Fail("MSS option not parsed");
+    }
+    if parsed.wscale != Some(7) {
+        return TestResult::Fail("Window Scale option not parsed");
+    }
+    if !parsed.sack_permitted {
+        return TestResult::Fail("SACK-Permitted not parsed");
+    }
+    if parsed.timestamps != Some((0xDEADBEEF, 0)) {
+        return TestResult::Fail("Timestamps not parsed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_options_parse_finds_all);
+
+fn smoke_tcp_options_negotiate_picks_lower_mss() -> TestResult {
+    use crate::tcp::options::{OptionsState, ParsedOptions};
+    let mut state = OptionsState::new();
+    state.our_mss = 1460;
+    let peer = ParsedOptions {
+        mss: Some(536),
+        ..Default::default()
+    };
+    state.negotiate(&peer, 7);
+    if state.peer_mss != 536 {
+        return TestResult::Fail("negotiated MSS should be the lower of the two");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_options_negotiate_picks_lower_mss);
+
+fn smoke_tcp_options_paws_rejects_stale() -> TestResult {
+    use crate::tcp::options::OptionsState;
+    let mut state = OptionsState::new();
+    state.timestamps_active = true;
+    state.ts_recent = 100;
+    if !state.paws_reject(50) {
+        return TestResult::Fail("PAWS should reject older TSval");
+    }
+    if state.paws_reject(150) {
+        return TestResult::Fail("PAWS should accept newer TSval");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_options_paws_rejects_stale);
+
+fn smoke_tcp_options_window_scale_round_trip() -> TestResult {
+    use crate::tcp::options::OptionsState;
+    let mut state = OptionsState::new();
+    state.our_wscale = 7;
+    state.peer_wscale = 7;
+    state.wscale_active = true;
+    if state.encode_our_window(256 * 1024) != 2048 {
+        return TestResult::Fail("256 KiB / 128 = 2048 on the wire");
+    }
+    if state.decode_peer_window(2048) != 256 * 1024 {
+        return TestResult::Fail("2048 << 7 = 256 KiB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_options_window_scale_round_trip);
+
+fn smoke_tcp_options_wscale_disabled_if_peer_silent() -> TestResult {
+    use crate::tcp::options::{OptionsState, ParsedOptions};
+    let mut state = OptionsState::new();
+    let peer = ParsedOptions::default();
+    state.negotiate(&peer, 7);
+    if state.wscale_active {
+        return TestResult::Fail("wscale must be disabled when peer didn't offer");
+    }
+    if state.our_wscale != 0 {
+        return TestResult::Fail("our_wscale should drop to 0 when WS not negotiated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_options_wscale_disabled_if_peer_silent);
+
+fn smoke_tcp_sendbuf_write_and_ack() -> TestResult {
+    use crate::tcp::socket_buf::SendBuf;
+    let mut s = SendBuf::new(1024, 100);
+    let n = s.write(b"hello world");
+    if n != 11 {
+        return TestResult::Fail("write returned wrong byte count");
+    }
+    s.mark_sent(5);
+    if s.inflight_bytes() != 5 {
+        return TestResult::Fail("inflight should be 5 after mark_sent");
+    }
+    let acked = s.ack(103);
+    if acked != 3 {
+        return TestResult::Fail("ack(103) should ack 3 bytes");
+    }
+    if s.unacked_head_seq != 103 {
+        return TestResult::Fail("unacked_head_seq should advance");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sendbuf_write_and_ack);
+
+fn smoke_tcp_recvbuf_in_order_delivery() -> TestResult {
+    use crate::tcp::socket_buf::RecvBuf;
+    let mut r = RecvBuf::new(1024);
+    let rcv_nxt = r.accept(100, b"AAAA", 100);
+    if rcv_nxt != 104 {
+        return TestResult::Fail("rcv_nxt should advance by payload len");
+    }
+    let mut buf = [0u8; 8];
+    let n = r.read(&mut buf);
+    if n != 4 || &buf[..4] != b"AAAA" {
+        return TestResult::Fail("read should yield queued bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_recvbuf_in_order_delivery);
+
+fn smoke_tcp_recvbuf_out_of_order_reassembly() -> TestResult {
+    use crate::tcp::socket_buf::RecvBuf;
+    let mut r = RecvBuf::new(1024);
+    let mut rcv_nxt = 100;
+    rcv_nxt = r.accept(110, b"DDDDD", rcv_nxt);
+    if rcv_nxt != 100 {
+        return TestResult::Fail("out-of-order arrival shouldn't advance rcv_nxt");
+    }
+    rcv_nxt = r.accept(100, b"AAAAAAAAAA", rcv_nxt);
+    if rcv_nxt != 115 {
+        return TestResult::Fail("in-order arrival should stitch the gap");
+    }
+    let mut buf = [0u8; 32];
+    let n = r.read(&mut buf);
+    if n != 15 {
+        return TestResult::Fail("entire reassembled stream should read out");
+    }
+    if &buf[..10] != b"AAAAAAAAAA" || &buf[10..15] != b"DDDDD" {
+        return TestResult::Fail("byte order on read mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_recvbuf_out_of_order_reassembly);
+
+fn smoke_tcp_recvbuf_sack_after_ooo() -> TestResult {
+    use crate::tcp::socket_buf::RecvBuf;
+    let mut r = RecvBuf::new(1024);
+    let _ = r.accept(200, b"E", 100);
+    let _ = r.accept(300, b"F", 100);
+    let blocks = r.sack_blocks();
+    if blocks.len() != 2 {
+        return TestResult::Fail("OO segments should produce 2 SACK blocks");
+    }
+    if blocks[0].left != 300 {
+        return TestResult::Fail("MRU SACK block first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_recvbuf_sack_after_ooo);
+
+fn smoke_tcp_recvbuf_window_shrinks_with_use() -> TestResult {
+    use crate::tcp::socket_buf::RecvBuf;
+    let mut r = RecvBuf::new(100);
+    let initial = r.free_window();
+    let _ = r.accept(0, &[0u8; 50], 0);
+    let after = r.free_window();
+    if after >= initial {
+        return TestResult::Fail("free window should shrink after data accepted");
+    }
+    if after != 50 {
+        return TestResult::Fail("50 bytes left after 50/100 used");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_recvbuf_window_shrinks_with_use);
+
+fn smoke_tcp_seq_compare_wraps() -> TestResult {
+    use crate::tcp::congestion::{seq_geq, seq_gt, seq_lt};
+    if !seq_lt(0xFFFFFFF0, 0x00000010) {
+        return TestResult::Fail("wrap: 0xFFFFFFF0 < 0x00000010");
+    }
+    if !seq_gt(0x00000010, 0xFFFFFFF0) {
+        return TestResult::Fail("wrap: 0x10 > 0xFFFFFFF0");
+    }
+    if !seq_geq(0x00000010, 0xFFFFFFF0) {
+        return TestResult::Fail("wrap: 0x10 >= 0xFFFFFFF0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_seq_compare_wraps);
+
+fn smoke_tcp_listen_returns_handle() -> TestResult {
+    use crate::tcp::core::{listen, __reset_for_test};
+    __reset_for_test();
+    let r = listen([10, 0, 2, 15], 8080, 16);
+    if r.is_err() {
+        return TestResult::Fail("listen should succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_listen_returns_handle);
+
+fn smoke_tcp_accept_empty_returns_none() -> TestResult {
+    use crate::tcp::core::{accept, listen, __reset_for_test};
+    __reset_for_test();
+    let id = listen([10, 0, 2, 15], 9090, 8).expect("listen");
+    match accept(id) {
+        Ok(None) => TestResult::Pass,
+        Ok(Some(_)) => TestResult::Fail("accept on idle listener should yield None"),
+        Err(_) => TestResult::Fail("accept should not error on idle listener"),
+    }
+}
+kernel_test_in!("net/tcp", smoke_tcp_accept_empty_returns_none);
+
+fn smoke_tcp_setsockopt_nodelay_toggles_nagle() -> TestResult {
+    use crate::tcp::core::{
+        getsockopt_int, setsockopt_int, TCP_NODELAY, __install_test_tcb,
+    };
+    use crate::tcp::state_machine::TcpState;
+    let id = __install_test_tcb([10, 0, 2, 15], 1234, [10, 0, 2, 2], 80, TcpState::Established);
+    setsockopt_int(id, TCP_NODELAY, 1).expect("set NODELAY");
+    if getsockopt_int(id, TCP_NODELAY).unwrap_or(0) != 1 {
+        return TestResult::Fail("NODELAY didn't round-trip on");
+    }
+    setsockopt_int(id, TCP_NODELAY, 0).expect("clear NODELAY");
+    if getsockopt_int(id, TCP_NODELAY).unwrap_or(1) != 0 {
+        return TestResult::Fail("NODELAY didn't round-trip off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_setsockopt_nodelay_toggles_nagle);
+
+fn smoke_tcp_setsockopt_congestion_alg() -> TestResult {
+    use crate::tcp::core::{
+        getsockopt_cong, setsockopt_str, TCP_CONGESTION, __install_test_tcb,
+    };
+    use crate::tcp::state_machine::TcpState;
+    let id = __install_test_tcb([10, 0, 2, 15], 4321, [10, 0, 2, 2], 80, TcpState::Established);
+    setsockopt_str(id, TCP_CONGESTION, "reno").expect("set reno");
+    if getsockopt_cong(id).unwrap_or("") != "reno" {
+        return TestResult::Fail("congestion alg didn't switch to reno");
+    }
+    setsockopt_str(id, TCP_CONGESTION, "cubic").expect("set cubic");
+    if getsockopt_cong(id).unwrap_or("") != "cubic" {
+        return TestResult::Fail("congestion alg didn't switch back to cubic");
+    }
+    if setsockopt_str(id, TCP_CONGESTION, "bbr").is_ok() {
+        return TestResult::Fail("unknown alg should fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_setsockopt_congestion_alg);
+
+fn smoke_tcp_setsockopt_keepalive_round_trip() -> TestResult {
+    use crate::tcp::core::{
+        getsockopt_int, setsockopt_int, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
+        TCP_KEEPINTVL, __install_test_tcb,
+    };
+    use crate::tcp::state_machine::TcpState;
+    let id = __install_test_tcb([10, 0, 2, 15], 1357, [10, 0, 2, 2], 80, TcpState::Established);
+    setsockopt_int(id, TCP_KEEPALIVE, 1).expect("set keepalive");
+    setsockopt_int(id, TCP_KEEPIDLE, 60).expect("set keepidle");
+    setsockopt_int(id, TCP_KEEPINTVL, 10).expect("set keepintvl");
+    setsockopt_int(id, TCP_KEEPCNT, 3).expect("set keepcnt");
+    if getsockopt_int(id, TCP_KEEPIDLE).unwrap_or(0) != 60 {
+        return TestResult::Fail("KEEPIDLE didn't round-trip");
+    }
+    if getsockopt_int(id, TCP_KEEPCNT).unwrap_or(0) != 3 {
+        return TestResult::Fail("KEEPCNT didn't round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_setsockopt_keepalive_round_trip);
+
+fn smoke_tcp_setsockopt_maxseg_floor() -> TestResult {
+    use crate::tcp::core::{
+        getsockopt_int, setsockopt_int, TCP_MAXSEG, __install_test_tcb,
+    };
+    use crate::tcp::state_machine::TcpState;
+    let id = __install_test_tcb([10, 0, 2, 15], 2468, [10, 0, 2, 2], 80, TcpState::Established);
+    setsockopt_int(id, TCP_MAXSEG, 100).expect("clamp");
+    let v = getsockopt_int(id, TCP_MAXSEG).unwrap_or(0);
+    if v < 536 {
+        return TestResult::Fail("MAXSEG should clamp at MIN_MSS = 536");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_setsockopt_maxseg_floor);
+
+fn smoke_tcp_sendbuf_full_slices() -> TestResult {
+    use crate::tcp::socket_buf::SendBuf;
+    let mut s = SendBuf::new(1024, 0);
+    s.write(b"abcdef");
+    let (a, b) = s.full_slices();
+    let total = a.len() + b.len();
+    if total != 6 {
+        return TestResult::Fail("full_slices must cover every buffered byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sendbuf_full_slices);
+
+fn smoke_tcp_unsent_slices_track_offset() -> TestResult {
+    use crate::tcp::socket_buf::SendBuf;
+    let mut s = SendBuf::new(1024, 0);
+    s.write(b"abcdef");
+    s.mark_sent(3);
+    let (a, b) = s.unsent_slices(10);
+    let mut got = alloc::vec::Vec::new();
+    got.extend_from_slice(a);
+    got.extend_from_slice(b);
+    if got != b"def" {
+        return TestResult::Fail("unsent_slices must skip the sent prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_unsent_slices_track_offset);
+
+fn smoke_tcp_sendbuf_rewind_resets_sent_offset() -> TestResult {
+    use crate::tcp::socket_buf::SendBuf;
+    let mut s = SendBuf::new(1024, 0);
+    s.write(b"abcdef");
+    s.mark_sent(4);
+    if s.inflight_bytes() != 4 {
+        return TestResult::Fail("inflight should be 4 before rewind");
+    }
+    s.rewind_for_retransmit();
+    if s.inflight_bytes() != 0 {
+        return TestResult::Fail("rewind should zero inflight");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_sendbuf_rewind_resets_sent_offset);
+
+fn smoke_tcp_recvbuf_idle_initially() -> TestResult {
+    use crate::tcp::socket_buf::RecvBuf;
+    let r = RecvBuf::new(256);
+    if !r.is_idle() {
+        return TestResult::Fail("fresh RecvBuf should be idle");
+    }
+    if r.has_data() {
+        return TestResult::Fail("fresh RecvBuf has no in-order data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_recvbuf_idle_initially);
+
+fn smoke_tcp_drop_cause_variants_distinguish() -> TestResult {
+    use crate::tcp::state_machine::DropCause;
+    if DropCause::Graceful == DropCause::PeerReset {
+        return TestResult::Fail("Graceful and PeerReset must be distinct");
+    }
+    if DropCause::RetransmitGiveUp == DropCause::KeepaliveDead {
+        return TestResult::Fail("RetransmitGiveUp and KeepaliveDead must be distinct");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_drop_cause_variants_distinguish);
+
+// ── DHCPv4 + DNS + resolv_conf smoke tests (RFC 2131 / 2132 / 1035) ───────
+//
+// These tests exercise packet builders and test-hook helpers only;
+// no live network or iface registration required.
+
+/// Synthesise a DHCP server reply (OFFER or ACK) for use in tests.
+///
+/// Embeds the supplied options and appends OPT_END.  Returns a valid
+/// on-wire DHCP payload (≥ 240 bytes).
+#[allow(clippy::too_many_arguments)]
+fn make_dhcp_reply(
+    xid: u32,
+    msg_type: u8,
+    yiaddr: [u8; 4],
+    server: [u8; 4],
+    netmask: [u8; 4],
+    gateway: [u8; 4],
+    lease_secs: u32,
+    dns: &[[u8; 4]],
+    t1: u32,
+    t2: u32,
+    domain: &str,
+) -> alloc::vec::Vec<u8> {
+    use crate::pkt_dhcp::{
+        append_end, append_message_type, append_option, DhcpHeader,
+        OPT_DNS_SERVER, OPT_DOMAIN_NAME, OPT_LEASE_TIME,
+        OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1,
+        OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
+    };
+    let mut buf = alloc::vec::Vec::with_capacity(400);
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    let hdr = DhcpHeader {
+        op: 2, htype: 1, hlen: 6, hops: 0, xid,
+        secs: 0, flags: 0,
+        ciaddr: [0; 4], yiaddr, siaddr: server, giaddr: [0; 4], chaddr,
+    };
+    hdr.encode_into(&mut buf);
+    append_message_type(&mut buf, msg_type);
+    append_option(&mut buf, OPT_SERVER_IDENTIFIER, &server);
+    append_option(&mut buf, OPT_SUBNET_MASK, &netmask);
+    append_option(&mut buf, OPT_ROUTER, &gateway);
+    append_option(&mut buf, OPT_LEASE_TIME, &lease_secs.to_be_bytes());
+    if !dns.is_empty() {
+        let mut dns_bytes = alloc::vec::Vec::with_capacity(dns.len() * 4);
+        for d in dns { dns_bytes.extend_from_slice(d); }
+        append_option(&mut buf, OPT_DNS_SERVER, &dns_bytes);
+    }
+    if t1 != 0 { append_option(&mut buf, OPT_RENEWAL_TIME_T1,    &t1.to_be_bytes()); }
+    if t2 != 0 { append_option(&mut buf, OPT_REBINDING_TIME_T2,  &t2.to_be_bytes()); }
+    if !domain.is_empty() { append_option(&mut buf, OPT_DOMAIN_NAME, domain.as_bytes()); }
+    append_end(&mut buf);
+    buf
+}
+
+// ── Smoke #S1: on_udp_in parses OFFER without crashing ───────────────
+
+fn smoke_dhcp_state_offer_parsed_from_wire() -> TestResult {
+    use crate::dhcp::on_udp_in;
+    use crate::pkt_dhcp::DHCPOFFER;
+    crate::dhcp::__reset_for_test();
+    let buf = make_dhcp_reply(
+        0x1111_2222, DHCPOFFER,
+        [192, 168, 10, 100], [192, 168, 10, 1],
+        [255, 255, 255, 0], [192, 168, 10, 1],
+        86400, &[], 0, 0, "",
+    );
+    // Must not panic.
+    on_udp_in([192,168,10,1], [255,255,255,255], 67, 68, &buf);
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_state_offer_parsed_from_wire);
+
+// ── Smoke #S2: option 1 subnet mask → /24 prefix length ──────────────
+
+fn smoke_dhcp_option1_subnet_mask() -> TestResult {
+    use crate::pkt_dhcp::{iter_options, DHCPACK, OPT_SUBNET_MASK};
+    let buf = make_dhcp_reply(
+        0xAAAA_BBBB, DHCPACK,
+        [10,1,2,3], [10,1,2,1],
+        [255,255,255,0], [10,1,2,1],
+        3600, &[], 0, 0, "",
+    );
+    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    let mut found = false;
+    for opt in iter_options(&buf[240..]) {
+        if opt.tag == OPT_SUBNET_MASK && opt.data.len() == 4 {
+            if opt.data != [255, 255, 255, 0] { return TestResult::Fail("netmask mismatch"); }
+            let prefix: u8 = opt.data.iter().map(|b| b.count_ones() as u8).sum();
+            if prefix != 24 { return TestResult::Fail("prefix length not 24"); }
+            found = true;
+        }
+    }
+    if !found { TestResult::Fail("OPT_SUBNET_MASK not found") } else { TestResult::Pass }
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_option1_subnet_mask);
+
+// ── Smoke #S3: option 3 router → default gateway address ─────────────
+
+fn smoke_dhcp_option3_router_gateway() -> TestResult {
+    use crate::pkt_dhcp::{iter_options, DHCPACK, OPT_ROUTER};
+    let buf = make_dhcp_reply(
+        0xCCCC_DDDD, DHCPACK,
+        [172,16,0,5], [172,16,0,1],
+        [255,255,0,0], [172,16,0,1],
+        7200, &[], 0, 0, "",
+    );
+    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    let mut gw = [0u8; 4];
+    let mut found = false;
+    for opt in iter_options(&buf[240..]) {
+        if opt.tag == OPT_ROUTER && opt.data.len() >= 4 {
+            gw.copy_from_slice(&opt.data[..4]);
+            found = true;
+        }
+    }
+    if !found { return TestResult::Fail("OPT_ROUTER not found"); }
+    if gw != [172, 16, 0, 1] { return TestResult::Fail("gateway address mismatch"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_option3_router_gateway);
+
+// ── Smoke #S4: option 6 DNS servers → 2 entries in wire ──────────────
+
+fn smoke_dhcp_option6_dns_two_servers() -> TestResult {
+    use crate::pkt_dhcp::{iter_options, DHCPACK, OPT_DNS_SERVER};
+    let dns: &[[u8; 4]] = &[[1, 1, 1, 1], [8, 8, 8, 8]];
+    let buf = make_dhcp_reply(
+        0xEEEE_FFFF, DHCPACK,
+        [10,0,0,5], [10,0,0,1],
+        [255,255,255,0], [10,0,0,1],
+        3600, dns, 0, 0, "",
+    );
+    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    let mut count = 0usize;
+    for opt in iter_options(&buf[240..]) {
+        if opt.tag == OPT_DNS_SERVER {
+            count = opt.data.len() / 4;
+            if count < 2 { return TestResult::Fail("too few DNS bytes"); }
+            if opt.data[..4]  != [1, 1, 1, 1] { return TestResult::Fail("DNS[0] mismatch"); }
+            if opt.data[4..8] != [8, 8, 8, 8] { return TestResult::Fail("DNS[1] mismatch"); }
+        }
+    }
+    if count < 2 { TestResult::Fail("OPT_DNS_SERVER not found or too short") } else { TestResult::Pass }
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_option6_dns_two_servers);
+
+// ── Smoke #S5: option 51 lease + explicit T1/T2 defaults ─────────────
+//
+// RFC 2131 §4.4.5: if server doesn't push 58/59 the client computes
+// T1 = 0.5 * lease, T2 = 0.875 * lease.  Here we check the wire
+// builder encodes supplied T1/T2 correctly.
+
+fn smoke_dhcp_option51_lease_and_t1_t2() -> TestResult {
+    use crate::pkt_dhcp::{
+        iter_options, DHCPACK,
+        OPT_LEASE_TIME, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2,
+    };
+    let lease: u32 = 86400;
+    let t1: u32 = lease / 2;        // 43200
+    let t2: u32 = lease * 7 / 8;    // 75600
+    let buf = make_dhcp_reply(
+        0x0102_0304, DHCPACK,
+        [10,0,1,2], [10,0,1,1],
+        [255,255,255,0], [10,0,1,1],
+        lease, &[], t1, t2, "",
+    );
+    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    let mut got_lease = 0u32;
+    let mut got_t1 = 0u32;
+    let mut got_t2 = 0u32;
+    for opt in iter_options(&buf[240..]) {
+        match opt.tag {
+            OPT_LEASE_TIME       if opt.data.len() == 4 =>
+                got_lease = u32::from_be_bytes([opt.data[0],opt.data[1],opt.data[2],opt.data[3]]),
+            OPT_RENEWAL_TIME_T1  if opt.data.len() == 4 =>
+                got_t1    = u32::from_be_bytes([opt.data[0],opt.data[1],opt.data[2],opt.data[3]]),
+            OPT_REBINDING_TIME_T2 if opt.data.len() == 4 =>
+                got_t2    = u32::from_be_bytes([opt.data[0],opt.data[1],opt.data[2],opt.data[3]]),
+            _ => {}
+        }
+    }
+    if got_lease != lease { return TestResult::Fail("lease_secs mismatch"); }
+    if got_t1 != t1       { return TestResult::Fail("T1 mismatch"); }
+    if got_t2 != t2       { return TestResult::Fail("T2 mismatch"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_option51_lease_and_t1_t2);
+
+// ── Smoke #S6: build_request_renew — unicast, ciaddr set, T1/T2 in PRL
+
+fn smoke_dhcp_renewal_request_wire() -> TestResult {
+    use crate::pkt_dhcp::{
+        build_request_renew, iter_options, DhcpHeader, DHCPREQUEST,
+        OPT_DHCP_MESSAGE_TYPE, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2,
+    };
+    let xid = 0xABCD_1234u32;
+    let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let ciaddr = [10, 20, 30, 40];
+    let pkt = build_request_renew(xid, mac, ciaddr);
+    let hdr = match DhcpHeader::decode(&pkt) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("header decode failed"),
+    };
+    if hdr.xid != xid       { return TestResult::Fail("xid mismatch"); }
+    if hdr.ciaddr != ciaddr { return TestResult::Fail("ciaddr not set for renewal"); }
+    if hdr.flags  != 0      { return TestResult::Fail("flags must be 0 for unicast renewal"); }
+    let mut got_type = 0u8;
+    let mut has_t1_req = false;
+    let mut has_t2_req = false;
+    if pkt.len() >= 240 {
+        for opt in iter_options(&pkt[240..]) {
+            match opt.tag {
+                OPT_DHCP_MESSAGE_TYPE if opt.data.len() == 1 => got_type = opt.data[0],
+                55 /* PRL */ => {
+                    has_t1_req = opt.data.contains(&OPT_RENEWAL_TIME_T1);
+                    has_t2_req = opt.data.contains(&OPT_REBINDING_TIME_T2);
+                }
+                _ => {}
+            }
+        }
+    }
+    if got_type  != DHCPREQUEST { return TestResult::Fail("not DHCPREQUEST"); }
+    if !has_t1_req { return TestResult::Fail("T1 not in PRL"); }
+    if !has_t2_req { return TestResult::Fail("T2 not in PRL"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_renewal_request_wire);
+
+// ── Smoke #S7: DHCPNAK injected through on_udp_in ────────────────────
+
+fn smoke_dhcp_nak_injected_via_on_udp_in() -> TestResult {
+    use crate::dhcp::on_udp_in;
+    use crate::pkt_dhcp::{
+        append_end, append_message_type, append_option, DhcpHeader,
+        DHCPNAK, OPT_SERVER_IDENTIFIER, OPT_DHCP_MESSAGE_TYPE, iter_options,
+    };
+    crate::dhcp::__reset_for_test();
+    let xid = 0x5A5A_A5A5u32;
+    let mut buf = alloc::vec::Vec::with_capacity(300);
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    let hdr = DhcpHeader {
+        op: 2, htype: 1, hlen: 6, hops: 0, xid,
+        secs: 0, flags: 0, ciaddr: [0;4], yiaddr: [0;4],
+        siaddr: [10,0,0,1], giaddr: [0;4], chaddr,
+    };
+    hdr.encode_into(&mut buf);
+    append_message_type(&mut buf, DHCPNAK);
+    append_option(&mut buf, OPT_SERVER_IDENTIFIER, &[10, 0, 0, 1]);
+    append_end(&mut buf);
+    // Must not panic.
+    on_udp_in([10,0,0,1], [255,255,255,255], 67, 68, &buf);
+    // Verify wire bytes carry DHCPNAK.
+    let mut got_type = 0u8;
+    if buf.len() >= 240 {
+        for opt in iter_options(&buf[240..]) {
+            if opt.tag == OPT_DHCP_MESSAGE_TYPE && opt.data.len() == 1 {
+                got_type = opt.data[0];
+            }
+        }
+    }
+    if got_type != DHCPNAK { TestResult::Fail("expected DHCPNAK in wire") }
+    else { TestResult::Pass }
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_nak_injected_via_on_udp_in);
+
+// ── Smoke #S8: build_release — unicast, ciaddr set, server ID ─────────
+
+fn smoke_dhcp_release_wire() -> TestResult {
+    use crate::pkt_dhcp::{
+        build_release, iter_options, DhcpHeader, DHCPRELEASE,
+        OPT_DHCP_MESSAGE_TYPE, OPT_SERVER_IDENTIFIER,
+    };
+    let xid = 0x1234_5678u32;
+    let mac    = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let ciaddr = [192, 168, 1, 50];
+    let server = [192, 168, 1,  1];
+    let pkt = build_release(xid, mac, ciaddr, server);
+    let hdr = match DhcpHeader::decode(&pkt) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("header decode failed"),
+    };
+    if hdr.xid    != xid    { return TestResult::Fail("xid mismatch"); }
+    if hdr.ciaddr != ciaddr { return TestResult::Fail("ciaddr mismatch in RELEASE"); }
+    if hdr.flags  != 0      { return TestResult::Fail("flags must be 0 (unicast RELEASE)"); }
+    let mut got_type = 0u8;
+    let mut got_srv  = [0u8; 4];
+    if pkt.len() >= 240 {
+        for opt in iter_options(&pkt[240..]) {
+            match opt.tag {
+                OPT_DHCP_MESSAGE_TYPE  if opt.data.len() == 1 => got_type = opt.data[0],
+                OPT_SERVER_IDENTIFIER  if opt.data.len() == 4 => got_srv.copy_from_slice(opt.data),
+                _ => {}
+            }
+        }
+    }
+    if got_type != DHCPRELEASE { return TestResult::Fail("not DHCPRELEASE"); }
+    if got_srv  != server       { return TestResult::Fail("server ID mismatch"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_release_wire);
+
+// ── Smoke #S9: build_decline — Requested-IP + Server-ID present ───────
+
+fn smoke_dhcp_decline_wire() -> TestResult {
+    use crate::pkt_dhcp::{
+        build_decline, iter_options, DhcpHeader, DHCPDECLINE,
+        OPT_DHCP_MESSAGE_TYPE, OPT_SERVER_IDENTIFIER, OPT_REQUESTED_IP,
+    };
+    let xid        = 0x9999_AAAAu32;
+    let mac        = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let declined   = [10, 0, 0, 99];
+    let server     = [10, 0, 0,  1];
+    let pkt = build_decline(xid, mac, declined, server);
+    let hdr = match DhcpHeader::decode(&pkt) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("header decode failed"),
+    };
+    if hdr.xid != xid { return TestResult::Fail("xid mismatch"); }
+    let mut got_type = 0u8;
+    let mut got_srv  = [0u8; 4];
+    let mut got_req  = [0u8; 4];
+    if pkt.len() >= 240 {
+        for opt in iter_options(&pkt[240..]) {
+            match opt.tag {
+                OPT_DHCP_MESSAGE_TYPE  if opt.data.len() == 1 => got_type = opt.data[0],
+                OPT_SERVER_IDENTIFIER  if opt.data.len() == 4 => got_srv.copy_from_slice(opt.data),
+                OPT_REQUESTED_IP       if opt.data.len() == 4 => got_req.copy_from_slice(opt.data),
+                _ => {}
+            }
+        }
+    }
+    if got_type != DHCPDECLINE { return TestResult::Fail("not DHCPDECLINE"); }
+    if got_srv  != server      { return TestResult::Fail("server ID mismatch in DECLINE"); }
+    if got_req  != declined    { return TestResult::Fail("Requested-IP mismatch in DECLINE"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_decline_wire);
+
+// ── Smoke #S10: A query wire format — qname encoding + type/class ─────
+//
+// "example.com" → \x07example\x03com\x00 (13 bytes).
+// Full query: 12 (hdr) + 13 (qname) + 2 (qtype) + 2 (qclass) = 29 bytes.
+
+fn smoke_dns_a_query_wire_example_com() -> TestResult {
+    use crate::pkt_dns::{build_a_query, FLAG_RD, TYPE_A, CLASS_IN};
+    let pkt = match build_a_query(0xABCD, "example.com") {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("build_a_query failed"),
+    };
+    if pkt.len() < 29 { return TestResult::Fail("packet shorter than 29 bytes"); }
+    let id    = u16::from_be_bytes([pkt[0], pkt[1]]);
+    let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+    if id != 0xABCD          { return TestResult::Fail("query ID mismatch"); }
+    if flags & FLAG_RD == 0  { return TestResult::Fail("RD bit not set"); }
+    if qdcount != 1          { return TestResult::Fail("qdcount != 1"); }
+    // QNAME at offset 12.
+    let expected: &[u8] = &[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+        3, b'c', b'o', b'm', 0,
+    ];
+    if &pkt[12..12 + expected.len()] != expected {
+        return TestResult::Fail("qname encoding wrong");
+    }
+    let qt_off = 12 + expected.len();
+    let qtype  = u16::from_be_bytes([pkt[qt_off],     pkt[qt_off + 1]]);
+    let qclass = u16::from_be_bytes([pkt[qt_off + 2], pkt[qt_off + 3]]);
+    if qtype  != TYPE_A  { return TestResult::Fail("qtype not A"); }
+    if qclass != CLASS_IN { return TestResult::Fail("qclass not IN"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dns", smoke_dns_a_query_wire_example_com);
+
+// ── Smoke #S11: parse A response → RData::A([1,2,3,4]) ───────────────
+
+fn smoke_dns_parse_a_response() -> TestResult {
+    use crate::dns::{__parse_response_for_test, RData};
+    use crate::pkt_dns::{TYPE_A, CLASS_IN};
+
+    // Minimal wire response:
+    //   Header: ID=1, QR=1, RA=1, QDCOUNT=1, ANCOUNT=1
+    //   Question:  example.com A IN
+    //   Answer:    <ptr to offset 12> A IN TTL=300 RDATA=1.2.3.4
+    let qname: &[u8] = &[7,b'e',b'x',b'a',b'm',b'p',b'l',b'e',3,b'c',b'o',b'm',0];
+    let mut msg = alloc::vec::Vec::new();
+    msg.extend_from_slice(&[0x00,0x01, 0x81,0x80, 0x00,0x01, 0x00,0x01, 0x00,0x00, 0x00,0x00]);
+    msg.extend_from_slice(qname);
+    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
+    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    // Answer: compression pointer → offset 12.
+    msg.extend_from_slice(&[0xC0, 0x0C]);
+    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
+    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(&300u32.to_be_bytes());   // TTL
+    msg.extend_from_slice(&4u16.to_be_bytes());     // RDLENGTH
+    msg.extend_from_slice(&[1, 2, 3, 4]);            // RDATA
+
+    let (records, ttl) = match __parse_response_for_test(&msg, "example.com", TYPE_A) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("parse_dns_response failed"),
+    };
+    if records.len() != 1 { return TestResult::Fail("expected 1 answer"); }
+    match &records[0] {
+        RData::A(ip) if *ip == [1u8,2,3,4] => {}
+        _ => return TestResult::Fail("A record IP mismatch"),
+    }
+    if ttl != 300 { return TestResult::Fail("TTL mismatch"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dns", smoke_dns_parse_a_response);
+
+// ── Smoke #S12: CNAME chain foo.com → bar.com → 5.6.7.8 ──────────────
+
+fn smoke_dns_cname_chain_resolve() -> TestResult {
+    use crate::dns::{__parse_response_for_test, RData};
+    use crate::pkt_dns::{TYPE_A, TYPE_CNAME, CLASS_IN};
+
+    // Both names as plain (uncompressed) labels:
+    //   foo.com = 3 f o o . 3 c o m . 0  (9 bytes)
+    //   bar.com = 3 b a r . 3 c o m . 0  (9 bytes)
+    let foo: &[u8] = &[3,b'f',b'o',b'o',3,b'c',b'o',b'm',0];
+    let bar: &[u8] = &[3,b'b',b'a',b'r',3,b'c',b'o',b'm',0];
+    let mut msg = alloc::vec::Vec::new();
+    // Header: QDCOUNT=1, ANCOUNT=2.
+    msg.extend_from_slice(&[0x00,0x02, 0x81,0x80, 0x00,0x01, 0x00,0x02, 0x00,0x00, 0x00,0x00]);
+    // Question: foo.com A IN.
+    msg.extend_from_slice(foo);
+    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
+    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    // Answer 1: foo.com CNAME bar.com (TTL=60).
+    msg.extend_from_slice(foo);
+    msg.extend_from_slice(&(TYPE_CNAME as u16).to_be_bytes());
+    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(&60u32.to_be_bytes());
+    msg.extend_from_slice(&(bar.len() as u16).to_be_bytes());
+    msg.extend_from_slice(bar);
+    // Answer 2: bar.com A 5.6.7.8 (TTL=120).
+    msg.extend_from_slice(bar);
+    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
+    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(&120u32.to_be_bytes());
+    msg.extend_from_slice(&4u16.to_be_bytes());
+    msg.extend_from_slice(&[5, 6, 7, 8]);
+
+    let (records, ttl) = match __parse_response_for_test(&msg, "foo.com", TYPE_A) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("cname chain parse failed"),
+    };
+    if records.len() != 1 { return TestResult::Fail("expected 1 final A record"); }
+    match &records[0] {
+        RData::A(ip) if *ip == [5u8,6,7,8] => {}
+        _ => return TestResult::Fail("final A IP mismatch after CNAME chain"),
+    }
+    if ttl != 120 { return TestResult::Fail("TTL should come from the A RR, not the CNAME"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dns", smoke_dns_cname_chain_resolve);
+
+// ── Smoke #S13: DNS TTL cache — insert then immediate hit ─────────────
+
+fn smoke_dns_cache_ttl_hit() -> TestResult {
+    use crate::dns::{
+        __cache_insert_for_test, __cache_lookup_for_test,
+        __flush_cache_for_test, RData,
+    };
+    use crate::pkt_dns::TYPE_A;
+
+    __flush_cache_for_test();
+    let records = alloc::vec![RData::A([9, 8, 7, 6])];
+    __cache_insert_for_test("cached.example", TYPE_A, records, 300);
+
+    // Immediate lookup should be a cache hit.
+    match __cache_lookup_for_test("cached.example", TYPE_A) {
+        None => return TestResult::Fail("cache miss immediately after insert"),
+        Some(r) => match r.first() {
+            Some(RData::A(ip)) if *ip == [9u8,8,7,6] => {}
+            _ => return TestResult::Fail("cached IP mismatch"),
+        },
+    }
+    // Different name must miss.
+    if __cache_lookup_for_test("other.example", TYPE_A).is_some() {
+        return TestResult::Fail("unexpected hit for different name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dns", smoke_dns_cache_ttl_hit);
+
+// ── Smoke #S14: resolv.conf parse — 2 nameservers + search list ───────
+
+fn smoke_resolv_conf_parse_two_ns_and_search() -> TestResult {
+    use crate::resolv_conf::ResolvConfig;
+    let content = "# test\nnameserver 1.1.1.1\nnameserver 8.8.8.8\nsearch example.com local\noptions ndots:2 timeout:3 rotate\n";
+    let cfg = ResolvConfig::parse(content);
+    if cfg.nameservers.len() != 2  { return TestResult::Fail("expected 2 nameservers"); }
+    if cfg.nameservers[0] != "1.1.1.1" { return TestResult::Fail("ns[0] mismatch"); }
+    if cfg.nameservers[1] != "8.8.8.8" { return TestResult::Fail("ns[1] mismatch"); }
+    if cfg.search.len() != 2       { return TestResult::Fail("expected 2 search domains"); }
+    if cfg.search[0] != "example.com" { return TestResult::Fail("search[0] mismatch"); }
+    if cfg.search[1] != "local"    { return TestResult::Fail("search[1] mismatch"); }
+    if cfg.ndots   != 2            { return TestResult::Fail("ndots should be 2"); }
+    if cfg.timeout != 3            { return TestResult::Fail("timeout should be 3"); }
+    if !cfg.rotate                 { return TestResult::Fail("rotate should be true"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_resolv_conf_parse_two_ns_and_search);

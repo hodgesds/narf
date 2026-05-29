@@ -49,6 +49,8 @@ pub mod http;
 pub mod http2;
 pub mod mqtt;
 pub mod dhcp;
+pub mod dns;
+pub mod resolv_conf;
 pub mod arp;
 pub mod arp_cache;
 pub mod ifaddr;

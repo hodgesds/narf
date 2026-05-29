@@ -68,6 +68,8 @@ pub const OPT_ROUTER: u8 = 3;
 pub const OPT_DNS_SERVER: u8 = 6;
 pub const OPT_HOSTNAME: u8 = 12;
 pub const OPT_DOMAIN_NAME: u8 = 15;
+/// RFC 2132 §5.1 — interface MTU in bytes (2-byte big-endian value).
+pub const OPT_INTERFACE_MTU: u8 = 26;
 pub const OPT_BROADCAST_ADDRESS: u8 = 28;
 pub const OPT_NTP_SERVERS: u8 = 42;
 pub const OPT_REQUESTED_IP: u8 = 50;
@@ -286,7 +288,136 @@ pub fn build_discover(xid: u32, mac: [u8; 6]) -> Vec<u8> {
     append_client_identifier_eth(&mut out, &mac);
     append_parameter_request_list(
         &mut out,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_DOMAIN_NAME, OPT_LEASE_TIME],
+        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_DOMAIN_NAME, OPT_LEASE_TIME,
+          OPT_INTERFACE_MTU, OPT_BROADCAST_ADDRESS, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2],
+    );
+    append_end(&mut out);
+    out
+}
+
+/// Build a DHCPREQUEST for lease renewal/rebinding (RENEWING/REBINDING).
+///
+/// RFC 2131 §4.3.2: in RENEWING the client unicasts to the server; in
+/// REBINDING it broadcasts. `ciaddr` is set to the currently-bound
+/// address. No Requested-IP or Server-Identifier options are included
+/// in renewal REQUESTs per RFC 2131 §4.3.2.
+pub fn build_request_renew(xid: u32, mac: [u8; 6], ciaddr: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(300);
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&mac);
+    let header = DhcpHeader {
+        op: OP_BOOT_REQUEST,
+        htype: HTYPE_ETHERNET,
+        hlen: 6,
+        hops: 0,
+        xid,
+        secs: 0,
+        flags: 0,
+        ciaddr,
+        yiaddr: [0; 4],
+        siaddr: [0; 4],
+        giaddr: [0; 4],
+        chaddr,
+    };
+    header.encode_into(&mut out);
+    append_message_type(&mut out, DHCPREQUEST);
+    append_client_identifier_eth(&mut out, &mac);
+    append_parameter_request_list(
+        &mut out,
+        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_LEASE_TIME,
+          OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2],
+    );
+    append_end(&mut out);
+    out
+}
+
+/// Build a DHCPDECLINE for an offered address that failed ARP probe.
+///
+/// RFC 2131 §4.4.1: sent when the client detects the offered address is
+/// already in use. Contains Requested-IP-Address + Server-Identifier.
+pub fn build_decline(xid: u32, mac: [u8; 6], declined_ip: [u8; 4], server_id: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(300);
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&mac);
+    let header = DhcpHeader {
+        op: OP_BOOT_REQUEST,
+        htype: HTYPE_ETHERNET,
+        hlen: 6,
+        hops: 0,
+        xid,
+        secs: 0,
+        flags: FLAG_BROADCAST,
+        ciaddr: [0; 4],
+        yiaddr: [0; 4],
+        siaddr: [0; 4],
+        giaddr: [0; 4],
+        chaddr,
+    };
+    header.encode_into(&mut out);
+    append_message_type(&mut out, DHCPDECLINE);
+    append_requested_ip(&mut out, declined_ip);
+    append_server_identifier(&mut out, server_id);
+    append_client_identifier_eth(&mut out, &mac);
+    append_end(&mut out);
+    out
+}
+
+/// Build a DHCPRELEASE for clean shutdown (RFC 2131 §4.4.6).
+/// `ciaddr` is the currently-bound address. Sent unicast to server.
+pub fn build_release(xid: u32, mac: [u8; 6], ciaddr: [u8; 4], server_id: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(300);
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&mac);
+    let header = DhcpHeader {
+        op: OP_BOOT_REQUEST,
+        htype: HTYPE_ETHERNET,
+        hlen: 6,
+        hops: 0,
+        xid,
+        secs: 0,
+        flags: 0,
+        ciaddr,
+        yiaddr: [0; 4],
+        siaddr: [0; 4],
+        giaddr: [0; 4],
+        chaddr,
+    };
+    header.encode_into(&mut out);
+    append_message_type(&mut out, DHCPRELEASE);
+    append_server_identifier(&mut out, server_id);
+    append_client_identifier_eth(&mut out, &mac);
+    append_end(&mut out);
+    out
+}
+
+/// Build a DHCPINFORM for stateless configuration (RFC 2131 §4.4.3).
+/// `ciaddr` is the externally-configured address. Requests options
+/// but does not include lease-time options.
+pub fn build_inform(xid: u32, mac: [u8; 6], ciaddr: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(300);
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&mac);
+    let header = DhcpHeader {
+        op: OP_BOOT_REQUEST,
+        htype: HTYPE_ETHERNET,
+        hlen: 6,
+        hops: 0,
+        xid,
+        secs: 0,
+        flags: FLAG_BROADCAST,
+        ciaddr,
+        yiaddr: [0; 4],
+        siaddr: [0; 4],
+        giaddr: [0; 4],
+        chaddr,
+    };
+    header.encode_into(&mut out);
+    append_message_type(&mut out, DHCPINFORM);
+    append_client_identifier_eth(&mut out, &mac);
+    append_parameter_request_list(
+        &mut out,
+        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_DOMAIN_NAME,
+          OPT_INTERFACE_MTU, OPT_BROADCAST_ADDRESS],
     );
     append_end(&mut out);
     out
@@ -319,7 +450,8 @@ pub fn build_request(xid: u32, mac: [u8; 6], requested_ip: [u8; 4], server_id: [
     append_client_identifier_eth(&mut out, &mac);
     append_parameter_request_list(
         &mut out,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_LEASE_TIME],
+        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_LEASE_TIME,
+          OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2],
     );
     append_end(&mut out);
     out
