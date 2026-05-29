@@ -1185,3 +1185,309 @@ kernel_test_in!(
     "filesystem/root_selector",
     smoke_root_mount_selector_no_match_refuses
 );
+
+// ── /dev/input smoke tests ─────────────────────────────────────────────────────
+//
+// All smokes prefix their ROUTER-registered devices with a comment so
+// readers know which global state they touch.  Each test unregisters its
+// device before returning.
+
+/// Helper: poll a future exactly once, returning `None` on Pending.
+fn poll_once_devfs_input<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn raw_waker() -> RawWaker {
+        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+/// 1. DevInputDir enumerate finds event0 after a device registers.
+fn smoke_dev_input_dir_enumerate_finds_event0() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+    use crate::devfs_input::DevInputDir;
+    use crate::DirOps;
+
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+
+    let dir = DevInputDir;
+    let entries = dir.enumerate(0, 32);
+    let found = entries.iter().any(|(name, _)| name.starts_with("event"));
+    ROUTER.unregister_device(id);
+
+    if !found {
+        return TestResult::Fail("enumerate did not find any event* entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_dir_enumerate_finds_event0);
+
+/// 2. InputEventFile read with empty ring + zero-size buf → 0 bytes (non-blocking).
+fn smoke_dev_input_read_zero_buf_non_blocking() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None for live device");
+        }
+    };
+
+    let mut buf = [];
+    let result = poll_once_devfs_input(file.read(0, &mut buf));
+    ROUTER.unregister_device(id);
+
+    match result {
+        Some(Ok(0)) => TestResult::Pass,
+        Some(Ok(n)) => {
+            let _ = n;
+            TestResult::Fail("empty buf read returned non-zero byte count")
+        }
+        Some(Err(_)) => TestResult::Fail("empty buf read returned error"),
+        None => TestResult::Fail("empty buf read returned Pending"),
+    }
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_read_zero_buf_non_blocking);
+
+/// 3. InputEventFile read with 1 event available → exactly EVDEV_EVENT_SIZE bytes,
+///    layout matches the event that was dispatched.
+fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use narf_input::evdev::key::KEY_A;
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+    use core::mem;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let (id, node) = ROUTER.register_device(caps);
+
+    let now = narf_time::now_cycles();
+    let sent = EvdevEvent { time: now, type_: EventType::Key, code: KEY_A, value: 1 };
+    node.dispatch(sent);
+
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None");
+        }
+    };
+
+    let mut buf = [0u8; 16];
+    let result = poll_once_devfs_input(file.read(0, &mut buf));
+    ROUTER.unregister_device(id);
+
+    match result {
+        Some(Ok(n)) if n == mem::size_of::<EvdevEvent>() => {}
+        Some(Ok(n)) => {
+            let _ = n;
+            return TestResult::Fail("read did not return exactly EVDEV_EVENT_SIZE bytes");
+        }
+        _ => return TestResult::Fail("read failed or returned Pending"),
+    }
+
+    // Verify layout: reconstruct EvdevEvent from the raw bytes.
+    let got: EvdevEvent = unsafe {
+        let mut v = core::mem::MaybeUninit::<EvdevEvent>::uninit();
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), v.as_mut_ptr() as *mut u8, 16);
+        v.assume_init()
+    };
+    if got.type_ != EventType::Key {
+        return TestResult::Fail("event type mismatch in serialised bytes");
+    }
+    if got.code != KEY_A {
+        return TestResult::Fail("event code mismatch");
+    }
+    if got.value != 1 {
+        return TestResult::Fail("event value mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_read_one_event_correct_layout);
+
+/// 4. InputEventFile read with 5 events available and a 10-event buffer →
+///    exactly 5 events returned in one call.
+fn smoke_dev_input_read_five_events_in_one_call() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use narf_input::evdev::key::KEY_A;
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+    use core::mem;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let (id, node) = ROUTER.register_device(caps);
+
+    let now = narf_time::now_cycles();
+    for v in 0i32..5 {
+        node.dispatch(EvdevEvent { time: now, type_: EventType::Key, code: KEY_A, value: v });
+    }
+
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None");
+        }
+    };
+
+    const EVENT_SIZE: usize = mem::size_of::<EvdevEvent>();
+    let mut buf = [0u8; EVENT_SIZE * 10];
+    let result = poll_once_devfs_input(file.read(0, &mut buf));
+    ROUTER.unregister_device(id);
+
+    match result {
+        Some(Ok(n)) if n == EVENT_SIZE * 5 => TestResult::Pass,
+        Some(Ok(n)) => {
+            let _ = n;
+            TestResult::Fail("read returned wrong byte count for 5 events")
+        }
+        _ => TestResult::Fail("read failed or returned Pending"),
+    }
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_read_five_events_in_one_call);
+
+/// 5. Write to hardware device → PermissionDenied.
+fn smoke_dev_input_write_hardware_denied() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::{FileOps, FsError};
+
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None");
+        }
+    };
+
+    // Attempt to write 16 zero bytes (one null EvdevEvent).
+    let payload = [0u8; 16];
+    let result = poll_once_devfs_input(file.write(0, &payload));
+    ROUTER.unregister_device(id);
+
+    match result {
+        Some(Err(FsError::PermissionDenied)) => TestResult::Pass,
+        Some(Err(_)) => TestResult::Fail("wrong error variant for hardware write"),
+        Some(Ok(_)) => TestResult::Fail("hardware write unexpectedly succeeded"),
+        None => TestResult::Fail("hardware write returned Pending"),
+    }
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_write_hardware_denied);
+
+/// 6. Write to UserDevice → event injected; reader sees it round-trip.
+fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use narf_input::evdev::key::KEY_A;
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+    use core::mem;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let (id, _node) = ROUTER.register_device(caps);
+
+    let file = match InputEventFile::open(id, DeviceKind::UserDevice) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None");
+        }
+    };
+
+    // Build a valid EvdevEvent into raw bytes.
+    let ev = EvdevEvent {
+        time: 0,
+        type_: EventType::Key,
+        code: KEY_A,
+        value: 1,
+    };
+    let mut payload = [0u8; 16];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &ev as *const EvdevEvent as *const u8,
+            payload.as_mut_ptr(),
+            mem::size_of::<EvdevEvent>(),
+        );
+    }
+
+    // Write the event via the uinput path.
+    let write_result = poll_once_devfs_input(file.write(0, &payload));
+    match write_result {
+        Some(Ok(n)) if n == 16 => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("uinput write failed or returned wrong count");
+        }
+    }
+
+    // Open a reader and check the event arrived.
+    let reader = match ROUTER.open_reader(id) {
+        Some(r) => r,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open_reader returned None after inject");
+        }
+    };
+    let ev_got = reader.poll_event();
+    ROUTER.unregister_device(id);
+
+    match ev_got {
+        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1 => {
+            TestResult::Pass
+        }
+        Some(_) => TestResult::Fail("injected event had wrong fields"),
+        None => TestResult::Fail("reader saw no event after uinput write"),
+    }
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_write_uinput_injects_event);
+
+/// 7. `/dev/input/event0` open by path resolves through DevDir → InputEventFile.
+fn smoke_dev_input_open_by_path() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+    use crate::{bootstrap_mount_authority, registry, DevFs, FileType};
+
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+    let event_num = id.0 - 1;
+
+    let auth = bootstrap_mount_authority();
+    // Mount at a test-local path to avoid colliding with earlier smokes.
+    let _ = registry().mount(&auth, "/dev", DevFs::new());
+
+    // Build the path "/dev/input/eventN" for the device we just registered.
+    let abs_path = alloc::format!("/dev/input/event{}", event_num);
+    let result = registry().resolve_absolute(
+        &abs_path,
+        |fs, rel| crate::resolve(fs.root(), rel).ok(),
+    );
+
+    ROUTER.unregister_device(id);
+
+    match result {
+        Some(Some(file_ops)) => {
+            // Confirm stat returns FileType::Special.
+            if file_ops.stat().mode.file_type != FileType::Special {
+                return TestResult::Fail("event file stat is not Special");
+            }
+            TestResult::Pass
+        }
+        Some(None) => TestResult::Fail("resolve returned None for event file"),
+        None => TestResult::Fail("resolve_absolute did not find /dev mount"),
+    }
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_open_by_path);

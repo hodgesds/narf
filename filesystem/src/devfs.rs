@@ -527,6 +527,7 @@ impl DirOps for DevDir {
             DirEntry { name: "fp0",     file_type: FileType::Special },
             DirEntry { name: "pts",     file_type: FileType::Dir },
             DirEntry { name: "disk",    file_type: FileType::Dir },
+            DirEntry { name: "input",   file_type: FileType::Dir },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -548,6 +549,7 @@ impl DirOps for DevDir {
             ("fp0",     FileType::Special),
             ("pts",     FileType::Dir),
             ("disk",    FileType::Dir),
+            ("input",   FileType::Dir),
         ];
         let static_names: Vec<String> = static_entries.iter().map(|(n, _)| (*n).into()).collect();
         let block_extras: Vec<(String, FileType)> =

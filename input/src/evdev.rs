@@ -448,6 +448,13 @@ impl Reader {
         g.ring.pop_front()
     }
 
+    /// Non-destructive check: `true` iff the ring has at least one
+    /// event pending. Used by `poll_readiness()` to avoid draining the
+    /// ring as a side-effect of checking.
+    pub fn has_pending(&self) -> bool {
+        !self.node.inner.lock().ring.is_empty()
+    }
+
     /// Is the underlying device still alive?
     pub fn is_valid(&self) -> bool {
         self.node.is_alive()
@@ -557,6 +564,20 @@ impl Router {
     /// Return the number of registered (live) devices.
     pub fn device_count(&self) -> usize {
         self.inner.lock().devices.len()
+    }
+
+    /// Snapshot the list of currently-registered live device ids.
+    /// The returned vec is a point-in-time view; devices may be added
+    /// or removed after this call returns. Used by `DevInputDir` to
+    /// enumerate `/dev/input/event*` entries.
+    pub fn device_ids(&self) -> Vec<DeviceId> {
+        self.inner
+            .lock()
+            .devices
+            .iter()
+            .filter(|n| n.is_alive())
+            .map(|n| n.id)
+            .collect()
     }
 }
 

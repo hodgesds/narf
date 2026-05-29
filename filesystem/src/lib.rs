@@ -77,6 +77,7 @@ pub mod uevent;
 mod tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
+mod sysfs_tests;
 pub use devfs::{install_console_signal_hook, mount_default as mount_devfs_default, DevFs};
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
 pub use fuse::{
