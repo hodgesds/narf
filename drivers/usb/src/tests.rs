@@ -3176,3 +3176,614 @@ fn smoke_ccid_t1_sequence_number_wrap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_sequence_number_wrap);
+
+// ── xhci spec-encode smokes ────────────────────────────────────────
+//
+// Verify the spec-aligned TRB / register / DCBAA / ERST / Slot+EP
+// Context encoders against the xHCI 1.2 specification field layouts.
+// These tests are pure encode/decode against hand-computed bit
+// patterns; they don't touch any controller MMIO so they pass on
+// hardware-less boots (Stage-1 verification).
+
+/// xHCI capability-register decode — confirm HCSPARAMS1 / HCSPARAMS2
+/// / HCCPARAMS1 unpack the fields the bring-up path needs.
+fn smoke_xhci_cap_decode_hcsparams1_hccparams1() -> TestResult {
+    use crate::xhci::cap::{
+        decode_hccparams1, decode_hcsparams1, HccParams1, HcsParams1, HcsParams2,
+    };
+    // HCSPARAMS1 fields: MaxSlots[7:0]=0x40, MaxIntrs[18:8]=0x20,
+    // MaxPorts[31:24]=0x14. Build: 0x14_00_20_40 (BE-style).
+    // 0x14 << 24 | 0x20 << 8 | 0x40 = 0x14002040.
+    let v = (0x14u32 << 24) | (0x20u32 << 8) | 0x40u32;
+    let h = decode_hcsparams1(v);
+    if h != (HcsParams1 { max_slots: 0x40, max_intrs: 0x20, max_ports: 0x14 }) {
+        return TestResult::Fail("HCSPARAMS1 decode mismatch");
+    }
+    // HCCPARAMS1: AC64=1, CSZ=0, xECP=0x100 dwords.
+    let h = decode_hccparams1(0x0100_0001);
+    let want = HccParams1 {
+        ac64: true,
+        bnc: false,
+        csz_64byte: false,
+        ppc: false,
+        pind: false,
+        lhrc: false,
+        ltc: false,
+        nss: false,
+        max_psa_size: 0,
+        xecp_dwords: 0x100,
+    };
+    if h != want {
+        return TestResult::Fail("HCCPARAMS1 decode mismatch");
+    }
+    // HCSPARAMS2: MAXSCRATCHPAD_BUFS spans bits[25:21] (high) +
+    // bits[31:27] (low). Want bufs=4: low=4 in bits[31:27].
+    let p2 = HcsParams2::decode(4u32 << 27);
+    if p2.max_scratchpad_bufs != 4 {
+        return TestResult::Fail("MAXSCRATCHPAD_BUFS low-only decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_cap_decode_hcsparams1_hccparams1);
+
+/// PORTSC decode — the port-reset state machine reads CCS/PED/PR/PLS
+/// + the change bits. Verify [`PortStatus::decode`] surfaces them.
+fn smoke_xhci_portsc_decode_state_machine() -> TestResult {
+    use crate::xhci::op::{PortLinkState, PortStatus, PORTSC_CCS, PORTSC_CSC, PORTSC_PR, PORTSC_PRC};
+    // Connected, reset-in-progress: CCS=1, PR=1, CSC=1 (a hot-plug
+    // event), PLS=Polling (7). PORTSC_PLS at bits[8:5].
+    let v = PORTSC_CCS | PORTSC_PR | PORTSC_CSC | (7u32 << 5);
+    let st = PortStatus::decode(v);
+    if !st.connected || !st.reset_in_progress || !st.csc {
+        return TestResult::Fail("expected CCS+PR+CSC set");
+    }
+    if st.link_state != Some(PortLinkState::Polling) {
+        return TestResult::Fail("PLS should decode to Polling");
+    }
+    // After reset: clear PRC + CSC via RW1C writeback. The compose
+    // helper should NOT carry PR back (only the change bits).
+    let wb = PortStatus::clear_changes_value(v, PORTSC_PRC | PORTSC_CSC);
+    if (wb & PORTSC_PR) != 0 {
+        return TestResult::Fail("clear_changes_value must drop PR");
+    }
+    if (wb & PORTSC_PRC) == 0 || (wb & PORTSC_CSC) == 0 {
+        return TestResult::Fail("clear_changes_value must keep change-clear bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_portsc_decode_state_machine);
+
+/// Command TRB encode — Enable Slot / Address Device / Configure
+/// Endpoint each carry well-known bit patterns.
+fn smoke_xhci_cmd_trb_encode_address_configure_enable() -> TestResult {
+    use crate::xhci::cmd_ring::{
+        encode_address_device, encode_configure_endpoint, encode_enable_slot,
+        TRB_TYPE_ADDRESS_DEVICE_CMD, TRB_TYPE_CONFIGURE_ENDPOINT_CMD,
+        TRB_TYPE_ENABLE_SLOT_CMD, TRB_TYPE_MASK, TRB_TYPE_SHIFT,
+    };
+    let trb = encode_enable_slot(0, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_ENABLE_SLOT_CMD {
+        return TestResult::Fail("Enable Slot wrong TRB type");
+    }
+    if (trb.control & 1) != 1 {
+        return TestResult::Fail("Cycle bit not preserved");
+    }
+    let trb = encode_address_device(0x12_3456_0000, 5, /*bsr*/ false, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_ADDRESS_DEVICE_CMD {
+        return TestResult::Fail("Address Device wrong TRB type");
+    }
+    if ((trb.control >> 24) & 0xFF) != 5 {
+        return TestResult::Fail("Address Device slot_id not in bits[31:24]");
+    }
+    if (trb.parameter & 0xF) != 0 {
+        return TestResult::Fail("Address Device parameter must be 16-byte aligned");
+    }
+    let trb = encode_configure_endpoint(0x40_0000_0000, 7, /*dc*/ false, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_CONFIGURE_ENDPOINT_CMD {
+        return TestResult::Fail("Configure Endpoint wrong TRB type");
+    }
+    if ((trb.control >> 24) & 0xFF) != 7 {
+        return TestResult::Fail("Configure Endpoint slot_id not in bits[31:24]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_cmd_trb_encode_address_configure_enable);
+
+/// Event TRB decode — Transfer Event, Command Completion, Port Status
+/// Change. Each fields its slot/EP/completion-code per §6.4.2.
+fn smoke_xhci_event_trb_decode_transfer_cmd_psc() -> TestResult {
+    use crate::xhci::event_ring::{
+        DecodedEvent, EVT_CMD_COMPLETION, EVT_PORT_STATUS_CHANGE, EVT_TRANSFER,
+    };
+    use crate::xhci::cmd_ring::TRB_TYPE_SHIFT;
+    // Transfer Event: slot=3, EP=DCI=2 (bulk-OUT EP1), completion=1 (Success),
+    // transfer_length residue=4. Pack into 4 dwords.
+    let xfer_d3 = (EVT_TRANSFER << TRB_TYPE_SHIFT) | (3u32 << 24) | (2u32 << 16);
+    let xfer_d2 = (1u32 << 24) | 4;
+    let ev = DecodedEvent::from_dwords([0xCAFE0000, 0, xfer_d2, xfer_d3]);
+    match ev {
+        DecodedEvent::Transfer(t) => {
+            if t.slot_id != 3 || t.endpoint_id != 2 || t.completion_code != 1 || t.transfer_length != 4 {
+                return TestResult::Fail("Transfer Event fields mismatch");
+            }
+        }
+        _ => return TestResult::Fail("expected Transfer Event"),
+    }
+    // Command Completion: slot=5, completion=9 (TRB Error).
+    let cmd_d3 = (EVT_CMD_COMPLETION << TRB_TYPE_SHIFT) | (5u32 << 24);
+    let cmd_d2 = 9u32 << 24;
+    let ev = DecodedEvent::from_dwords([0xABCD_0010, 0, cmd_d2, cmd_d3]);
+    match ev {
+        DecodedEvent::CmdCompletion(c) => {
+            if c.slot_id != 5 || c.completion_code != 9 {
+                return TestResult::Fail("CmdCompletion fields mismatch");
+            }
+        }
+        _ => return TestResult::Fail("expected CmdCompletion"),
+    }
+    // Port Status Change: port_id=4 lives in parameter bits[31:24].
+    let psc_d1 = 4u32 << 24;
+    let psc_d3 = EVT_PORT_STATUS_CHANGE << TRB_TYPE_SHIFT;
+    let ev = DecodedEvent::from_dwords([0, psc_d1, 0, psc_d3]);
+    match ev {
+        DecodedEvent::PortStatusChange(p) => {
+            if p.port_id != 4 {
+                return TestResult::Fail("PortStatusChange port_id mismatch");
+            }
+        }
+        _ => return TestResult::Fail("expected PortStatusChange"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_event_trb_decode_transfer_cmd_psc);
+
+/// Normal TRB encode — bulk-OUT data buffer + IOC flag.
+fn smoke_xhci_normal_trb_encode_bulk_out() -> TestResult {
+    use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_MASK, TRB_TYPE_NORMAL, TRB_TYPE_SHIFT};
+    use crate::xhci::transfer_ring::encode_normal;
+    let buf_pa: u64 = 0x1000_0000;
+    let trb = encode_normal(buf_pa, 1500, /*ioc*/ true, /*chain*/ false, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_NORMAL {
+        return TestResult::Fail("Normal TRB wrong type");
+    }
+    if (trb.status & 0x1_FFFF) != 1500 {
+        return TestResult::Fail("Normal TRB length not in status[16:0]");
+    }
+    if (trb.control & TRB_IOC) == 0 {
+        return TestResult::Fail("IOC must be set");
+    }
+    if trb.parameter != buf_pa {
+        return TestResult::Fail("Normal TRB parameter must hold buf_pa");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_normal_trb_encode_bulk_out);
+
+/// Setup / Data / Status Stage TRB encode for a control IN transfer.
+fn smoke_xhci_setup_data_status_stage_encode() -> TestResult {
+    use crate::xhci::cmd_ring::{
+        TRB_IDT, TRB_IOC, TRB_TYPE_DATA_STAGE, TRB_TYPE_MASK, TRB_TYPE_SETUP_STAGE,
+        TRB_TYPE_SHIFT, TRB_TYPE_STATUS_STAGE,
+    };
+    use crate::xhci::transfer_ring::{
+        encode_data_stage, encode_setup_stage, encode_status_stage, TRB_DIR_IN, TRT_IN_DATA,
+    };
+    // GET_DESCRIPTOR DEVICE: bmRT=0x80, bReq=6, wValue=(1<<8), wIndex=0,
+    // wLength=18.
+    let setup: [u8; 8] = [0x80, 6, 0, 1, 0, 0, 18, 0];
+    let trb = encode_setup_stage(setup, TRT_IN_DATA, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_SETUP_STAGE {
+        return TestResult::Fail("Setup TRB wrong type");
+    }
+    if (trb.control & TRB_IDT) == 0 {
+        return TestResult::Fail("IDT must be set on Setup Stage");
+    }
+    if ((trb.control >> 16) & 0x3) != TRT_IN_DATA {
+        return TestResult::Fail("TRT must be IN_DATA");
+    }
+    if trb.status != 8 {
+        return TestResult::Fail("Setup Stage status length must be 8");
+    }
+    if trb.parameter != u64::from_le_bytes(setup) {
+        return TestResult::Fail("Setup packet not packed into parameter");
+    }
+    // Data Stage IN with IOC.
+    let trb = encode_data_stage(0x2000_0000, 18, /*dir_in*/ true, /*ioc*/ true, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_DATA_STAGE {
+        return TestResult::Fail("Data Stage wrong type");
+    }
+    if (trb.control & TRB_DIR_IN) == 0 {
+        return TestResult::Fail("Data Stage DIR=IN missing");
+    }
+    if (trb.control & TRB_IOC) == 0 {
+        return TestResult::Fail("Data Stage IOC missing");
+    }
+    if (trb.status & 0x1_FFFF) != 18 {
+        return TestResult::Fail("Data Stage length mismatch");
+    }
+    // Status Stage OUT (opposite of IN data stage), IOC=1.
+    let trb = encode_status_stage(/*dir_in*/ false, true, 1);
+    if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_STATUS_STAGE {
+        return TestResult::Fail("Status Stage wrong type");
+    }
+    if (trb.control & TRB_DIR_IN) != 0 {
+        return TestResult::Fail("Status Stage after IN data must be OUT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_setup_data_status_stage_encode);
+
+/// Input Context layout — Add Context Flag bitmap addresses Slot
+/// (bit 0), EP0 (bit 1), then DCI N (bit N). Drop Flag rejects DCI <
+/// 2.
+fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
+    use crate::xhci::slot::{
+        encode_slot_ctx_dword0, input_ctx_add_flag, input_ctx_drop_flag,
+        input_context_size,
+    };
+    // Add Slot Context: bit 0.
+    if input_ctx_add_flag(0) != 1 {
+        return TestResult::Fail("Slot add flag must be bit 0");
+    }
+    // Add EP0: bit 1.
+    if input_ctx_add_flag(1) != 2 {
+        return TestResult::Fail("EP0 add flag must be bit 1");
+    }
+    // Add a bulk-OUT EP at DCI 4: bit 4.
+    if input_ctx_add_flag(4) != 0x10 {
+        return TestResult::Fail("DCI 4 add flag must be bit 4");
+    }
+    // Drop flag for DCI 0/1 = 0 (illegal to drop slot/EP0).
+    if input_ctx_drop_flag(0) != 0 || input_ctx_drop_flag(1) != 0 {
+        return TestResult::Fail("Drop slot/EP0 must be no-op");
+    }
+    if input_ctx_drop_flag(3) != 0x8 {
+        return TestResult::Fail("DCI 3 drop flag must be bit 3");
+    }
+    // Slot Context dword0: route_string + speed + hub + ctx_entries.
+    let d0 = encode_slot_ctx_dword0(0x12345, 3, false, true, 5);
+    if (d0 & 0xFFFFF) != 0x12345 {
+        return TestResult::Fail("route_string not in bits[19:0]");
+    }
+    if ((d0 >> 20) & 0xF) != 3 {
+        return TestResult::Fail("speed not in bits[23:20]");
+    }
+    if (d0 & (1 << 26)) == 0 {
+        return TestResult::Fail("HUB bit not set");
+    }
+    if ((d0 >> 27) & 0x1F) != 5 {
+        return TestResult::Fail("ctx_entries not in bits[31:27]");
+    }
+    // Input Context size — 32-byte and 64-byte variants.
+    if input_context_size(false) != 32 + 32 + 31 * 32 {
+        return TestResult::Fail("32-byte input context size wrong");
+    }
+    if input_context_size(true) != 64 + 64 + 31 * 64 {
+        return TestResult::Fail("64-byte input context size wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_input_ctx_layout_add_drop_flags);
+
+/// DCBAA entry encode — phys must be 64-byte aligned per §6.1.
+fn smoke_xhci_dcbaa_entry_encode() -> TestResult {
+    use crate::xhci::dcbaa::{encode_entry, is_aligned, DCBAA_BYTES, DCBAA_ENTRIES};
+    if DCBAA_ENTRIES != 256 {
+        return TestResult::Fail("DCBAA must be 256 entries");
+    }
+    if DCBAA_BYTES != 256 * 8 {
+        return TestResult::Fail("DCBAA byte count must be 2048");
+    }
+    // Entry must mask the low 6 bits.
+    if encode_entry(0x1234_5678) != 0x1234_5640 {
+        return TestResult::Fail("entry must mask bits[5:0]");
+    }
+    if !is_aligned(0x1000) {
+        return TestResult::Fail("0x1000 is 64-byte aligned");
+    }
+    if is_aligned(0x1020) {
+        return TestResult::Fail("0x1020 is NOT 64-byte aligned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_dcbaa_entry_encode);
+
+/// ERST entry encode — 64-byte aligned ring base, low 16 bits of size.
+fn smoke_xhci_erst_entry_encode() -> TestResult {
+    use crate::xhci::event_ring::{ErstEntry, ER_SEG_TRBS};
+    let e = ErstEntry::encode(0x2000_0000, ER_SEG_TRBS as u16);
+    if e.ring_seg_base != 0x2000_0000 {
+        return TestResult::Fail("ring_seg_base mismatch");
+    }
+    if e.ring_seg_size != ER_SEG_TRBS as u32 {
+        return TestResult::Fail("ring_seg_size mismatch");
+    }
+    // Encoding must mask off the bottom 6 bits of the base.
+    let e2 = ErstEntry::encode(0x2000_0033, 64);
+    if e2.ring_seg_base != 0x2000_0000 {
+        return TestResult::Fail("base must mask bits[5:0]");
+    }
+    let raw = e2.to_le_bytes();
+    if raw.len() != 16 {
+        return TestResult::Fail("ERST entry must be 16 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_erst_entry_encode);
+
+/// Slot Context state-machine values match Table 4-7.
+fn smoke_xhci_slot_state_machine_decode() -> TestResult {
+    use crate::xhci::slot::{SlotState, SLOT_CTX_STATE_SHIFT};
+    let d3_default = 1u32 << SLOT_CTX_STATE_SHIFT;
+    let d3_addressed = 2u32 << SLOT_CTX_STATE_SHIFT;
+    let d3_configured = 3u32 << SLOT_CTX_STATE_SHIFT;
+    let d3_disabled = 0u32 << SLOT_CTX_STATE_SHIFT;
+    if SlotState::from_dword3(d3_disabled) != Some(SlotState::DisabledOrEnabled) {
+        return TestResult::Fail("encoding 0 must decode to DisabledOrEnabled");
+    }
+    if SlotState::from_dword3(d3_default) != Some(SlotState::Default) {
+        return TestResult::Fail("encoding 1 must decode to Default");
+    }
+    if SlotState::from_dword3(d3_addressed) != Some(SlotState::Addressed) {
+        return TestResult::Fail("encoding 2 must decode to Addressed");
+    }
+    if SlotState::from_dword3(d3_configured) != Some(SlotState::Configured) {
+        return TestResult::Fail("encoding 3 must decode to Configured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_slot_state_machine_decode);
+
+/// Endpoint Context encode covers IN / OUT / Bulk / Interrupt / Iso.
+fn smoke_xhci_endpoint_context_encode_all_kinds() -> TestResult {
+    use crate::xhci::slot::{
+        encode_ep_ctx_dword1, encode_ep_ctx_dword2_tr_lo, encode_ep_ctx_dword4,
+        EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INT_IN,
+        EP_TYPE_INT_OUT, EP_TYPE_ISOCH_IN, EP_TYPE_ISOCH_OUT,
+    };
+    // Bulk OUT, CErr=3, MaxBurst=0, MPS=512.
+    let d1 = encode_ep_ctx_dword1(3, EP_TYPE_BULK_OUT, 0, 512);
+    if ((d1 >> 3) & 0x7) != EP_TYPE_BULK_OUT {
+        return TestResult::Fail("Bulk-OUT EP type mismatch");
+    }
+    if (d1 >> 16) != 512 {
+        return TestResult::Fail("MPS not in bits[31:16]");
+    }
+    if ((d1 >> 1) & 0x3) != 3 {
+        return TestResult::Fail("CErr not in bits[2:1]");
+    }
+    // Bulk-IN, IsochIn, IsochOut, IntIn, IntOut, Control all distinct.
+    let mut seen = [false; 8];
+    for k in [
+        EP_TYPE_BULK_IN, EP_TYPE_INT_IN, EP_TYPE_INT_OUT,
+        EP_TYPE_ISOCH_IN, EP_TYPE_ISOCH_OUT, EP_TYPE_CONTROL,
+    ] {
+        if seen[k as usize] {
+            return TestResult::Fail("EP type values must be distinct");
+        }
+        seen[k as usize] = true;
+    }
+    // TR Dequeue Pointer low: alignment + DCS bit.
+    let tr_lo = encode_ep_ctx_dword2_tr_lo(0x4000_0030, 1);
+    if (tr_lo & 0xF) != 1 {
+        return TestResult::Fail("DCS bit not in bit 0");
+    }
+    if (tr_lo & 0xFFFF_FFF0) != 0x4000_0000 {
+        return TestResult::Fail("TR Dequeue Pointer not aligned");
+    }
+    let d4 = encode_ep_ctx_dword4(64, 0xAA);
+    if (d4 & 0xFFFF) != 64 {
+        return TestResult::Fail("avg_trb_len not in bits[15:0]");
+    }
+    if (d4 >> 16) != 0xAA {
+        return TestResult::Fail("max_esit_payload_lo not in bits[31:16]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_endpoint_context_encode_all_kinds);
+
+/// PCI class triple match for an xHCI controller (0x0c0330).
+fn smoke_xhci_pci_class_match_triple() -> TestResult {
+    use crate::xhci::probe::{
+        is_xhci_class, PCI_CLASS_SERIAL_BUS, PCI_CLASS_TRIPLE_XHCI, PCI_PROGIF_XHCI,
+        PCI_SUBCLASS_USB,
+    };
+    if PCI_CLASS_SERIAL_BUS != 0x0C
+        || PCI_SUBCLASS_USB != 0x03
+        || PCI_PROGIF_XHCI != 0x30
+    {
+        return TestResult::Fail("PCI class constants wrong");
+    }
+    if PCI_CLASS_TRIPLE_XHCI != 0x000C_0330 {
+        return TestResult::Fail("PCI triple must equal 0x0C0330");
+    }
+    if !is_xhci_class(0x000C_0330) {
+        return TestResult::Fail("must match 0x0C0330");
+    }
+    if is_xhci_class(0x000C_0310) {
+        // 0x0C/03/10 = EHCI, should NOT match.
+        return TestResult::Fail("must not match EHCI 0x0C0310");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_pci_class_match_triple);
+
+/// Scratchpad-array entry encode + alignment guards.
+fn smoke_xhci_scratchpad_entry_encode() -> TestResult {
+    use crate::xhci::scratchpad::{
+        encode_entry, is_array_aligned, is_page_aligned, scratchpad_array_bytes,
+        SCRATCH_ARRAY_ALIGN, SCRATCH_PAGE_SIZE,
+    };
+    if SCRATCH_PAGE_SIZE != 4096 {
+        return TestResult::Fail("page size must be 4096");
+    }
+    if SCRATCH_ARRAY_ALIGN != 64 {
+        return TestResult::Fail("array alignment must be 64");
+    }
+    if scratchpad_array_bytes(8) != 64 {
+        return TestResult::Fail("8 entries × 8 bytes = 64");
+    }
+    if encode_entry(0x10_0FFF) != 0x10_0000 {
+        return TestResult::Fail("encode_entry must mask low 12 bits");
+    }
+    if !is_page_aligned(0x10000) {
+        return TestResult::Fail("0x10000 is 4K-aligned");
+    }
+    if is_page_aligned(0x10001) {
+        return TestResult::Fail("0x10001 is NOT 4K-aligned");
+    }
+    if !is_array_aligned(0x40) {
+        return TestResult::Fail("0x40 is 64-aligned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_scratchpad_entry_encode);
+
+// ── narf-usb device-model + rtl8xxxu bridge smokes ─────────────────
+
+/// USB device-model — UsbError translation from XhciError.
+fn smoke_usb_error_translates_completion_codes() -> TestResult {
+    use crate::device::UsbError;
+    use crate::xhci::XhciError;
+    if UsbError::from_xhci(XhciError::CmdFailed(6)) != UsbError::Stall {
+        return TestResult::Fail("ccode 6 must map to Stall");
+    }
+    if UsbError::from_xhci(XhciError::CmdFailed(4)) != UsbError::TransactionError {
+        return TestResult::Fail("ccode 4 must map to TransactionError");
+    }
+    if UsbError::from_xhci(XhciError::CmdFailed(7)) != UsbError::Babble {
+        return TestResult::Fail("ccode 7 must map to Babble");
+    }
+    if UsbError::from_xhci(XhciError::CmdTimeout) != UsbError::Timeout {
+        return TestResult::Fail("CmdTimeout must map to Timeout");
+    }
+    if UsbError::from_xhci(XhciError::PortResetTimeout) != UsbError::Timeout {
+        return TestResult::Fail("PortResetTimeout must map to Timeout");
+    }
+    if UsbError::from_xhci(XhciError::CmdFailed(99)) != UsbError::HardwareError(99) {
+        return TestResult::Fail("unknown ccode must pass through");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/device", smoke_usb_error_translates_completion_codes);
+
+/// dci_for() — bEndpointAddress → DCI math per xHCI §4.8.1.
+fn smoke_usb_dci_for_endpoint_address() -> TestResult {
+    use crate::bulk::dci_for;
+    // EP1 OUT → DCI 2; EP1 IN → DCI 3; EP2 OUT → DCI 4; EP2 IN → DCI 5.
+    if dci_for(0x01) != 2 {
+        return TestResult::Fail("EP1 OUT must map to DCI 2");
+    }
+    if dci_for(0x81) != 3 {
+        return TestResult::Fail("EP1 IN must map to DCI 3");
+    }
+    if dci_for(0x02) != 4 {
+        return TestResult::Fail("EP2 OUT must map to DCI 4");
+    }
+    if dci_for(0x82) != 5 {
+        return TestResult::Fail("EP2 IN must map to DCI 5");
+    }
+    if dci_for(0x0F) != 30 {
+        return TestResult::Fail("EP15 OUT must map to DCI 30");
+    }
+    if dci_for(0x8F) != 31 {
+        return TestResult::Fail("EP15 IN must map to DCI 31");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/device", smoke_usb_dci_for_endpoint_address);
+
+/// SETUP packet builder — vendor read + standard GET_DESCRIPTOR
+/// encode the right bmRT / bReq / wValue layout.
+fn smoke_usb_setup_packet_encode_vendor_and_get_descriptor() -> TestResult {
+    use crate::control::{get_descriptor, vendor_read, vendor_write, Setup};
+    // GET_DESCRIPTOR DEVICE: bmRT=0x80, bReq=6, wValue=(type<<8)|index.
+    let s = get_descriptor(1, 0, 0, 18);
+    if s.bm_request_type != 0x80 {
+        return TestResult::Fail("GET_DESCRIPTOR bmRT must be 0x80");
+    }
+    if s.b_request != 6 {
+        return TestResult::Fail("GET_DESCRIPTOR bReq must be 6");
+    }
+    if s.w_value != (1u16 << 8) {
+        return TestResult::Fail("GET_DESCRIPTOR wValue must be type<<8");
+    }
+    if s.w_length != 18 {
+        return TestResult::Fail("GET_DESCRIPTOR wLength mismatch");
+    }
+    if !s.is_in() {
+        return TestResult::Fail("GET_DESCRIPTOR must be IN");
+    }
+    // Vendor read: REALTEK_USB_READ pattern (0xC0/0x05/addr/0/len).
+    let s = vendor_read(0x05, 0x1234, 0, 4);
+    if s.bm_request_type != 0xC0 {
+        return TestResult::Fail("vendor_read bmRT must be 0xC0");
+    }
+    if !s.is_in() {
+        return TestResult::Fail("vendor_read must be IN");
+    }
+    // Vendor write: 0x40/0x05/addr/0/len.
+    let s = vendor_write(0x05, 0xABCD, 0, 4);
+    if s.bm_request_type != 0x40 {
+        return TestResult::Fail("vendor_write bmRT must be 0x40");
+    }
+    if s.is_in() {
+        return TestResult::Fail("vendor_write must NOT be IN");
+    }
+    // Round-trip to_bytes / from_bytes.
+    let s = Setup::new(0xC0, 5, 0xBABE, 0xCAFE, 2);
+    let bytes = s.to_bytes();
+    let back = Setup::from_bytes(bytes);
+    if back != s {
+        return TestResult::Fail("Setup encode/decode round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/control", smoke_usb_setup_packet_encode_vendor_and_get_descriptor);
+
+/// rtl8xxxu integration — read MAC EFUSE byte via control-transfer
+/// SETUP-packet encoding matches the per-chip Realtek read layout.
+///
+/// Realtek uses bmRT=0xC0 / bReq=0x05 / wValue=addr / wIndex=0 /
+/// wLength=width (1 / 2 / 4 bytes). The narf-usb control builder must
+/// produce a byte-identical SETUP packet for the bridge to forward —
+/// the rtl8xxxu USB transport (`drivers/wireless/src/rtl8xxxu/usb.rs`)
+/// uses the same encoding, sourced from `core.c::rtl8xxxu_read8` ~L621.
+fn smoke_rtl8xxxu_efuse_read_setup_via_narf_usb() -> TestResult {
+    use crate::control::Setup;
+    // Read 1 byte at EFUSE address 0x008C — `REG_EFUSE_CTRL+0` on
+    // 8188EU. Realtek reads here when assembling the per-chip MAC.
+    let addr: u16 = 0x008C;
+    let s = Setup::new(0xC0, 0x05, addr, 0x0000, 1);
+    let bytes = s.to_bytes();
+    // Hand-computed expected SETUP packet (USB 2.0 §9.3):
+    //   [0]=0xC0 bmRT, [1]=0x05 bReq, [2..3]=wValue LE,
+    //   [4..5]=wIndex LE, [6..7]=wLength LE.
+    let expected: [u8; 8] = [0xC0, 0x05, 0x8C, 0x00, 0x00, 0x00, 0x01, 0x00];
+    if bytes != expected {
+        return TestResult::Fail("narf-usb SETUP byte layout wrong for Realtek read");
+    }
+    // Sanity-check the IN direction bit + standard wValue/wLength.
+    if !s.is_in() {
+        return TestResult::Fail("0xC0 bmRT must be IN");
+    }
+    if u16::from_le_bytes([bytes[2], bytes[3]]) != addr {
+        return TestResult::Fail("wValue not little-endian addr");
+    }
+    if u16::from_le_bytes([bytes[6], bytes[7]]) != 1 {
+        return TestResult::Fail("wLength must be 1");
+    }
+    // The matching write SETUP (host → device): bmRT=0x40 with same
+    // bReq / wValue / wIndex.
+    let w = Setup::new(0x40, 0x05, 0x008C, 0, 1);
+    let w_bytes = w.to_bytes();
+    let w_expected: [u8; 8] = [0x40, 0x05, 0x8C, 0x00, 0x00, 0x00, 0x01, 0x00];
+    if w_bytes != w_expected {
+        return TestResult::Fail("Realtek write SETUP layout wrong");
+    }
+    if w.is_in() {
+        return TestResult::Fail("0x40 bmRT must NOT be IN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/control", smoke_rtl8xxxu_efuse_read_setup_via_narf_usb);

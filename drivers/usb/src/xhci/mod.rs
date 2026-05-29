@@ -64,6 +64,22 @@ use narf_lib::id::DomainId;
 use alloc::sync::Arc;
 use narf_lib::sync::IrqSafeSpinLock;
 
+// Spec-aligned submodules. These factor out the register-field decode,
+// TRB encode/decode helpers, and PCI-class matching constants so each
+// layer of the xHCI specification has a discoverable home. The big
+// monolithic implementation in this `mod.rs` still owns the live
+// controller state machine — these are pure spec-encode shapes.
+pub mod cap;
+pub mod cmd_ring;
+pub mod dcbaa;
+pub mod enumerate;
+pub mod event_ring;
+pub mod op;
+pub mod probe;
+pub mod scratchpad;
+pub mod slot;
+pub mod transfer_ring;
+
 /// QEMU `qemu-xhci`.
 pub const QEMU_XHCI_VENDOR: u16 = 0x1B36;
 pub const QEMU_XHCI_DEVICE: u16 = 0x000D;
