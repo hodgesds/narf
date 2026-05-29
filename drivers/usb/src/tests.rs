@@ -3796,3 +3796,279 @@ fn smoke_rtl8xxxu_efuse_read_setup_via_narf_usb() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/control", smoke_rtl8xxxu_efuse_read_setup_via_narf_usb);
+
+// ── Wacom tablet driver ─────────────────────────────────────────────
+
+fn smoke_wacom_device_table_size() -> TestResult {
+    use crate::hid::wacom_features::WACOM_DEVICES;
+    if WACOM_DEVICES.len() < 40 {
+        return TestResult::Fail("wacom device table has fewer than 40 entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_device_table_size);
+
+fn smoke_wacom_intuos_pro_s_in_table() -> TestResult {
+    use crate::hid::wacom_features::{lookup, WacomType};
+    let f = match lookup(0x0314) {
+        Some(f) => f,
+        None => return TestResult::Fail("Intuos Pro S (PTH-460, PID=0x0314) not found"),
+    };
+    if f.device_type != WacomType::IntuosProS {
+        return TestResult::Fail("Intuos Pro S device_type mismatch");
+    }
+    if f.pressure_max < 2047 {
+        return TestResult::Fail("Intuos Pro S pressure_max too low");
+    }
+    if f.touch_max != 16 {
+        return TestResult::Fail("Intuos Pro S touch_max should be 16");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_s_in_table);
+
+fn smoke_wacom_mode_select_feature_report() -> TestResult {
+    use crate::hid::wacom_features::{encode_pen_mode_report, WACOM_FEATURE_REPORT_ID, WACOM_PEN_MODE_VALUE};
+    let mut buf = [0u8; 8];
+    let n = encode_pen_mode_report(&mut buf);
+    if n != 2 {
+        return TestResult::Fail("encode_pen_mode_report returned wrong byte count");
+    }
+    if buf[0] != WACOM_FEATURE_REPORT_ID {
+        return TestResult::Fail("pen mode report ID must be 2");
+    }
+    if buf[1] != WACOM_PEN_MODE_VALUE {
+        return TestResult::Fail("pen mode value must be 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_mode_select_feature_report);
+
+fn smoke_wacom_intuos_pro_pen_tip_and_pressure() -> TestResult {
+    use crate::hid::wacom::{WacomState, REPORT_PENABLED};
+    use narf_input::{abs, init_global_ring, pop_absolute};
+
+    init_global_ring(256);
+
+    let mut state = match WacomState::new(0x0315) {
+        Some(s) => s,
+        None => return TestResult::Fail("Intuos Pro M not in device table"),
+    };
+
+    // Enter proximity (status byte 0xC0).
+    let mut enter = [0u8; 10];
+    enter[0] = REPORT_PENABLED;
+    enter[1] = 0xC0;
+    state.handle_report(&enter);
+
+    // Pen data: pressure ~2000 out of 2047 (near full scale).
+    // Pressure decode: t = (data[6]<<3)|((data[7]&0xC0)>>5)|(data[1]&1)
+    // For p_raw=2000: data[6] = 2000>>3 = 250, data[7] upper = (2000&7)<<5 = 0.
+    let p_raw: u32 = 2000;
+    let mut data = [0u8; 10];
+    data[0] = REPORT_PENABLED;
+    data[1] = 0x01; // tip bit set
+    data[2] = 0x01; // X high
+    data[3] = 0xF4; // X low
+    data[4] = 0x02; // Y high
+    data[5] = 0x58; // Y low
+    data[6] = (p_raw >> 3) as u8; // = 250
+    data[7] = ((p_raw & 7) << 5) as u8;
+    data[8] = 64u8; // tilt Y = 0 (offset by 64)
+
+    let n = state.handle_report(&data);
+    if n == 0 {
+        return TestResult::Fail("pen data report emitted no events");
+    }
+
+    // Drain and find ABS_PRESSURE.
+    let mut found_pressure = false;
+    let mut p_val = 0i32;
+    while let Some(e) = pop_absolute() {
+        if e.axis == abs::ABS_PRESSURE {
+            found_pressure = true;
+            p_val = e.value;
+        }
+    }
+    if !found_pressure {
+        return TestResult::Fail("no ABS_PRESSURE event from Intuos Pro pen report");
+    }
+    if p_val < 500 {
+        return TestResult::Fail("pressure value too low for near-full-scale input");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_pen_tip_and_pressure);
+
+fn smoke_wacom_intuos_pro_barrel_button() -> TestResult {
+    use crate::hid::wacom::{WacomState, REPORT_PENABLED};
+    use narf_input::{btn, init_global_ring, pop_button};
+
+    init_global_ring(256);
+    let mut state = match WacomState::new(0x0315) {
+        Some(s) => s,
+        None => return TestResult::Fail("Intuos Pro M not in device table"),
+    };
+
+    let mut enter = [0u8; 10];
+    enter[0] = REPORT_PENABLED;
+    enter[1] = 0xC0;
+    state.handle_report(&enter);
+
+    // Barrel button 1: status bit1 = 0x02.
+    let mut data = [0u8; 10];
+    data[0] = REPORT_PENABLED;
+    data[1] = 0x02; // barrel1 bit
+    data[8] = 64;   // tilt Y neutral
+    state.handle_report(&data);
+
+    while let Some(e) = pop_button() {
+        if e.code == btn::BTN_STYLUS && e.pressed {
+            return TestResult::Pass;
+        }
+    }
+    TestResult::Fail("BTN_STYLUS (barrel1) not emitted from Intuos Pro pen report")
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_barrel_button);
+
+fn smoke_wacom_intuos_pro_eraser_in_range() -> TestResult {
+    use crate::hid::wacom::{WacomState, REPORT_PENABLED};
+    use narf_input::btn;
+
+    let mut state = match WacomState::new(0x0315) {
+        Some(s) => s,
+        None => return TestResult::Fail("Intuos Pro M not in device table"),
+    };
+
+    // Enter proximity with eraser tool ID (data[3] bit3 → tool_id bit3 → eraser).
+    // tool_id = (data[2]<<4)|(data[3]>>4) — so data[3]=0x80 gives lower nibble 0x08.
+    let mut enter = [0u8; 10];
+    enter[0] = REPORT_PENABLED;
+    enter[1] = 0xC0;
+    enter[3] = 0x80; // eraser marker
+    state.handle_report(&enter);
+
+    if state.pen[0].tool != btn::BTN_TOOL_RUBBER {
+        return TestResult::Fail("eraser tool ID did not set BTN_TOOL_RUBBER");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_eraser_in_range);
+
+fn smoke_wacom_intuos_pro_tilt_signed() -> TestResult {
+    use crate::hid::wacom::{WacomState, REPORT_PENABLED};
+    use narf_input::{abs, init_global_ring, pop_absolute};
+
+    init_global_ring(256);
+    let mut state = match WacomState::new(0x0315) {
+        Some(s) => s,
+        None => return TestResult::Fail("Intuos Pro M not in device table"),
+    };
+
+    let mut enter = [0u8; 10];
+    enter[0] = REPORT_PENABLED;
+    enter[1] = 0xC0;
+    state.handle_report(&enter);
+
+    // Tilt X = +32: packed into data[7] bits [6:1].
+    // tilt_x = (((data[7] << 1) & 0x7E) | (data[8] >> 7)) - 64
+    // For tilt_x_raw = 32+64 = 96: data[7] = (96 << 0) & 0x7E = 96 & 0x7E = 96
+    // Simpler: set tilt_x bits so decoded value > 0 (positive tilt).
+    let mut data = [0u8; 10];
+    data[0] = REPORT_PENABLED;
+    data[1] = 0x00;
+    // data[7]: tilt_x = ((data[7]<<1)&0x7E | ...) - 64
+    // Set to give +45: raw = 45+64=109; (109>>0)&0x7E=108, data[7]=54.
+    data[7] = 54; // encodes tilt_x ≈ +44
+    // data[8]: tilt_y = (data[8] & 0x7F) - 64. For -20: 44 → data[8]=44.
+    data[8] = 44; // encodes tilt_y ≈ -20
+
+    state.handle_report(&data);
+
+    let mut tilt_x = None;
+    let mut tilt_y = None;
+    while let Some(e) = pop_absolute() {
+        if e.axis == abs::ABS_TILT_X { tilt_x = Some(e.value); }
+        if e.axis == abs::ABS_TILT_Y { tilt_y = Some(e.value); }
+    }
+
+    if let Some(tx) = tilt_x {
+        if tx <= 0 {
+            return TestResult::Fail("ABS_TILT_X should be positive");
+        }
+    }
+    if let Some(ty) = tilt_y {
+        if ty >= 0 {
+            return TestResult::Fail("ABS_TILT_Y should be negative");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_tilt_signed);
+
+fn smoke_wacom_bamboo_one_pen_decode() -> TestResult {
+    use crate::hid::wacom::{WacomState, REPORT_PENABLED};
+    use narf_input::{abs, init_global_ring, pop_absolute};
+
+    init_global_ring(256);
+    let mut state = match WacomState::new(0x037A) {
+        Some(s) => s,
+        None => return TestResult::Fail("One by Wacom S not in device table"),
+    };
+
+    // Bamboo pen report: bit5 = in_prox, bit0 = tip.
+    let mut pkt = [0u8; 10];
+    pkt[0] = REPORT_PENABLED;
+    pkt[1] = 0x21; // in_prox | tip
+    pkt[2] = 0xD2; // X low byte = 210
+    pkt[3] = 0x04; // X high byte
+    pkt[4] = 0xE2; // Y low byte = 226
+    pkt[5] = 0x15; // Y high byte → Y = 5602
+    pkt[6] = 0xFF; // pressure low
+    pkt[7] = 0x03; // pressure high bits
+
+    let n = state.handle_report(&pkt);
+    if n == 0 {
+        return TestResult::Fail("One by Wacom pen report emitted no events");
+    }
+
+    let mut found_x = false;
+    while let Some(e) = pop_absolute() {
+        if e.axis == abs::ABS_X && e.value > 0 { found_x = true; }
+    }
+    if !found_x {
+        return TestResult::Fail("no positive ABS_X from One by Wacom pen report");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_bamboo_one_pen_decode);
+
+fn smoke_wacom_cintiq_pad_expresskeys() -> TestResult {
+    use crate::hid::wacom::{WacomState, REPORT_INTUOSPAD};
+    use narf_input::{init_global_ring, pop_button};
+
+    init_global_ring(256);
+    let mut state = match WacomState::new(0x00FA) {
+        Some(s) => s,
+        None => return TestResult::Fail("Cintiq 22HD not in device table"),
+    };
+
+    // Cintiq 22HD pad: buttons = (data[8]<<10)|(data[7]&0x01)<<9|data[6]<<1|data[5]&0x01
+    // Press button 0 (data[5] |= 0x01).
+    let mut pkt = [0u8; 16];
+    pkt[0] = REPORT_INTUOSPAD;
+    pkt[5] = 0x01; // button 0
+
+    let n = state.handle_report(&pkt);
+    if n == 0 {
+        return TestResult::Fail("Cintiq pad report emitted no events");
+    }
+
+    while let Some(e) = pop_button() {
+        if e.code == 0x100 && e.pressed { // BTN_0
+            return TestResult::Pass;
+        }
+    }
+    TestResult::Fail("BTN_0 not pressed in Cintiq ExpressKey report")
+}
+kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_cintiq_pad_expresskeys);
