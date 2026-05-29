@@ -70,9 +70,15 @@ pub(crate) const HID_REPORT_PROTOCOL: u16 = 1;
 // needed in this driver, so we don't pull in a full enum.
 pub(crate) const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
+pub mod apple;
 pub mod consumer;
+pub mod logitech_dj;
+pub mod logitech_hidpp;
+pub mod microsoft;
 pub mod mouse;
 pub mod touchpad;
+pub mod wacom;
+pub mod wacom_features;
 
 /// Modifier mask bits in byte 0 of the boot keyboard report.
 pub mod kbd_mod {
