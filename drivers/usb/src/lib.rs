@@ -8,9 +8,15 @@ extern crate alloc;
 
 pub mod attach;
 pub mod btusb;
+pub mod bulk;
 pub mod ccid;
 pub mod cdc;
+pub mod control;
+pub mod device;
 pub mod ehci;
+pub mod firmware;
+pub mod intr;
+pub mod iso;
 pub mod ohci;
 pub mod uhci;
 pub mod cdc_acm;
