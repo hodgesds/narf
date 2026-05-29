@@ -60,6 +60,7 @@ extern crate alloc;
 pub mod dma;
 pub mod efuse;
 pub mod fw;
+pub mod fwdl;
 pub mod h2c;
 pub mod mac;
 pub mod mac_init;
