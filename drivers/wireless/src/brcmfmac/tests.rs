@@ -14,7 +14,9 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::msgbuf::{
-    ring_layout, BufAddr, CommonHdr, IoctlReq, IoctlResp, MsgType, Ring, WlEvent,
+    ring_layout, BufAddr, CommonHdr, IoctlReq, IoctlResp, MsgType, Ring, RxComplete, TxPost,
+    TxStatus, WlEvent,
+    chanspec_20mhz, chanspec_channel, chanspec_is5g,
     D2H_MSGRING_CONTROL_COMPLETE, D2H_MSGRING_CONTROL_COMPLETE_ITEMSIZE,
     D2H_MSGRING_CONTROL_COMPLETE_MAX_ITEM, D2H_MSGRING_RX_COMPLETE,
     D2H_MSGRING_RX_COMPLETE_ITEMSIZE, D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7,
@@ -24,7 +26,8 @@ use super::msgbuf::{
     H2D_MSGRING_RXPOST_SUBMIT, H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE,
     H2D_MSGRING_RXPOST_SUBMIT_MAX_ITEM, IOCTL_REQ_SIZE, IOCTL_RESP_SIZE,
     NROF_COMMON_MSGRINGS, NROF_D2H_COMMON_MSGRINGS, NROF_H2D_COMMON_MSGRINGS,
-    WL_EVENT_SIZE,
+    RX_COMPLETE_SIZE, TX_POST_SIZE, TX_STATUS_SIZE, WL_EVENT_SIZE,
+    WL_CHANSPEC_BAND_5G, WL_CHANSPEC_BW_20,
 };
 use super::pcie::{
     firmware_filename, name_for, register_pci_driver, ALL_DEV_IDS, BRCM_PCIE_43602_DEVICE_ID,
@@ -503,6 +506,156 @@ kernel_test_in!(
 );
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
+
+// ── Stage-3: TX/RX frame descriptors + chanspec (new smokes) ──────────
+
+fn smoke_brcmfmac_bcdc_tx_post_encode() -> TestResult {
+    // Build a TxPost descriptor for a 100-byte Ethernet frame residing
+    // at DMA address 0xDEAD_0000_1234_5678. Mirrors the descriptor the
+    // brcmf_msgbuf_txflow path (~L640, core.c) would build.
+    let desc = TxPost {
+        hdr: CommonHdr {
+            msgtype: MsgType::TxPost as u8,
+            ifidx: 0,
+            flags: 0,
+            request_id: 1,
+        },
+        metadata_buf_addr: BufAddr(0),
+        data_buf_addr: BufAddr(0xDEAD_0000_1234_5678),
+        metadata_len: 0,
+        data_len: 100,
+    };
+    let mut buf = [0u8; TX_POST_SIZE];
+    if desc.encode(&mut buf).is_none() {
+        return TestResult::Fail("TxPost encode returned None");
+    }
+    if buf.len() != 48 {
+        return TestResult::Fail("TX_POST_SIZE not 48 bytes");
+    }
+    // msgtype must be TxPost (0x0F).
+    if buf[0] != MsgType::TxPost as u8 {
+        return TestResult::Fail("TxPost msgtype byte wrong");
+    }
+    // data_len at bytes 26-27 LE.
+    if buf[26..28] != 100u16.to_le_bytes() {
+        return TestResult::Fail("TxPost data_len mis-encoded");
+    }
+    // Round-trip.
+    let decoded = match TxPost::decode(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("TxPost decode failed"),
+    };
+    if decoded != desc {
+        return TestResult::Fail("TxPost round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_bcdc_tx_post_encode);
+
+fn smoke_brcmfmac_rx_complete_decode() -> TestResult {
+    // Build an RxComplete for a 1500-byte frame with data_offset=28
+    // (standard brcmfmac overhead before the 802.11 payload). Mirrors
+    // brcmf_rx_frame (~L502, core.c) stripping the header.
+    let rxc = RxComplete {
+        hdr: CommonHdr {
+            msgtype: MsgType::RxCmplt as u8,
+            ifidx: 0,
+            flags: 0,
+            request_id: 42,
+        },
+        status: 0,
+        flow_ring_id: 0,
+        rx_status_0: 0x00C8, // RSSI=0, status bits=0
+        rx_status_1: 0,
+        data_offset: 28,
+        data_len: 1500,
+    };
+    let mut buf = [0u8; RX_COMPLETE_SIZE];
+    if rxc.encode(&mut buf).is_none() {
+        return TestResult::Fail("RxComplete encode returned None");
+    }
+    if buf.len() != 40 {
+        return TestResult::Fail("RX_COMPLETE_SIZE not 40 bytes");
+    }
+    // data_offset must land at byte 16.
+    if buf[16] != 28 {
+        return TestResult::Fail("RxComplete data_offset mis-encoded");
+    }
+    let decoded = match RxComplete::decode(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("RxComplete decode failed"),
+    };
+    if decoded != rxc {
+        return TestResult::Fail("RxComplete round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_rx_complete_decode);
+
+fn smoke_brcmfmac_tx_status_roundtrip() -> TestResult {
+    let st = TxStatus {
+        hdr: CommonHdr {
+            msgtype: MsgType::TxStatus as u8,
+            ifidx: 0,
+            flags: 0,
+            request_id: 1,
+        },
+        status: 0,
+        flow_ring_id: 3,
+        tx_status: 0,
+    };
+    let mut buf = [0u8; TX_STATUS_SIZE];
+    if st.encode(&mut buf).is_none() {
+        return TestResult::Fail("TxStatus encode returned None");
+    }
+    if buf.len() != 24 {
+        return TestResult::Fail("TX_STATUS_SIZE not 24 bytes");
+    }
+    let decoded = match TxStatus::decode(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("TxStatus decode failed"),
+    };
+    if decoded != st {
+        return TestResult::Fail("TxStatus round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_tx_status_roundtrip);
+
+fn smoke_brcmfmac_chanspec_5g_5180() -> TestResult {
+    // 5180 MHz = channel 36 (5 GHz). Mirrors Linux's `ch20mhz_chspec`
+    // and the cfg80211.c::brcmf_cfg80211_set_channel path (~L2445).
+    //
+    // Expected: channel 36 | BW_20 (0x0800) | BAND_5G (0x1000)
+    //         = 0x0024 | 0x0800 | 0x1000 = 0x1824
+    let chspec = chanspec_20mhz(36);
+    if chanspec_channel(chspec) != 36 {
+        return TestResult::Fail("chanspec_channel returned wrong channel");
+    }
+    if !chanspec_is5g(chspec) {
+        return TestResult::Fail("chanspec_is5g returned false for ch36");
+    }
+    if chspec & WL_CHANSPEC_BW_20 == 0 {
+        return TestResult::Fail("chanspec missing BW_20 bits");
+    }
+    if chspec & WL_CHANSPEC_BAND_5G == 0 {
+        return TestResult::Fail("chanspec missing BAND_5G bits");
+    }
+    let expected: u16 = 36 | WL_CHANSPEC_BW_20 | WL_CHANSPEC_BAND_5G;
+    if chspec != expected {
+        return TestResult::Fail("chanspec_20mhz(36) value mismatch");
+    }
+    // 2.4 GHz smoke: channel 6 must round-trip the other band.
+    let chspec2g = chanspec_20mhz(6);
+    if chanspec_is5g(chspec2g) {
+        return TestResult::Fail("channel 6 wrongly classified as 5G");
+    }
+    if chanspec_channel(chspec2g) != 6 {
+        return TestResult::Fail("chanspec_channel wrong for 2G channel 6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_chanspec_5g_5180);
 
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {

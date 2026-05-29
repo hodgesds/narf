@@ -580,6 +580,313 @@ impl IoctlResp {
     }
 }
 
+// ── TX-post descriptor (`MSGBUF_TYPE_TX_POST`) ──────────────────────
+//
+// Layout per `msgbuf.c::msgbuf_tx_msghdr` and Linux
+// `brcmfmac/core.c::brcmf_netdev_start_xmit` (~L293).
+//
+// The host builds a TxPost entry for every Ethernet frame it wants to
+// transmit; the firmware drains these from the flow-ring, DMAs the
+// frame payload out of the host-side buffer (described by `data_buf`),
+// and delivers a TxStatus back through D2H_MSGRING_TX_COMPLETE.
+//
+//   common_hdr (8B)             @ 0
+//   metadata_buf_addr BufAddr   @ 8..16   (set to 0 — metadata unused)
+//   data_buf_addr     BufAddr   @ 16..24  (DMA address of frame data)
+//   metadata_len      u16 LE    @ 24
+//   data_len          u16 LE    @ 26
+//   rsvd[4]           u32 LE×4  @ 28..44  (compat padding to 48 bytes)
+//
+// Total 48 bytes — matches `H2D_TXFLOWRING_ITEMSIZE`.
+//
+// Reference: Linux `brcmfmac/msgbuf.c::brcmf_msgbuf_txflow`
+// (~L640..L700, v6.6).
+
+/// Wire size of an encoded TxPost descriptor.
+pub const TX_POST_SIZE: usize = 48;
+
+/// Per-frame TX descriptor posted to a flow-ring.
+///
+/// The actual frame bytes live in the DMA buffer at `data_buf_addr`;
+/// only the address + length are carried here. `metadata_buf_addr`
+/// is left as zero (metadata feature not used in the baseline path).
+///
+/// Reference: Linux `brcmfmac/msgbuf.c::msgbuf_tx_msghdr` (~L97).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TxPost {
+    pub hdr: CommonHdr,
+    pub metadata_buf_addr: BufAddr,
+    pub data_buf_addr: BufAddr,
+    pub metadata_len: u16,
+    pub data_len: u16,
+}
+
+impl TxPost {
+    /// Encode to a 48-byte buffer. Returns `None` if the buffer is too
+    /// small.
+    pub fn encode(self, out: &mut [u8]) -> Option<()> {
+        if out.len() < TX_POST_SIZE {
+            return None;
+        }
+        let mut hdr = self.hdr;
+        hdr.msgtype = MsgType::TxPost as u8;
+        hdr.encode(out)?;
+        self.metadata_buf_addr.encode(&mut out[8..16])?;
+        self.data_buf_addr.encode(&mut out[16..24])?;
+        out[24..26].copy_from_slice(&self.metadata_len.to_le_bytes());
+        out[26..28].copy_from_slice(&self.data_len.to_le_bytes());
+        out[28..TX_POST_SIZE].fill(0);
+        Some(())
+    }
+
+    /// Decode from a 48-byte buffer.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < TX_POST_SIZE {
+            return None;
+        }
+        let hdr = CommonHdr::decode(&bytes[0..8])?;
+        let metadata_buf_addr = BufAddr::decode(&bytes[8..16])?;
+        let data_buf_addr = BufAddr::decode(&bytes[16..24])?;
+        let metadata_len = u16::from_le_bytes(bytes[24..26].try_into().ok()?);
+        let data_len = u16::from_le_bytes(bytes[26..28].try_into().ok()?);
+        Some(Self {
+            hdr,
+            metadata_buf_addr,
+            data_buf_addr,
+            metadata_len,
+            data_len,
+        })
+    }
+}
+
+// ── TX-status (D2H TX complete) ─────────────────────────────────────
+//
+// Layout per `msgbuf.c::msgbuf_tx_status` (~L115, v6.6).
+//
+//   common_hdr (8B)   @ 0
+//   compl_hdr  (4B)   @ 8..12  (status u16 + flow_ring_id u16)
+//   msg_type   u8     @ 12
+//   tx_status  u8     @ 13
+//   rsvd       u16    @ 14..16
+//
+// Total 16 bytes (pre-v7 item size for D2H TX complete).
+// v7+ pads to 24 bytes; we model the 24-byte form here.
+//   rsvd[2]    u32×2  @ 16..24
+//
+// Reference: `msgbuf.c` (~L115), `msgbuf.h` `D2H_MSGRING_TX_COMPLETE_ITEMSIZE`.
+
+/// Wire size of an encoded TxStatus (v7+ 24-byte form).
+pub const TX_STATUS_SIZE: usize = 24;
+
+/// Per-frame TX completion from firmware to host.
+///
+/// When the firmware finishes transmitting (or drops) a frame that was
+/// posted via [`TxPost`], it delivers one of these through
+/// `D2H_MSGRING_TX_COMPLETE`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TxStatus {
+    pub hdr: CommonHdr,
+    pub status: u16,
+    pub flow_ring_id: u16,
+    /// Firmware-side TX status code. 0 = success.
+    pub tx_status: u8,
+}
+
+impl TxStatus {
+    pub fn encode(self, out: &mut [u8]) -> Option<()> {
+        if out.len() < TX_STATUS_SIZE {
+            return None;
+        }
+        let mut hdr = self.hdr;
+        hdr.msgtype = MsgType::TxStatus as u8;
+        hdr.encode(out)?;
+        out[8..10].copy_from_slice(&self.status.to_le_bytes());
+        out[10..12].copy_from_slice(&self.flow_ring_id.to_le_bytes());
+        out[12] = MsgType::TxStatus as u8;
+        out[13] = self.tx_status;
+        out[14..TX_STATUS_SIZE].fill(0);
+        Some(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < TX_STATUS_SIZE {
+            return None;
+        }
+        let hdr = CommonHdr::decode(&bytes[0..8])?;
+        let status = u16::from_le_bytes(bytes[8..10].try_into().ok()?);
+        let flow_ring_id = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
+        let tx_status = bytes[13];
+        Some(Self {
+            hdr,
+            status,
+            flow_ring_id,
+            tx_status,
+        })
+    }
+}
+
+// ── RX-complete (D2H RX complete) ───────────────────────────────────
+//
+// Layout per `msgbuf.c::msgbuf_rx_complete` (~L126, v6.6).
+//
+//   common_hdr (8B)         @ 0
+//   compl_hdr  (4B)         @ 8..12
+//   rx_status_0 u16 LE      @ 12   (RSSI in high byte, status bits in low)
+//   rx_status_1 u16 LE      @ 14
+//   data_offset u8          @ 16   (bytes from start of DMA buf to 802.11)
+//   data_len    u16 LE      @ 17
+//   rsvd                    @ 19..40
+//
+// Total 40 bytes (v7+ form). Pre-v7 is 32 bytes; the extra 8 bytes are
+// reserved padding.
+//
+// Reference: Linux `msgbuf.c` (~L126..L143) +
+// `brcmf_rx_frame` in `core.c` (~L502..L560).
+
+/// Wire size of an encoded RxComplete (v7+ 40-byte form).
+pub const RX_COMPLETE_SIZE: usize = 40;
+
+/// Per-frame RX completion from firmware to host.
+///
+/// Firmware posts one of these for every inbound frame. The actual
+/// frame payload sits in the DMA buffer that was previously posted
+/// via `RxBufPost` (ring id `H2D_MSGRING_RXPOST_SUBMIT`); `data_offset`
+/// tells the host where the 802.11 payload starts in that buffer.
+///
+/// References: Linux `msgbuf.c::msgbuf_rx_complete` (~L126),
+/// `core.c::brcmf_rx_frame` (~L502).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RxComplete {
+    pub hdr: CommonHdr,
+    pub status: u16,
+    pub flow_ring_id: u16,
+    /// Combined status bits (low byte) and RSSI (high byte). Per
+    /// `msgbuf.c::msgbuf_rx_complete.rx_status_0`.
+    pub rx_status_0: u16,
+    /// Additional rx-status bits (flags, sequence number fragment).
+    pub rx_status_1: u16,
+    /// Byte offset from the start of the DMA buffer to the first byte
+    /// of the 802.11 frame payload. Mirrors `data_offset` in the
+    /// `brcmf_rx_frame` strip path.
+    pub data_offset: u8,
+    /// Length in bytes of the 802.11 frame (payload only; excludes the
+    /// DMA-buffer header bytes before `data_offset`).
+    pub data_len: u16,
+}
+
+impl RxComplete {
+    pub fn encode(self, out: &mut [u8]) -> Option<()> {
+        if out.len() < RX_COMPLETE_SIZE {
+            return None;
+        }
+        let mut hdr = self.hdr;
+        hdr.msgtype = MsgType::RxCmplt as u8;
+        hdr.encode(out)?;
+        out[8..10].copy_from_slice(&self.status.to_le_bytes());
+        out[10..12].copy_from_slice(&self.flow_ring_id.to_le_bytes());
+        out[12..14].copy_from_slice(&self.rx_status_0.to_le_bytes());
+        out[14..16].copy_from_slice(&self.rx_status_1.to_le_bytes());
+        out[16] = self.data_offset;
+        out[17..19].copy_from_slice(&self.data_len.to_le_bytes());
+        out[19..RX_COMPLETE_SIZE].fill(0);
+        Some(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < RX_COMPLETE_SIZE {
+            return None;
+        }
+        let hdr = CommonHdr::decode(&bytes[0..8])?;
+        let status = u16::from_le_bytes(bytes[8..10].try_into().ok()?);
+        let flow_ring_id = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
+        let rx_status_0 = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
+        let rx_status_1 = u16::from_le_bytes(bytes[14..16].try_into().ok()?);
+        let data_offset = bytes[16];
+        let data_len = u16::from_le_bytes(bytes[17..19].try_into().ok()?);
+        Some(Self {
+            hdr,
+            status,
+            flow_ring_id,
+            rx_status_0,
+            rx_status_1,
+            data_offset,
+            data_len,
+        })
+    }
+}
+
+// ── Chanspec encoding (cfg80211 / IOVAR `chanspec`) ──────────────────
+//
+// The brcmfmac firmware accepts a 16-bit `chanspec` word to describe
+// a channel. The encoding is defined in Linux's
+// `include/brcmu_wifi.h` (~L50..L164) and exercised by
+// `cfg80211.c::brcmf_cfg80211_set_channel` via the `chanspec` IOVAR
+// (~L2392..L2450, v6.6).
+//
+// Wire layout (16-bit LE):
+//
+//   bits 11-0  : channel number (1–14 for 2 GHz, 36–165 for 5 GHz)
+//   bits 12    : CTL_SB_NONE (= 0 for 20 MHz)
+//   bits 14-11 : bandwidth: 0x8 → BW_20
+//   bits 15-12 : band:      0x1 → 5 GHz, 0x2 → 2 GHz
+//
+// Concretely:
+//   `ch20mhz_chspec(channel)` (brcmu_wifi.h ~L158):
+//       channel | WL_CHANSPEC_BW_20 | WL_CHANSPEC_CTL_SB_NONE | band
+//
+// WL_CHANSPEC_BW_20   = 0x0800
+// WL_CHANSPEC_CTL_SB_NONE = 0x0000 (no sub-band bits set for 20 MHz)
+// WL_CHANSPEC_BAND_5G = 0x1000
+// WL_CHANSPEC_BAND_2G = 0x2000
+
+/// 20 MHz bandwidth selector (bits 11-10 = `0b10`).
+/// `WL_CHANSPEC_BW_20`. Linux `include/brcmu_wifi.h:54`.
+pub const WL_CHANSPEC_BW_20: u16 = 0x0800;
+/// 5 GHz band selector (bits 15-12 = `0b0001`).
+/// `WL_CHANSPEC_BAND_5G`. Linux `include/brcmu_wifi.h:60`.
+pub const WL_CHANSPEC_BAND_5G: u16 = 0x1000;
+/// 2.4 GHz band selector (bits 15-12 = `0b0010`).
+/// `WL_CHANSPEC_BAND_2G`. Linux `include/brcmu_wifi.h:61`.
+pub const WL_CHANSPEC_BAND_2G: u16 = 0x2000;
+/// Maximum 2 GHz channel number. Channels 1-14 are 2 GHz.
+/// `CH_MAX_2G_CHANNEL`. Linux `include/brcmu_wifi.h:43`.
+pub const CH_MAX_2G_CHANNEL: u8 = 14;
+
+/// Encode a 20 MHz chanspec for the given channel number.
+///
+/// Mirrors `ch20mhz_chspec()` from `include/brcmu_wifi.h` (~L158):
+///
+/// ```c
+/// u16 rc = channel <= CH_MAX_2G_CHANNEL ?
+///     WL_CHANSPEC_BAND_2G : WL_CHANSPEC_BAND_5G;
+/// return (u16)(channel | WL_CHANSPEC_BW_20 | WL_CHANSPEC_CTL_SB_NONE | rc);
+/// ```
+///
+/// `WL_CHANSPEC_CTL_SB_NONE` = 0 (no control-subband bits), so it
+/// does not appear in the expression.
+pub const fn chanspec_20mhz(channel: u8) -> u16 {
+    let band = if channel <= CH_MAX_2G_CHANNEL {
+        WL_CHANSPEC_BAND_2G
+    } else {
+        WL_CHANSPEC_BAND_5G
+    };
+    (channel as u16) | WL_CHANSPEC_BW_20 | band
+}
+
+/// Return the channel number from an encoded chanspec.
+/// `CHSPEC_CHANNEL(chspec)`. Linux `brcmu_wifi.h:99`.
+pub const fn chanspec_channel(chspec: u16) -> u8 {
+    // Channel number lives in the low 8 bits of the chanspec
+    // (the CHAN_MASK per Linux is 0xFF).
+    (chspec & 0x00FF) as u8
+}
+
+/// Return true if the chanspec is a 5 GHz channel.
+/// Mirrors `CHSPEC_IS5G(chspec)`. Linux `brcmu_wifi.h:116`.
+pub const fn chanspec_is5g(chspec: u16) -> bool {
+    (chspec & 0xF000) == WL_CHANSPEC_BAND_5G
+}
+
 // ── WL event (`MSGBUF_TYPE_WL_EVENT`) ──────────────────────────────
 //
 // Layout per `msgbuf.c::msgbuf_rx_event` (~L145):
