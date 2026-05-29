@@ -29,8 +29,13 @@ use super::hw::*;
 use super::hw::ce_off;
 use super::pci::{name_for, register_pci_driver};
 use super::wmi::{
-    build_pdev_set_param, decode_event, decode_wmi_hdr, encode_wmi_hdr, EventFrame, WmiCmdHdr,
-    WmiCmdId, WmiError, WmiEventId,
+    build_pdev_set_param, build_vdev_create, build_vdev_set_param,
+    decode_event, decode_wmi_hdr, encode_wmi_hdr, vdev_param,
+    EventFrame, VdevSubtype, VdevType, WmiCmdHdr, WmiCmdId, WmiError, WmiEventId,
+};
+use super::htt::{
+    build_rx_ring_setup, decode_rx_indication, encode_rx_ring_cfg,
+    h2t_msg_type, HTT_RX_RING_FILL_LEVEL, HTT_RX_RING_SIZE,
 };
 use alloc::vec;
 
@@ -660,4 +665,152 @@ fn smoke_ath10k_wmi_send_stub_returns_not_implemented() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath10k/wmi",
     smoke_ath10k_wmi_send_stub_returns_not_implemented
+);
+
+// ── Stage 3: HTT RX ring layout + encode ──────────────────────────
+
+fn smoke_ath10k_htt_rx_ring_layout_encode() -> TestResult {
+    use super::htt::rx_ring_flags;
+    if HTT_RX_RING_SIZE != 2048 {
+        return TestResult::Fail("HTT_RX_RING_SIZE != 2048");
+    }
+    if HTT_RX_RING_FILL_LEVEL != 1023 {
+        return TestResult::Fail("HTT_RX_RING_FILL_LEVEL != 1023");
+    }
+    let setup = build_rx_ring_setup(0x1000_0000, 0x2000_0000);
+    if setup.rx_ring_base_paddr != 0x1000_0000 {
+        return TestResult::Fail("rx_ring_base_paddr mismatch");
+    }
+    if setup.fw_idx_shadow_reg_paddr != 0x2000_0000 {
+        return TestResult::Fail("fw_idx_shadow_reg_paddr mismatch");
+    }
+    if setup.flags & rx_ring_flags::UNICAST_RX == 0 {
+        return TestResult::Fail("UNICAST_RX flag not set");
+    }
+    if setup.flags & rx_ring_flags::MULTICAST_RX == 0 {
+        return TestResult::Fail("MULTICAST_RX flag not set");
+    }
+    let enc = encode_rx_ring_cfg(&setup);
+    // Header: msg_type=2, num_rings=1, pad, pad.
+    if enc[0] != h2t_msg_type::RX_RING_CFG {
+        return TestResult::Fail("encoded msg_type != RX_RING_CFG(2)");
+    }
+    if enc[1] != 1 {
+        return TestResult::Fail("encoded num_rings != 1");
+    }
+    // base_paddr at bytes 8..12 (after 4-byte hdr + 4-byte shadow_paddr).
+    let base = u32::from_le_bytes(enc[8..12].try_into().unwrap());
+    if base != 0x1000_0000 {
+        return TestResult::Fail("encoded base_paddr wrong");
+    }
+    let shadow = u32::from_le_bytes(enc[4..8].try_into().unwrap());
+    if shadow != 0x2000_0000 {
+        return TestResult::Fail("encoded shadow_paddr wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htt",
+    smoke_ath10k_htt_rx_ring_layout_encode
+);
+
+// ── Stage 3: WMI VDEV_CREATE encode ───────────────────────────────
+
+fn smoke_ath10k_wmi_vdev_create_cmd_encode() -> TestResult {
+    let mac: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let frame = build_vdev_create(0, VdevType::Sta, VdevSubtype::None, mac);
+    // hdr(4) + vdev_id(4) + vdev_type(4) + vdev_subtype(4) + mac(6) + pad(2) = 24 bytes.
+    if frame.len() != 24 {
+        return TestResult::Fail("vdev_create frame size wrong (expected 24)");
+    }
+    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
+    if cmd_id != WmiCmdId::VdevCreate as u32 {
+        return TestResult::Fail("cmd_id != WMI_VDEV_CREATE_CMDID");
+    }
+    let vdev_id = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+    if vdev_id != 0 {
+        return TestResult::Fail("vdev_id != 0");
+    }
+    let vdev_type = u32::from_le_bytes(frame[8..12].try_into().unwrap());
+    if vdev_type != VdevType::Sta as u32 {
+        return TestResult::Fail("vdev_type != STA(2)");
+    }
+    if &frame[16..22] != &mac {
+        return TestResult::Fail("mac_addr bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_vdev_create_cmd_encode
+);
+
+fn smoke_ath10k_wmi_vdev_set_param_encode() -> TestResult {
+    // hdr(4) + vdev_id(4) + param_id(4) + param_value(4) = 16 bytes.
+    let frame = build_vdev_set_param(1, vdev_param::BEACON_INTERVAL, 100);
+    if frame.len() != 16 {
+        return TestResult::Fail("vdev_set_param frame size wrong (expected 16)");
+    }
+    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
+    // WMI_VDEV_SET_PARAM_CMDID = 0x5003.
+    if cmd_id != 0x5003 {
+        return TestResult::Fail("cmd_id != WMI_VDEV_SET_PARAM_CMDID (0x5003)");
+    }
+    let vdev_id = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+    if vdev_id != 1 {
+        return TestResult::Fail("vdev_id != 1");
+    }
+    let param_id = u32::from_le_bytes(frame[8..12].try_into().unwrap());
+    if param_id != vdev_param::BEACON_INTERVAL {
+        return TestResult::Fail("param_id != BEACON_INTERVAL");
+    }
+    let param_val = u32::from_le_bytes(frame[12..16].try_into().unwrap());
+    if param_val != 100 {
+        return TestResult::Fail("param_value != 100");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi",
+    smoke_ath10k_wmi_vdev_set_param_encode
+);
+
+// ── Stage 3: HTT RX indication decode ─────────────────────────────
+
+fn smoke_ath10k_htt_rx_indication_decode() -> TestResult {
+    use super::htt::mpdu_status;
+    // Build a synthetic T2H RX_IND message.
+    // Layout: msg_type(1) + info0(1) + peer_id(2) + info1(4) = hdr 8 bytes
+    //         + PPDU (44 bytes) + prefix/fw_rx_desc_bytes=0 (4 bytes)
+    //         + mpdu_range[0]: count(1) + status(1) + pad(2) = 4 bytes.
+    // Total = 8 + 44 + 4 + 4 = 60 bytes.
+    let mut msg = vec![0u8; 60];
+    msg[0] = super::htt::t2h_msg_type::RX_IND; // msg_type = 1
+    // peer_id at bytes 2..4 = 42.
+    msg[2..4].copy_from_slice(&42u16.to_le_bytes());
+    // PPDU block occupies bytes 8..52 — leave zeroed.
+    // fw_rx_desc_bytes at bytes 52..54 = 0 (no per-frame desc).
+    msg[52] = 0;
+    msg[53] = 0;
+    // mpdu_range at bytes 56..60: count=3, status=OK=1, pad.
+    msg[56] = 3;  // mpdu_count
+    msg[57] = mpdu_status::OK; // mpdu_range_status
+    let ind = match decode_rx_indication(&msg) {
+        Some(i) => i,
+        None => return TestResult::Fail("decode_rx_indication returned None"),
+    };
+    if ind.hdr.peer_id != 42 {
+        return TestResult::Fail("peer_id decode wrong");
+    }
+    if ind.mpdu_count != 3 {
+        return TestResult::Fail("mpdu_count wrong");
+    }
+    if ind.mpdu_status != mpdu_status::OK {
+        return TestResult::Fail("mpdu_status wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htt",
+    smoke_ath10k_htt_rx_indication_decode
 );

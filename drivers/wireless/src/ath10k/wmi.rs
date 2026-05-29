@@ -308,3 +308,80 @@ pub fn build_pdev_set_param(param_id: u32, param_value: u32) -> Vec<u8> {
 pub fn build_init_stub() -> Vec<u8> {
     Encoder::new(WmiCmdId::Init).finish()
 }
+
+// ── MAC vif (VDEV) commands ────────────────────────────────────────
+//
+// After HTC + WMI INIT, the host creates a virtual interface ("vdev")
+// with `WMI_VDEV_CREATE_CMDID`. Payload layout from
+// `wmi.h::struct wmi_vdev_create_cmd` (line 4871):
+//
+//   __le32 vdev_id;
+//   __le32 vdev_type;
+//   __le32 vdev_subtype;
+//   struct wmi_mac_addr vdev_macaddr;  // 6 bytes addr + 2 pad
+//
+// Total payload = 3 × 4 + 8 = 20 bytes.
+//
+// Reference: `wmi.c::ath10k_wmi_vdev_create_send` (line 7146).
+
+/// vdev type from `wmi.h::enum wmi_vdev_type`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VdevType {
+    Ap = 1,
+    Sta = 2,
+    Ibss = 3,
+    Monitor = 4,
+}
+
+/// vdev subtype from `wmi.h::enum wmi_vdev_subtype`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VdevSubtype {
+    None = 0,
+    P2pDevice = 1,
+    P2pClient = 2,
+    P2pGo = 3,
+}
+
+/// Build a `WMI_VDEV_CREATE_CMDID` command frame.
+///
+/// Reference: `wmi.c::ath10k_wmi_vdev_create_send` (line 7146).
+pub fn build_vdev_create(
+    vdev_id: u32,
+    vdev_type: VdevType,
+    vdev_subtype: VdevSubtype,
+    mac_addr: [u8; 6],
+) -> Vec<u8> {
+    let mut e = Encoder::new(WmiCmdId::VdevCreate);
+    e.push_u32(vdev_id);
+    e.push_u32(vdev_type as u32);
+    e.push_u32(vdev_subtype as u32);
+    // wmi_mac_addr: 6 bytes + 2 bytes pad.
+    e.push_slice(&mac_addr);
+    e.push_u16(0u16);
+    e.finish()
+}
+
+/// WMI_VDEV_PARAM_* constants from `wmi.h::enum wmi_vdev_param`.
+pub mod vdev_param {
+    pub const MAC_ADDR: u32 = 0x1;
+    pub const RTS_THRESHOLD: u32 = 0x2;
+    pub const FRAGMENTATION_THRESHOLD: u32 = 0x3;
+    pub const DTIM_PERIOD: u32 = 0x5;
+    pub const BEACON_INTERVAL: u32 = 0x6;
+}
+
+/// Build a `WMI_VDEV_SET_PARAM_CMDID` command frame.
+///
+/// Payload from `wmi.h::struct wmi_vdev_set_param_cmd`:
+///   __le32 vdev_id; __le32 param_id; __le32 param_value;
+pub fn build_vdev_set_param(vdev_id: u32, param_id: u32, param_value: u32) -> Vec<u8> {
+    // WMI_VDEV_SET_PARAM_CMDID = WMI_GRP_VDEV << 12 | 0x3 = 0x5003.
+    const VDEV_SET_PARAM_ID: u32 = 0x5003;
+    let mut buf = Vec::with_capacity(4 + 12);
+    let hdr = WmiCmdHdr::new(VDEV_SET_PARAM_ID);
+    buf.extend_from_slice(&hdr.cmd_id_and_priv.to_le_bytes());
+    buf.extend_from_slice(&vdev_id.to_le_bytes());
+    buf.extend_from_slice(&param_id.to_le_bytes());
+    buf.extend_from_slice(&param_value.to_le_bytes());
+    buf
+}

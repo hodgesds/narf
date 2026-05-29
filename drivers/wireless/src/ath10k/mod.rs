@@ -38,21 +38,23 @@
 //! - Default per-pipe configuration table mirroring Linux's
 //!   `host_ce_config_wlan`.
 //!
-//! ## Stage 2 (this commit)
+//! ## Stage 2 (prior commit)
 //!
 //! - HTC frame builder/parser (8-byte header + ConnectService /
 //!   SetupComplete bodies).
 //! - WMI command-id codec (24-bit cmd_id + 8-bit plt_priv).
 //! - WMI Encoder for command-frame assembly; EventFrame decoder for
 //!   firmware → host responses.
-//! - `run_handshake` / `wmi_send` return `Err(NotImplemented)`
-//!   because NARF doesn't yet ship the ath10k firmware blob —
-//!   Stage 3 wires those entry points through to the real CE
-//!   pipes.
+//! - `run_handshake` / `wmi_send` return `Err(NotImplemented)`.
 //!
-//! ## References (Linux v6.10, ISC-licensed — NARF is
-//! GPL-2.0-or-later post 2026-05-20, so direct adaptation is in-
-//! policy per `memory/MEMORY.md::feedback_no_gpl_links.md`)
+//! ## Stage 3 (this commit)
+//!
+//! - HTT RX ring setup command (`htt.rs`): ring layout, encode,
+//!   and RX-indication decode. Reference: `htt.h` / `htt_rx.c`.
+//! - WMI VDEV_CREATE + VDEV_SET_PARAM command builders (`wmi.rs`).
+//!   Reference: `wmi.c::ath10k_wmi_vdev_create_send` (line 7146).
+//!
+//! ## References (Linux v6.10)
 //!
 //! - `drivers/net/wireless/ath/ath10k/pci.c` — `ath10k_pci_probe`,
 //!   `ath10k_pci_id_table` (lines ~57..97 v6.10).
@@ -65,6 +67,7 @@ extern crate alloc;
 
 pub mod ce;
 pub mod htc;
+pub mod htt;
 pub mod hw;
 pub mod pci;
 pub mod wmi;
