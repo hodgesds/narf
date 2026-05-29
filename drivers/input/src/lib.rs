@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+pub mod hid_mt_features;
+pub mod hid_multitouch;
 pub mod hid_sensor;
 pub mod i2c_hid;
 pub mod i2c_hid_bind;
@@ -19,6 +21,7 @@ pub mod i2c_hid_touch;
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042_mouse;
+pub mod rmi4_core;
 pub mod wbdi;
 
 /// Stage::Device initcalls for this driver crate.
@@ -42,6 +45,12 @@ pub fn register_initcalls() {
     // i2c-hid-probe + i2c-hid-bind run on every arch — they
     // walk the AML namespace which is arch-independent.
     i2c_hid::register_initcalls();
+
+    // HID multi-touch class driver — banner + class-table load.
+    // Transport-specific probes (USB / i2c-HID) call into
+    // `hid_multitouch::MtDevice::attach` when they find an
+    // MT-shaped Report Descriptor.
+    hid_multitouch::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();
