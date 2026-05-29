@@ -49,8 +49,10 @@ pub mod fw;
 pub mod h2c;
 pub mod mac;
 pub mod pci;
+pub mod phy;
 pub mod power;
 pub mod regs;
+pub mod rf;
 
 pub mod rtl8188ee;
 pub mod rtl8192ce;
