@@ -2629,4 +2629,186 @@ kernel_test_in!(
     smoke_mt_apple_synth_descriptor_carries_scan_time
 );
 
+// ─── hid-rmi (RMI4 over HID transport) smoke tests ─────────────────
+
+fn smoke_hid_rmi_set_rmi_mode_feature_encode() -> TestResult {
+    use crate::hid_rmi::{
+        encode_set_rmi_mode, RMI_MODE_ATTN_REPORTS, RMI_SET_RMI_MODE_REPORT_ID,
+    };
+    let buf = encode_set_rmi_mode(RMI_MODE_ATTN_REPORTS);
+    if buf.len() != 2 {
+        return TestResult::Fail("Set_RMI_Mode body must be exactly 2 bytes");
+    }
+    if buf[0] != RMI_SET_RMI_MODE_REPORT_ID {
+        return TestResult::Fail("leading byte must be Set_RMI_Mode report id (0x0F)");
+    }
+    if buf[1] != RMI_MODE_ATTN_REPORTS {
+        return TestResult::Fail("mode byte not propagated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-rmi",
+    smoke_hid_rmi_set_rmi_mode_feature_encode
+);
+
+fn smoke_hid_rmi_transport_write_register_via_output_report() -> TestResult {
+    use crate::hid_rmi::{encode_write_block, RMI_WRITE_REPORT_ID};
+    // Write 3 bytes [0xDE, 0xAD, 0xBE] to RMI register 0x0142
+    // (page 1, offset 0x42). 19-byte output report (typical
+    // Synaptics touchpad reports 1 byte report id + 18 byte body).
+    let payload = [0xDEu8, 0xAD, 0xBE];
+    let buf = encode_write_block(0x0142, &payload, 19);
+    if buf.len() != 19 {
+        return TestResult::Fail("output report not padded to declared size");
+    }
+    if buf[0] != RMI_WRITE_REPORT_ID {
+        return TestResult::Fail("leading byte not WRITE_REPORT_ID (0x09)");
+    }
+    if buf[1] != 3 {
+        return TestResult::Fail("write-count field wrong");
+    }
+    if buf[2] != 0x42 || buf[3] != 0x01 {
+        return TestResult::Fail("addr LE encoding wrong");
+    }
+    if buf[4] != 0xDE || buf[5] != 0xAD || buf[6] != 0xBE {
+        return TestResult::Fail("payload bytes not copied at offset 4");
+    }
+    // Trailing bytes must be zero-padded.
+    for &b in &buf[7..] {
+        if b != 0 {
+            return TestResult::Fail("trailing pad bytes must be 0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-rmi",
+    smoke_hid_rmi_transport_write_register_via_output_report
+);
+
+fn smoke_hid_rmi_clickpad_quirk_path() -> TestResult {
+    use crate::hid_rmi::{clickpad_btn_left, is_clickpad, DeviceQuirks};
+    // Synaptics ThinkPad-class touchpad: no HAS_PHYS_BUTTONS,
+    // 0 mech_mouse_btns → clickpad.
+    if !is_clickpad(false, 0) {
+        return TestResult::Fail("default Synaptics touchpad should classify as clickpad");
+    }
+    // Razer Blade 14: HAS_PHYS_BUTTONS → NOT a clickpad.
+    let razer_quirks = DeviceQuirks::HAS_PHYS_BUTTONS;
+    if is_clickpad(razer_quirks.contains(DeviceQuirks::HAS_PHYS_BUTTONS), 2) {
+        return TestResult::Fail(
+            "phys-buttons quirk + 2 mech_mouse_btns must NOT be clickpad",
+        );
+    }
+    // F$30 bitmap 0b001 → BTN_LEFT pressed on clickpad.
+    if !clickpad_btn_left(0b001) {
+        return TestResult::Fail("clickpad_btn_left should fire on bit 0");
+    }
+    if clickpad_btn_left(0b010) {
+        return TestResult::Fail("clickpad_btn_left must ignore bit 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/hid-rmi", smoke_hid_rmi_clickpad_quirk_path);
+
+fn smoke_hid_rmi_device_id_table_covers_canonical_vids() -> TestResult {
+    use crate::hid_rmi::{
+        match_device, DeviceQuirks, RMI_DEVICE_TABLE, USB_DEVICE_ID_RAZER_BLADE_14,
+        USB_DEVICE_ID_SYNAPTICS_ACER_SWITCH5, USB_VENDOR_ID_LENOVO, USB_VENDOR_ID_PRIMAX,
+        USB_VENDOR_ID_RAZER, USB_VENDOR_ID_SYNAPTICS,
+    };
+    if RMI_DEVICE_TABLE.len() < 4 {
+        return TestResult::Fail("expected ≥4 entries in RMI_DEVICE_TABLE");
+    }
+    // Razer Blade 14 must carry HAS_PHYS_BUTTONS.
+    match match_device(USB_VENDOR_ID_RAZER, USB_DEVICE_ID_RAZER_BLADE_14) {
+        Some(m) => {
+            if !m.quirks.contains(DeviceQuirks::HAS_PHYS_BUTTONS) {
+                return TestResult::Fail("Razer Blade 14 missing HAS_PHYS_BUTTONS");
+            }
+        }
+        None => return TestResult::Fail("Razer Blade 14 not in table"),
+    }
+    // Synaptics Acer Switch 5 must carry OUTPUT_SET_REPORT.
+    match match_device(USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_ACER_SWITCH5) {
+        Some(m) => {
+            if !m.quirks.contains(DeviceQuirks::OUTPUT_SET_REPORT) {
+                return TestResult::Fail(
+                    "Synaptics Acer Switch 5 missing OUTPUT_SET_REPORT",
+                );
+            }
+        }
+        None => return TestResult::Fail("Synaptics Acer Switch 5 not in table"),
+    }
+    // Lenovo X1 Cover present without quirks.
+    if match_device(USB_VENDOR_ID_LENOVO, 0x6085).is_none() {
+        return TestResult::Fail("Lenovo X1 Cover not in table");
+    }
+    // Primax Rezel present.
+    if match_device(USB_VENDOR_ID_PRIMAX, 0x4E72).is_none() {
+        return TestResult::Fail("Primax Rezel not in table");
+    }
+    // Unmatched VID returns None.
+    if match_device(0xFFFF, 0xFFFF).is_some() {
+        return TestResult::Fail("unknown VID/PID should not match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-rmi",
+    smoke_hid_rmi_device_id_table_covers_canonical_vids
+);
+
+fn smoke_hid_rmi_set_page_output_report_layout() -> TestResult {
+    use crate::hid_rmi::{encode_set_page, rmi_page, RMI_WRITE_REPORT_ID};
+    if rmi_page(0x0142) != 1 {
+        return TestResult::Fail("rmi_page must return high byte of addr");
+    }
+    if rmi_page(0xFFFF) != 0xFF {
+        return TestResult::Fail("rmi_page edge case");
+    }
+    let buf = encode_set_page(2, 19);
+    if buf[0] != RMI_WRITE_REPORT_ID {
+        return TestResult::Fail("set_page must use WRITE_REPORT_ID");
+    }
+    if buf[1] != 1 {
+        return TestResult::Fail("set_page write-count must be 1");
+    }
+    if buf[2] != 0xFF || buf[3] != 0 {
+        return TestResult::Fail("set_page must target register 0x00FF");
+    }
+    if buf[4] != 2 {
+        return TestResult::Fail("set_page must carry the page byte at offset 4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-rmi",
+    smoke_hid_rmi_set_page_output_report_layout
+);
+
+fn smoke_hid_rmi_attn_report_decode() -> TestResult {
+    use crate::hid_rmi::{AttnReport, RMI_ATTN_REPORT_ID};
+    // ATTN report: [0x0C, 0x04 (int=F12), F12 data block...]
+    let buf = [RMI_ATTN_REPORT_ID, 0x04, 0xAA, 0xBB, 0xCC];
+    let attn = match AttnReport::decode(&buf) {
+        Some(a) => a,
+        None => return TestResult::Fail("AttnReport::decode rejected valid ATTN"),
+    };
+    if attn.interrupt_sources != 0x04 {
+        return TestResult::Fail("interrupt source byte mis-decoded");
+    }
+    if attn.data != &[0xAA, 0xBB, 0xCC] {
+        return TestResult::Fail("ATTN data slice wrong");
+    }
+    // Non-ATTN report returns None.
+    let other = [0x0B, 0x01, 0x00];
+    if AttnReport::decode(&other).is_some() {
+        return TestResult::Fail("AttnReport::decode must reject non-ATTN reports");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/hid-rmi", smoke_hid_rmi_attn_report_decode);
+
 

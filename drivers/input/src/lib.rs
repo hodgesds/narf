@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod hid_mt_features;
 pub mod hid_multitouch;
+pub mod hid_rmi;
 pub mod hid_sensor;
 pub mod i2c_hid;
 pub mod i2c_hid_bind;
@@ -51,6 +52,12 @@ pub fn register_initcalls() {
     // `hid_multitouch::MtDevice::attach` when they find an
     // MT-shaped Report Descriptor.
     hid_multitouch::register_initcalls();
+
+    // hid-rmi (Synaptics RMI4 over HID) — banner + device-id
+    // table load. The USB-HID transport reads
+    // `hid_rmi::RMI_DEVICE_TABLE` and `match_device()` when it
+    // sees a Synaptics VID at enumeration time.
+    hid_rmi::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();

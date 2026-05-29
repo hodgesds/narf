@@ -427,3 +427,340 @@ fn smoke_goodix_command_constants() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("input/goodix", smoke_goodix_command_constants);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// evdev layer smokes (10 required)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 1. EvdevEvent wire-size matches Linux struct input_event (16 bytes) ───────
+
+fn smoke_evdev_event_size_matches_linux() -> TestResult {
+    use crate::evdev::EvdevEvent;
+    // Linux 64-bit kernel struct input_event:
+    //   time = 8 + 8 bytes, type u16 + code u16 + value i32 = 16 bytes.
+    // Ref: include/uapi/linux/input.h struct input_event.
+    if core::mem::size_of::<EvdevEvent>() != 16 {
+        return TestResult::Fail("EvdevEvent must be 16 bytes to match Linux struct input_event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_event_size_matches_linux);
+
+// ── 2. Key + button + axis code constants match Linux ─────────────────────────
+
+fn smoke_evdev_code_constants_pinned() -> TestResult {
+    use crate::evdev::key;
+    // Ref: include/uapi/linux/input-event-codes.h
+    if key::KEY_A != 30 {
+        return TestResult::Fail("KEY_A must be 30");
+    }
+    if key::BTN_LEFT != 0x110 {
+        return TestResult::Fail("BTN_LEFT must be 0x110");
+    }
+    use crate::evdev::rel;
+    if rel::REL_X != 0 {
+        return TestResult::Fail("REL_X must be 0");
+    }
+    use crate::evdev::abs;
+    if abs::ABS_X != 0 {
+        return TestResult::Fail("ABS_X must be 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_code_constants_pinned);
+
+// ── 3. Queue overflow → SYN_DROPPED emitted ───────────────────────────────────
+
+fn smoke_evdev_queue_overflow_syn_dropped() -> TestResult {
+    use crate::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use crate::evdev::syn::SYN_DROPPED;
+    use crate::evdev::key::KEY_A;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let (id, node) = ROUTER.register_device(caps);
+
+    // Fill ring to capacity (256 slots).
+    for i in 0u32..256 {
+        node.dispatch(EvdevEvent {
+            time: i as u64,
+            type_: EventType::Key,
+            code: KEY_A,
+            value: 1,
+        });
+    }
+    // One more push causes overflow + SYN_DROPPED insertion.
+    node.dispatch(EvdevEvent {
+        time: 256,
+        type_: EventType::Key,
+        code: KEY_A,
+        value: 0,
+    });
+
+    let reader = ROUTER.open_reader(id).expect("reader");
+    let mut found_dropped = false;
+    let mut limit = 300usize;
+    while let Some(ev) = reader.poll_event() {
+        if ev.type_ == EventType::Syn && ev.code == SYN_DROPPED {
+            found_dropped = true;
+            break;
+        }
+        limit -= 1;
+        if limit == 0 {
+            break;
+        }
+    }
+    ROUTER.unregister_device(id);
+    if !found_dropped {
+        return TestResult::Fail("overflow did not produce SYN_DROPPED");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_queue_overflow_syn_dropped);
+
+// ── 4. Capability bitmap: KEY_A + KEY_B reported, not KEY_C ───────────────────
+
+fn smoke_evdev_capability_bitmap() -> TestResult {
+    use crate::evdev::{DeviceCaps, EventType};
+    use crate::evdev::key::{KEY_A, KEY_B, KEY_C};
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    caps.add_key(KEY_B);
+
+    if !caps.has(EventType::Key, KEY_A) {
+        return TestResult::Fail("KEY_A should be in caps");
+    }
+    if !caps.has(EventType::Key, KEY_B) {
+        return TestResult::Fail("KEY_B should be in caps");
+    }
+    if caps.has(EventType::Key, KEY_C) {
+        return TestResult::Fail("KEY_C should NOT be in caps");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_capability_bitmap);
+
+// ── 5. Reader blocking-wait future yields when an event arrives ────────────────
+
+fn smoke_evdev_reader_wait_future_resolves() -> TestResult {
+    use crate::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use core::future::Future;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    let (id, node) = ROUTER.register_device(DeviceCaps::new());
+    let reader = ROUTER.open_reader(id).expect("reader");
+
+    // Poll the future before any event arrives — should be Pending.
+    let mut fut = reader.wait_event_async();
+    // SAFETY: we don't move `fut` after this pin.
+    let mut fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
+
+    static VTABLE: RawWakerVTable = {
+        unsafe fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop_waker(_: *const ()) {}
+        RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker)
+    };
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Pending => {}
+        Poll::Ready(_) => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("future should be Pending before event pushed");
+        }
+    }
+
+    // Push an event — future should now resolve.
+    node.dispatch(EvdevEvent {
+        time: 0,
+        type_: EventType::Key,
+        code: crate::evdev::key::KEY_A,
+        value: 1,
+    });
+
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(Some(ev)) => {
+            ROUTER.unregister_device(id);
+            if ev.type_ != EventType::Key {
+                return TestResult::Fail("wrong event type from future");
+            }
+        }
+        Poll::Ready(None) => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("future resolved to None before device removal");
+        }
+        Poll::Pending => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("future still Pending after event pushed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_reader_wait_future_resolves);
+
+// ── 6. Many-readers fan-out (multiple readers can attach) ─────────────────────
+
+fn smoke_evdev_many_readers_fanout() -> TestResult {
+    use crate::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+
+    let (id, node) = ROUTER.register_device(DeviceCaps::new());
+    let r1 = ROUTER.open_reader(id).expect("reader1");
+    let r2 = ROUTER.open_reader(id).expect("reader2");
+    let r3 = ROUTER.open_reader(id).expect("reader3");
+
+    node.dispatch(EvdevEvent {
+        time: 1,
+        type_: EventType::Key,
+        code: crate::evdev::key::KEY_A,
+        value: 1,
+    });
+    node.dispatch(EvdevEvent {
+        time: 2,
+        type_: EventType::Key,
+        code: crate::evdev::key::KEY_B,
+        value: 1,
+    });
+    node.dispatch(EvdevEvent {
+        time: 3,
+        type_: EventType::Key,
+        code: crate::evdev::key::KEY_A,
+        value: 0,
+    });
+
+    let ev1 = r1.poll_event();
+    let ev2 = r2.poll_event();
+    let ev3 = r3.poll_event();
+
+    ROUTER.unregister_device(id);
+
+    // At least one reader must have seen an event (shared ring).
+    let saw_event = ev1.is_some() || ev2.is_some() || ev3.is_some();
+    drop((r1, r2, r3));
+    if !saw_event {
+        return TestResult::Fail("no reader received any event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_many_readers_fanout);
+
+// ── 7. uinput: create device with KEY_A cap, inject press, reader sees it ─────
+
+fn smoke_uinput_inject_key_press() -> TestResult {
+    use crate::evdev::{EventType, ROUTER};
+    use crate::evdev::key::KEY_A;
+    use crate::evdev::DeviceCaps;
+    use crate::uinput::UserDevice;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let dev = UserDevice::create(caps);
+    let id = dev.id();
+
+    let reader = ROUTER.open_reader(id).expect("reader");
+    dev.inject_key(KEY_A, true);
+
+    let mut found = false;
+    let mut limit = 10usize;
+    while let Some(ev) = reader.poll_event() {
+        if ev.type_ == EventType::Key && ev.code == KEY_A && ev.value == 1 {
+            found = true;
+        }
+        limit -= 1;
+        if limit == 0 {
+            break;
+        }
+    }
+    drop(dev); // unregisters device
+    if !found {
+        return TestResult::Fail("reader did not see KEY_A press from uinput");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_uinput_inject_key_press);
+
+// ── 8. i8042 key dispatch helper → reader sees EV_KEY with correct code ───────
+
+fn smoke_evdev_i8042_key_routes_to_evdev() -> TestResult {
+    use crate::evdev::{DeviceCaps, EventType, ROUTER};
+    use crate::evdev::key::KEY_A;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = ROUTER.open_reader(id).expect("reader");
+
+    // Use the i8042 driver helper directly.
+    crate::evdev::dispatch_key_to_node(&node, KEY_A, true);
+
+    let ev = reader.poll_event();
+    ROUTER.unregister_device(id);
+    match ev {
+        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1 => {
+            TestResult::Pass
+        }
+        Some(_) => TestResult::Fail("wrong event from i8042 key dispatch"),
+        None => TestResult::Fail("no event from i8042 key dispatch"),
+    }
+}
+kernel_test_in!("input/evdev", smoke_evdev_i8042_key_routes_to_evdev);
+
+// ── 9. i8042 mouse motion helper → reader sees EV_REL/REL_X ──────────────────
+
+fn smoke_evdev_i8042_mouse_routes_to_evdev() -> TestResult {
+    use crate::evdev::{rel, DeviceCaps, EventType, ROUTER};
+
+    let mut caps = DeviceCaps::new();
+    caps.add_rel(rel::REL_X);
+    caps.add_rel(rel::REL_Y);
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = ROUTER.open_reader(id).expect("reader");
+
+    crate::evdev::dispatch_rel_to_node(&node, 5, -3);
+
+    let mut found_x = false;
+    let mut limit = 10usize;
+    while let Some(ev) = reader.poll_event() {
+        if ev.type_ == EventType::Rel && ev.code == rel::REL_X && ev.value == 5 {
+            found_x = true;
+        }
+        limit -= 1;
+        if limit == 0 {
+            break;
+        }
+    }
+    ROUTER.unregister_device(id);
+    if !found_x {
+        return TestResult::Fail("REL_X event not seen from mouse dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_i8042_mouse_routes_to_evdev);
+
+// ── 10. Drop device → SYN_DROPPED + reader handle invalidates ─────────────────
+
+fn smoke_evdev_device_drop_invalidates_reader() -> TestResult {
+    use crate::evdev::{DeviceCaps, EventType, ROUTER};
+    use crate::evdev::syn::SYN_DROPPED;
+
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+    let reader = ROUTER.open_reader(id).expect("reader");
+
+    ROUTER.unregister_device(id);
+
+    let ev = reader.poll_event();
+    match ev {
+        Some(e) if e.type_ == EventType::Syn && e.code == SYN_DROPPED => {}
+        Some(_) => return TestResult::Fail("expected SYN_DROPPED, got different event"),
+        None => return TestResult::Fail("expected SYN_DROPPED, got None"),
+    }
+    if reader.is_valid() {
+        return TestResult::Fail("reader should be invalid after device removal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_device_drop_invalidates_reader);
