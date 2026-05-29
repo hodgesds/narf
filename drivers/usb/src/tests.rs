@@ -3321,10 +3321,11 @@ fn smoke_xhci_event_trb_decode_transfer_cmd_psc() -> TestResult {
         }
         _ => return TestResult::Fail("expected CmdCompletion"),
     }
-    // Port Status Change: port_id=4 lives in parameter bits[31:24].
-    let psc_d1 = 4u32 << 24;
+    // Port Status Change: port_id=4 lives in parameter bits[31:24],
+    // which is the LOWER 32-bit dword (d0) high byte.
+    let psc_d0 = 4u32 << 24;
     let psc_d3 = EVT_PORT_STATUS_CHANGE << TRB_TYPE_SHIFT;
-    let ev = DecodedEvent::from_dwords([0, psc_d1, 0, psc_d3]);
+    let ev = DecodedEvent::from_dwords([psc_d0, 0, 0, psc_d3]);
     match ev {
         DecodedEvent::PortStatusChange(p) => {
             if p.port_id != 4 {
@@ -3563,13 +3564,21 @@ fn smoke_xhci_endpoint_context_encode_all_kinds() -> TestResult {
         }
         seen[k as usize] = true;
     }
-    // TR Dequeue Pointer low: alignment + DCS bit.
-    let tr_lo = encode_ep_ctx_dword2_tr_lo(0x4000_0030, 1);
+    // TR Dequeue Pointer low: 16-byte alignment + DCS bit. Input
+    // address has the low 4 bits zero (TRBs are 16-byte aligned per
+    // §6.2.3); the encoder preserves the upper bits and ORs in DCS.
+    let tr_lo = encode_ep_ctx_dword2_tr_lo(0x4000_0010, 1);
     if (tr_lo & 0xF) != 1 {
         return TestResult::Fail("DCS bit not in bit 0");
     }
-    if (tr_lo & 0xFFFF_FFF0) != 0x4000_0000 {
-        return TestResult::Fail("TR Dequeue Pointer not aligned");
+    if (tr_lo & 0xFFFF_FFF0) != 0x4000_0010 {
+        return TestResult::Fail("TR Dequeue Pointer bits[31:4] not preserved");
+    }
+    // Encoder must mask off bits[3:1] of the input address (per spec
+    // bits[3:1] MBZ; only bit 0 is DCS).
+    let tr_lo2 = encode_ep_ctx_dword2_tr_lo(0x4000_001F, 0);
+    if (tr_lo2 & 0xF) != 0 {
+        return TestResult::Fail("DCS=0 should clear low 4 bits");
     }
     let d4 = encode_ep_ctx_dword4(64, 0xAA);
     if (d4 & 0xFFFF) != 64 {
