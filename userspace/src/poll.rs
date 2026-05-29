@@ -1,0 +1,207 @@
+//! `poll(2)` — synchronous readiness-wait on a set of file descriptors.
+//!
+//! Linux ref: `fs/select.c` `do_poll` / `poll_poll`.
+//!
+//! Wire layout on the user side matches POSIX `struct pollfd`:
+//! ```text
+//! struct pollfd {
+//!     fd:      i32  // offset 0
+//!     events:  u16  // offset 4
+//!     revents: u16  // offset 6
+//! }               // total 8 bytes
+//! ```
+//!
+//! This is a synchronous spin-style poll: we query every fd's
+//! `poll_readiness()` once; if nothing is ready we busy-yield (via
+//! `sleep_pumps::run()`) until either something becomes ready or the
+//! deadline expires.  The waker/async path is the epoll layer.
+//!
+//! `sys_poll` is called from `handlers.rs`; `do_poll` is the shared
+//! body re-used by `sys_select` / `sys_pselect6`.
+
+use alloc::vec::Vec;
+
+use crate::fd;
+
+// ── Re-export POLL_* constants ───────────────────────────────────────
+pub use narf_filesystem::{POLL_ERR, POLL_HUP, POLL_IN, POLL_NVAL, POLL_OUT, POLL_PRI};
+
+/// Kernel-internal representation of a single poll item.
+#[derive(Copy, Clone, Debug)]
+pub struct PollFd {
+    pub fd:      i32,
+    pub events:  u16,
+    pub revents: u16,
+}
+
+/// Core poll implementation.  `fds` is the kernel-side item array
+/// (pre-parsed from the user pointer by the syscall shim).
+/// `timeout_ms` is -1 for indefinite, 0 for non-blocking, >0 for
+/// bounded wait.
+///
+/// Returns the number of fds with non-zero revents, or 0 on timeout.
+///
+/// Linux ref: `fs/select.c`:do_poll (GPL-2.0-or-later, kernel.org).
+pub fn do_poll(task_id: u64, fds: &mut Vec<PollFd>, timeout_ms: i64) -> usize {
+    let deadline_ns: Option<u64> = if timeout_ms == 0 {
+        Some(0) // non-blocking: exactly one pass
+    } else if timeout_ms > 0 {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        Some(now.saturating_add((timeout_ms as u64) * 1_000_000))
+    } else {
+        None // infinite
+    };
+
+    loop {
+        // --- one pass: query every fd ---
+        let mut n_ready = 0usize;
+        fd::with_table(task_id, |t| {
+            for item in fds.iter_mut() {
+                if item.fd < 0 {
+                    // POSIX: negative fd → ignored, revents = 0.
+                    item.revents = 0;
+                    continue;
+                }
+                match t.get(item.fd as u32) {
+                    None => {
+                        // fd not open → POLLNVAL regardless of events.
+                        item.revents = POLL_NVAL as u16;
+                        n_ready += 1;
+                    }
+                    Some(e) => {
+                        let mask = e.ops.poll_readiness();
+                        // OR in ERR/HUP/NVAL so they're always returned
+                        // even if the caller didn't ask for them (POSIX).
+                        let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
+                        let want   = item.events | always;
+                        let ready  = (mask as u16) & want;
+                        item.revents = ready;
+                        if ready != 0 {
+                            n_ready += 1;
+                        }
+                    }
+                }
+            }
+        });
+
+        if n_ready > 0 {
+            return n_ready;
+        }
+
+        // --- check deadline ---
+        match deadline_ns {
+            Some(0) => return 0, // non-blocking, one shot only
+            Some(d) => {
+                let now = narf_scheduler::narf_time::monotonic_ns();
+                if now >= d {
+                    return 0; // timed out
+                }
+                // Yield to let background work run, then retry.
+                narf_scheduler::sleep_pumps::run();
+                core::hint::spin_loop();
+            }
+            None => {
+                // Indefinite: yield and retry.
+                narf_scheduler::sleep_pumps::run();
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Parse a user `pollfd` array at `ptr` with `nfds` entries into
+/// a kernel `Vec<PollFd>`.  Returns `None` on null/zero-length input.
+///
+/// # Safety
+/// Caller must guarantee `ptr` points to `nfds * 8` readable bytes
+/// in the currently-active user address space.
+pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> {
+    if ptr.is_null() || nfds == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(nfds);
+    for i in 0..nfds {
+        // SAFETY: caller guarantees `nfds * 8` readable bytes from `ptr`.
+        let base = unsafe { ptr.add(i * 8) };
+        let fd_val  = unsafe { core::ptr::read_unaligned(base as *const i32) };
+        let ev_val  = unsafe { core::ptr::read_unaligned(base.add(4) as *const u16) };
+        out.push(PollFd {
+            fd:      fd_val,
+            events:  ev_val,
+            revents: 0,
+        });
+    }
+    Some(out)
+}
+
+/// Write `revents` back to the user `pollfd` array at `ptr`.
+///
+/// # Safety
+/// Same pointer-validity contract as `parse_pollfds`.
+pub unsafe fn write_pollfds(ptr: *mut u8, fds: &[PollFd]) {
+    for (i, item) in fds.iter().enumerate() {
+        // SAFETY: caller guarantees `nfds * 8` writable bytes from `ptr`.
+        let base = unsafe { ptr.add(i * 8).add(6) as *mut u16 };
+        unsafe { core::ptr::write_unaligned(base, item.revents) };
+    }
+}
+
+// ── Syscall body ────────────────────────────────────────────────────
+
+use crate::syscall::{SyscallReturn, TrapContext};
+use crate::handlers::current_task_id;
+
+/// `sys_poll(pollfds_ptr, nfds, timeout_ms)`
+///
+/// - arg0 = ptr to packed `[{i32 fd, u16 events, u16 revents}]` array
+/// - arg1 = element count (nfds_t)
+/// - arg2 = timeout in milliseconds (-1 = block, 0 = nonblock, >0 = bounded)
+///
+/// Returns the number of ready fds, 0 on timeout, or -1 on error.
+///
+/// Linux ref: `fs/select.c`:do_sys_poll (GPL-2.0-or-later, kernel.org).
+pub fn sys_poll(ctx: &mut dyn TrapContext) {
+    let args    = *ctx.args();
+    let ptr     = args.arg0 as *mut u8;
+    let nfds    = args.arg1 as usize;
+    let timeout = args.arg2 as i64;
+    let fail    = SyscallReturn::ok((-1i64) as u64);
+
+    // Upper bound on nfds to prevent OOM from hostile input.
+    if nfds > 1_048_576 {
+        ctx.set_return(fail);
+        return;
+    }
+
+    if nfds == 0 {
+        // poll({}, 0, timeout_ms) is legal; it just sleeps for timeout_ms.
+        if timeout > 0 {
+            let deadline = narf_scheduler::narf_time::monotonic_ns()
+                .saturating_add((timeout as u64) * 1_000_000);
+            while narf_scheduler::narf_time::monotonic_ns() < deadline {
+                narf_scheduler::sleep_pumps::run();
+                core::hint::spin_loop();
+            }
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    // SAFETY: user pointer in the active AS; length bounded above.
+    let mut fds = match unsafe { parse_pollfds(ptr, nfds) } {
+        Some(v) => v,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+
+    let task = current_task_id();
+    let n    = do_poll(task, &mut fds, timeout);
+
+    // Write revents back to user memory.
+    // SAFETY: same pointer/length as parse step; user AS still active.
+    unsafe { write_pollfds(ptr, &fds) };
+
+    ctx.set_return(SyscallReturn::ok(n as u64));
+}

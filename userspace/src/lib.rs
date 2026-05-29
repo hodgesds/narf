@@ -40,6 +40,7 @@ extern crate alloc;
 
 pub mod elf;
 pub mod ephemeral_port;
+pub mod epoll;
 pub mod init;
 pub mod fd;
 pub mod handlers;
@@ -47,12 +48,15 @@ pub mod interp;
 pub mod loader;
 pub mod io_mux;
 pub mod pipe;
+pub mod poll;
 pub mod process;
+pub mod select;
 pub mod socket;
 pub mod syscall;
 #[cfg(target_arch = "x86_64")]
 pub mod tls;
 pub mod user_task;
+pub mod xdp_socket;
 
 mod tests;
 
