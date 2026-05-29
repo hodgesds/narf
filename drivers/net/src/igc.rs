@@ -293,6 +293,152 @@ const ADV_RXD_STAT_DD: u32 = 1 << 0;
 /// Bit 1 — End of Packet.
 const ADV_RXD_STAT_EOP: u32 = 1 << 1;
 
+// ── TX advanced descriptor offload bits ─────────────────────────────
+// Source: Linux igc_defines.h lines 309–329 and igc_base.h lines 28–51.
+
+/// Advanced TX data descriptor type (bits[21:20] = 0b11).
+pub const IGC_ADVTXD_DTYP_DATA: u32 = 0x0030_0000;
+/// Advanced TX context descriptor type (bits[21:20] = 0b10).
+pub const IGC_ADVTXD_DTYP_CTXT: u32 = 0x0020_0000;
+pub const IGC_ADVTXD_DCMD_DEXT: u32 = 1 << 29;
+pub const IGC_ADVTXD_DCMD_RS: u32 = 1 << 27;
+pub const IGC_ADVTXD_DCMD_IFCS: u32 = 1 << 25;
+pub const IGC_ADVTXD_DCMD_EOP: u32 = 1 << 24;
+/// TSE — TCP Segmentation Enable (bit 31 of cmd_type_len).
+pub const IGC_ADVTXD_DCMD_TSE: u32 = 1 << 31;
+/// PAYLEN shift — payload length sits at bits[31:14] of olinfo_status.
+pub const IGC_ADVTXD_PAYLEN_SHIFT: u32 = 14;
+/// Insert IP checksum (bit 8 of olinfo_status POPTS field).
+pub const IGC_TXD_POPTS_IXSM: u32 = 0x0100;
+/// Insert TCP/UDP checksum (bit 9 of olinfo_status POPTS field).
+pub const IGC_TXD_POPTS_TXSM: u32 = 0x0200;
+/// MAC length shift in vlan_macip_lens (bits[18:9]).
+pub const IGC_ADVTXD_MACLEN_SHIFT: u32 = 9;
+/// TUCMD: IPv4 packet.
+pub const IGC_ADVTXD_TUCMD_IPV4: u32 = 0x400;
+/// TUCMD: L4 type = TCP.
+pub const IGC_ADVTXD_TUCMD_L4T_TCP: u32 = 0x800;
+/// L4 length shift in mss_l4len_idx (bits[15:8]).
+pub const IGC_ADVTXD_L4LEN_SHIFT: u32 = 8;
+/// MSS shift in mss_l4len_idx (bits[31:16]).
+pub const IGC_ADVTXD_MSS_SHIFT: u32 = 16;
+
+// ── RX advanced descriptor checksum bits ────────────────────────────
+// Source: Linux igc_defines.h lines 726–729.
+
+/// status_error bit 6 — IP checksum computed.
+const ADV_RXD_STAT_IPCS: u32 = 1 << 6;
+/// status_error bit 7 — L4 (TCP/UDP) checksum computed.
+const ADV_RXD_STAT_L4CS: u32 = 1 << 7;
+/// status_error bit 24 — TCP/UDP checksum error.
+const ADV_RXD_ERR_TCPE: u32 = 1 << 24;
+/// status_error bit 25 — IP checksum error.
+const ADV_RXD_ERR_IPE: u32 = 1 << 25;
+
+/// RX checksum verification result decoded from an igc AdvRxDescWb.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult {
+    /// Hardware did not compute a checksum for this frame.
+    None,
+    /// Hardware computed and verified the checksum — no errors.
+    Ok,
+    /// Hardware detected a checksum error.
+    Fail,
+}
+
+/// Advanced TX context descriptor. Precedes the data descriptor for
+/// TSO; carries MSS / L4len / TUCMD. Layout mirrors igc_base.h.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AdvTxCtxtDesc {
+    pub vlan_macip_lens: u32,
+    pub launch_time: u32,
+    pub type_tucmd_mlhl: u32,
+    pub mss_l4len_idx: u32,
+}
+
+/// Advanced TX data descriptor. Replaces the legacy 8-byte descriptor
+/// on igc hardware when DEXT is set. Used for both plain sends and TSO.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AdvTxDataDesc {
+    pub buffer_addr: u64,
+    pub cmd_type_len: u32,
+    pub olinfo_status: u32,
+}
+
+// ── Descriptor offload impl blocks ──────────────────────────────────
+
+impl AdvRxDescWb {
+    /// Decode the RX checksum result from `status_error`.
+    pub fn csum_result(&self) -> RxCsumResult {
+        let ip_computed = self.status_error & ADV_RXD_STAT_IPCS != 0;
+        let l4_computed = self.status_error & ADV_RXD_STAT_L4CS != 0;
+        if !ip_computed && !l4_computed {
+            return RxCsumResult::None;
+        }
+        let ip_err = self.status_error & ADV_RXD_ERR_IPE != 0;
+        let tcp_err = self.status_error & ADV_RXD_ERR_TCPE != 0;
+        if ip_err || tcp_err {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
+    }
+}
+
+impl AdvTxCtxtDesc {
+    /// Build a TSO context descriptor for an IPv4/TCP frame.
+    pub fn new_tso_v4(mac_len: u8, ip_len: u8, l4_len: u8, mss: u16) -> Self {
+        let vlan_macip_lens = (ip_len as u32)
+            | ((mac_len as u32) << IGC_ADVTXD_MACLEN_SHIFT);
+        let type_tucmd_mlhl = IGC_ADVTXD_DCMD_DEXT
+            | IGC_ADVTXD_DTYP_CTXT
+            | IGC_ADVTXD_TUCMD_IPV4
+            | IGC_ADVTXD_TUCMD_L4T_TCP;
+        let mss_l4len_idx = ((l4_len as u32) << IGC_ADVTXD_L4LEN_SHIFT)
+            | ((mss as u32) << IGC_ADVTXD_MSS_SHIFT);
+        AdvTxCtxtDesc {
+            vlan_macip_lens,
+            launch_time: 0,
+            type_tucmd_mlhl,
+            mss_l4len_idx,
+        }
+    }
+}
+
+impl AdvTxDataDesc {
+    /// Build a data descriptor with IP + TCP/UDP checksum offload.
+    pub fn with_csum(addr: u64, len: u16) -> Self {
+        let cmd_type_len = (len as u32)
+            | IGC_ADVTXD_DTYP_DATA
+            | IGC_ADVTXD_DCMD_DEXT
+            | IGC_ADVTXD_DCMD_RS
+            | IGC_ADVTXD_DCMD_IFCS
+            | IGC_ADVTXD_DCMD_EOP;
+        let olinfo_status = ((len as u32) << IGC_ADVTXD_PAYLEN_SHIFT)
+            | IGC_TXD_POPTS_IXSM
+            | IGC_TXD_POPTS_TXSM;
+        AdvTxDataDesc { buffer_addr: addr, cmd_type_len, olinfo_status }
+    }
+
+    /// Build a data descriptor with TSO enabled. The hardware segments
+    /// using the MSS from the preceding context descriptor.
+    pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
+        let cmd_type_len = (len as u32)
+            | IGC_ADVTXD_DTYP_DATA
+            | IGC_ADVTXD_DCMD_DEXT
+            | IGC_ADVTXD_DCMD_RS
+            | IGC_ADVTXD_DCMD_IFCS
+            | IGC_ADVTXD_DCMD_EOP
+            | IGC_ADVTXD_DCMD_TSE;
+        let olinfo_status = ((len as u32) << IGC_ADVTXD_PAYLEN_SHIFT)
+            | IGC_TXD_POPTS_IXSM
+            | IGC_TXD_POPTS_TXSM;
+        AdvTxDataDesc { buffer_addr: addr, cmd_type_len, olinfo_status }
+    }
+}
+
 pub struct Igc {
     mmio: MmioRegion,
     mac: [u8; 6],

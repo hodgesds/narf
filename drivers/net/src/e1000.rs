@@ -368,6 +368,38 @@ const TXD_CMD_IFCS: u8 = 1 << 1; // Insert FCS
 const TXD_CMD_RS: u8 = 1 << 3; // Report Status
 const TXD_STAT_DD: u8 = 1 << 0; // Done
 
+// TX checksum / TSO bits for the legacy e1000 descriptor.
+// Source: Linux e1000_hw.h E1000_TXD_CMD_DEXT / E1000_TXD_CMD_TSE.
+/// DEXT — Descriptor Extension flag. Must be set when checksum or TSO
+/// offload bits are active.
+pub const TXD_CMD_DEXT: u8 = 1 << 5;
+/// TSE — TCP Segmentation Enable. Combined with DEXT + DTYP_D.
+pub const TXD_CMD_TSE: u8 = 1 << 2;
+/// DTYP_D — Data descriptor type indicator.
+pub const TXD_DTYP_D: u8 = 1 << 4;
+/// IXSM — Insert IP Checksum. Placed in the `css` byte alongside DEXT.
+pub const TXD_OPTS_IXSM: u8 = 1 << 0;
+/// TXSM — Insert TCP/UDP Checksum.
+pub const TXD_OPTS_TXSM: u8 = 1 << 1;
+
+// RX descriptor checksum status bits (e1000_hw.h E1000_RXD_STAT_IPCS /
+// E1000_RXD_STAT_TCPCS and E1000_RXD_ERR_IPE / E1000_RXD_ERR_TCPE).
+pub const RXD_STAT_IPCS: u8 = 1 << 6;
+pub const RXD_STAT_TCPCS: u8 = 1 << 5;
+pub const RXD_ERR_IPE: u8 = 1 << 6;
+pub const RXD_ERR_TCPE: u8 = 1 << 5;
+
+/// RX checksum verification result decoded from a legacy e1000 RxDesc.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult {
+    /// Hardware did not compute a checksum for this frame.
+    None,
+    /// Hardware computed and verified the checksum — no errors.
+    Ok,
+    /// Hardware detected a checksum error.
+    Fail,
+}
+
 // RCTL bits (Receive Control register).
 const RCTL_EN: u32 = 1 << 1; // Receiver Enable
 const RCTL_UPE: u32 = 1 << 3; // Unicast Promiscuous
@@ -440,6 +472,53 @@ struct RxDesc {
 }
 
 const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
+
+// ── Descriptor offload helpers ───────────────────────────────────────
+
+impl TxDesc {
+    /// Build a TX descriptor with IP + TCP/UDP checksum offload enabled.
+    /// `csum_opts` should be `TXD_OPTS_IXSM | TXD_OPTS_TXSM` for
+    /// full TCP/IPv4 offload. Setting DEXT + DTYP_D signals the
+    /// hardware that the `css` byte carries offload options.
+    pub fn new_with_csum(addr: u64, len: u16, csum_opts: u8) -> Self {
+        let mut cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
+        let mut css = 0u8;
+        if csum_opts != 0 {
+            cmd |= TXD_CMD_DEXT | TXD_DTYP_D;
+            css = csum_opts;
+        }
+        TxDesc { addr, length: len, cso: 0, cmd, status: 0, css, special: 0 }
+    }
+
+    /// Build a TX descriptor with TSO enabled. The hardware will segment
+    /// the payload into MSS-sized chunks. DEXT | DTYP_D | TSE must all
+    /// be set; both IP and TCP csum-insert bits are also required.
+    pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
+        let cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS
+            | TXD_CMD_DEXT | TXD_DTYP_D | TXD_CMD_TSE;
+        let css = TXD_OPTS_IXSM | TXD_OPTS_TXSM;
+        TxDesc { addr, length: len, cso: 0, cmd, status: 0, css, special: 0 }
+    }
+}
+
+impl RxDesc {
+    /// Decode the RX checksum result from the legacy e1000 descriptor
+    /// status and errors bytes.
+    pub fn csum_result(&self) -> RxCsumResult {
+        let ip_computed = self.status & RXD_STAT_IPCS != 0;
+        let tcp_computed = self.status & RXD_STAT_TCPCS != 0;
+        if !ip_computed && !tcp_computed {
+            return RxCsumResult::None;
+        }
+        let ip_err = self.errors & RXD_ERR_IPE != 0;
+        let tcp_err = self.errors & RXD_ERR_TCPE != 0;
+        if ip_err || tcp_err {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
+    }
+}
 
 /// e1000 driver errors.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

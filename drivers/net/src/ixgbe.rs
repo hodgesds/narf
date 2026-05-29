@@ -121,6 +121,43 @@ pub(crate) const ADVTXD_DCMD_IFCS: u32 = 1 << 25;
 pub(crate) const ADVTXD_DCMD_EOP: u32 = 1 << 24;
 pub(crate) const ADVTXD_STAT_DD: u32 = 1 << 0;
 
+// TX context / TSO descriptor bits.
+// Source: Linux ixgbe_type.h §7.2.3.2.2 / ixgbe_main.c.
+pub(crate) const ADVTXD_DTYP_CTXT: u32 = 0x2 << 20;
+pub(crate) const ADVTXD_DCMD_TSE: u32 = 1 << 31;
+pub(crate) const ADVTXD_POPTS_IXSM: u32 = 0x0100;
+pub(crate) const ADVTXD_POPTS_TXSM: u32 = 0x0200;
+pub(crate) const ADVTXD_PAYLEN_SHIFT: u32 = 14;
+pub(crate) const ADVTXD_TUCMD_IPV4: u32 = 0x400;
+pub(crate) const ADVTXD_TUCMD_L4T_TCP: u32 = 0x800;
+#[allow(dead_code)]
+pub(crate) const ADVTXD_TUCMD_L4T_UDP: u32 = 0x000;
+pub(crate) const ADVTXD_L4LEN_SHIFT: u32 = 8;
+pub(crate) const ADVTXD_MSS_SHIFT: u32 = 16;
+pub(crate) const ADVTXD_MACLEN_SHIFT: u32 = 9;
+
+/// RX checksum verification result decoded from a legacy ixgbe RxDesc.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult {
+    /// Hardware did not compute a checksum for this frame.
+    None,
+    /// Hardware computed and verified the checksum — no errors.
+    Ok,
+    /// Hardware detected a checksum error.
+    Fail,
+}
+
+/// Advanced TX context descriptor — precedes the data descriptor for
+/// TSO and carries MSS / L4-len / TUCMD fields. Per ixgbe §7.2.3.2.2.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AdvTxCtxtDesc {
+    pub vlan_macip_lens: u32,
+    pub seqnum_seed: u32,
+    pub type_tucmd_mlhl: u32,
+    pub mss_l4len_idx: u32,
+}
+
 // Legacy RX descriptor status bits.
 pub(crate) const RXD_STAT_DD: u8 = 1 << 0;
 #[allow(dead_code)]
@@ -167,6 +204,73 @@ pub(crate) struct RxDesc {
     pub special: u16,
 }
 const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
+
+// ── Descriptor offload helpers ───────────────────────────────────────
+
+impl AdvTxDesc {
+    /// Build a TX descriptor with IP + TCP/UDP checksum offload.
+    /// POPTS bits are set in `olinfo`; PAYLEN is also loaded there.
+    pub fn with_csum(addr: u64, len: u16) -> Self {
+        AdvTxDesc {
+            addr,
+            cmd_type_len: Self::ctrl_word(len),
+            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT)
+                | ADVTXD_POPTS_IXSM
+                | ADVTXD_POPTS_TXSM,
+        }
+    }
+
+    /// Build a TX data descriptor for TSO. The DCMD_TSE bit is added to
+    /// `cmd_type_len`; the context descriptor carries the MSS and L4len.
+    pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
+        AdvTxDesc {
+            addr,
+            cmd_type_len: Self::ctrl_word(len) | ADVTXD_DCMD_TSE,
+            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT)
+                | ADVTXD_POPTS_IXSM
+                | ADVTXD_POPTS_TXSM,
+        }
+    }
+}
+
+impl AdvTxCtxtDesc {
+    /// Build a TSO context descriptor for an IPv4/TCP frame.
+    /// `mac_len` = Ethernet header length (usually 14).
+    /// `ip_len`  = IP header length in bytes (usually 20).
+    /// `l4_len`  = TCP header length in bytes (usually 20).
+    /// `mss`     = maximum segment size in bytes.
+    pub fn new_tso_v4(mac_len: u8, ip_len: u8, l4_len: u8, mss: u16) -> Self {
+        let vlan_macip_lens = (ip_len as u32)
+            | ((mac_len as u32) << ADVTXD_MACLEN_SHIFT);
+        let type_tucmd_mlhl = ADVTXD_DCMD_DEXT
+            | ADVTXD_DTYP_CTXT
+            | ADVTXD_TUCMD_IPV4
+            | ADVTXD_TUCMD_L4T_TCP;
+        let mss_l4len_idx = ((l4_len as u32) << ADVTXD_L4LEN_SHIFT)
+            | ((mss as u32) << ADVTXD_MSS_SHIFT);
+        AdvTxCtxtDesc {
+            vlan_macip_lens,
+            seqnum_seed: 0,
+            type_tucmd_mlhl,
+            mss_l4len_idx,
+        }
+    }
+}
+
+impl RxDesc {
+    /// Decode the RX checksum result from the legacy ixgbe RxDesc.
+    /// The `csum` field is non-zero when hardware computed a checksum;
+    /// `errors` being 0 means the check passed.
+    pub fn csum_result(&self) -> RxCsumResult {
+        if self.csum == 0 {
+            RxCsumResult::None
+        } else if self.errors == 0 {
+            RxCsumResult::Ok
+        } else {
+            RxCsumResult::Fail
+        }
+    }
+}
 
 // ── EEPROM decode helper (Stage 2) ─────────────────────────────────
 
