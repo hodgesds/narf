@@ -274,6 +274,28 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
         }
     }
 
+    // Stage-4..13 bring-up orchestrator. On real silicon this would
+    // allocate the WFDMA0 ring set, program the rings, download the
+    // patch + WM + WA firmware, run the MCU init sequence, set up
+    // the vif, switch channel, and arm the data path. On QEMU /
+    // missing-firmware it returns `NotImplemented` at the FW dispatch
+    // step, which we treat as "ring set allocated successfully, real
+    // bring-up needs live MCU".
+    //
+    // The orchestrator is invoked with a default config primed with
+    // the EFUSE-derived MAC; the result is dropped because the ring
+    // set lives in the orchestrator's stack frame — when the real
+    // dispatch path lands, we'll thread the result into `Mt7921Device`.
+    use super::bringup::{full_bring_up, BringUpConfig};
+    let cfg = BringUpConfig {
+        effective_did,
+        own_mac: mac_bytes,
+        ..BringUpConfig::default()
+    };
+    // SAFETY: BAR0 mapped + owned per `# Safety`.
+    let bringup_outcome = unsafe { full_bring_up(&mmio_bar0, cfg) };
+    let _ = bringup_outcome;
+
     Ok(Mt7921Device {
         mmio_bar0,
         effective_did,

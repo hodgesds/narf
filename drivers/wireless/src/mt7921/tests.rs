@@ -1371,3 +1371,108 @@ kernel_test_in!(
     "drivers/wireless/mt7921",
     smoke_mt7921_tx_ring_full_detection
 );
+
+// ── Bring-up orchestrator ────────────────────────────────────────
+
+fn smoke_mt7921_mcu_init_sequence_layout() -> TestResult {
+    use super::bringup::{build_mcu_init_sequence, BringUpConfig};
+    use super::cmd::{INIT_RA_CFG_SIZE, PM_STATE_CTRL_SIZE, UNI_DEV_INFO_BODY_SIZE,
+                     PM_STATE_ACTIVE};
+    let cfg = BringUpConfig::default();
+    let seq = build_mcu_init_sequence(&cfg);
+    let expected = PM_STATE_CTRL_SIZE + INIT_RA_CFG_SIZE + UNI_DEV_INFO_BODY_SIZE;
+    if seq.len() != expected {
+        return TestResult::Fail("init sequence length wrong");
+    }
+    // First body: PM_STATE_CTRL with PM_STATE_ACTIVE.
+    if seq[0] != PM_STATE_ACTIVE {
+        return TestResult::Fail("first body should start with PM_STATE_ACTIVE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_mcu_init_sequence_layout
+);
+
+fn smoke_mt7921_mac_vif_setup_layout() -> TestResult {
+    use super::bringup::{build_mac_vif_setup_sequence, BringUpConfig};
+    use super::cmd::{BSS_INFO_BASIC_TLV_SIZE, DEV_INFO_UPDATE_SIZE, STA_REC_BASIC_TLV_SIZE};
+    let cfg = BringUpConfig::default();
+    let bssid = [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x42];
+    let seq = build_mac_vif_setup_sequence(&cfg, bssid);
+    let expected = DEV_INFO_UPDATE_SIZE + BSS_INFO_BASIC_TLV_SIZE + STA_REC_BASIC_TLV_SIZE;
+    if seq.len() != expected {
+        return TestResult::Fail("mac vif setup sequence length wrong");
+    }
+    // BSS_INFO_BASIC TLV at offset DEV_INFO_UPDATE_SIZE — bssid at +12.
+    let bssid_at = DEV_INFO_UPDATE_SIZE + 12;
+    if &seq[bssid_at..bssid_at + 6] != &bssid {
+        return TestResult::Fail("BSS_INFO bssid not at expected offset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_mac_vif_setup_layout
+);
+
+fn smoke_mt7921_assoc_open_frames_for_ssid() -> TestResult {
+    use super::bringup::{build_assoc_open_frames, BringUpConfig};
+    use super::cmd::{IEEE80211_AUTH_FRAME_SIZE, IEEE80211_MAC_HDR_SIZE};
+    let mut cfg = BringUpConfig::default();
+    cfg.own_mac = [0x11; 6];
+    let bssid = [0x22; 6];
+    let ssid = b"narf";
+    let (auth, assoc) = build_assoc_open_frames(&cfg, bssid, ssid);
+    if auth.len() != IEEE80211_AUTH_FRAME_SIZE {
+        return TestResult::Fail("auth frame length wrong");
+    }
+    // Auth's addr1 (DA) is bssid; addr3 (BSSID) is bssid; addr2
+    // (SA) is own_mac.
+    if &auth[4..10] != &bssid {
+        return TestResult::Fail("auth addr1 not bssid");
+    }
+    if &auth[10..16] != &cfg.own_mac {
+        return TestResult::Fail("auth addr2 not own_mac");
+    }
+    // Assoc carries the SSID IE at offset MAC_HDR + 4.
+    let p = IEEE80211_MAC_HDR_SIZE + 4;
+    if assoc[p] != 0 {
+        return TestResult::Fail("SSID IE id should be 0");
+    }
+    if assoc[p + 1] as usize != ssid.len() {
+        return TestResult::Fail("SSID IE len wrong");
+    }
+    if &assoc[p + 2..p + 2 + ssid.len()] != ssid {
+        return TestResult::Fail("SSID octets wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_assoc_open_frames_for_ssid
+);
+
+fn smoke_mt7921_secure_sta_rec_for_wpa2() -> TestResult {
+    use super::bringup::{build_secure_sta_rec_body, BringUpConfig};
+    use super::cmd::{StaCipher, STA_REC_BASIC_TLV_SIZE, STA_REC_WTBL_TLV_SIZE};
+    let cfg = BringUpConfig::default();
+    let bssid = [0x42; 6];
+    let key = [0xAAu8; 16];
+    let body = build_secure_sta_rec_body(&cfg, bssid, StaCipher::Ccmp128, 0, &key);
+    if body.len() != STA_REC_BASIC_TLV_SIZE + STA_REC_WTBL_TLV_SIZE {
+        return TestResult::Fail("secure sta_rec body length wrong");
+    }
+    // The WTBL TLV starts at offset STA_REC_BASIC_TLV_SIZE — cipher
+    // byte 6 (CCMP-128) at +4.
+    let p = STA_REC_BASIC_TLV_SIZE;
+    if body[p + 4] != 6 {
+        return TestResult::Fail("WTBL cipher should be CCMP-128 (6)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_secure_sta_rec_for_wpa2
+);

@@ -42,6 +42,7 @@
 
 extern crate alloc;
 
+pub mod bringup;
 pub mod cmd;
 pub mod dma;
 pub mod fwdl;
