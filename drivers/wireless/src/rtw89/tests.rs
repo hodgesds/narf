@@ -16,6 +16,14 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::mac_init::{
+    QtaMode, B_AX_CMAC_DMA_EN, B_AX_CMAC_EN, B_AX_DLE_DMAC_EN, B_AX_DMAC_FUNC_EN,
+    B_AX_DMAC_MIX_EN, B_AX_DMAC_PKT_IN_EN, B_AX_HCI_RXDMA_EN, B_AX_HCI_TXDMA_EN, B_AX_PHYINTF_EN,
+    B_AX_PTCLTOP_EN, B_AX_RMAC_EN, B_AX_SCHEDULER_EN, B_AX_TMAC_EN, B_AX_WLRF1_CTRL_1,
+    B_AX_WLRF1_CTRL_7, B_AX_WLRF_CTRL_1, B_AX_WLRF_CTRL_7, CMAC_ENABLE_MASK, DMAC_PRE_EN_MASK,
+    PHYREG_SET_ALL_CYCLE, R_AX_CMAC_FUNC_EN, R_AX_DMAC_FUNC_EN, R_AX_HCI_FUNC_EN,
+    R_AX_PHYREG_SET, R_AX_WLRF_CTRL, WLRF_ENABLE_MASK,
+};
 use super::efuse::{mac_is_valid, EfuseError};
 use super::fw::{expected_blob_name, FwError};
 use super::mac::*;
@@ -617,6 +625,96 @@ fn smoke_rtw89_dma_all_ax_offsets_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_all_ax_offsets_distinct);
+
+// ── Stage-5: MAC init register addresses + bit masks ──────────────
+
+fn smoke_rtw89_mac_init_register_pins() -> TestResult {
+    // R_AX_WLRF_CTRL = 0x02F0 per reg.h:307.
+    if R_AX_WLRF_CTRL != 0x02F0 {
+        return TestResult::Fail("R_AX_WLRF_CTRL drifted from reg.h:307");
+    }
+    // R_AX_PHYREG_SET = 0x8040 per reg.h:506.
+    if R_AX_PHYREG_SET != 0x8040 {
+        return TestResult::Fail("R_AX_PHYREG_SET drifted from reg.h:506");
+    }
+    // PHYREG_SET_ALL_CYCLE = 0x8 per reg.h:507.
+    if PHYREG_SET_ALL_CYCLE != 0x08 {
+        return TestResult::Fail("PHYREG_SET_ALL_CYCLE drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_register_pins);
+
+fn smoke_rtw89_mac_init_wlrf_mask() -> TestResult {
+    // The WLRF init mask in `rtw89_mac_enable_bb_rf` (mac.c:4176)
+    // ORs four bits: WLRF1_CTRL_7 | WLRF1_CTRL_1 | WLRF_CTRL_7 |
+    // WLRF_CTRL_1. Check the composite.
+    let expected = B_AX_WLRF1_CTRL_7 | B_AX_WLRF1_CTRL_1 | B_AX_WLRF_CTRL_7 | B_AX_WLRF_CTRL_1;
+    if WLRF_ENABLE_MASK != expected {
+        return TestResult::Fail("WLRF_ENABLE_MASK doesn't recompose");
+    }
+    // Bits must be distinct.
+    let bits = [B_AX_WLRF_CTRL_1, B_AX_WLRF_CTRL_7, B_AX_WLRF1_CTRL_1, B_AX_WLRF1_CTRL_7];
+    for i in 0..bits.len() {
+        for j in (i + 1)..bits.len() {
+            if bits[i] & bits[j] != 0 {
+                return TestResult::Fail("WLRF bits overlap");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_wlrf_mask);
+
+fn smoke_rtw89_mac_init_hci_dmac_cmac_bits() -> TestResult {
+    // HCI DMA-TRX bits — TXDMA at bit 0, RXDMA at bit 1.
+    if B_AX_HCI_TXDMA_EN != 1 << 0 {
+        return TestResult::Fail("HCI TXDMA bit drift");
+    }
+    if B_AX_HCI_RXDMA_EN != 1 << 1 {
+        return TestResult::Fail("HCI RXDMA bit drift");
+    }
+    // DMAC pre-en mask must include all the dispatcher/DLE/TBL/MIX bits.
+    let needed = B_AX_DMAC_FUNC_EN | B_AX_DLE_DMAC_EN | B_AX_DMAC_PKT_IN_EN | B_AX_DMAC_MIX_EN;
+    if DMAC_PRE_EN_MASK & needed != needed {
+        return TestResult::Fail("DMAC_PRE_EN_MASK missing required bits");
+    }
+    // CMAC enable mask must include TMAC + RMAC.
+    let cmac_needed = B_AX_CMAC_EN | B_AX_TMAC_EN | B_AX_RMAC_EN
+        | B_AX_PHYINTF_EN | B_AX_CMAC_DMA_EN | B_AX_PTCLTOP_EN | B_AX_SCHEDULER_EN;
+    if CMAC_ENABLE_MASK & cmac_needed != cmac_needed {
+        return TestResult::Fail("CMAC_ENABLE_MASK missing required bits");
+    }
+    // Register addresses must be distinct.
+    let regs = [R_AX_HCI_FUNC_EN, R_AX_DMAC_FUNC_EN, R_AX_CMAC_FUNC_EN, R_AX_WLRF_CTRL, R_AX_PHYREG_SET];
+    for i in 0..regs.len() {
+        for j in (i + 1)..regs.len() {
+            if regs[i] == regs[j] {
+                return TestResult::Fail("Two MAC-init registers share an offset");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_hci_dmac_cmac_bits);
+
+fn smoke_rtw89_mac_init_qta_mode_enum() -> TestResult {
+    // QtaMode covers the two values the FW-DL path uses.
+    let dlfw = QtaMode::DlFw;
+    let scc = QtaMode::Scc;
+    if dlfw == scc {
+        return TestResult::Fail("QtaMode variants compare equal");
+    }
+    // Debug-presence check.
+    use core::fmt::Write;
+    let mut buf = alloc::string::String::new();
+    let _ = write!(buf, "{:?} {:?}", dlfw, scc);
+    if buf.is_empty() {
+        return TestResult::Fail("QtaMode Debug doesn't render");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_qta_mode_enum);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //

@@ -61,6 +61,7 @@ pub mod dma;
 pub mod efuse;
 pub mod fw;
 pub mod mac;
+pub mod mac_init;
 pub mod pci;
 pub mod phy;
 pub mod txrx;
