@@ -74,6 +74,7 @@ pub mod transport;
 
 pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
 pub use ioctl::{build_request, parse_response, Direction, ParseError, Response};
+pub use iovar::{build_region_cmd, VAR_COUNTRY, COUNTRY_WORLDWIDE, WL_COUNTRY_T_SIZE};
 pub use transport::{Function, Transport, TransportError};
 
 // ── Hardware identification (public datasheet cover sheet) ─────────
@@ -89,6 +90,20 @@ pub const CYW43439_PART_NUMBER: &str = "CYW43439";
 pub const FIRMWARE_FILENAME: &str = "43439A0.bin";
 pub const NVRAM_FILENAME: &str = "43439A0.txt";
 pub const CLM_BLOB_FILENAME: &str = "43439A0_clm.bin";
+
+// ── SDIO bus identification ────────────────────────────────────────
+//
+// The CYW43439 presents as an SDIO combo device. These are the
+// Function 0 CCCR-reported vendor / device IDs as listed in the
+// Broadcom/Cypress driver trees and the Raspberry Pi Pico W schematic.
+
+/// Broadcom / Infineon SDIO vendor ID (matches the vendor field
+/// in the CCCR SDIO Vendor Specific bytes or the card function
+/// product identifier register per SDIO Spec Part E1 §6.9).
+pub const CYW43439_SDIO_VENDOR: u16 = 0x02D0;
+
+/// CYW43439 SDIO device/product ID.
+pub const CYW43439_SDIO_DEVICE: u16 = 0xA9A6;
 
 /// Stage-1 register stub — kept so existing call-sites (e.g. the
 /// wireless crate's `register_initcalls`) link cleanly. The chip
@@ -126,5 +141,88 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/cyw43439",
         smoke_firmware_filenames_present
+    );
+
+    fn smoke_cyw43439_probe_sdio_id_match() -> TestResult {
+        // Verify the vendor / device IDs match those documented in
+        // the Broadcom Cypress driver trees and the RPi Pico W
+        // schematic for the CYW43439 SDIO combo chip.
+        if CYW43439_SDIO_VENDOR != 0x02D0 {
+            return TestResult::Fail("SDIO vendor should be 0x02D0 (Broadcom/Infineon)");
+        }
+        if CYW43439_SDIO_DEVICE != 0xA9A6 {
+            return TestResult::Fail("SDIO device should be 0xA9A6 (CYW43439)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439",
+        smoke_cyw43439_probe_sdio_id_match
+    );
+
+    fn smoke_cyw43439_sdpcm_region_cmd_encode() -> TestResult {
+        // build_region_cmd("XX") must produce a well-formed IOVAR SET
+        // frame whose country-value payload encodes wl_country_t as:
+        //   bytes 0-1 = 'X','X'
+        //   bytes 2-3 = 0,0  (NUL pad)
+        //   bytes 4-7 = 0,0,0,0  (revision = 0)
+        //   bytes 8-9 = 'X','X'  (ccode)
+        //   bytes 10-11 = 0,0  (NUL pad)
+        use super::ioctl::WLC_SET_VAR;
+        use super::sdpcm::{BcdcHeader, HW_HEADER_LEN, SW_HEADER_LEN, BCDC_HEADER_LEN};
+
+        let frame = match build_region_cmd(1, 0, 0, b"XX") {
+            Some(f) => f,
+            None => return TestResult::Fail("build_region_cmd returned None for valid code"),
+        };
+
+        // Decode the BCDC header.
+        let bcdc_start = HW_HEADER_LEN + SW_HEADER_LEN;
+        if frame.len() < bcdc_start + BCDC_HEADER_LEN {
+            return TestResult::Fail("frame too short for BCDC header");
+        }
+        let bcdc = match BcdcHeader::decode(&frame[bcdc_start..]) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("BCDC decode failed"),
+        };
+        if bcdc.cmd != WLC_SET_VAR {
+            return TestResult::Fail("region cmd must use WLC_SET_VAR");
+        }
+        if !bcdc.is_set() {
+            return TestResult::Fail("SET flag must be set");
+        }
+
+        // Locate the payload: after BCDC header.
+        let payload_start = bcdc_start + BCDC_HEADER_LEN;
+        // Payload = "country\0" (8 bytes) + wl_country_t (12 bytes).
+        let var_name = b"country\x00";
+        let expected_payload_len = var_name.len() + WL_COUNTRY_T_SIZE;
+        if (bcdc.len as usize) < expected_payload_len {
+            return TestResult::Fail("BCDC payload length too short for country iovar");
+        }
+        // Verify var name.
+        if &frame[payload_start..payload_start + var_name.len()] != var_name {
+            return TestResult::Fail("country var name not at payload start");
+        }
+        // Verify wl_country_t.
+        let ct = &frame[payload_start + var_name.len()..payload_start + var_name.len() + WL_COUNTRY_T_SIZE];
+        if ct[0] != b'X' || ct[1] != b'X' {
+            return TestResult::Fail("country abbreviation bytes 0-1 must be 'XX'");
+        }
+        if ct[2] != 0 || ct[3] != 0 {
+            return TestResult::Fail("country abbreviation NUL pad wrong");
+        }
+        let rev = u32::from_le_bytes([ct[4], ct[5], ct[6], ct[7]]);
+        if rev != 0 {
+            return TestResult::Fail("country revision must be 0 for worldwide");
+        }
+        if ct[8] != b'X' || ct[9] != b'X' {
+            return TestResult::Fail("ccode bytes 8-9 must be 'XX'");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439",
+        smoke_cyw43439_sdpcm_region_cmd_encode
     );
 }

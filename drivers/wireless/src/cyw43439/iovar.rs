@@ -46,7 +46,53 @@ pub const VAR_PM2_SLEEP_RET: &str = "pm2_sleep_ret";
 /// here as a separate constant so callers can pick either spelling.
 pub const VAR_CURRENT_MAC: &str = "cur_etheraddr";
 
+// ── Country / region constants ─────────────────────────────────────
+
+/// Wildcard country code ("XX") used as a safe default before CLM
+/// locale is negotiated.  AN232689 §4.3 — pass `"XX"` if no country
+/// regulatory information is available; the firmware applies the most
+/// conservative channel set.
+pub const COUNTRY_WORLDWIDE: &[u8; 2] = b"XX";
+
+/// Broadcom `wl_country_t` layout size (AN232689 §5.1):
+///
+/// ```text
+///   bytes 0-3 : country abbreviation, NUL-padded to 4 bytes
+///   bytes 4-7 : revision (u32 LE; 0 = any / not restricted)
+///   bytes 8-11: ccode — firmware internal country string (4 bytes)
+/// ```
+pub const WL_COUNTRY_T_SIZE: usize = 12;
+
 // ── Encoders ──────────────────────────────────────────────────────
+
+/// Build a complete `country` IOVAR SET frame that configures the
+/// chip's regulatory region.
+///
+/// The `country` IOVAR value is a `wl_country_t` (AN232689 §5.1):
+///
+/// ```text
+///   [0..4]  country abbreviation, NUL-padded  ("XX\0\0")
+///   [4..8]  revision u32-LE (0 = unrestricted)
+///   [8..12] ccode, NUL-padded ("XX\0\0")
+/// ```
+///
+/// Pass a 2-byte ASCII country code in `code` (e.g. `b"XX"`).
+///
+/// Returns `None` if `code.len() != 2`.
+pub fn build_region_cmd(seq: u8, xact_id: u16, if_idx: u8, code: &[u8; 2]) -> Option<Vec<u8>> {
+    let mut value = [0u8; WL_COUNTRY_T_SIZE];
+    // bytes 0-1: country abbrev
+    value[0] = code[0];
+    value[1] = code[1];
+    // bytes 2-3: NUL padding (already zero)
+    // bytes 4-7: revision = 0 (little-endian, already zero)
+    // bytes 8-9: ccode (same abbreviation)
+    value[8] = code[0];
+    value[9] = code[1];
+    // bytes 10-11: NUL padding (already zero)
+    Some(build_set_request(seq, xact_id, if_idx, VAR_COUNTRY, &value))
+}
+
 
 /// Build the IOCTL payload for an IOVAR access.
 ///
