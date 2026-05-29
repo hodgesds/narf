@@ -841,3 +841,175 @@ fn smoke_rtl_mii_constants() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_mii_constants);
+
+// ── mlx5 EQE / CQE decode smokes ───────────────────────────────────
+
+fn smoke_mlx5_eqe_decode() -> TestResult {
+    // Build a synthetic SW-owned EQE (owner bit = 0) with event_type
+    // = PortStateChange (0x09) and sub-type = 0x04.  Verify
+    // decode_eqe extracts the right fields.
+    //
+    // EQE layout (mlx5/eqe.rs):
+    //   +0x01  event_type   u8
+    //   +0x03  event_sub_type u8
+    //   +0x3F  owner bit 0   (0 = SW owns)
+    use crate::mlx5::eqe;
+
+    let mut raw = [0u8; eqe::EQE_LEN];
+    raw[eqe::EQE_OFF_EVENT_TYPE] = 0x09;      // PortStateChange
+    raw[eqe::EQE_OFF_EVENT_SUB_TYPE] = 0x04;
+    raw[eqe::EQE_OFF_OWNER] = 0x00;           // SW owns
+
+    // is_hw_owned must be false for SW-owned slot.
+    if eqe::is_hw_owned(&raw) {
+        return TestResult::Fail("is_hw_owned returned true for owner=0");
+    }
+
+    let view = eqe::decode_eqe(&raw);
+    if view.event_type != eqe::EventType::PortStateChange {
+        return TestResult::Fail("event_type decoded wrongly");
+    }
+    if view.event_sub_type != 0x04 {
+        return TestResult::Fail("event_sub_type lost");
+    }
+    if view.owner {
+        return TestResult::Fail("owner field should be false for owner=0");
+    }
+
+    // A hardware-owned slot (owner bit = 1) must NOT be consumed.
+    raw[eqe::EQE_OFF_OWNER] = eqe::EQE_OWNER_BIT;
+    if !eqe::is_hw_owned(&raw) {
+        return TestResult::Fail("is_hw_owned returned false for owner=1");
+    }
+    let hw_view = eqe::decode_eqe(&raw);
+    if !hw_view.owner {
+        return TestResult::Fail("decode_eqe owner field wrong for owner=1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_decode);
+
+fn smoke_mlx5_cqe_decode() -> TestResult {
+    // Build a synthetic SW-owned CQE (owner bit = 0) representing a
+    // 1500-byte RX completion on QP 0x42 with Success status.
+    //
+    // CQE layout (mlx5/cqe.rs):
+    //   +0x14..0x17  byte_count  BE u32
+    //   +0x37        status      u8
+    //   +0x38..0x39  wqe_counter BE u16
+    //   +0x3C..0x3F  qp_op_own   BE u32:
+    //                  bits[31:8]  = qp_num
+    //                  bits[7:4]   = opcode (ResponderSend = 0x2)
+    //                  bit[0]      = owner (0 = SW)
+    use crate::mlx5::cqe;
+
+    let mut raw = [0u8; cqe::CQE_LEN];
+
+    // byte_count = 1500 at offset 0x14.
+    raw[cqe::CQE_OFF_BYTE_COUNT..cqe::CQE_OFF_BYTE_COUNT + 4]
+        .copy_from_slice(&1500u32.to_be_bytes());
+
+    // status = Success (0x00) at offset 0x37.
+    raw[cqe::CQE_OFF_STATUS] = 0x00;
+
+    // wqe_counter = 7 at offset 0x38.
+    raw[cqe::CQE_OFF_WQE_COUNTER..cqe::CQE_OFF_WQE_COUNTER + 2]
+        .copy_from_slice(&7u16.to_be_bytes());
+
+    // qp_op_own: qp_num=0x42, opcode=ResponderSend(0x2), owner=0.
+    // bits: [31:8]=0x42, [7:4]=0x2, [0]=0.
+    let qp_op_own: u32 = (0x42u32 << 8) | (0x2u32 << 4) | 0;
+    raw[cqe::CQE_OFF_QP_OP_OWN..cqe::CQE_OFF_QP_OP_OWN + 4]
+        .copy_from_slice(&qp_op_own.to_be_bytes());
+
+    // SW-owned: is_hw_owned must be false.
+    if cqe::is_hw_owned(&raw) {
+        return TestResult::Fail("is_hw_owned returned true for owner=0");
+    }
+
+    let view = cqe::decode_cqe(&raw);
+    if view.byte_count != 1500 {
+        return TestResult::Fail("byte_count decoded wrongly");
+    }
+    if view.status != cqe::CqeStatus::Success {
+        return TestResult::Fail("status decoded wrongly");
+    }
+    if view.wqe_counter != 7 {
+        return TestResult::Fail("wqe_counter decoded wrongly");
+    }
+    if view.qp_num != 0x42 {
+        return TestResult::Fail("qp_num decoded wrongly");
+    }
+    if view.opcode != cqe::CqeOpcode::ResponderSend {
+        return TestResult::Fail("opcode decoded wrongly");
+    }
+    if view.owner {
+        return TestResult::Fail("owner should be false for owner=0");
+    }
+
+    // HW-owned slot: owner bit = 1.
+    raw[cqe::CQE_OFF_QP_OP_OWN + 3] |= cqe::CQE_OWNER_BIT;
+    if !cqe::is_hw_owned(&raw) {
+        return TestResult::Fail("is_hw_owned returned false for owner=1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_decode);
+
+// ── vmxnet3 quiesce/reset command-code smokes ───────────────────────
+
+fn smoke_vmxnet3_quiesce_cmd_encode() -> TestResult {
+    // Verify VMXNET3_CMD_QUIESCE_DEV matches the Linux definition.
+    //
+    // Linux ref: `vmxnet3_defs.h` enum VMXNET3_CMD:
+    //   VMXNET3_CMD_QUIESCE_DEV = 0xCAFE0001
+    // and `vmxnet3_drv.c::vmxnet3_quiesce_dev` (line 3262):
+    //   VMXNET3_WRITE_BAR1_REG(adapter, VMXNET3_REG_CMD,
+    //                          VMXNET3_CMD_QUIESCE_DEV);
+    use crate::vmxnet3::regs;
+
+    if regs::VMXNET3_CMD_QUIESCE_DEV != 0xCAFE_0001 {
+        return TestResult::Fail(
+            "VMXNET3_CMD_QUIESCE_DEV != 0xCAFE0001 (vmxnet3_defs.h drift)",
+        );
+    }
+    // Sanity: must be "set" class (high 16 bits = 0xCAFE).
+    if regs::VMXNET3_CMD_QUIESCE_DEV >> 16 != 0xCAFE {
+        return TestResult::Fail("QUIESCE_DEV not in set-class range (0xCAFE_xxxx)");
+    }
+    // Must be distinct from ACTIVATE_DEV and RESET_DEV.
+    if regs::VMXNET3_CMD_QUIESCE_DEV == regs::VMXNET3_CMD_ACTIVATE_DEV {
+        return TestResult::Fail("QUIESCE_DEV == ACTIVATE_DEV");
+    }
+    if regs::VMXNET3_CMD_QUIESCE_DEV == regs::VMXNET3_CMD_RESET_DEV {
+        return TestResult::Fail("QUIESCE_DEV == RESET_DEV");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_quiesce_cmd_encode);
+
+fn smoke_vmxnet3_reset_cmd_encode() -> TestResult {
+    // Verify VMXNET3_CMD_RESET_DEV matches the Linux definition.
+    //
+    // Linux ref: `vmxnet3_defs.h` enum VMXNET3_CMD:
+    //   VMXNET3_CMD_RESET_DEV = 0xCAFE0002
+    // and `vmxnet3_drv.c::vmxnet3_reset_dev` (line 3247):
+    //   VMXNET3_WRITE_BAR1_REG(adapter, VMXNET3_REG_CMD,
+    //                          VMXNET3_CMD_RESET_DEV);
+    use crate::vmxnet3::regs;
+
+    if regs::VMXNET3_CMD_RESET_DEV != 0xCAFE_0002 {
+        return TestResult::Fail(
+            "VMXNET3_CMD_RESET_DEV != 0xCAFE0002 (vmxnet3_defs.h drift)",
+        );
+    }
+    if regs::VMXNET3_CMD_RESET_DEV >> 16 != 0xCAFE {
+        return TestResult::Fail("RESET_DEV not in set-class range (0xCAFE_xxxx)");
+    }
+    // Ordering invariant per Linux: QUIESCE (0x0001) < RESET (0x0002).
+    if regs::VMXNET3_CMD_RESET_DEV <= regs::VMXNET3_CMD_QUIESCE_DEV {
+        return TestResult::Fail("RESET_DEV must be > QUIESCE_DEV in the cmd enum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_reset_cmd_encode);

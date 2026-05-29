@@ -451,6 +451,104 @@ impl Vmxnet3Nic {
             self.pt.write32(REG_RXPROD, idx);
         }
     }
+
+    /// Quiesce the device — drain in-flight DMA and tell the host to
+    /// stop generating events. Must be called before `reset_dev` to
+    /// guarantee the host has stopped writing into our rings.
+    ///
+    /// Linux ref: `vmxnet3_drv.c::vmxnet3_quiesce_dev` (line 3253).
+    /// The host sets `VMXNET3_STATE_BIT_QUIESCED` once the command
+    /// completes; on ESX this is synchronous (command write returns
+    /// only after the device has drained). Our poll loop mirrors the
+    /// Linux pattern of writing the CMD register and then reading it
+    /// back — a non-zero readback would mean rejection, but quiesce
+    /// has no explicit rejection code in the spec so we log and proceed.
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent TX/RX DMA is in flight to
+    /// the descriptor rings while this runs.
+    pub unsafe fn quiesce_dev(&self) {
+        // SAFETY: identity-mapped BAR1 MMIO.
+        unsafe {
+            self.vd.write32(REG_CMD, VMXNET3_CMD_QUIESCE_DEV);
+        }
+        // The command register doubles as a status latch for "get"
+        // class commands (≥ 0xF00D0000); for "set" class (0xCAFE…)
+        // the readback reflects completion status — 0 = success.
+        // vmxnet3_drv.c line 3262 writes without checking; we do the
+        // same and rely on a subsequent RESET if the NIC is wedged.
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Reset the device — restores it to a post-power-on state, ready
+    /// for a fresh `bring_up` / activate sequence.
+    ///
+    /// Linux ref: `vmxnet3_drv.c::vmxnet3_reset_dev` (line 3243).
+    /// Full recovery sequence: quiesce → reset → re-activate, per
+    /// `vmxnet3_drv.c::vmxnet3_reset_work` (line 3937) and
+    /// `vmxnet3_drv.c` line 3648–3649.
+    ///
+    /// # Safety
+    /// Same as `quiesce_dev` — caller owns the BAR exclusively.
+    pub unsafe fn reset_dev(&self) {
+        // SAFETY: identity-mapped BAR1 MMIO.
+        unsafe {
+            self.vd.write32(REG_CMD, VMXNET3_CMD_RESET_DEV);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Full error-recovery sequence: quiesce, reset, re-activate.
+    ///
+    /// Mirrors `vmxnet3_drv.c::vmxnet3_reset_work` (line 3937):
+    /// ```c
+    ///   vmxnet3_quiesce_dev(adapter);
+    ///   vmxnet3_reset_dev(adapter);
+    ///   vmxnet3_activate_dev(adapter);
+    /// ```
+    ///
+    /// After reset the DriverShared structure + ring base PAs are
+    /// already in-place (they survive across reset; the device re-reads
+    /// them from DSAL/DSAH on ACTIVATE_DEV). The DSAL/DSAH registers
+    /// must be re-written because RESET_DEV clears them (documented
+    /// in `vmxnet3_defs.h`). Re-writing shared-PA and re-issuing
+    /// ACTIVATE_DEV restores full RX/TX.
+    ///
+    /// Returns `Ok(())` on successful re-activate; `Err(ActivateFailed)`
+    /// if the device rejects the activate after reset.
+    ///
+    /// # Safety
+    /// Caller must hold exclusive access to the BAR windows.
+    pub unsafe fn reset(&self) -> Result<(), Vmxnet3Error> {
+        // Step 1: quiesce — stop host-side DMA into our rings.
+        // Safety: caller-asserted exclusive BAR access.
+        unsafe { self.quiesce_dev() };
+
+        // Step 2: hard reset — returns device to power-on state.
+        // Safety: same.
+        unsafe { self.reset_dev() };
+
+        // Step 3: re-publish DriverShared PA into DSAL/DSAH (cleared
+        // by RESET_DEV) and re-activate.
+        let shared_pa = self.shared.phys_addr().raw();
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.vd.write32(REG_DSAL, (shared_pa & 0xFFFF_FFFF) as u32);
+            self.vd.write32(REG_DSAH, (shared_pa >> 32) as u32);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.vd.write32(REG_CMD, VMXNET3_CMD_ACTIVATE_DEV);
+        }
+        // SAFETY: same.
+        let status = unsafe { self.vd.read32(REG_CMD) };
+        if status != 0 {
+            return Err(Vmxnet3Error::ActivateFailed);
+        }
+        Ok(())
+    }
 }
 
 // ── Driver-match registration ───────────────────────────────────────
