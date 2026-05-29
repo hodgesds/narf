@@ -17,6 +17,12 @@ use super::mac::PowerError;
 use super::mcu::{mcu_ext_cmd_header, McuError, EFUSE_BLOCK_LEN};
 use super::pci::{firmware_blobs_for, l1_remap, name_for, register_pci_driver};
 use super::regs::*;
+use super::txrx::{
+    decode_rxd, encode_rxd_for_test, encode_sta_rec_update, encode_txd, RxdInfo, STA_REC_CMD_SIZE,
+    TXD_SIZE, TxdInfo, MCU_EXT_CMD_STA_REC_UPDATE,
+    TXD0_PKT_FMT_802_3, TXD1_LONG_FORMAT, TXD5_TX_STATUS_HOST,
+    RXD_BASE_SIZE, RXD0_PKT_TYPE_NORMAL,
+};
 
 // ── PCI match table ────────────────────────────────────────────────
 
@@ -337,6 +343,120 @@ fn smoke_mt7921_error_types_debug() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_error_types_debug);
+
+// ── Stage-3: TXD / RXD encode + MCU init command ──────────────────
+
+fn smoke_mt7921_txd_encode() -> TestResult {
+    // Build a TXD for a 1514-byte 802.3 frame on AC_BE ring (q_idx=2),
+    // wlan_idx=1, own_mac_idx=0. Mirrors the fields
+    // `mt76_connac2_mac_write_txwi` fills at ~L1..L90, v6.6.
+    let info = TxdInfo {
+        q_idx: MT7921_TXQ_AC_BE,
+        wlan_idx: 1,
+        own_mac_idx: 0,
+        tx_bytes: 1514 + TXD_SIZE as u16,
+        is_mcast: false,
+        pid: 7,
+    };
+    let mut buf = [0u8; TXD_SIZE];
+    if encode_txd(&info, &mut buf).is_none() {
+        return TestResult::Fail("encode_txd returned None");
+    }
+    let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    // PKT_FMT 802.3 must be set.
+    if dw0 & TXD0_PKT_FMT_802_3 == 0 {
+        return TestResult::Fail("TXD dw0: PKT_FMT_802_3 not set");
+    }
+    // Queue index must land in bits 31-25.
+    let q_check = (dw0 >> 25) & 0x7F;
+    if q_check != MT7921_TXQ_AC_BE as u32 {
+        return TestResult::Fail("TXD dw0: q_idx not encoded correctly");
+    }
+    let dw1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    // Long-format flag must be set for 8-dword TXD.
+    if dw1 & TXD1_LONG_FORMAT == 0 {
+        return TestResult::Fail("TXD dw1: LONG_FORMAT not set");
+    }
+    // WLAN index = 1.
+    if dw1 & 0x3FF != 1 {
+        return TestResult::Fail("TXD dw1: wlan_idx wrong");
+    }
+    let dw5 = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+    // TX_STATUS_HOST must be set.
+    if dw5 & TXD5_TX_STATUS_HOST == 0 {
+        return TestResult::Fail("TXD dw5: TX_STATUS_HOST not set");
+    }
+    // PID = 7.
+    if dw5 & 0xFF != 7 {
+        return TestResult::Fail("TXD dw5: PID wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_txd_encode);
+
+fn smoke_mt7921_rxd_decode_roundtrip() -> TestResult {
+    // Build a 1-frame normal-data RXD and decode it back.
+    let original = RxdInfo {
+        frame_len: 1024,
+        pkt_type: RXD0_PKT_TYPE_NORMAL as u8,
+        wlan_idx: 3,
+        fcs_err: false,
+        icv_err: false,
+    };
+    let bytes = encode_rxd_for_test(&original);
+    if bytes.len() != RXD_BASE_SIZE {
+        return TestResult::Fail("encode_rxd_for_test size wrong");
+    }
+    let decoded = match decode_rxd(&bytes) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_rxd returned None"),
+    };
+    if decoded != original {
+        return TestResult::Fail("RXD decode round-trip mismatch");
+    }
+    // FCS error round-trip.
+    let bad = RxdInfo {
+        frame_len: 64,
+        pkt_type: 0,
+        wlan_idx: 0,
+        fcs_err: true,
+        icv_err: false,
+    };
+    let bad_bytes = encode_rxd_for_test(&bad);
+    let dec_bad = decode_rxd(&bad_bytes).unwrap();
+    if !dec_bad.fcs_err {
+        return TestResult::Fail("fcs_err not preserved through round-trip");
+    }
+    if dec_bad.icv_err {
+        return TestResult::Fail("icv_err incorrectly set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_rxd_decode_roundtrip);
+
+fn smoke_mt7921_sta_rec_update_encode() -> TestResult {
+    // The minimal STA_REC_UPDATE command must have opcode=0x25 at byte 0
+    // and the wlan_idx at bytes 4-7 LE.
+    // Reference: Linux `mt76_connac_mcu.h:1226` + `mt76_connac_mcu.c`.
+    let mut buf = [0xFFu8; STA_REC_CMD_SIZE];
+    if encode_sta_rec_update(42, &mut buf).is_none() {
+        return TestResult::Fail("encode_sta_rec_update returned None");
+    }
+    if buf[0] != MCU_EXT_CMD_STA_REC_UPDATE {
+        return TestResult::Fail("STA_REC opcode wrong (expected 0x25)");
+    }
+    let wlan_idx = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if wlan_idx != 42 {
+        return TestResult::Fail("STA_REC wlan_idx not encoded correctly");
+    }
+    // Tag bitmap must be 0 (minimal record, no crypto).
+    let tag_bitmap = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if tag_bitmap != 0 {
+        return TestResult::Fail("STA_REC tag_bitmap should be 0 for minimal command");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_sta_rec_update_encode);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //

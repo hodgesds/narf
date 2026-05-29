@@ -46,6 +46,7 @@ pub mod mac;
 pub mod mcu;
 pub mod pci;
 pub mod regs;
+pub mod txrx;
 
 pub use pci::{
     firmware_blobs_for, l1_remap, name_for, probe, register_pci_driver, Mt7921Device, ProbeError,
