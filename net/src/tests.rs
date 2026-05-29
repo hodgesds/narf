@@ -5634,3 +5634,304 @@ fn bypass_build_eth_ipv4_tcp(dst_ip: [u8; 4], dst_port: u16) -> alloc::vec::Vec<
     buf.extend_from_slice(&0u16.to_be_bytes());
     buf
 }
+
+// ── FIB / routing / ARP-cache smokes ─────────────────────────────────
+
+fn smoke_route_lpm_specific_wins() -> TestResult {
+    use crate::route::{route_add, Scope, TABLE_MAIN, __reset_for_test};
+    use crate::route::{Ipv4Net, Route};
+    use crate::ipv4::Ipv4Addr;
+    use crate::ifaddr::__reset_for_test as ifaddr_reset;
+    use alloc::string::String;
+
+    __reset_for_test();
+    ifaddr_reset();
+
+    // /32 > /24 > /0
+    route_add(Route {
+        dst: Ipv4Net { addr: Ipv4Addr([0,0,0,0]), prefix_len: 0 },
+        gateway: Some(Ipv4Addr([10,0,2,2])),
+        iface: String::from("eth0"),
+        src_hint: None, metric: 100, scope: Scope::Universe, table: TABLE_MAIN,
+    });
+    route_add(Route {
+        dst: Ipv4Net { addr: Ipv4Addr([192,168,1,0]), prefix_len: 24 },
+        gateway: None,
+        iface: String::from("eth0"),
+        src_hint: Some(Ipv4Addr([192,168,1,10])),
+        metric: 0, scope: Scope::Link, table: TABLE_MAIN,
+    });
+    route_add(Route {
+        dst: Ipv4Net { addr: Ipv4Addr([192,168,1,1]), prefix_len: 32 },
+        gateway: None,
+        iface: String::from("eth0"),
+        src_hint: Some(Ipv4Addr([192,168,1,10])),
+        metric: 0, scope: Scope::Host, table: TABLE_MAIN,
+    });
+
+    let r = match crate::route::route_lookup_raw(Ipv4Addr([192,168,1,1])) {
+        Some(r) => r,
+        None => return TestResult::Fail("no route found for 192.168.1.1"),
+    };
+    if r.dst.prefix_len != 32 {
+        return TestResult::Fail("/32 should beat /24 and /0");
+    }
+    let r24 = match crate::route::route_lookup_raw(Ipv4Addr([192,168,1,5])) {
+        Some(r) => r,
+        None => return TestResult::Fail("no route for 192.168.1.5"),
+    };
+    if r24.dst.prefix_len != 24 {
+        return TestResult::Fail("/24 should beat /0 for 192.168.1.5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_route_lpm_specific_wins);
+
+fn smoke_route_default_fallback() -> TestResult {
+    use crate::route::{route_add, route_lookup_raw, Scope, TABLE_MAIN, __reset_for_test};
+    use crate::route::{Ipv4Net, Route};
+    use crate::ipv4::Ipv4Addr;
+    use alloc::string::String;
+
+    __reset_for_test();
+    route_add(Route {
+        dst: Ipv4Net { addr: Ipv4Addr([0,0,0,0]), prefix_len: 0 },
+        gateway: Some(Ipv4Addr([10,0,2,2])),
+        iface: String::from("eth0"),
+        src_hint: None, metric: 100, scope: Scope::Universe, table: TABLE_MAIN,
+    });
+
+    let r = match route_lookup_raw(Ipv4Addr([8,8,8,8])) {
+        Some(r) => r,
+        None => return TestResult::Fail("default route not found for 8.8.8.8"),
+    };
+    if r.dst.prefix_len != 0 {
+        return TestResult::Fail("expected default route (prefix 0)");
+    }
+    if r.gateway != Some(Ipv4Addr([10,0,2,2])) {
+        return TestResult::Fail("gateway mismatch on default route");
+    }
+    let r2 = match route_lookup_raw(Ipv4Addr([0,0,0,0])) {
+        Some(r) => r,
+        None => return TestResult::Fail("no route for 0.0.0.0"),
+    };
+    if r2.dst.prefix_len != 0 {
+        return TestResult::Fail("0.0.0.0 should match default route");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_route_default_fallback);
+
+fn smoke_route_loopback() -> TestResult {
+    use crate::route::{install_loopback_route, route_lookup_raw, __reset_for_test};
+    use crate::ipv4::Ipv4Addr;
+
+    __reset_for_test();
+    install_loopback_route();
+
+    let r = match route_lookup_raw(Ipv4Addr([127,0,0,1])) {
+        Some(r) => r,
+        None => return TestResult::Fail("127.0.0.1 must route to loopback"),
+    };
+    if r.iface != "lo" {
+        return TestResult::Fail("loopback route must use iface 'lo'");
+    }
+    if r.gateway.is_some() {
+        return TestResult::Fail("loopback route must be direct (no gateway)");
+    }
+    let r2 = match route_lookup_raw(Ipv4Addr([127,100,200,1])) {
+        Some(r) => r,
+        None => return TestResult::Fail("127.x.x.x must route to loopback"),
+    };
+    if r2.iface != "lo" {
+        return TestResult::Fail("127.x.x.x should also hit loopback /8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_route_loopback);
+
+fn smoke_src_selection_direct_subnet() -> TestResult {
+    use crate::route::{src_for, __reset_for_test};
+    use crate::ifaddr::{iface_add_addr, __reset_for_test as ifaddr_reset};
+    use crate::ipv4::Ipv4Addr;
+
+    __reset_for_test();
+    ifaddr_reset();
+    iface_add_addr("eth0", Ipv4Addr([10,1,0,1]), 24);
+
+    let (iface, src, gw) = match src_for(Ipv4Addr([10,1,0,5])) {
+        Some(t) => t,
+        None => return TestResult::Fail("no route/src for direct subnet dest"),
+    };
+    if iface != "eth0" { return TestResult::Fail("wrong egress iface"); }
+    if src.0 != [10,1,0,1] { return TestResult::Fail("src should be 10.1.0.1"); }
+    if gw.is_some() { return TestResult::Fail("direct: no gateway expected"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_src_selection_direct_subnet);
+
+fn smoke_src_selection_via_gateway() -> TestResult {
+    use crate::route::{route_add, src_for, Scope, TABLE_MAIN, __reset_for_test};
+    use crate::route::{Ipv4Net, Route};
+    use crate::ifaddr::{iface_add_addr, __reset_for_test as ifaddr_reset};
+    use crate::ipv4::Ipv4Addr;
+    use alloc::string::String;
+
+    __reset_for_test();
+    ifaddr_reset();
+    iface_add_addr("eth0", Ipv4Addr([192,168,1,10]), 24);
+    route_add(Route {
+        dst: Ipv4Net { addr: Ipv4Addr([0,0,0,0]), prefix_len: 0 },
+        gateway: Some(Ipv4Addr([192,168,1,1])),
+        iface: String::from("eth0"),
+        src_hint: None, metric: 100, scope: Scope::Universe, table: TABLE_MAIN,
+    });
+
+    let (iface, src, gw) = match src_for(Ipv4Addr([8,8,8,8])) {
+        Some(t) => t,
+        None => return TestResult::Fail("no route/src for 8.8.8.8"),
+    };
+    if iface != "eth0" { return TestResult::Fail("wrong egress iface"); }
+    if src.0 != [192,168,1,10] { return TestResult::Fail("src should be 192.168.1.10"); }
+    if gw != Some(Ipv4Addr([192,168,1,1])) { return TestResult::Fail("gateway mismatch"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_src_selection_via_gateway);
+
+fn smoke_arp_cache_incomplete_to_reachable() -> TestResult {
+    use crate::arp_cache::{mark_incomplete, insert, entry_state, ArpState, __reset_for_test};
+
+    __reset_for_test();
+    let ip = [10u8, 0, 0, 1];
+    let mac = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+    mark_incomplete("eth0", ip);
+    match entry_state("eth0", ip) {
+        Some(ArpState::Incomplete) => {}
+        _ => return TestResult::Fail("expected Incomplete after mark_incomplete"),
+    }
+    insert("eth0", ip, mac);
+    match entry_state("eth0", ip) {
+        Some(ArpState::Reachable) => TestResult::Pass,
+        _ => TestResult::Fail("expected Reachable after insert (ARP reply)"),
+    }
+}
+kernel_test_in!("net/arp_cache", smoke_arp_cache_incomplete_to_reachable);
+
+fn smoke_arp_cache_reachable_to_stale() -> TestResult {
+    use crate::arp_cache::{__insert_with_expiry, lookup, entry_state, ArpState, __reset_for_test};
+
+    __reset_for_test();
+    let ip = [10u8, 0, 0, 2];
+    let mac = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    // expires_at = 1 (already expired)
+    __insert_with_expiry("eth0", ip, mac, 1);
+
+    let m = lookup("eth0", ip);
+    if m.is_none() { return TestResult::Fail("stale entry should return MAC"); }
+    match entry_state("eth0", ip) {
+        Some(ArpState::Probe) => TestResult::Pass,
+        _ => TestResult::Fail("expected Probe after lookup on expired entry"),
+    }
+}
+kernel_test_in!("net/arp_cache", smoke_arp_cache_reachable_to_stale);
+
+fn smoke_arp_cache_eviction_lru() -> TestResult {
+    use crate::arp_cache::{insert, entry_count, get_entry, MAX_ENTRIES, __reset_for_test};
+
+    __reset_for_test();
+    for i in 0u32..MAX_ENTRIES as u32 {
+        let ip = ((0x0A000100u32).wrapping_add(i)).to_be_bytes();
+        let mac = [0x02, 0x00, (i >> 16) as u8, (i >> 8) as u8, i as u8, 0x01];
+        insert("eth0", ip, mac);
+    }
+    if entry_count("eth0") != MAX_ENTRIES {
+        return TestResult::Fail("cache should be at MAX_ENTRIES");
+    }
+    let overflow_ip = [10u8, 99, 99, 99];
+    insert("eth0", overflow_ip, [0xFFu8; 6]);
+    if entry_count("eth0") > MAX_ENTRIES {
+        return TestResult::Fail("cache exceeded MAX_ENTRIES after eviction");
+    }
+    if get_entry("eth0", overflow_ip).is_none() {
+        return TestResult::Fail("overflow entry should be in cache");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/arp_cache", smoke_arp_cache_eviction_lru);
+
+fn smoke_arp_cache_multi_iface_separation() -> TestResult {
+    use crate::arp_cache::{insert, get_entry, __reset_for_test};
+
+    __reset_for_test();
+    let ip = [192u8, 168, 1, 1];
+    let mac1 = [0x11u8; 6];
+    let mac2 = [0x22u8; 6];
+    insert("eth0", ip, mac1);
+    insert("eth1", ip, mac2);
+
+    let e0 = get_entry("eth0", ip).expect("eth0 entry");
+    let e1 = get_entry("eth1", ip).expect("eth1 entry");
+    if e0.mac != mac1 { return TestResult::Fail("eth0 MAC wrong"); }
+    if e1.mac != mac2 { return TestResult::Fail("eth1 MAC wrong"); }
+    if e0.mac == e1.mac { return TestResult::Fail("ifaces must have separate MACs"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/arp_cache", smoke_arp_cache_multi_iface_separation);
+
+fn smoke_iface_addr_connected_route_auto_installed() -> TestResult {
+    use crate::ifaddr::{iface_add_addr, iface_addrs, __reset_for_test as ifaddr_reset};
+    use crate::route::{route_lookup_raw, __reset_for_test as route_reset};
+    use crate::ipv4::Ipv4Addr;
+
+    route_reset();
+    ifaddr_reset();
+    iface_add_addr("eth0", Ipv4Addr([172,16,5,1]), 16);
+
+    let r = match route_lookup_raw(Ipv4Addr([172,16,100,50])) {
+        Some(r) => r,
+        None => return TestResult::Fail("connected route for 172.16.0.0/16 not installed"),
+    };
+    if r.iface != "eth0" { return TestResult::Fail("connected route must use eth0"); }
+    if r.dst.prefix_len != 16 { return TestResult::Fail("prefix_len should be 16"); }
+    let addrs = iface_addrs("eth0");
+    if addrs.is_empty() || addrs[0].addr.0 != [172,16,5,1] {
+        return TestResult::Fail("iface_addrs should return the added address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_iface_addr_connected_route_auto_installed);
+
+fn smoke_route_multi_iface_egress() -> TestResult {
+    use crate::route::{src_for, __reset_for_test};
+    use crate::ifaddr::{iface_add_addr, __reset_for_test as ifaddr_reset};
+    use crate::ipv4::Ipv4Addr;
+
+    __reset_for_test();
+    ifaddr_reset();
+    iface_add_addr("iface1", Ipv4Addr([10,1,0,1]), 24);
+    iface_add_addr("iface2", Ipv4Addr([10,2,0,1]), 24);
+
+    let (iface_a, src_a, _) = match src_for(Ipv4Addr([10,1,0,5])) {
+        Some(t) => t,
+        None => return TestResult::Fail("no route to 10.1.0.5"),
+    };
+    if iface_a != "iface1" { return TestResult::Fail("10.1.0.5 should egress via iface1"); }
+    if src_a.0 != [10,1,0,1] { return TestResult::Fail("src for iface1 should be 10.1.0.1"); }
+
+    let (iface_b, src_b, _) = match src_for(Ipv4Addr([10,2,0,5])) {
+        Some(t) => t,
+        None => return TestResult::Fail("no route to 10.2.0.5"),
+    };
+    if iface_b != "iface2" { return TestResult::Fail("10.2.0.5 should egress via iface2"); }
+    if src_b.0 != [10,2,0,1] { return TestResult::Fail("src for iface2 should be 10.2.0.1"); }
+    TestResult::Pass
+}
+kernel_test_in!("net/route", smoke_route_multi_iface_egress);
+
+fn smoke_arp_gratuitous_does_not_panic() -> TestResult {
+    use crate::arp_cache::send_gratuitous_arp;
+    send_gratuitous_arp("garp_eth0", [192,168,1,5]);
+    TestResult::Pass
+}
+kernel_test_in!("net/arp_cache", smoke_arp_gratuitous_does_not_panic);
