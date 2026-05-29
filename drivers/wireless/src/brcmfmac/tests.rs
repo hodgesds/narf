@@ -968,6 +968,170 @@ kernel_test_in!(
     smoke_brcmfmac_ring_mem_entry_decode
 );
 
+// ── Stage-6: firmware TRX header + NVRAM parser ───────────────────────
+
+fn smoke_brcmfmac_trx_header_decode() -> TestResult {
+    use super::firmware::{TrxHeader, TRX_HEADER_SIZE, TRX_MAGIC};
+    let mut buf = [0u8; TRX_HEADER_SIZE];
+    buf[0..4].copy_from_slice(&TRX_MAGIC.to_le_bytes());
+    buf[4..8].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0x0001_0002u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&28u32.to_le_bytes());
+    buf[20..24].copy_from_slice(&0x0004_0000u32.to_le_bytes());
+    buf[24..28].copy_from_slice(&0x0008_0000u32.to_le_bytes());
+
+    let h = match TrxHeader::parse(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("TrxHeader::parse returned None"),
+    };
+    if h.magic != TRX_MAGIC {
+        return TestResult::Fail("TRX magic mismatch");
+    }
+    if h.length != 0x0010_0000 {
+        return TestResult::Fail("TRX length mismatch");
+    }
+    if h.version() != 1 {
+        return TestResult::Fail("TRX version mismatch");
+    }
+    if h.flags() != 2 {
+        return TestResult::Fail("TRX flags mismatch");
+    }
+    if h.offsets[0] != 28 || h.offsets[1] != 0x40000 || h.offsets[2] != 0x80000 {
+        return TestResult::Fail("TRX offsets mismatch");
+    }
+    buf[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    if TrxHeader::parse(&buf).is_some() {
+        return TestResult::Fail("wrong magic should be rejected");
+    }
+    if TrxHeader::parse(&buf[..TRX_HEADER_SIZE - 1]).is_some() {
+        return TestResult::Fail("short buffer should be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_trx_header_decode);
+
+fn smoke_brcmfmac_fw_embedded_ramsize() -> TestResult {
+    use super::firmware::{embedded_ramsize, FW_RAMSIZE_MAGIC, FW_RAMSIZE_OFFSET};
+    let mut blob = alloc::vec![0u8; FW_RAMSIZE_OFFSET + 8 + 256];
+    blob[FW_RAMSIZE_OFFSET..FW_RAMSIZE_OFFSET + 4]
+        .copy_from_slice(&FW_RAMSIZE_MAGIC.to_le_bytes());
+    blob[FW_RAMSIZE_OFFSET + 4..FW_RAMSIZE_OFFSET + 8]
+        .copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    match embedded_ramsize(&blob) {
+        Some(0x0040_0000) => {}
+        _ => return TestResult::Fail("embedded_ramsize didn't return 4 MiB"),
+    }
+    blob[FW_RAMSIZE_OFFSET] = 0;
+    if embedded_ramsize(&blob).is_some() {
+        return TestResult::Fail("non-magic should produce None");
+    }
+    let tiny = [0u8; 4];
+    if embedded_ramsize(&tiny).is_some() {
+        return TestResult::Fail("tiny blob should produce None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fw_embedded_ramsize
+);
+
+fn smoke_brcmfmac_nvram_parse_basic() -> TestResult {
+    use super::firmware::parse_nvram;
+    let input = b"# Broadcom 4356 PCIe NVRAM\n\
+                  boardrev=0x1101\n\
+                  boardtype=0x07c1\n\
+                  # MAC address override\n\
+                  macaddr=00:11:22:33:44:55\n\
+                  cckdigfilttype=4\n\
+                  rxchain=3\n";
+    let parsed = parse_nvram(input);
+    if !parsed.boardrev_seen {
+        return TestResult::Fail("boardrev=… should have been observed");
+    }
+    if parsed.multi_dev_v1 || parsed.multi_dev_v2 {
+        return TestResult::Fail("single-dev file misdetected as multi-dev");
+    }
+    let entries: alloc::vec::Vec<&[u8]> = parsed
+        .bytes
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.len() != 5 {
+        return TestResult::Fail("expected 5 entries from sample NVRAM");
+    }
+    if entries[0] != b"boardrev=0x1101" {
+        return TestResult::Fail("first entry mismatch");
+    }
+    if entries[2] != b"macaddr=00:11:22:33:44:55" {
+        return TestResult::Fail("macaddr entry mismatch");
+    }
+    if entries[4] != b"rxchain=3" {
+        return TestResult::Fail("last entry mismatch");
+    }
+    for e in &entries {
+        for &b in *e {
+            if b == 0 || b == b'#' {
+                return TestResult::Fail("NVRAM entry contains illegal byte");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_nvram_parse_basic);
+
+fn smoke_brcmfmac_nvram_skips_raw1_and_bom() -> TestResult {
+    use super::firmware::parse_nvram;
+    let mut input: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    input.extend_from_slice(b"foo=bar\nRAW1=ignoreme\nbaz=qux\n");
+    let parsed = parse_nvram(&input);
+    let entries: alloc::vec::Vec<&[u8]> = parsed
+        .bytes
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.len() != 2 {
+        return TestResult::Fail("RAW1 entry should be dropped");
+    }
+    if entries[0] != b"foo=bar" || entries[1] != b"baz=qux" {
+        return TestResult::Fail("entries around RAW1 lost or reordered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_nvram_skips_raw1_and_bom
+);
+
+fn smoke_brcmfmac_nvram_appends_default_boardrev() -> TestResult {
+    use super::firmware::{append_default_boardrev, parse_nvram, NVRAM_DEFAULT_BOARDREV};
+    let input = b"foo=1\nbar=2\n";
+    let mut parsed = parse_nvram(input);
+    if parsed.boardrev_seen {
+        return TestResult::Fail("test setup wrong: no boardrev in input");
+    }
+    append_default_boardrev(&mut parsed);
+    if !parsed.boardrev_seen {
+        return TestResult::Fail("append_default_boardrev didn't flip boardrev_seen");
+    }
+    let last_entry: &[u8] = parsed
+        .bytes
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or(&[]);
+    if last_entry != NVRAM_DEFAULT_BOARDREV {
+        return TestResult::Fail("default boardrev entry not appended");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_nvram_appends_default_boardrev
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");
