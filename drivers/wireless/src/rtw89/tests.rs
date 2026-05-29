@@ -11,6 +11,11 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+use super::dma::{
+    addr_set_for, addr_set_for_chip, pack_idx, split_idx, RingState, AX_DMA_ADDR_SET,
+    AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
+    RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
+};
 use super::efuse::{mac_is_valid, EfuseError};
 use super::fw::{expected_blob_name, FwError};
 use super::mac::*;
@@ -396,6 +401,222 @@ fn smoke_rtw89_h2c_header_encode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_header_encode);
+
+// ── Stage-4: DMA-ring address tables + bookkeeping ─────────────────
+
+fn smoke_rtw89_dma_txch_count() -> TestResult {
+    if TXCH_NUM != 13 {
+        return TestResult::Fail("RTW89 TXCH count drifted from 13");
+    }
+    if RXCH_NUM != 2 {
+        return TestResult::Fail("RTW89 RXCH count drifted from 2");
+    }
+    // ACH0 must be channel 0 (matches RTW89_TXCH_ACH0 in txrx.h:660).
+    if TXCH_ACH0 != 0 {
+        return TestResult::Fail("RTW89_TXCH_ACH0 not 0");
+    }
+    // CH12 must be channel 12 (FW command ring).
+    if TXCH_CH12 != 12 {
+        return TestResult::Fail("RTW89_TXCH_CH12 not 12");
+    }
+    if RXCH_RXQ != 0 || RXCH_RPQ != 1 {
+        return TestResult::Fail("RTW89 RX channel numbering drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_txch_count);
+
+fn smoke_rtw89_dma_ax_addr_set_pins() -> TestResult {
+    // Pin a handful of AX baseline offsets against pci.c:1093..1113.
+    // ACH0 doorbell: 0x1058. ACH0 desa_l: 0x1110.
+    let set = AX_DMA_ADDR_SET;
+    if set.tx[0].idx != 0x1058 {
+        return TestResult::Fail("AX ACH0 doorbell drift");
+    }
+    if set.tx[0].desa_l != 0x1110 {
+        return TestResult::Fail("AX ACH0 desa_l drift");
+    }
+    if set.tx[0].desa_h != 0x1114 {
+        return TestResult::Fail("AX ACH0 desa_h drift");
+    }
+    // CH12 (FW cmd) doorbell: 0x1080.
+    if set.tx[12].idx != 0x1080 {
+        return TestResult::Fail("AX CH12 (FW cmd) doorbell drift");
+    }
+    // RXQ doorbell: 0x1050.
+    if set.rx[0].idx != 0x1050 {
+        return TestResult::Fail("AX RXQ doorbell drift");
+    }
+    if set.rx[1].idx != 0x1054 {
+        return TestResult::Fail("AX RPQ doorbell drift");
+    }
+    // CH10 / CH11 sit in the Type-1 BDRAM offset region.
+    if set.tx[10].idx != 0x137C || set.tx[11].idx != 0x1380 {
+        return TestResult::Fail("AX CH10/CH11 Type-1 BDRAM drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_ax_addr_set_pins);
+
+fn smoke_rtw89_dma_ax_v1_addr_set_pins() -> TestResult {
+    // 8852C V1 layout. ACH0 doorbell still 0x1058 (doorbells unchanged),
+    // but desa_l moves to the V1 base at 0x1230.
+    let set = AX_V1_DMA_ADDR_SET;
+    if set.tx[0].idx != 0x1058 {
+        return TestResult::Fail("V1 ACH0 doorbell drift");
+    }
+    if set.tx[0].desa_l != 0x1230 {
+        return TestResult::Fail("V1 ACH0 desa_l should be at 0x1230 base");
+    }
+    // RX rings: RXQ doorbell at 0x1218 in V1.
+    if set.rx[0].idx != 0x1218 {
+        return TestResult::Fail("V1 RXQ doorbell drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_ax_v1_addr_set_pins);
+
+fn smoke_rtw89_dma_addr_set_for_chip() -> TestResult {
+    // AX baseline parts → AX_DMA_ADDR_SET.
+    let s1 = addr_set_for_chip(ChipId::Rtl8852A);
+    if s1.tx[0].idx != AX_DMA_ADDR_SET.tx[0].idx {
+        return TestResult::Fail("8852A not on AX baseline");
+    }
+    let s2 = addr_set_for_chip(ChipId::Rtl8852B);
+    if s2.tx[0].idx != AX_DMA_ADDR_SET.tx[0].idx {
+        return TestResult::Fail("8852B not on AX baseline");
+    }
+    let s3 = addr_set_for_chip(ChipId::Rtl8851B);
+    if s3.tx[0].idx != AX_DMA_ADDR_SET.tx[0].idx {
+        return TestResult::Fail("8851B not on AX baseline");
+    }
+    // 8852C → V1.
+    let s4 = addr_set_for_chip(ChipId::Rtl8852C);
+    if s4.tx[0].desa_l != AX_V1_DMA_ADDR_SET.tx[0].desa_l {
+        return TestResult::Fail("8852C not on V1 layout");
+    }
+    // 8922A (BE) reuses V1 in our mapping.
+    let s5 = addr_set_for_chip(ChipId::Rtl8922A);
+    if s5.tx[0].desa_l != AX_V1_DMA_ADDR_SET.tx[0].desa_l {
+        return TestResult::Fail("8922A not on V1 layout");
+    }
+    // generation-only dispatch: Ax → baseline, Be → V1.
+    let g_ax = addr_set_for(ChipGeneration::Ax);
+    if g_ax.tx[0].idx != AX_DMA_ADDR_SET.tx[0].idx {
+        return TestResult::Fail("addr_set_for(Ax) wrong");
+    }
+    let g_be = addr_set_for(ChipGeneration::Be);
+    if g_be.tx[0].desa_l != AX_V1_DMA_ADDR_SET.tx[0].desa_l {
+        return TestResult::Fail("addr_set_for(Be) wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_addr_set_for_chip);
+
+fn smoke_rtw89_dma_ring_state_avail() -> TestResult {
+    // Brand new ring: 256 slots, all empty, all avail = 255 (one slot
+    // reserved to distinguish full from empty — matches
+    // `rtw89_pci_get_avail_txbd_num` at pci.c:1222).
+    let mut r = RingState::new(DEFAULT_TXBD_NUM);
+    if r.avail() != DEFAULT_TXBD_NUM - 1 {
+        return TestResult::Fail("empty ring avail wrong");
+    }
+    if r.is_full() {
+        return TestResult::Fail("empty ring claims full");
+    }
+    // Push 10 slots; HW hasn't moved yet.
+    r.advance_wp(10);
+    if r.avail() != DEFAULT_TXBD_NUM - 1 - 10 {
+        return TestResult::Fail("post-push avail wrong");
+    }
+    // HW reads 5 of them — 5 slots come back.
+    r.set_rp(5);
+    if r.avail() != DEFAULT_TXBD_NUM - 1 - 5 {
+        return TestResult::Fail("post-HW-advance avail wrong");
+    }
+    // Fill the rest of the ring; should report full.
+    let push = r.avail();
+    r.advance_wp(push);
+    if !r.is_full() {
+        return TestResult::Fail("ring should be full at avail=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_ring_state_avail);
+
+fn smoke_rtw89_dma_idx_pack_unpack() -> TestResult {
+    // pack_idx / split_idx round-trip — the index register format is
+    // (host_wp << 16) | hw_rp.
+    let packed = pack_idx(0x0AB, 0xCD12);
+    let (hw, host) = split_idx(packed);
+    if hw != 0x0AB {
+        return TestResult::Fail("HW pointer round-trip failed");
+    }
+    if host != 0xCD12 {
+        return TestResult::Fail("host pointer round-trip failed");
+    }
+    // Mask widths.
+    if RING_IDX_HW_MASK != 0x0FFF {
+        return TestResult::Fail("HW pointer mask not 12 bits");
+    }
+    if RING_IDX_HOST_SHIFT != 16 {
+        return TestResult::Fail("host shift not 16");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_idx_pack_unpack);
+
+fn smoke_rtw89_dma_bd_sizes() -> TestResult {
+    // BD descriptor sizes (`struct rtw89_pci_tx_bd_32` /
+    // `rtw89_pci_rx_bd_32`, pci.h:1283/1289). Both 8 bytes.
+    if TX_BD_SIZE != 8 {
+        return TestResult::Fail("TX BD size not 8");
+    }
+    if RX_BD_SIZE != 8 {
+        return TestResult::Fail("RX BD size not 8");
+    }
+    // Default ring depths.
+    if DEFAULT_TXBD_NUM != 256 {
+        return TestResult::Fail("default TX BD count drifted");
+    }
+    if DEFAULT_RXBD_NUM != 256 {
+        return TestResult::Fail("default RX BD count drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_bd_sizes);
+
+fn smoke_rtw89_dma_all_ax_offsets_distinct() -> TestResult {
+    // The AX baseline doorbells should all sit at distinct offsets —
+    // no two channels share a doorbell register. Catches transcription
+    // typos against pci.c:1093..1113.
+    let set = AX_DMA_ADDR_SET;
+    for i in 0..TXCH_NUM {
+        for j in (i + 1)..TXCH_NUM {
+            if set.tx[i].idx == set.tx[j].idx {
+                return TestResult::Fail("two AX TX channels share a doorbell");
+            }
+        }
+    }
+    for i in 0..RXCH_NUM {
+        for j in (i + 1)..RXCH_NUM {
+            if set.rx[i].idx == set.rx[j].idx {
+                return TestResult::Fail("two AX RX rings share a doorbell");
+            }
+        }
+    }
+    // And the same for V1.
+    let v1 = AX_V1_DMA_ADDR_SET;
+    for i in 0..TXCH_NUM {
+        for j in (i + 1)..TXCH_NUM {
+            if v1.tx[i].idx == v1.tx[j].idx {
+                return TestResult::Fail("two V1 TX channels share a doorbell");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_all_ax_offsets_distinct);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //

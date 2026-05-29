@@ -57,6 +57,7 @@
 
 extern crate alloc;
 
+pub mod dma;
 pub mod efuse;
 pub mod fw;
 pub mod mac;
