@@ -16,7 +16,7 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::efuse::{decode_efuse_map, efuse_addr_setups, extract_mac, mac_is_valid, EfuseAddr};
+use super::efuse::{decode_efuse_map, efuse_addr_setups, EfuseAddr};
 use super::fw::firmware_name;
 use super::regs::*;
 use super::usb::{IntrIn, TxDesc32, UsbControlSetup};
