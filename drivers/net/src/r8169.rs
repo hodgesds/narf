@@ -236,14 +236,14 @@ pub enum NicError {
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-struct Desc {
+pub(crate) struct Desc {
     /// Bits [31..14] are flags (OWN/EOR/FS/LS/... in TX; OWN/EOR/...
     /// + frame length in RX status), bits [13..0] are buffer size or
     /// frame length depending on direction.
-    flags_len: u32,
-    vlan: u32,
-    addr_lo: u32,
-    addr_hi: u32,
+    pub flags_len: u32,
+    pub vlan: u32,
+    pub addr_lo: u32,
+    pub addr_hi: u32,
 }
 const _: () = assert!(core::mem::size_of::<Desc>() == 16);
 

@@ -368,9 +368,9 @@ pub enum NicError {
 /// flags + length packed together.
 #[repr(C, align(8))]
 #[derive(Copy, Clone, Debug, Default)]
-struct Desc {
-    buf: u32,
-    flaglen: u32,
+pub(crate) struct Desc {
+    pub buf: u32,
+    pub flaglen: u32,
 }
 const _: () = assert!(core::mem::size_of::<Desc>() == 8);
 

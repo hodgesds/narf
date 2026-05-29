@@ -448,27 +448,27 @@ const RX_BUF_LEN: usize = 2048;
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-struct TxDesc {
-    addr: u64,
-    length: u16,
-    cso: u8,
-    cmd: u8,
-    status: u8,
-    css: u8,
-    special: u16,
+pub(crate) struct TxDesc {
+    pub addr: u64,
+    pub length: u16,
+    pub cso: u8,
+    pub cmd: u8,
+    pub status: u8,
+    pub css: u8,
+    pub special: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-struct RxDesc {
-    addr: u64,
-    length: u16,
-    csum: u16,
-    status: u8,
-    errors: u8,
-    special: u16,
+pub(crate) struct RxDesc {
+    pub addr: u64,
+    pub length: u16,
+    pub csum: u16,
+    pub status: u8,
+    pub errors: u8,
+    pub special: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
