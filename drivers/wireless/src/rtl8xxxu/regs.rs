@@ -347,3 +347,153 @@ pub const TXDESC_SIZE_32: usize = 32;
 /// TX descriptor size for 40-byte descriptor chips (8821CU, 8822BU).
 /// Source: `sizeof(struct rtl8xxxu_txdesc40)` in `rtl8xxxu.h`.
 pub const TXDESC_SIZE_40: usize = 40;
+
+/// RX descriptor size for 8188EU / 8192EU / 8723BU (16 bytes).
+/// Source: `sizeof(struct rtl8xxxu_rxdesc16)` in `rtl8xxxu.h` L135.
+pub const RXDESC_SIZE_16: usize = 16;
+
+/// RX descriptor size for 8821CU / 8822BU (24 bytes).
+/// Source: `sizeof(struct rtl8xxxu_rxdesc24)` in `rtl8xxxu.h` L275.
+pub const RXDESC_SIZE_24: usize = 24;
+
+// ── MCU firmware download details ────────────────────────────────────
+
+/// `MCU_FW_DL_ENABLE` — bit 0 of `REG_MCU_FW_DL`. `regs.h` L220.
+pub const MCU_FW_DL_ENABLE: u8 = 1 << 0;
+/// `MCU_FW_DL_READY` — bit 1 of `REG_MCU_FW_DL`. `regs.h` L221.
+pub const MCU_FW_DL_READY: u8 = 1 << 1;
+/// `MCU_FW_DL_CSUM_REPORT` — bit 2 of `REG_MCU_FW_DL`. `regs.h` L222.
+pub const MCU_FW_DL_CSUM_REPORT: u8 = 1 << 2;
+/// `MCU_WINT_INIT_READY` — bit 6 of `REG_MCU_FW_DL`. `regs.h` L226.
+pub const MCU_WINT_INIT_READY: u32 = 1 << 6;
+
+/// `REG_FW_START_ADDRESS` — firmware download write window. `regs.h` L1200.
+pub const REG_FW_START_ADDRESS: u16 = 0x1000;
+/// `REG_HMTFR` — host-to-MCU H2C command FIFO. `regs.h` L456.
+pub const REG_HMTFR: u16 = 0x01CC;
+/// `REG_TX_REPORT_CTRL` — TX report control.
+pub const REG_TX_REPORT_CTRL: u16 = 0x06D2;
+
+/// `REG_TRXFF_BNDY` — TRX FIFO boundary. `regs.h` L423 (= 0x0114).
+pub const REG_TRXFF_BNDY: u16 = 0x0114;
+/// `REG_TRXDMA_CTRL` — TRX DMA / queue priority control.
+pub const REG_TRXDMA_CTRL: u16 = 0x010C;
+
+/// `REG_EDCA_VO_PARAM` — EDCA voice queue parameters. `regs.h` L655.
+pub const REG_EDCA_VO_PARAM: u16 = 0x0500;
+/// `REG_EDCA_VI_PARAM` — EDCA video queue parameters. `regs.h` L656.
+pub const REG_EDCA_VI_PARAM: u16 = 0x0504;
+/// `REG_EDCA_BE_PARAM` — EDCA best-effort queue parameters. `regs.h` L657.
+pub const REG_EDCA_BE_PARAM: u16 = 0x0508;
+/// `REG_EDCA_BK_PARAM` — EDCA background queue parameters. `regs.h` L658.
+pub const REG_EDCA_BK_PARAM: u16 = 0x050C;
+
+/// `REG_MACID` — MAC address bytes 0-3 (= 0x0610).
+pub const REG_MACID: u16 = 0x0610;
+/// `REG_MACID + 4` holds MAC bytes 4-5.
+pub const REG_MACID_4_5: u16 = 0x0614;
+
+/// `REG_RCR` — RX configuration. `regs.h` ~L443 (= 0x0608).
+pub const REG_RCR: u16 = 0x0608;
+/// `REG_BCN_INTERVAL` — beacon interval (1024 µs units). `regs.h` ~L590.
+pub const REG_BCN_INTERVAL: u16 = 0x0540;
+/// `REG_BSSID` — BSSID register block.
+pub const REG_BSSID: u16 = 0x0618;
+
+// ── TX descriptor field shifts ───────────────────────────────────────
+
+/// TX descriptor queue shift in DW1. `rtl8xxxu.h` L494.
+pub const TXDESC_QUEUE_SHIFT: u32 = 8;
+/// TX descriptor queue mask in DW1. `rtl8xxxu.h` L495.
+pub const TXDESC_QUEUE_MASK: u32 = 0x1F00;
+/// QSEL: best-effort. `rtl8xxxu.h` L497.
+pub const TXDESC_QUEUE_BE: u8 = 0x00;
+/// QSEL: background. `rtl8xxxu.h` L496.
+pub const TXDESC_QUEUE_BK: u8 = 0x02;
+/// QSEL: video. `rtl8xxxu.h` L498.
+pub const TXDESC_QUEUE_VI: u8 = 0x05;
+/// QSEL: voice. `rtl8xxxu.h` L499.
+pub const TXDESC_QUEUE_VO: u8 = 0x07;
+/// QSEL: beacon. `rtl8xxxu.h` L500.
+pub const TXDESC_QUEUE_BEACON: u8 = 0x10;
+/// QSEL: high priority. `rtl8xxxu.h` L501.
+pub const TXDESC_QUEUE_HIGH: u8 = 0x11;
+/// QSEL: management. `rtl8xxxu.h` L502.
+pub const TXDESC_QUEUE_MGNT: u8 = 0x12;
+/// QSEL: H2C command. `rtl8xxxu.h` L503.
+pub const TXDESC_QUEUE_CMD: u8 = 0x13;
+
+/// `TXDESC_OWN` — bit 31 of DW0. `rtl8xxxu.h` L472.
+pub const TXDESC_OWN: u32 = 1 << 31;
+/// `TXDESC32_USE_DRIVER_RATE` — DW4 bit 8. `rtl8xxxu.h` L550.
+pub const TXDESC32_USE_DRIVER_RATE: u32 = 1 << 8;
+/// `TXDESC32_SEQ_SHIFT` — DW3 sequence number shift.
+pub const TXDESC32_SEQ_SHIFT: u32 = 16;
+/// `TXDESC32_SHORT_GI` — DW4 bit 6. `rtl8xxxu.h` L573.
+pub const TXDESC32_SHORT_GI: u32 = 1 << 6;
+/// `TXDESC32_RETRY_LIMIT_ENABLE` — DW4 bit 17. `rtl8xxxu.h` L575.
+pub const TXDESC32_RETRY_LIMIT_ENABLE: u32 = 1 << 17;
+/// `TXDESC32_RETRY_LIMIT_SHIFT` — DW4 bits[23:18]. `rtl8xxxu.h` L576.
+pub const TXDESC32_RETRY_LIMIT_SHIFT: u32 = 18;
+
+// ── PHY/BB/RF registers ──────────────────────────────────────────────
+
+/// `REG_FPGA0_RF_MODE` — FPGA RF mode register (0x0800).
+pub const REG_FPGA0_RF_MODE: u16 = 0x0800;
+/// `REG_FPGA0_TX_INFO` — FPGA TX info register (0x0804).
+pub const REG_FPGA0_TX_INFO: u16 = 0x0804;
+/// `REG_FPGA0_XAB_RF_SW_CTRL` — FPGA X-AB RF software ctrl (0x0870).
+pub const REG_FPGA0_XAB_RF_SW_CTRL: u16 = 0x0870;
+/// `REG_RF_CTRL` — RF control register (0x001F).
+pub const REG_RF_CTRL: u16 = 0x001F;
+/// `REG_OFDM0_TRX_PATH_ENABLE` — OFDM TRX path enable (0x0C04).
+pub const REG_OFDM0_TRX_PATH_ENABLE: u16 = 0x0C04;
+/// `REG_OFDM0_TR_MUX_PAR` — OFDM TR mux parameter (0x0C08).
+pub const REG_OFDM0_TR_MUX_PAR: u16 = 0x0C08;
+
+// ── 5 GHz channel set (8821CU/8822BU) ───────────────────────────────
+
+/// `REG_RF_MODE_AG` — RF mode A/G register for channel switch (0x0D08).
+pub const REG_RF_MODE_AG: u16 = 0x0D08;
+
+// ── RF path identifier ──────────────────────────────────────────────
+
+/// RF path A index. `rtl8xxxu.h::RF_A`.
+pub const RF_PATH_A: u8 = 0;
+/// RF path B index. `rtl8xxxu.h::RF_B`.
+pub const RF_PATH_B: u8 = 1;
+/// RF register `RF_AC` (channel + bandwidth) — 8821C/8822B 0x18.
+pub const RF_REG_CHANNEL: u8 = 0x18;
+/// RF register `RF_RXBB2` — 8821C/8822B 0x35.
+pub const RF_REG_RXBB2: u8 = 0x35;
+
+// ── IQ calibration register block ────────────────────────────────────
+
+/// `REG_FPGA0_IQK` — start of the IQ-calibration register block (0x0E28).
+pub const REG_FPGA0_IQK: u16 = 0x0E28;
+/// IQK PI control register A (0x0E40).
+pub const REG_TX_IQK_PI_A: u16 = 0x0E40;
+/// IQK tone register A (0x0E30).
+pub const REG_TX_IQK_TONE_A: u16 = 0x0E30;
+/// IQK return value status register (0x0E50).
+pub const REG_RX_IQK_TONE_A: u16 = 0x0E50;
+/// IQK trigger register (0x0E48).
+pub const REG_IQK_AGC_PTS: u16 = 0x0E48;
+/// IQK control register (0x0E4C).
+pub const REG_IQK_AGC_RSP: u16 = 0x0E4C;
+
+// ── LC calibration register ─────────────────────────────────────────
+
+/// `RF_CHNLBW` — RF channel/bandwidth register used during LC cal (0x18).
+pub const RF_REG_LC_CAL: u8 = 0x18;
+
+// ── 8723B BT coexistence ─────────────────────────────────────────────
+
+/// BT coex H2C command — set TDMA params. `8723b.c` H2C 0x60.
+pub const H2C_BT_TDMA: u8 = 0x60;
+/// BT coex H2C command — set coex mode. `8723b.c` H2C 0x66.
+pub const H2C_BT_SET_MODE: u8 = 0x66;
+/// BT coex H2C command — wlan-only. `8723b.c` H2C 0x62.
+pub const H2C_BT_WLAN_ONLY: u8 = 0x62;
+/// BT coex H2C command — BT info update. 0x63.
+pub const H2C_BT_INFO: u8 = 0x63;

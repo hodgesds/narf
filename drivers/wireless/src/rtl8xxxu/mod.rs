@@ -40,14 +40,20 @@
 
 extern crate alloc;
 
+pub mod btcoex;
 pub mod efuse;
 pub mod fw;
+pub mod intr;
+pub mod mac;
+pub mod phy;
+pub mod rate;
 pub mod regs;
 pub mod rtl8188e;
 pub mod rtl8192e;
 pub mod rtl8723b;
 pub mod rtl8821c;
 pub mod rtl8822b;
+pub mod rx;
 pub mod usb;
 
 pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
