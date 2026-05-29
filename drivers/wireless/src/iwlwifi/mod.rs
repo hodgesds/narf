@@ -55,6 +55,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod fw_loader;
+pub mod mac_ctx;
 pub mod mlme;
 pub mod regs;
 pub mod rekey;
@@ -1434,5 +1435,89 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_pnvm_filename_none_when_no_version
+    );
+
+    // ── Stage 3: MAC_CONTEXT_CMD + TIME_EVENT_CMD encode ──────────
+
+    fn smoke_iwlwifi_mac_context_cmd_encode() -> TestResult {
+        use mac_ctx::{build_mac_context_cmd, ctxt_action, filter_flags, mac_type,
+                      MAC_CONTEXT_CMD};
+        let node_addr: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let filter = filter_flags::IN_NON_MCAST | filter_flags::IN_MCAST;
+        let cmd = build_mac_context_cmd(0, mac_type::BSS_STA, node_addr, bssid, filter);
+        // cmd_hdr(4) + id_and_color(4) + action(4) + mac_type(4) + tsf_id(4)
+        // + node_addr(6)+pad(2) + bssid(6)+pad(2) + cck_rates(4) + ofdm_rates(4)
+        // + protection_flags(4) + cck_short_preamble(4) + short_slot(4)
+        // + filter_flags(4) + qos_flags(4) + ac[5]*8(40) + type_stub(4) = 108 bytes.
+        if cmd.len() != 108 {
+            return TestResult::Fail("mac_context_cmd size wrong (expected 108)");
+        }
+        // cmd[0] = MAC_CONTEXT_CMD = 0x28.
+        if cmd[0] != MAC_CONTEXT_CMD {
+            return TestResult::Fail("cmd[0] != MAC_CONTEXT_CMD (0x28)");
+        }
+        // id_and_color at bytes 4..8 = 0.
+        let id_and_color = u32::from_le_bytes(cmd[4..8].try_into().unwrap());
+        if id_and_color != 0 {
+            return TestResult::Fail("id_and_color != 0");
+        }
+        // action at bytes 8..12 = ADD = 1.
+        let action = u32::from_le_bytes(cmd[8..12].try_into().unwrap());
+        if action != ctxt_action::ADD {
+            return TestResult::Fail("action != ADD(1)");
+        }
+        // mac_type at bytes 12..16 = BSS_STA = 5.
+        let mtype = u32::from_le_bytes(cmd[12..16].try_into().unwrap());
+        if mtype != mac_type::BSS_STA {
+            return TestResult::Fail("mac_type != BSS_STA(5)");
+        }
+        // node_addr at bytes 20..26 (after cmd_hdr+id_and_color+action+mac_type+tsf_id=20).
+        if &cmd[20..26] != &node_addr {
+            return TestResult::Fail("node_addr bytes wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_mac_context_cmd_encode
+    );
+
+    fn smoke_iwlwifi_time_event_cmd_encode() -> TestResult {
+        use mac_ctx::{build_time_event_cmd, ctxt_action, te_type, TIME_EVENT_CMD};
+        let cmd = build_time_event_cmd(0, te_type::BSS_STA_ASSOC, 100);
+        // Expected: 4-byte cmd hdr + 36-byte body = 40 bytes.
+        if cmd.len() != 40 {
+            return TestResult::Fail("time_event_cmd size wrong (expected 40)");
+        }
+        // cmd[0] = TIME_EVENT_CMD = 0x29.
+        if cmd[0] != TIME_EVENT_CMD {
+            return TestResult::Fail("cmd[0] != TIME_EVENT_CMD (0x29)");
+        }
+        // id_and_color at bytes 4..8 = 0.
+        let id_and_color = u32::from_le_bytes(cmd[4..8].try_into().unwrap());
+        if id_and_color != 0 {
+            return TestResult::Fail("id_and_color != 0");
+        }
+        // action at bytes 8..12 = ADD = 1.
+        let action = u32::from_le_bytes(cmd[8..12].try_into().unwrap());
+        if action != ctxt_action::ADD {
+            return TestResult::Fail("action != ADD(1)");
+        }
+        // te_id at bytes 12..16 = BSS_STA_ASSOC = 1.
+        let te_id = u32::from_le_bytes(cmd[12..16].try_into().unwrap());
+        if te_id != te_type::BSS_STA_ASSOC {
+            return TestResult::Fail("te_id != BSS_STA_ASSOC(1)");
+        }
+        // duration at bytes 32..36 (after cmd_hdr+id+action+te_id+apply+max_delay+depends+interval = 32).
+        let duration = u32::from_le_bytes(cmd[32..36].try_into().unwrap());
+        if duration != 100 {
+            return TestResult::Fail("duration != 100");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_time_event_cmd_encode
     );
 }
