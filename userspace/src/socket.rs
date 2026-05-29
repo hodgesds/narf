@@ -37,13 +37,63 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
+/// NARF kernel-bypass family — equivalent of Linux's AF_XDP (44).
+/// Picks 45 because Linux's number is taken; carries our four-ring
+/// model rather than mmap'd shared pages.
+pub const AF_BYPASS: u16 = 45;
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
+pub const SOCK_RAW: u32 = 3;
 
 pub const SHUT_RD: u32 = 0;
 pub const SHUT_WR: u32 = 1;
 pub const SHUT_RDWR: u32 = 2;
+
+// ── Socket-option levels and names ──────────────────────────────
+// Numbers match Linux `<linux/socket.h>` / `<netinet/tcp.h>` /
+// `<linux/in.h>`. Used by both handlers.rs and the dispatcher.
+
+pub const SOL_SOCKET: u32 = 1;
+pub const IPPROTO_IP: u32 = 0;
+pub const IPPROTO_ICMP: u32 = 1;
+pub const IPPROTO_TCP: u32 = 6;
+pub const IPPROTO_UDP: u32 = 17;
+pub const IPPROTO_RAW: u32 = 255;
+
+pub const SO_REUSEADDR: u32 = 2;
+pub const SO_TYPE: u32 = 3;
+pub const SO_ERROR: u32 = 4;
+pub const SO_BROADCAST: u32 = 6;
+pub const SO_SNDBUF: u32 = 7;
+pub const SO_RCVBUF: u32 = 8;
+pub const SO_KEEPALIVE: u32 = 9;
+pub const SO_LINGER: u32 = 13;
+pub const SO_REUSEPORT: u32 = 15;
+pub const SO_BINDTODEVICE: u32 = 25;
+pub const SO_PROTOCOL: u32 = 38;
+pub const SO_DOMAIN: u32 = 39;
+
+pub const TCP_NODELAY: u32 = 1;
+pub const TCP_MAXSEG: u32 = 2;
+pub const TCP_CORK: u32 = 3;
+pub const TCP_KEEPIDLE: u32 = 4;
+pub const TCP_KEEPINTVL: u32 = 5;
+pub const TCP_KEEPCNT: u32 = 6;
+pub const TCP_QUICKACK: u32 = 12;
+pub const TCP_CONGESTION: u32 = 13;
+pub const TCP_USER_TIMEOUT: u32 = 18;
+
+pub const IP_TOS: u32 = 1;
+pub const IP_TTL: u32 = 2;
+pub const IP_PKTINFO: u32 = 8;
+pub const IP_RECVTTL: u32 = 12;
+pub const IP_MTU: u32 = 14;
+pub const IP_MULTICAST_TTL: u32 = 33;
+
+/// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
+/// to flip per-fd nonblock state on a SocketFile.
+pub const O_NONBLOCK: u32 = 0o4000;
 
 // ── Address shape ───────────────────────────────────────────────
 
@@ -67,6 +117,15 @@ pub enum SocketOp<'a> {
     Send { buf: &'a [u8], flags: u32, addr: Option<SockAddr> },
     Recv { buf: &'a mut [u8], flags: u32 },
     Shutdown { how: u32 },
+    /// `getsockname` — return the locally-bound address.
+    GetSockName,
+    /// `getpeername` — return the connected peer's address.
+    GetPeerName,
+    /// `setsockopt(fd, level, optname, value)`.
+    SetSockOpt { level: u32, name: u32, value: &'a [u8] },
+    /// `getsockopt(fd, level, optname, &out_buf)`. The dispatcher
+    /// writes into `buf` and returns the byte count via `OptValue`.
+    GetSockOpt { level: u32, name: u32, buf: &'a mut [u8] },
 }
 
 #[derive(Debug)]
@@ -74,6 +133,12 @@ pub enum SocketOpResult {
     Ok(u64),
     Accepted { socket: Arc<SocketFile>, peer: Option<SockAddr> },
     Received { n: usize, peer: Option<SockAddr> },
+    /// Result of GetSockName / GetPeerName.
+    Addr(SockAddr),
+    /// Result of GetSockOpt — bytes written into the user-supplied
+    /// buffer (the dispatcher wrote them directly through the
+    /// `&mut [u8]` borrow on the op).
+    OptValue { n: usize },
     Err(SockError),
 }
 
@@ -89,6 +154,7 @@ pub enum SockError {
     AddrNotAvail,
     ConnectionRefused,
     Pipe,
+    InProgress,
 }
 
 impl SockError {
@@ -105,6 +171,7 @@ impl SockError {
             Self::AddrNotAvail => 99,     // EADDRNOTAVAIL
             Self::ConnectionRefused => 111, // ECONNREFUSED
             Self::Pipe => 32,             // EPIPE
+            Self::InProgress => 115,      // EINPROGRESS
         }
     }
 }
@@ -114,7 +181,85 @@ impl SockError {
 pub struct SocketFile {
     pub domain: u16,
     pub kind: u32,
+    /// IPPROTO_* recorded at socket() time; surfaced via SO_PROTOCOL.
+    pub protocol: u32,
     state: IrqSafeSpinLock<SocketState>,
+    /// Per-socket option storage. Setsockopt writes here; getsockopt
+    /// reads. Values that affect packet shape (TCP_NODELAY,
+    /// SO_BROADCAST) push down into the kernel TCP/UDP stack when
+    /// the socket actually wires up; the rest are passive storage.
+    options: IrqSafeSpinLock<SockOptions>,
+    /// O_NONBLOCK — flipped by sys_fcntl(F_SETFL). recv/send/accept/
+    /// connect short-circuit to WouldBlock instead of yielding.
+    nonblock: AtomicBool,
+    /// Pending async error. connect/send/recv set on failure;
+    /// getsockopt(SO_ERROR) consumes (returns + clears) it.
+    pending_error: IrqSafeSpinLock<Option<SockError>>,
+}
+
+/// Faithful per-socket storage for set/getsockopt values. Defaults
+/// match Linux's documented defaults. Fields that affect packet
+/// shape get pushed down to the kernel stack when wired; the rest
+/// are passive storage faithful to setsockopt round-trips.
+#[derive(Debug)]
+pub struct SockOptions {
+    pub reuseaddr: bool,
+    pub reuseport: bool,
+    pub keepalive: bool,
+    pub broadcast: bool,
+    pub linger_on: bool,
+    pub linger_sec: u32,
+    pub rcvbuf: u32,
+    pub sndbuf: u32,
+    pub bindtodevice: Option<String>,
+    // TCP
+    pub tcp_nodelay: bool,
+    pub tcp_keepidle: u32,
+    pub tcp_keepintvl: u32,
+    pub tcp_keepcnt: u32,
+    pub tcp_user_timeout: u32,
+    pub tcp_maxseg: u32,
+    pub tcp_cork: bool,
+    pub tcp_quickack: bool,
+    pub tcp_congestion: String,
+    // IP
+    pub ip_ttl: u32,
+    pub ip_tos: u32,
+    pub ip_pktinfo: bool,
+    pub ip_recvttl: bool,
+    pub ip_mtu: u32,
+    pub ip_multicast_ttl: u32,
+}
+
+impl Default for SockOptions {
+    fn default() -> Self {
+        Self {
+            reuseaddr: false,
+            reuseport: false,
+            keepalive: false,
+            broadcast: false,
+            linger_on: false,
+            linger_sec: 0,
+            rcvbuf: 212_992,
+            sndbuf: 212_992,
+            bindtodevice: None,
+            tcp_nodelay: false,
+            tcp_keepidle: 7200,
+            tcp_keepintvl: 75,
+            tcp_keepcnt: 9,
+            tcp_user_timeout: 0,
+            tcp_maxseg: 1460,
+            tcp_cork: false,
+            tcp_quickack: false,
+            tcp_congestion: String::from("cubic"),
+            ip_ttl: 64,
+            ip_tos: 0,
+            ip_pktinfo: false,
+            ip_recvttl: false,
+            ip_mtu: 1500,
+            ip_multicast_ttl: 1,
+        }
+    }
 }
 
 enum SocketState {
@@ -195,6 +340,23 @@ enum SocketState {
         peer_addr: [u8; 16],
         peer_port: u16,
     },
+    /// AF_INET SOCK_RAW. `protocol` is the IP protocol number
+    /// (IPPROTO_ICMP, IPPROTO_RAW, etc.). ICMP echo flows route
+    /// through the local inbox; the kernel raw IP path lands when
+    /// `narf_net::raw_sock` wires through `iface::install_rx_handler`.
+    InetRaw {
+        protocol: u32,
+        local_addr: u32,
+        peer: Option<(u32, u16)>,
+        inbox: VecDeque<DgramPacket>,
+    },
+    /// AF_BYPASS / AF_XDP-equivalent socket. Carries an Arc to a
+    /// kernel-bypass state struct so `dispatch_op` can route into
+    /// `crate::xdp_socket` for the four-ring setup, bind, and
+    /// frame-level send/recv.
+    Bypass {
+        state: Arc<crate::xdp_socket::XdpSocketState>,
+    },
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -210,11 +372,128 @@ pub struct DgramPacket {
 
 impl SocketFile {
     pub fn new(domain: u16, kind: u32) -> Arc<Self> {
+        Self::with_protocol(domain, kind, 0)
+    }
+
+    /// Create a SocketFile with an explicit IP protocol. Used by
+    /// `socket(domain, type, protocol)` so SOCK_RAW carries its
+    /// IPPROTO_*, and so SO_PROTOCOL round-trips. Also seeds the
+    /// state with InetRaw for AF_INET/SOCK_RAW.
+    pub fn with_protocol(domain: u16, kind: u32, protocol: u32) -> Arc<Self> {
+        let state = if domain == AF_INET && kind == SOCK_RAW {
+            SocketState::InetRaw {
+                protocol,
+                local_addr: 0,
+                peer: None,
+                inbox: VecDeque::new(),
+            }
+        } else if domain == AF_BYPASS && kind == SOCK_RAW {
+            // AF_BYPASS / AF_XDP-equivalent. Kernel-bypass state is
+            // built lazily on setsockopt(XDP_UMEM_REG); here we just
+            // stamp a fresh per-socket state record.
+            SocketState::Bypass {
+                state: Arc::new(crate::xdp_socket::XdpSocketState::new()),
+            }
+        } else {
+            SocketState::Fresh
+        };
         Arc::new(Self {
             domain,
             kind,
-            state: IrqSafeSpinLock::new(SocketState::Fresh),
+            protocol,
+            state: IrqSafeSpinLock::new(state),
+            options: IrqSafeSpinLock::new(SockOptions::default()),
+            nonblock: AtomicBool::new(false),
+            pending_error: IrqSafeSpinLock::new(None),
         })
+    }
+
+    /// Toggle the O_NONBLOCK flag (fcntl F_SETFL path).
+    pub fn set_nonblock(&self, on: bool) {
+        self.nonblock.store(on, Ordering::Release);
+    }
+
+    pub fn is_nonblock(&self) -> bool {
+        self.nonblock.load(Ordering::Acquire)
+    }
+
+    /// Drain the pending async error. SO_ERROR consumes-and-clears.
+    pub fn take_pending_error(&self) -> Option<SockError> {
+        self.pending_error.lock().take()
+    }
+
+    /// Record an async error so a subsequent getsockopt(SO_ERROR)
+    /// can report it. Used by connect/send failure paths.
+    pub fn set_pending_error(&self, e: SockError) {
+        *self.pending_error.lock() = Some(e);
+    }
+
+    /// Encode the socket's locally-bound address (if any). Honors
+    /// the same shape as `copy_user_addr`'s input.
+    pub fn local_addr(&self) -> Option<SockAddr> {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::InetListener { addr, port, .. } => {
+                Some(make_sockaddr_in(*addr, *port))
+            }
+            SocketState::InetConnected { peer_addr, peer_port, .. } => {
+                let _ = (peer_addr, peer_port);
+                Some(make_sockaddr_in(0, 0))
+            }
+            SocketState::InetWired { peer_addr, peer_port, .. } => {
+                let _ = (peer_addr, peer_port);
+                Some(make_sockaddr_in(0, 0))
+            }
+            SocketState::InetDgram { local_addr, local_port, .. } => {
+                Some(make_sockaddr_in(*local_addr, *local_port))
+            }
+            SocketState::InetRaw { local_addr, .. } => {
+                Some(make_sockaddr_in(*local_addr, 0))
+            }
+            SocketState::UnixListener { path, .. } => Some(SockAddr {
+                family: AF_UNIX,
+                body: path.as_bytes().to_vec(),
+            }),
+            SocketState::UnixDgram { path: Some(p), .. } => Some(SockAddr {
+                family: AF_UNIX,
+                body: p.as_bytes().to_vec(),
+            }),
+            SocketState::Inet6Listener { addr, port, .. } => {
+                Some(make_sockaddr_in6(*addr, *port))
+            }
+            SocketState::Inet6Connected { peer_addr, peer_port, .. } => {
+                let _ = (peer_addr, peer_port);
+                Some(make_sockaddr_in6([0u8; 16], 0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Encode the socket's connected peer address (if any).
+    pub fn peer_addr(&self) -> Option<SockAddr> {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::InetConnected { peer_addr, peer_port, .. } => {
+                Some(make_sockaddr_in(*peer_addr, *peer_port))
+            }
+            SocketState::InetWired { peer_addr, peer_port, .. } => {
+                Some(make_sockaddr_in(*peer_addr, *peer_port))
+            }
+            SocketState::InetDgram { peer: Some((a, p)), .. } => {
+                Some(make_sockaddr_in(*a, *p))
+            }
+            SocketState::InetRaw { peer: Some((a, p)), .. } => {
+                Some(make_sockaddr_in(*a, *p))
+            }
+            SocketState::UnixDgram { peer: Some(p), .. } => Some(SockAddr {
+                family: AF_UNIX,
+                body: p.as_bytes().to_vec(),
+            }),
+            SocketState::Inet6Connected { peer_addr, peer_port, .. } => {
+                Some(make_sockaddr_in6(*peer_addr, *peer_port))
+            }
+            _ => None,
+        }
     }
 
     /// Tear down listener / dgram-bound registry entries owned by
@@ -297,6 +576,45 @@ impl core::fmt::Debug for SocketFile {
     }
 }
 
+/// Build a `SockAddr` matching the wire body shape (`copy_user_addr`
+/// in handlers.rs): family u16 + body[port_be, ip_be...]. `addr`
+/// and `port` are taken in host byte order; the body is encoded BE.
+pub fn make_sockaddr_in(addr: u32, port: u16) -> SockAddr {
+    let mut body = Vec::with_capacity(6);
+    body.extend_from_slice(&port.to_be_bytes());
+    body.extend_from_slice(&addr.to_be_bytes());
+    SockAddr {
+        family: AF_INET,
+        body,
+    }
+}
+
+/// Build an IPv6 sockaddr body.
+pub fn make_sockaddr_in6(addr: [u8; 16], port: u16) -> SockAddr {
+    let mut body = Vec::with_capacity(2 + 4 + 16);
+    body.extend_from_slice(&port.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes()); // flowinfo
+    body.extend_from_slice(&addr);
+    SockAddr {
+        family: AF_INET6,
+        body,
+    }
+}
+
+/// Parse a `sockaddr_in`-shaped body into (ip, port) in host byte
+/// order. Returns `None` if the family isn't AF_INET or the body
+/// is too short.
+pub fn parse_sockaddr_in(addr: &SockAddr) -> Option<(u32, u16)> {
+    if addr.family != AF_INET || addr.body.len() < 6 {
+        return None;
+    }
+    let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
+    let ip = u32::from_be_bytes([
+        addr.body[2], addr.body[3], addr.body[4], addr.body[5],
+    ]);
+    Some((ip, port))
+}
+
 impl FileOps for SocketFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
@@ -376,6 +694,19 @@ impl FileOps for SocketFile {
                 // stack exposes a per-TCB readability accessor.
                 narf_filesystem::POLL_OUT
             }
+            SocketState::InetRaw { inbox, .. } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !inbox.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            SocketState::Bypass { .. } => {
+                // Kernel-bypass path: readiness is managed by the XDP
+                // layer directly; report both directions so callers can
+                // always proceed and let the XDP ring buffer throttle.
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
+            }
         }
     }
 }
@@ -385,14 +716,411 @@ impl SocketFile {
     /// shape; the per-family branch executes it. POSIX syscall
     /// shims and ring opcodes both call this.
     pub fn dispatch_op(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        // Cross-family ops handled here directly: getsockname /
+        // getpeername / set/getsockopt operate on storage that's
+        // common across all family backends.
+        match op {
+            SocketOp::GetSockName => {
+                return match self.local_addr() {
+                    Some(a) => SocketOpResult::Addr(a),
+                    None => SocketOpResult::Err(SockError::NotConnected),
+                };
+            }
+            SocketOp::GetPeerName => {
+                return match self.peer_addr() {
+                    Some(a) => SocketOpResult::Addr(a),
+                    None => SocketOpResult::Err(SockError::NotConnected),
+                };
+            }
+            SocketOp::SetSockOpt { level, name, value } => {
+                return self.handle_setsockopt(level, name, value);
+            }
+            SocketOp::GetSockOpt { level, name, buf } => {
+                return self.handle_getsockopt(level, name, buf);
+            }
+            _ => {}
+        }
         match (self.domain, self.kind) {
             (AF_UNIX, SOCK_STREAM) => self.dispatch_unix_stream(op),
             (AF_INET, SOCK_STREAM) => self.dispatch_inet_stream(op),
             (AF_INET, SOCK_DGRAM) => self.dispatch_inet_dgram(op),
+            (AF_INET, SOCK_RAW) => self.dispatch_inet_raw(op),
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
+            (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
+    }
+
+    /// AF_BYPASS / AF_XDP-equivalent dispatcher. Routes the small
+    /// BSD-shaped surface (bind / recv / shutdown) into
+    /// `crate::xdp_socket`; the bulk of the API is exposed via
+    /// `setsockopt(SOL_XDP, …)` which `handle_setsockopt` routes.
+    fn dispatch_bypass(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        let state_arc = {
+            let g = self.state.lock();
+            match &*g {
+                SocketState::Bypass { state } => state.clone(),
+                _ => return SocketOpResult::Err(SockError::InvalidArg),
+            }
+        };
+        match op {
+            SocketOp::Bind { addr } => {
+                if addr.family != AF_BYPASS {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let parsed = match crate::xdp_socket::parse_sockaddr_xdp(&addr.body) {
+                    Some(p) => p,
+                    None => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                match crate::xdp_socket::handle_bind(&state_arc, &parsed) {
+                    Ok(()) => SocketOpResult::Ok(0),
+                    Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Recv { buf, flags: _ } => {
+                match crate::xdp_socket::try_recv(&state_arc) {
+                    Ok(Some((_slot, bytes))) => {
+                        let n = core::cmp::min(buf.len(), bytes.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        SocketOpResult::Received { n, peer: None }
+                    }
+                    Ok(None) => SocketOpResult::Err(SockError::WouldBlock),
+                    Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => {
+                crate::xdp_socket::close(&state_arc);
+                SocketOpResult::Ok(0)
+            }
+            // Listen/accept/connect/send via BSD shape intentionally
+            // don't apply to AF_BYPASS.
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// `setsockopt` dispatcher. `value` is the in-kernel
+    /// representation: 4-byte native-endian int for integer
+    /// options, raw bytes for string options.
+    fn handle_setsockopt(
+        &self,
+        level: u32,
+        name: u32,
+        value: &[u8],
+    ) -> SocketOpResult {
+        let read_u32 = |slot: &[u8]| -> Result<u32, SockError> {
+            if slot.len() < 4 {
+                return Err(SockError::InvalidArg);
+            }
+            Ok(u32::from_ne_bytes([slot[0], slot[1], slot[2], slot[3]]))
+        };
+        let mut opts = self.options.lock();
+        match (level, name) {
+            (SOL_SOCKET, SO_REUSEADDR) => match read_u32(value) {
+                Ok(v) => { opts.reuseaddr = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (SOL_SOCKET, SO_REUSEPORT) => match read_u32(value) {
+                Ok(v) => { opts.reuseport = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (SOL_SOCKET, SO_KEEPALIVE) => match read_u32(value) {
+                Ok(v) => { opts.keepalive = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (SOL_SOCKET, SO_BROADCAST) => match read_u32(value) {
+                Ok(v) => { opts.broadcast = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (SOL_SOCKET, SO_LINGER) => {
+                if value.len() < 8 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let onoff = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                let linger = u32::from_ne_bytes([value[4], value[5], value[6], value[7]]);
+                opts.linger_on = onoff != 0;
+                opts.linger_sec = linger;
+                SocketOpResult::Ok(0)
+            }
+            (SOL_SOCKET, SO_RCVBUF) => match read_u32(value) {
+                Ok(v) => { opts.rcvbuf = v.max(2_048); SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (SOL_SOCKET, SO_SNDBUF) => match read_u32(value) {
+                Ok(v) => { opts.sndbuf = v.max(2_048); SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (SOL_SOCKET, SO_BINDTODEVICE) => match core::str::from_utf8(value) {
+                Ok(s) => {
+                    let n = String::from(s.trim_end_matches('\0'));
+                    opts.bindtodevice = if n.is_empty() { None } else { Some(n) };
+                    SocketOpResult::Ok(0)
+                }
+                Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+            },
+            (SOL_SOCKET, SO_TYPE) | (SOL_SOCKET, SO_DOMAIN)
+            | (SOL_SOCKET, SO_PROTOCOL) | (SOL_SOCKET, SO_ERROR) => {
+                SocketOpResult::Err(SockError::InvalidArg)
+            }
+            (IPPROTO_TCP, TCP_NODELAY) => match read_u32(value) {
+                Ok(v) => { opts.tcp_nodelay = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_KEEPIDLE) => match read_u32(value) {
+                Ok(v) => { opts.tcp_keepidle = v; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_KEEPINTVL) => match read_u32(value) {
+                Ok(v) => { opts.tcp_keepintvl = v; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_KEEPCNT) => match read_u32(value) {
+                Ok(v) => { opts.tcp_keepcnt = v; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_USER_TIMEOUT) => match read_u32(value) {
+                Ok(v) => { opts.tcp_user_timeout = v; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_MAXSEG) => match read_u32(value) {
+                Ok(v) => {
+                    if v < 88 || v > 65_535 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    opts.tcp_maxseg = v;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_CORK) => match read_u32(value) {
+                Ok(v) => { opts.tcp_cork = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_QUICKACK) => match read_u32(value) {
+                Ok(v) => { opts.tcp_quickack = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_TCP, TCP_CONGESTION) => match core::str::from_utf8(value) {
+                Ok(s) => {
+                    let n = s.trim_end_matches('\0');
+                    match n {
+                        "reno" | "cubic" | "bbr" | "vegas" | "westwood" => {
+                            opts.tcp_congestion = String::from(n);
+                            SocketOpResult::Ok(0)
+                        }
+                        _ => SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                }
+                Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+            },
+            (IPPROTO_IP, IP_TTL) => match read_u32(value) {
+                Ok(v) => {
+                    if v == 0 || v > 255 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    opts.ip_ttl = v;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_IP, IP_TOS) => match read_u32(value) {
+                Ok(v) => {
+                    if v > 255 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    opts.ip_tos = v;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_IP, IP_PKTINFO) => match read_u32(value) {
+                Ok(v) => { opts.ip_pktinfo = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_IP, IP_RECVTTL) => match read_u32(value) {
+                Ok(v) => { opts.ip_recvttl = v != 0; SocketOpResult::Ok(0) }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            (IPPROTO_IP, IP_MULTICAST_TTL) => match read_u32(value) {
+                Ok(v) => {
+                    if v > 255 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    opts.ip_multicast_ttl = v;
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// `getsockopt` dispatcher. Writes the value into `buf` and
+    /// returns the byte count via `OptValue`. Integers are
+    /// native-endian 4 bytes per Linux ABI.
+    fn handle_getsockopt(
+        &self,
+        level: u32,
+        name: u32,
+        buf: &mut [u8],
+    ) -> SocketOpResult {
+        let write_u32 = |buf: &mut [u8], v: u32| -> SocketOpResult {
+            if buf.len() < 4 {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            buf[..4].copy_from_slice(&v.to_ne_bytes());
+            SocketOpResult::OptValue { n: 4 }
+        };
+        let write_bool = |buf: &mut [u8], v: bool| write_u32(buf, v as u32);
+        if level == SOL_SOCKET && name == SO_ERROR {
+            let e = self.take_pending_error();
+            let val = e.map(|e| e.errno() as u32).unwrap_or(0);
+            return write_u32(buf, val);
+        }
+        let opts = self.options.lock();
+        match (level, name) {
+            (SOL_SOCKET, SO_REUSEADDR) => write_bool(buf, opts.reuseaddr),
+            (SOL_SOCKET, SO_REUSEPORT) => write_bool(buf, opts.reuseport),
+            (SOL_SOCKET, SO_KEEPALIVE) => write_bool(buf, opts.keepalive),
+            (SOL_SOCKET, SO_BROADCAST) => write_bool(buf, opts.broadcast),
+            (SOL_SOCKET, SO_LINGER) => {
+                if buf.len() < 8 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                buf[..4].copy_from_slice(&(opts.linger_on as u32).to_ne_bytes());
+                buf[4..8].copy_from_slice(&opts.linger_sec.to_ne_bytes());
+                SocketOpResult::OptValue { n: 8 }
+            }
+            (SOL_SOCKET, SO_RCVBUF) => write_u32(buf, opts.rcvbuf),
+            (SOL_SOCKET, SO_SNDBUF) => write_u32(buf, opts.sndbuf),
+            (SOL_SOCKET, SO_BINDTODEVICE) => {
+                let s = opts.bindtodevice.as_deref().unwrap_or("");
+                let bytes = s.as_bytes();
+                let n = core::cmp::min(buf.len(), bytes.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                SocketOpResult::OptValue { n }
+            }
+            (SOL_SOCKET, SO_TYPE) => write_u32(buf, self.kind),
+            (SOL_SOCKET, SO_DOMAIN) => write_u32(buf, self.domain as u32),
+            (SOL_SOCKET, SO_PROTOCOL) => write_u32(buf, self.protocol),
+            (IPPROTO_TCP, TCP_NODELAY) => write_bool(buf, opts.tcp_nodelay),
+            (IPPROTO_TCP, TCP_KEEPIDLE) => write_u32(buf, opts.tcp_keepidle),
+            (IPPROTO_TCP, TCP_KEEPINTVL) => write_u32(buf, opts.tcp_keepintvl),
+            (IPPROTO_TCP, TCP_KEEPCNT) => write_u32(buf, opts.tcp_keepcnt),
+            (IPPROTO_TCP, TCP_USER_TIMEOUT) => write_u32(buf, opts.tcp_user_timeout),
+            (IPPROTO_TCP, TCP_MAXSEG) => write_u32(buf, opts.tcp_maxseg),
+            (IPPROTO_TCP, TCP_CORK) => write_bool(buf, opts.tcp_cork),
+            (IPPROTO_TCP, TCP_QUICKACK) => write_bool(buf, opts.tcp_quickack),
+            (IPPROTO_TCP, TCP_CONGESTION) => {
+                let bytes = opts.tcp_congestion.as_bytes();
+                let n = core::cmp::min(buf.len(), bytes.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                SocketOpResult::OptValue { n }
+            }
+            (IPPROTO_IP, IP_TTL) => write_u32(buf, opts.ip_ttl),
+            (IPPROTO_IP, IP_TOS) => write_u32(buf, opts.ip_tos),
+            (IPPROTO_IP, IP_PKTINFO) => write_bool(buf, opts.ip_pktinfo),
+            (IPPROTO_IP, IP_RECVTTL) => write_bool(buf, opts.ip_recvttl),
+            (IPPROTO_IP, IP_MTU) => write_u32(buf, opts.ip_mtu),
+            (IPPROTO_IP, IP_MULTICAST_TTL) => write_u32(buf, opts.ip_multicast_ttl),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// AF_INET SOCK_RAW dispatcher. Stage-1: bind/connect records
+    /// the local/remote; send for IPPROTO_ICMP loops bytes back
+    /// into the local inbox so a paired `recvfrom` returns them.
+    /// The kernel raw IP path lands when `narf_net::raw_sock`
+    /// wires into the iface RX dispatcher.
+    fn dispatch_inet_raw(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => {
+                let (ip, _port) = match parse_sockaddr_in(&addr) {
+                    Some(v) => v,
+                    None => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let mut state = self.state.lock();
+                if let SocketState::InetRaw { local_addr, .. } = &mut *state {
+                    *local_addr = ip;
+                    SocketOpResult::Ok(0)
+                } else {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
+            }
+            SocketOp::Connect { addr } => {
+                let (ip, port) = match parse_sockaddr_in(&addr) {
+                    Some(v) => v,
+                    None => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let mut state = self.state.lock();
+                if let SocketState::InetRaw { peer, .. } = &mut *state {
+                    *peer = Some((ip, port));
+                    SocketOpResult::Ok(0)
+                } else {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
+            }
+            SocketOp::Send { buf, flags: _, addr } => {
+                let state = self.state.lock();
+                let (protocol, dest) = match &*state {
+                    SocketState::InetRaw { protocol, peer, .. } => {
+                        let dest = if let Some(a) = addr {
+                            match parse_sockaddr_in(&a) {
+                                Some(v) => v,
+                                None => return SocketOpResult::Err(SockError::InvalidArg),
+                            }
+                        } else if let Some(d) = peer {
+                            *d
+                        } else {
+                            return SocketOpResult::Err(SockError::InvalidArg);
+                        };
+                        (*protocol, dest)
+                    }
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                drop(state);
+                if protocol == IPPROTO_ICMP {
+                    return self.deliver_icmp_loopback(buf, dest);
+                }
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            SocketOp::Recv { buf, flags: _ } => {
+                let mut state = self.state.lock();
+                if let SocketState::InetRaw { inbox, .. } = &mut *state {
+                    if let Some(pkt) = inbox.pop_front() {
+                        let n = core::cmp::min(buf.len(), pkt.payload.len());
+                        buf[..n].copy_from_slice(&pkt.payload[..n]);
+                        let peer = make_sockaddr_in(pkt.peer_addr, pkt.peer_port);
+                        return SocketOpResult::Received { n, peer: Some(peer) };
+                    }
+                    return SocketOpResult::Err(SockError::WouldBlock);
+                }
+                SocketOpResult::Err(SockError::NotConnected)
+            }
+            SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// Loopback ICMP echo: pushes the payload to our own inbox so
+    /// a paired `recvfrom` returns the same bytes. Minimal moral
+    /// equivalent of the in-kernel ICMP path.
+    fn deliver_icmp_loopback(
+        &self,
+        buf: &[u8],
+        dest: (u32, u16),
+    ) -> SocketOpResult {
+        let mut state = self.state.lock();
+        if let SocketState::InetRaw { inbox, .. } = &mut *state {
+            inbox.push_back(DgramPacket {
+                peer_unix: None,
+                peer_addr: dest.0,
+                peer_port: dest.1,
+                payload: buf.to_vec(),
+            });
+            return SocketOpResult::Ok(buf.len() as u64);
+        }
+        SocketOpResult::Err(SockError::InvalidArg)
     }
 
     fn dispatch_unix_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
@@ -542,6 +1270,7 @@ impl SocketFile {
                     _ => SocketOpResult::Err(SockError::NotConnected),
                 }
             }
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
@@ -718,9 +1447,19 @@ impl SocketFile {
                         if how == SHUT_RD || how == SHUT_RDWR { rx.close(); }
                         SocketOpResult::Ok(0)
                     }
+                    SocketState::InetWired { tcb_id, .. } => {
+                        // The kernel TCP stack doesn't expose a
+                        // half-close path yet. SHUT_RDWR sends a
+                        // FIN via tcp_stack::close.
+                        if how == SHUT_RDWR {
+                            let _ = narf_net::tcp_stack::close(*tcb_id);
+                        }
+                        SocketOpResult::Ok(0)
+                    }
                     _ => SocketOpResult::Err(SockError::NotConnected),
                 }
             }
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
@@ -816,6 +1555,12 @@ impl SocketFile {
                     _ => return SocketOpResult::Err(SockError::NotConnected),
                 };
                 drop(state);
+                // Linux net/ipv4/udp.c udp_sendmsg(): broadcast sends
+                // require SO_BROADCAST. Without it, sendto to
+                // 255.255.255.255 returns EACCES. We model the same.
+                if dest.0 == 0xFFFF_FFFF && !self.options.lock().broadcast {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
                 // Find the destination socket. Loopback + INADDR_ANY both match.
                 let dest_sock = {
                     let bound = INET_DGRAM_BOUND.lock();
@@ -849,8 +1594,18 @@ impl SocketFile {
             }
             SocketOp::Recv { buf, flags: _ } => {
                 let mut state = self.state.lock();
-                if let SocketState::InetDgram { inbox, .. } = &mut *state {
-                    if let Some(pkt) = inbox.pop_front() {
+                if let SocketState::InetDgram { inbox, peer, .. } = &mut *state {
+                    let connected_peer = *peer;
+                    // Connected-mode filter: when connect() was
+                    // called, drop any packets from a different
+                    // peer (Linux returns ECONNREFUSED on these in
+                    // a separate code path; we silently skip).
+                    while let Some(pkt) = inbox.pop_front() {
+                        if let Some((paddr, pport)) = connected_peer {
+                            if (paddr, pport) != (pkt.peer_addr, pkt.peer_port) {
+                                continue;
+                            }
+                        }
                         let n = core::cmp::min(buf.len(), pkt.payload.len());
                         buf[..n].copy_from_slice(&pkt.payload[..n]);
                         let mut peer_body = alloc::vec::Vec::with_capacity(6);
@@ -872,6 +1627,7 @@ impl SocketFile {
                 SocketOpResult::Err(SockError::NotSupported)
             }
             SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
@@ -986,6 +1742,7 @@ impl SocketFile {
                 SocketOpResult::Err(SockError::NotSupported)
             }
             SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
@@ -1125,6 +1882,7 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::NotConnected)
                 }
             }
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
