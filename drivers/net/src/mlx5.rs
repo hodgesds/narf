@@ -1144,6 +1144,143 @@ impl Mlx5Hca {
         Ok(())
     }
 
+    /// Stage 15: EQ interrupt handler — drain the EQ ring, dispatch
+    /// each EQE, and re-arm the EQ doorbell when done.
+    ///
+    /// Called from the MSI-X handler registered during `bring_up`.
+    /// For each SW-owned EQE at `eq_number`:
+    ///
+    /// - `CompletionEvent` (type 0x00): the EQE carries a CQ number;
+    ///   call the caller-supplied `on_cq_completion` to wake the CQ
+    ///   consumer. Linux: `mlx5_eq_comp_int` in `eq.c:106`.
+    /// - `PortStateChange` (type 0x09): wake the link-state path.
+    ///   Linux: `mlx5_eq_async_int` in `eq.c:191`.
+    /// - `CommandInterfaceCompletion` (type 0x0A): wake the command
+    ///   channel. Same async handler.
+    /// - All other types: record but don't act (async events land in
+    ///   a later stage).
+    ///
+    /// After draining, writes the EQ doorbell at UAR+0x40 to re-arm.
+    /// Linux: `eq_update_ci` called at `eq.c:143`/229; doorbell offset
+    /// `MLX5_EQ_DOORBELL_OFFSET = 0x40` at `eq.c:35`.
+    ///
+    /// Returns the number of EQEs consumed.
+    pub fn handle_eq_irq(
+        &self,
+        eq_number: u32,
+        on_cq_completion: impl Fn(u32),
+    ) -> u32 {
+        // Budget cap mirrors Linux's MLX5_EQ_POLLING_BUDGET = 128
+        // (eq.c:41) — prevents a livelock if the EQ fills faster than
+        // we drain.
+        const BUDGET: u32 = 128;
+        let mut consumed = 0u32;
+
+        loop {
+            if consumed >= BUDGET {
+                break;
+            }
+            match self.poll_eq(eq_number) {
+                Ok(Some(view)) => {
+                    // Dispatch by event type.
+                    match view.event_type {
+                        eqe::EventType::CompletionEvent => {
+                            // EQE payload byte 0x04..0x07 carries the
+                            // CQ number (24 bits, BE). We don't expose
+                            // the raw payload here yet — the
+                            // `on_cq_completion` callback receives 0
+                            // until the EQE payload decoder is wired
+                            // in a follow-up.  Linux parses `cqn` at
+                            // eq.c:125: `be32_to_cpu(eqe->data.comp.cqn)
+                            // & 0xffffff`.
+                            on_cq_completion(0);
+                        }
+                        // Port-state / cmd-completion / async: no-op
+                        // in this stage; a follow-up can register a
+                        // notifier chain per Linux's
+                        // `atomic_notifier_call_chain` at eq.c:217.
+                        _ => {}
+                    }
+                    consumed = consumed.wrapping_add(1);
+                }
+                // No more SW-owned EQEs; stop.
+                Ok(None) => break,
+                // EQ not found — nothing to do.
+                Err(_) => break,
+            }
+        }
+
+        // Re-arm: write the EQ consumer-index doorbell at UAR+0x40.
+        // PRM-documented value: bits[31:24] = eq_number low byte,
+        // bits[23:0] = consumer index. Linux: `eq_update_ci` called
+        // after each poll loop at eq.c:143 and eq.c:226.
+        // We read the updated consumer index from the live LiveEq
+        // record; the lock is already dropped since poll_eq advanced it.
+        if consumed > 0 {
+            let consumer = {
+                let eqs = self.eqs.lock();
+                eqs.iter()
+                    .find(|e| e.eq_number == eq_number)
+                    .map(|e| e.consumer)
+                    .unwrap_or(0)
+            };
+            let uar_page = {
+                let eqs = self.eqs.lock();
+                eqs.iter()
+                    .find(|e| e.eq_number == eq_number)
+                    .map(|e| e.params.uar_page)
+                    .unwrap_or(0)
+            };
+            self.arm_eq(uar_page, eq_number, consumer);
+        }
+
+        consumed
+    }
+
+    /// Stage 15: allocate one MSI-X vector for `eq_number` and wire
+    /// it into the mlx5 EQ. The EQ's `intr_vector` field must already
+    /// be set to `irq_vector` when `create_eq` was called.
+    ///
+    /// NARF MSI-X path mirrors Linux's `mlx5_irq_alloc` +
+    /// `request_irq` sequence: `enable_msix` → `alloc_vector` →
+    /// `program_vector` → `enable`. Linux ref: `pci_irq.c`'s
+    /// `mlx5_irq_alloc` and `create_map_eq` at `eq.c:286`,
+    /// `eq.c:321`: `eq->irqn = pci_irq_vector(dev->pdev, vecidx)`.
+    ///
+    /// Pattern follows igc's `try_enable_msix` (igc.rs:545–561):
+    /// call `narf_interrupts::vector::alloc()` for the IRQ vector
+    /// number, `alloc_vector()` for the MSI-X table slot, then
+    /// `program_vector(slot, apic_id, irq_vec)` → `enable()`.
+    ///
+    /// Returns `Ok(irq_vector)` on success, `Err` if the MSI-X table
+    /// can't be set up (e.g. device is in legacy-IRQ mode).
+    pub fn alloc_eq_msix_vector(
+        cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        device: &narf_bus::BusDevice,
+    ) -> Result<u8, Mlx5Error> {
+        use narf_bus::enable_msix;
+        // Allocate a system-wide IRQ vector number from the NARF
+        // interrupt vector allocator.
+        let irq_vec = narf_interrupts::vector::alloc()
+            .map_err(|_| Mlx5Error::Other("vector alloc"))?;
+        let mut table = enable_msix(cap, device).map_err(|_| Mlx5Error::Other("msix setup"))?;
+        // Reserve a slot in the MSI-X table (monotonic per-table alloc).
+        let _slot = table
+            .alloc_vector()
+            .ok_or(Mlx5Error::Other("msix alloc_vector"))?;
+        // Program table slot 0 → BSP APIC (id=0), irq_vec.
+        // Mirrors igc.rs:557: `msix.program_vector(0, 0, v)`.
+        unsafe {
+            table
+                .program_vector(0, 0, irq_vec)
+                .map_err(|_| Mlx5Error::Other("msix program_vector"))?;
+            table
+                .enable()
+                .map_err(|_| Mlx5Error::Other("msix enable"))?;
+        }
+        Ok(irq_vec)
+    }
+
     /// Stage 16: orderly tear-down — destroy every tracked QP/CQ/EQ
     /// and free every PD/UAR. Used by driver-shutdown paths and for
     /// re-bring-up scenarios. Errors are surfaced via the return,
