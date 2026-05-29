@@ -62,6 +62,7 @@ pub mod fw;
 pub mod mac;
 pub mod pci;
 pub mod phy;
+pub mod txrx;
 
 pub use mac::{ChipId, ChipGeneration, MacError};
 pub use pci::{name_for, probe, register_pci_driver, Rtw89Device};

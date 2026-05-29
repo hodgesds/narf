@@ -16,6 +16,14 @@ use super::fw::{expected_blob_name, FwError};
 use super::mac::*;
 use super::pci::{name_for, register_pci_driver};
 use super::phy::PhyError;
+use super::txrx::{
+    decode_rxd, encode_h2c_header, encode_rxd_for_test, encode_txd, RxdInfo, TxwdInfo,
+    H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL, H2C_HEADER_LEN, H2C_HDR_REC_ACK,
+    TXWD_BODY0_CHANNEL_MASK, TXWD_BODY0_WD_INFO_EN, TXWD_BODY2_MACID_MASK,
+    TXWD_BODY2_QSEL_MASK, TXWD_BODY2_TXPKT_SIZE_MASK, TXWD_BODY_SIZE,
+    AX_RXD_CRC32_ERR, AX_RXD_RPKT_TYPE_WIFI, RXD_SHORT_SIZE,
+    QSEL_B0_BE,
+};
 use super::*;
 
 // ── PCI match table ────────────────────────────────────────────────
@@ -274,6 +282,120 @@ fn smoke_rtw89_error_types_debug() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_error_types_debug);
+
+// ── Stage-3: TXWD / AX RXD / H2C header smokes ────────────────────
+
+fn smoke_rtw89_txwd_encode() -> TestResult {
+    // Build a TXWD body for a 1000-byte frame on ACH0 (channel=0),
+    // best-effort queue, mac_id=1. Mirrors the fields
+    // `rtw89_core_tx_build_txwd` fills at ~L300, v6.6.
+    let info = TxwdInfo {
+        channel: 0,          // RTW89_TXCH_ACH0
+        qsel: QSEL_B0_BE,
+        mac_id: 1,
+        pkt_size: 1000,
+    };
+    let mut buf = [0u8; TXWD_BODY_SIZE];
+    if encode_txd(&info, &mut buf).is_none() {
+        return TestResult::Fail("encode_txd returned None");
+    }
+    if buf.len() != 24 {
+        return TestResult::Fail("TXWD_BODY_SIZE not 24 bytes");
+    }
+    let dw0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    // WD_INFO_EN must be set.
+    if dw0 & TXWD_BODY0_WD_INFO_EN == 0 {
+        return TestResult::Fail("TXWD_BODY0_WD_INFO_EN not set");
+    }
+    // channel = 0 → CHANNEL_DMA bits should be zero.
+    if dw0 & TXWD_BODY0_CHANNEL_MASK != 0 {
+        return TestResult::Fail("channel field not zero for ACH0");
+    }
+    let dw2 = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    // mac_id must land in bits 30-24.
+    let mac_id_check = (dw2 & TXWD_BODY2_MACID_MASK) >> 24;
+    if mac_id_check != 1 {
+        return TestResult::Fail("mac_id not encoded correctly in dword2");
+    }
+    // pkt_size = 1000 must be in GENMASK(13,0).
+    if dw2 & TXWD_BODY2_TXPKT_SIZE_MASK != 1000 {
+        return TestResult::Fail("pkt_size not encoded correctly in dword2");
+    }
+    // qsel = QSEL_B0_BE = 0, verify the field is zero.
+    if dw2 & TXWD_BODY2_QSEL_MASK != 0 {
+        return TestResult::Fail("qsel field not zero for QSEL_B0_BE=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_txwd_encode);
+
+fn smoke_rtw89_rxd_decode_roundtrip() -> TestResult {
+    // Normal data frame, 512 bytes, no errors.
+    let original = RxdInfo {
+        pkt_len: 512,
+        pkt_type: AX_RXD_RPKT_TYPE_WIFI as u8,
+        crc32_err: false,
+        icv_err: false,
+    };
+    let bytes = encode_rxd_for_test(&original);
+    if bytes.len() != RXD_SHORT_SIZE {
+        return TestResult::Fail("encode_rxd_for_test size wrong");
+    }
+    let decoded = match decode_rxd(&bytes) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_rxd returned None"),
+    };
+    if decoded != original {
+        return TestResult::Fail("RXD round-trip mismatch");
+    }
+    // CRC32 error round-trip.
+    let bad = RxdInfo {
+        pkt_len: 64,
+        pkt_type: 0,
+        crc32_err: true,
+        icv_err: false,
+    };
+    let bad_bytes = encode_rxd_for_test(&bad);
+    let dec_bad = decode_rxd(&bad_bytes).unwrap();
+    if !dec_bad.crc32_err {
+        return TestResult::Fail("crc32_err not preserved through round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_rxd_decode_roundtrip);
+
+fn smoke_rtw89_h2c_header_encode() -> TestResult {
+    // Encode a LOG_CFG command (CAT=MAC, CLASS=FW_INFO, FUNC=0x0,
+    // seq=3, payload=16 bytes). Mirrors `rtw89_h2c_pkt_set_hdr` call
+    // shape from `fw.c:1564`.
+    let mut hdr = [0u8; H2C_HEADER_LEN];
+    if encode_h2c_header(H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL,
+                         3, 16, true, false, &mut hdr).is_none() {
+        return TestResult::Fail("encode_h2c_header returned None");
+    }
+    let dw0 = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    // CAT = 0x1 in bits 1-0.
+    if dw0 & 0x3 != H2C_CAT_MAC as u32 {
+        return TestResult::Fail("H2C CAT field wrong");
+    }
+    // SEQ = 3 in bits 31-24.
+    let seq_check = (dw0 >> 24) & 0xFF;
+    if seq_check != 3 {
+        return TestResult::Fail("H2C SEQ field wrong");
+    }
+    let dw1 = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    // total_len = 16 + 8 = 24.
+    let total_len = dw1 & 0x3FFF;
+    if total_len != 24 {
+        return TestResult::Fail("H2C total_len wrong (expected 24)");
+    }
+    // REC_ACK must be set.
+    if dw1 & H2C_HDR_REC_ACK == 0 {
+        return TestResult::Fail("H2C REC_ACK not set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_header_encode);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //
