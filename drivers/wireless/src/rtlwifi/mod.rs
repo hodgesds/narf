@@ -46,7 +46,10 @@ extern crate alloc;
 
 pub mod efuse;
 pub mod fw;
+pub mod h2c;
+pub mod mac;
 pub mod pci;
+pub mod power;
 pub mod regs;
 
 pub mod rtl8188ee;
