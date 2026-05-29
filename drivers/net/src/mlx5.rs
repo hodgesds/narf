@@ -1185,15 +1185,10 @@ impl Mlx5Hca {
                     // Dispatch by event type.
                     match view.event_type {
                         eqe::EventType::CompletionEvent => {
-                            // EQE payload byte 0x04..0x07 carries the
-                            // CQ number (24 bits, BE). We don't expose
-                            // the raw payload here yet — the
-                            // `on_cq_completion` callback receives 0
-                            // until the EQE payload decoder is wired
-                            // in a follow-up.  Linux parses `cqn` at
-                            // eq.c:125: `be32_to_cpu(eqe->data.comp.cqn)
-                            // & 0xffffff`.
-                            on_cq_completion(0);
+                            // CQN decoded from EQE byte 0x38 (BE u32,
+                            // low 24 bits). Linux eq.c:125:
+                            //   `be32_to_cpu(eqe->data.comp.cqn) & 0xffffff`
+                            on_cq_completion(view.cqn);
                         }
                         // Port-state / cmd-completion / async: no-op
                         // in this stage; a follow-up can register a
