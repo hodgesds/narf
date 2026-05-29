@@ -27,6 +27,9 @@ use narf_wireless::{
 };
 
 use super::efuse;
+use super::irq;
+use super::mac;
+use super::power;
 use super::regs::*;
 
 /// A bound rtlwifi PCIe device.  Holds BAR0 + MAC + device-ID.
@@ -113,6 +116,20 @@ impl core::fmt::Debug for RtlwifiDevice {
 pub enum ProbeError {
     Bar0MapFailed,
     Efuse(efuse::EfuseError),
+    PowerOn(power::PwrSeqError),
+    MacInit(mac::MacInitError),
+}
+
+impl From<power::PwrSeqError> for ProbeError {
+    fn from(e: power::PwrSeqError) -> Self {
+        ProbeError::PowerOn(e)
+    }
+}
+
+impl From<mac::MacInitError> for ProbeError {
+    fn from(e: mac::MacInitError) -> Self {
+        ProbeError::MacInit(e)
+    }
 }
 
 /// Single-device static slot.
@@ -171,13 +188,38 @@ pub fn probe(
     Ok(())
 }
 
-/// Map BAR0, read EFUSE MAC, build device object.
+/// Map BAR0, walk the chip-specific power-on flow, run the MAC-init
+/// sequence, read EFUSE MAC, unmask interrupts, build the device object.
+///
+/// This is the end-to-end bring-up path that takes the chip from
+/// "BAR0 just mapped" to "ready for FW download" — every step Linux
+/// runs between `rtl_pci_probe` (`rtlwifi/pci.c`) and the
+/// `_rtl<ver>_init_mac` return.  FW download itself is deferred to
+/// the wireless-runtime caller via [`crate::rtlwifi::h2c::download_fw`]
+/// once the FS layer has the blob in memory.
 ///
 /// # Safety
 /// Caller must own the device BARs exclusively.
 pub unsafe fn bring_up(device: &BusDevice) -> Result<RtlwifiDevice, ProbeError> {
     // SAFETY: caller-asserted.
     let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let did = device.id.device;
+
+    // Power-on (cardemu → active).  Optional — chips not in the table
+    // are tolerated for forward compat; the rest fall through to MAC
+    // init unchanged.
+    if power::power_on_table_for(did).is_some() {
+        // SAFETY: BAR0 mapped, no other thread holds the chip.
+        unsafe { power::power_on(&mmio_bar0, did) }?;
+    }
+
+    // MAC init (LLT, CR open, RCR/TCR seed, HISR clear).
+    // SAFETY: BAR0 mapped + chip powered on.
+    unsafe { mac::init_mac(&mmio_bar0, did) }?;
+
+    // Mask in the default interrupts (HIMR + HIMRE).
+    // SAFETY: same.
+    unsafe { irq::enable_interrupts(&mmio_bar0) };
 
     // SAFETY: BAR0 mapped and owned.
     let mac = unsafe { efuse::read_mac(&mmio_bar0) }.map_err(ProbeError::Efuse)?;

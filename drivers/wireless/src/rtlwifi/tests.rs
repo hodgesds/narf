@@ -731,3 +731,57 @@ fn smoke_rtlwifi_vht_capability() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_vht_capability);
+
+// ── 27. Per-chip name + power-on + fw resolution coverage ────────────────
+
+fn smoke_rtlwifi_per_chip_coverage_matrix() -> TestResult {
+    // For every chip in the family, every per-chip lookup must succeed.
+    // Encodes the per-chip "complete" matrix from the brief.
+    for &did in ALL_DEV_IDS {
+        // 1) Name resolves.
+        if name_for(did) == "rtlwifi" {
+            return TestResult::Fail("name_for: generic fallback for known chip");
+        }
+        // 2) Power-on table resolves.
+        if power_on_table_for(did).is_none() {
+            return TestResult::Fail("power_on_table_for: missing entry");
+        }
+        // 3) FW blob name resolves.
+        if fw_name_for(did).is_none() {
+            return TestResult::Fail("fw_name_for: missing entry");
+        }
+        // 4) TRX FIFO boundary is set.
+        if txpktbuf_bndy_for(did) == 0 {
+            return TestResult::Fail("txpktbuf_bndy_for: zero");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_per_chip_coverage_matrix);
+
+// ── 28. Per-chip BT-coex + VHT feature flag matrix ───────────────────────
+
+fn smoke_rtlwifi_per_chip_feature_flags() -> TestResult {
+    let cases: &[(u16, bool, bool)] = &[
+        // (did, has_bt, has_vht)
+        (RTL_DEV_8188EE, false, false),
+        (RTL_DEV_8192CE, false, false),
+        (RTL_DEV_8192CE_ALT, false, false),
+        (RTL_DEV_8192DE, false, false),
+        (RTL_DEV_8192EE, false, false),
+        (RTL_DEV_8723AE, true, false),
+        (RTL_DEV_8723BE, true, false),
+        (RTL_DEV_8821AE, true, true),
+        (RTL_DEV_8822BE, false, true),
+    ];
+    for &(did, want_bt, want_vht) in cases {
+        if has_bt(did) != want_bt {
+            return TestResult::Fail("has_bt classification mismatch for chip");
+        }
+        if has_vht(did) != want_vht {
+            return TestResult::Fail("has_vht classification mismatch for chip");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_per_chip_feature_flags);
