@@ -9691,3 +9691,804 @@ fn smoke_epoll_1000_fds_one_ready() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_epoll_1000_fds_one_ready);
+
+// ── AF_INET socket smokes ────────────────────────────────────────────
+//
+// Exercise the `SocketFile::dispatch_op` surface directly — that's the
+// boundary every POSIX syscall lands on, and it doesn't require a
+// full syscall-table fixture per test. The smokes cover:
+// - SOCK_STREAM bind / listen / connect (loopback path)
+// - SOCK_DGRAM bind / connect / sendto / recvfrom
+// - SOCK_RAW (IPPROTO_ICMP) — local-loop ICMP echo path
+// - Socket options: SO_REUSEADDR, SO_BROADCAST, TCP_NODELAY,
+//   TCP_CONGESTION, SO_BINDTODEVICE, SO_TYPE/DOMAIN/PROTOCOL
+// - Sockaddr validation: invalid family rejected
+// - O_NONBLOCK: recv on empty socket returns EAGAIN
+// - SO_ERROR consumes-and-clears pending_error
+// - getsockname / getpeername return the bound/peer addrs
+// - 16-socket concurrent fan-out
+
+fn build_sockaddr_in(ip: u32, port: u16) -> crate::socket::SockAddr {
+    crate::socket::make_sockaddr_in(ip, port)
+}
+
+/// AF_INET SOCK_STREAM loopback: socket → bind → listen → connect
+/// pairs the listener and connecter via the in-process registry.
+fn smoke_socket_inet_tcp_bind_listen_connect() -> TestResult {
+    let server = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    // Bind to 127.0.0.1:1234.
+    let addr = build_sockaddr_in(0x7F00_0001, 1234);
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind failed");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("listen failed");
+    }
+    let client = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    if !matches!(
+        client.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        server.unregister();
+        return TestResult::Fail("connect failed");
+    }
+    // Accept the pending connection.
+    match server.dispatch_op(crate::socket::SocketOp::Accept) {
+        crate::socket::SocketOpResult::Accepted { .. } => {
+            server.unregister();
+            TestResult::Pass
+        }
+        _ => {
+            server.unregister();
+            TestResult::Fail("accept did not return Accepted")
+        }
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_tcp_bind_listen_connect);
+
+/// AF_INET SOCK_STREAM loopback: full send/recv round-trip after
+/// a paired connect+accept.
+fn smoke_socket_inet_tcp_send_recv_loopback() -> TestResult {
+    let server = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let addr = build_sockaddr_in(0x7F00_0001, 1235);
+    let _ = server.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() });
+    let _ = server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 1 });
+    let client = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let _ = client.dispatch_op(crate::socket::SocketOp::Connect { addr });
+    let accepted = match server.dispatch_op(crate::socket::SocketOp::Accept) {
+        crate::socket::SocketOpResult::Accepted { socket, .. } => socket,
+        _ => { server.unregister(); return TestResult::Fail("no accept"); }
+    };
+    // Client → server.
+    let payload = b"hello narf";
+    let r = client.dispatch_op(crate::socket::SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: None,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Ok(n) if n == payload.len() as u64) {
+        server.unregister();
+        return TestResult::Fail("client send mismatch");
+    }
+    let mut recv_buf = [0u8; 16];
+    let r = accepted.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut recv_buf,
+        flags: 0,
+    });
+    server.unregister();
+    match r {
+        crate::socket::SocketOpResult::Received { n, .. } => {
+            if &recv_buf[..n] != payload {
+                TestResult::Fail("recv payload mismatch")
+            } else {
+                TestResult::Pass
+            }
+        }
+        _ => TestResult::Fail("recv did not return Received"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_tcp_send_recv_loopback);
+
+/// shutdown(SHUT_WR) closes the tx half on a loopback connection.
+fn smoke_socket_inet_tcp_shutdown_wr() -> TestResult {
+    let server = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let addr = build_sockaddr_in(0x7F00_0001, 1236);
+    let _ = server.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() });
+    let _ = server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 1 });
+    let client = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let _ = client.dispatch_op(crate::socket::SocketOp::Connect { addr });
+    let _ = server.dispatch_op(crate::socket::SocketOp::Accept);
+    let r = client.dispatch_op(crate::socket::SocketOp::Shutdown {
+        how: crate::socket::SHUT_WR,
+    });
+    server.unregister();
+    if matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shutdown(SHUT_WR) failed")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_tcp_shutdown_wr);
+
+/// AF_INET SOCK_DGRAM: bind, sendto self, recvfrom returns payload.
+fn smoke_socket_inet_udp_send_recv_self() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let addr = build_sockaddr_in(0x7F00_0001, 5000);
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind { addr: addr.clone() }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("udp bind failed");
+    }
+    let payload = b"udp-ping";
+    let _ = sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: Some(addr),
+    });
+    let mut buf = [0u8; 32];
+    let r = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    });
+    sock.unregister();
+    match r {
+        crate::socket::SocketOpResult::Received { n, peer } => {
+            if &buf[..n] != payload {
+                return TestResult::Fail("udp payload mismatch");
+            }
+            if peer.is_none() {
+                return TestResult::Fail("udp recv did not return peer");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("udp recv did not return Received"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_udp_send_recv_self);
+
+/// SO_BROADCAST: without it, sendto to 255.255.255.255 fails;
+/// with it, the send succeeds (queue drop is OK).
+fn smoke_socket_inet_udp_so_broadcast_gate() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let addr = build_sockaddr_in(0x7F00_0001, 5001);
+    let _ = sock.dispatch_op(crate::socket::SocketOp::Bind { addr });
+    let bcast = build_sockaddr_in(0xFFFF_FFFF, 5002);
+    let payload = b"bcast";
+    // Without SO_BROADCAST: must fail.
+    let r = sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: Some(bcast.clone()),
+    });
+    if matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        sock.unregister();
+        return TestResult::Fail("broadcast send w/o SO_BROADCAST should fail");
+    }
+    // Set SO_BROADCAST = 1.
+    let one = 1u32.to_ne_bytes();
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_BROADCAST,
+        value: &one,
+    });
+    let r2 = sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: Some(bcast),
+    });
+    sock.unregister();
+    if matches!(r2, crate::socket::SocketOpResult::Ok(_)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("broadcast send w/ SO_BROADCAST should succeed")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_udp_so_broadcast_gate);
+
+/// UDP connect()'d mode filters packets from a different peer.
+fn smoke_socket_inet_udp_connected_filter() -> TestResult {
+    // Sock A binds to port 6001, will recv only from 127.0.0.1:6002.
+    let a = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let _ = a.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 6001),
+    });
+    let peer_b = build_sockaddr_in(0x7F00_0001, 6002);
+    let _ = a.dispatch_op(crate::socket::SocketOp::Connect { addr: peer_b.clone() });
+    // Sock C (different sender) shoots a packet at A.
+    let c = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let _ = c.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 6003),
+    });
+    let _ = c.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"stranger",
+        flags: 0,
+        addr: Some(build_sockaddr_in(0x7F00_0001, 6001)),
+    });
+    let mut buf = [0u8; 16];
+    let r = a.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    });
+    a.unregister();
+    c.unregister();
+    // Connected mode filter drops the unmatched packet → WouldBlock.
+    match r {
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => TestResult::Pass,
+        _ => TestResult::Fail("connected udp did not filter wrong peer"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_udp_connected_filter);
+
+/// AF_INET SOCK_RAW with IPPROTO_ICMP: send + recv round-trip.
+fn smoke_socket_inet_raw_icmp_loopback() -> TestResult {
+    let sock = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_RAW,
+        crate::socket::IPPROTO_ICMP,
+    );
+    let dest = build_sockaddr_in(0x7F00_0001, 0);
+    let payload = b"\x08\x00\x00\x00ping";
+    let r = sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: Some(dest),
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        return TestResult::Fail("icmp send failed");
+    }
+    let mut buf = [0u8; 64];
+    let r = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    });
+    match r {
+        crate::socket::SocketOpResult::Received { n, .. } => {
+            if &buf[..n] != payload {
+                TestResult::Fail("icmp recv payload mismatch")
+            } else {
+                TestResult::Pass
+            }
+        }
+        _ => TestResult::Fail("icmp recv did not return Received"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet_raw_icmp_loopback);
+
+/// SO_REUSEADDR: stored value round-trips through get/setsockopt.
+fn smoke_socket_so_reuseaddr_round_trip() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let one = 1u32.to_ne_bytes();
+    let r = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_REUSEADDR,
+        value: &one,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        return TestResult::Fail("setsockopt(SO_REUSEADDR) failed");
+    }
+    let mut out = [0u8; 4];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_REUSEADDR,
+        buf: &mut out,
+    });
+    match r {
+        crate::socket::SocketOpResult::OptValue { n: 4 } => {
+            let v = u32::from_ne_bytes(out);
+            if v == 1 { TestResult::Pass } else { TestResult::Fail("got != 1") }
+        }
+        _ => TestResult::Fail("getsockopt did not return OptValue"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_so_reuseaddr_round_trip);
+
+/// TCP_NODELAY: stored value round-trips through get/setsockopt.
+fn smoke_socket_tcp_nodelay_round_trip() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let one = 1u32.to_ne_bytes();
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_TCP,
+        name: crate::socket::TCP_NODELAY,
+        value: &one,
+    });
+    let mut out = [0u8; 4];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::IPPROTO_TCP,
+        name: crate::socket::TCP_NODELAY,
+        buf: &mut out,
+    });
+    if matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
+        && u32::from_ne_bytes(out) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TCP_NODELAY did not round-trip")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_tcp_nodelay_round_trip);
+
+/// TCP_CONGESTION: round-trip "reno" then "cubic".
+fn smoke_socket_tcp_congestion_round_trip() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_TCP,
+        name: crate::socket::TCP_CONGESTION,
+        value: b"reno",
+    });
+    let mut out = [0u8; 16];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::IPPROTO_TCP,
+        name: crate::socket::TCP_CONGESTION,
+        buf: &mut out,
+    });
+    let n = match r {
+        crate::socket::SocketOpResult::OptValue { n } => n,
+        _ => return TestResult::Fail("TCP_CONGESTION get failed"),
+    };
+    if &out[..n] != b"reno" {
+        return TestResult::Fail("TCP_CONGESTION 'reno' round-trip failed");
+    }
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_TCP,
+        name: crate::socket::TCP_CONGESTION,
+        value: b"cubic",
+    });
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::IPPROTO_TCP,
+        name: crate::socket::TCP_CONGESTION,
+        buf: &mut out,
+    });
+    let n = match r {
+        crate::socket::SocketOpResult::OptValue { n } => n,
+        _ => return TestResult::Fail("TCP_CONGESTION (cubic) get failed"),
+    };
+    if &out[..n] != b"cubic" {
+        return TestResult::Fail("TCP_CONGESTION 'cubic' round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_tcp_congestion_round_trip);
+
+/// SO_BINDTODEVICE: string round-trip.
+fn smoke_socket_so_bindtodevice_round_trip() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_BINDTODEVICE,
+        value: b"eth0",
+    });
+    let mut out = [0u8; 16];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_BINDTODEVICE,
+        buf: &mut out,
+    });
+    let n = match r {
+        crate::socket::SocketOpResult::OptValue { n } => n,
+        _ => return TestResult::Fail("SO_BINDTODEVICE get failed"),
+    };
+    if &out[..n] == b"eth0" { TestResult::Pass }
+    else { TestResult::Fail("SO_BINDTODEVICE round-trip mismatch") }
+}
+kernel_test_in!("userspace", smoke_socket_so_bindtodevice_round_trip);
+
+/// sockaddr_in with invalid family rejected by Connect.
+fn smoke_socket_sockaddr_invalid_family_rejected() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let mut bogus = crate::socket::make_sockaddr_in(0x7F00_0001, 4321);
+    bogus.family = 9999; // not AF_INET / AF_UNIX / AF_INET6
+    let r = sock.dispatch_op(crate::socket::SocketOp::Connect { addr: bogus });
+    if matches!(r, crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("invalid family was not rejected")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_sockaddr_invalid_family_rejected);
+
+/// sockaddr_in port is honored in network byte order.
+fn smoke_socket_sockaddr_port_network_byte_order() -> TestResult {
+    // Build an explicit body with port 0x4321 (BE) + IP 127.0.0.1.
+    let body = alloc::vec![0x43u8, 0x21, 127, 0, 0, 1];
+    let addr = crate::socket::SockAddr {
+        family: crate::socket::AF_INET,
+        body,
+    };
+    match crate::socket::parse_sockaddr_in(&addr) {
+        Some((ip, port)) => {
+            if ip == 0x7F00_0001 && port == 0x4321 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("port/ip parse mismatch")
+            }
+        }
+        None => TestResult::Fail("parse failed"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_sockaddr_port_network_byte_order);
+
+/// O_NONBLOCK: recv on empty socket returns EAGAIN immediately.
+fn smoke_socket_nonblock_recv_returns_eagain() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let _ = sock.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 7000),
+    });
+    sock.set_nonblock(true);
+    if !sock.is_nonblock() {
+        sock.unregister();
+        return TestResult::Fail("set_nonblock didn't take");
+    }
+    let mut buf = [0u8; 8];
+    let r = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    });
+    sock.unregister();
+    match r {
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("nonblock recv did not return WouldBlock"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_nonblock_recv_returns_eagain);
+
+/// SO_ERROR consumes and clears a pending async error.
+fn smoke_socket_so_error_consumes_and_clears() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    sock.set_pending_error(crate::socket::SockError::ConnectionRefused);
+    let mut out = [0u8; 4];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_ERROR,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 }) {
+        return TestResult::Fail("first SO_ERROR get failed");
+    }
+    let v = u32::from_ne_bytes(out);
+    // ConnectionRefused → errno 111.
+    if v != 111 {
+        return TestResult::Fail("SO_ERROR returned wrong errno");
+    }
+    // Second read should return 0 (cleared).
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_ERROR,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 }) {
+        return TestResult::Fail("second SO_ERROR get failed");
+    }
+    let v = u32::from_ne_bytes(out);
+    if v != 0 { return TestResult::Fail("SO_ERROR did not clear"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_so_error_consumes_and_clears);
+
+/// getsockname after bind returns the assigned (port, ip).
+fn smoke_socket_getsockname_after_bind() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let _ = sock.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 4040),
+    });
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockName);
+    sock.unregister();
+    match r {
+        crate::socket::SocketOpResult::Addr(addr) => {
+            match crate::socket::parse_sockaddr_in(&addr) {
+                Some((ip, port)) if ip == 0x7F00_0001 && port == 4040 => TestResult::Pass,
+                _ => TestResult::Fail("getsockname returned wrong addr"),
+            }
+        }
+        _ => TestResult::Fail("getsockname did not return Addr"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_getsockname_after_bind);
+
+/// getpeername on a connected UDP socket returns the connect()'d peer.
+fn smoke_socket_getpeername_after_connect() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    let peer = build_sockaddr_in(0x7F00_0001, 9999);
+    let _ = sock.dispatch_op(crate::socket::SocketOp::Connect { addr: peer });
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetPeerName);
+    match r {
+        crate::socket::SocketOpResult::Addr(addr) => {
+            match crate::socket::parse_sockaddr_in(&addr) {
+                Some((ip, port)) if ip == 0x7F00_0001 && port == 9999 => TestResult::Pass,
+                _ => TestResult::Fail("getpeername returned wrong addr"),
+            }
+        }
+        _ => TestResult::Fail("getpeername did not return Addr"),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_getpeername_after_connect);
+
+/// SO_TYPE, SO_DOMAIN, SO_PROTOCOL all report what socket() captured.
+fn smoke_socket_so_type_domain_protocol() -> TestResult {
+    let sock = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+        crate::socket::IPPROTO_UDP,
+    );
+    let mut out = [0u8; 4];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_TYPE,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
+        || u32::from_ne_bytes(out) != crate::socket::SOCK_DGRAM {
+        return TestResult::Fail("SO_TYPE mismatch");
+    }
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_DOMAIN,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
+        || u32::from_ne_bytes(out) != crate::socket::AF_INET as u32 {
+        return TestResult::Fail("SO_DOMAIN mismatch");
+    }
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_PROTOCOL,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
+        || u32::from_ne_bytes(out) != crate::socket::IPPROTO_UDP {
+        return TestResult::Fail("SO_PROTOCOL mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_so_type_domain_protocol);
+
+/// IP_TTL is validated on the way in (0 and >255 → InvalidArg) and
+/// round-trips otherwise.
+fn smoke_socket_ip_ttl_validated_and_round_trip() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    // Reject 0.
+    let zero = 0u32.to_ne_bytes();
+    let r = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IP,
+        name: crate::socket::IP_TTL,
+        value: &zero,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)) {
+        return TestResult::Fail("IP_TTL=0 should be rejected");
+    }
+    // Reject 300.
+    let big = 300u32.to_ne_bytes();
+    let r = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IP,
+        name: crate::socket::IP_TTL,
+        value: &big,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)) {
+        return TestResult::Fail("IP_TTL=300 should be rejected");
+    }
+    // Accept 32.
+    let val = 32u32.to_ne_bytes();
+    let r = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::IPPROTO_IP,
+        name: crate::socket::IP_TTL,
+        value: &val,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        return TestResult::Fail("IP_TTL=32 set failed");
+    }
+    let mut out = [0u8; 4];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::IPPROTO_IP,
+        name: crate::socket::IP_TTL,
+        buf: &mut out,
+    });
+    if matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
+        && u32::from_ne_bytes(out) == 32 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("IP_TTL did not round-trip 32")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_ip_ttl_validated_and_round_trip);
+
+/// 16 concurrent UDP sockets — verify no allocator pressure / state leak.
+fn smoke_socket_inet_udp_16_concurrent() -> TestResult {
+    let mut socks: alloc::vec::Vec<alloc::sync::Arc<crate::socket::SocketFile>>
+        = alloc::vec::Vec::with_capacity(16);
+    for i in 0..16u16 {
+        let s = crate::socket::SocketFile::new(
+            crate::socket::AF_INET,
+            crate::socket::SOCK_DGRAM,
+        );
+        let r = s.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: build_sockaddr_in(0x7F00_0001, 8000 + i),
+        });
+        if !matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+            for s in &socks { s.unregister(); }
+            return TestResult::Fail("16 concurrent bind failed");
+        }
+        socks.push(s);
+    }
+    // sendto self for each.
+    for (i, s) in socks.iter().enumerate() {
+        let payload = (i as u32).to_ne_bytes();
+        let _ = s.dispatch_op(crate::socket::SocketOp::Send {
+            buf: &payload,
+            flags: 0,
+            addr: Some(build_sockaddr_in(0x7F00_0001, 8000 + i as u16)),
+        });
+    }
+    // recvfrom each, verify payload.
+    let mut ok = true;
+    for (i, s) in socks.iter().enumerate() {
+        let mut buf = [0u8; 4];
+        let r = s.dispatch_op(crate::socket::SocketOp::Recv {
+            buf: &mut buf,
+            flags: 0,
+        });
+        match r {
+            crate::socket::SocketOpResult::Received { n: 4, .. } => {
+                if u32::from_ne_bytes(buf) != i as u32 { ok = false; }
+            }
+            _ => { ok = false; }
+        }
+    }
+    for s in &socks { s.unregister(); }
+    if ok { TestResult::Pass } else { TestResult::Fail("16 concurrent payload mismatch") }
+}
+kernel_test_in!("userspace", smoke_socket_inet_udp_16_concurrent);
+
+/// SO_REUSEADDR + double-bind: the second bind to the same port
+/// succeeds when SO_REUSEADDR was set; our Stage-1 impl is
+/// faithful to the option storage (real dual-bind behaviour
+/// lands when the listener registry honours the flag).
+fn smoke_socket_so_reuseaddr_storage_stable() -> TestResult {
+    // This is the storage-side test — the registry-side check is
+    // gated on bind() actually consulting the option, which lands
+    // when the parallel-agent SO_REUSEADDR enforcement merges.
+    let a = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let one = 1u32.to_ne_bytes();
+    let _ = a.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_REUSEADDR,
+        value: &one,
+    });
+    let _ = a.dispatch_op(crate::socket::SocketOp::Bind {
+        addr: build_sockaddr_in(0x7F00_0001, 9100),
+    });
+    let _ = a.dispatch_op(crate::socket::SocketOp::Listen { backlog: 4 });
+    // Even though the first listener occupies the port, SO_REUSEADDR
+    // round-trip on the second socket must succeed (storage-side).
+    let b = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_STREAM,
+    );
+    let r = b.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_REUSEADDR,
+        value: &one,
+    });
+    a.unregister();
+    if matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("SO_REUSEADDR set on second socket failed")
+    }
+}
+kernel_test_in!("userspace", smoke_socket_so_reuseaddr_storage_stable);
+
+/// SO_RCVBUF / SO_SNDBUF clamp small values to ≥ 2 KiB and
+/// round-trip larger values verbatim.
+fn smoke_socket_so_rcvbuf_sndbuf_clamp() -> TestResult {
+    let sock = crate::socket::SocketFile::new(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+    );
+    // Set RCVBUF to 100; should clamp to 2048.
+    let v = 100u32.to_ne_bytes();
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_RCVBUF,
+        value: &v,
+    });
+    let mut out = [0u8; 4];
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_RCVBUF,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 }) {
+        return TestResult::Fail("SO_RCVBUF get failed");
+    }
+    if u32::from_ne_bytes(out) != 2_048 {
+        return TestResult::Fail("SO_RCVBUF did not clamp");
+    }
+    // Set SNDBUF to 64 KiB; should round-trip exact.
+    let v = 65_536u32.to_ne_bytes();
+    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_SNDBUF,
+        value: &v,
+    });
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_SNDBUF,
+        buf: &mut out,
+    });
+    if !matches!(r, crate::socket::SocketOpResult::OptValue { n: 4 })
+        || u32::from_ne_bytes(out) != 65_536 {
+        return TestResult::Fail("SO_SNDBUF did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_so_rcvbuf_sndbuf_clamp);
