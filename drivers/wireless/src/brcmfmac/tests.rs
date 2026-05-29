@@ -1132,6 +1132,74 @@ kernel_test_in!(
     smoke_brcmfmac_nvram_appends_default_boardrev
 );
 
+// ── Stage-7: ring buffer + doorbell ────────────────────────────────────
+
+fn smoke_brcmfmac_ringbuf_buf_size_and_reserve() -> TestResult {
+    use super::ringbuf::RingBuf;
+    use core::ptr;
+    // Build a 64×40 H2D control-submit ring with a null host base — we
+    // only exercise the index dance.
+    let mut rb = RingBuf::new(0, 64, 40, ptr::null_mut(), 0xDEAD_BEEF, 0x100, 0x102);
+    if rb.buf_size() != 64 * 40 {
+        return TestResult::Fail("buf_size should be depth × item_len");
+    }
+    let off = match rb.reserve_one() {
+        Some(o) => o,
+        None => return TestResult::Fail("reserve_one returned None on empty ring"),
+    };
+    if off != 0 {
+        return TestResult::Fail("first reserve_one should return byte 0");
+    }
+    rb.publish();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_ringbuf_buf_size_and_reserve
+);
+
+fn smoke_brcmfmac_write_complete_doorbell_seq() -> TestResult {
+    use super::ringbuf::{
+        write_complete, RecordingDoorbell, RecordingIndexIo, RingBuf, DEFAULT_DOORBELL_VALUE,
+    };
+    use core::ptr;
+    // 16×24 ring. w_idx_addr = 0x200, r_idx_addr = 0x202, mailbox at
+    // 0x140 (default reginfo H2D_MAILBOX_0).
+    let mut rb = RingBuf::new(2, 16, 24, ptr::null_mut(), 0, 0x202, 0x200);
+    rb.reserve_one().unwrap();
+    rb.reserve_one().unwrap();
+    let mut idx = RecordingIndexIo::default();
+    let mut door = RecordingDoorbell::default();
+    write_complete(&mut rb, &mut idx, &mut door, 0x140, DEFAULT_DOORBELL_VALUE);
+    // After publish + push_w_idx + ring_bell:
+    //  - idx slot @ 0x200 should hold w_ptr=2
+    //  - bells should have one entry (0x140, 1)
+    if idx.slots.get(&0x200).copied() != Some(2) {
+        return TestResult::Fail("push_w_idx didn't land w_ptr=2 at 0x200");
+    }
+    if door.bells.len() != 1 || door.bells[0] != (0x140, 1) {
+        return TestResult::Fail("doorbell sequence wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_write_complete_doorbell_seq
+);
+
+fn smoke_brcmfmac_hostrdy_db1_value() -> TestResult {
+    use super::ringbuf::HOSTRDY_DB1_VALUE;
+    // Per BRCMF_PCIE_SHARED_HOSTRDY_DB1 (pcie.c ~L222).
+    if HOSTRDY_DB1_VALUE != 0x1000_0000 {
+        return TestResult::Fail("HOSTRDY_DB1 sentinel value wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_hostrdy_db1_value
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");

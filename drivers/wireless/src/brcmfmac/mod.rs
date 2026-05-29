@@ -55,6 +55,7 @@ pub mod firmware;
 pub mod fwil;
 pub mod msgbuf;
 pub mod pcie;
+pub mod ringbuf;
 pub mod shared;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
