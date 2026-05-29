@@ -16,6 +16,8 @@ narf-lib          = { path = "../lib" }
 narf-init         = { path = "../init" }
 narf-drivers      = { path = "../drivers" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-time         = { path = "../time" }
+narf-scheduler    = { path = "../scheduler" }
 
 [lints]
 workspace = true

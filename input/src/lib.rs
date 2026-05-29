@@ -598,15 +598,20 @@ pub struct ButtonEvent {
     pub pressed: bool,
 }
 
-/// Linux evdev `BTN_*` codes — gamepad + joystick + digitiser
-/// subset. Vendored from `include/uapi/linux/input-event-codes.h`
+/// Linux evdev `BTN_*` codes — mouse + gamepad + joystick + digitiser.
+/// Vendored from `include/uapi/linux/input-event-codes.h`
 /// (Linux UAPI, public per `LICENSES/exceptions/Linux-syscall-note`).
-///
-/// `BTN_LEFT` / `RIGHT` / `MIDDLE` / `SIDE` / `EXTRA` / `FORWARD` /
-/// `BACK` / `TASK` aren't repeated here — they're already covered
-/// by `PointerButtons` and consumers should pop `PointerEvent`s for
-/// those.
 pub mod btn {
+    // Mouse / pointer buttons (0x110..) — also in `PointerButtons` but
+    // surfaced here for drivers that need the raw evdev code (e.g. HID multitouch).
+    pub const BTN_LEFT: u16 = 0x110;
+    pub const BTN_RIGHT: u16 = 0x111;
+    pub const BTN_MIDDLE: u16 = 0x112;
+    pub const BTN_SIDE: u16 = 0x113;
+    pub const BTN_EXTRA: u16 = 0x114;
+    pub const BTN_FORWARD: u16 = 0x115;
+    pub const BTN_BACK: u16 = 0x116;
+    pub const BTN_TASK: u16 = 0x117;
     // Joystick (0x120..)
     pub const BTN_TRIGGER: u16 = 0x120;
     pub const BTN_THUMB: u16 = 0x121;
@@ -754,6 +759,11 @@ pub mod abs {
     pub const ABS_MT_DISTANCE: u16 = 0x3B;
     pub const ABS_MT_TOOL_X: u16 = 0x3C;
     pub const ABS_MT_TOOL_Y: u16 = 0x3D;
+    /// Miscellaneous axis — used by some HID drivers as a generic
+    /// slot. Ref: `include/uapi/linux/input-event-codes.h ABS_MISC`.
+    pub const ABS_MISC: u16 = 0x28;
+    pub const ABS_VOLUME: u16 = 0x20;
+    pub const ABS_CNT: u16 = 0x40;
 }
 
 /// Tagged-union of every event a driver can emit.
@@ -1190,6 +1200,36 @@ pub fn register_initcalls() {
 
 pub mod goodix;
 pub mod rmi4;
+
+// ── evdev event-routing layer ─────────────────────────────────────────────────
+
+/// Per-device event queue, capability bitmap, Reader, and Router.
+/// The evdev layer sits between drivers (which call `evdev::ROUTER.dispatch`)
+/// and consumers (which call `evdev::ROUTER.open_reader`).
+pub mod evdev;
+
+/// Userspace synthetic input device (analogous to Linux uinput).
+pub mod uinput;
+
+/// `EventSink` is the driver-facing trait.  Drivers that have a
+/// `DeviceNode` call `node.dispatch()` directly, but the trait
+/// provides a uniform interface for tests and future virtual-device
+/// shims that don't need a full `DeviceNode`.
+///
+/// Linux analogue: `input_dev::event` callback pointer
+/// (`include/linux/input.h struct input_dev::event`).
+pub trait EventSink: Send + Sync {
+    /// Deliver one evdev event. The sink is responsible for any
+    /// queueing, fan-out, and waking of blocked readers.
+    fn dispatch(&self, ev: evdev::EvdevEvent) -> bool;
+}
+
+// Blanket impl so Arc<DeviceNode> can be used as an EventSink.
+impl EventSink for alloc::sync::Arc<evdev::DeviceNode> {
+    fn dispatch(&self, ev: evdev::EvdevEvent) -> bool {
+        evdev::DeviceNode::dispatch(self, ev)
+    }
+}
 
 // Per-crate smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the
