@@ -94,6 +94,7 @@ members = [
     "drivers/nfc",
     "drivers/spi",
     "drivers/wwan",
+    "drivers/sdio",
 ]
 # narf-testbin / userspace/init / userspace/shell are built out-of-
 # line by verification's build.rs (and by xtask's iso-boot path)

@@ -69,6 +69,7 @@ pub mod gspi;
 pub mod ioctl;
 pub mod iovar;
 pub mod sdio;
+pub mod sdio_bridge;
 pub mod sdpcm;
 pub mod transport;
 
