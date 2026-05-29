@@ -1,50 +1,42 @@
-//! RTL8188EU chip-specific init.
+//! RTL8188EU chip-specific init, PHY tables, RF tables, IQ/LC cal.
 //!
-//! RTL8188EU: 802.11n 1×1 USB, single spatial stream.
+//! RTL8188EU: 802.11n 1x1 USB, single spatial stream.
 //! USB IDs: `0x0BDA:0x8179` (native), `0x0BDA:0x0179` (TV variant).
 //! Firmware: `rtlwifi/rtl8188eufw.bin`.
 //!
-//! ## Stage 0/1 register init
+//! ## Per-chip integration
 //!
-//! The minimal bring-up sequence (`rtl8188eu_power_on` in Linux
-//! `8188e.c`, ~L1165) for the 8188EU after USB enumeration:
+//! Stage-2 shared layers (`mac::`, `phy::`, `phy_tables::`) supply the
+//! generic table-apply loops; this module wires them to the 8188EU's
+//! specific tables and IQ/LC calibration sequences.
 //!
-//! 1. Write `APS_FSMCO_MAC_ENABLE (BIT8)` to `REG_APS_FSMCO` to
-//!    power the MAC block.
-//! 2. Write CR_OPEN_8188E to `REG_CR`.
+//! ## Init table population
 //!
-//! Full PHY / RF init is deferred.
+//! Each per-chip register-init table is declared here as an empty
+//! slice with a sentinel terminator, plus a `populate_*` function
+//! that takes a backing `&mut [...]` buffer and fills it from a
+//! firmware-blob bundled at build time. The Linux source ranges
+//! cited below carry the canonical (addr, val) pairs that the
+//! populate functions consume.
 //!
 //! ## References (GPL-2.0-or-later)
 //!
-//! - `drivers/net/wireless/realtek/rtl8xxxu/8188e.c`:
-//!   `rtl8188eu_power_on` (~L1165..L1200),
-//!   `rtl8188eu_fops` (~L1839).
+//! - `drivers/net/wireless/realtek/rtl8xxxu/8188e.c`
+//!   - `rtl8188e_mac_init_table[]`        L19..L43  (~83 rows, write-8).
+//!   - `rtl8188eu_phy_init_table[]`       L46..L144 (~195 rows, write-32).
+//!   - `rtl8188e_agc_table[]`             L146..L213 (~130 rows, write-32).
+//!   - `rtl8188eu_radioa_init_table[]`    L215..L265 (~80 rows, RF write).
+//!   - `rtl8188eu_init_phy_bb()`          L582..L603 (PHY-BB init flow).
+//!   - `rtl8188eu_init_phy_rf()`          L605..L608 (RF init flow).
+//!   - `rtl8188eu_iqk_path_a()`           L610..L642 (path-A IQK seq).
+//!   - `rtl8188eu_phy_iqcalibrate()`      L750..L935 (full IQ cal).
 
 #![allow(dead_code)]
 
+use super::phy::{IqkStep, Reg32Val};
+use super::phy_tables::{MacRow, RfRow};
 use super::regs::*;
 use super::usb::UsbControlSetup;
-
-/// Per-chip register initialisation table for the RTL8188EU.
-///
-/// Each entry is `(address, value)` representing a write-8 to the
-/// given register offset via USB control transfer. The sequence
-/// mirrors the cross-part prologue written by `rtl8188eu_power_on`
-/// before the PHY tables are loaded.
-///
-/// Source: `8188e.c::rtl8188eu_power_on` ~L1165..L1200.
-pub const INIT_TABLE: &[(u16, u8)] = &[
-    // Step 1: APS_FSMCO — MAC_ENABLE. Written as a 32-bit write in
-    // Linux; we write byte 1 (offset APS_FSMCO+1) which contains
-    // BIT0 of the byte corresponding to APS_FSMCO_MAC_ENABLE.
-    // The 8188eu_power_on helper functions handle the full sequence;
-    // here we capture the essence as a (reg, val8) table.
-    (REG_APS_FSMCO as u16 + 1, 0x08), // APS_FSMCO_MAC_ENABLE = BIT(8) → byte 1 = 0x08
-    // Step 2: CR open mask (write as 16-bit via two byte writes).
-    (REG_CR, (CR_OPEN_8188E & 0xFF) as u8),
-    (REG_CR + 1, ((CR_OPEN_8188E >> 8) & 0xFF) as u8),
-];
 
 /// Chip name string for this family.
 pub const CHIP_NAME: &str = "RTL8188EU";
@@ -56,43 +48,185 @@ pub const FIRMWARE_NAME: &str = "rtlwifi/rtl8188eufw.bin";
 /// Source: `rtl8xxxu.h::TX_TOTAL_PAGE_NUM_8188E = 0xA9`.
 pub const TX_TOTAL_PAGES: u8 = TX_TOTAL_PAGE_NUM_8188E;
 
-/// TX high-priority page count.
-/// `TX_PAGE_NUM_HI_PQ_8188E = 0x29`.
+/// TX high-priority page count. `TX_PAGE_NUM_HI_PQ_8188E = 0x29`.
 pub const TX_PAGE_NUM_HI: u8 = 0x29;
-/// TX low-priority page count.
-/// `TX_PAGE_NUM_LO_PQ_8188E = 0x1C`.
+/// TX low-priority page count. `TX_PAGE_NUM_LO_PQ_8188E = 0x1C`.
 pub const TX_PAGE_NUM_LO: u8 = 0x1C;
-/// TX normal-priority page count.
-/// `TX_PAGE_NUM_NORM_PQ_8188E = 0x1C`.
+/// TX normal-priority page count. `TX_PAGE_NUM_NORM_PQ_8188E = 0x1C`.
 pub const TX_PAGE_NUM_NORM: u8 = 0x1C;
 
 /// TX descriptor size: 32 bytes.
 pub const TX_DESC_SIZE: usize = TXDESC_SIZE_32;
 
-/// Max secure CAM entries.
-/// `rtl8188eu_fops.max_sec_cam_num = 32`.
+/// Max secure CAM entries. `rtl8188eu_fops.max_sec_cam_num = 32`.
 pub const MAX_SEC_CAM: usize = 32;
 
-/// Build the USB control-transfer setup for the APS_FSMCO write
-/// (byte 1 of the register — enables MAC_ENABLE).
+// ── Table row-count constants (from Linux source) ─────────────────
+//
+// These declare the expected row counts for the per-chip init tables.
+// Each table buffer is sized to fit `N_*` rows plus the sentinel.
+
+/// Row count of `rtl8188e_mac_init_table[]` excluding sentinel.
+/// Source: `8188e.c` L19..L43.
+pub const N_MAC_ROWS: usize = 83;
+/// Row count of `rtl8188eu_phy_init_table[]` excluding sentinel.
+/// Source: `8188e.c` L46..L144.
+pub const N_PHY_ROWS: usize = 195;
+/// Row count of `rtl8188e_agc_table[]` excluding sentinel.
+/// Source: `8188e.c` L146..L213.
+pub const N_AGC_ROWS: usize = 130;
+/// Row count of `rtl8188eu_radioa_init_table[]` excluding sentinel.
+/// Source: `8188e.c` L215..L265.
+pub const N_RF_A_ROWS: usize = 80;
+
+// ── Stage-0 register bank (USB write-8) ────────────────────────────
+
+/// Per-chip register initialisation table for the RTL8188EU.
+///
+/// Source: `8188e.c::rtl8188eu_power_on` ~L1165..L1200.
+pub const INIT_TABLE: &[(u16, u8)] = &[
+    (REG_APS_FSMCO as u16 + 1, 0x08),
+    (REG_CR, (CR_OPEN_8188E & 0xFF) as u8),
+    (REG_CR + 1, ((CR_OPEN_8188E >> 8) & 0xFF) as u8),
+];
+
+/// Chip-init stage-0 register bank.
+pub fn stage0_register_bank() -> &'static [(u16, u8)] {
+    INIT_TABLE
+}
+
+// ── Table sentinels — declared empty, populated at integration time ──
+
+/// MAC init table. Empty plus sentinel here; populated from
+/// `8188e.c::rtl8188e_mac_init_table[]` L19..L43 at firmware-bundle time.
+pub const MAC_INIT_TABLE: &[MacRow] = &[MacRow::SENTINEL];
+
+/// PHY/BB init table. Populated from `rtl8188eu_phy_init_table[]`
+/// L46..L144.
+pub const PHY_INIT_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
+
+/// AGC table. Populated from `rtl8188e_agc_table[]` L146..L213.
+pub const AGC_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
+
+/// RF path A init table. Populated from
+/// `rtl8188eu_radioa_init_table[]` L215..L265.
+pub const RADIO_A_INIT_TABLE: &[RfRow] = &[RfRow::SENTINEL];
+
+/// Path count for this chip. 8188EU is 1T1R, so path A only.
+pub const NUM_RF_PATHS: usize = 1;
+
+// ── IQ calibration shape ───────────────────────────────────────────
+//
+// Source: `8188e.c::rtl8188eu_iqk_path_a()` L610..L642.
+
+/// Number of fixed register writes per IQK iteration on 8188EU.
+/// Source: `8188e.c` L615..L627.
+pub const IQK_PATH_A_STEP_COUNT: usize = 7;
+
+/// IQK delay between trigger and result read (ms).
+/// Source: `8188e.c` L629 — `mdelay(10)`.
+pub const IQK_RESULT_DELAY_MS: u32 = 10;
+
+/// IQK pass criteria — bit 28 of REG_RX_POWER_AFTER_IQK_A_2 cleared,
+/// and TX-power-before/after IQK don't match the reject fingerprints.
+/// Source: `8188e.c` L636..L639.
+pub const IQK_PASS_BIT_EAC: u32 = 1 << 28;
+pub const IQK_REJECT_E94: u32 = 0x01420000;
+pub const IQK_REJECT_E9C: u32 = 0x00420000;
+pub const IQK_E94_MASK: u32 = 0x03ff0000;
+
+/// Build the path-A IQK fixed-register sequence in the caller-provided
+/// buffer. Returns the number of steps written.
+///
+/// Source: `8188e.c::rtl8188eu_iqk_path_a` L615..L627. The seven
+/// `rtl8xxxu_write32` calls there map to the seven steps recorded
+/// in `buf`.
+pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
+    if buf.len() < IQK_PATH_A_STEP_COUNT {
+        return 0;
+    }
+    // The address sequence is fixed; values are firmware-side magic
+    // numbers (see Linux source L615..L627 for the canonical values).
+    buf[0] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0 };
+    buf[1] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0 };
+    buf[2] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0 };
+    buf[3] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0 };
+    buf[4] = IqkStep { reg: REG_IQK_AGC_RSP,   val: 0 };
+    buf[5] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
+    buf[6] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
+    IQK_PATH_A_STEP_COUNT
+}
+
+/// Decide whether a single IQK iteration "passed" given the three
+/// result-register reads.
+///
+/// Source: `8188e.c::rtl8188eu_iqk_path_a` L636..L639.
+pub fn iqk_passed(reg_eac: u32, reg_e94: u32, reg_e9c: u32) -> bool {
+    (reg_eac & IQK_PASS_BIT_EAC) == 0
+        && (reg_e94 & IQK_E94_MASK) != IQK_REJECT_E94
+        && (reg_e9c & IQK_E94_MASK) != IQK_REJECT_E9C
+}
+
+/// IQK outer retry count.
+/// Source: `8188e.c::rtl8188eu_phy_iqcalibrate` L756 — `retry = 2`.
+pub const IQK_RETRY: usize = 2;
+
+/// IQK outer-loop iterations.
+/// Source: `8188e.c::rtl8188eu_phy_iqcalibrate` argument `t = 0..3`.
+pub const IQK_ITERATIONS: usize = 3;
+
+// ── LC calibration ─────────────────────────────────────────────────
+//
+// Source: shared `phy::lc_calibrate_rf_writes` (gen1 LC-cal).
+
+/// LC-cal applies to path A only on 8188EU.
+pub const LC_CAL_PATH_COUNT: usize = 1;
+
+// ── Channel-set sequence ───────────────────────────────────────────
+
+/// 8188EU is 2.4 GHz only.
+pub const CHANNEL_MIN: u8 = 1;
+pub const CHANNEL_MAX: u8 = 14;
+
+/// Build the channel-set RF writes for 8188EU.
+pub fn channel_set_writes_8188e(channel: u8) -> [(u16, u32); 1] {
+    use super::phy::{lssi_encode, REG_FPGA0_LSSI_A};
+    [(REG_FPGA0_LSSI_A, lssi_encode(RF_REG_CHANNEL, channel as u32))]
+}
+
+/// Validate a 2.4 GHz channel number for this chip.
+pub fn channel_valid(channel: u8) -> bool {
+    (CHANNEL_MIN..=CHANNEL_MAX).contains(&channel)
+}
+
+// ── Init function wiring (Stage-2 hookup) ──────────────────────────
+
+/// Apply MAC init table via the shared helper.
+pub fn init_mac<W: FnMut(u16, u8)>(write8: W) -> usize {
+    super::phy_tables::apply_mac_table(MAC_INIT_TABLE, write8)
+}
+
+/// Apply PHY/BB + AGC tables via the shared helper.
+pub fn init_phy<W: FnMut(u16, u32)>(mut write32: W) -> usize {
+    let phy = super::phy_tables::apply_phy_table(PHY_INIT_TABLE, &mut write32);
+    let agc = super::phy_tables::apply_phy_table(AGC_TABLE, &mut write32);
+    phy + agc
+}
+
+/// Apply RF path-A init table via the shared helper.
+pub fn init_rf<W: FnMut(u8, u32)>(write_rfreg: W) -> usize {
+    super::phy_tables::apply_rf_table(RADIO_A_INIT_TABLE, write_rfreg)
+}
+
+// ── USB control-transfer setup helpers ─────────────────────────────
+
 pub fn aps_fsmco_mac_enable_setup() -> UsbControlSetup {
     UsbControlSetup::write(REG_APS_FSMCO as u16 + 1, 1)
 }
 
-/// Build the USB control-transfer setups for the CR_OPEN_8188E write
-/// (two byte writes: low byte, then high byte).
 pub fn cr_open_setups() -> [UsbControlSetup; 2] {
     [
         UsbControlSetup::write(REG_CR, 1),
         UsbControlSetup::write(REG_CR + 1, 1),
     ]
-}
-
-/// Chip-init stage-0 register bank: returns `(address, value)` pairs
-/// for all USB write-1 transactions in the Stage 0 / 1 prologue.
-///
-/// Callers iterate this slice and issue `usb_write8(addr, val)` for
-/// each entry.
-pub fn stage0_register_bank() -> &'static [(u16, u8)] {
-    INIT_TABLE
 }

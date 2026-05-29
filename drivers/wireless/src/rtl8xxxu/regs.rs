@@ -482,10 +482,77 @@ pub const REG_IQK_AGC_PTS: u16 = 0x0E48;
 /// IQK control register (0x0E4C).
 pub const REG_IQK_AGC_RSP: u16 = 0x0E4C;
 
+/// `REG_RX_IQK_PI_A` — RX IQK PI control A (0x0E44).
+pub const REG_RX_IQK_PI_A: u16 = 0x0E44;
+/// `REG_TX_IQK` — TX IQK base (0x0E38).
+pub const REG_TX_IQK: u16 = 0x0E38;
+/// `REG_RX_IQK` — RX IQK base (0x0E3C).
+pub const REG_RX_IQK: u16 = 0x0E3C;
+/// `REG_TX_POWER_BEFORE_IQK_A` (0x0E94).
+pub const REG_TX_POWER_BEFORE_IQK_A: u16 = 0x0E94;
+/// `REG_TX_POWER_AFTER_IQK_A` (0x0E9C).
+pub const REG_TX_POWER_AFTER_IQK_A: u16 = 0x0E9C;
+/// `REG_RX_POWER_BEFORE_IQK_A_2` (0x0EA4).
+pub const REG_RX_POWER_BEFORE_IQK_A_2: u16 = 0x0EA4;
+/// `REG_RX_POWER_AFTER_IQK_A_2` (0x0EAC).
+pub const REG_RX_POWER_AFTER_IQK_A_2: u16 = 0x0EAC;
+/// `REG_TX_POWER_BEFORE_IQK_B` (0x0EB4).
+pub const REG_TX_POWER_BEFORE_IQK_B: u16 = 0x0EB4;
+/// `REG_TX_POWER_AFTER_IQK_B` (0x0EBC).
+pub const REG_TX_POWER_AFTER_IQK_B: u16 = 0x0EBC;
+
 // ── LC calibration register ─────────────────────────────────────────
 
 /// `RF_CHNLBW` — RF channel/bandwidth register used during LC cal (0x18).
 pub const RF_REG_LC_CAL: u8 = 0x18;
+
+// ── Additional channel-set + gen2 registers ─────────────────────────
+
+/// `REG_FPGA1_RF_MODE` — secondary FPGA RF mode (0x0900).
+pub const REG_FPGA1_RF_MODE: u16 = 0x0900;
+/// `REG_CCK0_SYSTEM` — CCK0 system register (0x0A00).
+pub const REG_CCK0_SYSTEM: u16 = 0x0A00;
+/// `REG_OFDM1_LSTF` — OFDM1 long-symbol training field (0x0D00).
+pub const REG_OFDM1_LSTF: u16 = 0x0D00;
+/// `REG_WMAC_TRXPTCL_CTL` — TRX protocol control (0x0668).
+pub const REG_WMAC_TRXPTCL_CTL: u16 = 0x0668;
+/// `REG_DATA_SUBCHANNEL` — data sub-channel (0x0483).
+pub const REG_DATA_SUBCHANNEL: u16 = 0x0483;
+/// `REG_SIFS_CCK` — SIFS for CCK (0x0514).
+pub const REG_SIFS_CCK: u16 = 0x0514;
+/// `REG_SIFS_OFDM` — SIFS for OFDM (0x0516).
+pub const REG_SIFS_OFDM: u16 = 0x0516;
+/// `REG_R2T_SIFS` — RX-to-TX SIFS (0x063A).
+pub const REG_R2T_SIFS: u16 = 0x063A;
+/// `REG_T2T_SIFS` — TX-to-TX SIFS (0x063C).
+pub const REG_T2T_SIFS: u16 = 0x063C;
+/// `REG_S0S1_PATH_SWITCH` — antenna S0/S1 path switch (0x0948).
+pub const REG_S0S1_PATH_SWITCH: u16 = 0x0948;
+
+/// `WMAC_TRXPTCL_CTL_BW_MASK` (bits 7..8).
+pub const WMAC_TRXPTCL_CTL_BW_MASK: u16 = 0x0180;
+pub const WMAC_TRXPTCL_CTL_BW_20: u16 = 0x0000;
+pub const WMAC_TRXPTCL_CTL_BW_40: u16 = 0x0080;
+pub const WMAC_TRXPTCL_CTL_BW_80: u16 = 0x0100;
+
+/// `MODE_AG_CHANNEL_MASK` — channel field (low 8 bits).
+pub const MODE_AG_CHANNEL_MASK: u32 = 0x000000FF;
+/// `MODE_AG_BW_MASK` — bandwidth field.
+pub const MODE_AG_BW_MASK: u32 = 0x00000C00;
+pub const MODE_AG_BW_20MHZ_8723B: u32 = 0x00000400;
+pub const MODE_AG_BW_40MHZ_8723B: u32 = 0x00000800;
+pub const MODE_AG_BW_80MHZ_8723B: u32 = 0x00000C00;
+
+/// `RF6052_REG_MODE_AG` (0x18).
+pub const RF6052_REG_MODE_AG: u8 = 0x18;
+/// `RF6052_REG_WE_LUT` (0xEF).
+pub const RF6052_REG_WE_LUT: u8 = 0xEF;
+/// `RF6052_REG_RCK_OS` (0x30).
+pub const RF6052_REG_RCK_OS: u8 = 0x30;
+/// `RF6052_REG_TXPA_G1` (0x31).
+pub const RF6052_REG_TXPA_G1: u8 = 0x31;
+/// `RF6052_REG_TXPA_G2` (0x32).
+pub const RF6052_REG_TXPA_G2: u8 = 0x32;
 
 // ── 8723B BT coexistence ─────────────────────────────────────────────
 

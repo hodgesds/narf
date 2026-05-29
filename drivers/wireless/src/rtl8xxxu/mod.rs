@@ -46,6 +46,7 @@ pub mod fw;
 pub mod intr;
 pub mod mac;
 pub mod phy;
+pub mod phy_tables;
 pub mod rate;
 pub mod regs;
 pub mod rtl8188e;
