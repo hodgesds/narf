@@ -255,6 +255,11 @@ fn timer_tick_pump() {
 /// Called once at boot.
 pub fn init() {
     iface::install_rx_handler(rx_handler);
+    // Register default netfilter hooks: conntrack at PRE_ROUTING &
+    // LOCAL_OUT, filter at all five points, NAT at PRE_ROUTING /
+    // POST_ROUTING. Idempotent — calling twice double-registers, so
+    // `init()` is only run once at boot.
+    crate::netfilter::filter::init_all_default_hooks();
     if TIMER_PUMP_INSTALLED
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -266,3 +271,34 @@ pub fn init() {
 /// MTU we plan on per outbound frame. Kept at the legacy surface;
 /// the tcp::core path computes its own per-MSS budget.
 pub const TCP_MTU: usize = 1500;
+
+/// Run the netfilter LOCAL_OUT + POST_ROUTING hooks against an
+/// outbound L3 packet. Callers building outbound IPv4 frames (TCP
+/// stack, UDP socket layer, raw socket layer) should run this just
+/// before handing the frame off to `iface::send`. The packet is
+/// mutated in place — NAT rewrites src/dst + recomputes checksums.
+/// Returns `Verdict::Accept` to mean "send", any other verdict to
+/// mean "don't".
+///
+/// Matches the Linux outbound flow `__ip_local_out()` →
+/// `ip_output()` in `net/ipv4/ip_output.c`.
+pub fn nf_tx_filter(
+    iface_out: &str,
+    ipv4_packet: &mut [u8],
+) -> crate::netfilter::Verdict {
+    {
+        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
+            crate::netfilter::HookPoint::LocalOut,
+            "", iface_out, ipv4_packet,
+        );
+        let v = crate::netfilter::nf_dispatch(&mut ctx);
+        if v != crate::netfilter::Verdict::Accept {
+            return v;
+        }
+    }
+    let mut ctx = crate::netfilter::PktCtx::new_ipv4(
+        crate::netfilter::HookPoint::PostRouting,
+        "", iface_out, ipv4_packet,
+    );
+    crate::netfilter::nf_dispatch(&mut ctx)
+}
