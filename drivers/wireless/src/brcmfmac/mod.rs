@@ -51,6 +51,7 @@
 extern crate alloc;
 
 pub mod cfg80211;
+pub mod fwil;
 pub mod msgbuf;
 pub mod pcie;
 

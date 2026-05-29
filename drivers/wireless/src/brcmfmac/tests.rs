@@ -657,6 +657,182 @@ fn smoke_brcmfmac_chanspec_5g_5180() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_chanspec_5g_5180);
 
+// ── Stage-4: fwil IOCTL + IOVAR encoders ───────────────────────────────
+
+fn smoke_brcmfmac_fwil_command_table_constants() -> TestResult {
+    use super::fwil::{
+        BRCMF_C_DOWN, BRCMF_C_GET_REVINFO, BRCMF_C_GET_VAR, BRCMF_C_SET_KEY,
+        BRCMF_C_SET_SSID, BRCMF_C_SET_VAR, BRCMF_C_SET_WSEC_PMK, BRCMF_C_UP,
+    };
+    // Per Linux `fwil.h` (lines 14..83 verbatim).
+    if BRCMF_C_UP != 2 {
+        return TestResult::Fail("BRCMF_C_UP should be 2");
+    }
+    if BRCMF_C_DOWN != 3 {
+        return TestResult::Fail("BRCMF_C_DOWN should be 3");
+    }
+    if BRCMF_C_SET_SSID != 26 {
+        return TestResult::Fail("BRCMF_C_SET_SSID should be 26");
+    }
+    if BRCMF_C_SET_KEY != 45 {
+        return TestResult::Fail("BRCMF_C_SET_KEY should be 45");
+    }
+    if BRCMF_C_GET_REVINFO != 98 {
+        return TestResult::Fail("BRCMF_C_GET_REVINFO should be 98");
+    }
+    if BRCMF_C_GET_VAR != 262 {
+        return TestResult::Fail("BRCMF_C_GET_VAR should be 262");
+    }
+    if BRCMF_C_SET_VAR != 263 {
+        return TestResult::Fail("BRCMF_C_SET_VAR should be 263");
+    }
+    if BRCMF_C_SET_WSEC_PMK != 268 {
+        return TestResult::Fail("BRCMF_C_SET_WSEC_PMK should be 268");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fwil_command_table_constants
+);
+
+fn smoke_brcmfmac_fwil_iovar_payload_encode() -> TestResult {
+    use super::fwil::{build_iovar_payload, parse_iovar_payload};
+    // Build the canonical `chanspec` IOVAR — a common path the
+    // Linux brcmfmac code drives every time the connect IOCTL fires.
+    let mut buf = [0u8; 64];
+    let chanspec_le = 0x1824u16.to_le_bytes();
+    let written = build_iovar_payload("chanspec", &chanspec_le, &mut buf);
+    let n = match written {
+        Some(v) => v,
+        None => return TestResult::Fail("iovar encode returned None"),
+    };
+    // Expected: "chanspec\0\x24\x18"  (8 + 1 + 2 = 11).
+    if n != 11 {
+        return TestResult::Fail("iovar payload size mismatch");
+    }
+    if &buf[..8] != b"chanspec" {
+        return TestResult::Fail("iovar name not at start");
+    }
+    if buf[8] != 0 {
+        return TestResult::Fail("missing NUL between name and data");
+    }
+    if buf[9..11] != [0x24, 0x18] {
+        return TestResult::Fail("iovar data bytes mis-encoded");
+    }
+    // Round-trip via parse_iovar_payload.
+    let (name, data) = match parse_iovar_payload(&buf[..n]) {
+        Some(v) => v,
+        None => return TestResult::Fail("iovar parse returned None"),
+    };
+    if name != "chanspec" {
+        return TestResult::Fail("iovar parse name mismatch");
+    }
+    if data != [0x24, 0x18] {
+        return TestResult::Fail("iovar parse data mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fwil_iovar_payload_encode
+);
+
+fn smoke_brcmfmac_fwil_iovar_too_small_buffer_rejected() -> TestResult {
+    use super::fwil::build_iovar_payload;
+    // 4-byte buffer can't hold `"chanspec"` even before the NUL.
+    let mut tiny = [0u8; 4];
+    if build_iovar_payload("chanspec", &[0u8; 0], &mut tiny).is_some() {
+        return TestResult::Fail("encode should reject too-small buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fwil_iovar_too_small_buffer_rejected
+);
+
+fn smoke_brcmfmac_fwil_ssid_le_encode() -> TestResult {
+    use super::fwil::{decode_ssid_le, encode_ssid_le, SSID_LE_SIZE};
+    let ssid = b"NarfTestNet";
+    let mut buf = [0u8; SSID_LE_SIZE];
+    if encode_ssid_le(ssid, &mut buf).is_none() {
+        return TestResult::Fail("encode_ssid_le returned None on valid SSID");
+    }
+    // Wire ordering: u32 LE length, then 32-byte buffer.
+    if buf[..4] != (ssid.len() as u32).to_le_bytes() {
+        return TestResult::Fail("ssid length byte mis-encoded");
+    }
+    if &buf[4..4 + ssid.len()] != ssid {
+        return TestResult::Fail("ssid bytes not copied verbatim");
+    }
+    // Padding bytes after the SSID must be zero.
+    for &b in &buf[4 + ssid.len()..SSID_LE_SIZE] {
+        if b != 0 {
+            return TestResult::Fail("ssid padding not zero");
+        }
+    }
+    // Round-trip.
+    let (decoded_len, decoded_buf) = match decode_ssid_le(&buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("decode_ssid_le returned None"),
+    };
+    if decoded_len as usize != ssid.len() {
+        return TestResult::Fail("decoded ssid length mismatch");
+    }
+    if &decoded_buf[..ssid.len()] != ssid {
+        return TestResult::Fail("decoded ssid bytes mismatch");
+    }
+    // Over-length SSID rejected.
+    let too_long = [b'A'; 64];
+    if encode_ssid_le(&too_long, &mut buf).is_some() {
+        return TestResult::Fail("encode_ssid_le should reject 64-byte SSID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fwil_ssid_le_encode
+);
+
+fn smoke_brcmfmac_fwil_join_params_encode() -> TestResult {
+    use super::fwil::{encode_join_params, ETH_ALEN, JOIN_PARAMS_BLIND_SIZE};
+    use super::msgbuf::chanspec_20mhz;
+    let ssid = b"MyHomeWifi";
+    let mut buf = [0u8; 64];
+    let chanspec = chanspec_20mhz(36); // 5 GHz channel 36, BW20.
+    let n = match encode_join_params(ssid, None, chanspec, &mut buf) {
+        Some(v) => v,
+        None => return TestResult::Fail("encode_join_params returned None"),
+    };
+    if n != JOIN_PARAMS_BLIND_SIZE {
+        return TestResult::Fail("join params size mismatch");
+    }
+    // SSID length at byte 0.
+    if buf[..4] != (ssid.len() as u32).to_le_bytes() {
+        return TestResult::Fail("join: ssid length mis-encoded");
+    }
+    // BSSID at byte 36 — all-zero for "any AP".
+    for &b in &buf[36..36 + ETH_ALEN] {
+        if b != 0 {
+            return TestResult::Fail("join: bssid not zeroed for blind join");
+        }
+    }
+    // chanspec_num = 1 at byte 42..46 (we passed a real chanspec).
+    if buf[42..46] != 1u32.to_le_bytes() {
+        return TestResult::Fail("join: chanspec_num not 1");
+    }
+    // chanspec at byte 46..48.
+    if buf[46..48] != chanspec.to_le_bytes() {
+        return TestResult::Fail("join: chanspec not encoded LE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_fwil_join_params_encode
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");
