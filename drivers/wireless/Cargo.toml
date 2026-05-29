@@ -30,6 +30,7 @@ narf-console      = { path = "../../console" }
 narf-firmware     = { path = "../../firmware" }
 narf-init         = { path = "../../init" }
 narf-drivers-sdio = { path = "../sdio" }
+narf-drivers-usb  = { path = "../usb" }
 async-trait = "0.1"
 
 [features]
