@@ -310,6 +310,234 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
     }
 }
 
+// ── TX offload descriptor helpers ───────────────────────────────────
+// Same TD1 offload-bit layout as RTL8125 (TxDesc.vlan / word1).
+// Linux r8169_main.c `rtl8169_tso_csum_v2` (same path for VER_70).
+// RTL8126 uses the v2 offload path identically to RTL8125.
+
+/// TSO: enable giant-send IPv4. Combine with `TD1_IPv4_CS | TD1_TCP_CS`
+/// and MSS in `[28:18]`. Linux `r8169_main.c` TD_RSOB_TX.
+pub const TD1_GTSENV4: u32 = 1 << 26;
+/// MSS field shift for TSO (bits `[28:18]` in `TxDesc.vlan`).
+pub const TD1_MSS_SHIFT: u32 = 18;
+/// IPv4 header checksum offload. Linux `r8169_main.c` `TD1_IPv4_CS`.
+pub const TD1_IPv4_CS: u32 = 1 << 29;
+/// TCP checksum offload. Linux `r8169_main.c` `TD1_TCP_CS`.
+pub const TD1_TCP_CS: u32 = 1 << 30;
+
+// RX descriptor csum status bits (word0 after chip writes back).
+// Same layout as RTL8125 (Linux r8169_main.c csum check path).
+pub(crate) const RX_IPOK: u32 = 1 << 5;
+pub(crate) const RX_TCPOK: u32 = 1 << 6;
+pub(crate) const RX_UDPOK: u32 = 1 << 7;
+pub(crate) const RX_IPFAIL: u32 = 1 << 16;
+pub(crate) const RX_TCPFAIL: u32 = 1 << 14;
+pub(crate) const RX_UDPFAIL: u32 = 1 << 15;
+
+/// Result of hardware checksum verification on a received frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult {
+    /// Hardware did not perform checksum verification (e.g. non-IP).
+    None,
+    /// Hardware verified the checksum and it passed.
+    Ok,
+    /// Hardware verified the checksum and it failed.
+    Fail,
+}
+
+impl TxDesc {
+    /// Build a TX descriptor with IPv4 + TCP checksum offload only.
+    /// Sets `TD1_IPv4_CS | TD1_TCP_CS` in the vlan word; no TSO.
+    /// Mirrors `rtl8125::TxDesc::with_csum`.
+    pub const fn with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
+        TxDesc {
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
+            vlan: TD1_IPv4_CS | TD1_TCP_CS,
+            addr_lo,
+            addr_hi,
+        }
+    }
+
+    /// Build a TX descriptor with TSO + IPv4 + TCP checksum offload.
+    /// Sets `TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS` and encodes `mss`
+    /// in bits `[28:18]` of the vlan word.
+    /// Mirrors `rtl8125::TxDesc::with_tso`.
+    pub const fn with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
+        TxDesc {
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
+            vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT),
+            addr_lo,
+            addr_hi,
+        }
+    }
+
+    /// Decode the RX checksum result from a chip-writeback descriptor.
+    pub const fn rx_csum_result(&self) -> RxCsumResult {
+        let done = self.flags_len & (RX_IPOK | RX_TCPOK | RX_UDPOK) != 0;
+        if !done {
+            return RxCsumResult::None;
+        }
+        if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
+    }
+}
+
+// ── Firmware names ───────────────────────────────────────────────────
+// Linux r8169_main.c lines 64–65 / 109–110.
+
+/// Firmware for XID 0x64a (RTL8126A, the more-common rev).
+/// Linux `FIRMWARE_8126A_3` = `"rtl_nic/rtl8126a-3.fw"`.
+pub const FIRMWARE_8126A_3: &str = "rtl_nic/rtl8126a-3.fw";
+
+/// Firmware for XID 0x649.
+/// Linux `FIRMWARE_8126A_2` = `"rtl_nic/rtl8126a-2.fw"`.
+pub const FIRMWARE_8126A_2: &str = "rtl_nic/rtl8126a-2.fw";
+
+/// Return the firmware name for a given XID.
+/// Linux r8169_main.c lines 109–110.
+pub const fn firmware_name_for_xid(xid: u32) -> &'static str {
+    match xid {
+        0x64a => FIRMWARE_8126A_3,
+        0x649 => FIRMWARE_8126A_2,
+        _ => FIRMWARE_8126A_3,
+    }
+}
+
+// ── PHY paged-register access types ─────────────────────────────────
+// The RTL8126A uses the same paged-MDIO scheme as RTL8125 / RTL8168G.
+// "Page" = value written to MII reg 0x1F; the helpers here model the
+// Linux `phy_modify_paged` / `phy_write_paged` / `r8168g_phy_param` /
+// `rtl8125_phy_param` helpers from r8169_phy_config.c.
+
+/// One entry in the static PHY configuration table.
+/// Encodes a `phy_modify_paged` or `phy_write_paged` operation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhyConfigEntry {
+    /// PHY page (value written to MII reg 0x1F).
+    pub page: u16,
+    /// MII register within that page.
+    pub reg: u8,
+    /// Bits to clear (ANDed inverted with current value).
+    pub mask: u16,
+    /// Bits to set (ORed after masking).
+    pub val: u16,
+    /// Entry kind.
+    pub kind: PhyConfigKind,
+}
+
+/// Which PHY-access flavour this entry uses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PhyConfigKind {
+    /// `phy_modify_paged(page, reg, mask, val)` — page via MII reg 0x1F.
+    /// Linux r8169_phy_config.c `phy_modify_paged` callers.
+    ModifyPaged,
+    /// `phy_write_paged(page, reg, val)` — full 16-bit write.
+    /// Equivalent to `ModifyPaged` with `mask = 0xFFFF`.
+    WritePaged,
+    /// `r8168g_phy_param(parm, mask, val)` — page 0x0a43, reg 0x13
+    /// = parm, modify reg 0x14.
+    /// Linux r8169_phy_config.c lines 42–51.
+    R8168gParam,
+    /// `rtl8125_phy_param(parm, mask, val)` — MMD VEND2 registers
+    /// 0xb87c / 0xb87e.
+    /// Linux r8169_phy_config.c lines 53–60.
+    Rtl8125Param,
+}
+
+// ── Full rtl8126a_hw_phy_config table ───────────────────────────────
+//
+// Rust translation of `rtl8126a_hw_phy_config` in Linux
+// `drivers/net/ethernet/realtek/r8169_phy_config.c` lines 1123–1131.
+//
+// After firmware load the function applies:
+//
+//   rtl8168g_enable_gphy_10m  (line 1127):
+//     phy_modify_paged(0x0a44, 0x11, 0, BIT(11))
+//
+//   rtl8125_legacy_force_mode (line 1128):
+//     phy_modify_paged(0xa5b, 0x12, BIT(15), 0)
+//
+//   rtl8168g_disable_aldps    (line 1129):
+//     phy_modify_paged(0x0a43, 0x10, BIT(2), 0)
+//
+//   rtl8125_common_config_eee_phy (line 1130, 3 entries):
+//     phy_modify_paged(0xa6d, 0x14, 0x0010, 0x0000)
+//     phy_modify_paged(0xa42, 0x14, 0x0080, 0x0000)
+//     phy_modify_paged(0xa4a, 0x11, 0x0200, 0x0000)
+//
+// Total: 6 ModifyPaged entries. Firmware load is handled separately
+// by the NARF firmware subsystem before this table is applied.
+
+/// Static PHY configuration table for RTL8126A (VER_70).
+///
+/// Linux ref: `r8169_phy_config.c` `rtl8126a_hw_phy_config` lines
+/// 1123–1131 plus helper expansions at lines 720–728, 993–996,
+/// 101–106.
+pub const PHY_CONFIG_TABLE: &[PhyConfigEntry] = &[
+    // rtl8168g_enable_gphy_10m: phy_modify_paged(0x0a44, 0x11, 0, BIT(11))
+    PhyConfigEntry { page: 0x0a44, reg: 0x11, mask: 0x0000, val: 1 << 11, kind: PhyConfigKind::ModifyPaged },
+    // rtl8125_legacy_force_mode: phy_modify_paged(0xa5b, 0x12, BIT(15), 0)
+    PhyConfigEntry { page: 0x0a5b, reg: 0x12, mask: 1 << 15, val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    // rtl8168g_disable_aldps: phy_modify_paged(0x0a43, 0x10, BIT(2), 0)
+    PhyConfigEntry { page: 0x0a43, reg: 0x10, mask: 1 << 2,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    // rtl8125_common_config_eee_phy entry 1: phy_modify_paged(0xa6d, 0x14, 0x0010, 0x0000)
+    PhyConfigEntry { page: 0x0a6d, reg: 0x14, mask: 0x0010,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    // rtl8125_common_config_eee_phy entry 2: phy_modify_paged(0xa42, 0x14, 0x0080, 0x0000)
+    PhyConfigEntry { page: 0x0a42, reg: 0x14, mask: 0x0080,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    // rtl8125_common_config_eee_phy entry 3: phy_modify_paged(0xa4a, 0x11, 0x0200, 0x0000)
+    PhyConfigEntry { page: 0x0a4a, reg: 0x11, mask: 0x0200,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+];
+
+/// Number of entries in `PHY_CONFIG_TABLE`.
+pub const PHY_CONFIG_TABLE_LEN: usize = PHY_CONFIG_TABLE.len();
+
+/// Distinct PHY pages touched by `PHY_CONFIG_TABLE` (for smoke tests).
+pub const PHY_CONFIG_PAGES: &[u16] = &[0x0a44, 0x0a5b, 0x0a43, 0x0a6d, 0x0a42, 0x0a4a];
+
+// ── Link partner capability negotiation ─────────────────────────────
+
+/// Link speeds, descending preference order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum LinkSpeed {
+    Down    = 0,
+    Speed10M  = 1,
+    Speed100M = 2,
+    Speed1G   = 3,
+    Speed2_5G = 4,
+    Speed5G   = 5,
+}
+
+impl LinkSpeed {
+    /// Highest speed mutually supported by `local` and `partner`.
+    /// Implements the 5G → 2.5G → 1G → 100M → 10M fallback ladder.
+    ///
+    /// When local is 5G-capable but partner only advertises ≥1G
+    /// (no TBI_Enable in partner), we conservatively report `Speed2_5G`
+    /// because the partner could be a 2.5G-only device — the definitive
+    /// speed requires a PHYAR read.
+    pub const fn negotiate(local: &PhyStatus, partner: &PhyStatus) -> Self {
+        if local.speed_5g && partner.speed_5g {
+            Self::Speed5G
+        } else if local.speed_1000m_or_above && partner.speed_1000m_or_above {
+            if local.speed_5g {
+                Self::Speed2_5G  // partner ≥1G but not 5G; upper bound
+            } else {
+                Self::Speed1G
+            }
+        } else if local.speed_100m && partner.speed_100m {
+            Self::Speed100M
+        } else if local.speed_10m && partner.speed_10m {
+            Self::Speed10M
+        } else {
+            Self::Down
+        }
+    }
+}
+
 // ── MAC helpers ──────────────────────────────────────────────────────
 
 /// Maximum polling iterations for CR.RST self-clear.

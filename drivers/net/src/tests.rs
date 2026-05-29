@@ -1182,3 +1182,150 @@ fn smoke_forcedeth_csum_offload_bits() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_csum_offload_bits);
+
+// ── rtl8126 ───────────────────────────────────────────────────────
+
+fn smoke_rtl8126_phy_config_table_size_and_page_coverage() -> TestResult {
+    // Structural: PHY config table must have exactly 6 entries and
+    // cover all pages from `rtl8126a_hw_phy_config` in Linux
+    // r8169_phy_config.c lines 1123–1131.
+    // Pages: 0x0a44, 0x0a5b, 0x0a43, 0x0a6d, 0x0a42, 0x0a4a.
+    use crate::rtl8126::{PHY_CONFIG_PAGES, PHY_CONFIG_TABLE, PHY_CONFIG_TABLE_LEN};
+    if PHY_CONFIG_TABLE_LEN != 6 {
+        return TestResult::Fail("PHY config table must have exactly 6 entries");
+    }
+    if PHY_CONFIG_TABLE.len() != PHY_CONFIG_TABLE_LEN {
+        return TestResult::Fail("PHY_CONFIG_TABLE_LEN constant disagrees with slice length");
+    }
+    let required_pages: &[u16] = &[0x0a44, 0x0a5b, 0x0a43, 0x0a6d, 0x0a42, 0x0a4a];
+    for &page in required_pages {
+        if !PHY_CONFIG_PAGES.iter().any(|&p| p == page) {
+            return TestResult::Fail("PHY_CONFIG_PAGES missing a required page");
+        }
+        if !PHY_CONFIG_TABLE.iter().any(|e| e.page == page) {
+            return TestResult::Fail("PHY_CONFIG_TABLE missing entry for a required page");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8126",
+    smoke_rtl8126_phy_config_table_size_and_page_coverage
+);
+
+fn smoke_rtl8126_fw_name_resolution() -> TestResult {
+    // XID 0x64a → rtl8126a-3.fw; XID 0x649 → rtl8126a-2.fw.
+    // Linux r8169_main.c lines 64–65 / 109–110.
+    use crate::rtl8126::{firmware_name_for_xid, FIRMWARE_8126A_2, FIRMWARE_8126A_3};
+    if FIRMWARE_8126A_3 != "rtl_nic/rtl8126a-3.fw" {
+        return TestResult::Fail("FIRMWARE_8126A_3 string wrong");
+    }
+    if FIRMWARE_8126A_2 != "rtl_nic/rtl8126a-2.fw" {
+        return TestResult::Fail("FIRMWARE_8126A_2 string wrong");
+    }
+    if firmware_name_for_xid(0x64a) != FIRMWARE_8126A_3 {
+        return TestResult::Fail("XID 0x64a must map to rtl8126a-3.fw");
+    }
+    if firmware_name_for_xid(0x649) != FIRMWARE_8126A_2 {
+        return TestResult::Fail("XID 0x649 must map to rtl8126a-2.fw");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_fw_name_resolution);
+
+fn smoke_rtl8126_phystat_decode_5g() -> TestResult {
+    // PHYStatus bit 7 (TBI_Enable) = 5 Gbps link on RTL8126.
+    // Linux r8169_main.c: PHYStatus register at 0x6C.
+    use crate::rtl8126::{
+        PhyStatus, PHYSTAT_100BPS, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS,
+        PHYSTAT_TBI_OR_5G,
+    };
+    // 5G link.
+    let b5g = PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF | PHYSTAT_TBI_OR_5G;
+    let s5 = PhyStatus::parse(b5g);
+    if !s5.link_up  { return TestResult::Fail("5G: link_up should be true"); }
+    if !s5.speed_5g { return TestResult::Fail("5G: speed_5g must be set when TBI_Enable=1"); }
+    if !s5.speed_1000m_or_above { return TestResult::Fail("5G: speed_1000m_or_above must be set"); }
+    if s5.speed_label() != "5G" { return TestResult::Fail("5G: speed_label must be \"5G\""); }
+    // 1G link.
+    let b1g = PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF;
+    let s1g = PhyStatus::parse(b1g);
+    if s1g.speed_5g { return TestResult::Fail("1G: speed_5g must be false when TBI_Enable=0"); }
+    if s1g.speed_label() != "1000M-or-2.5G" { return TestResult::Fail("1G: speed_label wrong"); }
+    // 100M link.
+    let b100 = PHYSTAT_LINKSTS | PHYSTAT_100BPS;
+    let s100 = PhyStatus::parse(b100);
+    if s100.speed_5g { return TestResult::Fail("100M: speed_5g must be false"); }
+    if s100.speed_label() != "100M" { return TestResult::Fail("100M: speed_label wrong"); }
+    // Down.
+    let down = PhyStatus::parse(0x00);
+    if down.link_up || down.speed_5g { return TestResult::Fail("down: must not report link_up or speed_5g"); }
+    if down.speed_label() != "down" { return TestResult::Fail("down: speed_label must be \"down\""); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_phystat_decode_5g);
+
+fn smoke_rtl8126_tso_desc_encode() -> TestResult {
+    // TSO descriptor: TD1_GTSENV4 + csum bits + MSS field.
+    // Same v2 offload path as RTL8125. Linux r8169_main.c `rtl8169_tso_csum_v2`.
+    use crate::rtl8126::{TxDesc, TD1_GTSENV4, TD1_IPv4_CS, TD1_MSS_SHIFT, TD1_TCP_CS};
+    let d = TxDesc::with_tso(0xF000u32, 0x0001u32, 1448, 1448);
+    if d.vlan & TD1_GTSENV4 == 0 { return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 not set"); }
+    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("rtl8126 TSO: TD1_IPv4_CS not set"); }
+    if d.vlan & TD1_TCP_CS == 0  { return TestResult::Fail("rtl8126 TSO: TD1_TCP_CS not set"); }
+    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 { return TestResult::Fail("rtl8126 TSO: mss wrong"); }
+    // Bit positions must match RTL8125 (shared silicon).
+    if TD1_GTSENV4 != 1 << 26 { return TestResult::Fail("TD1_GTSENV4 bit position drift"); }
+    if TD1_IPv4_CS != 1 << 29 { return TestResult::Fail("TD1_IPv4_CS bit position drift"); }
+    if TD1_TCP_CS  != 1 << 30 { return TestResult::Fail("TD1_TCP_CS bit position drift"); }
+    if TD1_MSS_SHIFT != 18 { return TestResult::Fail("TD1_MSS_SHIFT must be 18"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_tso_desc_encode);
+
+fn smoke_rtl8126_csum_offload_bits() -> TestResult {
+    // csum-only descriptor: IPv4_CS + TCP_CS set, GTSENV4 must NOT be set.
+    use crate::rtl8126::{TxDesc, TD1_GTSENV4, TD1_IPv4_CS, TD1_TCP_CS};
+    let d = TxDesc::with_csum(0xE000u32, 0x0001u32, 60);
+    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("rtl8126 csum: TD1_IPv4_CS not set"); }
+    if d.vlan & TD1_TCP_CS == 0  { return TestResult::Fail("rtl8126 csum: TD1_TCP_CS not set"); }
+    if d.vlan & TD1_GTSENV4 != 0 { return TestResult::Fail("rtl8126 csum: TD1_GTSENV4 must not be set"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_csum_offload_bits);
+
+fn smoke_rtl8126_link_partner_cap_negotiation() -> TestResult {
+    // 5G→2.5G→1G→100M fallback in `LinkSpeed::negotiate`.
+    use crate::rtl8126::{
+        LinkSpeed, PhyStatus,
+        PHYSTAT_100BPS, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, PHYSTAT_TBI_OR_5G,
+    };
+    let cap_5g = PhyStatus::parse(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF | PHYSTAT_TBI_OR_5G);
+    // Both 5G → 5G.
+    if LinkSpeed::negotiate(&cap_5g, &cap_5g) != LinkSpeed::Speed5G {
+        return TestResult::Fail("5G+5G must negotiate 5G");
+    }
+    // Local=5G, partner=1G (no TBI) → at most 2.5G.
+    let cap_1g = PhyStatus::parse(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF);
+    if LinkSpeed::negotiate(&cap_5g, &cap_1g) != LinkSpeed::Speed2_5G {
+        return TestResult::Fail("5G+1G must fall back to 2.5G");
+    }
+    // Both 1G → 1G.
+    if LinkSpeed::negotiate(&cap_1g, &cap_1g) != LinkSpeed::Speed1G {
+        return TestResult::Fail("1G+1G must negotiate 1G");
+    }
+    // Both 100M.
+    let cap_100m = PhyStatus::parse(PHYSTAT_LINKSTS | PHYSTAT_100BPS);
+    if LinkSpeed::negotiate(&cap_100m, &cap_100m) != LinkSpeed::Speed100M {
+        return TestResult::Fail("100M+100M must negotiate 100M");
+    }
+    // Speed ordering.
+    if LinkSpeed::Speed5G <= LinkSpeed::Speed2_5G { return TestResult::Fail("ordering: 5G > 2.5G"); }
+    if LinkSpeed::Speed2_5G <= LinkSpeed::Speed1G { return TestResult::Fail("ordering: 2.5G > 1G"); }
+    if LinkSpeed::Speed1G <= LinkSpeed::Speed100M { return TestResult::Fail("ordering: 1G > 100M"); }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8126",
+    smoke_rtl8126_link_partner_cap_negotiation
+);
