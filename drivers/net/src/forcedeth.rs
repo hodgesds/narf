@@ -96,7 +96,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
 use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
+use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
@@ -379,7 +379,11 @@ impl Desc {
         Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_CHECKSUM_L3 | NV_TX2_CHECKSUM_L4 | (len as u32 & DESC_LEN_MASK_V2) }
     }
     pub fn tx_with_tso(buf: u32, len: u16, mss: u16) -> Self {
-        Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_TSO | NV_TX2_CHECKSUM_L3 | NV_TX2_CHECKSUM_L4 | ((mss as u32) << NV_TX2_TSO_SHIFT) | (len as u32 & DESC_LEN_MASK_V2) }
+        // NV_TX2_CHECKSUM_L3/L4 are NOT set when TSO is active — they are
+        // in an else-branch in Linux forcedeth.c:2335.  MSS occupies
+        // bits[27:14]; CHECKSUM_L3 is bit 27 — setting both corrupts the
+        // MSS field on the decode side.
+        Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_TSO | ((mss as u32) << NV_TX2_TSO_SHIFT) | (len as u32 & DESC_LEN_MASK_V2) }
     }
     pub fn rx_csum_result(&self) -> RxCsumResult {
         if self.flaglen & RXD_ERROR != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
@@ -686,7 +690,7 @@ impl ForcedethNic {
 
     /// Transmit a single Ethernet frame, polled. Frame must be in
     /// `[1, 1518]` bytes; padding for runt frames is the chip's job.
-    pub fn transmit(&self, frame: &[u8]) -> Result<(), NicError> {
+    pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -710,18 +714,25 @@ impl ForcedethNic {
             return Err(NicError::TxRingFull);
         }
 
+        // Build descriptor — select offload flags from TxMeta.
+        let d = if let Some(mss) = meta.tso_mss {
+            Desc::tx_with_tso(phys as u32, frame.len() as u16, mss)
+        } else if meta.csum_l4.is_some() {
+            Desc::tx_with_csum(phys as u32, frame.len() as u16)
+        } else {
+            Desc { buf: phys as u32, flaglen: TXD_VALID | TXD_LASTPACKET | (frame.len() as u32 & DESC_LEN_MASK_V2) }
+        };
         // Per forcedeth.c §"nv_start_xmit_optimized": write buf first,
-        // fence, then flip VALID. The chip sees VALID set only after
-        // the buffer pointer has propagated.
+        // fence, then flip flaglen (VALID + offload bits). The chip
+        // sees VALID set only after the buffer pointer has propagated.
         // SAFETY: identity-mapped DMA ring page.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut u32, phys as u32);
+            core::ptr::write_volatile(desc_addr as *mut u32, d.buf);
         }
         compiler_fence(Ordering::SeqCst);
-        let flaglen = TXD_VALID | TXD_LASTPACKET | (frame.len() as u32 & DESC_LEN_MASK_V2);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((desc_addr + 4) as *mut u32, flaglen);
+            core::ptr::write_volatile((desc_addr + 4) as *mut u32, d.flaglen);
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -988,7 +999,7 @@ async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Fram
 
 async fn forcedeth_tx_pump(device: Arc<ForcedethNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.transmit(frame.payload());
+        let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
 }
 
