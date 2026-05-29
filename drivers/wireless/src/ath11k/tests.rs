@@ -431,6 +431,73 @@ fn smoke_ath11k_probe_bound_or_skip() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_probe_bound_or_skip);
 
+// ── Stage 3: WMI VDEV commands ─────────────────────────────────────
+
+fn smoke_ath11k_wmi_vdev_create_encode() -> TestResult {
+    let mac: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let frame = build_vdev_create(0, vdev_type::STA, mac, 0);
+    // cmd_hdr(4) + VDEV_CREATE_CMD TLV hdr(4) + payload(36)
+    //           + ARRAY_STRUCT TLV hdr(4) + streams(24) = 72 bytes.
+    if frame.len() < 16 {
+        return TestResult::Fail("vdev_create frame too short");
+    }
+    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
+    if cmd_id != WMI_VDEV_CREATE_CMDID {
+        return TestResult::Fail("cmd_id != WMI_VDEV_CREATE_CMDID");
+    }
+    // walk_event parses from the cmd_hdr (offset 0), treating it as the event id.
+    let (evt_id, tlvs) = match walk_event(&frame) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("walk_event failed on vdev_create frame"),
+    };
+    if evt_id != WMI_VDEV_CREATE_CMDID {
+        return TestResult::Fail("walk_event evt_id != WMI_VDEV_CREATE_CMDID");
+    }
+    if tlvs.is_empty() {
+        return TestResult::Fail("no TLVs in vdev_create frame");
+    }
+    // First TLV is VDEV_CREATE_CMD; payload[0..4] = vdev_id.
+    if tlvs[0].payload.len() < 4 {
+        return TestResult::Fail("first TLV payload too short");
+    }
+    let vdev_id = u32::from_le_bytes(tlvs[0].payload[0..4].try_into().unwrap());
+    if vdev_id != 0 {
+        return TestResult::Fail("vdev_id != 0 in first TLV");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k/wmi", smoke_ath11k_wmi_vdev_create_encode);
+
+fn smoke_ath11k_wmi_vdev_set_param_channel_encode() -> TestResult {
+    let frame = build_vdev_set_param(0, vdev_param::CHANNEL, 5180);
+    // cmd_hdr(4) + VDEV_SET_PARAM_CMD TLV hdr(4) + payload(12) = 20 bytes.
+    if frame.len() != 20 {
+        return TestResult::Fail("vdev_set_param frame size wrong (expected 20)");
+    }
+    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
+    if cmd_id != WMI_VDEV_SET_PARAM_CMDID {
+        return TestResult::Fail("cmd_id != WMI_VDEV_SET_PARAM_CMDID");
+    }
+    // cmd_id must differ from ath10k's 0x5003.
+    if cmd_id == 0x5003 {
+        return TestResult::Fail("ath11k set_param cmd_id wrongly matches ath10k 0x5003");
+    }
+    // TLV payload at offset 8: vdev_id(4) + param_id(4) + param_value(4).
+    let param_id = u32::from_le_bytes(frame[12..16].try_into().unwrap());
+    let param_val = u32::from_le_bytes(frame[16..20].try_into().unwrap());
+    if param_id != vdev_param::CHANNEL {
+        return TestResult::Fail("param_id != CHANNEL");
+    }
+    if param_val != 5180 {
+        return TestResult::Fail("param_value != 5180");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/wmi",
+    smoke_ath11k_wmi_vdev_set_param_channel_encode
+);
+
 // Suppress the unused-import warning when the `Vec` import isn't
 // used by any helper above (compiler can't tell from the macro
 // expansion).

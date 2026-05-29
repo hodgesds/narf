@@ -261,3 +261,111 @@ pub fn build_init_cmd(rc: &ResourceConfig) -> Vec<u8> {
     b.push_tlv(WMI_TAG_RESOURCE_CONFIG, &rc.to_bytes());
     b.finish()
 }
+
+// ── VDEV commands ──────────────────────────────────────────────────
+//
+// After INIT, the host creates a virtual interface ("vdev") using
+// WMI_VDEV_CREATE_CMDID. ath11k uses TLV-wrapped WMI so the payload
+// is a VDEV_CREATE_CMD TLV (36-byte body) followed by two
+// VDEV_TXRX_STREAMS TLVs (12 bytes each) for 2.4GHz and 5GHz bands.
+//
+// Reference: `wmi.c::ath11k_wmi_vdev_create` line 717,
+//            `wmi.h::wmi_vdev_create_cmd` line 2625.
+
+/// Additional TLV tag IDs needed for VDEV commands.
+pub const WMI_TAG_VDEV_SET_PARAM_CMD: u16 = 0x69;
+pub const WMI_TAG_VDEV_TXRX_STREAMS: u16 = 0x68;
+pub const WMI_TAG_ARRAY_STRUCT: u16 = 0x15;
+
+/// TPC chainmask band indices.
+pub const WMI_TPC_CHAINMASK_CONFIG_BAND_2G: u32 = 0;
+pub const WMI_TPC_CHAINMASK_CONFIG_BAND_5G: u32 = 1;
+
+/// VDEV type constants (`wmi.h::enum wmi_vdev_type`).
+pub mod vdev_type {
+    pub const AP: u32 = 1;
+    pub const STA: u32 = 2;
+    pub const IBSS: u32 = 3;
+    pub const MONITOR: u32 = 4;
+}
+
+/// VDEV subtype constants.
+pub mod vdev_subtype {
+    pub const NONE: u32 = 0;
+    pub const P2P_DEVICE: u32 = 1;
+    pub const P2P_CLIENT: u32 = 2;
+    pub const P2P_GO: u32 = 3;
+}
+
+/// `WMI_VDEV_SET_PARAM_CMDID` — VDEV_CREATE group base + 7.
+/// `wmi.h` encodes this as `WMI_TLV_CMD(WMI_GRP_VDEV) + 7`.
+pub const WMI_VDEV_SET_PARAM_CMDID: u32 = WMI_VDEV_CREATE_CMDID + 7;
+
+/// VDEV parameter IDs (`wmi.h::enum wmi_vdev_param`).
+pub mod vdev_param {
+    pub const RTS_THRESHOLD: u32 = 0x1;
+    pub const FRAGMENTATION_THRESHOLD: u32 = 0x2;
+    pub const BEACON_INTERVAL: u32 = 0x3;
+    pub const DTIM_PERIOD: u32 = 0x9;
+    pub const CHANNEL: u32 = 0x22;
+}
+
+/// Build a `WMI_VDEV_CREATE_CMDID` command frame.
+///
+/// Emits: cmd_hdr + VDEV_CREATE_CMD TLV (36 bytes) +
+/// ARRAY_STRUCT TLV wrapping 2× VDEV_TXRX_STREAMS (2.4G + 5G).
+///
+/// Reference: `wmi.c::ath11k_wmi_vdev_create` (line 717).
+pub fn build_vdev_create(
+    vdev_id: u32,
+    vdev_type_: u32,
+    mac_addr: [u8; 6],
+    pdev_id: u32,
+) -> Vec<u8> {
+    let mut b = WmiCmdBuilder::new(WMI_VDEV_CREATE_CMDID);
+
+    // VDEV_CREATE_CMD TLV payload (36 bytes):
+    //   vdev_id(4) + vdev_type(4) + vdev_subtype(4) +
+    //   mac_addr(6) + pad(2) + num_cfg_txrx_streams(4) +
+    //   pdev_id(4) + mbssid_flags(4) + mbssid_tx_vdev_id(4) = 36 bytes
+    let mut vdev_payload = [0u8; 36];
+    vdev_payload[0..4].copy_from_slice(&vdev_id.to_le_bytes());
+    vdev_payload[4..8].copy_from_slice(&vdev_type_.to_le_bytes());
+    // vdev_subtype = NONE at offset 8 (already 0)
+    vdev_payload[12..18].copy_from_slice(&mac_addr);
+    // num_cfg_txrx_streams = 2 at offset 20
+    vdev_payload[20..24].copy_from_slice(&2u32.to_le_bytes());
+    vdev_payload[24..28].copy_from_slice(&pdev_id.to_le_bytes());
+    b.push_tlv(WMI_TAG_VDEV_CREATE_CMD, &vdev_payload);
+
+    // ARRAY_STRUCT TLV containing 2 VDEV_TXRX_STREAMS entries.
+    // Each entry: TLV header(4) + band(4) + supported_rate_chains(4) + preferred_tx_streams(4) = 12 bytes.
+    let mut streams_payload = Vec::with_capacity(24);
+    for band in [WMI_TPC_CHAINMASK_CONFIG_BAND_2G, WMI_TPC_CHAINMASK_CONFIG_BAND_5G] {
+        // Inner TLV header for VDEV_TXRX_STREAMS.
+        let inner_hdr = pack_tlv_header(WMI_TAG_VDEV_TXRX_STREAMS, 8);
+        streams_payload.extend_from_slice(&inner_hdr.to_le_bytes());
+        streams_payload.extend_from_slice(&band.to_le_bytes());
+        // supported_rate_chains = 1, preferred_tx_streams = 0.
+        streams_payload.extend_from_slice(&1u32.to_le_bytes());
+        streams_payload.extend_from_slice(&0u32.to_le_bytes());
+    }
+    b.push_tlv(WMI_TAG_ARRAY_STRUCT, &streams_payload);
+
+    b.finish()
+}
+
+/// Build a `WMI_VDEV_SET_PARAM_CMDID` command frame.
+///
+/// Payload TLV: `{ vdev_id, param_id, param_value }` (12 bytes).
+///
+/// Reference: `wmi.h::struct wmi_vdev_set_param_cmd`.
+pub fn build_vdev_set_param(vdev_id: u32, param_id: u32, param_value: u32) -> Vec<u8> {
+    let mut payload = [0u8; 12];
+    payload[0..4].copy_from_slice(&vdev_id.to_le_bytes());
+    payload[4..8].copy_from_slice(&param_id.to_le_bytes());
+    payload[8..12].copy_from_slice(&param_value.to_le_bytes());
+    let mut b = WmiCmdBuilder::new(WMI_VDEV_SET_PARAM_CMDID);
+    b.push_tlv(WMI_TAG_VDEV_SET_PARAM_CMD, &payload);
+    b.finish()
+}
