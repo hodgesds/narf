@@ -37,7 +37,6 @@
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -55,15 +54,15 @@ use crate::pkt_tcp::{
     TCP_HDR_MIN,
 };
 
-use super::congestion::{seq_geq, seq_gt, seq_leq, seq_lt, CongAlg, CongestionState};
+use super::congestion::{seq_geq, seq_leq, seq_lt, CongAlg, CongestionState};
 use super::options::{
     encode_data_options, encode_syn_options, OptionsState, ParsedOptions, DEFAULT_WSCALE,
     MIN_MSS,
 };
-use super::retransmit::{OutSeg, RttEstimator, MAX_RETRANSMITS};
+use super::retransmit::{OutSeg, RttEstimator};
 use super::sack::{SackBlock, SackBook, SenderScoreboard};
 use super::socket_buf::{RecvBuf, SendBuf, DEFAULT_RCV_BUF, DEFAULT_SND_BUF};
-use super::state_machine::{DropCause, Shutdown, TcpState, Transition};
+use super::state_machine::{DropCause, Shutdown, TcpState};
 
 // ── Configuration constants ─────────────────────────────────────────
 
@@ -989,7 +988,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // out of the send buffer (data) or by synthesising a FIN.
     let payload_len = seg.len.saturating_sub(if seg.flags & FLAG_FIN != 0 { 1 } else { 0 });
     let (payload, peer_mac, src_ip, dst_ip, src_port, dst_port, ack, window, opt_bytes, _flags) = {
-        let mut t = arc.lock();
+        let t = arc.lock();
         let want = payload_len as usize;
         let mut payload = Vec::with_capacity(want);
         let (a, b) = t.send_buf.unsent_slices(want);
@@ -1864,7 +1863,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Retransmit segments at snd_una that aren't on the SACK
     // scoreboard. This is the RFC 6675 selective-retx path.
     let (seg_seq, seg_flags, payload, peer_mac, src_ip, dst_ip, src_port, dst_port, window, ack, opt_bytes) = {
-        let mut t = arc.lock();
+        let t = arc.lock();
         let oldest = match t.retx_queue.front() {
             Some(s) => *s,
             None => return,
