@@ -4664,3 +4664,466 @@ fn smoke_ipv6_mld_join_report() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6", smoke_ipv6_mld_join_report);
+
+// ── netfilter smokes ────────────────────────────────────────────────
+
+/// Build a minimal IPv4 + TCP packet for the netfilter smokes.
+/// 20-byte IP header + 20-byte TCP header, total 40 bytes; everything
+/// after byte 20 is the L4 header.
+fn nf_build_tcp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, flags: u8) -> alloc::vec::Vec<u8> {
+    use alloc::vec;
+    let mut p = vec![0u8; 40];
+    p[0] = 0x45;                 // ver=4, ihl=5
+    p[2] = 0x00; p[3] = 40;      // total length
+    p[8] = 64;                   // ttl
+    p[9] = 6;                    // proto = TCP
+    p[12..16].copy_from_slice(&src);
+    p[16..20].copy_from_slice(&dst);
+    // TCP header at offset 20.
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p[32] = 0x50;                // data offset = 5 (20 bytes)
+    p[33] = flags;
+    p[34] = 0xFF; p[35] = 0xFF;  // window
+    p
+}
+
+fn nf_build_udp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> alloc::vec::Vec<u8> {
+    use alloc::vec;
+    let mut p = vec![0u8; 28];
+    p[0] = 0x45;
+    p[2] = 0x00; p[3] = 28;
+    p[8] = 64;
+    p[9] = 17;
+    p[12..16].copy_from_slice(&src);
+    p[16..20].copy_from_slice(&dst);
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p[24] = 0x00; p[25] = 8;     // UDP length
+    p[26] = 0x00; p[27] = 0x00;  // csum = 0 (no checksum)
+    p
+}
+
+fn smoke_nf_hook_register_dispatch() -> TestResult {
+    use crate::netfilter::{
+        hooks, nf_register_hook, nf_dispatch,
+        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+    __reset_all_for_test();
+    static CALLED: AtomicU32 = AtomicU32::new(0);
+    fn hook_count(_ctx: &mut PktCtx<'_>) -> Verdict {
+        CALLED.fetch_add(1, Ordering::Relaxed);
+        Verdict::Accept
+    }
+    CALLED.store(0, Ordering::Relaxed);
+    nf_register_hook(HookPoint::PreRouting, 0, hook_count);
+    if hooks().len(HookPoint::PreRouting) != 1 {
+        return TestResult::Fail("hook didn't register");
+    }
+    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let v;
+    {
+        let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
+        v = nf_dispatch(&mut ctx);
+    }
+    if v != Verdict::Accept {
+        return TestResult::Fail("verdict should be Accept");
+    }
+    if CALLED.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("hook was not invoked exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_nf_hook_register_dispatch);
+
+fn smoke_nf_hook_chain_priority_ordering() -> TestResult {
+    use crate::netfilter::{
+        nf_register_hook, nf_dispatch,
+        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+    __reset_all_for_test();
+    static ORDER: AtomicU32 = AtomicU32::new(0);
+    static FIRST: AtomicU32 = AtomicU32::new(0);
+    static SECOND: AtomicU32 = AtomicU32::new(0);
+    fn pri0(_ctx: &mut PktCtx<'_>) -> Verdict {
+        FIRST.store(ORDER.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        Verdict::Accept
+    }
+    fn pri100(_ctx: &mut PktCtx<'_>) -> Verdict {
+        SECOND.store(ORDER.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        Verdict::Accept
+    }
+    ORDER.store(0, Ordering::Relaxed);
+    FIRST.store(0, Ordering::Relaxed);
+    SECOND.store(0, Ordering::Relaxed);
+    // Install priority 100 first, then 0 — chain should still run 0 first.
+    nf_register_hook(HookPoint::PreRouting, 100, pri100);
+    nf_register_hook(HookPoint::PreRouting, 0, pri0);
+    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    {
+        let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
+        let _ = nf_dispatch(&mut ctx);
+    }
+    if FIRST.load(Ordering::Relaxed) >= SECOND.load(Ordering::Relaxed) {
+        return TestResult::Fail("priority 0 must run before priority 100");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_nf_hook_chain_priority_ordering);
+
+fn smoke_ct_new_tcp_syn_creates_syn_sent() -> TestResult {
+    use crate::netfilter::{
+        conntrack::{conntrack_hook, ct, TcpCtState},
+        HookPoint, PktCtx, __reset_all_for_test, Tuple,
+    };
+    __reset_all_for_test();
+    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 5555, 80, 0x02);
+    let id_opt;
+    {
+        let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
+        let _ = conntrack_hook(&mut ctx);
+        id_opt = ctx.conntrack_id;
+    }
+    if ct().len() != 1 {
+        return TestResult::Fail("conntrack table should hold 1 entry");
+    }
+    let id = match id_opt {
+        Some(i) => i,
+        None => return TestResult::Fail("conntrack id not assigned"),
+    };
+    let entry = ct().lookup(&Tuple{
+        src_ip: [10,0,0,5], dst_ip: [203,0,113,7],
+        src_port: 5555, dst_port: 80, proto: 6,
+    }).expect("entry");
+    if entry.lock().id != id {
+        return TestResult::Fail("id mismatch");
+    }
+    if entry.lock().tcp_state != Some(TcpCtState::SynSent) {
+        return TestResult::Fail("TCP state should be SynSent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_ct_new_tcp_syn_creates_syn_sent);
+
+fn smoke_ct_tcp_synack_advances_to_synrecv() -> TestResult {
+    use crate::netfilter::{
+        conntrack::{conntrack_hook, ct, TcpCtState},
+        HookPoint, PktCtx, __reset_all_for_test, Tuple,
+    };
+    __reset_all_for_test();
+    // 1) SYN: 10.0.0.5:5555 → 203.0.113.7:80
+    let mut p1 = nf_build_tcp([10,0,0,5], [203,0,113,7], 5555, 80, 0x02);
+    {
+        let mut c1 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p1);
+        let _ = conntrack_hook(&mut c1);
+    }
+    // 2) SYN+ACK in reply direction: 203.0.113.7:80 → 10.0.0.5:5555
+    let mut p2 = nf_build_tcp([203,0,113,7], [10,0,0,5], 80, 5555, 0x12);
+    {
+        let mut c2 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p2);
+        let _ = conntrack_hook(&mut c2);
+    }
+    let tuple = Tuple{ src_ip: [10,0,0,5], dst_ip: [203,0,113,7], src_port: 5555, dst_port: 80, proto: 6 };
+    let entry = ct().lookup(&tuple).expect("entry");
+    let g = entry.lock();
+    // After SYN+ACK the state moves to SynRecv (await ACK to become Established).
+    if g.tcp_state != Some(TcpCtState::SynRecv) {
+        return TestResult::Fail("TCP state should be SynRecv after SYN+ACK reply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_ct_tcp_synack_advances_to_synrecv);
+
+fn smoke_ct_udp_new_then_reply_established() -> TestResult {
+    use crate::netfilter::{
+        conntrack::{conntrack_hook, ct, CtState},
+        HookPoint, PktCtx, Tuple, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    let mut p1 = nf_build_udp([10,0,0,5], [8,8,8,8], 5555, 53);
+    {
+        let mut c1 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p1);
+        let _ = conntrack_hook(&mut c1);
+    }
+    let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:5555, dst_port:53, proto:17 };
+    let entry = ct().lookup(&t).expect("entry");
+    if entry.lock().state != CtState::New {
+        return TestResult::Fail("first UDP packet should be NEW");
+    }
+    drop(entry);
+    // Reply.
+    let mut p2 = nf_build_udp([8,8,8,8], [10,0,0,5], 53, 5555);
+    {
+        let mut c2 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p2);
+        let _ = conntrack_hook(&mut c2);
+    }
+    let entry = ct().lookup(&t).expect("entry");
+    if entry.lock().state != CtState::Established {
+        return TestResult::Fail("UDP should be ESTABLISHED after reply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_ct_udp_new_then_reply_established);
+
+fn smoke_ct_expiry_evicts_idle_entry() -> TestResult {
+    use crate::netfilter::{
+        conntrack::{ct, UDP_DEFAULT_EXPIRY_NS},
+        Tuple, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:5555, dst_port:53, proto:17 };
+    let _ = ct().insert_new(t, 0);
+    if ct().len() != 1 {
+        return TestResult::Fail("entry should exist");
+    }
+    // Reap with now > expiry: UDP default 30s.
+    let removed = ct().reap_expired(UDP_DEFAULT_EXPIRY_NS + 1);
+    if removed != 1 {
+        return TestResult::Fail("expected 1 entry reaped");
+    }
+    if ct().len() != 0 {
+        return TestResult::Fail("table should be empty after reap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_ct_expiry_evicts_idle_entry);
+
+fn smoke_ct_lru_evicts_oldest_at_capacity() -> TestResult {
+    use crate::netfilter::{
+        conntrack::Conntrack,
+        Tuple,
+    };
+    // Use a dedicated table cap-3 to verify the LRU eviction policy.
+    let table = Conntrack::new(3);
+    let t1 = Tuple{src_ip:[10,0,0,1], dst_ip:[8,8,8,8], src_port:1, dst_port:53, proto:17};
+    let t2 = Tuple{src_ip:[10,0,0,2], dst_ip:[8,8,8,8], src_port:2, dst_port:53, proto:17};
+    let t3 = Tuple{src_ip:[10,0,0,3], dst_ip:[8,8,8,8], src_port:3, dst_port:53, proto:17};
+    let t4 = Tuple{src_ip:[10,0,0,4], dst_ip:[8,8,8,8], src_port:4, dst_port:53, proto:17};
+    let _ = table.insert_new(t1, 100);
+    let _ = table.insert_new(t2, 200);
+    let _ = table.insert_new(t3, 300);
+    if table.len() != 3 {
+        return TestResult::Fail("expected len=3 after 3 inserts");
+    }
+    // 4th insert evicts LRU (t1).
+    let _ = table.insert_new(t4, 400);
+    if table.len() != 3 {
+        return TestResult::Fail("len should stay capped at 3");
+    }
+    if table.lookup(&t1).is_some() {
+        return TestResult::Fail("t1 should have been LRU-evicted");
+    }
+    if table.lookup(&t4).is_none() {
+        return TestResult::Fail("t4 should be present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_ct_lru_evicts_oldest_at_capacity);
+
+fn smoke_nat_masquerade_rewrites_egress() -> TestResult {
+    use crate::netfilter::{
+        nat::{nat_masquerade_add, snat_postrouting, nat},
+        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
+    let mut packet = nf_build_tcp([10,0,0,5], [198,51,100,1], 1234, 80, 0x02);
+    let ct_id;
+    let v;
+    {
+        let mut ctx = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut packet);
+        v = snat_postrouting(&mut ctx);
+        ct_id = ctx.conntrack_id;
+    }
+    if v != Verdict::Accept {
+        return TestResult::Fail("verdict should be Accept");
+    }
+    let new_src = [packet[12], packet[13], packet[14], packet[15]];
+    if new_src != [203,0,113,7] {
+        return TestResult::Fail("src IP should be rewritten to 203.0.113.7");
+    }
+    let new_sport = u16::from_be_bytes([packet[20], packet[21]]);
+    if new_sport == 0 {
+        return TestResult::Fail("src port should not be 0");
+    }
+    let ct_id = ct_id.expect("ct id");
+    if nat().lookup_ct(ct_id).is_none() {
+        return TestResult::Fail("NAT mapping not recorded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_nat_masquerade_rewrites_egress);
+
+fn smoke_nat_reverse_restores_dst_on_reply() -> TestResult {
+    use crate::netfilter::{
+        nat::{nat_masquerade_add, snat_postrouting, dnat_prerouting},
+        HookPoint, PktCtx, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
+    let mut egress = nf_build_tcp([10,0,0,5], [198,51,100,1], 1234, 80, 0x02);
+    {
+        let mut ec = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut egress);
+        let _ = snat_postrouting(&mut ec);
+    }
+    let nat_sport = u16::from_be_bytes([egress[20], egress[21]]);
+    let mut reply = nf_build_tcp([198,51,100,1], [203,0,113,7], 80, nat_sport, 0x12);
+    {
+        let mut rc = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut reply);
+        let _ = dnat_prerouting(&mut rc);
+    }
+    let new_dst = [reply[16], reply[17], reply[18], reply[19]];
+    let new_dport = u16::from_be_bytes([reply[22], reply[23]]);
+    if new_dst != [10,0,0,5] {
+        return TestResult::Fail("reply dst IP should be restored to 10.0.0.5");
+    }
+    if new_dport != 1234 {
+        return TestResult::Fail("reply dst port should be restored to 1234");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_nat_reverse_restores_dst_on_reply);
+
+fn smoke_nat_port_collision_reallocates() -> TestResult {
+    use crate::netfilter::{
+        nat::{nat_masquerade_add, snat_postrouting},
+        HookPoint, PktCtx, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
+    let mut a = nf_build_tcp([10,0,0,5], [198,51,100,1], 32768, 80, 0x02);
+    {
+        let mut ac = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut a);
+        let _ = snat_postrouting(&mut ac);
+    }
+    let a_sport = u16::from_be_bytes([a[20], a[21]]);
+    let mut b = nf_build_tcp([10,0,0,6], [198,51,100,1], 32768, 80, 0x02);
+    {
+        let mut bc = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut b);
+        let _ = snat_postrouting(&mut bc);
+    }
+    let b_sport = u16::from_be_bytes([b[20], b[21]]);
+    if a_sport == b_sport {
+        return TestResult::Fail("colliding flows should get distinct NAT ports");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_nat_port_collision_reallocates);
+
+fn smoke_filter_drop_rule_at_prerouting() -> TestResult {
+    use crate::netfilter::{
+        filter::{nf_table_add, filter_prerouting},
+        rules::Match,
+        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    let m = Match::from_src_ip([10,0,0,99]);
+    nf_table_add("filter", "prerouting", m, Verdict::Drop);
+    let mut packet = nf_build_tcp([10,0,0,99], [203,0,113,7], 1234, 80, 0x02);
+    let v;
+    {
+        let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
+        v = filter_prerouting(&mut ctx);
+    }
+    if v != Verdict::Drop {
+        return TestResult::Fail("matching DROP rule should yield Verdict::Drop");
+    }
+    let mut p2 = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let v2;
+    {
+        let mut c2 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p2);
+        v2 = filter_prerouting(&mut c2);
+    }
+    if v2 != Verdict::Accept {
+        return TestResult::Fail("non-matching packet should be accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_filter_drop_rule_at_prerouting);
+
+fn smoke_filter_default_policy_accept() -> TestResult {
+    use crate::netfilter::{
+        filter::filter_input,
+        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let v;
+    {
+        let mut ctx = PktCtx::new_ipv4(HookPoint::LocalIn, "eth0", "", &mut packet);
+        v = filter_input(&mut ctx);
+    }
+    if v != Verdict::Accept {
+        return TestResult::Fail("empty filter table should default-Accept");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_filter_default_policy_accept);
+
+fn smoke_icmp_ratelimit_drops_excess() -> TestResult {
+    use crate::netfilter::icmp_ratelimit;
+    let rl = icmp_ratelimit();
+    rl.__reset_for_test();
+    let mut accepted = 0u32;
+    let mut dropped = 0u32;
+    for _ in 0..1100 {
+        if rl.try_acquire(0) { accepted += 1; } else { dropped += 1; }
+    }
+    if accepted != 1000 {
+        return TestResult::Fail("bucket cap should yield ~1000 accepts");
+    }
+    if dropped != 100 {
+        return TestResult::Fail("expected ~100 drops");
+    }
+    let _ = rl.try_acquire(1_000_000_000);
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_icmp_ratelimit_drops_excess);
+
+fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
+    use crate::netfilter::{
+        nat::{nat_masquerade_add, snat_postrouting, dnat_prerouting},
+        conntrack::{conntrack_hook, ct, TcpCtState},
+        HookPoint, PktCtx, Tuple, __reset_all_for_test,
+    };
+    __reset_all_for_test();
+    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
+    let mut syn = nf_build_tcp([10,0,0,5], [8,8,8,8], 42000, 80, 0x02);
+    {
+        let mut c1 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut syn);
+        let _ = conntrack_hook(&mut c1);
+    }
+    {
+        let mut c2 = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut syn);
+        let _ = snat_postrouting(&mut c2);
+    }
+    let nat_sport = u16::from_be_bytes([syn[20], syn[21]]);
+    let new_src = [syn[12], syn[13], syn[14], syn[15]];
+    if new_src != [203,0,113,7] {
+        return TestResult::Fail("egress src not masqueraded");
+    }
+    let mut synack = nf_build_tcp([8,8,8,8], [203,0,113,7], 80, nat_sport, 0x12);
+    {
+        let mut c3 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut synack);
+        let _ = dnat_prerouting(&mut c3);
+    }
+    let dst = [synack[16], synack[17], synack[18], synack[19]];
+    let dport = u16::from_be_bytes([synack[22], synack[23]]);
+    if dst != [10,0,0,5] || dport != 42000 {
+        return TestResult::Fail("reply dst not restored");
+    }
+    {
+        let mut c4 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut synack);
+        let _ = conntrack_hook(&mut c4);
+    }
+    let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:42000, dst_port:80, proto:6 };
+    let entry = ct().lookup(&t).expect("entry");
+    let state = entry.lock().tcp_state;
+    if state != Some(TcpCtState::SynRecv) {
+        return TestResult::Fail("TCP state should be SynRecv after SYN+ACK reply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/netfilter", smoke_nf_e2e_nat_round_trip_smoke);

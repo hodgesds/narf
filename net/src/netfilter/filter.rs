@@ -12,7 +12,7 @@
 //! Filter hooks run at priority `0` so they sit *between* conntrack
 //! (`-200`) and NAT (`+100`).
 
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
