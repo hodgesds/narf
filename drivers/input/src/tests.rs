@@ -2158,3 +2158,475 @@ kernel_test_in!(
     smoke_rmi4_f30_button_bitmap_to_btn_codes
 );
 
+// ── HID multi-touch class driver smokes ──────────────────────────
+//
+// Lives in drivers/input/{hid_multitouch.rs,hid_mt_features.rs}.
+// Covers report-descriptor shape match, slot-B emission, PTP
+// feature mode encode + max-contact decode, button state, 4
+// per-device classes (Default/Win8/Apple/Nsmu), and the
+// touchscreen variant. References:
+//   - linux/drivers/hid/hid-multitouch.c
+//   - HID Usage Tables 1.4 §16
+//   - Microsoft PTP Implementation Guide
+
+fn smoke_mt_descriptor_matches_touchpad_collection() -> TestResult {
+    use crate::hid_multitouch::MtShape;
+    use narf_hid::descriptor::parse;
+    let blob = narf_hid::ptp::__ptp_descriptor_blob();
+    let parsed = match parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("PTP blob fails to parse"),
+    };
+    match MtShape::detect(&parsed) {
+        Some(MtShape::TouchPad) => TestResult::Pass,
+        Some(other) => {
+            let _ = other;
+            TestResult::Fail("expected TouchPad shape on PTP blob")
+        }
+        None => TestResult::Fail("PTP blob not matched as MT"),
+    }
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_descriptor_matches_touchpad_collection
+);
+
+fn smoke_mt_descriptor_matches_touchscreen_collection() -> TestResult {
+    use crate::hid_multitouch::{MtClass, MtShape, __attach_synth_screen_for_test};
+    let dev = __attach_synth_screen_for_test(MtClass::Default, 0);
+    if dev.shape != MtShape::TouchScreen {
+        return TestResult::Fail("expected TouchScreen shape on synth descriptor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_descriptor_matches_touchscreen_collection
+);
+
+fn smoke_mt_contact_id_and_tip_switch_fields_resolved() -> TestResult {
+    // Reuses the in-tree PTP profile probe — confirms that on the
+    // canonical PTP blob, every per-contact ContactFields entry has
+    // a non-None contact_id field AND that tip_switch is populated.
+    use narf_hid::descriptor::parse;
+    use narf_hid::ptp;
+    let blob = ptp::__ptp_descriptor_blob();
+    let parsed = match parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("PTP blob parse"),
+    };
+    let profile = match ptp::detect(&parsed) {
+        Some(p) => p,
+        None => return TestResult::Fail("PTP blob not matched"),
+    };
+    for (i, c) in profile.contacts.iter().enumerate() {
+        if c.contact_id.is_none() {
+            let _ = i;
+            return TestResult::Fail("contact missing contact_id field");
+        }
+        // tip_switch is non-Option in ContactFields — its presence
+        // is implicit. Sanity-check the report_size is at least 1
+        // bit per HID spec.
+        if c.tip_switch.report_size == 0 {
+            return TestResult::Fail("tip_switch field has zero report_size");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_contact_id_and_tip_switch_fields_resolved
+);
+
+fn smoke_mt_ptp_mode_feature_encode_round_trip() -> TestResult {
+    use crate::hid_mt_features::{encode_mode_feature, mode};
+    use narf_hid::descriptor::parse;
+    use narf_hid::ptp;
+    let blob = ptp::__ptp_descriptor_blob();
+    let parsed = match parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("parse"),
+    };
+    let p = match ptp::detect(&parsed) {
+        Some(p) => p,
+        None => return TestResult::Fail("PTP detect"),
+    };
+    let bytes = match encode_mode_feature(&p, mode::TOUCHPAD) {
+        Some(b) => b,
+        None => return TestResult::Fail("encode_mode_feature returned None"),
+    };
+    // First byte = report-id (Configuration TLC = 3 in the canonical
+    // blob). Body[0] should carry the mode = 0x03.
+    if bytes.is_empty() {
+        return TestResult::Fail("empty mode feature");
+    }
+    if bytes[0] != 3 {
+        return TestResult::Fail("mode report id wrong");
+    }
+    if bytes.len() < 2 || bytes[1] != mode::TOUCHPAD {
+        return TestResult::Fail("mode byte not placed at body[0]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_ptp_mode_feature_encode_round_trip
+);
+
+fn smoke_mt_max_contact_count_decode_defaults() -> TestResult {
+    use crate::hid_mt_features::{decode_max_contact_count, find_contact_count_max_feature};
+    use narf_hid::descriptor::parse;
+    use narf_hid::ptp;
+    let blob = ptp::__ptp_descriptor_blob();
+    let parsed = match parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("parse"),
+    };
+    // The canonical blob doesn't expose a Contact Count Max field;
+    // find_contact_count_max_feature should return None.
+    if find_contact_count_max_feature(&parsed).is_some() {
+        // Blob updated — recompute against a real field.
+        let f = find_contact_count_max_feature(&parsed).unwrap().clone();
+        let body = alloc::vec![0u8; 8];
+        let v = decode_max_contact_count(&f, &body);
+        if v == 0 {
+            return TestResult::Fail("decoded zero, expected fallback ≥1");
+        }
+    }
+    // Resolve path: with no class override and no Feature field,
+    // we should fall back to profile.contacts_max (2) per the
+    // canonical blob.
+    let p = match ptp::detect(&parsed) {
+        Some(p) => p,
+        None => return TestResult::Fail("PTP detect"),
+    };
+    let n = crate::hid_mt_features::resolve_max_contacts(&p, &parsed, None);
+    if n != 2 {
+        return TestResult::Fail("expected resolve_max_contacts == 2 for canonical blob");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_max_contact_count_decode_defaults
+);
+
+fn smoke_mt_five_finger_contacts_emit_five_slot_events() -> TestResult {
+    use crate::hid_multitouch::{
+        MtClass, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
+        __reset_registry_for_test,
+    };
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch};
+    init_global_ring(64);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    let dev = __attach_synth_pad_for_test(MtClass::Win8, 5);
+    // Five contacts, all tip=true.
+    let decoded = __build_ptp_decoded_for_test(
+        &[
+            (10, true, 100, 200),
+            (11, true, 110, 210),
+            (12, true, 120, 220),
+            (13, true, 130, 230),
+            (14, true, 140, 240),
+        ],
+        false,
+    );
+    let emitted = dev.pump_ptp(&decoded);
+    if emitted < 5 {
+        return TestResult::Fail("expected ≥5 events");
+    }
+    let mut seen_slots = 0u32;
+    for _ in 0..5 {
+        let t = match pop_touch() {
+            Some(t) => t,
+            None => return TestResult::Fail("expected 5 Touch events"),
+        };
+        if t.tracking_id.is_none() {
+            return TestResult::Fail("tracking_id should be Some on Down");
+        }
+        seen_slots |= 1 << t.slot;
+    }
+    if seen_slots.count_ones() != 5 {
+        return TestResult::Fail("expected 5 distinct slots");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_five_finger_contacts_emit_five_slot_events
+);
+
+fn smoke_mt_contact_release_emits_tracking_id_none() -> TestResult {
+    use crate::hid_multitouch::{
+        MtClass, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
+        __reset_registry_for_test,
+    };
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch};
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    let dev = __attach_synth_pad_for_test(MtClass::Win8, 5);
+    // Frame 1: contact down.
+    let down = __build_ptp_decoded_for_test(&[(7, true, 100, 200)], false);
+    let _ = dev.pump_ptp(&down);
+    // Drain Down event.
+    let t_down = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected Down event"),
+    };
+    if t_down.tracking_id != Some(7) {
+        return TestResult::Fail("Down tracking_id mismatch");
+    }
+    // Frame 2: same contact_id, tip=false → release.
+    let up = __build_ptp_decoded_for_test(&[(7, false, 100, 200)], false);
+    let _ = dev.pump_ptp(&up);
+    let t_up = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected Up event"),
+    };
+    if t_up.tracking_id.is_some() {
+        return TestResult::Fail("Up event tracking_id should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_contact_release_emits_tracking_id_none
+);
+
+fn smoke_mt_button1_press_emits_pointer_left() -> TestResult {
+    use crate::hid_multitouch::{
+        MtClass, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
+        __reset_registry_for_test,
+    };
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_pointer, PointerButtons,
+    };
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    let dev = __attach_synth_pad_for_test(MtClass::Default, 5);
+    // Frame 1: button up.
+    let f1 = __build_ptp_decoded_for_test(&[(1, false, 0, 0)], false);
+    let _ = dev.pump_ptp(&f1);
+    // Drain any noise.
+    let _ = pop_pointer();
+    // Frame 2: button1 press.
+    let f2 = __build_ptp_decoded_for_test(&[(1, false, 0, 0)], true);
+    let _ = dev.pump_ptp(&f2);
+    let p = match pop_pointer() {
+        Some(p) => p,
+        None => return TestResult::Fail("expected PointerEvent on button1 press"),
+    };
+    if !p.buttons.contains(PointerButtons::LEFT) {
+        return TestResult::Fail("LEFT button bit missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_button1_press_emits_pointer_left
+);
+
+fn smoke_mt_apple_class_lookup_carries_apple_quirks() -> TestResult {
+    use crate::hid_multitouch::{lookup_class, MtClass, MtQuirks};
+    let e = lookup_class(MtClass::Apple);
+    if !e.quirks.contains(MtQuirks::APPLE_TOUCHBAR) {
+        return TestResult::Fail("Apple class missing APPLE_TOUCHBAR");
+    }
+    if !e.quirks.contains(MtQuirks::SLOT_IS_CONTACTID_MINUS_ONE) {
+        return TestResult::Fail("Apple class missing SLOT_IS_CONTACTID_MINUS_ONE");
+    }
+    if e.max_contacts != 11 {
+        return TestResult::Fail("Apple max_contacts should be 11");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_apple_class_lookup_carries_apple_quirks
+);
+
+fn smoke_mt_win8_class_defaults_to_five_contacts() -> TestResult {
+    use crate::hid_mt_features::DEFAULT_MAX_CONTACTS;
+    use crate::hid_multitouch::{MtClass, __attach_synth_pad_for_test};
+    let dev = __attach_synth_pad_for_test(MtClass::Win8, 0);
+    if dev.max_contacts != DEFAULT_MAX_CONTACTS {
+        return TestResult::Fail("Win8 attach should default max_contacts to 5");
+    }
+    Ok::<(), ()>(()).err().ok_or(()).err();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_win8_class_defaults_to_five_contacts
+);
+
+fn smoke_mt_touchscreen_emits_abs_x_y_without_slot_first() -> TestResult {
+    use crate::hid_multitouch::{
+        MtClass, __attach_synth_screen_for_test, __build_screen_decoded_for_test,
+        __reset_registry_for_test,
+    };
+    use narf_input::{
+        abs, __reset_global_ring_for_test, init_global_ring, pop_absolute,
+    };
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    let dev = __attach_synth_screen_for_test(MtClass::Default, 0);
+    // One contact, tip down.
+    let decoded = __build_screen_decoded_for_test(&[(1, true, 5000, 8000)]);
+    let _ = dev.pump_screen(&decoded);
+    // First two events should be ABS_X then ABS_Y (touchscreens
+    // emit absolute for the first in-range contact).
+    let x = match pop_absolute() {
+        Some(a) => a,
+        None => return TestResult::Fail("expected ABS_X event"),
+    };
+    if x.axis != abs::ABS_X || x.value != 5000 {
+        return TestResult::Fail("ABS_X shape wrong");
+    }
+    let y = match pop_absolute() {
+        Some(a) => a,
+        None => return TestResult::Fail("expected ABS_Y event"),
+    };
+    if y.axis != abs::ABS_Y || y.value != 8000 {
+        return TestResult::Fail("ABS_Y shape wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_touchscreen_emits_abs_x_y_without_slot_first
+);
+
+fn smoke_mt_frame_emits_touch_events_per_slot() -> TestResult {
+    // Functional analog of "Frame SYN_REPORT termination" — verify
+    // that across two consecutive frames, slot reuse for the same
+    // contact_id stays stable (no spurious release/re-acquire) and
+    // that a fresh contact_id allocates a new slot.
+    use crate::hid_multitouch::{
+        MtClass, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
+        __reset_registry_for_test,
+    };
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_touch, TouchState,
+    };
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    let dev = __attach_synth_pad_for_test(MtClass::Win8, 5);
+    // Frame 1: contact 42 down.
+    let f1 = __build_ptp_decoded_for_test(&[(42, true, 100, 200)], false);
+    let _ = dev.pump_ptp(&f1);
+    let t1 = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected Down event frame 1"),
+    };
+    if t1.state != TouchState::Down {
+        return TestResult::Fail("frame 1 should be Down");
+    }
+    let first_slot = t1.slot;
+    // Frame 2: same contact 42 stays down, new contact 43 added.
+    let f2 = __build_ptp_decoded_for_test(
+        &[(42, true, 110, 210), (43, true, 300, 400)],
+        false,
+    );
+    let _ = dev.pump_ptp(&f2);
+    // Drain — expect Move for slot 0, Down for slot 1.
+    let mut got_move_42 = false;
+    let mut got_down_43 = false;
+    for _ in 0..2 {
+        let t = match pop_touch() {
+            Some(t) => t,
+            None => return TestResult::Fail("expected two events frame 2"),
+        };
+        if t.slot == first_slot && t.state == TouchState::Move && t.tracking_id == Some(42) {
+            got_move_42 = true;
+        } else if t.slot != first_slot
+            && t.state == TouchState::Down
+            && t.tracking_id == Some(43)
+        {
+            got_down_43 = true;
+        }
+    }
+    if !got_move_42 {
+        return TestResult::Fail("contact 42 should emit Move on frame 2");
+    }
+    if !got_down_43 {
+        return TestResult::Fail("contact 43 should emit Down on frame 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_frame_emits_touch_events_per_slot
+);
+
+fn smoke_mt_nsmu_quirk_synthesises_release_for_unseen_contact() -> TestResult {
+    use crate::hid_multitouch::{
+        MtClass, MtQuirks, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
+        __reset_registry_for_test, lookup_class,
+    };
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    // Confirm Nsmu carries NOT_SEEN_MEANS_UP.
+    let entry = lookup_class(MtClass::Nsmu);
+    if !entry.quirks.contains(MtQuirks::NOT_SEEN_MEANS_UP) {
+        return TestResult::Fail("Nsmu class missing NOT_SEEN_MEANS_UP");
+    }
+    let dev = __attach_synth_pad_for_test(MtClass::Nsmu, 5);
+    // Frame 1: contact 99 down.
+    let f1 = __build_ptp_decoded_for_test(&[(99, true, 50, 60)], false);
+    let _ = dev.pump_ptp(&f1);
+    // Drain Down.
+    let _ = pop_touch();
+    // Frame 2: empty report (contact_count = 0) — Nsmu should emit
+    // an Up for the stale contact.
+    let f2 = __build_ptp_decoded_for_test(&[], false);
+    let _ = dev.pump_ptp(&f2);
+    let t = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected synthesised Up"),
+    };
+    if t.state != TouchState::Up {
+        return TestResult::Fail("expected TouchState::Up");
+    }
+    if t.tracking_id.is_some() {
+        return TestResult::Fail("Up tracking_id should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_nsmu_quirk_synthesises_release_for_unseen_contact
+);
+
+fn smoke_mt_apple_synth_descriptor_carries_scan_time() -> TestResult {
+    // Per the task spec: "Apple Magic Trackpad 2 quirk: scan time
+    // field present". The PTP canonical blob includes a Scan Time
+    // field; verify the Apple class attach exposes it via the PTP
+    // profile (the profile holds the parsed Field).
+    use crate::hid_multitouch::{
+        MtClass, MtProfile, __attach_synth_pad_for_test,
+    };
+    let dev = __attach_synth_pad_for_test(MtClass::Apple, 0);
+    match &dev.profile {
+        MtProfile::Pad(p) => {
+            if p.scan_time.is_none() {
+                return TestResult::Fail("Apple PTP profile missing scan_time field");
+            }
+        }
+        MtProfile::Screen(_) => return TestResult::Fail("expected Pad profile"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-multitouch",
+    smoke_mt_apple_synth_descriptor_carries_scan_time
+);
+
+
