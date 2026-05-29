@@ -5127,3 +5127,510 @@ fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/netfilter", smoke_nf_e2e_nat_round_trip_smoke);
+
+// ── Kernel-bypass smokes ───────────────────────────────────────────
+//
+// Cover UMEM registration, the four-ring SPSC plumbing, classifier
+// 5-tuple matching, daemon-attach protocol, poll-mode toggle, and an
+// end-to-end RX path (classifier → UMEM → user RX ring).
+
+fn bypass_register_loopback_for_test(name: &'static str) {
+    narf_scheduler::__reset_queues_for_test();
+    if crate::registry().with_interface(name, |_| ()).is_some() {
+        return;
+    }
+    let authority = crate::bootstrap_authority();
+    let _ = crate::register_loopback_named(&authority, name);
+    crate::iface::register(name, [0x02, 0, 0, 0, 0, 0xAA], |_b| Ok(()));
+}
+
+fn smoke_bypass_umem_register_valid() -> TestResult {
+    crate::bypass::__reset_for_test();
+    match crate::bypass::Umem::register(4096, 2048) {
+        Ok(u) => {
+            if u.nb_frames() != 2 {
+                return TestResult::Fail("4096/2048 = 2 frames");
+            }
+            if u.frame_size() != 2048 {
+                return TestResult::Fail("frame_size");
+            }
+            TestResult::Pass
+        }
+        Err(_) => TestResult::Fail("register failed"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_umem_register_valid);
+
+fn smoke_bypass_umem_register_revoked() -> TestResult {
+    crate::bypass::__reset_for_test();
+    let u = match crate::bypass::Umem::register(4096, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Fail("register"),
+    };
+    let cap = u.cap();
+    cap.revoke();
+    match u.authorise(&cap) {
+        Err(crate::bypass::UmemError::AccessDenied) => TestResult::Pass,
+        Err(crate::bypass::UmemError::Revoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked cap should reject"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_umem_register_revoked);
+
+fn smoke_bypass_umem_invalid_frame_size() -> TestResult {
+    crate::bypass::__reset_for_test();
+    match crate::bypass::Umem::register(4096, 3000) {
+        Err(crate::bypass::UmemError::InvalidFrameSize) => {}
+        _ => return TestResult::Fail("non-pow2 should reject"),
+    }
+    match crate::bypass::Umem::register(4096, 1024) {
+        Err(crate::bypass::UmemError::InvalidFrameSize) => {}
+        _ => return TestResult::Fail("undersize should reject"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_umem_invalid_frame_size);
+
+fn smoke_bypass_ring_fill_rx_spsc() -> TestResult {
+    crate::bypass::__reset_for_test();
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let mut parts = crate::bypass::XdpSocket::create(umem);
+    let s0 = crate::bypass::UmemSlot { frame_idx: 0, len: 0 };
+    let s1 = crate::bypass::UmemSlot { frame_idx: 1, len: 0 };
+    let s2 = crate::bypass::UmemSlot { frame_idx: 2, len: 0 };
+    parts.fill_prod.try_send(s0.pack()).expect("fill 0");
+    parts.fill_prod.try_send(s1.pack()).expect("fill 1");
+    parts.fill_prod.try_send(s2.pack()).expect("fill 2");
+    let a = parts.socket.pop_fill().expect("a");
+    let b = parts.socket.pop_fill().expect("b");
+    let c = parts.socket.pop_fill().expect("c");
+    if a.frame_idx != 0 || b.frame_idx != 1 || c.frame_idx != 2 {
+        return TestResult::Fail("FIFO order broken");
+    }
+    if parts.socket.pop_fill().is_some() {
+        return TestResult::Fail("ring should be empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_ring_fill_rx_spsc);
+
+fn smoke_bypass_ring_tx_completion_spsc() -> TestResult {
+    crate::bypass::__reset_for_test();
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let mut parts = crate::bypass::XdpSocket::create(umem);
+    let slot = crate::bypass::UmemSlot { frame_idx: 1, len: 64 };
+    parts.tx_prod.try_send(slot.pack()).expect("tx push");
+    let got = parts.socket.pop_tx().expect("tx pop");
+    if got.frame_idx != 1 || got.len != 64 {
+        return TestResult::Fail("TX slot round-trip");
+    }
+    parts.socket.push_completion(got).expect("completion push");
+    let mut comp_cons = parts.comp_cons;
+    let v = match comp_cons.try_recv() {
+        Ok(Some(v)) => v,
+        _ => return TestResult::Fail("completion ring empty"),
+    };
+    let back = crate::bypass::UmemSlot::unpack(v);
+    if back.frame_idx != 1 || back.len != 64 {
+        return TestResult::Fail("completion payload mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_ring_tx_completion_spsc);
+
+fn smoke_bypass_classifier_per_flow_match() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-flow");
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let mut parts = crate::bypass::XdpSocket::create(umem);
+    parts
+        .fill_prod
+        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .expect("fill");
+    let key = crate::bypass::FlowKey {
+        src_ip: [0; 4],
+        src_port: 0,
+        dst_ip: [10, 0, 0, 1],
+        dst_port: 80,
+        proto: 6,
+    };
+    let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
+    let frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 1], 80);
+    match crate::bypass::classify("lo.bypass-flow", &frame) {
+        crate::bypass::Verdict::Consumed => {}
+        _ => return TestResult::Fail("expected Consumed"),
+    }
+    let mut rx = parts.rx_cons;
+    match rx.try_recv() {
+        Ok(Some(v)) => {
+            let s = crate::bypass::UmemSlot::unpack(v);
+            if s.frame_idx != 0 || s.len as usize != frame.len() {
+                return TestResult::Fail("rx slot mismatch");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("RX ring empty after Consumed"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_classifier_per_flow_match);
+
+fn smoke_bypass_classifier_no_match_pass_through() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-nopass");
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let parts = crate::bypass::XdpSocket::create(umem);
+    let key = crate::bypass::FlowKey {
+        src_ip: [0; 4],
+        src_port: 0,
+        dst_ip: [10, 0, 0, 1],
+        dst_port: 80,
+        proto: 6,
+    };
+    let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
+    let frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 99], 80);
+    match crate::bypass::classify("lo.bypass-nopass", &frame) {
+        crate::bypass::Verdict::PassThrough => TestResult::Pass,
+        _ => TestResult::Fail("non-matching frame should pass through"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_classifier_no_match_pass_through);
+
+fn smoke_bypass_classifier_wildcard_matches() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-wc");
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let mut parts = crate::bypass::XdpSocket::create(umem);
+    parts
+        .fill_prod
+        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .expect("fill");
+    let key = crate::bypass::FlowKey::default();
+    let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
+    let frame = bypass_build_eth_ipv4_tcp([1, 2, 3, 4], 9999);
+    match crate::bypass::classify("lo.bypass-wc", &frame) {
+        crate::bypass::Verdict::Consumed => TestResult::Pass,
+        _ => TestResult::Fail("wildcard should match"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_classifier_wildcard_matches);
+
+fn smoke_bypass_classifier_lpm_more_specific_wins() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-lpm");
+    let umem_a = crate::bypass::Umem::register(8192, 2048).expect("umem-a");
+    let umem_b = crate::bypass::Umem::register(8192, 2048).expect("umem-b");
+    let mut parts_a = crate::bypass::XdpSocket::create(umem_a);
+    let mut parts_b = crate::bypass::XdpSocket::create(umem_b);
+    parts_a
+        .fill_prod
+        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .expect("fill-a");
+    parts_b
+        .fill_prod
+        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .expect("fill-b");
+    let wide = crate::bypass::FlowKey::default();
+    let _ = crate::bypass::register_flow(wide, parts_a.socket.clone()).expect("wide");
+    let narrow = crate::bypass::FlowKey {
+        src_ip: [0; 4],
+        src_port: 0,
+        dst_ip: [10, 0, 0, 1],
+        dst_port: 80,
+        proto: 6,
+    };
+    let _ = crate::bypass::register_flow(narrow, parts_b.socket.clone()).expect("narrow");
+    let frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 1], 80);
+    let _ = crate::bypass::classify("lo.bypass-lpm", &frame);
+    let mut rx_b = parts_b.rx_cons;
+    if rx_b.try_recv().ok().flatten().is_none() {
+        return TestResult::Fail("more-specific claim should win");
+    }
+    let mut rx_a = parts_a.rx_cons;
+    if rx_a.try_recv().ok().flatten().is_some() {
+        return TestResult::Fail("less-specific claim should NOT receive");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_classifier_lpm_more_specific_wins);
+
+fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-attach");
+    use crate::{NetIface, StackAttach, StackDaemon};
+    use narf_capabilities::{Cap, Invoke, Write};
+
+    let iface_cap: Cap<NetIface, Write> = Cap::bootstrap();
+    let daemon_cap: Cap<StackDaemon, Invoke> = Cap::bootstrap();
+    let req = StackAttach {
+        iface: iface_cap,
+        daemon: daemon_cap,
+    };
+    use crate::{Frame, RX_RING_N, TX_RING_N};
+    use alloc::string::ToString;
+    let (tx_prod, _tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
+    let (_rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    let stub = crate::virtio_net::VirtioNet::new(
+        "lo.bypass-attach".to_string(),
+        [0; 6],
+        1500,
+        true,
+        tx_prod,
+        rx_cons,
+    );
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let parts = crate::bypass::XdpSocket::create(umem);
+    let socket = parts.socket.clone();
+    match crate::stack::attach(&req, &stub, socket) {
+        Ok(reply) => {
+            if !reply.admin.is_live() {
+                return TestResult::Fail("admin cap should be live");
+            }
+            if !crate::bypass::is_attached("lo.bypass-attach") {
+                return TestResult::Fail("iface should report attached");
+            }
+            TestResult::Pass
+        }
+        Err(_) => TestResult::Fail("attach should succeed"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_daemon_attach_succeeds);
+
+fn smoke_bypass_daemon_attach_twice_fails() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-twice");
+    use crate::{AttachError, NetIface, StackAttach, StackDaemon};
+    use narf_capabilities::{Cap, Invoke, Write};
+
+    let iface_cap: Cap<NetIface, Write> = Cap::bootstrap();
+    let daemon_cap: Cap<StackDaemon, Invoke> = Cap::bootstrap();
+    let req = StackAttach {
+        iface: iface_cap,
+        daemon: daemon_cap,
+    };
+    use crate::{Frame, RX_RING_N, TX_RING_N};
+    use alloc::string::ToString;
+    let (tx_prod, _tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
+    let (_rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    let stub = crate::virtio_net::VirtioNet::new(
+        "lo.bypass-twice".to_string(),
+        [0; 6],
+        1500,
+        true,
+        tx_prod,
+        rx_cons,
+    );
+    let umem1 = crate::bypass::Umem::register(8192, 2048).expect("umem1");
+    let parts1 = crate::bypass::XdpSocket::create(umem1);
+    let _ = crate::stack::attach(&req, &stub, parts1.socket).expect("first attach");
+
+    let umem2 = crate::bypass::Umem::register(8192, 2048).expect("umem2");
+    let parts2 = crate::bypass::XdpSocket::create(umem2);
+    match crate::stack::attach(&req, &stub, parts2.socket) {
+        Err(AttachError::InterfaceBusy) => TestResult::Pass,
+        _ => TestResult::Fail("second attach should reject"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_daemon_attach_twice_fails);
+
+fn smoke_bypass_daemon_attach_revoked_iface() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-revoked");
+    use crate::{AttachError, NetIface, StackAttach, StackDaemon};
+    use narf_capabilities::{Cap, Invoke, Write};
+
+    let iface_cap: Cap<NetIface, Write> = Cap::bootstrap();
+    let daemon_cap: Cap<StackDaemon, Invoke> = Cap::bootstrap();
+    let req = StackAttach {
+        iface: iface_cap,
+        daemon: daemon_cap,
+    };
+    use crate::{Frame, RX_RING_N, TX_RING_N};
+    use alloc::string::ToString;
+    let (tx_prod, _tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
+    let (_rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    let stub = crate::virtio_net::VirtioNet::new(
+        "lo.bypass-revoked".to_string(),
+        [0; 6],
+        1500,
+        true,
+        tx_prod,
+        rx_cons,
+    );
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let parts = crate::bypass::XdpSocket::create(umem);
+    iface_cap.revoke();
+    match crate::stack::attach(&req, &stub, parts.socket) {
+        Err(AttachError::IfaceCapRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked iface cap should be rejected"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_daemon_attach_revoked_iface);
+
+fn smoke_bypass_poll_mode_toggle() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    crate::bypass::__reset_for_test();
+    let admin: Cap<crate::AdminCap, Invoke> = Cap::bootstrap();
+    if !crate::bypass::rx_irq_enabled("eth-poll") {
+        return TestResult::Fail("rx_irq should default enabled");
+    }
+    crate::bypass::set_poll_mode(&admin, "eth-poll", true).expect("set on");
+    if crate::bypass::rx_irq_enabled("eth-poll") {
+        return TestResult::Fail("rx_irq should be disabled");
+    }
+    if !crate::bypass::is_poll_mode("eth-poll") {
+        return TestResult::Fail("is_poll_mode should be true");
+    }
+    crate::bypass::set_poll_mode(&admin, "eth-poll", false).expect("set off");
+    if !crate::bypass::rx_irq_enabled("eth-poll") {
+        return TestResult::Fail("rx_irq should be re-enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_poll_mode_toggle);
+
+fn smoke_bypass_poll_mode_revoked_cap() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    crate::bypass::__reset_for_test();
+    let admin: Cap<crate::AdminCap, Invoke> = Cap::bootstrap();
+    admin.revoke();
+    match crate::bypass::set_poll_mode(&admin, "eth-poll-rev", true) {
+        Err(crate::bypass::PollModeError::AdminCapRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("revoked admin should reject"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_poll_mode_revoked_cap);
+
+fn smoke_bypass_xdp_socket_bind() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-bind");
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let parts = crate::bypass::XdpSocket::create(umem);
+    if parts.socket.is_bound() {
+        return TestResult::Fail("should start unbound");
+    }
+    match parts
+        .socket
+        .bind(alloc::string::String::from("lo.bypass-bind"), 0)
+    {
+        Ok(()) => {}
+        Err(_) => return TestResult::Fail("bind to existing iface"),
+    }
+    if !parts.socket.is_bound() {
+        return TestResult::Fail("should be bound");
+    }
+    match parts
+        .socket
+        .bind(alloc::string::String::from("lo.bypass-bind"), 0)
+    {
+        Err(crate::bypass::XdpError::AlreadyBound) => TestResult::Pass,
+        _ => TestResult::Fail("re-bind should reject"),
+    }
+}
+kernel_test_in!("net/bypass", smoke_bypass_xdp_socket_bind);
+
+fn smoke_bypass_end_to_end_rx() -> TestResult {
+    crate::bypass::__reset_for_test();
+    bypass_register_loopback_for_test("lo.bypass-e2e");
+    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let mut parts = crate::bypass::XdpSocket::create(umem.clone());
+    parts
+        .fill_prod
+        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .expect("fill");
+    let key = crate::bypass::FlowKey::default();
+    let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
+    let frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 1], 80);
+    let v = crate::bypass::classify("lo.bypass-e2e", &frame);
+    match v {
+        crate::bypass::Verdict::Consumed => {}
+        _ => return TestResult::Fail("classifier should consume"),
+    }
+    let v = match parts.rx_cons.try_recv() {
+        Ok(Some(v)) => v,
+        _ => return TestResult::Fail("RX ring empty"),
+    };
+    let slot = crate::bypass::UmemSlot::unpack(v);
+    let bytes = umem.frame_bytes(slot.frame_idx).expect("frame_bytes");
+    let used = &bytes[..slot.len as usize];
+    if used != &frame[..] {
+        return TestResult::Fail("end-to-end byte mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_end_to_end_rx);
+
+fn smoke_bypass_flow_key_specificity() -> TestResult {
+    let wildcard = crate::bypass::FlowKey::default();
+    if wildcard.specificity() != 0 {
+        return TestResult::Fail("wildcard specificity 0");
+    }
+    let mid = crate::bypass::FlowKey {
+        src_ip: [0; 4],
+        src_port: 0,
+        dst_ip: [10, 0, 0, 1],
+        dst_port: 0,
+        proto: 6,
+    };
+    if mid.specificity() != 2 {
+        return TestResult::Fail("dst_ip + proto = 2");
+    }
+    let full = crate::bypass::FlowKey {
+        src_ip: [1, 2, 3, 4],
+        src_port: 1234,
+        dst_ip: [10, 0, 0, 1],
+        dst_port: 80,
+        proto: 6,
+    };
+    if full.specificity() != 5 {
+        return TestResult::Fail("full 5-tuple = 5");
+    }
+    if !mid.matches(&full) {
+        return TestResult::Fail("partial should match full");
+    }
+    if full.matches(&mid) {
+        return TestResult::Fail("full should not match partial");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_flow_key_specificity);
+
+fn smoke_bypass_umem_slot_pack_unpack() -> TestResult {
+    let s = crate::bypass::UmemSlot { frame_idx: 0xCAFE_BABE, len: 0xDEAD_BEEF };
+    let packed = s.pack();
+    let back = crate::bypass::UmemSlot::unpack(packed);
+    if back != s {
+        return TestResult::Fail("pack/unpack round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/bypass", smoke_bypass_umem_slot_pack_unpack);
+
+// Helper: build an Ethernet+IPv4+TCP test frame with the requested
+// destination address. The 5-tuple parser in the classifier extracts
+// (src_ip, src_port, dst_ip, dst_port, proto=TCP).
+fn bypass_build_eth_ipv4_tcp(dst_ip: [u8; 4], dst_port: u16) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec::Vec::with_capacity(54);
+    buf.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    buf.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    buf.extend_from_slice(&0x0800u16.to_be_bytes());
+    buf.push(0x45);
+    buf.push(0x00);
+    buf.extend_from_slice(&40u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.push(64);
+    buf.push(6);
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&[1, 2, 3, 4]);
+    buf.extend_from_slice(&dst_ip);
+    buf.extend_from_slice(&1234u16.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.push(0x50);
+    buf.push(0x02);
+    buf.extend_from_slice(&65535u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf
+}
