@@ -48,7 +48,7 @@ pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     *TASK_LOOKUP.lock() = Some(lookup);
 }
 
-fn current_task_id() -> u64 {
+pub fn current_task_id() -> u64 {
     let f = *TASK_LOOKUP.lock();
     f.map(|lookup| lookup()).unwrap_or(0)
 }
@@ -917,6 +917,13 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let cmd = args.arg1;
     let arg = args.arg2;
     let task = current_task_id();
+    // For F_SETFL on a socket fd, push O_NONBLOCK down into the
+    // SocketFile so recv/send/accept/connect see the flag.
+    if cmd == F_SETFL {
+        if let Some(sock) = current_socket(fd) {
+            sock.set_nonblock((arg as u32) & crate::socket::O_NONBLOCK != 0);
+        }
+    }
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
         Some(match cmd {
@@ -925,12 +932,16 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 entry.flags = arg as u32;
                 SyscallReturn::ok(0)
             }
-            // F_GETFL / F_SETFL: NARF doesn't model O_RDONLY / O_WRONLY
-            // / O_NONBLOCK at the fd-table layer yet (every fd is
-            // implicitly read+write — the FileOps impl is what
-            // refuses unsupported sides). Return 0 so callers that
-            // probe the flag set don't see a spurious error.
-            F_GETFL => SyscallReturn::ok(0),
+            // F_GETFL returns whichever per-fd flag bits we model
+            // explicitly: O_NONBLOCK (mirrored to/from SocketFile),
+            // others reported as 0.
+            F_GETFL => {
+                let nb = current_socket(fd)
+                    .map(|s| s.is_nonblock())
+                    .unwrap_or(false);
+                let v = if nb { crate::socket::O_NONBLOCK as u64 } else { 0 };
+                SyscallReturn::ok(v)
+            }
             F_SETFL => SyscallReturn::ok(0),
             _ => SyscallReturn::invalid_op(),
         })
@@ -7116,8 +7127,19 @@ fn sys_socket(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let domain = args.arg0 as u16;
     let kind = args.arg1 as u32;
-    let _proto = args.arg2;
-    let sock = crate::socket::SocketFile::new(domain, kind);
+    let proto = args.arg2 as u32;
+    // Reject unknown families up front (EAFNOSUPPORT shape).
+    if !matches!(
+        domain,
+        crate::socket::AF_UNIX
+            | crate::socket::AF_INET
+            | crate::socket::AF_INET6
+            | crate::socket::AF_BYPASS
+    ) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
+    let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
     socket_arc_register(&sock);
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
@@ -7362,19 +7384,315 @@ fn sys_socket_shutdown(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// `getsockopt(fd, level, optname, opt_val_out, opt_len_inout)`.
+/// Linux ref: net/socket.c:SYSCALL_DEFINE5(getsockopt, ...).
 fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
-    // Stage-1: every getsockopt returns success with len=0 to keep
-    // libc happy. Real per-option storage lands once a consumer
-    // (TCP) needs it.
-    let _ = ctx.args();
-    ctx.set_return(SyscallReturn::ok(0));
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let level = args.arg1 as u32;
+    let name = args.arg2 as u32;
+    let val_ptr = args.arg3;
+    let len_ptr = args.arg4;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    // Read in/out len so we know how much the caller can hold.
+    let in_len = if len_ptr != 0 {
+        let mut b = [0u8; 4];
+        unsafe {
+            for i in 0..4 {
+                b[i] = core::ptr::read_volatile((len_ptr + i as u64) as *const u8);
+            }
+        }
+        u32::from_ne_bytes(b) as usize
+    } else {
+        0
+    };
+    if val_ptr == 0 || in_len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let mut buf = alloc::vec![0u8; in_len];
+    let result = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level,
+        name,
+        buf: &mut buf,
+    });
+    match result {
+        crate::socket::SocketOpResult::OptValue { n } => {
+            unsafe {
+                for i in 0..n {
+                    core::ptr::write_volatile((val_ptr + i as u64) as *mut u8, buf[i]);
+                }
+                // Update *optlen.
+                let len_bytes = (n as u32).to_ne_bytes();
+                for i in 0..4 {
+                    core::ptr::write_volatile((len_ptr + i as u64) as *mut u8, len_bytes[i]);
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        _ => ctx.set_return(fail),
+    }
 }
 
+/// `setsockopt(fd, level, optname, opt_val, opt_len)`.
+/// Linux ref: net/socket.c:SYSCALL_DEFINE5(setsockopt, ...).
 fn sys_socket_setsockopt(ctx: &mut dyn TrapContext) {
-    // Stage-1: accept and ignore. Real setsockopt routing lands
-    // alongside TCP.
-    let _ = ctx.args();
-    ctx.set_return(SyscallReturn::ok(0));
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let level = args.arg1 as u32;
+    let name = args.arg2 as u32;
+    let val_ptr = args.arg3;
+    let val_len = args.arg4 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    if val_ptr == 0 || val_len == 0 || val_len > 256 {
+        ctx.set_return(fail);
+        return;
+    }
+    let mut buf = alloc::vec![0u8; val_len];
+    unsafe {
+        for i in 0..val_len {
+            buf[i] = core::ptr::read_volatile((val_ptr + i as u64) as *const u8);
+        }
+    }
+    match sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+        level,
+        name,
+        value: &buf,
+    }) {
+        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        _ => ctx.set_return(fail),
+    }
+}
+
+/// `getsockname(fd, addr_out, addrlen_inout)`. Writes the
+/// `sockaddr` shape per family. Linux net/socket.c:SYSCALL_DEFINE3.
+fn sys_socket_getsockname(ctx: &mut dyn TrapContext) {
+    sys_socket_get_addr(ctx, false);
+}
+
+/// `getpeername(fd, addr_out, addrlen_inout)`.
+fn sys_socket_getpeername(ctx: &mut dyn TrapContext) {
+    sys_socket_get_addr(ctx, true);
+}
+
+fn sys_socket_get_addr(ctx: &mut dyn TrapContext, peer: bool) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let addr_ptr = args.arg1;
+    let len_ptr = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    let op = if peer {
+        crate::socket::SocketOp::GetPeerName
+    } else {
+        crate::socket::SocketOp::GetSockName
+    };
+    let result = sock.dispatch_op(op);
+    match result {
+        crate::socket::SocketOpResult::Addr(addr) => {
+            // Read in length (caller-supplied capacity).
+            let in_len = if len_ptr != 0 {
+                let mut b = [0u8; 4];
+                unsafe {
+                    for i in 0..4 {
+                        b[i] = core::ptr::read_volatile((len_ptr + i as u64) as *const u8);
+                    }
+                }
+                u32::from_ne_bytes(b) as usize
+            } else {
+                0
+            };
+            // Pack as: family(u16) + body.
+            let total = 2 + addr.body.len();
+            let n = core::cmp::min(in_len, total);
+            unsafe {
+                if addr_ptr != 0 && n >= 2 {
+                    let fam_bytes = addr.family.to_le_bytes();
+                    core::ptr::write_volatile(addr_ptr as *mut u8, fam_bytes[0]);
+                    core::ptr::write_volatile((addr_ptr + 1) as *mut u8, fam_bytes[1]);
+                    let body_n = n - 2;
+                    for i in 0..body_n {
+                        core::ptr::write_volatile(
+                            (addr_ptr + 2 + i as u64) as *mut u8,
+                            addr.body[i],
+                        );
+                    }
+                }
+                if len_ptr != 0 {
+                    let len_bytes = (total as u32).to_ne_bytes();
+                    for i in 0..4 {
+                        core::ptr::write_volatile((len_ptr + i as u64) as *mut u8, len_bytes[i]);
+                    }
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
+/// `sendmsg(fd, msghdr, flags)`. We squash the iovec into a single
+/// allocation, call the dispatcher's Send, and report the count.
+fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let msg_ptr = args.arg1;
+    let flags = args.arg2 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    if msg_ptr == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // struct msghdr { void *name; u32 namelen; struct iovec *iov;
+    //                 usize iovlen; void *ctrl; usize ctrllen; int flags; }
+    // Layout matches Linux x86_64 64-bit.
+    let name_ptr = read_user_u64(msg_ptr);
+    let name_len = read_user_u32(msg_ptr + 8);
+    let iov_ptr = read_user_u64(msg_ptr + 16);
+    let iov_len = read_user_u64(msg_ptr + 24) as usize;
+    // Reassemble into a flat buffer.
+    let mut total = alloc::vec::Vec::new();
+    for i in 0..iov_len {
+        let base = iov_ptr + (i as u64) * 16;
+        let p = read_user_u64(base);
+        let l = read_user_u64(base + 8) as usize;
+        if p == 0 || l == 0 { continue; }
+        total.reserve(l);
+        unsafe {
+            for j in 0..l {
+                total.push(core::ptr::read_volatile((p + j as u64) as *const u8));
+            }
+        }
+    }
+    let dest = if name_ptr != 0 && name_len >= 2 {
+        copy_user_addr(name_ptr, name_len as u64)
+    } else {
+        None
+    };
+    match sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: &total,
+        flags,
+        addr: dest,
+    }) {
+        crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
+        _ => ctx.set_return(fail),
+    }
+}
+
+/// `recvmsg(fd, msghdr, flags)`. Reverse of sendmsg.
+fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let msg_ptr = args.arg1;
+    let flags = args.arg2 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    if msg_ptr == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let name_ptr = read_user_u64(msg_ptr);
+    let name_len_ptr = msg_ptr + 8; // namelen lives at offset 8
+    let iov_ptr = read_user_u64(msg_ptr + 16);
+    let iov_len = read_user_u64(msg_ptr + 24) as usize;
+    // Total capacity from iovecs.
+    let mut total_cap = 0usize;
+    for i in 0..iov_len {
+        let base = iov_ptr + (i as u64) * 16;
+        total_cap += read_user_u64(base + 8) as usize;
+    }
+    let mut staging = alloc::vec![0u8; total_cap];
+    let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut staging,
+        flags,
+    });
+    match result {
+        crate::socket::SocketOpResult::Received { n, peer } => {
+            // Scatter into iovec destinations.
+            let mut copied = 0;
+            for i in 0..iov_len {
+                if copied >= n { break; }
+                let base = iov_ptr + (i as u64) * 16;
+                let p = read_user_u64(base);
+                let l = read_user_u64(base + 8) as usize;
+                let take = core::cmp::min(l, n - copied);
+                unsafe {
+                    for j in 0..take {
+                        core::ptr::write_volatile(
+                            (p + j as u64) as *mut u8,
+                            staging[copied + j],
+                        );
+                    }
+                }
+                copied += take;
+            }
+            // Write peer if requested.
+            if let (Some(peer), Some(name_ptr_v)) = (peer, Some(name_ptr)) {
+                if name_ptr_v != 0 {
+                    unsafe {
+                        let fam_bytes = peer.family.to_le_bytes();
+                        core::ptr::write_volatile(name_ptr_v as *mut u8, fam_bytes[0]);
+                        core::ptr::write_volatile((name_ptr_v + 1) as *mut u8, fam_bytes[1]);
+                        for i in 0..peer.body.len() {
+                            core::ptr::write_volatile(
+                                (name_ptr_v + 2 + i as u64) as *mut u8,
+                                peer.body[i],
+                            );
+                        }
+                        let nl = ((peer.body.len() + 2) as u32).to_ne_bytes();
+                        for i in 0..4 {
+                            core::ptr::write_volatile(
+                                (name_len_ptr + i as u64) as *mut u8,
+                                nl[i],
+                            );
+                        }
+                    }
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(n as u64));
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
+#[inline]
+fn read_user_u32(ptr: u64) -> u32 {
+    let mut b = [0u8; 4];
+    unsafe {
+        for i in 0..4 {
+            b[i] = core::ptr::read_volatile((ptr + i as u64) as *const u8);
+        }
+    }
+    u32::from_ne_bytes(b)
+}
+
+#[inline]
+fn read_user_u64(ptr: u64) -> u64 {
+    let mut b = [0u8; 8];
+    unsafe {
+        for i in 0..8 {
+            b[i] = core::ptr::read_volatile((ptr + i as u64) as *const u8);
+        }
+    }
+    u64::from_ne_bytes(b)
 }
 
 fn sys_sock_register_buf(ctx: &mut dyn TrapContext) {
@@ -8264,6 +8582,10 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SocketShutdown, "shutdown", RawFnHandler(sys_socket_shutdown));
     table.install_raw(Syscall::SocketGetSockOpt, "getsockopt", RawFnHandler(sys_socket_getsockopt));
     table.install_raw(Syscall::SocketSetSockOpt, "setsockopt", RawFnHandler(sys_socket_setsockopt));
+    table.install_raw(Syscall::SocketGetSockName, "getsockname", RawFnHandler(sys_socket_getsockname));
+    table.install_raw(Syscall::SocketGetPeerName, "getpeername", RawFnHandler(sys_socket_getpeername));
+    table.install_raw(Syscall::SocketSendMsg, "sendmsg", RawFnHandler(sys_socket_sendmsg));
+    table.install_raw(Syscall::SocketRecvMsg, "recvmsg", RawFnHandler(sys_socket_recvmsg));
     table.install_raw(Syscall::SockRegisterBuf, "sock_register_buf", RawFnHandler(sys_sock_register_buf));
     table.install_raw(Syscall::SockSendZc, "sock_send_zc", RawFnHandler(sys_sock_send_zc));
     table.install_raw(Syscall::Poll, "poll", RawFnHandler(sys_poll));
@@ -8535,6 +8857,26 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
 
     // Tier-3z entropy.
     table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));
+
+    // I/O multiplexing: poll / select / pselect6 / epoll.
+    table.install_raw(Syscall::Poll,     "poll",       RawFnHandler(crate::poll::sys_poll));
+    table.install_raw(Syscall::Select,   "select",     RawFnHandler(crate::select::sys_select));
+    table.install_raw(Syscall::Pselect6, "pselect6",   RawFnHandler(crate::select::sys_pselect6));
+    table.install_raw(
+        Syscall::EpollCreate,
+        "epoll_create1",
+        RawFnHandler(crate::epoll::sys_epoll_create1),
+    );
+    table.install_raw(
+        Syscall::EpollCtl,
+        "epoll_ctl",
+        RawFnHandler(crate::epoll::sys_epoll_ctl),
+    );
+    table.install_raw(
+        Syscall::EpollWait,
+        "epoll_wait",
+        RawFnHandler(crate::epoll::sys_epoll_wait),
+    );
 
     // Auto-wire both delivery hooks so any kernel that uses
     // `install_core_syscalls` gets the async + sync signal paths

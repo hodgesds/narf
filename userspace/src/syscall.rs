@@ -618,6 +618,22 @@ pub enum Syscall {
     /// `setsockopt(fd, level, opt, buf, len)`.
     SocketSetSockOpt,
 
+    /// `getsockname(fd, addr_out, addrlen_inout)` — return the
+    /// socket's locally-bound address.
+    SocketGetSockName,
+
+    /// `getpeername(fd, addr_out, addrlen_inout)` — return the
+    /// remote peer's address on a connected socket.
+    SocketGetPeerName,
+
+    /// `sendmsg(fd, msghdr, flags)` — scatter send with optional
+    /// destination address (carried inside the msghdr).
+    SocketSendMsg,
+
+    /// `recvmsg(fd, msghdr, flags)` — gather receive with optional
+    /// source-address writeback.
+    SocketRecvMsg,
+
     /// ZC fast path: register a user buffer for zerocopy I/O.
     /// `register_buffer(ptr, len) → buf_id`. The kernel pins the
     /// pages and assigns an opaque id usable in `SockSendZc`.
@@ -646,6 +662,18 @@ pub enum Syscall {
     /// !0u64 on error. select(2) and pselect(2) are libc-side
     /// translations to this syscall.
     Poll,
+
+    /// `select(nfds, readfds, writefds, exceptfds, timeval)`.
+    /// arg0 = nfds, arg1..=arg4 = fd_set ptrs + timeval ptr.
+    /// Converts fd_set bitmaps to poll internally; see `select.rs`.
+    /// Linux x86_64 number 23; aarch64 has no direct select — maps
+    /// to ppoll (73) via pselect6.
+    Select,
+
+    /// `pselect6(nfds, readfds, writefds, exceptfds, timespec,
+    /// sigmask_ptr)`. Linux x86_64 number 270; aarch64 72.
+    /// Sigmask is accepted and ignored (no signal masking yet).
+    Pselect6,
 
     /// `epoll_create1(flags)` — create an epoll instance fd.
     /// arg0 = flags (only EPOLL_CLOEXEC = 0x80000 honoured).
@@ -1268,6 +1296,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fstat, 5),
     (Syscall::Lstat, 6),
     (Syscall::Poll, 7),
+    (Syscall::Select, 23),
     (Syscall::Lseek, 8),
     (Syscall::Mmap, 9),
     (Syscall::MProtect, 10),
@@ -1290,9 +1319,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketAccept, 43),
     (Syscall::SocketSend, 44),      // sendto
     (Syscall::SocketRecv, 45),      // recvfrom
+    (Syscall::SocketSendMsg, 46),
+    (Syscall::SocketRecvMsg, 47),
     (Syscall::SocketShutdown, 48),
     (Syscall::SocketBind, 49),
     (Syscall::SocketListen, 50),
+    (Syscall::SocketGetSockName, 51),
+    (Syscall::SocketGetPeerName, 52),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -1363,6 +1396,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Tgkill, 234),
     (Syscall::Openat, 257),
     (Syscall::Mkdirat, 258),
+    (Syscall::Pselect6, 270),
     (Syscall::Fchownat, 260),
     (Syscall::Newfstatat, 262),
     (Syscall::Unlinkat, 263),
@@ -1492,11 +1526,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketListen, 201),
     (Syscall::SocketAccept, 202),
     (Syscall::SocketConnect, 203),
+    (Syscall::SocketGetSockName, 204),
+    (Syscall::SocketGetPeerName, 205),
     (Syscall::SocketSend, 206),     // sendto
     (Syscall::SocketRecv, 207),     // recvfrom
     (Syscall::SocketSetSockOpt, 208),
     (Syscall::SocketGetSockOpt, 209),
     (Syscall::SocketShutdown, 210),
+    (Syscall::SocketSendMsg, 211),
+    (Syscall::SocketRecvMsg, 212),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -1512,6 +1550,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::CopyFileRange, 285),
     (Syscall::Statfs, 43),
     (Syscall::Fstatfs, 44),
+    (Syscall::Pselect6, 72),        // pselect6
     (Syscall::Poll, 73),            // ppoll
 ];
 
