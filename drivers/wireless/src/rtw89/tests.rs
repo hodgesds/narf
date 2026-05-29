@@ -16,6 +16,7 @@ use super::dma::{
     AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
     RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::datapath::{consume_rx_bd, stage_tx, RxChannelState, TxChannelState};
 use super::btc::{
     build_btc_set_cmd, encode_cxhdr, encode_cxhdr_v7, make_btc_ctrl_h2c, make_btc_init_h2c,
     make_btc_run_h2c, make_btc_set_h2c, BTFC_FW_EVENT, BTFC_GET, BTFC_SET, CXDRVINFO_CTRL,
@@ -1423,6 +1424,115 @@ fn smoke_rtw89_btc_full_cmd_build() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_btc_full_cmd_build);
+
+// ── Stage-11: Datapath (TX stage + RX consume + channel state) ────
+
+fn smoke_rtw89_datapath_stage_tx() -> TestResult {
+    let frame = [0xDDu8; 200];
+    let sub = match stage_tx(0, super::txrx::QSEL_B0_BE, 7, &frame) {
+        Some(s) => s,
+        None => return TestResult::Fail("stage_tx None"),
+    };
+    if sub.frame.len() != 200 {
+        return TestResult::Fail("frame length not preserved");
+    }
+    if sub.total != 200 + 24 {
+        return TestResult::Fail("total != frame + TXWD");
+    }
+    // TXWD body byte 0 — WD_INFO_EN bit (bit 22 of dword 0) must be set.
+    let dw0 = u32::from_le_bytes([sub.txwd[0], sub.txwd[1], sub.txwd[2], sub.txwd[3]]);
+    if dw0 & (1 << 22) == 0 {
+        return TestResult::Fail("TXWD WD_INFO_EN not set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_datapath_stage_tx);
+
+fn smoke_rtw89_datapath_consume_rx() -> TestResult {
+    // Build a 16-byte RXD + 100-byte frame payload.
+    let rxd_info = super::txrx::RxdInfo {
+        pkt_len: 100,
+        pkt_type: super::txrx::AX_RXD_RPKT_TYPE_WIFI as u8,
+        crc32_err: false,
+        icv_err: false,
+    };
+    let rxd_bytes = super::txrx::encode_rxd_for_test(&rxd_info);
+    let mut bd = alloc::vec::Vec::new();
+    bd.extend_from_slice(&rxd_bytes);
+    bd.extend(core::iter::repeat(0xEEu8).take(100));
+
+    let d = match consume_rx_bd(&bd) {
+        Some(d) => d,
+        None => return TestResult::Fail("consume_rx_bd None"),
+    };
+    if d.frame.len() != 100 {
+        return TestResult::Fail("rx frame length wrong");
+    }
+    if d.frame[0] != 0xEE {
+        return TestResult::Fail("rx frame content wrong");
+    }
+
+    // CRC error: should drop.
+    let bad_info = super::txrx::RxdInfo {
+        pkt_len: 100,
+        pkt_type: 0,
+        crc32_err: true,
+        icv_err: false,
+    };
+    let bad_bytes = super::txrx::encode_rxd_for_test(&bad_info);
+    let mut bad_bd = alloc::vec::Vec::new();
+    bad_bd.extend_from_slice(&bad_bytes);
+    bad_bd.extend(core::iter::repeat(0u8).take(100));
+    if consume_rx_bd(&bad_bd).is_some() {
+        return TestResult::Fail("CRC32 errored frame not dropped");
+    }
+
+    // Truncated BD: pkt_len says 200 but only 16+50 = 66 bytes available.
+    let trunc_info = super::txrx::RxdInfo {
+        pkt_len: 200,
+        pkt_type: 0,
+        crc32_err: false,
+        icv_err: false,
+    };
+    let trunc_bytes = super::txrx::encode_rxd_for_test(&trunc_info);
+    let mut trunc = alloc::vec::Vec::new();
+    trunc.extend_from_slice(&trunc_bytes);
+    trunc.extend(core::iter::repeat(0u8).take(50));
+    if consume_rx_bd(&trunc).is_some() {
+        return TestResult::Fail("truncated BD not rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_datapath_consume_rx);
+
+fn smoke_rtw89_datapath_channel_state() -> TestResult {
+    // AX baseline 8852A: TX channel 0 (ACH0).
+    let tx = TxChannelState::new(ChipId::Rtl8852A, 0, 256);
+    if tx.channel != 0 {
+        return TestResult::Fail("tx channel index wrong");
+    }
+    if tx.state.len != 256 {
+        return TestResult::Fail("tx ring depth not 256");
+    }
+    if tx.regs.idx != 0x1058 {
+        return TestResult::Fail("AX ACH0 doorbell wrong");
+    }
+    // 8852C (V1 layout) — same doorbell but desa_l moves to V1 base.
+    let tx_v1 = TxChannelState::new(ChipId::Rtl8852C, 0, 256);
+    if tx_v1.regs.desa_l != 0x1230 {
+        return TestResult::Fail("V1 ACH0 desa_l wrong");
+    }
+    // RX baseline.
+    let rx = RxChannelState::new(ChipId::Rtl8852A, 0, 256);
+    if rx.regs.idx != 0x1050 {
+        return TestResult::Fail("AX RXQ doorbell wrong");
+    }
+    if rx.state.len != 256 {
+        return TestResult::Fail("rx ring depth wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_datapath_channel_state);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //

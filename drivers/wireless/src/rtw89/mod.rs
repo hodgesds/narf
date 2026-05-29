@@ -59,6 +59,7 @@ extern crate alloc;
 
 pub mod btc;
 pub mod chan;
+pub mod datapath;
 pub mod dma;
 pub mod efuse;
 pub mod fw;
