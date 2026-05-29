@@ -814,6 +814,67 @@ impl SocketFile {
             }
             Ok(u32::from_ne_bytes([slot[0], slot[1], slot[2], slot[3]]))
         };
+        // Kernel TCB pushdown: when the socket is bound to a real
+        // narf_net::tcp_stack TCB, forward TCP-layer options through
+        // the kernel API so the negotiation actually takes effect on
+        // the wire. Options we don't recognise here fall through and
+        // are stored in `self.options` for round-trip purposes.
+        if level == IPPROTO_TCP {
+            let tcb_id = {
+                let state = self.state.lock();
+                if let SocketState::InetWired { tcb_id, .. } = &*state {
+                    Some(*tcb_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(id) = tcb_id {
+                if name == TCP_CONGESTION {
+                    if let Ok(s) = core::str::from_utf8(value) {
+                        let name = s.trim_end_matches('\0');
+                        let _ = narf_net::tcp_stack::setsockopt_str(
+                            id,
+                            narf_net::tcp_stack::TCP_CONGESTION,
+                            name,
+                        );
+                    }
+                } else {
+                    let raw = match read_u32(value) { Ok(v) => v as i32, Err(_) => 0 };
+                    let kid: Option<i32> = match name {
+                        TCP_NODELAY => Some(narf_net::tcp_stack::TCP_NODELAY),
+                        TCP_KEEPIDLE => Some(narf_net::tcp_stack::TCP_KEEPIDLE),
+                        TCP_KEEPINTVL => Some(narf_net::tcp_stack::TCP_KEEPINTVL),
+                        TCP_KEEPCNT => Some(narf_net::tcp_stack::TCP_KEEPCNT),
+                        TCP_USER_TIMEOUT => Some(narf_net::tcp_stack::TCP_USER_TIMEOUT),
+                        TCP_MAXSEG => Some(narf_net::tcp_stack::TCP_MAXSEG),
+                        TCP_CORK => Some(narf_net::tcp_stack::TCP_CORK),
+                        TCP_QUICKACK => Some(narf_net::tcp_stack::TCP_QUICKACK),
+                        _ => None,
+                    };
+                    if let Some(opt) = kid {
+                        let _ = narf_net::tcp_stack::setsockopt_int(id, opt, raw);
+                    }
+                }
+            }
+        }
+        if level == SOL_SOCKET && name == SO_KEEPALIVE {
+            let tcb_id = {
+                let state = self.state.lock();
+                if let SocketState::InetWired { tcb_id, .. } = &*state {
+                    Some(*tcb_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(id) = tcb_id {
+                let raw = match read_u32(value) { Ok(v) => v as i32, Err(_) => 0 };
+                let _ = narf_net::tcp_stack::setsockopt_int(
+                    id,
+                    narf_net::tcp_stack::TCP_KEEPALIVE,
+                    raw,
+                );
+            }
+        }
         let mut opts = self.options.lock();
         match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => match read_u32(value) {
