@@ -103,6 +103,27 @@ pub fn rx_handler(frame: &[u8]) {
     if frame.len() < ETH_HDR_LEN {
         return;
     }
+    // Kernel-bypass classifier. Runs before any L2 parse so a
+    // whole-NIC daemon attach sees the raw frame; per-flow claims
+    // get their 5-tuple from the frame's IPv4+L4 headers. On a
+    // Consumed verdict the frame is already staged into the
+    // claimant's UMEM → RX ring and we MUST NOT continue down the
+    // kernel stack — that would double-deliver the frame.
+    //
+    // Linux ref: linux/net/core/dev.c::netif_receive_skb_core
+    // installs the XDP/AF_XDP hook ahead of the protocol-stack
+    // dispatch; same shape.
+    let bypass_iface = iface::primary()
+        .map(|s| s.name)
+        .unwrap_or_else(|| alloc::string::String::from("eth0"));
+    match crate::bypass::classifier::classify(&bypass_iface, frame) {
+        crate::bypass::classifier::Verdict::Consumed => return,
+        crate::bypass::classifier::Verdict::Dropped => return,
+        crate::bypass::classifier::Verdict::PassThrough => {}
+    }
+
+    // AF_PACKET raw sockets see every frame before L3 dispatch.
+    crate::raw_sock::raw_pkt_deliver(frame, 1);
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
