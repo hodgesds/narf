@@ -1388,6 +1388,187 @@ kernel_test_in!(
     smoke_brcmfmac_eapol_m4_secure_bit
 );
 
+// ── Stage-9: connect orchestrator ──────────────────────────────────────
+
+fn smoke_brcmfmac_connect_iovar_builders() -> TestResult {
+    use super::connect::{
+        build_chanspec_iovar, build_country_iovar, build_wpa_auth_iovar, WPA_AUTH_WPA2_PSK,
+    };
+    let mut buf = [0u8; 64];
+    let n = build_chanspec_iovar(0x1824, &mut buf).unwrap();
+    if &buf[..8] != b"chanspec" || buf[8] != 0 || buf[9..11] != [0x24, 0x18] {
+        return TestResult::Fail("chanspec iovar mis-encoded");
+    }
+    if n != 11 {
+        return TestResult::Fail("chanspec iovar wrong size");
+    }
+    let n = build_wpa_auth_iovar(WPA_AUTH_WPA2_PSK, &mut buf).unwrap();
+    if &buf[..8] != b"wpa_auth" || buf[8] != 0 {
+        return TestResult::Fail("wpa_auth iovar mis-encoded");
+    }
+    if buf[9..13] != WPA_AUTH_WPA2_PSK.to_le_bytes() {
+        return TestResult::Fail("wpa_auth data bytes wrong");
+    }
+    if n != 13 {
+        return TestResult::Fail("wpa_auth iovar wrong size");
+    }
+    let _ = build_country_iovar(b"US\0\0", &mut buf).unwrap();
+    if &buf[..7] != b"country" || buf[7] != 0 || &buf[8..12] != b"US\0\0" {
+        return TestResult::Fail("country iovar mis-encoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_connect_iovar_builders
+);
+
+fn smoke_brcmfmac_connect_orchestrator_happy_path() -> TestResult {
+    use super::connect::{connect_wpa2_psk, EventQueue, RecordingIoctl};
+    use super::fweh::{
+        EventMsg, BRCMF_E_ASSOC, BRCMF_E_LINK, BRCMF_E_PSK_SUP, BRCMF_E_STATUS_FWSUP_COMPLETED,
+        BRCMF_E_STATUS_SUCCESS, BRCMF_EVENT_MSG_LINK,
+    };
+    use super::fwil::{BRCMF_C_SET_SSID, BRCMF_C_UP};
+    use super::msgbuf::chanspec_20mhz;
+
+    let mut ioctl = RecordingIoctl::default();
+    let mut events = EventQueue {
+        events: alloc::vec![
+            EventMsg {
+                version: 1,
+                flags: BRCMF_EVENT_MSG_LINK,
+                event_code: BRCMF_E_LINK,
+                status: BRCMF_E_STATUS_SUCCESS,
+                reason: 0,
+                auth_type: 0,
+                datalen: 0,
+                addr: [0; 6],
+                ifidx: 0,
+                bsscfgidx: 0,
+            },
+            EventMsg {
+                version: 1,
+                flags: 0,
+                event_code: BRCMF_E_ASSOC,
+                status: BRCMF_E_STATUS_SUCCESS,
+                reason: 0,
+                auth_type: 0,
+                datalen: 0,
+                addr: [0; 6],
+                ifidx: 0,
+                bsscfgidx: 0,
+            },
+            EventMsg {
+                version: 1,
+                flags: 0,
+                event_code: BRCMF_E_PSK_SUP,
+                status: BRCMF_E_STATUS_FWSUP_COMPLETED,
+                reason: 0,
+                auth_type: 0,
+                datalen: 0,
+                addr: [0; 6],
+                ifidx: 0,
+                bsscfgidx: 0,
+            },
+        ],
+        cursor: 0,
+    };
+
+    let ssid = b"NarfTestNet";
+    let chanspec = chanspec_20mhz(36);
+    if connect_wpa2_psk(ssid, chanspec, &mut ioctl, &mut events).is_err() {
+        return TestResult::Fail("connect_wpa2_psk happy-path failed");
+    }
+    if ioctl.calls.len() != 2 {
+        return TestResult::Fail("orchestrator should issue exactly 2 IOCTLs");
+    }
+    if ioctl.calls[0].0 != BRCMF_C_UP {
+        return TestResult::Fail("first IOCTL should be BRCMF_C_UP");
+    }
+    if ioctl.calls[1].0 != BRCMF_C_SET_SSID {
+        return TestResult::Fail("second IOCTL should be BRCMF_C_SET_SSID");
+    }
+    if ioctl.calls[1].1.len() != super::fwil::JOIN_PARAMS_BLIND_SIZE {
+        return TestResult::Fail("SET_SSID payload wrong size");
+    }
+    if &ioctl.calls[1].1[4..4 + ssid.len()] != ssid {
+        return TestResult::Fail("SET_SSID payload missing SSID bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_connect_orchestrator_happy_path
+);
+
+fn smoke_brcmfmac_connect_link_down_propagates_reason() -> TestResult {
+    use super::connect::{connect_wpa2_psk, ConnectError, EventQueue, RecordingIoctl};
+    use super::fweh::{EventMsg, BRCMF_E_LINK};
+
+    let mut ioctl = RecordingIoctl::default();
+    let mut events = EventQueue {
+        events: alloc::vec![EventMsg {
+            version: 1,
+            flags: 0,
+            event_code: BRCMF_E_LINK,
+            status: 0,
+            reason: 15,
+            auth_type: 0,
+            datalen: 0,
+            addr: [0; 6],
+            ifidx: 0,
+            bsscfgidx: 0,
+        }],
+        cursor: 0,
+    };
+    match connect_wpa2_psk(b"DownNet", 0, &mut ioctl, &mut events) {
+        Err(ConnectError::JoinRejected(15)) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("expected ConnectError::JoinRejected(15)")
+        }
+        Ok(_) => TestResult::Fail("expected error, got Ok"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_connect_link_down_propagates_reason
+);
+
+fn smoke_brcmfmac_disconnect_drives_disassoc_then_link_down() -> TestResult {
+    use super::connect::{disconnect, EventQueue, RecordingIoctl};
+    use super::fweh::{EventMsg, BRCMF_E_LINK};
+    use super::fwil::BRCMF_C_DISASSOC;
+    let mut ioctl = RecordingIoctl::default();
+    let mut events = EventQueue {
+        events: alloc::vec![EventMsg {
+            version: 1,
+            flags: 0,
+            event_code: BRCMF_E_LINK,
+            status: 0,
+            reason: 3,
+            auth_type: 0,
+            datalen: 0,
+            addr: [0; 6],
+            ifidx: 0,
+            bsscfgidx: 0,
+        }],
+        cursor: 0,
+    };
+    if disconnect(&mut ioctl, &mut events).is_err() {
+        return TestResult::Fail("disconnect should return Ok");
+    }
+    if ioctl.calls.len() != 1 || ioctl.calls[0].0 != BRCMF_C_DISASSOC {
+        return TestResult::Fail("disconnect should issue BRCMF_C_DISASSOC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_disconnect_drives_disassoc_then_link_down
+);
+
 fn smoke_brcmfmac_probe_bound_or_skip() -> TestResult {
     if !super::pcie::is_probed() {
         return TestResult::Skip("brcmfmac: no BCM43xxx PCIe bound (expected on QEMU)");

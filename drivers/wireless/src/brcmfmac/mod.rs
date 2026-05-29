@@ -51,6 +51,7 @@
 extern crate alloc;
 
 pub mod cfg80211;
+pub mod connect;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;
