@@ -131,6 +131,59 @@ const TXD_EOR: u32 = 1 << 30;
 const TXD_FS: u32 = 1 << 29;
 const TXD_LS: u32 = 1 << 28;
 
+// TX v1 offload bits (word0; older chips RTL8168b and earlier).
+// Source: Linux r8169_main.c around line 588.
+/// v1 LSO enable (large-send offload). Bit 27 of word0.
+pub const TD_LSO: u32 = 1 << 27;
+/// v1 MSS field shift within word0 (bits[26:16]). Mask = 0x07FF_0000.
+pub const TD0_MSS_SHIFT: u32 = 16;
+/// v1 TCP checksum insert (word0 bit 16). Set alongside TD_LSO.
+pub const TD0_TCP_CS: u32 = 1 << 16;
+/// v1 IP checksum insert (word0 bit 18).
+pub const TD0_IP_CS: u32 = 1 << 18;
+
+// TX v2 offload bits (word1/vlan field; RTL8168c+ chips).
+// Source: Linux r8169_main.c around line 597.
+/// v2 GTS IPv4 large-send (word1 bit 26).
+pub const TD1_GTSENV4: u32 = 1 << 26;
+/// v2 GTS IPv6 large-send (word1 bit 25).
+pub const TD1_GTSENV6: u32 = 1 << 25;
+/// v2 MSS field shift in word1 (bits[28:18]). Mask = 0x1FFC_0000.
+pub const TD1_MSS_SHIFT: u32 = 18;
+/// v2 IPv4 header checksum insert (word1 bit 29).
+pub const TD1_IPv4_CS: u32 = 1 << 29;
+/// v2 TCP checksum insert (word1 bit 30).
+pub const TD1_TCP_CS: u32 = 1 << 30;
+/// v2 UDP checksum insert (word1 bit 31).
+pub const TD1_UDP_CS: u32 = 1 << 31;
+
+// RX status bits in word0 returned by hardware after a received frame.
+// Source: Linux r8169_main.c; IPFail/UDPFail/TCPFail in rx descriptor.
+/// RX: IP checksum failed (bit 16 of the returned flags_len word).
+pub const RX_IPFAIL: u32 = 1 << 16;
+/// RX: UDP checksum failed (bit 15).
+pub const RX_UDPFAIL: u32 = 1 << 15;
+/// RX: TCP checksum failed (bit 14).
+pub const RX_TCPFAIL: u32 = 1 << 14;
+/// RX: IP protocol present (bit 5). Set => hardware attempted IP csum.
+pub const RX_IPOK: u32 = 1 << 5;
+/// RX: TCP protocol present (bit 6). Set => hardware attempted L4 csum.
+pub const RX_TCPOK: u32 = 1 << 6;
+/// RX: UDP protocol present (bit 7). Set => hardware attempted L4 csum.
+pub const RX_UDPOK: u32 = 1 << 7;
+
+/// RX checksum verification result decoded from `Desc.flags_len` on
+/// a chip-returned RX descriptor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult {
+    /// Hardware did not compute a checksum for this frame.
+    None,
+    /// Hardware computed and verified the checksum — no errors.
+    Ok,
+    /// Hardware detected a checksum error.
+    Fail,
+}
+
 // RX descriptor flags (word0 high bits).
 const RXD_OWN: u32 = 1 << 31;
 const RXD_EOR: u32 = 1 << 30;
@@ -193,6 +246,63 @@ struct Desc {
     addr_hi: u32,
 }
 const _: () = assert!(core::mem::size_of::<Desc>() == 16);
+
+// ── Descriptor offload builders ─────────────────────────────────────
+
+impl Desc {
+    /// Build a TX descriptor with v2-path IP + TCP checksum offload.
+    /// The v2 csum bits live in `vlan` (word1); `flags_len` carries the
+    /// standard OWN | FS | LS | buffer-length encoding.
+    pub fn tx_with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
+        Desc {
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32),
+            vlan: TD1_IPv4_CS | TD1_TCP_CS,
+            addr_lo,
+            addr_hi,
+        }
+    }
+
+    /// Build a TX descriptor for TSO (v2 path). MSS is packed into
+    /// `vlan` bits[28:18] alongside the GTS-enable bit (TD1_GTSENV4).
+    /// Source: Linux r8169_main.c `rtl8169_tso_csum_v2`.
+    pub fn tx_with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
+        Desc {
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32),
+            vlan: TD1_GTSENV4
+                | TD1_IPv4_CS
+                | TD1_TCP_CS
+                | ((mss as u32) << TD1_MSS_SHIFT),
+            addr_lo,
+            addr_hi,
+        }
+    }
+
+    /// Decode the RX checksum result from a chip-returned descriptor.
+    ///
+    /// On RX, after the chip clears OWN, `flags_len` carries the error
+    /// indicator bits at specific positions. The *OK* bits (IPOK /
+    /// TCPOK / UDPOK) tell us the hardware attempted csum verification;
+    /// the *FAIL* bits (RX_IPFAIL / RX_TCPFAIL / RX_UDPFAIL) indicate
+    /// a bad result. If no OK bits are set the frame had no checksummed
+    /// protocol and we return None. Source: Linux r8169_main.c
+    /// `rtl8169_rx_csum`.
+    pub fn rx_csum_result(&self) -> RxCsumResult {
+        let ip_done = self.flags_len & RX_IPOK != 0;
+        let tcp_done = self.flags_len & RX_TCPOK != 0;
+        let udp_done = self.flags_len & RX_UDPOK != 0;
+        if !ip_done && !tcp_done && !udp_done {
+            return RxCsumResult::None;
+        }
+        let ip_fail = self.flags_len & RX_IPFAIL != 0;
+        let tcp_fail = self.flags_len & RX_TCPFAIL != 0;
+        let udp_fail = self.flags_len & RX_UDPFAIL != 0;
+        if ip_fail || tcp_fail || udp_fail {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
+    }
+}
 
 // ── Driver state ────────────────────────────────────────────────────
 

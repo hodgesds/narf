@@ -240,10 +240,18 @@ const _: () = assert!(core::mem::size_of::<RxBufferDesc>() == 32);
 // TX descriptor flag bits, native widths.
 pub const TXD_FLAG_END: u32 = 0x0004;
 pub const TXD_LEN_SHIFT: u32 = 16;
+pub const TXD_FLAG_TCPUDP_CSUM: u32 = 0x0001;
+pub const TXD_FLAG_IP_CSUM: u32 = 0x0002;
+pub const TXD_MSS_SHIFT: u32 = 16;
 
 // RX descriptor flag bits (in `type_flags`).
 pub const RXD_FLAG_END: u32 = 0x0004;
 pub const RXD_FLAG_ERROR: u32 = 0x0400;
+pub const RXD_FLAG_IP_CSUM: u32 = 0x1000;
+pub const RXD_FLAG_TCPUDP_CSUM: u32 = 0x2000;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult { None, Ok, Fail }
 
 // Error mask in `err_vlan`. Mirrors Linux `RXD_ERR_MASK` per
 // tg3.h:2630 — BAD_CRC | COLLISION | LINK_LOST | PHY_DECODE |
@@ -264,6 +272,32 @@ pub const RXD_ERR_MASK: u32 = RXD_ERR_BAD_CRC
     | RXD_ERR_TOO_SMALL
     | RXD_ERR_NO_RESOURCES
     | RXD_ERR_HUGE_FRAME;
+
+impl TxBufferDesc {
+    pub fn with_csum(addr_hi: u32, addr_lo: u32, len: u16) -> Self {
+        TxBufferDesc {
+            addr_hi, addr_lo,
+            len_flags: ((len as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END | TXD_FLAG_IP_CSUM | TXD_FLAG_TCPUDP_CSUM,
+            vlan_tag: 0,
+        }
+    }
+    pub fn with_tso(addr_hi: u32, addr_lo: u32, len: u16, mss: u16) -> Self {
+        TxBufferDesc {
+            addr_hi, addr_lo,
+            len_flags: ((len as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END | TXD_FLAG_IP_CSUM | TXD_FLAG_TCPUDP_CSUM,
+            vlan_tag: (mss as u32) << TXD_MSS_SHIFT,
+        }
+    }
+}
+
+impl RxBufferDesc {
+    pub fn csum_result(&self) -> RxCsumResult {
+        let ip_computed = self.type_flags & RXD_FLAG_IP_CSUM != 0;
+        let l4_computed = self.type_flags & RXD_FLAG_TCPUDP_CSUM != 0;
+        if !ip_computed && !l4_computed { return RxCsumResult::None; }
+        if self.type_flags & RXD_FLAG_ERROR != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
+    }
+}
 
 // ── Errors ──────────────────────────────────────────────────────────
 

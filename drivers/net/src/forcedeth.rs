@@ -309,6 +309,15 @@ pub const RXD_AVAIL: u32 = 1 << 31;
 /// `0xFFFFFFFF ^ FLAG_MASK_V2 = 0x3FFF` per forcedeth.c).
 pub const DESC_LEN_MASK_V2: u32 = 0x3FFF;
 
+// TX checksum / TSO offload bits. Source: forcedeth.c NV_TX2_*.
+pub const NV_TX2_TSO: u32 = 1 << 28;
+pub const NV_TX2_TSO_SHIFT: u32 = 14;
+pub const NV_TX2_CHECKSUM_L3: u32 = 1 << 27;
+pub const NV_TX2_CHECKSUM_L4: u32 = 1 << 26;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult { Fail, Ok }
+
 // ── MII Clause-22 register subset ──────────────────────────────────
 
 pub const MII_BMCR: u32 = 0x00;
@@ -364,6 +373,18 @@ struct Desc {
     flaglen: u32,
 }
 const _: () = assert!(core::mem::size_of::<Desc>() == 8);
+
+impl Desc {
+    pub fn tx_with_csum(buf: u32, len: u16) -> Self {
+        Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_CHECKSUM_L3 | NV_TX2_CHECKSUM_L4 | (len as u32 & DESC_LEN_MASK_V2) }
+    }
+    pub fn tx_with_tso(buf: u32, len: u16, mss: u16) -> Self {
+        Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_TSO | NV_TX2_CHECKSUM_L3 | NV_TX2_CHECKSUM_L4 | ((mss as u32) << NV_TX2_TSO_SHIFT) | (len as u32 & DESC_LEN_MASK_V2) }
+    }
+    pub fn rx_csum_result(&self) -> RxCsumResult {
+        if self.flaglen & RXD_ERROR != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
+    }
+}
 
 // ── Driver state ────────────────────────────────────────────────────
 

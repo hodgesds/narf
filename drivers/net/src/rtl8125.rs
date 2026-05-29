@@ -490,6 +490,35 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
     }
 }
 
+// v2 offload bits in TxDesc.vlan (word1). RTL8125 always uses v2 path.
+pub const TD1_GTSENV4: u32 = 1 << 26;
+pub const TD1_MSS_SHIFT: u32 = 18;
+pub const TD1_IPv4_CS: u32 = 1 << 29;
+pub const TD1_TCP_CS: u32 = 1 << 30;
+pub const RX_IPOK: u32 = 1 << 5;
+pub const RX_TCPOK: u32 = 1 << 6;
+pub const RX_UDPOK: u32 = 1 << 7;
+pub const RX_IPFAIL: u32 = 1 << 16;
+pub const RX_TCPFAIL: u32 = 1 << 14;
+pub const RX_UDPFAIL: u32 = 1 << 15;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult { None, Ok, Fail }
+
+impl TxDesc {
+    pub fn with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
+        TxDesc { flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK), vlan: TD1_IPv4_CS | TD1_TCP_CS, addr_lo, addr_hi }
+    }
+    pub fn with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
+        TxDesc { flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK), vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT), addr_lo, addr_hi }
+    }
+    pub fn rx_csum_result(&self) -> RxCsumResult {
+        let done = self.flags_len & (RX_IPOK | RX_TCPOK | RX_UDPOK) != 0;
+        if !done { return RxCsumResult::None; }
+        if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
+    }
+}
+
 // ── Live driver state ───────────────────────────────────────────────
 // Stage 2b: descriptor rings, MMIO-backed bring_up, polled TX/RX path.
 
