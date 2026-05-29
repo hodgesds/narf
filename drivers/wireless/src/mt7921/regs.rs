@@ -266,3 +266,114 @@ pub const MT7921_RX_RING_COUNT: usize = 2;
 /// of-two depth that fits both — DMA ring init in `mac.rs` will
 /// refine per-ring once real silicon bring-up lands.
 pub const MT7921_RING_DEPTH: usize = 128;
+
+// ── Per-ring sizes (Linux `mt7921.h` ~L10..L16) ────────────────────
+
+/// TX data ring depth on real Linux (`MT7921_TX_RING_SIZE`).
+pub const LINUX_MT7921_TX_RING_SIZE: usize = 2048;
+/// MCU command TX ring depth on real Linux (`MT7921_TX_MCU_RING_SIZE`).
+pub const LINUX_MT7921_TX_MCU_RING_SIZE: usize = 256;
+/// Firmware-download TX ring depth on real Linux (`MT7921_TX_FWDL_RING_SIZE`).
+pub const LINUX_MT7921_TX_FWDL_RING_SIZE: usize = 128;
+/// Data RX ring depth on real Linux (`MT7921_RX_RING_SIZE`).
+pub const LINUX_MT7921_RX_RING_SIZE: usize = 1536;
+/// Pre-firmware MCU event RX ring depth (`MT7921_RX_MCU_RING_SIZE`).
+pub const LINUX_MT7921_RX_MCU_RING_SIZE: usize = 8;
+/// Post-firmware MCU "WA" event RX ring depth (`MT7921_RX_MCU_WA_RING_SIZE`).
+pub const LINUX_MT7921_RX_MCU_WA_RING_SIZE: usize = 512;
+
+/// Stage-4 baseline ring depth (one 4 KiB DmaBuffer = 16 entries of
+/// 16-byte mt76_desc).
+pub const MT7921_BASELINE_RING_DEPTH: usize = 16;
+
+// ── WFDMA0 control extensions (mt792x_regs.h ~L290..L350) ──────────
+
+/// `MT_WFDMA0_GLO_CFG_TX_DMA_BUSY` — TX engine busy.
+pub const MT_WFDMA0_GLO_CFG_TX_DMA_BUSY: u32 = 1 << 1;
+/// `MT_WFDMA0_GLO_CFG_RX_DMA_BUSY` — RX engine busy.
+pub const MT_WFDMA0_GLO_CFG_RX_DMA_BUSY: u32 = 1 << 3;
+/// `MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN`.
+pub const MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN: u32 = 1 << 12;
+/// `MT_WFDMA0_GLO_CFG_RX_WB_DDONE`.
+pub const MT_WFDMA0_GLO_CFG_RX_WB_DDONE: u32 = 1 << 13;
+/// `MT_WFDMA0_GLO_CFG_OMIT_RX_INFO`.
+pub const MT_WFDMA0_GLO_CFG_OMIT_RX_INFO: u32 = 1 << 27;
+/// `MT_WFDMA0_GLO_CFG_OMIT_TX_INFO`.
+pub const MT_WFDMA0_GLO_CFG_OMIT_TX_INFO: u32 = 1 << 28;
+/// `MT_WFDMA0_GLO_CFG_CLK_GAT_DIS`.
+pub const MT_WFDMA0_GLO_CFG_CLK_GAT_DIS: u32 = 1 << 30;
+
+/// `MT_TX_RING_BASE` (== `MT_WFDMA0(0x300)`).
+pub const MT_TX_RING_BASE: u32 = MT_WFDMA0_BASE + 0x300;
+/// `MT_RX_EVENT_RING_BASE` (== `MT_WFDMA0(0x500)`).
+pub const MT_RX_EVENT_RING_BASE: u32 = MT_WFDMA0_BASE + 0x500;
+/// Post-firmware MCU-WA event ring base.
+pub const MT_RX_MCU_WA_RING_BASE: u32 = MT_WFDMA0_BASE + 0x540;
+/// `MT_RX_DATA_RING_BASE` (== `MT_WFDMA0(0x520)`).
+pub const MT_RX_DATA_RING_BASE: u32 = MT_WFDMA0_BASE + 0x520;
+
+/// Per-ring MMIO stride (16 bytes: base_lo + depth + cidx + didx).
+pub const RING_REG_STRIDE: u32 = 0x10;
+
+/// `MT_WFDMA0_HOST_INT_ENA`.
+pub const MT_WFDMA0_HOST_INT_ENA: u32 = MT_WFDMA0_BASE + 0x204;
+/// `MT_WFDMA0_HOST_INT_STA`.
+pub const MT_WFDMA0_HOST_INT_STA: u32 = MT_WFDMA0_BASE + 0x200;
+/// `MT_MCU2HOST_SW_INT_ENA`.
+pub const MT_MCU2HOST_SW_INT_ENA: u32 = MT_WFDMA0_BASE + 0x1f4;
+
+// ── INFRA bus windows (mt7921/regs.h:63..70) ───────────────────────
+
+/// `MT_INFRA_CFG_BASE` (BAR0 offset 0xfe000).
+pub const MT_INFRA_CFG_BASE: u32 = 0xfe000;
+/// `MT_HIF_REMAP_L1` — per-driver L1 remap register.
+pub const MT_HIF_REMAP_L1: u32 = MT_INFRA_CFG_BASE + 0x24c;
+/// Lower-half mask of `MT_HIF_REMAP_L1`.
+pub const MT_HIF_REMAP_L1_MASK: u32 = 0x0000_FFFF;
+/// Upper-half mask of `MT_HIF_REMAP_L1`.
+pub const MT_HIF_REMAP_L1_BASE: u32 = 0xFFFF_0000;
+/// Where the L1-remapped slab lands in BAR0.
+pub const MT_HIF_REMAP_BASE_L1: u32 = 0x40000;
+
+/// `MT_WFSYS_SW_RST_B` — Wi-Fi subsystem soft-reset.
+pub const MT_WFSYS_SW_RST_B: u32 = 0x18000140;
+
+// ── Extra MCU command opcodes (mt76_connac_mcu.h:1215..L1313) ──────
+
+/// `MCU_EXT_CMD_PM_STATE_CTRL`.
+pub const MCU_EXT_CMD_PM_STATE_CTRL: u8 = 0x07;
+/// `MCU_EXT_CMD_CHANNEL_SWITCH`.
+pub const MCU_EXT_CMD_CHANNEL_SWITCH: u8 = 0x08;
+/// `MCU_EXT_CMD_DEV_INFO_UPDATE`.
+pub const MCU_EXT_CMD_DEV_INFO_UPDATE: u8 = 0x2A;
+/// `MCU_EXT_CMD_BSS_INFO_UPDATE`.
+pub const MCU_EXT_CMD_BSS_INFO_UPDATE: u8 = 0x26;
+
+/// `MCU_UNI_CMD_DEV_INFO_UPDATE`.
+pub const MCU_UNI_CMD_DEV_INFO_UPDATE: u8 = 0x01;
+
+// ── Patch / firmware-download MCU opcodes ──────────────────────────
+
+/// `MCU_CMD_TARGET_ADDRESS_LEN_REQ` (opcode 0x01).
+pub const MCU_CMD_TARGET_ADDRESS_LEN_REQ: u8 = 0x01;
+/// `MCU_CMD_FW_START_REQ` (opcode 0x02).
+pub const MCU_CMD_FW_START_REQ: u8 = 0x02;
+/// `MCU_CMD_PATCH_START_REQ` (opcode 0x05).
+pub const MCU_CMD_PATCH_START_REQ: u8 = 0x05;
+/// `MCU_CMD_FW_SCATTER` (opcode 0xee).
+pub const MCU_CMD_FW_SCATTER: u8 = 0xEE;
+
+// ── 5 GHz channels ────────────────────────────────────────────────
+
+/// Channel 36 (5180 MHz). Default Stage-7 association channel.
+pub const MT7921_DEFAULT_CHAN_5G: u8 = 36;
+/// Channel 36 centre frequency (MHz).
+pub const MT7921_DEFAULT_CHAN_5G_MHZ: u16 = 5180;
+
+// ── INIT_RA_CFG (per Linux `mt76_connac_mcu.h:1226`, ext-cid 0x90) ─
+
+/// `MCU_EXT_CMD_INIT_RA_CFG` — initialise the rate-adaptation config.
+/// Per `mt76_connac_mcu.h` the opcode is part of the `MCU_EXT_CMD_*`
+/// table; Linux's `mt76_connac_mcu_set_rate_txpower` ultimately routes
+/// to opcode `0x90` for this leg.
+pub const MCU_EXT_CMD_INIT_RA_CFG: u8 = 0x90;

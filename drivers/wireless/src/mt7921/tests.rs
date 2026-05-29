@@ -481,3 +481,358 @@ kernel_test_in!(
     "drivers/wireless/mt7921",
     smoke_mt7921_probe_bound_or_skip
 );
+
+// ── Stage-4: DMA ring scaffolding ──────────────────────────────────
+
+fn smoke_mt7921_ring_regs_per_block() -> TestResult {
+    use super::dma::{mt7921_tx_ring_regs, mt7921_rx_ring_regs, RingRegs};
+    // TX ring 0 must land at MT_TX_RING_BASE + 0.
+    let tx0 = match mt7921_tx_ring_regs(0) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("tx ring 0 lookup failed"),
+    };
+    if tx0.base_lo != MT_TX_RING_BASE {
+        return TestResult::Fail("TX ring 0 base_lo not at MT_TX_RING_BASE");
+    }
+    if tx0.depth != MT_TX_RING_BASE + 0x04 {
+        return TestResult::Fail("TX ring 0 depth offset wrong");
+    }
+    if tx0.cidx != MT_TX_RING_BASE + 0x08 {
+        return TestResult::Fail("TX ring 0 cidx offset wrong");
+    }
+    if tx0.didx != MT_TX_RING_BASE + 0x0c {
+        return TestResult::Fail("TX ring 0 didx offset wrong");
+    }
+    // TX ring 4 (BMC) must be at base + 4 * 16.
+    let tx4 = mt7921_tx_ring_regs(4).unwrap();
+    if tx4.base_lo != MT_TX_RING_BASE + 4 * RING_REG_STRIDE {
+        return TestResult::Fail("TX ring 4 (BMC) stride wrong");
+    }
+    // FWDL (queue 16) and MCU (queue 17) land contiguously after BMC.
+    let fwdl = mt7921_tx_ring_regs(16).unwrap();
+    if fwdl.base_lo != MT_TX_RING_BASE + 5 * RING_REG_STRIDE {
+        return TestResult::Fail("FWDL ring stride wrong");
+    }
+    let mcu = mt7921_tx_ring_regs(17).unwrap();
+    if mcu.base_lo != MT_TX_RING_BASE + 6 * RING_REG_STRIDE {
+        return TestResult::Fail("MCU_WM ring stride wrong");
+    }
+    // RX rings — data at MT_RX_DATA_RING_BASE, MCU pre-FW at
+    // MT_RX_EVENT_RING_BASE, MCU post-FW at MT_RX_MCU_WA_RING_BASE.
+    let rx0 = mt7921_rx_ring_regs(0).unwrap();
+    if rx0.base_lo != MT_RX_DATA_RING_BASE {
+        return TestResult::Fail("RX data ring not at MT_RX_DATA_RING_BASE");
+    }
+    let rx1 = mt7921_rx_ring_regs(1).unwrap();
+    if rx1.base_lo != MT_RX_EVENT_RING_BASE {
+        return TestResult::Fail("RX MCU event ring not at MT_RX_EVENT_RING_BASE");
+    }
+    let rx2 = mt7921_rx_ring_regs(2).unwrap();
+    if rx2.base_lo != MT_RX_MCU_WA_RING_BASE {
+        return TestResult::Fail("RX MCU WA ring not at MT_RX_MCU_WA_RING_BASE");
+    }
+    // Bad queue id must error.
+    if mt7921_tx_ring_regs(127).is_ok() {
+        return TestResult::Fail("invalid TX queue id was accepted");
+    }
+    if mt7921_rx_ring_regs(99).is_ok() {
+        return TestResult::Fail("invalid RX queue id was accepted");
+    }
+    // Stride helper itself.
+    let custom = RingRegs::for_block(0x1000, 3);
+    if custom.base_lo != 0x1000 + 3 * 16 {
+        return TestResult::Fail("RingRegs::for_block stride math wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_ring_regs_per_block
+);
+
+fn smoke_mt7921_desc_size_and_dma_ctl() -> TestResult {
+    use super::dma::{
+        Mt76Desc, MT76_DESC_SIZE, MT_DMA_CTL_DMA_DONE, MT_DMA_CTL_LAST_SEC0,
+        MT_DMA_CTL_SD_LEN0_MASK, MT_DMA_CTL_SD_LEN0_SHIFT,
+    };
+    // The Linux struct mt76_desc must be exactly 16 bytes.
+    if MT76_DESC_SIZE != 16 {
+        return TestResult::Fail("Mt76Desc not 16 bytes");
+    }
+    if core::mem::size_of::<Mt76Desc>() != 16 {
+        return TestResult::Fail("Mt76Desc size_of wrong");
+    }
+    // DMA_DONE is BIT(31).
+    if MT_DMA_CTL_DMA_DONE != 1 << 31 {
+        return TestResult::Fail("MT_DMA_CTL_DMA_DONE not BIT(31)");
+    }
+    // LAST_SEC0 is BIT(30).
+    if MT_DMA_CTL_LAST_SEC0 != 1 << 30 {
+        return TestResult::Fail("MT_DMA_CTL_LAST_SEC0 not BIT(30)");
+    }
+    // SD_LEN0 occupies bits 29..16 — that's 14 bits.
+    if MT_DMA_CTL_SD_LEN0_SHIFT != 16 {
+        return TestResult::Fail("MT_DMA_CTL_SD_LEN0_SHIFT not 16");
+    }
+    if MT_DMA_CTL_SD_LEN0_MASK != 0x3FFF << 16 {
+        return TestResult::Fail("MT_DMA_CTL_SD_LEN0_MASK wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_desc_size_and_dma_ctl
+);
+
+fn smoke_mt7921_tx_ring_alloc() -> TestResult {
+    use super::dma::{alloc_tx_ring, MT76_DESC_SIZE};
+    // Allocate a TX ring of the baseline depth. Buffer pool stays
+    // empty (TX path allocs at submit time).
+    let depth = MT7921_BASELINE_RING_DEPTH;
+    let ring = match alloc_tx_ring(0, depth) {
+        Ok(r) => r,
+        Err(e) => {
+            // If the allocator is unavailable (early-boot) skip.
+            let _ = e;
+            return TestResult::Skip("alloc_coherent unavailable");
+        }
+    };
+    if ring.depth() != depth {
+        return TestResult::Fail("ring depth mismatch");
+    }
+    if ring.q_idx() != 0 {
+        return TestResult::Fail("ring q_idx mismatch");
+    }
+    if ring.cpu_idx() != 0 {
+        return TestResult::Fail("TX ring cpu_idx not 0 at alloc");
+    }
+    // Descriptor block has exactly `depth` entries of MT76_DESC_SIZE.
+    if ring.descriptors().len() * MT76_DESC_SIZE != depth * MT76_DESC_SIZE {
+        return TestResult::Fail("descriptor slice length wrong");
+    }
+    // Depth out-of-range must error.
+    if alloc_tx_ring(0, 9999).is_ok() {
+        return TestResult::Fail("oversized depth was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_tx_ring_alloc);
+
+fn smoke_mt7921_rx_ring_alloc_primed() -> TestResult {
+    use super::dma::{alloc_rx_ring, Mt76Desc, MT_DMA_CTL_SD_LEN0_MASK, RX_BUF_LEN};
+    let depth = MT7921_BASELINE_RING_DEPTH;
+    let ring = match alloc_rx_ring(0, depth, RX_BUF_LEN) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Skip("alloc_coherent unavailable"),
+    };
+    if ring.buffers().len() != depth {
+        return TestResult::Fail("RX buffer pool not pre-filled");
+    }
+    // CPU pointer sits at depth-1 — all entries primed for HW pickup.
+    if ring.cpu_idx() != depth - 1 {
+        return TestResult::Fail("RX cpu_idx not at depth-1 after prime");
+    }
+    // Every descriptor must have a non-zero buf0 (the buffer's phys
+    // addr) and ctrl.SD_LEN0 set.
+    for (i, d) in ring.descriptors().iter().enumerate() {
+        let dummy: &Mt76Desc = d;
+        if dummy.buf0 == 0 {
+            return TestResult::Fail("RX descriptor buf0 not primed");
+        }
+        let sd_len0 = (dummy.ctrl & MT_DMA_CTL_SD_LEN0_MASK) >> 16;
+        if sd_len0 == 0 {
+            return TestResult::Fail("RX descriptor SD_LEN0 not set");
+        }
+        let _ = i;
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_rx_ring_alloc_primed
+);
+
+fn smoke_mt7921_l1_remap_helper() -> TestResult {
+    use super::dma::l1_remapped_offset;
+    // After programming MT_HIF_REMAP_L1 to cover upper-bits `0x7c06`,
+    // accessing absolute address 0x7c060010 lands at BAR0 offset
+    // MT_HIF_REMAP_BASE_L1 + (addr & MT_HIF_REMAP_L1_MASK)
+    //                     = 0x40000 + 0x0010 = 0x40010.
+    let off = l1_remapped_offset(MT_CONN_ON_LPCTL);
+    if off & MT_HIF_REMAP_L1_BASE != MT_HIF_REMAP_BASE_L1 {
+        return TestResult::Fail("L1 remap base bits wrong");
+    }
+    if off & MT_HIF_REMAP_L1_MASK != (MT_CONN_ON_LPCTL & MT_HIF_REMAP_L1_MASK) {
+        return TestResult::Fail("L1 remap offset bits wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_l1_remap_helper);
+
+fn smoke_mt7921_ring_set_allocates() -> TestResult {
+    use super::dma::allocate_ring_set;
+    let set = match allocate_ring_set() {
+        Ok(s) => s,
+        Err(_) => return TestResult::Skip("ring set alloc unavailable"),
+    };
+    if set.tx_data.len() != MT7921_TX_RING_COUNT {
+        return TestResult::Fail("ring set TX count wrong");
+    }
+    if set.tx_fwdl.q_idx() != 16 {
+        return TestResult::Fail("FWDL q_idx wrong");
+    }
+    if set.tx_mcu.q_idx() != 17 {
+        return TestResult::Fail("MCU q_idx wrong");
+    }
+    if set.rx_data.q_idx() != 0 {
+        return TestResult::Fail("RX data q_idx wrong");
+    }
+    if set.rx_mcu_evt.q_idx() != 1 {
+        return TestResult::Fail("RX MCU event q_idx wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_ring_set_allocates
+);
+
+fn smoke_mt7921_linux_ring_sizes_visible() -> TestResult {
+    // Pin the Linux ring sizes against drift in mt7921.h.
+    if LINUX_MT7921_TX_RING_SIZE != 2048 {
+        return TestResult::Fail("LINUX_MT7921_TX_RING_SIZE drifted");
+    }
+    if LINUX_MT7921_TX_MCU_RING_SIZE != 256 {
+        return TestResult::Fail("LINUX_MT7921_TX_MCU_RING_SIZE drifted");
+    }
+    if LINUX_MT7921_TX_FWDL_RING_SIZE != 128 {
+        return TestResult::Fail("LINUX_MT7921_TX_FWDL_RING_SIZE drifted");
+    }
+    if LINUX_MT7921_RX_RING_SIZE != 1536 {
+        return TestResult::Fail("LINUX_MT7921_RX_RING_SIZE drifted");
+    }
+    if LINUX_MT7921_RX_MCU_RING_SIZE != 8 {
+        return TestResult::Fail("LINUX_MT7921_RX_MCU_RING_SIZE drifted");
+    }
+    if LINUX_MT7921_RX_MCU_WA_RING_SIZE != 512 {
+        return TestResult::Fail("LINUX_MT7921_RX_MCU_WA_RING_SIZE drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_linux_ring_sizes_visible
+);
+
+fn smoke_mt7921_extended_mcu_opcodes() -> TestResult {
+    // Pin the Linux MCU_EXT_CMD_* opcodes against drift in
+    // mt76_connac_mcu.h. Stage-5..7 depend on these.
+    if MCU_EXT_CMD_PM_STATE_CTRL != 0x07 {
+        return TestResult::Fail("MCU_EXT_CMD_PM_STATE_CTRL not 0x07");
+    }
+    if MCU_EXT_CMD_CHANNEL_SWITCH != 0x08 {
+        return TestResult::Fail("MCU_EXT_CMD_CHANNEL_SWITCH not 0x08");
+    }
+    if MCU_EXT_CMD_BSS_INFO_UPDATE != 0x26 {
+        return TestResult::Fail("MCU_EXT_CMD_BSS_INFO_UPDATE not 0x26");
+    }
+    if MCU_EXT_CMD_DEV_INFO_UPDATE != 0x2A {
+        return TestResult::Fail("MCU_EXT_CMD_DEV_INFO_UPDATE not 0x2A");
+    }
+    if MCU_UNI_CMD_DEV_INFO_UPDATE != 0x01 {
+        return TestResult::Fail("MCU_UNI_CMD_DEV_INFO_UPDATE not 0x01");
+    }
+    if MCU_CMD_TARGET_ADDRESS_LEN_REQ != 0x01 {
+        return TestResult::Fail("MCU_CMD_TARGET_ADDRESS_LEN_REQ not 0x01");
+    }
+    if MCU_CMD_FW_START_REQ != 0x02 {
+        return TestResult::Fail("MCU_CMD_FW_START_REQ not 0x02");
+    }
+    if MCU_CMD_PATCH_START_REQ != 0x05 {
+        return TestResult::Fail("MCU_CMD_PATCH_START_REQ not 0x05");
+    }
+    if MCU_CMD_FW_SCATTER != 0xEE {
+        return TestResult::Fail("MCU_CMD_FW_SCATTER not 0xEE");
+    }
+    if MCU_EXT_CMD_INIT_RA_CFG != 0x90 {
+        return TestResult::Fail("MCU_EXT_CMD_INIT_RA_CFG not 0x90");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_extended_mcu_opcodes
+);
+
+fn smoke_mt7921_infra_window_constants() -> TestResult {
+    // Catch drift on the INFRA L1 remap window constants — these are
+    // cross-referenced from `mt7921/regs.h:63..70`.
+    if MT_INFRA_CFG_BASE != 0xfe000 {
+        return TestResult::Fail("MT_INFRA_CFG_BASE drifted");
+    }
+    if MT_HIF_REMAP_L1 != 0xfe000 + 0x24c {
+        return TestResult::Fail("MT_HIF_REMAP_L1 drifted");
+    }
+    if MT_HIF_REMAP_BASE_L1 != 0x40000 {
+        return TestResult::Fail("MT_HIF_REMAP_BASE_L1 drifted");
+    }
+    if MT_HIF_REMAP_L1_MASK != 0x0000_FFFF {
+        return TestResult::Fail("MT_HIF_REMAP_L1_MASK drifted");
+    }
+    if MT_HIF_REMAP_L1_BASE != 0xFFFF_0000 {
+        return TestResult::Fail("MT_HIF_REMAP_L1_BASE drifted");
+    }
+    if MT_WFSYS_SW_RST_B != 0x18000140 {
+        return TestResult::Fail("MT_WFSYS_SW_RST_B drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_infra_window_constants
+);
+
+fn smoke_mt7921_wfdma0_extended_bits() -> TestResult {
+    // Catch drift on the GLO_CFG flag bits we add in Stage-4.
+    if MT_WFDMA0_GLO_CFG_TX_DMA_BUSY != 1 << 1 {
+        return TestResult::Fail("TX_DMA_BUSY not BIT(1)");
+    }
+    if MT_WFDMA0_GLO_CFG_RX_DMA_BUSY != 1 << 3 {
+        return TestResult::Fail("RX_DMA_BUSY not BIT(3)");
+    }
+    if MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN != 1 << 12 {
+        return TestResult::Fail("FIFO_LE not BIT(12)");
+    }
+    if MT_WFDMA0_GLO_CFG_RX_WB_DDONE != 1 << 13 {
+        return TestResult::Fail("RX_WB_DDONE not BIT(13)");
+    }
+    if MT_WFDMA0_GLO_CFG_OMIT_RX_INFO != 1 << 27 {
+        return TestResult::Fail("OMIT_RX_INFO not BIT(27)");
+    }
+    if MT_WFDMA0_GLO_CFG_OMIT_TX_INFO != 1 << 28 {
+        return TestResult::Fail("OMIT_TX_INFO not BIT(28)");
+    }
+    if MT_WFDMA0_GLO_CFG_CLK_GAT_DIS != 1 << 30 {
+        return TestResult::Fail("CLK_GAT_DIS not BIT(30)");
+    }
+    // Per-ring stride is 16 bytes.
+    if RING_REG_STRIDE != 0x10 {
+        return TestResult::Fail("RING_REG_STRIDE drifted");
+    }
+    // The TX/RX ring base addresses must match Linux's
+    // `MT_TX_RING_BASE` (MT_WFDMA0(0x300)) and `MT_RX_*_RING_BASE`.
+    if MT_TX_RING_BASE != MT_WFDMA0_BASE + 0x300 {
+        return TestResult::Fail("MT_TX_RING_BASE drifted");
+    }
+    if MT_RX_DATA_RING_BASE != MT_WFDMA0_BASE + 0x520 {
+        return TestResult::Fail("MT_RX_DATA_RING_BASE drifted");
+    }
+    if MT_RX_EVENT_RING_BASE != MT_WFDMA0_BASE + 0x500 {
+        return TestResult::Fail("MT_RX_EVENT_RING_BASE drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_wfdma0_extended_bits
+);
