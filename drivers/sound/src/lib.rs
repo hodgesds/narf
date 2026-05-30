@@ -69,10 +69,13 @@
 extern crate alloc;
 
 pub mod codec;
+pub mod devfs_bridge;
 pub mod format;
 pub mod hda;
 pub mod mixer;
 pub mod pcm;
+pub mod procfs_bridge;
+pub mod sysfs_bridge;
 
 mod tests;
 
@@ -378,4 +381,55 @@ pub fn finalize_probe(driver: &'static str, id: &'static str, name: &'static str
 /// Sample-format / rate / channel quick-check used by tests.
 pub fn supported_format(fmt: SampleFormat, rate: SampleRate, channels: ChannelCount) -> bool {
     crate::format::supported(fmt, rate, channels)
+}
+
+// ── VFS bridge initcall ─────────────────────────────────────────────────
+
+/// Register all sound-driver VFS bridges.
+///
+/// Called once from the kernel's filesystem initcall sequence after the
+/// first HDA controller is probed.  Idempotent — safe to call again
+/// (replaces the existing delegates with fresh instances that still read
+/// from the same live `CARD_REGISTRY`).
+///
+/// Order:
+///   1. sysfs  — `/sys/class/sound/*` kobjects  (no ordering dep on devfs)
+///   2. devfs  — `/dev/snd/*` character nodes
+///   3. procfs — `/proc/asound/*` generators (stub until Wave-19 API lands)
+pub fn sound_fs_initcall() {
+    crate::sysfs_bridge::register_all_cards_sysfs();
+    crate::devfs_bridge::register_devfs_snd();
+    crate::procfs_bridge::register_procfs_asound();
+}
+
+// ── Test support ────────────────────────────────────────────────────────
+
+/// Helpers used by `devfs_bridge` and `sysfs_bridge` unit tests to
+/// drive `FsFuture` without a full async executor.
+pub mod tests_support {
+    /// Synchronously poll `fut` once with a no-op waker.
+    ///
+    /// `FsFuture` values produced by the bridge `FileOps` impls are always
+    /// immediately ready — they do not yield to the executor.  The no-op
+    /// waker is therefore correct: we never need to wake it.
+    pub fn poll_once<T>(
+        fut: impl core::future::Future<Output = T>,
+    ) -> T {
+        use core::pin::Pin;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable =
+                RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut boxed = alloc::boxed::Box::pin(fut);
+        match boxed.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("poll_once: future is pending"),
+        }
+    }
 }

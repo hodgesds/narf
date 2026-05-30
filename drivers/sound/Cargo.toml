@@ -23,6 +23,7 @@ narf-init         = { path = "../../init" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
 narf-drivers      = { path = "../../drivers" }
+narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]

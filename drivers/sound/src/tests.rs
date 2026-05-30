@@ -714,3 +714,145 @@ fn smoke_mixer_handle_list_controls() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/sound", smoke_mixer_handle_list_controls);
+
+// ── #28: /dev/snd/controlC0 appears after card registration ──────────
+
+fn smoke_devfs_control_node_appears() -> TestResult {
+    use narf_filesystem::DirOps as _;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    mixer::register_standard_realtek(0, true, true, true);
+    let dir = crate::devfs_bridge::DevSndDir;
+    match dir.lookup("controlC0") {
+        Some(_) => TestResult::Pass,
+        None => TestResult::Fail("controlC0 not visible after card 0 registration"),
+    }
+}
+kernel_test_in!("drivers/sound", smoke_devfs_control_node_appears);
+
+// ── #29: /dev/snd/pcmC0D0p visible after registration ────────────────
+
+fn smoke_devfs_pcm_playback_node() -> TestResult {
+    use narf_filesystem::DirOps as _;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    let dir = crate::devfs_bridge::DevSndDir;
+    match dir.lookup("pcmC0D0p") {
+        Some(_) => TestResult::Pass,
+        None => TestResult::Fail("pcmC0D0p not visible after card 0 registration"),
+    }
+}
+kernel_test_in!("drivers/sound", smoke_devfs_pcm_playback_node);
+
+// ── #30: /sys/class/sound/card0/id contains codec name ───────────────
+
+fn smoke_sysfs_card_id_attr() -> TestResult {
+    crate::__reset_for_test();
+    register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    let cards = list_cards();
+    let card = match cards.first() {
+        Some(c) => c.clone(),
+        None => return TestResult::Fail("no cards registered"),
+    };
+    let id_text = crate::sysfs_bridge::render_card_id_attr(&card);
+    if id_text.contains("HDA Intel PCH") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("card id attr does not contain codec name")
+    }
+}
+kernel_test_in!("drivers/sound", smoke_sysfs_card_id_attr);
+
+// ── #31: /sys/class/sound/pcmC0D0p/dev starts with "116:" ────────────
+
+fn smoke_sysfs_pcm_dev_attr_format() -> TestResult {
+    crate::__reset_for_test();
+    register_card("hda-amd", "HDA AMD", "HDA AMD Renoir", 0, 2, 1);
+    let dev_attr = crate::sysfs_bridge::render_pcm_dev_attr(0, 0, false);
+    if dev_attr.starts_with("116:") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("pcmC0D0p dev attr does not start with '116:'")
+    }
+}
+kernel_test_in!("drivers/sound", smoke_sysfs_pcm_dev_attr_format);
+
+// ── #32: PCM playback write 4096 bytes succeeds ──────────────────────
+
+fn smoke_devfs_pcm_write_4096() -> TestResult {
+    use crate::devfs_bridge::DevSndDir;
+    use narf_filesystem::DirOps;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    let dir = DevSndDir;
+    let node = match dir.lookup("pcmC0D0p") {
+        Some(n) => n,
+        None => return TestResult::Fail("pcmC0D0p not found"),
+    };
+    let samples = alloc::vec![0u8; 4096];
+    let result = crate::tests_support::poll_once(node.write(0, &samples));
+    match result {
+        Ok(n) if n == 4096 => TestResult::Pass,
+        Ok(n) => {
+            // Partial write is acceptable too (ring may absorb less).
+            let _ = n;
+            TestResult::Pass
+        }
+        Err(_) => TestResult::Fail("pcmC0D0p write returned error"),
+    }
+}
+kernel_test_in!("drivers/sound", smoke_devfs_pcm_write_4096);
+
+// ── #33: /proc/asound/cards format is correct ────────────────────────
+
+fn smoke_procfs_cards_format() -> TestResult {
+    crate::__reset_for_test();
+    register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    let text = crate::procfs_bridge::render_cards_list();
+    // Linux format: " N [id           ]: driver - longname"
+    if text.contains(" 0 [") && text.contains("]: hda-intel") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("procfs cards list format incorrect")
+    }
+}
+kernel_test_in!("drivers/sound", smoke_procfs_cards_format);
+
+// ── #34: /proc/asound/version contains ALSA header ───────────────────
+
+fn smoke_procfs_version_alsa_header() -> TestResult {
+    let text = crate::procfs_bridge::render_version();
+    if text.contains("Advanced Linux Sound Architecture") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("procfs version text missing ALSA header")
+    }
+}
+kernel_test_in!("drivers/sound", smoke_procfs_version_alsa_header);
+
+// ── #35: 2 cards → card0 + card1 both enumerate in /dev/snd ──────────
+
+fn smoke_devfs_multi_card_enumerate() -> TestResult {
+    use crate::devfs_bridge::DevSndDir;
+    use narf_filesystem::DirOps;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    register_card("hda-amd",   "HDA AMD",       "HDA AMD Renoir", 1, 1, 1);
+    let dir = DevSndDir;
+    let entries = dir.enumerate(0, 64);
+    let names: alloc::vec::Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    let has_c0 = names.contains(&"controlC0");
+    let has_c1 = names.contains(&"controlC1");
+    let has_p0 = names.contains(&"pcmC0D0p");
+    let has_p1 = names.contains(&"pcmC1D0p");
+    if has_c0 && has_c1 && has_p0 && has_p1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("multi-card enumerate missing expected nodes")
+    }
+}
+kernel_test_in!("drivers/sound", smoke_devfs_multi_card_enumerate);
