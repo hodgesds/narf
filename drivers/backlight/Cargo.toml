@@ -21,9 +21,10 @@ narf-console      = { path = "../../console" }
 narf-init         = { path = "../../init" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
+narf-drivers-leds = { path = "../leds" }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-drivers-leds/kernel-test"]
 
 [lints]
 workspace = true

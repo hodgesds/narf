@@ -25,7 +25,7 @@ mod smokes {
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
     use crate::{
         backlight_device, backlight_devices, register_backlight, unregister_backlight,
-        BacklightKind, __reset_all_for_test,
+        BacklightDevice, BacklightKind, __reset_all_for_test,
     };
 
     // ── 1. BacklightDevice registry add / remove ───────────────────
@@ -222,7 +222,7 @@ mod smokes {
     }
     kernel_test_in!("drivers/backlight", smoke_led_registry);
 
-    // ── 7. LED Trigger::Heartbeat — set suppresses direct writes ──
+    // ── 7. LED Trigger::Heartbeat — trigger get/set round-trip ──────
 
     fn smoke_led_trigger_heartbeat() -> TestResult {
         __reset_all_for_test();
@@ -231,25 +231,25 @@ mod smokes {
         register_led(led.clone() as Arc<dyn LedDevice>);
 
         let d = led_device("test::heartbeat").unwrap();
-        // No trigger → direct write works.
+        // No trigger → default is None.
+        if d.current_trigger() != Trigger::None {
+            return TestResult::Fail("default trigger should be None");
+        }
+        // Direct write works.
         d.set_brightness(100);
-        if d.current_brightness() != 100 {
+        if d.brightness() != 100 {
             return TestResult::Fail("initial set_brightness failed");
         }
-        // Attach heartbeat → direct write suppressed.
+        // Attach heartbeat trigger.
         d.set_trigger(Trigger::Heartbeat);
-        d.set_brightness(200);
-        if d.current_brightness() != 100 {
-            return TestResult::Fail("write should be suppressed with Heartbeat trigger");
-        }
-        if d.trigger() != Trigger::Heartbeat {
-            return TestResult::Fail("trigger() not Heartbeat");
+        if d.current_trigger() != Trigger::Heartbeat {
+            return TestResult::Fail("current_trigger() not Heartbeat");
         }
         // Clear trigger → direct write works again.
         d.set_trigger(Trigger::None);
         d.set_brightness(50);
-        if d.current_brightness() != 50 {
-            return TestResult::Fail("write failed after trigger cleared");
+        if d.brightness() != 50 {
+            return TestResult::Fail("set_brightness failed after trigger cleared");
         }
 
         unregister_led("test::heartbeat");

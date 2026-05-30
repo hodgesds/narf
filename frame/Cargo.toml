@@ -73,7 +73,9 @@ narf-accel           = { path = "../accel" }
 narf-tpm             = { path = "../tpm" }
 narf-i3c             = { path = "../i3c" }
 narf-pwm             = { path = "../pwm" }
-narf-pmbus           = { path = "../pmbus" }
+narf-drivers-leds      = { path = "../drivers/leds" }
+narf-drivers-backlight = { path = "../drivers/backlight" }
+narf-pmbus             = { path = "../pmbus" }
 narf-spdm            = { path = "../spdm" }
 narf-scmi            = { path = "../scmi" }
 narf-shmem           = { path = "../shmem" }
@@ -131,6 +133,8 @@ kernel-test  = [
     "narf-drivers-i2c/kernel-test",
     "narf-drivers-gpio/kernel-test",
     "narf-pwm/kernel-test",
+    "narf-drivers-leds/kernel-test",
+    "narf-drivers-backlight/kernel-test",
     "narf-pmbus/kernel-test",
     "narf-spdm/kernel-test",
     "narf-scmi/kernel-test",

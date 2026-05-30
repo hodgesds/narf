@@ -58,14 +58,14 @@ pub struct AcpiVideoDevice {
     /// battery defaults) are stripped; remainder is sorted ascending.
     pub levels: Vec<u32>,
     /// Last written brightness (snapped). `-1` = never written.
-    last: AtomicI32,
+    pub(crate) last: AtomicI32,
 }
 
 impl AcpiVideoDevice {
     /// Find the closest level on the ladder to `requested`.
     /// Ties break toward brighter. Returns the first ladder entry
     /// on an empty ladder.
-    fn snap(&self, requested: u32) -> u32 {
+    pub(crate) fn snap(&self, requested: u32) -> u32 {
         if self.levels.is_empty() {
             return 0;
         }

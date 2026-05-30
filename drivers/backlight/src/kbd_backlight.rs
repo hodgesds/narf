@@ -212,7 +212,7 @@ impl LedDevice for KbdBacklightDevice {
         self.max
     }
 
-    fn current_brightness(&self) -> u32 {
+    fn brightness(&self) -> u32 {
         self.cached.load(Ordering::Acquire)
     }
 
@@ -226,7 +226,7 @@ impl LedDevice for KbdBacklightDevice {
         // Keyboard backlights don't support software triggers.
     }
 
-    fn trigger(&self) -> Trigger {
+    fn current_trigger(&self) -> Trigger {
         Trigger::None
     }
 }
