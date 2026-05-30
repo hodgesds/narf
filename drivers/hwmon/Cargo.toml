@@ -1,0 +1,24 @@
+[package]
+name         = "narf-drivers-hwmon"
+description  = "Hardware monitoring drivers: k10temp (AMD), coretemp (Intel), nct6775 (Nuvoton Super-I/O), dell_smm."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_hwmon"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-bus          = { path = "../../bus" }
+narf-arch         = { path = "../../arch" }
+narf-capabilities = { path = "../../capabilities" }
+narf-init         = { path = "../../init" }
+narf-console      = { path = "../../console" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[lints]
+workspace = true
