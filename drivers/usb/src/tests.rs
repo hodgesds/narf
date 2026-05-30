@@ -4072,3 +4072,107 @@ fn smoke_wacom_cintiq_pad_expresskeys() -> TestResult {
     TestResult::Fail("BTN_0 not pressed in Cintiq ExpressKey report")
 }
 kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_cintiq_pad_expresskeys);
+
+// ── drivers/usb/hub — protocol-level smokes ────────────────────────
+// Required by the hwmon/serial/hub task spec.
+
+/// Hub descriptor decode: `bNbrPorts` and `wHubCharacteristics`
+/// are parsed correctly from a synthetic 9-byte descriptor buffer.
+///
+/// Reference: USB 2.0 §11.23.2.1 (Hub Descriptor), Table 11-13.
+/// Linux hub.c `usb_hub_descriptor` / `hub_configure` ~L3200.
+fn smoke_usb_hub_descriptor_decode() -> TestResult {
+    use crate::hub::{HubDescriptor, HUB_DESC_TYPE};
+    // Synthetic 9-byte USB 2.0 hub descriptor:
+    //   bLength=9, bDescriptorType=0x29, bNbrPorts=4,
+    //   wHubCharacteristics=0x0000 (ganged power, no OC),
+    //   bPwrOn2PwrGood=50 (100ms), bHubContrCurrent=100mA,
+    //   DeviceRemovable=0x00, PortPwrCtrlMask=0xFF
+    let buf: [u8; 9] = [0x09, HUB_DESC_TYPE, 4, 0x00, 0x00, 50, 100, 0x00, 0xFF];
+    let desc = match HubDescriptor::decode(&buf) {
+        Some(d) => d,
+        None => return TestResult::Fail("HubDescriptor::decode returned None for valid buffer"),
+    };
+    if desc.num_ports != 4 {
+        return TestResult::Fail("bNbrPorts decode wrong (expected 4)");
+    }
+    if desc.characteristics != 0x0000 {
+        return TestResult::Fail("wHubCharacteristics decode wrong (expected 0x0000)");
+    }
+    if desc.poweron_time_2ms != 50 {
+        return TestResult::Fail("bPwrOn2PwrGood decode wrong (expected 50)");
+    }
+    if desc.controller_current != 100 {
+        return TestResult::Fail("bHubContrCurrent decode wrong (expected 100)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_hub_descriptor_decode);
+
+/// Hub Port Status decode: connection-change, over-current, and reset
+/// bits are at the correct positions in the 32-bit GET_STATUS word.
+///
+/// Reference: USB 2.0 §11.24.2.7 (GetPortStatus), Table 11-15 (wPortStatus),
+/// Table 11-16 (wPortChange). Linux hub.c `hub_port_status` ~L665.
+fn smoke_usb_hub_port_status_decode() -> TestResult {
+    use crate::hub::{
+        C_PORT_CONNECTION, C_PORT_OVER_CURRENT, C_PORT_RESET,
+        PSTAT_CONNECTION, PSTAT_ENABLE, PSTAT_OVER_CURRENT, PSTAT_RESET,
+    };
+    // wPortStatus: bit 0 = connection, 1 = enable, 3 = over-current, 4 = reset.
+    if PSTAT_CONNECTION != 1 << 0 {
+        return TestResult::Fail("PSTAT_CONNECTION must be bit 0");
+    }
+    if PSTAT_ENABLE != 1 << 1 {
+        return TestResult::Fail("PSTAT_ENABLE must be bit 1");
+    }
+    if PSTAT_OVER_CURRENT != 1 << 3 {
+        return TestResult::Fail("PSTAT_OVER_CURRENT must be bit 3");
+    }
+    if PSTAT_RESET != 1 << 4 {
+        return TestResult::Fail("PSTAT_RESET must be bit 4");
+    }
+    // wPortChange change-bits map to feature codes (C_PORT_*):
+    // C_PORT_CONNECTION = 16, C_PORT_OVER_CURRENT = 19, C_PORT_RESET = 20.
+    // These are feature selector values for CLEAR_FEATURE, not bit indices.
+    if C_PORT_CONNECTION != 16 {
+        return TestResult::Fail("C_PORT_CONNECTION feature selector should be 16");
+    }
+    if C_PORT_OVER_CURRENT != 19 {
+        return TestResult::Fail("C_PORT_OVER_CURRENT feature selector should be 19");
+    }
+    if C_PORT_RESET != 20 {
+        return TestResult::Fail("C_PORT_RESET feature selector should be 20");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_hub_port_status_decode);
+
+/// SET_FEATURE PORT_POWER encodes the correct bmRequestType + bRequest
+/// + wValue triple. This test verifies that the constants used in
+/// `UsbHub::attach` (which issues SET_FEATURE PORT_POWER for each port)
+/// match the USB 2.0 Class-Specific Request table.
+///
+/// Reference: USB 2.0 §11.24.2.7 Table 11-17 (Port Feature Selectors).
+/// Linux hub.c `hub_power_on` ~L487.
+fn smoke_usb_hub_set_feature_port_power_encode() -> TestResult {
+    use crate::hub::{
+        PORT_POWER,
+        REQ_SET_FEATURE,
+        RT_HOST_TO_DEV_CLASS_OTHER,
+    };
+    // bmRequestType = 0x23: Host-to-Device, Class, Other (port).
+    if RT_HOST_TO_DEV_CLASS_OTHER != 0x23 {
+        return TestResult::Fail("bmRequestType for SET_FEATURE(port) should be 0x23");
+    }
+    // bRequest = 0x03 (SET_FEATURE per USB §9.4.9).
+    if REQ_SET_FEATURE != 0x03 {
+        return TestResult::Fail("bRequest SET_FEATURE should be 0x03");
+    }
+    // wValue = PORT_POWER = 8 (USB 2.0 §11.24.2.7.2 Table 11-17).
+    if PORT_POWER != 8 {
+        return TestResult::Fail("PORT_POWER feature selector should be 8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub", smoke_usb_hub_set_feature_port_power_encode);
