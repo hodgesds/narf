@@ -1392,10 +1392,12 @@ dependencies = [
  "narf-arch",
  "narf-block",
  "narf-boot",
+ "narf-bus",
  "narf-capabilities",
  "narf-console",
  "narf-init",
  "narf-input",
+ "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
@@ -1692,6 +1694,16 @@ name = "narf-memory"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-modules"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-filesystem",
  "narf-kernel-test",
  "narf-lib",
 ]
