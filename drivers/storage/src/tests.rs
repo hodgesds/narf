@@ -1341,3 +1341,350 @@ fn smoke_ahci_hot_unplug_state_transition() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_hot_unplug_state_transition);
+
+// ── RTSX smokes ────────────────────────────────────────────────────
+
+/// Verify that every Realtek device ID in the RTSX table is registered
+/// as a VendorDevice match after `register_pci_driver()`.
+fn smoke_rtsx_device_id_match() -> TestResult {
+    use crate::rtsx;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    rtsx::register_pci_driver();
+    let regs = registered_pci_drivers();
+    for (did, _name) in rtsx::RTSX_DEVICE_IDS.iter().copied() {
+        let has = regs.iter().any(|m| {
+            matches!(
+                m.kind,
+                MatchKind::VendorDevice {
+                    vendor: rtsx::RTSX_VENDOR,
+                    device,
+                } if device == did
+            )
+        });
+        if !has {
+            return TestResult::Fail("rtsx: missing VendorDevice match for known DID");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_device_id_match);
+
+/// Verify RTS525A (0x525A) is in the RTSX device table — the device
+/// found on Phoenix-class HawkPoint1 laptops.
+fn smoke_rtsx_rts525a_in_table() -> TestResult {
+    use crate::rtsx;
+    let has = rtsx::RTSX_DEVICE_IDS.iter().any(|(did, _)| *did == 0x525A);
+    if !has {
+        return TestResult::Fail("RTS525A (0x525A) must be in RTSX_DEVICE_IDS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_rts525a_in_table);
+
+/// Verify the RTSX vendor ID is 0x10EC (Realtek).
+fn smoke_rtsx_vendor_id() -> TestResult {
+    use crate::rtsx;
+    if rtsx::RTSX_VENDOR != 0x10EC {
+        return TestResult::Fail("RTSX_VENDOR must be 0x10EC (Realtek)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_vendor_id);
+
+/// Verify the SD command frame built by `build_sd_cmd_frame`:
+/// CMD17 (READ_SINGLE_BLOCK) with LBA 0x12345678 should produce a
+/// 6-byte frame with the start+direction bits set, the command index
+/// in bits[5:0] of byte 0, and the argument in bytes 1..4 big-endian.
+fn smoke_rtsx_sd_cmd17_encode() -> TestResult {
+    use crate::rtsx::cmd::build_sd_cmd_frame;
+
+    let frame = build_sd_cmd_frame(17, 0x1234_5678);
+
+    // Byte 0: 0x40 | cmd_index — start=0 (implicit), direction=1, index=17.
+    if frame[0] != (0x40 | 17) {
+        return TestResult::Fail("CMD17 frame byte 0: must be 0x40 | 17");
+    }
+    // Bytes 1..4: argument big-endian.
+    let reconstructed_arg = ((frame[1] as u32) << 24)
+        | ((frame[2] as u32) << 16)
+        | ((frame[3] as u32) << 8)
+        | (frame[4] as u32);
+    if reconstructed_arg != 0x1234_5678 {
+        return TestResult::Fail("CMD17 argument big-endian encoding wrong");
+    }
+    // Byte 5: CRC7 placeholder = 0x00.
+    if frame[5] != 0x00 {
+        return TestResult::Fail("CMD17 frame byte 5 must be 0 (CRC7 filled by hardware)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_sd_cmd17_encode);
+
+/// Verify CMD0 (GO_IDLE_STATE) frame: index 0, arg 0, byte 0 = 0x40.
+fn smoke_rtsx_sd_cmd0_encode() -> TestResult {
+    use crate::rtsx::cmd::build_sd_cmd_frame;
+
+    let frame = build_sd_cmd_frame(0, 0);
+    if frame[0] != 0x40 {
+        return TestResult::Fail("CMD0 byte 0 must be 0x40 (0b01_000000)");
+    }
+    for b in &frame[1..5] {
+        if *b != 0 {
+            return TestResult::Fail("CMD0 argument must be all-zero");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_sd_cmd0_encode);
+
+/// Verify CMD8 (SEND_IF_COND) frame: index 8, arg 0x000001AA.
+fn smoke_rtsx_sd_cmd8_encode() -> TestResult {
+    use crate::rtsx::cmd::build_sd_cmd_frame;
+
+    let frame = build_sd_cmd_frame(8, 0x000001AA);
+    if frame[0] != (0x40 | 8) {
+        return TestResult::Fail("CMD8 frame byte 0 must be 0x40 | 8");
+    }
+    // Argument 0x000001AA → bytes 1..4 = 0x00, 0x00, 0x01, 0xAA.
+    if frame[1] != 0x00 || frame[2] != 0x00 || frame[3] != 0x01 || frame[4] != 0xAA {
+        return TestResult::Fail("CMD8 argument 0x000001AA encoding wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_sd_cmd8_encode);
+
+/// Verify the RTSX write-register host-command-buffer entry encoding.
+/// A WRITE_REG for addr=0xFDA9 (SD_CMD0), mask=0xFF, data=0x51 should
+/// encode to a specific 32-bit LE word per the RTSX spec.
+fn smoke_rtsx_cmd_entry_write_encode() -> TestResult {
+    use crate::rtsx::cmd::CmdEntry;
+    use crate::rtsx::regs::{SD_CMD0, WRITE_REG_CMD};
+
+    let e = CmdEntry::write(SD_CMD0, 0xFF, 0x51);
+    let bytes = e.as_le_bytes();
+    let word = u32::from_le_bytes(bytes);
+
+    // type   = WRITE_REG_CMD (1) → bits[31:30] = 0b01
+    let expected_type = (WRITE_REG_CMD as u32) << 30;
+    if word & (0x3u32 << 30) != expected_type {
+        return TestResult::Fail("WRITE_REG type bits wrong");
+    }
+    // addr   = 0xFDA9 & 0x3FFF = 0x3DA9 → bits[29:16]
+    let expected_addr = (0xFDA9u32 & 0x3FFF) << 16;
+    if word & (0x3FFFu32 << 16) != expected_addr {
+        return TestResult::Fail("WRITE_REG addr bits wrong");
+    }
+    // mask   = 0xFF → bits[15:8]
+    if (word >> 8) & 0xFF != 0xFF {
+        return TestResult::Fail("WRITE_REG mask bits wrong");
+    }
+    // data   = 0x51 → bits[7:0]
+    if word & 0xFF != 0x51 {
+        return TestResult::Fail("WRITE_REG data bits wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_cmd_entry_write_encode);
+
+/// Verify the CmdBuf accumulates entries and serialises correctly.
+fn smoke_rtsx_cmd_buf_serialise() -> TestResult {
+    use crate::rtsx::cmd::CmdBuf;
+    use crate::rtsx::regs::{SD_CMD0, SD_CMD1};
+
+    let mut buf = CmdBuf::new();
+    assert!(buf.push_write(SD_CMD0, 0xFF, 0x51));
+    assert!(buf.push_write(SD_CMD1, 0xFF, 0x23));
+    if buf.len() != 2 {
+        return TestResult::Fail("CmdBuf::len should be 2");
+    }
+    let mut out = [0u8; 8];
+    buf.serialise(&mut out);
+
+    // Deserialise and verify each entry.
+    let w0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+    let w1 = u32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+
+    if w0 & 0xFF != 0x51 {
+        return TestResult::Fail("first entry data byte lost in serialise");
+    }
+    if w1 & 0xFF != 0x23 {
+        return TestResult::Fail("second entry data byte lost in serialise");
+    }
+    // Check clear + re-use.
+    buf.clear();
+    if buf.len() != 0 {
+        return TestResult::Fail("CmdBuf::clear should reset len to 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_cmd_buf_serialise);
+
+/// Verify BIPR_SD_EXIST (bit 16) is used for card-detection.
+/// Linux `rtsx_pci.h:60` — `SD_EXIST = (1 << 16)`.
+fn smoke_rtsx_bipr_sd_exist_bit() -> TestResult {
+    use crate::rtsx::card::sd_card_detected;
+    use crate::rtsx::regs::BIPR_SD_EXIST;
+
+    if BIPR_SD_EXIST != (1 << 16) {
+        return TestResult::Fail("BIPR_SD_EXIST must be bit 16 (1 << 16)");
+    }
+    // When bit 16 is set, sd_card_detected returns true.
+    if !sd_card_detected(1 << 16) {
+        return TestResult::Fail("sd_card_detected should be true when SD_EXIST bit set");
+    }
+    // When bit 16 is clear, sd_card_detected returns false.
+    if sd_card_detected(0x0000_FFFF) {
+        return TestResult::Fail("sd_card_detected should be false when SD_EXIST clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_bipr_sd_exist_bit);
+
+/// Verify the ACMD41 argument sets CCS (bit 30) when hcs=true,
+/// and clears it when hcs=false.
+fn smoke_rtsx_acmd41_hcs_arg() -> TestResult {
+    use crate::rtsx::card::SdCmd;
+
+    let acmd_hcs = SdCmd::acmd41(true);
+    if acmd_hcs.arg & (1 << 30) == 0 {
+        return TestResult::Fail("ACMD41 with hcs=true must set CCS (bit 30)");
+    }
+    let acmd_no_hcs = SdCmd::acmd41(false);
+    if acmd_no_hcs.arg & (1 << 30) != 0 {
+        return TestResult::Fail("ACMD41 with hcs=false must clear CCS");
+    }
+    if acmd_hcs.index != 41 {
+        return TestResult::Fail("ACMD41 command index must be 41");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_acmd41_hcs_arg);
+
+/// Verify RTSX probe rejects a non-RTSX device.
+fn smoke_rtsx_probe_rejects_non_rtsx() -> TestResult {
+    use crate::rtsx;
+    use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr, ProbeError};
+    use narf_capabilities::Cap;
+    use narf_memory::PhysAddr;
+
+    let addr = PcieAddr::new(0, 0, 0x1F, 2);
+    let dev = BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor: 0x8086, // Intel, not Realtek
+            device: 0x2922,
+            class: 0xFF0000,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: PhysAddr::new(0),
+        },
+    };
+    let cap = Cap::<BusDeviceCap, narf_capabilities::Write>::bootstrap();
+    match rtsx::probe(dev, cap) {
+        Err(ProbeError::NotForThisDriver) => TestResult::Pass,
+        Err(_) => TestResult::Fail("rtsx: non-RTSX device rejected with wrong error"),
+        Ok(_) => TestResult::Fail("rtsx: probe must not claim non-RTSX devices"),
+    }
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_probe_rejects_non_rtsx);
+
+/// Verify R7 (CMD8 response) decode: voltage nibble=1, pattern=0xAA.
+fn smoke_rtsx_r7_decode() -> TestResult {
+    use crate::rtsx::card::decode_r7;
+
+    // Standard CMD8 response for 2.7–3.6 V range + check pattern 0xAA.
+    let resp: u32 = 0x0000_01AA;
+    let (v_ok, pat_ok) = decode_r7(resp);
+    if !v_ok {
+        return TestResult::Fail("R7 voltage nibble 1 should be accepted");
+    }
+    if !pat_ok {
+        return TestResult::Fail("R7 check pattern 0xAA should match");
+    }
+    // Mismatched pattern.
+    let (_, bad_pat) = decode_r7(0x0000_0155);
+    if bad_pat {
+        return TestResult::Fail("R7 pattern 0x55 should not match 0xAA");
+    }
+    // Wrong voltage nibble.
+    let (bad_v, _) = decode_r7(0x0000_02AA);
+    if bad_v {
+        return TestResult::Fail("R7 voltage nibble 2 should not be accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_r7_decode);
+
+// ── MMC command-protocol smokes ────────────────────────────────────
+
+/// Verify the eMMC CMD8 (SEND_EXT_CSD) EXT_CSD HS200/HS400 decode
+/// round-trip: set both HS200 1.8 V and HS400 1.8 V bits and verify
+/// both predicates fire.
+fn smoke_mmc_cmd8_ext_csd_hs_flags() -> TestResult {
+    use crate::emmc::{
+        ExtCsd, CARD_TYPE_HS200_1V8, CARD_TYPE_HS400_1V8, EXT_CSD_CARD_TYPE,
+    };
+
+    let mut buf = [0u8; 512];
+    buf[EXT_CSD_CARD_TYPE] = CARD_TYPE_HS200_1V8 | CARD_TYPE_HS400_1V8;
+    let ext = ExtCsd::parse(&buf).expect("parse");
+
+    if !ext.supports_hs200() {
+        return TestResult::Fail("HS200 flag must be set when CARD_TYPE_HS200_1V8 is set");
+    }
+    if !ext.supports_hs400() {
+        return TestResult::Fail("HS400 flag must be set when CARD_TYPE_HS400_1V8 is set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_mmc_cmd8_ext_csd_hs_flags);
+
+/// Verify eMMC CMD0 framing: index=0, arg=0, no response expected.
+/// This maps to the `SdCmd::go_idle()` constructor in the RTSX card
+/// layer (same encoding used by the MMC layer for SDHCI).
+fn smoke_mmc_cmd0_encoding() -> TestResult {
+    use crate::rtsx::card::SdCmd;
+
+    let cmd = SdCmd::go_idle();
+    if cmd.index != 0 {
+        return TestResult::Fail("CMD0 index must be 0");
+    }
+    if cmd.arg != 0 {
+        return TestResult::Fail("CMD0 argument must be 0");
+    }
+    use crate::rtsx::card::RspType;
+    if cmd.rsp != RspType::None {
+        return TestResult::Fail("CMD0 must expect no response");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/mmc", smoke_mmc_cmd0_encoding);
+
+/// Verify CMD3 (SEND_RELATIVE_ADDR) and CMD7 (SELECT) encoding in
+/// the RTSX card layer — same protocol used by the eMMC MMC layer.
+fn smoke_mmc_cmd3_cmd7_encoding() -> TestResult {
+    use crate::rtsx::card::SdCmd;
+
+    let cmd3 = SdCmd::send_relative_addr();
+    if cmd3.index != 3 {
+        return TestResult::Fail("CMD3 index must be 3");
+    }
+    if cmd3.arg != 0 {
+        return TestResult::Fail("CMD3 argument must be 0 on host side");
+    }
+
+    let rca: u16 = 0xBEEF;
+    let cmd7 = SdCmd::select_card(rca);
+    if cmd7.index != 7 {
+        return TestResult::Fail("CMD7 index must be 7");
+    }
+    // CMD7 argument = RCA << 16.
+    if cmd7.arg != ((rca as u32) << 16) {
+        return TestResult::Fail("CMD7 argument must be RCA << 16");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/mmc", smoke_mmc_cmd3_cmd7_encoding);
