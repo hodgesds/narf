@@ -36,8 +36,10 @@ use crate::{
 
 pub mod net;
 pub mod pid_ext;
+pub mod stubs;
 pub mod sys;
 pub mod sys_fs;
+pub mod sys_kernel;
 pub mod sys_net;
 pub mod sys_vm;
 
@@ -126,6 +128,144 @@ fn task_info(pid: u64) -> Option<ProcTaskInfo> {
         return None;
     }
     let f: TaskInfoFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+// ── Extended + writable per-pid hook types ──────────────────────
+
+type FdPathFn = fn(u64, u32) -> Option<String>;
+type RlimitsFn = fn(u64) -> [(u64, u64); 16];
+type NiceFn = fn(u64) -> i32;
+type EnvironFn = fn(u64) -> Vec<u8>;
+type AuxvFn = fn(u64) -> Vec<u8>;
+type SetCommFn = fn(u64, &str) -> Result<(), FsError>;
+type OomAdjGetFn = fn(u64) -> i16;
+type OomAdjSetFn = fn(u64, i16) -> Result<(), FsError>;
+type CoredumpGetFn = fn(u64) -> u32;
+type CoredumpSetFn = fn(u64, u32) -> Result<(), FsError>;
+type OomScoreFn = fn(u64) -> i32;
+
+static FD_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
+static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static ENVIRON_HOOK: AtomicUsize = AtomicUsize::new(0);
+static AUXV_HOOK: AtomicUsize = AtomicUsize::new(0);
+static SET_COMM_HOOK: AtomicUsize = AtomicUsize::new(0);
+static OOM_ADJ_GET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static OOM_ADJ_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static COREDUMP_GET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static COREDUMP_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static OOM_SCORE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the extended /proc/[pid]/* read hooks. Called once at boot.
+pub fn install_proc_ext_hooks(
+    fd_path: FdPathFn,
+    rlimits: RlimitsFn,
+    nice: NiceFn,
+    environ: EnvironFn,
+    auxv: AuxvFn,
+) {
+    FD_PATH_HOOK.store(fd_path as usize, Ordering::Release);
+    RLIMITS_HOOK.store(rlimits as usize, Ordering::Release);
+    NICE_HOOK.store(nice as usize, Ordering::Release);
+    ENVIRON_HOOK.store(environ as usize, Ordering::Release);
+    AUXV_HOOK.store(auxv as usize, Ordering::Release);
+}
+
+/// Wire the writable per-pid procfs hooks. Called once at boot after
+/// `install_proc_ext_hooks`.
+///
+/// Linux refs: `comm_write` (fs/proc/base.c), `oom_score_adj_write`.
+pub fn install_proc_write_hooks(
+    set_comm: SetCommFn,
+    oom_adj_get: OomAdjGetFn,
+    oom_adj_set: OomAdjSetFn,
+    coredump_get: CoredumpGetFn,
+    coredump_set: CoredumpSetFn,
+    oom_score: OomScoreFn,
+) {
+    SET_COMM_HOOK.store(set_comm as usize, Ordering::Release);
+    OOM_ADJ_GET_HOOK.store(oom_adj_get as usize, Ordering::Release);
+    OOM_ADJ_SET_HOOK.store(oom_adj_set as usize, Ordering::Release);
+    COREDUMP_GET_HOOK.store(coredump_get as usize, Ordering::Release);
+    COREDUMP_SET_HOOK.store(coredump_set as usize, Ordering::Release);
+    OOM_SCORE_HOOK.store(oom_score as usize, Ordering::Release);
+}
+
+pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {
+    let v = FD_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 { return None; }
+    let f: FdPathFn = unsafe { core::mem::transmute(v) };
+    f(pid, fd)
+}
+
+pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
+    let v = RLIMITS_HOOK.load(Ordering::Acquire);
+    if v == 0 { return [(0, 0); 16]; }
+    let f: RlimitsFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_nice(pid: u64) -> i32 {
+    let v = NICE_HOOK.load(Ordering::Acquire);
+    if v == 0 { return 0; }
+    let f: NiceFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_environ(pid: u64) -> Vec<u8> {
+    let v = ENVIRON_HOOK.load(Ordering::Acquire);
+    if v == 0 { return Vec::new(); }
+    let f: EnvironFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_auxv(pid: u64) -> Vec<u8> {
+    let v = AUXV_HOOK.load(Ordering::Acquire);
+    if v == 0 { return alloc::vec![0u8; 16]; }
+    let f: AuxvFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_set_comm(pid: u64, name: &str) -> Result<(), FsError> {
+    let v = SET_COMM_HOOK.load(Ordering::Acquire);
+    if v == 0 { return Err(FsError::Unsupported); }
+    let f: SetCommFn = unsafe { core::mem::transmute(v) };
+    f(pid, name)
+}
+
+pub(crate) fn hook_oom_adj_get(pid: u64) -> i16 {
+    let v = OOM_ADJ_GET_HOOK.load(Ordering::Acquire);
+    if v == 0 { return 0; }
+    let f: OomAdjGetFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_oom_adj_set(pid: u64, val: i16) -> Result<(), FsError> {
+    let v = OOM_ADJ_SET_HOOK.load(Ordering::Acquire);
+    if v == 0 { return Err(FsError::Unsupported); }
+    let f: OomAdjSetFn = unsafe { core::mem::transmute(v) };
+    f(pid, val)
+}
+
+pub(crate) fn hook_coredump_get(pid: u64) -> u32 {
+    let v = COREDUMP_GET_HOOK.load(Ordering::Acquire);
+    if v == 0 { return 0x33; } // default: anon + anon-huge + ELF headers
+    let f: CoredumpGetFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_coredump_set(pid: u64, val: u32) -> Result<(), FsError> {
+    let v = COREDUMP_SET_HOOK.load(Ordering::Acquire);
+    if v == 0 { return Err(FsError::Unsupported); }
+    let f: CoredumpSetFn = unsafe { core::mem::transmute(v) };
+    f(pid, val)
+}
+
+pub(crate) fn hook_oom_score(pid: u64) -> i32 {
+    let v = OOM_SCORE_HOOK.load(Ordering::Acquire);
+    if v == 0 { return 0; }
+    let f: OomScoreFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
@@ -460,14 +600,30 @@ impl FileOps for ProcPidFile {
             slice_read(body.as_bytes(), offset, buf)
         })
     }
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let pid = self.pid;
+        let field = self.field;
+        Box::pin(async move {
+            if !matches!(field, PidField::Comm) {
+                return Err(FsError::ReadOnly);
+            }
+            // Strip trailing newline / NUL (Linux write(2) shape).
+            let trimmed = buf.trim_ascii_end();
+            let name = core::str::from_utf8(trimmed).map_err(|_| FsError::InvalidData)?;
+            hook_set_comm(pid, name).map_err(|_| FsError::InvalidData)?;
+            Ok(buf.len())
+        })
     }
     fn stat(&self) -> Stat {
+        let mode = if matches!(self.field, PidField::Comm) {
+            Mode::FILE_RW
+        } else {
+            Mode::FILE_RO
+        };
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode::FILE_RO,
+            mode,
             mtime_cycles: 0,
         }
     }
@@ -523,15 +679,33 @@ struct ProcPidDir {
 
 impl DirOps for ProcPidDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        use pid_ext::PidExtFile;
+        // Subdirectory markers — resolve_async calls lookup_dir next.
+        match name {
+            "fd" | "fdinfo" | "task" => return Some(Arc::new(ProcDirMarker)),
+            _ => {}
+        }
+        // Core flat files.
         let field = match name {
             "stat" => PidField::Stat,
             "status" => PidField::Status,
             "cmdline" => PidField::Cmdline,
             "maps" => PidField::Maps,
             "comm" => PidField::Comm,
-            _ => return None,
+            _ => {
+                return pid_ext::lookup_pid_ext(self.pid, name)
+                    .map(|f| Arc::new(f) as Arc<dyn FileOps>);
+            }
         };
         Some(Arc::new(ProcPidFile { pid: self.pid, field }))
+    }
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        match name {
+            "fd" => Some(Arc::new(pid_ext::ProcFdDir { pid: self.pid })),
+            "fdinfo" => Some(Arc::new(pid_ext::ProcFdInfoDir { pid: self.pid })),
+            "task" => Some(Arc::new(pid_ext::ProcTaskDir { pid: self.pid })),
+            _ => None,
+        }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
         Box::new(
@@ -541,6 +715,15 @@ impl DirOps for ProcPidDir {
                 DirEntry { name: "cmdline", file_type: FileType::File },
                 DirEntry { name: "maps", file_type: FileType::File },
                 DirEntry { name: "comm", file_type: FileType::File },
+                DirEntry { name: "oom_score", file_type: FileType::File },
+                DirEntry { name: "oom_score_adj", file_type: FileType::File },
+                DirEntry { name: "coredump_filter", file_type: FileType::File },
+                DirEntry { name: "environ", file_type: FileType::File },
+                DirEntry { name: "auxv", file_type: FileType::File },
+                DirEntry { name: "limits", file_type: FileType::File },
+                DirEntry { name: "fd", file_type: FileType::Dir },
+                DirEntry { name: "fdinfo", file_type: FileType::Dir },
+                DirEntry { name: "task", file_type: FileType::Dir },
             ]
             .into_iter(),
         )
