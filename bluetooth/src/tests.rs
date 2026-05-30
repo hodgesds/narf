@@ -4109,3 +4109,146 @@ fn smoke_l2cap_well_known_psms() -> TestResult {
 }
 kernel_test_in!("bluetooth/l2cap", smoke_l2cap_well_known_psms);
 
+// ── Well-known service builders ─────────────────────────────────────
+
+/// Mounting the GAP service emits a Primary Service decl + Device Name
+/// + Appearance characteristics. Walk the resulting database and
+/// assert all three slots are present with the right UUIDs.
+fn smoke_services_gap_mount() -> TestResult {
+    use crate::gatt::Uuid;
+    use crate::gatt_server::AttributeDatabase;
+    use crate::services::{
+        mount_gap_service, APPEARANCE_KEYBOARD, UUID_APPEARANCE, UUID_DEVICE_NAME,
+    };
+    let mut db = AttributeDatabase::new();
+    let _svc = mount_gap_service(&mut db, "narf-test", APPEARANCE_KEYBOARD);
+    let attrs = db.attrs();
+    // 5 attrs: Primary Service + Device Name decl + value + Appearance
+    // decl + value.
+    if attrs.len() != 5 {
+        return TestResult::Fail("GAP service should produce 5 attrs");
+    }
+    // Walk slots: 0x2800 (svc), 0x2803 (decl), name, 0x2803 (decl),
+    // appearance.
+    let name_attr = attrs.iter().find(|a| a.uuid == Uuid::U16(UUID_DEVICE_NAME));
+    if name_attr.is_none() || name_attr.unwrap().value != b"narf-test" {
+        return TestResult::Fail("Device Name characteristic missing/wrong");
+    }
+    let app_attr = attrs.iter().find(|a| a.uuid == Uuid::U16(UUID_APPEARANCE));
+    if app_attr.is_none() {
+        return TestResult::Fail("Appearance characteristic missing");
+    }
+    if u16::from_le_bytes([app_attr.unwrap().value[0], app_attr.unwrap().value[1]])
+        != APPEARANCE_KEYBOARD
+    {
+        return TestResult::Fail("Appearance value not Keyboard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/services", smoke_services_gap_mount);
+
+/// Battery Service with NOTIFY + CCCD — mount and assert the initial
+/// battery level + the CCCD attribute are present.
+fn smoke_services_battery_mount_with_cccd() -> TestResult {
+    use crate::gatt::{Uuid, UUID_CCC_DESCRIPTOR};
+    use crate::gatt_server::AttributeDatabase;
+    use crate::services::{mount_battery_service, UUID_BATTERY_LEVEL};
+    let mut db = AttributeDatabase::new();
+    let (_svc, level_handle, cccd_handle) = mount_battery_service(&mut db, 85);
+    // Service Decl + Characteristic Decl + Value + CCCD = 4 attrs.
+    if db.attrs().len() != 4 {
+        return TestResult::Fail("battery service should produce 4 attrs");
+    }
+    let level = db.attr_by_handle(level_handle).expect("level attr");
+    if level.uuid != Uuid::U16(UUID_BATTERY_LEVEL) {
+        return TestResult::Fail("level uuid wrong");
+    }
+    if level.value != alloc::vec![85] {
+        return TestResult::Fail("level value wrong");
+    }
+    let cccd = db.attr_by_handle(cccd_handle).expect("cccd attr");
+    if cccd.uuid != Uuid::U16(UUID_CCC_DESCRIPTOR) {
+        return TestResult::Fail("cccd uuid wrong");
+    }
+    if cccd.value != alloc::vec![0, 0] {
+        return TestResult::Fail("cccd initial != 0x0000");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/services", smoke_services_battery_mount_with_cccd);
+
+/// Device Information Service: only manufacturer + model populated.
+fn smoke_services_device_info_partial() -> TestResult {
+    use crate::gatt::Uuid;
+    use crate::gatt_server::AttributeDatabase;
+    use crate::services::{
+        mount_device_information_service, DeviceInformation, UUID_MANUFACTURER_NAME_STRING,
+        UUID_MODEL_NUMBER_STRING, UUID_SERIAL_NUMBER_STRING,
+    };
+    let mut db = AttributeDatabase::new();
+    let info = DeviceInformation {
+        manufacturer: Some("narf"),
+        model: Some("narf-001"),
+        ..Default::default()
+    };
+    let _svc = mount_device_information_service(&mut db, &info);
+    let attrs = db.attrs();
+    // Service + 2 characteristics × (decl + value) = 5 attrs.
+    if attrs.len() != 5 {
+        return TestResult::Fail("DIS partial mount expected 5 attrs");
+    }
+    let mfr = attrs.iter().find(|a| a.uuid == Uuid::U16(UUID_MANUFACTURER_NAME_STRING));
+    if mfr.is_none() || mfr.unwrap().value != b"narf" {
+        return TestResult::Fail("manufacturer not mounted");
+    }
+    let mdl = attrs.iter().find(|a| a.uuid == Uuid::U16(UUID_MODEL_NUMBER_STRING));
+    if mdl.is_none() || mdl.unwrap().value != b"narf-001" {
+        return TestResult::Fail("model not mounted");
+    }
+    if attrs.iter().any(|a| a.uuid == Uuid::U16(UUID_SERIAL_NUMBER_STRING)) {
+        return TestResult::Fail("serial spuriously mounted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/services", smoke_services_device_info_partial);
+
+/// Heart Rate Measurement 8-bit format. Flags byte = 0x00 and 1-byte
+/// BPM follows per HRS v1.0 §3.1.
+fn smoke_services_heart_rate_measurement_8bit() -> TestResult {
+    use crate::services::heart_rate_measurement_8bit;
+    let v = heart_rate_measurement_8bit(72);
+    if v.len() != 2 {
+        return TestResult::Fail("HRM 8-bit value should be 2 bytes");
+    }
+    if v[0] != 0x00 {
+        return TestResult::Fail("HRM flags should be 0 (8-bit format)");
+    }
+    if v[1] != 72 {
+        return TestResult::Fail("HRM BPM value wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/services",
+    smoke_services_heart_rate_measurement_8bit
+);
+
+/// CCCD value encoder — bit 0 = Notifications, bit 1 = Indications.
+fn smoke_services_cccd_value_encoding() -> TestResult {
+    use crate::services::{cccd_value, CCCD_INDICATIONS, CCCD_NOTIFICATIONS};
+    let v = cccd_value(true, false);
+    if u16::from_le_bytes(v) != CCCD_NOTIFICATIONS {
+        return TestResult::Fail("CCCD(notify) != bit 0");
+    }
+    let v = cccd_value(false, true);
+    if u16::from_le_bytes(v) != CCCD_INDICATIONS {
+        return TestResult::Fail("CCCD(indicate) != bit 1");
+    }
+    let v = cccd_value(true, true);
+    if u16::from_le_bytes(v) != (CCCD_NOTIFICATIONS | CCCD_INDICATIONS) {
+        return TestResult::Fail("CCCD(both) != bits 0+1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/services", smoke_services_cccd_value_encoding);
+

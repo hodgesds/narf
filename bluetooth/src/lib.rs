@@ -55,6 +55,7 @@ pub mod hogp;
 pub mod usb_transport;
 pub mod rfcomm;
 pub mod sdp;
+pub mod services;
 pub mod l2cap;
 pub mod mesh;
 pub mod opcode;
