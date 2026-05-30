@@ -33,7 +33,9 @@
 extern crate alloc;
 
 pub mod crb;
+pub mod devfs_bridge;
 pub mod probe;
+pub mod sysfs_bridge;
 pub mod tests;
 pub mod tis;
 pub mod tpm2;

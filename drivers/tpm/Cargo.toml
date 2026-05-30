@@ -14,6 +14,8 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib          = { path = "../../lib" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-filesystem   = { path = "../../filesystem" }
+narf-block        = { path = "../../block" }
 
 [features]
 kernel-test = []
