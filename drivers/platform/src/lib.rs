@@ -52,6 +52,45 @@ pub mod amd_asf;
 #[cfg(target_arch = "x86_64")]
 pub mod wmi_vendors;
 
+/// Shared WMI MOF/GUID helpers used by vendor platform drivers.
+pub mod wmi_core;
+
+/// Platform driver registry — vendor probe + per-driver init dispatch.
+/// Identifies OEM via SMBIOS Type-1 manufacturer and routes to the
+/// appropriate per-vendor driver at Stage::Subsys.
+#[cfg(target_arch = "x86_64")]
+pub mod registry;
+
+/// Lenovo ThinkPad ACPI platform driver.
+/// Hotkeys via HKEY, LED control, battery conservation, fan control.
+#[cfg(target_arch = "x86_64")]
+pub mod thinkpad_acpi;
+
+/// Dell laptop platform driver.
+/// SMBIOS SMI commands, WMI hotkeys, keyboard backlight, battery charge limit.
+#[cfg(target_arch = "x86_64")]
+pub mod dell_laptop;
+
+/// HP WMI platform driver.
+/// BIOS GUID queries, hotkeys, wireless toggle, Coolsense fan profile.
+#[cfg(target_arch = "x86_64")]
+pub mod hp_wmi;
+
+/// ASUS WMI platform driver (asus-wmi + asus-nb-wmi).
+/// Hotkeys, fan curves, throttle policy, Optimus GPU toggle.
+#[cfg(target_arch = "x86_64")]
+pub mod asus_wmi;
+
+/// Lenovo IdeaPad / Yoga platform driver.
+/// VPC2004 ACPI device, battery conservation, performance mode.
+#[cfg(target_arch = "x86_64")]
+pub mod ideapad_laptop;
+
+/// Samsung laptop platform driver.
+/// SABI SMI interface, hotkeys, performance mode, USB charge in sleep.
+#[cfg(target_arch = "x86_64")]
+pub mod samsung_laptop;
+
 mod tests;
 
 /// Stage::Subsys initcalls for this driver crate.
@@ -128,6 +167,15 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "wmi-vendors", || {
         let _ = wmi_vendors::init();
+        InitResult::Ok
+    });
+    // Vendor platform driver registry: probe SMBIOS manufacturer,
+    // then route to ThinkPad / IdeaPad / Dell / HP / ASUS / Samsung.
+    // Must run after wmi-vendors (which ensures WMI GUIDs are listed).
+    // Best-effort: UnknownVendor or NoSmbios just means not a laptop.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "laptop-vendor-drivers", || {
+        let _ = registry::probe_and_register();
         InitResult::Ok
     });
 }

@@ -30,7 +30,8 @@ narf-input        = { path = "../../input" }
 narf-console      = { path = "../../console" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-kernel-test     = { path = "../../verification/kernel-test" }
+narf-firmware-smbios = { path = "../../firmware/smbios" }
 async-trait       = "0.1"
 
 [features]
