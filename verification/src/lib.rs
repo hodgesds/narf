@@ -42,6 +42,12 @@ static __FORCE_LINK_OBS: fn() -> usize = || {
     narf_observability::install_count()
 };
 
+extern crate narf_drivers_sound;
+#[used]
+static __FORCE_LINK_SOUND: fn() -> usize = || {
+    narf_drivers_sound::card_count()
+};
+
 use core::fmt::Write;
 
 use narf_console::Writer;

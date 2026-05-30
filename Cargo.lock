@@ -939,6 +939,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-bus",
+ "narf-capabilities",
  "narf-console",
  "narf-init",
  "narf-kernel-test",
@@ -982,6 +983,7 @@ dependencies = [
 name = "narf-drivers-leds"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-drivers-gpio",
  "narf-init",
  "narf-kernel-test",
@@ -1463,6 +1465,7 @@ dependencies = [
  "narf-drivers-gpu",
  "narf-drivers-i2c",
  "narf-drivers-i3c",
+ "narf-drivers-leds",
  "narf-drivers-net",
  "narf-drivers-nvidia",
  "narf-drivers-nvme",
@@ -1913,6 +1916,7 @@ dependencies = [
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-platform",
+ "narf-drivers-sound",
  "narf-drivers-storage",
  "narf-drivers-thunderbolt",
  "narf-drivers-usb",
