@@ -115,3 +115,70 @@ pub const HCI_WRITE_PAGE_TIMEOUT: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0018);
 pub const HCI_WRITE_SCAN_ENABLE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x001A);
 pub const HCI_WRITE_CLASS_OF_DEVICE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0024);
 pub const HCI_WRITE_LOCAL_NAME: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0013);
+
+// ── LE Advertising (§7.8.5..7.8.9) ────────────────────────────────
+/// HCI_LE_Set_Advertising_Parameters (§7.8.5).
+pub const HCI_LE_SET_ADVERTISING_PARAMETERS: u16 = opcode(OGF_LE_CONTROLLER, 0x0006);
+/// HCI_LE_Set_Advertising_Data (§7.8.7). 32-byte param: length + 31-byte data.
+pub const HCI_LE_SET_ADVERTISING_DATA: u16 = opcode(OGF_LE_CONTROLLER, 0x0008);
+/// HCI_LE_Set_Scan_Response_Data (§7.8.8).
+pub const HCI_LE_SET_SCAN_RESPONSE_DATA: u16 = opcode(OGF_LE_CONTROLLER, 0x0009);
+/// HCI_LE_Set_Advertising_Enable (§7.8.9). 1-byte param.
+pub const HCI_LE_SET_ADVERTISING_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x000A);
+/// HCI_LE_Set_Random_Address (§7.8.4).
+pub const HCI_LE_SET_RANDOM_ADDRESS: u16 = opcode(OGF_LE_CONTROLLER, 0x0005);
+
+// ── LE Filter Accept List (§7.8.14..16) ───────────────────────────
+/// HCI_LE_Add_Device_To_Filter_Accept_List (§7.8.16).
+/// 7-byte param: address_type (1) + address (6).
+pub const HCI_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST: u16 = opcode(OGF_LE_CONTROLLER, 0x0011);
+/// HCI_LE_Remove_Device_From_Filter_Accept_List (§7.8.17).
+pub const HCI_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST: u16 = opcode(OGF_LE_CONTROLLER, 0x0012);
+/// HCI_LE_Clear_Filter_Accept_List (§7.8.15).
+pub const HCI_LE_CLEAR_FILTER_ACCEPT_LIST: u16 = opcode(OGF_LE_CONTROLLER, 0x0010);
+
+// ── LE Crypto helpers (§7.8.22, §7.8.23) ──────────────────────────
+/// HCI_LE_Encrypt (§7.8.22). 32-byte param: key (16) + plaintext (16).
+/// Returns 16-byte ciphertext via Command Complete.
+pub const HCI_LE_ENCRYPT: u16 = opcode(OGF_LE_CONTROLLER, 0x0017);
+/// HCI_LE_Rand (§7.8.23). No params. Returns 8 random bytes.
+pub const HCI_LE_RAND: u16 = opcode(OGF_LE_CONTROLLER, 0x0018);
+
+// ── LE Start Encryption (§7.8.24) ─────────────────────────────────
+/// HCI_LE_Start_Encryption (§7.8.24). 28-byte param.
+pub const HCI_LE_START_ENCRYPTION: u16 = opcode(OGF_LE_CONTROLLER, 0x0019);
+/// HCI_LE_Long_Term_Key_Request_Reply (§7.8.25).
+pub const HCI_LE_LTK_REQUEST_REPLY: u16 = opcode(OGF_LE_CONTROLLER, 0x001A);
+/// HCI_LE_Long_Term_Key_Request_Negative_Reply (§7.8.26).
+pub const HCI_LE_LTK_REQUEST_NEGATIVE_REPLY: u16 = opcode(OGF_LE_CONTROLLER, 0x001B);
+
+// ── LE Read max data length, used by Data Length Extension (§7.8.46) ─
+pub const HCI_LE_READ_MAX_DATA_LENGTH: u16 = opcode(OGF_LE_CONTROLLER, 0x002F);
+pub const HCI_LE_SET_DATA_LENGTH: u16 = opcode(OGF_LE_CONTROLLER, 0x0022);
+
+// ── BLE Audio / ISO (§7.8.97..) — for ISO Data Path setup ─────────
+/// HCI_LE_Setup_ISO_Data_Path (§7.8.109).
+pub const HCI_LE_SETUP_ISO_DATA_PATH: u16 = opcode(OGF_LE_CONTROLLER, 0x006E);
+/// HCI_LE_Remove_ISO_Data_Path (§7.8.110).
+pub const HCI_LE_REMOVE_ISO_DATA_PATH: u16 = opcode(OGF_LE_CONTROLLER, 0x006F);
+
+#[cfg(test)]
+mod selftest_ext {
+    use super::*;
+    // §7.8.5: OGF=0x08 OCF=0x0006 → 0x2006.
+    const _: () = assert!(HCI_LE_SET_ADVERTISING_PARAMETERS == 0x2006);
+    // §7.8.7: OGF=0x08 OCF=0x0008 → 0x2008.
+    const _: () = assert!(HCI_LE_SET_ADVERTISING_DATA == 0x2008);
+    // §7.8.9: OGF=0x08 OCF=0x000A → 0x200A.
+    const _: () = assert!(HCI_LE_SET_ADVERTISING_ENABLE == 0x200A);
+    // §7.8.16: OGF=0x08 OCF=0x0011 → 0x2011.
+    const _: () = assert!(HCI_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST == 0x2011);
+    // §7.8.22: OGF=0x08 OCF=0x0017 → 0x2017.
+    const _: () = assert!(HCI_LE_ENCRYPT == 0x2017);
+    // §7.8.23: OGF=0x08 OCF=0x0018 → 0x2018.
+    const _: () = assert!(HCI_LE_RAND == 0x2018);
+    // §7.1.5: OGF=0x01 OCF=0x0005 → 0x0405.
+    const _: () = assert!(HCI_CREATE_CONNECTION == 0x0405);
+    // §7.4.5: OGF=0x04 OCF=0x0005 → 0x1005.
+    const _: () = assert!(HCI_READ_BUFFER_SIZE == 0x1005);
+}

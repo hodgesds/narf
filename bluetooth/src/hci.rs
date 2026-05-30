@@ -178,3 +178,111 @@ pub const fn opcode(ogf: u8, ocf: u16) -> u16 {
 pub const fn split_opcode(opcode: u16) -> (u8, u16) {
     (((opcode >> 10) & 0x3F) as u8, opcode & 0x03FF)
 }
+
+/// HCI Synchronous (SCO/eSCO) Data packet (Vol 4 Part E §5.4.3).
+///
+/// Wire layout:
+///
+/// ```text
+///   0..2: u16 LE handle (low 12) + flags (PS:2 RFU:2 in bits[12..16])
+///   2:    u8  Data Total Length
+///   3..N: data
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoData {
+    pub handle: u16,
+    /// Packet-Status flag (§5.4.3): 0 correct / 1 possible-invalid /
+    /// 2 no-data / 3 partial-loss. Maps into bits 12..14 of the
+    /// 16-bit handle field on the wire.
+    pub packet_status: u8,
+    pub data: Vec<u8>,
+}
+
+impl ScoData {
+    pub fn encode(&self) -> Vec<u8> {
+        let h = (self.handle & 0x0FFF) | (((self.packet_status & 0x3) as u16) << 12);
+        let mut out = Vec::with_capacity(3 + self.data.len());
+        out.push((h & 0xFF) as u8);
+        out.push((h >> 8) as u8);
+        out.push(self.data.len() as u8);
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 3 {
+            return None;
+        }
+        let h = u16::from_le_bytes([buf[0], buf[1]]);
+        let len = buf[2] as usize;
+        if buf.len() < 3 + len {
+            return None;
+        }
+        Some(Self {
+            handle: h & 0x0FFF,
+            packet_status: ((h >> 12) & 0x3) as u8,
+            data: buf[3..3 + len].to_vec(),
+        })
+    }
+}
+
+/// HCI Isochronous Data packet (Vol 4 Part E §5.4.5, BLE Audio).
+///
+/// Wire layout (the "ISO Data Load" can carry an optional Time-Stamp +
+/// Packet-Sequence-Number + SDU header depending on PB flag):
+///
+/// ```text
+///   0..2: u16 LE handle (low 12) + PB:2 + TS:1 + RFU:1
+///   2..4: u16 LE Data_Total_Length
+///   4..N: ISO Data Load
+/// ```
+///
+/// PB flag values (§5.4.5):
+///   0b00 — first fragment of fragmented SDU
+///   0b01 — continuation fragment of fragmented SDU
+///   0b10 — complete SDU
+///   0b11 — last fragment of fragmented SDU
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsoData {
+    /// Connection handle (low 12 bits).
+    pub handle: u16,
+    /// PB flag (§5.4.5).
+    pub pb_flag: u8,
+    /// TS flag — 1 if a Time-Stamp field is present in the data load.
+    pub ts_flag: bool,
+    /// Raw ISO Data Load (may include time-stamp + SDU header).
+    pub data: Vec<u8>,
+}
+
+impl IsoData {
+    pub fn encode(&self) -> Vec<u8> {
+        let h = (self.handle & 0x0FFF)
+            | (((self.pb_flag & 0x3) as u16) << 12)
+            | (if self.ts_flag { 1u16 << 14 } else { 0 });
+        let mut out = Vec::with_capacity(4 + self.data.len());
+        out.push((h & 0xFF) as u8);
+        out.push((h >> 8) as u8);
+        let len = (self.data.len() as u16) & 0x3FFF;
+        out.push((len & 0xFF) as u8);
+        out.push((len >> 8) as u8);
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 4 {
+            return None;
+        }
+        let h = u16::from_le_bytes([buf[0], buf[1]]);
+        let len = (u16::from_le_bytes([buf[2], buf[3]]) & 0x3FFF) as usize;
+        if buf.len() < 4 + len {
+            return None;
+        }
+        Some(Self {
+            handle: h & 0x0FFF,
+            pb_flag: ((h >> 12) & 0x3) as u8,
+            ts_flag: (h & (1 << 14)) != 0,
+            data: buf[4..4 + len].to_vec(),
+        })
+    }
+}
