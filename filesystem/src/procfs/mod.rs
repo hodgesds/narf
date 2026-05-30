@@ -979,3 +979,124 @@ fn render_maps(info: &ProcTaskInfo) -> String {
     }
     s
 }
+
+// ── Framework smokes ────────────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// Minimal `ProcFile` for tests: emits a fixed byte string.
+#[derive(Debug)]
+struct TestProcFile {
+    body: Vec<u8>,
+}
+
+impl ProcFile for TestProcFile {
+    fn read(&self) -> Vec<u8> {
+        self.body.clone()
+    }
+}
+
+/// Framework smoke: register a file, read returns its content.
+fn smoke_register_proc_then_read() -> TestResult {
+    let payload = b"hello-procfs\n".to_vec();
+    register_proc(
+        "tests/framework_smoke",
+        Arc::new(TestProcFile { body: payload.clone() }),
+    );
+    let snap = lookup_registry(&["tests", "framework_smoke"]);
+    let ok = match snap {
+        Some(ProcNodeSnapshot::File(f)) => f.read() == payload,
+        _ => false,
+    };
+    unregister_proc("tests/framework_smoke");
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("register_proc → lookup → read round-trip failed")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_register_proc_then_read);
+
+/// Regression: the static cpuinfo file still resolves through the
+/// root and returns non-empty content. This verifies the refactor
+/// didn't break the existing surface that tools depend on.
+fn smoke_static_cpuinfo_still_works() -> TestResult {
+    let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
+    let f = match root.lookup("cpuinfo") {
+        Some(f) => f,
+        None => return TestResult::Fail("cpuinfo lookup returned None"),
+    };
+    let mut buf = [0u8; 256];
+    let res = poll_once(f.read(0, &mut buf));
+    match res {
+        Some(Ok(n)) if n > 0 && buf[..n].starts_with(b"processor") => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("cpuinfo content unexpected"),
+        Some(Err(_)) => TestResult::Fail("cpuinfo read returned error"),
+        None => TestResult::Fail("cpuinfo read future not ready synchronously"),
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_static_cpuinfo_still_works);
+
+/// Framework smoke: register a file, then unregister it, then
+/// confirm subsequent lookups fail.
+fn smoke_unregister_proc_clears_entry() -> TestResult {
+    register_proc(
+        "tests/unregister_me",
+        Arc::new(TestProcFile { body: alloc::vec![0u8; 4] }),
+    );
+    let before = matches!(
+        lookup_registry(&["tests", "unregister_me"]),
+        Some(ProcNodeSnapshot::File(_))
+    );
+    let removed = unregister_proc("tests/unregister_me");
+    let after = matches!(
+        lookup_registry(&["tests", "unregister_me"]),
+        Some(ProcNodeSnapshot::File(_))
+    );
+    if before && removed && !after {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("unregister sequence wrong")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_unregister_proc_clears_entry);
+
+/// mtime_cycles default reports a non-zero monotonic value.
+fn smoke_proc_file_mtime_default_nonzero() -> TestResult {
+    #[derive(Debug)]
+    struct EmptyFile;
+    impl ProcFile for EmptyFile {
+        fn read(&self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+    let f = EmptyFile;
+    let t1 = f.mtime_cycles();
+    let t2 = f.mtime_cycles();
+    if t1 > 0 && t2 >= t1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mtime_cycles default did not return non-zero monotonic")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_proc_file_mtime_default_nonzero);
+
+/// /proc root iter must list both static files and dynamically-
+/// registered top-level entries.
+fn smoke_root_iter_lists_dynamic_top_level() -> TestResult {
+    register_proc(
+        "tests_iter_topdir/leaf",
+        Arc::new(TestProcFile { body: alloc::vec![0u8; 1] }),
+    );
+    let root = ProcRoot;
+    let names: Vec<String> = root.iter().map(|e| String::from(e.name)).collect();
+    let saw_cpuinfo = names.iter().any(|n| n == "cpuinfo");
+    let saw_dynamic = names.iter().any(|n| n == "tests_iter_topdir");
+    unregister_proc("tests_iter_topdir/leaf");
+    if saw_cpuinfo && saw_dynamic {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("root iter missing static or dynamic entries")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_root_iter_lists_dynamic_top_level);
