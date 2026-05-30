@@ -798,3 +798,420 @@ kernel_test_in!(
     "drivers/platform/wmi_vendors",
     smoke_wmi_vendors_detection_no_guid
 );
+
+// ── wmi_core ──────────────────────────────────────────────────────────
+
+/// WMI block decode: GUID parse + object ID + flags.
+/// Verifies the shared `wmi_core::guid_to_bytes` round-trips a known GUID
+/// and that `decode_wdg` correctly unpacks a synthetic _WDG buffer.
+fn smoke_wmi_core_guid_and_wdg_decode() -> TestResult {
+    use crate::wmi_core::guid_to_bytes;
+    use narf_aml::wmi::{decode_wdg, WDG_FLAG_EVENT};
+
+    // Known Dell WMI descriptor GUID must parse successfully.
+    let bytes = guid_to_bytes("8D9DDCBC-A997-11DA-B012-B622A1EF5492");
+    if bytes.is_none() {
+        return TestResult::Fail("wmi_core::guid_to_bytes failed for Dell descriptor GUID");
+    }
+
+    // Craft a minimal 20-byte _WDG buffer: one descriptor.
+    //   GUID = [0u8; 16], object_id = b"AA", instance=1, flags=WDG_FLAG_EVENT.
+    let mut wdg = [0u8; 20];
+    wdg[16] = b'A';
+    wdg[17] = b'A';
+    wdg[18] = 1; // instance_count
+    wdg[19] = WDG_FLAG_EVENT;
+
+    let descs = decode_wdg(&wdg);
+    match descs {
+        Ok(ref v) if v.len() == 1 => {
+            if !v[0].is_event() {
+                return TestResult::Fail("WDG descriptor flag WDG_FLAG_EVENT not detected");
+            }
+            if v[0].object_id != [b'A', b'A'] {
+                return TestResult::Fail("WDG descriptor object_id mismatch");
+            }
+        }
+        _ => return TestResult::Fail("decode_wdg failed on valid 20-byte buffer"),
+    }
+
+    // Notification ID field — bad length should error.
+    let short = [0u8; 7];
+    if decode_wdg(&short).is_ok() {
+        return TestResult::Fail("decode_wdg should reject non-multiple-of-20 length");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/wmi_core",
+    smoke_wmi_core_guid_and_wdg_decode
+);
+
+/// WMI method invocation argument encoding.
+/// Verifies `wmi_core::build_wmi_args` produces the correct three-arg layout.
+fn smoke_wmi_core_method_arg_encode() -> TestResult {
+    use crate::wmi_core::build_wmi_args;
+
+    let guid = [0xABu8; 16];
+    let args = build_wmi_args(0, 42, &guid);
+
+    // Arg0 = integer 0 (instance).
+    match &args[0] {
+        narf_aml::Value::Integer(0) => {}
+        _ => return TestResult::Fail("Arg0 should be Integer(0) for instance"),
+    }
+    // Arg1 = integer 42 (method_id).
+    match &args[1] {
+        narf_aml::Value::Integer(42) => {}
+        _ => return TestResult::Fail("Arg1 should be Integer(42) for method_id"),
+    }
+    // Arg2 = Buffer(16 bytes of GUID).
+    match &args[2] {
+        narf_aml::Value::Buffer(b) if b.len() == 16 && b[0] == 0xAB => {}
+        _ => return TestResult::Fail("Arg2 should be Buffer(16-byte GUID)"),
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/wmi_core",
+    smoke_wmi_core_method_arg_encode
+);
+
+// ── thinkpad_acpi ──────────────────────────────────────────────────────
+
+/// ThinkPad HKEY 0x1004 → KEY_BRIGHTNESSUP.
+/// Reference: thinkpad_acpi.c hotkey_map for 0x1004 (BRIGHTNESSUP).
+fn smoke_thinkpad_hkey_0x1004_brightness_up() -> TestResult {
+    use crate::thinkpad_acpi::{decode_hkey_event, hkey_to_keycode, HkeyEvent};
+    use narf_input::KeyCode;
+
+    let ev = decode_hkey_event(0x1004);
+    match ev {
+        HkeyEvent::FnKey { code: 0x1004 } => {}
+        _ => return TestResult::Fail("0x1004 should decode as FnKey{0x1004}"),
+    }
+    match hkey_to_keycode(0x1004) {
+        Some(KeyCode::BrightnessUp) => {}
+        _ => return TestResult::Fail("0x1004 should map to KeyCode::BrightnessUp"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_hkey_0x1004_brightness_up
+);
+
+/// ThinkPad battery conservation set/get round-trip.
+fn smoke_thinkpad_battery_conservation_round_trip() -> TestResult {
+    use crate::thinkpad_acpi::{battery_conservation_enabled, set_battery_conservation, __test_reset};
+
+    __test_reset();
+
+    if battery_conservation_enabled() {
+        return TestResult::Fail("conservation should be false after reset");
+    }
+    set_battery_conservation(true);
+    if !battery_conservation_enabled() {
+        return TestResult::Fail("conservation should be true after set(true)");
+    }
+    set_battery_conservation(false);
+    if battery_conservation_enabled() {
+        return TestResult::Fail("conservation should be false after set(false)");
+    }
+    __test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_battery_conservation_round_trip
+);
+
+/// ThinkPad dock-in / dock-out HKEY decode.
+fn smoke_thinkpad_dock_hkey_decode() -> TestResult {
+    use crate::thinkpad_acpi::{decode_hkey_event, HkeyEvent};
+
+    match decode_hkey_event(0x4010) {
+        HkeyEvent::DockIn => {}
+        _ => return TestResult::Fail("0x4010 should decode as DockIn"),
+    }
+    match decode_hkey_event(0x4011) {
+        HkeyEvent::DockOut => {}
+        _ => return TestResult::Fail("0x4011 should decode as DockOut"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_dock_hkey_decode
+);
+
+// ── dell_laptop ────────────────────────────────────────────────────────
+
+/// Dell SMBIOS class/select/cmd encode (4-byte header).
+/// Verifies `DellSmbiosCmd::encode` matches the Linux `struct dell_smbios_call_in`.
+fn smoke_dell_smbios_cmd_encode() -> TestResult {
+    use crate::dell_laptop::DellSmbiosCmd;
+
+    let cmd = DellSmbiosCmd::new(17, 3);
+    let buf = cmd.encode();
+    // header = (17 << 8) | 3 = 0x1103 LE.
+    let header = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if header != (17u32 << 8) | 3 {
+        return TestResult::Fail("DellSmbiosCmd header encoding mismatch");
+    }
+    // in1..in3 should be zero for a default command.
+    if buf[4..16].iter().any(|&b| b != 0) {
+        return TestResult::Fail("DellSmbiosCmd default in1/in2/in3 should be zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/dell_laptop",
+    smoke_dell_smbios_cmd_encode
+);
+
+/// Dell WMI event 0xE040 → KEY_KBDILLUMUP.
+/// Reference: dell-wmi-base.c `KE_KEY, 0xE040, { KEY_KBDILLUMUP }`.
+fn smoke_dell_wmi_event_0xe040_kbdillumup() -> TestResult {
+    use crate::dell_laptop::{decode_dell_wmi_event, DellWmiEvent};
+
+    let buf: [u8; 6] = [
+        2, 0,
+        0x10, 0x00, // event_type 0x0010
+        0x40, 0xE0, // code 0xE040 LE
+    ];
+    match decode_dell_wmi_event(&buf) {
+        Some(DellWmiEvent::KbdIllumUp) => {}
+        _ => return TestResult::Fail("Dell WMI code 0xE040 should decode as KbdIllumUp"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/dell_laptop",
+    smoke_dell_wmi_event_0xe040_kbdillumup
+);
+
+// ── hp_wmi ─────────────────────────────────────────────────────────────
+
+/// HP WMI command type 0x07 (wireless) — verify type constant.
+fn smoke_hp_wmi_command_wireless_type() -> TestResult {
+    use crate::hp_wmi::HpWmiCommand;
+
+    if HpWmiCommand::Wireless as u32 != 0x07 {
+        return TestResult::Fail("HpWmiCommand::Wireless should have value 0x07");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/hp_wmi",
+    smoke_hp_wmi_command_wireless_type
+);
+
+/// HP WMI wireless state decode from response buffer.
+fn smoke_hp_wmi_wireless_state_decode() -> TestResult {
+    use crate::hp_wmi::decode_wireless_state;
+
+    // flags = 0x03 → wifi=true, bluetooth=true, wwan=false.
+    let buf = [0x03u8, 0x00, 0x00, 0x00, 0, 0, 0, 0];
+    let state = match decode_wireless_state(&buf) {
+        Some(s) => s,
+        None => return TestResult::Fail("decode_wireless_state returned None"),
+    };
+    if !state.wifi {
+        return TestResult::Fail("wifi should be true (bit 0)");
+    }
+    if !state.bluetooth {
+        return TestResult::Fail("bluetooth should be true (bit 1)");
+    }
+    if state.wwan {
+        return TestResult::Fail("wwan should be false (bit 2 clear)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/hp_wmi",
+    smoke_hp_wmi_wireless_state_decode
+);
+
+// ── asus_wmi ───────────────────────────────────────────────────────────
+
+/// ASUS hotkey 0x39 → KEY_VOLUMEDOWN.
+/// Reference: asus-nb-wmi.c keymap entry 0x39.
+fn smoke_asus_hotkey_0x39_volumedown() -> TestResult {
+    use crate::asus_wmi::asus_keycode;
+    use narf_input::KeyCode;
+
+    match asus_keycode(0x39) {
+        Some(KeyCode::VolumeDown) => {}
+        _ => return TestResult::Fail("ASUS hotkey 0x39 should map to KeyCode::VolumeDown"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/asus_wmi",
+    smoke_asus_hotkey_0x39_volumedown
+);
+
+/// ASUS ROG fan curve 4-point setpoint interpolation.
+fn smoke_asus_fan_curve_interpolate() -> TestResult {
+    use crate::asus_wmi::FanCurve;
+
+    let curve = FanCurve::new((30, 10), (50, 30), (70, 60), (90, 100));
+
+    // Below lowest point → lowest pct.
+    if curve.interpolate(20) != 10 {
+        return TestResult::Fail("temp below min should return min fan pct (10)");
+    }
+    // Above highest point → 100%.
+    if curve.interpolate(95) != 100 {
+        return TestResult::Fail("temp above max should return 100");
+    }
+    // Midpoint between (50,30) and (70,60): temp=60 → pct=45.
+    let mid = curve.interpolate(60);
+    if mid != 45 {
+        return TestResult::Fail("midpoint interpolation mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/asus_wmi",
+    smoke_asus_fan_curve_interpolate
+);
+
+// ── ideapad_laptop ─────────────────────────────────────────────────────
+
+/// IdeaPad VPC index 0x2 (camera state) — constant value.
+fn smoke_ideapad_vpc_camera_index() -> TestResult {
+    use crate::ideapad_laptop::VPC_IDX_CAMERA;
+
+    if VPC_IDX_CAMERA != 0x2 {
+        return TestResult::Fail("VPC_IDX_CAMERA must be 0x2 per ideapad-laptop.c");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/ideapad_laptop",
+    smoke_ideapad_vpc_camera_index
+);
+
+/// IdeaPad performance mode 1=Balanced / 2=Performance round-trip.
+fn smoke_ideapad_perf_mode_round_trip() -> TestResult {
+    use crate::ideapad_laptop::{perf_mode, set_perf_mode, PerfMode, __test_reset};
+
+    __test_reset();
+    if perf_mode() != PerfMode::Balanced {
+        return TestResult::Fail("default perf mode should be Balanced(1)");
+    }
+    set_perf_mode(PerfMode::Performance);
+    if perf_mode() != PerfMode::Performance {
+        return TestResult::Fail("set_perf_mode(Performance) not stored");
+    }
+    set_perf_mode(PerfMode::Quiet);
+    if perf_mode() != PerfMode::Quiet {
+        return TestResult::Fail("set_perf_mode(Quiet) not stored");
+    }
+    __test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/ideapad_laptop",
+    smoke_ideapad_perf_mode_round_trip
+);
+
+/// IdeaPad battery conservation toggle round-trip.
+fn smoke_ideapad_battery_conservation_toggle() -> TestResult {
+    use crate::ideapad_laptop::{battery_conservation_enabled, set_battery_conservation, __test_reset};
+
+    __test_reset();
+    if battery_conservation_enabled() {
+        return TestResult::Fail("conservation should be false after reset");
+    }
+    set_battery_conservation(true);
+    if !battery_conservation_enabled() {
+        return TestResult::Fail("conservation should be true after enable");
+    }
+    __test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/ideapad_laptop",
+    smoke_ideapad_battery_conservation_toggle
+);
+
+// ── samsung_laptop ─────────────────────────────────────────────────────
+
+/// Samsung SABI invocation header encode.
+/// Verifies the magic bytes and class/function fields.
+fn smoke_samsung_sabi_header_encode() -> TestResult {
+    use crate::samsung_laptop::{SabiCmd, SABI_MAGIC};
+
+    let cmd = SabiCmd {
+        class: 0x08,
+        function: 0x13,
+        data0: 0xDEAD_BEEF,
+    };
+    let buf = cmd.encode();
+
+    // Bytes 0–1: SABI_MAGIC (0x5AA5 LE).
+    let magic = u16::from_le_bytes([buf[0], buf[1]]);
+    if magic != SABI_MAGIC {
+        return TestResult::Fail("SABI magic bytes incorrect");
+    }
+    // Byte 2: class.
+    if buf[2] != 0x08 {
+        return TestResult::Fail("SABI class byte incorrect");
+    }
+    // Byte 3: function.
+    if buf[3] != 0x13 {
+        return TestResult::Fail("SABI function byte incorrect");
+    }
+    // Bytes 4–7: data0 LE.
+    let data0 = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if data0 != 0xDEAD_BEEF {
+        return TestResult::Fail("SABI data0 bytes incorrect");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/samsung_laptop",
+    smoke_samsung_sabi_header_encode
+);
+
+// ── registry ───────────────────────────────────────────────────────────
+
+/// Vendor-detect: match by manufacturer string → OemVendor route.
+fn smoke_registry_vendor_detect_from_mfr() -> TestResult {
+    use crate::registry::OemVendor;
+
+    // LENOVO → ThinkPad (tentative; AML refinement not run in unit test).
+    if OemVendor::from_manufacturer("LENOVO") != OemVendor::ThinkPad {
+        return TestResult::Fail("LENOVO should map to OemVendor::ThinkPad");
+    }
+    // Dell variant with "Inc." suffix.
+    if OemVendor::from_manufacturer("Dell Inc.") != OemVendor::Dell {
+        return TestResult::Fail("Dell Inc. should map to OemVendor::Dell");
+    }
+    // HP with leading "HP " space.
+    if OemVendor::from_manufacturer("HP Laptop") != OemVendor::Hp {
+        return TestResult::Fail("HP Laptop should map to OemVendor::Hp");
+    }
+    // ASUS.
+    if OemVendor::from_manufacturer("ASUSTeK COMPUTER INC.") != OemVendor::Asus {
+        return TestResult::Fail("ASUSTeK should map to OemVendor::Asus");
+    }
+    // Samsung.
+    if OemVendor::from_manufacturer("SAMSUNG ELECTRONICS CO., LTD.") != OemVendor::Samsung {
+        return TestResult::Fail("SAMSUNG should map to OemVendor::Samsung");
+    }
+    // Unknown.
+    if OemVendor::from_manufacturer("Acme Corp") != OemVendor::Unknown {
+        return TestResult::Fail("Unknown manufacturer should map to OemVendor::Unknown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/registry",
+    smoke_registry_vendor_detect_from_mfr
+);
