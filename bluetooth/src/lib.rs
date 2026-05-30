@@ -35,11 +35,14 @@ extern crate alloc;
 
 pub mod att;
 pub mod avdtp;
+pub mod avrcp;
+pub mod btusb_quirks;
 pub mod profiles;
 pub mod classic;
 pub mod cmd_queue;
 pub mod controller;
 pub mod event;
+pub mod ertm;
 pub mod gap;
 pub mod gatt;
 pub mod gatt_server;
