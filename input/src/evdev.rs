@@ -171,7 +171,7 @@ const CAP_BITS: usize = 768;
 /// Fixed-size bit array covering codes 0..CAP_BITS.
 #[derive(Clone, Debug, Default)]
 pub struct CapBitmap {
-    words: [u64; (CAP_BITS + 63) / 64],
+    pub words: [u64; (CAP_BITS + 63) / 64],
 }
 
 impl CapBitmap {
@@ -617,6 +617,40 @@ pub fn dispatch_key_to_node(node: &DeviceNode, code: u16, pressed: bool) {
         value: if pressed { 1 } else { 0 },
     });
     node.dispatch(EvdevEvent::syn_report(now));
+}
+
+// ── Procfs snapshot API ───────────────────────────────────────────────────────
+
+/// A point-in-time snapshot of one registered input device, suitable for
+/// rendering into `/proc/bus/input/devices`.  Cloned out of the router's
+/// lock so the caller holds no lock while formatting text.
+///
+/// Linux ref: `drivers/input/input.c::input_proc_devices_show`.
+#[derive(Clone, Debug)]
+pub struct DeviceSnapshot {
+    /// Router-assigned device id.
+    pub id: DeviceId,
+    /// `true` while the device is still registered.
+    pub alive: bool,
+    /// Capability bitmaps cloned from the `DeviceNode`.
+    pub caps: DeviceCaps,
+}
+
+/// Return a point-in-time snapshot of every live registered device.
+///
+/// Called by `/proc/bus/input/devices` on every read.  Acquires the
+/// router lock once, clones the necessary data, then releases it.
+pub fn snapshot_devices() -> Vec<DeviceSnapshot> {
+    let g = ROUTER.inner.lock();
+    g.devices
+        .iter()
+        .filter(|n| n.is_alive())
+        .map(|n| DeviceSnapshot {
+            id: n.id,
+            alive: true,
+            caps: n.caps.clone(),
+        })
+        .collect()
 }
 
 /// Convenience helper for mouse drivers: dispatch `EV_REL REL_X` / `REL_Y`
