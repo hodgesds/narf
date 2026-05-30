@@ -19,6 +19,7 @@ narf-driver-runtime  = { path = "../runtime", default-features = false, features
 narf-drivers         = { path = ".." }
 narf-bus             = { path = "../../bus" }
 narf-init            = { path = "../../init" }
+narf-filesystem      = { path = "../../filesystem" }
 narf-drivers-i2c     = { path = "../i2c" }
 narf-console         = { path = "../../console" }
 narf-scheduler       = { path = "../../scheduler" }

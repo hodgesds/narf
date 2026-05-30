@@ -43,6 +43,9 @@ pub mod intel_ipu3;
 pub mod intel_ipu6;
 pub mod amd_mp2_isp;
 
+// ── devfs / sysfs bridge ────────────────────────────────────────────
+pub mod devfs_bridge;
+
 // ── MIPI-CSI sensor interface ───────────────────────────────────────
 pub mod sensor;
 
@@ -241,6 +244,15 @@ pub trait Camera: core::fmt::Debug {
 /// Register initcalls for all video drivers.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Install devfs hooks so /dev/video<N> nodes resolve.
+    // Linux ref: `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`.
+    narf_init::register(Stage::Subsys, "video-devfs", || {
+        narf_filesystem::devfs::install_video_hooks(
+            devfs_bridge::lookup_video,
+            devfs_bridge::enumerate_video,
+        );
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "intel-ipu3-pci", || {
         intel_ipu3::register_pci_driver();
         InitResult::Ok
