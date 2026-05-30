@@ -469,6 +469,18 @@ pub enum CapKind {
     // RAPL energy joules, and C-state residency. Granted broadly
     // since it can't change anything.
     CpuTelemetry = 0x00F2,
+
+    // Event bus — per-topic publish/subscribe (see `event_bus/SPEC.md`).
+    // `TopicRegistry` gates mint/lookup of topics; `EventPublisher`
+    // gates `publish()` on a topic; `EventSubscriber` gates
+    // `subscribe()` and `recv()`. Three distinct kinds so a
+    // compromised consumer can't forge events on the topic it
+    // subscribes to. `Event` prefix because the unqualified
+    // `Publisher`/`Subscriber` names collide with subscriber lists
+    // elsewhere.
+    TopicRegistry = 0x0100,
+    EventPublisher = 0x0101,
+    EventSubscriber = 0x0102,
 }
 
 pub trait CapType: 'static {
@@ -554,6 +566,9 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("Bluetooth", CapKind::Bluetooth),
     ("UsbPd", CapKind::UsbPd),
     ("CpuTelemetry", CapKind::CpuTelemetry),
+    ("TopicRegistry", CapKind::TopicRegistry),
+    ("EventPublisher", CapKind::EventPublisher),
+    ("EventSubscriber", CapKind::EventSubscriber),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────

@@ -1243,6 +1243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-event-bus"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-fb"
 version = "0.0.0"
 dependencies = [
@@ -1374,6 +1384,7 @@ dependencies = [
  "narf-drivers-wireless",
  "narf-edid",
  "narf-efi",
+ "narf-event-bus",
  "narf-fb",
  "narf-filesystem",
  "narf-firmware",
