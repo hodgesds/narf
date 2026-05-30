@@ -1311,3 +1311,57 @@ fn smoke_root_iter_lists_dynamic_top_level() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_root_iter_lists_dynamic_top_level);
+
+/// Smoke: `/proc/<pid>/comm` stat() reports FILE_RW mode.
+fn smoke_comm_file_is_rw() -> TestResult {
+    let f = ProcPidFile { pid: 1, field: PidField::Comm };
+    if f.stat().mode == Mode::FILE_RW {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("/proc/<pid>/comm stat mode should be FILE_RW")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_comm_file_is_rw);
+
+/// Smoke: write "newname\n" to comm succeeds and hook is exercised.
+fn smoke_comm_write_updates_read() -> TestResult {
+    // Use a stable per-test pid to avoid colliding with live tasks.
+    const PID: u64 = 0xf0ca1_0001;
+    let f = ProcPidFile { pid: PID, field: PidField::Comm };
+    // Write with a trailing newline (Linux userspace shape).
+    match poll_once(f.write(0, b"newname\n")) {
+        Some(Ok(n)) if n > 0 => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("comm write returned 0 bytes written"),
+        Some(Err(_)) => TestResult::Fail("comm write returned error"),
+        None => TestResult::Fail("comm write future did not complete"),
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_comm_write_updates_read);
+
+/// Smoke: write 30-char name → truncated to 15 (TASK_COMM_LEN - 1).
+fn smoke_comm_write_truncates_to_15() -> TestResult {
+    const PID: u64 = 0xf0ca1_0002;
+    let f = ProcPidFile { pid: PID, field: PidField::Comm };
+    // 30 ASCII 'a' chars + newline — handler must accept and truncate.
+    let long_name = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    match poll_once(f.write(0, long_name)) {
+        // write() must succeed (buf.len() returned) even for overlong names.
+        Some(Ok(n)) if n == long_name.len() => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("comm write returned unexpected byte count"),
+        Some(Err(_)) => TestResult::Fail("comm write of overlong name returned error"),
+        None => TestResult::Fail("comm write future did not complete"),
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_comm_write_truncates_to_15);
+
+/// Smoke: write to a non-comm pid file returns ReadOnly.
+fn smoke_non_comm_write_returns_readonly() -> TestResult {
+    let f = ProcPidFile { pid: 1, field: PidField::Stat };
+    let wr = poll_once(f.write(0, b"ignored\n"));
+    if matches!(wr, Some(Err(FsError::ReadOnly))) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("stat write should return ReadOnly")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_non_comm_write_returns_readonly);
