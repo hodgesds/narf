@@ -88,8 +88,8 @@ impl core::fmt::Debug for HandlerEntry {
 
 /// Max CPUs we track per-vector fire counts for. Matches
 /// `narf_lib::percpu::MAX_CPUS` but pinned locally so this crate
-/// doesn't need the dep.
-const PERCPU_FIRES_MAX: usize = 64;
+/// doesn't need the dep. Re-exported for `/proc/interrupts` rendering.
+pub const PERCPU_FIRES_MAX: usize = 64;
 
 // ── Re-entry guard ─────────────────────────────────────────────────
 //
@@ -540,6 +540,55 @@ fn current_cpu_index() -> usize {
 }
 
 // ── Counters ───────────────────────────────────────────────────────
+
+/// Per-vector snapshot for `/proc/interrupts`.
+///
+/// Returns a `Vec` of `(vector, global_fire_count, per_cpu_counts,
+/// handler_names)` tuples for every vector that has at least one
+/// installed handler OR at least one recorded fire. Vectors with
+/// zero fires and no handlers are omitted to keep the output compact.
+///
+/// `per_cpu_counts` is a fixed-length slice of `PERCPU_FIRES_MAX`
+/// entries; the caller should truncate at the actual online-CPU count
+/// before rendering.
+///
+/// Linux ref: `fs/proc/interrupts.c` `show_interrupts` +
+/// `kernel/irq/proc.c` `irq_node` / `irq_domain_name`.
+pub fn snapshot_counters() -> alloc::vec::Vec<IrqCounterSnapshot> {
+    let mut out = alloc::vec::Vec::new();
+    for (v, slot) in SLOTS.iter().enumerate() {
+        let fired = slot.fired.load(Ordering::Acquire);
+        let handlers: alloc::vec::Vec<&'static str> =
+            slot.handlers.lock().iter().map(|h| h.name).collect();
+        if fired == 0 && handlers.is_empty() {
+            continue;
+        }
+        let mut per_cpu = [0u64; PERCPU_FIRES_MAX];
+        for (cpu, count) in per_cpu.iter_mut().enumerate() {
+            *count = slot.per_cpu_fired[cpu].load(Ordering::Acquire);
+        }
+        out.push(IrqCounterSnapshot {
+            vector: v as u8,
+            total: fired,
+            per_cpu,
+            handler_names: handlers,
+        });
+    }
+    out
+}
+
+/// One vector's snapshot for `/proc/interrupts`.
+#[derive(Debug)]
+pub struct IrqCounterSnapshot {
+    /// IDT / LPI vector number.
+    pub vector: u8,
+    /// Total fires across all CPUs since boot.
+    pub total: u64,
+    /// Per-CPU fire counts (indexed 0..PERCPU_FIRES_MAX).
+    pub per_cpu: [u64; PERCPU_FIRES_MAX],
+    /// Driver names registered on this vector.
+    pub handler_names: alloc::vec::Vec<&'static str>,
+}
 
 /// Snapshot of a vector's global fire count.
 #[inline]
