@@ -2738,6 +2738,70 @@ fn smoke_acpi_fan_registry_register_and_iterate() -> TestResult {
 }
 kernel_test_in!("acpi/fan", smoke_acpi_fan_registry_register_and_iterate);
 
+fn smoke_acpi_fan_fif_decode_fine_grained() -> TestResult {
+    use crate::fan::{decode_fif, FifDecodeError};
+    // Typical fine-grained fan: step_size=1 (0.1%), speed_levels=0.
+    let pkg = [0u32, 1, 1, 0];
+    let info = match decode_fif(&pkg) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("decode_fif rejected valid 4-tuple"),
+    };
+    if !info.fine_grained_control {
+        return TestResult::Fail("fine_grained_control must be true when field[1]=1");
+    }
+    if info.step_size != 1 {
+        return TestResult::Fail("step_size mis-decoded");
+    }
+    // Discrete fan: fine_grained=0, step_size=100 (10%), 10 levels.
+    let pkg2 = [0u32, 0, 100, 10];
+    let info2 = decode_fif(&pkg2).expect("decode_fif 2");
+    if info2.fine_grained_control {
+        return TestResult::Fail("fine_grained_control must be false when field[1]=0");
+    }
+    if info2.step_size != 100 || info2.speed_levels != 10 {
+        return TestResult::Fail("step_size/speed_levels mis-decoded");
+    }
+    // Short package → WrongElementCount.
+    match decode_fif(&[0u32, 1, 1]) {
+        Err(FifDecodeError::WrongElementCount) => {}
+        _ => return TestResult::Fail("3-element _FIF must be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/fan", smoke_acpi_fan_fif_decode_fine_grained);
+
+fn smoke_acpi_fan_fsl_encode_and_clamp() -> TestResult {
+    use crate::fan::{encode_fsl, encode_fsl_validated, FslError};
+    // Within range → unchanged.
+    if encode_fsl(0) != 0 {
+        return TestResult::Fail("encode_fsl(0) must be 0");
+    }
+    if encode_fsl(500) != 500 {
+        return TestResult::Fail("encode_fsl(500) must be 500");
+    }
+    if encode_fsl(1000) != 1000 {
+        return TestResult::Fail("encode_fsl(1000) must be 1000");
+    }
+    // Over range → clamped to 1000.
+    if encode_fsl(1001) != 1000 {
+        return TestResult::Fail("encode_fsl(1001) must clamp to 1000");
+    }
+    if encode_fsl(u32::MAX) != 1000 {
+        return TestResult::Fail("encode_fsl(MAX) must clamp to 1000");
+    }
+    // Validated variant surfaces the Clamped error.
+    match encode_fsl_validated(1200) {
+        (1000, Some(FslError::Clamped(1200))) => {}
+        _ => return TestResult::Fail("validated 1200 must yield (1000, Clamped(1200))"),
+    }
+    match encode_fsl_validated(800) {
+        (800, None) => {}
+        _ => return TestResult::Fail("validated 800 must yield (800, None)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/fan", smoke_acpi_fan_fsl_encode_and_clamp);
+
 // ── acpi/wake-vector arming ────────────────────────────────────────
 
 fn smoke_acpi_arm_s3_waking_vector_requires_facs() -> TestResult {

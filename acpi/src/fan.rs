@@ -76,6 +76,86 @@ pub fn decode_fst(values: &[u32]) -> Result<FanStatus, FanDecodeError> {
     })
 }
 
+// ── _FIF decoder ──────────────────────────────────────────────────
+
+/// Decoded `_FIF` Package contents (fine-grained fan info).
+///
+/// `_FIF` is an ACPI 6.5 §11.3 extension that advertises whether
+/// a fan supports fine-grained speed control and how many discrete
+/// levels it offers. Not all firmware exposes `_FIF`; its absence
+/// means the fan only supports on/off via D-state transitions.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FanInfo {
+    /// Revision — 0 per ACPI 6.5.
+    pub revision: u32,
+    /// True when the fan supports fine-grained speed control
+    /// (i.e. `_FSL` takes any value in 0..=1000). False when
+    /// only coarse-level (`speed_levels` discrete steps) is available.
+    pub fine_grained_control: bool,
+    /// Step size in tenths of a percent. Meaningful only when
+    /// `fine_grained_control == false`. E.g. step_size=100 means
+    /// the fan has 10 speed levels in 10% increments.
+    pub step_size: u32,
+    /// Number of discrete speed levels. If `fine_grained_control` is
+    /// true the firmware may report 0 here.
+    pub speed_levels: u32,
+}
+
+/// Errors decoding `_FIF` packages.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FifDecodeError {
+    /// `_FIF` returned fewer than 4 elements.
+    WrongElementCount,
+}
+
+/// Decode a `_FIF` Package — `values[0]` = revision,
+/// `[1]` = fine_grained_control (0 or 1),
+/// `[2]` = step_size (tenths of %), `[3]` = speed_levels.
+pub fn decode_fif(values: &[u32]) -> Result<FanInfo, FifDecodeError> {
+    if values.len() < 4 {
+        return Err(FifDecodeError::WrongElementCount);
+    }
+    Ok(FanInfo {
+        revision: values[0],
+        fine_grained_control: values[1] != 0,
+        step_size: values[2],
+        speed_levels: values[3],
+    })
+}
+
+// ── _FSL encoder ──────────────────────────────────────────────────
+
+/// Encode a fan control level for `_FSL(level)`. The ACPI spec
+/// defines the argument in tenths of a percent (0..=1000). Values
+/// above 1000 are clamped to 1000 (100 %).
+///
+/// `_FSL` never fails — it either writes the level or the EC ignores
+/// the over-range value. Clamping here matches Linux `acpi_fan_set_level`.
+#[inline]
+pub fn encode_fsl(control: u32) -> u32 {
+    control.min(1000)
+}
+
+/// Validate the control argument before encoding. Returns the
+/// (possibly clamped) value and an optional error indicating clamping
+/// occurred. Useful for drivers that want to surface the warning
+/// without refusing the call.
+pub fn encode_fsl_validated(control: u32) -> (u32, Option<FslError>) {
+    if control > 1000 {
+        (1000, Some(FslError::Clamped(control)))
+    } else {
+        (control, None)
+    }
+}
+
+/// Soft error from [`encode_fsl_validated`] — not fatal, just
+/// diagnostic.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FslError {
+    /// The requested level was above 1000 and has been clamped to 1000.
+    Clamped(u32),
+}
+
 // ── Fan trait ──────────────────────────────────────────────────────
 
 /// One physical fan on the platform. Implementations live in
