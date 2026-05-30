@@ -52,6 +52,8 @@ extern crate alloc;
 
 pub mod cable;
 pub mod class;
+pub mod sysfs_bridge;
 pub mod typec;
+pub mod typec_class;
 
 mod tests;
