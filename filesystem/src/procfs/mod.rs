@@ -711,17 +711,30 @@ impl DirOps for ProcPidDir {
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
         Box::new(
             [
+                // Core five (original Stage-1).
                 DirEntry { name: "stat", file_type: FileType::File },
                 DirEntry { name: "status", file_type: FileType::File },
                 DirEntry { name: "cmdline", file_type: FileType::File },
                 DirEntry { name: "maps", file_type: FileType::File },
                 DirEntry { name: "comm", file_type: FileType::File },
-                DirEntry { name: "oom_score", file_type: FileType::File },
-                DirEntry { name: "oom_score_adj", file_type: FileType::File },
-                DirEntry { name: "coredump_filter", file_type: FileType::File },
+                // Extended flat files.
+                DirEntry { name: "io", file_type: FileType::File },
+                DirEntry { name: "sched", file_type: FileType::File },
+                DirEntry { name: "schedstat", file_type: FileType::File },
+                DirEntry { name: "stack", file_type: FileType::File },
+                DirEntry { name: "wchan", file_type: FileType::File },
+                DirEntry { name: "syscall", file_type: FileType::File },
                 DirEntry { name: "environ", file_type: FileType::File },
                 DirEntry { name: "auxv", file_type: FileType::File },
                 DirEntry { name: "limits", file_type: FileType::File },
+                DirEntry { name: "oom_score", file_type: FileType::File },
+                DirEntry { name: "oom_score_adj", file_type: FileType::File },
+                DirEntry { name: "coredump_filter", file_type: FileType::File },
+                DirEntry { name: "mountinfo", file_type: FileType::File },
+                DirEntry { name: "mountstats", file_type: FileType::File },
+                DirEntry { name: "personality", file_type: FileType::File },
+                DirEntry { name: "cgroup", file_type: FileType::File },
+                // Subdirectories.
                 DirEntry { name: "fd", file_type: FileType::Dir },
                 DirEntry { name: "fdinfo", file_type: FileType::Dir },
                 DirEntry { name: "task", file_type: FileType::Dir },
