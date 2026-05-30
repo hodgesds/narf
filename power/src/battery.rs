@@ -27,11 +27,85 @@
 //!   `status()` may surface `MethodMissing` until the EC opregion
 //!   is wired in. Tests don't depend on the live EC.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use narf_aml::eval::evaluate_method;
 use narf_aml::{find_all_devices_by_hid, Value};
+use narf_lib::sync::IrqSafeSpinLock;
+
+// ── Notify fan-out ─────────────────────────────────────────────────
+
+/// Battery notification events. Values mirror the ACPI notify codes.
+///
+/// Spec: ACPI 6.5 §10.2 — Notify(battery, 0x80) = "battery status
+/// changed" (new `_BST`), Notify(battery, 0x81) = "battery info
+/// changed" (new `_BIX`). The `_BTP` trip-point fires its own 0x80
+/// but in a distinct context tracked by `CapacityLow`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BatteryTripEvent {
+    /// Notify code 0x80: battery status changed (new `_BST` available).
+    StatusChanged,
+    /// Notify code 0x81: battery info changed (new `_BIX`; e.g. new
+    /// battery inserted or design-capacity recalibrated).
+    InfoChanged,
+    /// `_BTP` trip point crossed — remaining capacity dropped below
+    /// the programmed threshold.
+    CapacityLow,
+}
+
+type BatterySubscriber = Box<dyn Fn(&BatteryTripEvent) + Send + Sync + 'static>;
+
+static BATTERY_SUBS: IrqSafeSpinLock<Vec<BatterySubscriber>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Register a callback for battery trip events. Called from the
+/// ACPI notify dispatcher (0x80/0x81) and from `_BTP` expiry.
+///
+/// All registered callbacks run synchronously on the notify/SCI thread
+/// — keep them short and non-blocking.
+pub fn subscribe<F>(cb: F)
+where
+    F: Fn(&BatteryTripEvent) + Send + Sync + 'static,
+{
+    BATTERY_SUBS.lock().push(Box::new(cb));
+}
+
+/// Number of registered battery subscribers (debug helper).
+pub fn subscriber_count() -> usize {
+    BATTERY_SUBS.lock().len()
+}
+
+/// Fan out a raw ACPI Notify code to all registered subscribers.
+/// 0x80 → `StatusChanged`, 0x81 → `InfoChanged`, other → `CapacityLow`.
+pub fn notify(code: u8) {
+    let ev = match code {
+        0x80 => BatteryTripEvent::StatusChanged,
+        0x81 => BatteryTripEvent::InfoChanged,
+        _ => BatteryTripEvent::CapacityLow,
+    };
+    let subs = BATTERY_SUBS.lock();
+    for cb in subs.iter() {
+        cb(&ev);
+    }
+}
+
+/// Convenience: directly signal a capacity-low trip (from `_BTP`
+/// polling logic or firmware event).
+pub fn notify_capacity_low() {
+    let ev = BatteryTripEvent::CapacityLow;
+    let subs = BATTERY_SUBS.lock();
+    for cb in subs.iter() {
+        cb(&ev);
+    }
+}
+
+/// Reset subscribers — test helper only.
+#[doc(hidden)]
+pub fn __reset_for_test() {
+    BATTERY_SUBS.lock().clear();
+}
 
 /// One PNP0C0A battery device. Cheap to clone (just a path string).
 #[derive(Clone, Debug)]
@@ -183,6 +257,22 @@ impl BatteryDevice {
         method.push_str("._BST");
         let v = evaluate_method(&method, &[]).map_err(|_| BatteryError::MethodMissing)?;
         decode_bst(&v)
+    }
+
+    /// Set the `_BTP` (Battery Trip Point) to `capacity`. Firmware fires
+    /// Notify(battery, 0x80) when `remaining_capacity` crosses this value.
+    ///
+    /// Spec: ACPI 6.5 §10.2.2.7 `_BTP(TripPoint)`. Pass 0 to disable the
+    /// trip point. The argument is in the same unit as `_BST.remaining_capacity`
+    /// (mAh or mWh depending on `_BIX.power_unit`). Returns `MethodMissing`
+    /// on firmware that doesn't implement `_BTP` (desktops; some embedded
+    /// platforms).
+    pub fn set_trip(&self, capacity: u64) -> Result<(), BatteryError> {
+        let mut method = self.path.clone();
+        method.push_str("._BTP");
+        evaluate_method(&method, &[Value::Integer(capacity)])
+            .map(|_| ())
+            .map_err(|_| BatteryError::MethodMissing)
     }
 }
 
@@ -406,4 +496,61 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("power/battery", smoke_battery_decode_rejects_short_pkg);
+
+    fn smoke_battery_btp_trip_notify_fanout() -> TestResult {
+        use super::{
+            notify, notify_capacity_low, subscribe, subscriber_count, BatteryTripEvent,
+            __reset_for_test,
+        };
+        use alloc::sync::Arc;
+        use narf_lib::sync::IrqSafeSpinLock;
+
+        __reset_for_test();
+        if subscriber_count() != 0 {
+            return TestResult::Fail("fresh subscriber list must be empty");
+        }
+
+        // Use a spinlock-protected Vec to collect events from the callback.
+        let events: Arc<IrqSafeSpinLock<Vec<BatteryTripEvent>>> =
+            Arc::new(IrqSafeSpinLock::new(Vec::new()));
+        let ev_clone = Arc::clone(&events);
+        subscribe(move |e| {
+            ev_clone.lock().push(*e);
+        });
+
+        if subscriber_count() != 1 {
+            return TestResult::Fail("subscriber_count must be 1 after subscribe");
+        }
+
+        // Notify(0x80) → StatusChanged.
+        notify(0x80);
+        {
+            let evs = events.lock();
+            if evs.len() != 1 || evs[0] != BatteryTripEvent::StatusChanged {
+                return TestResult::Fail("notify(0x80) must yield StatusChanged");
+            }
+        }
+
+        // Notify(0x81) → InfoChanged.
+        notify(0x81);
+        {
+            let evs = events.lock();
+            if evs.len() != 2 || evs[1] != BatteryTripEvent::InfoChanged {
+                return TestResult::Fail("notify(0x81) must yield InfoChanged");
+            }
+        }
+
+        // notify_capacity_low() → CapacityLow.
+        notify_capacity_low();
+        {
+            let evs = events.lock();
+            if evs.len() != 3 || evs[2] != BatteryTripEvent::CapacityLow {
+                return TestResult::Fail("notify_capacity_low must yield CapacityLow");
+            }
+        }
+
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("power/battery", smoke_battery_btp_trip_notify_fanout);
 }
