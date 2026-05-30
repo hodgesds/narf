@@ -5997,6 +5997,82 @@ pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
     g.as_ref().and_then(|m| m.get(&pid).cloned())
 }
 
+// ── /proc/[pid]/comm writable hook ─────────────────────────────
+
+/// Update comm from a procfs write. Linux ref: `comm_write` in
+/// `fs/proc/base.c`. Truncates to 15 chars; returns `Ok(())`.
+pub fn proc_set_comm(pid: u64, name: &str) -> Result<(), narf_filesystem::FsError> {
+    set_proc_comm(pid, name);
+    Ok(())
+}
+
+// ── /proc/[pid]/oom_score_adj ───────────────────────────────────
+
+static PROC_OOM_ADJ: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, i16>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Return the oom_score_adj for `pid`. Default 0.
+pub fn proc_oom_adj_of(pid: u64) -> i16 {
+    let g = PROC_OOM_ADJ.lock();
+    g.as_ref().and_then(|m| m.get(&pid).copied()).unwrap_or(0)
+}
+
+/// Set the oom_score_adj for `pid`. Range is validated by the caller.
+pub fn proc_set_oom_adj(pid: u64, val: i16) -> Result<(), narf_filesystem::FsError> {
+    let mut g = PROC_OOM_ADJ.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, val);
+    Ok(())
+}
+
+/// Compute a 0..1000 oom_score for `pid`.
+///
+/// Stub formula: `clamp(rss_pages * 1000 / total_pages + adj, 0, 1000)`.
+/// Linux ref: `oom_badness` in `mm/oom_kill.c`.
+pub fn proc_oom_score_of(pid: u64) -> i32 {
+    let stats = narf_memory::frame::stats();
+    // RSS is approximated as the task's VMA pages. NARF tracks
+    // VMAs but not resident pages yet — use vma_count as a proxy.
+    let rss_pages = {
+        let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid));
+        task.map(|as_arc| {
+            let regions = as_arc.regions_snapshot();
+            regions.iter().map(|r| (r.len / 4096).max(1) as u64).sum::<u64>()
+        }).unwrap_or(0)
+    };
+    let total = stats.total.max(1);
+    let base = (rss_pages as i64 * 1000 / total as i64) as i32;
+    let adj = proc_oom_adj_of(pid) as i32;
+    (base + adj).clamp(0, 1000)
+}
+
+// ── /proc/[pid]/coredump_filter ────────────────────────────────
+
+/// Default coredump_filter: anonymous + anonymous-huge + ELF headers.
+/// Linux ref: `DEFAULT_MAP_WINDOW` macros + `PR_SET_DUMPABLE` handler.
+const DEFAULT_COREDUMP_FILTER: u32 = 0x33;
+
+static PROC_COREDUMP_FILTER: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u32>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Return the coredump_filter bitmap for `pid`. Default 0x33.
+pub fn proc_coredump_filter_of(pid: u64) -> u32 {
+    let g = PROC_COREDUMP_FILTER.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&pid).copied())
+        .unwrap_or(DEFAULT_COREDUMP_FILTER)
+}
+
+/// Set the coredump_filter bitmap for `pid`.
+pub fn proc_set_coredump_filter(pid: u64, bits: u32) -> Result<(), narf_filesystem::FsError> {
+    let mut g = PROC_COREDUMP_FILTER.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, bits);
+    Ok(())
+}
+
 /// /proc/self pid hook — returns the current task id.
 pub fn proc_current_pid() -> u64 {
     current_task_id()
@@ -6099,6 +6175,103 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         vmas,
     })
 }
+
+// ── Extended /proc/[pid]/* public accessors ────────────────────────
+//
+// Called by `narf_filesystem::procfs::pid_ext` via fn-pointer hooks
+// wired in `cross_crate_init::install_proc_ext_hooks`.
+
+/// Return the full rlimit table for `pid` as `[(cur, max); 16]`.
+/// Indices follow RLIMIT_* numbering (0=CPU, 3=STACK, 7=NOFILE, …).
+pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
+    let row = {
+        let g = RLIMIT_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&pid).copied())
+            .unwrap_or_else(default_rlimits)
+    };
+    let mut out = [(0u64, 0u64); 16];
+    for (i, p) in row.iter().enumerate() {
+        out[i] = (p.cur, p.max);
+    }
+    out
+}
+
+/// Return the nice value for `pid`. Default 0.
+pub fn nice_of(pid: u64) -> i32 {
+    read_nice(pid)
+}
+
+/// Return the environ block for `pid` (NUL-separated key=value bytes).
+/// Returns empty Vec when no environ has been recorded.
+pub fn proc_environ_of(pid: u64) -> alloc::vec::Vec<u8> {
+    let g = PROC_ENVIRON.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&pid).cloned())
+        .unwrap_or_default()
+}
+
+/// Return the packed ELF auxv bytes for `pid`.  Each entry is two
+/// little-endian u64s (key, value).  AT_NULL (0, 0) terminates.
+pub fn proc_auxv_of(pid: u64) -> alloc::vec::Vec<u8> {
+    let g = PROC_AUXV.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&pid).cloned())
+        .unwrap_or_else(|| alloc::vec![0u8; 16])
+}
+
+/// Record NUL-separated environ for a task at execve time.
+pub fn set_proc_environ(pid: u64, envp: &[&str]) {
+    let mut packed = alloc::vec::Vec::new();
+    for s in envp {
+        packed.extend_from_slice(s.as_bytes());
+        packed.push(0);
+    }
+    let mut g = PROC_ENVIRON.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, packed);
+}
+
+/// Record packed auxv (key, value) pairs for a task at execve time.
+/// AT_NULL is appended automatically.
+pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
+    let mut packed: alloc::vec::Vec<u8> =
+        alloc::vec::Vec::with_capacity((aux.len() + 1) * 16);
+    for (key, val) in aux {
+        packed.extend_from_slice(&key.to_le_bytes());
+        packed.extend_from_slice(&val.to_le_bytes());
+    }
+    packed.extend_from_slice(&0u64.to_le_bytes());
+    packed.extend_from_slice(&0u64.to_le_bytes());
+    let mut g = PROC_AUXV.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, packed);
+}
+
+/// Return the backing description for fd `n` of `pid`.  Shaped like
+/// a Linux `/proc/[pid]/fd/<n>` symlink target.  Returns `None` when
+/// the fd or task doesn't exist.
+pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
+    crate::fd::with_table(pid, |t| {
+        let entry = t.get(n)?;
+        // Use the type_name as a fallback until FileOps grows a path()
+        // method with the VFS pathname cache.
+        let name = core::any::type_name_of_val(&*entry.ops);
+        // Extract the last component (e.g. "PipeRead" from "crate::pipe::PipeRead").
+        let short = name.rsplit("::").next().unwrap_or(name);
+        Some(alloc::format!("anon_inode:[{}]", short))
+    })
+    .flatten()
+}
+
+// Per-task environ and auxv byte stores.
+static PROC_ENVIRON: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Clear the pending bit for `signum` on `task`. Used by signalfd
 /// after delivering the signal through the fd path.
