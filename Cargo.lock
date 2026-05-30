@@ -609,6 +609,7 @@ dependencies = [
  "narf-arch",
  "narf-boot",
  "narf-capabilities",
+ "narf-event-bus",
  "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",

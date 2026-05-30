@@ -32,6 +32,14 @@ pub mod registry;
 pub mod subscriber;
 pub mod topic;
 
+/// Adapter shape: the existing `bus/src/acpi_notify.rs` test code
+/// imported `acpi_notify::__test_reset` to clear state between
+/// smokes. Migration leaves that surface intact via a re-export of
+/// the registry-side reset, since the bus is the only state the
+/// `acpi_notify` module now carries.
+#[doc(hidden)]
+pub use registry::__reset_for_test as __registry_reset_for_test;
+
 mod tests;
 
 pub use audit::AuditEvent;

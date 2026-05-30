@@ -1,25 +1,35 @@
-//! ACPI Notify listener — Stage-4 structural shape.
+//! ACPI Notify event-bus topic — migrated to `narf-event-bus`.
 //!
-//! Spec: `bus/specification/spec.md` (Stage-4 ACPI notify
-//! integration). The platform firmware delivers Notify events to
-//! kernel via ACPI (e.g. battery state change, power-button press,
-//! hot-plug, thermal) through the interpreter's `Notify` method.
-//! NARF routes these through a cap-gated registry of listeners so
-//! only authorized subsystems observe them.
+//! Stage-4 structural shape. The platform firmware delivers Notify
+//! events to the kernel via ACPI (e.g. battery state change,
+//! power-button press, hot-plug, thermal) through the interpreter's
+//! `Notify` method. NARF routes these onto the
+//! `acpi.notify` event-bus topic; subscribers attach via
+//! `event_bus::lookup_topic::<NotifyEvent>` and consume async.
 //!
 //! Without an ACPI interpreter linked in (a Stage-4+ piece),
-//! `dispatch_notify()` is called by test code to prove the
-//! subscribe/dispatch shape; production wiring comes when the
-//! interpreter lands.
+//! `dispatch_notify()` is called by test code to prove the publish
+//! shape; production wiring comes when the interpreter lands.
+//!
+//! Migration note (Phase 1 hard cutover): the previous
+//! `Vec<Box<dyn Fn(&NotifyEvent)>>` callback list + spinlock was
+//! removed in this commit. Subsystems that registered callbacks now
+//! `lookup_topic::<NotifyEvent>` and spawn an async task that drains
+//! `Subscriber::next().await`. The previous `subscribe(cap, cb)` and
+//! `subscriber_count()` symbols no longer exist.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-
-use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, NoopOp};
+use narf_capabilities::{Cap, CapType, CapKind, Read, Write};
+use narf_event_bus::{
+    create_topic, lookup_topic, CreateError, LookupError, PublishError, Publisher, Subscriber,
+    TopicRegistry,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Cap-type marker for ACPI notify subscribers.
-/// `Cap<AcpiNotify, Grant>` authorises installation of a listener.
+/// Cap-type marker retained for in-tree subsystems that still spell
+/// their authority as `Cap<AcpiNotify, R>`. The new event-bus path
+/// uses `Cap<TopicRegistry, R>` directly; this is preserved so
+/// callers that hold an `AcpiNotify` cap can transparently mint the
+/// matching registry cap.
 #[derive(Copy, Clone, Debug)]
 pub struct AcpiNotify;
 
@@ -29,7 +39,9 @@ impl CapType for AcpiNotify {
 
 /// ACPI notify value — 8-bit per ACPI spec. Named variants cover
 /// the fixed device classes; `Device(u8)` carries device-specific
-/// codes verbatim.
+/// codes verbatim. The Rust enum's discriminant layout is the
+/// compiler's choice; the bit-level mapping to/from the ACPI byte
+/// is in `from_raw` / `raw`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NotifyKind {
     /// 0x00 — Bus Check (device configuration may have changed).
@@ -78,78 +90,97 @@ impl NotifyKind {
     }
 }
 
-/// Event delivered to subscribers.
+/// Event delivered to subscribers via the `acpi.notify` topic.
+/// `Copy + 'static + Send + Sync` so it fits a fixed-size bus slot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct NotifyEvent {
     pub acpi_handle: u64,
     pub kind: NotifyKind,
 }
 
-/// Errors from the ACPI notify surface.
+// SAFETY: NotifyEvent is plain data with no interior mutability and
+// no references; Copy. The bus's `Event` trait is automatically
+// implemented for any `T: Copy + Send + Sync + 'static`.
+
+/// Errors surfaced by this module's wrappers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NotifyError {
     AuthorityRevoked,
     NotInitialised,
+    CreateFailed,
+    LookupFailed,
 }
 
-impl From<CapError> for NotifyError {
-    fn from(_: CapError) -> Self {
-        NotifyError::AuthorityRevoked
-    }
-}
+/// Topic name used for ACPI Notify events. Picked from the reserved-
+/// root `acpi.` namespace so only kernel can mint.
+pub const TOPIC: &str = "acpi.notify";
 
-type Subscriber = Box<dyn Fn(&NotifyEvent) + Send + Sync + 'static>;
+/// Default ring capacity (slots). Notify-rate is human-driven (button
+/// presses, AC plug/unplug, occasional thermal crossings); 64 slots
+/// covers any reasonable burst.
+pub const CAPACITY: usize = 64;
 
-struct Registry {
-    subs: Vec<Subscriber>,
-}
+/// Cached publisher handle minted during `init`. `IrqSafeSpinLock`
+/// because the SCI bottom-half may publish from interrupt context.
+static PUBLISHER: IrqSafeSpinLock<Option<Publisher<NotifyEvent>>> = IrqSafeSpinLock::new(None);
 
-impl core::fmt::Debug for Registry {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Registry")
-            .field("subs", &self.subs.len())
-            .finish()
-    }
-}
-
-static REG: IrqSafeSpinLock<Option<Registry>> = IrqSafeSpinLock::new(None);
-
-/// Initialise the ACPI notify registry.
+/// Initialise the topic. Mints a `Cap<TopicRegistry, Write>`,
+/// creates `acpi.notify` with `NotifyEvent` payload, and caches the
+/// publisher. Idempotent.
 pub fn init() {
-    *REG.lock() = Some(Registry { subs: Vec::new() });
-}
-
-/// Install a notify subscriber. Cap-gated; called by each subsystem
-/// at boot after it has received its `Cap<AcpiNotify, Grant>`.
-pub fn subscribe<F>(cap: &Cap<AcpiNotify, Grant>, cb: F) -> Result<(), NotifyError>
-where
-    F: Fn(&NotifyEvent) + Send + Sync + 'static,
-{
-    cap.invoke(NoopOp)?;
-    let mut r = REG.lock();
-    let reg = r.as_mut().ok_or(NotifyError::NotInitialised)?;
-    reg.subs.push(Box::new(cb));
-    Ok(())
-}
-
-/// Dispatch a synthetic notify event to every subscriber. Production
-/// callers come from the ACPI interpreter; tests can call directly.
-pub fn dispatch_notify(ev: NotifyEvent) -> Result<(), NotifyError> {
-    let r = REG.lock();
-    let reg = r.as_ref().ok_or(NotifyError::NotInitialised)?;
-    for cb in &reg.subs {
-        cb(&ev);
+    let g = PUBLISHER.lock();
+    if g.is_some() {
+        return;
     }
-    Ok(())
+    drop(g);
+
+    // Ensure the bus is initialised before we mint a topic on it.
+    narf_event_bus::init();
+
+    let reg: Cap<TopicRegistry, Write> = Cap::bootstrap();
+    match create_topic::<NotifyEvent>(&reg, TOPIC, CAPACITY) {
+        Ok((_id, publisher)) => {
+            *PUBLISHER.lock() = Some(publisher);
+        }
+        Err(CreateError::NameTaken) => {
+            // Another path raced us — fine, just no-op.
+        }
+        Err(_) => {
+            // Could log here; for Phase 1 silently leave PUBLISHER
+            // = None so dispatch_notify reports NotInitialised.
+        }
+    }
 }
 
-/// Count of registered subscribers.
-pub fn subscriber_count() -> usize {
-    REG.lock().as_ref().map(|r| r.subs.len()).unwrap_or(0)
+/// Mint a fresh `Subscriber<NotifyEvent>` for the topic. The caller
+/// holds a `Cap<TopicRegistry, Read>` (the lookup-only authority);
+/// the registry checks liveness. Drives the per-task drain via
+/// `Subscriber::next().await`.
+pub fn subscribe(reg: &Cap<TopicRegistry, Read>) -> Result<Subscriber<NotifyEvent>, NotifyError> {
+    match lookup_topic::<NotifyEvent>(reg, TOPIC) {
+        Ok(s) => Ok(s),
+        Err(LookupError::CapRevoked) => Err(NotifyError::AuthorityRevoked),
+        Err(LookupError::NotFound) => Err(NotifyError::NotInitialised),
+        Err(_) => Err(NotifyError::LookupFailed),
+    }
+}
+
+/// Publish a synthetic notify event. Production callers come from
+/// the ACPI interpreter; tests can call directly.
+pub fn dispatch_notify(ev: NotifyEvent) -> Result<(), NotifyError> {
+    let g = PUBLISHER.lock();
+    let p = g.as_ref().ok_or(NotifyError::NotInitialised)?;
+    match p.publish(ev) {
+        Ok(_) => Ok(()),
+        Err(PublishError::CapRevoked) => Err(NotifyError::AuthorityRevoked),
+        Err(_) => Err(NotifyError::CreateFailed),
+    }
 }
 
 /// Test helper.
 #[doc(hidden)]
 pub fn __test_reset() {
-    *REG.lock() = None;
+    *PUBLISHER.lock() = None;
+    narf_event_bus::registry::__reset_for_test();
 }

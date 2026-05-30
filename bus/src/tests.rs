@@ -482,32 +482,31 @@ fn smoke_bus_iommu_group_default() -> TestResult {
 kernel_test_in!("bus", smoke_bus_iommu_group_default);
 
 fn smoke_bus_acpi_notify_dispatch() -> TestResult {
-    use crate::acpi_notify::{self, AcpiNotify, NotifyEvent, NotifyKind};
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_capabilities::{Cap, Grant};
+    use crate::acpi_notify::{self, NotifyEvent, NotifyKind};
+    use narf_capabilities::{Cap, Read};
+    use narf_event_bus::TopicRegistry;
 
     acpi_notify::__test_reset();
     acpi_notify::init();
 
-    static HITS: AtomicU32 = AtomicU32::new(0);
-    HITS.store(0, Ordering::Relaxed);
-
-    let cap: Cap<AcpiNotify, Grant> = Cap::bootstrap();
-    if acpi_notify::subscribe(&cap, |ev| {
-        if matches!(ev.kind, NotifyKind::Thermal) {
-            HITS.fetch_add(1, Ordering::Relaxed);
-        }
-    })
-    .is_err()
-    {
-        return TestResult::Fail("subscribe failed on live cap");
-    }
+    // Mint a registry-read cap for the subscriber path.
+    let reg_r: Cap<TopicRegistry, Read> = Cap::bootstrap();
+    let mut sub = match acpi_notify::subscribe(&reg_r) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("subscribe failed on live cap"),
+    };
 
     let _ = acpi_notify::dispatch_notify(NotifyEvent {
         acpi_handle: 0x4242,
         kind: NotifyKind::Thermal,
     });
-    if HITS.load(Ordering::Relaxed) != 1 {
+    let mut thermal_hits: u32 = 0;
+    if let Ok(Some((_seq, ev))) = sub.try_next() {
+        if matches!(ev.kind, NotifyKind::Thermal) {
+            thermal_hits += 1;
+        }
+    }
+    if thermal_hits != 1 {
         return TestResult::Fail("Thermal notify did not reach subscriber");
     }
 
@@ -515,8 +514,14 @@ fn smoke_bus_acpi_notify_dispatch() -> TestResult {
         acpi_handle: 0x4242,
         kind: NotifyKind::PowerSource,
     });
-    if HITS.load(Ordering::Relaxed) != 1 {
-        return TestResult::Fail("non-thermal notify incremented thermal counter");
+    let mut non_thermal_seen = false;
+    if let Ok(Some((_seq, ev))) = sub.try_next() {
+        if matches!(ev.kind, NotifyKind::PowerSource) {
+            non_thermal_seen = true;
+        }
+    }
+    if !non_thermal_seen {
+        return TestResult::Fail("non-thermal notify did not arrive");
     }
 
     if NotifyKind::from_raw(0x82) != NotifyKind::Thermal {
