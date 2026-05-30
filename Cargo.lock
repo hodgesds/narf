@@ -957,6 +957,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-leds"
+version = "0.0.0"
+dependencies = [
+ "narf-drivers-gpio",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-pwm",
+]
+
+[[package]]
 name = "narf-drivers-net"
 version = "0.0.0"
 dependencies = [
@@ -1146,6 +1157,14 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+]
+
+[[package]]
+name = "narf-drivers-tpm"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
