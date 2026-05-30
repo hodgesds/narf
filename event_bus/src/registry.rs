@@ -72,6 +72,7 @@ pub(crate) struct TopicEntry {
     /// only carry fixed-size events never allocate one.
     pub arena: Option<Arc<Arena>>,
     /// Index in the object table for the publisher cap.
+    #[allow(dead_code)]
     pub pub_index: u32,
     /// Index in the object table for the subscriber cap (template;
     /// each subscribe call bootstraps its own subscriber cap, so
