@@ -200,7 +200,8 @@ pub fn decode_name(msg: &[u8], pos: usize) -> Result<(String, usize), DnsError> 
             0x00 => {
                 let len = b as usize;
                 if len == 0 {
-                    let total = consumed_at_first_pointer.unwrap_or(p + 1 - pos);
+                    let total = consumed_at_first_pointer
+                        .unwrap_or_else(|| (p + 1).saturating_sub(pos));
                     return Ok((name, total));
                 }
                 if len > 63 || p + 1 + len > msg.len() {

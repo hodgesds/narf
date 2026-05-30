@@ -8,6 +8,8 @@
 //! receiver crate stores the pointer in an `AtomicUsize` and
 //! reads it on demand, so the dep direction stays one-way.
 
+extern crate alloc;
+
 use core::fmt::Write as _;
 
 use narf_console as console;

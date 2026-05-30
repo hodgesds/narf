@@ -5193,7 +5193,10 @@ kernel_test_in!("net/bypass", smoke_bypass_umem_invalid_frame_size);
 
 fn smoke_bypass_ring_fill_rx_spsc() -> TestResult {
     crate::bypass::__reset_for_test();
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let mut parts = crate::bypass::XdpSocket::create(umem);
     let s0 = crate::bypass::UmemSlot { frame_idx: 0, len: 0 };
     let s1 = crate::bypass::UmemSlot { frame_idx: 1, len: 0 };
@@ -5216,7 +5219,10 @@ kernel_test_in!("net/bypass", smoke_bypass_ring_fill_rx_spsc);
 
 fn smoke_bypass_ring_tx_completion_spsc() -> TestResult {
     crate::bypass::__reset_for_test();
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let mut parts = crate::bypass::XdpSocket::create(umem);
     let slot = crate::bypass::UmemSlot { frame_idx: 1, len: 64 };
     parts.tx_prod.try_send(slot.pack()).expect("tx push");
@@ -5241,7 +5247,10 @@ kernel_test_in!("net/bypass", smoke_bypass_ring_tx_completion_spsc);
 fn smoke_bypass_classifier_per_flow_match() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-flow");
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let mut parts = crate::bypass::XdpSocket::create(umem);
     parts
         .fill_prod
@@ -5277,7 +5286,10 @@ kernel_test_in!("net/bypass", smoke_bypass_classifier_per_flow_match);
 fn smoke_bypass_classifier_no_match_pass_through() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-nopass");
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let parts = crate::bypass::XdpSocket::create(umem);
     let key = crate::bypass::FlowKey {
         src_ip: [0; 4],
@@ -5298,7 +5310,10 @@ kernel_test_in!("net/bypass", smoke_bypass_classifier_no_match_pass_through);
 fn smoke_bypass_classifier_wildcard_matches() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-wc");
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let mut parts = crate::bypass::XdpSocket::create(umem);
     parts
         .fill_prod
@@ -5317,8 +5332,14 @@ kernel_test_in!("net/bypass", smoke_bypass_classifier_wildcard_matches);
 fn smoke_bypass_classifier_lpm_more_specific_wins() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-lpm");
-    let umem_a = crate::bypass::Umem::register(8192, 2048).expect("umem-a");
-    let umem_b = crate::bypass::Umem::register(8192, 2048).expect("umem-b");
+    let umem_a = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
+    let umem_b = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let mut parts_a = crate::bypass::XdpSocket::create(umem_a);
     let mut parts_b = crate::bypass::XdpSocket::create(umem_b);
     parts_a
@@ -5377,7 +5398,10 @@ fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
         tx_prod,
         rx_cons,
     );
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let parts = crate::bypass::XdpSocket::create(umem);
     let socket = parts.socket.clone();
     match crate::stack::attach(&req, &stub, socket) {
@@ -5419,11 +5443,17 @@ fn smoke_bypass_daemon_attach_twice_fails() -> TestResult {
         tx_prod,
         rx_cons,
     );
-    let umem1 = crate::bypass::Umem::register(8192, 2048).expect("umem1");
+    let umem1 = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let parts1 = crate::bypass::XdpSocket::create(umem1);
     let _ = crate::stack::attach(&req, &stub, parts1.socket).expect("first attach");
 
-    let umem2 = crate::bypass::Umem::register(8192, 2048).expect("umem2");
+    let umem2 = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let parts2 = crate::bypass::XdpSocket::create(umem2);
     match crate::stack::attach(&req, &stub, parts2.socket) {
         Err(AttachError::InterfaceBusy) => TestResult::Pass,
@@ -5456,7 +5486,10 @@ fn smoke_bypass_daemon_attach_revoked_iface() -> TestResult {
         tx_prod,
         rx_cons,
     );
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let parts = crate::bypass::XdpSocket::create(umem);
     iface_cap.revoke();
     match crate::stack::attach(&req, &stub, parts.socket) {
@@ -5503,7 +5536,10 @@ kernel_test_in!("net/bypass", smoke_bypass_poll_mode_revoked_cap);
 fn smoke_bypass_xdp_socket_bind() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-bind");
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let parts = crate::bypass::XdpSocket::create(umem);
     if parts.socket.is_bound() {
         return TestResult::Fail("should start unbound");
@@ -5531,7 +5567,10 @@ kernel_test_in!("net/bypass", smoke_bypass_xdp_socket_bind);
 fn smoke_bypass_end_to_end_rx() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-e2e");
-    let umem = crate::bypass::Umem::register(8192, 2048).expect("umem");
+    let umem = match crate::bypass::Umem::register(8192, 2048) {
+        Ok(u) => u,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
     let mut parts = crate::bypass::XdpSocket::create(umem.clone());
     parts
         .fill_prod
