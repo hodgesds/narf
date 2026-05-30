@@ -20,6 +20,7 @@ pub fn install_all_hooks() {
     install_console_signal_hook();
     install_proc_hooks();
     install_net_stack();
+    install_procfs_net_hooks();
 }
 
 fn install_console_signal_hook() {
@@ -63,4 +64,244 @@ fn install_net_stack() {
             narf_scheduler::yield_now().await;
         }
     });
+}
+
+// ── /proc/net/* — bridge the net stack into procfs ──────────────
+//
+// The per-subsystem snapshot APIs live in `narf-net`; the per-file
+// renderers live in `narf-filesystem::procfs::net`. This module
+// stitches them together by installing fn-pointer hooks the
+// renderers call on every `read()`.
+//
+// Per-subsystem snapshot types differ between the source (typed
+// per crate) and the FS surface (a single SnapshotXxx wire-format
+// type per file). Tiny adapter fns convert one to the other.
+
+fn install_procfs_net_hooks() {
+    use narf_filesystem::procfs::net as pn;
+
+    pn::install_hooks(
+        tcp_adapter,
+        udp_adapter,
+        raw_adapter,
+        arp_adapter,
+        route_adapter,
+        iface_counters_adapter,
+        ipv6_ifaddr_adapter,
+        ipv6_route_adapter,
+        conntrack_adapter,
+        snmp_adapter,
+        igmp_adapter,
+        igmp6_adapter,
+        tcp6_adapter,
+        udp6_adapter,
+        raw6_adapter,
+    );
+    // Register the actual /proc/net/* files on the procfs registry.
+    pn::register_all();
+}
+
+fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
+    narf_net::tcp::core::snapshot()
+        .into_iter()
+        .map(|t| narf_filesystem::procfs::net::TcbSnapshot {
+            local_addr: t.local_addr,
+            local_port: t.local_port,
+            remote_addr: t.remote_addr,
+            remote_port: t.remote_port,
+            state_code: t.state_code,
+            tx_queue: t.tx_queue,
+            rx_queue: t.rx_queue,
+            retrnsmt: t.retrnsmt,
+            uid: 0,
+            timeout: 0,
+            inode: 0,
+        })
+        .collect()
+}
+
+fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnapshot> {
+    narf_net::udp_sock::snapshot()
+        .into_iter()
+        .map(|u| narf_filesystem::procfs::net::UdpSocketSnapshot {
+            local_addr: u.local_addr,
+            local_port: u.local_port,
+            remote_addr: u.remote_addr,
+            remote_port: u.remote_port,
+            state_code: u.state_code,
+            tx_queue: u.tx_queue,
+            rx_queue: u.rx_queue,
+            uid: 0,
+            inode: 0,
+        })
+        .collect()
+}
+
+fn raw_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RawSocketSnapshot> {
+    narf_net::raw_sock::snapshot()
+        .into_iter()
+        .map(|r| narf_filesystem::procfs::net::RawSocketSnapshot {
+            local_addr: r.local_addr,
+            local_port: r.local_port,
+            remote_addr: r.remote_addr,
+            remote_port: r.remote_port,
+            state_code: r.state_code,
+            uid: 0,
+            inode: 0,
+            protocol: r.protocol,
+        })
+        .collect()
+}
+
+fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
+    narf_net::arp_cache::snapshot()
+        .into_iter()
+        .map(|a| narf_filesystem::procfs::net::ArpSnapshot {
+            ip: a.ip,
+            mac: a.mac,
+            iface: a.iface,
+            flags: a.flags,
+        })
+        .collect()
+}
+
+fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapshot> {
+    narf_net::route::snapshot()
+        .into_iter()
+        .map(|r| narf_filesystem::procfs::net::RouteSnapshot {
+            iface: r.iface,
+            dst: r.dst,
+            gateway: r.gateway,
+            flags: r.flags,
+            refcnt: r.refcnt,
+            use_count: r.use_count,
+            metric: r.metric,
+            mask: r.mask,
+            mtu: r.mtu,
+            window: r.window,
+            irtt: r.irtt,
+        })
+        .collect()
+}
+
+fn iface_counters_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IfaceCounterSnapshot> {
+    narf_net::iface::snapshot_counters()
+        .into_iter()
+        .map(|c| narf_filesystem::procfs::net::IfaceCounterSnapshot {
+            name: c.name,
+            rx_bytes: c.rx_bytes,
+            rx_packets: c.rx_packets,
+            rx_errs: c.rx_errs,
+            rx_drop: c.rx_drop,
+            rx_fifo: c.rx_fifo,
+            rx_frame: c.rx_frame,
+            rx_compressed: c.rx_compressed,
+            rx_multicast: c.rx_multicast,
+            tx_bytes: c.tx_bytes,
+            tx_packets: c.tx_packets,
+            tx_errs: c.tx_errs,
+            tx_drop: c.tx_drop,
+            tx_fifo: c.tx_fifo,
+            tx_colls: c.tx_colls,
+            tx_carrier: c.tx_carrier,
+            tx_compressed: c.tx_compressed,
+        })
+        .collect()
+}
+
+fn ipv6_ifaddr_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6IfAddrSnapshot> {
+    narf_net::ipv6::addrs::snapshot()
+        .into_iter()
+        .map(|a| narf_filesystem::procfs::net::Ipv6IfAddrSnapshot {
+            iface: a.iface,
+            addr: a.addr,
+            ifindex: a.ifindex,
+            prefix_len: a.prefix_len,
+            scope: a.scope,
+            flags: a.flags,
+        })
+        .collect()
+}
+
+fn ipv6_route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6RouteSnapshot> {
+    narf_net::ipv6::route::snapshot()
+        .into_iter()
+        .map(|r| narf_filesystem::procfs::net::Ipv6RouteSnapshot {
+            dst: r.dst,
+            dst_prefix_len: r.dst_prefix_len,
+            src: r.src,
+            src_prefix_len: r.src_prefix_len,
+            gateway: r.gateway,
+            metric: r.metric,
+            refcnt: r.refcnt,
+            use_count: r.use_count,
+            flags: r.flags,
+            iface: r.iface,
+        })
+        .collect()
+}
+
+fn conntrack_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ConntrackSnapshot> {
+    narf_net::netfilter::conntrack::snapshot()
+        .into_iter()
+        .map(|c| narf_filesystem::procfs::net::ConntrackSnapshot {
+            l3proto: c.l3proto,
+            l3proto_num: c.l3proto_num,
+            l4proto: c.l4proto,
+            l4proto_num: c.l4proto_num,
+            timeout: c.timeout,
+            state: c.state,
+            orig_src: c.orig_src,
+            orig_dst: c.orig_dst,
+            orig_sport: c.orig_sport,
+            orig_dport: c.orig_dport,
+            reply_src: c.reply_src,
+            reply_dst: c.reply_dst,
+            reply_sport: c.reply_sport,
+            reply_dport: c.reply_dport,
+            assured: c.assured,
+            use_count: c.use_count,
+        })
+        .collect()
+}
+
+fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
+    // SNMP counters live in atomic globals across the net stack;
+    // until those land in narf_net, surface a baseline MIB with
+    // the static defaults RFC 1213 specifies as well-known.
+    narf_filesystem::procfs::net::SnmpMib {
+        ip_forwarding: 2,    // 1=router, 2=host (NARF: host today)
+        ip_default_ttl: 64,
+        tcp_rto_algorithm: 1, // 1=other, 2=constant, 3=mil-std-1778, 4=van-jacobson
+        tcp_rto_min: 200,
+        tcp_rto_max: 120_000,
+        tcp_max_conn: -1i64 as u64, // unbounded
+        ..Default::default()
+    }
+}
+
+fn igmp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IgmpSnapshot> {
+    // IGMP membership tracking lives in pkt_dhcp / dhcp paths and
+    // isn't centralised yet. Return empty — the header line still
+    // renders so libnetfilter-mcast probes don't fail.
+    alloc::vec::Vec::new()
+}
+
+fn igmp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Igmp6Snapshot> {
+    // MLD membership: same status as IGMP — empty until centralised.
+    alloc::vec::Vec::new()
+}
+
+fn tcp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
+    // IPv6 TCP sockets ride the same tcp::core table today; the
+    // stack maps IPv4 + IPv6 onto separate TCBs once that lands.
+    alloc::vec::Vec::new()
+}
+
+fn udp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSnapshot> {
+    alloc::vec::Vec::new()
+}
+
+fn raw6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Raw6SocketSnapshot> {
+    alloc::vec::Vec::new()
 }
