@@ -182,4 +182,6 @@ pub fn register_msr_driver() {
         description: "Intel CPU core temperature",
         bus_loc: "msr",
     });
+    use alloc::sync::Arc;
+    registry::register_device(Arc::new(Coretemp::new(tjmax, 0)));
 }

@@ -390,7 +390,8 @@ pub fn register_isa_driver() {
                     description: chip.name(),
                     bus_loc: "isa",
                 });
-                // TODO: store Nct6775 in a global once Arc path lands.
+                use alloc::sync::Arc;
+                registry::register_device(Arc::new(Nct6775::new(chip, chip_id, idx, dat)));
                 return;
             }
         }

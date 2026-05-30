@@ -257,4 +257,6 @@ pub fn register_smm_driver() {
         description: "Dell SMM fan/temperature",
         bus_loc: "smm",
     });
+    use alloc::sync::Arc;
+    registry::register_device(Arc::new(DellSmm::new()));
 }

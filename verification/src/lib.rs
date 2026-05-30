@@ -48,6 +48,12 @@ static __FORCE_LINK_SOUND: fn() -> usize = || {
     narf_drivers_sound::card_count()
 };
 
+extern crate narf_drivers_hwmon;
+#[used]
+static __FORCE_LINK_HWMON: fn() -> usize = || {
+    narf_drivers_hwmon::registry::count()
+};
+
 use core::fmt::Write;
 
 use narf_console::Writer;

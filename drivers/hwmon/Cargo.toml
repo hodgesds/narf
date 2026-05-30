@@ -16,8 +16,9 @@ narf-lib          = { path = "../../lib" }
 narf-bus          = { path = "../../bus" }
 narf-arch         = { path = "../../arch" }
 narf-capabilities = { path = "../../capabilities" }
-narf-init         = { path = "../../init" }
 narf-console      = { path = "../../console" }
+narf-filesystem   = { path = "../../filesystem" }
+narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [lints]

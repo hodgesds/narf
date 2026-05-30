@@ -273,9 +273,8 @@ fn probe_k10temp(dev: narf_bus::BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Re
         description: chip.description,
         bus_loc: "pci",
     });
-    // Store the device in the global registry for use by hwmon reads.
-    let _device = K10temp::new(bus, slot, func, chip);
-    // TODO: move into global Arc<K10temp> registry once arc path lands.
+    use alloc::sync::Arc;
+    registry::register_device(Arc::new(K10temp::new(bus, slot, func, chip)));
     Ok(())
 }
 

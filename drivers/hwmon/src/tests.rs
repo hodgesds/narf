@@ -257,3 +257,205 @@ fn smoke_hwmon_registry() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/hwmon/registry", smoke_hwmon_registry);
+
+// ── sysfs bridge ──────────────────────────────────────────────────────
+
+/// After registering a k10temp device and populating the hwmon class,
+/// `/sys/class/hwmon/hwmon0` appears with a `name` attribute.
+fn smoke_bridge_k10temp_hwmon0_enumerated() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let chip = match chip_info(AMD_RENOIR_NB) {
+        Some(c) => c,
+        None => return TestResult::Fail("Renoir chip info missing"),
+    };
+    let dev = K10temp::new(0, 0, 0, chip);
+    crate::registry::register_device(Arc::new(dev));
+    crate::sysfs_bridge::populate_hwmon_class();
+    // /sys/class/hwmon/hwmon0 must exist.
+    let root = narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"));
+    if root.is_none() {
+        return TestResult::Fail("hwmon0 kobject not found under /sys/class/hwmon/");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_k10temp_hwmon0_enumerated);
+
+/// `hwmon0/name` returns the chip name (`"k10temp\n"`).
+fn smoke_bridge_name_attr_reads_k10temp() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let chip = match chip_info(AMD_RENOIR_NB) {
+        Some(c) => c,
+        None => return TestResult::Fail("Renoir chip info missing"),
+    };
+    crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    match kobj.attr_show("name") {
+        Some(s) if s == "k10temp\n" => TestResult::Pass,
+        Some(s) => {
+            let _ = s;
+            TestResult::Fail("hwmon0/name did not return 'k10temp\\n'")
+        }
+        None => TestResult::Fail("hwmon0/name attr missing"),
+    }
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_name_attr_reads_k10temp);
+
+/// `temp1_input` attr exists and returns ASCII digits (the value may
+/// be 0 if no hardware is accessible in the test environment).
+fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::k10temp::{K10temp, chip_info, AMD_PHOENIX_NB};
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let chip = match chip_info(AMD_PHOENIX_NB) {
+        Some(c) => c,
+        None => return TestResult::Fail("Phoenix chip info missing"),
+    };
+    crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    match kobj.attr_show("temp1_input") {
+        Some(s) => {
+            // Value must be a number (possibly "0\n" in test env).
+            let trimmed = s.trim();
+            if trimmed.parse::<i64>().is_err() {
+                return TestResult::Fail("temp1_input is not numeric ASCII");
+            }
+            TestResult::Pass
+        }
+        None => TestResult::Fail("temp1_input attr missing from hwmon0"),
+    }
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_temp1_input_returns_ascii);
+
+/// `temp1_label` returns the label string with a newline.
+fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let chip = match chip_info(AMD_RENOIR_NB) {
+        Some(c) => c,
+        None => return TestResult::Fail("Renoir chip info missing"),
+    };
+    crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    match kobj.attr_show("temp1_label") {
+        // k10temp's first label is "Tctl"
+        Some(s) if s.trim_end_matches('\n') == "Tctl" => TestResult::Pass,
+        Some(s) => {
+            let _ = s;
+            TestResult::Fail("temp1_label did not return 'Tctl'")
+        }
+        None => TestResult::Fail("temp1_label attr missing"),
+    }
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_temp1_label_returns_tctl);
+
+/// Two devices produce hwmon0 and hwmon1.
+fn smoke_bridge_multiple_devices_enumerated() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
+    use crate::coretemp::Coretemp;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let chip = match chip_info(AMD_RENOIR_NB) {
+        Some(c) => c,
+        None => return TestResult::Fail("Renoir chip info missing"),
+    };
+    crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
+    crate::registry::register_device(Arc::new(Coretemp::new(100, 0)));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let class_hwmon = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("/sys/class/hwmon not found"),
+    };
+    let names = class_hwmon.child_names();
+    if !names.iter().any(|n| n == "hwmon0") {
+        return TestResult::Fail("hwmon0 missing");
+    }
+    if !names.iter().any(|n| n == "hwmon1") {
+        return TestResult::Fail("hwmon1 missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_multiple_devices_enumerated);
+
+/// NCT6779D has 5 fans; bridge should expose fan1_input through fan5_input.
+fn smoke_bridge_nct6779d_five_fan_inputs() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::nct6775::{Nct6775, NctChip, NCT6779D_ID};
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let dev = Nct6775::new(NctChip::Nct6779D, NCT6779D_ID, 0x2E, 0x2F);
+    crate::registry::register_device(Arc::new(dev));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    for i in 1u32..=5 {
+        let attr = alloc::format!("fan{}_input", i);
+        if kobj.attr_show(&attr).is_none() {
+            return TestResult::Fail("NCT6779D fan attr missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_nct6779d_five_fan_inputs);
+
+/// `update_interval` attr exists and returns "1000\n".
+fn smoke_bridge_update_interval_attr() -> TestResult {
+    use alloc::sync::Arc;
+    use crate::coretemp::Coretemp;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(Coretemp::new(105, 0)));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    match kobj.attr_show("update_interval") {
+        Some(s) if s == "1000\n" => TestResult::Pass,
+        Some(_) => TestResult::Fail("update_interval did not return '1000\\n'"),
+        None => TestResult::Fail("update_interval attr missing"),
+    }
+}
+kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_update_interval_attr);

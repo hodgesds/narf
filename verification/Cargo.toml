@@ -63,6 +63,7 @@ narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }
 narf-drivers-sound = { path = "../drivers/sound" }
+narf-drivers-hwmon = { path = "../drivers/hwmon" }
 narf-compat-win   = { path = "../compat/win" }
 
 [features]

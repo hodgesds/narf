@@ -28,6 +28,7 @@ pub mod dell_smm;
 pub mod k10temp;
 pub mod nct6775;
 pub mod registry;
+pub mod sysfs_bridge;
 
 mod tests;
 
@@ -78,6 +79,11 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "hwmon-dell-smm", || {
         #[cfg(target_arch = "x86_64")]
         dell_smm::register_smm_driver();
+        InitResult::Ok
+    });
+    // Stage::Late: sysfs bridge runs after all Stage::Subsys driver probes.
+    narf_init::register(Stage::Late, "hwmon-sysfs-bridge", || {
+        sysfs_bridge::populate_hwmon_class();
         InitResult::Ok
     });
 }
