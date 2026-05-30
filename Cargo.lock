@@ -714,6 +714,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-backlight"
+version = "0.0.0"
+dependencies = [
+ "narf-aml",
+ "narf-capabilities",
+ "narf-console",
+ "narf-init",
+ "narf-input",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-drivers-crypto"
 version = "0.0.0"
 dependencies = [
@@ -1661,6 +1676,7 @@ dependencies = [
  "narf-arch",
  "narf-capabilities",
  "narf-console",
+ "narf-event-bus",
  "narf-init",
  "narf-interrupts",
  "narf-kernel-test",

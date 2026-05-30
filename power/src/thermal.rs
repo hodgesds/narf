@@ -22,7 +22,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, NoopOp};
+use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, NoopOp, Read, Write};
+use narf_event_bus::{
+    create_topic, lookup_topic, PublishError, Publisher as BusPublisher, Subscriber as BusSubscriber,
+    TopicRegistry,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Cap-type marker for the thermal control surface.
@@ -87,8 +91,6 @@ pub enum ThermalState {
     Critical,
 }
 
-type Subscriber = Box<dyn Fn(&ThermalEvent) + Send + Sync + 'static>;
-
 /// A device that can reduce system temperature (Fan, Throttle, etc.).
 pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
     fn name(&self) -> &'static str;
@@ -96,9 +98,21 @@ pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
     fn set_level(&self, level: u8);
 }
 
+/// Topic name for thermal events. Reserved-root `power.` namespace
+/// — only kernel can mint. Phase 1 ships a single per-system topic;
+/// per-zone topics (`power.thermal.<zone>`) land when wildcards
+/// arrive in Phase 2.
+pub const TOPIC: &str = "power.thermal";
+
+/// Ring capacity. Thermal crossings are rare (human-perceptible
+/// scale); 64 slots covers any reasonable burst at boot.
+pub const CAPACITY: usize = 64;
+
 struct Registry {
     zones: Vec<ThermalZone>,
-    subscribers: Vec<Subscriber>,
+    /// Bus publisher; minted at `init()` time. Replaces the old
+    /// `subscribers: Vec<Box<dyn Fn(&ThermalEvent)>>` callback list.
+    publisher: Option<BusPublisher<ThermalEvent>>,
     cooling_devices: Vec<alloc::sync::Arc<dyn CoolingDevice>>,
     /// Active-cooling governor. When set, each thermal-event dispatch
     /// computes a level via the policy and drives every cooling
@@ -111,7 +125,7 @@ impl core::fmt::Debug for Registry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Registry")
             .field("zones", &self.zones.len())
-            .field("subscribers", &self.subscribers.len())
+            .field("publisher", &self.publisher.is_some())
             .field("cooling_devices", &self.cooling_devices.len())
             .field("policy", &self.policy.is_some())
             .finish()
@@ -135,12 +149,21 @@ impl From<CapError> for ThermalError {
 }
 
 /// Initialise the thermal registry. Safe to call more than once —
-/// re-initialisation clears the zone + subscriber tables and installs
-/// the default `StepPolicy` active-cooling governor.
+/// re-initialisation clears the zone tables, mints a fresh bus
+/// publisher for `power.thermal`, and installs the default
+/// `StepPolicy` active-cooling governor.
 pub fn init() {
+    narf_event_bus::init();
+    let reg_cap: Cap<TopicRegistry, Write> = Cap::bootstrap();
+    let publisher = match create_topic::<ThermalEvent>(&reg_cap, TOPIC, CAPACITY) {
+        Ok((_id, p)) => Some(p),
+        // NameTaken happens on `init()` re-entry (the bus topic
+        // remains live across resets); not a fatal failure.
+        Err(_) => None,
+    };
     *REG.lock() = Some(Registry {
         zones: Vec::new(),
-        subscribers: Vec::new(),
+        publisher,
         cooling_devices: Vec::new(),
         policy: Some(Box::new(StepPolicy)),
     });
@@ -189,16 +212,12 @@ pub fn register_zone(
     Ok(id)
 }
 
-/// Install a subscriber for thermal events.
-pub fn subscribe<F>(cap: &Cap<Thermal, Grant>, cb: F) -> Result<(), ThermalError>
-where
-    F: Fn(&ThermalEvent) + Send + Sync + 'static,
-{
-    cap.invoke(NoopOp)?;
-    let mut r = REG.lock();
-    let reg = r.as_mut().ok_or(ThermalError::NotInitialised)?;
-    reg.subscribers.push(Box::new(cb));
-    Ok(())
+/// Mint a fresh `Subscriber<ThermalEvent>` for the `power.thermal`
+/// topic. Replaces the old callback-list `subscribe(cap, cb)`. The
+/// caller drains in its own async task via
+/// `Subscriber::next().await`.
+pub fn subscribe(reg: &Cap<TopicRegistry, Read>) -> Result<BusSubscriber<ThermalEvent>, ThermalError> {
+    lookup_topic::<ThermalEvent>(reg, TOPIC).map_err(|_| ThermalError::NotInitialised)
 }
 
 /// Record a temperature reading on `zone`; synchronously emit any
@@ -224,8 +243,13 @@ pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError
             ThermalState::Warm => ThermalEvent::Warm { zone, milli_c },
             ThermalState::Critical => ThermalEvent::Critical { zone, milli_c },
         };
-        for cb in &reg.subscribers {
-            cb(&event);
+        // Publish onto the bus topic. Wait-free; never blocks; a
+        // slow subscriber sees a `Gapped` signal on its next
+        // `recv()` rather than slowing the producer.
+        if let Some(p) = reg.publisher.as_ref() {
+            match p.publish(event) {
+                Ok(_) | Err(PublishError::CapRevoked) | Err(PublishError::NoArena) => {}
+            }
         }
         // Drive the active-cooling governor inline. Walking
         // `cooling_devices` under the lock we already hold avoids any
@@ -276,6 +300,7 @@ pub fn zones_snapshot() -> Vec<(String, i32, ThermalState)> {
 #[doc(hidden)]
 pub fn __test_reset() {
     *REG.lock() = None;
+    narf_event_bus::__registry_reset_for_test();
 }
 
 // ── Active-cooling governor ─────────────────────────────────────────

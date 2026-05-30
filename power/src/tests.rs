@@ -1031,60 +1031,61 @@ kernel_test_in!(
 // ── relocated from verification (subsystem 'power') ──
 
 fn smoke_power_thermal_zone_transitions() -> TestResult {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_capabilities::{Cap, Grant};
+    use narf_capabilities::{Cap, Grant, Read};
+    use narf_event_bus::TopicRegistry;
     use crate::{thermal, Thermal, ThermalEvent, ThermalState};
 
     thermal::__test_reset();
     thermal::init();
-
-    static LAST: AtomicU8 = AtomicU8::new(0);
-    LAST.store(0, Ordering::Relaxed);
 
     let cap: Cap<Thermal, Grant> = Cap::bootstrap();
     let id = match thermal::register_zone(&cap, "cpu0", 70_000, 95_000) {
         Ok(id) => id,
         Err(_) => return TestResult::Fail("register_zone failed"),
     };
-    if thermal::subscribe(&cap, |ev| {
-        let code = match ev {
-            ThermalEvent::Normal { .. } => 1,
-            ThermalEvent::Warm { .. } => 2,
-            ThermalEvent::Critical { .. } => 3,
-        };
-        LAST.store(code, Ordering::Relaxed);
-    })
-    .is_err()
-    {
-        return TestResult::Fail("subscribe failed");
-    }
+    let reg_r: Cap<TopicRegistry, Read> = Cap::bootstrap();
+    let mut sub = match thermal::subscribe(&reg_r) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("subscribe failed"),
+    };
+
+    // Helper to drain the next event into a code mirroring the old
+    // 1/2/3 = Normal/Warm/Critical mapping.
+    let drain = |sub: &mut narf_event_bus::Subscriber<ThermalEvent>| -> u8 {
+        match sub.try_next() {
+            Ok(Some((_seq, ThermalEvent::Normal { .. }))) => 1,
+            Ok(Some((_seq, ThermalEvent::Warm { .. }))) => 2,
+            Ok(Some((_seq, ThermalEvent::Critical { .. }))) => 3,
+            _ => 0,
+        }
+    };
 
     // 50_000 milli_C → still Normal, no event (Normal → Normal).
     if thermal::record_temp(id, 50_000).unwrap() != ThermalState::Normal {
         return TestResult::Fail("50C classified wrong");
     }
-    if LAST.load(Ordering::Relaxed) != 0 {
+    if drain(&mut sub) != 0 {
         return TestResult::Fail("no event should fire Normal→Normal");
     }
     // 75_000 → Warm; event fires.
     if thermal::record_temp(id, 75_000).unwrap() != ThermalState::Warm {
         return TestResult::Fail("75C classified wrong");
     }
-    if LAST.load(Ordering::Relaxed) != 2 {
+    if drain(&mut sub) != 2 {
         return TestResult::Fail("Warm event did not fire");
     }
     // 96_000 → Critical; event fires.
     if thermal::record_temp(id, 96_000).unwrap() != ThermalState::Critical {
         return TestResult::Fail("96C classified wrong");
     }
-    if LAST.load(Ordering::Relaxed) != 3 {
+    if drain(&mut sub) != 3 {
         return TestResult::Fail("Critical event did not fire");
     }
     // Back to 40_000 → Normal again; event fires.
     if thermal::record_temp(id, 40_000).unwrap() != ThermalState::Normal {
         return TestResult::Fail("40C classified wrong");
     }
-    if LAST.load(Ordering::Relaxed) != 1 {
+    if drain(&mut sub) != 1 {
         return TestResult::Fail("Normal return event did not fire");
     }
 

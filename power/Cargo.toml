@@ -24,6 +24,7 @@ narf-capabilities = { path = "../capabilities" }
 narf-acpi         = { path = "../acpi" }
 narf-aml          = { path = "../aml" }
 narf-interrupts   = { path = "../interrupts" }
+narf-event-bus    = { path = "../event_bus" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
