@@ -51,6 +51,7 @@ pub mod leds_input_caps;
 pub mod leds_input_num;
 pub mod leds_input_scroll;
 pub mod leds_pwm;
+pub mod sysfs_bridge;
 pub mod triggers;
 
 // Re-export the core types at crate root for convenience.
@@ -82,6 +83,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "leds/class", || {
         // LED class has no hardware to probe; it is always present.
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Device, "leds/sysfs", || {
+        sysfs_bridge::populate_leds_class();
         InitResult::Ok
     });
 }
