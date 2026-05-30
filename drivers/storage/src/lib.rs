@@ -28,6 +28,9 @@ mod tests;
 /// Stage::Subsys + Stage::Device initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // SD/MMC block device bridge: register_card() is called at probe
+    // time by the RTSX driver; no additional initcall needed here.
+    // Linux ref: `drivers/mmc/core/block.c:mmc_blk_alloc_req`.
     narf_init::register(Stage::Subsys, "ahci", || {
         ahci::register_pci_driver();
         InitResult::Ok

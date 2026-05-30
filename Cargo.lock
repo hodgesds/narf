@@ -1487,6 +1487,7 @@ dependencies = [
  "narf-drivers-thunderbolt",
  "narf-drivers-usb",
  "narf-drivers-usbpd",
+ "narf-drivers-video",
  "narf-drivers-virtio",
  "narf-drivers-wireless",
  "narf-edid",

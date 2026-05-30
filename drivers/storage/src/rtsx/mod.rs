@@ -31,6 +31,7 @@
 //!
 //! Cited and adapted under NARF's GPL-2.0-or-later licence.
 
+pub mod block_bridge;
 pub mod card;
 pub mod cmd;
 pub mod regs;

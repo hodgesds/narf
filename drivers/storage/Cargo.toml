@@ -20,6 +20,7 @@ narf-io           = { path = "../../io" }
 narf-memory       = { path = "../../memory" }
 narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
+narf-filesystem   = { path = "../../filesystem" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-interrupts   = { path = "../../interrupts" }
