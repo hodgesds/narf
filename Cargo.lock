@@ -523,7 +523,9 @@ name = "narf-aml"
 version = "0.0.0"
 dependencies = [
  "narf-acpi",
+ "narf-capabilities",
  "narf-console",
+ "narf-event-bus",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
@@ -1059,6 +1061,24 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-sound"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-drivers",
+ "narf-init",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
  "narf-time",
 ]
 

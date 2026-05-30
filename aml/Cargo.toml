@@ -18,6 +18,8 @@ narf-acpi        = { path = "../acpi" }
 narf-memory      = { path = "../memory" }
 narf-time        = { path = "../time" }
 narf-scheduler   = { path = "../scheduler" }
+narf-capabilities = { path = "../capabilities" }
+narf-event-bus   = { path = "../event_bus" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]

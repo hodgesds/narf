@@ -36,6 +36,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use narf_capabilities::{Cap, Read, Write};
+use narf_event_bus::{
+    create_topic, lookup_topic, PublishError, Publisher, Subscriber, TopicRegistry,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::Value;
@@ -83,48 +87,65 @@ pub enum ButtonEvent {
     SleepPressed,
 }
 
-// ── Subscriber registry ───────────────────────────────────────────────────────
+// ── Event-bus topic ───────────────────────────────────────────────────────────
+//
+// Hard cutover (Phase 1 of the event-bus migration): the previous
+// fixed-size `[Option<ButtonHandler>; 8]` slot array has been
+// removed in this commit. Subscribers now mint a
+// `Subscriber<ButtonEvent>` via `subscribe(reg)` and drain via
+// `Subscriber::next().await` in their own task. The internal
+// `fan_out` is replaced by `publish_event`, which routes to the
+// cached topic publisher.
 
-/// Handler invoked on every dispatched event. Runs in the calling
-/// context (Notify dispatch from AML eval, or SCI bottom-half for
-/// fixed-hardware) — handlers must not block.
-pub type ButtonHandler = fn(ButtonEvent);
+/// Topic name (reserved-root `acpi.` namespace — kernel-only mint).
+pub const TOPIC: &str = "acpi.button";
 
-/// Slot-based subscriber list. Capped so we don't grow unbounded
-/// across module init calls; 8 slots are plenty for the OS-side
-/// consumers we expect (power policy, FB blank, TTY, observability).
-const MAX_SUBSCRIBERS: usize = 8;
+/// Ring capacity. Button presses are human-rate; 32 covers double-
+/// taps and any reasonable burst.
+pub const CAPACITY: usize = 32;
 
-static SUBSCRIBERS: IrqSafeSpinLock<[Option<ButtonHandler>; MAX_SUBSCRIBERS]> =
-    IrqSafeSpinLock::new([None; MAX_SUBSCRIBERS]);
+/// Cached publisher minted at [`init_topic`] time. Held under an
+/// `IrqSafeSpinLock` because publishes happen from SCI bottom-half
+/// (IRQ context).
+static PUBLISHER: IrqSafeSpinLock<Option<Publisher<ButtonEvent>>> = IrqSafeSpinLock::new(None);
 
-/// Register a handler to receive every [`ButtonEvent`]. Returns true
-/// if the handler was installed; false when every slot is already
-/// occupied (which usually means a buggy init flow is registering
-/// the same handler dozens of times).
-pub fn subscribe(handler: ButtonHandler) -> bool {
-    let mut g = SUBSCRIBERS.lock();
-    for slot in g.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(handler);
-            return true;
-        }
+/// Initialise the event-bus topic. Idempotent. Separate from
+/// `init()` (which discovers ACPI devices) so callers that want the
+/// topic open before namespace bring-up can request it explicitly.
+pub fn init_topic() {
+    let g = PUBLISHER.lock();
+    if g.is_some() {
+        return;
     }
-    false
+    drop(g);
+    narf_event_bus::init();
+    let reg: Cap<TopicRegistry, Write> = Cap::bootstrap();
+    if let Ok((_id, publisher)) = create_topic::<ButtonEvent>(&reg, TOPIC, CAPACITY) {
+        *PUBLISHER.lock() = Some(publisher);
+    }
 }
 
-/// Dispatch `ev` to every registered subscriber. Snapshots the
-/// handler list under the lock and calls handlers with the lock
-/// released so a subscriber that re-enters (e.g. logs through
-/// `narf_console`) can't deadlock.
-fn fan_out(ev: ButtonEvent) {
-    let handlers: [Option<ButtonHandler>; MAX_SUBSCRIBERS] = {
-        let g = SUBSCRIBERS.lock();
-        *g
-    };
-    for h in handlers.iter().filter_map(|s| s.as_ref()) {
-        h(ev);
+/// Mint a fresh `Subscriber<ButtonEvent>` for the topic. Replaces
+/// the old `subscribe(fn(ButtonEvent))` registration. The caller
+/// drains in its own async task.
+pub fn subscribe(reg: &Cap<TopicRegistry, Read>) -> Option<Subscriber<ButtonEvent>> {
+    lookup_topic::<ButtonEvent>(reg, TOPIC).ok()
+}
+
+/// Publish a button event onto the topic. Wait-free at the
+/// publisher; safe from IRQ context.
+fn publish_event(ev: ButtonEvent) {
+    let g = PUBLISHER.lock();
+    if let Some(p) = g.as_ref() {
+        match p.publish(ev) {
+            Ok(_) | Err(PublishError::CapRevoked) | Err(PublishError::NoArena) => {}
+        }
     }
+}
+
+/// Alias kept so the existing `fan_out(ev)` call sites compile.
+fn fan_out(ev: ButtonEvent) {
+    publish_event(ev);
 }
 
 // ── Lid state ─────────────────────────────────────────────────────────────────
@@ -355,11 +376,12 @@ fn matching_devices(target_hid: &str) -> Vec<String> {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     INIT_DONE.store(false, Ordering::Release);
-    SUBSCRIBERS.lock().iter_mut().for_each(|s| *s = None);
+    *PUBLISHER.lock() = None;
     *LID_PATH.lock() = None;
     *LID_STATE.lock() = None;
     POWER_PRESSES.store(0, Ordering::Release);
     SLEEP_PRESSES.store(0, Ordering::Release);
+    narf_event_bus::__registry_reset_for_test();
 }
 
 // ── Smokes ────────────────────────────────────────────────────────────────────
@@ -406,56 +428,38 @@ fn smoke_buttons_pwrbtn_sts_bit_position() -> TestResult {
 }
 kernel_test_in!("aml", smoke_buttons_pwrbtn_sts_bit_position);
 
-/// Subscribe + dispatch round-trip with a fake notifier: register a
-/// handler, fire the lid notify handler against a synthetic AML
-/// namespace, observe the typed event.
+/// Subscribe + dispatch round-trip via the event-bus topic. After
+/// migration the slot-based registry is gone; the smoke mints a
+/// `Subscriber<ButtonEvent>` and drains via `try_next` after each
+/// publish path.
 fn smoke_buttons_subscribe_dispatch_round_trip() -> TestResult {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: AtomicU32 = AtomicU32::new(0);
-    static LAST: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
-    fn h(ev: ButtonEvent) {
-        SEEN.fetch_add(1, Ordering::Relaxed);
-        LAST.store(
-            match ev {
-                ButtonEvent::LidClosed => 0,
-                ButtonEvent::LidOpened => 1,
-                ButtonEvent::PowerPressed => 2,
-                ButtonEvent::SleepPressed => 3,
-            },
-            Ordering::Relaxed,
-        );
-    }
-
     __reset_for_test();
-    SEEN.store(0, Ordering::Relaxed);
-    LAST.store(0xFFFF_FFFF, Ordering::Relaxed);
-
-    if !subscribe(h) {
-        return TestResult::Fail("subscribe should succeed in a fresh state");
-    }
-    // Direct fan_out path — exercises the slot-based registry without
+    init_topic();
+    let reg_r: Cap<TopicRegistry, Read> = Cap::bootstrap();
+    let mut sub = match subscribe(&reg_r) {
+        Some(s) => s,
+        None => return TestResult::Fail("subscribe should succeed once topic is open"),
+    };
+    // Direct fan_out path — exercises the publish step without
     // needing AML evaluation.
     fan_out(ButtonEvent::PowerPressed);
-    if SEEN.load(Ordering::Relaxed) != 1 {
-        return TestResult::Fail("subscriber not called for PowerPressed");
+    match sub.try_next() {
+        Ok(Some((_seq, ButtonEvent::PowerPressed))) => {}
+        _ => return TestResult::Fail("subscriber didn't receive PowerPressed"),
     }
-    if LAST.load(Ordering::Relaxed) != 2 {
-        return TestResult::Fail("subscriber saw wrong variant");
-    }
-    // Also exercise the SCI bottom-half entry point: this bumps
-    // POWER_PRESSES (the fan_out path above does NOT — it bypasses
-    // the counter so the test can keep the two paths separable).
+    // SCI bottom-half entry point also publishes and bumps the
+    // counter.
     record_pwrbtn_sts();
-    if SEEN.load(Ordering::Relaxed) != 2 {
-        return TestResult::Fail("record_pwrbtn_sts didn't dispatch");
+    match sub.try_next() {
+        Ok(Some((_seq, ButtonEvent::PowerPressed))) => {}
+        _ => return TestResult::Fail("record_pwrbtn_sts didn't publish"),
     }
     if drain_power_presses() != 1 {
-        return TestResult::Fail("drain_power_presses should return 1 (single record_pwrbtn_sts)");
+        return TestResult::Fail("drain_power_presses should return 1");
     }
     if drain_power_presses() != 0 {
         return TestResult::Fail("drain_power_presses should zero on re-drain");
     }
-    // Multiple SCI events accumulate.
     record_pwrbtn_sts();
     record_pwrbtn_sts();
     record_pwrbtn_sts();
@@ -473,25 +477,28 @@ kernel_test_in!("aml", smoke_buttons_subscribe_dispatch_round_trip);
 /// event.
 fn smoke_buttons_notify_dispatch_on_pnp0c0d() -> TestResult {
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static EVENTS: AtomicU32 = AtomicU32::new(0);
-    fn handler(ev: ButtonEvent) {
-        // Encode: bit0 = LidOpened seen, bit1 = LidClosed seen.
-        match ev {
-            ButtonEvent::LidOpened => {
-                EVENTS.fetch_or(1, Ordering::Relaxed);
-            }
-            ButtonEvent::LidClosed => {
-                EVENTS.fetch_or(2, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
 
     crate::__reset_for_test();
     crate::sync::__reset_for_test();
     __reset_for_test();
-    EVENTS.store(0, Ordering::Relaxed);
+    init_topic();
+    let reg_r: Cap<TopicRegistry, Read> = Cap::bootstrap();
+    let mut sub = match subscribe(&reg_r) {
+        Some(s) => s,
+        None => return TestResult::Fail("subscribe failed"),
+    };
+    // Drain into the same bit encoding as the pre-migration smoke.
+    fn drain_bits(sub: &mut Subscriber<ButtonEvent>) -> u32 {
+        let mut bits = 0u32;
+        while let Ok(Some((_seq, ev))) = sub.try_next() {
+            match ev {
+                ButtonEvent::LidOpened => bits |= 1,
+                ButtonEvent::LidClosed => bits |= 2,
+                _ => {}
+            }
+        }
+        bits
+    }
 
     // Synthetic AML blob:
     //   Device(\LID_) {
@@ -560,11 +567,8 @@ fn smoke_buttons_notify_dispatch_on_pnp0c0d() -> TestResult {
         return TestResult::Fail("\\LID device _HID didn't resolve to PNP0C0D");
     }
 
-    // Subscribe and init — init evaluates _LID once and dispatches
-    // the initial open state.
-    if !subscribe(handler) {
-        return TestResult::Fail("subscribe failed");
-    }
+    // init evaluates _LID once and publishes the initial open
+    // state onto the bus.
     let summary = init();
     if summary.lids == 0 {
         return TestResult::Fail("init() didn't discover the lid device");
@@ -572,7 +576,8 @@ fn smoke_buttons_notify_dispatch_on_pnp0c0d() -> TestResult {
     if current_lid_state() != Some(true) {
         return TestResult::Fail("initial _LID should evaluate to open (1)");
     }
-    if EVENTS.load(Ordering::Relaxed) & 1 == 0 {
+    let bits = drain_bits(&mut sub);
+    if bits & 1 == 0 {
         return TestResult::Fail("initial LidOpened event not dispatched");
     }
 
@@ -588,7 +593,8 @@ fn smoke_buttons_notify_dispatch_on_pnp0c0d() -> TestResult {
     if current_lid_state() != Some(false) {
         return TestResult::Fail("Notify did not transition lid to closed");
     }
-    if EVENTS.load(Ordering::Relaxed) & 2 == 0 {
+    let bits = drain_bits(&mut sub);
+    if bits & 2 == 0 {
         return TestResult::Fail("LidClosed event not dispatched on notify");
     }
     TestResult::Pass
