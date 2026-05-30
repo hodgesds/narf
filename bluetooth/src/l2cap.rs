@@ -501,3 +501,223 @@ pub enum CidClass {
     /// Spec-reserved CID we don't handle here.
     Reserved,
 }
+
+// ── Well-known PSMs (Bluetooth Assigned Numbers) ───────────────────
+
+/// SDP — Service Discovery Protocol.
+pub const PSM_SDP: u16 = 0x0001;
+/// RFCOMM — serial-port emulation.
+pub const PSM_RFCOMM: u16 = 0x0003;
+/// TCS-BIN — Telephony Control Specification.
+pub const PSM_TCS_BIN: u16 = 0x0005;
+/// BNEP — Bluetooth Network Encapsulation Protocol.
+pub const PSM_BNEP: u16 = 0x000F;
+/// HID Control channel.
+pub const PSM_HID_CONTROL: u16 = 0x0011;
+/// HID Interrupt channel.
+pub const PSM_HID_INTERRUPT: u16 = 0x0013;
+/// AVCTP — Audio/Video Control Transport (AVRCP carrier).
+pub const PSM_AVCTP: u16 = 0x0017;
+/// AVDTP — Audio/Video Distribution Transport (A2DP carrier).
+pub const PSM_AVDTP: u16 = 0x0019;
+/// AVCTP browsing channel.
+pub const PSM_AVCTP_BROWSING: u16 = 0x001B;
+/// ATT over BR/EDR (rare; LE uses fixed CID 0x0004 instead).
+pub const PSM_ATT: u16 = 0x001F;
+
+// ── L2CAP Signalling-command builders (§4.X) ───────────────────────
+
+/// Build a Connection Request signalling command (§4.2). 4-byte data:
+/// PSM (2 LE) + Source_CID (2 LE).
+pub fn build_connection_request(identifier: u8, psm: u16, source_cid: u16) -> SignallingCommand {
+    let mut data = Vec::with_capacity(4);
+    data.extend_from_slice(&psm.to_le_bytes());
+    data.extend_from_slice(&source_cid.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::ConnectionRequest as u8,
+        identifier,
+        data,
+    }
+}
+
+/// Connection-Response result codes (§4.3, table 4-5).
+pub const CONN_RESULT_SUCCESS: u16 = 0x0000;
+pub const CONN_RESULT_PENDING: u16 = 0x0001;
+pub const CONN_RESULT_REFUSED_PSM_NOT_SUPPORTED: u16 = 0x0002;
+pub const CONN_RESULT_REFUSED_SECURITY_BLOCK: u16 = 0x0003;
+pub const CONN_RESULT_REFUSED_NO_RESOURCES: u16 = 0x0004;
+
+/// Connection-Response status codes (§4.3, table 4-6).
+pub const CONN_STATUS_NO_INFORMATION: u16 = 0x0000;
+pub const CONN_STATUS_AUTHENTICATION_PENDING: u16 = 0x0001;
+pub const CONN_STATUS_AUTHORISATION_PENDING: u16 = 0x0002;
+
+/// Build a Connection Response (§4.3). 8-byte data: Dest_CID (2 LE) +
+/// Source_CID (2 LE) + Result (2 LE) + Status (2 LE).
+pub fn build_connection_response(
+    identifier: u8,
+    dest_cid: u16,
+    source_cid: u16,
+    result: u16,
+    status: u16,
+) -> SignallingCommand {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&dest_cid.to_le_bytes());
+    data.extend_from_slice(&source_cid.to_le_bytes());
+    data.extend_from_slice(&result.to_le_bytes());
+    data.extend_from_slice(&status.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::ConnectionResponse as u8,
+        identifier,
+        data,
+    }
+}
+
+/// Build a Configuration Request (§4.4). 4-byte fixed header + options:
+/// Dest_CID (2 LE) + Flags (2 LE) + options.
+pub fn build_configure_request(
+    identifier: u8,
+    dest_cid: u16,
+    continuation: bool,
+    options: &[u8],
+) -> SignallingCommand {
+    let flags: u16 = if continuation { 1 } else { 0 };
+    let mut data = Vec::with_capacity(4 + options.len());
+    data.extend_from_slice(&dest_cid.to_le_bytes());
+    data.extend_from_slice(&flags.to_le_bytes());
+    data.extend_from_slice(options);
+    SignallingCommand {
+        code: SignallingCode::ConfigureRequest as u8,
+        identifier,
+        data,
+    }
+}
+
+/// Build a Disconnection Request (§4.6). 4-byte data: Dest_CID (2 LE) +
+/// Source_CID (2 LE).
+pub fn build_disconnection_request(
+    identifier: u8,
+    dest_cid: u16,
+    source_cid: u16,
+) -> SignallingCommand {
+    let mut data = Vec::with_capacity(4);
+    data.extend_from_slice(&dest_cid.to_le_bytes());
+    data.extend_from_slice(&source_cid.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::DisconnectionRequest as u8,
+        identifier,
+        data,
+    }
+}
+
+/// Build an Echo Request (§4.8). Variable-length data ping.
+pub fn build_echo_request(identifier: u8, data: &[u8]) -> SignallingCommand {
+    SignallingCommand {
+        code: SignallingCode::EchoRequest as u8,
+        identifier,
+        data: data.to_vec(),
+    }
+}
+
+/// Information-Request InfoType values (§4.10, table 4-13).
+pub const INFO_TYPE_CONNECTIONLESS_MTU: u16 = 0x0001;
+pub const INFO_TYPE_EXTENDED_FEATURES: u16 = 0x0002;
+pub const INFO_TYPE_FIXED_CHANNELS: u16 = 0x0003;
+
+/// Build an Information Request (§4.10). 2-byte data: InfoType (2 LE).
+pub fn build_information_request(identifier: u8, info_type: u16) -> SignallingCommand {
+    SignallingCommand {
+        code: SignallingCode::InformationRequest as u8,
+        identifier,
+        data: info_type.to_le_bytes().to_vec(),
+    }
+}
+
+// ── LE Credit-Based Connection (§4.22) ─────────────────────────────
+//
+// LE COC (Connection-Oriented Channel) is the BLE replacement for the
+// classic BR/EDR configure-then-stream dance. Credits flow as a
+// separate signalling command; each credit grants the peer permission
+// to send one K-frame.
+
+/// Build an LE Credit-Based Connection Request (§4.22). Data:
+/// LE_PSM (2 LE) + Source_CID (2 LE) + MTU (2 LE) + MPS (2 LE) +
+/// Initial_Credits (2 LE) = 10 bytes.
+pub fn build_le_credit_based_connection_request(
+    identifier: u8,
+    le_psm: u16,
+    source_cid: u16,
+    mtu: u16,
+    mps: u16,
+    initial_credits: u16,
+) -> SignallingCommand {
+    let mut data = Vec::with_capacity(10);
+    data.extend_from_slice(&le_psm.to_le_bytes());
+    data.extend_from_slice(&source_cid.to_le_bytes());
+    data.extend_from_slice(&mtu.to_le_bytes());
+    data.extend_from_slice(&mps.to_le_bytes());
+    data.extend_from_slice(&initial_credits.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::LeCreditBasedConnectionRequest as u8,
+        identifier,
+        data,
+    }
+}
+
+/// Build an LE Flow Control Credit signalling command (§4.24). Data:
+/// CID (2 LE) + Credits (2 LE).
+pub fn build_le_flow_control_credit(
+    identifier: u8,
+    cid: u16,
+    credits: u16,
+) -> SignallingCommand {
+    let mut data = Vec::with_capacity(4);
+    data.extend_from_slice(&cid.to_le_bytes());
+    data.extend_from_slice(&credits.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::FlowControlCredit as u8,
+        identifier,
+        data,
+    }
+}
+
+// ── LE Connection Parameter Update Request (§4.20) ─────────────────
+
+/// Build an LE Connection Parameter Update Request (§4.20).
+/// Data: Interval_Min (2 LE) + Interval_Max (2 LE) + Latency (2 LE) +
+/// Timeout (2 LE) = 8 bytes. Intervals are in 1.25 ms units; timeout
+/// in 10 ms.
+pub fn build_le_connection_parameter_update_request(
+    identifier: u8,
+    interval_min: u16,
+    interval_max: u16,
+    latency: u16,
+    timeout: u16,
+) -> SignallingCommand {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&interval_min.to_le_bytes());
+    data.extend_from_slice(&interval_max.to_le_bytes());
+    data.extend_from_slice(&latency.to_le_bytes());
+    data.extend_from_slice(&timeout.to_le_bytes());
+    SignallingCommand {
+        code: SignallingCode::ConnectionParameterUpdateRequest as u8,
+        identifier,
+        data,
+    }
+}
+
+// ── MTU-option encoder (§5.1) ──────────────────────────────────────
+
+/// MTU configuration option type (§5.1, table 5-1).
+pub const CONFIG_OPT_MTU: u8 = 0x01;
+
+/// Encode the L2CAP MTU configuration option (§5.1). Format:
+/// type(1) length(1=2) MTU (u16 LE).
+pub fn config_option_mtu(mtu: u16) -> [u8; 4] {
+    [
+        CONFIG_OPT_MTU,
+        2,
+        (mtu & 0xFF) as u8,
+        (mtu >> 8) as u8,
+    ]
+}

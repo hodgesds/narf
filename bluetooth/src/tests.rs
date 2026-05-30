@@ -3945,3 +3945,167 @@ fn smoke_user_confirmation_request_decode() -> TestResult {
 }
 kernel_test_in!("bluetooth/event", smoke_user_confirmation_request_decode);
 
+// ── L2CAP signaling builders ────────────────────────────────────────
+
+/// L2CAP §4.2 Connection Request — PSM(2 LE) + Source_CID(2 LE).
+/// Verify the wire layout matches the spec exactly.
+fn smoke_l2cap_connection_request_encoding() -> TestResult {
+    use crate::l2cap::{build_connection_request, PSM_AVDTP, SignallingCode};
+    let cmd = build_connection_request(0x42, PSM_AVDTP, 0x0050);
+    if cmd.code != SignallingCode::ConnectionRequest as u8 {
+        return TestResult::Fail("conn-req code wrong");
+    }
+    if cmd.identifier != 0x42 {
+        return TestResult::Fail("identifier wrong");
+    }
+    if cmd.data.len() != 4 {
+        return TestResult::Fail("data length not 4");
+    }
+    if u16::from_le_bytes([cmd.data[0], cmd.data[1]]) != PSM_AVDTP {
+        return TestResult::Fail("PSM encoding wrong");
+    }
+    if u16::from_le_bytes([cmd.data[2], cmd.data[3]]) != 0x0050 {
+        return TestResult::Fail("source CID encoding wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/l2cap", smoke_l2cap_connection_request_encoding);
+
+/// L2CAP §4.3 Connection Response — 8-byte payload with the Result
+/// codes from table 4-5.
+fn smoke_l2cap_connection_response_success() -> TestResult {
+    use crate::l2cap::{
+        build_connection_response, CONN_RESULT_SUCCESS, CONN_STATUS_NO_INFORMATION,
+    };
+    let cmd = build_connection_response(0x05, 0x0050, 0x0040, CONN_RESULT_SUCCESS,
+                                         CONN_STATUS_NO_INFORMATION);
+    if cmd.data.len() != 8 {
+        return TestResult::Fail("conn-rsp data not 8 bytes");
+    }
+    if u16::from_le_bytes([cmd.data[0], cmd.data[1]]) != 0x0050 {
+        return TestResult::Fail("dest CID wrong");
+    }
+    if u16::from_le_bytes([cmd.data[2], cmd.data[3]]) != 0x0040 {
+        return TestResult::Fail("source CID wrong");
+    }
+    if u16::from_le_bytes([cmd.data[4], cmd.data[5]]) != CONN_RESULT_SUCCESS {
+        return TestResult::Fail("result wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/l2cap", smoke_l2cap_connection_response_success);
+
+/// L2CAP §4.4 Configure Request — Dest_CID + Flags + options. We
+/// embed an MTU=1024 option (§5.1) and verify the encoded bytes.
+fn smoke_l2cap_configure_request_mtu_option() -> TestResult {
+    use crate::l2cap::{build_configure_request, config_option_mtu};
+    let opt = config_option_mtu(1024);
+    let cmd = build_configure_request(0x10, 0x0050, false, &opt);
+    // Layout: dest_cid(2) + flags(2) + options(4) = 8 bytes.
+    if cmd.data.len() != 8 {
+        return TestResult::Fail("config-req data not 8 bytes");
+    }
+    // dest cid = 0x0050.
+    if u16::from_le_bytes([cmd.data[0], cmd.data[1]]) != 0x0050 {
+        return TestResult::Fail("dest CID wrong");
+    }
+    // flags = 0 (no continuation).
+    if u16::from_le_bytes([cmd.data[2], cmd.data[3]]) != 0 {
+        return TestResult::Fail("flags should be 0");
+    }
+    // option: type=0x01 length=2 mtu=1024 LE.
+    if cmd.data[4] != 0x01 || cmd.data[5] != 2 {
+        return TestResult::Fail("MTU option header wrong");
+    }
+    if u16::from_le_bytes([cmd.data[6], cmd.data[7]]) != 1024 {
+        return TestResult::Fail("MTU value wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/l2cap", smoke_l2cap_configure_request_mtu_option);
+
+/// L2CAP §4.22 LE Credit-Based Connection Request — 10-byte data
+/// block with LE_PSM, Source_CID, MTU, MPS, Initial_Credits all LE.
+fn smoke_l2cap_le_credit_based_connection_request() -> TestResult {
+    use crate::l2cap::build_le_credit_based_connection_request;
+    let cmd = build_le_credit_based_connection_request(0x20, 0x0080, 0x0040, 512, 251, 10);
+    if cmd.data.len() != 10 {
+        return TestResult::Fail("LE-CoC req not 10 bytes");
+    }
+    if u16::from_le_bytes([cmd.data[0], cmd.data[1]]) != 0x0080 {
+        return TestResult::Fail("LE PSM wrong");
+    }
+    if u16::from_le_bytes([cmd.data[4], cmd.data[5]]) != 512 {
+        return TestResult::Fail("MTU wrong");
+    }
+    if u16::from_le_bytes([cmd.data[8], cmd.data[9]]) != 10 {
+        return TestResult::Fail("Initial credits wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_le_credit_based_connection_request
+);
+
+/// L2CAP §4.20 LE Connection Parameter Update Request — peripheral
+/// asks central to renegotiate interval. Data is 4×u16 LE.
+fn smoke_l2cap_le_conn_param_update_request() -> TestResult {
+    use crate::l2cap::build_le_connection_parameter_update_request;
+    // 7.5 ms interval = 6 units, 15 ms = 12 units, lat=0, timeout=500=5s.
+    let cmd = build_le_connection_parameter_update_request(0x30, 6, 12, 0, 500);
+    if cmd.data.len() != 8 {
+        return TestResult::Fail("conn-param-update data not 8 bytes");
+    }
+    if u16::from_le_bytes([cmd.data[0], cmd.data[1]]) != 6 {
+        return TestResult::Fail("interval_min wrong");
+    }
+    if u16::from_le_bytes([cmd.data[6], cmd.data[7]]) != 500 {
+        return TestResult::Fail("timeout wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_le_conn_param_update_request
+);
+
+/// L2CAP §4.10 Information Request for Extended Features — used by
+/// initiators to discover ERTM / Streaming / FCS support.
+fn smoke_l2cap_information_request_extended_features() -> TestResult {
+    use crate::l2cap::{
+        build_information_request, INFO_TYPE_EXTENDED_FEATURES, SignallingCode,
+    };
+    let cmd = build_information_request(0x01, INFO_TYPE_EXTENDED_FEATURES);
+    if cmd.code != SignallingCode::InformationRequest as u8 {
+        return TestResult::Fail("not InformationRequest");
+    }
+    if u16::from_le_bytes([cmd.data[0], cmd.data[1]]) != INFO_TYPE_EXTENDED_FEATURES {
+        return TestResult::Fail("info type not Extended Features");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/l2cap",
+    smoke_l2cap_information_request_extended_features
+);
+
+/// Confirm well-known PSMs match the Assigned Numbers values used in
+/// every public Bluetooth profile.
+fn smoke_l2cap_well_known_psms() -> TestResult {
+    use crate::l2cap::{
+        PSM_AVCTP, PSM_AVCTP_BROWSING, PSM_AVDTP, PSM_BNEP, PSM_HID_CONTROL,
+        PSM_HID_INTERRUPT, PSM_RFCOMM, PSM_SDP,
+    };
+    if PSM_SDP != 0x0001 { return TestResult::Fail("PSM_SDP wrong"); }
+    if PSM_RFCOMM != 0x0003 { return TestResult::Fail("PSM_RFCOMM wrong"); }
+    if PSM_BNEP != 0x000F { return TestResult::Fail("PSM_BNEP wrong"); }
+    if PSM_HID_CONTROL != 0x0011 { return TestResult::Fail("PSM_HID_CONTROL wrong"); }
+    if PSM_HID_INTERRUPT != 0x0013 { return TestResult::Fail("PSM_HID_INTERRUPT wrong"); }
+    if PSM_AVCTP != 0x0017 { return TestResult::Fail("PSM_AVCTP wrong"); }
+    if PSM_AVDTP != 0x0019 { return TestResult::Fail("PSM_AVDTP wrong"); }
+    if PSM_AVCTP_BROWSING != 0x001B { return TestResult::Fail("PSM_AVCTP_BROWSING wrong"); }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/l2cap", smoke_l2cap_well_known_psms);
+
