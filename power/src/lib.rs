@@ -43,6 +43,7 @@ pub mod suspend;
 pub mod syscall;
 pub mod system;
 pub mod thermal;
+pub mod sysfs_bridge;
 pub mod watchdog;
 pub mod watchdog_bridge;
 
@@ -287,6 +288,16 @@ pub fn register_initcalls() {
         } else {
             InitResult::Ok
         }
+    });
+    // Wire ACPI battery, AC adapter, and thermal-zone objects to
+    // /sys/class/power_supply/ and /sys/class/thermal/.
+    // Runs after the acpi-*-enum initcalls so the device lists are
+    // fully populated before we register sysfs nodes.
+    // Linux ref: power_supply_class.c:power_supply_add_attrs (6.9 line 483)
+    //            thermal_sysfs.c:thermal_zone_device_register (6.9 line 344)
+    narf_init::register(Stage::Late, "power-sysfs-bridge", || {
+        sysfs_bridge::populate_power_supply_and_thermal();
+        InitResult::Ok
     });
     // CPUFreq governor bring-up. Runs after `cpu-pstate` (Stage::Subsys)
     // so the one-shot HWP/CPPC capabilities + initial request are
