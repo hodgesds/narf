@@ -57,6 +57,7 @@ members = [
     "drivers/storage",
     "drivers/usb",
     "drivers/usbpd",
+    "drivers/extcon",
     "drivers/thunderbolt",
     "drivers/fingerprint",
     "drivers/input",
