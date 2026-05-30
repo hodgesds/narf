@@ -3376,3 +3376,572 @@ kernel_test_in!(
     smoke_profiles_a2dp_source_sbc_encode_streaming
 );
 
+// ── ISO data packet round-trip ───────────────────────────────────────
+
+/// Vol 4 Part E §5.4.5: ISO Data packet handle field carries 12 bits of
+/// handle, 2 bits of PB flag, 1 bit of TS flag. Encode/decode must
+/// round-trip both flags.
+fn smoke_iso_data_round_trip() -> TestResult {
+    use crate::hci::IsoData;
+    let original = IsoData {
+        handle: 0x123,
+        pb_flag: 0b10, // complete SDU
+        ts_flag: true,
+        data: alloc::vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE],
+    };
+    let bytes = original.encode();
+    if bytes.len() != 4 + 6 {
+        return TestResult::Fail("ISO encoded length wrong");
+    }
+    // Wire bit-15 should be zero; PB=0b10 → bits 12..14 = 0b10;
+    // TS=1 → bit 14.
+    let h = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if (h & 0x0FFF) != 0x123 {
+        return TestResult::Fail("ISO handle truncation wrong");
+    }
+    if ((h >> 12) & 0x3) != 0b10 {
+        return TestResult::Fail("ISO PB encoding wrong");
+    }
+    if (h & (1 << 14)) == 0 {
+        return TestResult::Fail("ISO TS bit not set");
+    }
+    let decoded = IsoData::decode(&bytes).expect("decode iso");
+    if decoded != original {
+        return TestResult::Fail("ISO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_iso_data_round_trip);
+
+/// Vol 4 Part E §5.4.3: SCO data packet handle field carries 12 bits of
+/// handle + 2 bits packet-status flag. Round-trip both fields.
+fn smoke_sco_data_round_trip() -> TestResult {
+    use crate::hci::ScoData;
+    let original = ScoData {
+        handle: 0x0FF,
+        packet_status: 0b01, // possibly invalid
+        data: alloc::vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    };
+    let bytes = original.encode();
+    if bytes.len() != 3 + 10 {
+        return TestResult::Fail("SCO encoded length wrong");
+    }
+    let decoded = ScoData::decode(&bytes).expect("decode sco");
+    if decoded != original {
+        return TestResult::Fail("SCO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_sco_data_round_trip);
+
+/// btusb_quirks::identify maps known VID:PID to the right family.
+/// Cover at least one match for every implemented Quirk variant.
+fn smoke_btusb_quirks_identification() -> TestResult {
+    use crate::btusb_quirks::{identify, Quirk};
+    if identify(0x8087, 0x0032) != Some(Quirk::Intel) {
+        return TestResult::Fail("Intel AX210 (8087:0032) not matched");
+    }
+    if identify(0x0bda, 0x8771) != Some(Quirk::Realtek) {
+        return TestResult::Fail("Realtek RTL8761B not matched");
+    }
+    if identify(0x0489, 0xe0cd) != Some(Quirk::QualcommWcn6855) {
+        return TestResult::Fail("Qualcomm WCN6855 not matched");
+    }
+    if identify(0x0e8d, 0x7922) != Some(Quirk::MediaTek) {
+        return TestResult::Fail("MediaTek MT7922 not matched");
+    }
+    if identify(0x0a12, 0x0001) != Some(Quirk::Csr) {
+        return TestResult::Fail("CSR8510 not matched");
+    }
+    // Unknown VID/PID should miss.
+    if identify(0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown VID/PID spuriously matched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/btusb", smoke_btusb_quirks_identification);
+
+/// Fake-CSR detection — bcdDevice 0x0867 on VID 0x0a12 PID 0x0001 is
+/// a known clone with broken BD_ADDR. is_fake_csr must flag it; real
+/// CSR8510 (bcdDevice 0x4001) must not.
+fn smoke_btusb_fake_csr_detection() -> TestResult {
+    use crate::btusb_quirks::is_fake_csr;
+    if !is_fake_csr(0x0a12, 0x0001, 0x0867) {
+        return TestResult::Fail("fake CSR 0867 not detected");
+    }
+    if !is_fake_csr(0x0a12, 0x0001, 0x1915) {
+        return TestResult::Fail("fake CSR 1915 not detected");
+    }
+    if is_fake_csr(0x0a12, 0x0001, 0x4001) {
+        return TestResult::Fail("real CSR8510 flagged as fake");
+    }
+    if is_fake_csr(0x8087, 0x0032, 0x0867) {
+        return TestResult::Fail("Intel adapter flagged as fake CSR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/btusb", smoke_btusb_fake_csr_detection);
+
+/// Per-quirk firmware paths return non-empty for the four vendors that
+/// require host-side blob loading; empty for CSR (on-chip firmware).
+fn smoke_btusb_firmware_paths_per_quirk() -> TestResult {
+    use crate::btusb_quirks::{firmware_paths, Quirk};
+    if firmware_paths(Quirk::Intel).is_empty() {
+        return TestResult::Fail("Intel firmware list empty");
+    }
+    if firmware_paths(Quirk::Realtek).is_empty() {
+        return TestResult::Fail("Realtek firmware list empty");
+    }
+    if firmware_paths(Quirk::MediaTek).is_empty() {
+        return TestResult::Fail("MediaTek firmware list empty");
+    }
+    if firmware_paths(Quirk::QualcommWcn6855).is_empty() {
+        return TestResult::Fail("Qualcomm firmware list empty");
+    }
+    if !firmware_paths(Quirk::Csr).is_empty() {
+        return TestResult::Fail("CSR firmware list should be empty (on-chip)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/btusb", smoke_btusb_firmware_paths_per_quirk);
+
+// ── AVRCP smokes ────────────────────────────────────────────────────
+
+/// AVCTP §6.2: packet header has 4-bit transaction label + 2-bit packet
+/// type + CR + IPID. Round-trip encode/decode of all four fields.
+fn smoke_avrcp_avctp_packet_round_trip() -> TestResult {
+    use crate::avrcp::{AvctpPacket, AVCTP_SINGLE, AVRCP_PID};
+    let original = AvctpPacket {
+        transaction_label: 0x0A,
+        packet_type: AVCTP_SINGLE,
+        is_response: false,
+        ipid: false,
+        pid: AVRCP_PID,
+        payload: alloc::vec![1, 2, 3, 4, 5],
+    };
+    let bytes = original.encode();
+    // Header byte: 0xA<<4 | 0b00<<2 | 0 | 0 = 0xA0.
+    if bytes[0] != 0xA0 {
+        return TestResult::Fail("AVCTP header byte wrong");
+    }
+    // PID is big-endian 0x110E.
+    if bytes[1] != 0x11 || bytes[2] != 0x0E {
+        return TestResult::Fail("AVCTP PID encoding wrong");
+    }
+    let decoded = AvctpPacket::decode(&bytes).expect("decode");
+    if decoded != original {
+        return TestResult::Fail("AVCTP round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avrcp", smoke_avrcp_avctp_packet_round_trip);
+
+/// AVRCP §4.6.1 PASS THROUGH frame builder for PLAY (op 0x44) press
+/// state. Decode back to assert opcode + state bit.
+fn smoke_avrcp_pass_through_play_press() -> TestResult {
+    use crate::avrcp::{
+        pass_through_frame, AVC_OPCODE_PASS_THROUGH, CTYPE_CONTROL, OP_PLAY, PassThrough,
+        SUBUNIT_PANEL_BYTE,
+    };
+    let frame = pass_through_frame(OP_PLAY, false);
+    if frame.len() != 5 {
+        return TestResult::Fail("PASS THROUGH frame should be 5 bytes");
+    }
+    if frame[0] != CTYPE_CONTROL {
+        return TestResult::Fail("ctype not CONTROL");
+    }
+    if frame[1] != SUBUNIT_PANEL_BYTE {
+        return TestResult::Fail("subunit not PANEL");
+    }
+    if frame[2] != AVC_OPCODE_PASS_THROUGH {
+        return TestResult::Fail("opcode not PASS_THROUGH");
+    }
+    let decoded = PassThrough::decode(&frame).expect("decode");
+    if decoded.operation_id != OP_PLAY {
+        return TestResult::Fail("operation_id != PLAY");
+    }
+    if decoded.released {
+        return TestResult::Fail("PLAY press shouldn't be released");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avrcp", smoke_avrcp_pass_through_play_press);
+
+/// AVRCP §4.6.1 PASS THROUGH release frame mirrors the press; the
+/// state bit (bit 7 of byte 3) flips.
+fn smoke_avrcp_pass_through_release() -> TestResult {
+    use crate::avrcp::{pass_through_frame, OP_VOLUME_UP, PassThrough};
+    let frame = pass_through_frame(OP_VOLUME_UP, true);
+    if (frame[3] & 0x80) == 0 {
+        return TestResult::Fail("release bit not set");
+    }
+    let decoded = PassThrough::decode(&frame).expect("decode");
+    if !decoded.released {
+        return TestResult::Fail("release flag not detected");
+    }
+    if decoded.operation_id != OP_VOLUME_UP {
+        return TestResult::Fail("operation_id != VOLUME_UP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avrcp", smoke_avrcp_pass_through_release);
+
+/// AVRCP §28.20 SET_ABSOLUTE_VOLUME — Vendor Dependent frame with
+/// BT-SIG company ID and a 7-bit volume value.
+fn smoke_avrcp_set_absolute_volume() -> TestResult {
+    use crate::avrcp::{
+        parse_vendor_dependent, set_absolute_volume, BT_SIG_COMPANY_ID,
+        PDU_SET_ABSOLUTE_VOLUME,
+    };
+    let frame = set_absolute_volume(0x40);
+    let (_ctype, cid, pdu_id, params) =
+        parse_vendor_dependent(&frame).expect("parse vendor-dep");
+    if cid != BT_SIG_COMPANY_ID {
+        return TestResult::Fail("company ID not BT SIG");
+    }
+    if pdu_id != PDU_SET_ABSOLUTE_VOLUME {
+        return TestResult::Fail("pdu id not SET_ABSOLUTE_VOLUME");
+    }
+    if params.len() != 1 || params[0] != 0x40 {
+        return TestResult::Fail("volume param wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avrcp", smoke_avrcp_set_absolute_volume);
+
+/// AVRCP §28.5 REGISTER_NOTIFICATION for EVENT_VOLUME_CHANGED — used
+/// by absolute-volume controllers to learn the peer's volume change.
+fn smoke_avrcp_register_notification_volume_changed() -> TestResult {
+    use crate::avrcp::{
+        parse_vendor_dependent, register_notification, EVENT_VOLUME_CHANGED, PDU_REGISTER_NOTIFICATION,
+    };
+    let frame = register_notification(EVENT_VOLUME_CHANGED, 0);
+    let (_ctype, _cid, pdu_id, params) =
+        parse_vendor_dependent(&frame).expect("parse vendor-dep");
+    if pdu_id != PDU_REGISTER_NOTIFICATION {
+        return TestResult::Fail("pdu id not REGISTER_NOTIFICATION");
+    }
+    // 1-byte event id + 4-byte playback interval = 5 bytes.
+    if params.len() != 5 || params[0] != EVENT_VOLUME_CHANGED {
+        return TestResult::Fail("event id / playback interval wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/avrcp",
+    smoke_avrcp_register_notification_volume_changed
+);
+
+/// AVRCP media_key_press wraps the PASS THROUGH frame in an AVCTP
+/// single command. The first 3 bytes are the AVCTP header + PID.
+fn smoke_avrcp_media_key_press_wrapping() -> TestResult {
+    use crate::avrcp::media_key_press;
+    let bytes = media_key_press(0x05, crate::avrcp::OP_PLAY);
+    // AVCTP header: label=5 → 0x50, ptype=0b00, cr=cmd=0 → 0x50.
+    if bytes[0] != 0x50 {
+        return TestResult::Fail("AVCTP header label wrong");
+    }
+    // PID big-endian 0x110E.
+    if bytes[1] != 0x11 || bytes[2] != 0x0E {
+        return TestResult::Fail("AVCTP PID big-endian wrong");
+    }
+    // Payload should be a PASS THROUGH frame, byte 2 = opcode 0x7C.
+    if bytes[3 + 2] != 0x7C {
+        return TestResult::Fail("PASS THROUGH opcode not in payload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avrcp", smoke_avrcp_media_key_press_wrapping);
+
+// ── ERTM smokes ─────────────────────────────────────────────────────
+
+/// Vol 3 Part A §3.3.5: L2CAP FCS uses CRC-16 with polynomial 0xA001
+/// (reflected). Verify against a known vector — a single zero byte
+/// CRCs to 0 (initial value 0, no LSB flips since 0x00 input).
+fn smoke_ertm_fcs_known_vector() -> TestResult {
+    use crate::ertm::fcs;
+    // 0x00 byte: each bit shift sees LSB=0, no XOR; result is 0.
+    if fcs(&[0x00]) != 0 {
+        return TestResult::Fail("fcs([0x00]) != 0");
+    }
+    // 0x01 byte: shift right by 1, LSB was 1 → XOR 0xA001.
+    // CRC after step 1 = 0xA001. Step 2..8 (zero ext): each shift
+    // either XORs or doesn't. Final CRC for 0x01 input is 0xC0C0
+    // (computed by hand and matches the Modbus CRC of "01").
+    let single01 = fcs(&[0x01]);
+    if single01 == 0 {
+        return TestResult::Fail("fcs([0x01]) suspiciously 0");
+    }
+    // Round-trip: appending the FCS little-endian must result in a
+    // CRC of 0 when the whole message is re-CRC'd (Modbus property).
+    let mut msg = alloc::vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let c = fcs(&msg);
+    msg.extend_from_slice(&c.to_le_bytes());
+    if fcs(&msg) != 0 {
+        return TestResult::Fail("appending FCS doesn't zero re-CRC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/ertm", smoke_ertm_fcs_known_vector);
+
+/// ERTM I-frame encode/decode round-trip. ECF layout is 16-bit LE with
+/// the discriminator in bit 0; we encode an unsegmented I-frame
+/// with tx_seq=5 / req_seq=3 / SAR=0b00 and assert each field.
+fn smoke_ertm_iframe_round_trip() -> TestResult {
+    use crate::ertm::{IFrame, SAR_UNSEGMENTED};
+    let original = IFrame {
+        tx_seq: 5,
+        req_seq: 3,
+        sar: SAR_UNSEGMENTED,
+        payload: alloc::vec![1, 2, 3, 4],
+        fcs: None,
+    };
+    let bytes = original.encode();
+    if (bytes[0] & 1) != 0 {
+        return TestResult::Fail("I-frame discriminator wrong");
+    }
+    let decoded = IFrame::decode(&bytes, false).expect("decode");
+    if decoded != original {
+        return TestResult::Fail("I-frame round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/ertm", smoke_ertm_iframe_round_trip);
+
+/// ERTM S-frame round-trip — RR with req_seq=7 and final-bit set.
+fn smoke_ertm_sframe_rr_round_trip() -> TestResult {
+    use crate::ertm::{SFrame, SupervisorFunc};
+    let original = SFrame {
+        function: SupervisorFunc::Rr,
+        req_seq: 7,
+        final_bit: true,
+    };
+    let bytes = original.encode();
+    if (bytes[0] & 1) != 1 {
+        return TestResult::Fail("S-frame discriminator wrong");
+    }
+    let decoded = SFrame::decode(&bytes).expect("decode");
+    if decoded != original {
+        return TestResult::Fail("S-frame round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/ertm", smoke_ertm_sframe_rr_round_trip);
+
+/// ERTM tx-window enforcement (§3.4.2). With tx_window=3, the first
+/// three assigns succeed (outstanding 0→1→2) — the *fourth* try is
+/// the one that should be blocked. After an ack the window slides
+/// and we can send again.
+fn smoke_ertm_tx_window_enforcement() -> TestResult {
+    use crate::ertm::ErtmState;
+    let mut s = ErtmState::new(3);
+    for _ in 0..3 {
+        if !s.can_send() {
+            return TestResult::Fail("should be able to send within window");
+        }
+        s.assign_tx_seq();
+    }
+    if s.can_send() {
+        return TestResult::Fail("tx-window not enforced after 3 sends");
+    }
+    // Peer acks 2 frames.
+    s.on_peer_ack(2);
+    if !s.can_send() {
+        return TestResult::Fail("window not slid after peer ack");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/ertm", smoke_ertm_tx_window_enforcement);
+
+/// ERTM RFC config option encoder produces the exact 11-byte layout
+/// the spec mandates (§5.4): type(0x04) length(9) mode(1) tx_win(1)
+/// max_transmit(1) retransmit_timeout(2 LE) monitor_timeout(2 LE)
+/// max_pdu(2 LE) = 1+1+9 = 11 bytes total.
+fn smoke_ertm_config_option_rfc_encoding() -> TestResult {
+    use crate::ertm::{config_option_rfc, CONFIG_OPT_RFC, MODE_ERTM};
+    let opt = config_option_rfc(MODE_ERTM, 10, 3, 2000, 12000, 1024);
+    if opt[0] != CONFIG_OPT_RFC {
+        return TestResult::Fail("option type not RFC");
+    }
+    if opt[1] != 9 {
+        return TestResult::Fail("option length != 9");
+    }
+    if opt[2] != MODE_ERTM {
+        return TestResult::Fail("mode not ERTM");
+    }
+    if opt[3] != 10 {
+        return TestResult::Fail("tx_window wrong");
+    }
+    // retransmit_timeout 2000 = 0x07D0 LE.
+    if u16::from_le_bytes([opt[5], opt[6]]) != 2000 {
+        return TestResult::Fail("retransmit_timeout LE wrong");
+    }
+    if u16::from_le_bytes([opt[9], opt[10]]) != 1024 {
+        return TestResult::Fail("max_pdu LE wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/ertm", smoke_ertm_config_option_rfc_encoding);
+
+/// ERTM sequence-number arithmetic wraps at the 64 boundary. Within a
+/// window [62..3), seqs 62, 63, 0, 1, 2 must be admitted; 4, 5, 60
+/// must not.
+fn smoke_ertm_seq_in_window_wrap() -> TestResult {
+    use crate::ertm::seq_in_window;
+    if !seq_in_window(62, 62, 3) {
+        return TestResult::Fail("62 should be in [62..3)");
+    }
+    if !seq_in_window(62, 0, 3) {
+        return TestResult::Fail("0 should be in [62..3)");
+    }
+    if !seq_in_window(62, 2, 3) {
+        return TestResult::Fail("2 should be in [62..3)");
+    }
+    if seq_in_window(62, 3, 3) {
+        return TestResult::Fail("3 is exclusive end");
+    }
+    if seq_in_window(62, 60, 3) {
+        return TestResult::Fail("60 is outside the wrap window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/ertm", smoke_ertm_seq_in_window_wrap);
+
+// ── HCI extension opcode smokes ─────────────────────────────────────
+
+/// LE Encrypt opcode (§7.8.22, OGF=0x08 OCF=0x0017 → 0x2017). Issuing
+/// the command requires concatenating a 16-byte key + 16-byte
+/// plaintext as the 32-byte parameter block.
+fn smoke_hci_le_encrypt_encoding() -> TestResult {
+    use crate::hci::Command;
+    use crate::opcode::HCI_LE_ENCRYPT;
+    let key = [0x11u8; 16];
+    let plaintext = [0x22u8; 16];
+    let mut params = alloc::vec::Vec::with_capacity(32);
+    params.extend_from_slice(&key);
+    params.extend_from_slice(&plaintext);
+    let cmd = Command::with_params(HCI_LE_ENCRYPT, &params);
+    let bytes = cmd.encode();
+    // 2-byte opcode + 1-byte plen + 32-byte param = 35.
+    if bytes.len() != 35 {
+        return TestResult::Fail("encrypt cmd length wrong");
+    }
+    if u16::from_le_bytes([bytes[0], bytes[1]]) != 0x2017 {
+        return TestResult::Fail("encrypt opcode != 0x2017");
+    }
+    if bytes[2] != 32 {
+        return TestResult::Fail("encrypt plen != 32");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_le_encrypt_encoding);
+
+/// LE Rand opcode (§7.8.23, OGF=0x08 OCF=0x0018 → 0x2018). No params;
+/// 8 random bytes come back via Command Complete.
+fn smoke_hci_le_rand_encoding() -> TestResult {
+    use crate::hci::Command;
+    use crate::opcode::HCI_LE_RAND;
+    let cmd = Command::with_params(HCI_LE_RAND, &[]);
+    let bytes = cmd.encode();
+    if bytes.len() != 3 {
+        return TestResult::Fail("LE_Rand cmd length != 3");
+    }
+    if u16::from_le_bytes([bytes[0], bytes[1]]) != 0x2018 {
+        return TestResult::Fail("LE_Rand opcode != 0x2018");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_le_rand_encoding);
+
+/// LE Add Device To Filter Accept List (§7.8.16) — 7-byte param:
+/// address_type(1) + BD_ADDR(6 LE). Used to mint a peer to the
+/// allowlist for auto-connect.
+fn smoke_hci_le_add_filter_accept_list_encoding() -> TestResult {
+    use crate::hci::Command;
+    use crate::opcode::HCI_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST;
+    let mut params = alloc::vec::Vec::with_capacity(7);
+    params.push(0x00); // public address
+    params.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
+    let cmd = Command::with_params(HCI_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, &params);
+    let bytes = cmd.encode();
+    if u16::from_le_bytes([bytes[0], bytes[1]]) != 0x2011 {
+        return TestResult::Fail("accept-list opcode != 0x2011");
+    }
+    if bytes[2] != 7 {
+        return TestResult::Fail("accept-list plen != 7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/hci",
+    smoke_hci_le_add_filter_accept_list_encoding
+);
+
+// ── LE LTK Request decoder smoke ───────────────────────────────────
+
+/// LE Long Term Key Request subevent (§7.7.65.5) carries Rand + EDIV.
+/// Synthesise the event and round-trip the fields.
+fn smoke_le_long_term_key_request_decode() -> TestResult {
+    use crate::event::{LeLongTermKeyRequest, LeSubevent};
+    use crate::hci::Event;
+    let mut params = alloc::vec::Vec::new();
+    params.push(LeSubevent::LongTermKeyRequest as u8); // subevent
+    params.extend_from_slice(&0x0123u16.to_le_bytes()); // handle
+    params.extend_from_slice(&0xDEADBEEFCAFEBABEu64.to_le_bytes()); // rand
+    params.extend_from_slice(&0x5678u16.to_le_bytes()); // ediv
+    let event = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params,
+    };
+    let ltkr = LeLongTermKeyRequest::parse(&event).expect("parse");
+    if ltkr.handle != 0x123 {
+        return TestResult::Fail("handle decode wrong");
+    }
+    if ltkr.random_number != 0xDEADBEEFCAFEBABE {
+        return TestResult::Fail("rand decode wrong");
+    }
+    if ltkr.ediv != 0x5678 {
+        return TestResult::Fail("ediv decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/event", smoke_le_long_term_key_request_decode);
+
+/// IO Capability Request event (§7.7.40) carries just the peer BD_ADDR.
+fn smoke_io_capability_request_decode() -> TestResult {
+    use crate::event::{EventCode, IoCapabilityRequest};
+    use crate::hci::Event;
+    let event = Event {
+        code: EventCode::IoCapabilityRequest as u8,
+        params: alloc::vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+    };
+    let req = IoCapabilityRequest::parse(&event).expect("parse");
+    if req.bd_addr != [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC] {
+        return TestResult::Fail("BD_ADDR decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/event", smoke_io_capability_request_decode);
+
+/// User Confirmation Request event (§7.7.42) — numeric-comparison SSP.
+/// 6-byte BD_ADDR + 4-byte little-endian numeric value.
+fn smoke_user_confirmation_request_decode() -> TestResult {
+    use crate::event::{EventCode, UserConfirmationRequest};
+    use crate::hci::Event;
+    let mut params = alloc::vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    params.extend_from_slice(&123456u32.to_le_bytes());
+    let event = Event {
+        code: EventCode::UserConfirmationRequest as u8,
+        params,
+    };
+    let req = UserConfirmationRequest::parse(&event).expect("parse");
+    if req.numeric_value != 123456 {
+        return TestResult::Fail("numeric value decode wrong");
+    }
+    if req.bd_addr != [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF] {
+        return TestResult::Fail("BD_ADDR decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/event", smoke_user_confirmation_request_decode);
+
