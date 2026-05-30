@@ -26,6 +26,7 @@ narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-initramfs    = { path = "../initramfs" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-modules      = { path = "../modules" }
 
 [features]
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests

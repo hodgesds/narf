@@ -8723,6 +8723,94 @@ pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
     }))
 }
 
+// ── Loadable kernel modules ─────────────────────────────────────────
+//
+// `init_module(2)` and `finit_module(2)` take an in-memory image of
+// a relocatable ELF and link it into the running kernel via the
+// `narf-modules` crate. `delete_module(2)` removes a loaded module
+// by name. All three accept user pointers; we copy the image into
+// kernel space before parsing so the user can't race the parser.
+
+fn sys_init_module(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
+    // arg2 = params_ptr — parsed/used by `narf_modules::loader` once
+    // the param string parser lands. Phase 1 ignores user-supplied
+    // params; modules read static `.narf_kparams` from their ELF.
+    if ptr.is_null() || len == 0 || len > (1 << 28) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+    // SAFETY: caller pointer in the active AS; bounds-checked by len.
+    let bytes_user = unsafe { core::slice::from_raw_parts(ptr, len) };
+    // Copy to kernel heap so the user can't mutate the buffer during
+    // parsing.
+    let owned: alloc::vec::Vec<u8> = bytes_user.to_vec();
+    match narf_modules::syscalls::sys_init_module(&owned) {
+        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(e) => ctx.set_return(SyscallReturn::ok((e.to_errno() as i64) as u64)),
+    }
+}
+
+fn sys_finit_module(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    // arg1 = params_ptr, arg2 = flags — both ignored in Phase 1.
+    // Read the file via the fd table.
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get_mut(fd).ok_or(())?;
+        let mut accum = alloc::vec::Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let off = entry.offset;
+            let n = poll_blocking(entry.ops.read(off, &mut buf))
+                .and_then(|r| r.ok())
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            accum.extend_from_slice(&buf[..n]);
+            entry.offset = off + n as u64;
+            if accum.len() > (1 << 28) {
+                return Err(());
+            }
+        }
+        Ok(accum)
+    });
+    match outcome {
+        Some(Ok(bytes)) => match narf_modules::syscalls::sys_finit_module(&bytes) {
+            Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(e) => ctx.set_return(SyscallReturn::ok((e.to_errno() as i64) as u64)),
+        },
+        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
+    }
+}
+
+fn sys_delete_module(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let name_ptr = args.arg0 as *const u8;
+    let name_len = args.arg1 as usize;
+    if name_ptr.is_null() || name_len == 0 || name_len > 256 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+    // SAFETY: caller pointer in the active AS; bounds-checked.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            return;
+        }
+    };
+    match narf_modules::syscalls::sys_delete_module(name) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(e) => ctx.set_return(SyscallReturn::ok((e.to_errno() as i64) as u64)),
+    }
+}
+
 /// Drop the core set of handlers into `table`. Idempotent — later
 /// subsystems can install richer handlers over the same slots
 /// (e.g. a real file-descriptor-backed `Read`).
@@ -9049,6 +9137,23 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::EpollWait,
         "epoll_wait",
         RawFnHandler(crate::epoll::sys_epoll_wait),
+    );
+
+    // Loadable kernel modules.
+    table.install_raw(
+        Syscall::InitModule,
+        "init_module",
+        RawFnHandler(sys_init_module),
+    );
+    table.install_raw(
+        Syscall::FinitModule,
+        "finit_module",
+        RawFnHandler(sys_finit_module),
+    );
+    table.install_raw(
+        Syscall::DeleteModule,
+        "delete_module",
+        RawFnHandler(sys_delete_module),
     );
 
     // Auto-wire both delivery hooks so any kernel that uses
