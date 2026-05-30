@@ -21,6 +21,8 @@ use narf_console as console;
 pub fn install_all_hooks() {
     install_console_signal_hook();
     install_proc_hooks();
+    install_proc_ext_hooks();
+    install_proc_write_hooks();
     install_net_stack();
     install_procfs_net_hooks();
 }
@@ -41,6 +43,29 @@ fn install_proc_hooks() {
         narf_userspace::handlers::proc_current_pid,
         narf_userspace::handlers::proc_list_pids,
         narf_userspace::handlers::proc_task_info,
+    );
+}
+
+fn install_proc_ext_hooks() {
+    // Extended /proc/[pid]/* read hooks: fd, rlimits, nice, environ, auxv.
+    narf_filesystem::procfs::install_proc_ext_hooks(
+        narf_userspace::handlers::fd_path_of,
+        narf_userspace::handlers::rlimits_of,
+        narf_userspace::handlers::nice_of,
+        narf_userspace::handlers::proc_environ_of,
+        narf_userspace::handlers::proc_auxv_of,
+    );
+}
+
+fn install_proc_write_hooks() {
+    // Writable per-pid procfs hooks: comm, oom_score_adj, coredump_filter.
+    narf_filesystem::procfs::install_proc_write_hooks(
+        narf_userspace::handlers::proc_set_comm,
+        narf_userspace::handlers::proc_oom_adj_of,
+        narf_userspace::handlers::proc_set_oom_adj,
+        narf_userspace::handlers::proc_coredump_filter_of,
+        narf_userspace::handlers::proc_set_coredump_filter,
+        narf_userspace::handlers::proc_oom_score_of,
     );
 }
 

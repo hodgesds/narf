@@ -34,6 +34,8 @@ use crate::{
     DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
 };
 
+pub mod aggregate;
+pub mod bus;
 pub mod net;
 pub mod pid_ext;
 pub mod stubs;
@@ -122,7 +124,7 @@ fn list_pids() -> Vec<u64> {
     f()
 }
 
-fn task_info(pid: u64) -> Option<ProcTaskInfo> {
+pub(crate) fn task_info(pid: u64) -> Option<ProcTaskInfo> {
     let v = TASK_INFO_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return None;
@@ -629,7 +631,7 @@ impl FileOps for ProcPidFile {
     }
 }
 
-fn slice_read(bytes: &[u8], offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+pub(crate) fn slice_read(bytes: &[u8], offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
     let off = offset as usize;
     if off >= bytes.len() {
         return Ok(0);
@@ -651,7 +653,7 @@ fn slice_read(bytes: &[u8], offset: u64, buf: &mut [u8]) -> Result<usize, FsErro
 // check in resolve_async.
 
 #[derive(Debug)]
-struct ProcDirMarker;
+pub(crate) struct ProcDirMarker;
 
 impl FileOps for ProcDirMarker {
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -679,7 +681,6 @@ struct ProcPidDir {
 
 impl DirOps for ProcPidDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-        use pid_ext::PidExtFile;
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
             "fd" | "fdinfo" | "task" => return Some(Arc::new(ProcDirMarker)),
