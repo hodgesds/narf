@@ -35,6 +35,7 @@
 
 pub mod ch341;
 pub mod cp210x;
+pub mod devfs_bridge;
 pub mod ftdi;
 pub mod pl2303;
 

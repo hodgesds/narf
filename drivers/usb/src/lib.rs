@@ -39,6 +39,15 @@ mod tests;
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Install devfs hooks so /dev/ttyUSB<N> nodes resolve.
+    // Linux ref: `drivers/usb/serial/usb-serial.c:usb_serial_register_drivers`.
+    narf_init::register(Stage::Subsys, "usb-serial-devfs", || {
+        narf_filesystem::devfs::install_tty_usb_hooks(
+            serial::devfs_bridge::lookup_tty_usb,
+            serial::devfs_bridge::enumerate_tty_usb,
+        );
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "xhci", || {
         xhci::register_pci_driver();
         InitResult::Ok
