@@ -30,6 +30,7 @@ pub mod uac;
 pub mod uvc;
 pub mod uvc_stream;
 pub mod wbdi;
+pub mod serial;
 pub mod xhci;
 pub mod xpad;
 
