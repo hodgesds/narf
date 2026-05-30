@@ -632,4 +632,410 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/tpm/crb", smoke_crb_program_buffers_six_writes);
+
+    // ── devfs_bridge smoke tests ──────────────────────────────────────
+
+    // Minimal sync future poller for no_std tests.
+    fn poll_once_sync<F: core::future::Future>(fut: F) -> Option<F::Output> {
+        use core::pin::Pin;
+        use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+        unsafe fn no_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTAB)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        static VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        let raw = RawWaker::new(core::ptr::null(), &VTAB);
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = core::pin::pin!(fut);
+        match pinned.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(v) => Some(v),
+            core::task::Poll::Pending => None,
+        }
+    }
+
+    /// A mock transport that returns a fixed canned GetRandom response
+    /// containing 8 known bytes: [0xDE,0xAD,0xBE,0xEF,0x01,0x02,0x03,0x04].
+    ///
+    /// Response layout (TPM2_GetRandom Part 3 §18.2):
+    ///   header (10 bytes) + TPM2B_DIGEST size(u16) + 8 random bytes
+    struct GetRandomMock;
+    impl crate::devfs_bridge::TpmTransport for GetRandomMock {
+        fn submit(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            let mut r = alloc::vec![0u8; 10 + 2 + 8];
+            // tag = TPM_ST_NO_SESSIONS
+            r[0] = 0x80; r[1] = 0x01;
+            // size = 20
+            let sz = 20u32;
+            r[2] = (sz >> 24) as u8;
+            r[3] = (sz >> 16) as u8;
+            r[4] = (sz >> 8)  as u8;
+            r[5] = sz as u8;
+            // rc = TPM_RC_SUCCESS
+            r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+            // TPM2B_DIGEST size = 8
+            r[10] = 0x00; r[11] = 0x08;
+            // random bytes
+            r[12] = 0xDE; r[13] = 0xAD; r[14] = 0xBE; r[15] = 0xEF;
+            r[16] = 0x01; r[17] = 0x02; r[18] = 0x03; r[19] = 0x04;
+            Ok(r)
+        }
+    }
+
+    fn smoke_tpm0_write_read_roundtrip() -> TestResult {
+        use alloc::sync::Arc;
+        use crate::devfs_bridge::{DevTpm0, TpmTransport};
+        use narf_filesystem::FileOps;
+
+        // Install mock transport
+        crate::devfs_bridge::register_transport(Arc::new(GetRandomMock) as Arc<dyn TpmTransport>);
+
+        let dev = DevTpm0::new();
+
+        // Build a minimal GetRandom command (tag + size + CC + count)
+        let mut cmd = alloc::vec![0u8; 12];
+        cmd[0] = 0x80; cmd[1] = 0x01;             // tag TPM_ST_NO_SESSIONS
+        cmd[2] = 0; cmd[3] = 0; cmd[4] = 0; cmd[5] = 12; // size
+        cmd[6] = 0; cmd[7] = 0; cmd[8] = 0x01; cmd[9] = 0x7B; // CC GetRandom
+        cmd[10] = 0; cmd[11] = 8;                 // bytesRequested = 8
+
+        let n = poll_once_sync(dev.write(0, &cmd))
+            .and_then(|r| r.ok());
+        if n != Some(12) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("write did not return 12");
+        }
+
+        let mut buf = [0u8; 32];
+        let n = poll_once_sync(dev.read(0, &mut buf))
+            .and_then(|r| r.ok());
+        if n != Some(20) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("read did not return 20");
+        }
+        let expected = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        if &buf[12..20] != &expected {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("response payload mismatch");
+        }
+        crate::devfs_bridge::unregister_transport();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/devfs", smoke_tpm0_write_read_roundtrip);
+
+    /// Echo transport: returns the command bytes back verbatim.
+    struct EchoTransport;
+    impl crate::devfs_bridge::TpmTransport for EchoTransport {
+        fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            Ok(cmd.to_vec())
+        }
+    }
+
+    fn smoke_tpm0_poll_readiness_pending() -> TestResult {
+        use alloc::sync::Arc;
+        use crate::devfs_bridge::{DevTpm0, TpmTransport};
+        use narf_filesystem::{FileOps, POLL_IN, POLL_OUT};
+
+        crate::devfs_bridge::register_transport(Arc::new(EchoTransport) as Arc<dyn TpmTransport>);
+
+        let dev = DevTpm0::new();
+
+        // Before write: only POLL_OUT, not POLL_IN
+        let before = dev.poll_readiness();
+        if before & POLL_IN != 0 {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("POLL_IN should not be set before write");
+        }
+        if before & POLL_OUT == 0 {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("POLL_OUT should be set before write");
+        }
+
+        // Write a minimal valid command
+        let mut cmd = alloc::vec![0u8; 10];
+        cmd[0] = 0x80; cmd[1] = 0x01; // tag
+        cmd[2] = 0; cmd[3] = 0; cmd[4] = 0; cmd[5] = 10; // size
+        // CC doesn't matter for EchoTransport
+        let _ = poll_once_sync(dev.write(0, &cmd));
+
+        // After write: both POLL_IN | POLL_OUT
+        let after = dev.poll_readiness();
+        if after & POLL_IN == 0 {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("POLL_IN should be set after write");
+        }
+        if after & POLL_OUT == 0 {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("POLL_OUT should be set after write");
+        }
+
+        crate::devfs_bridge::unregister_transport();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/devfs", smoke_tpm0_poll_readiness_pending);
+
+    /// Transport that records flush calls for inspection.
+    static FLUSH_CALLS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u32>> =
+        narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+    struct TrackingTransport;
+    impl crate::devfs_bridge::TpmTransport for TrackingTransport {
+        fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            // Detect TPM2_FlushContext (CC = 0x0165) and record handle
+            if cmd.len() >= 14 {
+                let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+                if cc == 0x0000_0165 {
+                    let handle = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
+                    FLUSH_CALLS.lock().push(handle);
+                    // Return a success response
+                    let mut r = alloc::vec![0u8; 10];
+                    r[0] = 0x80; r[1] = 0x01;
+                    r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 10;
+                    return Ok(r);
+                }
+            }
+            // For TPM2_Load (CC = 0x0157): return response with transient handle 0x8000_0001
+            if cmd.len() >= 10 {
+                let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+                if cc == crate::tpm2::TPM_CC_LOAD {
+                    let mut r = alloc::vec![0u8; 14];
+                    r[0] = 0x80; r[1] = 0x01;
+                    r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 14;
+                    // rc = 0 (success)
+                    r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+                    // objectHandle = 0x8000_0001 (transient)
+                    r[10] = 0x80; r[11] = 0x00; r[12] = 0x00; r[13] = 0x01;
+                    return Ok(r);
+                }
+            }
+            Ok(alloc::vec![0u8; 10])
+        }
+    }
+
+    fn smoke_tpmrm0_flush_on_drop() -> TestResult {
+        use alloc::sync::Arc;
+        use crate::devfs_bridge::{DevTpmRm0, TpmTransport};
+        use narf_filesystem::FileOps;
+
+        // Reset flush call tracker
+        FLUSH_CALLS.lock().clear();
+
+        crate::devfs_bridge::register_transport(
+            Arc::new(TrackingTransport) as Arc<dyn TpmTransport>,
+        );
+
+        {
+            let dev = DevTpmRm0::new();
+
+            // Send a TPM2_Load command — the response will contain handle 0x8000_0001
+            let mut cmd = alloc::vec![0u8; 10];
+            cmd[0] = 0x80; cmd[1] = 0x01;
+            cmd[2] = 0; cmd[3] = 0; cmd[4] = 0; cmd[5] = 10;
+            // CC = TPM_CC_LOAD = 0x0157
+            cmd[6] = 0x00; cmd[7] = 0x00; cmd[8] = 0x01; cmd[9] = 0x57;
+            let _ = poll_once_sync(dev.write(0, &cmd));
+
+            // DevTpmRm0 drops here → flush_all_transients → TPM2_FlushContext(0x8000_0001)
+        }
+
+        let calls = FLUSH_CALLS.lock().clone();
+        crate::devfs_bridge::unregister_transport();
+
+        if !calls.contains(&0x8000_0001) {
+            return TestResult::Fail("FlushContext was not called for handle 0x8000_0001");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/devfs", smoke_tpmrm0_flush_on_drop);
+
+    // ── sysfs_bridge smoke tests ──────────────────────────────────────
+
+    /// Null transport: always fails. Used to verify static attributes
+    /// (version, enabled, active) that don't require a live TPM.
+    struct NullTransport;
+    impl crate::devfs_bridge::TpmTransport for NullTransport {
+        fn submit(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            Err(())
+        }
+    }
+
+    fn smoke_sysfs_tpm_version_major() -> TestResult {
+        use alloc::sync::Arc;
+        use crate::devfs_bridge::TpmTransport;
+
+        // register_sysfs_tpm0 calls class_register which is idempotent;
+        // the kobject tree allows repeated attribute additions (noop on dup).
+        let t = Arc::new(NullTransport) as Arc<dyn TpmTransport>;
+        crate::sysfs_bridge::register_sysfs_tpm0(t);
+
+        // Read back the static attribute via the sysfs kobject.
+        let class_tpm = narf_filesystem::class_register("tpm");
+        let tpm0 = narf_filesystem::class_device_register(class_tpm, "tpm0");
+
+        let major = tpm0.attr_show("tpm_version_major");
+        let minor = tpm0.attr_show("tpm_version_minor");
+
+        if major.as_deref() != Some("2\n") {
+            return TestResult::Fail("tpm_version_major != '2\\n'");
+        }
+        if minor.as_deref() != Some("0\n") {
+            return TestResult::Fail("tpm_version_minor != '0\\n'");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_tpm_version_major);
+
+    /// PCR transport: returns a canned PCR_Read response with 20-byte
+    /// SHA-1 and 32-byte SHA-256 digests (all-zeros).
+    struct PcrTransport;
+    impl crate::devfs_bridge::TpmTransport for PcrTransport {
+        fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            if cmd.len() < 10 {
+                return Err(());
+            }
+            let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+            if cc == crate::tpm2::TPM_CC_PCR_READ {
+                // Determine digest size from the algorithm in the command.
+                // PCR_Read command layout Part 3 §22.4:
+                // header(10) + TPML_PCR_SELECTION: count(4) + hashAlg(2) +
+                // sizeofSelect(1) + pcrSelect(3)
+                let alg = if cmd.len() >= 16 {
+                    u16::from_be_bytes([cmd[14], cmd[15]])
+                } else {
+                    0x000B // default SHA-256
+                };
+                let digest_size = if alg == 0x0004 { 20usize } else { 32usize };
+
+                // Build response:
+                // header(10) + pcrUpdateCounter(4) +
+                // TPML_PCR_SELECTION: count(4)+hashAlg(2)+sos(1)+bitmap(3) +
+                // TPML_DIGEST: count(4) + TPM2B_DIGEST: size(2)+bytes(digest_size)
+                let body_len = 4 + (4 + 2 + 1 + 3) + (4 + 2 + digest_size);
+                let total = 10 + body_len;
+                let mut r = alloc::vec![0u8; total];
+                // header
+                r[0] = 0x80; r[1] = 0x01;
+                let sz = total as u32;
+                r[2] = (sz >> 24) as u8; r[3] = (sz >> 16) as u8;
+                r[4] = (sz >> 8) as u8;  r[5] = sz as u8;
+                // rc = 0
+                r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+                let mut p = 10usize;
+                // pcrUpdateCounter = 0
+                p += 4;
+                // TPML_PCR_SELECTION count = 1
+                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 1; p += 4;
+                // hashAlg
+                r[p] = (alg >> 8) as u8; r[p+1] = alg as u8; p += 2;
+                // sizeofSelect = 3
+                r[p] = 3; p += 1;
+                // pcrSelect = 3 bytes (all zeros, doesn't matter for parsing)
+                p += 3;
+                // TPML_DIGEST count = 1
+                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 1; p += 4;
+                // TPM2B_DIGEST size
+                r[p] = (digest_size >> 8) as u8;
+                r[p+1] = digest_size as u8;
+                p += 2;
+                // digest bytes = all zeros (already zeroed)
+                let _ = p; // suppress unused warning
+                return Ok(r);
+            }
+            Err(())
+        }
+    }
+
+    fn smoke_sysfs_pcrs_format() -> TestResult {
+        use alloc::sync::Arc;
+        use crate::devfs_bridge::TpmTransport;
+
+        let t = Arc::new(PcrTransport) as Arc<dyn TpmTransport>;
+        crate::sysfs_bridge::register_sysfs_tpm0(t);
+
+        let class_tpm = narf_filesystem::class_register("tpm");
+        let tpm0 = narf_filesystem::class_device_register(class_tpm, "tpm0");
+
+        let pcrs = match tpm0.attr_show("pcrs") {
+            Some(s) => s,
+            None => return TestResult::Fail("pcrs attribute missing"),
+        };
+
+        if !pcrs.starts_with("PCR-00:") {
+            return TestResult::Fail("pcrs does not start with PCR-00:");
+        }
+        if !pcrs.contains("(SHA-1)") {
+            return TestResult::Fail("pcrs missing '(SHA-1)' label");
+        }
+        if !pcrs.contains("(SHA-256)") {
+            return TestResult::Fail("pcrs missing '(SHA-256)' label");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_pcrs_format);
+
+    /// Manufacturer transport: returns 0x494E4643 ("INFC") for PT_MANUFACTURER.
+    struct MfrTransport;
+    impl crate::devfs_bridge::TpmTransport for MfrTransport {
+        fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            if cmd.len() < 10 {
+                return Err(());
+            }
+            let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+            if cc == crate::tpm2::TPM_CC_GET_CAPABILITY {
+                // Build GetCapability response with value 0x494E4643 ("INFC")
+                // Body: moreData(1) + cap(4) + count(4) + tag(4) + value(4)
+                let body = 1 + 4 + 4 + 4 + 4; // 17 bytes
+                let total = 10 + body;
+                let mut r = alloc::vec![0u8; total];
+                r[0] = 0x80; r[1] = 0x01;
+                let sz = total as u32;
+                r[2] = (sz >> 24) as u8; r[3] = (sz >> 16) as u8;
+                r[4] = (sz >> 8) as u8;  r[5] = sz as u8;
+                // rc = 0
+                r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+                let mut p = 10usize;
+                // moreData = 0
+                r[p] = 0; p += 1;
+                // capabilityCode = TPM_CAP_TPM_PROPERTIES = 6
+                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 6; p += 4;
+                // count = 1
+                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 1; p += 4;
+                // property tag = PT_MANUFACTURER = 0x105
+                r[p] = 0; r[p+1] = 0; r[p+2] = 0x01; r[p+3] = 0x05; p += 4;
+                // value = 0x494E4643 ("INFC")
+                r[p] = 0x49; r[p+1] = 0x4E; r[p+2] = 0x46; r[p+3] = 0x43;
+                return Ok(r);
+            }
+            Err(())
+        }
+    }
+
+    fn smoke_sysfs_manufacturer_ascii() -> TestResult {
+        use alloc::sync::Arc;
+        use crate::devfs_bridge::TpmTransport;
+
+        let t = Arc::new(MfrTransport) as Arc<dyn TpmTransport>;
+        crate::sysfs_bridge::register_sysfs_tpm0(t);
+
+        let class_tpm = narf_filesystem::class_register("tpm");
+        let tpm0 = narf_filesystem::class_device_register(class_tpm, "tpm0");
+
+        let mfr = match tpm0.attr_show("manufacturer") {
+            Some(s) => s,
+            None => return TestResult::Fail("manufacturer attribute missing"),
+        };
+
+        // Should be "INFC\n"
+        if !mfr.trim_end_matches('\n').chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+            return TestResult::Fail("manufacturer value contains non-printable chars");
+        }
+        if mfr.trim_end_matches('\n').len() != 4 {
+            return TestResult::Fail("manufacturer value is not 4 chars");
+        }
+        if !mfr.starts_with("INFC") {
+            return TestResult::Fail("manufacturer should be 'INFC'");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_manufacturer_ascii);
 }
