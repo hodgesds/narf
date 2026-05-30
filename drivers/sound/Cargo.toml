@@ -1,0 +1,32 @@
+[package]
+name         = "narf-drivers-sound"
+description  = "Intel/AMD HDA controller + Realtek codec drivers + ALSA-equivalent PCM/mixer surface. Targets the AMD HDA controllers on Zen2/Phoenix laptops with Realtek ALC codecs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_sound"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-memory       = { path = "../../memory" }
+narf-io           = { path = "../../io" }
+narf-arch         = { path = "../../arch" }
+narf-bus          = { path = "../../bus" }
+narf-interrupts   = { path = "../../interrupts" }
+narf-init         = { path = "../../init" }
+narf-scheduler    = { path = "../../scheduler" }
+narf-time         = { path = "../../time" }
+narf-drivers      = { path = "../../drivers" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
