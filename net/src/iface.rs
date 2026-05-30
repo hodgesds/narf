@@ -59,6 +59,62 @@ pub fn count() -> usize {
     IFACES.lock().as_ref().map(|v| v.len()).unwrap_or(0)
 }
 
+/// Per-interface counter snapshot for `/proc/net/dev`. NARF
+/// drivers don't yet report their RX/TX statistics into a central
+/// counter table — when they do, this snapshot will pick them up.
+/// Until then we emit zeros for every counter so unmodified
+/// `ifconfig` / `ip -s link` parsers still print a coherent row.
+#[derive(Clone, Debug)]
+pub struct IfaceCounterSnapshot {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errs: u64,
+    pub rx_drop: u64,
+    pub rx_fifo: u64,
+    pub rx_frame: u64,
+    pub rx_compressed: u64,
+    pub rx_multicast: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errs: u64,
+    pub tx_drop: u64,
+    pub tx_fifo: u64,
+    pub tx_colls: u64,
+    pub tx_carrier: u64,
+    pub tx_compressed: u64,
+}
+
+/// Snapshot every registered interface's name + counters.
+pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
+    let g = IFACES.lock();
+    let v = match g.as_ref() {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    v.iter()
+        .map(|e| IfaceCounterSnapshot {
+            name: e.name.clone(),
+            rx_bytes: 0,
+            rx_packets: 0,
+            rx_errs: 0,
+            rx_drop: 0,
+            rx_fifo: 0,
+            rx_frame: 0,
+            rx_compressed: 0,
+            rx_multicast: 0,
+            tx_bytes: 0,
+            tx_packets: 0,
+            tx_errs: 0,
+            tx_drop: 0,
+            tx_fifo: 0,
+            tx_colls: 0,
+            tx_carrier: 0,
+            tx_compressed: 0,
+        })
+        .collect()
+}
+
 /// Find the first registered interface (Stage-1: there's at most
 /// one; multi-iface routing wants the destination IP to pick).
 pub fn primary() -> Option<NetIfaceSnapshot> {

@@ -74,6 +74,44 @@ static RAW_PKT_SOCKETS: IrqSafeSpinLock<Vec<Arc<RawPacketSocket>>> =
 
 // ── Public API ─────────────────────────────────────────────────────
 
+/// Snapshot of one raw packet socket for `/proc/net/raw`. The raw
+/// row format is the same as TCP/UDP — local/remote address,
+/// queues — even though most fields are unused. We zero what
+/// doesn't apply.
+#[derive(Clone, Debug)]
+pub struct RawSocketSnapshot {
+    pub local_addr: [u8; 4],
+    pub local_port: u16,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    /// Convention: 7=CLOSE for raw (no L4 state).
+    pub state_code: u8,
+    pub protocol: u8,
+}
+
+/// Snapshot every raw packet socket. Cheap: only a few fields.
+pub fn snapshot() -> Vec<RawSocketSnapshot> {
+    let socks = RAW_PKT_SOCKETS.lock();
+    socks
+        .iter()
+        .map(|s| RawSocketSnapshot {
+            local_addr: [0u8; 4],
+            local_port: 0,
+            remote_addr: [0u8; 4],
+            remote_port: 0,
+            state_code: 0x07,
+            // ETH_P_ALL → 0xFF sentinel since we don't have an L4
+            // protocol number; ICMP raw sockets are handled by
+            // `icmp_sock::snapshot_raw_protocols` separately.
+            protocol: if s.protocol == ETH_P_ALL {
+                0xFF
+            } else {
+                (s.protocol & 0xFF) as u8
+            },
+        })
+        .collect()
+}
+
 /// Open a raw packet socket.
 ///
 /// - `protocol`: `ETH_P_ALL` for all frames, or a specific ethertype

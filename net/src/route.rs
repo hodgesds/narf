@@ -162,6 +162,53 @@ pub fn route_list() -> Vec<Route> {
     ROUTE_TABLE.lock().clone()
 }
 
+/// Snapshot of one route in the form `/proc/net/route` expects.
+/// Mirrors what Linux's `rt_cache_seq_show` emits per row.
+#[derive(Clone, Debug)]
+pub struct RouteSnapshot {
+    pub iface: String,
+    pub dst: [u8; 4],
+    pub gateway: [u8; 4],
+    /// Linux flag bits: 1=UP, 2=GATEWAY, 4=HOST, 0x10=DYNAMIC, ...
+    pub flags: u16,
+    pub refcnt: u32,
+    pub use_count: u32,
+    pub metric: u32,
+    pub mask: [u8; 4],
+    pub mtu: u32,
+    pub window: u32,
+    pub irtt: u32,
+}
+
+/// Snapshot the routing table in `/proc/net/route` row shape.
+pub fn snapshot() -> Vec<RouteSnapshot> {
+    let g = ROUTE_TABLE.lock();
+    let mut out = Vec::with_capacity(g.len());
+    for r in g.iter() {
+        // RTF_UP is always set; RTF_GATEWAY when a gateway exists.
+        let mut flags: u16 = 0x0001;
+        if r.gateway.is_some() {
+            flags |= 0x0002;
+        }
+        let gateway = r.gateway.map(|g| g.0).unwrap_or([0u8; 4]);
+        let mask = u32::to_be_bytes(prefix_to_mask(r.dst.prefix_len));
+        out.push(RouteSnapshot {
+            iface: r.iface.clone(),
+            dst: r.dst.addr.0,
+            gateway,
+            flags,
+            refcnt: 0,
+            use_count: 0,
+            metric: r.metric,
+            mask,
+            mtu: 0,
+            window: 0,
+            irtt: 0,
+        });
+    }
+    out
+}
+
 /// Longest-prefix-match lookup for `dst`.
 ///
 /// Returns the first `Route` (highest prefix_len) whose `dst` network

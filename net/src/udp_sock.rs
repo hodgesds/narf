@@ -498,6 +498,46 @@ pub fn deliver(
     q.push_back(dg);
 }
 
+/// Snapshot of one UDP socket's fields-of-interest, used to
+/// render `/proc/net/udp`. Mirrors what Linux's `udp4_seq_show`
+/// extracts per row.
+#[derive(Clone, Debug)]
+pub struct UdpSocketSnapshot {
+    pub local_addr: [u8; 4],
+    pub local_port: u16,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    /// Linux convention: 7=CLOSE (unconnected UDP), 1=ESTABLISHED
+    /// (connected UDP, peer set).
+    pub state_code: u8,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
+}
+
+/// Snapshot every bound UDP socket. Cheap: a few fields per entry.
+pub fn snapshot() -> alloc::vec::Vec<UdpSocketSnapshot> {
+    let tbl = PORT_TABLE.lock();
+    let mut out = alloc::vec::Vec::with_capacity(tbl.entries.len());
+    for (_p, s) in tbl.entries.iter() {
+        let peer = *s.peer.lock();
+        let (remote_addr, remote_port, state_code) = match peer {
+            Some(p) => (p.ip, p.port, 0x01),
+            None => ([0u8; 4], 0u16, 0x07),
+        };
+        let rx_queue = s.rx_queue.lock().len() as u32;
+        out.push(UdpSocketSnapshot {
+            local_addr: s.local.ip,
+            local_port: s.local.port,
+            remote_addr,
+            remote_port,
+            state_code,
+            tx_queue: 0, // UDP has no kernel send queue (sync send)
+            rx_queue,
+        });
+    }
+    out
+}
+
 /// Deliver an ICMP error to the socket whose local addr / port
 /// matches the embedded original-datagram header.
 /// Called from `icmp_sock::deliver_error`.

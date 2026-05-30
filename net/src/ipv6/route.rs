@@ -91,6 +91,49 @@ pub fn list_all() -> Vec<Route> {
     ROUTES.lock().clone()
 }
 
+/// Snapshot for `/proc/net/ipv6_route`. Linux's format:
+/// `<dst> <plen> <src> <splen> <next-hop> <metric> <ref> <use>
+///  <flags> <iface>`.
+#[derive(Clone, Debug)]
+pub struct Ipv6RouteSnapshot {
+    pub dst: [u8; 16],
+    pub dst_prefix_len: u8,
+    pub src: [u8; 16],
+    pub src_prefix_len: u8,
+    pub gateway: [u8; 16],
+    pub metric: u32,
+    pub refcnt: u32,
+    pub use_count: u32,
+    pub flags: u32,
+    pub iface: String,
+}
+
+/// Snapshot every IPv6 route.
+pub fn snapshot() -> Vec<Ipv6RouteSnapshot> {
+    let g = ROUTES.lock();
+    let mut out = Vec::with_capacity(g.len());
+    for r in g.iter() {
+        let gateway = r.gateway.unwrap_or([0u8; 16]);
+        let mut flags: u32 = 0x0001; // RTF_UP
+        if r.gateway.is_some() {
+            flags |= 0x0002; // RTF_GATEWAY
+        }
+        out.push(Ipv6RouteSnapshot {
+            dst: r.prefix,
+            dst_prefix_len: r.prefix_len,
+            src: [0u8; 16],
+            src_prefix_len: 0,
+            gateway,
+            metric: r.metric,
+            refcnt: 0,
+            use_count: 0,
+            flags,
+            iface: r.iface.clone(),
+        });
+    }
+    out
+}
+
 /// Walk routes and drop any whose deadline has elapsed.
 pub fn age_tick(now_ns: u64) {
     let mut g = ROUTES.lock();

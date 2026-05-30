@@ -282,6 +282,40 @@ pub fn __reset_for_test() {
     CACHES.lock().clear();
 }
 
+/// Snapshot of one ARP cache entry. Used by `/proc/net/arp` to
+/// produce the per-row text. Mirrors what Linux's `arp_seq_show`
+/// extracts.
+#[derive(Clone, Debug)]
+pub struct ArpSnapshot {
+    pub ip: [u8; 4],
+    pub mac: [u8; 6],
+    pub iface: String,
+    /// Linux flag bits from `arp_seq_show`. 0=Incomplete, 2=Complete,
+    /// 4=Permanent, 6=Pub.
+    pub flags: u8,
+}
+
+/// Snapshot every entry across all per-iface caches.
+pub fn snapshot() -> Vec<ArpSnapshot> {
+    let g = CACHES.lock();
+    let mut out = Vec::new();
+    for cache in g.iter() {
+        for (ip, e) in cache.entries.iter() {
+            let flags = match e.state {
+                ArpState::Reachable | ArpState::Stale | ArpState::Probe => 0x02,
+                ArpState::Incomplete => 0x00,
+            };
+            out.push(ArpSnapshot {
+                ip: *ip,
+                mac: e.mac,
+                iface: cache.name.clone(),
+                flags,
+            });
+        }
+    }
+    out
+}
+
 // ── Fake-time test hook ────────────────────────────────────────────────
 
 /// Insert an entry and set its `expires_at` to the given value. Test-only.

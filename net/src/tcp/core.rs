@@ -390,6 +390,69 @@ pub fn __reset_for_test() {
     NEXT_LOCAL_PORT.store(49152, Ordering::Relaxed);
 }
 
+/// Snapshot of one TCB's fields-of-interest. Used to render
+/// `/proc/net/tcp` without holding the TCB table lock across the
+/// whole render — we copy minimal data out, drop the lock, then
+/// format. Matches what Linux's `get_tcp4_sock` extracts per row.
+#[derive(Clone, Debug)]
+pub struct TcbSnapshot {
+    pub local_addr: [u8; 4],
+    pub local_port: u16,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    /// Per Linux's `include/net/tcp_states.h` (1-indexed).
+    pub state_code: u8,
+    pub tx_queue: u32,
+    pub rx_queue: u32,
+    pub retrnsmt: u32,
+}
+
+/// Snapshot every TCB in the table. Cheap: a few cycles per entry
+/// to copy 16 bytes plus the state byte.
+pub fn snapshot() -> alloc::vec::Vec<TcbSnapshot> {
+    let g = TCB_TABLE.lock();
+    let m = match g.as_ref() {
+        Some(m) => m,
+        None => return alloc::vec::Vec::new(),
+    };
+    let mut out = alloc::vec::Vec::with_capacity(m.len());
+    for arc in m.values() {
+        let t = arc.lock();
+        out.push(TcbSnapshot {
+            local_addr: t.local_addr,
+            local_port: t.local_port,
+            remote_addr: t.remote_addr,
+            remote_port: t.remote_port,
+            state_code: tcp_state_code(t.state),
+            tx_queue: t.send_buf.len() as u32,
+            // RecvBuf exposes free_window; rx_queue is the in-order
+            // bytes waiting for the user, i.e. limit - free_window.
+            rx_queue: (t.recv_buf.limit as u32).saturating_sub(t.recv_buf.free_window()),
+            retrnsmt: t.rto_count,
+        });
+    }
+    out
+}
+
+/// Map the in-tree `TcpState` enum onto Linux's tcp_state numbering
+/// from `include/net/tcp_states.h`. The numeric values are what
+/// netstat / ss parse from /proc/net/tcp's `st` column.
+fn tcp_state_code(s: TcpState) -> u8 {
+    match s {
+        TcpState::Established => 0x01,
+        TcpState::SynSent     => 0x02,
+        TcpState::SynReceived => 0x03,
+        TcpState::FinWait1    => 0x04,
+        TcpState::FinWait2    => 0x05,
+        TcpState::TimeWait    => 0x06,
+        TcpState::Closed      => 0x07,
+        TcpState::CloseWait   => 0x08,
+        TcpState::LastAck     => 0x09,
+        TcpState::Listen      => 0x0A,
+        TcpState::Closing     => 0x0B,
+    }
+}
+
 // ── Public API: listen / accept ─────────────────────────────────────
 
 pub fn listen(local_addr: [u8; 4], local_port: u16, backlog: usize) -> Result<u32, ()> {

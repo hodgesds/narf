@@ -110,6 +110,66 @@ pub fn list_all() -> Vec<Ipv6IfAddr> {
     ADDRS.lock().clone()
 }
 
+/// Snapshot for `/proc/net/if_inet6`. The Linux format is one
+/// line per address with fields `<32-hex-addr> <ifindex-hex>
+/// <prefix-hex> <scope-hex> <flags-hex> <iface>`.
+#[derive(Clone, Debug)]
+pub struct Ipv6IfAddrSnapshot {
+    pub iface: String,
+    pub addr: [u8; 16],
+    pub ifindex: u32,
+    pub prefix_len: u8,
+    /// Linux scope byte: 0=Global, 0x10=LinkLocal, 0x20=SiteLocal.
+    pub scope: u8,
+    /// IFA_F_* bitmap: Tentative=0x40, Permanent=0x80, Deprecated=0x20.
+    pub flags: u8,
+}
+
+/// Snapshot every IPv6 address bound to any interface.
+pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
+    let g = ADDRS.lock();
+    let mut out = Vec::with_capacity(g.len());
+    // Assign a per-iface index starting at 1. Real ifindex
+    // allocation needs to live in iface.rs once that surface
+    // exists; until then index by iface-name ordinal.
+    let mut idx_for_iface: alloc::collections::BTreeMap<&str, u32> =
+        alloc::collections::BTreeMap::new();
+    let mut next_idx: u32 = 1;
+    for e in g.iter() {
+        let ifindex = *idx_for_iface
+            .entry(e.iface.as_str())
+            .or_insert_with(|| {
+                let i = next_idx;
+                next_idx += 1;
+                i
+            });
+        let scope = match e.scope {
+            AddrScope::Global => 0x00,
+            AddrScope::LinkLocal => 0x20,
+            AddrScope::UniqueLocal => 0x40,
+        };
+        let mut flags: u8 = 0;
+        if e.state == AddrState::Tentative {
+            flags |= 0x40;
+        }
+        if e.state == AddrState::Deprecated {
+            flags |= 0x20;
+        }
+        if e.state == AddrState::Preferred {
+            flags |= 0x80;
+        }
+        out.push(Ipv6IfAddrSnapshot {
+            iface: e.iface.clone(),
+            addr: e.addr,
+            ifindex,
+            prefix_len: e.prefix_len,
+            scope,
+            flags,
+        });
+    }
+    out
+}
+
 /// True iff `addr` is bound to *any* interface.
 pub fn is_local(addr: &[u8; 16]) -> bool {
     let g = ADDRS.lock();

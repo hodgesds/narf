@@ -304,6 +304,81 @@ pub fn __reset_for_test() {
     CT.__reset_for_test();
 }
 
+/// Snapshot of one conntrack entry for `/proc/net/nf_conntrack`.
+/// Linux's `ct_seq_show` emits one line per entry; we copy minimal
+/// data out of the locked entry so the render loop doesn't hold
+/// the global table lock.
+#[derive(Clone, Debug)]
+pub struct ConntrackSnapshot {
+    pub l3proto: &'static str,
+    pub l3proto_num: u8,
+    pub l4proto: &'static str,
+    pub l4proto_num: u8,
+    pub timeout: u32,
+    pub state: &'static str,
+    pub orig_src: [u8; 4],
+    pub orig_dst: [u8; 4],
+    pub orig_sport: u16,
+    pub orig_dport: u16,
+    pub reply_src: [u8; 4],
+    pub reply_dst: [u8; 4],
+    pub reply_sport: u16,
+    pub reply_dport: u16,
+    pub assured: bool,
+    pub use_count: u32,
+}
+
+/// Snapshot every tracked flow for `/proc/net/nf_conntrack`.
+pub fn snapshot() -> alloc::vec::Vec<ConntrackSnapshot> {
+    let by_id = CT.by_id.lock();
+    let mut out = alloc::vec::Vec::with_capacity(by_id.len());
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    for entry in by_id.values() {
+        let e = entry.lock();
+        let l4_num = e.original.proto;
+        let l4_name = match super::L4Proto::from_u8(l4_num) {
+            super::L4Proto::Tcp => "tcp",
+            super::L4Proto::Udp => "udp",
+            super::L4Proto::Icmp => "icmp",
+            super::L4Proto::Other(_) => "other",
+        };
+        let state_str = match (l4_name, e.state, e.tcp_state) {
+            ("tcp", _, Some(TcpCtState::SynSent)) => "SYN_SENT",
+            ("tcp", _, Some(TcpCtState::SynRecv)) => "SYN_RECV",
+            ("tcp", _, Some(TcpCtState::Established)) => "ESTABLISHED",
+            ("tcp", _, Some(TcpCtState::FinWait)) => "FIN_WAIT",
+            ("tcp", _, Some(TcpCtState::CloseWait)) => "CLOSE_WAIT",
+            ("tcp", _, Some(TcpCtState::LastAck)) => "LAST_ACK",
+            ("tcp", _, Some(TcpCtState::TimeWait)) => "TIME_WAIT",
+            ("tcp", _, Some(TcpCtState::Close)) => "CLOSE",
+            (_, CtState::Established, _) => "ESTABLISHED",
+            (_, CtState::New, _) => "NEW",
+            (_, CtState::Related, _) => "RELATED",
+            (_, CtState::Invalid, _) => "INVALID",
+        };
+        let timeout = (e.expires_at_ns.saturating_sub(now) / 1_000_000_000) as u32;
+        out.push(ConntrackSnapshot {
+            l3proto: "ipv4",
+            l3proto_num: 2,
+            l4proto: l4_name,
+            l4proto_num: l4_num,
+            timeout,
+            state: state_str,
+            orig_src: e.original.src_ip,
+            orig_dst: e.original.dst_ip,
+            orig_sport: e.original.src_port,
+            orig_dport: e.original.dst_port,
+            reply_src: e.reply.src_ip,
+            reply_dst: e.reply.dst_ip,
+            reply_sport: e.reply.src_port,
+            reply_dport: e.reply.dst_port,
+            assured: e.state == CtState::Established,
+            use_count: 1,
+        });
+    }
+    out
+}
+
 /// Advance a TCP entry's sub-state based on inbound flags + direction.
 /// `is_reply` is true when the packet matches the reply tuple (or
 /// equivalently, originated from the responder).
