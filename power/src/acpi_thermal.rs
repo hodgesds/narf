@@ -83,6 +83,31 @@ pub struct ThermalTripPoints {
     pub tc2: Option<u64>,
 }
 
+/// Fan device paths returned by `_ALx` (Active cooling fan List).
+///
+/// ACPI 6.5 §11.4.5: `_AL0`..`_AL9` each return a Package of
+/// `ObjectReference` values, one per fan device that should be
+/// engaged at that active-cooling level. This struct holds the
+/// string paths of those references so the thermal governor can
+/// call `acpi_fan.set_control()` on each.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActiveCoolingList {
+    /// Fully-qualified namespace paths of the fans for this level.
+    /// May be empty if the zone has no `_AL{N}` or the package is empty.
+    pub fans: Vec<String>,
+}
+
+/// Processor device paths returned by `_PSL` (Passive cooling
+/// processor List). ACPI 6.5 §11.4.12: `_PSL` returns a Package of
+/// `ObjectReference` values, one per processor that should be
+/// throttled when `_PSV` is crossed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PassiveCoolingList {
+    /// Fully-qualified namespace paths of the processor objects
+    /// to throttle. May be empty if `_PSL` is absent.
+    pub processors: Vec<String>,
+}
+
 /// Errors from a `ThermalZone` query.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThermalError {
@@ -176,6 +201,67 @@ impl ThermalZone {
             return None;
         }
         Some(decik_to_milli_c(dk))
+    }
+
+    /// Return the list of fan device paths for active cooling level `n`
+    /// (`_AL0`..`_AL9`). ACPI 6.5 §11.4.5.
+    ///
+    /// Returns an empty `ActiveCoolingList` when the zone has no `_ALn`
+    /// or when the returned Package contains no recognisable paths.
+    /// The list is a snapshot — safe to hold without the AML lock.
+    pub fn active_cooling_list(&self, level: u8) -> ActiveCoolingList {
+        // Build method name "_ALn".
+        if level > 9 {
+            return ActiveCoolingList::default();
+        }
+        let mut name = [0u8; 4];
+        name[0] = b'_';
+        name[1] = b'A';
+        name[2] = b'L';
+        name[3] = b'0' + level;
+        let leaf = core::str::from_utf8(&name).unwrap();
+        let mut method = self.path.clone();
+        method.push('.');
+        method.push_str(leaf);
+        let v = match evaluate_method(&method, &[]) {
+            Ok(v) => v,
+            Err(_) => return ActiveCoolingList::default(),
+        };
+        let fans = match v {
+            narf_aml::Value::Package(pkg) => pkg
+                .into_iter()
+                .filter_map(|item| match item {
+                    narf_aml::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        ActiveCoolingList { fans }
+    }
+
+    /// Return the list of processor device paths for passive cooling
+    /// (`_PSL`). ACPI 6.5 §11.4.12.
+    ///
+    /// Returns an empty `PassiveCoolingList` when the zone has no `_PSL`.
+    pub fn passive_cooling_list(&self) -> PassiveCoolingList {
+        let mut method = self.path.clone();
+        method.push_str("._PSL");
+        let v = match evaluate_method(&method, &[]) {
+            Ok(v) => v,
+            Err(_) => return PassiveCoolingList::default(),
+        };
+        let processors = match v {
+            narf_aml::Value::Package(pkg) => pkg
+                .into_iter()
+                .filter_map(|item| match item {
+                    narf_aml::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        PassiveCoolingList { processors }
     }
 
     /// Helper: read a method that returns a plain integer.
@@ -470,4 +556,69 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_classify_sparse_trips);
+
+    fn smoke_acpi_thermal_tmp_known_values_3531_3631() -> TestResult {
+        // Renoir 4700U DSDT has _CRT = 3731 and typical idle _TMP ~3531.
+        // 3531 deciK = 353.1 K = 79.95 C = 79_950 milli-C.
+        if decik_to_milli_c(3531) != 79_950 {
+            return TestResult::Fail("3531 deciK must map to 79_950 milli-C (~80 C)");
+        }
+        // 3631 deciK = 363.1 K = 89.95 C = 89_950 milli-C (~90 C).
+        if decik_to_milli_c(3631) != 89_950 {
+            return TestResult::Fail("3631 deciK must map to 89_950 milli-C (~90 C)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_tmp_known_values_3531_3631);
+
+    fn smoke_acpi_thermal_psv_trip_passive_cooling() -> TestResult {
+        // _PSV = 75 C = 75_000 milli-C. Boundary and above → Passive.
+        let mut trips = ThermalTripPoints::default();
+        trips.passive_milli_c = Some(75_000);
+
+        // Below PSV: still None.
+        if classify(74_999, &trips) != ActiveTrip::None {
+            return TestResult::Fail("74.999 C just below _PSV=75 should be None");
+        }
+        // Exactly at PSV boundary (inclusive): Passive.
+        if classify(75_000, &trips) != ActiveTrip::Passive {
+            return TestResult::Fail("75 C at _PSV=75 boundary must be Passive");
+        }
+        // Well above PSV: Passive (no CRT/HOT set).
+        if classify(95_000, &trips) != ActiveTrip::Passive {
+            return TestResult::Fail("95 C with only _PSV=75 must remain Passive");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_psv_trip_passive_cooling);
+
+    fn smoke_acpi_thermal_acx_fan_engagement() -> TestResult {
+        // _AC0 = 70 C, _AC1 = 60 C, _PSV = 80 C.
+        // ACPI §11.4.5: Passive > Active; lower index is more aggressive.
+        let mut trips = ThermalTripPoints::default();
+        trips.passive_milli_c = Some(80_000);
+        trips.active_milli_c[0] = Some(70_000);
+        trips.active_milli_c[1] = Some(60_000);
+
+        // 65 C: above _AC1 (60) but below _AC0 (70) → Active(1).
+        match classify(65_000, &trips) {
+            ActiveTrip::Active(1) => {}
+            _ => return TestResult::Fail("65 C should be Active(1)"),
+        }
+        // 72 C: above _AC0 (70) but below _PSV (80) → Active(0).
+        match classify(72_000, &trips) {
+            ActiveTrip::Active(0) => {}
+            _ => return TestResult::Fail("72 C should be Active(0) (not Passive yet)"),
+        }
+        // 82 C: above _PSV (80) → Passive wins over any Active.
+        if classify(82_000, &trips) != ActiveTrip::Passive {
+            return TestResult::Fail("82 C above _PSV should be Passive, not Active");
+        }
+        // 55 C: below all thresholds → None.
+        if classify(55_000, &trips) != ActiveTrip::None {
+            return TestResult::Fail("55 C below all trips should be None");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_acx_fan_engagement);
 }
