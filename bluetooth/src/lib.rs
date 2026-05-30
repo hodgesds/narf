@@ -62,6 +62,9 @@ pub mod opcode;
 pub mod smp;
 pub mod transport;
 
+pub mod devfs_bridge;
+pub mod sysfs_bridge;
+
 mod tests;
 
 use narf_capabilities::{Cap, CapKind, CapType, Grant};
@@ -94,6 +97,24 @@ pub fn register_initcalls() {
         // controller probed by the USB supervisor will print its own
         // `bluetooth: ... adapter` line at attach time.
         let _ = transport::transport_count();
+        InitResult::Ok
+    });
+    // Stage: install /dev/rfcomm<N> lookup + enumerate hooks into devfs.
+    // Linux ref: net/bluetooth/rfcomm/tty.c:rfcomm_dev_add().
+    narf_init::register(Stage::Late, "bluetooth-devfs", || {
+        fn rfcomm_lookup_hook(name: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+            crate::devfs_bridge::lookup_rfcomm_file(name)
+        }
+        fn rfcomm_enum_hook() -> alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)> {
+            crate::devfs_bridge::enumerate_rfcomm_devices(0, usize::MAX)
+        }
+        narf_filesystem::devfs::install_rfcomm_hooks(rfcomm_lookup_hook, rfcomm_enum_hook);
+        InitResult::Ok
+    });
+    // Stage: register /sys/class/bluetooth/ class stub.
+    // Linux ref: net/bluetooth/hci_sysfs.c:bt_sysfs_init().
+    narf_init::register(Stage::Late, "bluetooth-sysfs", || {
+        let _ = narf_filesystem::sysfs::class_register("bluetooth");
         InitResult::Ok
     });
 }
