@@ -2575,3 +2575,239 @@ fn smoke_fb_pm_hooks_fire_on_phase_pingpong() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/suspend", smoke_fb_pm_hooks_fire_on_phase_pingpong);
+
+// ── Watchdog-bridge smokes ────────────────────────────────────────────────
+//
+// These tests exercise the VFS surface added by `watchdog_bridge.rs`:
+//   /dev/watchdog0  (DevWatchdog FileOps)
+//   /sys/class/watchdog/watchdog<N>/ (WatchdogDevDir attr files)
+//
+// None of these tests touch live hardware — they use `__new_test_state` to
+// allocate isolated `WatchdogState` cells, avoiding global-registry side-
+// effects and cross-test pollution.
+
+fn poll_once_watchdog<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn raw_waker() -> RawWaker {
+        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+// Smoke 1: write any byte → kick_count increments.
+// Linux ref: watchdog_dev.c:watchdog_write (lines 238–275) — any write = ping.
+fn smoke_watchdog_write_any_byte_kicks() -> TestResult {
+    use crate::watchdog_bridge::{DevWatchdog, __new_test_state};
+    use narf_filesystem::FileOps;
+    use core::sync::atomic::Ordering;
+
+    let state = __new_test_state("SP5100 TCO", 60);
+    let before = state.kick_count.load(Ordering::Relaxed);
+    let node = DevWatchdog::new(state.clone());
+    let r = poll_once_watchdog(node.write(0, b"a"));
+    match r {
+        Some(Ok(n)) if n == 1 => {}
+        _ => return TestResult::Fail("write 'a' did not return Ok(1)"),
+    }
+    let after = state.kick_count.load(Ordering::Relaxed);
+    if after != before + 1 {
+        return TestResult::Fail("kick_count did not increment on write 'a'");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_write_any_byte_kicks);
+
+// Smoke 2: write 'V' then watchdog_release → active becomes false.
+// Linux ref: watchdog_dev.c:watchdog_release (lines 278–310) — magic close disarms.
+fn smoke_watchdog_magic_v_close_disarms() -> TestResult {
+    use crate::watchdog_bridge::{DevWatchdog, watchdog_release, __new_test_state};
+    use narf_filesystem::FileOps;
+    use core::sync::atomic::Ordering;
+
+    let state = __new_test_state("SP5100 TCO", 60);
+    let node = DevWatchdog::new(state.clone());
+    // Write 'V' — arms the watchdog AND sets magic_close.
+    let r = poll_once_watchdog(node.write(0, b"V"));
+    match r {
+        Some(Ok(_)) => {}
+        _ => return TestResult::Fail("write 'V' failed"),
+    }
+    if !state.active.load(Ordering::Acquire) {
+        return TestResult::Fail("active not set after write 'V'");
+    }
+    // Release with magic 'V' set → should disarm.
+    watchdog_release(&state);
+    if state.active.load(Ordering::Acquire) {
+        return TestResult::Fail("active still set after magic-V release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_magic_v_close_disarms);
+
+// Smoke 3: write 'a' then close without 'V' → watchdog stays armed.
+// Linux ref: watchdog_dev.c:watchdog_release (lines 296–302) — no magic = no disarm.
+fn smoke_watchdog_close_without_v_keeps_active() -> TestResult {
+    use crate::watchdog_bridge::{DevWatchdog, watchdog_release, __new_test_state};
+    use narf_filesystem::FileOps;
+    use core::sync::atomic::Ordering;
+
+    let state = __new_test_state("SP5100 TCO", 60);
+    let node = DevWatchdog::new(state.clone());
+    let r = poll_once_watchdog(node.write(0, b"a"));
+    match r {
+        Some(Ok(_)) => {}
+        _ => return TestResult::Fail("write 'a' failed"),
+    }
+    if !state.active.load(Ordering::Acquire) {
+        return TestResult::Fail("active not set after write 'a'");
+    }
+    watchdog_release(&state);
+    // No 'V' was written — active must remain true.
+    if !state.active.load(Ordering::Acquire) {
+        return TestResult::Fail("active was cleared on close without magic 'V'");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_close_without_v_keeps_active);
+
+// Smoke 4: /sys/class/watchdog/watchdog0/identity returns "SP5100 TCO\n".
+// Linux ref: watchdog_dev.c WDIOC_GETSUPPORT — identity string.
+fn smoke_watchdog_sysfs_identity() -> TestResult {
+    use crate::watchdog_bridge::{WatchdogDevDir, __new_test_state};
+    use narf_filesystem::DirOps;
+
+    let state = __new_test_state("SP5100 TCO", 60);
+    let dir = WatchdogDevDir { state };
+    let file = match dir.lookup("identity") {
+        Some(f) => f,
+        None => return TestResult::Fail("identity attr not found"),
+    };
+    let mut buf = [0u8; 64];
+    let n = match poll_once_watchdog(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("identity read failed"),
+    };
+    let s = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("identity not valid UTF-8"),
+    };
+    if s != "SP5100 TCO\n" {
+        return TestResult::Fail("identity value mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_sysfs_identity);
+
+// Smoke 5: /sys/class/watchdog/watchdog0/timeout: reads initial, writes new, reads back.
+// Linux ref: watchdog_dev.c:watchdog_set_timeout (lines 95–123).
+fn smoke_watchdog_sysfs_timeout_rw() -> TestResult {
+    use crate::watchdog_bridge::{WatchdogDevDir, __new_test_state};
+    use narf_filesystem::DirOps;
+
+    let state = __new_test_state("SP5100 TCO", 30);
+    let dir = WatchdogDevDir { state };
+
+    // Read initial timeout.
+    let file = match dir.lookup("timeout") {
+        Some(f) => f,
+        None => return TestResult::Fail("timeout attr not found"),
+    };
+    let mut buf = [0u8; 32];
+    let n = match poll_once_watchdog(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("timeout read failed"),
+    };
+    let s = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("timeout not valid UTF-8"),
+    };
+    if s != "30\n" {
+        return TestResult::Fail("initial timeout value mismatch");
+    }
+
+    // Write new timeout.
+    let wr = poll_once_watchdog(file.write(0, b"120\n"));
+    match wr {
+        Some(Ok(_)) => {}
+        _ => return TestResult::Fail("timeout write failed"),
+    }
+
+    // Read back.
+    let mut buf2 = [0u8; 32];
+    let n2 = match poll_once_watchdog(file.read(0, &mut buf2)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("timeout read-back failed"),
+    };
+    let s2 = match core::str::from_utf8(&buf2[..n2]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("timeout read-back not valid UTF-8"),
+    };
+    if s2 != "120\n" {
+        return TestResult::Fail("timeout read-back value mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_sysfs_timeout_rw);
+
+// Smoke 6: bootstatus reflects the CONTROL_FIRED bit.
+// Linux ref: sp5100_tco.c lines 291–327 — CONTROL_FIRED latched at probe.
+fn smoke_watchdog_sysfs_bootstatus() -> TestResult {
+    use crate::watchdog_bridge::{WatchdogDevDir, __new_test_state};
+    use narf_filesystem::DirOps;
+    use core::sync::atomic::Ordering;
+
+    let state = __new_test_state("SP5100 TCO", 60);
+    let dir = WatchdogDevDir { state: state.clone() };
+    let file = match dir.lookup("bootstatus") {
+        Some(f) => f,
+        None => return TestResult::Fail("bootstatus attr not found"),
+    };
+
+    // Initial: CONTROL_FIRED not set → "0\n".
+    let mut buf = [0u8; 8];
+    let n = match poll_once_watchdog(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("bootstatus read failed"),
+    };
+    let s = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bootstatus not valid UTF-8"),
+    };
+    if s != "0\n" {
+        return TestResult::Fail("bootstatus should be 0 initially");
+    }
+
+    // Simulate CONTROL_FIRED set by probe.
+    state.bootstatus.store(true, Ordering::Release);
+
+    // Re-lookup a fresh file node from a fresh dir (closures capture Arc clone).
+    let dir2 = WatchdogDevDir { state: state.clone() };
+    let file2 = match dir2.lookup("bootstatus") {
+        Some(f) => f,
+        None => return TestResult::Fail("bootstatus attr not found (2nd lookup)"),
+    };
+    let mut buf2 = [0u8; 8];
+    let n2 = match poll_once_watchdog(file2.read(0, &mut buf2)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("bootstatus read (fired) failed"),
+    };
+    let s2 = match core::str::from_utf8(&buf2[..n2]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bootstatus (fired) not valid UTF-8"),
+    };
+    if s2 != "1\n" {
+        return TestResult::Fail("bootstatus should be 1 after CONTROL_FIRED");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_sysfs_bootstatus);

@@ -44,6 +44,7 @@ pub mod syscall;
 pub mod system;
 pub mod thermal;
 pub mod watchdog;
+pub mod watchdog_bridge;
 
 #[cfg(target_arch = "x86_64")]
 pub mod cppc;
@@ -300,6 +301,13 @@ pub fn register_initcalls() {
         Err(cpufreq::CpuFreqError::NoBackend) => InitResult::NotPresent,
         Err(_) => InitResult::Ok,
     });
+    // Watchdog VFS bridge: sp5100_tco (AMD) + iTCO (Intel) exposed as
+    // /dev/watchdog0, /dev/watchdog (compat alias), and
+    // /sys/class/watchdog/watchdog<N>/ served by WatchdogSysFs.
+    // Stage::Subsys so devfs + sysfs nodes are live before Stage::Late
+    // initcalls start.
+    // Linux ref: watchdog_core.c:watchdog_cdev_register (lines 391–431).
+    watchdog_bridge::register_bridge();
 }
 
 use alloc::boxed::Box;
