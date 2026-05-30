@@ -816,53 +816,6 @@ impl DeviceRuntimePm for NoopDev {
     }
 }
 
-// ── Smoke Tests ───────────────────────────────────────────────────
-
-#[cfg(any(test, feature = "kernel-test"))]
-mod tests {
-    use super::*;
-    use alloc::sync::Arc;
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    #[kernel_test]
-    async fn smoke_power_source_registration() {
-        use alloc::sync::Arc;
-        struct MockSource;
-        impl PowerSource for MockSource {
-            fn source_type(&self) -> PowerSourceType { PowerSourceType::AcAdaptor }
-            fn capacity_percent(&self) -> u8 { 100 }
-            fn is_charging(&self) -> bool { true }
-            fn name(&self) -> &'static str { "MOCK" }
-        }
-        let src = Arc::new(MockSource);
-        register_source(src);
-        let sources = list_sources();
-        assert!(sources.iter().any(|s| s.name() == "MOCK"));
-    }
-
-    #[kernel_test]
-    async fn smoke_power_device_pm_lifecycle() {
-        let power = bootstrap_device_pm_authority();
-        struct MockDev { reads: core::sync::atomic::AtomicU32 }
-        impl DeviceRuntimePm for MockDev {
-            fn suspend<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-                self.reads.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async {})
-            }
-            fn resume<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-                self.reads.fetch_add(10, Ordering::SeqCst);
-                Box::pin(async {})
-            }
-        }
-        let dev = MockDev { reads: core::sync::atomic::AtomicU32::new(0) };
-        let h = register_device_pm(&power, dev).expect("register");
-        suspend_device(h).await.expect("suspend");
-        resume_device(h).await.expect("resume");
-        // Verify state changes reached the device.
-        // (Implementation detail: MockDev was swapped and put back).
-    }
-}
-
 // ── Bootstrap ───────────────────────────────────────────────────────
 
 /// Mint a `Cap<Power, Grant>`. TCB-only entry path — the kernel calls

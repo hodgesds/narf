@@ -490,23 +490,24 @@ kernel_test_in!("power/watchdog", smoke_watchdog_itco_initial_seconds_clamp);
 
 
 fn smoke_watchdog_sp5100_count_pass_through() -> TestResult {
-
+    // sp5100_tco.h:19,23 — START_STOP = BIT(0), TRIGGER_BIT = BIT(7).
     use crate::watchdog::sp5100::{compose_count_seconds, CONTROL_ENABLE, CONTROL_TRIGGER};
 
     if compose_count_seconds(60) != 60 {
-
         return TestResult::Fail("1 Hz pass-through");
-
     }
 
-    if CONTROL_ENABLE != 1 || CONTROL_TRIGGER != (1 << 6) {
+    // sp5100_tco.h:19 — START_STOP_BIT = BIT(0).
+    if CONTROL_ENABLE != (1 << 0) {
+        return TestResult::Fail("CONTROL_ENABLE wrong (expected BIT(0))");
+    }
 
-        return TestResult::Fail("control bits wrong");
-
+    // sp5100_tco.h:23 — TRIGGER_BIT = BIT(7).
+    if CONTROL_TRIGGER != (1 << 7) {
+        return TestResult::Fail("CONTROL_TRIGGER wrong (expected BIT(7))");
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/watchdog", smoke_watchdog_sp5100_count_pass_through);
@@ -547,7 +548,314 @@ fn smoke_watchdog_sp805_lock_magic_and_load() -> TestResult {
 
 kernel_test_in!("power/watchdog", smoke_watchdog_sp805_lock_magic_and_load);
 
+// ── sp5100 driver smokes ─────────────────────────────────────────────
 
+// Smoke 1: PMIO base resolution — Sp5100PmioBase::mmio_addr() for each variant.
+// Ref: sp5100_tco.c lines 451–476 (MMIO base selection logic).
+fn smoke_sp5100_pmio_base_resolution() -> TestResult {
+    use crate::watchdog::sp5100;
+    use crate::watchdog::Sp5100PmioBase;
+
+    // SB7xx: raw & ~0xFFF → aligned page.
+    let sb7 = Sp5100PmioBase::Sb7xx(0xFEB00_ABC);
+    if sb7.mmio_addr() != 0xFEB00_000 {
+        return TestResult::Fail("Sb7xx page alignment wrong");
+    }
+
+    // SB8xx: (raw & ~0xFFF) + SB800_WDT_MMIO_OFFSET.
+    // SB800_WDT_MMIO_OFFSET = 0xB00.
+    let sb8 = Sp5100PmioBase::Sb8xx(0xFED80_000);
+    if sb8.mmio_addr() != 0xFED80_000 + sp5100::SB800_WDT_MMIO_OFFSET as u64 {
+        return TestResult::Fail("Sb8xx mmio_addr wrong");
+    }
+
+    // EFCH: fixed 0xFEB0_0000.
+    // sp5100_tco.h:79 — EFCH_PM_WDT_ADDR = 0xfeb00000.
+    let efch = Sp5100PmioBase::Efch;
+    if efch.mmio_addr() != sp5100::EFCH_WDT_BASE {
+        return TestResult::Fail("EFCH fixed base wrong");
+    }
+
+    // EfchMmio: supplied base + 0xB00.
+    let efch_mmio = Sp5100PmioBase::EfchMmio(sp5100::EFCH_ACPI_MMIO_BASE);
+    let want = sp5100::EFCH_ACPI_MMIO_BASE + sp5100::EFCH_ACPI_MMIO_WDT_OFFSET as u64;
+    if efch_mmio.mmio_addr() != want {
+        return TestResult::Fail("EfchMmio base + offset wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_sp5100_pmio_base_resolution);
+
+// Smoke 2: sp5100 CONTROL register layout — bit positions for ENABLE, FIRED,
+// DISABLED, TRIGGER match Linux sp5100_tco.h:19–23.
+fn smoke_sp5100_control_register_layout() -> TestResult {
+    use crate::watchdog::sp5100::{
+        CONTROL_DISABLED, CONTROL_ENABLE, CONTROL_FIRED, CONTROL_TRIGGER,
+    };
+
+    // sp5100_tco.h:19 — BIT(0).
+    if CONTROL_ENABLE != 0x01 {
+        return TestResult::Fail("CONTROL_ENABLE != BIT(0)");
+    }
+    // sp5100_tco.h:20 — BIT(1).
+    if CONTROL_FIRED != 0x02 {
+        return TestResult::Fail("CONTROL_FIRED != BIT(1)");
+    }
+    // sp5100_tco.h:22 — BIT(3).
+    if CONTROL_DISABLED != 0x08 {
+        return TestResult::Fail("CONTROL_DISABLED != BIT(3)");
+    }
+    // sp5100_tco.h:23 — BIT(7).
+    if CONTROL_TRIGGER != 0x80 {
+        return TestResult::Fail("CONTROL_TRIGGER != BIT(7)");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_sp5100_control_register_layout);
+
+// Smoke 3: sp5100 kick path — compose_kick_control sets TRIGGER, preserves
+// ENABLE, and does not change other bits.
+// Ref: sp5100_tco.c lines 137–144 (tco_timer_ping).
+fn smoke_sp5100_kick_sets_trigger() -> TestResult {
+    use crate::watchdog::sp5100::{compose_kick_control, CONTROL_ENABLE, CONTROL_TRIGGER};
+
+    // Start with just ENABLE set.
+    let ctrl = CONTROL_ENABLE;
+    let kicked = compose_kick_control(ctrl);
+    if kicked & CONTROL_TRIGGER == 0 {
+        return TestResult::Fail("kick did not set TRIGGER");
+    }
+    if kicked & CONTROL_ENABLE == 0 {
+        return TestResult::Fail("kick cleared ENABLE");
+    }
+
+    // Kick on already-running state (ENABLE | TRIGGER already set).
+    let ctrl2 = CONTROL_ENABLE | CONTROL_TRIGGER;
+    let kicked2 = compose_kick_control(ctrl2);
+    if kicked2 & CONTROL_TRIGGER == 0 {
+        return TestResult::Fail("kick on running: TRIGGER not set");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_sp5100_kick_sets_trigger);
+
+// Smoke 4: sp5100 set_timeout encode — compose_count_seconds is identity
+// (1 Hz tick rate). Ref: sp5100_tco.c:149–155.
+fn smoke_sp5100_set_timeout_encode() -> TestResult {
+    use crate::watchdog::sp5100::compose_count_seconds;
+
+    for &s in &[0u32, 1, 30, 60, 120, u32::MAX] {
+        if compose_count_seconds(s) != s {
+            return TestResult::Fail("count_seconds not identity");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_sp5100_set_timeout_encode);
+
+// Smoke 5: Sp5100Driver::from_probe aborts when WDT_DISABLED is set.
+// Ref: sp5100_tco.c:297–301.
+fn smoke_sp5100_probe_disabled_returns_none() -> TestResult {
+    use crate::watchdog::{sp5100, Sp5100Driver};
+
+    let ctrl_disabled = sp5100::CONTROL_DISABLED;
+    if Sp5100Driver::from_probe(0xFEB0_0000, 60, ctrl_disabled).is_some() {
+        return TestResult::Fail("probe should return None when DISABLED bit is set");
+    }
+
+    // Without DISABLED bit: probe should succeed.
+    let ctrl_ok = sp5100::CONTROL_ENABLE;
+    if Sp5100Driver::from_probe(0xFEB0_0000, 60, ctrl_ok).is_none() {
+        return TestResult::Fail("probe returned None on a healthy CONTROL value");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_sp5100_probe_disabled_returns_none);
+
+// Smoke 6: Sp5100Driver records the WDT_FIRED latch from probe CONTROL value.
+// Ref: sp5100_tco.c:307–308 (save WatchDogFired status).
+fn smoke_sp5100_fired_latch_on_probe() -> TestResult {
+    use crate::watchdog::{sp5100, Sp5100Driver};
+
+    let ctrl_fired = sp5100::CONTROL_FIRED;
+    let drv = Sp5100Driver::from_probe(0xFEB0_0000, 60, ctrl_fired)
+        .expect("probe must succeed (no DISABLED bit)");
+    if !drv.fired_on_prev_boot {
+        return TestResult::Fail("FIRED bit not latched into fired_on_prev_boot");
+    }
+
+    let drv2 = Sp5100Driver::from_probe(0xFEB0_0000, 60, 0)
+        .expect("probe must succeed");
+    if drv2.fired_on_prev_boot {
+        return TestResult::Fail("fired_on_prev_boot set without FIRED bit");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_sp5100_fired_latch_on_probe);
+
+// ── iTCO driver smokes ───────────────────────────────────────────────
+
+// Smoke 7: iTCO TCO1 register offsets match Linux iTCO_wdt.c lines 72–80.
+fn smoke_itco_register_offsets() -> TestResult {
+    use crate::watchdog::itco;
+
+    // iTCO_wdt.c:72 — TCO_RLD = TCOBASE + 0x00.
+    if itco::TCO_RLD != 0x00 {
+        return TestResult::Fail("TCO_RLD != 0x00");
+    }
+    // iTCO_wdt.c:76 — TCO1_STS = TCOBASE + 0x04.
+    if itco::TCO1_STS != 0x04 {
+        return TestResult::Fail("TCO1_STS != 0x04");
+    }
+    // iTCO_wdt.c:77 — TCO2_STS = TCOBASE + 0x06.
+    if itco::TCO2_STS != 0x06 {
+        return TestResult::Fail("TCO2_STS != 0x06");
+    }
+    // iTCO_wdt.c:78 — TCO1_CNT = TCOBASE + 0x08.
+    if itco::TCO1_CNT != 0x08 {
+        return TestResult::Fail("TCO1_CNT != 0x08");
+    }
+    // iTCO_wdt.c:80 — TCOv2_TMR = TCOBASE + 0x12.
+    if itco::TCOV2_TMR != 0x12 {
+        return TestResult::Fail("TCOV2_TMR != 0x12");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_itco_register_offsets);
+
+// Smoke 8: iTCO kick — ITcoDriver::kick_value() == TCO_RLD_KICK == 1.
+// Ref: iTCO_wdt.c:293 — outw(0x01, TCO_RLD(p)).
+fn smoke_itco_kick_value() -> TestResult {
+    use crate::watchdog::{ITcoDriver, ITcoVersion, itco};
+
+    let drv = ITcoDriver::new(0x0460, ITcoVersion::V2, 60, None);
+    if drv.kick_value() != itco::TCO_RLD_KICK {
+        return TestResult::Fail("kick_value != TCO_RLD_KICK");
+    }
+    if drv.kick_value() != 1 {
+        return TestResult::Fail("TCO_RLD_KICK must be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_itco_kick_value);
+
+// Smoke 9: iTCO timeout calc — secs → tmr register encoding.
+// The TCO clock ticks at ~0.6 s; 30 s → 50 ticks; 600 s → 0x3FF (clamped).
+// Ref: iTCO_wdt.c:345–389 (iTCO_wdt_set_timeout) + compose_initial_seconds.
+fn smoke_itco_timeout_calc() -> TestResult {
+    use crate::watchdog::itco::compose_initial_seconds;
+
+    // 30 s: ceil(30000 / 600) = 50.
+    if compose_initial_seconds(30) != 50 {
+        return TestResult::Fail("30 s != 50 ticks");
+    }
+
+    // Minimum clamp: anything ≤ 2 s → 4 ticks.
+    if compose_initial_seconds(0) != 4 {
+        return TestResult::Fail("0 s should clamp to minimum 4");
+    }
+    if compose_initial_seconds(1) != 4 {
+        return TestResult::Fail("1 s should clamp to minimum 4");
+    }
+    if compose_initial_seconds(2) != 4 {
+        return TestResult::Fail("2 s should clamp to minimum 4");
+    }
+
+    // 3 s: ceil(3000 / 600) = 5 ticks.
+    if compose_initial_seconds(3) != 5 {
+        return TestResult::Fail("3 s != 5 ticks");
+    }
+
+    // Maximum clamp.
+    if compose_initial_seconds(u32::MAX) != 0x3FF {
+        return TestResult::Fail("overflow should clamp to 0x3FF");
+    }
+
+    // Cross-check: timer value → ITcoDriver.
+    let drv = crate::watchdog::ITcoDriver::new(0x0460, crate::watchdog::ITcoVersion::V2, 30, None);
+    if drv.timer_value() != 50 {
+        return TestResult::Fail("ITcoDriver::timer_value() for 30 s != 50");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_itco_timeout_calc);
+
+// Smoke 10: iTCO enable/stop CNT manipulations mask NMI_NOW correctly.
+// Ref: iTCO_wdt.c:279–320.
+fn smoke_itco_cnt_enable_stop() -> TestResult {
+    use crate::watchdog::{ITcoDriver, ITcoVersion, itco};
+
+    let drv = ITcoDriver::new(0x0460, ITcoVersion::V2, 60, None);
+
+    // Enable: clears HALT and NMI_NOW, other bits preserved.
+    let cnt_with_halt = itco::TCO1_CNT_HALT | itco::NMI_NOW | 0x0800; // NO_REBOOT set
+    let enabled = drv.enable_cnt(cnt_with_halt);
+    if enabled & itco::TCO1_CNT_HALT != 0 {
+        return TestResult::Fail("enable left HALT set");
+    }
+    if enabled & itco::NMI_NOW != 0 {
+        return TestResult::Fail("enable left NMI_NOW set");
+    }
+    // NO_REBOOT (bit 11) should be preserved.
+    if enabled & itco::TCO1_CNT_NO_REBOOT == 0 {
+        return TestResult::Fail("enable cleared NO_REBOOT");
+    }
+
+    // Stop: sets HALT, masks NMI_NOW.
+    let cnt_running = 0x0800u16; // NO_REBOOT, no HALT
+    let stopped = drv.stop_cnt(cnt_running);
+    if stopped & itco::TCO1_CNT_HALT == 0 {
+        return TestResult::Fail("stop did not set HALT");
+    }
+    if stopped & itco::NMI_NOW != 0 {
+        return TestResult::Fail("stop left NMI_NOW set");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_itco_cnt_enable_stop);
+
+// Smoke 11: Watchdog kick-task period = timeout / 2 (minimum 1 s).
+fn smoke_watchdog_kick_task_period() -> TestResult {
+    use crate::watchdog::WatchdogKickTask;
+
+    let t60 = WatchdogKickTask::for_timeout(60);
+    if t60.period_ms != 30_000 {
+        return TestResult::Fail("60 s timeout -> 30 s period");
+    }
+
+    let t0 = WatchdogKickTask::for_timeout(0);
+    if t0.period_ms != 1_000 {
+        return TestResult::Fail("0 s timeout -> 1 s minimum period");
+    }
+
+    let t1 = WatchdogKickTask::for_timeout(1);
+    if t1.period_ms != 1_000 {
+        return TestResult::Fail("1 s timeout -> 1 s minimum period");
+    }
+
+    let sp_drv = crate::watchdog::Sp5100Driver::from_probe(0xFEB0_0000, 60, 0)
+        .expect("probe must succeed");
+    if sp_drv.kick_period_secs() != 30 {
+        return TestResult::Fail("Sp5100Driver kick_period_secs(60) != 30");
+    }
+
+    let itco_drv = crate::watchdog::ITcoDriver::new(
+        0x0460, crate::watchdog::ITcoVersion::V2, 60, None);
+    if itco_drv.kick_period_secs() != 30 {
+        return TestResult::Fail("ITcoDriver kick_period_secs(60) != 30");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/watchdog", smoke_watchdog_kick_task_period);
 
 // ── PSCI ──────────────────────────────────────────────────────────
 
