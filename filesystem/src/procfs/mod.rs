@@ -714,7 +714,6 @@ impl DirOps for ProcDynamicDir {
 ///
 /// Used in tests that drive async `resolve_async` calls synchronously.
 pub fn poll_once<F: core::future::Future>(fut: F) -> Option<F::Output> {
-    use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     // No-op waker — procfs futures are always `Poll::Ready` on the

@@ -78,7 +78,7 @@ mod tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
 mod sysfs_tests;
-pub use devfs::{install_console_signal_hook, mount_default as mount_devfs_default, DevFs};
+pub use devfs::{install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks, mount_default as mount_devfs_default, register_snd_dir, register_tpm, unregister_tpm, DevFs};
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
@@ -88,8 +88,8 @@ pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 pub use sysfs::{
     class_device_register, class_register, kobject_add_attr, kobject_add_bin_attr,
-    kobject_emit_uevent, install_net_snapshot_hook, AttrShow, BinAttrRead, Kobject,
-    NetIfaceInfo, SysFs, SysKobjDir,
+    kobject_add_writable_attr, kobject_emit_uevent, install_net_snapshot_hook, sysfs_root,
+    AttrShow, AttrStore, BinAttrRead, Kobject, NetIfaceInfo, SysFs, SysKobjDir,
 };
 pub use uevent::{
     emit as emit_uevent, emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv,
@@ -262,6 +262,9 @@ pub enum FsError {
     /// The backing FS doesn't implement this op (e.g. virtiofs skeleton
     /// pre-Stage-4).
     Unsupported,
+    /// Data supplied by userspace was not parseable or out of range.
+    /// Maps to POSIX `EINVAL`. Used by sysfs store callbacks.
+    InvalidData,
 }
 
 impl From<CapError> for FsError {

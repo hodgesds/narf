@@ -23,9 +23,10 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
+use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT};
 
 /// `/dev/null` — read = EOF, write = discard.
 struct DevNull;
@@ -63,7 +64,6 @@ impl FileOps for DevNull {
 /// non-cryptographic guarantee `crypto::per_task_rng()` documents.
 struct DevRandom;
 
-use core::sync::atomic::{AtomicU64, Ordering};
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 
 fn next_random_u32() -> u32 {
@@ -230,6 +230,106 @@ pub fn unregister_fp() {
     *FP_NODE.lock() = None;
 }
 
+// ── /dev/rfcomm<N> hook ───────────────────────────────────────────────────
+// Linux ref: `net/bluetooth/rfcomm/tty.c:318` — rfcomm_dev_add.
+
+static RFCOMM_LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
+static RFCOMM_ENUM_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn install_rfcomm_hooks(
+    lookup: fn(&str) -> Option<Arc<dyn FileOps>>,
+    enumerate: fn() -> Vec<(String, FileType)>,
+) {
+    RFCOMM_LOOKUP_HOOK.store(lookup as usize, Ordering::Release);
+    RFCOMM_ENUM_HOOK.store(enumerate as usize, Ordering::Release);
+}
+
+fn rfcomm_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
+    let ptr = RFCOMM_LOOKUP_HOOK.load(Ordering::Acquire);
+    if ptr == 0 { return None; }
+    let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
+    f(name)
+}
+
+fn rfcomm_enumerate() -> Vec<(String, FileType)> {
+    let ptr = RFCOMM_ENUM_HOOK.load(Ordering::Acquire);
+    if ptr == 0 { return Vec::new(); }
+    let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
+    f()
+}
+
+// ── /dev/ttyUSB<N> hook ───────────────────────────────────────────────────
+// Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
+
+static TTY_USB_LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
+static TTY_USB_ENUM_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn install_tty_usb_hooks(
+    lookup: fn(&str) -> Option<Arc<dyn FileOps>>,
+    enumerate: fn() -> Vec<(String, FileType)>,
+) {
+    TTY_USB_LOOKUP_HOOK.store(lookup as usize, Ordering::Release);
+    TTY_USB_ENUM_HOOK.store(enumerate as usize, Ordering::Release);
+}
+
+fn tty_usb_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
+    let ptr = TTY_USB_LOOKUP_HOOK.load(Ordering::Acquire);
+    if ptr == 0 { return None; }
+    let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
+    f(name)
+}
+
+fn tty_usb_enumerate() -> Vec<(String, FileType)> {
+    let ptr = TTY_USB_ENUM_HOOK.load(Ordering::Acquire);
+    if ptr == 0 { return Vec::new(); }
+    let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
+    f()
+}
+
+// ── /dev/video<N> hook ────────────────────────────────────────────────────
+// Linux ref: `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`.
+
+static VIDEO_LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
+static VIDEO_ENUM_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn install_video_hooks(
+    lookup: fn(&str) -> Option<Arc<dyn FileOps>>,
+    enumerate: fn() -> Vec<(String, FileType)>,
+) {
+    VIDEO_LOOKUP_HOOK.store(lookup as usize, Ordering::Release);
+    VIDEO_ENUM_HOOK.store(enumerate as usize, Ordering::Release);
+}
+
+fn video_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
+    let ptr = VIDEO_LOOKUP_HOOK.load(Ordering::Acquire);
+    if ptr == 0 { return None; }
+    let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
+    f(name)
+}
+
+fn video_enumerate() -> Vec<(String, FileType)> {
+    let ptr = VIDEO_ENUM_HOOK.load(Ordering::Acquire);
+    if ptr == 0 { return Vec::new(); }
+    let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
+    f()
+}
+
+// ── /dev/snd/ delegate ────────────────────────────────────────────────
+
+/// Delegate for `/dev/snd/*`, installed by the sound driver.
+///
+/// Same hook/delegate pattern as `FP_NODE` (fingerprint) to avoid a
+/// circular dependency between `narf-filesystem` and `narf-drivers-sound`.
+static SND_DIR: IrqSafeSpinLock<Option<Arc<dyn DirOps>>> = IrqSafeSpinLock::new(None);
+
+/// Register (or replace) the `/dev/snd/` directory delegate.
+///
+/// Called once from `narf_drivers_sound::sound_fs_initcall()` after the
+/// first card is probed.  Idempotent.
+pub fn register_snd_dir(dir: Arc<dyn DirOps>) {
+    *SND_DIR.lock() = Some(dir);
+}
+
 /// `/dev/fp0` — proxy to whatever `Arc<dyn FileOps>` the USB
 /// fingerprint driver installed.
 struct DevFp;
@@ -264,6 +364,121 @@ impl FileOps for DevFp {
                 perms: 0o660,
             },
             mtime_cycles: 0,
+        }
+    }
+}
+
+// ── /dev/tpm0 + /dev/tpmrm0 ──────────────────────────────────────────
+
+/// Optional `FileOps` delegate for `/dev/tpm0`.  Installed by the TPM
+/// driver after the CRB/TIS transport is probed.  Reads/writes from
+/// `/dev/tpm0` route to the TPM2 command/response path.
+///
+/// Linux ref: `drivers/char/tpm/tpm-dev.c` — per-fd buffer model.
+static TPM0_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
+
+/// Optional `FileOps` delegate for `/dev/tpmrm0`.  Tracks transient
+/// handles and flushes them on close.
+static TPMRM0_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
+
+/// Register both TPM device nodes at once.  Called by `tpm::devfs_bridge::register_dev_nodes()`.
+pub fn register_tpm(tpm0: Arc<dyn FileOps>, tpmrm0: Arc<dyn FileOps>) {
+    *TPM0_NODE.lock() = Some(tpm0);
+    *TPMRM0_NODE.lock() = Some(tpmrm0);
+}
+
+/// Unregister both TPM device nodes (driver tear-down / test reset).
+pub fn unregister_tpm() {
+    *TPM0_NODE.lock() = None;
+    *TPMRM0_NODE.lock() = None;
+}
+
+/// `/dev/tpm0` — proxy to the installed TPM FileOps.
+struct DevTpm0Proxy;
+
+impl FileOps for DevTpm0Proxy {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let node = TPM0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.read(offset, buf).await,
+                None => Err(FsError::Io(narf_block::BlockError::IOError)),
+            }
+        })
+    }
+
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let node = TPM0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.write(offset, buf).await,
+                None => Err(FsError::Io(narf_block::BlockError::IOError)),
+            }
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        let node = TPM0_NODE.lock().clone();
+        match node {
+            Some(n) => n.poll_readiness(),
+            None => POLL_OUT,
+        }
+    }
+}
+
+/// `/dev/tpmrm0` — proxy to the installed TPM resource-manager FileOps.
+struct DevTpmRm0Proxy;
+
+impl FileOps for DevTpmRm0Proxy {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let node = TPMRM0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.read(offset, buf).await,
+                None => Err(FsError::Io(narf_block::BlockError::IOError)),
+            }
+        })
+    }
+
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let node = TPMRM0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.write(offset, buf).await,
+                None => Err(FsError::Io(narf_block::BlockError::IOError)),
+            }
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        let node = TPMRM0_NODE.lock().clone();
+        match node {
+            Some(n) => n.poll_readiness(),
+            None => POLL_OUT,
         }
     }
 }
@@ -478,6 +693,29 @@ impl DirOps for DevDir {
             }
             "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
+            "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
+            "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
+            // Dynamic: ttyUSB<N> USB-to-serial ports.
+            // Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
+            name if name.starts_with("ttyUSB")
+                && name[6..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                tty_usb_lookup(name)
+            }
+            // Dynamic: video<N> V4L2 camera nodes.
+            // Linux ref: `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`.
+            name if name.starts_with("video")
+                && name[5..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                video_lookup(name)
+            }
+            // Dynamic: rfcomm<N> Bluetooth serial ports.
+            // Linux ref: `net/bluetooth/rfcomm/tty.c:318` — rfcomm_dev_add.
+            name if name.starts_with("rfcomm")
+                && name[6..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                rfcomm_lookup(name)
+            }
             // Dynamic: query the block-device registry after static names miss.
             // Covers registered names like "nvme0", "sata0p1", "vblk0", etc.
             _ => crate::devfs_block::lookup_block_file(name),
@@ -493,6 +731,8 @@ impl DirOps for DevDir {
             "pts"   => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
             "disk"  => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
             "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
+            // Sound subsystem — delegate installed by narf-drivers-sound.
+            "snd"   => SND_DIR.lock().clone(),
             _ => None,
         }
     }
@@ -525,9 +765,12 @@ impl DirOps for DevDir {
             DirEntry { name: "tty0",    file_type: FileType::Special },
             DirEntry { name: "ptmx",    file_type: FileType::Special },
             DirEntry { name: "fp0",     file_type: FileType::Special },
+            DirEntry { name: "tpm0",    file_type: FileType::Special },
+            DirEntry { name: "tpmrm0",  file_type: FileType::Special },
             DirEntry { name: "pts",     file_type: FileType::Dir },
             DirEntry { name: "disk",    file_type: FileType::Dir },
             DirEntry { name: "input",   file_type: FileType::Dir },
+            DirEntry { name: "snd",     file_type: FileType::Dir },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -547,9 +790,12 @@ impl DirOps for DevDir {
             ("tty0",    FileType::Special),
             ("ptmx",    FileType::Special),
             ("fp0",     FileType::Special),
+            ("tpm0",    FileType::Special),
+            ("tpmrm0",  FileType::Special),
             ("pts",     FileType::Dir),
             ("disk",    FileType::Dir),
             ("input",   FileType::Dir),
+            ("snd",     FileType::Dir),
         ];
         let static_names: Vec<String> = static_entries.iter().map(|(n, _)| (*n).into()).collect();
         let block_extras: Vec<(String, FileType)> =
@@ -558,10 +804,17 @@ impl DirOps for DevDir {
                 .filter(|(name, _)| !static_names.iter().any(|s| s == name))
                 .collect();
 
+        let rfcomm_extras = rfcomm_enumerate();
+        let tty_usb_extras = tty_usb_enumerate();
+        let video_extras = video_enumerate();
+
         static_entries
             .iter()
             .map(|(n, t)| ((*n).into(), *t))
             .chain(block_extras)
+            .chain(rfcomm_extras)
+            .chain(tty_usb_extras)
+            .chain(video_extras)
             .skip(cursor)
             .take(max)
             .collect()
