@@ -737,6 +737,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-extcon"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-usbpd",
+]
+
+[[package]]
 name = "narf-drivers-fingerprint"
 version = "0.0.0"
 dependencies = [
@@ -924,6 +934,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-hwmon"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-console",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-i2c"
 version = "0.0.0"
 dependencies = [
@@ -1051,6 +1073,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-input",
  "narf-interrupts",
@@ -1088,6 +1111,20 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-serial"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-arch",
+ "narf-bus",
+ "narf-console",
+ "narf-init",
+ "narf-interrupts",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]

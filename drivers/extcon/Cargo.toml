@@ -1,0 +1,26 @@
+[package]
+name         = "narf-drivers-extcon"
+description  = "External Connector (extcon) framework + USB Type-C connector class. Mirrors Linux drivers/extcon/ + drivers/usb/typec/."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_extcon"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-usbpd        = { path = "../../usbpd" }
+narf-capabilities = { path = "../../capabilities" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+# Gating so `#[cfg(feature = "kernel-test")]` inside src/ doesn't
+# trigger the unexpected_cfgs lint. The test harness enables this.
+kernel-test = []
+
+[lints]
+workspace = true
