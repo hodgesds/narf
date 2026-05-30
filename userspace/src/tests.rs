@@ -10507,3 +10507,290 @@ fn smoke_socket_so_rcvbuf_sndbuf_clamp() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_socket_so_rcvbuf_sndbuf_clamp);
+
+// ── SMAP copy-from/to-user smoke tests ────────────────────────────
+//
+// These tests exercise the `copy_from_user` / `copy_to_user` helpers
+// added by the SMAP fix. Because the kernel-test harness runs in
+// supervisor mode (CPL=0) with the kernel's own address space active,
+// we use *kernel-heap* buffers as the simulated "user pointer". The
+// kernel heap is canonical (0xFFFF_FF80_*) so `validate_user_range`
+// passes; SMAP does not fire because kernel pages carry PTE.U=0 (the
+// supervisor-to-supervisor read is always permitted).
+//
+// A full user-pointer test requires an actual ring-3 task — the
+// init/shell boot path exercises that in the QEMU integration test.
+//
+// Linux analogue: `lib/test_user_copy.c` (`test_kernel_ptr_fail`,
+// `test_valid_kernel_copy`).
+
+/// Smoke 1: `sys_write` copies kernel buffer through FileOps without
+/// passing the raw user pointer to the FileOps impl.
+#[cfg(target_arch = "x86_64")]
+fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, FdEntry, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static SEEN_CORRECT: AtomicBool = AtomicBool::new(false);
+    SEEN_CORRECT.store(false, Ordering::Relaxed);
+
+    // FileOps that records whether the write buffer contained the
+    // expected sentinel bytes (proving the copy happened correctly).
+    struct SentinelFile;
+    impl FileOps for SentinelFile {
+        fn read<'a>(&'a self, _o: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            buf.fill(0xBB);
+            alloc::boxed::Box::pin(async move { Ok(buf.len()) })
+        }
+        fn write<'a>(&'a self, _o: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            // Verify every byte is the expected sentinel.
+            let all_aa = buf.iter().all(|&b| b == 0xAA);
+            SEEN_CORRECT.store(all_aa, Ordering::Relaxed);
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0, mode: narf_filesystem::Mode::FILE_RW, mtime_cycles: 0 }
+        }
+    }
+
+    static FAKE_TASK_W: u64 = 0xF001;
+    fn task_w() -> u64 { FAKE_TASK_W }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_w);
+    let fd_n = fd::with_table(FAKE_TASK_W, |t| {
+        t.open(FdEntry { ops: Arc::new(SentinelFile), offset: 0, flags: 0 })
+    }).expect("with_table");
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // "User" buffer is a kernel-heap allocation filled with 0xAA.
+    let user_buf = alloc::vec![0xAAu8; 32];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_n as u64,
+            arg1: user_buf.as_ptr() as u64,
+            arg2: user_buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 32) {
+        return TestResult::Fail("sys_write returned wrong value");
+    }
+    if !SEEN_CORRECT.load(Ordering::Relaxed) {
+        return TestResult::Fail("FileOps::write received wrong bytes (copy_from_user broken)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_smap_sys_write_kbuf_roundtrip);
+
+/// Smoke 2: `sys_write` with `len > 16 MiB` returns EINVAL (-22).
+#[cfg(target_arch = "x86_64")]
+fn smoke_smap_sys_write_oversized_einval() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK_OV: u64 = 0xF002;
+    fn task_ov() -> u64 { FAKE_TASK_OV }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_ov);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // 17 MiB > 16 MiB cap — should return EINVAL = -22.
+    // ptr value doesn't matter (len check fires first); use a stable address.
+    let dummy_buf = [0u8; 1];
+    let dummy_ptr = dummy_buf.as_ptr() as u64;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,  // fd (doesn't matter)
+            arg1: dummy_ptr,
+            arg2: (17 * 1024 * 1024) as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    let expected = SyscallReturn::ok((-22i64) as u64);
+    if ctx.ret != Some(expected) {
+        return TestResult::Fail("sys_write with len>16MiB did not return EINVAL");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_smap_sys_write_oversized_einval);
+
+/// Smoke 3: `sys_write` with null pointer returns EFAULT (-14).
+#[cfg(target_arch = "x86_64")]
+fn smoke_smap_sys_write_null_efault() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK_NP: u64 = 0xF003;
+    fn task_np() -> u64 { FAKE_TASK_NP }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_np);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // ptr = 0 (null) → EFAULT = -14.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: 0,   // null pointer
+            arg2: 16,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    let expected = SyscallReturn::ok((-14i64) as u64);
+    if ctx.ret != Some(expected) {
+        return TestResult::Fail("sys_write with null ptr did not return EFAULT");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_smap_sys_write_null_efault);
+
+/// Smoke 4: `sys_read` writes kernel-buf result back to a kernel-side
+/// output buffer; verifies copy_to_user carries the correct bytes.
+#[cfg(target_arch = "x86_64")]
+fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, FdEntry, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK_R: u64 = 0xF004;
+    fn task_r() -> u64 { FAKE_TASK_R }
+
+    // FileOps that fills the kernel staging buffer with 0xCC.
+    struct CcFile;
+    impl FileOps for CcFile {
+        fn read<'a>(&'a self, _o: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            buf.fill(0xCC);
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn write<'a>(&'a self, _o: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0, mode: narf_filesystem::Mode::FILE_RW, mtime_cycles: 0 }
+        }
+    }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_r);
+    let fd_n = fd::with_table(FAKE_TASK_R, |t| {
+        t.open(FdEntry { ops: Arc::new(CcFile), offset: 0, flags: 0 })
+    }).expect("with_table");
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // Simulated "user" output buffer: kernel heap, all zeros initially.
+    let mut out_buf = alloc::vec![0u8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_n as u64,
+            arg1: out_buf.as_mut_ptr() as u64,
+            arg2: out_buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 16) {
+        return TestResult::Fail("sys_read returned wrong count");
+    }
+    // copy_to_user must have written 0xCC into the output buffer.
+    if out_buf.iter().any(|&b| b != 0xCC) {
+        return TestResult::Fail("sys_read output buffer not filled with expected bytes");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_smap_sys_read_kbuf_roundtrip);
