@@ -60,6 +60,12 @@ static __FORCE_LINK_EXTCON: fn() -> usize = || {
     narf_drivers_extcon::class::device_count()
 };
 
+extern crate narf_modules;
+#[used]
+static __FORCE_LINK_MODULES: fn() -> usize = || {
+    narf_modules::registry::len()
+};
+
 use core::fmt::Write;
 
 use narf_console::Writer;

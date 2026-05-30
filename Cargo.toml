@@ -103,6 +103,7 @@ members = [
     "drivers/tpm",
     "drivers/hwmon",
     "drivers/serial",
+    "modules",
 ]
 # narf-testbin / userspace/init / userspace/shell are built out-of-
 # line by verification's build.rs (and by xtask's iso-boot path)

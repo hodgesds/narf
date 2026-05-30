@@ -66,6 +66,7 @@ narf-drivers-sound = { path = "../drivers/sound" }
 narf-drivers-hwmon   = { path = "../drivers/hwmon" }
 narf-drivers-extcon  = { path = "../drivers/extcon", features = ["kernel-test"] }
 narf-compat-win   = { path = "../compat/win" }
+narf-modules      = { path = "../modules" }
 
 [features]
 # Opt-in end-to-end user-mode smoke tests. Enabling this adds the

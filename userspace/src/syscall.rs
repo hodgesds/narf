@@ -1217,6 +1217,27 @@ pub enum Syscall {
     /// cursor; the kernel re-snapshots each call.
     Listdir,
 
+    /// `arg0 = image_ptr`, `arg1 = image_len`, `arg2 = params_ptr`
+    /// (currently ignored). Linux `init_module(2)` (x86_64=175,
+    /// aarch64 generic ABI has no direct number — NARF wires both
+    /// to the same handler). Loads a kernel module from an in-memory
+    /// image. The kernel copies the image into kernel space, parses
+    /// the ELF, applies relocations, and calls `narf_module_init`.
+    /// Returns 0 on success, negative errno on failure (see
+    /// `narf_modules::syscalls::ModuleSyscallError::to_errno`).
+    InitModule,
+
+    /// `arg0 = fd`, `arg1 = params_ptr`, `arg2 = flags`. Linux
+    /// `finit_module(2)` (x86_64=313, aarch64=273). Like InitModule
+    /// but reads the image from an open file descriptor.
+    FinitModule,
+
+    /// `arg0 = name_ptr`, `arg1 = name_len`, `arg2 = flags`. Linux
+    /// `delete_module(2)` (x86_64=176, aarch64=106). Unloads the
+    /// module named `name` if its refcount is zero, otherwise
+    /// returns -EBUSY.
+    DeleteModule,
+
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor`,
     /// `arg3 = out_buf_ptr`, `arg4 = out_buf_len`. Batched
     /// directory read: serialise as many entries as fit into the
@@ -1420,6 +1441,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRandom, 318),
     (Syscall::MemfdCreate, 319),
     (Syscall::CopyFileRange, 326),
+    // Loadable kernel modules — Linux x86_64 numbers.
+    // init_module = 175, delete_module = 176, finit_module = 313.
+    (Syscall::InitModule, 175),
+    (Syscall::DeleteModule, 176),
+    (Syscall::FinitModule, 313),
     // tcgetattr/tcsetattr are libc-only on Linux (ioctl(TCGETS) backed);
     // we keep them as direct syscalls and place them in the NARF range.
     // gethostname is libc-only on Linux too.
@@ -1552,6 +1578,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fstatfs, 44),
     (Syscall::Pselect6, 72),        // pselect6
     (Syscall::Poll, 73),            // ppoll
+    // Loadable kernel modules — aarch64 generic ABI numbers.
+    // init_module = 105, delete_module = 106, finit_module = 273.
+    (Syscall::InitModule, 105),
+    (Syscall::DeleteModule, 106),
+    (Syscall::FinitModule, 273),
 ];
 
 /// NARF-only extension numbers — single shared range on every arch.

@@ -1,0 +1,21 @@
+[package]
+name         = "narf-modules"
+description  = "Runtime-loadable kernel module subsystem: ELF parse, relocate, lifecycle, /proc + /sys integration."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_modules"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-filesystem   = { path = "../filesystem" }
+
+[lints]
+workspace = true
