@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod ahci;
 pub mod emmc;
+pub mod rtsx;
 pub mod sd_proto;
 pub mod sdhci;
 pub mod ufs;
@@ -33,6 +34,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "sdhci", || {
         sdhci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtsx", || {
+        rtsx::register_pci_driver();
         InitResult::Ok
     });
     // Intel VMD must register at Stage::Device because its probe
