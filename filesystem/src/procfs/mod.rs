@@ -21,15 +21,20 @@
 //! lookups return NotFound and /proc/self resolves to pid 0.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use narf_lib::sync::IrqSafeSpinLock;
+
 use crate::{
     DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
 };
+
+pub mod net;
 
 // ── Hook plumbing ───────────────────────────────────────────────
 
@@ -108,6 +113,248 @@ fn task_info(pid: u64) -> Option<ProcTaskInfo> {
     }
     let f: TaskInfoFn = unsafe { core::mem::transmute(v) };
     f(pid)
+}
+
+// ── Dynamic registration framework ──────────────────────────────
+//
+// `ProcFile` is the per-file trait other subsystems implement and
+// register via `register_proc`. The registry is a tree of nodes
+// (file or dir) keyed by the leading path components; `register_proc`
+// auto-creates the intermediate directories.
+
+/// One dynamically-registered procfs file. The `read` method is
+/// called on every open; subsystems usually format their state into
+/// a fresh `Vec<u8>` per call so the user sees a consistent
+/// snapshot per read.
+///
+/// Linux ref: `struct proc_dir_entry::proc_iops` + `proc_fops` from
+/// `fs/proc/internal.h`. The Rust trait collapses inode + file ops
+/// into one object — NARF doesn't have a separate inode cache yet.
+pub trait ProcFile: Send + Sync + core::fmt::Debug {
+    /// Generate the file's content at this moment.
+    fn read(&self) -> Vec<u8>;
+
+    /// `true` if the file accepts writes. Default is read-only.
+    fn writable(&self) -> bool {
+        false
+    }
+
+    /// Handle a write. Default returns `FsError::ReadOnly`.
+    fn write(&self, _buf: &[u8]) -> Result<usize, FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Last-modified time in monotonic cycles. Default reports the
+    /// current monotonic clock so callers that snapshot mtime to
+    /// detect a change always observe a fresh value across reads.
+    fn mtime_cycles(&self) -> u64 {
+        narf_time::monotonic_ns()
+    }
+}
+
+/// A node in the dynamic procfs tree — either a file (leaf) or a
+/// directory containing more nodes.
+pub(crate) enum ProcNode {
+    File(Arc<dyn ProcFile>),
+    Dir(BTreeMap<String, ProcNode>),
+}
+
+impl core::fmt::Debug for ProcNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ProcNode::File(_) => f.write_str("ProcNode::File"),
+            ProcNode::Dir(m) => write!(f, "ProcNode::Dir(len={})", m.len()),
+        }
+    }
+}
+
+pub(crate) static REGISTRY: IrqSafeSpinLock<Option<BTreeMap<String, ProcNode>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Register a procfs file at `path` (relative to `/proc`, e.g.
+/// `"net/tcp"` not `"/proc/net/tcp"`). Intermediate directories
+/// are created automatically.
+///
+/// A second `register_proc` at the same path replaces the existing
+/// file — hard cutover; the old `Arc<dyn ProcFile>` is dropped.
+///
+/// Linux ref: `proc_create_data` in `fs/proc/generic.c:566`.
+pub fn register_proc(path: &str, file: Arc<dyn ProcFile>) {
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return;
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    let mut g = REGISTRY.lock();
+    let root = g.get_or_insert_with(BTreeMap::new);
+    insert_into(root, &components, file);
+}
+
+fn insert_into(
+    map: &mut BTreeMap<String, ProcNode>,
+    components: &[&str],
+    file: Arc<dyn ProcFile>,
+) {
+    match components {
+        [] => {}
+        [name] => {
+            map.insert(String::from(*name), ProcNode::File(file));
+        }
+        [head, tail @ ..] => {
+            let entry = map
+                .entry(String::from(*head))
+                .or_insert_with(|| ProcNode::Dir(BTreeMap::new()));
+            // Hard cutover: if the slot was a file, replace it with
+            // a directory holding the new path. Loses the old file,
+            // matches Linux behaviour where a registration would
+            // simply fail with -EEXIST today.
+            if let ProcNode::File(_) = entry {
+                *entry = ProcNode::Dir(BTreeMap::new());
+            }
+            if let ProcNode::Dir(child_map) = entry {
+                insert_into(child_map, tail, file);
+            }
+        }
+    }
+}
+
+/// Remove a previously-registered procfs file. Returns `true` iff
+/// an entry existed at that path. Empty parent directories are
+/// left in place — Linux's `remove_proc_entry` does the same.
+pub fn unregister_proc(path: &str) -> bool {
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return false;
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    let mut g = REGISTRY.lock();
+    let root = match g.as_mut() {
+        Some(r) => r,
+        None => return false,
+    };
+    remove_from(root, &components)
+}
+
+fn remove_from(map: &mut BTreeMap<String, ProcNode>, components: &[&str]) -> bool {
+    match components {
+        [] => false,
+        [name] => map.remove(*name).is_some(),
+        [head, tail @ ..] => {
+            if let Some(ProcNode::Dir(child_map)) = map.get_mut(*head) {
+                remove_from(child_map, tail)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Snapshot of one directory level so callers (lookup/iter) can
+/// release the registry lock before walking children.
+#[derive(Debug)]
+pub(crate) enum ProcNodeSnapshot {
+    File(Arc<dyn ProcFile>),
+    Dir(Vec<(String, ProcNodeKind)>),
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum ProcNodeKind {
+    File,
+    Dir,
+}
+
+/// Look up a node in the registry by relative path.
+pub(crate) fn lookup_registry(components: &[&str]) -> Option<ProcNodeSnapshot> {
+    let g = REGISTRY.lock();
+    let mut cur = g.as_ref()?;
+    let mut i = 0;
+    while i < components.len() {
+        let seg = components[i];
+        let node = cur.get(seg)?;
+        if i + 1 == components.len() {
+            return Some(match node {
+                ProcNode::File(f) => ProcNodeSnapshot::File(f.clone()),
+                ProcNode::Dir(m) => ProcNodeSnapshot::Dir(snapshot_dir(m)),
+            });
+        }
+        match node {
+            ProcNode::Dir(m) => {
+                cur = m;
+                i += 1;
+            }
+            ProcNode::File(_) => return None,
+        }
+    }
+    None
+}
+
+fn snapshot_dir(m: &BTreeMap<String, ProcNode>) -> Vec<(String, ProcNodeKind)> {
+    m.iter()
+        .map(|(k, v)| {
+            let kind = match v {
+                ProcNode::File(_) => ProcNodeKind::File,
+                ProcNode::Dir(_) => ProcNodeKind::Dir,
+            };
+            (k.clone(), kind)
+        })
+        .collect()
+}
+
+/// Iterator helper: list names at a given dir path.
+fn list_registry_dir(components: &[&str]) -> Vec<(String, ProcNodeKind)> {
+    if components.is_empty() {
+        let g = REGISTRY.lock();
+        if let Some(m) = g.as_ref() {
+            return snapshot_dir(m);
+        }
+        return Vec::new();
+    }
+    match lookup_registry(components) {
+        Some(ProcNodeSnapshot::Dir(v)) => v,
+        _ => Vec::new(),
+    }
+}
+
+/// `FileOps` adapter for a dynamically-registered `ProcFile`.
+pub(crate) struct ProcDynFile {
+    pub(crate) file: Arc<dyn ProcFile>,
+}
+
+impl core::fmt::Debug for ProcDynFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProcDynFile").field("file", &self.file).finish()
+    }
+}
+
+impl FileOps for ProcDynFile {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let bytes = self.file.read();
+            slice_read(&bytes, offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let writable = self.file.writable();
+        let result = if writable {
+            self.file.write(buf)
+        } else {
+            Err(FsError::ReadOnly)
+        };
+        Box::pin(async move { result })
+    }
+    fn stat(&self) -> Stat {
+        let mode = if self.file.writable() {
+            Mode::FILE_RW
+        } else {
+            Mode::FILE_RO
+        };
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode,
+            mtime_cycles: self.file.mtime_cycles(),
+        }
+    }
 }
 
 // ── Generic closure-backed read-only file ───────────────────────
@@ -306,6 +553,15 @@ impl DirOps for ProcRoot {
             "sched" => Some(Arc::new(ProcStaticFile { name: "sched", gen: gen_sched })),
             "self" => Some(Arc::new(ProcDirMarker)),
             _ => {
+                // Dynamic registry — file or directory marker. The
+                // dir marker keeps resolve_async happy so it'll
+                // then descend via lookup_dir afterwards.
+                if let Some(snap) = lookup_registry(&[name]) {
+                    return Some(match snap {
+                        ProcNodeSnapshot::File(f) => Arc::new(ProcDynFile { file: f }) as Arc<dyn FileOps>,
+                        ProcNodeSnapshot::Dir(_) => Arc::new(ProcDirMarker) as Arc<dyn FileOps>,
+                    });
+                }
                 // Numeric pid → directory marker (lookup-as-file).
                 // resolve_async needs lookup_async to return a
                 // FileOps that stat()s as Dir before it'll call
@@ -325,6 +581,13 @@ impl DirOps for ProcRoot {
             // time; we materialise a fresh ProcPidDir bound to it.
             let pid = current_pid();
             return Some(Arc::new(ProcPidDir { pid }));
+        }
+        // Registry-backed subdirectory (e.g. "net").
+        let snap = lookup_registry(&[name]);
+        if matches!(snap, Some(ProcNodeSnapshot::Dir(_))) {
+            return Some(Arc::new(ProcDynamicDir {
+                path_components: alloc::vec![String::from(name)],
+            }));
         }
         // Numeric name → per-pid dir. Validate the pid is live.
         if let Ok(pid) = name.parse::<u64>() {
@@ -354,6 +617,17 @@ impl DirOps for ProcRoot {
             DirEntry { name: "sched", file_type: FileType::File },
             DirEntry { name: "self", file_type: FileType::Dir },
         ];
+        // Dynamic registry top-level entries (e.g. "net", "acpi", ...).
+        for (name, kind) in list_registry_dir(&[]) {
+            let leaked: &'static str = Box::leak(name.into_boxed_str());
+            entries.push(DirEntry {
+                name: leaked,
+                file_type: match kind {
+                    ProcNodeKind::File => FileType::File,
+                    ProcNodeKind::Dir => FileType::Dir,
+                },
+            });
+        }
         for pid in list_pids() {
             let s = pid.to_string();
             // Leak the String so its bytes outlive this iter call.
@@ -363,6 +637,102 @@ impl DirOps for ProcRoot {
             entries.push(DirEntry { name: leaked, file_type: FileType::Dir });
         }
         Box::new(entries.into_iter())
+    }
+}
+
+// ── Dynamic-registry directory view ────────────────────────────
+//
+// `ProcDynamicDir` presents a registry subtree (e.g. `["net"]`) as a
+// `DirOps` — the same view that `ProcRoot::lookup_dir` hands to
+// `resolve_async` when it descends into a dynamic sub-directory.
+//
+// Linux ref: `proc_lookup` (fs/proc/generic.c:499) + the inode-lookup
+// path that backs every `struct proc_dir_entry` with a `proc_iops`.
+
+/// A `DirOps` view of a dynamic procfs subtree identified by the
+/// leading `path_components` that reach it from the registry root.
+///
+/// Calling `iter()` returns one `DirEntry` per child of that node;
+/// `lookup()` returns the `FileOps` for a registered file under it.
+#[derive(Debug)]
+pub struct ProcDynamicDir {
+    /// Path components from the registry root to this directory,
+    /// e.g. `["net"]` for `/proc/net/`.
+    pub path_components: Vec<String>,
+}
+
+impl DirOps for ProcDynamicDir {
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        let mut path: Vec<&str> = self.path_components.iter().map(String::as_str).collect();
+        path.push(name);
+        match lookup_registry(&path) {
+            Some(ProcNodeSnapshot::File(f)) => Some(Arc::new(ProcDynFile { file: f })),
+            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker)),
+            None => None,
+        }
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        let mut path: Vec<&str> = self.path_components.iter().map(String::as_str).collect();
+        path.push(name);
+        if matches!(lookup_registry(&path), Some(ProcNodeSnapshot::Dir(_))) {
+            let mut child_components = self.path_components.clone();
+            child_components.push(String::from(name));
+            return Some(Arc::new(ProcDynamicDir {
+                path_components: child_components,
+            }));
+        }
+        None
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
+        let comps: Vec<&str> = self.path_components.iter().map(String::as_str).collect();
+        let children = list_registry_dir(&comps);
+        // DirEntry holds &'static str for name; we need to leak the
+        // String — the same approach ProcRoot::iter uses for pid names.
+        let entries: Vec<DirEntry> = children
+            .into_iter()
+            .map(|(name, kind)| {
+                let file_type = match kind {
+                    ProcNodeKind::File => FileType::File,
+                    ProcNodeKind::Dir => FileType::Dir,
+                };
+                let leaked: &'static str = Box::leak(name.into_boxed_str());
+                DirEntry { name: leaked, file_type }
+            })
+            .collect();
+        Box::new(entries.into_iter())
+    }
+}
+
+// ── Single-poll helper (for tests) ─────────────────────────────
+
+/// Poll `fut` exactly once using a no-op waker. Returns `Some(value)`
+/// if the future completes in that single poll, or `None` if it would
+/// need to wake up later (which never happens for procfs futs — they
+/// are always immediately ready).
+///
+/// Used in tests that drive async `resolve_async` calls synchronously.
+pub fn poll_once<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // No-op waker — procfs futures are always `Poll::Ready` on the
+    // first poll so we never need to schedule a wake-up.
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |data| RawWaker::new(data, &VTABLE), // clone
+        |_| {},                              // wake
+        |_| {},                              // wake_by_ref
+        |_| {},                              // drop
+    );
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+
+    let mut pinned = core::pin::pin!(fut);
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
     }
 }
 
