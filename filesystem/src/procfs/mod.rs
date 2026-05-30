@@ -35,6 +35,11 @@ use crate::{
 };
 
 pub mod net;
+pub mod pid_ext;
+pub mod sys;
+pub mod sys_fs;
+pub mod sys_net;
+pub mod sys_vm;
 
 // ── Hook plumbing ───────────────────────────────────────────────
 
@@ -56,6 +61,15 @@ pub struct ProcTaskInfo {
     /// the kernel hook from the AS's regions table; rendered into
     /// /proc/[pid]/maps text by `render_maps`.
     pub vmas: Vec<ProcVma>,
+}
+
+/// A key-value pair from the ELF auxiliary vector.  Used by
+/// `set_proc_auxv` / `proc_auxv_of` and rendered into
+/// `/proc/[pid]/auxv` as two little-endian u64s (key, value).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ProcAuxEntry {
+    pub key: u64,
+    pub value: u64,
 }
 
 /// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
