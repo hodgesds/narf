@@ -155,6 +155,10 @@ impl core::fmt::Debug for ConnectorState {
 }
 
 // Cables a Type-C connector can report.
+// Headphone is included because a USB-C to 3.5 mm DAC adapter connected
+// to a Type-C port presents as an audio accessory that the extcon class
+// must reflect. Linux drivers/extcon/extcon.c registers EXTCON_JACK_HEADPHONE
+// as a cable state on typec ports that support audio adapters.
 const SUPPORTED: [Cable; CABLE_COUNT] = [
     Cable::Usb,
     Cable::UsbHost,
@@ -164,8 +168,9 @@ const SUPPORTED: [Cable; CABLE_COUNT] = [
     Cable::Dp,
     Cable::Dock,
     Cable::ThunderboltDock,
+    Cable::Headphone,
 ];
-const CABLE_COUNT: usize = 8;
+const CABLE_COUNT: usize = 9;
 
 impl TypecConnector {
     /// Create a new Type-C connector with `name` as its stable

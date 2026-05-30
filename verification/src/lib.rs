@@ -54,6 +54,12 @@ static __FORCE_LINK_HWMON: fn() -> usize = || {
     narf_drivers_hwmon::registry::count()
 };
 
+extern crate narf_drivers_extcon;
+#[used]
+static __FORCE_LINK_EXTCON: fn() -> usize = || {
+    narf_drivers_extcon::class::device_count()
+};
+
 use core::fmt::Write;
 
 use narf_console::Writer;

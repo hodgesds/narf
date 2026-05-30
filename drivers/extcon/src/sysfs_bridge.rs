@@ -235,8 +235,8 @@ mod tests {
     extern crate alloc;
 
     use alloc::sync::Arc;
-    use alloc::string::ToString;
 
+    use narf_filesystem::FsInstance;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_usbpd::tcpc::{CcState, CcStatus};
 
@@ -271,9 +271,7 @@ mod tests {
         crate::class::register(conn.clone());
         populate_extcon_class();
 
-        let root = narf_filesystem::sysfs::SysFs::new();
-        use narf_filesystem::FsInstance;
-        let sys_root = root.root();
+        let sys_root = narf_filesystem::sysfs::SysFs::new().root();
 
         let class_dir = match sys_root.lookup_dir("class") {
             Some(d) => d,
@@ -289,13 +287,10 @@ mod tests {
         };
 
         // Read the name attr.
-        use narf_filesystem::DirOps;
         let name_file = match dev_dir.lookup("name") {
             Some(f) => f,
             None => return TestResult::Fail("name attr missing on extcon0"),
         };
-
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 64];
         let n = poll_once(name_file.read(0, &mut buf));
         match n {
@@ -323,7 +318,6 @@ mod tests {
         crate::class::register(conn.clone());
         populate_extcon_class();
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
         let dev_dir = descend_path(
             &sys_root,
@@ -334,13 +328,11 @@ mod tests {
             None => return TestResult::Fail("extcon0 path missing"),
         };
 
-        use narf_filesystem::DirOps;
         let state_file = match dev_dir.lookup("state") {
             Some(f) => f,
             None => return TestResult::Fail("state attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 256];
         let n = poll_once(state_file.read(0, &mut buf));
         match n {
@@ -368,7 +360,6 @@ mod tests {
         crate::class::register(conn.clone());
         populate_extcon_class();
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
 
         // Descend: class → extcon → extcon0 → cable.0
@@ -381,13 +372,11 @@ mod tests {
             None => return TestResult::Fail("cable.0 subdir missing"),
         };
 
-        use narf_filesystem::DirOps;
         let name_file = match cable_dir.lookup("name") {
             Some(f) => f,
             None => return TestResult::Fail("cable.0/name attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 64];
         let n = poll_once(name_file.read(0, &mut buf));
         match n {
@@ -419,7 +408,6 @@ mod tests {
         // Now attach the first cable (Cable::Usb for TypecConnector).
         conn.update_cable_state(Cable::Usb, true);
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
         let dev_dir = descend_path(&sys_root, &["class", "extcon", "extcon0"]);
         let dev_dir = match dev_dir {
@@ -427,13 +415,11 @@ mod tests {
             None => return TestResult::Fail("extcon0 path missing"),
         };
 
-        use narf_filesystem::DirOps;
         let state_file = match dev_dir.lookup("state") {
             Some(f) => f,
             None => return TestResult::Fail("state attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 256];
         let n = poll_once(state_file.read(0, &mut buf));
         match n {
@@ -463,7 +449,6 @@ mod tests {
         typec_class::typec_register(conn.clone());
         populate_typec_class();
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
         let port_dir = descend_path(&sys_root, &["class", "typec", "port0"]);
         let port_dir = match port_dir {
@@ -471,13 +456,11 @@ mod tests {
             None => return TestResult::Fail("typec/port0 path missing"),
         };
 
-        use narf_filesystem::DirOps;
         let orient_file = match port_dir.lookup("orientation") {
             Some(f) => f,
             None => return TestResult::Fail("orientation attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 32];
         let n = poll_once(orient_file.read(0, &mut buf));
         match n {
@@ -506,7 +489,6 @@ mod tests {
         typec_class::typec_register(conn.clone());
         populate_typec_class();
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
         let port_dir = descend_path(&sys_root, &["class", "typec", "port0"]);
         let port_dir = match port_dir {
@@ -514,13 +496,11 @@ mod tests {
             None => return TestResult::Fail("typec/port0 missing"),
         };
 
-        use narf_filesystem::DirOps;
         let dr_file = match port_dir.lookup("data_role") {
             Some(f) => f,
             None => return TestResult::Fail("data_role attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 32];
         let n = poll_once(dr_file.read(0, &mut buf));
         match n {
@@ -549,7 +529,6 @@ mod tests {
         typec_class::typec_register(conn.clone());
         populate_typec_class();
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
         let port_dir = descend_path(&sys_root, &["class", "typec", "port0"]);
         let port_dir = match port_dir {
@@ -557,13 +536,11 @@ mod tests {
             None => return TestResult::Fail("typec/port0 missing"),
         };
 
-        use narf_filesystem::DirOps;
         let pr_file = match port_dir.lookup("power_role") {
             Some(f) => f,
             None => return TestResult::Fail("power_role attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 32];
         let n = poll_once(pr_file.read(0, &mut buf));
         match n {
@@ -593,7 +570,6 @@ mod tests {
         typec_class::typec_register(conn.clone());
         populate_typec_class();
 
-        use narf_filesystem::FsInstance;
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
         // Alt mode appears under port0.altmode0 inside the port0 kobject.
         let port_dir = descend_path(&sys_root, &["class", "typec", "port0"]);
@@ -602,7 +578,6 @@ mod tests {
             None => return TestResult::Fail("typec/port0 missing"),
         };
 
-        use narf_filesystem::DirOps;
         let alt_dir = match port_dir.lookup_dir("port0.altmode0") {
             Some(d) => d,
             None => return TestResult::Fail("port0.altmode0 subdir missing"),
@@ -612,7 +587,6 @@ mod tests {
             None => return TestResult::Fail("svid attr missing"),
         };
 
-        use narf_filesystem::FileOps;
         let mut buf = [0u8; 32];
         let n = poll_once(svid_file.read(0, &mut buf));
         match n {
