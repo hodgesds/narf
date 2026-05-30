@@ -45,6 +45,7 @@ pub mod brightness_keys;
 pub mod intel_bl;
 pub mod kbd_backlight;
 pub mod leds;
+pub mod sysfs_bridge;
 
 mod tests;
 
@@ -163,6 +164,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Device, "backlight/brightness-keys", || {
         brightness_keys::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Device, "backlight/sysfs", || {
+        sysfs_bridge::populate_backlight_class();
         InitResult::Ok
     });
 }

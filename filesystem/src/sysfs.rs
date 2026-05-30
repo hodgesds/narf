@@ -69,6 +69,12 @@ use crate::uevent::{UeventAction, emit};
 /// Linux ref: `struct attribute / show` (include/linux/sysfs.h:24).
 pub type AttrShow = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Attribute store (write) function for writable sysfs files.
+/// Called with the raw user-supplied bytes; returns
+/// `Err(FsError::InvalidData)` for malformed input.
+/// Linux ref: `struct attribute / store` (include/linux/sysfs.h:26).
+pub type AttrStore = Arc<dyn Fn(&[u8]) -> Result<(), crate::FsError> + Send + Sync>;
+
 /// Binary-attribute read function: called with `(offset, buf)`.
 /// Returns the number of bytes written.
 /// Linux ref: `struct bin_attribute / read` (include/linux/sysfs.h:68).
@@ -121,6 +127,9 @@ pub struct Kobject {
     children: IrqSafeSpinLock<Vec<Arc<Kobject>>>,
     /// Text attribute files (`show` callbacks).
     attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrShow>>,
+    /// Write callbacks for read-write attributes.
+    /// Linux ref: `struct attribute / store` (include/linux/sysfs.h:26).
+    store_attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrStore>>,
     /// Binary attribute files.
     bin_attrs: IrqSafeSpinLock<BTreeMap<&'static str, BinAttrRead>>,
 }
@@ -141,6 +150,7 @@ impl Kobject {
             parent: None,
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
@@ -153,6 +163,7 @@ impl Kobject {
             parent: Some(parent.clone()),
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         parent.children.lock().push(child.clone());
@@ -205,6 +216,27 @@ impl Kobject {
         Some(show())
     }
 
+    /// Call the store function for `name` with raw user bytes.
+    /// Returns `None` if `name` has no store callback (attr is read-only).
+    /// Linux ref: `sysfs_kf_write` (fs/sysfs/file.c:160).
+    pub fn attr_store(&self, name: &str, data: &[u8]) -> Option<Result<(), crate::FsError>> {
+        let store = self.store_attrs.lock().get(name)?.clone();
+        Some(store(data))
+    }
+
+    /// True if `name` has a registered store callback (i.e. is writable).
+    pub fn attr_is_writable(&self, name: &str) -> bool {
+        self.store_attrs.lock().contains_key(name)
+    }
+
+    /// Recover the `&'static str` key matching `name` by scanning the
+    /// attrs BTreeMap.  Used by VFS lookup so that any attr registered
+    /// via `kobject_add_attr` / `kobject_add_writable_attr` is
+    /// automatically visible in the VFS without a separate static list.
+    pub fn find_attr_key(&self, name: &str) -> Option<&'static str> {
+        self.attrs.lock().keys().copied().find(|&k| k == name)
+    }
+
     /// Call the bin-attr read function for `name`.
     pub fn bin_attr_read(&self, name: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
         let read = *self.bin_attrs.lock().get(name)?;
@@ -236,6 +268,15 @@ fn ensure_root() -> Arc<Kobject> {
 
 fn get_root() -> Arc<Kobject> {
     ensure_root()
+}
+
+/// Return the sysfs root kobject. Used by tests to navigate the tree
+/// after `populate_*` calls.
+///
+/// Returns a clone of the root `Arc<Kobject>`; the root is created
+/// lazily on first call (same as `ensure_root`).
+pub fn sysfs_root() -> Arc<Kobject> {
+    get_root()
 }
 
 // ── Driver registration API ───────────────────────────────────────────
@@ -272,6 +313,30 @@ where
 /// Linux ref: `sysfs_create_bin_file` (fs/sysfs/bin.c:209).
 pub fn kobject_add_bin_attr(kobj: &Kobject, name: &'static str, read: BinAttrRead) {
     kobj.bin_attrs.lock().insert(name, read);
+}
+
+/// Add a read-write text attribute (show + store) to a kobject.
+///
+/// `show` is called on every `read()`.  `store` is called on `write()`
+/// and receives the raw user-supplied bytes; returns
+/// `Err(FsError::InvalidData)` for malformed input.
+///
+/// Linux ref: `struct attribute` with both `.show` and `.store`
+/// pointers set (`include/linux/sysfs.h:24-26`).  Examples:
+/// `cur_state_store` at `drivers/thermal/thermal_sysfs.c:533`,
+/// `brightness_store` at `drivers/leds/led-class.c`.
+pub fn kobject_add_writable_attr<F, G>(
+    kobj: &Kobject,
+    name: &'static str,
+    show: F,
+    store: G,
+)
+where
+    F: Fn() -> String + Send + Sync + 'static,
+    G: Fn(&[u8]) -> Result<(), crate::FsError> + Send + Sync + 'static,
+{
+    kobj.attrs.lock().insert(name, Arc::new(show));
+    kobj.store_attrs.lock().insert(name, Arc::new(store));
 }
 
 /// Emit a uevent for `kobj` with `action`.
@@ -443,14 +508,13 @@ struct SysRoot;
 impl DirOps for SysRoot {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let kobj = get_root();
-        // Attrs at root level
-        if kobj.has_attr(name) {
-            if let Some(attr_s) = attr_name_static(name) {
-                return Some(Arc::new(SysAttrFile {
-                    kobj: kobj.clone(),
-                    attr_name: attr_s,
-                }));
-            }
+        // Text attrs: use find_attr_key so any dynamically-registered attr
+        // is visible without a separate static allowlist.
+        if let Some(attr_s) = kobj.find_attr_key(name) {
+            return Some(Arc::new(SysAttrFile {
+                kobj: kobj.clone(),
+                attr_name: attr_s,
+            }));
         }
         // Sub-kobjects look like directories
         if kobj.get_child(name).is_some() {
@@ -497,14 +561,13 @@ pub struct SysKobjDir {
 
 impl DirOps for SysKobjDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-        // Text attrs
-        if self.kobj.has_attr(name) {
-            if let Some(attr_s) = attr_name_static(name) {
-                return Some(Arc::new(SysAttrFile {
-                    kobj: self.kobj.clone(),
-                    attr_name: attr_s,
-                }));
-            }
+        // Text attrs: use find_attr_key so any dynamically-registered attr
+        // (backlight, leds, hwmon, etc.) is visible without a static list.
+        if let Some(attr_s) = self.kobj.find_attr_key(name) {
+            return Some(Arc::new(SysAttrFile {
+                kobj: self.kobj.clone(),
+                attr_name: attr_s,
+            }));
         }
         // Child dirs look like files so resolve() can stat them
         if self.kobj.get_child(name).is_some() {
@@ -569,7 +632,8 @@ impl FileOps for SysDirMarker {
     }
 }
 
-/// A text attribute file: read calls the show-fn on demand.
+/// A text attribute file: read calls the show-fn on demand;
+/// write calls the store-fn if present, else returns `ReadOnly`.
 #[derive(Clone)]
 struct SysAttrFile {
     kobj: Arc<Kobject>,
@@ -602,11 +666,25 @@ impl FileOps for SysAttrFile {
         })
     }
 
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Err(FsError::ReadOnly) })
+    /// Write to a sysfs attribute file.
+    ///
+    /// Delegates to the store callback registered via
+    /// `kobject_add_writable_attr`.  Returns `FsError::ReadOnly` for
+    /// read-only attributes (no store callback registered).
+    /// Linux ref: `sysfs_kf_write` (fs/sysfs/file.c:160).
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        match self.kobj.attr_store(self.attr_name, buf) {
+            Some(Ok(())) => {
+                let n = buf.len();
+                Box::pin(async move { Ok(n) })
+            }
+            Some(Err(e)) => Box::pin(async move { Err(e) }),
+            None => Box::pin(async move { Err(FsError::ReadOnly) }),
+        }
     }
 
     fn stat(&self) -> Stat {
+        let is_writable = self.kobj.attr_is_writable(self.attr_name);
         let size = self
             .kobj
             .attr_show(self.attr_name)
@@ -615,35 +693,10 @@ impl FileOps for SysAttrFile {
         Stat {
             size,
             blocks: 0,
-            mode: Mode::FILE_RO,
+            mode: if is_writable { Mode::FILE_RW } else { Mode::FILE_RO },
             mtime_cycles: 0,
         }
     }
-}
-
-// ── attr_name_static helper ───────────────────────────────────────────
-
-/// Recover a `&'static str` reference to a well-known attribute name.
-///
-/// `SysAttrFile.attr_name` must be `&'static str` (the type stored in
-/// the kobject's `BTreeMap`), so when VFS `lookup` is called with a
-/// `&str` name we must map it back to the matching static key.
-/// All callers of `kobject_add_attr` must pass a `&'static str` key, so
-/// enumerating the known set here is safe.
-fn attr_name_static(name: &str) -> Option<&'static str> {
-    static KNOWN: &[&str] = &[
-        "size",
-        "removable",
-        "queue/scheduler",
-        "mtu",
-        "address",
-        "operstate",
-        "name",
-        "capabilities/key",
-        "capabilities/rel",
-        "uevent_seqnum",
-    ];
-    KNOWN.iter().copied().find(|&k| k == name)
 }
 
 // ── Default mount helper ──────────────────────────────────────────────
