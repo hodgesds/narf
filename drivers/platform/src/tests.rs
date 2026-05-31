@@ -96,6 +96,43 @@ kernel_test_in!(
     smoke_ec_sci_dispatch_notifies_subscribers
 );
 
+/// Verify `dispatch_sci` is truly alloc-free when called from simulated
+/// IRQ context. The `AllocContext::Sleepable` debug assert fires on
+/// any `slab::alloc` call while `in_irq_depth > 0`, so this test would
+/// **panic** (not return Fail) if the ISR path allocates.
+///
+/// This is the regression test for the Wave-23 fix — ensures the
+/// deferred-drain design holds under repeated SCI fires.
+#[cfg(target_arch = "x86_64")]
+fn smoke_ec_dispatch_sci_from_irq_context() -> TestResult {
+    use crate::ec;
+    use narf_lib::context::{enter_irq, exit_irq};
+
+    ec::__test_reset_sci();
+
+    // Fire dispatch_sci 8 times from simulated IRQ context.
+    // If any path inside dispatch_sci allocates from the sleepable
+    // heap, the debug_assert_consistent() check in slab::alloc
+    // will panic (which is visible as a test panic, not a Fail).
+    for _ in 0..8 {
+        enter_irq();
+        ec::dispatch_sci();
+        exit_irq();
+    }
+
+    // Counters should have advanced.
+    if ec::sci_fire_count() < 8 {
+        return TestResult::Fail("sci_fire_count did not advance across 8 simulated IRQ fires");
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/ec",
+    smoke_ec_dispatch_sci_from_irq_context
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_ec_handle_gpe_unclaimed_notifies() -> TestResult {
     use crate::ec;
