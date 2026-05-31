@@ -28,6 +28,7 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-init         = { path = "../init" }
 narf-filesystem   = { path = "../filesystem" }
 narf-initramfs    = { path = "../initramfs" }
+narf-scheduler    = { path = "../scheduler" }
 
 [lints]
 workspace = true

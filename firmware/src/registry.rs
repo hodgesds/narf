@@ -1,10 +1,18 @@
 //! Firmware blob registry — backing storage + cap → blob lookup.
 //!
-//! Storage shape is one `Vec<Entry>` per priority tier
-//! (`InTree`, `Initramfs`, `HotInstall`); lookup walks high → low.
-//! Each `Entry` owns its DMA-coherent backing page and a sequence
-//! number used by issued caps to route through the registry on
-//! every `view()` call.
+//! Storage shape is one `Vec<Entry>` per priority tier:
+//!
+//! | Tier         | Priority | Source                           |
+//! |--------------|----------|----------------------------------|
+//! | `InTree`     | lowest   | `register_in_tree` at boot       |
+//! | `Initramfs`  | mid-low  | `firmware-scan-initramfs` initcall |
+//! | `Rootfs`     | mid-high | `firmware-scan-rootfs` initcall  |
+//! | `HotInstall` | highest  | `sys_firmware_install` at runtime|
+//!
+//! Lookup walks high → low so a later-registered rootfs entry
+//! shadows an initramfs entry of the same name — matching the
+//! Linux convention where /lib/firmware/ takes precedence over
+//! the initramfs copy.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -61,6 +69,9 @@ struct CapBinding {
 
 static IN_TREE: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static INITRAMFS: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+/// Root-partition firmware scan tier. Populated by `firmware-scan-rootfs`
+/// after `root-mount-auto`; shadows Initramfs entries of the same name.
+static ROOTFS: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static HOT_INSTALL: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Cap-binding routing table. Indexed by cap sequence number;
@@ -72,7 +83,7 @@ static BINDINGS: IrqSafeSpinLock<Vec<CapBinding>> = IrqSafeSpinLock::new(Vec::ne
 /// Look up an entry by canonical name across all priority tiers,
 /// high → low. Returns the entry's binding parameters.
 fn lookup(name: &str) -> Option<CapBinding> {
-    for tier in [&HOT_INSTALL, &INITRAMFS, &IN_TREE] {
+    for tier in [&HOT_INSTALL, &ROOTFS, &INITRAMFS, &IN_TREE] {
         let g = tier.lock();
         if let Some(e) = g.iter().find(|e| e.name == name) {
             return Some(CapBinding {
@@ -197,6 +208,7 @@ pub(crate) fn install_blob(
     let tier = match source {
         BlobSource::InTree => &IN_TREE,
         BlobSource::Initramfs => &INITRAMFS,
+        BlobSource::Rootfs => &ROOTFS,
         BlobSource::HotInstall => &HOT_INSTALL,
     };
     let mut g = tier.lock();
@@ -210,6 +222,7 @@ pub(crate) fn snapshot_all() -> Vec<BlobIdentity> {
     for (tier, src) in [
         (&IN_TREE, BlobSource::InTree),
         (&INITRAMFS, BlobSource::Initramfs),
+        (&ROOTFS, BlobSource::Rootfs),
         (&HOT_INSTALL, BlobSource::HotInstall),
     ] {
         let g = tier.lock();
@@ -230,6 +243,7 @@ pub(crate) fn snapshot_all() -> Vec<BlobIdentity> {
 pub(crate) fn source_for(name: &str) -> Option<BlobSource> {
     for (tier, src) in [
         (&HOT_INSTALL, BlobSource::HotInstall),
+        (&ROOTFS, BlobSource::Rootfs),
         (&INITRAMFS, BlobSource::Initramfs),
         (&IN_TREE, BlobSource::InTree),
     ] {
@@ -242,13 +256,17 @@ pub(crate) fn source_for(name: &str) -> Option<BlobSource> {
 }
 
 pub(crate) fn has_any() -> bool {
-    !IN_TREE.lock().is_empty() || !INITRAMFS.lock().is_empty() || !HOT_INSTALL.lock().is_empty()
+    !IN_TREE.lock().is_empty()
+        || !INITRAMFS.lock().is_empty()
+        || !ROOTFS.lock().is_empty()
+        || !HOT_INSTALL.lock().is_empty()
 }
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
     IN_TREE.lock().clear();
     INITRAMFS.lock().clear();
+    ROOTFS.lock().clear();
     HOT_INSTALL.lock().clear();
     BINDINGS.lock().clear();
 }

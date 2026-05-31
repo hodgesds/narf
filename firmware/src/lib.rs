@@ -146,8 +146,12 @@ pub struct BlobIdentity {
 pub enum BlobSource {
     /// `register_initcalls` time; an `include_bytes!` blob.
     InTree,
-    /// `Stage::Late` initramfs unpack.
+    /// `Stage::Late` initramfs unpack (firmware-scan-initramfs).
     Initramfs,
+    /// `Stage::Late` root-partition scan (firmware-scan-rootfs).
+    /// Registered AFTER `root-mount-auto`; a Rootfs entry for the
+    /// same name shadows an Initramfs entry (later wins).
+    Rootfs,
     /// Post-boot via `install()`.
     HotInstall,
 }
@@ -158,9 +162,13 @@ pub enum BlobSource {
 /// `Cap<FirmwareBlob, Read>` on success.
 ///
 /// Resolution walks the registry in priority order: hot-installed
-/// entries override initramfs entries which override in-tree
-/// fallbacks. `source_for(name)` reports which source served a
-/// given name.
+/// entries override rootfs entries which override initramfs entries
+/// which override in-tree fallbacks. `source_for(name)` reports
+/// which source served a given name.
+///
+/// Linux convention (`firmware_loader/main.c::fw_get_filesystem_firmware`):
+/// drivers' request_firmware() searches both initramfs and /lib/firmware/;
+/// root-partition (Rootfs) entries take precedence on conflict.
 pub fn open(
     name: &str,
     auth: &Cap<FirmwareRegistry, Read>,
@@ -373,14 +381,31 @@ pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
 /// `Stage::Subsys` slot reserved for build profiles that ship
 /// kernel-baked vendor firmware images via `register_in_tree_bundle`.
 ///
-/// `Stage::Late` slot scans whatever initramfs the boot path
-/// staged via `install_initramfs(&'static Initramfs)` and
-/// populates the registry's `Initramfs` priority tier. When no
-/// initramfs is staged the slot returns `NotPresent` so the init
-/// harness records the absence without flagging it as failure.
+/// Two `Stage::Late` slots implement the Linux hybrid firmware model:
+///
+/// - `firmware-scan-initramfs`: scans the multiboot2 initramfs for
+///   `firmware/*` entries (populated only when `--initramfs-firmware`
+///   globs were passed to `xtask image`). With no globs the initramfs
+///   is firmware-free and this slot returns `NotPresent` — that is
+///   documented as OK.
+///
+/// - `firmware-scan-rootfs`: registered AFTER `root-mount-auto` and
+///   after `firmware-scan-initramfs`. Walks `/lib/firmware/` on the
+///   mounted root partition and registers every blob under
+///   `BlobSource::Rootfs`. Rootfs entries shadow Initramfs entries
+///   for the same name (later registration wins).
+///
+/// Linux convention (`linux/drivers/base/firmware_loader/main.c`
+/// `fw_get_filesystem_firmware`): drivers' `request_firmware()` finds
+/// blobs from both sources; the root partition takes precedence.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "firmware-init", || InitResult::Ok);
+
+    // ── firmware-scan-initramfs (Stage::Late, registered first) ────
+    // Linux convention: initramfs holds only what must be available
+    // BEFORE root mounts (CPU microcode, early-FB GPU firmware, storage
+    // controller quirk blobs). Default builds carry zero firmware here.
     narf_init::register(Stage::Late, "firmware-scan-initramfs", || {
         // The staged initramfs lives in `narf-initramfs` (spec §6
         // step-2 consolidation). When the boot path stages one,
@@ -394,8 +419,47 @@ pub fn register_initcalls() {
             None => return InitResult::Error("no trusted-loader authority"),
         };
         match scan_initramfs(fs, &auth) {
-            Ok(_) => InitResult::Ok,
+            Ok(n) => {
+                let _ = n; // count is informational; logged by the init harness
+                InitResult::Ok
+            }
             Err(_) => InitResult::Error("scan_initramfs failed"),
+        }
+    });
+
+    // ── firmware-scan-rootfs (Stage::Late, registered AFTER
+    //    firmware-scan-initramfs and root-mount-auto) ─────────────────
+    //
+    // `root-mount-auto` is registered by `frame/src/bare_main.rs` at
+    // Stage::Late before this crate's `register_initcalls` runs, which
+    // means registration order is:
+    //   1. root-mount-auto        (frame/src/bare_main.rs)
+    //   2. firmware-scan-initramfs (this fn, registered just above)
+    //   3. firmware-scan-rootfs   (this fn, registered just below)
+    //
+    // Stage::Late initcalls run in registration order (narf-init
+    // spec), so root-mount-auto is guaranteed to complete before
+    // firmware-scan-rootfs executes.
+    //
+    // If root was not mounted (ISO-only QEMU boot, no root= on
+    // cmdline), the initcall returns NotPresent — that is expected
+    // and logged by the harness without flagging it as failure.
+    narf_init::register(Stage::Late, "firmware-scan-rootfs", || {
+        let auth = match trusted_loader_authority() {
+            Some(a) => a,
+            None => return InitResult::Error("no trusted-loader authority"),
+        };
+        match scan_rootfs(&auth) {
+            Ok(n) => {
+                let _ = n;
+                InitResult::Ok
+            }
+            Err(FirmwareError::NotFound) => {
+                // /lib/firmware/ absent on root — normal for ISO-only
+                // boots (QEMU CD-only, no root partition mounted).
+                InitResult::NotPresent
+            }
+            Err(_) => InitResult::Error("scan_rootfs failed"),
         }
     });
 }
@@ -426,12 +490,15 @@ pub fn __reset_staged_initramfs() {
 /// Walk every `firmware/*` entry in an initramfs and register it
 /// with the registry under `BlobSource::Initramfs`. Per spec §5,
 /// this is the mid-priority population path — it overrides
-/// in-tree fallbacks but is overridden by `HotInstall`.
+/// in-tree fallbacks but is overridden by `Rootfs` and `HotInstall`.
 ///
 /// Naming: each archive entry whose path starts with `"firmware/"`
 /// is registered under the suffix as its canonical name. So
 /// `firmware/qcom/qcnfa765/amss.bin` lands in the registry under
 /// `"qcom/qcnfa765/amss.bin"`.
+///
+/// Linux convention: initramfs is scanned first; rootfs entries
+/// registered later by `scan_rootfs` shadow these on name collision.
 ///
 /// Returns the number of entries successfully registered. Any
 /// entry whose trailer is malformed or whose signature is rejected
@@ -462,6 +529,152 @@ pub fn scan_initramfs(
                 // rest of the walk. A future iteration may surface
                 // these via the observability layer.
             }
+        }
+    }
+    Ok(n_ok)
+}
+
+/// Walk `/lib/firmware/` on the mounted root filesystem and register
+/// every regular file with the registry under `BlobSource::Rootfs`.
+///
+/// Naming: strips the `/lib/firmware/` prefix so that
+/// `/lib/firmware/amdgpu/raven_dmcu.bin` is registered under
+/// `"amdgpu/raven_dmcu.bin"` — the canonical name drivers open
+/// via `narf_firmware::open(name, auth)`.
+///
+/// Priority: `Rootfs` entries shadow `Initramfs` entries for the
+/// same name (later registration wins) but are overridden by
+/// `HotInstall`. This matches the Linux convention where the root
+/// partition's `/lib/firmware/` copy takes precedence over the
+/// initramfs copy.
+///
+/// Returns `Err(FirmwareError::NotFound)` when `/lib/firmware/` is
+/// absent on the mounted root (normal for ISO-only boots where no
+/// root partition is mounted — QEMU CD-only, for example).
+///
+/// Internally uses `narf_scheduler::block_on` to drive the async
+/// ext2/ext4 directory traversal from the synchronous initcall
+/// context. Same pattern as `ext_factory` in the ext2 driver crate.
+pub fn scan_rootfs(auth: &Cap<FirmwareRegistry, Write>) -> Result<usize, FirmwareError> {
+    use alloc::string::String;
+
+    if auth.check_live().is_err() {
+        return Err(FirmwareError::AuthorityRevoked);
+    }
+
+    // Obtain the root DirOps from the VFS registry.
+    let root_dir = narf_filesystem::registry()
+        .with_mount("/", |m| m.root())
+        .ok_or(FirmwareError::NotFound)?;
+
+    // Walk lib → firmware asynchronously (ext2/ext4 lookups are async;
+    // block_on bridges from the sync initcall context).
+    let lib_dir =
+        narf_scheduler::block_on(root_dir.lookup_dir_async("lib"))
+            .map_err(|_| FirmwareError::NotFound)?;
+    let lib_firmware_dir =
+        narf_scheduler::block_on(lib_dir.lookup_dir_async("firmware"))
+            .map_err(|_| FirmwareError::NotFound)?;
+
+    walk_and_register_dir(lib_firmware_dir, String::new(), BlobSource::Rootfs, auth)
+}
+
+/// Shared recursive directory walker used by both `scan_initramfs`
+/// (flat CPIO) and `scan_rootfs` (nested ext2/ext4 directory tree).
+///
+/// Iterates `dir` via `enumerate_async` (the async-safe path that
+/// ext2 implements) and descends into subdirectories with
+/// `lookup_dir_async`. Files are read fully via `FileOps::read` then
+/// handed to `registry::install_blob` under `source`.
+///
+/// `path_prefix` accumulates the `/`-separated path relative to the
+/// original starting directory so the canonical name reconstructed
+/// here matches the name a driver would pass to `open()`.
+fn walk_and_register_dir(
+    dir: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    path_prefix: alloc::string::String,
+    source: BlobSource,
+    auth: &Cap<FirmwareRegistry, Write>,
+) -> Result<usize, FirmwareError> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    let mut n_ok = 0usize;
+
+    // Snapshot the directory. `enumerate_async` is the async-safe
+    // version ext2/ext4 implements; the sync `iter()` returns empty
+    // for disk-backed FSes (DirOps::iter contract).
+    let entries: Vec<(String, narf_filesystem::FileType)> =
+        narf_scheduler::block_on(dir.enumerate_async(0, usize::MAX))
+            .unwrap_or_default();
+
+    for (name, file_type) in entries {
+        // Skip the two POSIX self/parent entries.
+        if name == "." || name == ".." {
+            continue;
+        }
+        let canonical = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            alloc::format!("{}/{}", path_prefix, name)
+        };
+
+        match file_type {
+            narf_filesystem::FileType::Dir => {
+                // Descend into subdirectory.
+                let subdir = narf_scheduler::block_on(
+                    dir.lookup_dir_async(&name),
+                );
+                match subdir {
+                    Ok(d) => {
+                        match walk_and_register_dir(d, canonical, source, auth) {
+                            Ok(n) => n_ok += n,
+                            Err(FirmwareError::AuthorityRevoked) => {
+                                return Err(FirmwareError::AuthorityRevoked);
+                            }
+                            Err(_) => {
+                                // Best-effort: one bad subtree doesn't
+                                // abort the rest of the walk.
+                            }
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            narf_filesystem::FileType::File => {
+                // Read file bytes, then register.
+                let file = narf_scheduler::block_on(dir.lookup_async(&name));
+                let file = match file {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let size = file.stat().size as usize;
+                if size == 0 {
+                    continue;
+                }
+                let mut buf: Vec<u8> = alloc::vec![0u8; size];
+                let n_read = narf_scheduler::block_on(file.read(0, &mut buf))
+                    .unwrap_or(0);
+                if n_read == 0 {
+                    continue;
+                }
+                buf.truncate(n_read);
+                // Leak the canonical name into `&'static str` so
+                // the registry (which requires `name: &'static str`)
+                // can keep it for the kernel's lifetime. The blob
+                // bytes are copied by `install_blob` into DMA-coherent
+                // memory, so `buf` may be dropped after the call.
+                let name_static: &'static str =
+                    alloc::boxed::Box::leak(canonical.into_boxed_str());
+                match registry::install_blob(name_static, &buf, source) {
+                    Ok(()) => n_ok += 1,
+                    Err(_) => {
+                        // Best-effort: malformed/unsigned blob logged
+                        // by the observability layer in a future iter.
+                    }
+                }
+            }
+            _ => continue,
         }
     }
     Ok(n_ok)

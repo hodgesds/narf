@@ -4,10 +4,10 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::registry::__reset_for_test;
+use crate::registry::{__reset_for_test, install_blob};
 use crate::{
-    bootstrap_authority, install, open, register_in_tree, snapshot, source_for, view_of,
-    BlobSource, FirmwareError, BLOB_TRAILER_MAGIC,
+    bootstrap_authority, install, open, register_in_tree, scan_initramfs, snapshot, source_for,
+    view_of, BlobSource, FirmwareError, BLOB_TRAILER_MAGIC,
 };
 
 /// Build an unsigned firmware blob whose payload is the supplied
@@ -454,6 +454,147 @@ kernel_test_in!(
     "firmware",
     smoke_firmware_per_task_authority_grant_and_revoke
 );
+
+// ── Hybrid model smokes (initramfs-only, rootfs-only, both+shadow) ──
+
+fn smoke_firmware_hybrid_rootfs_only() -> TestResult {
+    // Register a blob directly into the Rootfs tier (simulating what
+    // `scan_rootfs` does after `root-mount-auto`). Verify source_for
+    // reports Rootfs and open() returns it.
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_for_test();
+    let blob = build_unsigned_blob(b"rootfs payload", None);
+    // Directly install with BlobSource::Rootfs (same path scan_rootfs uses).
+    if install_blob("vendor/rootfs-blob", &blob, BlobSource::Rootfs).is_err() {
+        return TestResult::Fail("install Rootfs blob");
+    }
+    if source_for("vendor/rootfs-blob") != Some(BlobSource::Rootfs) {
+        return TestResult::Fail("source_for didn't report Rootfs");
+    }
+    let (_w, read) = bootstrap_authority();
+    let cap = match open("vendor/rootfs-blob", &read) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("open Rootfs blob"),
+    };
+    let v = match view_of(&cap) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("view Rootfs blob"),
+    };
+    if !v.bytes.starts_with(b"rootfs payload") {
+        return TestResult::Fail("Rootfs payload bytes mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_hybrid_rootfs_only);
+
+fn smoke_firmware_hybrid_initramfs_only() -> TestResult {
+    // Verifies the initramfs scanner path still works in isolation
+    // (no rootfs entry for the same name — existing test covers this
+    // more deeply via make_cpio_newc; this one confirms source==Initramfs
+    // survives the Rootfs tier being added to the registry).
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_for_test();
+    let blob_bytes = build_unsigned_blob(b"initramfs-only payload", None);
+    let archive = make_cpio_newc(&[("firmware/init-only/blob.bin", &blob_bytes)]);
+    let archive_static: &'static [u8] = alloc::boxed::Box::leak(archive.into_boxed_slice());
+    let fs = match narf_filesystem::Initramfs::from_cpio("hybrid-initramfs-only", archive_static) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("CPIO parse"),
+    };
+    let (write, read) = bootstrap_authority();
+    let n = match scan_initramfs(&fs, &write) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("scan_initramfs"),
+    };
+    if n != 1 {
+        return TestResult::Fail("expected 1 entry from scan_initramfs");
+    }
+    if source_for("init-only/blob.bin") != Some(BlobSource::Initramfs) {
+        return TestResult::Fail("source_for didn't report Initramfs");
+    }
+    // Rootfs tier must be empty — no shadowing here.
+    if source_for("init-only/blob.bin") == Some(BlobSource::Rootfs) {
+        return TestResult::Fail("Rootfs tier falsely shadowed Initramfs");
+    }
+    let cap = match open("init-only/blob.bin", &read) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("open"),
+    };
+    let v = match view_of(&cap) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("view"),
+    };
+    if !v.bytes.starts_with(b"initramfs-only payload") {
+        return TestResult::Fail("payload mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_hybrid_initramfs_only);
+
+fn smoke_firmware_hybrid_rootfs_shadows_initramfs() -> TestResult {
+    // Linux hybrid model: initramfs entry registers first at lower
+    // priority; rootfs entry registers second at higher priority and
+    // shadows it. `open()` must resolve to the rootfs bytes.
+    //
+    // Mirrors the Linux convention where /lib/firmware/ takes
+    // precedence over the initramfs copy (described in
+    // linux/drivers/base/firmware_loader/main.c::fw_get_filesystem_firmware).
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_for_test();
+    const BLOB_NAME: &str = "vendor/shared/hw.bin";
+
+    let init_blob = build_unsigned_blob(b"OLD: initramfs copy", None);
+    let root_blob = build_unsigned_blob(b"NEW: rootfs copy", None);
+
+    // Step 1: initramfs scan registers at Initramfs priority.
+    let cpio_path = alloc::format!("firmware/{}", BLOB_NAME);
+    let archive = make_cpio_newc(&[(cpio_path.as_str(), &init_blob)]);
+    let archive_static: &'static [u8] = alloc::boxed::Box::leak(archive.into_boxed_slice());
+    let fs = match narf_filesystem::Initramfs::from_cpio("hybrid-shadow-initramfs", archive_static) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("CPIO parse"),
+    };
+    let (write, read) = bootstrap_authority();
+    if scan_initramfs(&fs, &write).is_err() {
+        return TestResult::Fail("scan_initramfs");
+    }
+    // Verify initramfs entry visible before rootfs scans.
+    if source_for(BLOB_NAME) != Some(BlobSource::Initramfs) {
+        return TestResult::Fail("before rootfs scan: source should be Initramfs");
+    }
+
+    // Step 2: rootfs scan registers same name at Rootfs priority.
+    if install_blob(BLOB_NAME, &root_blob, BlobSource::Rootfs).is_err() {
+        return TestResult::Fail("install Rootfs blob");
+    }
+
+    // After rootfs registration, source_for must report Rootfs (higher
+    // priority wins in lookup).
+    if source_for(BLOB_NAME) != Some(BlobSource::Rootfs) {
+        return TestResult::Fail("after rootfs scan: source should be Rootfs (shadow)");
+    }
+
+    // open() must return rootfs bytes.
+    let cap = match open(BLOB_NAME, &read) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("open after rootfs shadow"),
+    };
+    let v = match view_of(&cap) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("view"),
+    };
+    if !v.bytes.starts_with(b"NEW") {
+        return TestResult::Fail("rootfs blob didn't shadow initramfs blob");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_hybrid_rootfs_shadows_initramfs);
 
 /// Build a minimal CPIO newc archive — header + path + data — for
 /// each `(name, data)` plus the `TRAILER!!!` sentinel. Used by
