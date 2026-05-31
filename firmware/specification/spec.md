@@ -15,8 +15,10 @@
   bytes live in DMA-coherent memory ready for staging via BHI /
   ACP-DMA / wherever the device's loader expects.
 - **Discovery + load policy** — where blobs come from
-  (initramfs, signed package, in-tree fallback) and how the
-  kernel decides which one a driver gets.
+  (initramfs, root-partition /lib/firmware/, in-tree fallback)
+  and how the kernel decides which one a driver gets. Uses the
+  Linux hybrid model: initramfs holds only blobs needed before
+  root mounts; /lib/firmware/ holds everything else.
 - **Signature verification** — every blob is verified against
   the kernel's trusted-firmware-signers root before it can be
   handed to a driver. Unsigned blobs are accepted only when the
@@ -203,9 +205,12 @@ pub fn install(
 pub fn snapshot() -> Vec<BlobIdentity>;
 ```
 
-## 5. Discovery + load order
+## 5. Discovery + load order — Linux hybrid model
 
-The registry is populated in three sources, in priority order:
+The registry is populated in four sources, in priority order.
+The model mirrors Linux (`linux/drivers/base/firmware_loader/main.c`
+`fw_get_filesystem_firmware` for the search-path pattern;
+`linux/init/initramfs.c` for the boot-time initramfs include):
 
 1. **In-tree fallback** (lowest priority). A driver crate may
    embed a known-good blob via `include_bytes!`. The blob is
@@ -217,23 +222,64 @@ The registry is populated in three sources, in priority order:
    licence-restricted images always come from one of the
    higher-priority sources.
 
-2. **initramfs** (mid priority). Stage-2 boot unpacks an
-   initramfs whose `/firmware/` directory is walked at
-   `Stage::Late` and every entry registered. This is the
-   primary path for vendor-supplied blobs that distros ship
-   alongside the kernel image. Entries here override in-tree
-   fallbacks of the same canonical name.
+2. **initramfs** (mid-low priority, `BlobSource::Initramfs`).
+   `firmware-scan-initramfs` at `Stage::Late` scans the
+   multiboot2 initramfs CPIO for `firmware/*` entries. By
+   default the initramfs carries **no firmware** (so Limine can
+   allocate it as a multiboot2 module without running out of
+   memory on the 1.7 GiB linux-firmware bundle). Use
+   `cargo xtask image --initramfs-firmware <glob>` to add blobs
+   needed BEFORE root mounts (CPU microcode, early-FB GPU
+   firmware, storage-controller quirk blobs). Entries here
+   override in-tree fallbacks of the same canonical name.
 
-3. **Hot install** (highest priority). A privileged daemon
-   may call `sys_firmware_install` after boot to push an
-   updated blob without rebooting. The hot-installed blob
-   replaces any prior entry of the same name; existing
-   `Cap<FirmwareBlob, Read>` handles continue to point at the
-   old bytes (RCU grace) and re-open to pick up the new one.
+3. **Root partition** (mid-high priority, `BlobSource::Rootfs`).
+   `firmware-scan-rootfs` at `Stage::Late`, registered AFTER
+   `root-mount-auto`, walks `/lib/firmware/` on the mounted root
+   partition. `xtask image` stages everything NOT matched by
+   `--initramfs-firmware` into `target/rootfs-firmware-staging/
+   lib/firmware/`; `xtask disk-write-partitioned` copies that
+   tree onto the NARF_ROOT ext4 partition. Rootfs entries shadow
+   Initramfs entries of the same name (later wins). In ISO-only
+   boots (QEMU CD-only, no root partition mounted) this initcall
+   returns `NotPresent` — that is documented as OK.
 
-Lookup walks priority high → low. The first match wins. The
+4. **Hot install** (highest priority, `BlobSource::HotInstall`).
+   A privileged daemon may call `sys_firmware_install` after boot
+   to push an updated blob without rebooting. The hot-installed
+   blob replaces any prior entry of the same name; existing
+   `Cap<FirmwareBlob, Read>` handles continue to point at the old
+   bytes (RCU grace) and re-open to pick up the new one.
+
+Lookup walks priority high → low: `HotInstall` → `Rootfs` →
+`Initramfs` → `InTree`. The first match wins. The
 `source_for(name)` accessor reports which source served a given
 blob so observability tools can audit deployment.
+
+### Build-time firmware split: `--initramfs-firmware`
+
+```
+$ cargo xtask image --initramfs-firmware "amd-ucode/*" \
+                    --initramfs-firmware "intel-ucode/*"
+xtask image: initramfs firmware: 12 entries (4.2 MiB)
+xtask image: rootfs firmware:    38214 entries (1696.3 MiB)
+```
+
+With no `--initramfs-firmware` flags (the default):
+- initramfs carries zero firmware (< 200 KiB for init + shell)
+- All of `target/firmware/` goes to the root partition
+- Limine can allocate the initramfs as a multiboot2 module
+
+### Deferred items
+
+- **Firmware signature verification on rootfs** — blobs read from
+  `/lib/firmware/` are still validated by the NARF trailer parser
+  and signature verifier before registration. Signature key
+  rotation for rootfs-delivered firmware (A/B partition rollback,
+  signed-package updates) is a follow-up.
+- **A/B partition for firmware rollback** — single root partition
+  is the current layout; a second partition for staged updates is
+  a future disk-layout addition.
 
 ## 6. Signature model
 
@@ -390,9 +436,13 @@ Stage-6 lands `firmware/` in three steps:
    that succeed only when the in-tree fallback is present.
    (3 PRs, one per driver.)
 
-3. **initramfs + hot-install paths** — the boot path mounts
-   `/firmware/` from initramfs at `Stage::Late` and walks it,
-   then `sys_firmware_install` ships. (2 PRs.)
+3. **Linux hybrid model + hot-install paths** — `firmware-scan-
+   initramfs` walks the (now-minimal) initramfs at `Stage::Late`;
+   `firmware-scan-rootfs` walks `/lib/firmware/` on the root
+   partition after `root-mount-auto`; `sys_firmware_install` ships
+   for runtime updates. `xtask image --initramfs-firmware` splits
+   the firmware bundle between initramfs and rootfs so Limine can
+   allocate the initramfs as a multiboot2 module. (2 PRs.)
 
 After Stage-6, `qcnfa765.rs` graduates from "presence-only" to
 "WiFi 6E associate + station", `hda.rs` from "controller bring-up
