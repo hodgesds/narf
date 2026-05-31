@@ -2059,6 +2059,26 @@ pub fn gpe_block_status(b: GpeBlockInfo) -> alloc::vec::Vec<u8> {
     out
 }
 
+/// IRQ-safe variant: read GPE block status registers into a
+/// fixed-size stack buffer — no heap allocation. Returns the
+/// buffer and how many bytes are valid. Capped at 32 bytes
+/// (= 256 GPE bits) which covers every real platform.
+///
+/// Called from `dispatch_sci` (ISR context); the sleepable
+/// allocator is not available there.
+#[cfg(target_arch = "x86_64")]
+pub fn gpe_block_status_irq(b: GpeBlockInfo) -> ([u8; 32], usize) {
+    let half = (b.byte_count / 2) as usize;
+    let count = half.min(32);
+    let mut buf = [0u8; 32];
+    for i in 0..count {
+        let port = (b.address + i as u64) as u16;
+        // SAFETY: GPE block address from a checksummed FADT.
+        buf[i] = unsafe { narf_arch::x86_64::io_port::inb(port) };
+    }
+    (buf, count)
+}
+
 /// Clear a single GPE status bit by writing 1 to its status-register
 /// position (W1C). No-op if `gpe_num` is outside both blocks.
 #[cfg(target_arch = "x86_64")]

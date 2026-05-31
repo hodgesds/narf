@@ -23,6 +23,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Poll, Waker};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -226,9 +227,38 @@ static EC_QUERIES: AtomicU64 = AtomicU64::new(0);
 /// EC-query path and treats every set bit as a non-EC GPE.
 static EC_GPE_BIT: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Install a platform-event subscriber. Callbacks fire from the SCI
-/// dispatcher path — keep them short (post to a channel, set an
-/// atomic, wake a task).
+// ── Deferred SCI dispatch ───────────────────────────────────────────
+//
+// `dispatch_sci` runs from IRQ context (IF=0, in_irq_depth=1). Every
+// path below it — `gpe_block_status` (Vec alloc), `handle_gpe`
+// (format! + AML evaluate_method alloc), `handle_ec_gpe`
+// (find_device_by_hid + format! allocs), `notify` (subscriber
+// closures that call writeln!/power_off) — allocates from the
+// sleepable heap and panics under `AllocContext::Sleepable`'s
+// debug assertion.
+//
+// Fix: the ISR records WHICH PM1 bits and GPE bits fired (bitmasks),
+// W1C-clears the hardware latches so the level-triggered line
+// deasserts, and wakes `sci_drain_task`. The drain task runs from
+// the async executor (non-IRQ context) where sleepable alloc is
+// allowed.
+
+/// Pending PM1 fixed-event bits (same bit positions as PM1_STS).
+/// Written from ISR; drained by `sci_drain_task`.
+static PENDING_PM1: AtomicU64 = AtomicU64::new(0);
+
+/// Pending GPE bits, two 64-bit words = GPEs 0..127.
+/// Written from ISR; drained by `sci_drain_task`.
+static PENDING_GPES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Waker for `sci_drain_task`. Written from task context (poll);
+/// read + cloned from ISR (wake_by_ref — atomic increment only,
+/// no alloc).
+static SCI_DRAIN_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+
+/// Install a platform-event subscriber. Callbacks fire from the
+/// `sci_drain_task` path (non-IRQ) — may allocate, may wake further
+/// tasks. Keep them bounded.
 pub fn subscribe_platform_event<F>(cb: F)
 where
     F: Fn(PlatformEvent) + Send + Sync + 'static,
@@ -253,46 +283,133 @@ pub fn ec_query_count() -> u64 {
     EC_QUERIES.load(Ordering::Acquire)
 }
 
+// ── ISR-safe PM1 / GPE recording ───────────────────────────────────
+//
+// These run from dispatch_sci which is a real hardware ISR. They
+// MUST NOT allocate (slab::alloc panics when in_irq > 0 in debug
+// builds). Instead they W1C-clear the hardware latches (so the
+// level-triggered SCI line deasserts) and record which events fired
+// in the PENDING_* atomics for sci_drain_task to process.
+
 #[cfg(target_arch = "x86_64")]
-fn dispatch_pm1() {
+fn record_pm1_irq() {
     let s = narf_acpi::pm1_status_read();
-    if s & narf_acpi::PM1_STS_PWRBTN != 0 {
-        narf_acpi::pm1_status_clear(narf_acpi::PM1_STS_PWRBTN);
+    let bits = (s & (narf_acpi::PM1_STS_PWRBTN
+        | narf_acpi::PM1_STS_SLPBTN
+        | narf_acpi::PM1_STS_RTC)) as u64;
+    if bits != 0 {
+        // W1C-clear individual bits first so the level-triggered
+        // line deasserts before we exit the ISR.
+        if s & narf_acpi::PM1_STS_PWRBTN != 0 {
+            narf_acpi::pm1_status_clear(narf_acpi::PM1_STS_PWRBTN);
+        }
+        if s & narf_acpi::PM1_STS_SLPBTN != 0 {
+            narf_acpi::pm1_status_clear(narf_acpi::PM1_STS_SLPBTN);
+        }
+        if s & narf_acpi::PM1_STS_RTC != 0 {
+            narf_acpi::pm1_status_clear(narf_acpi::PM1_STS_RTC);
+        }
+        // Record for the drain task — OR so concurrent SCIs
+        // accumulate without a drain race.
+        PENDING_PM1.fetch_or(bits, Ordering::Release);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn record_pm1_irq() {}
+
+#[cfg(target_arch = "x86_64")]
+fn record_gpe_bits_irq(block: narf_acpi::GpeBlockInfo) {
+    // Read status registers inline — gpe_block_status_irq uses a
+    // stack buffer, no heap allocation.
+    let (buf, count) = narf_acpi::gpe_block_status_irq(block);
+    for (byte_idx, &byte) in buf[..count].iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        for bit in 0..8u32 {
+            if byte & (1 << bit) == 0 {
+                continue;
+            }
+            let gpe_num = block.base_gsi + (byte_idx as u32 * 8) + bit;
+            // W1C-clear immediately so the line deasserts.
+            narf_acpi::gpe_status_clear_bit(gpe_num);
+            // Record for the drain task (GPEs 0..127 only;
+            // higher numbers are exotic and unsupported here).
+            if gpe_num < 128 {
+                let word = (gpe_num / 64) as usize;
+                let bit_pos = gpe_num % 64;
+                PENDING_GPES[word].fetch_or(1 << bit_pos, Ordering::Release);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn record_gpe_bits_irq(_block: narf_acpi::GpeBlockInfo) {}
+
+// ── Non-IRQ (task-context) PM1 / GPE handling ──────────────────────
+//
+// These mirror the old dispatch_pm1 / dispatch_gpe_block logic but
+// run from sci_drain_task (non-IRQ context, sleepable alloc OK).
+
+#[cfg(target_arch = "x86_64")]
+fn drain_pm1_task(bits: u64) {
+    if bits & (narf_acpi::PM1_STS_PWRBTN as u64) != 0 {
         notify(PlatformEvent::PowerButton);
     }
-    if s & narf_acpi::PM1_STS_SLPBTN != 0 {
-        narf_acpi::pm1_status_clear(narf_acpi::PM1_STS_SLPBTN);
+    if bits & (narf_acpi::PM1_STS_SLPBTN as u64) != 0 {
         notify(PlatformEvent::SleepButton);
     }
-    if s & narf_acpi::PM1_STS_RTC != 0 {
-        narf_acpi::pm1_status_clear(narf_acpi::PM1_STS_RTC);
+    if bits & (narf_acpi::PM1_STS_RTC as u64) != 0 {
         notify(PlatformEvent::RtcAlarm);
     }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn dispatch_pm1() {}
+fn drain_pm1_task(_bits: u64) {}
 
-#[cfg(target_arch = "x86_64")]
-fn dispatch_gpe_block(block: narf_acpi::GpeBlockInfo) {
-    let status = narf_acpi::gpe_block_status(block);
-    for (byte_idx, byte) in status.iter().enumerate() {
-        if *byte == 0 {
-            continue;
-        }
-        for bit in 0..8 {
-            if byte & (1 << bit) == 0 {
-                continue;
+/// Async task: dequeue pending PM1 + GPE events and process them
+/// from non-IRQ context where sleepable allocation is allowed.
+/// Spawned once by `init_sci`; runs indefinitely.
+async fn sci_drain_task() {
+    loop {
+        // Park the task until the SCI ISR (or __test_dispatch_*)
+        // records pending events and wakes us.
+        core::future::poll_fn(|cx| {
+            // Register our waker so the ISR can wake us. Replace
+            // any stale waker from a previous poll round.
+            *SCI_DRAIN_WAKER.lock() = Some(cx.waker().clone());
+            // If work is already pending (e.g. ISR fired before we
+            // registered the waker), resolve immediately.
+            if PENDING_PM1.load(Ordering::Acquire) != 0
+                || PENDING_GPES[0].load(Ordering::Acquire) != 0
+                || PENDING_GPES[1].load(Ordering::Acquire) != 0
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
             }
-            let gpe_num = block.base_gsi + (byte_idx as u32 * 8) + bit;
-            handle_gpe(gpe_num);
-            narf_acpi::gpe_status_clear_bit(gpe_num);
+        })
+        .await;
+
+        // Drain PM1 fixed events.
+        let pm1 = PENDING_PM1.swap(0, Ordering::AcqRel);
+        if pm1 != 0 {
+            drain_pm1_task(pm1);
+        }
+
+        // Drain GPE bits.
+        for word in 0..2usize {
+            let bits = PENDING_GPES[word].swap(0, Ordering::AcqRel);
+            for bit in 0..64u32 {
+                if bits & (1 << bit) != 0 {
+                    handle_gpe(word as u32 * 64 + bit);
+                }
+            }
         }
     }
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-fn dispatch_gpe_block(_block: narf_acpi::GpeBlockInfo) {}
 
 fn handle_gpe(gpe_num: u32) {
     let ec_bit = EC_GPE_BIT.load(Ordering::Acquire);
@@ -368,17 +485,36 @@ impl AcpiEc {
     }
 }
 
-/// Run one pass of the SCI dispatcher. Wired as the synchronous
-/// handler on the SCI vector by `init_sci()`; also exposed for the
-/// kernel-test path that injects a synthetic SCI to verify dispatch.
+/// IRQ handler for the SCI vector. Records which PM1 and GPE bits
+/// fired (W1C-clears the hardware latches so the level-triggered
+/// line deasserts) then wakes `sci_drain_task` to process them
+/// outside IRQ context.
+///
+/// **Allocation-free by design**: every operation here — atomic
+/// stores, W1C port writes, `Waker::clone` (Arc refcount bump only),
+/// `wake_by_ref` (atomic store) — is safe from inside an ISR.
+/// The sleepable work (AML evaluation, `format!`, subscriber
+/// callbacks) happens in `sci_drain_task`.
 pub fn dispatch_sci() {
     SCI_FIRES.fetch_add(1, Ordering::Release);
-    dispatch_pm1();
+    // Record + W1C-clear PM1 fixed events.
+    record_pm1_irq();
+    // Record + W1C-clear GPE block bits.
     if let Some(b) = narf_acpi::gpe0_block() {
-        dispatch_gpe_block(b);
+        record_gpe_bits_irq(b);
     }
     if let Some(b) = narf_acpi::gpe1_block() {
-        dispatch_gpe_block(b);
+        record_gpe_bits_irq(b);
+    }
+    // Wake the drain task. `clone()` on the Option<Waker> calls
+    // the vtable `clone_raw` which increments the Arc refcount —
+    // no heap allocation. `wake_by_ref` is an atomic store.
+    let w = {
+        let g = SCI_DRAIN_WAKER.lock();
+        g.clone()
+    };
+    if let Some(w) = w {
+        w.wake_by_ref();
     }
 }
 
@@ -520,5 +656,10 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
             "  acpi-ec: SCI dispatcher installed (SCI_INT {} → GSI {} → vec {}, level/active-low, ec_gpe={:?})",
             pm.sci_int, gsi, vector, ec_gpe_bit
         );
+
+        // Spawn the drain task now that the SCI line is live.  All
+        // AML evaluation, notify() calls, and format! happen here in
+        // task context (AllocContext::Sleepable is valid).
+        narf_scheduler::spawn(sci_drain_task());
     }
 }
