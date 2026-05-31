@@ -276,18 +276,33 @@ impl DeviceNodeInner {
 
     /// Push one event, dropping the oldest and synthesising SYN_DROPPED
     /// on overflow. Ref: `evdev.c` `evdev_pass_values` overflow path.
+    ///
+    /// The ring has a fixed capacity pre-allocated at construction
+    /// (`VecDeque::with_capacity(RING_CAP)`). This function must never
+    /// push more than `capacity` elements in total, otherwise
+    /// `push_back` would trigger a heap reallocation from IRQ context.
+    ///
+    /// Overflow path: we need room for both SYN_DROPPED and `ev`
+    /// (two pushes). When the ring is full we pop two oldest events
+    /// first, keeping the ring at exactly `RING_CAP` after both pushes.
     fn push(&mut self, ev: EvdevEvent) {
         if self.ring.len() >= RING_CAP {
-            // Drop oldest event.
+            // Need two free slots: one for syn_dropped, one for ev.
+            // Pop the two oldest events so the ring ends at RING_CAP
+            // after both pushes below — no VecDeque reallocation.
+            self.ring.pop_front();
             self.ring.pop_front();
             // Synthesise SYN_DROPPED per Linux evdev.c:152.
             let dropped = EvdevEvent::syn_dropped(ev.time);
-            // If ring is still full after the pop, drop one more.
-            if self.ring.len() >= RING_CAP {
-                self.ring.pop_front();
-            }
             self.ring.push_back(dropped);
         }
+        // At this point len <= RING_CAP - 1, so push_back stays within
+        // the pre-allocated capacity and never reallocates.
+        debug_assert!(
+            self.ring.len() < RING_CAP,
+            "evdev ring overflow: len={} cap={RING_CAP} — push_back would alloc from IRQ",
+            self.ring.len()
+        );
         self.ring.push_back(ev);
     }
 
