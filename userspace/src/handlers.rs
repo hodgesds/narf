@@ -737,12 +737,16 @@ fn sys_write(ctx: &mut dyn TrapContext) {
     // FileOps::write never touches a user page directly — SMAP would
     // fault any kernel-mode dereference of a user-accessible page
     // outside an explicit STAC/CLAC window.
-    let mut kbuf = alloc::vec![0u8; len];
+    // Validate length *before* allocating so an oversized len returns
+    // EINVAL rather than OOMing the kernel heap.
     // SAFETY: single-threaded syscall; AS is still active.
-    if let Err(e) = unsafe { copy_from_user(&mut kbuf, ptr) } {
-        ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-        return;
-    }
+    let kbuf = match unsafe { copy_from_user_vec(ptr, len) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
 
     // Stdio (fd 0/1/2) is auto-installed in fresh fd tables by
     // `fd::with_table`, so all fds — including stdio — route
@@ -1163,12 +1167,16 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    let mut kbuf = alloc::vec![0u8; len];
+    // Validate length before allocating — reject oversized len with EINVAL
+    // rather than OOMing the kernel heap.
     // SAFETY: single-threaded syscall; AS active.
-    if let Err(e) = unsafe { copy_from_user(&mut kbuf, ptr) } {
-        ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-        return;
-    }
+    let kbuf = match unsafe { copy_from_user_vec(ptr, len) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
     let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
@@ -4364,6 +4372,12 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
         return;
     }
     let bytes = size & !7; // round to 8
+    // Validate the destination range before allocating — an oversized size
+    // would otherwise OOM the kernel heap before copy_to_user fires.
+    if validate_user_range(out, bytes).is_err() {
+        ctx.set_return(fail);
+        return;
+    }
     // Build the affinity bitmap in kernel memory (CPU 0 set, rest zero),
     // then copy to user space under the SMAP bracket.
     let mut kbuf = alloc::vec![0u8; bytes];
@@ -5525,6 +5539,26 @@ unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(), u64> {
         }
     }
     Ok(())
+}
+
+/// Allocate a kernel `Vec<u8>` of `len` bytes and fill it from userspace
+/// address `src_uptr`.
+///
+/// Validates `len <= MAX_USER_COPY` (EINVAL) and pointer canonicality
+/// (EFAULT) *before* the allocation, so an oversized user-supplied length
+/// never reaches the heap allocator.  This is the correct helper to use
+/// whenever a syscall would otherwise `vec![0u8; len]` and then call
+/// `copy_from_user` — the two steps are merged here so the ordering
+/// cannot be violated per call site.
+///
+/// # Safety
+/// Same as `copy_from_user`.
+unsafe fn copy_from_user_vec(src_uptr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, u64> {
+    validate_user_range(src_uptr, len)?;
+    let mut buf = alloc::vec![0u8; len];
+    // SAFETY: validated above; SMAP bracket inside copy_from_user.
+    unsafe { copy_from_user(&mut buf, src_uptr) }?;
+    Ok(buf)
 }
 
 /// Copy `len` bytes from the kernel-owned slice `src` into userspace
@@ -7563,14 +7597,16 @@ fn sys_socket_send(ctx: &mut dyn TrapContext) {
         None => { ctx.set_return(fail); return; }
     };
     // Copy user send buffer into kernel memory under the SMAP bracket.
-    let mut buf = alloc::vec![0u8; buf_len];
-    if buf_len > 0 {
-        // SAFETY: AS active; SMAP bracket inside copy_from_user.
-        if unsafe { copy_from_user(&mut buf, buf_ptr) }.is_err() {
-            ctx.set_return(fail);
-            return;
+    // Validate length before allocating — reject oversized len with EINVAL.
+    let buf = if buf_len > 0 {
+        // SAFETY: AS active; SMAP bracket inside copy_from_user_vec.
+        match unsafe { copy_from_user_vec(buf_ptr, buf_len) } {
+            Ok(b) => b,
+            Err(_) => { ctx.set_return(fail); return; }
         }
-    }
+    } else {
+        alloc::vec::Vec::new()
+    };
     let dest = if addr_ptr != 0 && addr_len >= 2 {
         copy_user_addr(addr_ptr, addr_len)
     } else {
@@ -7682,6 +7718,12 @@ fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         0
     };
     if val_ptr == 0 || in_len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // Validate the output range before allocating — prevents OOM from a
+    // user-supplied in_len larger than MAX_USER_COPY.
+    if validate_user_range(val_ptr, in_len).is_err() {
         ctx.set_return(fail);
         return;
     }
@@ -7819,12 +7861,17 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     let iov_ptr = read_user_u64(msg_ptr + 16);
     let iov_len = read_user_u64(msg_ptr + 24) as usize;
     // Reassemble into a flat kernel buffer under SMAP bracket.
+    // Cap total to MAX_USER_COPY so a user-crafted iovec cannot OOM the heap.
     let mut total = alloc::vec::Vec::new();
     for i in 0..iov_len {
         let base = iov_ptr + (i as u64) * 16;
         let p = read_user_u64(base);
         let l = read_user_u64(base + 8) as usize;
         if p == 0 || l == 0 { continue; }
+        if total.len().saturating_add(l) > MAX_USER_COPY {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            return;
+        }
         let old_len = total.len();
         total.resize(old_len + l, 0u8);
         // SAFETY: SMAP bracket inside copy_from_user; p is a user VA.
@@ -7865,11 +7912,16 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
     let name_len_ptr = msg_ptr + 8; // namelen lives at offset 8
     let iov_ptr = read_user_u64(msg_ptr + 16);
     let iov_len = read_user_u64(msg_ptr + 24) as usize;
-    // Total capacity from iovecs.
+    // Total capacity from iovecs. Cap at MAX_USER_COPY to prevent OOM
+    // from a user-crafted iovec with a giant per-slot length.
     let mut total_cap = 0usize;
     for i in 0..iov_len {
         let base = iov_ptr + (i as u64) * 16;
-        total_cap += read_user_u64(base + 8) as usize;
+        total_cap = total_cap.saturating_add(read_user_u64(base + 8) as usize);
+    }
+    if total_cap > MAX_USER_COPY {
+        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        return;
     }
     let mut staging = alloc::vec![0u8; total_cap];
     let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
