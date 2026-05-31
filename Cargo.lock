@@ -1904,6 +1904,7 @@ name = "narf-userspace"
 version = "0.0.0"
 dependencies = [
  "narf-abi",
+ "narf-arch",
  "narf-block",
  "narf-capabilities",
  "narf-console",
