@@ -56,19 +56,18 @@ enum Cmd {
     /// (`firmware/specification/spec.md` §6). Produces an unsigned
     /// blob — kernel must be built with `firmware-allow-unsigned`
     /// for these to load. The wrapped output goes into
-    /// `firmware/<name>` inside the workspace (so `xtask image`
-    /// auto-bundles it into the initramfs CPIO).
+    /// `target/firmware/<name>` (so `xtask image` stages it either
+    /// into the initramfs CPIO if matched by `--initramfs-firmware`,
+    /// or onto the root partition's /lib/firmware/ otherwise).
     PackFirmware(PackFirmwareArgs),
     /// Bulk-import firmware blobs from a source directory tree
-    /// (default `/lib/firmware/`) into the workspace's
-    /// `firmware/` dir. Recursively walks, decompresses `.zst`
-    /// entries on the fly (Arch's linux-firmware ships everything
-    /// zstd-compressed), and wraps each with the NARF trailer.
-    /// Result is bundled into the initramfs by `xtask image`.
-    ///
-    /// Mirrors the `linux-firmware` payload a Linux live ISO
-    /// ships — the ISO will carry firmware for any device a driver
-    /// later wants to load, without per-device hand-curation.
+    /// (default `/lib/firmware/`) into `target/firmware/`.
+    /// Recursively walks, decompresses `.zst` entries on the fly
+    /// (Arch's linux-firmware ships everything zstd-compressed), and
+    /// wraps each with the NARF trailer. `xtask image` then splits
+    /// the result: blobs matched by `--initramfs-firmware` go into
+    /// the initramfs CPIO; everything else stages onto the root
+    /// partition's /lib/firmware/ (Linux hybrid model).
     ImportFirmware(ImportFirmwareArgs),
 }
 
@@ -150,12 +149,13 @@ struct DiskWritePartitionedArgs {
     device: Option<String>,
 
     /// ESP partition size in MiB. Holds kernel + initramfs +
-    /// Limine. Default 1024 MiB accommodates the Linux-firmware-
-    /// scale initramfs (`xtask import-firmware` bundles 90 MB+
-    /// of amdgpu blobs alone; with iwlwifi/mt76/rtw89 +
-    /// microcode the total reaches ~750 MB on Arch). Drop to 256
-    /// for a "kernel + init/shell only" minimal-ISO build.
-    #[arg(long, default_value_t = 1024)]
+    /// Limine. With the Linux hybrid model the initramfs now holds
+    /// only `--initramfs-firmware` globs (default: nothing), so the
+    /// ESP is typically 64–256 MiB — enough for the kernel ELF,
+    /// Limine support files, and microcode-only initramfs. Drop to
+    /// 64 for a "kernel + init/shell only" minimal build; raise if
+    /// you point `--initramfs-firmware` at large GPU blobs.
+    #[arg(long, default_value_t = 256)]
     esp_size_mib: u64,
 
     /// Filesystem for the root partition.
@@ -243,6 +243,26 @@ struct BuildArgs {
     /// Hardware profile to use for QEMU.
     #[arg(long, value_enum, default_value_t = HwProfile::Full)]
     hw_profile: HwProfile,
+
+    /// Glob patterns (relative to target/firmware/) for blobs to pack
+    /// into the initramfs CPIO. Only firmware matching at least one
+    /// glob goes into the initramfs; everything else stages onto the
+    /// root partition's /lib/firmware/. May be supplied multiple times.
+    ///
+    /// Linux convention: initramfs holds only what must be available
+    /// BEFORE the root filesystem mounts (CPU microcode, early-FB GPU
+    /// firmware, storage-controller quirk blobs). Everything else
+    /// lives on the root partition and is registered by the
+    /// `firmware-scan-rootfs` initcall AFTER `root-mount-auto`.
+    ///
+    /// Default (no flags): zero firmware in initramfs; all firmware
+    /// goes to the root partition. This keeps the initramfs small
+    /// enough for Limine to allocate as a multiboot2 module.
+    ///
+    /// Example: --initramfs-firmware "amd-ucode/*"
+    ///          --initramfs-firmware "intel-ucode/*"
+    #[arg(long, value_name = "GLOB")]
+    initramfs_firmware: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default, Debug)]
@@ -1119,18 +1139,42 @@ fn ensure_feature(features: &mut String, feature: &str) {
     features.push_str(feature);
 }
 
-/// Recursively walk `fw_dir` collecting every regular file. Returns
-/// `(cpio_name, bytes)` pairs where `cpio_name = "firmware/<rel>"`
-/// — the prefix the kernel's `scan_initramfs` strips when it
-/// registers entries by canonical name.
+/// Recursively walk `fw_dir` collecting every regular file. Returns a
+/// pair of entry lists:
+///
+/// - `initramfs`: `(cpio_name, bytes)` pairs where `cpio_name =
+///   "firmware/<rel>"` for blobs whose `<rel>` path matches at least
+///   one glob in `initramfs_globs`. These go into the CPIO archive
+///   so the kernel's `firmware-scan-initramfs` initcall registers
+///   them before root mounts.
+///
+/// - `rootfs`: `(rel, bytes)` pairs for everything else. The caller
+///   copies these to `<root-staging>/lib/firmware/<rel>` so
+///   `firmware-scan-rootfs` registers them after `root-mount-auto`.
+///
+/// Linux convention (linux/init/initramfs.c + linux/drivers/base/
+/// firmware_loader/main.c::fw_get_filesystem_firmware): only blobs
+/// needed BEFORE root mounts (CPU microcode, early-FB GPU firmware,
+/// storage-controller quirk blobs) go in the initramfs. Everything
+/// else lives on the root partition at /lib/firmware/.
+///
+/// Default (empty `initramfs_globs`): zero firmware in initramfs;
+/// all firmware goes to rootfs. Keeps the initramfs small enough for
+/// Limine's multiboot2 module allocator (< 20 MiB without firmware
+/// vs. 1.7 GiB with a full linux-firmware import).
 ///
 /// Empty result is fine — a build with no firmware just skips the
 /// scan + ships the same init+shell-only CPIO as before.
-fn collect_firmware_blobs(fw_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+fn collect_firmware_blobs(
+    fw_dir: &Path,
+    initramfs_globs: &[String],
+) -> Result<(Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>)> {
     if !fw_dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
-    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut initramfs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut rootfs: Vec<(String, Vec<u8>)> = Vec::new();
+
     let mut stack: Vec<PathBuf> = vec![fw_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir)
@@ -1153,17 +1197,87 @@ fn collect_firmware_blobs(fw_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
                 .to_str()
                 .ok_or_else(|| anyhow!("firmware path {} not valid UTF-8", path.display()))?
                 .replace('\\', "/");
-            let cpio_name = format!("firmware/{}", rel_str);
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("reading firmware blob {}", path.display()))?;
-            out.push((cpio_name, bytes));
+            // Match against initramfs globs. A glob is matched against
+            // the rel-path (e.g. "amd-ucode/microcode_amd.bin") using
+            // simple wildcard expansion: `*` matches any sequence of
+            // characters that doesn't cross a `/` boundary, `**` is
+            // not supported (use `amdgpu/*` for a whole subdirectory).
+            let in_initramfs = initramfs_globs
+                .iter()
+                .any(|glob| glob_match(glob, &rel_str));
+            if in_initramfs {
+                let cpio_name = format!("firmware/{}", rel_str);
+                initramfs.push((cpio_name, bytes));
+            } else {
+                rootfs.push((rel_str, bytes));
+            }
         }
     }
-    // Stable order so successive builds produce byte-identical CPIO
-    // payloads when nothing in firmware/ changed (helps debugging +
-    // any future reproducibility work).
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
+    // Stable order for reproducibility.
+    initramfs.sort_by(|a, b| a.0.cmp(&b.0));
+    rootfs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((initramfs, rootfs))
+}
+
+/// Simple single-level glob matcher. Supports `*` (matches any
+/// characters except `/`) within a path component. Does NOT support
+/// `?` or `[...]` — firmware path globs don't need them.
+///
+/// Examples:
+///   glob_match("amd-ucode/*",        "amd-ucode/microcode_amd.bin") → true
+///   glob_match("intel-ucode/*",      "amd-ucode/microcode_amd.bin") → false
+///   glob_match("amdgpu/raven_*.bin", "amdgpu/raven_dmcu.bin")       → true
+///   glob_match("amdgpu/*",           "amdgpu/sub/blob.bin")         → false
+fn glob_match(glob: &str, path: &str) -> bool {
+    // Split both into `/`-separated segments and match segment by segment.
+    let g_segs: Vec<&str> = glob.split('/').collect();
+    let p_segs: Vec<&str> = path.split('/').collect();
+    if g_segs.len() != p_segs.len() {
+        return false;
+    }
+    g_segs.iter().zip(p_segs.iter()).all(|(g, p)| {
+        // Each segment is matched with `*` as a wildcard.
+        segment_match(g, p)
+    })
+}
+
+fn segment_match(glob: &str, text: &str) -> bool {
+    // Recursive: consume one glob char at a time.
+    if glob.is_empty() {
+        return text.is_empty();
+    }
+    if glob == "*" {
+        // Remaining glob is just `*` — matches anything (including empty).
+        return true;
+    }
+    let mut gi = glob.chars();
+    let first = gi.next().unwrap();
+    if first != '*' {
+        // Literal char: must match.
+        let mut pi = text.chars();
+        match pi.next() {
+            Some(c) if c == first => segment_match(gi.as_str(), pi.as_str()),
+            _ => false,
+        }
+    } else {
+        // `*` at start of glob segment: try matching 0..=N text chars.
+        let rest_glob = gi.as_str();
+        let mut t = text;
+        loop {
+            if segment_match(rest_glob, t) {
+                return true;
+            }
+            if t.is_empty() {
+                return false;
+            }
+            // Advance one character in text.
+            let mut ci = t.chars();
+            ci.next();
+            t = ci.as_str();
+        }
+    }
 }
 
 /// Wrap raw payload bytes with the NARF unsigned trailer. Pure
@@ -1508,50 +1622,84 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let shell_bytes = std::fs::read(&shell_elf)
         .with_context(|| format!("reading shell ELF at {}", shell_elf.display()))?;
 
-    // Firmware bundling: walk `target/firmware/` (the default
-    // `xtask import-firmware --out`). Each file lands in the
-    // initramfs CPIO as `firmware/<relpath>` and the kernel's
-    // `firmware-scan-initramfs` initcall registers it under that
-    // suffix. Pack with `cargo xtask pack-firmware` for one-offs
-    // or `cargo xtask import-firmware` for a Linux-live-ISO-style
-    // bulk bundle. `firmware/` (workspace) is intentionally NOT
-    // walked — that's the narf-firmware crate dir, walking it
-    // would CPIO source files.
+    // Firmware bundling — Linux hybrid model:
+    //   initramfs: only blobs matching --initramfs-firmware globs.
+    //              Needed BEFORE root mounts (CPU microcode, early-FB
+    //              GPU firmware, storage-controller quirk blobs).
+    //              Default: ZERO blobs → initramfs stays tiny so
+    //              Limine can allocate it as a multiboot2 module.
+    //   rootfs:    everything else → target/rootfs-firmware-staging/
+    //              lib/firmware/<rel>. disk-write-partitioned copies
+    //              this tree onto the NARF_ROOT ext4 partition;
+    //              firmware-scan-rootfs registers it after root-mount.
+    //
+    // Linux references:
+    //   linux/init/initramfs.c — boot-time initramfs include.
+    //   linux/drivers/base/firmware_loader/main.c::fw_get_filesystem_firmware
+    //     — /lib/firmware/ search-path pattern.
     let fw_dir = root.join("target").join("firmware");
-    let fw_entries = collect_firmware_blobs(&fw_dir)?;
+    let (fw_initramfs, fw_rootfs) =
+        collect_firmware_blobs(&fw_dir, &args.initramfs_firmware)?;
 
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
     cpio_entries.push(("init", &init_bytes));
     cpio_entries.push(("shell", &shell_bytes));
-    for (path, bytes) in &fw_entries {
+    for (path, bytes) in &fw_initramfs {
         cpio_entries.push((path.as_str(), bytes.as_slice()));
     }
     let cpio = encode_cpio_newc(&cpio_entries);
     let cpio_path = boot_dir.join("initramfs.cpio");
     std::fs::write(&cpio_path, &cpio)
         .with_context(|| format!("writing initramfs CPIO to {}", cpio_path.display()))?;
-    if fw_entries.is_empty() {
-        println!(
-            "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, no firmware)",
-            cpio.len(),
-            init_bytes.len(),
-            shell_bytes.len(),
-        );
-    } else {
-        let fw_total: usize = fw_entries.iter().map(|(_, b)| b.len()).sum();
-        println!(
-            "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, \
-             {} firmware blob(s) totalling {} bytes)",
-            cpio.len(),
-            init_bytes.len(),
-            shell_bytes.len(),
-            fw_entries.len(),
-            fw_total,
-        );
-        for (name, bytes) in &fw_entries {
-            println!("  firmware: {} ({} bytes)", name, bytes.len());
+
+    // Stage rootfs firmware at target/rootfs-firmware-staging/lib/firmware/<rel>
+    // so disk-write-partitioned can copy the whole tree onto NARF_ROOT.
+    let rootfs_fw_stage = root
+        .join("target")
+        .join("rootfs-firmware-staging")
+        .join("lib")
+        .join("firmware");
+    if !fw_rootfs.is_empty() {
+        std::fs::create_dir_all(&rootfs_fw_stage)
+            .context("creating rootfs firmware staging dir")?;
+        for (rel, bytes) in &fw_rootfs {
+            let dst = rootfs_fw_stage.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating staging subdir {}", parent.display()))?;
+            }
+            std::fs::write(&dst, bytes)
+                .with_context(|| format!("staging rootfs firmware blob {}", rel))?;
         }
     }
+
+    let initramfs_fw_bytes: usize = fw_initramfs.iter().map(|(_, b)| b.len()).sum();
+    let rootfs_fw_bytes: usize = fw_rootfs.iter().map(|(_, b)| b.len()).sum();
+    fn fmt_mib(bytes: usize) -> String {
+        if bytes >= 1024 * 1024 {
+            format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.1} KiB", bytes as f64 / 1024.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+    println!(
+        "xtask image: initramfs firmware: {} entries ({})",
+        fw_initramfs.len(),
+        fmt_mib(initramfs_fw_bytes),
+    );
+    println!(
+        "xtask image: rootfs firmware:    {} entries ({})",
+        fw_rootfs.len(),
+        fmt_mib(rootfs_fw_bytes),
+    );
+    println!(
+        "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes)",
+        cpio.len(),
+        init_bytes.len(),
+        shell_bytes.len(),
+    );
 
     // BIOS support files are nice-to-have. xorriso flags below
     // reference them; if missing, drop the BIOS-side El-Torito
@@ -2422,6 +2570,70 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     mk_root_dir(&mnt_fs, "bin")?;
     cp_root(&init_elf, &mnt_fs.join("sbin/init"))?;
     cp_root(&shell_elf, &mnt_fs.join("bin/sh"))?;
+
+    // ── 5c. Copy staged rootfs firmware onto the root partition ──
+    // `xtask image` populated target/rootfs-firmware-staging/lib/firmware/
+    // with every blob NOT matched by --initramfs-firmware globs.
+    // Copy that whole tree onto the root partition so the kernel's
+    // `firmware-scan-rootfs` initcall finds it at /lib/firmware/ after
+    // `root-mount-auto` mounts the ext4 partition.
+    //
+    // Linux convention: /lib/firmware/ is the canonical search path
+    // (linux/drivers/base/firmware_loader/main.c::fw_get_filesystem_firmware).
+    let rootfs_fw_stage = target_dir
+        .join("rootfs-firmware-staging")
+        .join("lib")
+        .join("firmware");
+    if rootfs_fw_stage.exists() {
+        mk_root_dir(&mnt_fs, "lib")?;
+        mk_root_dir(&mnt_fs, "lib/firmware")?;
+        // Walk the staging tree and copy each blob.
+        let mut fw_copied = 0usize;
+        let mut fw_bytes = 0u64;
+        let mut fw_stack: Vec<PathBuf> = vec![rootfs_fw_stage.clone()];
+        while let Some(dir) = fw_stack.pop() {
+            let rel_dir = dir
+                .strip_prefix(&rootfs_fw_stage)
+                .unwrap_or(std::path::Path::new(""));
+            let entries = std::fs::read_dir(&dir)
+                .with_context(|| format!("read_dir fw-staging {}", dir.display()))?;
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    fw_stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let fname = entry.file_name();
+                let rel_path = rel_dir.join(&fname);
+                let rel_str = rel_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("firmware path not valid UTF-8"))?;
+                let dst_rel = format!("lib/firmware/{}", rel_str.replace('\\', "/"));
+                // Ensure parent dir exists on the mounted partition.
+                if let Some(parent) = std::path::Path::new(&dst_rel).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        mk_root_dir(&mnt_fs, parent.to_str().unwrap_or(""))?;
+                    }
+                }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                cp_root(&path, &mnt_fs.join(&dst_rel))?;
+                fw_copied += 1;
+                fw_bytes += size;
+            }
+        }
+        println!(
+            "  root partition: copied {} firmware blob(s) ({:.1} MiB) to /lib/firmware/",
+            fw_copied,
+            fw_bytes as f64 / (1024.0 * 1024.0),
+        );
+    } else {
+        println!("  root partition: no staged rootfs firmware (run `cargo xtask image` first, or no firmware imported)");
+    }
 
     // ── 6. Unmount + sync ────────────────────────────────────────
     let _ = Command::new("sync").status();

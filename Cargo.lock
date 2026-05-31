@@ -1419,6 +1419,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-rcu",
+ "narf-scheduler",
 ]
 
 [[package]]
