@@ -55,6 +55,13 @@ pub fn sys_finit_module(bytes: &[u8]) -> Result<Arc<Module>, ModuleSyscallError>
 /// `sys_delete_module(name, flags)` — unload `name` if its refcount
 /// is zero. Linux's `flags` carries `O_NONBLOCK` etc.; NARF ignores
 /// those today (we never block).
+///
+/// Sequence mirrors `linux/kernel/module/main.c::free_module`:
+///   1. invoke_exit (state Going → Dead)
+///   2. sweep KSYMTAB — `unregister_exports_of` removes all entries
+///      owned by this module, preventing use-after-free on any later
+///      `resolve` call (DESIGN.md §6)
+///   3. remove from registry (drops the Arc, freeing placements)
 pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     let module = registry::lookup(name)
         .ok_or(ModuleSyscallError::NotFound)?;
@@ -64,6 +71,12 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     // registry::remove drops the registry's reference.
     unsafe { loader::invoke_exit(&module) }
         .map_err(ModuleSyscallError::ExitFailed)?;
+
+    // Sweep all KSYMTAB entries registered by this module during its
+    // init.  Must happen before the Arc is dropped so that if the
+    // module's exit handler re-exported anything, those are gone too.
+    let _removed = crate::symbols::unregister_exports_of(module.id);
+
     registry::remove(name);
     Ok(())
 }
