@@ -180,6 +180,101 @@ changes. A module compiled against the old signature carries the
 old CRC; the symbol resolver returns `ResolveError::CrcMismatch`
 and the load aborts.
 
+## §6 Per-module symbol ownership and unregister-on-unload
+
+Prior to Wave-29 there was a use-after-free gap: `register_export` added
+symbols to KSYMTAB unconditionally at module init time. On
+`sys_delete_module` the exports persisted, and a subsequent `resolve` call
+could return a dangling address pointing into freed module memory.
+
+This is now fixed. The implementation follows Linux's
+`kernel/module/kallsyms.c::module_kallsyms_lookup_name` (per-module symbol
+table) and `kernel/module/main.c::free_module` (the sweep point).
+
+### Design choice: Design A — owner-id field on each KSYMTAB entry
+
+Each `KernelExport` carries an `owner: ModuleId` field. In-tree exports
+use `KERNEL_MODULE_ID = ModuleId(0)`. LKM exports use a per-module
+`ModuleId` assigned at load time from `symbols::alloc_module_id()`.
+
+Design B (side-table of ModuleId → Vec<name>) was considered and rejected:
+KSYMTAB is small (tens to low hundreds of entries), so the single-pass
+`retain()` sweep in `unregister_exports_of` is cheaper than maintaining a
+two-structure invariant.
+
+### API
+
+```rust
+/// Permanent kernel export — KERNEL_MODULE_ID owner.
+pub const KERNEL_MODULE_ID: ModuleId = ModuleId(0);
+
+/// Allocate a fresh ModuleId for a loading module.
+pub fn alloc_module_id() -> ModuleId;
+
+/// Register with explicit owner (for callers that need control).
+pub fn register_export_owned_by(owner: ModuleId, export: KernelExport);
+
+/// Register using the current init-attribution context.
+/// Outside invoke_init this is KERNEL_MODULE_ID (permanent).
+pub fn register_export(export: KernelExport);  // thin wrapper, not a shim
+
+/// Sweep all KSYMTAB entries owned by module_id. Returns count removed.
+/// Called from sys_delete_module after invoke_exit, before registry::remove.
+pub fn unregister_exports_of(module_id: ModuleId) -> usize;
+```
+
+The existing `export(name, addr, crc)` and `export_with_cap(...)` helpers
+are unchanged in signature — they route through `register_export` which
+reads `current_init_id()` to auto-attribute. Callers outside any init
+context (boot code) get `KERNEL_MODULE_ID` automatically.
+
+### Init-attribution context
+
+`loader::invoke_init` brackets the module's `narf_module_init` call with:
+
+```rust
+symbols::set_init_context(module.id);   // arm
+let rc = init();
+symbols::set_init_context(KERNEL_MODULE_ID);  // restore (even on error)
+```
+
+This means an LKM's init can call the bare `narf_export!` macro and the
+symbol is automatically tagged with the right owner — no API change to
+module authoring required. Linux uses `module->init_layout` and
+`current->mm` for analogous context tracking.
+
+### Unload sweep
+
+`sys_delete_module` calls `symbols::unregister_exports_of(module.id)`
+after `invoke_exit` returns but before `registry::remove` drops the Arc:
+
+```rust
+unsafe { loader::invoke_exit(&module) }.map_err(...)?;
+let _removed = symbols::unregister_exports_of(module.id);
+registry::remove(name);
+```
+
+### Verified by e2e smoke 4
+
+`modules/e2e::e2e_unload_cleans_proc_and_sys` (formerly a deferral) now
+asserts:
+  1. Symbol visible after load (resolve returns Ok).
+  2. Symbol gone after unload (resolve returns Err(Unknown)).
+  3. Symbol reappears after re-load (idempotency across ModuleId allocation).
+
+### Deferred items
+
+  * **Per-symbol export reference counting.** If module B holds a function
+    pointer resolved from module A's export, module A's `unregister_exports_of`
+    removes the KSYMTAB entry but doesn't prevent B from calling through the
+    stale pointer. Full safety requires refcount-guarded inter-module
+    dependencies (like Linux's `try_module_get`/`module_put` pair).
+  * **Livepatch.** Symbol ownership interacts with livepatch if a patched
+    symbol is later unregistered; deferred until livepatch lands.
+  * **`__reset_for_test` resets the MODULE_ID_ALLOC counter.** Tests that
+    call `__reset_for_test` between loads get fresh IDs — adequate for
+    in-kernel test isolation, but counter exhaustion at 2^64 is theoretical.
+
 ## Open questions / future phases
 
   * **Ed25519 signature verification.** The hook is in place; the
