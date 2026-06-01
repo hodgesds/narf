@@ -510,29 +510,50 @@ fn e2e_refcount_blocks_unload() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_refcount_blocks_unload);
 
-// ── Smoke 4: unload → /proc/modules + /sys/module cleanup ───────────
+// ── Smoke 4: unload → /proc/modules + /sys/module + KSYMTAB cleanup ──
+//
+// Verifies the full unload sequence including the KSYMTAB sweep
+// introduced in DESIGN.md §6.  The module registers a symbol during
+// its init (attributed to module.id via the CURRENT_INIT_MODULE_ID
+// context); after unload that entry must be gone.  Re-loading the
+// same module re-registers the symbol under a new ModuleId — the
+// idempotency test confirms the ownership model survives multiple
+// load/unload cycles.
+
+/// Init function for smoke 4: registers "e2e_cleanup_alive" while
+/// the init-attribution context is set to this module's id.
+extern "C" fn smoke_init_cleanup() -> i32 {
+    INIT_RAN.store(true, Ordering::Release);
+    crate::symbols::export("e2e_cleanup_alive", smoke_alive as usize, 0x4242);
+    0
+}
 
 fn e2e_unload_cleans_proc_and_sys() -> TestResult {
     let abi = fresh_abi();
     fresh_state(abi);
-    let elf = standard_test_elf("e2e_cleanup", abi);
+    let elf = build_smoke_elf(&SmokeElfSpec {
+        modinfo: build_modinfo("e2e_cleanup", abi, None),
+        init_addr: smoke_init_cleanup as usize as u64,
+        exit_addr: smoke_exit as usize as u64,
+    });
 
     let m = match sys_init_module(&elf) {
         Ok(m) => m,
         Err(_) => return TestResult::Fail("load failed"),
     };
-    // Publish a symbol the module would have provided.
-    crate::symbols::export(
-        "e2e_cleanup_alive",
-        smoke_alive as usize,
-        0x4242,
-    );
     let _kobj = crate::sysfs_module::install_module(&m);
+
+    // Symbol must be visible before unload.
+    let manifest = crate::manifest::Manifest::default();
+    if crate::symbols::resolve("e2e_cleanup_alive", None, &manifest).is_err() {
+        return TestResult::Fail("e2e_cleanup_alive not in ksymtab before unload");
+    }
 
     if sys_delete_module("e2e_cleanup").is_err() {
         return TestResult::Fail("delete returned error");
     }
 
+    // /proc/modules and registry must be empty.
     let snapshot = crate::registry::snapshot();
     let proc = crate::proc_modules::render_all(&snapshot);
     if proc.contains("e2e_cleanup") {
@@ -542,13 +563,33 @@ fn e2e_unload_cleans_proc_and_sys() -> TestResult {
         return TestResult::Fail("registry still lists module after delete");
     }
 
-    // The exported symbol the module published lives in the kernel
-    // KSYMTAB and is the module's responsibility to deregister in
-    // its exit. NARF doesn't have a per-module symbol-ownership
-    // table yet (see DESIGN.md §6 — pending); for now the smoke
-    // verifies the *module's* presence is gone. When per-module
-    // export tracking lands, this smoke will additionally assert
-    // the symbol is unregistered. Documented in `tests_e2e.rs`.
+    // DESIGN.md §6: the KSYMTAB entry registered during init must have
+    // been swept by sys_delete_module → unregister_exports_of(module.id).
+    match crate::symbols::resolve("e2e_cleanup_alive", None, &manifest) {
+        Err(crate::symbols::ResolveError::Unknown) => {}
+        Ok(_) => return TestResult::Fail("e2e_cleanup_alive still in ksymtab after unload (use-after-free risk)"),
+        Err(_) => return TestResult::Fail("unexpected resolve error after unload"),
+    }
+
+    // Idempotency: reload the module — the symbol reappears under a new
+    // ModuleId and is visible again.
+    INIT_RAN.store(false, Ordering::Release);
+    EXIT_RAN.store(false, Ordering::Release);
+    let abi2 = fresh_abi();
+    crate::symbols::set_kernel_abi(abi2);
+    let elf2 = build_smoke_elf(&SmokeElfSpec {
+        modinfo: build_modinfo("e2e_cleanup", abi2, None),
+        init_addr: smoke_init_cleanup as usize as u64,
+        exit_addr: smoke_exit as usize as u64,
+    });
+    if sys_init_module(&elf2).is_err() {
+        return TestResult::Fail("re-load failed");
+    }
+    if crate::symbols::resolve("e2e_cleanup_alive", None, &manifest).is_err() {
+        return TestResult::Fail("e2e_cleanup_alive not visible after re-load");
+    }
+    // Clean up.
+    let _ = sys_delete_module("e2e_cleanup");
 
     TestResult::Pass
 }
