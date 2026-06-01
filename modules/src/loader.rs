@@ -281,6 +281,13 @@ fn find_symtab(
 
 /// Locate `narf_module_init` (required) and `narf_module_exit`
 /// (optional) within the module's local symbols.
+///
+/// Both `SHN_ABS` symbols (absolute address baked into `st_value` —
+/// commonly used by build-time tooling that knows the function's
+/// final VA) and section-relative symbols are honoured. Linux's
+/// `find_module_sections` does the same in `kernel/module/main.c`
+/// (`main.c:2606`); ABS symbols there land at their `st_value`
+/// unchanged.
 fn find_lifecycle_symbols(
     symbols: &SymbolTable,
     placements: &[SectionPlacement],
@@ -297,19 +304,26 @@ fn find_lifecycle_symbols(
         }
         let name = symbols.name(&s);
         if name == "narf_module_init" {
-            init = local_address(&s, placements);
+            init = resolve_local_address(&s, placements);
         } else if name == "narf_module_exit" {
-            exit = local_address(&s, placements);
+            exit = resolve_local_address(&s, placements);
         }
     }
     let init = init.ok_or(LoadError::MissingInit)?;
     Ok((init, exit))
 }
 
-fn local_address(
+/// Resolve a defined symbol to a runtime address. Handles ABS
+/// (st_shndx == SHN_ABS) and section-relative symbols. Returns
+/// `None` if the symbol references a section we didn't lay out.
+fn resolve_local_address(
     sym: &crate::elf::Elf64Symbol,
     placements: &[SectionPlacement],
 ) -> Option<usize> {
+    if sym.st_shndx == crate::elf::symbols::SHN_ABS {
+        // Absolute symbol — the value is the runtime address.
+        return Some(sym.st_value as usize);
+    }
     let p = placements
         .iter()
         .find(|p| p.section_idx == sym.st_shndx as usize)?;
