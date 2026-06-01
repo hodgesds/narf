@@ -129,6 +129,15 @@ pub fn find_block_device(name: &str) -> Option<Arc<dyn BlockDeviceSync>> {
         .map(|e| e.dev.clone())
 }
 
+/// Unregister a block device by name.  No-op if the name is not
+/// present.  Used by hot-unplug paths and by test teardown.
+pub fn unregister_block_device(name: &str) {
+    let mut g = REGISTRY.lock();
+    if let Some(pos) = g.iter().position(|e| e.name == name) {
+        g.swap_remove(pos);
+    }
+}
+
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __reset_for_test() {

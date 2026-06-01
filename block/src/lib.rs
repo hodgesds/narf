@@ -38,12 +38,13 @@ pub mod registry;
 pub mod scsi;
 
 mod tests;
+mod e2e_tests;
 
 pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use registry::{
-    block_device_count, block_devices, find_block_device, register_block_device, BlockDeviceSync,
-    BlockIoError, RegisteredBlockDevice, SyncBlock,
+    block_device_count, block_devices, find_block_device, register_block_device,
+    unregister_block_device, BlockDeviceSync, BlockIoError, RegisteredBlockDevice, SyncBlock,
 };
 
 use core::future::Future;
