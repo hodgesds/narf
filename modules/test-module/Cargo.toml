@@ -1,0 +1,41 @@
+# Minimal NARF kernel module used by the loader's end-to-end smokes.
+#
+# This crate is intentionally tiny: it compiles to a relocatable ELF
+# that demonstrates the authoring shape from MODULE_AUTHORING.md
+# (modinfo lines, narf_module_init / narf_module_exit C-ABI symbols,
+# one cap-typed export hook). The kernel's end-to-end smokes in
+# `modules/src/tests_e2e.rs` synthesize an ELF blob in-line so they
+# don't depend on the workspace cross-compiler being set up to emit
+# a relocatable .o; this crate is the human-readable reference that
+# tracks the same shape so authors of out-of-tree modules can copy
+# from it.
+#
+# Built target: x86_64-unknown-none (matches the kernel). Built as
+# `staticlib` per MODULE_AUTHORING.md so the build emits an archive
+# we can later extract the .o from.
+#
+# Linux refs:
+#   * tools/testing/selftests/kmod/kmod_test.sh — userspace smoke
+#     using a real test_module.ko.
+#   * lib/test_modload.c — kernel-side regression module loaded by
+#     the kmod selftests.
+
+[package]
+name         = "narf-test-module"
+description  = "Tiny NARF kernel module used as a reference shape + smoke input."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name        = "narf_test_module"
+crate-type  = ["staticlib"]
+
+[dependencies]
+# No runtime deps. The module touches only its own statics so the
+# loader has something observable to confirm init/exit fired.
+
+[lints]
+workspace = true

@@ -1853,6 +1853,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-test-module"
+version = "0.0.0"
+
+[[package]]
 name = "narf-time"
 version = "0.0.0"
 dependencies = [
