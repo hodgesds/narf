@@ -78,6 +78,8 @@ mod tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
 mod sysfs_tests;
+mod e2e_tests;
+#[cfg(feature = "kernel-test")] mod sysfs_e2e_tests;
 pub use devfs::{install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks, mount_default as mount_devfs_default, register_snd_dir, register_tpm, unregister_tpm, DevFs};
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
 pub use fuse::{
