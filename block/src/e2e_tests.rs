@@ -198,9 +198,15 @@ impl BlockFileShim {
 
 // ── Smoke 2: unaligned read spanning 3 LBAs ──────────────────────────
 //
-// Fill LBAs 0/1/2 with 0xAA/0xBB/0xCC. Read 1500 bytes starting at
-// offset 200. The shim issues exactly 1 batched driver read covering
-// all 3 LBAs (first_lba=0, n_lbas=3).
+// Fill LBAs 0/1/2 with 0xAA/0xBB/0xCC. Read 1300 bytes starting at
+// offset 200 (device bytes 200..1499). The last byte (1499) falls
+// in LBA 2 (1024..1535), so the span covers exactly LBAs 0, 1, 2.
+// The shim issues exactly 1 batched driver read (first_lba=0, n_lbas=3).
+//
+// Segment boundaries in buf[]:
+//   buf[0..312]    device bytes 200..511   (LBA 0, 312 bytes)
+//   buf[312..824]  device bytes 512..1023  (LBA 1, 512 bytes)
+//   buf[824..1300] device bytes 1024..1499 (LBA 2, 476 bytes)
 
 fn smoke_e2e_unaligned_read_spans_3_lbas() -> TestResult {
     let dev = FakeBlockDevice::new_1mib();
@@ -212,12 +218,12 @@ fn smoke_e2e_unaligned_read_spans_3_lbas() -> TestResult {
     }
     let bf = BlockFileShim::from_fake(dev.clone());
 
-    let mut buf = vec![0u8; 1500];
+    let mut buf = vec![0u8; 1300];
     match bf.read(200, &mut buf) {
-        Ok(1500) => {}
+        Ok(1300) => {}
         Ok(n) => {
             let _ = n;
-            return TestResult::Fail("expected 1500 bytes returned");
+            return TestResult::Fail("expected 1300 bytes returned");
         }
         Err(_) => return TestResult::Fail("unaligned 3-LBA read returned error"),
     }
@@ -228,17 +234,17 @@ fn smoke_e2e_unaligned_read_spans_3_lbas() -> TestResult {
         return TestResult::Fail("expected exactly 1 driver read call for 3-LBA span");
     }
 
-    // Byte content:
-    //   buf[0..312]   from LBA 0 (offsets 200..511) -> 0xAA
-    //   buf[312..812] from LBA 1 (offsets 512..1023) -> 0xBB
-    //   buf[812..1500] from LBA 2 (offsets 1024..1699) -> 0xCC
+    // Byte content (offset=200, len=1300 → device bytes 200..1499):
+    //   buf[0..312]    from LBA 0 (device bytes 200..511)   -> 0xAA  (312 bytes)
+    //   buf[312..824]  from LBA 1 (device bytes 512..1023)  -> 0xBB  (512 bytes)
+    //   buf[824..1300] from LBA 2 (device bytes 1024..1499) -> 0xCC  (476 bytes)
     if buf[..312].iter().any(|&b| b != 0xAA) {
         return TestResult::Fail("3-LBA read: LBA 0 bytes wrong");
     }
-    if buf[312..812].iter().any(|&b| b != 0xBB) {
+    if buf[312..824].iter().any(|&b| b != 0xBB) {
         return TestResult::Fail("3-LBA read: LBA 1 bytes wrong");
     }
-    if buf[812..1500].iter().any(|&b| b != 0xCC) {
+    if buf[824..1300].iter().any(|&b| b != 0xCC) {
         return TestResult::Fail("3-LBA read: LBA 2 bytes wrong");
     }
     TestResult::Pass
@@ -397,13 +403,17 @@ fn smoke_e2e_block_geometry_1mib() -> TestResult {
 }
 kernel_test_in!("block/e2e", smoke_e2e_block_geometry_1mib);
 
-// ── Smoke 9: large write clamped to device capacity ───────────────────
+// ── Smoke 9: over-capacity write clamped to device capacity ──────────
 //
 // BlockFile::write_sync clamps len = src.len().min(avail) where
 // avail = capacity - offset. There is no artificial max-write-size cap
-// at the BlockFile level. This smoke documents that a 17 MiB write
-// at offset 0 on a 1 MiB device is clamped to 1 MiB, not rejected
-// with a synthetic EINVAL.
+// at the BlockFile level. This smoke documents that a write whose
+// requested size exceeds the remaining device capacity is silently
+// clamped to the available bytes, not rejected with a synthetic EINVAL.
+//
+// We use a 512 KiB write on a 256 KiB tail (offset = 768 KiB on a
+// 1 MiB device) so the clamped length is exactly 256 KiB. The payload
+// fits in the test-VM heap; 17 MiB did not.
 //
 // If a write-size cap is added to BlockFile later, update this smoke
 // to assert Err(FsError::InvalidData) above the cap boundary.
@@ -412,23 +422,28 @@ fn smoke_e2e_large_write_clamped_not_einval() -> TestResult {
     let dev = FakeBlockDevice::new_1mib();
     let bf = BlockFileShim::from_fake(dev.clone());
 
-    let big_payload = vec![0x55u8; 17 * 1024 * 1024]; // 17 MiB
-    match bf.write(0, &big_payload) {
+    // 256 KiB remain at offset 768 KiB; request 512 KiB → clamped to 256 KiB.
+    const OFFSET: u64 = 768 * 1024;
+    const REQUEST: usize = 512 * 1024;
+    const CLAMPED: usize = 256 * 1024; // 1 MiB - 768 KiB
+
+    let payload = vec![0x55u8; REQUEST];
+    match bf.write(OFFSET, &payload) {
         Ok(n) => {
-            if n != 1024 * 1024 {
+            if n != CLAMPED {
                 return TestResult::Fail(
-                    "over-capacity write must be clamped to device size",
+                    "over-capacity write must be clamped to remaining device bytes",
                 );
             }
         }
         Err(BlockIoError::OutOfRange) => {
-            // Also acceptable: driver rejects OOB range.
+            // Also acceptable: driver rejects the OOB portion.
         }
         Err(_) => {
-            return TestResult::Fail("large write returned unexpected error");
+            return TestResult::Fail("over-capacity write returned unexpected error");
         }
     }
-    // Documented: no 16+ MiB cap is enforced by BlockFile today.
+    // Documented: no artificial write-size cap is enforced by BlockFile today.
     TestResult::Pass
 }
 kernel_test_in!("block/e2e", smoke_e2e_large_write_clamped_not_einval);
