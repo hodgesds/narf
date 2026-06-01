@@ -58,6 +58,9 @@ mod tests;
 #[doc(hidden)]
 mod tests_smoke;
 
+#[doc(hidden)]
+mod tests_e2e;
+
 pub use lifecycle::ModuleState;
 pub use loader::{load_image, Module};
 
