@@ -89,6 +89,7 @@ pub mod ws;
 pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
 
 mod tests;
+mod e2e_tests;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
