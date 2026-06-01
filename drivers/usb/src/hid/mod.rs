@@ -83,6 +83,9 @@ pub mod touchpad;
 pub mod wacom;
 pub mod wacom_features;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod e2e_tests;
+
 /// Modifier mask bits in byte 0 of the boot keyboard report.
 pub mod kbd_mod {
     pub const LCTRL: u8 = 1 << 0;
