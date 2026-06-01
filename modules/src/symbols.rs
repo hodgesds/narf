@@ -3,6 +3,10 @@
 //! Mirrors Linux's `__ksymtab` / `EXPORT_SYMBOL` mechanism:
 //!   * `linux/include/linux/export.h::EXPORT_SYMBOL` (`export.h:42`)
 //!   * `linux/kernel/module/main.c::find_symbol` (`main.c:432`)
+//!   * `linux/kernel/module/kallsyms.c::module_kallsyms_lookup_name` — the
+//!     per-module symbol-table pattern NARF mirrors with `ModuleId` ownership.
+//!   * `linux/kernel/module/main.c::free_module` — the sweep point at which
+//!     NARF calls `unregister_exports_of`.
 //!
 //! Key differences in NARF:
 //!   * Each export carries a `crc` — a 32-bit version hash of the
@@ -13,18 +17,82 @@
 //!     a matching `RequiredCap` in its manifest before the relocator
 //!     resolves the reference. This makes cap requirements visible
 //!     at link time, not just at first call. Linux has no equivalent.
+//!   * Each export carries an `owner: ModuleId`. In-tree exports use
+//!     `KERNEL_MODULE_ID`; LKM exports are attributed to the loading
+//!     module via `current_init_id()`. `unregister_exports_of(id)`
+//!     sweeps the table on unload, preventing use-after-free on
+//!     subsequent `resolve` calls (see DESIGN.md §6).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_capabilities::CapKind;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::manifest::Manifest;
 
+// ── ModuleId ─────────────────────────────────────────────────────────
+
+/// Opaque identity for a loaded module (or the kernel itself).
+///
+/// Assigned at load time from a monotonically-increasing counter;
+/// never reused within a boot session so stale pointers to a
+/// deallocated module can't be confused with a subsequently loaded one.
+///
+/// Linux ref: the per-module `struct module *` is the Linux
+/// equivalent; NARF uses a numeric ID to avoid lifetime entanglement.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModuleId(pub u64);
+
+/// The kernel itself — owns all exports registered via the bare
+/// `register_export` / `export` / `narf_export!` helpers that are
+/// called outside of a module init context.  These are built-in,
+/// permanent exports that survive for the lifetime of the running
+/// kernel and are never swept by `unregister_exports_of`.
+pub const KERNEL_MODULE_ID: ModuleId = ModuleId(0);
+
+/// Per-module ID allocator. Starts at 1; 0 is reserved for the kernel.
+static MODULE_ID_ALLOC: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh `ModuleId`. Called once per `load_image`.
+pub fn alloc_module_id() -> ModuleId {
+    ModuleId(MODULE_ID_ALLOC.fetch_add(1, Ordering::Relaxed))
+}
+
+// ── CURRENT_INIT_MODULE_ID ────────────────────────────────────────────
+//
+// Set to the loading module's ID during `invoke_init` so that bare
+// `register_export` / `export` / `export_with_cap` calls from inside a
+// module's init function are automatically attributed to the right owner.
+// After init returns the sentinel KERNEL_MODULE_ID is restored so any
+// stray post-init calls from kernel code still land under the kernel owner.
+//
+// This is NARF's equivalent of Linux's use of `current->mm` /
+// `module->init_layout` to know which module is mid-init.  We use a
+// simple atomic rather than per-CPU or TLS because NARF's LKM init path
+// is single-threaded at Wave-27 scope.
+
+static CURRENT_INIT_MODULE_ID: AtomicU64 = AtomicU64::new(KERNEL_MODULE_ID.0);
+
+/// Set the module-init attribution context. Called by `loader::invoke_init`
+/// immediately before the module's init function runs.
+pub fn set_init_context(id: ModuleId) {
+    CURRENT_INIT_MODULE_ID.store(id.0, Ordering::Release);
+}
+
+/// Retrieve the ID of the module whose init is currently running,
+/// or `KERNEL_MODULE_ID` if no init is in progress.
+pub fn current_init_id() -> ModuleId {
+    ModuleId(CURRENT_INIT_MODULE_ID.load(Ordering::Acquire))
+}
+
+// ── KernelExport ─────────────────────────────────────────────────────
+
 /// One symbol the kernel exports to modules.
 ///
 /// Linux equivalent: `struct kernel_symbol` in `include/linux/export.h`.
+/// NARF extends it with an `owner` field for per-module symbol ownership
+/// tracking (Design A — owner-id on each entry; see DESIGN.md §6).
 #[derive(Copy, Clone, Debug)]
 pub struct KernelExport {
     /// Linker-visible name (e.g. `"narf_io_alloc_coherent"`).
@@ -40,6 +108,10 @@ pub struct KernelExport {
     /// Cap holders only: a module must declare a matching RequiredCap
     /// in its manifest before the relocator will resolve a reference.
     pub required_cap: Option<CapKind>,
+    /// Which module (or the kernel) owns this export.
+    /// `KERNEL_MODULE_ID` for in-tree exports that never unload.
+    /// A module's assigned `ModuleId` for LKM exports.
+    pub owner: ModuleId,
 }
 
 /// Resolution result.
@@ -82,10 +154,15 @@ pub fn kernel_abi() -> u32 {
     KERNEL_ABI.load(Ordering::Acquire)
 }
 
-/// Register a single kernel export. Idempotent on `name`: a second
-/// call with the same name replaces the prior entry, preserving the
-/// O(n) lookup invariant.
-pub fn register_export(export: KernelExport) {
+/// Register a single kernel export owned by `owner`.
+///
+/// Idempotent on `name`: a second call with the same name replaces the
+/// prior entry (ownership transfers to the new `owner`).
+///
+/// Linux ref: `kernel/module/main.c::add_kallsyms` + the per-symbol
+/// `owner` field NARF adds to track which module registered each export.
+pub fn register_export_owned_by(owner: ModuleId, export: KernelExport) {
+    let export = KernelExport { owner, ..export };
     let mut g = KSYMTAB.lock();
     if let Some(slot) = g.iter_mut().find(|e| e.name == export.name) {
         *slot = export;
@@ -94,10 +171,25 @@ pub fn register_export(export: KernelExport) {
     }
 }
 
-/// Bulk-register a slice (compile-time table).
+/// Register a single kernel export. The owner is resolved automatically:
+/// when called from inside a module's `narf_module_init` (during
+/// `invoke_init`) the export is attributed to the loading module via
+/// `current_init_id()`; calls from kernel boot code (outside any init
+/// context) attribute to `KERNEL_MODULE_ID`.
+///
+/// This is a hard-cutover drop-in for callers that do not need to
+/// specify ownership explicitly. Callers that need explicit control
+/// should use `register_export_owned_by`.
+pub fn register_export(export: KernelExport) {
+    register_export_owned_by(current_init_id(), export);
+}
+
+/// Bulk-register a slice (compile-time table). All entries are owned
+/// by the kernel (`KERNEL_MODULE_ID`) unconditionally — these are
+/// in-tree, permanent exports.
 pub fn register_exports(exports: &[KernelExport]) {
     for e in exports {
-        register_export(*e);
+        register_export_owned_by(KERNEL_MODULE_ID, *e);
     }
 }
 
@@ -135,19 +227,43 @@ pub fn resolve(
     })
 }
 
+/// Remove all KSYMTAB entries whose `owner` matches `module_id`.
+///
+/// Called from `sys_delete_module` after `narf_module_exit` returns
+/// but before the module's memory is released.  This prevents a
+/// subsequent `resolve` from returning a dangling pointer into freed
+/// module memory (the use-after-free described in DESIGN.md §6).
+///
+/// Returns the number of entries removed.
+///
+/// Linux ref: `kernel/module/main.c::free_module` — Linux tears down
+/// the per-module kallsyms table at the same point in the unload path.
+pub fn unregister_exports_of(module_id: ModuleId) -> usize {
+    let mut g = KSYMTAB.lock();
+    let before = g.len();
+    g.retain(|e| e.owner != module_id);
+    before - g.len()
+}
+
 /// Number of registered exports — for `/sys/kernel/symbols_count`
 /// and tests.
 pub fn export_count() -> usize {
     KSYMTAB.lock().len()
 }
 
-/// Test helper: clear all exports.
+/// Test helper: clear all exports and reset the init-context sentinel.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     KSYMTAB.lock().clear();
+    CURRENT_INIT_MODULE_ID.store(KERNEL_MODULE_ID.0, Ordering::Release);
 }
 
 /// Convenience: build + register an export by parts.
+///
+/// When called from inside a module's `narf_module_init` (during
+/// `invoke_init`), the export is automatically attributed to the
+/// loading module via `current_init_id()`. Calls from kernel boot
+/// code (outside any init context) attribute to `KERNEL_MODULE_ID`.
 ///
 /// Use the macro form `narf_export!(name, addr, crc)` in subsystems
 /// instead of calling this directly.
@@ -157,10 +273,11 @@ pub fn export(name: &'static str, addr: usize, crc: u32) {
         addr,
         crc,
         required_cap: None,
+        owner: KERNEL_MODULE_ID, // overridden by register_export → current_init_id()
     });
 }
 
-/// Cap-gated export.
+/// Cap-gated export. Owner attribution follows the same rule as `export`.
 pub fn export_with_cap(
     name: &'static str,
     addr: usize,
@@ -172,6 +289,7 @@ pub fn export_with_cap(
         addr,
         crc,
         required_cap: Some(required_cap),
+        owner: KERNEL_MODULE_ID, // overridden by register_export → current_init_id()
     });
 }
 

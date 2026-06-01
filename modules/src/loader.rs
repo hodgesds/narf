@@ -22,7 +22,7 @@ use crate::params::{self, ParamSlot};
 use crate::refcount::RefCount;
 use crate::relocator::{apply_all_relas, RelocatorError, SectionPlacement};
 use crate::sign;
-use crate::symbols::kernel_abi;
+use crate::symbols::{kernel_abi, ModuleId};
 
 /// Errors raised at any step of the load pipeline. Each variant
 /// carries enough context to surface a meaningful diagnostic to
@@ -82,6 +82,11 @@ impl From<crate::domain::DomainError> for LoadError {
 /// can observe state + refcount.
 #[derive(Debug)]
 pub struct Module {
+    /// Unique per-session identifier used for KSYMTAB ownership tracking
+    /// (DESIGN.md §6).  Assigned by `symbols::alloc_module_id()` during
+    /// `load_image` and is stable for the module's lifetime.  Never
+    /// reused within a boot session.
+    pub id: ModuleId,
     pub manifest: Manifest,
     pub domain: DomainId,
     /// The full image we were loaded from. Kept so /sys can serve
@@ -223,6 +228,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
     };
 
     Ok(Arc::new(Module {
+        id: crate::symbols::alloc_module_id(),
         manifest,
         domain: domain_id,
         image_size: image.len(),
@@ -332,13 +338,26 @@ fn resolve_local_address(
 
 /// Call the module's init function, transitioning to Live on success.
 ///
+/// Sets `symbols::CURRENT_INIT_MODULE_ID` to `module.id` for the
+/// duration of the call so that any `register_export` / `export` /
+/// `export_with_cap` calls from inside the module's init are
+/// automatically attributed to the right owner (DESIGN.md §6).
+/// The context is always restored to `KERNEL_MODULE_ID` on return,
+/// even on error.
+///
 /// # Safety
 /// The caller must have just relocated the module via `load_image`
 /// AND must be calling this on a freshly-loaded module in state
 /// `Loading`.
 pub unsafe fn invoke_init(module: &Module) -> Result<(), crate::lifecycle::LifecycleError> {
+    // Arm the init-attribution context so exports registered during
+    // init are tagged with this module's id.
+    crate::symbols::set_init_context(module.id);
     let init: ModuleInitFn = unsafe { core::mem::transmute(module.init_addr) };
     let rc = unsafe { init() };
+    // Restore unconditionally — even on failure the next init call
+    // must start clean.
+    crate::symbols::set_init_context(crate::symbols::KERNEL_MODULE_ID);
     if rc != 0 {
         return Err(crate::lifecycle::LifecycleError::InitFailed(rc));
     }

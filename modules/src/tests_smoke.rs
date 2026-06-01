@@ -764,6 +764,7 @@ fn arc_test_module(name: &str, abi: u32) -> Arc<crate::loader::Module> {
     );
     let mf = Manifest::parse(raw.as_bytes(), abi).expect("manifest");
     Arc::new(crate::loader::Module {
+        id: crate::symbols::alloc_module_id(),
         manifest: mf,
         domain: narf_lib::id::DomainId::SCRATCH,
         image_size: 0,
@@ -786,6 +787,7 @@ fn arc_test_module_with_params(
     // We can't mutate the Arc<Module>'s `params` Vec directly because
     // it's behind Arc; rebuild a fresh Arc with the same fields.
     let new = crate::loader::Module {
+        id: crate::symbols::alloc_module_id(),
         manifest: m.manifest.clone(),
         domain: m.domain,
         image_size: m.image_size,
