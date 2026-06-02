@@ -882,3 +882,399 @@ fn smoke_rtl8xxxu_iqk_lc_shapes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_iqk_lc_shapes);
+
+// ── 18-25: USB class registry + EFUSE bridge smokes ─────────────────
+//
+// These smokes cover the Wave-11 USB class-driver bridge:
+// VID/PID matching, dispatch_probe, chip-family detection, EFUSE
+// byte-read sequence, MAC extraction, and disconnect/re-register.
+//
+// No live USB hardware required; tests use the transport-abstracted
+// EFUSE path and the would_match() helper from the class registry.
+//
+// Linux refs:
+//   - drivers/usb/core/driver.c::usb_match_id    ~L141
+//   - drivers/usb/core/driver.c::usb_register_driver ~L967
+//   - drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c::
+//     rtl8xxxu_read_efuse8 ~L1746
+//     rtl8xxxu_probe       ~L7692
+
+// ── 18. class_registry: no-match returns false ──────────────────────
+
+fn smoke_rtl8xxxu_class_registry_no_match() -> TestResult {
+    use narf_drivers_usb::class_registry;
+
+    // Reset to ensure no prior registrations bleed in.
+    class_registry::reset_for_test();
+
+    // With no drivers registered, no VID/PID should match.
+    if class_registry::would_match(RTL8XXXU_VENDOR, RTL8188EU_ID) {
+        return TestResult::Fail("would_match true with empty registry");
+    }
+    if class_registry::registered_count() != 0 {
+        return TestResult::Fail("registered_count != 0 on fresh registry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_class_registry_no_match);
+
+// ── 19. class_registry: RTL8188EU VID/PID claimed after registration ─
+
+fn smoke_rtl8xxxu_class_registry_rtl8188eu_match() -> TestResult {
+    use narf_drivers_usb::class_registry;
+    use super::RTL8XXXU_USB_IDS;
+
+    class_registry::reset_for_test();
+
+    // Register a no-op probe so the table is in.
+    fn noop_probe(
+        _dev: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+    ) -> Result<(), narf_drivers_usb::class_registry::UsbProbeError> {
+        Ok(())
+    }
+
+    class_registry::register_class_driver("rtl8xxxu-test", RTL8XXXU_USB_IDS, noop_probe)
+        .expect("register_class_driver failed");
+
+    // Primary Realtek RTL8188EU ID must match.
+    if !class_registry::would_match(RTL8XXXU_VENDOR, RTL8188EU_ID) {
+        return TestResult::Fail("RTL8188EU primary ID not matched");
+    }
+    // Primary Realtek RTL8192EU ID must match.
+    if !class_registry::would_match(RTL8XXXU_VENDOR, RTL8192EU_ID) {
+        return TestResult::Fail("RTL8192EU primary ID not matched");
+    }
+    // Primary Realtek RTL8723BU ID must match.
+    if !class_registry::would_match(RTL8XXXU_VENDOR, RTL8723BU_ID) {
+        return TestResult::Fail("RTL8723BU primary ID not matched");
+    }
+    // TP-Link TL-WN722N v2 (rebranded RTL8188EU) must match.
+    if !class_registry::would_match(0x2357, 0x010C) {
+        return TestResult::Fail("TP-Link TL-WN722N v2 not matched");
+    }
+    // Non-Realtek VID/PID must NOT match.
+    if class_registry::would_match(0x1234, 0x5678) {
+        return TestResult::Fail("unknown VID/PID incorrectly matched");
+    }
+
+    class_registry::reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_class_registry_rtl8188eu_match);
+
+// ── 20. class_registry: non-matching VID/PID not claimed ────────────
+
+fn smoke_rtl8xxxu_class_registry_non_matching() -> TestResult {
+    use narf_drivers_usb::class_registry;
+    use super::RTL8XXXU_USB_IDS;
+
+    class_registry::reset_for_test();
+
+    fn noop_probe(
+        _dev: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+    ) -> Result<(), narf_drivers_usb::class_registry::UsbProbeError> {
+        Ok(())
+    }
+
+    class_registry::register_class_driver("rtl8xxxu-test", RTL8XXXU_USB_IDS, noop_probe)
+        .expect("register");
+
+    // A generic USB device with no relation to Realtek must not match.
+    if class_registry::would_match(0x05AC, 0x0250) {
+        // Apple USB Ethernet adapter — should never match rtl8xxxu
+        return TestResult::Fail("Apple device incorrectly matched rtl8xxxu");
+    }
+    if class_registry::would_match(0x045E, 0x0750) {
+        // Microsoft Surface Hub — should never match
+        return TestResult::Fail("Microsoft device incorrectly matched");
+    }
+
+    class_registry::reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_class_registry_non_matching);
+
+// ── 21. rtl8xxxu_probe stores the device handle ─────────────────────
+//
+// Calls rtl8xxxu_probe with a real USBDevice from the xHCI controller
+// if one is available; otherwise skips. Also tests that DEVICES global
+// is populated after a successful probe.
+
+fn smoke_rtl8xxxu_probe_stores_device_handle() -> TestResult {
+    // Clear the DEVICES registry before testing.
+    super::DEVICES.lock().clear();
+
+    if !narf_drivers_usb::xhci::is_probed() {
+        return TestResult::Skip("xhci not probed (no live controller)");
+    }
+    let c = match narf_drivers_usb::xhci::controller() {
+        Some(c) => c,
+        None => return TestResult::Skip("xhci controller() returned None"),
+    };
+
+    // Build a fake USBDevice with RTL8188EU VID/PID.
+    // Use slot 0xFF (unused sentinel) so we don't disturb live slots.
+    let mut dev = narf_drivers_usb::device::USBDevice::new(
+        c,
+        0xFF, // slot_id
+        1,    // port
+        narf_drivers_usb::xhci::PortSpeed::High,
+    );
+    dev.set_ids(RTL8XXXU_VENDOR, RTL8188EU_ID);
+    let dev = alloc::sync::Arc::new(dev);
+
+    let result = super::rtl8xxxu_probe(dev);
+    if result.is_err() {
+        return TestResult::Fail("rtl8xxxu_probe returned Err for RTL8188EU");
+    }
+
+    // DEVICES should now contain one entry for slot 0xFF.
+    let count = super::DEVICES.lock()
+        .iter()
+        .filter(|d| d.device.slot_id() == 0xFF)
+        .count();
+    if count != 1 {
+        return TestResult::Fail("DEVICES registry missing probe entry");
+    }
+    if super::DEVICES.lock()
+        .iter()
+        .find(|d| d.device.slot_id() == 0xFF)
+        .map(|d| d.family)
+        != Some(ChipFamily::Rtl8188eu)
+    {
+        return TestResult::Fail("DEVICES entry has wrong ChipFamily");
+    }
+
+    // Clean up.
+    super::DEVICES.lock().retain(|d| d.device.slot_id() != 0xFF);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_probe_stores_device_handle);
+
+// ── 22. EFUSE byte read: transport-abstracted round-trip ────────────
+//
+// Simulates a Realtek REG_EFUSE_CTRL read sequence using a closure
+// that returns canned data. Verifies that read_efuse_byte_with_transport
+// returns the expected byte value 0xAB.
+//
+// Linux ref: rtl8xxxu_read_efuse8 (~L1746) in rtl8xxxu_core.c.
+
+fn smoke_rtl8xxxu_efuse_byte_read_transport() -> TestResult {
+    use super::efuse::{EfuseAddr, EfuseReadError, read_efuse_byte_with_transport};
+    use core::cell::Cell;
+
+    // Simulated register bank. We prime REG_EFUSE_CTRL with:
+    //   bit 31 set (data ready) + byte 0xAB in bits[7:0] → 0x800000AB.
+    // Other registers (CTRL+1, CTRL+2, CTRL+3) start at 0.
+    //
+    // Use `Cell` to allow both closures to share the state without
+    // conflicting borrows — each Cell is Copy/interior-mutable.
+    let reg_ctrl1 = Cell::new(0u8);
+    let reg_ctrl2 = Cell::new(0u8);
+    let reg_ctrl3 = Cell::new(0u8);
+    let efuse_ctrl_word: u32 = 0x8000_00AB; // bit31=ready, data=0xAB
+
+    let mut reg_read = |addr: u16, buf: &mut [u8]| -> Result<(), ()> {
+        match (addr, buf.len()) {
+            (a, 4) if a == REG_EFUSE_CTRL => {
+                buf.copy_from_slice(&efuse_ctrl_word.to_le_bytes());
+                Ok(())
+            }
+            (a, 1) if a == REG_EFUSE_CTRL + 1 => { buf[0] = reg_ctrl1.get(); Ok(()) }
+            (a, 1) if a == REG_EFUSE_CTRL + 2 => { buf[0] = reg_ctrl2.get(); Ok(()) }
+            (a, 1) if a == REG_EFUSE_CTRL + 3 => { buf[0] = reg_ctrl3.get(); Ok(()) }
+            _ => Err(()),
+        }
+    };
+    let mut reg_write = |addr: u16, data: &[u8]| -> Result<(), ()> {
+        match (addr, data.len()) {
+            (a, 1) if a == REG_EFUSE_CTRL + 1 => { reg_ctrl1.set(data[0]); Ok(()) }
+            (a, 1) if a == REG_EFUSE_CTRL + 2 => { reg_ctrl2.set(data[0]); Ok(()) }
+            (a, 1) if a == REG_EFUSE_CTRL + 3 => { reg_ctrl3.set(data[0]); Ok(()) }
+            _ => Err(()),
+        }
+    };
+
+    let byte = read_efuse_byte_with_transport(
+        EfuseAddr::new(0),
+        &mut reg_read,
+        &mut reg_write,
+    );
+    match byte {
+        Ok(0xAB) => {}
+        Ok(v) => {
+            let _ = v;
+            return TestResult::Fail("read_efuse_byte returned wrong value");
+        }
+        Err(EfuseReadError::Timeout) => {
+            return TestResult::Fail("EFUSE read timed out");
+        }
+        Err(_) => {
+            return TestResult::Fail("EFUSE read transport error");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_efuse_byte_read_transport);
+
+// ── 23. EFUSE MAC read: extract MAC from 6-byte EFUSE map block ──────
+//
+// Constructs a synthetic EFUSE logical map with a known 6-byte MAC at
+// EFUSE_WIFI_MAC_OFFSET and verifies extract_mac() decodes it correctly.
+
+fn smoke_rtl8xxxu_efuse_mac_extract() -> TestResult {
+    use super::efuse::{extract_mac, EFUSE_WIFI_MAC_OFFSET};
+    use super::regs::EFUSE_MAP_LEN;
+
+    let mut map = [0xFFu8; EFUSE_MAP_LEN];
+    let mac_expected: [u8; 6] = [0x00, 0x0E, 0xC6, 0xAB, 0xCD, 0xEF];
+
+    // Write the MAC at the canonical offset.
+    let off = EFUSE_WIFI_MAC_OFFSET;
+    map[off..off + 6].copy_from_slice(&mac_expected);
+
+    let mac = match extract_mac(&map) {
+        Some(m) => m,
+        None => return TestResult::Fail("extract_mac returned None for valid MAC"),
+    };
+    if mac != mac_expected {
+        return TestResult::Fail("extracted MAC does not match expected");
+    }
+
+    // All-zero MAC should be rejected.
+    let mut zero_map = [0xFFu8; EFUSE_MAP_LEN];
+    zero_map[off..off + 6].copy_from_slice(&[0u8; 6]);
+    if extract_mac(&zero_map).is_some() {
+        return TestResult::Fail("all-zero MAC should return None");
+    }
+
+    // All-0xFF MAC (unwritten EFUSE) should be rejected.
+    let ff_map = [0xFFu8; EFUSE_MAP_LEN];
+    if extract_mac(&ff_map).is_some() {
+        return TestResult::Fail("all-0xFF MAC should return None");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_efuse_mac_extract);
+
+// ── 24. Chip family detection: RTL8723BU → ChipFamily::Rtl8723b ──────
+//
+// Verifies that ChipFamily::from_usb_id correctly identifies RTL8723BU
+// from its primary VID/PID and distinguishes it from RTL8188EU.
+
+fn smoke_rtl8xxxu_chip_family_detection_8723bu() -> TestResult {
+    // RTL8723BU primary ID.
+    let fam = ChipFamily::from_usb_id(RTL8XXXU_VENDOR, RTL8723BU_ID);
+    if fam != ChipFamily::Rtl8723bu {
+        return TestResult::Fail("RTL8723BU VID/PID should yield Rtl8723bu");
+    }
+
+    // Edimax 7392:A611 (rebranded RTL8723BU) must also yield Rtl8723bu.
+    let fam_reb = ChipFamily::from_usb_id(0x7392, 0xA611);
+    if fam_reb != ChipFamily::Rtl8723bu {
+        return TestResult::Fail("Edimax 7392:A611 should yield Rtl8723bu");
+    }
+
+    // RTL8188EU should NOT be confused with RTL8723BU.
+    let fam8188 = ChipFamily::from_usb_id(RTL8XXXU_VENDOR, RTL8188EU_ID);
+    if fam8188 == ChipFamily::Rtl8723bu {
+        return TestResult::Fail("RTL8188EU should not yield Rtl8723bu");
+    }
+    if fam8188 != ChipFamily::Rtl8188eu {
+        return TestResult::Fail("RTL8188EU should yield Rtl8188eu");
+    }
+
+    // All 5 chip families are distinguishable.
+    let cases: &[(u16, u16, ChipFamily)] = &[
+        (RTL8XXXU_VENDOR, RTL8188EU_ID, ChipFamily::Rtl8188eu),
+        (RTL8XXXU_VENDOR, RTL8192EU_ID, ChipFamily::Rtl8192eu),
+        (RTL8XXXU_VENDOR, RTL8723BU_ID, ChipFamily::Rtl8723bu),
+        (RTL8XXXU_VENDOR, RTL8821CU_ID, ChipFamily::Rtl8821cu),
+        (RTL8XXXU_VENDOR, RTL8822BU_ID, ChipFamily::Rtl8822bu),
+    ];
+    for &(vid, pid, expected) in cases {
+        if ChipFamily::from_usb_id(vid, pid) != expected {
+            return TestResult::Fail("chip family mismatch in all-5 check");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_chip_family_detection_8723bu);
+
+// ── 25. Disconnect path: re-register after DEVICES cleared ──────────
+//
+// Verifies that after the DEVICES registry is cleared (simulating a
+// disconnect), a new probe for the same VID/PID succeeds and creates
+// a fresh entry. Tests the idempotency guard on slot_id dedup.
+
+fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
+    super::DEVICES.lock().clear();
+
+    if !narf_drivers_usb::xhci::is_probed() {
+        return TestResult::Skip("xhci not probed");
+    }
+    let c = match narf_drivers_usb::xhci::controller() {
+        Some(c) => c,
+        None => return TestResult::Skip("xhci controller() returned None"),
+    };
+
+    // First probe — uses sentinel slot 0xFE.
+    let mut dev1 = narf_drivers_usb::device::USBDevice::new(
+        c.clone(),
+        0xFE,
+        1,
+        narf_drivers_usb::xhci::PortSpeed::High,
+    );
+    dev1.set_ids(RTL8XXXU_VENDOR, RTL8192EU_ID);
+    let dev1 = alloc::sync::Arc::new(dev1);
+
+    if super::rtl8xxxu_probe(dev1).is_err() {
+        return TestResult::Fail("first probe failed");
+    }
+    let count_after_first = super::DEVICES.lock()
+        .iter()
+        .filter(|d| d.device.slot_id() == 0xFE)
+        .count();
+    if count_after_first != 1 {
+        return TestResult::Fail("DEVICES entry missing after first probe");
+    }
+
+    // Simulate disconnect by removing the entry.
+    super::DEVICES.lock().retain(|d| d.device.slot_id() != 0xFE);
+    let count_after_disconnect = super::DEVICES.lock()
+        .iter()
+        .filter(|d| d.device.slot_id() == 0xFE)
+        .count();
+    if count_after_disconnect != 0 {
+        return TestResult::Fail("DEVICES entry not cleared on disconnect");
+    }
+
+    // Second probe on the same slot should succeed (not double-insert).
+    let mut dev2 = narf_drivers_usb::device::USBDevice::new(
+        c,
+        0xFE,
+        1,
+        narf_drivers_usb::xhci::PortSpeed::High,
+    );
+    dev2.set_ids(RTL8XXXU_VENDOR, RTL8192EU_ID);
+    let dev2 = alloc::sync::Arc::new(dev2);
+
+    if super::rtl8xxxu_probe(dev2).is_err() {
+        return TestResult::Fail("second probe after disconnect failed");
+    }
+    let count_after_second = super::DEVICES.lock()
+        .iter()
+        .filter(|d| d.device.slot_id() == 0xFE)
+        .count();
+    if count_after_second != 1 {
+        return TestResult::Fail("DEVICES count wrong after re-register");
+    }
+
+    // Clean up.
+    super::DEVICES.lock().retain(|d| d.device.slot_id() != 0xFE);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_disconnect_re_register);

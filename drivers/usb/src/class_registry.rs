@@ -200,9 +200,23 @@ pub fn registered_count() -> usize {
     REGISTRY.lock().len()
 }
 
-/// Reset the registry — used only in tests to avoid cross-test
-/// state pollution. Not compiled into production builds.
-#[cfg(any(test, feature = "kernel-test"))]
+/// Walk registered drivers and return whether any driver's match table
+/// contains `(vendor_id, product_id)`. Does NOT call `probe` — used
+/// only to test the VID/PID matching logic without needing a live
+/// `Arc<USBDevice>`.
+pub fn would_match(vendor_id: u16, product_id: u16) -> bool {
+    let g = REGISTRY.lock();
+    for entry in g.iter() {
+        if entry.matches.iter().any(|m| m.vendor_id == vendor_id && m.product_id == product_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reset the registry — used by smoke tests to avoid cross-test
+/// state pollution. Always compiled; callers should only invoke
+/// this from test code.
 pub fn reset_for_test() {
     REGISTRY.lock().clear();
 }
