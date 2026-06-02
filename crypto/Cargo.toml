@@ -29,6 +29,10 @@ ed25519-dalek      = { version = "2",    default-features = false, features = ["
 # that, the dep compiles clean on both arches.
 chacha20poly1305   = { version = "0.10", default-features = false, features = ["alloc"] }
 aes                = { version = "0.8",  default-features = false }
+# aes-gcm: AES-128/256-GCM AEAD for e2e smoke tests and Stage-4 AEAD surface.
+# `aes_force_soft` rustflag (see .cargo/config.toml) pins the software AES path
+# so AES-NI isn't probed under code-model=kernel.
+aes-gcm            = { version = "0.10", default-features = false, features = ["alloc", "aes"] }
 xts-mode           = { version = "0.5",  default-features = false }
 hkdf               = { version = "0.12", default-features = false }
 sha2               = { version = "0.10", default-features = false }

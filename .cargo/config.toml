@@ -45,6 +45,9 @@ rustflags = [
     "--cfg", "poly1305_force_soft",
     # aes: same as curve25519/poly1305.
     "--cfg", "aes_force_soft",
+    # polyval (ghash backend for aes-gcm): same family of SIMD issues as
+    # poly1305/aes under code-model=kernel. Pin the soft path.
+    "--cfg", "polyval_force_soft",
 ]
 
 # ─── aarch64 kernel target ─────────────────────────────────────────
