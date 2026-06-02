@@ -105,6 +105,10 @@ pub enum AttachOutcome {
     /// subclass 0x00 / protocol 0x00). Slot stays alive; entry in
     /// `ccid::CCID_READERS`. PC/SC daemon attaches via /dev/ccid0.
     CcidReader,
+    /// Device claimed by a driver registered in the USB class-driver
+    /// registry (e.g. rtl8xxxu USB-WiFi). Slot stays alive; the
+    /// registered driver owns the device.
+    UsbClassDriver,
     /// We addressed the device but couldn't bind a class driver
     /// (unknown class, or a class driver we don't have). The slot
     /// has been disabled to free it for re-use.
@@ -618,6 +622,25 @@ async fn dispatch_after_address(
             xhci_dev, slot_id, &cfg_blob,
         ).await.is_ok() {
             return AttachOutcome::WbdiFingerprint;
+        }
+    }
+
+    // USB class-driver registry — VID/PID match for drivers that
+    // registered at Stage::Subsys (e.g. rtl8xxxu USB-WiFi dongles).
+    // Runs after every built-in class probe so a RTL8188EU dongle
+    // that looks like a CDC-ACM or vendor-class device doesn't get
+    // misclassified. Linux analogue: `usb_probe_device` walking the
+    // bus's driver list in `drivers/usb/core/driver.c` (~L310).
+    if let Some(c) = xhci::controller() {
+        use alloc::sync::Arc;
+        // Wrap the slot in a USBDevice with the VID/PID we already
+        // fetched so dispatch_probe can read vendor/product IDs
+        // without a second GET_DESCRIPTOR round-trip.
+        let mut dev = crate::device::USBDevice::new(c, slot_id, port, speed);
+        dev.set_ids(dev_vid, dev_pid);
+        let dev = Arc::new(dev);
+        if crate::class_registry::dispatch_probe(dev) {
+            return AttachOutcome::UsbClassDriver;
         }
     }
 

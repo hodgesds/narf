@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod attach;
 pub mod btusb;
 pub mod bulk;
+pub mod class_registry;
 pub mod ccid;
 pub mod cdc;
 pub mod control;
@@ -397,6 +398,7 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::WbdiFingerprint
                     | AttachOutcome::Fingerprint
                     | AttachOutcome::CcidReader
+                    | AttachOutcome::UsbClassDriver
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
                         root_fail_count[pi] = 0;
@@ -484,6 +486,7 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::WbdiFingerprint
                         | AttachOutcome::Fingerprint
                         | AttachOutcome::CcidReader
+                        | AttachOutcome::UsbClassDriver
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
                         }

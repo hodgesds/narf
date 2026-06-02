@@ -150,6 +150,14 @@ impl USBDevice {
         })
     }
 
+    /// Override the cached `vendor_id` / `product_id`. Used by the
+    /// attach dispatcher to inject the IDs already fetched via
+    /// GET_DESCRIPTOR(DEVICE) without issuing a second control transfer.
+    pub fn set_ids(&mut self, vendor_id: u16, product_id: u16) {
+        self.vendor_id = vendor_id;
+        self.product_id = product_id;
+    }
+
     /// Slot id allocated by `Enable Slot`.
     pub fn slot_id(&self) -> u8 {
         self.slot_id
