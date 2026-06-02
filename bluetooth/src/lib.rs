@@ -67,6 +67,9 @@ pub mod sysfs_bridge;
 
 mod tests;
 
+#[cfg(feature = "kernel-test")]
+mod e2e_tests;
+
 use narf_capabilities::{Cap, CapKind, CapType, Grant};
 
 /// Cap-type marker for the Bluetooth control surface.
