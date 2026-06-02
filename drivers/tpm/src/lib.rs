@@ -34,6 +34,7 @@ extern crate alloc;
 
 pub mod crb;
 pub mod devfs_bridge;
+#[cfg(feature = "kernel-test")] pub mod e2e_tests;
 pub mod probe;
 pub mod sysfs_bridge;
 pub mod tests;
