@@ -102,7 +102,7 @@ fn map_err(e: DrmIoctlError) -> FsError {
 ///
 /// Returns the syscall return value (0 on success for most ioctls, or
 /// an ioctl-specific positive value) or a translated `FsError`.
-pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<i64, FsError> {
+pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
     let mode_state = crate::drm_registry::mode_state(card_index)
@@ -150,7 +150,7 @@ fn handle_version(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
-) -> Result<i64, FsError> {
+) -> Result<u64, FsError> {
     // Read the user struct.
     let bytes = unsafe {
         copy_in(arg, core::mem::size_of::<DrmVersionUapi>())?
@@ -160,13 +160,14 @@ fn handle_version(
     };
 
     // Run the generic dispatcher to get the filled in version struct.
-    let card = mode_state.lock();
-    let result = dispatch(&mut card.clone(), 0x00, &[], ctx).map_err(map_err)?;
-    let v = match result {
-        DrmIoctlResult::Version(v) => v,
-        _ => return Err(FsError::Unsupported),
+    let v = {
+        let mut card_guard = mode_state.lock();
+        let result = dispatch(&mut *card_guard, 0x00, &[], ctx).map_err(map_err)?;
+        match result {
+            DrmIoctlResult::Version(v) => v,
+            _ => return Err(FsError::Unsupported),
+        }
     };
-    drop(card);
 
     // Write the driver name / date / desc into the user buffers,
     // truncated to whatever capacity the user supplied. Then write
@@ -209,18 +210,20 @@ fn handle_getresources(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
-) -> Result<i64, FsError> {
+) -> Result<u64, FsError> {
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCardResUapi>())? };
     let mut req: DrmModeCardResUapi =
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCardResUapi) };
 
-    let card = mode_state.lock();
+    let mut card_guard = mode_state.lock();
     // Run the existing dispatch path for the count fields.
-    let result = dispatch(&mut card.clone(), 0xA0, &[], ctx).map_err(map_err)?;
+    let result = dispatch(&mut *card_guard, 0xA0, &[], ctx).map_err(map_err)?;
     let res = match result {
         DrmIoctlResult::GetResources(r) => r,
         _ => return Err(FsError::Unsupported),
     };
+    // Re-borrow the locked Card for the ID write helpers below.
+    let card = &*card_guard;
 
     // Helper to write an id array to user memory iff (a) the user
     // supplied a non-null ptr and (b) the user-supplied count is
@@ -254,7 +257,7 @@ fn handle_getresources(
     req.max_width = res.max_width;
     req.min_height = res.min_height;
     req.max_height = res.max_height;
-    drop(card);
+    drop(card_guard);
 
     let out_bytes: [u8; core::mem::size_of::<DrmModeCardResUapi>()] =
         unsafe { core::mem::transmute(req) };
@@ -270,7 +273,7 @@ fn handle_atomic(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     _ctx: &DrmFileCtx,
-) -> Result<i64, FsError> {
+) -> Result<u64, FsError> {
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeAtomicUapi>())? };
     let req: DrmModeAtomicUapi =
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeAtomicUapi) };
@@ -311,7 +314,7 @@ fn handle_generic(
     cmd: u32,
     arg: usize,
     ctx: &DrmFileCtx,
-) -> Result<i64, FsError> {
+) -> Result<u64, FsError> {
     let nr = drm_uapi::ioc_nr(cmd);
     // For ioctls with a known struct size, copy the input through.
     let size = drm_uapi::ioc_size(cmd) as usize;

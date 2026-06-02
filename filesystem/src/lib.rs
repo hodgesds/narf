@@ -365,6 +365,28 @@ pub trait FileOps: Send + Sync {
     fn poll_readiness(&self) -> u32 {
         POLL_IN | POLL_OUT
     }
+
+    /// Linux `ioctl(2)` dispatch for this file. `cmd` is the encoded
+    /// request word (Linux `_IOC(dir, type, nr, size)`); `arg` is the
+    /// raw user-pointer argument the syscall layer received.
+    ///
+    /// The default returns [`FsError::Unsupported`] which the syscall
+    /// layer translates to `-ENOTTY` (25 — Linux's "inappropriate ioctl
+    /// for device" errno) — matching the behaviour of opening a regular
+    /// file and calling ioctl on it. Device-node FileOps (DRM card,
+    /// TPM, watchdog) override to dispatch the device-specific number
+    /// table.
+    ///
+    /// Implementations are responsible for their own user-pointer
+    /// validation through the kernel `copy_from_user` /
+    /// `copy_to_user` helpers; the syscall layer hands `arg` straight
+    /// through without inspecting it.
+    ///
+    /// Linux ref: `fs/ioctl.c::do_vfs_ioctl` +
+    /// `include/linux/fs.h::file_operations.unlocked_ioctl`.
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 // ── POSIX poll(2) event bits ────────────────────────────────────

@@ -72,7 +72,7 @@ impl FileOps for DriCardFile {
     /// DRM_IOCTL_* dispatch for `/dev/dri/card<N>`. Primary-node fd
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
-    fn ioctl(&self, cmd: u32, arg: usize) -> Result<i64, FsError> {
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         crate::drm_ioctl_bridge::dispatch_card(self.index, cmd, arg, /*render*/ false)
     }
 }
@@ -117,7 +117,7 @@ impl FileOps for DriRenderFile {
     /// fd implies `DrmFileCtx::render_client` so the dispatcher rejects
     /// modesetting ioctls with PermissionDenied (→ EACCES at the
     /// syscall layer).
-    fn ioctl(&self, cmd: u32, arg: usize) -> Result<i64, FsError> {
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         crate::drm_ioctl_bridge::dispatch_card(self.index, cmd, arg, /*render*/ true)
     }
 }

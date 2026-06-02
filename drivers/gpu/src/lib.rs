@@ -194,6 +194,9 @@ mod e2e_ring_tests;
 #[cfg(feature = "kernel-test")]
 mod atomic_e2e_tests;
 
+#[cfg(feature = "kernel-test")]
+mod drm_ioctl_smokes;
+
 /// Stage::Subsys initcalls — register every GPU driver with the
 /// bus match table. Stage::Late initcalls hook DP Alt Mode →
 /// GPU bridges into the usbpd registry so a USB-C port that finishes
