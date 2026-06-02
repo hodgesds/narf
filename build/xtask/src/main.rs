@@ -1622,6 +1622,32 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let shell_bytes = std::fs::read(&shell_elf)
         .with_context(|| format!("reading shell ELF at {}", shell_elf.display()))?;
 
+    // Build the 5 coreutils and read their ELFs.
+    // Each crate lives at userspace/coreutils/<name>/ and uses
+    // <name>.ld as its linker script. They land in the CPIO at
+    // "bin/<name>" so the shell's "/bin/<name>" PATH resolution
+    // finds them after root-mount-auto mounts the initramfs at "/".
+    //
+    // Linux reference: BusyBox multi-call layout — each applet
+    // invoked at its own /bin/<name> path. We split them into
+    // separate ELFs rather than a multi-call binary to keep the
+    // no_std build simple.
+    let coreutil_names = ["echo", "pwd", "cat", "ls", "ps"];
+    let mut coreutil_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    for name in coreutil_names {
+        let crate_dir = format!("userspace/coreutils/{}", name);
+        let ld_name   = format!("{}.ld", name);
+        let elf = build_user_binary(&root, &crate_dir, name, &ld_name)?;
+        let bytes = std::fs::read(&elf)
+            .with_context(|| format!("reading {} ELF at {}", name, elf.display()))?;
+        println!(
+            "xtask image: coreutil {} = {} bytes",
+            name,
+            bytes.len()
+        );
+        coreutil_bytes.push((format!("bin/{}", name), bytes));
+    }
+
     // Firmware bundling — Linux hybrid model:
     //   initramfs: only blobs matching --initramfs-firmware globs.
     //              Needed BEFORE root mounts (CPU microcode, early-FB
@@ -1644,6 +1670,11 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
     cpio_entries.push(("init", &init_bytes));
     cpio_entries.push(("shell", &shell_bytes));
+    // Stage coreutils at bin/<name> so the shell's /bin/<name>
+    // PATH resolution resolves them after the initramfs is mounted.
+    for (path, bytes) in &coreutil_bytes {
+        cpio_entries.push((path.as_str(), bytes.as_slice()));
+    }
     for (path, bytes) in &fw_initramfs {
         cpio_entries.push((path.as_str(), bytes.as_slice()));
     }
@@ -1694,11 +1725,14 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         fw_rootfs.len(),
         fmt_mib(rootfs_fw_bytes),
     );
+    let coreutil_total: usize = coreutil_bytes.iter().map(|(_, b)| b.len()).sum();
     println!(
-        "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes)",
+        "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, coreutils={} bytes [{}])",
         cpio.len(),
         init_bytes.len(),
         shell_bytes.len(),
+        coreutil_total,
+        coreutil_bytes.iter().map(|(n, b)| format!("{}={}", n, b.len())).collect::<Vec<_>>().join(", "),
     );
 
     // BIOS support files are nice-to-have. xorriso flags below
