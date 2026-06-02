@@ -1226,7 +1226,8 @@ impl Initramfs {
 
             off += 110;
 
-            if off + namesize > archive.len() {
+            // namesize includes the trailing NUL, so it must be at least 1.
+            if namesize < 1 || off + namesize > archive.len() {
                 return Err(CpioError::Truncated);
             }
             // Name includes the trailing NUL — drop it before UTF-8.
