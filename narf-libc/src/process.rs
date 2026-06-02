@@ -209,27 +209,55 @@ pub unsafe extern "C" fn usleep(us: u32) -> i32 {
     narf_user_runtime::nanosleep(ns)
 }
 
-// ── fork / exec / wait — ENOSYS stubs ───────────────────────────────
-//
-// NARF doesn't expose fork/exec to user mode (the userspace daemon
-// model spawns processes via a privileged supervisor instead). The
-// libc entries exist so a binary that mentions them in a never-taken
-// branch links cleanly.
+// ── fork / exec / wait ──────────────────────────────────────────────
 
-const ENOSYS: i32 = 38;
-
-/// `fork()` — refuses with ENOSYS.
+/// `fork()` — create an independent copy of the calling process.
+///
+/// Routes to `Syscall::Fork` (wire number 57 on x86_64, matching
+/// Linux's `arch/x86/entry/syscalls/syscall_64.tbl`). The kernel
+/// copies the calling task's address space (COW), fd table, brk,
+/// signal handlers, pgid, and sid into a new task; pending signals
+/// in the child are reset per POSIX.
+///
+/// Return convention (POSIX):
+///   parent — the child's pid (positive)
+///   child  — 0
+///   error  — -1 + errno set (EAGAIN on resource exhaustion, ENOMEM
+///             on AS-copy failure)
+///
+/// Reference: musl `src/process/fork.c`; Linux `kernel/fork.c`.
+///
+/// # Safety
+/// `extern "C"` shape — pure syscall delegation, no invariants to
+/// uphold in the calling task.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fork() -> i32 {
-    crate::errno::set_errno(ENOSYS);
-    -1
+    match narf_user_runtime::fork() {
+        Ok(pid) => pid as i32,
+        Err(()) => {
+            // EAGAIN: kernel couldn't allocate the child task (the
+            // most common failure — resource limit or AS-copy OOM).
+            // POSIX allows either EAGAIN or ENOMEM; we pick EAGAIN
+            // matching the Linux default (glibc fork.c).
+            crate::errno::set_errno(11); // EAGAIN
+            -1
+        }
+    }
 }
 
-/// `vfork()` — same as [`fork`] under our model.
+/// `vfork()` — POSIX permits aliasing to `fork()`; we do so because
+/// NARF doesn't implement the optimised-stack-sharing semantics of
+/// the original BSD vfork (which requires the child to avoid using
+/// the parent's stack until exec/exit). Callers that rely on vfork's
+/// COW-skip optimisation get correct behaviour, just without the
+/// allocation savings.
+///
+/// Reference: musl `src/process/vfork.c` (aliases fork on platforms
+/// without vfork support).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vfork() -> i32 {
-    crate::errno::set_errno(ENOSYS);
-    -1
+    // SAFETY: forwarded to fork() which is sound.
+    unsafe { fork() }
 }
 
 /// `execve(path, argv, envp)` — re-image the calling task with the
