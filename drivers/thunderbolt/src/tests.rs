@@ -59,6 +59,8 @@ fn smoke_tb_match_kind_matches_synthetic_tgl() -> TestResult {
             vendor: nhi::INTEL_VENDOR,
             device: 0x9A1B,
             class: 0x0C0340,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr,
@@ -108,6 +110,8 @@ fn smoke_tb_rejects_unrelated_intel_device() -> TestResult {
             vendor: 0x8086,
             device: 0x2922, // ICH9 AHCI — definitively not a TB ID
             class: 0x010601,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr,

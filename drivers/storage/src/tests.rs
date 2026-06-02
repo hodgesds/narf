@@ -559,6 +559,8 @@ fn smoke_vmd_match_kind_matches_synthetic_device() -> TestResult {
             vendor: vmd::INTEL_VENDOR,
             device: 0x9A0B, // Tiger Lake VMD
             class: 0x010400,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr,
@@ -604,6 +606,8 @@ fn smoke_vmd_rejects_unrelated_intel_device() -> TestResult {
             vendor: 0x8086,
             device: 0x2922, // ICH9 AHCI, not a VMD ID
             class: 0x010601,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr,
@@ -1576,6 +1580,8 @@ fn smoke_rtsx_probe_rejects_non_rtsx() -> TestResult {
             vendor: 0x8086, // Intel, not Realtek
             device: 0x2922,
             class: 0xFF0000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr,

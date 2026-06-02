@@ -215,10 +215,14 @@ impl crate::drm_registry::DrmCard for BochsCard {
         0x1111
     }
     fn subsystem_vendor(&self) -> u16 {
-        0x0000
+        // QEMU bochs-display: Red Hat, Inc. PCI subsystem vendor.
+        // cfg+0x2C = 0x1AF4 on all QEMU bochs-display instances.
+        0x1AF4
     }
     fn subsystem_device(&self) -> u16 {
-        0x0000
+        // QEMU bochs-display subsystem device ID.
+        // cfg+0x2E = 0x1100 on all QEMU bochs-display instances.
+        0x1100
     }
     fn vbios_version(&self) -> Option<&str> {
         None

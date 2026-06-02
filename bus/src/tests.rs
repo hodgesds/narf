@@ -147,6 +147,8 @@ fn smoke_bus_append_devices_grows_registry() -> TestResult {
             vendor: 0x1234,
             device: 0xAAAA,
             class: 0x010400,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr: PcieAddr::new(0, 0, 1, 0),
@@ -159,6 +161,8 @@ fn smoke_bus_append_devices_grows_registry() -> TestResult {
             vendor: 0x144D,
             device: 0xA80A,
             class: 0x010802,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::Pcie {
             addr: PcieAddr::new(0x8000, 0, 0, 0),
@@ -414,6 +418,8 @@ fn smoke_bus_hotplug_listener_roundtrip() -> TestResult {
             vendor: 0x1af4,
             device: 0x1001,
             class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
     });
     dispatch_event(HotplugEvent::Detach { addr });
@@ -1412,6 +1418,8 @@ fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
             vendor: 0x1234,
             device: 0x5678,
             class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
     });
     dispatch_event(HotplugEvent::Detach { addr });
@@ -1756,7 +1764,7 @@ fn smoke_pci_requester_id_packs_bdf() -> TestResult {
                 addr: crate::addr::PcieAddr::new(0, bus, device, function),
                 cfg_phys: narf_memory::PhysAddr::new(0),
             },
-            id: crate::device::DeviceId { vendor: 0, device: 0, class: 0 },
+            id: crate::device::DeviceId { vendor: 0, device: 0, class: 0 , subsystem_vendor: 0, subsystem_id: 0 },
             addr: crate::addr::BusAddr::Pcie(crate::addr::PcieAddr::new(0, bus, device, function)),
         }
     }
@@ -1785,7 +1793,7 @@ fn smoke_pci_requester_id_none_for_non_pcie() -> TestResult {
     let phys = narf_memory::PhysAddr::new(0xFF00_0000);
     let dev = BusDevice {
         addr: BusAddr::Mmio(phys),
-        id: DeviceId { vendor: 0, device: 0, class: 0 },
+        id: DeviceId { vendor: 0, device: 0, class: 0 , subsystem_vendor: 0, subsystem_id: 0 },
         kind: BusKind::VirtioMmio { base: phys, len: 0x200, device_id: 1 },
     };
     if requester_id(&dev).is_some() {
@@ -1808,7 +1816,7 @@ fn smoke_pci_read_command_revoked_cap_rejected() -> TestResult {
     let pcie = PcieAddr::new(0, 0, 0, 0);
     let dev = BusDevice {
         addr: BusAddr::Pcie(pcie),
-        id: DeviceId { vendor: 0, device: 0, class: 0 },
+        id: DeviceId { vendor: 0, device: 0, class: 0 , subsystem_vendor: 0, subsystem_id: 0 },
         kind: BusKind::Pcie { addr: pcie, cfg_phys: narf_memory::PhysAddr::new(0) },
     };
     match read_command(&cap, &dev) {
@@ -1898,7 +1906,7 @@ fn smoke_hotplug_dispatch_fans_out_to_listeners() -> TestResult {
     }
 
     let addr = BusAddr::Pcie(PcieAddr::new(0, 1, 2, 3));
-    let id = DeviceId { vendor: 0x1B36, device: 0x0010, class: 0x010802 };
+    let id = DeviceId { vendor: 0x1B36, device: 0x0010, class: 0x010802, subsystem_vendor: 0, subsystem_id: 0 };
     dispatch_event(HotplugEvent::Attach { addr, device_id: id });
     if ATTACH_HITS.load(Ordering::Relaxed) != 2 {
         return TestResult::Fail("Attach didn't fan out to both listeners");
@@ -1921,7 +1929,7 @@ fn smoke_hotplug_event_variants_distinct() -> TestResult {
     use crate::device::DeviceId;
     use crate::hotplug::HotplugEvent;
     let addr = BusAddr::Pcie(PcieAddr::new(0, 0, 0, 0));
-    let id = DeviceId { vendor: 0, device: 0, class: 0 };
+    let id = DeviceId { vendor: 0, device: 0, class: 0, subsystem_vendor: 0, subsystem_id: 0 };
     let a = HotplugEvent::Attach { addr, device_id: id };
     let d = HotplugEvent::Detach { addr };
     if a == d {

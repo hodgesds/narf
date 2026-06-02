@@ -1534,8 +1534,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             card_name,
             device.id.vendor,
             device.id.device,
-            0, // subsystem_vendor: not in BusDevice::id; deferred
-            0, // subsystem_device: not in BusDevice::id; deferred
+            device.id.subsystem_vendor, // cfg offset 0x2C, populated at ECAM probe
+            device.id.subsystem_id,     // cfg offset 0x2E, populated at ECAM probe
             vbios_version,
         );
         crate::drm_registry::register_drm_card(alloc::sync::Arc::new(amdgpu_card));

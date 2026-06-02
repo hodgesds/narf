@@ -467,7 +467,7 @@ fn smoke_pci_devices_line_count() -> TestResult {
     bus_registry::install(alloc::vec![
         BusDevice {
             addr: BusAddr::Pcie(PcieAddr::new(0, 0, 1, 0)),
-            id: BusDevId { vendor: 0x8086, device: 0x1234, class: 0x060000 },
+            id: BusDevId { vendor: 0x8086, device: 0x1234, class: 0x060000, subsystem_vendor: 0, subsystem_id: 0 },
             kind: BusKind::Pcie {
                 addr: PcieAddr::new(0, 0, 1, 0),
                 cfg_phys: PhysAddr::new(0),
@@ -475,7 +475,7 @@ fn smoke_pci_devices_line_count() -> TestResult {
         },
         BusDevice {
             addr: BusAddr::Pcie(PcieAddr::new(0, 0, 2, 0)),
-            id: BusDevId { vendor: 0x10de, device: 0x5678, class: 0x030000 },
+            id: BusDevId { vendor: 0x10de, device: 0x5678, class: 0x030000, subsystem_vendor: 0, subsystem_id: 0 },
             kind: BusKind::Pcie {
                 addr: PcieAddr::new(0, 0, 2, 0),
                 cfg_phys: PhysAddr::new(0),
@@ -504,7 +504,7 @@ fn smoke_pci_devices_hex_bdf() -> TestResult {
     // bus=0x02, dev=0x03, fn=1 → (2<<8)|(3<<3)|1 = 0x219
     bus_registry::install(alloc::vec![BusDevice {
         addr: BusAddr::Pcie(PcieAddr::new(0, 0x02, 0x03, 1)),
-        id: BusDevId { vendor: 0xAAAA, device: 0xBBBB, class: 0 },
+        id: BusDevId { vendor: 0xAAAA, device: 0xBBBB, class: 0, subsystem_vendor: 0, subsystem_id: 0 },
         kind: BusKind::Pcie {
             addr: PcieAddr::new(0, 0x02, 0x03, 1),
             cfg_phys: PhysAddr::new(0),

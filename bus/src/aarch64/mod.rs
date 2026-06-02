@@ -440,6 +440,8 @@ unsafe fn probe_virtio_mmio(base_addr: u64, len: u64) -> Option<BusDevice> {
             vendor: 0x1AF4, // Red Hat / virtio — matches the PCI transport
             device: device_id as u16,
             class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
         },
         kind: BusKind::VirtioMmio {
             base: phys,

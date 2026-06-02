@@ -107,12 +107,25 @@ pub unsafe fn enumerate_segment(
                 let class_word = unsafe { ecam_read32(PhysAddr::new(cfg.raw() + 0x08)) };
                 let class = (class_word >> 8) & 0x00FF_FFFF;
 
+                // Offsets 0x2C/0x2E: Subsystem Vendor ID + Subsystem ID.
+                // PCI 3.0 §6.2.4 — present in every type-0 header.
+                // Linux ref: drivers/pci/probe.c::pci_read_bases (called
+                // by pci_setup_device) populates dev->subsystem_vendor /
+                // dev->subsystem_device. Packed in one 32-bit read:
+                // bits [15:0] = subsystem_vendor, [31:16] = subsystem_id.
+                // SAFETY: 0x2C is 4-byte aligned; in-range type-0 header.
+                let subsys_word = unsafe { ecam_read32(PhysAddr::new(cfg.raw() + 0x2C)) };
+                let subsystem_vendor = (subsys_word & 0xFFFF) as u16;
+                let subsystem_id = ((subsys_word >> 16) & 0xFFFF) as u16;
+
                 devices.push(BusDevice {
                     addr: BusAddr::Pcie(addr),
                     id: DeviceId {
                         vendor,
                         device,
                         class,
+                        subsystem_vendor,
+                        subsystem_id,
                     },
                     kind: BusKind::Pcie {
                         addr,

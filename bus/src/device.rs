@@ -13,21 +13,33 @@ use crate::addr::{BusAddr, PcieAddr};
 use narf_memory::PhysAddr;
 
 /// Identification fields common across transports. PCIe populates all
-/// three; MMIO virtio populates `vendor`/`device` from the transport's
-/// own registers (magic + device id) with `class` left at 0.
+/// five; MMIO virtio populates `vendor`/`device` from the transport's
+/// own registers (magic + device id) with `class` left at 0 and
+/// `subsystem_vendor`/`subsystem_id` left at 0.
+///
+/// Subsystem IDs come from the PCI type-0 header at offsets 0x2C
+/// (Subsystem Vendor ID) and 0x2E (Subsystem ID) per PCI 3.0 §6.2.4.
+/// Linux reads them in `drivers/pci/probe.c::pci_read_bases` (called
+/// by `pci_setup_device`) and stores as `dev->subsystem_vendor` /
+/// `dev->subsystem_device`.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct DeviceId {
     pub vendor: u16,
     pub device: u16,
     pub class: u32,
+    /// PCI Subsystem Vendor ID (cfg offset 0x2C). 0 for non-PCIe transports.
+    pub subsystem_vendor: u16,
+    /// PCI Subsystem ID (cfg offset 0x2E). 0 for non-PCIe transports.
+    pub subsystem_id: u16,
 }
 
 impl fmt::Debug for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "DeviceId({:04x}:{:04x}, class={:06x})",
-            self.vendor, self.device, self.class
+            "DeviceId({:04x}:{:04x}, class={:06x}, subsys={:04x}:{:04x})",
+            self.vendor, self.device, self.class,
+            self.subsystem_vendor, self.subsystem_id
         )
     }
 }

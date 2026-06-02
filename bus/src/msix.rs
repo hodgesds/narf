@@ -466,6 +466,8 @@ pub fn __synth_msix_table(size: u16) -> MsixTable {
                 vendor: 0,
                 device: 0,
                 class: 0,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
             },
             kind: BusKind::Pcie {
                 addr,

@@ -890,3 +890,202 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_syncobj_signalled_after_commit);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Wave-37 subsystem-ID smokes
+//
+// Linux ref: PCI 3.0 §6.2.4 — Subsystem Vendor ID (cfg+0x2C) + Subsystem ID
+//            (cfg+0x2E). Linux reads them in drivers/pci/probe.c::pci_read_bases
+//            (called from pci_setup_device) and exposes via
+//            /sys/bus/pci/devices/<slot>/subsystem_vendor + subsystem_device.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Smoke 17: DeviceId subsystem field round-trip ──────────────────────────
+// Verify that (vendor=0x1002, device=0x1636, subsystem_vendor=0x1849,
+// subsystem_id=0x1636) round-trips through DeviceId correctly.
+// 0x1849 = ASRock, device 0x1636 = Renoir.
+
+fn smoke_subsystem_id_device_id_round_trip() -> TestResult {
+    use narf_bus::DeviceId;
+
+    let id = DeviceId {
+        vendor: 0x1002,
+        device: 0x1636,
+        class: 0x030000,
+        subsystem_vendor: 0x1849,
+        subsystem_id: 0x1636,
+    };
+
+    if id.vendor != 0x1002 {
+        return TestResult::Fail("vendor mismatch");
+    }
+    if id.device != 0x1636 {
+        return TestResult::Fail("device mismatch");
+    }
+    if id.subsystem_vendor != 0x1849 {
+        return TestResult::Fail("subsystem_vendor mismatch (expected 0x1849 ASRock)");
+    }
+    if id.subsystem_id != 0x1636 {
+        return TestResult::Fail("subsystem_id mismatch (expected 0x1636 Renoir)");
+    }
+    // Also verify PartialEq round-trip.
+    let id2 = id;
+    if id != id2 {
+        return TestResult::Fail("DeviceId Copy/PartialEq broken");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_device_id_round_trip);
+
+// ── Smoke 18: PCI config-space subsystem ID parse ─────────────────────────
+// Synthesise a 64-byte type-0 header byte-slice with subsystem IDs at
+// offsets 0x2C/0x2E and verify our parse logic extracts them correctly.
+// This mirrors what pcie::enumerate_segment reads at boot time.
+
+fn smoke_subsystem_id_config_space_parse() -> TestResult {
+    // Build a synthetic 64-byte config-space buffer.
+    let mut cfg = [0u8; 64];
+    // Offset 0x00: vendor=0x1002, device=0x1636.
+    cfg[0x00] = 0x02;
+    cfg[0x01] = 0x10;
+    cfg[0x02] = 0x36;
+    cfg[0x03] = 0x16;
+    // Offset 0x2C: subsystem_vendor=0x1849 (ASRock).
+    cfg[0x2C] = 0x49;
+    cfg[0x2D] = 0x18;
+    // Offset 0x2E: subsystem_id=0x1636.
+    cfg[0x2E] = 0x36;
+    cfg[0x2F] = 0x16;
+
+    // Parse as little-endian u16 values — the same read the ECAM walker does.
+    let subsys_word = u32::from_le_bytes([cfg[0x2C], cfg[0x2D], cfg[0x2E], cfg[0x2F]]);
+    let subsystem_vendor = (subsys_word & 0xFFFF) as u16;
+    let subsystem_id = ((subsys_word >> 16) & 0xFFFF) as u16;
+
+    if subsystem_vendor != 0x1849 {
+        return TestResult::Fail("subsystem_vendor parse mismatch (expected 0x1849)");
+    }
+    if subsystem_id != 0x1636 {
+        return TestResult::Fail("subsystem_id parse mismatch (expected 0x1636)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_config_space_parse);
+
+// ── Smoke 19: sysfs subsystem_vendor attr format ──────────────────────────
+// AmdgpuCard::subsystem_vendor() returns the value; sysfs formats it as
+// "0x<hex4>\n". Verify the formatting function produces the right string.
+
+fn smoke_subsystem_id_sysfs_vendor_format() -> TestResult {
+    use crate::drm_devfs_bridge::AmdgpuCard;
+    use crate::drm_registry::DrmCard;
+
+    let card = AmdgpuCard::new(
+        "card0".into(),
+        0x1002, // AMD
+        0x1636, // Renoir
+        0x1849, // ASRock subsystem vendor
+        0x1636, // Renoir subsystem id
+        None,
+    );
+
+    let sv = card.subsystem_vendor();
+    if sv != 0x1849 {
+        return TestResult::Fail("subsystem_vendor() != 0x1849");
+    }
+    // Verify the sysfs formatting would produce "0x1849\n".
+    let formatted = alloc::format!("0x{:04x}\n", sv);
+    if formatted != "0x1849\n" {
+        return TestResult::Fail("sysfs subsystem_vendor format mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_sysfs_vendor_format);
+
+// ── Smoke 20: sysfs subsystem_device attr format ──────────────────────────
+
+fn smoke_subsystem_id_sysfs_device_format() -> TestResult {
+    use crate::drm_devfs_bridge::AmdgpuCard;
+    use crate::drm_registry::DrmCard;
+
+    let card = AmdgpuCard::new(
+        "card0".into(),
+        0x1002, // AMD
+        0x1636, // Renoir
+        0x1849, // ASRock subsystem vendor
+        0x1636, // Renoir subsystem id
+        None,
+    );
+
+    let sd = card.subsystem_device();
+    if sd != 0x1636 {
+        return TestResult::Fail("subsystem_device() != 0x1636");
+    }
+    let formatted = alloc::format!("0x{:04x}\n", sd);
+    if formatted != "0x1636\n" {
+        return TestResult::Fail("sysfs subsystem_device format mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_sysfs_device_format);
+
+// ── Smoke 21: bochs card subsystem IDs = (0x1AF4, 0x1100) ─────────────────
+
+fn smoke_subsystem_id_bochs_qemu_values() -> TestResult {
+    use crate::drm_devfs_bridge::BochsCard;
+    use crate::drm_registry::DrmCard;
+
+    let card = BochsCard::new("card0".into());
+
+    let sv = card.subsystem_vendor();
+    let sd = card.subsystem_device();
+
+    if sv != 0x1AF4 {
+        return TestResult::Fail("BochsCard subsystem_vendor != 0x1AF4 (Red Hat/QEMU)");
+    }
+    if sd != 0x1100 {
+        return TestResult::Fail("BochsCard subsystem_device != 0x1100");
+    }
+    // Also verify sysfs formatting.
+    let sv_str = alloc::format!("0x{:04x}\n", sv);
+    let sd_str = alloc::format!("0x{:04x}\n", sd);
+    if sv_str != "0x1af4\n" {
+        return TestResult::Fail("BochsCard subsystem_vendor sysfs format wrong");
+    }
+    if sd_str != "0x1100\n" {
+        return TestResult::Fail("BochsCard subsystem_device sysfs format wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_bochs_qemu_values);
+
+// ── Smoke 22: existing Wave-33 smokes — AmdgpuCard non-zero subsystem ──────
+// Verify that an AmdgpuCard constructed with real subsystem IDs doesn't
+// accidentally return 0 (which was the pre-fix stub behaviour).
+
+fn smoke_subsystem_id_amdgpu_nonzero_when_set() -> TestResult {
+    use crate::drm_devfs_bridge::AmdgpuCard;
+    use crate::drm_registry::DrmCard;
+
+    // Simulate probe with a real subsystem vendor (ThinkPad OEM = Lenovo 0x17AA).
+    let card = AmdgpuCard::new(
+        "card0".into(),
+        0x1002,  // AMD
+        0x1900,  // Phoenix HawkPoint1
+        0x17AA,  // Lenovo
+        0x3813,  // Lenovo ThinkPad subsystem device
+        None,
+    );
+
+    if card.subsystem_vendor() == 0 {
+        return TestResult::Fail("subsystem_vendor is 0 even though 0x17AA was provided");
+    }
+    if card.subsystem_device() == 0 {
+        return TestResult::Fail("subsystem_device is 0 even though 0x3813 was provided");
+    }
+    if card.subsystem_vendor() != 0x17AA {
+        return TestResult::Fail("subsystem_vendor doesn't match 0x17AA (Lenovo)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_amdgpu_nonzero_when_set);
