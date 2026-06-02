@@ -28,6 +28,7 @@ pub mod snd_pci;
 pub mod vsock_pci;
 
 mod tests;
+mod e2e_tests;
 
 /// Stage::Subsys initcalls — register every virtio-PCI driver with
 /// the bus match table. Each call is idempotent on its own; the
