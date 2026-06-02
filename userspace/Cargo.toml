@@ -26,6 +26,7 @@ narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-initramfs    = { path = "../initramfs" }
+narf-input        = { path = "../input" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-modules      = { path = "../modules" }
 

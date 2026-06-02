@@ -10794,3 +10794,262 @@ fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_smap_sys_read_kbuf_roundtrip);
+
+// ── ConsoleFile stdin smoke tests (Wave 37) ───────────────────────────────────
+//
+// These tests drive ConsoleFile::read (fd 0 / stdin) through the BYTE_RING
+// to verify the wired serial RX path end-to-end at the FileOps level.
+//
+// All four tests use the syscall path (sys_read via kernel_syscall_entry) so
+// they exercise the same code path as the real shell.
+
+fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
+    // ConsoleFile::read with an empty (zero-length) user buffer must
+    // return Ok(0) immediately — the fast-path guard before the await.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_0001);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Open stdin (fd 0) is pre-populated by fd::with_table with ConsoleFile.
+    // We need fd 0 to exist; force-create the table entry.
+    let _dummy = fd::with_table(task, |_t| ());
+
+    // Dummy output buffer — we ask for 0 bytes.
+    let mut buf = [0u8; 4];
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,  // fd 0 = stdin
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: 0,  // zero-length read
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    fd::__test_reset();
+    __test_clear_global();
+
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("zero-len read did not return Ok(0)")
+        }
+    }
+}
+kernel_test_in!("userspace", smoke_console_read_empty_buf_returns_zero);
+
+fn smoke_console_read_one_byte_in_ring() -> TestResult {
+    // ConsoleFile::read with one byte pre-loaded into the BYTE_RING must
+    // return Ok(1) and the exact byte value.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_0002);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Pre-load one byte ('A' = 0x41) into the ASCII ring.
+    narf_input::push_global(narf_input::InputEvent::AsciiByte(b'A'));
+
+    let _ = fd::with_table(task, |_t| ());
+
+    let mut buf = [0u8; 4];
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    fd::__test_reset();
+    __test_clear_global();
+
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 1 => {
+            if buf[0] == b'A' {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("byte value mismatch — expected 'A'")
+            }
+        }
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {
+            TestResult::Fail("read returned 0 bytes — byte in ring was not consumed")
+        }
+        _ => TestResult::Fail("sys_read returned unexpected status"),
+    }
+}
+kernel_test_in!("userspace", smoke_console_read_one_byte_in_ring);
+
+fn smoke_console_read_drains_burst() -> TestResult {
+    // ConsoleFile::read with 3 bytes pre-loaded must return Ok(3) and
+    // deliver all three bytes in order (paste-burst drain path).
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_0003);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Pre-load "hi\n" (3 bytes) into the ASCII ring.
+    for &b in b"hi\n" {
+        narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+    }
+
+    let _ = fd::with_table(task, |_t| ());
+
+    let mut buf = [0u8; 8];
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    fd::__test_reset();
+    __test_clear_global();
+
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 3 => {
+            if &buf[..3] == b"hi\n" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("3-byte burst: payload mismatch")
+            }
+        }
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {
+            TestResult::Fail("3-byte burst: read returned 0 — bytes not consumed")
+        }
+        Some(r) if r.status == SyscallReturn::OK => {
+            TestResult::Fail("3-byte burst: wrong count returned")
+        }
+        _ => TestResult::Fail("3-byte burst: sys_read bad status"),
+    }
+}
+kernel_test_in!("userspace", smoke_console_read_drains_burst);
+
+fn smoke_console_read_empty_ring_returns_zero() -> TestResult {
+    // ConsoleFile::read with an empty ring and a non-zero buffer must return
+    // Ok(0) — no bytes available yet. The shell's usleep-retry loop handles
+    // the backoff; returning 0 is the non-blocking "try again later" signal.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_0004);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Ring is empty — no push.
+    let _ = fd::with_table(task, |_t| ());
+
+    let mut buf = [0u8; 4];
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    fd::__test_reset();
+    __test_clear_global();
+
+    // Either Ok(0) — poll_blocking timed out → handler unwrap_or(0) —
+    // or a deliberate Ok(0) from the future. Both signal "no data now".
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => TestResult::Pass,
+        _ => TestResult::Fail("empty ring: expected Ok(0) from sys_read"),
+    }
+}
+kernel_test_in!("userspace", smoke_console_read_empty_ring_returns_zero);

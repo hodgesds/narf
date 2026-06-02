@@ -183,8 +183,29 @@ impl core::fmt::Debug for ConsoleFile {
 }
 
 impl FileOps for ConsoleFile {
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) }) // EOF
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Non-blocking raw-mode read. Drains whatever bytes are in the
+        // BYTE_RING (serial RX / keyboard ASCII path) without blocking.
+        //
+        // Returns Ok(0) immediately when the ring is empty — callers that
+        // want blocking behaviour (the shell's `read_byte` loop) retry with
+        // a brief usleep(10_000) between attempts, matching the pattern that
+        // `devfs::DevConsole::read` already uses for /dev/console.
+        //
+        // Approach: raw mode (no line discipline). The shell's classify()
+        // function handles backspace / submit / ignore semantics per-byte.
+        let mut n = 0usize;
+        while n < buf.len() {
+            match narf_input::pop_ascii_byte() {
+                Some(b) => {
+                    buf[n] = b;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        let result = Ok(n);
+        Box::pin(async move { result })
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let n = buf.len();
