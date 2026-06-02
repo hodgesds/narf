@@ -366,3 +366,214 @@ pub async fn upload_firmware(
 ) -> Result<usize, narf_drivers_usb::firmware::FirmwareError> {
     narf_drivers_usb::firmware::upload_default(dev, ep_addr, blob, max_packet).await
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Transport abstraction
+//
+// `Rtl8xxxuTransport` is the surface the per-chip bring-up code uses
+// against the wire. Production paths bind to `narf_drivers_usb`; smoke
+// tests bind to `FakeUsbTransport` which captures every operation so a
+// test can assert the exact register-write order, bulk-OUT chunk
+// stream, and bulk-IN injection points.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Errors a transport call can raise. Generic across both real USB and
+/// the in-process fake.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TransportError {
+    /// The caller asked for an addr the transport doesn't model.
+    BadAddr,
+    /// A poll-based step exhausted its retry budget.
+    PollTimeout,
+    /// A bulk transfer didn't move the expected byte count.
+    ShortTransfer,
+    /// The transport is closed / the device went away.
+    Closed,
+}
+
+/// The minimal interface every rtl8xxxu transport needs.
+///
+/// All methods are synchronous because the bring-up sequence is
+/// strictly serialised; the production path simply blocks on its
+/// async USB primitives from the bring-up worker task.
+pub trait Rtl8xxxuTransport {
+    fn read8(&self, addr: u16) -> Result<u8, TransportError>;
+    fn read16(&self, addr: u16) -> Result<u16, TransportError>;
+    fn read32(&self, addr: u16) -> Result<u32, TransportError>;
+    fn write8(&self, addr: u16, val: u8) -> Result<(), TransportError>;
+    fn write16(&self, addr: u16, val: u16) -> Result<(), TransportError>;
+    fn write32(&self, addr: u16, val: u32) -> Result<(), TransportError>;
+    /// Submit one bulk-OUT frame on the bulk-OUT endpoint reserved
+    /// for FW download. Returns bytes transferred.
+    fn bulk_out(&self, ep: u8, bytes: &[u8]) -> Result<usize, TransportError>;
+    /// Receive one bulk-IN URB. Returns bytes copied into `out`.
+    fn bulk_in(&self, ep: u8, out: &mut [u8]) -> Result<usize, TransportError>;
+}
+
+/// In-memory transport for smoke tests. Records every operation in
+/// order; reads are served from a register-backed `HashMap` (default
+/// 0). Bulk-IN is served from a FIFO of pre-injected byte buffers.
+#[derive(Default)]
+pub struct FakeUsbTransport {
+    inner: core::cell::RefCell<FakeInner>,
+}
+
+#[derive(Default)]
+struct FakeInner {
+    /// 16-bit-keyed register space (post-write value).
+    regs: alloc::collections::BTreeMap<u16, u32>,
+    /// Ordered log of operations (one entry per primitive).
+    log: alloc::vec::Vec<FakeOp>,
+    /// FIFO of injected bulk-IN frames.
+    bulk_in_queue: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
+    /// Whether the next read of REG_MCU_FW_DL should set bit 2 (CSUM).
+    csum_ready: bool,
+    /// Whether the next read of REG_MCU_FW_DL should set bit 6 (init ready).
+    init_ready: bool,
+}
+
+/// Log entry for one transport primitive call. Smokes match
+/// against this stream to verify ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeOp {
+    Read8(u16),
+    Read16(u16),
+    Read32(u16),
+    Write8(u16, u8),
+    Write16(u16, u16),
+    Write32(u16, u32),
+    BulkOut { ep: u8, bytes: alloc::vec::Vec<u8> },
+    BulkIn { ep: u8, len: usize },
+}
+
+impl FakeUsbTransport {
+    /// Create a fresh in-memory transport.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the value a future `read*` of `addr` will see (subject to
+    /// the FW-download poll bits, which the transport flips itself).
+    pub fn prime_reg(&self, addr: u16, val: u32) {
+        self.inner.borrow_mut().regs.insert(addr, val);
+    }
+
+    /// Push a bulk-IN URB the next `bulk_in()` call will return.
+    pub fn inject_bulk_in(&self, bytes: alloc::vec::Vec<u8>) {
+        self.inner.borrow_mut().bulk_in_queue.push_back(bytes);
+    }
+
+    /// Arrange that the next read of `REG_MCU_FW_DL` (low byte) yields
+    /// `MCU_FW_DL_CSUM_REPORT`. Used by FW-download smokes to short-
+    /// circuit the post-page checksum poll.
+    pub fn arm_fw_csum_ok(&self) {
+        self.inner.borrow_mut().csum_ready = true;
+    }
+
+    /// Arrange that the next read of `REG_MCU_FW_DL` (high word) sets
+    /// `MCU_WINT_INIT_READY`. Used by FW-download smokes to short-
+    /// circuit the post-checksum init poll.
+    pub fn arm_fw_init_ready(&self) {
+        self.inner.borrow_mut().init_ready = true;
+    }
+
+    /// Borrow the immutable log for assertions.
+    pub fn log(&self) -> alloc::vec::Vec<FakeOp> {
+        self.inner.borrow().log.clone()
+    }
+
+    /// Return all `BulkOut` payload bytes concatenated in transmit order.
+    pub fn bulk_out_concat(&self) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        for op in &self.inner.borrow().log {
+            if let FakeOp::BulkOut { bytes, .. } = op {
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
+
+    /// Count `BulkOut` operations.
+    pub fn bulk_out_count(&self) -> usize {
+        self.inner.borrow().log.iter().filter(|op| matches!(op, FakeOp::BulkOut { .. })).count()
+    }
+}
+
+impl Rtl8xxxuTransport for FakeUsbTransport {
+    fn read8(&self, addr: u16) -> Result<u8, TransportError> {
+        let mut g = self.inner.borrow_mut();
+        let mut v = (*g.regs.get(&addr).unwrap_or(&0)) as u8;
+        // FW-download self-progression: REG_MCU_FW_DL low byte gets
+        // CSUM_REPORT set after the first read once `csum_ready` is armed.
+        if addr == REG_MCU_FW_DL && g.csum_ready {
+            v |= MCU_FW_DL_CSUM_REPORT;
+            g.csum_ready = false;
+        }
+        g.log.push(FakeOp::Read8(addr));
+        Ok(v)
+    }
+
+    fn read16(&self, addr: u16) -> Result<u16, TransportError> {
+        let mut g = self.inner.borrow_mut();
+        let v = (*g.regs.get(&addr).unwrap_or(&0)) as u16;
+        g.log.push(FakeOp::Read16(addr));
+        Ok(v)
+    }
+
+    fn read32(&self, addr: u16) -> Result<u32, TransportError> {
+        let mut g = self.inner.borrow_mut();
+        let mut v = *g.regs.get(&addr).unwrap_or(&0);
+        if addr == REG_MCU_FW_DL && g.csum_ready {
+            v |= MCU_FW_DL_CSUM_REPORT as u32;
+            g.csum_ready = false;
+        }
+        if addr == REG_MCU_FW_DL && g.init_ready {
+            v |= MCU_WINT_INIT_READY;
+            g.init_ready = false;
+        }
+        g.log.push(FakeOp::Read32(addr));
+        Ok(v)
+    }
+
+    fn write8(&self, addr: u16, val: u8) -> Result<(), TransportError> {
+        let mut g = self.inner.borrow_mut();
+        let prev = *g.regs.get(&addr).unwrap_or(&0);
+        g.regs.insert(addr, (prev & !0xFF) | (val as u32));
+        g.log.push(FakeOp::Write8(addr, val));
+        Ok(())
+    }
+
+    fn write16(&self, addr: u16, val: u16) -> Result<(), TransportError> {
+        let mut g = self.inner.borrow_mut();
+        let prev = *g.regs.get(&addr).unwrap_or(&0);
+        g.regs.insert(addr, (prev & !0xFFFF) | (val as u32));
+        g.log.push(FakeOp::Write16(addr, val));
+        Ok(())
+    }
+
+    fn write32(&self, addr: u16, val: u32) -> Result<(), TransportError> {
+        let mut g = self.inner.borrow_mut();
+        g.regs.insert(addr, val);
+        g.log.push(FakeOp::Write32(addr, val));
+        Ok(())
+    }
+
+    fn bulk_out(&self, ep: u8, bytes: &[u8]) -> Result<usize, TransportError> {
+        let mut g = self.inner.borrow_mut();
+        g.log.push(FakeOp::BulkOut { ep, bytes: bytes.to_vec() });
+        Ok(bytes.len())
+    }
+
+    fn bulk_in(&self, ep: u8, out: &mut [u8]) -> Result<usize, TransportError> {
+        let mut g = self.inner.borrow_mut();
+        match g.bulk_in_queue.pop_front() {
+            Some(buf) => {
+                let n = buf.len().min(out.len());
+                out[..n].copy_from_slice(&buf[..n]);
+                g.log.push(FakeOp::BulkIn { ep, len: n });
+                Ok(n)
+            }
+            None => Err(TransportError::Closed),
+        }
+    }
+}

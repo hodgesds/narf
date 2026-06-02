@@ -181,3 +181,119 @@ pub fn slice_urb24<'a>(bytes: &'a [u8], desc: &RxDesc24Decoded) -> Option<RxFram
         mpdu: &bytes[hdr..total],
     })
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// RX ring dispatch
+//
+// Each USB transfer on the bulk-IN endpoint can contain zero, one, or
+// many 802.11 MPDUs each prefixed with a 16-byte (gen1) or 24-byte
+// (gen2) RxDesc and an optional drvinfo blob. `pump_rx` decodes the
+// transfer into per-frame slices and dispatches each via the caller-
+// supplied closure.
+//
+// Source: `core.c::rtl8xxxu_rx_complete` ~L4400 (gen1) — the Linux
+// driver walks one URB at a time popping `pkt_len` + drvinfo +
+// 8-byte alignment per frame.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Generation flag: which RxDesc layout the chip uses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxDescGen {
+    /// 8188EU / 8192EU / 8723BU — 16-byte descriptor.
+    Gen1,
+    /// 8821CU / 8822BU — 24-byte descriptor.
+    Gen2,
+}
+
+/// Align `n` up to the next multiple of 8 (USB-side per-MPDU padding).
+const fn align_up8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// Walk a bulk-IN transfer buffer and invoke `on_frame` once per
+/// decoded MPDU. Returns the number of MPDUs dispatched.
+///
+/// Source: `core.c::rtl8xxxu_rx_complete` ~L4400 (16-byte path) and
+/// ~L4800 (24-byte path). Linux uses 8-byte padding between MPDUs
+/// inside a single URB.
+pub fn pump_rx_buf<F>(gen: RxDescGen, buf: &[u8], mut on_frame: F) -> usize
+where
+    F: FnMut(&[u8]),
+{
+    let mut off = 0usize;
+    let mut n_frames = 0usize;
+    while off + descriptor_size(gen) <= buf.len() {
+        let (header_len, pkt_len) = match gen {
+            RxDescGen::Gen1 => {
+                let desc = match RxDesc16Decoded::parse(&buf[off..]) {
+                    Some(d) => d,
+                    None => break,
+                };
+                (desc.header_len(), desc.pktlen as usize)
+            }
+            RxDescGen::Gen2 => {
+                let desc = match RxDesc24Decoded::parse(&buf[off..]) {
+                    Some(d) => d,
+                    None => break,
+                };
+                (desc.header_len(), desc.pktlen as usize)
+            }
+        };
+        // Trailing zero-pad / runt: a descriptor with pktlen == 0 ends
+        // the URB regardless of what bytes follow.
+        if pkt_len == 0 {
+            break;
+        }
+        let total = header_len + pkt_len;
+        if off + total > buf.len() {
+            break;
+        }
+        on_frame(&buf[off + header_len..off + total]);
+        n_frames += 1;
+        // Linux advances by 8-byte-aligned MPDU end so the next desc
+        // lands on an 8-byte boundary inside the URB.
+        let advance = align_up8(total);
+        if advance == 0 {
+            break;
+        }
+        off += advance;
+    }
+    n_frames
+}
+
+const fn descriptor_size(gen: RxDescGen) -> usize {
+    match gen {
+        RxDescGen::Gen1 => RxDesc16Decoded::SIZE,
+        RxDescGen::Gen2 => RxDesc24Decoded::SIZE,
+    }
+}
+
+/// Build a synthetic gen1 RX URB containing one MPDU. Used by smokes
+/// to drive `pump_rx_buf` without live hardware.
+pub fn build_synthetic_gen1_urb(mpdu: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec::Vec::with_capacity(RxDesc16Decoded::SIZE + mpdu.len() + 8);
+    let mut dw0 = (mpdu.len() as u32) & 0x3FFF;
+    // drvinfo_sz_words = 0.
+    let _ = &mut dw0;
+    buf.extend_from_slice(&dw0.to_le_bytes()); // DW0
+    buf.extend_from_slice(&0u32.to_le_bytes()); // DW1
+    buf.extend_from_slice(&0u32.to_le_bytes()); // DW2
+    buf.extend_from_slice(&0u32.to_le_bytes()); // DW3
+    buf.extend_from_slice(mpdu);
+    let pad = align_up8(buf.len()) - buf.len();
+    for _ in 0..pad {
+        buf.push(0);
+    }
+    buf
+}
+
+/// Build a synthetic gen1 URB with `count` MPDUs concatenated.
+pub fn build_synthetic_gen1_urb_multi(mpdus: &[&[u8]]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    for m in mpdus {
+        out.extend_from_slice(&build_synthetic_gen1_urb(m));
+    }
+    out
+}
+
+extern crate alloc;

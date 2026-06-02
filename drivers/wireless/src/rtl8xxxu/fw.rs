@@ -237,3 +237,109 @@ pub fn page_selector_setup() -> super::usb::UsbControlSetup {
 }
 
 extern crate alloc;
+
+// ──────────────────────────────────────────────────────────────────────
+// Firmware download executor
+//
+// Walks a `Vec<FwDlStep>` produced by `fw_download_plan` against a
+// `Rtl8xxxuTransport`. Plus a one-shot `upload_firmware` convenience.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Bulk-OUT endpoint used for FW page transfers.
+///
+/// Source: `rtl8xxxu_core.c::rtl8xxxu_probe_select` / endpoint table —
+/// 8188EU and the other gen1 chips put the H2C / FW download channel
+/// on EP4 OUT (bit 7 clear, low nibble 4).
+pub const FW_BULK_OUT_EP: u8 = 0x04;
+
+/// Bulk-IN endpoint for RX frames. Gen1 chips put RX on EP3 IN.
+pub const RX_BULK_IN_EP: u8 = 0x83;
+
+/// Reasons a FW download can fail.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FwDlError {
+    /// Plan referenced a page index past the end of the firmware blob.
+    PlanCorrupt,
+    /// Transport returned a fault mid-stream.
+    TransportError(super::usb::TransportError),
+    /// A `Poll32` step exhausted its retry budget.
+    PollTimeout,
+    /// CSUM check after the download flagged a mismatch.
+    ChecksumMismatch,
+}
+
+/// Execute a previously-built FW download plan against a transport.
+///
+/// `fw_payload` is the stripped-header firmware bytes (see
+/// `FwLayout::strip_header`); the plan's `PageOut` steps reference
+/// page indices that index into `fw_payload`.
+pub fn execute_fw_download<T: super::usb::Rtl8xxxuTransport>(
+    transport: &T,
+    plan: &[FwDlStep],
+    fw_payload: &[u8],
+) -> Result<usize, FwDlError> {
+    use super::regs::RTL_FW_PAGE_SIZE;
+    let mut bytes_xferred: usize = 0;
+    for step in plan {
+        match *step {
+            FwDlStep::Read8 { addr } => {
+                let _ = transport.read8(addr).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::Read16 { addr } => {
+                let _ = transport.read16(addr).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::Read32 { addr } => {
+                let _ = transport.read32(addr).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::Write8 { addr, val } => {
+                transport.write8(addr, val).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::Write16 { addr, val } => {
+                transport.write16(addr, val).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::Write32 { addr, val } => {
+                transport.write32(addr, val).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::Write8RMW { addr, keep, set } => {
+                let cur = transport.read8(addr).map_err(FwDlError::TransportError)?;
+                let new = (cur & keep) | set;
+                transport.write8(addr, new).map_err(FwDlError::TransportError)?;
+            }
+            FwDlStep::PageOut { page_idx, len } => {
+                let off = (page_idx as usize) * RTL_FW_PAGE_SIZE;
+                let end = off.checked_add(len).ok_or(FwDlError::PlanCorrupt)?;
+                if end > fw_payload.len() {
+                    return Err(FwDlError::PlanCorrupt);
+                }
+                let n = transport
+                    .bulk_out(FW_BULK_OUT_EP, &fw_payload[off..end])
+                    .map_err(FwDlError::TransportError)?;
+                bytes_xferred = bytes_xferred.saturating_add(n);
+            }
+            FwDlStep::Poll32 { addr, mask, match_val, max } => {
+                let mut ok = false;
+                for _ in 0..max {
+                    let v = transport.read32(addr).map_err(FwDlError::TransportError)?;
+                    if (v & mask) == match_val {
+                        ok = true;
+                        break;
+                    }
+                }
+                if !ok {
+                    return Err(FwDlError::PollTimeout);
+                }
+            }
+        }
+    }
+    Ok(bytes_xferred)
+}
+
+/// One-shot: build the plan from `fw_payload`, execute it, return
+/// total bytes sent over bulk-OUT (sum of PageOut step lengths).
+pub fn upload_firmware_blob<T: super::usb::Rtl8xxxuTransport>(
+    transport: &T,
+    fw_payload: &[u8],
+) -> Result<usize, FwDlError> {
+    let plan = fw_download_plan(fw_payload);
+    execute_fw_download(transport, &plan, fw_payload)
+}
