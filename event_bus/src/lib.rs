@@ -41,6 +41,7 @@ pub mod topic;
 pub use registry::__reset_for_test as __registry_reset_for_test;
 
 mod tests;
+mod e2e_tests;
 
 pub use audit::AuditEvent;
 pub use cap::{Publisher as PublisherCap, Subscriber as SubscriberCap, TopicRegistry};
