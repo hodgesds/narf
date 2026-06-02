@@ -1,0 +1,22 @@
+# Isolated workspace root — must NOT join the kernel workspace.
+# See userspace/init/Cargo.toml for the rationale.
+[workspace]
+
+[package]
+name         = "narf-coreutil-ps"
+description  = "NARF coreutil: ps — report process status."
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "GPL-2.0-or-later"
+
+[dependencies]
+narf-libc = { path = "../../../narf-libc" }
+
+[[bin]]
+name = "ps"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
