@@ -35,6 +35,7 @@ pub mod xhci;
 pub mod xpad;
 
 mod tests;
+#[cfg(feature = "kernel-test")] mod e2e_tests;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
