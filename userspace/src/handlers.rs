@@ -3613,6 +3613,30 @@ pub fn __test_wait_reset() {
     *PENDING_EXITS.lock() = None;
 }
 
+/// Test hook: directly register a parent-of relationship without going
+/// through `sys_fork`.  Used by smokes that verify wait4 routing against
+/// synthetic task IDs that never ran through the scheduler.
+#[doc(hidden)]
+pub fn __test_inject_parent_of(child: u64, parent: u64) {
+    // Initialise the tables if they haven't been yet (test may call
+    // this before wait_init — initialise on demand).
+    {
+        let mut g = PARENT_OF.lock();
+        if g.is_none() {
+            *g = Some(BTreeMap::new());
+        }
+        if let Some(m) = g.as_mut() {
+            m.insert(child, parent);
+        }
+    }
+    {
+        let mut g = PENDING_EXITS.lock();
+        if g.is_none() {
+            *g = Some(BTreeMap::new());
+        }
+    }
+}
+
 fn parent_of_set(child: u64, parent: u64) {
     let mut g = PARENT_OF.lock();
     if let Some(m) = g.as_mut() {
@@ -3626,22 +3650,41 @@ fn parent_of_get(child: u64) -> Option<u64> {
 }
 
 /// Exit observer registered by `wait_init`. Called when a polled
-/// user task transitions to Exited; pushes (child_pid, status)
-/// onto the parent's pending-exits queue so a future wait4 can
-/// reap it. Status: today we don't carry the user-supplied exit
-/// code through the polling routine, so this records 0. Future
-/// fix: thread the sys_exit_task `arg0` exit code through
-/// `EXIT_REASON_EXITED` to here.
+/// user task transitions to Exited:
+///
+///   1. Pushes (child_pid, status) onto the parent's pending-exits
+///      queue so a future wait4 can reap it.
+///   2. Sets SIGCHLD (17) pending on the parent so the parent's
+///      signal handler (if installed) is invoked on the next trap
+///      return.  POSIX 2017 §2.4.3: "If a process is stopped or
+///      terminated by a signal, SIGCHLD shall be generated for its
+///      parent process."
+///
+/// Status: the user-supplied exit code from sys_exit_task is not yet
+/// threaded through EXIT_REASON_EXITED to here — this records 0.
+/// Future fix: carry `arg0` through the UserTaskFuture polling loop.
 fn on_child_exit(child_pid: u64) {
     let parent = match parent_of_get(child_pid) {
         Some(p) => p,
         None => return, // No registered parent — orphan; nothing to reap.
     };
-    let mut g = PENDING_EXITS.lock();
+    // (1) Reap entry — for wait4.
+    {
+        let mut g = PENDING_EXITS.lock();
+        if let Some(m) = g.as_mut() {
+            m.entry(parent)
+                .or_insert_with(alloc::vec::Vec::new)
+                .push((child_pid, 0));
+        }
+    }
+    // (2) SIGCHLD delivery — for the parent's sigaction(SIGCHLD) handler.
+    // Linux: kernel/signal.c::do_notify_parent sets SIGCHLD pending.
+    // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
+    const SIGCHLD: u32 = 17;
+    let mut g = SIGNAL_PENDING.lock();
     if let Some(m) = g.as_mut() {
-        m.entry(parent)
-            .or_insert_with(alloc::vec::Vec::new)
-            .push((child_pid, 0));
+        let slot = m.entry(parent).or_insert(0);
+        *slot |= 1u32 << SIGCHLD;
     }
 }
 
