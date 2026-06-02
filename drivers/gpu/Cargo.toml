@@ -30,6 +30,7 @@ narf-scheduler       = { path = "../../scheduler" }
 narf-time            = { path = "../../time" }
 narf-power           = { path = "../../power" }
 narf-console         = { path = "../../console" }
+narf-filesystem      = { path = "../../filesystem" }
 
 [features]
 kernel-test = []

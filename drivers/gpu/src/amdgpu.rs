@@ -1424,6 +1424,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
+    // Register with the DRM card registry so /sys/class/drm/card<N>/
+    // and /dev/dri/card<N> appear after Stage::Late.
+    // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
+    {
+        let drm_count = crate::drm_registry::count() as u32;
+        let card_name = alloc::format!("card{}", drm_count);
+        let amdgpu_card = crate::drm_devfs_bridge::AmdgpuCard::new(
+            card_name,
+            device.id.vendor,
+            device.id.device,
+            0, // subsystem_vendor: not in BusDevice; deferred
+            0, // subsystem_device: not in BusDevice; deferred
+            None, // vbios_version: deferred until ATOMBIOS parse lands
+        );
+        crate::drm_registry::register_drm_card(alloc::sync::Arc::new(amdgpu_card));
+    }
     // Register against the device PM registry. AMDGPU suspend
     // saves the current Mode so set_mode can re-program it on
     // resume; full S3 also needs PSP TMR teardown + SMU

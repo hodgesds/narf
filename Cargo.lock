@@ -959,6 +959,7 @@ dependencies = [
  "narf-drivers-usbpd",
  "narf-drivers-virtio",
  "narf-edid",
+ "narf-filesystem",
  "narf-firmware",
  "narf-graphics",
  "narf-graphics-driver",

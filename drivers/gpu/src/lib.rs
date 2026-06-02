@@ -112,6 +112,9 @@ pub enum GpuError {
 
 pub mod dmabuf;
 pub mod drm;
+pub mod drm_registry;
+pub mod drm_sysfs_bridge;
+pub mod drm_devfs_bridge;
 pub mod amdgpu;
 pub mod amdgpu_atom_dcn;
 pub mod backlight;
@@ -209,6 +212,31 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Device, "gpu-backlight", || {
         backlight::init_backlight_initcall();
+        InitResult::Ok
+    });
+    // bochs DRM card registration: runs at Device stage (after Subsys
+    // where bochs probe runs). Registers a BochsCard with the DRM
+    // registry so /sys/class/drm/card<N>/ and /dev/dri/card<N> appear.
+    // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
+    narf_init::register(Stage::Device, "bochs-drm-card", || {
+        if narf_graphics_driver::bochs::is_probed() {
+            let count = drm_registry::count() as u32;
+            let card_name = alloc::format!("card{}", count);
+            let card = drm_devfs_bridge::BochsCard::new(card_name);
+            drm_registry::register_drm_card(alloc::sync::Arc::new(card));
+        }
+        InitResult::Ok
+    });
+    // DRM devfs bridge: install /dev/dri/ delegate.
+    // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
+    narf_init::register(Stage::Late, "drm-devfs-bridge", || {
+        drm_devfs_bridge::install_dri_dir();
+        InitResult::Ok
+    });
+    // DRM sysfs bridge: populate /sys/class/drm/.
+    // Linux ref: drm_sysfs.c::dev_show.
+    narf_init::register(Stage::Late, "drm-sysfs-bridge", || {
+        drm_sysfs_bridge::populate_drm_class();
         InitResult::Ok
     });
 }
