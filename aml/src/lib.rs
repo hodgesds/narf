@@ -59,6 +59,7 @@ pub mod sync;
 pub mod wmi;
 
 mod tests;
+mod e2e_tests;
 
 /// Run-time AML value, used by the method evaluator + Field
 /// accessors. `Name(...)` flat-constant decoding stays in
