@@ -1,28 +1,39 @@
 //! NARF interactive shell.
 //!
 //! Reads keystrokes from `/dev/console` one byte at a time, builds
-//! a line buffer, and dispatches a tiny set of built-ins on Enter.
-//! Single-process, no fork — every command runs synchronously inside
-//! the shell's own trap context.
+//! a line buffer, parses it with `parser::parse_line`, and dispatches
+//! the resulting AST through `exec::execute`.
 //!
-//! Built-in commands grouped by surface they exercise:
+//! Operators supported by the new parser (Wave 33):
+//!
+//!   `|`   pipeline           `>`   stdout redirect (truncate)
+//!   `>>`  stdout append      `<`   stdin redirect
+//!   `;`   command sequence   `&&`  and-short-circuit
+//!   `||`  or-short-circuit   `&`   background
+//!   `"…"` double-quoted arg  `'…'` single-quoted arg
+//!   `\x`  backslash escape
+//!
+//! Built-in commands (run in-process without fork):
 //!
 //!   basic:  help echo uname pid pwd cd whoami hostname clear date env
-//!           getenv true false exit
+//!           getenv true false exit :
 //!   fs:     cat ls stat head wc mkdir rmdir rm mv touch
 //!   proc:   sleep kill exec
 //!   smoke:  termtest condwait polltest tcpwire pidtest flocktest
 //!           mqtest proctest udptest entropytest shmtest tcptest
 //!           socktest threads raise
 //!
-//! Anything else is reported as "unknown command". The dispatch table
-//! lives in `dispatch_line` so adding a new built-in is one match arm
-//! plus its handler. Path-taking builtins share the `trim_arg` helper
-//! (strips leading whitespace + trailing control bytes) and a stack
-//! 256-byte NUL buffer for the C-string handoff.
+//! External commands search `/bin/<name>` after the built-in table.
+//! The dispatch table lives in `dispatch_line` (built-ins only).
+//! `exec::execute` handles the AST dispatch; `exec::dispatch_builtin_inproc`
+//! reconstructs a flat line and calls back into `dispatch_line` so
+//! all existing built-ins work unchanged.
 
 #![no_std]
 #![no_main]
+
+mod parser;
+mod exec;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU32;
@@ -2247,6 +2258,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
 
         let mut line = [0u8; LINE_BUF];
+        // Last command exit code — tracked so `&&`/`||` decisions work.
+        let mut last_exit: i32 = 0;
 
         loop {
             // Prompt.
@@ -2285,7 +2298,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 }
             }
 
-            if !dispatch_line(fd, &line[..len]) {
+            let input = &line[..len];
+            // Route through the new parser + exec engine.
+            // `dispatch_line` (the built-in table) is reached from
+            // `exec::dispatch_builtin_inproc` when fork is unavailable
+            // or the command is a built-in.
+            let cmd = parser::parse_line(input);
+            let keep = exec::execute(fd, &cmd, &mut last_exit);
+            if !keep {
                 write_all(fd, b"shell: bye\n");
                 return 0;
             }
