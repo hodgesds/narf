@@ -47,7 +47,10 @@ use alloc::vec::Vec;
 
 use narf_hid::descriptor::{self, ReportDescriptor};
 use narf_hid::ptp::{self, DecodedReport, PtpProfile};
-use narf_input::{push_global, InputEvent, PointerButtons, PointerEvent};
+use narf_input::{
+    evdev::{dispatch_rel_to_node, rel, DeviceCaps, DeviceId, DeviceNode, ROUTER},
+    push_global, InputEvent, PointerButtons, PointerEvent,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::HidError;
@@ -92,6 +95,10 @@ pub struct PtpTouchpad {
     last_xy: IrqSafeSpinLock<Option<(i32, i32)>>,
     /// Last seen mechanical button state, for press/release diff.
     last_button: IrqSafeSpinLock<bool>,
+    /// evdev ROUTER device id — for unregister on detach.
+    pub(crate) evdev_id: DeviceId,
+    /// evdev DeviceNode — pointer events dispatched here.
+    pub(crate) evdev_node: Arc<DeviceNode>,
 }
 
 /// Global registry of bound touchpads. Populated by
@@ -309,6 +316,14 @@ pub async fn try_bind_touchpad_already_addressed(
         .arm_interrupt_in(slot_id, dci, buf_len as u32)
         .map_err(HidError::Xhci)?;
 
+    // Register with the evdev ROUTER as a relative-motion pointer device.
+    // The PTP driver emits relative (dx, dy) via the first-contact diff,
+    // so REL_X/REL_Y is the right evdev type. Mirrors i8042_mouse.rs::init().
+    let mut caps = DeviceCaps::new();
+    caps.add_rel(rel::REL_X);
+    caps.add_rel(rel::REL_Y);
+    let (evdev_id, evdev_node) = ROUTER.register_device(caps);
+
     let pad = Arc::new(PtpTouchpad {
         slot_id,
         interrupt_in_dci: dci,
@@ -316,9 +331,21 @@ pub async fn try_bind_touchpad_already_addressed(
         profile,
         last_xy: IrqSafeSpinLock::new(None),
         last_button: IrqSafeSpinLock::new(false),
+        evdev_id,
+        evdev_node,
     });
     TOUCHPADS.lock().push(pad);
     Ok(())
+}
+
+/// Unregister a touchpad's evdev DeviceNode from the ROUTER.
+/// Call when the device is detached / unplugged.
+pub fn unregister_touchpad_evdev(slot_id: u8) {
+    let mut g = TOUCHPADS.lock();
+    if let Some(pos) = g.iter().position(|p| p.slot_id == slot_id) {
+        let pad = g.remove(pos);
+        ROUTER.unregister_device(pad.evdev_id);
+    }
 }
 
 /// Drain reports from every bound touchpad. Each successful poll
@@ -383,11 +410,10 @@ fn emit_events(pad: &PtpTouchpad, r: DecodedReport) -> usize {
         };
         *last = Some((c.x, c.y));
         if dx != 0 || dy != 0 {
-            push_global(InputEvent::Pointer(PointerEvent {
-                dx,
-                dy,
-                buttons,
-            }));
+            // Legacy ring.
+            push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
+            // evdev ROUTER — relative motion.
+            dispatch_rel_to_node(&pad.evdev_node, dx, dy);
             emitted += 1;
         }
     } else {
@@ -402,11 +428,15 @@ fn emit_events(pad: &PtpTouchpad, r: DecodedReport) -> usize {
         let mut last_btn = pad.last_button.lock();
         if *last_btn != r.button1 {
             *last_btn = r.button1;
+            // Legacy ring.
             push_global(InputEvent::Pointer(PointerEvent {
                 dx: 0,
                 dy: 0,
                 buttons,
             }));
+            // evdev ROUTER — button click (dx=0 dy=0 still needs a SYN_REPORT
+            // frame; dispatch_rel_to_node always appends one).
+            dispatch_rel_to_node(&pad.evdev_node, 0, 0);
             emitted += 1;
         }
     }
