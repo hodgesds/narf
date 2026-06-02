@@ -1316,3 +1316,320 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_disconnect_re_register);
+
+// ── 26. RTL8188EU register tables populated — count + first row ─────
+//
+// Wave 36 smoke. Confirms phy_tables::{MAC,BB,AGC,RF_A}_REGS_8188E
+// have the row counts from Linux v6.13's 8188e.c plus a sentinel,
+// and that the first row of each matches the Linux source exactly.
+
+fn smoke_rtl8xxxu_wave36_8188eu_tables_populated() -> TestResult {
+    use super::phy_tables::*;
+    if MAC_REGS_8188E.len() != 93 {
+        return TestResult::Fail("MAC table length != 93 (92 + sentinel)");
+    }
+    if BB_REGS_8188E.len() != 193 {
+        return TestResult::Fail("BB table length != 193 (192 + sentinel)");
+    }
+    if AGC_REGS_8188E.len() != 131 {
+        return TestResult::Fail("AGC table length != 131 (130 + sentinel)");
+    }
+    if RF_A_REGS_8188E.len() != 96 {
+        return TestResult::Fail("RF-A table length != 96 (95 + sentinel)");
+    }
+    if !MAC_REGS_8188E.last().unwrap().is_sentinel() {
+        return TestResult::Fail("MAC table last row not sentinel");
+    }
+    if !RF_A_REGS_8188E.last().unwrap().is_sentinel() {
+        return TestResult::Fail("RF-A table last row not sentinel");
+    }
+    if MAC_REGS_8188E[0].reg != 0x026 || MAC_REGS_8188E[0].val != 0x41 {
+        return TestResult::Fail("MAC first row mismatch");
+    }
+    if BB_REGS_8188E[0].reg != 0x800 || BB_REGS_8188E[0].val != 0x80040000 {
+        return TestResult::Fail("BB first row mismatch");
+    }
+    if AGC_REGS_8188E[0].reg != 0xc78 || AGC_REGS_8188E[0].val != 0xfb000001 {
+        return TestResult::Fail("AGC first row mismatch");
+    }
+    if RF_A_REGS_8188E[0].reg != 0x00 || RF_A_REGS_8188E[0].val != 0x00030000 {
+        return TestResult::Fail("RF-A first row mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_8188eu_tables_populated);
+
+// ── 27. MAC init drives N_MAC_ROWS writes on FakeUsbTransport ───────
+
+fn smoke_rtl8xxxu_wave36_init_mac_via_fake() -> TestResult {
+    use super::usb::{FakeUsbTransport, FakeOp, Rtl8xxxuTransport};
+    let t = FakeUsbTransport::new();
+    let mut n = 0usize;
+    let _ = super::rtl8188e::init_mac(|r, v| {
+        let _ = t.write8(r, v);
+        n += 1;
+    });
+    if n != super::rtl8188e::N_MAC_ROWS {
+        return TestResult::Fail("init_mac count != N_MAC_ROWS");
+    }
+    let log = t.log();
+    if log.len() != n {
+        return TestResult::Fail("FakeUsbTransport log mismatch");
+    }
+    // First op must match the first row of MAC_REGS_8188E.
+    match log[0] {
+        FakeOp::Write8(0x026, 0x41) => {}
+        _ => return TestResult::Fail("MAC first log op != (0x026, 0x41)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_init_mac_via_fake);
+
+// ── 28. PHY+AGC init drives 322 write32 calls in order ─────────────
+
+fn smoke_rtl8xxxu_wave36_init_phy_via_fake() -> TestResult {
+    use super::usb::{FakeUsbTransport, FakeOp, Rtl8xxxuTransport};
+    let t = FakeUsbTransport::new();
+    let mut n = 0usize;
+    let _ = super::rtl8188e::init_phy(|r, v| {
+        let _ = t.write32(r, v);
+        n += 1;
+    });
+    let expected = super::rtl8188e::N_PHY_ROWS + super::rtl8188e::N_AGC_ROWS;
+    if n != expected {
+        return TestResult::Fail("init_phy count != N_PHY + N_AGC");
+    }
+    // First log op should be BB[0] = (0x800, 0x80040000).
+    match t.log()[0] {
+        FakeOp::Write32(0x800, 0x80040000) => {}
+        _ => return TestResult::Fail("PHY first log op != BB[0]"),
+    }
+    // The first AGC row sits at index N_PHY_ROWS — it's (0xc78, 0xfb000001).
+    match t.log()[super::rtl8188e::N_PHY_ROWS] {
+        FakeOp::Write32(0xc78, 0xfb000001) => {}
+        _ => return TestResult::Fail("AGC[0] not at expected log index"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_init_phy_via_fake);
+
+// ── 29. RF init drives 95 RF-A writes ───────────────────────────────
+
+fn smoke_rtl8xxxu_wave36_init_rf_via_fake() -> TestResult {
+    use super::usb::{FakeUsbTransport, Rtl8xxxuTransport};
+    let t = FakeUsbTransport::new();
+    let mut n = 0usize;
+    let _ = super::rtl8188e::init_rf(|addr, val| {
+        let lssi = super::phy::lssi_encode(addr, val);
+        let _ = t.write32(super::phy::REG_FPGA0_LSSI_A, lssi);
+        n += 1;
+    });
+    if n != super::rtl8188e::N_RF_A_ROWS {
+        return TestResult::Fail("init_rf count != N_RF_A_ROWS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_init_rf_via_fake);
+
+// ── 30. FW upload via bulk-OUT: 2-page synthetic blob ───────────────
+
+fn smoke_rtl8xxxu_wave36_fw_upload_bulk_out() -> TestResult {
+    use super::fw::{upload_firmware_blob, FW_BULK_OUT_EP};
+    use super::regs::RTL_FW_PAGE_SIZE;
+    use super::usb::FakeUsbTransport;
+    let t = FakeUsbTransport::new();
+    // Arm both poll-loops: CSUM after page transfer, INIT after CSUM.
+    t.arm_fw_csum_ok();
+    t.arm_fw_init_ready();
+
+    // 2 full pages = 8192 bytes (payload only — header already stripped).
+    let payload = alloc::vec![0x5Au8; 2 * RTL_FW_PAGE_SIZE];
+
+    let bytes = match upload_firmware_blob(&t, &payload) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("upload_firmware_blob returned Err"),
+    };
+    if bytes != 2 * RTL_FW_PAGE_SIZE {
+        return TestResult::Fail("bytes_xferred != 2 pages");
+    }
+    if t.bulk_out_count() != 2 {
+        return TestResult::Fail("bulk_out count != 2 for 2 pages");
+    }
+    // Verify all bulk-OUT bytes went to the FW endpoint.
+    let log = t.log();
+    for op in &log {
+        if let super::usb::FakeOp::BulkOut { ep, .. } = op {
+            if *ep != FW_BULK_OUT_EP {
+                return TestResult::Fail("bulk-OUT on wrong endpoint");
+            }
+        }
+    }
+    // The first byte of every page should be 0x5A (payload sentinel).
+    if t.bulk_out_concat().iter().any(|&b| b != 0x5A) {
+        return TestResult::Fail("page bytes corrupted in bulk-OUT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_fw_upload_bulk_out);
+
+// ── 31. RX ring: single MPDU per URB ───────────────────────────────
+
+fn smoke_rtl8xxxu_wave36_rx_single_mpdu() -> TestResult {
+    use super::rx::{build_synthetic_gen1_urb, pump_rx_buf, RxDescGen};
+    let mpdu = alloc::vec![0xAAu8; 64];
+    let urb = build_synthetic_gen1_urb(&mpdu);
+    let mut got_len = 0usize;
+    let mut got_first = 0u8;
+    let n = pump_rx_buf(RxDescGen::Gen1, &urb, |frame| {
+        got_len = frame.len();
+        got_first = frame[0];
+    });
+    if n != 1 {
+        return TestResult::Fail("pump_rx_buf yielded != 1 frame");
+    }
+    if got_len != 64 {
+        return TestResult::Fail("decoded MPDU length wrong");
+    }
+    if got_first != 0xAA {
+        return TestResult::Fail("decoded MPDU payload wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_rx_single_mpdu);
+
+// ── 32. RX ring: 3 MPDUs in one URB ─────────────────────────────────
+
+fn smoke_rtl8xxxu_wave36_rx_multi_mpdu() -> TestResult {
+    use super::rx::{build_synthetic_gen1_urb_multi, pump_rx_buf, RxDescGen};
+    let m1 = alloc::vec![0x11u8; 24];
+    let m2 = alloc::vec![0x22u8; 64];
+    let m3 = alloc::vec![0x33u8; 100];
+    let urb = build_synthetic_gen1_urb_multi(&[&m1, &m2, &m3]);
+    let mut sizes: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let n = pump_rx_buf(RxDescGen::Gen1, &urb, |frame| {
+        sizes.push(frame.len());
+    });
+    if n != 3 {
+        return TestResult::Fail("pump_rx_buf yielded != 3 frames");
+    }
+    if sizes != alloc::vec![24, 64, 100] {
+        return TestResult::Fail("decoded MPDU sizes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_rx_multi_mpdu);
+
+// ── 33. IQK calibration: 7 steps in expected order ──────────────────
+
+fn smoke_rtl8xxxu_wave36_iqk_step_order() -> TestResult {
+    use super::regs::{REG_TX_IQK_TONE_A, REG_RX_IQK_TONE_A, REG_TX_IQK_PI_A,
+                      REG_RX_IQK_PI_A, REG_IQK_AGC_RSP, REG_IQK_AGC_PTS};
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
+                   super::rtl8188e::IQK_PATH_A_STEP_COUNT];
+    let n = super::rtl8188e::build_iqk_path_a_sequence(&mut iqk);
+    if n != 7 {
+        return TestResult::Fail("IQK step count != 7");
+    }
+    let expected = [
+        (REG_TX_IQK_TONE_A, 0x10008c1fu32),
+        (REG_RX_IQK_TONE_A, 0x10008c1f),
+        (REG_TX_IQK_PI_A,   0x82140102),
+        (REG_RX_IQK_PI_A,   0x28160502),
+        (REG_IQK_AGC_RSP,   0x001028d1),
+        (REG_IQK_AGC_PTS,   0xf9000000),
+        (REG_IQK_AGC_PTS,   0xf8000000),
+    ];
+    for (i, &(r, v)) in expected.iter().enumerate() {
+        if iqk[i].reg != r || iqk[i].val != v {
+            return TestResult::Fail("IQK step value/reg mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_iqk_step_order);
+
+// ── 34. Channel set: ch 6 tune yields 1 LSSI write ───────────────────
+
+fn smoke_rtl8xxxu_wave36_channel_set_ch6() -> TestResult {
+    use super::usb::{FakeUsbTransport, FakeOp, Rtl8xxxuTransport};
+    let t = FakeUsbTransport::new();
+    let writes = super::rtl8188e::channel_set_writes_8188e(6);
+    for &(reg, val) in writes.iter() {
+        let _ = t.write32(reg, val);
+    }
+    let log = t.log();
+    if log.len() != 1 {
+        return TestResult::Fail("channel 6 should emit 1 write");
+    }
+    // The write should target REG_FPGA0_LSSI_A.
+    match log[0] {
+        FakeOp::Write32(reg, _) if reg == super::phy::REG_FPGA0_LSSI_A => {}
+        _ => return TestResult::Fail("channel 6 LSSI register wrong"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_channel_set_ch6);
+
+// ── 35. Full bring_up_8188eu against FakeUsbTransport ────────────────
+
+fn smoke_rtl8xxxu_wave36_full_bring_up() -> TestResult {
+    use super::usb::FakeUsbTransport;
+    let t = FakeUsbTransport::new();
+    // FW upload short-circuit progressions.
+    t.arm_fw_csum_ok();
+    t.arm_fw_init_ready();
+
+    // 1-page payload (4096 bytes) — minimum sensible blob.
+    let payload = alloc::vec![0u8; super::regs::RTL_FW_PAGE_SIZE];
+
+    let total = match super::bring_up_8188eu(&t, &payload, 6) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("bring_up_8188eu returned Err"),
+    };
+
+    // Expected lower bound: stage0 (3) + MAC (92) + PHY+AGC (322) +
+    // RF-A (95) + IQK (7) + LC (3) + ch-set (1) + RX-enable (1) +
+    // FW-pages (1 page = 1).
+    let expected_min = 3 + 92 + 322 + 95 + 7 + 3 + 1 + 1 + 1;
+    if total < expected_min {
+        return TestResult::Fail("bring_up write count too low");
+    }
+    // Verify at least one BulkOut happened (FW page).
+    if t.bulk_out_count() != 1 {
+        return TestResult::Fail("bring_up should emit exactly 1 bulk-OUT page");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_full_bring_up);
+
+// ── 36. bring_up rejects out-of-range channel ───────────────────────
+
+fn smoke_rtl8xxxu_wave36_bring_up_bad_channel() -> TestResult {
+    use super::usb::FakeUsbTransport;
+    use super::BringUpError;
+    let t = FakeUsbTransport::new();
+    match super::bring_up_8188eu(&t, &[], 36) {
+        Err(BringUpError::BadChannel(36)) => {}
+        Ok(_) => return TestResult::Fail("bring_up accepted ch 36 (5 GHz)"),
+        Err(_) => return TestResult::Fail("bring_up wrong error for ch 36"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_bring_up_bad_channel);
+
+// ── 37. FW upload: poll timeout when CSUM never asserts ─────────────
+
+fn smoke_rtl8xxxu_wave36_fw_upload_poll_timeout() -> TestResult {
+    use super::fw::{upload_firmware_blob, FwDlError};
+    use super::regs::RTL_FW_PAGE_SIZE;
+    use super::usb::FakeUsbTransport;
+    let t = FakeUsbTransport::new();
+    // Note: csum / init ready bits NOT armed → poll exhausts.
+    let payload = alloc::vec![0xCCu8; RTL_FW_PAGE_SIZE];
+    match upload_firmware_blob(&t, &payload) {
+        Err(FwDlError::PollTimeout) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("upload should poll-timeout without armed bits"),
+        Err(_) => TestResult::Fail("upload wrong error for CSUM timeout"),
+    }
+}
+kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_fw_upload_poll_timeout);
