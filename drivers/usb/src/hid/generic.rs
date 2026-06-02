@@ -43,8 +43,12 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use narf_input::{push_global, push_key, InputEvent, ButtonEvent, PointerEvent, ScrollEvent, AbsoluteEvent};
+use narf_input::{
+    evdev::{dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode, ROUTER},
+    push_global, push_key, InputEvent, ButtonEvent, PointerEvent, ScrollEvent, AbsoluteEvent,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::{usage_to_keycode, HidError};
@@ -79,6 +83,10 @@ pub struct GenericDevice {
     /// Previous raw report (up to `MAX_GENERIC_REPORT` bytes).
     /// Used for Array-field diff to generate press/release events.
     prev_report: IrqSafeSpinLock<[u8; MAX_GENERIC_REPORT]>,
+    /// evdev ROUTER device id — for unregister on detach.
+    pub(crate) evdev_id: DeviceId,
+    /// evdev DeviceNode — keyboard/mouse events dispatched here.
+    pub(crate) evdev_node: Arc<DeviceNode>,
 }
 
 /// Global registry of bound Generic HID interfaces.
@@ -89,12 +97,58 @@ static GENERIC_DEVICES: IrqSafeSpinLock<Vec<GenericDevice>> =
 pub static ATTACHED_GENERIC_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// Build a `DeviceCaps` set for a generic HID device by inspecting the
+/// parsed descriptor. We declare EV_KEY for any Keyboard/Consumer/Button
+/// field, and EV_REL for any relative Generic-Desktop axis field.
+/// This gives the ROUTER enough information to filter events and expose
+/// a correctly-typed device node.
+fn generic_evdev_caps(descriptor: &ReportDescriptor) -> DeviceCaps {
+    let mut caps = DeviceCaps::new();
+    for field in descriptor.fields.iter().filter(|f| f.kind == FieldKind::Input) {
+        match field.usage_page {
+            USAGE_PAGE_KEYBOARD => {
+                // Full boot-range keyboard usages.
+                for c in 1u16..=127 {
+                    caps.add_key(c);
+                }
+            }
+            USAGE_PAGE_CONSUMER => {
+                // Expose standard consumer codes.
+                for c in [
+                    key::BTN_LEFT, key::BTN_RIGHT, key::BTN_MIDDLE,
+                    // Media key placeholder range 0x70..=0x77 (volume etc.).
+                    0x71u16, 0x72, 0x73,
+                ] {
+                    caps.add_key(c);
+                }
+            }
+            USAGE_PAGE_BUTTON => {
+                // Up to 8 generic buttons.
+                for c in [key::BTN_LEFT, key::BTN_RIGHT, key::BTN_MIDDLE,
+                          key::BTN_SIDE, key::BTN_EXTRA] {
+                    caps.add_key(c);
+                }
+            }
+            USAGE_PAGE_GENERIC_DESKTOP => {
+                let is_relative = field.flags.contains(FieldFlags::RELATIVE);
+                if is_relative {
+                    caps.add_rel(rel::REL_X);
+                    caps.add_rel(rel::REL_Y);
+                }
+            }
+            _ => {}
+        }
+    }
+    caps
+}
+
 // ── Bind entry point ──────────────────────────────────────────────────
 
 /// Bind a HID interface as a Generic device. `descriptor_blob` is the
 /// raw Report Descriptor fetched by the attach dispatcher. Returns
 /// `Err(NotBootKeyboard)` if the descriptor fails to parse (so the
-/// dispatcher can skip silently).
+/// dispatcher can skip silently). Registers a DeviceNode with the
+/// evdev ROUTER so keyboard/mouse events reach `/dev/input/event<N>`.
 pub async fn try_bind_generic(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -109,12 +163,18 @@ pub async fn try_bind_generic(
         .arm_interrupt_in(slot_id, interrupt_in_dci, MAX_GENERIC_REPORT as u32)
         .map_err(HidError::Xhci)?;
 
+    // Register with the evdev ROUTER.
+    let caps = generic_evdev_caps(&descriptor);
+    let (evdev_id, evdev_node) = ROUTER.register_device(caps);
+
     let dev = GenericDevice {
         slot_id,
         interrupt_in_dci,
         interface_num,
         descriptor,
         prev_report: IrqSafeSpinLock::new([0u8; MAX_GENERIC_REPORT]),
+        evdev_id,
+        evdev_node,
     };
     {
         let mut g = GENERIC_DEVICES.lock();
@@ -130,6 +190,17 @@ pub async fn try_bind_generic(
         );
     }
     Ok(())
+}
+
+/// Unregister a generic device's evdev DeviceNode from the ROUTER.
+/// Call when the device is detached / unplugged.
+pub fn unregister_generic_evdev(slot_id: u8) {
+    let mut g = GENERIC_DEVICES.lock();
+    if let Some(pos) = g.iter().position(|d| d.slot_id == slot_id) {
+        let dev = g.remove(pos);
+        ROUTER.unregister_device(dev.evdev_id);
+        ATTACHED_GENERIC_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+    }
 }
 
 // ── Pump ─────────────────────────────────────────────────────────────
@@ -159,18 +230,18 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
         match xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
             Ok(Some(n)) => {
                 let report = &buf[..n.min(MAX_GENERIC_REPORT)];
-                // Snapshot descriptor + prev_report under lock.
-                let (desc, prev) = {
+                // Snapshot descriptor + prev_report + evdev_node under lock.
+                let (desc, prev, node) = {
                     let g = GENERIC_DEVICES.lock();
                     match g.get(idx) {
                         Some(d) => {
                             let pr = *d.prev_report.lock();
-                            (d.descriptor.clone(), pr)
+                            (d.descriptor.clone(), pr, Arc::clone(&d.evdev_node))
                         }
                         None => break,
                     }
                 };
-                total += dispatch_report(&desc, report, &prev[..n.min(MAX_GENERIC_REPORT)]);
+                total += dispatch_report(&desc, report, &prev[..n.min(MAX_GENERIC_REPORT)], &node);
                 // Update prev_report.
                 {
                     let g = GENERIC_DEVICES.lock();
@@ -232,10 +303,17 @@ fn extract_field_value(report: &[u8], bit_offset: u32, size_bits: u32, logical_m
 }
 
 /// Dispatch one incoming report against the parsed descriptor, emitting
-/// input events for each non-padding field. Returns event count.
+/// input events for each non-padding field to both the legacy global
+/// ring and the evdev ROUTER DeviceNode. Returns event count.
 ///
 /// Mirrors `hid-input.c::hidinput_hid_event` per-page dispatch.
-pub fn dispatch_report(desc: &ReportDescriptor, report: &[u8], prev: &[u8]) -> usize {
+/// `node` receives keyboard/pointer events for ROUTER delivery.
+pub fn dispatch_report(
+    desc: &ReportDescriptor,
+    report: &[u8],
+    prev: &[u8],
+    node: &DeviceNode,
+) -> usize {
     let mut emitted = 0usize;
 
     // If the descriptor uses report IDs, the first byte is the report ID.
@@ -259,13 +337,13 @@ pub fn dispatch_report(desc: &ReportDescriptor, report: &[u8], prev: &[u8]) -> u
             && f.report_id == report_id
             && !f.flags.contains(FieldFlags::CONSTANT)
     }) {
-        emitted += dispatch_field(field, payload, prev_payload);
+        emitted += dispatch_field(field, payload, prev_payload, node);
     }
     emitted
 }
 
 /// Dispatch one field's events. Returns count.
-fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8]) -> usize {
+fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8], node: &DeviceNode) -> usize {
     let mut emitted = 0;
     let is_variable = field.flags.contains(FieldFlags::VARIABLE);
     let is_relative = field.flags.contains(FieldFlags::RELATIVE);
@@ -289,7 +367,7 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8]) -> usize {
                 continue;
             };
 
-            emitted += dispatch_usage_value(field.usage_page, usage_id, val, is_relative);
+            emitted += dispatch_usage_value(field.usage_page, usage_id, val, is_relative, node);
         }
     } else {
         // Array fields: each non-zero element is a currently-pressed usage id.
@@ -308,27 +386,31 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8]) -> usize {
         // Releases: in prev but not in cur.
         for &pu in &prev_usages {
             if !cur_usages.iter().any(|&c| c == pu) {
-                emitted += dispatch_array_usage(field.usage_page, pu, false);
+                emitted += dispatch_array_usage(field.usage_page, pu, false, node);
             }
         }
         // Presses: in cur but not in prev.
         for &cu in &cur_usages {
             if !prev_usages.iter().any(|&p| p == cu) {
-                emitted += dispatch_array_usage(field.usage_page, cu, true);
+                emitted += dispatch_array_usage(field.usage_page, cu, true, node);
             }
         }
     }
     emitted
 }
 
-/// Dispatch a variable-field value to the appropriate input event sink.
-fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool) -> usize {
+/// Dispatch a variable-field value to both the legacy global ring and
+/// the evdev ROUTER DeviceNode.
+fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool, node: &DeviceNode) -> usize {
     match page {
         USAGE_PAGE_KEYBOARD => {
             // Keyboard page: bit-per-key (modifier byte style).
             // Val=1 → press, val=0 → release.
             let code = usage_to_keycode(usage as u8);
+            // Legacy ring.
             push_key(code, val != 0);
+            // evdev ROUTER.
+            dispatch_key_to_node(node, code as u16, val != 0);
             1
         }
         USAGE_PAGE_GENERIC_DESKTOP => {
@@ -339,10 +421,13 @@ fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool) -> usiz
                         else { (0, 0) };
                     if usage == GD_X || usage == GD_Y {
                         use narf_input::PointerButtons;
+                        // Legacy ring.
                         push_global(InputEvent::Pointer(PointerEvent {
                             dx, dy,
                             buttons: PointerButtons::EMPTY,
                         }));
+                        // evdev ROUTER.
+                        dispatch_rel_to_node(node, dx, dy);
                     } else {
                         push_global(InputEvent::Scroll(ScrollEvent { dx: val, dy: 0 }));
                     }
@@ -353,7 +438,7 @@ fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool) -> usiz
                     1
                 }
                 _ => {
-                    // Unknown GD usage: emit as Absolute axis.
+                    // Unknown GD usage: emit as Absolute axis (legacy only).
                     push_global(InputEvent::Absolute(AbsoluteEvent {
                         axis: usage,
                         value: val,
@@ -374,7 +459,10 @@ fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool) -> usiz
             let kc = consumer_usage_to_keycode(usage as u16);
             use narf_input::KeyCode;
             if kc != KeyCode::Unknown {
+                // Legacy ring.
                 push_key(kc, val != 0);
+                // evdev ROUTER.
+                dispatch_key_to_node(node, kc as u16, val != 0);
                 1
             } else {
                 // Raw fallback for unknown consumer codes.
@@ -386,7 +474,7 @@ fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool) -> usiz
             }
         }
         _ => {
-            // Unknown usage page: raw delivery via ButtonEvent.
+            // Unknown usage page: raw delivery via ButtonEvent (legacy only).
             push_global(InputEvent::Button(ButtonEvent {
                 code: usage,
                 pressed: val != 0,
@@ -396,18 +484,26 @@ fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool) -> usiz
     }
 }
 
-/// Dispatch an Array-field usage (press or release).
-fn dispatch_array_usage(page: u16, usage: u32, pressed: bool) -> usize {
+/// Dispatch an Array-field usage (press or release) to both legacy ring
+/// and evdev ROUTER DeviceNode.
+fn dispatch_array_usage(page: u16, usage: u32, pressed: bool, node: &DeviceNode) -> usize {
     match page {
         USAGE_PAGE_KEYBOARD if usage <= 0xFF => {
-            push_key(usage_to_keycode(usage as u8), pressed);
+            let kc = usage_to_keycode(usage as u8);
+            // Legacy ring.
+            push_key(kc, pressed);
+            // evdev ROUTER.
+            dispatch_key_to_node(node, kc as u16, pressed);
             1
         }
         USAGE_PAGE_CONSUMER => {
             let kc = consumer_usage_to_keycode(usage as u16);
             use narf_input::KeyCode;
             if kc != KeyCode::Unknown {
+                // Legacy ring.
                 push_key(kc, pressed);
+                // evdev ROUTER.
+                dispatch_key_to_node(node, kc as u16, pressed);
                 1
             } else {
                 push_global(InputEvent::Button(ButtonEvent {
@@ -418,7 +514,7 @@ fn dispatch_array_usage(page: u16, usage: u32, pressed: bool) -> usize {
             }
         }
         _ => {
-            // Unknown usage: raw fallback.
+            // Unknown usage: raw fallback (legacy only).
             push_global(InputEvent::Button(ButtonEvent {
                 code: usage as u16,
                 pressed,
@@ -440,6 +536,7 @@ pub fn __reset_generic_devices_for_test() {
 pub(crate) mod tests {
     use super::*;
     use narf_input::{
+        evdev::ROUTER,
         pop_key, pop_button, pop_pointer, pop_scroll,
         __reset_global_ring_for_test, init_global_ring, KeyCode,
     };
@@ -478,6 +575,13 @@ pub(crate) mod tests {
         0xC0,       // End Collection (Application)
     ];
 
+    /// Allocate a throw-away DeviceNode for unit tests that call
+    /// `dispatch_report` directly (no real device registration needed).
+    fn make_test_node() -> Arc<DeviceNode> {
+        let (_id, node) = ROUTER.register_device(DeviceCaps::new());
+        node
+    }
+
     // ── Test 1: Generic Desktop dispatch table ────────────────────────
 
     fn smoke_generic_gd_dispatch() -> TestResult {
@@ -492,9 +596,10 @@ pub(crate) mod tests {
         // Byte 1: X = 10 = 0x0A.
         // Byte 2: Y = -5 = 0xFB (i8).
         // Byte 3: Wheel = 1 = 0x01.
+        let node = make_test_node();
         let report: &[u8] = &[0x00, 0x0A, 0xFB, 0x01];
         let prev: &[u8] = &[0x00, 0x00, 0x00, 0x00];
-        let n = dispatch_report(&desc, report, prev);
+        let n = dispatch_report(&desc, report, prev, &node);
         if n == 0 {
             return TestResult::Fail("expected at least 1 event from mouse report");
         }
@@ -545,9 +650,10 @@ pub(crate) mod tests {
         ];
         let desc = parse(vendor_desc).expect("vendor parse failed");
         // Report: byte 0 = 0x01 (bit 0 set = vendor usage pressed).
+        let node = make_test_node();
         let report: &[u8] = &[0x01];
         let prev: &[u8] = &[0x00];
-        let n = dispatch_report(&desc, report, prev);
+        let n = dispatch_report(&desc, report, prev, &node);
         // Should emit at least 1 raw ButtonEvent.
         if n == 0 {
             return TestResult::Fail("expected fallback event for vendor usage");
@@ -585,9 +691,10 @@ pub(crate) mod tests {
             0xC0,       // End Collection
         ];
         let desc = parse(consumer_desc).expect("consumer parse failed");
+        let node = make_test_node();
         let report: &[u8] = &[0x01]; // Volume Up pressed
         let prev: &[u8] = &[0x00];
-        let n = dispatch_report(&desc, report, prev);
+        let n = dispatch_report(&desc, report, prev, &node);
         if n == 0 {
             return TestResult::Fail("expected event from consumer volume-up");
         }
@@ -622,10 +729,11 @@ pub(crate) mod tests {
             0xC0,       // End Collection
         ];
         let desc = parse(kbd_desc).expect("kbd parse failed");
+        let node = make_test_node();
         // Report with Enter pressed (usage 0x28).
         let cur: &[u8] = &[0x28, 0x00, 0x00, 0x00, 0x00, 0x00];
         let prev: &[u8] = &[0x00; 6];
-        let n = dispatch_report(&desc, cur, prev);
+        let n = dispatch_report(&desc, cur, prev, &node);
         if n == 0 {
             return TestResult::Fail("expected key event from keyboard array report");
         }
@@ -645,10 +753,11 @@ pub(crate) mod tests {
         narf_input::__reset_modifiers_for_test();
 
         let desc = parse(MOUSE_DESC).expect("mouse parse failed");
+        let node = make_test_node();
         // Left button (bit 0) pressed: byte 0 = 0x01.
         let report: &[u8] = &[0x01, 0x00, 0x00, 0x00];
         let prev: &[u8] = &[0x00, 0x00, 0x00, 0x00];
-        let n = dispatch_report(&desc, report, prev);
+        let n = dispatch_report(&desc, report, prev, &node);
         if n == 0 {
             return TestResult::Fail("expected button event");
         }
