@@ -39,10 +39,12 @@
 #![allow(dead_code)]
 
 pub mod field;
+pub mod hash_to_curve;
 pub mod point;
 pub mod scalar;
 
 pub use field::Fp;
+pub use hash_to_curve::{p256_encode_to_curve, p256_hash_to_curve};
 pub use point::{AffinePoint, ProjectivePoint};
 pub use scalar::Scalar;
 
