@@ -77,6 +77,14 @@ pub struct DrmCardEntry {
     pub index: u32,
     /// The card object.
     pub card: Arc<dyn DrmCard>,
+    /// Per-card mode-setting state (CRTCs / connectors / encoders /
+    /// framebuffers / GEM objects). The ioctl layer takes the spin-
+    /// lock for the duration of a single DRM_IOCTL_* dispatch.
+    ///
+    /// Optional because the registry is also used by drivers that
+    /// haven't yet built a `drm::card::Card` (early bring-up). The
+    /// DRM ioctl path returns ENOTSUP for those cards.
+    pub mode_state: Option<Arc<IrqSafeSpinLock<crate::drm::card::Card>>>,
 }
 
 impl core::fmt::Debug for DrmCardEntry {
@@ -93,14 +101,54 @@ static REGISTRY: IrqSafeSpinLock<Vec<DrmCardEntry>> = IrqSafeSpinLock::new(Vec::
 /// Register a DRM card and return its assigned index.
 ///
 /// The card index is determined by the current registry length
-/// (registration order).
+/// (registration order). The mode-setting state is left at `None` —
+/// drivers that need ioctl dispatch call `attach_mode_state` after.
 ///
 /// Linux ref: `drm_dev_register` (drivers/gpu/drm/drm_drv.c).
 pub fn register_drm_card(card: Arc<dyn DrmCard>) -> u32 {
     let mut g = REGISTRY.lock();
     let index = g.len() as u32;
-    g.push(DrmCardEntry { index, card });
+    g.push(DrmCardEntry { index, card, mode_state: None });
     index
+}
+
+/// Register a DRM card with its mode-setting state in one go.
+///
+/// Callers that have already built a `drm::card::Card` (with CRTCs,
+/// connectors, encoders enumerated) pass it here so DRM_IOCTL_*
+/// dispatch works against this card from the moment of registration.
+pub fn register_drm_card_with_state(
+    card: Arc<dyn DrmCard>,
+    mode_state: crate::drm::card::Card,
+) -> u32 {
+    let mut g = REGISTRY.lock();
+    let index = g.len() as u32;
+    g.push(DrmCardEntry {
+        index,
+        card,
+        mode_state: Some(Arc::new(IrqSafeSpinLock::new(mode_state))),
+    });
+    index
+}
+
+/// Attach (or replace) the mode-setting state for a previously
+/// registered card. Returns `true` on success, `false` if `index`
+/// is out of range.
+pub fn attach_mode_state(index: u32, mode_state: crate::drm::card::Card) -> bool {
+    let mut g = REGISTRY.lock();
+    if let Some(entry) = g.get_mut(index as usize) {
+        entry.mode_state = Some(Arc::new(IrqSafeSpinLock::new(mode_state)));
+        true
+    } else {
+        false
+    }
+}
+
+/// Look up the mode-setting state Arc for a card index. Cheap clone
+/// of an `Arc`; the caller holds the spin-lock only for the duration
+/// of one ioctl dispatch.
+pub fn mode_state(index: u32) -> Option<Arc<IrqSafeSpinLock<crate::drm::card::Card>>> {
+    REGISTRY.lock().get(index as usize).and_then(|e| e.mode_state.clone())
 }
 
 /// Return a snapshot of all registered cards (clones the Arc pointers;

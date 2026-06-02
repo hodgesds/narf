@@ -116,6 +116,8 @@ pub mod drm;
 pub mod drm_registry;
 pub mod drm_sysfs_bridge;
 pub mod drm_devfs_bridge;
+pub mod drm_uapi;
+pub mod drm_ioctl_bridge;
 pub mod amdgpu;
 pub mod amdgpu_atom_dcn;
 pub mod backlight;
