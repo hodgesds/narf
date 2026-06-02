@@ -718,4 +718,502 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_multi_monitor_enumerate_independent_modesets);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// DRM Registry + sysfs bridge + devfs bridge smoke tests
+//
+// These cover the full stack introduced in Wave 35:
+//   register_drm_card → /sys/class/drm/card<N>/ attrs + /dev/dri/ entries.
+//
+// Linux references (GPL-2.0-or-later):
+//   - `linux/drivers/gpu/drm/drm_sysfs.c::dev_show`
+//   - `linux/drivers/gpu/drm/drm_drv.c::drm_dev_register`
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Shared FakeDrmCard ────────────────────────────────────────────────────
+
+struct FakeDrmCard {
+    name_str: alloc::string::String,
+    driver_str: &'static str,
+    vid: u16,
+    did: u16,
+}
+
+impl crate::drm_registry::DrmCard for FakeDrmCard {
+    fn name(&self) -> &str { &self.name_str }
+    fn driver(&self) -> &str { self.driver_str }
+    fn vendor_id(&self) -> u16 { self.vid }
+    fn device_id(&self) -> u16 { self.did }
+    fn subsystem_vendor(&self) -> u16 { 0x0000 }
+    fn subsystem_device(&self) -> u16 { 0x0000 }
+    fn vbios_version(&self) -> Option<&str> { Some("FAKE-BIOS-1.0") }
+    fn gpu_busy_percent(&self) -> Option<u32> { Some(42) }
+    fn power_state(&self) -> &str { "D0" }
+}
+
+impl core::fmt::Debug for FakeDrmCard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FakeDrmCard")
+            .field("name", &self.name_str)
+            .finish_non_exhaustive()
+    }
+}
+
+// ── Smoke 11: register one FakeDrmCard → count == 1 ──────────────────────
+
+fn smoke_drm_registry_register_one_card() -> TestResult {
+    use crate::drm_registry;
+    drm_registry::__reset_for_test();
+
+    let card = alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    });
+    let idx = drm_registry::register_drm_card(card);
+
+    if idx != 0 {
+        return TestResult::Fail("first card should get index 0");
+    }
+    if drm_registry::count() != 1 {
+        return TestResult::Fail("count should be 1 after one registration");
+    }
+
+    drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_registry_register_one_card);
+
+// ── Smoke 12: /sys/class/drm/card0/name → "card0\n" ─────────────────────
+
+fn smoke_drm_sysfs_name_attr() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    let card = alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    });
+    drm_registry::register_drm_card(card);
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let root = sysfs::sysfs_root();
+    let class = match root.get_child("class") {
+        Some(c) => c,
+        None => return TestResult::Fail("/sys/class missing"),
+    };
+    let drm = match class.get_child("drm") {
+        Some(d) => d,
+        None => return TestResult::Fail("/sys/class/drm missing"),
+    };
+    let card0 = match drm.get_child("card0") {
+        Some(c) => c,
+        None => return TestResult::Fail("/sys/class/drm/card0 missing"),
+    };
+
+    match card0.attr_show("name") {
+        Some(v) if v == "card0\n" => {}
+        Some(_) => return TestResult::Fail("name attr wrong value"),
+        None => return TestResult::Fail("name attr missing"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_name_attr);
+
+// ── Smoke 13: /sys/class/drm/card0/dev → "226:0\n" ───────────────────────
+
+fn smoke_drm_sysfs_dev_attr() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let root = sysfs::sysfs_root();
+    let card0 = root.get_child("class")
+        .and_then(|c| c.get_child("drm"))
+        .and_then(|d| d.get_child("card0"));
+    let card0 = match card0 {
+        Some(k) => k,
+        None => return TestResult::Fail("card0 kobject missing"),
+    };
+
+    match card0.attr_show("dev") {
+        Some(v) if v == "226:0\n" => {}
+        Some(v) => return TestResult::Fail("dev attr wrong value"),
+        None => return TestResult::Fail("dev attr missing"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_dev_attr);
+
+// ── Smoke 14: /sys/class/drm/card0/device/vendor → "0x1002\n" ────────────
+
+fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "amdgpu",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let root = sysfs::sysfs_root();
+    let device_kobj = root.get_child("class")
+        .and_then(|c| c.get_child("drm"))
+        .and_then(|d| d.get_child("card0"))
+        .and_then(|c| c.get_child("device"));
+    let device_kobj = match device_kobj {
+        Some(k) => k,
+        None => return TestResult::Fail("card0/device kobject missing"),
+    };
+
+    match device_kobj.attr_show("vendor") {
+        Some(v) if v == "0x1002\n" => {}
+        Some(v) => return TestResult::Fail("vendor attr wrong value"),
+        None => return TestResult::Fail("vendor attr missing"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_vendor_attr);
+
+// ── Smoke 15: /sys/class/drm/card0/device/device → "0x1636\n" for Renoir ─
+
+fn smoke_drm_sysfs_device_id_attr() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "amdgpu",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let root = sysfs::sysfs_root();
+    let device_kobj = root.get_child("class")
+        .and_then(|c| c.get_child("drm"))
+        .and_then(|d| d.get_child("card0"))
+        .and_then(|c| c.get_child("device"));
+    let device_kobj = match device_kobj {
+        Some(k) => k,
+        None => return TestResult::Fail("card0/device kobject missing"),
+    };
+
+    match device_kobj.attr_show("device") {
+        Some(v) if v == "0x1636\n" => {}
+        Some(v) => return TestResult::Fail("device attr wrong value"),
+        None => return TestResult::Fail("device attr missing"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_id_attr);
+
+// ── Smoke 16: vbios_version attr readable ─────────────────────────────────
+
+fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let root = sysfs::sysfs_root();
+    let card0 = root.get_child("class")
+        .and_then(|c| c.get_child("drm"))
+        .and_then(|d| d.get_child("card0"));
+    let card0 = match card0 {
+        Some(k) => k,
+        None => return TestResult::Fail("card0 kobject missing"),
+    };
+
+    // FakeDrmCard returns Some("FAKE-BIOS-1.0"), so vbios_version must be present.
+    match card0.attr_show("vbios_version") {
+        Some(v) if v.contains("FAKE-BIOS-1.0") => {}
+        Some(v) => return TestResult::Fail("vbios_version wrong content"),
+        None => return TestResult::Fail("vbios_version attr missing"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_vbios_version_attr);
+
+// ── Smoke 17: renderD128/dev → "226:128\n" ────────────────────────────────
+
+fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let root = sysfs::sysfs_root();
+    let render128 = root.get_child("class")
+        .and_then(|c| c.get_child("drm"))
+        .and_then(|d| d.get_child("renderD128"));
+    let render128 = match render128 {
+        Some(k) => k,
+        None => return TestResult::Fail("renderD128 kobject missing"),
+    };
+
+    match render128.attr_show("dev") {
+        Some(v) if v == "226:128\n" => {}
+        Some(v) => return TestResult::Fail("renderD128 dev attr wrong value"),
+        None => return TestResult::Fail("renderD128 dev attr missing"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_render_node_dev_attr);
+
+// ── Smoke 18: /dev/dri/card0 resolves through DriDir ─────────────────────
+
+fn smoke_devdri_card0_resolves() -> TestResult {
+    use crate::drm_registry;
+    use crate::drm_devfs_bridge::DriDir;
+    use narf_filesystem::DirOps;
+
+    drm_registry::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+
+    let dir = DriDir;
+    match dir.lookup("card0") {
+        Some(_) => {}
+        None => return TestResult::Fail("/dev/dri/card0 not found via DriDir::lookup"),
+    }
+
+    drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_devdri_card0_resolves);
+
+// ── Smoke 19: /dev/dri/renderD128 resolves ────────────────────────────────
+
+fn smoke_devdri_render128_resolves() -> TestResult {
+    use crate::drm_registry;
+    use crate::drm_devfs_bridge::DriDir;
+    use narf_filesystem::DirOps;
+
+    drm_registry::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+
+    let dir = DriDir;
+    match dir.lookup("renderD128") {
+        Some(_) => {}
+        None => return TestResult::Fail("/dev/dri/renderD128 not found via DriDir::lookup"),
+    }
+
+    drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_devdri_render128_resolves);
+
+// ── Smoke 20: bochs probe → BochsCard registers ───────────────────────────
+
+fn smoke_bochs_probe_registers_drm_card() -> TestResult {
+    use crate::drm_registry;
+    use narf_graphics_driver::bochs;
+
+    if !bochs::is_probed() {
+        return TestResult::Skip("bochs-display not present");
+    }
+
+    // On a system where bochs is probed, the Stage::Device initcall
+    // `"bochs-drm-card"` should have registered at least one card.
+    // Since tests may run before initcalls, check count via a direct probe-path
+    // registration here (mimicking what the initcall does).
+    let pre_count = drm_registry::count();
+    // Register a BochsCard to simulate what the initcall does.
+    let card_name = alloc::format!("card{}", pre_count);
+    let card = crate::drm_devfs_bridge::BochsCard::new(card_name);
+    drm_registry::register_drm_card(alloc::sync::Arc::new(card));
+
+    if drm_registry::count() != pre_count + 1 {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("BochsCard registration did not increment count");
+    }
+
+    // Verify the driver name is "bochs".
+    let cards = drm_registry::cards();
+    let last = cards.last().unwrap();
+    if last.driver() != "bochs" {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("BochsCard driver() != 'bochs'");
+    }
+
+    drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_bochs_probe_registers_drm_card);
+
+// ── Smoke 21: AMDGPU Renoir probe → AmdgpuCard with correct vendor/device ─
+
+fn smoke_amdgpu_renoir_registers_drm_card() -> TestResult {
+    use crate::drm_registry;
+    use crate::drm_devfs_bridge::AmdgpuCard;
+    use crate::amdgpu::{AMD_VENDOR, RENOIR};
+
+    let pre_count = drm_registry::count();
+    let card_name = alloc::format!("card{}", pre_count);
+    let card = AmdgpuCard::new(card_name, AMD_VENDOR, RENOIR, 0, 0, None);
+    drm_registry::register_drm_card(alloc::sync::Arc::new(card));
+
+    let cards = drm_registry::cards();
+    let added = match cards.last() {
+        Some(c) => c.clone(),
+        None => {
+            drm_registry::__reset_for_test();
+            return TestResult::Fail("no card after register");
+        }
+    };
+
+    if added.vendor_id() != AMD_VENDOR {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("vendor_id != AMD_VENDOR");
+    }
+    if added.device_id() != RENOIR {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("device_id != RENOIR (0x1636)");
+    }
+    if added.driver() != "amdgpu" {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("driver() != 'amdgpu'");
+    }
+
+    drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_renoir_registers_drm_card);
+
+// ── Smoke 22: two cards → card0+card1 + renderD128+renderD129 in DriDir ───
+
+fn smoke_drm_two_cards_enumerate() -> TestResult {
+    use crate::drm_registry;
+    use crate::drm_devfs_bridge::{AmdgpuCard, BochsCard, DriDir};
+    use narf_filesystem::DirOps;
+    use crate::amdgpu::{AMD_VENDOR, RENOIR};
+
+    drm_registry::__reset_for_test();
+
+    // Register bochs as card0, AMDGPU as card1.
+    drm_registry::register_drm_card(alloc::sync::Arc::new(
+        BochsCard::new("card0".into())
+    ));
+    drm_registry::register_drm_card(alloc::sync::Arc::new(
+        AmdgpuCard::new("card1".into(), AMD_VENDOR, RENOIR, 0, 0, None)
+    ));
+
+    let dir = DriDir;
+
+    // Both card nodes must resolve.
+    if dir.lookup("card0").is_none() {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("card0 missing");
+    }
+    if dir.lookup("card1").is_none() {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("card1 missing");
+    }
+    // Both render nodes must resolve.
+    if dir.lookup("renderD128").is_none() {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("renderD128 missing");
+    }
+    if dir.lookup("renderD129").is_none() {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("renderD129 missing");
+    }
+
+    // Enumerate should list all 4 entries.
+    let entries = dir.enumerate(0, 100);
+    let names: alloc::vec::Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    if !names.contains(&"card0") {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("enumerate missing card0");
+    }
+    if !names.contains(&"card1") {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("enumerate missing card1");
+    }
+    if !names.contains(&"renderD128") {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("enumerate missing renderD128");
+    }
+    if !names.contains(&"renderD129") {
+        drm_registry::__reset_for_test();
+        return TestResult::Fail("enumerate missing renderD129");
+    }
+
+    drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_two_cards_enumerate);
+
 extern crate alloc;
