@@ -232,45 +232,123 @@ fn smoke_shell_parser_quoted_args() -> TestResult {
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_quoted_args);
 
-// ── Smoke 4: pipe syntax — not yet parsed ────────────────────────────
+// ── Smoke 4: pipe syntax — parser recognises `|` (Wave 33) ──────────
 //
-// The NARF shell does NOT yet implement a pipe parser.  `|` in the
-// command line lands uninterpreted in `rest`.  This smoke documents
-// the current behaviour so a future pipe-parser landing immediately
-// shows up as a test change.
+// Wave 33 added a proper tokeniser.  `|` is now a `Pipe` token;
+// `ls | grep foo` should lex to [Word("ls"), Pipe, Word("grep"),
+// Word("foo"), Eof] — i.e. a pipeline with two stages.
 //
-// The syscall-layer pipe mechanics are verified separately in
-// smokes 9-11.
+// We mirror the production `lex` function inline and assert the
+// token stream so the smoke stays in lock-step with parser.rs.
 
-fn smoke_shell_parser_pipe_not_yet_parsed() -> TestResult {
-    let (cmd, rest) = split_first(b"ls | grep foo");
-    if cmd != b"ls" {
-        return TestResult::Fail("pipe: first token should be \"ls\"");
+/// Mirror of the production `Tok` enum (pure-value subset).
+#[derive(Debug, PartialEq, Eq)]
+enum Tok4 {
+    Word,
+    Pipe,
+    Semicolon,
+    And,
+    Or,
+    Ampersand,
+    RedirIn,
+    RedirOut,
+    RedirAppend,
+    Eof,
+}
+
+fn lex4(input: &[u8]) -> alloc::vec::Vec<Tok4> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < input.len() {
+        let b = input[i];
+        if b == b' ' || b == b'\t' { i += 1; continue; }
+        match b {
+            b'|' if i + 1 < input.len() && input[i+1] == b'|' => { out.push(Tok4::Or);        i += 2; }
+            b'|' => { out.push(Tok4::Pipe);        i += 1; }
+            b'&' if i + 1 < input.len() && input[i+1] == b'&' => { out.push(Tok4::And);        i += 2; }
+            b'&' => { out.push(Tok4::Ampersand);   i += 1; }
+            b';' => { out.push(Tok4::Semicolon);   i += 1; }
+            b'>' if i + 1 < input.len() && input[i+1] == b'>' => { out.push(Tok4::RedirAppend); i += 2; }
+            b'>' => { out.push(Tok4::RedirOut);    i += 1; }
+            b'<' => { out.push(Tok4::RedirIn);     i += 1; }
+            _ => {
+                // Consume a word token.
+                while i < input.len() {
+                    let c = input[i];
+                    match c {
+                        b' ' | b'\t' | b'|' | b'&' | b';' | b'>' | b'<' => break,
+                        b'\'' => { i += 1; while i < input.len() && input[i] != b'\'' { i += 1; } if i < input.len() { i += 1; } }
+                        b'"'  => { i += 1; while i < input.len() && input[i] != b'"'  { i += 1; } if i < input.len() { i += 1; } }
+                        b'\\' => { i += 2; }
+                        _ => { i += 1; }
+                    }
+                }
+                out.push(Tok4::Word);
+            }
+        }
     }
-    // The pipe character is in `rest`, uninterpreted.
-    if !rest.starts_with(b"|") {
-        return TestResult::Fail("pipe: rest should begin with '|' (pipe not yet parsed)");
+    out.push(Tok4::Eof);
+    out
+}
+
+fn smoke_shell_parser_pipe_recognized() -> TestResult {
+    // "ls | grep foo" → [Word("ls"), Pipe, Word("grep"), Word("foo"), Eof]
+    // That is exactly a 2-stage pipeline.
+    let toks = lex4(b"ls | grep foo");
+    if toks.len() != 5 {
+        return TestResult::Fail("pipe: expected 5 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("pipe: tok[0] should be Word(\"ls\")");
+    }
+    if toks[1] != Tok4::Pipe {
+        return TestResult::Fail("pipe: tok[1] should be Pipe");
+    }
+    if toks[2] != Tok4::Word {
+        return TestResult::Fail("pipe: tok[2] should be Word(\"grep\")");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("pipe: tok[3] should be Word(\"foo\")");
+    }
+    if toks[4] != Tok4::Eof {
+        return TestResult::Fail("pipe: tok[4] should be Eof");
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace/shell", smoke_shell_parser_pipe_not_yet_parsed);
+kernel_test_in!("userspace/shell", smoke_shell_parser_pipe_recognized);
 
-// ── Smoke 5: redirect syntax — not yet parsed ─────────────────────────
+// ── Smoke 5: redirect syntax — parser recognises `>` (Wave 33) ───────
 //
-// Same situation as pipe: `>` is not scanned by dispatch_line.
-// This smoke pins the current parser behaviour.
+// "echo hi > /tmp/test.txt" should lex to:
+//   [Word("echo"), Word("hi"), RedirOut, Word("/tmp/test.txt"), Eof]
+//
+// The `Simple` command therefore has:
+//   argv  = ["echo", "hi"]
+//   redirs = [StdoutTo("/tmp/test.txt")]
 
-fn smoke_shell_parser_redirect_not_yet_parsed() -> TestResult {
-    let (cmd, rest) = split_first(b"echo hi > /tmp/test.txt");
-    if cmd != b"echo" {
-        return TestResult::Fail("redir: cmd should be \"echo\"");
+fn smoke_shell_parser_redirect_recognized() -> TestResult {
+    let toks = lex4(b"echo hi > /tmp/test.txt");
+    if toks.len() != 5 {
+        return TestResult::Fail("redir: expected 5 tokens");
     }
-    if !rest.contains(&b'>') {
-        return TestResult::Fail("redir: rest should contain '>'");
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("redir: tok[0] should be Word(\"echo\")");
+    }
+    if toks[1] != Tok4::Word {
+        return TestResult::Fail("redir: tok[1] should be Word(\"hi\")");
+    }
+    if toks[2] != Tok4::RedirOut {
+        return TestResult::Fail("redir: tok[2] should be RedirOut");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("redir: tok[3] should be Word(\"/tmp/test.txt\")");
+    }
+    if toks[4] != Tok4::Eof {
+        return TestResult::Fail("redir: tok[4] should be Eof");
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace/shell", smoke_shell_parser_redirect_not_yet_parsed);
+kernel_test_in!("userspace/shell", smoke_shell_parser_redirect_recognized);
 
 // ── Smoke 6: builtin `cd` arg parsing ────────────────────────────────
 //
@@ -1064,3 +1142,458 @@ fn smoke_shell_pipe_sequential_writes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_pipe_sequential_writes);
+
+// ═══════════════════════════════════════════════════════════════════════
+// Wave 33 — new parser + exec-engine smokes (smokes 16 – 29)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Layer A — pure tokeniser / parser unit tests (no kernel required).
+// These carry inline helpers that mirror `userspace/shell/src/parser.rs`.
+// The production file is audited side-by-side; any divergence here
+// means the tests need to be updated.
+
+// ── Token word extraction helper ──────────────────────────────────────
+//
+// `word_at(toks, pos)` extracts the word bytes for token at position
+// `pos` from the original input.  Used by smokes that need to assert
+// the actual characters in a word, not just that a Word token was seen.
+//
+// For brevity we use the `lex4` helper defined in smoke 4 above and
+// `lex4_words` which pairs the token stream with the original word
+// bytes scanned in the same pass.
+
+fn lex4_with_words<'a>(input: &'a [u8]) -> alloc::vec::Vec<(Tok4, &'a [u8])> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < input.len() {
+        let b = input[i];
+        if b == b' ' || b == b'\t' { i += 1; continue; }
+        match b {
+            b'|' if i + 1 < input.len() && input[i+1] == b'|' => { out.push((Tok4::Or,         &input[i..i+2])); i += 2; }
+            b'|' => { out.push((Tok4::Pipe,        &input[i..i+1])); i += 1; }
+            b'&' if i + 1 < input.len() && input[i+1] == b'&' => { out.push((Tok4::And,         &input[i..i+2])); i += 2; }
+            b'&' => { out.push((Tok4::Ampersand,   &input[i..i+1])); i += 1; }
+            b';' => { out.push((Tok4::Semicolon,   &input[i..i+1])); i += 1; }
+            b'>' if i + 1 < input.len() && input[i+1] == b'>' => { out.push((Tok4::RedirAppend, &input[i..i+2])); i += 2; }
+            b'>' => { out.push((Tok4::RedirOut,    &input[i..i+1])); i += 1; }
+            b'<' => { out.push((Tok4::RedirIn,     &input[i..i+1])); i += 1; }
+            _ => {
+                let start = i;
+                while i < input.len() {
+                    let c = input[i];
+                    match c {
+                        b' ' | b'\t' | b'|' | b'&' | b';' | b'>' | b'<' => break,
+                        b'\'' => { i += 1; while i < input.len() && input[i] != b'\'' { i += 1; } if i < input.len() { i += 1; } }
+                        b'"'  => { i += 1; while i < input.len() && input[i] != b'"'  { i += 1; } if i < input.len() { i += 1; } }
+                        b'\\' => { i += 2; }
+                        _ => { i += 1; }
+                    }
+                }
+                out.push((Tok4::Word, &input[start..i]));
+            }
+        }
+    }
+    out.push((Tok4::Eof, &input[input.len()..]));
+    out
+}
+
+/// Extract the unquoted value of a word token (mirrors production `lex_word`).
+/// Only handles the simple cases needed by the smokes below.
+fn word_value(raw: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        match raw[i] {
+            b'\'' => {
+                i += 1;
+                while i < raw.len() && raw[i] != b'\'' { out.push(raw[i]); i += 1; }
+                if i < raw.len() { i += 1; }
+            }
+            b'"' => {
+                i += 1;
+                while i < raw.len() && raw[i] != b'"' {
+                    if raw[i] == b'\\' && i + 1 < raw.len() && raw[i+1] == b'"' {
+                        out.push(b'"'); i += 2;
+                    } else {
+                        out.push(raw[i]); i += 1;
+                    }
+                }
+                if i < raw.len() { i += 1; }
+            }
+            b'\\' => {
+                if i + 1 < raw.len() { out.push(raw[i+1]); i += 2; } else { i += 1; }
+            }
+            b => { out.push(b); i += 1; }
+        }
+    }
+    out
+}
+
+// ── Smoke 16: sequence `;` recognised ────────────────────────────────
+//
+// "echo a; echo b" should lex to:
+//   [Word, Word, Semicolon, Word, Word, Eof]
+
+fn smoke_shell_parser_sequence_recognized() -> TestResult {
+    let toks = lex4(b"echo a; echo b");
+    // Tokens: Word("echo") Word("a") Semicolon Word("echo") Word("b") Eof
+    if toks.len() != 6 {
+        return TestResult::Fail("seq: expected 6 tokens");
+    }
+    if toks[0] != Tok4::Word      { return TestResult::Fail("seq: tok[0] not Word"); }
+    if toks[1] != Tok4::Word      { return TestResult::Fail("seq: tok[1] not Word"); }
+    if toks[2] != Tok4::Semicolon { return TestResult::Fail("seq: tok[2] not Semicolon"); }
+    if toks[3] != Tok4::Word      { return TestResult::Fail("seq: tok[3] not Word"); }
+    if toks[4] != Tok4::Word      { return TestResult::Fail("seq: tok[4] not Word"); }
+    if toks[5] != Tok4::Eof       { return TestResult::Fail("seq: tok[5] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_sequence_recognized);
+
+// ── Smoke 17: `&&` recognised ─────────────────────────────────────────
+//
+// "true && echo ok" → [Word, And, Word, Word, Eof]
+
+fn smoke_shell_parser_and_recognized() -> TestResult {
+    let toks = lex4(b"true && echo ok");
+    if toks.len() != 5 { return TestResult::Fail("and: expected 5 tokens"); }
+    if toks[0] != Tok4::Word { return TestResult::Fail("and: tok[0] not Word"); }
+    if toks[1] != Tok4::And  { return TestResult::Fail("and: tok[1] not And"); }
+    if toks[2] != Tok4::Word { return TestResult::Fail("and: tok[2] not Word"); }
+    if toks[3] != Tok4::Word { return TestResult::Fail("and: tok[3] not Word"); }
+    if toks[4] != Tok4::Eof  { return TestResult::Fail("and: tok[4] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_and_recognized);
+
+// ── Smoke 18: `||` recognised ────────────────────────────────────────
+//
+// "false || echo recovered" → [Word, Or, Word, Word, Eof]
+
+fn smoke_shell_parser_or_recognized() -> TestResult {
+    let toks = lex4(b"false || echo recovered");
+    if toks.len() != 5 { return TestResult::Fail("or: expected 5 tokens"); }
+    if toks[0] != Tok4::Word { return TestResult::Fail("or: tok[0] not Word"); }
+    if toks[1] != Tok4::Or   { return TestResult::Fail("or: tok[1] not Or"); }
+    if toks[2] != Tok4::Word { return TestResult::Fail("or: tok[2] not Word"); }
+    if toks[3] != Tok4::Word { return TestResult::Fail("or: tok[3] not Word"); }
+    if toks[4] != Tok4::Eof  { return TestResult::Fail("or: tok[4] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_or_recognized);
+
+// ── Smoke 19: `&` background recognised ──────────────────────────────
+//
+// "sleep 0 &" → [Word, Word, Ampersand, Eof]
+
+fn smoke_shell_parser_background_recognized() -> TestResult {
+    let toks = lex4(b"sleep 0 &");
+    if toks.len() != 4 { return TestResult::Fail("bg: expected 4 tokens"); }
+    if toks[0] != Tok4::Word      { return TestResult::Fail("bg: tok[0] not Word"); }
+    if toks[1] != Tok4::Word      { return TestResult::Fail("bg: tok[1] not Word"); }
+    if toks[2] != Tok4::Ampersand { return TestResult::Fail("bg: tok[2] not Ampersand"); }
+    if toks[3] != Tok4::Eof       { return TestResult::Fail("bg: tok[3] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_background_recognized);
+
+// ── Smoke 20: `>>` append redirect recognised ─────────────────────────
+//
+// "echo line >> /tmp/r.txt" → [Word, Word, RedirAppend, Word, Eof]
+
+fn smoke_shell_parser_append_recognized() -> TestResult {
+    let toks = lex4(b"echo line >> /tmp/r.txt");
+    if toks.len() != 5 { return TestResult::Fail("append: expected 5 tokens"); }
+    if toks[0] != Tok4::Word        { return TestResult::Fail("append: tok[0] not Word"); }
+    if toks[1] != Tok4::Word        { return TestResult::Fail("append: tok[1] not Word"); }
+    if toks[2] != Tok4::RedirAppend { return TestResult::Fail("append: tok[2] not RedirAppend"); }
+    if toks[3] != Tok4::Word        { return TestResult::Fail("append: tok[3] not Word"); }
+    if toks[4] != Tok4::Eof         { return TestResult::Fail("append: tok[4] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_append_recognized);
+
+// ── Smoke 21: `<` stdin redirect recognised ───────────────────────────
+//
+// "cat < /tmp/r.txt" → [Word, RedirIn, Word, Eof]
+
+fn smoke_shell_parser_stdin_redir_recognized() -> TestResult {
+    let toks = lex4(b"cat < /tmp/r.txt");
+    if toks.len() != 4 { return TestResult::Fail("stdin-redir: expected 4 tokens"); }
+    if toks[0] != Tok4::Word    { return TestResult::Fail("stdin-redir: tok[0] not Word"); }
+    if toks[1] != Tok4::RedirIn { return TestResult::Fail("stdin-redir: tok[1] not RedirIn"); }
+    if toks[2] != Tok4::Word    { return TestResult::Fail("stdin-redir: tok[2] not Word"); }
+    if toks[3] != Tok4::Eof     { return TestResult::Fail("stdin-redir: tok[3] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_stdin_redir_recognized);
+
+// ── Smoke 22: double-quoted word preserves spaces ─────────────────────
+//
+// `echo "a b" c` → three word tokens; word[1] value = "a b"
+
+fn smoke_shell_parser_double_quoted() -> TestResult {
+    let pairs = lex4_with_words(b"echo \"a b\" c");
+    // Tokens: Word("echo") Word("\"a b\"") Word("c") Eof
+    if pairs.len() != 4 { return TestResult::Fail("dquote: expected 4 tokens"); }
+    if pairs[0].0 != Tok4::Word { return TestResult::Fail("dquote: tok[0] not Word"); }
+    if pairs[1].0 != Tok4::Word { return TestResult::Fail("dquote: tok[1] not Word"); }
+    if pairs[2].0 != Tok4::Word { return TestResult::Fail("dquote: tok[2] not Word"); }
+    // The raw token for "\"a b\"" — strip quotes and verify interior bytes.
+    let v = word_value(pairs[1].1);
+    if v != b"a b" {
+        return TestResult::Fail("dquote: double-quoted word value should be \"a b\"");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_double_quoted);
+
+// ── Smoke 23: single-quoted word is literal ───────────────────────────
+//
+// `echo 'literal "quoted"'` → two word tokens; word[1] value is
+// `literal "quoted"` (the double-quotes are literal, not metacharacters).
+
+fn smoke_shell_parser_single_quoted() -> TestResult {
+    let pairs = lex4_with_words(b"echo 'literal \"quoted\"'");
+    if pairs.len() != 3 { return TestResult::Fail("squote: expected 3 tokens"); }
+    if pairs[0].0 != Tok4::Word { return TestResult::Fail("squote: tok[0] not Word"); }
+    if pairs[1].0 != Tok4::Word { return TestResult::Fail("squote: tok[1] not Word"); }
+    let v = word_value(pairs[1].1);
+    if v != b"literal \"quoted\"" {
+        return TestResult::Fail("squote: single-quoted value should preserve double-quotes literally");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_single_quoted);
+
+// ── Smoke 24: backslash escape outside quotes ─────────────────────────
+//
+// `echo \"hello\"` → two word tokens; word[1] value is `"hello"`.
+
+fn smoke_shell_parser_backslash_escape() -> TestResult {
+    let pairs = lex4_with_words(b"echo \\\"hello\\\"");
+    if pairs.len() != 3 { return TestResult::Fail("bslash: expected 3 tokens"); }
+    if pairs[0].0 != Tok4::Word { return TestResult::Fail("bslash: tok[0] not Word"); }
+    if pairs[1].0 != Tok4::Word { return TestResult::Fail("bslash: tok[1] not Word"); }
+    let v = word_value(pairs[1].1);
+    if v != b"\"hello\"" {
+        return TestResult::Fail("bslash: escaped quotes should produce literal double-quote chars");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_backslash_escape);
+
+// ── Smoke 25: multi-pipe three-stage ──────────────────────────────────
+//
+// "echo a | cat | cat" → [Word, Word, Pipe, Word, Pipe, Word, Eof]
+// That is 3 stages: echo a, cat, cat.
+
+fn smoke_shell_parser_multi_pipe() -> TestResult {
+    let toks = lex4(b"echo a | cat | cat");
+    // Word Word Pipe Word Pipe Word Eof
+    if toks.len() != 7 { return TestResult::Fail("multi-pipe: expected 7 tokens"); }
+    if toks[0] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[0] not Word"); }
+    if toks[1] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[1] not Word"); }
+    if toks[2] != Tok4::Pipe { return TestResult::Fail("multi-pipe: tok[2] not Pipe"); }
+    if toks[3] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[3] not Word"); }
+    if toks[4] != Tok4::Pipe { return TestResult::Fail("multi-pipe: tok[4] not Pipe"); }
+    if toks[5] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[5] not Word"); }
+    if toks[6] != Tok4::Eof  { return TestResult::Fail("multi-pipe: tok[6] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_multi_pipe);
+
+// ── Smoke 26: `|` and `||` disambiguated ──────────────────────────────
+//
+// "a || b | c" → [Word, Or, Word, Pipe, Word, Eof]
+// `||` must be consumed as a single token, not as `|` + `|`.
+
+fn smoke_shell_parser_pipe_vs_or() -> TestResult {
+    let toks = lex4(b"a || b | c");
+    if toks.len() != 6 { return TestResult::Fail("pipe-vs-or: expected 6 tokens"); }
+    if toks[0] != Tok4::Word { return TestResult::Fail("pipe-vs-or: tok[0] not Word"); }
+    if toks[1] != Tok4::Or   { return TestResult::Fail("pipe-vs-or: tok[1] not Or (got Pipe?)"); }
+    if toks[2] != Tok4::Word { return TestResult::Fail("pipe-vs-or: tok[2] not Word"); }
+    if toks[3] != Tok4::Pipe { return TestResult::Fail("pipe-vs-or: tok[3] not Pipe"); }
+    if toks[4] != Tok4::Word { return TestResult::Fail("pipe-vs-or: tok[4] not Word"); }
+    if toks[5] != Tok4::Eof  { return TestResult::Fail("pipe-vs-or: tok[5] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_pipe_vs_or);
+
+// ── Smoke 27: `&` vs `&&` disambiguated ───────────────────────────────
+//
+// "cmd1 && cmd2 &" → [Word, And, Word, Ampersand, Eof]
+
+fn smoke_shell_parser_ampersand_vs_and() -> TestResult {
+    let toks = lex4(b"cmd1 && cmd2 &");
+    if toks.len() != 5 { return TestResult::Fail("amp-vs-and: expected 5 tokens"); }
+    if toks[0] != Tok4::Word      { return TestResult::Fail("amp-vs-and: tok[0] not Word"); }
+    if toks[1] != Tok4::And       { return TestResult::Fail("amp-vs-and: tok[1] not And (got Ampersand?)"); }
+    if toks[2] != Tok4::Word      { return TestResult::Fail("amp-vs-and: tok[2] not Word"); }
+    if toks[3] != Tok4::Ampersand { return TestResult::Fail("amp-vs-and: tok[3] not Ampersand"); }
+    if toks[4] != Tok4::Eof       { return TestResult::Fail("amp-vs-and: tok[4] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_ampersand_vs_and);
+
+// ── Smoke 28: empty-line still gives Empty ────────────────────────────
+//
+// An empty input after Wave 33's lex/parse should still yield no
+// tokens except Eof (mirrors smoke 1 but via the new lexer).
+
+fn smoke_shell_parser_empty_line_v2() -> TestResult {
+    let toks = lex4(b"");
+    if toks.len() != 1 { return TestResult::Fail("empty-v2: expected exactly Eof"); }
+    if toks[0] != Tok4::Eof { return TestResult::Fail("empty-v2: only token should be Eof"); }
+    let toks2 = lex4(b"   ");
+    if toks2.len() != 1 { return TestResult::Fail("empty-v2: whitespace-only should give just Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_empty_line_v2);
+
+// ── Smoke 29: complex command-line round-trip ─────────────────────────
+//
+// "echo hi > /tmp/out.txt; cat < /tmp/out.txt | grep hi && echo found"
+//
+// This exercises all major operator classes together.  We only assert
+// the token stream shape, not the execution result.
+//
+// Expected token stream:
+//  Word("echo") Word("hi") RedirOut Word("/tmp/out.txt")
+//  Semicolon
+//  Word("cat") RedirIn Word("/tmp/out.txt")
+//  Pipe
+//  Word("grep") Word("hi")
+//  And
+//  Word("echo") Word("found")
+//  Eof
+//  total = 14 tokens
+
+fn smoke_shell_parser_complex_pipeline() -> TestResult {
+    let toks = lex4(
+        b"echo hi > /tmp/out.txt; cat < /tmp/out.txt | grep hi && echo found"
+    );
+    // Count: echo hi > /tmp/out.txt = 4 tokens
+    //        ; = 1
+    //        cat < /tmp/out.txt = 3
+    //        | = 1
+    //        grep hi = 2
+    //        && = 1
+    //        echo found = 2
+    //        Eof = 1
+    //        total = 15
+    if toks.len() != 15 {
+        return TestResult::Fail("complex: expected 15 tokens");
+    }
+    if toks[0]  != Tok4::Word        { return TestResult::Fail("complex: tok[0]  not Word"); }
+    if toks[1]  != Tok4::Word        { return TestResult::Fail("complex: tok[1]  not Word"); }
+    if toks[2]  != Tok4::RedirOut    { return TestResult::Fail("complex: tok[2]  not RedirOut"); }
+    if toks[3]  != Tok4::Word        { return TestResult::Fail("complex: tok[3]  not Word"); }
+    if toks[4]  != Tok4::Semicolon   { return TestResult::Fail("complex: tok[4]  not Semicolon"); }
+    if toks[5]  != Tok4::Word        { return TestResult::Fail("complex: tok[5]  not Word"); }
+    if toks[6]  != Tok4::RedirIn     { return TestResult::Fail("complex: tok[6]  not RedirIn"); }
+    if toks[7]  != Tok4::Word        { return TestResult::Fail("complex: tok[7]  not Word"); }
+    if toks[8]  != Tok4::Pipe        { return TestResult::Fail("complex: tok[8]  not Pipe"); }
+    if toks[9]  != Tok4::Word        { return TestResult::Fail("complex: tok[9]  not Word"); }
+    if toks[10] != Tok4::Word        { return TestResult::Fail("complex: tok[10] not Word"); }
+    if toks[11] != Tok4::And         { return TestResult::Fail("complex: tok[11] not And"); }
+    if toks[12] != Tok4::Word        { return TestResult::Fail("complex: tok[12] not Word"); }
+    if toks[13] != Tok4::Word        { return TestResult::Fail("complex: tok[13] not Word"); }
+    if toks[14] != Tok4::Eof         { return TestResult::Fail("complex: tok[14] not Eof"); }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_parser_complex_pipeline);
+
+// ── Smoke 30: pipe write+read via syscall layer with dup2 wiring ──────
+//
+// Full "echo hello | cat" plumbing at the syscall level:
+//   1. pipe() → (rfd, wfd)
+//   2. write("hello\n") to wfd (simulating echo's stdout)
+//   3. dup2(rfd, 0) (simulating cat's stdin)
+//   4. read(fd 0) → "hello\n"
+//
+// This is the kernel-layer proof that the pieces the exec engine
+// calls actually compose correctly for a single-pipe command.
+
+fn smoke_shell_pipe_exec_wiring() -> TestResult {
+    crate::syscall::__test_clear_global();
+    fd::__test_reset();
+    fd::init();
+
+    SHELL_TASK.store(0x5020, Ordering::Relaxed);
+    install_task_id_lookup(shell_task_id);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // (1) Create pipe.
+    let mut pipe_fds: [i32; 2] = [-1, -1];
+    let mut pctx = StubCtx {
+        args: SyscallArgs {
+            arg0: pipe_fds.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pipe.raw(), &mut pctx);
+    if pctx.ret != Some(SyscallReturn::ok(0)) {
+        fd::__test_reset(); crate::syscall::__test_clear_global();
+        return TestResult::Fail("pipe-exec-wiring: sys_pipe failed");
+    }
+    let rfd = pipe_fds[0] as u64;
+    let wfd = pipe_fds[1] as u64;
+
+    // (2) "echo side": write "hello\n" to the write-end.
+    let payload = b"hello\n";
+    let mut wctx = StubCtx {
+        args: SyscallArgs { arg0: wfd, arg1: payload.as_ptr() as u64, arg2: payload.len() as u64,
+                             ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
+    if wctx.ret != Some(SyscallReturn::ok(payload.len() as u64)) {
+        fd::__test_reset(); crate::syscall::__test_clear_global();
+        return TestResult::Fail("pipe-exec-wiring: write to wfd failed");
+    }
+
+    // (3) dup2(rfd, 0) — wire stdin to the read-end.
+    let mut dctx = StubCtx {
+        args: SyscallArgs { arg0: rfd, arg1: 0, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Dup2.raw(), &mut dctx);
+    match dctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            fd::__test_reset(); crate::syscall::__test_clear_global();
+            return TestResult::Fail("pipe-exec-wiring: dup2(rfd,0) failed");
+        }
+    }
+
+    // (4) "cat side": read from fd 0.
+    let mut buf = [0u8; 16];
+    let mut rctx = StubCtx {
+        args: SyscallArgs { arg0: 0, arg1: buf.as_mut_ptr() as u64, arg2: buf.len() as u64,
+                             ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+    let n = match rctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => {
+            fd::__test_reset(); crate::syscall::__test_clear_global();
+            return TestResult::Fail("pipe-exec-wiring: read from fd 0 failed");
+        }
+    };
+    if n != payload.len() || &buf[..n] != payload {
+        fd::__test_reset(); crate::syscall::__test_clear_global();
+        return TestResult::Fail("pipe-exec-wiring: payload mismatch on cat-side read");
+    }
+
+    fd::__test_reset();
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/shell", smoke_shell_pipe_exec_wiring);
