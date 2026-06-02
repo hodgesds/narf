@@ -1,4 +1,4 @@
-//! Wave-30 + Wave-35 process-model end-to-end smokes.
+//! Wave-30 + Wave-35 + Wave-37 process-model end-to-end smokes.
 //!
 //! Covers: fork → wait4 → signal delivery, all the way through the
 //! kernel-side handler layer.  Each test drives the syscall handlers
@@ -7,6 +7,10 @@
 //! binary or ring-3 trip is required.
 //!
 //! Wave-35 additions (smokes 13-18): verify that the syscall numbers
+//!
+//! Wave-37 additions (smokes 19-22): verify the sys_wait4 cooperative-
+//! yield rewrite — waker registration, on_child_exit wake-up, fallback
+//! busy-spin path (test context), and concurrent 3-child reap.
 //! used by the newly-wired narf-libc fork/pipe/dup2/getpid/getppid
 //! wrappers reach the right kernel handlers and return correct values.
 //! These complement the Wave-30 kernel-level smokes (1-12) and the
@@ -1497,3 +1501,281 @@ fn smoke_wave35_waitpid_wnohang_before_after() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave35_waitpid_wnohang_before_after);
+
+// ── Smoke 19 (Wave-37): blocking wait4 fallback — exit before wait ────
+//
+// Tests the "test/no-future fallback" path in sys_wait4: when there is
+// no UserTaskFuture/yield hook installed (StubCtx), the handler falls
+// back to a synchronous busy-poll.  Pre-registering the child exit
+// ensures the loop exits immediately and returns the child pid.
+//
+// This also validates the WNOHANG-false path, which was previously the
+// deadlock path in QEMU (the spin prevented the child from running).
+//
+// Linux ref: kernel/exit.c::do_wait.
+
+fn smoke_wave37_blocking_wait4_fallback_exit_before_wait() -> TestResult {
+    const PARENT: u64 = 0xF0_19;
+    const CHILD: u64 = 0xC0_19;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Fire child exit BEFORE the blocking wait4 call.
+    crate::user_task::notify_task_exited(CHILD);
+
+    // Blocking wait4(-1, &status, 0) — no WNOHANG.
+    // In test context (no yield hook), the fallback busy-spin exits
+    // immediately because PENDING_EXITS already has an entry.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 0, // blocking (no WNOHANG)
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("blocking wait4 (fallback): non-OK return");
+        }
+    };
+    if reaped != CHILD {
+        teardown_process_state();
+        return TestResult::Fail("blocking wait4 (fallback): wrong child pid");
+    }
+    if status != 0 {
+        teardown_process_state();
+        return TestResult::Fail("wstatus should be 0");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave37_blocking_wait4_fallback_exit_before_wait);
+
+// ── Smoke 20 (Wave-37): wait_child_check_fn callback contract ─────────
+//
+// Directly invokes the `wait_child_check_fn` callback registered by
+// `wait_init` to verify it:
+//   (A) returns 0 when the queue is empty,
+//   (B) returns the child pid when the queue has a matching entry and
+//       drains it (so a second call returns 0 again).
+//
+// Linux ref: kernel/exit.c::wait_consider_task.
+
+fn smoke_wave37_wait_child_check_fn_contract() -> TestResult {
+    const PARENT: u64 = 0xF0_20;
+    const CHILD: u64 = 0xC0_20;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // (A) Queue empty → check returns 0.
+    let r0 = crate::user_task::call_wait_child_check(PARENT, -1, 0);
+    if r0 != 0 {
+        teardown_process_state();
+        return TestResult::Fail("check_fn on empty queue should return 0");
+    }
+
+    // Populate the queue.
+    crate::user_task::notify_task_exited(CHILD);
+
+    // (B) Queue has entry → returns child pid.
+    let r1 = crate::user_task::call_wait_child_check(PARENT, -1, 0);
+    if r1 != CHILD as i64 {
+        teardown_process_state();
+        return TestResult::Fail("check_fn should return child pid after exit");
+    }
+
+    // (C) Queue was drained → second call returns 0.
+    let r2 = crate::user_task::call_wait_child_check(PARENT, -1, 0);
+    if r2 != 0 {
+        teardown_process_state();
+        return TestResult::Fail("check_fn should return 0 after queue was drained");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave37_wait_child_check_fn_contract);
+
+// ── Smoke 21 (Wave-37): on_child_exit fires wake_wait_child ───────────
+//
+// Verifies that when a child exits, `on_child_exit` (called via
+// `notify_task_exited`) also calls `wake_wait_child` for the parent.
+// We confirm this by pre-registering a waker, firing the exit, and
+// checking whether the waker was consumed (the waker table entry
+// should be gone after the wake).
+//
+// Because we can't easily introspect a `Waker`'s fired state in
+// no_std, we verify the table entry is removed by calling
+// `call_wait_child_check` which is idempotent — the real verification
+// is that `wake_wait_child` was called (draining the slot) rather
+// than the pending-exits queue (which we drain via check_fn).
+//
+// Linux ref: kernel/signal.c::do_notify_parent → complete_signal.
+
+fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering as Ord};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    const PARENT: u64 = 0xF0_21;
+    const CHILD: u64 = 0xC0_21;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Build a tiny waker backed by an AtomicBool flag.
+    static WOKE: AtomicBool = AtomicBool::new(false);
+    WOKE.store(false, Ord::Relaxed);
+
+    unsafe fn clone_raw(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    unsafe fn wake_raw(_: *const ()) {
+        WOKE.store(true, Ord::Release);
+    }
+    unsafe fn wake_by_ref_raw(_: *const ()) {
+        WOKE.store(true, Ord::Release);
+    }
+    unsafe fn drop_raw(_: *const ()) {}
+    static VTAB: RawWakerVTable =
+        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
+    crate::user_task::register_wait_child_waker(PARENT, waker);
+
+    // Fire child exit — this should call wake_wait_child(PARENT)
+    // which consumes the waker we stored and calls w.wake().
+    crate::user_task::notify_task_exited(CHILD);
+
+    if !WOKE.load(Ord::Acquire) {
+        teardown_process_state();
+        return TestResult::Fail("on_child_exit did not call wake_wait_child");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave37_on_child_exit_fires_wake);
+
+// ── Smoke 22 (Wave-37): concurrent 3 children, sequential WNOHANG reap
+//
+// Three children exit before the parent calls wait4.  Each successive
+// WNOHANG call should reap exactly one child.  After three calls the
+// queue is empty and the fourth returns 0.
+//
+// Regresses the "leftover children block subsequent wait4" class of
+// bugs that can arise from the try_reap remove-by-index logic.
+//
+// Linux ref: kernel/exit.c::do_wait → wait_consider_task.
+
+fn smoke_wave37_three_children_sequential_reap() -> TestResult {
+    const PARENT: u64 = 0xF0_22;
+    const C1: u64 = 0xCA_22;
+    const C2: u64 = 0xCB_22;
+    const C3: u64 = 0xCC_22;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(C1, PARENT);
+    crate::handlers::__test_inject_parent_of(C2, PARENT);
+    crate::handlers::__test_inject_parent_of(C3, PARENT);
+
+    crate::user_task::notify_task_exited(C1);
+    crate::user_task::notify_task_exited(C2);
+    crate::user_task::notify_task_exited(C3);
+
+    let mut reaped_set = [0u64; 3];
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    for slot in reaped_set.iter_mut() {
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: (-1i64) as u64,
+                arg1: 0,
+                arg2: 1, // WNOHANG
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+        let v = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => {
+                teardown_process_state();
+                return TestResult::Fail("sequential reap: WNOHANG returned 0 too early");
+            }
+        };
+        *slot = v;
+    }
+
+    // All three must have been reaped — check each expected child
+    // appears exactly once in the result set.
+    for &c in &[C1, C2, C3] {
+        if !reaped_set.contains(&c) {
+            teardown_process_state();
+            return TestResult::Fail("sequential reap: not all children reaped");
+        }
+    }
+
+    // Fourth call: queue empty → 0.
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: 0,
+            arg2: 1, // WNOHANG
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("sequential reap: 4th WNOHANG should return 0");
+        }
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave37_three_children_sequential_reap);
