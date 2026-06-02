@@ -16,11 +16,11 @@
 //! | `false`    | no-op; last-exit = 1                           |
 //! | `:`        | no-op (POSIX null utility); last-exit = 0      |
 //!
-//! All other commands are dispatched to `dispatch_builtin` in
-//! `main.rs` first (the existing built-in table); if that function
-//! returns `false` (meaning the command is unknown), the exec engine
-//! would attempt fork+execve.  Because `fork` currently returns ENOSYS
-//! on NARF, external commands log an error and return exit-code 127.
+//! All other commands are dispatched via fork+execve.  The Wave-35
+//! narf-libc wiring landed `fork()` on top of `Syscall::Fork` (wire
+//! number 57) so external commands now take the real fork+exec path.
+//! The in-process fallback (`dispatch_builtin_inproc`) is retained for
+//! error handling when fork fails with EAGAIN / ENOMEM.
 //!
 //! PATH resolution: if argv[0] does not contain `/`, the path
 //! `/bin/<name>` is tried.  This is documented behaviour.
@@ -133,16 +133,15 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
 
     // ── Fork + exec path ────────────────────────────────────────────────
     //
-    // All other commands (including `echo`, `pwd`, etc.) are dispatched
-    // via `try_fork_exec`.  For now `fork` returns ENOSYS on NARF so
-    // the fork path falls through to the in-process dispatch in
-    // `dispatch_builtin_inproc`.  Once `fork` is wired, `try_fork_exec`
-    // will succeed and the in-process fallback becomes unreachable for
-    // external commands.
+    // All other commands are dispatched via `try_fork_exec`.  Wave-35
+    // wired `fork()` to `Syscall::Fork` (SYS_FORK = 57) so the real
+    // fork+exec path is now taken.  The in-process fallback in
+    // `dispatch_builtin_inproc` is only reached if fork fails (EAGAIN /
+    // ENOMEM), which is an exceptional error condition.
     unsafe { try_fork_exec(fd, sc) }
 }
 
-/// Try to fork and exec the command.  On ENOSYS (fork not yet wired),
+/// Try to fork and exec the command.  On fork failure (EAGAIN/ENOMEM),
 /// falls back to the in-process built-in table.
 unsafe fn try_fork_exec(fd: i32, sc: &SimpleCmd) -> i32 {
     // Apply redirections to a saved-fd set (restored on fork failure
@@ -154,7 +153,7 @@ unsafe fn try_fork_exec(fd: i32, sc: &SimpleCmd) -> i32 {
     // For now we fork() and check.
     let child_pid = unsafe { libc::fork() };
     if child_pid < 0 {
-        // fork not available (ENOSYS) — run in-process with redirects.
+        // fork failed (EAGAIN/ENOMEM) — run in-process with redirects.
         if unsafe { apply_redirs(fd, sc) } {
             let rc = unsafe { dispatch_builtin_inproc(fd, sc) };
             unsafe { restore_stdio(saved); }
@@ -221,7 +220,7 @@ unsafe fn restore_stdio(saved: SavedStdio) {
     }
 }
 
-/// Apply redirections in-process (for the ENOSYS fork fallback).
+/// Apply redirections in-process (for the fork-failure fallback).
 /// Returns `false` if a redirect file couldn't be opened.
 unsafe fn apply_redirs(fd: i32, sc: &SimpleCmd) -> bool {
     for i in 0..sc.redir_count {
@@ -332,7 +331,7 @@ unsafe fn exec_child(sc: &SimpleCmd) {
 // ── In-process built-in dispatch (fork not available) ──────────────────
 
 /// Run the command in-process using the existing built-in table.
-/// Used as the fallback when `fork()` returns ENOSYS.
+/// Used as the fallback when `fork()` fails (EAGAIN / ENOMEM).
 unsafe fn dispatch_builtin_inproc(fd: i32, sc: &SimpleCmd) -> i32 {
     // Reconstruct a command line from argv so `dispatch_line` can
     // parse it.  This is safe because dispatch_line is the existing
@@ -365,7 +364,7 @@ unsafe fn dispatch_builtin_inproc(fd: i32, sc: &SimpleCmd) -> i32 {
 /// children are forked, wired, and waited on.  The parent
 /// closes all pipe fds after forking each child.
 ///
-/// On ENOSYS (fork not available) the pipeline is run
+/// On fork failure (EAGAIN/ENOMEM) the pipeline is run
 /// sequentially in-process with the pipe fds replaced by
 /// an intermediate memory buffer (simulated pipeline).
 unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: usize) -> i32 {
@@ -481,7 +480,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
 // ── Background ─────────────────────────────────────────────────────────
 
 /// Fork and run `sc` in the background; parent does not wait.
-/// On ENOSYS, runs in-process (synchronously) as a fallback.
+/// On fork failure, runs in-process (synchronously) as a fallback.
 unsafe fn exec_background(fd: i32, sc: &SimpleCmd) {
     let child = unsafe { libc::fork() };
     if child < 0 {

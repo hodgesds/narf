@@ -1,4 +1,4 @@
-//! Wave-30 process-model end-to-end smokes.
+//! Wave-30 + Wave-35 process-model end-to-end smokes.
 //!
 //! Covers: fork → wait4 → signal delivery, all the way through the
 //! kernel-side handler layer.  Each test drives the syscall handlers
@@ -6,11 +6,19 @@
 //! pattern `tests.rs` uses for clone/fork smokes) so no real ELF
 //! binary or ring-3 trip is required.
 //!
+//! Wave-35 additions (smokes 13-18): verify that the syscall numbers
+//! used by the newly-wired narf-libc fork/pipe/dup2/getpid/getppid
+//! wrappers reach the right kernel handlers and return correct values.
+//! These complement the Wave-30 kernel-level smokes (1-12) and the
+//! narf_user_runtime ABI which already had execve/wait4 wired.
+//!
 //! Linux references:
 //!   - `kernel/fork.c::copy_process`        (fork inheritance rules)
 //!   - `kernel/signal.c::do_signal`         (signal delivery hook)
 //!   - `kernel/signal.c::complete_signal`   (SIGKILL default action)
 //!   - `kernel/exit.c::do_exit`             (exit observer, SIGCHLD)
+//!   - `fs/pipe.c::do_pipe2`                (pipe allocation)
+//!   - `fs/fcntl.c::do_dup2`               (dup2 semantics)
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1099,3 +1107,393 @@ fn smoke_process_execve_input_validation() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_execve_input_validation);
+
+// ── Smoke 13 (Wave-35): fork via Syscall::Fork returns non-zero child
+//    pid — the narf-libc fork() wrapper wires to SYS_FORK (wire=57).
+//    This verifies that the syscall number reaches sys_fork, which is
+//    the root cause of the Wave-34 ENOSYS regression.
+//
+// Linux ref: arch/x86/entry/syscalls/syscall_64.tbl (fork = 57).
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave35_fork_returns_nonzero_child_pid() -> TestResult {
+    const PARENT: u64 = 0xF0_13;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user failed");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Issue Syscall::Fork — this is the number narf-libc's fork() now
+    // invokes.  The kernel handler must return a non-zero child tid in
+    // the parent (proving no ENOSYS / stub return of -1).
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let ret = match ctx.ret {
+        Some(r) => r,
+        None => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork: no return value (ENOSYS stub hit?)");
+        }
+    };
+    if ret.status != SyscallReturn::OK {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("fork returned non-OK status (ENOSYS stub?)");
+    }
+    if ret.value == 0 {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("fork returned 0 in parent (expected child pid)");
+    }
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_wave35_fork_returns_nonzero_child_pid);
+
+// ── Smoke 14 (Wave-35): pipe allocates two distinct fds > 2 ──────────
+//
+// Verifies that Syscall::Pipe (the wire number narf-libc's pipe()
+// wrapper uses) allocates a read+write fd pair with fds[0] != fds[1]
+// and both > stderr (fd 2).
+//
+// Linux ref: fs/pipe.c::do_pipe2; musl src/unistd/pipe.c.
+
+fn smoke_wave35_pipe_allocates_distinct_fds() -> TestResult {
+    const TASK: u64 = 0xF0_14;
+    crate::syscall::__test_clear_global();
+    setup_process_state(TASK);
+
+    crate::fd::__test_reset();
+    crate::fd::init();
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+
+    // Provide a two-element output buffer in a local array.  The pipe
+    // syscall writes [read_fd: i32, write_fd: i32] to arg0 (a pointer).
+    let mut fds: [i32; 2] = [-1, -1];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: fds.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pipe.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("pipe: non-OK return");
+        }
+    }
+    if fds[0] < 0 || fds[1] < 0 {
+        teardown_process_state();
+        return TestResult::Fail("pipe: fds not written (still -1)");
+    }
+    if fds[0] == fds[1] {
+        teardown_process_state();
+        return TestResult::Fail("pipe: read_fd == write_fd");
+    }
+    if fds[0] <= 2 || fds[1] <= 2 {
+        teardown_process_state();
+        return TestResult::Fail("pipe: fds should be > stderr (2)");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave35_pipe_allocates_distinct_fds);
+
+// ── Smoke 15 (Wave-35): dup2 rewires a descriptor ────────────────────
+//
+// Verifies that Syscall::Dup2 successfully re-points fd 0 (stdin) to
+// an existing fd — the narf-libc dup2() wrapper wires to SYS_DUP2
+// (wire=33 on x86_64).  The smoke checks the kernel returns newfd in
+// the success value, matching POSIX "dup2 returns the new fd".
+//
+// Linux ref: fs/fcntl.c::do_dup2; musl src/unistd/dup2.c.
+
+fn smoke_wave35_dup2_rewires_descriptor() -> TestResult {
+    const TASK: u64 = 0xF0_15;
+    crate::syscall::__test_clear_global();
+    setup_process_state(TASK);
+
+    crate::fd::__test_reset();
+    crate::fd::init();
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+
+    // Allocate a pipe so we have a real fd > 2 to dup onto 0.
+    let mut fds: [i32; 2] = [-1, -1];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: fds.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pipe.raw(), &mut ctx);
+    if fds[0] < 0 {
+        teardown_process_state();
+        return TestResult::Fail("dup2 smoke: pipe setup failed");
+    }
+    let rfd = fds[0];
+
+    // dup2(rfd, 0) — rewire stdin to the read-end of the pipe.
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: rfd as u64,
+            arg1: 0,          // target = stdin
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Dup2.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("dup2(rfd, 0): expected OK with value=0");
+        }
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave35_dup2_rewires_descriptor);
+
+// ── Smoke 16 (Wave-35): getpid returns non-zero ───────────────────────
+//
+// Verifies that Syscall::GetPid returns the calling task's id (non-
+// zero). The narf-libc getpid() wrapper routes to SYS_GETPID = 39.
+//
+// Linux ref: kernel/sys.c::sys_getpid; musl src/process/getpid.c.
+
+fn smoke_wave35_getpid_nonzero() -> TestResult {
+    const TASK: u64 = 0xF0_16;
+    crate::syscall::__test_clear_global();
+    setup_process_state(TASK);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetPid.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("getpid should return non-zero task id");
+        }
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave35_getpid_nonzero);
+
+// ── Smoke 17 (Wave-35): getppid differs from getpid after fork ────────
+//
+// Verifies that after a fork, Syscall::GetPpid from the child returns
+// the parent's task id (non-zero, != child pid).  The narf-libc
+// getppid() wrapper routes to SYS_GETPPID = 110.
+//
+// Linux ref: kernel/sys.c::sys_getppid; musl src/process/getppid.c.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave35_getppid_differs_from_getpid() -> TestResult {
+    const PARENT: u64 = 0xF0_17;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user failed");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Fork to get a child task id.
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let child_tid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork failed in getppid smoke");
+        }
+    };
+
+    // Switch task context to the child and query getpid + getppid.
+    LOOKUP_TASK.store(child_tid, Ordering::Relaxed);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetPid.raw(), &mut ctx);
+    let child_pid_seen = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("getpid in child returned non-OK");
+        }
+    };
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetPpid.raw(), &mut ctx);
+    let child_ppid_seen = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("getppid in child returned non-OK");
+        }
+    };
+
+    if child_pid_seen == child_ppid_seen {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child: getpid == getppid (ppid should be parent)");
+    }
+    if child_ppid_seen != PARENT {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child ppid should equal parent task id");
+    }
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_wave35_getppid_differs_from_getpid);
+
+// ── Smoke 18 (Wave-35): waitpid WNOHANG before/after child exit ───────
+//
+// Mirrors the Wave-30 Smoke 3 pattern but exercises the libc-shaped
+// waitpid wrapper's syscall number explicitly via Syscall::Wait4
+// (both waitpid and wait4 route to the same kernel handler on NARF —
+// the narf-libc waitpid() calls narf_user_runtime::wait4()).
+//
+// Verifies:
+//   (A) Wait4 WNOHANG before child exits → returns 0 (no child ready).
+//   (B) Wait4 WNOHANG after child exits  → returns child pid.
+//
+// Linux ref: kernel/exit.c::do_wait; musl src/process/waitpid.c.
+
+fn smoke_wave35_waitpid_wnohang_before_after() -> TestResult {
+    const PARENT: u64 = 0xF0_18;
+    const CHILD: u64 = 0xC0_18;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+
+    // (A) WNOHANG before child exits — must return 0.
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64, // any child
+            arg1: 0,
+            arg2: 1,              // WNOHANG
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("waitpid WNOHANG before exit: expected 0");
+        }
+    }
+
+    // (B) Fire child exit, then WNOHANG — must return child pid.
+    crate::user_task::notify_task_exited(CHILD);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: 0,
+            arg2: 1, // WNOHANG
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == CHILD => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("waitpid WNOHANG after exit: expected child pid");
+        }
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave35_waitpid_wnohang_before_after);
