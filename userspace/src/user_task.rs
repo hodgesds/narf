@@ -31,7 +31,7 @@
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::UserState;
@@ -100,6 +100,41 @@ pub struct UserTaskCtx {
     /// space` / `entry` / `stack_top` for the new image's values.
     /// Reset to null on consumption.
     pub pending_exec: AtomicPtr<ExecRequest>,
+
+    // ── wait4 cooperative parking ───────────────────────────────────
+    //
+    // When `sys_wait4` needs to block (no child has exited yet and
+    // WNOHANG is not set), it:
+    //   1. Stores the target pid in `wait_child_want_pid`.
+    //   2. Stores the user status pointer in `wait_child_status_ptr`.
+    //   3. Sets `wait_child_pending = true`.
+    //   4. Saves the user state (RAX will be updated by the poll
+    //      routine once a reap succeeds) and longjmps via the yield
+    //      hook.
+    //
+    // `UserTaskFuture::poll` sees `wait_child_pending = true` and
+    // calls the registered `WAIT_CHILD_CHECK_FN` to try the reap.
+    // If the reap succeeds it writes the child pid into the saved
+    // UserState.rax, clears the flag, and falls through to re-enter
+    // user mode. If the reap fails it stores `cx.waker()` (via
+    // `register_wait_child_waker`) and returns `Poll::Pending`
+    // without scheduling a wake-by-ref — the task truly parks until
+    // `on_child_exit` fires the waker.
+    //
+    // Mirror of the `WaitAsciiByteFuture` pattern in narf-input.
+
+    /// Set by `sys_wait4` before longjmping; cleared by the poll
+    /// routine once a successful reap has been written into the
+    /// saved UserState.
+    pub wait_child_pending: AtomicBool,
+
+    /// `want_pid` argument forwarded from `sys_wait4`: > 0 = wait
+    /// for a specific child, ≤ 0 = any child.
+    pub wait_child_want_pid: AtomicI64,
+
+    /// User-space pointer to write the POSIX wstatus integer into
+    /// on a successful reap. `0` = caller passed NULL (discard).
+    pub wait_child_status_ptr: AtomicU64,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -118,6 +153,9 @@ impl UserTaskCtx {
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
+            wait_child_pending: AtomicBool::new(false),
+            wait_child_want_pid: AtomicI64::new(0),
+            wait_child_status_ptr: AtomicU64::new(0),
         }
     }
 }
@@ -275,6 +313,102 @@ pub fn __test_clear_hooks() {
     YIELD_HOOK.store(core::ptr::null_mut(), Ordering::Release);
     EXIT_HOOK.store(core::ptr::null_mut(), Ordering::Release);
     clear_current();
+}
+
+// ── wait4 cooperative parking support ────────────────────────────────
+//
+// Two global tables coordinate the "parent parked in wait4" pattern:
+//
+//   WAIT_CHILD_CHECK_FN — a single registered fn(parent_id, want_pid,
+//     status_ptr) -> i64 that tries to drain one entry from the parent's
+//     pending-exits queue.  Returns the reaped child pid (> 0) on
+//     success, or 0 if the queue is empty.  Registered at boot by
+//     `handlers::wait_init`.  The fn must NOT take any lock that could
+//     be held concurrently by a caller of `register_wait_child_waker`
+//     (both run from the kernel-side polling path, single-CPU today).
+//
+//   WAIT_CHILD_WAKERS — per-task Waker slots stored when a task parks
+//     in wait4.  `on_child_exit` in handlers.rs pulls the parent's slot
+//     and calls wake() so the executor re-polls the task.
+//
+// Mirror of the `BYTE_RING_WAKER` pattern in narf-input.
+
+/// fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64
+///   Returns reaped child pid (> 0) if a matching entry was drained
+///   from the pending-exits queue, or 0 if the queue is empty.
+pub type WaitChildCheckFn = fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64;
+
+static WAIT_CHILD_CHECK_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Register the wait4 reap-check callback.  Called once at boot by
+/// `handlers::wait_init`.
+pub fn register_wait_child_check(f: WaitChildCheckFn) {
+    WAIT_CHILD_CHECK_FN.store(f as *mut (), Ordering::Release);
+}
+
+/// Invoke the registered check callback.  Returns 0 if no callback
+/// is installed (test/fallback context without real wait4 tables).
+pub fn call_wait_child_check(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
+    let p = WAIT_CHILD_CHECK_FN.load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    // SAFETY: p was stored by `register_wait_child_check` with a valid
+    // WaitChildCheckFn; the static lifetime outlives any call.
+    let f: WaitChildCheckFn = unsafe { core::mem::transmute(p) };
+    f(parent_id, want_pid, status_ptr)
+}
+
+/// Per-task Waker slots for tasks parked in a blocking wait4.
+/// Keyed by the parent task's pid (u64).  The slot is populated by
+/// `UserTaskFuture::poll` when it finds `wait_child_pending = true`
+/// and no reap is immediately available; it is consumed (wake called)
+/// by `on_child_exit` in handlers.rs.
+static WAIT_CHILD_WAKERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the waker table (called once at boot alongside `wait_init`).
+pub fn wait_child_waker_init() {
+    *WAIT_CHILD_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+}
+
+/// Store a waker for `parent_id`.  The waker fires when the parent's
+/// child exits and `on_child_exit` is invoked.
+pub fn register_wait_child_waker(parent_id: u64, waker: core::task::Waker) {
+    let mut g = WAIT_CHILD_WAKERS.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(parent_id, waker);
+    }
+}
+
+/// Take and wake the stored waker for `parent_id`, if any.  Called by
+/// `on_child_exit` after pushing to the pending-exits queue.
+pub fn wake_wait_child(parent_id: u64) {
+    let waker = {
+        let mut g = WAIT_CHILD_WAKERS.lock();
+        g.as_mut().and_then(|m| m.remove(&parent_id))
+    };
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+/// Remove (drop, don't wake) the stored waker for `parent_id`.
+/// Used by `UserTaskFuture::poll` when the double-check after
+/// registering the waker finds a result — we clear the table slot
+/// without scheduling a spurious re-poll.
+pub fn drop_wait_child_waker(parent_id: u64) {
+    let mut g = WAIT_CHILD_WAKERS.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&parent_id);
+    }
+}
+
+/// Test-only: drain the waker table.
+#[doc(hidden)]
+pub fn __test_wait_child_waker_reset() {
+    *WAIT_CHILD_WAKERS.lock() = None;
 }
 
 #[inline]
@@ -579,6 +713,68 @@ impl core::future::Future for UserTaskFuture {
             // call doesn't see stale state, then fall through
             // to the normal resume path.
             this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
+        }
+
+        // sys_wait4 cooperative parking: when a blocking wait4 finds
+        // no exited child yet, it sets `wait_child_pending = true`
+        // and longjmps back here.  We try to reap first; if that
+        // fails we store our waker (so `on_child_exit` can fire it)
+        // and return `Pending` — NO `wake_by_ref`, so the task truly
+        // parks until the waker fires.  On re-poll after the wake,
+        // the reap should succeed and we write the result into the
+        // saved UserState.rax before falling through to re-enter
+        // user mode.
+        if this.ctx.wait_child_pending.load(Ordering::Acquire) {
+            let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
+            let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
+            let task_pid = this.process.pid.raw();
+            let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
+            if reaped > 0 {
+                // Reap succeeded — write child pid into saved RAX
+                // so user mode sees it as the wait4 return value,
+                // then clear the pending flag and fall through to
+                // the normal resume path.
+                // SAFETY: ctx.state is a valid, aligned UserState;
+                // we own it and hold Pin guarantees on the future.
+                unsafe {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let us = &mut *(this.ctx.state.get()
+                            as *mut narf_scheduler::UserState);
+                        us.rax = reaped as u64;
+                    }
+                }
+                this.ctx.wait_child_pending.store(false, Ordering::Release);
+                // Fall through to re-enter user mode with the result.
+            } else {
+                // No child has exited yet — register our waker so
+                // `on_child_exit` can wake us, then park.
+                // Double-check after registering (race: child exits
+                // between the reap check above and registering here).
+                register_wait_child_waker(task_pid, cx.waker().clone());
+                let reaped2 = call_wait_child_check(task_pid, want_pid, status_ptr);
+                if reaped2 > 0 {
+                    // Child exited in the window — remove the waker
+                    // we just stored (no spurious self-wake needed),
+                    // write the result, clear pending, fall through.
+                    drop_wait_child_waker(task_pid);
+                    // Write reaped pid into saved RAX.
+                    unsafe {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            let us = &mut *(this.ctx.state.get()
+                                as *mut narf_scheduler::UserState);
+                            us.rax = reaped2 as u64;
+                        }
+                    }
+                    this.ctx.wait_child_pending.store(false, Ordering::Release);
+                    // Fall through to re-enter user mode.
+                } else {
+                    // Truly no child yet — park until `on_child_exit`
+                    // wakes us.  Do NOT call wake_by_ref here.
+                    return core::task::Poll::Pending;
+                }
+            }
         }
 
         // Snapshot kernel CR3 once, on the first poll. Subsequent
@@ -888,6 +1084,43 @@ impl core::future::Future for UserTaskFuture {
                 return core::task::Poll::Pending;
             }
             this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
+        }
+
+        // sys_wait4 cooperative parking (mirrors x86_64 poll body).
+        if this.ctx.wait_child_pending.load(Ordering::Acquire) {
+            let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
+            let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
+            let task_pid = this.process.pid.raw();
+            let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
+            if reaped > 0 {
+                unsafe {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        // On aarch64 x0 is the return register.
+                        let us = &mut *(this.ctx.state.get()
+                            as *mut narf_scheduler::UserState);
+                        us.x[0] = reaped as u64;
+                    }
+                }
+                this.ctx.wait_child_pending.store(false, Ordering::Release);
+            } else {
+                register_wait_child_waker(task_pid, cx.waker().clone());
+                let reaped2 = call_wait_child_check(task_pid, want_pid, status_ptr);
+                if reaped2 > 0 {
+                    drop_wait_child_waker(task_pid);
+                    unsafe {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let us = &mut *(this.ctx.state.get()
+                                as *mut narf_scheduler::UserState);
+                            us.x[0] = reaped2 as u64;
+                        }
+                    }
+                    this.ctx.wait_child_pending.store(false, Ordering::Release);
+                } else {
+                    return core::task::Poll::Pending;
+                }
+            }
         }
 
         // Snapshot kernel TTBR0_EL1 once. Subsequent polls land

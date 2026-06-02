@@ -3659,12 +3659,54 @@ pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
     crate::user_task::register_exit_observer(on_child_exit);
+    crate::user_task::register_wait_child_check(wait_child_check_fn);
+    crate::user_task::wait_child_waker_init();
 }
 
 #[doc(hidden)]
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = None;
     *PENDING_EXITS.lock() = None;
+    crate::user_task::__test_wait_child_waker_reset();
+}
+
+/// Callback invoked by `UserTaskFuture::poll` when `wait_child_pending`
+/// is set: tries to drain one matching entry from the parent's pending-
+/// exits queue.
+///
+/// Returns the reaped child pid (> 0) on success, or 0 if the queue
+/// holds no matching entry.  If `status_ptr != 0`, writes the POSIX
+/// wstatus into the user-space pointer (same as `sys_wait4` does on the
+/// fast path).
+fn wait_child_check_fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
+    let entry = {
+        let mut g = PENDING_EXITS.lock();
+        let m = match g.as_mut() {
+            Some(m) => m,
+            None => return 0,
+        };
+        let q = match m.get_mut(&parent_id) {
+            Some(q) => q,
+            None => return 0,
+        };
+        let idx = if want_pid > 0 {
+            match q.iter().position(|&(p, _)| p == want_pid as u64) {
+                Some(i) => i,
+                None => return 0,
+            }
+        } else {
+            if q.is_empty() {
+                return 0;
+            }
+            0
+        };
+        q.remove(idx)
+    };
+    let (child_pid, status) = entry;
+    if status_ptr != 0 {
+        let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+    }
+    child_pid as i64
 }
 
 /// Test hook: directly register a parent-of relationship without going
@@ -3735,11 +3777,18 @@ fn on_child_exit(child_pid: u64) {
     // Linux: kernel/signal.c::do_notify_parent sets SIGCHLD pending.
     // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
     const SIGCHLD: u32 = 17;
-    let mut g = SIGNAL_PENDING.lock();
-    if let Some(m) = g.as_mut() {
-        let slot = m.entry(parent).or_insert(0);
-        *slot |= 1u32 << SIGCHLD;
+    {
+        let mut g = SIGNAL_PENDING.lock();
+        if let Some(m) = g.as_mut() {
+            let slot = m.entry(parent).or_insert(0);
+            *slot |= 1u32 << SIGCHLD;
+        }
     }
+    // (3) Wake any parent task parked in a blocking wait4.  The waker
+    // was stored by `UserTaskFuture::poll` when it found the pending-
+    // exits queue empty.  Now that we've pushed an entry, fire the waker
+    // so the executor re-polls the parent and it can reap.
+    crate::user_task::wake_wait_child(parent);
 }
 
 fn sys_wait4(ctx: &mut dyn TrapContext) {
@@ -3787,10 +3836,55 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Blocking wait — busy-poll with sleep_pumps so kernel async
-    // tasks (FB drain, cursor pump, IRQ wakers) keep making
-    // progress. Cap at 60 s to bound a wedged child + missing
-    // exit observer wiring.
+    // Blocking wait — cooperative yield to the scheduler.
+    //
+    // Previous implementation was a busy-spin that prevented the
+    // child task from ever being scheduled (the child's UserTaskFuture
+    // was on the ready queue but the parent's spin loop never returned
+    // to the executor).
+    //
+    // New implementation mirrors `sys_futex` / `sys_sleep`:
+    //   1. Set wait_child_pending + args on the current UserTaskCtx.
+    //   2. Save user state (RAX will be overwritten by the poll
+    //      routine once a reap succeeds).
+    //   3. Longjmp back to the executor via the yield hook.
+    //
+    // `UserTaskFuture::poll` sees `wait_child_pending = true` and
+    // tries to reap.  If the queue is empty it stores `cx.waker()`
+    // (so `on_child_exit` can fire it) and returns `Poll::Pending`.
+    // The child gets scheduled, exits, `on_child_exit` wakes the
+    // parent, and the parent is re-polled; this time the reap
+    // succeeds and the result is written into the saved RAX.
+    //
+    // Fallback: if no polling future is installed (test context),
+    // the code falls through to the spin below.
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        // SAFETY: uctx is valid for the lifetime of the polling
+        // routine which holds it pinned; we're about to longjmp.
+        unsafe {
+            let uc = &*uctx;
+            uc.wait_child_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+            uc.wait_child_want_pid
+                .store(want_pid, core::sync::atomic::Ordering::Release);
+            uc.wait_child_status_ptr
+                .store(status_ptr, core::sync::atomic::Ordering::Release);
+            // Save user-mode register state.  The RAX written here
+            // is a placeholder; UserTaskFuture::poll overwrites it
+            // with the reaped child pid before re-entering user mode.
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable — hook() never returns
+    }
+
+    // Test/no-future fallback: synchronous busy-poll (same as
+    // before, kept for tests that use StubCtx without a real
+    // UserTaskFuture / yield hook).  Cap at 60 s.
     let deadline = narf_time::Deadline::after_ms(60_000);
     let mut reaped = None;
     while !deadline.expired() {
