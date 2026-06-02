@@ -54,6 +54,7 @@ pub mod sha512;
 mod tests;
 #[cfg(test)]
 mod primitive_tests;
+mod e2e_tests;
 
 extern crate alloc;
 
