@@ -899,6 +899,34 @@ pub fn futex_wake(uaddr: u64, n: u32) -> i64 {
     futex(uaddr as *mut u32, 1 /* FUTEX_WAKE */, n, 0, 0, 0)
 }
 
+/// `fork()` — create an independent copy of the calling process.
+/// POSIX semantics: child observes `0` in its return register;
+/// parent observes the child's pid (non-zero). Returns the child
+/// pid in the parent, 0 in the child, or `Err(())` on failure
+/// (kernel couldn't allocate an AS copy or the task context is
+/// not available — e.g. not running in user mode).
+///
+/// The kernel side (`Syscall::Fork = 57`) copies every region in
+/// the parent's `AddressSpace` frame-by-frame (COW: shares frames
+/// with ref-count bumps and strips WRITE on both sides; first
+/// write on either side allocates a private frame). The child
+/// inherits the fd table, cwd, brk, signal handlers, pgid, and
+/// sid; pending signals are reset.
+///
+/// Reference: `kernel/fork.c::copy_process` (Linux).
+#[inline]
+pub fn fork() -> Result<u64, ()> {
+    // SAFETY: SYS_FORK takes no arguments. The kernel rewrites
+    // the child's RAX to 0 before the child's first user-mode
+    // resume; the parent sees the child's tid in RAX here.
+    let r = unsafe { syscall0(SYS_FORK) };
+    if r == u64::MAX || r == ((-1i64) as u64) {
+        Err(())
+    } else {
+        Ok(r)
+    }
+}
+
 /// `clone(entry, stack_top, arg, fs_base)` — spawn a new task that
 /// shares the calling task's address space. The thread enters at
 /// `entry` with RSP = `stack_top` and RDI = `arg`. `fs_base = 0`
