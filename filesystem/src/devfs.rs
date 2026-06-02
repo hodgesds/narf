@@ -23,7 +23,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT};
@@ -54,54 +54,25 @@ impl FileOps for DevNull {
     }
 }
 
-/// `/dev/random` and `/dev/urandom` — read = fill with PRNG bytes,
-/// write = discard. NARF doesn't distinguish blocking-vs-non-
-/// blocking RNG today (no entropy pool), so both entries map to
-/// the same backing.
+/// `/dev/random` and `/dev/urandom` — ChaCha20-based CSPRNG.
 ///
-/// Backing: a Park-Miller minimal-standard LCG seeded lazily on
-/// first read from `narf_time::now_cycles()`. Matches the same
-/// non-cryptographic guarantee `crypto::per_task_rng()` documents.
+/// Post-Linux-5.18 semantics: both files are identical — both deliver
+/// bytes from the same ChaCha20 CSPRNG seeded from hardware entropy
+/// (RDSEED → RDRAND → TSC-fallback on x86_64).  Neither blocks once the
+/// pool is seeded; the pool is always seeded synchronously during kernel
+/// init via `csprng::init_csprng()`.
+///
+/// Write = discard (matching `/dev/null` semantics for the write path).
+/// A write-to-stir-the-pool extension is deferred (Linux ref:
+/// `drivers/char/random.c::write_pool`).
+///
+/// Linux ref: `drivers/char/random.c::extract_crng`.
 struct DevRandom;
-
-static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
-
-fn next_random_u32() -> u32 {
-    let mut s = RANDOM_STATE.load(Ordering::Relaxed);
-    if s == 0 {
-        let cy = narf_time::now_cycles();
-        s = (cy ^ 0x9E37_79B9_7F4A_7C15).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) & 0x7FFF_FFFF;
-        if s == 0 {
-            s = 1;
-        }
-    }
-    s = (s.wrapping_mul(48271)) % 0x7FFF_FFFF;
-    RANDOM_STATE.store(s, Ordering::Relaxed);
-    s as u32
-}
 
 impl FileOps for DevRandom {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let len = buf.len();
-        // Fill the user buffer in 4-byte chunks, plus tail bytes.
-        let mut i = 0usize;
-        while i + 4 <= len {
-            let v = next_random_u32();
-            buf[i] = (v & 0xFF) as u8;
-            buf[i + 1] = ((v >> 8) & 0xFF) as u8;
-            buf[i + 2] = ((v >> 16) & 0xFF) as u8;
-            buf[i + 3] = ((v >> 24) & 0xFF) as u8;
-            i += 4;
-        }
-        if i < len {
-            let v = next_random_u32();
-            let mut shift = 0u32;
-            while i < len {
-                buf[i] = ((v >> shift) & 0xFF) as u8;
-                i += 1;
-                shift += 8;
-            }
-        }
+        crate::csprng::fill(buf);
         Box::pin(async move { Ok(len) })
     }
 
