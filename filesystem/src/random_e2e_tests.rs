@@ -55,7 +55,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::devfs::DevFs;
 use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::procfs::sys_kernel;
-use crate::FsInstance;
+use crate::FsInstance as _;
 
 // ── poll_once helper ────────────────────────────────────────────────────────
 
