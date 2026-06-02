@@ -91,6 +91,8 @@ pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemo
 mod tests;
 mod e2e_tests;
 mod dhcp_dns_e2e_tests;
+mod ipv6_e2e_tests;
+mod tcp_timer_e2e_tests;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
