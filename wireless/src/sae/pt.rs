@@ -51,10 +51,8 @@ use alloc::vec::Vec;
 use narf_crypto::hkdf::{hkdf_expand, hkdf_extract};
 use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
-use narf_crypto::p256::{p256_hash_to_curve, Fp};
+use narf_crypto::p256::p256_hash_to_curve;
 use narf_crypto::sha256::Sha256;
-
-use super::dragonfly::SaeError;
 
 /// Domain Separation Tag for SAE Hash-to-Element on P-256.
 /// IEEE 802.11-2020 §12.4.4.2.3 step 1 + RFC 9380 §3.1. Public
@@ -143,17 +141,6 @@ pub fn pwe_valid(pwe: &AffinePoint) -> bool {
         return false;
     }
     pwe.is_on_curve()
-}
-
-// Suppress unused-warning for the field type when h2c is the only consumer.
-#[allow(dead_code)]
-fn _fp_alive() -> Fp {
-    Fp::ZERO
-}
-
-#[allow(dead_code)]
-fn _err_alive() -> SaeError {
-    SaeError::Protocol
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
