@@ -31,10 +31,14 @@ use super::{
     HidError, HID_BOOT_PROTOCOL, HID_INTERFACE_CLASS, HID_REQ_SET_PROTOCOL, HID_SUBCLASS_BOOT,
 };
 use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
-use narf_input::{push_global, InputEvent, PointerButtons, PointerEvent};
+use narf_input::{
+    evdev::{dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode, ROUTER},
+    push_global, InputEvent, PointerButtons, PointerEvent,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 extern crate alloc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// HID Boot Protocol code for a mouse (§4.3, table on page 9).
@@ -72,7 +76,7 @@ impl MouseReport {
 
 /// Boot-mouse binding. Holds the slot id + interrupt-IN DCI; caller
 /// polls via `read_report` (raw 3-byte report) or `pump_once`
-/// (decoded → global input ring).
+/// (decoded → global input ring + evdev ROUTER).
 #[derive(Debug)]
 pub struct BootMouse {
     pub slot_id: u8,
@@ -83,6 +87,10 @@ pub struct BootMouse {
     /// fresh dx/dy every report, so each report is a self-contained
     /// pointer event.
     pub(crate) last_buttons: u8,
+    /// evdev ROUTER device id — for unregister on detach.
+    pub(crate) evdev_id: DeviceId,
+    /// evdev DeviceNode — pointer events dispatched here for ROUTER.
+    pub(crate) evdev_node: Arc<DeviceNode>,
 }
 
 /// Walk a Configuration Descriptor (§9.6.3) tree looking for a HID
@@ -138,10 +146,29 @@ pub fn find_boot_mouse(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
         .ok_or(HidError::NoInterruptIn)
 }
 
+/// Build the `DeviceCaps` for a USB boot-protocol mouse.
+/// Registers REL_X/REL_Y axes and the three standard buttons.
+/// Mirrors the PS/2 mouse capability setup in
+/// `drivers/input/src/i8042_mouse.rs::init`.
+pub fn boot_mouse_evdev_caps() -> DeviceCaps {
+    let mut caps = DeviceCaps::new();
+    caps.add_rel(rel::REL_X);
+    caps.add_rel(rel::REL_Y);
+    caps.add_key(key::BTN_LEFT);
+    caps.add_key(key::BTN_RIGHT);
+    caps.add_key(key::BTN_MIDDLE);
+    caps
+}
+
 impl BootMouse {
     /// Bind a boot mouse to an already-addressed + configured xHCI
     /// slot. Issues `Set Protocol(Boot)` so subsequent `read_report`
-    /// calls return the fixed 3-byte format.
+    /// calls return the fixed 3-byte format. Also registers a
+    /// DeviceNode with the evdev ROUTER so pointer events reach
+    /// `/dev/input/event<N>`.
+    ///
+    /// Ref: `linux/drivers/hid/usbhid/usbmouse.c::usb_mouse_probe`
+    /// (GPL-2.0-or-later).
     pub async fn attach(
         xhci_dev: &Xhci,
         slot_id: u8,
@@ -166,12 +193,25 @@ impl BootMouse {
         xhci_dev
             .arm_interrupt_in(slot_id, interrupt_in_ep, 8)
             .map_err(HidError::Xhci)?;
+
+        // Register with the evdev ROUTER. Mirrors i8042_mouse.rs::init().
+        let (evdev_id, evdev_node) = ROUTER.register_device(boot_mouse_evdev_caps());
+
         Ok(BootMouse {
             slot_id,
             interrupt_in_ep,
             interface_num,
             last_buttons: 0,
+            evdev_id,
+            evdev_node,
         })
+    }
+
+    /// Unregister this mouse's DeviceNode from the evdev ROUTER.
+    /// Call when the device is detached / unplugged so
+    /// `/dev/input/event<N>` disappears.
+    pub fn unregister_evdev(&self) {
+        ROUTER.unregister_device(self.evdev_id);
     }
 
     /// Drain one pending interrupt-IN report off the endpoint without
@@ -203,19 +243,46 @@ impl BootMouse {
     }
 
     /// Same translation as `pump_once`, but works from a caller-
-    /// supplied report. Used by the in-tree smokes.
+    /// supplied report. Dispatches to both the legacy global ring and
+    /// the evdev ROUTER DeviceNode.
     pub fn translate_report(&mut self, report: MouseReport) -> usize {
         let buttons_changed = report.buttons != self.last_buttons;
         let moved = report.dx != 0 || report.dy != 0;
-        self.last_buttons = report.buttons;
+
         if !buttons_changed && !moved {
             return 0;
         }
-        push_global(InputEvent::Pointer(PointerEvent {
-            dx: report.dx as i32,
-            dy: report.dy as i32,
-            buttons: button_byte_to_buttons(report.buttons),
-        }));
+
+        let dx = report.dx as i32;
+        let dy = report.dy as i32;
+        let btns = button_byte_to_buttons(report.buttons);
+
+        // Legacy global ring (for cursor pump / FB status panel).
+        push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons: btns }));
+
+        // evdev ROUTER — motion.
+        if moved {
+            dispatch_rel_to_node(&self.evdev_node, dx, dy);
+        }
+
+        // evdev ROUTER — button transitions (EV_KEY BTN_LEFT/RIGHT/MIDDLE).
+        if buttons_changed {
+            let prev = self.last_buttons;
+            let cur = report.buttons;
+            for &(mask, code) in &[
+                (btn::LEFT,   key::BTN_LEFT),
+                (btn::RIGHT,  key::BTN_RIGHT),
+                (btn::MIDDLE, key::BTN_MIDDLE),
+            ] {
+                let was = prev & mask != 0;
+                let now = cur & mask != 0;
+                if was != now {
+                    dispatch_key_to_node(&self.evdev_node, code, now);
+                }
+            }
+        }
+
+        self.last_buttons = report.buttons;
         1
     }
 

@@ -34,8 +34,12 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use narf_input::{push_key, KeyCode, Modifiers, update_modifiers};
+use narf_input::{
+    evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceId, DeviceNode, ROUTER},
+    push_key, KeyCode, Modifiers, update_modifiers,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::{
@@ -102,6 +106,9 @@ pub enum KbdProtocol {
 /// - Report Protocol capability.
 /// - LED SET_REPORT support.
 /// - Per-field keycode decoding via the parsed Report Descriptor.
+/// - evdev ROUTER integration: events are dispatched to a `DeviceNode`
+///   so `/dev/input/event<N>` is populated for userspace.
+///   Ref: `linux/drivers/hid/usbhid/usbkbd.c::usb_kbd_irq` (GPL-2.0-or-later).
 #[derive(Debug)]
 pub struct UsbKeyboard {
     pub slot_id: u8,
@@ -118,6 +125,10 @@ pub struct UsbKeyboard {
     pub(crate) descriptor: Option<ReportDescriptor>,
     /// Current LED state.
     pub(crate) leds: LedState,
+    /// evdev ROUTER device id — used to unregister on detach.
+    pub(crate) evdev_id: DeviceId,
+    /// evdev DeviceNode — used to dispatch events to ROUTER.
+    pub(crate) evdev_node: Arc<DeviceNode>,
 }
 
 /// Global registry of bound USB keyboards.
@@ -134,9 +145,10 @@ pub static ATTACHED_USB_KBD_COUNT: core::sync::atomic::AtomicU32 =
 use crate::hid::kbd_mod;
 
 /// Decode the HID modifier byte into a Modifiers bitset and push
-/// individual modifier KeyEvents for any bit transitions. Returns
-/// (events_emitted, current_modifiers).
-fn diff_modifiers(prev_byte: u8, cur_byte: u8) -> (usize, Modifiers) {
+/// individual modifier KeyEvents for any bit transitions. Also dispatches
+/// each modifier to the evdev DeviceNode for ROUTER delivery.
+/// Returns (events_emitted, current_modifiers).
+fn diff_modifiers(prev_byte: u8, cur_byte: u8, node: &DeviceNode) -> (usize, Modifiers) {
     use narf_input::InputEvent;
     use narf_input::KeyEvent;
     use narf_input::push_global;
@@ -145,37 +157,51 @@ fn diff_modifiers(prev_byte: u8, cur_byte: u8) -> (usize, Modifiers) {
         crate::hid::modifier_byte_to_modifiers(cur_byte).bits(),
     );
 
-    let mod_pairs: &[(u8, KeyCode)] = &[
-        (kbd_mod::LCTRL, KeyCode::LeftCtrl),
-        (kbd_mod::LSHIFT, KeyCode::LeftShift),
-        (kbd_mod::LALT, KeyCode::LeftAlt),
-        (kbd_mod::LGUI, KeyCode::LeftMeta),
-        (kbd_mod::RCTRL, KeyCode::RightCtrl),
-        (kbd_mod::RSHIFT, KeyCode::RightShift),
-        (kbd_mod::RALT, KeyCode::RightAlt),
-        (kbd_mod::RGUI, KeyCode::RightMeta),
+    // HID modifier bit → (KeyCode for legacy ring, evdev code for ROUTER).
+    // Evdev codes from linux/include/uapi/linux/input-event-codes.h.
+    let mod_pairs: &[(u8, KeyCode, u16)] = &[
+        (kbd_mod::LCTRL,  KeyCode::LeftCtrl,   29),
+        (kbd_mod::LSHIFT, KeyCode::LeftShift,  42),
+        (kbd_mod::LALT,   KeyCode::LeftAlt,    56),
+        (kbd_mod::LGUI,   KeyCode::LeftMeta,   125),
+        (kbd_mod::RCTRL,  KeyCode::RightCtrl,  97),
+        (kbd_mod::RSHIFT, KeyCode::RightShift, 54),
+        (kbd_mod::RALT,   KeyCode::RightAlt,   100),
+        (kbd_mod::RGUI,   KeyCode::RightMeta,  126),
     ];
     let mut emitted = 0usize;
-    for &(bit, code) in mod_pairs {
+    for &(bit, code, evdev_code) in mod_pairs {
         let was = prev_byte & bit != 0;
         let now = cur_byte & bit != 0;
         if was != now {
+            // Legacy global ring.
             let mods = update_modifiers(code, now);
             push_global(InputEvent::Key(KeyEvent {
                 code,
                 pressed: now,
                 modifiers: mods,
             }));
+            // evdev ROUTER.
+            dispatch_key_to_node(node, evdev_code, now);
             emitted += 1;
         }
     }
     (emitted, cur_mods_raw)
 }
 
-/// Diff two 6-byte keycode arrays and push press/release events.
+/// Diff two 6-byte keycode arrays and push press/release events to both
+/// the legacy global ring and the evdev DeviceNode (ROUTER).
 /// Returns the number of events pushed. Rollover (all slots = 0x01)
 /// is suppressed — no events for phantom key combinations.
-pub fn diff_keycodes(prev: &[u8; 6], cur: &[u8; 6], _cur_mods: Modifiers) -> usize {
+///
+/// Ref: `linux/drivers/hid/usbhid/usbkbd.c::usb_kbd_irq` key-array diff
+/// (line 100). GPL-2.0-or-later.
+pub fn diff_keycodes(
+    prev: &[u8; 6],
+    cur: &[u8; 6],
+    _cur_mods: Modifiers,
+    node: &DeviceNode,
+) -> usize {
     let is_rollover = cur.iter().all(|&k| k == ROLLOVER_USAGE);
     if is_rollover {
         return 0;
@@ -187,7 +213,11 @@ pub fn diff_keycodes(prev: &[u8; 6], cur: &[u8; 6], _cur_mods: Modifiers) -> usi
             continue;
         }
         if !cur.iter().any(|&c| c == k) {
-            push_key(usage_to_keycode(k), false);
+            let kc = usage_to_keycode(k);
+            // Legacy ring.
+            push_key(kc, false);
+            // evdev ROUTER — use KeyCode as u16 (matches set-1/evdev code).
+            dispatch_key_to_node(node, kc as u16, false);
             emitted += 1;
         }
     }
@@ -197,7 +227,11 @@ pub fn diff_keycodes(prev: &[u8; 6], cur: &[u8; 6], _cur_mods: Modifiers) -> usi
             continue;
         }
         if !prev.iter().any(|&p| p == k) {
-            push_key(usage_to_keycode(k), true);
+            let kc = usage_to_keycode(k);
+            // Legacy ring.
+            push_key(kc, true);
+            // evdev ROUTER.
+            dispatch_key_to_node(node, kc as u16, true);
             emitted += 1;
         }
     }
@@ -207,14 +241,19 @@ pub fn diff_keycodes(prev: &[u8; 6], cur: &[u8; 6], _cur_mods: Modifiers) -> usi
 // ── Boot-protocol report decoder ─────────────────────────────────────
 
 /// Decode a raw 8-byte boot-keyboard report and diff it against the
-/// stored `last_mods`/`last_keys` on a `UsbKeyboard`, pushing events.
+/// stored `last_mods`/`last_keys` on a `UsbKeyboard`, pushing events to
+/// both the legacy global ring and the evdev ROUTER DeviceNode.
 /// Returns the count of events emitted.
+///
+/// Ref: `linux/drivers/hid/usbhid/usbkbd.c::usb_kbd_irq` (GPL-2.0-or-later).
 pub fn process_boot_report(kbd: &mut UsbKeyboard, raw: &[u8; 8]) -> usize {
     let new_mods = raw[0];
     let new_keys: [u8; 6] = [raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]];
 
-    let (mod_events, cur_mods) = diff_modifiers(kbd.last_mods, new_mods);
-    let key_events = diff_keycodes(&kbd.last_keys, &new_keys, cur_mods);
+    // Clone the Arc to get a reference without holding the global lock.
+    let node = Arc::clone(&kbd.evdev_node);
+    let (mod_events, cur_mods) = diff_modifiers(kbd.last_mods, new_mods, &node);
+    let key_events = diff_keycodes(&kbd.last_keys, &new_keys, cur_mods, &node);
 
     kbd.last_mods = new_mods;
     kbd.last_keys = new_keys;
@@ -321,12 +360,45 @@ pub async fn try_switch_to_report_protocol(
     Ok(())
 }
 
+// ── evdev capability set for a USB boot keyboard ─────────────────────
+
+/// Build the `DeviceCaps` for a USB boot-protocol keyboard.
+/// Registers the full boot-keycode range (Linux evdev codes 1..=127)
+/// plus the standard modifier keys.
+///
+/// Mirrors the i8042 keyboard capability setup in
+/// `drivers/input/src/i8042.rs::init`.
+pub fn keyboard_evdev_caps() -> DeviceCaps {
+    let mut caps = DeviceCaps::new();
+    // Boot-protocol keycode range (set-1 / evdev 1..=127).
+    for c in 1u16..=127 {
+        caps.add_key(c);
+    }
+    // Standard modifier + extended key evdev codes.
+    for c in [
+        key::BTN_LEFT, key::BTN_RIGHT, key::BTN_MIDDLE,
+        // Right-side modifier codes beyond 127.
+        97u16,  // KEY_RIGHTCTRL
+        100u16, // KEY_RIGHTALT
+        125u16, // KEY_LEFTMETA
+        126u16, // KEY_RIGHTMETA
+    ] {
+        caps.add_key(c);
+    }
+    caps
+}
+
 // ── Bind entry point (for the attach dispatcher) ──────────────────────
 
 /// Bind an already-addressed xHCI slot as a USB keyboard.
 /// Does NOT issue SET_CONFIGURATION (the attach dispatcher owns that).
 /// Does issue SET_PROTOCOL(Boot) + SET_IDLE.
-/// On success the keyboard is added to `USB_KEYBOARDS`.
+/// On success the keyboard is added to `USB_KEYBOARDS` and a
+/// DeviceNode is registered with the evdev ROUTER so the keyboard
+/// appears as `/dev/input/event<N>` for userspace.
+///
+/// Ref: `linux/drivers/hid/usbhid/usbkbd.c::usb_kbd_probe` pattern.
+/// GPL-2.0-or-later.
 pub async fn try_bind_keyboard_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -364,6 +436,9 @@ pub async fn try_bind_keyboard_already_addressed(
         .arm_interrupt_in(slot_id, interrupt_in_dci, 8)
         .map_err(HidError::Xhci)?;
 
+    // Register with the evdev ROUTER. Mirrors i8042.rs::init().
+    let (evdev_id, evdev_node) = ROUTER.register_device(keyboard_evdev_caps());
+
     let kbd = UsbKeyboard {
         slot_id,
         interrupt_in_dci,
@@ -374,6 +449,8 @@ pub async fn try_bind_keyboard_already_addressed(
         last_mods: 0,
         descriptor: None,
         leds: LedState::default(),
+        evdev_id,
+        evdev_node,
     };
     {
         let mut g = USB_KEYBOARDS.lock();
@@ -381,6 +458,18 @@ pub async fn try_bind_keyboard_already_addressed(
         ATTACHED_USB_KBD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
     }
     Ok(())
+}
+
+/// Unregister a USB keyboard's evdev DeviceNode from the ROUTER.
+/// Call when the device is detached/unplugged so `/dev/input/event<N>`
+/// disappears. Mirrors `input_unregister_device` in Linux.
+pub fn unregister_keyboard_evdev(slot_id: u8) {
+    let mut g = USB_KEYBOARDS.lock();
+    if let Some(pos) = g.iter().position(|k| k.slot_id == slot_id) {
+        let kbd = g.remove(pos);
+        ROUTER.unregister_device(kbd.evdev_id);
+        ATTACHED_USB_KBD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Drain reports from all bound USB keyboards, push events. Returns
@@ -433,14 +522,12 @@ pub(crate) mod tests {
     use narf_input::{pop_key, __reset_global_ring_for_test, init_global_ring, KeyCode};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    // ── Test 1: boot-protocol parse — no keys ────────────────────────
-
-    fn smoke_kbd_boot_no_keys() -> TestResult {
-        init_global_ring(64);
-        __reset_global_ring_for_test();
-        narf_input::__reset_modifiers_for_test();
-
-        let mut kbd = UsbKeyboard {
+    /// Build a test `UsbKeyboard` already wired to a fresh evdev DeviceNode.
+    /// Each test that calls `process_boot_report` or `diff_keycodes` should
+    /// use this so it gets a valid `evdev_node`.
+    fn make_test_kbd() -> UsbKeyboard {
+        let (evdev_id, evdev_node) = ROUTER.register_device(keyboard_evdev_caps());
+        UsbKeyboard {
             slot_id: 0,
             interrupt_in_dci: 0,
             interface_num: 0,
@@ -450,7 +537,19 @@ pub(crate) mod tests {
             last_mods: 0,
             descriptor: None,
             leds: LedState::default(),
-        };
+            evdev_id,
+            evdev_node,
+        }
+    }
+
+    // ── Test 1: boot-protocol parse — no keys ────────────────────────
+
+    fn smoke_kbd_boot_no_keys() -> TestResult {
+        init_global_ring(64);
+        __reset_global_ring_for_test();
+        narf_input::__reset_modifiers_for_test();
+
+        let mut kbd = make_test_kbd();
         let raw = [0u8; 8];
         let n = process_boot_report(&mut kbd, &raw);
         if n != 0 {
@@ -467,17 +566,7 @@ pub(crate) mod tests {
         __reset_global_ring_for_test();
         narf_input::__reset_modifiers_for_test();
 
-        let mut kbd = UsbKeyboard {
-            slot_id: 0,
-            interrupt_in_dci: 0,
-            interface_num: 0,
-            protocol: KbdProtocol::Boot,
-            led_report_id: None,
-            last_keys: [0u8; 6],
-            last_mods: 0,
-            descriptor: None,
-            leds: LedState::default(),
-        };
+        let mut kbd = make_test_kbd();
         // LSHIFT (0x02) held, keys A(0x04), B(0x05), C(0x06).
         let raw: [u8; 8] = [0x02, 0x00, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00];
         let n = process_boot_report(&mut kbd, &raw);
@@ -525,17 +614,7 @@ pub(crate) mod tests {
         __reset_global_ring_for_test();
         narf_input::__reset_modifiers_for_test();
 
-        let mut kbd = UsbKeyboard {
-            slot_id: 0,
-            interrupt_in_dci: 0,
-            interface_num: 0,
-            protocol: KbdProtocol::Boot,
-            led_report_id: None,
-            last_keys: [0u8; 6],
-            last_mods: 0,
-            descriptor: None,
-            leds: LedState::default(),
-        };
+        let mut kbd = make_test_kbd();
         // Rollover: all keycode slots = 0x01.
         let raw: [u8; 8] = [0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01];
         let n = process_boot_report(&mut kbd, &raw);
@@ -577,17 +656,7 @@ pub(crate) mod tests {
         __reset_global_ring_for_test();
         narf_input::__reset_modifiers_for_test();
 
-        let mut kbd = UsbKeyboard {
-            slot_id: 0,
-            interrupt_in_dci: 0,
-            interface_num: 0,
-            protocol: KbdProtocol::Boot,
-            led_report_id: None,
-            last_keys: [0u8; 6],
-            last_mods: 0,
-            descriptor: None,
-            leds: LedState::default(),
-        };
+        let mut kbd = make_test_kbd();
         // Press Enter.
         let press: [u8; 8] = [0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00];
         process_boot_report(&mut kbd, &press);
@@ -613,10 +682,11 @@ pub(crate) mod tests {
         __reset_global_ring_for_test();
         narf_input::__reset_modifiers_for_test();
 
+        let (_id, node) = ROUTER.register_device(keyboard_evdev_caps());
         let prev = [0u8; 6];
         let cur: [u8; 6] = [0x04, 0x05, 0, 0, 0, 0]; // A, B
         let mods = Modifiers::EMPTY;
-        let n = diff_keycodes(&prev, &cur, mods);
+        let n = diff_keycodes(&prev, &cur, mods, &node);
         if n != 2 {
             return TestResult::Fail("expected 2 press events");
         }
@@ -648,17 +718,7 @@ pub(crate) mod tests {
         __reset_global_ring_for_test();
         narf_input::__reset_modifiers_for_test();
 
-        let mut kbd = UsbKeyboard {
-            slot_id: 0,
-            interrupt_in_dci: 0,
-            interface_num: 0,
-            protocol: KbdProtocol::Boot,
-            led_report_id: None,
-            last_keys: [0u8; 6],
-            last_mods: 0,
-            descriptor: None,
-            leds: LedState::default(),
-        };
+        let mut kbd = make_test_kbd();
         // RightAlt pressed (bit 6 of modifier byte).
         let raw: [u8; 8] = [kbd_mod::RALT, 0, 0, 0, 0, 0, 0, 0];
         let n = process_boot_report(&mut kbd, &raw);

@@ -1364,18 +1364,22 @@ fn smoke_hid_boot_mouse_parse() -> TestResult {
 kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_parse);
 
 fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
-    use crate::hid::mouse::{self, BootMouse, MouseReport};
+    use crate::hid::mouse::{self, BootMouse, MouseReport, boot_mouse_evdev_caps};
     use narf_input::{
+        evdev::ROUTER,
         init_global_ring, pop_global, InputEvent, PointerButtons, __reset_global_ring_for_test,
     };
 
     init_global_ring(64);
     __reset_global_ring_for_test();
+    let (evdev_id, evdev_node) = ROUTER.register_device(boot_mouse_evdev_caps());
     let mut m = BootMouse {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
         last_buttons: 0,
+        evdev_id,
+        evdev_node,
     };
 
     // Idle report → no event.
