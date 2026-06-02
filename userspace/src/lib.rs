@@ -60,6 +60,7 @@ pub mod xdp_socket;
 
 mod tests;
 mod process_e2e_tests;
+mod shell_e2e_tests;
 
 pub use interp::{lookup_interpreter, register_interpreter};
 
