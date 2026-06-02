@@ -83,7 +83,7 @@ mod sysfs_e2e_tests;
 mod uevent_e2e_tests;
 mod procsys_e2e_tests;
 mod fs_mount_e2e_tests;
-pub use devfs::{install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks, mount_default as mount_devfs_default, register_snd_dir, register_tpm, unregister_tpm, DevFs};
+pub use devfs::{install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks, mount_default as mount_devfs_default, register_dri_dir, register_snd_dir, register_tpm, unregister_tpm, DevFs};
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,

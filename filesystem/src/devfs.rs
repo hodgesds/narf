@@ -314,6 +314,27 @@ fn video_enumerate() -> Vec<(String, FileType)> {
     f()
 }
 
+// ── /dev/dri/ delegate ────────────────────────────────────────────────
+
+/// Delegate for `/dev/dri/*`, installed by the DRM GPU driver bridge.
+///
+/// Provides `/dev/dri/card<N>` and `/dev/dri/renderD<N+128>` entries.
+/// Same hook/delegate pattern as `SND_DIR` (sound subsystem) to avoid a
+/// circular dependency between `narf-filesystem` and `narf-drivers-gpu`.
+///
+/// Linux ref: `drivers/gpu/drm/drm_drv.c::drm_dev_register` — minor allocation.
+static DRI_DIR: IrqSafeSpinLock<Option<Arc<dyn DirOps>>> = IrqSafeSpinLock::new(None);
+
+/// Register (or replace) the `/dev/dri/` directory delegate.
+///
+/// Called once from `narf_drivers_gpu::drm_devfs_bridge::install_dri_dir()`.
+/// Idempotent.
+///
+/// Linux ref: `drm_dev_register` (drivers/gpu/drm/drm_drv.c).
+pub fn register_dri_dir(dir: Arc<dyn DirOps>) {
+    *DRI_DIR.lock() = Some(dir);
+}
+
 // ── /dev/snd/ delegate ────────────────────────────────────────────────
 
 /// Delegate for `/dev/snd/*`, installed by the sound driver.
@@ -733,6 +754,9 @@ impl DirOps for DevDir {
             "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
             // Sound subsystem — delegate installed by narf-drivers-sound.
             "snd"   => SND_DIR.lock().clone(),
+            // DRM/DRI subsystem — delegate installed by narf-drivers-gpu.
+            // Linux ref: `drivers/gpu/drm/drm_drv.c::drm_dev_register`.
+            "dri"   => DRI_DIR.lock().clone(),
             _ => None,
         }
     }
@@ -771,6 +795,7 @@ impl DirOps for DevDir {
             DirEntry { name: "disk",    file_type: FileType::Dir },
             DirEntry { name: "input",   file_type: FileType::Dir },
             DirEntry { name: "snd",     file_type: FileType::Dir },
+            DirEntry { name: "dri",     file_type: FileType::Dir },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -796,6 +821,7 @@ impl DirOps for DevDir {
             ("disk",    FileType::Dir),
             ("input",   FileType::Dir),
             ("snd",     FileType::Dir),
+            ("dri",     FileType::Dir),
         ];
         let static_names: Vec<String> = static_entries.iter().map(|(n, _)| (*n).into()).collect();
         let block_extras: Vec<(String, FileType)> =
