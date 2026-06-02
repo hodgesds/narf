@@ -1389,6 +1389,96 @@ unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock
     }
 }
 
+// ── VBIOS image acquisition ────────────────────────────────────────────────
+//
+// AMD GPUs expose their VBIOS through the PCI expansion ROM BAR (cfg+0x30).
+// Protocol (per AMD amdgpu_bios.c::amdgpu_read_bios, lines 101-140):
+//   1. Read ROM BAR address from cfg+0x30 (bits[31:11] = phys base).
+//   2. Probe the ROM header for presence / size field.
+//   3. Slurp bytes into a heap Vec<u8>.
+//   4. Parse ATOMBIOS header, extract version string.
+//
+// On any failure, returns None without affecting probe.
+// Linux ref: drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c::amdgpu_read_bios.
+
+/// Try to read the VBIOS from the PCI expansion ROM BAR and parse the
+/// ATOMBIOS version string.  Returns `None` on any failure.
+///
+/// # Safety
+/// Caller holds `cap` (authority over the PCI device). Reads are
+/// performed through the identity-mapped MMIO path; garbage reads
+/// are safe (we check for the 0xFF sentinel before proceeding).
+unsafe fn read_vbios_version_from_rom(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Option<alloc::string::String> {
+    use narf_bus::bar::{BarKind, MmioRegion};
+    use narf_memory::PhysAddr;
+
+    // Get the expansion ROM BAR address from the PCI config snapshot.
+    let saved = narf_bus::pci::save_config(cap, device).ok()?;
+    let rom_bar_reg = saved.expansion_rom_bar;
+
+    // Bits[31:11] are the phys base; bit 0 = ROM_ENABLE.
+    let rom_phys_base = rom_bar_reg & !0x1u32;
+    if rom_phys_base == 0 {
+        return None;
+    }
+    let rom_phys = rom_phys_base as u64;
+
+    // Map a small probe window to read the PCI ROM header (first 3 bytes).
+    let probe_region = MmioRegion {
+        phys: PhysAddr::new(rom_phys),
+        len: 512,
+        kind: BarKind::Mmio32 { prefetchable: false },
+    };
+
+    // Guard against unmapped / absent ROM (reads back 0xFF 0xFF).
+    // SAFETY: identity-mapped MMIO in NARF's kernel context.
+    let b0 = unsafe { probe_region.read8(0) };
+    let b1 = unsafe { probe_region.read8(1) };
+    if b0 == 0xFF && b1 == 0xFF {
+        return None;
+    }
+
+    // PCI ROM header byte 2: image size in 512-byte blocks.
+    let blocks = unsafe { probe_region.read8(2) };
+    let rom_size: u64 = if blocks == 0 {
+        65536 // fallback: 64 KiB
+    } else {
+        (blocks as u64).saturating_mul(512)
+    }
+    // Hard cap: real AMD VBIOSes are <= 256 KiB.
+    .min(256 * 1024);
+
+    // Re-map with the full ROM size.
+    let region = MmioRegion {
+        phys: PhysAddr::new(rom_phys),
+        len: rom_size,
+        kind: BarKind::Mmio32 { prefetchable: false },
+    };
+
+    // Slurp ROM bytes via 32-bit reads.
+    let n_bytes = rom_size as usize;
+    let mut buf = alloc::vec![0u8; n_bytes];
+    let n4 = n_bytes / 4;
+    for i in 0..n4 {
+        // SAFETY: offset i*4 is within [0, rom_size).
+        let word = unsafe { region.read32(i as u64 * 4) };
+        let bytes = word.to_le_bytes();
+        buf[i * 4] = bytes[0];
+        buf[i * 4 + 1] = bytes[1];
+        buf[i * 4 + 2] = bytes[2];
+        buf[i * 4 + 3] = bytes[3];
+    }
+
+    // Parse the ATOMBIOS header and extract the version string.
+    match crate::atombios::parse(&buf) {
+        Ok(atom) => atom.version,
+        Err(_) => None,
+    }
+}
+
 // ── Driver-match registration ───────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
@@ -1424,6 +1514,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
+    // Attempt to read the VBIOS image from the PCI expansion ROM BAR
+    // and parse the ATOMBIOS version string. Falls back to None on
+    // any failure without affecting probe success.
+    //
+    // SAFETY: caller-authority over the device. ROM BAR is read-only
+    // from the CPU side once the phys address is known.
+    // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
+    let vbios_version: Option<alloc::string::String> =
+        unsafe { read_vbios_version_from_rom(&cap, &device) };
+
     // Register with the DRM card registry so /sys/class/drm/card<N>/
     // and /dev/dri/card<N> appear after Stage::Late.
     // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
@@ -1434,9 +1534,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             card_name,
             device.id.vendor,
             device.id.device,
-            0, // subsystem_vendor: not in BusDevice; deferred
-            0, // subsystem_device: not in BusDevice; deferred
-            None, // vbios_version: deferred until ATOMBIOS parse lands
+            0, // subsystem_vendor: not in BusDevice::id; deferred
+            0, // subsystem_device: not in BusDevice::id; deferred
+            vbios_version,
         );
         crate::drm_registry::register_drm_card(alloc::sync::Arc::new(amdgpu_card));
     }
