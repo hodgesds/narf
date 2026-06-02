@@ -79,6 +79,8 @@ pub mod sysfs_bridge;
 
 mod tests;
 
+#[cfg(feature = "kernel-test")] mod e2e_tests;
+
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
