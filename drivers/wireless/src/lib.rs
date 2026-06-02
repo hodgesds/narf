@@ -13,6 +13,9 @@ pub mod rtlwifi;
 pub mod rtw88;
 pub mod rtw89;
 
+#[cfg(feature = "kernel-test")]
+mod e2e_tests;
+
 use narf_init::{InitResult, Stage};
 
 pub fn register_initcalls() {
