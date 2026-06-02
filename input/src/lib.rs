@@ -18,6 +18,7 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -881,6 +882,17 @@ static ABSOLUTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(
 static TOUCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static BUTTON_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 
+/// Single waker slot for the `WaitAsciiByteFuture`. There is at most one
+/// console reader blocked on stdin at any time (NARF's shell is single-
+/// threaded). If a second waiter ever appears it simply overwrites the
+/// first — both will be rescheduled by the next byte anyway.
+///
+/// The IRQ handler calls `pop_ascii_byte` (which holds the BYTE_RING lock
+/// very briefly), so this waker lock must be acquired *after* the ring is
+/// released to avoid inversion. `push_global_ascii_and_wake` always takes
+/// the ring first, then the waker slot.
+static BYTE_RING_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+
 fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
     match ev {
         InputEvent::Key(_) => &KEY_RING,
@@ -979,6 +991,12 @@ pub fn __reset_modifiers_for_test() {
 
 /// Push an event onto the appropriate per-class ring. Silently
 /// drops if `init_global_ring` hasn't been called.
+///
+/// When the event is `AsciiByte`, any waker registered via
+/// `WaitAsciiByteFuture` is picked up and queued through
+/// `narf_lib::deferred_wake` so the serial IRQ handler can wake the
+/// blocked console reader from IRQ context without dropping an `Arc`
+/// under the lock.
 pub fn push_global(ev: InputEvent) -> bool {
     let is_key = matches!(ev, InputEvent::Key(_));
     let is_ascii = matches!(ev, InputEvent::AsciiByte(_));
@@ -992,6 +1010,15 @@ pub fn push_global(ev: InputEvent) -> bool {
             }
             if is_ascii {
                 ASCII_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // Wake the console reader. Drop the ring lock first so
+                // the waker lock is always taken after the ring — this
+                // matches the acquire order in `WaitAsciiByteFuture::poll`.
+                drop(g);
+                let maybe_waker = BYTE_RING_WAKER.lock().take();
+                if let Some(w) = maybe_waker {
+                    narf_lib::deferred_wake::push_pending(core::iter::once(Some(w)));
+                }
+                return ok;
             }
         }
         ok
@@ -1039,6 +1066,57 @@ pub fn pop_ascii_byte() -> Option<u8> {
         Some(b)
     } else {
         None
+    }
+}
+
+/// Return a future that resolves to the next byte from the ASCII/serial
+/// input ring, blocking the current task until one arrives.
+///
+/// Uses the `BYTE_RING_WAKER` slot: on the first `Poll::Pending` the
+/// future stores `cx.waker()` there. When `push_global(AsciiByte(_))`
+/// runs (from the serial IRQ handler via `deferred_wake`) the stored
+/// waker is queued for wake-up.
+///
+/// Raw mode — returns as soon as any single byte is available. Line
+/// discipline (echo, backspace processing, newline buffering) is the
+/// caller's responsibility; the NARF shell already does this in its own
+/// read loop.
+pub fn wait_ascii_byte() -> WaitAsciiByteFuture {
+    WaitAsciiByteFuture { _priv: () }
+}
+
+/// Future returned by [`wait_ascii_byte`].
+#[derive(Debug)]
+pub struct WaitAsciiByteFuture {
+    _priv: (),
+}
+
+impl core::future::Future for WaitAsciiByteFuture {
+    type Output = u8;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<u8> {
+        // Try to pop a byte first — avoids registering a waker if data
+        // is already available (common when multiple bytes arrive in a
+        // burst before the task is rescheduled).
+        if let Some(b) = pop_ascii_byte() {
+            return core::task::Poll::Ready(b);
+        }
+        // No byte yet. Register our waker so the next push wakes us.
+        // Lock order: BYTE_RING_WAKER after BYTE_RING pop (already released
+        // above) — matches the producer's drop-ring-then-lock-waker order.
+        *BYTE_RING_WAKER.lock() = Some(cx.waker().clone());
+        // Re-check after registering the waker to close the window where
+        // a byte arrives between pop and register.
+        if let Some(b) = pop_ascii_byte() {
+            // Byte raced in. Clear the waker we just stored (no need to
+            // wake ourselves again).
+            BYTE_RING_WAKER.lock().take();
+            return core::task::Poll::Ready(b);
+        }
+        core::task::Poll::Pending
     }
 }
 
