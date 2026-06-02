@@ -1126,6 +1126,26 @@ pub enum Syscall {
     /// F_GETFD / F_SETFD / F_GETFL / F_SETFL.
     Fcntl,
 
+    /// `arg0 = fd`, `arg1 = cmd` (u32), `arg2 = arg` (usize — typically
+    /// a user-pointer to an inout struct). Linux `ioctl(2)`
+    /// (x86_64 = 16, aarch64 = 29). Dispatches through `FileOps::ioctl`
+    /// on the per-fd op vtable.
+    ///
+    /// The `cmd` word follows Linux's `_IOC` encoding (dir | size |
+    /// type | nr); the per-FileOps impl decides which numbers it
+    /// recognises. The default `FileOps::ioctl` returns
+    /// `FsError::Unsupported` which surfaces as `-ENOTTY` (25) at this
+    /// syscall layer — matching Linux's behaviour for fds whose driver
+    /// has no ioctl handler.
+    ///
+    /// Wave 36 wires this so `/dev/dri/card<N>` + `/dev/dri/renderD<N>`
+    /// dispatch the `DRM_IOCTL_*` set via
+    /// `drivers/gpu/src/drm/ioctl.rs::dispatch`.
+    ///
+    /// Linux ref: `fs/ioctl.c::SYSCALL_DEFINE3(ioctl, ...)` +
+    /// `include/uapi/asm-generic/ioctl.h` for the `_IOC` macro.
+    Ioctl,
+
     // ── Working-directory state ────────────────────────────────────
     //
     // Slots 170/171 sit above the dup family (160..=163) so the cwd
@@ -1326,6 +1346,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Sigaction, 13),       // rt_sigaction
     (Syscall::Sigprocmask, 14),     // rt_sigprocmask
     (Syscall::Sigreturn, 15),       // rt_sigreturn
+    (Syscall::Ioctl, 16),
     (Syscall::Pread64, 17),
     (Syscall::Pwrite64, 18),
     (Syscall::Access, 21),
@@ -1468,6 +1489,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Dup, 23),
     (Syscall::Dup3, 24),
     (Syscall::Fcntl, 25),
+    (Syscall::Ioctl, 29),
     (Syscall::Flock, 32),
     (Syscall::Mkdirat, 34),
     (Syscall::Unlinkat, 35),

@@ -965,6 +965,60 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── ioctl(2) ───────────────────────────────────────────────────────
+//
+// Generic ioctl dispatcher. `cmd` is the Linux-shaped `_IOC` encoded
+// request word (dir|size|type|nr); `arg` is the raw user-pointer
+// argument the caller passed in RDX (on x86_64). Every per-fd
+// `FileOps` impl decides which `cmd` values it recognises, validates
+// the user pointer with the `copy_from_user` / `copy_to_user`
+// helpers, and returns a non-negative i64 on success or
+// `FsError::Unsupported` (→ ENOTTY) for an unknown number.
+//
+// EBADF on closed fd; ENOTTY on a FileOps without an `ioctl` impl
+// or on an unrecognised cmd — mirrors Linux's `do_vfs_ioctl`.
+
+/// Linux ENOTTY value (25 — "inappropriate ioctl for device").
+const ENOTTY: u64 = 25;
+/// Linux EBADF value (9).
+const EBADF: u64 = 9;
+
+fn sys_ioctl(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let cmd = args.arg1 as u32;
+    let arg = args.arg2 as usize;
+    let task = current_task_id();
+    // Clone the Arc out of the fd table so we drop the table lock
+    // before invoking the FileOps::ioctl body (which may take
+    // device-internal locks of its own).
+    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
+    let ops = match ops {
+        Some(Some(o)) => o,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        }
+    };
+    match ops.ioctl(cmd, arg) {
+        Ok(rc) => ctx.set_return(SyscallReturn::ok(rc as u64)),
+        Err(narf_filesystem::FsError::Unsupported) => {
+            ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+        }
+        Err(narf_filesystem::FsError::PermissionDenied) => {
+            // EACCES = 13
+            ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+        }
+        Err(narf_filesystem::FsError::InvalidData)
+        | Err(narf_filesystem::FsError::InvalidPath) => {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        }
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        }
+    }
+}
+
 // ── Stat / Fstat ───────────────────────────────────────────────────
 //
 // `StatBuf` is the kernel-user wire-stable shape NARF surfaces today.
@@ -9158,6 +9212,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Dup2, "dup2", RawFnHandler(sys_dup2));
     table.install_raw(Syscall::Dup3, "dup3", RawFnHandler(sys_dup3));
     table.install_raw(Syscall::Fcntl, "fcntl", RawFnHandler(sys_fcntl));
+    table.install_raw(Syscall::Ioctl, "ioctl", RawFnHandler(sys_ioctl));
     table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
     table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
     table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));

@@ -192,10 +192,16 @@ fn build_cpio_archive(entries: &[CpioEntry<'_>]) -> Vec<u8> {
     }
 
     // TRAILER!!! sentinel.
+    // CPIO newc header has 13 fields after the magic:
+    //   1:  c_ino       2:  c_mode     3:  c_uid      4:  c_gid
+    //   5:  c_nlink     6:  c_mtime    7:  c_filesize  8:  c_devmajor
+    //   9:  c_devminor  10: c_rdevmajor 11: c_rdevminor
+    //   12: c_namesize  13: c_check
+    // Write fields 1–11 as zero, then the real namesize, then check.
     let trailer = b"TRAILER!!!";
     let namesize = trailer.len() + 1;
     out.extend_from_slice(b"070701");
-    for _ in 0..13 {
+    for _ in 0..11 {
         write_hex8(&mut out, 0);
     }
     write_hex8(&mut out, namesize as u32);
