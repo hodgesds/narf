@@ -179,6 +179,9 @@ pub mod nvidia_gpu_pmc;
 
 mod tests;
 
+#[cfg(feature = "kernel-test")]
+mod e2e_tests;
+
 /// Stage::Subsys initcalls — register every GPU driver with the
 /// bus match table. Stage::Late initcalls hook DP Alt Mode →
 /// GPU bridges into the usbpd registry so a USB-C port that finishes
