@@ -110,6 +110,7 @@ pub enum GpuError {
     InvalidSubmission,
 }
 
+pub mod atombios;
 pub mod dmabuf;
 pub mod drm;
 pub mod drm_registry;
