@@ -24,6 +24,7 @@ pub mod ufs;
 pub mod vmd;
 
 mod tests;
+mod e2e_tests;
 
 /// Stage::Subsys + Stage::Device initcalls for this driver crate.
 pub fn register_initcalls() {
