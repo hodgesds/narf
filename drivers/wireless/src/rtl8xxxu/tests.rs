@@ -455,18 +455,18 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_phy_tables_apply_loo
 fn smoke_rtl8xxxu_8188eu_per_chip() -> TestResult {
     use super::rtl8188e;
 
-    // Row-count constants — match Linux 8188e.c.
-    if rtl8188e::N_MAC_ROWS != 83 {
-        return TestResult::Fail("8188e N_MAC_ROWS != 83");
+    // Row-count constants — match Linux 8188e.c (Wave 36: populated).
+    if rtl8188e::N_MAC_ROWS != 92 {
+        return TestResult::Fail("8188e N_MAC_ROWS != 92");
     }
-    if rtl8188e::N_PHY_ROWS != 195 {
-        return TestResult::Fail("8188e N_PHY_ROWS != 195");
+    if rtl8188e::N_PHY_ROWS != 192 {
+        return TestResult::Fail("8188e N_PHY_ROWS != 192");
     }
     if rtl8188e::N_AGC_ROWS != 130 {
         return TestResult::Fail("8188e N_AGC_ROWS != 130");
     }
-    if rtl8188e::N_RF_A_ROWS != 80 {
-        return TestResult::Fail("8188e N_RF_A_ROWS != 80");
+    if rtl8188e::N_RF_A_ROWS != 95 {
+        return TestResult::Fail("8188e N_RF_A_ROWS != 95");
     }
     if rtl8188e::NUM_RF_PATHS != 1 {
         return TestResult::Fail("8188e is 1T1R");
@@ -511,13 +511,51 @@ fn smoke_rtl8xxxu_8188eu_per_chip() -> TestResult {
         return TestResult::Fail("8188e channel set should emit 1 write");
     }
 
-    // init_mac / init_phy / init_rf with empty tables: should be 0 ops.
-    let mut count = 0usize;
-    let _ = rtl8188e::init_mac(|_r, _v| count += 1);
-    let _ = rtl8188e::init_phy(|_r, _v| count += 1);
-    let _ = rtl8188e::init_rf(|_r, _v| count += 1);
-    if count != 0 {
-        return TestResult::Fail("8188e empty tables should not invoke writer");
+    // init_mac / init_phy / init_rf with populated tables — call counts
+    // must match the N_*_ROWS constants exactly.
+    let mut mac_count = 0usize;
+    let n_mac = rtl8188e::init_mac(|_r, _v| mac_count += 1);
+    if n_mac != rtl8188e::N_MAC_ROWS || mac_count != rtl8188e::N_MAC_ROWS {
+        return TestResult::Fail("8188e init_mac call count != N_MAC_ROWS");
+    }
+    let mut phy_count = 0usize;
+    let n_phy = rtl8188e::init_phy(|_r, _v| phy_count += 1);
+    let n_expected = rtl8188e::N_PHY_ROWS + rtl8188e::N_AGC_ROWS;
+    if n_phy != n_expected || phy_count != n_expected {
+        return TestResult::Fail("8188e init_phy != N_PHY+N_AGC");
+    }
+    let mut rf_count = 0usize;
+    let n_rf = rtl8188e::init_rf(|_r, _v| rf_count += 1);
+    if n_rf != rtl8188e::N_RF_A_ROWS || rf_count != rtl8188e::N_RF_A_ROWS {
+        return TestResult::Fail("8188e init_rf != N_RF_A_ROWS");
+    }
+    // First MAC row should be (0x026, 0x41) per Linux 8188e.c L20.
+    let first_mac = rtl8188e::MAC_INIT_TABLE[0];
+    if first_mac.reg != 0x026 || first_mac.val != 0x41 {
+        return TestResult::Fail("8188e MAC first row != (0x026, 0x41)");
+    }
+    // First BB row should be (0x800, 0x80040000) per Linux 8188e.c L47.
+    let first_bb = rtl8188e::PHY_INIT_TABLE[0];
+    if first_bb.reg != 0x800 || first_bb.val != 0x80040000 {
+        return TestResult::Fail("8188e BB first row != (0x800, 0x80040000)");
+    }
+    // First RF row should be (0x00, 0x00030000) per Linux 8188e.c L216.
+    let first_rf = rtl8188e::RADIO_A_INIT_TABLE[0];
+    if first_rf.reg != 0x00 || first_rf.val != 0x00030000 {
+        return TestResult::Fail("8188e RF-A first row != (0x00, 0x00030000)");
+    }
+    // IQK values populated — step 0 = REG_TX_IQK_TONE_A val 0x10008c1f.
+    let mut iqk2 = [super::phy::IqkStep { reg: 0, val: 0 };
+                    rtl8188e::IQK_PATH_A_STEP_COUNT];
+    rtl8188e::build_iqk_path_a_sequence(&mut iqk2);
+    if iqk2[0].val != 0x10008c1f {
+        return TestResult::Fail("8188e IQK step 0 val != 0x10008c1f");
+    }
+    if iqk2[2].val != 0x82140102 {
+        return TestResult::Fail("8188e IQK step 2 val != 0x82140102");
+    }
+    if iqk2[5].val != 0xf9000000 || iqk2[6].val != 0xf8000000 {
+        return TestResult::Fail("8188e IQK step 5/6 trigger values wrong");
     }
 
     TestResult::Pass

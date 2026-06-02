@@ -67,17 +67,17 @@ pub const MAX_SEC_CAM: usize = 32;
 // Each table buffer is sized to fit `N_*` rows plus the sentinel.
 
 /// Row count of `rtl8188e_mac_init_table[]` excluding sentinel.
-/// Source: `8188e.c` L19..L43.
-pub const N_MAC_ROWS: usize = 83;
+/// Source: `8188e.c` L19..L44. Counted: 92 (verified against Linux v6.13).
+pub const N_MAC_ROWS: usize = 92;
 /// Row count of `rtl8188eu_phy_init_table[]` excluding sentinel.
-/// Source: `8188e.c` L46..L144.
-pub const N_PHY_ROWS: usize = 195;
+/// Source: `8188e.c` L46..L144. Counted: 192.
+pub const N_PHY_ROWS: usize = 192;
 /// Row count of `rtl8188e_agc_table[]` excluding sentinel.
-/// Source: `8188e.c` L146..L213.
+/// Source: `8188e.c` L146..L213. Counted: 130.
 pub const N_AGC_ROWS: usize = 130;
 /// Row count of `rtl8188eu_radioa_init_table[]` excluding sentinel.
-/// Source: `8188e.c` L215..L265.
-pub const N_RF_A_ROWS: usize = 80;
+/// Source: `8188e.c` L215..L265. Counted: 95.
+pub const N_RF_A_ROWS: usize = 95;
 
 // ── Stage-0 register bank (USB write-8) ────────────────────────────
 
@@ -97,20 +97,26 @@ pub fn stage0_register_bank() -> &'static [(u16, u8)] {
 
 // ── Table sentinels — declared empty, populated at integration time ──
 
-/// MAC init table. Empty plus sentinel here; populated from
-/// `8188e.c::rtl8188e_mac_init_table[]` L19..L43 at firmware-bundle time.
-pub const MAC_INIT_TABLE: &[MacRow] = &[MacRow::SENTINEL];
+/// MAC init table.
+///
+/// Source: `8188e.c::rtl8188e_mac_init_table[]` L19..L44 (verbatim port).
+/// Table lives in `super::phy_tables::MAC_REGS_8188E`.
+pub const MAC_INIT_TABLE: &[MacRow] = super::phy_tables::MAC_REGS_8188E;
 
-/// PHY/BB init table. Populated from `rtl8188eu_phy_init_table[]`
-/// L46..L144.
-pub const PHY_INIT_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
+/// PHY/BB init table.
+///
+/// Source: `8188e.c::rtl8188eu_phy_init_table[]` L46..L144 (verbatim port).
+pub const PHY_INIT_TABLE: &[Reg32Val] = super::phy_tables::BB_REGS_8188E;
 
-/// AGC table. Populated from `rtl8188e_agc_table[]` L146..L213.
-pub const AGC_TABLE: &[Reg32Val] = &[Reg32Val::SENTINEL];
+/// AGC table.
+///
+/// Source: `8188e.c::rtl8188e_agc_table[]` L146..L213 (verbatim port).
+pub const AGC_TABLE: &[Reg32Val] = super::phy_tables::AGC_REGS_8188E;
 
-/// RF path A init table. Populated from
-/// `rtl8188eu_radioa_init_table[]` L215..L265.
-pub const RADIO_A_INIT_TABLE: &[RfRow] = &[RfRow::SENTINEL];
+/// RF path A init table.
+///
+/// Source: `8188e.c::rtl8188eu_radioa_init_table[]` L215..L265 (verbatim port).
+pub const RADIO_A_INIT_TABLE: &[RfRow] = super::phy_tables::RF_A_REGS_8188E;
 
 /// Path count for this chip. 8188EU is 1T1R, so path A only.
 pub const NUM_RF_PATHS: usize = 1;
@@ -145,15 +151,18 @@ pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
     if buf.len() < IQK_PATH_A_STEP_COUNT {
         return 0;
     }
-    // The address sequence is fixed; values are firmware-side magic
-    // numbers (see Linux source L615..L627 for the canonical values).
-    buf[0] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0 };
-    buf[1] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0 };
-    buf[2] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0 };
-    buf[3] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0 };
-    buf[4] = IqkStep { reg: REG_IQK_AGC_RSP,   val: 0 };
-    buf[5] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
-    buf[6] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
+    // Source: `core.c::rtl8xxxu_iqk_path_a` L3094..L3117 — these are the
+    // shared gen1 IQK values 8188EU uses. 8188EU is 1T1R so the
+    // `priv->rf_paths > 1` branch is never taken → RX_IQK_PI_A=0x28160502.
+    buf[0] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0x10008c1f };
+    buf[1] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0x10008c1f };
+    buf[2] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0x82140102 };
+    buf[3] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0x28160502 };
+    // LO calibration setting.
+    buf[4] = IqkStep { reg: REG_IQK_AGC_RSP,   val: 0x001028d1 };
+    // One shot, path A LOK & IQK — two writes to AGC_PTS.
+    buf[5] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0xf9000000 };
+    buf[6] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0xf8000000 };
     IQK_PATH_A_STEP_COUNT
 }
 
