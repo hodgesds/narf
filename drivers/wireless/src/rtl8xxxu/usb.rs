@@ -503,11 +503,11 @@ impl Rtl8xxxuTransport for FakeUsbTransport {
     fn read8(&self, addr: u16) -> Result<u8, TransportError> {
         let mut g = self.inner.borrow_mut();
         let mut v = (*g.regs.get(&addr).unwrap_or(&0)) as u8;
-        // FW-download self-progression: REG_MCU_FW_DL low byte gets
-        // CSUM_REPORT set after the first read once `csum_ready` is armed.
+        // FW-download self-progression: once armed the CSUM_REPORT bit
+        // stays set on every read (sticky) so the driver's poll loop
+        // sees a match regardless of how many iterations it takes.
         if addr == REG_MCU_FW_DL && g.csum_ready {
             v |= MCU_FW_DL_CSUM_REPORT;
-            g.csum_ready = false;
         }
         g.log.push(FakeOp::Read8(addr));
         Ok(v)
@@ -525,11 +525,9 @@ impl Rtl8xxxuTransport for FakeUsbTransport {
         let mut v = *g.regs.get(&addr).unwrap_or(&0);
         if addr == REG_MCU_FW_DL && g.csum_ready {
             v |= MCU_FW_DL_CSUM_REPORT as u32;
-            g.csum_ready = false;
         }
         if addr == REG_MCU_FW_DL && g.init_ready {
             v |= MCU_WINT_INIT_READY;
-            g.init_ready = false;
         }
         g.log.push(FakeOp::Read32(addr));
         Ok(v)
