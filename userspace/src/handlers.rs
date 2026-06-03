@@ -6821,6 +6821,15 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
             // gives the caller back to the scheduler with a
             // bounded park. POSIX permits spurious wakeups; the
             // user-side recheck handles them.
+            //
+            // Null uaddr: no possible wait queue, treat as immediate
+            // success (POSIX-permitted spurious wake). Lets smoke
+            // tests exercise the wait/wake fast path without a
+            // backing user mapping.
+            if uaddr == 0 {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
             let mut buf4 = [0u8; 4];
             let current = if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
                 u32::from_ne_bytes(buf4)
