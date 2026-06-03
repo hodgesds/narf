@@ -967,13 +967,13 @@ fn e2e_aml_concatenate_buffers() -> TestResult {
     // PkgLength total = 1(PkgLen byte) + 1(BytePrefix) + 1(size) + 1(data) = 4
     let buf_aa: &[u8] = &[
         0x11, // BufferOp
-        0x05, // PkgLength = 5 (1 PkgLen + 2 size + 1 data = 4 content, total 5)
+        0x04, // PkgLength = 4 (1 PkgLen + 2 size + 1 data)
         0x0A, 0x01, // BytePrefix 1 (size)
         0xAA,
     ];
     let buf_bb: &[u8] = &[
         0x11, // BufferOp
-        0x05,
+        0x04,
         0x0A, 0x01,
         0xBB,
     ];
