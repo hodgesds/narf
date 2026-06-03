@@ -1833,13 +1833,17 @@ pub fn block_on_spin<F: Future>(fut: F) -> F::Output {
 fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     use core::pin::Pin;
     use core::task::{Context, Poll};
-    // Defensive: refuse to run from inside an executor poll. The
-    // executor publishes CURRENT_TASK before polling and clears
-    // after; if it's non-zero we're inside someone else's poll
-    // body, and recursing into block_on would deadlock the
-    // executor's polling loop. The same panic-on-misuse pattern
-    // as `init()`'s double-call check.
-    if CURRENT_TASK.load(Ordering::Acquire) != 0 {
+    // Defensive: refuse to run the halting variant from inside an
+    // executor poll. The executor publishes CURRENT_TASK before
+    // polling and clears after; if it's non-zero we're inside
+    // someone else's poll body, and recursing into block_on with
+    // halt would deadlock the polling loop. The spinning variant
+    // (block_on_spin) cannot deadlock the executor since it
+    // busy-polls instead of calling halt_until_irq, and its
+    // documented callers (panic dump, IRQ handlers, lock holders,
+    // SMP startup, sleep_pump re-entry) may legitimately observe
+    // CURRENT_TASK != 0.
+    if allow_halt && CURRENT_TASK.load(Ordering::Acquire) != 0 {
         panic!(
             "narf_scheduler::block_on called from inside executor poll \
              (CURRENT_TASK != 0) — would deadlock the polling loop. \
