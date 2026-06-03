@@ -883,10 +883,10 @@ fn e2e_aml_create_byte_field_round_trip() -> TestResult {
 
     // Name(\E14B, Buffer(4){ 0xAA, 0xBB, 0xCC, 0xDD })
     // Buffer encoding: BufferOp PkgLen SizeTermArg ByteData...
-    // PkgLen content = 1(PkgLen) + 2(BytePrefix 4) + 4(data) = 7
+    // PkgLength counts itself + payload: 1 + 2(BytePrefix 4) + 4(data) = 7.
     let buffer_body: &[u8] = &[
         0x11, // BufferOp
-        0x08, // PkgLength (1 + 2 + 4 = 7 content, total = 8)
+        0x07, // PkgLength (self + 6 payload bytes)
         0x0A, 0x04, // BytePrefix 4 (size)
         0xAA, 0xBB, 0xCC, 0xDD,
     ];

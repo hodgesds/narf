@@ -1577,6 +1577,31 @@ fn parse_term_list_inner(
                         });
                         *count += 1;
                     }
+                    // CreateField (variable-width): 0x5B 0x13
+                    // SourceBuf BitIndex NumBits NameString.
+                    // Register at parse time so namespace lookups find
+                    // the BufferField before eval starts.
+                    0x13 => {
+                        let src_path = match p.peek() {
+                            Some(b) if is_parse_name_lead(b) => {
+                                let s = read_name_string(p, parent)?;
+                                Some(full_path(s, parent))
+                            }
+                            _ => {
+                                let after = (p.pos + 1).min(p.buf.len());
+                                let _ = try_read_simple_value(p, after)?;
+                                None
+                            }
+                        };
+                        let bit_idx = read_simple_uint(p)?;
+                        let bit_len = read_simple_uint(p)?;
+                        let fname = read_name_string(p, parent)?;
+                        let fpath = full_path(fname, parent);
+                        if let Some(src) = src_path {
+                            register_buffer_field(&fpath, &src, bit_idx, bit_len);
+                            *count += 1;
+                        }
+                    }
                     _ => {
                         // Unknown extended opcode. Best-effort:
                         // bail out of this term list — anything we
@@ -1638,6 +1663,43 @@ fn parse_term_list_inner(
                 // an undecoded tail.
                 p.pos = pkg_end;
             }
+            // CreateBitField / CreateByteField / CreateWordField /
+            // CreateDWordField / CreateQWordField at namespace-build
+            // time. The eval-time handler in eval.rs covers in-method
+            // declarations; this branch covers top-level / Scope-body
+            // declarations so subsequent TermObjs (like sibling
+            // Methods that reference the field) still parse and the
+            // BufferField is reachable for read/write.
+            0x8D | 0x8C | 0x8B | 0x8A | 0x8F => {
+                let opc = op;
+                p.skip(1)?;
+                let src_path = match p.peek() {
+                    Some(b) if is_parse_name_lead(b) => {
+                        let s = read_name_string(p, parent)?;
+                        Some(full_path(s, parent))
+                    }
+                    _ => {
+                        let after = (p.pos + 1).min(p.buf.len());
+                        let _ = try_read_simple_value(p, after)?;
+                        None
+                    }
+                };
+                let idx = read_simple_uint(p)?;
+                let fname = read_name_string(p, parent)?;
+                let fpath = full_path(fname, parent);
+                if let Some(src) = src_path {
+                    let (bit_offset, bit_length) = match opc {
+                        0x8D => (idx, 1),       // CreateBitField
+                        0x8C => (idx * 8, 8),   // CreateByteField
+                        0x8B => (idx * 8, 16),  // CreateWordField
+                        0x8A => (idx * 8, 32),  // CreateDWordField
+                        0x8F => (idx * 8, 64),  // CreateQWordField
+                        _ => unreachable!(),
+                    };
+                    register_buffer_field(&fpath, &src, bit_offset, bit_length);
+                    *count += 1;
+                }
+            }
             _ => {
                 // Anything else: best-effort skip of one byte.
                 // Unknown opcodes may carry PkgLength; without
@@ -1648,6 +1710,46 @@ fn parse_term_list_inner(
         }
     }
     Ok(())
+}
+
+/// Local helper: detect a NameString lead byte at parse time.
+#[inline]
+fn is_parse_name_lead(b: u8) -> bool {
+    // RootChar '\', ParentPrefix '^', DualName '\x2E', MultiName '\x2F',
+    // or NameSeg first char (uppercase / underscore).
+    matches!(b, b'\\' | b'^' | 0x2E | 0x2F) || b.is_ascii_uppercase() || b == b'_'
+}
+
+/// Local helper: read a flat-integer TermArg (Zero/One/Byte/Word/
+/// DWord/Qword prefix). Used by parse-time CreateXxxField handlers
+/// for the BitIndex / NumBits arguments — these are almost always
+/// literal integers in real AML; complex TermArgs at parse time
+/// would require running the evaluator, which the namespace builder
+/// doesn't do.
+fn read_simple_uint(p: &mut Parser<'_>) -> Result<u64, AmlError> {
+    let op = p.read_u8()?;
+    Ok(match op {
+        ZERO_OP => 0,
+        ONE_OP => 1,
+        ONES_OP => u64::MAX,
+        BYTE_PREFIX => p.read_u8()? as u64,
+        WORD_PREFIX => {
+            let bytes = p.slice_n(2)?;
+            u16::from_le_bytes([bytes[0], bytes[1]]) as u64
+        }
+        DWORD_PREFIX => {
+            let bytes = p.slice_n(4)?;
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
+        }
+        QWORD_PREFIX => {
+            let bytes = p.slice_n(8)?;
+            u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ])
+        }
+        _ => 0,
+    })
 }
 
 /// Step `cur` past one TermArg in `buf`, bounded by `end`. Built
