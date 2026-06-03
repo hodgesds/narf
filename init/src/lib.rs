@@ -102,6 +102,22 @@ impl Stage {
     }
 }
 
+/// Map a `Stage` to its `BootPhase` for the status-panel diag.
+/// Kept terse — pure 1:1 dispatch.
+fn stage_to_phase(s: Stage) -> narf_memory::diag::BootPhase {
+    use narf_memory::diag::BootPhase;
+    match s {
+        Stage::Early => BootPhase::InitEarly,
+        Stage::Core => BootPhase::InitCore,
+        Stage::PostCore => BootPhase::InitPostCore,
+        Stage::Arch => BootPhase::InitArch,
+        Stage::Subsys => BootPhase::InitSubsys,
+        Stage::Fs => BootPhase::InitFs,
+        Stage::Device => BootPhase::InitDevice,
+        Stage::Late => BootPhase::InitLate,
+    }
+}
+
 /// Wall-time budget every initcall gets by default. Picked
 /// generously: real-HW probes on the slowest paths (HDA codec
 /// link-up, IOMMU table walk) come in around 50–150 ms; this
@@ -276,6 +292,11 @@ fn cycles_to_ms(cycles: u64) -> u64 {
 /// is logged + counted. Returns the stage's stats post-run.
 pub fn run_stage(stage: Stage) -> StageStats {
     let i = stage as usize;
+    // Status-panel diag: advance the boot-phase marker so a
+    // bare-metal operator sees forward progress across stages
+    // without needing serial. One atomic store per stage; no
+    // allocation, no lock.
+    narf_memory::diag::set_phase(stage_to_phase(stage));
     // Take a snapshot — registrations during a stage's run are
     // possible (a Subsys initcall might Stage::Device-register a
     // probe), but they should land in the *target* stage's vec for

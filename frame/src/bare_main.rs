@@ -231,6 +231,10 @@ fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
+    // Status-panel diag: first non-firmware phase. set_phase is a
+    // single atomic store — safe from very-early boot before any
+    // allocator is alive.
+    narf_memory::diag::set_phase(narf_memory::diag::BootPhase::StartRust);
     // Boot beacons (left-to-right, top-left of FB). Each lit
     // slot proves we passed that stage. See `boot_beacon` doc.
     //   slot 0 RED    — _start_rust entered
@@ -1095,6 +1099,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 narf_memory::heap::capacity_bytes()
                             );
                             narf_memory::heap::promote_to_slab();
+                            // Status-panel diag: heap is live; mark
+                            // the phase so the bare-metal status
+                            // panel transitions out of StartRust.
+                            narf_memory::diag::set_phase(
+                                narf_memory::diag::BootPhase::HeapUp,
+                            );
                             let _ = writeln!(
                                 console::Writer,
                                 "  heap: slab is live"
@@ -2329,6 +2339,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_memory::beacon::paint(slot, color);
             }
             let _ = narf_init::print_summary(&mut console::Writer);
+            // Status-panel diag: initcalls done; flip the phase to
+            // Userspace so the panel shows the kernel reached its
+            // final boot phase (scheduler, executors, sleep_pumps).
+            narf_memory::diag::set_phase(
+                narf_memory::diag::BootPhase::Userspace,
+            );
 
             // AMD-specific amd-pstate active-mode bring-up. Sibling
             // of narf_power::pstate (which handled Intel HWP /
