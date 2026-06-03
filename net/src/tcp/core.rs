@@ -476,7 +476,7 @@ pub fn accept(listen_id: u32) -> Result<Option<u32>, ()> {
 // ── Public API: connect ─────────────────────────────────────────────
 
 pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
-    let iface = iface::primary().ok_or(())?;
+    let iface = iface::for_dst(remote_addr).ok_or(())?;
     let mac = crate::tcp_stack::arp_resolve(iface.gateway, 1000)?;
     let local_port = fresh_local_port();
     let id = fresh_tcb_id();
@@ -747,7 +747,8 @@ fn build_frame(
 }
 
 fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
-    let iface = match iface::primary() {
+    let dst_for_iface = arc.lock().remote_addr;
+    let iface = match iface::for_dst(dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -783,7 +784,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         opts,
         &[],
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
     // Track SYN in the retransmit queue so a missed SYN-ACK
     // re-triggers retransmit.
     let mut t = arc.lock();
@@ -794,7 +795,8 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
 }
 
 fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
-    let iface = match iface::primary() {
+    let dst_for_iface = arc.lock().remote_addr;
+    let iface = match iface::for_dst(dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -832,11 +834,12 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         opt_bytes,
         &[],
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
-    let iface = match iface::primary() {
+    let dst_for_iface = arc.lock().remote_addr;
+    let iface = match iface::for_dst(dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -865,7 +868,7 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
         Vec::new(),
         &[],
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
 }
 
 /// Build & send one data segment carrying `payload` from sequence
@@ -878,7 +881,8 @@ fn send_data(
     extra_flags: u8,
     record_retx: bool,
 ) {
-    let iface = match iface::primary() {
+    let dst_for_iface = arc.lock().remote_addr;
+    let iface = match iface::for_dst(dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -914,7 +918,7 @@ fn send_data(
         opt_bytes,
         payload,
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -1075,7 +1079,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             seg.flags,
         )
     };
-    let iface = match iface::primary() {
+    let iface = match iface::for_dst(dst_ip) {
         Some(i) => i,
         None => return,
     };
@@ -1093,7 +1097,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &payload,
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
     {
         let mut t = arc.lock();
         // Advance send-buf sent_offset by the payload length so
@@ -1129,7 +1133,8 @@ fn tick_persist(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 }
 
 fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
-    let iface = match iface::primary() {
+    let dst_for_iface = arc.lock().remote_addr;
+    let iface = match iface::for_dst(dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1176,7 +1181,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &[probe_byte],
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
 }
 
 fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -1219,7 +1224,8 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         return;
     }
     // Send empty segment with seq = snd_una - 1 (RFC 9293 §3.8.4).
-    let iface = match iface::primary() {
+    let dst_for_iface = arc.lock().remote_addr;
+    let iface = match iface::for_dst(dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1255,7 +1261,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &[],
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
 }
 
 fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -1972,7 +1978,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             opts,
         )
     };
-    let iface = match iface::primary() {
+    let iface = match iface::for_dst(dst_ip) {
         Some(i) => i,
         None => return,
     };
@@ -1990,7 +1996,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &payload,
     );
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
     let mut t = arc.lock();
     // Mark the segment as retransmitted (Karn).
     if let Some(front) = t.retx_queue.front_mut() {

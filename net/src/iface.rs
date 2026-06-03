@@ -159,6 +159,28 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
     send_fn(frame)
 }
 
+/// Pick the egress iface for a destination IPv4 address by consulting
+/// the FIB and falling back to `primary()`. The returned snapshot is
+/// what TCP / UDP / ICMP send paths use to stamp the source MAC and
+/// dispatch the frame so each flow exits on the correct NIC instead
+/// of always the first-registered one.
+pub fn for_dst(dst: [u8; 4]) -> Option<NetIfaceSnapshot> {
+    if let Some(r) = crate::route::route_lookup(crate::ipv4::Ipv4Addr(dst)) {
+        if let Some(s) = lookup(&r.iface) {
+            return Some(s);
+        }
+    }
+    primary()
+}
+
+/// Send a complete Ethernet frame through the iface chosen by
+/// `for_dst(dst_ip)`. Returns Err if no iface is registered or the
+/// driver failed.
+pub fn send_for_dst(dst: [u8; 4], frame: &[u8]) -> Result<(), ()> {
+    let send_fn = for_dst(dst).ok_or(())?.send;
+    send_fn(frame)
+}
+
 /// Owned-by-value snapshot of a NetIfaceEntry. Used to avoid
 /// holding the IFACES lock while rendering / sending.
 #[derive(Clone, Debug)]
