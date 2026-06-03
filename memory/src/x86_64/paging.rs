@@ -208,15 +208,39 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     }
     crate::frame::__pagetable_register(phys.raw());
 
-    // Full-copy the 4 KiB of PML4 entries into the fresh frame.
-    // SAFETY: both `cur_pml4` and `phys` point at properly-aligned
-    // `PageTable`-sized identity-mapped regions.
+    // Build the new PML4 from scratch rather than copying the full
+    // parent PML4 and only patching PML4[1]. The full-copy approach
+    // left PML4[2..255] pointing at the parent's own intermediate
+    // tables (PDPT/PD/PT pages), which the child's `materialize`
+    // would walk and share — creating aliased PTEs between parent
+    // and child address spaces (COW bypass).
+    //
+    // Strategy:
+    //   PML4[0]:       copy from cur_pml4 — kernel identity-map of
+    //                  physical RAM (0..512 GiB), used for kernel
+    //                  heap/stack access while the user CR3 is active.
+    //                  Shared but kernel-only (intermediate entries
+    //                  have U=0), so user-mode code can't reach it.
+    //   PML4[1]:       fixed below with a fresh private PDPT so the
+    //                  user binary subtree (PDPT[0]) is isolated.
+    //   PML4[2..255]:  zeroed — populated on demand by `materialize`
+    //                  through private PD/PT chains for this AS.
+    //   PML4[256..511]: copy from cur_pml4 — kernel high-half
+    //                  (≥ 0xFFFF_8000_0000_0000); identical across
+    //                  all ASes so kernel code reaches during traps.
+    // SAFETY: `phys` points at a freshly-allocated identity-mapped frame.
     unsafe {
-        ptr::copy_nonoverlapping(
-            cur_pml4.raw() as *const u8,
-            phys.raw() as *mut u8,
-            core::mem::size_of::<PageTable>(),
-        );
+        // Start with all zeroes.
+        ptr::write_bytes(phys.raw() as *mut u8, 0, core::mem::size_of::<PageTable>());
+        // Preserve PML4[0] (kernel identity window) and
+        // PML4[256..511] (kernel high half) from the current PML4.
+        let src_e0 = ptr::read_volatile(cur_pml4.raw() as *const u64);
+        ptr::write_volatile(phys.raw() as *mut u64, src_e0);
+        for i in 256u64..512 {
+            let src = (cur_pml4.raw() + i * 8) as *const u64;
+            let dst = (phys.raw() + i * 8) as *mut u64;
+            ptr::write_volatile(dst, ptr::read_volatile(src));
+        }
     }
 
     // PML4[1] is shared between two consumers:
