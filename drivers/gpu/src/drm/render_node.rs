@@ -227,8 +227,8 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // are blocked but plain (non-master, authenticated) clients
         // can still enumerate.
         0xA0 | 0xA7 | 0xB5 => Some(IoctlFlags::auth_only()),
-        // ADDFB2 / RMFB — DRM_MASTER (display authority).
-        0xB8 | 0xA8 => Some(IoctlFlags::master_only()),
+        // SETCRTC / ADDFB2 / RMFB — DRM_MASTER (display authority).
+        0xA2 | 0xB8 | 0xA8 => Some(IoctlFlags::master_only()),
         // ATOMIC commit — DRM_MASTER.
         0xBC => Some(IoctlFlags::master_only()),
         // PRIME handle ↔ fd — RENDER_ALLOW (no display authority needed).
