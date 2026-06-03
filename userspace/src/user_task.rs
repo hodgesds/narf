@@ -727,7 +727,11 @@ impl core::future::Future for UserTaskFuture {
         if this.ctx.wait_child_pending.load(Ordering::Acquire) {
             let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
             let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
-            let task_pid = this.process.pid.raw();
+            // Use the scheduler TaskId (set by CURRENT_TASK before this poll)
+            // as the key to look up PENDING_EXITS. `sys_fork` stores the
+            // parent's TaskId (`current_task_id()`) into PARENT_OF and
+            // PENDING_EXITS, so the lookup key must also be the TaskId.
+            let task_pid = crate::handlers::current_task_id();
             let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
             if reaped > 0 {
                 // Reap succeeded — write child pid into saved RAX
@@ -1090,7 +1094,11 @@ impl core::future::Future for UserTaskFuture {
         if this.ctx.wait_child_pending.load(Ordering::Acquire) {
             let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
             let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
-            let task_pid = this.process.pid.raw();
+            // Use the scheduler TaskId (set by CURRENT_TASK before this poll)
+            // as the key to look up PENDING_EXITS. `sys_fork` stores the
+            // parent's TaskId (`current_task_id()`) into PARENT_OF and
+            // PENDING_EXITS, so the lookup key must also be the TaskId.
+            let task_pid = crate::handlers::current_task_id();
             let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
             if reaped > 0 {
                 unsafe {

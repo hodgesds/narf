@@ -7191,9 +7191,14 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
         return TestResult::Fail("fork returned non-OK status");
     }
     if ret.value == 0 {
-        return TestResult::Fail("fork returned tid=0");
+        return TestResult::Fail("fork returned pid=0");
     }
-    let child_tid = narf_scheduler::TaskId(ret.value);
+    // fork returns ProcessId; translate to TaskId for scheduler lookups.
+    let child_task_raw = match crate::handlers::pid_to_task_raw(ret.value) {
+        Some(t) => t,
+        None => return TestResult::Fail("no PID→TaskId mapping after fork"),
+    };
+    let child_tid = narf_scheduler::TaskId(child_task_raw);
     let child_as = match narf_scheduler::address_space_of(child_tid) {
         Some(a) => a,
         None => return TestResult::Fail("child has no AS attached"),
@@ -7465,9 +7470,14 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
         return TestResult::Fail("fork returned non-OK status");
     }
     if ret.value == 0 {
-        return TestResult::Fail("parent return tid=0");
+        return TestResult::Fail("parent return pid=0");
     }
-    let child_tid = narf_scheduler::TaskId(ret.value);
+    // fork returns ProcessId; translate to TaskId for scheduler lookups.
+    let child_task_raw = match crate::handlers::pid_to_task_raw(ret.value) {
+        Some(t) => t,
+        None => return TestResult::Fail("no PID→TaskId mapping after fork"),
+    };
+    let child_tid = narf_scheduler::TaskId(child_task_raw);
 
     // Reach into the scheduler to find the child task and confirm
     // its UserTaskFuture's saved state matches `parent_snapshot`
@@ -7866,14 +7876,22 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
-    let child_tid = match ctx.ret {
+    let child_pid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
             *PARENT_AS.lock() = None;
             return TestResult::Fail("fork failed");
         }
     };
-    let child_cwd = crate::handlers::cwd_of(child_tid);
+    // fork returns ProcessId; cwd table is keyed by TaskId.
+    let child_task_raw = match crate::handlers::pid_to_task_raw(child_pid) {
+        Some(t) => t,
+        None => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("no PID→TaskId mapping after fork");
+        }
+    };
+    let child_cwd = crate::handlers::cwd_of(child_task_raw);
     *PARENT_AS.lock() = None;
     crate::handlers::__test_cwd_reset();
     crate::syscall::__test_clear_global();
@@ -7943,21 +7961,29 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
         return TestResult::Fail("parent handler not recorded");
     }
 
-    // Fork → child_tid; sigaction_lookup(child, SIGTERM) must
-    // return HANDLER.
+    // Fork → child_pid; sigaction_lookup(child_task_id, SIGTERM) must
+    // return HANDLER. fork returns ProcessId; sigaction table is keyed
+    // by TaskId so translate through the explicit mapping.
     let mut ctx = StubCtx {
         args: SyscallArgs::default(),
         ret: None,
     };
     kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
-    let child_tid = match ctx.ret {
+    let child_pid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
             *PARENT_AS.lock() = None;
             return TestResult::Fail("fork failed");
         }
     };
-    let inherited = crate::handlers::sigaction_lookup(child_tid, SIGTERM as usize);
+    let child_task_raw = match crate::handlers::pid_to_task_raw(child_pid) {
+        Some(t) => t,
+        None => {
+            *PARENT_AS.lock() = None;
+            return TestResult::Fail("no PID→TaskId mapping after fork");
+        }
+    };
+    let inherited = crate::handlers::sigaction_lookup(child_task_raw, SIGTERM as usize);
     *PARENT_AS.lock() = None;
     crate::handlers::__test_sigaction_reset();
     crate::syscall::__test_clear_global();
@@ -8016,8 +8042,11 @@ fn smoke_userspace_fork_multiple_distinct_address_spaces() -> TestResult {
             return TestResult::Fail("second fork failed");
         }
     };
-    let as1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(c1));
-    let as2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(c2));
+    // c1/c2 are ProcessIds; translate to TaskId for scheduler lookups.
+    let t1 = crate::handlers::pid_to_task_raw(c1).map(narf_scheduler::TaskId);
+    let t2 = crate::handlers::pid_to_task_raw(c2).map(narf_scheduler::TaskId);
+    let as1 = t1.and_then(narf_scheduler::address_space_of);
+    let as2 = t2.and_then(narf_scheduler::address_space_of);
     let pass = match (as1, as2) {
         (Some(a), Some(b)) => {
             !Arc::ptr_eq(&a, &parent_as)

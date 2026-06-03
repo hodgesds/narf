@@ -620,7 +620,13 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok(!0u64);
     // Copy path from userspace into kernel buffer under SMAP bracket.
     let path_owned = match copy_user_path(path_ptr, path_len) {
-        Some(s) => s,
+        Some(s) => {
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "sys_open: path='{}' task={}", s, current_task_id());
+            }
+            s
+        }
         None => { ctx.set_return(fail); return; }
     };
     let path: &str = &path_owned;
@@ -3505,6 +3511,18 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // Re-materialise the parent's PTEs. `clone_for_fork` stripped
+    // WRITE from every region's metadata but the parent's live page
+    // tables still carry the old WRITE-set PTEs. Without this, the
+    // parent continues writing to the shared physical frames without
+    // triggering a COW fault, silently corrupting the child's copy.
+    // SAFETY: identity map live; root valid; may be called while
+    // the parent AS is the active CR3 — invlpg per page keeps the
+    // TLB coherent. Single-CPU BSP-only (Stage-4).
+    if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
     let child_as = alloc::sync::Arc::new(child_as);
 
     // Snapshot the parent's trap frame BEFORE we set the parent's
@@ -3602,6 +3620,9 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         narf_scheduler::TaskSpec::unthrottled(),
         child_as,
     );
+    // Record the explicit ProcessId ↔ TaskId binding.  Must happen
+    // before any code that crosses the ID-space boundary.
+    register_pid_task_mapping(child_pid.raw(), child_tid.raw());
     // POSIX inheritance — fd / cwd / brk / sigaction handlers are
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
@@ -3609,13 +3630,16 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     cwd_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
-    // Parent-of bookkeeping for waitpid: the child's exit fires
-    // an observer that uses this to find the parent's pending-
-    // exits queue. Without it, the parent's wait4 has no way to
-    // see the child's exit status.
-    parent_of_set(child_tid.raw(), parent_pid);
-    let _ = child_pid; // tid != pid distinction lands with thread-group bookkeeping
-    ctx.set_return(SyscallReturn::ok(child_tid.raw()));
+    // Parent-of bookkeeping for waitpid: keyed by the child's
+    // ProcessId so `on_child_exit(child_pid)` can resolve the
+    // parent. `notify_task_exited` uses `this.process.pid.raw()`
+    // (ProcessId) as the argument to the exit observer, so the
+    // key here must also be ProcessId — not TaskId.
+    parent_of_set(child_pid.raw(), parent_pid);
+    // Return the child's user-visible ProcessId (POSIX fork(2)
+    // contract). The parent's waitpid() call passes this same
+    // value back to us as `want_pid`.
+    ctx.set_return(SyscallReturn::ok(child_pid.raw()));
 }
 
 // ── waitpid / wait4 — parent observes child exit status ────────────
@@ -3658,6 +3682,7 @@ static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    pid_task_map_init();
     crate::user_task::register_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
@@ -3667,6 +3692,7 @@ pub fn wait_init() {
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = None;
     *PENDING_EXITS.lock() = None;
+    pid_task_map_reset();
     crate::user_task::__test_wait_child_waker_reset();
 }
 
@@ -3743,6 +3769,64 @@ fn parent_of_set(child: u64, parent: u64) {
 fn parent_of_get(child: u64) -> Option<u64> {
     let g = PARENT_OF.lock();
     g.as_ref().and_then(|m| m.get(&child).copied())
+}
+
+// ── ProcessId ↔ TaskId translation ────────────────────────────────
+//
+// `sys_fork` mints a fresh ProcessId (from `alloc_pid()`) and a fresh
+// TaskId (from `spawn_user()`). Any code that receives a ProcessId
+// (e.g. a user-visible fork return value or a /proc path) but needs
+// the internal TaskId (e.g. scheduler lookups, fd-table accesses) must
+// translate through this table.
+
+/// ProcessId.raw() → TaskId.raw()
+static PID_TO_TASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// TaskId.raw() → ProcessId.raw()
+static TASK_TO_PID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn pid_task_map_init() {
+    *PID_TO_TASK.lock() = Some(BTreeMap::new());
+    *TASK_TO_PID.lock() = Some(BTreeMap::new());
+}
+
+pub fn pid_task_map_reset() {
+    *PID_TO_TASK.lock() = None;
+    *TASK_TO_PID.lock() = None;
+}
+
+/// Register a (ProcessId → TaskId) mapping. Called by `sys_fork` and
+/// boot spawn_one for every user task that gets a user-visible ProcessId.
+/// Records both directions simultaneously so all translations are O(1).
+pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
+    {
+        let mut g = PID_TO_TASK.lock();
+        if let Some(m) = g.as_mut() {
+            m.insert(pid_raw, task_raw);
+        }
+    }
+    {
+        let mut g = TASK_TO_PID.lock();
+        if let Some(m) = g.as_mut() {
+            m.insert(task_raw, pid_raw);
+        }
+    }
+}
+
+/// Translate a user-visible ProcessId to the scheduler TaskId. Returns
+/// `None` when the pid was never registered (kernel-internal tasks,
+/// boot tasks spawned before the table was inited, etc.).
+pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
+    PID_TO_TASK.lock().as_ref().and_then(|m| m.get(&pid_raw).copied())
+}
+
+/// Translate a scheduler TaskId to the user-visible ProcessId registered
+/// at fork/spawn time. Returns `None` when the task has no registered
+/// ProcessId (kernel-only tasks, test stubs).
+pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
+    TASK_TO_PID.lock().as_ref().and_then(|m| m.get(&task_raw).copied())
 }
 
 /// Exit observer registered by `wait_init`. Called when a polled

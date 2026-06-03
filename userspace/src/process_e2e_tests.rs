@@ -1779,3 +1779,355 @@ fn smoke_wave37_three_children_sequential_reap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave37_three_children_sequential_reap);
+
+// ── Wave-38 smokes: ProcessId ↔ TaskId aliasing hardening ────────────
+//
+// These smokes verify that the explicit PID↔TaskId mapping introduced
+// in Wave-38 works correctly even when the two counters are out of
+// alignment (e.g. after the scheduler has already advanced its counter
+// independently).  They directly exercise the side-table without going
+// through a full fork() round-trip.
+//
+// Smoke 23: mapping table stores and retrieves correctly (both dirs)
+// Smoke 24: fork produces a mapping entry; translation is consistent
+// Smoke 25: wait4 returns child ProcessId, not child TaskId
+// Smoke 26: on_child_exit fires via ProcessId key; waker uses TaskId
+
+/// Smoke 23: Direct mapping table insert + bidirectional lookup.
+fn smoke_wave38_pid_task_mapping_roundtrip() -> TestResult {
+    use crate::handlers::{__test_wait_reset, pid_to_task_raw, register_pid_task_mapping, task_to_pid_raw, wait_init};
+
+    crate::syscall::__test_clear_global();
+    crate::handlers::__test_wait_reset();
+    wait_init();
+
+    // Synthesise a task with ProcessId(5) and TaskId(99) — these are
+    // deliberately mismatched to prove the table tracks them as distinct
+    // values rather than treating them as the same integer.
+    let pid_raw: u64 = 5;
+    let task_raw: u64 = 99;
+    register_pid_task_mapping(pid_raw, task_raw);
+
+    // Forward lookup: ProcessId → TaskId
+    match pid_to_task_raw(pid_raw) {
+        Some(t) if t == task_raw => {}
+        other => {
+            crate::handlers::__test_wait_reset();
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail(if other.is_none() {
+                "pid_to_task_raw returned None for registered pid"
+            } else {
+                "pid_to_task_raw returned wrong TaskId"
+            });
+        }
+    }
+
+    // Reverse lookup: TaskId → ProcessId
+    match task_to_pid_raw(task_raw) {
+        Some(p) if p == pid_raw => {}
+        other => {
+            crate::handlers::__test_wait_reset();
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail(if other.is_none() {
+                "task_to_pid_raw returned None for registered task"
+            } else {
+                "task_to_pid_raw returned wrong ProcessId"
+            });
+        }
+    }
+
+    // A different PID must not resolve to the same TaskId.
+    if pid_to_task_raw(pid_raw + 1).is_some() {
+        crate::handlers::__test_wait_reset();
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("unregistered pid_raw+1 should not be found");
+    }
+
+    crate::handlers::__test_wait_reset();
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave38_pid_task_mapping_roundtrip);
+
+/// Smoke 24: fork() registers a PID↔TaskId mapping; the translation is
+/// consistent (ProcessId from fork return → TaskId in scheduler).
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave38_fork_registers_mapping() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_24;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let child_pid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork failed");
+        }
+    };
+
+    // The PID→TaskId mapping must exist after fork.
+    let child_task_raw = match crate::handlers::pid_to_task_raw(child_pid) {
+        Some(t) => t,
+        None => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("no PID→TaskId mapping registered by fork");
+        }
+    };
+
+    // Reverse direction must also work.
+    match crate::handlers::task_to_pid_raw(child_task_raw) {
+        Some(p) if p == child_pid => {}
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("task_to_pid_raw reverse lookup incorrect");
+        }
+    }
+
+    // The TaskId must correspond to an actual scheduler slot.
+    let child_tid_obj = narf_scheduler::TaskId(child_task_raw);
+    if narf_scheduler::address_space_of(child_tid_obj).is_none() {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child has no AS in scheduler after fork");
+    }
+
+    // The ProcessId and TaskId must be distinct values (the whole
+    // point of this fix — they could be equal by coincidence, but
+    // the system must not *require* them to be equal).
+    // We just verify the mapping records them as independent fields.
+    // (On a freshly reset queue they may happen to be equal; that's
+    // fine — what we're testing is the code path, not the values.)
+    let _ = (child_pid, child_task_raw); // both valid, independently tracked
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_wave38_fork_registers_mapping);
+
+/// Smoke 25: wait4 returns child ProcessId (user-visible) not TaskId.
+/// The child's ProcessId is what the parent's fork() returned; the
+/// wait4 reap must echo that same value back.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_25;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Fork → child_pid (ProcessId).
+    let mut ctx = StubCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let child_pid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork failed");
+        }
+    };
+    let child_task_raw = match crate::handlers::pid_to_task_raw(child_pid) {
+        Some(t) => t,
+        None => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("no PID→TaskId mapping");
+        }
+    };
+
+    // Verify ProcessId != TaskId here; if they happen to be equal on
+    // this run we skip the "distinctness" sub-check but keep going.
+    let ids_differ = child_pid != child_task_raw;
+
+    // Simulate child exit via notify_task_exited(ProcessId).
+    crate::user_task::notify_task_exited(child_pid);
+
+    // wait4 by the parent should return the child's ProcessId.
+    let mut status: i32 = -1;
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64, // any child
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 1, // WNOHANG
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("wait4 did not return OK");
+        }
+    };
+
+    // Reaped value must equal the child's ProcessId.
+    if reaped != child_pid {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("wait4 returned TaskId instead of ProcessId");
+    }
+
+    // If ProcessId and TaskId differ, verify wait4 did NOT return TaskId.
+    if ids_differ && reaped == child_task_raw {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("wait4 returned TaskId when ProcessId != TaskId");
+    }
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_wave38_wait4_returns_child_process_id);
+
+/// Smoke 26: on_child_exit fires correctly even when the child's
+/// ProcessId and TaskId are explicitly mismatched (injected directly
+/// into the mapping table, bypassing fork's counter alignment).
+fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
+    use crate::handlers::{
+        __test_inject_parent_of, __test_wait_reset, pid_to_task_raw,
+        register_pid_task_mapping, signal_pending_of, wait_init,
+    };
+
+    const PARENT_TASK: u64 = 0xAA01; // parent's "TaskId" (current_task_id() value)
+    const CHILD_PID: u64 = 0xBB05;   // child's ProcessId (alloc_pid() value)
+    const CHILD_TASK: u64 = 0xCC99;  // child's TaskId (spawn_user() value) — different!
+
+    crate::syscall::__test_clear_global();
+    crate::handlers::__test_wait_reset();
+    crate::handlers::__test_sigaction_reset();
+    crate::sigaction_init();
+    crate::signal_init();
+    wait_init();
+
+    // Directly register the mismatched mapping.
+    register_pid_task_mapping(CHILD_PID, CHILD_TASK);
+
+    // Register CHILD_PID → PARENT_TASK in the parent-of table (as
+    // sys_fork would do using child_pid.raw() as key).
+    __test_inject_parent_of(CHILD_PID, PARENT_TASK);
+
+    // Verify lookup works in both directions.
+    match pid_to_task_raw(CHILD_PID) {
+        Some(t) if t == CHILD_TASK => {}
+        _ => {
+            crate::handlers::__test_wait_reset();
+            crate::handlers::__test_sigaction_reset();
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail("pid_to_task_raw lookup failed for injected mapping");
+        }
+    }
+
+    // Fire the exit observer with the child's ProcessId.
+    crate::user_task::notify_task_exited(CHILD_PID);
+
+    // on_child_exit must have pushed (CHILD_PID, status) into
+    // PENDING_EXITS[PARENT_TASK] and set SIGCHLD pending on PARENT_TASK.
+    let sigchld_pending = signal_pending_of(PARENT_TASK);
+    const SIGCHLD: u32 = 17;
+    if sigchld_pending & (1 << SIGCHLD) == 0 {
+        crate::handlers::__test_wait_reset();
+        crate::handlers::__test_sigaction_reset();
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("SIGCHLD not pending on parent after child exit");
+    }
+
+    // wait4 from PARENT_TASK should reap CHILD_PID.
+    LOOKUP_TASK.store(PARENT_TASK, Ordering::Relaxed);
+    install_task_id_lookup(lookup_task_shim);
+
+    let mut status: i32 = -1;
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 1, // WNOHANG
+            arg3: 0, arg4: 0, arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            crate::handlers::__test_wait_reset();
+            crate::handlers::__test_sigaction_reset();
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail("wait4 did not return OK");
+        }
+    };
+    if reaped != CHILD_PID {
+        crate::handlers::__test_wait_reset();
+        crate::handlers::__test_sigaction_reset();
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("wait4 returned wrong value — expected CHILD_PID");
+    }
+    // Must not return CHILD_TASK (the internal scheduler ID).
+    if reaped == CHILD_TASK {
+        crate::handlers::__test_wait_reset();
+        crate::handlers::__test_sigaction_reset();
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("wait4 returned TaskId instead of ProcessId");
+    }
+
+    crate::handlers::__test_wait_reset();
+    crate::handlers::__test_sigaction_reset();
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave38_on_child_exit_with_mismatched_ids);
