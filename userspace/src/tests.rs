@@ -7921,6 +7921,7 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     crate::handlers::__test_sigaction_reset();
     crate::sigaction_init();
+    crate::handlers::pid_task_map_init();
 
     static FAKE_TID: AtomicU64 = AtomicU64::new(0x51C1);
     fn task_lookup() -> u64 {
@@ -7986,6 +7987,7 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
     let inherited = crate::handlers::sigaction_lookup(child_task_raw, SIGTERM as usize);
     *PARENT_AS.lock() = None;
     crate::handlers::__test_sigaction_reset();
+    crate::handlers::pid_task_map_reset();
     crate::syscall::__test_clear_global();
     if inherited == Some(HANDLER) {
         TestResult::Pass
