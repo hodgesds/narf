@@ -5105,18 +5105,21 @@ fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
         return TestResult::Fail("egress src not masqueraded");
     }
     let mut synack = nf_build_tcp([8,8,8,8], [203,0,113,7], 80, nat_sport, 0x12);
+    // Linux PRE_ROUTING priorities: conntrack (-200) runs before
+    // NAT_DST (-100). Conntrack needs the pre-DNAT tuple to match
+    // the entry's reply (8.8.8.8 → 203.0.113.7:nat_sport).
     {
         let mut c3 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut synack);
-        let _ = dnat_prerouting(&mut c3);
+        let _ = conntrack_hook(&mut c3);
+    }
+    {
+        let mut c4 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut synack);
+        let _ = dnat_prerouting(&mut c4);
     }
     let dst = [synack[16], synack[17], synack[18], synack[19]];
     let dport = u16::from_be_bytes([synack[22], synack[23]]);
     if dst != [10,0,0,5] || dport != 42000 {
         return TestResult::Fail("reply dst not restored");
-    }
-    {
-        let mut c4 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut synack);
-        let _ = conntrack_hook(&mut c4);
     }
     let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:42000, dst_port:80, proto:6 };
     let entry = ct().lookup(&t).expect("entry");
