@@ -4944,3 +4944,261 @@ fn smoke_ro_after_init_latch_observability() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/ro_after_init", smoke_ro_after_init_latch_observability);
+
+// ── Wave-46: trap-driven COW write-fault round trip ─────────────────
+//
+// The #PF handler in frame/src/x86_64/trap.rs calls
+// `cow_split_on_write` then `remap_page` on user-mode write faults
+// where (P+W+U) all set. Earlier smokes cover each routine in
+// isolation; these reproduce the *coupled* sequence so that
+// regressions in either side surface here instead of only on real
+// hardware after a fork.
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
+    // Parent maps one writable page, stamps a sentinel, then forks.
+    // Both sides materialise the post-fork RO PTEs. We then replay
+    // exactly what the #PF handler does on the child's first write:
+    //   1. cow_split_on_write — allocates a private frame, memcpys,
+    //      dec_refs the shared frame, regains WRITE on the region.
+    //   2. remap_page — rewrites the live PTE so the next user
+    //      instruction succeeds.
+    // After the round trip, mutating through the child's PTE must
+    // NOT corrupt the parent's still-shared frame.
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    #[cfg(target_arch = "x86_64")]
+    use crate::x86_64::paging::translate;
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
+    use crate::VirtAddr;
+
+    cow::__test_clear();
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let p_frame = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame parent"),
+    };
+    const VADDR: u64 = 0x0000_0080_0046_0000;
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![p_frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region parent");
+    }
+    if unsafe { parent.materialize() }.is_err() {
+        return TestResult::Fail("parent materialize");
+    }
+    // SAFETY: parent is sole owner; identity-mapped.
+    unsafe {
+        *(p_frame.raw() as *mut u32) = 0xCAFEBABE;
+    }
+
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("clone_for_fork"),
+    };
+    if unsafe { child.materialize() }.is_err() {
+        return TestResult::Fail("child materialize");
+    }
+    // Parent's PTEs need re-walking: clone_for_fork stripped WRITE
+    // from the regions but the live PTEs are still RW.
+    if unsafe { parent.rematerialize() }.is_err() {
+        return TestResult::Fail("parent rematerialize");
+    }
+
+    // ── Replay the #PF handler's COW recovery on the child ──
+    if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("cow_split_on_write child");
+    }
+    if unsafe { child.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("remap_page child");
+    }
+
+    // Live PTE in the child must now resolve to a NEW phys frame.
+    let child_pte = unsafe { translate(child.root, VirtAddr::new(VADDR)) };
+    let child_phys = match child_pte {
+        Some(p) => p,
+        None => return TestResult::Fail("child PTE not present after remap"),
+    };
+    if child_phys == p_frame {
+        return TestResult::Fail("child PTE still points at parent's frame");
+    }
+    // Parent's PTE must still resolve to the original shared frame.
+    let parent_pte = unsafe { translate(parent.root, VirtAddr::new(VADDR)) };
+    if parent_pte != Some(p_frame) {
+        return TestResult::Fail("parent PTE moved off the original frame");
+    }
+
+    // Mutate through the child's private frame; the parent's shared
+    // frame must not see the change.
+    // SAFETY: identity-mapped, child is now sole owner of child_phys.
+    unsafe {
+        *(child_phys.raw() as *mut u32) = 0xDEADBEEF;
+    }
+    // SAFETY: identity-mapped.
+    let parent_word = unsafe { *(p_frame.raw() as *const u32) };
+    if parent_word != 0xCAFEBABE {
+        return TestResult::Fail("child's post-split write leaked into parent");
+    }
+    let child_word = unsafe { *(child_phys.raw() as *const u32) };
+    if child_word != 0xDEADBEEF {
+        return TestResult::Fail("child's private frame did not retain write");
+    }
+
+    let _ = parent;
+    let _ = child;
+    cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_cow_fault_path_child_diverges);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
+    // Symmetric to the child smoke: the trap handler runs on
+    // whichever side writes first. Parent-side cow_split_on_write +
+    // remap_page must allocate a private frame for the PARENT,
+    // leaving the child with the original (now sole-owner) frame.
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    #[cfg(target_arch = "x86_64")]
+    use crate::x86_64::paging::translate;
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
+    use crate::VirtAddr;
+
+    cow::__test_clear();
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let orig_frame = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame parent"),
+    };
+    const VADDR: u64 = 0x0000_0080_0046_1000;
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![orig_frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region parent");
+    }
+    if unsafe { parent.materialize() }.is_err() {
+        return TestResult::Fail("parent materialize");
+    }
+    // SAFETY: sole owner pre-fork.
+    unsafe {
+        *(orig_frame.raw() as *mut u32) = 0xA5A5_A5A5;
+    }
+
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("clone_for_fork"),
+    };
+    if unsafe { child.materialize() }.is_err() {
+        return TestResult::Fail("child materialize");
+    }
+    if unsafe { parent.rematerialize() }.is_err() {
+        return TestResult::Fail("parent rematerialize");
+    }
+
+    // Parent writes first → trap path runs on the parent.
+    if unsafe { parent.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("cow_split_on_write parent");
+    }
+    if unsafe { parent.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("remap_page parent");
+    }
+
+    let parent_phys = match unsafe { translate(parent.root, VirtAddr::new(VADDR)) } {
+        Some(p) => p,
+        None => return TestResult::Fail("parent PTE not present after remap"),
+    };
+    if parent_phys == orig_frame {
+        return TestResult::Fail("parent PTE still points at the shared frame");
+    }
+    if unsafe { translate(child.root, VirtAddr::new(VADDR)) } != Some(orig_frame) {
+        return TestResult::Fail("child PTE drifted off original after parent split");
+    }
+    // Parent now has refcount 0 on its private frame (fresh, never
+    // cow-registered); child is now sole logical owner of orig_frame.
+    if cow::count(orig_frame) > 1 {
+        return TestResult::Fail("orig_frame refcount should drop to ≤1 after split");
+    }
+
+    // SAFETY: identity-mapped, parent owns parent_phys exclusively.
+    unsafe {
+        *(parent_phys.raw() as *mut u32) = 0x5A5A_5A5A;
+    }
+    // SAFETY: identity-mapped.
+    let child_word = unsafe { *(orig_frame.raw() as *const u32) };
+    if child_word != 0xA5A5_A5A5 {
+        return TestResult::Fail("parent split leaked into child's frame");
+    }
+
+    let _ = parent;
+    let _ = child;
+    cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_cow_fault_path_parent_diverges);
+
+fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
+    // Trap-handler fallthrough: cow_split_on_write on a vaddr that
+    // is NOT in any region must return Unmapped so the #PF handler
+    // falls through to the existing SIGSEGV/panic path. Regression
+    // backstop on the gate that prevents a genuine RO-by-intent
+    // fault from being silently turned into a COW recovery.
+    use crate::address_space::{AddressSpace, AddressSpaceError, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::VirtAddr;
+
+    cow::__test_clear();
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let f = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    const REGION_VADDR: u64 = 0x0000_0080_0046_2000;
+    if a
+        .map_region(Region {
+            base: VirtAddr::new(REGION_VADDR),
+            len: 4096,
+            perms: RegionPerms::READ,
+            phys: alloc::vec![f],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region");
+    }
+
+    // Vaddr well outside any mapped region.
+    const STRAY: u64 = 0x0000_0080_00FF_E000;
+    match unsafe { a.cow_split_on_write(VirtAddr::new(STRAY)) } {
+        Err(AddressSpaceError::Unmapped) => {}
+        Ok(()) => return TestResult::Fail("split on unmapped vaddr returned Ok"),
+        Err(_) => return TestResult::Fail("split returned wrong error variant"),
+    }
+    let _ = a;
+    cow::__test_clear();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_cow_fault_path_outside_region_fails);
