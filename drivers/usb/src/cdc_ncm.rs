@@ -608,8 +608,8 @@ pub mod tests {
 
     fn smoke_ncm_descriptor() -> TestResult {
         // length 6, CS_INTERFACE, subtype 0x1A NCM, bcdNCM=0x0100,
-        // capabilities 0x35 (packet_filter | encap_command | max_dgram | ndp_8byte).
-        let raw = [6u8, CS_INTERFACE, 0x1A, 0x00, 0x01, 0x35];
+        // capabilities 0x2D (packet_filter | encap_command | max_dgram | ndp_8byte).
+        let raw = [6u8, CS_INTERFACE, 0x1A, 0x00, 0x01, 0x2D];
         let d = match NcmDescriptor::parse(&raw) {
             Ok(d) => d,
             Err(_) => return TestResult::Fail("clean NCM desc rejected"),
