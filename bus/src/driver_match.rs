@@ -160,13 +160,15 @@ impl core::fmt::Debug for PciMatch {
 /// is fine.
 static REGISTRY: IrqSafeSpinLock<Vec<PciMatch>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Register a driver with the match table. Idempotent on `name` —
-/// re-registering replaces the prior entry, so the test harness
-/// can drive multiple smokes that re-add the same driver without
-/// leaking entries.
+/// Register a driver with the match table. Idempotent on
+/// `(name, kind)` — re-registering the same predicate replaces the
+/// prior entry, so the test harness can drive multiple smokes that
+/// re-add the same driver without leaking entries. Drivers like
+/// k10temp that push multiple (vendor, device) entries under one
+/// name retain all of them because the kind differs.
 pub fn register(m: PciMatch) {
     let mut g = REGISTRY.lock();
-    if let Some(pos) = g.iter().position(|e| e.name == m.name) {
+    if let Some(pos) = g.iter().position(|e| e.name == m.name && e.kind == m.kind) {
         g[pos] = m;
     } else {
         g.push(m);
