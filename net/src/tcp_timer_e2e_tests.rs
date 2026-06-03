@@ -1041,16 +1041,22 @@ fn smoke_keepalive_after_two_hour_idle() -> TestResult {
         };
 
     // Enable keepalive and set idle timeout to a manageable value.
+    // tick_keepalive computes `elapsed = now_cycles().wrapping_sub(last_prog)`
+    // and fires when elapsed >= keepalive_idle_ns * cycles_per_ns. In test
+    // mode now_cycles() is small, so back-dating last_progress via wrapping
+    // subtraction is the only way to guarantee elapsed crosses the 2-hour
+    // threshold without changing the production threshold itself.
+    let now_cyc = narf_scheduler::narf_time::now_cycles();
+    let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+    let two_hour_cycles = KEEPALIVE_IDLE_NS.saturating_mul(cpn);
     __with_tcb_mut(child_id, |t| {
         t.keepalive_enabled = true;
-        t.keepalive_idle_ns = KEEPALIVE_IDLE_NS; // 2 hours (we'll fake elapsed time)
+        t.keepalive_idle_ns = KEEPALIVE_IDLE_NS; // 2 hours
         t.keepalive_intvl_ns = 75_000_000_000; // 75s
         t.keepalive_cnt = 9;
         t.keepalive_probes_sent = 0;
-        // Back-date last_progress_cycles so that elapsed > 2h.
-        // cycles_per_ns = 1, so 2h = 7200s = 7_200_000_000_000 ns = 7_200_000_000_000 cycles.
-        // Set last_progress = 0, so elapsed = now_cycles() which is always > that.
-        t.last_progress_cycles = 0;
+        // Pin last_progress two hours + 1 cycle behind now (wrapping).
+        t.last_progress_cycles = now_cyc.wrapping_sub(two_hour_cycles.saturating_add(1));
     });
 
     // tick_keepalive inside tick_retransmit should fire a probe.
