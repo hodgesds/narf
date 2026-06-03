@@ -1487,6 +1487,21 @@ impl DirOps for InitramfsDir {
                 }));
             }
         }
+        // Synthesize virtual directory for implicit subdirectories —
+        // same rationale as InitramfsRoot::lookup.
+        let any_child = self.entries.iter().any(|e| {
+            let canon = canonicalize_cpio_name(e.name);
+            canon.strip_prefix(&target)
+                .and_then(|r| r.strip_prefix('/'))
+                .is_some()
+        });
+        if any_child {
+            return Some(Arc::new(InitramfsFile {
+                data: &[],
+                mode: 0o040_755,
+                mtime: 0,
+            }));
+        }
         None
     }
 
@@ -1553,6 +1568,25 @@ impl DirOps for InitramfsRoot {
                     mtime: e.mtime,
                 }));
             }
+        }
+        // Synthesize a virtual directory entry for implicit directories —
+        // CPIO archives produced without explicit directory entries (e.g.
+        // `echo -e "bin/echo" | cpio …`) still need `lookup("bin")` to
+        // return something with FileType::Dir so `resolve_async` can descend
+        // into the directory for paths like `/bin/echo`.
+        let any_child = self.entries().iter().any(|e| {
+            let canon = canonicalize_cpio_name(e.name);
+            canon.strip_prefix(name)
+                .and_then(|r| r.strip_prefix('/'))
+                .is_some()
+        });
+        if any_child {
+            // Mode 0o040755 = drwxr-xr-x (directory)
+            return Some(Arc::new(InitramfsFile {
+                data: &[],
+                mode: 0o040_755,
+                mtime: 0,
+            }));
         }
         None
     }
