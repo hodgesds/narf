@@ -426,14 +426,14 @@ pub mod tests {
         // 9600 baud must produce a valid (non-None) divisor.
         match calc_divisor(9600) {
             Some(w) => {
-                // ps should be 3 (highest prescaler) for low baud.
-                // Verify ps bits (1:0) can represent ps=3.
+                // 9600 falls between MIN_RATES[1]=366 and MIN_RATES[2]=2929
+                // (below MIN_RATES[3]=23437), so the selector picks ps=2.
                 let _div_high = (w >> 8) as u8;
                 let ps = w & 0x03;
-                if ps == 3 {
+                if ps == 2 {
                     TestResult::Pass
                 } else {
-                    TestResult::Fail("9600 baud: expected ps=3")
+                    TestResult::Fail("9600 baud: expected ps=2")
                 }
             }
             None => TestResult::Fail("9600 baud should produce valid divisor"),
