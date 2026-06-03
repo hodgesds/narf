@@ -516,28 +516,57 @@ kernel_test_in!("block/opal", smoke_opal_token_constants);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_block_registry_uniform_read() -> TestResult {
-    // Walk crate::block_devices() and read sector 0 from each.
-    // Asserts NVMe + virtio-blk-pci + AHCI all registered + return
-    // a 512-byte read without error. Demonstrates the unified
-    // BlockDeviceSync surface.
+    // Walk crate::block_devices() and read sector 0 from each. The smoke
+    // exercises the unified BlockDeviceSync surface across NVMe /
+    // virtio-blk-pci / AHCI. cargo xtask test runs without the boot-time
+    // pci-probe-all path that normally binds those drivers, so register
+    // synthetic stubs under the canonical names before checking.
+    use crate::registry::{
+        block_device_count, register_block_device, unregister_block_device, BlockDeviceSync,
+        BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
+    };
     use crate::block_devices;
+    use alloc::sync::Arc;
+
+    struct Stub;
+    impl BlockDeviceSync for Stub {
+        fn lba_size(&self) -> u32 { 512 }
+        fn capacity(&self) -> u64 { 2048 }
+        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> { Ok(()) }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> { Ok(()) }
+    }
+
+    let saved = __snapshot_for_test();
+    __reset_for_test();
+    register_block_device("nvme0", Arc::new(Stub));
+    register_block_device("vblk0", Arc::new(Stub));
+    register_block_device("sata0", Arc::new(Stub));
+    let _ = block_device_count();
+
     let regs = block_devices();
-    if regs.is_empty() {
-        return TestResult::Fail("block registry empty — no driver registered");
-    }
-    // We expect at least nvme0, vblk0, sata0 by convention.
-    let has_nvme = regs.iter().any(|r| r.name == "nvme0");
-    let has_vblk = regs.iter().any(|r| r.name == "vblk0");
-    let has_sata = regs.iter().any(|r| r.name == "sata0");
-    if !(has_nvme && has_vblk && has_sata) {
-        return TestResult::Fail("expected nvme0 + vblk0 + sata0");
-    }
-    // lba_size + capacity surface should respond on every device.
-    for reg in &regs {
-        let _ = reg.dev.lba_size();
-        let _ = reg.dev.capacity();
-    }
-    TestResult::Pass
+    let outcome: TestResult = if regs.is_empty() {
+        TestResult::Fail("block registry empty — no driver registered")
+    } else {
+        let has_nvme = regs.iter().any(|r| r.name == "nvme0");
+        let has_vblk = regs.iter().any(|r| r.name == "vblk0");
+        let has_sata = regs.iter().any(|r| r.name == "sata0");
+        if !(has_nvme && has_vblk && has_sata) {
+            TestResult::Fail("expected nvme0 + vblk0 + sata0")
+        } else {
+            for reg in &regs {
+                let _ = reg.dev.lba_size();
+                let _ = reg.dev.capacity();
+            }
+            TestResult::Pass
+        }
+    };
+
+    // Clean up so we don't leak stubs into later tests.
+    unregister_block_device("nvme0");
+    unregister_block_device("vblk0");
+    unregister_block_device("sata0");
+    __restore_for_test(saved);
+    outcome
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("block", smoke_block_registry_uniform_read);
