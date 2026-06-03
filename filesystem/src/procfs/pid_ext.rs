@@ -802,9 +802,31 @@ fn smoke_coredump_filter_default() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_coredump_filter_default);
 
+/// Stub hooks used by the procfs write-validation smokes so the
+/// validation path runs without depending on `install_all_hooks`
+/// from the frame crate (which isn't called in `cargo xtask test`).
+fn _stub_set_comm(_pid: u64, _name: &str) -> Result<(), FsError> { Ok(()) }
+fn _stub_oom_adj_get(_pid: u64) -> i16 { 0 }
+fn _stub_oom_adj_set(_pid: u64, _val: i16) -> Result<(), FsError> { Ok(()) }
+fn _stub_coredump_get(_pid: u64) -> u32 { 0 }
+fn _stub_coredump_set(_pid: u64, _val: u32) -> Result<(), FsError> { Ok(()) }
+fn _stub_oom_score(_pid: u64) -> i32 { 0 }
+
+fn _install_stub_proc_write_hooks() {
+    super::install_proc_write_hooks(
+        _stub_set_comm,
+        _stub_oom_adj_get,
+        _stub_oom_adj_set,
+        _stub_coredump_get,
+        _stub_coredump_set,
+        _stub_oom_score,
+    );
+}
+
 /// Smoke: oom_score_adj write "100" is accepted; "1500" is rejected.
 fn smoke_oom_score_adj_write_validation() -> TestResult {
     use super::poll_once;
+    _install_stub_proc_write_hooks();
     // Valid write: "100\n".
     let f = PidExtFile { pid: 1, field: PidExtField::OomScoreAdj };
     let ok = poll_once(f.write(0, b"100\n"));
@@ -822,6 +844,7 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_oom_score_adj_write_validatio
 /// Smoke: coredump_filter write "ff" roundtrips; invalid hex rejected.
 fn smoke_coredump_filter_write_validation() -> TestResult {
     use super::poll_once;
+    _install_stub_proc_write_hooks();
     let f = PidExtFile { pid: 1, field: PidExtField::CoredumpFilter };
     let ok = poll_once(f.write(0, b"ff\n"));
     let bad = poll_once(f.write(0, b"zz\n"));
