@@ -230,67 +230,44 @@ fn curve_eqn(x: &Fp) -> Fp {
     x3.sub(&three_x).add(&b)
 }
 
-/// `inv0` per RFC 9380 §4: `0 ↦ 0`, otherwise `x ↦ x^(-1)`.
-fn inv0(x: &Fp) -> Fp {
-    if x.is_zero() {
-        Fp::ZERO
-    } else {
-        x.invert()
-    }
-}
-
 /// Simplified SWU map for `p ≡ 3 (mod 4)` (RFC 9380 §6.6.2).
+///
+/// Follows the reference 10-step listing verbatim:
+///   tv1 = inv0(Z²u⁴ + Zu²)
+///   x1  = (-B/A) * (1 + tv1)            // or B/(Z*A) if tv1 == 0
+///   gx1 = x1³ + a·x1 + b
+///   x2  = Z·u² · x1
+///   gx2 = x2³ + a·x2 + b
+///   (x, y) = (x1, sqrt(gx1)) if gx1 is a square, else (x2, sqrt(gx2))
+///   if sgn0(u) != sgn0(y): y = -y
 fn map_to_curve_sswu(u: &Fp) -> AffinePoint {
     let z = sswu_z();
     let a = curve_a();
     let b = Fp::from_limbs(super::CURVE_B);
 
-    // tv1 = u^2; tv1 = Z * tv1
-    let z_u2 = z.mul(&u.square());
-    // tv2 = tv1^2; tv2 = tv2 + tv1  ==  (Z*u^2)^2 + (Z*u^2)
-    let tv2 = z_u2.square().add(&z_u2);
-    // tv3 = tv2 + 1; tv3 = tv3 * b
-    let tv3 = tv2.add(&Fp::ONE).mul(&b);
-    // tv4 = if tv2 == 0 then Z else -tv2; tv4 = tv4 * a
-    let tv4 = if tv2.is_zero() { z } else { tv2.neg() }.mul(&a);
-    // tv2 = tv3^2
-    let tv2_sq = tv3.square();
-    // tv6 = tv4^2
-    let tv6 = tv4.square();
-    // tv5 = tv6 * a
-    let tv5 = tv6.mul(&a);
-    // tv2 = tv2 + tv5; tv2 = tv2 * tv3
-    let tv2 = tv2_sq.add(&tv5).mul(&tv3);
-    // tv6 = tv6 * tv4
-    let tv6 = tv6.mul(&tv4);
-    // tv5 = tv6 * b; tv2 = tv2 + tv5
-    let tv5 = tv6.mul(&b);
-    let tv2 = tv2.add(&tv5);
-    // x = tv1 * tv3 == Z*u^2 * tv3
-    let x = z_u2.mul(&tv3);
-    // Is gx1 (= tv2 / tv6) a square?
-    // We can simplify: gx1 is a QR iff tv2 * tv6 is a QR (since tv6 != 0
-    // and tv6^2 is always a QR; tv2/tv6 has the same Legendre symbol
-    // as tv2 * tv6).
-    let gx1_qr = tv2.mul(&tv6).is_quadratic_residue();
-    // y = sqrt(tv2 / tv6) — we compute as sqrt(tv2 * tv6) / tv6 to
-    // avoid an extra inversion: y^2 = tv2 / tv6, so y = sqrt(tv2*tv6)/tv6.
-    // But RFC presents it via sqrt_ratio. Simplest: compute gx1 directly.
-    let y1 = {
-        let gx1 = tv2.mul(&inv0(&tv6));
-        gx1.sqrt()
-    };
-    // If gx1 not a square, use x' = Z*u^2 * x and y' = u^3 * y.
-    let (x_out, y_pre) = if gx1_qr {
-        (x, y1)
+    let z_u2 = z.mul(&u.square());           // Z·u²
+    let z2_u4 = z_u2.square();               // Z²·u⁴
+    let denom = z2_u4.add(&z_u2);            // Z²u⁴ + Z u²
+
+    // x1 = (-B / A) * (1 + inv0(denom)); exceptional path picks B/(Z·A).
+    let x1 = if denom.is_zero() {
+        b.mul(&z.mul(&a).invert())
     } else {
-        let x2 = z_u2.mul(&x);
-        let u3 = u.square().mul(u);
-        let y2 = u3.mul(&y1);
-        (x2, y2)
+        let tv1 = denom.invert();
+        b.neg().mul(&a.invert()).mul(&Fp::ONE.add(&tv1))
     };
-    // Sign correction: sgn0(u) == sgn0(y) ? y : -y. sgn0 in GF(p) for
-    // P-256 (RFC 9380 §4.1) is the LSB of the integer representative.
+    let gx1 = curve_eqn(&x1);
+    let x2 = z_u2.mul(&x1);
+    let gx2 = curve_eqn(&x2);
+
+    let (x_out, y_pre) = if gx1.is_quadratic_residue() {
+        (x1, gx1.sqrt())
+    } else {
+        // gx2 is guaranteed to be a QR when gx1 is not — RFC 9380 §6.6.2.
+        (x2, gx2.sqrt())
+    };
+
+    // sgn0 for P-256 (RFC 9380 §4.1) is the LSB of the integer representative.
     let y_out = if u.lsb() == y_pre.lsb() {
         y_pre
     } else {
