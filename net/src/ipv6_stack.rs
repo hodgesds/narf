@@ -312,7 +312,8 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
             let cks = pseudo_checksum(dst_ip, src_ip, NEXT_HEADER_ICMPV6, &reply);
             reply[2] = (cks >> 8) as u8;
             reply[3] = (cks & 0xFF) as u8;
-            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            // Per Linux icmpv6_rcv(): kernel answers Echo Requests
+            // itself; raw/ping sockets do not see inbound type 128.
             // We don't synchronously transmit here; the kernel send
             // path is iface-aware. For tests, the reply body is the
             // important artifact.
