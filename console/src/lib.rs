@@ -259,6 +259,30 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
         narf_arch::halt_forever();
     }
 
+    // Status-panel diag: latch the panic location into the shared
+    // diag state so the FB status panel turns red and shows a
+    // compact marker (file/line hashed into a u64). First-only
+    // semantics inside latch_panic mean the panic that caused us
+    // is preserved even if the FB hook or RBP walk below tries to
+    // re-panic. Atomic-only — no allocation, no lock acquisition.
+    {
+        let mut marker: u64 = 0;
+        if let Some(loc) = info.location() {
+            // Cheap FNV-1a 64 of file path + line. Compact enough
+            // for the panel; the operator can grep the kernel for
+            // the matching file/line later.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in loc.file().as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            h ^= loc.line() as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            marker = h;
+        }
+        narf_memory::diag::latch_panic(marker);
+    }
+
     // Format into a small fixed-size buffer + emit to both
     // sinks. Using `core::fmt::Write` against a stack buffer
     // avoids allocation and avoids the CONSOLE.lock path.
