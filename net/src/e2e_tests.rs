@@ -1208,3 +1208,230 @@ fn smoke_e2e_iface_unregister_cleanup() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_e2e_iface_unregister_cleanup);
+
+// ── Wave 47: route non-TCP send paths via for_dst, not primary ──────────────
+//
+// Wave 42 fixed TCP. The same systemic bug existed in every other L3/L4
+// send-site: UDP, ICMP echo, and ARP request all called `iface::primary()`
+// + `iface::send()`, which always pick the first-registered NIC. In real
+// hosts with two NICs (or a test that registers a capture iface after the
+// boot driver), all traffic egressed on the first iface regardless of
+// route. These smokes register a "primary" iface first, then a "capture"
+// iface owning the destination subnet, and assert the frame egressed on
+// the capture iface (Wave-47 path) and NOT on the boot-time primary.
+//
+// Linux ref: ip_route_output_key_hash_rcu (linux/net/ipv4/route.c)
+//   selects the egress device from the FIB, then arp_solicit etc. send
+//   on that device — not the first-registered netdev.
+
+/// Drop-counter for the "primary" iface in the routing smokes. If a send
+/// path correctly consults the FIB, this counter stays at zero — the
+/// frame went through capture_send instead.
+static PRIMARY_TX_COUNT: IrqSafeSpinLock<usize> = IrqSafeSpinLock::new(0);
+
+fn primary_send(_frame: &[u8]) -> Result<(), ()> {
+    *PRIMARY_TX_COUNT.lock() += 1;
+    Ok(())
+}
+
+/// Common setup for Wave-47 smokes. Registers PRIMARY first (boot-time
+/// driver analog), then CAPTURE second with a connected /24 owning
+/// `capture_subnet`. Sends to an address in that /24 must land on the
+/// capture iface, not on primary.
+fn wave47_two_iface_setup(
+    primary_name: &'static str,
+    primary_ip: [u8; 4],
+    capture_name: &'static str,
+    capture_ip: [u8; 4],
+    capture_prefix_len: u8,
+) {
+    core::__reset_for_test();
+    route::__reset_for_test();
+    arp_cache::__reset_for_test();
+    crate::ifaddr::__reset_for_test();
+    TX_CAPTURE.lock().clear();
+    *PRIMARY_TX_COUNT.lock() = 0;
+
+    // Primary iface — what a real driver registers at boot. Owns its own
+    // disjoint /24 so the capture-subnet route can't accidentally pick it.
+    iface::register(primary_name, [0x02, 0xAA, 0, 0, 0, 0x01], primary_send);
+    iface::set_iface_ipv4(primary_name, primary_ip, primary_ip);
+    iface::add_addr(primary_name, primary_ip, 24);
+
+    // Capture iface — registered AFTER primary, like a test fixture or a
+    // second NIC that comes up later. Owns the subnet the smoke will
+    // target.
+    iface::register(capture_name, [0x02, 0xBB, 0, 0, 0, 0x05], capture_send);
+    iface::set_iface_ipv4(capture_name, capture_ip, capture_ip);
+    iface::add_addr(capture_name, capture_ip, capture_prefix_len);
+}
+
+// ── Wave 47 smoke: UDP send picks for_dst, not primary ─────────────────────
+//
+// Bind a UDP socket, send to a destination in the capture iface's /24.
+// Wave 42 / 47: udp_send must use iface::for_dst(dst.ip), so the frame
+// lands in TX_CAPTURE. If the regression returns, frames go through
+// primary_send instead and the smoke fails.
+
+fn smoke_wave47_udp_send_routes_via_for_dst() -> TestResult {
+    const PRIMARY:     &str    = "wave47-udp-pri";
+    const PRIMARY_IP:  [u8; 4] = [10, 47, 1, 1];
+    const CAPTURE:     &str    = "wave47-udp-cap";
+    const CAPTURE_IP:  [u8; 4] = [10, 47, 2, 1];
+    const DST_IP:      [u8; 4] = [10, 47, 2, 99];
+    const DST_PORT:    u16     = 16047;
+    const SRC_PORT:    u16     = 56047;
+
+    wave47_two_iface_setup(PRIMARY, PRIMARY_IP, CAPTURE, CAPTURE_IP, 24);
+
+    // Seed ARP for the in-subnet destination so udp_send doesn't spin.
+    let dst_mac = [0x02, 0xBB, 0, 0, 0, 0x99];
+    crate::tcp_stack::__arp_insert_legacy(DST_IP, dst_mac);
+    arp_cache::insert(CAPTURE, DST_IP, dst_mac);
+
+    let sock = match crate::udp_sock::udp_bind(
+        SocketAddrV4::new(CAPTURE_IP, SRC_PORT),
+        crate::udp_sock::UdpOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("udp_bind failed"),
+    };
+
+    let payload = b"wave47-udp";
+    match crate::udp_sock::udp_send(
+        &sock,
+        payload,
+        Some(SocketAddrV4::new(DST_IP, DST_PORT)),
+    ) {
+        Ok(n) if n == payload.len() => {}
+        Ok(_) => return TestResult::Fail("udp_send returned wrong byte count"),
+        Err(_) => return TestResult::Fail("udp_send failed"),
+    }
+
+    let txd = drain_captured();
+    if txd.is_empty() {
+        return TestResult::Fail("UDP frame did not land on capture iface (regression: routed via primary)");
+    }
+    if *PRIMARY_TX_COUNT.lock() != 0 {
+        return TestResult::Fail("UDP frame leaked to primary iface (Wave-47 regression)");
+    }
+
+    // Quick sanity: IPv4 dst bytes match.
+    let frame = &txd[0];
+    if frame.len() < ETH_HDR_LEN + 20 {
+        return TestResult::Fail("captured UDP frame too short");
+    }
+    let ip_dst: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].try_into().unwrap();
+    if ip_dst != DST_IP {
+        return TestResult::Fail("captured UDP frame has wrong IPv4 dst");
+    }
+
+    crate::udp_sock::udp_close(&sock);
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_wave47_udp_send_routes_via_for_dst);
+
+// ── Wave 47 smoke: ICMP echo request routes via for_dst ────────────────────
+//
+// icmp_echo_send used iface::primary() before Wave 47. Open an echo
+// socket, send to a destination in the capture iface's /24, verify the
+// frame went through capture_send.
+
+fn smoke_wave47_icmp_echo_routes_via_for_dst() -> TestResult {
+    const PRIMARY:     &str    = "wave47-icmp-pri";
+    const PRIMARY_IP:  [u8; 4] = [10, 47, 3, 1];
+    const CAPTURE:     &str    = "wave47-icmp-cap";
+    const CAPTURE_IP:  [u8; 4] = [10, 47, 4, 1];
+    const DST_IP:      [u8; 4] = [10, 47, 4, 42];
+
+    wave47_two_iface_setup(PRIMARY, PRIMARY_IP, CAPTURE, CAPTURE_IP, 24);
+
+    // ARP seed for the in-subnet target.
+    let dst_mac = [0x02, 0xBB, 0, 0, 0, 0x42];
+    crate::tcp_stack::__arp_insert_legacy(DST_IP, dst_mac);
+    arp_cache::insert(CAPTURE, DST_IP, dst_mac);
+
+    let sock = crate::icmp_sock::icmp_echo_open();
+    let payload = b"wave47-icmp";
+    match crate::icmp_sock::icmp_echo_send(&sock, DST_IP, 1, payload) {
+        Ok(()) => {}
+        Err(_) => return TestResult::Fail("icmp_echo_send failed"),
+    }
+    crate::icmp_sock::icmp_echo_close(&sock);
+
+    let txd = drain_captured();
+    if txd.is_empty() {
+        return TestResult::Fail("ICMP frame did not land on capture iface (regression: routed via primary)");
+    }
+    if *PRIMARY_TX_COUNT.lock() != 0 {
+        return TestResult::Fail("ICMP frame leaked to primary iface (Wave-47 regression)");
+    }
+
+    // IPv4 protocol byte = ICMP (1) and dst matches.
+    let frame = &txd[0];
+    if frame.len() < ETH_HDR_LEN + 20 {
+        return TestResult::Fail("captured ICMP frame too short");
+    }
+    if frame[ETH_HDR_LEN + 9] != 1 {
+        return TestResult::Fail("captured frame is not ICMP");
+    }
+    let ip_dst: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].try_into().unwrap();
+    if ip_dst != DST_IP {
+        return TestResult::Fail("captured ICMP frame has wrong IPv4 dst");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_wave47_icmp_echo_routes_via_for_dst);
+
+// ── Wave 47 smoke: ARP request egresses on iface owning the target subnet ──
+//
+// tcp_stack::send_arp_request called iface::primary() pre-Wave-47. Build
+// a two-iface topology, request ARP for a host in the capture iface's
+// /24, verify the request egressed on capture not primary.
+
+fn smoke_wave47_arp_request_routes_via_for_dst() -> TestResult {
+    const PRIMARY:     &str    = "wave47-arp-pri";
+    const PRIMARY_IP:  [u8; 4] = [10, 47, 5, 1];
+    const CAPTURE:     &str    = "wave47-arp-cap";
+    const CAPTURE_IP:  [u8; 4] = [10, 47, 6, 1];
+    const TARGET_IP:   [u8; 4] = [10, 47, 6, 200];
+
+    wave47_two_iface_setup(PRIMARY, PRIMARY_IP, CAPTURE, CAPTURE_IP, 24);
+
+    match crate::tcp_stack::send_arp_request(TARGET_IP) {
+        Ok(()) => {}
+        Err(()) => return TestResult::Fail("send_arp_request returned Err"),
+    }
+
+    let txd = drain_captured();
+    if txd.is_empty() {
+        return TestResult::Fail("ARP request did not land on capture iface (regression: routed via primary)");
+    }
+    if *PRIMARY_TX_COUNT.lock() != 0 {
+        return TestResult::Fail("ARP request leaked to primary iface (Wave-47 regression)");
+    }
+
+    // Frame is ARP: ethertype = 0x0806 at offset 12..14.
+    let frame = &txd[0];
+    if frame.len() < 42 {
+        return TestResult::Fail("captured ARP frame too short");
+    }
+    let et = u16::from_be_bytes([frame[12], frame[13]]);
+    if et != 0x0806 {
+        return TestResult::Fail("captured frame is not ARP");
+    }
+    // ARP target protocol address (TPA) at bytes 38..42 of the frame.
+    let tpa: [u8; 4] = frame[38..42].try_into().unwrap();
+    if tpa != TARGET_IP {
+        return TestResult::Fail("captured ARP frame has wrong TPA");
+    }
+    // ARP sender protocol address (SPA) at bytes 28..32 must be capture's IP.
+    let spa: [u8; 4] = frame[28..32].try_into().unwrap();
+    if spa != CAPTURE_IP {
+        return TestResult::Fail("captured ARP SPA is not capture iface's IP");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_wave47_arp_request_routes_via_for_dst);

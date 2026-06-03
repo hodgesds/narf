@@ -163,7 +163,8 @@ pub fn icmp_echo_send(
     seq: u16,
     payload: &[u8],
 ) -> Result<(), IcmpError2> {
-    let iface = iface::primary().ok_or(IcmpError2::NoInterface)?;
+    // Wave-47: route by destination, not boot-time primary.
+    let iface = iface::for_dst(target).ok_or(IcmpError2::NoInterface)?;
     let dst_mac = if target == [255, 255, 255, 255] {
         [0xFF; 6]
     } else {
@@ -201,7 +202,7 @@ pub fn icmp_echo_send(
 
     let sent_ns = narf_scheduler::narf_time::monotonic_ns();
 
-    iface::send(&frame).map_err(|_| IcmpError2::NoInterface)?;
+    (iface.send)(&frame).map_err(|_| IcmpError2::NoInterface)?;
 
     // Record the pending echo.
     sock.pending.lock().push_back(PendingEcho {
@@ -314,7 +315,8 @@ fn handle_echo_request(src_ip: [u8; 4], _dst_ip: [u8; 4], icmp_body: &[u8]) {
     let seq = u16::from_be_bytes([icmp_body[6], icmp_body[7]]);
     let payload = &icmp_body[8..];
 
-    let iface = match iface::primary() {
+    // Wave-47: reply via the iface that owns the route to the requester.
+    let iface = match iface::for_dst(src_ip) {
         Some(i) => i,
         None => return,
     };
@@ -351,7 +353,7 @@ fn handle_echo_request(src_ip: [u8; 4], _dst_ip: [u8; 4], icmp_body: &[u8]) {
     let cs = ip_checksum(&frame[icmp_off..icmp_off + icmp_len]);
     frame[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
 
-    let _ = iface::send(&frame);
+    let _ = (iface.send)(&frame);
 }
 
 fn handle_echo_reply(_src_ip: [u8; 4], icmp_body: &[u8]) {

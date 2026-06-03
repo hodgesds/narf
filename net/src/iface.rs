@@ -204,6 +204,21 @@ pub fn set_default_ipv4(ipv4: [u8; 4], gateway: [u8; 4]) {
     }
 }
 
+/// Replace the IPv4 / gateway pair on a named iface. Wave-47: the
+/// per-flow `for_dst` path stamps src-IP from `NetIfaceSnapshot::ipv4`,
+/// so multi-iface tests (and any future multi-NIC bring-up) need a
+/// per-iface setter rather than `set_default_ipv4`, which only touches
+/// the first-registered entry.
+pub fn set_iface_ipv4(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
+    let mut g = IFACES.lock();
+    if let Some(v) = g.as_mut() {
+        if let Some(e) = v.iter_mut().find(|e| e.name == name) {
+            e.ipv4 = ipv4;
+            e.gateway = gateway;
+        }
+    }
+}
+
 // ── Per-interface address management ───────────────────────────────────
 //
 // These functions forward to `ifaddr` and `route` to keep iface.rs as

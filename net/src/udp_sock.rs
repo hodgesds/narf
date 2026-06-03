@@ -325,7 +325,9 @@ pub fn udp_send(
         return Err(UdpError::MsgTooLong);
     }
 
-    let iface = iface::primary().ok_or(UdpError::NoInterface)?;
+    // Wave-47: route by destination so flows on a non-primary iface
+    // egress on the correct NIC (capture-iface smokes, multi-NIC hosts).
+    let iface = iface::for_dst(dst.ip).ok_or(UdpError::NoInterface)?;
     let src_ip = iface.ipv4;
     let src_port = sock.local.port;
     let dst_ip = dst.ip;
@@ -391,7 +393,7 @@ pub fn udp_send(
     };
     frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
 
-    iface::send(&frame).map_err(|_| UdpError::NoInterface)?;
+    (iface.send)(&frame).map_err(|_| UdpError::NoInterface)?;
     Ok(payload.len())
 }
 

@@ -68,13 +68,16 @@ pub fn __arp_insert_legacy(ip: [u8; 4], mac: [u8; 6]) {
     arp_insert_local(ip, mac);
 }
 
-/// Send an ARP request for `target_ip` via the primary iface.
+/// Send an ARP request for `target_ip` via the iface that owns the
+/// route to `target_ip`. Wave-47: prior code went out the boot-time
+/// primary, which on multi-NIC / capture-iface setups missed the
+/// subnet that actually contains the target.
 pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {
-    let iface = iface::primary().ok_or(())?;
+    let iface = iface::for_dst(target_ip).ok_or(())?;
     let mut frame = [0u8; 60];
     let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip)
         .ok_or(())?;
-    iface::send(&frame[..n])
+    (iface.send)(&frame[..n])
 }
 
 /// Resolve `ip` to a MAC: cache → ARP-request → busy-wait for reply.
