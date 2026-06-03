@@ -840,6 +840,17 @@ impl AddressSpace {
                 flags = flags | PtFlags::NO_EXEC;
             }
             for (i, p) in r.phys.iter().enumerate() {
+                // Skip demand-paged pages (phys == 0). They are
+                // NOT currently mapped (materialize skips them),
+                // so unmap_4kb would be a no-op and map_4kb would
+                // incorrectly install a PTE pointing at physical
+                // address 0 (BIOS/firmware area), corrupting the
+                // address space. Demand-paged pages get their
+                // real PTEs installed by `demand_alloc_page` on
+                // first user-mode access — no action needed here.
+                if p.raw() == 0 {
+                    continue;
+                }
                 let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: identity-mapped; v lies inside r which
                 // was bookkept by a prior map_region.
@@ -989,6 +1000,38 @@ impl AddressSpace {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
+    }
+
+    /// Force-rewrite every existing PTE to match the current region
+    /// permission metadata. Unlike [`materialize`] (which skips
+    /// already-mapped pages), this tears down and reinstalls every
+    /// leaf PTE so stale permission bits (e.g. WRITE still set in
+    /// old PTEs after `clone_for_fork` stripped WRITE from regions)
+    /// are corrected.
+    ///
+    /// Called on the **parent** address space after [`clone_for_fork`]
+    /// to install READ-ONLY PTEs on regions that previously had WRITE.
+    /// Without this the parent would continue writing to physical frames
+    /// shared with the child (COW bypass), corrupting the child's view.
+    ///
+    /// # Safety
+    /// - Identity map of the low 4 GiB must be live.
+    /// - `self.root` must be a valid page-table root allocated by
+    ///   `new_for_user`.
+    /// - May be called while `self` is the active CR3 — the `invlpg`
+    ///   issued by `unmap_4kb` / `map_4kb` flushes each TLB entry.
+    ///   Single-CPU Stage-4 BSP-only.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn rematerialize(&self) -> Result<(), AddressSpaceError> {
+        let regions = self.regions.lock().clone();
+        // SAFETY: identity-map live; `root` valid from `new_for_user`.
+        unsafe { self.rewrite_perms_pages(&regions) };
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub unsafe fn rematerialize(&self) -> Result<(), AddressSpaceError> {
+        Ok(())
     }
 
     /// Duplicate this address space for a `fork(2)`-style child.
