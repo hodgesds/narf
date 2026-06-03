@@ -39,7 +39,7 @@ fn smoke_uvc_vc_header_decode() -> TestResult {
         VC_HEADER,   // bDescriptorSubtype
         0x50, 0x01,  // bcdUVC = 0x0150 (UVC 1.5)
         0x27, 0x00,  // wTotalLength = 39
-        0x80, 0x8D, 0x5B, 0x02, // dwClockFrequency = 48_000_000
+        0x00, 0x6C, 0xDC, 0x02, // dwClockFrequency = 48_000_000
         0x01,        // bInCollection = 1
         0x01,        // baInterfaceNr[0] = 1
     ];
