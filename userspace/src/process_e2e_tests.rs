@@ -198,8 +198,9 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
     }
 
     // (3) fire the exit observer manually (simulates child calling
-    //     sys_exit_task) and verify wait4 reaps it.
-    crate::user_task::notify_task_exited(child_task_raw);
+    //     sys_exit_task) and verify wait4 reaps it. notify_task_exited
+    //     takes a ProcessId per Wave-38.
+    crate::user_task::notify_task_exited(child_pid);
 
     // (4) wait4(-1, &status, 0) from the parent should return child_tid
     let mut status: i32 = -1;
