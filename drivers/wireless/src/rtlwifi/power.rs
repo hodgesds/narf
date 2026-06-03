@@ -277,7 +277,7 @@ const fn pci_end() -> WlanPwrCfg {
 /// RTL8192EE Cardemu→Active power-on flow.
 ///
 /// Source: `rtl8192ee/pwrseq.h::RTL8192E_TRANS_CARDEMU_TO_ACT`.
-pub const RTL8192EE_PWR_ON: &[WlanPwrCfg] = &[
+pub static RTL8192EE_PWR_ON: &[WlanPwrCfg] = &[
     // disable HWPDN 0x04[15]=0
     pci_w(0x0005, 1 << 7, 0),
     // disable SW LPS 0x04[10]=0
@@ -297,7 +297,7 @@ pub const RTL8192EE_PWR_ON: &[WlanPwrCfg] = &[
 
 /// RTL8188EE Cardemu→Active power-on flow.  Source:
 /// `rtl8188ee/pwrseq.h::RTL8188EE_TRANS_CARDEMU_TO_ACT`.
-pub const RTL8188EE_PWR_ON: &[WlanPwrCfg] = &[
+pub static RTL8188EE_PWR_ON: &[WlanPwrCfg] = &[
     pci_w(0x0006, 1 << 0, 1 << 0),
     pci_p(0x0006, 1 << 1, 1 << 1),
     pci_w(0x0005, (1 << 4) | (1 << 7), 0),
@@ -308,7 +308,7 @@ pub const RTL8188EE_PWR_ON: &[WlanPwrCfg] = &[
 
 /// RTL8723BE Cardemu→Active power-on flow.  Source:
 /// `rtl8723be/pwrseq.h::RTL8723BE_TRANS_CARDEMU_TO_ACT`.
-pub const RTL8723BE_PWR_ON: &[WlanPwrCfg] = &[
+pub static RTL8723BE_PWR_ON: &[WlanPwrCfg] = &[
     pci_w(0x0005, 1 << 7, 0),
     pci_w(0x0005, 1 << 2, 0),
     pci_w(0x0005, (1 << 4) | (1 << 3), 0),
@@ -321,7 +321,7 @@ pub const RTL8723BE_PWR_ON: &[WlanPwrCfg] = &[
 
 /// RTL8821AE Cardemu→Active power-on flow.  Source:
 /// `rtl8821ae/pwrseq.h::RTL8812_TRANS_CARDEMU_TO_ACT`.
-pub const RTL8821AE_PWR_ON: &[WlanPwrCfg] = &[
+pub static RTL8821AE_PWR_ON: &[WlanPwrCfg] = &[
     // 0x20[0]=1  enable LDO
     pci_w(0x0020, 1 << 0, 1 << 0),
     // 0x67[0]=0
@@ -338,7 +338,7 @@ pub const RTL8821AE_PWR_ON: &[WlanPwrCfg] = &[
 
 /// RTL8192CE Cardemu→Active power-on flow.  Source:
 /// `rtl8192ce/pwrseq.h::RTL8192C_TRANS_CARDEMU_TO_ACT`.
-pub const RTL8192CE_PWR_ON: &[WlanPwrCfg] = &[
+pub static RTL8192CE_PWR_ON: &[WlanPwrCfg] = &[
     pci_w(0x0005, 1 << 7, 0),
     pci_p(0x0006, 1 << 1, 1 << 1),
     pci_w(0x0006, 1 << 0, 1 << 0),
@@ -351,7 +351,7 @@ pub const RTL8192CE_PWR_ON: &[WlanPwrCfg] = &[
 /// the legacy rtlwifi binding shares the driver class; the table is a
 /// trimmed version of `rtl8821ae/pwrseq.h` with the 8822BE-specific
 /// rows from the kernel diff (BIT(0) at 0x21 to enable VHT-80 LDO).
-pub const RTL8822BE_PWR_ON: &[WlanPwrCfg] = &[
+pub static RTL8822BE_PWR_ON: &[WlanPwrCfg] = &[
     pci_w(0x0020, 1 << 0, 1 << 0),
     pci_w(0x0021, 1 << 0, 1 << 0),
     pci_w(0x0005, 1 << 7, 0),
