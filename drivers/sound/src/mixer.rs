@@ -263,14 +263,12 @@ pub fn register_standard_realtek(controller_index: usize, has_speaker: bool,
         next_idx += 1;
         add(
             ControlInfo {
-                id, name: ControlKind::JackSense.name(),
+                id: jack, name: ControlKind::JackSense.name(),
                 value_min: 0, value_max: 1, step: 1, channels: 1,
                 is_boolean: true, is_read_only: true,
             },
             ControlValue::boolean(false), // not plugged
         );
-        // jack is added too — bump again with the jack id (intentional copy)
-        let _ = jack;
     }
 
     if has_mic {
