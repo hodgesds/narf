@@ -37,6 +37,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../userspace/init/init.ld");
     println!("cargo:rerun-if-changed=../userspace/init/Cargo.toml");
     println!("cargo:rerun-if-changed=../userspace/shell/src/main.rs");
+    println!("cargo:rerun-if-changed=../userspace/shell/src/exec.rs");
+    println!("cargo:rerun-if-changed=../userspace/shell/src/parser.rs");
     println!("cargo:rerun-if-changed=../userspace/shell/shell.ld");
     println!("cargo:rerun-if-changed=../userspace/shell/Cargo.toml");
 
