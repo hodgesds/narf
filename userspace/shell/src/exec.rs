@@ -130,6 +130,18 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
     if name == b"false" {
         return 1;
     }
+    // `echo` runs in-process. Real shells (bash, dash, busybox)
+    // shadow /bin/echo with a built-in for two reasons: it's hot,
+    // and the built-in handles flags the external binary's `-n`
+    // / `-e` semantics fragment over. NARF additionally has no
+    // `/bin/echo` in the default image (no rootfs, initramfs
+    // optional), so going through fork+exec → ENOENT always
+    // produces `echo: exec failed`. Routing through the existing
+    // legacy dispatcher gives the same code path the in-kernel
+    // `smoke_echo_hello_world_end_to_end` proves.
+    if name == b"echo" {
+        return unsafe { dispatch_builtin_inproc(fd, sc) };
+    }
 
     // ── Fork + exec path ────────────────────────────────────────────────
     //
