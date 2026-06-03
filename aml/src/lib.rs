@@ -1533,17 +1533,11 @@ fn parse_term_list_inner(
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
                         let pkg_end = pkg_start + pkg_len;
-                        push_node(AmlNode {
-                            path: full_path(String::new(), parent),
-                            kind: NodeKind::Field,
-                            value: None,
-                            method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
-                        });
-                        *count += 1;
                         // Parse individual field entries and register them.
+                        // parse_field_body pushes a real Field node per
+                        // NameSeg so find_node can resolve them.
                         let _ = oregion::parse_field_body(p, parent, pkg_end);
+                        *count += 1;
                         p.pos = pkg_end;
                     }
                     EXT_INDEX_FIELD_OP => {
@@ -1907,6 +1901,22 @@ fn predefined_method_argcount(name: &str) -> usize {
 fn push_node(n: AmlNode) {
     let mut g = NAMESPACE.lock();
     g.nodes.push(n);
+}
+
+/// Register a `Field` namespace node so per-field NameSegs declared
+/// inside `Field(...) {...}` (and IndexField / BankField) bodies are
+/// reachable from `find_node`. Without this the evaluator falls
+/// through to `Value::Integer(0)` instead of routing through
+/// `oregion::read_field` for the backing region.
+pub(crate) fn push_field_node(path: String) {
+    push_node(AmlNode {
+        path,
+        kind: NodeKind::Field,
+        value: None,
+        method_body: (0, 0),
+        method_flags: 0,
+        buffer_field: None,
+    });
 }
 
 /// Update the `value` field of the first `Name` node matching `path`.

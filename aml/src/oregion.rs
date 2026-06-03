@@ -1250,6 +1250,10 @@ fn parse_field_list_full(
                     s
                 };
 
+                // Also push a namespace node so eval.rs find_node can
+                // resolve the NameSeg and route Field reads through
+                // oregion::read_field instead of falling through to 0.
+                crate::push_field_node(field_path.clone());
                 register_field(FieldInfo {
                     path: field_path,
                     region_path: alloc::string::String::from(region_path),
