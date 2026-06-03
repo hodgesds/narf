@@ -703,7 +703,6 @@ fn smoke_udp_rcvbuf_overflow_drops_oldest() -> TestResult {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("bind failed"),
     };
-
     // Inject 3 datagrams: A, B, C.  A should be dropped when C arrives.
     for b in [b'A', b'B', b'C'] {
         let mut seg = [0u8; 9];
@@ -714,20 +713,23 @@ fn smoke_udp_rcvbuf_overflow_drops_oldest() -> TestResult {
         deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
     }
 
+    // Snapshot each recv's first byte before the next call overwrites buf.
     let mut buf = [0u8; 8];
     let first = udp_recv(&sock, &mut buf);
+    let a = match first {
+        Ok((1, _)) => buf[0],
+        _ => { udp_close(&sock); return TestResult::Fail("first recv failed"); }
+    };
+    let mut buf = [0u8; 8];
     let second = udp_recv(&sock, &mut buf);
+    let b_byte = match second {
+        Ok((1, _)) => buf[0],
+        _ => { udp_close(&sock); return TestResult::Fail("second recv failed"); }
+    };
+    let mut buf = [0u8; 8];
     let third = udp_recv(&sock, &mut buf);
     udp_close(&sock);
 
-    let a = match first {
-        Ok((1, _)) => buf[0],
-        _ => return TestResult::Fail("first recv failed"),
-    };
-    let b_byte = match second {
-        Ok((1, _)) => buf[0],
-        _ => return TestResult::Fail("second recv failed"),
-    };
     if a != b'B' || b_byte != b'C' {
         return TestResult::Fail("oldest datagram not dropped (should be A)");
     }
