@@ -11082,3 +11082,183 @@ fn smoke_console_read_empty_ring_returns_zero() -> TestResult {
     }
 }
 kernel_test_in!("userspace", smoke_console_read_empty_ring_returns_zero);
+
+// ── Wave 39: end-to-end `echo hello world` golden path ────────────────────
+//
+// The Wave-37/38/39 chain (serial RX → BYTE_RING → ConsoleFile::read →
+// shell built-in echo → ConsoleFile::write → console::write_str → klog)
+// is the project's end-to-end target. Each link has its own unit-level
+// smoke; this one drives the whole chain in one shot so a regression
+// anywhere along the way is caught by a single failing test.
+//
+// Steps:
+//   1. Pre-load "echo hello world\n" into the BYTE_RING (simulates QEMU
+//      `-serial stdio` typing).
+//   2. sys_read on fd 0 — must drain the full line into a buffer.
+//   3. Parse the line shell-style: split on first space, take "hello world"
+//      as `rest`. Mirror userspace/shell/src/main.rs:1560-1564's built-in
+//      echo (write rest, write NEWLINE).
+//   4. sys_write each segment on fd 1 — routes through ConsoleFile::write
+//      → narf_console::Writer → write_str → klog::record.
+//   5. klog::snapshot must contain "hello world\n" as a contiguous run.
+//
+// We can't observe the real UART backend in a kernel-test (no QEMU stdio
+// hooked to the SUT's COM1 in test mode), but klog is fed unconditionally
+// upstream of the backend, so it's a faithful proxy for "the bytes left
+// the userspace task and reached the platform console layer."
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_echo_hello_world_end_to_end() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_E2E0);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Step 1: stuff "echo hello world\n" into the global ASCII byte ring,
+    // exactly as the IRQ-4 serial RX handler would on real bytes typed
+    // into `qemu -serial stdio`.
+    const LINE: &[u8] = b"echo hello world\n";
+    for &b in LINE {
+        narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+    }
+
+    // Force the per-task fd table to materialise with fd 0/1/2 wired
+    // to ConsoleFile.
+    let _ = fd::with_table(task, |_t| ());
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // Step 2: sys_read on fd 0. Buffer is sized for the full line plus a
+    // generous tail.
+    let mut buf = [0u8; 64];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    let n_read = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => {
+            fd::__test_reset();
+            __test_clear_global();
+            return TestResult::Fail("sys_read on fd 0: bad status");
+        }
+    };
+    if n_read != LINE.len() || &buf[..n_read] != LINE {
+        fd::__test_reset();
+        __test_clear_global();
+        return TestResult::Fail("sys_read drained wrong payload");
+    }
+
+    // Step 3: shell-style parse. Find the first space; "echo" is the
+    // command, the rest is the argv tail. Strip the trailing newline so
+    // the echo built-in's write_all(rest) matches what we expect on the
+    // wire.
+    let line_no_nl = &buf[..n_read - 1]; // drop '\n'
+    let space_at = match line_no_nl.iter().position(|&b| b == b' ') {
+        Some(i) => i,
+        None => {
+            fd::__test_reset();
+            __test_clear_global();
+            return TestResult::Fail("parse: no space in line");
+        }
+    };
+    let cmd = &line_no_nl[..space_at];
+    let rest = &line_no_nl[space_at + 1..];
+    if cmd != b"echo" {
+        fd::__test_reset();
+        __test_clear_global();
+        return TestResult::Fail("parse: cmd != echo");
+    }
+
+    // Snapshot klog *before* we write so we can find the new region after.
+    let pre_len = narf_console::klog::snapshot().len();
+
+    // Step 4: sys_write on fd 1 — the body, then a newline. Two calls
+    // mirror the shell's `write_all(fd, rest); write_all(fd, NEWLINE);`.
+    let mut ctx_w1 = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: rest.as_ptr() as u64,
+            arg2: rest.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx_w1);
+    match ctx_w1.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == rest.len() as u64 => {}
+        _ => {
+            fd::__test_reset();
+            __test_clear_global();
+            return TestResult::Fail("sys_write(rest) failed");
+        }
+    }
+
+    let nl: &[u8] = b"\n";
+    let mut ctx_w2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: nl.as_ptr() as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx_w2);
+    match ctx_w2.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 1 => {}
+        _ => {
+            fd::__test_reset();
+            __test_clear_global();
+            return TestResult::Fail("sys_write(NL) failed");
+        }
+    }
+
+    // Step 5: pull a fresh klog snapshot and look for "hello world\n"
+    // anywhere in the post-write tail. The pre/post split is just a
+    // performance hint — if the ring has wrapped, search the whole
+    // window.
+    let post = narf_console::klog::snapshot();
+    let needle: &[u8] = b"hello world\n";
+    let tail_start = pre_len.min(post.len().saturating_sub(needle.len()));
+    let haystack = &post[tail_start..];
+    let found = haystack.windows(needle.len()).any(|w| w == needle);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if found {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("klog did not contain \"hello world\\n\" after sys_write on fd 1")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_echo_hello_world_end_to_end);
