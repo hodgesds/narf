@@ -931,7 +931,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     let section_num = 1u32;
     let mut blob = alloc::vec::Vec::new();
     let mut hdr = [0u32; 8];
-    hdr[1] = 0x0001_0002;
+    hdr[1] = 0x0000_0102;
     hdr[6] = section_num << 8;
     hdr[7] = 0;
     for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
