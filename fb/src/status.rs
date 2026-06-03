@@ -30,11 +30,19 @@ use crate::{FbWriter, Rect};
 
 const PANEL_BG: Pixel32 = Pixel32(0xFF0A_1428); // dark navy
 const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
+/// Background used when the diag layer reports a latched panic.
+/// Switching the panel to deep red makes "the kernel paniced"
+/// unmissable to a bare-metal operator across the room.
+const PANEL_BG_PANIC: Pixel32 = Pixel32(0xFF40_0000); // dark red
 /// Number of klog tail lines displayed under the live-state lines.
 /// 16 keeps recent boot output visible on a 1280×800 FB. Below
 /// that height the panel self-suppresses (line 65 guard).
 const KLOG_TAIL_LINES: usize = 16;
-const HEADER_LINES: u32 = 5;
+/// Number of header lines: the 5 input/USB/AML/i8042 lines PLUS
+/// one diag line (boot phase + IRQ + heap + #PF/panic). Adding the
+/// diag line at the top is intentional — it's the densest
+/// real-HW-diagnostic line and operators read top-down.
+const HEADER_LINES: u32 = 6;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -65,10 +73,34 @@ pub fn paint(fb: &FbWriter) {
     if h < PANEL_HEIGHT + PANEL_PAD * 2 || w < 200 {
         return;
     }
+
+    // Pull a coherent snapshot of the diag state BEFORE the rest
+    // of the per-subsystem reads — operators care most about the
+    // boot-phase / IRQ / panic line, and a coherent snapshot
+    // means the diag fields don't drift across the render.
+    //
+    // Low-rate poll: push the kernel-heap KB into diag so the
+    // snapshot has fresh numbers. The render runs at ~1.25 Hz so
+    // the slab::stats() call (an N_CLASSES-long fold) is cheap.
+    let heap_used_b = narf_memory::heap::used_bytes() as u64;
+    let slab = narf_memory::slab::stats();
+    let mut slab_in_use_b: u64 = 0;
+    for c in slab.classes.iter() {
+        slab_in_use_b = slab_in_use_b.saturating_add((c.in_use * c.block_size) as u64);
+    }
+    let used_kb = ((heap_used_b + slab_in_use_b) / 1024) as u32;
+    let total_kb = (narf_memory::heap::capacity_bytes() / 1024) as u32;
+    narf_memory::diag::set_heap_kb(used_kb, total_kb);
+    let diag = narf_memory::diag::snapshot();
+
     let panel_y = h - PANEL_HEIGHT - PANEL_PAD;
+    // Panic-latched: paint the panel red. A bare-metal operator
+    // sees the bottom of the screen flip from navy to red at the
+    // first panic — unmissable without serial.
+    let bg = if diag.panic_latched { PANEL_BG_PANIC } else { PANEL_BG };
     let _ = fb.fill(
         Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD),
-        PANEL_BG,
+        bg,
     );
 
     let info = crate::info();
@@ -178,7 +210,46 @@ pub fn paint(fb: &FbWriter) {
         )
     };
 
+    // Diag line: boot phase + IRQ + heap + first-PF + panic
+    // marker. Designed to be parseable-by-eye on a bare-metal
+    // panel — every operator-visible bring-up signal in 60-80
+    // chars. Order: phase first (forward progress), then IRQ
+    // (timer alive?), then heap (alloc storm?), then any latched
+    // fault (CR2/panic).
+    let diag_line = if diag.panic_latched {
+        format!(
+            "PANIC: marker={:016x} phase={} irq#{}={} heap={}/{} KB",
+            diag.panic_marker,
+            diag.phase.as_str(),
+            diag.last_irq_vector,
+            diag.irq_total,
+            diag.heap_used_kb,
+            diag.heap_total_kb,
+        )
+    } else if diag.first_pf_seen {
+        format!(
+            "phase={} irq#{}={} heap={}/{} KB #PF cr2={:x} rip={:x}",
+            diag.phase.as_str(),
+            diag.last_irq_vector,
+            diag.irq_total,
+            diag.heap_used_kb,
+            diag.heap_total_kb,
+            diag.first_pf_cr2,
+            diag.first_pf_rip,
+        )
+    } else {
+        format!(
+            "phase={} irq#{}={} heap={}/{} KB",
+            diag.phase.as_str(),
+            diag.last_irq_vector,
+            diag.irq_total,
+            diag.heap_used_kb,
+            diag.heap_total_kb,
+        )
+    };
+
     let header = [
+        diag_line.as_str(),
         fb_line.as_str(),
         dev_line.as_str(),
         usb_hid_line.as_str(),
@@ -191,7 +262,7 @@ pub fn paint(fb: &FbWriter) {
     let mut fbm = unsafe { fb.scanout_for_cursor_mut() };
     let mut y = panel_y + PANEL_PAD;
     for line in header.iter() {
-        fbm.draw_string_8x8(PANEL_PAD, y, line, PANEL_FG, PANEL_BG);
+        fbm.draw_string_8x8(PANEL_PAD, y, line, PANEL_FG, bg);
         y += 8;
     }
     // Separator + klog tail. Truncates each line to ~150 chars so a
@@ -202,7 +273,7 @@ pub fn paint(fb: &FbWriter) {
         y,
         "--- recent log (klog tail) ----------------------------------",
         PANEL_FG,
-        PANEL_BG,
+        bg,
     );
     y += 8;
     let max_chars = ((w - PANEL_PAD * 2) / 8) as usize;
@@ -212,7 +283,7 @@ pub fn paint(fb: &FbWriter) {
         } else {
             line.as_str()
         };
-        fbm.draw_string_8x8(PANEL_PAD, y, truncated, PANEL_FG, PANEL_BG);
+        fbm.draw_string_8x8(PANEL_PAD, y, truncated, PANEL_FG, bg);
         y += 8;
     }
     let _ = fb.flush(Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD));
