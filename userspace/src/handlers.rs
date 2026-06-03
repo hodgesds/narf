@@ -3344,8 +3344,9 @@ fn sys_getpid(ctx: &mut dyn TrapContext) {
 }
 
 fn sys_getppid(ctx: &mut dyn TrapContext) {
-    // Stage-4 stub: scheduler doesn't track parentage yet.
-    ctx.set_return(SyscallReturn::ok(0));
+    let me = current_task_id();
+    let ppid = parent_of_get(me).unwrap_or(0);
+    ctx.set_return(SyscallReturn::ok(ppid));
 }
 
 fn sys_gettid(ctx: &mut dyn TrapContext) {
