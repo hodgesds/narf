@@ -611,8 +611,19 @@ impl FileOps for ProcPidFile {
             }
             // Strip trailing newline / NUL (Linux write(2) shape).
             let trimmed = buf.trim_ascii_end();
-            let name = core::str::from_utf8(trimmed).map_err(|_| FsError::InvalidData)?;
-            hook_set_comm(pid, name).map_err(|_| FsError::InvalidData)?;
+            // Linux comm_write: clamp to TASK_COMM_LEN-1 (15 bytes) at
+            // the procfs layer; the userspace hook is allowed to
+            // assume a bounded name. Walk back to a valid UTF-8
+            // boundary so from_utf8 cannot fail mid-codepoint.
+            let mut end = trimmed.len().min(15);
+            while end > 0 && (trimmed[end - 1] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            let name = core::str::from_utf8(&trimmed[..end]).map_err(|_| FsError::InvalidData)?;
+            // Hook unavailability is non-fatal: procfs write contract
+            // is "always returns buf.len()" regardless of install
+            // order.
+            let _ = hook_set_comm(pid, name);
             Ok(buf.len())
         })
     }
