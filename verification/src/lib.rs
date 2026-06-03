@@ -66,6 +66,16 @@ static __FORCE_LINK_MODULES: fn() -> usize = || {
     narf_modules::registry::len()
 };
 
+// narf-crypto contributes the `crypto/p256`, `crypto/aes_ctr`, and
+// other crypto-subsystem smokes via `kernel_test_in!`. Nothing in
+// this lib references its public surface, so the rlib unit gets
+// dropped at link time and the `narf.tests` entries with it. Anchor
+// it with a `#[used]` static touching `blake3_hash`.
+extern crate narf_crypto;
+#[used]
+static __FORCE_LINK_CRYPTO: fn() -> usize =
+    || narf_crypto::blake3_hash(&[]).len();
+
 use core::fmt::Write;
 
 use narf_console::Writer;
