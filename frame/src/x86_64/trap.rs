@@ -392,6 +392,24 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // Status-panel diag: capture the UNRECOVERED #PF's CR2/RIP into
+    // the diag latch. By placing the call after every recovery
+    // surface (demand-paging, stack-grow, COW split, probe-catch)
+    // and before the panic block, the diag latch holds the
+    // earliest fault that actually killed the kernel — exactly
+    // what the operator wants to read off the status panel on a
+    // bare-metal boot that dies in #PF. First-fault-wins inside
+    // diag::note_pf means cascading panics don't overwrite.
+    if frame.vector == 14 {
+        let cr2: u64;
+        // SAFETY: reading CR2 at CPL=0 is always defined.
+        unsafe {
+            core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
+                options(nostack, preserves_flags));
+        }
+        narf_memory::diag::note_pf(cr2, frame.rip);
+    }
+
     // Paint a HUGE diagnostic block to FB so real-HW boots
     // without serial can see WHICH vector fired. Uses the
     // beacon facility — slot index = vector number, color
