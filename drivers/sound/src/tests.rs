@@ -98,7 +98,8 @@ kernel_test_in!("drivers/sound", smoke_corb_verb_encode);
 // ── #4: RIRB response decode ───────────────────────────────────────
 
 fn smoke_rirb_response_decode() -> TestResult {
-    let raw: u64 = 0x10EC0256_00000001; // data=0x10EC0256, caddr=1, sol
+    // HDA §3.3.34: data is bits[31:0], caddr/unsol live in bits[36:32].
+    let raw: u64 = 0x00000001_10EC0256; // data=0x10EC0256, caddr=1, sol
     let r = Response::decode(raw);
     if r.data != 0x10EC0256 {
         return TestResult::Fail("data decode");
