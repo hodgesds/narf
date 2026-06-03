@@ -5202,3 +5202,111 @@ fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_cow_fault_path_outside_region_fails);
+
+// ---------------------------------------------------------------
+// diag — fixed-region status state. Bare-metal bring-up surface;
+// every updater must be O(1) atomic + every read must be coherent
+// across the snapshot. Each smoke clears state at entry so the
+// suite is reorderable.
+// ---------------------------------------------------------------
+
+fn smoke_diag_phase_round_trip() -> TestResult {
+    use crate::diag::{self, BootPhase};
+    diag::__reset_for_test();
+    if diag::snapshot().phase != BootPhase::Firmware {
+        return TestResult::Fail("initial phase not Firmware");
+    }
+    diag::set_phase(BootPhase::InitDevice);
+    if diag::snapshot().phase != BootPhase::InitDevice {
+        return TestResult::Fail("phase didn't round-trip through atomic");
+    }
+    diag::set_phase(BootPhase::Userspace);
+    if diag::snapshot().phase != BootPhase::Userspace {
+        return TestResult::Fail("phase transition to Userspace lost");
+    }
+    diag::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_phase_round_trip);
+
+fn smoke_diag_bump_irq_counts_total_and_last() -> TestResult {
+    use crate::diag;
+    diag::__reset_for_test();
+    diag::bump_irq(32);
+    diag::bump_irq(33);
+    diag::bump_irq(32);
+    let s = diag::snapshot();
+    if s.irq_total != 3 {
+        return TestResult::Fail("irq_total not 3 after 3 bumps");
+    }
+    if s.last_irq_vector != 32 {
+        return TestResult::Fail("last_irq_vector not the latest bump");
+    }
+    diag::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_bump_irq_counts_total_and_last);
+
+fn smoke_diag_note_pf_first_fault_wins() -> TestResult {
+    use crate::diag;
+    diag::__reset_for_test();
+    diag::note_pf(0xDEAD_BEEF, 0xCAFE_F00D);
+    diag::note_pf(0x1234_5678, 0xAAAA_BBBB);
+    let s = diag::snapshot();
+    if !s.first_pf_seen {
+        return TestResult::Fail("first_pf_seen false after note_pf");
+    }
+    if s.first_pf_cr2 != 0xDEAD_BEEF || s.first_pf_rip != 0xCAFE_F00D {
+        return TestResult::Fail("second note_pf overwrote first (must be first-fault-wins)");
+    }
+    diag::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_note_pf_first_fault_wins);
+
+fn smoke_diag_latch_panic_first_only() -> TestResult {
+    use crate::diag;
+    diag::__reset_for_test();
+    diag::latch_panic(0x4242_4242);
+    diag::latch_panic(0x9999_9999);
+    let s = diag::snapshot();
+    if !s.panic_latched {
+        return TestResult::Fail("panic_latched false after latch_panic");
+    }
+    if s.panic_marker != 0x4242_4242 {
+        return TestResult::Fail("second latch_panic overwrote marker");
+    }
+    diag::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_latch_panic_first_only);
+
+fn smoke_diag_heap_kb_round_trip() -> TestResult {
+    use crate::diag;
+    diag::__reset_for_test();
+    diag::set_heap_kb(123, 4096);
+    let s = diag::snapshot();
+    if s.heap_used_kb != 123 || s.heap_total_kb != 4096 {
+        return TestResult::Fail("heap_kb didn't round-trip");
+    }
+    diag::set_heap_kb(456, 4096);
+    let s = diag::snapshot();
+    if s.heap_used_kb != 456 {
+        return TestResult::Fail("heap_used didn't update on second write");
+    }
+    diag::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_heap_kb_round_trip);
+
+fn smoke_diag_phase_decode_clamps_unknown_to_firmware() -> TestResult {
+    use crate::diag::BootPhase;
+    if BootPhase::from_u8(200) != BootPhase::Firmware {
+        return TestResult::Fail("out-of-range u8 must clamp to Firmware");
+    }
+    if BootPhase::from_u8(11) != BootPhase::Userspace {
+        return TestResult::Fail("u8 11 must decode to Userspace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_diag_phase_decode_clamps_unknown_to_firmware);
