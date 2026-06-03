@@ -171,17 +171,26 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
-    let child_tid = match ctx.ret {
+    let child_pid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
-            return TestResult::Fail("fork did not return child tid");
+            return TestResult::Fail("fork did not return child pid");
         }
     };
 
-    // (2) verify child task was registered in the scheduler
-    let child_tid_obj = narf_scheduler::TaskId(child_tid);
+    // (2) verify child task was registered in the scheduler. Wave-38
+    //     split ProcessId from TaskId, so translate before query.
+    let child_task_raw = match crate::handlers::pid_to_task_raw(child_pid) {
+        Some(t) => t,
+        None => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("no PID→TaskId mapping registered by fork");
+        }
+    };
+    let child_tid_obj = narf_scheduler::TaskId(child_task_raw);
     if narf_scheduler::address_space_of(child_tid_obj).is_none() {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
@@ -190,7 +199,7 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 
     // (3) fire the exit observer manually (simulates child calling
     //     sys_exit_task) and verify wait4 reaps it.
-    crate::user_task::notify_task_exited(child_tid);
+    crate::user_task::notify_task_exited(child_task_raw);
 
     // (4) wait4(-1, &status, 0) from the parent should return child_tid
     let mut status: i32 = -1;
@@ -216,7 +225,7 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
             return TestResult::Fail("wait4 did not return OK");
         }
     };
-    if reaped != child_tid {
+    if reaped != child_pid {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("wait4 returned wrong child pid");
