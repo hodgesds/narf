@@ -111,6 +111,10 @@ pub const FWSECTION_W0_DL_ADDR_MASK: u32 = 0x1FFF_FFFF;
 /// `FWSECTION_HDR_W1_SECTIONTYPE` — bits[27:24]. `fw.h:577`.
 pub const FWSECTION_W1_TYPE_SHIFT: u32 = 24;
 pub const FWSECTION_W1_TYPE_MASK: u32 = 0xF << FWSECTION_W1_TYPE_SHIFT;
+/// v1 widens SECTIONTYPE to bits[31:24] — needed for FW_TYPE_BBMCU0
+/// (64) and friends that don't fit in the v0 4-bit field.
+pub const FWSECTION_V1_W1_TYPE_SHIFT: u32 = 24;
+pub const FWSECTION_V1_W1_TYPE_MASK: u32 = 0xFF << FWSECTION_V1_W1_TYPE_SHIFT;
 /// `FWSECTION_HDR_W1_SEC_SIZE` — bits[23:0]. `fw.h:578`.
 pub const FWSECTION_W1_SEC_SIZE_MASK: u32 = 0x00FF_FFFF;
 /// `FWSECTION_HDR_W1_CHECKSUM` — `BIT(28)`. `fw.h:579`.
@@ -280,8 +284,9 @@ pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
         let sec_off = FW_HDR_V1_BASE_SIZE + i * FW_HDR_V1_SECTION_SIZE;
         let sw0 = read_u32(blob, sec_off).ok_or(FwError::BadFormat)?;
         let sw1 = read_u32(blob, sec_off + 4).ok_or(FwError::BadFormat)?;
-        // v1 type is at bits [27:24] same as v0 per fw.h:623.
-        let kind = ((sw1 & FWSECTION_W1_TYPE_MASK) >> FWSECTION_W1_TYPE_SHIFT) as u8;
+        // v1 widens type to bits[31:24] (FW_TYPE_BBMCU0=64 wouldn't
+        // fit otherwise); v0's 4-bit mask is wrong here.
+        let kind = ((sw1 & FWSECTION_V1_W1_TYPE_MASK) >> FWSECTION_V1_W1_TYPE_SHIFT) as u8;
         let chksum = sw1 & FWSECTION_W1_CHECKSUM != 0;
         let redl = sw1 & FWSECTION_W1_REDL != 0;
         let raw_len = sw1 & FWSECTION_W1_SEC_SIZE_MASK;
