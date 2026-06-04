@@ -50,8 +50,7 @@ pub unsafe fn enable_rx_irq(base: usize, kind: UartKind) {
 /// Set to true once the scratch register loopback at init time
 /// proves a UART is responding. When false, `write_bytes` drops
 /// bytes silently rather than spinning.
-static UART_PRESENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static UART_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Program the UART to 115200 8N1, FIFO on, interrupts off. `base` is an
 /// x86 I/O port number (truncated to `u16`).

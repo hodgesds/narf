@@ -328,7 +328,8 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
             // boot low-half (pre-Wave-2 stack swap) RBP values.
             // Reject only the bogus ones: null, unaligned, or
             // canonical-hole [0x0001_0000_0000_0000 .. 0xffff_0000_0000_0000].
-            if rbp == 0 || rbp & 0x7 != 0
+            if rbp == 0
+                || rbp & 0x7 != 0
                 || (rbp >= 0x0000_8000_0000_0000 && rbp < 0xffff_8000_0000_0000)
             {
                 break;
