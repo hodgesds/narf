@@ -866,8 +866,8 @@ impl PendingCancels {
     fn enter_inflight(&self, tag: Tag, chain: u32) -> Arc<CancelToken> {
         let mut g = self.inner.lock();
         let tok = Arc::new(CancelToken::new(tag));
-        let pre_cancelled = g.tags.iter().any(|&t| t == tag.raw())
-            || g.chains.iter().any(|&c| c == chain);
+        let pre_cancelled =
+            g.tags.iter().any(|&t| t == tag.raw()) || g.chains.iter().any(|&c| c == chain);
         if pre_cancelled {
             tok.request();
         }
@@ -1068,10 +1068,7 @@ impl<const N: usize> Dispatcher<N> {
 
             OpCode::Yield => {
                 narf_scheduler::yield_now().await;
-                let cancelled = token
-                    .as_ref()
-                    .map(|t| t.is_requested())
-                    .unwrap_or(false);
+                let cancelled = token.as_ref().map(|t| t.is_requested()).unwrap_or(false);
                 if cancelled {
                     cancel_outcome(tag, sub.flags)
                 } else {

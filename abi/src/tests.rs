@@ -517,10 +517,7 @@ fn smoke_abi_submission_field_offsets() -> TestResult {
     for &(got, want, name) in pins {
         if got != want {
             // Box::leak gives the message a 'static lifetime.
-            let msg = alloc::format!(
-                "Submission::{} offset {} (expected {})",
-                name, got, want
-            );
+            let msg = alloc::format!("Submission::{} offset {} (expected {})", name, got, want);
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
         }
@@ -541,10 +538,7 @@ fn smoke_abi_completion_field_offsets() -> TestResult {
     ];
     for &(got, want, name) in pins {
         if got != want {
-            let msg = alloc::format!(
-                "Completion::{} offset {} (expected {})",
-                name, got, want
-            );
+            let msg = alloc::format!("Completion::{} offset {} (expected {})", name, got, want);
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
         }
@@ -575,19 +569,33 @@ fn smoke_abi_opcode_full_wire_pins() -> TestResult {
         (crate::OpCode::CpuTopology, 0x0020, "CpuTopology"),
         (crate::OpCode::CpuPerfState, 0x0021, "CpuPerfState"),
         (crate::OpCode::RaplEnergy, 0x0022, "RaplEnergy"),
-        (crate::OpCode::CpuIdleLatencyHint, 0x0030, "CpuIdleLatencyHint"),
+        (
+            crate::OpCode::CpuIdleLatencyHint,
+            0x0030,
+            "CpuIdleLatencyHint",
+        ),
         (crate::OpCode::CpuIdleRelease, 0x0031, "CpuIdleRelease"),
         (crate::OpCode::CpuSetFreqRange, 0x0040, "CpuSetFreqRange"),
         (crate::OpCode::CpuSetEpp, 0x0041, "CpuSetEpp"),
         (crate::OpCode::CpuSetGovernor, 0x0042, "CpuSetGovernor"),
-        (crate::OpCode::CpuSetEnergyBudget, 0x0050, "CpuSetEnergyBudget"),
-        (crate::OpCode::CpuClearEnergyBudget, 0x0051, "CpuClearEnergyBudget"),
+        (
+            crate::OpCode::CpuSetEnergyBudget,
+            0x0050,
+            "CpuSetEnergyBudget",
+        ),
+        (
+            crate::OpCode::CpuClearEnergyBudget,
+            0x0051,
+            "CpuClearEnergyBudget",
+        ),
     ];
     for &(op, wire, name) in pins {
         if op.as_u32() != wire {
             let msg = alloc::format!(
                 "OpCode::{} wire {:#x} (expected {:#x})",
-                name, op.as_u32(), wire
+                name,
+                op.as_u32(),
+                wire
             );
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
@@ -605,7 +613,11 @@ fn smoke_abi_narfstatus_full_wire_pins() -> TestResult {
         (crate::NarfStatus::Ok, 0x0000, "Ok"),
         (crate::NarfStatus::Pending, 0x0001, "Pending"),
         (crate::NarfStatus::Cancelled, 0x0002, "Cancelled"),
-        (crate::NarfStatus::CancelRequested, 0x0003, "CancelRequested"),
+        (
+            crate::NarfStatus::CancelRequested,
+            0x0003,
+            "CancelRequested",
+        ),
         (crate::NarfStatus::CapRevoked, 0x0004, "CapRevoked"),
         (crate::NarfStatus::InvalidOp, 0x0005, "InvalidOp"),
         (crate::NarfStatus::Busy, 0x0006, "Busy"),
@@ -617,7 +629,9 @@ fn smoke_abi_narfstatus_full_wire_pins() -> TestResult {
         if st.as_u32() != wire {
             let msg = alloc::format!(
                 "NarfStatus::{} wire {:#x} (expected {:#x})",
-                name, st.as_u32(), wire
+                name,
+                st.as_u32(),
+                wire
             );
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
@@ -845,7 +859,10 @@ fn smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op() -> TestResult {
         _ => TestResult::Fail("dispatcher never drained"),
     }
 }
-kernel_test_in!("abi", smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op);
+kernel_test_in!(
+    "abi",
+    smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op
+);
 
 fn smoke_abi_submission_inline_words_constant() -> TestResult {
     // The INLINE_WORDS and CAP_SLOTS constants are part of the public
@@ -887,8 +904,12 @@ fn smoke_abi_file_op_kind_wire_pins() -> TestResult {
     }
     // Pairwise distinct.
     let all = [
-        FileOpKind::Open, FileOpKind::Read, FileOpKind::Write,
-        FileOpKind::Close, FileOpKind::Mmap, FileOpKind::Munmap,
+        FileOpKind::Open,
+        FileOpKind::Read,
+        FileOpKind::Write,
+        FileOpKind::Close,
+        FileOpKind::Mmap,
+        FileOpKind::Munmap,
     ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
@@ -921,10 +942,16 @@ fn smoke_abi_cpu_op_kind_wire_pins() -> TestResult {
         }
     }
     let all = [
-        CpuOpKind::Topology, CpuOpKind::PerfState, CpuOpKind::RaplEnergy,
-        CpuOpKind::LatencyHint, CpuOpKind::LatencyRelease,
-        CpuOpKind::SetFreqRange, CpuOpKind::SetEpp, CpuOpKind::SetGovernor,
-        CpuOpKind::SetEnergyBudget, CpuOpKind::ClearEnergyBudget,
+        CpuOpKind::Topology,
+        CpuOpKind::PerfState,
+        CpuOpKind::RaplEnergy,
+        CpuOpKind::LatencyHint,
+        CpuOpKind::LatencyRelease,
+        CpuOpKind::SetFreqRange,
+        CpuOpKind::SetEpp,
+        CpuOpKind::SetGovernor,
+        CpuOpKind::SetEnergyBudget,
+        CpuOpKind::ClearEnergyBudget,
     ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
@@ -1049,9 +1076,15 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
             d.request_inflight_cancel(Tag::new(args.a0));
         }
         if cx.is_cancel_requested() {
-            return FileOpReturn { status: 2, value: 0 };
+            return FileOpReturn {
+                status: 2,
+                value: 0,
+            };
         }
-        FileOpReturn { status: 0, value: 0 }
+        FileOpReturn {
+            status: 0,
+            value: 0,
+        }
     }
 
     DISPATCHER_PTR.store(0, Ordering::Relaxed);
@@ -1074,8 +1107,7 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
     );
     // SAFETY: the dispatcher outlives the spawned task because it
     // lives in a `Box` we leak below.
-    let dispatcher_addr =
-        alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
+    let dispatcher_addr = alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
 
     narf_scheduler::spawn(async move {
         // SAFETY: leaked above; only one mutable user.
@@ -1134,9 +1166,15 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
             d.request_inflight_cancel(Tag::new(args.a0));
         }
         if cx.is_cancel_requested() {
-            return FileOpReturn { status: 2, value: 0 };
+            return FileOpReturn {
+                status: 2,
+                value: 0,
+            };
         }
-        FileOpReturn { status: 0, value: 0 }
+        FileOpReturn {
+            status: 0,
+            value: 0,
+        }
     }
 
     DISPATCHER_PTR.store(0, Ordering::Relaxed);
@@ -1152,8 +1190,7 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
         dispatcher.as_ref() as *const Dispatcher<4> as u64,
         Ordering::Relaxed,
     );
-    let dispatcher_addr =
-        alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
+    let dispatcher_addr = alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
 
     narf_scheduler::spawn(async move {
         let d = unsafe { &mut *(dispatcher_addr as *mut Dispatcher<4>) };
@@ -1188,15 +1225,16 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
         _ => TestResult::Fail("producer never saw a completion"),
     }
 }
-kernel_test_in!("abi", smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request);
+kernel_test_in!(
+    "abi",
+    smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request
+);
 
 fn smoke_abi_cancel_after_target_completes_is_noop() -> TestResult {
     // Cancel arriving *after* its target already completed must be a
     // benign no-op: the cancel op completes Ok; no later submission
     // inherits the cancel.
-    use crate::{
-        completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag,
-    };
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
     use core::sync::atomic::{AtomicU8, Ordering};
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
