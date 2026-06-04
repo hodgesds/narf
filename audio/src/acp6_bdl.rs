@@ -367,7 +367,7 @@ pub fn wire_i2s_to_codec_tree(
     if !realtek_alc::is_supported(chip) {
         return Err(CodecWireError::UnsupportedCodec);
     }
-    realtek_alc::bring_up_alc295_with(tree.cad, send)
+    realtek_alc::bring_up_alc_supported_with(tree.cad, send)
         .map_err(|_| CodecWireError::BringUpFailed)
 }
 

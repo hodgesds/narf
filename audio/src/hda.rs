@@ -870,7 +870,7 @@ impl IntelHda {
             }
         }
 
-        Ok(Self {
+        let dev = Self {
             bar0,
             _corb: corb,
             _rirb: rirb,
@@ -889,7 +889,15 @@ impl IntelHda {
             irq_vector,
             msix,
             ready: true,
-        })
+        };
+
+        // 17. Bring up all codecs (Realtek patches + generic route).
+        // SAFETY: we own the BAR0 mapping and just initialized it.
+        unsafe {
+            let _ = dev.bring_up_all_codecs();
+        }
+
+        Ok(dev)
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT
@@ -1173,7 +1181,39 @@ impl IntelHda {
         Ok((conv_nid, pin_nid))
     }
 
-    /// Convenience: set up the default output path, load a 1 kHz sine
+    /// Attempt vendor-specific bring-up for all discovered codecs.
+    ///
+    /// This includes Realtek ALC-family patches (EAPD, amp unmute).
+    /// Always calls [`Self::setup_default_output_path`] first to
+    /// establish a baseline converter-to-pin route on the primary
+    /// codec.
+    ///
+    /// # Safety
+    /// Caller owns the BAR0 mapping.
+    pub unsafe fn bring_up_all_codecs(&self) -> Result<(), HdaError> {
+        // 1. Generic path setup (converter + first pin) on primary codec.
+        unsafe {
+            self.setup_default_output_path()?;
+        }
+
+        // 2. Vendor-specific patches for all codecs.
+        for codec in self.codecs() {
+            let cad = codec.addr;
+            let mut send = |c, n, v, p| unsafe {
+                self.send_verb(crate::codec::verb(c, n, v, p))
+                    .map_err(|_| crate::codec::CodecError::TransportFailed)
+            };
+
+            if let Ok(Some(chip)) = crate::realtek_alc::detect_with(cad, &mut send) {
+                if crate::realtek_alc::is_supported(chip) {
+                    let _ = crate::realtek_alc::bring_up_alc_supported_with(cad, &mut send);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Convenience: set up the output path(s), load a 1 kHz sine
     /// test tone, and start the engine. Used by the platform "is
     /// audio working?" probe.
     ///
@@ -1182,7 +1222,7 @@ impl IntelHda {
     pub unsafe fn play_test_tone(&self, freq_hz: u32) -> Result<(), HdaError> {
         // SAFETY: caller-asserted exclusive ownership.
         unsafe {
-            self.setup_default_output_path()?;
+            self.bring_up_all_codecs()?;
         }
         let _ = self.load_sine_test_tone(freq_hz);
         // SAFETY: same.

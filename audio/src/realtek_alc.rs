@@ -402,10 +402,10 @@ pub const MIC_PIN_PAYLOAD: u8 = pin_ctl::IN_ENABLE | pin_ctl::VREF_80;
 // ── ALC295 bring-up ─────────────────────────────────────────────────
 
 /// Bring up the ALC295's analog output path through the probed HDA
-/// controller. Convenience wrapper over [`bring_up_alc295_with`] that
+/// controller. Convenience wrapper over [`bring_up_alc_supported_with`] that
 /// dispatches through [`crate::codec::send_verb`].
-pub fn bring_up_alc295(cad: u8) -> Result<(), AlcError> {
-    bring_up_alc295_with(cad, &mut |c, n, v, p| codec::send_verb(c, n, v, p))
+pub fn bring_up_alc_supported(cad: u8) -> Result<(), AlcError> {
+    bring_up_alc_supported_with(cad, &mut |c, n, v, p| codec::send_verb(c, n, v, p))
 }
 
 /// Bring-up with an injected verb closure. The smokes drive this
@@ -414,8 +414,8 @@ pub fn bring_up_alc295(cad: u8) -> Result<(), AlcError> {
 /// Sequence (mirrors `alc_init` + `alc295_fixup_*` in Linux's
 /// `patch_realtek.c`):
 ///
-///  1. **Detect.** Read VENDOR_ID, confirm Realtek 0x10EC + device
-///     0x0295.
+///  1. **Detect.** Read VENDOR_ID, confirm Realtek 0x10EC and a
+///     supported device.
 ///  2. **Enumerate.** Walk the codec graph to discover every Pin
 ///     Complex + its default config + its connection list.
 ///  3. **Power on AFG.** Set Power State D0 on the Audio Function
@@ -432,13 +432,13 @@ pub fn bring_up_alc295(cad: u8) -> Result<(), AlcError> {
 ///  7. **Headphone unsol response.** On every Pin Complex with default
 ///     device == 0x2 (Headphone Out), set Unsolicited Response Enable
 ///     (verb 0x708) bit 7 with tag 0.
-pub fn bring_up_alc295_with(cad: u8, send: SendVerb<'_>) -> Result<(), AlcError> {
+pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), AlcError> {
     // 1. Detect.
     let chip = match detect_with(cad, &mut |c, n, v, p| send(c, n, v, p))? {
         Some(c) => c,
         None => return Err(AlcError::NotRealtek),
     };
-    if chip != RealtekChip::Alc295 {
+    if !is_supported(chip) {
         return Err(AlcError::WrongChip);
     }
 
@@ -656,18 +656,16 @@ mod tests {
     }
     kernel_test_in!("audio/realtek_alc", smoke_alc_pin_defaults_decode_cleanly);
 
-    /// `bring_up_alc295` drives the right speaker-amp on/off verbs
-    /// through a FakeCorb — Set Pin Widget Control on the speaker pin
-    /// + Set Amp Gain/Mute on its DAC + Set Unsolicited Response on
-    /// the headphone pin.
+    /// `bring_up_alc_supported` drives the right speaker-amp on/off verbs
+    /// through a FakeCorb.
     fn smoke_alc295_speaker_amp_round_trip() -> TestResult {
         let cad: u8 = 0;
         let mut fake = FakeCorb::new();
         arm_fake_alc295(&mut fake, cad);
 
-        let r = bring_up_alc295_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)));
+        let r = bring_up_alc_supported_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)));
         if r.is_err() {
-            return TestResult::Fail("bring_up_alc295_with errored");
+            return TestResult::Fail("bring_up_alc_supported_with errored");
         }
 
         // Speaker pin (NID 4) saw Set Pin Widget Control with the
@@ -829,18 +827,18 @@ mod tests {
     }
     kernel_test_in!("audio/realtek_alc", smoke_alc_unsol_response_decode);
 
-    /// Wrong-chip dispatch returns the right error — caller invoked
-    /// `bring_up_alc295` against an ALC289.
-    fn smoke_alc295_rejects_alc289() -> TestResult {
+    /// Unsupported-chip dispatch returns the right error.
+    fn smoke_alc_rejects_unsupported() -> TestResult {
         let cad: u8 = 0;
         let mut fake = FakeCorb::new();
-        fake.arm_param(cad, 0, param::VENDOR_ID, (0x10ECu32 << 16) | 0x0289);
-        let r = bring_up_alc295_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)));
+        // 0x4208 is not in our supported list.
+        fake.arm_param(cad, 0, param::VENDOR_ID, (0x10ECu32 << 16) | 0x4208);
+        let r = bring_up_alc_supported_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)));
         match r {
             Err(AlcError::WrongChip) => TestResult::Pass,
             Err(_) => TestResult::Fail("wrong error variant"),
             Ok(_) => TestResult::Fail("should have failed with WrongChip"),
         }
     }
-    kernel_test_in!("audio/realtek_alc", smoke_alc295_rejects_alc289);
+    kernel_test_in!("audio/realtek_alc", smoke_alc_rejects_unsupported);
 }

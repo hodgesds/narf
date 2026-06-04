@@ -42,7 +42,7 @@
 //!
 //! ## ALC295 / ALC289 connect
 //!
-//! Both chips use `realtek_alc::bring_up_alc295_with`. The codec-link
+//! Both chips use `realtek_alc::bring_up_alc_supported_with`. The codec-link
 //! layer provides the verb-send transport (I2S path uses the HDA CORB
 //! that co-exists on ACP3x; SoundWire path uses the SDW IMM-CMD
 //! channel). The bring-up sequence is identical: power AFG, EAPD,
@@ -604,7 +604,7 @@ pub fn sdw_send_hda_verb<M: MmioAccess>(
 
 /// Bring up the ALC295 codec over the SoundWire IMM_CMD verb channel.
 ///
-/// Calls [`realtek_alc::bring_up_alc295_with`] with a closure that
+/// Calls [`realtek_alc::bring_up_alc_supported_with`] with a closure that
 /// dispatches each HDA verb through [`sdw_send_hda_verb`].
 ///
 /// `poll_ready` drives the IMM_CMD status polling (same contract as
@@ -615,7 +615,7 @@ pub fn connect_alc295_over_soundwire<M: MmioAccess>(
 ) -> Result<(), CodecLinkError> {
     // CAD 0 — single codec on SDW bus device address 1.
     let cad: u8 = 0;
-    realtek_alc::bring_up_alc295_with(cad, &mut |_c, nid, verb_id, payload| {
+    realtek_alc::bring_up_alc_supported_with(cad, &mut |_c, nid, verb_id, payload| {
         sdw_send_hda_verb(mmio, SDW_CODEC_DEV_ADDR, nid, verb_id, payload, poll_ready)
             .map_err(|_| crate::codec::CodecError::TransportFailed)
     })
@@ -638,7 +638,7 @@ pub fn connect_codec(codec_kind: RealtekChip) -> Result<(), CodecLinkError> {
     match path {
         CodecLinkPath::I2s => {
             // HDA CORB verb path (ACP3x parts have a co-located HDA block).
-            realtek_alc::bring_up_alc295_with(
+            realtek_alc::bring_up_alc_supported_with(
                 0, // CAD 0 — first codec on the link
                 &mut |c, n, v, p| crate::codec::send_verb(c, n, v, p),
             )
@@ -966,7 +966,7 @@ mod tests {
         let mut fake = FakeCorb::new();
         arm_fake_alc295(&mut fake, cad);
 
-        let r = realtek_alc::bring_up_alc295_with(
+        let r = realtek_alc::bring_up_alc_supported_with(
             cad,
             &mut |c, n, v, p| Ok(fake.send(c, n, v, p)),
         );
@@ -985,7 +985,7 @@ mod tests {
         let mut fake289 = FakeCorb::new();
         fake289.arm_param(cad, 0, crate::codec::param::VENDOR_ID,
                           (0x10ECu32 << 16) | 0x0289);
-        let r289 = realtek_alc::bring_up_alc295_with(
+        let r289 = realtek_alc::bring_up_alc_supported_with(
             cad,
             &mut |c, n, v, p| Ok(fake289.send(c, n, v, p)),
         );
@@ -1114,7 +1114,7 @@ mod tests {
         // Drive bring_up through the SDW verb closure.  The result may
         // be an error (fake MMIO doesn't emulate full HDA graph) but
         // the dispatch path must have fired.
-        let _ = realtek_alc::bring_up_alc295_with(cad, &mut |_c, nid, verb_id, payload| {
+        let _ = realtek_alc::bring_up_alc_supported_with(cad, &mut |_c, nid, verb_id, payload| {
             sdw_send_hda_verb(&mmio, SDW_CODEC_DEV_ADDR, nid, verb_id, payload, &mut poll)
                 .map_err(|_| crate::codec::CodecError::TransportFailed)
         });
