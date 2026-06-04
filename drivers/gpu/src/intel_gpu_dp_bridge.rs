@@ -229,14 +229,6 @@ fn read_preferred_mode_via_aux<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Op
 ///   `h_active`     → `h_active`
 ///   `h_blanking`   → `h_total = h_active + h_blanking`
 ///   `h_sync_offset`→ `h_sync_start = h_active + h_sync_offset` (front porch)
-///   `h_sync_width` → `h_sync_end = h_sync_start + h_sync_width`
-/// (Same shape for the V channel.)
-///
-/// Sync polarity isn't exposed by the parser yet (byte 17 of the
-/// 18-byte detailed-timing descriptor encodes it for digital
-/// separate-sync displays — VESA E-EDID 1.4 §3.10.3.6). Default
-/// to active-high which is by far the most common for DP/HDMI;
-/// the eventual VBT / panel-feature-flags parse can override.
 pub(crate) fn detailed_timing_to_mode(dt: &narf_graphics::edid::DetailedTiming) -> Mode {
     let h_total = dt.h_active.saturating_add(dt.h_blanking);
     let v_total = dt.v_active.saturating_add(dt.v_blanking);
@@ -254,8 +246,8 @@ pub(crate) fn detailed_timing_to_mode(dt: &narf_graphics::edid::DetailedTiming) 
         v_total,
         v_sync_start,
         v_sync_end,
-        h_sync_positive: true,
-        v_sync_positive: true,
+        h_sync_positive: dt.h_sync_positive,
+        v_sync_positive: dt.v_sync_positive,
     }
 }
 
