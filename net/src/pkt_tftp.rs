@@ -93,9 +93,7 @@ fn read_nul_string(buf: &[u8], pos: &mut usize) -> Result<String, TftpError> {
     if *pos >= buf.len() {
         return Err(TftpError::Unterminated);
     }
-    let s = core::str::from_utf8(&buf[start..*pos])
-        .unwrap_or("")
-        .into();
+    let s = core::str::from_utf8(&buf[start..*pos]).unwrap_or("").into();
     *pos += 1; // skip NUL
     Ok(s)
 }

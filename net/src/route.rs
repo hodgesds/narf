@@ -54,7 +54,7 @@ use crate::ipv4::Ipv4Addr;
 /// IPv4 network (address + CIDR prefix length).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Ipv4Net {
-    pub addr:       Ipv4Addr,
+    pub addr: Ipv4Addr,
     pub prefix_len: u8,
 }
 
@@ -72,47 +72,47 @@ impl Ipv4Net {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
     /// Route to a specific host directly reachable.
-    Host     = 254,
+    Host = 254,
     /// Link-scope — direct delivery, no gateway.
-    Link     = 253,
+    Link = 253,
     /// Universe — requires a gateway to reach.
     Universe = 0,
 }
 
 /// Route table IDs (subset of Linux RT_TABLE_*).
-pub const TABLE_MAIN:    u8 = 254;
-pub const TABLE_LOCAL:   u8 = 255;
+pub const TABLE_MAIN: u8 = 254;
+pub const TABLE_LOCAL: u8 = 255;
 pub const TABLE_DEFAULT: u8 = 253;
 
 /// A single routing table entry.
 #[derive(Clone, Debug)]
 pub struct Route {
     /// Destination network (address + prefix length).
-    pub dst:      Ipv4Net,
+    pub dst: Ipv4Net,
     /// Next-hop router. `None` means the destination is directly connected
     /// (link-local delivery). Ref: Linux `fib_nh.fib_nh_gw4`.
-    pub gateway:  Option<Ipv4Addr>,
+    pub gateway: Option<Ipv4Addr>,
     /// Egress interface name.
-    pub iface:    String,
+    pub iface: String,
     /// Preferred source address hint. When set, `src_for` skips the
     /// address scan and uses this directly.
     pub src_hint: Option<Ipv4Addr>,
     /// Route metric (lower is better). Used for tie-breaking when two
     /// routes have equal prefix length.
-    pub metric:   u32,
-    pub scope:    Scope,
-    pub table:    u8,
+    pub metric: u32,
+    pub scope: Scope,
+    pub table: u8,
 }
 
 /// Result of a successful route lookup.
 #[derive(Clone, Debug)]
 pub struct RouteResult {
     /// Egress interface.
-    pub iface:   String,
+    pub iface: String,
     /// Next-hop IP (gateway, or `dst` itself for direct delivery).
     pub nexthop: Ipv4Addr,
     /// Preferred source address (after `src_for` is run).
-    pub src:     Ipv4Addr,
+    pub src: Ipv4Addr,
     /// The raw gateway (for callers that need to distinguish direct from
     /// routed delivery).
     pub gateway: Option<Ipv4Addr>,
@@ -122,8 +122,7 @@ pub struct RouteResult {
 
 /// The routing table. Maintained sorted by `prefix_len` descending so
 /// the first match in a linear scan is always the longest prefix.
-static ROUTE_TABLE: IrqSafeSpinLock<Vec<Route>> =
-    IrqSafeSpinLock::new(Vec::new());
+static ROUTE_TABLE: IrqSafeSpinLock<Vec<Route>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Public API ─────────────────────────────────────────────────────────
 
@@ -135,13 +134,12 @@ static ROUTE_TABLE: IrqSafeSpinLock<Vec<Route>> =
 pub fn route_add(route: Route) {
     let mut g = ROUTE_TABLE.lock();
     // Hard cutover: remove any exact-match (dst, iface, table).
-    g.retain(|r| {
-        !(r.dst == route.dst && r.iface == route.iface && r.table == route.table)
-    });
+    g.retain(|r| !(r.dst == route.dst && r.iface == route.iface && r.table == route.table));
     g.push(route);
     // Sort: longest prefix first; break ties by metric ascending.
     g.sort_by(|a, b| {
-        b.dst.prefix_len
+        b.dst
+            .prefix_len
             .cmp(&a.dst.prefix_len)
             .then(a.metric.cmp(&b.metric))
     });
@@ -150,9 +148,10 @@ pub fn route_add(route: Route) {
 /// Delete the first route whose (dst, iface, table) matches.
 pub fn route_delete(dst: Ipv4Net, iface_name: &str, table: u8) {
     let mut g = ROUTE_TABLE.lock();
-    if let Some(pos) = g.iter().position(|r| {
-        r.dst == dst && r.iface == iface_name && r.table == table
-    }) {
+    if let Some(pos) = g
+        .iter()
+        .position(|r| r.dst == dst && r.iface == iface_name && r.table == table)
+    {
         g.remove(pos);
     }
 }
@@ -234,7 +233,7 @@ pub fn route_lookup(dst: Ipv4Addr) -> Option<RouteResult> {
     let nexthop = route.gateway.unwrap_or(dst);
     let src = choose_src(&route, nexthop, dst);
     Some(RouteResult {
-        iface:   route.iface.clone(),
+        iface: route.iface.clone(),
         nexthop,
         src,
         gateway: route.gateway,
@@ -259,15 +258,18 @@ pub fn src_for(dst: Ipv4Addr) -> Option<(String, Ipv4Addr, Option<Ipv4Addr>)> {
 pub fn install_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) {
     let mask = prefix_to_mask(prefix_len);
     let net_addr = Ipv4Addr::from_u32(addr.to_u32() & mask);
-    let dst = Ipv4Net { addr: net_addr, prefix_len };
+    let dst = Ipv4Net {
+        addr: net_addr,
+        prefix_len,
+    };
     route_add(Route {
         dst,
-        gateway:  None, // direct delivery
-        iface:    String::from(iface_name),
+        gateway: None, // direct delivery
+        iface: String::from(iface_name),
         src_hint: Some(addr),
-        metric:   0,
-        scope:    Scope::Link,
-        table:    TABLE_MAIN,
+        metric: 0,
+        scope: Scope::Link,
+        table: TABLE_MAIN,
     });
 }
 
@@ -276,7 +278,10 @@ pub fn install_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8)
 pub fn remove_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) {
     let mask = prefix_to_mask(prefix_len);
     let net_addr = Ipv4Addr::from_u32(addr.to_u32() & mask);
-    let dst = Ipv4Net { addr: net_addr, prefix_len };
+    let dst = Ipv4Net {
+        addr: net_addr,
+        prefix_len,
+    };
     route_delete(dst, iface_name, TABLE_MAIN);
 }
 
@@ -285,15 +290,15 @@ pub fn remove_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) 
 pub fn install_loopback_route() {
     route_add(Route {
         dst: Ipv4Net {
-            addr:       Ipv4Addr([127, 0, 0, 0]),
+            addr: Ipv4Addr([127, 0, 0, 0]),
             prefix_len: 8,
         },
-        gateway:  None,
-        iface:    String::from("lo"),
+        gateway: None,
+        iface: String::from("lo"),
         src_hint: Some(Ipv4Addr([127, 0, 0, 1])),
-        metric:   0,
-        scope:    Scope::Host,
-        table:    TABLE_LOCAL,
+        metric: 0,
+        scope: Scope::Host,
+        table: TABLE_LOCAL,
     });
 }
 
@@ -313,7 +318,11 @@ fn choose_src(route: &Route, nexthop: Ipv4Addr, dst: Ipv4Addr) -> Ipv4Addr {
     // Step 2: find an address on the egress iface that covers the nexthop
     // (or dst if direct delivery). Ref: Linux `inet_select_addr()` in
     // `net/ipv4/fib_semantics.c` line ~1294.
-    let probe = if route.gateway.is_some() { nexthop } else { dst };
+    let probe = if route.gateway.is_some() {
+        nexthop
+    } else {
+        dst
+    };
     for ia in &addrs {
         if ia.covers(probe) {
             return ia.addr;
@@ -321,7 +330,10 @@ fn choose_src(route: &Route, nexthop: Ipv4Addr, dst: Ipv4Addr) -> Ipv4Addr {
     }
 
     // Step 3: first address on the interface.
-    addrs.first().map(|ia| ia.addr).unwrap_or(Ipv4Addr::UNSPECIFIED)
+    addrs
+        .first()
+        .map(|ia| ia.addr)
+        .unwrap_or(Ipv4Addr::UNSPECIFIED)
 }
 
 // ── Test helpers ───────────────────────────────────────────────────────

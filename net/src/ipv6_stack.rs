@@ -31,9 +31,9 @@ use crate::pkt::{ip_checksum, write_eth_header, ETHERTYPE_IPV6, ETH_HDR_LEN};
 use crate::pkt_ipv6::{
     pseudo_checksum, Icmpv6Header, Ipv6Header, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST,
     ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION, ICMPV6_REDIRECT,
-    ICMPV6_ROUTER_ADVERTISEMENT, ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN, NEXT_HEADER_FRAGMENT,
-    NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6, NEXT_HEADER_TCP, NEXT_HEADER_UDP,
-    NEXT_HEADER_DESTINATION_OPTIONS, NEXT_HEADER_ROUTING,
+    ICMPV6_ROUTER_ADVERTISEMENT, ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN,
+    NEXT_HEADER_DESTINATION_OPTIONS, NEXT_HEADER_FRAGMENT, NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6,
+    NEXT_HEADER_ROUTING, NEXT_HEADER_TCP, NEXT_HEADER_UDP,
 };
 
 /// Result of walking the next-header chain.
@@ -78,7 +78,10 @@ pub fn skip_extension_headers(initial_nh: u8, payload: &[u8]) -> Option<L4> {
                 off += 8;
             }
             NEXT_HEADER_TCP | NEXT_HEADER_UDP | NEXT_HEADER_ICMPV6 => {
-                return Some(L4 { proto: nh, offset: off });
+                return Some(L4 {
+                    proto: nh,
+                    offset: off,
+                });
             }
             _ => return None,
         }
@@ -103,8 +106,7 @@ struct FragBuf {
     nh: u8,
 }
 
-static FRAGS: IrqSafeSpinLock<BTreeMap<FragKey, FragBuf>> =
-    IrqSafeSpinLock::new(BTreeMap::new());
+static FRAGS: IrqSafeSpinLock<BTreeMap<FragKey, FragBuf>> = IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Process a fragment. Returns `Some((nh, body))` if the assembly is
 /// complete; `None` otherwise.
@@ -249,8 +251,7 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
     if frame_after_eth.len() < IPV6_HDR_LEN + ip.payload_length as usize {
         return false;
     }
-    let payload = &frame_after_eth
-        [IPV6_HDR_LEN..IPV6_HDR_LEN + ip.payload_length as usize];
+    let payload = &frame_after_eth[IPV6_HDR_LEN..IPV6_HDR_LEN + ip.payload_length as usize];
     // Validate the checksum on ICMPv6 / UDP / TCP via the pseudo header.
     let nh = ip.next_header;
     // Handle a single Fragment header up front (RFC 8200 §4.5).
@@ -273,13 +274,7 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
     dispatch_l4(iface, ip.src_ip, ip.dst_ip, l4.proto, &payload[l4.offset..])
 }
 
-fn dispatch_l4(
-    iface: &str,
-    src_ip: [u8; 16],
-    dst_ip: [u8; 16],
-    proto: u8,
-    l4: &[u8],
-) -> bool {
+fn dispatch_l4(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], proto: u8, l4: &[u8]) -> bool {
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
         _ => false,
@@ -324,26 +319,22 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
             icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
-        ICMPV6_NEIGHBOR_SOLICITATION => {
-            match ndp::on_ns(iface, None, body) {
-                ndp::NdRxResult::SendBody(_) => true,
-                ndp::NdRxResult::Updated => true,
-                ndp::NdRxResult::DadConflict(addr) => {
-                    slaac::dad_failed(iface, &addr);
-                    true
-                }
-                ndp::NdRxResult::Ignored => false,
+        ICMPV6_NEIGHBOR_SOLICITATION => match ndp::on_ns(iface, None, body) {
+            ndp::NdRxResult::SendBody(_) => true,
+            ndp::NdRxResult::Updated => true,
+            ndp::NdRxResult::DadConflict(addr) => {
+                slaac::dad_failed(iface, &addr);
+                true
             }
-        }
-        ICMPV6_NEIGHBOR_ADVERTISEMENT => {
-            match ndp::on_na(iface, body) {
-                ndp::NdRxResult::DadConflict(addr) => {
-                    slaac::dad_failed(iface, &addr);
-                    true
-                }
-                _ => true,
+            ndp::NdRxResult::Ignored => false,
+        },
+        ICMPV6_NEIGHBOR_ADVERTISEMENT => match ndp::on_na(iface, body) {
+            ndp::NdRxResult::DadConflict(addr) => {
+                slaac::dad_failed(iface, &addr);
+                true
             }
-        }
+            _ => true,
+        },
         ICMPV6_ROUTER_ADVERTISEMENT => {
             let now = narf_scheduler::narf_time::monotonic_ns();
             if let Some(info) = ndp::on_ra(iface, src_ip, body, now) {

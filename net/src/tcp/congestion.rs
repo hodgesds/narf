@@ -181,12 +181,9 @@ impl CongestionState {
     /// We accumulate ack'd bytes; when the counter passes cwnd,
     /// add one MSS and subtract cwnd from the counter.
     fn reno_ca_step(&mut self, bytes_acked: u32) {
-        self.bytes_acked_in_window = self
-            .bytes_acked_in_window
-            .saturating_add(bytes_acked);
+        self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_add(bytes_acked);
         while self.bytes_acked_in_window >= self.cwnd {
-            self.bytes_acked_in_window =
-                self.bytes_acked_in_window.saturating_sub(self.cwnd);
+            self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_sub(self.cwnd);
             self.cwnd = self.cwnd.saturating_add(self.mss);
         }
     }
@@ -216,11 +213,9 @@ impl CongestionState {
         // we'd take in Reno (one MSS per cwnd bytes acked) and
         // pick the more conservative target. This is the standard
         // "TCP friendliness" path of RFC 9438 §4.2.
-        self.bytes_acked_in_window =
-            self.bytes_acked_in_window.saturating_add(bytes_acked);
+        self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_add(bytes_acked);
         let reno_target = if self.bytes_acked_in_window >= self.cwnd {
-            self.bytes_acked_in_window =
-                self.bytes_acked_in_window.saturating_sub(self.cwnd);
+            self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_sub(self.cwnd);
             self.cwnd.saturating_add(self.mss)
         } else {
             self.cwnd
@@ -416,7 +411,7 @@ mod tests {
         c.enter_fast_recovery(100_000, 0, 1);
         c.in_recovery = false;
         c.cwnd = c.ssthresh; // post-recovery start
-        // Advance time and ack — cwnd should not shrink.
+                             // Advance time and ack — cwnd should not shrink.
         let initial = c.cwnd;
         c.on_ack(c.mss, 1_000_000_000);
         assert!(c.cwnd >= initial);

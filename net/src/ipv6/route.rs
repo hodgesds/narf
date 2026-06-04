@@ -65,14 +65,16 @@ static ROUTES: IrqSafeSpinLock<Vec<Route>> = IrqSafeSpinLock::new(Vec::new());
 pub fn add(route: Route) {
     let mut g = ROUTES.lock();
     g.retain(|r| {
-        !(r.prefix == route.prefix
-            && r.prefix_len == route.prefix_len
-            && r.iface == route.iface)
+        !(r.prefix == route.prefix && r.prefix_len == route.prefix_len && r.iface == route.iface)
     });
     g.push(route);
     // Keep the table sorted longest-prefix-first so lookup is a
     // straight forward scan.
-    g.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len).then(a.metric.cmp(&b.metric)));
+    g.sort_by(|a, b| {
+        b.prefix_len
+            .cmp(&a.prefix_len)
+            .then(a.metric.cmp(&b.metric))
+    });
 }
 
 /// Remove a route by `(prefix, prefix_len, iface)`. Returns true iff a
@@ -80,9 +82,7 @@ pub fn add(route: Route) {
 pub fn remove(prefix: &[u8; 16], prefix_len: u8, iface: &str) -> bool {
     let mut g = ROUTES.lock();
     let before = g.len();
-    g.retain(|r| {
-        !(&r.prefix == prefix && r.prefix_len == prefix_len && r.iface == iface)
-    });
+    g.retain(|r| !(&r.prefix == prefix && r.prefix_len == prefix_len && r.iface == iface));
     g.len() != before
 }
 

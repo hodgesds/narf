@@ -242,7 +242,9 @@ impl Umem {
         if presented.slot().index != self.cap.slot().index {
             return Err(UmemError::AccessDenied);
         }
-        presented.check_live().map_err(|_| UmemError::AccessDenied)?;
+        presented
+            .check_live()
+            .map_err(|_| UmemError::AccessDenied)?;
         Ok(())
     }
 

@@ -123,11 +123,7 @@ pub fn build_ipv4(
 /// Returns `Ok(())` when the receiver's running ones-complement sum
 /// of pseudo-header + datagram is zero (or when the sender disabled
 /// the checksum by leaving it at 0).
-pub fn verify_ipv4(
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    datagram: &[u8],
-) -> Result<(), UdpError> {
+pub fn verify_ipv4(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8]) -> Result<(), UdpError> {
     if datagram.len() < UDP_HDR_LEN {
         return Err(UdpError::Short);
     }

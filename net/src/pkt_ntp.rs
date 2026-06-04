@@ -124,9 +124,8 @@ pub struct NtpHeader {
 impl NtpHeader {
     pub fn encode(&self) -> [u8; NTP_HDR_LEN] {
         let mut out = [0u8; NTP_HDR_LEN];
-        out[0] = ((self.leap_indicator & 0x03) << 6)
-            | ((self.version & 0x07) << 3)
-            | (self.mode & 0x07);
+        out[0] =
+            ((self.leap_indicator & 0x03) << 6) | ((self.version & 0x07) << 3) | (self.mode & 0x07);
         out[1] = self.stratum;
         out[2] = self.poll as u8;
         out[3] = self.precision as u8;

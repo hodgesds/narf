@@ -61,9 +61,8 @@ impl VlanTag {
     pub fn encode(self) -> [u8; 4] {
         let mut out = [0u8; 4];
         out[0..2].copy_from_slice(&self.tpid.to_be_bytes());
-        let tci = ((self.pcp as u16 & 0x07) << 13)
-            | ((self.dei as u16) << 12)
-            | (self.vid & 0x0FFF);
+        let tci =
+            ((self.pcp as u16 & 0x07) << 13) | ((self.dei as u16) << 12) | (self.vid & 0x0FFF);
         out[2..4].copy_from_slice(&tci.to_be_bytes());
         out
     }

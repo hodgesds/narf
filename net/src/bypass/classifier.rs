@@ -59,11 +59,21 @@ impl FlowKey {
     /// Number of non-wildcard fields. "More specific" = larger count.
     pub fn specificity(&self) -> u32 {
         let mut s = 0u32;
-        if self.src_ip != [0; 4] { s += 1; }
-        if self.src_port != 0 { s += 1; }
-        if self.dst_ip != [0; 4] { s += 1; }
-        if self.dst_port != 0 { s += 1; }
-        if self.proto != 0 { s += 1; }
+        if self.src_ip != [0; 4] {
+            s += 1;
+        }
+        if self.src_port != 0 {
+            s += 1;
+        }
+        if self.dst_ip != [0; 4] {
+            s += 1;
+        }
+        if self.dst_port != 0 {
+            s += 1;
+        }
+        if self.proto != 0 {
+            s += 1;
+        }
         s
     }
 }

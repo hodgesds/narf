@@ -29,17 +29,19 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use narf_lib::sync::IrqSafeSpinLock;
 use crate::iface;
+use crate::pkt::{
+    set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
+    IPV4_HDR_LEN, IP_PROTO_UDP,
+};
 use crate::pkt_dns::{
-    build_a_query, decode_name, DnsError, DnsHeader, Question, ResourceRecord, FLAG_RD,
-    FLAG_TC, RCODE_NXDOMAIN, RCODE_NOERROR, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_MX, TYPE_NS,
-    TYPE_PTR, TYPE_SRV, TYPE_TXT, CLASS_IN,
+    build_a_query, decode_name, DnsError, DnsHeader, Question, ResourceRecord, CLASS_IN, FLAG_RD,
+    FLAG_TC, RCODE_NOERROR, RCODE_NXDOMAIN, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_MX, TYPE_NS,
+    TYPE_PTR, TYPE_SRV, TYPE_TXT,
 };
 use crate::pkt_udp;
-use crate::pkt::{write_eth_header, write_ipv4_header, set_ipv4_checksum,
-                 ETH_HDR_LEN, IPV4_HDR_LEN, ETHERTYPE_IPV4, IP_PROTO_UDP};
 use crate::pkt_udp::UDP_HDR_LEN;
+use narf_lib::sync::IrqSafeSpinLock;
 
 /// DNS record type the caller can request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,14 +59,14 @@ pub enum DnsType {
 impl DnsType {
     fn to_wire(self) -> u16 {
         match self {
-            DnsType::A    => TYPE_A,
+            DnsType::A => TYPE_A,
             DnsType::Aaaa => TYPE_AAAA,
-            DnsType::Cname=> TYPE_CNAME,
-            DnsType::Mx   => TYPE_MX,
-            DnsType::Ns   => TYPE_NS,
-            DnsType::Ptr  => TYPE_PTR,
-            DnsType::Txt  => TYPE_TXT,
-            DnsType::Srv  => TYPE_SRV,
+            DnsType::Cname => TYPE_CNAME,
+            DnsType::Mx => TYPE_MX,
+            DnsType::Ns => TYPE_NS,
+            DnsType::Ptr => TYPE_PTR,
+            DnsType::Txt => TYPE_TXT,
+            DnsType::Srv => TYPE_SRV,
         }
     }
 }
@@ -123,8 +125,8 @@ pub enum ResolveError {
 /// clock — we just compare on lookup.
 #[derive(Clone, Debug)]
 struct CacheEntry {
-    name:    String,
-    qtype:   u16,
+    name: String,
+    qtype: u16,
     records: Vec<RData>,
     expiry_ns: u64,
 }
@@ -142,7 +144,11 @@ impl DnsCache {
     const fn new_empty() -> Self {
         // Can't call Vec::with_capacity in a const, so capacity is set
         // lazily on first insert. The `head` starts at 0.
-        Self { entries: Vec::new(), head: 0, capacity: 512 }
+        Self {
+            entries: Vec::new(),
+            head: 0,
+            capacity: 512,
+        }
     }
 
     /// Look up `(name, qtype)`. Returns `Some(&[RData])` if present
@@ -179,7 +185,12 @@ impl DnsCache {
             }
         }
 
-        let entry = CacheEntry { name, qtype, records, expiry_ns };
+        let entry = CacheEntry {
+            name,
+            qtype,
+            records,
+            expiry_ns,
+        };
         if self.entries.len() < self.capacity {
             self.entries.push(entry);
         } else {
@@ -214,13 +225,19 @@ const DNS_REPLY_TIMEOUT_MS: u64 = 3_000;
 
 /// Build and send a DNS query datagram for `name` / `qtype` to `ns_ip`
 /// on the primary interface. Returns the query ID used.
-fn send_dns_query(iface_name: &str, ns_ip: [u8; 4], name: &str, qtype: u16) -> Result<u16, ResolveError> {
+fn send_dns_query(
+    iface_name: &str,
+    ns_ip: [u8; 4],
+    name: &str,
+    qtype: u16,
+) -> Result<u16, ResolveError> {
     let snap = iface::lookup(iface_name).ok_or(ResolveError::NoIface)?;
 
     let qid = next_query_id();
 
     // Build DNS query wire bytes.
-    let dns_payload = build_dns_query_wire(qid, name, qtype).map_err(|_| ResolveError::ParseError)?;
+    let dns_payload =
+        build_dns_query_wire(qid, name, qtype).map_err(|_| ResolveError::ParseError)?;
 
     // Wrap in UDP + IPv4 + Ethernet.
     let total = ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + dns_payload.len();
@@ -229,7 +246,13 @@ fn send_dns_query(iface_name: &str, ns_ip: [u8; 4], name: &str, qtype: u16) -> R
     // it'll reach the gateway which forwards it). Conservative.
     write_eth_header(&mut frame, [0xFF; 6], snap.mac, ETHERTYPE_IPV4);
     let ip_total = (IPV4_HDR_LEN + UDP_HDR_LEN + dns_payload.len()) as u16;
-    let _ = write_ipv4_header(&mut frame[ETH_HDR_LEN..], ip_total, IP_PROTO_UDP, snap.ipv4, ns_ip);
+    let _ = write_ipv4_header(
+        &mut frame[ETH_HDR_LEN..],
+        ip_total,
+        IP_PROTO_UDP,
+        snap.ipv4,
+        ns_ip,
+    );
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..]);
     let udp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     // Ephemeral source port: use query id + 1024 to avoid well-known ports.
@@ -329,9 +352,7 @@ fn decode_rdata(rr: &ResourceRecord, msg: &[u8]) -> RData {
     let raw = &rr.rdata;
 
     match rr.rtype {
-        TYPE_A if raw.len() == 4 => {
-            RData::A([raw[0], raw[1], raw[2], raw[3]])
-        }
+        TYPE_A if raw.len() == 4 => RData::A([raw[0], raw[1], raw[2], raw[3]]),
         TYPE_AAAA if raw.len() == 16 => {
             let mut a = [0u8; 16];
             a.copy_from_slice(raw);
@@ -344,8 +365,8 @@ fn decode_rdata(rr: &ResourceRecord, msg: &[u8]) -> RData {
                 let name = decode_name(msg, off).map(|(n, _)| n).unwrap_or_default();
                 match rr.rtype {
                     TYPE_CNAME => RData::Cname(name),
-                    TYPE_PTR   => RData::Ptr(name),
-                    _          => RData::Ns(name),
+                    TYPE_PTR => RData::Ptr(name),
+                    _ => RData::Ns(name),
                 }
             } else {
                 RData::Raw(raw.to_vec())
@@ -354,7 +375,9 @@ fn decode_rdata(rr: &ResourceRecord, msg: &[u8]) -> RData {
         TYPE_MX if raw.len() >= 3 => {
             let pref = u16::from_be_bytes([raw[0], raw[1]]);
             if let Some(off) = find_rdata_offset(msg, &raw[2..]) {
-                let name = decode_name(msg, off + 2).map(|(n, _)| n).unwrap_or_default();
+                let name = decode_name(msg, off + 2)
+                    .map(|(n, _)| n)
+                    .unwrap_or_default();
                 RData::Mx(pref, name)
             } else {
                 RData::Raw(raw.to_vec())
@@ -379,10 +402,12 @@ fn decode_rdata(rr: &ResourceRecord, msg: &[u8]) -> RData {
         }
         TYPE_SRV if raw.len() >= 6 => {
             let priority = u16::from_be_bytes([raw[0], raw[1]]);
-            let weight   = u16::from_be_bytes([raw[2], raw[3]]);
-            let port     = u16::from_be_bytes([raw[4], raw[5]]);
+            let weight = u16::from_be_bytes([raw[2], raw[3]]);
+            let port = u16::from_be_bytes([raw[4], raw[5]]);
             if let Some(off) = find_rdata_offset(msg, &raw[6..]) {
-                let name = decode_name(msg, off + 6).map(|(n, _)| n).unwrap_or_default();
+                let name = decode_name(msg, off + 6)
+                    .map(|(n, _)| n)
+                    .unwrap_or_default();
                 RData::Srv(priority, weight, port, name)
             } else {
                 RData::Raw(raw.to_vec())
@@ -407,9 +432,11 @@ fn find_rdata_offset(haystack: &[u8], slice: &[u8]) -> Option<usize> {
 
 /// Parse a DNS wire-format response. Returns `(records, min_ttl)`.
 /// Resolves CNAME chains up to 8 hops.
-fn parse_dns_response(msg: &[u8], orig_name: &str, final_qtype: u16)
-    -> Result<(Vec<RData>, u32), ResolveError>
-{
+fn parse_dns_response(
+    msg: &[u8],
+    orig_name: &str,
+    final_qtype: u16,
+) -> Result<(Vec<RData>, u32), ResolveError> {
     let hdr = DnsHeader::decode(msg).map_err(|_| ResolveError::ParseError)?;
     if !hdr.is_response() {
         return Err(ResolveError::ParseError);
@@ -448,9 +475,9 @@ fn parse_dns_response(msg: &[u8], orig_name: &str, final_qtype: u16)
             return Err(ResolveError::CnameLoop);
         }
         // Look for the final requested type first.
-        let typed: Vec<&ResourceRecord> = rrs.iter()
-            .filter(|r| r.rtype == final_qtype &&
-                        r.name.to_lowercase() == current_name)
+        let typed: Vec<&ResourceRecord> = rrs
+            .iter()
+            .filter(|r| r.rtype == final_qtype && r.name.to_lowercase() == current_name)
             .collect();
         if !typed.is_empty() {
             let min_ttl = typed.iter().map(|r| r.ttl).min().unwrap_or(60);
@@ -458,9 +485,9 @@ fn parse_dns_response(msg: &[u8], orig_name: &str, final_qtype: u16)
             return Ok((data, min_ttl));
         }
         // Look for a CNAME redirect.
-        let cname = rrs.iter().find(|r| {
-            r.rtype == TYPE_CNAME && r.name.to_lowercase() == current_name
-        });
+        let cname = rrs
+            .iter()
+            .find(|r| r.rtype == TYPE_CNAME && r.name.to_lowercase() == current_name);
         match cname {
             Some(cn) => {
                 // Follow the CNAME.
@@ -494,11 +521,7 @@ fn parse_dns_response(msg: &[u8], orig_name: &str, final_qtype: u16)
 ///
 /// `iface_name`: the network interface to use for sending. Pass `""` to
 /// use the primary interface (first registered).
-pub fn resolve(
-    iface_name: &str,
-    name: &str,
-    qtype: DnsType,
-) -> Result<Vec<RData>, ResolveError> {
+pub fn resolve(iface_name: &str, name: &str, qtype: DnsType) -> Result<Vec<RData>, ResolveError> {
     let wire_type = qtype.to_wire();
 
     // 1. Cache check.
@@ -535,7 +558,10 @@ pub fn resolve(
 
         let qid = match send_dns_query(&effective_iface, ns_ip, name, wire_type) {
             Ok(id) => id,
-            Err(e) => { last_err = e; continue; }
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
         };
 
         // 4. Wait for reply.
@@ -557,22 +583,25 @@ pub fn resolve(
 
         let raw = match raw_reply {
             Some(r) => r,
-            None => { last_err = ResolveError::Timeout; continue; }
+            None => {
+                last_err = ResolveError::Timeout;
+                continue;
+            }
         };
 
         // 5. Parse the response.
         match parse_dns_response(&raw, name, wire_type) {
             Ok((records, ttl)) => {
                 // 6. Cache the result.
-                DNS_CACHE.lock().insert(
-                    name.to_string(),
-                    wire_type,
-                    records.clone(),
-                    ttl,
-                );
+                DNS_CACHE
+                    .lock()
+                    .insert(name.to_string(), wire_type, records.clone(), ttl);
                 return Ok(records);
             }
-            Err(e) => { last_err = e; continue; }
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
         }
     }
 
@@ -628,7 +657,9 @@ pub fn __parse_response_for_test(
 /// Test-only: force a cache insertion so TTL-hit tests work.
 #[doc(hidden)]
 pub fn __cache_insert_for_test(name: &str, qtype: u16, records: Vec<RData>, ttl_secs: u32) {
-    DNS_CACHE.lock().insert(name.to_string(), qtype, records, ttl_secs);
+    DNS_CACHE
+        .lock()
+        .insert(name.to_string(), qtype, records, ttl_secs);
 }
 
 /// Test-only: look up from cache directly.

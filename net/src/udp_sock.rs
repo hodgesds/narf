@@ -86,7 +86,7 @@ impl Default for UdpOptions {
             ip_recvttl: false,
             bind_to_device: 0,
             reuseport: false,
-            ip_ttl: 0,  // 0 = use system default (64)
+            ip_ttl: 0, // 0 = use system default (64)
             ip_tos: 0,
         }
     }
@@ -115,7 +115,10 @@ impl SocketAddrV4 {
     pub const fn new(ip: [u8; 4], port: u16) -> Self {
         Self { ip, port }
     }
-    pub const UNSPECIFIED: Self = Self { ip: [0, 0, 0, 0], port: 0 };
+    pub const UNSPECIFIED: Self = Self {
+        ip: [0, 0, 0, 0],
+        port: 0,
+    };
 }
 
 // ── Error delivery from ICMP ────────────────────────────────────────
@@ -231,10 +234,7 @@ pub enum UdpError {
 /// Bind a new UDP socket to `local`. If `local.port == 0`, an
 /// ephemeral port in 32768-60999 is allocated. Returns `Arc<UdpSocket>`.
 /// Mirrors Linux `udp_lib_get_port` (net/ipv4/udp.c:253+).
-pub fn udp_bind(
-    local: SocketAddrV4,
-    options: UdpOptions,
-) -> Result<Arc<UdpSocket>, UdpError> {
+pub fn udp_bind(local: SocketAddrV4, options: UdpOptions) -> Result<Arc<UdpSocket>, UdpError> {
     let mut tbl = PORT_TABLE.lock();
     let port = if local.port == 0 {
         tbl.alloc_ephemeral().ok_or(UdpError::NoEphemeral)?
@@ -375,8 +375,7 @@ pub fn udp_send(
         checksum: 0,
     };
     frame[udp_off..udp_off + UDP_HDR_LEN].copy_from_slice(&udp_hdr.encode());
-    frame[udp_off + UDP_HDR_LEN..udp_off + UDP_HDR_LEN + payload.len()]
-        .copy_from_slice(payload);
+    frame[udp_off + UDP_HDR_LEN..udp_off + UDP_HDR_LEN + payload.len()].copy_from_slice(payload);
 
     // Compute UDP checksum over pseudo-header + datagram.
     let udp_segment = &frame[udp_off..udp_off + udp_len];
@@ -389,7 +388,11 @@ pub fn udp_send(
     pseudo.extend_from_slice(udp_segment);
     let cs = {
         let s = ip_checksum(&pseudo);
-        if s == 0 { 0xFFFF } else { s }
+        if s == 0 {
+            0xFFFF
+        } else {
+            s
+        }
     };
     frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
 
@@ -424,7 +427,8 @@ pub fn udp_err_recv(sock: &Arc<UdpSocket>) -> Option<SockError> {
 pub fn udp_close(sock: &Arc<UdpSocket>) {
     let port = sock.local.port;
     let mut tbl = PORT_TABLE.lock();
-    tbl.entries.retain(|(p, s)| !(*p == port && Arc::ptr_eq(s, sock)));
+    tbl.entries
+        .retain(|(p, s)| !(*p == port && Arc::ptr_eq(s, sock)));
 }
 
 // ── RX dispatch ────────────────────────────────────────────────────
@@ -437,12 +441,7 @@ static RR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Deliver a received UDP datagram to matching socket(s).
 /// `datagram` is the raw UDP segment (header + payload, 8+ bytes).
-pub fn deliver(
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    datagram: &[u8],
-    ttl: u8,
-) {
+pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     if datagram.len() < UDP_HDR_LEN {
         return;
     }
@@ -543,18 +542,12 @@ pub fn snapshot() -> alloc::vec::Vec<UdpSocketSnapshot> {
 /// Deliver an ICMP error to the socket whose local addr / port
 /// matches the embedded original-datagram header.
 /// Called from `icmp_sock::deliver_error`.
-pub fn deliver_icmp_error(
-    orig_src_ip: [u8; 4],
-    orig_src_port: u16,
-    err: SockError,
-) {
+pub fn deliver_icmp_error(orig_src_ip: [u8; 4], orig_src_port: u16, err: SockError) {
     let candidates: Vec<Arc<UdpSocket>> = {
         let tbl = PORT_TABLE.lock();
         tbl.entries
             .iter()
-            .filter(|(p, s)| {
-                *p == orig_src_port && s.local.ip == orig_src_ip
-            })
+            .filter(|(p, s)| *p == orig_src_port && s.local.ip == orig_src_ip)
             .map(|(_, s)| s.clone())
             .collect()
     };
@@ -629,9 +622,9 @@ fn smoke_udp_recv_loopback_inject() -> TestResult {
     // Simulate the RX path: build a raw UDP segment and call deliver.
     let mut seg = [0u8; 8 + 9]; // UDP header + "hello-udp"
     seg[0..2].copy_from_slice(&9001u16.to_be_bytes()); // src port
-    seg[2..4].copy_from_slice(&port.to_be_bytes());    // dst port
+    seg[2..4].copy_from_slice(&port.to_be_bytes()); // dst port
     seg[4..6].copy_from_slice(&(17u16).to_be_bytes()); // length=17
-    seg[6..8].copy_from_slice(&[0, 0]);                // checksum disabled
+    seg[6..8].copy_from_slice(&[0, 0]); // checksum disabled
     seg[8..17].copy_from_slice(payload);
 
     deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
@@ -720,13 +713,19 @@ fn smoke_udp_rcvbuf_overflow_drops_oldest() -> TestResult {
     let first = udp_recv(&sock, &mut buf);
     let a = match first {
         Ok((1, _)) => buf[0],
-        _ => { udp_close(&sock); return TestResult::Fail("first recv failed"); }
+        _ => {
+            udp_close(&sock);
+            return TestResult::Fail("first recv failed");
+        }
     };
     let mut buf = [0u8; 8];
     let second = udp_recv(&sock, &mut buf);
     let b_byte = match second {
         Ok((1, _)) => buf[0],
-        _ => { udp_close(&sock); return TestResult::Fail("second recv failed"); }
+        _ => {
+            udp_close(&sock);
+            return TestResult::Fail("second recv failed");
+        }
     };
     let mut buf = [0u8; 8];
     let third = udp_recv(&sock, &mut buf);
@@ -834,10 +833,10 @@ fn smoke_udp_fragment_reassembly_via_deliver() -> TestResult {
     // After IP-level reassembly, deliver() receives the full UDP segment.
     let total_udp = UDP_HDR_LEN + payload.len();
     let mut seg = alloc::vec![0u8; total_udp];
-    seg[0..2].copy_from_slice(&9001u16.to_be_bytes());       // src port
-    seg[2..4].copy_from_slice(&port.to_be_bytes());          // dst port
+    seg[0..2].copy_from_slice(&9001u16.to_be_bytes()); // src port
+    seg[2..4].copy_from_slice(&port.to_be_bytes()); // dst port
     seg[4..6].copy_from_slice(&(total_udp as u16).to_be_bytes()); // length
-    seg[6..8].copy_from_slice(&[0, 0]);                       // checksum (optional)
+    seg[6..8].copy_from_slice(&[0, 0]); // checksum (optional)
     seg[UDP_HDR_LEN..].copy_from_slice(&payload);
 
     deliver([10, 0, 0, 5], [0, 0, 0, 0], &seg, 64);
@@ -875,8 +874,12 @@ fn smoke_udp_ip_ttl_tos_setsockopt() -> TestResult {
     let tos_ok = opts.ip_tos == 0x10;
     drop(opts);
     udp_close(&sock);
-    if !ttl_ok { return TestResult::Fail("IP_TTL not stored correctly"); }
-    if !tos_ok { return TestResult::Fail("IP_TOS not stored correctly"); }
+    if !ttl_ok {
+        return TestResult::Fail("IP_TTL not stored correctly");
+    }
+    if !tos_ok {
+        return TestResult::Fail("IP_TOS not stored correctly");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/udp", smoke_udp_ip_ttl_tos_setsockopt);

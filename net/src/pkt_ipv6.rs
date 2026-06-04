@@ -73,9 +73,8 @@ pub struct Ipv6Header {
 impl Ipv6Header {
     pub fn encode(&self) -> [u8; IPV6_HDR_LEN] {
         let mut out = [0u8; IPV6_HDR_LEN];
-        let v = (6u32) << 28
-            | ((self.traffic_class as u32) << 20)
-            | (self.flow_label & 0x000F_FFFF);
+        let v =
+            (6u32) << 28 | ((self.traffic_class as u32) << 20) | (self.flow_label & 0x000F_FFFF);
         out[0..4].copy_from_slice(&v.to_be_bytes());
         out[4..6].copy_from_slice(&self.payload_length.to_be_bytes());
         out[6] = self.next_header;

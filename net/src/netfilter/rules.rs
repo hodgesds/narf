@@ -10,8 +10,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{HookPoint, Tuple, Verdict};
 use super::conntrack::CtState;
+use super::{HookPoint, Tuple, Verdict};
 
 /// Direction relative to the interface a packet is leaving or
 /// arriving on. Useful for the `iifname` / `oifname` distinction
@@ -28,11 +28,11 @@ pub enum Direction {
 /// All `Some` fields must match (AND semantics).
 #[derive(Clone, Debug, Default)]
 pub struct Match {
-    pub src_ip:   Option<[u8; 4]>,
-    pub dst_ip:   Option<[u8; 4]>,
+    pub src_ip: Option<[u8; 4]>,
+    pub dst_ip: Option<[u8; 4]>,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
-    pub proto:    Option<u8>,
+    pub proto: Option<u8>,
     pub iface_in: Option<String>,
     pub iface_out: Option<String>,
     pub ct_state: Option<CtState>,
@@ -41,10 +41,13 @@ pub struct Match {
 impl Match {
     pub const fn any() -> Self {
         Self {
-            src_ip: None, dst_ip: None,
-            src_port: None, dst_port: None,
+            src_ip: None,
+            dst_ip: None,
+            src_port: None,
+            dst_port: None,
             proto: None,
-            iface_in: None, iface_out: None,
+            iface_in: None,
+            iface_out: None,
             ct_state: None,
         }
     }
@@ -64,19 +67,45 @@ impl Match {
         iface_out: &str,
         ct_state: Option<CtState>,
     ) -> bool {
-        if let Some(s) = self.src_ip { if s != t.src_ip { return false; } }
-        if let Some(d) = self.dst_ip { if d != t.dst_ip { return false; } }
-        if let Some(p) = self.src_port { if p != t.src_port { return false; } }
-        if let Some(p) = self.dst_port { if p != t.dst_port { return false; } }
-        if let Some(p) = self.proto { if p != t.proto { return false; } }
+        if let Some(s) = self.src_ip {
+            if s != t.src_ip {
+                return false;
+            }
+        }
+        if let Some(d) = self.dst_ip {
+            if d != t.dst_ip {
+                return false;
+            }
+        }
+        if let Some(p) = self.src_port {
+            if p != t.src_port {
+                return false;
+            }
+        }
+        if let Some(p) = self.dst_port {
+            if p != t.dst_port {
+                return false;
+            }
+        }
+        if let Some(p) = self.proto {
+            if p != t.proto {
+                return false;
+            }
+        }
         if let Some(ref n) = self.iface_in {
-            if n.as_str() != iface_in { return false; }
+            if n.as_str() != iface_in {
+                return false;
+            }
         }
         if let Some(ref n) = self.iface_out {
-            if n.as_str() != iface_out { return false; }
+            if n.as_str() != iface_out {
+                return false;
+            }
         }
         if let Some(s) = self.ct_state {
-            if ct_state != Some(s) { return false; }
+            if ct_state != Some(s) {
+                return false;
+            }
         }
         true
     }
@@ -141,7 +170,10 @@ pub struct Table {
 
 impl Table {
     pub fn new(name: String) -> Self {
-        Self { name, chains: Vec::new() }
+        Self {
+            name,
+            chains: Vec::new(),
+        }
     }
 
     pub fn chain(&mut self, name: &str) -> &mut Chain {
@@ -151,10 +183,10 @@ impl Table {
             None => {
                 // Auto-create with a default hook based on chain name.
                 let hook = match name {
-                    "prerouting"  => HookPoint::PreRouting,
-                    "input"       => HookPoint::LocalIn,
-                    "forward"     => HookPoint::Forward,
-                    "output"      => HookPoint::LocalOut,
+                    "prerouting" => HookPoint::PreRouting,
+                    "input" => HookPoint::LocalIn,
+                    "forward" => HookPoint::Forward,
+                    "output" => HookPoint::LocalOut,
                     "postrouting" => HookPoint::PostRouting,
                     _ => HookPoint::LocalIn,
                 };

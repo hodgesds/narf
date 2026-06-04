@@ -50,14 +50,12 @@ use crate::pkt::{
     IP_PROTO_TCP,
 };
 use crate::pkt_tcp::{
-    ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_PSH, FLAG_RST, FLAG_SYN,
-    TCP_HDR_MIN,
+    ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_PSH, FLAG_RST, FLAG_SYN, TCP_HDR_MIN,
 };
 
 use super::congestion::{seq_geq, seq_leq, seq_lt, CongAlg, CongestionState};
 use super::options::{
-    encode_data_options, encode_syn_options, OptionsState, ParsedOptions, DEFAULT_WSCALE,
-    MIN_MSS,
+    encode_data_options, encode_syn_options, OptionsState, ParsedOptions, DEFAULT_WSCALE, MIN_MSS,
 };
 use super::retransmit::{OutSeg, RttEstimator};
 use super::sack::{SackBlock, SackBook, SenderScoreboard};
@@ -293,21 +291,8 @@ impl Tcb {
         }
     }
 
-    pub fn new_listener(
-        id: u32,
-        local_addr: [u8; 4],
-        local_port: u16,
-        backlog: usize,
-    ) -> Self {
-        let mut t = Self::new_active(
-            id,
-            local_addr,
-            local_port,
-            [0; 4],
-            0,
-            [0; 6],
-            0,
-        );
+    pub fn new_listener(id: u32, local_addr: [u8; 4], local_port: u16, backlog: usize) -> Self {
+        let mut t = Self::new_active(id, local_addr, local_port, [0; 4], 0, [0; 6], 0);
         t.state = TcpState::Listen;
         t.backlog = backlog.max(1);
         t
@@ -325,7 +310,8 @@ impl Tcb {
     /// `true` once we transition into a state where the user
     /// can read inbound data.
     pub fn user_can_read(&self) -> bool {
-        self.recv_buf.has_data() || matches!(self.state, TcpState::CloseWait | TcpState::Closed)
+        self.recv_buf.has_data()
+            || matches!(self.state, TcpState::CloseWait | TcpState::Closed)
             || self.drop_cause.is_some()
     }
 
@@ -440,16 +426,16 @@ pub fn snapshot() -> alloc::vec::Vec<TcbSnapshot> {
 fn tcp_state_code(s: TcpState) -> u8 {
     match s {
         TcpState::Established => 0x01,
-        TcpState::SynSent     => 0x02,
+        TcpState::SynSent => 0x02,
         TcpState::SynReceived => 0x03,
-        TcpState::FinWait1    => 0x04,
-        TcpState::FinWait2    => 0x05,
-        TcpState::TimeWait    => 0x06,
-        TcpState::Closed      => 0x07,
-        TcpState::CloseWait   => 0x08,
-        TcpState::LastAck     => 0x09,
-        TcpState::Listen      => 0x0A,
-        TcpState::Closing     => 0x0B,
+        TcpState::FinWait1 => 0x04,
+        TcpState::FinWait2 => 0x05,
+        TcpState::TimeWait => 0x06,
+        TcpState::Closed => 0x07,
+        TcpState::CloseWait => 0x08,
+        TcpState::LastAck => 0x09,
+        TcpState::Listen => 0x0A,
+        TcpState::Closing => 0x0B,
     }
 }
 
@@ -736,8 +722,7 @@ fn build_frame(
     };
     let bytes = hdr.encode();
     frame[tcp_off..tcp_off + bytes.len()].copy_from_slice(&bytes);
-    frame[tcp_off + bytes.len()..tcp_off + bytes.len() + payload.len()]
-        .copy_from_slice(payload);
+    frame[tcp_off + bytes.len()..tcp_off + bytes.len() + payload.len()].copy_from_slice(payload);
     let segment = &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()];
     let cs = ipv4_pseudo_checksum(src_ip, dst_ip, segment);
     hdr.checksum = cs;
@@ -769,7 +754,11 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         )
     };
     let opts = encode_syn_options(mss, our_wscale, our_ts, if ack_too { ack } else { 0 });
-    let flags = if ack_too { FLAG_SYN | FLAG_ACK } else { FLAG_SYN };
+    let flags = if ack_too {
+        FLAG_SYN | FLAG_ACK
+    } else {
+        FLAG_SYN
+    };
     let frame = build_frame(
         iface.mac,
         peer_dst_mac,
@@ -853,7 +842,11 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
             t.remote_mac,
         )
     };
-    let flags = if ack_flag { FLAG_RST | FLAG_ACK } else { FLAG_RST };
+    let flags = if ack_flag {
+        FLAG_RST | FLAG_ACK
+    } else {
+        FLAG_RST
+    };
     let frame = build_frame(
         iface.mac,
         peer_mac,
@@ -1053,7 +1046,9 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     }
     // Otherwise it's data (possibly with FIN). Build by pulling
     // out of the send buffer (data) or by synthesising a FIN.
-    let payload_len = seg.len.saturating_sub(if seg.flags & FLAG_FIN != 0 { 1 } else { 0 });
+    let payload_len = seg
+        .len
+        .saturating_sub(if seg.flags & FLAG_FIN != 0 { 1 } else { 0 });
     let (payload, peer_mac, src_ip, dst_ip, src_port, dst_port, ack, window, opt_bytes, _flags) = {
         let t = arc.lock();
         let want = payload_len as usize;
@@ -1084,18 +1079,8 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         None => return,
     };
     let frame = build_frame(
-        iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        seg.seq,
-        ack,
-        seg.flags,
-        window,
-        opt_bytes,
-        &payload,
+        iface.mac, peer_mac, src_ip, dst_ip, src_port, dst_port, seg.seq, ack, seg.flags, window,
+        opt_bytes, &payload,
     );
     let _ = (iface.send)(&frame);
     {
@@ -1103,9 +1088,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         // Advance send-buf sent_offset by the payload length so
         // pump_send doesn't double-send.
         t.send_buf.mark_sent(payload.len());
-        t.snd_nxt = t
-            .snd_nxt
-            .wrapping_add(seg.len);
+        t.snd_nxt = t.snd_nxt.wrapping_add(seg.len);
         arm_retransmit_timer(&mut t);
     }
 }
@@ -1149,7 +1132,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let seq = t.snd_una; // probe at snd_una as a one-byte ping
-        // Schedule the next probe with exponential back-off.
+                             // Schedule the next probe with exponential back-off.
         t.persist_backoff_ns = (t.persist_backoff_ns * 2).min(PERSIST_MAX_NS);
         let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles()
@@ -1420,9 +1403,7 @@ pub fn handle_segment(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
         m.values()
             .find(|t| {
                 let g = t.lock();
-                g.local_addr == dst
-                    && g.local_port == hdr.dst_port
-                    && g.state == TcpState::Listen
+                g.local_addr == dst && g.local_port == hdr.dst_port && g.state == TcpState::Listen
             })
             .cloned()
     };
@@ -1464,9 +1445,7 @@ fn accept_into_listen(
     };
     let id = fresh_tcb_id();
     let iss = compute_isn();
-    let mut child = Tcb::new_active(
-        id, dst, hdr.dst_port, src, hdr.src_port, mac, iss,
-    );
+    let mut child = Tcb::new_active(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss);
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
@@ -1624,8 +1603,8 @@ fn handle_in_syn_sent(
         // Take an RTT sample from the SYN's queue entry.
         if let Some(seg) = t.retx_queue.pop_front() {
             if !seg.retransmitted {
-                let elapsed = narf_scheduler::narf_time::now_cycles()
-                    .wrapping_sub(seg.sent_at_cycles);
+                let elapsed =
+                    narf_scheduler::narf_time::now_cycles().wrapping_sub(seg.sent_at_cycles);
                 let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
                 let rtt_ns = elapsed / cpn;
                 t.rtt.sample(rtt_ns);
@@ -1640,11 +1619,7 @@ fn handle_in_syn_sent(
     let _ = payload; // SYN+ACK shouldn't carry data
 }
 
-fn handle_in_syn_received(
-    arc: &Arc<IrqSafeSpinLock<Tcb>>,
-    hdr: &TcpHeader,
-    payload: &[u8],
-) {
+fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payload: &[u8]) {
     // Expecting ACK of our SYN.
     if hdr.flags & FLAG_ACK == 0 {
         return;
@@ -1662,8 +1637,8 @@ fn handle_in_syn_received(
         t.state = TcpState::Established;
         if let Some(seg) = t.retx_queue.pop_front() {
             if !seg.retransmitted {
-                let elapsed = narf_scheduler::narf_time::now_cycles()
-                    .wrapping_sub(seg.sent_at_cycles);
+                let elapsed =
+                    narf_scheduler::narf_time::now_cycles().wrapping_sub(seg.sent_at_cycles);
                 let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
                 let rtt_ns = elapsed / cpn;
                 t.rtt.sample(rtt_ns);
@@ -1695,9 +1670,7 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     };
     if let Some(listen_arc) = m.values().find(|t| {
         let l = t.lock();
-        l.state == TcpState::Listen
-            && l.local_addr == local_addr
-            && l.local_port == local_port
+        l.state == TcpState::Listen && l.local_addr == local_addr && l.local_port == local_port
     }) {
         let mut l = listen_arc.lock();
         if l.accept_queue.len() < l.backlog {
@@ -1779,20 +1752,12 @@ fn handle_in_fin_wait2(
     schedule_ack(arc, payload.len() > 0 || hdr.flags & FLAG_FIN != 0);
 }
 
-fn handle_in_close_wait(
-    arc: &Arc<IrqSafeSpinLock<Tcb>>,
-    hdr: &TcpHeader,
-    parsed: &ParsedOptions,
-) {
+fn handle_in_close_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedOptions) {
     handle_ack(arc, hdr, parsed);
     pump_send(arc);
 }
 
-fn handle_in_closing(
-    arc: &Arc<IrqSafeSpinLock<Tcb>>,
-    hdr: &TcpHeader,
-    parsed: &ParsedOptions,
-) {
+fn handle_in_closing(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedOptions) {
     handle_ack(arc, hdr, parsed);
     let our_fin_acked = {
         let t = arc.lock();
@@ -1807,11 +1772,7 @@ fn handle_in_closing(
     }
 }
 
-fn handle_in_last_ack(
-    arc: &Arc<IrqSafeSpinLock<Tcb>>,
-    hdr: &TcpHeader,
-    parsed: &ParsedOptions,
-) {
+fn handle_in_last_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedOptions) {
     handle_ack(arc, hdr, parsed);
     let our_fin_acked = {
         let t = arc.lock();
@@ -1843,20 +1804,14 @@ fn handle_in_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
 
 // ── ACK + retransmit queue cleanup ──────────────────────────────────
 
-fn handle_ack(
-    arc: &Arc<IrqSafeSpinLock<Tcb>>,
-    hdr: &TcpHeader,
-    parsed: &ParsedOptions,
-) {
+fn handle_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedOptions) {
     if hdr.flags & FLAG_ACK == 0 {
         return;
     }
     let ack = hdr.acknowledgement;
     let mut t = arc.lock();
     // Window update (RFC 9293 §3.10.7.4).
-    if seq_lt(t.snd_wl1, hdr.sequence)
-        || (t.snd_wl1 == hdr.sequence && seq_leq(t.snd_wl2, ack))
-    {
+    if seq_lt(t.snd_wl1, hdr.sequence) || (t.snd_wl1 == hdr.sequence && seq_leq(t.snd_wl2, ack)) {
         t.snd_wnd = (hdr.window as u32) << t.opts.peer_wscale;
         t.snd_wl1 = hdr.sequence;
         t.snd_wl2 = ack;
@@ -1931,7 +1886,19 @@ fn handle_ack(
 fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Retransmit segments at snd_una that aren't on the SACK
     // scoreboard. This is the RFC 6675 selective-retx path.
-    let (seg_seq, seg_flags, payload, peer_mac, src_ip, dst_ip, src_port, dst_port, window, ack, opt_bytes) = {
+    let (
+        seg_seq,
+        seg_flags,
+        payload,
+        peer_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        window,
+        ack,
+        opt_bytes,
+    ) = {
         let t = arc.lock();
         let oldest = match t.retx_queue.front() {
             Some(s) => *s,
@@ -1940,10 +1907,11 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         if t.scoreboard.is_sacked(oldest.seq) {
             return;
         }
-        let payload_len = oldest
-            .len
-            .saturating_sub(if oldest.flags & FLAG_FIN != 0 { 1 } else { 0 })
-            as usize;
+        let payload_len =
+            oldest
+                .len
+                .saturating_sub(if oldest.flags & FLAG_FIN != 0 { 1 } else { 0 })
+                as usize;
         let head = t.send_buf.unacked_head_seq;
         let off = oldest.seq.wrapping_sub(head) as usize;
         let (a, b) = t.send_buf.full_slices();
@@ -1953,11 +1921,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             let end = (off + payload_len).min(total_avail);
             // Stitch across the (possibly-wrapped) deque ring.
             for i in off..end {
-                let byte = if i < a.len() {
-                    a[i]
-                } else {
-                    b[i - a.len()]
-                };
+                let byte = if i < a.len() { a[i] } else { b[i - a.len()] };
                 payload.push(byte);
             }
         }
@@ -1983,18 +1947,8 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         None => return,
     };
     let frame = build_frame(
-        iface.mac,
-        peer_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        seg_seq,
-        ack,
-        seg_flags,
-        window,
-        opt_bytes,
-        &payload,
+        iface.mac, peer_mac, src_ip, dst_ip, src_port, dst_port, seg_seq, ack, seg_flags, window,
+        opt_bytes, &payload,
     );
     let _ = (iface.send)(&frame);
     let mut t = arc.lock();
@@ -2016,7 +1970,8 @@ fn enqueue_recv(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, payload: &[u8]) {
         t.sack_book.prune_to(new_rcv);
     } else if !payload.is_empty() {
         // Out-of-order segment — record SACK range.
-        t.sack_book.add_range(seq, seq.wrapping_add(payload.len() as u32));
+        t.sack_book
+            .add_range(seq, seq.wrapping_add(payload.len() as u32));
     }
     t.rcv_nxt = new_rcv;
     t.unacked_data_segments = t.unacked_data_segments.saturating_add(1);
@@ -2027,7 +1982,9 @@ fn process_fin(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
     // FIN consumes one sequence number.
     // Only advance rcv_nxt for the FIN if our buffered data is
     // contiguous (i.e. peer's FIN sequence == rcv_nxt + payload).
-    let fin_seq = hdr.sequence.wrapping_add(if hdr.flags & FLAG_SYN != 0 { 1 } else { 0 })
+    let fin_seq = hdr
+        .sequence
+        .wrapping_add(if hdr.flags & FLAG_SYN != 0 { 1 } else { 0 })
         .wrapping_add(if hdr.flags & FLAG_FIN != 0 {
             // Compute payload length in this segment.
             0
@@ -2161,12 +2118,7 @@ pub fn tick_all() {
 /// Convert an ICMP destination-unreachable into a connection drop.
 /// Mirrors `tcp_v4_err` (`net/ipv4/tcp_ipv4.c`); we don't currently
 /// distinguish hard vs. soft errors and just close the TCB.
-pub fn signal_icmp_error(
-    remote_ip: [u8; 4],
-    remote_port: u16,
-    local_ip: [u8; 4],
-    local_port: u16,
-) {
+pub fn signal_icmp_error(remote_ip: [u8; 4], remote_port: u16, local_ip: [u8; 4], local_port: u16) {
     let arc = {
         let g = TCB_TABLE.lock();
         let m = match g.as_ref() {

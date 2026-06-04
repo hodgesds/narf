@@ -95,12 +95,8 @@ impl ParsedOptions {
                 TcpOption::Other { kind, data } if kind == OPT_SACK => {
                     let mut i = 0;
                     while i + 8 <= data.len() && sack_idx < 4 {
-                        let left = u32::from_be_bytes([
-                            data[i],
-                            data[i + 1],
-                            data[i + 2],
-                            data[i + 3],
-                        ]);
+                        let left =
+                            u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                         let right = u32::from_be_bytes([
                             data[i + 4],
                             data[i + 5],

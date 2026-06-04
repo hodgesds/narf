@@ -131,8 +131,7 @@ pub fn process_pio(
     // Temporary: random IID, possibly with shorter lifetimes
     // (RFC 8981 §3.3 — caps the lifetimes at TEMP_*_LIFETIME).
     if cfg.privacy_extensions {
-        let seed = now_ns
-            .rotate_left(13)
+        let seed = now_ns.rotate_left(13)
             ^ u64::from_be_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
         let iid = random_iid(seed);
         let temp = slaac_compose(&pio.prefix, pio.prefix_len, &iid);
@@ -158,8 +157,7 @@ pub fn process_pio(
             scope: addrs::scope_of(&a.addr),
             preferred_deadline_ns: now_ns
                 .saturating_add((a.preferred_lifetime_s as u64) * 1_000_000_000),
-            valid_deadline_ns: now_ns
-                .saturating_add((a.valid_lifetime_s as u64) * 1_000_000_000),
+            valid_deadline_ns: now_ns.saturating_add((a.valid_lifetime_s as u64) * 1_000_000_000),
             temporary: a.temporary,
         });
     }

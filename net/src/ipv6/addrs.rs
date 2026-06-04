@@ -136,13 +136,11 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
         alloc::collections::BTreeMap::new();
     let mut next_idx: u32 = 1;
     for e in g.iter() {
-        let ifindex = *idx_for_iface
-            .entry(e.iface.as_str())
-            .or_insert_with(|| {
-                let i = next_idx;
-                next_idx += 1;
-                i
-            });
+        let ifindex = *idx_for_iface.entry(e.iface.as_str()).or_insert_with(|| {
+            let i = next_idx;
+            next_idx += 1;
+            i
+        });
         let scope = match e.scope {
             AddrScope::Global => 0x00,
             AddrScope::LinkLocal => 0x20,
@@ -173,13 +171,15 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
 /// True iff `addr` is bound to *any* interface.
 pub fn is_local(addr: &[u8; 16]) -> bool {
     let g = ADDRS.lock();
-    g.iter().any(|e| &e.addr == addr && e.state != AddrState::Invalid)
+    g.iter()
+        .any(|e| &e.addr == addr && e.state != AddrState::Invalid)
 }
 
 /// True iff `addr` is bound to a specific interface.
 pub fn is_local_on(iface: &str, addr: &[u8; 16]) -> bool {
     let g = ADDRS.lock();
-    g.iter().any(|e| e.iface == iface && &e.addr == addr && e.state != AddrState::Invalid)
+    g.iter()
+        .any(|e| e.iface == iface && &e.addr == addr && e.state != AddrState::Invalid)
 }
 
 /// Walk every address and demote/expire per the current time.
@@ -204,15 +204,17 @@ pub fn pick_source(iface: &str, dst: &[u8; 16]) -> Option<[u8; 16]> {
     let dst_scope = scope_of(dst);
     let g = ADDRS.lock();
     // First pass: state == Preferred and scopes match.
-    if let Some(e) = g.iter().find(|e| {
-        e.iface == iface
-            && e.state == AddrState::Preferred
-            && e.scope == dst_scope
-    }) {
+    if let Some(e) = g
+        .iter()
+        .find(|e| e.iface == iface && e.state == AddrState::Preferred && e.scope == dst_scope)
+    {
         return Some(e.addr);
     }
     // Second pass: any Preferred address.
-    if let Some(e) = g.iter().find(|e| e.iface == iface && e.state == AddrState::Preferred) {
+    if let Some(e) = g
+        .iter()
+        .find(|e| e.iface == iface && e.state == AddrState::Preferred)
+    {
         return Some(e.addr);
     }
     // Third pass: any non-Invalid.

@@ -40,24 +40,21 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::arp_cache;
 use crate::iface;
+use crate::ipv4::Ipv4Addr;
 use crate::pkt::{
-    set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4,
-    ETH_HDR_LEN, IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
+    set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
+    IPV4_HDR_LEN, IP_PROTO_TCP, IP_PROTO_UDP,
 };
-use crate::pkt_tcp::{
-    ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN,
-};
+use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN};
 use crate::pkt_udp::{UdpHeader, UDP_HDR_LEN};
 use crate::route;
 use crate::tcp::core::{
-    self, accept, close, handle_segment, listen, lookup_tcb, recv, send,
-    shutdown, tick_retransmit,
+    self, accept, close, handle_segment, listen, lookup_tcb, recv, send, shutdown, tick_retransmit,
 };
 use crate::tcp::state_machine::{Shutdown, TcpState};
 use crate::udp_sock::{
     deliver as udp_deliver, udp_bind, udp_close, udp_recv, SocketAddrV4, UdpOptions,
 };
-use crate::ipv4::Ipv4Addr;
 
 // ── Shared TX-capture cell ──────────────────────────────────────────────────
 //
@@ -94,7 +91,11 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     TX_CAPTURE.lock().clear();
 
     // Register the synthetic NIC — `SendFn` captures frames.
-    iface::register(iface_name, [0x02, 0x00, 0x00, 0x00, 0x00, 0x05], capture_send);
+    iface::register(
+        iface_name,
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x05],
+        capture_send,
+    );
     iface::set_default_ipv4(local_ip, gateway);
     iface::add_addr(iface_name, local_ip, 24);
 
@@ -115,17 +116,17 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
 /// Build a minimal Ethernet + IPv4 + TCP segment. Used to inject frames
 /// into the RX dispatch path (matching `netif_receive_skb` in Linux).
 fn build_tcp_frame(
-    src_mac:   [u8; 6],
-    dst_mac:   [u8; 6],
-    src_ip:    [u8; 4],
-    dst_ip:    [u8; 4],
-    src_port:  u16,
-    dst_port:  u16,
-    seq:       u32,
-    ack:       u32,
-    flags:     u8,
-    window:    u16,
-    payload:   &[u8],
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
 ) -> Vec<u8> {
     let tcp_hdr_len = TCP_HDR_MIN; // no options for test frames
     let total = ETH_HDR_LEN + IPV4_HDR_LEN + tcp_hdr_len + payload.len();
@@ -169,18 +170,24 @@ fn build_tcp_frame(
 
 /// Build a minimal Ethernet + IPv4 + UDP frame.
 fn build_udp_frame(
-    src_ip:   [u8; 4],
-    dst_ip:   [u8; 4],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
     src_port: u16,
     dst_port: u16,
-    payload:  &[u8],
+    payload: &[u8],
 ) -> Vec<u8> {
     let udp_len = UDP_HDR_LEN + payload.len();
     let ip_total = IPV4_HDR_LEN + udp_len;
     let total = ETH_HDR_LEN + ip_total;
     let mut frame = vec![0u8; total];
     write_eth_header(&mut frame, [0xFF; 6], [0x02; 6], ETHERTYPE_IPV4);
-    write_ipv4_header(&mut frame[ETH_HDR_LEN..], ip_total as u16, IP_PROTO_UDP, src_ip, dst_ip);
+    write_ipv4_header(
+        &mut frame[ETH_HDR_LEN..],
+        ip_total as u16,
+        IP_PROTO_UDP,
+        src_ip,
+        dst_ip,
+    );
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
     let udp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let hdr = UdpHeader {
@@ -204,11 +211,11 @@ fn build_udp_frame(
 //   three-way handshake + data transfer.
 
 fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
-    const IFACE:       &str    = "e2e-lo1";
-    const LOCAL_IP:    [u8;4]  = [10, 0, 1, 1];
-    const GW:          [u8;4]  = [10, 0, 1, 1]; // self-GW for loopback
-    const SERVER_PORT: u16     = 17080;
-    const CLIENT_PORT: u16     = 54321;
+    const IFACE: &str = "e2e-lo1";
+    const LOCAL_IP: [u8; 4] = [10, 0, 1, 1];
+    const GW: [u8; 4] = [10, 0, 1, 1]; // self-GW for loopback
+    const SERVER_PORT: u16 = 17080;
+    const CLIENT_PORT: u16 = 54321;
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -221,10 +228,17 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     // ── Client: build & inject SYN ──
     let client_iss: u32 = 0x2000_0000;
     let syn = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP,
-        CLIENT_PORT, SERVER_PORT,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
@@ -239,17 +253,25 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     };
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let server_iss = u32::from_be_bytes([
-        synack[tcp_off + 4], synack[tcp_off + 5],
-        synack[tcp_off + 6], synack[tcp_off + 7],
+        synack[tcp_off + 4],
+        synack[tcp_off + 5],
+        synack[tcp_off + 6],
+        synack[tcp_off + 7],
     ]);
 
     // ── Client: inject ACK of SYN-ACK → child reaches ESTABLISHED ──
     let ack = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP,
-        CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
@@ -259,7 +281,10 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
         let mut sid = None;
         for _ in 0..50 {
             match accept(listen_id) {
-                Ok(Some(id)) => { sid = Some(id); break; }
+                Ok(Some(id)) => {
+                    sid = Some(id);
+                    break;
+                }
                 _ => {}
             }
         }
@@ -289,13 +314,23 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     // ── Data: inject 16-byte PSH+ACK from client → recv on server ──
     let payload = b"hello-narf-stack";
     let data_frame = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP,
-        CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK | 0x08 /* PSH */, 65535, payload,
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK | 0x08, /* PSH */
+        65535,
+        payload,
     );
-    handle_segment(LOCAL_IP, LOCAL_IP, &data_frame[ETH_HDR_LEN + IPV4_HDR_LEN..]);
+    handle_segment(
+        LOCAL_IP,
+        LOCAL_IP,
+        &data_frame[ETH_HDR_LEN + IPV4_HDR_LEN..],
+    );
     let _ = drain_captured();
 
     // Server recv should return the 16 bytes.
@@ -333,7 +368,7 @@ kernel_test_in!("net/e2e", smoke_e2e_tcp_loopback_round_trip);
 fn smoke_e2e_udp_send_recv_loopback() -> TestResult {
     const SERVER_PORT: u16 = 15000;
     const CLIENT_PORT: u16 = 15001;
-    const SERVER_IP:   [u8;4] = [127, 0, 0, 1];
+    const SERVER_IP: [u8; 4] = [127, 0, 0, 1];
 
     // Bind server socket — no iface needed for pure inject path.
     let server = match udp_bind(
@@ -357,7 +392,7 @@ fn smoke_e2e_udp_send_recv_loopback() -> TestResult {
     seg[UDP_HDR_LEN..].copy_from_slice(&payload);
 
     udp_deliver(
-        [127, 0, 0, 1],   // src IP
+        [127, 0, 0, 1], // src IP
         SERVER_IP,
         &seg,
         64,
@@ -401,11 +436,11 @@ kernel_test_in!("net/e2e", smoke_e2e_udp_send_recv_loopback);
 //   mirrors `inet_stream_ops` call chain in `linux/net/ipv4/af_inet.c`.
 
 fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
-    const IFACE:       &str    = "e2e-fd3";
-    const LOCAL_IP:    [u8;4]  = [10, 0, 3, 1];
-    const GW:          [u8;4]  = [10, 0, 3, 1];
-    const SERVER_PORT: u16     = 18081;
-    const CLIENT_PORT: u16     = 55001;
+    const IFACE: &str = "e2e-fd3";
+    const LOCAL_IP: [u8; 4] = [10, 0, 3, 1];
+    const GW: [u8; 4] = [10, 0, 3, 1];
+    const SERVER_PORT: u16 = 18081;
+    const CLIENT_PORT: u16 = 55001;
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -418,10 +453,17 @@ fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
     // sys_connect equivalent: inject SYN + complete handshake via frames.
     let client_iss: u32 = 0x3000_0000;
     let syn = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP,
-        CLIENT_PORT, SERVER_PORT,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
@@ -435,15 +477,23 @@ fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
     };
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let server_iss = u32::from_be_bytes([
-        synack[tcp_off + 4], synack[tcp_off + 5],
-        synack[tcp_off + 6], synack[tcp_off + 7],
+        synack[tcp_off + 4],
+        synack[tcp_off + 5],
+        synack[tcp_off + 6],
+        synack[tcp_off + 7],
     ]);
     let ack = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP,
-        CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
@@ -466,13 +516,23 @@ fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
     // sys_send: inject a data frame to the server child (simulates M sending "hi").
     let data = b"hi";
     let data_frame = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP,
-        CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK | 0x08, 65535, data,
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK | 0x08,
+        65535,
+        data,
     );
-    handle_segment(LOCAL_IP, LOCAL_IP, &data_frame[ETH_HDR_LEN + IPV4_HDR_LEN..]);
+    handle_segment(
+        LOCAL_IP,
+        LOCAL_IP,
+        &data_frame[ETH_HDR_LEN + IPV4_HDR_LEN..],
+    );
     let _ = drain_captured();
 
     // sys_recv: read 2 bytes "hi".
@@ -506,11 +566,11 @@ kernel_test_in!("net/e2e", smoke_e2e_af_inet_socket_fd_table);
 //   then `arp_find` in `linux/net/ipv4/arp.c`.
 
 fn smoke_e2e_routing_and_arp_resolution() -> TestResult {
-    const IFACE:      &str    = "e2e-eth4";
-    const LOCAL_IP:   [u8;4]  = [10, 0, 0, 5];
-    const GW:         [u8;4]  = [10, 0, 0, 1];
-    const GW_MAC:     [u8;6]  = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-    const REMOTE_IP:  [u8;4]  = [8, 8, 8, 8];
+    const IFACE: &str = "e2e-eth4";
+    const LOCAL_IP: [u8; 4] = [10, 0, 0, 5];
+    const GW: [u8; 4] = [10, 0, 0, 1];
+    const GW_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const REMOTE_IP: [u8; 4] = [8, 8, 8, 8];
 
     full_reset(IFACE, LOCAL_IP, GW);
     // Ensure the default route (0.0.0.0/0 → GW) is installed.
@@ -519,7 +579,9 @@ fn smoke_e2e_routing_and_arp_resolution() -> TestResult {
     // Verify route_lookup picks the default route for 8.8.8.8.
     let route = match route::route_lookup(Ipv4Addr(REMOTE_IP)) {
         Some(r) => r,
-        None => return TestResult::Fail("route_lookup(8.8.8.8) returned None — default route missing"),
+        None => {
+            return TestResult::Fail("route_lookup(8.8.8.8) returned None — default route missing")
+        }
     };
     if route.nexthop.0 != GW {
         return TestResult::Fail("nexthop is not the configured gateway");
@@ -548,10 +610,17 @@ fn smoke_e2e_routing_and_arp_resolution() -> TestResult {
     arp_cache::insert(IFACE, REMOTE_IP, GW_MAC);
 
     let syn = build_tcp_frame(
-        GW_MAC, [0x02, 0, 0, 0, 0, 0x05],
-        REMOTE_IP, LOCAL_IP,
-        12345, SERVER_PORT,
-        0xABCD_0000, 0, FLAG_SYN, 65535, &[],
+        GW_MAC,
+        [0x02, 0, 0, 0, 0, 0x05],
+        REMOTE_IP,
+        LOCAL_IP,
+        12345,
+        SERVER_PORT,
+        0xABCD_0000,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(REMOTE_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
@@ -566,7 +635,9 @@ fn smoke_e2e_routing_and_arp_resolution() -> TestResult {
     };
 
     // Verify IPv4 dst is 8.8.8.8 (bytes 16..20 of IPv4 header at ETH_HDR_LEN).
-    let ip_dst: [u8; 4] = synack[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].try_into().unwrap();
+    let ip_dst: [u8; 4] = synack[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20]
+        .try_into()
+        .unwrap();
     if ip_dst != REMOTE_IP {
         return TestResult::Fail("SYN-ACK IPv4 dst is not 8.8.8.8");
     }
@@ -591,11 +662,11 @@ kernel_test_in!("net/e2e", smoke_e2e_routing_and_arp_resolution);
 //   `tcp_retransmit_skb` in `linux/net/ipv4/tcp_output.c`.
 
 fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
-    const IFACE:       &str    = "e2e-lo5";
-    const LOCAL_IP:    [u8;4]  = [10, 0, 5, 1];
-    const GW:          [u8;4]  = [10, 0, 5, 1];
-    const SERVER_PORT: u16     = 20080;
-    const CLIENT_PORT: u16     = 55200;
+    const IFACE: &str = "e2e-lo5";
+    const LOCAL_IP: [u8; 4] = [10, 0, 5, 1];
+    const GW: [u8; 4] = [10, 0, 5, 1];
+    const SERVER_PORT: u16 = 20080;
+    const CLIENT_PORT: u16 = 55200;
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -607,9 +678,17 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
     // Complete handshake (inject SYN + ACK from "client").
     let client_iss: u32 = 0x4000_0000;
     let syn = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
@@ -623,21 +702,35 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
     };
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let server_iss = u32::from_be_bytes([
-        synack[tcp_off + 4], synack[tcp_off + 5],
-        synack[tcp_off + 6], synack[tcp_off + 7],
+        synack[tcp_off + 4],
+        synack[tcp_off + 5],
+        synack[tcp_off + 6],
+        synack[tcp_off + 7],
     ]);
     let ack = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
     let server_id = {
         let mut sid = None;
-        for _ in 0..50 { if let Ok(Some(id)) = accept(listen_id) { sid = Some(id); break; } }
+        for _ in 0..50 {
+            if let Ok(Some(id)) = accept(listen_id) {
+                sid = Some(id);
+                break;
+            }
+        }
         match sid {
             Some(id) => id,
             None => return TestResult::Fail("accept failed in retransmit smoke"),
@@ -653,9 +746,10 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
     }
     let txd_after_send = drain_captured();
     // There should be at least one data segment in the TX capture.
-    let data_seg = match txd_after_send.iter().find(|f| {
-        f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN
-    }) {
+    let data_seg = match txd_after_send
+        .iter()
+        .find(|f| f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN)
+    {
         Some(f) => f.clone(),
         None => return TestResult::Fail("no data segment emitted after send(200)"),
     };
@@ -663,8 +757,10 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
     // Extract the SEQ number from the data segment.
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let orig_seq = u32::from_be_bytes([
-        data_seg[tcp_off + 4], data_seg[tcp_off + 5],
-        data_seg[tcp_off + 6], data_seg[tcp_off + 7],
+        data_seg[tcp_off + 4],
+        data_seg[tcp_off + 5],
+        data_seg[tcp_off + 6],
+        data_seg[tcp_off + 7],
     ]);
 
     // ── Force retransmit by manipulating the TCB's timer deadline ──
@@ -693,9 +789,16 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
     let txd_retx = drain_captured();
     // Must have a retransmitted data segment with the same SEQ.
     let retx_seg = match txd_retx.iter().find(|f| {
-        if f.len() < ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN + 1 { return false; }
+        if f.len() < ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN + 1 {
+            return false;
+        }
         let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
-        let seq = u32::from_be_bytes([f[tcp_off+4], f[tcp_off+5], f[tcp_off+6], f[tcp_off+7]]);
+        let seq = u32::from_be_bytes([
+            f[tcp_off + 4],
+            f[tcp_off + 5],
+            f[tcp_off + 6],
+            f[tcp_off + 7],
+        ]);
         seq == orig_seq
     }) {
         Some(f) => f,
@@ -732,11 +835,11 @@ kernel_test_in!("net/e2e", smoke_e2e_tcp_retransmit_on_missed_ack);
 //   `tcp_time_wait` in `linux/net/ipv4/tcp_minisocks.c`.
 
 fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
-    const IFACE:       &str    = "e2e-lo6";
-    const LOCAL_IP:    [u8;4]  = [10, 0, 6, 1];
-    const GW:          [u8;4]  = [10, 0, 6, 1];
-    const SERVER_PORT: u16     = 21080;
-    const CLIENT_PORT: u16     = 55300;
+    const IFACE: &str = "e2e-lo6";
+    const LOCAL_IP: [u8; 4] = [10, 0, 6, 1];
+    const GW: [u8; 4] = [10, 0, 6, 1];
+    const SERVER_PORT: u16 = 21080;
+    const CLIENT_PORT: u16 = 55300;
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -748,9 +851,17 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
     let client_iss: u32 = 0x5000_0000;
     // Perform handshake.
     let syn = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let txd = drain_captured();
@@ -763,21 +874,35 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
     };
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let server_iss = u32::from_be_bytes([
-        synack[tcp_off + 4], synack[tcp_off + 5],
-        synack[tcp_off + 6], synack[tcp_off + 7],
+        synack[tcp_off + 4],
+        synack[tcp_off + 5],
+        synack[tcp_off + 6],
+        synack[tcp_off + 7],
     ]);
     let ack_frame = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_frame[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
     let server_id = {
         let mut sid = None;
-        for _ in 0..50 { if let Ok(Some(id)) = accept(listen_id) { sid = Some(id); break; } }
+        for _ in 0..50 {
+            if let Ok(Some(id)) = accept(listen_id) {
+                sid = Some(id);
+                break;
+            }
+        }
         match sid {
             Some(id) => id,
             None => return TestResult::Fail("accept failed in TIME_WAIT smoke"),
@@ -808,12 +933,23 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
         t.fin_seq
     };
     let client_ack_fin = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_fin_seq.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_fin_seq.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
-    handle_segment(LOCAL_IP, LOCAL_IP, &client_ack_fin[ETH_HDR_LEN + IPV4_HDR_LEN..]);
+    handle_segment(
+        LOCAL_IP,
+        LOCAL_IP,
+        &client_ack_fin[ETH_HDR_LEN + IPV4_HDR_LEN..],
+    );
     let _ = drain_captured();
 
     // Verify server is now in FIN_WAIT_2.
@@ -830,12 +966,23 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
 
     // ── Client sends FIN (passive close) ──
     let client_fin = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_fin_seq.wrapping_add(1),
-        FLAG_FIN | FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_fin_seq.wrapping_add(1),
+        FLAG_FIN | FLAG_ACK,
+        65535,
+        &[],
     );
-    handle_segment(LOCAL_IP, LOCAL_IP, &client_fin[ETH_HDR_LEN + IPV4_HDR_LEN..]);
+    handle_segment(
+        LOCAL_IP,
+        LOCAL_IP,
+        &client_fin[ETH_HDR_LEN + IPV4_HDR_LEN..],
+    );
     let _ = drain_captured();
 
     // ── Verify TIME_WAIT ──
@@ -935,11 +1082,11 @@ kernel_test_in!("net/e2e", smoke_e2e_udp_reuseport_load_balance);
 //   `get_tcp4_sock` for the per-sock rendering.
 
 fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
-    const IFACE:       &str    = "e2e-lo8";
-    const LOCAL_IP:    [u8;4]  = [10, 0, 8, 1];
-    const GW:          [u8;4]  = [10, 0, 8, 1];
-    const SERVER_PORT: u16     = 23080;
-    const CLIENT_PORT: u16     = 55800;
+    const IFACE: &str = "e2e-lo8";
+    const LOCAL_IP: [u8; 4] = [10, 0, 8, 1];
+    const GW: [u8; 4] = [10, 0, 8, 1];
+    const SERVER_PORT: u16 = 23080;
+    const CLIENT_PORT: u16 = 55800;
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -950,9 +1097,9 @@ fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
 
     // Snapshot should contain LISTEN state (0x0A) for the server port.
     let snap = core::snapshot();
-    let has_listen = snap.iter().any(|s| {
-        s.local_port == SERVER_PORT && s.state_code == 0x0A
-    });
+    let has_listen = snap
+        .iter()
+        .any(|s| s.local_port == SERVER_PORT && s.state_code == 0x0A);
     if !has_listen {
         return TestResult::Fail("snapshot missing LISTEN entry for server port");
     }
@@ -960,9 +1107,17 @@ fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
     // Complete handshake.
     let client_iss: u32 = 0x7000_0000;
     let syn = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let txd = drain_captured();
@@ -975,23 +1130,32 @@ fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
     };
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let server_iss = u32::from_be_bytes([
-        synack[tcp_off + 4], synack[tcp_off + 5],
-        synack[tcp_off + 6], synack[tcp_off + 7],
+        synack[tcp_off + 4],
+        synack[tcp_off + 5],
+        synack[tcp_off + 6],
+        synack[tcp_off + 7],
     ]);
     let ack_frame = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_frame[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
     // Snapshot should now contain ESTABLISHED child.
     let snap2 = core::snapshot();
-    let has_estab = snap2.iter().any(|s| {
-        s.local_port == SERVER_PORT && s.state_code == 0x01
-    });
+    let has_estab = snap2
+        .iter()
+        .any(|s| s.local_port == SERVER_PORT && s.state_code == 0x01);
     if !has_estab {
         return TestResult::Fail("snapshot missing ESTABLISHED entry after handshake");
     }
@@ -1004,7 +1168,10 @@ fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
     let addr = [127u8, 0, 0, 1];
     let expected_le_hex = alloc::format!(
         "{:02X}{:02X}{:02X}{:02X}",
-        addr[3], addr[2], addr[1], addr[0]
+        addr[3],
+        addr[2],
+        addr[1],
+        addr[0]
     );
     if expected_le_hex != "0100007F" {
         return TestResult::Fail("LE-hex encoding of 127.0.0.1 is wrong — expected 0100007F");
@@ -1027,11 +1194,11 @@ kernel_test_in!("net/e2e", smoke_e2e_proc_net_tcp_shows_connections);
 //   `ip_rcv` → `ip_rcv_core` PRE_ROUTING hook.
 
 fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
-    const IFACE:       &str    = "e2e-ct9";
-    const LOCAL_IP:    [u8;4]  = [10, 0, 9, 1];
-    const GW:          [u8;4]  = [10, 0, 9, 1];
-    const SERVER_PORT: u16     = 24080;
-    const CLIENT_PORT: u16     = 55900;
+    const IFACE: &str = "e2e-ct9";
+    const LOCAL_IP: [u8; 4] = [10, 0, 9, 1];
+    const GW: [u8; 4] = [10, 0, 9, 1];
+    const SERVER_PORT: u16 = 24080;
+    const CLIENT_PORT: u16 = 55900;
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -1050,20 +1217,26 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
     // through rx_handler to exercise the netfilter conntrack path.
     let client_iss: u32 = 0x8000_0000;
     let syn_full = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     crate::tcp_stack::rx_handler(&syn_full);
     let _ = drain_captured();
 
     // Conntrack snapshot should have a TCP entry for this flow.
     let ct_snap = crate::netfilter::conntrack::snapshot();
-    let has_entry = ct_snap.iter().any(|e| {
-        e.l4proto == "tcp"
-            && e.orig_sport == CLIENT_PORT
-            && e.orig_dport == SERVER_PORT
-    });
+    let has_entry = ct_snap
+        .iter()
+        .any(|e| e.l4proto == "tcp" && e.orig_sport == CLIENT_PORT && e.orig_dport == SERVER_PORT);
     if !has_entry {
         return TestResult::Fail("conntrack snapshot missing TCP entry after SYN");
     }
@@ -1083,14 +1256,23 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
     };
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let server_iss = u32::from_be_bytes([
-        synack[tcp_off + 4], synack[tcp_off + 5],
-        synack[tcp_off + 6], synack[tcp_off + 7],
+        synack[tcp_off + 4],
+        synack[tcp_off + 5],
+        synack[tcp_off + 6],
+        synack[tcp_off + 7],
     ]);
     let ack_full = build_tcp_frame(
-        [0x02,0,0,0,0,0x05], [0x02,0,0,0,0,0x05],
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        [0x02, 0, 0, 0, 0, 0x05],
+        [0x02, 0, 0, 0, 0, 0x05],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     crate::tcp_stack::rx_handler(&ack_full);
     let _ = drain_captured();
@@ -1108,9 +1290,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         // to reach ESTABLISHED. With only the inject path it may still be
         // SYN_RECV — accept that as partial success.
         let is_synrecv = ct_snap2.iter().any(|e| {
-            e.l4proto == "tcp"
-                && e.orig_sport == CLIENT_PORT
-                && e.orig_dport == SERVER_PORT
+            e.l4proto == "tcp" && e.orig_sport == CLIENT_PORT && e.orig_dport == SERVER_PORT
         });
         if !is_synrecv {
             return TestResult::Fail("conntrack lost the TCP entry after ACK inject");
@@ -1140,9 +1320,9 @@ kernel_test_in!("net/e2e", smoke_e2e_netfilter_conntrack_tracks_flow);
 //   → `call_netdevice_notifiers(NETDEV_DOWN)` → route/ARP flush.
 
 fn smoke_e2e_iface_unregister_cleanup() -> TestResult {
-    const IFACE:     &str    = "e2e-down10";
-    const LOCAL_IP:  [u8;4]  = [10, 0, 10, 5];
-    const GW:        [u8;4]  = [10, 0, 10, 1];
+    const IFACE: &str = "e2e-down10";
+    const LOCAL_IP: [u8; 4] = [10, 0, 10, 5];
+    const GW: [u8; 4] = [10, 0, 10, 1];
 
     full_reset(IFACE, LOCAL_IP, GW);
 
@@ -1274,13 +1454,13 @@ fn wave47_two_iface_setup(
 // primary_send instead and the smoke fails.
 
 fn smoke_wave47_udp_send_routes_via_for_dst() -> TestResult {
-    const PRIMARY:     &str    = "wave47-udp-pri";
-    const PRIMARY_IP:  [u8; 4] = [10, 47, 1, 1];
-    const CAPTURE:     &str    = "wave47-udp-cap";
-    const CAPTURE_IP:  [u8; 4] = [10, 47, 2, 1];
-    const DST_IP:      [u8; 4] = [10, 47, 2, 99];
-    const DST_PORT:    u16     = 16047;
-    const SRC_PORT:    u16     = 56047;
+    const PRIMARY: &str = "wave47-udp-pri";
+    const PRIMARY_IP: [u8; 4] = [10, 47, 1, 1];
+    const CAPTURE: &str = "wave47-udp-cap";
+    const CAPTURE_IP: [u8; 4] = [10, 47, 2, 1];
+    const DST_IP: [u8; 4] = [10, 47, 2, 99];
+    const DST_PORT: u16 = 16047;
+    const SRC_PORT: u16 = 56047;
 
     wave47_two_iface_setup(PRIMARY, PRIMARY_IP, CAPTURE, CAPTURE_IP, 24);
 
@@ -1298,11 +1478,7 @@ fn smoke_wave47_udp_send_routes_via_for_dst() -> TestResult {
     };
 
     let payload = b"wave47-udp";
-    match crate::udp_sock::udp_send(
-        &sock,
-        payload,
-        Some(SocketAddrV4::new(DST_IP, DST_PORT)),
-    ) {
+    match crate::udp_sock::udp_send(&sock, payload, Some(SocketAddrV4::new(DST_IP, DST_PORT))) {
         Ok(n) if n == payload.len() => {}
         Ok(_) => return TestResult::Fail("udp_send returned wrong byte count"),
         Err(_) => return TestResult::Fail("udp_send failed"),
@@ -1310,7 +1486,9 @@ fn smoke_wave47_udp_send_routes_via_for_dst() -> TestResult {
 
     let txd = drain_captured();
     if txd.is_empty() {
-        return TestResult::Fail("UDP frame did not land on capture iface (regression: routed via primary)");
+        return TestResult::Fail(
+            "UDP frame did not land on capture iface (regression: routed via primary)",
+        );
     }
     if *PRIMARY_TX_COUNT.lock() != 0 {
         return TestResult::Fail("UDP frame leaked to primary iface (Wave-47 regression)");
@@ -1321,7 +1499,9 @@ fn smoke_wave47_udp_send_routes_via_for_dst() -> TestResult {
     if frame.len() < ETH_HDR_LEN + 20 {
         return TestResult::Fail("captured UDP frame too short");
     }
-    let ip_dst: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].try_into().unwrap();
+    let ip_dst: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20]
+        .try_into()
+        .unwrap();
     if ip_dst != DST_IP {
         return TestResult::Fail("captured UDP frame has wrong IPv4 dst");
     }
@@ -1338,11 +1518,11 @@ kernel_test_in!("net/e2e", smoke_wave47_udp_send_routes_via_for_dst);
 // frame went through capture_send.
 
 fn smoke_wave47_icmp_echo_routes_via_for_dst() -> TestResult {
-    const PRIMARY:     &str    = "wave47-icmp-pri";
-    const PRIMARY_IP:  [u8; 4] = [10, 47, 3, 1];
-    const CAPTURE:     &str    = "wave47-icmp-cap";
-    const CAPTURE_IP:  [u8; 4] = [10, 47, 4, 1];
-    const DST_IP:      [u8; 4] = [10, 47, 4, 42];
+    const PRIMARY: &str = "wave47-icmp-pri";
+    const PRIMARY_IP: [u8; 4] = [10, 47, 3, 1];
+    const CAPTURE: &str = "wave47-icmp-cap";
+    const CAPTURE_IP: [u8; 4] = [10, 47, 4, 1];
+    const DST_IP: [u8; 4] = [10, 47, 4, 42];
 
     wave47_two_iface_setup(PRIMARY, PRIMARY_IP, CAPTURE, CAPTURE_IP, 24);
 
@@ -1361,7 +1541,9 @@ fn smoke_wave47_icmp_echo_routes_via_for_dst() -> TestResult {
 
     let txd = drain_captured();
     if txd.is_empty() {
-        return TestResult::Fail("ICMP frame did not land on capture iface (regression: routed via primary)");
+        return TestResult::Fail(
+            "ICMP frame did not land on capture iface (regression: routed via primary)",
+        );
     }
     if *PRIMARY_TX_COUNT.lock() != 0 {
         return TestResult::Fail("ICMP frame leaked to primary iface (Wave-47 regression)");
@@ -1375,7 +1557,9 @@ fn smoke_wave47_icmp_echo_routes_via_for_dst() -> TestResult {
     if frame[ETH_HDR_LEN + 9] != 1 {
         return TestResult::Fail("captured frame is not ICMP");
     }
-    let ip_dst: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].try_into().unwrap();
+    let ip_dst: [u8; 4] = frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20]
+        .try_into()
+        .unwrap();
     if ip_dst != DST_IP {
         return TestResult::Fail("captured ICMP frame has wrong IPv4 dst");
     }
@@ -1391,11 +1575,11 @@ kernel_test_in!("net/e2e", smoke_wave47_icmp_echo_routes_via_for_dst);
 // /24, verify the request egressed on capture not primary.
 
 fn smoke_wave47_arp_request_routes_via_for_dst() -> TestResult {
-    const PRIMARY:     &str    = "wave47-arp-pri";
-    const PRIMARY_IP:  [u8; 4] = [10, 47, 5, 1];
-    const CAPTURE:     &str    = "wave47-arp-cap";
-    const CAPTURE_IP:  [u8; 4] = [10, 47, 6, 1];
-    const TARGET_IP:   [u8; 4] = [10, 47, 6, 200];
+    const PRIMARY: &str = "wave47-arp-pri";
+    const PRIMARY_IP: [u8; 4] = [10, 47, 5, 1];
+    const CAPTURE: &str = "wave47-arp-cap";
+    const CAPTURE_IP: [u8; 4] = [10, 47, 6, 1];
+    const TARGET_IP: [u8; 4] = [10, 47, 6, 200];
 
     wave47_two_iface_setup(PRIMARY, PRIMARY_IP, CAPTURE, CAPTURE_IP, 24);
 
@@ -1406,7 +1590,9 @@ fn smoke_wave47_arp_request_routes_via_for_dst() -> TestResult {
 
     let txd = drain_captured();
     if txd.is_empty() {
-        return TestResult::Fail("ARP request did not land on capture iface (regression: routed via primary)");
+        return TestResult::Fail(
+            "ARP request did not land on capture iface (regression: routed via primary)",
+        );
     }
     if *PRIMARY_TX_COUNT.lock() != 0 {
         return TestResult::Fail("ARP request leaked to primary iface (Wave-47 regression)");

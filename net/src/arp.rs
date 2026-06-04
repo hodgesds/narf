@@ -49,7 +49,7 @@ const ARP_CACHE_SIZE: usize = 16;
 /// One entry in the ARP cache.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ArpEntry {
-    pub ip:  [u8; 4],
+    pub ip: [u8; 4],
     pub mac: [u8; 6],
 }
 

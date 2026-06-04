@@ -62,16 +62,16 @@ use crate::iface;
 use crate::ifaddr;
 use crate::ipv4::{self, Ipv4Addr};
 use crate::pkt_dhcp::{
-    build_decline, build_discover, build_release, build_request, iter_options, DhcpHeader,
-    OP_BOOT_REQUEST, DHCPACK, DHCPDISCOVER, DHCPNAK, DHCPOFFER, DHCPREQUEST, DHCPRELEASE,
-    DHCPDECLINE, FLAG_BROADCAST, HTYPE_ETHERNET, MAGIC_COOKIE, OPT_DNS_SERVER,
-    OPT_DHCP_MESSAGE_TYPE, OPT_LEASE_TIME, OPT_PARAMETER_REQUEST_LIST, OPT_REQUESTED_IP,
-    OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2,
-    OPT_INTERFACE_MTU, DHCP_HDR_LEN, append_option, append_message_type, append_end,
+    append_end, append_message_type, append_option, build_decline, build_discover, build_release,
+    build_request, iter_options, DhcpHeader, DHCPACK, DHCPDECLINE, DHCPDISCOVER, DHCPNAK,
+    DHCPOFFER, DHCPRELEASE, DHCPREQUEST, DHCP_HDR_LEN, FLAG_BROADCAST, HTYPE_ETHERNET,
+    MAGIC_COOKIE, OPT_DHCP_MESSAGE_TYPE, OPT_DNS_SERVER, OPT_INTERFACE_MTU, OPT_LEASE_TIME,
+    OPT_PARAMETER_REQUEST_LIST, OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1, OPT_REQUESTED_IP,
+    OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK, OP_BOOT_REQUEST,
 };
 use crate::pkt_dns::{
-    encode_name, DnsHeader, FLAG_QR, FLAG_RD, FLAG_TC, RCODE_NXDOMAIN,
-    TYPE_A, TYPE_CNAME, CLASS_IN, DNS_HDR_LEN,
+    encode_name, DnsHeader, CLASS_IN, DNS_HDR_LEN, FLAG_QR, FLAG_RD, FLAG_TC, RCODE_NXDOMAIN,
+    TYPE_A, TYPE_CNAME,
 };
 use crate::resolv_conf;
 use crate::route;
@@ -399,11 +399,11 @@ fn smoke_dhcp_discover_frame_format() -> TestResult {
             OPT_PARAMETER_REQUEST_LIST => {
                 saw_prl = true;
                 prl_has_router = opt.data.contains(&OPT_ROUTER);
-                prl_has_dns    = opt.data.contains(&OPT_DNS_SERVER);
-                prl_has_lease  = opt.data.contains(&OPT_LEASE_TIME);
-                prl_has_t1     = opt.data.contains(&OPT_RENEWAL_TIME_T1);
-                prl_has_t2     = opt.data.contains(&OPT_REBINDING_TIME_T2);
-                prl_has_mtu    = opt.data.contains(&OPT_INTERFACE_MTU);
+                prl_has_dns = opt.data.contains(&OPT_DNS_SERVER);
+                prl_has_lease = opt.data.contains(&OPT_LEASE_TIME);
+                prl_has_t1 = opt.data.contains(&OPT_RENEWAL_TIME_T1);
+                prl_has_t2 = opt.data.contains(&OPT_REBINDING_TIME_T2);
+                prl_has_mtu = opt.data.contains(&OPT_INTERFACE_MTU);
             }
             _ => {}
         }
@@ -451,13 +451,13 @@ fn smoke_dhcp_offer_triggers_request_format() -> TestResult {
     const IFACE: &str = "dhcp-e2e-2";
     reset_all(IFACE);
 
-    let xid       = 0x1111_2222_u32;
-    let offered   = [192, 168, 1, 42_u8];
-    let server_id = [192, 168, 1,  1_u8];
-    let subnet    = [255, 255, 255, 0_u8];
-    let gw        = [192, 168, 1,  1_u8];
-    let dns       = [[1u8, 1, 1, 1], [8, 8, 8, 8]];
-    let lease     = 3600_u32;
+    let xid = 0x1111_2222_u32;
+    let offered = [192, 168, 1, 42_u8];
+    let server_id = [192, 168, 1, 1_u8];
+    let subnet = [255, 255, 255, 0_u8];
+    let gw = [192, 168, 1, 1_u8];
+    let dns = [[1u8, 1, 1, 1], [8, 8, 8, 8]];
+    let lease = 3600_u32;
 
     // Build and inject the OFFER.
     let offer = build_offer_bytes(xid, offered, server_id, lease, gw, &dns, subnet);
@@ -545,13 +545,13 @@ fn smoke_dhcp_ack_bound_addr_installed() -> TestResult {
     const IFACE: &str = "dhcp-e2e-3";
     reset_all(IFACE);
 
-    let xid       = 0xAAAA_BBBB_u32;
-    let offered   = [192, 168, 1, 42_u8];
-    let server_id = [192, 168, 1,  1_u8];
-    let subnet    = [255, 255, 255, 0_u8];
-    let gw        = [192, 168, 1,  1_u8];
-    let dns       = [[1u8, 1, 1, 1], [8, 8, 8, 8]];
-    let lease     = 3600_u32;
+    let xid = 0xAAAA_BBBB_u32;
+    let offered = [192, 168, 1, 42_u8];
+    let server_id = [192, 168, 1, 1_u8];
+    let subnet = [255, 255, 255, 0_u8];
+    let gw = [192, 168, 1, 1_u8];
+    let dns = [[1u8, 1, 1, 1], [8, 8, 8, 8]];
+    let lease = 3600_u32;
 
     // Inject ACK — `on_udp_in` caches it in LATEST_REPLY.
     let ack = build_ack_bytes(xid, offered, server_id, lease, gw, &dns, subnet);
@@ -607,14 +607,19 @@ fn smoke_dhcp_default_route_installed() -> TestResult {
     const IFACE: &str = "dhcp-e2e-4";
     reset_all(IFACE);
 
-    let offered   = [192, 168, 1, 42_u8];
-    let gw        = [192, 168, 1,  1_u8];
-    let subnet    = [255, 255, 255, 0_u8];
+    let offered = [192, 168, 1, 42_u8];
+    let gw = [192, 168, 1, 1_u8];
+    let subnet = [255, 255, 255, 0_u8];
     let dns_addrs = [Ipv4Addr([1, 1, 1, 1])];
 
     // Replicate what `acquire` does on success.
-    ipv4::bind_address(IFACE, Ipv4Addr(offered), Ipv4Addr(subnet),
-                        Some(Ipv4Addr(gw)), &dns_addrs);
+    ipv4::bind_address(
+        IFACE,
+        Ipv4Addr(offered),
+        Ipv4Addr(subnet),
+        Some(Ipv4Addr(gw)),
+        &dns_addrs,
+    );
     iface::add_addr(IFACE, offered, 24);
     iface::set_default_ipv4(offered, gw);
     iface::set_gateway(IFACE, gw);
@@ -622,7 +627,9 @@ fn smoke_dhcp_default_route_installed() -> TestResult {
     // route_lookup(8.8.8.8) — not in 192.168.1.0/24, so must hit default.
     let result = match route::route_lookup(Ipv4Addr([8, 8, 8, 8])) {
         Some(r) => r,
-        None => return TestResult::Fail("route_lookup(8.8.8.8) returned None — default route missing"),
+        None => {
+            return TestResult::Fail("route_lookup(8.8.8.8) returned None — default route missing")
+        }
     };
 
     if result.nexthop.0 != gw {
@@ -652,13 +659,13 @@ fn smoke_dhcp_resolv_conf_populated() -> TestResult {
     const IFACE: &str = "dhcp-e2e-5";
     reset_all(IFACE);
 
-    let xid       = 0xCCCC_DDDD_u32;
-    let offered   = [192, 168, 1, 42_u8];
-    let server_id = [192, 168, 1,  1_u8];
-    let subnet    = [255, 255, 255, 0_u8];
-    let gw        = [192, 168, 1,  1_u8];
-    let dns       = [[1u8, 1, 1, 1], [8, 8, 8, 8]];
-    let lease     = 3600_u32;
+    let xid = 0xCCCC_DDDD_u32;
+    let offered = [192, 168, 1, 42_u8];
+    let server_id = [192, 168, 1, 1_u8];
+    let subnet = [255, 255, 255, 0_u8];
+    let gw = [192, 168, 1, 1_u8];
+    let dns = [[1u8, 1, 1, 1], [8, 8, 8, 8]];
+    let lease = 3600_u32;
 
     // Inject ACK into on_udp_in.
     let ack = build_ack_bytes(xid, offered, server_id, lease, gw, &dns, subnet);
@@ -697,7 +704,7 @@ fn smoke_dhcp_nak_clears_state() -> TestResult {
     const IFACE: &str = "dhcp-e2e-6";
     reset_all(IFACE);
 
-    let xid       = 0xEEEE_FFFF_u32;
+    let xid = 0xEEEE_FFFF_u32;
     let server_id = [192, 168, 1, 1_u8];
 
     // Build and inject a NAK.
@@ -732,8 +739,15 @@ fn smoke_dhcp_nak_clears_state() -> TestResult {
     // After reset, a future `take_matching_reply` inside `acquire` finds nothing —
     // the LATEST_REPLY is None. We verify this indirectly: inject a new OFFER
     // with a different xid and confirm on_udp_in is still operational.
-    let offer2 = build_offer_bytes(0x1234, [10, 0, 0, 5], [10, 0, 0, 1],
-                                   1200, [10, 0, 0, 1], &[[8, 8, 8, 8]], [255, 255, 0, 0]);
+    let offer2 = build_offer_bytes(
+        0x1234,
+        [10, 0, 0, 5],
+        [10, 0, 0, 1],
+        1200,
+        [10, 0, 0, 1],
+        &[[8, 8, 8, 8]],
+        [255, 255, 0, 0],
+    );
     inject_dhcp_udp(&offer2);
     // Verify it was stored by checking the OFFER header fields.
     let hdr2 = DhcpHeader::decode(&offer2).unwrap();
@@ -760,9 +774,9 @@ fn smoke_dhcp_release_format() -> TestResult {
     const IFACE: &str = "dhcp-e2e-7";
     reset_all(IFACE);
 
-    let xid       = 0x7777_8888_u32;
-    let ciaddr    = [192, 168, 1, 42_u8];
-    let server_id = [192, 168, 1,  1_u8];
+    let xid = 0x7777_8888_u32;
+    let ciaddr = [192, 168, 1, 42_u8];
+    let server_id = [192, 168, 1, 1_u8];
 
     let release = build_release(xid, IFACE_MAC, ciaddr, server_id);
 
@@ -849,7 +863,11 @@ fn smoke_dhcp_timeout_link_local_fallback() -> TestResult {
     // MAC = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01].
     let mac = IFACE_MAC;
     let a = if mac[4] == 0 { 1u8 } else { mac[4] }; // 0xDD = 221
-    let b = if mac[5] == 0 || mac[5] == 255 { 1u8 } else { mac[5] }; // 0x01 = 1
+    let b = if mac[5] == 0 || mac[5] == 255 {
+        1u8
+    } else {
+        mac[5]
+    }; // 0x01 = 1
     let ll = Ipv4Addr([169, 254, a, b]);
 
     if !ll.is_link_local() {
@@ -868,7 +886,11 @@ fn smoke_dhcp_timeout_link_local_fallback() -> TestResult {
 
     // MAC with mac[5]=255 must produce b=1.
     let mac_ff = [0x02u8, 0xAA, 0xBB, 0xCC, 0x05, 0xFF];
-    let b2 = if mac_ff[5] == 0 || mac_ff[5] == 255 { 1u8 } else { mac_ff[5] };
+    let b2 = if mac_ff[5] == 0 || mac_ff[5] == 255 {
+        1u8
+    } else {
+        mac_ff[5]
+    };
     if b2 != 1 {
         return TestResult::Fail("link-local formula: mac[5]=255 should yield b=1");
     }
@@ -896,9 +918,9 @@ fn smoke_dhcp_decline_format() -> TestResult {
     const IFACE: &str = "dhcp-e2e-9";
     reset_all(IFACE);
 
-    let xid          = 0x9999_AAAA_u32;
-    let conflicting  = [192, 168, 1, 42_u8];
-    let server_id    = [192, 168, 1,  1_u8];
+    let xid = 0x9999_AAAA_u32;
+    let conflicting = [192, 168, 1, 42_u8];
+    let server_id = [192, 168, 1, 1_u8];
 
     // Seed the ARP cache so the "conflict detection" precondition is met.
     arp_cache::insert(IFACE, conflicting, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x02]);
@@ -1077,10 +1099,10 @@ fn smoke_dns_a_response_parse() -> TestResult {
     const IFACE: &str = "dhcp-e2e-11";
     reset_all(IFACE);
 
-    let qid  = 0xABCD_u16;
+    let qid = 0xABCD_u16;
     let addr = [93, 184, 216, 34_u8];
-    let ttl  = 300_u32;
-    let msg  = build_dns_a_response(qid, "example.com", addr, ttl);
+    let ttl = 300_u32;
+    let msg = build_dns_a_response(qid, "example.com", addr, ttl);
 
     let (records, min_ttl) = match dns::__parse_response_for_test(&msg, "example.com", TYPE_A) {
         Ok(r) => r,
@@ -1118,9 +1140,9 @@ fn smoke_dns_cache_hit() -> TestResult {
     const IFACE: &str = "dhcp-e2e-12";
     reset_all(IFACE);
 
-    let addr    = [93, 184, 216, 34_u8];
+    let addr = [93, 184, 216, 34_u8];
     let records = vec![RData::A(addr)];
-    let ttl_s   = 300_u32;
+    let ttl_s = 300_u32;
 
     // Insert directly into the cache.
     dns::__cache_insert_for_test("example.com", TYPE_A, records.clone(), ttl_s);
@@ -1167,11 +1189,11 @@ fn smoke_dns_cname_chain() -> TestResult {
     const IFACE: &str = "dhcp-e2e-13";
     reset_all(IFACE);
 
-    let qid      = 0xCCDD_u16;
+    let qid = 0xCCDD_u16;
     let from_name = "foo.example.com";
-    let to_name   = "bar.example.com";
-    let addr      = [5, 6, 7, 8_u8];
-    let ttl       = 120_u32;
+    let to_name = "bar.example.com";
+    let addr = [5, 6, 7, 8_u8];
+    let ttl = 120_u32;
 
     let msg = build_dns_cname_then_a(qid, from_name, to_name, addr, ttl);
 

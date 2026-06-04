@@ -150,9 +150,15 @@ pub enum TcpOption<'a> {
     Mss(u16),
     WindowScale(u8),
     SackPermitted,
-    Timestamps { tsval: u32, tsecr: u32 },
+    Timestamps {
+        tsval: u32,
+        tsecr: u32,
+    },
     /// Anything else — kind + payload bytes.
-    Other { kind: u8, data: &'a [u8] },
+    Other {
+        kind: u8,
+        data: &'a [u8],
+    },
 }
 
 /// Iterate options. Stops at end-of-list (kind 0) or when the buffer
@@ -189,7 +195,10 @@ pub fn iter_options(mut buf: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
                 tsval: u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
                 tsecr: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
             },
-            _ => TcpOption::Other { kind, data: payload },
+            _ => TcpOption::Other {
+                kind,
+                data: payload,
+            },
         };
         buf = &buf[len..];
         Some(opt)

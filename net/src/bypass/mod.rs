@@ -107,9 +107,8 @@ pub mod umem;
 pub mod xdp;
 
 pub use classifier::{
-    classify, FlowKey, Verdict,
-    attach_daemon, detach_daemon, is_daemon_attached,
-    register_flow, unregister_flow,
+    attach_daemon, classify, detach_daemon, is_daemon_attached, register_flow, unregister_flow,
+    FlowKey, Verdict,
 };
 pub use daemon_attach::{attach as daemon_attach, detach as daemon_detach, is_attached};
 pub use poll_mode::{is_poll_mode, register_driver, rx_irq_enabled, set_poll_mode, PollModeError};

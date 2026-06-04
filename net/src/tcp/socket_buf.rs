@@ -306,7 +306,8 @@ impl RecvBuf {
         let mut merged: Vec<u8> = seg.data;
         let mut survivors = Vec::with_capacity(self.out_of_order.len() + 1);
         for existing in self.out_of_order.drain(..) {
-            if segment_overlap_or_adjacent(merged_seq, merged_end, existing.seq, existing.end_seq()) {
+            if segment_overlap_or_adjacent(merged_seq, merged_end, existing.seq, existing.end_seq())
+            {
                 // Merge.
                 if seq_lt(existing.seq, merged_seq) {
                     let prepend_len = merged_seq.wrapping_sub(existing.seq) as usize;

@@ -14,9 +14,8 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::{
-    conntrack, HookPoint, L4Proto, PktCtx, Tuple, Verdict,
-    parse_tuple_ipv4, IPV4_MIN_HDR_LEN, IPV4_OFF_DST, IPV4_OFF_SRC,
-    L4_OFF_DPORT, L4_OFF_SPORT,
+    conntrack, parse_tuple_ipv4, HookPoint, L4Proto, PktCtx, Tuple, Verdict, IPV4_MIN_HDR_LEN,
+    IPV4_OFF_DST, IPV4_OFF_SRC, L4_OFF_DPORT, L4_OFF_SPORT,
 };
 
 /// First port in the NAT ephemeral range — matches Linux's default
@@ -88,7 +87,8 @@ impl Nat {
     /// Find the rule for an outbound packet, if any.
     pub fn lookup_rule(&self, iface_out: &str, src_ip: [u8; 4]) -> Option<MasqRule> {
         let rules = self.rules.lock();
-        rules.iter()
+        rules
+            .iter()
             .find(|r| r.iface == iface_out && r.matches(src_ip))
             .cloned()
     }
@@ -97,12 +97,7 @@ impl Nat {
     /// next-port cursor; the first slot that isn't currently mapped
     /// wins. Returns `None` if every port in the range is in use
     /// (catastrophic — port pressure).
-    fn allocate_port(
-        &self,
-        iface_ip: [u8; 4],
-        proto: u8,
-        original_port: u16,
-    ) -> Option<u16> {
+    fn allocate_port(&self, iface_ip: [u8; 4], proto: u8, original_port: u16) -> Option<u16> {
         let map = self.egress_map.lock();
         // First, try `original_port` itself (preserve when possible).
         if !map.contains_key(&(iface_ip, original_port, proto)) {
@@ -112,8 +107,8 @@ impl Nat {
         let span = (NAT_PORT_RANGE_HI - NAT_PORT_RANGE_LO + 1) as u32;
         let start = self.next_port.load(Ordering::Acquire);
         for i in 0..span {
-            let p = NAT_PORT_RANGE_LO
-                + ((start as u32 - NAT_PORT_RANGE_LO as u32 + i) % span) as u16;
+            let p =
+                NAT_PORT_RANGE_LO + ((start as u32 - NAT_PORT_RANGE_LO as u32 + i) % span) as u16;
             let map = self.egress_map.lock();
             if !map.contains_key(&(iface_ip, p, proto)) {
                 drop(map);
@@ -134,10 +129,9 @@ impl Nat {
         orig_port: u16,
         proto: u8,
     ) {
-        self.egress_map.lock().insert(
-            (iface_ip, nat_port, proto),
-            (orig_src, orig_port),
-        );
+        self.egress_map
+            .lock()
+            .insert((iface_ip, nat_port, proto), (orig_src, orig_port));
         self.by_ct.lock().insert(ct_id, (iface_ip, nat_port));
     }
 
@@ -154,7 +148,10 @@ impl Nat {
         dst_port: u16,
         proto: u8,
     ) -> Option<([u8; 4], u16)> {
-        self.egress_map.lock().get(&(dst_ip, dst_port, proto)).copied()
+        self.egress_map
+            .lock()
+            .get(&(dst_ip, dst_port, proto))
+            .copied()
     }
 
     /// Wipe NAT state. Test-only.
@@ -210,7 +207,7 @@ pub fn __reset_for_test() {
 
 fn csum_incremental(old_csum: u16, old_word: u16, new_word: u16) -> u16 {
     let hc = !old_csum as u32;
-    let m  = !old_word as u32;
+    let m = !old_word as u32;
     let mp = new_word as u32;
     let sum = hc + m + mp;
     let mut folded = (sum & 0xFFFF) + (sum >> 16);
@@ -220,8 +217,12 @@ fn csum_incremental(old_csum: u16, old_word: u16, new_word: u16) -> u16 {
 
 /// Update IP src/dst + L4 checksums after rewriting `src_ip`.
 fn rewrite_src_ip(packet: &mut [u8], new_src: [u8; 4]) {
-    let old = [packet[IPV4_OFF_SRC], packet[IPV4_OFF_SRC + 1],
-               packet[IPV4_OFF_SRC + 2], packet[IPV4_OFF_SRC + 3]];
+    let old = [
+        packet[IPV4_OFF_SRC],
+        packet[IPV4_OFF_SRC + 1],
+        packet[IPV4_OFF_SRC + 2],
+        packet[IPV4_OFF_SRC + 3],
+    ];
     packet[IPV4_OFF_SRC..IPV4_OFF_SRC + 4].copy_from_slice(&new_src);
 
     // IP header checksum (offset 10–11). Update in-place — two
@@ -244,8 +245,8 @@ fn rewrite_src_ip(packet: &mut [u8], new_src: [u8; 4]) {
     let proto = packet[9];
     let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
     let (csum_off, applies) = match L4Proto::from_u8(proto) {
-        L4Proto::Tcp  => (16, l4.len() >= 18),
-        L4Proto::Udp  => (6, l4.len() >= 8),
+        L4Proto::Tcp => (16, l4.len() >= 18),
+        L4Proto::Udp => (6, l4.len() >= 8),
         _ => (0, false),
     };
     if applies {
@@ -269,8 +270,12 @@ fn rewrite_src_ip(packet: &mut [u8], new_src: [u8; 4]) {
 
 /// Update IP dst + L4 checksums after rewriting `dst_ip`.
 fn rewrite_dst_ip(packet: &mut [u8], new_dst: [u8; 4]) {
-    let old = [packet[IPV4_OFF_DST], packet[IPV4_OFF_DST + 1],
-               packet[IPV4_OFF_DST + 2], packet[IPV4_OFF_DST + 3]];
+    let old = [
+        packet[IPV4_OFF_DST],
+        packet[IPV4_OFF_DST + 1],
+        packet[IPV4_OFF_DST + 2],
+        packet[IPV4_OFF_DST + 3],
+    ];
     packet[IPV4_OFF_DST..IPV4_OFF_DST + 4].copy_from_slice(&new_dst);
 
     let ip_csum = u16::from_be_bytes([packet[10], packet[11]]);
@@ -289,8 +294,8 @@ fn rewrite_dst_ip(packet: &mut [u8], new_dst: [u8; 4]) {
     let proto = packet[9];
     let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
     let (csum_off, applies) = match L4Proto::from_u8(proto) {
-        L4Proto::Tcp  => (16, l4.len() >= 18),
-        L4Proto::Udp  => (6, l4.len() >= 8),
+        L4Proto::Tcp => (16, l4.len() >= 18),
+        L4Proto::Udp => (6, l4.len() >= 8),
         _ => (0, false),
     };
     if applies {
@@ -315,12 +320,14 @@ fn rewrite_dst_ip(packet: &mut [u8], new_dst: [u8; 4]) {
 fn rewrite_src_port(packet: &mut [u8], new_port: u16) {
     let proto = packet[9];
     let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
-    if l4.len() < 4 { return; }
+    if l4.len() < 4 {
+        return;
+    }
     let old = u16::from_be_bytes([l4[L4_OFF_SPORT], l4[L4_OFF_SPORT + 1]]);
     l4[L4_OFF_SPORT..L4_OFF_SPORT + 2].copy_from_slice(&new_port.to_be_bytes());
     let (csum_off, applies) = match L4Proto::from_u8(proto) {
-        L4Proto::Tcp  => (16, l4.len() >= 18),
-        L4Proto::Udp  => (6, l4.len() >= 8),
+        L4Proto::Tcp => (16, l4.len() >= 18),
+        L4Proto::Udp => (6, l4.len() >= 8),
         _ => (0, false),
     };
     if applies {
@@ -336,12 +343,14 @@ fn rewrite_src_port(packet: &mut [u8], new_port: u16) {
 fn rewrite_dst_port(packet: &mut [u8], new_port: u16) {
     let proto = packet[9];
     let l4 = &mut packet[IPV4_MIN_HDR_LEN..];
-    if l4.len() < 4 { return; }
+    if l4.len() < 4 {
+        return;
+    }
     let old = u16::from_be_bytes([l4[L4_OFF_DPORT], l4[L4_OFF_DPORT + 1]]);
     l4[L4_OFF_DPORT..L4_OFF_DPORT + 2].copy_from_slice(&new_port.to_be_bytes());
     let (csum_off, applies) = match L4Proto::from_u8(proto) {
-        L4Proto::Tcp  => (16, l4.len() >= 18),
-        L4Proto::Udp  => (6, l4.len() >= 8),
+        L4Proto::Tcp => (16, l4.len() >= 18),
+        L4Proto::Udp => (6, l4.len() >= 8),
         _ => (0, false),
     };
     if applies {
@@ -372,7 +381,9 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
     // Find / create conntrack entry.
     let ct = conntrack::ct();
     let now = narf_scheduler::narf_time::monotonic_ns();
-    let entry = ct.lookup(&tuple).unwrap_or_else(|| ct.insert_new(tuple, now));
+    let entry = ct
+        .lookup(&tuple)
+        .unwrap_or_else(|| ct.insert_new(tuple, now));
     let id = entry.lock().id;
     ctx.conntrack_id = Some(id);
 
@@ -388,7 +399,14 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
         Some(p) => p,
         None => return Verdict::Drop, // port pressure
     };
-    NAT.insert_mapping(id, rule.iface_ip, nat_port, tuple.src_ip, tuple.src_port, tuple.proto);
+    NAT.insert_mapping(
+        id,
+        rule.iface_ip,
+        nat_port,
+        tuple.src_ip,
+        tuple.src_port,
+        tuple.proto,
+    );
 
     // Update conntrack's reply tuple so the ingress lookup finds this flow.
     let new_reply = Tuple {
@@ -418,7 +436,9 @@ pub fn dnat_prerouting(ctx: &mut PktCtx<'_>) -> Verdict {
         Some(t) => t,
         None => return Verdict::Accept,
     };
-    if let Some((orig_ip, orig_port)) = NAT.lookup_ingress(tuple.dst_ip, tuple.dst_port, tuple.proto) {
+    if let Some((orig_ip, orig_port)) =
+        NAT.lookup_ingress(tuple.dst_ip, tuple.dst_port, tuple.proto)
+    {
         rewrite_dst_ip(ctx.packet, orig_ip);
         rewrite_dst_port(ctx.packet, orig_port);
     }
@@ -431,6 +451,6 @@ pub fn dnat_prerouting(ctx: &mut PktCtx<'_>) -> Verdict {
 /// `NF_IP_PRI_NAT_SRC` in Linux
 /// `include/uapi/linux/netfilter_ipv4.h:54-55`.
 pub fn register_default_hooks() {
-    super::nf_register_hook(HookPoint::PreRouting,  100, dnat_prerouting);
+    super::nf_register_hook(HookPoint::PreRouting, 100, dnat_prerouting);
     super::nf_register_hook(HookPoint::PostRouting, 100, snat_postrouting);
 }

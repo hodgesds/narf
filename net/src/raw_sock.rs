@@ -125,9 +125,7 @@ pub fn raw_packet_open(protocol: u16, ifindex: u32) -> Arc<RawPacketSocket> {
 
 /// Close a raw packet socket.
 pub fn raw_packet_close(sock: &Arc<RawPacketSocket>) {
-    RAW_PKT_SOCKETS
-        .lock()
-        .retain(|s| !Arc::ptr_eq(s, sock));
+    RAW_PKT_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
 }
 
 /// Receive the next frame from a raw packet socket.
@@ -148,7 +146,9 @@ pub fn raw_packet_set_depth(sock: &Arc<RawPacketSocket>, depth: usize) {
     let ptr = sock.as_ref() as *const RawPacketSocket as *mut RawPacketSocket;
     // SAFETY: We hold the only lock that serialises queue writes; this
     // field is only mutated here and read under the same lock path.
-    unsafe { (*ptr).max_depth = depth; }
+    unsafe {
+        (*ptr).max_depth = depth;
+    }
     drop(q);
 }
 
@@ -202,7 +202,7 @@ fn smoke_raw_eth_p_all_receives_all_frames() -> TestResult {
 
     // Build a minimal 14-byte ARP-shaped frame (ethertype=0x0806).
     let mut frame = [0u8; 60];
-    frame[0..6].copy_from_slice(&[0xFF; 6]);               // dst MAC
+    frame[0..6].copy_from_slice(&[0xFF; 6]); // dst MAC
     frame[6..12].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]); // src MAC
     frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // ARP ethertype
 

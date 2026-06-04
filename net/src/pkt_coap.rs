@@ -231,7 +231,11 @@ pub fn append_option(out: &mut Vec<u8>, last_number: &mut u32, opt: &CoapOption)
     let mut extended_delta = Vec::new();
     let mut extended_length = Vec::new();
     encode_extended(&mut extended_delta, &mut delta_nibble, delta);
-    encode_extended(&mut extended_length, &mut length_nibble, opt.value.len() as u32);
+    encode_extended(
+        &mut extended_length,
+        &mut length_nibble,
+        opt.value.len() as u32,
+    );
     out.push((delta_nibble << 4) | length_nibble);
     out.extend_from_slice(&extended_delta);
     out.extend_from_slice(&extended_length);
@@ -269,11 +273,7 @@ pub fn parse_options_and_payload(buf: &[u8]) -> Result<(Vec<CoapOption>, &[u8], 
 // ── Convenience ───────────────────────────────────────────────────
 
 /// Build a complete CoAP UDP message: header + options + (payload).
-pub fn build_message(
-    header: &Header,
-    options: &[CoapOption],
-    payload: Option<&[u8]>,
-) -> Vec<u8> {
+pub fn build_message(header: &Header, options: &[CoapOption], payload: Option<&[u8]>) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + options.len() * 4);
     header.encode_into(&mut out);
     let mut last_number = 0u32;

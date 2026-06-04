@@ -194,10 +194,8 @@ impl ResolvConfig {
     pub fn update_from_dhcp(&mut self, servers: &[[u8; 4]], search_domain: &str) {
         self.nameservers.clear();
         for s in servers.iter().take(3) {
-            self.nameservers.push(alloc::format!(
-                "{}.{}.{}.{}",
-                s[0], s[1], s[2], s[3]
-            ));
+            self.nameservers
+                .push(alloc::format!("{}.{}.{}.{}", s[0], s[1], s[2], s[3]));
         }
         if !search_domain.is_empty() {
             self.search.clear();
@@ -210,16 +208,15 @@ impl ResolvConfig {
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-static LIVE_CONFIG: IrqSafeSpinLock<ResolvConfig> =
-    IrqSafeSpinLock::new(ResolvConfig {
-        nameservers: Vec::new(),
-        search: Vec::new(),
-        ndots: 1,
-        timeout: 5,
-        attempts: 2,
-        rotate: false,
-        no_check_names: false,
-    });
+static LIVE_CONFIG: IrqSafeSpinLock<ResolvConfig> = IrqSafeSpinLock::new(ResolvConfig {
+    nameservers: Vec::new(),
+    search: Vec::new(),
+    ndots: 1,
+    timeout: 5,
+    attempts: 2,
+    rotate: false,
+    no_check_names: false,
+});
 
 /// Install a new live config. Called on boot after reading
 /// `/etc/resolv.conf` (or after a DHCP ACK populates it).

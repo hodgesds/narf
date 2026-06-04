@@ -121,17 +121,11 @@ fn multicast_mac(addr: &[u8; 16]) -> [u8; 6] {
 }
 
 /// All-routers multicast: FF02::2
-const ALL_ROUTERS: [u8; 16] = [
-    0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
-];
+const ALL_ROUTERS: [u8; 16] = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
 /// All-nodes multicast: FF02::1
-const ALL_NODES: [u8; 16] = [
-    0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-];
+const ALL_NODES: [u8; 16] = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
 /// All-DHCPv6 servers + relay agents: FF02::1:2
-const ALL_DHCP_RELAY: [u8; 16] = [
-    0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x02, 0, 0,
-];
+const ALL_DHCP_RELAY: [u8; 16] = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x02, 0, 0];
 
 /// Build a minimal Router Advertisement body (no options, just header).
 fn build_ra_body(mo_flags: u8, lifetime_s: u16) -> Vec<u8> {
@@ -444,9 +438,7 @@ fn smoke_v6_ra_default_route_installed() -> TestResult {
     reset_v6(IFACE, MAC);
 
     // fe80::1 (source of RA).
-    let router: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    let router: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
 
     let ra_body = build_ra_body(0, 1800);
     let _info = ndp::on_ra(IFACE, router, &ra_body, 0);
@@ -493,9 +485,7 @@ fn smoke_v6_ra_pio_slaac_global_addr() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let prefix: [u8; 16] = [
-        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
+    let prefix: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let pio = ndp::RaPrefix {
         prefix,
         prefix_len: 64,
@@ -581,9 +571,7 @@ fn smoke_v6_ra_rdnss_updates_resolv_conf() -> TestResult {
 
     let ra_body = build_ra_with_rdnss(3600, &[ns1, ns2]);
 
-    let router: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    let router: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
     let info = match ndp::on_ra(IFACE, router, &ra_body, 0) {
         Some(i) => i,
         None => return TestResult::Fail("on_ra returned None for valid RA body"),
@@ -610,10 +598,22 @@ fn smoke_v6_ra_rdnss_updates_resolv_conf() -> TestResult {
         let s = alloc::format!(
             "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:\
              {:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-            addr[0], addr[1], addr[2], addr[3],
-            addr[4], addr[5], addr[6], addr[7],
-            addr[8], addr[9], addr[10], addr[11],
-            addr[12], addr[13], addr[14], addr[15],
+            addr[0],
+            addr[1],
+            addr[2],
+            addr[3],
+            addr[4],
+            addr[5],
+            addr[6],
+            addr[7],
+            addr[8],
+            addr[9],
+            addr[10],
+            addr[11],
+            addr[12],
+            addr[13],
+            addr[14],
+            addr[15],
         );
         if cfg.nameservers.len() < 3 {
             cfg.nameservers.push(s);
@@ -646,9 +646,7 @@ fn smoke_v6_ra_m1_triggers_dhcpv6_solicit() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let router: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    let router: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
 
     // RA with M=1 flag.
     let ra_body = build_ra_body(RA_FLAG_MANAGED, 1800);
@@ -709,9 +707,7 @@ fn smoke_v6_ra_o1_stateless_dhcpv6() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let router: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    let router: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
 
     // RA with O=1 (and M=0).
     let ra_body = build_ra_body(RA_FLAG_OTHER_CONFIG, 1800);
@@ -731,8 +727,8 @@ fn smoke_v6_ra_o1_stateless_dhcpv6() -> TestResult {
     // INFORMATION-REQUEST msg_type = 11.
     // For stateless DHCPv6 we don't need an IA_NA — just client-id + oro.
     use crate::pkt_dhcpv6::{
-        append_clientid_duid_ll, append_elapsed_time, append_oro, DhcpV6Header,
-        OPT_DNS_SERVERS, OPT_DOMAIN_LIST,
+        append_clientid_duid_ll, append_elapsed_time, append_oro, DhcpV6Header, OPT_DNS_SERVERS,
+        OPT_DOMAIN_LIST,
     };
     let mut info_req: Vec<u8> = Vec::with_capacity(64);
     let hdr = DhcpV6Header {
@@ -807,10 +803,14 @@ fn smoke_v6_ns_for_our_addr_triggers_na() -> TestResult {
             }
         }
         ndp::NdRxResult::DadConflict(_) => {
-            return TestResult::Fail("on_ns returned DadConflict for Preferred addr (should send NA)");
+            return TestResult::Fail(
+                "on_ns returned DadConflict for Preferred addr (should send NA)",
+            );
         }
         _ => {
-            return TestResult::Fail("on_ns did not return SendBody for NS targeting our Preferred addr");
+            return TestResult::Fail(
+                "on_ns did not return SendBody for NS targeting our Preferred addr",
+            );
         }
     }
 
@@ -832,9 +832,7 @@ fn smoke_v6_na_updates_neighbor_cache() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let peer_ip: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    let peer_ip: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
     let peer_mac: [u8; 6] = [0x02, 0xAB, 0xCD, 0xEF, 0x00, 0x01];
 
     // Pre-insert an Incomplete entry (as if we had sent an NS and are waiting).
@@ -867,7 +865,10 @@ fn smoke_v6_na_updates_neighbor_cache() -> TestResult {
     }
 
     let neigh_list = ndp::neigh_list();
-    let entry = match neigh_list.iter().find(|e| e.ip == peer_ip && e.iface == IFACE) {
+    let entry = match neigh_list
+        .iter()
+        .find(|e| e.ip == peer_ip && e.iface == IFACE)
+    {
         Some(e) => e,
         None => return TestResult::Fail("neighbor entry not found in list"),
     };
@@ -893,9 +894,7 @@ fn smoke_v6_neigh_reachable_to_stale() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let peer_ip: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
-    ];
+    let peer_ip: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
     let peer_mac: [u8; 6] = [0x02, 0xBB, 0xCC, 0xDD, 0x00, 0x01];
 
     // Insert a Reachable entry with a deadline of 1 ns (already past).
@@ -912,7 +911,10 @@ fn smoke_v6_neigh_reachable_to_stale() -> TestResult {
     ndp::age_tick(2);
 
     let neigh_list = ndp::neigh_list();
-    let entry = match neigh_list.iter().find(|e| e.ip == peer_ip && e.iface == IFACE) {
+    let entry = match neigh_list
+        .iter()
+        .find(|e| e.ip == peer_ip && e.iface == IFACE)
+    {
         Some(e) => e,
         None => return TestResult::Fail("neighbor entry vanished after age_tick"),
     };
@@ -938,9 +940,7 @@ fn smoke_v6_neigh_stale_delay_probe() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let peer_ip: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03,
-    ];
+    let peer_ip: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03];
     let peer_mac: [u8; 6] = [0x02, 0xCC, 0xDD, 0xEE, 0x00, 0x01];
 
     // Insert Stale.
@@ -975,7 +975,10 @@ fn smoke_v6_neigh_stale_delay_probe() -> TestResult {
     ndp::age_tick(2);
 
     let neigh_list = ndp::neigh_list();
-    let entry = match neigh_list.iter().find(|e| e.ip == peer_ip && e.iface == IFACE) {
+    let entry = match neigh_list
+        .iter()
+        .find(|e| e.ip == peer_ip && e.iface == IFACE)
+    {
         Some(e) => e,
         None => return TestResult::Fail("neighbor entry vanished after age_tick"),
     };
@@ -1089,9 +1092,7 @@ kernel_test_in!("net/ipv6_e2e", smoke_v6_ping6_echo_loopback);
 fn smoke_v6_mld_report_on_group_join() -> TestResult {
     const _IFACE: &str = "v6e2e-16";
 
-    let group: [u8; 16] = [
-        0xFF, 0x0E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xCA, 0xFE,
-    ];
+    let group: [u8; 16] = [0xFF, 0x0E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xCA, 0xFE];
 
     let report = mld::build_join_report(group);
 
@@ -1143,9 +1144,7 @@ fn smoke_v6_proc_if_inet6_reflects_slaac() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let prefix: [u8; 16] = [
-        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
+    let prefix: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let pio = ndp::RaPrefix {
         prefix,
         prefix_len: 64,
@@ -1189,7 +1188,10 @@ fn smoke_v6_proc_if_inet6_reflects_slaac() -> TestResult {
     }
 
     // Verify the 32-hex-addr format would round-trip correctly.
-    let hex_addr: String = expected.iter().map(|b| alloc::format!("{:02x}", b)).collect();
+    let hex_addr: String = expected
+        .iter()
+        .map(|b| alloc::format!("{:02x}", b))
+        .collect();
     if hex_addr.len() != 32 {
         return TestResult::Fail("32-hex-addr formatting is wrong length");
     }
@@ -1212,9 +1214,7 @@ fn smoke_v6_proc_ipv6_route_reflects_default_route() -> TestResult {
 
     reset_v6(IFACE, MAC);
 
-    let router: [u8; 16] = [
-        0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-    ];
+    let router: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
     let ra_body = build_ra_body(0, 1800);
     ndp::on_ra(IFACE, router, &ra_body, 0);
 
@@ -1231,7 +1231,9 @@ fn smoke_v6_proc_ipv6_route_reflects_default_route() -> TestResult {
             }
             // RTF_GATEWAY flag (0x0002) must be set.
             if r.flags & 0x0002 == 0 {
-                return TestResult::Fail("/proc/net/ipv6_route: RTF_GATEWAY not set on default route");
+                return TestResult::Fail(
+                    "/proc/net/ipv6_route: RTF_GATEWAY not set on default route",
+                );
             }
             // RTF_UP (0x0001) must be set.
             if r.flags & 0x0001 == 0 {
@@ -1242,4 +1244,7 @@ fn smoke_v6_proc_ipv6_route_reflects_default_route() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("net/ipv6_e2e", smoke_v6_proc_ipv6_route_reflects_default_route);
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_proc_ipv6_route_reflects_default_route
+);

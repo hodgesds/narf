@@ -49,7 +49,7 @@ use narf_scheduler::narf_time;
 use crate::iface;
 use crate::ipv4::{bind_address, Ipv4Addr};
 use crate::pkt::{
-    self, set_ipv4_checksum, write_eth_header, write_ipv4_header, ETH_HDR_LEN, ETHERTYPE_IPV4,
+    self, set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
     IPV4_HDR_LEN, IP_PROTO_UDP,
 };
 use crate::pkt_dhcp::{
@@ -117,13 +117,7 @@ fn next_xid() -> u32 {
 /// Called from `tcp_stack::handle_ipv4` when a UDP datagram with
 /// `dst_port == 68` arrives. Parses the DHCP payload and caches it
 /// for `acquire` to pick up.
-pub fn on_udp_in(
-    _src_ip: [u8; 4],
-    _dst_ip: [u8; 4],
-    src_port: u16,
-    dst_port: u16,
-    payload: &[u8],
-) {
+pub fn on_udp_in(_src_ip: [u8; 4], _dst_ip: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) {
     if src_port != DHCP_SERVER_PORT || dst_port != DHCP_CLIENT_PORT {
         return;
     }
@@ -148,12 +142,8 @@ pub fn on_udp_in(
             OPT_SUBNET_MASK if opt.data.len() == 4 => netmask.copy_from_slice(opt.data),
             OPT_ROUTER if opt.data.len() >= 4 => gateway.copy_from_slice(&opt.data[..4]),
             OPT_LEASE_TIME if opt.data.len() == 4 => {
-                lease_secs = u32::from_be_bytes([
-                    opt.data[0],
-                    opt.data[1],
-                    opt.data[2],
-                    opt.data[3],
-                ]);
+                lease_secs =
+                    u32::from_be_bytes([opt.data[0], opt.data[1], opt.data[2], opt.data[3]]);
             }
             // RFC 2132 §3.8 option 6: DNS server(s). Each address is 4
             // bytes; parse up to 3 addresses.
@@ -318,8 +308,7 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
 // We stash the DNS array here (populated from the ACK's option 6)
 // so `dhcp_acquire` can read it after `acquire` returns.
 
-static LATEST_DNS: IrqSafeSpinLock<([[u8; 4]; 3], u8)> =
-    IrqSafeSpinLock::new(([[0u8; 4]; 3], 0));
+static LATEST_DNS: IrqSafeSpinLock<([[u8; 4]; 3], u8)> = IrqSafeSpinLock::new(([[0u8; 4]; 3], 0));
 
 // ── Public API ────────────────────────────────────────────────────
 

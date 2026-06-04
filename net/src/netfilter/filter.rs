@@ -17,10 +17,8 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::{
-    conntrack, HookPoint, PktCtx, Verdict, parse_tuple_ipv4,
-};
 use super::rules::{Chain, Match, Rule, Table};
+use super::{conntrack, parse_tuple_ipv4, HookPoint, PktCtx, Verdict};
 
 /// Builtin filter table — the single global rule store. Stage-3 only
 /// implements one table; nftables-style multi-table support is a
@@ -32,7 +30,9 @@ pub struct Filter {
 
 impl Filter {
     pub const fn new() -> Self {
-        Self { inner: IrqSafeSpinLock::new(Vec::new()) }
+        Self {
+            inner: IrqSafeSpinLock::new(Vec::new()),
+        }
     }
 
     /// Get-or-create a table.
@@ -142,19 +142,29 @@ fn filter_for(hook: HookPoint, ctx: &mut PktCtx<'_>) -> Verdict {
     Verdict::Accept
 }
 
-pub fn filter_prerouting(ctx: &mut PktCtx<'_>)  -> Verdict { filter_for(HookPoint::PreRouting,  ctx) }
-pub fn filter_input(ctx: &mut PktCtx<'_>)       -> Verdict { filter_for(HookPoint::LocalIn,     ctx) }
-pub fn filter_forward(ctx: &mut PktCtx<'_>)     -> Verdict { filter_for(HookPoint::Forward,     ctx) }
-pub fn filter_output(ctx: &mut PktCtx<'_>)      -> Verdict { filter_for(HookPoint::LocalOut,    ctx) }
-pub fn filter_postrouting(ctx: &mut PktCtx<'_>) -> Verdict { filter_for(HookPoint::PostRouting, ctx) }
+pub fn filter_prerouting(ctx: &mut PktCtx<'_>) -> Verdict {
+    filter_for(HookPoint::PreRouting, ctx)
+}
+pub fn filter_input(ctx: &mut PktCtx<'_>) -> Verdict {
+    filter_for(HookPoint::LocalIn, ctx)
+}
+pub fn filter_forward(ctx: &mut PktCtx<'_>) -> Verdict {
+    filter_for(HookPoint::Forward, ctx)
+}
+pub fn filter_output(ctx: &mut PktCtx<'_>) -> Verdict {
+    filter_for(HookPoint::LocalOut, ctx)
+}
+pub fn filter_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
+    filter_for(HookPoint::PostRouting, ctx)
+}
 
 /// Register the filter hooks at priority `0` (sits between conntrack
 /// `-200` and NAT `+100`).
 pub fn register_default_hooks() {
-    super::nf_register_hook(HookPoint::PreRouting,  0, filter_prerouting);
-    super::nf_register_hook(HookPoint::LocalIn,     0, filter_input);
-    super::nf_register_hook(HookPoint::Forward,     0, filter_forward);
-    super::nf_register_hook(HookPoint::LocalOut,    0, filter_output);
+    super::nf_register_hook(HookPoint::PreRouting, 0, filter_prerouting);
+    super::nf_register_hook(HookPoint::LocalIn, 0, filter_input);
+    super::nf_register_hook(HookPoint::Forward, 0, filter_forward);
+    super::nf_register_hook(HookPoint::LocalOut, 0, filter_output);
     super::nf_register_hook(HookPoint::PostRouting, 0, filter_postrouting);
 }
 

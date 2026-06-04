@@ -24,7 +24,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::pkt_dns::{decode_name, DnsHeader, DnsError, FLAG_AA, FLAG_QR};
+use crate::pkt_dns::{decode_name, DnsError, DnsHeader, FLAG_AA, FLAG_QR};
 
 /// Standard mDNS UDP port.
 pub const MDNS_PORT: u16 = 5353;
@@ -33,9 +33,7 @@ pub const MDNS_PORT: u16 = 5353;
 pub const MDNS_IPV4_GROUP: [u8; 4] = [224, 0, 0, 251];
 
 /// IPv6 multicast address `FF02::FB` for mDNS.
-pub const MDNS_IPV6_GROUP: [u8; 16] = [
-    0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFB,
-];
+pub const MDNS_IPV6_GROUP: [u8; 16] = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFB];
 
 /// Top bit of QCLASS — request unicast response (RFC 6762 §18.12).
 pub const QCLASS_UNICAST_RESPONSE_BIT: u16 = 1 << 15;

@@ -47,8 +47,7 @@ pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 
 // ── ARP legacy cache (kept for compat with non-TCP callers) ─────
 
-static ARP_CACHE: IrqSafeSpinLock<Option<BTreeMap<[u8; 4], [u8; 6]>>> =
-    IrqSafeSpinLock::new(None);
+static ARP_CACHE: IrqSafeSpinLock<Option<BTreeMap<[u8; 4], [u8; 6]>>> = IrqSafeSpinLock::new(None);
 
 fn arp_lookup_local(ip: [u8; 4]) -> Option<[u8; 6]> {
     let g = ARP_CACHE.lock();
@@ -75,8 +74,7 @@ pub fn __arp_insert_legacy(ip: [u8; 4], mac: [u8; 6]) {
 pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {
     let iface = iface::for_dst(target_ip).ok_or(())?;
     let mut frame = [0u8; 60];
-    let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip)
-        .ok_or(())?;
+    let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip).ok_or(())?;
     (iface.send)(&frame[..n])
 }
 
@@ -194,7 +192,9 @@ fn handle_ipv4(body: &[u8]) {
     {
         let mut ctx = crate::netfilter::PktCtx::new_ipv4(
             crate::netfilter::HookPoint::PreRouting,
-            "", "", &mut scratch,
+            "",
+            "",
+            &mut scratch,
         );
         if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
             return;
@@ -203,7 +203,9 @@ fn handle_ipv4(body: &[u8]) {
     {
         let mut ctx = crate::netfilter::PktCtx::new_ipv4(
             crate::netfilter::HookPoint::LocalIn,
-            "", "", &mut scratch,
+            "",
+            "",
+            &mut scratch,
         );
         if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
             return;
@@ -306,14 +308,13 @@ pub const TCP_MTU: usize = 1500;
 ///
 /// Matches the Linux outbound flow `__ip_local_out()` →
 /// `ip_output()` in `net/ipv4/ip_output.c`.
-pub fn nf_tx_filter(
-    iface_out: &str,
-    ipv4_packet: &mut [u8],
-) -> crate::netfilter::Verdict {
+pub fn nf_tx_filter(iface_out: &str, ipv4_packet: &mut [u8]) -> crate::netfilter::Verdict {
     {
         let mut ctx = crate::netfilter::PktCtx::new_ipv4(
             crate::netfilter::HookPoint::LocalOut,
-            "", iface_out, ipv4_packet,
+            "",
+            iface_out,
+            ipv4_packet,
         );
         let v = crate::netfilter::nf_dispatch(&mut ctx);
         if v != crate::netfilter::Verdict::Accept {
@@ -322,7 +323,9 @@ pub fn nf_tx_filter(
     }
     let mut ctx = crate::netfilter::PktCtx::new_ipv4(
         crate::netfilter::HookPoint::PostRouting,
-        "", iface_out, ipv4_packet,
+        "",
+        iface_out,
+        ipv4_packet,
     );
     crate::netfilter::nf_dispatch(&mut ctx)
 }

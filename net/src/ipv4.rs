@@ -40,7 +40,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::arp;
 use crate::iface;
 use crate::pkt::{
-    set_ipv4_checksum, write_eth_header, write_ipv4_header, ETH_HDR_LEN, ETHERTYPE_IPV4,
+    set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
     IPV4_HDR_LEN,
 };
 
@@ -114,9 +114,9 @@ pub enum IpProto {
 impl IpProto {
     pub fn to_u8(self) -> u8 {
         match self {
-            IpProto::Icmp  => 1,
-            IpProto::Tcp   => 6,
-            IpProto::Udp   => 17,
+            IpProto::Icmp => 1,
+            IpProto::Tcp => 6,
+            IpProto::Udp => 17,
             IpProto::Raw(n) => n,
         }
     }
@@ -187,7 +187,11 @@ pub fn bind_address(
 /// Look up the binding for `iface_name`. Returns a clone so the lock
 /// is not held during slow operations (ARP resolution).
 pub fn lookup_binding(iface_name: &str) -> Option<Binding> {
-    BINDINGS.lock().iter().find(|b| b.iface_name == iface_name).cloned()
+    BINDINGS
+        .lock()
+        .iter()
+        .find(|b| b.iface_name == iface_name)
+        .cloned()
 }
 
 // ── ipv4_send ──────────────────────────────────────────────────────
@@ -228,8 +232,7 @@ pub fn ipv4_send(
     let dst_raw = dst.to_u32();
     let mask_raw = binding.netmask.to_u32();
     let addr_raw = binding.addr.to_u32();
-    let nexthop_ip = if dst == Ipv4Addr::BROADCAST
-        || (dst_raw & mask_raw) == (addr_raw & mask_raw)
+    let nexthop_ip = if dst == Ipv4Addr::BROADCAST || (dst_raw & mask_raw) == (addr_raw & mask_raw)
     {
         dst
     } else {
@@ -237,13 +240,10 @@ pub fn ipv4_send(
     };
 
     // Resolve next-hop to MAC. Broadcast maps directly.
-    let dst_mac: [u8; 6] = if dst == Ipv4Addr::BROADCAST
-        || nexthop_ip == Ipv4Addr::BROADCAST
-    {
+    let dst_mac: [u8; 6] = if dst == Ipv4Addr::BROADCAST || nexthop_ip == Ipv4Addr::BROADCAST {
         [0xFF; 6]
     } else {
-        arp::resolve_blocking(iface_name, nexthop_ip.0, 1000)
-            .map_err(|_| SendError::ArpTimeout)?
+        arp::resolve_blocking(iface_name, nexthop_ip.0, 1000).map_err(|_| SendError::ArpTimeout)?
     };
 
     // Build the frame on the stack.

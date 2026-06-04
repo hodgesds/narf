@@ -227,20 +227,12 @@ pub fn set_iface_ipv4(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
 /// Add an IPv4 address (with CIDR prefix length) to the named interface.
 /// Automatically installs a connected subnet route. Idempotent.
 pub fn add_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
-    crate::ifaddr::iface_add_addr(
-        iface_name,
-        crate::ipv4::Ipv4Addr(addr),
-        prefix_len,
-    );
+    crate::ifaddr::iface_add_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
 }
 
 /// Remove an IPv4 address from the named interface.
 pub fn del_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
-    crate::ifaddr::iface_del_addr(
-        iface_name,
-        crate::ipv4::Ipv4Addr(addr),
-        prefix_len,
-    );
+    crate::ifaddr::iface_del_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
 }
 
 /// Return all IPv4 addresses assigned to the named interface as a
@@ -256,18 +248,18 @@ pub fn get_addrs(iface_name: &str) -> alloc::vec::Vec<(crate::ipv4::Ipv4Addr, u8
 /// gateway). Called by boot-time static config or DHCP ACK.
 pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
     use crate::ipv4::Ipv4Addr;
-    use crate::route::{Route, Scope, TABLE_MAIN, Ipv4Net};
+    use crate::route::{Ipv4Net, Route, Scope, TABLE_MAIN};
     crate::route::route_add(Route {
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,
         },
-        gateway:  Some(Ipv4Addr(gateway)),
-        iface:    alloc::string::String::from(iface_name),
+        gateway: Some(Ipv4Addr(gateway)),
+        iface: alloc::string::String::from(iface_name),
         src_hint: None,
-        metric:   100,
-        scope:    Scope::Universe,
-        table:    TABLE_MAIN,
+        metric: 100,
+        scope: Scope::Universe,
+        table: TABLE_MAIN,
     });
 }
 

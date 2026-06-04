@@ -38,10 +38,10 @@ pub mod rules;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HookPoint {
-    PreRouting  = 0,
-    LocalIn     = 1,
-    Forward     = 2,
-    LocalOut    = 3,
+    PreRouting = 0,
+    LocalIn = 1,
+    Forward = 2,
+    LocalOut = 3,
     PostRouting = 4,
 }
 
@@ -52,10 +52,10 @@ impl HookPoint {
     /// builtin-chain naming).
     pub fn chain_name(self) -> &'static str {
         match self {
-            HookPoint::PreRouting  => "prerouting",
-            HookPoint::LocalIn     => "input",
-            HookPoint::Forward     => "forward",
-            HookPoint::LocalOut    => "output",
+            HookPoint::PreRouting => "prerouting",
+            HookPoint::LocalIn => "input",
+            HookPoint::Forward => "forward",
+            HookPoint::LocalOut => "output",
             HookPoint::PostRouting => "postrouting",
         }
     }
@@ -90,26 +90,26 @@ pub enum L3Proto {
 #[repr(u8)]
 pub enum L4Proto {
     Icmp = 1,
-    Tcp  = 6,
-    Udp  = 17,
+    Tcp = 6,
+    Udp = 17,
     Other(u8) = 255, // catch-all; payload below
 }
 
 impl L4Proto {
     pub fn from_u8(p: u8) -> L4Proto {
         match p {
-            1  => L4Proto::Icmp,
-            6  => L4Proto::Tcp,
+            1 => L4Proto::Icmp,
+            6 => L4Proto::Tcp,
             17 => L4Proto::Udp,
-            _  => L4Proto::Other(p),
+            _ => L4Proto::Other(p),
         }
     }
 
     pub fn as_u8(self) -> u8 {
         match self {
-            L4Proto::Icmp     => 1,
-            L4Proto::Tcp      => 6,
-            L4Proto::Udp      => 17,
+            L4Proto::Icmp => 1,
+            L4Proto::Tcp => 6,
+            L4Proto::Udp => 17,
             L4Proto::Other(p) => p,
         }
     }
@@ -211,7 +211,10 @@ impl HookTable {
         let mut slot = self.slots[point as usize].lock();
         let entry = HookEntry { priority, hook_fn };
         // Insertion-sort by ascending priority.
-        let idx = slot.iter().position(|e| e.priority > priority).unwrap_or(slot.len());
+        let idx = slot
+            .iter()
+            .position(|e| e.priority > priority)
+            .unwrap_or(slot.len());
         slot.insert(idx, entry);
     }
 
@@ -326,12 +329,12 @@ impl Tuple {
 
 /// Minimal IPv4 header offsets, no options. Stage-3 callers populate
 /// fixed-format frames, so we can index without parsing.
-pub const IPV4_OFF_PROTO: usize    = 9;
-pub const IPV4_OFF_SRC: usize      = 12;
-pub const IPV4_OFF_DST: usize      = 16;
-pub const IPV4_MIN_HDR_LEN: usize  = 20;
-pub const L4_OFF_SPORT: usize      = 0;
-pub const L4_OFF_DPORT: usize      = 2;
+pub const IPV4_OFF_PROTO: usize = 9;
+pub const IPV4_OFF_SRC: usize = 12;
+pub const IPV4_OFF_DST: usize = 16;
+pub const IPV4_MIN_HDR_LEN: usize = 20;
+pub const L4_OFF_SPORT: usize = 0;
+pub const L4_OFF_DPORT: usize = 2;
 
 /// Extract the 5-tuple from a packet whose layout is
 /// `IPv4 header (20 bytes, no options) || L4 header`. For ICMP the
@@ -342,16 +345,30 @@ pub fn parse_tuple_ipv4(packet: &[u8]) -> Option<Tuple> {
         return None;
     }
     let proto = packet[IPV4_OFF_PROTO];
-    let src_ip = [packet[IPV4_OFF_SRC], packet[IPV4_OFF_SRC + 1],
-                  packet[IPV4_OFF_SRC + 2], packet[IPV4_OFF_SRC + 3]];
-    let dst_ip = [packet[IPV4_OFF_DST], packet[IPV4_OFF_DST + 1],
-                  packet[IPV4_OFF_DST + 2], packet[IPV4_OFF_DST + 3]];
+    let src_ip = [
+        packet[IPV4_OFF_SRC],
+        packet[IPV4_OFF_SRC + 1],
+        packet[IPV4_OFF_SRC + 2],
+        packet[IPV4_OFF_SRC + 3],
+    ];
+    let dst_ip = [
+        packet[IPV4_OFF_DST],
+        packet[IPV4_OFF_DST + 1],
+        packet[IPV4_OFF_DST + 2],
+        packet[IPV4_OFF_DST + 3],
+    ];
     let l4 = &packet[IPV4_MIN_HDR_LEN..];
     match L4Proto::from_u8(proto) {
         L4Proto::Tcp | L4Proto::Udp => {
             let src_port = u16::from_be_bytes([l4[L4_OFF_SPORT], l4[L4_OFF_SPORT + 1]]);
             let dst_port = u16::from_be_bytes([l4[L4_OFF_DPORT], l4[L4_OFF_DPORT + 1]]);
-            Some(Tuple { src_ip, dst_ip, src_port, dst_port, proto })
+            Some(Tuple {
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                proto,
+            })
         }
         L4Proto::Icmp => {
             // type, code, checksum, id, sequence
@@ -359,12 +376,22 @@ pub fn parse_tuple_ipv4(packet: &[u8]) -> Option<Tuple> {
                 return None;
             }
             let t_c = u16::from_be_bytes([l4[0], l4[1]]);
-            let id  = u16::from_be_bytes([l4[4], l4[5]]);
-            Some(Tuple { src_ip, dst_ip, src_port: t_c, dst_port: id, proto })
+            let id = u16::from_be_bytes([l4[4], l4[5]]);
+            Some(Tuple {
+                src_ip,
+                dst_ip,
+                src_port: t_c,
+                dst_port: id,
+                proto,
+            })
         }
-        L4Proto::Other(_) => {
-            Some(Tuple { src_ip, dst_ip, src_port: 0, dst_port: 0, proto })
-        }
+        L4Proto::Other(_) => Some(Tuple {
+            src_ip,
+            dst_ip,
+            src_port: 0,
+            dst_port: 0,
+            proto,
+        }),
     }
 }
 
@@ -412,9 +439,11 @@ impl IcmpRateLimit {
             if cur == 0 {
                 return false;
             }
-            if self.tokens.compare_exchange_weak(
-                cur, cur - 1, Ordering::AcqRel, Ordering::Acquire,
-            ).is_ok() {
+            if self
+                .tokens
+                .compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 return true;
             }
         }
@@ -434,18 +463,21 @@ impl IcmpRateLimit {
             return;
         }
         // CAS last_refill_ns so concurrent callers don't double-count.
-        if self.last_refill_ns.compare_exchange(
-            last, now_ns, Ordering::AcqRel, Ordering::Acquire,
-        ).is_err() {
+        if self
+            .last_refill_ns
+            .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
         // Cap tokens at capacity.
         let mut cur = self.tokens.load(Ordering::Acquire);
         loop {
             let new = core::cmp::min(self.capacity, cur.saturating_add(to_add));
-            match self.tokens.compare_exchange_weak(
-                cur, new, Ordering::AcqRel, Ordering::Acquire,
-            ) {
+            match self
+                .tokens
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }

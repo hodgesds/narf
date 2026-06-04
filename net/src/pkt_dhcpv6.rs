@@ -41,12 +41,9 @@ pub const CLIENT_PORT: u16 = 546;
 pub const SERVER_PORT: u16 = 547;
 
 /// Multicast addresses (RFC 8415 §7.1).
-pub const ALL_DHCP_RELAY_AGENTS_AND_SERVERS: [u8; 16] = [
-    0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x02, 0, 0,
-];
-pub const ALL_DHCP_SERVERS: [u8; 16] = [
-    0xFF, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x03, 0, 0,
-];
+pub const ALL_DHCP_RELAY_AGENTS_AND_SERVERS: [u8; 16] =
+    [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x02, 0, 0];
+pub const ALL_DHCP_SERVERS: [u8; 16] = [0xFF, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x03, 0, 0];
 
 // ── Message types (RFC 8415 §7.3) ──────────────────────────────────
 
@@ -105,8 +102,8 @@ pub const STATUS_NO_PREFIX_AVAIL: u16 = 6;
 // ── DUID type values (RFC 8415 §11) ───────────────────────────────
 
 pub const DUID_TYPE_LLT: u16 = 1; // Link-layer + time
-pub const DUID_TYPE_EN: u16 = 2;  // Enterprise number
-pub const DUID_TYPE_LL: u16 = 3;  // Link-layer
+pub const DUID_TYPE_EN: u16 = 2; // Enterprise number
+pub const DUID_TYPE_LL: u16 = 3; // Link-layer
 pub const DUID_TYPE_UUID: u16 = 4;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

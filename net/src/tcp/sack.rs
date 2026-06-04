@@ -155,8 +155,7 @@ impl SackBook {
     pub fn prune_to(&mut self, rcv_nxt: u32) {
         self.blocks.retain(|b| {
             // Keep blocks that have at least one byte beyond rcv_nxt.
-            (b.right.wrapping_sub(rcv_nxt) as i32) > 0
-                && (b.left.wrapping_sub(rcv_nxt) as i32) >= 0
+            (b.right.wrapping_sub(rcv_nxt) as i32) > 0 && (b.left.wrapping_sub(rcv_nxt) as i32) >= 0
         });
     }
 
@@ -243,9 +242,18 @@ mod tests {
     #[test]
     fn encode_decode_round_trip_three_blocks() {
         let blocks = alloc::vec![
-            SackBlock { left: 1000, right: 2000 },
-            SackBlock { left: 3000, right: 3500 },
-            SackBlock { left: 5000, right: 7000 },
+            SackBlock {
+                left: 1000,
+                right: 2000
+            },
+            SackBlock {
+                left: 3000,
+                right: 3500
+            },
+            SackBlock {
+                left: 5000,
+                right: 7000
+            },
         ];
         let encoded = encode_blocks(&blocks);
         assert_eq!(encoded.len(), 8 * 3);
@@ -272,7 +280,13 @@ mod tests {
         b.add_range(1000, 2000);
         b.add_range(2000, 3000); // adjacent right
         assert_eq!(b.blocks().len(), 1);
-        assert_eq!(b.blocks()[0], SackBlock { left: 1000, right: 3000 });
+        assert_eq!(
+            b.blocks()[0],
+            SackBlock {
+                left: 1000,
+                right: 3000
+            }
+        );
     }
 
     #[test]
@@ -289,8 +303,14 @@ mod tests {
     fn scoreboard_pruning() {
         let mut s = SenderScoreboard::new();
         s.update_from(&[
-            SackBlock { left: 100, right: 200 },
-            SackBlock { left: 300, right: 400 },
+            SackBlock {
+                left: 100,
+                right: 200,
+            },
+            SackBlock {
+                left: 300,
+                right: 400,
+            },
         ]);
         s.prune_below(250); // covers first block
         assert_eq!(s.blocks.len(), 1);

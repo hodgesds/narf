@@ -182,8 +182,8 @@ pub fn parse_headers(buf: &[u8]) -> Result<(Vec<HeaderField<'_>>, usize), HttpEr
             i += 1;
         }
         let end = line_end.ok_or(HttpError::Short)?;
-        let line = core::str::from_utf8(&buf[line_start..end])
-            .map_err(|_| HttpError::BadFieldLine)?;
+        let line =
+            core::str::from_utf8(&buf[line_start..end]).map_err(|_| HttpError::BadFieldLine)?;
         let colon = line.find(':').ok_or(HttpError::BadFieldLine)?;
         let name = &line[..colon];
         let value = line[colon + 1..].trim_start_matches(|c| c == ' ' || c == '\t');
@@ -218,9 +218,7 @@ pub struct Chunk<'a> {
 /// Walk the chunked body. Stops after consuming a zero-sized chunk,
 /// per §7.1. Trailer fields after the final chunk are *not* consumed
 /// here — the caller resumes header parsing at the returned offset.
-pub fn iter_chunks<'a>(
-    buf: &'a [u8],
-) -> impl Iterator<Item = Result<Chunk<'a>, HttpError>> + 'a {
+pub fn iter_chunks<'a>(buf: &'a [u8]) -> impl Iterator<Item = Result<Chunk<'a>, HttpError>> + 'a {
     let mut pos = 0;
     let mut done = false;
     core::iter::from_fn(move || {
@@ -239,11 +237,10 @@ pub fn iter_chunks<'a>(
         if i + 1 >= buf.len() {
             return Some(Err(HttpError::Short));
         }
-        let size_str =
-            match core::str::from_utf8(&buf[line_start..i]) {
-                Ok(s) => s,
-                Err(_) => return Some(Err(HttpError::BadChunkSize)),
-            };
+        let size_str = match core::str::from_utf8(&buf[line_start..i]) {
+            Ok(s) => s,
+            Err(_) => return Some(Err(HttpError::BadChunkSize)),
+        };
         // Strip chunk-ext beyond the first ';'.
         let size_field = size_str.split(';').next().unwrap_or("").trim();
         let size = match u64::from_str_radix(size_field, 16) {
@@ -257,7 +254,9 @@ pub fn iter_chunks<'a>(
             // the final body-terminator CRLF are the caller's
             // problem.
             done = true;
-            return Some(Ok(Chunk { data: &buf[pos..pos] }));
+            return Some(Ok(Chunk {
+                data: &buf[pos..pos],
+            }));
         }
         if pos + size + 2 > buf.len() {
             return Some(Err(HttpError::Short));

@@ -44,21 +44,24 @@
 
 extern crate alloc;
 
-pub mod bypass;
-pub mod http;
-pub mod http2;
-pub mod mqtt;
-pub mod dhcp;
-pub mod dns;
-pub mod resolv_conf;
 pub mod arp;
 pub mod arp_cache;
+pub mod bypass;
+pub mod dhcp;
+pub mod dns;
+pub mod http;
+pub mod http2;
+pub mod icmp_sock;
+pub mod iface;
 pub mod ifaddr;
 pub mod ipv4;
-pub mod route;
+pub mod ipv6;
+pub mod ipv6_stack;
+pub mod mqtt;
+pub mod netfilter;
 pub mod pkt;
-pub mod pkt_dhcp;
 pub mod pkt_coap;
+pub mod pkt_dhcp;
 pub mod pkt_dhcpv6;
 pub mod pkt_dns;
 pub mod pkt_gre;
@@ -71,28 +74,25 @@ pub mod pkt_sctp;
 pub mod pkt_tcp;
 pub mod pkt_tftp;
 pub mod pkt_udp;
-pub mod iface;
-pub mod ipv6;
-pub mod ipv6_stack;
-pub mod netfilter;
+pub mod quic;
+pub mod raw_sock;
+pub mod resolv_conf;
+pub mod route;
 pub mod stack;
 pub mod stun;
 pub mod tcp;
 pub mod tcp_stack;
-pub mod udp_sock;
-pub mod icmp_sock;
-pub mod raw_sock;
-pub mod quic;
 pub mod tls;
+pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
 
-mod tests;
-mod e2e_tests;
 mod dhcp_dns_e2e_tests;
+mod e2e_tests;
 mod ipv6_e2e_tests;
 mod tcp_timer_e2e_tests;
+mod tests;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -713,17 +713,29 @@ pub struct TxMeta {
 impl TxMeta {
     /// Convenience: a plain data frame with no offloads.
     pub const fn plain() -> Self {
-        Self { csum_l4: None, tso_mss: None, vlan_tag: None }
+        Self {
+            csum_l4: None,
+            tso_mss: None,
+            vlan_tag: None,
+        }
     }
 
     /// Convenience: request L4 checksum offload only.
     pub const fn with_csum(kind: L4CsumKind) -> Self {
-        Self { csum_l4: Some(kind), tso_mss: None, vlan_tag: None }
+        Self {
+            csum_l4: Some(kind),
+            tso_mss: None,
+            vlan_tag: None,
+        }
     }
 
     /// Convenience: request TSO (implies TCP checksum offload).
     pub const fn with_tso(mss: u16) -> Self {
-        Self { csum_l4: Some(L4CsumKind::Tcp), tso_mss: Some(mss), vlan_tag: None }
+        Self {
+            csum_l4: Some(L4CsumKind::Tcp),
+            tso_mss: Some(mss),
+            vlan_tag: None,
+        }
     }
 }
 

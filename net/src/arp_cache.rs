@@ -81,13 +81,13 @@ pub enum ArpState {
 /// One entry in the per-interface ARP cache.
 #[derive(Copy, Clone, Debug)]
 pub struct ArpEntry {
-    pub mac:                  [u8; 6],
-    pub state:                ArpState,
+    pub mac: [u8; 6],
+    pub state: ArpState,
     /// Monotonic nanosecond timestamp when the entry becomes Stale
     /// (only meaningful in Reachable state).
-    pub expires_at:           u64,
+    pub expires_at: u64,
     /// Monotonic nanosecond timestamp of last use. Used for LRU eviction.
-    pub last_used_ns:         u64,
+    pub last_used_ns: u64,
     /// Number of ARP requests outstanding for this entry.
     pub requests_outstanding: u8,
 }
@@ -95,12 +95,11 @@ pub struct ArpEntry {
 // ── Per-interface cache ─────────────────────────────────────────────────
 
 struct IfaceArpCache {
-    name:    String,
+    name: String,
     entries: BTreeMap<[u8; 4], ArpEntry>,
 }
 
-static CACHES: IrqSafeSpinLock<Vec<IfaceArpCache>> =
-    IrqSafeSpinLock::new(Vec::new());
+static CACHES: IrqSafeSpinLock<Vec<IfaceArpCache>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Internal helpers ───────────────────────────────────────────────────
 
@@ -131,7 +130,7 @@ fn get_or_create_cache<'g>(
         return &mut g[pos].entries;
     }
     g.push(IfaceArpCache {
-        name:    String::from(iface_name),
+        name: String::from(iface_name),
         entries: BTreeMap::new(),
     });
     let last = g.len() - 1;
@@ -183,22 +182,25 @@ pub fn insert(iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {
     let map = get_or_create_cache(&mut g, iface_name);
 
     if let Some(entry) = map.get_mut(&ip) {
-        entry.mac      = mac;
-        entry.state    = ArpState::Reachable;
-        entry.expires_at   = now + REACHABLE_TIME_NS;
+        entry.mac = mac;
+        entry.state = ArpState::Reachable;
+        entry.expires_at = now + REACHABLE_TIME_NS;
         entry.last_used_ns = now;
         entry.requests_outstanding = 0;
         return;
     }
 
     maybe_evict(map);
-    map.insert(ip, ArpEntry {
-        mac,
-        state:                ArpState::Reachable,
-        expires_at:           now + REACHABLE_TIME_NS,
-        last_used_ns:         now,
-        requests_outstanding: 0,
-    });
+    map.insert(
+        ip,
+        ArpEntry {
+            mac,
+            state: ArpState::Reachable,
+            expires_at: now + REACHABLE_TIME_NS,
+            last_used_ns: now,
+            requests_outstanding: 0,
+        },
+    );
 }
 
 /// Mark an entry as Incomplete (ARP request sent, no reply yet).
@@ -209,10 +211,10 @@ pub fn mark_incomplete(iface_name: &str, ip: [u8; 4]) {
     let mut g = CACHES.lock();
     let map = get_or_create_cache(&mut g, iface_name);
     map.entry(ip).or_insert_with(|| ArpEntry {
-        mac:                  [0u8; 6],
-        state:                ArpState::Incomplete,
-        expires_at:           0,
-        last_used_ns:         now,
+        mac: [0u8; 6],
+        state: ArpState::Incomplete,
+        expires_at: 0,
+        last_used_ns: now,
         requests_outstanding: 1,
     });
 }
@@ -320,21 +322,19 @@ pub fn snapshot() -> Vec<ArpSnapshot> {
 
 /// Insert an entry and set its `expires_at` to the given value. Test-only.
 #[doc(hidden)]
-pub fn __insert_with_expiry(
-    iface_name: &str,
-    ip: [u8; 4],
-    mac: [u8; 6],
-    expires_at: u64,
-) {
+pub fn __insert_with_expiry(iface_name: &str, ip: [u8; 4], mac: [u8; 6], expires_at: u64) {
     let now = now_ns();
     let mut g = CACHES.lock();
     let map = get_or_create_cache(&mut g, iface_name);
     maybe_evict(map);
-    map.insert(ip, ArpEntry {
-        mac,
-        state:                ArpState::Reachable,
-        expires_at,
-        last_used_ns:         now,
-        requests_outstanding: 0,
-    });
+    map.insert(
+        ip,
+        ArpEntry {
+            mac,
+            state: ArpState::Reachable,
+            expires_at,
+            last_used_ns: now,
+            requests_outstanding: 0,
+        },
+    );
 }

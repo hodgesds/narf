@@ -39,9 +39,8 @@ use alloc::vec::Vec;
 
 use crate::pkt_dhcpv6::{
     append_clientid_duid_ll, append_elapsed_time, append_option, append_oro, iter_options,
-    DhcpV6Header, DhcpV6Option, MT_REPLY, MT_REQUEST, MT_SOLICIT, OPT_CLIENTID,
-    OPT_DNS_SERVERS, OPT_DOMAIN_LIST, OPT_IAADDR, OPT_IA_NA, OPT_IA_PD, OPT_SERVERID,
-    OPT_STATUS_CODE,
+    DhcpV6Header, DhcpV6Option, MT_REPLY, MT_REQUEST, MT_SOLICIT, OPT_CLIENTID, OPT_DNS_SERVERS,
+    OPT_DOMAIN_LIST, OPT_IAADDR, OPT_IA_NA, OPT_IA_PD, OPT_SERVERID, OPT_STATUS_CODE,
 };
 
 /// Client state (RFC 8415 §18).
@@ -199,12 +198,8 @@ impl DhcpV6Client {
                 Err(_) => return false,
             };
             if opt.code == OPT_IA_NA && opt.data.len() >= 12 {
-                t1_s = u32::from_be_bytes([
-                    opt.data[4], opt.data[5], opt.data[6], opt.data[7],
-                ]);
-                t2_s = u32::from_be_bytes([
-                    opt.data[8], opt.data[9], opt.data[10], opt.data[11],
-                ]);
+                t1_s = u32::from_be_bytes([opt.data[4], opt.data[5], opt.data[6], opt.data[7]]);
+                t2_s = u32::from_be_bytes([opt.data[8], opt.data[9], opt.data[10], opt.data[11]]);
             }
             self.consume_option(opt);
         }
@@ -244,12 +239,10 @@ impl DhcpV6Client {
                     if s.code == OPT_IAADDR && s.data.len() >= 24 {
                         let mut a = [0u8; 16];
                         a.copy_from_slice(&s.data[0..16]);
-                        let preferred = u32::from_be_bytes([
-                            s.data[16], s.data[17], s.data[18], s.data[19],
-                        ]);
-                        let valid = u32::from_be_bytes([
-                            s.data[20], s.data[21], s.data[22], s.data[23],
-                        ]);
+                        let preferred =
+                            u32::from_be_bytes([s.data[16], s.data[17], s.data[18], s.data[19]]);
+                        let valid =
+                            u32::from_be_bytes([s.data[20], s.data[21], s.data[22], s.data[23]]);
                         if valid > 0 {
                             self.leases.push(IaAddr {
                                 addr: a,

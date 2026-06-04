@@ -33,7 +33,7 @@ use crate::ipv4::Ipv4Addr;
 /// A single IPv4 address assigned to an interface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IfaceAddr {
-    pub addr:       Ipv4Addr,
+    pub addr: Ipv4Addr,
     /// CIDR prefix length (0–32). e.g. 24 for a /24 netmask.
     pub prefix_len: u8,
 }
@@ -73,11 +73,10 @@ pub fn prefix_to_mask(prefix_len: u8) -> u32 {
 
 struct IfaceAddrs {
     iface_name: String,
-    addrs:      Vec<IfaceAddr>,
+    addrs: Vec<IfaceAddr>,
 }
 
-static IFACE_ADDRS: IrqSafeSpinLock<Vec<IfaceAddrs>> =
-    IrqSafeSpinLock::new(Vec::new());
+static IFACE_ADDRS: IrqSafeSpinLock<Vec<IfaceAddrs>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Public API ─────────────────────────────────────────────────────────
 
@@ -97,7 +96,7 @@ pub fn iface_add_addr(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) {
         } else {
             g.push(IfaceAddrs {
                 iface_name: String::from(iface_name),
-                addrs:      alloc::vec![entry],
+                addrs: alloc::vec![entry],
             });
         }
     }

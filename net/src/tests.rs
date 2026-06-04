@@ -224,15 +224,8 @@ kernel_test_in!("net/udp", smoke_udp_header_round_trip);
 fn smoke_udp_build_and_verify_ipv4() -> TestResult {
     use crate::pkt_udp::{build_ipv4, verify_ipv4};
     let mut out = [0u8; 64];
-    let written = build_ipv4(
-        &mut out,
-        [10, 0, 0, 1],
-        [10, 0, 0, 2],
-        12345,
-        53,
-        b"hello",
-    )
-    .expect("build");
+    let written =
+        build_ipv4(&mut out, [10, 0, 0, 1], [10, 0, 0, 2], 12345, 53, b"hello").expect("build");
     if written != 8 + 5 {
         return TestResult::Fail("UDP datagram = 8 hdr + 5 payload");
     }
@@ -253,15 +246,8 @@ kernel_test_in!("net/udp", smoke_udp_disabled_checksum_accepted);
 fn smoke_udp_bad_checksum_rejected() -> TestResult {
     use crate::pkt_udp::{build_ipv4, verify_ipv4, UdpError};
     let mut out = [0u8; 64];
-    let written = build_ipv4(
-        &mut out,
-        [10, 0, 0, 1],
-        [10, 0, 0, 2],
-        12345,
-        53,
-        b"hello",
-    )
-    .expect("build");
+    let written =
+        build_ipv4(&mut out, [10, 0, 0, 1], [10, 0, 0, 2], 12345, 53, b"hello").expect("build");
     out[12] ^= 0xFF; // tamper payload
     match verify_ipv4([10, 0, 0, 1], [10, 0, 0, 2], &out[..written]) {
         Err(UdpError::BadChecksum) => TestResult::Pass,
@@ -291,8 +277,8 @@ kernel_test_in!("net/udp", smoke_udp_zero_checksum_transmitted_as_ffff);
 fn smoke_dhcp_on_udp_in_parses_offer() -> TestResult {
     use crate::dhcp::{acquire, on_udp_in, DhcpLease};
     use crate::pkt_dhcp::{
-        append_end, append_message_type, append_option, build_discover, DhcpHeader,
-        DHCPOFFER, OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
+        append_end, append_message_type, append_option, build_discover, DhcpHeader, DHCPOFFER,
+        OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
     };
     // Synthesise a DHCPOFFER payload as if SLIRP had sent it back.
     // xid = 0xDEAD_BEEF, yiaddr = 10.0.2.15, gateway = 10.0.2.2,
@@ -333,13 +319,16 @@ fn smoke_dhcp_on_udp_in_parses_offer() -> TestResult {
     // exercise that without iface — so this smoke just checks the
     // parser side via a side-channel: re-arming on_udp_in with a
     // mismatched xid should leave the previous one cached.)
-    let _ = (acquire, DhcpLease {
-        ip: [0; 4],
-        netmask: [0; 4],
-        gateway: [0; 4],
-        server: [0; 4],
-        lease_secs: 0,
-    });
+    let _ = (
+        acquire,
+        DhcpLease {
+            ip: [0; 4],
+            netmask: [0; 4],
+            gateway: [0; 4],
+            server: [0; 4],
+            lease_secs: 0,
+        },
+    );
     let _ = build_discover; // silence unused
     TestResult::Pass
 }
@@ -553,7 +542,9 @@ kernel_test_in!("net/ipv6", smoke_icmpv6_router_solicitation_layout);
 
 fn smoke_icmpv6_neighbor_solicitation_carries_target() -> TestResult {
     use crate::pkt_ipv6::{neighbor_solicitation, ICMPV6_NEIGHBOR_SOLICITATION};
-    let target = [0x20u8, 0x01, 0xDB, 0x8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42];
+    let target = [
+        0x20u8, 0x01, 0xDB, 0x8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42,
+    ];
     let body = neighbor_solicitation(target, &[]);
     if body.len() != 24 {
         return TestResult::Fail("NS without options = 24 bytes");
@@ -566,7 +557,10 @@ fn smoke_icmpv6_neighbor_solicitation_carries_target() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/ipv6", smoke_icmpv6_neighbor_solicitation_carries_target);
+kernel_test_in!(
+    "net/ipv6",
+    smoke_icmpv6_neighbor_solicitation_carries_target
+);
 
 fn smoke_icmpv6_neighbor_advertisement_flags() -> TestResult {
     use crate::pkt_ipv6::{
@@ -586,9 +580,7 @@ fn smoke_icmpv6_neighbor_advertisement_flags() -> TestResult {
 kernel_test_in!("net/ipv6", smoke_icmpv6_neighbor_advertisement_flags);
 
 fn smoke_icmpv6_router_advertisement_layout() -> TestResult {
-    use crate::pkt_ipv6::{
-        router_advertisement, ICMPV6_ROUTER_ADVERTISEMENT, RA_FLAG_MANAGED,
-    };
+    use crate::pkt_ipv6::{router_advertisement, ICMPV6_ROUTER_ADVERTISEMENT, RA_FLAG_MANAGED};
     let body = router_advertisement(64, RA_FLAG_MANAGED, 1800, 30_000, 1_000, &[]);
     if body[0] != ICMPV6_ROUTER_ADVERTISEMENT {
         return TestResult::Fail("type byte = 134");
@@ -655,10 +647,7 @@ fn smoke_dns_encode_name_three_labels() -> TestResult {
     let mut out = alloc::vec::Vec::new();
     encode_name(&mut out, "www.example.com").expect("encode");
     let expected: alloc::vec::Vec<u8> = alloc::vec![
-        3, b'w', b'w', b'w',
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-        3, b'c', b'o', b'm',
-        0,
+        3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ];
     if out != expected {
         return TestResult::Fail("name wire encoding");
@@ -670,7 +659,9 @@ kernel_test_in!("net/dns", smoke_dns_encode_name_three_labels);
 fn smoke_dns_decode_name_uncompressed() -> TestResult {
     use crate::pkt_dns::decode_name;
     let mut msg: alloc::vec::Vec<u8> = alloc::vec![0u8; 0];
-    msg.extend_from_slice(&[3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+    msg.extend_from_slice(&[
+        3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
     let (name, used) = decode_name(&msg, 0).expect("decode");
     if name != "www.example.com" {
         return TestResult::Fail("uncompressed name decode");
@@ -689,7 +680,9 @@ fn smoke_dns_decode_name_with_compression_pointer() -> TestResult {
     //   offset 12..28: full name "www.example.com" (17 bytes).
     //   offset 29..31: compressed pointer to offset 12 → 0xC0 0x0C.
     let mut msg: alloc::vec::Vec<u8> = alloc::vec![0u8; 12];
-    msg.extend_from_slice(&[3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+    msg.extend_from_slice(&[
+        3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
     msg.extend_from_slice(&[0xC0, 0x0C]);
     let (name, used) = decode_name(&msg, 29).expect("decode");
     if name != "www.example.com" {
@@ -746,7 +739,9 @@ fn smoke_dns_resource_record_decode() -> TestResult {
     // RR for example.com IN A 93.184.216.34 with TTL 3600.
     let mut msg: alloc::vec::Vec<u8> = alloc::vec![0u8; 12];
     let name_off = msg.len();
-    msg.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+    msg.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
     msg.extend_from_slice(&TYPE_A.to_be_bytes());
     msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS_IN
     msg.extend_from_slice(&3600u32.to_be_bytes()); // TTL
@@ -848,7 +843,10 @@ fn smoke_dhcp_options_iterator_skips_pad_and_stops_on_end() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/dhcp", smoke_dhcp_options_iterator_skips_pad_and_stops_on_end);
+kernel_test_in!(
+    "net/dhcp",
+    smoke_dhcp_options_iterator_skips_pad_and_stops_on_end
+);
 
 fn smoke_dhcp_build_discover_carries_required_options() -> TestResult {
     use crate::pkt_dhcp::{
@@ -893,7 +891,10 @@ fn smoke_dhcp_build_discover_carries_required_options() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/dhcp", smoke_dhcp_build_discover_carries_required_options);
+kernel_test_in!(
+    "net/dhcp",
+    smoke_dhcp_build_discover_carries_required_options
+);
 
 fn smoke_dhcp_build_request_carries_server_id_and_requested_ip() -> TestResult {
     use crate::pkt_dhcp::{
@@ -1056,9 +1057,7 @@ fn smoke_tls_record_for_alert_layout() -> TestResult {
 kernel_test_in!("net/tls", smoke_tls_record_for_alert_layout);
 
 fn smoke_tls_extension_constants() -> TestResult {
-    use crate::tls::{
-        EXT_KEY_SHARE, EXT_PRE_SHARED_KEY, EXT_SERVER_NAME, EXT_SUPPORTED_VERSIONS,
-    };
+    use crate::tls::{EXT_KEY_SHARE, EXT_PRE_SHARED_KEY, EXT_SERVER_NAME, EXT_SUPPORTED_VERSIONS};
     if EXT_SERVER_NAME != 0 {
         return TestResult::Fail("server_name = 0");
     }
@@ -1192,8 +1191,7 @@ fn smoke_http_chunked_strips_chunk_ext() -> TestResult {
     use crate::http::iter_chunks;
     // 5 bytes of data, with a chunk-ext that should be ignored.
     let buf = b"5;ext=value\r\nhello\r\n0\r\n";
-    let chunks: alloc::vec::Vec<_> =
-        iter_chunks(buf).collect::<Result<_, _>>().expect("decode");
+    let chunks: alloc::vec::Vec<_> = iter_chunks(buf).collect::<Result<_, _>>().expect("decode");
     if chunks[0].data != b"hello" {
         return TestResult::Fail("chunk-ext was not stripped");
     }
@@ -1255,8 +1253,8 @@ fn smoke_mdns_browse_name_format() -> TestResult {
 kernel_test_in!("net/mdns", smoke_mdns_browse_name_format);
 
 fn smoke_mdns_query_response_headers() -> TestResult {
-    use crate::pkt_mdns::{query_header, response_header};
     use crate::pkt_dns::{FLAG_AA, FLAG_QR};
+    use crate::pkt_mdns::{query_header, response_header};
     let q = query_header(2);
     if q.id != 0 {
         return TestResult::Fail("mDNS query ID = 0");
@@ -1632,9 +1630,7 @@ fn smoke_dhcpv6_options_iter() -> TestResult {
 kernel_test_in!("net/dhcpv6", smoke_dhcpv6_options_iter);
 
 fn smoke_dhcpv6_clientid_duid_ll() -> TestResult {
-    use crate::pkt_dhcpv6::{
-        append_clientid_duid_ll, iter_options, DUID_TYPE_LL, OPT_CLIENTID,
-    };
+    use crate::pkt_dhcpv6::{append_clientid_duid_ll, iter_options, DUID_TYPE_LL, OPT_CLIENTID};
     let mut out = alloc::vec::Vec::new();
     let mac = [0x02u8, 0x42, 0xCA, 0xFE, 0xBE, 0xEF];
     append_clientid_duid_ll(&mut out, 1, &mac);
@@ -1661,7 +1657,10 @@ fn smoke_dhcpv6_solicit_layout() -> TestResult {
     let pkt = build_solicit(
         0x12_3456,
         [0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF],
-        &[crate::pkt_dhcpv6::OPT_DNS_SERVERS, crate::pkt_dhcpv6::OPT_DOMAIN_LIST],
+        &[
+            crate::pkt_dhcpv6::OPT_DNS_SERVERS,
+            crate::pkt_dhcpv6::OPT_DOMAIN_LIST,
+        ],
     );
     let h = DhcpV6Header::decode(&pkt).expect("header");
     if h.msg_type != MT_SOLICIT {
@@ -1693,7 +1692,11 @@ fn smoke_dhcpv6_status_codes() -> TestResult {
     use crate::pkt_dhcpv6::{
         STATUS_NOT_ON_LINK, STATUS_NO_ADDRS_AVAIL, STATUS_SUCCESS, STATUS_USE_MULTICAST,
     };
-    if STATUS_SUCCESS != 0 || STATUS_NO_ADDRS_AVAIL != 2 || STATUS_NOT_ON_LINK != 4 || STATUS_USE_MULTICAST != 5 {
+    if STATUS_SUCCESS != 0
+        || STATUS_NO_ADDRS_AVAIL != 2
+        || STATUS_NOT_ON_LINK != 4
+        || STATUS_USE_MULTICAST != 5
+    {
         return TestResult::Fail("status code values per §21.13");
     }
     TestResult::Pass
@@ -1721,10 +1724,7 @@ fn smoke_icmp_fragmentation_needed_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "net/icmp-extra",
-    smoke_icmp_fragmentation_needed_round_trip
-);
+kernel_test_in!("net/icmp-extra", smoke_icmp_fragmentation_needed_round_trip);
 
 fn smoke_icmp_time_exceeded_layout() -> TestResult {
     use crate::pkt_icmp_extra::{
@@ -1754,9 +1754,7 @@ fn smoke_icmp_redirect_carries_gateway() -> TestResult {
 kernel_test_in!("net/icmp-extra", smoke_icmp_redirect_carries_gateway);
 
 fn smoke_icmp_decode_rejects_bad_checksum() -> TestResult {
-    use crate::pkt_icmp_extra::{
-        build_fragmentation_needed, IcmpError, IcmpExtraError,
-    };
+    use crate::pkt_icmp_extra::{build_fragmentation_needed, IcmpError, IcmpExtraError};
     let mut pkt = build_fragmentation_needed(1280, &[0u8; 28]);
     pkt[10] ^= 0xFF;
     match IcmpError::decode(&pkt) {
@@ -1849,7 +1847,7 @@ fn smoke_http2_client_preface_constant() -> TestResult {
 kernel_test_in!("net/http2", smoke_http2_client_preface_constant);
 
 fn smoke_http2_frame_header_round_trip() -> TestResult {
-    use crate::http2::{FrameHeader, FLAG_END_HEADERS, FT_HEADERS, FRAME_HEADER_LEN};
+    use crate::http2::{FrameHeader, FLAG_END_HEADERS, FRAME_HEADER_LEN, FT_HEADERS};
     let h = FrameHeader {
         length: 0x12_3456,
         frame_type: FT_HEADERS,
@@ -1956,7 +1954,10 @@ fn smoke_http2_goaway_carries_last_stream_and_error() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/http2", smoke_http2_goaway_carries_last_stream_and_error);
+kernel_test_in!(
+    "net/http2",
+    smoke_http2_goaway_carries_last_stream_and_error
+);
 
 fn smoke_http2_ping_ack_flag() -> TestResult {
     use crate::http2::{build_ping, FLAG_ACK, FT_PING};
@@ -2058,7 +2059,9 @@ fn smoke_stun_attribute_iterator_handles_padding() -> TestResult {
     if out.len() != 4 + 8 {
         return TestResult::Fail("attribute should pad to 4-byte boundary");
     }
-    let recs: alloc::vec::Vec<_> = iter_attributes(&out).collect::<Result<_, _>>().expect("walk");
+    let recs: alloc::vec::Vec<_> = iter_attributes(&out)
+        .collect::<Result<_, _>>()
+        .expect("walk");
     if recs.len() != 1 {
         return TestResult::Fail("expected 1 attribute");
     }
@@ -2096,8 +2099,13 @@ fn smoke_stun_binding_request_with_software() -> TestResult {
     }
     let body_len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
     let body = &pkt[STUN_HDR_LEN..STUN_HDR_LEN + body_len];
-    let recs: alloc::vec::Vec<_> = iter_attributes(body).collect::<Result<_, _>>().expect("walk");
-    if !recs.iter().any(|r| r.typ == ATTR_SOFTWARE && r.data == b"narf-stun") {
+    let recs: alloc::vec::Vec<_> = iter_attributes(body)
+        .collect::<Result<_, _>>()
+        .expect("walk");
+    if !recs
+        .iter()
+        .any(|r| r.typ == ATTR_SOFTWARE && r.data == b"narf-stun")
+    {
         return TestResult::Fail("SOFTWARE attribute should be present");
     }
     TestResult::Pass
@@ -2273,12 +2281,15 @@ kernel_test_in!("net/l2/vlan", smoke_vlan_tci_bit_layout);
 
 fn smoke_lldp_tlv_round_trip() -> TestResult {
     use crate::pkt_l2::{
-        append_chassis_id, append_end_of_lldpdu, append_port_id, append_ttl, iter_tlvs,
-        parse_ttl, CHASSIS_ID_MAC_ADDRESS, PORT_ID_INTERFACE_NAME, TLV_CHASSIS_ID, TLV_PORT_ID,
-        TLV_TTL,
+        append_chassis_id, append_end_of_lldpdu, append_port_id, append_ttl, iter_tlvs, parse_ttl,
+        CHASSIS_ID_MAC_ADDRESS, PORT_ID_INTERFACE_NAME, TLV_CHASSIS_ID, TLV_PORT_ID, TLV_TTL,
     };
     let mut out = alloc::vec::Vec::new();
-    append_chassis_id(&mut out, CHASSIS_ID_MAC_ADDRESS, &[0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF]);
+    append_chassis_id(
+        &mut out,
+        CHASSIS_ID_MAC_ADDRESS,
+        &[0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF],
+    );
     append_port_id(&mut out, PORT_ID_INTERFACE_NAME, b"eth0");
     append_ttl(&mut out, 120);
     append_end_of_lldpdu(&mut out);
@@ -2343,7 +2354,12 @@ kernel_test_in!("net/l2/lldp", smoke_lldp_system_capabilities_layout);
 fn smoke_lldp_truncated_tlv_rejected() -> TestResult {
     use crate::pkt_l2::{iter_tlvs, LldpError};
     // Header claims 5-byte body, but only 2 bytes follow.
-    let buf = [(2u16 << 9 | 5).to_be_bytes()[0], (2u16 << 9 | 5).to_be_bytes()[1], 0, 0];
+    let buf = [
+        (2u16 << 9 | 5).to_be_bytes()[0],
+        (2u16 << 9 | 5).to_be_bytes()[1],
+        0,
+        0,
+    ];
     let mut errs = 0;
     for r in iter_tlvs(&buf) {
         if matches!(r, Err(LldpError::Truncated)) {
@@ -2758,8 +2774,14 @@ fn smoke_tftp_rrq_with_options() -> TestResult {
         filename: alloc::string::String::from("img"),
         mode: alloc::string::String::from(MODE_OCTET),
         options: alloc::vec![
-            (alloc::string::String::from("blksize"), alloc::string::String::from("1428")),
-            (alloc::string::String::from("tsize"), alloc::string::String::from("0")),
+            (
+                alloc::string::String::from("blksize"),
+                alloc::string::String::from("1428")
+            ),
+            (
+                alloc::string::String::from("tsize"),
+                alloc::string::String::from("0")
+            ),
         ],
     };
     let bytes = p.encode();
@@ -2848,15 +2870,12 @@ fn smoke_tftp_decode_rejects_unknown_opcode() -> TestResult {
 }
 kernel_test_in!("net/tftp", smoke_tftp_decode_rejects_unknown_opcode);
 
-
-
 // ── WireGuard codec ───────────────────────────────────────────────
 
-
-
 fn smoke_wireguard_handshake_initiation_round_trip() -> TestResult {
-
-    use crate::wireguard::{build_handshake_initiation, decode_handshake_initiation, HANDSHAKE_INITIATION_LEN};
+    use crate::wireguard::{
+        build_handshake_initiation, decode_handshake_initiation, HANDSHAKE_INITIATION_LEN,
+    };
 
     let eph = [0xAAu8; 32];
 
@@ -2871,31 +2890,36 @@ fn smoke_wireguard_handshake_initiation_round_trip() -> TestResult {
     let buf = build_handshake_initiation(0xCAFEBABE, &eph, &stat, &ts, &mac1, &mac2);
 
     if buf.len() != HANDSHAKE_INITIATION_LEN {
-
         return TestResult::Fail("length");
-
     }
 
     let h = decode_handshake_initiation(&buf).expect("decode");
 
-    if h.sender_index != 0xCAFEBABE { return TestResult::Fail("sender"); }
+    if h.sender_index != 0xCAFEBABE {
+        return TestResult::Fail("sender");
+    }
 
-    if h.unencrypted_ephemeral != &eph { return TestResult::Fail("eph"); }
+    if h.unencrypted_ephemeral != &eph {
+        return TestResult::Fail("eph");
+    }
 
-    if h.encrypted_static != &stat { return TestResult::Fail("static"); }
+    if h.encrypted_static != &stat {
+        return TestResult::Fail("static");
+    }
 
-    if h.mac1 != &mac1 { return TestResult::Fail("mac1"); }
+    if h.mac1 != &mac1 {
+        return TestResult::Fail("mac1");
+    }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("net/wireguard", smoke_wireguard_handshake_initiation_round_trip);
-
-
+kernel_test_in!(
+    "net/wireguard",
+    smoke_wireguard_handshake_initiation_round_trip
+);
 
 fn smoke_wireguard_handshake_response_round_trip() -> TestResult {
-
     use crate::wireguard::{build_handshake_response, decode_handshake_response};
 
     let eph = [0xEEu8; 32];
@@ -2911,41 +2935,38 @@ fn smoke_wireguard_handshake_response_round_trip() -> TestResult {
     let h = decode_handshake_response(&buf).expect("decode");
 
     if h.sender_index != 0xAA || h.receiver_index != 0xBB {
-
         return TestResult::Fail("indices");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("net/wireguard", smoke_wireguard_handshake_response_round_trip);
-
-
+kernel_test_in!(
+    "net/wireguard",
+    smoke_wireguard_handshake_response_round_trip
+);
 
 fn smoke_wireguard_transport_header_round_trip() -> TestResult {
-
     use crate::wireguard::{build_transport_header, decode_transport_header};
 
     let h = build_transport_header(0x12345678, 0xDEADBEEF_CAFEBABE);
 
     let dec = decode_transport_header(&h).expect("decode");
 
-    if dec.receiver_index != 0x12345678 { return TestResult::Fail("receiver"); }
+    if dec.receiver_index != 0x12345678 {
+        return TestResult::Fail("receiver");
+    }
 
-    if dec.counter != 0xDEADBEEF_CAFEBABE { return TestResult::Fail("counter"); }
+    if dec.counter != 0xDEADBEEF_CAFEBABE {
+        return TestResult::Fail("counter");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/wireguard", smoke_wireguard_transport_header_round_trip);
 
-
-
 fn smoke_wireguard_decode_rejects_nonzero_reserved() -> TestResult {
-
     use crate::wireguard::{decode_handshake_initiation, WgError, HANDSHAKE_INITIATION_LEN};
 
     let mut buf = alloc::vec![0u8; HANDSHAKE_INITIATION_LEN];
@@ -2955,109 +2976,104 @@ fn smoke_wireguard_decode_rejects_nonzero_reserved() -> TestResult {
     buf[2] = 0xAA; // reserved byte tampered
 
     match decode_handshake_initiation(&buf) {
-
         Err(WgError::NonZeroReserved) => TestResult::Pass,
 
         _ => TestResult::Fail("reserved must be zero"),
-
     }
-
 }
 
-kernel_test_in!("net/wireguard", smoke_wireguard_decode_rejects_nonzero_reserved);
-
-
+kernel_test_in!(
+    "net/wireguard",
+    smoke_wireguard_decode_rejects_nonzero_reserved
+);
 
 fn smoke_wireguard_anti_replay_window() -> TestResult {
-
     use crate::wireguard::AntiReplay;
 
     let mut ar = AntiReplay::default();
 
-    if !ar.check_and_update(1) { return TestResult::Fail("first packet"); }
+    if !ar.check_and_update(1) {
+        return TestResult::Fail("first packet");
+    }
 
-    if ar.check_and_update(1) { return TestResult::Fail("replay"); }
+    if ar.check_and_update(1) {
+        return TestResult::Fail("replay");
+    }
 
-    if !ar.check_and_update(5) { return TestResult::Fail("jump"); }
+    if !ar.check_and_update(5) {
+        return TestResult::Fail("jump");
+    }
 
-    if !ar.check_and_update(2) { return TestResult::Fail("out-of-order ok"); }
+    if !ar.check_and_update(2) {
+        return TestResult::Fail("out-of-order ok");
+    }
 
-    if ar.check_and_update(2) { return TestResult::Fail("out-of-order replay"); }
+    if ar.check_and_update(2) {
+        return TestResult::Fail("out-of-order replay");
+    }
 
-    if ar.check_and_update(0) { return TestResult::Fail("counter 0 reserved"); }
+    if ar.check_and_update(0) {
+        return TestResult::Fail("counter 0 reserved");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/wireguard", smoke_wireguard_anti_replay_window);
 
-
-
 // ── QUIC + HTTP/3 ─────────────────────────────────────────────────
 
-
-
 fn smoke_quic_varint_round_trip() -> TestResult {
-
     use crate::quic::{varint_decode, varint_encode};
 
-    let cases = [0u64, 1, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, 4_611_686_018_427_387_903];
+    let cases = [
+        0u64,
+        1,
+        63,
+        64,
+        16_383,
+        16_384,
+        1_073_741_823,
+        1_073_741_824,
+        4_611_686_018_427_387_903,
+    ];
 
     for v in cases {
-
         let enc = varint_encode(v);
 
         let (d, n) = varint_decode(&enc).expect("decode");
 
         if d != v || n != enc.len() {
-
             return TestResult::Fail("varint round-trip");
-
         }
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/quic", smoke_quic_varint_round_trip);
 
-
-
 fn smoke_quic_varint_uses_minimum_encoding() -> TestResult {
-
     use crate::quic::varint_encode;
 
     if varint_encode(0).len() != 1 || varint_encode(63).len() != 1 {
-
         return TestResult::Fail("<=63 must be 1 byte");
-
     }
 
     if varint_encode(64).len() != 2 || varint_encode(16383).len() != 2 {
-
         return TestResult::Fail("14-bit form must be 2 bytes");
-
     }
 
     if varint_encode(16384).len() != 4 {
-
         return TestResult::Fail("30-bit form must be 4 bytes");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/quic", smoke_quic_varint_uses_minimum_encoding);
 
-
-
 fn smoke_quic_long_header_decodes() -> TestResult {
-
     use crate::quic::{decode_long_header, first_byte_long, LongPacketType};
 
     let mut buf = alloc::vec::Vec::new();
@@ -3074,52 +3090,60 @@ fn smoke_quic_long_header_decodes() -> TestResult {
 
     let (h, _) = decode_long_header(&buf).expect("decode");
 
-    if h.packet_type != LongPacketType::Initial { return TestResult::Fail("ptype"); }
+    if h.packet_type != LongPacketType::Initial {
+        return TestResult::Fail("ptype");
+    }
 
-    if h.version != 1 { return TestResult::Fail("version"); }
+    if h.version != 1 {
+        return TestResult::Fail("version");
+    }
 
-    if h.dest_cid.len() != 8 || h.dest_cid[0] != 1 { return TestResult::Fail("dcid"); }
+    if h.dest_cid.len() != 8 || h.dest_cid[0] != 1 {
+        return TestResult::Fail("dcid");
+    }
 
-    if !h.src_cid.is_empty() { return TestResult::Fail("scid"); }
+    if !h.src_cid.is_empty() {
+        return TestResult::Fail("scid");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/quic", smoke_quic_long_header_decodes);
 
-
-
 fn smoke_quic_connection_close_frame() -> TestResult {
-
-    use crate::quic::{build_connection_close, FrameType, varint_decode};
+    use crate::quic::{build_connection_close, varint_decode, FrameType};
 
     let f = build_connection_close(0x100, 0, b"test");
 
-    if f[0] != FrameType::ConnectionCloseQuic as u8 { return TestResult::Fail("type byte"); }
+    if f[0] != FrameType::ConnectionCloseQuic as u8 {
+        return TestResult::Fail("type byte");
+    }
 
     let (code, n) = varint_decode(&f[1..]).expect("code");
 
-    if code != 0x100 { return TestResult::Fail("error code"); }
+    if code != 0x100 {
+        return TestResult::Fail("error code");
+    }
 
     let (frame_type, n2) = varint_decode(&f[1 + n..]).expect("frame_type");
 
-    if frame_type != 0 { return TestResult::Fail("frame_type"); }
+    if frame_type != 0 {
+        return TestResult::Fail("frame_type");
+    }
 
     let (rlen, _) = varint_decode(&f[1 + n + n2..]).expect("reason");
 
-    if rlen != 4 { return TestResult::Fail("reason length"); }
+    if rlen != 4 {
+        return TestResult::Fail("reason length");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/quic", smoke_quic_connection_close_frame);
 
-
-
 fn smoke_h3_frame_round_trip() -> TestResult {
-
     use crate::quic::{build_h3_frame, decode_h3_frame, H3FrameType};
 
     let payload = b"hello";
@@ -3128,12 +3152,15 @@ fn smoke_h3_frame_round_trip() -> TestResult {
 
     let (ty, body) = decode_h3_frame(&buf).expect("decode");
 
-    if ty != H3FrameType::Data as u64 { return TestResult::Fail("type"); }
+    if ty != H3FrameType::Data as u64 {
+        return TestResult::Fail("type");
+    }
 
-    if body != payload { return TestResult::Fail("body"); }
+    if body != payload {
+        return TestResult::Fail("body");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("net/h3", smoke_h3_frame_round_trip);
@@ -3207,8 +3234,7 @@ kernel_test_in!("net", smoke_net_icmp_echo_builder);
 fn smoke_udp_build_empty_payload() -> TestResult {
     use crate::pkt_udp::{build_ipv4, verify_ipv4, UDP_HDR_LEN};
     let mut out = [0u8; 16];
-    let n = build_ipv4(&mut out, [10, 0, 0, 1], [10, 0, 0, 2], 53, 53, b"")
-        .expect("build empty");
+    let n = build_ipv4(&mut out, [10, 0, 0, 1], [10, 0, 0, 2], 53, 53, b"").expect("build empty");
     if n != UDP_HDR_LEN {
         return TestResult::Fail("empty payload should produce 8-byte datagram");
     }
@@ -3346,15 +3372,12 @@ fn smoke_net_ip_checksum_known_vector() -> TestResult {
     // the checksum slot) to a checksum of 0xB1E6.
     use crate::pkt::ip_checksum;
     let bytes: [u8; 20] = [
-        0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00,
-        0xac, 0x10, 0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c,
+        0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xac, 0x10, 0x0a,
+        0x63, 0xac, 0x10, 0x0a, 0x0c,
     ];
     let cs = ip_checksum(&bytes);
     if cs != 0xB1E6 {
-        let msg = alloc::format!(
-            "ip_checksum returned {:#06x}, expected 0xb1e6",
-            cs
-        );
+        let msg = alloc::format!("ip_checksum returned {:#06x}, expected 0xb1e6", cs);
         let leaked: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
         return TestResult::Fail(leaked);
     }
@@ -3370,7 +3393,9 @@ fn smoke_net_ip_checksum_known_vector() -> TestResult {
 kernel_test_in!("net", smoke_net_ip_checksum_known_vector);
 
 fn smoke_net_ipv4_header_round_trip() -> TestResult {
-    use crate::pkt::{parse_ipv4, set_ipv4_checksum, write_ipv4_header, IPV4_HDR_LEN, IP_PROTO_UDP};
+    use crate::pkt::{
+        parse_ipv4, set_ipv4_checksum, write_ipv4_header, IPV4_HDR_LEN, IP_PROTO_UDP,
+    };
     let mut out = [0u8; 28];
     // 28 bytes total = 20 hdr + 8 UDP-shaped payload.
     {
@@ -3550,12 +3575,12 @@ kernel_test_in!("net/ipv4", smoke_ipv4_header_checksum_rfc1071_vector);
 /// Smoke 2: ARP request encode + decode round-trip (RFC 826).
 fn smoke_arp_request_encode_decode_round_trip() -> TestResult {
     use crate::pkt::{
-        build_arp_request, parse_arp, parse_eth_header, ARP_OP_REQUEST, ETHERTYPE_ARP,
-        ETH_HDR_LEN, ARP_PAYLOAD_LEN,
+        build_arp_request, parse_arp, parse_eth_header, ARP_OP_REQUEST, ARP_PAYLOAD_LEN,
+        ETHERTYPE_ARP, ETH_HDR_LEN,
     };
     let src_mac = [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56];
-    let src_ip  = [192u8, 168, 1, 1];
-    let tgt_ip  = [192u8, 168, 1, 254];
+    let src_ip = [192u8, 168, 1, 1];
+    let tgt_ip = [192u8, 168, 1, 254];
 
     let mut buf = [0u8; ETH_HDR_LEN + ARP_PAYLOAD_LEN];
     let n = build_arp_request(&mut buf, src_mac, src_ip, tgt_ip).unwrap_or(0);
@@ -3601,12 +3626,12 @@ kernel_test_in!("net/arp", smoke_arp_request_encode_decode_round_trip);
 fn smoke_arp_reply_encode_decode_round_trip() -> TestResult {
     use crate::pkt::{
         build_arp_reply, parse_arp, parse_eth_header, ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST,
-        ETHERTYPE_ARP, ETH_HDR_LEN, ARP_PAYLOAD_LEN,
+        ARP_PAYLOAD_LEN, ETHERTYPE_ARP, ETH_HDR_LEN,
     };
-    let our_mac     = [0x52u8, 0x54, 0x00, 0xAA, 0xBB, 0xCC];
-    let our_ip      = [10u8, 0, 2, 2];
-    let request     = ArpPacket {
-        op:  ARP_OP_REQUEST,
+    let our_mac = [0x52u8, 0x54, 0x00, 0xAA, 0xBB, 0xCC];
+    let our_ip = [10u8, 0, 2, 2];
+    let request = ArpPacket {
+        op: ARP_OP_REQUEST,
         sha: [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56],
         spa: [10u8, 0, 2, 15],
         tha: [0u8; 6],
@@ -3691,8 +3716,8 @@ kernel_test_in!("net/arp", smoke_arp_lru_cache_insert_lookup_evict);
 /// RFC 2132 §9.6: option 53 (DHCP Message Type) with value 1 = DISCOVER.
 fn smoke_dhcp_discover_builder_magic_cookie_and_msg_type() -> TestResult {
     use crate::pkt_dhcp::{
-        build_discover, iter_options, DhcpHeader, DHCPDISCOVER, DHCP_HDR_LEN,
-        MAGIC_COOKIE, OPT_DHCP_MESSAGE_TYPE,
+        build_discover, iter_options, DhcpHeader, DHCPDISCOVER, DHCP_HDR_LEN, MAGIC_COOKIE,
+        OPT_DHCP_MESSAGE_TYPE,
     };
 
     let mac = [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -3736,7 +3761,10 @@ fn smoke_dhcp_discover_builder_magic_cookie_and_msg_type() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/dhcp", smoke_dhcp_discover_builder_magic_cookie_and_msg_type);
+kernel_test_in!(
+    "net/dhcp",
+    smoke_dhcp_discover_builder_magic_cookie_and_msg_type
+);
 
 /// Smoke 6: DHCP OFFER decoder — yiaddr + Server Identifier + Lease Time + DNS.
 ///
@@ -3745,29 +3773,32 @@ kernel_test_in!("net/dhcp", smoke_dhcp_discover_builder_magic_cookie_and_msg_typ
 fn smoke_dhcp_offer_decoder_fields() -> TestResult {
     use crate::dhcp::on_udp_in;
     use crate::pkt_dhcp::{
-        append_end, append_message_type, append_option, DhcpHeader, DHCPOFFER,
-        OPT_DNS_SERVER, OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER,
-        OPT_SUBNET_MASK,
+        append_end, append_message_type, append_option, DhcpHeader, DHCPOFFER, OPT_DNS_SERVER,
+        OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
     };
 
     crate::dhcp::__reset_for_test();
 
-    let xid     = 0xBEEF_CAFEu32;
-    let yiaddr  = [172u8, 16, 0, 42];
-    let server  = [172u8, 16, 0, 1];
+    let xid = 0xBEEF_CAFEu32;
+    let yiaddr = [172u8, 16, 0, 42];
+    let server = [172u8, 16, 0, 1];
     let netmask = [255u8, 255, 255, 0];
     let gateway = [172u8, 16, 0, 1];
-    let dns1    = [8u8, 8, 8, 8];
-    let dns2    = [8u8, 8, 4, 4];
-    let lease   = 7200u32;
+    let dns1 = [8u8, 8, 8, 8];
+    let dns2 = [8u8, 8, 4, 4];
+    let lease = 7200u32;
 
     let mut buf = alloc::vec::Vec::with_capacity(300);
     let mut chaddr = [0u8; 16];
     chaddr[..6].copy_from_slice(&[0x52u8, 0x54, 0x00, 0xAB, 0xCD, 0xEF]);
     let hdr = DhcpHeader {
-        op: 2, htype: 1, hlen: 6, hops: 0,
+        op: 2,
+        htype: 1,
+        hlen: 6,
+        hops: 0,
         xid,
-        secs: 0, flags: 0,
+        secs: 0,
+        flags: 0,
         ciaddr: [0; 4],
         yiaddr,
         siaddr: server,
@@ -3809,18 +3840,17 @@ kernel_test_in!("net/dhcp", smoke_dhcp_offer_decoder_fields);
 fn smoke_dhcp_state_machine_discover_to_ack() -> TestResult {
     use crate::dhcp::{on_udp_in, DhcpLease, __reset_for_test};
     use crate::pkt_dhcp::{
-        append_end, append_message_type, append_option, DhcpHeader,
-        DHCPACK, DHCPOFFER, OPT_LEASE_TIME, OPT_ROUTER,
-        OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
+        append_end, append_message_type, append_option, DhcpHeader, DHCPACK, DHCPOFFER,
+        OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
     };
 
     __reset_for_test();
 
-    let xid     = 0x1234_5678u32;
+    let xid = 0x1234_5678u32;
     let offered = [192u8, 168, 10, 50];
-    let server  = [192u8, 168, 10, 1];
-    let mask    = [255u8, 255, 255, 0];
-    let gw      = [192u8, 168, 10, 1];
+    let server = [192u8, 168, 10, 1];
+    let mask = [255u8, 255, 255, 0];
+    let gw = [192u8, 168, 10, 1];
 
     // Helper: build a DHCPOFFER or DHCPACK payload and inject via on_udp_in.
     let make_reply = |msg: u8, yiaddr: [u8; 4]| {
@@ -3828,9 +3858,13 @@ fn smoke_dhcp_state_machine_discover_to_ack() -> TestResult {
         let mut chaddr = [0u8; 16];
         chaddr[..6].copy_from_slice(&[0x52u8, 0x54, 0, 0, 0, 1]);
         let hdr = DhcpHeader {
-            op: 2, htype: 1, hlen: 6, hops: 0,
+            op: 2,
+            htype: 1,
+            hlen: 6,
+            hops: 0,
             xid,
-            secs: 0, flags: 0,
+            secs: 0,
+            flags: 0,
             ciaddr: [0; 4],
             yiaddr,
             siaddr: server,
@@ -3901,11 +3935,11 @@ fn smoke_ipv4_bind_address_lookup_round_trip() -> TestResult {
 
     __reset_for_test();
 
-    let name    = "eth0.test";
-    let addr    = Ipv4Addr([10, 0, 2, 15]);
-    let mask    = Ipv4Addr([255, 255, 255, 0]);
-    let gw      = Ipv4Addr([10, 0, 2, 2]);
-    let dns     = [Ipv4Addr([8, 8, 8, 8]), Ipv4Addr([8, 8, 4, 4])];
+    let name = "eth0.test";
+    let addr = Ipv4Addr([10, 0, 2, 15]);
+    let mask = Ipv4Addr([255, 255, 255, 0]);
+    let gw = Ipv4Addr([10, 0, 2, 2]);
+    let dns = [Ipv4Addr([8, 8, 8, 8]), Ipv4Addr([8, 8, 4, 4])];
 
     bind_address(name, addr, mask, Some(gw), &dns);
 
@@ -3948,9 +3982,17 @@ fn smoke_ipv6_header_full_parse() -> TestResult {
     use crate::pkt_ipv6::Ipv6Header;
 
     let mut src = [0u8; 16];
-    src[0] = 0x20; src[1] = 0x01; src[2] = 0x0d; src[3] = 0xb8; src[15] = 0x01;
+    src[0] = 0x20;
+    src[1] = 0x01;
+    src[2] = 0x0d;
+    src[3] = 0xb8;
+    src[15] = 0x01;
     let mut dst = [0u8; 16];
-    dst[0] = 0x20; dst[1] = 0x01; dst[2] = 0x0d; dst[3] = 0xb8; dst[15] = 0x02;
+    dst[0] = 0x20;
+    dst[1] = 0x01;
+    dst[2] = 0x0d;
+    dst[3] = 0xb8;
+    dst[15] = 0x02;
     let h = Ipv6Header {
         version: 6,
         traffic_class: 0,
@@ -3984,7 +4026,9 @@ fn smoke_ipv6_ns_encode_with_source_ll() -> TestResult {
     };
 
     let mut target = [0u8; 16];
-    target[0] = 0xFE; target[1] = 0x80; target[15] = 0x42;
+    target[0] = 0xFE;
+    target[1] = 0x80;
+    target[15] = 0x42;
     let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     let body = build_ns(target, mac);
     if body[0] != ICMPV6_NEIGHBOR_SOLICITATION {
@@ -4043,7 +4087,9 @@ fn smoke_ipv6_ndp_rx_ns_for_us_emits_na() -> TestResult {
     ndp::__reset_for_test();
 
     let mut us = [0u8; 16];
-    us[0] = 0xFE; us[1] = 0x80; us[15] = 0xAB;
+    us[0] = 0xFE;
+    us[1] = 0x80;
+    us[15] = 0xAB;
     addrs::add(Ipv6IfAddr {
         iface: alloc::string::String::from("eth0"),
         addr: us,
@@ -4081,7 +4127,9 @@ fn smoke_ipv6_dad_conflict_via_ns() -> TestResult {
     ndp::__reset_for_test();
 
     let mut us = [0u8; 16];
-    us[0] = 0xFE; us[1] = 0x80; us[15] = 0x99;
+    us[0] = 0xFE;
+    us[1] = 0x80;
+    us[15] = 0x99;
     addrs::add(Ipv6IfAddr {
         iface: alloc::string::String::from("eth0"),
         addr: us,
@@ -4114,7 +4162,11 @@ fn smoke_ipv6_dad_pass_address_usable() -> TestResult {
     addrs::__reset_for_test();
 
     let mut a = [0u8; 16];
-    a[0] = 0x20; a[1] = 0x01; a[2] = 0x0d; a[3] = 0xb8; a[15] = 0xee;
+    a[0] = 0x20;
+    a[1] = 0x01;
+    a[2] = 0x0d;
+    a[3] = 0xb8;
+    a[15] = 0xee;
     addrs::add(Ipv6IfAddr {
         iface: alloc::string::String::from("eth0"),
         addr: a,
@@ -4147,7 +4199,10 @@ fn smoke_ipv6_slaac_eui64_tentative_install() -> TestResult {
     addrs::__reset_for_test();
 
     let mut prefix = [0u8; 16];
-    prefix[0] = 0x20; prefix[1] = 0x01; prefix[2] = 0x0d; prefix[3] = 0xb8;
+    prefix[0] = 0x20;
+    prefix[1] = 0x01;
+    prefix[2] = 0x0d;
+    prefix[3] = 0xb8;
     let pio = RaPrefix {
         prefix,
         prefix_len: 64,
@@ -4197,7 +4252,10 @@ fn smoke_ipv6_slaac_privacy_random_iid() -> TestResult {
     addrs::__reset_for_test();
 
     let mut prefix = [0u8; 16];
-    prefix[0] = 0x20; prefix[1] = 0x01; prefix[2] = 0x0d; prefix[3] = 0xb8;
+    prefix[0] = 0x20;
+    prefix[1] = 0x01;
+    prefix[2] = 0x0d;
+    prefix[3] = 0xb8;
     let pio = RaPrefix {
         prefix,
         prefix_len: 64,
@@ -4244,14 +4302,21 @@ fn smoke_ipv6_ra_rdnss_parsed() -> TestResult {
     data.extend_from_slice(&[0u8; 2]); // reserved
     data.extend_from_slice(&u32::MAX.to_be_bytes()); // lifetime
     let mut dns = [0u8; 16];
-    dns[0] = 0x20; dns[1] = 0x01; dns[2] = 0x48; dns[3] = 0x60; dns[14] = 0x88; dns[15] = 0x88;
+    dns[0] = 0x20;
+    dns[1] = 0x01;
+    dns[2] = 0x48;
+    dns[3] = 0x60;
+    dns[14] = 0x88;
+    dns[15] = 0x88;
     data.extend_from_slice(&dns);
     // 22 bytes; 2 + 22 = 24, multiple of 8. Good.
     let mut opts = alloc::vec::Vec::new();
     let _ = append_nd_option(&mut opts, 25, &data);
     let ra = router_advertisement(64, 0, 1800, 30000, 0, &opts);
     let mut src = [0u8; 16];
-    src[0] = 0xFE; src[1] = 0x80; src[15] = 0x01;
+    src[0] = 0xFE;
+    src[1] = 0x80;
+    src[15] = 0x01;
     let info = match ndp::on_ra("eth0", src, &ra, 1_000_000_000) {
         Some(i) => i,
         None => return TestResult::Fail("RA parse failed"),
@@ -4292,12 +4357,17 @@ fn smoke_ipv6_dhcpv6_solicit_carries_clientid_and_iana() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/ipv6", smoke_ipv6_dhcpv6_solicit_carries_clientid_and_iana);
+kernel_test_in!(
+    "net/ipv6",
+    smoke_ipv6_dhcpv6_solicit_carries_clientid_and_iana
+);
 
 /// DHCPv6 ADVERTISE decode: Server DUID + offered IAADDR extracted.
 fn smoke_ipv6_dhcpv6_advertise_decode() -> TestResult {
     use crate::ipv6::dhcpv6::DhcpV6Client;
-    use crate::pkt_dhcpv6::{append_option, DhcpV6Header, MT_ADVERTISE, OPT_IAADDR, OPT_IA_NA, OPT_SERVERID};
+    use crate::pkt_dhcpv6::{
+        append_option, DhcpV6Header, MT_ADVERTISE, OPT_IAADDR, OPT_IA_NA, OPT_SERVERID,
+    };
 
     let mut payload = alloc::vec::Vec::new();
     let hdr = DhcpV6Header {
@@ -4316,10 +4386,14 @@ fn smoke_ipv6_dhcpv6_advertise_decode() -> TestResult {
     ia_na.extend_from_slice(&0xDEADBEEFu32.to_be_bytes());
     ia_na.extend_from_slice(&3600u32.to_be_bytes()); // T1
     ia_na.extend_from_slice(&7200u32.to_be_bytes()); // T2
-    // Nested IAADDR: 16 bytes addr + 4 bytes preferred + 4 bytes valid.
+                                                     // Nested IAADDR: 16 bytes addr + 4 bytes preferred + 4 bytes valid.
     let mut iaaddr = alloc::vec::Vec::new();
     let mut a = [0u8; 16];
-    a[0] = 0x20; a[1] = 0x01; a[2] = 0x0d; a[3] = 0xb8; a[15] = 0x05;
+    a[0] = 0x20;
+    a[1] = 0x01;
+    a[2] = 0x0d;
+    a[3] = 0xb8;
+    a[15] = 0x05;
     iaaddr.extend_from_slice(&a);
     iaaddr.extend_from_slice(&7200u32.to_be_bytes());
     iaaddr.extend_from_slice(&14400u32.to_be_bytes());
@@ -4358,7 +4432,10 @@ fn smoke_ipv6_dhcpv6_state_to_bound() -> TestResult {
     }
     // Synthesize an Advertise + drive Request.
     let mut adv = alloc::vec::Vec::new();
-    let h = DhcpV6Header { msg_type: MT_ADVERTISE, transaction_id: 0xCAFE01 };
+    let h = DhcpV6Header {
+        msg_type: MT_ADVERTISE,
+        transaction_id: 0xCAFE01,
+    };
     adv.extend_from_slice(&h.encode());
     let mut srv = alloc::vec::Vec::new();
     srv.extend_from_slice(&3u16.to_be_bytes());
@@ -4371,7 +4448,9 @@ fn smoke_ipv6_dhcpv6_state_to_bound() -> TestResult {
     ia_na.extend_from_slice(&0u32.to_be_bytes());
     let mut iaaddr = alloc::vec::Vec::new();
     let mut a = [0u8; 16];
-    a[0] = 0x20; a[1] = 0x01; a[15] = 0x77;
+    a[0] = 0x20;
+    a[1] = 0x01;
+    a[15] = 0x77;
     iaaddr.extend_from_slice(&a);
     iaaddr.extend_from_slice(&3600u32.to_be_bytes());
     iaaddr.extend_from_slice(&7200u32.to_be_bytes());
@@ -4386,7 +4465,10 @@ fn smoke_ipv6_dhcpv6_state_to_bound() -> TestResult {
     let _ = c.build_request();
     // Synthesize the Reply.
     let mut reply = alloc::vec::Vec::new();
-    let h = DhcpV6Header { msg_type: MT_REPLY, transaction_id: 0xCAFE01 };
+    let h = DhcpV6Header {
+        msg_type: MT_REPLY,
+        transaction_id: 0xCAFE01,
+    };
     reply.extend_from_slice(&h.encode());
     append_option(&mut reply, OPT_SERVERID, &srv);
     append_option(&mut reply, OPT_IA_NA, &ia_na);
@@ -4407,7 +4489,10 @@ fn smoke_ipv6_routing_connected_direct() -> TestResult {
     route::__reset_for_test();
 
     let mut prefix = [0u8; 16];
-    prefix[0] = 0x20; prefix[1] = 0x01; prefix[2] = 0x0d; prefix[3] = 0xb8;
+    prefix[0] = 0x20;
+    prefix[1] = 0x01;
+    prefix[2] = 0x0d;
+    prefix[3] = 0xb8;
     route::add(Route {
         prefix,
         prefix_len: 64,
@@ -4417,7 +4502,11 @@ fn smoke_ipv6_routing_connected_direct() -> TestResult {
         valid_deadline_ns: 0,
     });
     let mut dst = [0u8; 16];
-    dst[0] = 0x20; dst[1] = 0x01; dst[2] = 0x0d; dst[3] = 0xb8; dst[15] = 0x05;
+    dst[0] = 0x20;
+    dst[1] = 0x01;
+    dst[2] = 0x0d;
+    dst[3] = 0xb8;
+    dst[15] = 0x05;
     match route::lookup(&dst, None) {
         NextHop::Direct(iface) if iface == "eth0" => TestResult::Pass,
         _ => TestResult::Fail("expected Direct(eth0)"),
@@ -4432,7 +4521,10 @@ fn smoke_ipv6_routing_default_via_gateway() -> TestResult {
     route::__reset_for_test();
 
     let mut connected = [0u8; 16];
-    connected[0] = 0x20; connected[1] = 0x01; connected[2] = 0x0d; connected[3] = 0xb8;
+    connected[0] = 0x20;
+    connected[1] = 0x01;
+    connected[2] = 0x0d;
+    connected[3] = 0xb8;
     route::add(Route {
         prefix: connected,
         prefix_len: 64,
@@ -4442,7 +4534,9 @@ fn smoke_ipv6_routing_default_via_gateway() -> TestResult {
         valid_deadline_ns: 0,
     });
     let mut gw = [0u8; 16];
-    gw[0] = 0xFE; gw[1] = 0x80; gw[15] = 0x01;
+    gw[0] = 0xFE;
+    gw[1] = 0x80;
+    gw[15] = 0x01;
     route::add(Route {
         prefix: [0u8; 16],
         prefix_len: 0,
@@ -4453,7 +4547,11 @@ fn smoke_ipv6_routing_default_via_gateway() -> TestResult {
     });
     // Off-link dst: 2606:4700::1.
     let mut dst = [0u8; 16];
-    dst[0] = 0x26; dst[1] = 0x06; dst[2] = 0x47; dst[3] = 0x00; dst[15] = 0x01;
+    dst[0] = 0x26;
+    dst[1] = 0x06;
+    dst[2] = 0x47;
+    dst[3] = 0x00;
+    dst[15] = 0x01;
     match route::lookup(&dst, None) {
         NextHop::Gateway { gateway, iface } => {
             if gateway != gw {
@@ -4476,7 +4574,9 @@ fn smoke_ipv6_routing_link_local_requires_scope() -> TestResult {
     route::__reset_for_test();
 
     let mut dst = [0u8; 16];
-    dst[0] = 0xFE; dst[1] = 0x80; dst[15] = 0x01;
+    dst[0] = 0xFE;
+    dst[1] = 0x80;
+    dst[15] = 0x01;
     match route::lookup(&dst, None) {
         NextHop::Unreachable => {}
         _ => return TestResult::Fail("LL without scope should be Unreachable"),
@@ -4557,8 +4657,10 @@ fn smoke_ipv6_fragment_reassembly_two_pieces() -> TestResult {
 
     __reset_for_test();
 
-    let mut src = [0u8; 16]; src[15] = 1;
-    let mut dst = [0u8; 16]; dst[15] = 2;
+    let mut src = [0u8; 16];
+    src[15] = 1;
+    let mut dst = [0u8; 16];
+    dst[15] = 2;
     let id = 0x12345678u32;
     // First fragment: nh=TCP, offset=0, more=1 (M=1).
     let mut frag1_hdr = [0u8; 8];
@@ -4623,8 +4725,11 @@ fn smoke_ipv6_solicited_node_multicast() -> TestResult {
     use crate::ipv6::addrs::solicited_node_multicast;
 
     let mut target = [0u8; 16];
-    target[0] = 0xFE; target[1] = 0x80;
-    target[13] = 0x12; target[14] = 0x34; target[15] = 0x56;
+    target[0] = 0xFE;
+    target[1] = 0x80;
+    target[13] = 0x12;
+    target[14] = 0x34;
+    target[15] = 0x56;
     let snm = solicited_node_multicast(&target);
     // ff02::1:ff12:3456.
     if snm[0] != 0xFF || snm[1] != 0x02 {
@@ -4646,7 +4751,9 @@ fn smoke_ipv6_mld_join_report() -> TestResult {
 
     // Group: ff02::fb (mDNS).
     let mut group = [0u8; 16];
-    group[0] = 0xFF; group[1] = 0x02; group[15] = 0xFB;
+    group[0] = 0xFF;
+    group[1] = 0x02;
+    group[15] = 0xFB;
     let body = build_join_report(group);
     if body[0] != ICMPV6_MLD2_REPORT {
         return TestResult::Fail("MLD2 Report type wrong");
@@ -4670,21 +4777,29 @@ kernel_test_in!("net/ipv6", smoke_ipv6_mld_join_report);
 /// Build a minimal IPv4 + TCP packet for the netfilter smokes.
 /// 20-byte IP header + 20-byte TCP header, total 40 bytes; everything
 /// after byte 20 is the L4 header.
-fn nf_build_tcp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, flags: u8) -> alloc::vec::Vec<u8> {
+fn nf_build_tcp(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    flags: u8,
+) -> alloc::vec::Vec<u8> {
     use alloc::vec;
     let mut p = vec![0u8; 40];
-    p[0] = 0x45;                 // ver=4, ihl=5
-    p[2] = 0x00; p[3] = 40;      // total length
-    p[8] = 64;                   // ttl
-    p[9] = 6;                    // proto = TCP
+    p[0] = 0x45; // ver=4, ihl=5
+    p[2] = 0x00;
+    p[3] = 40; // total length
+    p[8] = 64; // ttl
+    p[9] = 6; // proto = TCP
     p[12..16].copy_from_slice(&src);
     p[16..20].copy_from_slice(&dst);
     // TCP header at offset 20.
     p[20..22].copy_from_slice(&sport.to_be_bytes());
     p[22..24].copy_from_slice(&dport.to_be_bytes());
-    p[32] = 0x50;                // data offset = 5 (20 bytes)
+    p[32] = 0x50; // data offset = 5 (20 bytes)
     p[33] = flags;
-    p[34] = 0xFF; p[35] = 0xFF;  // window
+    p[34] = 0xFF;
+    p[35] = 0xFF; // window
     p
 }
 
@@ -4692,22 +4807,24 @@ fn nf_build_udp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> alloc::ve
     use alloc::vec;
     let mut p = vec![0u8; 28];
     p[0] = 0x45;
-    p[2] = 0x00; p[3] = 28;
+    p[2] = 0x00;
+    p[3] = 28;
     p[8] = 64;
     p[9] = 17;
     p[12..16].copy_from_slice(&src);
     p[16..20].copy_from_slice(&dst);
     p[20..22].copy_from_slice(&sport.to_be_bytes());
     p[22..24].copy_from_slice(&dport.to_be_bytes());
-    p[24] = 0x00; p[25] = 8;     // UDP length
-    p[26] = 0x00; p[27] = 0x00;  // csum = 0 (no checksum)
+    p[24] = 0x00;
+    p[25] = 8; // UDP length
+    p[26] = 0x00;
+    p[27] = 0x00; // csum = 0 (no checksum)
     p
 }
 
 fn smoke_nf_hook_register_dispatch() -> TestResult {
     use crate::netfilter::{
-        hooks, nf_register_hook, nf_dispatch,
-        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        hooks, nf_dispatch, nf_register_hook, HookPoint, PktCtx, Verdict, __reset_all_for_test,
     };
     use core::sync::atomic::{AtomicU32, Ordering};
     __reset_all_for_test();
@@ -4721,7 +4838,7 @@ fn smoke_nf_hook_register_dispatch() -> TestResult {
     if hooks().len(HookPoint::PreRouting) != 1 {
         return TestResult::Fail("hook didn't register");
     }
-    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let mut packet = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 1234, 80, 0x02);
     let v;
     {
         let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
@@ -4739,8 +4856,7 @@ kernel_test_in!("net/netfilter", smoke_nf_hook_register_dispatch);
 
 fn smoke_nf_hook_chain_priority_ordering() -> TestResult {
     use crate::netfilter::{
-        nf_register_hook, nf_dispatch,
-        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        nf_dispatch, nf_register_hook, HookPoint, PktCtx, Verdict, __reset_all_for_test,
     };
     use core::sync::atomic::{AtomicU32, Ordering};
     __reset_all_for_test();
@@ -4761,7 +4877,7 @@ fn smoke_nf_hook_chain_priority_ordering() -> TestResult {
     // Install priority 100 first, then 0 — chain should still run 0 first.
     nf_register_hook(HookPoint::PreRouting, 100, pri100);
     nf_register_hook(HookPoint::PreRouting, 0, pri0);
-    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let mut packet = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 1234, 80, 0x02);
     {
         let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
         let _ = nf_dispatch(&mut ctx);
@@ -4776,10 +4892,10 @@ kernel_test_in!("net/netfilter", smoke_nf_hook_chain_priority_ordering);
 fn smoke_ct_new_tcp_syn_creates_syn_sent() -> TestResult {
     use crate::netfilter::{
         conntrack::{conntrack_hook, ct, TcpCtState},
-        HookPoint, PktCtx, __reset_all_for_test, Tuple,
+        HookPoint, PktCtx, Tuple, __reset_all_for_test,
     };
     __reset_all_for_test();
-    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 5555, 80, 0x02);
+    let mut packet = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 5555, 80, 0x02);
     let id_opt;
     {
         let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
@@ -4793,10 +4909,15 @@ fn smoke_ct_new_tcp_syn_creates_syn_sent() -> TestResult {
         Some(i) => i,
         None => return TestResult::Fail("conntrack id not assigned"),
     };
-    let entry = ct().lookup(&Tuple{
-        src_ip: [10,0,0,5], dst_ip: [203,0,113,7],
-        src_port: 5555, dst_port: 80, proto: 6,
-    }).expect("entry");
+    let entry = ct()
+        .lookup(&Tuple {
+            src_ip: [10, 0, 0, 5],
+            dst_ip: [203, 0, 113, 7],
+            src_port: 5555,
+            dst_port: 80,
+            proto: 6,
+        })
+        .expect("entry");
     if entry.lock().id != id {
         return TestResult::Fail("id mismatch");
     }
@@ -4810,22 +4931,28 @@ kernel_test_in!("net/netfilter", smoke_ct_new_tcp_syn_creates_syn_sent);
 fn smoke_ct_tcp_synack_advances_to_synrecv() -> TestResult {
     use crate::netfilter::{
         conntrack::{conntrack_hook, ct, TcpCtState},
-        HookPoint, PktCtx, __reset_all_for_test, Tuple,
+        HookPoint, PktCtx, Tuple, __reset_all_for_test,
     };
     __reset_all_for_test();
     // 1) SYN: 10.0.0.5:5555 → 203.0.113.7:80
-    let mut p1 = nf_build_tcp([10,0,0,5], [203,0,113,7], 5555, 80, 0x02);
+    let mut p1 = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 5555, 80, 0x02);
     {
         let mut c1 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p1);
         let _ = conntrack_hook(&mut c1);
     }
     // 2) SYN+ACK in reply direction: 203.0.113.7:80 → 10.0.0.5:5555
-    let mut p2 = nf_build_tcp([203,0,113,7], [10,0,0,5], 80, 5555, 0x12);
+    let mut p2 = nf_build_tcp([203, 0, 113, 7], [10, 0, 0, 5], 80, 5555, 0x12);
     {
         let mut c2 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p2);
         let _ = conntrack_hook(&mut c2);
     }
-    let tuple = Tuple{ src_ip: [10,0,0,5], dst_ip: [203,0,113,7], src_port: 5555, dst_port: 80, proto: 6 };
+    let tuple = Tuple {
+        src_ip: [10, 0, 0, 5],
+        dst_ip: [203, 0, 113, 7],
+        src_port: 5555,
+        dst_port: 80,
+        proto: 6,
+    };
     let entry = ct().lookup(&tuple).expect("entry");
     let g = entry.lock();
     // After SYN+ACK the state moves to SynRecv (await ACK to become Established).
@@ -4842,19 +4969,25 @@ fn smoke_ct_udp_new_then_reply_established() -> TestResult {
         HookPoint, PktCtx, Tuple, __reset_all_for_test,
     };
     __reset_all_for_test();
-    let mut p1 = nf_build_udp([10,0,0,5], [8,8,8,8], 5555, 53);
+    let mut p1 = nf_build_udp([10, 0, 0, 5], [8, 8, 8, 8], 5555, 53);
     {
         let mut c1 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p1);
         let _ = conntrack_hook(&mut c1);
     }
-    let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:5555, dst_port:53, proto:17 };
+    let t = Tuple {
+        src_ip: [10, 0, 0, 5],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 5555,
+        dst_port: 53,
+        proto: 17,
+    };
     let entry = ct().lookup(&t).expect("entry");
     if entry.lock().state != CtState::New {
         return TestResult::Fail("first UDP packet should be NEW");
     }
     drop(entry);
     // Reply.
-    let mut p2 = nf_build_udp([8,8,8,8], [10,0,0,5], 53, 5555);
+    let mut p2 = nf_build_udp([8, 8, 8, 8], [10, 0, 0, 5], 53, 5555);
     {
         let mut c2 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p2);
         let _ = conntrack_hook(&mut c2);
@@ -4873,7 +5006,13 @@ fn smoke_ct_expiry_evicts_idle_entry() -> TestResult {
         Tuple, __reset_all_for_test,
     };
     __reset_all_for_test();
-    let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:5555, dst_port:53, proto:17 };
+    let t = Tuple {
+        src_ip: [10, 0, 0, 5],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 5555,
+        dst_port: 53,
+        proto: 17,
+    };
     let _ = ct().insert_new(t, 0);
     if ct().len() != 1 {
         return TestResult::Fail("entry should exist");
@@ -4891,16 +5030,37 @@ fn smoke_ct_expiry_evicts_idle_entry() -> TestResult {
 kernel_test_in!("net/netfilter", smoke_ct_expiry_evicts_idle_entry);
 
 fn smoke_ct_lru_evicts_oldest_at_capacity() -> TestResult {
-    use crate::netfilter::{
-        conntrack::Conntrack,
-        Tuple,
-    };
+    use crate::netfilter::{conntrack::Conntrack, Tuple};
     // Use a dedicated table cap-3 to verify the LRU eviction policy.
     let table = Conntrack::new(3);
-    let t1 = Tuple{src_ip:[10,0,0,1], dst_ip:[8,8,8,8], src_port:1, dst_port:53, proto:17};
-    let t2 = Tuple{src_ip:[10,0,0,2], dst_ip:[8,8,8,8], src_port:2, dst_port:53, proto:17};
-    let t3 = Tuple{src_ip:[10,0,0,3], dst_ip:[8,8,8,8], src_port:3, dst_port:53, proto:17};
-    let t4 = Tuple{src_ip:[10,0,0,4], dst_ip:[8,8,8,8], src_port:4, dst_port:53, proto:17};
+    let t1 = Tuple {
+        src_ip: [10, 0, 0, 1],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 1,
+        dst_port: 53,
+        proto: 17,
+    };
+    let t2 = Tuple {
+        src_ip: [10, 0, 0, 2],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 2,
+        dst_port: 53,
+        proto: 17,
+    };
+    let t3 = Tuple {
+        src_ip: [10, 0, 0, 3],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 3,
+        dst_port: 53,
+        proto: 17,
+    };
+    let t4 = Tuple {
+        src_ip: [10, 0, 0, 4],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 4,
+        dst_port: 53,
+        proto: 17,
+    };
     let _ = table.insert_new(t1, 100);
     let _ = table.insert_new(t2, 200);
     let _ = table.insert_new(t3, 300);
@@ -4924,12 +5084,12 @@ kernel_test_in!("net/netfilter", smoke_ct_lru_evicts_oldest_at_capacity);
 
 fn smoke_nat_masquerade_rewrites_egress() -> TestResult {
     use crate::netfilter::{
-        nat::{nat_masquerade_add, snat_postrouting, nat},
+        nat::{nat, nat_masquerade_add, snat_postrouting},
         HookPoint, PktCtx, Verdict, __reset_all_for_test,
     };
     __reset_all_for_test();
-    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
-    let mut packet = nf_build_tcp([10,0,0,5], [198,51,100,1], 1234, 80, 0x02);
+    nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
+    let mut packet = nf_build_tcp([10, 0, 0, 5], [198, 51, 100, 1], 1234, 80, 0x02);
     let ct_id;
     let v;
     {
@@ -4941,7 +5101,7 @@ fn smoke_nat_masquerade_rewrites_egress() -> TestResult {
         return TestResult::Fail("verdict should be Accept");
     }
     let new_src = [packet[12], packet[13], packet[14], packet[15]];
-    if new_src != [203,0,113,7] {
+    if new_src != [203, 0, 113, 7] {
         return TestResult::Fail("src IP should be rewritten to 203.0.113.7");
     }
     let new_sport = u16::from_be_bytes([packet[20], packet[21]]);
@@ -4958,25 +5118,25 @@ kernel_test_in!("net/netfilter", smoke_nat_masquerade_rewrites_egress);
 
 fn smoke_nat_reverse_restores_dst_on_reply() -> TestResult {
     use crate::netfilter::{
-        nat::{nat_masquerade_add, snat_postrouting, dnat_prerouting},
+        nat::{dnat_prerouting, nat_masquerade_add, snat_postrouting},
         HookPoint, PktCtx, __reset_all_for_test,
     };
     __reset_all_for_test();
-    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
-    let mut egress = nf_build_tcp([10,0,0,5], [198,51,100,1], 1234, 80, 0x02);
+    nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
+    let mut egress = nf_build_tcp([10, 0, 0, 5], [198, 51, 100, 1], 1234, 80, 0x02);
     {
         let mut ec = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut egress);
         let _ = snat_postrouting(&mut ec);
     }
     let nat_sport = u16::from_be_bytes([egress[20], egress[21]]);
-    let mut reply = nf_build_tcp([198,51,100,1], [203,0,113,7], 80, nat_sport, 0x12);
+    let mut reply = nf_build_tcp([198, 51, 100, 1], [203, 0, 113, 7], 80, nat_sport, 0x12);
     {
         let mut rc = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut reply);
         let _ = dnat_prerouting(&mut rc);
     }
     let new_dst = [reply[16], reply[17], reply[18], reply[19]];
     let new_dport = u16::from_be_bytes([reply[22], reply[23]]);
-    if new_dst != [10,0,0,5] {
+    if new_dst != [10, 0, 0, 5] {
         return TestResult::Fail("reply dst IP should be restored to 10.0.0.5");
     }
     if new_dport != 1234 {
@@ -4992,14 +5152,14 @@ fn smoke_nat_port_collision_reallocates() -> TestResult {
         HookPoint, PktCtx, __reset_all_for_test,
     };
     __reset_all_for_test();
-    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
-    let mut a = nf_build_tcp([10,0,0,5], [198,51,100,1], 32768, 80, 0x02);
+    nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
+    let mut a = nf_build_tcp([10, 0, 0, 5], [198, 51, 100, 1], 32768, 80, 0x02);
     {
         let mut ac = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut a);
         let _ = snat_postrouting(&mut ac);
     }
     let a_sport = u16::from_be_bytes([a[20], a[21]]);
-    let mut b = nf_build_tcp([10,0,0,6], [198,51,100,1], 32768, 80, 0x02);
+    let mut b = nf_build_tcp([10, 0, 0, 6], [198, 51, 100, 1], 32768, 80, 0x02);
     {
         let mut bc = PktCtx::new_ipv4(HookPoint::PostRouting, "", "eth0", &mut b);
         let _ = snat_postrouting(&mut bc);
@@ -5014,14 +5174,14 @@ kernel_test_in!("net/netfilter", smoke_nat_port_collision_reallocates);
 
 fn smoke_filter_drop_rule_at_prerouting() -> TestResult {
     use crate::netfilter::{
-        filter::{nf_table_add, filter_prerouting},
+        filter::{filter_prerouting, nf_table_add},
         rules::Match,
         HookPoint, PktCtx, Verdict, __reset_all_for_test,
     };
     __reset_all_for_test();
-    let m = Match::from_src_ip([10,0,0,99]);
+    let m = Match::from_src_ip([10, 0, 0, 99]);
     nf_table_add("filter", "prerouting", m, Verdict::Drop);
-    let mut packet = nf_build_tcp([10,0,0,99], [203,0,113,7], 1234, 80, 0x02);
+    let mut packet = nf_build_tcp([10, 0, 0, 99], [203, 0, 113, 7], 1234, 80, 0x02);
     let v;
     {
         let mut ctx = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut packet);
@@ -5030,7 +5190,7 @@ fn smoke_filter_drop_rule_at_prerouting() -> TestResult {
     if v != Verdict::Drop {
         return TestResult::Fail("matching DROP rule should yield Verdict::Drop");
     }
-    let mut p2 = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let mut p2 = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 1234, 80, 0x02);
     let v2;
     {
         let mut c2 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut p2);
@@ -5045,11 +5205,10 @@ kernel_test_in!("net/netfilter", smoke_filter_drop_rule_at_prerouting);
 
 fn smoke_filter_default_policy_accept() -> TestResult {
     use crate::netfilter::{
-        filter::filter_input,
-        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        filter::filter_input, HookPoint, PktCtx, Verdict, __reset_all_for_test,
     };
     __reset_all_for_test();
-    let mut packet = nf_build_tcp([10,0,0,5], [203,0,113,7], 1234, 80, 0x02);
+    let mut packet = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 1234, 80, 0x02);
     let v;
     {
         let mut ctx = PktCtx::new_ipv4(HookPoint::LocalIn, "eth0", "", &mut packet);
@@ -5069,7 +5228,11 @@ fn smoke_icmp_ratelimit_drops_excess() -> TestResult {
     let mut accepted = 0u32;
     let mut dropped = 0u32;
     for _ in 0..1100 {
-        if rl.try_acquire(0) { accepted += 1; } else { dropped += 1; }
+        if rl.try_acquire(0) {
+            accepted += 1;
+        } else {
+            dropped += 1;
+        }
     }
     if accepted != 1000 {
         return TestResult::Fail("bucket cap should yield ~1000 accepts");
@@ -5084,13 +5247,13 @@ kernel_test_in!("net/netfilter", smoke_icmp_ratelimit_drops_excess);
 
 fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
     use crate::netfilter::{
-        nat::{nat_masquerade_add, snat_postrouting, dnat_prerouting},
         conntrack::{conntrack_hook, ct, TcpCtState},
+        nat::{dnat_prerouting, nat_masquerade_add, snat_postrouting},
         HookPoint, PktCtx, Tuple, __reset_all_for_test,
     };
     __reset_all_for_test();
-    nat_masquerade_add("eth0", [10,0,0,0], 24, [203,0,113,7]);
-    let mut syn = nf_build_tcp([10,0,0,5], [8,8,8,8], 42000, 80, 0x02);
+    nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
+    let mut syn = nf_build_tcp([10, 0, 0, 5], [8, 8, 8, 8], 42000, 80, 0x02);
     {
         let mut c1 = PktCtx::new_ipv4(HookPoint::PreRouting, "eth0", "", &mut syn);
         let _ = conntrack_hook(&mut c1);
@@ -5101,10 +5264,10 @@ fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
     }
     let nat_sport = u16::from_be_bytes([syn[20], syn[21]]);
     let new_src = [syn[12], syn[13], syn[14], syn[15]];
-    if new_src != [203,0,113,7] {
+    if new_src != [203, 0, 113, 7] {
         return TestResult::Fail("egress src not masqueraded");
     }
-    let mut synack = nf_build_tcp([8,8,8,8], [203,0,113,7], 80, nat_sport, 0x12);
+    let mut synack = nf_build_tcp([8, 8, 8, 8], [203, 0, 113, 7], 80, nat_sport, 0x12);
     // Linux PRE_ROUTING priorities: conntrack (-200) runs before
     // NAT_DST (-100). Conntrack needs the pre-DNAT tuple to match
     // the entry's reply (8.8.8.8 → 203.0.113.7:nat_sport).
@@ -5118,10 +5281,16 @@ fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
     }
     let dst = [synack[16], synack[17], synack[18], synack[19]];
     let dport = u16::from_be_bytes([synack[22], synack[23]]);
-    if dst != [10,0,0,5] || dport != 42000 {
+    if dst != [10, 0, 0, 5] || dport != 42000 {
         return TestResult::Fail("reply dst not restored");
     }
-    let t = Tuple{ src_ip:[10,0,0,5], dst_ip:[8,8,8,8], src_port:42000, dst_port:80, proto:6 };
+    let t = Tuple {
+        src_ip: [10, 0, 0, 5],
+        dst_ip: [8, 8, 8, 8],
+        src_port: 42000,
+        dst_port: 80,
+        proto: 6,
+    };
     let entry = ct().lookup(&t).expect("entry");
     let state = entry.lock().tcp_state;
     if state != Some(TcpCtState::SynRecv) {
@@ -5201,9 +5370,18 @@ fn smoke_bypass_ring_fill_rx_spsc() -> TestResult {
         Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
     };
     let mut parts = crate::bypass::XdpSocket::create(umem);
-    let s0 = crate::bypass::UmemSlot { frame_idx: 0, len: 0 };
-    let s1 = crate::bypass::UmemSlot { frame_idx: 1, len: 0 };
-    let s2 = crate::bypass::UmemSlot { frame_idx: 2, len: 0 };
+    let s0 = crate::bypass::UmemSlot {
+        frame_idx: 0,
+        len: 0,
+    };
+    let s1 = crate::bypass::UmemSlot {
+        frame_idx: 1,
+        len: 0,
+    };
+    let s2 = crate::bypass::UmemSlot {
+        frame_idx: 2,
+        len: 0,
+    };
     parts.fill_prod.try_send(s0.pack()).expect("fill 0");
     parts.fill_prod.try_send(s1.pack()).expect("fill 1");
     parts.fill_prod.try_send(s2.pack()).expect("fill 2");
@@ -5227,7 +5405,10 @@ fn smoke_bypass_ring_tx_completion_spsc() -> TestResult {
         Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
     };
     let mut parts = crate::bypass::XdpSocket::create(umem);
-    let slot = crate::bypass::UmemSlot { frame_idx: 1, len: 64 };
+    let slot = crate::bypass::UmemSlot {
+        frame_idx: 1,
+        len: 64,
+    };
     parts.tx_prod.try_send(slot.pack()).expect("tx push");
     let got = parts.socket.pop_tx().expect("tx pop");
     if got.frame_idx != 1 || got.len != 64 {
@@ -5257,7 +5438,13 @@ fn smoke_bypass_classifier_per_flow_match() -> TestResult {
     let mut parts = crate::bypass::XdpSocket::create(umem);
     parts
         .fill_prod
-        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .try_send(
+            crate::bypass::UmemSlot {
+                frame_idx: 0,
+                len: 0,
+            }
+            .pack(),
+        )
         .expect("fill");
     let key = crate::bypass::FlowKey {
         src_ip: [0; 4],
@@ -5320,7 +5507,13 @@ fn smoke_bypass_classifier_wildcard_matches() -> TestResult {
     let mut parts = crate::bypass::XdpSocket::create(umem);
     parts
         .fill_prod
-        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .try_send(
+            crate::bypass::UmemSlot {
+                frame_idx: 0,
+                len: 0,
+            }
+            .pack(),
+        )
         .expect("fill");
     let key = crate::bypass::FlowKey::default();
     let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
@@ -5347,11 +5540,23 @@ fn smoke_bypass_classifier_lpm_more_specific_wins() -> TestResult {
     let mut parts_b = crate::bypass::XdpSocket::create(umem_b);
     parts_a
         .fill_prod
-        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .try_send(
+            crate::bypass::UmemSlot {
+                frame_idx: 0,
+                len: 0,
+            }
+            .pack(),
+        )
         .expect("fill-a");
     parts_b
         .fill_prod
-        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .try_send(
+            crate::bypass::UmemSlot {
+                frame_idx: 0,
+                len: 0,
+            }
+            .pack(),
+        )
         .expect("fill-b");
     let wide = crate::bypass::FlowKey::default();
     let _ = crate::bypass::register_flow(wide, parts_a.socket.clone()).expect("wide");
@@ -5577,7 +5782,13 @@ fn smoke_bypass_end_to_end_rx() -> TestResult {
     let mut parts = crate::bypass::XdpSocket::create(umem.clone());
     parts
         .fill_prod
-        .try_send(crate::bypass::UmemSlot { frame_idx: 0, len: 0 }.pack())
+        .try_send(
+            crate::bypass::UmemSlot {
+                frame_idx: 0,
+                len: 0,
+            }
+            .pack(),
+        )
         .expect("fill");
     let key = crate::bypass::FlowKey::default();
     let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
@@ -5637,7 +5848,10 @@ fn smoke_bypass_flow_key_specificity() -> TestResult {
 kernel_test_in!("net/bypass", smoke_bypass_flow_key_specificity);
 
 fn smoke_bypass_umem_slot_pack_unpack() -> TestResult {
-    let s = crate::bypass::UmemSlot { frame_idx: 0xCAFE_BABE, len: 0xDEAD_BEEF };
+    let s = crate::bypass::UmemSlot {
+        frame_idx: 0xCAFE_BABE,
+        len: 0xDEAD_BEEF,
+    };
     let packed = s.pack();
     let back = crate::bypass::UmemSlot::unpack(packed);
     if back != s {
@@ -5680,10 +5894,10 @@ fn bypass_build_eth_ipv4_tcp(dst_ip: [u8; 4], dst_port: u16) -> alloc::vec::Vec<
 // ── FIB / routing / ARP-cache smokes ─────────────────────────────────
 
 fn smoke_route_lpm_specific_wins() -> TestResult {
-    use crate::route::{route_add, Scope, TABLE_MAIN, __reset_for_test};
-    use crate::route::{Ipv4Net, Route};
-    use crate::ipv4::Ipv4Addr;
     use crate::ifaddr::__reset_for_test as ifaddr_reset;
+    use crate::ipv4::Ipv4Addr;
+    use crate::route::{route_add, Scope, __reset_for_test, TABLE_MAIN};
+    use crate::route::{Ipv4Net, Route};
     use alloc::string::String;
 
     __reset_for_test();
@@ -5691,34 +5905,50 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
 
     // /32 > /24 > /0
     route_add(Route {
-        dst: Ipv4Net { addr: Ipv4Addr([0,0,0,0]), prefix_len: 0 },
-        gateway: Some(Ipv4Addr([10,0,2,2])),
+        dst: Ipv4Net {
+            addr: Ipv4Addr([0, 0, 0, 0]),
+            prefix_len: 0,
+        },
+        gateway: Some(Ipv4Addr([10, 0, 2, 2])),
         iface: String::from("eth0"),
-        src_hint: None, metric: 100, scope: Scope::Universe, table: TABLE_MAIN,
+        src_hint: None,
+        metric: 100,
+        scope: Scope::Universe,
+        table: TABLE_MAIN,
     });
     route_add(Route {
-        dst: Ipv4Net { addr: Ipv4Addr([192,168,1,0]), prefix_len: 24 },
+        dst: Ipv4Net {
+            addr: Ipv4Addr([192, 168, 1, 0]),
+            prefix_len: 24,
+        },
         gateway: None,
         iface: String::from("eth0"),
-        src_hint: Some(Ipv4Addr([192,168,1,10])),
-        metric: 0, scope: Scope::Link, table: TABLE_MAIN,
+        src_hint: Some(Ipv4Addr([192, 168, 1, 10])),
+        metric: 0,
+        scope: Scope::Link,
+        table: TABLE_MAIN,
     });
     route_add(Route {
-        dst: Ipv4Net { addr: Ipv4Addr([192,168,1,1]), prefix_len: 32 },
+        dst: Ipv4Net {
+            addr: Ipv4Addr([192, 168, 1, 1]),
+            prefix_len: 32,
+        },
         gateway: None,
         iface: String::from("eth0"),
-        src_hint: Some(Ipv4Addr([192,168,1,10])),
-        metric: 0, scope: Scope::Host, table: TABLE_MAIN,
+        src_hint: Some(Ipv4Addr([192, 168, 1, 10])),
+        metric: 0,
+        scope: Scope::Host,
+        table: TABLE_MAIN,
     });
 
-    let r = match crate::route::route_lookup_raw(Ipv4Addr([192,168,1,1])) {
+    let r = match crate::route::route_lookup_raw(Ipv4Addr([192, 168, 1, 1])) {
         Some(r) => r,
         None => return TestResult::Fail("no route found for 192.168.1.1"),
     };
     if r.dst.prefix_len != 32 {
         return TestResult::Fail("/32 should beat /24 and /0");
     }
-    let r24 = match crate::route::route_lookup_raw(Ipv4Addr([192,168,1,5])) {
+    let r24 = match crate::route::route_lookup_raw(Ipv4Addr([192, 168, 1, 5])) {
         Some(r) => r,
         None => return TestResult::Fail("no route for 192.168.1.5"),
     };
@@ -5730,30 +5960,36 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
 kernel_test_in!("net/route", smoke_route_lpm_specific_wins);
 
 fn smoke_route_default_fallback() -> TestResult {
-    use crate::route::{route_add, route_lookup_raw, Scope, TABLE_MAIN, __reset_for_test};
-    use crate::route::{Ipv4Net, Route};
     use crate::ipv4::Ipv4Addr;
+    use crate::route::{route_add, route_lookup_raw, Scope, __reset_for_test, TABLE_MAIN};
+    use crate::route::{Ipv4Net, Route};
     use alloc::string::String;
 
     __reset_for_test();
     route_add(Route {
-        dst: Ipv4Net { addr: Ipv4Addr([0,0,0,0]), prefix_len: 0 },
-        gateway: Some(Ipv4Addr([10,0,2,2])),
+        dst: Ipv4Net {
+            addr: Ipv4Addr([0, 0, 0, 0]),
+            prefix_len: 0,
+        },
+        gateway: Some(Ipv4Addr([10, 0, 2, 2])),
         iface: String::from("eth0"),
-        src_hint: None, metric: 100, scope: Scope::Universe, table: TABLE_MAIN,
+        src_hint: None,
+        metric: 100,
+        scope: Scope::Universe,
+        table: TABLE_MAIN,
     });
 
-    let r = match route_lookup_raw(Ipv4Addr([8,8,8,8])) {
+    let r = match route_lookup_raw(Ipv4Addr([8, 8, 8, 8])) {
         Some(r) => r,
         None => return TestResult::Fail("default route not found for 8.8.8.8"),
     };
     if r.dst.prefix_len != 0 {
         return TestResult::Fail("expected default route (prefix 0)");
     }
-    if r.gateway != Some(Ipv4Addr([10,0,2,2])) {
+    if r.gateway != Some(Ipv4Addr([10, 0, 2, 2])) {
         return TestResult::Fail("gateway mismatch on default route");
     }
-    let r2 = match route_lookup_raw(Ipv4Addr([0,0,0,0])) {
+    let r2 = match route_lookup_raw(Ipv4Addr([0, 0, 0, 0])) {
         Some(r) => r,
         None => return TestResult::Fail("no route for 0.0.0.0"),
     };
@@ -5765,13 +6001,13 @@ fn smoke_route_default_fallback() -> TestResult {
 kernel_test_in!("net/route", smoke_route_default_fallback);
 
 fn smoke_route_loopback() -> TestResult {
-    use crate::route::{install_loopback_route, route_lookup_raw, __reset_for_test};
     use crate::ipv4::Ipv4Addr;
+    use crate::route::{__reset_for_test, install_loopback_route, route_lookup_raw};
 
     __reset_for_test();
     install_loopback_route();
 
-    let r = match route_lookup_raw(Ipv4Addr([127,0,0,1])) {
+    let r = match route_lookup_raw(Ipv4Addr([127, 0, 0, 1])) {
         Some(r) => r,
         None => return TestResult::Fail("127.0.0.1 must route to loopback"),
     };
@@ -5781,7 +6017,7 @@ fn smoke_route_loopback() -> TestResult {
     if r.gateway.is_some() {
         return TestResult::Fail("loopback route must be direct (no gateway)");
     }
-    let r2 = match route_lookup_raw(Ipv4Addr([127,100,200,1])) {
+    let r2 = match route_lookup_raw(Ipv4Addr([127, 100, 200, 1])) {
         Some(r) => r,
         None => return TestResult::Fail("127.x.x.x must route to loopback"),
     };
@@ -5793,55 +6029,73 @@ fn smoke_route_loopback() -> TestResult {
 kernel_test_in!("net/route", smoke_route_loopback);
 
 fn smoke_src_selection_direct_subnet() -> TestResult {
-    use crate::route::{src_for, __reset_for_test};
-    use crate::ifaddr::{iface_add_addr, __reset_for_test as ifaddr_reset};
+    use crate::ifaddr::{__reset_for_test as ifaddr_reset, iface_add_addr};
     use crate::ipv4::Ipv4Addr;
+    use crate::route::{__reset_for_test, src_for};
 
     __reset_for_test();
     ifaddr_reset();
-    iface_add_addr("eth0", Ipv4Addr([10,1,0,1]), 24);
+    iface_add_addr("eth0", Ipv4Addr([10, 1, 0, 1]), 24);
 
-    let (iface, src, gw) = match src_for(Ipv4Addr([10,1,0,5])) {
+    let (iface, src, gw) = match src_for(Ipv4Addr([10, 1, 0, 5])) {
         Some(t) => t,
         None => return TestResult::Fail("no route/src for direct subnet dest"),
     };
-    if iface != "eth0" { return TestResult::Fail("wrong egress iface"); }
-    if src.0 != [10,1,0,1] { return TestResult::Fail("src should be 10.1.0.1"); }
-    if gw.is_some() { return TestResult::Fail("direct: no gateway expected"); }
+    if iface != "eth0" {
+        return TestResult::Fail("wrong egress iface");
+    }
+    if src.0 != [10, 1, 0, 1] {
+        return TestResult::Fail("src should be 10.1.0.1");
+    }
+    if gw.is_some() {
+        return TestResult::Fail("direct: no gateway expected");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/route", smoke_src_selection_direct_subnet);
 
 fn smoke_src_selection_via_gateway() -> TestResult {
-    use crate::route::{route_add, src_for, Scope, TABLE_MAIN, __reset_for_test};
-    use crate::route::{Ipv4Net, Route};
-    use crate::ifaddr::{iface_add_addr, __reset_for_test as ifaddr_reset};
+    use crate::ifaddr::{__reset_for_test as ifaddr_reset, iface_add_addr};
     use crate::ipv4::Ipv4Addr;
+    use crate::route::{route_add, src_for, Scope, __reset_for_test, TABLE_MAIN};
+    use crate::route::{Ipv4Net, Route};
     use alloc::string::String;
 
     __reset_for_test();
     ifaddr_reset();
-    iface_add_addr("eth0", Ipv4Addr([192,168,1,10]), 24);
+    iface_add_addr("eth0", Ipv4Addr([192, 168, 1, 10]), 24);
     route_add(Route {
-        dst: Ipv4Net { addr: Ipv4Addr([0,0,0,0]), prefix_len: 0 },
-        gateway: Some(Ipv4Addr([192,168,1,1])),
+        dst: Ipv4Net {
+            addr: Ipv4Addr([0, 0, 0, 0]),
+            prefix_len: 0,
+        },
+        gateway: Some(Ipv4Addr([192, 168, 1, 1])),
         iface: String::from("eth0"),
-        src_hint: None, metric: 100, scope: Scope::Universe, table: TABLE_MAIN,
+        src_hint: None,
+        metric: 100,
+        scope: Scope::Universe,
+        table: TABLE_MAIN,
     });
 
-    let (iface, src, gw) = match src_for(Ipv4Addr([8,8,8,8])) {
+    let (iface, src, gw) = match src_for(Ipv4Addr([8, 8, 8, 8])) {
         Some(t) => t,
         None => return TestResult::Fail("no route/src for 8.8.8.8"),
     };
-    if iface != "eth0" { return TestResult::Fail("wrong egress iface"); }
-    if src.0 != [192,168,1,10] { return TestResult::Fail("src should be 192.168.1.10"); }
-    if gw != Some(Ipv4Addr([192,168,1,1])) { return TestResult::Fail("gateway mismatch"); }
+    if iface != "eth0" {
+        return TestResult::Fail("wrong egress iface");
+    }
+    if src.0 != [192, 168, 1, 10] {
+        return TestResult::Fail("src should be 192.168.1.10");
+    }
+    if gw != Some(Ipv4Addr([192, 168, 1, 1])) {
+        return TestResult::Fail("gateway mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/route", smoke_src_selection_via_gateway);
 
 fn smoke_arp_cache_incomplete_to_reachable() -> TestResult {
-    use crate::arp_cache::{mark_incomplete, insert, entry_state, ArpState, __reset_for_test};
+    use crate::arp_cache::{entry_state, insert, mark_incomplete, ArpState, __reset_for_test};
 
     __reset_for_test();
     let ip = [10u8, 0, 0, 1];
@@ -5861,7 +6115,7 @@ fn smoke_arp_cache_incomplete_to_reachable() -> TestResult {
 kernel_test_in!("net/arp_cache", smoke_arp_cache_incomplete_to_reachable);
 
 fn smoke_arp_cache_reachable_to_stale() -> TestResult {
-    use crate::arp_cache::{__insert_with_expiry, lookup, entry_state, ArpState, __reset_for_test};
+    use crate::arp_cache::{__insert_with_expiry, entry_state, lookup, ArpState, __reset_for_test};
 
     __reset_for_test();
     let ip = [10u8, 0, 0, 2];
@@ -5870,7 +6124,9 @@ fn smoke_arp_cache_reachable_to_stale() -> TestResult {
     __insert_with_expiry("eth0", ip, mac, 1);
 
     let m = lookup("eth0", ip);
-    if m.is_none() { return TestResult::Fail("stale entry should return MAC"); }
+    if m.is_none() {
+        return TestResult::Fail("stale entry should return MAC");
+    }
     match entry_state("eth0", ip) {
         Some(ArpState::Probe) => TestResult::Pass,
         _ => TestResult::Fail("expected Probe after lookup on expired entry"),
@@ -5879,7 +6135,7 @@ fn smoke_arp_cache_reachable_to_stale() -> TestResult {
 kernel_test_in!("net/arp_cache", smoke_arp_cache_reachable_to_stale);
 
 fn smoke_arp_cache_eviction_lru() -> TestResult {
-    use crate::arp_cache::{insert, entry_count, get_entry, MAX_ENTRIES, __reset_for_test};
+    use crate::arp_cache::{__reset_for_test, entry_count, get_entry, insert, MAX_ENTRIES};
 
     __reset_for_test();
     for i in 0u32..MAX_ENTRIES as u32 {
@@ -5903,7 +6159,7 @@ fn smoke_arp_cache_eviction_lru() -> TestResult {
 kernel_test_in!("net/arp_cache", smoke_arp_cache_eviction_lru);
 
 fn smoke_arp_cache_multi_iface_separation() -> TestResult {
-    use crate::arp_cache::{insert, get_entry, __reset_for_test};
+    use crate::arp_cache::{__reset_for_test, get_entry, insert};
 
     __reset_for_test();
     let ip = [192u8, 168, 1, 1];
@@ -5914,30 +6170,40 @@ fn smoke_arp_cache_multi_iface_separation() -> TestResult {
 
     let e0 = get_entry("eth0", ip).expect("eth0 entry");
     let e1 = get_entry("eth1", ip).expect("eth1 entry");
-    if e0.mac != mac1 { return TestResult::Fail("eth0 MAC wrong"); }
-    if e1.mac != mac2 { return TestResult::Fail("eth1 MAC wrong"); }
-    if e0.mac == e1.mac { return TestResult::Fail("ifaces must have separate MACs"); }
+    if e0.mac != mac1 {
+        return TestResult::Fail("eth0 MAC wrong");
+    }
+    if e1.mac != mac2 {
+        return TestResult::Fail("eth1 MAC wrong");
+    }
+    if e0.mac == e1.mac {
+        return TestResult::Fail("ifaces must have separate MACs");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/arp_cache", smoke_arp_cache_multi_iface_separation);
 
 fn smoke_iface_addr_connected_route_auto_installed() -> TestResult {
-    use crate::ifaddr::{iface_add_addr, iface_addrs, __reset_for_test as ifaddr_reset};
-    use crate::route::{route_lookup_raw, __reset_for_test as route_reset};
+    use crate::ifaddr::{__reset_for_test as ifaddr_reset, iface_add_addr, iface_addrs};
     use crate::ipv4::Ipv4Addr;
+    use crate::route::{__reset_for_test as route_reset, route_lookup_raw};
 
     route_reset();
     ifaddr_reset();
-    iface_add_addr("eth0", Ipv4Addr([172,16,5,1]), 16);
+    iface_add_addr("eth0", Ipv4Addr([172, 16, 5, 1]), 16);
 
-    let r = match route_lookup_raw(Ipv4Addr([172,16,100,50])) {
+    let r = match route_lookup_raw(Ipv4Addr([172, 16, 100, 50])) {
         Some(r) => r,
         None => return TestResult::Fail("connected route for 172.16.0.0/16 not installed"),
     };
-    if r.iface != "eth0" { return TestResult::Fail("connected route must use eth0"); }
-    if r.dst.prefix_len != 16 { return TestResult::Fail("prefix_len should be 16"); }
+    if r.iface != "eth0" {
+        return TestResult::Fail("connected route must use eth0");
+    }
+    if r.dst.prefix_len != 16 {
+        return TestResult::Fail("prefix_len should be 16");
+    }
     let addrs = iface_addrs("eth0");
-    if addrs.is_empty() || addrs[0].addr.0 != [172,16,5,1] {
+    if addrs.is_empty() || addrs[0].addr.0 != [172, 16, 5, 1] {
         return TestResult::Fail("iface_addrs should return the added address");
     }
     TestResult::Pass
@@ -5945,35 +6211,43 @@ fn smoke_iface_addr_connected_route_auto_installed() -> TestResult {
 kernel_test_in!("net/route", smoke_iface_addr_connected_route_auto_installed);
 
 fn smoke_route_multi_iface_egress() -> TestResult {
-    use crate::route::{src_for, __reset_for_test};
-    use crate::ifaddr::{iface_add_addr, __reset_for_test as ifaddr_reset};
+    use crate::ifaddr::{__reset_for_test as ifaddr_reset, iface_add_addr};
     use crate::ipv4::Ipv4Addr;
+    use crate::route::{__reset_for_test, src_for};
 
     __reset_for_test();
     ifaddr_reset();
-    iface_add_addr("iface1", Ipv4Addr([10,1,0,1]), 24);
-    iface_add_addr("iface2", Ipv4Addr([10,2,0,1]), 24);
+    iface_add_addr("iface1", Ipv4Addr([10, 1, 0, 1]), 24);
+    iface_add_addr("iface2", Ipv4Addr([10, 2, 0, 1]), 24);
 
-    let (iface_a, src_a, _) = match src_for(Ipv4Addr([10,1,0,5])) {
+    let (iface_a, src_a, _) = match src_for(Ipv4Addr([10, 1, 0, 5])) {
         Some(t) => t,
         None => return TestResult::Fail("no route to 10.1.0.5"),
     };
-    if iface_a != "iface1" { return TestResult::Fail("10.1.0.5 should egress via iface1"); }
-    if src_a.0 != [10,1,0,1] { return TestResult::Fail("src for iface1 should be 10.1.0.1"); }
+    if iface_a != "iface1" {
+        return TestResult::Fail("10.1.0.5 should egress via iface1");
+    }
+    if src_a.0 != [10, 1, 0, 1] {
+        return TestResult::Fail("src for iface1 should be 10.1.0.1");
+    }
 
-    let (iface_b, src_b, _) = match src_for(Ipv4Addr([10,2,0,5])) {
+    let (iface_b, src_b, _) = match src_for(Ipv4Addr([10, 2, 0, 5])) {
         Some(t) => t,
         None => return TestResult::Fail("no route to 10.2.0.5"),
     };
-    if iface_b != "iface2" { return TestResult::Fail("10.2.0.5 should egress via iface2"); }
-    if src_b.0 != [10,2,0,1] { return TestResult::Fail("src for iface2 should be 10.2.0.1"); }
+    if iface_b != "iface2" {
+        return TestResult::Fail("10.2.0.5 should egress via iface2");
+    }
+    if src_b.0 != [10, 2, 0, 1] {
+        return TestResult::Fail("src for iface2 should be 10.2.0.1");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/route", smoke_route_multi_iface_egress);
 
 fn smoke_arp_gratuitous_does_not_panic() -> TestResult {
     use crate::arp_cache::send_gratuitous_arp;
-    send_gratuitous_arp("garp_eth0", [192,168,1,5]);
+    send_gratuitous_arp("garp_eth0", [192, 168, 1, 5]);
     TestResult::Pass
 }
 kernel_test_in!("net/arp_cache", smoke_arp_gratuitous_does_not_panic);
@@ -6174,9 +6448,18 @@ kernel_test_in!("net/tcp", smoke_tcp_cubic_grows_after_loss);
 fn smoke_tcp_sack_encode_decode_round_trip() -> TestResult {
     use crate::tcp::sack::{decode_blocks, encode_blocks, SackBlock};
     let blocks = alloc::vec![
-        SackBlock { left: 1000, right: 2000 },
-        SackBlock { left: 3000, right: 3500 },
-        SackBlock { left: 5000, right: 7000 },
+        SackBlock {
+            left: 1000,
+            right: 2000
+        },
+        SackBlock {
+            left: 3000,
+            right: 3500
+        },
+        SackBlock {
+            left: 5000,
+            right: 7000
+        },
     ];
     let encoded = encode_blocks(&blocks);
     if encoded.len() != 24 {
@@ -6215,7 +6498,12 @@ fn smoke_tcp_sack_book_merges_adjacent() -> TestResult {
     if b.blocks().len() != 1 {
         return TestResult::Fail("adjacent ranges must merge into one block");
     }
-    if b.blocks()[0] != (SackBlock { left: 1000, right: 3000 }) {
+    if b.blocks()[0]
+        != (SackBlock {
+            left: 1000,
+            right: 3000,
+        })
+    {
         return TestResult::Fail("merged block has the wrong extent");
     }
     TestResult::Pass
@@ -6237,7 +6525,10 @@ kernel_test_in!("net/tcp", smoke_tcp_sack_book_keeps_mru_order);
 fn smoke_tcp_sack_scoreboard_blocks_retx() -> TestResult {
     use crate::tcp::sack::{SackBlock, SenderScoreboard};
     let mut s = SenderScoreboard::new();
-    s.update_from(&[SackBlock { left: 100, right: 200 }]);
+    s.update_from(&[SackBlock {
+        left: 100,
+        right: 200,
+    }]);
     if !s.is_sacked(150) {
         return TestResult::Fail("scoreboard should report 150 as SACKed");
     }
@@ -6444,7 +6735,7 @@ fn smoke_tcp_seq_compare_wraps() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_seq_compare_wraps);
 
 fn smoke_tcp_listen_returns_handle() -> TestResult {
-    use crate::tcp::core::{listen, __reset_for_test};
+    use crate::tcp::core::{__reset_for_test, listen};
     __reset_for_test();
     let r = listen([10, 0, 2, 15], 8080, 16);
     if r.is_err() {
@@ -6455,7 +6746,7 @@ fn smoke_tcp_listen_returns_handle() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_listen_returns_handle);
 
 fn smoke_tcp_accept_empty_returns_none() -> TestResult {
-    use crate::tcp::core::{accept, listen, __reset_for_test};
+    use crate::tcp::core::{__reset_for_test, accept, listen};
     __reset_for_test();
     let id = listen([10, 0, 2, 15], 9090, 8).expect("listen");
     match accept(id) {
@@ -6467,11 +6758,15 @@ fn smoke_tcp_accept_empty_returns_none() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_accept_empty_returns_none);
 
 fn smoke_tcp_setsockopt_nodelay_toggles_nagle() -> TestResult {
-    use crate::tcp::core::{
-        getsockopt_int, setsockopt_int, TCP_NODELAY, __install_test_tcb,
-    };
+    use crate::tcp::core::{__install_test_tcb, getsockopt_int, setsockopt_int, TCP_NODELAY};
     use crate::tcp::state_machine::TcpState;
-    let id = __install_test_tcb([10, 0, 2, 15], 1234, [10, 0, 2, 2], 80, TcpState::Established);
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        1234,
+        [10, 0, 2, 2],
+        80,
+        TcpState::Established,
+    );
     setsockopt_int(id, TCP_NODELAY, 1).expect("set NODELAY");
     if getsockopt_int(id, TCP_NODELAY).unwrap_or(0) != 1 {
         return TestResult::Fail("NODELAY didn't round-trip on");
@@ -6485,11 +6780,15 @@ fn smoke_tcp_setsockopt_nodelay_toggles_nagle() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_setsockopt_nodelay_toggles_nagle);
 
 fn smoke_tcp_setsockopt_congestion_alg() -> TestResult {
-    use crate::tcp::core::{
-        getsockopt_cong, setsockopt_str, TCP_CONGESTION, __install_test_tcb,
-    };
+    use crate::tcp::core::{__install_test_tcb, getsockopt_cong, setsockopt_str, TCP_CONGESTION};
     use crate::tcp::state_machine::TcpState;
-    let id = __install_test_tcb([10, 0, 2, 15], 4321, [10, 0, 2, 2], 80, TcpState::Established);
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        4321,
+        [10, 0, 2, 2],
+        80,
+        TcpState::Established,
+    );
     setsockopt_str(id, TCP_CONGESTION, "reno").expect("set reno");
     if getsockopt_cong(id).unwrap_or("") != "reno" {
         return TestResult::Fail("congestion alg didn't switch to reno");
@@ -6507,11 +6806,17 @@ kernel_test_in!("net/tcp", smoke_tcp_setsockopt_congestion_alg);
 
 fn smoke_tcp_setsockopt_keepalive_round_trip() -> TestResult {
     use crate::tcp::core::{
-        getsockopt_int, setsockopt_int, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
-        TCP_KEEPINTVL, __install_test_tcb,
+        __install_test_tcb, getsockopt_int, setsockopt_int, TCP_KEEPALIVE, TCP_KEEPCNT,
+        TCP_KEEPIDLE, TCP_KEEPINTVL,
     };
     use crate::tcp::state_machine::TcpState;
-    let id = __install_test_tcb([10, 0, 2, 15], 1357, [10, 0, 2, 2], 80, TcpState::Established);
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        1357,
+        [10, 0, 2, 2],
+        80,
+        TcpState::Established,
+    );
     setsockopt_int(id, TCP_KEEPALIVE, 1).expect("set keepalive");
     setsockopt_int(id, TCP_KEEPIDLE, 60).expect("set keepidle");
     setsockopt_int(id, TCP_KEEPINTVL, 10).expect("set keepintvl");
@@ -6527,11 +6832,15 @@ fn smoke_tcp_setsockopt_keepalive_round_trip() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_setsockopt_keepalive_round_trip);
 
 fn smoke_tcp_setsockopt_maxseg_floor() -> TestResult {
-    use crate::tcp::core::{
-        getsockopt_int, setsockopt_int, TCP_MAXSEG, __install_test_tcb,
-    };
+    use crate::tcp::core::{__install_test_tcb, getsockopt_int, setsockopt_int, TCP_MAXSEG};
     use crate::tcp::state_machine::TcpState;
-    let id = __install_test_tcb([10, 0, 2, 15], 2468, [10, 0, 2, 2], 80, TcpState::Established);
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        2468,
+        [10, 0, 2, 2],
+        80,
+        TcpState::Established,
+    );
     setsockopt_int(id, TCP_MAXSEG, 100).expect("clamp");
     let v = getsockopt_int(id, TCP_MAXSEG).unwrap_or(0);
     if v < 536 {
@@ -6635,18 +6944,26 @@ fn make_dhcp_reply(
     domain: &str,
 ) -> alloc::vec::Vec<u8> {
     use crate::pkt_dhcp::{
-        append_end, append_message_type, append_option, DhcpHeader,
-        OPT_DNS_SERVER, OPT_DOMAIN_NAME, OPT_LEASE_TIME,
-        OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1,
-        OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
+        append_end, append_message_type, append_option, DhcpHeader, OPT_DNS_SERVER,
+        OPT_DOMAIN_NAME, OPT_LEASE_TIME, OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1, OPT_ROUTER,
+        OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
     };
     let mut buf = alloc::vec::Vec::with_capacity(400);
     let mut chaddr = [0u8; 16];
     chaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
     let hdr = DhcpHeader {
-        op: 2, htype: 1, hlen: 6, hops: 0, xid,
-        secs: 0, flags: 0,
-        ciaddr: [0; 4], yiaddr, siaddr: server, giaddr: [0; 4], chaddr,
+        op: 2,
+        htype: 1,
+        hlen: 6,
+        hops: 0,
+        xid,
+        secs: 0,
+        flags: 0,
+        ciaddr: [0; 4],
+        yiaddr,
+        siaddr: server,
+        giaddr: [0; 4],
+        chaddr,
     };
     hdr.encode_into(&mut buf);
     append_message_type(&mut buf, msg_type);
@@ -6656,12 +6973,20 @@ fn make_dhcp_reply(
     append_option(&mut buf, OPT_LEASE_TIME, &lease_secs.to_be_bytes());
     if !dns.is_empty() {
         let mut dns_bytes = alloc::vec::Vec::with_capacity(dns.len() * 4);
-        for d in dns { dns_bytes.extend_from_slice(d); }
+        for d in dns {
+            dns_bytes.extend_from_slice(d);
+        }
         append_option(&mut buf, OPT_DNS_SERVER, &dns_bytes);
     }
-    if t1 != 0 { append_option(&mut buf, OPT_RENEWAL_TIME_T1,    &t1.to_be_bytes()); }
-    if t2 != 0 { append_option(&mut buf, OPT_REBINDING_TIME_T2,  &t2.to_be_bytes()); }
-    if !domain.is_empty() { append_option(&mut buf, OPT_DOMAIN_NAME, domain.as_bytes()); }
+    if t1 != 0 {
+        append_option(&mut buf, OPT_RENEWAL_TIME_T1, &t1.to_be_bytes());
+    }
+    if t2 != 0 {
+        append_option(&mut buf, OPT_REBINDING_TIME_T2, &t2.to_be_bytes());
+    }
+    if !domain.is_empty() {
+        append_option(&mut buf, OPT_DOMAIN_NAME, domain.as_bytes());
+    }
     append_end(&mut buf);
     buf
 }
@@ -6673,13 +6998,20 @@ fn smoke_dhcp_state_offer_parsed_from_wire() -> TestResult {
     use crate::pkt_dhcp::DHCPOFFER;
     crate::dhcp::__reset_for_test();
     let buf = make_dhcp_reply(
-        0x1111_2222, DHCPOFFER,
-        [192, 168, 10, 100], [192, 168, 10, 1],
-        [255, 255, 255, 0], [192, 168, 10, 1],
-        86400, &[], 0, 0, "",
+        0x1111_2222,
+        DHCPOFFER,
+        [192, 168, 10, 100],
+        [192, 168, 10, 1],
+        [255, 255, 255, 0],
+        [192, 168, 10, 1],
+        86400,
+        &[],
+        0,
+        0,
+        "",
     );
     // Must not panic.
-    on_udp_in([192,168,10,1], [255,255,255,255], 67, 68, &buf);
+    on_udp_in([192, 168, 10, 1], [255, 255, 255, 255], 67, 68, &buf);
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_state_offer_parsed_from_wire);
@@ -6689,22 +7021,39 @@ kernel_test_in!("net/dhcp", smoke_dhcp_state_offer_parsed_from_wire);
 fn smoke_dhcp_option1_subnet_mask() -> TestResult {
     use crate::pkt_dhcp::{iter_options, DHCPACK, OPT_SUBNET_MASK};
     let buf = make_dhcp_reply(
-        0xAAAA_BBBB, DHCPACK,
-        [10,1,2,3], [10,1,2,1],
-        [255,255,255,0], [10,1,2,1],
-        3600, &[], 0, 0, "",
+        0xAAAA_BBBB,
+        DHCPACK,
+        [10, 1, 2, 3],
+        [10, 1, 2, 1],
+        [255, 255, 255, 0],
+        [10, 1, 2, 1],
+        3600,
+        &[],
+        0,
+        0,
+        "",
     );
-    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    if buf.len() < 240 {
+        return TestResult::Fail("reply too short");
+    }
     let mut found = false;
     for opt in iter_options(&buf[240..]) {
         if opt.tag == OPT_SUBNET_MASK && opt.data.len() == 4 {
-            if opt.data != [255, 255, 255, 0] { return TestResult::Fail("netmask mismatch"); }
+            if opt.data != [255, 255, 255, 0] {
+                return TestResult::Fail("netmask mismatch");
+            }
             let prefix: u8 = opt.data.iter().map(|b| b.count_ones() as u8).sum();
-            if prefix != 24 { return TestResult::Fail("prefix length not 24"); }
+            if prefix != 24 {
+                return TestResult::Fail("prefix length not 24");
+            }
             found = true;
         }
     }
-    if !found { TestResult::Fail("OPT_SUBNET_MASK not found") } else { TestResult::Pass }
+    if !found {
+        TestResult::Fail("OPT_SUBNET_MASK not found")
+    } else {
+        TestResult::Pass
+    }
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_option1_subnet_mask);
 
@@ -6713,12 +7062,21 @@ kernel_test_in!("net/dhcp", smoke_dhcp_option1_subnet_mask);
 fn smoke_dhcp_option3_router_gateway() -> TestResult {
     use crate::pkt_dhcp::{iter_options, DHCPACK, OPT_ROUTER};
     let buf = make_dhcp_reply(
-        0xCCCC_DDDD, DHCPACK,
-        [172,16,0,5], [172,16,0,1],
-        [255,255,0,0], [172,16,0,1],
-        7200, &[], 0, 0, "",
+        0xCCCC_DDDD,
+        DHCPACK,
+        [172, 16, 0, 5],
+        [172, 16, 0, 1],
+        [255, 255, 0, 0],
+        [172, 16, 0, 1],
+        7200,
+        &[],
+        0,
+        0,
+        "",
     );
-    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    if buf.len() < 240 {
+        return TestResult::Fail("reply too short");
+    }
     let mut gw = [0u8; 4];
     let mut found = false;
     for opt in iter_options(&buf[240..]) {
@@ -6727,8 +7085,12 @@ fn smoke_dhcp_option3_router_gateway() -> TestResult {
             found = true;
         }
     }
-    if !found { return TestResult::Fail("OPT_ROUTER not found"); }
-    if gw != [172, 16, 0, 1] { return TestResult::Fail("gateway address mismatch"); }
+    if !found {
+        return TestResult::Fail("OPT_ROUTER not found");
+    }
+    if gw != [172, 16, 0, 1] {
+        return TestResult::Fail("gateway address mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_option3_router_gateway);
@@ -6739,22 +7101,41 @@ fn smoke_dhcp_option6_dns_two_servers() -> TestResult {
     use crate::pkt_dhcp::{iter_options, DHCPACK, OPT_DNS_SERVER};
     let dns: &[[u8; 4]] = &[[1, 1, 1, 1], [8, 8, 8, 8]];
     let buf = make_dhcp_reply(
-        0xEEEE_FFFF, DHCPACK,
-        [10,0,0,5], [10,0,0,1],
-        [255,255,255,0], [10,0,0,1],
-        3600, dns, 0, 0, "",
+        0xEEEE_FFFF,
+        DHCPACK,
+        [10, 0, 0, 5],
+        [10, 0, 0, 1],
+        [255, 255, 255, 0],
+        [10, 0, 0, 1],
+        3600,
+        dns,
+        0,
+        0,
+        "",
     );
-    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    if buf.len() < 240 {
+        return TestResult::Fail("reply too short");
+    }
     let mut count = 0usize;
     for opt in iter_options(&buf[240..]) {
         if opt.tag == OPT_DNS_SERVER {
             count = opt.data.len() / 4;
-            if count < 2 { return TestResult::Fail("too few DNS bytes"); }
-            if opt.data[..4]  != [1, 1, 1, 1] { return TestResult::Fail("DNS[0] mismatch"); }
-            if opt.data[4..8] != [8, 8, 8, 8] { return TestResult::Fail("DNS[1] mismatch"); }
+            if count < 2 {
+                return TestResult::Fail("too few DNS bytes");
+            }
+            if opt.data[..4] != [1, 1, 1, 1] {
+                return TestResult::Fail("DNS[0] mismatch");
+            }
+            if opt.data[4..8] != [8, 8, 8, 8] {
+                return TestResult::Fail("DNS[1] mismatch");
+            }
         }
     }
-    if count < 2 { TestResult::Fail("OPT_DNS_SERVER not found or too short") } else { TestResult::Pass }
+    if count < 2 {
+        TestResult::Fail("OPT_DNS_SERVER not found or too short")
+    } else {
+        TestResult::Pass
+    }
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_option6_dns_two_servers);
 
@@ -6766,36 +7147,53 @@ kernel_test_in!("net/dhcp", smoke_dhcp_option6_dns_two_servers);
 
 fn smoke_dhcp_option51_lease_and_t1_t2() -> TestResult {
     use crate::pkt_dhcp::{
-        iter_options, DHCPACK,
-        OPT_LEASE_TIME, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2,
+        iter_options, DHCPACK, OPT_LEASE_TIME, OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1,
     };
     let lease: u32 = 86400;
-    let t1: u32 = lease / 2;        // 43200
-    let t2: u32 = lease * 7 / 8;    // 75600
+    let t1: u32 = lease / 2; // 43200
+    let t2: u32 = lease * 7 / 8; // 75600
     let buf = make_dhcp_reply(
-        0x0102_0304, DHCPACK,
-        [10,0,1,2], [10,0,1,1],
-        [255,255,255,0], [10,0,1,1],
-        lease, &[], t1, t2, "",
+        0x0102_0304,
+        DHCPACK,
+        [10, 0, 1, 2],
+        [10, 0, 1, 1],
+        [255, 255, 255, 0],
+        [10, 0, 1, 1],
+        lease,
+        &[],
+        t1,
+        t2,
+        "",
     );
-    if buf.len() < 240 { return TestResult::Fail("reply too short"); }
+    if buf.len() < 240 {
+        return TestResult::Fail("reply too short");
+    }
     let mut got_lease = 0u32;
     let mut got_t1 = 0u32;
     let mut got_t2 = 0u32;
     for opt in iter_options(&buf[240..]) {
         match opt.tag {
-            OPT_LEASE_TIME       if opt.data.len() == 4 =>
-                got_lease = u32::from_be_bytes([opt.data[0],opt.data[1],opt.data[2],opt.data[3]]),
-            OPT_RENEWAL_TIME_T1  if opt.data.len() == 4 =>
-                got_t1    = u32::from_be_bytes([opt.data[0],opt.data[1],opt.data[2],opt.data[3]]),
-            OPT_REBINDING_TIME_T2 if opt.data.len() == 4 =>
-                got_t2    = u32::from_be_bytes([opt.data[0],opt.data[1],opt.data[2],opt.data[3]]),
+            OPT_LEASE_TIME if opt.data.len() == 4 => {
+                got_lease = u32::from_be_bytes([opt.data[0], opt.data[1], opt.data[2], opt.data[3]])
+            }
+            OPT_RENEWAL_TIME_T1 if opt.data.len() == 4 => {
+                got_t1 = u32::from_be_bytes([opt.data[0], opt.data[1], opt.data[2], opt.data[3]])
+            }
+            OPT_REBINDING_TIME_T2 if opt.data.len() == 4 => {
+                got_t2 = u32::from_be_bytes([opt.data[0], opt.data[1], opt.data[2], opt.data[3]])
+            }
             _ => {}
         }
     }
-    if got_lease != lease { return TestResult::Fail("lease_secs mismatch"); }
-    if got_t1 != t1       { return TestResult::Fail("T1 mismatch"); }
-    if got_t2 != t2       { return TestResult::Fail("T2 mismatch"); }
+    if got_lease != lease {
+        return TestResult::Fail("lease_secs mismatch");
+    }
+    if got_t1 != t1 {
+        return TestResult::Fail("T1 mismatch");
+    }
+    if got_t2 != t2 {
+        return TestResult::Fail("T2 mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_option51_lease_and_t1_t2);
@@ -6804,8 +7202,8 @@ kernel_test_in!("net/dhcp", smoke_dhcp_option51_lease_and_t1_t2);
 
 fn smoke_dhcp_renewal_request_wire() -> TestResult {
     use crate::pkt_dhcp::{
-        build_request_renew, iter_options, DhcpHeader, DHCPREQUEST,
-        OPT_DHCP_MESSAGE_TYPE, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2,
+        build_request_renew, iter_options, DhcpHeader, DHCPREQUEST, OPT_DHCP_MESSAGE_TYPE,
+        OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1,
     };
     let xid = 0xABCD_1234u32;
     let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
@@ -6815,9 +7213,15 @@ fn smoke_dhcp_renewal_request_wire() -> TestResult {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("header decode failed"),
     };
-    if hdr.xid != xid       { return TestResult::Fail("xid mismatch"); }
-    if hdr.ciaddr != ciaddr { return TestResult::Fail("ciaddr not set for renewal"); }
-    if hdr.flags  != 0      { return TestResult::Fail("flags must be 0 for unicast renewal"); }
+    if hdr.xid != xid {
+        return TestResult::Fail("xid mismatch");
+    }
+    if hdr.ciaddr != ciaddr {
+        return TestResult::Fail("ciaddr not set for renewal");
+    }
+    if hdr.flags != 0 {
+        return TestResult::Fail("flags must be 0 for unicast renewal");
+    }
     let mut got_type = 0u8;
     let mut has_t1_req = false;
     let mut has_t2_req = false;
@@ -6833,9 +7237,15 @@ fn smoke_dhcp_renewal_request_wire() -> TestResult {
             }
         }
     }
-    if got_type  != DHCPREQUEST { return TestResult::Fail("not DHCPREQUEST"); }
-    if !has_t1_req { return TestResult::Fail("T1 not in PRL"); }
-    if !has_t2_req { return TestResult::Fail("T2 not in PRL"); }
+    if got_type != DHCPREQUEST {
+        return TestResult::Fail("not DHCPREQUEST");
+    }
+    if !has_t1_req {
+        return TestResult::Fail("T1 not in PRL");
+    }
+    if !has_t2_req {
+        return TestResult::Fail("T2 not in PRL");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_renewal_request_wire);
@@ -6845,8 +7255,8 @@ kernel_test_in!("net/dhcp", smoke_dhcp_renewal_request_wire);
 fn smoke_dhcp_nak_injected_via_on_udp_in() -> TestResult {
     use crate::dhcp::on_udp_in;
     use crate::pkt_dhcp::{
-        append_end, append_message_type, append_option, DhcpHeader,
-        DHCPNAK, OPT_SERVER_IDENTIFIER, OPT_DHCP_MESSAGE_TYPE, iter_options,
+        append_end, append_message_type, append_option, iter_options, DhcpHeader, DHCPNAK,
+        OPT_DHCP_MESSAGE_TYPE, OPT_SERVER_IDENTIFIER,
     };
     crate::dhcp::__reset_for_test();
     let xid = 0x5A5A_A5A5u32;
@@ -6854,16 +7264,25 @@ fn smoke_dhcp_nak_injected_via_on_udp_in() -> TestResult {
     let mut chaddr = [0u8; 16];
     chaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
     let hdr = DhcpHeader {
-        op: 2, htype: 1, hlen: 6, hops: 0, xid,
-        secs: 0, flags: 0, ciaddr: [0;4], yiaddr: [0;4],
-        siaddr: [10,0,0,1], giaddr: [0;4], chaddr,
+        op: 2,
+        htype: 1,
+        hlen: 6,
+        hops: 0,
+        xid,
+        secs: 0,
+        flags: 0,
+        ciaddr: [0; 4],
+        yiaddr: [0; 4],
+        siaddr: [10, 0, 0, 1],
+        giaddr: [0; 4],
+        chaddr,
     };
     hdr.encode_into(&mut buf);
     append_message_type(&mut buf, DHCPNAK);
     append_option(&mut buf, OPT_SERVER_IDENTIFIER, &[10, 0, 0, 1]);
     append_end(&mut buf);
     // Must not panic.
-    on_udp_in([10,0,0,1], [255,255,255,255], 67, 68, &buf);
+    on_udp_in([10, 0, 0, 1], [255, 255, 255, 255], 67, 68, &buf);
     // Verify wire bytes carry DHCPNAK.
     let mut got_type = 0u8;
     if buf.len() >= 240 {
@@ -6873,8 +7292,11 @@ fn smoke_dhcp_nak_injected_via_on_udp_in() -> TestResult {
             }
         }
     }
-    if got_type != DHCPNAK { TestResult::Fail("expected DHCPNAK in wire") }
-    else { TestResult::Pass }
+    if got_type != DHCPNAK {
+        TestResult::Fail("expected DHCPNAK in wire")
+    } else {
+        TestResult::Pass
+    }
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_nak_injected_via_on_udp_in);
 
@@ -6882,34 +7304,44 @@ kernel_test_in!("net/dhcp", smoke_dhcp_nak_injected_via_on_udp_in);
 
 fn smoke_dhcp_release_wire() -> TestResult {
     use crate::pkt_dhcp::{
-        build_release, iter_options, DhcpHeader, DHCPRELEASE,
-        OPT_DHCP_MESSAGE_TYPE, OPT_SERVER_IDENTIFIER,
+        build_release, iter_options, DhcpHeader, DHCPRELEASE, OPT_DHCP_MESSAGE_TYPE,
+        OPT_SERVER_IDENTIFIER,
     };
     let xid = 0x1234_5678u32;
-    let mac    = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let mac = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
     let ciaddr = [192, 168, 1, 50];
-    let server = [192, 168, 1,  1];
+    let server = [192, 168, 1, 1];
     let pkt = build_release(xid, mac, ciaddr, server);
     let hdr = match DhcpHeader::decode(&pkt) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("header decode failed"),
     };
-    if hdr.xid    != xid    { return TestResult::Fail("xid mismatch"); }
-    if hdr.ciaddr != ciaddr { return TestResult::Fail("ciaddr mismatch in RELEASE"); }
-    if hdr.flags  != 0      { return TestResult::Fail("flags must be 0 (unicast RELEASE)"); }
+    if hdr.xid != xid {
+        return TestResult::Fail("xid mismatch");
+    }
+    if hdr.ciaddr != ciaddr {
+        return TestResult::Fail("ciaddr mismatch in RELEASE");
+    }
+    if hdr.flags != 0 {
+        return TestResult::Fail("flags must be 0 (unicast RELEASE)");
+    }
     let mut got_type = 0u8;
-    let mut got_srv  = [0u8; 4];
+    let mut got_srv = [0u8; 4];
     if pkt.len() >= 240 {
         for opt in iter_options(&pkt[240..]) {
             match opt.tag {
-                OPT_DHCP_MESSAGE_TYPE  if opt.data.len() == 1 => got_type = opt.data[0],
-                OPT_SERVER_IDENTIFIER  if opt.data.len() == 4 => got_srv.copy_from_slice(opt.data),
+                OPT_DHCP_MESSAGE_TYPE if opt.data.len() == 1 => got_type = opt.data[0],
+                OPT_SERVER_IDENTIFIER if opt.data.len() == 4 => got_srv.copy_from_slice(opt.data),
                 _ => {}
             }
         }
     }
-    if got_type != DHCPRELEASE { return TestResult::Fail("not DHCPRELEASE"); }
-    if got_srv  != server       { return TestResult::Fail("server ID mismatch"); }
+    if got_type != DHCPRELEASE {
+        return TestResult::Fail("not DHCPRELEASE");
+    }
+    if got_srv != server {
+        return TestResult::Fail("server ID mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_release_wire);
@@ -6918,35 +7350,43 @@ kernel_test_in!("net/dhcp", smoke_dhcp_release_wire);
 
 fn smoke_dhcp_decline_wire() -> TestResult {
     use crate::pkt_dhcp::{
-        build_decline, iter_options, DhcpHeader, DHCPDECLINE,
-        OPT_DHCP_MESSAGE_TYPE, OPT_SERVER_IDENTIFIER, OPT_REQUESTED_IP,
+        build_decline, iter_options, DhcpHeader, DHCPDECLINE, OPT_DHCP_MESSAGE_TYPE,
+        OPT_REQUESTED_IP, OPT_SERVER_IDENTIFIER,
     };
-    let xid        = 0x9999_AAAAu32;
-    let mac        = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let declined   = [10, 0, 0, 99];
-    let server     = [10, 0, 0,  1];
+    let xid = 0x9999_AAAAu32;
+    let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let declined = [10, 0, 0, 99];
+    let server = [10, 0, 0, 1];
     let pkt = build_decline(xid, mac, declined, server);
     let hdr = match DhcpHeader::decode(&pkt) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("header decode failed"),
     };
-    if hdr.xid != xid { return TestResult::Fail("xid mismatch"); }
+    if hdr.xid != xid {
+        return TestResult::Fail("xid mismatch");
+    }
     let mut got_type = 0u8;
-    let mut got_srv  = [0u8; 4];
-    let mut got_req  = [0u8; 4];
+    let mut got_srv = [0u8; 4];
+    let mut got_req = [0u8; 4];
     if pkt.len() >= 240 {
         for opt in iter_options(&pkt[240..]) {
             match opt.tag {
-                OPT_DHCP_MESSAGE_TYPE  if opt.data.len() == 1 => got_type = opt.data[0],
-                OPT_SERVER_IDENTIFIER  if opt.data.len() == 4 => got_srv.copy_from_slice(opt.data),
-                OPT_REQUESTED_IP       if opt.data.len() == 4 => got_req.copy_from_slice(opt.data),
+                OPT_DHCP_MESSAGE_TYPE if opt.data.len() == 1 => got_type = opt.data[0],
+                OPT_SERVER_IDENTIFIER if opt.data.len() == 4 => got_srv.copy_from_slice(opt.data),
+                OPT_REQUESTED_IP if opt.data.len() == 4 => got_req.copy_from_slice(opt.data),
                 _ => {}
             }
         }
     }
-    if got_type != DHCPDECLINE { return TestResult::Fail("not DHCPDECLINE"); }
-    if got_srv  != server      { return TestResult::Fail("server ID mismatch in DECLINE"); }
-    if got_req  != declined    { return TestResult::Fail("Requested-IP mismatch in DECLINE"); }
+    if got_type != DHCPDECLINE {
+        return TestResult::Fail("not DHCPDECLINE");
+    }
+    if got_srv != server {
+        return TestResult::Fail("server ID mismatch in DECLINE");
+    }
+    if got_req != declined {
+        return TestResult::Fail("Requested-IP mismatch in DECLINE");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_dhcp_decline_wire);
@@ -6957,31 +7397,42 @@ kernel_test_in!("net/dhcp", smoke_dhcp_decline_wire);
 // Full query: 12 (hdr) + 13 (qname) + 2 (qtype) + 2 (qclass) = 29 bytes.
 
 fn smoke_dns_a_query_wire_example_com() -> TestResult {
-    use crate::pkt_dns::{build_a_query, FLAG_RD, TYPE_A, CLASS_IN};
+    use crate::pkt_dns::{build_a_query, CLASS_IN, FLAG_RD, TYPE_A};
     let pkt = match build_a_query(0xABCD, "example.com") {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("build_a_query failed"),
     };
-    if pkt.len() < 29 { return TestResult::Fail("packet shorter than 29 bytes"); }
-    let id    = u16::from_be_bytes([pkt[0], pkt[1]]);
+    if pkt.len() < 29 {
+        return TestResult::Fail("packet shorter than 29 bytes");
+    }
+    let id = u16::from_be_bytes([pkt[0], pkt[1]]);
     let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
     let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
-    if id != 0xABCD          { return TestResult::Fail("query ID mismatch"); }
-    if flags & FLAG_RD == 0  { return TestResult::Fail("RD bit not set"); }
-    if qdcount != 1          { return TestResult::Fail("qdcount != 1"); }
+    if id != 0xABCD {
+        return TestResult::Fail("query ID mismatch");
+    }
+    if flags & FLAG_RD == 0 {
+        return TestResult::Fail("RD bit not set");
+    }
+    if qdcount != 1 {
+        return TestResult::Fail("qdcount != 1");
+    }
     // QNAME at offset 12.
     let expected: &[u8] = &[
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-        3, b'c', b'o', b'm', 0,
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ];
     if &pkt[12..12 + expected.len()] != expected {
         return TestResult::Fail("qname encoding wrong");
     }
     let qt_off = 12 + expected.len();
-    let qtype  = u16::from_be_bytes([pkt[qt_off],     pkt[qt_off + 1]]);
+    let qtype = u16::from_be_bytes([pkt[qt_off], pkt[qt_off + 1]]);
     let qclass = u16::from_be_bytes([pkt[qt_off + 2], pkt[qt_off + 3]]);
-    if qtype  != TYPE_A  { return TestResult::Fail("qtype not A"); }
-    if qclass != CLASS_IN { return TestResult::Fail("qclass not IN"); }
+    if qtype != TYPE_A {
+        return TestResult::Fail("qtype not A");
+    }
+    if qclass != CLASS_IN {
+        return TestResult::Fail("qclass not IN");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dns", smoke_dns_a_query_wire_example_com);
@@ -6989,16 +7440,20 @@ kernel_test_in!("net/dns", smoke_dns_a_query_wire_example_com);
 // ── Smoke #S11: parse A response → RData::A([1,2,3,4]) ───────────────
 
 fn smoke_dns_parse_a_response() -> TestResult {
-    use crate::dns::{__parse_response_for_test, RData};
-    use crate::pkt_dns::{TYPE_A, CLASS_IN};
+    use crate::dns::{RData, __parse_response_for_test};
+    use crate::pkt_dns::{CLASS_IN, TYPE_A};
 
     // Minimal wire response:
     //   Header: ID=1, QR=1, RA=1, QDCOUNT=1, ANCOUNT=1
     //   Question:  example.com A IN
     //   Answer:    <ptr to offset 12> A IN TTL=300 RDATA=1.2.3.4
-    let qname: &[u8] = &[7,b'e',b'x',b'a',b'm',b'p',b'l',b'e',3,b'c',b'o',b'm',0];
+    let qname: &[u8] = &[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ];
     let mut msg = alloc::vec::Vec::new();
-    msg.extend_from_slice(&[0x00,0x01, 0x81,0x80, 0x00,0x01, 0x00,0x01, 0x00,0x00, 0x00,0x00]);
+    msg.extend_from_slice(&[
+        0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ]);
     msg.extend_from_slice(qname);
     msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
     msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
@@ -7006,20 +7461,24 @@ fn smoke_dns_parse_a_response() -> TestResult {
     msg.extend_from_slice(&[0xC0, 0x0C]);
     msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
     msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
-    msg.extend_from_slice(&300u32.to_be_bytes());   // TTL
-    msg.extend_from_slice(&4u16.to_be_bytes());     // RDLENGTH
-    msg.extend_from_slice(&[1, 2, 3, 4]);            // RDATA
+    msg.extend_from_slice(&300u32.to_be_bytes()); // TTL
+    msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+    msg.extend_from_slice(&[1, 2, 3, 4]); // RDATA
 
     let (records, ttl) = match __parse_response_for_test(&msg, "example.com", TYPE_A) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("parse_dns_response failed"),
     };
-    if records.len() != 1 { return TestResult::Fail("expected 1 answer"); }
+    if records.len() != 1 {
+        return TestResult::Fail("expected 1 answer");
+    }
     match &records[0] {
-        RData::A(ip) if *ip == [1u8,2,3,4] => {}
+        RData::A(ip) if *ip == [1u8, 2, 3, 4] => {}
         _ => return TestResult::Fail("A record IP mismatch"),
     }
-    if ttl != 300 { return TestResult::Fail("TTL mismatch"); }
+    if ttl != 300 {
+        return TestResult::Fail("TTL mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dns", smoke_dns_parse_a_response);
@@ -7027,17 +7486,19 @@ kernel_test_in!("net/dns", smoke_dns_parse_a_response);
 // ── Smoke #S12: CNAME chain foo.com → bar.com → 5.6.7.8 ──────────────
 
 fn smoke_dns_cname_chain_resolve() -> TestResult {
-    use crate::dns::{__parse_response_for_test, RData};
-    use crate::pkt_dns::{TYPE_A, TYPE_CNAME, CLASS_IN};
+    use crate::dns::{RData, __parse_response_for_test};
+    use crate::pkt_dns::{CLASS_IN, TYPE_A, TYPE_CNAME};
 
     // Both names as plain (uncompressed) labels:
     //   foo.com = 3 f o o . 3 c o m . 0  (9 bytes)
     //   bar.com = 3 b a r . 3 c o m . 0  (9 bytes)
-    let foo: &[u8] = &[3,b'f',b'o',b'o',3,b'c',b'o',b'm',0];
-    let bar: &[u8] = &[3,b'b',b'a',b'r',3,b'c',b'o',b'm',0];
+    let foo: &[u8] = &[3, b'f', b'o', b'o', 3, b'c', b'o', b'm', 0];
+    let bar: &[u8] = &[3, b'b', b'a', b'r', 3, b'c', b'o', b'm', 0];
     let mut msg = alloc::vec::Vec::new();
     // Header: QDCOUNT=1, ANCOUNT=2.
-    msg.extend_from_slice(&[0x00,0x02, 0x81,0x80, 0x00,0x01, 0x00,0x02, 0x00,0x00, 0x00,0x00]);
+    msg.extend_from_slice(&[
+        0x00, 0x02, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+    ]);
     // Question: foo.com A IN.
     msg.extend_from_slice(foo);
     msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
@@ -7061,12 +7522,16 @@ fn smoke_dns_cname_chain_resolve() -> TestResult {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("cname chain parse failed"),
     };
-    if records.len() != 1 { return TestResult::Fail("expected 1 final A record"); }
+    if records.len() != 1 {
+        return TestResult::Fail("expected 1 final A record");
+    }
     match &records[0] {
-        RData::A(ip) if *ip == [5u8,6,7,8] => {}
+        RData::A(ip) if *ip == [5u8, 6, 7, 8] => {}
         _ => return TestResult::Fail("final A IP mismatch after CNAME chain"),
     }
-    if ttl != 120 { return TestResult::Fail("TTL should come from the A RR, not the CNAME"); }
+    if ttl != 120 {
+        return TestResult::Fail("TTL should come from the A RR, not the CNAME");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dns", smoke_dns_cname_chain_resolve);
@@ -7075,8 +7540,7 @@ kernel_test_in!("net/dns", smoke_dns_cname_chain_resolve);
 
 fn smoke_dns_cache_ttl_hit() -> TestResult {
     use crate::dns::{
-        __cache_insert_for_test, __cache_lookup_for_test,
-        __flush_cache_for_test, RData,
+        RData, __cache_insert_for_test, __cache_lookup_for_test, __flush_cache_for_test,
     };
     use crate::pkt_dns::TYPE_A;
 
@@ -7088,7 +7552,7 @@ fn smoke_dns_cache_ttl_hit() -> TestResult {
     match __cache_lookup_for_test("cached.example", TYPE_A) {
         None => return TestResult::Fail("cache miss immediately after insert"),
         Some(r) => match r.first() {
-            Some(RData::A(ip)) if *ip == [9u8,8,7,6] => {}
+            Some(RData::A(ip)) if *ip == [9u8, 8, 7, 6] => {}
             _ => return TestResult::Fail("cached IP mismatch"),
         },
     }
@@ -7106,15 +7570,33 @@ fn smoke_resolv_conf_parse_two_ns_and_search() -> TestResult {
     use crate::resolv_conf::ResolvConfig;
     let content = "# test\nnameserver 1.1.1.1\nnameserver 8.8.8.8\nsearch example.com local\noptions ndots:2 timeout:3 rotate\n";
     let cfg = ResolvConfig::parse(content);
-    if cfg.nameservers.len() != 2  { return TestResult::Fail("expected 2 nameservers"); }
-    if cfg.nameservers[0] != "1.1.1.1" { return TestResult::Fail("ns[0] mismatch"); }
-    if cfg.nameservers[1] != "8.8.8.8" { return TestResult::Fail("ns[1] mismatch"); }
-    if cfg.search.len() != 2       { return TestResult::Fail("expected 2 search domains"); }
-    if cfg.search[0] != "example.com" { return TestResult::Fail("search[0] mismatch"); }
-    if cfg.search[1] != "local"    { return TestResult::Fail("search[1] mismatch"); }
-    if cfg.ndots   != 2            { return TestResult::Fail("ndots should be 2"); }
-    if cfg.timeout != 3            { return TestResult::Fail("timeout should be 3"); }
-    if !cfg.rotate                 { return TestResult::Fail("rotate should be true"); }
+    if cfg.nameservers.len() != 2 {
+        return TestResult::Fail("expected 2 nameservers");
+    }
+    if cfg.nameservers[0] != "1.1.1.1" {
+        return TestResult::Fail("ns[0] mismatch");
+    }
+    if cfg.nameservers[1] != "8.8.8.8" {
+        return TestResult::Fail("ns[1] mismatch");
+    }
+    if cfg.search.len() != 2 {
+        return TestResult::Fail("expected 2 search domains");
+    }
+    if cfg.search[0] != "example.com" {
+        return TestResult::Fail("search[0] mismatch");
+    }
+    if cfg.search[1] != "local" {
+        return TestResult::Fail("search[1] mismatch");
+    }
+    if cfg.ndots != 2 {
+        return TestResult::Fail("ndots should be 2");
+    }
+    if cfg.timeout != 3 {
+        return TestResult::Fail("timeout should be 3");
+    }
+    if !cfg.rotate {
+        return TestResult::Fail("rotate should be true");
+    }
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp", smoke_resolv_conf_parse_two_ns_and_search);

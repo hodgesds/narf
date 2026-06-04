@@ -165,7 +165,9 @@ pub struct StunAttribute<'a> {
 /// Walk attributes in the body (i.e. `&buf[20..20+message_length]`).
 /// Each TLV is `type(BE u16) + length(BE u16) + body padded to a
 /// 4-byte multiple` per §6.
-pub fn iter_attributes(mut buf: &[u8]) -> impl Iterator<Item = Result<StunAttribute<'_>, StunError>> {
+pub fn iter_attributes(
+    mut buf: &[u8],
+) -> impl Iterator<Item = Result<StunAttribute<'_>, StunError>> {
     core::iter::from_fn(move || {
         if buf.is_empty() {
             return None;
@@ -207,17 +209,15 @@ pub fn encode_xor_mapped_ipv4(transaction_id: &[u8; 12], port: u16, ip: [u8; 4])
     let xor_port = port ^ ((MAGIC_COOKIE >> 16) as u16);
     body.extend_from_slice(&xor_port.to_be_bytes());
     let mc = MAGIC_COOKIE.to_be_bytes();
-    body.extend_from_slice(&[
-        ip[0] ^ mc[0],
-        ip[1] ^ mc[1],
-        ip[2] ^ mc[2],
-        ip[3] ^ mc[3],
-    ]);
+    body.extend_from_slice(&[ip[0] ^ mc[0], ip[1] ^ mc[1], ip[2] ^ mc[2], ip[3] ^ mc[3]]);
     body
 }
 
 /// Decode a XOR-MAPPED-ADDRESS attribute body into (port, ip).
-pub fn decode_xor_mapped_ipv4(transaction_id: &[u8; 12], body: &[u8]) -> Result<(u16, [u8; 4]), StunError> {
+pub fn decode_xor_mapped_ipv4(
+    transaction_id: &[u8; 12],
+    body: &[u8],
+) -> Result<(u16, [u8; 4]), StunError> {
     let _ = transaction_id;
     if body.len() < 8 {
         return Err(StunError::Short);

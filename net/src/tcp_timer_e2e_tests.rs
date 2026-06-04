@@ -62,19 +62,14 @@ use crate::pkt::{
     set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
     IPV4_HDR_LEN, IP_PROTO_TCP,
 };
-use crate::pkt_tcp::{
-    ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN,
-};
+use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN};
 use crate::route;
 use crate::tcp::congestion::{CongAlg, CongestionState};
 use crate::tcp::core::{
-    self, handle_segment, listen, lookup_tcb, accept, send, close, shutdown,
-    tick_retransmit, __with_tcb, __with_tcb_mut,
-    PERSIST_INITIAL_NS, PERSIST_MAX_NS, KEEPALIVE_IDLE_NS,
+    self, __with_tcb, __with_tcb_mut, accept, close, handle_segment, listen, lookup_tcb, send,
+    shutdown, tick_retransmit, KEEPALIVE_IDLE_NS, PERSIST_INITIAL_NS, PERSIST_MAX_NS,
 };
-use crate::tcp::retransmit::{
-    RttEstimator, RTO_MIN_NS, RTO_MAX_NS, MAX_RETRANSMITS,
-};
+use crate::tcp::retransmit::{RttEstimator, MAX_RETRANSMITS, RTO_MAX_NS, RTO_MIN_NS};
 use crate::tcp::sack::{SackBlock, SackBook, SenderScoreboard};
 use crate::tcp::state_machine::{Shutdown, TcpState};
 
@@ -106,7 +101,11 @@ fn timer_full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4
     crate::ifaddr::__reset_for_test();
     TIMER_TX_CAPTURE.lock().clear();
 
-    iface::register(iface_name, [0x02, 0x00, 0x00, 0x00, 0x00, 0x07], timer_capture_send);
+    iface::register(
+        iface_name,
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x07],
+        timer_capture_send,
+    );
     iface::set_default_ipv4(local_ip, gateway);
     iface::add_addr(iface_name, local_ip, 24);
 
@@ -140,8 +139,19 @@ fn build_tcp_seg(
     let total = ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN + payload.len();
     let mut frame = vec![0u8; total];
     let ip_total = (IPV4_HDR_LEN + TCP_HDR_MIN + payload.len()) as u16;
-    write_eth_header(&mut frame, [0x02; 6], [0x52, 0x54, 0, 0, 0, 1], ETHERTYPE_IPV4);
-    write_ipv4_header(&mut frame[ETH_HDR_LEN..], ip_total, IP_PROTO_TCP, src_ip, dst_ip);
+    write_eth_header(
+        &mut frame,
+        [0x02; 6],
+        [0x52, 0x54, 0, 0, 0, 1],
+        ETHERTYPE_IPV4,
+    );
+    write_ipv4_header(
+        &mut frame[ETH_HDR_LEN..],
+        ip_total,
+        IP_PROTO_TCP,
+        src_ip,
+        dst_ip,
+    );
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
     let mut hdr = TcpHeader {
@@ -175,7 +185,12 @@ fn frame_seq(frame: &[u8]) -> u32 {
     if frame.len() < off + 8 {
         return 0;
     }
-    u32::from_be_bytes([frame[off + 4], frame[off + 5], frame[off + 6], frame[off + 7]])
+    u32::from_be_bytes([
+        frame[off + 4],
+        frame[off + 5],
+        frame[off + 6],
+        frame[off + 7],
+    ])
 }
 
 /// Extract ACK number from a captured frame.
@@ -184,7 +199,12 @@ fn frame_ack(frame: &[u8]) -> u32 {
     if frame.len() < off + 12 {
         return 0;
     }
-    u32::from_be_bytes([frame[off + 8], frame[off + 9], frame[off + 10], frame[off + 11]])
+    u32::from_be_bytes([
+        frame[off + 8],
+        frame[off + 9],
+        frame[off + 10],
+        frame[off + 11],
+    ])
 }
 
 /// Extract flags byte from a captured frame.
@@ -206,12 +226,26 @@ fn establish_server_side(
     server_port: u16,
     client_port: u16,
     client_iss: u32,
-) -> Result<(u32 /* listen_id */, u32 /* child_id */, u32 /* server_iss */), &'static str> {
+) -> Result<
+    (
+        u32, /* listen_id */
+        u32, /* child_id */
+        u32, /* server_iss */
+    ),
+    &'static str,
+> {
     let listen_id = listen(local_ip, server_port, 8).map_err(|_| "listen failed")?;
 
     let syn = build_tcp_seg(
-        local_ip, local_ip, client_port, server_port,
-        client_iss, 0, FLAG_SYN, 65535, &[],
+        local_ip,
+        local_ip,
+        client_port,
+        server_port,
+        client_iss,
+        0,
+        FLAG_SYN,
+        65535,
+        &[],
     );
     handle_segment(local_ip, local_ip, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
@@ -220,7 +254,8 @@ fn establish_server_side(
         .iter()
         .find(|f| {
             f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN
-                && f[ETH_HDR_LEN + IPV4_HDR_LEN + 13] & (FLAG_SYN | FLAG_ACK) == (FLAG_SYN | FLAG_ACK)
+                && f[ETH_HDR_LEN + IPV4_HDR_LEN + 13] & (FLAG_SYN | FLAG_ACK)
+                    == (FLAG_SYN | FLAG_ACK)
         })
         .cloned()
         .ok_or("no SYN-ACK")?;
@@ -228,9 +263,15 @@ fn establish_server_side(
     let server_iss = frame_seq(&synack);
 
     let ack = build_tcp_seg(
-        local_ip, local_ip, client_port, server_port,
-        client_iss.wrapping_add(1), server_iss.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        local_ip,
+        local_ip,
+        client_port,
+        server_port,
+        client_iss.wrapping_add(1),
+        server_iss.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(local_ip, local_ip, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
@@ -278,7 +319,10 @@ fn smoke_rtt_first_sample_seeds_srtt_and_rttvar() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/tcp/timer", smoke_rtt_first_sample_seeds_srtt_and_rttvar);
+kernel_test_in!(
+    "net/tcp/timer",
+    smoke_rtt_first_sample_seeds_srtt_and_rttvar
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 2 — EWMA smoothing across multiple samples
@@ -393,7 +437,10 @@ fn smoke_rto_fires_retransmit() -> TestResult {
         _ => return TestResult::Fail("send(100) failed"),
     }
     let txd = timer_drain_captured();
-    let orig_seg = match txd.iter().find(|f| f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN) {
+    let orig_seg = match txd
+        .iter()
+        .find(|f| f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN)
+    {
         Some(f) => f.clone(),
         None => return TestResult::Fail("no data segment after send"),
     };
@@ -418,9 +465,9 @@ fn smoke_rto_fires_retransmit() -> TestResult {
     }
 
     let retx = timer_drain_captured();
-    let retx_seg = retx.iter().find(|f| {
-        f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN && frame_seq(f) == orig_seq
-    });
+    let retx_seg = retx
+        .iter()
+        .find(|f| f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN && frame_seq(f) == orig_seq);
     if retx_seg.is_none() {
         return TestResult::Fail("no retransmit with orig SEQ after RTO fire");
     }
@@ -466,7 +513,10 @@ fn smoke_karn_algorithm_no_sample_on_retransmit() -> TestResult {
         _ => return TestResult::Fail("send(50) failed"),
     }
     let txd = timer_drain_captured();
-    let orig_seg = match txd.iter().find(|f| f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN) {
+    let orig_seg = match txd
+        .iter()
+        .find(|f| f.len() > ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN)
+    {
         Some(f) => f.clone(),
         None => return TestResult::Fail("no data segment"),
     };
@@ -496,9 +546,15 @@ fn smoke_karn_algorithm_no_sample_on_retransmit() -> TestResult {
     // Now inject a cumulative ACK covering the segment.
     let client_next = 0x1200_0001u32; // client's next seq
     let ack_seg = build_tcp_seg(
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_next, seg_end_seq,
-        FLAG_ACK, 65535, &[],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_next,
+        seg_end_seq,
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_seg[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
@@ -515,7 +571,10 @@ fn smoke_karn_algorithm_no_sample_on_retransmit() -> TestResult {
     let _ = close(listen_id);
     TestResult::Pass
 }
-kernel_test_in!("net/tcp/timer", smoke_karn_algorithm_no_sample_on_retransmit);
+kernel_test_in!(
+    "net/tcp/timer",
+    smoke_karn_algorithm_no_sample_on_retransmit
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 7 — RTO exponential back-off × 3 rounds → RTO = base * 8
@@ -736,9 +795,15 @@ fn smoke_three_dup_acks_fast_retransmit() -> TestResult {
 
     for _ in 0..3 {
         let dup = build_tcp_seg(
-            LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-            client_seq, snd_una,
-            FLAG_ACK, 65535, &[],
+            LOCAL_IP,
+            LOCAL_IP,
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq,
+            snd_una,
+            FLAG_ACK,
+            65535,
+            &[],
         );
         handle_segment(LOCAL_IP, LOCAL_IP, &dup[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     }
@@ -810,7 +875,10 @@ fn smoke_fast_recovery_exit_on_ack_above_recover_point() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/tcp/timer", smoke_fast_recovery_exit_on_ack_above_recover_point);
+kernel_test_in!(
+    "net/tcp/timer",
+    smoke_fast_recovery_exit_on_ack_above_recover_point
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 14 — SACK block encoded in ACK for out-of-order delivery
@@ -858,7 +926,10 @@ fn smoke_sack_block_recorded_for_out_of_order_segment() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("net/tcp/timer", smoke_sack_block_recorded_for_out_of_order_segment);
+kernel_test_in!(
+    "net/tcp/timer",
+    smoke_sack_block_recorded_for_out_of_order_segment
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 15 — Skip-on-SACK: retransmit skips scoreboarded ranges
@@ -873,8 +944,14 @@ fn smoke_skip_on_sack_retransmit() -> TestResult {
 
     // Peer SACKed seq 1000..2000 and 3000..4000 (segs 2 and 4 of 5).
     sb.update_from(&[
-        SackBlock { left: 1000, right: 2000 },
-        SackBlock { left: 3000, right: 4000 },
+        SackBlock {
+            left: 1000,
+            right: 2000,
+        },
+        SackBlock {
+            left: 3000,
+            right: 4000,
+        },
     ]);
 
     // Gaps: 0..1000, 2000..3000, 4000..5000 should be retransmitted.
@@ -945,9 +1022,14 @@ fn smoke_zero_window_persist_timer() -> TestResult {
     let snd_una = __with_tcb(child_id, |t| t.snd_una).unwrap_or(0);
     let client_seq: u32 = 0x1500_0001;
     let zero_win = build_tcp_seg(
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_seq, snd_una,
-        FLAG_ACK, 0, // window = 0
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_seq,
+        snd_una,
+        FLAG_ACK,
+        0, // window = 0
         &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &zero_win[ETH_HDR_LEN + IPV4_HDR_LEN..]);
@@ -1128,20 +1210,36 @@ fn smoke_time_wait_2msl_expiry() -> TestResult {
     let fin_seq = __with_tcb(child_id, |t| t.fin_seq).unwrap_or(0);
     let client_seq: u32 = 0x1700_0001;
     let ack_fin = build_tcp_seg(
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_seq, fin_seq.wrapping_add(1),
-        FLAG_ACK, 65535, &[],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_seq,
+        fin_seq.wrapping_add(1),
+        FLAG_ACK,
+        65535,
+        &[],
     );
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_fin[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
 
     // Peer sends FIN (passive close → server reaches TIME-WAIT).
     let client_fin = build_tcp_seg(
-        LOCAL_IP, LOCAL_IP, CLIENT_PORT, SERVER_PORT,
-        client_seq, fin_seq.wrapping_add(1),
-        FLAG_FIN | FLAG_ACK, 65535, &[],
+        LOCAL_IP,
+        LOCAL_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        client_seq,
+        fin_seq.wrapping_add(1),
+        FLAG_FIN | FLAG_ACK,
+        65535,
+        &[],
     );
-    handle_segment(LOCAL_IP, LOCAL_IP, &client_fin[ETH_HDR_LEN + IPV4_HDR_LEN..]);
+    handle_segment(
+        LOCAL_IP,
+        LOCAL_IP,
+        &client_fin[ETH_HDR_LEN + IPV4_HDR_LEN..],
+    );
     let _ = timer_drain_captured();
 
     // Server should now be in TIME-WAIT.

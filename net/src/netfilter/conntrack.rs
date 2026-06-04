@@ -22,19 +22,19 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::{HookPoint, PktCtx, Tuple, Verdict, parse_tuple_ipv4, L4Proto};
+use super::{parse_tuple_ipv4, HookPoint, L4Proto, PktCtx, Tuple, Verdict};
 
 /// Maximum tracked entries. LRU evicts beyond this.
 pub const MAX_ENTRIES: usize = 4096;
 
 /// Default expiry deadlines per protocol (nanoseconds).
-pub const UDP_DEFAULT_EXPIRY_NS: u64       = 30 * 1_000_000_000;
-pub const ICMP_DEFAULT_EXPIRY_NS: u64      = 30 * 1_000_000_000;
-pub const TCP_SYN_SENT_EXPIRY_NS: u64      = 120 * 1_000_000_000;
-pub const TCP_ESTABLISHED_EXPIRY_NS: u64   = 5 * 60 * 1_000_000_000;
-pub const TCP_FIN_WAIT_EXPIRY_NS: u64      = 120 * 1_000_000_000;
-pub const TCP_TIME_WAIT_EXPIRY_NS: u64     = 120 * 1_000_000_000;
-pub const TCP_CLOSE_EXPIRY_NS: u64         = 10 * 1_000_000_000;
+pub const UDP_DEFAULT_EXPIRY_NS: u64 = 30 * 1_000_000_000;
+pub const ICMP_DEFAULT_EXPIRY_NS: u64 = 30 * 1_000_000_000;
+pub const TCP_SYN_SENT_EXPIRY_NS: u64 = 120 * 1_000_000_000;
+pub const TCP_ESTABLISHED_EXPIRY_NS: u64 = 5 * 60 * 1_000_000_000;
+pub const TCP_FIN_WAIT_EXPIRY_NS: u64 = 120 * 1_000_000_000;
+pub const TCP_TIME_WAIT_EXPIRY_NS: u64 = 120 * 1_000_000_000;
+pub const TCP_CLOSE_EXPIRY_NS: u64 = 10 * 1_000_000_000;
 
 /// Generic conntrack state. Mirrors `enum ip_conntrack_status` bits
 /// in Linux `include/uapi/linux/netfilter/nf_conntrack_common.h`.
@@ -93,8 +93,12 @@ impl ConntrackEntry {
     fn new(id: u64, original: Tuple, now_ns: u64) -> Self {
         let proto = L4Proto::from_u8(original.proto);
         let (state, tcp_state, expiry) = match proto {
-            L4Proto::Tcp  => (CtState::New, Some(TcpCtState::SynSent), TCP_SYN_SENT_EXPIRY_NS),
-            L4Proto::Udp  => (CtState::New, None, UDP_DEFAULT_EXPIRY_NS),
+            L4Proto::Tcp => (
+                CtState::New,
+                Some(TcpCtState::SynSent),
+                TCP_SYN_SENT_EXPIRY_NS,
+            ),
+            L4Proto::Udp => (CtState::New, None, UDP_DEFAULT_EXPIRY_NS),
             L4Proto::Icmp => (CtState::New, None, ICMP_DEFAULT_EXPIRY_NS),
             L4Proto::Other(_) => (CtState::New, None, UDP_DEFAULT_EXPIRY_NS),
         };
@@ -121,13 +125,14 @@ impl ConntrackEntry {
             L4Proto::Tcp => match self.tcp_state {
                 Some(TcpCtState::SynSent | TcpCtState::SynRecv) => TCP_SYN_SENT_EXPIRY_NS,
                 Some(TcpCtState::Established) => TCP_ESTABLISHED_EXPIRY_NS,
-                Some(TcpCtState::FinWait | TcpCtState::CloseWait | TcpCtState::LastAck)
-                    => TCP_FIN_WAIT_EXPIRY_NS,
+                Some(TcpCtState::FinWait | TcpCtState::CloseWait | TcpCtState::LastAck) => {
+                    TCP_FIN_WAIT_EXPIRY_NS
+                }
                 Some(TcpCtState::TimeWait) => TCP_TIME_WAIT_EXPIRY_NS,
                 Some(TcpCtState::Close) => TCP_CLOSE_EXPIRY_NS,
                 None => TCP_ESTABLISHED_EXPIRY_NS,
             },
-            L4Proto::Udp  => UDP_DEFAULT_EXPIRY_NS,
+            L4Proto::Udp => UDP_DEFAULT_EXPIRY_NS,
             L4Proto::Icmp => ICMP_DEFAULT_EXPIRY_NS,
             L4Proto::Other(_) => UDP_DEFAULT_EXPIRY_NS,
         };
@@ -205,11 +210,7 @@ impl Conntrack {
     /// Insert a new flow originating from `original`. Returns the new
     /// entry's Arc. If a same-tuple entry already exists, returns the
     /// existing one (no double-insert).
-    pub fn insert_new(
-        &self,
-        original: Tuple,
-        now_ns: u64,
-    ) -> Arc<IrqSafeSpinLock<ConntrackEntry>> {
+    pub fn insert_new(&self, original: Tuple, now_ns: u64) -> Arc<IrqSafeSpinLock<ConntrackEntry>> {
         if let Some(e) = self.lookup(&original) {
             self.touch_lru(e.lock().id);
             return e;
@@ -219,7 +220,9 @@ impl Conntrack {
             self.evict_lru();
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(IrqSafeSpinLock::new(ConntrackEntry::new(id, original, now_ns)));
+        let entry = Arc::new(IrqSafeSpinLock::new(ConntrackEntry::new(
+            id, original, now_ns,
+        )));
         {
             let reply = entry.lock().reply;
             let mut by = self.by_tuple.lock();
@@ -233,12 +236,7 @@ impl Conntrack {
 
     /// Update the per-tuple index after NAT changes the reply tuple.
     /// Removes the old reply key and inserts the new one.
-    pub fn update_reply_tuple(
-        &self,
-        id: u64,
-        old_reply: Tuple,
-        new_reply: Tuple,
-    ) {
+    pub fn update_reply_tuple(&self, id: u64, old_reply: Tuple, new_reply: Tuple) {
         let mut by = self.by_tuple.lock();
         by.remove(&old_reply);
         by.insert(new_reply, id);
@@ -395,8 +393,10 @@ pub fn tcp_advance(
     e.state = match new {
         TcpCtState::Established => CtState::Established,
         TcpCtState::SynSent | TcpCtState::SynRecv => CtState::New,
-        TcpCtState::FinWait | TcpCtState::CloseWait
-        | TcpCtState::LastAck | TcpCtState::TimeWait
+        TcpCtState::FinWait
+        | TcpCtState::CloseWait
+        | TcpCtState::LastAck
+        | TcpCtState::TimeWait
         | TcpCtState::Close => CtState::Established, // still tracked while closing
     };
     e.refresh_expiry(now_ns);
@@ -445,8 +445,9 @@ fn next_tcp_state(cur: TcpCtState, flags: u8, is_reply: bool) -> TcpCtState {
                 cur
             }
         }
-        TcpCtState::TimeWait | TcpCtState::CloseWait
-        | TcpCtState::LastAck | TcpCtState::Close => cur,
+        TcpCtState::TimeWait | TcpCtState::CloseWait | TcpCtState::LastAck | TcpCtState::Close => {
+            cur
+        }
     }
 }
 
@@ -460,7 +461,9 @@ pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
         None => return Verdict::Accept,
     };
     let now = narf_scheduler::narf_time::monotonic_ns();
-    let entry = CT.lookup(&tuple).unwrap_or_else(|| CT.insert_new(tuple, now));
+    let entry = CT
+        .lookup(&tuple)
+        .unwrap_or_else(|| CT.insert_new(tuple, now));
     let id = entry.lock().id;
     ctx.conntrack_id = Some(id);
     CT.touch_lru(id);
@@ -506,5 +509,5 @@ pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
 /// `include/uapi/linux/netfilter_ipv4.h:51`).
 pub fn register_default_hooks() {
     super::nf_register_hook(HookPoint::PreRouting, -200, conntrack_hook);
-    super::nf_register_hook(HookPoint::LocalOut,   -200, conntrack_hook);
+    super::nf_register_hook(HookPoint::LocalOut, -200, conntrack_hook);
 }

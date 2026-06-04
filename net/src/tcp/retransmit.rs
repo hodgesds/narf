@@ -126,16 +126,13 @@ impl RttEstimator {
             // RFC 6298 §2.3: subsequent measurements.
             // RTTVAR ← (1-β)·RTTVAR + β·|SRTT - R'|
             let diff = self.srtt_ns.abs_diff(rtt_ns);
-            self.rttvar_ns = self.rttvar_ns - (self.rttvar_ns >> BETA_SHIFT)
-                + (diff >> BETA_SHIFT);
+            self.rttvar_ns = self.rttvar_ns - (self.rttvar_ns >> BETA_SHIFT) + (diff >> BETA_SHIFT);
             // SRTT ← (1-α)·SRTT + α·R'
-            self.srtt_ns = self.srtt_ns - (self.srtt_ns >> ALPHA_SHIFT)
-                + (rtt_ns >> ALPHA_SHIFT);
+            self.srtt_ns = self.srtt_ns - (self.srtt_ns >> ALPHA_SHIFT) + (rtt_ns >> ALPHA_SHIFT);
         }
         // RTO ← SRTT + max(G, K·RTTVAR)
         let var_term = core::cmp::max(RTO_GRANULARITY_NS, K * self.rttvar_ns);
-        self.rto_ns = (self.srtt_ns.saturating_add(var_term))
-            .clamp(RTO_MIN_NS, RTO_MAX_NS);
+        self.rto_ns = (self.srtt_ns.saturating_add(var_term)).clamp(RTO_MIN_NS, RTO_MAX_NS);
         self.backoff_count = 0;
     }
 

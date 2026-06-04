@@ -288,8 +288,17 @@ pub fn build_discover(xid: u32, mac: [u8; 6]) -> Vec<u8> {
     append_client_identifier_eth(&mut out, &mac);
     append_parameter_request_list(
         &mut out,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_DOMAIN_NAME, OPT_LEASE_TIME,
-          OPT_INTERFACE_MTU, OPT_BROADCAST_ADDRESS, OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2],
+        &[
+            OPT_SUBNET_MASK,
+            OPT_ROUTER,
+            OPT_DNS_SERVER,
+            OPT_DOMAIN_NAME,
+            OPT_LEASE_TIME,
+            OPT_INTERFACE_MTU,
+            OPT_BROADCAST_ADDRESS,
+            OPT_RENEWAL_TIME_T1,
+            OPT_REBINDING_TIME_T2,
+        ],
     );
     append_end(&mut out);
     out
@@ -324,8 +333,14 @@ pub fn build_request_renew(xid: u32, mac: [u8; 6], ciaddr: [u8; 4]) -> Vec<u8> {
     append_client_identifier_eth(&mut out, &mac);
     append_parameter_request_list(
         &mut out,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_LEASE_TIME,
-          OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2],
+        &[
+            OPT_SUBNET_MASK,
+            OPT_ROUTER,
+            OPT_DNS_SERVER,
+            OPT_LEASE_TIME,
+            OPT_RENEWAL_TIME_T1,
+            OPT_REBINDING_TIME_T2,
+        ],
     );
     append_end(&mut out);
     out
@@ -416,8 +431,14 @@ pub fn build_inform(xid: u32, mac: [u8; 6], ciaddr: [u8; 4]) -> Vec<u8> {
     append_client_identifier_eth(&mut out, &mac);
     append_parameter_request_list(
         &mut out,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_DOMAIN_NAME,
-          OPT_INTERFACE_MTU, OPT_BROADCAST_ADDRESS],
+        &[
+            OPT_SUBNET_MASK,
+            OPT_ROUTER,
+            OPT_DNS_SERVER,
+            OPT_DOMAIN_NAME,
+            OPT_INTERFACE_MTU,
+            OPT_BROADCAST_ADDRESS,
+        ],
     );
     append_end(&mut out);
     out
@@ -450,8 +471,14 @@ pub fn build_request(xid: u32, mac: [u8; 6], requested_ip: [u8; 4], server_id: [
     append_client_identifier_eth(&mut out, &mac);
     append_parameter_request_list(
         &mut out,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER, OPT_LEASE_TIME,
-          OPT_RENEWAL_TIME_T1, OPT_REBINDING_TIME_T2],
+        &[
+            OPT_SUBNET_MASK,
+            OPT_ROUTER,
+            OPT_DNS_SERVER,
+            OPT_LEASE_TIME,
+            OPT_RENEWAL_TIME_T1,
+            OPT_REBINDING_TIME_T2,
+        ],
     );
     append_end(&mut out);
     out

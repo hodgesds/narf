@@ -29,9 +29,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::pkt_ipv6::{
     self, append_nd_option, iter_nd_options, neighbor_advertisement, neighbor_solicitation,
     router_solicitation, ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION,
-    ICMPV6_REDIRECT, ICMPV6_ROUTER_ADVERTISEMENT, ND_OPT_PREFIX_INFORMATION,
-    ND_OPT_SOURCE_LINK_LAYER_ADDR, ND_OPT_TARGET_LINK_LAYER_ADDR, NA_FLAG_OVERRIDE,
-    NA_FLAG_SOLICITED,
+    ICMPV6_REDIRECT, ICMPV6_ROUTER_ADVERTISEMENT, NA_FLAG_OVERRIDE, NA_FLAG_SOLICITED,
+    ND_OPT_PREFIX_INFORMATION, ND_OPT_SOURCE_LINK_LAYER_ADDR, ND_OPT_TARGET_LINK_LAYER_ADDR,
 };
 
 use super::addrs::{self, solicited_node_multicast};
@@ -70,7 +69,10 @@ static NEIGH: IrqSafeSpinLock<Vec<Neigh>> = IrqSafeSpinLock::new(Vec::new());
 /// Insert / update a neighbor entry.
 pub fn neigh_upsert(entry: Neigh) {
     let mut g = NEIGH.lock();
-    if let Some(e) = g.iter_mut().find(|e| e.iface == entry.iface && e.ip == entry.ip) {
+    if let Some(e) = g
+        .iter_mut()
+        .find(|e| e.iface == entry.iface && e.ip == entry.ip)
+    {
         e.mac = entry.mac;
         e.state = entry.state;
         e.is_router = entry.is_router;
@@ -134,7 +136,10 @@ pub fn routers() -> Vec<DefaultRouter> {
 
 fn router_upsert(r: DefaultRouter) {
     let mut g = ROUTERS.lock();
-    if let Some(e) = g.iter_mut().find(|e| e.iface == r.iface && e.addr == r.addr) {
+    if let Some(e) = g
+        .iter_mut()
+        .find(|e| e.iface == r.iface && e.addr == r.addr)
+    {
         e.deadline_ns = r.deadline_ns;
     } else {
         g.push(r);
@@ -331,8 +336,7 @@ pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Optio
             gateway: Some(src_addr),
             iface: String::from(iface),
             metric: 1024,
-            valid_deadline_ns: now_ns
-                .saturating_add((router_lifetime_s as u64) * 1_000_000_000),
+            valid_deadline_ns: now_ns.saturating_add((router_lifetime_s as u64) * 1_000_000_000),
         });
     }
     let mut prefixes = Vec::new();
@@ -378,12 +382,8 @@ pub fn on_ra(iface: &str, src_addr: [u8; 16], body: &[u8], now_ns: u64) -> Optio
             // MTU option (RFC 4861 §4.6.4).
             pkt_ipv6::ND_OPT_MTU => {
                 if opt.data.len() >= 6 {
-                    let v = u32::from_be_bytes([
-                        opt.data[2],
-                        opt.data[3],
-                        opt.data[4],
-                        opt.data[5],
-                    ]);
+                    let v =
+                        u32::from_be_bytes([opt.data[2], opt.data[3], opt.data[4], opt.data[5]]);
                     mtu = Some(v);
                 }
             }

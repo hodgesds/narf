@@ -127,11 +127,9 @@ impl IcmpRawSocket {
 
 // ── Global socket tables ───────────────────────────────────────────
 
-static ECHO_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpEchoSocket>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static ECHO_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpEchoSocket>>> = IrqSafeSpinLock::new(Vec::new());
 
-static RAW_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpRawSocket>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static RAW_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpRawSocket>>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -147,9 +145,7 @@ pub fn icmp_echo_open() -> Arc<IcmpEchoSocket> {
 
 /// Close an echo socket.
 pub fn icmp_echo_close(sock: &Arc<IcmpEchoSocket>) {
-    ECHO_SOCKETS
-        .lock()
-        .retain(|s| !Arc::ptr_eq(s, sock));
+    ECHO_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
 }
 
 /// Send an ICMP Echo Request to `target` and record it as pending.
@@ -218,10 +214,7 @@ pub fn icmp_echo_send(
 
 /// Poll for a completed Echo Reply for the given `seq`. Returns
 /// `Some((payload, rtt_ns))` if the reply has arrived, `None` otherwise.
-pub fn icmp_echo_poll_reply(
-    sock: &Arc<IcmpEchoSocket>,
-    seq: u16,
-) -> Option<(Vec<u8>, u64)> {
+pub fn icmp_echo_poll_reply(sock: &Arc<IcmpEchoSocket>, seq: u16) -> Option<(Vec<u8>, u64)> {
     let mut q = sock.pending.lock();
     for entry in q.iter_mut() {
         if entry.seq == seq {
@@ -249,9 +242,7 @@ pub fn icmp_raw_open(filter: IcmpFilter) -> Arc<IcmpRawSocket> {
 
 /// Close a raw ICMP socket.
 pub fn icmp_raw_close(sock: &Arc<IcmpRawSocket>) {
-    RAW_SOCKETS
-        .lock()
-        .retain(|s| !Arc::ptr_eq(s, sock));
+    RAW_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
 }
 
 /// Receive from a raw ICMP socket. Returns the next queued datagram.
@@ -387,12 +378,7 @@ fn handle_echo_reply(_src_ip: [u8; 4], icmp_body: &[u8]) {
 ///
 /// Mirrors Linux `icmp_err` → `udp_err` (net/ipv4/udp.c:633) and
 /// `tcp_v4_err` (net/ipv4/tcp_ipv4.c:483).
-pub fn deliver_error(
-    from_ip: [u8; 4],
-    icmp_type: u8,
-    icmp_code: u8,
-    icmp_body: &[u8],
-) {
+pub fn deliver_error(from_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: &[u8]) {
     // ICMP error body: [type code csum(2) rest(4) origIP+8bytes…]
     // The original IP header starts at offset 8.
     if icmp_body.len() < 8 + IPV4_HDR_LEN + 8 {
@@ -408,7 +394,11 @@ pub fn deliver_error(
     }
     let orig_src_port = u16::from_be_bytes([orig_l4[0], orig_l4[1]]);
 
-    let err = SockError { icmp_type, icmp_code, from_ip };
+    let err = SockError {
+        icmp_type,
+        icmp_code,
+        from_ip,
+    };
 
     match orig_ip.protocol {
         IP_PROTO_UDP => {
@@ -460,13 +450,15 @@ fn smoke_icmp_echo_send_recv_reply() -> TestResult {
 
     // Pre-load a pending echo (normally done by icmp_echo_send but
     // we skip ARP/iface here and inject the reply directly).
-    sock.pending.lock().push_back(crate::icmp_sock::PendingEcho {
-        identifier: id,
-        seq,
-        reply: None,
-        sent_ns: 1_000_000,
-        recv_ns: 0,
-    });
+    sock.pending
+        .lock()
+        .push_back(crate::icmp_sock::PendingEcho {
+            identifier: id,
+            seq,
+            reply: None,
+            sent_ns: 1_000_000,
+            recv_ns: 0,
+        });
 
     // Simulate receiving a reply: build a minimal ICMP Echo Reply body.
     let mut icmp_body = [0u8; 8 + 4];
@@ -508,7 +500,7 @@ fn smoke_icmp_raw_receives_any() -> TestResult {
     icmp_body[0] = ICMP_ECHO_REQUEST;
     icmp_body[1] = 0;
     icmp_body[4..6].copy_from_slice(&42u16.to_be_bytes()); // identifier
-    icmp_body[6..8].copy_from_slice(&1u16.to_be_bytes());  // seq
+    icmp_body[6..8].copy_from_slice(&1u16.to_be_bytes()); // seq
     let cs = ip_checksum(&icmp_body);
     icmp_body[2] = (cs >> 8) as u8;
     icmp_body[3] = (cs & 0xFF) as u8;
@@ -544,14 +536,14 @@ fn smoke_icmp_dest_unreach_delivered_to_udp_socket() -> TestResult {
     // The embedded IP says: src=local_ip:port → dst=10.0.0.2:9999.
     let orig_total_len = (IPV4_HDR_LEN + 8) as u16;
     let mut orig_ip = [0u8; IPV4_HDR_LEN + 8];
-    orig_ip[0] = (4 << 4) | 5;       // ver+IHL
+    orig_ip[0] = (4 << 4) | 5; // ver+IHL
     orig_ip[2..4].copy_from_slice(&orig_total_len.to_be_bytes()); // total_len
     orig_ip[9] = IP_PROTO_UDP;
     orig_ip[12..16].copy_from_slice(&local_ip);
     orig_ip[16..20].copy_from_slice(&[10, 0, 0, 2]);
-    orig_ip[IPV4_HDR_LEN..IPV4_HDR_LEN + 2].copy_from_slice(&port.to_be_bytes());   // src port
+    orig_ip[IPV4_HDR_LEN..IPV4_HDR_LEN + 2].copy_from_slice(&port.to_be_bytes()); // src port
     orig_ip[IPV4_HDR_LEN + 2..IPV4_HDR_LEN + 4].copy_from_slice(&9999u16.to_be_bytes()); // dst port
-    // Patch IP checksum.
+                                                                                         // Patch IP checksum.
     orig_ip[10] = 0;
     orig_ip[11] = 0;
     let ip_cs = ip_checksum(&orig_ip[..IPV4_HDR_LEN]);
@@ -640,7 +632,7 @@ kernel_test_in!("net/icmp", smoke_icmp_time_exceeded_delivered_to_udp_socket);
 /// queuing a packet.
 fn smoke_icmp_raw_filter_rejects_wrong_source() -> TestResult {
     let wanted_src = [10, 0, 0, 7];
-    let other_src  = [10, 0, 0, 8];
+    let other_src = [10, 0, 0, 8];
     let sock = icmp_raw_open(IcmpFilter::SrcIp(wanted_src));
 
     // Build a valid Echo Request ICMP body.

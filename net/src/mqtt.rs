@@ -198,11 +198,7 @@ pub fn decode_utf8_string(buf: &[u8], pos: usize) -> Result<(String, usize), Mqt
 ///   * Keep Alive: BE u16 in seconds
 ///   * Properties Length: VarInt (we emit 0 — no properties)
 ///   * Client Identifier: UTF-8 string (may be empty for server-assigned)
-pub fn build_connect_v5(
-    flags: u8,
-    keep_alive_secs: u16,
-    client_id: &str,
-) -> Vec<u8> {
+pub fn build_connect_v5(flags: u8, keep_alive_secs: u16, client_id: &str) -> Vec<u8> {
     // Variable header.
     let mut variable = Vec::with_capacity(64 + client_id.len());
     append_utf8_string(&mut variable, "MQTT");
