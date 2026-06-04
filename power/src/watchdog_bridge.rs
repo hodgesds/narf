@@ -128,8 +128,7 @@ struct WatchdogSlot {
     state: Arc<WatchdogState>,
 }
 
-static WATCHDOG_SLOTS: IrqSafeSpinLock<Vec<WatchdogSlot>> =
-    IrqSafeSpinLock::new(Vec::new());
+static WATCHDOG_SLOTS: IrqSafeSpinLock<Vec<WatchdogSlot>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a watchdog driver and return its slot index.
 ///
@@ -244,8 +243,7 @@ pub fn watchdog_release(state: &WatchdogState) {
 // ── /dev/watchdog compat alias ────────────────────────────────────────
 
 /// Global slot-0 state for `/dev/watchdog` alias.
-static WATCHDOG0_NODE: IrqSafeSpinLock<Option<Arc<WatchdogState>>> =
-    IrqSafeSpinLock::new(None);
+static WATCHDOG0_NODE: IrqSafeSpinLock<Option<Arc<WatchdogState>>> = IrqSafeSpinLock::new(None);
 
 /// Install the `/dev/watchdog` and `/dev/watchdog0` compat nodes.
 pub fn install_dev_watchdog_nodes() {
@@ -325,7 +323,12 @@ impl FileOps for WatchdogAttrFile {
 
     fn stat(&self) -> Stat {
         let size = (self.show)().len() as u64;
-        Stat { size, blocks: 0, mode: Mode::FILE_RO, mtime_cycles: 0 }
+        Stat {
+            size,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
     }
 }
 
@@ -346,7 +349,8 @@ struct WatchdogWritableAttrFile {
 
 impl core::fmt::Debug for WatchdogWritableAttrFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("WatchdogWritableAttrFile").finish_non_exhaustive()
+        f.debug_struct("WatchdogWritableAttrFile")
+            .finish_non_exhaustive()
     }
 }
 
@@ -378,7 +382,12 @@ impl FileOps for WatchdogWritableAttrFile {
 
     fn stat(&self) -> Stat {
         let size = (self.show)().len() as u64;
-        Stat { size, blocks: 0, mode: Mode::FILE_RW, mtime_cycles: 0 }
+        Stat {
+            size,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
     }
 }
 
@@ -411,7 +420,9 @@ impl core::fmt::Debug for WatchdogDevDir {
 
 impl WatchdogDevDir {
     fn ro_attr(show: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn FileOps> {
-        Arc::new(WatchdogAttrFile { show: Arc::new(show) })
+        Arc::new(WatchdogAttrFile {
+            show: Arc::new(show),
+        })
     }
 
     fn rw_attr(
@@ -427,14 +438,38 @@ impl WatchdogDevDir {
 
 // Static entries for `iter()` — must be `&'static str`.
 const WATCHDOG_ATTR_NAMES: &[DirEntry] = &[
-    DirEntry { name: "identity",   file_type: FileType::File },
-    DirEntry { name: "state",      file_type: FileType::File },
-    DirEntry { name: "status",     file_type: FileType::File },
-    DirEntry { name: "timeout",    file_type: FileType::File },
-    DirEntry { name: "pretimeout", file_type: FileType::File },
-    DirEntry { name: "nowayout",   file_type: FileType::File },
-    DirEntry { name: "bootstatus", file_type: FileType::File },
-    DirEntry { name: "fw_version", file_type: FileType::File },
+    DirEntry {
+        name: "identity",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "state",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "status",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "timeout",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "pretimeout",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "nowayout",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "bootstatus",
+        file_type: FileType::File,
+    },
+    DirEntry {
+        name: "fw_version",
+        file_type: FileType::File,
+    },
 ];
 
 impl DirOps for WatchdogDevDir {
@@ -454,7 +489,11 @@ impl DirOps for WatchdogDevDir {
             "status" => Some(Self::ro_attr(move || {
                 // Bit 2 (0x4) = WDIOF_CARDRESET: previous boot was a WD reset.
                 // `watchdog_dev.c:WDIOC_GETSTATUS`.
-                let bits: u32 = if s.bootstatus.load(Ordering::Acquire) { 0x4 } else { 0x0 };
+                let bits: u32 = if s.bootstatus.load(Ordering::Acquire) {
+                    0x4
+                } else {
+                    0x0
+                };
                 format!("{:#x}\n", bits)
             })),
             "timeout" => {
@@ -491,12 +530,20 @@ impl DirOps for WatchdogDevDir {
                 ))
             }
             "nowayout" => Some(Self::ro_attr(move || {
-                if s.nowayout.load(Ordering::Acquire) { "1\n".to_string() } else { "0\n".to_string() }
+                if s.nowayout.load(Ordering::Acquire) {
+                    "1\n".to_string()
+                } else {
+                    "0\n".to_string()
+                }
             })),
             "bootstatus" => Some(Self::ro_attr(move || {
                 // Reflects sp5100 CONTROL_FIRED bit latched at probe time.
                 // `sp5100_tco.c:291–327` — `tco_timer_start` checks `WDT_FIRED`.
-                if s.bootstatus.load(Ordering::Acquire) { "1\n".to_string() } else { "0\n".to_string() }
+                if s.bootstatus.load(Ordering::Acquire) {
+                    "1\n".to_string()
+                } else {
+                    "0\n".to_string()
+                }
             })),
             "fw_version" => Some(Self::ro_attr(move || {
                 format!("{}\n", s.fw_version.lock().as_str())
@@ -614,11 +661,7 @@ pub fn register_bridge() {
         // longest-prefix match routes it here before the main sysfs.
         // `watchdog_core.c:watchdog_cdev_register` (lines 391–431).
         let auth = narf_filesystem::bootstrap_mount_authority();
-        let _ = narf_filesystem::registry().mount(
-            &auth,
-            "/sys/class/watchdog",
-            WatchdogSysFs,
-        );
+        let _ = narf_filesystem::registry().mount(&auth, "/sys/class/watchdog", WatchdogSysFs);
 
         let _ = narf_console::write_str(
             "  watchdog-bridge: /dev/watchdog0 + /sys/class/watchdog/watchdog0 registered\n",

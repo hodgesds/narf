@@ -312,7 +312,9 @@ impl Sp5100PmioBase {
     pub fn mmio_addr(self) -> u64 {
         match self {
             Sp5100PmioBase::Sb7xx(raw) => (raw & !0xFFF) as u64,
-            Sp5100PmioBase::Sb8xx(raw) => (raw & !0xFFF) as u64 + sp5100::SB800_WDT_MMIO_OFFSET as u64,
+            Sp5100PmioBase::Sb8xx(raw) => {
+                (raw & !0xFFF) as u64 + sp5100::SB800_WDT_MMIO_OFFSET as u64
+            }
             Sp5100PmioBase::Efch => sp5100::EFCH_WDT_BASE,
             Sp5100PmioBase::EfchMmio(base) => base + sp5100::EFCH_ACPI_MMIO_WDT_OFFSET as u64,
         }
@@ -437,8 +439,18 @@ pub struct ITcoDriver {
 
 impl ITcoDriver {
     /// Build a driver state struct.  Does not touch hardware.
-    pub fn new(tco_base: u16, version: ITcoVersion, timeout_secs: u32, smi_base: Option<u16>) -> Self {
-        ITcoDriver { tco_base, version, timeout_secs, smi_base }
+    pub fn new(
+        tco_base: u16,
+        version: ITcoVersion,
+        timeout_secs: u32,
+        smi_base: Option<u16>,
+    ) -> Self {
+        ITcoDriver {
+            tco_base,
+            version,
+            timeout_secs,
+            smi_base,
+        }
     }
 
     /// Compose the `TCO1_TMR` / `TCOv2_TMR` initial value for the current

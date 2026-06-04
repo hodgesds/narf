@@ -168,13 +168,14 @@ struct PerCpu {
 }
 
 const MAX_CPUS: usize = 64;
-static PERCPU: IrqSafeSpinLock<[PerCpu; MAX_CPUS]> =
-    IrqSafeSpinLock::new([PerCpu {
+static PERCPU: IrqSafeSpinLock<[PerCpu; MAX_CPUS]> = IrqSafeSpinLock::new(
+    [PerCpu {
         last_timer_fires: 0,
         last_desired: 0,
         min_perf: 0,
         max_perf: 0,
-    }; MAX_CPUS]);
+    }; MAX_CPUS],
+);
 
 /// Monotonic tick counter — incremented by [`tick()`] for
 /// diagnostics.
@@ -694,10 +695,7 @@ mod smoke_tests {
         // builder reused for AMD; for HWP we exercise the same
         // bit positions inline. Build (min=1, max=255, des=128,
         // EPP=balanced=0x80).
-        let req: u64 = (1u64)
-            | (255u64 << 8)
-            | (128u64 << 16)
-            | (0x80u64 << 24);
+        let req: u64 = (1u64) | (255u64 << 8) | (128u64 << 16) | (0x80u64 << 24);
         if (req & 0xFF) != 1 {
             return TestResult::Fail("req[7:0]");
         }
@@ -765,7 +763,7 @@ mod smoke_tests {
         // 3-state table: 3500/2200/800 MHz at decreasing power.
         let pss = Value::Package(vec![
             Value::Package(vec![
-                Value::Integer(3500), // CoreFreq MHz
+                Value::Integer(3500),   // CoreFreq MHz
                 Value::Integer(15_000), // Power mW
                 Value::Integer(10),     // TransitionLatency µs
                 Value::Integer(10),     // BusMasterLatency µs

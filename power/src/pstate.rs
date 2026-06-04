@@ -403,10 +403,12 @@ pub fn amd_pstate_summary() -> AmdPstateSummary {
     for i in 0..8u8 {
         let v = match rdmsr_or_gp(MSR_AMD_PSTATE_DEF_0 + i as u32) {
             Ok(v) => v,
-            Err(_) => return AmdPstateSummary {
-                defined: 0,
-                formatted_freqs: String::from("(BIOS-locked)"),
-            },
+            Err(_) => {
+                return AmdPstateSummary {
+                    defined: 0,
+                    formatted_freqs: String::from("(BIOS-locked)"),
+                }
+            }
         };
         if v >> 63 == 0 {
             continue;

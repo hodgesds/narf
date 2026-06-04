@@ -41,9 +41,9 @@ pub mod laptop_state;
 pub mod psci;
 pub mod suspend;
 pub mod syscall;
+pub mod sysfs_bridge;
 pub mod system;
 pub mod thermal;
-pub mod sysfs_bridge;
 pub mod watchdog;
 pub mod watchdog_bridge;
 
@@ -103,8 +103,7 @@ pub fn list_sources() -> Vec<Arc<dyn PowerSource>> {
 // cpu-pstate Stage::Subsys initcall; readers see whatever the
 // initcall last wrote.
 
-static CPU_STATUS_LINE: IrqSafeSpinLock<Option<alloc::string::String>> =
-    IrqSafeSpinLock::new(None);
+static CPU_STATUS_LINE: IrqSafeSpinLock<Option<alloc::string::String>> = IrqSafeSpinLock::new(None);
 
 pub fn set_cpu_status_line(line: alloc::string::String) {
     *CPU_STATUS_LINE.lock() = Some(line);
@@ -236,7 +235,8 @@ pub fn register_initcalls() {
             let _ = writeln!(
                 narf_console::Writer,
                 "  amd-pstate: {} slots, {}",
-                amd.defined, amd.formatted_freqs,
+                amd.defined,
+                amd.formatted_freqs,
             );
         }
 

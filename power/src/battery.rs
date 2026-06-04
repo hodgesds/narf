@@ -57,8 +57,7 @@ pub enum BatteryTripEvent {
 
 type BatterySubscriber = Box<dyn Fn(&BatteryTripEvent) + Send + Sync + 'static>;
 
-static BATTERY_SUBS: IrqSafeSpinLock<Vec<BatterySubscriber>> =
-    IrqSafeSpinLock::new(Vec::new());
+static BATTERY_SUBS: IrqSafeSpinLock<Vec<BatterySubscriber>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a callback for battery trip events. Called from the
 /// ACPI notify dispatcher (0x80/0x81) and from `_BTP` expiry.
@@ -372,30 +371,32 @@ mod tests {
         // battery: 50 Wh design, 47 Wh last-full, 12 V nominal,
         // 312 cycles, "BAT0/Li-ion/ACME".
         let pkg = Value::Package(vec![
-            Value::Integer(0),                       // revision
-            Value::Integer(0),                       // power_unit = mW/mWh
-            Value::Integer(50_000),                  // design_capacity (mWh)
-            Value::Integer(47_000),                  // last_full_charge
-            Value::Integer(1),                       // technology = secondary
-            Value::Integer(12_000),                  // design_voltage (mV)
-            Value::Integer(5_000),                   // warning
-            Value::Integer(2_500),                   // low
-            Value::Integer(312),                     // cycle_count
-            Value::Integer(80_000),                  // measurement_accuracy
-            Value::Integer(60_000),                  // max_sampling_time_ms
-            Value::Integer(1_000),                   // min_sampling_time_ms
-            Value::Integer(60_000),                  // max_averaging_interval_ms
-            Value::Integer(1_000),                   // min_averaging_interval_ms
-            Value::Integer(100),                     // capacity_granularity_1
-            Value::Integer(100),                     // capacity_granularity_2
-            Value::String("Model-X".to_string()),    // model_number
-            Value::String("SN-12345".to_string()),   // serial_number
-            Value::String("LIon".to_string()),       // battery_type
-            Value::String("ACME-OEM".to_string()),   // oem_info
+            Value::Integer(0),                     // revision
+            Value::Integer(0),                     // power_unit = mW/mWh
+            Value::Integer(50_000),                // design_capacity (mWh)
+            Value::Integer(47_000),                // last_full_charge
+            Value::Integer(1),                     // technology = secondary
+            Value::Integer(12_000),                // design_voltage (mV)
+            Value::Integer(5_000),                 // warning
+            Value::Integer(2_500),                 // low
+            Value::Integer(312),                   // cycle_count
+            Value::Integer(80_000),                // measurement_accuracy
+            Value::Integer(60_000),                // max_sampling_time_ms
+            Value::Integer(1_000),                 // min_sampling_time_ms
+            Value::Integer(60_000),                // max_averaging_interval_ms
+            Value::Integer(1_000),                 // min_averaging_interval_ms
+            Value::Integer(100),                   // capacity_granularity_1
+            Value::Integer(100),                   // capacity_granularity_2
+            Value::String("Model-X".to_string()),  // model_number
+            Value::String("SN-12345".to_string()), // serial_number
+            Value::String("LIon".to_string()),     // battery_type
+            Value::String("ACME-OEM".to_string()), // oem_info
         ]);
         let bix = match decode_bix(&pkg) {
             Ok(b) => b,
-            Err(_) => return TestResult::Fail("decode_bix rejected a well-formed 20-field package"),
+            Err(_) => {
+                return TestResult::Fail("decode_bix rejected a well-formed 20-field package")
+            }
         };
         if bix.design_capacity != 50_000 {
             return TestResult::Fail("design_capacity mis-decoded");

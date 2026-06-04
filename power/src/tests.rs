@@ -322,8 +322,7 @@ fn smoke_s3_arm_resume_refuses_without_s3() -> TestResult {
         suspend::__test_reset();
         let cap: Cap<Power, Invoke> = Cap::bootstrap();
         match suspend::arm_s3_resume(&cap) {
-            Err(suspend::SuspendError::NotImplemented)
-            | Err(suspend::SuspendError::Aborted) => {}
+            Err(suspend::SuspendError::NotImplemented) | Err(suspend::SuspendError::Aborted) => {}
             Err(suspend::SuspendError::AuthorityRevoked) => {
                 return TestResult::Fail("live cap was rejected as revoked");
             }
@@ -451,43 +450,29 @@ fn smoke_rapl_unit_decode() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("power/rapl", smoke_rapl_unit_decode);
 
-
-
 // ── Watchdog codec smokes ─────────────────────────────────────────
 
-
-
 fn smoke_watchdog_itco_initial_seconds_clamp() -> TestResult {
-
     use crate::watchdog::itco::compose_initial_seconds;
 
     if compose_initial_seconds(1) < 4 {
-
         return TestResult::Fail("min clamp");
-
     }
 
     if compose_initial_seconds(10_000) != 0x3FF {
-
         return TestResult::Fail("max clamp");
-
     }
 
     // 30 s → 30_000 / 600 = 50 ticks.
 
     if compose_initial_seconds(30) != 50 {
-
         return TestResult::Fail("tick conversion");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/watchdog", smoke_watchdog_itco_initial_seconds_clamp);
-
-
 
 fn smoke_watchdog_sp5100_count_pass_through() -> TestResult {
     // sp5100_tco.h:19,23 — START_STOP = BIT(0), TRIGGER_BIT = BIT(7).
@@ -512,24 +497,17 @@ fn smoke_watchdog_sp5100_count_pass_through() -> TestResult {
 
 kernel_test_in!("power/watchdog", smoke_watchdog_sp5100_count_pass_through);
 
-
-
 fn smoke_watchdog_sp805_lock_magic_and_load() -> TestResult {
-
     use crate::watchdog::sp805::{compose_load_seconds, LOCK_LOCK, LOCK_UNLOCK};
 
     // Spec-defined unlock magic.
 
     if LOCK_UNLOCK != 0x1ACC_E551 {
-
         return TestResult::Fail("unlock magic");
-
     }
 
     if LOCK_LOCK != 0 {
-
         return TestResult::Fail("lock magic");
-
     }
 
     // 30 s @ 24 MHz / 2 = 12 MHz tick.
@@ -537,13 +515,10 @@ fn smoke_watchdog_sp805_lock_magic_and_load() -> TestResult {
     let want = 30u32 * (24_000_000 / 2);
 
     if compose_load_seconds(30, 24_000_000) != want {
-
         return TestResult::Fail("load value math wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/watchdog", smoke_watchdog_sp805_lock_magic_and_load);
@@ -688,8 +663,7 @@ fn smoke_sp5100_fired_latch_on_probe() -> TestResult {
         return TestResult::Fail("FIRED bit not latched into fired_on_prev_boot");
     }
 
-    let drv2 = Sp5100Driver::from_probe(0xFEB0_0000, 60, 0)
-        .expect("probe must succeed");
+    let drv2 = Sp5100Driver::from_probe(0xFEB0_0000, 60, 0).expect("probe must succeed");
     if drv2.fired_on_prev_boot {
         return TestResult::Fail("fired_on_prev_boot set without FIRED bit");
     }
@@ -732,7 +706,7 @@ kernel_test_in!("power/watchdog", smoke_itco_register_offsets);
 // Smoke 8: iTCO kick — ITcoDriver::kick_value() == TCO_RLD_KICK == 1.
 // Ref: iTCO_wdt.c:293 — outw(0x01, TCO_RLD(p)).
 fn smoke_itco_kick_value() -> TestResult {
-    use crate::watchdog::{ITcoDriver, ITcoVersion, itco};
+    use crate::watchdog::{itco, ITcoDriver, ITcoVersion};
 
     let drv = ITcoDriver::new(0x0460, ITcoVersion::V2, 60, None);
     if drv.kick_value() != itco::TCO_RLD_KICK {
@@ -790,7 +764,7 @@ kernel_test_in!("power/watchdog", smoke_itco_timeout_calc);
 // Smoke 10: iTCO enable/stop CNT manipulations mask NMI_NOW correctly.
 // Ref: iTCO_wdt.c:279–320.
 fn smoke_itco_cnt_enable_stop() -> TestResult {
-    use crate::watchdog::{ITcoDriver, ITcoVersion, itco};
+    use crate::watchdog::{itco, ITcoDriver, ITcoVersion};
 
     let drv = ITcoDriver::new(0x0460, ITcoVersion::V2, 60, None);
 
@@ -841,14 +815,14 @@ fn smoke_watchdog_kick_task_period() -> TestResult {
         return TestResult::Fail("1 s timeout -> 1 s minimum period");
     }
 
-    let sp_drv = crate::watchdog::Sp5100Driver::from_probe(0xFEB0_0000, 60, 0)
-        .expect("probe must succeed");
+    let sp_drv =
+        crate::watchdog::Sp5100Driver::from_probe(0xFEB0_0000, 60, 0).expect("probe must succeed");
     if sp_drv.kick_period_secs() != 30 {
         return TestResult::Fail("Sp5100Driver kick_period_secs(60) != 30");
     }
 
-    let itco_drv = crate::watchdog::ITcoDriver::new(
-        0x0460, crate::watchdog::ITcoVersion::V2, 60, None);
+    let itco_drv =
+        crate::watchdog::ITcoDriver::new(0x0460, crate::watchdog::ITcoVersion::V2, 60, None);
     if itco_drv.kick_period_secs() != 30 {
         return TestResult::Fail("ITcoDriver kick_period_secs(60) != 30");
     }
@@ -859,199 +833,159 @@ kernel_test_in!("power/watchdog", smoke_watchdog_kick_task_period);
 
 // ── PSCI ──────────────────────────────────────────────────────────
 
-
-
 fn smoke_psci_function_ids_match_spec() -> TestResult {
-
     use crate::psci::fn_id;
 
     if fn_id::PSCI_VERSION != 0x84000000
-
         || fn_id::CPU_OFF != 0x84000002
-
         || fn_id::CPU_ON_64 != 0xC4000003
-
         || fn_id::SYSTEM_OFF != 0x84000008
-
         || fn_id::SYSTEM_RESET != 0x84000009
-
     {
-
         return TestResult::Fail("PSCI function IDs wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/psci", smoke_psci_function_ids_match_spec);
 
-
-
 fn smoke_psci_power_state_encoding() -> TestResult {
-
     use crate::psci::encode_power_state;
 
     let s = encode_power_state(0x42, true, 1);
 
-    if s & 0xFFFF != 0x42 { return TestResult::Fail("state id"); }
+    if s & 0xFFFF != 0x42 {
+        return TestResult::Fail("state id");
+    }
 
-    if s & (1 << 16) == 0 { return TestResult::Fail("power-down"); }
+    if s & (1 << 16) == 0 {
+        return TestResult::Fail("power-down");
+    }
 
-    if (s >> 24) & 0x7 != 1 { return TestResult::Fail("affinity"); }
+    if (s >> 24) & 0x7 != 1 {
+        return TestResult::Fail("affinity");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/psci", smoke_psci_power_state_encoding);
 
-
-
 fn smoke_psci_status_decode() -> TestResult {
-
     use crate::psci::Status;
 
-    if Status::from_i32(0) != Status::Success { return TestResult::Fail("0"); }
+    if Status::from_i32(0) != Status::Success {
+        return TestResult::Fail("0");
+    }
 
-    if Status::from_i32(-4) != Status::AlreadyOn { return TestResult::Fail("-4"); }
+    if Status::from_i32(-4) != Status::AlreadyOn {
+        return TestResult::Fail("-4");
+    }
 
-    if Status::from_i32(-9) != Status::InvalidAddress { return TestResult::Fail("-9"); }
+    if Status::from_i32(-9) != Status::InvalidAddress {
+        return TestResult::Fail("-9");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/psci", smoke_psci_status_decode);
 
-
-
 // ── AMD CPPC ──────────────────────────────────────────────────────
-
-
 
 #[cfg(target_arch = "x86_64")]
 
 fn smoke_cppc_request_round_trip() -> TestResult {
-
     use crate::cppc::{epp, Request};
 
     let r = Request::build(50, 200, 150, epp::BALANCED_PERFORMANCE);
 
     if r.min_perf() != 50 || r.max_perf() != 200 || r.desired_perf() != 150 {
-
         return TestResult::Fail("perf fields");
-
     }
 
     if r.energy_performance_preference() != epp::BALANCED_PERFORMANCE {
-
         return TestResult::Fail("EPP");
-
     }
 
     TestResult::Pass
-
 }
 
 #[cfg(target_arch = "x86_64")]
 
 kernel_test_in!("power/cppc", smoke_cppc_request_round_trip);
 
-
-
 #[cfg(target_arch = "x86_64")]
 
 fn smoke_cppc_cap1_field_layout() -> TestResult {
-
     use crate::cppc::Cap1;
 
     let c = Cap1(0x12_34_56_78);
 
-    if c.lowest_perf() != 0x78 || c.lowest_nonlinear_perf() != 0x56
-
-        || c.nominal_perf() != 0x34 || c.highest_perf() != 0x12 {
-
+    if c.lowest_perf() != 0x78
+        || c.lowest_nonlinear_perf() != 0x56
+        || c.nominal_perf() != 0x34
+        || c.highest_perf() != 0x12
+    {
         return TestResult::Fail("Cap1 fields");
-
     }
 
     TestResult::Pass
-
 }
 
 #[cfg(target_arch = "x86_64")]
 
 kernel_test_in!("power/cppc", smoke_cppc_cap1_field_layout);
 
-
-
 #[cfg(target_arch = "x86_64")]
 
 fn smoke_cppc_supported_query_does_not_fault() -> TestResult {
-
     // `cppc::supported()` must be safe to call on any host —
     // CPUID-only, no MSR access. This pins down the contract that
     // detection is GP-fault-safe before the boot path queries it.
     let _ = crate::cppc::supported();
 
     TestResult::Pass
-
 }
 
 #[cfg(target_arch = "x86_64")]
 
 kernel_test_in!("power/cppc", smoke_cppc_supported_query_does_not_fault);
 
-
-
 // ── CPU power syscall bridge ──────────────────────────────────────
 
-
-
 fn smoke_syscall_resolve_cpu_id_current_sentinel() -> TestResult {
-
     use crate::syscall::{resolve_cpu_id, CPU_ID_CURRENT};
 
     if resolve_cpu_id(CPU_ID_CURRENT, false, 3) != Some(3) {
-
         return TestResult::Fail("current sentinel");
-
     }
 
     if resolve_cpu_id(3, false, 3) != Some(3) {
-
         return TestResult::Fail("matching cpu");
-
     }
 
     if resolve_cpu_id(7, false, 3).is_some() {
-
         return TestResult::Fail("other cpu must be denied for non-TCB");
-
     }
 
     if resolve_cpu_id(7, true, 3) != Some(7) {
-
         return TestResult::Fail("TCB must allow other cpu");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("power/syscall", smoke_syscall_resolve_cpu_id_current_sentinel);
-
-
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_resolve_cpu_id_current_sentinel
+);
 
 fn smoke_syscall_perf_state_pack_round_trip() -> TestResult {
-
     use crate::syscall::{pack_perf_state, unpack_perf_state, PerfState};
 
     let s = PerfState {
-
         delivered_perf: 200,
 
         epp: 0x40,
@@ -1062,24 +996,21 @@ fn smoke_syscall_perf_state_pack_round_trip() -> TestResult {
 
         mperf: 0x2345_6789,
 
-        tsc:   0x3456_789A,
-
+        tsc: 0x3456_789A,
     };
 
     let r = unpack_perf_state(pack_perf_state(s));
 
-    if r != s { return TestResult::Fail("perf state round-trip"); }
+    if r != s {
+        return TestResult::Fail("perf state round-trip");
+    }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("power/syscall", smoke_syscall_perf_state_pack_round_trip);
 
-
-
 fn smoke_syscall_topology_returns_at_least_one_cpu() -> TestResult {
-
     use crate::syscall::{handle, CpuOpArgs};
 
     use narf_abi::CpuOpKind;
@@ -1087,21 +1018,18 @@ fn smoke_syscall_topology_returns_at_least_one_cpu() -> TestResult {
     let r = handle(CpuOpKind::Topology, &CpuOpArgs::default(), 0);
 
     if r.status != 0 || r.result[0] == 0 {
-
         return TestResult::Fail("topology must report at least 1 cpu");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("power/syscall", smoke_syscall_topology_returns_at_least_one_cpu);
-
-
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_topology_returns_at_least_one_cpu
+);
 
 fn smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb() -> TestResult {
-
     use crate::syscall::{handle, CpuOpArgs};
 
     use narf_abi::CpuOpKind;
@@ -1114,23 +1042,24 @@ fn smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb() -> TestResult {
 
     let r = handle(CpuOpKind::PerfState, &a, 0);
 
-    if r.status != 8 /* Forbidden */ {
-
+    if r.status != 8
+    /* Forbidden */
+    {
         return TestResult::Fail("cpu 7 from cpu 0 must be Forbidden");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("power/syscall", smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb);
-
-
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb
+);
 
 fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
-
-    use crate::syscall::{__reset_latency_hints_for_test, current_latency_floor_us, handle, CpuOpArgs};
+    use crate::syscall::{
+        __reset_latency_hints_for_test, current_latency_floor_us, handle, CpuOpArgs,
+    };
 
     use narf_abi::CpuOpKind;
 
@@ -1142,14 +1071,14 @@ fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
 
     let r = handle(CpuOpKind::LatencyHint, &a, 0);
 
-    if r.status != 0 { return TestResult::Fail("register"); }
+    if r.status != 0 {
+        return TestResult::Fail("register");
+    }
 
     let token = r.result[0];
 
     if current_latency_floor_us() != Some(50) {
-
         return TestResult::Fail("floor not 50");
-
     }
 
     let mut b = CpuOpArgs::default();
@@ -1159,9 +1088,7 @@ fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
     let _ = handle(CpuOpKind::LatencyHint, &b, 0);
 
     if current_latency_floor_us() != Some(50) {
-
         return TestResult::Fail("floor must stay at strictest");
-
     }
 
     let mut rel = CpuOpArgs::default();
@@ -1171,30 +1098,33 @@ fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
     handle(CpuOpKind::LatencyRelease, &rel, 0);
 
     if current_latency_floor_us() != Some(200) {
-
         return TestResult::Fail("floor must rise after release");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("power/syscall", smoke_syscall_latency_hint_register_and_release);
-
-
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_latency_hint_register_and_release
+);
 
 fn smoke_syscall_set_freq_range_returns_unsupported_without_dvfs() -> TestResult {
     use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps};
     use narf_abi::CpuOpKind;
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = 0;
     a.a1 = 800_000;
     a.a2 = 4_000_000;
     let r = handle(CpuOpKind::SetFreqRange, &a, 0);
     __set_caps_for_test(None);
-    if r.status != 9 /* Unsupported */ {
+    if r.status != 9
+    /* Unsupported */
+    {
         return TestResult::Fail("no DVFS must return Unsupported");
     }
     TestResult::Pass
@@ -1207,7 +1137,10 @@ kernel_test_in!(
 fn smoke_syscall_set_freq_range_echoes_request_when_dvfs_present() -> TestResult {
     use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps};
     use narf_abi::CpuOpKind;
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: true, has_rapl: false }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: true,
+        has_rapl: false,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = 0;
     a.a1 = 800_000;
@@ -1227,7 +1160,10 @@ kernel_test_in!(
 fn smoke_syscall_set_epp_returns_unsupported_without_dvfs() -> TestResult {
     use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps};
     use narf_abi::CpuOpKind;
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = 0;
     a.a1 = 0x40;
@@ -1246,7 +1182,10 @@ kernel_test_in!(
 fn smoke_syscall_set_governor_returns_unsupported_without_dvfs() -> TestResult {
     use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, Governor, PowerCaps};
     use narf_abi::CpuOpKind;
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = 0;
     a.a1 = Governor::Powersave as u64;
@@ -1265,7 +1204,10 @@ kernel_test_in!(
 fn smoke_syscall_energy_budget_returns_unsupported_without_rapl() -> TestResult {
     use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps, RaplDomain};
     use narf_abi::CpuOpKind;
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = RaplDomain::Package as u64;
     a.a1 = 1000;
@@ -1289,7 +1231,10 @@ fn smoke_syscall_energy_budget_install_and_clear_with_rapl() -> TestResult {
     };
     use narf_abi::CpuOpKind;
     __reset_energy_budgets_for_test();
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: true }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: false,
+        has_rapl: true,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = RaplDomain::Package as u64;
     a.a1 = 1000;
@@ -1320,7 +1265,10 @@ kernel_test_in!(
 fn smoke_syscall_rapl_energy_returns_unsupported_without_rapl() -> TestResult {
     use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps, RaplDomain};
     use narf_abi::CpuOpKind;
-    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    __set_caps_for_test(Some(PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }));
     let mut a = CpuOpArgs::default();
     a.a0 = 0;
     a.a1 = RaplDomain::Package as u64;
@@ -1339,9 +1287,9 @@ kernel_test_in!(
 // ── relocated from verification (subsystem 'power') ──
 
 fn smoke_power_thermal_zone_transitions() -> TestResult {
+    use crate::{thermal, Thermal, ThermalEvent, ThermalState};
     use narf_capabilities::{Cap, Grant, Read};
     use narf_event_bus::TopicRegistry;
-    use crate::{thermal, Thermal, ThermalEvent, ThermalState};
 
     thermal::__test_reset();
     thermal::init();
@@ -1485,7 +1433,9 @@ fn smoke_idle_encode_cstate_full_table() -> TestResult {
         if encode_cstate(depth) != want {
             let msg = alloc::format!(
                 "encode_cstate({}) = {:#x} (expected {:#x})",
-                depth, encode_cstate(depth), want
+                depth,
+                encode_cstate(depth),
+                want
             );
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
@@ -1738,9 +1688,9 @@ kernel_test_in!("power/laptop_state", smoke_laptop_state_default_is_all_none);
 
 fn smoke_laptop_state_critical_low_on_battery_fires() -> TestResult {
     use crate::laptop_state::LaptopStateSnapshot;
+    use alloc::string::String;
     use narf_acpi::ac_adapter::AcAdapterState;
     use narf_acpi::battery::{decode_bif, decode_bst, BatteryStatus};
-    use alloc::string::String;
     let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
     let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
     let info = decode_bif(&ints, &strings).expect("bif");
@@ -1822,8 +1772,8 @@ kernel_test_in!(
 
 fn smoke_laptop_state_battery_percent_fuses_info_and_state() -> TestResult {
     use crate::laptop_state::LaptopStateSnapshot;
-    use narf_acpi::battery::{decode_bif, decode_bst, BatteryStatus};
     use alloc::string::String;
+    use narf_acpi::battery::{decode_bif, decode_bst, BatteryStatus};
     let ints: [u32; 9] = [0, 50_000, 48_000, 1, 11_400, 5_000, 2_500, 1, 1];
     let strings: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
     let info = decode_bif(&ints, &strings).expect("bif");
@@ -1891,8 +1841,7 @@ fn smoke_pm_fail_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
 
 fn smoke_device_pm_register_and_fanout_order() -> TestResult {
     use crate::device_pm::{
-        device_count, register_device_pm, resume_all_devices, suspend_all_devices,
-        __reset_for_test,
+        __reset_for_test, device_count, register_device_pm, resume_all_devices, suspend_all_devices,
     };
     __reset_for_test();
     PM_SEQ.store(0, TestOrdering::Release);
@@ -1956,10 +1905,7 @@ fn smoke_device_pm_one_failure_doesnt_abort_chain() -> TestResult {
     if report.failure_count != 1 {
         return TestResult::Fail("expected exactly 1 failure");
     }
-    if !matches!(
-        report.outcomes[1].result,
-        Err(DeviceSuspendError::Busy)
-    ) {
+    if !matches!(report.outcomes[1].result, Err(DeviceSuspendError::Busy)) {
         return TestResult::Fail("middle outcome must carry the Busy error");
     }
     // Both Ok handlers ran despite the middle failure.
@@ -1979,7 +1925,7 @@ kernel_test_in!(
 
 fn smoke_device_pm_re_register_replaces() -> TestResult {
     use crate::device_pm::{
-        device_count, register_device_pm, suspend_all_devices, __reset_for_test,
+        __reset_for_test, device_count, register_device_pm, suspend_all_devices,
     };
     __reset_for_test();
     PM_SEQ.store(0, TestOrdering::Release);
@@ -2029,9 +1975,7 @@ fn smoke_arm_s3_resume_refuses_without_armed_real_sleep() -> TestResult {
     let cap: Cap<Power, Invoke> = Cap::bootstrap();
     match arm_s3_resume(&cap) {
         Err(SuspendError::NotImplemented) => TestResult::Pass,
-        Err(_) | Ok(_) => TestResult::Fail(
-            "arm_s3_resume must refuse without REAL_SLEEP_ARMED",
-        ),
+        Err(_) | Ok(_) => TestResult::Fail("arm_s3_resume must refuse without REAL_SLEEP_ARMED"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -2106,9 +2050,7 @@ fn smoke_s3_wake_entry_phys_resolvable_via_cr3() -> TestResult {
     // SAFETY: CPL=0 read.
     let cr3 = unsafe { read_cr3() } & !0xFFFu64;
     let entry_virt = s3_wake_entry as usize as u64;
-    let phys = unsafe {
-        translate(PhysAddr::new(cr3), VirtAddr::new(entry_virt))
-    };
+    let phys = unsafe { translate(PhysAddr::new(cr3), VirtAddr::new(entry_virt)) };
     let phys_page = match phys {
         Some(p) => p.raw(),
         None => return TestResult::Fail("CR3 walk couldn't resolve s3_wake_entry virt"),
@@ -2123,10 +2065,7 @@ fn smoke_s3_wake_entry_phys_resolvable_via_cr3() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!(
-    "power/suspend",
-    smoke_s3_wake_entry_phys_resolvable_via_cr3
-);
+kernel_test_in!("power/suspend", smoke_s3_wake_entry_phys_resolvable_via_cr3);
 
 // ── DevicePmOps trait round-trip ────────────────────────────────────
 
@@ -2590,7 +2529,9 @@ fn poll_once_watchdog<F: core::future::Future>(mut fut: F) -> Option<F::Output> 
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -2608,8 +2549,8 @@ fn poll_once_watchdog<F: core::future::Future>(mut fut: F) -> Option<F::Output> 
 // Linux ref: watchdog_dev.c:watchdog_write (lines 238–275) — any write = ping.
 fn smoke_watchdog_write_any_byte_kicks() -> TestResult {
     use crate::watchdog_bridge::{DevWatchdog, __new_test_state};
-    use narf_filesystem::FileOps;
     use core::sync::atomic::Ordering;
+    use narf_filesystem::FileOps;
 
     let state = __new_test_state("SP5100 TCO", 60);
     let before = state.kick_count.load(Ordering::Relaxed);
@@ -2630,9 +2571,9 @@ kernel_test_in!("power/watchdog", smoke_watchdog_write_any_byte_kicks);
 // Smoke 2: write 'V' then watchdog_release → active becomes false.
 // Linux ref: watchdog_dev.c:watchdog_release (lines 278–310) — magic close disarms.
 fn smoke_watchdog_magic_v_close_disarms() -> TestResult {
-    use crate::watchdog_bridge::{DevWatchdog, watchdog_release, __new_test_state};
-    use narf_filesystem::FileOps;
+    use crate::watchdog_bridge::{watchdog_release, DevWatchdog, __new_test_state};
     use core::sync::atomic::Ordering;
+    use narf_filesystem::FileOps;
 
     let state = __new_test_state("SP5100 TCO", 60);
     let node = DevWatchdog::new(state.clone());
@@ -2657,9 +2598,9 @@ kernel_test_in!("power/watchdog", smoke_watchdog_magic_v_close_disarms);
 // Smoke 3: write 'a' then close without 'V' → watchdog stays armed.
 // Linux ref: watchdog_dev.c:watchdog_release (lines 296–302) — no magic = no disarm.
 fn smoke_watchdog_close_without_v_keeps_active() -> TestResult {
-    use crate::watchdog_bridge::{DevWatchdog, watchdog_release, __new_test_state};
-    use narf_filesystem::FileOps;
+    use crate::watchdog_bridge::{watchdog_release, DevWatchdog, __new_test_state};
     use core::sync::atomic::Ordering;
+    use narf_filesystem::FileOps;
 
     let state = __new_test_state("SP5100 TCO", 60);
     let node = DevWatchdog::new(state.clone());
@@ -2678,7 +2619,10 @@ fn smoke_watchdog_close_without_v_keeps_active() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("power/watchdog", smoke_watchdog_close_without_v_keeps_active);
+kernel_test_in!(
+    "power/watchdog",
+    smoke_watchdog_close_without_v_keeps_active
+);
 
 // Smoke 4: /sys/class/watchdog/watchdog0/identity returns "SP5100 TCO\n".
 // Linux ref: watchdog_dev.c WDIOC_GETSUPPORT — identity string.
@@ -2763,11 +2707,13 @@ kernel_test_in!("power/watchdog", smoke_watchdog_sysfs_timeout_rw);
 // Linux ref: sp5100_tco.c lines 291–327 — CONTROL_FIRED latched at probe.
 fn smoke_watchdog_sysfs_bootstatus() -> TestResult {
     use crate::watchdog_bridge::{WatchdogDevDir, __new_test_state};
-    use narf_filesystem::DirOps;
     use core::sync::atomic::Ordering;
+    use narf_filesystem::DirOps;
 
     let state = __new_test_state("SP5100 TCO", 60);
-    let dir = WatchdogDevDir { state: state.clone() };
+    let dir = WatchdogDevDir {
+        state: state.clone(),
+    };
     let file = match dir.lookup("bootstatus") {
         Some(f) => f,
         None => return TestResult::Fail("bootstatus attr not found"),
@@ -2791,7 +2737,9 @@ fn smoke_watchdog_sysfs_bootstatus() -> TestResult {
     state.bootstatus.store(true, Ordering::Release);
 
     // Re-lookup a fresh file node from a fresh dir (closures capture Arc clone).
-    let dir2 = WatchdogDevDir { state: state.clone() };
+    let dir2 = WatchdogDevDir {
+        state: state.clone(),
+    };
     let file2 = match dir2.lookup("bootstatus") {
         Some(f) => f,
         None => return TestResult::Fail("bootstatus attr not found (2nd lookup)"),

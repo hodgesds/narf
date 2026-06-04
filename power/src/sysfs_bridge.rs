@@ -51,7 +51,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
 use crate::ac::AcAdapter;
-use crate::acpi_thermal::{ThermalZone, ThermalTripPoints};
+use crate::acpi_thermal::{ThermalTripPoints, ThermalZone};
 use crate::battery::{BatteryDevice, BatteryStateBits};
 
 // ── Cooling-device state store ────────────────────────────────────────
@@ -131,8 +131,9 @@ pub fn register_battery_sysfs(bat: BatteryDevice, index: u32) {
                     // comparing remaining with design capacity from _BIF;
                     // fall back to "Not charging" (covers balanced AC+DC).
                     match bat_status.info() {
-                        Ok(info) if info.last_full_charge > 0
-                            && bst.remaining_capacity >= info.last_full_charge =>
+                        Ok(info)
+                            if info.last_full_charge > 0
+                                && bst.remaining_capacity >= info.last_full_charge =>
                         {
                             "Full"
                         }
@@ -383,10 +384,7 @@ pub fn register_thermal_zone_sysfs(zone: ThermalZone, index: u32) {
 ///
 /// Linux registers the trip attrs in `thermal_zone_device_register_with_trips`
 /// (thermal_core.c), walking `tz->trips[i]` in order.
-fn register_trip_point_attrs(
-    kobj: &narf_filesystem::sysfs::Kobject,
-    zone: &ThermalZone,
-) {
+fn register_trip_point_attrs(kobj: &narf_filesystem::sysfs::Kobject, zone: &ThermalZone) {
     // Snapshot trips once at registration time.  The trip temperatures
     // are static firmware values (_CRT, _PSV, _ACx) that don't change
     // at runtime on any known ACPI firmware, so snapshotting is correct.
@@ -413,18 +411,66 @@ fn register_trip_point_attrs(
     // table of the trip-point triples for i = 0..11 (12 entries covers
     // any realistic DSDT: 1 CRT + 1 HOT + 1 PSV + 9 ACx = 12 max).
     const TRIP_ATTR_NAMES: &[(&str, &str, &str)] = &[
-        ("trip_point_0_type",  "trip_point_0_temp",  "trip_point_0_hyst"),
-        ("trip_point_1_type",  "trip_point_1_temp",  "trip_point_1_hyst"),
-        ("trip_point_2_type",  "trip_point_2_temp",  "trip_point_2_hyst"),
-        ("trip_point_3_type",  "trip_point_3_temp",  "trip_point_3_hyst"),
-        ("trip_point_4_type",  "trip_point_4_temp",  "trip_point_4_hyst"),
-        ("trip_point_5_type",  "trip_point_5_temp",  "trip_point_5_hyst"),
-        ("trip_point_6_type",  "trip_point_6_temp",  "trip_point_6_hyst"),
-        ("trip_point_7_type",  "trip_point_7_temp",  "trip_point_7_hyst"),
-        ("trip_point_8_type",  "trip_point_8_temp",  "trip_point_8_hyst"),
-        ("trip_point_9_type",  "trip_point_9_temp",  "trip_point_9_hyst"),
-        ("trip_point_10_type", "trip_point_10_temp", "trip_point_10_hyst"),
-        ("trip_point_11_type", "trip_point_11_temp", "trip_point_11_hyst"),
+        (
+            "trip_point_0_type",
+            "trip_point_0_temp",
+            "trip_point_0_hyst",
+        ),
+        (
+            "trip_point_1_type",
+            "trip_point_1_temp",
+            "trip_point_1_hyst",
+        ),
+        (
+            "trip_point_2_type",
+            "trip_point_2_temp",
+            "trip_point_2_hyst",
+        ),
+        (
+            "trip_point_3_type",
+            "trip_point_3_temp",
+            "trip_point_3_hyst",
+        ),
+        (
+            "trip_point_4_type",
+            "trip_point_4_temp",
+            "trip_point_4_hyst",
+        ),
+        (
+            "trip_point_5_type",
+            "trip_point_5_temp",
+            "trip_point_5_hyst",
+        ),
+        (
+            "trip_point_6_type",
+            "trip_point_6_temp",
+            "trip_point_6_hyst",
+        ),
+        (
+            "trip_point_7_type",
+            "trip_point_7_temp",
+            "trip_point_7_hyst",
+        ),
+        (
+            "trip_point_8_type",
+            "trip_point_8_temp",
+            "trip_point_8_hyst",
+        ),
+        (
+            "trip_point_9_type",
+            "trip_point_9_temp",
+            "trip_point_9_hyst",
+        ),
+        (
+            "trip_point_10_type",
+            "trip_point_10_temp",
+            "trip_point_10_hyst",
+        ),
+        (
+            "trip_point_11_type",
+            "trip_point_11_temp",
+            "trip_point_11_hyst",
+        ),
     ];
 
     for (i, (type_str, temp_milli)) in ordered.iter().enumerate() {
@@ -450,10 +496,7 @@ fn register_trip_point_attrs(
 ///   `type_show` (thermal_sysfs.c).
 ///
 /// Returns the `CoolingDeviceNode` so callers can read/write `cur_state`.
-pub fn register_cooling_device_sysfs(
-    dev: CoolingDeviceNode,
-    index: u32,
-) -> CoolingDeviceNode {
+pub fn register_cooling_device_sysfs(dev: CoolingDeviceNode, index: u32) -> CoolingDeviceNode {
     let class = class_register("thermal");
     let node_name = format!("cooling_device{}", index);
     let kobj = class_device_register(class, &node_name);
@@ -504,10 +547,10 @@ pub fn populate_power_supply_and_thermal() {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
-    use narf_filesystem::sysfs::{__reset_for_test, class_register, class_device_register};
+    use narf_filesystem::sysfs::{__reset_for_test, class_device_register, class_register};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use crate::acpi_thermal::{ThermalZone as _};
+    use crate::acpi_thermal::ThermalZone as _;
     use crate::battery::{decode_bix, BatteryStateBits};
 
     // ── helpers ──────────────────────────────────────────────────────
@@ -515,7 +558,8 @@ mod tests {
     /// Invoke the registered show-fn for `attr` on `kobj` and return the
     /// raw string without the trailing newline, for cleaner assertions.
     fn read_attr(kobj: &Arc<narf_filesystem::sysfs::Kobject>, attr: &str) -> Option<String> {
-        kobj.attr_show(attr).map(|s| s.trim_end_matches('\n').to_string())
+        kobj.attr_show(attr)
+            .map(|s| s.trim_end_matches('\n').to_string())
     }
 
     // ── Smoke 1: BAT0 capacity returns 0..100 + trailing newline ─────
@@ -553,7 +597,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("power/sysfs_bridge", smoke_sysfs_bat_capacity_range_and_newline);
+    kernel_test_in!(
+        "power/sysfs_bridge",
+        smoke_sysfs_bat_capacity_range_and_newline
+    );
 
     // ── Smoke 2: BAT0/status = "Discharging" when _BST bit 0 set ────
 
@@ -646,7 +693,10 @@ mod tests {
             None => TestResult::Fail("status attr missing"),
         }
     }
-    kernel_test_in!("power/sysfs_bridge", smoke_sysfs_bat_status_full_when_at_design);
+    kernel_test_in!(
+        "power/sysfs_bridge",
+        smoke_sysfs_bat_status_full_when_at_design
+    );
 
     // ── Smoke 5: AC/online = "1" when _PSR == 1 ─────────────────────
 
@@ -729,7 +779,10 @@ mod tests {
             _ => TestResult::Fail("trip_point_0_type not 'critical'"),
         }
     }
-    kernel_test_in!("power/sysfs_bridge", smoke_sysfs_thermal_trip_point_0_type_critical);
+    kernel_test_in!(
+        "power/sysfs_bridge",
+        smoke_sysfs_thermal_trip_point_0_type_critical
+    );
 
     // ── Smoke 9: cooling_device0/cur_state reads back what was set ───
 
@@ -759,7 +812,10 @@ mod tests {
             None => TestResult::Fail("cur_state attr missing"),
         }
     }
-    kernel_test_in!("power/sysfs_bridge", smoke_sysfs_cooling_device_cur_state_readback);
+    kernel_test_in!(
+        "power/sysfs_bridge",
+        smoke_sysfs_cooling_device_cur_state_readback
+    );
 
     // ── Smoke 10: model_name from _BIF/_BIX ──────────────────────────
 
@@ -770,26 +826,26 @@ mod tests {
 
         // Build a synthetic _BIX package with model "ThinkPad-X1".
         let pkg = Value::Package(vec![
-            Value::Integer(0),                             // revision
-            Value::Integer(0),                             // power_unit = mWh
-            Value::Integer(50_000),                        // design_capacity
-            Value::Integer(47_000),                        // last_full_charge
-            Value::Integer(1),                             // technology
-            Value::Integer(12_000),                        // design_voltage
-            Value::Integer(5_000),                         // warning
-            Value::Integer(2_500),                         // low
-            Value::Integer(501),                           // cycle_count
-            Value::Integer(80_000),                        // accuracy
-            Value::Integer(60_000),                        // max_sampling_ms
-            Value::Integer(1_000),                         // min_sampling_ms
-            Value::Integer(60_000),                        // max_avg_ms
-            Value::Integer(1_000),                         // min_avg_ms
-            Value::Integer(100),                           // gran1
-            Value::Integer(100),                           // gran2
-            Value::String("ThinkPad-X1".to_string()),      // model_number
-            Value::String("SN-99999".to_string()),         // serial_number
-            Value::String("LIon".to_string()),             // battery_type
-            Value::String("Lenovo".to_string()),           // oem_info
+            Value::Integer(0),                        // revision
+            Value::Integer(0),                        // power_unit = mWh
+            Value::Integer(50_000),                   // design_capacity
+            Value::Integer(47_000),                   // last_full_charge
+            Value::Integer(1),                        // technology
+            Value::Integer(12_000),                   // design_voltage
+            Value::Integer(5_000),                    // warning
+            Value::Integer(2_500),                    // low
+            Value::Integer(501),                      // cycle_count
+            Value::Integer(80_000),                   // accuracy
+            Value::Integer(60_000),                   // max_sampling_ms
+            Value::Integer(1_000),                    // min_sampling_ms
+            Value::Integer(60_000),                   // max_avg_ms
+            Value::Integer(1_000),                    // min_avg_ms
+            Value::Integer(100),                      // gran1
+            Value::Integer(100),                      // gran2
+            Value::String("ThinkPad-X1".to_string()), // model_number
+            Value::String("SN-99999".to_string()),    // serial_number
+            Value::String("LIon".to_string()),        // battery_type
+            Value::String("Lenovo".to_string()),      // oem_info
         ]);
         let info = match decode_bix(&pkg) {
             Ok(b) => b,
@@ -821,13 +877,9 @@ mod tests {
         let kobj = class_device_register(class, "BAT0-energy-test");
 
         // last_full_charge = 47_000 mWh → 47_000_000 µWh.
-        kobject_add_attr(&kobj, "energy_full", || {
-            format!("{}\n", 47_000u64 * 1000)
-        });
+        kobject_add_attr(&kobj, "energy_full", || format!("{}\n", 47_000u64 * 1000));
         // remaining_capacity = 23_500 mWh → 23_500_000 µWh.
-        kobject_add_attr(&kobj, "energy_now", || {
-            format!("{}\n", 23_500u64 * 1000)
-        });
+        kobject_add_attr(&kobj, "energy_now", || format!("{}\n", 23_500u64 * 1000));
 
         let ef = read_attr(&kobj, "energy_full")
             .and_then(|s| s.parse::<u64>().ok())
@@ -886,7 +938,7 @@ mod tests {
 
     fn smoke_sysfs_trip_point_ordering() -> TestResult {
         __reset_for_test();
-        use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr};
+        use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
         let class = class_register("thermal");
         let kobj = class_device_register(class, "thermal_zone0-order-test");

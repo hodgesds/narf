@@ -24,8 +24,8 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, NoopOp, Read, Write};
 use narf_event_bus::{
-    create_topic, lookup_topic, PublishError, Publisher as BusPublisher, Subscriber as BusSubscriber,
-    TopicRegistry,
+    create_topic, lookup_topic, PublishError, Publisher as BusPublisher,
+    Subscriber as BusSubscriber, TopicRegistry,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -216,7 +216,9 @@ pub fn register_zone(
 /// topic. Replaces the old callback-list `subscribe(cap, cb)`. The
 /// caller drains in its own async task via
 /// `Subscriber::next().await`.
-pub fn subscribe(reg: &Cap<TopicRegistry, Read>) -> Result<BusSubscriber<ThermalEvent>, ThermalError> {
+pub fn subscribe(
+    reg: &Cap<TopicRegistry, Read>,
+) -> Result<BusSubscriber<ThermalEvent>, ThermalError> {
     lookup_topic::<ThermalEvent>(reg, TOPIC).map_err(|_| ThermalError::NotInitialised)
 }
 

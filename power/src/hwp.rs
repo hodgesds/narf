@@ -47,9 +47,7 @@ use core::fmt::Write as _;
 use narf_arch::x86_64::cpuid::cpuid;
 use narf_arch::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
 
-use crate::pstate::{
-    MSR_IA32_HWP_CAPABILITIES, MSR_IA32_HWP_REQUEST, MSR_IA32_PM_ENABLE,
-};
+use crate::pstate::{MSR_IA32_HWP_CAPABILITIES, MSR_IA32_HWP_REQUEST, MSR_IA32_PM_ENABLE};
 
 /// EPP byte values per Intel SDM Vol 4 §2.16. The hardware
 /// interprets the byte as a hint to the autonomous selector;
@@ -268,10 +266,7 @@ pub fn intel_hwp_summary() -> HwpSummary {
     // program `IA32_HWP_REQUEST` with (min=lowest, max=highest,
     // desired=0=autonomous, EPP=0x80=balanced).
     if wrmsr_or_gp(MSR_IA32_PM_ENABLE, 1).is_err() {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  hwp: enable #GP — firmware default"
-        );
+        let _ = writeln!(narf_console::Writer, "  hwp: enable #GP — firmware default");
         return HwpSummary::EnableGp;
     }
     let req = (caps.lowest_perf as u64)

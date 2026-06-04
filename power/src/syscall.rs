@@ -88,7 +88,11 @@ pub fn resolve_cpu_id(cpu_id: u64, is_tcb: bool, current: u64) -> Option<u64> {
     if !cpu_id_allowed(cpu_id, is_tcb, current) {
         return None;
     }
-    Some(if cpu_id == CPU_ID_CURRENT { current } else { cpu_id })
+    Some(if cpu_id == CPU_ID_CURRENT {
+        current
+    } else {
+        cpu_id
+    })
 }
 
 // ── Decoded perf-state shape (Phase 1) ────────────────────────────
@@ -126,9 +130,7 @@ pub struct PerfState {
 ///   result[5]  = 0 (reserved)
 /// ```
 pub fn pack_perf_state(s: PerfState) -> [u64; 6] {
-    let bundled = (s.delivered_perf as u64)
-        | ((s.epp as u64) << 8)
-        | ((s.c_state as u64) << 16);
+    let bundled = (s.delivered_perf as u64) | ((s.epp as u64) << 8) | ((s.c_state as u64) << 16);
     [bundled, s.aperf, s.mperf, s.tsc, 0, 0]
 }
 
@@ -356,7 +358,12 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             };
             let domain = match RaplDomain::from_u8(args.a1 as u8) {
                 Some(d) => d,
-                None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
+                None => {
+                    return CpuOpReturn {
+                        status: STATUS_INVALID_OP,
+                        result: [0; 6],
+                    }
+                }
             };
             if !detect_caps().has_rapl {
                 return unsupported();
@@ -364,7 +371,10 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             let uj = read_rapl_energy_uj(cpu, domain);
             let mut result = [0u64; 6];
             result[0] = uj;
-            CpuOpReturn { status: STATUS_OK, result }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result,
+            }
         }
 
         // ── Phase 2: latency hints ──────────────────────────────
@@ -373,11 +383,17 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             let token = register_latency_hint(max_idle_us);
             let mut result = [0u64; 6];
             result[0] = token.0;
-            CpuOpReturn { status: STATUS_OK, result }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result,
+            }
         }
         CpuOpKind::LatencyRelease => {
             release_latency_hint(LatencyToken(args.a0));
-            CpuOpReturn { status: STATUS_OK, result: [0; 6] }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result: [0; 6],
+            }
         }
 
         // ── Phase 3: frequency control (write path) ─────────────
@@ -395,7 +411,10 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             let mut result = [0u64; 6];
             result[0] = applied_min as u64;
             result[1] = applied_max as u64;
-            CpuOpReturn { status: STATUS_OK, result }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result,
+            }
         }
         CpuOpKind::SetEpp => {
             let cpu = match resolve_cpu_id(args.a0, is_tcb, current_cpu) {
@@ -406,7 +425,10 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 return unsupported();
             }
             apply_epp(cpu, args.a1 as u8);
-            CpuOpReturn { status: STATUS_OK, result: [0; 6] }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result: [0; 6],
+            }
         }
         CpuOpKind::SetGovernor => {
             let cpu = match resolve_cpu_id(args.a0, is_tcb, current_cpu) {
@@ -415,20 +437,33 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             };
             let gov = match Governor::from_u8(args.a1 as u8) {
                 Some(g) => g,
-                None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
+                None => {
+                    return CpuOpReturn {
+                        status: STATUS_INVALID_OP,
+                        result: [0; 6],
+                    }
+                }
             };
             if !detect_caps().has_dvfs {
                 return unsupported();
             }
             apply_governor(cpu, gov);
-            CpuOpReturn { status: STATUS_OK, result: [0; 6] }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result: [0; 6],
+            }
         }
 
         // ── Phase 4: energy budget ──────────────────────────────
         CpuOpKind::SetEnergyBudget => {
             let domain = match RaplDomain::from_u8(args.a0 as u8) {
                 Some(d) => d,
-                None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
+                None => {
+                    return CpuOpReturn {
+                        status: STATUS_INVALID_OP,
+                        result: [0; 6],
+                    }
+                }
             };
             if !detect_caps().has_rapl {
                 return unsupported();
@@ -436,18 +471,29 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             let window_ms = args.a1 as u32;
             let energy_mj = args.a2 as u32;
             apply_energy_budget(domain, window_ms, energy_mj);
-            CpuOpReturn { status: STATUS_OK, result: [0; 6] }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result: [0; 6],
+            }
         }
         CpuOpKind::ClearEnergyBudget => {
             let domain = match RaplDomain::from_u8(args.a0 as u8) {
                 Some(d) => d,
-                None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
+                None => {
+                    return CpuOpReturn {
+                        status: STATUS_INVALID_OP,
+                        result: [0; 6],
+                    }
+                }
             };
             if !detect_caps().has_rapl {
                 return unsupported();
             }
             clear_energy_budget(domain);
-            CpuOpReturn { status: STATUS_OK, result: [0; 6] }
+            CpuOpReturn {
+                status: STATUS_OK,
+                result: [0; 6],
+            }
         }
     }
 }
@@ -526,11 +572,7 @@ fn release_latency_hint(token: LatencyToken) {
 /// Returned as `Some(microseconds)` or `None` if no hints active.
 /// The C-state selector consults this every time it picks a depth.
 pub fn current_latency_floor_us() -> Option<u32> {
-    LATENCY_HINTS
-        .lock()
-        .iter()
-        .map(|(_, us)| *us)
-        .min()
+    LATENCY_HINTS.lock().iter().map(|(_, us)| *us).min()
 }
 
 #[doc(hidden)]
@@ -598,13 +640,12 @@ pub fn install_bridge() {
     narf_abi::install_cpu_op_bridge(bridge_thunk);
 }
 
-fn bridge_thunk(
-    kind: CpuOpKind,
-    args: &CpuOpArgs,
-    cx: &narf_abi::CancelCtx<'_>,
-) -> CpuOpReturn {
+fn bridge_thunk(kind: CpuOpKind, args: &CpuOpArgs, cx: &narf_abi::CancelCtx<'_>) -> CpuOpReturn {
     if cx.is_cancel_requested() {
-        return CpuOpReturn { status: 2 /* Cancelled */, result: [0; 6] };
+        return CpuOpReturn {
+            status: 2, /* Cancelled */
+            result: [0; 6],
+        };
     }
     // Boot order may install us before SMP brings up the per-CPU
     // id register; treat "no current cpu" as cpu 0 + non-TCB so
@@ -612,4 +653,3 @@ fn bridge_thunk(
     let current = narf_arch::current_cpu_id().raw() as u64;
     handle(kind, args, current)
 }
-

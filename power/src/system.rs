@@ -20,7 +20,6 @@
 //! on failure they `halt_forever` rather than letting the caller
 //! limp on with a half-broken transition in flight.
 
-
 /// Default `\_S5` SLP_TYP values for QEMU + most x86 firmware.
 /// Real hardware varies — when the AML interpreter lands a
 /// `\_S5_` evaluator, callers should prefer those values.

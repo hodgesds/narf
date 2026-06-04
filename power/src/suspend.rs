@@ -271,10 +271,11 @@ fn parse_s3_package(buf: &[u8]) -> Option<S3SlpTyp> {
         let op = buf[*i];
         *i += 1;
         match op {
-            0x00 => Some(0),                        // ZeroOp
-            0x01 => Some(1),                        // OneOp
-            0xFF => Some(0xFF),                     // OnesOp (treat as 7)
-            0x0A => {                               // ByteOp
+            0x00 => Some(0),    // ZeroOp
+            0x01 => Some(1),    // OneOp
+            0xFF => Some(0xFF), // OnesOp (treat as 7)
+            0x0A => {
+                // ByteOp
                 if *i >= buf.len() {
                     return None;
                 }
@@ -282,7 +283,7 @@ fn parse_s3_package(buf: &[u8]) -> Option<S3SlpTyp> {
                 *i += 1;
                 Some(v)
             }
-            _ if op < 0x10 => Some(op),             // Some firmwares emit raw 0..=7 inline
+            _ if op < 0x10 => Some(op), // Some firmwares emit raw 0..=7 inline
             _ => None,
         }
     };
@@ -448,8 +449,7 @@ pub fn invoke_fb_resume() {
 
 /// Whether the FB hook pair is installed. Diagnostic.
 pub fn fb_pm_hooks_installed() -> bool {
-    FB_SUSPEND_HOOK.load(Ordering::Acquire) != 0
-        && FB_RESUME_HOOK.load(Ordering::Acquire) != 0
+    FB_SUSPEND_HOOK.load(Ordering::Acquire) != 0 && FB_RESUME_HOOK.load(Ordering::Acquire) != 0
 }
 
 #[doc(hidden)]
@@ -488,9 +488,7 @@ pub fn __test_parse_s3(buf: &[u8]) -> Option<S3SlpTyp> {
 /// safely (FACS_PHYS resolved, RESUME_CONTEXT_PHYS resolved),
 /// returns `NotImplemented` without touching PM1.
 #[cfg(target_arch = "x86_64")]
-pub fn arm_s3_resume(
-    cap: &Cap<Power, narf_capabilities::Invoke>,
-) -> Result<(), SuspendError> {
+pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
     cap.invoke(NoopOp)?;
     let slp = s3_slp_typ().ok_or(SuspendError::NotImplemented)?;
     // Snapshot CPU state.
@@ -517,9 +515,7 @@ pub fn arm_s3_resume(
     let mut jmp_snapshot = narf_arch::x86_64::setjmp::JmpBuf::default();
     // SAFETY: jmp_snapshot lives on this stack frame through the
     // PM1 write + the wake path's longjmp.
-    let r = unsafe {
-        narf_arch::x86_64::setjmp::setjmp(&mut jmp_snapshot as *mut _)
-    };
+    let r = unsafe { narf_arch::x86_64::setjmp::setjmp(&mut jmp_snapshot as *mut _) };
     if r == narf_arch::x86_64::s3_resume::S3_RESUMED_SENTINEL {
         // We came back via the wake trampoline. Device fan-out
         // already ran in the continuation; just unwind.
@@ -541,22 +537,15 @@ pub fn arm_s3_resume(
     let cr3 = unsafe { narf_arch::x86_64::cr::read_cr3() } & !0xFFFu64;
     let pml4_phys = narf_memory::PhysAddr::new(cr3);
     let entry_virt = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
-    let ctx_virt =
-        narf_arch::x86_64::s3_resume::resume_context_static_addr() as u64;
+    let ctx_virt = narf_arch::x86_64::s3_resume::resume_context_static_addr() as u64;
     let entry_phys = match unsafe {
-        narf_memory::x86_64::paging::translate(
-            pml4_phys,
-            narf_memory::VirtAddr::new(entry_virt),
-        )
+        narf_memory::x86_64::paging::translate(pml4_phys, narf_memory::VirtAddr::new(entry_virt))
     } {
         Some(p) => p.raw() | (entry_virt & 0xFFF),
         None => return Err(SuspendError::Aborted),
     };
     let ctx_phys = match unsafe {
-        narf_memory::x86_64::paging::translate(
-            pml4_phys,
-            narf_memory::VirtAddr::new(ctx_virt),
-        )
+        narf_memory::x86_64::paging::translate(pml4_phys, narf_memory::VirtAddr::new(ctx_virt))
     } {
         Some(p) => p.raw() | (ctx_virt & 0xFFF),
         None => return Err(SuspendError::Aborted),
@@ -580,19 +569,14 @@ pub fn arm_s3_resume(
     let _ = crate::device_pm::suspend_all_devices();
     PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
     // `\_PTS(3)` — platform-specific quiesce AML.
-    let _ = narf_aml::eval::evaluate_method(
-        "\\_PTS",
-        &[narf_aml::Value::Integer(3)],
-    );
+    let _ = narf_aml::eval::evaluate_method("\\_PTS", &[narf_aml::Value::Integer(3)]);
     // Refuse the real PM1 write unless explicitly armed. Until
     // we've validated the trampoline on real silicon, this
     // returns NotImplemented rather than putting the box into a
     // state it can't recover from. Either the test back-door
     // (REAL_SLEEP_ARMED) or the production opt-in
     // (PRODUCTION_S3_ENABLED) authorises the PM1 write.
-    if !REAL_SLEEP_ARMED.load(Ordering::Acquire)
-        && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire)
-    {
+    if !REAL_SLEEP_ARMED.load(Ordering::Acquire) && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire) {
         return Err(SuspendError::NotImplemented);
     }
     // SAFETY: pm1_enter_sleep doesn't return on success — the
@@ -617,17 +601,12 @@ pub fn s3_enter(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspe
 
     // `\_PTS(slp_state)` runs platform-specific quiesce AML (turns
     // off LEDs, parks devices firmware controls, etc.).
-    let _ = narf_aml::eval::evaluate_method(
-        "\\_PTS",
-        &[narf_aml::Value::Integer(3)],
-    );
+    let _ = narf_aml::eval::evaluate_method("\\_PTS", &[narf_aml::Value::Integer(3)]);
 
     // Without a real-mode resume trampoline the system would never
     // come back. Refuse to enter unless explicitly armed via either
     // the test back-door or the production opt-in.
-    if !REAL_SLEEP_ARMED.load(Ordering::Acquire)
-        && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire)
-    {
+    if !REAL_SLEEP_ARMED.load(Ordering::Acquire) && !PRODUCTION_S3_ENABLED.load(Ordering::Acquire) {
         return Err(SuspendError::NotImplemented);
     }
 

@@ -365,10 +365,7 @@ pub fn enumerate() -> Vec<ThermalZone> {
             paths.push(node.path);
         }
     }
-    paths
-        .into_iter()
-        .map(|path| ThermalZone { path })
-        .collect()
+    paths.into_iter().map(|path| ThermalZone { path }).collect()
 }
 
 // ── Bridge to the generic `crate::thermal` registry ─────────────────
@@ -401,9 +398,7 @@ static BRIDGE: IrqSafeSpinLock<AVec<(String, u32)>> = IrqSafeSpinLock::new(AVec:
 /// Stage::Late or whenever the namespace is stable; a second call
 /// after the bridge is populated re-walks but does NOT double-register
 /// existing paths.
-pub fn register_with_generic_registry(
-    cap: &Cap<generic::Thermal, Grant>,
-) -> usize {
+pub fn register_with_generic_registry(cap: &Cap<generic::Thermal, Grant>) -> usize {
     let mut bridge = BRIDGE.lock();
     let mut newly_registered = 0usize;
     for zone in enumerate() {
@@ -555,7 +550,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_classify_sparse_trips);
+    kernel_test_in!(
+        "power/acpi_thermal",
+        smoke_acpi_thermal_classify_sparse_trips
+    );
 
     fn smoke_acpi_thermal_tmp_known_values_3531_3631() -> TestResult {
         // Renoir 4700U DSDT has _CRT = 3731 and typical idle _TMP ~3531.
@@ -569,7 +567,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_tmp_known_values_3531_3631);
+    kernel_test_in!(
+        "power/acpi_thermal",
+        smoke_acpi_thermal_tmp_known_values_3531_3631
+    );
 
     fn smoke_acpi_thermal_psv_trip_passive_cooling() -> TestResult {
         // _PSV = 75 C = 75_000 milli-C. Boundary and above → Passive.
@@ -590,7 +591,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_psv_trip_passive_cooling);
+    kernel_test_in!(
+        "power/acpi_thermal",
+        smoke_acpi_thermal_psv_trip_passive_cooling
+    );
 
     fn smoke_acpi_thermal_acx_fan_engagement() -> TestResult {
         // _AC0 = 70 C, _AC1 = 60 C, _PSV = 80 C.
