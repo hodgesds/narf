@@ -386,8 +386,8 @@ fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
     // BSP running run_until_empty, the task completes — same outcome
     // as an unpinned spawn from BSP, but exercising the affinity
     // routing path through `target_cpu`.
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+    use core::sync::atomic::{AtomicU32, Ordering};
     static RAN: AtomicU32 = AtomicU32::new(0);
     RAN.store(0, Ordering::Relaxed);
 
@@ -422,8 +422,8 @@ fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     // stealing; run the BSP loop. Tasks all complete because affinity
     // routes them to their target CPU's queue and the BSP steals
     // them.
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     static DONE: AtomicU32 = AtomicU32::new(0);
     DONE.store(0, Ordering::Relaxed);
@@ -458,10 +458,10 @@ kernel_test_in!("scheduler", smoke_scheduler_numa_steal_prefers_same_node);
 
 fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     extern crate alloc;
+    use crate::{address_space_of, spawn_user, TaskSpec};
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
-    use crate::{address_space_of, spawn_user, TaskSpec};
 
     crate::__reset_queues_for_test();
     static RAN: AtomicU32 = AtomicU32::new(0);
@@ -510,7 +510,10 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_spawn_user_carries_address_space);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_spawn_user_carries_address_space
+);
 
 /// Regression: polling a user task must restore the kernel CR3
 /// before returning to the caller, otherwise any subsequent
@@ -529,9 +532,9 @@ kernel_test_in!("scheduler", smoke_scheduler_spawn_user_carries_address_space);
 #[cfg(target_arch = "x86_64")]
 fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
     use alloc::sync::Arc;
     use narf_memory::AddressSpace;
-    use crate::{spawn_user, TaskSpec};
 
     // SAFETY: `mov %cr3, reg` is unconditional at CPL=0.
     #[inline(always)]
@@ -597,9 +600,9 @@ kernel_test_in!(
 #[cfg(target_arch = "aarch64")]
 fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
     use alloc::sync::Arc;
     use narf_memory::AddressSpace;
-    use crate::{spawn_user, TaskSpec};
 
     // SAFETY: `MRS TTBR0_EL1` is unconditional at EL1.
     #[inline(always)]
@@ -621,11 +624,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let arc_as = Arc::new(user_as);
 
-    let _tid = spawn_user(
-        async {},
-        TaskSpec::unthrottled(),
-        Arc::clone(&arc_as),
-    );
+    let _tid = spawn_user(async {}, TaskSpec::unthrottled(), Arc::clone(&arc_as));
 
     crate::run_until_empty();
 
@@ -657,10 +656,10 @@ kernel_test_in!(
 #[cfg(target_arch = "x86_64")]
 fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
     extern crate alloc;
+    use crate::{spawn, spawn_user, TaskSpec};
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use narf_memory::AddressSpace;
-    use crate::{spawn, spawn_user, TaskSpec};
 
     static USER_RAN: AtomicBool = AtomicBool::new(false);
     static KERNEL_RAN: AtomicBool = AtomicBool::new(false);
@@ -742,10 +741,10 @@ kernel_test_in!(
 #[cfg(target_arch = "aarch64")]
 fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     extern crate alloc;
+    use crate::{spawn, spawn_user, TaskSpec};
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use narf_memory::AddressSpace;
-    use crate::{spawn, spawn_user, TaskSpec};
 
     static USER_RAN: AtomicBool = AtomicBool::new(false);
     static KERNEL_RAN: AtomicBool = AtomicBool::new(false);
@@ -1058,7 +1057,10 @@ fn smoke_scheduler_smt_share_policy_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_smt_share_policy_variants_distinct);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_smt_share_policy_variants_distinct
+);
 
 // ── budget ─────────────────────────────────────────────────────────
 
@@ -1082,7 +1084,10 @@ fn smoke_scheduler_overrun_policy_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_overrun_policy_variants_distinct);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_overrun_policy_variants_distinct
+);
 
 fn smoke_scheduler_resource_budget_unthrottled_shape() -> TestResult {
     use crate::budget::{OverrunPolicy, ResourceBudget};
@@ -1104,7 +1109,10 @@ fn smoke_scheduler_resource_budget_unthrottled_shape() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_resource_budget_unthrottled_shape);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_resource_budget_unthrottled_shape
+);
 
 fn smoke_scheduler_resource_budget_fair_share_shape() -> TestResult {
     use crate::budget::{OverrunPolicy, ResourceBudget};
@@ -1120,7 +1128,10 @@ fn smoke_scheduler_resource_budget_fair_share_shape() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_resource_budget_fair_share_shape);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_resource_budget_fair_share_shape
+);
 
 fn smoke_scheduler_budget_account_tracks_polls_and_cycles() -> TestResult {
     use crate::budget::{BudgetAccount, ChargeOutcome, ResourceBudget};
@@ -1153,7 +1164,10 @@ fn smoke_scheduler_budget_account_tracks_polls_and_cycles() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_budget_account_tracks_polls_and_cycles);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_budget_account_tracks_polls_and_cycles
+);
 
 fn smoke_scheduler_budget_account_charge_saturates() -> TestResult {
     use crate::budget::{BudgetAccount, ResourceBudget};
@@ -1176,7 +1190,7 @@ kernel_test_in!("scheduler", smoke_scheduler_budget_account_charge_saturates);
 
 fn smoke_scheduler_cpu_online_boot_starts_online() -> TestResult {
     use crate::affinity::CpuId;
-    use crate::cpu_lifecycle::{cpu_online, online_count, __test_reset_online_mask};
+    use crate::cpu_lifecycle::{__test_reset_online_mask, cpu_online, online_count};
     __test_reset_online_mask();
     if !cpu_online(CpuId::BOOT) {
         return TestResult::Fail("CPU 0 not online after reset");
@@ -1253,7 +1267,10 @@ fn smoke_scheduler_cpu_bring_up_take_offline_lifecycle() -> TestResult {
     __test_reset_online_mask();
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_cpu_bring_up_take_offline_lifecycle);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_cpu_bring_up_take_offline_lifecycle
+);
 
 fn smoke_scheduler_cpu_bring_up_out_of_range() -> TestResult {
     use crate::affinity::CpuId;
@@ -1280,13 +1297,16 @@ fn smoke_scheduler_cpu_lifecycle_revoked_cap_rejected() -> TestResult {
         _ => TestResult::Fail("revoked cap didn't surface AuthorityRevoked"),
     }
 }
-kernel_test_in!("scheduler", smoke_scheduler_cpu_lifecycle_revoked_cap_rejected);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_cpu_lifecycle_revoked_cap_rejected
+);
 
 // ── TaskSpec ───────────────────────────────────────────────────────
 
 fn smoke_scheduler_task_spec_unthrottled_bsp_pinned() -> TestResult {
-    use crate::TaskSpec;
     use crate::affinity::CpuId;
+    use crate::TaskSpec;
     let s = TaskSpec::unthrottled();
     if s.affinity.preferred != Some(CpuId::BOOT) {
         return TestResult::Fail("unthrottled not BSP-pinned");
@@ -1296,7 +1316,10 @@ fn smoke_scheduler_task_spec_unthrottled_bsp_pinned() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_task_spec_unthrottled_bsp_pinned);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_task_spec_unthrottled_bsp_pinned
+);
 
 fn smoke_scheduler_task_spec_realtime_shape() -> TestResult {
     use crate::priority::{Priority, SchedClass};
@@ -1342,8 +1365,8 @@ kernel_test_in!("scheduler", smoke_scheduler_donate_error_variants_distinct);
 // ── all_task_ids + spawn surface ───────────────────────────────────
 
 fn smoke_scheduler_all_task_ids_lists_spawned() -> TestResult {
-    use core::sync::atomic::{AtomicBool, Ordering};
     use crate::TaskId;
+    use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     DONE.store(false, Ordering::Relaxed);
 
@@ -1380,7 +1403,9 @@ fn smoke_scheduler_yield_now_resolves_on_second_poll() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VT)
+    }
     fn wake(_: *const ()) {}
     fn drop_no(_: *const ()) {}
     static VT: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake, drop_no);
@@ -1398,7 +1423,10 @@ fn smoke_scheduler_yield_now_resolves_on_second_poll() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_yield_now_resolves_on_second_poll);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_yield_now_resolves_on_second_poll
+);
 
 // ── responsive_spin ────────────────────────────────────────────────
 
@@ -1409,13 +1437,19 @@ fn smoke_scheduler_responsive_spin_returns_true_when_done_immediately() -> TestR
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_responsive_spin_returns_true_when_done_immediately);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_responsive_spin_returns_true_when_done_immediately
+);
 
 fn smoke_scheduler_responsive_spin_caps_at_max_iters() -> TestResult {
     use core::cell::Cell;
     let calls = Cell::new(0u32);
     let result = crate::responsive_spin(
-        || { calls.set(calls.get() + 1); false },
+        || {
+            calls.set(calls.get() + 1);
+            false
+        },
         16,
     );
     if result {
@@ -1426,7 +1460,10 @@ fn smoke_scheduler_responsive_spin_caps_at_max_iters() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_responsive_spin_caps_at_max_iters);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_responsive_spin_caps_at_max_iters
+);
 
 // ── Stage-5 donation fast path ─────────────────────────────────────
 
@@ -1473,7 +1510,10 @@ fn smoke_scheduler_donation_credit_saturates_at_zero() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_donation_credit_saturates_at_zero);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_donation_credit_saturates_at_zero
+);
 
 fn smoke_scheduler_donate_to_revoked_cap_falls_back() -> TestResult {
     // Donating with a live cap, then revoking before the donee
@@ -1509,7 +1549,10 @@ fn smoke_scheduler_donate_to_revoked_cap_falls_back() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_donate_to_revoked_cap_falls_back);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_donate_to_revoked_cap_falls_back
+);
 
 fn smoke_scheduler_donate_to_credits_donee_account() -> TestResult {
     // After donate_to on a live cap, the donee's BudgetAccount
@@ -1797,4 +1840,7 @@ fn smoke_scheduler_charge_outcome_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_charge_outcome_variants_distinct);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_charge_outcome_variants_distinct
+);

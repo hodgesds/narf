@@ -92,14 +92,14 @@ pub use narf_capabilities::Invoke;
 // exists (`narf-scheduler` → `narf-arch`); this just exposes it.
 #[cfg(target_arch = "x86_64")]
 pub use narf_arch::x86_64::{
-    enter_user_mode, enter_user_mode_resume, enter_user_mode_with_arg, longjmp,
-    set_user_fs_base, setjmp, JmpBuf, UserState, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, enter_user_mode_with_arg, longjmp, set_user_fs_base,
+    setjmp, JmpBuf, UserState, USER_RFLAGS,
 };
 
 #[cfg(target_arch = "aarch64")]
 pub use narf_arch::aarch64::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf,
-    UserState, USER_SPSR,
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf, UserState,
+    USER_SPSR,
 };
 
 // `halt_forever` is the right "I should never reach here" sink for
@@ -632,10 +632,7 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
 /// keyed to the same id.
 ///
 /// Returns None if no slot with that id is on any ready queue.
-pub fn replace_address_space(
-    id: TaskId,
-    new_arc: Arc<AddressSpace>,
-) -> Option<Arc<AddressSpace>> {
+pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
     // Wave-49fu: when execve fires from inside a user task's poll
     // body (the normal case), the slot has been popped from the
     // ready queue and lives on the executor's stack — the queue
@@ -660,7 +657,10 @@ pub fn replace_address_space(
             *g = Some(new_arc.clone());
         }
         let mut p = PENDING_SLOT_AS.lock();
-        let prev = p.iter().find(|(k, _)| *k == id.raw()).map(|(_, v)| v.clone());
+        let prev = p
+            .iter()
+            .find(|(k, _)| *k == id.raw())
+            .map(|(_, v)| v.clone());
         p.retain(|(k, _)| *k != id.raw());
         p.push((id.raw(), new_arc));
         return prev;
@@ -910,8 +910,7 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 /// tasks. Lets a real-HW observer distinguish "wake_by_ref is never
 /// fired" (waker plumbing broken or waker isn't reaching this
 /// vtable) from "wake fires but the executor doesn't re-poll."
-pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 unsafe fn wake_raw(data: *const ()) {
     WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1515,9 +1514,7 @@ pub fn run_until_empty() {
                     // wheel).
                     let start = narf_time::now_cycles();
                     while narf_time::now_cycles() < deadline {
-                        let _ = narf_time::timer_wheel::fire_due(
-                            narf_time::now_cycles(),
-                        );
+                        let _ = narf_time::timer_wheel::fire_due(narf_time::now_cycles());
                         // Bail out if any task became ready (an
                         // IRQ-driven wake fired during the spin).
                         if local_ready_count(cpu) > 0 {
@@ -1536,9 +1533,7 @@ pub fn run_until_empty() {
                     }
                     // Final fire_due after the spin in case the
                     // deadline passed in our last iteration.
-                    let _ = narf_time::timer_wheel::fire_due(
-                        narf_time::now_cycles(),
-                    );
+                    let _ = narf_time::timer_wheel::fire_due(narf_time::now_cycles());
                 }
                 None => {
                     // Wheel empty + no ready tasks + no steal
