@@ -12,9 +12,7 @@ use narf_capabilities::{CapKind, CapType};
 pub mod registry;
 pub mod types;
 
-pub use types::{
-    CccDest, CommonCommandCode, I3cDevice, I3cError, I3cOp, IbiHandler, IbiPayload,
-};
+pub use types::{CccDest, CommonCommandCode, I3cDevice, I3cError, I3cOp, IbiHandler, IbiPayload};
 
 /// A specialized capability for I3C operations.
 #[derive(Debug)]
@@ -84,8 +82,7 @@ pub trait I3cBus: Send + Sync {
     /// the raw bit rate doubles vs SDR at the same clock frequency.
     ///
     /// I3C spec rev 1.1 §5.2.3; Linux dw-i3c-master.c COMMAND_PORT_SPEED.
-    async fn hdr_ddr_write(&self, addr: u8, command: u8, data: &[u16])
-        -> Result<(), I3cError>;
+    async fn hdr_ddr_write(&self, addr: u8, command: u8, data: &[u16]) -> Result<(), I3cError>;
 
     /// HDR-DDR read from a target device.
     ///
@@ -93,8 +90,7 @@ pub trait I3cBus: Send + Sync {
     /// and reads back the data words from the bus.
     ///
     /// I3C spec rev 1.1 §5.2.3.
-    async fn hdr_ddr_read(&self, addr: u8, command: u8, data: &mut [u16])
-        -> Result<(), I3cError>;
+    async fn hdr_ddr_read(&self, addr: u8, command: u8, data: &mut [u16]) -> Result<(), I3cError>;
 
     /// Registers an async waker for an In-Band Interrupt (IBI).
     fn register_ibi_waker(&self, addr: u8, waker: Waker);

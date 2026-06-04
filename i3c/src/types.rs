@@ -100,7 +100,6 @@ pub enum CommonCommandCode {
     // ENTHDR2 = Enter HDR-TSP mode.   Opcode 0x22.
     //
     // All ENTHDR CCCs are broadcast-only (no directed form).
-
     /// Enter HDR-DDR mode — broadcast (0x20)
     /// I3C spec §5.2.3; Linux I3C_CCC_ENTHDR(0).
     Enthdr0 = 0x20,
