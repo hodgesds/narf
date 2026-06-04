@@ -2806,3 +2806,319 @@ fn smoke_wave61_pidfd_shared_state() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave61_pidfd_shared_state);
+
+// ── Wave-65: clone3(CLONE_VM|CLONE_THREAD) + set_tid_address ──────────
+//
+// Three smokes that exercise the new clone3-shaped thread spawn:
+//
+//   1. clone3 with CLONE_VM|CLONE_THREAD spawns a child that shares
+//      the parent's `Arc<AddressSpace>` and CLONE_PARENT_SETTID writes
+//      the child TID into the parent-visible slot. Sanity-check on
+//      the core multi-thread plumbing.
+//
+//   2. set_tid_address(uaddr) records the caller's clear_child_tid
+//      slot and returns the caller's TID — matches Linux's contract
+//      (used by relibc's __thread_init at task start).
+//
+//   3. CLONE_CHILD_CLEARTID + task exit clears the user word and
+//      bumps the futex wake counter at that uaddr so a parent parked
+//      on FUTEX_WAIT observes a wake. End-to-end signature of
+//      pthread_join's wake path.
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_65;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Build a clone_args struct in kernel stack memory. The handler's
+    // `copy_from_user` accepts canonical low-half addresses; the
+    // test's stack lives in the kernel's low-half pre-paging map, so
+    // the validate-user-range check is satisfied by construction.
+    #[repr(C)]
+    #[derive(Default)]
+    struct TestCloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+    }
+    let mut child_tid_slot: u32 = 0;
+    let mut ca = TestCloneArgs::default();
+    // CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FS | CLONE_FILES
+    // | CLONE_PARENT_SETTID
+    ca.flags = 0x0000_0100 | 0x0001_0000 | 0x0000_0800 | 0x0000_0200 | 0x0000_0400 | 0x0010_0000;
+    ca.stack = 0x7fff_fff0_0000;
+    ca.stack_size = 0x1_0000;
+    ca.parent_tid = &mut child_tid_slot as *mut u32 as u64;
+
+    let uargs = &ca as *const TestCloneArgs as u64;
+    let size = core::mem::size_of::<TestCloneArgs>() as u64;
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: uargs,
+            arg1: size,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+
+    let ret_tid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("clone3 did not return a child TID");
+        }
+    };
+
+    // (1) Child TID written into parent_tid by CLONE_PARENT_SETTID.
+    if child_tid_slot as u64 != ret_tid {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("CLONE_PARENT_SETTID did not write child TID");
+    }
+
+    // (2) Child shares the parent's AS Arc.
+    let child_task = narf_scheduler::TaskId(ret_tid);
+    let child_as = match narf_scheduler::address_space_of(child_task) {
+        Some(a) => a,
+        None => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("child has no AS");
+        }
+    };
+    if !Arc::ptr_eq(&child_as, &parent_as) {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("CLONE_VM child does not share parent AS");
+    }
+
+    // (3) Thread-group binding: child's visible PID matches parent's.
+    // The map stores (visible_pid → TaskId). For CLONE_THREAD the
+    // visible_pid == parent_pid, so PID→TaskId for parent's PID now
+    // resolves to the child's TaskId — which is what we want for
+    // gettid/getpid divergence.
+    // (We don't assert a specific resolution here because the parent
+    // was never `register_pid_task_mapping`'d in this test; what
+    // matters is that the child's TaskId is registered and the AS
+    // share holds.)
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    TestResult::Pass
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("userspace/process", smoke_wave65_clone3_vm_thread_shared_as);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_wave65_set_tid_address_records_and_returns_tid() -> TestResult {
+    const ME: u64 = 0xF0_66;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(ME);
+    crate::handlers::__test_reset_clear_child_tid();
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut tid_word: u32 = 0;
+    let uaddr = &mut tid_word as *mut u32 as u64;
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: uaddr,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::SetTidAddress.raw(), &mut ctx);
+
+    // (1) Returns the caller's TID.
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == ME => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("set_tid_address did not return caller TID");
+        }
+    }
+
+    // (2) Stored the uaddr in the clear_child_tid table.
+    match crate::handlers::__test_peek_clear_child_tid(ME) {
+        Some(a) if a == uaddr => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("clear_child_tid slot not populated");
+        }
+    }
+
+    // (3) Passing 0 clears the slot.
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::SetTidAddress.raw(), &mut ctx);
+    if crate::handlers::__test_peek_clear_child_tid(ME).is_some() {
+        teardown_process_state();
+        return TestResult::Fail("set_tid_address(0) should clear the slot");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave65_set_tid_address_records_and_returns_tid
+);
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_67;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    crate::handlers::__test_reset_clear_child_tid();
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct TestCloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+    }
+    // The child_tid uaddr lives on the test stack — this is what
+    // pthread_join would normally watch. It stays in kernel-stack
+    // memory throughout because the smoke doesn't really ride the
+    // user AS; the exit observer's `paging::translate(root, page)`
+    // won't resolve a kernel-stack address through `parent_as`'s
+    // page tables, so the *(uaddr)=0 write will silently no-op.
+    // But the futex_bump_counter side fires regardless, which is
+    // what we assert here.
+    let mut clear_tid_word: u32 = 0xDEAD_BEEF;
+    let mut ca = TestCloneArgs::default();
+    // CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_CHILD_CLEARTID
+    ca.flags = 0x0000_0100 | 0x0001_0000 | 0x0000_0800 | 0x0020_0000;
+    ca.stack = 0x7fff_fff0_0000;
+    ca.stack_size = 0x1_0000;
+    ca.child_tid = &mut clear_tid_word as *mut u32 as u64;
+
+    let uargs = &ca as *const TestCloneArgs as u64;
+    let size = core::mem::size_of::<TestCloneArgs>() as u64;
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: uargs,
+            arg1: size,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+
+    let child_tid_raw = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("clone3 did not return a child TID");
+        }
+    };
+
+    // Verify the clear_child_tid slot was populated.
+    match crate::handlers::__test_peek_clear_child_tid(child_tid_raw) {
+        Some(a) if a == ca.child_tid => {}
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("CLONE_CHILD_CLEARTID did not record uaddr");
+        }
+    }
+
+    // Snapshot the futex wake counter at ca.child_tid pre-exit.
+    let pre = crate::handlers::__test_futex_wake_counter(ca.child_tid);
+
+    // Simulate child exit. The observer chain fires
+    // fire_clear_child_tid_on_exit which bumps the futex counter at
+    // ca.child_tid.
+    crate::user_task::notify_task_exited(child_tid_raw);
+
+    let post = crate::handlers::__test_futex_wake_counter(ca.child_tid);
+    if post <= pre {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("CLONE_CHILD_CLEARTID exit did not bump futex counter");
+    }
+
+    // The slot should be drained (single-shot per Linux semantics).
+    if crate::handlers::__test_peek_clear_child_tid(child_tid_raw).is_some() {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("clear_child_tid slot not consumed on exit");
+    }
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    TestResult::Pass
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave65_clone_child_cleartid_wakes_on_exit
+);

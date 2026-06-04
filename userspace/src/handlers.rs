@@ -3628,6 +3628,478 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── clone3(2) + set_tid_address — pthread bring-up surface ─────────
+//
+// Wave-65. Gated behind the `linux-compat` crate feature so non-
+// Linux-shaped consumers (the testbin runner, kernel-internal task
+// shapes) don't pull in the per-thread bookkeeping below.
+//
+// clone3(2) takes a single user pointer to `struct clone_args`
+// (Linux kernel uapi/linux/sched.h). The kernel reads the flags +
+// stack + tls + tid-pointer fields and routes:
+//
+//   - CLONE_VM       child shares parent's Arc<AddressSpace>.
+//   - CLONE_THREAD   child joins the parent's thread group; its
+//                    user-visible TGID is the parent's, while its
+//                    TID is a fresh scheduler TaskId. Without this
+//                    bit the child is treated as a process (fresh
+//                    ProcessId allocation).
+//   - CLONE_FS       cwd table shared (skip cwd_fork).
+//   - CLONE_FILES    fd table shared (skip fd::fork).
+//   - CLONE_SIGHAND  sigaction table shared (skip sigaction_fork).
+//   - CLONE_SETTLS   args.tls programmed into IA32_FS_BASE on first
+//                    dispatch (per-thread TLS thread-pointer).
+//   - CLONE_PARENT_SETTID writes the child TID into *args.parent_tid.
+//   - CLONE_CHILD_CLEARTID stashes args.child_tid in a per-task slot;
+//                    on thread exit, the kernel writes 0 there and
+//                    FUTEX_WAKEs one waiter.
+//
+// CLONE_NEWPID / CLONE_NEWNS / etc are accepted-and-ignored — the
+// container surface is a separate wave.
+//
+// set_tid_address(tidptr) sets the calling task's CLOSE_CHILD_CLEARTID
+// slot in the same per-task table; returns the caller's TID.
+#[cfg(feature = "linux-compat")]
+const CLONE_VM: u64 = 0x0000_0100;
+#[cfg(feature = "linux-compat")]
+const CLONE_FS: u64 = 0x0000_0200;
+#[cfg(feature = "linux-compat")]
+const CLONE_FILES: u64 = 0x0000_0400;
+#[cfg(feature = "linux-compat")]
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+#[cfg(feature = "linux-compat")]
+const CLONE_THREAD: u64 = 0x0001_0000;
+#[cfg(feature = "linux-compat")]
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+#[cfg(feature = "linux-compat")]
+const CLONE_SETTLS: u64 = 0x0008_0000;
+#[cfg(feature = "linux-compat")]
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+#[cfg(feature = "linux-compat")]
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+#[cfg(feature = "linux-compat")]
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+// Per-task CLONE_CHILD_CLEARTID slot. Keyed by scheduler TaskId raw
+// — the consumer (`fire_clear_child_tid_on_exit`) is invoked from
+// the exit-observer fan-out which receives the dying task's pid (=
+// TaskId for a CLONE_THREAD child, = ProcessId for a fork()'d
+// process; both cases route through `notify_task_exited(pid_raw)`
+// which uses `this.process.pid.raw()`).
+//
+// `register_pid_task_mapping` already records the (ProcessId,
+// TaskId) bindings sys_fork installs; for CLONE_THREAD children
+// the kernel records the same TaskId on both sides so the lookup
+// from exit-side `pid_raw` to "is there a clear_child_tid?" works
+// uniformly.
+#[cfg(feature = "linux-compat")]
+static CLEAR_CHILD_TID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the clear_child_tid table. Called once at boot
+/// alongside the other per-task state tables; idempotent.
+#[cfg(feature = "linux-compat")]
+pub fn clear_child_tid_init() {
+    let mut g = CLEAR_CHILD_TID.lock();
+    if g.is_none() {
+        *g = Some(BTreeMap::new());
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
+    let mut g = CLEAR_CHILD_TID.lock();
+    if g.is_none() {
+        *g = Some(BTreeMap::new());
+    }
+    if let Some(m) = g.as_mut() {
+        if uaddr == 0 {
+            m.remove(&task_id_raw);
+        } else {
+            m.insert(task_id_raw, uaddr);
+        }
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+fn take_clear_child_tid(task_id_raw: u64) -> Option<u64> {
+    let mut g = CLEAR_CHILD_TID.lock();
+    g.as_mut().and_then(|m| m.remove(&task_id_raw))
+}
+
+/// Diagnostic / test-only — inspect a task's clear_child_tid slot
+/// without consuming it.
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn __test_peek_clear_child_tid(task_id_raw: u64) -> Option<u64> {
+    let g = CLEAR_CHILD_TID.lock();
+    g.as_ref().and_then(|m| m.get(&task_id_raw).copied())
+}
+
+/// Force-clear the entire clear_child_tid table for test isolation.
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn __test_reset_clear_child_tid() {
+    *CLEAR_CHILD_TID.lock() = Some(BTreeMap::new());
+}
+
+/// Exit-observer body invoked from `notify_task_exited` for every
+/// dying user task. If the task registered a clear_child_tid (via
+/// `set_tid_address` or `clone3(CLONE_CHILD_CLEARTID)`), zero the
+/// user word and fire FUTEX_WAKE on it so any pthread_join sleeper
+/// observes the exit.
+///
+/// Called inside the polling future's exit fan-out, AFTER the user
+/// state's longjmp has popped us back to kernel context but BEFORE
+/// the AS Arc is dropped — for CLONE_THREAD children, the AS Arc is
+/// shared with the parent so it stays mapped. The writes use the
+/// kernel-side identity map via `paging::translate` to avoid
+/// requiring an `activate()` (the user task's AS was the active CR3
+/// at the moment of longjmp and the trap-exit path restored the
+/// kernel CR3 before reaching us; we don't want to bounce CR3 again
+/// just for one qword write).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn fire_clear_child_tid_on_exit(pid_raw: u64) {
+    let uaddr = match take_clear_child_tid(pid_raw) {
+        Some(a) if a != 0 => a,
+        _ => return,
+    };
+    // Resolve the dying task's address space. For CLONE_THREAD
+    // children this is the same Arc as the parent; for non-thread
+    // forks it's the child's own AS. `address_space_of` consults
+    // the scheduler's task table — works because we run during the
+    // exit-observer fan-out, before the scheduler reaps the slot.
+    let task_id = narf_scheduler::TaskId(pid_raw);
+    let as_arc = match narf_scheduler::address_space_of(task_id) {
+        Some(a) => a,
+        None => return,
+    };
+    // Write zero into *uaddr via the AS's page tables. The
+    // identity map covers the resulting phys, so a translate+
+    // raw-pointer write is safe.
+    let root = as_arc.root;
+    let page = uaddr & !0xFFFu64;
+    let off = uaddr & 0xFFFu64;
+    if off + 4 > 4096 {
+        // Crossing a page boundary on a 4-byte futex word is
+        // structurally invalid (futex words are required to be
+        // naturally aligned); drop the request rather than handle
+        // a split write.
+        return;
+    }
+    let phys = match unsafe { narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page)) } {
+        Some(p) => p,
+        None => return,
+    };
+    // SAFETY: identity-mapped low 4 GiB; the AS Arc keeps the
+    // backing frame alive across this write.
+    unsafe {
+        *((phys.as_u64() + off) as *mut u32) = 0;
+    }
+    // FUTEX_WAKE one waiter on the same uaddr — pthread_join's
+    // futex_wait observes the change. Uses the existing futex
+    // wake counter (the spin-counter model `sys_futex` rides on).
+    futex_bump_counter(uaddr);
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+fn fire_clear_child_tid_on_exit(_pid_raw: u64) {
+    // aarch64 / other arches: clone3 path is x86_64-gated below;
+    // the table never gets populated, so this is a no-op.
+}
+
+/// Register the clear_child_tid observer with `register_exit_observer`.
+/// Idempotent and safe to call before `clear_child_tid_init` (the
+/// observer no-ops on an unpopulated table).
+#[cfg(feature = "linux-compat")]
+pub fn install_clear_child_tid_observer() {
+    crate::user_task::register_exit_observer(fire_clear_child_tid_on_exit);
+}
+
+/// Linux `struct clone_args` — uapi shape from <linux/sched.h>.
+/// All fields are u64 on the wire; the kernel reads only the
+/// subset we honour.
+#[cfg(feature = "linux-compat")]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    // The full struct grows; later fields (set_tid, set_tid_size,
+    // cgroup) are honoured-as-zero today. We only copy as many bytes
+    // as the user provided (the second arg to clone3 is the struct
+    // size), capped at our known prefix.
+}
+
+#[cfg(feature = "linux-compat")]
+const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn sys_clone3(ctx: &mut dyn TrapContext) {
+    use crate::process::DEFAULT_USER_STACK_BYTES;
+
+    let args = *ctx.args();
+    let uargs = args.arg0;
+    let size = args.arg1 as usize;
+    if uargs == 0 || size < 8 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+
+    // Copy in just what we honour. Larger user structs (Linux has
+    // grown the struct several times) are read as a prefix; smaller
+    // ones (unlikely — the minimum Linux ever shipped was 64 bytes)
+    // would be rejected above on the 8-byte floor.
+    let copy_len = core::cmp::min(size, CLONE_ARGS_MIN);
+    let mut raw = [0u8; CLONE_ARGS_MIN];
+    if unsafe { copy_from_user(&mut raw[..copy_len], uargs) }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: `CloneArgs` is `#[repr(C)]` of u64s; any bit pattern
+    // is a valid `CloneArgs`. `raw` has the same size + alignment
+    // (u8 array can be transmuted to a struct-of-u64 because we
+    // only read it).
+    let ca: CloneArgs = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const CloneArgs) };
+
+    let flags = ca.flags;
+    let parent_as = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+
+    // CLONE_VM: share AS via Arc::clone. Without it, this would be a
+    // full fork — but pthread always passes CLONE_VM so the no-VM
+    // path is uncommon. We support both: no-VM falls back to
+    // `clone_for_fork` (sys_fork's path).
+    let share_vm = (flags & CLONE_VM) != 0;
+    let share_thread = (flags & CLONE_THREAD) != 0;
+    let share_fs = (flags & CLONE_FS) != 0;
+    let share_files = (flags & CLONE_FILES) != 0;
+    let _share_sighand = (flags & CLONE_SIGHAND) != 0;
+    let _share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
+
+    // CLONE_THREAD requires CLONE_VM + CLONE_SIGHAND in Linux.
+    // We enforce CLONE_VM (without a shared AS the child can't
+    // observe the parent's memory) but accept CLONE_SIGHAND as
+    // a behavioural-only flag.
+    if share_thread && !share_vm {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+
+    // No-VM (fork-shaped) path: redirect to sys_fork's machinery.
+    // The clone_args fields not consumed by fork are accepted-and-
+    // ignored on this branch (Linux behaviour: clone3 without
+    // CLONE_VM produces a process, not a thread, and TLS / tid
+    // pointers are still honoured but in a separate AS).
+    let child_as = if share_vm {
+        parent_as.clone()
+    } else {
+        let dup = match unsafe { parent_as.clone_for_fork() } {
+            Ok(a) => a,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+        };
+        if unsafe { dup.materialize() }.is_err() {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+        if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+        alloc::sync::Arc::new(dup)
+    };
+
+    // Stack: clone_args.stack points at the LOW end of the user-
+    // provided stack region; the child's initial RSP is
+    // `stack + stack_size`. Linux requires stack != 0 + stack_size
+    // != 0 (otherwise the kernel rejects with EINVAL).
+    if ca.stack == 0 || ca.stack_size == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let rsp = ca.stack.saturating_add(ca.stack_size);
+
+    // Entry: clone3 doesn't carry an explicit entry RIP in
+    // clone_args. The child resumes at the parent's saved trap-
+    // frame RIP (the instruction after the clone3 syscall) with
+    // a rewritten RAX = 0 — same shape as fork(). User code
+    // dispatches "am I the child? if so, call my start_routine"
+    // off the zero return value (relibc's pthread_create does
+    // exactly this).
+    let child_state: Option<crate::user_task::UserState> = {
+        use core::mem::MaybeUninit;
+        let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
+        let ok = unsafe { ctx.save_user_state(s.as_mut_ptr() as *mut u8) };
+        if ok {
+            let mut snap = unsafe { s.assume_init() };
+            snap.rax = 0;
+            // Plant the user-supplied RSP. The parent's trap-frame
+            // RSP stays in the parent's snapshot (its set_return
+            // path writes its own rax = child_tid later); the
+            // child's snapshot gets the freshly-allocated thread
+            // stack.
+            snap.rsp = rsp;
+            Some(snap)
+        } else {
+            None
+        }
+    };
+
+    let parent_pid = current_task_id();
+
+    // Allocate identifiers. Two cases:
+    //   - CLONE_THREAD: child shares the parent's user-visible PID
+    //                   (its TGID). Its scheduler TaskId is fresh
+    //                   (spawn_user mints it). Record both → same
+    //                   TaskId in TASK_TO_PID so getpid() returns
+    //                   the parent's PID and gettid() returns the
+    //                   TaskId.
+    //   - else:         fresh ProcessId via alloc_pid(), same as
+    //                   sys_fork.
+    let child_visible_pid = if share_thread {
+        // Parent's getpid() lookup — fall back to parent_pid if no
+        // mapping was registered (e.g., the parent is init).
+        task_to_pid_raw(parent_pid).unwrap_or(parent_pid)
+    } else {
+        crate::alloc_pid().raw()
+    };
+
+    let proc = crate::UserProcess {
+        pid: crate::ProcessId(child_visible_pid),
+        address_space: child_as.clone(),
+        entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
+        stack_top: narf_memory::VirtAddr::new(rsp),
+        fs_base: if (flags & CLONE_SETTLS) != 0 && ca.tls != 0 {
+            Some(ca.tls)
+        } else {
+            // Inherit parent's FS_BASE — read the live MSR.
+            let lo: u32;
+            let hi: u32;
+            const IA32_FS_BASE: u32 = 0xC000_0100;
+            unsafe {
+                core::arch::asm!(
+                    "rdmsr",
+                    in("ecx") IA32_FS_BASE,
+                    out("eax") lo,
+                    out("edx") hi,
+                    options(nostack, preserves_flags),
+                );
+            }
+            let v = (lo as u64) | ((hi as u64) << 32);
+            if v == 0 {
+                None
+            } else {
+                Some(v)
+            }
+        },
+        entry_arg: None,
+    };
+    let _ = DEFAULT_USER_STACK_BYTES;
+
+    let future = match child_state {
+        Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
+        None => crate::user_task::UserTaskFuture::new(proc),
+    };
+    let child_tid =
+        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::unthrottled(), child_as);
+
+    // Register the (visible-pid → TaskId) binding. For
+    // CLONE_THREAD children visible_pid == parent's pid, so the
+    // mapping is "child TaskId → parent's PID" — gettid returns
+    // the TaskId raw, getpid translates TaskId → PID.
+    register_pid_task_mapping(child_visible_pid, child_tid.raw());
+
+    // POSIX-shaped inheritance for the non-shared resources.
+    if !share_files {
+        crate::fd::fork(parent_pid, child_tid.raw());
+    }
+    if !share_fs {
+        cwd_fork(parent_pid, child_tid.raw());
+    }
+    if !share_vm {
+        // brk and sigaction map onto AS state; only meaningful for
+        // a non-VM clone (a true fork). For thread spawns the
+        // parent's brk/sigaction stay reachable through the shared
+        // AS and the per-tid sigaction lookup.
+        brk_fork(parent_pid, child_tid.raw());
+        sigaction_fork(parent_pid, child_tid.raw());
+    }
+
+    // CLONE_PARENT_SETTID: write child TID to *parent_tid in the
+    // parent's AS (still active here — we haven't returned to the
+    // user yet, so the parent's CR3 is in place from before the
+    // trap entry).
+    if (flags & CLONE_PARENT_SETTID) != 0 && ca.parent_tid != 0 {
+        let tid_bytes = (child_tid.raw() as u32).to_ne_bytes();
+        let _ = unsafe { copy_to_user(ca.parent_tid, &tid_bytes) };
+    }
+
+    // CLONE_CHILD_SETTID: write child TID to *child_tid in the
+    // child's AS. For CLONE_VM, parent and child share the AS so
+    // we can write through the live CR3 immediately; for non-VM
+    // we'd need to bounce CR3, which we don't support today on
+    // this branch (rare path: clone3 without CLONE_VM but with
+    // CHILD_SETTID is structurally weird).
+    if (flags & CLONE_CHILD_SETTID) != 0 && ca.child_tid != 0 && share_vm {
+        let tid_bytes = (child_tid.raw() as u32).to_ne_bytes();
+        let _ = unsafe { copy_to_user(ca.child_tid, &tid_bytes) };
+    }
+
+    // CLONE_CHILD_CLEARTID: stash for the exit-observer to consume.
+    if (flags & CLONE_CHILD_CLEARTID) != 0 && ca.child_tid != 0 {
+        set_clear_child_tid(child_tid.raw(), ca.child_tid);
+    }
+
+    // Parent-of bookkeeping for wait4 — process-style only. A
+    // thread (CLONE_THREAD) is not waitpid-reapable; pthread_join
+    // uses the futex on clear_child_tid instead.
+    if !share_thread {
+        parent_of_set(child_visible_pid, parent_pid);
+    }
+
+    // Return: parent sees child TID (== visible-pid for !THREAD,
+    // == TaskId.raw() for THREAD where TID and PID diverge).
+    let ret_val = if share_thread {
+        child_tid.raw()
+    } else {
+        child_visible_pid
+    };
+    ctx.set_return(SyscallReturn::ok(ret_val));
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+fn sys_clone3(ctx: &mut dyn TrapContext) {
+    // aarch64 / other arches: depends on x86_64-only user_task
+    // pipeline. Will land alongside the EL0 user-task bring-up.
+    ctx.set_return(SyscallReturn::invalid_op());
+}
+
+#[cfg(feature = "linux-compat")]
+fn sys_set_tid_address(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let tidptr = args.arg0;
+    let me = current_task_id();
+    // Per Linux: set_tid_address records the pointer regardless
+    // of value; passing 0 effectively disables clear_child_tid.
+    set_clear_child_tid(me, tidptr);
+    // Return the caller's TID.
+    ctx.set_return(SyscallReturn::ok(me));
+}
+
 // ── fork(2) — duplicate-process counterpart to sys_clone ───────────
 //
 // Where sys_clone shares the parent's `Arc<AddressSpace>` so a new
@@ -3879,6 +4351,16 @@ pub fn wait_init() {
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     crate::pidfd::init();
+    // Wave-65: clone3 CLONE_CHILD_CLEARTID + set_tid_address(2)
+    // bookkeeping. The table holds per-task user-pointer slots;
+    // the exit observer reads them on thread exit and fires the
+    // pthread_join futex wake. Gated so a no-linux-compat build
+    // doesn't carry the observer.
+    #[cfg(feature = "linux-compat")]
+    {
+        clear_child_tid_init();
+        install_clear_child_tid_observer();
+    }
 }
 
 #[doc(hidden)]
@@ -7236,6 +7718,14 @@ fn futex_bump_counter(uaddr: u64) {
     }
 }
 
+/// Test-only accessor for the futex wake counter — Wave-65 smokes
+/// observe CLONE_CHILD_CLEARTID's exit-side futex wake by reading
+/// this counter before/after the exit notification.
+#[doc(hidden)]
+pub fn __test_futex_wake_counter(uaddr: u64) -> u64 {
+    futex_wake_counter(uaddr)
+}
+
 fn sys_futex(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let uaddr = args.arg0;
@@ -9998,6 +10488,15 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Gettid, "gettid", RawFnHandler(sys_gettid));
     table.install_raw(Syscall::Clone, "clone", RawFnHandler(sys_clone));
     table.install_raw(Syscall::Fork, "fork", RawFnHandler(sys_fork));
+    #[cfg(feature = "linux-compat")]
+    {
+        table.install_raw(Syscall::Clone3, "clone3", RawFnHandler(sys_clone3));
+        table.install_raw(
+            Syscall::SetTidAddress,
+            "set_tid_address",
+            RawFnHandler(sys_set_tid_address),
+        );
+    }
     table.install_raw(Syscall::GetUid, "getuid", RawFnHandler(sys_getuid));
     table.install_raw(Syscall::GetGid, "getgid", RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid, "setuid", RawFnHandler(sys_setuid));

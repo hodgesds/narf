@@ -1035,6 +1035,39 @@ pub enum Syscall {
     /// WRITE — all without burning RAM upfront.
     Fork,
 
+    /// Linux clone3(2) — modern `clone_args`-shaped task spawn.
+    /// Single user argument: a pointer to `struct clone_args`
+    /// (see `man 2 clone3`). The kernel reads `flags`, `stack`,
+    /// `stack_size`, `tls`, `parent_tid`, `child_tid`, and
+    /// `exit_signal` from it; everything else is treated as zero.
+    ///
+    /// Honoured `CLONE_*` flags (Wave-65):
+    ///   - `CLONE_VM`              child shares parent's AS via Arc.
+    ///   - `CLONE_THREAD`          child joins parent's thread group
+    ///                             (same getpid(), distinct gettid()).
+    ///   - `CLONE_SIGHAND`         share sigaction table (accepted).
+    ///   - `CLONE_FS`              share cwd table.
+    ///   - `CLONE_FILES`           share fd table.
+    ///   - `CLONE_SYSVSEM`         accepted-and-ignored (no SysV sem).
+    ///   - `CLONE_PARENT_SETTID`   on success, write child TID to
+    ///                             `*parent_tid`.
+    ///   - `CLONE_CHILD_CLEARTID`  on thread exit, zero `*child_tid`
+    ///                             and FUTEX_WAKE one waiter there.
+    ///   - `CLONE_SETTLS`          program child's `IA32_FS_BASE` to
+    ///                             `args.tls` on first dispatch.
+    ///
+    /// Unsupported flags (CLONE_NEWPID, CLONE_NEWNS, etc.) are
+    /// silently accepted today; container support lands in Wave-67.
+    /// Returns the child's TID (which equals its PID when
+    /// CLONE_THREAD is unset, or shares the parent's PID when set).
+    Clone3,
+
+    /// Linux set_tid_address(2). Sets the calling task's
+    /// `clear_child_tid` user pointer, used by `CLONE_CHILD_CLEARTID`
+    /// on thread exit. `arg0 = tidptr`. Returns the caller's TID
+    /// (POSIX: returns the calling thread's TID).
+    SetTidAddress,
+
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific
     /// thread within a process group. NARF is single-threaded per
     /// process — tgkill aliases sys_kill. `arg0 = tgid` (-1 = any),
@@ -1407,6 +1440,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
     (Syscall::Fork, 57),
+    (Syscall::SetTidAddress, 218),
+    (Syscall::Clone3, 435),
     (Syscall::Execve, 59),
     (Syscall::ExitTask, 60), // exit
     (Syscall::Wait4, 61),
@@ -1627,6 +1662,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
+    (Syscall::SetTidAddress, 96),
+    (Syscall::Clone3, 435),
     (Syscall::Execve, 221),
     (Syscall::Mmap, 222),
     (Syscall::MProtect, 226),

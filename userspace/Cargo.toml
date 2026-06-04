@@ -31,6 +31,11 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-modules      = { path = "../modules" }
 
 [features]
+# Default-on so the workspace's `cargo xtask kernel-test` driver
+# (which doesn't enable any per-crate features explicitly) still
+# builds the Linux-shaped surface into the kernel. Strip with
+# --no-default-features at the workspace level if a future
+# non-Linux-shaped consumer wants them off.
 default = ["linux-compat"]
 
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
@@ -41,7 +46,8 @@ default = ["linux-compat"]
 user-mode-e2e = []
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
-# mprotect, madvise, and dynamic-linker plumbing.
+# set_tid_address, mprotect, madvise, dynamic-linker plumbing,
+# pthread bring-up under relibc.
 linux-compat = ["narf-memory/linux-compat"]
 
 # Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
