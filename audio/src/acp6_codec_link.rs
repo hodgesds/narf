@@ -60,9 +60,9 @@
 
 extern crate alloc;
 
+use crate::codec::CodecError;
 use crate::i2s::{Acp3xIter, Acp3xTxFrmt, FrameFormat, I2sFormat, WordLength};
 use crate::realtek_alc::{self, RealtekChip};
-use crate::codec::CodecError;
 
 // ── Public API ─────────────────────────────────────────────────────────
 
@@ -149,7 +149,7 @@ pub const fn classify_acp_version(version: u32) -> Option<CodecLinkPath> {
 /// On a real board, call this after `acp6::register_pci_driver()` has
 /// run and the AcpDevice singleton is populated.
 pub fn detect_platform() -> Result<CodecLinkPath, CodecLinkError> {
-    use crate::acp6::{with_controller, regs};
+    use crate::acp6::{regs, with_controller};
     let version = with_controller(|c| {
         // SAFETY: BAR0 MMIO is valid for the lifetime of the AcpDevice.
         unsafe { c.mmio.read32(regs::ACP_VERSION) }
@@ -350,9 +350,7 @@ impl SdwImmCmd {
         let upper_addr = ((reg_addr >> 8) & 0xFF) as u32;
         let lower_addr = (reg_addr & 0xFF) as u32;
         Self {
-            upper: ((dev_addr as u32 & 0xF) << 8)
-                | sdw_regs::MCP_CMD_READ
-                | upper_addr,
+            upper: ((dev_addr as u32 & 0xF) << 8) | sdw_regs::MCP_CMD_READ | upper_addr,
             lower: lower_addr << 24,
         }
     }
@@ -362,9 +360,7 @@ impl SdwImmCmd {
         let upper_addr = ((reg_addr >> 8) & 0xFF) as u32;
         let lower_addr = (reg_addr & 0xFF) as u32;
         Self {
-            upper: ((dev_addr as u32 & 0xF) << 8)
-                | sdw_regs::MCP_CMD_WRITE
-                | upper_addr,
+            upper: ((dev_addr as u32 & 0xF) << 8) | sdw_regs::MCP_CMD_WRITE | upper_addr,
             lower: (lower_addr << 24) | ((data as u32) << 7),
         }
     }
@@ -691,7 +687,7 @@ mod tests {
     /// `val = val | (rtd->xfer_resolution << 3)`.
     fn smoke_codec_link_i2s_iter_bit_positions() -> TestResult {
         use crate::i2s::{Acp3xIter, IterSampLen, ITER_SAMP_LEN_MASK};
-        use crate::i2s::{Channels, I2sFormat, FrameFormat, WordLength};
+        use crate::i2s::{Channels, FrameFormat, I2sFormat, WordLength};
 
         // S16LE Standard I2S — xfer_resolution=2 → 2 << 3 = 0x10.
         let fmt = I2sFormat {
@@ -717,14 +713,20 @@ mod tests {
         }
 
         // S32LE — xfer_resolution=5 → 5 << 3 = 0x28.
-        let fmt32 = I2sFormat { word_length: WordLength::Bits32, ..fmt };
+        let fmt32 = I2sFormat {
+            word_length: WordLength::Bits32,
+            ..fmt
+        };
         let iter32 = Acp3xIter::build(fmt32);
         if iter32.raw() & ITER_SAMP_LEN_MASK != IterSampLen::Bits32 as u32 {
             return TestResult::Fail("S32LE samp-len field wrong");
         }
 
         // DspPcm sets TDM bit 1.
-        let fmt_tdm = I2sFormat { frame_format: FrameFormat::DspPcm, ..fmt };
+        let fmt_tdm = I2sFormat {
+            frame_format: FrameFormat::DspPcm,
+            ..fmt
+        };
         let iter_tdm = Acp3xIter::build(fmt_tdm);
         if iter_tdm.raw() & Acp3xIter::TDM_ENABLE == 0 {
             return TestResult::Fail("TDM bit not set for DspPcm");
@@ -753,7 +755,10 @@ mod tests {
         }
         // First ITER write (samp-len RMW): should have samp-len but NOT enable.
         let writes: alloc::vec::Vec<u32> = {
-            mmio.inner.writes.borrow().iter()
+            mmio.inner
+                .writes
+                .borrow()
+                .iter()
                 .filter(|(o, _)| *o == i2s_regs::ITER)
                 .map(|(_, v)| *v)
                 .collect()
@@ -870,7 +875,8 @@ mod tests {
         let mmio = FakeMmioAdapter::new();
 
         // Pre-arm: SW_IMM_CMD_STS returns IMM_RES_VALID on first poll.
-        mmio.inner.set_read(sdw_regs::SW_IMM_CMD_STS, sdw_regs::IMM_RES_VALID);
+        mmio.inner
+            .set_read(sdw_regs::SW_IMM_CMD_STS, sdw_regs::IMM_RES_VALID);
         // Response lower word: ACK=1 always (we'll filter by address in a
         // real driver; here all addresses ACK to test bitmask accumulation
         // for addresses 1 and 3 only — we use the fake by pre-arming only
@@ -887,7 +893,11 @@ mod tests {
         //   - expected_nonzero=true (wait for result): immediately ok
         let mut poll_ready = |m: &FakeMmioAdapter, offset: u64, expected_nonzero: bool| -> bool {
             let val = unsafe { m.read32(offset) };
-            if expected_nonzero { val != 0 } else { val == 0 }
+            if expected_nonzero {
+                val != 0
+            } else {
+                val == 0
+            }
         };
 
         // Override cmd_sts: first read shows 0 (not busy), second read
@@ -966,31 +976,36 @@ mod tests {
         let mut fake = FakeCorb::new();
         arm_fake_alc295(&mut fake, cad);
 
-        let r = realtek_alc::bring_up_alc_supported_with(
-            cad,
-            &mut |c, n, v, p| Ok(fake.send(c, n, v, p)),
-        );
+        let r = realtek_alc::bring_up_alc_supported_with(cad, &mut |c, n, v, p| {
+            Ok(fake.send(c, n, v, p))
+        });
         if r.is_err() {
             return TestResult::Fail("bring_up_alc295_with failed on FakeCorb");
         }
 
         // Speaker pin (NID 4) saw Set Pin Widget Control.
-        if !fake.saw(cad, 4, crate::codec::VERB_SET_PIN_WIDGET_CONTROL,
-                     realtek_alc::SPEAKER_PIN_PAYLOAD)
-        {
+        if !fake.saw(
+            cad,
+            4,
+            crate::codec::VERB_SET_PIN_WIDGET_CONTROL,
+            realtek_alc::SPEAKER_PIN_PAYLOAD,
+        ) {
             return TestResult::Fail("speaker pin control missing");
         }
 
-        // ALC289 bring-up must be rejected (wrong chip).
-        let mut fake289 = FakeCorb::new();
-        fake289.arm_param(cad, 0, crate::codec::param::VENDOR_ID,
-                          (0x10ECu32 << 16) | 0x0289);
-        let r289 = realtek_alc::bring_up_alc_supported_with(
+        // Unsupported chip bring-up must be rejected (wrong chip).
+        let mut fake288 = FakeCorb::new();
+        fake288.arm_param(
             cad,
-            &mut |c, n, v, p| Ok(fake289.send(c, n, v, p)),
+            0,
+            crate::codec::param::VENDOR_ID,
+            (0x10ECu32 << 16) | 0x0288,
         );
-        if !matches!(r289, Err(realtek_alc::AlcError::WrongChip)) {
-            return TestResult::Fail("ALC289 should have been rejected");
+        let r288 = realtek_alc::bring_up_alc_supported_with(cad, &mut |c, n, v, p| {
+            Ok(fake288.send(c, n, v, p))
+        });
+        if !matches!(r288, Err(realtek_alc::AlcError::WrongChip)) {
+            return TestResult::Fail("Unsupported chip should have been rejected");
         }
 
         TestResult::Pass
@@ -1006,13 +1021,13 @@ mod tests {
         let phoenix_ver: u32 = 0x0600_0000 | 0x0001;
         match classify_acp_version(phoenix_ver) {
             Some(CodecLinkPath::SoundWire) => {}
-            other => return TestResult::Fail(
-                if matches!(other, Some(CodecLinkPath::I2s)) {
+            other => {
+                return TestResult::Fail(if matches!(other, Some(CodecLinkPath::I2s)) {
                     "Phoenix mis-classified as I2S"
                 } else {
                     "Phoenix classified as None"
-                }
-            ),
+                })
+            }
         }
 
         // ACP3.x (Renoir) — bits [27:24] = 0x3.
@@ -1075,12 +1090,22 @@ mod tests {
         }
         // upper: dev=1, write(3<<12), reg_hi=0x70
         let expected_upper: u32 = (1u32 << 8) | sdw_regs::MCP_CMD_WRITE | 0x70;
-        if mmio.inner.last_write(sdw_regs::SW_IMM_CMD_UPPER).unwrap_or(0) != expected_upper {
+        if mmio
+            .inner
+            .last_write(sdw_regs::SW_IMM_CMD_UPPER)
+            .unwrap_or(0)
+            != expected_upper
+        {
             return TestResult::Fail("SW_IMM_CMD_UPPER value wrong for HDA verb");
         }
         // lower: reg_lo=0x74, data=0xC0
         let expected_lower: u32 = (0x74u32 << 24) | (0xC0u32 << 7);
-        if mmio.inner.last_write(sdw_regs::SW_IMM_CMD_LOWER).unwrap_or(0) != expected_lower {
+        if mmio
+            .inner
+            .last_write(sdw_regs::SW_IMM_CMD_LOWER)
+            .unwrap_or(0)
+            != expected_lower
+        {
             return TestResult::Fail("SW_IMM_CMD_LOWER value wrong for HDA verb");
         }
         TestResult::Pass
@@ -1138,7 +1163,9 @@ mod tests {
 
     impl FakeMmioAdapter {
         fn new() -> Self {
-            Self { inner: FakeMmio::new() }
+            Self {
+                inner: FakeMmio::new(),
+            }
         }
     }
 
