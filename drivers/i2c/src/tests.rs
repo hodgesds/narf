@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::amd_fch::{recognised_hids, AmdFchI2c};
-use crate::lpss::{recognised_hids as lpss_recognised_hids, __new_for_test as lpss_new_for_test};
+use crate::lpss::{__new_for_test as lpss_new_for_test, recognised_hids as lpss_recognised_hids};
 use crate::{registry, I2cBus, I2cError, I2cOp};
 use narf_memory::PhysAddr;
 
@@ -54,17 +54,17 @@ impl I2cBus for MockBus {
 const DW_COMP_TYPE: u32 = 0x4457_0140;
 
 fn make_synthetic_mmio(seed_comp_type: bool) -> (PhysAddr, u64) {
-    // 256 B aligned to 4 B (Vec<u32> guarantees 4-byte alignment).
+    // 1024 B aligned to 4 B (Vec<u32> guarantees 4-byte alignment).
     // Leak into a Box so the kernel-test harness can hold the addr
     // for the lifetime of the test without lifetime tracking.
-    let buf: Box<[u32; 64]> = Box::new([0u32; 64]);
+    let buf: Box<[u32; 256]> = Box::new([0u32; 256]);
     let raw = Box::leak(buf);
     if seed_comp_type {
         // IC_COMP_TYPE is at byte offset 0xfc -> u32 index 63.
         raw[63] = DW_COMP_TYPE;
     }
     let phys = raw.as_ptr() as u64;
-    (PhysAddr::new(phys), 256)
+    (PhysAddr::new(phys), 1024)
 }
 
 // ── Smokes ───────────────────────────────────────────────────────
@@ -106,7 +106,10 @@ fn smoke_i2c_registry_lists_multiple_buses() -> TestResult {
     if registry::count() != 3 {
         return TestResult::Fail("expected 3 registered buses");
     }
-    let names: alloc::vec::Vec<_> = registry::list().iter().map(|b| b.name().to_string()).collect();
+    let names: alloc::vec::Vec<_> = registry::list()
+        .iter()
+        .map(|b| b.name().to_string())
+        .collect();
     for want in ["\\_SB.I2CA", "\\_SB.I2CB", "\\_SB.I2CC"] {
         if !names.iter().any(|n| n == want) {
             return TestResult::Fail("listed buses missing one we registered");
@@ -283,7 +286,10 @@ fn smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates() -> TestResult {
         Err(_) => TestResult::Fail("LPSS probe_component_type rejected real DW magic"),
     }
 }
-kernel_test_in!("drivers-i2c", smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates);
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates
+);
 
 fn smoke_lpss_i2c_enable_writes_expected_regs() -> TestResult {
     let (phys, len) = make_synthetic_mmio(true);
