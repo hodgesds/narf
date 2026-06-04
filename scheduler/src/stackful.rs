@@ -58,6 +58,17 @@ use core::task::{Context, Poll, Waker};
 #[cfg(target_arch = "x86_64")]
 use narf_arch::x86_64::kernel_ctx::{kernel_switch, KernelContext};
 
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Default, Copy, Clone, Debug)]
+pub struct KernelContext;
+
+#[cfg(not(target_arch = "x86_64"))]
+impl KernelContext {
+    pub fn fresh(_stack_top: u64, _entry: u64, _arg: u64) -> Self {
+        Self
+    }
+}
+
 /// Trap frame layout matching `narf_frame::x86_64::trap::TrapFrame`.
 /// Re-declared here because scheduler can't depend on frame (frame
 /// depends on scheduler). A const-assert pins layout equality at
@@ -143,8 +154,7 @@ struct PerCpuTaskPtr {
     inner: [AtomicPtr<KernelTask>; narf_lib::percpu::MAX_CPUS],
 }
 static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
-    inner: [const { AtomicPtr::new(core::ptr::null_mut()) };
-        narf_lib::percpu::MAX_CPUS],
+    inner: [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS],
 };
 
 #[inline]
@@ -160,10 +170,28 @@ fn this_cpu() -> usize {
 #[inline]
 const fn zeroed_trap_frame() -> TrapFrame {
     TrapFrame {
-        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
-        vector: 0, error_code: 0,
-        rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        vector: 0,
+        error_code: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp: 0,
+        ss: 0,
     }
 }
 
@@ -268,7 +296,10 @@ impl KernelTask {
         F: Future<Output = ()> + Send + 'static,
     {
         assert!(stack_bytes >= 4096, "kernel stack must be ≥ 4 KiB");
-        assert!(stack_bytes & 0xF == 0, "kernel stack must be 16-byte aligned");
+        assert!(
+            stack_bytes & 0xF == 0,
+            "kernel stack must be 16-byte aligned"
+        );
 
         // Allocate the stack on the heap so it's stable across
         // moves (we're going to point r15 at the task itself, and
@@ -299,9 +330,8 @@ impl KernelTask {
         // without a `call` — `kernel_switch` does a `jmp rcx` to
         // it — so the entry sees rsp as 16-aligned, which is what
         // the SysV ABI wants for a fresh function entry.
-        let stack_top = (me.stack.as_mut_ptr() as u64)
-            .wrapping_add(me.stack.len() as u64)
-            & !0xFu64;
+        let stack_top =
+            (me.stack.as_mut_ptr() as u64).wrapping_add(me.stack.len() as u64) & !0xFu64;
 
         // Smuggle the task pointer in via r15 (callee-saved
         // register, survives the asm restore). The trampoline
@@ -310,11 +340,7 @@ impl KernelTask {
 
         #[cfg(target_arch = "x86_64")]
         {
-            me.ctx = KernelContext::fresh(
-                stack_top,
-                trampoline_entry as u64,
-                task_ptr_as_u64,
-            );
+            me.ctx = KernelContext::fresh(stack_top, trampoline_entry as u64, task_ptr_as_u64);
         }
         let _ = stack_top; // silence warning on aarch64 stub
 
@@ -346,8 +372,7 @@ impl KernelTask {
         // re-arms the correct slot — see `task_body_rust`.
         *self.current_waker.lock() = Some(waker.clone());
         // Publish exec_ctx so the task can find it on yield.
-        self.exec_ctx
-            .store(exec_ctx as *mut _, Ordering::Release);
+        self.exec_ctx.store(exec_ctx as *mut _, Ordering::Release);
         // Record when this slice started — the trap-handler
         // preempt hook reads `tsc_started` to decide whether
         // we've used our slice.
@@ -365,7 +390,8 @@ impl KernelTask {
         // crate's code segment.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
-        self.exec_ctx.store(core::ptr::null_mut(), Ordering::Release);
+        self.exec_ctx
+            .store(core::ptr::null_mut(), Ordering::Release);
         if self.completed.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
@@ -466,7 +492,11 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         let prev_52 = STACKFUL_POLL_TICKS.fetch_add(1, Ordering::Relaxed);
         narf_memory::beacon::paint(
             52,
-            if prev_52 & 1 == 0 { 0x00FF_FFFF } else { 0x0080_80FF },
+            if prev_52 & 1 == 0 {
+                0x00FF_FFFF
+            } else {
+                0x0080_80FF
+            },
         );
         let waker_guard = task.current_waker.lock();
         let waker = match waker_guard.as_ref() {
@@ -479,7 +509,11 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         let prev_53 = STACKFUL_YIELD_TICKS.fetch_add(1, Ordering::Relaxed);
         narf_memory::beacon::paint(
             53,
-            if prev_53 & 1 == 0 { 0x0000_FF80 } else { 0x00FF_8000 },
+            if prev_53 & 1 == 0 {
+                0x0000_FF80
+            } else {
+                0x00FF_8000
+            },
         );
         match result {
             Poll::Ready(()) => {
@@ -911,9 +945,9 @@ pub mod tests {
     fn smoke_try_preempt_skips_non_preempt_vector() -> TestResult {
         let mut frame = zero_trap_frame();
         frame.vector = 33; // anything other than 32
-        frame.cs = 0x08;   // CPL=0
-        // Doesn't matter what CURRENT_STACKFUL_TASK holds — the
-        // vector check fires first.
+        frame.cs = 0x08; // CPL=0
+                         // Doesn't matter what CURRENT_STACKFUL_TASK holds — the
+                         // vector check fires first.
         let result = unsafe { try_preempt(&mut frame) };
         if result {
             return TestResult::Fail("preempted on vector != 32");
@@ -1144,8 +1178,12 @@ pub mod tests {
         COUNTER_A.store(0, Ordering::Release);
         COUNTER_B.store(0, Ordering::Release);
 
-        let mut task_a = KernelTask::new(TrivialFuture { counter: &COUNTER_A });
-        let mut task_b = KernelTask::new(TrivialFuture { counter: &COUNTER_B });
+        let mut task_a = KernelTask::new(TrivialFuture {
+            counter: &COUNTER_A,
+        });
+        let mut task_b = KernelTask::new(TrivialFuture {
+            counter: &COUNTER_B,
+        });
         let mut exec_ctx = KernelContext::default();
         let waker = KernelTask::no_op_waker();
 
@@ -1155,9 +1193,7 @@ pub mod tests {
         if ra != Poll::Ready(()) || rb != Poll::Ready(()) {
             return TestResult::Fail("one of the tasks didn't complete");
         }
-        if COUNTER_A.load(Ordering::Acquire) != 1
-            || COUNTER_B.load(Ordering::Acquire) != 1
-        {
+        if COUNTER_A.load(Ordering::Acquire) != 1 || COUNTER_B.load(Ordering::Acquire) != 1 {
             return TestResult::Fail("counters bled between tasks");
         }
         TestResult::Pass
@@ -1279,10 +1315,7 @@ pub mod tests {
         });
         let waker: Waker = observer.clone().into();
         // SAFETY: u64 cast of the Arc data ptr is a stable diagnostic.
-        OBSERVED_WAKER_DATA.store(
-            Arc::as_ptr(&observer) as u64,
-            Ordering::Release,
-        );
+        OBSERVED_WAKER_DATA.store(Arc::as_ptr(&observer) as u64, Ordering::Release);
 
         let mut task = KernelTask::new(CaptureWakerData);
         let mut exec_ctx = KernelContext::default();
@@ -1584,8 +1617,7 @@ pub mod tests {
                 // pattern so a misalloc that hands out an
                 // already-live block would corrupt it.
                 let pattern = (self.idx as u8).wrapping_mul(17).wrapping_add(0x42);
-                let buf: alloc::boxed::Box<[u8; 256]> =
-                    alloc::boxed::Box::new([pattern; 256]);
+                let buf: alloc::boxed::Box<[u8; 256]> = alloc::boxed::Box::new([pattern; 256]);
                 // Sanity check that all bytes survived the
                 // allocation untouched. (Realistically we'd only
                 // catch live-block reuse here — but that IS the
@@ -1615,7 +1647,10 @@ pub mod tests {
         // headroom even with other boot tasks sharing the queue.
         for _ in 0..256 {
             crate::poll_one_round();
-            if COUNTS.iter().all(|c| c.load(Ordering::Acquire) >= ITERS_PER_TASK) {
+            if COUNTS
+                .iter()
+                .all(|c| c.load(Ordering::Acquire) >= ITERS_PER_TASK)
+            {
                 break;
             }
         }
@@ -1639,11 +1674,8 @@ pub mod tests {
         const TASKS: usize = 3;
         const VECS_PER_TASK: u32 = 16;
         const PUSHES_PER_VEC: usize = 128;
-        static COUNTS: [AtomicU32; TASKS] = [
-            AtomicU32::new(0),
-            AtomicU32::new(0),
-            AtomicU32::new(0),
-        ];
+        static COUNTS: [AtomicU32; TASKS] =
+            [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
         static FAULT: AtomicBool = AtomicBool::new(false);
         for c in COUNTS.iter() {
             c.store(0, Ordering::Release);
@@ -1660,8 +1692,7 @@ pub mod tests {
                 if self.remaining == 0 {
                     return Poll::Ready(());
                 }
-                let mut v: alloc::vec::Vec<u32> =
-                    alloc::vec::Vec::with_capacity(8);
+                let mut v: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(8);
                 for k in 0..PUSHES_PER_VEC {
                     v.push((self.idx as u32) * 1_000_000 + k as u32);
                 }
@@ -1877,8 +1908,12 @@ pub mod tests {
         }
 
         for _ in 0..3 {
-            crate::spawn(Once { counter: &PLAIN_DONE });
-            crate::spawn_stackful(Once { counter: &STACK_DONE });
+            crate::spawn(Once {
+                counter: &PLAIN_DONE,
+            });
+            crate::spawn_stackful(Once {
+                counter: &STACK_DONE,
+            });
         }
         for _ in 0..32 {
             crate::poll_one_round();
@@ -1933,8 +1968,7 @@ pub mod tests {
         crate::spawn(Parent);
         for _ in 0..64 {
             crate::poll_one_round();
-            if PARENT_DONE.load(Ordering::Acquire)
-                && CHILD_DONE.load(Ordering::Acquire) >= CHILDREN
+            if PARENT_DONE.load(Ordering::Acquire) && CHILD_DONE.load(Ordering::Acquire) >= CHILDREN
             {
                 break;
             }
@@ -2135,11 +2169,8 @@ pub mod tests {
         const READERS: usize = 3;
         const WRITES: u32 = 8;
         static DROPS: AtomicU32 = AtomicU32::new(0);
-        static READS: [AtomicU32; READERS] = [
-            AtomicU32::new(0),
-            AtomicU32::new(0),
-            AtomicU32::new(0),
-        ];
+        static READS: [AtomicU32; READERS] =
+            [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
         DROPS.store(0, Ordering::Release);
         for r in READS.iter() {
             r.store(0, Ordering::Release);
@@ -2499,16 +2530,15 @@ pub mod tests {
         const TASKS: usize = 4;
         const ITERS: u32 = 16;
 
-        let pool: &'static AtomicPool<u32> = alloc::boxed::Box::leak(
-            alloc::boxed::Box::new(AtomicPool::new(POOL_SIZE, {
+        let pool: &'static AtomicPool<u32> =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(POOL_SIZE, {
                 let mut next = 0u32;
                 move || {
                     let id = next;
                     next += 1;
                     id
                 }
-            })),
-        );
+            })));
         static IN_USE: [AtomicBool; POOL_SIZE] = [
             AtomicBool::new(false),
             AtomicBool::new(false),
@@ -2630,14 +2660,38 @@ pub mod tests {
         const TASKS: usize = 4;
         const ITERS: u32 = 8;
         static BASES: [AtomicU64; TASKS * (ITERS as usize)] = [
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
         ];
         static COMPLETED: AtomicU32 = AtomicU32::new(0);
         for s in BASES.iter() {
@@ -2795,10 +2849,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_try_preempt_skips_user_mode);
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_try_preempt_skips_when_no_task
-    );
+    kernel_test_in!("scheduler/stackful", smoke_try_preempt_skips_when_no_task);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -2815,10 +2866,7 @@ pub mod tests {
         smoke_stackful_pending_round_trips_preserve_state
     );
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_stackful_runs_on_dedicated_stack
-    );
+    kernel_test_in!("scheduler/stackful", smoke_stackful_runs_on_dedicated_stack);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -2845,15 +2893,9 @@ pub mod tests {
         smoke_stackful_inner_waker_is_executor_waker
     );
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_current_task_cleared_after_poll
-    );
+    kernel_test_in!("scheduler/stackful", smoke_current_task_cleared_after_poll);
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_stackful_adapter_applies_options
-    );
+    kernel_test_in!("scheduler/stackful", smoke_stackful_adapter_applies_options);
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_options_defaults_match_constants
@@ -2876,20 +2918,11 @@ pub mod tests {
         smoke_concurrency_no_preempt_still_round_robins
     );
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_alloc_concurrency_box_round_trip
-    );
+    kernel_test_in!("scheduler/stackful", smoke_alloc_concurrency_box_round_trip);
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_alloc_concurrency_vec_grow_drop
-    );
+    kernel_test_in!("scheduler/stackful", smoke_alloc_concurrency_vec_grow_drop);
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_alloc_concurrency_mixed_sizes
-    );
+    kernel_test_in!("scheduler/stackful", smoke_alloc_concurrency_mixed_sizes);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -2906,25 +2939,16 @@ pub mod tests {
         smoke_concurrency_plain_spawn_round_robin
     );
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_concurrency_mixed_spawn_types
-    );
+    kernel_test_in!("scheduler/stackful", smoke_concurrency_mixed_spawn_types);
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_concurrency_spawn_during_spawn
-    );
+    kernel_test_in!("scheduler/stackful", smoke_concurrency_spawn_during_spawn);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
         smoke_concurrency_stackful_spawns_stackful
     );
     #[cfg(target_arch = "x86_64")]
-    kernel_test_in!(
-        "scheduler/stackful",
-        smoke_concurrency_spawn_fifo_order
-    );
+    kernel_test_in!("scheduler/stackful", smoke_concurrency_spawn_fifo_order);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
