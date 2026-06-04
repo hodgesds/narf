@@ -645,13 +645,136 @@ fn virtio_blk_image_path() -> PathBuf {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut buf = vec![0u8; 1024 * 1024];
-        for i in 0..512usize {
-            buf[i] = (i as u8).wrapping_mul(0x97);
-        }
-        let _ = std::fs::write(&path, &buf);
+        // Minimal ext2 image containing `/hello.txt` so the boot
+        // path's Stage::Late `mnt-mount-ext2` initcall can detect
+        // an ext2 filesystem on the virtio-blk device and mount it
+        // at /mnt. Mirrors drivers/fs/ext2/src/tests.rs build_ext2_image.
+        let img = build_ext2_disk_image(b"hello.txt", b"hello from disk\n");
+        let _ = std::fs::write(&path, &img);
     }
     path
+}
+
+/// Build a minimal single-group ext2 image. 1 KiB blocks, 64 blocks
+/// total (64 KiB), one regular file at root. Layout mirrors the test
+/// fixture in drivers/fs/ext2/src/tests.rs::build_ext2_image so it
+/// rides the same mount + read paths.
+fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
+    const BS: usize = 1024;
+    const TOTAL_BLOCKS: u32 = 64;
+    const INODES_PER_GROUP: u32 = 32;
+    const INODE_SIZE: u16 = 128;
+    const BLOCKS_PER_GROUP: u32 = 64;
+    const FT_DIR: u8 = 2;
+    const FT_REG: u8 = 1;
+
+    let mut img = vec![0u8; BS * TOTAL_BLOCKS as usize];
+
+    fn put_u16(b: &mut [u8], off: usize, v: u16) {
+        b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u32(b: &mut [u8], off: usize, v: u32) {
+        b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    // Superblock at byte 1024.
+    {
+        let sb = &mut img[1024..2048];
+        put_u32(sb, 0, INODES_PER_GROUP);
+        put_u32(sb, 4, TOTAL_BLOCKS);
+        put_u32(sb, 20, 1); // s_first_data_block
+        put_u32(sb, 24, 0); // s_log_block_size → 1024
+        put_u32(sb, 32, BLOCKS_PER_GROUP);
+        put_u32(sb, 40, INODES_PER_GROUP);
+        put_u16(sb, 56, 0xEF53);
+        put_u32(sb, 76, 1); // s_rev_level
+        put_u16(sb, 88, INODE_SIZE);
+    }
+
+    // Block group descriptor at block 2.
+    let gdt_off = 2 * BS;
+    put_u32(&mut img, gdt_off + 0, 3); // bg_block_bitmap
+    put_u32(&mut img, gdt_off + 4, 4); // bg_inode_bitmap
+    put_u32(&mut img, gdt_off + 8, 5); // bg_inode_table
+    put_u16(&mut img, gdt_off + 12, 0);
+    put_u16(&mut img, gdt_off + 14, 0);
+    put_u16(&mut img, gdt_off + 16, 1);
+
+    // Block bitmap (block 3): mark blocks 0..=10 used.
+    let bm_off = 3 * BS;
+    img[bm_off] = 0xFF;
+    img[bm_off + 1] = 0x07;
+
+    // Inode bitmap (block 4): inodes 1, 2, 12 used.
+    let ibm_off = 4 * BS;
+    img[ibm_off] = 0b0000_0011;
+    img[ibm_off + 1] = 0b0000_1000;
+
+    // Inode table (blocks 5..=8).
+    let itab_off = 5 * BS;
+
+    // Root inode (#2) at table index 1.
+    let root_off = itab_off + INODE_SIZE as usize;
+    put_u16(&mut img, root_off + 0, 0x4000 | 0o755);
+    put_u32(&mut img, root_off + 4, BS as u32);
+    put_u32(&mut img, root_off + 28, (BS / 512) as u32);
+    put_u32(&mut img, root_off + 40, 9);
+
+    // File inode (#12) at table index 11.
+    let file_off = itab_off + 11 * INODE_SIZE as usize;
+    put_u16(&mut img, file_off + 0, 0x8000 | 0o644);
+    put_u32(&mut img, file_off + 4, file_data.len() as u32);
+    put_u32(
+        &mut img,
+        file_off + 28,
+        ((file_data.len() + 511) / 512) as u32,
+    );
+    if !file_data.is_empty() {
+        put_u32(&mut img, file_off + 40, 10);
+    }
+
+    // Root directory data block (9).
+    let root_data = 9 * BS;
+    let mut cursor = 0usize;
+    // "." → 2
+    {
+        let off = root_data + cursor;
+        put_u32(&mut img, off + 0, 2);
+        put_u16(&mut img, off + 4, 12);
+        img[off + 6] = 1;
+        img[off + 7] = FT_DIR;
+        img[off + 8] = b'.';
+        cursor += 12;
+    }
+    // ".." → 2
+    {
+        let off = root_data + cursor;
+        put_u32(&mut img, off + 0, 2);
+        put_u16(&mut img, off + 4, 12);
+        img[off + 6] = 2;
+        img[off + 7] = FT_DIR;
+        img[off + 8] = b'.';
+        img[off + 9] = b'.';
+        cursor += 12;
+    }
+    // file → 12, fills rest of block.
+    {
+        let off = root_data + cursor;
+        let remaining = BS - cursor;
+        put_u32(&mut img, off + 0, 12);
+        put_u16(&mut img, off + 4, remaining as u16);
+        img[off + 6] = file_name.len() as u8;
+        img[off + 7] = FT_REG;
+        img[off + 8..off + 8 + file_name.len()].copy_from_slice(file_name);
+    }
+
+    // File data block (10).
+    if !file_data.is_empty() {
+        let data_off = 10 * BS;
+        img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
+    }
+
+    img
 }
 
 fn nvme_image_path() -> PathBuf {
