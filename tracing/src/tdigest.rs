@@ -216,8 +216,7 @@ impl TDigest {
 
         // Move all centroids + buffered samples into one working set,
         // sort by mean. This is the §3.2 merging-compression sweep.
-        let mut work: Vec<Centroid> =
-            Vec::with_capacity(self.centroids.len() + self.buffer.len());
+        let mut work: Vec<Centroid> = Vec::with_capacity(self.centroids.len() + self.buffer.len());
         work.extend(self.centroids.drain(..));
         work.extend(self.buffer.drain(..));
         work.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(Ordering::Equal));
@@ -276,7 +275,8 @@ impl TDigest {
         // — merging is associative because compression is driven
         // entirely by the sorted-by-mean sweep + cumulative-quantile
         // bound).
-        self.buffer.reserve(other.centroids.len() + other.buffer.len());
+        self.buffer
+            .reserve(other.centroids.len() + other.buffer.len());
         for c in other.centroids.iter().chain(other.buffer.iter()) {
             self.buffer.push(*c);
         }
@@ -355,7 +355,11 @@ impl TDigest {
                 // means (clamped to global min/max at the edges). The
                 // paper §2.4 uses neighbour means so the slope of the
                 // CDF is continuous between buckets.
-                let left_mean = if i == 0 { self.min } else { (merged[i - 1].mean + c.mean) * 0.5 };
+                let left_mean = if i == 0 {
+                    self.min
+                } else {
+                    (merged[i - 1].mean + c.mean) * 0.5
+                };
                 let right_mean = if i + 1 == merged.len() {
                     self.max
                 } else {
@@ -392,7 +396,11 @@ impl TDigest {
         // centroid, linearly interpolating cumulative weight.
         let mut cum = 0.0;
         for (i, c) in merged.iter().enumerate() {
-            let left_mean = if i == 0 { self.min } else { (merged[i - 1].mean + c.mean) * 0.5 };
+            let left_mean = if i == 0 {
+                self.min
+            } else {
+                (merged[i - 1].mean + c.mean) * 0.5
+            };
             let right_mean = if i + 1 == merged.len() {
                 self.max
             } else {
@@ -428,8 +436,7 @@ impl TDigest {
         if self.buffer.is_empty() {
             return self.centroids.clone();
         }
-        let mut v: Vec<Centroid> =
-            Vec::with_capacity(self.centroids.len() + self.buffer.len());
+        let mut v: Vec<Centroid> = Vec::with_capacity(self.centroids.len() + self.buffer.len());
         v.extend(self.centroids.iter().copied());
         v.extend(self.buffer.iter().copied());
         v.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(Ordering::Equal));

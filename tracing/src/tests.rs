@@ -348,7 +348,10 @@ fn smoke_tracing_welford_sample_variance_zero_below_2() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("tracing", smoke_tracing_welford_sample_variance_zero_below_2);
+kernel_test_in!(
+    "tracing",
+    smoke_tracing_welford_sample_variance_zero_below_2
+);
 
 fn smoke_tracing_welford_new_sentinel() -> TestResult {
     // `Welford::new()` initialises min=MAX (sentinel so the first
