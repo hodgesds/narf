@@ -10050,6 +10050,51 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// Wave-64: `timerfd_gettime(fd, &curr_value)` — snapshot the
+// currently-armed timer. Writes `itimerspec` (16 B interval +
+// 16 B value-remaining; absolute time stripped because the read
+// view is the relative gap from `now` to the next fire). Returns
+// 0 on success or -1 on a bad fd / NULL out ptr.
+//
+// Linux ref: `fs/timerfd.c`:SYSCALL_DEFINE2(timerfd_gettime, …)
+// (GPL-2.0-or-later, kernel.org).
+#[cfg(feature = "linux-compat")]
+fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let out_ptr = args.arg1 as u64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    if out_ptr == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let tfd = match timerfd_arc_from_fd(task, fd) {
+        Some(t) => t,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let (value_remaining_ns, interval_ns) = tfd.current();
+    // itimerspec = { interval: timespec, value: timespec },
+    // timespec = { tv_sec: i64, tv_nsec: i64 }.
+    let mut buf = [0u8; 32];
+    let interval_sec = (interval_ns / 1_000_000_000) as i64;
+    let interval_nsec = (interval_ns % 1_000_000_000) as i64;
+    let value_sec = (value_remaining_ns / 1_000_000_000) as i64;
+    let value_nsec = (value_remaining_ns % 1_000_000_000) as i64;
+    buf[0..8].copy_from_slice(&interval_sec.to_le_bytes());
+    buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
+    buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
+    buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+    if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 static TIMERFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::TimerFd>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -10451,6 +10496,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::TimerfdSettime,
         "timerfd_settime",
         RawFnHandler(sys_timerfd_settime),
+    );
+    #[cfg(feature = "linux-compat")]
+    table.install_raw(
+        Syscall::TimerfdGettime,
+        "timerfd_gettime",
+        RawFnHandler(sys_timerfd_gettime),
     );
     table.install_raw(Syscall::Signalfd, "signalfd", RawFnHandler(sys_signalfd));
     table.install_raw(Syscall::Tcgetattr, "tcgetattr", RawFnHandler(sys_tcgetattr));

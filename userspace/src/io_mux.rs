@@ -147,6 +147,24 @@ impl TimerFd {
         s.expirations = 0;
     }
 
+    /// Wave-64: `timerfd_gettime(2)` snapshot.
+    ///
+    /// Returns `(value_remaining_ns, interval_ns)` — the time
+    /// remaining until the next expiration and the configured
+    /// re-arm interval (0 = one-shot). Both relative.
+    ///
+    /// Linux ref: `fs/timerfd.c`:do_timerfd_gettime
+    /// (GPL-2.0-or-later, kernel.org).
+    pub fn current(&self) -> (u64, u64) {
+        let s = self.state.lock();
+        if s.next_fire_ns == 0 {
+            return (0, s.interval_ns);
+        }
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        let remaining = s.next_fire_ns.saturating_sub(now);
+        (remaining, s.interval_ns)
+    }
+
     /// Tick: if the deadline has passed, increment expirations and
     /// re-arm if periodic. Called from `read` and `poll_readiness`.
     fn tick(&self) {

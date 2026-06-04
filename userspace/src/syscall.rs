@@ -713,6 +713,11 @@ pub enum Syscall {
     /// itimerspec ptr, arg3 = old_value out (may be 0).
     TimerfdSettime,
 
+    /// Wave-64: `timerfd_gettime(fd, &curr_value)` — read the
+    /// timer's current setting. arg0 = fd, arg1 = itimerspec out
+    /// ptr (32 bytes). Linux x86_64 number 287; aarch64 87.
+    TimerfdGettime,
+
     /// `signalfd4(fd, &mask, sizemask, flags)` — receive signals
     /// via an fd. arg0 = fd (-1 = create new), arg1 = sigmask
     /// ptr, arg2 = sizemask, arg3 = flags.
@@ -1526,6 +1531,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Eventfd, 284), // eventfd / eventfd2 share name
     (Syscall::Fallocate, 285),
     (Syscall::TimerfdSettime, 286),
+    (Syscall::TimerfdGettime, 287),
     (Syscall::EpollWait, 232), // epoll_wait
     (Syscall::EpollCtl, 233),
     (Syscall::Pipe2, 293),
@@ -1599,6 +1605,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fdatasync, 83),
     (Syscall::TimerfdCreate, 85),
     (Syscall::TimerfdSettime, 86),
+    (Syscall::TimerfdGettime, 87),
     (Syscall::ExitTask, 93), // exit
     (Syscall::Unshare, 97),
     // Wave-67 — Linux aarch64 setns = 268.
