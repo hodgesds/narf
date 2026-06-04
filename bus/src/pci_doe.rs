@@ -138,7 +138,11 @@ impl Object {
         let vendor_id = (dwords[0] & 0xFFFF) as u16;
         let data_object_type = ((dwords[0] >> 16) & 0xFF) as u8;
         let len_field = dwords[1] & 0x3_FFFF;
-        let total = if len_field == 0 { 1u32 << 18 } else { len_field };
+        let total = if len_field == 0 {
+            1u32 << 18
+        } else {
+            len_field
+        };
         if total < 2 {
             return Err(DoeError::BadLength);
         }

@@ -235,9 +235,7 @@ pub unsafe fn find_aer_cap_offset(cfg_phys: u64) -> Option<u16> {
         }
         // SAFETY: caller-asserted live config space; offset
         // bounded above.
-        let header = unsafe {
-            core::ptr::read_volatile((cfg_phys + off as u64) as *const u32)
-        };
+        let header = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if header == 0 || header == u32::MAX {
             return None;
         }
@@ -504,9 +502,7 @@ pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
             return None;
         }
         // SAFETY: caller-asserted; offset bounded.
-        let hdr = unsafe {
-            core::ptr::read_volatile((cfg_phys + off as u64) as *const u32)
-        };
+        let hdr = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if hdr == 0 || hdr == 0xFFFF_FFFF {
             return None;
         }
@@ -515,9 +511,8 @@ pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
         if cap_id == DPC_CAP_ID {
             // DPC Capability register is at cap_off + 0x04 (16-bit).
             // SAFETY: same.
-            let dpc_raw = unsafe {
-                core::ptr::read_volatile((cfg_phys + off as u64 + 0x04) as *const u16)
-            };
+            let dpc_raw =
+                unsafe { core::ptr::read_volatile((cfg_phys + off as u64 + 0x04) as *const u16) };
             return Some(DpcCapability::decode(dpc_raw));
         }
         if next == 0 {
@@ -532,14 +527,11 @@ pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
 
 /// Diagnostic counters — bumped by the AER MSI handler. Exported
 /// so tests / debug commands can observe AER deliveries.
-pub static AER_FATAL_COUNT: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static AER_FATAL_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static AER_NONFATAL_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static AER_CORRECTABLE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-
-
 
 /// AER ISR — runs in IRQ context. Reads Root Error Status from
 /// every root port that carries an AER cap, increments the
@@ -557,8 +549,8 @@ pub static AER_CORRECTABLE_COUNT: core::sync::atomic::AtomicU64 =
 /// the offending downstream device). Caller routes recovery via
 /// [`crate::pcie_recovery::do_recovery`] using this aggregation.
 pub fn aer_isr() {
-    use core::sync::atomic::Ordering;
     use crate::devices;
+    use core::sync::atomic::Ordering;
     for d in devices().iter() {
         let cfg_phys = match d.kind {
             crate::BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
@@ -576,8 +568,9 @@ pub fn aer_isr() {
         // is harmless.
         // SAFETY: same.
         let sts = unsafe {
-            core::ptr::read_volatile((cfg_phys + aer + regs::ROOT_ERROR_STATUS as u64)
-                as *const u32)
+            core::ptr::read_volatile(
+                (cfg_phys + aer + regs::ROOT_ERROR_STATUS as u64) as *const u32,
+            )
         };
         if sts & root_sts::ERR_COR_RECEIVED != 0 {
             AER_CORRECTABLE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -666,14 +659,12 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
             // SAFETY: same.
             let ue = unsafe {
                 core::ptr::read_volatile(
-                    (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64)
-                        as *const u32,
+                    (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64) as *const u32,
                 )
             };
             let ce = unsafe {
                 core::ptr::read_volatile(
-                    (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64)
-                        as *const u32,
+                    (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64) as *const u32,
                 )
             };
             if ue == 0 && ce == 0 {
@@ -682,8 +673,7 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
             // SAFETY: same.
             let sev = unsafe {
                 core::ptr::read_volatile(
-                    (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_SEVERITY as u64)
-                        as *const u32,
+                    (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_SEVERITY as u64) as *const u32,
                 )
             };
             let severity = classify_uncorrectable(ue, sev);
@@ -692,8 +682,7 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
                 // SAFETY: same.
                 unsafe {
                     core::ptr::write_volatile(
-                        (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64)
-                            as *mut u32,
+                        (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64) as *mut u32,
                         ue,
                     );
                 }
@@ -702,8 +691,7 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
                 // SAFETY: same.
                 unsafe {
                     core::ptr::write_volatile(
-                        (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64)
-                            as *mut u32,
+                        (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64) as *mut u32,
                         ce,
                     );
                 }
@@ -723,8 +711,7 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
         // SAFETY: same.
         let source_id = unsafe {
             core::ptr::read_volatile(
-                (cfg_phys + aer + regs::ERROR_SOURCE_IDENTIFICATION as u64)
-                    as *const u32,
+                (cfg_phys + aer + regs::ERROR_SOURCE_IDENTIFICATION as u64) as *const u32,
             )
         };
         let severity = root_sts.ue_severity();
@@ -854,10 +841,8 @@ pub unsafe fn retrain_link_live(
     settle_step: &mut dyn FnMut(),
     timeout_polls: u32,
 ) -> bool {
-    let lnk_ctl_ptr =
-        (cfg_phys + pcie_cap_off as u64 + pcie_cap::LINK_CONTROL as u64) as *mut u16;
-    let lnk_sts_ptr =
-        (cfg_phys + pcie_cap_off as u64 + pcie_cap::LINK_STATUS as u64) as *const u16;
+    let lnk_ctl_ptr = (cfg_phys + pcie_cap_off as u64 + pcie_cap::LINK_CONTROL as u64) as *mut u16;
+    let lnk_sts_ptr = (cfg_phys + pcie_cap_off as u64 + pcie_cap::LINK_STATUS as u64) as *const u16;
     let mut read_status = || -> u16 {
         // SAFETY: caller-asserted live PCIe config; aligned 16-bit.
         unsafe { core::ptr::read_volatile(lnk_sts_ptr) }
@@ -871,5 +856,10 @@ pub unsafe fn retrain_link_live(
             core::ptr::write_volatile(lnk_ctl_ptr, new);
         }
     };
-    retrain_link(&mut read_status, &mut write_ctrl, settle_step, timeout_polls)
+    retrain_link(
+        &mut read_status,
+        &mut write_ctrl,
+        settle_step,
+        timeout_polls,
+    )
 }

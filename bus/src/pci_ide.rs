@@ -243,10 +243,13 @@ pub fn parse(buf: &[u8]) -> Result<(u8, StreamSelector, Vec<u8>), IdeError> {
     let selector = StreamSelector::decode(u16::from_le_bytes([buf[2], buf[3]]));
     let tail = buf[4..].to_vec();
     match object_id {
-        KM_OBJECT_KEY_PROG | KM_OBJECT_KP_ACK | KM_OBJECT_K_SET_GO | KM_OBJECT_K_SET_STOP
-        | KM_OBJECT_K_GOSTOP_ACK | KM_OBJECT_KEY_QUERY | KM_OBJECT_K_QUERY_RESP => {
-            Ok((object_id, selector, tail))
-        }
+        KM_OBJECT_KEY_PROG
+        | KM_OBJECT_KP_ACK
+        | KM_OBJECT_K_SET_GO
+        | KM_OBJECT_K_SET_STOP
+        | KM_OBJECT_K_GOSTOP_ACK
+        | KM_OBJECT_KEY_QUERY
+        | KM_OBJECT_K_QUERY_RESP => Ok((object_id, selector, tail)),
         other => Err(IdeError::BadObjectId(other)),
     }
 }

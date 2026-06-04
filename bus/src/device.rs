@@ -38,8 +38,7 @@ impl fmt::Debug for DeviceId {
         write!(
             f,
             "DeviceId({:04x}:{:04x}, class={:06x}, subsys={:04x}:{:04x})",
-            self.vendor, self.device, self.class,
-            self.subsystem_vendor, self.subsystem_id
+            self.vendor, self.device, self.class, self.subsystem_vendor, self.subsystem_id
         )
     }
 }

@@ -216,9 +216,7 @@ pub unsafe fn find_dpc_cap_offset(cfg_phys: u64) -> Option<u16> {
             return None;
         }
         // SAFETY: caller-asserted live config; offset bounded above.
-        let hdr = unsafe {
-            core::ptr::read_volatile((cfg_phys + off as u64) as *const u32)
-        };
+        let hdr = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if hdr == 0 || hdr == u32::MAX {
             return None;
         }
@@ -267,9 +265,7 @@ pub unsafe fn read_and_clear_status(cfg_phys: u64, dpc_off: u16) -> DpcStatus {
 pub unsafe fn read_source_id(cfg_phys: u64, dpc_off: u16) -> u16 {
     // SAFETY: caller-asserted.
     unsafe {
-        core::ptr::read_volatile(
-            (cfg_phys + dpc_off as u64 + regs::SOURCE_ID as u64) as *const u16,
-        )
+        core::ptr::read_volatile((cfg_phys + dpc_off as u64 + regs::SOURCE_ID as u64) as *const u16)
     }
 }
 
@@ -297,8 +293,7 @@ pub unsafe fn configure_dpc(cfg_phys: u64, dpc_off: u16) {
         );
         // Read-modify-write CTL: clear TRIGGER mask, then OR in EN_FATAL
         // + INT_EN.
-        let ctl_ptr =
-            (cfg_phys + dpc_off as u64 + regs::CONTROL as u64) as *mut u16;
+        let ctl_ptr = (cfg_phys + dpc_off as u64 + regs::CONTROL as u64) as *mut u16;
         let mut ctl = core::ptr::read_volatile(ctl_ptr as *const u16);
         ctl &= !ctrl::TRIGGER_MASK;
         ctl |= ctrl::EN_FATAL | ctrl::INT_EN;
@@ -314,8 +309,7 @@ pub unsafe fn configure_dpc(cfg_phys: u64, dpc_off: u16) {
 pub unsafe fn disable_dpc(cfg_phys: u64, dpc_off: u16) {
     // SAFETY: caller-asserted.
     unsafe {
-        let ctl_ptr =
-            (cfg_phys + dpc_off as u64 + regs::CONTROL as u64) as *mut u16;
+        let ctl_ptr = (cfg_phys + dpc_off as u64 + regs::CONTROL as u64) as *mut u16;
         let mut ctl = core::ptr::read_volatile(ctl_ptr as *const u16);
         ctl &= !(ctrl::EN_FATAL | ctrl::EN_NONFATAL | ctrl::INT_EN);
         core::ptr::write_volatile(ctl_ptr, ctl);

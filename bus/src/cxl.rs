@@ -142,10 +142,7 @@ pub const fn pack_command_register(opcode: u16, input_len: u32) -> u64 {
 
 /// Decode a Command register value back into (opcode, input_len).
 pub const fn unpack_command_register(reg: u64) -> (u16, u32) {
-    (
-        (reg & 0xFFFF) as u16,
-        ((reg >> 16) & 0x1F_FFFF) as u32,
-    )
+    ((reg & 0xFFFF) as u16, ((reg >> 16) & 0x1F_FFFF) as u32)
 }
 
 /// Pack the Status register value: bits 47..32 = return code, bits

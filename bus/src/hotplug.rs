@@ -382,8 +382,7 @@ pub unsafe fn find_pcie_cap_offset(cfg_phys: u64) -> Option<u8> {
             return None;
         }
         // SAFETY: offset bounded.
-        let header =
-            unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u16) };
+        let header = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u16) };
         if header == 0 || header == u16::MAX {
             return None;
         }
@@ -496,8 +495,7 @@ pub fn hotplug_isr() {
             // SAFETY: same.
             let pd_state = unsafe {
                 core::ptr::read_volatile(
-                    (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64)
-                        as *const u16,
+                    (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64) as *const u16,
                 )
             } & (1 << 6)
                 != 0;
@@ -560,8 +558,7 @@ pub unsafe fn slot_power_off(cfg_phys: u64, pcie_off: u8) {
         let cur = core::ptr::read_volatile(addr as *const u16);
         // Set POWER_CONTROLLER_OFF (bit 10) to cut power.
         // Set Power Indicator to Off (bits[9:8] = 0b11).
-        let new = (cur | slot_ctrl::POWER_CONTROLLER_OFF)
-            & !slot_ctrl::PWR_IND_MASK
+        let new = (cur | slot_ctrl::POWER_CONTROLLER_OFF) & !slot_ctrl::PWR_IND_MASK
             | slot_ctrl::PWR_IND_OFF;
         core::ptr::write_volatile(addr, new);
     }
@@ -654,4 +651,3 @@ impl SlotPolicy {
         }
     }
 }
-

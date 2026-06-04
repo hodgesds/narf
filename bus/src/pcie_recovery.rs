@@ -174,8 +174,7 @@ impl core::fmt::Debug for CallbackEntry {
     }
 }
 
-static CALLBACKS: IrqSafeSpinLock<Vec<CallbackEntry>> =
-    IrqSafeSpinLock::new(Vec::new());
+static CALLBACKS: IrqSafeSpinLock<Vec<CallbackEntry>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a driver's error callback for `bdf`. Replaces any
 /// previously registered entry. Safe to call from any context.

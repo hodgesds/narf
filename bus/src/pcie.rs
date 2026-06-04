@@ -54,11 +54,7 @@ pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
 /// # Safety
 /// `ecam_base + n_buses * 0x10_0000` must lie inside the kernel's
 /// identity map of MMIO-tolerant memory.
-pub unsafe fn enumerate_segment(
-    ecam_base: PhysAddr,
-    n_buses: u16,
-    segment: u16,
-) -> Vec<BusDevice> {
+pub unsafe fn enumerate_segment(ecam_base: PhysAddr, n_buses: u16, segment: u16) -> Vec<BusDevice> {
     let mut devices = Vec::new();
 
     for bus in 0..n_buses {

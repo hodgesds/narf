@@ -43,15 +43,15 @@ pub mod hotplug;
 pub mod msi;
 pub mod msix;
 pub mod pci;
-pub mod pcie_aer;
-pub mod pcie_dpc;
-pub mod pcie_recovery;
 pub mod pci_cap;
 pub mod pci_cap_ext;
 pub mod pci_doe;
 pub mod pci_express;
 pub mod pci_ide;
 pub mod pcie;
+pub mod pcie_aer;
+pub mod pcie_dpc;
+pub mod pcie_recovery;
 pub mod registry;
 
 pub use acpi_notify::{AcpiNotify, NotifyEvent, NotifyKind};

@@ -141,10 +141,7 @@ const PM_STATE_D3HOT: u16 = 3;
 /// Returns `Err(CapNotPresent)` if the device has no PM cap (very
 /// unusual on PCIe — every endpoint must advertise it per PCIe
 /// §7.5.2).
-pub fn pm_d3hot_cycle(
-    cap: &Cap<BusDeviceCap, Write>,
-    device: &BusDevice,
-) -> Result<(), PciError> {
+pub fn pm_d3hot_cycle(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<(), PciError> {
     cap.check_live()?;
     // SAFETY: walking the cap-list on identity-mapped PCIe ECAM.
     let pm_off = match unsafe { crate::pci_cap::find_cap(device, PM_CAP_ID) } {
@@ -160,23 +157,21 @@ pub fn pm_d3hot_cycle(
     // Enter D3hot.
     // SAFETY: same.
     unsafe {
-        cfg_write16(cfg, pmcsr_off, (cur & !PM_PMCSR_STATE_MASK) | PM_STATE_D3HOT);
+        cfg_write16(
+            cfg,
+            pmcsr_off,
+            (cur & !PM_PMCSR_STATE_MASK) | PM_STATE_D3HOT,
+        );
     }
     // PCI PM Spec §5.4: 10 ms minimum before next config access.
-    let _ = narf_scheduler::responsive_spin_until(
-        || false,
-        narf_time::Deadline::after_ms(10),
-    );
+    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(10));
     // Return to D0. The PowerState field is RW; bits 15..2 are
     // preserved so we don't clobber PME enable / data / status.
     // SAFETY: same.
     unsafe {
         cfg_write16(cfg, pmcsr_off, cur & !PM_PMCSR_STATE_MASK);
     }
-    let _ = narf_scheduler::responsive_spin_until(
-        || false,
-        narf_time::Deadline::after_ms(10),
-    );
+    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(10));
     Ok(())
 }
 
@@ -375,10 +370,7 @@ const INTERRUPT_PIN_OFFSET: u64 = 0x3D;
 /// route through the IOAPIC.
 ///
 /// Cap-gated; the cap's epoch is checked.
-pub fn read_intx_pin(
-    cap: &Cap<BusDeviceCap, Write>,
-    device: &BusDevice,
-) -> Result<u8, PciError> {
+pub fn read_intx_pin(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<u8, PciError> {
     cap.check_live()?;
     let cfg = pcie_cfg_phys(device)?;
     // SAFETY: cfg-space is identity-mapped for the lifetime of

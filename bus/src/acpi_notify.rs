@@ -18,7 +18,7 @@
 //! `Subscriber::next().await`. The previous `subscribe(cap, cb)` and
 //! `subscriber_count()` symbols no longer exist.
 
-use narf_capabilities::{Cap, CapType, CapKind, Read, Write};
+use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
 use narf_event_bus::{
     create_topic, lookup_topic, CreateError, LookupError, PublishError, Publisher, Subscriber,
     TopicRegistry,

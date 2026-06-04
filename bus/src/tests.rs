@@ -212,9 +212,7 @@ fn smoke_bus_enumerate_segment_tags_devices() -> TestResult {
     // path uses; identity-mapped. Cap the walk at 32 buses — enough
     // for QEMU q35 to surface the usual lineup without scanning the
     // whole 256-bus address space.
-    let devs = unsafe {
-        enumerate_segment(crate::x86_64::ECAM_DEFAULT_BASE, 32, 0x8765)
-    };
+    let devs = unsafe { enumerate_segment(crate::x86_64::ECAM_DEFAULT_BASE, 32, 0x8765) };
     if devs.is_empty() {
         return TestResult::Skip("no devices to enumerate");
     }
@@ -740,13 +738,16 @@ fn smoke_aer_correctable_bits_at_documented_positions() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bus/aer", smoke_aer_correctable_bits_at_documented_positions);
+kernel_test_in!(
+    "bus/aer",
+    smoke_aer_correctable_bits_at_documented_positions
+);
 
 fn smoke_aer_listener_dispatch_round_trip() -> TestResult {
     use crate::addr::BusAddr;
     use crate::pci_cap_ext::{
-        __clear_aer_listeners, aer_listener_count, dispatch_aer, register_aer_listener,
-        AerEvent, AerListener, AerSeverity,
+        __clear_aer_listeners, aer_listener_count, dispatch_aer, register_aer_listener, AerEvent,
+        AerListener, AerSeverity,
     };
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -969,7 +970,10 @@ fn smoke_ide_set_go_set_stop_layout() -> TestResult {
     use crate::pci_ide::{
         k_set_go, k_set_stop, StreamSelector, KM_OBJECT_K_SET_GO, KM_OBJECT_K_SET_STOP,
     };
-    let s = StreamSelector { stream_id: 3, ..Default::default() };
+    let s = StreamSelector {
+        stream_id: 3,
+        ..Default::default()
+    };
     let go = k_set_go(s);
     let stop = k_set_stop(s);
     if go[0] != KM_OBJECT_K_SET_GO {
@@ -1145,14 +1149,9 @@ fn smoke_cxl_dvsec_vendor_constant() -> TestResult {
 }
 kernel_test_in!("bus/cxl", smoke_cxl_dvsec_vendor_constant);
 
-
-
 // ── PCIe AER ──────────────────────────────────────────────────────
 
-
-
 fn smoke_aer_ext_cap_header_decode() -> TestResult {
-
     use crate::pcie_aer::{ExtCapHeader, AER_CAP_ID};
 
     let raw = (AER_CAP_ID as u32) | (2u32 << 16) | (0x180u32 << 20);
@@ -1160,69 +1159,52 @@ fn smoke_aer_ext_cap_header_decode() -> TestResult {
     let h = ExtCapHeader::decode(raw);
 
     if !h.is_aer() || h.cap_version != 2 || h.next_ptr != 0x180 {
-
         return TestResult::Fail("AER ext-cap header decode");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("bus/pcie-aer", smoke_aer_ext_cap_header_decode);
 
-
-
 fn smoke_aer_classify_uncorrectable() -> TestResult {
-
     use crate::pcie_aer::{classify_uncorrectable, ue, UeSeverity};
 
     if classify_uncorrectable(0, ue::DEFAULT_SEVERE) != UeSeverity::None {
-
         return TestResult::Fail("empty status");
-
     }
 
     let cur = ue::COMPLETION_TIMEOUT;
 
     if classify_uncorrectable(cur, ue::DEFAULT_SEVERE) != UeSeverity::NonFatal {
-
         return TestResult::Fail("completion timeout default = non-fatal");
-
     }
 
     let cur = ue::MALFORMED_TLP;
 
     if classify_uncorrectable(cur, ue::DEFAULT_SEVERE) != UeSeverity::Severe {
-
         return TestResult::Fail("malformed TLP default = severe");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("bus/pcie-aer", smoke_aer_classify_uncorrectable);
 
-
-
 fn smoke_aer_header_log_decodes_le() -> TestResult {
-
     use crate::pcie_aer::HeaderLog;
 
-    let raw = [0x78, 0x56, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0];
+    let raw = [
+        0x78, 0x56, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
 
     let h = HeaderLog::decode(&raw);
 
     if h.0[0] != 0x12345678 || h.0[1] != 0xDEADBEEF {
-
         return TestResult::Fail("LE header-log decode");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("bus/pcie-aer", smoke_aer_header_log_decodes_le);
@@ -1364,13 +1346,13 @@ fn smoke_msix_program_block() -> TestResult {
 kernel_test_in!("bus", smoke_msix_program_block);
 
 fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::hotplug::{
         __clear_listeners, dispatch_event, install_default_dispatcher, listener_count,
         HotplugEvent, HotplugListener,
     };
     use crate::{BusAddr, DeviceId, PcieAddr};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     __clear_listeners();
     if listener_count() != 0 {
@@ -1508,8 +1490,8 @@ fn smoke_bus_pcie_aer_cap_walker() -> TestResult {
     // mask) by asserting the walker terminates and returns
     // either a sane cap offset or None for every device.
     use crate::pcie_aer::find_aer_cap_offset;
-    use crate::{devices, BusKind};
     use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{devices, BusKind};
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut walked = 0u32;
@@ -1609,11 +1591,19 @@ kernel_test_in!("bus/pcie_aer", smoke_aer_ext_cap_header_round_trip_full);
 fn smoke_aer_is_aer_classifier() -> TestResult {
     // Only AER_CAP_ID (0x0001) classifies as AER.
     use crate::pcie_aer::{ExtCapHeader, AER_CAP_ID};
-    let aer = ExtCapHeader { cap_id: AER_CAP_ID, cap_version: 1, next_ptr: 0 };
+    let aer = ExtCapHeader {
+        cap_id: AER_CAP_ID,
+        cap_version: 1,
+        next_ptr: 0,
+    };
     if !aer.is_aer() {
         return TestResult::Fail("AER header not classified as AER");
     }
-    let not_aer = ExtCapHeader { cap_id: 0x0008, cap_version: 1, next_ptr: 0 };
+    let not_aer = ExtCapHeader {
+        cap_id: 0x0008,
+        cap_version: 1,
+        next_ptr: 0,
+    };
     if not_aer.is_aer() {
         return TestResult::Fail("non-AER cap classified as AER");
     }
@@ -1647,10 +1637,8 @@ fn smoke_aer_header_log_decodes_le_words() -> TestResult {
     // 16-byte raw → 4 little-endian u32 words.
     use crate::pcie_aer::HeaderLog;
     let raw: [u8; 16] = [
-        0x01, 0x00, 0x00, 0x00,
-        0xFF, 0xFF, 0xFF, 0xFF,
-        0x00, 0x01, 0x02, 0x03,
-        0x04, 0x05, 0x06, 0x07,
+        0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07,
     ];
     let log = HeaderLog::decode(&raw);
     if log.0 != [1, u32::MAX, 0x0302_0100, 0x0706_0504] {
@@ -1671,10 +1659,7 @@ fn smoke_aer_msi_number_decodes_top_5_bits() -> TestResult {
     for &(raw, want) in pins {
         let got = aer_msi_number(raw);
         if got != want {
-            let msg = alloc::format!(
-                "aer_msi_number({:#x}) = {} (expected {})",
-                raw, got, want
-            );
+            let msg = alloc::format!("aer_msi_number({:#x}) = {} (expected {})", raw, got, want);
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
         }
@@ -1715,7 +1700,12 @@ fn smoke_pci_command_bits_layout() -> TestResult {
         return TestResult::Fail("INTX_DISABLE bit drifted from 10");
     }
     // All four bits must be pairwise distinct.
-    let all = [cmd::IO_SPACE, cmd::MEM_SPACE, cmd::BUS_MASTER, cmd::INTX_DISABLE];
+    let all = [
+        cmd::IO_SPACE,
+        cmd::MEM_SPACE,
+        cmd::BUS_MASTER,
+        cmd::INTX_DISABLE,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -1764,7 +1754,13 @@ fn smoke_pci_requester_id_packs_bdf() -> TestResult {
                 addr: crate::addr::PcieAddr::new(0, bus, device, function),
                 cfg_phys: narf_memory::PhysAddr::new(0),
             },
-            id: crate::device::DeviceId { vendor: 0, device: 0, class: 0 , subsystem_vendor: 0, subsystem_id: 0 },
+            id: crate::device::DeviceId {
+                vendor: 0,
+                device: 0,
+                class: 0,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
+            },
             addr: crate::addr::BusAddr::Pcie(crate::addr::PcieAddr::new(0, bus, device, function)),
         }
     }
@@ -1793,8 +1789,18 @@ fn smoke_pci_requester_id_none_for_non_pcie() -> TestResult {
     let phys = narf_memory::PhysAddr::new(0xFF00_0000);
     let dev = BusDevice {
         addr: BusAddr::Mmio(phys),
-        id: DeviceId { vendor: 0, device: 0, class: 0 , subsystem_vendor: 0, subsystem_id: 0 },
-        kind: BusKind::VirtioMmio { base: phys, len: 0x200, device_id: 1 },
+        id: DeviceId {
+            vendor: 0,
+            device: 0,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::VirtioMmio {
+            base: phys,
+            len: 0x200,
+            device_id: 1,
+        },
     };
     if requester_id(&dev).is_some() {
         return TestResult::Fail("requester_id returned Some for virtio-mmio");
@@ -1816,8 +1822,17 @@ fn smoke_pci_read_command_revoked_cap_rejected() -> TestResult {
     let pcie = PcieAddr::new(0, 0, 0, 0);
     let dev = BusDevice {
         addr: BusAddr::Pcie(pcie),
-        id: DeviceId { vendor: 0, device: 0, class: 0 , subsystem_vendor: 0, subsystem_id: 0 },
-        kind: BusKind::Pcie { addr: pcie, cfg_phys: narf_memory::PhysAddr::new(0) },
+        id: DeviceId {
+            vendor: 0,
+            device: 0,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr: pcie,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
     };
     match read_command(&cap, &dev) {
         Err(PciError::AuthorityRevoked) => TestResult::Pass,
@@ -1844,8 +1859,8 @@ kernel_test_in!("bus/hotplug", smoke_hotplug_error_variants_distinct);
 fn smoke_hotplug_register_rejects_revoked_authority() -> TestResult {
     use crate::hotplug::{register_listener, HotplugError, HotplugEvent, HotplugListener};
     use crate::registry::BusRegistryCap;
-    use narf_capabilities::{Cap, Grant};
     use alloc::sync::Arc;
+    use narf_capabilities::{Cap, Grant};
 
     struct NoOp;
     impl HotplugListener for NoOp {
@@ -1859,7 +1874,10 @@ fn smoke_hotplug_register_rejects_revoked_authority() -> TestResult {
         _ => TestResult::Fail("revoked authority didn't surface AuthorityRevoked"),
     }
 }
-kernel_test_in!("bus/hotplug", smoke_hotplug_register_rejects_revoked_authority);
+kernel_test_in!(
+    "bus/hotplug",
+    smoke_hotplug_register_rejects_revoked_authority
+);
 
 fn smoke_hotplug_dispatch_fans_out_to_listeners() -> TestResult {
     use crate::addr::{BusAddr, PcieAddr};
@@ -1869,9 +1887,9 @@ fn smoke_hotplug_dispatch_fans_out_to_listeners() -> TestResult {
         __clear_listeners,
     };
     use crate::registry::BusRegistryCap;
-    use narf_capabilities::{Cap, Grant};
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Grant};
 
     static ATTACH_HITS: AtomicU32 = AtomicU32::new(0);
     static DETACH_HITS: AtomicU32 = AtomicU32::new(0);
@@ -1906,8 +1924,17 @@ fn smoke_hotplug_dispatch_fans_out_to_listeners() -> TestResult {
     }
 
     let addr = BusAddr::Pcie(PcieAddr::new(0, 1, 2, 3));
-    let id = DeviceId { vendor: 0x1B36, device: 0x0010, class: 0x010802, subsystem_vendor: 0, subsystem_id: 0 };
-    dispatch_event(HotplugEvent::Attach { addr, device_id: id });
+    let id = DeviceId {
+        vendor: 0x1B36,
+        device: 0x0010,
+        class: 0x010802,
+        subsystem_vendor: 0,
+        subsystem_id: 0,
+    };
+    dispatch_event(HotplugEvent::Attach {
+        addr,
+        device_id: id,
+    });
     if ATTACH_HITS.load(Ordering::Relaxed) != 2 {
         return TestResult::Fail("Attach didn't fan out to both listeners");
     }
@@ -1929,8 +1956,17 @@ fn smoke_hotplug_event_variants_distinct() -> TestResult {
     use crate::device::DeviceId;
     use crate::hotplug::HotplugEvent;
     let addr = BusAddr::Pcie(PcieAddr::new(0, 0, 0, 0));
-    let id = DeviceId { vendor: 0, device: 0, class: 0, subsystem_vendor: 0, subsystem_id: 0 };
-    let a = HotplugEvent::Attach { addr, device_id: id };
+    let id = DeviceId {
+        vendor: 0,
+        device: 0,
+        class: 0,
+        subsystem_vendor: 0,
+        subsystem_id: 0,
+    };
+    let a = HotplugEvent::Attach {
+        addr,
+        device_id: id,
+    };
     let d = HotplugEvent::Detach { addr };
     if a == d {
         return TestResult::Fail("Attach == Detach");
@@ -2072,9 +2108,7 @@ kernel_test_in!("bus/hotplug", smoke_presence_detect_debounce_in_range);
 fn smoke_slot_policy_from_caps() -> TestResult {
     // SlotPolicy correctly inherits power-ctrl flag from SlotCaps.
     use crate::hotplug::{slot_cap, SlotCaps, SlotPolicy};
-    let with_pwr = SlotCaps::decode(
-        slot_cap::HOT_PLUG_CAPABLE | slot_cap::POWER_CONTROLLER,
-    );
+    let with_pwr = SlotCaps::decode(slot_cap::HOT_PLUG_CAPABLE | slot_cap::POWER_CONTROLLER);
     let p = SlotPolicy::from_caps(0xDEAD_0000, 0x70, &with_pwr);
     if !p.has_power_ctrl {
         return TestResult::Fail("has_power_ctrl not propagated");
@@ -2247,19 +2281,13 @@ fn smoke_recovery_merge_result_lattice() -> TestResult {
     if merge_result(PciErsResult::Recovered, PciErsResult::None) != PciErsResult::Recovered {
         return TestResult::Fail("None should pass through");
     }
-    if merge_result(PciErsResult::CanRecover, PciErsResult::NeedReset)
-        != PciErsResult::NeedReset
-    {
+    if merge_result(PciErsResult::CanRecover, PciErsResult::NeedReset) != PciErsResult::NeedReset {
         return TestResult::Fail("CanRecover -> NeedReset");
     }
-    if merge_result(PciErsResult::Disconnect, PciErsResult::NeedReset)
-        != PciErsResult::NeedReset
-    {
+    if merge_result(PciErsResult::Disconnect, PciErsResult::NeedReset) != PciErsResult::NeedReset {
         return TestResult::Fail("Disconnect upgrades to NeedReset");
     }
-    if merge_result(PciErsResult::Disconnect, PciErsResult::Recovered)
-        != PciErsResult::Disconnect
-    {
+    if merge_result(PciErsResult::Disconnect, PciErsResult::Recovered) != PciErsResult::Disconnect {
         return TestResult::Fail("Disconnect should not downgrade to Recovered");
     }
     TestResult::Pass
@@ -2421,9 +2449,7 @@ fn smoke_aer_isr_aggregates_counters() -> TestResult {
     // QEMU, but we CAN assert that the ISR walks without panicking and
     // that the counters are monotonic (i.e. the W1C write doesn't
     // corrupt them).
-    use crate::pcie_aer::{
-        aer_isr, AER_CORRECTABLE_COUNT, AER_FATAL_COUNT, AER_NONFATAL_COUNT,
-    };
+    use crate::pcie_aer::{aer_isr, AER_CORRECTABLE_COUNT, AER_FATAL_COUNT, AER_NONFATAL_COUNT};
     use core::sync::atomic::Ordering;
     // Snapshot counters, run ISR, verify no decrease.
     let c0 = AER_CORRECTABLE_COUNT.load(Ordering::Relaxed);

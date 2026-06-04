@@ -409,12 +409,11 @@ pub fn clear_aer_status(
     let read_cap: Cap<BusDeviceCap, Read> = cap
         .derive::<Read>()
         .map_err(|_| AerWriteError::AuthorityRevoked)?;
-    let hdr = match find_cap(&read_cap, device, id::AER)
-        .map_err(|_| AerWriteError::AuthorityRevoked)?
-    {
-        Some(h) => h,
-        None => return Err(AerWriteError::NoAer),
-    };
+    let hdr =
+        match find_cap(&read_cap, device, id::AER).map_err(|_| AerWriteError::AuthorityRevoked)? {
+            Some(h) => h,
+            None => return Err(AerWriteError::NoAer),
+        };
     let off = if correctable {
         aer_off::CORR_STATUS
     } else {
@@ -445,12 +444,11 @@ pub fn set_aer_mask(
     let read_cap: Cap<BusDeviceCap, Read> = cap
         .derive::<Read>()
         .map_err(|_| AerWriteError::AuthorityRevoked)?;
-    let hdr = match find_cap(&read_cap, device, id::AER)
-        .map_err(|_| AerWriteError::AuthorityRevoked)?
-    {
-        Some(h) => h,
-        None => return Err(AerWriteError::NoAer),
-    };
+    let hdr =
+        match find_cap(&read_cap, device, id::AER).map_err(|_| AerWriteError::AuthorityRevoked)? {
+            Some(h) => h,
+            None => return Err(AerWriteError::NoAer),
+        };
     let off = if correctable {
         aer_off::CORR_MASK
     } else {
@@ -478,12 +476,11 @@ pub fn set_aer_severity(
     let read_cap: Cap<BusDeviceCap, Read> = cap
         .derive::<Read>()
         .map_err(|_| AerWriteError::AuthorityRevoked)?;
-    let hdr = match find_cap(&read_cap, device, id::AER)
-        .map_err(|_| AerWriteError::AuthorityRevoked)?
-    {
-        Some(h) => h,
-        None => return Err(AerWriteError::NoAer),
-    };
+    let hdr =
+        match find_cap(&read_cap, device, id::AER).map_err(|_| AerWriteError::AuthorityRevoked)? {
+            Some(h) => h,
+            None => return Err(AerWriteError::NoAer),
+        };
     // SAFETY: same as above.
     unsafe {
         cfg_write32(cfg, hdr.offset + aer_off::UNCORR_SEVERITY, severity);
@@ -895,8 +892,8 @@ pub struct PasidStatus {
 
 impl PasidStatus {
     pub fn max_pasid_width(&self) -> u8 {
-        ((self.capability & pasid_cap::MAX_PASID_WIDTH_MASK)
-            >> pasid_cap::MAX_PASID_WIDTH_SHIFT) as u8
+        ((self.capability & pasid_cap::MAX_PASID_WIDTH_MASK) >> pasid_cap::MAX_PASID_WIDTH_SHIFT)
+            as u8
     }
     pub fn enabled(&self) -> bool {
         self.control & pasid_ctrl::ENABLE != 0
@@ -947,7 +944,7 @@ mod ext_cap_codec_tests {
 
     fn smoke_ats_field_decode() -> TestResult {
         let s = AtsStatus {
-            capability: 0x0008, // Invalidate Queue Depth = 8
+            capability: 0x0008,                 // Invalidate Queue Depth = 8
             control: ats_ctrl::ENABLE | 0x0004, // STU=4, enabled
         };
         if s.invalidate_queue_depth() != 8 {
@@ -969,8 +966,7 @@ mod ext_cap_codec_tests {
             | (4u16 << acs_cap::ECV_SIZE_SHIFT);
         let s = AcsStatus {
             capability: cap_word,
-            control: acs_ctrl::P2P_REQUEST_REDIRECT_EN
-                | acs_ctrl::P2P_COMPLETION_REDIRECT_EN,
+            control: acs_ctrl::P2P_REQUEST_REDIRECT_EN | acs_ctrl::P2P_COMPLETION_REDIRECT_EN,
         };
         if !s.p2p_isolation_enabled() {
             return TestResult::Fail("P2P isolation should be enabled");
