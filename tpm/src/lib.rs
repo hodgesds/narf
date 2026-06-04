@@ -340,7 +340,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("tpm/commands", smoke_tpm_command_builder_writes_size_in_header);
+    kernel_test_in!(
+        "tpm/commands",
+        smoke_tpm_command_builder_writes_size_in_header
+    );
 
     fn smoke_tpm_command_builder_pcr_read_encodes_selection() -> TestResult {
         use crate::commands::{CommandBuilder, CommandCode};
@@ -377,7 +380,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("tpm/commands", smoke_tpm_command_builder_pcr_read_encodes_selection);
+    kernel_test_in!(
+        "tpm/commands",
+        smoke_tpm_command_builder_pcr_read_encodes_selection
+    );
 
     fn smoke_tpm_command_builder_pcr_extend_carries_digest() -> TestResult {
         use crate::commands::{CommandBuilder, CommandCode};
@@ -415,7 +421,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("tpm/commands", smoke_tpm_command_builder_pcr_extend_carries_digest);
+    kernel_test_in!(
+        "tpm/commands",
+        smoke_tpm_command_builder_pcr_extend_carries_digest
+    );
 
     fn smoke_tpm_response_parser_rejects_short_buf() -> TestResult {
         use crate::commands::ResponseParser;
@@ -503,7 +512,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("tpm/commands", smoke_tpm_response_parser_get_random_decodes_tail);
+    kernel_test_in!(
+        "tpm/commands",
+        smoke_tpm_response_parser_get_random_decodes_tail
+    );
 
     // ── deep tpm/types coverage ───────────────────────────────────────
 
@@ -537,7 +549,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("tpm/types", smoke_tpm_types_pcr_set_contains_walks_full_range);
+    kernel_test_in!(
+        "tpm/types",
+        smoke_tpm_types_pcr_set_contains_walks_full_range
+    );
 
     fn smoke_tpm_error_variants_distinct() -> TestResult {
         use crate::types::{TpmError, TpmRc};
@@ -658,7 +673,9 @@ mod tests {
     );
 
     fn smoke_tpm_crb_run_command_surfaces_error_bit() -> TestResult {
-        use crate::crb::{run_command, CrbError, MockCrb, CTRL_STS_ERROR, REG_CTRL_START, REG_CTRL_STS};
+        use crate::crb::{
+            run_command, CrbError, MockCrb, CTRL_STS_ERROR, REG_CTRL_START, REG_CTRL_STS,
+        };
         let mut m = MockCrb::new();
         m.regs[REG_CTRL_STS / 4] = CTRL_STS_ERROR | 0x1234_0000; // error bit + diagnostic bits
         m.install_hook(REG_CTRL_START, |regs| {

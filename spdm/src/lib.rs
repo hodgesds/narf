@@ -357,7 +357,12 @@ mod tests {
 
     fn smoke_spdm_messages_header_encode_decode_round_trip() -> TestResult {
         use crate::messages::SpdmHeader;
-        let h = SpdmHeader { version: 0x12, code: 0x84, param1: 0xAA, param2: 0xBB };
+        let h = SpdmHeader {
+            version: 0x12,
+            code: 0x84,
+            param1: 0xAA,
+            param2: 0xBB,
+        };
         let mut buf = alloc::vec::Vec::new();
         h.encode(&mut buf);
         if buf.len() != 4 {
@@ -372,7 +377,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("spdm/messages", smoke_spdm_messages_header_encode_decode_round_trip);
+    kernel_test_in!(
+        "spdm/messages",
+        smoke_spdm_messages_header_encode_decode_round_trip
+    );
 
     fn smoke_spdm_messages_header_short_buf_rejected() -> TestResult {
         use crate::messages::SpdmHeader;
@@ -384,7 +392,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("spdm/messages", smoke_spdm_messages_header_short_buf_rejected);
+    kernel_test_in!(
+        "spdm/messages",
+        smoke_spdm_messages_header_short_buf_rejected
+    );
 
     fn smoke_spdm_messages_request_response_codes_distinct() -> TestResult {
         use crate::messages::{ErrorCode, RequestCode, ResponseCode};
@@ -433,7 +444,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("spdm/messages", smoke_spdm_messages_request_response_codes_distinct);
+    kernel_test_in!(
+        "spdm/messages",
+        smoke_spdm_messages_request_response_codes_distinct
+    );
 
     fn smoke_spdm_messages_get_capabilities_layout() -> TestResult {
         use crate::messages::GetCapabilitiesRequest;
@@ -474,7 +488,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("spdm/messages", smoke_spdm_messages_get_measurements_carries_zero_nonce);
+    kernel_test_in!(
+        "spdm/messages",
+        smoke_spdm_messages_get_measurements_carries_zero_nonce
+    );
 
     fn smoke_spdm_messages_get_version_pins_to_v10() -> TestResult {
         // GET_VERSION must always carry version=0x10 per DSP0274; the

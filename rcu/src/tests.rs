@@ -435,7 +435,9 @@ fn smoke_rcu_atomic_compare_and_set_success() -> TestResult {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary(u32);
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     DROPS.store(0, Ordering::Relaxed);
 
@@ -479,7 +481,9 @@ fn smoke_rcu_atomic_compare_and_set_failure_returns_owned() -> TestResult {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     DROPS.store(0, Ordering::Relaxed);
 
@@ -510,7 +514,10 @@ fn smoke_rcu_atomic_compare_and_set_failure_returns_owned() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("rcu", smoke_rcu_atomic_compare_and_set_failure_returns_owned);
+kernel_test_in!(
+    "rcu",
+    smoke_rcu_atomic_compare_and_set_failure_returns_owned
+);
 
 fn smoke_rcu_owned_drops_immediately_if_unpublished() -> TestResult {
     // `Owned::new(...)` without store/CAS just drops the inner Box
@@ -521,7 +528,9 @@ fn smoke_rcu_owned_drops_immediately_if_unpublished() -> TestResult {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     DROPS.store(0, Ordering::Relaxed);
     {
@@ -545,16 +554,18 @@ fn smoke_rcu_qsbr_multiple_defers_same_epoch_all_reclaim() -> TestResult {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     DROPS.store(0, Ordering::Relaxed);
 
     let cell: Atomic<Canary> = Atomic::new(Canary);
     {
         let g = crate::pin();
-        cell.store(Owned::new(Canary), &g);  // displaces #1
-        cell.store(Owned::new(Canary), &g);  // displaces #2
-        cell.store(Owned::new(Canary), &g);  // displaces #3
+        cell.store(Owned::new(Canary), &g); // displaces #1
+        cell.store(Owned::new(Canary), &g); // displaces #2
+        cell.store(Owned::new(Canary), &g); // displaces #3
     }
     if DROPS.load(Ordering::Relaxed) != 0 {
         return TestResult::Fail("displaced values reclaimed before sync");
@@ -577,7 +588,9 @@ fn smoke_rcu_qsbr_defer_drop_while_pinned_waits() -> TestResult {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     DROPS.store(0, Ordering::Relaxed);
 
@@ -684,7 +697,9 @@ fn smoke_rcu_batched_two_flushes_track_totals() -> TestResult {
     let r = BatchedReclaimer::new(0);
 
     for _ in 0..5 {
-        let _ = r.submit(|| { N.fetch_add(1, Ordering::Relaxed); });
+        let _ = r.submit(|| {
+            N.fetch_add(1, Ordering::Relaxed);
+        });
     }
     r.flush();
     if N.load(Ordering::Relaxed) != 5 || r.pending() != 0 {
@@ -692,7 +707,9 @@ fn smoke_rcu_batched_two_flushes_track_totals() -> TestResult {
     }
 
     for _ in 0..7 {
-        let _ = r.submit(|| { N.fetch_add(1, Ordering::Relaxed); });
+        let _ = r.submit(|| {
+            N.fetch_add(1, Ordering::Relaxed);
+        });
     }
     r.flush();
     if N.load(Ordering::Relaxed) != 12 {
@@ -718,7 +735,9 @@ fn smoke_rcu_batched_pending_tracks_unflushed() -> TestResult {
     N.store(0, Ordering::Relaxed);
     let r = BatchedReclaimer::new(0);
     for _ in 0..3 {
-        let _ = r.submit(|| { N.fetch_add(1, Ordering::Relaxed); });
+        let _ = r.submit(|| {
+            N.fetch_add(1, Ordering::Relaxed);
+        });
     }
     if r.pending() != 3 {
         return TestResult::Fail("pending didn't track three submits");

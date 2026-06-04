@@ -211,7 +211,7 @@ mod arch_syscalls {
     pub const SYS_EPOLL_WAIT: u64 = 22;
     pub const SYS_DUP: u64 = 23;
     pub const SYS_DUP3: u64 = 24;
-    pub const SYS_DUP2: u64 = 24;        // aarch64 has no separate dup2
+    pub const SYS_DUP2: u64 = 24; // aarch64 has no separate dup2
     pub const SYS_FCNTL: u64 = 25;
     pub const SYS_FLOCK: u64 = 32;
     pub const SYS_MKDIRAT: u64 = 34;
@@ -230,22 +230,22 @@ mod arch_syscalls {
     pub const SYS_FCHOWNAT: u64 = 54;
     pub const SYS_FCHOWN: u64 = 55;
     pub const SYS_OPENAT: u64 = 56;
-    pub const SYS_OPEN: u64 = 56;        // legacy open → openat
+    pub const SYS_OPEN: u64 = 56; // legacy open → openat
     pub const SYS_CLOSE: u64 = 57;
     pub const SYS_PIPE2: u64 = 59;
-    pub const SYS_PIPE: u64 = 59;        // legacy pipe → pipe2
+    pub const SYS_PIPE: u64 = 59; // legacy pipe → pipe2
     pub const SYS_GETDENTS64: u64 = 61;
     pub const SYS_LSEEK: u64 = 62;
     pub const SYS_READ: u64 = 63;
     pub const SYS_WRITE: u64 = 64;
     pub const SYS_PREAD64: u64 = 67;
     pub const SYS_PWRITE64: u64 = 68;
-    pub const SYS_POLL: u64 = 73;        // ppoll
+    pub const SYS_POLL: u64 = 73; // ppoll
     pub const SYS_SIGNALFD: u64 = 74;
     pub const SYS_READLINKAT: u64 = 78;
     pub const SYS_NEWFSTATAT: u64 = 79;
     pub const SYS_FSTAT: u64 = 80;
-    pub const SYS_STAT: u64 = 79;        // legacy stat → newfstatat
+    pub const SYS_STAT: u64 = 79; // legacy stat → newfstatat
     pub const SYS_LSTAT: u64 = 79;
     pub const SYS_FSYNC: u64 = 82;
     pub const SYS_FDATASYNC: u64 = 83;
@@ -308,7 +308,7 @@ mod arch_syscalls {
     pub const SYS_BRK: u64 = 214;
     pub const SYS_MUNMAP: u64 = 215;
     pub const SYS_CLONE: u64 = 220;
-    pub const SYS_FORK: u64 = 220;       // aarch64 has no separate fork
+    pub const SYS_FORK: u64 = 220; // aarch64 has no separate fork
     pub const SYS_EXECVE: u64 = 221;
     pub const SYS_MMAP: u64 = 222;
     pub const SYS_MPROTECT: u64 = 226;
@@ -319,16 +319,16 @@ mod arch_syscalls {
     pub const SYS_GETRANDOM: u64 = 278;
     pub const SYS_MEMFD_CREATE: u64 = 279;
     pub const SYS_COPY_FILE_RANGE: u64 = 285;
-    pub const SYS_ACCESS: u64 = 48;      // aarch64: legacy access → faccessat
-    pub const SYS_UNLINK: u64 = 35;      // legacy unlink → unlinkat
-    pub const SYS_RENAME: u64 = 38;      // legacy rename → renameat
-    pub const SYS_MKDIR: u64 = 34;       // legacy mkdir → mkdirat
-    pub const SYS_RMDIR: u64 = 35;       // legacy rmdir → unlinkat (with AT_REMOVEDIR)
-    pub const SYS_SYMLINK: u64 = 36;     // legacy symlink → symlinkat
-    pub const SYS_READLINK: u64 = 78;    // legacy readlink → readlinkat
-    pub const SYS_CHMOD: u64 = 53;       // legacy chmod → fchmodat
-    pub const SYS_CHOWN: u64 = 54;       // legacy chown → fchownat
-    pub const SYS_TRUNCATE: u64 = 45;    // aarch64 has truncate at 45
+    pub const SYS_ACCESS: u64 = 48; // aarch64: legacy access → faccessat
+    pub const SYS_UNLINK: u64 = 35; // legacy unlink → unlinkat
+    pub const SYS_RENAME: u64 = 38; // legacy rename → renameat
+    pub const SYS_MKDIR: u64 = 34; // legacy mkdir → mkdirat
+    pub const SYS_RMDIR: u64 = 35; // legacy rmdir → unlinkat (with AT_REMOVEDIR)
+    pub const SYS_SYMLINK: u64 = 36; // legacy symlink → symlinkat
+    pub const SYS_READLINK: u64 = 78; // legacy readlink → readlinkat
+    pub const SYS_CHMOD: u64 = 53; // legacy chmod → fchmodat
+    pub const SYS_CHOWN: u64 = 54; // legacy chown → fchownat
+    pub const SYS_TRUNCATE: u64 = 45; // aarch64 has truncate at 45
     pub const SYS_FTRUNCATE: u64 = 46;
 }
 
@@ -886,7 +886,14 @@ pub fn tgkill(tgid: i64, tid: u64, signum: u32) -> i32 {
 /// `uaddr` must be a valid u32 address in the calling task's AS.
 #[inline]
 pub fn futex_wait(uaddr: u64, expected: u32, timeout_ns: u64) -> i64 {
-    futex(uaddr as *mut u32, 0 /* FUTEX_WAIT */, expected, timeout_ns, 0, 0)
+    futex(
+        uaddr as *mut u32,
+        0, /* FUTEX_WAIT */
+        expected,
+        timeout_ns,
+        0,
+        0,
+    )
 }
 
 /// `futex_wake(uaddr, n)` — wake up to `n` waiters parked on
@@ -1370,12 +1377,7 @@ pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), ()> {
 /// `status` and `rusage` must be either null or valid writable
 /// pointers in the calling task's AS for the duration of the call.
 #[inline]
-pub unsafe fn wait4(
-    pid: i64,
-    status: *mut i32,
-    options: u32,
-    rusage: *mut u8,
-) -> Result<i64, ()> {
+pub unsafe fn wait4(pid: i64, status: *mut i32, options: u32, rusage: *mut u8) -> Result<i64, ()> {
     // SAFETY: SYS_WAIT4 4-arg signature.
     let r = unsafe {
         syscall4(
@@ -1451,8 +1453,7 @@ pub unsafe fn execve(
 /// the duration of the call.
 #[inline]
 pub unsafe fn mount(source: &str, target: &str, fstype: &str) -> Result<(), ()> {
-    let packed_fstype =
-        ((fstype.as_ptr() as u64) << 32) | (fstype.len() as u64 & 0xFFFF_FFFF);
+    let packed_fstype = ((fstype.as_ptr() as u64) << 32) | (fstype.len() as u64 & 0xFFFF_FFFF);
     // SAFETY: SYS_MOUNT 5-arg signature.
     let r = unsafe {
         syscall5(
@@ -1464,7 +1465,11 @@ pub unsafe fn mount(source: &str, target: &str, fstype: &str) -> Result<(), ()> 
             packed_fstype,
         )
     };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// `umount2(target, flags)` — unmount the filesystem at `target`.
@@ -1484,7 +1489,11 @@ pub unsafe fn umount2(target: &str, flags: u32) -> Result<(), ()> {
             flags as u64,
         )
     };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// `statfs(path, &buf)` — fill `buf` with stats about the FS
@@ -1505,7 +1514,11 @@ pub unsafe fn statfs(path: &str, buf: *mut u8) -> Result<(), ()> {
             buf as u64,
         )
     };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// `sigreturn(sc_vaddr)` — restore the trap context from the
@@ -1570,9 +1583,7 @@ pub unsafe fn syscall3_raw(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
 /// ready events, 0 on timeout, -1 on error.
 #[inline]
 pub fn poll(pollfds: *mut u8, n: usize, timeout_ms: i32) -> i32 {
-    let r = unsafe {
-        syscall3(SYS_POLL, pollfds as u64, n as u64, timeout_ms as i64 as u64)
-    };
+    let r = unsafe { syscall3(SYS_POLL, pollfds as u64, n as u64, timeout_ms as i64 as u64) };
     r as i32
 }
 
@@ -1585,7 +1596,13 @@ pub fn epoll_create(flags: u32) -> i32 {
 #[inline]
 pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event: *const u8) -> i32 {
     let r = unsafe {
-        syscall4(SYS_EPOLL_CTL, epfd as u64, op as u64, fd as u64, event as u64)
+        syscall4(
+            SYS_EPOLL_CTL,
+            epfd as u64,
+            op as u64,
+            fd as u64,
+            event as u64,
+        )
     };
     r as i32
 }
@@ -1617,12 +1634,7 @@ pub fn timerfd_create(clockid: u32, flags: u32) -> i32 {
 }
 
 #[inline]
-pub fn timerfd_settime(
-    fd: i32,
-    flags: u32,
-    new_value: *const u8,
-    old_value: *mut u8,
-) -> i32 {
+pub fn timerfd_settime(fd: i32, flags: u32, new_value: *const u8, old_value: *mut u8) -> i32 {
     let r = unsafe {
         syscall4(
             SYS_TIMERFD_SETTIME,
@@ -1674,18 +1686,14 @@ pub fn listen(fd: i32, backlog: u32) -> i32 {
 /// fd or -1. addr_out / addrlen_out may be NULL.
 #[inline]
 pub fn accept(fd: i32, addr_out: *mut u8, addrlen_out: *mut u32) -> i32 {
-    let r = unsafe {
-        syscall3(SYS_ACCEPT, fd as u64, addr_out as u64, addrlen_out as u64)
-    };
+    let r = unsafe { syscall3(SYS_ACCEPT, fd as u64, addr_out as u64, addrlen_out as u64) };
     r as i32
 }
 
 /// `connect(fd, addr, addrlen)`.
 #[inline]
 pub fn connect(fd: i32, addr: *const u8, addrlen: u32) -> i32 {
-    let r = unsafe {
-        syscall3(SYS_CONNECT, fd as u64, addr as u64, addrlen as u64)
-    };
+    let r = unsafe { syscall3(SYS_CONNECT, fd as u64, addr as u64, addrlen as u64) };
     r as i32
 }
 
@@ -1749,9 +1757,7 @@ pub fn shutdown(fd: i32, how: u32) -> i32 {
 /// an opaque buf_id usable in `send_zc`.
 #[inline]
 pub fn sock_register_buffer(ptr: *const u8, len: usize) -> i32 {
-    let r = unsafe {
-        syscall2(SYS_SOCK_REGISTER_BUF, ptr as u64, len as u64)
-    };
+    let r = unsafe { syscall2(SYS_SOCK_REGISTER_BUF, ptr as u64, len as u64) };
     r as i32
 }
 
@@ -1779,7 +1785,11 @@ pub fn sock_send_zc(fd: i32, buf_id: u32, off: u64, len: u64, flags: u32) -> isi
 pub fn unshare(flags: u32) -> Result<(), ()> {
     // SAFETY: SYS_UNSHARE 1-arg signature.
     let r = unsafe { syscall1(SYS_UNSHARE, flags as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// `fstatfs(fd, &buf)` — same as `statfs` but addressed by an
@@ -1791,7 +1801,11 @@ pub fn unshare(flags: u32) -> Result<(), ()> {
 pub unsafe fn fstatfs(fd: u32, buf: *mut u8) -> Result<(), ()> {
     // SAFETY: SYS_FSTATFS 2-arg signature.
     let r = unsafe { syscall2(SYS_FSTATFS, fd as u64, buf as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Force-back every demand-paged page in `[addr, addr+len)` and
@@ -1802,7 +1816,11 @@ pub unsafe fn fstatfs(fd: u32, buf: *mut u8) -> Result<(), ()> {
 pub unsafe fn mlock(addr: *const u8, len: usize) -> Result<(), ()> {
     // SAFETY: SYS_MLOCK signature: arg0 base, arg1 len.
     let r = unsafe { syscall2(SYS_MLOCK, addr as u64, len as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Clear the LOCKED flag on `[addr, addr+len)`. Frames stay
@@ -1813,7 +1831,11 @@ pub unsafe fn mlock(addr: *const u8, len: usize) -> Result<(), ()> {
 pub unsafe fn munlock(addr: *const u8, len: usize) -> Result<(), ()> {
     // SAFETY: SYS_MUNLOCK signature: arg0 base, arg1 len.
     let r = unsafe { syscall2(SYS_MUNLOCK, addr as u64, len as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Query (`new_break == 0`) or resize the per-task heap break.

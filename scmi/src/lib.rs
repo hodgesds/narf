@@ -193,7 +193,10 @@ mod tests {
         // Construct each attribute struct via its public surface and
         // confirm the fields stick. Catches drift in the Stage-4
         // ScmiClock attribute shape.
-        let c = ClockAttributes { enabled: true, name: "pll0" };
+        let c = ClockAttributes {
+            enabled: true,
+            name: "pll0",
+        };
         if !c.enabled || c.name != "pll0" {
             return TestResult::Fail("ClockAttributes field round-trip");
         }

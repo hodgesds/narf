@@ -199,13 +199,16 @@ fn smoke_initramfs_mount_at_root() -> TestResult {
     }
     // Resolve through the registry to confirm the proxy actually
     // serves the staged entries.
-    let pair: Option<(alloc::sync::Arc<dyn narf_filesystem::DirOps>, alloc::string::String)> =
-        narf_filesystem::registry().resolve_absolute(
-            "/initramfs-smoke/hello",
-            |fs, rel| (fs.root(), alloc::string::String::from(rel)),
-        );
+    let pair: Option<(
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        alloc::string::String,
+    )> = narf_filesystem::registry().resolve_absolute("/initramfs-smoke/hello", |fs, rel| {
+        (fs.root(), alloc::string::String::from(rel))
+    });
     if pair.is_none() {
-        return TestResult::Fail("registry didn't return the mounted FS for /initramfs-smoke/hello");
+        return TestResult::Fail(
+            "registry didn't return the mounted FS for /initramfs-smoke/hello",
+        );
     }
     TestResult::Pass
 }

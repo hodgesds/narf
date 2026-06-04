@@ -176,7 +176,12 @@ mod tests {
 
     fn smoke_accel_kind_variants_distinct() -> TestResult {
         use crate::device::AccelKind;
-        let all = [AccelKind::Npu, AccelKind::Tpu, AccelKind::Fpga, AccelKind::Dsp];
+        let all = [
+            AccelKind::Npu,
+            AccelKind::Tpu,
+            AccelKind::Fpga,
+            AccelKind::Dsp,
+        ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
                 if i != j && a == b {

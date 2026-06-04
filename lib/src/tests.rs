@@ -430,15 +430,17 @@ fn smoke_bitmap_first_clear_finds_gap_in_full_word() -> TestResult {
 kernel_test_in!("lib", smoke_bitmap_first_clear_finds_gap_in_full_word);
 
 fn smoke_sync_once_runs_exactly_once() -> TestResult {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use crate::sync::Once;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     let o = Once::new();
     let n = AtomicUsize::new(0);
     if o.is_completed() {
         return TestResult::Fail("fresh Once reports completed");
     }
     for _ in 0..5 {
-        o.call_once(|| { n.fetch_add(1, Ordering::Relaxed); });
+        o.call_once(|| {
+            n.fetch_add(1, Ordering::Relaxed);
+        });
     }
     if n.load(Ordering::Relaxed) != 1 {
         return TestResult::Fail("Once ran more than once");
@@ -475,8 +477,8 @@ fn smoke_sync_once_lock_set_get_double_set() -> TestResult {
 kernel_test_in!("lib", smoke_sync_once_lock_set_get_double_set);
 
 fn smoke_sync_once_lock_get_or_init() -> TestResult {
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::sync::OnceLock;
+    use core::sync::atomic::{AtomicU32, Ordering};
     static INITS: AtomicU32 = AtomicU32::new(0);
     INITS.store(0, Ordering::Relaxed);
     let cell: OnceLock<u32> = OnceLock::new();
@@ -607,11 +609,17 @@ kernel_test_in!("lib", smoke_id_typed_ids_are_transparent);
 fn smoke_id_typed_id_new_raw_round_trip() -> TestResult {
     use crate::id::{CpuId, IrqId, TaskId};
     let c = CpuId::new(7);
-    if c.raw() != 7 { return TestResult::Fail("CpuId round-trip"); }
+    if c.raw() != 7 {
+        return TestResult::Fail("CpuId round-trip");
+    }
     let t = TaskId::new(0xCAFE_BEEF);
-    if t.raw() != 0xCAFE_BEEF { return TestResult::Fail("TaskId round-trip"); }
+    if t.raw() != 0xCAFE_BEEF {
+        return TestResult::Fail("TaskId round-trip");
+    }
     let i = IrqId::new(u32::MAX);
-    if i.raw() != u32::MAX { return TestResult::Fail("IrqId round-trip at MAX"); }
+    if i.raw() != u32::MAX {
+        return TestResult::Fail("IrqId round-trip at MAX");
+    }
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_id_typed_id_new_raw_round_trip);

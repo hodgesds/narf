@@ -241,14 +241,19 @@ fn smoke_cap_rights_bits_are_distinct_singletons() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("capabilities", smoke_cap_rights_bits_are_distinct_singletons);
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_rights_bits_are_distinct_singletons
+);
 
 fn smoke_cap_grant_derives_every_lesser_right() -> TestResult {
     // Grant is the lattice top — must derive Read, Write, Spend,
     // and Invoke without complaint.
     use crate::{Cap, CapKind, CapType, Grant, Invoke, Read, Spend, Write};
     struct TestObj;
-    impl CapType for TestObj { const KIND: CapKind = CapKind::Domain; }
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Domain;
+    }
 
     let g: Cap<TestObj, Grant> = Cap::bootstrap();
     if g.derive::<Read>().is_err() {
@@ -431,7 +436,9 @@ fn smoke_cap_clone_preserves_slot() -> TestResult {
     // sibling that shares the underlying object table slot.
     use crate::{Cap, CapKind, CapType, Write};
     struct TestObj;
-    impl CapType for TestObj { const KIND: CapKind = CapKind::Endpoint; }
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
 
     let a: Cap<TestObj, Write> = Cap::bootstrap();
     let b = a; // Copy

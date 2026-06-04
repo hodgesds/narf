@@ -342,8 +342,7 @@ impl Arch {
                 // matches Renoir's BIOS behavior where x2APIC is
                 // refused. Example:
                 //   NARF_QEMU_CPU="max,-x2apic,-tsc-deadline"
-                let cpu = std::env::var("NARF_QEMU_CPU")
-                    .unwrap_or_else(|_| "max".into());
+                let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
                 let mut args = vec![
                     "-machine".into(), "q35,hmat=on".into(),
                     "-cpu".into(),     cpu,
@@ -401,10 +400,7 @@ impl Arch {
                     // something to attach to. With this in place the
                     // QEMU smoke harness exercises the full
                     // xHCI → HID-boot-keyboard → narf_input pipeline.
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "usb-kbd,bus=xhci0.0".into(),
-                    ]);
+                    args.extend_from_slice(&["-device".into(), "usb-kbd,bus=xhci0.0".into()]);
                     args.extend_from_slice(&[
                         "-vga".into(),
                         "none".into(),
@@ -869,18 +865,8 @@ fn build_userspace_disk_image(workspace: &Path, out_path: &Path) -> Result<()> {
         bail!("mtools (mcopy) not on PATH");
     }
 
-    let init_elf = build_user_binary(
-        workspace,
-        "userspace/init",
-        "init",
-        "init.ld",
-    )?;
-    let shell_elf = build_user_binary(
-        workspace,
-        "userspace/shell",
-        "shell",
-        "shell.ld",
-    )?;
+    let init_elf = build_user_binary(workspace, "userspace/init", "init", "init.ld")?;
+    let shell_elf = build_user_binary(workspace, "userspace/shell", "shell", "shell.ld")?;
 
     // 16 MiB raw image — comfortable headroom for a few-hundred-KiB
     // pair of user binaries plus future additions, well below FAT16's
@@ -981,7 +967,10 @@ fn build_user_binary(
 
     let bin = target_dir.join(triple).join("release").join(bin_name);
     if !bin.exists() {
-        bail!("expected output {} missing after cargo build", bin.display());
+        bail!(
+            "expected output {} missing after cargo build",
+            bin.display()
+        );
     }
     Ok(bin)
 }
@@ -1012,13 +1001,7 @@ fn encode_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let s = format!("{:08X}", v);
         out.extend_from_slice(s.as_bytes());
     }
-    fn write_entry(
-        out: &mut Vec<u8>,
-        ino: u32,
-        mode: u32,
-        name: &str,
-        data: &[u8],
-    ) {
+    fn write_entry(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8]) {
         let name_bytes = name.as_bytes();
         let namesize = (name_bytes.len() + 1) as u32; // +1 for NUL
         out.extend_from_slice(b"070701");
@@ -1042,7 +1025,11 @@ fn encode_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
         pad_to_4(out);
     }
     let mut out = Vec::with_capacity(
-        entries.iter().map(|(n, d)| 110 + n.len() + 4 + d.len() + 4).sum::<usize>() + 256,
+        entries
+            .iter()
+            .map(|(n, d)| 110 + n.len() + 4 + d.len() + 4)
+            .sum::<usize>()
+            + 256,
     );
     for (i, (name, data)) in entries.iter().enumerate() {
         // Inode 0 is reserved for the trailer; start at 1.
@@ -1220,9 +1207,7 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
                 Err(_) => break,
             };
             println!("{line}");
-            if panic_line.is_none()
-                && panic_markers.iter().any(|m| line.contains(m))
-            {
+            if panic_line.is_none() && panic_markers.iter().any(|m| line.contains(m)) {
                 panic_line = Some(line);
             }
         }
@@ -1240,10 +1225,7 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
             child.kill()?;
             child.wait()?;
             if let Some(p) = panic_line {
-                bail!(
-                    "xtask boot-smoke: panic before clean exit — '{}'",
-                    p
-                );
+                bail!("xtask boot-smoke: panic before clean exit — '{}'", p);
             }
             bail!(
                 "xtask boot-smoke: kernel did not call exit_kernel within {}s — possible hang in real init flow",
@@ -1314,12 +1296,20 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(build.arch.qemu_args(&kernel, &build.display, build.hw_profile));
+    cmd.args(
+        build
+            .arch
+            .qemu_args(&kernel, &build.display, build.hw_profile),
+    );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    println!("xtask run-interactive: launching {} {}", qemu, kernel.display());
+    println!(
+        "xtask run-interactive: launching {} {}",
+        qemu,
+        kernel.display()
+    );
 
     let mut child = cmd
         .spawn()
@@ -1415,10 +1405,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
                 // straddling a read boundary.
                 if !prompt_sent {
                     let tail_from = line.len().saturating_sub(PROMPT.len() * 2);
-                    if line[tail_from..]
-                        .windows(PROMPT.len())
-                        .any(|w| w == PROMPT)
-                    {
+                    if line[tail_from..].windows(PROMPT.len()).any(|w| w == PROMPT) {
                         prompt_sent = true;
                         let _ = tx_reader.send(Ev::Prompt);
                     }
@@ -1447,7 +1434,10 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask run-interactive: kernel panic before prompt — '{}'", p);
+                bail!(
+                    "xtask run-interactive: kernel panic before prompt — '{}'",
+                    p
+                );
             }
             Ok(Ev::Eof) => {
                 let _ = child.wait();
@@ -1469,7 +1459,10 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         );
     }
 
-    println!("\nxtask run-interactive: prompt seen, typing `{}`...", args.cmd);
+    println!(
+        "\nxtask run-interactive: prompt seen, typing `{}`...",
+        args.cmd
+    );
 
     // Drain the kernel's late-boot log noise (USB-HID enumeration
     // typically lands a few hundred ms after the shell prompt is
@@ -1664,8 +1657,8 @@ fn collect_firmware_blobs(
 
     let mut stack: Vec<PathBuf> = vec![fw_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -1677,9 +1670,9 @@ fn collect_firmware_blobs(
             if !ft.is_file() {
                 continue;
             }
-            let rel = path
-                .strip_prefix(fw_dir)
-                .with_context(|| format!("strip_prefix {} vs {}", path.display(), fw_dir.display()))?;
+            let rel = path.strip_prefix(fw_dir).with_context(|| {
+                format!("strip_prefix {} vs {}", path.display(), fw_dir.display())
+            })?;
             let rel_str = rel
                 .to_str()
                 .ok_or_else(|| anyhow!("firmware path {} not valid UTF-8", path.display()))?
@@ -1840,8 +1833,8 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
 
     let mut stack: Vec<PathBuf> = vec![source.clone()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
@@ -1867,11 +1860,9 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
                 continue;
             }
 
-            let rel = path
-                .strip_prefix(&source)
-                .with_context(|| {
-                    format!("strip_prefix {} vs {}", path.display(), source.display())
-                })?;
+            let rel = path.strip_prefix(&source).with_context(|| {
+                format!("strip_prefix {} vs {}", path.display(), source.display())
+            })?;
 
             // Vendor filter: only import paths that match the
             // requested prefix (path-component-wise, so `--vendor
@@ -1969,7 +1960,10 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
         imported, total_payload_bytes
     );
     if skipped_existing > 0 {
-        println!("  skipped {} (already present; --skip-existing)", skipped_existing);
+        println!(
+            "  skipped {} (already present; --skip-existing)",
+            skipped_existing
+        );
     }
     if skipped_too_big > 0 {
         println!(
@@ -1988,7 +1982,10 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
     }
     println!("  output dir: {}", out_root.display());
     if host_uname.is_some() {
-        println!("  trailer version stamp: {}", host_uname.as_deref().unwrap_or(""));
+        println!(
+            "  trailer version stamp: {}",
+            host_uname.as_deref().unwrap_or("")
+        );
     }
     Ok(())
 }
@@ -2007,7 +2004,10 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
     let payload = std::fs::read(&args.payload)
         .with_context(|| format!("reading payload from {}", &args.payload))?;
     if payload.is_empty() {
-        bail!("payload {} is empty — NARF amdgpu rejects size==0", &args.payload);
+        bail!(
+            "payload {} is empty — NARF amdgpu rejects size==0",
+            &args.payload
+        );
     }
     if let Some(ver) = &args.version {
         if ver.as_bytes().len() > 255 {
@@ -2123,15 +2123,11 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let mut coreutil_bytes: Vec<(String, Vec<u8>)> = Vec::new();
     for name in coreutil_names {
         let crate_dir = format!("userspace/coreutils/{}", name);
-        let ld_name   = format!("{}.ld", name);
+        let ld_name = format!("{}.ld", name);
         let elf = build_user_binary(&root, &crate_dir, name, &ld_name)?;
         let bytes = std::fs::read(&elf)
             .with_context(|| format!("reading {} ELF at {}", name, elf.display()))?;
-        println!(
-            "xtask image: coreutil {} = {} bytes",
-            name,
-            bytes.len()
-        );
+        println!("xtask image: coreutil {} = {} bytes", name, bytes.len());
         coreutil_bytes.push((format!("bin/{}", name), bytes));
     }
 
@@ -2151,8 +2147,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     //   linux/drivers/base/firmware_loader/main.c::fw_get_filesystem_firmware
     //     — /lib/firmware/ search-path pattern.
     let fw_dir = root.join("target").join("firmware");
-    let (fw_initramfs, fw_rootfs) =
-        collect_firmware_blobs(&fw_dir, &args.initramfs_firmware)?;
+    let (fw_initramfs, fw_rootfs) = collect_firmware_blobs(&fw_dir, &args.initramfs_firmware)?;
 
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
     cpio_entries.push(("init", &init_bytes));
@@ -2283,9 +2278,7 @@ interface_resolution: 1024x768
             .arg("--efi-boot-image")
             .arg("--protective-msdos-label");
     }
-    cmd.arg(stage.as_os_str())
-        .arg("-o")
-        .arg(iso.as_os_str());
+    cmd.arg(stage.as_os_str()).arg("-o").arg(iso.as_os_str());
 
     let status = cmd.status().context("running xorriso")?;
     if !status.success() {
@@ -2458,7 +2451,10 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
             .arg("virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off");
     }
 
-    println!("xtask iso-boot: launching qemu-system-x86_64 with ISO {}", iso.display());
+    println!(
+        "xtask iso-boot: launching qemu-system-x86_64 with ISO {}",
+        iso.display()
+    );
 
     let mut child = cmd.spawn().context("failed to spawn qemu-system-x86_64")?;
     let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
@@ -2555,20 +2551,20 @@ fn ovmf_code_path() -> PathBuf {
 fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    let iso_path = args
-        .iso
-        .clone()
-        .unwrap_or_else(|| {
-            workspace_root()
-                .ok()
-                .map(|r| r.join("target").join("narf-x86_64.iso"))
-                .unwrap_or_else(|| PathBuf::from("target/narf-x86_64.iso"))
-                .display()
-                .to_string()
-        });
+    let iso_path = args.iso.clone().unwrap_or_else(|| {
+        workspace_root()
+            .ok()
+            .map(|r| r.join("target").join("narf-x86_64.iso"))
+            .unwrap_or_else(|| PathBuf::from("target/narf-x86_64.iso"))
+            .display()
+            .to_string()
+    });
     let iso = PathBuf::from(&iso_path);
     if !iso.exists() {
-        bail!("ISO not found at {}; run `cargo xtask image` first", iso.display());
+        bail!(
+            "ISO not found at {}; run `cargo xtask image` first",
+            iso.display()
+        );
     }
     let iso_size = std::fs::metadata(&iso)?.len();
     println!("ISO: {} ({} MiB)", iso.display(), iso_size / 1024 / 1024);
@@ -2735,8 +2731,7 @@ fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
     let dev2 = if args.device.is_some() && std::path::Path::new(&dev).exists() {
         dev.clone()
     } else {
-        detect_usb_device()
-            .context("USB stick not detected after replug — is it inserted?")?
+        detect_usb_device().context("USB stick not detected after replug — is it inserted?")?
     };
     if dev2 != dev {
         println!("USB came back as {} (was {})", dev2, dev);
@@ -2887,9 +2882,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
         }
     }
     if !missing.is_empty() {
-        let mut msg = String::from(
-            "missing host tools required by disk-write-partitioned:\n",
-        );
+        let mut msg = String::from("missing host tools required by disk-write-partitioned:\n");
         for (bin, pkg) in &missing {
             msg.push_str(&format!("  - {bin}  (package: {pkg})\n"));
         }
@@ -2902,11 +2895,11 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
         .args(["-o", "NAME,SIZE,MODEL,TRAN,MOUNTPOINTS"])
         .arg(&dev)
         .status();
+    println!("Plan: GPT layout on {}", dev);
     println!(
-        "Plan: GPT layout on {}",
-        dev
+        "  - ESP (FAT32, {} MiB) — kernel + initramfs + Limine",
+        args.esp_size_mib
     );
-    println!("  - ESP (FAT32, {} MiB) — kernel + initramfs + Limine", args.esp_size_mib);
     println!(
         "  - {} ({}, rest of disk, PARTLABEL={})",
         "narf-root",
@@ -2945,12 +2938,18 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     let st = Command::new("sudo")
         .args([
             "sgdisk",
-            "-n", &format!("1:0:{}", esp_end),
-            "-t", "1:EF00",
-            "-c", "1:ESP",
-            "-n", "2:0:0",
-            "-t", "2:8300",
-            "-c", &format!("2:{}", args.root_label),
+            "-n",
+            &format!("1:0:{}", esp_end),
+            "-t",
+            "1:EF00",
+            "-c",
+            "1:ESP",
+            "-n",
+            "2:0:0",
+            "-t",
+            "2:8300",
+            "-c",
+            &format!("2:{}", args.root_label),
             &dev,
         ])
         .status()
@@ -2980,7 +2979,8 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
         .args([
             args.root_fs.mkfs_program(),
             "-F", // force on a partition that just got created
-            "-L", &args.root_label,
+            "-L",
+            &args.root_label,
             &root_dev,
         ])
         .status()
@@ -3037,11 +3037,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     let cp = |src: &Path, dst_rel: &str| -> Result<()> {
         let dst = mnt_esp.join(dst_rel);
         let st = Command::new("sudo")
-            .args([
-                "cp",
-                src.to_str().unwrap(),
-                dst.to_str().unwrap(),
-            ])
+            .args(["cp", src.to_str().unwrap(), dst.to_str().unwrap()])
             .status()?;
         if !st.success() {
             bail!("cp {} -> {} failed", src.display(), dst.display());
@@ -3064,7 +3060,9 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
         ])
         .status()?;
     if !st.success() {
-        eprintln!("warning: Limine support-file copy reported failure (some boot modes may not work)");
+        eprintln!(
+            "warning: Limine support-file copy reported failure (some boot modes may not work)"
+        );
     }
     // Limine config — same shape as the ISO's, but with `root=
     // PARTLABEL=<label>` so the kernel's root_selector picks the
@@ -3209,10 +3207,7 @@ fn partition_paths(dev: &str) -> (String, String) {
 fn write_as_root(dst: &Path, contents: &str) -> Result<()> {
     // Write to a temp file the build user owns, then `sudo cp` it
     // into place.
-    let tmp = std::env::temp_dir().join(format!(
-        "narf-disk-write-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("narf-disk-write-{}", std::process::id()));
     std::fs::write(&tmp, contents)?;
     let st = Command::new("sudo")
         .args(["cp", tmp.to_str().unwrap(), dst.to_str().unwrap()])
@@ -3237,11 +3232,7 @@ fn mk_root_dir(mnt: &Path, sub: &str) -> Result<()> {
 
 fn cp_root(src: &Path, dst: &Path) -> Result<()> {
     let st = Command::new("sudo")
-        .args([
-            "cp",
-            src.to_str().unwrap(),
-            dst.to_str().unwrap(),
-        ])
+        .args(["cp", src.to_str().unwrap(), dst.to_str().unwrap()])
         .status()?;
     if !st.success() {
         bail!("cp {} -> {} failed", src.display(), dst.display());
