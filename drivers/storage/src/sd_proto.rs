@@ -222,9 +222,8 @@ impl Csd {
             1 => {
                 // CSD v2.0 (§5.3.3) — fixed READ/WRITE BLEN = 512.
                 // C_SIZE: 22 bits at 69..48 → byte 7 low 6 | byte 8 | byte 9.
-                let c_size = (((csd[7] as u32) & 0x3F) << 16)
-                    | ((csd[8] as u32) << 8)
-                    | (csd[9] as u32);
+                let c_size =
+                    (((csd[7] as u32) & 0x3F) << 16) | ((csd[8] as u32) << 8) | (csd[9] as u32);
                 // capacity = (C_SIZE + 1) × 512 KiB.
                 let capacity_bytes = (c_size as u64 + 1) * 512 * 1024;
                 Some(Self {

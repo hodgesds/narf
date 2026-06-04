@@ -166,7 +166,9 @@ struct FakeNvmeMmio {
 
 impl FakeNvmeMmio {
     fn new() -> Self {
-        let mut m = Self { mem: [0u8; 16 * 1024] };
+        let mut m = Self {
+            mem: [0u8; 16 * 1024],
+        };
         // CAP: MQES=63, DSTRD=0 (stride=4), MPSMIN=0, MPSMAX=0.
         // CAP.TO (timeout in 500ms units) = 0x0F at bits[31:24] of CAP_HI.
         // CAP.MQES = 63 → depth up to 64. We use 4 for the admin queue.
@@ -201,7 +203,11 @@ impl FakeNvmeMmio {
     /// - CC.EN set      → CSTS.RDY sets.
     fn react_cc(&mut self) {
         let cc = self.read32(NVME_REG_CC);
-        let rdy = if cc & NVME_CC_EN != 0 { NVME_CSTS_RDY } else { 0 };
+        let rdy = if cc & NVME_CC_EN != 0 {
+            NVME_CSTS_RDY
+        } else {
+            0
+        };
         self.write32(NVME_REG_CSTS, rdy);
     }
 
@@ -310,10 +316,8 @@ fn smoke_nvme_controller_reset() -> TestResult {
     bar.write32(NVME_REG_ACQ_LO, acq_phys as u32);
     bar.write32(NVME_REG_ACQ_HI, (acq_phys >> 32) as u32);
 
-    let got_asq = (bar.read32(NVME_REG_ASQ_HI) as u64) << 32
-        | bar.read32(NVME_REG_ASQ_LO) as u64;
-    let got_acq = (bar.read32(NVME_REG_ACQ_HI) as u64) << 32
-        | bar.read32(NVME_REG_ACQ_LO) as u64;
+    let got_asq = (bar.read32(NVME_REG_ASQ_HI) as u64) << 32 | bar.read32(NVME_REG_ASQ_LO) as u64;
+    let got_acq = (bar.read32(NVME_REG_ACQ_HI) as u64) << 32 | bar.read32(NVME_REG_ACQ_LO) as u64;
     if got_asq != asq_phys {
         return TestResult::Fail("ASQ physical address round-trip failed");
     }
@@ -339,10 +343,7 @@ fn smoke_nvme_controller_reset() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_controller_reset
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_controller_reset);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 2: IDENTIFY CONTROLLER (admin, CNS=1) ─────────────────────────
@@ -402,10 +403,7 @@ fn smoke_nvme_identify_controller() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_identify_controller
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_identify_controller);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 3: IDENTIFY NAMESPACE (CNS=0, NSID=1) ─────────────────────────
@@ -429,7 +427,7 @@ fn smoke_nvme_identify_namespace() -> TestResult {
     ns_buf[8..16].copy_from_slice(&nsze.to_le_bytes()); // NCAP = NSZE
     ns_buf[25] = 0; // NLBAF = 0 → 1 format
     ns_buf[26] = 0; // FLBAS: active = LBAF[0]
-    // LBAF[0] at byte 128: MS[15:0] = 0, LBADS[23:16] = 12, RP[25:24] = 0
+                    // LBAF[0] at byte 128: MS[15:0] = 0, LBADS[23:16] = 12, RP[25:24] = 0
     ns_buf[130] = lbads; // LBAF[0].LBADS at byte offset +2 within LBAF
 
     // Decode the fields.
@@ -438,7 +436,11 @@ fn smoke_nvme_identify_namespace() -> TestResult {
     let active_lbaf = (flbas & 0x0F) as usize;
     let lbaf_off = 128 + active_lbaf * 4;
     let got_lbads = ns_buf[lbaf_off + 2];
-    let got_lba_bytes: u32 = if got_lbads == 0 { 512 } else { 1u32 << got_lbads };
+    let got_lba_bytes: u32 = if got_lbads == 0 {
+        512
+    } else {
+        1u32 << got_lbads
+    };
 
     if got_nsze != nsze {
         return TestResult::Fail("IDENTIFY NAMESPACE: NSZE round-trip wrong");
@@ -467,10 +469,7 @@ fn smoke_nvme_identify_namespace() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_identify_namespace
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_identify_namespace);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 4: Create IO Completion Queue (admin opcode 0x05) ─────────────
@@ -535,10 +534,7 @@ fn smoke_nvme_create_io_cq() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_create_io_cq
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_create_io_cq);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 5: Create IO Submission Queue (admin opcode 0x01) ─────────────
@@ -598,10 +594,7 @@ fn smoke_nvme_create_io_sq() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_create_io_sq
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_create_io_sq);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 6: NVMe READ command (opcode 0x02) ────────────────────────────
@@ -670,10 +663,7 @@ fn smoke_nvme_read_command() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_read_command
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_read_command);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 7: NVMe WRITE command (opcode 0x01) + re-read confirms ────────
@@ -733,10 +723,7 @@ fn smoke_nvme_write_command() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_write_command
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_write_command);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 8: NVMe register_block_device ("nvme0n1") ─────────────────────
@@ -776,10 +763,7 @@ fn smoke_nvme_register_block_device() -> TestResult {
     unregister_block_device("nvme0n1");
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/nvme-e2e",
-    smoke_nvme_register_block_device
-);
+kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_register_block_device);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── FakeAhciMmio — 64 KiB synthetic BAR5 (ABAR) ─────────────────────────
@@ -829,7 +813,9 @@ impl FakeAhciMmio {
     /// Create a fake ABAR with port 0 pre-configured as a SATA device
     /// (DET=3, IPM=1, SIG=0x00000101).
     fn new_with_sata_port0() -> Self {
-        let mut m = Self { mem: [0u8; 64 * 1024] };
+        let mut m = Self {
+            mem: [0u8; 64 * 1024],
+        };
         // CAP: NCS (num cmd slots) at bits[12:8] = 31, NP (num ports-1) at bits[4:0] = 0.
         let cap: u32 = (31 << 8) | 0;
         m.write32(AHCI_HBA_CAP, cap);
@@ -847,7 +833,7 @@ impl FakeAhciMmio {
         m.write32(p + PORT_SIG, SIG_SATA);
         // TFD: BSY=0, DRQ=0, ERR=0 — ready.
         m.write32(p + PORT_TFD, 0x0000_0050); // DRDY bit set
-        // CMD: FRE=1, FR=1, ST=1, CR=0 (idle, FIS receive active).
+                                              // CMD: FRE=1, FR=1, ST=1, CR=0 (idle, FIS receive active).
         m.write32(p + PORT_CMD, PORT_CMD_FRE | PORT_CMD_FR | PORT_CMD_ST);
         m
     }
@@ -970,10 +956,8 @@ fn smoke_ahci_command_list_and_fis_setup() -> TestResult {
     abar.write32(p + PORT_FBU, (fb_phys >> 32) as u32);
 
     // Read back and reconstruct 64-bit addresses.
-    let got_clb = (abar.read32(p + PORT_CLBU) as u64) << 32
-        | abar.read32(p + PORT_CLB) as u64;
-    let got_fb = (abar.read32(p + PORT_FBU) as u64) << 32
-        | abar.read32(p + PORT_FB) as u64;
+    let got_clb = (abar.read32(p + PORT_CLBU) as u64) << 32 | abar.read32(p + PORT_CLB) as u64;
+    let got_fb = (abar.read32(p + PORT_FBU) as u64) << 32 | abar.read32(p + PORT_FB) as u64;
 
     if got_clb != clb_phys {
         return TestResult::Fail("AHCI: PxCLB round-trip failed");
@@ -1077,10 +1061,7 @@ fn smoke_ahci_identify_device() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/ahci-e2e",
-    smoke_ahci_identify_device
-);
+kernel_test_in!("drivers/storage/ahci-e2e", smoke_ahci_identify_device);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 12: AHCI READ DMA EXT (ATA 0x25) ──────────────────────────────
@@ -1143,10 +1124,7 @@ fn smoke_ahci_read_dma_ext() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/ahci-e2e",
-    smoke_ahci_read_dma_ext
-);
+kernel_test_in!("drivers/storage/ahci-e2e", smoke_ahci_read_dma_ext);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 13: AHCI WRITE DMA EXT (ATA 0x35) ─────────────────────────────
@@ -1215,10 +1193,7 @@ fn smoke_ahci_write_dma_ext() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/ahci-e2e",
-    smoke_ahci_write_dma_ext
-);
+kernel_test_in!("drivers/storage/ahci-e2e", smoke_ahci_write_dma_ext);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── Smoke 14: AHCI register_block_device ("sata0") ──────────────────────
@@ -1254,10 +1229,7 @@ fn smoke_ahci_register_block_device() -> TestResult {
     unregister_block_device("sata0");
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/storage/ahci-e2e",
-    smoke_ahci_register_block_device
-);
+kernel_test_in!("drivers/storage/ahci-e2e", smoke_ahci_register_block_device);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── GPT helper (mirrors filesystem/e2e_tests.rs write_synthetic_gpt) ─────
@@ -1287,7 +1259,7 @@ fn write_synthetic_gpt_with_label(buf: &mut [u8], label: &str) {
         hdr[0..8].copy_from_slice(b"EFI PART"); // signature
         hdr[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // revision 1.0
         hdr[12..16].copy_from_slice(&92u32.to_le_bytes()); // header size
-        // my_lba = 1
+                                                           // my_lba = 1
         hdr[24..32].copy_from_slice(&1u64.to_le_bytes());
         // alternate_lba = last LBA of the disk.
         hdr[32..40].copy_from_slice(&(total_lbas - 1).to_le_bytes());
@@ -1308,14 +1280,14 @@ fn write_synthetic_gpt_with_label(buf: &mut [u8], label: &str) {
     // Partition type GUID (basic data: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7)
     // stored as mixed-endian.
     let type_guid = [
-        0xA2u8, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
-        0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+        0xA2u8, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
     ];
     entry[0..16].copy_from_slice(&type_guid);
     // Unique partition GUID (synthetic).
     let part_guid = [
-        0x11u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33,
-        0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x11u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55,
     ];
     entry[16..32].copy_from_slice(&part_guid);
     // Starting LBA = 34.

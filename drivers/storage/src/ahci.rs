@@ -1509,11 +1509,7 @@ const PMP_CTRL_PORT: u8 = 0x0F;
 ///
 /// # Safety
 /// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
-pub unsafe fn pmp_read_gscr(
-    ahci: &Ahci,
-    port_idx: u8,
-    reg: u8,
-) -> Result<u32, AhciError> {
+pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, AhciError> {
     let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
 
     // Stop port if running.
@@ -1616,9 +1612,9 @@ pub unsafe fn pmp_read_gscr(
     let d2h = fis_recv + 0x40;
     let val = unsafe {
         let nsect = core::ptr::read_volatile((d2h + 4) as *const u8) as u32;
-        let lbal  = core::ptr::read_volatile((d2h + 5) as *const u8) as u32;
-        let lbam  = core::ptr::read_volatile((d2h + 6) as *const u8) as u32;
-        let lbah  = core::ptr::read_volatile((d2h + 8) as *const u8) as u32;
+        let lbal = core::ptr::read_volatile((d2h + 5) as *const u8) as u32;
+        let lbam = core::ptr::read_volatile((d2h + 6) as *const u8) as u32;
+        let lbah = core::ptr::read_volatile((d2h + 8) as *const u8) as u32;
         nsect | (lbal << 8) | (lbam << 16) | (lbah << 24)
     };
 
@@ -1640,10 +1636,7 @@ pub unsafe fn pmp_read_gscr(
 ///
 /// # Safety
 /// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
-pub unsafe fn discover_pmp_topology(
-    ahci: &Ahci,
-    port_idx: u8,
-) -> Option<PmpTopology> {
+pub unsafe fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopology> {
     let info = ahci.ports.iter().find(|p| p.index == port_idx)?;
     if info.kind != PortKind::Pmp {
         return None;
@@ -1795,9 +1788,13 @@ pub unsafe fn atapi_send_cdb(
     // PRDT length = 1 if data transfer, 0 if NODATA.
     // Reference: AHCI 1.3.1 §4.2.3.1, Table 4.
     let prdt_len = if dir == AtapiDmaDir::None { 0u32 } else { 1u32 };
-    let w_bit: u32 = if dir == AtapiDmaDir::HostToDevice { 1 << 6 } else { 0 };
+    let w_bit: u32 = if dir == AtapiDmaDir::HostToDevice {
+        1 << 6
+    } else {
+        0
+    };
     let header_w0: u32 = (prdt_len << 16) | w_bit | (1 << 5) | 5; // A=1, CFL=5
-    // SAFETY: identity-mapped DMA.
+                                                                  // SAFETY: identity-mapped DMA.
     unsafe {
         core::ptr::write_volatile(cmd_list as *mut u32, header_w0);
         core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
@@ -1808,9 +1805,9 @@ pub unsafe fn atapi_send_cdb(
     //   features byte: bit 0 = DMA, bit 2 = DMADIR (1=D2H, 0=H2D).
     // Reference: ATA8-ACS Table 101 (PACKET command FIS).
     let feat = match dir {
-        AtapiDmaDir::None           => 0x00u8,
-        AtapiDmaDir::DeviceToHost   => 0x01 | 0x04, // DMA | DMADIR=D2H
-        AtapiDmaDir::HostToDevice   => 0x01,         // DMA only
+        AtapiDmaDir::None => 0x00u8,
+        AtapiDmaDir::DeviceToHost => 0x01 | 0x04, // DMA | DMADIR=D2H
+        AtapiDmaDir::HostToDevice => 0x01,        // DMA only
     };
     // SAFETY: identity-mapped DMA.
     unsafe {
@@ -1865,7 +1862,7 @@ pub unsafe fn atapi_send_cdb(
     let mut errored = false;
     let done = narf_scheduler::responsive_spin_until(
         || {
-            let ci  = unsafe { ahci.mmio.read32(off + PORT_CI) };
+            let ci = unsafe { ahci.mmio.read32(off + PORT_CI) };
             let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
             if tfd & 0x01 != 0 {
                 errored = true;
@@ -1894,10 +1891,7 @@ pub unsafe fn atapi_send_cdb(
 ///
 /// # Safety
 /// Same as `atapi_send_cdb`. `port_idx` must be an ATAPI port.
-pub unsafe fn read_atapi_capacity(
-    ahci: &Ahci,
-    port_idx: u8,
-) -> Result<(u32, u32), AhciError> {
+pub unsafe fn read_atapi_capacity(ahci: &Ahci, port_idx: u8) -> Result<(u32, u32), AhciError> {
     // Allocate the 8-byte response in the persistent scratch at
     // data_buf (offset 0x600, safe since scratch is 4 KiB).
     let base = ahci_scratch_phys();
@@ -1919,16 +1913,7 @@ pub unsafe fn read_atapi_capacity(
     let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     // SAFETY: caller-asserted ATAPI port.
-    unsafe {
-        atapi_send_cdb(
-            ahci,
-            port_idx,
-            &cdb,
-            AtapiDmaDir::DeviceToHost,
-            data_buf,
-            8,
-        )
-    }?;
+    unsafe { atapi_send_cdb(ahci, port_idx, &cdb, AtapiDmaDir::DeviceToHost, data_buf, 8) }?;
 
     // Decode the 8-byte big-endian response.
     // SAFETY: identity-mapped DMA.
@@ -1979,18 +1964,18 @@ pub unsafe fn read_atapi_lba(
 ) -> Result<(), AhciError> {
     // SCSI READ(10) packed into 12 bytes (ATAPI CDB length).
     let cdb = [
-        0x28u8,                         // READ(10) opcode
-        0x00,                           // flags
-        ((lba >> 24) & 0xFF) as u8,     // LBA[31:24]
-        ((lba >> 16) & 0xFF) as u8,     // LBA[23:16]
-        ((lba >>  8) & 0xFF) as u8,     // LBA[15:8]
-        (lba         & 0xFF) as u8,     // LBA[7:0]
-        0x00,                           // group number
-        ((count >> 8) & 0xFF) as u8,    // transfer length high
-        (count        & 0xFF) as u8,    // transfer length low
-        0x00,                           // control
-        0x00,                           // padding
-        0x00,                           // padding
+        0x28u8,                      // READ(10) opcode
+        0x00,                        // flags
+        ((lba >> 24) & 0xFF) as u8,  // LBA[31:24]
+        ((lba >> 16) & 0xFF) as u8,  // LBA[23:16]
+        ((lba >> 8) & 0xFF) as u8,   // LBA[15:8]
+        (lba & 0xFF) as u8,          // LBA[7:0]
+        0x00,                        // group number
+        ((count >> 8) & 0xFF) as u8, // transfer length high
+        (count & 0xFF) as u8,        // transfer length low
+        0x00,                        // control
+        0x00,                        // padding
+        0x00,                        // padding
     ];
 
     // SAFETY: caller-asserted ATAPI port.
@@ -2070,10 +2055,7 @@ pub unsafe fn port_enable_phyrdy_irq(ahci: &Ahci, port_idx: u8) {
 ///
 /// # Safety
 /// Caller owns the HBA + the named port exclusively; `port_idx < 32`.
-pub unsafe fn handle_phyrdy_change(
-    ahci: &Ahci,
-    port_idx: u8,
-) -> PortLinkState {
+pub unsafe fn handle_phyrdy_change(ahci: &Ahci, port_idx: u8) -> PortLinkState {
     let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
 
     // Clear the PHYRDY SERR.N bit (W1C) so the PHY can re-latch the
@@ -2107,7 +2089,7 @@ pub unsafe fn handle_phyrdy_change(
         }
         Ok(()) => {
             // Read new signature from PORT_SIG / PORT_SSTS.
-            let sig   = unsafe { ahci.mmio.read32(off + PORT_SIG) };
+            let sig = unsafe { ahci.mmio.read32(off + PORT_SIG) };
             let ssts2 = unsafe { ahci.mmio.read32(off + PORT_SSTS) };
             PortKind::from_sig(sig, ssts2)
         }
@@ -2262,10 +2244,7 @@ fn try_enable_msix_ahci(
 /// legacy INTx. Some emulated AHCI controllers expose the MSI cap
 /// but not MSI-X.
 #[cfg(target_arch = "x86_64")]
-fn try_enable_msi_ahci(
-    cap: &Cap<BusDeviceCap, Write>,
-    device: &BusDevice,
-) -> Option<u8> {
+fn try_enable_msi_ahci(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Option<u8> {
     let mut cfg = narf_bus::msi::enable_msi(cap, device, 1).ok()?;
     let v = narf_interrupts::vector::alloc().ok()?;
     // SAFETY: caller-authority over cfg space; vector reserved.

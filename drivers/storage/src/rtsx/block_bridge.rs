@@ -42,17 +42,15 @@
 //! - MMC HS200/HS400 tuning.
 //! - CSD parse to extract real capacity.
 
-use alloc::sync::Arc;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 
-use narf_block::registry::{
-    BlockDeviceSync, BlockIoError, register_block_device,
-};
+use narf_block::registry::{register_block_device, BlockDeviceSync, BlockIoError};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::{with_controller, RtsxError};
 use super::card::SdCardInfo;
+use super::{with_controller, RtsxError};
 
 // ── RtsxBlockDevice ───────────────────────────────────────────────────────
 
@@ -181,7 +179,7 @@ pub fn register_card(info: SdCardInfo) {
 /// Linux ref: `mmc_alloc_host` in `drivers/mmc/core/host.c` and
 /// `mmc_add_card` in `drivers/mmc/core/bus.c`.
 fn register_sysfs(info: SdCardInfo) {
-    use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr};
+    use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
     let mmc_class = class_register("mmc_host");
     // /sys/class/mmc_host/mmc0/
@@ -194,17 +192,15 @@ fn register_sysfs(info: SdCardInfo) {
     // Linux: `drivers/mmc/core/mmc.c::mmc_read_cid` issues CMD2 to
     // get the 128-bit CID; we expose 32 zero hex digits as a stub.
     let rca = info.rca;
-    kobject_add_attr(&card_kobj, "cid",
-        move || alloc::format!("{:032x}\n", rca as u64));
+    kobject_add_attr(&card_kobj, "cid", move || {
+        alloc::format!("{:032x}\n", rca as u64)
+    });
 
-    kobject_add_attr(&card_kobj, "name",
-        move || "SD\n".into());
+    kobject_add_attr(&card_kobj, "name", move || "SD\n".into());
 
-    kobject_add_attr(&card_kobj, "manfid",
-        move || "0x000000\n".into());
+    kobject_add_attr(&card_kobj, "manfid", move || "0x000000\n".into());
 
-    kobject_add_attr(&card_kobj, "oemid",
-        move || "0x0000\n".into());
+    kobject_add_attr(&card_kobj, "oemid", move || "0x0000\n".into());
 }
 
 // ── Test-only helpers ─────────────────────────────────────────────────────
@@ -212,8 +208,8 @@ fn register_sysfs(info: SdCardInfo) {
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_block::registry::__reset_for_test as block_reset;
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_rtsx_card_detect_registers_mmcblk0() -> TestResult {
         block_reset();

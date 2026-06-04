@@ -48,8 +48,7 @@ impl CmdEntry {
     /// batch completes.
     #[inline]
     pub fn read(addr: u16) -> Self {
-        let word = ((READ_REG_CMD as u32) << 30)
-            | ((addr as u32 & 0x3FFF) << 16);
+        let word = ((READ_REG_CMD as u32) << 30) | ((addr as u32 & 0x3FFF) << 16);
         CmdEntry(word)
     }
 

@@ -21,13 +21,13 @@ fn smoke_ahci_command_fis_layout() -> TestResult {
     fis[0] = 0x27; // FIS type: Register H2D
     fis[1] = 0x80; // C bit set (command, not control), PMP = 0
     fis[2] = 0x25; // READ DMA EXT
-    fis[3] = 0;    // features lo
-    fis[4] = (lba & 0xFF) as u8;         // LBA[7:0]
-    fis[5] = ((lba >> 8) & 0xFF) as u8;  // LBA[15:8]
+    fis[3] = 0; // features lo
+    fis[4] = (lba & 0xFF) as u8; // LBA[7:0]
+    fis[5] = ((lba >> 8) & 0xFF) as u8; // LBA[15:8]
     fis[6] = ((lba >> 16) & 0xFF) as u8; // LBA[23:16]
-    fis[7] = 0x40;                        // Device: LBA mode
-    fis[8] = ((lba >> 24) & 0xFF) as u8;  // LBA[31:24]
-    fis[9] = ((lba >> 32) & 0xFF) as u8;  // LBA[39:32]
+    fis[7] = 0x40; // Device: LBA mode
+    fis[8] = ((lba >> 24) & 0xFF) as u8; // LBA[31:24]
+    fis[9] = ((lba >> 32) & 0xFF) as u8; // LBA[39:32]
     fis[10] = ((lba >> 40) & 0xFF) as u8; // LBA[47:40]
     fis[11] = 0; // features hi
     fis[12] = (n & 0xFF) as u8;
@@ -94,7 +94,9 @@ kernel_test_in!("drivers/storage/ahci", smoke_ahci_prd_byte_count_encoding);
 /// (byte-swapped pairs), LBA-28 capacity (words 60–61), and LBA-48
 /// capacity (words 100–103, gated by word 83 bit 10).
 fn smoke_ahci_identify_parser() -> TestResult {
-    use crate::ahci::{identify_features, identify_lba28_capacity, identify_lba48_capacity, identify_model};
+    use crate::ahci::{
+        identify_features, identify_lba28_capacity, identify_lba48_capacity, identify_model,
+    };
 
     let mut id = [0u8; 512];
     // Write "TESTDISK            " as ATA model string at word 27 (byte 54).
@@ -145,7 +147,7 @@ kernel_test_in!("drivers/storage/ahci", smoke_ahci_identify_parser);
 fn smoke_ahci_read_dma_ext_encode() -> TestResult {
     // Command-list header word 0: PRDT_LEN=1, W=0, CFL=5.
     let header_w0: u32 = (1u32 << 16) | 5; // no bit 6 (W=0 means read)
-    // CFIS bytes.
+                                           // CFIS bytes.
     let lba: u64 = 0xABCD_EF01_2345;
     let n_sectors: u16 = 7;
     let mut cfis = [0u8; 20];
@@ -586,7 +588,10 @@ fn smoke_vmd_match_kind_matches_synthetic_device() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/vmd", smoke_vmd_match_kind_matches_synthetic_device);
+kernel_test_in!(
+    "drivers/storage/vmd",
+    smoke_vmd_match_kind_matches_synthetic_device
+);
 
 fn smoke_vmd_rejects_unrelated_intel_device() -> TestResult {
     // Probe with the AHCI ICH9 device ID — also vendor 0x8086 —
@@ -621,7 +626,10 @@ fn smoke_vmd_rejects_unrelated_intel_device() -> TestResult {
         Ok(_) => TestResult::Fail("vmd: probe must not claim non-VMD devices"),
     }
 }
-kernel_test_in!("drivers/storage/vmd", smoke_vmd_rejects_unrelated_intel_device);
+kernel_test_in!(
+    "drivers/storage/vmd",
+    smoke_vmd_rejects_unrelated_intel_device
+);
 
 fn smoke_vmd_segment_base_is_high() -> TestResult {
     // VMD synthetic segments must live well clear of real ACPI _SEG
@@ -649,7 +657,9 @@ fn smoke_vmd_not_present_on_qemu_tcg() -> TestResult {
     let has_vmd = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
             && d.id.vendor == vmd::INTEL_VENDOR
-            && vmd::VMD_DEVICE_IDS.iter().any(|(did, _)| *did == d.id.device)
+            && vmd::VMD_DEVICE_IDS
+                .iter()
+                .any(|(did, _)| *did == d.id.device)
     });
     if has_vmd {
         return TestResult::Skip("vmd present (real-HW path); positive smoke is a follow-up");
@@ -669,7 +679,9 @@ kernel_test_in!("drivers/storage/vmd", smoke_vmd_not_present_on_qemu_tcg);
 
 fn smoke_sd_r1_status_error_mask() -> TestResult {
     use crate::sd_proto::R1Status;
-    let s = R1Status { raw: R1Status::ERR_ILLEGAL_CMD | (5 << 9) | (1 << 8) };
+    let s = R1Status {
+        raw: R1Status::ERR_ILLEGAL_CMD | (5 << 9) | (1 << 8),
+    };
     if !s.has_error() {
         return TestResult::Fail("ILLEGAL_CMD should be flagged");
     }
@@ -698,7 +710,10 @@ fn smoke_sd_r6_splits_rca_and_status() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/sd-proto", smoke_sd_r6_splits_rca_and_status);
+kernel_test_in!(
+    "drivers/storage/sd-proto",
+    smoke_sd_r6_splits_rca_and_status
+);
 
 fn smoke_sd_r7_check_pattern() -> TestResult {
     use crate::sd_proto::R7;
@@ -749,7 +764,10 @@ fn smoke_sd_csd_v2_extracts_capacity() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/sd-proto", smoke_sd_csd_v2_extracts_capacity);
+kernel_test_in!(
+    "drivers/storage/sd-proto",
+    smoke_sd_csd_v2_extracts_capacity
+);
 
 fn smoke_sd_cid_decodes_manufacturer_and_date() -> TestResult {
     use crate::sd_proto::Cid;
@@ -798,7 +816,10 @@ fn smoke_sd_cid_decodes_manufacturer_and_date() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/sd-proto", smoke_sd_cid_decodes_manufacturer_and_date);
+kernel_test_in!(
+    "drivers/storage/sd-proto",
+    smoke_sd_cid_decodes_manufacturer_and_date
+);
 
 // ── eMMC EXT_CSD smokes ────────────────────────────────────────────
 
@@ -814,7 +835,7 @@ fn smoke_emmc_ext_csd_capacity_decode() -> TestResult {
     use crate::emmc::{ExtCsd, EXT_CSD_REV, EXT_CSD_SEC_COUNT};
     let mut buf = [0u8; 512];
     buf[EXT_CSD_REV] = 8; // EXT_CSD revision 8 = JESD84-B51
-    // 64 GiB user partition = 134_217_728 sectors of 512 bytes.
+                          // 64 GiB user partition = 134_217_728 sectors of 512 bytes.
     let sectors: u32 = 134_217_728;
     buf[EXT_CSD_SEC_COUNT..EXT_CSD_SEC_COUNT + 4].copy_from_slice(&sectors.to_le_bytes());
     let ext = ExtCsd::parse(&buf).expect("parse");
@@ -857,7 +878,10 @@ fn smoke_emmc_ext_csd_partition_config_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_partition_config_decode);
+kernel_test_in!(
+    "drivers/storage/emmc",
+    smoke_emmc_ext_csd_partition_config_decode
+);
 
 fn smoke_emmc_ext_csd_boot_and_rpmb_size_mult() -> TestResult {
     use crate::emmc::{ExtCsd, EXT_CSD_BOOT_SIZE_MULT, EXT_CSD_RPMB_SIZE_MULT};
@@ -873,7 +897,10 @@ fn smoke_emmc_ext_csd_boot_and_rpmb_size_mult() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_boot_and_rpmb_size_mult);
+kernel_test_in!(
+    "drivers/storage/emmc",
+    smoke_emmc_ext_csd_boot_and_rpmb_size_mult
+);
 
 fn smoke_emmc_switch_argument_layout() -> TestResult {
     use crate::emmc::{ExtCsd, EXT_CSD_HS_TIMING, HS_TIMING_HS200};
@@ -907,18 +934,12 @@ fn smoke_emmc_pre_eol_warning_decoded() -> TestResult {
 }
 kernel_test_in!("drivers/storage/emmc", smoke_emmc_pre_eol_warning_decoded);
 
-
-
 // ── UFS / UFSHCI 3.0 ──────────────────────────────────────────────
 
-
-
 fn smoke_ufs_utrd_round_trip() -> TestResult {
-
     use crate::ufs::{CommandType, DataDir, OcsStatus, Utrd};
 
     let u = Utrd {
-
         command_type: CommandType::Scsi,
 
         data_dir: DataDir::DeviceToHost,
@@ -940,27 +961,20 @@ fn smoke_ufs_utrd_round_trip() -> TestResult {
         prdt_offset_bytes: 256,
 
         prdt_entry_count: 4,
-
     };
 
     let r = Utrd::unpack(&u.pack());
 
     if r != u {
-
         return TestResult::Fail("UTRD round-trip failed");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("drivers/storage/ufs", smoke_ufs_utrd_round_trip);
 
-
-
 fn smoke_ufs_command_upiu_layout() -> TestResult {
-
     use crate::ufs::{build_command_upiu, cmd_flags, UpiuHeader, UpiuType};
 
     // SCSI READ(10): opcode 0x28, lba=0x100, length=4 blocks.
@@ -970,9 +984,7 @@ fn smoke_ufs_command_upiu_layout() -> TestResult {
     let buf = build_command_upiu(0, 0x42, cmd_flags::READ, 0x800, &cdb);
 
     if buf.len() != 32 {
-
         return TestResult::Fail("Command UPIU should be 32 bytes");
-
     }
 
     let mut hdr = [0u8; 12];
@@ -982,39 +994,28 @@ fn smoke_ufs_command_upiu_layout() -> TestResult {
     let h = UpiuHeader::unpack(&hdr).expect("hdr");
 
     if h.kind != UpiuType::Command || h.task_tag != 0x42 || h.flags != cmd_flags::READ {
-
         return TestResult::Fail("command header decoded wrong");
-
     }
 
     let edl = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
 
     if edl != 0x800 {
-
         return TestResult::Fail("Expected Data Length lost");
-
     }
 
     if &buf[16..16 + cdb.len()] != cdb {
-
         return TestResult::Fail("CDB lost");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("drivers/storage/ufs", smoke_ufs_command_upiu_layout);
 
-
-
 fn smoke_ufs_response_upiu_decode() -> TestResult {
-
     use crate::ufs::{decode_response_upiu, UpiuHeader, UpiuType};
 
     let hdr = UpiuHeader {
-
         kind: UpiuType::Response,
 
         flags: 0,
@@ -1036,7 +1037,6 @@ fn smoke_ufs_response_upiu_decode() -> TestResult {
         device_information: 0,
 
         data_segment_length: 8,
-
     };
 
     let mut buf = alloc::vec::Vec::new();
@@ -1048,67 +1048,48 @@ fn smoke_ufs_response_upiu_decode() -> TestResult {
     buf.extend_from_slice(&[0xF0, 0x00, 0x05, 0x00, 0, 0, 0x0A, 0]);
 
     let (h, residual, sense) = match decode_response_upiu(&buf) {
-
         Some(t) => t,
 
         None => return TestResult::Fail("decode_response_upiu failed"),
-
     };
 
     if h.task_tag != 0x42 || h.status != 0x02 {
-
         return TestResult::Fail("response header decoded wrong");
-
     }
 
     if residual != 0x12345678 {
-
         return TestResult::Fail("residual lost");
-
     }
 
     if sense.len() != 8 {
-
         return TestResult::Fail("sense data length wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("drivers/storage/ufs", smoke_ufs_response_upiu_decode);
 
-
-
 fn smoke_ufs_prdt_byte_count_zero_based() -> TestResult {
-
     use crate::ufs::PrdtEntry;
 
     let e = PrdtEntry {
-
         data_addr: 0x0000_DEAD_BEEF_0000,
 
         byte_count: 4096,
-
     };
 
     let r = PrdtEntry::unpack(&e.pack());
 
     if r.byte_count != 4096 {
-
         return TestResult::Fail("PRDT round-trip byte count failed");
-
     }
 
     if r.data_addr != 0x0000_DEAD_BEEF_0000 {
-
         return TestResult::Fail("PRDT data addr lost");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("drivers/storage/ufs", smoke_ufs_prdt_byte_count_zero_based);
@@ -1130,8 +1111,8 @@ fn smoke_ahci_pmp_read_fis_layout() -> TestResult {
     let mut cfis = [0u8; 20];
     cfis[0] = 0x27;
     cfis[1] = 0x80 | 0x0F; // C=1 | PMP control port (0x0F)
-    cfis[2] = 0xE4;         // ATA_CMD_PMP_READ
-    cfis[3] = gscr_reg;     // GSCR register index in features field
+    cfis[2] = 0xE4; // ATA_CMD_PMP_READ
+    cfis[3] = gscr_reg; // GSCR register index in features field
 
     if cfis[0] != 0x27 {
         return TestResult::Fail("PMP READ FIS type must be 0x27 (H2D)");
@@ -1163,11 +1144,11 @@ kernel_test_in!("drivers/storage/ahci", smoke_ahci_pmp_read_fis_layout);
 fn smoke_ahci_pmp_gscr_decode() -> TestResult {
     // Synthetic GSCR register values.
     let gscr0: u32 = (0xBEEFu32 << 16) | 0xCAFEu32; // product=0xBEEF, vendor=0xCAFE
-    let gscr1: u32 = (0x12u32 << 8) | 0x03u32;       // major=0x12, minor=0x03
-    let gscr2: u32 = 0xF5u32;                         // num_ports = bits[3:0] = 5
-    let gscr64: u32 = 0x0000_0041u32;                 // features
+    let gscr1: u32 = (0x12u32 << 8) | 0x03u32; // major=0x12, minor=0x03
+    let gscr2: u32 = 0xF5u32; // num_ports = bits[3:0] = 5
+    let gscr64: u32 = 0x0000_0041u32; // features
 
-    let vendor  = (gscr0 & 0xFFFF) as u16;
+    let vendor = (gscr0 & 0xFFFF) as u16;
     let product = (gscr0 >> 16) as u16;
     let revision = ((gscr1 >> 8) & 0xFF) as u8;
     let num_ports = (gscr2 & 0x0F) as u8;
@@ -1278,7 +1259,10 @@ fn smoke_ahci_atapi_read_capacity_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/ahci", smoke_ahci_atapi_read_capacity_decode);
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_atapi_read_capacity_decode
+);
 
 /// Verify that PORT_IS_PHYRDY (bit 22) is the correct bit position
 /// for the PhyRdy change interrupt in PORT_IS / PORT_IE.
@@ -1313,7 +1297,7 @@ kernel_test_in!("drivers/storage/ahci", smoke_ahci_phyrdy_bit_position);
 /// `handle_phyrdy_change` with DET = 0 must return
 /// `PortLinkState::Disconnected` without attempting a port reset.
 fn smoke_ahci_hot_unplug_state_transition() -> TestResult {
-    use crate::ahci::{PortLinkState, ssts_decode, SSTS_DET_NO_DEVICE, SSTS_DET_PRESENT};
+    use crate::ahci::{ssts_decode, PortLinkState, SSTS_DET_NO_DEVICE, SSTS_DET_PRESENT};
 
     // Simulate reading PORT_SSTS after a hot-unplug: DET = 0, IPM = 0.
     let ssts_after_unplug: u32 = 0x0000_0000;
@@ -1323,7 +1307,9 @@ fn smoke_ahci_hot_unplug_state_transition() -> TestResult {
     let state = if det != SSTS_DET_PRESENT {
         PortLinkState::Disconnected
     } else {
-        PortLinkState::Connected { kind: crate::ahci::PortKind::Sata }
+        PortLinkState::Connected {
+            kind: crate::ahci::PortKind::Sata,
+        }
     };
 
     if state != PortLinkState::Disconnected {
@@ -1344,7 +1330,10 @@ fn smoke_ahci_hot_unplug_state_transition() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/storage/ahci", smoke_ahci_hot_unplug_state_transition);
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_hot_unplug_state_transition
+);
 
 // ── RTSX smokes ────────────────────────────────────────────────────
 
@@ -1630,9 +1619,7 @@ kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_r7_decode);
 /// round-trip: set both HS200 1.8 V and HS400 1.8 V bits and verify
 /// both predicates fire.
 fn smoke_mmc_cmd8_ext_csd_hs_flags() -> TestResult {
-    use crate::emmc::{
-        ExtCsd, CARD_TYPE_HS200_1V8, CARD_TYPE_HS400_1V8, EXT_CSD_CARD_TYPE,
-    };
+    use crate::emmc::{ExtCsd, CARD_TYPE_HS200_1V8, CARD_TYPE_HS400_1V8, EXT_CSD_CARD_TYPE};
 
     let mut buf = [0u8; 512];
     buf[EXT_CSD_CARD_TYPE] = CARD_TYPE_HS200_1V8 | CARD_TYPE_HS400_1V8;

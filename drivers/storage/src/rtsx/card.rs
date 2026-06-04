@@ -9,8 +9,8 @@
 //!   Linux `drivers/mmc/host/rtsx_pci_sdmmc.c` (GPL-2.0-or-later).
 
 use super::regs::{
-    BIPR_SD_EXIST, CARD_CLK_EN, CARD_CLK_EN_SD, CARD_OE, CARD_OE_SD, CARD_SELECT,
-    CARD_SELECT_SD, SD_BUS_WIDTH_1, SD_CFG1,
+    BIPR_SD_EXIST, CARD_CLK_EN, CARD_CLK_EN_SD, CARD_OE, CARD_OE_SD, CARD_SELECT, CARD_SELECT_SD,
+    SD_BUS_WIDTH_1, SD_CFG1,
 };
 
 /// SD card response types (determines how many bytes of response to
@@ -43,60 +43,115 @@ pub struct SdCmd {
 impl SdCmd {
     /// CMD0 — GO_IDLE_STATE.
     pub const fn go_idle() -> Self {
-        SdCmd { index: 0, arg: 0, rsp: RspType::None, app_cmd: false }
+        SdCmd {
+            index: 0,
+            arg: 0,
+            rsp: RspType::None,
+            app_cmd: false,
+        }
     }
 
     /// CMD8 — SEND_IF_COND (SD 2.0 voltage check).
     /// Argument: VHS=0x1 (2.7–3.6 V) + check pattern 0xAA → 0x000001AA.
     pub const fn send_if_cond() -> Self {
-        SdCmd { index: 8, arg: 0x000001AA, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 8,
+            arg: 0x000001AA,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 
     /// ACMD41 — SD_SEND_OP_COND (after CMD55 with RCA=0).
     /// `hcs` = 1 for SDHC/SDXC support.
     pub const fn acmd41(hcs: bool) -> Self {
         let ocr = 0x00FF_8000 | if hcs { 1u32 << 30 } else { 0 };
-        SdCmd { index: 41, arg: ocr, rsp: RspType::R1, app_cmd: true }
+        SdCmd {
+            index: 41,
+            arg: ocr,
+            rsp: RspType::R1,
+            app_cmd: true,
+        }
     }
 
     /// CMD55 — APP_CMD (sets RCA=0 before ACMD41).
     pub const fn app_cmd_prefix() -> Self {
-        SdCmd { index: 55, arg: 0, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 55,
+            arg: 0,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 
     /// CMD2 — ALL_SEND_CID.
     pub const fn all_send_cid() -> Self {
-        SdCmd { index: 2, arg: 0, rsp: RspType::R2, app_cmd: false }
+        SdCmd {
+            index: 2,
+            arg: 0,
+            rsp: RspType::R2,
+            app_cmd: false,
+        }
     }
 
     /// CMD3 — SEND_RELATIVE_ADDR (get RCA from card).
     pub const fn send_relative_addr() -> Self {
-        SdCmd { index: 3, arg: 0, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 3,
+            arg: 0,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 
     /// CMD7 — SELECT/DESELECT_CARD (select by RCA).
     pub const fn select_card(rca: u16) -> Self {
-        SdCmd { index: 7, arg: (rca as u32) << 16, rsp: RspType::R1b, app_cmd: false }
+        SdCmd {
+            index: 7,
+            arg: (rca as u32) << 16,
+            rsp: RspType::R1b,
+            app_cmd: false,
+        }
     }
 
     /// CMD17 — READ_SINGLE_BLOCK.
     pub const fn read_single_block(lba: u32) -> Self {
-        SdCmd { index: 17, arg: lba, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 17,
+            arg: lba,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 
     /// CMD24 — WRITE_BLOCK.
     pub const fn write_block(lba: u32) -> Self {
-        SdCmd { index: 24, arg: lba, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 24,
+            arg: lba,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 
     /// CMD16 — SET_BLOCKLEN (for SDSC cards; SDHC always 512).
     pub const fn set_blocklen(len: u32) -> Self {
-        SdCmd { index: 16, arg: len, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 16,
+            arg: len,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 
     /// CMD13 — SEND_STATUS.
     pub const fn send_status(rca: u16) -> Self {
-        SdCmd { index: 13, arg: (rca as u32) << 16, rsp: RspType::R1, app_cmd: false }
+        SdCmd {
+            index: 13,
+            arg: (rca as u32) << 16,
+            rsp: RspType::R1,
+            app_cmd: false,
+        }
     }
 }
 

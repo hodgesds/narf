@@ -47,7 +47,7 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use card::{SlotState, SdCardInfo, SdCmd};
+use card::{SdCardInfo, SdCmd, SlotState};
 use cmd::{build_sd_cmd_frame, CmdBuf};
 use regs::*;
 
@@ -85,8 +85,7 @@ const RTSX_BAR: u8 = 0;
 static RTSX: IrqSafeSpinLock<Option<RtsxController>> = IrqSafeSpinLock::new(None);
 
 /// How many RTSX devices have been successfully probed.
-static PROBE_COUNT: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static PROBE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // ── Error type ────────────────────────────────────────────────────
 
@@ -142,13 +141,12 @@ impl RtsxController {
         device_id: u16,
     ) -> Result<Self, RtsxError> {
         // SAFETY: caller-authority.
-        let mmio = unsafe { map_bar(device, RTSX_BAR) }
-            .map_err(|_| RtsxError::BarMapFailed)?;
+        let mmio = unsafe { map_bar(device, RTSX_BAR) }.map_err(|_| RtsxError::BarMapFailed)?;
 
-        let cmd_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| RtsxError::DmaAllocFailed)?;
-        let data_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| RtsxError::DmaAllocFailed)?;
+        let cmd_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| RtsxError::DmaAllocFailed)?;
+        let data_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| RtsxError::DmaAllocFailed)?;
 
         Ok(RtsxController {
             mmio,
@@ -187,10 +185,7 @@ impl RtsxController {
     /// # Safety
     /// Caller must not issue concurrent HAIMR or cmd-buffer transactions.
     pub unsafe fn haimr_write(&self, addr: u16, mask: u8, data: u8) -> Result<(), RtsxError> {
-        let val = HAIMR_WRITE
-            | ((addr as u32) << 16)
-            | ((mask as u32) << 8)
-            | (data as u32);
+        let val = HAIMR_WRITE | ((addr as u32) << 16) | ((mask as u32) << 8) | (data as u32);
         // SAFETY: identity-mapped MMIO.
         unsafe { self.write32(HAIMR, val) }
 
@@ -326,10 +321,7 @@ impl RtsxController {
     ///
     /// # Safety
     /// SD slot must be enabled; `cmd.index < 64`.
-    pub unsafe fn issue_sd_cmd(
-        &self,
-        cmd: &SdCmd,
-    ) -> Result<u32, RtsxError> {
+    pub unsafe fn issue_sd_cmd(&self, cmd: &SdCmd) -> Result<u32, RtsxError> {
         let frame = build_sd_cmd_frame(cmd.index, cmd.arg);
 
         let mut buf = CmdBuf::new();
@@ -369,10 +361,7 @@ impl RtsxController {
         let b4 = unsafe { self.haimr_read(SD_CMD4)? };
         let b5 = unsafe { self.haimr_read(SD_CMD5)? };
 
-        Ok(((b2 as u32) << 24)
-            | ((b3 as u32) << 16)
-            | ((b4 as u32) << 8)
-            | (b5 as u32))
+        Ok(((b2 as u32) << 24) | ((b3 as u32) << 16) | ((b4 as u32) << 8) | (b5 as u32))
     }
 
     /// Run the SD card identification sequence.
@@ -396,8 +385,7 @@ impl RtsxController {
         let mut ocr: u32 = 0;
         for _ in 0..1000 {
             let _ = unsafe { self.issue_sd_cmd(&SdCmd::app_cmd_prefix()) };
-            ocr = unsafe { self.issue_sd_cmd(&SdCmd::acmd41(is_v2)) }
-                .unwrap_or(0);
+            ocr = unsafe { self.issue_sd_cmd(&SdCmd::acmd41(is_v2)) }.unwrap_or(0);
             if ocr & (1 << 31) != 0 {
                 break;
             }
@@ -512,10 +500,7 @@ pub fn register_pci_driver() {
 }
 
 /// PCI probe callback — called when the bus matches an RTSX device.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
     // Check the device ID matches one we know.
     let did = device.id.device;
     if !RTSX_DEVICE_IDS.iter().any(|(id, _)| *id == did) {
@@ -523,8 +508,8 @@ pub fn probe(
     }
 
     // SAFETY: we own the device; PCI enumeration provides exclusive access.
-    let controller = unsafe { RtsxController::new(&device, &cap, did) }
-        .map_err(|_| ProbeError::BadDevice)?;
+    let controller =
+        unsafe { RtsxController::new(&device, &cap, did) }.map_err(|_| ProbeError::BadDevice)?;
 
     *RTSX.lock() = Some(controller);
     PROBE_COUNT.fetch_add(1, Ordering::Relaxed);

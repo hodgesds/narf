@@ -48,8 +48,8 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_bus::{
-    append_devices, map_bar, register_pci_driver, BusDevice, BusDeviceCap, MatchKind,
-    MmioRegion, PciMatch, ProbeError,
+    append_devices, map_bar, register_pci_driver, BusDevice, BusDeviceCap, MatchKind, MmioRegion,
+    PciMatch, ProbeError,
 };
 use narf_capabilities::{Cap, Write};
 
@@ -59,7 +59,7 @@ pub const INTEL_VENDOR: u16 = 0x8086;
 /// VMD device-ID table — every PCI ID Intel ships VMD bridges under.
 /// Sourced from `vmd_pci_tbl[]` in Linux `drivers/pci/controller/vmd.c`.
 pub const VMD_DEVICE_IDS: &[(u16, &str)] = &[
-    (0x201D, "vmd-original"),    // VMD (older)
+    (0x201D, "vmd-original"), // VMD (older)
     (0x28C0, "vmd-skylake-x"),
     (0x467F, "vmd-comet-lake"),
     (0x4C3D, "vmd-rocket-alder-lake-p"),
@@ -154,9 +154,7 @@ impl Vmd {
         // function 4 KiB stride, same vendor-ID sentinel checks.
         // SAFETY: cfgbar.phys is identity-mapped (Stage-3 invariant)
         // and we promised it's a real config window above.
-        let children = unsafe {
-            narf_bus::pcie::enumerate_segment(cfgbar.phys, n_buses, segment)
-        };
+        let children = unsafe { narf_bus::pcie::enumerate_segment(cfgbar.phys, n_buses, segment) };
 
         Ok(Self {
             device_id: device.id.device,
@@ -173,10 +171,7 @@ impl Vmd {
     pub fn install_children(&self) {
         if !self.children.is_empty() {
             append_devices(self.children.clone());
-            VMD_CHILDREN_FOUND.fetch_add(
-                self.children.len() as u32,
-                Ordering::AcqRel,
-            );
+            VMD_CHILDREN_FOUND.fetch_add(self.children.len() as u32, Ordering::AcqRel);
         }
     }
 
@@ -189,10 +184,7 @@ impl Vmd {
 
 /// Per-driver `probe` invoked by the bus driver-match dispatcher
 /// once a matching device is discovered.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
     // Defensive double-check: the match table only registers exact
     // VendorDevice entries for the eight Intel VMD IDs, but a future
     // edit might add a class backstop (VMD exposes class 0x010400
