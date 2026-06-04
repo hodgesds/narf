@@ -4580,6 +4580,7 @@ fn smoke_fdtable_concurrent_open_close_per_task() -> TestResult {
                 ops: Arc::new(NoopOps) as Arc<dyn FileOps>,
                 offset: 0,
                 flags: 0,
+                status_flags: 0,
             };
             // Open into THIS task's per-task table (keyed by
             // self.task_id, not the executor's current task id).

@@ -2298,6 +2298,208 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fcntl_flags_round_trip);
 
+// ── Wave-68 fcntl extensions: dup/CLOEXEC, status flags, locks ─────
+
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+fn smoke_userspace_fcntl_dupfd_cloexec() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext, FD_CLOEXEC,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+
+    struct S;
+    impl FileOps for S {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0, mode: narf_filesystem::Mode::FILE_RW, mtime_cycles: 0 }
+        }
+    }
+    static TASK: AtomicU64 = AtomicU64::new(0xD2);
+    fn t() -> u64 { TASK.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(t);
+    let task = TASK.load(Ordering::Relaxed);
+    let src = fd::with_table(task, |x| {
+        x.open(FdEntry { ops: Arc::new(S), offset: 0, flags: 0, status_flags: 0 })
+    })
+    .expect("table");
+
+    __test_clear_global();
+    let mut tbl = SyscallTable::new();
+    install_core_syscalls(&mut tbl);
+    install_global(tbl);
+
+    struct C { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for C {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // F_DUPFD_CLOEXEC dup the source fd; min-fd = 10.
+    let mut c = C {
+        args: SyscallArgs { arg0: src as u64, arg1: 1030, arg2: 10, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut c);
+    let new_fd = match c.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value >= 10 => r.value as u32,
+        _ => return TestResult::Fail("F_DUPFD_CLOEXEC did not return >= min fd"),
+    };
+
+    // F_GETFD on the new fd: must report FD_CLOEXEC stamped.
+    let mut g = C {
+        args: SyscallArgs { arg0: new_fd as u64, arg1: 1, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut g);
+    match g.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == FD_CLOEXEC as u64 => {}
+        _ => return TestResult::Fail("F_DUPFD_CLOEXEC did not stamp FD_CLOEXEC"),
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+kernel_test_in!("userspace", smoke_userspace_fcntl_dupfd_cloexec);
+
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+fn smoke_userspace_fcntl_status_flags() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+
+    struct S;
+    impl FileOps for S {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0, mode: narf_filesystem::Mode::FILE_RW, mtime_cycles: 0 }
+        }
+    }
+    static TASK: AtomicU64 = AtomicU64::new(0xD3);
+    fn t() -> u64 { TASK.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(t);
+    let task = TASK.load(Ordering::Relaxed);
+    let fd_n = fd::with_table(task, |x| {
+        x.open(FdEntry { ops: Arc::new(S), offset: 0, flags: 0, status_flags: 0 })
+    })
+    .expect("table");
+
+    __test_clear_global();
+    let mut tbl = SyscallTable::new();
+    install_core_syscalls(&mut tbl);
+    install_global(tbl);
+
+    struct C { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for C {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // F_SETFL O_NONBLOCK | O_APPEND.
+    let want = (crate::fd::O_NONBLOCK | crate::fd::O_APPEND) as u64;
+    let mut s = C {
+        args: SyscallArgs { arg0: fd_n as u64, arg1: 4, arg2: want, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut s);
+    if s.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("F_SETFL did not return 0");
+    }
+    // F_GETFL should report the same bits (masked to the settable set).
+    let mut g = C {
+        args: SyscallArgs { arg0: fd_n as u64, arg1: 3, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut g);
+    match g.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value & want == want => {}
+        _ => return TestResult::Fail("F_GETFL did not round-trip O_NONBLOCK|O_APPEND"),
+    }
+    // Verify the FdEntry actually carries the bits.
+    let observed = fd::with_table(task, |x| x.get(fd_n).map(|e| e.status_flags))
+        .flatten()
+        .unwrap_or(0);
+    if (observed as u64) & want != want {
+        return TestResult::Fail("FdEntry.status_flags missing the bits");
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+kernel_test_in!("userspace", smoke_userspace_fcntl_status_flags);
+
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
+    use crate::fd::locks;
+    locks::__test_reset();
+    // Same key, two owners, overlapping write requests.
+    let key: usize = 0xDEAD_BEEF;
+    let a = locks::Lock { owner: 1, ty: locks::F_WRLCK, start: 0, len: 100 };
+    let b = locks::Lock { owner: 2, ty: locks::F_WRLCK, start: 50, len: 100 };
+    if locks::try_set(key, a).is_err() {
+        return TestResult::Fail("first lock install must succeed");
+    }
+    match locks::try_set(key, b) {
+        Err(blocker) if blocker.owner == 1 => {}
+        Ok(()) => return TestResult::Fail("overlapping write lock must conflict"),
+        Err(_) => return TestResult::Fail("blocker should be owner 1"),
+    }
+    // Probe must surface the same blocker.
+    match locks::probe(key, b) {
+        Some(l) if l.owner == 1 && l.ty == locks::F_WRLCK => {}
+        _ => return TestResult::Fail("probe did not surface blocker"),
+    }
+    // Two readers must coexist.
+    locks::__test_reset();
+    let r1 = locks::Lock { owner: 1, ty: locks::F_RDLCK, start: 0, len: 100 };
+    let r2 = locks::Lock { owner: 2, ty: locks::F_RDLCK, start: 50, len: 100 };
+    if locks::try_set(key, r1).is_err() || locks::try_set(key, r2).is_err() {
+        return TestResult::Fail("overlapping read locks must coexist");
+    }
+    // Release on owner-exit clears the bucket.
+    locks::release_owner(1);
+    locks::release_owner(2);
+    if locks::probe(key, r1).is_some() {
+        return TestResult::Fail("release_owner did not drain locks");
+    }
+    locks::__test_reset();
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+kernel_test_in!("userspace", smoke_userspace_fcntl_setlk_conflict);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_stat_returns_size() -> TestResult {
     use crate::{

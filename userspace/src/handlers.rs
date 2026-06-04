@@ -1104,6 +1104,11 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // Resolve any socket-side flag BEFORE entering the fd-table
+    // closure — `current_socket` itself locks the table, which would
+    // re-enter and deadlock if called from inside `with_table`.
+    let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
+
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
         Some(match cmd {
@@ -1117,8 +1122,8 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // its own nonblock toggle (kept in sync via F_SETFL).
             F_GETFL => {
                 let mut v = entry.status_flags as u64;
-                if let Some(sock) = current_socket(fd) {
-                    if sock.is_nonblock() {
+                if let Some(nb) = sock_nb {
+                    if nb {
                         v |= crate::socket::O_NONBLOCK as u64;
                     } else {
                         v &= !(crate::socket::O_NONBLOCK as u64);
