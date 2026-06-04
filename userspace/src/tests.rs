@@ -12088,6 +12088,78 @@ fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_tiocspgrp_round_trip);
 
+// Wave-60: two ConsoleFile instances must not share fg_pgrp.
+// Pre-fix, TIOCSPGRP poked a single global, so any "second tty"
+// would be a thin alias of the first.
+fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
+    use crate::fd::{ConsoleFile, TIOCGPGRP, TIOCSPGRP};
+    use narf_filesystem::FileOps;
+
+    let tty_a = ConsoleFile::new();
+    let tty_b = ConsoleFile::new();
+
+    // Set tty_a's fg_pgrp to 111.
+    let pgid_a: i32 = 111;
+    if tty_a
+        .ioctl(TIOCSPGRP, &pgid_a as *const _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCSPGRP on tty_a failed");
+    }
+
+    // Read tty_b — must still be 0 (unset), not 111.
+    let mut got_b: i32 = -1;
+    if tty_b
+        .ioctl(TIOCGPGRP, &mut got_b as *mut _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCGPGRP on tty_b failed");
+    }
+    if got_b != 0 {
+        return TestResult::Fail("tty_b fg_pgrp leaked from tty_a write");
+    }
+
+    // Set tty_b's fg_pgrp to 222.
+    let pgid_b: i32 = 222;
+    if tty_b
+        .ioctl(TIOCSPGRP, &pgid_b as *const _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCSPGRP on tty_b failed");
+    }
+
+    // tty_a must still read back 111, not 222.
+    let mut got_a: i32 = -1;
+    if tty_a
+        .ioctl(TIOCGPGRP, &mut got_a as *mut _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCGPGRP on tty_a failed");
+    }
+    if got_a != 111 {
+        return TestResult::Fail("tty_a fg_pgrp clobbered by tty_b write");
+    }
+    if got_b != 0 {
+        return TestResult::Fail("tty_b earlier read was wrong");
+    }
+
+    // Confirm tty_b reads 222 now.
+    let mut got_b2: i32 = -1;
+    if tty_b
+        .ioctl(TIOCGPGRP, &mut got_b2 as *mut _ as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCGPGRP on tty_b (second) failed");
+    }
+    if got_b2 != 222 {
+        return TestResult::Fail("tty_b fg_pgrp did not round-trip");
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_per_tty_fg_pgrp_is_isolated);
+
 fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,

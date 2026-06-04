@@ -140,7 +140,7 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
         // Stage-4 default: all three stdio slots route to the
         // kernel console. stdin reads return 0 (EOF) until a
         // real keyboard/serial backing lands.
-        let console: Arc<dyn FileOps> = Arc::new(ConsoleFile);
+        let console: Arc<dyn FileOps> = Arc::new(ConsoleFile::new());
         t.set(
             0,
             FdEntry {
@@ -170,16 +170,40 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
     Some(op(table))
 }
 
-/// Per-task default stdio backing. Reads always return 0 (EOF);
-/// writes go to the kernel console via `narf_console::Writer`.
-/// Replaces the historical hardcoded fd=1/2 console fast-path
-/// inside `sys_write` — sys_write now routes everything through
-/// the fd table uniformly.
-struct ConsoleFile;
+/// Per-tty backing. Reads drain the input ring; writes go to the
+/// kernel console via `narf_console::Writer`. Each `ConsoleFile`
+/// instance owns its own foreground process group, so once `/dev/pts`
+/// lands a per-PTY TIOCSPGRP write only affects that one tty.
+///
+/// The stdio fast-path (fd 0/1/2 sharing one `Arc<ConsoleFile>`) still
+/// shares fg_pgrp across the three slots — that matches POSIX: stdio
+/// inherits from the controlling tty, so tcsetpgrp on fd 0 is visible
+/// on fd 1/2 of the same shell.
+pub struct ConsoleFile {
+    /// Foreground process group for this tty. 0 = unset; a job-
+    /// control shell calls `tcsetpgrp` (TIOCSPGRP) at startup.
+    fg_pgrp: AtomicU64,
+}
+
+impl ConsoleFile {
+    pub const fn new() -> Self {
+        Self {
+            fg_pgrp: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for ConsoleFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl core::fmt::Debug for ConsoleFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ConsoleFile").finish()
+        f.debug_struct("ConsoleFile")
+            .field("fg_pgrp", &self.fg_pgrp.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -224,11 +248,6 @@ static CONSOLE_WINSIZE: IrqSafeSpinLock<Winsize> = IrqSafeSpinLock::new(Winsize 
     ws_ypixel: 0,
 });
 
-/// Foreground process group for the console tty. 0 = unset; a job-
-/// control shell calls `tcsetpgrp` (TIOCSPGRP) at startup with its
-/// own pgid so SIGINT routing works.
-static CONSOLE_FG_PGRP: AtomicU64 = AtomicU64::new(0);
-
 /// Query the current console window size. Test hook + introspection.
 pub fn console_winsize() -> Winsize {
     *CONSOLE_WINSIZE.lock()
@@ -239,17 +258,8 @@ pub fn set_console_winsize(ws: Winsize) {
     *CONSOLE_WINSIZE.lock() = ws;
 }
 
-/// Query the console's foreground process group (TIOCGPGRP).
-pub fn console_fg_pgrp() -> u64 {
-    CONSOLE_FG_PGRP.load(Ordering::Acquire)
-}
-
-/// Set the console's foreground process group (TIOCSPGRP).
-pub fn set_console_fg_pgrp(pgid: u64) {
-    CONSOLE_FG_PGRP.store(pgid, Ordering::Release);
-}
-
-/// Reset terminal state — test hook.
+/// Reset terminal state — test hook. Per-tty `fg_pgrp` drops with
+/// the `ConsoleFile` Arc when the test tears down its fd table.
 #[doc(hidden)]
 pub fn __test_reset_tty() {
     *CONSOLE_WINSIZE.lock() = Winsize {
@@ -258,7 +268,6 @@ pub fn __test_reset_tty() {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    CONSOLE_FG_PGRP.store(0, Ordering::Release);
 }
 
 impl FileOps for ConsoleFile {
@@ -338,7 +347,7 @@ impl FileOps for ConsoleFile {
             }
             TIOCGPGRP => {
                 // pid_t = i32 on Linux x86_64.
-                let pgrp = console_fg_pgrp() as i32;
+                let pgrp = self.fg_pgrp.load(Ordering::Acquire) as i32;
                 let bytes = pgrp.to_le_bytes();
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
@@ -354,7 +363,7 @@ impl FileOps for ConsoleFile {
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
                 }
-                set_console_fg_pgrp(pgrp as u64);
+                self.fg_pgrp.store(pgrp as u64, Ordering::Release);
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),
