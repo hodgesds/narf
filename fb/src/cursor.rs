@@ -123,10 +123,7 @@ fn snapshot(fb: &FbWriter, x: u32, y: u32) -> Vec<Pixel32> {
 
 /// Restore previously-saved pixels at their original position.
 fn restore(fb: &FbWriter, save: &SavedRect) -> Result<(), crate::FbWriteError> {
-    fb.blit(
-        Rect::new(save.x, save.y, save.w, save.h),
-        &save.pixels,
-    )
+    fb.blit(Rect::new(save.x, save.y, save.w, save.h), &save.pixels)
 }
 
 /// Drain the Pointer event ring, apply each event to the cursor

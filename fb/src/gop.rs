@@ -150,7 +150,10 @@ impl ProtocolMode {
     /// Build a unified `Framebuffer` descriptor.
     pub fn to_framebuffer(self) -> Result<crate::gop::Framebuffer, GopError> {
         if self.framebuffer_base == 0
-            || matches!(self.mode.pixel_format, PixelFormat::BltOnly | PixelFormat::Other)
+            || matches!(
+                self.mode.pixel_format,
+                PixelFormat::BltOnly | PixelFormat::Other
+            )
         {
             return Err(GopError::NoFramebuffer);
         }

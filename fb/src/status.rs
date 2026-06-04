@@ -97,11 +97,12 @@ pub fn paint(fb: &FbWriter) {
     // Panic-latched: paint the panel red. A bare-metal operator
     // sees the bottom of the screen flip from navy to red at the
     // first panic — unmissable without serial.
-    let bg = if diag.panic_latched { PANEL_BG_PANIC } else { PANEL_BG };
-    let _ = fb.fill(
-        Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD),
-        bg,
-    );
+    let bg = if diag.panic_latched {
+        PANEL_BG_PANIC
+    } else {
+        PANEL_BG
+    };
+    let _ = fb.fill(Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD), bg);
 
     let info = crate::info();
     let fb_line = match info {
@@ -112,10 +113,7 @@ pub fn paint(fb: &FbWriter) {
             i.height,
             narf_time::cycles_per_ns(),
         ),
-        None => format!(
-            "FB: none  tsc-cpns: {}",
-            narf_time::cycles_per_ns(),
-        ),
+        None => format!("FB: none  tsc-cpns: {}", narf_time::cycles_per_ns(),),
     };
 
     // All counts are atomic loads — no registry / namespace /
@@ -132,7 +130,11 @@ pub fn paint(fb: &FbWriter) {
         if xhci_up { "up" } else { "no" },
         kbd_n,
         mouse_n,
-        if crate::cursor::moves() > 0 { "ACTIVE" } else { "idle" },
+        if crate::cursor::moves() > 0 {
+            "ACTIVE"
+        } else {
+            "idle"
+        },
     );
 
     // USB HID pump telemetry. All three are AtomicU32; reading
@@ -161,7 +163,11 @@ pub fn paint(fb: &FbWriter) {
         narf_time::cycles_per_ns(),
         {
             let v = narf_input::I8042_KBD_IRQ_VECTOR.load(Ordering::Acquire);
-            if v == 0 { 0 } else { narf_interrupts::fire_count(v) }
+            if v == 0 {
+                0
+            } else {
+                narf_interrupts::fire_count(v)
+            }
         },
     );
 
