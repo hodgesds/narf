@@ -171,6 +171,8 @@ pub struct SdCard {
     /// CCS bit from ACMD41 — 1 = SDHC/SDXC (block-addressed),
     /// 0 = SDSC (byte-addressed).
     pub ccs: bool,
+    /// Card capacity in 512-byte blocks.
+    pub capacity_blocks: u64,
 }
 
 pub struct Sdhci {
@@ -465,6 +467,12 @@ impl Sdhci {
         let r6 = self.cmd(3, 0, RESP_48, false, 0, 0, 0)?;
         let rca = (r6 >> 16) as u16;
 
+        // CMD9 (SEND_CSD) — 136-bit response. Addressed by RCA in Standby state.
+        let _ = self.cmd(9, (rca as u32) << 16, RESP_136, false, 0, 0, 0)?;
+        let csd_raw = self.read_response_136();
+        let csd = crate::sd_proto::Csd::parse_shifted(&csd_raw).unwrap_or_default();
+        let capacity_blocks = csd.capacity_bytes / 512;
+
         // CMD7 (SELECT/DESELECT_CARD) — move card to TRAN state so
         // subsequent CMD17/24 are accepted.
         let _ = self.cmd(7, (rca as u32) << 16, RESP_48_BUSY, false, 0, 0, 0)?;
@@ -478,6 +486,7 @@ impl Sdhci {
             cid,
             if_cond_match,
             ccs,
+            capacity_blocks,
         })
     }
 
@@ -636,6 +645,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     };
     *CONTROLLER.lock() = Some(dev);
+
+    if let Some(card) = CONTROLLER.lock().as_ref().unwrap().card.lock().as_ref() {
+        if card.capacity_blocks > 0 {
+            let block_dev = alloc::sync::Arc::new(SdhciBlockDevice {
+                capacity_blocks: card.capacity_blocks,
+                ccs: card.ccs,
+            });
+            narf_block::registry::register_block_device("sdhci0", block_dev);
+        }
+    }
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("sd0"),
         kind: narf_drivers::BoundKind::Block,
@@ -644,6 +664,81 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
     Ok(())
+}
+
+struct SdhciBlockDevice {
+    capacity_blocks: u64,
+    ccs: bool,
+}
+
+impl narf_block::registry::BlockDeviceSync for SdhciBlockDevice {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+
+    fn capacity(&self) -> u64 {
+        self.capacity_blocks
+    }
+
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), narf_block::registry::BlockIoError> {
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let needed = n_blocks as usize * 512;
+        if out.len() < needed {
+            return Err(narf_block::registry::BlockIoError::BufferTooSmall);
+        }
+        let max_lba = self.capacity_blocks.saturating_sub(n_blocks as u64);
+        if lba > max_lba {
+            return Err(narf_block::registry::BlockIoError::OutOfRange);
+        }
+
+        with_controller(|ctrl| {
+            for i in 0..n_blocks as u64 {
+                let block_addr = if self.ccs {
+                    (lba + i) as u32
+                } else {
+                    ((lba + i) as u32).saturating_mul(512)
+                };
+                let offset = i as usize * 512;
+                let mut buf = [0u8; 512];
+                ctrl.read_block(block_addr, &mut buf).map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
+                out[offset..offset + 512].copy_from_slice(&buf);
+            }
+            Ok(())
+        })
+        .unwrap_or(Err(narf_block::registry::BlockIoError::DriverError))
+    }
+
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::registry::BlockIoError> {
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let needed = n_blocks as usize * 512;
+        if data.len() < needed {
+            return Err(narf_block::registry::BlockIoError::BufferTooSmall);
+        }
+        let max_lba = self.capacity_blocks.saturating_sub(n_blocks as u64);
+        if lba > max_lba {
+            return Err(narf_block::registry::BlockIoError::OutOfRange);
+        }
+
+        with_controller(|ctrl| {
+            for i in 0..n_blocks as u64 {
+                let block_addr = if self.ccs {
+                    (lba + i) as u32
+                } else {
+                    ((lba + i) as u32).saturating_mul(512)
+                };
+                let offset = i as usize * 512;
+                let mut buf = [0u8; 512];
+                buf.copy_from_slice(&data[offset..offset + 512]);
+                ctrl.write_block(block_addr, &buf).map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
+            }
+            Ok(())
+        })
+        .unwrap_or(Err(narf_block::registry::BlockIoError::DriverError))
+    }
 }
 
 pub fn register_pci_driver() {
