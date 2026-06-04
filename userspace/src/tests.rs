@@ -12514,3 +12514,128 @@ fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
     }
 }
 kernel_test_in!("userspace", smoke_sys_kill_sighup_sigint_sigabrt_round_trip);
+
+// ── Wave-67 — PID + mount namespaces ───────────────────────────────
+
+/// CLONE_NEWPID via the namespace module directly: the task gets
+/// bound as inner pid 1, and `self_inner_pid` returns 1 even though
+/// the outer pid is whatever the root pool minted.
+#[cfg(feature = "container")]
+fn smoke_unshare_pid_ns_sees_self_as_pid_one() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let fake_task: u64 = 0xABCD_1234;
+    let fake_outer: u64 = 4242;
+    let ns = crate::pid_ns::unshare_pid_ns(fake_task, fake_outer);
+    if ns.outer_to_inner(fake_outer) != Some(1) {
+        return TestResult::Fail("first bind should be inner pid 1");
+    }
+    if crate::pid_ns::self_inner_pid(fake_task, fake_outer) != 1 {
+        return TestResult::Fail("self_inner_pid != 1 after unshare");
+    }
+    // Outer pid still resolvable for kernel-side delivery.
+    if ns.inner_to_outer(1) != Some(fake_outer) {
+        return TestResult::Fail("inner→outer translation broken");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_unshare_pid_ns_sees_self_as_pid_one);
+
+/// Child inherits the parent's namespace and gets a fresh inner pid
+/// (parent stays at 1; child becomes 2).
+#[cfg(feature = "container")]
+fn smoke_pid_ns_inherit_assigns_child_inner_two() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let parent_task: u64 = 0x1111;
+    let parent_outer: u64 = 100;
+    let child_outer: u64 = 101;
+
+    let ns = crate::pid_ns::unshare_pid_ns(parent_task, parent_outer);
+    assert_eq!(ns.outer_to_inner(parent_outer), Some(1));
+
+    let child_inner = match crate::pid_ns::inherit_into_child(parent_task, child_outer) {
+        Some(i) => i,
+        None => return TestResult::Fail("inherit_into_child returned None"),
+    };
+    if child_inner != 2 {
+        return TestResult::Fail("child inner pid != 2");
+    }
+    if crate::pid_ns::self_inner_pid(child_outer, child_outer) != 2 {
+        return TestResult::Fail("child self_inner_pid != 2");
+    }
+    if ns.inner_to_outer(2) != Some(child_outer) {
+        return TestResult::Fail("ns missing child translation");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_inherit_assigns_child_inner_two);
+
+/// Outside-the-namespace caller (root NS) can still target a task
+/// inside a child namespace by its outer pid. The resolve_inner_pid
+/// identity branch keeps the outer pid intact, signal-pending bit
+/// lands on the outer pid.
+#[cfg(feature = "container")]
+fn smoke_kill_from_outside_namespace_addresses_by_outer_pid() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let child_task: u64 = 0x2222;
+    let child_outer: u64 = 200;
+    let _ns = crate::pid_ns::unshare_pid_ns(child_task, child_outer);
+
+    // The root-namespace caller has no entry in TASK_PID_NS, so
+    // resolve_inner_pid returns Some(input).
+    let outside_caller: u64 = 0x3333;
+    let resolved = match crate::pid_ns::resolve_inner_pid(outside_caller, child_outer) {
+        Some(v) => v,
+        None => return TestResult::Fail("root NS caller should resolve identically"),
+    };
+    if resolved != child_outer {
+        return TestResult::Fail("root NS resolve broke outer pid");
+    }
+
+    // The in-namespace task targeting itself by inner pid 1 must
+    // also resolve to the child's outer pid.
+    let inside = match crate::pid_ns::resolve_inner_pid(child_task, 1) {
+        Some(v) => v,
+        None => return TestResult::Fail("inside task can't resolve inner pid 1"),
+    };
+    if inside != child_outer {
+        return TestResult::Fail("inner→outer translation broken inside NS");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace",
+    smoke_kill_from_outside_namespace_addresses_by_outer_pid
+);
+
+/// Mount namespace snapshot: a private NS sees its own mount table,
+/// independent of further mounts on the global registry.
+#[cfg(feature = "container")]
+fn smoke_mount_ns_isolates_per_task_mounts() -> TestResult {
+    // Snapshot the global registry into two private NSes. They start
+    // with the same view but diverge once mounts are added to one.
+    // We don't have a no-side-effect mount-adder here, so the
+    // assertion is structural: snapshot_global produces a distinct
+    // Arc per call (each task gets its own).
+    let ns_a = narf_filesystem::MountNamespace::snapshot_global();
+    let ns_b = narf_filesystem::MountNamespace::snapshot_global();
+    if alloc::sync::Arc::ptr_eq(&ns_a, &ns_b) {
+        return TestResult::Fail("snapshot_global returned aliased Arc");
+    }
+    // Both snapshots reflect the same set of mount paths.
+    let mut paths_a = ns_a.list();
+    let mut paths_b = ns_b.list();
+    paths_a.sort();
+    paths_b.sort();
+    if paths_a != paths_b {
+        return TestResult::Fail("snapshots disagree on initial mount set");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_mount_ns_isolates_per_task_mounts);
