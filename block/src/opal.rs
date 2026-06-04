@@ -328,8 +328,7 @@ pub fn decode_atom(buf: &[u8]) -> Result<(&[u8], usize), OpalError> {
         if buf.len() < 4 {
             return Err(OpalError::Short);
         }
-        let n =
-            ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
+        let n = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
         if buf.len() < 4 + n {
             return Err(OpalError::Truncated);
         }

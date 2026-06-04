@@ -338,18 +338,12 @@ fn smoke_scsi_status_constants() -> TestResult {
 }
 kernel_test_in!("block/scsi", smoke_scsi_status_constants);
 
-
-
 // ── TCG OPAL ──────────────────────────────────────────────────────
 
-
-
 fn smoke_opal_compacket_header_round_trip() -> TestResult {
-
     use crate::opal::ComPacketHeader;
 
     let h = ComPacketHeader {
-
         com_id: 0x07FE,
 
         com_id_ext: 0,
@@ -359,7 +353,6 @@ fn smoke_opal_compacket_header_round_trip() -> TestResult {
         min_transfer: 0,
 
         length: 64,
-
     };
 
     let buf = h.encode();
@@ -367,21 +360,15 @@ fn smoke_opal_compacket_header_round_trip() -> TestResult {
     let r = ComPacketHeader::decode(&buf).expect("decode");
 
     if r != h {
-
         return TestResult::Fail("ComPacket round-trip");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("block/opal", smoke_opal_compacket_header_round_trip);
 
-
-
 fn smoke_opal_atom_round_trip() -> TestResult {
-
     use crate::opal::{decode_atom, encode_short_atom, encode_tiny_uint};
 
     // Tiny: 0..=63 single byte.
@@ -393,9 +380,7 @@ fn smoke_opal_atom_round_trip() -> TestResult {
     let (payload, n) = decode_atom(&tiny_buf).expect("tiny");
 
     if n != 1 || payload[0] != 42 {
-
         return TestResult::Fail("tiny atom decode");
-
     }
 
     // Short: 5 bytes of payload.
@@ -405,21 +390,15 @@ fn smoke_opal_atom_round_trip() -> TestResult {
     let (p2, n2) = decode_atom(&s).expect("short");
 
     if p2 != b"hello" || n2 != s.len() {
-
         return TestResult::Fail("short atom decode");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("block/opal", smoke_opal_atom_round_trip);
 
-
-
 fn smoke_opal_level0_discovery_walks_features() -> TestResult {
-
     use crate::opal::{feature, parse_level0_discovery};
 
     // Build a synthetic Level 0 Discovery response with two
@@ -466,48 +445,39 @@ fn smoke_opal_level0_discovery_walks_features() -> TestResult {
 
     let (h, descs) = parse_level0_discovery(&buf).expect("parse");
 
-    if h.parameter_length != param_len { return TestResult::Fail("length"); }
+    if h.parameter_length != param_len {
+        return TestResult::Fail("length");
+    }
 
-    if descs.len() != 2 { return TestResult::Fail("feature count"); }
+    if descs.len() != 2 {
+        return TestResult::Fail("feature count");
+    }
 
     if descs[0].feature_code != feature::TPER || descs[0].data.len() != 4 {
-
         return TestResult::Fail("TPer descriptor");
-
     }
 
     if descs[1].feature_code != feature::OPAL_V2 || descs[1].data.len() != 16 {
-
         return TestResult::Fail("Opal v2 descriptor");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("block/opal", smoke_opal_level0_discovery_walks_features);
 
-
-
 fn smoke_opal_token_constants() -> TestResult {
-
     use crate::opal::token;
 
     if token::CALL != 0xF8 || token::END_OF_DATA != 0xF9 || token::END_OF_SESSION != 0xFA {
-
         return TestResult::Fail("method-call tokens");
-
     }
 
     if token::START_LIST != 0xF0 || token::END_LIST != 0xF1 {
-
         return TestResult::Fail("list tokens");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("block/opal", smoke_opal_token_constants);
@@ -521,19 +491,27 @@ fn smoke_block_registry_uniform_read() -> TestResult {
     // virtio-blk-pci / AHCI. cargo xtask test runs without the boot-time
     // pci-probe-all path that normally binds those drivers, so register
     // synthetic stubs under the canonical names before checking.
+    use crate::block_devices;
     use crate::registry::{
         block_device_count, register_block_device, unregister_block_device, BlockDeviceSync,
         BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
     };
-    use crate::block_devices;
     use alloc::sync::Arc;
 
     struct Stub;
     impl BlockDeviceSync for Stub {
-        fn lba_size(&self) -> u32 { 512 }
-        fn capacity(&self) -> u64 { 2048 }
-        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> { Ok(()) }
-        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> { Ok(()) }
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            2048
+        }
+        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
     }
 
     let saved = __snapshot_for_test();
@@ -654,7 +632,10 @@ fn smoke_block_deadline_write_only_drains_in_order() -> TestResult {
     use crate::{BlockOp, DeadlineScheduler};
     let s = DeadlineScheduler::new();
     for i in 0..4 {
-        s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x100 + i), u64::MAX);
+        s.enqueue(
+            make_block_request(BlockOp::Write { fua: false }, 0x100 + i),
+            u64::MAX,
+        );
     }
     if s.writes_pending() != 4 {
         return TestResult::Fail("writes_pending didn't reach 4");
@@ -706,15 +687,27 @@ fn smoke_block_deadline_streak_resets_after_write() -> TestResult {
     let s = DeadlineScheduler::new();
     // STARVE_BOUND reads then 1 write — write promotes after the run.
     for i in 0..STARVE_BOUND {
-        s.enqueue(make_block_request(BlockOp::Read, 0x100 + i as u64), u64::MAX);
+        s.enqueue(
+            make_block_request(BlockOp::Read, 0x100 + i as u64),
+            u64::MAX,
+        );
     }
-    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0xC0), u64::MAX);
+    s.enqueue(
+        make_block_request(BlockOp::Write { fua: false }, 0xC0),
+        u64::MAX,
+    );
     // Now add 5 more reads + 1 more write so we can observe streak
     // reset behaviour.
     for i in 0..STARVE_BOUND {
-        s.enqueue(make_block_request(BlockOp::Read, 0x200 + i as u64), u64::MAX);
+        s.enqueue(
+            make_block_request(BlockOp::Read, 0x200 + i as u64),
+            u64::MAX,
+        );
     }
-    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0xCC), u64::MAX);
+    s.enqueue(
+        make_block_request(BlockOp::Write { fua: false }, 0xCC),
+        u64::MAX,
+    );
 
     // First batch of reads: STARVE_BOUND of them.
     for _ in 0..STARVE_BOUND {
@@ -828,10 +821,18 @@ fn smoke_block_registry_register_find_round_trip() -> TestResult {
 
     struct Stub;
     impl BlockDeviceSync for Stub {
-        fn lba_size(&self) -> u32 { 512 }
-        fn capacity(&self) -> u64 { 8 }
-        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> { Ok(()) }
-        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> { Ok(()) }
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            8
+        }
+        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
     }
 
     // Save boot-time registrations so later tests (e.g.
@@ -923,7 +924,7 @@ fn build_mbr_sector(kind: u8) -> [u8; 512] {
     s[450] = kind;
     s[454..458].copy_from_slice(&1u32.to_le_bytes()); // start_lba
     s[458..462].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sector_count
-    // 0xAA55 signature.
+                                                                // 0xAA55 signature.
     s[510] = 0x55;
     s[511] = 0xAA;
     s
@@ -952,7 +953,10 @@ fn smoke_block_partition_mbr_parse_signature_and_entry() -> TestResult {
     let _ = MBR_BOOT_SIGNATURE; // doc-link sanity
     TestResult::Pass
 }
-kernel_test_in!("block/partition", smoke_block_partition_mbr_parse_signature_and_entry);
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_mbr_parse_signature_and_entry
+);
 
 fn smoke_block_partition_gpt_protective_detected() -> TestResult {
     use crate::partition::{is_gpt_protective, parse_mbr};
@@ -970,7 +974,10 @@ fn smoke_block_partition_gpt_protective_detected() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("block/partition", smoke_block_partition_gpt_protective_detected);
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_gpt_protective_detected
+);
 
 /// Build a 92-byte minimal GPT primary header (rest of sector is
 /// zero-padding). Header fields per UEFI 2.10 §5.3.2.
@@ -1012,7 +1019,10 @@ fn smoke_block_partition_gpt_header_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("block/partition", smoke_block_partition_gpt_header_round_trip);
+kernel_test_in!(
+    "block/partition",
+    smoke_block_partition_gpt_header_round_trip
+);
 
 fn smoke_block_partition_gpt_header_rejects_bad_signature() -> TestResult {
     use crate::partition::{parse_gpt_header, GptError};
@@ -1034,12 +1044,12 @@ fn smoke_block_partition_gpt_entries_decode_names_and_lba_range() -> TestResult 
     // (0FC63DAF-8483-4772-8E79-3D69D8477DE4) — first 16 bytes.
     let mut array = alloc::vec![0u8; 256];
     array[0..16].copy_from_slice(&[
-        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
-        0x7D, 0xE4,
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
+        0xE4,
     ]);
     array[32..40].copy_from_slice(&2048u64.to_le_bytes()); // start_lba
     array[40..48].copy_from_slice(&(2048u64 + 4096 - 1).to_le_bytes()); // end_lba inclusive
-    // Name "NARFROOT" as UTF-16LE.
+                                                                        // Name "NARFROOT" as UTF-16LE.
     let name = "NARFROOT";
     for (i, c) in name.chars().enumerate() {
         let cu = c as u16;
@@ -1157,8 +1167,7 @@ fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
     // LBA 0: protective MBR with single 0xEE entry.
     let mbr_off = 0;
     bytes[mbr_off + 446 + 4] = 0xEE; // kind
-    bytes[mbr_off + 446 + 8..mbr_off + 446 + 12]
-        .copy_from_slice(&1u32.to_le_bytes()); // start_lba
+    bytes[mbr_off + 446 + 8..mbr_off + 446 + 12].copy_from_slice(&1u32.to_le_bytes()); // start_lba
     bytes[mbr_off + 510] = 0x55;
     bytes[mbr_off + 511] = 0xAA;
     // LBA 1: GPT header (92-byte minimal).
@@ -1173,16 +1182,16 @@ fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
     bytes[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes()); // entries LBA
     bytes[h + 80..h + 84].copy_from_slice(&2u32.to_le_bytes()); // num entries
     bytes[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes()); // entry size
-    // LBA 2: one non-empty entry + one empty entry.
+                                                                  // LBA 2: one non-empty entry + one empty entry.
     let e = 1024; // byte offset of LBA 2
-    // Type GUID — Linux root GUID first 16 bytes.
+                  // Type GUID — Linux root GUID first 16 bytes.
     bytes[e..e + 16].copy_from_slice(&[
-        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
-        0x7D, 0xE4,
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
+        0xE4,
     ]);
     bytes[e + 32..e + 40].copy_from_slice(&100u64.to_le_bytes()); // start
     bytes[e + 40..e + 48].copy_from_slice(&199u64.to_le_bytes()); // end inclusive
-    // Second entry stays all-zero (empty).
+                                                                  // Second entry stays all-zero (empty).
 
     let parent = Arc::new(VecBlock {
         data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(bytes)),
@@ -1190,7 +1199,7 @@ fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
     }) as Arc<dyn crate::BlockDeviceSync>;
 
     use crate::registry::{
-        find_block_device, __reset_for_test, __restore_for_test, __snapshot_for_test,
+        __reset_for_test, __restore_for_test, __snapshot_for_test, find_block_device,
     };
     // Snapshot + restore the registry so this test doesn't pollute it.
     let snap = __snapshot_for_test();
@@ -1226,7 +1235,10 @@ kernel_test_in!(
 // LBAs carry the target FS's magic + minimal valid superblock, then
 // verifies detect_filesystem picks the right FsType.
 
-fn synthetic_block(payload: alloc::vec::Vec<u8>, lba_size: u32) -> alloc::sync::Arc<dyn crate::BlockDeviceSync> {
+fn synthetic_block(
+    payload: alloc::vec::Vec<u8>,
+    lba_size: u32,
+) -> alloc::sync::Arc<dyn crate::BlockDeviceSync> {
     use alloc::sync::Arc;
     // Pad to a multiple of lba_size.
     let mut padded = payload;
@@ -1254,7 +1266,10 @@ fn smoke_block_fs_detect_ext_via_magic_at_byte_1080() -> TestResult {
         }
     }
 }
-kernel_test_in!("block/fs_detect", smoke_block_fs_detect_ext_via_magic_at_byte_1080);
+kernel_test_in!(
+    "block/fs_detect",
+    smoke_block_fs_detect_ext_via_magic_at_byte_1080
+);
 
 fn smoke_block_fs_detect_fat_via_bpb_and_signature() -> TestResult {
     use crate::fs_detect::{detect_filesystem, FsType};
@@ -1278,7 +1293,10 @@ fn smoke_block_fs_detect_fat_via_bpb_and_signature() -> TestResult {
         }
     }
 }
-kernel_test_in!("block/fs_detect", smoke_block_fs_detect_fat_via_bpb_and_signature);
+kernel_test_in!(
+    "block/fs_detect",
+    smoke_block_fs_detect_fat_via_bpb_and_signature
+);
 
 fn smoke_block_fs_detect_exfat_via_oem_signature() -> TestResult {
     use crate::fs_detect::{detect_filesystem, FsType};
@@ -1298,7 +1316,10 @@ fn smoke_block_fs_detect_exfat_via_oem_signature() -> TestResult {
         }
     }
 }
-kernel_test_in!("block/fs_detect", smoke_block_fs_detect_exfat_via_oem_signature);
+kernel_test_in!(
+    "block/fs_detect",
+    smoke_block_fs_detect_exfat_via_oem_signature
+);
 
 fn smoke_block_fs_detect_iso9660_via_cd001() -> TestResult {
     use crate::fs_detect::{detect_filesystem, FsType};
@@ -1345,7 +1366,10 @@ fn smoke_block_fs_detect_returns_none_for_zero_disk() -> TestResult {
         }
     }
 }
-kernel_test_in!("block/fs_detect", smoke_block_fs_detect_returns_none_for_zero_disk);
+kernel_test_in!(
+    "block/fs_detect",
+    smoke_block_fs_detect_returns_none_for_zero_disk
+);
 
 // ── block/sync_to_async (SyncBlock geometry forwarding) ──────────────
 
@@ -1375,5 +1399,7 @@ fn smoke_sync_block_reports_geometry_from_inner() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("block/sync_to_async", smoke_sync_block_reports_geometry_from_inner);
-
+kernel_test_in!(
+    "block/sync_to_async",
+    smoke_sync_block_reports_geometry_from_inner
+);

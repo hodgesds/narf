@@ -267,9 +267,7 @@ impl SyncBlock {
         }
         // SAFETY: identity-mapped DMA bytes (see DmaBuffer doc),
         // exclusive for the duration of this synchronous IO.
-        let slice = unsafe {
-            core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), total)
-        };
+        let slice = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), total) };
         let map_err = |e: BlockIoError| match e {
             BlockIoError::OutOfRange => BlockError::InvalidRange,
             BlockIoError::BufferTooSmall => BlockError::InvalidRange,
@@ -278,10 +276,7 @@ impl SyncBlock {
         };
         match req.op {
             BlockOp::Read => self.0.read(req.lba, blocks, slice).map_err(map_err),
-            BlockOp::Write { fua: _ } => self
-                .0
-                .write(req.lba, blocks, slice)
-                .map_err(map_err),
+            BlockOp::Write { fua: _ } => self.0.write(req.lba, blocks, slice).map_err(map_err),
             BlockOp::WriteZeroes => {
                 for b in slice.iter_mut() {
                     *b = 0;

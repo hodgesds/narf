@@ -90,9 +90,7 @@ impl From<BlockIoError> for DetectError {
 /// FAT / exFAT / squashfs; LBA 2-3 covers ext; LBA 16 covers
 /// ISO9660; LBA 128 covers btrfs). The function returns at the
 /// first hit so cheap matches don't pay for the deeper reads.
-pub fn detect_filesystem(
-    dev: &Arc<dyn BlockDeviceSync>,
-) -> Result<Option<FsType>, DetectError> {
+pub fn detect_filesystem(dev: &Arc<dyn BlockDeviceSync>) -> Result<Option<FsType>, DetectError> {
     let lba_size = dev.lba_size();
     if !matches!(lba_size, 512 | 1024 | 2048 | 4096) {
         return Err(DetectError::UnsupportedLbaSize(lba_size));
@@ -116,15 +114,11 @@ pub fn detect_filesystem(
     let ext_magic_byte = ext_byte_offset + 56;
     let ext_first_lba = (ext_byte_offset / lba_size as usize) as u64;
     let ext_last_byte = ext_magic_byte + 2; // need 2 bytes for the magic
-    let ext_lba_count = (ext_last_byte + lba_size as usize - 1) / lba_size as usize
-        - ext_first_lba as usize;
+    let ext_lba_count =
+        (ext_last_byte + lba_size as usize - 1) / lba_size as usize - ext_first_lba as usize;
     let mut ext_buf = vec![0u8; ext_lba_count * lba_size as usize];
     if dev
-        .read(
-            ext_first_lba,
-            ext_lba_count as u16,
-            &mut ext_buf,
-        )
+        .read(ext_first_lba, ext_lba_count as u16, &mut ext_buf)
         .is_ok()
     {
         let in_buf_off = ext_magic_byte - ext_first_lba as usize * lba_size as usize;
@@ -168,11 +162,7 @@ pub fn detect_filesystem(
 
 fn is_squashfs(lba0: &[u8]) -> bool {
     // 'hsqs' little-endian = 0x73717368.
-    lba0.len() >= 4
-        && lba0[0] == 0x68
-        && lba0[1] == 0x73
-        && lba0[2] == 0x71
-        && lba0[3] == 0x73
+    lba0.len() >= 4 && lba0[0] == 0x68 && lba0[1] == 0x73 && lba0[2] == 0x71 && lba0[3] == 0x73
 }
 
 fn is_exfat(lba0: &[u8]) -> bool {

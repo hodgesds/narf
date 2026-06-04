@@ -108,7 +108,10 @@ pub fn parse_mbr(sector0: &[u8]) -> Result<[MbrPartition; 4], MbrError> {
 /// covering most of the disk. Returns `true` iff the disk should be
 /// re-read as GPT rather than treated as legacy MBR.
 pub fn is_gpt_protective(mbr: &[MbrPartition; 4]) -> bool {
-    let proto_count = mbr.iter().filter(|p| p.kind == MBR_TYPE_GPT_PROTECTIVE).count();
+    let proto_count = mbr
+        .iter()
+        .filter(|p| p.kind == MBR_TYPE_GPT_PROTECTIVE)
+        .count();
     let other_count = mbr
         .iter()
         .filter(|p| p.kind != 0 && p.kind != MBR_TYPE_GPT_PROTECTIVE)
@@ -229,7 +232,9 @@ impl GptPartition {
     }
     /// Sector count = end - start + 1 (inclusive endpoints).
     pub fn sector_count(&self) -> u64 {
-        self.end_lba.saturating_sub(self.start_lba).saturating_add(1)
+        self.end_lba
+            .saturating_sub(self.start_lba)
+            .saturating_add(1)
     }
 }
 
@@ -239,11 +244,7 @@ impl GptPartition {
 /// `count` should equal `header.num_partition_entries`. Empty
 /// (zero type-GUID) entries are included so the caller's indexing
 /// matches the on-disk slot order.
-pub fn parse_gpt_partitions(
-    array: &[u8],
-    entry_size: usize,
-    count: usize,
-) -> Vec<GptPartition> {
+pub fn parse_gpt_partitions(array: &[u8], entry_size: usize, count: usize) -> Vec<GptPartition> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let off = i * entry_size;
@@ -352,7 +353,10 @@ impl BlockDeviceSync for PartitionBlockDevice {
     }
     fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
-        if lba.checked_add(n).map_or(true, |end| end > self.sector_count) {
+        if lba
+            .checked_add(n)
+            .map_or(true, |end| end > self.sector_count)
+        {
             return Err(BlockIoError::OutOfRange);
         }
         let abs = self.start_lba + lba;
@@ -360,7 +364,10 @@ impl BlockDeviceSync for PartitionBlockDevice {
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
-        if lba.checked_add(n).map_or(true, |end| end > self.sector_count) {
+        if lba
+            .checked_add(n)
+            .map_or(true, |end| end > self.sector_count)
+        {
             return Err(BlockIoError::OutOfRange);
         }
         let abs = self.start_lba + lba;
@@ -409,9 +416,7 @@ pub fn scan_and_register_partitions(
     let lba_bytes = parent.lba_size() as usize;
     // Read LBA 0.
     let mut sector0 = alloc::vec![0u8; lba_bytes];
-    parent
-        .read(0, 1, &mut sector0)
-        .map_err(ScanError::Mbr)?;
+    parent.read(0, 1, &mut sector0).map_err(ScanError::Mbr)?;
     let mbr = parse_mbr(&sector0).map_err(ScanError::MbrSignature)?;
     let mut registered = Vec::new();
 

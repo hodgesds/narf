@@ -137,7 +137,11 @@ impl BlockFileShim {
     fn from_fake(dev: Arc<FakeBlockDevice>) -> Self {
         let lba_size = dev.lba_size();
         let lba_count = dev.capacity();
-        Self { dev, lba_size, lba_count }
+        Self {
+            dev,
+            lba_size,
+            lba_count,
+        }
     }
 
     fn byte_capacity(&self) -> u64 {
@@ -212,9 +216,15 @@ fn smoke_e2e_unaligned_read_spans_3_lbas() -> TestResult {
     let dev = FakeBlockDevice::new_1mib();
     {
         let mut g = dev.data.lock();
-        for b in g[0..512].iter_mut()    { *b = 0xAA; }
-        for b in g[512..1024].iter_mut() { *b = 0xBB; }
-        for b in g[1024..1536].iter_mut() { *b = 0xCC; }
+        for b in g[0..512].iter_mut() {
+            *b = 0xAA;
+        }
+        for b in g[512..1024].iter_mut() {
+            *b = 0xBB;
+        }
+        for b in g[1024..1536].iter_mut() {
+            *b = 0xCC;
+        }
     }
     let bf = BlockFileShim::from_fake(dev.clone());
 
@@ -345,7 +355,10 @@ fn smoke_e2e_unaligned_rmw_preserves_surrounding_bytes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("block/e2e", smoke_e2e_unaligned_rmw_preserves_surrounding_bytes);
+kernel_test_in!(
+    "block/e2e",
+    smoke_e2e_unaligned_rmw_preserves_surrounding_bytes
+);
 
 // ── Smoke 7 (block-side): FakeBlockDevice counter invariants ──────────
 //

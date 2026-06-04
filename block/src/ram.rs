@@ -69,7 +69,9 @@ impl RamBlockDevice {
 
     fn byte_range(&self, lba: u64, blocks: u32) -> Result<(usize, usize), BlockError> {
         let lbs = self.logical_block_size as u64;
-        let end = lba.checked_add(blocks as u64).ok_or(BlockError::InvalidRange)?;
+        let end = lba
+            .checked_add(blocks as u64)
+            .ok_or(BlockError::InvalidRange)?;
         if end > self.capacity_blocks {
             return Err(BlockError::InvalidRange);
         }

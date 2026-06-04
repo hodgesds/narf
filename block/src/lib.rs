@@ -29,16 +29,16 @@ extern crate alloc;
 
 pub mod deadline;
 pub mod encrypted;
-pub mod mq;
 pub mod fs_detect;
+pub mod mq;
 pub mod opal;
 pub mod partition;
 pub mod ram;
 pub mod registry;
 pub mod scsi;
 
-mod tests;
 mod e2e_tests;
+mod tests;
 
 pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
