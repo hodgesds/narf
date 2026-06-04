@@ -636,6 +636,35 @@ pub fn replace_address_space(
     id: TaskId,
     new_arc: Arc<AddressSpace>,
 ) -> Option<Arc<AddressSpace>> {
+    // Wave-49fu: when execve fires from inside a user task's poll
+    // body (the normal case), the slot has been popped from the
+    // ready queue and lives on the executor's stack — the queue
+    // scan below won't find it. Two updates are needed for the
+    // mismatch-free outcome:
+    //
+    //   1. ACTIVE_USER_AS — the trap path / sys_* handlers read
+    //      this immediately for any further #PF / mmap / brk in the
+    //      same poll round (e.g. demand-paging the new image's
+    //      stack writes during the bytes-walk of init_sysv_stack).
+    //   2. PENDING_SLOT_AS map — the slot will be pushed back to
+    //      the queue on Poll::Pending; on the NEXT round the
+    //      scheduler must publish the NEW AS, not the slot's stale
+    //      addr_space field. The map is checked after the slot is
+    //      popped; the override takes precedence over the slot's
+    //      own field.
+    let id_now = CURRENT_TASK.load(Ordering::Acquire);
+    if id_now == id.raw() {
+        {
+            let mut g = ACTIVE_USER_AS.lock();
+            let _ = g.take();
+            *g = Some(new_arc.clone());
+        }
+        let mut p = PENDING_SLOT_AS.lock();
+        let prev = p.iter().find(|(k, _)| *k == id.raw()).map(|(_, v)| v.clone());
+        p.retain(|(k, _)| *k != id.raw());
+        p.push((id.raw(), new_arc));
+        return prev;
+    }
     for q in READY.iter() {
         let mut g = q.lock();
         if let Some(ref mut dq) = *g {
@@ -647,6 +676,27 @@ pub fn replace_address_space(
         }
     }
     None
+}
+
+/// Wave-49fu: pending slot AS updates queued by `replace_address_
+/// space` when the target slot is the currently-polling task. The
+/// scheduler's per-poll prelude drains this on pop and applies the
+/// override to the slot's `addr_space` before activate. Vec instead
+/// of BTreeMap to avoid an alloc-only dependency on `alloc::collections`
+/// for one-or-two-entry workloads. Wave-49+ may swap this to a
+/// `BTreeMap` if the post-fork burst pattern needs it.
+static PENDING_SLOT_AS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, Arc<AddressSpace>)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Drain `PENDING_SLOT_AS` for the given task id, returning the
+/// pending AS if any. Called by `poll_one_round` after popping a
+/// slot — the caller assigns the override into `slot.addr_space`
+/// so the activate + ACTIVE_USER_AS publication see the new AS.
+fn take_pending_slot_as(id: TaskId) -> Option<Arc<AddressSpace>> {
+    let mut p = PENDING_SLOT_AS.lock();
+    let pos = p.iter().position(|(k, _)| *k == id.raw())?;
+    let (_, v) = p.swap_remove(pos);
+    Some(v)
 }
 
 /// Errors `donate_to` can return.
@@ -1106,6 +1156,21 @@ pub fn run_until_empty() {
                     None => break,
                 }
             };
+
+            // Wave-49fu: apply any deferred AS update that
+            // `replace_address_space` queued while this slot was
+            // off-queue (currently polling). Without this, an
+            // execve-driven AS swap that fired during the prior
+            // poll body only updated ACTIVE_USER_AS for the rest of
+            // that round — the slot's own `addr_space` stayed at the
+            // pre-execve value, and the next round's activate() +
+            // ACTIVE_USER_AS publication would resurrect the stale
+            // AS, mis-routing demand-paging into the wrong PML4 and
+            // looping the user task on its first write to any
+            // post-execve heap page.
+            if let Some(new_as) = take_pending_slot_as(slot.id) {
+                slot.addr_space = Some(new_as);
+            }
 
             // Settle any pending donation claim before deciding to
             // drop. A revoked donation cap rolls back both sides;
