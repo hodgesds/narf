@@ -109,9 +109,15 @@ impl MsQuirks {
     /// Xbox One controller force-feedback (deferred).
     pub const QUIRK_FF: Self = Self(1 << 7);
 
-    pub const fn empty() -> Self { Self(0) }
-    pub const fn union(self, o: Self) -> Self { Self(self.0 | o.0) }
-    pub const fn contains(self, o: Self) -> bool { (self.0 & o.0) == o.0 }
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn union(self, o: Self) -> Self {
+        Self(self.0 | o.0)
+    }
+    pub const fn contains(self, o: Self) -> bool {
+        (self.0 & o.0) == o.0
+    }
 }
 
 /// One row of the device match table.
@@ -124,10 +130,20 @@ pub struct MsDeviceId {
 }
 
 const fn usb(pid: u16, q: MsQuirks) -> MsDeviceId {
-    MsDeviceId { vid: USB_VENDOR_ID_MICROSOFT, pid, bluetooth: false, quirks: q }
+    MsDeviceId {
+        vid: USB_VENDOR_ID_MICROSOFT,
+        pid,
+        bluetooth: false,
+        quirks: q,
+    }
 }
 const fn bt(pid: u16, q: MsQuirks) -> MsDeviceId {
-    MsDeviceId { vid: USB_VENDOR_ID_MICROSOFT, pid, bluetooth: true, quirks: q }
+    MsDeviceId {
+        vid: USB_VENDOR_ID_MICROSOFT,
+        pid,
+        bluetooth: true,
+        quirks: q,
+    }
 }
 
 /// Microsoft HID device match table. Mirrors `ms_devices[]` at
@@ -138,29 +154,52 @@ pub const MICROSOFT_DEVICES: &[MsDeviceId] = &[
     usb(USB_DEVICE_ID_MS_NE4K, MsQuirks::ERGONOMY),
     usb(USB_DEVICE_ID_MS_NE4K_JP, MsQuirks::ERGONOMY),
     usb(USB_DEVICE_ID_MS_NE7K, MsQuirks::ERGONOMY),
-    usb(USB_DEVICE_ID_MS_LK6K, MsQuirks::ERGONOMY.union(MsQuirks::RDESC)),
+    usb(
+        USB_DEVICE_ID_MS_LK6K,
+        MsQuirks::ERGONOMY.union(MsQuirks::RDESC),
+    ),
     usb(USB_DEVICE_ID_MS_PRESENTER_8K_USB, MsQuirks::PRESENTER),
     usb(USB_DEVICE_ID_MS_DIGITAL_MEDIA_3K, MsQuirks::ERGONOMY),
     usb(USB_DEVICE_ID_MS_DIGITAL_MEDIA_7K, MsQuirks::ERGONOMY),
     usb(USB_DEVICE_ID_MS_DIGITAL_MEDIA_600, MsQuirks::ERGONOMY),
     usb(USB_DEVICE_ID_MS_DIGITAL_MEDIA_3KV1, MsQuirks::ERGONOMY),
     usb(USB_DEVICE_ID_WIRELESS_OPTICAL_DESKTOP_3_0, MsQuirks::NOGET),
-    usb(USB_DEVICE_ID_MS_COMFORT_MOUSE_4500, MsQuirks::DUPLICATE_USAGES),
+    usb(
+        USB_DEVICE_ID_MS_COMFORT_MOUSE_4500,
+        MsQuirks::DUPLICATE_USAGES,
+    ),
     usb(USB_DEVICE_ID_MS_POWER_COVER, MsQuirks::HIDINPUT),
     usb(USB_DEVICE_ID_MS_COMFORT_KEYBOARD, MsQuirks::ERGONOMY),
     bt(USB_DEVICE_ID_MS_PRESENTER_8K_BT, MsQuirks::PRESENTER),
     bt(BT_DEVICE_ID_MS_SURFACE_DIAL, MsQuirks::SURFACE_DIAL),
-    bt(USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708, MsQuirks::QUIRK_FF),
-    bt(USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE, MsQuirks::QUIRK_FF),
-    bt(USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1914, MsQuirks::QUIRK_FF),
-    bt(USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797, MsQuirks::QUIRK_FF),
-    bt(USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797_BLE, MsQuirks::QUIRK_FF),
+    bt(
+        USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708,
+        MsQuirks::QUIRK_FF,
+    ),
+    bt(
+        USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE,
+        MsQuirks::QUIRK_FF,
+    ),
+    bt(
+        USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1914,
+        MsQuirks::QUIRK_FF,
+    ),
+    bt(
+        USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797,
+        MsQuirks::QUIRK_FF,
+    ),
+    bt(
+        USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797_BLE,
+        MsQuirks::QUIRK_FF,
+    ),
     bt(USB_DEVICE_ID_8BITDO_SN30_PRO_PLUS, MsQuirks::QUIRK_FF),
 ];
 
 /// Look up a device by VID/PID/bluetooth.
 pub fn lookup(vid: u16, pid: u16, bluetooth: bool) -> Option<&'static MsDeviceId> {
-    MICROSOFT_DEVICES.iter().find(|d| d.vid == vid && d.pid == pid && d.bluetooth == bluetooth)
+    MICROSOFT_DEVICES
+        .iter()
+        .find(|d| d.vid == vid && d.pid == pid && d.bluetooth == bluetooth)
 }
 
 // ── NE4K / Wireless Receiver 1028 report-descriptor fix-up ────────
@@ -229,17 +268,41 @@ pub const HID_UP_GENDESK: u8 = 0x01;
 /// Sculpt / Comfort keyboard families via `MsQuirks::ERGONOMY`.
 pub const MS_ERGO_KEYS: &[MsErgoKey] = &[
     // Consumer-page reserved values used as Office hotkeys.
-    MsErgoKey { usage_low: 0x29D, page: HID_UP_CONSUMER, keycode: KeyCode::PlayPause }, // PROG1
-    MsErgoKey { usage_low: 0x29E, page: HID_UP_CONSUMER, keycode: KeyCode::Stop },      // PROG2
+    MsErgoKey {
+        usage_low: 0x29D,
+        page: HID_UP_CONSUMER,
+        keycode: KeyCode::PlayPause,
+    }, // PROG1
+    MsErgoKey {
+        usage_low: 0x29E,
+        page: HID_UP_CONSUMER,
+        keycode: KeyCode::Stop,
+    }, // PROG2
     // Vendor-page hotkeys.
-    MsErgoKey { usage_low: 0xfd06, page: HID_UP_MSVENDOR, keycode: KeyCode::PlayPause }, // CHAT
-    MsErgoKey { usage_low: 0xfd07, page: HID_UP_MSVENDOR, keycode: KeyCode::Stop },      // PHONE
+    MsErgoKey {
+        usage_low: 0xfd06,
+        page: HID_UP_MSVENDOR,
+        keycode: KeyCode::PlayPause,
+    }, // CHAT
+    MsErgoKey {
+        usage_low: 0xfd07,
+        page: HID_UP_MSVENDOR,
+        keycode: KeyCode::Stop,
+    }, // PHONE
     // Numeric-keypad equals + parens (NARF maps to plain Equal /
     // letter approximations because there's no KpEqual / KpParen).
-    MsErgoKey { usage_low: 0xff00, page: HID_UP_MSVENDOR, keycode: KeyCode::Equal },
+    MsErgoKey {
+        usage_low: 0xff00,
+        page: HID_UP_MSVENDOR,
+        keycode: KeyCode::Equal,
+    },
     // F13..F18 — mapped down to F10..F12 + repeats since NARF caps
     // its F-key range at F12. Linux carries F13..F18 distinctly.
-    MsErgoKey { usage_low: 0xff05, page: HID_UP_MSVENDOR, keycode: KeyCode::F10 },
+    MsErgoKey {
+        usage_low: 0xff05,
+        page: HID_UP_MSVENDOR,
+        keycode: KeyCode::F10,
+    },
 ];
 
 /// Look up a Microsoft ergonomy vendor-page usage → KeyCode.
@@ -256,11 +319,11 @@ pub fn ergo_usage_to_keycode(page: u8, usage_low: u16) -> Option<KeyCode> {
 /// back / play-pause / close / play. Mirrors `ms_presenter_8k_quirk`
 /// at `hid-microsoft.c:142`.
 pub const MS_PRESENTER_KEYS: &[(u16, KeyCode)] = &[
-    (0xfd08, KeyCode::NextSong),       // FORWARD
-    (0xfd09, KeyCode::PreviousSong),   // BACK
+    (0xfd08, KeyCode::NextSong),     // FORWARD
+    (0xfd09, KeyCode::PreviousSong), // BACK
     (0xfd0b, KeyCode::PlayPause),
-    (0xfd0e, KeyCode::Stop),           // CLOSE
-    (0xfd0f, KeyCode::PlayPause),      // PLAY
+    (0xfd0e, KeyCode::Stop),      // CLOSE
+    (0xfd0f, KeyCode::PlayPause), // PLAY
 ];
 
 /// Look up a Presenter Mouse 8000 vendor-page hotkey → KeyCode.
@@ -316,7 +379,11 @@ pub fn surface_dial_to_pointer(ev: SurfaceDialEvent) -> PointerEvent {
     PointerEvent {
         dx: ev.rotation as i32,
         dy: 0,
-        buttons: if ev.pressed { PointerButtons::LEFT } else { PointerButtons::EMPTY },
+        buttons: if ev.pressed {
+            PointerButtons::LEFT
+        } else {
+            PointerButtons::EMPTY
+        },
     }
 }
 
@@ -349,7 +416,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/microsoft", smoke_microsoft_device_table_size);
+    kernel_test_in!(
+        "drivers/usb/hid/microsoft",
+        smoke_microsoft_device_table_size
+    );
 
     // ── Smoke 2: NE4K / 1028 report-descriptor fix-up ──
 
@@ -382,7 +452,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/microsoft", smoke_microsoft_1028_rdesc_fixup);
+    kernel_test_in!(
+        "drivers/usb/hid/microsoft",
+        smoke_microsoft_1028_rdesc_fixup
+    );
 
     // ── Smoke 3: ergonomy + presenter table lookups ──
 
@@ -409,7 +482,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/microsoft", smoke_microsoft_ergo_presenter_lookup);
+    kernel_test_in!(
+        "drivers/usb/hid/microsoft",
+        smoke_microsoft_ergo_presenter_lookup
+    );
 
     // ── Smoke 4: Surface Dial rotation event ──
 
@@ -449,5 +525,8 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/microsoft", smoke_microsoft_surface_dial_rotation);
+    kernel_test_in!(
+        "drivers/usb/hid/microsoft",
+        smoke_microsoft_surface_dial_rotation
+    );
 }

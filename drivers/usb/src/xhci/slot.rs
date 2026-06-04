@@ -52,15 +52,13 @@ pub enum SlotState {
 
 impl SlotState {
     pub fn from_dword3(d3: u32) -> Option<Self> {
-        Some(
-            match (d3 & SLOT_CTX_STATE_MASK) >> SLOT_CTX_STATE_SHIFT {
-                0 => SlotState::DisabledOrEnabled,
-                1 => SlotState::Default,
-                2 => SlotState::Addressed,
-                3 => SlotState::Configured,
-                _ => return None,
-            },
-        )
+        Some(match (d3 & SLOT_CTX_STATE_MASK) >> SLOT_CTX_STATE_SHIFT {
+            0 => SlotState::DisabledOrEnabled,
+            1 => SlotState::Default,
+            2 => SlotState::Addressed,
+            3 => SlotState::Configured,
+            _ => return None,
+        })
     }
 }
 
@@ -78,25 +76,20 @@ pub fn encode_slot_ctx_dword0(
         | (((speed as u32) << SLOT_CTX_SPEED_SHIFT) & SLOT_CTX_SPEED_MASK)
         | (if mtt { SLOT_CTX_MTT_BIT } else { 0 })
         | (if hub { SLOT_CTX_HUB_BIT } else { 0 })
-        | (((ctx_entries as u32) << SLOT_CTX_CTX_ENTRIES_SHIFT)
-            & SLOT_CTX_CTX_ENTRIES_MASK)
+        | (((ctx_entries as u32) << SLOT_CTX_CTX_ENTRIES_SHIFT) & SLOT_CTX_CTX_ENTRIES_MASK)
 }
 
 /// Encode Slot Context dword 1 (§6.2.2 Table 6-5):
 /// MaxExitLatency in bits[15:0], root_hub_port in bits[23:16], number
 /// of downstream ports if hub in bits[31:24].
 pub fn encode_slot_ctx_dword1(max_exit_lat: u16, root_hub_port: u8, num_ports: u8) -> u32 {
-    (max_exit_lat as u32)
-        | ((root_hub_port as u32) << 16)
-        | ((num_ports as u32) << 24)
+    (max_exit_lat as u32) | ((root_hub_port as u32) << 16) | ((num_ports as u32) << 24)
 }
 
 /// Encode Slot Context dword 2 (§6.2.2 Table 6-6 — LS/FS-behind-HS-hub
 /// fields). All zero for HS+ devices on root hub.
 pub fn encode_slot_ctx_dword2(parent_hub_slot: u8, parent_port: u8, tt_think_time: u8) -> u32 {
-    (parent_hub_slot as u32)
-        | ((parent_port as u32) << 8)
-        | (((tt_think_time as u32) & 0x3) << 16)
+    (parent_hub_slot as u32) | ((parent_port as u32) << 8) | (((tt_think_time as u32) & 0x3) << 16)
 }
 
 /// Encode an Endpoint Context dword 1 (§6.2.3 Table 6-9):

@@ -168,14 +168,16 @@ impl UsbHub {
         // GET_DESCRIPTOR(Hub) — bmRequestType 0xA0, value
         // (HUB_DESC_TYPE << 8), index 0.
         let mut desc_buf = [0u8; 16];
-        let n = xhci_dev.control_in(
-            slot_id,
-            RT_DEV_TO_HOST_CLASS_DEVICE,
-            REQ_GET_DESCRIPTOR,
-            (HUB_DESC_TYPE as u16) << 8,
-            0,
-            &mut desc_buf,
-        ).await?;
+        let n = xhci_dev
+            .control_in(
+                slot_id,
+                RT_DEV_TO_HOST_CLASS_DEVICE,
+                REQ_GET_DESCRIPTOR,
+                (HUB_DESC_TYPE as u16) << 8,
+                0,
+                &mut desc_buf,
+            )
+            .await?;
         if n < 9 {
             return Err(HubError::BadDescriptor);
         }
@@ -184,14 +186,16 @@ impl UsbHub {
         // Power on every downstream port via SET_FEATURE(PORT_POWER).
         let mut nothing = [0u8; 0];
         for p in 1..=descriptor.num_ports {
-            let _ = xhci_dev.control_in(
-                slot_id,
-                RT_HOST_TO_DEV_CLASS_OTHER,
-                REQ_SET_FEATURE,
-                PORT_POWER,
-                p as u16,
-                &mut nothing,
-            ).await;
+            let _ = xhci_dev
+                .control_in(
+                    slot_id,
+                    RT_HOST_TO_DEV_CLASS_OTHER,
+                    REQ_SET_FEATURE,
+                    PORT_POWER,
+                    p as u16,
+                    &mut nothing,
+                )
+                .await;
         }
 
         Ok(UsbHub {
@@ -204,14 +208,16 @@ impl UsbHub {
     /// Read the 4-byte port status word for `port` (1-indexed).
     pub async fn port_status(&self, xhci_dev: &Xhci, port: u8) -> Result<u32, HubError> {
         let mut buf = [0u8; 4];
-        xhci_dev.control_in(
-            self.slot_id,
-            RT_DEV_TO_HOST_CLASS_OTHER,
-            REQ_GET_STATUS,
-            0,
-            port as u16,
-            &mut buf,
-        ).await?;
+        xhci_dev
+            .control_in(
+                self.slot_id,
+                RT_DEV_TO_HOST_CLASS_OTHER,
+                REQ_GET_STATUS,
+                0,
+                port as u16,
+                &mut buf,
+            )
+            .await?;
         Ok(u32::from_le_bytes(buf))
     }
 
@@ -220,14 +226,16 @@ impl UsbHub {
     /// asserts, then clears the C_PORT_RESET change bit.
     pub async fn port_reset(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
         let mut nothing = [0u8; 0];
-        let _ = xhci_dev.control_in(
-            self.slot_id,
-            RT_HOST_TO_DEV_CLASS_OTHER,
-            REQ_SET_FEATURE,
-            PORT_RESET,
-            port as u16,
-            &mut nothing,
-        ).await?;
+        let _ = xhci_dev
+            .control_in(
+                self.slot_id,
+                RT_HOST_TO_DEV_CLASS_OTHER,
+                REQ_SET_FEATURE,
+                PORT_RESET,
+                port as u16,
+                &mut nothing,
+            )
+            .await?;
         // 100 ms wall-clock budget (USB 2.0 §11.5.1.5 TDRST max
         // 50 ms + ~10 ms TDRSTR + headroom). Between status polls
         // we sleep briefly so the executor isn't pinned to one task.
@@ -255,14 +263,16 @@ impl UsbHub {
         if got_reset {
             // Clear the change bit so the next reset returns a
             // fresh edge.
-            let _ = xhci_dev.control_in(
-                self.slot_id,
-                RT_HOST_TO_DEV_CLASS_OTHER,
-                REQ_CLEAR_FEATURE,
-                C_PORT_RESET,
-                port as u16,
-                &mut nothing,
-            ).await;
+            let _ = xhci_dev
+                .control_in(
+                    self.slot_id,
+                    RT_HOST_TO_DEV_CLASS_OTHER,
+                    REQ_CLEAR_FEATURE,
+                    C_PORT_RESET,
+                    port as u16,
+                    &mut nothing,
+                )
+                .await;
             return Ok(());
         }
         Err(HubError::PortResetTimeout)
@@ -276,14 +286,16 @@ impl UsbHub {
     /// Re-issue [`port_resume`] to wake it.
     pub async fn port_suspend(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
         let mut nothing = [0u8; 0];
-        let _ = xhci_dev.control_in(
-            self.slot_id,
-            RT_HOST_TO_DEV_CLASS_OTHER,
-            REQ_SET_FEATURE,
-            PORT_SUSPEND,
-            port as u16,
-            &mut nothing,
-        ).await?;
+        let _ = xhci_dev
+            .control_in(
+                self.slot_id,
+                RT_HOST_TO_DEV_CLASS_OTHER,
+                REQ_SET_FEATURE,
+                PORT_SUSPEND,
+                port as u16,
+                &mut nothing,
+            )
+            .await?;
         Ok(())
     }
 
@@ -295,22 +307,26 @@ impl UsbHub {
     /// observes a fresh edge.
     pub async fn port_resume(&self, xhci_dev: &Xhci, port: u8) -> Result<(), HubError> {
         let mut nothing = [0u8; 0];
-        let _ = xhci_dev.control_in(
-            self.slot_id,
-            RT_HOST_TO_DEV_CLASS_OTHER,
-            REQ_CLEAR_FEATURE,
-            PORT_SUSPEND,
-            port as u16,
-            &mut nothing,
-        ).await?;
-        let _ = xhci_dev.control_in(
-            self.slot_id,
-            RT_HOST_TO_DEV_CLASS_OTHER,
-            REQ_CLEAR_FEATURE,
-            C_PORT_SUSPEND,
-            port as u16,
-            &mut nothing,
-        ).await;
+        let _ = xhci_dev
+            .control_in(
+                self.slot_id,
+                RT_HOST_TO_DEV_CLASS_OTHER,
+                REQ_CLEAR_FEATURE,
+                PORT_SUSPEND,
+                port as u16,
+                &mut nothing,
+            )
+            .await?;
+        let _ = xhci_dev
+            .control_in(
+                self.slot_id,
+                RT_HOST_TO_DEV_CLASS_OTHER,
+                REQ_CLEAR_FEATURE,
+                C_PORT_SUSPEND,
+                port as u16,
+                &mut nothing,
+            )
+            .await;
         Ok(())
     }
 
@@ -351,7 +367,11 @@ impl UsbHub {
     /// rides on top of this same encoding for the SS LinkState
     /// nibble. For Stage 1 we only resolve LS / FS / HS; SS hubs
     /// are reported as HS until link-state decoding lands.
-    pub async fn port_speed(&self, xhci_dev: &Xhci, port: u8) -> Result<crate::xhci::PortSpeed, HubError> {
+    pub async fn port_speed(
+        &self,
+        xhci_dev: &Xhci,
+        port: u8,
+    ) -> Result<crate::xhci::PortSpeed, HubError> {
         use crate::xhci::PortSpeed;
         let s = self.port_status(xhci_dev, port).await? as u16;
         if s & PSTAT_LOW_SPEED != 0 {

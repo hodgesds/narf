@@ -103,8 +103,7 @@ pub struct PtpTouchpad {
 
 /// Global registry of bound touchpads. Populated by
 /// [`try_bind_touchpad_already_addressed`]; consumed by [`pump_all`].
-static TOUCHPADS: IrqSafeSpinLock<Vec<Arc<PtpTouchpad>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static TOUCHPADS: IrqSafeSpinLock<Vec<Arc<PtpTouchpad>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Locate the HID interface in a configuration descriptor and return
 /// `(interface_num, hid_descriptor_offset, interrupt_in_endpoint)`.
@@ -197,8 +196,7 @@ pub async fn try_bind_touchpad_already_addressed(
     cfg: &[u8],
     ep: EndpointConfig,
 ) -> Result<(), HidError> {
-    let report_len = report_descriptor_length(cfg, hid_desc_off)
-        .ok_or(HidError::NoInterruptIn)?;
+    let report_len = report_descriptor_length(cfg, hid_desc_off).ok_or(HidError::NoInterruptIn)?;
     if report_len == 0 || report_len > 4096 {
         return Err(HidError::NoInterruptIn);
     }
@@ -215,8 +213,7 @@ pub async fn try_bind_touchpad_already_addressed(
         .await
         .map_err(HidError::Xhci)?;
 
-    let parsed: ReportDescriptor =
-        descriptor::parse(&blob).map_err(|_| HidError::NoInterruptIn)?;
+    let parsed: ReportDescriptor = descriptor::parse(&blob).map_err(|_| HidError::NoInterruptIn)?;
     let profile = ptp::detect(&parsed).ok_or(HidError::NoInterruptIn)?;
 
     // Configure xHC-side endpoint context.
@@ -294,15 +291,17 @@ pub async fn try_bind_touchpad_already_addressed(
     // Boot Mouse semantics.
     if let Some(mode_report) = ptp::build_mode_feature_report(&profile, 3) {
         let report_id = mode_report[0] as u16;
-        let _ = xhci_dev.control_out(
-            slot_id,
-            RT_HOST_TO_DEV_CLASS_IFACE,
-            HID_REQ_SET_REPORT,
-            // wValue = (report-type << 8) | report-id. Feature = 3.
-            (3u16 << 8) | report_id,
-            interface_num as u16,
-            &mode_report[1..], // strip leading report-id byte; xHCI sends it via wValue
-        ).await;
+        let _ = xhci_dev
+            .control_out(
+                slot_id,
+                RT_HOST_TO_DEV_CLASS_IFACE,
+                HID_REQ_SET_REPORT,
+                // wValue = (report-type << 8) | report-id. Feature = 3.
+                (3u16 << 8) | report_id,
+                interface_num as u16,
+                &mode_report[1..], // strip leading report-id byte; xHCI sends it via wValue
+            )
+            .await;
     }
 
     let interrupt_in_ep = ep.ep_addr & 0x0F;

@@ -51,8 +51,7 @@
 //! Linux ref: wacom_intuos_general(), wacom_wac.c:849.
 
 use super::wacom_features::{
-    lookup, needs_pen_mode, WacomFeatures, WacomType,
-    WACOM_FEATURE_REPORT_ID, WACOM_PEN_MODE_VALUE,
+    lookup, needs_pen_mode, WacomFeatures, WacomType, WACOM_FEATURE_REPORT_ID, WACOM_PEN_MODE_VALUE,
 };
 use narf_input::{
     abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent, TouchEvent, TouchState,
@@ -182,10 +181,13 @@ impl WacomState {
             return 0;
         }
         match self.features.device_type {
-            WacomType::Intuos | WacomType::Intuos5S | WacomType::Intuos5 | WacomType::Intuos5L
-            | WacomType::IntuosProS | WacomType::IntuosProM | WacomType::IntuosProL => {
-                self.handle_intuos(data)
-            }
+            WacomType::Intuos
+            | WacomType::Intuos5S
+            | WacomType::Intuos5
+            | WacomType::Intuos5L
+            | WacomType::IntuosProS
+            | WacomType::IntuosProM
+            | WacomType::IntuosProL => self.handle_intuos(data),
             WacomType::BambooPen | WacomType::BambooPT => self.handle_bamboo_pen(data),
             WacomType::IntuosHT | WacomType::IntuosHT2 => self.handle_bamboo_pen(data),
             WacomType::Cintiq
@@ -205,7 +207,9 @@ impl WacomState {
     ///
     /// Linux: wacom_intuos_irq(), wacom_wac.c:1022.
     fn handle_intuos(&mut self, data: &[u8]) -> usize {
-        if data.is_empty() { return 0; }
+        if data.is_empty() {
+            return 0;
+        }
         let rid = data[0];
 
         // Pad / ExpressKey report.
@@ -214,8 +218,11 @@ impl WacomState {
         }
 
         // Pen / proximity reports.
-        if rid == REPORT_PENABLED || rid == REPORT_CINTIQ || rid == REPORT_INTUOS_PEN
-            || rid == REPORT_INTUOS_ID1 || rid == REPORT_INTUOS_ID2
+        if rid == REPORT_PENABLED
+            || rid == REPORT_CINTIQ
+            || rid == REPORT_INTUOS_PEN
+            || rid == REPORT_INTUOS_ID1
+            || rid == REPORT_INTUOS_ID2
         {
             // Tool identity report (enter-prox).
             if let Some(n) = self.decode_intuos_inout(data) {
@@ -235,7 +242,9 @@ impl WacomState {
     /// Returns `Some(events_emitted)` if this was a prox event,
     /// `None` if it's a data report.
     fn decode_intuos_inout(&mut self, data: &[u8]) -> Option<usize> {
-        if data.len() < 2 { return None; }
+        if data.len() < 2 {
+            return None;
+        }
         let status = data[1];
 
         // Dual-pen index: bit 0 of status selects pen slot 0 or 1.
@@ -248,7 +257,9 @@ impl WacomState {
         // Enter proximity: bits 7:2 of status == 0b110000 (0xC0 mask).
         // Linux: wacom_wac.c:786 — (data[1] & 0xfc) == 0xc0.
         if (status & 0xFC) == 0xC0 {
-            if data.len() < 9 { return Some(0); }
+            if data.len() < 9 {
+                return Some(0);
+            }
             // Extract serial: wacom_wac.c:788-790.
             let serial = ((data[3] as u64 & 0x0F) << 28)
                 | ((data[4] as u64) << 20)
@@ -268,8 +279,7 @@ impl WacomState {
             pen.in_prox = true;
             pen.id_known = true;
 
-            let n = push_btn(pen.tool, true)
-                + push_abs(ABS_MISC, STYLUS_DEVICE_ID as i32);
+            let n = push_btn(pen.tool, true) + push_abs(ABS_MISC, STYLUS_DEVICE_ID as i32);
             return Some(n);
         }
 
@@ -321,7 +331,9 @@ impl WacomState {
     ///
     /// Linux: wacom_intuos_general(), wacom_wac.c:849.
     fn decode_intuos_general(&mut self, data: &[u8]) -> usize {
-        if data.len() < 10 { return 0; }
+        if data.len() < 10 {
+            return 0;
+        }
         let status = data[1];
 
         let idx = if self.features.device_type == WacomType::Intuos {
@@ -331,12 +343,19 @@ impl WacomState {
         };
 
         let pen = &self.pen[idx];
-        if !pen.id_known { return 0; }
+        if !pen.id_known {
+            return 0;
+        }
         // Cintiq guard: bit6 must be set (RDY) for CINTIQ type.
-        if matches!(self.features.device_type, WacomType::Cintiq | WacomType::Cintiq13HD
-                    | WacomType::Cintiq21UX2 | WacomType::Cintiq22HD | WacomType::Dtk
-                    | WacomType::Cintiq24HD)
-            && (status & 0x40 == 0)
+        if matches!(
+            self.features.device_type,
+            WacomType::Cintiq
+                | WacomType::Cintiq13HD
+                | WacomType::Cintiq21UX2
+                | WacomType::Cintiq22HD
+                | WacomType::Dtk
+                | WacomType::Cintiq24HD
+        ) && (status & 0x40 == 0)
         {
             return 0;
         }
@@ -408,7 +427,9 @@ impl WacomState {
     ///
     /// Linux: wacom_intuos_pad(), wacom_wac.c:513.
     fn decode_intuos_pad(&mut self, data: &[u8]) -> usize {
-        if data.len() < 4 { return 0; }
+        if data.len() < 4 {
+            return 0;
+        }
         let n_buttons = self.features.num_buttons as usize;
         let mut buttons: u32;
         let mut ring1: u8 = 0;
@@ -416,7 +437,9 @@ impl WacomState {
         match self.features.device_type {
             WacomType::Cintiq24HD | WacomType::Cintiq21UX2 | WacomType::Cintiq22HD => {
                 // Cintiq 21UX2 / 22HD: wacom_wac.c:619-638.
-                if data.len() < 10 { return 0; }
+                if data.len() < 10 {
+                    return 0;
+                }
                 buttons = ((data[8] as u32) << 10)
                     | ((data[7] as u32 & 0x01) << 9)
                     | ((data[6] as u32) << 1)
@@ -432,30 +455,42 @@ impl WacomState {
             }
             WacomType::Cintiq13HD => {
                 // Cintiq 13HD: wacom_wac.c:537-538.
-                if data.len() < 5 { return 0; }
+                if data.len() < 5 {
+                    return 0;
+                }
                 buttons = ((data[4] as u32) << 1) | (data[3] as u32 & 0x01);
             }
             WacomType::Dtk => {
                 // DTK: wacom_wac.c:535-536.
-                if data.len() < 7 { return 0; }
+                if data.len() < 7 {
+                    return 0;
+                }
                 buttons = data[6] as u32;
             }
             WacomType::Intuos5S | WacomType::IntuosProS => {
                 // Intuos5S / Pro S: 7 buttons + ring. wacom_wac.c:608-617.
-                if data.len() < 5 { return 0; }
+                if data.len() < 5 {
+                    return 0;
+                }
                 buttons = ((data[4] as u32) << 1) | (data[3] as u32 & 0x01);
                 ring1 = data[2];
             }
-            WacomType::Intuos5 | WacomType::Intuos5L
-            | WacomType::IntuosProM | WacomType::IntuosProL => {
+            WacomType::Intuos5
+            | WacomType::Intuos5L
+            | WacomType::IntuosProM
+            | WacomType::IntuosProL => {
                 // Intuos5 M/L / Pro M/L: 9 buttons + ring.
-                if data.len() < 5 { return 0; }
+                if data.len() < 5 {
+                    return 0;
+                }
                 buttons = ((data[4] as u32) << 1) | (data[3] as u32 & 0x01);
                 ring1 = data[2];
             }
             _ => {
                 // Classic Intuos3 / Intuos4 layout. wacom_wac.c:631-637.
-                if data.len() < 7 { return 0; }
+                if data.len() < 7 {
+                    return 0;
+                }
                 buttons = ((data[6] as u32 & 0x10) << 5)
                     | ((data[5] as u32 & 0x10) << 4)
                     | ((data[6] as u32 & 0x0F) << 4)
@@ -496,7 +531,9 @@ impl WacomState {
     /// uses the same pen report as INTUOSHT devices.
     /// wacom_wac.c:849 (wacom_intuos_general) handles the pen part.
     fn handle_bamboo_pen(&mut self, data: &[u8]) -> usize {
-        if data.len() < 2 { return 0; }
+        if data.len() < 2 {
+            return 0;
+        }
         let rid = data[0];
 
         // Bamboo Pen pad report (INTUOSPAD / INTUOS5PAD).
@@ -506,8 +543,12 @@ impl WacomState {
             return 0;
         }
 
-        if rid != REPORT_PENABLED { return 0; }
-        if data.len() < 10 { return 0; }
+        if rid != REPORT_PENABLED {
+            return 0;
+        }
+        if data.len() < 10 {
+            return 0;
+        }
 
         let status = data[1];
         let in_prox = status & 0x20 != 0; // bit 5
@@ -540,7 +581,7 @@ impl WacomState {
             };
 
             let in_range = status & 0x40 != 0; // proximity/hover
-            let tip = status & 0x01 != 0;      // tip switch
+            let tip = status & 0x01 != 0; // tip switch
             let barrel1 = status & 0x02 != 0;
             let barrel2 = status & 0x04 != 0;
 
@@ -576,11 +617,17 @@ impl WacomState {
     ///
     /// Linux: wacom_penpartner_irq(), wacom_wac.c:118.
     fn handle_penpartner(&mut self, data: &[u8]) -> usize {
-        if data.len() < 7 { return 0; }
+        if data.len() < 7 {
+            return 0;
+        }
         let in_prox = data[0] & 0x80 != 0;
 
         if in_prox && !self.pen[0].id_known {
-            self.pen[0].tool = if data[0] & 0x40 != 0 { btn::BTN_TOOL_RUBBER } else { btn::BTN_TOOL_PEN };
+            self.pen[0].tool = if data[0] & 0x40 != 0 {
+                btn::BTN_TOOL_RUBBER
+            } else {
+                btn::BTN_TOOL_PEN
+            };
             self.pen[0].id = if self.pen[0].tool == btn::BTN_TOOL_RUBBER {
                 ERASER_DEVICE_ID
             } else {
@@ -624,9 +671,13 @@ impl WacomState {
     ///
     /// Each contact occupies `WACOM_BYTES_PER_MT_PACKET` = 11 bytes.
     pub fn handle_mt_report(&mut self, data: &[u8]) -> usize {
-        if data.len() < 2 { return 0; }
+        if data.len() < 2 {
+            return 0;
+        }
         let num_contacts = self.features.touch_max as usize;
-        if num_contacts == 0 { return 0; }
+        if num_contacts == 0 {
+            return 0;
+        }
 
         // Byte 0 = report ID, byte 1 = contact count for this frame.
         let contacts_in_frame = data[1] as usize;
@@ -637,11 +688,15 @@ impl WacomState {
 
         for i in 0..contacts {
             let off = 2 + i * BYTES_PER;
-            if off + BYTES_PER > data.len() { break; }
+            if off + BYTES_PER > data.len() {
+                break;
+            }
             let c = &data[off..off + BYTES_PER];
 
             let contact_id = c[0] as usize;
-            if contact_id >= MAX_MT_CONTACTS { continue; }
+            if contact_id >= MAX_MT_CONTACTS {
+                continue;
+            }
 
             let tip = c[1] & 0x01 != 0;
             let x = (c[2] as i32) | ((c[3] as i32) << 8);
@@ -662,7 +717,11 @@ impl WacomState {
             } else {
                 let had_contact = slot.tracking_id.is_some();
                 slot.tracking_id = None;
-                if had_contact { TouchState::Up } else { continue; }
+                if had_contact {
+                    TouchState::Up
+                } else {
+                    continue;
+                }
             };
 
             n += push_global(InputEvent::Touch(TouchEvent {
@@ -722,13 +781,17 @@ mod tests {
 
     fn pop_abs_drain() -> alloc::vec::Vec<AbsoluteEvent> {
         let mut v = alloc::vec::Vec::new();
-        while let Some(e) = pop_absolute() { v.push(e); }
+        while let Some(e) = pop_absolute() {
+            v.push(e);
+        }
         v
     }
 
     fn pop_btn_drain() -> alloc::vec::Vec<ButtonEvent> {
         let mut v = alloc::vec::Vec::new();
-        while let Some(e) = pop_button() { v.push(e); }
+        while let Some(e) = pop_button() {
+            v.push(e);
+        }
         v
     }
 
@@ -793,21 +856,29 @@ mod tests {
         pkt[5] = 0x00;
         pkt[6] = 0x00;
         pkt[7] = serial_nibbles << 4; // high nibble of byte[7] → part of tool ID
-        pkt[8] = tool_id_bytes[2];    // part of tool ID
+        pkt[8] = tool_id_bytes[2]; // part of tool ID
         pkt[9] = 0x00;
         pkt
     }
 
     /// Construct a 10-byte Intuos5/Pro pen-data report.
-    fn intuos_pen_data(x: u16, y: u16, pressure_raw: u16, tilt_x: i8, tilt_y: i8,
-                        barrel1: bool, barrel2: bool, tip: bool) -> [u8; 10] {
+    fn intuos_pen_data(
+        x: u16,
+        y: u16,
+        pressure_raw: u16,
+        tilt_x: i8,
+        tilt_y: i8,
+        barrel1: bool,
+        barrel2: bool,
+        tip: bool,
+    ) -> [u8; 10] {
         let mut pkt = [0u8; 10];
         pkt[0] = REPORT_PENABLED;
         // status: general pen packet type 0x00; barrel bits; no prox-enter/exit.
         // bit1 = barrel1, bit2 = barrel2.
         pkt[1] = (if barrel1 { 0x02 } else { 0 })
-               | (if barrel2 { 0x04 } else { 0 })
-               | (if tip { 0x01 } else { 0 });
+            | (if barrel2 { 0x04 } else { 0 })
+            | (if tip { 0x01 } else { 0 });
 
         // X/Y: big-endian, right-shifted (upper 15 bits of a 17-bit coord).
         // The 17th bit is in data[9].
@@ -824,8 +895,7 @@ mod tests {
         // Pack pressure_raw into data[6] and data[7] upper bits.
         let p = pressure_raw as u32;
         pkt[6] = (p >> 3) as u8;
-        pkt[7] = (((p & 0x07) << 5) as u8)
-               | (((tilt_x as u8 & 0x3F) << 1) & 0x7E);
+        pkt[7] = (((p & 0x07) << 5) as u8) | (((tilt_x as u8 & 0x3F) << 1) & 0x7E);
 
         // Tilt Y in byte[8].
         pkt[8] = ((tilt_y as u8).wrapping_add(64)) & 0x7F;
@@ -853,7 +923,8 @@ mod tests {
         assert!(n > 0, "pen data report produced no events");
 
         let abs_evts = pop_abs_drain();
-        let pressures: alloc::vec::Vec<i32> = abs_evts.iter()
+        let pressures: alloc::vec::Vec<i32> = abs_evts
+            .iter()
             .filter(|e| e.axis == abs::ABS_PRESSURE)
             .map(|e| e.value)
             .collect();
@@ -878,7 +949,10 @@ mod tests {
 
         let btns = pop_btn_drain();
         let barrel1_pressed = btns.iter().any(|e| e.code == btn::BTN_STYLUS && e.pressed);
-        assert!(barrel1_pressed, "BTN_STYLUS (barrel1) not seen in button events");
+        assert!(
+            barrel1_pressed,
+            "BTN_STYLUS (barrel1) not seen in button events"
+        );
     }
 
     #[test]
@@ -900,7 +974,11 @@ mod tests {
         enter[3] = 0x80; // tool_id bits = (0x00<<4)|(0x80>>4) = 0x08 → eraser
         state.handle_report(&enter);
 
-        assert_eq!(state.pen[0].tool, btn::BTN_TOOL_RUBBER, "expected BTN_TOOL_RUBBER for eraser ID");
+        assert_eq!(
+            state.pen[0].tool,
+            btn::BTN_TOOL_RUBBER,
+            "expected BTN_TOOL_RUBBER for eraser ID"
+        );
     }
 
     #[test]
@@ -916,16 +994,30 @@ mod tests {
         state.handle_report(&pkt);
 
         let abs_evts = pop_abs_drain();
-        let tx = abs_evts.iter().find(|e| e.axis == abs::ABS_TILT_X).map(|e| e.value);
-        let ty = abs_evts.iter().find(|e| e.axis == abs::ABS_TILT_Y).map(|e| e.value);
+        let tx = abs_evts
+            .iter()
+            .find(|e| e.axis == abs::ABS_TILT_X)
+            .map(|e| e.value);
+        let ty = abs_evts
+            .iter()
+            .find(|e| e.axis == abs::ABS_TILT_Y)
+            .map(|e| e.value);
 
         // Tilt X should be positive for +45.
         if let Some(v) = tx {
-            assert!(v > 0, "ABS_TILT_X should be positive for +45 tilt, got {}", v);
+            assert!(
+                v > 0,
+                "ABS_TILT_X should be positive for +45 tilt, got {}",
+                v
+            );
         }
         // Tilt Y should be negative for -30.
         if let Some(v) = ty {
-            assert!(v < 0, "ABS_TILT_Y should be negative for -30 tilt, got {}", v);
+            assert!(
+                v < 0,
+                "ABS_TILT_Y should be negative for -30 tilt, got {}",
+                v
+            );
         }
     }
 
@@ -973,7 +1065,10 @@ mod tests {
         state.handle_report(&pkt);
 
         let abs_evts = pop_abs_drain();
-        let p = abs_evts.iter().find(|e| e.axis == abs::ABS_PRESSURE).map(|e| e.value);
+        let p = abs_evts
+            .iter()
+            .find(|e| e.axis == abs::ABS_PRESSURE)
+            .map(|e| e.value);
         assert!(p.is_some(), "no ABS_PRESSURE from Bamboo pen");
         // Should be within 10-bit range.
         let pv = p.unwrap();
@@ -998,7 +1093,7 @@ mod tests {
         pkt[0] = REPORT_INTUOSPAD;
         pkt[5] = 0x01; // button 0
         pkt[6] = 0x01; // contributes bits 1..8 via <<1; bit 0 here → bit1 in buttons
-        // So buttons = 0 | 0 | (0x01 << 1) | 0x01 = 0x03 — buttons 0 and 1 pressed.
+                       // So buttons = 0 | 0 | (0x01 << 1) | 0x01 = 0x03 — buttons 0 and 1 pressed.
 
         let n = state.handle_report(&pkt);
         assert!(n > 0, "Cintiq pad report produced no events");

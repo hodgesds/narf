@@ -726,8 +726,7 @@ pub fn find_video_streaming_iso_in_ep(cfg: &[u8]) -> u8 {
         if desc_type == 0x04 && len >= 9 {
             let cls = cfg[i + 5];
             let sub = cfg[i + 6];
-            in_vs_iface = cls == USB_CLASS_VIDEO
-                && sub == USB_VIDEO_SUBCLASS_VIDEOSTREAMING;
+            in_vs_iface = cls == USB_CLASS_VIDEO && sub == USB_VIDEO_SUBCLASS_VIDEOSTREAMING;
         } else if desc_type == 0x05 && in_vs_iface && len >= 7 {
             let ep_addr = cfg[i + 2];
             let attrs = cfg[i + 3];
@@ -759,9 +758,7 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError>
         Some(c) => c,
         None => return Err(UvcError::SetConfigFailed),
     };
-    let outcome = narf_scheduler::block_on(async {
-        c.isoch_in(slot_id, dci, out).await
-    });
+    let outcome = narf_scheduler::block_on(async { c.isoch_in(slot_id, dci, out).await });
     match outcome {
         Ok(n) => Ok(n),
         Err(_) => Err(UvcError::SetConfigFailed),

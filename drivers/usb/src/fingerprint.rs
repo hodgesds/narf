@@ -310,11 +310,10 @@ impl FingerprintDevice {
                     }
                 }
             }
-            FpVendor::Synaptics | FpVendor::Goodix => {
-                xhci.bulk_in(self.slot_id, self.bulk_in_ep, buf)
-                    .await
-                    .map_err(|_| FpError::EndpointConfig)
-            }
+            FpVendor::Synaptics | FpVendor::Goodix => xhci
+                .bulk_in(self.slot_id, self.bulk_in_ep, buf)
+                .await
+                .map_err(|_| FpError::EndpointConfig),
         }
     }
 
@@ -376,33 +375,27 @@ impl core::fmt::Debug for FpFileNode {
 }
 
 impl narf_filesystem::FileOps for FpFileNode {
-    fn read<'a>(
-        &'a self,
-        _offset: u64,
-        buf: &'a mut [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         let dev = self.dev.clone();
         Box::pin(async move {
-            let xhci = crate::xhci::controller()
-                .ok_or(narf_filesystem::FsError::Io(narf_block::BlockError::IOError))?;
+            let xhci = crate::xhci::controller().ok_or(narf_filesystem::FsError::Io(
+                narf_block::BlockError::IOError,
+            ))?;
             dev.read_response(&xhci, buf)
                 .await
                 .map_err(|_| narf_filesystem::FsError::Io(narf_block::BlockError::IOError))
         })
     }
 
-    fn write<'a>(
-        &'a self,
-        _offset: u64,
-        buf: &'a [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         let dev = self.dev.clone();
         let len = buf.len();
         // Clone buf into an owned Vec so the future can be 'static.
         let owned: alloc::vec::Vec<u8> = buf.to_vec();
         Box::pin(async move {
-            let xhci = crate::xhci::controller()
-                .ok_or(narf_filesystem::FsError::Io(narf_block::BlockError::IOError))?;
+            let xhci = crate::xhci::controller().ok_or(narf_filesystem::FsError::Io(
+                narf_block::BlockError::IOError,
+            ))?;
             dev.send_command(&xhci, &owned)
                 .await
                 .map(|()| len)
@@ -449,7 +442,9 @@ pub async fn try_bind_fingerprint_already_addressed(
 
     // Configure xHC endpoint contexts.
     let ep_configs: alloc::vec::Vec<EndpointConfig> = match eps {
-        FpEndpoints::Bulk { bulk_in, bulk_out, .. } => alloc::vec![bulk_in, bulk_out],
+        FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        } => alloc::vec![bulk_in, bulk_out],
         FpEndpoints::InterruptIn { intr_in, .. } => alloc::vec![intr_in],
     };
     xhci_dev
@@ -477,7 +472,9 @@ pub async fn try_bind_fingerprint_already_addressed(
 
     // Build the FingerprintDevice record.
     let (bulk_in_dci, bulk_out_dci, in_max_packet) = match eps {
-        FpEndpoints::Bulk { bulk_in, bulk_out, .. } => {
+        FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        } => {
             let bi_dci = ep_dci(bulk_in.ep_addr, true);
             let bo_dci = ep_dci(bulk_out.ep_addr, false);
             (bi_dci, bo_dci, bulk_in.max_packet)
@@ -498,7 +495,12 @@ pub async fn try_bind_fingerprint_already_addressed(
         let _ = writeln!(
             narf_console::Writer,
             "  usb-fp: {} fingerprint reader slot={} vid={:04x}:{:04x} in_dci={} out_dci={}",
-            vendor_str, slot_id, vid, pid, bulk_in_dci, bulk_out_dci
+            vendor_str,
+            slot_id,
+            vid,
+            pid,
+            bulk_in_dci,
+            bulk_out_dci
         );
     }
 
@@ -517,8 +519,7 @@ pub async fn try_bind_fingerprint_already_addressed(
     {
         let idx = FP_DEVICES.lock().len();
         if idx == 0 {
-            let node: Arc<dyn narf_filesystem::FileOps> =
-                Arc::new(FpFileNode { dev: dev.clone() });
+            let node: Arc<dyn narf_filesystem::FileOps> = Arc::new(FpFileNode { dev: dev.clone() });
             narf_filesystem::devfs::register_fp(node);
         }
     }
@@ -604,28 +605,60 @@ mod tests {
         // Config (9) + Interface (9) + bulk-IN (7) + bulk-OUT (7) = 32.
         let mut v = alloc::vec![0u8; 32];
         // Config header
-        v[0] = 9; v[1] = 0x02; v[2] = 32; v[3] = 0; v[4] = 1; v[5] = 1;
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 32;
+        v[3] = 0;
+        v[4] = 1;
+        v[5] = 1;
         // Interface: class = interface_class, iface# = 0
-        v[9] = 9; v[10] = 0x04; v[11] = 0; v[12] = 0; v[13] = 2;
-        v[14] = interface_class; v[15] = 0; v[16] = 0;
+        v[9] = 9;
+        v[10] = 0x04;
+        v[11] = 0;
+        v[12] = 0;
+        v[13] = 2;
+        v[14] = interface_class;
+        v[15] = 0;
+        v[16] = 0;
         // bulk-IN @ ep 0x81
-        v[18] = 7; v[19] = 0x05; v[20] = 0x81; v[21] = 0x02;
-        v[22] = 0x00; v[23] = 0x02; // wMaxPacketSize = 512
-        // bulk-OUT @ ep 0x01
-        v[25] = 7; v[26] = 0x05; v[27] = 0x01; v[28] = 0x02;
-        v[29] = 0x00; v[30] = 0x02;
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x81;
+        v[21] = 0x02;
+        v[22] = 0x00;
+        v[23] = 0x02; // wMaxPacketSize = 512
+                      // bulk-OUT @ ep 0x01
+        v[25] = 7;
+        v[26] = 0x05;
+        v[27] = 0x01;
+        v[28] = 0x02;
+        v[29] = 0x00;
+        v[30] = 0x02;
         v
     }
 
     fn make_cfg_intr(interface_class: u8) -> alloc::vec::Vec<u8> {
         // Config (9) + Interface (9) + interrupt-IN (7) = 25.
         let mut v = alloc::vec![0u8; 25];
-        v[0] = 9; v[1] = 0x02; v[2] = 25; v[3] = 0; v[4] = 1; v[5] = 1;
-        v[9] = 9; v[10] = 0x04; v[11] = 0; v[12] = 0; v[13] = 1;
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 25;
+        v[3] = 0;
+        v[4] = 1;
+        v[5] = 1;
+        v[9] = 9;
+        v[10] = 0x04;
+        v[11] = 0;
+        v[12] = 0;
+        v[13] = 1;
         v[14] = interface_class;
         // interrupt-IN @ ep 0x81 (bmAttributes=3)
-        v[18] = 7; v[19] = 0x05; v[20] = 0x81; v[21] = 0x03;
-        v[22] = 0x40; v[23] = 0x00; // wMaxPacketSize = 64
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x81;
+        v[21] = 0x03;
+        v[22] = 0x40;
+        v[23] = 0x00; // wMaxPacketSize = 64
         v
     }
 
@@ -634,7 +667,12 @@ mod tests {
         let cfg = make_cfg_bulk(0xFF);
         let eps = find_fp_endpoints(&cfg, FpVendor::Goodix).expect("should find bulk pair");
         match eps {
-            FpEndpoints::Bulk { bulk_in, bulk_out, interface, .. } => {
+            FpEndpoints::Bulk {
+                bulk_in,
+                bulk_out,
+                interface,
+                ..
+            } => {
                 assert_eq!(bulk_in.ep_addr, 0x81);
                 assert_eq!(bulk_in.kind, EndpointKind::BulkIn);
                 assert_eq!(bulk_out.ep_addr, 0x01);
@@ -650,7 +688,9 @@ mod tests {
         let cfg = make_cfg_intr(0xFF);
         let eps = find_fp_endpoints(&cfg, FpVendor::Elan).expect("should find intr-IN");
         match eps {
-            FpEndpoints::InterruptIn { intr_in, interface, .. } => {
+            FpEndpoints::InterruptIn {
+                intr_in, interface, ..
+            } => {
                 assert_eq!(intr_in.ep_addr, 0x81);
                 assert_eq!(intr_in.kind, EndpointKind::InterruptIn);
                 assert_eq!(intr_in.max_packet, 64);

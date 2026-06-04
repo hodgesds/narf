@@ -32,7 +32,10 @@ use super::{
 };
 use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 use narf_input::{
-    evdev::{dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode, ROUTER},
+    evdev::{
+        dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode,
+        ROUTER,
+    },
     push_global, InputEvent, PointerButtons, PointerEvent,
 };
 use narf_lib::sync::IrqSafeSpinLock;
@@ -258,7 +261,11 @@ impl BootMouse {
         let btns = button_byte_to_buttons(report.buttons);
 
         // Legacy global ring (for cursor pump / FB status panel).
-        push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons: btns }));
+        push_global(InputEvent::Pointer(PointerEvent {
+            dx,
+            dy,
+            buttons: btns,
+        }));
 
         // evdev ROUTER — motion.
         if moved {
@@ -270,8 +277,8 @@ impl BootMouse {
             let prev = self.last_buttons;
             let cur = report.buttons;
             for &(mask, code) in &[
-                (btn::LEFT,   key::BTN_LEFT),
-                (btn::RIGHT,  key::BTN_RIGHT),
+                (btn::LEFT, key::BTN_LEFT),
+                (btn::RIGHT, key::BTN_RIGHT),
                 (btn::MIDDLE, key::BTN_MIDDLE),
             ] {
                 let was = prev & mask != 0;
@@ -376,7 +383,8 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
             .await
             .map_err(HidError::Xhci)?;
         bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await
-    }.await;
+    }
+    .await;
     if res.is_err() {
         let _ = xhci_dev.disable_slot(slot_id).await;
     }
@@ -393,91 +401,89 @@ async fn bind_mouse_addressed_slot(
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
 ) -> Result<(), HidError> {
-        // Refresh EP0 MPS via Evaluate Context once the device tells
-        // us its real bMaxPacketSize0. Same logic as kbd path
-        // (audit F-22 + F-23).
-        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
-            let mps0 = desc[7] as u16;
-            let want = match speed {
-                crate::xhci::PortSpeed::Low | crate::xhci::PortSpeed::Full
-                    if matches!(mps0, 8 | 16 | 32 | 64) =>
-                {
-                    Some(mps0)
-                }
-                crate::xhci::PortSpeed::High if mps0 == 64 => Some(64),
-                crate::xhci::PortSpeed::Super | crate::xhci::PortSpeed::SuperPlus
-                    if mps0 <= 13 =>
-                {
-                    Some(1u16 << mps0)
-                }
-                _ => None,
-            };
-            if let Some(real_mps) = want {
-                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps).await;
+    // Refresh EP0 MPS via Evaluate Context once the device tells
+    // us its real bMaxPacketSize0. Same logic as kbd path
+    // (audit F-22 + F-23).
+    if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
+        let mps0 = desc[7] as u16;
+        let want = match speed {
+            crate::xhci::PortSpeed::Low | crate::xhci::PortSpeed::Full
+                if matches!(mps0, 8 | 16 | 32 | 64) =>
+            {
+                Some(mps0)
             }
+            crate::xhci::PortSpeed::High if mps0 == 64 => Some(64),
+            crate::xhci::PortSpeed::Super | crate::xhci::PortSpeed::SuperPlus if mps0 <= 13 => {
+                Some(1u16 << mps0)
+            }
+            _ => None,
+        };
+        if let Some(real_mps) = want {
+            let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps).await;
         }
+    }
 
-        let mut head = [0u8; 9];
-        let n = xhci_dev
-            .get_config_descriptor(slot_id, 0, &mut head)
-            .await
-            .map_err(HidError::Xhci)?;
-        if n < 9 {
-            return Err(HidError::NoInterruptIn);
-        }
-        let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-        if total < 9 || total > 4096 {
-            return Err(HidError::NoInterruptIn);
-        }
-        // bConfigurationValue lives at cfg-descriptor offset +5
-        // (USB 2.0 §9.6.3 table 9-10). Required by SET_CONFIGURATION
-        // below (audit F-62).
-        let cfg_value = head[5];
+    let mut head = [0u8; 9];
+    let n = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut head)
+        .await
+        .map_err(HidError::Xhci)?;
+    if n < 9 {
+        return Err(HidError::NoInterruptIn);
+    }
+    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+    if total < 9 || total > 4096 {
+        return Err(HidError::NoInterruptIn);
+    }
+    // bConfigurationValue lives at cfg-descriptor offset +5
+    // (USB 2.0 §9.6.3 table 9-10). Required by SET_CONFIGURATION
+    // below (audit F-62).
+    let cfg_value = head[5];
 
-        let mut full = alloc::vec![0u8; total];
-        let n2 = xhci_dev
-            .get_config_descriptor(slot_id, 0, &mut full)
-            .await
-            .map_err(HidError::Xhci)?;
-        if n2 < total {
-            full.truncate(n2);
-        }
+    let mut full = alloc::vec![0u8; total];
+    let n2 = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut full)
+        .await
+        .map_err(HidError::Xhci)?;
+    if n2 < total {
+        full.truncate(n2);
+    }
 
-        let (iface, ep) = find_boot_mouse(&full)?;
+    let (iface, ep) = find_boot_mouse(&full)?;
 
-        // Configure xHC-side endpoint contexts first (xHCI §4.3.6
-        // recommends this *before* SET_CONFIGURATION so the rings
-        // are ready when the device starts producing reports).
-        xhci_dev
-            .configure_endpoints(slot_id, &[ep])
-            .await
-            .map_err(HidError::Xhci)?;
+    // Configure xHC-side endpoint contexts first (xHCI §4.3.6
+    // recommends this *before* SET_CONFIGURATION so the rings
+    // are ready when the device starts producing reports).
+    xhci_dev
+        .configure_endpoints(slot_id, &[ep])
+        .await
+        .map_err(HidError::Xhci)?;
 
-        // SET_CONFIGURATION (audit F-62): without this the device
-        // stays in Address state and class requests STALL. Same fix
-        // as the kbd path picked up earlier.
-        // bmRequestType: Host-to-Device | Standard | Device = 0x00.
-        let mut nothing = [0u8; 0];
-        xhci_dev
-            .control_in(
-                slot_id,
-                0x00,
-                crate::hid::STD_REQ_SET_CONFIGURATION,
-                cfg_value as u16,
-                0,
-                &mut nothing,
-            )
-            .await
-            .map_err(HidError::Xhci)?;
+    // SET_CONFIGURATION (audit F-62): without this the device
+    // stays in Address state and class requests STALL. Same fix
+    // as the kbd path picked up earlier.
+    // bmRequestType: Host-to-Device | Standard | Device = 0x00.
+    let mut nothing = [0u8; 0];
+    xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            crate::hid::STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .await
+        .map_err(HidError::Xhci)?;
 
-        let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
-        let m = BootMouse::attach(xhci_dev, slot_id, iface, dci).await?;
-        {
-            let mut g = MICE.lock();
-            g.push(m);
-            ATTACHED_MOUSE_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
-        }
-        Ok(())
+    let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
+    let m = BootMouse::attach(xhci_dev, slot_id, iface, dci).await?;
+    {
+        let mut g = MICE.lock();
+        g.push(m);
+        ATTACHED_MOUSE_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+    }
+    Ok(())
 }
 
 /// Lock-free count of bound mice. Same rationale as

@@ -29,9 +29,7 @@
 
 #![allow(dead_code)]
 
-use narf_input::{
-    abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent,
-};
+use narf_input::{abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent};
 
 // ── Mapping flags (xpad.c:80–86) ─────────────────────────────────────
 
@@ -106,8 +104,7 @@ pub const GIP_MOTOR_R: u8 = 1 << 0;
 pub const GIP_MOTOR_L: u8 = 1 << 1;
 pub const GIP_MOTOR_RT: u8 = 1 << 2;
 pub const GIP_MOTOR_LT: u8 = 1 << 3;
-pub const GIP_MOTOR_ALL: u8 =
-    GIP_MOTOR_R | GIP_MOTOR_L | GIP_MOTOR_RT | GIP_MOTOR_LT;
+pub const GIP_MOTOR_ALL: u8 = GIP_MOTOR_R | GIP_MOTOR_L | GIP_MOTOR_RT | GIP_MOTOR_LT;
 
 // ── Device-ID table ───────────────────────────────────────────────────
 
@@ -127,126 +124,714 @@ pub struct XpadDevice {
 /// PDP, 8BitDo, Razer, SteelSeries, Thrustmaster and many others.
 pub static XPAD_DEVICES: &[XpadDevice] = &[
     // ── GPD / CRKD ────────────────────────────────────────────────
-    XpadDevice { vendor: 0x0079, product: 0x18d4, name: "GPD Win 2 X-Box Controller",            mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0351, product: 0x1000, name: "CRKD LP Blueberry Burst Pro Edition",   mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0351, product: 0x2000, name: "CRKD LP Black Tribal Edition",          mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x0079,
+        product: 0x18d4,
+        name: "GPD Win 2 X-Box Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0351,
+        product: 0x1000,
+        name: "CRKD LP Blueberry Burst Pro Edition",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0351,
+        product: 0x2000,
+        name: "CRKD LP Black Tribal Edition",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── Thrustmaster ─────────────────────────────────────────────
-    XpadDevice { vendor: 0x044f, product: 0x0f00, name: "Thrustmaster Wheel",                    mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x044f, product: 0x0f07, name: "Thrustmaster, Inc. Controller",         mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x044f, product: 0xb326, name: "Thrustmaster Gamepad GP XID",           mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x044f,
+        product: 0x0f00,
+        name: "Thrustmaster Wheel",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x044f,
+        product: 0x0f07,
+        name: "Thrustmaster, Inc. Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x044f,
+        product: 0xb326,
+        name: "Thrustmaster Gamepad GP XID",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── Microsoft Xbox classic ────────────────────────────────────
-    XpadDevice { vendor: 0x045e, product: 0x0202, name: "Microsoft X-Box pad v1 (US)",           mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x045e, product: 0x0285, name: "Microsoft X-Box pad (Japan)",           mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x045e, product: 0x0287, name: "Microsoft Xbox Controller S",           mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x045e, product: 0x0288, name: "Microsoft Xbox Controller S v2",        mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x045e, product: 0x0289, name: "Microsoft X-Box pad v2 (US)",           mapping: 0,                    xtype: XTYPE_XBOX     },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0202,
+        name: "Microsoft X-Box pad v1 (US)",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0285,
+        name: "Microsoft X-Box pad (Japan)",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0287,
+        name: "Microsoft Xbox Controller S",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0288,
+        name: "Microsoft Xbox Controller S v2",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0289,
+        name: "Microsoft X-Box pad v2 (US)",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
     // ── Microsoft Xbox 360 ────────────────────────────────────────
-    XpadDevice { vendor: 0x045e, product: 0x028e, name: "Microsoft X-Box 360 pad",               mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x045e, product: 0x028f, name: "Microsoft X-Box 360 pad v2",            mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x028e,
+        name: "Microsoft X-Box 360 pad",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x028f,
+        name: "Microsoft X-Box 360 pad v2",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── Microsoft Xbox 360 Wireless Receiver ─────────────────────
-    XpadDevice { vendor: 0x045e, product: 0x0291, name: "Xbox 360 Wireless Receiver (XBOX)",     mapping: MAP_DPAD_TO_BUTTONS,  xtype: XTYPE_XBOX360W },
-    XpadDevice { vendor: 0x045e, product: 0x02a9, name: "Xbox 360 Wireless Receiver (Unofficial)",mapping: MAP_DPAD_TO_BUTTONS, xtype: XTYPE_XBOX360W },
-    XpadDevice { vendor: 0x045e, product: 0x0719, name: "Xbox 360 Wireless Receiver",            mapping: MAP_DPAD_TO_BUTTONS,  xtype: XTYPE_XBOX360W },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0291,
+        name: "Xbox 360 Wireless Receiver (XBOX)",
+        mapping: MAP_DPAD_TO_BUTTONS,
+        xtype: XTYPE_XBOX360W,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x02a9,
+        name: "Xbox 360 Wireless Receiver (Unofficial)",
+        mapping: MAP_DPAD_TO_BUTTONS,
+        xtype: XTYPE_XBOX360W,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0719,
+        name: "Xbox 360 Wireless Receiver",
+        mapping: MAP_DPAD_TO_BUTTONS,
+        xtype: XTYPE_XBOX360W,
+    },
     // ── Microsoft Xbox One ────────────────────────────────────────
-    XpadDevice { vendor: 0x045e, product: 0x02d1, name: "Microsoft X-Box One pad",               mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x045e, product: 0x02dd, name: "Microsoft X-Box One pad (FW 2015)",     mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x045e, product: 0x02e3, name: "Microsoft X-Box One Elite pad",         mapping: MAP_PADDLES,          xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x045e, product: 0x02ea, name: "Microsoft X-Box One S pad",             mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x045e, product: 0x0b00, name: "Microsoft X-Box One Elite 2 pad",       mapping: MAP_PADDLES,          xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x045e, product: 0x0b0a, name: "Microsoft X-Box Adaptive Controller",   mapping: MAP_PROFILE_BUTTON,   xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x045e, product: 0x0b12, name: "Microsoft Xbox Series S|X Controller",  mapping: MAP_SHARE_BUTTON | MAP_SHARE_OFFSET, xtype: XTYPE_XBOXONE },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x02d1,
+        name: "Microsoft X-Box One pad",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x02dd,
+        name: "Microsoft X-Box One pad (FW 2015)",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x02e3,
+        name: "Microsoft X-Box One Elite pad",
+        mapping: MAP_PADDLES,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x02ea,
+        name: "Microsoft X-Box One S pad",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0b00,
+        name: "Microsoft X-Box One Elite 2 pad",
+        mapping: MAP_PADDLES,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0b0a,
+        name: "Microsoft X-Box Adaptive Controller",
+        mapping: MAP_PROFILE_BUTTON,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x045e,
+        product: 0x0b12,
+        name: "Microsoft Xbox Series S|X Controller",
+        mapping: MAP_SHARE_BUTTON | MAP_SHARE_OFFSET,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Logitech ─────────────────────────────────────────────────
-    XpadDevice { vendor: 0x046d, product: 0xc21d, name: "Logitech Gamepad F310",                 mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x046d, product: 0xc21e, name: "Logitech Gamepad F510",                 mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x046d, product: 0xc21f, name: "Logitech Gamepad F710",                 mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x046d, product: 0xc242, name: "Logitech Chillstream Controller",       mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x046d, product: 0xca84, name: "Logitech Xbox Cordless Controller",     mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x046d, product: 0xca88, name: "Logitech Compact Controller for Xbox",  mapping: 0,                    xtype: XTYPE_XBOX     },
+    XpadDevice {
+        vendor: 0x046d,
+        product: 0xc21d,
+        name: "Logitech Gamepad F310",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x046d,
+        product: 0xc21e,
+        name: "Logitech Gamepad F510",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x046d,
+        product: 0xc21f,
+        name: "Logitech Gamepad F710",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x046d,
+        product: 0xc242,
+        name: "Logitech Chillstream Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x046d,
+        product: 0xca84,
+        name: "Logitech Xbox Cordless Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x046d,
+        product: 0xca88,
+        name: "Logitech Compact Controller for Xbox",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
     // ── Mad Catz ─────────────────────────────────────────────────
-    XpadDevice { vendor: 0x0738, product: 0x4503, name: "Mad Catz Racing Wheel",                 mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x0738, product: 0x4516, name: "Mad Catz Control Pad",                  mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x0738, product: 0x4520, name: "Mad Catz Control Pad Pro",              mapping: 0,                    xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x0738, product: 0x4540, name: "Mad Catz Beat Pad",                     mapping: MAP_DPAD_TO_BUTTONS,  xtype: XTYPE_XBOX     },
-    XpadDevice { vendor: 0x0738, product: 0x4716, name: "Mad Catz Wired Xbox 360 Controller",    mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0738, product: 0x4718, name: "Mad Catz Street Fighter IV FightStick SE", mapping: 0,                xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0738, product: 0x4726, name: "Mad Catz Xbox 360 Controller",          mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0738, product: 0x4728, name: "Mad Catz Street Fighter IV FightPad",   mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOX360 },
-    XpadDevice { vendor: 0x0738, product: 0x4758, name: "Mad Catz Arcade Game Stick",            mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOX360 },
-    XpadDevice { vendor: 0x0738, product: 0x4a01, name: "Mad Catz FightStick TE 2",              mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOXONE },
-    XpadDevice { vendor: 0x0738, product: 0xb726, name: "Mad Catz Xbox controller - MW2",        mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0738, product: 0xbeef, name: "Mad Catz JOYTECH NEO SE Advanced GamePad", mapping: 0,                xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4503,
+        name: "Mad Catz Racing Wheel",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4516,
+        name: "Mad Catz Control Pad",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4520,
+        name: "Mad Catz Control Pad Pro",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4540,
+        name: "Mad Catz Beat Pad",
+        mapping: MAP_DPAD_TO_BUTTONS,
+        xtype: XTYPE_XBOX,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4716,
+        name: "Mad Catz Wired Xbox 360 Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4718,
+        name: "Mad Catz Street Fighter IV FightStick SE",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4726,
+        name: "Mad Catz Xbox 360 Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4728,
+        name: "Mad Catz Street Fighter IV FightPad",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4758,
+        name: "Mad Catz Arcade Game Stick",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0x4a01,
+        name: "Mad Catz FightStick TE 2",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0xb726,
+        name: "Mad Catz Xbox controller - MW2",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0738,
+        product: 0xbeef,
+        name: "Mad Catz JOYTECH NEO SE Advanced GamePad",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── PDP / Afterglow ──────────────────────────────────────────
-    XpadDevice { vendor: 0x0e6f, product: 0x0113, name: "Afterglow AX.1 Gamepad for Xbox 360",  mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0e6f, product: 0x0131, name: "PDP EA Sports Controller",              mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0e6f, product: 0x013a, name: "PDP Xbox One Controller",               mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x0e6f, product: 0x0146, name: "Rock Candy Wired Controller for Xbox One", mapping: 0,                xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x0e6f, product: 0x015c, name: "PDP Xbox One Arcade Stick",             mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOXONE },
-    XpadDevice { vendor: 0x0e6f, product: 0x0161, name: "PDP Xbox One Controller",               mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x0e6f, product: 0x02a4, name: "PDP Wired Controller for Xbox One - Stealth Series", mapping: 0,     xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x0e6f, product: 0x02a6, name: "PDP Wired Controller for Xbox One - Camo Series",   mapping: 0,      xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x0113,
+        name: "Afterglow AX.1 Gamepad for Xbox 360",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x0131,
+        name: "PDP EA Sports Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x013a,
+        name: "PDP Xbox One Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x0146,
+        name: "Rock Candy Wired Controller for Xbox One",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x015c,
+        name: "PDP Xbox One Arcade Stick",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x0161,
+        name: "PDP Xbox One Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x02a4,
+        name: "PDP Wired Controller for Xbox One - Stealth Series",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0e6f,
+        product: 0x02a6,
+        name: "PDP Wired Controller for Xbox One - Camo Series",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Hori ─────────────────────────────────────────────────────
-    XpadDevice { vendor: 0x0f0d, product: 0x000a, name: "Hori Co. DOA4 FightStick",              mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0f0d, product: 0x000d, name: "Hori Fighting Stick EX2",               mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOX360 },
-    XpadDevice { vendor: 0x0f0d, product: 0x0016, name: "Hori Real Arcade Pro.EX",               mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOX360 },
-    XpadDevice { vendor: 0x0f0d, product: 0x0063, name: "Hori Real Arcade Pro Hayabusa (USA) Xbox One", mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOXONE },
-    XpadDevice { vendor: 0x0f0d, product: 0x0067, name: "HORIPAD ONE",                           mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x0f0d, product: 0x0078, name: "Hori Real Arcade Pro V Kai Xbox One",   mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOXONE },
+    XpadDevice {
+        vendor: 0x0f0d,
+        product: 0x000a,
+        name: "Hori Co. DOA4 FightStick",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0f0d,
+        product: 0x000d,
+        name: "Hori Fighting Stick EX2",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0f0d,
+        product: 0x0016,
+        name: "Hori Real Arcade Pro.EX",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0f0d,
+        product: 0x0063,
+        name: "Hori Real Arcade Pro Hayabusa (USA) Xbox One",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0f0d,
+        product: 0x0067,
+        name: "HORIPAD ONE",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x0f0d,
+        product: 0x0078,
+        name: "Hori Real Arcade Pro V Kai Xbox One",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── SteelSeries ──────────────────────────────────────────────
-    XpadDevice { vendor: 0x1038, product: 0x1430, name: "SteelSeries Stratus Duo",               mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x1038, product: 0x1431, name: "SteelSeries Stratus Duo",               mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x1038,
+        product: 0x1430,
+        name: "SteelSeries Stratus Duo",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x1038,
+        product: 0x1431,
+        name: "SteelSeries Stratus Duo",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── Razer ────────────────────────────────────────────────────
-    XpadDevice { vendor: 0x1532, product: 0x0a00, name: "Razer Atrox Arcade Stick",              mapping: MAP_TRIGGERS_TO_BUTTONS, xtype: XTYPE_XBOXONE },
-    XpadDevice { vendor: 0x1532, product: 0x0a03, name: "Razer Wildcat",                         mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x1532, product: 0x0a29, name: "Razer Wolverine V2",                    mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x1689, product: 0xfd00, name: "Razer Onza Tournament Edition",         mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x1689, product: 0xfd01, name: "Razer Onza Classic Edition",            mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x1689, product: 0xfe00, name: "Razer Sabertooth",                      mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x1532,
+        product: 0x0a00,
+        name: "Razer Atrox Arcade Stick",
+        mapping: MAP_TRIGGERS_TO_BUTTONS,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x1532,
+        product: 0x0a03,
+        name: "Razer Wildcat",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x1532,
+        product: 0x0a29,
+        name: "Razer Wolverine V2",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x1689,
+        product: 0xfd00,
+        name: "Razer Onza Tournament Edition",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x1689,
+        product: 0xfd01,
+        name: "Razer Onza Classic Edition",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x1689,
+        product: 0xfe00,
+        name: "Razer Sabertooth",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── PowerA ───────────────────────────────────────────────────
-    XpadDevice { vendor: 0x20d6, product: 0x2001, name: "BDA Xbox Series X Wired Controller",    mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x20d6, product: 0x2009, name: "PowerA Enhanced Wired Controller for Xbox Series X|S", mapping: 0,  xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x20d6, product: 0x2064, name: "PowerA Wired Controller for Xbox",      mapping: MAP_SHARE_BUTTON,     xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x20d6, product: 0x281f, name: "PowerA Wired Controller For Xbox 360",  mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x24c6, product: 0x5300, name: "PowerA MINI PROEX Controller",          mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x24c6, product: 0x531a, name: "PowerA Pro Ex",                         mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x24c6, product: 0x541a, name: "PowerA Xbox One Mini Wired Controller", mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x24c6, product: 0x543a, name: "PowerA Xbox One wired controller",      mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x24c6, product: 0x551a, name: "PowerA FUSION Pro Controller",          mapping: 0,                    xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x20d6,
+        product: 0x2001,
+        name: "BDA Xbox Series X Wired Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x20d6,
+        product: 0x2009,
+        name: "PowerA Enhanced Wired Controller for Xbox Series X|S",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x20d6,
+        product: 0x2064,
+        name: "PowerA Wired Controller for Xbox",
+        mapping: MAP_SHARE_BUTTON,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x20d6,
+        product: 0x281f,
+        name: "PowerA Wired Controller For Xbox 360",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x24c6,
+        product: 0x5300,
+        name: "PowerA MINI PROEX Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x24c6,
+        product: 0x531a,
+        name: "PowerA Pro Ex",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x24c6,
+        product: 0x541a,
+        name: "PowerA Xbox One Mini Wired Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x24c6,
+        product: 0x543a,
+        name: "PowerA Xbox One wired controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x24c6,
+        product: 0x551a,
+        name: "PowerA FUSION Pro Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── 8BitDo ───────────────────────────────────────────────────
-    XpadDevice { vendor: 0x2dc8, product: 0x2000, name: "8BitDo Pro 2 Wired Controller for Xbox",mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x2dc8, product: 0x200f, name: "8BitDo Ultimate 3-mode Controller for Xbox", mapping: MAP_SHARE_BUTTON, xtype: XTYPE_XBOXONE },
-    XpadDevice { vendor: 0x2dc8, product: 0x3106, name: "8BitDo Ultimate Wireless / Pro 2 Wired Controller", mapping: 0,      xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x2dc8, product: 0x6001, name: "8BitDo SN30 Pro",                       mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x2dc8,
+        product: 0x2000,
+        name: "8BitDo Pro 2 Wired Controller for Xbox",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x2dc8,
+        product: 0x200f,
+        name: "8BitDo Ultimate 3-mode Controller for Xbox",
+        mapping: MAP_SHARE_BUTTON,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x2dc8,
+        product: 0x3106,
+        name: "8BitDo Ultimate Wireless / Pro 2 Wired Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x2dc8,
+        product: 0x6001,
+        name: "8BitDo SN30 Pro",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── Snakebyte ────────────────────────────────────────────────
-    XpadDevice { vendor: 0x294b, product: 0x3303, name: "Snakebyte GAMEPAD BASE X",              mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x294b, product: 0x3404, name: "Snakebyte GAMEPAD RGB X",               mapping: 0,                    xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x294b,
+        product: 0x3303,
+        name: "Snakebyte GAMEPAD BASE X",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x294b,
+        product: 0x3404,
+        name: "Snakebyte GAMEPAD RGB X",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Harmonix (Rock Band) ──────────────────────────────────────
-    XpadDevice { vendor: 0x1bad, product: 0x0002, name: "Harmonix Rock Band Guitar",             mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x1bad, product: 0x0003, name: "Harmonix Rock Band Drumkit",            mapping: MAP_DPAD_TO_BUTTONS,  xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x1bad, product: 0xf016, name: "Mad Catz Xbox 360 Controller",          mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x1bad, product: 0xf900, name: "Harmonix Xbox 360 Controller",          mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x1bad,
+        product: 0x0002,
+        name: "Harmonix Rock Band Guitar",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x1bad,
+        product: 0x0003,
+        name: "Harmonix Rock Band Drumkit",
+        mapping: MAP_DPAD_TO_BUTTONS,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x1bad,
+        product: 0xf016,
+        name: "Mad Catz Xbox 360 Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x1bad,
+        product: 0xf900,
+        name: "Harmonix Xbox 360 Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── BigBen / Nacon ───────────────────────────────────────────
-    XpadDevice { vendor: 0x146b, product: 0x0601, name: "BigBen Interactive XBOX 360 Controller",mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x3285, product: 0x0603, name: "Nacon Pro Compact controller for Xbox", mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x3285, product: 0x0607, name: "Nacon GC-100",                          mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x3285, product: 0x0663, name: "Nacon Evol-X",                          mapping: 0,                    xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x146b,
+        product: 0x0601,
+        name: "BigBen Interactive XBOX 360 Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x3285,
+        product: 0x0603,
+        name: "Nacon Pro Compact controller for Xbox",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x3285,
+        product: 0x0607,
+        name: "Nacon GC-100",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x3285,
+        product: 0x0663,
+        name: "Nacon Evol-X",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Turtle Beach ─────────────────────────────────────────────
-    XpadDevice { vendor: 0x10f5, product: 0x7005, name: "Turtle Beach Recon Controller",         mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x10f5, product: 0x7008, name: "Turtle Beach Recon Controller",         mapping: MAP_SHARE_BUTTON,     xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x10f5,
+        product: 0x7005,
+        name: "Turtle Beach Recon Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x10f5,
+        product: 0x7008,
+        name: "Turtle Beach Recon Controller",
+        mapping: MAP_SHARE_BUTTON,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Hyperkin ─────────────────────────────────────────────────
-    XpadDevice { vendor: 0x2e24, product: 0x0652, name: "Hyperkin Duke X-Box One pad",           mapping: 0,                    xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x2e24, product: 0x1688, name: "Hyperkin X91 X-Box One pad",            mapping: 0,                    xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x2e24,
+        product: 0x0652,
+        name: "Hyperkin Duke X-Box One pad",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x2e24,
+        product: 0x1688,
+        name: "Hyperkin X91 X-Box One pad",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Lenovo / ASUS / Amazon ────────────────────────────────────
-    XpadDevice { vendor: 0x17ef, product: 0x6182, name: "Lenovo Legion Controller for Windows",  mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x0b05, product: 0x1a38, name: "ASUS ROG RAIKIRI",                      mapping: MAP_SHARE_BUTTON,     xtype: XTYPE_XBOXONE  },
-    XpadDevice { vendor: 0x1949, product: 0x041a, name: "Amazon Game Controller",                mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x17ef,
+        product: 0x6182,
+        name: "Lenovo Legion Controller for Windows",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x0b05,
+        product: 0x1a38,
+        name: "ASUS ROG RAIKIRI",
+        mapping: MAP_SHARE_BUTTON,
+        xtype: XTYPE_XBOXONE,
+    },
+    XpadDevice {
+        vendor: 0x1949,
+        product: 0x041a,
+        name: "Amazon Game Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── GameSir ──────────────────────────────────────────────────
-    XpadDevice { vendor: 0x3537, product: 0x1004, name: "GameSir T4 Kaleid",                     mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x3537, product: 0x1010, name: "GameSir G7 SE",                         mapping: 0,                    xtype: XTYPE_XBOXONE  },
+    XpadDevice {
+        vendor: 0x3537,
+        product: 0x1004,
+        name: "GameSir T4 Kaleid",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x3537,
+        product: 0x1010,
+        name: "GameSir G7 SE",
+        mapping: 0,
+        xtype: XTYPE_XBOXONE,
+    },
     // ── Wooting ──────────────────────────────────────────────────
-    XpadDevice { vendor: 0x31e3, product: 0x1100, name: "Wooting One",                           mapping: 0,                    xtype: XTYPE_XBOX360  },
-    XpadDevice { vendor: 0x31e3, product: 0x1200, name: "Wooting Two",                           mapping: 0,                    xtype: XTYPE_XBOX360  },
+    XpadDevice {
+        vendor: 0x31e3,
+        product: 0x1100,
+        name: "Wooting One",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
+    XpadDevice {
+        vendor: 0x31e3,
+        product: 0x1200,
+        name: "Wooting Two",
+        mapping: 0,
+        xtype: XTYPE_XBOX360,
+    },
     // ── Generic fallback ─────────────────────────────────────────
-    XpadDevice { vendor: 0xffff, product: 0xffff, name: "Chinese-made Xbox Controller",          mapping: 0,                    xtype: XTYPE_XBOX     },
+    XpadDevice {
+        vendor: 0xffff,
+        product: 0xffff,
+        name: "Chinese-made Xbox Controller",
+        mapping: 0,
+        xtype: XTYPE_XBOX,
+    },
 ];
 
 /// Look up a device entry by VID/PID.  Returns the first match or the
@@ -265,17 +850,12 @@ pub fn lookup_device(vendor: u16, product: u16) -> &'static XpadDevice {
 /// Returns `None` if the interface is not an Xbox controller.
 ///
 /// Ref: xpad.c:497–515.
-pub fn match_interface(
-    class: u8,
-    subclass: u8,
-    protocol: u8,
-) -> Option<u8> {
+pub fn match_interface(class: u8, subclass: u8, protocol: u8) -> Option<u8> {
     if class != USB_CLASS_VENDOR_SPEC {
         return None;
     }
     if subclass == XBOX360_INTF_SUBCLASS
-        && (protocol == XBOX360_INTF_PROTOCOL_WIRED
-            || protocol == XBOX360_INTF_PROTOCOL_WIRELESS)
+        && (protocol == XBOX360_INTF_PROTOCOL_WIRED || protocol == XBOX360_INTF_PROTOCOL_WIRELESS)
     {
         return Some(if protocol == XBOX360_INTF_PROTOCOL_WIRELESS {
             XTYPE_XBOX360W
@@ -303,51 +883,144 @@ pub struct XboxOneInitPacket {
 }
 
 // Static payload arrays (xpad.c:657–724).
-static XBOXONE_POWER_ON: &[u8] = &[
-    GIP_CMD_POWER, GIP_OPT_INTERNAL, GIP_SEQ0, 0x01, GIP_PWR_ON,
-];
-static XBOXONE_S_INIT: &[u8] = &[
-    GIP_CMD_POWER, GIP_OPT_INTERNAL, GIP_SEQ0, 0x0f, 0x06,
-];
-static EXTRA_INPUT_PACKET_INIT: &[u8] = &[
-    0x4d, 0x10, 0x01, 0x02, 0x07, 0x00,
-];
+static XBOXONE_POWER_ON: &[u8] = &[GIP_CMD_POWER, GIP_OPT_INTERNAL, GIP_SEQ0, 0x01, GIP_PWR_ON];
+static XBOXONE_S_INIT: &[u8] = &[GIP_CMD_POWER, GIP_OPT_INTERNAL, GIP_SEQ0, 0x0f, 0x06];
+static EXTRA_INPUT_PACKET_INIT: &[u8] = &[0x4d, 0x10, 0x01, 0x02, 0x07, 0x00];
 static XBOXONE_HORI_ACK_ID: &[u8] = &[
-    GIP_CMD_ACK, GIP_OPT_INTERNAL, GIP_SEQ0, 0x09,
-    0x00, GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, 0x3a,
-    0x00, 0x00, 0x00, 0x80, 0x00,
+    GIP_CMD_ACK,
+    GIP_OPT_INTERNAL,
+    GIP_SEQ0,
+    0x09,
+    0x00,
+    GIP_CMD_IDENTIFY,
+    GIP_OPT_INTERNAL,
+    0x3a,
+    0x00,
+    0x00,
+    0x00,
+    0x80,
+    0x00,
 ];
 static XBOXONE_LED_ON: &[u8] = &[
-    GIP_CMD_LED, GIP_OPT_INTERNAL, GIP_SEQ0, 0x03, 0x00, GIP_LED_ON, 0x14,
+    GIP_CMD_LED,
+    GIP_OPT_INTERNAL,
+    GIP_SEQ0,
+    0x03,
+    0x00,
+    GIP_LED_ON,
+    0x14,
 ];
 static XBOXONE_AUTH_DONE: &[u8] = &[
-    GIP_CMD_AUTHENTICATE, GIP_OPT_INTERNAL, GIP_SEQ0, 0x02, 0x01, 0x00,
+    GIP_CMD_AUTHENTICATE,
+    GIP_OPT_INTERNAL,
+    GIP_SEQ0,
+    0x02,
+    0x01,
+    0x00,
 ];
 static XBOXONE_RUMBLEBEGIN_INIT: &[u8] = &[
-    GIP_CMD_RUMBLE, 0x00, GIP_SEQ0, 0x09,
-    0x00, GIP_MOTOR_ALL, 0x00, 0x00, 0x1D, 0x1D, 0xFF, 0x00, 0x00,
+    GIP_CMD_RUMBLE,
+    0x00,
+    GIP_SEQ0,
+    0x09,
+    0x00,
+    GIP_MOTOR_ALL,
+    0x00,
+    0x00,
+    0x1D,
+    0x1D,
+    0xFF,
+    0x00,
+    0x00,
 ];
 static XBOXONE_RUMBLEEND_INIT: &[u8] = &[
-    GIP_CMD_RUMBLE, 0x00, GIP_SEQ0, 0x09,
-    0x00, GIP_MOTOR_ALL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    GIP_CMD_RUMBLE,
+    0x00,
+    GIP_SEQ0,
+    0x09,
+    0x00,
+    GIP_MOTOR_ALL,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
 ];
 
 /// Ordered init-packet sequence, xpad.c:733–748.
 pub static XBOXONE_INIT_PACKETS: &[XboxOneInitPacket] = &[
-    XboxOneInitPacket { vendor: 0x0e6f, product: 0x0165, data: XBOXONE_HORI_ACK_ID },
-    XboxOneInitPacket { vendor: 0x0f0d, product: 0x0067, data: XBOXONE_HORI_ACK_ID },
-    XboxOneInitPacket { vendor: 0x0000, product: 0x0000, data: XBOXONE_POWER_ON },
-    XboxOneInitPacket { vendor: 0x045e, product: 0x02ea, data: XBOXONE_S_INIT },
-    XboxOneInitPacket { vendor: 0x045e, product: 0x0b00, data: XBOXONE_S_INIT },
-    XboxOneInitPacket { vendor: 0x045e, product: 0x0b00, data: EXTRA_INPUT_PACKET_INIT },
-    XboxOneInitPacket { vendor: 0x0000, product: 0x0000, data: XBOXONE_LED_ON },
-    XboxOneInitPacket { vendor: 0x0000, product: 0x0000, data: XBOXONE_AUTH_DONE },
-    XboxOneInitPacket { vendor: 0x24c6, product: 0x541a, data: XBOXONE_RUMBLEBEGIN_INIT },
-    XboxOneInitPacket { vendor: 0x24c6, product: 0x542a, data: XBOXONE_RUMBLEBEGIN_INIT },
-    XboxOneInitPacket { vendor: 0x24c6, product: 0x543a, data: XBOXONE_RUMBLEBEGIN_INIT },
-    XboxOneInitPacket { vendor: 0x24c6, product: 0x541a, data: XBOXONE_RUMBLEEND_INIT },
-    XboxOneInitPacket { vendor: 0x24c6, product: 0x542a, data: XBOXONE_RUMBLEEND_INIT },
-    XboxOneInitPacket { vendor: 0x24c6, product: 0x543a, data: XBOXONE_RUMBLEEND_INIT },
+    XboxOneInitPacket {
+        vendor: 0x0e6f,
+        product: 0x0165,
+        data: XBOXONE_HORI_ACK_ID,
+    },
+    XboxOneInitPacket {
+        vendor: 0x0f0d,
+        product: 0x0067,
+        data: XBOXONE_HORI_ACK_ID,
+    },
+    XboxOneInitPacket {
+        vendor: 0x0000,
+        product: 0x0000,
+        data: XBOXONE_POWER_ON,
+    },
+    XboxOneInitPacket {
+        vendor: 0x045e,
+        product: 0x02ea,
+        data: XBOXONE_S_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x045e,
+        product: 0x0b00,
+        data: XBOXONE_S_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x045e,
+        product: 0x0b00,
+        data: EXTRA_INPUT_PACKET_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x0000,
+        product: 0x0000,
+        data: XBOXONE_LED_ON,
+    },
+    XboxOneInitPacket {
+        vendor: 0x0000,
+        product: 0x0000,
+        data: XBOXONE_AUTH_DONE,
+    },
+    XboxOneInitPacket {
+        vendor: 0x24c6,
+        product: 0x541a,
+        data: XBOXONE_RUMBLEBEGIN_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x24c6,
+        product: 0x542a,
+        data: XBOXONE_RUMBLEBEGIN_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x24c6,
+        product: 0x543a,
+        data: XBOXONE_RUMBLEBEGIN_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x24c6,
+        product: 0x541a,
+        data: XBOXONE_RUMBLEEND_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x24c6,
+        product: 0x542a,
+        data: XBOXONE_RUMBLEEND_INIT,
+    },
+    XboxOneInitPacket {
+        vendor: 0x24c6,
+        product: 0x543a,
+        data: XBOXONE_RUMBLEEND_INIT,
+    },
 ];
 
 // ── Wireless receiver slot state ──────────────────────────────────────
@@ -451,10 +1124,10 @@ pub fn xpad_process_packet(data: &[u8], mapping: u8) {
 
     // Sticks — xpad.c:826–836
     if mapping & MAP_STICKS_TO_NULL == 0 {
-        emit_abs(abs::ABS_X,  read_le_i16(data, 12) as i32);
-        emit_abs(abs::ABS_Y,  !(read_le_i16(data, 14) as i32));  // inverted
+        emit_abs(abs::ABS_X, read_le_i16(data, 12) as i32);
+        emit_abs(abs::ABS_Y, !(read_le_i16(data, 14) as i32)); // inverted
         emit_abs(abs::ABS_RX, read_le_i16(data, 16) as i32);
-        emit_abs(abs::ABS_RY, !(read_le_i16(data, 18) as i32));  // inverted
+        emit_abs(abs::ABS_RY, !(read_le_i16(data, 18) as i32)); // inverted
     }
 
     // Triggers — xpad.c:839–845
@@ -462,16 +1135,16 @@ pub fn xpad_process_packet(data: &[u8], mapping: u8) {
         emit_btn(btn::BTN_TL2, data[10] != 0);
         emit_btn(btn::BTN_TR2, data[11] != 0);
     } else {
-        emit_abs(abs::ABS_Z,  data[10] as i32);
+        emit_abs(abs::ABS_Z, data[10] as i32);
         emit_abs(abs::ABS_RZ, data[11] as i32);
     }
 
     // D-Pad — xpad.c:848–858
     if mapping & MAP_DPAD_TO_BUTTONS != 0 {
-        emit_btn(btn::BTN_DPAD_LEFT,  data[2] & (1 << 2) != 0);
+        emit_btn(btn::BTN_DPAD_LEFT, data[2] & (1 << 2) != 0);
         emit_btn(btn::BTN_DPAD_RIGHT, data[2] & (1 << 3) != 0);
-        emit_btn(btn::BTN_DPAD_UP,    data[2] & (1 << 0) != 0);
-        emit_btn(btn::BTN_DPAD_DOWN,  data[2] & (1 << 1) != 0);
+        emit_btn(btn::BTN_DPAD_UP, data[2] & (1 << 0) != 0);
+        emit_btn(btn::BTN_DPAD_DOWN, data[2] & (1 << 1) != 0);
     } else {
         let hat_x = (data[2] & 0x08 != 0) as i32 - (data[2] & 0x04 != 0) as i32;
         let hat_y = (data[2] & 0x02 != 0) as i32 - (data[2] & 0x01 != 0) as i32;
@@ -480,20 +1153,20 @@ pub fn xpad_process_packet(data: &[u8], mapping: u8) {
     }
 
     // Start / Back / Thumb — xpad.c:862–865
-    emit_btn(btn::BTN_START,  data[2] & (1 << 4) != 0);
+    emit_btn(btn::BTN_START, data[2] & (1 << 4) != 0);
     emit_btn(btn::BTN_SELECT, data[2] & (1 << 5) != 0);
     emit_btn(btn::BTN_THUMBL, data[2] & (1 << 6) != 0);
     emit_btn(btn::BTN_THUMBR, data[2] & (1 << 7) != 0);
 
     // A/B/X/Y (analog treated as digital) — xpad.c:868–875
-    emit_btn(btn::BTN_SOUTH, data[4] != 0);  // A
-    emit_btn(btn::BTN_EAST,  data[5] != 0);  // B
-    emit_btn(btn::BTN_NORTH, data[6] != 0);  // X
-    emit_btn(btn::BTN_WEST,  data[7] != 0);  // Y
+    emit_btn(btn::BTN_SOUTH, data[4] != 0); // A
+    emit_btn(btn::BTN_EAST, data[5] != 0); // B
+    emit_btn(btn::BTN_NORTH, data[6] != 0); // X
+    emit_btn(btn::BTN_WEST, data[7] != 0); // Y
 
     // Black / White — xpad.c:873–875
-    emit_btn(btn::BTN_C, data[8] != 0);  // Black
-    emit_btn(btn::BTN_Z, data[9] != 0);  // White
+    emit_btn(btn::BTN_C, data[8] != 0); // Black
+    emit_btn(btn::BTN_Z, data[9] != 0); // White
 }
 
 /// Decode an Xbox 360 wired controller 20-byte report.
@@ -525,10 +1198,10 @@ pub fn xpad360_process_packet(data: &[u8], mapping: u8, is_wireless: bool) {
 
     // D-Pad — xpad.c:899–918
     if mapping & MAP_DPAD_TO_BUTTONS != 0 {
-        emit_btn(btn::BTN_DPAD_LEFT,  data[2] & (1 << 2) != 0);
+        emit_btn(btn::BTN_DPAD_LEFT, data[2] & (1 << 2) != 0);
         emit_btn(btn::BTN_DPAD_RIGHT, data[2] & (1 << 3) != 0);
-        emit_btn(btn::BTN_DPAD_UP,    data[2] & (1 << 0) != 0);
-        emit_btn(btn::BTN_DPAD_DOWN,  data[2] & (1 << 1) != 0);
+        emit_btn(btn::BTN_DPAD_UP, data[2] & (1 << 0) != 0);
+        emit_btn(btn::BTN_DPAD_DOWN, data[2] & (1 << 1) != 0);
     }
     // Always emit hat for 360W or when not dpad-as-buttons — xpad.c:913–918
     if mapping & MAP_DPAD_TO_BUTTONS == 0 || is_wireless {
@@ -539,26 +1212,26 @@ pub fn xpad360_process_packet(data: &[u8], mapping: u8, is_wireless: bool) {
     }
 
     // Start / Back / Thumb — xpad.c:922–927
-    emit_btn(btn::BTN_START,  data[2] & (1 << 4) != 0);
+    emit_btn(btn::BTN_START, data[2] & (1 << 4) != 0);
     emit_btn(btn::BTN_SELECT, data[2] & (1 << 5) != 0);
     emit_btn(btn::BTN_THUMBL, data[2] & (1 << 6) != 0);
     emit_btn(btn::BTN_THUMBR, data[2] & (1 << 7) != 0);
 
     // A/B/X/Y/LB/RB/Guide — xpad.c:930–936
-    emit_btn(btn::BTN_SOUTH, data[3] & (1 << 4) != 0);  // A
-    emit_btn(btn::BTN_EAST,  data[3] & (1 << 5) != 0);  // B
-    emit_btn(btn::BTN_NORTH, data[3] & (1 << 6) != 0);  // X
-    emit_btn(btn::BTN_WEST,  data[3] & (1 << 7) != 0);  // Y
-    emit_btn(btn::BTN_TL,    data[3] & (1 << 0) != 0);  // LB
-    emit_btn(btn::BTN_TR,    data[3] & (1 << 1) != 0);  // RB
-    emit_btn(btn::BTN_MODE,  data[3] & (1 << 2) != 0);  // Guide
+    emit_btn(btn::BTN_SOUTH, data[3] & (1 << 4) != 0); // A
+    emit_btn(btn::BTN_EAST, data[3] & (1 << 5) != 0); // B
+    emit_btn(btn::BTN_NORTH, data[3] & (1 << 6) != 0); // X
+    emit_btn(btn::BTN_WEST, data[3] & (1 << 7) != 0); // Y
+    emit_btn(btn::BTN_TL, data[3] & (1 << 0) != 0); // LB
+    emit_btn(btn::BTN_TR, data[3] & (1 << 1) != 0); // RB
+    emit_btn(btn::BTN_MODE, data[3] & (1 << 2) != 0); // Guide
 
     // Sticks — xpad.c:938–950
     if mapping & MAP_STICKS_TO_NULL == 0 {
-        emit_abs(abs::ABS_X,  read_le_i16(data, 6) as i32);
-        emit_abs(abs::ABS_Y,  !read_le_i16(data, 8) as i32);   // inverted
+        emit_abs(abs::ABS_X, read_le_i16(data, 6) as i32);
+        emit_abs(abs::ABS_Y, !read_le_i16(data, 8) as i32); // inverted
         emit_abs(abs::ABS_RX, read_le_i16(data, 10) as i32);
-        emit_abs(abs::ABS_RY, !read_le_i16(data, 12) as i32);  // inverted
+        emit_abs(abs::ABS_RY, !read_le_i16(data, 12) as i32); // inverted
     }
 
     // Triggers — xpad.c:953–959
@@ -566,7 +1239,7 @@ pub fn xpad360_process_packet(data: &[u8], mapping: u8, is_wireless: bool) {
         emit_btn(btn::BTN_TL2, data[4] != 0);
         emit_btn(btn::BTN_TR2, data[5] != 0);
     } else {
-        emit_abs(abs::ABS_Z,  data[4] as i32);
+        emit_abs(abs::ABS_Z, data[4] as i32);
         emit_abs(abs::ABS_RZ, data[5] as i32);
     }
 }
@@ -575,10 +1248,7 @@ pub fn xpad360_process_packet(data: &[u8], mapping: u8, is_wireless: bool) {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WirelessResult {
     /// Presence changed for the given slot.
-    PresenceChanged {
-        slot: usize,
-        connected: bool,
-    },
+    PresenceChanged { slot: usize, connected: bool },
     /// Input data decoded (calls `xpad360_process_packet` internally).
     DataDecoded,
     /// Packet was not valid data (pad data byte != 0x01).
@@ -613,7 +1283,10 @@ pub fn xpad360w_process_packet(
     if data[0] & 0x08 != 0 {
         let present = data[1] & 0x80 != 0;
         receiver.update_presence(slot, present);
-        return WirelessResult::PresenceChanged { slot, connected: present };
+        return WirelessResult::PresenceChanged {
+            slot,
+            connected: present,
+        };
     }
 
     // Valid pad data — xpad.c:1036–1043
@@ -664,21 +1337,21 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
                 return;
             }
             // Menu / View — xpad.c:1105–1106
-            emit_btn(btn::BTN_START,  data[4] & (1 << 2) != 0);
+            emit_btn(btn::BTN_START, data[4] & (1 << 2) != 0);
             emit_btn(btn::BTN_SELECT, data[4] & (1 << 3) != 0);
 
             // A / B / X / Y — xpad.c:1114–1118
-            emit_btn(btn::BTN_SOUTH, data[4] & (1 << 4) != 0);  // A
-            emit_btn(btn::BTN_EAST,  data[4] & (1 << 5) != 0);  // B
-            emit_btn(btn::BTN_NORTH, data[4] & (1 << 6) != 0);  // X
-            emit_btn(btn::BTN_WEST,  data[4] & (1 << 7) != 0);  // Y
+            emit_btn(btn::BTN_SOUTH, data[4] & (1 << 4) != 0); // A
+            emit_btn(btn::BTN_EAST, data[4] & (1 << 5) != 0); // B
+            emit_btn(btn::BTN_NORTH, data[4] & (1 << 6) != 0); // X
+            emit_btn(btn::BTN_WEST, data[4] & (1 << 7) != 0); // Y
 
             // D-Pad — xpad.c:1121–1132
             if mapping & MAP_DPAD_TO_BUTTONS != 0 {
-                emit_btn(btn::BTN_DPAD_LEFT,  data[5] & (1 << 2) != 0);
+                emit_btn(btn::BTN_DPAD_LEFT, data[5] & (1 << 2) != 0);
                 emit_btn(btn::BTN_DPAD_RIGHT, data[5] & (1 << 3) != 0);
-                emit_btn(btn::BTN_DPAD_UP,    data[5] & (1 << 0) != 0);
-                emit_btn(btn::BTN_DPAD_DOWN,  data[5] & (1 << 1) != 0);
+                emit_btn(btn::BTN_DPAD_UP, data[5] & (1 << 0) != 0);
+                emit_btn(btn::BTN_DPAD_DOWN, data[5] & (1 << 1) != 0);
             } else {
                 let hat_x = (data[5] & 0x08 != 0) as i32 - (data[5] & 0x04 != 0) as i32;
                 let hat_y = (data[5] & 0x02 != 0) as i32 - (data[5] & 0x01 != 0) as i32;
@@ -687,17 +1360,17 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
             }
 
             // LB / RB / ThL / ThR — xpad.c:1134–1140
-            emit_btn(btn::BTN_TL,     data[5] & (1 << 4) != 0);
-            emit_btn(btn::BTN_TR,     data[5] & (1 << 5) != 0);
+            emit_btn(btn::BTN_TL, data[5] & (1 << 4) != 0);
+            emit_btn(btn::BTN_TR, data[5] & (1 << 5) != 0);
             emit_btn(btn::BTN_THUMBL, data[5] & (1 << 6) != 0);
             emit_btn(btn::BTN_THUMBR, data[5] & (1 << 7) != 0);
 
             // Sticks — xpad.c:1142–1154
             if mapping & MAP_STICKS_TO_NULL == 0 {
-                emit_abs(abs::ABS_X,  read_le_i16(data, 10) as i32);
-                emit_abs(abs::ABS_Y,  !read_le_i16(data, 12) as i32);  // inverted
+                emit_abs(abs::ABS_X, read_le_i16(data, 10) as i32);
+                emit_abs(abs::ABS_Y, !read_le_i16(data, 12) as i32); // inverted
                 emit_abs(abs::ABS_RX, read_le_i16(data, 14) as i32);
-                emit_abs(abs::ABS_RY, !read_le_i16(data, 16) as i32);  // inverted
+                emit_abs(abs::ABS_RY, !read_le_i16(data, 16) as i32); // inverted
             }
 
             // Triggers — xpad.c:1156–1167
@@ -705,7 +1378,7 @@ pub fn xpadone_process_packet(data: &[u8], len: usize, mapping: u8) {
                 emit_btn(btn::BTN_TL2, read_le_u16(data, 6) != 0);
                 emit_btn(btn::BTN_TR2, read_le_u16(data, 8) != 0);
             } else {
-                emit_abs(abs::ABS_Z,  read_le_u16(data, 6) as i32);
+                emit_abs(abs::ABS_Z, read_le_u16(data, 6) as i32);
                 emit_abs(abs::ABS_RZ, read_le_u16(data, 8) as i32);
             }
 
@@ -762,7 +1435,10 @@ pub fn encode_rumble(
     weak: u16,
     odata_serial: &mut u8,
 ) -> Option<RumblePacket> {
-    let mut pkt = RumblePacket { data: [0u8; 13], len: 0 };
+    let mut pkt = RumblePacket {
+        data: [0u8; 13],
+        len: 0,
+    };
     match xtype {
         XTYPE_XBOX => {
             // xpad.c:1567–1575
@@ -779,8 +1455,8 @@ pub fn encode_rumble(
             pkt.data[0] = 0x00;
             pkt.data[1] = 0x08;
             pkt.data[2] = 0x00;
-            pkt.data[3] = (strong / 256) as u8;  // left actuator
-            pkt.data[4] = (weak / 256) as u8;    // right actuator
+            pkt.data[3] = (strong / 256) as u8; // left actuator
+            pkt.data[4] = (weak / 256) as u8; // right actuator
             pkt.data[5] = 0x00;
             pkt.data[6] = 0x00;
             pkt.data[7] = 0x00;
@@ -805,16 +1481,16 @@ pub fn encode_rumble(
             pkt.data[0] = GIP_CMD_RUMBLE;
             pkt.data[1] = 0x00;
             pkt.data[2] = seq;
-            pkt.data[3] = 0x09;           // payload length (LEB128 of 9)
+            pkt.data[3] = 0x09; // payload length (LEB128 of 9)
             pkt.data[4] = 0x00;
             pkt.data[5] = GIP_MOTOR_ALL;
-            pkt.data[6] = 0x00;           // left trigger motor
-            pkt.data[7] = 0x00;           // right trigger motor
-            pkt.data[8]  = (strong / 512) as u8;  // left actuator
-            pkt.data[9]  = (weak / 512) as u8;    // right actuator
-            pkt.data[10] = 0xFF;          // on period
-            pkt.data[11] = 0x00;          // off period
-            pkt.data[12] = 0xFF;          // repeat count
+            pkt.data[6] = 0x00; // left trigger motor
+            pkt.data[7] = 0x00; // right trigger motor
+            pkt.data[8] = (strong / 512) as u8; // left actuator
+            pkt.data[9] = (weak / 512) as u8; // right actuator
+            pkt.data[10] = 0xFF; // on period
+            pkt.data[11] = 0x00; // off period
+            pkt.data[12] = 0xFF; // repeat count
             pkt.len = 13;
         }
         _ => return None,
@@ -847,7 +1523,10 @@ pub struct LedPacket {
 /// Xbox One).
 pub fn encode_led(xtype: u8, command: u8) -> Option<LedPacket> {
     let cmd = command % 16;
-    let mut pkt = LedPacket { data: [0u8; 12], len: 0 };
+    let mut pkt = LedPacket {
+        data: [0u8; 12],
+        len: 0,
+    };
     match xtype {
         XTYPE_XBOX360 => {
             // xpad.c:1692–1697
@@ -883,8 +1562,7 @@ pub fn iter_init_packets(
     product: u16,
 ) -> impl Iterator<Item = &'static XboxOneInitPacket> {
     XBOXONE_INIT_PACKETS.iter().filter(move |p| {
-        (p.vendor == 0x0000 || p.vendor == vendor)
-            && (p.product == 0x0000 || p.product == product)
+        (p.vendor == 0x0000 || p.vendor == vendor) && (p.product == 0x0000 || p.product == product)
     })
 }
 
@@ -914,11 +1592,11 @@ mod tests {
         // LT = 0x80
         // LX = 0x0000 (actually -32768 full-left is 0x00, 0x80)
         let mut data = [0u8; 20];
-        data[0] = 0x00;  // valid type
-        data[1] = 0x14;  // length
+        data[0] = 0x00; // valid type
+        data[1] = 0x14; // length
         data[3] = 1 << 4; // A button
-        data[4] = 0x80;   // LT
-        // LX full-left = -32768 = 0x8000 in LE → [0x00, 0x80]
+        data[4] = 0x80; // LT
+                        // LX full-left = -32768 = 0x8000 in LE → [0x00, 0x80]
         data[6] = 0x00;
         data[7] = 0x80;
 
@@ -970,7 +1648,10 @@ mod tests {
         let data = [0x08u8, 0x80, 0, 0, 0, 0];
         let result = xpad360w_process_packet(&mut rx, 0, &data, 0);
         match result {
-            WirelessResult::PresenceChanged { slot: 0, connected: true } => {}
+            WirelessResult::PresenceChanged {
+                slot: 0,
+                connected: true,
+            } => {}
             _ => return TestResult::Fail("360W: expected connect event on slot 0"),
         }
         if rx.slots[0] != WirelessSlotState::Present {
@@ -989,7 +1670,7 @@ mod tests {
         // inner payload at [4..]: type=0x00, A button pressed (data[7] bit4)
         let mut data = [0u8; 32];
         data[1] = 0x01;
-        data[4] = 0x00;  // inner[0] = type valid
+        data[4] = 0x00; // inner[0] = type valid
         data[7] = 1 << 4; // inner[3] = A button
         narf_input::__reset_global_ring_for_test();
         let result = xpad360w_process_packet(&mut rx, 1, &data, 0);
@@ -1022,7 +1703,7 @@ mod tests {
         // data[4] bit4 = A pressed
         let mut data = [0u8; 18];
         data[0] = GIP_CMD_INPUT;
-        data[4] = 1 << 4;  // A
+        data[4] = 1 << 4; // A
         narf_input::__reset_global_ring_for_test();
         xpadone_process_packet(&data, 18, 0);
         let mut found_a = false;
@@ -1052,8 +1733,7 @@ mod tests {
         // (wildcard, always applies) match Linux's known payloads.
         // xpad.c:736: XBOXONE_INIT_PKT(0x0000, 0x0000, xboxone_power_on)
         // is the first wildcard entry (index 2).
-        let packets: alloc::vec::Vec<_> =
-            iter_init_packets(0x045e, 0x02d1).collect();
+        let packets: alloc::vec::Vec<_> = iter_init_packets(0x045e, 0x02d1).collect();
         if packets.len() < 3 {
             return TestResult::Fail("Xbox One init: fewer than 3 applicable packets");
         }
@@ -1156,7 +1836,7 @@ mod tests {
         // 360 report with D-pad up pressed (data[2] bit0)
         let mut data = [0u8; 20];
         data[0] = 0x00;
-        data[2] = 0x01;  // DUp bit
+        data[2] = 0x01; // DUp bit
         narf_input::__reset_global_ring_for_test();
         xpad360_process_packet(&data, 0, false);
         let mut found_hat_y = false;
@@ -1190,7 +1870,10 @@ mod tests {
             let data = [0x08u8, 0x80, 0, 0, 0, 0];
             let result = xpad360w_process_packet(&mut rx, slot, &data, 0);
             match result {
-                WirelessResult::PresenceChanged { slot: s, connected: true } if s == slot => {}
+                WirelessResult::PresenceChanged {
+                    slot: s,
+                    connected: true,
+                } if s == slot => {}
                 _ => return TestResult::Fail("4-slot: connect not dispatched correctly"),
             }
         }
@@ -1203,7 +1886,10 @@ mod tests {
         let disc = [0x08u8, 0x00, 0, 0, 0, 0];
         let result = xpad360w_process_packet(&mut rx, 2, &disc, 0);
         match result {
-            WirelessResult::PresenceChanged { slot: 2, connected: false } => {}
+            WirelessResult::PresenceChanged {
+                slot: 2,
+                connected: false,
+            } => {}
             _ => return TestResult::Fail("4-slot: disconnect not dispatched correctly"),
         }
         if rx.slots[2] != WirelessSlotState::Absent {

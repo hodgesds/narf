@@ -153,7 +153,12 @@ pub fn encode_baud_divisor(baud: u32) -> ([u8; 4], u32) {
 /// bytes 0–3 with `encode_baud_divisor` output if needed.
 ///
 /// Linux: pl2303.c `pl2303_set_termios` l.855–895
-pub fn build_line_coding(baud: u32, data_bits: DataBits, parity: Parity, stop_bits: StopBits) -> [u8; 7] {
+pub fn build_line_coding(
+    baud: u32,
+    data_bits: DataBits,
+    parity: Parity,
+    stop_bits: StopBits,
+) -> [u8; 7] {
     let baud_bytes = encode_baud_direct(baud);
     let stop = match stop_bits {
         StopBits::One => 0u8,
@@ -173,7 +178,15 @@ pub fn build_line_coding(baud: u32, data_bits: DataBits, parity: Parity, stop_bi
         DataBits::Seven => 7u8,
         DataBits::Eight => 8u8,
     };
-    [baud_bytes[0], baud_bytes[1], baud_bytes[2], baud_bytes[3], stop, par, db]
+    [
+        baud_bytes[0],
+        baud_bytes[1],
+        baud_bytes[2],
+        baud_bytes[3],
+        stop,
+        par,
+        db,
+    ]
 }
 
 /// Build the SETUP packet fields for SET_LINE_CODING.
@@ -261,12 +274,7 @@ impl Pl2303State {
     pub fn new(slot_id: u8) -> Self {
         Self {
             slot_id,
-            line_coding: build_line_coding(
-                9600,
-                DataBits::Eight,
-                Parity::None,
-                StopBits::One,
-            ),
+            line_coding: build_line_coding(9600, DataBits::Eight, Parity::None, StopBits::One),
             modem: ModemStatus::default(),
             dtr: false,
             rts: false,
@@ -371,7 +379,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/pl2303", smoke_pl2303_vendor_write_encode);
+    kernel_test_in!(
+        "drivers/usb/serial/pl2303",
+        smoke_pl2303_vendor_write_encode
+    );
 
     fn smoke_pl2303_set_baud_9600_direct() -> TestResult {
         let buf = encode_baud_direct(9600);
@@ -381,7 +392,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/pl2303", smoke_pl2303_set_baud_9600_direct);
+    kernel_test_in!(
+        "drivers/usb/serial/pl2303",
+        smoke_pl2303_set_baud_9600_direct
+    );
 
     fn smoke_pl2303_baud_divisor_flag() -> TestResult {
         // Divisor encoding must have buf[3] = 0x80 as the flag byte.
@@ -409,7 +423,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/pl2303", smoke_pl2303_set_line_coding_setup);
+    kernel_test_in!(
+        "drivers/usb/serial/pl2303",
+        smoke_pl2303_set_line_coding_setup
+    );
 
     fn smoke_pl2303_line_coding_8n1() -> TestResult {
         let lc = build_line_coding(9600, DataBits::Eight, Parity::None, StopBits::One);
@@ -444,5 +461,8 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/pl2303", smoke_pl2303_modem_status_decode);
+    kernel_test_in!(
+        "drivers/usb/serial/pl2303",
+        smoke_pl2303_modem_status_decode
+    );
 }

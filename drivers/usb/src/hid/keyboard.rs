@@ -38,19 +38,19 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_input::{
     evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceId, DeviceNode, ROUTER},
-    push_key, KeyCode, Modifiers, update_modifiers,
+    push_key, update_modifiers, KeyCode, Modifiers,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::{
-    usage_to_keycode, HidError, HID_BOOT_PROTOCOL, HID_REQ_SET_IDLE,
-    HID_REQ_SET_PROTOCOL, HID_REPORT_PROTOCOL,
+    usage_to_keycode, HidError, HID_BOOT_PROTOCOL, HID_REPORT_PROTOCOL, HID_REQ_SET_IDLE,
+    HID_REQ_SET_PROTOCOL,
 };
 use crate::xhci::Xhci;
 
 use super::report_descriptor::{
-    build_led_report, find_keyboard_fields, has_keyboard_collection, parse,
-    FieldKind, ReportDescriptor, USAGE_PAGE_LED,
+    build_led_report, find_keyboard_fields, has_keyboard_collection, parse, FieldKind,
+    ReportDescriptor, USAGE_PAGE_LED,
 };
 
 // HID class request codes.
@@ -149,9 +149,9 @@ use crate::hid::kbd_mod;
 /// each modifier to the evdev DeviceNode for ROUTER delivery.
 /// Returns (events_emitted, current_modifiers).
 fn diff_modifiers(prev_byte: u8, cur_byte: u8, node: &DeviceNode) -> (usize, Modifiers) {
+    use narf_input::push_global;
     use narf_input::InputEvent;
     use narf_input::KeyEvent;
-    use narf_input::push_global;
 
     let cur_mods_raw = narf_input::Modifiers::from_bits_truncate(
         crate::hid::modifier_byte_to_modifiers(cur_byte).bits(),
@@ -160,14 +160,14 @@ fn diff_modifiers(prev_byte: u8, cur_byte: u8, node: &DeviceNode) -> (usize, Mod
     // HID modifier bit → (KeyCode for legacy ring, evdev code for ROUTER).
     // Evdev codes from linux/include/uapi/linux/input-event-codes.h.
     let mod_pairs: &[(u8, KeyCode, u16)] = &[
-        (kbd_mod::LCTRL,  KeyCode::LeftCtrl,   29),
-        (kbd_mod::LSHIFT, KeyCode::LeftShift,  42),
-        (kbd_mod::LALT,   KeyCode::LeftAlt,    56),
-        (kbd_mod::LGUI,   KeyCode::LeftMeta,   125),
-        (kbd_mod::RCTRL,  KeyCode::RightCtrl,  97),
+        (kbd_mod::LCTRL, KeyCode::LeftCtrl, 29),
+        (kbd_mod::LSHIFT, KeyCode::LeftShift, 42),
+        (kbd_mod::LALT, KeyCode::LeftAlt, 56),
+        (kbd_mod::LGUI, KeyCode::LeftMeta, 125),
+        (kbd_mod::RCTRL, KeyCode::RightCtrl, 97),
         (kbd_mod::RSHIFT, KeyCode::RightShift, 54),
-        (kbd_mod::RALT,   KeyCode::RightAlt,   100),
-        (kbd_mod::RGUI,   KeyCode::RightMeta,  126),
+        (kbd_mod::RALT, KeyCode::RightAlt, 100),
+        (kbd_mod::RGUI, KeyCode::RightMeta, 126),
     ];
     let mut emitted = 0usize;
     for &(bit, code, evdev_code) in mod_pairs {
@@ -296,7 +296,11 @@ pub async fn set_leds(
             HID_REQ_SET_REPORT,
             w_value,
             kbd.interface_num as u16,
-            &mut { let mut d = [0u8; 2]; d[..len].copy_from_slice(&buf[..len]); d }[..len],
+            &mut {
+                let mut d = [0u8; 2];
+                d[..len].copy_from_slice(&buf[..len]);
+                d
+            }[..len],
         )
         .await
         .map_err(HidError::Xhci)
@@ -376,7 +380,9 @@ pub fn keyboard_evdev_caps() -> DeviceCaps {
     }
     // Standard modifier + extended key evdev codes.
     for c in [
-        key::BTN_LEFT, key::BTN_RIGHT, key::BTN_MIDDLE,
+        key::BTN_LEFT,
+        key::BTN_RIGHT,
+        key::BTN_MIDDLE,
         // Right-side modifier codes beyond 127.
         97u16,  // KEY_RIGHTCTRL
         100u16, // KEY_RIGHTALT
@@ -519,7 +525,7 @@ pub fn __reset_usb_keyboards_for_test() {
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod tests {
     use super::*;
-    use narf_input::{pop_key, __reset_global_ring_for_test, init_global_ring, KeyCode};
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_key, KeyCode};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     /// Build a test `UsbKeyboard` already wired to a fresh evdev DeviceNode.
@@ -673,7 +679,10 @@ pub(crate) mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/keyboard", smoke_kbd_press_release_roundtrip);
+    kernel_test_in!(
+        "drivers/usb/hid/keyboard",
+        smoke_kbd_press_release_roundtrip
+    );
 
     // ── Test 6: diff_keycodes — no rollover, 2 simultaneous keys ─────
 
@@ -736,16 +745,30 @@ pub(crate) mod tests {
     // ── Test 8: LedState::as_byte encoding ───────────────────────────
 
     fn smoke_kbd_led_state_as_byte() -> TestResult {
-        use super::super::report_descriptor::{LED_BIT_CAPSLOCK, LED_BIT_NUMLOCK, LED_BIT_SCROLLLOCK};
-        let all_off = LedState { num_lock: false, caps_lock: false, scroll_lock: false };
+        use super::super::report_descriptor::{
+            LED_BIT_CAPSLOCK, LED_BIT_NUMLOCK, LED_BIT_SCROLLLOCK,
+        };
+        let all_off = LedState {
+            num_lock: false,
+            caps_lock: false,
+            scroll_lock: false,
+        };
         if all_off.as_byte() != 0x00 {
             return TestResult::Fail("all-off LED byte should be 0x00");
         }
-        let caps_only = LedState { num_lock: false, caps_lock: true, scroll_lock: false };
+        let caps_only = LedState {
+            num_lock: false,
+            caps_lock: true,
+            scroll_lock: false,
+        };
         if caps_only.as_byte() != LED_BIT_CAPSLOCK {
             return TestResult::Fail("caps-only LED byte wrong");
         }
-        let all_on = LedState { num_lock: true, caps_lock: true, scroll_lock: true };
+        let all_on = LedState {
+            num_lock: true,
+            caps_lock: true,
+            scroll_lock: true,
+        };
         if all_on.as_byte() != (LED_BIT_NUMLOCK | LED_BIT_CAPSLOCK | LED_BIT_SCROLLLOCK) {
             return TestResult::Fail("all-on LED byte wrong");
         }

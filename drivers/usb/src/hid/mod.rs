@@ -255,14 +255,16 @@ impl BootKeyboard {
         // here is non-fatal (some devices STALL because they
         // don't implement the request); SET_PROTOCOL was the
         // load-bearing call.
-        let _ = xhci_dev.control_in(
-            slot_id,
-            0x21,
-            HID_REQ_SET_IDLE,
-            0, // (duration<<8) | reportID — both zero
-            interface_num as u16,
-            &mut nothing,
-        ).await;
+        let _ = xhci_dev
+            .control_in(
+                slot_id,
+                0x21,
+                HID_REQ_SET_IDLE,
+                0, // (duration<<8) | reportID — both zero
+                interface_num as u16,
+                &mut nothing,
+            )
+            .await;
         // Pre-arm the interrupt-IN endpoint with one Normal TRB so
         // the controller starts polling the device immediately. The
         // first state-change report from the device completes that
@@ -630,13 +632,17 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         err
     })?;
     let res = async {
-        xhci_dev.address_device(slot_id, port, speed).await.map_err(|e| {
-            let err = HidError::Xhci(e);
-            note_attach_fail(port, AttachStep::AddressDevice, &err);
-            err
-        })?;
+        xhci_dev
+            .address_device(slot_id, port, speed)
+            .await
+            .map_err(|e| {
+                let err = HidError::Xhci(e);
+                note_attach_fail(port, AttachStep::AddressDevice, &err);
+                err
+            })?;
         bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed).await
-    }.await;
+    }
+    .await;
     if res.is_err() {
         // Free the slot so a retry doesn't leak xHCI device
         // contexts. AMD Renoir's MaxSlots is typically 32 and a
@@ -659,126 +665,127 @@ async fn bind_kbd_addressed_slot(
     port: u8,
     speed: xhci::PortSpeed,
 ) -> Result<(), HidError> {
-        // GET_DESCRIPTOR(DEVICE) and refresh EP0 MaxPacketSize via
-        // Evaluate Context if the device's real bMaxPacketSize0
-        // differs from the speed-default we programmed at Address
-        // Device time (audit F-22 + F-23). This matters for full-
-        // speed devices (we initially seed MPS=8 — the smallest
-        // legal — and most FS devices are actually 8/16/32/64).
-        // High-speed defaults to 64 already.
-        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
-            let mps0 = desc[7] as u16;
-            // Valid Full-Speed values per USB 2.0 §9.6.1: 8/16/32/64.
-            // Low-Speed must be 8. High-Speed must be 64. SuperSpeed
-            // encodes the exponent (2^bMaxPacketSize0). Skip the
-            // refresh on weird values rather than blindly trusting.
-            let want = match speed {
-                xhci::PortSpeed::Low | xhci::PortSpeed::Full
-                    if matches!(mps0, 8 | 16 | 32 | 64) =>
-                {
-                    Some(mps0)
-                }
-                xhci::PortSpeed::High if mps0 == 64 => Some(64),
-                xhci::PortSpeed::Super | xhci::PortSpeed::SuperPlus if mps0 <= 13 => {
-                    Some(1u16 << mps0)
-                }
-                _ => None,
-            };
-            if let Some(real_mps) = want {
-                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps).await;
+    // GET_DESCRIPTOR(DEVICE) and refresh EP0 MaxPacketSize via
+    // Evaluate Context if the device's real bMaxPacketSize0
+    // differs from the speed-default we programmed at Address
+    // Device time (audit F-22 + F-23). This matters for full-
+    // speed devices (we initially seed MPS=8 — the smallest
+    // legal — and most FS devices are actually 8/16/32/64).
+    // High-speed defaults to 64 already.
+    if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id).await {
+        let mps0 = desc[7] as u16;
+        // Valid Full-Speed values per USB 2.0 §9.6.1: 8/16/32/64.
+        // Low-Speed must be 8. High-Speed must be 64. SuperSpeed
+        // encodes the exponent (2^bMaxPacketSize0). Skip the
+        // refresh on weird values rather than blindly trusting.
+        let want = match speed {
+            xhci::PortSpeed::Low | xhci::PortSpeed::Full if matches!(mps0, 8 | 16 | 32 | 64) => {
+                Some(mps0)
             }
+            xhci::PortSpeed::High if mps0 == 64 => Some(64),
+            xhci::PortSpeed::Super | xhci::PortSpeed::SuperPlus if mps0 <= 13 => Some(1u16 << mps0),
+            _ => None,
+        };
+        if let Some(real_mps) = want {
+            let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps).await;
         }
+    }
 
-        // Read the 9-byte cfg header to discover wTotalLength
-        // and the bConfigurationValue we'll feed SET_CONFIGURATION.
-        let mut head = [0u8; 9];
-        let n = xhci_dev
-            .get_config_descriptor(slot_id, 0, &mut head)
-            .await
-            .map_err(|e| {
-                let err = HidError::Xhci(e);
-                note_attach_fail(port, AttachStep::GetCfgHeader, &err);
-                err
-            })?;
-        if n < 9 {
-            let err = HidError::NotBootKeyboard;
+    // Read the 9-byte cfg header to discover wTotalLength
+    // and the bConfigurationValue we'll feed SET_CONFIGURATION.
+    let mut head = [0u8; 9];
+    let n = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut head)
+        .await
+        .map_err(|e| {
+            let err = HidError::Xhci(e);
             note_attach_fail(port, AttachStep::GetCfgHeader, &err);
-            return Err(err);
-        }
-        let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-        if total < 9 || total > 4096 {
-            let err = HidError::NotBootKeyboard;
-            note_attach_fail(port, AttachStep::GetCfgHeader, &err);
-            return Err(err);
-        }
-        // bConfigurationValue lives at offset +5 of the cfg
-        // descriptor (USB 2.0 §9.6.3 table 9-10). Required as
-        // the wValue of SET_CONFIGURATION below.
-        let cfg_value = head[5];
-
-        // Pull the full tree.
-        let mut full = alloc::vec![0u8; total];
-        let n2 = xhci_dev
-            .get_config_descriptor(slot_id, 0, &mut full)
-            .await
-            .map_err(|e| {
-                let err = HidError::Xhci(e);
-                note_attach_fail(port, AttachStep::GetCfgFull, &err);
-                err
-            })?;
-        if n2 < total {
-            full.truncate(n2);
-        }
-
-        let (iface, ep) = find_boot_keyboard(&full).map_err(|e| {
-            note_attach_fail(port, AttachStep::FindBootKbd, &e);
-            e
+            err
         })?;
+    if n < 9 {
+        let err = HidError::NotBootKeyboard;
+        note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+        return Err(err);
+    }
+    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+    if total < 9 || total > 4096 {
+        let err = HidError::NotBootKeyboard;
+        note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+        return Err(err);
+    }
+    // bConfigurationValue lives at offset +5 of the cfg
+    // descriptor (USB 2.0 §9.6.3 table 9-10). Required as
+    // the wValue of SET_CONFIGURATION below.
+    let cfg_value = head[5];
 
-        // Configure the controller-side endpoint context first
-        // so the device-side SET_CONFIGURATION below can drive
-        // traffic through the now-running rings.
-        xhci_dev.configure_endpoints(slot_id, &[ep]).await.map_err(|e| {
+    // Pull the full tree.
+    let mut full = alloc::vec![0u8; total];
+    let n2 = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut full)
+        .await
+        .map_err(|e| {
+            let err = HidError::Xhci(e);
+            note_attach_fail(port, AttachStep::GetCfgFull, &err);
+            err
+        })?;
+    if n2 < total {
+        full.truncate(n2);
+    }
+
+    let (iface, ep) = find_boot_keyboard(&full).map_err(|e| {
+        note_attach_fail(port, AttachStep::FindBootKbd, &e);
+        e
+    })?;
+
+    // Configure the controller-side endpoint context first
+    // so the device-side SET_CONFIGURATION below can drive
+    // traffic through the now-running rings.
+    xhci_dev
+        .configure_endpoints(slot_id, &[ep])
+        .await
+        .map_err(|e| {
             let err = HidError::Xhci(e);
             note_attach_fail(port, AttachStep::ConfigureEndpoints, &err);
             err
         })?;
 
-        // SET_CONFIGURATION (USB 2.0 §9.4.7, bRequest=9). Without
-        // this, the device stays in Address state and any class
-        // request (SET_PROTOCOL, SET_IDLE) returns STALL — which
-        // is the entire reason the keyboard pipeline was silent
-        // on real-HW boots while QEMU's lax xhci stack worked.
-        // bmRequestType: Host-to-Device | Standard | Device = 0x00.
-        let mut nothing = [0u8; 0];
-        xhci_dev
-            .control_in(
-                slot_id,
-                0x00,
-                STD_REQ_SET_CONFIGURATION,
-                cfg_value as u16,
-                0,
-                &mut nothing,
-            )
-            .await
-            .map_err(|_| {
-                let err = HidError::SetProtocolFailed;
-                note_attach_fail(port, AttachStep::SetConfiguration, &err);
-                err
-            })?;
+    // SET_CONFIGURATION (USB 2.0 §9.4.7, bRequest=9). Without
+    // this, the device stays in Address state and any class
+    // request (SET_PROTOCOL, SET_IDLE) returns STALL — which
+    // is the entire reason the keyboard pipeline was silent
+    // on real-HW boots while QEMU's lax xhci stack worked.
+    // bmRequestType: Host-to-Device | Standard | Device = 0x00.
+    let mut nothing = [0u8; 0];
+    xhci_dev
+        .control_in(
+            slot_id,
+            0x00,
+            STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &mut nothing,
+        )
+        .await
+        .map_err(|_| {
+            let err = HidError::SetProtocolFailed;
+            note_attach_fail(port, AttachStep::SetConfiguration, &err);
+            err
+        })?;
 
-        let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
-        let dci = (interrupt_in_ep * 2) + 1;
-        let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci).await.map_err(|e| {
+    let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
+    let dci = (interrupt_in_ep * 2) + 1;
+    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci)
+        .await
+        .map_err(|e| {
             note_attach_fail(port, AttachStep::SetProtocol, &e);
             e
         })?;
-        {
-            let mut g = KEYBOARDS.lock();
-            g.push(kbd);
-            ATTACHED_KEYBOARD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
-        }
-        Ok(())
+    {
+        let mut g = KEYBOARDS.lock();
+        g.push(kbd);
+        ATTACHED_KEYBOARD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+    }
+    Ok(())
 }
 
 /// Lock-free atomic count of bound keyboards. Diagnostics
@@ -823,8 +830,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 /// 100 ms timeout). Surfaced in the FB status panel so a real-HW
 /// observer can tell at a glance whether the supervisor is alive
 /// — a stuck `0` means the supervisor task is wedged.
-pub static PUMP_ALL_CALLS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static PUMP_ALL_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Diagnostic counter: how many non-empty `read_report` calls
 /// have returned reports across all attached keyboards. Bumped
@@ -833,8 +839,7 @@ pub static PUMP_ALL_CALLS: core::sync::atomic::AtomicU32 =
 /// stuck at 0 with `attached_keyboard_count() > 0` means the
 /// kbd is bound but no reports are arriving (an xHCI ring /
 /// IRQ / endpoint-state issue).
-pub static REPORTS_READ: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static REPORTS_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[doc(hidden)]
 pub fn __reset_keyboards_for_test() {

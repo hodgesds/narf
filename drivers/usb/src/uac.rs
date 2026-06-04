@@ -493,8 +493,7 @@ pub fn find_audio_streaming_iso_eps(cfg: &[u8]) -> (u8, u8) {
             // INTERFACE: check AS class triple.
             let cls = cfg[i + 5];
             let sub = cfg[i + 6];
-            in_as_iface = cls == USB_CLASS_AUDIO
-                && sub == USB_AUDIO_SUBCLASS_AUDIOSTREAMING;
+            in_as_iface = cls == USB_CLASS_AUDIO && sub == USB_AUDIO_SUBCLASS_AUDIOSTREAMING;
         } else if desc_type == 0x05 && in_as_iface && len >= 7 {
             // ENDPOINT under an AS interface — check iso (xfer type 1).
             let ep_addr = cfg[i + 2];
@@ -534,9 +533,7 @@ pub fn playback_one_packet(idx: usize, data: &[u8]) -> Result<usize, UacError> {
         Some(c) => c,
         None => return Err(UacError::SetConfigFailed),
     };
-    let outcome = narf_scheduler::block_on(async {
-        c.isoch_out(slot_id, dci, data).await
-    });
+    let outcome = narf_scheduler::block_on(async { c.isoch_out(slot_id, dci, data).await });
     match outcome {
         Ok(n) => Ok(n),
         Err(_) => Err(UacError::SetConfigFailed),
@@ -560,9 +557,7 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UacError>
         Some(c) => c,
         None => return Err(UacError::SetConfigFailed),
     };
-    let outcome = narf_scheduler::block_on(async {
-        c.isoch_in(slot_id, dci, out).await
-    });
+    let outcome = narf_scheduler::block_on(async { c.isoch_in(slot_id, dci, out).await });
     match outcome {
         Ok(n) => Ok(n),
         Err(_) => Err(UacError::SetConfigFailed),

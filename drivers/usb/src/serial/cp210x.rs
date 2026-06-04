@@ -208,7 +208,13 @@ pub fn build_set_line_ctl(
     iface: u8,
 ) -> (u8, u8, u16, u16, u16) {
     let bits = encode_line_ctl(data_bits, parity, stop_bits);
-    (REQTYPE_HOST_TO_INTERFACE, SET_LINE_CTL, bits, iface as u16, 0)
+    (
+        REQTYPE_HOST_TO_INTERFACE,
+        SET_LINE_CTL,
+        bits,
+        iface as u16,
+        0,
+    )
 }
 
 /// Build the control transfer parameters for `IFC_ENABLE`.
@@ -364,7 +370,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/cp210x", smoke_cp210x_set_baudrate_control_transfer);
+    kernel_test_in!(
+        "drivers/usb/serial/cp210x",
+        smoke_cp210x_set_baudrate_control_transfer
+    );
 
     fn smoke_cp210x_set_line_ctl_8n1() -> TestResult {
         let word = encode_line_ctl(DataBits::Eight, Parity::None, StopBits::One);
@@ -418,7 +427,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/cp210x", smoke_cp210x_modem_ctrl_both_set);
+    kernel_test_in!(
+        "drivers/usb/serial/cp210x",
+        smoke_cp210x_modem_ctrl_both_set
+    );
 
     fn smoke_cp210x_modem_ctrl_dtr_only() -> TestResult {
         let v = encode_modem_ctrl(true, false);
@@ -436,7 +448,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/cp210x", smoke_cp210x_modem_ctrl_dtr_only);
+    kernel_test_in!(
+        "drivers/usb/serial/cp210x",
+        smoke_cp210x_modem_ctrl_dtr_only
+    );
 
     fn smoke_cp210x_modem_status_decode() -> TestResult {
         // CTS=0x10, DSR=0x20, RI=0x40, DCD=0x80
@@ -450,7 +465,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/cp210x", smoke_cp210x_modem_status_decode);
+    kernel_test_in!(
+        "drivers/usb/serial/cp210x",
+        smoke_cp210x_modem_status_decode
+    );
 
     fn smoke_cp210x_ifc_enable_setup() -> TestResult {
         let (bm_rt, b_req, w_val, _w_idx, _w_len) = build_ifc_enable(true, 0);

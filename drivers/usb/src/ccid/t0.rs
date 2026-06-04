@@ -24,8 +24,8 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use super::CcidError;
+use alloc::vec::Vec;
 
 // ── SW1 constants ─────────────────────────────────────────────────────
 
@@ -83,13 +83,7 @@ impl T0Apdu {
     /// Wire format: CLA INS P1 P2 Lc DATA (5 + Lc bytes).
     /// Returns `CcidError::BadResponse` if `data` exceeds 255 bytes
     /// (T=0 short APDU limit, ISO 7816-3 §10.3.2).
-    pub fn build_case3(
-        cla: u8,
-        ins: u8,
-        p1: u8,
-        p2: u8,
-        data: &[u8],
-    ) -> Result<Self, CcidError> {
+    pub fn build_case3(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Result<Self, CcidError> {
         if data.len() > 255 {
             return Err(CcidError::ResponseTooLong);
         }
@@ -190,7 +184,9 @@ mod tests {
         // ISO 7816-4 §5.3.3 — Case 3: CLA INS P1 P2 Lc DATA.
         let data = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
         let apdu = T0Apdu::build_case3(0x00, 0xA4, 0x04, 0x00, &data).unwrap();
-        let want: &[u8] = &[0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
+        let want: &[u8] = &[
+            0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01,
+        ];
         assert_eq!(apdu.as_bytes(), want);
     }
 

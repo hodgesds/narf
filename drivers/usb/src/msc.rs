@@ -93,9 +93,8 @@ impl InquiryData {
         }
         let peripheral_type = buf[0] & 0x1F;
         let removable = buf[1] & 0x80 != 0;
-        let vendor = alloc::string::String::from(
-            core::str::from_utf8(&buf[8..16]).unwrap_or("").trim_end(),
-        );
+        let vendor =
+            alloc::string::String::from(core::str::from_utf8(&buf[8..16]).unwrap_or("").trim_end());
         let product = alloc::string::String::from(
             core::str::from_utf8(&buf[16..32]).unwrap_or("").trim_end(),
         );
@@ -223,7 +222,12 @@ impl MscDevice {
     /// populated. Caller must have already run
     /// `xhci.configure_endpoints` for the bulk pair returned by
     /// `find_bot_endpoints`.
-    pub async fn attach(xhci: &Xhci, slot_id: u8, bulk_in: u8, bulk_out: u8) -> Result<Self, MscError> {
+    pub async fn attach(
+        xhci: &Xhci,
+        slot_id: u8,
+        bulk_in: u8,
+        bulk_out: u8,
+    ) -> Result<Self, MscError> {
         let dev = MscDevice {
             slot_id,
             bulk_in,
@@ -327,7 +331,8 @@ impl MscDevice {
     /// access; a CSW status of 1 means the device wants the host
     /// to call REQUEST SENSE.
     pub async fn test_unit_ready(&self, xhci: &Xhci) -> Result<(), MscError> {
-        self.cmd_no_data(xhci, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0]).await
+        self.cmd_no_data(xhci, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0])
+            .await
     }
 
     /// `REQUEST SENSE` (SPC-4 §6.28). Returns a fixed-format sense
@@ -358,7 +363,8 @@ impl MscDevice {
     ) -> Result<(), MscError> {
         // CDB byte 4: LOEJ bit (bit 1) + START bit (bit 0).
         let flags: u8 = if eject { 0x02 } else { 0x00 } | if start { 0x01 } else { 0x00 };
-        self.cmd_no_data(xhci, &[SCSI_START_STOP_UNIT, 0, 0, 0, flags, 0]).await
+        self.cmd_no_data(xhci, &[SCSI_START_STOP_UNIT, 0, 0, 0, flags, 0])
+            .await
     }
 
     /// `INQUIRY` (SPC-4 §6.5). Returns the standard 36-byte INQUIRY
@@ -446,7 +452,12 @@ impl MscDevice {
     /// Multi-block `READ(10)`. Reads `nblocks` consecutive blocks
     /// starting at `lba`. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per
     /// call. Returns the concatenated payload.
-    pub async fn read_blocks(&self, xhci: &Xhci, lba: u32, nblocks: u16) -> Result<Vec<u8>, MscError> {
+    pub async fn read_blocks(
+        &self,
+        xhci: &Xhci,
+        lba: u32,
+        nblocks: u16,
+    ) -> Result<Vec<u8>, MscError> {
         if self.lba_bytes == 0 || nblocks == 0 || nblocks > MSC_MAX_BLOCKS_PER_XFER {
             return Err(MscError::BadLength);
         }
@@ -632,7 +643,9 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
 
         // Read 9-byte cfg header for wTotalLength.
         let mut head = [0u8; 9];
-        let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await?;
+        let n = xhci_dev
+            .get_config_descriptor(slot_id, 0, &mut head)
+            .await?;
         if n < 9 {
             return Err(MscError::NotMsc);
         }
@@ -643,7 +656,9 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
 
         // Pull the full descriptor tree.
         let mut full = alloc::vec![0u8; total];
-        let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await?;
+        let n2 = xhci_dev
+            .get_config_descriptor(slot_id, 0, &mut full)
+            .await?;
         if n2 < total {
             full.truncate(n2);
         }
@@ -657,7 +672,8 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
         let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
         let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
         MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await
-    }.await;
+    }
+    .await;
     match result {
         Ok(dev) => {
             MSC_DEVICES.lock().push(dev);
@@ -737,7 +753,11 @@ pub fn decode_csw(buf: &[u8]) -> Option<CswFields> {
     let tag = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let residue = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let status = buf[12];
-    Some(CswFields { tag, residue, status })
+    Some(CswFields {
+        tag,
+        residue,
+        status,
+    })
 }
 
 /// Encode a READ(10) CDB (SBC-3 §5.10). Returns the 10-byte
@@ -746,7 +766,9 @@ pub fn decode_csw(buf: &[u8]) -> Option<CswFields> {
 pub fn encode_read10(lba: u32, nblocks: u16) -> [u8; 10] {
     let lba_be = lba.to_be_bytes();
     let nb = nblocks.to_be_bytes();
-    [0x28, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0]
+    [
+        0x28, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
+    ]
 }
 
 /// Encode a WRITE(10) CDB (SBC-3 §5.27). Returns the 10-byte
@@ -754,7 +776,9 @@ pub fn encode_read10(lba: u32, nblocks: u16) -> [u8; 10] {
 pub fn encode_write10(lba: u32, nblocks: u16) -> [u8; 10] {
     let lba_be = lba.to_be_bytes();
     let nb = nblocks.to_be_bytes();
-    [0x2A, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0]
+    [
+        0x2A, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
+    ]
 }
 
 /// Decode a READ CAPACITY(10) response buffer (SBC-3 Table 56).
@@ -834,10 +858,15 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         n_blocks: u16,
         out: &mut [u8],
     ) -> Result<(), narf_block::BlockIoError> {
-        if lba.checked_add(n_blocks as u64).map_or(true, |end| end > self.capacity) {
+        if lba
+            .checked_add(n_blocks as u64)
+            .map_or(true, |end| end > self.capacity)
+        {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let lba32: u32 = lba.try_into().map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let lba32: u32 = lba
+            .try_into()
+            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if out.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -868,9 +897,8 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             last_lba: 0,
             tag: IrqSafeSpinLock::new(1),
         };
-        let result = narf_scheduler::block_on(async {
-            dev_snapshot.read_blocks(&c, lba32, n_blocks).await
-        });
+        let result =
+            narf_scheduler::block_on(async { dev_snapshot.read_blocks(&c, lba32, n_blocks).await });
         match result {
             Ok(data) => {
                 out[..expected].copy_from_slice(&data);
@@ -879,16 +907,16 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             Err(_) => Err(narf_block::BlockIoError::DriverError),
         }
     }
-    fn write(
-        &self,
-        lba: u64,
-        n_blocks: u16,
-        data: &[u8],
-    ) -> Result<(), narf_block::BlockIoError> {
-        if lba.checked_add(n_blocks as u64).map_or(true, |end| end > self.capacity) {
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        if lba
+            .checked_add(n_blocks as u64)
+            .map_or(true, |end| end > self.capacity)
+        {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let lba32: u32 = lba.try_into().map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let lba32: u32 = lba
+            .try_into()
+            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -914,7 +942,9 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             tag: IrqSafeSpinLock::new(1),
         };
         let result = narf_scheduler::block_on(async {
-            dev_snapshot.write_blocks(&c, lba32, n_blocks, &data[..expected]).await
+            dev_snapshot
+                .write_blocks(&c, lba32, n_blocks, &data[..expected])
+                .await
         });
         match result {
             Ok(()) => Ok(()),

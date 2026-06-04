@@ -28,7 +28,10 @@ pub const fn encode_entry(dev_ctx_phys: u64) -> u64 {
 /// Encode an entire DCBAA. `slot_ctx_phys[slot_id]` provides the
 /// device-context address for each slot (or 0 if the slot is unused).
 /// `scratchpad_pa` goes into entry 0.
-pub fn encode_array(slot_ctx_phys: &[u64; DCBAA_ENTRIES], scratchpad_pa: u64) -> [u64; DCBAA_ENTRIES] {
+pub fn encode_array(
+    slot_ctx_phys: &[u64; DCBAA_ENTRIES],
+    scratchpad_pa: u64,
+) -> [u64; DCBAA_ENTRIES] {
     let mut out = [0u64; DCBAA_ENTRIES];
     out[0] = encode_entry(scratchpad_pa);
     let mut i = 1;

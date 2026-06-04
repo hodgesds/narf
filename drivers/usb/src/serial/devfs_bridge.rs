@@ -42,8 +42,8 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use narf_lib::sync::IrqSafeSpinLock;
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN, POLL_OUT};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use super::ChipFamily;
 
@@ -84,7 +84,11 @@ pub struct SerialRing {
 
 impl SerialRing {
     pub const fn new() -> Self {
-        SerialRing { buf: [0u8; 256], head: 0, count: 0 }
+        SerialRing {
+            buf: [0u8; 256],
+            head: 0,
+            count: 0,
+        }
     }
 
     /// Push bytes; returns number accepted (may be less than `data.len()`).
@@ -153,8 +157,8 @@ impl SerialPort {
     /// Linux: `usb_serial_driver::driver_name` field.
     pub fn driver_name(&self) -> &'static str {
         match self.chip {
-            ChipFamily::Ch341  => "ch341",
-            ChipFamily::Ftdi   => "ftdi_sio",
+            ChipFamily::Ch341 => "ch341",
+            ChipFamily::Ftdi => "ftdi_sio",
             ChipFamily::Pl2303 => "pl2303",
             ChipFamily::Cp210x => "cp210x",
         }
@@ -185,7 +189,11 @@ pub fn register_tty_usb(chip: ChipFamily) -> usize {
 
 /// Retrieve the port state for ttyUSB<N>, if registered.
 pub fn get_port(index: usize) -> Option<Arc<IrqSafeSpinLock<SerialPort>>> {
-    TTY_USB_NODES.lock().iter().find(|p| p.lock().index == index).cloned()
+    TTY_USB_NODES
+        .lock()
+        .iter()
+        .find(|p| p.lock().index == index)
+        .cloned()
 }
 
 /// Number of registered ttyUSB ports.
@@ -208,7 +216,7 @@ pub fn __reset_for_test() {
 /// `usb_serial_register`) creates a kobject under the "tty" class
 /// (`drivers/usb/serial/usb-serial.c:usb_serial_register`).
 fn register_sysfs(idx: usize, chip: ChipFamily) {
-    use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr};
+    use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
     let tty_class = class_register("tty");
     let name = format!("ttyUSB{}", idx);
@@ -224,8 +232,8 @@ fn register_sysfs(idx: usize, chip: ChipFamily) {
     // Linux: the driver symlink under `device/` is a kobject attribute
     // populated by the driver model; we expose it as a plain attr here.
     let driver_name = match chip {
-        ChipFamily::Ch341  => "ch341",
-        ChipFamily::Ftdi   => "ftdi_sio",
+        ChipFamily::Ch341 => "ch341",
+        ChipFamily::Ftdi => "ftdi_sio",
         ChipFamily::Pl2303 => "pl2303",
         ChipFamily::Cp210x => "cp210x",
     };
@@ -292,7 +300,11 @@ impl FileOps for TtyUsbFile {
     /// `POLL_IN` when RX ring has bytes; `POLL_OUT` always (TX has space).
     fn poll_readiness(&self) -> u32 {
         let has_rx = self.port.lock().rx.has_data();
-        if has_rx { POLL_IN | POLL_OUT } else { POLL_OUT }
+        if has_rx {
+            POLL_IN | POLL_OUT
+        } else {
+            POLL_OUT
+        }
     }
 }
 
@@ -339,7 +351,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/devfs_bridge", smoke_ch341_probe_allocates_ttyusb0);
+    kernel_test_in!(
+        "drivers/usb/serial/devfs_bridge",
+        smoke_ch341_probe_allocates_ttyusb0
+    );
 
     /// /dev/ttyUSB0 write → TX ring gets the bytes (bulk-OUT scheduled).
     fn smoke_ttyusb_write_reaches_tx_ring() -> TestResult {
@@ -363,7 +378,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/devfs_bridge", smoke_ttyusb_write_reaches_tx_ring);
+    kernel_test_in!(
+        "drivers/usb/serial/devfs_bridge",
+        smoke_ttyusb_write_reaches_tx_ring
+    );
 
     /// /dev/ttyUSB0 read after bulk-IN delivery returns data.
     fn smoke_ttyusb_read_drains_rx_ring() -> TestResult {
@@ -384,14 +402,17 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/devfs_bridge", smoke_ttyusb_read_drains_rx_ring);
+    kernel_test_in!(
+        "drivers/usb/serial/devfs_bridge",
+        smoke_ttyusb_read_drains_rx_ring
+    );
 
     /// /sys/class/tty/ttyUSB0/device/driver returns chip name.
     fn smoke_ttyusb_sysfs_driver_attr() -> TestResult {
         narf_filesystem::sysfs::__reset_for_test();
         __reset_for_test();
         let _idx = register_tty_usb(ChipFamily::Ch341);
-        use narf_filesystem::sysfs::{class_register};
+        use narf_filesystem::sysfs::class_register;
         let tty_class = class_register("tty");
         let child = tty_class.get_child("ttyUSB0");
         if child.is_none() {
@@ -405,7 +426,10 @@ pub mod tests {
             None => TestResult::Fail("device/driver attr missing"),
         }
     }
-    kernel_test_in!("drivers/usb/serial/devfs_bridge", smoke_ttyusb_sysfs_driver_attr);
+    kernel_test_in!(
+        "drivers/usb/serial/devfs_bridge",
+        smoke_ttyusb_sysfs_driver_attr
+    );
 
     /// lookup_tty_usb("ttyUSB0") returns Some after registration.
     fn smoke_ttyusb_lookup() -> TestResult {

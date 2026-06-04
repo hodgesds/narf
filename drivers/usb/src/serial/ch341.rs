@@ -209,9 +209,7 @@ pub fn calc_divisor(baud: u32) -> Option<u16> {
     }
 
     // Pack: bits 15:8 = (0x100 - div), bits 3:2 = fact, bits 1:0 = ps
-    let word = (((0x100u32.wrapping_sub(div)) & 0xFF) << 8)
-        | (fact << 2)
-        | ps;
+    let word = (((0x100u32.wrapping_sub(div)) & 0xFF) << 8) | (fact << 2) | ps;
     Some(word as u16)
 }
 
@@ -275,10 +273,7 @@ pub fn baud_control_words(baud: u32) -> Option<[(u16, u16); 2]> {
     //   (Linux l.268: val | 0x0030 — keep bits 5:4 set; they enable
     //    the baud generator in the chip's internal state machine.)
     let low_byte = (div_word & 0xFF) | 0x30;
-    Some([
-        (REG_BAUD_HIGH, div_word),
-        (REG_BAUD_LOW, low_byte),
-    ])
+    Some([(REG_BAUD_HIGH, div_word), (REG_BAUD_LOW, low_byte)])
 }
 
 /// Build the `(wValue, wIndex)` pair for a line-control write.
@@ -409,8 +404,12 @@ impl UsbSerial for Ch341State {
 /// where `control` has bit 5 = DTR, bit 6 = RTS.
 pub fn encode_modem_ctrl(dtr: bool, rts: bool) -> u16 {
     let mut control: u16 = 0;
-    if dtr { control |= 1 << 5; }
-    if rts { control |= 1 << 6; }
+    if dtr {
+        control |= 1 << 5;
+    }
+    if rts {
+        control |= 1 << 6;
+    }
     // Active-low: invert the low 8 bits.
     (!control) & 0xFF
 }
@@ -512,7 +511,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/ch341", smoke_ch341_modem_ctrl_both_asserted);
+    kernel_test_in!(
+        "drivers/usb/serial/ch341",
+        smoke_ch341_modem_ctrl_both_asserted
+    );
 
     fn smoke_ch341_modem_status_decode() -> TestResult {
         // All signals active (active-low, so byte=0x00 → all asserted).

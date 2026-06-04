@@ -266,7 +266,8 @@ pub async fn try_bind_wbdi_already_addressed(
     let _ = writeln!(
         narf_console::Writer,
         "  usb-wbdi: fingerprint reader recognised on slot={} iface={}",
-        slot_id, vendor_iface
+        slot_id,
+        vendor_iface
     );
     let mut g = WBDI_DEVICES.lock();
     let idx = g.len();

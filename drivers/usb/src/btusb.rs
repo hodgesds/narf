@@ -239,8 +239,7 @@ impl fmt::Debug for BtUsbDevice {
 
 /// Registry of bound USB Bluetooth controllers. Append-only for now;
 /// Stage 1 will introduce removal on detach.
-static BTUSB_DEVICES: IrqSafeSpinLock<Vec<Arc<BtUsbDevice>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static BTUSB_DEVICES: IrqSafeSpinLock<Vec<Arc<BtUsbDevice>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Snapshot the registry. Used by tests + future data-plane.
 pub fn devices() -> Vec<Arc<BtUsbDevice>> {
@@ -559,7 +558,9 @@ pub async fn try_bind_btusb_already_addressed(
             let _ = writeln!(
                 narf_console::Writer,
                 "  bluetooth: {} adapter, HCI v0x{:02x}, Bluetooth {}",
-                vendor, info.hci_version, bt_ver
+                vendor,
+                info.hci_version,
+                bt_ver
             );
         }
     }

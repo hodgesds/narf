@@ -51,17 +51,15 @@ use core::mem;
 
 use narf_filesystem::devfs_input::{DeviceKind, InputEventFile};
 use narf_input::evdev::{
-    DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, ROUTER,
-    dispatch_key_to_node, syn,
+    dispatch_key_to_node, syn, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, ROUTER,
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::hid::keyboard::{
-    KbdProtocol, LedState, UsbKeyboard,
-    keyboard_evdev_caps, process_boot_report, ROLLOVER_USAGE,
-};
-use crate::hid::mouse::{BootMouse, MouseReport, boot_mouse_evdev_caps};
 use crate::hid::kbd_mod;
+use crate::hid::keyboard::{
+    keyboard_evdev_caps, process_boot_report, KbdProtocol, LedState, UsbKeyboard, ROLLOVER_USAGE,
+};
+use crate::hid::mouse::{boot_mouse_evdev_caps, BootMouse, MouseReport};
 use crate::hid::usage_to_keycode;
 
 // ── Wire constants ────────────────────────────────────────────────────────────
@@ -183,10 +181,7 @@ fn smoke_e2e_kbd_registers_evdev_device() -> TestResult {
     bk.unregister();
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_kbd_registers_evdev_device
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_kbd_registers_evdev_device);
 
 // ── Smoke 2: keypress → evdev event end-to-end ───────────────────────────────
 //
@@ -260,10 +255,7 @@ fn smoke_e2e_kbd_keypress_end_to_end() -> TestResult {
     bk.unregister();
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_kbd_keypress_end_to_end
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_kbd_keypress_end_to_end);
 
 // ── Smoke 3: multi-key + modifier ─────────────────────────────────────────────
 //
@@ -295,7 +287,9 @@ fn smoke_e2e_kbd_multi_key_modifier() -> TestResult {
     let mut saw_syn = false;
     for _ in 0..16 {
         match reader.poll_event() {
-            Some(ev) if ev.type_ == EventType::Key && ev.code == KEY_LEFTSHIFT_CODE && ev.value == 1 => {
+            Some(ev)
+                if ev.type_ == EventType::Key && ev.code == KEY_LEFTSHIFT_CODE && ev.value == 1 =>
+            {
                 saw_shift_press = true;
             }
             Some(ev) if ev.type_ == EventType::Key && ev.code == KEY_A_CODE && ev.value == 1 => {
@@ -338,7 +332,9 @@ fn smoke_e2e_kbd_multi_key_modifier() -> TestResult {
     let mut saw_b_rel = false;
     for _ in 0..16 {
         match reader.poll_event() {
-            Some(ev) if ev.type_ == EventType::Key && ev.code == KEY_LEFTSHIFT_CODE && ev.value == 0 => {
+            Some(ev)
+                if ev.type_ == EventType::Key && ev.code == KEY_LEFTSHIFT_CODE && ev.value == 0 =>
+            {
                 saw_shift_rel = true;
             }
             Some(ev) if ev.type_ == EventType::Key && ev.code == KEY_A_CODE && ev.value == 0 => {
@@ -360,10 +356,7 @@ fn smoke_e2e_kbd_multi_key_modifier() -> TestResult {
     bk.unregister();
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_kbd_multi_key_modifier
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_kbd_multi_key_modifier);
 
 // ── Smoke 4: 6KRO rollover ghost suppression ──────────────────────────────────
 //
@@ -406,7 +399,9 @@ fn smoke_e2e_kbd_6kro_rollover() -> TestResult {
 
     // Drain SYNs.
     for _ in 0..10 {
-        if reader.poll_event().is_none() { break; }
+        if reader.poll_event().is_none() {
+            break;
+        }
     }
 
     // Feed rollover indicator: all 0x01.
@@ -431,10 +426,7 @@ fn smoke_e2e_kbd_6kro_rollover() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_kbd_6kro_rollover
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_kbd_6kro_rollover);
 
 // ── Smoke 5: LED feedback (Caps Lock) ────────────────────────────────────────
 //
@@ -474,10 +466,7 @@ fn smoke_e2e_kbd_led_encode_caps_lock() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_kbd_led_encode_caps_lock
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_kbd_led_encode_caps_lock);
 
 // ── Smoke 6: HID multitouch boot → 5-finger MT dispatch ──────────────────────
 //
@@ -495,7 +484,7 @@ kernel_test_in!(
 // Ref: Linux `hid-multitouch.c` `mt_slots_evdev_emit` (line ~880).
 
 fn smoke_e2e_mt_abs_dispatch_infra() -> TestResult {
-    use narf_input::evdev::{abs, EvdevEvent, EventType, ROUTER, DeviceCaps};
+    use narf_input::evdev::{abs, DeviceCaps, EvdevEvent, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_abs(abs::ABS_MT_SLOT);
@@ -515,10 +504,30 @@ fn smoke_e2e_mt_abs_dispatch_infra() -> TestResult {
     // Emit Slot-Protocol-B events for one contact: slot 0, tracking_id 42,
     // position (100, 200).  Ref: MT protocol §Slot Protocol B.
     let now = narf_time::now_cycles();
-    node.dispatch(EvdevEvent { time: now, type_: EventType::Abs, code: abs::ABS_MT_SLOT, value: 0 });
-    node.dispatch(EvdevEvent { time: now, type_: EventType::Abs, code: abs::ABS_MT_TRACKING_ID, value: 42 });
-    node.dispatch(EvdevEvent { time: now, type_: EventType::Abs, code: abs::ABS_MT_POSITION_X, value: 100 });
-    node.dispatch(EvdevEvent { time: now, type_: EventType::Abs, code: abs::ABS_MT_POSITION_Y, value: 200 });
+    node.dispatch(EvdevEvent {
+        time: now,
+        type_: EventType::Abs,
+        code: abs::ABS_MT_SLOT,
+        value: 0,
+    });
+    node.dispatch(EvdevEvent {
+        time: now,
+        type_: EventType::Abs,
+        code: abs::ABS_MT_TRACKING_ID,
+        value: 42,
+    });
+    node.dispatch(EvdevEvent {
+        time: now,
+        type_: EventType::Abs,
+        code: abs::ABS_MT_POSITION_X,
+        value: 100,
+    });
+    node.dispatch(EvdevEvent {
+        time: now,
+        type_: EventType::Abs,
+        code: abs::ABS_MT_POSITION_Y,
+        value: 200,
+    });
     node.dispatch(EvdevEvent::syn_report(now));
 
     // Verify we see the four ABS events plus SYN.
@@ -529,16 +538,30 @@ fn smoke_e2e_mt_abs_dispatch_infra() -> TestResult {
     let mut got_syn = false;
     for _ in 0..10 {
         match reader.poll_event() {
-            Some(ev) if ev.type_ == EventType::Abs && ev.code == abs::ABS_MT_SLOT && ev.value == 0 => {
+            Some(ev)
+                if ev.type_ == EventType::Abs && ev.code == abs::ABS_MT_SLOT && ev.value == 0 =>
+            {
                 got_slot = true;
             }
-            Some(ev) if ev.type_ == EventType::Abs && ev.code == abs::ABS_MT_TRACKING_ID && ev.value == 42 => {
+            Some(ev)
+                if ev.type_ == EventType::Abs
+                    && ev.code == abs::ABS_MT_TRACKING_ID
+                    && ev.value == 42 =>
+            {
                 got_tid = true;
             }
-            Some(ev) if ev.type_ == EventType::Abs && ev.code == abs::ABS_MT_POSITION_X && ev.value == 100 => {
+            Some(ev)
+                if ev.type_ == EventType::Abs
+                    && ev.code == abs::ABS_MT_POSITION_X
+                    && ev.value == 100 =>
+            {
                 got_x = true;
             }
-            Some(ev) if ev.type_ == EventType::Abs && ev.code == abs::ABS_MT_POSITION_Y && ev.value == 200 => {
+            Some(ev)
+                if ev.type_ == EventType::Abs
+                    && ev.code == abs::ABS_MT_POSITION_Y
+                    && ev.value == 200 =>
+            {
                 got_y = true;
             }
             Some(ev) if ev.type_ == EventType::Syn && ev.code == syn::SYN_REPORT => {
@@ -559,10 +582,7 @@ fn smoke_e2e_mt_abs_dispatch_infra() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_mt_abs_dispatch_infra
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_mt_abs_dispatch_infra);
 
 // ── Smoke 7: device unplug → /dev/input/event<N> disappears ─────────────────
 //
@@ -597,10 +617,7 @@ fn smoke_e2e_kbd_unplug_removes_device() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_kbd_unplug_removes_device
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_kbd_unplug_removes_device);
 
 // ── Smoke 8: uinput write injection ──────────────────────────────────────────
 //
@@ -610,9 +627,9 @@ kernel_test_in!(
 // Ref: Linux `uinput.c::uinput_write` (line ~502).
 
 fn smoke_e2e_uinput_write_injection() -> TestResult {
-    use narf_input::uinput::UserDevice;
     use narf_filesystem::devfs_input::{DeviceKind, InputEventFile};
     use narf_filesystem::FileOps;
+    use narf_input::uinput::UserDevice;
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_F1_CODE);
@@ -661,7 +678,9 @@ fn smoke_e2e_uinput_write_injection() -> TestResult {
         use core::future::Future;
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         static VTABLE: RawWakerVTable = {
-            unsafe fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+            unsafe fn clone(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
             unsafe fn wake(_: *const ()) {}
             unsafe fn wake_by_ref(_: *const ()) {}
             unsafe fn drop_waker(_: *const ()) {}
@@ -702,10 +721,7 @@ fn smoke_e2e_uinput_write_injection() -> TestResult {
         None => TestResult::Fail("reader received no event from uinput injection"),
     }
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_uinput_write_injection
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_uinput_write_injection);
 
 // ── Smoke 9: hardware-device write rejection ─────────────────────────────────
 //
@@ -751,7 +767,9 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
         use core::future::Future;
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         static VTABLE: RawWakerVTable = {
-            unsafe fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+            unsafe fn clone(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
             unsafe fn wake(_: *const ()) {}
             unsafe fn wake_by_ref(_: *const ()) {}
             unsafe fn drop_waker(_: *const ()) {}
@@ -776,16 +794,11 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
                 let _ = e;
                 TestResult::Fail("write to hardware evdev returned wrong error kind")
             }
-            Poll::Pending => {
-                TestResult::Fail("write future returned Pending for hardware device")
-            }
+            Poll::Pending => TestResult::Fail("write future returned Pending for hardware device"),
         }
     }
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_hw_device_write_rejected
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_hw_device_write_rejected);
 
 // ── Smoke 10: many-readers fan-out ────────────────────────────────────────────
 //
@@ -833,10 +846,7 @@ fn smoke_e2e_many_readers_fanout() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_many_readers_fanout
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_many_readers_fanout);
 
 // ── Smoke 11: USB keyboard plug/unplug → /dev/input/event<N> lifecycle ────────
 //
@@ -905,7 +915,7 @@ kernel_test_in!(
 // Ref: `linux/drivers/hid/usbhid/usbmouse.c::usb_mouse_irq`.
 
 fn smoke_e2e_mouse_boot_report_to_router() -> TestResult {
-    use narf_input::evdev::{rel, key};
+    use narf_input::evdev::{key, rel};
 
     let (evdev_id, evdev_node) = ROUTER.register_device(boot_mouse_evdev_caps());
     let reader = match ROUTER.open_reader(evdev_id) {
@@ -926,7 +936,11 @@ fn smoke_e2e_mouse_boot_report_to_router() -> TestResult {
     };
 
     // Boot report: LEFT button pressed (bit 0), dx=+5, dy=-3.
-    let report = MouseReport { buttons: 0x01, dx: 5, dy: -3 };
+    let report = MouseReport {
+        buttons: 0x01,
+        dx: 5,
+        dy: -3,
+    };
     let n = m.translate_report(report);
     if n == 0 {
         ROUTER.unregister_device(evdev_id);
@@ -974,10 +988,7 @@ fn smoke_e2e_mouse_boot_report_to_router() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/hid/e2e",
-    smoke_e2e_mouse_boot_report_to_router
-);
+kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_mouse_boot_report_to_router);
 
 // ── Smoke 13: Touchpad single-touch → REL pointer events reach ROUTER ────────
 //
@@ -996,7 +1007,7 @@ kernel_test_in!(
 // pattern for touchpad drivers. GPL-2.0-or-later.
 
 fn smoke_e2e_touchpad_pointer_events_reach_router() -> TestResult {
-    use narf_input::evdev::{rel, dispatch_rel_to_node, DeviceCaps};
+    use narf_input::evdev::{dispatch_rel_to_node, rel, DeviceCaps};
 
     // Register a REL device (the same caps PtpTouchpad uses at bind time).
     let mut caps = DeviceCaps::new();

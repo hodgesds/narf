@@ -46,19 +46,21 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_input::{
-    evdev::{dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode, ROUTER},
-    push_global, push_key, InputEvent, ButtonEvent, PointerEvent, ScrollEvent, AbsoluteEvent,
+    evdev::{
+        dispatch_key_to_node, dispatch_rel_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode,
+        ROUTER,
+    },
+    push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, PointerEvent, ScrollEvent,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::hid::{usage_to_keycode, HidError};
-use crate::xhci::Xhci;
 use super::consumer::usage_to_keycode as consumer_usage_to_keycode;
 use super::report_descriptor::{
-    parse, Field, FieldFlags, FieldKind, ReportDescriptor,
-    USAGE_PAGE_BUTTON, USAGE_PAGE_CONSUMER, USAGE_PAGE_GENERIC_DESKTOP,
-    USAGE_PAGE_KEYBOARD,
+    parse, Field, FieldFlags, FieldKind, ReportDescriptor, USAGE_PAGE_BUTTON, USAGE_PAGE_CONSUMER,
+    USAGE_PAGE_GENERIC_DESKTOP, USAGE_PAGE_KEYBOARD,
 };
+use crate::hid::{usage_to_keycode, HidError};
+use crate::xhci::Xhci;
 
 // Generic Desktop usage IDs (§4, table 4-1 / 4-3) used for axis dispatch.
 const GD_X: u16 = 0x30;
@@ -90,8 +92,7 @@ pub struct GenericDevice {
 }
 
 /// Global registry of bound Generic HID interfaces.
-static GENERIC_DEVICES: IrqSafeSpinLock<Vec<GenericDevice>> =
-    IrqSafeSpinLock::new(Vec::new());
+static GENERIC_DEVICES: IrqSafeSpinLock<Vec<GenericDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Lock-free count.
 pub static ATTACHED_GENERIC_COUNT: core::sync::atomic::AtomicU32 =
@@ -104,7 +105,11 @@ pub static ATTACHED_GENERIC_COUNT: core::sync::atomic::AtomicU32 =
 /// a correctly-typed device node.
 fn generic_evdev_caps(descriptor: &ReportDescriptor) -> DeviceCaps {
     let mut caps = DeviceCaps::new();
-    for field in descriptor.fields.iter().filter(|f| f.kind == FieldKind::Input) {
+    for field in descriptor
+        .fields
+        .iter()
+        .filter(|f| f.kind == FieldKind::Input)
+    {
         match field.usage_page {
             USAGE_PAGE_KEYBOARD => {
                 // Full boot-range keyboard usages.
@@ -115,17 +120,26 @@ fn generic_evdev_caps(descriptor: &ReportDescriptor) -> DeviceCaps {
             USAGE_PAGE_CONSUMER => {
                 // Expose standard consumer codes.
                 for c in [
-                    key::BTN_LEFT, key::BTN_RIGHT, key::BTN_MIDDLE,
+                    key::BTN_LEFT,
+                    key::BTN_RIGHT,
+                    key::BTN_MIDDLE,
                     // Media key placeholder range 0x70..=0x77 (volume etc.).
-                    0x71u16, 0x72, 0x73,
+                    0x71u16,
+                    0x72,
+                    0x73,
                 ] {
                     caps.add_key(c);
                 }
             }
             USAGE_PAGE_BUTTON => {
                 // Up to 8 generic buttons.
-                for c in [key::BTN_LEFT, key::BTN_RIGHT, key::BTN_MIDDLE,
-                          key::BTN_SIDE, key::BTN_EXTRA] {
+                for c in [
+                    key::BTN_LEFT,
+                    key::BTN_RIGHT,
+                    key::BTN_MIDDLE,
+                    key::BTN_SIDE,
+                    key::BTN_EXTRA,
+                ] {
                     caps.add_key(c);
                 }
             }
@@ -186,7 +200,9 @@ pub async fn try_bind_generic(
         let _ = core::write!(
             narf_console::Writer,
             "  usb-hid: generic slot={} iface={} dci={}\n",
-            slot_id, interface_num, interrupt_in_dci,
+            slot_id,
+            interface_num,
+            interrupt_in_dci,
         );
     }
     Ok(())
@@ -289,7 +305,11 @@ fn extract_field_value(report: &[u8], bit_offset: u32, size_bits: u32, logical_m
         raw |= (report[byte_offset + b] as u32) << (b * 8);
     }
     raw >>= bit_shift;
-    let mask = if size_bits >= 32 { u32::MAX } else { (1u32 << size_bits) - 1 };
+    let mask = if size_bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << size_bits) - 1
+    };
     raw &= mask;
 
     // Sign-extend if this is a signed field (logical_min < 0).
@@ -327,7 +347,11 @@ pub fn dispatch_report(
         (0, report)
     };
     let prev_payload: &[u8] = if desc.has_report_ids {
-        if prev.len() > 1 { &prev[1..] } else { &[] }
+        if prev.len() > 1 {
+            &prev[1..]
+        } else {
+            &[]
+        }
     } else {
         prev
     };
@@ -353,7 +377,8 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8], node: &Dev
         for elem in 0..field.report_count {
             let bit_off = field.bit_offset + elem * field.report_size;
             let val = extract_field_value(payload, bit_off, field.report_size, field.logical_min);
-            let prev_val = extract_field_value(prev_payload, bit_off, field.report_size, field.logical_min);
+            let prev_val =
+                extract_field_value(prev_payload, bit_off, field.report_size, field.logical_min);
             if val == prev_val && !is_relative {
                 continue; // Absolute: no change.
             }
@@ -362,7 +387,11 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8], node: &Dev
                 field.usages[elem as usize].1
             } else if let (Some(min), Some(max)) = (field.usage_min, field.usage_max) {
                 let id = min.1 + elem as u16;
-                if id <= max.1 { id } else { continue }
+                if id <= max.1 {
+                    id
+                } else {
+                    continue;
+                }
             } else {
                 continue;
             };
@@ -379,9 +408,14 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8], node: &Dev
         for elem in 0..(count.min(16)) {
             let bit_off = field.bit_offset + elem as u32 * field.report_size;
             let v = extract_field_value(payload, bit_off, field.report_size, field.logical_min);
-            let p = extract_field_value(prev_payload, bit_off, field.report_size, field.logical_min);
-            if v > 0 { cur_usages.push(v as u32); }
-            if p > 0 { prev_usages.push(p as u32); }
+            let p =
+                extract_field_value(prev_payload, bit_off, field.report_size, field.logical_min);
+            if v > 0 {
+                cur_usages.push(v as u32);
+            }
+            if p > 0 {
+                prev_usages.push(p as u32);
+            }
         }
         // Releases: in prev but not in cur.
         for &pu in &prev_usages {
@@ -401,7 +435,13 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8], node: &Dev
 
 /// Dispatch a variable-field value to both the legacy global ring and
 /// the evdev ROUTER DeviceNode.
-fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool, node: &DeviceNode) -> usize {
+fn dispatch_usage_value(
+    page: u16,
+    usage: u16,
+    val: i32,
+    relative: bool,
+    node: &DeviceNode,
+) -> usize {
     match page {
         USAGE_PAGE_KEYBOARD => {
             // Keyboard page: bit-per-key (modifier byte style).
@@ -416,14 +456,19 @@ fn dispatch_usage_value(page: u16, usage: u16, val: i32, relative: bool, node: &
         USAGE_PAGE_GENERIC_DESKTOP => {
             match usage {
                 GD_X | GD_Y | GD_Z | GD_H_WHEEL if relative => {
-                    let (dx, dy) = if usage == GD_X { (val, 0) }
-                        else if usage == GD_Y { (0, val) }
-                        else { (0, 0) };
+                    let (dx, dy) = if usage == GD_X {
+                        (val, 0)
+                    } else if usage == GD_Y {
+                        (0, val)
+                    } else {
+                        (0, 0)
+                    };
                     if usage == GD_X || usage == GD_Y {
                         use narf_input::PointerButtons;
                         // Legacy ring.
                         push_global(InputEvent::Pointer(PointerEvent {
-                            dx, dy,
+                            dx,
+                            dy,
                             buttons: PointerButtons::EMPTY,
                         }));
                         // evdev ROUTER.
@@ -534,14 +579,13 @@ pub fn __reset_generic_devices_for_test() {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod tests {
+    use super::super::report_descriptor::parse;
     use super::*;
     use narf_input::{
-        evdev::ROUTER,
-        pop_key, pop_button, pop_pointer, pop_scroll,
-        __reset_global_ring_for_test, init_global_ring, KeyCode,
+        __reset_global_ring_for_test, evdev::ROUTER, init_global_ring, pop_button, pop_key,
+        pop_pointer, pop_scroll, KeyCode,
     };
     use narf_kernel_test::{kernel_test_in, TestResult};
-    use super::super::report_descriptor::parse;
 
     // Minimal Generic Desktop mouse descriptor (same as report_descriptor
     // tests) — used for the generic dispatch tests below.
@@ -571,8 +615,8 @@ pub(crate) mod tests {
         0x75, 0x08, //     Report Size (8)
         0x95, 0x03, //     Report Count (3)
         0x81, 0x06, //     Input (Data, Variable, Relative)
-        0xC0,       //   End Collection (Physical)
-        0xC0,       // End Collection (Application)
+        0xC0, //   End Collection (Physical)
+        0xC0, // End Collection (Application)
     ];
 
     /// Allocate a throw-away DeviceNode for unit tests that call
@@ -614,7 +658,9 @@ pub(crate) mod tests {
                 _ => {}
             }
             match narf_input::pop_scroll() {
-                Some(_) => { saw_scroll = true; }
+                Some(_) => {
+                    saw_scroll = true;
+                }
                 None => {}
             }
         }
@@ -635,18 +681,18 @@ pub(crate) mod tests {
         // A descriptor with a vendor-specific usage page (0xFF00).
         let vendor_desc: &[u8] = &[
             0x06, 0x00, 0xFF, // Usage Page (Vendor 0xFF00) — 2-byte
-            0x09, 0x01,       // Usage (Vendor Usage 1)
-            0xA1, 0x01,       // Collection (Application)
-            0x09, 0x01,       //   Usage (Vendor Usage 1)
-            0x15, 0x00,       //   Logical Minimum (0)
-            0x25, 0x01,       //   Logical Maximum (1)
-            0x75, 0x01,       //   Report Size (1)
-            0x95, 0x01,       //   Report Count (1)
-            0x81, 0x02,       //   Input (Data, Variable, Absolute)
-            0x75, 0x07,       //   Report Size (7) — padding
-            0x95, 0x01,       //   Report Count (1)
-            0x81, 0x01,       //   Input (Constant)
-            0xC0,             // End Collection
+            0x09, 0x01, // Usage (Vendor Usage 1)
+            0xA1, 0x01, // Collection (Application)
+            0x09, 0x01, //   Usage (Vendor Usage 1)
+            0x15, 0x00, //   Logical Minimum (0)
+            0x25, 0x01, //   Logical Maximum (1)
+            0x75, 0x01, //   Report Size (1)
+            0x95, 0x01, //   Report Count (1)
+            0x81, 0x02, //   Input (Data, Variable, Absolute)
+            0x75, 0x07, //   Report Size (7) — padding
+            0x95, 0x01, //   Report Count (1)
+            0x81, 0x01, //   Input (Constant)
+            0xC0, // End Collection
         ];
         let desc = parse(vendor_desc).expect("vendor parse failed");
         // Report: byte 0 = 0x01 (bit 0 set = vendor usage pressed).
@@ -665,7 +711,10 @@ pub(crate) mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/generic", smoke_generic_unknown_usage_fallback);
+    kernel_test_in!(
+        "drivers/usb/hid/generic",
+        smoke_generic_unknown_usage_fallback
+    );
 
     // ── Test 3: consumer-page dispatch ───────────────────────────────
 
@@ -686,9 +735,7 @@ pub(crate) mod tests {
             0x95, 0x01, // Report Count (1)
             0x81, 0x02, // Input (Data, Variable, Absolute)
             0x75, 0x07, // Padding
-            0x95, 0x01,
-            0x81, 0x01,
-            0xC0,       // End Collection
+            0x95, 0x01, 0x81, 0x01, 0xC0, // End Collection
         ];
         let desc = parse(consumer_desc).expect("consumer parse failed");
         let node = make_test_node();
@@ -726,7 +773,7 @@ pub(crate) mod tests {
             0x75, 0x08, // Report Size (8)
             0x95, 0x06, // Report Count (6)
             0x81, 0x00, // Input (Data, Array, Absolute)
-            0xC0,       // End Collection
+            0xC0, // End Collection
         ];
         let desc = parse(kbd_desc).expect("kbd parse failed");
         let node = make_test_node();
@@ -743,7 +790,10 @@ pub(crate) mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/generic", smoke_generic_keyboard_array_dispatch);
+    kernel_test_in!(
+        "drivers/usb/hid/generic",
+        smoke_generic_keyboard_array_dispatch
+    );
 
     // ── Test 5: button-page dispatch ─────────────────────────────────
 
@@ -768,7 +818,10 @@ pub(crate) mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/generic", smoke_generic_button_page_dispatch);
+    kernel_test_in!(
+        "drivers/usb/hid/generic",
+        smoke_generic_button_page_dispatch
+    );
 
     // ── Test 6: extract_field_value basic coverage ───────────────────
 

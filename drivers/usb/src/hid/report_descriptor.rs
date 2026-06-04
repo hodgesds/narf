@@ -250,44 +250,23 @@ pub(crate) mod tests {
     // Fields: modifier byte (8x 1-bit variables), keycode array (6x 8-bit).
     static LOGITECH_KBD_DESC: &[u8] = &[
         // Usage Page (Generic Desktop)
-        0x05, 0x01,
-        // Usage (Keyboard)
-        0x09, 0x06,
-        // Collection (Application)
-        0xA1, 0x01,
-        // Usage Page (Keyboard)
-        0x05, 0x07,
-        // Usage Minimum (Keyboard Left Control = 0xE0)
-        0x19, 0xE0,
-        // Usage Maximum (Keyboard Right GUI = 0xE7)
-        0x29, 0xE7,
-        // Logical Minimum (0)
-        0x15, 0x00,
-        // Logical Maximum (1)
-        0x25, 0x01,
-        // Report Size (1)
-        0x75, 0x01,
-        // Report Count (8)
-        0x95, 0x08,
-        // Input (Data, Variable, Absolute) — 8 modifier bits
-        0x81, 0x02,
-        // Report Count (1), Report Size (8)
-        0x95, 0x01,
-        0x75, 0x08,
-        // Input (Constant) — reserved byte
-        0x81, 0x01,
-        // Report Count (6), Report Size (8)
-        0x95, 0x06,
-        0x75, 0x08,
-        // Usage Minimum (0x00), Usage Maximum (0xFF)
-        0x19, 0x00,
-        0x29, 0xFF,
-        // Logical Minimum (0), Logical Maximum (255)
-        0x15, 0x00,
-        0x26, 0xFF, 0x00,
-        // Input (Data, Array, Absolute) — 6 keycodes
-        0x81, 0x00,
-        // End Collection
+        0x05, 0x01, // Usage (Keyboard)
+        0x09, 0x06, // Collection (Application)
+        0xA1, 0x01, // Usage Page (Keyboard)
+        0x05, 0x07, // Usage Minimum (Keyboard Left Control = 0xE0)
+        0x19, 0xE0, // Usage Maximum (Keyboard Right GUI = 0xE7)
+        0x29, 0xE7, // Logical Minimum (0)
+        0x15, 0x00, // Logical Maximum (1)
+        0x25, 0x01, // Report Size (1)
+        0x75, 0x01, // Report Count (8)
+        0x95, 0x08, // Input (Data, Variable, Absolute) — 8 modifier bits
+        0x81, 0x02, // Report Count (1), Report Size (8)
+        0x95, 0x01, 0x75, 0x08, // Input (Constant) — reserved byte
+        0x81, 0x01, // Report Count (6), Report Size (8)
+        0x95, 0x06, 0x75, 0x08, // Usage Minimum (0x00), Usage Maximum (0xFF)
+        0x19, 0x00, 0x29, 0xFF, // Logical Minimum (0), Logical Maximum (255)
+        0x15, 0x00, 0x26, 0xFF, 0x00, // Input (Data, Array, Absolute) — 6 keycodes
+        0x81, 0x00, // End Collection
         0xC0,
     ];
 
@@ -323,8 +302,8 @@ pub(crate) mod tests {
         0x75, 0x08, //     Report Size (8)
         0x95, 0x03, //     Report Count (3)
         0x81, 0x06, //     Input (Data, Variable, Relative)
-        0xC0,       //   End Collection (Physical)
-        0xC0,       // End Collection (Application)
+        0xC0, //   End Collection (Physical)
+        0xC0, // End Collection (Application)
     ];
 
     // ── Test 1: keyboard boot-descriptor parse end-to-end ────────────
@@ -345,9 +324,7 @@ pub(crate) mod tests {
         }
         let (pg, id) = desc.top_level_apps[0];
         if pg != 0x01 || id != 0x06 {
-            return TestResult::Fail(
-                "top-level app is not Generic Desktop / Keyboard",
-            );
+            return TestResult::Fail("top-level app is not Generic Desktop / Keyboard");
         }
         TestResult::Pass
     }
@@ -411,7 +388,7 @@ pub(crate) mod tests {
             0x75, 0x01, //   Report Size (1)
             0x95, 0x08, //   Report Count (8)
             0x81, 0x02, //   Input (Data, Variable, Absolute)
-            0xC0,       // End Collection
+            0xC0, // End Collection
             0x05, 0x0C, // Usage Page (Consumer)
             0x09, 0x01, // Usage (Consumer Control)
             0xA1, 0x01, // Collection (Application)
@@ -421,7 +398,7 @@ pub(crate) mod tests {
             0x75, 0x08, //   Report Size (8)
             0x95, 0x01, //   Report Count (1)
             0x81, 0x00, //   Input (Data, Array, Absolute)
-            0xC0,       // End Collection
+            0xC0, // End Collection
         ];
         let desc = parse(desc_with_ids).expect("parse failed");
         if !desc.has_report_ids {
@@ -663,7 +640,7 @@ pub(crate) mod tests {
             0x75, 0x01, //   Report Size (1)
             0x95, 0x08, //   Report Count (8)
             0x81, 0x02, //   Input (Data, Variable, Absolute)
-            0xC0,       // End Collection
+            0xC0, // End Collection
         ];
         let desc = parse(kbd_with_rid).expect("parse failed");
         if !desc.has_report_ids {

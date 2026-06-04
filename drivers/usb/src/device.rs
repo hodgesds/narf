@@ -205,7 +205,14 @@ impl USBDevice {
         out: &mut [u8],
     ) -> Result<usize, UsbError> {
         self.controller
-            .control_in(self.slot_id, bm_request_type, b_request, w_value, w_index, out)
+            .control_in(
+                self.slot_id,
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                out,
+            )
             .await
             .map_err(UsbError::from_xhci)
     }
@@ -222,7 +229,14 @@ impl USBDevice {
         data: &[u8],
     ) -> Result<usize, UsbError> {
         self.controller
-            .control_out(self.slot_id, bm_request_type, b_request, w_value, w_index, data)
+            .control_out(
+                self.slot_id,
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                data,
+            )
             .await
             .map_err(UsbError::from_xhci)
     }
@@ -256,11 +270,7 @@ impl USBDevice {
 
     /// Poll for a completed interrupt-IN transfer. Returns the bytes
     /// actually transferred (or `None` if nothing has arrived).
-    pub fn poll_interrupt_in(
-        &self,
-        dci: u8,
-        out: &mut [u8],
-    ) -> Result<Option<usize>, UsbError> {
+    pub fn poll_interrupt_in(&self, dci: u8, out: &mut [u8]) -> Result<Option<usize>, UsbError> {
         self.controller
             .poll_interrupt_in(self.slot_id, dci, out)
             .map_err(UsbError::from_xhci)

@@ -126,7 +126,11 @@ pub fn register_class_driver(
     if g.len() >= MAX_DRIVERS {
         return Err(UsbProbeError::RegistryFull);
     }
-    g.push(DriverEntry { name, matches, probe });
+    g.push(DriverEntry {
+        name,
+        matches,
+        probe,
+    });
     Ok(())
 }
 
@@ -175,7 +179,9 @@ pub fn dispatch_probe(device: Arc<USBDevice>) -> bool {
                 let _ = writeln!(
                     narf_console::Writer,
                     "  usb-class-registry: {:04x}:{:04x} claimed by {}",
-                    vid, pid, name
+                    vid,
+                    pid,
+                    name
                 );
                 return true;
             }
@@ -185,7 +191,10 @@ pub fn dispatch_probe(device: Arc<USBDevice>) -> bool {
                 let _ = writeln!(
                     narf_console::Writer,
                     "  usb-class-registry: {:04x}:{:04x} probe {} failed: {:?}",
-                    vid, pid, name, e
+                    vid,
+                    pid,
+                    name,
+                    e
                 );
                 // Continue to next driver (unusual but allowed).
             }
@@ -207,7 +216,11 @@ pub fn registered_count() -> usize {
 pub fn would_match(vendor_id: u16, product_id: u16) -> bool {
     let g = REGISTRY.lock();
     for entry in g.iter() {
-        if entry.matches.iter().any(|m| m.vendor_id == vendor_id && m.product_id == product_id) {
+        if entry
+            .matches
+            .iter()
+            .any(|m| m.vendor_id == vendor_id && m.product_id == product_id)
+        {
             return true;
         }
     }

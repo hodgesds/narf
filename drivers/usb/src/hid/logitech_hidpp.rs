@@ -228,11 +228,7 @@ pub fn encode_get_feature(
 /// Encode the Root.GetProtocolVersion ping. Carries the ping byte
 /// (0x5A by Linux convention) in params[2]; the device echoes it back
 /// in the response so the host can match request to reply.
-pub fn encode_ping(
-    out: &mut [u8],
-    device_index: u8,
-    ping_byte: u8,
-) -> Result<usize, HidppError> {
+pub fn encode_ping(out: &mut [u8], device_index: u8, ping_byte: u8) -> Result<usize, HidppError> {
     let params = [0, 0, ping_byte];
     encode_short_fap(
         out,
@@ -386,16 +382,16 @@ pub fn claims_device(supported_reports: u8) -> bool {
 /// pretty-print pair notifications, not for binding.
 pub const HIDPP_KNOWN_DEVICES: &[(&str, u16, u16)] = &[
     // (name, vid, pid_or_bluetooth_id)
-    ("MX Master 3 Anywhere",  0x046d, 0x4082),
-    ("MX Master 3S",          0x046d, 0xb034),
-    ("MX Keys",               0x046d, 0x408a),
-    ("MX Vertical",           0x046d, 0x407b),
-    ("G502 Hero",             0x046d, 0xc08b),
-    ("K780 Multi-Device",     0x046d, 0x405b),
-    ("M720 Triathlon",        0x046d, 0x405e),
-    ("K400 Plus",             0x046d, 0x4024),
-    ("M557",                  0x046d, 0xb010),
-    ("MX Anywhere 2",         0x046d, 0x404a),
+    ("MX Master 3 Anywhere", 0x046d, 0x4082),
+    ("MX Master 3S", 0x046d, 0xb034),
+    ("MX Keys", 0x046d, 0x408a),
+    ("MX Vertical", 0x046d, 0x407b),
+    ("G502 Hero", 0x046d, 0xc08b),
+    ("K780 Multi-Device", 0x046d, 0x405b),
+    ("M720 Triathlon", 0x046d, 0x405e),
+    ("K400 Plus", 0x046d, 0x4024),
+    ("M557", 0x046d, 0xb010),
+    ("MX Anywhere 2", 0x046d, 0x404a),
 ];
 
 // ── Smokes ─────────────────────────────────────────────────────────
@@ -488,7 +484,12 @@ mod tests {
     fn smoke_hidpp_get_feature_encode() -> TestResult {
         let mut buf = [0u8; HIDPP_REPORT_SHORT_LENGTH];
         // Ask for the battery feature (0x1000) on device index 0xFF.
-        encode_get_feature(&mut buf, HIDPP_RECEIVER_INDEX, HIDPP_PAGE_BATTERY_LEVEL_STATUS).unwrap();
+        encode_get_feature(
+            &mut buf,
+            HIDPP_RECEIVER_INDEX,
+            HIDPP_PAGE_BATTERY_LEVEL_STATUS,
+        )
+        .unwrap();
         if buf[0] != REPORT_ID_HIDPP_SHORT {
             return TestResult::Fail("not a short report");
         }
@@ -505,20 +506,39 @@ mod tests {
             return TestResult::Fail("feature ID bytes wrong (MSB/LSB)");
         }
         // Decode a synthetic reply: feature index = 0x05.
-        let reply: &[u8] = &[REPORT_ID_HIDPP_SHORT, HIDPP_RECEIVER_INDEX, HIDPP_PAGE_ROOT_IDX, 0x00, 0x05, 0x00, 0x00];
+        let reply: &[u8] = &[
+            REPORT_ID_HIDPP_SHORT,
+            HIDPP_RECEIVER_INDEX,
+            HIDPP_PAGE_ROOT_IDX,
+            0x00,
+            0x05,
+            0x00,
+            0x00,
+        ];
         let got = decode_get_feature_response(reply).unwrap();
         if got != Some(0x05) {
             return TestResult::Fail("decoded feature index should be 5");
         }
         // Decode "not supported" — index = 0.
-        let reply2: &[u8] = &[REPORT_ID_HIDPP_SHORT, HIDPP_RECEIVER_INDEX, HIDPP_PAGE_ROOT_IDX, 0x00, 0x00, 0x00, 0x00];
+        let reply2: &[u8] = &[
+            REPORT_ID_HIDPP_SHORT,
+            HIDPP_RECEIVER_INDEX,
+            HIDPP_PAGE_ROOT_IDX,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
         let got = decode_get_feature_response(reply2).unwrap();
         if got.is_some() {
             return TestResult::Fail("zero index should decode as not-supported");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/logitech_hidpp", smoke_hidpp_get_feature_encode);
+    kernel_test_in!(
+        "drivers/usb/hid/logitech_hidpp",
+        smoke_hidpp_get_feature_encode
+    );
 
     // ── Smoke 4: battery feature 0x1000 response decode ──
 
@@ -527,13 +547,7 @@ mod tests {
         // device index 0x02, feature index 0x05 (whatever GetFeature
         // returned), capacity 73%, next_capacity 60%, status =
         // Discharging.
-        let reply: &[u8] = &[
-            REPORT_ID_HIDPP_SHORT,
-            0x02,
-            0x05,
-            0x00,
-            73, 60, 0, 0,
-        ];
+        let reply: &[u8] = &[REPORT_ID_HIDPP_SHORT, 0x02, 0x05, 0x00, 73, 60, 0, 0];
         let br = decode_battery_response(reply).unwrap();
         if br.capacity != 73 {
             return TestResult::Fail("capacity wrong");
@@ -555,13 +569,7 @@ mod tests {
             return TestResult::Fail("95% should map to Full");
         }
         // Charge complete response.
-        let reply2: &[u8] = &[
-            REPORT_ID_HIDPP_SHORT,
-            0x02,
-            0x05,
-            0x00,
-            100, 0, 3, 0,
-        ];
+        let reply2: &[u8] = &[REPORT_ID_HIDPP_SHORT, 0x02, 0x05, 0x00, 100, 0, 3, 0];
         let br2 = decode_battery_response(reply2).unwrap();
         if br2.status != BatteryStatus::ChargeComplete {
             return TestResult::Fail("status byte 3 should decode as ChargeComplete");

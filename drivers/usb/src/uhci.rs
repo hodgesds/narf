@@ -168,7 +168,7 @@ pub struct Td {
     pub link: FrameListPtr,
     /// Status / Control DWord (§3.2.1 dword 1).
     pub actual_length: u16, // bits [10:0]
-    pub status: u8,         // bits [23:16]
+    pub status: u8, // bits [23:16]
     pub interrupt_on_completion: bool,
     pub iso: bool,
     pub low_speed: bool,
@@ -176,10 +176,10 @@ pub struct Td {
     pub short_packet_detect: bool,
     /// Token DWord (§3.2.1 dword 2).
     pub pid: TdPid,
-    pub device_addr: u8,    // bits [14:8]
-    pub endpoint: u8,       // bits [18:15]
-    pub data_toggle: bool,  // bit 19
-    pub max_len: u16,       // bits [31:21]
+    pub device_addr: u8,   // bits [14:8]
+    pub endpoint: u8,      // bits [18:15]
+    pub data_toggle: bool, // bit 19
+    pub max_len: u16,      // bits [31:21]
     /// Buffer pointer DWord — flat 32-bit address.
     pub buffer: u32,
 }
@@ -325,10 +325,7 @@ pub fn probe(
     let class = ((device.id.class >> 16) & 0xFF) as u8;
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     let prog_if = (device.id.class & 0xFF) as u8;
-    if class != PCI_CLASS_SERIAL_BUS
-        || subclass != PCI_SUBCLASS_USB
-        || prog_if != PCI_PROGIF_UHCI
-    {
+    if class != PCI_CLASS_SERIAL_BUS || subclass != PCI_SUBCLASS_USB || prog_if != PCI_PROGIF_UHCI {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     // UHCI needs IO_SPACE + BUS_MASTER + INTX_DISABLE — the legacy
@@ -353,7 +350,9 @@ pub fn probe(
             let _ = writeln!(
                 narf_console::Writer,
                 "  uhci: BAR{} read failed for {:04x}:{:04x}",
-                UHCI_BAR_INDEX, device.id.vendor, device.id.device
+                UHCI_BAR_INDEX,
+                device.id.vendor,
+                device.id.device
             );
             return Err(narf_bus::ProbeError::BadDevice);
         }
@@ -363,7 +362,8 @@ pub fn probe(
         let _ = writeln!(
             narf_console::Writer,
             "  uhci: BAR{} not an I/O port BAR (kind={:?})",
-            UHCI_BAR_INDEX, bar.kind
+            UHCI_BAR_INDEX,
+            bar.kind
         );
         return Err(narf_bus::ProbeError::BadDevice);
     }

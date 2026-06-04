@@ -69,7 +69,7 @@ use alloc::vec::Vec;
 use narf_input::{push_key, KeyCode};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::hid::{HidError, HID_REQ_SET_IDLE, HID_REQ_SET_PROTOCOL, HID_REPORT_PROTOCOL};
+use crate::hid::{HidError, HID_REPORT_PROTOCOL, HID_REQ_SET_IDLE, HID_REQ_SET_PROTOCOL};
 use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 
 // ── HID Consumer Page constants ────────────────────────────────────
@@ -139,8 +139,7 @@ pub struct ConsumerDevice {
 }
 
 /// Global registry of bound Consumer Control interfaces.
-static CONSUMER_DEVICES: IrqSafeSpinLock<Vec<ConsumerDevice>> =
-    IrqSafeSpinLock::new(Vec::new());
+static CONSUMER_DEVICES: IrqSafeSpinLock<Vec<ConsumerDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Usage-page detection in Report Descriptor ─────────────────────
 
@@ -399,8 +398,8 @@ pub fn usage_to_keycode(usage: u16) -> KeyCode {
 
         // Volume / mute (§15, table 15-7). These are the three most
         // common consumer keys on any laptop keyboard.
-        0xE0 => KeyCode::Mute,       // Mute
-        0xE2 => KeyCode::Mute,       // Mute (some devices use 0xE2)
+        0xE0 => KeyCode::Mute, // Mute
+        0xE2 => KeyCode::Mute, // Mute (some devices use 0xE2)
         0xE9 => KeyCode::VolumeUp,
         0xEA => KeyCode::VolumeDown,
 
@@ -418,8 +417,8 @@ pub fn usage_to_keycode(usage: u16) -> KeyCode {
         0x7B => KeyCode::KbdIlluminationDown,
 
         // Wireless / WLAN / Airplane mode. Linux: KEY_WLAN.
-        0x18A => KeyCode::WLan,     // AL Internet Browser (closest)
-        0x0C8 => KeyCode::WLan,     // AC Wireless (§15.6 consumer)
+        0x18A => KeyCode::WLan, // AL Internet Browser (closest)
+        0x0C8 => KeyCode::WLan, // AC Wireless (§15.6 consumer)
 
         // Touchpad toggle (Fn+F9 on many AMD laptops). Vendor-specific
         // on many OEMs but a handful use the HID consumer code.
@@ -596,8 +595,7 @@ pub async fn try_bind_consumer_already_addressed(
 
     // Step 2: determine Report Descriptor length from the inline HID
     // Descriptor block.
-    let report_len =
-        report_descriptor_length(desc, hid_off).ok_or(HidError::NoInterruptIn)?;
+    let report_len = report_descriptor_length(desc, hid_off).ok_or(HidError::NoInterruptIn)?;
     if report_len == 0 || report_len as usize > MAX_REPORT_DESCRIPTOR {
         return Err(HidError::NoInterruptIn);
     }
@@ -695,15 +693,16 @@ pub async fn try_bind_consumer_already_addressed(
     {
         let mut g = CONSUMER_DEVICES.lock();
         g.push(dev);
-        ATTACHED_CONSUMER_COUNT
-            .store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        ATTACHED_CONSUMER_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
     }
     {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
             "  usb-hid: consumer slot={} iface={} dci={}",
-            slot_id, iface_num, dci,
+            slot_id,
+            iface_num,
+            dci,
         );
     }
     Ok(())
@@ -826,7 +825,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/consumer", smoke_consumer_usage_to_keycode_top10);
+    kernel_test_in!(
+        "drivers/usb/hid/consumer",
+        smoke_consumer_usage_to_keycode_top10
+    );
 
     // ── Smoke 2: multi-press report decode ───────────────────────────────
 
@@ -866,7 +868,10 @@ mod tests {
 
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/consumer", smoke_consumer_multi_press_decode);
+    kernel_test_in!(
+        "drivers/usb/hid/consumer",
+        smoke_consumer_multi_press_decode
+    );
 
     // ── Smoke 3: descriptor-shape detection (consumer page presence) ─────
 
@@ -894,7 +899,7 @@ mod tests {
             0x75, 0x08, // Report Size (8)
             0x95, 0x01, // Report Count (1)
             0x81, 0x00, // Input (Data, Array, Abs)
-            0xC0,       // End Collection
+            0xC0, // End Collection
         ];
 
         if !has_consumer_control_collection(consumer_desc) {
@@ -906,7 +911,7 @@ mod tests {
             0x05, 0x01, // Usage Page (Generic Desktop)
             0x09, 0x06, // Usage (Keyboard)
             0xA1, 0x01, // Collection (Application)
-            0xC0,       // End Collection
+            0xC0, // End Collection
         ];
         if has_consumer_control_collection(kbd_desc) {
             return TestResult::Fail("keyboard descriptor false-positive as consumer");
@@ -929,7 +934,7 @@ mod tests {
             0x75, 0x08, // Report Size (8)
             0x95, 0x01, // Report Count (1)
             0x81, 0x00, // Input
-            0xC0,       // End Collection
+            0xC0, // End Collection
         ];
         if !has_consumer_control_collection(desc_with_rid) {
             return TestResult::Fail("consumer descriptor with report-ID not detected");
@@ -941,7 +946,10 @@ mod tests {
 
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/consumer", smoke_consumer_descriptor_detection);
+    kernel_test_in!(
+        "drivers/usb/hid/consumer",
+        smoke_consumer_descriptor_detection
+    );
 
     // ── Smoke 4: translate_diff pushes correct press/release events ──────
 
@@ -1017,5 +1025,8 @@ mod tests {
 
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/consumer", smoke_consumer_translate_diff_events);
+    kernel_test_in!(
+        "drivers/usb/hid/consumer",
+        smoke_consumer_translate_diff_events
+    );
 }

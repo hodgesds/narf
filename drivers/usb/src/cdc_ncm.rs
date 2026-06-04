@@ -202,11 +202,21 @@ impl PacketFilter {
     /// Encode as the `wValue` u16 for the class control request.
     pub fn encode(&self) -> u16 {
         let mut v: u16 = 0;
-        if self.promiscuous { v |= 1 << 0; }
-        if self.all_multicast { v |= 1 << 1; }
-        if self.directed { v |= 1 << 2; }
-        if self.broadcast { v |= 1 << 3; }
-        if self.multicast { v |= 1 << 4; }
+        if self.promiscuous {
+            v |= 1 << 0;
+        }
+        if self.all_multicast {
+            v |= 1 << 1;
+        }
+        if self.directed {
+            v |= 1 << 2;
+        }
+        if self.broadcast {
+            v |= 1 << 3;
+        }
+        if self.multicast {
+            v |= 1 << 4;
+        }
         v
     }
 
@@ -499,11 +509,7 @@ pub enum NcmError {
 ///
 /// `sequence` is the host-monotonic counter the receiver echoes
 /// back. `crc` selects the NDP16 signature (NCM0 vs NCM1).
-pub fn build_ntb16(
-    sequence: u16,
-    datagrams: &[&[u8]],
-    crc: bool,
-) -> Result<Vec<u8>, NcmError> {
+pub fn build_ntb16(sequence: u16, datagrams: &[&[u8]], crc: bool) -> Result<Vec<u8>, NcmError> {
     // Datagrams precede the NDP16 in the wire layout. Compute
     // each datagram's offset (which sits in the NDP16 entry).
     let mut datagram_block_size = 0usize;
@@ -633,12 +639,19 @@ pub mod tests {
 
     fn smoke_ethernet_networking_descriptor() -> TestResult {
         let raw = [
-            13u8, CS_INTERFACE, 0x0F, // header
+            13u8,
+            CS_INTERFACE,
+            0x0F, // header
             5,    // iMACAddress
-            0, 0, 0, 0, // statistics
-            0xEA, 0x05, // wMaxSegmentSize = 1514
-            0, 0, // wNumberMCFilters
-            0,    // bNumberPowerFilters
+            0,
+            0,
+            0,
+            0, // statistics
+            0xEA,
+            0x05, // wMaxSegmentSize = 1514
+            0,
+            0, // wNumberMCFilters
+            0, // bNumberPowerFilters
         ];
         let d = match EthernetNetworkingDescriptor::parse(&raw) {
             Ok(d) => d,
@@ -652,10 +665,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/usb/cdc_ncm",
-        smoke_ethernet_networking_descriptor
-    );
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ethernet_networking_descriptor);
 
     fn smoke_ntb16_round_trip_single_datagram() -> TestResult {
         let dg: &[u8] = b"hello-ethernet-frame";
@@ -719,10 +729,7 @@ pub mod tests {
             _ => TestResult::Fail("bad signature must be rejected"),
         }
     }
-    kernel_test_in!(
-        "drivers/usb/cdc_ncm",
-        smoke_ntb16_rejects_bad_signature
-    );
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ntb16_rejects_bad_signature);
 
     fn smoke_ndp16_signature_selects_crc_mode() -> TestResult {
         let ntb_no_crc = build_ntb16(0, &[b"x"], false).expect("clean inputs");
@@ -848,8 +855,7 @@ pub struct CdcNcmDevice {
 }
 
 /// System-wide registry of bound CDC-NCM devices.
-pub static CDC_NCM_DEVICES: IrqSafeSpinLock<Vec<CdcNcmDevice>> =
-    IrqSafeSpinLock::new(Vec::new());
+pub static CDC_NCM_DEVICES: IrqSafeSpinLock<Vec<CdcNcmDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Find the first CDC-Comm interface with subclass NCM in `cfg`.
 pub fn find_ncm_comm_interface(cfg: &[u8]) -> Option<u8> {
@@ -1014,9 +1020,8 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
         Some(c) => c,
         None => return Err(NcmError::Truncated),
     };
-    let outcome = narf_scheduler::block_on(async move {
-        c.bulk_out(slot_id, bulk_out_dci, &ntb).await
-    });
+    let outcome =
+        narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, &ntb).await });
     match outcome {
         Ok(n) => Ok(n),
         Err(_) => Err(NcmError::Truncated),
@@ -1028,10 +1033,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
 /// first datagram (if any). Caller polls this periodically; on
 /// real silicon the bulk-IN ring continuously holds an NTB-sized
 /// read posted so frames stream in.
-pub fn recv_frame<'a>(
-    idx: usize,
-    scratch: &'a mut [u8],
-) -> Result<Option<&'a [u8]>, NcmError> {
+pub fn recv_frame<'a>(idx: usize, scratch: &'a mut [u8]) -> Result<Option<&'a [u8]>, NcmError> {
     let (slot_id, bulk_in_dci) = {
         let g = CDC_NCM_DEVICES.lock();
         let dev = g.get(idx).ok_or(NcmError::NotNcm)?;
@@ -1043,9 +1045,8 @@ pub fn recv_frame<'a>(
         Some(c) => c,
         None => return Err(NcmError::Truncated),
     };
-    let outcome = narf_scheduler::block_on(async {
-        c.bulk_in(slot_id, bulk_in_dci, scratch).await
-    });
+    let outcome =
+        narf_scheduler::block_on(async { c.bulk_in(slot_id, bulk_in_dci, scratch).await });
     let n = match outcome {
         Ok(n) => n,
         Err(_) => return Err(NcmError::Truncated),

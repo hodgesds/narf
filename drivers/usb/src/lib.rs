@@ -9,34 +9,35 @@ extern crate alloc;
 pub mod attach;
 pub mod btusb;
 pub mod bulk;
-pub mod class_registry;
 pub mod ccid;
 pub mod cdc;
-pub mod control;
-pub mod device;
-pub mod ehci;
-pub mod firmware;
-pub mod intr;
-pub mod iso;
-pub mod ohci;
-pub mod uhci;
 pub mod cdc_acm;
 pub mod cdc_ncm;
+pub mod class_registry;
+pub mod control;
+pub mod device;
 pub mod dfu;
+pub mod ehci;
 pub mod fingerprint;
+pub mod firmware;
 pub mod hid;
 pub mod hub;
+pub mod intr;
+pub mod iso;
 pub mod msc;
+pub mod ohci;
+pub mod serial;
 pub mod uac;
+pub mod uhci;
 pub mod uvc;
 pub mod uvc_stream;
 pub mod wbdi;
-pub mod serial;
 pub mod xhci;
 pub mod xpad;
 
+#[cfg(feature = "kernel-test")]
+mod e2e_tests;
 mod tests;
-#[cfg(feature = "kernel-test")] mod e2e_tests;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
@@ -199,8 +200,7 @@ impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
 /// either (a) never enqueued, (b) enqueued on a CPU that isn't
 /// polling, or (c) preempted at every dispatch before reaching
 /// this increment. Surfaced on the FB status panel.
-pub static SUPERVISOR_TICKS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static SUPERVISOR_TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Most-recent phase marker the supervisor reached inside the
 /// current loop iteration. Updated as the supervisor crosses each
@@ -217,8 +217,7 @@ pub static SUPERVISOR_TICKS: core::sync::atomic::AtomicU32 =
 /// 7 = Phase 2 done; about to call hid::pump_all
 /// 8 = pump_all done; about to call idle_suspend_pass
 /// 9 = about to .await wait_for_irq_until / sleep_cycles
-pub static SUPERVISOR_PHASE: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
+pub static SUPERVISOR_PHASE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Port number the supervisor is currently trying to attach (if
 /// inside try_attach_root). 0 = not in try_attach_root. Lets us
@@ -337,7 +336,8 @@ fn spawn_supervisor_task() {
                         let _ = writeln!(
                             narf_console::Writer,
                             "  usb-supervisor: port {} PLS {:x}→U0, retry budget reset",
-                            p, prev
+                            p,
+                            prev
                         );
                         root_fail_count[pi] = 0;
                     }
@@ -464,14 +464,9 @@ fn spawn_supervisor_task() {
                     if (bound_mask | new_bound_bits) & dpb != 0 {
                         continue;
                     }
-                    let outcome = attach::try_attach_via_hub(
-                        c,
-                        &hub_copy,
-                        *route,
-                        *tier,
-                        *root_port,
-                        dp,
-                    ).await;
+                    let outcome =
+                        attach::try_attach_via_hub(c, &hub_copy, *route, *tier, *root_port, dp)
+                            .await;
                     match outcome {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse

@@ -531,10 +531,7 @@ pub mod tests {
             _ => TestResult::Fail("invalid state must be rejected"),
         }
     }
-    kernel_test_in!(
-        "drivers/usb/dfu",
-        smoke_status_block_rejects_bad_state
-    );
+    kernel_test_in!("drivers/usb/dfu", smoke_status_block_rejects_bad_state);
 
     fn smoke_v10_descriptor_default_version() -> TestResult {
         // 7-byte (DFU 1.0) descriptor — no bcdDFUVersion field.

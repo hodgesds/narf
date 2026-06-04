@@ -93,9 +93,8 @@ impl Trb {
 /// the Protocol Slot Type from a Supported Protocol Capability; 0 is
 /// the default (USB 2.0 / USB 3.x stock).
 pub fn encode_enable_slot(slot_type: u8, cycle: u32) -> Trb {
-    let control = (TRB_TYPE_ENABLE_SLOT_CMD << TRB_TYPE_SHIFT)
-        | ((slot_type as u32) << 16)
-        | (cycle & 1);
+    let control =
+        (TRB_TYPE_ENABLE_SLOT_CMD << TRB_TYPE_SHIFT) | ((slot_type as u32) << 16) | (cycle & 1);
     Trb {
         parameter: 0,
         status: 0,
@@ -105,9 +104,8 @@ pub fn encode_enable_slot(slot_type: u8, cycle: u32) -> Trb {
 
 /// Encode a Disable Slot command TRB (§6.4.3.3).
 pub fn encode_disable_slot(slot_id: u8, cycle: u32) -> Trb {
-    let control = (TRB_TYPE_DISABLE_SLOT_CMD << TRB_TYPE_SHIFT)
-        | ((slot_id as u32) << 24)
-        | (cycle & 1);
+    let control =
+        (TRB_TYPE_DISABLE_SLOT_CMD << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | (cycle & 1);
     Trb {
         parameter: 0,
         status: 0,
@@ -121,9 +119,8 @@ pub fn encode_disable_slot(slot_id: u8, cycle: u32) -> Trb {
 /// controller does the Set Address PHASE but doesn't issue the actual
 /// SetAddress to the device, used during initial speed/MPS evaluation.
 pub fn encode_address_device(input_ctx_pa: u64, slot_id: u8, bsr: bool, cycle: u32) -> Trb {
-    let mut control = (TRB_TYPE_ADDRESS_DEVICE_CMD << TRB_TYPE_SHIFT)
-        | ((slot_id as u32) << 24)
-        | (cycle & 1);
+    let mut control =
+        (TRB_TYPE_ADDRESS_DEVICE_CMD << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | (cycle & 1);
     if bsr {
         control |= 1 << 9; // BSR bit per §6.4.3.4
     }
@@ -138,12 +135,7 @@ pub fn encode_address_device(input_ctx_pa: u64, slot_id: u8, bsr: bool, cycle: u
 /// (Deconfigure) clears all non-default endpoints and returns the
 /// Slot to the Addressed state; otherwise the Input Context add/drop
 /// flags select which endpoints to configure.
-pub fn encode_configure_endpoint(
-    input_ctx_pa: u64,
-    slot_id: u8,
-    dc: bool,
-    cycle: u32,
-) -> Trb {
+pub fn encode_configure_endpoint(input_ctx_pa: u64, slot_id: u8, dc: bool, cycle: u32) -> Trb {
     let mut control = (TRB_TYPE_CONFIGURE_ENDPOINT_CMD << TRB_TYPE_SHIFT)
         | ((slot_id as u32) << 24)
         | (cycle & 1);
@@ -159,9 +151,8 @@ pub fn encode_configure_endpoint(
 
 /// Encode an Evaluate Context command TRB (§6.4.3.6).
 pub fn encode_eval_context(input_ctx_pa: u64, slot_id: u8, cycle: u32) -> Trb {
-    let control = (TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT)
-        | ((slot_id as u32) << 24)
-        | (cycle & 1);
+    let control =
+        (TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | (cycle & 1);
     Trb {
         parameter: input_ctx_pa & !0xF,
         status: 0,

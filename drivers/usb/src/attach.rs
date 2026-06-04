@@ -291,7 +291,10 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
         let _ = xhci_dev.disable_slot(slot_id).await;
         return AttachOutcome::UnknownClass;
     }
-    dispatch_after_address(xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port).await
+    dispatch_after_address(
+        xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port,
+    )
+    .await
 }
 
 /// Drive enumeration for a device on `hub_port` of an already-bound
@@ -450,7 +453,9 @@ async fn dispatch_after_address(
         // controller sizes its TT-routing state for downstream
         // enumeration (xHCI 1.2 §6.2.2 dword0[26], dword1[31:24]).
         // Failure here isn't fatal — most controllers tolerate it.
-        let _ = xhci_dev.mark_as_hub(slot_id, bound.descriptor.num_ports, /*mtt*/ false).await;
+        let _ = xhci_dev
+            .mark_as_hub(slot_id, bound.descriptor.num_ports, /*mtt*/ false)
+            .await;
         // Tier of THIS hub = number of 4-bit nibbles already
         // populated in `this_route`. For a tier-0 hub the route is
         // 0 and tier is 0; downstream-of-hub devices will use
@@ -465,7 +470,10 @@ async fn dispatch_after_address(
             let _ = writeln!(
                 narf_console::Writer,
                 "  usb-hub: attached on root_port={} route=0x{:05x} tier={} num_ports={}",
-                root_port, this_route, tier, bound.descriptor.num_ports
+                root_port,
+                this_route,
+                tier,
+                bound.descriptor.num_ports
             );
         }
         HUBS.lock().push(HubBinding {
@@ -494,7 +502,10 @@ async fn dispatch_after_address(
     // CDC-NCM → btusb → WBDI fingerprint. Keyboard and mouse use
     // class-at-interface match; the rest fingerprint via the config
     // descriptor blob.
-    if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed).await.is_ok() {
+    if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed)
+        .await
+        .is_ok()
+    {
         return AttachOutcome::Keyboard;
     }
     // PTP touchpad / CDC-ACM serial / MSC / UAC / UVC / CDC-NCM /
@@ -505,9 +516,7 @@ async fn dispatch_after_address(
     if let Some(cfg_blob) = fetch_full_config(xhci_dev, slot_id).await {
         // PTP touchpad first — HID class with Report descriptor
         // shape matching a precision-touchpad device.
-        if let Some((iface, hid_off, ep)) =
-            hid::touchpad::find_hid_interface(&cfg_blob)
-        {
+        if let Some((iface, hid_off, ep)) = hid::touchpad::find_hid_interface(&cfg_blob) {
             if hid::touchpad::try_bind_touchpad_already_addressed(
                 xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
             )
@@ -522,11 +531,9 @@ async fn dispatch_after_address(
         // report-descriptor shape) and before Boot Mouse (protocol 2)
         // because consumer interfaces present protocol=0 and would
         // look like a non-boot HID device to the mouse scanner.
-        if hid::consumer::try_bind_consumer_already_addressed(
-            xhci_dev, slot_id, 0, &cfg_blob,
-        )
-        .await
-        .is_ok()
+        if hid::consumer::try_bind_consumer_already_addressed(xhci_dev, slot_id, 0, &cfg_blob)
+            .await
+            .is_ok()
         {
             return AttachOutcome::ConsumerControl;
         }
@@ -535,11 +542,9 @@ async fn dispatch_after_address(
         // demoted to a boot mouse, but before CDC-ACM so a USB mouse
         // isn't misclassified as a serial dongle.
         if mouse::find_boot_mouse(&cfg_blob).is_ok() {
-            if mouse::try_bind_mouse_already_addressed(
-                xhci_dev, slot_id, speed,
-            )
-            .await
-            .is_ok()
+            if mouse::try_bind_mouse_already_addressed(xhci_dev, slot_id, speed)
+                .await
+                .is_ok()
             {
                 return AttachOutcome::Mouse;
             }
@@ -560,36 +565,37 @@ async fn dispatch_after_address(
         // SubClass=0x06, Protocol=0x50. `find_bot_endpoints`
         // walks the config blob; if it doesn't find an MSC
         // interface it returns EndpointsMissing and we fall through.
-        if let Ok(_idx) = crate::msc::try_bind_msc_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await {
+        if let Ok(_idx) =
+            crate::msc::try_bind_msc_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        {
             return AttachOutcome::MassStorage;
         }
         // USB Audio Class — class 0x01, subclass 0x01 (AC).
-        if let Ok(_idx) = crate::uac::try_bind_audio_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await {
+        if let Ok(_idx) =
+            crate::uac::try_bind_audio_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        {
             return AttachOutcome::AudioClass;
         }
         // USB Video Class — class 0x0E, subclass 0x01 (VC).
-        if let Ok(_idx) = crate::uvc::try_bind_video_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await {
+        if let Ok(_idx) =
+            crate::uvc::try_bind_video_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        {
             return AttachOutcome::VideoClass;
         }
         // CDC-NCM ethernet — class 0x02 (Comm), subclass 0x0D.
-        if let Ok(_idx) = crate::cdc_ncm::try_bind_ncm_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await {
+        if let Ok(_idx) =
+            crate::cdc_ncm::try_bind_ncm_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        {
             return AttachOutcome::NetworkClass;
         }
         // USB Bluetooth HCI — class 0xE0 / subclass 0x01 / proto 0x01.
         // `find_bt_endpoints` walks the config blob; if no matching
         // interface is present it returns NotBluetooth and we fall
         // through to the unknown-class log.
-        if crate::btusb::try_bind_btusb_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await.is_ok() {
+        if crate::btusb::try_bind_btusb_already_addressed(xhci_dev, slot_id, &cfg_blob)
+            .await
+            .is_ok()
+        {
             return AttachOutcome::Bluetooth;
         }
         // Explicit USB-ID fingerprint match — Synaptics, Goodix, ELAN.
@@ -600,16 +606,20 @@ async fn dispatch_after_address(
         if fingerprint::classify_vid_pid(dev_vid, dev_pid).is_some() {
             if fingerprint::try_bind_fingerprint_already_addressed(
                 xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
-            ).await.is_ok() {
+            )
+            .await
+            .is_ok()
+            {
                 return AttachOutcome::Fingerprint;
             }
         }
         // USB CCID smart-card reader — class 0x0B / subclass 0x00 /
         // protocol 0x00. `find_ccid_interface` walks the config blob;
         // returns NotCcid if not present.
-        if crate::ccid::try_bind_ccid_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await.is_ok() {
+        if crate::ccid::try_bind_ccid_already_addressed(xhci_dev, slot_id, &cfg_blob)
+            .await
+            .is_ok()
+        {
             return AttachOutcome::CcidReader;
         }
         // WBDI fingerprint reader — Microsoft Biometric Device
@@ -618,9 +628,10 @@ async fn dispatch_after_address(
         // wire-up here is intentionally non-fatal: a positive WBDI
         // sniff records the device for a future userland driver
         // but doesn't seize the slot beyond logging.
-        if crate::wbdi::try_bind_wbdi_already_addressed(
-            xhci_dev, slot_id, &cfg_blob,
-        ).await.is_ok() {
+        if crate::wbdi::try_bind_wbdi_already_addressed(xhci_dev, slot_id, &cfg_blob)
+            .await
+            .is_ok()
+        {
             return AttachOutcome::WbdiFingerprint;
         }
     }
@@ -661,13 +672,19 @@ async fn dispatch_after_address(
 /// + interface + endpoint descriptors), or None on any error.
 async fn fetch_full_config(xhci_dev: &Xhci, slot_id: u8) -> Option<alloc::vec::Vec<u8>> {
     let mut head = [0u8; 9];
-    xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await.ok()?;
+    xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut head)
+        .await
+        .ok()?;
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
     if !(9..=4096).contains(&total) {
         return None;
     }
     let mut full = alloc::vec![0u8; total];
-    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await.ok()?;
+    let n = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut full)
+        .await
+        .ok()?;
     if n < total {
         full.truncate(n);
     }
@@ -682,7 +699,11 @@ async fn fetch_full_config(xhci_dev: &Xhci, slot_id: u8) -> Option<alloc::vec::V
 async fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
     use core::fmt::Write as _;
     let mut head = [0u8; 9];
-    if xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await.is_err() {
+    if xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut head)
+        .await
+        .is_err()
+    {
         return;
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
@@ -728,7 +749,12 @@ async fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
             let _ = writeln!(
                 narf_console::Writer,
                 "  usb-attach: port={} slot={} unknown class {:02x}/{:02x}/{:02x} ({})",
-                port, slot_id, cls, sub, prot, s
+                port,
+                slot_id,
+                cls,
+                sub,
+                prot,
+                s
             );
         }
         i += len;

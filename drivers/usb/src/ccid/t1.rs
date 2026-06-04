@@ -26,8 +26,8 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use super::CcidError;
+use alloc::vec::Vec;
 
 // ── PCB block-type masks (ISO 7816-3 §11.3.2 Table 16) ───────────────
 
@@ -59,19 +59,19 @@ pub const PCB_RBLOCK_ERR2: u8 = 0x02;
 // ── S-block PCB values (ISO 7816-3 §11.3.2 Table 16) ─────────────────
 
 /// S(IFS request): reader requests an interface-device frame size change.
-pub const PCB_SBLOCK_IFS_REQ:    u8 = 0xC1;
+pub const PCB_SBLOCK_IFS_REQ: u8 = 0xC1;
 /// S(IFS response): card acknowledges the IFS change.
-pub const PCB_SBLOCK_IFS_RESP:   u8 = 0xE1;
+pub const PCB_SBLOCK_IFS_RESP: u8 = 0xE1;
 /// S(ABORT request): reader requests protocol abort.
-pub const PCB_SBLOCK_ABORT_REQ:  u8 = 0xC2;
+pub const PCB_SBLOCK_ABORT_REQ: u8 = 0xC2;
 /// S(ABORT response): card acknowledges the abort.
 pub const PCB_SBLOCK_ABORT_RESP: u8 = 0xE2;
 /// S(WTX request): card requests a waiting-time extension.
-pub const PCB_SBLOCK_WTX_REQ:    u8 = 0xC3;
+pub const PCB_SBLOCK_WTX_REQ: u8 = 0xC3;
 /// S(WTX response): reader grants the waiting-time extension.
-pub const PCB_SBLOCK_WTX_RESP:   u8 = 0xE3;
+pub const PCB_SBLOCK_WTX_RESP: u8 = 0xE3;
 /// S(RESYNCH request): reader requests link re-synchronisation.
-pub const PCB_SBLOCK_RESYNCH_REQ:  u8 = 0xC0;
+pub const PCB_SBLOCK_RESYNCH_REQ: u8 = 0xC0;
 /// S(RESYNCH response): card acknowledges re-synchronisation.
 pub const PCB_SBLOCK_RESYNCH_RESP: u8 = 0xE0;
 
@@ -105,8 +105,7 @@ impl T1Block {
     /// `ns` is the sender's sequence number (0 or 1). The PCB has
     /// bit 7 = 0, bit 6 = N(S), bit 5 = 0 (no chaining).
     pub fn i_block(ns: u8, apdu_chunk: &[u8]) -> Self {
-        let pcb = PCB_IBLOCK_MASK
-            | if ns & 1 != 0 { PCB_IBLOCK_NS_BIT } else { 0 };
+        let pcb = PCB_IBLOCK_MASK | if ns & 1 != 0 { PCB_IBLOCK_NS_BIT } else { 0 };
         Self {
             nad: NAD_DEFAULT,
             pcb,
@@ -118,9 +117,12 @@ impl T1Block {
     ///
     /// Used to acknowledge a correctly-received I-block or as a resend request.
     pub fn r_block_ack(nr: u8) -> Self {
-        let pcb = PCB_RBLOCK_BASE
-            | if nr & 1 != 0 { PCB_RBLOCK_NR_BIT } else { 0 };
-        Self { nad: NAD_DEFAULT, pcb, inf: Vec::new() }
+        let pcb = PCB_RBLOCK_BASE | if nr & 1 != 0 { PCB_RBLOCK_NR_BIT } else { 0 };
+        Self {
+            nad: NAD_DEFAULT,
+            pcb,
+            inf: Vec::new(),
+        }
     }
 
     /// Build an R-block NAK (parity or other error detected, ISO §11.6.2.2).
@@ -128,10 +130,13 @@ impl T1Block {
     /// `nr` is the sequence number of the expected next I-block.
     /// Error bit 1 is set per §11.3.2 Table 16 footnote.
     pub fn r_block_nak(nr: u8) -> Self {
-        let pcb = PCB_RBLOCK_BASE
-            | if nr & 1 != 0 { PCB_RBLOCK_NR_BIT } else { 0 }
-            | PCB_RBLOCK_ERR1;
-        Self { nad: NAD_DEFAULT, pcb, inf: Vec::new() }
+        let pcb =
+            PCB_RBLOCK_BASE | if nr & 1 != 0 { PCB_RBLOCK_NR_BIT } else { 0 } | PCB_RBLOCK_ERR1;
+        Self {
+            nad: NAD_DEFAULT,
+            pcb,
+            inf: Vec::new(),
+        }
     }
 
     /// Build an S(IFS request) block: ask the card to accept frame size `ifsd`
@@ -155,7 +160,11 @@ impl T1Block {
 
     /// Build an S(ABORT request) block (ISO 7816-3 §11.6.3.3).
     pub fn s_abort_request() -> Self {
-        Self { nad: NAD_DEFAULT, pcb: PCB_SBLOCK_ABORT_REQ, inf: Vec::new() }
+        Self {
+            nad: NAD_DEFAULT,
+            pcb: PCB_SBLOCK_ABORT_REQ,
+            inf: Vec::new(),
+        }
     }
 
     /// Build an S(WTX response) block: reader acknowledges a waiting-time
@@ -171,7 +180,11 @@ impl T1Block {
 
     /// Build an S(RESYNCH request) block (ISO 7816-3 §11.6.3.4).
     pub fn s_resynch_request() -> Self {
-        Self { nad: NAD_DEFAULT, pcb: PCB_SBLOCK_RESYNCH_REQ, inf: Vec::new() }
+        Self {
+            nad: NAD_DEFAULT,
+            pcb: PCB_SBLOCK_RESYNCH_REQ,
+            inf: Vec::new(),
+        }
     }
 
     // ── Encoding ────────────────────────────────────────────────────
@@ -252,12 +265,20 @@ impl T1Block {
 
     /// For I-blocks: returns N(S) (bit 6 of PCB) as 0 or 1.
     pub fn ns(&self) -> u8 {
-        if self.pcb & PCB_IBLOCK_NS_BIT != 0 { 1 } else { 0 }
+        if self.pcb & PCB_IBLOCK_NS_BIT != 0 {
+            1
+        } else {
+            0
+        }
     }
 
     /// For R-blocks: returns N(R) (bit 4 of PCB) as 0 or 1.
     pub fn nr(&self) -> u8 {
-        if self.pcb & PCB_RBLOCK_NR_BIT != 0 { 1 } else { 0 }
+        if self.pcb & PCB_RBLOCK_NR_BIT != 0 {
+            1
+        } else {
+            0
+        }
     }
 
     /// For R-blocks: returns `true` if an error is indicated
@@ -427,7 +448,7 @@ mod tests {
         assert_eq!(block.inf, &[0xFE]);
         let wire = block.encode().unwrap();
         assert_eq!(wire[1], 0xC1, "S(IFS req) PCB = 0xC1");
-        assert_eq!(wire[2], 1,    "LEN = 1");
+        assert_eq!(wire[2], 1, "LEN = 1");
         assert_eq!(wire[3], 0xFE, "INF = IFSD value");
         assert_eq!(lrc_check(&wire), 0x00);
     }

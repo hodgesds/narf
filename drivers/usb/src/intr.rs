@@ -29,11 +29,7 @@ pub fn arm(dev: &USBDevice, ep_addr: u8, len: u32) -> Result<u64, UsbError> {
 /// Non-blocking drain. Returns `Ok(Some(n))` if the controller has
 /// reported a completed transfer of `n` bytes into `out`; `Ok(None)`
 /// if no event has been demuxed for this endpoint yet.
-pub fn poll(
-    dev: &USBDevice,
-    ep_addr: u8,
-    out: &mut [u8],
-) -> Result<Option<usize>, UsbError> {
+pub fn poll(dev: &USBDevice, ep_addr: u8, out: &mut [u8]) -> Result<Option<usize>, UsbError> {
     dev.poll_interrupt_in(dci_for(ep_addr), out)
 }
 

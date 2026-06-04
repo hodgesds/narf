@@ -215,10 +215,8 @@ const Q_FN_ISO: AppleQuirks = AppleQuirks::HAS_FN.union(AppleQuirks::ISO_TILDE_Q
 const Q_FN_JIS: AppleQuirks = AppleQuirks::HAS_FN.union(AppleQuirks::RDESC_JIS);
 const Q_NUM_FN_ISO: AppleQuirks = Q_NUM_FN.union(AppleQuirks::ISO_TILDE_QUIRK);
 const Q_NUM_FN_JIS: AppleQuirks = Q_NUM_FN.union(AppleQuirks::RDESC_JIS);
-const Q_MK_USB: AppleQuirks =
-    Q_FN_ISO.union(AppleQuirks::RDESC_BATTERY);
-const Q_TB_FN: AppleQuirks = Q_FN_ISO
-    .union(AppleQuirks::BACKLIGHT_CTL);
+const Q_MK_USB: AppleQuirks = Q_FN_ISO.union(AppleQuirks::RDESC_BATTERY);
+const Q_TB_FN: AppleQuirks = Q_FN_ISO.union(AppleQuirks::BACKLIGHT_CTL);
 const Q_TB_FN_DIS: AppleQuirks = Q_TB_FN.union(AppleQuirks::DISABLE_FKEYS);
 
 /// Full device-match table — covers every Apple HID device the Linux
@@ -227,9 +225,10 @@ const Q_TB_FN_DIS: AppleQuirks = Q_TB_FN.union(AppleQuirks::DISABLE_FKEYS);
 /// this table.
 pub const APPLE_DEVICES: &[AppleDeviceId] = &[
     // Mighty Mouse — bus mouse, no Fn.
-    usb(USB_DEVICE_ID_APPLE_MIGHTYMOUSE,
-        AppleQuirks::MIGHTYMOUSE.union(AppleQuirks::INVERT_HWHEEL)),
-
+    usb(
+        USB_DEVICE_ID_APPLE_MIGHTYMOUSE,
+        AppleQuirks::MIGHTYMOUSE.union(AppleQuirks::INVERT_HWHEEL),
+    ),
     // Fountain / Geyser internal laptop kbds — first-gen Wellspring.
     usb(USB_DEVICE_ID_APPLE_FOUNTAIN_ANSI, Q_NUM_FN),
     usb(USB_DEVICE_ID_APPLE_FOUNTAIN_ISO, Q_NUM_FN),
@@ -242,7 +241,6 @@ pub const APPLE_DEVICES: &[AppleDeviceId] = &[
     usb(USB_DEVICE_ID_APPLE_GEYSER4_ANSI, Q_NUM_FN),
     usb(USB_DEVICE_ID_APPLE_GEYSER4_ISO, Q_NUM_FN_ISO),
     usb(USB_DEVICE_ID_APPLE_GEYSER4_JIS, Q_NUM_FN_JIS),
-
     // Aluminium standalone (USB & BT).
     usb(USB_DEVICE_ID_APPLE_ALU_MINI_ANSI, Q_FN),
     usb(USB_DEVICE_ID_APPLE_ALU_MINI_ISO, Q_FN),
@@ -255,7 +253,6 @@ pub const APPLE_DEVICES: &[AppleDeviceId] = &[
     usb(USB_DEVICE_ID_APPLE_ALU_REVB_ISO, Q_FN),
     bt_usbvid(USB_DEVICE_ID_APPLE_ALU_REVB_ISO, Q_FN),
     usb(USB_DEVICE_ID_APPLE_ALU_REVB_JIS, Q_FN),
-
     // Wireless aluminium (Bluetooth).
     bt_usbvid(USB_DEVICE_ID_APPLE_ALU_WIRELESS_ANSI, Q_NUM_FN),
     bt_usbvid(USB_DEVICE_ID_APPLE_ALU_WIRELESS_ISO, Q_NUM_FN_ISO),
@@ -263,7 +260,6 @@ pub const APPLE_DEVICES: &[AppleDeviceId] = &[
     bt_usbvid(USB_DEVICE_ID_APPLE_ALU_WIRELESS_2009_ISO, Q_NUM_FN_ISO),
     bt_usbvid(USB_DEVICE_ID_APPLE_ALU_WIRELESS_2011_ANSI, Q_NUM_FN),
     bt_usbvid(USB_DEVICE_ID_APPLE_ALU_WIRELESS_2011_ISO, Q_NUM_FN_ISO),
-
     // Magic Keyboards (USB + Bluetooth).
     usb(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2015, Q_MK_USB),
     bt(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2015, Q_FN_ISO),
@@ -271,11 +267,13 @@ pub const APPLE_DEVICES: &[AppleDeviceId] = &[
     bt(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2015, Q_FN_ISO),
     usb(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021, Q_MK_USB),
     bt(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021, Q_FN_ISO),
-    usb(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2021, Q_MK_USB),
+    usb(
+        USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2021,
+        Q_MK_USB,
+    ),
     usb(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2021, Q_MK_USB),
     usb(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2024, Q_MK_USB),
     usb(USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2024, Q_MK_USB),
-
     // Wellspring (MacBook Pro internal) — generations 1..9 + T2.
     usb(USB_DEVICE_ID_APPLE_WELLSPRING_ANSI, Q_FN),
     usb(USB_DEVICE_ID_APPLE_WELLSPRING2_ANSI, Q_FN),
@@ -290,19 +288,29 @@ pub const APPLE_DEVICES: &[AppleDeviceId] = &[
     usb(USB_DEVICE_ID_APPLE_WELLSPRINGT2_J132, Q_TB_FN_DIS),
     usb(USB_DEVICE_ID_APPLE_WELLSPRINGT2_J680, Q_TB_FN_DIS),
     usb(USB_DEVICE_ID_APPLE_WELLSPRINGT2_J213, Q_TB_FN_DIS),
-    usb(USB_DEVICE_ID_APPLE_WELLSPRINGT2_J214K, Q_FN_ISO.union(AppleQuirks::DISABLE_FKEYS)),
-    usb(USB_DEVICE_ID_APPLE_WELLSPRINGT2_J223, Q_FN_ISO.union(AppleQuirks::DISABLE_FKEYS)),
-
+    usb(
+        USB_DEVICE_ID_APPLE_WELLSPRINGT2_J214K,
+        Q_FN_ISO.union(AppleQuirks::DISABLE_FKEYS),
+    ),
+    usb(
+        USB_DEVICE_ID_APPLE_WELLSPRINGT2_J223,
+        Q_FN_ISO.union(AppleQuirks::DISABLE_FKEYS),
+    ),
     // Touch surfaces.
     usb(USB_DEVICE_ID_APPLE_MAGICMOUSE, AppleQuirks::empty()),
     usb(USB_DEVICE_ID_APPLE_MAGICMOUSE2, AppleQuirks::empty()),
     usb(USB_DEVICE_ID_APPLE_MAGICMOUSE2_USBC, AppleQuirks::empty()),
     usb(USB_DEVICE_ID_APPLE_MAGICTRACKPAD, AppleQuirks::empty()),
     usb(USB_DEVICE_ID_APPLE_MAGICTRACKPAD2, AppleQuirks::empty()),
-    usb(USB_DEVICE_ID_APPLE_MAGICTRACKPAD2_USBC, AppleQuirks::empty()),
-
+    usb(
+        USB_DEVICE_ID_APPLE_MAGICTRACKPAD2_USBC,
+        AppleQuirks::empty(),
+    ),
     // Touch Bar backlight. Deferred — registered for ID only.
-    usb(USB_DEVICE_ID_APPLE_TOUCHBAR_BACKLIGHT, AppleQuirks::MAGIC_BACKLIGHT),
+    usb(
+        USB_DEVICE_ID_APPLE_TOUCHBAR_BACKLIGHT,
+        AppleQuirks::MAGIC_BACKLIGHT,
+    ),
 ];
 
 /// Look up the device-table row for a (vid, pid, bluetooth) triple.
@@ -376,7 +384,6 @@ pub const APPLE_FN_KEYS: &[FnRemap] = &[
     r_nav(KeyCode::Down, KeyCode::PageDown),
     r_nav(KeyCode::Left, KeyCode::Home),
     r_nav(KeyCode::Right, KeyCode::End),
-
     // F-key row — media when no Fn (default mode), raw F-key with Fn.
     r_fkey(KeyCode::F1, KeyCode::BrightnessDown),
     r_fkey(KeyCode::F2, KeyCode::BrightnessUp),
@@ -551,7 +558,11 @@ mod tests {
             return TestResult::Fail("apple device table too short");
         }
         // Magic Keyboard 2021 (USB) must exist with HAS_FN.
-        let mk = lookup(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021, false);
+        let mk = lookup(
+            USB_VENDOR_ID_APPLE,
+            USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021,
+            false,
+        );
         let row = match mk {
             Some(r) => r,
             None => return TestResult::Fail("Magic Keyboard 2021 missing"),
@@ -652,8 +663,7 @@ mod tests {
         //        contact: X=0x0100, Y=0x0080, size=0x40, id=0x03,
         //                 pressure=0x7F, status=0x80 (active)
         let report: &[u8] = &[
-            0x29, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x80, 0x00, 0x40, 0x03, 0x7F, 0x80,
+            0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00, 0x40, 0x03, 0x7F, 0x80,
         ];
         let mut touches = [MagicMouseTouch::default(); MAGICMOUSE_MAX_TOUCHES];
         let n = decode_magic_mouse_touches(report, &mut touches);
@@ -674,8 +684,7 @@ mod tests {
         }
         // Inactive contact (status bit 7 cleared) should be skipped.
         let report2: &[u8] = &[
-            0x29, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x80, 0x00, 0x40, 0x03, 0x7F, 0x00,
+            0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00, 0x40, 0x03, 0x7F, 0x00,
         ];
         let n = decode_magic_mouse_touches(report2, &mut touches);
         if n != 0 {
@@ -683,7 +692,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/hid/apple", smoke_apple_magic_mouse_touch_decode);
+    kernel_test_in!(
+        "drivers/usb/hid/apple",
+        smoke_apple_magic_mouse_touch_decode
+    );
 
     // ── Smoke 6: numpad equals ──
 

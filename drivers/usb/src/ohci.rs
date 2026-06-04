@@ -188,13 +188,13 @@ pub enum EdSpeed {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Ed {
-    pub fa: u8,        // bits [6:0] Function Address
-    pub en: u8,        // bits [10:7] Endpoint Number
-    pub dir: EdDir,    // bits [12:11]
-    pub speed: EdSpeed, // bit 13
-    pub skip: bool,    // bit 14
-    pub format_iso: bool, // bit 15: 0 = General TD, 1 = Iso TD
-    pub max_packet: u16, // bits [26:16]
+    pub fa: u8,            // bits [6:0] Function Address
+    pub en: u8,            // bits [10:7] Endpoint Number
+    pub dir: EdDir,        // bits [12:11]
+    pub speed: EdSpeed,    // bit 13
+    pub skip: bool,        // bit 14
+    pub format_iso: bool,  // bit 15: 0 = General TD, 1 = Iso TD
+    pub max_packet: u16,   // bits [26:16]
     pub tail_pointer: u32, // dword 1
     /// Head pointer (low 28 bits; bit 0 = Halted, bit 1 = Toggle
     /// Carry).
@@ -323,8 +323,8 @@ pub struct GeneralTd {
     /// Delay Interrupt, bits [23:21]. 7 = no interrupt, 0 = next
     /// frame.
     pub delay_interrupt: u8,
-    pub data_toggle: u8,       // bits [25:24]
-    pub error_count: u8,       // bits [27:26]
+    pub data_toggle: u8,                // bits [25:24]
+    pub error_count: u8,                // bits [27:26]
     pub condition_code: CompletionCode, // bits [31:28]
     pub current_buffer_pointer: u32,
     pub next_td: u32,
@@ -414,12 +414,10 @@ pub fn hcca_interrupt_eds(blob: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::with_capacity(HCCA_INTERRUPT_TABLE_ENTRIES);
     for i in 0..HCCA_INTERRUPT_TABLE_ENTRIES {
         let off = hcca::INTERRUPT_TABLE_OFFSET + i * 4;
-        out.push(u32::from_le_bytes([
-            blob[off],
-            blob[off + 1],
-            blob[off + 2],
-            blob[off + 3],
-        ]) & 0xFFFF_FFF0);
+        out.push(
+            u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]])
+                & 0xFFFF_FFF0,
+        );
     }
     Some(out)
 }
@@ -460,10 +458,7 @@ pub fn probe(
     let class = ((device.id.class >> 16) & 0xFF) as u8;
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     let prog_if = (device.id.class & 0xFF) as u8;
-    if class != PCI_CLASS_SERIAL_BUS
-        || subclass != PCI_SUBCLASS_USB
-        || prog_if != PCI_PROGIF_OHCI
-    {
+    if class != PCI_CLASS_SERIAL_BUS || subclass != PCI_SUBCLASS_USB || prog_if != PCI_PROGIF_OHCI {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     let _ = narf_bus::pci::set_command(
@@ -482,7 +477,9 @@ pub fn probe(
             let _ = writeln!(
                 narf_console::Writer,
                 "  ohci: BAR{} map failed for {:04x}:{:04x}",
-                OHCI_BAR_INDEX, device.id.vendor, device.id.device
+                OHCI_BAR_INDEX,
+                device.id.vendor,
+                device.id.device
             );
             return Err(narf_bus::ProbeError::BadDevice);
         }

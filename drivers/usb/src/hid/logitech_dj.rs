@@ -70,24 +70,56 @@ pub const USB_DEVICE_ID_LOGITECH_BOLT_RECEIVER: u16 = 0xc548;
 /// `hid-logitech-dj.c` claims (see `logi_dj_receivers` at the
 /// bottom of that file). Mirrors `hid-ids.h:929..941`.
 pub const LOGITECH_RECEIVERS: &[(u16, u16)] = &[
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_27MHZ_MOUSE_RECEIVER),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_UNIFYING_RECEIVER),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_27MHZ_MOUSE_RECEIVER,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_UNIFYING_RECEIVER,
+    ),
     (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER),
     (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G700_RECEIVER),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_UNIFYING_RECEIVER_2),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_2),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_1),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_2),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_3),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_4),
-    (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_POWERPLAY),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_UNIFYING_RECEIVER_2,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_2,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_1,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_2,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_3,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_LIGHTSPEED_1_4,
+    ),
+    (
+        USB_VENDOR_ID_LOGITECH,
+        USB_DEVICE_ID_LOGITECH_NANO_RECEIVER_POWERPLAY,
+    ),
     (USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_BOLT_RECEIVER),
 ];
 
 /// `true` when (vid, pid) is one of the receivers we claim.
 pub fn is_receiver(vid: u16, pid: u16) -> bool {
-    LOGITECH_RECEIVERS.iter().any(|&(v, p)| v == vid && p == pid)
+    LOGITECH_RECEIVERS
+        .iter()
+        .any(|&(v, p)| v == vid && p == pid)
 }
 
 // ── DJ protocol constants (mirrors hid-logitech-dj.c:19..113) ─────
@@ -348,7 +380,11 @@ impl DjReceiver {
             return None;
         }
         let v = self.slots[idx as usize].load(Ordering::Acquire);
-        if v == 0 { None } else { Some(v) }
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     /// Apply a pair / unpair event to the slot table.
@@ -393,7 +429,10 @@ mod tests {
     // ── Smoke 1: receiver match table ──
 
     fn smoke_dj_receiver_match() -> TestResult {
-        if !is_receiver(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_UNIFYING_RECEIVER) {
+        if !is_receiver(
+            USB_VENDOR_ID_LOGITECH,
+            USB_DEVICE_ID_LOGITECH_UNIFYING_RECEIVER,
+        ) {
             return TestResult::Fail("Unifying receiver should match");
         }
         if !is_receiver(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_BOLT_RECEIVER) {
@@ -489,7 +528,12 @@ mod tests {
         }
         // Demux of receiver index returns None (it's a notification,
         // not a forwarded input report).
-        let recv_report: &[u8] = &[REPORT_ID_DJ_SHORT, DJ_RECEIVER_INDEX, REPORT_TYPE_NOTIF_DEVICE_PAIRED, 0];
+        let recv_report: &[u8] = &[
+            REPORT_ID_DJ_SHORT,
+            DJ_RECEIVER_INDEX,
+            REPORT_TYPE_NOTIF_DEVICE_PAIRED,
+            0,
+        ];
         if recv.demux(recv_report).is_some() {
             return TestResult::Fail("receiver-targeted report should not demux");
         }
@@ -507,7 +551,10 @@ mod tests {
             5, // device index
             REPORT_TYPE_NOTIF_DEVICE_PAIRED,
             // payload: SPFUNCTION, eQuad LSB/MSB, RF type
-            0x00, 0x12, 0xAB, REPORT_TYPE_KEYBOARD,
+            0x00,
+            0x12,
+            0xAB,
+            REPORT_TYPE_KEYBOARD,
         ];
         let ev = match decode_pair_notification(report) {
             Ok(e) => e,

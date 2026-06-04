@@ -57,11 +57,11 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
-use alloc::sync::Arc;
 use narf_lib::sync::IrqSafeSpinLock;
 
 // Spec-aligned submodules. These factor out the register-field decode,
@@ -291,15 +291,15 @@ impl Topology {
     /// matter when stepping LS/FS through an HS hub). Callers that
     /// know they're addressing an LS/FS device should override
     /// those fields manually.
-    pub const fn for_downstream(
-        parent_route: u32,
-        parent_tier: u32,
-        hub_port: u8,
-    ) -> Self {
+    pub const fn for_downstream(parent_route: u32, parent_tier: u32, hub_port: u8) -> Self {
         // Append `hub_port` to the next 4-bit nibble. xHCI clamps
         // the route string at 20 bits (5 hubs); ports >15 must be
         // encoded as 15 per §4.5.2.
-        let port4 = if hub_port > 15 { 15u32 } else { hub_port as u32 };
+        let port4 = if hub_port > 15 {
+            15u32
+        } else {
+            hub_port as u32
+        };
         let shift = parent_tier * 4;
         let route = parent_route | ((port4 & 0xF) << shift);
         Self {
@@ -1277,9 +1277,7 @@ impl Xhci {
         // (the bit is RO-as-set). Mask off the change-status
         // (RW1C) bits so we don't accidentally clear them.
         for port in 1..=max_ports {
-            let port_off = op_off
-                + OP_PORTSC_BASE
-                + ((port as u64 - 1) * PORT_REGS_STRIDE);
+            let port_off = op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
             // SAFETY: identity-mapped MMIO; port range bounded by
             // HCSPARAMS1.MaxPorts.
             let cur = unsafe { mmio.read32(port_off) };
@@ -1312,9 +1310,7 @@ impl Xhci {
         let _ = narf_scheduler::responsive_spin_until(
             || {
                 for port in 1..=max_ports {
-                    let port_off = op_off
-                        + OP_PORTSC_BASE
-                        + ((port as u64 - 1) * PORT_REGS_STRIDE);
+                    let port_off = op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
                     // SAFETY: identity-mapped MMIO; port range
                     // bounded by HCSPARAMS1.MaxPorts.
                     let v = unsafe { mmio.read32(port_off) };
@@ -1335,9 +1331,7 @@ impl Xhci {
         use core::fmt::Write as _;
         let mut connected = 0u32;
         for port in 1..=max_ports {
-            let port_off = op_off
-                + OP_PORTSC_BASE
-                + ((port as u64 - 1) * PORT_REGS_STRIDE);
+            let port_off = op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
             // SAFETY: same — bounded by MaxPorts.
             let v = unsafe { mmio.read32(port_off) };
             let pp = (v & PORTSC_PP) != 0;
@@ -1407,7 +1401,11 @@ impl Xhci {
         // ERDP must point inside the segment. If the drain consumed
         // the whole segment, wrap to slot 0 — same path `poll_event`
         // takes when the SW dequeue cursor crosses the segment.
-        let erdp_slot = if drained_evs >= ER_SEG_TRBS { 0 } else { drained_evs };
+        let erdp_slot = if drained_evs >= ER_SEG_TRBS {
+            0
+        } else {
+            drained_evs
+        };
         let new_deq_phys = event_ring.phys_addr().raw() + (erdp_slot as u64) * 16;
         let ir0 = rtsoff as u64 + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
@@ -1485,12 +1483,12 @@ impl Xhci {
             // wrap dequeue to 0 and flip CCS to match `poll_event`'s
             // wrap-toggle path; otherwise CCS stays 1 because the
             // drain only stops on the first cycle=0 slot.
-            er_ccs: IrqSafeSpinLock::new(
-                if drained_evs >= ER_SEG_TRBS { 0 } else { 1 },
-            ),
-            er_dequeue: IrqSafeSpinLock::new(
-                if drained_evs >= ER_SEG_TRBS { 0 } else { drained_evs },
-            ),
+            er_ccs: IrqSafeSpinLock::new(if drained_evs >= ER_SEG_TRBS { 0 } else { 1 }),
+            er_dequeue: IrqSafeSpinLock::new(if drained_evs >= ER_SEG_TRBS {
+                0
+            } else {
+                drained_evs
+            }),
             devices: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             // Pre-allocate to MAX_DEPTH (64) so the ISR's
             // `push_back` from `demux_one_event` never grows the
@@ -1500,12 +1498,8 @@ impl Xhci {
             // demux_one_event (line 1814: `if g.len() >= MAX_DEPTH
             // { pop_front; }`). Future events recycle slots
             // without ever realloc'ing.
-            cmd_events: IrqSafeSpinLock::new(
-                alloc::collections::VecDeque::with_capacity(64),
-            ),
-            transfer_events: IrqSafeSpinLock::new(
-                alloc::collections::VecDeque::with_capacity(64),
-            ),
+            cmd_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
+            transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
             running: true,
             msix,
@@ -1561,10 +1555,7 @@ impl Xhci {
     /// done by the supervisor pump task awaiting `wait_for_irq`.
     /// Returns the allocated vector, or None on any failure.
     #[cfg(target_arch = "x86_64")]
-    fn try_install_intx(
-        cap: &Cap<BusDeviceCap, Write>,
-        device: &BusDevice,
-    ) -> Option<u8> {
+    fn try_install_intx(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Option<u8> {
         let pin = narf_bus::pci::read_intx_pin(cap, device).ok()?;
         if pin == 0 || pin > 4 {
             return None; // device doesn't drive an INTx line
@@ -1609,10 +1600,7 @@ impl Xhci {
         Some(v)
     }
     #[cfg(not(target_arch = "x86_64"))]
-    fn try_install_intx(
-        _cap: &Cap<BusDeviceCap, Write>,
-        _device: &BusDevice,
-    ) -> Option<u8> {
+    fn try_install_intx(_cap: &Cap<BusDeviceCap, Write>, _device: &BusDevice) -> Option<u8> {
         None
     }
 
@@ -1640,7 +1628,11 @@ impl Xhci {
     /// form pads the upper half with reserved zeros.
     #[inline]
     fn context_stride(&self) -> u64 {
-        if self.csz_64byte { 0x40 } else { 0x20 }
+        if self.csz_64byte {
+            0x40
+        } else {
+            0x20
+        }
     }
     pub fn is_running(&self) -> bool {
         self.running
@@ -1792,10 +1784,7 @@ impl Xhci {
         // Assert PR + keep PP. Mask RW1C change bits to 0 so this
         // write doesn't accidentally clear them, and skip PED
         // (RW1C, leave 0).
-        let to_write = (cur & !PORTSC_CHG_MASK)
-            & !PORTSC_PED
-            | PORTSC_PR
-            | PORTSC_PP;
+        let to_write = (cur & !PORTSC_CHG_MASK) & !PORTSC_PED | PORTSC_PR | PORTSC_PP;
         // SAFETY: same.
         unsafe {
             self.mmio.write32(off, to_write);
@@ -1820,10 +1809,7 @@ impl Xhci {
                 // which W1Cs every change bit it observes set). PEC
                 // gets the same treatment in case the port toggled
                 // PED across the reset.
-                let ack = (v & !PORTSC_CHG_MASK)
-                    | PORTSC_PRC
-                    | PORTSC_CSC
-                    | PORTSC_PEC;
+                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_PRC | PORTSC_CSC | PORTSC_PEC;
                 // SAFETY: same.
                 unsafe {
                     self.mmio.write32(off, ack);
@@ -2112,7 +2098,9 @@ impl Xhci {
         self.submit_command(0, 0, 0, trb_type)?;
         // Wait for a Command Completion Event (§6.4.2.2).
         let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type).await?;
+        let ev = self
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)
+            .await?;
         // CCE layout (§6.4.2.2):
         //   dword0..1 = command-TRB phys addr
         //   dword2[31:24] = completion code
@@ -2143,7 +2131,9 @@ impl Xhci {
         let d3 = trb_type | ((slot_id as u32) << 24);
         self.submit_command(0, 0, 0, d3)?;
         let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type).await?;
+        let ev = self
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -2177,8 +2167,14 @@ impl Xhci {
     /// transits). Equivalent to `address_device_with(slot_id, port,
     /// speed, Topology::ROOT)` — for devices reached through one or
     /// more USB hubs use `address_device_with` directly.
-    pub async fn address_device(&self, slot_id: u8, port: u8, speed: PortSpeed) -> Result<u8, XhciError> {
-        self.address_device_with(slot_id, port, speed, Topology::ROOT).await
+    pub async fn address_device(
+        &self,
+        slot_id: u8,
+        port: u8,
+        speed: PortSpeed,
+    ) -> Result<u8, XhciError> {
+        self.address_device_with(slot_id, port, speed, Topology::ROOT)
+            .await
     }
 
     /// Issue the Address Device command (§4.6.5) for `slot_id`,
@@ -2216,7 +2212,8 @@ impl Xhci {
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let dev_ctx = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let ctrl_tr = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let ctrl_data = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
+        let ctrl_data =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
 
         let input_phys = input.phys_addr().raw();
         let dev_ctx_phys = dev_ctx.phys_addr().raw();
@@ -2231,7 +2228,10 @@ impl Xhci {
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
             core::ptr::write_volatile(ctrl_link_addr as *mut u32, ctrl_tr_phys as u32);
-            core::ptr::write_volatile((ctrl_link_addr + 4) as *mut u32, (ctrl_tr_phys >> 32) as u32);
+            core::ptr::write_volatile(
+                (ctrl_link_addr + 4) as *mut u32,
+                (ctrl_tr_phys >> 32) as u32,
+            );
             core::ptr::write_volatile((ctrl_link_addr + 8) as *mut u32, 0);
             core::ptr::write_volatile((ctrl_link_addr + 12) as *mut u32, ctrl_link_d3);
         }
@@ -2275,8 +2275,8 @@ impl Xhci {
         let input_ctrl = input_phys; // always at offset 0
         let slot_ctx = input_phys + cs; // immediately after Input Control
         let ep0_ctx = input_phys + cs * 2; // EP0 = DCI 1, indexed from Slot
-                                            // Equivalent computation is `input_phys
-                                            // + cs + cs * dci` with dci=1.
+                                           // Equivalent computation is `input_phys
+                                           // + cs + cs * dci` with dci=1.
 
         // Input Control Context — A0 (Slot) + A1 (EP0).
         // SAFETY: identity-mapped DMA; offsets in-page.
@@ -2313,8 +2313,8 @@ impl Xhci {
                     | (topology.route_string & 0x000F_FFFF); // Route String
         let slot_d1 = (port as u32) << 16; // Root Hub Port Number
         let slot_d2 = (topology.parent_hub_slot_id as u32)
-                    | ((topology.parent_hub_port as u32) << 8)
-                    | ((topology.tt_think_time as u32 & 0x3) << 16);
+            | ((topology.parent_hub_port as u32) << 8)
+            | ((topology.tt_think_time as u32 & 0x3) << 16);
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
@@ -2549,9 +2549,7 @@ impl Xhci {
         // spec — the controller only consumes the MPS field for this
         // command. Keep the EP-Type/Error-Count bits set so an xHC
         // that requires a fully-formed EP context is still happy.
-        let ep0_d1 = (3 << 1)
-                   | (4 << 3)
-                   | ((new_mps as u32) << 16);
+        let ep0_d1 = (3 << 1) | (4 << 3) | ((new_mps as u32) << 16);
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile((ep0_ctx + 4) as *mut u32, ep0_d1);
@@ -2839,8 +2837,7 @@ impl Xhci {
         // ── Status Stage TRB ──────────────────────────────────────
         // For an OUT data stage, status stage is IN (DIR=1). For
         // NO_DATA the status stage is also IN.
-        let status_d3 =
-            (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_DIR_IN | TRB_IOC;
+        let status_d3 = (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_DIR_IN | TRB_IOC;
         self.ctrl_enqueue(slot_id, 0, 0, 0, status_d3)?;
 
         self.ring_slot_doorbell(slot_id, DCI_CONTROL_EP);
@@ -2868,14 +2865,16 @@ impl Xhci {
     /// pulls VID/DID etc. out of fixed offsets.
     pub async fn get_device_descriptor(&self, slot_id: u8) -> Result<[u8; 18], XhciError> {
         let mut buf = [0u8; 18];
-        let n = self.control_in(
-            slot_id,
-            0x80,                               // bmRequestType: IN, Standard, Device
-            USB_REQ_GET_DESCRIPTOR,             // bRequest
-            (USB_DESC_TYPE_DEVICE as u16) << 8, // wValue: descriptor type | index
-            0,                                  // wIndex
-            &mut buf,
-        ).await?;
+        let n = self
+            .control_in(
+                slot_id,
+                0x80,                               // bmRequestType: IN, Standard, Device
+                USB_REQ_GET_DESCRIPTOR,             // bRequest
+                (USB_DESC_TYPE_DEVICE as u16) << 8, // wValue: descriptor type | index
+                0,                                  // wIndex
+                &mut buf,
+            )
+            .await?;
         if n < 8 {
             return Err(XhciError::CmdFailed(0xFB));
         }
@@ -2924,7 +2923,8 @@ impl Xhci {
             w_value,
             0,
             out,
-        ).await
+        )
+        .await
     }
 
     /// Issue Configure Endpoint (§4.6.6) for `slot_id`, programming
@@ -2997,7 +2997,7 @@ impl Xhci {
             let link_trb_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
             let link_addr = tr_phys + link_trb_off;
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC; // TC=1, cycle=0
-            // SAFETY: identity-mapped DMA, offset checked.
+                                                                      // SAFETY: identity-mapped DMA, offset checked.
             unsafe {
                 core::ptr::write_volatile(link_addr as *mut u32, tr_phys as u32);
                 core::ptr::write_volatile((link_addr + 4) as *mut u32, (tr_phys >> 32) as u32);
@@ -3153,8 +3153,7 @@ impl Xhci {
             // subsequent wraps need fresh cycle bits).
             let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
             let link_addr = ep.tr.phys_addr().raw() + link_off;
-            let link_d3 =
-                (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
+            let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
                 core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
@@ -3189,13 +3188,7 @@ impl Xhci {
     /// for a host-specified Frame ID. TBC/TLBPC stay 0 (single
     /// burst, single packet per burst) — enough for the bring-up
     /// targets that use 1-packet-per-bInterval (USB 2.0 full-speed).
-    fn ep_enqueue_isoch(
-        &self,
-        slot_id: u8,
-        dci: u8,
-        phys: u64,
-        len: u32,
-    ) -> Result<(), XhciError> {
+    fn ep_enqueue_isoch(&self, slot_id: u8, dci: u8, phys: u64, len: u32) -> Result<(), XhciError> {
         let mut g = self.devices.lock();
         let dev = g
             .get_mut(slot_id as usize)
@@ -3211,8 +3204,7 @@ impl Xhci {
         if ep.enq == CTRL_TR_TRBS - 1 {
             let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
             let link_addr = ep.tr.phys_addr().raw() + link_off;
-            let link_d3 =
-                (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
+            let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
                 core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
@@ -3230,10 +3222,7 @@ impl Xhci {
         //   bit 31 = SIA (Start Isochronous ASAP)
         // TBC (bits 7-8), TLBPC (bits 16-19), Frame ID (bits 20-30)
         // all stay 0.
-        let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT)
-            | TRB_IOC
-            | TRB_SIA
-            | (ep.pcs & TRB_CYCLE_BIT);
+        let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT) | TRB_IOC | TRB_SIA | (ep.pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
             core::ptr::write_volatile(trb_addr as *mut u32, phys as u32);
@@ -3277,11 +3266,13 @@ impl Xhci {
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let want_ep = (dci as u32) << 16;
-        let ev = self.await_event(|t| {
-            (t[3] & TRB_TYPE_MASK) == xfer
-                && (t[3] & 0xFF00_0000) == want_slot
-                && (t[3] & 0x001F_0000) == want_ep
-        }).await?;
+        let ev = self
+            .await_event(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            })
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         // CC 1 = Success; CC 13 = Short Packet (acceptable on iso
         // OUT — controller transmitted fewer bytes than requested
@@ -3314,11 +3305,13 @@ impl Xhci {
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let want_ep = (dci as u32) << 16;
-        let ev = self.await_event(|t| {
-            (t[3] & TRB_TYPE_MASK) == xfer
-                && (t[3] & 0xFF00_0000) == want_slot
-                && (t[3] & 0x001F_0000) == want_ep
-        }).await?;
+        let ev = self
+            .await_event(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            })
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 && ccode != 13 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3358,11 +3351,13 @@ impl Xhci {
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let want_ep = (dci as u32) << 16;
-        let ev = self.await_event(|t| {
-            (t[3] & TRB_TYPE_MASK) == xfer
-                && (t[3] & 0xFF00_0000) == want_slot
-                && (t[3] & 0x001F_0000) == want_ep
-        }).await?;
+        let ev = self
+            .await_event(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            })
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 && ccode != 13 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3506,11 +3501,13 @@ impl Xhci {
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let want_ep = (dci as u32) << 16;
-        let ev = self.await_event(|t| {
-            (t[3] & TRB_TYPE_MASK) == xfer
-                && (t[3] & 0xFF00_0000) == want_slot
-                && (t[3] & 0x001F_0000) == want_ep
-        }).await?;
+        let ev = self
+            .await_event(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            })
+            .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
@@ -3596,11 +3593,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Real D3 handling for xHCI also needs to save/restore the
     // Operational + Doorbell register windows, which the
     // current shape doesn't do — registered as best-effort.
-    narf_power::device_pm::register_device_pm(
-        "xhci0",
-        xhci_suspend_handler,
-        xhci_resume_handler,
-    );
+    narf_power::device_pm::register_device_pm("xhci0", xhci_suspend_handler, xhci_resume_handler);
     Ok(())
 }
 
@@ -3692,8 +3685,7 @@ pub fn register_pci_driver() {
 /// and IrqSafeSpinLock disables IF on the waiter — a status-panel
 /// paint that locks CONTROLLER freezes the entire CPU until the
 /// supervisor releases.
-pub static IS_PROBED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+pub static IS_PROBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn is_probed() -> bool {
     IS_PROBED.load(core::sync::atomic::Ordering::Acquire)
@@ -3711,8 +3703,7 @@ pub fn is_probed() -> bool {
 /// pause to expire. With the counter in place the supervisor can
 /// also `wake_by_ref` the cached waker (see `USB_SUPERVISOR_WAKER`)
 /// for an immediate re-poll.
-pub static USB_PSCE_EVENTS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static USB_PSCE_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Optional supervisor waker. The USB supervisor registers its
 /// `core::task::Waker` via [`register_supervisor_waker`]; the xHCI

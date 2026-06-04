@@ -66,12 +66,8 @@ impl CapabilityRegs {
         Some(Self {
             cap_length: mmio[0],
             hci_version: u16::from_le_bytes([mmio[2], mmio[3]]),
-            hcs_params: HcsParams(u32::from_le_bytes([
-                mmio[4], mmio[5], mmio[6], mmio[7],
-            ])),
-            hcc_params: HccParams(u32::from_le_bytes([
-                mmio[8], mmio[9], mmio[10], mmio[11],
-            ])),
+            hcs_params: HcsParams(u32::from_le_bytes([mmio[4], mmio[5], mmio[6], mmio[7]])),
+            hcc_params: HccParams(u32::from_le_bytes([mmio[8], mmio[9], mmio[10], mmio[11]])),
         })
     }
 }
@@ -243,9 +239,8 @@ impl PortSc {
     /// Port Owner: 0 = EHCI, 1 = companion (OHCI/UHCI).
     pub const PORT_OWNER: u32 = 1 << 13;
     /// Bits cleared by W1C masks.
-    pub const RWC_MASK: u32 = Self::CONNECT_STATUS_CHANGE
-        | Self::PORT_ENABLE_CHANGE
-        | Self::OVERCURRENT_CHANGE;
+    pub const RWC_MASK: u32 =
+        Self::CONNECT_STATUS_CHANGE | Self::PORT_ENABLE_CHANGE | Self::OVERCURRENT_CHANGE;
 
     pub fn connected(self) -> bool {
         self.0 & Self::CURRENT_CONNECT_STATUS != 0
@@ -442,11 +437,11 @@ pub struct QhEndpointInfo {
     /// Inactivate-on-Next-Transaction (bit 7) — periodic schedule
     /// only.
     pub inactivate: bool,
-    pub endpoint: u8,        // bits [11:8]
-    pub speed: Speed,        // bits [13:12]
+    pub endpoint: u8,           // bits [11:8]
+    pub speed: Speed,           // bits [13:12]
     pub data_toggle_ctrl: bool, // bit 14: 0=ignore in setup, 1=use DT from QTD
-    pub head_of_list: bool,  // bit 15: H=1 marks the reclaim head
-    pub max_packet: u16,     // bits [26:16]
+    pub head_of_list: bool,     // bit 15: H=1 marks the reclaim head
+    pub max_packet: u16,        // bits [26:16]
     /// Control endpoint flag (bit 27). For low/full-speed control
     /// endpoints the HC issues per-token PINGs.
     pub control_ep: bool,
@@ -571,9 +566,7 @@ pub fn synth_cap_block(
 /// qTDs and return references to each qTD whose status indicates
 /// completion. Demonstrates the reclamation iteration shape; doesn't
 /// actually consume MMIO.
-pub fn dump_completed_qtds(
-    qtd_blob: &[u8],
-) -> Vec<Qtd> {
+pub fn dump_completed_qtds(qtd_blob: &[u8]) -> Vec<Qtd> {
     let mut out = Vec::new();
     let mut off = 0;
     while off + 32 <= qtd_blob.len() {
@@ -620,10 +613,7 @@ pub fn probe(
     let class = ((device.id.class >> 16) & 0xFF) as u8;
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     let prog_if = (device.id.class & 0xFF) as u8;
-    if class != PCI_CLASS_SERIAL_BUS
-        || subclass != PCI_SUBCLASS_USB
-        || prog_if != PCI_PROGIF_EHCI
-    {
+    if class != PCI_CLASS_SERIAL_BUS || subclass != PCI_SUBCLASS_USB || prog_if != PCI_PROGIF_EHCI {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     // Bring the controller's MMIO + bus-master enable bits up so the
@@ -646,7 +636,9 @@ pub fn probe(
             let _ = writeln!(
                 narf_console::Writer,
                 "  ehci: BAR{} map failed for {:04x}:{:04x}",
-                EHCI_BAR_INDEX, device.id.vendor, device.id.device
+                EHCI_BAR_INDEX,
+                device.id.vendor,
+                device.id.device
             );
             return Err(narf_bus::ProbeError::BadDevice);
         }
@@ -675,7 +667,8 @@ pub fn probe(
         let _ = writeln!(
             narf_console::Writer,
             "  ehci: probed {:04x}:{:04x} (capreg decode failed)",
-            device.id.vendor, device.id.device
+            device.id.vendor,
+            device.id.device
         );
     }
     Err(narf_bus::ProbeError::Other("ehci: not implemented"))

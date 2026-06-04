@@ -512,5 +512,8 @@ pub mod tests {
         let _ = wv;
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/serial/ftdi", smoke_ftdi_bm_9600_wvalue_windex_channel0);
+    kernel_test_in!(
+        "drivers/usb/serial/ftdi",
+        smoke_ftdi_bm_9600_wvalue_windex_channel0
+    );
 }

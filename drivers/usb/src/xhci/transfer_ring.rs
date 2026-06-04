@@ -63,10 +63,8 @@ pub fn encode_normal(data_pa: u64, len: u32, ioc: bool, chain: bool, cycle: u32)
 pub fn encode_setup_stage(setup: [u8; 8], trt: u32, cycle: u32) -> Trb {
     let parameter = u64::from_le_bytes(setup);
     let status: u32 = 8;
-    let control = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT)
-        | TRB_IDT
-        | ((trt & 0x3) << 16)
-        | (cycle & 1);
+    let control =
+        (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT) | TRB_IDT | ((trt & 0x3) << 16) | (cycle & 1);
     Trb {
         parameter,
         status,
@@ -78,13 +76,7 @@ pub fn encode_setup_stage(setup: [u8; 8], trt: u32, cycle: u32) -> Trb {
 ///
 /// `dir_in` selects DIR=1 for IN (device-to-host data) or DIR=0 for
 /// OUT (host-to-device data).
-pub fn encode_data_stage(
-    data_pa: u64,
-    length: u32,
-    dir_in: bool,
-    ioc: bool,
-    cycle: u32,
-) -> Trb {
+pub fn encode_data_stage(data_pa: u64, length: u32, dir_in: bool, ioc: bool, cycle: u32) -> Trb {
     let status = length & 0x0001_FFFF;
     let mut control = (TRB_TYPE_DATA_STAGE << TRB_TYPE_SHIFT) | (cycle & 1);
     if dir_in {

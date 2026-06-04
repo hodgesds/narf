@@ -44,8 +44,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_e2e_pci_class_xhci_probe() -> TestResult {
     use crate::xhci::probe::{
-        PCI_CLASS_SERIAL_BUS, PCI_PROGIF_XHCI, PCI_SUBCLASS_USB,
-        PCI_CLASS_TRIPLE_XHCI, is_xhci_class,
+        is_xhci_class, PCI_CLASS_SERIAL_BUS, PCI_CLASS_TRIPLE_XHCI, PCI_PROGIF_XHCI,
+        PCI_SUBCLASS_USB,
     };
 
     // Canonical xHCI class triple.
@@ -59,16 +59,14 @@ fn smoke_e2e_pci_class_xhci_probe() -> TestResult {
         return TestResult::Fail("is_xhci_class rejected canonical triple");
     }
     // EHCI (prog-if 0x20) must NOT match.
-    let ehci_triple = ((PCI_CLASS_SERIAL_BUS as u32) << 16)
-        | ((PCI_SUBCLASS_USB as u32) << 8)
-        | 0x20u32;
+    let ehci_triple =
+        ((PCI_CLASS_SERIAL_BUS as u32) << 16) | ((PCI_SUBCLASS_USB as u32) << 8) | 0x20u32;
     if is_xhci_class(ehci_triple) {
         return TestResult::Fail("is_xhci_class accepted EHCI triple");
     }
     // OHCI (prog-if 0x10) must NOT match.
-    let ohci_triple = ((PCI_CLASS_SERIAL_BUS as u32) << 16)
-        | ((PCI_SUBCLASS_USB as u32) << 8)
-        | 0x10u32;
+    let ohci_triple =
+        ((PCI_CLASS_SERIAL_BUS as u32) << 16) | ((PCI_SUBCLASS_USB as u32) << 8) | 0x10u32;
     if is_xhci_class(ohci_triple) {
         return TestResult::Fail("is_xhci_class accepted OHCI triple");
     }
@@ -92,9 +90,7 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_pci_class_xhci_probe);
 // xHCI 1.2 §5.3 — Capability Registers.
 
 fn smoke_e2e_capability_register_layout() -> TestResult {
-    use crate::xhci::cap::{
-        CAP_CAPLENGTH, CAP_HCIVERSION, CAP_HCSPARAMS1, CAP_DBOFF, CAP_RTSOFF,
-    };
+    use crate::xhci::cap::{CAP_CAPLENGTH, CAP_DBOFF, CAP_HCIVERSION, CAP_HCSPARAMS1, CAP_RTSOFF};
 
     // Spec-mandated offsets (§5.3).
     if CAP_CAPLENGTH != 0x00 {
@@ -140,11 +136,9 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_capability_register_layout);
 // xHCI 1.2 §5.4 — Operational Registers.
 
 fn smoke_e2e_dcbaa_crcr_erst_programming() -> TestResult {
-    use crate::xhci::op::{
-        OP_CRCR, OP_DCBAAP, OP_USBCMD, OP_USBSTS, OP_CONFIG,
-    };
+    use crate::xhci::cmd_ring::{Trb, TRB_CYCLE_BIT, TRB_TC, TRB_TYPE_LINK, TRB_TYPE_SHIFT};
     use crate::xhci::event_ring::{ErstEntry, ER_SEG_TRBS};
-    use crate::xhci::cmd_ring::{Trb, TRB_CYCLE_BIT, TRB_TYPE_LINK, TRB_TYPE_SHIFT, TRB_TC};
+    use crate::xhci::op::{OP_CONFIG, OP_CRCR, OP_DCBAAP, OP_USBCMD, OP_USBSTS};
 
     // Spec-mandated offsets (§5.4).
     if OP_USBCMD != 0x00 {
@@ -209,8 +203,8 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_dcbaa_crcr_erst_programming);
 
 fn smoke_e2e_portsc_port_reset_bits() -> TestResult {
     use crate::xhci::op::{
-        PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PP, PORTSC_CHG_MASK,
-        PORTSC_CSC, PORTSC_PEC, PORTSC_PRC, PORTSC_PLS_MASK,
+        PORTSC_CCS, PORTSC_CHG_MASK, PORTSC_CSC, PORTSC_PEC, PORTSC_PED, PORTSC_PLS_MASK,
+        PORTSC_PP, PORTSC_PR, PORTSC_PRC,
     };
 
     // Bit positions per xHCI 1.2 §5.4.8.
@@ -276,9 +270,9 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_portsc_port_reset_bits);
 
 fn smoke_e2e_enable_slot_trb_encode() -> TestResult {
     use crate::xhci::cmd_ring::{
-        encode_enable_slot, TRB_TYPE_ENABLE_SLOT_CMD, TRB_TYPE_SHIFT, TRB_CYCLE_BIT,
+        encode_enable_slot, TRB_CYCLE_BIT, TRB_TYPE_ENABLE_SLOT_CMD, TRB_TYPE_SHIFT,
     };
-    use crate::xhci::event_ring::{DecodedEvent, CmdCompletionEvent, EVT_CMD_COMPLETION};
+    use crate::xhci::event_ring::{CmdCompletionEvent, DecodedEvent, EVT_CMD_COMPLETION};
 
     // Encode with cycle=1.
     let trb = encode_enable_slot(0, 1);
@@ -300,9 +294,8 @@ fn smoke_e2e_enable_slot_trb_encode() -> TestResult {
     let slot_id: u8 = 1;
     let completion_code: u8 = 1;
     let cce_d2 = (completion_code as u32) << 24;
-    let cce_d3 = ((EVT_CMD_COMPLETION as u32) << TRB_TYPE_SHIFT)
-        | ((slot_id as u32) << 24)
-        | TRB_CYCLE_BIT;
+    let cce_d3 =
+        ((EVT_CMD_COMPLETION as u32) << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | TRB_CYCLE_BIT;
     let raw: [u32; 4] = [0, 0, cce_d2, cce_d3];
     let decoded = DecodedEvent::from_dwords(raw);
     match decoded {
@@ -333,14 +326,13 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_enable_slot_trb_encode);
 // xHCI 1.2 §6.2.2 + §6.2.3 + §6.4.3.4.
 
 fn smoke_e2e_address_device_input_context() -> TestResult {
-    use crate::xhci::slot::{
-        encode_slot_ctx_dword0, encode_slot_ctx_dword1, encode_slot_ctx_dword2,
-        encode_ep_ctx_dword1, encode_ep_ctx_dword2_tr_lo,
-        SLOT_CTX_SPEED_SHIFT, SLOT_CTX_CTX_ENTRIES_SHIFT,
-        EP_TYPE_CONTROL,
-    };
     use crate::xhci::cmd_ring::{
         encode_address_device, TRB_TYPE_ADDRESS_DEVICE_CMD, TRB_TYPE_SHIFT,
+    };
+    use crate::xhci::slot::{
+        encode_ep_ctx_dword1, encode_ep_ctx_dword2_tr_lo, encode_slot_ctx_dword0,
+        encode_slot_ctx_dword1, encode_slot_ctx_dword2, EP_TYPE_CONTROL,
+        SLOT_CTX_CTX_ENTRIES_SHIFT, SLOT_CTX_SPEED_SHIFT,
     };
 
     // Root-hub device, High-Speed (speed=3), port=1, EP0 only (entries=1).
@@ -425,16 +417,14 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_address_device_input_context);
 // xHCI 1.2 §6.4.1.2 + USB 2.0 §9.4.3.
 
 fn smoke_e2e_get_descriptor_control_transfer_trbs() -> TestResult {
-    use crate::xhci::transfer_ring::{
-        encode_setup_stage, encode_data_stage, encode_status_stage,
-        TRT_IN_DATA, TRB_DIR_IN,
-    };
-    use crate::xhci::cmd_ring::{
-        TRB_IDT, TRB_IOC, TRB_CYCLE_BIT,
-        TRB_TYPE_SETUP_STAGE, TRB_TYPE_DATA_STAGE, TRB_TYPE_STATUS_STAGE,
-        TRB_TYPE_SHIFT,
-    };
     use crate::control::{get_descriptor, Setup};
+    use crate::xhci::cmd_ring::{
+        TRB_CYCLE_BIT, TRB_IDT, TRB_IOC, TRB_TYPE_DATA_STAGE, TRB_TYPE_SETUP_STAGE, TRB_TYPE_SHIFT,
+        TRB_TYPE_STATUS_STAGE,
+    };
+    use crate::xhci::transfer_ring::{
+        encode_data_stage, encode_setup_stage, encode_status_stage, TRB_DIR_IN, TRT_IN_DATA,
+    };
 
     // Standard GET_DESCRIPTOR(Device, index=0) setup packet.
     let setup = get_descriptor(0x01, 0, 0, 18);
@@ -514,7 +504,7 @@ fn smoke_e2e_get_descriptor_control_transfer_trbs() -> TestResult {
         18, 1, 0x10, 0x02, // bLength, bDescriptorType, bcdUSB
         0x00, 0x00, 0x00, 64, // bDeviceClass, Sub, Protocol, bMaxPacketSize0
         0xAB, 0xCD, 0x34, 0x12, // idVendor=0xCDAB, idProduct=0x1234
-        0x00, 0x01, 0, 0, 1, 1,  // bcdDevice, iMfr, iProduct, iSN, bNumConfigs
+        0x00, 0x01, 0, 0, 1, 1, // bcdDevice, iMfr, iProduct, iSN, bNumConfigs
     ];
     if dev_desc[0] != 18 {
         return TestResult::Fail("bLength wrong");
@@ -532,7 +522,10 @@ fn smoke_e2e_get_descriptor_control_transfer_trbs() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/e2e", smoke_e2e_get_descriptor_control_transfer_trbs);
+kernel_test_in!(
+    "drivers/usb/e2e",
+    smoke_e2e_get_descriptor_control_transfer_trbs
+);
 
 // ── Smoke 8: Configure Endpoint Input Context ───────────────────────
 //
@@ -542,12 +535,11 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_get_descriptor_control_transfer_trb
 // xHCI 1.2 §4.6.6 + §6.4.3.5.
 
 fn smoke_e2e_configure_endpoint_input_context() -> TestResult {
-    use crate::xhci::slot::{
-        input_ctx_add_flag, encode_ep_ctx_dword1,
-        EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT,
-    };
     use crate::xhci::cmd_ring::{
         encode_configure_endpoint, TRB_TYPE_CONFIGURE_ENDPOINT_CMD, TRB_TYPE_SHIFT,
+    };
+    use crate::xhci::slot::{
+        encode_ep_ctx_dword1, input_ctx_add_flag, EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT,
     };
 
     // Add Slot (A0) + EP1-IN (DCI 3) + EP2-OUT (DCI 4).
@@ -605,7 +597,10 @@ fn smoke_e2e_configure_endpoint_input_context() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/e2e", smoke_e2e_configure_endpoint_input_context);
+kernel_test_in!(
+    "drivers/usb/e2e",
+    smoke_e2e_configure_endpoint_input_context
+);
 
 // ── Smoke 9: Bulk OUT Normal TRB + Transfer Event decode ───────────
 //
@@ -617,12 +612,10 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_configure_endpoint_input_context);
 // xHCI 1.2 §6.4.1.1 + §6.4.2.1.
 
 fn smoke_e2e_bulk_out_normal_trb_and_transfer_event() -> TestResult {
-    use crate::xhci::transfer_ring::encode_normal;
-    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
-    use crate::xhci::cmd_ring::{
-        TRB_TYPE_NORMAL, TRB_IOC, TRB_CYCLE_BIT, TRB_TYPE_SHIFT,
-    };
     use crate::bulk::dci_for;
+    use crate::xhci::cmd_ring::{TRB_CYCLE_BIT, TRB_IOC, TRB_TYPE_NORMAL, TRB_TYPE_SHIFT};
+    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
+    use crate::xhci::transfer_ring::encode_normal;
 
     // EP2-OUT: ep_addr = 0x02 (OUT, ep_num=2). DCI = 2*2 = 4.
     let ep_addr: u8 = 0x02;
@@ -697,7 +690,10 @@ fn smoke_e2e_bulk_out_normal_trb_and_transfer_event() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/e2e", smoke_e2e_bulk_out_normal_trb_and_transfer_event);
+kernel_test_in!(
+    "drivers/usb/e2e",
+    smoke_e2e_bulk_out_normal_trb_and_transfer_event
+);
 
 // ── Smoke 10: Bulk IN 64-byte round-trip ───────────────────────────
 //
@@ -708,10 +704,10 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_bulk_out_normal_trb_and_transfer_ev
 // DCI formula: ep_num*2 + 1 for IN endpoints (§4.8.1).
 
 fn smoke_e2e_bulk_in_roundtrip() -> TestResult {
-    use crate::xhci::transfer_ring::encode_normal;
-    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
-    use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_SHIFT};
     use crate::bulk::dci_for;
+    use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_SHIFT};
+    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
+    use crate::xhci::transfer_ring::encode_normal;
 
     // EP1-IN: ep_addr = 0x81, DCI = 1*2+1 = 3.
     let ep_addr: u8 = 0x81;
@@ -738,7 +734,11 @@ fn smoke_e2e_bulk_in_roundtrip() -> TestResult {
     let raw: [u32; 4] = [0, 0, te_d2, te_d3];
     let decoded = DecodedEvent::from_dwords(raw);
     let residue = match decoded {
-        DecodedEvent::Transfer(TransferEvent { transfer_length, completion_code, .. }) => {
+        DecodedEvent::Transfer(TransferEvent {
+            transfer_length,
+            completion_code,
+            ..
+        }) => {
             if completion_code != 1 {
                 return TestResult::Fail("Bulk-IN Transfer Event completion code wrong");
             }
@@ -775,11 +775,11 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_bulk_in_roundtrip);
 // xHCI 1.2 §6.4.1.1 + HID spec §7.2.4 (interrupt transfer).
 
 fn smoke_e2e_interrupt_in_polling() -> TestResult {
-    use crate::xhci::transfer_ring::encode_normal;
-    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
-    use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_SHIFT};
     use crate::bulk::dci_for;
     use crate::intr;
+    use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_SHIFT};
+    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
+    use crate::xhci::transfer_ring::encode_normal;
 
     // EP3-IN: ep_addr = 0x83, DCI = 3*2+1 = 7.
     let ep_addr: u8 = 0x83;
@@ -854,9 +854,10 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_interrupt_in_polling);
 // Linux ref: `drivers/usb/core/hub.c::usb_hub_probe`. GPL-2.0-or-later.
 
 fn smoke_e2e_hub_class_device_descriptor() -> TestResult {
-    use crate::hub::{HUB_INTERFACE_CLASS, HUB_DESC_TYPE,
-                    RT_DEV_TO_HOST_CLASS_DEVICE, REQ_GET_DESCRIPTOR,
-                    HubDescriptor};
+    use crate::hub::{
+        HubDescriptor, HUB_DESC_TYPE, HUB_INTERFACE_CLASS, REQ_GET_DESCRIPTOR,
+        RT_DEV_TO_HOST_CLASS_DEVICE,
+    };
 
     // Hub class code must be 0x09.
     if HUB_INTERFACE_CLASS != 0x09 {
@@ -873,7 +874,8 @@ fn smoke_e2e_hub_class_device_descriptor() -> TestResult {
         18, 1, 0x00, 0x02, // bLength, bDescriptorType, bcdUSB=2.0
         0x09, 0x00, 0x01, 64, // bDeviceClass=Hub, SubClass, Protocol, bMaxPacketSize0
         0x12, 0x34, 0x56, 0x78, // idVendor, idProduct
-        0x00, 0x01, 1, 2, 1, 1, // bcdDevice, iManufacturer, iProduct, iSerialNumber, bNumConfigurations
+        0x00, 0x01, 1, 2, 1,
+        1, // bcdDevice, iManufacturer, iProduct, iSerialNumber, bNumConfigurations
     ];
     if hub_dev_desc[4] != HUB_INTERFACE_CLASS {
         return TestResult::Fail("Hub device descriptor bDeviceClass wrong");
@@ -894,8 +896,7 @@ fn smoke_e2e_hub_class_device_descriptor() -> TestResult {
     // Hub Descriptor: bLength=9, bDescriptorType=0x29, bNbrPorts=4,
     // wHubCharacteristics=0, bPwrOn2PwrGood=50, bHubContrCurrent=100.
     let hub_desc_bytes: [u8; 9] = [9, 0x29, 4, 0x00, 0x00, 50, 100, 0, 0];
-    let hub_desc = HubDescriptor::decode(&hub_desc_bytes)
-        .expect("hub descriptor decode failed");
+    let hub_desc = HubDescriptor::decode(&hub_desc_bytes).expect("hub descriptor decode failed");
     if hub_desc.num_ports != 4 {
         return TestResult::Fail("Hub descriptor num_ports wrong");
     }
@@ -921,10 +922,8 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_hub_class_device_descriptor);
 // USB 2.0 §11.24.2.7 Table 11-17.
 
 fn smoke_e2e_hub_port_power_on_setup_packet() -> TestResult {
-    use crate::hub::{
-        RT_HOST_TO_DEV_CLASS_OTHER, REQ_SET_FEATURE, PORT_POWER,
-    };
     use crate::control::Setup;
+    use crate::hub::{PORT_POWER, REQ_SET_FEATURE, RT_HOST_TO_DEV_CLASS_OTHER};
 
     if RT_HOST_TO_DEV_CLASS_OTHER != 0x23 {
         return TestResult::Fail("RT_HOST_TO_DEV_CLASS_OTHER should be 0x23");
@@ -980,9 +979,8 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_hub_port_power_on_setup_packet);
 
 fn smoke_e2e_hub_port_status_change_interrupt() -> TestResult {
     use crate::hub::{
-        RT_DEV_TO_HOST_CLASS_OTHER, REQ_GET_STATUS,
-        PSTAT_CONNECTION, PORT_CONNECTION, C_PORT_CONNECTION,
-        HUB_INTERFACE_CLASS,
+        C_PORT_CONNECTION, HUB_INTERFACE_CLASS, PORT_CONNECTION, PSTAT_CONNECTION, REQ_GET_STATUS,
+        RT_DEV_TO_HOST_CLASS_OTHER,
     };
 
     // 1-byte interrupt report: bit 1 set → port 1 changed.
@@ -1006,8 +1004,10 @@ fn smoke_e2e_hub_port_status_change_interrupt() -> TestResult {
     let port_change: u16 = 1 << 0; // bit 0: connection changed
 
     let status_buf: [u8; 4] = [
-        (port_status & 0xFF) as u8, (port_status >> 8) as u8,
-        (port_change & 0xFF) as u8, (port_change >> 8) as u8,
+        (port_status & 0xFF) as u8,
+        (port_status >> 8) as u8,
+        (port_change & 0xFF) as u8,
+        (port_change >> 8) as u8,
     ];
     let w_port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
     let w_port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
@@ -1034,7 +1034,10 @@ fn smoke_e2e_hub_port_status_change_interrupt() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/e2e", smoke_e2e_hub_port_status_change_interrupt);
+kernel_test_in!(
+    "drivers/usb/e2e",
+    smoke_e2e_hub_port_status_change_interrupt
+);
 
 // ── Smoke 15: DCI calculation for all standard endpoint addresses ───
 //
@@ -1051,12 +1054,12 @@ fn smoke_e2e_dci_calculation_all_endpoints() -> TestResult {
     // Check the canonical EP addr → DCI formula for ep_num 1..=15.
     let cases: &[(u8, u8)] = &[
         // (bEndpointAddress, expected_dci)
-        (0x01, 2), // EP1-OUT: 1*2=2
-        (0x81, 3), // EP1-IN:  1*2+1=3
-        (0x02, 4), // EP2-OUT: 2*2=4
-        (0x82, 5), // EP2-IN:  2*2+1=5
-        (0x03, 6), // EP3-OUT: 3*2=6
-        (0x83, 7), // EP3-IN:  3*2+1=7
+        (0x01, 2),  // EP1-OUT: 1*2=2
+        (0x81, 3),  // EP1-IN:  1*2+1=3
+        (0x02, 4),  // EP2-OUT: 2*2=4
+        (0x82, 5),  // EP2-IN:  2*2+1=5
+        (0x03, 6),  // EP3-OUT: 3*2=6
+        (0x83, 7),  // EP3-IN:  3*2+1=7
         (0x0F, 30), // EP15-OUT: 15*2=30
         (0x8F, 31), // EP15-IN:  15*2+1=31
     ];
@@ -1102,8 +1105,8 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_dci_calculation_all_endpoints);
 // slot_id before dispatching. GPL-2.0-or-later.
 
 fn smoke_e2e_transfer_event_slot_endpoint_filter() -> TestResult {
-    use crate::xhci::event_ring::{DecodedEvent, EVT_TRANSFER};
     use crate::xhci::cmd_ring::TRB_TYPE_SHIFT;
+    use crate::xhci::event_ring::{DecodedEvent, EVT_TRANSFER};
 
     // Build four Transfer Events: two slots (1, 2) × two DCIs (3, 5).
     let make_te = |slot: u8, dci: u8, code: u8| -> [u32; 4] {
@@ -1154,7 +1157,10 @@ fn smoke_e2e_transfer_event_slot_endpoint_filter() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/e2e", smoke_e2e_transfer_event_slot_endpoint_filter);
+kernel_test_in!(
+    "drivers/usb/e2e",
+    smoke_e2e_transfer_event_slot_endpoint_filter
+);
 
 // ── Smoke 17: Command Completion Event decode — all completion codes ─
 //
@@ -1164,23 +1170,25 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_transfer_event_slot_endpoint_filter
 // Context Error (11 — Context State invalid), Short Packet (13).
 
 fn smoke_e2e_command_completion_codes() -> TestResult {
-    use crate::xhci::event_ring::{DecodedEvent, CmdCompletionEvent, EVT_CMD_COMPLETION};
-    use crate::xhci::cmd_ring::TRB_TYPE_SHIFT;
     use crate::device::{UsbError, UsbError::*};
+    use crate::xhci::cmd_ring::TRB_TYPE_SHIFT;
+    use crate::xhci::event_ring::{CmdCompletionEvent, DecodedEvent, EVT_CMD_COMPLETION};
     use crate::xhci::XhciError;
 
     let make_cce = |code: u8, slot: u8| -> [u32; 4] {
         let d2 = (code as u32) << 24;
-        let d3 = ((EVT_CMD_COMPLETION as u32) << TRB_TYPE_SHIFT)
-            | ((slot as u32) << 24)
-            | 1u32;
+        let d3 = ((EVT_CMD_COMPLETION as u32) << TRB_TYPE_SHIFT) | ((slot as u32) << 24) | 1u32;
         [0, 0, d2, d3]
     };
 
     // Success (code=1): must decode to completion_code=1, slot_id=1.
     let success_ev = make_cce(1, 1);
     match DecodedEvent::from_dwords(success_ev) {
-        DecodedEvent::CmdCompletion(CmdCompletionEvent { completion_code: 1, slot_id: 1, .. }) => {}
+        DecodedEvent::CmdCompletion(CmdCompletionEvent {
+            completion_code: 1,
+            slot_id: 1,
+            ..
+        }) => {}
         _ => return TestResult::Fail("Success CCE decode wrong"),
     }
 
@@ -1229,7 +1237,7 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_command_completion_codes);
 // `hub.c::usb_set_device_state`. GPL-2.0-or-later.
 
 fn smoke_e2e_topology_route_string() -> TestResult {
-    use crate::xhci::{Topology};
+    use crate::xhci::Topology;
 
     // Root device: route_string = 0.
     let root = Topology::ROOT;
@@ -1283,7 +1291,7 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_topology_route_string);
 // USB 2.0 §9.3 Table 9-2.
 
 fn smoke_e2e_setup_packet_roundtrip() -> TestResult {
-    use crate::control::{Setup, get_descriptor, set_configuration, set_interface, vendor_read};
+    use crate::control::{get_descriptor, set_configuration, set_interface, vendor_read, Setup};
 
     // GET_DESCRIPTOR(Device, index 0, lang 0, len 18): must be IN.
     let gd = get_descriptor(0x01, 0, 0, 18);
@@ -1365,8 +1373,7 @@ fn smoke_e2e_erst_entry_serialisation() -> TestResult {
     // to_le_bytes serialisation.
     let bytes = entry.to_le_bytes();
     let base_from_bytes = u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]);
     if base_from_bytes != base {
         return TestResult::Fail("ERST to_le_bytes base wrong");

@@ -417,8 +417,7 @@ impl CcidReader {
         if n < CCID_HDR_LEN {
             return Err(CcidError::BadResponse);
         }
-        let (msg_type, _pl, _rs, _rseq, b_status, b_error) =
-            Self::decode_response_header(&resp)?;
+        let (msg_type, _pl, _rs, _rseq, b_status, b_error) = Self::decode_response_header(&resp)?;
         if msg_type != RDR_TO_PC_SLOT_STATUS {
             return Err(CcidError::BadResponse);
         }
@@ -445,9 +444,12 @@ impl CcidReader {
         let seq = self.next_seq(slot);
         let payload_len = payload.len() as u32;
         let mut msg = alloc::vec![0u8; CCID_HDR_LEN + payload.len()];
-        msg[..CCID_HDR_LEN].copy_from_slice(
-            &Self::build_header(PC_TO_RDR_XFR_BLOCK, payload_len, slot, seq)
-        );
+        msg[..CCID_HDR_LEN].copy_from_slice(&Self::build_header(
+            PC_TO_RDR_XFR_BLOCK,
+            payload_len,
+            slot,
+            seq,
+        ));
         msg[CCID_HDR_LEN..].copy_from_slice(payload);
         xhci_dev
             .bulk_out(self.slot_id, self.bulk_out_dci(), &msg)
@@ -574,8 +576,7 @@ impl CcidReader {
 
         loop {
             let resp_raw = self.xfr_block_raw(xhci_dev, slot, &current_wire).await?;
-            let block = t1::T1Block::decode(&resp_raw)
-                .map_err(|_| CcidError::BadResponse)?;
+            let block = t1::T1Block::decode(&resp_raw).map_err(|_| CcidError::BadResponse)?;
 
             if block.is_iblock() {
                 seq.advance_nr();
@@ -626,8 +627,7 @@ impl CcidReader {
 
 /// Global registry of bound CCID readers. Append-only — a userland
 /// PC/SC daemon attaches by index or slot_id when it loads.
-pub static CCID_READERS: IrqSafeSpinLock<Vec<CcidReader>> =
-    IrqSafeSpinLock::new(Vec::new());
+pub static CCID_READERS: IrqSafeSpinLock<Vec<CcidReader>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Return the number of CCID readers currently registered.
 pub fn attached_count() -> usize {
@@ -802,8 +802,8 @@ pub async fn try_bind_ccid_already_addressed(
 ) -> Result<usize, CcidError> {
     // Step 1: find the CCID interface + class descriptor.
     let (iface_num, iface_off) = find_ccid_interface(cfg).ok_or(CcidError::NotCcid)?;
-    let desc = find_ccid_class_descriptor(cfg, iface_off)
-        .ok_or(CcidError::CcidDescriptorMissing)?;
+    let desc =
+        find_ccid_class_descriptor(cfg, iface_off).ok_or(CcidError::CcidDescriptorMissing)?;
     // Step 2: collect endpoints.
     let eps = find_ccid_endpoints(cfg, iface_off)?;
 
@@ -878,7 +878,7 @@ mod tests {
         buf[3] = 0x01; // bcdCCID MSB → 0x0110 = rev 1.1
         buf[4] = 0; // bMaxSlotIndex (1 slot)
         buf[5] = 0x07; // bVoltageSupport: 5V+3V+1.8V
-        // dwProtocols: T=0 (bit 0) | T=1 (bit 1).
+                       // dwProtocols: T=0 (bit 0) | T=1 (bit 1).
         buf[6..10].copy_from_slice(&(CCID_PROTO_T0 | CCID_PROTO_T1).to_le_bytes());
         // dwMaxIFSD = 254 (T=1 default, §5.1 Table 5-1).
         buf[28..32].copy_from_slice(&254u32.to_le_bytes());
@@ -978,8 +978,8 @@ mod tests {
         cfg[19] = CCID_DESC_TYPE; // 0x21
         cfg[20] = 0x10; // bcdCCID LSB
         cfg[21] = 0x01; // bcdCCID MSB
-        // dwProtocols = T=0 | T=1 at offsets 24..28 (relative to cfg[18]).
-        // Absolute offset = 18 + 6 = 24.
+                        // dwProtocols = T=0 | T=1 at offsets 24..28 (relative to cfg[18]).
+                        // Absolute offset = 18 + 6 = 24.
         cfg[24..28].copy_from_slice(&(CCID_PROTO_T0 | CCID_PROTO_T1).to_le_bytes());
         // dwMaxIFSD = 254 at absolute offset 18 + 28 = 46.
         cfg[46..50].copy_from_slice(&254u32.to_le_bytes());
@@ -1014,28 +1014,35 @@ mod tests {
         cfg[92] = 8; // bInterval
 
         // Verify: find_ccid_interface returns (iface=0, offset=9).
-        let (iface_num, iface_off) =
-            find_ccid_interface(&cfg).expect("should find CCID interface");
+        let (iface_num, iface_off) = find_ccid_interface(&cfg).expect("should find CCID interface");
         assert_eq!(iface_num, 0, "bInterfaceNumber");
         assert_eq!(iface_off, 9, "interface offset");
 
         // Verify: class descriptor parses correctly.
-        let desc = find_ccid_class_descriptor(&cfg, iface_off)
-            .expect("should find CCID class descriptor");
+        let desc =
+            find_ccid_class_descriptor(&cfg, iface_off).expect("should find CCID class descriptor");
         assert_ne!(desc.protocols & CCID_PROTO_T0, 0, "T=0 supported");
         assert_ne!(desc.protocols & CCID_PROTO_T1, 0, "T=1 supported");
         assert_eq!(desc.max_ifsd, 254, "maxIFSD");
 
         // Verify: endpoints parse correctly.
-        let eps = find_ccid_endpoints(&cfg, iface_off)
-            .expect("should find CCID endpoints");
+        let eps = find_ccid_endpoints(&cfg, iface_off).expect("should find CCID endpoints");
         assert_eq!(eps.bulk_in.ep_addr, 0x81, "bulk-IN addr");
-        assert!(matches!(eps.bulk_in.kind, EndpointKind::BulkIn), "bulk-IN kind");
+        assert!(
+            matches!(eps.bulk_in.kind, EndpointKind::BulkIn),
+            "bulk-IN kind"
+        );
         assert_eq!(eps.bulk_out.ep_addr, 0x01, "bulk-OUT addr");
-        assert!(matches!(eps.bulk_out.kind, EndpointKind::BulkOut), "bulk-OUT kind");
+        assert!(
+            matches!(eps.bulk_out.kind, EndpointKind::BulkOut),
+            "bulk-OUT kind"
+        );
         assert!(eps.intr_in.is_some(), "intr-IN should be present");
         let intr = eps.intr_in.unwrap();
         assert_eq!(intr.ep_addr, 0x82, "intr-IN addr");
-        assert!(matches!(intr.kind, EndpointKind::InterruptIn), "intr-IN kind");
+        assert!(
+            matches!(intr.kind, EndpointKind::InterruptIn),
+            "intr-IN kind"
+        );
     }
 }

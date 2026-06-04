@@ -166,10 +166,8 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
     }
     // Reset state — earlier tests may have allocated slots already.
     hid::__reset_keyboards_for_test();
-    let port = match xhci::with_controller(|c| {
-        c.connected_ports().first().copied().map(|(p, _)| p)
-    })
-    .flatten()
+    let port = match xhci::with_controller(|c| c.connected_ports().first().copied().map(|(p, _)| p))
+        .flatten()
     {
         Some(p) => p,
         None => return TestResult::Skip("no connected port"),
@@ -838,9 +836,7 @@ fn smoke_uac_ac_header_decodes_collection() -> TestResult {
     use crate::uac::AcHeader;
     // bLength=10, CS_INTERFACE, HEADER, bcdADC=0x0100,
     // wTotalLength=0x0040, bInCollection=2, [iface_a, iface_b]
-    let buf = [
-        10, 0x24, 0x01, 0x00, 0x01, 0x40, 0x00, 2, 0x01, 0x02,
-    ];
+    let buf = [10, 0x24, 0x01, 0x00, 0x01, 0x40, 0x00, 2, 0x01, 0x02];
     let h = AcHeader::parse(&buf).expect("parse");
     if h.bcd_adc != 0x0100 {
         return TestResult::Fail("bcdADC should decode to 0x0100");
@@ -899,7 +895,12 @@ fn smoke_uac_feature_unit_decodes_per_channel_controls() -> TestResult {
     // bSourceID=1, bControlSize=1, master ctrl = MUTE|VOLUME,
     // ch1 = VOLUME, ch2 = VOLUME, iFeature=0
     let buf = [
-        10, 0x24, 0x06, 4, 1, 1,
+        10,
+        0x24,
+        0x06,
+        4,
+        1,
+        1,
         (FEATURE_MUTE | FEATURE_VOLUME) as u8,
         FEATURE_VOLUME as u8,
         FEATURE_VOLUME as u8,
@@ -920,7 +921,10 @@ fn smoke_uac_feature_unit_decodes_per_channel_controls() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uac", smoke_uac_feature_unit_decodes_per_channel_controls);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_feature_unit_decodes_per_channel_controls
+);
 
 fn smoke_uac_format_type_i_pcm_44k_48k() -> TestResult {
     use crate::uac::{FormatTypeI, FORMAT_TYPE_I};
@@ -928,8 +932,16 @@ fn smoke_uac_format_type_i_pcm_44k_48k() -> TestResult {
     // bNrChannels=2, bSubframeSize=2, bBitResolution=16, bSamFreqType=2,
     // tSamFreq[0] = 44100 (LE 24-bit), tSamFreq[1] = 48000
     let mut buf = alloc::vec![14, 0x24, 0x02, FORMAT_TYPE_I, 2, 2, 16, 2];
-    buf.extend_from_slice(&[(44100u32 & 0xFF) as u8, ((44100u32 >> 8) & 0xFF) as u8, ((44100u32 >> 16) & 0xFF) as u8]);
-    buf.extend_from_slice(&[(48000u32 & 0xFF) as u8, ((48000u32 >> 8) & 0xFF) as u8, ((48000u32 >> 16) & 0xFF) as u8]);
+    buf.extend_from_slice(&[
+        (44100u32 & 0xFF) as u8,
+        ((44100u32 >> 8) & 0xFF) as u8,
+        ((44100u32 >> 16) & 0xFF) as u8,
+    ]);
+    buf.extend_from_slice(&[
+        (48000u32 & 0xFF) as u8,
+        ((48000u32 >> 8) & 0xFF) as u8,
+        ((48000u32 >> 16) & 0xFF) as u8,
+    ]);
     let f = FormatTypeI::parse(&buf).expect("parse");
     if f.nr_channels != 2 || f.subframe_size != 2 || f.bit_resolution != 16 {
         return TestResult::Fail("format Type-I header mismatch");
@@ -947,7 +959,11 @@ fn smoke_uac_format_type_i_continuous_range() -> TestResult {
     let mut buf = alloc::vec![14, 0x24, 0x02, FORMAT_TYPE_I, 2, 2, 16, 0];
     // 8000 .. 96000
     buf.extend_from_slice(&[(8000u32 & 0xFF) as u8, ((8000u32 >> 8) & 0xFF) as u8, 0]);
-    buf.extend_from_slice(&[(96000u32 & 0xFF) as u8, ((96000u32 >> 8) & 0xFF) as u8, ((96000u32 >> 16) & 0xFF) as u8]);
+    buf.extend_from_slice(&[
+        (96000u32 & 0xFF) as u8,
+        ((96000u32 >> 8) & 0xFF) as u8,
+        ((96000u32 >> 16) & 0xFF) as u8,
+    ]);
     let f = FormatTypeI::parse(&buf).expect("parse");
     if f.range_lower_hz != Some(8000) || f.range_upper_hz != Some(96000) {
         return TestResult::Fail("continuous-range Hz decode wrong");
@@ -1039,7 +1055,10 @@ fn smoke_uvc_camera_input_terminal_carries_focal_length() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc", smoke_uvc_camera_input_terminal_carries_focal_length);
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_camera_input_terminal_carries_focal_length
+);
 
 fn smoke_uvc_format_uncompressed_yuy2() -> TestResult {
     use crate::uvc::{FormatUncompressed, GUID_FORMAT_YUY2};
@@ -1119,7 +1138,10 @@ fn smoke_uvc_format_mjpeg_decodes_default_frame_index() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc", smoke_uvc_format_mjpeg_decodes_default_frame_index);
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_format_mjpeg_decodes_default_frame_index
+);
 
 fn smoke_uvc_frame_mjpeg_720p30_discrete() -> TestResult {
     use crate::uvc::FrameMjpeg;
@@ -1225,7 +1247,10 @@ fn smoke_uvc_stream_header_round_trip_no_optional_fields() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_header_round_trip_no_optional_fields);
+kernel_test_in!(
+    "drivers/usb/uvc-stream",
+    smoke_uvc_stream_header_round_trip_no_optional_fields
+);
 
 fn smoke_uvc_stream_header_with_pts() -> TestResult {
     use crate::uvc_stream::PayloadHeader;
@@ -1277,7 +1302,10 @@ fn smoke_uvc_stream_header_with_pts_and_scr() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_header_with_pts_and_scr);
+kernel_test_in!(
+    "drivers/usb/uvc-stream",
+    smoke_uvc_stream_header_with_pts_and_scr
+);
 
 fn smoke_uvc_stream_reassembler_detects_frame_boundary() -> TestResult {
     use crate::uvc_stream::{FrameReassembler, PayloadHeader};
@@ -1312,7 +1340,10 @@ fn smoke_uvc_stream_reassembler_detects_frame_boundary() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_reassembler_detects_frame_boundary);
+kernel_test_in!(
+    "drivers/usb/uvc-stream",
+    smoke_uvc_stream_reassembler_detects_frame_boundary
+);
 
 fn smoke_uvc_stream_rejects_short_buffer() -> TestResult {
     use crate::uvc_stream::{PayloadHeader, UvcStreamError};
@@ -1321,7 +1352,10 @@ fn smoke_uvc_stream_rejects_short_buffer() -> TestResult {
         _ => TestResult::Fail("1-byte buffer must be rejected"),
     }
 }
-kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_rejects_short_buffer);
+kernel_test_in!(
+    "drivers/usb/uvc-stream",
+    smoke_uvc_stream_rejects_short_buffer
+);
 
 // ── HID Boot Mouse — descriptor parser + diff ──────────────────────
 
@@ -1364,10 +1398,10 @@ fn smoke_hid_boot_mouse_parse() -> TestResult {
 kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_parse);
 
 fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
-    use crate::hid::mouse::{self, BootMouse, MouseReport, boot_mouse_evdev_caps};
+    use crate::hid::mouse::{self, boot_mouse_evdev_caps, BootMouse, MouseReport};
     use narf_input::{
-        evdev::ROUTER,
-        init_global_ring, pop_global, InputEvent, PointerButtons, __reset_global_ring_for_test,
+        evdev::ROUTER, init_global_ring, pop_global, InputEvent, PointerButtons,
+        __reset_global_ring_for_test,
     };
 
     init_global_ring(64);
@@ -1550,7 +1584,10 @@ fn smoke_ehci_portsc_low_speed_release_to_companion() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/ehci", smoke_ehci_portsc_low_speed_release_to_companion);
+kernel_test_in!(
+    "drivers/usb/ehci",
+    smoke_ehci_portsc_low_speed_release_to_companion
+);
 
 // ── OHCI ──────────────────────────────────────────────────────────
 
@@ -1614,7 +1651,10 @@ fn smoke_ohci_general_td_completion_code_decodes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/ohci", smoke_ohci_general_td_completion_code_decodes);
+kernel_test_in!(
+    "drivers/usb/ohci",
+    smoke_ohci_general_td_completion_code_decodes
+);
 
 fn smoke_ohci_hcca_status_extracted() -> TestResult {
     use crate::ohci::{hcca, read_hcca_status, HCCA_SIZE};
@@ -1622,8 +1662,7 @@ fn smoke_ohci_hcca_status_extracted() -> TestResult {
     blob[hcca::FRAME_NUMBER_OFFSET] = 0x34;
     blob[hcca::FRAME_NUMBER_OFFSET + 1] = 0x12;
     let done = 0xCAFE_C0D0u32;
-    blob[hcca::DONE_HEAD_OFFSET..hcca::DONE_HEAD_OFFSET + 4]
-        .copy_from_slice(&done.to_le_bytes());
+    blob[hcca::DONE_HEAD_OFFSET..hcca::DONE_HEAD_OFFSET + 4].copy_from_slice(&done.to_le_bytes());
     let (frame, dh) = read_hcca_status(&blob).expect("read");
     if frame != 0x1234 || dh != (done & 0xFFFF_FFF0) {
         return TestResult::Fail("HCCA status decoded wrong");
@@ -1734,7 +1773,14 @@ fn smoke_xhci_sibling_port_pairs_within_overlap() -> TestResult {
     // that on the live controller every USB3 port with a non-zero
     // sibling has a sibling that's marked USB2 (and vice versa),
     // proving the table is self-consistent.
-    let max = xhci::with_controller(|c| c.connected_ports().iter().map(|(p, _)| *p).max().unwrap_or(0)).unwrap_or(0);
+    let max = xhci::with_controller(|c| {
+        c.connected_ports()
+            .iter()
+            .map(|(p, _)| *p)
+            .max()
+            .unwrap_or(0)
+    })
+    .unwrap_or(0);
     if max == 0 {
         return TestResult::Skip("no connected port to walk");
     }
@@ -1763,7 +1809,10 @@ fn smoke_xhci_sibling_port_pairs_within_overlap() -> TestResult {
         TestResult::Fail("sibling table not USB2↔USB3 symmetric")
     }
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_sibling_port_pairs_within_overlap);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_sibling_port_pairs_within_overlap
+);
 
 fn smoke_xhci_sibling_port_zero_when_no_sibling() -> TestResult {
     // sibling_port for port 0 (sentinel) and port > max_ports is 0.
@@ -1771,17 +1820,18 @@ fn smoke_xhci_sibling_port_zero_when_no_sibling() -> TestResult {
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let result = xhci::with_controller(|c| {
-        c.sibling_port(0) == 0 && c.sibling_port(255) == 0
-    })
-    .unwrap_or(false);
+    let result = xhci::with_controller(|c| c.sibling_port(0) == 0 && c.sibling_port(255) == 0)
+        .unwrap_or(false);
     if result {
         TestResult::Pass
     } else {
         TestResult::Fail("out-of-range sibling_port returned non-zero")
     }
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_sibling_port_zero_when_no_sibling);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_sibling_port_zero_when_no_sibling
+);
 
 // ── drivers/usb/class-detection ────────────────────────────────────
 //
@@ -1792,30 +1842,35 @@ kernel_test_in!("drivers/usb/xhci", smoke_xhci_sibling_port_zero_when_no_sibling
 
 /// Build a 9-byte config header + a 9-byte interface descriptor
 /// with the given class triple.
-fn build_cfg_with_class(class: u8, subclass: u8, protocol: u8, iface_num: u8) -> alloc::vec::Vec<u8> {
+fn build_cfg_with_class(
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+    iface_num: u8,
+) -> alloc::vec::Vec<u8> {
     let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     // CONFIG descriptor: 9 bytes.
     v.extend_from_slice(&[
         9, 0x02, // bLength, bDescriptorType=CONFIG
-        18, 0,   // wTotalLength = 18 (9 cfg + 9 iface)
-        1,       // bNumInterfaces
-        1,       // bConfigurationValue
+        18, 0, // wTotalLength = 18 (9 cfg + 9 iface)
+        1, // bNumInterfaces
+        1, // bConfigurationValue
         0, 0xC0, 50,
     ]);
     // INTERFACE descriptor: 9 bytes.
     v.extend_from_slice(&[
         9, 0x04, // bLength, bDescriptorType=INTERFACE
-        iface_num,
-        0,       // bAlternateSetting
-        0,       // bNumEndpoints
-        class, subclass, protocol,
-        0,       // iInterface
+        iface_num, 0, // bAlternateSetting
+        0, // bNumEndpoints
+        class, subclass, protocol, 0, // iInterface
     ]);
     v
 }
 
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
-    use crate::uac::{find_audio_control_interface, USB_AUDIO_SUBCLASS_AUDIOCONTROL, USB_CLASS_AUDIO};
+    use crate::uac::{
+        find_audio_control_interface, USB_AUDIO_SUBCLASS_AUDIOCONTROL, USB_CLASS_AUDIO,
+    };
     // Audio / AudioControl on interface number 7.
     let cfg = build_cfg_with_class(USB_CLASS_AUDIO, USB_AUDIO_SUBCLASS_AUDIOCONTROL, 0, 7);
     if find_audio_control_interface(&cfg) != Some(7) {
@@ -1828,10 +1883,15 @@ fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uac", smoke_usb_uac_finder_picks_audiocontrol_interface);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_usb_uac_finder_picks_audiocontrol_interface
+);
 
 fn smoke_usb_uvc_finder_picks_videocontrol_interface() -> TestResult {
-    use crate::uvc::{find_video_control_interface, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL};
+    use crate::uvc::{
+        find_video_control_interface, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL,
+    };
     let cfg = build_cfg_with_class(USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL, 0, 3);
     if find_video_control_interface(&cfg) != Some(3) {
         return TestResult::Fail("VC interface not found at expected iface_num");
@@ -1843,7 +1903,10 @@ fn smoke_usb_uvc_finder_picks_videocontrol_interface() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_finder_picks_videocontrol_interface);
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_finder_picks_videocontrol_interface
+);
 
 fn smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface() -> TestResult {
     use crate::cdc::{CDC_SUBCLASS_NCM, USB_CLASS_CDC_COMM};
@@ -1859,14 +1922,16 @@ fn smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/cdc_ncm", smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface);
+kernel_test_in!(
+    "drivers/usb/cdc_ncm",
+    smoke_usb_cdc_ncm_finder_picks_comm_ncm_interface
+);
 
 // ── drivers/usb/hub (port suspend constants) ───────────────────────
 
 fn smoke_usb_hub_port_suspend_constants_distinct() -> TestResult {
     use crate::hub::{
-        C_PORT_SUSPEND, PORT_SUSPEND, PSTAT_SUSPEND,
-        C_PORT_CONNECTION, C_PORT_RESET, PORT_RESET,
+        C_PORT_CONNECTION, C_PORT_RESET, C_PORT_SUSPEND, PORT_RESET, PORT_SUSPEND, PSTAT_SUSPEND,
     };
     // Distinct feature codes — silent collision would suspend
     // when we meant to reset.
@@ -1882,7 +1947,10 @@ fn smoke_usb_hub_port_suspend_constants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/hub", smoke_usb_hub_port_suspend_constants_distinct);
+kernel_test_in!(
+    "drivers/usb/hub",
+    smoke_usb_hub_port_suspend_constants_distinct
+);
 
 fn smoke_usb_attach_idle_suspend_threshold_is_30s() -> TestResult {
     use crate::attach::IDLE_SUSPEND_NS;
@@ -1891,7 +1959,10 @@ fn smoke_usb_attach_idle_suspend_threshold_is_30s() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/attach", smoke_usb_attach_idle_suspend_threshold_is_30s);
+kernel_test_in!(
+    "drivers/usb/attach",
+    smoke_usb_attach_idle_suspend_threshold_is_30s
+);
 
 // ── drivers/usb/cdc_ncm (Data interface + bulk endpoints) ──────────
 
@@ -1912,13 +1983,9 @@ fn smoke_usb_cdc_ncm_finder_picks_bulk_pair_under_data_iface() -> TestResult {
     v[2] = (total & 0xFF) as u8;
     v[3] = (total >> 8) as u8;
     // COMM interface.
-    v.extend_from_slice(&[
-        9, 0x04, 0, 0, 0, USB_CLASS_CDC_COMM, CDC_SUBCLASS_NCM, 0, 0,
-    ]);
+    v.extend_from_slice(&[9, 0x04, 0, 0, 0, USB_CLASS_CDC_COMM, CDC_SUBCLASS_NCM, 0, 0]);
     // DATA interface.
-    v.extend_from_slice(&[
-        9, 0x04, 1, 0, 2, USB_CLASS_CDC_DATA, 0, 0, 0,
-    ]);
+    v.extend_from_slice(&[9, 0x04, 1, 0, 2, USB_CLASS_CDC_DATA, 0, 0, 0]);
     // Bulk OUT endpoint, ep_addr=0x01, attrs=0x02 (bulk), MPS=512.
     v.extend_from_slice(&[7, 0x05, 0x01, 0x02, 0x00, 0x02, 0]);
     // Bulk IN endpoint, ep_addr=0x82.
@@ -1955,9 +2022,13 @@ fn smoke_usb_uvc_payload_header_decodes_pts_and_eof() -> TestResult {
     let buf = [
         6,
         bfh::EOH | bfh::EOF | bfh::PTS,
-        0x78, 0x56, 0x34, 0x12,
+        0x78,
+        0x56,
+        0x34,
+        0x12,
         // payload bytes follow — not in the header itself
-        0xAA, 0xBB,
+        0xAA,
+        0xBB,
     ];
     let h = match UvcPayloadHeader::parse(&buf) {
         Ok(h) => h,
@@ -1980,10 +2051,13 @@ fn smoke_usb_uvc_payload_header_decodes_pts_and_eof() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_payload_header_decodes_pts_and_eof);
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_payload_header_decodes_pts_and_eof
+);
 
 fn smoke_usb_uvc_payload_header_rejects_truncated() -> TestResult {
-    use crate::uvc::{bfh, UvcPayloadHeader, UvcError};
+    use crate::uvc::{bfh, UvcError, UvcPayloadHeader};
     // BFH says PTS|SCR (4+6 bytes follow) but length=2 means none of
     // those bytes are inside the declared header → Truncated.
     let buf = [2, bfh::EOH | bfh::PTS | bfh::SCR];
@@ -2103,29 +2177,44 @@ kernel_test_in!("drivers/usb/uac", smoke_usb_uac_encode_sampling_freq_48k);
 
 fn smoke_usb_uac_pcm_format_audio_frame_bytes() -> TestResult {
     use crate::uac::PcmFormat;
-    let stereo_16 = PcmFormat { channels: 2, bytes_per_sample: 2, bit_depth: 16 };
+    let stereo_16 = PcmFormat {
+        channels: 2,
+        bytes_per_sample: 2,
+        bit_depth: 16,
+    };
     if stereo_16.audio_frame_bytes() != 4 {
         return TestResult::Fail("stereo/16: 2 ch * 2 bytes = 4");
     }
     if stereo_16.iso_packet_bytes(48) != 4 * 48 {
         return TestResult::Fail("iso_packet_bytes(48) wrong");
     }
-    let five_one_24 = PcmFormat { channels: 6, bytes_per_sample: 4, bit_depth: 24 };
+    let five_one_24 = PcmFormat {
+        channels: 6,
+        bytes_per_sample: 4,
+        bit_depth: 24,
+    };
     if five_one_24.audio_frame_bytes() != 24 {
         return TestResult::Fail("5.1/24-in-32: 6 ch * 4 = 24");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_format_audio_frame_bytes);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_usb_uac_pcm_format_audio_frame_bytes
+);
 
 fn smoke_usb_uac_pcm_ring_push_pop_round_trip() -> TestResult {
     use crate::uac::{PcmFormat, PcmRing};
-    let fmt = PcmFormat { channels: 2, bytes_per_sample: 2, bit_depth: 16 };
+    let fmt = PcmFormat {
+        channels: 2,
+        bytes_per_sample: 2,
+        bit_depth: 16,
+    };
     let mut ring = PcmRing::new(fmt, 128);
     // Push 16 bytes (4 audio frames).
     let in_bytes: [u8; 16] = [
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x10,
     ];
     ring.push(&in_bytes).expect("push");
     if ring.filled() != 16 {
@@ -2141,11 +2230,18 @@ fn smoke_usb_uac_pcm_ring_push_pop_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_push_pop_round_trip);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_usb_uac_pcm_ring_push_pop_round_trip
+);
 
 fn smoke_usb_uac_pcm_ring_misaligned_rejected() -> TestResult {
     use crate::uac::{PcmError, PcmFormat, PcmRing};
-    let fmt = PcmFormat { channels: 2, bytes_per_sample: 2, bit_depth: 16 };
+    let fmt = PcmFormat {
+        channels: 2,
+        bytes_per_sample: 2,
+        bit_depth: 16,
+    };
     let mut ring = PcmRing::new(fmt, 64);
     // 5 bytes — not a multiple of 4 (audio_frame_bytes).
     match ring.push(&[0u8; 5]) {
@@ -2158,13 +2254,20 @@ fn smoke_usb_uac_pcm_ring_misaligned_rejected() -> TestResult {
         _ => TestResult::Fail("misaligned pop must reject"),
     }
 }
-kernel_test_in!("drivers/usb/uac", smoke_usb_uac_pcm_ring_misaligned_rejected);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_usb_uac_pcm_ring_misaligned_rejected
+);
 
 fn smoke_usb_uac_pcm_ring_wraps_around() -> TestResult {
     use crate::uac::{PcmFormat, PcmRing};
-    let fmt = PcmFormat { channels: 1, bytes_per_sample: 2, bit_depth: 16 };
+    let fmt = PcmFormat {
+        channels: 1,
+        bytes_per_sample: 2,
+        bit_depth: 16,
+    };
     let mut ring = PcmRing::new(fmt, 8); // capacity = 8 bytes
-    // Fill the ring, drain it, fill again — forces head+tail wrap.
+                                         // Fill the ring, drain it, fill again — forces head+tail wrap.
     ring.push(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22])
         .expect("push 1");
     let mut tmp = [0u8; 8];
@@ -2238,9 +2341,8 @@ kernel_test_in!("drivers/usb/uac", smoke_uac_format_type_i_24bit_48k_stereo);
 
 fn smoke_uac_volume_set_cur_get_cur_encode_decode() -> TestResult {
     use crate::uac::{
-        decode_mute, decode_volume, encode_mute, encode_volume,
-        fu_windex, fu_wvalue, FU_CS_VOLUME, FU_CS_MUTE, CHANNEL_MASTER,
-        REQ_SET_CUR, REQ_GET_CUR,
+        decode_mute, decode_volume, encode_mute, encode_volume, fu_windex, fu_wvalue,
+        CHANNEL_MASTER, FU_CS_MUTE, FU_CS_VOLUME, REQ_GET_CUR, REQ_SET_CUR,
     };
 
     // ── request-code round-trip ──────────────────────────────────────
@@ -2304,7 +2406,10 @@ fn smoke_uac_volume_set_cur_get_cur_encode_decode() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uac", smoke_uac_volume_set_cur_get_cur_encode_decode);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_volume_set_cur_get_cur_encode_decode
+);
 
 // ── drivers/usb/xhci (iso EP discovery + iso TRB constants) ────────
 //
@@ -2325,11 +2430,31 @@ fn smoke_usb_uac_finder_picks_iso_endpoints_from_as_iface() -> TestResult {
     // AC iface
     v.extend_from_slice(&[9, 0x04, 0, 0, 0, USB_CLASS_AUDIO, 0x01, 0, 0]);
     // AS iface 1
-    v.extend_from_slice(&[9, 0x04, 1, 0, 1, USB_CLASS_AUDIO, USB_AUDIO_SUBCLASS_AUDIOSTREAMING, 0, 0]);
+    v.extend_from_slice(&[
+        9,
+        0x04,
+        1,
+        0,
+        1,
+        USB_CLASS_AUDIO,
+        USB_AUDIO_SUBCLASS_AUDIOSTREAMING,
+        0,
+        0,
+    ]);
     // iso OUT endpoint 0x03, attrs=0x01 (iso, asynch).
     v.extend_from_slice(&[7, 0x05, 0x03, 0x01, 0x00, 0x01, 1]);
     // AS iface 2 (capture)
-    v.extend_from_slice(&[9, 0x04, 2, 0, 1, USB_CLASS_AUDIO, USB_AUDIO_SUBCLASS_AUDIOSTREAMING, 0, 0]);
+    v.extend_from_slice(&[
+        9,
+        0x04,
+        2,
+        0,
+        1,
+        USB_CLASS_AUDIO,
+        USB_AUDIO_SUBCLASS_AUDIOSTREAMING,
+        0,
+        0,
+    ]);
     // iso IN endpoint 0x82, attrs=0x01.
     v.extend_from_slice(&[7, 0x05, 0x82, 0x01, 0x00, 0x01, 1]);
     let total = v.len() as u16;
@@ -2347,7 +2472,10 @@ fn smoke_usb_uac_finder_picks_iso_endpoints_from_as_iface() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uac", smoke_usb_uac_finder_picks_iso_endpoints_from_as_iface);
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_usb_uac_finder_picks_iso_endpoints_from_as_iface
+);
 
 fn smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface() -> TestResult {
     use crate::uvc::{
@@ -2358,7 +2486,17 @@ fn smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface() -> TestResult {
     // VC iface
     v.extend_from_slice(&[9, 0x04, 0, 0, 0, USB_CLASS_VIDEO, 0x01, 0, 0]);
     // VS iface
-    v.extend_from_slice(&[9, 0x04, 1, 0, 1, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOSTREAMING, 0, 0]);
+    v.extend_from_slice(&[
+        9,
+        0x04,
+        1,
+        0,
+        1,
+        USB_CLASS_VIDEO,
+        USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+        0,
+        0,
+    ]);
     // iso IN endpoint 0x81.
     v.extend_from_slice(&[7, 0x05, 0x81, 0x01, 0x00, 0x04, 1]);
     let total = v.len() as u16;
@@ -2379,7 +2517,10 @@ fn smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface);
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_finder_picks_iso_in_endpoint_from_vs_iface
+);
 
 // ── Bring-up replication: input chain failure modes ───────────────
 //
@@ -2414,7 +2555,10 @@ fn smoke_hid_pump_all_with_no_keyboards_is_noop() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/hid", smoke_hid_pump_all_with_no_keyboards_is_noop);
+kernel_test_in!(
+    "drivers/usb/hid",
+    smoke_hid_pump_all_with_no_keyboards_is_noop
+);
 
 /// On-screen diagnostic contract: `PUMP_ALL_CALLS` advances on
 /// every supervisor wake; `REPORTS_READ` advances on every
@@ -2493,8 +2637,7 @@ kernel_test_in!(
 /// that's missing an interrupt-IN endpoint. Reproduces the
 /// `port=6 step=find_boot_kbd err=NoInterruptIn` message from
 /// the user's real-HW boot — same root path.
-fn smoke_hid_find_boot_keyboard_returns_no_interrupt_in_when_missing()
--> TestResult {
+fn smoke_hid_find_boot_keyboard_returns_no_interrupt_in_when_missing() -> TestResult {
     use crate::hid::{find_boot_keyboard, HidError};
     // HID Boot Keyboard interface BUT no interrupt-IN endpoint.
     let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -2521,13 +2664,8 @@ kernel_test_in!(
 /// The USB-IF Wireless Controllers class triple for a Bluetooth
 /// programming interface (Vol 4 Part B + USB-IF v1.0).
 fn smoke_btusb_class_triple_constants() -> TestResult {
-    use crate::btusb::{
-        USB_CLASS_WIRELESS, USB_PROTOCOL_BLUETOOTH, USB_SUBCLASS_RF,
-    };
-    if USB_CLASS_WIRELESS != 0xE0
-        || USB_SUBCLASS_RF != 0x01
-        || USB_PROTOCOL_BLUETOOTH != 0x01
-    {
+    use crate::btusb::{USB_CLASS_WIRELESS, USB_PROTOCOL_BLUETOOTH, USB_SUBCLASS_RF};
+    if USB_CLASS_WIRELESS != 0xE0 || USB_SUBCLASS_RF != 0x01 || USB_PROTOCOL_BLUETOOTH != 0x01 {
         return TestResult::Fail("btusb class triple drift");
     }
     TestResult::Pass
@@ -2563,19 +2701,13 @@ fn smoke_btusb_find_endpoints_minimal_descriptor() -> TestResult {
     if eps.interface != 0 || eps.config_value != 1 {
         return TestResult::Fail("interface / configValue mismatch");
     }
-    if eps.event_in.ep_addr != 0x81
-        || !matches!(eps.event_in.kind, EndpointKind::InterruptIn)
-    {
+    if eps.event_in.ep_addr != 0x81 || !matches!(eps.event_in.kind, EndpointKind::InterruptIn) {
         return TestResult::Fail("event-IN mis-identified");
     }
-    if eps.acl_in.ep_addr != 0x82
-        || !matches!(eps.acl_in.kind, EndpointKind::BulkIn)
-    {
+    if eps.acl_in.ep_addr != 0x82 || !matches!(eps.acl_in.kind, EndpointKind::BulkIn) {
         return TestResult::Fail("ACL-IN mis-identified");
     }
-    if eps.acl_out.ep_addr != 0x02
-        || !matches!(eps.acl_out.kind, EndpointKind::BulkOut)
-    {
+    if eps.acl_out.ep_addr != 0x02 || !matches!(eps.acl_out.kind, EndpointKind::BulkOut) {
         return TestResult::Fail("ACL-OUT mis-identified");
     }
     if eps.event_in.max_packet != 16 || eps.acl_in.max_packet != 64 {
@@ -2713,12 +2845,32 @@ fn smoke_fp_endpoint_discovery() -> TestResult {
     // Build a vendor-class (0xFF) config with bulk-IN @ 0x81 +
     // bulk-OUT @ 0x01.
     let mut cfg: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
-    cfg[0] = 9; cfg[1] = 0x02; cfg[2] = 32; cfg[4] = 1; cfg[5] = 1;
-    cfg[9] = 9; cfg[10] = 0x04; cfg[11] = 0; cfg[13] = 2; cfg[14] = 0xFF;
-    cfg[18] = 7; cfg[19] = 0x05; cfg[20] = 0x81; cfg[21] = 0x02; cfg[22] = 0x00; cfg[23] = 0x02;
-    cfg[25] = 7; cfg[26] = 0x05; cfg[27] = 0x01; cfg[28] = 0x02; cfg[29] = 0x00; cfg[30] = 0x02;
+    cfg[0] = 9;
+    cfg[1] = 0x02;
+    cfg[2] = 32;
+    cfg[4] = 1;
+    cfg[5] = 1;
+    cfg[9] = 9;
+    cfg[10] = 0x04;
+    cfg[11] = 0;
+    cfg[13] = 2;
+    cfg[14] = 0xFF;
+    cfg[18] = 7;
+    cfg[19] = 0x05;
+    cfg[20] = 0x81;
+    cfg[21] = 0x02;
+    cfg[22] = 0x00;
+    cfg[23] = 0x02;
+    cfg[25] = 7;
+    cfg[26] = 0x05;
+    cfg[27] = 0x01;
+    cfg[28] = 0x02;
+    cfg[29] = 0x00;
+    cfg[30] = 0x02;
     match find_fp_endpoints(&cfg, FpVendor::Goodix) {
-        Ok(FpEndpoints::Bulk { bulk_in, bulk_out, .. }) => {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
             if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
                 return TestResult::Fail("bulk-IN mis-decoded");
             }
@@ -2730,10 +2882,22 @@ fn smoke_fp_endpoint_discovery() -> TestResult {
     }
     // ELAN: interrupt-IN @ 0x81 (bmAttributes=3).
     let mut cfg2: alloc::vec::Vec<u8> = alloc::vec![0u8; 25];
-    cfg2[0] = 9; cfg2[1] = 0x02; cfg2[2] = 25; cfg2[4] = 1; cfg2[5] = 1;
-    cfg2[9] = 9; cfg2[10] = 0x04; cfg2[11] = 0; cfg2[13] = 1; cfg2[14] = 0xFF;
-    cfg2[18] = 7; cfg2[19] = 0x05; cfg2[20] = 0x81; cfg2[21] = 0x03;
-    cfg2[22] = 0x40; cfg2[23] = 0x00;
+    cfg2[0] = 9;
+    cfg2[1] = 0x02;
+    cfg2[2] = 25;
+    cfg2[4] = 1;
+    cfg2[5] = 1;
+    cfg2[9] = 9;
+    cfg2[10] = 0x04;
+    cfg2[11] = 0;
+    cfg2[13] = 1;
+    cfg2[14] = 0xFF;
+    cfg2[18] = 7;
+    cfg2[19] = 0x05;
+    cfg2[20] = 0x81;
+    cfg2[21] = 0x03;
+    cfg2[22] = 0x40;
+    cfg2[23] = 0x00;
     match find_fp_endpoints(&cfg2, FpVendor::Elan) {
         Ok(FpEndpoints::InterruptIn { intr_in, .. }) => {
             if intr_in.ep_addr != 0x81 || intr_in.kind != EndpointKind::InterruptIn {
@@ -2761,9 +2925,7 @@ kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
 
 /// Class constants for CCID (USB-IF CCID spec rev 1.1 §4.3 Table 5-1).
 fn smoke_ccid_class_triple_constants() -> TestResult {
-    use crate::ccid::{
-        CCID_INTERFACE_CLASS, CCID_INTERFACE_PROTOCOL, CCID_INTERFACE_SUBCLASS,
-    };
+    use crate::ccid::{CCID_INTERFACE_CLASS, CCID_INTERFACE_PROTOCOL, CCID_INTERFACE_SUBCLASS};
     if CCID_INTERFACE_CLASS != 0x0B
         || CCID_INTERFACE_SUBCLASS != 0x00
         || CCID_INTERFACE_PROTOCOL != 0x00
@@ -2778,9 +2940,7 @@ kernel_test_in!("drivers/usb/ccid", smoke_ccid_class_triple_constants);
 /// set in dwProtocols, and verify `CcidDescriptor::from_bytes` decodes
 /// them (CCID spec §5.1 Table 5-1).
 fn smoke_ccid_descriptor_t0_t1() -> TestResult {
-    use crate::ccid::{
-        CcidDescriptor, CCID_DESC_TYPE, CCID_HDR_LEN, CCID_PROTO_T0, CCID_PROTO_T1,
-    };
+    use crate::ccid::{CcidDescriptor, CCID_DESC_TYPE, CCID_HDR_LEN, CCID_PROTO_T0, CCID_PROTO_T1};
     let _ = CCID_HDR_LEN; // used indirectly through the protocol
     let mut buf = [0u8; 54];
     buf[0] = 54;
@@ -2890,30 +3050,47 @@ fn smoke_ccid_bind_fake_xhci() -> TestResult {
     // Config (9) + Interface (9) + CCID descriptor (54) + 3 endpoints (21) = 93.
     let total: u16 = 93;
     let mut cfg = alloc::vec![0u8; total as usize];
-    cfg[0] = 9;    cfg[1] = 0x02;
-    cfg[2] = (total & 0xFF) as u8; cfg[3] = (total >> 8) as u8;
-    cfg[4] = 1;    cfg[5] = 1; // bConfigurationValue
-    cfg[7] = 0xC0; cfg[8] = 50;
+    cfg[0] = 9;
+    cfg[1] = 0x02;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+    cfg[4] = 1;
+    cfg[5] = 1; // bConfigurationValue
+    cfg[7] = 0xC0;
+    cfg[8] = 50;
     // Interface at 9
-    cfg[9] = 9; cfg[10] = 0x04; cfg[11] = 0;
+    cfg[9] = 9;
+    cfg[10] = 0x04;
+    cfg[11] = 0;
     cfg[13] = 3;
     cfg[14] = CCID_INTERFACE_CLASS;
     cfg[15] = CCID_INTERFACE_SUBCLASS;
     cfg[16] = CCID_INTERFACE_PROTOCOL;
     // CCID class descriptor at 18
-    cfg[18] = 54; cfg[19] = CCID_DESC_TYPE;
-    cfg[20] = 0x10; cfg[21] = 0x01; // bcdCCID = 0x0110
+    cfg[18] = 54;
+    cfg[19] = CCID_DESC_TYPE;
+    cfg[20] = 0x10;
+    cfg[21] = 0x01; // bcdCCID = 0x0110
     cfg[24..28].copy_from_slice(&(CCID_PROTO_T0 | CCID_PROTO_T1).to_le_bytes());
     cfg[46..50].copy_from_slice(&254u32.to_le_bytes()); // dwMaxIFSD
     cfg[62..66].copy_from_slice(&271u32.to_le_bytes()); // dwMaxCCIDMessageLength
-    // Bulk-IN (EP1 IN) at 72
-    cfg[72] = 7; cfg[73] = 0x05; cfg[74] = 0x81; cfg[75] = 0x02;
+                                                        // Bulk-IN (EP1 IN) at 72
+    cfg[72] = 7;
+    cfg[73] = 0x05;
+    cfg[74] = 0x81;
+    cfg[75] = 0x02;
     cfg[76] = 64;
     // Bulk-OUT (EP1 OUT) at 79
-    cfg[79] = 7; cfg[80] = 0x05; cfg[81] = 0x01; cfg[82] = 0x02;
+    cfg[79] = 7;
+    cfg[80] = 0x05;
+    cfg[81] = 0x01;
+    cfg[82] = 0x02;
     cfg[83] = 64;
     // Interrupt-IN (EP2 IN) at 86
-    cfg[86] = 7; cfg[87] = 0x05; cfg[88] = 0x82; cfg[89] = 0x03;
+    cfg[86] = 7;
+    cfg[87] = 0x05;
+    cfg[88] = 0x82;
+    cfg[89] = 0x03;
     cfg[90] = 8;
 
     let (iface, iface_off) = match find_ccid_interface(&cfg) {
@@ -3060,7 +3237,7 @@ kernel_test_in!("drivers/usb/ccid/t0", smoke_ccid_t0_get_response_chaining);
 /// T=1 I-block with N(S)=0: PCB=0x00, LRC covers NAD+PCB+LEN+INF.
 /// ISO 7816-3 §11.3.2 / §11.3.3.
 fn smoke_ccid_t1_iblock_lrc() -> TestResult {
-    use crate::ccid::t1::{T1Block, lrc_check};
+    use crate::ccid::t1::{lrc_check, T1Block};
     let block = T1Block::i_block(0, &[0xDE, 0xAD]);
     let wire = match block.encode() {
         Ok(w) => w,
@@ -3085,7 +3262,7 @@ kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_iblock_lrc);
 /// T=1 R-block ACK (N(R)=0) encodes to PCB=0x80, no INF.
 /// ISO 7816-3 §11.6.2.2 / Table 16.
 fn smoke_ccid_t1_rblock_ack_nak() -> TestResult {
-    use crate::ccid::t1::{T1Block, lrc_check};
+    use crate::ccid::t1::{lrc_check, T1Block};
     let ack = T1Block::r_block_ack(0);
     if !ack.is_rblock() {
         return TestResult::Fail("r_block_ack should be an R-block");
@@ -3124,7 +3301,7 @@ kernel_test_in!("drivers/usb/ccid/t1", smoke_ccid_t1_rblock_ack_nak);
 /// T=1 S(IFS request) encodes to PCB=0xC1 with one-byte INF=ifsd.
 /// ISO 7816-3 §11.6.3.1.
 fn smoke_ccid_t1_sblock_ifs_request() -> TestResult {
-    use crate::ccid::t1::{T1Block, lrc_check, PCB_SBLOCK_IFS_REQ};
+    use crate::ccid::t1::{lrc_check, T1Block, PCB_SBLOCK_IFS_REQ};
     let block = T1Block::s_ifs_request(0xFE);
     if !block.is_sblock() {
         return TestResult::Fail("IFS block should be S-block");
@@ -3200,7 +3377,11 @@ fn smoke_xhci_cap_decode_hcsparams1_hccparams1() -> TestResult {
     // 0x14 << 24 | 0x20 << 8 | 0x40 = 0x14002040.
     let v = (0x14u32 << 24) | (0x20u32 << 8) | 0x40u32;
     let h = decode_hcsparams1(v);
-    if h != (HcsParams1 { max_slots: 0x40, max_intrs: 0x20, max_ports: 0x14 }) {
+    if h != (HcsParams1 {
+        max_slots: 0x40,
+        max_intrs: 0x20,
+        max_ports: 0x14,
+    }) {
         return TestResult::Fail("HCSPARAMS1 decode mismatch");
     }
     // HCCPARAMS1: AC64=1, CSZ=0, xECP=0x100 dwords.
@@ -3228,12 +3409,17 @@ fn smoke_xhci_cap_decode_hcsparams1_hccparams1() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_cap_decode_hcsparams1_hccparams1);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_cap_decode_hcsparams1_hccparams1
+);
 
 /// PORTSC decode — the port-reset state machine reads CCS/PED/PR/PLS
 /// + the change bits. Verify [`PortStatus::decode`] surfaces them.
 fn smoke_xhci_portsc_decode_state_machine() -> TestResult {
-    use crate::xhci::op::{PortLinkState, PortStatus, PORTSC_CCS, PORTSC_CSC, PORTSC_PR, PORTSC_PRC};
+    use crate::xhci::op::{
+        PortLinkState, PortStatus, PORTSC_CCS, PORTSC_CSC, PORTSC_PR, PORTSC_PRC,
+    };
     // Connected, reset-in-progress: CCS=1, PR=1, CSC=1 (a hot-plug
     // event), PLS=Polling (7). PORTSC_PLS at bits[8:5].
     let v = PORTSC_CCS | PORTSC_PR | PORTSC_CSC | (7u32 << 5);
@@ -3262,8 +3448,8 @@ kernel_test_in!("drivers/usb/xhci", smoke_xhci_portsc_decode_state_machine);
 fn smoke_xhci_cmd_trb_encode_address_configure_enable() -> TestResult {
     use crate::xhci::cmd_ring::{
         encode_address_device, encode_configure_endpoint, encode_enable_slot,
-        TRB_TYPE_ADDRESS_DEVICE_CMD, TRB_TYPE_CONFIGURE_ENDPOINT_CMD,
-        TRB_TYPE_ENABLE_SLOT_CMD, TRB_TYPE_MASK, TRB_TYPE_SHIFT,
+        TRB_TYPE_ADDRESS_DEVICE_CMD, TRB_TYPE_CONFIGURE_ENDPOINT_CMD, TRB_TYPE_ENABLE_SLOT_CMD,
+        TRB_TYPE_MASK, TRB_TYPE_SHIFT,
     };
     let trb = encode_enable_slot(0, 1);
     if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_ENABLE_SLOT_CMD {
@@ -3291,15 +3477,18 @@ fn smoke_xhci_cmd_trb_encode_address_configure_enable() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_cmd_trb_encode_address_configure_enable);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_cmd_trb_encode_address_configure_enable
+);
 
 /// Event TRB decode — Transfer Event, Command Completion, Port Status
 /// Change. Each fields its slot/EP/completion-code per §6.4.2.
 fn smoke_xhci_event_trb_decode_transfer_cmd_psc() -> TestResult {
+    use crate::xhci::cmd_ring::TRB_TYPE_SHIFT;
     use crate::xhci::event_ring::{
         DecodedEvent, EVT_CMD_COMPLETION, EVT_PORT_STATUS_CHANGE, EVT_TRANSFER,
     };
-    use crate::xhci::cmd_ring::TRB_TYPE_SHIFT;
     // Transfer Event: slot=3, EP=DCI=2 (bulk-OUT EP1), completion=1 (Success),
     // transfer_length residue=4. Pack into 4 dwords.
     let xfer_d3 = (EVT_TRANSFER << TRB_TYPE_SHIFT) | (3u32 << 24) | (2u32 << 16);
@@ -3307,7 +3496,11 @@ fn smoke_xhci_event_trb_decode_transfer_cmd_psc() -> TestResult {
     let ev = DecodedEvent::from_dwords([0xCAFE0000, 0, xfer_d2, xfer_d3]);
     match ev {
         DecodedEvent::Transfer(t) => {
-            if t.slot_id != 3 || t.endpoint_id != 2 || t.completion_code != 1 || t.transfer_length != 4 {
+            if t.slot_id != 3
+                || t.endpoint_id != 2
+                || t.completion_code != 1
+                || t.transfer_length != 4
+            {
                 return TestResult::Fail("Transfer Event fields mismatch");
             }
         }
@@ -3340,7 +3533,10 @@ fn smoke_xhci_event_trb_decode_transfer_cmd_psc() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_event_trb_decode_transfer_cmd_psc);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_event_trb_decode_transfer_cmd_psc
+);
 
 /// Normal TRB encode — bulk-OUT data buffer + IOC flag.
 fn smoke_xhci_normal_trb_encode_bulk_out() -> TestResult {
@@ -3367,8 +3563,8 @@ kernel_test_in!("drivers/usb/xhci", smoke_xhci_normal_trb_encode_bulk_out);
 /// Setup / Data / Status Stage TRB encode for a control IN transfer.
 fn smoke_xhci_setup_data_status_stage_encode() -> TestResult {
     use crate::xhci::cmd_ring::{
-        TRB_IDT, TRB_IOC, TRB_TYPE_DATA_STAGE, TRB_TYPE_MASK, TRB_TYPE_SETUP_STAGE,
-        TRB_TYPE_SHIFT, TRB_TYPE_STATUS_STAGE,
+        TRB_IDT, TRB_IOC, TRB_TYPE_DATA_STAGE, TRB_TYPE_MASK, TRB_TYPE_SETUP_STAGE, TRB_TYPE_SHIFT,
+        TRB_TYPE_STATUS_STAGE,
     };
     use crate::xhci::transfer_ring::{
         encode_data_stage, encode_setup_stage, encode_status_stage, TRB_DIR_IN, TRT_IN_DATA,
@@ -3416,15 +3612,17 @@ fn smoke_xhci_setup_data_status_stage_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_setup_data_status_stage_encode);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_setup_data_status_stage_encode
+);
 
 /// Input Context layout — Add Context Flag bitmap addresses Slot
 /// (bit 0), EP0 (bit 1), then DCI N (bit N). Drop Flag rejects DCI <
 /// 2.
 fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
     use crate::xhci::slot::{
-        encode_slot_ctx_dword0, input_ctx_add_flag, input_ctx_drop_flag,
-        input_context_size,
+        encode_slot_ctx_dword0, input_context_size, input_ctx_add_flag, input_ctx_drop_flag,
     };
     // Add Slot Context: bit 0.
     if input_ctx_add_flag(0) != 1 {
@@ -3468,7 +3666,10 @@ fn smoke_xhci_input_ctx_layout_add_drop_flags() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_input_ctx_layout_add_drop_flags);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_input_ctx_layout_add_drop_flags
+);
 
 /// DCBAA entry encode — phys must be 64-byte aligned per §6.1.
 fn smoke_xhci_dcbaa_entry_encode() -> TestResult {
@@ -3542,9 +3743,9 @@ kernel_test_in!("drivers/usb/xhci", smoke_xhci_slot_state_machine_decode);
 /// Endpoint Context encode covers IN / OUT / Bulk / Interrupt / Iso.
 fn smoke_xhci_endpoint_context_encode_all_kinds() -> TestResult {
     use crate::xhci::slot::{
-        encode_ep_ctx_dword1, encode_ep_ctx_dword2_tr_lo, encode_ep_ctx_dword4,
-        EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INT_IN,
-        EP_TYPE_INT_OUT, EP_TYPE_ISOCH_IN, EP_TYPE_ISOCH_OUT,
+        encode_ep_ctx_dword1, encode_ep_ctx_dword2_tr_lo, encode_ep_ctx_dword4, EP_TYPE_BULK_IN,
+        EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INT_IN, EP_TYPE_INT_OUT, EP_TYPE_ISOCH_IN,
+        EP_TYPE_ISOCH_OUT,
     };
     // Bulk OUT, CErr=3, MaxBurst=0, MPS=512.
     let d1 = encode_ep_ctx_dword1(3, EP_TYPE_BULK_OUT, 0, 512);
@@ -3560,8 +3761,12 @@ fn smoke_xhci_endpoint_context_encode_all_kinds() -> TestResult {
     // Bulk-IN, IsochIn, IsochOut, IntIn, IntOut, Control all distinct.
     let mut seen = [false; 8];
     for k in [
-        EP_TYPE_BULK_IN, EP_TYPE_INT_IN, EP_TYPE_INT_OUT,
-        EP_TYPE_ISOCH_IN, EP_TYPE_ISOCH_OUT, EP_TYPE_CONTROL,
+        EP_TYPE_BULK_IN,
+        EP_TYPE_INT_IN,
+        EP_TYPE_INT_OUT,
+        EP_TYPE_ISOCH_IN,
+        EP_TYPE_ISOCH_OUT,
+        EP_TYPE_CONTROL,
     ] {
         if seen[k as usize] {
             return TestResult::Fail("EP type values must be distinct");
@@ -3593,7 +3798,10 @@ fn smoke_xhci_endpoint_context_encode_all_kinds() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/xhci", smoke_xhci_endpoint_context_encode_all_kinds);
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_endpoint_context_encode_all_kinds
+);
 
 /// PCI class triple match for an xHCI controller (0x0c0330).
 fn smoke_xhci_pci_class_match_triple() -> TestResult {
@@ -3601,10 +3809,7 @@ fn smoke_xhci_pci_class_match_triple() -> TestResult {
         is_xhci_class, PCI_CLASS_SERIAL_BUS, PCI_CLASS_TRIPLE_XHCI, PCI_PROGIF_XHCI,
         PCI_SUBCLASS_USB,
     };
-    if PCI_CLASS_SERIAL_BUS != 0x0C
-        || PCI_SUBCLASS_USB != 0x03
-        || PCI_PROGIF_XHCI != 0x30
-    {
+    if PCI_CLASS_SERIAL_BUS != 0x0C || PCI_SUBCLASS_USB != 0x03 || PCI_PROGIF_XHCI != 0x30 {
         return TestResult::Fail("PCI class constants wrong");
     }
     if PCI_CLASS_TRIPLE_XHCI != 0x000C_0330 {
@@ -3678,7 +3883,10 @@ fn smoke_usb_error_translates_completion_codes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/device", smoke_usb_error_translates_completion_codes);
+kernel_test_in!(
+    "drivers/usb/device",
+    smoke_usb_error_translates_completion_codes
+);
 
 /// dci_for() — bEndpointAddress → DCI math per xHCI §4.8.1.
 fn smoke_usb_dci_for_endpoint_address() -> TestResult {
@@ -3752,7 +3960,10 @@ fn smoke_usb_setup_packet_encode_vendor_and_get_descriptor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/control", smoke_usb_setup_packet_encode_vendor_and_get_descriptor);
+kernel_test_in!(
+    "drivers/usb/control",
+    smoke_usb_setup_packet_encode_vendor_and_get_descriptor
+);
 
 /// rtl8xxxu integration — read MAC EFUSE byte via control-transfer
 /// SETUP-packet encoding matches the per-chip Realtek read layout.
@@ -3799,7 +4010,10 @@ fn smoke_rtl8xxxu_efuse_read_setup_via_narf_usb() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/control", smoke_rtl8xxxu_efuse_read_setup_via_narf_usb);
+kernel_test_in!(
+    "drivers/usb/control",
+    smoke_rtl8xxxu_efuse_read_setup_via_narf_usb
+);
 
 // ── Wacom tablet driver ─────────────────────────────────────────────
 
@@ -3832,7 +4046,9 @@ fn smoke_wacom_intuos_pro_s_in_table() -> TestResult {
 kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_s_in_table);
 
 fn smoke_wacom_mode_select_feature_report() -> TestResult {
-    use crate::hid::wacom_features::{encode_pen_mode_report, WACOM_FEATURE_REPORT_ID, WACOM_PEN_MODE_VALUE};
+    use crate::hid::wacom_features::{
+        encode_pen_mode_report, WACOM_FEATURE_REPORT_ID, WACOM_PEN_MODE_VALUE,
+    };
     let mut buf = [0u8; 8];
     let n = encode_pen_mode_report(&mut buf);
     if n != 2 {
@@ -3846,7 +4062,10 @@ fn smoke_wacom_mode_select_feature_report() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_mode_select_feature_report);
+kernel_test_in!(
+    "drivers/usb/hid/wacom",
+    smoke_wacom_mode_select_feature_report
+);
 
 fn smoke_wacom_intuos_pro_pen_tip_and_pressure() -> TestResult {
     use crate::hid::wacom::{WacomState, REPORT_PENABLED};
@@ -3902,7 +4121,10 @@ fn smoke_wacom_intuos_pro_pen_tip_and_pressure() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_pen_tip_and_pressure);
+kernel_test_in!(
+    "drivers/usb/hid/wacom",
+    smoke_wacom_intuos_pro_pen_tip_and_pressure
+);
 
 fn smoke_wacom_intuos_pro_barrel_button() -> TestResult {
     use crate::hid::wacom::{WacomState, REPORT_PENABLED};
@@ -3923,7 +4145,7 @@ fn smoke_wacom_intuos_pro_barrel_button() -> TestResult {
     let mut data = [0u8; 10];
     data[0] = REPORT_PENABLED;
     data[1] = 0x02; // barrel1 bit
-    data[8] = 64;   // tilt Y neutral
+    data[8] = 64; // tilt Y neutral
     state.handle_report(&data);
 
     while let Some(e) = pop_button() {
@@ -3933,7 +4155,10 @@ fn smoke_wacom_intuos_pro_barrel_button() -> TestResult {
     }
     TestResult::Fail("BTN_STYLUS (barrel1) not emitted from Intuos Pro pen report")
 }
-kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_barrel_button);
+kernel_test_in!(
+    "drivers/usb/hid/wacom",
+    smoke_wacom_intuos_pro_barrel_button
+);
 
 fn smoke_wacom_intuos_pro_eraser_in_range() -> TestResult {
     use crate::hid::wacom::{WacomState, REPORT_PENABLED};
@@ -3957,7 +4182,10 @@ fn smoke_wacom_intuos_pro_eraser_in_range() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/hid/wacom", smoke_wacom_intuos_pro_eraser_in_range);
+kernel_test_in!(
+    "drivers/usb/hid/wacom",
+    smoke_wacom_intuos_pro_eraser_in_range
+);
 
 fn smoke_wacom_intuos_pro_tilt_signed() -> TestResult {
     use crate::hid::wacom::{WacomState, REPORT_PENABLED};
@@ -3984,7 +4212,7 @@ fn smoke_wacom_intuos_pro_tilt_signed() -> TestResult {
     // data[7]: tilt_x = ((data[7]<<1)&0x7E | ...) - 64
     // Set to give +45: raw = 45+64=109; (109>>0)&0x7E=108, data[7]=54.
     data[7] = 54; // encodes tilt_x ≈ +44
-    // data[8]: tilt_y = (data[8] & 0x7F) - 64. For -20: 44 → data[8]=44.
+                  // data[8]: tilt_y = (data[8] & 0x7F) - 64. For -20: 44 → data[8]=44.
     data[8] = 44; // encodes tilt_y ≈ -20
 
     state.handle_report(&data);
@@ -3992,8 +4220,12 @@ fn smoke_wacom_intuos_pro_tilt_signed() -> TestResult {
     let mut tilt_x = None;
     let mut tilt_y = None;
     while let Some(e) = pop_absolute() {
-        if e.axis == abs::ABS_TILT_X { tilt_x = Some(e.value); }
-        if e.axis == abs::ABS_TILT_Y { tilt_y = Some(e.value); }
+        if e.axis == abs::ABS_TILT_X {
+            tilt_x = Some(e.value);
+        }
+        if e.axis == abs::ABS_TILT_Y {
+            tilt_y = Some(e.value);
+        }
     }
 
     if let Some(tx) = tilt_x {
@@ -4038,7 +4270,9 @@ fn smoke_wacom_bamboo_one_pen_decode() -> TestResult {
 
     let mut found_x = false;
     while let Some(e) = pop_absolute() {
-        if e.axis == abs::ABS_X && e.value > 0 { found_x = true; }
+        if e.axis == abs::ABS_X && e.value > 0 {
+            found_x = true;
+        }
     }
     if !found_x {
         return TestResult::Fail("no positive ABS_X from One by Wacom pen report");
@@ -4069,7 +4303,8 @@ fn smoke_wacom_cintiq_pad_expresskeys() -> TestResult {
     }
 
     while let Some(e) = pop_button() {
-        if e.code == 0x100 && e.pressed { // BTN_0
+        if e.code == 0x100 && e.pressed {
+            // BTN_0
             return TestResult::Pass;
         }
     }
@@ -4120,8 +4355,8 @@ kernel_test_in!("drivers/usb/hub", smoke_usb_hub_descriptor_decode);
 /// Table 11-16 (wPortChange). Linux hub.c `hub_port_status` ~L665.
 fn smoke_usb_hub_port_status_decode() -> TestResult {
     use crate::hub::{
-        C_PORT_CONNECTION, C_PORT_OVER_CURRENT, C_PORT_RESET,
-        PSTAT_CONNECTION, PSTAT_ENABLE, PSTAT_OVER_CURRENT, PSTAT_RESET,
+        C_PORT_CONNECTION, C_PORT_OVER_CURRENT, C_PORT_RESET, PSTAT_CONNECTION, PSTAT_ENABLE,
+        PSTAT_OVER_CURRENT, PSTAT_RESET,
     };
     // wPortStatus: bit 0 = connection, 1 = enable, 3 = over-current, 4 = reset.
     if PSTAT_CONNECTION != 1 << 0 {
@@ -4160,11 +4395,7 @@ kernel_test_in!("drivers/usb/hub", smoke_usb_hub_port_status_decode);
 /// Reference: USB 2.0 §11.24.2.7 Table 11-17 (Port Feature Selectors).
 /// Linux hub.c `hub_power_on` ~L487.
 fn smoke_usb_hub_set_feature_port_power_encode() -> TestResult {
-    use crate::hub::{
-        PORT_POWER,
-        REQ_SET_FEATURE,
-        RT_HOST_TO_DEV_CLASS_OTHER,
-    };
+    use crate::hub::{PORT_POWER, REQ_SET_FEATURE, RT_HOST_TO_DEV_CLASS_OTHER};
     // bmRequestType = 0x23: Host-to-Device, Class, Other (port).
     if RT_HOST_TO_DEV_CLASS_OTHER != 0x23 {
         return TestResult::Fail("bmRequestType for SET_FEATURE(port) should be 0x23");
@@ -4179,4 +4410,7 @@ fn smoke_usb_hub_set_feature_port_power_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/hub", smoke_usb_hub_set_feature_port_power_encode);
+kernel_test_in!(
+    "drivers/usb/hub",
+    smoke_usb_hub_set_feature_port_power_encode
+);
