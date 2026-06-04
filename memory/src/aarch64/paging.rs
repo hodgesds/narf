@@ -249,7 +249,11 @@ pub unsafe fn new_user_ttbr0() -> Result<PhysAddr, PageTableAllocError> {
     // SAFETY: frame is identity-mapped per the allocator's
     // contract; 4 KiB write is aligned.
     unsafe {
-        ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, core::mem::size_of::<PageTable>());
+        ptr::write_bytes(
+            phys.kernel_mut_ptr::<u8>(),
+            0,
+            core::mem::size_of::<PageTable>(),
+        );
     }
     Ok(phys)
 }
@@ -367,7 +371,11 @@ unsafe fn ensure_next_table(entry: &mut PageTableEntry) -> Result<PhysAddr, MapE
     // Zero the new table.
     // SAFETY: identity-mapped frame.
     unsafe {
-        ptr::write_bytes(next.kernel_mut_ptr::<u8>(), 0, core::mem::size_of::<PageTable>());
+        ptr::write_bytes(
+            next.kernel_mut_ptr::<u8>(),
+            0,
+            core::mem::size_of::<PageTable>(),
+        );
     }
     // Table descriptor: low bits 0b11 = valid + table.
     *entry = PageTableEntry(next.raw() | 0b11);

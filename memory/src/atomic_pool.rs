@@ -106,14 +106,18 @@ impl<T: 'static> Deref for Pooled<T> {
     fn deref(&self) -> &T {
         // Always Some until Drop. The Option is for move-out,
         // not for dynamic absence.
-        self.item.as_deref().expect("Pooled<T> moved-out before Drop")
+        self.item
+            .as_deref()
+            .expect("Pooled<T> moved-out before Drop")
     }
 }
 
 impl<T: 'static> DerefMut for Pooled<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        self.item.as_deref_mut().expect("Pooled<T> moved-out before Drop")
+        self.item
+            .as_deref_mut()
+            .expect("Pooled<T> moved-out before Drop")
     }
 }
 

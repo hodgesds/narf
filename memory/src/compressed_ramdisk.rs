@@ -160,9 +160,7 @@ impl CompressedRamDisk {
         if out.len() < bytes_needed {
             return Err(RamDiskError::BufferTooSmall);
         }
-        let end = lba
-            .checked_add(n as u64)
-            .ok_or(RamDiskError::OutOfRange)?;
+        let end = lba.checked_add(n as u64).ok_or(RamDiskError::OutOfRange)?;
         if end > self.capacity_lba {
             return Err(RamDiskError::OutOfRange);
         }
@@ -184,9 +182,7 @@ impl CompressedRamDisk {
         if data.len() < bytes_needed {
             return Err(RamDiskError::BufferTooSmall);
         }
-        let end = lba
-            .checked_add(n as u64)
-            .ok_or(RamDiskError::OutOfRange)?;
+        let end = lba.checked_add(n as u64).ok_or(RamDiskError::OutOfRange)?;
         if end > self.capacity_lba {
             return Err(RamDiskError::OutOfRange);
         }

@@ -629,9 +629,7 @@ pub unsafe fn _test_magazine_push(class_idx: usize, cpu: usize, ptr: NonNull<u8>
     mag.top += 1;
     // Mirror the accounting that `dealloc_class` would have done
     // if this push had come through the public path.
-    CLASSES[class_idx]
-        .in_use
-        .fetch_sub(1, Ordering::Relaxed);
+    CLASSES[class_idx].in_use.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Test: per-CPU isolation. After parking a freed block in CPU 1's
@@ -710,7 +708,11 @@ fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
     let mut g = class.head.lock();
     // SAFETY: `blk` came from this slab's class; we own its bytes
     // until pushed onto the central list.
-    unsafe { blk.as_ptr().cast::<FreeBlock>().write(FreeBlock { next: *g }) };
+    unsafe {
+        blk.as_ptr()
+            .cast::<FreeBlock>()
+            .write(FreeBlock { next: *g })
+    };
     *g = Some(blk);
     drop(g);
     TestResult::Pass

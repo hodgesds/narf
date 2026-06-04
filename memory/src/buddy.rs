@@ -29,8 +29,8 @@
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use crate::frame::{PhysFrame, EARLY_PHYS_CEILING, PAGE_SHIFT, PAGE_SIZE};
 use crate::PhysAddr;
-use crate::frame::{EARLY_PHYS_CEILING, PAGE_SHIFT, PAGE_SIZE, PhysFrame};
 
 /// Smallest block order. Order 0 = 4 KiB.
 pub const MIN_ORDER: u8 = 0;
@@ -341,11 +341,7 @@ impl BuddyZone {
     /// into the buddy (slab refill), and we're holding the
     /// frame-allocator lock for the duration. Allocating here
     /// would recurse and deadlock.
-    pub fn drain_into(
-        &mut self,
-        dest: &mut BuddyZone,
-        predicate: impl Fn(u64) -> bool,
-    ) {
+    pub fn drain_into(&mut self, dest: &mut BuddyZone, predicate: impl Fn(u64) -> bool) {
         for order in 0..NUM_ORDERS {
             let mut i = 0;
             while i < self.free_lists[order].len() {
@@ -494,8 +490,8 @@ mod tests {
     fn coalesce_after_free_buddy() {
         let mut z = BuddyZone::new();
         z.donate(0, 4); // 1 order-2 block (frames 0..4)
-        // Allocate two order-0 blocks (frames 0 and 1 should be
-        // siblings after splitting all the way down).
+                        // Allocate two order-0 blocks (frames 0 and 1 should be
+                        // siblings after splitting all the way down).
         let a = z.alloc(0).unwrap();
         let b = z.alloc(0).unwrap();
         // Free both; they should coalesce back up.

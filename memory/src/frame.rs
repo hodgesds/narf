@@ -27,8 +27,8 @@ use core::fmt;
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::PhysAddr;
 use crate::buddy::{self, BuddyZone, MAX_ORDER};
+use crate::PhysAddr;
 
 /// Page size in bytes. x86_64 / aarch64 both use 4 KiB as the base size.
 pub const PAGE_SIZE: u64 = 4096;
@@ -167,12 +167,7 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
         if region_start >= region_end {
             continue;
         }
-        donate_around_excludes(
-            &mut guard.zones[0],
-            region_start,
-            region_end,
-            exclude,
-        );
+        donate_around_excludes(&mut guard.zones[0], region_start, region_end, exclude);
     }
     guard.initialised = true;
     guard.total_frames = total;
@@ -207,12 +202,7 @@ pub fn reserve_for_slab_promotion() {
 /// Donate the byte range `[start, end)` to `zone`, splitting around
 /// any excluded sub-ranges. Aligns each sub-range to page boundaries
 /// before donating.
-fn donate_around_excludes(
-    zone: &mut BuddyZone,
-    start: u64,
-    end: u64,
-    exclude: &[(u64, u64)],
-) {
+fn donate_around_excludes(zone: &mut BuddyZone, start: u64, end: u64, exclude: &[(u64, u64)]) {
     // Walk left to right, emitting sub-ranges between excludes.
     let mut cursor = start;
     // Collect overlapping excludes, sorted by start.
@@ -503,8 +493,7 @@ static PT_REGISTRY: [core::sync::atomic::AtomicU64; PT_REGISTRY_LEN] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; PT_REGISTRY_LEN]
 };
-static PT_REGISTRY_HEAD: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static PT_REGISTRY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub fn __pagetable_register(phys: u64) {
@@ -527,7 +516,9 @@ pub fn __pagetable_unregister(phys: u64) {
 #[doc(hidden)]
 pub fn __pagetable_is_registered(phys: u64) -> bool {
     use core::sync::atomic::Ordering;
-    PT_REGISTRY.iter().any(|s| s.load(Ordering::Relaxed) == phys)
+    PT_REGISTRY
+        .iter()
+        .any(|s| s.load(Ordering::Relaxed) == phys)
 }
 
 /// Per-frame reference counting for the COW-fork path.

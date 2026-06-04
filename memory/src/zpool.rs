@@ -148,11 +148,7 @@ impl Zpool {
     }
 
     /// Decompress the slot identified by `h` into `out`.
-    pub fn load(
-        &self,
-        h: ZpoolHandle,
-        out: &mut [u8; ZPAGE_SIZE],
-    ) -> Result<(), ZpoolError> {
+    pub fn load(&self, h: ZpoolHandle, out: &mut [u8; ZPAGE_SIZE]) -> Result<(), ZpoolError> {
         let slot = self
             .slots
             .get(h.0 as usize)

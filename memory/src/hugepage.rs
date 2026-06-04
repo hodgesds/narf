@@ -184,7 +184,10 @@ pub fn alloc_hugepage_2m() -> Result<HugeFrame, HugeAllocError> {
     POOL.lock()
         .free_2m
         .pop()
-        .map(|phys| HugeFrame { phys, size: HugeSize::M2 })
+        .map(|phys| HugeFrame {
+            phys,
+            size: HugeSize::M2,
+        })
         .ok_or(HugeAllocError::Empty)
 }
 
@@ -194,7 +197,10 @@ pub fn alloc_hugepage_1g() -> Result<HugeFrame, HugeAllocError> {
     POOL.lock()
         .free_1g
         .pop()
-        .map(|phys| HugeFrame { phys, size: HugeSize::G1 })
+        .map(|phys| HugeFrame {
+            phys,
+            size: HugeSize::G1,
+        })
         .ok_or(HugeAllocError::Empty)
 }
 

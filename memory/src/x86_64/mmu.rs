@@ -98,10 +98,18 @@ struct EarlyPageTables {
 
 const ZERO_ENTRIES: [PageTableEntry; 512] = [PageTableEntry::EMPTY; 512];
 static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
-    pml4: PageTable { entries: ZERO_ENTRIES },
-    pdpt_lo: PageTable { entries: ZERO_ENTRIES },
-    pdpt_hi_mmio: PageTable { entries: ZERO_ENTRIES },
-    pdpt_hi: PageTable { entries: ZERO_ENTRIES },
+    pml4: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pdpt_lo: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pdpt_hi_mmio: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pdpt_hi: PageTable {
+        entries: ZERO_ENTRIES,
+    },
 };
 
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {

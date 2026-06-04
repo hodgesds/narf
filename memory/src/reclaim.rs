@@ -91,8 +91,8 @@
 
 extern crate alloc as alloc_crate;
 
-use alloc_crate::vec::Vec;
 use alloc_crate::collections::VecDeque;
+use alloc_crate::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -400,7 +400,9 @@ pub fn unregister_page(handle: PageHandle) {
 /// reclaimed concurrently).
 pub fn mark_accessed(handle: PageHandle) {
     let mut state = STATE.lock();
-    let Some(idx) = state.find(handle) else { return };
+    let Some(idx) = state.find(handle) else {
+        return;
+    };
 
     state.slots[idx].entry.flags = state.slots[idx].entry.flags.union(PageFlags::ACCESSED);
     state.slots[idx].entry.age = INITIAL_AGE;
@@ -411,8 +413,7 @@ pub fn mark_accessed(handle: PageHandle) {
         if let Some(pos) = state.inactive.iter().position(|h| *h == handle) {
             state.inactive.remove(pos);
         }
-        state.slots[idx].entry.flags =
-            state.slots[idx].entry.flags.union(PageFlags::ON_ACTIVE);
+        state.slots[idx].entry.flags = state.slots[idx].entry.flags.union(PageFlags::ON_ACTIVE);
         state.active.push_back(handle);
     } else {
         // Already hot — refresh recency by moving to the back.
@@ -439,11 +440,9 @@ pub fn mark_locked(handle: PageHandle, locked: bool) {
     let mut state = STATE.lock();
     if let Some(idx) = state.find(handle) {
         if locked {
-            state.slots[idx].entry.flags =
-                state.slots[idx].entry.flags.union(PageFlags::LOCKED);
+            state.slots[idx].entry.flags = state.slots[idx].entry.flags.union(PageFlags::LOCKED);
         } else {
-            state.slots[idx].entry.flags =
-                state.slots[idx].entry.flags.without(PageFlags::LOCKED);
+            state.slots[idx].entry.flags = state.slots[idx].entry.flags.without(PageFlags::LOCKED);
         }
     }
 }
@@ -478,7 +477,9 @@ pub fn reclaim_sweep() -> usize {
     // ── Active list: demote idle pages. ─────────────────────────
     let snapshot_active: Vec<PageHandle> = state.active.iter().copied().collect();
     for handle in snapshot_active {
-        let Some(idx) = state.find(handle) else { continue };
+        let Some(idx) = state.find(handle) else {
+            continue;
+        };
         if state.slots[idx].entry.flags.contains(PageFlags::ACCESSED) {
             state.slots[idx].entry.flags =
                 state.slots[idx].entry.flags.without(PageFlags::ACCESSED);
@@ -503,7 +504,9 @@ pub fn reclaim_sweep() -> usize {
     // ── Inactive list: promote re-accessed pages. ───────────────
     let snapshot_inactive: Vec<PageHandle> = state.inactive.iter().copied().collect();
     for handle in snapshot_inactive {
-        let Some(idx) = state.find(handle) else { continue };
+        let Some(idx) = state.find(handle) else {
+            continue;
+        };
         if state.slots[idx].entry.flags.contains(PageFlags::ACCESSED) {
             // Promote.
             state.slots[idx].entry.flags =
@@ -512,8 +515,7 @@ pub fn reclaim_sweep() -> usize {
             if let Some(pos) = state.inactive.iter().position(|h| *h == handle) {
                 state.inactive.remove(pos);
             }
-            state.slots[idx].entry.flags =
-                state.slots[idx].entry.flags.union(PageFlags::ON_ACTIVE);
+            state.slots[idx].entry.flags = state.slots[idx].entry.flags.union(PageFlags::ON_ACTIVE);
             state.active.push_back(handle);
             moved += 1;
         } else if state.slots[idx].entry.age > 0 {
@@ -572,7 +574,9 @@ pub fn reclaim_target_pages(n: usize) -> usize {
             // any survivors after the lock is dropped + handlers
             // have run.
             for _ in 0..take {
-                let Some(handle) = state.inactive.pop_back() else { break };
+                let Some(handle) = state.inactive.pop_back() else {
+                    break;
+                };
                 let Some(idx) = state.find(handle) else {
                     // Stale list entry — shouldn't happen, but if
                     // it does just drop it and keep going.
@@ -751,7 +755,10 @@ mod tests {
         reset_for_test();
         TestResult::Pass
     }
-    kernel_test_in!("memory/reclaim", smoke_reclaim_register_unregister_roundtrip);
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_register_unregister_roundtrip
+    );
 
     // ── 2. mark_accessed moves inactive → active ─────────────
 
@@ -938,7 +945,10 @@ mod tests {
         reset_for_test();
         TestResult::Pass
     }
-    kernel_test_in!("memory/reclaim", smoke_reclaim_stats_counters_track_activity);
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_stats_counters_track_activity
+    );
 
     // ── 7. Bonus: mark_accessed on an inactive page during scan ─
 

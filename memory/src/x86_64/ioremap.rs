@@ -144,9 +144,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     let flags = match attrs {
         MmioAttrs::Device => PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE,
         MmioAttrs::WriteBack => PtFlags::PRESENT | PtFlags::WRITABLE,
-        MmioAttrs::WriteCombining => {
-            PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::WRITE_THROUGH
-        }
+        MmioAttrs::WriteCombining => PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::WRITE_THROUGH,
     };
 
     // Map page by page. On failure, walk back and unmap the

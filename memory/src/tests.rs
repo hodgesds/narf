@@ -576,9 +576,7 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
                         unsafe {
                             crate::slab::dealloc(p, layout);
                         }
-                        return TestResult::Fail(
-                            "slab::alloc returned address past usable RAM",
-                        );
+                        return TestResult::Fail("slab::alloc returned address past usable RAM");
                     }
                     if raw & (layout.align() as u64 - 1) != 0 {
                         for (q, ql) in held.drain(..) {
@@ -1111,8 +1109,8 @@ fn smoke_slab_alloc_free_round_trip() -> TestResult {
     // free, re-allocate the same class, verify the new pointer
     // can be written to (i.e. re-use works without corrupting the
     // free list).
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
     for c in 0..slab::num_classes() {
         let block_size = 16usize << c;
         let layout = Layout::from_size_align(block_size, 16).unwrap();
@@ -1162,8 +1160,8 @@ fn smoke_slab_class_picker() -> TestResult {
     // Verify every class gets distinct backing blocks (no
     // accidental aliasing across classes) by allocating one of
     // each + asserting all pointers are unique.
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
     let mut ptrs = alloc::vec::Vec::with_capacity(slab::num_classes());
     for c in 0..slab::num_classes() {
         let block_size = 16usize << c;
@@ -1194,8 +1192,8 @@ kernel_test_in!("memory", smoke_slab_class_picker);
 fn smoke_slab_stats_advance() -> TestResult {
     // After an alloc, the relevant class's `in_use` advances; after
     // free it returns to baseline.
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
     let layout = Layout::from_size_align(64, 16).unwrap();
     let class_idx = 2; // 64 = 16 << 2
     let before = slab::stats().classes[class_idx].in_use;
@@ -1222,8 +1220,8 @@ fn smoke_slab_magazine_hot_path() -> TestResult {
     // list `grown` counter only advances once (the initial frame
     // grow), not on every alloc. This is the headline property of
     // the per-CPU magazine path.
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
     let layout = Layout::from_size_align(64, 16).unwrap();
     let class_idx = 2; // 64 = 16 << 2
 
@@ -1324,28 +1322,20 @@ fn smoke_memory_address_space_materialize() -> TestResult {
                     // Dump every level of the walk so the failure
                     // message names where the path diverges.
                     let v = VirtAddr::new(vbase);
-                    let pml4 = unsafe {
-                        &*a.root.as_ptr::<crate::x86_64::paging::PageTable>()
-                    };
+                    let pml4 = unsafe { &*a.root.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pml4_idx = (v.raw() >> 39) & 0x1FF;
                     let pdpt_idx = (v.raw() >> 30) & 0x1FF;
                     let pd_idx = (v.raw() >> 21) & 0x1FF;
                     let pt_idx = (v.raw() >> 12) & 0x1FF;
                     let pml4e = pml4.entries[pml4_idx as usize];
                     let pdpt_pa = pml4e.addr();
-                    let pdpt = unsafe {
-                        &*pdpt_pa.as_ptr::<crate::x86_64::paging::PageTable>()
-                    };
+                    let pdpt = unsafe { &*pdpt_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pdpte = pdpt.entries[pdpt_idx as usize];
                     let pd_pa = pdpte.addr();
-                    let pd = unsafe {
-                        &*pd_pa.as_ptr::<crate::x86_64::paging::PageTable>()
-                    };
+                    let pd = unsafe { &*pd_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pde = pd.entries[pd_idx as usize];
                     let pt_pa = pde.addr();
-                    let pt = unsafe {
-                        &*pt_pa.as_ptr::<crate::x86_64::paging::PageTable>()
-                    };
+                    let pt = unsafe { &*pt_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pte = pt.entries[pt_idx as usize];
                     let msg = alloc::format!(
                         "translate: target={:#x} got={:#x} root={:#x} \
@@ -1353,13 +1343,16 @@ fn smoke_memory_address_space_materialize() -> TestResult {
                         target.raw(),
                         phys.raw(),
                         a.root.raw(),
-                        pml4_idx, pml4e.addr().raw(),
-                        pdpt_idx, pdpte.addr().raw(),
-                        pd_idx, pde.addr().raw(),
-                        pt_idx, pte.addr().raw(),
+                        pml4_idx,
+                        pml4e.addr().raw(),
+                        pdpt_idx,
+                        pdpte.addr().raw(),
+                        pd_idx,
+                        pde.addr().raw(),
+                        pt_idx,
+                        pte.addr().raw(),
                     );
-                    let s: &'static str =
-                        alloc::boxed::Box::leak(msg.into_boxed_str());
+                    let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
                     return TestResult::Fail(s);
                 }
             }
@@ -2064,10 +2057,7 @@ fn smoke_memory_change_perms_updates_region() -> TestResult {
     }
 
     // Change to READ-only.
-    if a
-        .change_perms_range(v, 0x1000, RegionPerms::READ)
-        .is_err()
-    {
+    if a.change_perms_range(v, 0x1000, RegionPerms::READ).is_err() {
         core::mem::forget(a);
         return TestResult::Fail("change_perms_range returned err");
     }
@@ -2174,9 +2164,7 @@ fn smoke_memory_frame_alloc_free_stress() -> TestResult {
         match crate::alloc_frame() {
             Ok(f) => realloced.push(f),
             Err(_) => {
-                return TestResult::Fail(
-                    "couldn't realloc 64 frames after freeing 64",
-                );
+                return TestResult::Fail("couldn't realloc 64 frames after freeing 64");
             }
         }
     }
@@ -2367,7 +2355,8 @@ fn smoke_memory_buddy_no_duplicate_allocs() -> TestResult {
             crate::free_frame(f);
             let msg = alloc::format!(
                 "buddy returned duplicate frame {:#x} at iter {}",
-                dup_pa, iter
+                dup_pa,
+                iter
             );
             let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
             return TestResult::Fail(s);
@@ -2551,9 +2540,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     if cow::count(frame) != 2 {
         return TestResult::Fail("COW: refcount should be 2 after fork");
     }
-    if p_region.perms.contains(RegionPerms::WRITE)
-        || c_region.perms.contains(RegionPerms::WRITE)
-    {
+    if p_region.perms.contains(RegionPerms::WRITE) || c_region.perms.contains(RegionPerms::WRITE) {
         return TestResult::Fail("COW: both regions must lose WRITE post-fork");
     }
 
@@ -2561,8 +2548,12 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write");
     }
-    let c_split = child.lookup(VirtAddr::new(VADDR)).expect("child post-split");
-    let p_post = parent.lookup(VirtAddr::new(VADDR)).expect("parent post-split");
+    let c_split = child
+        .lookup(VirtAddr::new(VADDR))
+        .expect("child post-split");
+    let p_post = parent
+        .lookup(VirtAddr::new(VADDR))
+        .expect("parent post-split");
     if c_split.phys[0] == frame {
         return TestResult::Fail("split should have allocated a new child frame");
     }
@@ -2590,7 +2581,10 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     cow::__test_clear();
     TestResult::Pass
 }
-kernel_test_in!("memory", smoke_memory_clone_for_fork_shares_frames_then_splits);
+kernel_test_in!(
+    "memory",
+    smoke_memory_clone_for_fork_shares_frames_then_splits
+);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
@@ -2599,12 +2593,12 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     // the live page table and re-install the PTE with the new
     // values. Verify the walked-and-re-mapped page actually
     // resolves (via paging::translate) to the new phys.
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
     use crate::address_space::{AddressSpace, Region, RegionPerms};
     use crate::frame::cow;
     #[cfg(target_arch = "x86_64")]
     use crate::x86_64::paging::translate;
-    #[cfg(target_arch = "aarch64")]
-    use crate::aarch64::paging::translate;
     use crate::VirtAddr;
 
     cow::__test_clear();
@@ -2617,14 +2611,13 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
         Err(_) => return TestResult::Fail("alloc_frame f1"),
     };
     const VADDR: u64 = 0x0000_0080_0000_5000;
-    if a
-        .map_region(Region {
-            base: VirtAddr::new(VADDR),
-            len: 4096,
-            perms: RegionPerms::READ,
-            phys: alloc::vec![f1],
-        })
-        .is_err()
+    if a.map_region(Region {
+        base: VirtAddr::new(VADDR),
+        len: 4096,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![f1],
+    })
+    .is_err()
     {
         return TestResult::Fail("map_region");
     }
@@ -2658,14 +2651,13 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
         // covers this in its own test. Here we round-trip via
         // unmap_region + map_region.
         let _ = a.unmap_region(VirtAddr::new(VADDR));
-        if a
-            .map_region(Region {
-                base: VirtAddr::new(VADDR),
-                len: 4096,
-                perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![f2],
-            })
-            .is_err()
+        if a.map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![f2],
+        })
+        .is_err()
         {
             return TestResult::Fail("re-map_region");
         }
@@ -2695,11 +2687,11 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
 kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);
 
 fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
+    use crate::frame::UsableRegion;
     use crate::hugepage::{
         alloc_hugepage_2m, free_hugepage, reserve_from_regions, stats, HugeAllocError,
         HUGEPAGE_2M_BYTES,
     };
-    use crate::frame::UsableRegion;
     use crate::PhysAddr;
 
     // Synthetic 16 MiB region aligned to 2 MiB. The phys addresses
@@ -2772,8 +2764,8 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
 kernel_test_in!("memory/hugepage", smoke_hugepage_2m_reserve_alloc_free);
 
 fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
-    use crate::hugepage::{reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
     use crate::frame::UsableRegion;
+    use crate::hugepage::{reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
     use crate::PhysAddr;
 
     // Region whose start is mis-aligned: head is dropped, the one
@@ -2810,7 +2802,10 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     let _ = crate::hugepage::alloc_hugepage_1g();
     TestResult::Pass
 }
-kernel_test_in!("memory/hugepage", smoke_hugepage_1g_reserve_picks_aligned_chunk);
+kernel_test_in!(
+    "memory/hugepage",
+    smoke_hugepage_1g_reserve_picks_aligned_chunk
+);
 
 fn smoke_slab_steady_state_under_churn() -> TestResult {
     // Acceptance criterion #4 from the heap-migration spec: a
@@ -2818,8 +2813,8 @@ fn smoke_slab_steady_state_under_churn() -> TestResult {
     // working-set size, not grow unboundedly. Exercise multiple
     // size classes (each with its own magazines + central free
     // list) so a leak in any one of them shows up.
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
 
     // One representative layout per class index. Sizes are chosen
     // to fall squarely inside their class so rounding doesn't move
@@ -2886,8 +2881,8 @@ fn smoke_slab_large_alloc_steady_state() -> TestResult {
     // Same property for the >max_class_size path that routes
     // straight to the page-frame buddy. Uses a 16 KiB allocation
     // (above the 8 KiB largest size class).
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
 
     let layout = Layout::from_size_align(16384, 16).unwrap();
     let before = slab::stats().large_in_use;
@@ -2971,8 +2966,8 @@ fn smoke_slab_atomic_alloc_magazine_only() -> TestResult {
     // (returns the same blocks the magazine holds, no central
     // refill, no buddy growth) and return None when the magazine
     // is drained — never blocking, never sleeping.
-    use core::alloc::Layout;
     use crate::slab;
+    use core::alloc::Layout;
 
     let layout = Layout::from_size_align(64, 16).unwrap();
     // Warm the magazine with a normal alloc/free roundtrip.
@@ -3029,9 +3024,9 @@ fn smoke_slab_atomic_perf_bounded() -> TestResult {
     // upper bound (< 50 000 cycles ≈ 50 µs at 1 GHz) just to
     // catch true degenerate paths (e.g. accidentally taking the
     // central lock). Real-HW perf is a follow-up benchmark.
+    use crate::slab;
     use core::alloc::Layout;
     use core::arch::x86_64::_rdtsc;
-    use crate::slab;
 
     let layout = Layout::from_size_align(64, 16).unwrap();
 
@@ -3186,8 +3181,7 @@ fn smoke_atomic_pool_drain_and_refill() -> TestResult {
     // drains via try_get, refills as Pooled handles drop.
     use crate::atomic_pool::AtomicPool;
 
-    static POOL: narf_lib::sync::OnceLock<AtomicPool<u64>> =
-        narf_lib::sync::OnceLock::new();
+    static POOL: narf_lib::sync::OnceLock<AtomicPool<u64>> = narf_lib::sync::OnceLock::new();
     let pool = POOL.get_or_init(|| AtomicPool::new(4, || 0u64));
 
     if pool.capacity() != 4 {
@@ -3247,8 +3241,7 @@ kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_drain_and_refill);
 fn smoke_atomic_pool_capacity_pinned_after_drain() -> TestResult {
     use crate::atomic_pool::AtomicPool;
     use narf_lib::sync::IrqSafeSpinLock;
-    static POOL: IrqSafeSpinLock<Option<&'static AtomicPool<u64>>> =
-        IrqSafeSpinLock::new(None);
+    static POOL: IrqSafeSpinLock<Option<&'static AtomicPool<u64>>> = IrqSafeSpinLock::new(None);
     let pool: &'static AtomicPool<u64> = {
         let p = alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(3, || 0u64)));
         *POOL.lock() = Some(p);
@@ -3280,7 +3273,10 @@ fn smoke_atomic_pool_capacity_pinned_after_drain() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_capacity_pinned_after_drain);
+kernel_test_in!(
+    "memory/atomic_pool",
+    smoke_atomic_pool_capacity_pinned_after_drain
+);
 
 fn smoke_atomic_pool_pooled_deref_mut_visible_next_lease() -> TestResult {
     // Pooled<T>'s DerefMut writes are observable when the item
@@ -3288,8 +3284,7 @@ fn smoke_atomic_pool_pooled_deref_mut_visible_next_lease() -> TestResult {
     // resetting items on drop.
     use crate::atomic_pool::AtomicPool;
     use narf_lib::sync::IrqSafeSpinLock;
-    static POOL: IrqSafeSpinLock<Option<&'static AtomicPool<u32>>> =
-        IrqSafeSpinLock::new(None);
+    static POOL: IrqSafeSpinLock<Option<&'static AtomicPool<u32>>> = IrqSafeSpinLock::new(None);
     let pool: &'static AtomicPool<u32> = {
         let p = alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(1, || 0u32)));
         *POOL.lock() = Some(p);
@@ -3305,7 +3300,10 @@ fn smoke_atomic_pool_pooled_deref_mut_visible_next_lease() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_pooled_deref_mut_visible_next_lease);
+kernel_test_in!(
+    "memory/atomic_pool",
+    smoke_atomic_pool_pooled_deref_mut_visible_next_lease
+);
 
 // ── deep memory/tlb_shootdown ────────────────────────────────────
 
@@ -3325,7 +3323,10 @@ fn smoke_tlb_shootdown_request_constructors() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_request_constructors);
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_shootdown_request_constructors
+);
 
 fn smoke_tlb_shootdown_counter_monotonic() -> TestResult {
     use crate::tlb_shootdown::{shootdown, shootdown_count, ShootdownRequest, __reset_for_test};
@@ -3340,7 +3341,10 @@ fn smoke_tlb_shootdown_counter_monotonic() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_counter_monotonic);
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_shootdown_counter_monotonic
+);
 
 fn smoke_tlb_shootdown_request_equality() -> TestResult {
     use crate::tlb_shootdown::ShootdownRequest;
@@ -3361,7 +3365,11 @@ kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_request_equality);
 
 fn smoke_context_alloc_context_variants_distinct() -> TestResult {
     use crate::context::AllocContext;
-    let all = [AllocContext::Sleepable, AllocContext::Atomic, AllocContext::IrqOff];
+    let all = [
+        AllocContext::Sleepable,
+        AllocContext::Atomic,
+        AllocContext::IrqOff,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -3371,7 +3379,10 @@ fn smoke_context_alloc_context_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/context", smoke_context_alloc_context_variants_distinct);
+kernel_test_in!(
+    "memory/context",
+    smoke_context_alloc_context_variants_distinct
+);
 
 fn smoke_context_atomic_assert_is_noop() -> TestResult {
     // Atomic / IrqOff carry no precondition on the caller's
@@ -3387,7 +3398,7 @@ kernel_test_in!("memory/context", smoke_context_atomic_assert_is_noop);
 // ── deep memory/asid_alloc ──────────────────────────────────────
 
 fn smoke_asid_alloc_cached_returns_same_tag() -> TestResult {
-    use crate::asid_alloc::{alloc, cached, __reset_for_test};
+    use crate::asid_alloc::{__reset_for_test, alloc, cached};
     use narf_lib::id::DomainId;
     __reset_for_test();
     let dom = DomainId::SCRATCH;
@@ -3398,10 +3409,13 @@ fn smoke_asid_alloc_cached_returns_same_tag() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_cached_returns_same_tag);
+kernel_test_in!(
+    "memory/asid_alloc",
+    smoke_asid_alloc_cached_returns_same_tag
+);
 
 fn smoke_asid_alloc_invalidate_clears_cache() -> TestResult {
-    use crate::asid_alloc::{alloc, cached, invalidate_tag, __reset_for_test};
+    use crate::asid_alloc::{__reset_for_test, alloc, cached, invalidate_tag};
     use narf_lib::id::DomainId;
     __reset_for_test();
     let dom = DomainId::SCRATCH;
@@ -3420,10 +3434,13 @@ fn smoke_asid_alloc_invalidate_clears_cache() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_invalidate_clears_cache);
+kernel_test_in!(
+    "memory/asid_alloc",
+    smoke_asid_alloc_invalidate_clears_cache
+);
 
 fn smoke_asid_alloc_rollover_bumps_generation() -> TestResult {
-    use crate::asid_alloc::{alloc, current_generation, rollover_now, __reset_for_test};
+    use crate::asid_alloc::{__reset_for_test, alloc, current_generation, rollover_now};
     use narf_lib::id::DomainId;
     __reset_for_test();
     let before = current_generation();
@@ -3440,7 +3457,10 @@ fn smoke_asid_alloc_rollover_bumps_generation() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_rollover_bumps_generation);
+kernel_test_in!(
+    "memory/asid_alloc",
+    smoke_asid_alloc_rollover_bumps_generation
+);
 
 fn smoke_asid_alloc_reserved_tag_constant() -> TestResult {
     use crate::asid_alloc::TAG_RESERVED;
@@ -3455,7 +3475,11 @@ kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_reserved_tag_constant);
 
 fn smoke_per_domain_root_alloc_error_variants_distinct() -> TestResult {
     use crate::per_domain_root::AllocError;
-    let all = [AllocError::OutOfMemory, AllocError::NotInitialised, AllocError::AlreadyAllocated];
+    let all = [
+        AllocError::OutOfMemory,
+        AllocError::NotInitialised,
+        AllocError::AlreadyAllocated,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -3465,7 +3489,10 @@ fn smoke_per_domain_root_alloc_error_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_alloc_error_variants_distinct);
+kernel_test_in!(
+    "memory/per_domain_root",
+    smoke_per_domain_root_alloc_error_variants_distinct
+);
 
 fn smoke_per_domain_root_lookup_none_before_register() -> TestResult {
     use crate::per_domain_root::{__reset_for_test, lookup, unregister_root};
@@ -3478,7 +3505,10 @@ fn smoke_per_domain_root_lookup_none_before_register() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_lookup_none_before_register);
+kernel_test_in!(
+    "memory/per_domain_root",
+    smoke_per_domain_root_lookup_none_before_register
+);
 
 fn smoke_per_domain_root_double_register_rejected() -> TestResult {
     use crate::per_domain_root::{__reset_for_test, register_root, unregister_root, AllocError};
@@ -3497,7 +3527,10 @@ fn smoke_per_domain_root_double_register_rejected() -> TestResult {
     unregister_root(dom);
     TestResult::Pass
 }
-kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_double_register_rejected);
+kernel_test_in!(
+    "memory/per_domain_root",
+    smoke_per_domain_root_double_register_rejected
+);
 
 // ── deep memory/buddy ────────────────────────────────────────────
 
@@ -3515,9 +3548,7 @@ fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
         Err(FrameAllocError::Uninitialised) => {
             TestResult::Skip("frame allocator not up in this flavour")
         }
-        Err(FrameAllocError::Exhausted) => {
-            TestResult::Skip("buddy exhausted on this test image")
-        }
+        Err(FrameAllocError::Exhausted) => TestResult::Skip("buddy exhausted on this test image"),
     }
 }
 kernel_test_in!("memory/buddy", smoke_buddy_alloc_pages_on_order_round_trip);
@@ -3536,7 +3567,10 @@ fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
         Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
     }
 }
-kernel_test_in!("memory/buddy", smoke_buddy_alloc_pages_on_max_order_boundary);
+kernel_test_in!(
+    "memory/buddy",
+    smoke_buddy_alloc_pages_on_max_order_boundary
+);
 
 // ── deep memory/hugepage ─────────────────────────────────────────
 
@@ -3571,7 +3605,10 @@ fn smoke_hugepage_alloc_2m_empty_after_no_reserve() -> TestResult {
         _ => TestResult::Fail("empty 2m pool didn't surface Empty"),
     }
 }
-kernel_test_in!("memory/hugepage", smoke_hugepage_alloc_2m_empty_after_no_reserve);
+kernel_test_in!(
+    "memory/hugepage",
+    smoke_hugepage_alloc_2m_empty_after_no_reserve
+);
 
 // ── demand paging — AddressSpace::demand_alloc_page surface ──────
 //
@@ -3752,7 +3789,10 @@ fn smoke_memory_demand_alloc_multi_page_distinct_frames() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_memory_demand_alloc_multi_page_distinct_frames);
+kernel_test_in!(
+    "memory",
+    smoke_memory_demand_alloc_multi_page_distinct_frames
+);
 
 /// Fresh demand-allocated frame is zero-filled. Anonymous mmap
 /// semantics require the user observes zeros — not the previous
@@ -3871,7 +3911,10 @@ fn smoke_memory_try_grow_stack_promotes_and_installs_new_guard() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_memory_try_grow_stack_promotes_and_installs_new_guard);
+kernel_test_in!(
+    "memory",
+    smoke_memory_try_grow_stack_promotes_and_installs_new_guard
+);
 
 /// try_grow_stack on a non-STACK_GUARD region returns Unmapped
 /// so the trap handler falls through to the SEGV path (a write
@@ -3920,7 +3963,10 @@ fn smoke_memory_try_grow_stack_outside_region_is_unmapped() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_memory_try_grow_stack_outside_region_is_unmapped);
+kernel_test_in!(
+    "memory",
+    smoke_memory_try_grow_stack_outside_region_is_unmapped
+);
 
 /// New guard one page below the current guard must NOT collide
 /// with an existing region. The grow surfaces Overlap so the trap
@@ -4140,7 +4186,10 @@ fn smoke_memory_unmap_region_lazy_is_noop_on_free_count() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_memory_unmap_region_lazy_is_noop_on_free_count);
+kernel_test_in!(
+    "memory",
+    smoke_memory_unmap_region_lazy_is_noop_on_free_count
+);
 
 /// Mixed region (some lazy + some backed) returns ONLY the
 /// backed slots. The demand-paging contract says lazy slots had
@@ -4572,9 +4621,7 @@ fn smoke_compressed_ramdisk_compresses_repetitive() -> TestResult {
         return TestResult::Fail("expected 8 stored pages");
     }
     if stats.compressed_bytes as usize >= stats.raw_bytes as usize {
-        return TestResult::Fail(
-            "compressed_bytes ≥ raw_bytes on a highly-compressible pattern",
-        );
+        return TestResult::Fail("compressed_bytes ≥ raw_bytes on a highly-compressible pattern");
     }
     TestResult::Pass
 }
@@ -4714,9 +4761,9 @@ fn smoke_atomic_pool_lease_returns_on_drop() -> TestResult {
     // Box::leak to get a 'static reference — AtomicPool::try_get
     // requires &'static self for the Pooled's pool pointer.
     let pool: &'static AtomicPool<u64> =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(
-            AtomicPool::new(4, || 0xDEAD_BEEFu64),
-        ));
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(4, || {
+            0xDEAD_BEEFu64
+        })));
     if pool.capacity() != 4 {
         return TestResult::Fail("capacity mismatch");
     }
@@ -4746,9 +4793,7 @@ kernel_test_in!("memory", smoke_atomic_pool_lease_returns_on_drop);
 fn smoke_atomic_pool_exhausted_returns_none() -> TestResult {
     use crate::atomic_pool::AtomicPool;
     let pool: &'static AtomicPool<u32> =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(
-            AtomicPool::new(2, || 42u32),
-        ));
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(AtomicPool::new(2, || 42u32)));
     let a = pool.try_get().expect("a");
     let b = pool.try_get().expect("b");
     if pool.try_get().is_some() {
@@ -4848,10 +4893,7 @@ fn smoke_kaslr_random_u64_is_live() -> TestResult {
     // variants — not a stub.
     if !matches!(
         sa,
-        EntropySource::Rdrand
-            | EntropySource::Rdseed
-            | EntropySource::Rndr
-            | EntropySource::TscMix
+        EntropySource::Rdrand | EntropySource::Rdseed | EntropySource::Rndr | EntropySource::TscMix
     ) {
         return TestResult::Fail("EntropySource not one of the documented variants");
     }
@@ -4925,7 +4967,7 @@ fn smoke_ro_after_init_rw_before_latch() -> TestResult {
 kernel_test_in!("memory/ro_after_init", smoke_ro_after_init_rw_before_latch);
 
 fn smoke_ro_after_init_latch_observability() -> TestResult {
-    use crate::ro_after_init::{is_init_complete, mark_init_complete, _reset_for_test};
+    use crate::ro_after_init::{_reset_for_test, is_init_complete, mark_init_complete};
     _reset_for_test();
     if is_init_complete() {
         return TestResult::Fail("reset did not clear the latch");
@@ -4943,7 +4985,10 @@ fn smoke_ro_after_init_latch_observability() -> TestResult {
     _reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("memory/ro_after_init", smoke_ro_after_init_latch_observability);
+kernel_test_in!(
+    "memory/ro_after_init",
+    smoke_ro_after_init_latch_observability
+);
 
 // ── Wave-46: trap-driven COW write-fault round trip ─────────────────
 //
@@ -4965,12 +5010,12 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     //      instruction succeeds.
     // After the round trip, mutating through the child's PTE must
     // NOT corrupt the parent's still-shared frame.
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
     use crate::address_space::{AddressSpace, Region, RegionPerms};
     use crate::frame::cow;
     #[cfg(target_arch = "x86_64")]
     use crate::x86_64::paging::translate;
-    #[cfg(target_arch = "aarch64")]
-    use crate::aarch64::paging::translate;
     use crate::VirtAddr;
 
     cow::__test_clear();
@@ -5068,12 +5113,12 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     // whichever side writes first. Parent-side cow_split_on_write +
     // remap_page must allocate a private frame for the PARENT,
     // leaving the child with the original (now sole-owner) frame.
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
     use crate::address_space::{AddressSpace, Region, RegionPerms};
     use crate::frame::cow;
     #[cfg(target_arch = "x86_64")]
     use crate::x86_64::paging::translate;
-    #[cfg(target_arch = "aarch64")]
-    use crate::aarch64::paging::translate;
     use crate::VirtAddr;
 
     cow::__test_clear();
@@ -5178,14 +5223,13 @@ fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
         Err(_) => return TestResult::Fail("alloc_frame"),
     };
     const REGION_VADDR: u64 = 0x0000_0080_0046_2000;
-    if a
-        .map_region(Region {
-            base: VirtAddr::new(REGION_VADDR),
-            len: 4096,
-            perms: RegionPerms::READ,
-            phys: alloc::vec![f],
-        })
-        .is_err()
+    if a.map_region(Region {
+        base: VirtAddr::new(REGION_VADDR),
+        len: 4096,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![f],
+    })
+    .is_err()
     {
         return TestResult::Fail("map_region");
     }

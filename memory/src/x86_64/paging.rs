@@ -262,13 +262,11 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // kernel's PDPT[1..512] entries (the high-MMIO 1-GiB pages)
     // into it, leave PDPT[0] zero so the user's materialize can
     // safely descend into a private PD/PT subtree.
-    let kernel_pml4_e1: u64 = unsafe {
-        ptr::read_volatile((cur_pml4.raw() + 1 * 8) as *const u64)
-    };
+    let kernel_pml4_e1: u64 = unsafe { ptr::read_volatile((cur_pml4.raw() + 1 * 8) as *const u64) };
     if kernel_pml4_e1 & 1 != 0 {
         let kernel_pdpt_phys = PhysAddr::new(kernel_pml4_e1 & 0x000f_ffff_ffff_f000);
-        let user_pdpt_frame = crate::frame::alloc_frame_on(node)
-            .map_err(|_| PageTableAllocError::NoFrame)?;
+        let user_pdpt_frame =
+            crate::frame::alloc_frame_on(node).map_err(|_| PageTableAllocError::NoFrame)?;
         let user_pdpt_phys = user_pdpt_frame.start_address();
         // Sanity: user_pdpt phys must differ from the PML4 phys
         // we just allocated. If alloc handed back the same frame

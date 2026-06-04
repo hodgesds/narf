@@ -240,7 +240,9 @@ impl AddressSpace {
                     if existing_p.raw() == new_p.raw() {
                         panic!(
                             "map_region: duplicate phys {:#x} new-base={:#x} existing-base={:#x}",
-                            new_p.raw(), region.base.as_u64(), r.base.as_u64(),
+                            new_p.raw(),
+                            region.base.as_u64(),
+                            r.base.as_u64(),
                         );
                     }
                 }
@@ -627,19 +629,14 @@ impl AddressSpace {
     /// `mlock(base, len)` — force-back every lazy page in regions
     /// intersecting `[base, base + len)` and set the LOCKED flag.
     /// Returns Unmapped if no region intersects.
-    pub fn mlock_range(
-        &self,
-        base: VirtAddr,
-        len: u64,
-    ) -> Result<(), AddressSpaceError> {
+    pub fn mlock_range(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
         let lo = base.as_u64();
         let hi = lo.saturating_add(len);
         // Force-back any zero phys entries first; do this with
         // the lock dropped so frame allocation doesn't recurse
         // on an IRQ-safe lock. Snapshot the region indices.
         let mut touched_any = false;
-        let mut backings: alloc::vec::Vec<(usize, alloc::vec::Vec<usize>)> =
-            alloc::vec::Vec::new();
+        let mut backings: alloc::vec::Vec<(usize, alloc::vec::Vec<usize>)> = alloc::vec::Vec::new();
         {
             let g = self.regions.lock();
             for (idx, r) in g.iter().enumerate() {
@@ -726,11 +723,7 @@ impl AddressSpace {
     /// region intersecting `[base, base + len)`. Frames stay
     /// backed (no swap exists yet to reclaim them). Returns
     /// Unmapped if no region intersects.
-    pub fn munlock_range(
-        &self,
-        base: VirtAddr,
-        len: u64,
-    ) -> Result<(), AddressSpaceError> {
+    pub fn munlock_range(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
         let lo = base.as_u64();
         let hi = lo.saturating_add(len);
         let mut g = self.regions.lock();
@@ -1096,9 +1089,7 @@ impl AddressSpace {
         // MMAP_CURSOR_BASE — which already overlaps a parent-mmap'd
         // region the child just cloned — and map_region fails with
         // Overlap, breaking libc's malloc in the post-fork child.
-        let parent_cursor = self
-            .mmap_cursor
-            .load(core::sync::atomic::Ordering::Relaxed);
+        let parent_cursor = self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed);
         child
             .mmap_cursor
             .store(parent_cursor, core::sync::atomic::Ordering::Relaxed);
@@ -1165,8 +1156,7 @@ impl AddressSpace {
 
         // Multiple owners. Allocate a private frame, copy bytes,
         // dec_ref the shared one.
-        let new_frame =
-            crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
+        let new_frame = crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
         // SAFETY: kernel_ptr / kernel_mut_ptr resolve through the
         // kernel's identity map (x86_64) or TTBR1 high-half RAM

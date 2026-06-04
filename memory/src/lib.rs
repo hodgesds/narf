@@ -12,14 +12,14 @@ extern crate alloc;
 
 pub mod addr;
 pub mod address_space;
-pub mod beacon;
-pub mod diag;
+pub mod asid_alloc;
 pub mod atomic_pool;
+pub mod beacon;
 pub mod buddy;
 pub mod compress;
 pub mod compressed_ramdisk;
-pub mod asid_alloc;
 pub mod context;
+pub mod diag;
 pub mod frame;
 pub mod heap;
 pub mod hugepage;
@@ -28,11 +28,11 @@ pub mod per_domain_root;
 pub mod reclaim;
 pub mod ro_after_init;
 pub mod slab;
-pub mod zpool;
 pub mod spd5;
 pub mod tlb_shootdown;
 pub mod vmalloc;
 pub mod wx;
+pub mod zpool;
 
 mod tests;
 

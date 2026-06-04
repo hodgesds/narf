@@ -606,7 +606,9 @@ fn smoke_tlb_shootdown_batched_range_encodes_one_request() -> TestResult {
     // call), not N requests.
     __reset_for_test();
     let before = shootdown_count();
-    shootdown_range(/* pcid */ 9, /* va */ 0x10_0000, /* pages */ 16);
+    shootdown_range(
+        /* pcid */ 9, /* va */ 0x10_0000, /* pages */ 16,
+    );
     let after = shootdown_count();
     if after - before != 1 {
         return TestResult::Fail("range shootdown made multiple requests");
