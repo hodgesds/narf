@@ -311,7 +311,10 @@ fn smoke_fs_file_max_write_roundtrip() -> TestResult {
         _ => TestResult::Fail("fs/file-max read after write did not round-trip"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_file_max_write_roundtrip);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_file_max_write_roundtrip
+);
 
 fn smoke_fs_file_nr_three_values() -> TestResult {
     ensure_registered();
@@ -348,7 +351,10 @@ fn smoke_fs_inotify_max_user_watches_default() -> TestResult {
         _ => TestResult::Fail("fs/inotify/max_user_watches default should be '8192\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_inotify_max_user_watches_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_inotify_max_user_watches_default
+);
 
 fn smoke_fs_dentry_state_six_ints() -> TestResult {
     ensure_registered();
@@ -373,7 +379,10 @@ fn smoke_fs_pipe_max_size_rejects_non_power_of_two() -> TestResult {
         _ => TestResult::Fail("fs/pipe-max-size should reject non-power-of-two values"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_pipe_max_size_rejects_non_power_of_two);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_pipe_max_size_rejects_non_power_of_two
+);
 
 fn smoke_fs_lease_break_time_default() -> TestResult {
     ensure_registered();
@@ -383,4 +392,7 @@ fn smoke_fs_lease_break_time_default() -> TestResult {
         _ => TestResult::Fail("fs/lease-break-time default should be '45\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_lease_break_time_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_lease_break_time_default
+);

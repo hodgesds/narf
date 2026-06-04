@@ -60,8 +60,8 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, Initramfs,
-    MemFs, Mode,
+    bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, Initramfs, MemFs,
+    Mode,
 };
 
 // ── poll_once helper ──────────────────────────────────────────────────
@@ -335,15 +335,18 @@ fn smoke_vfs_dir_listing() -> TestResult {
         Err(_) => return TestResult::Fail("mount() failed"),
     };
 
-    let entries: Vec<(String, FileType)> = match registry().with_mount(PATH, |fs| {
-        fs.root().enumerate(0, 64)
-    }) {
-        Some(e) => e,
-        None => return TestResult::Fail("with_mount returned None"),
-    };
+    let entries: Vec<(String, FileType)> =
+        match registry().with_mount(PATH, |fs| fs.root().enumerate(0, 64)) {
+            Some(e) => e,
+            None => return TestResult::Fail("with_mount returned None"),
+        };
 
-    let has_hello = entries.iter().any(|(n, t)| n == "hello.txt" && *t == FileType::File);
-    let has_world = entries.iter().any(|(n, t)| n == "world.bin" && *t == FileType::File);
+    let has_hello = entries
+        .iter()
+        .any(|(n, t)| n == "hello.txt" && *t == FileType::File);
+    let has_world = entries
+        .iter()
+        .any(|(n, t)| n == "world.bin" && *t == FileType::File);
 
     // Cleanup regardless of assertions.
     let _ = registry().unmount(&handle, PATH);
@@ -394,9 +397,7 @@ fn smoke_vfs_nested_dir_traverse() -> TestResult {
         Err(_) => return TestResult::Fail("mount() failed"),
     };
 
-    let file = match registry()
-        .with_mount(PATH, |fs| resolve(fs.root(), "dir1/dir2/nested.txt"))
-    {
+    let file = match registry().with_mount(PATH, |fs| resolve(fs.root(), "dir1/dir2/nested.txt")) {
         Some(Ok(f)) => f,
         Some(Err(e)) => {
             let _ = registry().unmount(&handle, PATH);
@@ -466,7 +467,10 @@ fn smoke_vfs_empty_fs_lookup_returns_not_found() -> TestResult {
         None => TestResult::Fail("with_mount returned None for live mount"),
     }
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_vfs_empty_fs_lookup_returns_not_found);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_empty_fs_lookup_returns_not_found
+);
 
 // ── Smoke 4b: bad CPIO magic → Initramfs::from_cpio rejects ──────────
 //
@@ -482,7 +486,10 @@ fn smoke_vfs_bad_cpio_magic_rejects_mount() -> TestResult {
         Ok(_) => TestResult::Fail("from_cpio accepted junk bytes — should reject"),
     }
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_vfs_bad_cpio_magic_rejects_mount);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_bad_cpio_magic_rejects_mount
+);
 
 // ── Smoke 5: read-only FS — write returns ReadOnly ────────────────────
 //
@@ -549,7 +556,10 @@ fn smoke_vfs_readonly_fs_write_returns_error() -> TestResult {
         None => TestResult::Fail("write future returned Pending (should be Ready)"),
     }
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_vfs_readonly_fs_write_returns_error);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_readonly_fs_write_returns_error
+);
 
 // ── Smoke 6: writable FS — create + write + read back ────────────────
 //
@@ -619,7 +629,10 @@ fn smoke_vfs_writable_fs_create_write_read() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_vfs_writable_fs_create_write_read);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_writable_fs_create_write_read
+);
 
 // ── Smoke 7: flat FS with multiple files ─────────────────────────────
 //
@@ -637,9 +650,21 @@ fn smoke_vfs_flat_multi_file_read() -> TestResult {
     let fs = match make_initramfs(
         "fme7",
         &[
-            CpioEntry { name: "a.txt", mode: 0o100644, data: b"aaa" },
-            CpioEntry { name: "b.txt", mode: 0o100644, data: b"bbb" },
-            CpioEntry { name: "c.txt", mode: 0o100644, data: b"ccc" },
+            CpioEntry {
+                name: "a.txt",
+                mode: 0o100644,
+                data: b"aaa",
+            },
+            CpioEntry {
+                name: "b.txt",
+                mode: 0o100644,
+                data: b"bbb",
+            },
+            CpioEntry {
+                name: "c.txt",
+                mode: 0o100644,
+                data: b"ccc",
+            },
         ],
     ) {
         Some(f) => f,
@@ -699,7 +724,11 @@ fn smoke_vfs_multi_mount_independent() -> TestResult {
 
     let fs_a = match make_initramfs(
         "fme8a",
-        &[CpioEntry { name: "file_a.txt", mode: 0o100644, data: b"from a" }],
+        &[CpioEntry {
+            name: "file_a.txt",
+            mode: 0o100644,
+            data: b"from a",
+        }],
     ) {
         Some(f) => f,
         None => return TestResult::Fail("CPIO build A failed"),
@@ -707,7 +736,11 @@ fn smoke_vfs_multi_mount_independent() -> TestResult {
 
     let fs_b = match make_initramfs(
         "fme8b",
-        &[CpioEntry { name: "file_b.txt", mode: 0o100644, data: b"from b" }],
+        &[CpioEntry {
+            name: "file_b.txt",
+            mode: 0o100644,
+            data: b"from b",
+        }],
     ) {
         Some(f) => f,
         None => return TestResult::Fail("CPIO build B failed"),
@@ -782,14 +815,22 @@ fn smoke_vfs_busy_on_duplicate_mountpoint() -> TestResult {
 
     let fs1 = match make_initramfs(
         "fme9-first",
-        &[CpioEntry { name: "f.txt", mode: 0o100644, data: b"first" }],
+        &[CpioEntry {
+            name: "f.txt",
+            mode: 0o100644,
+            data: b"first",
+        }],
     ) {
         Some(f) => f,
         None => return TestResult::Fail("CPIO build failed"),
     };
     let fs2 = match make_initramfs(
         "fme9-second",
-        &[CpioEntry { name: "g.txt", mode: 0o100644, data: b"second" }],
+        &[CpioEntry {
+            name: "g.txt",
+            mode: 0o100644,
+            data: b"second",
+        }],
     ) {
         Some(f) => f,
         None => return TestResult::Fail("CPIO build 2 failed"),
@@ -815,7 +856,10 @@ fn smoke_vfs_busy_on_duplicate_mountpoint() -> TestResult {
         }
     }
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_vfs_busy_on_duplicate_mountpoint);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_busy_on_duplicate_mountpoint
+);
 
 // ── Smoke 10: stat reports correct size and mode ─────────────────────
 //
@@ -885,7 +929,10 @@ fn smoke_vfs_stat_correct_size_mode_blocks() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_vfs_stat_correct_size_mode_blocks);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_stat_correct_size_mode_blocks
+);
 
 // ── FS coverage matrix ────────────────────────────────────────────────
 //

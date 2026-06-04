@@ -30,19 +30,19 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::FsError;
 use super::sys::{register_sysctl, SysctlEntry};
+use crate::FsError;
 
 // ── net.core atomics ────────────────────────────────────────────────────
 
-static SOMAXCONN:          AtomicU32 = AtomicU32::new(128);
+static SOMAXCONN: AtomicU32 = AtomicU32::new(128);
 static NETDEV_MAX_BACKLOG: AtomicU32 = AtomicU32::new(1000);
-static RMEM_DEFAULT:       AtomicU32 = AtomicU32::new(212992);
-static RMEM_MAX:           AtomicU32 = AtomicU32::new(212992);
-static WMEM_DEFAULT:       AtomicU32 = AtomicU32::new(212992);
-static WMEM_MAX:           AtomicU32 = AtomicU32::new(212992);
-static BPF_JIT_ENABLE:     AtomicU32 = AtomicU32::new(0);
-static BPF_JIT_KALLSYMS:   AtomicU32 = AtomicU32::new(0);
+static RMEM_DEFAULT: AtomicU32 = AtomicU32::new(212992);
+static RMEM_MAX: AtomicU32 = AtomicU32::new(212992);
+static WMEM_DEFAULT: AtomicU32 = AtomicU32::new(212992);
+static WMEM_MAX: AtomicU32 = AtomicU32::new(212992);
+static BPF_JIT_ENABLE: AtomicU32 = AtomicU32::new(0);
+static BPF_JIT_KALLSYMS: AtomicU32 = AtomicU32::new(0);
 // default_qdisc is a short string; 16 bytes is enough.
 static DEFAULT_QDISC: IrqSafeSpinLock<[u8; 16]> =
     IrqSafeSpinLock::new(*b"fq_codel\0\0\0\0\0\0\0\0");
@@ -50,40 +50,40 @@ static DEFAULT_QDISC: IrqSafeSpinLock<[u8; 16]> =
 // ── net.ipv4 atomics ────────────────────────────────────────────────────
 
 /// Consulted by the routing path: 1 = forward packets between interfaces.
-pub static IP_FORWARD:         AtomicU32 = AtomicU32::new(0);
-static IP_DEFAULT_TTL:         AtomicU32 = AtomicU32::new(64);
-static TCP_KEEPALIVE_TIME:     AtomicU32 = AtomicU32::new(7200);
-static TCP_KEEPALIVE_INTVL:    AtomicU32 = AtomicU32::new(75);
-static TCP_KEEPALIVE_PROBES:   AtomicU32 = AtomicU32::new(9);
-static TCP_FIN_TIMEOUT:        AtomicU32 = AtomicU32::new(60);
-static TCP_MAX_SYN_BACKLOG:    AtomicU32 = AtomicU32::new(256);
-static TCP_SYNACK_RETRIES:     AtomicU32 = AtomicU32::new(5);
-static TCP_SYN_RETRIES:        AtomicU32 = AtomicU32::new(6);
+pub static IP_FORWARD: AtomicU32 = AtomicU32::new(0);
+static IP_DEFAULT_TTL: AtomicU32 = AtomicU32::new(64);
+static TCP_KEEPALIVE_TIME: AtomicU32 = AtomicU32::new(7200);
+static TCP_KEEPALIVE_INTVL: AtomicU32 = AtomicU32::new(75);
+static TCP_KEEPALIVE_PROBES: AtomicU32 = AtomicU32::new(9);
+static TCP_FIN_TIMEOUT: AtomicU32 = AtomicU32::new(60);
+static TCP_MAX_SYN_BACKLOG: AtomicU32 = AtomicU32::new(256);
+static TCP_SYNACK_RETRIES: AtomicU32 = AtomicU32::new(5);
+static TCP_SYN_RETRIES: AtomicU32 = AtomicU32::new(6);
 /// Exposed to TCP options layer. 1 = window scaling enabled by default.
-pub static TCP_WSCALE:         AtomicU32 = AtomicU32::new(1);
+pub static TCP_WSCALE: AtomicU32 = AtomicU32::new(1);
 /// Exposed to TCP options layer. 1 = timestamps enabled by default.
-pub static TCP_TIMESTAMPS:     AtomicU32 = AtomicU32::new(1);
+pub static TCP_TIMESTAMPS: AtomicU32 = AtomicU32::new(1);
 /// Exposed to TCP options layer. 1 = SACK enabled by default.
-pub static TCP_SACK:           AtomicU32 = AtomicU32::new(1);
-static TCP_ECN:                AtomicU32 = AtomicU32::new(2);
-static TCP_NO_METRICS_SAVE:    AtomicU32 = AtomicU32::new(0);
-static TCP_MAX_ORPHANS:        AtomicU32 = AtomicU32::new(4096);
-static TCP_MTU_PROBING:        AtomicU32 = AtomicU32::new(0);
+pub static TCP_SACK: AtomicU32 = AtomicU32::new(1);
+static TCP_ECN: AtomicU32 = AtomicU32::new(2);
+static TCP_NO_METRICS_SAVE: AtomicU32 = AtomicU32::new(0);
+static TCP_MAX_ORPHANS: AtomicU32 = AtomicU32::new(4096);
+static TCP_MTU_PROBING: AtomicU32 = AtomicU32::new(0);
 // tcp_rmem: min / default / max (bytes)
-static TCP_RMEM_MIN:     AtomicU32 = AtomicU32::new(4096);
+static TCP_RMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static TCP_RMEM_DEFAULT: AtomicU32 = AtomicU32::new(131072);
-static TCP_RMEM_MAX:     AtomicU32 = AtomicU32::new(6291456);
+static TCP_RMEM_MAX: AtomicU32 = AtomicU32::new(6291456);
 // tcp_wmem: min / default / max (bytes)
-static TCP_WMEM_MIN:     AtomicU32 = AtomicU32::new(4096);
+static TCP_WMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static TCP_WMEM_DEFAULT: AtomicU32 = AtomicU32::new(16384);
-static TCP_WMEM_MAX:     AtomicU32 = AtomicU32::new(4194304);
+static TCP_WMEM_MAX: AtomicU32 = AtomicU32::new(4194304);
 // udp socket minimums
 static UDP_RMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static UDP_WMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 // icmp
-static ICMP_ECHO_IGNORE_ALL:        AtomicU32 = AtomicU32::new(0);
+static ICMP_ECHO_IGNORE_ALL: AtomicU32 = AtomicU32::new(0);
 static ICMP_ECHO_IGNORE_BROADCASTS: AtomicU32 = AtomicU32::new(1);
-static ICMP_RATELIMIT:              AtomicU32 = AtomicU32::new(1000);
+static ICMP_RATELIMIT: AtomicU32 = AtomicU32::new(1000);
 // ephemeral port range
 pub static PORT_RANGE_LO: AtomicU32 = AtomicU32::new(32768);
 pub static PORT_RANGE_HI: AtomicU32 = AtomicU32::new(60999);
@@ -100,29 +100,25 @@ static TCP_ALLOWED_CONG: IrqSafeSpinLock<[u8; 32]> =
 
 // ── net.ipv6 atomics ────────────────────────────────────────────────────
 
-pub static IPV6_FORWARDING:   AtomicU32 = AtomicU32::new(0);
-static IPV6_ACCEPT_RA:        AtomicU32 = AtomicU32::new(1);
-static IPV6_AUTOCONF:         AtomicU32 = AtomicU32::new(1);
-static IPV6_USE_TEMPADDR:     AtomicU32 = AtomicU32::new(2);
-static IPV6_DISABLE_IPV6:     AtomicU32 = AtomicU32::new(0);
-static IPV6_BINDV6ONLY:       AtomicU32 = AtomicU32::new(0);
+pub static IPV6_FORWARDING: AtomicU32 = AtomicU32::new(0);
+static IPV6_ACCEPT_RA: AtomicU32 = AtomicU32::new(1);
+static IPV6_AUTOCONF: AtomicU32 = AtomicU32::new(1);
+static IPV6_USE_TEMPADDR: AtomicU32 = AtomicU32::new(2);
+static IPV6_DISABLE_IPV6: AtomicU32 = AtomicU32::new(0);
+static IPV6_BINDV6ONLY: AtomicU32 = AtomicU32::new(0);
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn read_cstring_16(slot: &IrqSafeSpinLock<[u8; 16]>) -> String {
     let g = slot.lock();
     let end = g.iter().position(|&b| b == 0).unwrap_or(16);
-    core::str::from_utf8(&g[..end])
-        .unwrap_or("?")
-        .to_string()
+    core::str::from_utf8(&g[..end]).unwrap_or("?").to_string()
 }
 
 fn read_cstring_32(slot: &IrqSafeSpinLock<[u8; 32]>) -> String {
     let g = slot.lock();
     let end = g.iter().position(|&b| b == 0).unwrap_or(32);
-    core::str::from_utf8(&g[..end])
-        .unwrap_or("?")
-        .to_string()
+    core::str::from_utf8(&g[..end]).unwrap_or("?").to_string()
 }
 
 fn write_cstring_16(slot: &IrqSafeSpinLock<[u8; 16]>, val: &str) -> Result<(), FsError> {
@@ -204,8 +200,8 @@ pub fn ephemeral_port_range() -> (u16, u16) {
 /// Default TCP options flags (window_scaling, timestamps, sack).
 #[inline]
 pub fn tcp_option_defaults() -> (bool, bool, bool) {
-    let ws   = TCP_WSCALE.load(Ordering::Relaxed) != 0;
-    let ts   = TCP_TIMESTAMPS.load(Ordering::Relaxed) != 0;
+    let ws = TCP_WSCALE.load(Ordering::Relaxed) != 0;
+    let ts = TCP_TIMESTAMPS.load(Ordering::Relaxed) != 0;
     let sack = TCP_SACK.load(Ordering::Relaxed) != 0;
     (ws, ts, sack)
 }
@@ -416,10 +412,14 @@ pub fn register_all() {
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/tcp_rmem",
-        read: || format!("{}\t{}\t{}\n",
-            TCP_RMEM_MIN.load(Ordering::Relaxed),
-            TCP_RMEM_DEFAULT.load(Ordering::Relaxed),
-            TCP_RMEM_MAX.load(Ordering::Relaxed)),
+        read: || {
+            format!(
+                "{}\t{}\t{}\n",
+                TCP_RMEM_MIN.load(Ordering::Relaxed),
+                TCP_RMEM_DEFAULT.load(Ordering::Relaxed),
+                TCP_RMEM_MAX.load(Ordering::Relaxed)
+            )
+        },
         write: Some(|s| {
             let parts: alloc::vec::Vec<&str> = s.split_whitespace().collect();
             if parts.len() != 3 {
@@ -440,10 +440,14 @@ pub fn register_all() {
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/tcp_wmem",
-        read: || format!("{}\t{}\t{}\n",
-            TCP_WMEM_MIN.load(Ordering::Relaxed),
-            TCP_WMEM_DEFAULT.load(Ordering::Relaxed),
-            TCP_WMEM_MAX.load(Ordering::Relaxed)),
+        read: || {
+            format!(
+                "{}\t{}\t{}\n",
+                TCP_WMEM_MIN.load(Ordering::Relaxed),
+                TCP_WMEM_DEFAULT.load(Ordering::Relaxed),
+                TCP_WMEM_MAX.load(Ordering::Relaxed)
+            )
+        },
         write: Some(|s| {
             let parts: alloc::vec::Vec<&str> = s.split_whitespace().collect();
             if parts.len() != 3 {
@@ -494,9 +498,13 @@ pub fn register_all() {
     });
     register_sysctl(SysctlEntry {
         path: "net/ipv4/ip_local_port_range",
-        read: || format!("{}\t{}\n",
-            PORT_RANGE_LO.load(Ordering::Relaxed),
-            PORT_RANGE_HI.load(Ordering::Relaxed)),
+        read: || {
+            format!(
+                "{}\t{}\n",
+                PORT_RANGE_LO.load(Ordering::Relaxed),
+                PORT_RANGE_HI.load(Ordering::Relaxed)
+            )
+        },
         write: Some(|s| {
             let parts: alloc::vec::Vec<&str> = s.split_whitespace().collect();
             if parts.len() != 2 {
@@ -556,8 +564,8 @@ pub fn register_all() {
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-use narf_kernel_test::{kernel_test_in, TestResult};
 use super::{lookup_registry, ProcNodeSnapshot};
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_core_somaxconn_default_128() -> TestResult {
     register_all();
@@ -575,7 +583,10 @@ fn smoke_core_somaxconn_default_128() -> TestResult {
         _ => TestResult::Fail("somaxconn not found in registry"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_core_somaxconn_default_128);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_core_somaxconn_default_128
+);
 
 fn smoke_core_somaxconn_write_roundtrip() -> TestResult {
     register_all();
@@ -595,9 +606,16 @@ fn smoke_core_somaxconn_write_roundtrip() -> TestResult {
         _ => return TestResult::Fail("somaxconn not found"),
     };
     SOMAXCONN.store(128, Ordering::Relaxed);
-    if ok { TestResult::Pass } else { TestResult::Fail("somaxconn round-trip failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("somaxconn round-trip failed")
+    }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_core_somaxconn_write_roundtrip);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_core_somaxconn_write_roundtrip
+);
 
 fn smoke_ipv4_ip_forward_0_1() -> TestResult {
     register_all();
@@ -618,7 +636,11 @@ fn smoke_ipv4_ip_forward_0_1() -> TestResult {
         _ => return TestResult::Fail("ip_forward not found"),
     };
     IP_FORWARD.store(0, Ordering::Relaxed);
-    if ok { TestResult::Pass } else { TestResult::Fail("ip_forward toggle failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ip_forward toggle failed")
+    }
 }
 kernel_test_in!("filesystem/procfs/sys_net", smoke_ipv4_ip_forward_0_1);
 
@@ -636,15 +658,20 @@ fn smoke_ipv4_ip_default_ttl_write_32() -> TestResult {
         _ => return TestResult::Fail("ip_default_ttl not found"),
     };
     IP_DEFAULT_TTL.store(64, Ordering::Relaxed);
-    if ok { TestResult::Pass } else { TestResult::Fail("ip_default_ttl write failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ip_default_ttl write failed")
+    }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_ipv4_ip_default_ttl_write_32);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_ipv4_ip_default_ttl_write_32
+);
 
 fn smoke_tcp_available_congestion_control_has_cubic_reno() -> TestResult {
     register_all();
-    let snap = lookup_registry(&[
-        "sys", "net", "ipv4", "tcp_available_congestion_control",
-    ]);
+    let snap = lookup_registry(&["sys", "net", "ipv4", "tcp_available_congestion_control"]);
     match snap {
         Some(ProcNodeSnapshot::File(f)) => {
             let v = f.read();
@@ -681,9 +708,16 @@ fn smoke_tcp_congestion_control_write_reno() -> TestResult {
         _ => return TestResult::Fail("tcp_congestion_control not found"),
     };
     write_cstring_16(&TCP_CONG_ALG, "cubic").ok();
-    if ok { TestResult::Pass } else { TestResult::Fail("congestion control reno write failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("congestion control reno write failed")
+    }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_tcp_congestion_control_write_reno);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_tcp_congestion_control_write_reno
+);
 
 fn smoke_tcp_congestion_control_write_bogus_invalid_data() -> TestResult {
     register_all();
@@ -722,7 +756,10 @@ fn smoke_tcp_rmem_returns_3_int_format() -> TestResult {
         _ => TestResult::Fail("tcp_rmem not found"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_tcp_rmem_returns_3_int_format);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_tcp_rmem_returns_3_int_format
+);
 
 fn smoke_ip_local_port_range_roundtrip() -> TestResult {
     register_all();
@@ -741,9 +778,16 @@ fn smoke_ip_local_port_range_roundtrip() -> TestResult {
     };
     PORT_RANGE_LO.store(32768, Ordering::Relaxed);
     PORT_RANGE_HI.store(60999, Ordering::Relaxed);
-    if ok { TestResult::Pass } else { TestResult::Fail("port_range round-trip failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("port_range round-trip failed")
+    }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_ip_local_port_range_roundtrip);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_ip_local_port_range_roundtrip
+);
 
 fn smoke_icmp_echo_ignore_all_0_1() -> TestResult {
     register_all();
@@ -764,7 +808,11 @@ fn smoke_icmp_echo_ignore_all_0_1() -> TestResult {
         _ => return TestResult::Fail("icmp_echo_ignore_all not found"),
     };
     ICMP_ECHO_IGNORE_ALL.store(0, Ordering::Relaxed);
-    if ok { TestResult::Pass } else { TestResult::Fail("icmp_echo_ignore_all toggle failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("icmp_echo_ignore_all toggle failed")
+    }
 }
 kernel_test_in!("filesystem/procfs/sys_net", smoke_icmp_echo_ignore_all_0_1);
 
@@ -787,9 +835,16 @@ fn smoke_ipv6_conf_all_forwarding_0_1() -> TestResult {
         _ => return TestResult::Fail("ipv6/conf/all/forwarding not found"),
     };
     IPV6_FORWARDING.store(0, Ordering::Relaxed);
-    if ok { TestResult::Pass } else { TestResult::Fail("ipv6 forwarding toggle failed") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ipv6 forwarding toggle failed")
+    }
 }
-kernel_test_in!("filesystem/procfs/sys_net", smoke_ipv6_conf_all_forwarding_0_1);
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_ipv6_conf_all_forwarding_0_1
+);
 
 fn smoke_tcp_syn_retries_default_6() -> TestResult {
     register_all();

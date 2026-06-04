@@ -121,17 +121,14 @@ impl ProcFile for PciDevicesFile {
                 | ((pcie_addr.device as u32) << 3)
                 | (pcie_addr.function as u32);
             // vendor+device concatenated (no separator).
-            let vid_did =
-                ((d.id.vendor as u32) << 16) | (d.id.device as u32);
+            let vid_did = ((d.id.vendor as u32) << 16) | (d.id.device as u32);
 
             // IRQ from cfg-space offset 0x3C (interrupt_line).
             let irq: u8 = if cfg_phys != 0 {
                 // SAFETY: cfg_phys is the ECAM window (set by the bus
                 // enumerator).  Offset 0x3C is within the 256-byte type-0
                 // standard header which is always readable.  Identity-mapped.
-                unsafe {
-                    core::ptr::read_volatile((cfg_phys + 0x3C) as *const u8)
-                }
+                unsafe { core::ptr::read_volatile((cfg_phys + 0x3C) as *const u8) }
             } else {
                 0
             };
@@ -143,17 +140,14 @@ impl ProcFile for PciDevicesFile {
                     // SAFETY: BAR registers at offsets 0x10..0x28; within
                     // the 256-byte standard header; identity-mapped.
                     bars[i as usize] = unsafe {
-                        core::ptr::read_volatile(
-                            (cfg_phys + 0x10 + i * 4) as *const u32,
-                        ) as u64
+                        core::ptr::read_volatile((cfg_phys + 0x10 + i * 4) as *const u32) as u64
                     };
                 }
                 // Merge 64-bit BAR pairs (bit 2 of low slot set = 64-bit).
                 let mut i = 0;
                 while i < 5 {
                     if (bars[i] & 0b110) == 0b100 {
-                        bars[i] =
-                            (bars[i + 1] << 32) | (bars[i] & 0xFFFF_FFF0);
+                        bars[i] = (bars[i + 1] << 32) | (bars[i] & 0xFFFF_FFF0);
                         bars[i + 1] = 0;
                         i += 2;
                     } else {
@@ -165,11 +159,7 @@ impl ProcFile for PciDevicesFile {
             // ROM BAR at offset 0x30.
             let rom: u64 = if cfg_phys != 0 {
                 // SAFETY: offset 0x30 within the 256-byte header.
-                unsafe {
-                    core::ptr::read_volatile(
-                        (cfg_phys + 0x30) as *const u32,
-                    ) as u64
-                }
+                unsafe { core::ptr::read_volatile((cfg_phys + 0x30) as *const u32) as u64 }
             } else {
                 0
             };
@@ -209,11 +199,8 @@ impl ProcFile for PciCfgSpaceFile {
         let mut out = Vec::with_capacity(CFG_SIZE);
         for off in 0..CFG_SIZE {
             // SAFETY: cfg_phys is the ECAM window; identity-mapped.
-            let val = unsafe {
-                core::ptr::read_volatile(
-                    (self.cfg_phys as usize + off) as *const u8,
-                )
-            };
+            let val =
+                unsafe { core::ptr::read_volatile((self.cfg_phys as usize + off) as *const u8) };
             out.push(val);
         }
         out
@@ -336,7 +323,11 @@ struct InputDevicesFile;
 /// Linux ref: `drivers/input/input.c::input_seq_print_bitmap`.
 fn render_bitmap(words: &[u64]) -> String {
     use core::fmt::Write as _;
-    let top = words.iter().rposition(|&w| w != 0).map(|i| i + 1).unwrap_or(0);
+    let top = words
+        .iter()
+        .rposition(|&w| w != 0)
+        .map(|i| i + 1)
+        .unwrap_or(0);
     if top == 0 {
         return String::from("0");
     }
@@ -360,16 +351,10 @@ impl ProcFile for InputDevicesFile {
             let id_num = snap.id.0;
             let caps = &snap.caps;
 
-            let _ = writeln!(
-                out,
-                "I: Bus=0000 Vendor=0000 Product=0000 Version=0000"
-            );
+            let _ = writeln!(out, "I: Bus=0000 Vendor=0000 Product=0000 Version=0000");
             let _ = writeln!(out, "N: Name=\"input{id_num}\"");
             let _ = writeln!(out, "P: Phys=");
-            let _ = writeln!(
-                out,
-                "S: Sysfs=/devices/virtual/input/input{id_num}"
-            );
+            let _ = writeln!(out, "S: Sysfs=/devices/virtual/input/input{id_num}");
             let _ = writeln!(out, "U: Uniq=");
 
             // H: always include evdev eventN; also kbd when EV_KEY is set.
@@ -414,10 +399,10 @@ impl ProcFile for InputHandlersFile {
     fn read(&self) -> Vec<u8> {
         use core::fmt::Write as _;
         static HANDLERS: &[(&str, Option<u8>)] = &[
-            ("sysrq",    Some(64)),
-            ("kbd",      None),
+            ("sysrq", Some(64)),
+            ("kbd", None),
             ("mousedev", Some(32)),
-            ("evdev",    Some(64)),
+            ("evdev", Some(64)),
         ];
         let mut out = String::new();
         for (i, &(name, minor)) in HANDLERS.iter().enumerate() {
@@ -444,18 +429,18 @@ impl ProcFile for InputHandlersFile {
 /// Deferred: PCI config-space write support (not exposed in read-only
 /// mode today).  USB bandwidth allocation percentages in B: lines.
 pub fn register_bus_proc() {
-    register_proc("bus/pci/devices",     Arc::new(PciDevicesFile));
-    register_proc("bus/usb/devices",     Arc::new(UsbDevicesFile));
-    register_proc("bus/input/devices",   Arc::new(InputDevicesFile));
-    register_proc("bus/input/handlers",  Arc::new(InputHandlersFile));
+    register_proc("bus/pci/devices", Arc::new(PciDevicesFile));
+    register_proc("bus/usb/devices", Arc::new(UsbDevicesFile));
+    register_proc("bus/input/devices", Arc::new(InputDevicesFile));
+    register_proc("bus/input/handlers", Arc::new(InputHandlersFile));
 }
 
 // ════════════════════════════════════════════════════════════════════
 // Smoke tests
 // ════════════════════════════════════════════════════════════════════
 
-use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_bus::registry as bus_registry;
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// /proc/bus/pci/devices: one line per registered PCI device.
 fn smoke_pci_devices_line_count() -> TestResult {
@@ -467,7 +452,13 @@ fn smoke_pci_devices_line_count() -> TestResult {
     bus_registry::install(alloc::vec![
         BusDevice {
             addr: BusAddr::Pcie(PcieAddr::new(0, 0, 1, 0)),
-            id: BusDevId { vendor: 0x8086, device: 0x1234, class: 0x060000, subsystem_vendor: 0, subsystem_id: 0 },
+            id: BusDevId {
+                vendor: 0x8086,
+                device: 0x1234,
+                class: 0x060000,
+                subsystem_vendor: 0,
+                subsystem_id: 0
+            },
             kind: BusKind::Pcie {
                 addr: PcieAddr::new(0, 0, 1, 0),
                 cfg_phys: PhysAddr::new(0),
@@ -475,7 +466,13 @@ fn smoke_pci_devices_line_count() -> TestResult {
         },
         BusDevice {
             addr: BusAddr::Pcie(PcieAddr::new(0, 0, 2, 0)),
-            id: BusDevId { vendor: 0x10de, device: 0x5678, class: 0x030000, subsystem_vendor: 0, subsystem_id: 0 },
+            id: BusDevId {
+                vendor: 0x10de,
+                device: 0x5678,
+                class: 0x030000,
+                subsystem_vendor: 0,
+                subsystem_id: 0
+            },
             kind: BusKind::Pcie {
                 addr: PcieAddr::new(0, 0, 2, 0),
                 cfg_phys: PhysAddr::new(0),
@@ -504,7 +501,13 @@ fn smoke_pci_devices_hex_bdf() -> TestResult {
     // bus=0x02, dev=0x03, fn=1 → (2<<8)|(3<<3)|1 = 0x219
     bus_registry::install(alloc::vec![BusDevice {
         addr: BusAddr::Pcie(PcieAddr::new(0, 0x02, 0x03, 1)),
-        id: BusDevId { vendor: 0xAAAA, device: 0xBBBB, class: 0, subsystem_vendor: 0, subsystem_id: 0 },
+        id: BusDevId {
+            vendor: 0xAAAA,
+            device: 0xBBBB,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0
+        },
         kind: BusKind::Pcie {
             addr: PcieAddr::new(0, 0x02, 0x03, 1),
             cfg_phys: PhysAddr::new(0),
@@ -569,8 +572,8 @@ kernel_test_in!("filesystem/procfs/bus", smoke_usb_devices_hub_ifs);
 fn smoke_input_devices_ev_line() -> TestResult {
     use narf_input::evdev::{DeviceCaps, ROUTER};
     let mut caps = DeviceCaps::new();
-    caps.add_key(1);   // KEY_ESC
-    caps.add_key(28);  // KEY_ENTER
+    caps.add_key(1); // KEY_ESC
+    caps.add_key(28); // KEY_ENTER
     let (_id, _node) = ROUTER.register_device(caps);
 
     let bytes = InputDevicesFile.read();

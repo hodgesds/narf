@@ -143,12 +143,10 @@ impl CsprngInner {
         self.state[12] = self.counter as u32;
         self.state[13] = (self.counter >> 32) as u32;
         // Nonce (words 14 + 15, 8 bytes total; last 4 bytes of nonce are 0).
-        self.state[14] = u32::from_le_bytes([
-            self.nonce[0], self.nonce[1], self.nonce[2], self.nonce[3],
-        ]);
-        self.state[15] = u32::from_le_bytes([
-            self.nonce[4], self.nonce[5], self.nonce[6], self.nonce[7],
-        ]);
+        self.state[14] =
+            u32::from_le_bytes([self.nonce[0], self.nonce[1], self.nonce[2], self.nonce[3]]);
+        self.state[15] =
+            u32::from_le_bytes([self.nonce[4], self.nonce[5], self.nonce[6], self.nonce[7]]);
     }
 
     /// Advance the counter and re-sync state words 12 + 13.
@@ -195,25 +193,73 @@ impl CsprngInner {
 
 #[inline(always)]
 fn qr(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32) {
-    *a = a.wrapping_add(*b); *d ^= *a; *d = d.rotate_left(16);
-    *c = c.wrapping_add(*d); *b ^= *c; *b = b.rotate_left(12);
-    *a = a.wrapping_add(*b); *d ^= *a; *d = d.rotate_left(8);
-    *c = c.wrapping_add(*d); *b ^= *c; *b = b.rotate_left(7);
+    *a = a.wrapping_add(*b);
+    *d ^= *a;
+    *d = d.rotate_left(16);
+    *c = c.wrapping_add(*d);
+    *b ^= *c;
+    *b = b.rotate_left(12);
+    *a = a.wrapping_add(*b);
+    *d ^= *a;
+    *d = d.rotate_left(8);
+    *c = c.wrapping_add(*d);
+    *b ^= *c;
+    *b = b.rotate_left(7);
 }
 
 fn chacha20_block(state: &[u32; 16], out: &mut [u8; 64]) {
     let mut x = *state;
     for _ in 0..10 {
         // Column rounds.
-        let (mut a, mut b, mut c, mut d) = (x[0], x[4], x[8],  x[12]); qr(&mut a, &mut b, &mut c, &mut d); x[0]=a; x[4]=b; x[8]=c; x[12]=d;
-        let (mut a, mut b, mut c, mut d) = (x[1], x[5], x[9],  x[13]); qr(&mut a, &mut b, &mut c, &mut d); x[1]=a; x[5]=b; x[9]=c; x[13]=d;
-        let (mut a, mut b, mut c, mut d) = (x[2], x[6], x[10], x[14]); qr(&mut a, &mut b, &mut c, &mut d); x[2]=a; x[6]=b; x[10]=c; x[14]=d;
-        let (mut a, mut b, mut c, mut d) = (x[3], x[7], x[11], x[15]); qr(&mut a, &mut b, &mut c, &mut d); x[3]=a; x[7]=b; x[11]=c; x[15]=d;
+        let (mut a, mut b, mut c, mut d) = (x[0], x[4], x[8], x[12]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[0] = a;
+        x[4] = b;
+        x[8] = c;
+        x[12] = d;
+        let (mut a, mut b, mut c, mut d) = (x[1], x[5], x[9], x[13]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[1] = a;
+        x[5] = b;
+        x[9] = c;
+        x[13] = d;
+        let (mut a, mut b, mut c, mut d) = (x[2], x[6], x[10], x[14]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[2] = a;
+        x[6] = b;
+        x[10] = c;
+        x[14] = d;
+        let (mut a, mut b, mut c, mut d) = (x[3], x[7], x[11], x[15]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[3] = a;
+        x[7] = b;
+        x[11] = c;
+        x[15] = d;
         // Diagonal rounds.
-        let (mut a, mut b, mut c, mut d) = (x[0], x[5], x[10], x[15]); qr(&mut a, &mut b, &mut c, &mut d); x[0]=a; x[5]=b; x[10]=c; x[15]=d;
-        let (mut a, mut b, mut c, mut d) = (x[1], x[6], x[11], x[12]); qr(&mut a, &mut b, &mut c, &mut d); x[1]=a; x[6]=b; x[11]=c; x[12]=d;
-        let (mut a, mut b, mut c, mut d) = (x[2], x[7], x[8],  x[13]); qr(&mut a, &mut b, &mut c, &mut d); x[2]=a; x[7]=b; x[8]=c; x[13]=d;
-        let (mut a, mut b, mut c, mut d) = (x[3], x[4], x[9],  x[14]); qr(&mut a, &mut b, &mut c, &mut d); x[3]=a; x[4]=b; x[9]=c; x[14]=d;
+        let (mut a, mut b, mut c, mut d) = (x[0], x[5], x[10], x[15]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[0] = a;
+        x[5] = b;
+        x[10] = c;
+        x[15] = d;
+        let (mut a, mut b, mut c, mut d) = (x[1], x[6], x[11], x[12]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[1] = a;
+        x[6] = b;
+        x[11] = c;
+        x[12] = d;
+        let (mut a, mut b, mut c, mut d) = (x[2], x[7], x[8], x[13]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[2] = a;
+        x[7] = b;
+        x[8] = c;
+        x[13] = d;
+        let (mut a, mut b, mut c, mut d) = (x[3], x[4], x[9], x[14]);
+        qr(&mut a, &mut b, &mut c, &mut d);
+        x[3] = a;
+        x[4] = b;
+        x[9] = c;
+        x[14] = d;
     }
     for i in 0..16 {
         let val = x[i].wrapping_add(state[i]);
@@ -312,10 +358,10 @@ pub fn last_entropy_source() -> Option<EntropySource> {
 
 fn record_source(s: EntropySource) {
     let v = match s {
-        EntropySource::Rdseed      => 0,
-        EntropySource::Rdrand      => 1,
-        EntropySource::Rndrrs      => 2,
-        EntropySource::Rndr        => 3,
+        EntropySource::Rdseed => 0,
+        EntropySource::Rdrand => 1,
+        EntropySource::Rndrrs => 2,
+        EntropySource::Rndr => 3,
         EntropySource::TscFallback => 4,
     };
     LAST_SOURCE.store(v, Ordering::Relaxed);
@@ -326,8 +372,8 @@ fn gather_entropy_into(buf: &mut [u8; 32]) {
     use narf_arch::x86_64::hwrng::{fill_key_32, HwRngSource};
     let src = fill_key_32(buf);
     record_source(match src {
-        HwRngSource::Rdseed      => EntropySource::Rdseed,
-        HwRngSource::Rdrand      => EntropySource::Rdrand,
+        HwRngSource::Rdseed => EntropySource::Rdseed,
+        HwRngSource::Rdrand => EntropySource::Rdrand,
         HwRngSource::TscFallback => EntropySource::TscFallback,
     });
 }
@@ -341,7 +387,10 @@ fn gather_entropy_into(buf: &mut [u8; 32]) {
         for i in 0..4usize {
             match rndr::try_rndrrs() {
                 Some(v) => buf[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes()),
-                None => { ok = false; break; }
+                None => {
+                    ok = false;
+                    break;
+                }
             }
         }
         if ok {
@@ -353,7 +402,10 @@ fn gather_entropy_into(buf: &mut [u8; 32]) {
         for i in 0..4usize {
             match rndr::try_rndr() {
                 Some(v) => buf[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes()),
-                None => { ok2 = false; break; }
+                None => {
+                    ok2 = false;
+                    break;
+                }
             }
         }
         if ok2 {

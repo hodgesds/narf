@@ -36,9 +36,7 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::sysfs::{
-    class_device_register, class_register, kobject_emit_uevent,
-};
+use crate::sysfs::{class_device_register, class_register, kobject_emit_uevent};
 use crate::uevent::{self, UeventAction, UeventReader};
 
 // ── Minimal fake block device ─────────────────────────────────────────────
@@ -56,13 +54,20 @@ impl core::fmt::Debug for FakeBlock {
 
 impl FakeBlock {
     fn new(lba_size: u32, cap: u64) -> Arc<dyn narf_block::BlockDeviceSync> {
-        Arc::new(Self { lba_size, capacity: cap })
+        Arc::new(Self {
+            lba_size,
+            capacity: cap,
+        })
     }
 }
 
 impl narf_block::BlockDeviceSync for FakeBlock {
-    fn lba_size(&self) -> u32 { self.lba_size }
-    fn capacity(&self) -> u64 { self.capacity }
+    fn lba_size(&self) -> u32 {
+        self.lba_size
+    }
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
     fn read(&self, _lba: u64, n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
         let n_bytes = n as usize * self.lba_size as usize;
         out[..n_bytes].fill(0);
@@ -412,7 +417,10 @@ fn smoke_uevent_e2e_slow_reader_independent_cursor() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("uevent_e2e", smoke_uevent_e2e_slow_reader_independent_cursor);
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_e2e_slow_reader_independent_cursor
+);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Smoke 8 — Ring overflow drops oldest, no panic
@@ -443,9 +451,7 @@ fn smoke_uevent_e2e_ring_overflow_no_panic() -> TestResult {
     // Ring must be exactly full, not larger.
     let ring_len = uevent::ring_len();
     if ring_len != uevent::UEVENT_RING_N {
-        return TestResult::Fail(
-            "ring length after overflow != UEVENT_RING_N",
-        );
+        return TestResult::Fail("ring length after overflow != UEVENT_RING_N");
     }
 
     // The oldest event still in the ring should have seqnum 45
@@ -624,9 +630,7 @@ fn smoke_uevent_e2e_format_required_keys_order() -> TestResult {
             None => return TestResult::Fail("SEQNUM= not found"),
         };
 
-        if !(pos_action < pos_devpath
-            && pos_devpath < pos_subsystem
-            && pos_subsystem < pos_seqnum)
+        if !(pos_action < pos_devpath && pos_devpath < pos_subsystem && pos_subsystem < pos_seqnum)
         {
             return TestResult::Fail(
                 "mandatory keys are not in Linux order: ACTION DEVPATH SUBSYSTEM SEQNUM",
@@ -713,7 +717,9 @@ fn smoke_uevent_e2e_multiple_subsystems() -> TestResult {
             s.len()
         };
         if n_distinct != 3 {
-            return TestResult::Fail("block, net, input ADD events do not have 3 distinct SUBSYSTEMs");
+            return TestResult::Fail(
+                "block, net, input ADD events do not have 3 distinct SUBSYSTEMs",
+            );
         }
 
         TestResult::Pass

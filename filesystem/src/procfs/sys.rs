@@ -70,10 +70,13 @@ impl core::fmt::Debug for SysctlEntry {
 /// in `kernel/sysctl.c`.
 pub fn register_sysctl(entry: SysctlEntry) {
     let path = alloc::format!("sys/{}", entry.path.trim_matches('/'));
-    register_proc(&path, Arc::new(SysctlProcFile {
-        read_fn: entry.read,
-        write_fn: entry.write,
-    }));
+    register_proc(
+        &path,
+        Arc::new(SysctlProcFile {
+            read_fn: entry.read,
+            write_fn: entry.write,
+        }),
+    );
 }
 
 // ── ProcFile adapter ─────────────────────────────────────────────
@@ -186,7 +189,10 @@ fn smoke_sysctl_writable_write_calls_handler() -> TestResult {
         TestResult::Fail("sysctl writable write did not call handler with trimmed value")
     }
 }
-kernel_test_in!("filesystem/procfs/sys", smoke_sysctl_writable_write_calls_handler);
+kernel_test_in!(
+    "filesystem/procfs/sys",
+    smoke_sysctl_writable_write_calls_handler
+);
 
 /// Writing to a read-only key returns FsError::ReadOnly.
 fn smoke_sysctl_readonly_write_returns_error() -> TestResult {
@@ -214,4 +220,7 @@ fn smoke_sysctl_readonly_write_returns_error() -> TestResult {
         TestResult::Fail("read-only sysctl write did not return ReadOnly")
     }
 }
-kernel_test_in!("filesystem/procfs/sys", smoke_sysctl_readonly_write_returns_error);
+kernel_test_in!(
+    "filesystem/procfs/sys",
+    smoke_sysctl_readonly_write_returns_error
+);

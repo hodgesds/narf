@@ -75,17 +75,21 @@ pub mod root_selector;
 pub mod sysfs;
 pub mod uevent;
 
-mod tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
-mod sysfs_tests;
 mod e2e_tests;
-mod sysfs_e2e_tests;
-mod uevent_e2e_tests;
-mod procsys_e2e_tests;
 mod fs_mount_e2e_tests;
+mod procsys_e2e_tests;
 mod random_e2e_tests;
-pub use devfs::{install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks, mount_default as mount_devfs_default, register_dri_dir, register_snd_dir, register_tpm, unregister_tpm, DevFs};
+mod sysfs_e2e_tests;
+mod sysfs_tests;
+mod tests;
+mod uevent_e2e_tests;
+pub use devfs::{
+    install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks,
+    mount_default as mount_devfs_default, register_dri_dir, register_snd_dir, register_tpm,
+    unregister_tpm, DevFs,
+};
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
@@ -94,9 +98,9 @@ pub use fuse::{
 pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 pub use sysfs::{
-    class_device_register, class_register, kobject_add_attr, kobject_add_bin_attr,
-    kobject_add_writable_attr, kobject_emit_uevent, install_net_snapshot_hook, sysfs_root,
-    AttrShow, AttrStore, BinAttrRead, Kobject, NetIfaceInfo, SysFs, SysKobjDir,
+    class_device_register, class_register, install_net_snapshot_hook, kobject_add_attr,
+    kobject_add_bin_attr, kobject_add_writable_attr, kobject_emit_uevent, sysfs_root, AttrShow,
+    AttrStore, BinAttrRead, Kobject, NetIfaceInfo, SysFs, SysKobjDir,
 };
 pub use uevent::{
     emit as emit_uevent, emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv,
@@ -466,7 +470,11 @@ pub trait DirOps: Send + Sync {
     }
 
     /// Snapshot entries asynchronously.
-    fn enumerate_async<'a>(&'a self, _cursor: usize, _max: usize) -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>> {
+    fn enumerate_async<'a>(
+        &'a self,
+        _cursor: usize,
+        _max: usize,
+    ) -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
@@ -652,8 +660,7 @@ pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, A
                 // at a single page.
                 let mut buf = alloc::vec![0u8; 4096];
                 let n = f.read(0, &mut buf).await?;
-                let target = core::str::from_utf8(&buf[..n])
-                    .map_err(|_| FsError::InvalidPath)?;
+                let target = core::str::from_utf8(&buf[..n]).map_err(|_| FsError::InvalidPath)?;
                 let absolute = target.starts_with('/');
                 let target_components: alloc::vec::Vec<alloc::string::String> = target
                     .split('/')
@@ -688,9 +695,9 @@ pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, A
             }
             let next = match current_dir.lookup_dir_async(&seg).await {
                 Ok(d) => d,
-                Err(FsError::Unsupported) => current_dir
-                    .lookup_dir(&seg)
-                    .ok_or(FsError::NotFound)?,
+                Err(FsError::Unsupported) => {
+                    current_dir.lookup_dir(&seg).ok_or(FsError::NotFound)?
+                }
                 Err(e) => return Err(e),
             };
             parent_chain.push(current_dir);
@@ -952,9 +959,7 @@ impl VfsRegistry {
             return Err(FsError::Busy);
         }
         drop(q);
-        let bind = alloc::sync::Arc::new(BindMount {
-            inner: source_fs,
-        });
+        let bind = alloc::sync::Arc::new(BindMount { inner: source_fs });
         self.mount_arc(authority, target, bind)
     }
 
@@ -1042,7 +1047,8 @@ impl VfsRegistry {
         for m in q.iter() {
             let is_match = abs == m.path
                 || m.path == "/"
-                || (abs.starts_with(m.path.as_str()) && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+                || (abs.starts_with(m.path.as_str())
+                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
             if is_match {
                 if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
                     best = Some(m);
@@ -1397,8 +1403,8 @@ fn collect_immediate_children<'a>(
     entries: &'a [crate::InitramfsEntry],
     prefix: &str,
 ) -> Vec<(String, FileType)> {
-    use alloc::string::ToString;
     use alloc::collections::BTreeMap;
+    use alloc::string::ToString;
     // (child, has_subentries)
     let mut seen: BTreeMap<&'a str, bool> = BTreeMap::new();
     for e in entries.iter() {
@@ -1420,8 +1426,7 @@ fn collect_immediate_children<'a>(
             Some(slash) => (&rest[..slash], &rest[slash + 1..]),
             None => (rest, ""),
         };
-        let has_children = !tail.is_empty()
-            || (rest == first && (e.mode & 0o170000 == 0o040000));
+        let has_children = !tail.is_empty() || (rest == first && (e.mode & 0o170000 == 0o040000));
         match seen.get_mut(first) {
             Some(flag) => {
                 *flag |= has_children;
@@ -1435,7 +1440,11 @@ fn collect_immediate_children<'a>(
         .map(|(name, is_dir)| {
             (
                 name.to_string(),
-                if is_dir { FileType::Dir } else { FileType::File },
+                if is_dir {
+                    FileType::Dir
+                } else {
+                    FileType::File
+                },
             )
         })
         .collect()
@@ -1491,7 +1500,8 @@ impl DirOps for InitramfsDir {
         // same rationale as InitramfsRoot::lookup.
         let any_child = self.entries.iter().any(|e| {
             let canon = canonicalize_cpio_name(e.name);
-            canon.strip_prefix(&target)
+            canon
+                .strip_prefix(&target)
                 .and_then(|r| r.strip_prefix('/'))
                 .is_some()
         });
@@ -1576,7 +1586,8 @@ impl DirOps for InitramfsRoot {
         // into the directory for paths like `/bin/echo`.
         let any_child = self.entries().iter().any(|e| {
             let canon = canonicalize_cpio_name(e.name);
-            canon.strip_prefix(name)
+            canon
+                .strip_prefix(name)
                 .and_then(|r| r.strip_prefix('/'))
                 .is_some()
         });
@@ -1592,9 +1603,7 @@ impl DirOps for InitramfsRoot {
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            self.lookup(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
@@ -1604,7 +1613,10 @@ impl DirOps for InitramfsRoot {
         let any_match = self.entries().iter().any(|e| {
             let canon = canonicalize_cpio_name(e.name);
             canon == name
-                || canon.strip_prefix(name).and_then(|r| r.strip_prefix('/')).is_some()
+                || canon
+                    .strip_prefix(name)
+                    .and_then(|r| r.strip_prefix('/'))
+                    .is_some()
         });
         if !any_match {
             return None;
@@ -1616,9 +1628,7 @@ impl DirOps for InitramfsRoot {
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move {
-            self.lookup_dir(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -1632,10 +1642,12 @@ impl DirOps for InitramfsRoot {
         all.into_iter().skip(cursor).take(max).collect()
     }
 
-    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
-        Box::pin(async move {
-            Ok(self.enumerate(cursor, max))
-        })
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move { Ok(self.enumerate(cursor, max)) })
     }
 }
 

@@ -38,10 +38,10 @@ use core::sync::atomic::Ordering;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::procfs::sys_kernel;
 use crate::procfs::sys_net;
 use crate::procfs::sys_vm;
+use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::FsError;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -162,7 +162,10 @@ fn e2e_tcp_congestion_control_reno_propagates() -> TestResult {
         _ => TestResult::Fail("tcp_congestion_control read-back after 'reno' write mismatch"),
     }
 }
-kernel_test_in!("procsys_e2e/net", e2e_tcp_congestion_control_reno_propagates);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_tcp_congestion_control_reno_propagates
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 4 — net.ipv4.tcp_timestamps 0
@@ -199,7 +202,10 @@ fn e2e_tcp_timestamps_0_propagates_to_option_defaults() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("procsys_e2e/net", e2e_tcp_timestamps_0_propagates_to_option_defaults);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_tcp_timestamps_0_propagates_to_option_defaults
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 5 — net.ipv4.tcp_sack 0
@@ -235,7 +241,10 @@ fn e2e_tcp_sack_0_propagates_to_option_defaults() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("procsys_e2e/net", e2e_tcp_sack_0_propagates_to_option_defaults);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_tcp_sack_0_propagates_to_option_defaults
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 6 — net.ipv4.tcp_window_scaling 0
@@ -271,7 +280,10 @@ fn e2e_tcp_window_scaling_0_propagates_to_option_defaults() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("procsys_e2e/net", e2e_tcp_window_scaling_0_propagates_to_option_defaults);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_tcp_window_scaling_0_propagates_to_option_defaults
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 7 — net.ipv4.ip_local_port_range (wired: PORT_RANGE_LO/HI atomics
@@ -305,7 +317,10 @@ fn e2e_ip_local_port_range_propagates_to_accessor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("procsys_e2e/net", e2e_ip_local_port_range_propagates_to_accessor);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_ip_local_port_range_propagates_to_accessor
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 8 — net.ipv6.conf.all.forwarding 1
@@ -341,7 +356,10 @@ fn e2e_ipv6_forwarding_propagates_to_accessor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("procsys_e2e/net", e2e_ipv6_forwarding_propagates_to_accessor);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_ipv6_forwarding_propagates_to_accessor
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 9 — vm.swappiness (accept-and-store: SWAPPINESS AtomicU64)
@@ -468,7 +486,10 @@ fn e2e_randomize_va_space_3_returns_invalid_data() -> TestResult {
         None => TestResult::Fail("randomize_va_space not found in registry"),
     }
 }
-kernel_test_in!("procsys_e2e/kernel", e2e_randomize_va_space_3_returns_invalid_data);
+kernel_test_in!(
+    "procsys_e2e/kernel",
+    e2e_randomize_va_space_3_returns_invalid_data
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 14 — net.ipv4.tcp_congestion_control "bogus": write → InvalidData
@@ -483,7 +504,9 @@ fn e2e_tcp_congestion_control_bogus_returns_invalid_data() -> TestResult {
     let path = &["sys", "net", "ipv4", "tcp_congestion_control"];
     match sysctl_write(path, b"bogus\n") {
         Some(Err(FsError::InvalidData)) => TestResult::Pass,
-        Some(Ok(_)) => TestResult::Fail("tcp_congestion_control write 'bogus' should return InvalidData"),
+        Some(Ok(_)) => {
+            TestResult::Fail("tcp_congestion_control write 'bogus' should return InvalidData")
+        }
         Some(Err(e)) => {
             let _ = e;
             TestResult::Fail("tcp_congestion_control write 'bogus' returned unexpected error")
@@ -491,7 +514,10 @@ fn e2e_tcp_congestion_control_bogus_returns_invalid_data() -> TestResult {
         None => TestResult::Fail("tcp_congestion_control not found in registry"),
     }
 }
-kernel_test_in!("procsys_e2e/net", e2e_tcp_congestion_control_bogus_returns_invalid_data);
+kernel_test_in!(
+    "procsys_e2e/net",
+    e2e_tcp_congestion_control_bogus_returns_invalid_data
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 15 — vm.swappiness 201: write → InvalidData
@@ -537,7 +563,10 @@ fn e2e_kernel_pid_max_negative_returns_invalid_data() -> TestResult {
         None => TestResult::Fail("kernel/pid_max not found in registry"),
     }
 }
-kernel_test_in!("procsys_e2e/kernel", e2e_kernel_pid_max_negative_returns_invalid_data);
+kernel_test_in!(
+    "procsys_e2e/kernel",
+    e2e_kernel_pid_max_negative_returns_invalid_data
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 17 — kernel.dmesg_restrict write: returns ReadOnly
@@ -556,9 +585,14 @@ fn e2e_kernel_dmesg_restrict_write_returns_readonly() -> TestResult {
         Some(Ok(_)) => TestResult::Fail("kernel/dmesg_restrict write should return ReadOnly"),
         Some(Err(e)) => {
             let _ = e;
-            TestResult::Fail("kernel/dmesg_restrict write returned unexpected error (want ReadOnly)")
+            TestResult::Fail(
+                "kernel/dmesg_restrict write returned unexpected error (want ReadOnly)",
+            )
         }
         None => TestResult::Fail("kernel/dmesg_restrict not found in registry"),
     }
 }
-kernel_test_in!("procsys_e2e/kernel", e2e_kernel_dmesg_restrict_write_returns_readonly);
+kernel_test_in!(
+    "procsys_e2e/kernel",
+    e2e_kernel_dmesg_restrict_write_returns_readonly
+);

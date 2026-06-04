@@ -26,7 +26,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT};
+use crate::{
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT,
+};
 
 /// `/dev/null` — read = EOF, write = discard.
 struct DevNull;
@@ -217,14 +219,18 @@ pub fn install_rfcomm_hooks(
 
 fn rfcomm_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     let ptr = RFCOMM_LOOKUP_HOOK.load(Ordering::Acquire);
-    if ptr == 0 { return None; }
+    if ptr == 0 {
+        return None;
+    }
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
 
 fn rfcomm_enumerate() -> Vec<(String, FileType)> {
     let ptr = RFCOMM_ENUM_HOOK.load(Ordering::Acquire);
-    if ptr == 0 { return Vec::new(); }
+    if ptr == 0 {
+        return Vec::new();
+    }
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -245,14 +251,18 @@ pub fn install_tty_usb_hooks(
 
 fn tty_usb_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     let ptr = TTY_USB_LOOKUP_HOOK.load(Ordering::Acquire);
-    if ptr == 0 { return None; }
+    if ptr == 0 {
+        return None;
+    }
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
 
 fn tty_usb_enumerate() -> Vec<(String, FileType)> {
     let ptr = TTY_USB_ENUM_HOOK.load(Ordering::Acquire);
-    if ptr == 0 { return Vec::new(); }
+    if ptr == 0 {
+        return Vec::new();
+    }
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -273,14 +283,18 @@ pub fn install_video_hooks(
 
 fn video_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     let ptr = VIDEO_LOOKUP_HOOK.load(Ordering::Acquire);
-    if ptr == 0 { return None; }
+    if ptr == 0 {
+        return None;
+    }
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
 
 fn video_enumerate() -> Vec<(String, FileType)> {
     let ptr = VIDEO_ENUM_HOOK.load(Ordering::Acquire);
-    if ptr == 0 { return Vec::new(); }
+    if ptr == 0 {
+        return Vec::new();
+    }
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -519,11 +533,31 @@ fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Optio
     use narf_input::{KeyCode as K, Modifiers as M};
     let shift = mods.contains(M::SHIFT) ^ mods.contains(M::CAPS_LOCK);
     let base = match code {
-        K::A => b'a', K::B => b'b', K::C => b'c', K::D => b'd', K::E => b'e',
-        K::F => b'f', K::G => b'g', K::H => b'h', K::I => b'i', K::J => b'j',
-        K::K => b'k', K::L => b'l', K::M => b'm', K::N => b'n', K::O => b'o',
-        K::P => b'p', K::Q => b'q', K::R => b'r', K::S => b's', K::T => b't',
-        K::U => b'u', K::V => b'v', K::W => b'w', K::X => b'x', K::Y => b'y',
+        K::A => b'a',
+        K::B => b'b',
+        K::C => b'c',
+        K::D => b'd',
+        K::E => b'e',
+        K::F => b'f',
+        K::G => b'g',
+        K::H => b'h',
+        K::I => b'i',
+        K::J => b'j',
+        K::K => b'k',
+        K::L => b'l',
+        K::M => b'm',
+        K::N => b'n',
+        K::O => b'o',
+        K::P => b'p',
+        K::Q => b'q',
+        K::R => b'r',
+        K::S => b's',
+        K::T => b't',
+        K::U => b'u',
+        K::V => b'v',
+        K::W => b'w',
+        K::X => b'x',
+        K::Y => b'y',
         K::Z => b'z',
         K::Key0 => return Some(if shift { b')' } else { b'0' }),
         K::Key1 => return Some(if shift { b'!' } else { b'1' }),
@@ -553,7 +587,11 @@ fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Optio
         K::Slash => return Some(if shift { b'?' } else { b'/' }),
         _ => return None,
     };
-    Some(if shift { base.to_ascii_uppercase() } else { base })
+    Some(if shift {
+        base.to_ascii_uppercase()
+    } else {
+        base
+    })
 }
 
 impl FileOps for DevConsole {
@@ -608,8 +646,7 @@ impl FileOps for DevConsole {
             if written < buf.len() {
                 if let Some(b) = narf_input::pop_ascii_byte() {
                     let consumed = if signal_hook != 0 {
-                        let hook: fn(u8) -> bool =
-                            unsafe { core::mem::transmute(signal_hook) };
+                        let hook: fn(u8) -> bool = unsafe { core::mem::transmute(signal_hook) };
                         hook(b)
                     } else {
                         false
@@ -680,32 +717,24 @@ impl DirOps for DevDir {
             "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
-            "console" | "tty" | "tty0" => {
-                Some(Arc::new(DevConsole) as Arc<dyn FileOps>)
-            }
+            "console" | "tty" | "tty0" => Some(Arc::new(DevConsole) as Arc<dyn FileOps>),
             "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
             "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
             "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
             // Dynamic: ttyUSB<N> USB-to-serial ports.
             // Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
-            name if name.starts_with("ttyUSB")
-                && name[6..].chars().all(|c| c.is_ascii_digit()) =>
-            {
+            name if name.starts_with("ttyUSB") && name[6..].chars().all(|c| c.is_ascii_digit()) => {
                 tty_usb_lookup(name)
             }
             // Dynamic: video<N> V4L2 camera nodes.
             // Linux ref: `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`.
-            name if name.starts_with("video")
-                && name[5..].chars().all(|c| c.is_ascii_digit()) =>
-            {
+            name if name.starts_with("video") && name[5..].chars().all(|c| c.is_ascii_digit()) => {
                 video_lookup(name)
             }
             // Dynamic: rfcomm<N> Bluetooth serial ports.
             // Linux ref: `net/bluetooth/rfcomm/tty.c:318` — rfcomm_dev_add.
-            name if name.starts_with("rfcomm")
-                && name[6..].chars().all(|c| c.is_ascii_digit()) =>
-            {
+            name if name.starts_with("rfcomm") && name[6..].chars().all(|c| c.is_ascii_digit()) => {
                 rfcomm_lookup(name)
             }
             // Dynamic: query the block-device registry after static names miss.
@@ -720,28 +749,24 @@ impl DirOps for DevDir {
     /// - `/dev/input` → `DevInputDir` (evdev event nodes, Wave 12 bridge)
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
-            "pts"   => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
-            "disk"  => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
+            "pts" => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
+            "disk" => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
             "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
             // Sound subsystem — delegate installed by narf-drivers-sound.
-            "snd"   => SND_DIR.lock().clone(),
+            "snd" => SND_DIR.lock().clone(),
             // DRM/DRI subsystem — delegate installed by narf-drivers-gpu.
             // Linux ref: `drivers/gpu/drm/drm_drv.c::drm_dev_register`.
-            "dri"   => DRI_DIR.lock().clone(),
+            "dri" => DRI_DIR.lock().clone(),
             _ => None,
         }
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            self.lookup(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move {
-            self.lookup_dir(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -749,24 +774,78 @@ impl DirOps for DevDir {
         // satisfy `&'static str` so they don't appear here; use
         // `enumerate()` for a full readdir listing.
         const ENTRIES: &[DirEntry] = &[
-            DirEntry { name: "null",    file_type: FileType::Special },
-            DirEntry { name: "zero",    file_type: FileType::Special },
-            DirEntry { name: "full",    file_type: FileType::Special },
-            DirEntry { name: "random",  file_type: FileType::Special },
-            DirEntry { name: "urandom", file_type: FileType::Special },
-            DirEntry { name: "kmsg",    file_type: FileType::Special },
-            DirEntry { name: "console", file_type: FileType::Special },
-            DirEntry { name: "tty",     file_type: FileType::Special },
-            DirEntry { name: "tty0",    file_type: FileType::Special },
-            DirEntry { name: "ptmx",    file_type: FileType::Special },
-            DirEntry { name: "fp0",     file_type: FileType::Special },
-            DirEntry { name: "tpm0",    file_type: FileType::Special },
-            DirEntry { name: "tpmrm0",  file_type: FileType::Special },
-            DirEntry { name: "pts",     file_type: FileType::Dir },
-            DirEntry { name: "disk",    file_type: FileType::Dir },
-            DirEntry { name: "input",   file_type: FileType::Dir },
-            DirEntry { name: "snd",     file_type: FileType::Dir },
-            DirEntry { name: "dri",     file_type: FileType::Dir },
+            DirEntry {
+                name: "null",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "zero",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "full",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "random",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "urandom",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "kmsg",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "console",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "tty",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "tty0",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "ptmx",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "fp0",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "tpm0",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "tpmrm0",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "pts",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "disk",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "input",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "snd",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "dri",
+                file_type: FileType::Dir,
+            },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -776,30 +855,29 @@ impl DirOps for DevDir {
         // devices that share a name with a static entry are skipped
         // (static entry wins, matching Linux's static-node precedence).
         let static_entries: &[(&str, FileType)] = &[
-            ("null",    FileType::Special),
-            ("zero",    FileType::Special),
-            ("full",    FileType::Special),
-            ("random",  FileType::Special),
+            ("null", FileType::Special),
+            ("zero", FileType::Special),
+            ("full", FileType::Special),
+            ("random", FileType::Special),
             ("urandom", FileType::Special),
             ("console", FileType::Special),
-            ("tty",     FileType::Special),
-            ("tty0",    FileType::Special),
-            ("ptmx",    FileType::Special),
-            ("fp0",     FileType::Special),
-            ("tpm0",    FileType::Special),
-            ("tpmrm0",  FileType::Special),
-            ("pts",     FileType::Dir),
-            ("disk",    FileType::Dir),
-            ("input",   FileType::Dir),
-            ("snd",     FileType::Dir),
-            ("dri",     FileType::Dir),
+            ("tty", FileType::Special),
+            ("tty0", FileType::Special),
+            ("ptmx", FileType::Special),
+            ("fp0", FileType::Special),
+            ("tpm0", FileType::Special),
+            ("tpmrm0", FileType::Special),
+            ("pts", FileType::Dir),
+            ("disk", FileType::Dir),
+            ("input", FileType::Dir),
+            ("snd", FileType::Dir),
+            ("dri", FileType::Dir),
         ];
         let static_names: Vec<String> = static_entries.iter().map(|(n, _)| (*n).into()).collect();
-        let block_extras: Vec<(String, FileType)> =
-            crate::devfs_block::enumerate_block_devices()
-                .into_iter()
-                .filter(|(name, _)| !static_names.iter().any(|s| s == name))
-                .collect();
+        let block_extras: Vec<(String, FileType)> = crate::devfs_block::enumerate_block_devices()
+            .into_iter()
+            .filter(|(name, _)| !static_names.iter().any(|s| s == name))
+            .collect();
 
         let rfcomm_extras = rfcomm_enumerate();
         let tty_usb_extras = tty_usb_enumerate();
@@ -817,7 +895,11 @@ impl DirOps for DevDir {
             .collect()
     }
 
-    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
         let v = self.enumerate(cursor, max);
         Box::pin(async move { Ok(v) })
     }

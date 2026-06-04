@@ -57,8 +57,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::uevent::{emit, UeventAction};
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
-use crate::uevent::{UeventAction, emit};
 
 // ── Attr function types ───────────────────────────────────────────────
 
@@ -197,12 +197,20 @@ impl Kobject {
 
     /// List child names.
     pub fn child_names(&self) -> Vec<String> {
-        self.children.lock().iter().map(|c| c.name.clone()).collect()
+        self.children
+            .lock()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
     }
 
     /// Look up a child by name.
     pub fn get_child(&self, name: &str) -> Option<Arc<Kobject>> {
-        self.children.lock().iter().find(|c| c.name == name).cloned()
+        self.children
+            .lock()
+            .iter()
+            .find(|c| c.name == name)
+            .cloned()
     }
 
     /// List text attribute names.
@@ -245,8 +253,7 @@ impl Kobject {
 
     /// True if `name` is a registered text or binary attribute.
     pub fn has_attr(&self, name: &str) -> bool {
-        self.attrs.lock().contains_key(name)
-            || self.bin_attrs.lock().contains_key(name)
+        self.attrs.lock().contains_key(name) || self.bin_attrs.lock().contains_key(name)
     }
 }
 
@@ -325,12 +332,7 @@ pub fn kobject_add_bin_attr(kobj: &Kobject, name: &'static str, read: BinAttrRea
 /// pointers set (`include/linux/sysfs.h:24-26`).  Examples:
 /// `cur_state_store` at `drivers/thermal/thermal_sysfs.c:533`,
 /// `brightness_store` at `drivers/leds/led-class.c`.
-pub fn kobject_add_writable_attr<F, G>(
-    kobj: &Kobject,
-    name: &'static str,
-    show: F,
-    store: G,
-)
+pub fn kobject_add_writable_attr<F, G>(kobj: &Kobject, name: &'static str, show: F, store: G)
 where
     F: Fn() -> String + Send + Sync + 'static,
     G: Fn(&[u8]) -> Result<(), crate::FsError> + Send + Sync + 'static,
@@ -524,9 +526,9 @@ impl DirOps for SysRoot {
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        get_root().get_child(name).map(|child| {
-            Arc::new(SysKobjDir { kobj: child }) as Arc<dyn DirOps>
-        })
+        get_root()
+            .get_child(name)
+            .map(|child| Arc::new(SysKobjDir { kobj: child }) as Arc<dyn DirOps>)
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -536,7 +538,10 @@ impl DirOps for SysRoot {
             .into_iter()
             .map(|n| {
                 let leaked: &'static str = Box::leak(n.into_boxed_str());
-                DirEntry { name: leaked, file_type: FileType::Dir }
+                DirEntry {
+                    name: leaked,
+                    file_type: FileType::Dir,
+                }
             })
             .collect();
         Box::new(entries.into_iter())
@@ -577,9 +582,9 @@ impl DirOps for SysKobjDir {
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        self.kobj.get_child(name).map(|child| {
-            Arc::new(SysKobjDir { kobj: child }) as Arc<dyn DirOps>
-        })
+        self.kobj
+            .get_child(name)
+            .map(|child| Arc::new(SysKobjDir { kobj: child }) as Arc<dyn DirOps>)
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -588,10 +593,16 @@ impl DirOps for SysKobjDir {
         let mut entries: Vec<DirEntry> = Vec::new();
         for n in child_names {
             let leaked: &'static str = Box::leak(n.into_boxed_str());
-            entries.push(DirEntry { name: leaked, file_type: FileType::Dir });
+            entries.push(DirEntry {
+                name: leaked,
+                file_type: FileType::Dir,
+            });
         }
         for n in attr_names {
-            entries.push(DirEntry { name: n, file_type: FileType::File });
+            entries.push(DirEntry {
+                name: n,
+                file_type: FileType::File,
+            });
         }
         Box::new(entries.into_iter())
     }
@@ -693,7 +704,11 @@ impl FileOps for SysAttrFile {
         Stat {
             size,
             blocks: 0,
-            mode: if is_writable { Mode::FILE_RW } else { Mode::FILE_RO },
+            mode: if is_writable {
+                Mode::FILE_RW
+            } else {
+                Mode::FILE_RO
+            },
             mtime_cycles: 0,
         }
     }

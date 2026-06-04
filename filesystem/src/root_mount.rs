@@ -42,8 +42,7 @@ use crate::{FsError, FsInstance};
 /// this candidate and tries the next).
 pub type FsFactory = fn(Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError>;
 
-static FS_FACTORIES: IrqSafeSpinLock<Vec<(FsType, FsFactory)>> =
-    IrqSafeSpinLock::new(Vec::new());
+static FS_FACTORIES: IrqSafeSpinLock<Vec<(FsType, FsFactory)>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a driver-side factory for `fs_type`. Idempotent — a
 /// later registration for the same type replaces the prior factory.
@@ -107,7 +106,9 @@ pub enum RootMountError {
 ///   `RootMountError::SelectorNoMatch`.
 /// - Otherwise, fall back to "first detected FS wins" in
 ///   registration order — the existing behaviour.
-pub fn try_mount_root(authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>) -> Result<MountReport, RootMountError> {
+pub fn try_mount_root(
+    authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
+) -> Result<MountReport, RootMountError> {
     let selector = crate::root_selector::RootSelector::from_cmdline(narf_boot::cmdline());
     try_mount_root_with(authority, selector.as_ref())
 }
@@ -137,18 +138,14 @@ pub fn try_mount_root_with(
                         continue;
                     }
                 }
-                RootSelector::ByPartLabel(target) => {
-                    match &entry.partition {
-                        Some(m) if &m.partlabel == target => {}
-                        _ => continue,
-                    }
-                }
-                RootSelector::ByPartUuid(target) => {
-                    match &entry.partition {
-                        Some(m) if m.partuuid.eq_ignore_ascii_case(target) => {}
-                        _ => continue,
-                    }
-                }
+                RootSelector::ByPartLabel(target) => match &entry.partition {
+                    Some(m) if &m.partlabel == target => {}
+                    _ => continue,
+                },
+                RootSelector::ByPartUuid(target) => match &entry.partition {
+                    Some(m) if m.partuuid.eq_ignore_ascii_case(target) => {}
+                    _ => continue,
+                },
                 // FS-UUID needs per-FS-instance metadata we still
                 // don't carry (would need a UUID accessor on
                 // FsInstance). Lenient until that lands — the

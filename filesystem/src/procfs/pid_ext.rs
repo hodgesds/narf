@@ -25,8 +25,8 @@ use core::fmt::Write as _;
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
-    hook_auxv, hook_environ, hook_fd_path, hook_nice, hook_rlimits, slice_read, task_info,
-    hook_oom_adj_get, hook_oom_adj_set, hook_coredump_get, hook_coredump_set, hook_oom_score,
+    hook_auxv, hook_coredump_get, hook_coredump_set, hook_environ, hook_fd_path, hook_nice,
+    hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits, slice_read, task_info,
     ProcDirMarker,
 };
 
@@ -82,20 +82,19 @@ impl FileOps for PidExtFile {
                     if !(-1000..=1000).contains(&val) {
                         return Err(FsError::InvalidData);
                     }
-                    hook_oom_adj_set(pid, val as i16)
-                        .map_err(|_| FsError::InvalidData)?;
+                    hook_oom_adj_set(pid, val as i16).map_err(|_| FsError::InvalidData)?;
                     Ok(buf.len())
                 }
                 PidExtField::CoredumpFilter => {
                     let s = core::str::from_utf8(buf.trim_ascii_end())
                         .map_err(|_| FsError::InvalidData)?;
-                    let stripped = s.strip_prefix("0x")
+                    let stripped = s
+                        .strip_prefix("0x")
                         .or_else(|| s.strip_prefix("0X"))
                         .unwrap_or(s);
-                    let bits = u32::from_str_radix(stripped, 16)
-                        .map_err(|_| FsError::InvalidData)?;
-                    hook_coredump_set(pid, bits)
-                        .map_err(|_| FsError::InvalidData)?;
+                    let bits =
+                        u32::from_str_radix(stripped, 16).map_err(|_| FsError::InvalidData)?;
+                    hook_coredump_set(pid, bits).map_err(|_| FsError::InvalidData)?;
                     Ok(buf.len())
                 }
                 _ => Err(FsError::ReadOnly),
@@ -110,7 +109,11 @@ impl FileOps for PidExtFile {
         Stat {
             size: 0,
             blocks: 0,
-            mode: if writable { Mode::FILE_RW } else { Mode::FILE_RO },
+            mode: if writable {
+                Mode::FILE_RW
+            } else {
+                Mode::FILE_RO
+            },
             mtime_cycles: 0,
         }
     }
@@ -240,7 +243,11 @@ fn render_sched(pid: u64) -> String {
     let _ = writeln!(s, "se.avg.util_avg                    :                 0");
     let _ = writeln!(s, "se.avg.last_update_time            :                 0");
     let _ = writeln!(s, "policy                             :                 0");
-    let _ = writeln!(s, "prio                               :               {}", 20 + nice);
+    let _ = writeln!(
+        s,
+        "prio                               :               {}",
+        20 + nice
+    );
     let _ = writeln!(s, "clock-delta                        :                 0");
     s
 }
@@ -377,11 +384,7 @@ fn render_mountinfo(_pid: u64) -> String {
     let mut s = String::new();
     let mut id = 1u32;
     for (path, fs_name) in crate::registry().list_with_names() {
-        let _ = writeln!(
-            s,
-            "{} 0 0:1 / {} rw - {} {} rw",
-            id, path, fs_name, fs_name
-        );
+        let _ = writeln!(s, "{} 0 0:1 / {} rw - {} {} rw", id, path, fs_name, fs_name);
         id += 1;
     }
     if s.is_empty() {
@@ -436,8 +439,7 @@ impl FileOps for ProcFdFile {
         let pid = self.pid;
         let fd = self.fd;
         Box::pin(async move {
-            let path = hook_fd_path(pid, fd)
-                .unwrap_or_else(|| format!("anon_inode:[unknown]"));
+            let path = hook_fd_path(pid, fd).unwrap_or_else(|| format!("anon_inode:[unknown]"));
             let bytes = path.into_bytes();
             slice_read(&bytes, offset, buf)
         })
@@ -446,7 +448,12 @@ impl FileOps for ProcFdFile {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        Stat { size: 0, blocks: 0, mode: Mode::FILE_RO, mtime_cycles: 0 }
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
     }
 }
 
@@ -471,7 +478,10 @@ impl DirOps for ProcFdDir {
             }
             let s = n.to_string();
             let leaked: &'static str = Box::leak(s.into_boxed_str());
-            entries.push(DirEntry { name: leaked, file_type: FileType::File });
+            entries.push(DirEntry {
+                name: leaked,
+                file_type: FileType::File,
+            });
         }
         Box::new(entries.into_iter())
     }
@@ -520,7 +530,12 @@ impl FileOps for ProcFdInfoFile {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        Stat { size: 0, blocks: 0, mode: Mode::FILE_RO, mtime_cycles: 0 }
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
     }
 }
 
@@ -541,7 +556,10 @@ impl DirOps for ProcFdInfoDir {
             }
             let s = n.to_string();
             let leaked: &'static str = Box::leak(s.into_boxed_str());
-            entries.push(DirEntry { name: leaked, file_type: FileType::File });
+            entries.push(DirEntry {
+                name: leaked,
+                file_type: FileType::File,
+            });
         }
         Box::new(entries.into_iter())
     }
@@ -585,7 +603,12 @@ impl FileOps for ProcTaskTidComm {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        Stat { size: 0, blocks: 0, mode: Mode::FILE_RO, mtime_cycles: 0 }
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
     }
 }
 
@@ -597,7 +620,13 @@ impl DirOps for ProcTaskTidDir {
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new([DirEntry { name: "comm", file_type: FileType::File }].into_iter())
+        Box::new(
+            [DirEntry {
+                name: "comm",
+                file_type: FileType::File,
+            }]
+            .into_iter(),
+        )
     }
 }
 
@@ -621,7 +650,13 @@ impl DirOps for ProcTaskDir {
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
         let s = self.pid.to_string();
         let leaked: &'static str = Box::leak(s.into_boxed_str());
-        Box::new([DirEntry { name: leaked, file_type: FileType::Dir }].into_iter())
+        Box::new(
+            [DirEntry {
+                name: leaked,
+                file_type: FileType::Dir,
+            }]
+            .into_iter(),
+        )
     }
 }
 
@@ -649,7 +684,10 @@ fn smoke_sched_contains_exec_runtime() -> TestResult {
         TestResult::Fail("render_sched missing exec_runtime field")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_sched_contains_exec_runtime);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_sched_contains_exec_runtime
+);
 
 /// Smoke: `render_schedstat` is exactly "0 0 0\n".
 fn smoke_schedstat_shape() -> TestResult {
@@ -672,7 +710,10 @@ fn smoke_limits_has_16_resource_lines() -> TestResult {
         TestResult::Fail("render_limits should have 17 lines (1 header + 16 resources)")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_limits_has_16_resource_lines);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_limits_has_16_resource_lines
+);
 
 /// Smoke: `render_mountinfo` produces at least 1 line.
 fn smoke_mountinfo_at_least_one_line() -> TestResult {
@@ -683,7 +724,10 @@ fn smoke_mountinfo_at_least_one_line() -> TestResult {
         TestResult::Fail("render_mountinfo produced no lines")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_mountinfo_at_least_one_line);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_mountinfo_at_least_one_line
+);
 
 /// Smoke: `render_wchan` for an unknown pid (no task-info hook)
 /// returns "0\n" because the fallback state is 'R'.
@@ -695,7 +739,10 @@ fn smoke_wchan_unknown_pid_returns_zero() -> TestResult {
         TestResult::Fail("render_wchan for unknown pid should be '0\\n'")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_wchan_unknown_pid_returns_zero);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_wchan_unknown_pid_returns_zero
+);
 
 /// Smoke: AT_NULL (16 zero bytes) is always at the tail of the
 /// auxv returned by `hook_auxv` when no AUXV hook is installed.
@@ -711,7 +758,10 @@ fn smoke_auxv_has_at_null_terminator() -> TestResult {
         TestResult::Fail("auxv missing AT_NULL (0,0) terminator at tail")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_auxv_has_at_null_terminator);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_auxv_has_at_null_terminator
+);
 
 /// Smoke: `hook_environ` with no hook installed returns empty bytes.
 fn smoke_environ_empty_without_hook() -> TestResult {
@@ -722,7 +772,10 @@ fn smoke_environ_empty_without_hook() -> TestResult {
         TestResult::Fail("environ without hook should be empty")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_environ_empty_without_hook);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_environ_empty_without_hook
+);
 
 /// Smoke: `ProcFdDir::lookup` with no FD_PATH hook returns None.
 fn smoke_fd_lookup_no_hook_returns_none() -> TestResult {
@@ -732,7 +785,10 @@ fn smoke_fd_lookup_no_hook_returns_none() -> TestResult {
         Some(_) => TestResult::Fail("fd lookup without hook should return None"),
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_fd_lookup_no_hook_returns_none);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_fd_lookup_no_hook_returns_none
+);
 
 /// Smoke: `ProcTaskDir::lookup` returns Some for own tid, None otherwise.
 fn smoke_task_dir_own_tid_only() -> TestResult {
@@ -749,9 +805,18 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_task_dir_own_tid_only);
 
 /// Smoke: `oom_score_adj` + `coredump_filter` are writable; `oom_score` is read-only.
 fn smoke_writable_files_have_rw_mode() -> TestResult {
-    let adj = PidExtFile { pid: 1, field: PidExtField::OomScoreAdj };
-    let cd = PidExtFile { pid: 1, field: PidExtField::CoredumpFilter };
-    let score = PidExtFile { pid: 1, field: PidExtField::OomScore };
+    let adj = PidExtFile {
+        pid: 1,
+        field: PidExtField::OomScoreAdj,
+    };
+    let cd = PidExtFile {
+        pid: 1,
+        field: PidExtField::CoredumpFilter,
+    };
+    let score = PidExtFile {
+        pid: 1,
+        field: PidExtField::OomScore,
+    };
     if adj.stat().mode == Mode::FILE_RW
         && cd.stat().mode == Mode::FILE_RW
         && score.stat().mode == Mode::FILE_RO
@@ -761,12 +826,18 @@ fn smoke_writable_files_have_rw_mode() -> TestResult {
         TestResult::Fail("oom_score_adj/coredump_filter should be RW; oom_score RO")
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_writable_files_have_rw_mode);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_writable_files_have_rw_mode
+);
 
 /// Smoke: oom_score reads back "0\n" (no hook installed → 0).
 fn smoke_oom_score_reads_back_zero() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile { pid: 1, field: PidExtField::OomScore };
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::OomScore,
+    };
     let mut buf = [0u8; 64];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if n > 0 => {
@@ -786,7 +857,10 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_oom_score_reads_back_zero);
 /// Smoke: coredump_filter default returns "33\n" (no hook → 0x33).
 fn smoke_coredump_filter_default() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile { pid: 1, field: PidExtField::CoredumpFilter };
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::CoredumpFilter,
+    };
     let mut buf = [0u8; 64];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if n > 0 => {
@@ -805,12 +879,24 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_coredump_filter_default);
 /// Stub hooks used by the procfs write-validation smokes so the
 /// validation path runs without depending on `install_all_hooks`
 /// from the frame crate (which isn't called in `cargo xtask test`).
-fn _stub_set_comm(_pid: u64, _name: &str) -> Result<(), FsError> { Ok(()) }
-fn _stub_oom_adj_get(_pid: u64) -> i16 { 0 }
-fn _stub_oom_adj_set(_pid: u64, _val: i16) -> Result<(), FsError> { Ok(()) }
-fn _stub_coredump_get(_pid: u64) -> u32 { 0 }
-fn _stub_coredump_set(_pid: u64, _val: u32) -> Result<(), FsError> { Ok(()) }
-fn _stub_oom_score(_pid: u64) -> i32 { 0 }
+fn _stub_set_comm(_pid: u64, _name: &str) -> Result<(), FsError> {
+    Ok(())
+}
+fn _stub_oom_adj_get(_pid: u64) -> i16 {
+    0
+}
+fn _stub_oom_adj_set(_pid: u64, _val: i16) -> Result<(), FsError> {
+    Ok(())
+}
+fn _stub_coredump_get(_pid: u64) -> u32 {
+    0
+}
+fn _stub_coredump_set(_pid: u64, _val: u32) -> Result<(), FsError> {
+    Ok(())
+}
+fn _stub_oom_score(_pid: u64) -> i32 {
+    0
+}
 
 fn _install_stub_proc_write_hooks() {
     super::install_proc_write_hooks(
@@ -828,7 +914,10 @@ fn smoke_oom_score_adj_write_validation() -> TestResult {
     use super::poll_once;
     _install_stub_proc_write_hooks();
     // Valid write: "100\n".
-    let f = PidExtFile { pid: 1, field: PidExtField::OomScoreAdj };
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::OomScoreAdj,
+    };
     let ok = poll_once(f.write(0, b"100\n"));
     let reject = poll_once(f.write(0, b"1500\n"));
     let reject_neg = poll_once(f.write(0, b"-1001\n"));
@@ -839,13 +928,19 @@ fn smoke_oom_score_adj_write_validation() -> TestResult {
         _ => TestResult::Fail("oom_score_adj write validation wrong"),
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_oom_score_adj_write_validation);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_oom_score_adj_write_validation
+);
 
 /// Smoke: coredump_filter write "ff" roundtrips; invalid hex rejected.
 fn smoke_coredump_filter_write_validation() -> TestResult {
     use super::poll_once;
     _install_stub_proc_write_hooks();
-    let f = PidExtFile { pid: 1, field: PidExtField::CoredumpFilter };
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::CoredumpFilter,
+    };
     let ok = poll_once(f.write(0, b"ff\n"));
     let bad = poll_once(f.write(0, b"zz\n"));
     match (ok, bad) {
@@ -853,7 +948,10 @@ fn smoke_coredump_filter_write_validation() -> TestResult {
         _ => TestResult::Fail("coredump_filter write validation wrong"),
     }
 }
-kernel_test_in!("filesystem/procfs/pid_ext", smoke_coredump_filter_write_validation);
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_coredump_filter_write_validation
+);
 
 /// Smoke: fdinfo file contains "pos:" and "flags:" lines.
 fn smoke_fdinfo_has_pos_and_flags() -> TestResult {

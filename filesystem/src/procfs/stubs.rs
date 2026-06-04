@@ -35,8 +35,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::{register_proc, ProcFile};
 use super::sys::{register_sysctl, SysctlEntry};
+use super::{register_proc, ProcFile};
 
 // ── /proc/cgroups ────────────────────────────────────────────────
 //
@@ -145,8 +145,8 @@ fn read_zero() -> String {
 /// idempotent via `register_proc` / `register_sysctl` semantics.
 pub fn register_all() {
     // /proc top-level files.
-    register_proc("cgroups",   Arc::new(CgroupsFile));
-    register_proc("keys",      Arc::new(KeysFile));
+    register_proc("cgroups", Arc::new(CgroupsFile));
+    register_proc("keys", Arc::new(KeysFile));
     register_proc("key-users", Arc::new(KeyUsersFile));
 
     // /proc/sys/kernel/ns_last_pid — no PID namespace layer.
@@ -212,8 +212,8 @@ pub fn register_all() {
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-use narf_kernel_test::{kernel_test_in, TestResult};
 use super::{lookup_registry, ProcNodeSnapshot};
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_cgroups_header_only() -> TestResult {
     register_all();
@@ -226,7 +226,11 @@ fn smoke_cgroups_header_only() -> TestResult {
         }
         _ => false,
     };
-    if ok { TestResult::Pass } else { TestResult::Fail("/proc/cgroups missing header") }
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("/proc/cgroups missing header")
+    }
 }
 kernel_test_in!("filesystem/procfs/stubs", smoke_cgroups_header_only);
 
@@ -240,7 +244,10 @@ fn smoke_sys_user_max_user_namespaces_zero() -> TestResult {
         TestResult::Fail("max_user_namespaces did not return '0\\n'")
     }
 }
-kernel_test_in!("filesystem/procfs/stubs", smoke_sys_user_max_user_namespaces_zero);
+kernel_test_in!(
+    "filesystem/procfs/stubs",
+    smoke_sys_user_max_user_namespaces_zero
+);
 
 fn smoke_proc_keys_empty() -> TestResult {
     register_all();

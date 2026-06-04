@@ -308,9 +308,18 @@ impl DirOps for DevDiskDir {
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         const ENTRIES: &[DirEntry] = &[
-            DirEntry { name: "by-label",    file_type: FileType::Dir },
-            DirEntry { name: "by-uuid",     file_type: FileType::Dir },
-            DirEntry { name: "by-partuuid", file_type: FileType::Dir },
+            DirEntry {
+                name: "by-label",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "by-uuid",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "by-partuuid",
+                file_type: FileType::Dir,
+            },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -350,8 +359,13 @@ impl DirOps for DevDiskByLabel {
         narf_block::block_devices()
             .into_iter()
             .filter_map(|r| {
-                r.partition
-                    .and_then(|p| if p.partlabel.is_empty() { None } else { Some(p.partlabel) })
+                r.partition.and_then(|p| {
+                    if p.partlabel.is_empty() {
+                        None
+                    } else {
+                        Some(p.partlabel)
+                    }
+                })
             })
             .skip(cursor)
             .take(max)
@@ -428,8 +442,13 @@ impl DirOps for DevDiskByPartUuid {
         narf_block::block_devices()
             .into_iter()
             .filter_map(|r| {
-                r.partition
-                    .and_then(|p| if p.partuuid.is_empty() { None } else { Some(p.partuuid) })
+                r.partition.and_then(|p| {
+                    if p.partuuid.is_empty() {
+                        None
+                    } else {
+                        Some(p.partuuid)
+                    }
+                })
             })
             .skip(cursor)
             .take(max)

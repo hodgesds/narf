@@ -191,9 +191,7 @@ impl DirOps for MemDir {
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            self.lookup(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
@@ -210,9 +208,7 @@ impl DirOps for MemDir {
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move {
-            self.lookup_dir(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -239,10 +235,12 @@ impl DirOps for MemDir {
             .collect()
     }
 
-    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
-        Box::pin(async move {
-            Ok(self.enumerate(cursor, max))
-        })
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move { Ok(self.enumerate(cursor, max)) })
     }
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {

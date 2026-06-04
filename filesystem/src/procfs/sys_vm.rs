@@ -127,7 +127,7 @@ fn drop_caches_write(s: &str) -> Result<(), FsError> {
 fn compute_min_free_kbytes() -> u64 {
     let stats = narf_memory::frame::stats();
     let total_kb = (stats.total as u64) * 4; // 4 KiB pages
-    // Integer square root approximation.
+                                             // Integer square root approximation.
     let x = total_kb;
     if x == 0 {
         return 128;
@@ -381,9 +381,7 @@ use super::{lookup_registry, ProcNodeSnapshot};
 /// Helper: look up a registered sysctl, call ProcFile::read, return String.
 fn sysctl_read(path: &[&str]) -> Option<String> {
     match lookup_registry(path) {
-        Some(ProcNodeSnapshot::File(f)) => {
-            String::from_utf8(f.read()).ok()
-        }
+        Some(ProcNodeSnapshot::File(f)) => String::from_utf8(f.read()).ok(),
         _ => None,
     }
 }
@@ -427,7 +425,10 @@ fn smoke_vm_swappiness_write_roundtrip() -> TestResult {
         _ => TestResult::Fail("vm/swappiness read after write '200' did not return '200\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_swappiness_write_roundtrip);
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_swappiness_write_roundtrip
+);
 
 fn smoke_vm_swappiness_rejects_out_of_range() -> TestResult {
     ensure_registered();
@@ -437,7 +438,10 @@ fn smoke_vm_swappiness_rejects_out_of_range() -> TestResult {
         _ => TestResult::Fail("vm/swappiness write '201' should return InvalidData"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_swappiness_rejects_out_of_range);
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_swappiness_rejects_out_of_range
+);
 
 fn smoke_vm_drop_caches_write_3() -> TestResult {
     ensure_registered();
@@ -452,7 +456,10 @@ kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_drop_caches_write_3);
 fn smoke_vm_overcommit_memory_valid() -> TestResult {
     ensure_registered();
     for &v in &[b"0\n" as &[u8], b"1\n", b"2\n"] {
-        if !matches!(sysctl_write(&["sys", "vm", "overcommit_memory"], v), Some(Ok(_))) {
+        if !matches!(
+            sysctl_write(&["sys", "vm", "overcommit_memory"], v),
+            Some(Ok(_))
+        ) {
             return TestResult::Fail("vm/overcommit_memory valid write failed");
         }
     }
@@ -467,7 +474,10 @@ fn smoke_vm_overcommit_memory_rejects_3() -> TestResult {
         _ => TestResult::Fail("vm/overcommit_memory write '3' should return InvalidData"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_overcommit_memory_rejects_3);
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_overcommit_memory_rejects_3
+);
 
 fn smoke_vm_dirty_background_bytes_default() -> TestResult {
     ensure_registered();
@@ -477,7 +487,10 @@ fn smoke_vm_dirty_background_bytes_default() -> TestResult {
         _ => TestResult::Fail("vm/dirty_background_bytes default should be '0\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_dirty_background_bytes_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_dirty_background_bytes_default
+);
 
 fn smoke_vm_min_free_kbytes_nonzero() -> TestResult {
     ensure_registered();

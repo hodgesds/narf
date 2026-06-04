@@ -301,9 +301,7 @@ impl DirOps for DevInputDir {
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            self.lookup(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
     }
 
     fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -346,6 +344,9 @@ mod devfs_input_unit {
     /// Verify the event file size constant matches Linux's `struct input_event`.
     #[test]
     fn evdev_event_size_is_16() {
-        assert_eq!(EVDEV_EVENT_SIZE, 16, "EvdevEvent must be 16 bytes to match Linux ABI");
+        assert_eq!(
+            EVDEV_EVENT_SIZE, 16,
+            "EvdevEvent must be 16 bytes to match Linux ABI"
+        );
     }
 }

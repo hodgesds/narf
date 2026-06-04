@@ -623,9 +623,15 @@ impl ProcFile for TcpFile {
             let _ = writeln!(
                 s,
                 "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} ",
-                i, local, remote, tcb.state_code,
-                tcb.tx_queue, tcb.rx_queue,
-                0u8, 0u32, tcb.retrnsmt,
+                i,
+                local,
+                remote,
+                tcb.state_code,
+                tcb.tx_queue,
+                tcb.rx_queue,
+                0u8,
+                0u32,
+                tcb.retrnsmt,
                 tcb.uid,
                 tcb.inode,
             );
@@ -671,8 +677,7 @@ impl ProcFile for RawFile {
             let _ = writeln!(
                 s,
                 "{:>4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0 ",
-                i, local, remote, r.state_code,
-                r.uid, r.inode,
+                i, local, remote, r.state_code, r.uid, r.inode,
             );
         }
         s.into_bytes()
@@ -692,10 +697,17 @@ impl ProcFile for Tcp6File {
             let _ = writeln!(
                 s,
                 "{:>4}: {} {} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5}        0 {} ",
-                i, local, remote, tcb.state_code,
-                tcb.tx_queue, tcb.rx_queue,
-                0u8, 0u32, tcb.retrnsmt,
-                tcb.uid, tcb.inode,
+                i,
+                local,
+                remote,
+                tcb.state_code,
+                tcb.tx_queue,
+                tcb.rx_queue,
+                0u8,
+                0u32,
+                tcb.retrnsmt,
+                tcb.uid,
+                tcb.inode,
             );
         }
         s.into_bytes()
@@ -738,8 +750,7 @@ impl ProcFile for Raw6File {
             let _ = writeln!(
                 s,
                 "{:>4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0 ",
-                i, local, remote, r.state_code,
-                r.uid, r.inode,
+                i, local, remote, r.state_code, r.uid, r.inode,
             );
         }
         s.into_bytes()
@@ -788,9 +799,17 @@ impl ProcFile for RouteFile {
             let _ = writeln!(
                 s,
                 "{}\t{:08X}\t{:08X}\t{:04X}\t{}\t{}\t{}\t{:08X}\t{}\t{}\t{}",
-                r.iface, dst_hex, gw_hex, r.flags,
-                r.refcnt, r.use_count, r.metric, mask_hex,
-                r.mtu, r.window, r.irtt,
+                r.iface,
+                dst_hex,
+                gw_hex,
+                r.flags,
+                r.refcnt,
+                r.use_count,
+                r.metric,
+                mask_hex,
+                r.mtu,
+                r.window,
+                r.irtt,
             );
         }
         s.into_bytes()
@@ -837,7 +856,10 @@ impl ProcFile for IfInet6File {
                 s,
                 "{} {:02x} {:02x} {:02x} {:02x} {:>8}",
                 fmt_ipv6_raw(a.addr),
-                a.ifindex, a.prefix_len, a.scope, a.flags,
+                a.ifindex,
+                a.prefix_len,
+                a.scope,
+                a.flags,
                 a.iface,
             );
         }
@@ -859,10 +881,15 @@ impl ProcFile for Ipv6RouteFile {
             let _ = writeln!(
                 s,
                 "{} {:02x} {} {:02x} {} {:08x} {:08x} {:08x} {:08x} {:>8}",
-                fmt_ipv6_raw(r.dst), r.dst_prefix_len,
-                fmt_ipv6_raw(r.src), r.src_prefix_len,
+                fmt_ipv6_raw(r.dst),
+                r.dst_prefix_len,
+                fmt_ipv6_raw(r.src),
+                r.src_prefix_len,
                 fmt_ipv6_raw(r.gateway),
-                r.metric, r.refcnt, r.use_count, r.flags,
+                r.metric,
+                r.refcnt,
+                r.use_count,
+                r.flags,
                 r.iface,
             );
         }
@@ -880,9 +907,8 @@ impl ProcFile for IgmpFile {
         // 1 line per joined group indented by tab. Even with no
         // groups the file always exists with at least the version
         // marker so libnetfilter-mcast probes succeed.
-        let mut s = String::from(
-            "Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n",
-        );
+        let mut s =
+            String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
         // Group entries grouped by iface name. Stage-1: a flat
         // walk; in practice we only have one or two ifaces.
         let mut current_iface: Option<String> = None;
@@ -890,18 +916,13 @@ impl ProcFile for IgmpFile {
         for g in igmp_snapshot() {
             if current_iface.as_deref() != Some(g.iface.as_str()) {
                 idx += 1;
-                let _ = writeln!(
-                    s,
-                    "{}\t{:<10}: 1 V3",
-                    idx, g.iface,
-                );
+                let _ = writeln!(s, "{}\t{:<10}: 1 V3", idx, g.iface,);
                 current_iface = Some(g.iface.clone());
             }
             let _ = writeln!(
                 s,
                 "\t\t\t{:02X}{:02X}{:02X}{:02X} {:>5} {:>5}:{:08x}\t\t{}",
-                g.group[3], g.group[2], g.group[1], g.group[0],
-                g.users, 0u32, g.timer, g.reporter,
+                g.group[3], g.group[2], g.group[1], g.group[0], g.users, 0u32, g.timer, g.reporter,
             );
         }
         s.into_bytes()
@@ -919,9 +940,12 @@ impl ProcFile for Igmp6File {
             let _ = writeln!(
                 s,
                 "{}\t{:<10}{} {} {:08x} {:>5}",
-                g.ifindex, g.iface,
+                g.ifindex,
+                g.iface,
                 fmt_ipv6_raw(g.group),
-                g.users, g.flags, g.timer,
+                g.users,
+                g.flags,
+                g.timer,
             );
         }
         s.into_bytes()
@@ -944,11 +968,25 @@ impl ProcFile for SnmpFile {
         let _ = writeln!(
             s,
             "Ip: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            m.ip_forwarding, m.ip_default_ttl, m.ip_in_receives, m.ip_in_hdr_errors,
-            m.ip_in_addr_errors, m.ip_forwd_datagrams, m.ip_in_unknown_protos, m.ip_in_discards,
-            m.ip_in_delivers, m.ip_out_requests, m.ip_out_discards, m.ip_out_no_routes,
-            m.ip_reasm_timeout, m.ip_reasm_reqds, m.ip_reasm_oks, m.ip_reasm_fails,
-            m.ip_frag_oks, m.ip_frag_fails, m.ip_frag_creates,
+            m.ip_forwarding,
+            m.ip_default_ttl,
+            m.ip_in_receives,
+            m.ip_in_hdr_errors,
+            m.ip_in_addr_errors,
+            m.ip_forwd_datagrams,
+            m.ip_in_unknown_protos,
+            m.ip_in_discards,
+            m.ip_in_delivers,
+            m.ip_out_requests,
+            m.ip_out_discards,
+            m.ip_out_no_routes,
+            m.ip_reasm_timeout,
+            m.ip_reasm_reqds,
+            m.ip_reasm_oks,
+            m.ip_reasm_fails,
+            m.ip_frag_oks,
+            m.ip_frag_fails,
+            m.ip_frag_creates,
         );
         // ICMP MIB
         let _ = writeln!(
@@ -958,13 +996,32 @@ impl ProcFile for SnmpFile {
         let _ = writeln!(
             s,
             "Icmp: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            m.icmp_in_msgs, m.icmp_in_errors, m.icmp_in_dest_unreachs, m.icmp_in_time_excds,
-            m.icmp_in_parm_probs, m.icmp_in_src_quenchs, m.icmp_in_redirects, m.icmp_in_echos,
-            m.icmp_in_echo_reps, m.icmp_in_timestamps, m.icmp_in_timestamp_reps, m.icmp_in_addr_masks,
-            m.icmp_in_addr_mask_reps, m.icmp_out_msgs, m.icmp_out_errors, m.icmp_out_dest_unreachs,
-            m.icmp_out_time_excds, m.icmp_out_parm_probs, m.icmp_out_src_quenchs, m.icmp_out_redirects,
-            m.icmp_out_echos, m.icmp_out_echo_reps, m.icmp_out_timestamps, m.icmp_out_timestamp_reps,
-            m.icmp_out_addr_masks, m.icmp_out_addr_mask_reps,
+            m.icmp_in_msgs,
+            m.icmp_in_errors,
+            m.icmp_in_dest_unreachs,
+            m.icmp_in_time_excds,
+            m.icmp_in_parm_probs,
+            m.icmp_in_src_quenchs,
+            m.icmp_in_redirects,
+            m.icmp_in_echos,
+            m.icmp_in_echo_reps,
+            m.icmp_in_timestamps,
+            m.icmp_in_timestamp_reps,
+            m.icmp_in_addr_masks,
+            m.icmp_in_addr_mask_reps,
+            m.icmp_out_msgs,
+            m.icmp_out_errors,
+            m.icmp_out_dest_unreachs,
+            m.icmp_out_time_excds,
+            m.icmp_out_parm_probs,
+            m.icmp_out_src_quenchs,
+            m.icmp_out_redirects,
+            m.icmp_out_echos,
+            m.icmp_out_echo_reps,
+            m.icmp_out_timestamps,
+            m.icmp_out_timestamp_reps,
+            m.icmp_out_addr_masks,
+            m.icmp_out_addr_mask_reps,
         );
         // TCP MIB — 15 standard counters per RFC 1213.
         let _ = writeln!(
@@ -974,10 +1031,21 @@ impl ProcFile for SnmpFile {
         let _ = writeln!(
             s,
             "Tcp: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            m.tcp_rto_algorithm, m.tcp_rto_min, m.tcp_rto_max, m.tcp_max_conn,
-            m.tcp_active_opens, m.tcp_passive_opens, m.tcp_attempt_fails, m.tcp_estab_resets,
-            m.tcp_curr_estab, m.tcp_in_segs, m.tcp_out_segs, m.tcp_retrans_segs,
-            m.tcp_in_errs, m.tcp_out_rsts, m.tcp_in_csum_errors,
+            m.tcp_rto_algorithm,
+            m.tcp_rto_min,
+            m.tcp_rto_max,
+            m.tcp_max_conn,
+            m.tcp_active_opens,
+            m.tcp_passive_opens,
+            m.tcp_attempt_fails,
+            m.tcp_estab_resets,
+            m.tcp_curr_estab,
+            m.tcp_in_segs,
+            m.tcp_out_segs,
+            m.tcp_retrans_segs,
+            m.tcp_in_errs,
+            m.tcp_out_rsts,
+            m.tcp_in_csum_errors,
         );
         // UDP MIB
         let _ = writeln!(
@@ -987,8 +1055,14 @@ impl ProcFile for SnmpFile {
         let _ = writeln!(
             s,
             "Udp: {} {} {} {} {} {} {} {}",
-            m.udp_in_datagrams, m.udp_no_ports, m.udp_in_errors, m.udp_out_datagrams,
-            m.udp_rcvbuf_errors, m.udp_sndbuf_errors, m.udp_in_csum_errors, m.udp_ignored_multi,
+            m.udp_in_datagrams,
+            m.udp_no_ports,
+            m.udp_in_errors,
+            m.udp_out_datagrams,
+            m.udp_rcvbuf_errors,
+            m.udp_sndbuf_errors,
+            m.udp_in_csum_errors,
+            m.udp_ignored_multi,
         );
         s.into_bytes()
     }
@@ -1130,18 +1204,29 @@ kernel_test_in!("filesystem/procfs/net", smoke_tcp6_address_is_32_hex_digits);
 
 fn smoke_udp_two_sockets_two_lines() -> TestResult {
     register_all();
-    static FAKE_UDP: IrqSafeSpinLock<Vec<UdpSocketSnapshot>> =
-        IrqSafeSpinLock::new(Vec::new());
+    static FAKE_UDP: IrqSafeSpinLock<Vec<UdpSocketSnapshot>> = IrqSafeSpinLock::new(Vec::new());
     *FAKE_UDP.lock() = alloc::vec![
         UdpSocketSnapshot {
-            local_addr: [0, 0, 0, 0], local_port: 53,
-            remote_addr: [0, 0, 0, 0], remote_port: 0,
-            state_code: 7, tx_queue: 0, rx_queue: 0, uid: 0, inode: 0,
+            local_addr: [0, 0, 0, 0],
+            local_port: 53,
+            remote_addr: [0, 0, 0, 0],
+            remote_port: 0,
+            state_code: 7,
+            tx_queue: 0,
+            rx_queue: 0,
+            uid: 0,
+            inode: 0,
         },
         UdpSocketSnapshot {
-            local_addr: [0, 0, 0, 0], local_port: 67,
-            remote_addr: [0, 0, 0, 0], remote_port: 0,
-            state_code: 7, tx_queue: 0, rx_queue: 0, uid: 0, inode: 0,
+            local_addr: [0, 0, 0, 0],
+            local_port: 67,
+            remote_addr: [0, 0, 0, 0],
+            remote_port: 0,
+            state_code: 7,
+            tx_queue: 0,
+            rx_queue: 0,
+            uid: 0,
+            inode: 0,
         },
     ];
     fn fake_udp_fn() -> Vec<UdpSocketSnapshot> {
@@ -1174,15 +1259,20 @@ fn smoke_arp_one_entry_parses_through_regex() -> TestResult {
     let body = ArpFile.read();
     ARP_HOOK.store(prev, Ordering::Release);
     let text = core::str::from_utf8(&body).unwrap_or("");
-    let ok = text.contains("192.168.1.1") && text.contains("00:11:22:33:44:55")
-        && text.contains("eth0") && text.contains("0x2");
+    let ok = text.contains("192.168.1.1")
+        && text.contains("00:11:22:33:44:55")
+        && text.contains("eth0")
+        && text.contains("0x2");
     if ok {
         TestResult::Pass
     } else {
         TestResult::Fail("arp line missing expected fields")
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_arp_one_entry_parses_through_regex);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_arp_one_entry_parses_through_regex
+);
 
 fn smoke_route_hex_destination_gateway() -> TestResult {
     static FAKE_ROUTE: IrqSafeSpinLock<Vec<RouteSnapshot>> = IrqSafeSpinLock::new(Vec::new());
@@ -1208,8 +1298,7 @@ fn smoke_route_hex_destination_gateway() -> TestResult {
     let text = core::str::from_utf8(&body).unwrap_or("");
     // Destination is 0.0.0.0 → 00000000.
     // Gateway is 192.168.1.1 → 0101A8C0 in little-endian u32 hex.
-    let ok = text.contains("eth0") && text.contains("00000000")
-        && text.contains("0101A8C0");
+    let ok = text.contains("eth0") && text.contains("00000000") && text.contains("0101A8C0");
     if ok {
         TestResult::Pass
     } else {
@@ -1219,14 +1308,25 @@ fn smoke_route_hex_destination_gateway() -> TestResult {
 kernel_test_in!("filesystem/procfs/net", smoke_route_hex_destination_gateway);
 
 fn smoke_dev_per_iface_counter_line() -> TestResult {
-    static FAKE_DEV: IrqSafeSpinLock<Vec<IfaceCounterSnapshot>> =
-        IrqSafeSpinLock::new(Vec::new());
+    static FAKE_DEV: IrqSafeSpinLock<Vec<IfaceCounterSnapshot>> = IrqSafeSpinLock::new(Vec::new());
     *FAKE_DEV.lock() = alloc::vec![IfaceCounterSnapshot {
         name: String::from("eth0"),
-        rx_bytes: 123456, rx_packets: 1234, rx_errs: 0, rx_drop: 0,
-        rx_fifo: 0, rx_frame: 0, rx_compressed: 0, rx_multicast: 0,
-        tx_bytes: 789012, tx_packets: 789, tx_errs: 0, tx_drop: 0,
-        tx_fifo: 0, tx_colls: 0, tx_carrier: 0, tx_compressed: 0,
+        rx_bytes: 123456,
+        rx_packets: 1234,
+        rx_errs: 0,
+        rx_drop: 0,
+        rx_fifo: 0,
+        rx_frame: 0,
+        rx_compressed: 0,
+        rx_multicast: 0,
+        tx_bytes: 789012,
+        tx_packets: 789,
+        tx_errs: 0,
+        tx_drop: 0,
+        tx_fifo: 0,
+        tx_colls: 0,
+        tx_carrier: 0,
+        tx_compressed: 0,
     }];
     fn fake_fn() -> Vec<IfaceCounterSnapshot> {
         FAKE_DEV.lock().clone()
@@ -1244,8 +1344,7 @@ fn smoke_dev_per_iface_counter_line() -> TestResult {
 kernel_test_in!("filesystem/procfs/net", smoke_dev_per_iface_counter_line);
 
 fn smoke_if_inet6_link_local_and_global() -> TestResult {
-    static FAKE_IFADDR: IrqSafeSpinLock<Vec<Ipv6IfAddrSnapshot>> =
-        IrqSafeSpinLock::new(Vec::new());
+    static FAKE_IFADDR: IrqSafeSpinLock<Vec<Ipv6IfAddrSnapshot>> = IrqSafeSpinLock::new(Vec::new());
     let mut ll = [0u8; 16];
     ll[0] = 0xfe;
     ll[1] = 0x80;
@@ -1257,13 +1356,19 @@ fn smoke_if_inet6_link_local_and_global() -> TestResult {
     *FAKE_IFADDR.lock() = alloc::vec![
         Ipv6IfAddrSnapshot {
             iface: String::from("eth0"),
-            addr: ll, ifindex: 2, prefix_len: 0x40,
-            scope: 0x20, flags: 0x80,
+            addr: ll,
+            ifindex: 2,
+            prefix_len: 0x40,
+            scope: 0x20,
+            flags: 0x80,
         },
         Ipv6IfAddrSnapshot {
             iface: String::from("eth0"),
-            addr: gl, ifindex: 2, prefix_len: 0x40,
-            scope: 0x00, flags: 0x80,
+            addr: gl,
+            ifindex: 2,
+            prefix_len: 0x40,
+            scope: 0x00,
+            flags: 0x80,
         },
     ];
     fn fake_fn() -> Vec<Ipv6IfAddrSnapshot> {
@@ -1282,7 +1387,10 @@ fn smoke_if_inet6_link_local_and_global() -> TestResult {
         TestResult::Fail("if_inet6 missing link-local + global lines")
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_if_inet6_link_local_and_global);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_if_inet6_link_local_and_global
+);
 
 fn smoke_snmp_tcp_has_15_standard_counters() -> TestResult {
     let body = SnmpFile.read();
@@ -1301,20 +1409,30 @@ fn smoke_snmp_tcp_has_15_standard_counters() -> TestResult {
         None => TestResult::Fail("snmp file missing Tcp: header"),
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_snmp_tcp_has_15_standard_counters);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_snmp_tcp_has_15_standard_counters
+);
 
 fn smoke_nf_conntrack_one_entry_one_line() -> TestResult {
-    static FAKE_CT: IrqSafeSpinLock<Vec<ConntrackSnapshot>> =
-        IrqSafeSpinLock::new(Vec::new());
+    static FAKE_CT: IrqSafeSpinLock<Vec<ConntrackSnapshot>> = IrqSafeSpinLock::new(Vec::new());
     *FAKE_CT.lock() = alloc::vec![ConntrackSnapshot {
-        l3proto: "ipv4", l3proto_num: 2,
-        l4proto: "tcp", l4proto_num: 6,
-        timeout: 431999, state: "ESTABLISHED",
-        orig_src: [10, 0, 0, 5], orig_dst: [8, 8, 8, 8],
-        orig_sport: 42000, orig_dport: 80,
-        reply_src: [8, 8, 8, 8], reply_dst: [203, 0, 113, 7],
-        reply_sport: 80, reply_dport: 32768,
-        assured: true, use_count: 2,
+        l3proto: "ipv4",
+        l3proto_num: 2,
+        l4proto: "tcp",
+        l4proto_num: 6,
+        timeout: 431999,
+        state: "ESTABLISHED",
+        orig_src: [10, 0, 0, 5],
+        orig_dst: [8, 8, 8, 8],
+        orig_sport: 42000,
+        orig_dport: 80,
+        reply_src: [8, 8, 8, 8],
+        reply_dst: [203, 0, 113, 7],
+        reply_sport: 80,
+        reply_dport: 32768,
+        assured: true,
+        use_count: 2,
     }];
     fn fake_fn() -> Vec<ConntrackSnapshot> {
         FAKE_CT.lock().clone()
@@ -1334,17 +1452,29 @@ fn smoke_nf_conntrack_one_entry_one_line() -> TestResult {
         TestResult::Fail("nf_conntrack format mismatch")
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_nf_conntrack_one_entry_one_line);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_nf_conntrack_one_entry_one_line
+);
 
 fn smoke_ipv6_route_default_line() -> TestResult {
     static FAKE_R: IrqSafeSpinLock<Vec<Ipv6RouteSnapshot>> = IrqSafeSpinLock::new(Vec::new());
     *FAKE_R.lock() = alloc::vec![Ipv6RouteSnapshot {
-        dst: [0; 16], dst_prefix_len: 0,
-        src: [0; 16], src_prefix_len: 0,
+        dst: [0; 16],
+        dst_prefix_len: 0,
+        src: [0; 16],
+        src_prefix_len: 0,
         gateway: {
-            let mut g = [0u8; 16]; g[0] = 0xfe; g[1] = 0x80; g[15] = 0x01; g
+            let mut g = [0u8; 16];
+            g[0] = 0xfe;
+            g[1] = 0x80;
+            g[15] = 0x01;
+            g
         },
-        metric: 1024, refcnt: 0, use_count: 0, flags: 0x00000001,
+        metric: 1024,
+        refcnt: 0,
+        use_count: 0,
+        flags: 0x00000001,
         iface: String::from("eth0"),
     }];
     fn fake_fn() -> Vec<Ipv6RouteSnapshot> {
@@ -1375,11 +1505,14 @@ fn smoke_igmp_at_least_header_when_empty() -> TestResult {
         TestResult::Fail("igmp header missing")
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_igmp_at_least_header_when_empty);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_igmp_at_least_header_when_empty
+);
 
 fn smoke_proc_net_tcp_resolves_through_vfs() -> TestResult {
-    use crate::{bootstrap_mount_authority, registry, resolve_async};
     use crate::procfs::ProcFs;
+    use crate::{bootstrap_mount_authority, registry, resolve_async};
 
     register_all();
     let auth = bootstrap_mount_authority();
@@ -1404,7 +1537,10 @@ fn smoke_proc_net_tcp_resolves_through_vfs() -> TestResult {
         _ => TestResult::Fail("/proc/net/tcp did not resolve through VFS"),
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_proc_net_tcp_resolves_through_vfs);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_proc_net_tcp_resolves_through_vfs
+);
 
 fn smoke_proc_net_dir_lists_all_registered_files() -> TestResult {
     use crate::DirOps;
@@ -1414,9 +1550,21 @@ fn smoke_proc_net_dir_lists_all_registered_files() -> TestResult {
     };
     let names: Vec<String> = dir.iter().map(|e| String::from(e.name)).collect();
     let needed = [
-        "tcp", "udp", "raw", "tcp6", "udp6", "raw6",
-        "arp", "route", "dev", "if_inet6", "ipv6_route",
-        "igmp", "igmp6", "snmp", "nf_conntrack",
+        "tcp",
+        "udp",
+        "raw",
+        "tcp6",
+        "udp6",
+        "raw6",
+        "arp",
+        "route",
+        "dev",
+        "if_inet6",
+        "ipv6_route",
+        "igmp",
+        "igmp6",
+        "snmp",
+        "nf_conntrack",
     ];
     let all_present = needed.iter().all(|n| names.iter().any(|m| m == n));
     if all_present {
@@ -1425,7 +1573,10 @@ fn smoke_proc_net_dir_lists_all_registered_files() -> TestResult {
         TestResult::Fail("/proc/net iter missing one of the registered files")
     }
 }
-kernel_test_in!("filesystem/procfs/net", smoke_proc_net_dir_lists_all_registered_files);
+kernel_test_in!(
+    "filesystem/procfs/net",
+    smoke_proc_net_dir_lists_all_registered_files
+);
 
 fn smoke_subsystem_can_unregister_file() -> TestResult {
     use super::{lookup_registry, register_proc, unregister_proc, ProcNodeSnapshot};

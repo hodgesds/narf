@@ -30,9 +30,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
-};
+use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
 pub mod aggregate;
 pub mod bus;
@@ -196,77 +194,99 @@ pub fn install_proc_write_hooks(
 
 pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {
     let v = FD_PATH_HOOK.load(Ordering::Acquire);
-    if v == 0 { return None; }
+    if v == 0 {
+        return None;
+    }
     let f: FdPathFn = unsafe { core::mem::transmute(v) };
     f(pid, fd)
 }
 
 pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
     let v = RLIMITS_HOOK.load(Ordering::Acquire);
-    if v == 0 { return [(0, 0); 16]; }
+    if v == 0 {
+        return [(0, 0); 16];
+    }
     let f: RlimitsFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
 pub(crate) fn hook_nice(pid: u64) -> i32 {
     let v = NICE_HOOK.load(Ordering::Acquire);
-    if v == 0 { return 0; }
+    if v == 0 {
+        return 0;
+    }
     let f: NiceFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
 pub(crate) fn hook_environ(pid: u64) -> Vec<u8> {
     let v = ENVIRON_HOOK.load(Ordering::Acquire);
-    if v == 0 { return Vec::new(); }
+    if v == 0 {
+        return Vec::new();
+    }
     let f: EnvironFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
 pub(crate) fn hook_auxv(pid: u64) -> Vec<u8> {
     let v = AUXV_HOOK.load(Ordering::Acquire);
-    if v == 0 { return alloc::vec![0u8; 16]; }
+    if v == 0 {
+        return alloc::vec![0u8; 16];
+    }
     let f: AuxvFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
 pub(crate) fn hook_set_comm(pid: u64, name: &str) -> Result<(), FsError> {
     let v = SET_COMM_HOOK.load(Ordering::Acquire);
-    if v == 0 { return Err(FsError::Unsupported); }
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
     let f: SetCommFn = unsafe { core::mem::transmute(v) };
     f(pid, name)
 }
 
 pub(crate) fn hook_oom_adj_get(pid: u64) -> i16 {
     let v = OOM_ADJ_GET_HOOK.load(Ordering::Acquire);
-    if v == 0 { return 0; }
+    if v == 0 {
+        return 0;
+    }
     let f: OomAdjGetFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
 pub(crate) fn hook_oom_adj_set(pid: u64, val: i16) -> Result<(), FsError> {
     let v = OOM_ADJ_SET_HOOK.load(Ordering::Acquire);
-    if v == 0 { return Err(FsError::Unsupported); }
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
     let f: OomAdjSetFn = unsafe { core::mem::transmute(v) };
     f(pid, val)
 }
 
 pub(crate) fn hook_coredump_get(pid: u64) -> u32 {
     let v = COREDUMP_GET_HOOK.load(Ordering::Acquire);
-    if v == 0 { return 0x33; } // default: anon + anon-huge + ELF headers
+    if v == 0 {
+        return 0x33;
+    } // default: anon + anon-huge + ELF headers
     let f: CoredumpGetFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 
 pub(crate) fn hook_coredump_set(pid: u64, val: u32) -> Result<(), FsError> {
     let v = COREDUMP_SET_HOOK.load(Ordering::Acquire);
-    if v == 0 { return Err(FsError::Unsupported); }
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
     let f: CoredumpSetFn = unsafe { core::mem::transmute(v) };
     f(pid, val)
 }
 
 pub(crate) fn hook_oom_score(pid: u64) -> i32 {
     let v = OOM_SCORE_HOOK.load(Ordering::Acquire);
-    if v == 0 { return 0; }
+    if v == 0 {
+        return 0;
+    }
     let f: OomScoreFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -346,11 +366,7 @@ pub fn register_proc(path: &str, file: Arc<dyn ProcFile>) {
     insert_into(root, &components, file);
 }
 
-fn insert_into(
-    map: &mut BTreeMap<String, ProcNode>,
-    components: &[&str],
-    file: Arc<dyn ProcFile>,
-) {
+fn insert_into(map: &mut BTreeMap<String, ProcNode>, components: &[&str], file: Arc<dyn ProcFile>) {
     match components {
         [] => {}
         [name] => {
@@ -478,7 +494,9 @@ pub(crate) struct ProcDynFile {
 
 impl core::fmt::Debug for ProcDynFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ProcDynFile").field("file", &self.file).finish()
+        f.debug_struct("ProcDynFile")
+            .field("file", &self.file)
+            .finish()
     }
 }
 
@@ -527,7 +545,9 @@ struct ProcStaticFile {
 
 impl core::fmt::Debug for ProcStaticFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ProcStaticFile").field("name", &self.name).finish()
+        f.debug_struct("ProcStaticFile")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -709,7 +729,10 @@ impl DirOps for ProcPidDir {
                     .map(|f| Arc::new(f) as Arc<dyn FileOps>);
             }
         };
-        Some(Arc::new(ProcPidFile { pid: self.pid, field }))
+        Some(Arc::new(ProcPidFile {
+            pid: self.pid,
+            field,
+        }))
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
@@ -723,32 +746,104 @@ impl DirOps for ProcPidDir {
         Box::new(
             [
                 // Core five (original Stage-1).
-                DirEntry { name: "stat", file_type: FileType::File },
-                DirEntry { name: "status", file_type: FileType::File },
-                DirEntry { name: "cmdline", file_type: FileType::File },
-                DirEntry { name: "maps", file_type: FileType::File },
-                DirEntry { name: "comm", file_type: FileType::File },
+                DirEntry {
+                    name: "stat",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "status",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "cmdline",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "maps",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "comm",
+                    file_type: FileType::File,
+                },
                 // Extended flat files.
-                DirEntry { name: "io", file_type: FileType::File },
-                DirEntry { name: "sched", file_type: FileType::File },
-                DirEntry { name: "schedstat", file_type: FileType::File },
-                DirEntry { name: "stack", file_type: FileType::File },
-                DirEntry { name: "wchan", file_type: FileType::File },
-                DirEntry { name: "syscall", file_type: FileType::File },
-                DirEntry { name: "environ", file_type: FileType::File },
-                DirEntry { name: "auxv", file_type: FileType::File },
-                DirEntry { name: "limits", file_type: FileType::File },
-                DirEntry { name: "oom_score", file_type: FileType::File },
-                DirEntry { name: "oom_score_adj", file_type: FileType::File },
-                DirEntry { name: "coredump_filter", file_type: FileType::File },
-                DirEntry { name: "mountinfo", file_type: FileType::File },
-                DirEntry { name: "mountstats", file_type: FileType::File },
-                DirEntry { name: "personality", file_type: FileType::File },
-                DirEntry { name: "cgroup", file_type: FileType::File },
+                DirEntry {
+                    name: "io",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "sched",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "schedstat",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "stack",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "wchan",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "syscall",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "environ",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "auxv",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "limits",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "oom_score",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "oom_score_adj",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "coredump_filter",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "mountinfo",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "mountstats",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "personality",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "cgroup",
+                    file_type: FileType::File,
+                },
                 // Subdirectories.
-                DirEntry { name: "fd", file_type: FileType::Dir },
-                DirEntry { name: "fdinfo", file_type: FileType::Dir },
-                DirEntry { name: "task", file_type: FileType::Dir },
+                DirEntry {
+                    name: "fd",
+                    file_type: FileType::Dir,
+                },
+                DirEntry {
+                    name: "fdinfo",
+                    file_type: FileType::Dir,
+                },
+                DirEntry {
+                    name: "task",
+                    file_type: FileType::Dir,
+                },
             ]
             .into_iter(),
         )
@@ -763,16 +858,46 @@ struct ProcRoot;
 impl DirOps for ProcRoot {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
-            "cpuinfo" => Some(Arc::new(ProcStaticFile { name: "cpuinfo", gen: gen_cpuinfo })),
-            "meminfo" => Some(Arc::new(ProcStaticFile { name: "meminfo", gen: gen_meminfo })),
-            "mounts" => Some(Arc::new(ProcStaticFile { name: "mounts", gen: gen_mounts })),
-            "uptime" => Some(Arc::new(ProcStaticFile { name: "uptime", gen: gen_uptime })),
-            "version" => Some(Arc::new(ProcStaticFile { name: "version", gen: gen_version })),
-            "cmdline" => Some(Arc::new(ProcStaticFile { name: "cmdline", gen: gen_cmdline })),
-            "loadavg" => Some(Arc::new(ProcStaticFile { name: "loadavg", gen: gen_loadavg })),
-            "filesystems" => Some(Arc::new(ProcStaticFile { name: "filesystems", gen: gen_filesystems })),
-            "partitions" => Some(Arc::new(ProcStaticFile { name: "partitions", gen: gen_partitions })),
-            "sched" => Some(Arc::new(ProcStaticFile { name: "sched", gen: gen_sched })),
+            "cpuinfo" => Some(Arc::new(ProcStaticFile {
+                name: "cpuinfo",
+                gen: gen_cpuinfo,
+            })),
+            "meminfo" => Some(Arc::new(ProcStaticFile {
+                name: "meminfo",
+                gen: gen_meminfo,
+            })),
+            "mounts" => Some(Arc::new(ProcStaticFile {
+                name: "mounts",
+                gen: gen_mounts,
+            })),
+            "uptime" => Some(Arc::new(ProcStaticFile {
+                name: "uptime",
+                gen: gen_uptime,
+            })),
+            "version" => Some(Arc::new(ProcStaticFile {
+                name: "version",
+                gen: gen_version,
+            })),
+            "cmdline" => Some(Arc::new(ProcStaticFile {
+                name: "cmdline",
+                gen: gen_cmdline,
+            })),
+            "loadavg" => Some(Arc::new(ProcStaticFile {
+                name: "loadavg",
+                gen: gen_loadavg,
+            })),
+            "filesystems" => Some(Arc::new(ProcStaticFile {
+                name: "filesystems",
+                gen: gen_filesystems,
+            })),
+            "partitions" => Some(Arc::new(ProcStaticFile {
+                name: "partitions",
+                gen: gen_partitions,
+            })),
+            "sched" => Some(Arc::new(ProcStaticFile {
+                name: "sched",
+                gen: gen_sched,
+            })),
             "self" => Some(Arc::new(ProcDirMarker)),
             _ => {
                 // Dynamic registry — file or directory marker. The
@@ -780,7 +905,9 @@ impl DirOps for ProcRoot {
                 // then descend via lookup_dir afterwards.
                 if let Some(snap) = lookup_registry(&[name]) {
                     return Some(match snap {
-                        ProcNodeSnapshot::File(f) => Arc::new(ProcDynFile { file: f }) as Arc<dyn FileOps>,
+                        ProcNodeSnapshot::File(f) => {
+                            Arc::new(ProcDynFile { file: f }) as Arc<dyn FileOps>
+                        }
                         ProcNodeSnapshot::Dir(_) => Arc::new(ProcDirMarker) as Arc<dyn FileOps>,
                     });
                 }
@@ -827,17 +954,50 @@ impl DirOps for ProcRoot {
         // Followups: switch DirEntry's name to String once a real
         // consumer needs the savings.
         let mut entries: Vec<DirEntry> = alloc::vec![
-            DirEntry { name: "cpuinfo", file_type: FileType::File },
-            DirEntry { name: "meminfo", file_type: FileType::File },
-            DirEntry { name: "mounts", file_type: FileType::File },
-            DirEntry { name: "uptime", file_type: FileType::File },
-            DirEntry { name: "version", file_type: FileType::File },
-            DirEntry { name: "cmdline", file_type: FileType::File },
-            DirEntry { name: "loadavg", file_type: FileType::File },
-            DirEntry { name: "filesystems", file_type: FileType::File },
-            DirEntry { name: "partitions", file_type: FileType::File },
-            DirEntry { name: "sched", file_type: FileType::File },
-            DirEntry { name: "self", file_type: FileType::Dir },
+            DirEntry {
+                name: "cpuinfo",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "meminfo",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "mounts",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "uptime",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "version",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "cmdline",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "loadavg",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "filesystems",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "partitions",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "sched",
+                file_type: FileType::File
+            },
+            DirEntry {
+                name: "self",
+                file_type: FileType::Dir
+            },
         ];
         // Dynamic registry top-level entries (e.g. "net", "acpi", ...).
         for (name, kind) in list_registry_dir(&[]) {
@@ -856,7 +1016,10 @@ impl DirOps for ProcRoot {
             // Acceptable cost: real consumers (ls, ps) read /proc
             // infrequently and we cap at the live-pid count.
             let leaked: &'static str = Box::leak(s.into_boxed_str());
-            entries.push(DirEntry { name: leaked, file_type: FileType::Dir });
+            entries.push(DirEntry {
+                name: leaked,
+                file_type: FileType::Dir,
+            });
         }
         Box::new(entries.into_iter())
     }
@@ -920,7 +1083,10 @@ impl DirOps for ProcDynamicDir {
                     ProcNodeKind::Dir => FileType::Dir,
                 };
                 let leaked: &'static str = Box::leak(name.into_boxed_str());
-                DirEntry { name: leaked, file_type }
+                DirEntry {
+                    name: leaked,
+                    file_type,
+                }
             })
             .collect();
         Box::new(entries.into_iter())
@@ -988,11 +1154,7 @@ fn gen_cpuinfo() -> String {
             ident::Vendor::Other(_) => "Unknown",
         };
         let brand = ident::brand_str(&id);
-        let model_name = if brand.is_empty() {
-            "(unknown)"
-        } else {
-            brand
-        };
+        let model_name = if brand.is_empty() { "(unknown)" } else { brand };
         // One block per logical CPU. SMP enumeration lands when the
         // userspace AP-count surface is wired through; today we
         // report the BSP only — matches what /proc/cpuinfo on a
@@ -1040,10 +1202,8 @@ fn gen_meminfo() -> String {
 fn gen_mounts() -> String {
     let mut s = String::new();
     for (path, fs_name) in crate::registry().list_with_names() {
-        let _ = core::fmt::Write::write_fmt(
-            &mut s,
-            format_args!("none {} {} rw 0 0\n", path, fs_name),
-        );
+        let _ =
+            core::fmt::Write::write_fmt(&mut s, format_args!("none {} {} rw 0 0\n", path, fs_name));
     }
     s
 }
@@ -1152,15 +1312,19 @@ fn render_stat(info: &ProcTaskInfo) -> String {
 fn render_status(info: &ProcTaskInfo) -> String {
     let mut s = String::new();
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Name:\t{}\n", info.comm));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("State:\t{} ({})\n",
-        info.state,
-        match info.state {
-            'R' => "running",
-            'S' => "sleeping",
-            'Z' => "zombie",
-            _ => "unknown",
-        },
-    ));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!(
+            "State:\t{} ({})\n",
+            info.state,
+            match info.state {
+                'R' => "running",
+                'S' => "sleeping",
+                'Z' => "zombie",
+                _ => "unknown",
+            },
+        ),
+    );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(
         &mut s,
@@ -1192,10 +1356,7 @@ fn render_maps(info: &ProcTaskInfo) -> String {
             ),
         );
         if !v.label.is_empty() {
-            let _ = core::fmt::Write::write_fmt(
-                &mut s,
-                format_args!("          {}", v.label),
-            );
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("          {}", v.label));
         }
         s.push('\n');
     }
@@ -1223,7 +1384,9 @@ fn smoke_register_proc_then_read() -> TestResult {
     let payload = b"hello-procfs\n".to_vec();
     register_proc(
         "tests/framework_smoke",
-        Arc::new(TestProcFile { body: payload.clone() }),
+        Arc::new(TestProcFile {
+            body: payload.clone(),
+        }),
     );
     let snap = lookup_registry(&["tests", "framework_smoke"]);
     let ok = match snap {
@@ -1264,7 +1427,9 @@ kernel_test_in!("filesystem/procfs", smoke_static_cpuinfo_still_works);
 fn smoke_unregister_proc_clears_entry() -> TestResult {
     register_proc(
         "tests/unregister_me",
-        Arc::new(TestProcFile { body: alloc::vec![0u8; 4] }),
+        Arc::new(TestProcFile {
+            body: alloc::vec![0u8; 4],
+        }),
     );
     let before = matches!(
         lookup_registry(&["tests", "unregister_me"]),
@@ -1308,7 +1473,9 @@ kernel_test_in!("filesystem/procfs", smoke_proc_file_mtime_default_nonzero);
 fn smoke_root_iter_lists_dynamic_top_level() -> TestResult {
     register_proc(
         "tests_iter_topdir/leaf",
-        Arc::new(TestProcFile { body: alloc::vec![0u8; 1] }),
+        Arc::new(TestProcFile {
+            body: alloc::vec![0u8; 1],
+        }),
     );
     let root = ProcRoot;
     let names: Vec<String> = root.iter().map(|e| String::from(e.name)).collect();
@@ -1325,7 +1492,10 @@ kernel_test_in!("filesystem/procfs", smoke_root_iter_lists_dynamic_top_level);
 
 /// Smoke: `/proc/<pid>/comm` stat() reports FILE_RW mode.
 fn smoke_comm_file_is_rw() -> TestResult {
-    let f = ProcPidFile { pid: 1, field: PidField::Comm };
+    let f = ProcPidFile {
+        pid: 1,
+        field: PidField::Comm,
+    };
     if f.stat().mode == Mode::FILE_RW {
         TestResult::Pass
     } else {
@@ -1338,7 +1508,10 @@ kernel_test_in!("filesystem/procfs", smoke_comm_file_is_rw);
 fn smoke_comm_write_updates_read() -> TestResult {
     // Use a stable per-test pid to avoid colliding with live tasks.
     const PID: u64 = 0xf0ca1_0001;
-    let f = ProcPidFile { pid: PID, field: PidField::Comm };
+    let f = ProcPidFile {
+        pid: PID,
+        field: PidField::Comm,
+    };
     // Write with a trailing newline (Linux userspace shape).
     match poll_once(f.write(0, b"newname\n")) {
         Some(Ok(n)) if n > 0 => TestResult::Pass,
@@ -1352,7 +1525,10 @@ kernel_test_in!("filesystem/procfs", smoke_comm_write_updates_read);
 /// Smoke: write 30-char name → truncated to 15 (TASK_COMM_LEN - 1).
 fn smoke_comm_write_truncates_to_15() -> TestResult {
     const PID: u64 = 0xf0ca1_0002;
-    let f = ProcPidFile { pid: PID, field: PidField::Comm };
+    let f = ProcPidFile {
+        pid: PID,
+        field: PidField::Comm,
+    };
     // 30 ASCII 'a' chars + newline — handler must accept and truncate.
     let long_name = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
     match poll_once(f.write(0, long_name)) {
@@ -1367,7 +1543,10 @@ kernel_test_in!("filesystem/procfs", smoke_comm_write_truncates_to_15);
 
 /// Smoke: write to a non-comm pid file returns ReadOnly.
 fn smoke_non_comm_write_returns_readonly() -> TestResult {
-    let f = ProcPidFile { pid: 1, field: PidField::Stat };
+    let f = ProcPidFile {
+        pid: 1,
+        field: PidField::Stat,
+    };
     let wr = poll_once(f.write(0, b"ignored\n"));
     if matches!(wr, Some(Err(FsError::ReadOnly))) {
         TestResult::Pass

@@ -14,15 +14,14 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::sysfs::{
-    class_device_register, class_register, kobject_add_attr, kobject_emit_uevent, Kobject,
-    SysFs,
+    class_device_register, class_register, kobject_add_attr, kobject_emit_uevent, Kobject, SysFs,
 };
 use crate::uevent::{self, UeventAction, UeventReader};
 use crate::FsInstance;
@@ -47,9 +46,10 @@ impl core::fmt::Debug for FakeBlock {
 impl FakeBlock {
     fn new(lba_size: u32, cap: u64) -> Arc<dyn narf_block::BlockDeviceSync> {
         Arc::new(Self {
-            data: narf_lib::sync::IrqSafeSpinLock::new(
-                vec![0u8; (lba_size as usize) * (cap as usize)],
-            ),
+            data: narf_lib::sync::IrqSafeSpinLock::new(vec![
+                0u8;
+                (lba_size as usize) * (cap as usize)
+            ]),
             lba_size,
             capacity: cap,
         })

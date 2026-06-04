@@ -23,7 +23,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -36,16 +36,16 @@ use crate::FsError;
 // contend on a single lock.  String fields use IrqSafeSpinLock<String>;
 // numeric fields use atomics where possible.
 
-static HOSTNAME:   IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
+static HOSTNAME: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 static DOMAINNAME: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 
-static PID_MAX:    AtomicU32 = AtomicU32::new(32768);
+static PID_MAX: AtomicU32 = AtomicU32::new(32768);
 static THREADS_MAX: AtomicU32 = AtomicU32::new(65536);
 static RANDOMIZE_VA_SPACE: AtomicU32 = AtomicU32::new(2);
-static PANIC_SECS:   AtomicI32 = AtomicI32::new(0);
+static PANIC_SECS: AtomicI32 = AtomicI32::new(0);
 static PANIC_ON_OOPS: AtomicU32 = AtomicU32::new(0);
 static SCHED_RT_RUNTIME_US: AtomicI32 = AtomicI32::new(950000);
-static SCHED_RT_PERIOD_US:  AtomicU32 = AtomicU32::new(1000000);
+static SCHED_RT_PERIOD_US: AtomicU32 = AtomicU32::new(1000000);
 static PERF_EVENT_PARANOID: AtomicI32 = AtomicI32::new(2);
 
 // ── boot_id — generated once, then fixed ────────────────────────
@@ -128,14 +128,14 @@ fn write_hostname(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-fn read_ostype()    -> String { String::from("NARF\n") }
+fn read_ostype() -> String {
+    String::from("NARF\n")
+}
 fn read_osrelease() -> String {
     String::from(concat!(env!("CARGO_PKG_VERSION"), "\n"))
 }
 fn read_version() -> String {
-    String::from(concat!(
-        "#1 NARF ", env!("CARGO_PKG_VERSION"), " SMP\n",
-    ))
+    String::from(concat!("#1 NARF ", env!("CARGO_PKG_VERSION"), " SMP\n",))
 }
 
 fn read_domainname() -> String {
@@ -150,7 +150,9 @@ fn write_domainname(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-fn read_pid_max()    -> String { format!("{}\n", PID_MAX.load(Ordering::Relaxed)) }
+fn read_pid_max() -> String {
+    format!("{}\n", PID_MAX.load(Ordering::Relaxed))
+}
 fn write_pid_max(v: &str) -> Result<(), FsError> {
     let n: u32 = v.parse().map_err(|_| FsError::InvalidData)?;
     if n == 0 || n > 4194304 {
@@ -160,7 +162,9 @@ fn write_pid_max(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-fn read_threads_max()    -> String { format!("{}\n", THREADS_MAX.load(Ordering::Relaxed)) }
+fn read_threads_max() -> String {
+    format!("{}\n", THREADS_MAX.load(Ordering::Relaxed))
+}
 fn write_threads_max(v: &str) -> Result<(), FsError> {
     let n: u32 = v.parse().map_err(|_| FsError::InvalidData)?;
     if n == 0 {
@@ -182,14 +186,18 @@ fn write_randomize_va_space(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-fn read_panic() -> String { format!("{}\n", PANIC_SECS.load(Ordering::Relaxed)) }
+fn read_panic() -> String {
+    format!("{}\n", PANIC_SECS.load(Ordering::Relaxed))
+}
 fn write_panic(v: &str) -> Result<(), FsError> {
     let n: i32 = v.parse().map_err(|_| FsError::InvalidData)?;
     PANIC_SECS.store(n, Ordering::Relaxed);
     Ok(())
 }
 
-fn read_panic_on_oops() -> String { format!("{}\n", PANIC_ON_OOPS.load(Ordering::Relaxed)) }
+fn read_panic_on_oops() -> String {
+    format!("{}\n", PANIC_ON_OOPS.load(Ordering::Relaxed))
+}
 fn write_panic_on_oops(v: &str) -> Result<(), FsError> {
     let n: u32 = v.parse().map_err(|_| FsError::InvalidData)?;
     if n > 1 {
@@ -230,18 +238,24 @@ fn write_sched_rt_period_us(v: &str) -> Result<(), FsError> {
 // Format: console_loglevel default_loglevel minimum_loglevel default_console_loglevel
 // NARF does not implement per-level filtering yet; the values are
 // informational stubs matching Linux defaults.
-fn read_printk() -> String { String::from("4 4 1 7\n") }
+fn read_printk() -> String {
+    String::from("4 4 1 7\n")
+}
 
 // kernel/dmesg_restrict: NARF uses capability gating, not this sysctl.
 // Return "1" (most-restrictive) read-only — matching the NARF security
 // posture of exposing kernel addresses only to cap holders.
-fn read_dmesg_restrict() -> String { String::from("1\n") }
+fn read_dmesg_restrict() -> String {
+    String::from("1\n")
+}
 
 // kernel/kptr_restrict: "2" — always hide kernel pointers.
 // NARF full restriction by default; writable for completeness but
 // we never loosen below 1 (in a real build the cap system enforces
 // this separately; here we just clamp).
-fn read_kptr_restrict() -> String { String::from("2\n") }
+fn read_kptr_restrict() -> String {
+    String::from("2\n")
+}
 
 fn read_perf_event_paranoid() -> String {
     format!("{}\n", PERF_EVENT_PARANOID.load(Ordering::Relaxed))
@@ -260,14 +274,18 @@ fn write_perf_event_paranoid(v: &str) -> Result<(), FsError> {
 // read-only. Linux uses this path to exec the module loader; NARF has
 // no execve yet and no module ABI. Consumers that check for empty treat
 // it as "no modprobe binary" — correct.
-fn read_modprobe() -> String { String::from("\n") }
+fn read_modprobe() -> String {
+    String::from("\n")
+}
 
 // ── kernel/random/* ─────────────────────────────────────────────
 
 // entropy_avail: report a fixed stub. NARF has no entropy pool yet;
 // returning a modest non-zero value (256 bits) keeps userspace from
 // spinning on a "not yet ready" check.
-fn read_entropy_avail() -> String { String::from("256\n") }
+fn read_entropy_avail() -> String {
+    String::from("256\n")
+}
 
 fn read_random_uuid() -> String {
     format!("{}\n", fmt_uuid(cheap_uuid_bytes()))
@@ -445,7 +463,10 @@ fn smoke_kernel_hostname_default() -> TestResult {
         None => TestResult::Fail("kernel/hostname not found"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_hostname_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_hostname_default
+);
 
 /// hostname write+read round-trip.
 fn smoke_kernel_hostname_write_roundtrip() -> TestResult {
@@ -463,7 +484,10 @@ fn smoke_kernel_hostname_write_roundtrip() -> TestResult {
         _ => TestResult::Fail("hostname write+read round-trip failed"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_hostname_write_roundtrip);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_hostname_write_roundtrip
+);
 
 /// ostype returns "NARF\n".
 fn smoke_kernel_ostype_is_narf() -> TestResult {
@@ -508,7 +532,10 @@ fn smoke_kernel_randomize_va_space_validation() -> TestResult {
         TestResult::Fail("randomize_va_space validation wrong")
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_randomize_va_space_validation);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_randomize_va_space_validation
+);
 
 /// random/uuid has correct RFC-4122 dashes format.
 fn smoke_kernel_random_uuid_format() -> TestResult {
@@ -533,7 +560,10 @@ fn smoke_kernel_random_uuid_format() -> TestResult {
         None => TestResult::Fail("kernel/random/uuid not found"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_random_uuid_format);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_random_uuid_format
+);
 
 /// kptr_restrict = "2".
 fn smoke_kernel_kptr_restrict_is_two() -> TestResult {
@@ -543,7 +573,10 @@ fn smoke_kernel_kptr_restrict_is_two() -> TestResult {
         _ => TestResult::Fail("kptr_restrict is not 2"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_kptr_restrict_is_two);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_kptr_restrict_is_two
+);
 
 /// modprobe returns "\n" (empty stub).
 fn smoke_kernel_modprobe_empty_stub() -> TestResult {
@@ -553,7 +586,10 @@ fn smoke_kernel_modprobe_empty_stub() -> TestResult {
         _ => TestResult::Fail("modprobe did not return empty stub"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_modprobe_empty_stub);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_modprobe_empty_stub
+);
 
 /// ostype is read-only — write returns ReadOnly.
 fn smoke_kernel_ostype_readonly_write() -> TestResult {
@@ -567,7 +603,10 @@ fn smoke_kernel_ostype_readonly_write() -> TestResult {
         _ => TestResult::Fail("ostype write did not return ReadOnly"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_ostype_readonly_write);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_ostype_readonly_write
+);
 
 /// boot_id is stable across two reads.
 fn smoke_kernel_boot_id_stable() -> TestResult {
@@ -591,7 +630,10 @@ fn smoke_kernel_uuid_unique_per_read() -> TestResult {
         _ => TestResult::Fail("uuid returned the same value twice"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_uuid_unique_per_read);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_uuid_unique_per_read
+);
 
 /// perf_event_paranoid is writable and rejects out-of-range.
 fn smoke_kernel_perf_event_paranoid_validation() -> TestResult {
@@ -601,10 +643,10 @@ fn smoke_kernel_perf_event_paranoid_validation() -> TestResult {
         None => return TestResult::Fail("perf_event_paranoid not found"),
     };
     let ok_minus1 = f.write(b"-1\n").is_ok();
-    let ok_0      = f.write(b"0\n").is_ok();
-    let ok_2      = f.write(b"2\n").is_ok();
-    let ok_3      = f.write(b"3\n").is_ok();
-    let bad_4     = matches!(f.write(b"4\n"), Err(FsError::InvalidData));
+    let ok_0 = f.write(b"0\n").is_ok();
+    let ok_2 = f.write(b"2\n").is_ok();
+    let ok_3 = f.write(b"3\n").is_ok();
+    let bad_4 = matches!(f.write(b"4\n"), Err(FsError::InvalidData));
     // Restore.
     PERF_EVENT_PARANOID.store(2, Ordering::Relaxed);
     if ok_minus1 && ok_0 && ok_2 && ok_3 && bad_4 {
@@ -613,4 +655,7 @@ fn smoke_kernel_perf_event_paranoid_validation() -> TestResult {
         TestResult::Fail("perf_event_paranoid validation wrong")
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_perf_event_paranoid_validation);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_perf_event_paranoid_validation
+);

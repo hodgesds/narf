@@ -44,7 +44,10 @@ impl FakeBlockDevice {
     /// Pre-fill with `fill_byte`.
     fn filled(n_blocks: usize, lba_size: u32, fill_byte: u8) -> Arc<Self> {
         Arc::new(FakeBlockDevice {
-            data: narf_lib::sync::IrqSafeSpinLock::new(vec![fill_byte; n_blocks * lba_size as usize]),
+            data: narf_lib::sync::IrqSafeSpinLock::new(vec![
+                fill_byte;
+                n_blocks * lba_size as usize
+            ]),
             lba_size,
         })
     }
@@ -97,7 +100,9 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -132,7 +137,10 @@ fn smoke_devfs_block_read_aligned_one_block() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_read_aligned_one_block);
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_read_aligned_one_block
+);
 
 // ── Test 2: BlockFile::read — unaligned start ─────────────────────────
 
@@ -144,8 +152,12 @@ fn smoke_devfs_block_read_unaligned_start() -> TestResult {
     let dev = FakeBlockDevice::new(4, 512);
     {
         let mut g = dev.data.lock();
-        for b in g[0..512].iter_mut() { *b = 0x11; }
-        for b in g[512..1024].iter_mut() { *b = 0x22; }
+        for b in g[0..512].iter_mut() {
+            *b = 0x11;
+        }
+        for b in g[512..1024].iter_mut() {
+            *b = 0x22;
+        }
     }
     let bf = BlockFile::from_dev(dev);
 
@@ -165,7 +177,10 @@ fn smoke_devfs_block_read_unaligned_start() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_read_unaligned_start);
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_read_unaligned_start
+);
 
 // ── Test 3: BlockFile::read — spans 3 blocks ──────────────────────────
 
@@ -177,9 +192,15 @@ fn smoke_devfs_block_read_spans_three_blocks() -> TestResult {
     let dev = FakeBlockDevice::new(4, 512);
     {
         let mut g = dev.data.lock();
-        for b in g[0..512].iter_mut()    { *b = 0xAA; }
-        for b in g[512..1024].iter_mut() { *b = 0xBB; }
-        for b in g[1024..1536].iter_mut() { *b = 0xCC; }
+        for b in g[0..512].iter_mut() {
+            *b = 0xAA;
+        }
+        for b in g[512..1024].iter_mut() {
+            *b = 0xBB;
+        }
+        for b in g[1024..1536].iter_mut() {
+            *b = 0xCC;
+        }
     }
     let bf = BlockFile::from_dev(dev);
 
@@ -201,7 +222,10 @@ fn smoke_devfs_block_read_spans_three_blocks() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_read_spans_three_blocks);
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_read_spans_three_blocks
+);
 
 // ── Test 4: BlockFile::write — aligned, 1 block ──────────────────────
 
@@ -268,7 +292,10 @@ fn smoke_devfs_block_write_unaligned_rmw() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_write_unaligned_rmw);
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_write_unaligned_rmw
+);
 
 // ── Test 6: BlockFile::stat — correct size ────────────────────────────
 
@@ -338,14 +365,18 @@ fn smoke_devfs_block_devdir_lookup_nvme0() -> TestResult {
         None => TestResult::Fail("DevDir lookup of nvme0-test returned None"),
     }
 }
-kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_devdir_lookup_nvme0);
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_devdir_lookup_nvme0
+);
 
 // ── Test 8: /dev/disk/by-label lookup ────────────────────────────────
 
 fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
-    use narf_block::registry::{PartitionMetadata, __restore_for_test, __snapshot_for_test,
-                               register_block_device_with_meta};
     use crate::{bootstrap_mount_authority, registry, DevFs, FileType};
+    use narf_block::registry::{
+        PartitionMetadata, __restore_for_test, __snapshot_for_test, register_block_device_with_meta,
+    };
 
     let snap = __snapshot_for_test();
 
@@ -353,7 +384,7 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
     let dev = FakeBlockDevice::filled(4, 512, 0x55);
     let meta = PartitionMetadata {
         partlabel: alloc::string::String::from("NARF_ROOT_TEST"),
-        partuuid:  alloc::string::String::from("aaaaaaaa-0000-0000-0000-bbbbbbbbbbbb"),
+        partuuid: alloc::string::String::from("aaaaaaaa-0000-0000-0000-bbbbbbbbbbbb"),
     };
     register_block_device_with_meta("nvme0p1-lbltest", dev, Some(meta));
 
@@ -389,7 +420,7 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
     let dev2 = FakeBlockDevice::filled(4, 512, 0x55);
     let meta2 = PartitionMetadata {
         partlabel: alloc::string::String::from("NARF_ROOT_TEST"),
-        partuuid:  alloc::string::String::new(),
+        partuuid: alloc::string::String::new(),
     };
     register_block_device_with_meta("nvme0p1-lbltest2", dev2, Some(meta2));
 
@@ -406,7 +437,10 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
         None => TestResult::Fail("by-label lookup of NARF_ROOT_TEST returned None"),
     }
 }
-kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_disk_by_label_lookup);
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_disk_by_label_lookup
+);
 
 // ── Test 9: BlockFile::read returns 0 at EOF ─────────────────────────
 

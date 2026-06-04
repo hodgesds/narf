@@ -117,7 +117,7 @@ impl<const N: usize> ByteRing<N> {
         let consume = match newline_pos {
             Some(pos) => pos + 1, // include the '\n'
             None if eof => g.len,
-            None => return 0,     // ICANON: block until newline
+            None => return 0, // ICANON: block until newline
         };
         let n = consume.min(buf.len());
         for i in 0..n {
@@ -253,8 +253,7 @@ impl Pty {
 /// `Arc<Pty>`).  We use a `Vec` because the table is expected to hold O(10)
 /// entries at most; a `BTreeMap` would require `narf-alloc` features not yet
 /// pulled in here.
-static PTY_TABLE: IrqSafeSpinLock<Vec<(u32, Arc<Pty>)>> =
-    IrqSafeSpinLock::new(Vec::new());
+static PTY_TABLE: IrqSafeSpinLock<Vec<(u32, Arc<Pty>)>> = IrqSafeSpinLock::new(Vec::new());
 
 static NEXT_PTY_INDEX: AtomicU32 = AtomicU32::new(0);
 
@@ -275,7 +274,8 @@ pub fn ptmx_close(index: u32) {
 
 /// Look up a PTY by its pts index.  Returns `None` if not found.
 pub fn pts_lookup(index: u32) -> Option<Arc<Pty>> {
-    PTY_TABLE.lock()
+    PTY_TABLE
+        .lock()
         .iter()
         .find(|(i, _)| *i == index)
         .map(|(_, p)| Arc::clone(p))
@@ -523,9 +523,7 @@ impl DirOps for DevPts {
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            self.lookup(name).ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {

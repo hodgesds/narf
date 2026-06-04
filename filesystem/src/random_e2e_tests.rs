@@ -53,8 +53,8 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::devfs::DevFs;
-use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::procfs::sys_kernel;
+use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::FsInstance as _;
 
 // ── poll_once helper ────────────────────────────────────────────────────────
@@ -63,7 +63,9 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -131,7 +133,10 @@ fn smoke_rand_urandom_read_nonblocking_32bytes() -> TestResult {
         None => TestResult::Fail("/dev/urandom read pended or node missing"),
     }
 }
-kernel_test_in!("filesystem/random_e2e", smoke_rand_urandom_read_nonblocking_32bytes);
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_urandom_read_nonblocking_32bytes
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 4 — /dev/random read returns 32 bytes
@@ -199,7 +204,10 @@ fn smoke_rand_read_distribution_nonzero_variance() -> TestResult {
         TestResult::Fail("/dev/urandom 1024-byte read: fewer than 8 distinct byte values")
     }
 }
-kernel_test_in!("filesystem/random_e2e", smoke_rand_read_distribution_nonzero_variance);
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_read_distribution_nonzero_variance
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 7 — 4096-byte histogram: max per-bucket deviation < 4σ from uniform
@@ -262,12 +270,16 @@ fn smoke_rand_random_urandom_independent_streams() -> TestResult {
     // Both should have high distinctness (ChaCha20 spreads bytes evenly).
     let distinct_a = {
         let mut seen = [false; 256];
-        for &byte in &a { seen[byte as usize] = true; }
+        for &byte in &a {
+            seen[byte as usize] = true;
+        }
         seen.iter().filter(|&&x| x).count()
     };
     let distinct_b = {
         let mut seen = [false; 256];
-        for &byte in &b { seen[byte as usize] = true; }
+        for &byte in &b {
+            seen[byte as usize] = true;
+        }
         seen.iter().filter(|&&x| x).count()
     };
     if distinct_a < 100 {
@@ -278,7 +290,10 @@ fn smoke_rand_random_urandom_independent_streams() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/random_e2e", smoke_rand_random_urandom_independent_streams);
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_random_urandom_independent_streams
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 9 — /proc/sys/kernel/random/entropy_avail is readable, ends with '\n'
@@ -306,7 +321,10 @@ fn smoke_rand_entropy_avail_readable_newline() -> TestResult {
         Err(_) => TestResult::Fail("entropy_avail value does not parse as u64"),
     }
 }
-kernel_test_in!("filesystem/random_e2e", smoke_rand_entropy_avail_readable_newline);
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_entropy_avail_readable_newline
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 10 — /proc/sys/kernel/random/uuid matches RFC-4122 v4 format
@@ -330,8 +348,11 @@ fn smoke_rand_uuid_format() -> TestResult {
     if parts.len() != 5 {
         return TestResult::Fail("uuid does not have 5 dash-separated groups");
     }
-    if parts[0].len() != 8 || parts[1].len() != 4
-        || parts[2].len() != 4 || parts[3].len() != 4 || parts[4].len() != 12
+    if parts[0].len() != 8
+        || parts[1].len() != 4
+        || parts[2].len() != 4
+        || parts[3].len() != 4
+        || parts[4].len() != 12
     {
         return TestResult::Fail("uuid group lengths wrong (expected 8-4-4-4-12)");
     }
@@ -412,7 +433,10 @@ fn smoke_rand_kernel_getrandom_fills_buffer() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/random_e2e", smoke_rand_kernel_getrandom_fills_buffer);
+kernel_test_in!(
+    "filesystem/random_e2e",
+    smoke_rand_kernel_getrandom_fills_buffer
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 13 — CSPRNG seeded from hardware: first 32 bytes are non-zero

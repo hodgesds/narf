@@ -47,8 +47,8 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::sysfs::{
-    class_device_register, class_register, kobject_add_attr, kobject_add_writable_attr,
-    sysfs_root, __reset_for_test as sysfs_reset, Kobject,
+    __reset_for_test as sysfs_reset, class_device_register, class_register, kobject_add_attr,
+    kobject_add_writable_attr, sysfs_root, Kobject,
 };
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
@@ -58,7 +58,9 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -386,7 +388,10 @@ impl FileOps for FakeTpmFileOps {
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode { file_type: FileType::Special, perms: 0o600 },
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
             mtime_cycles: 0,
         }
     }
@@ -395,10 +400,10 @@ impl FileOps for FakeTpmFileOps {
 fn smoke_tpm_devfs_roundtrip() -> TestResult {
     // Canned 12-byte response: TPM_ST_NO_SESSIONS, size=12, RC_SUCCESS, 2 body bytes.
     let canned: Vec<u8> = vec![
-        0x80, 0x01,             // tag: TPM_ST_NO_SESSIONS
+        0x80, 0x01, // tag: TPM_ST_NO_SESSIONS
         0x00, 0x00, 0x00, 0x0C, // size: 12
         0x00, 0x00, 0x00, 0x00, // RC_SUCCESS
-        0xDE, 0xAD,             // body bytes
+        0xDE, 0xAD, // body bytes
     ];
 
     let fake_tpm0: Arc<FakeTpmFileOps> = FakeTpmFileOps::new(canned.clone());
@@ -424,8 +429,7 @@ fn smoke_tpm_devfs_roundtrip() -> TestResult {
 
     // Write a 12-byte command (TPM_CC_STARTUP header).
     let cmd: Vec<u8> = vec![
-        0x80, 0x01,
-        0x00, 0x00, 0x00, 0x0C, // declared size = 12
+        0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, // declared size = 12
         0x00, 0x00, 0x01, 0x44, // CC_STARTUP
         0x00, 0x00,
     ];
@@ -614,9 +618,8 @@ fn smoke_power_supply_battery_and_ac() -> TestResult {
     sysfs_reset();
 
     let capacity: Arc<AtomicU32> = Arc::new(AtomicU32::new(73));
-    let status: Arc<narf_lib::sync::IrqSafeSpinLock<String>> = Arc::new(
-        narf_lib::sync::IrqSafeSpinLock::new("Charging".to_string()),
-    );
+    let status: Arc<narf_lib::sync::IrqSafeSpinLock<String>> =
+        Arc::new(narf_lib::sync::IrqSafeSpinLock::new("Charging".to_string()));
     let energy_full_design: u64 = 50_000;
 
     let class = class_register("power_supply");
@@ -730,7 +733,11 @@ fn smoke_watchdog_sysfs_kobject_e2e() -> TestResult {
     {
         let a = active.clone();
         kobject_add_attr(&kobj, "state", move || {
-            if a.load(Ordering::Acquire) { "active\n".to_string() } else { "inactive\n".to_string() }
+            if a.load(Ordering::Acquire) {
+                "active\n".to_string()
+            } else {
+                "inactive\n".to_string()
+            }
         });
     }
     {
@@ -751,7 +758,9 @@ fn smoke_watchdog_sysfs_kobject_e2e() -> TestResult {
                     .map_err(|_| FsError::InvalidData)?
                     .trim();
                 let v: u32 = s.parse().map_err(|_| FsError::InvalidData)?;
-                if v == 0 { return Err(FsError::InvalidData); }
+                if v == 0 {
+                    return Err(FsError::InvalidData);
+                }
                 ts2.store(v, Ordering::Release);
                 Ok(())
             },
@@ -896,7 +905,7 @@ fn smoke_typec_orientation_and_role_e2e() -> TestResult {
 
     // 0=Unknown, 1=Normal, 2=Reversed
     let orientation: Arc<AtomicU32> = Arc::new(AtomicU32::new(1)); // Normal initially
-    // 0=Device, 1=Host, 2=Dual
+                                                                   // 0=Device, 1=Host, 2=Dual
     let data_role: Arc<AtomicU32> = Arc::new(AtomicU32::new(1)); // Host
 
     let class = class_register("typec");
@@ -985,8 +994,7 @@ fn smoke_bluetooth_hci_sysfs_e2e() -> TestResult {
     kobject_add_attr(&kobj, "address", move || {
         format!(
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\n",
-            bd_addr[5], bd_addr[4], bd_addr[3],
-            bd_addr[2], bd_addr[1], bd_addr[0]
+            bd_addr[5], bd_addr[4], bd_addr[3], bd_addr[2], bd_addr[1], bd_addr[0]
         )
     });
     kobject_add_attr(&kobj, "hci_ver", move || format!("{}\n", lmp_ver));
@@ -1037,7 +1045,9 @@ struct FakeSndDir {
 
 impl FakeSndDir {
     fn new() -> Arc<Self> {
-        Arc::new(Self { resolved: AtomicBool::new(false) })
+        Arc::new(Self {
+            resolved: AtomicBool::new(false),
+        })
     }
 }
 
@@ -1071,7 +1081,10 @@ impl FileOps for DevNullStub {
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode { file_type: FileType::Special, perms: 0o660 },
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o660,
+            },
             mtime_cycles: 0,
         }
     }

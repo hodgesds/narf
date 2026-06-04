@@ -12,14 +12,16 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::devfs_pty::{open_ptmx, pts_lookup, DevPts, PtySlave, __reset_for_test};
 use crate::devfs_misc::DevFull;
+use crate::devfs_pty::{open_ptmx, pts_lookup, DevPts, PtySlave, __reset_for_test};
 use crate::{DirOps, FileOps, FsError};
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
-    unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+    unsafe fn no_clone(_: *const ()) -> RawWaker {
+        raw_waker()
+    }
     unsafe fn no_op(_: *const ()) {}
     fn raw_waker() -> RawWaker {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
@@ -133,9 +135,9 @@ fn smoke_pty_pts_dir_lists_open_ptys() -> TestResult {
 
     let dir = DevPts;
     let entries = dir.enumerate(0, 64);
-    let found = entries.iter().any(|(name, _)| {
-        name.parse::<u32>().ok() == Some(idx)
-    });
+    let found = entries
+        .iter()
+        .any(|(name, _)| name.parse::<u32>().ok() == Some(idx));
     if !found {
         return TestResult::Fail("/dev/pts did not list newly-opened PTY");
     }
@@ -155,9 +157,9 @@ fn smoke_pty_pts_disappears_after_master_drop() -> TestResult {
 
     let dir = DevPts;
     let entries = dir.enumerate(0, 64);
-    let found = entries.iter().any(|(name, _)| {
-        name.parse::<u32>().ok() == Some(idx)
-    });
+    let found = entries
+        .iter()
+        .any(|(name, _)| name.parse::<u32>().ok() == Some(idx));
     if found {
         return TestResult::Fail("/dev/pts still lists PTY after master drop");
     }
@@ -207,7 +209,10 @@ fn smoke_pty_slave_icanon_blocks_until_newline() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/pty", smoke_pty_slave_icanon_blocks_until_newline);
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_slave_icanon_blocks_until_newline
+);
 
 // ── Test 7: ECHO — slave write sends copy to master ──────────────────────────
 
@@ -302,9 +307,7 @@ fn smoke_pty_ptmx_reachable_via_devdir() -> TestResult {
     let _ = registry().mount(&auth, "/dev", DevFs::new());
 
     let ptmx = registry()
-        .resolve_absolute("/dev/ptmx", |fs, rel| {
-            crate::resolve(fs.root(), rel).ok()
-        })
+        .resolve_absolute("/dev/ptmx", |fs, rel| crate::resolve(fs.root(), rel).ok())
         .flatten();
     if ptmx.is_none() {
         return TestResult::Fail("resolve /dev/ptmx returned None");
@@ -321,9 +324,7 @@ fn smoke_pty_full_reachable_via_devdir() -> TestResult {
     let _ = registry().mount(&auth, "/dev", DevFs::new());
 
     let full = registry()
-        .resolve_absolute("/dev/full", |fs, rel| {
-            crate::resolve(fs.root(), rel).ok()
-        })
+        .resolve_absolute("/dev/full", |fs, rel| crate::resolve(fs.root(), rel).ok())
         .flatten();
     if full.is_none() {
         return TestResult::Fail("resolve /dev/full returned None");

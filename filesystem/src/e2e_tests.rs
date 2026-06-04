@@ -62,7 +62,6 @@ impl FakeBlockDevice {
             write_count: AtomicU64::new(0),
         })
     }
-
 }
 
 impl BlockDeviceSync for FakeBlockDevice {
@@ -114,7 +113,9 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -154,36 +155,36 @@ fn write_synthetic_gpt(buf: &mut [u8]) {
     let h = &mut buf[512..1024];
     h[0..8].copy_from_slice(b"EFI PART");
     h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // rev 1.0
-    h[12..16].copy_from_slice(&92u32.to_le_bytes());         // header_size
-    h[16..20].copy_from_slice(&0u32.to_le_bytes());          // header_crc (ignored)
-    h[24..32].copy_from_slice(&1u64.to_le_bytes());          // my_lba
-    h[32..40].copy_from_slice(&2047u64.to_le_bytes());       // alternate_lba
-    h[40..48].copy_from_slice(&34u64.to_le_bytes());         // first_usable
-    h[48..56].copy_from_slice(&2047u64.to_le_bytes());       // last_usable
-    // disk_guid [56..72] — left zero
-    h[72..80].copy_from_slice(&2u64.to_le_bytes());          // partition_entry_lba = 2
-    h[80..84].copy_from_slice(&2u32.to_le_bytes());          // num_partition_entries
-    h[84..88].copy_from_slice(&128u32.to_le_bytes());        // size_of_partition_entry
+    h[12..16].copy_from_slice(&92u32.to_le_bytes()); // header_size
+    h[16..20].copy_from_slice(&0u32.to_le_bytes()); // header_crc (ignored)
+    h[24..32].copy_from_slice(&1u64.to_le_bytes()); // my_lba
+    h[32..40].copy_from_slice(&2047u64.to_le_bytes()); // alternate_lba
+    h[40..48].copy_from_slice(&34u64.to_le_bytes()); // first_usable
+    h[48..56].copy_from_slice(&2047u64.to_le_bytes()); // last_usable
+                                                       // disk_guid [56..72] — left zero
+    h[72..80].copy_from_slice(&2u64.to_le_bytes()); // partition_entry_lba = 2
+    h[80..84].copy_from_slice(&2u32.to_le_bytes()); // num_partition_entries
+    h[84..88].copy_from_slice(&128u32.to_le_bytes()); // size_of_partition_entry
 
     // LBA 2: partition entry array (two 128-byte entries).
     // Entry 0: the real partition.
     let e = &mut buf[1024..1024 + 128];
     // type_guid [0..16] — use Linux root GUID (non-empty type)
     e[0..16].copy_from_slice(&[
-        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
-        0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
+        0xE4,
     ]);
     // unique_partition_guid [16..32] — encode "11111111-2222-3333-4444-555555555555"
     // GPT GUIDs are stored as mixed-endian: first three fields LE, last two BE.
     e[16..20].copy_from_slice(&0x11111111u32.to_le_bytes()); // time_low
-    e[20..22].copy_from_slice(&0x2222u16.to_le_bytes());     // time_mid
-    e[22..24].copy_from_slice(&0x3333u16.to_le_bytes());     // time_hi
-    e[24..26].copy_from_slice(&[0x44, 0x44]);                // clock_seq (BE)
+    e[20..22].copy_from_slice(&0x2222u16.to_le_bytes()); // time_mid
+    e[22..24].copy_from_slice(&0x3333u16.to_le_bytes()); // time_hi
+    e[24..26].copy_from_slice(&[0x44, 0x44]); // clock_seq (BE)
     e[26..32].copy_from_slice(&[0x55, 0x55, 0x55, 0x55, 0x55, 0x55]); // node (BE)
-    // start/end LBAs
-    e[32..40].copy_from_slice(&34u64.to_le_bytes());         // starting_lba
-    e[40..48].copy_from_slice(&2047u64.to_le_bytes());       // ending_lba (inclusive)
-    // partition_name [56..128]: "TESTPART" as UTF-16LE
+                                                                      // start/end LBAs
+    e[32..40].copy_from_slice(&34u64.to_le_bytes()); // starting_lba
+    e[40..48].copy_from_slice(&2047u64.to_le_bytes()); // ending_lba (inclusive)
+                                                       // partition_name [56..128]: "TESTPART" as UTF-16LE
     let name = "TESTPART";
     for (i, c) in name.chars().enumerate() {
         let cu = c as u16;
@@ -220,7 +221,9 @@ fn smoke_e2e_full_path_register_lookup_read() -> TestResult {
     // Pre-fill LBA 0 with a marker.
     {
         let mut g = dev.data.lock();
-        for b in g[..512].iter_mut() { *b = 0xDE; }
+        for b in g[..512].iter_mut() {
+            *b = 0xDE;
+        }
     }
     let dev_arc = dev.clone() as Arc<dyn BlockDeviceSync>;
 
@@ -276,10 +279,7 @@ kernel_test_in!("filesystem/e2e", smoke_e2e_full_path_register_lookup_read);
 fn smoke_e2e_gpt_partition_label_partuuid_resolution() -> TestResult {
     use crate::devfs_block::{DevDiskByLabel, DevDiskByPartUuid};
     use crate::DirOps;
-    use narf_block::{
-        partition::PartitionBlockDevice,
-        registry::register_block_device_with_meta,
-    };
+    use narf_block::{partition::PartitionBlockDevice, registry::register_block_device_with_meta};
 
     // Build the fake disk with the synthetic GPT.
     let dev = FakeBlockDevice::new_1mib();
@@ -296,8 +296,7 @@ fn smoke_e2e_gpt_partition_label_partuuid_resolution() -> TestResult {
 
     // Build the PartitionBlockDevice for partition 1 (LBAs 34..=2047).
     // PartitionBlockDevice translates sub-LBAs to parent LBAs.
-    let part_dev: Arc<dyn BlockDeviceSync> =
-        Arc::new(PartitionBlockDevice::new(parent, 34, 2014));
+    let part_dev: Arc<dyn BlockDeviceSync> = Arc::new(PartitionBlockDevice::new(parent, 34, 2014));
 
     // Build PartitionMetadata matching the GPT entry.
     // The partuuid string must match what the GPT scanner produces from
@@ -354,7 +353,10 @@ fn smoke_e2e_gpt_partition_label_partuuid_resolution() -> TestResult {
         TestResult::Pass
     })
 }
-kernel_test_in!("filesystem/e2e", smoke_e2e_gpt_partition_label_partuuid_resolution);
+kernel_test_in!(
+    "filesystem/e2e",
+    smoke_e2e_gpt_partition_label_partuuid_resolution
+);
 
 // ── Smoke 6: device unregister cleanup ───────────────────────────────
 //

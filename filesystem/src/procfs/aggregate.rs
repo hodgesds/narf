@@ -94,33 +94,33 @@ fn agg(gen: fn() -> Vec<u8>) -> Arc<dyn ProcFile> {
 /// is available. Safe to call multiple times (hard cutover: the second
 /// call replaces the first).
 pub fn register_all() {
-    register_proc("stat",         agg(gen_stat));
-    register_proc("diskstats",    agg(gen_diskstats));
-    register_proc("interrupts",   agg(gen_interrupts));
-    register_proc("softirqs",     agg(gen_softirqs));
-    register_proc("swaps",        agg(gen_swaps));
-    register_proc("modules",      agg(gen_modules));
-    register_proc("iomem",        agg(gen_iomem));
-    register_proc("ioports",      agg(gen_ioports));
-    register_proc("slabinfo",     agg(gen_slabinfo));
-    register_proc("vmstat",       agg(gen_vmstat));
-    register_proc("zoneinfo",     agg(gen_zoneinfo));
-    register_proc("buddyinfo",    agg(gen_buddyinfo));
+    register_proc("stat", agg(gen_stat));
+    register_proc("diskstats", agg(gen_diskstats));
+    register_proc("interrupts", agg(gen_interrupts));
+    register_proc("softirqs", agg(gen_softirqs));
+    register_proc("swaps", agg(gen_swaps));
+    register_proc("modules", agg(gen_modules));
+    register_proc("iomem", agg(gen_iomem));
+    register_proc("ioports", agg(gen_ioports));
+    register_proc("slabinfo", agg(gen_slabinfo));
+    register_proc("vmstat", agg(gen_vmstat));
+    register_proc("zoneinfo", agg(gen_zoneinfo));
+    register_proc("buddyinfo", agg(gen_buddyinfo));
     register_proc("pagetypeinfo", agg(gen_pagetypeinfo));
-    register_proc("timer_list",   agg(gen_timer_list));
-    register_proc("locks",        agg(gen_locks));
-    register_proc("devices",      agg(gen_devices));
-    register_proc("consoles",     agg(gen_consoles));
-    register_proc("misc",         agg(gen_misc));
-    register_proc("tty/drivers",  agg(gen_tty_drivers));
-    register_proc("fb",           agg(gen_fb));
-    register_proc("crypto",       agg(gen_crypto));
+    register_proc("timer_list", agg(gen_timer_list));
+    register_proc("locks", agg(gen_locks));
+    register_proc("devices", agg(gen_devices));
+    register_proc("consoles", agg(gen_consoles));
+    register_proc("misc", agg(gen_misc));
+    register_proc("tty/drivers", agg(gen_tty_drivers));
+    register_proc("fb", agg(gen_fb));
+    register_proc("crypto", agg(gen_crypto));
     // /proc/filesystems is already served from ProcRoot::lookup as a
     // static file; the aggregate version here extends it with the
     // nodev annotations Linux tools expect (procps-ng checks "nodev"
     // on "proc" and "sysfs"). A second register_proc hard-cuts over
     // the old entry — correct per the registry's replacement contract.
-    register_proc("filesystems",  agg(gen_filesystems_annotated));
+    register_proc("filesystems", agg(gen_filesystems_annotated));
 }
 
 // ── /proc/stat ──────────────────────────────────────────────────────
@@ -290,8 +290,7 @@ fn gen_interrupts() -> Vec<u8> {
 //           subsystem is implemented. All zero for now.
 
 const SOFTIRQ_NAMES: [&str; 10] = [
-    "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK",
-    "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
+    "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
 ];
 
 fn gen_softirqs() -> Vec<u8> {
@@ -466,7 +465,11 @@ fn gen_vmstat() -> Vec<u8> {
     let _ = writeln!(s, "nr_mlock 0");
     let _ = writeln!(s, "nr_bounce 0");
     let _ = writeln!(s, "nr_slab_reclaimable 0");
-    let _ = writeln!(s, "nr_slab_unreclaimable {}", narf_memory::slab::stats().large_in_use);
+    let _ = writeln!(
+        s,
+        "nr_slab_unreclaimable {}",
+        narf_memory::slab::stats().large_in_use
+    );
     let _ = writeln!(s, "nr_page_table_pages 0");
     let _ = writeln!(s, "nr_kernel_stack 0");
     let _ = writeln!(s, "nr_anon_pages 0");
@@ -561,7 +564,11 @@ fn gen_zoneinfo() -> Vec<u8> {
     let mut s = String::new();
     let fs = narf_memory::frame_stats();
     let numa_aware = narf_memory::is_numa_aware();
-    let max_nodes = if numa_aware { narf_memory::FRAME_MAX_NUMA_NODES } else { 1 };
+    let max_nodes = if numa_aware {
+        narf_memory::FRAME_MAX_NUMA_NODES
+    } else {
+        1
+    };
 
     for node in 0..max_nodes {
         let node_free = narf_memory::node_free(node);
@@ -903,16 +910,34 @@ fn gen_crypto() -> Vec<u8> {
     // These match the implementations in crypto/src/*.rs.
     let algorithms: &[(&str, &str, u32, &str, &str)] = &[
         // (name, type, priority, blocksize, extra)
-        ("sha256",            "shash",  100, "64",  "digestsize: 32"),
-        ("sha512",            "shash",  100, "128", "digestsize: 64"),
-        ("sha1",              "shash",  100, "64",  "digestsize: 20"),
-        ("chacha20-poly1305", "aead",   100, "64",  "ivsize: 12\nauthsize: 16\nmaxauthsize: 16"),
-        ("aes-xts",           "skcipher", 100, "16", "min keysize: 64\nmax keysize: 64\nivsize: 16\nchunksize: 16\nwalksize: 16"),
-        ("ed25519",           "akcipher", 100, "0",  ""),
-        ("curve25519",        "kpp",    100, "0",  ""),
-        ("hmac-sha1",         "shash",  100, "64",  "digestsize: 20"),
-        ("cmac-aes128",       "shash",  100, "16",  "digestsize: 16"),
-        ("aes-gcm",           "aead",   100, "16",  "ivsize: 12\nauthsize: 16\nmaxauthsize: 16"),
+        ("sha256", "shash", 100, "64", "digestsize: 32"),
+        ("sha512", "shash", 100, "128", "digestsize: 64"),
+        ("sha1", "shash", 100, "64", "digestsize: 20"),
+        (
+            "chacha20-poly1305",
+            "aead",
+            100,
+            "64",
+            "ivsize: 12\nauthsize: 16\nmaxauthsize: 16",
+        ),
+        (
+            "aes-xts",
+            "skcipher",
+            100,
+            "16",
+            "min keysize: 64\nmax keysize: 64\nivsize: 16\nchunksize: 16\nwalksize: 16",
+        ),
+        ("ed25519", "akcipher", 100, "0", ""),
+        ("curve25519", "kpp", 100, "0", ""),
+        ("hmac-sha1", "shash", 100, "64", "digestsize: 20"),
+        ("cmac-aes128", "shash", 100, "16", "digestsize: 16"),
+        (
+            "aes-gcm",
+            "aead",
+            100,
+            "16",
+            "ivsize: 12\nauthsize: 16\nmaxauthsize: 16",
+        ),
     ];
 
     for (name, alg_type, prio, blocksize, extra) in algorithms {
@@ -954,13 +979,21 @@ fn smoke_diskstats_one_line_per_device() -> TestResult {
     __reset_for_test();
     // Register two synthetic devices.
     use alloc::sync::Arc;
-    use narf_block::registry::{BlockDeviceSync, BlockIoError, register_block_device};
+    use narf_block::registry::{register_block_device, BlockDeviceSync, BlockIoError};
     struct NullDev;
     impl BlockDeviceSync for NullDev {
-        fn lba_size(&self) -> u32 { 512 }
-        fn capacity(&self) -> u64 { 2048 }
-        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> { Ok(()) }
-        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> { Ok(()) }
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            2048
+        }
+        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
     }
     register_block_device("smoke0", Arc::new(NullDev));
     register_block_device("smoke1", Arc::new(NullDev));
@@ -987,7 +1020,10 @@ fn smoke_diskstats_one_line_per_device() -> TestResult {
         TestResult::Fail("diskstats: expected ≥2 lines for 2 devices")
     }
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_diskstats_one_line_per_device);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_diskstats_one_line_per_device
+);
 
 /// /proc/interrupts: header columns match CPU count.
 fn smoke_interrupts_header_matches_cpu_count() -> TestResult {
@@ -1008,7 +1044,10 @@ fn smoke_interrupts_header_matches_cpu_count() -> TestResult {
         TestResult::Fail("interrupts: header missing CPU0 column")
     }
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_interrupts_header_matches_cpu_count);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_interrupts_header_matches_cpu_count
+);
 
 /// /proc/softirqs: all 10 standard type names are present.
 fn smoke_softirqs_has_all_ten_types() -> TestResult {
@@ -1028,7 +1067,10 @@ fn smoke_softirqs_has_all_ten_types() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_softirqs_has_all_ten_types);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_softirqs_has_all_ten_types
+);
 
 /// /proc/stat: has cpu aggregate line + per-cpu line + ctxt + btime.
 fn smoke_stat_has_cpu_and_ctxt_btime() -> TestResult {
@@ -1041,17 +1083,20 @@ fn smoke_stat_has_cpu_and_ctxt_btime() -> TestResult {
         Ok(t) => t,
         Err(_) => return TestResult::Fail("stat not utf-8"),
     };
-    let has_cpu    = text.lines().any(|l| l.starts_with("cpu "));
-    let has_cpu0   = text.lines().any(|l| l.starts_with("cpu0 "));
-    let has_ctxt   = text.lines().any(|l| l.starts_with("ctxt "));
-    let has_btime  = text.lines().any(|l| l.starts_with("btime "));
+    let has_cpu = text.lines().any(|l| l.starts_with("cpu "));
+    let has_cpu0 = text.lines().any(|l| l.starts_with("cpu0 "));
+    let has_ctxt = text.lines().any(|l| l.starts_with("ctxt "));
+    let has_btime = text.lines().any(|l| l.starts_with("btime "));
     if has_cpu && has_cpu0 && has_ctxt && has_btime {
         TestResult::Pass
     } else {
         TestResult::Fail("stat: missing required fields")
     }
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_stat_has_cpu_and_ctxt_btime);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_stat_has_cpu_and_ctxt_btime
+);
 
 /// /proc/swaps: header line only.
 fn smoke_swaps_header_only() -> TestResult {
@@ -1108,7 +1153,10 @@ fn smoke_devices_has_both_sections() -> TestResult {
         TestResult::Fail("devices: missing Character or Block section")
     }
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_devices_has_both_sections);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_devices_has_both_sections
+);
 
 /// /proc/filesystems (annotated): contains both "proc" and "sysfs".
 fn smoke_filesystems_contains_proc_and_sysfs() -> TestResult {
@@ -1127,7 +1175,10 @@ fn smoke_filesystems_contains_proc_and_sysfs() -> TestResult {
         TestResult::Fail("filesystems: missing proc or sysfs")
     }
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_filesystems_contains_proc_and_sysfs);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_filesystems_contains_proc_and_sysfs
+);
 
 /// /proc/consoles: format has "tty" prefix and major:minor.
 fn smoke_consoles_format() -> TestResult {
@@ -1141,9 +1192,9 @@ fn smoke_consoles_format() -> TestResult {
         Err(_) => return TestResult::Fail("consoles not utf-8"),
     };
     // Expect at least one line with a colon in the major:minor field.
-    let has_colon = text.lines().any(|l| {
-        l.contains(':') && (l.contains("tty") || l.contains("ttyS"))
-    });
+    let has_colon = text
+        .lines()
+        .any(|l| l.contains(':') && (l.contains("tty") || l.contains("ttyS")));
     if has_colon {
         TestResult::Pass
     } else {
@@ -1207,4 +1258,7 @@ fn smoke_crypto_returns_algorithms() -> TestResult {
         TestResult::Fail("crypto: expected sha256 algorithm entry")
     }
 }
-kernel_test_in!("filesystem/procfs/aggregate", smoke_crypto_returns_algorithms);
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_crypto_returns_algorithms
+);

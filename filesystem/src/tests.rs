@@ -237,13 +237,13 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     // `/test_pa/sub`. `resolve_absolute("/test_pa/sub/x")` must
     // match the nested mount and hand the FS a relative path of
     // `x`, NOT `sub/x` against the outer FS.
-    use alloc::boxed::Box;
-    use alloc::sync::Arc;
-    use narf_capabilities::{Cap, Grant};
     use crate::{
         bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
         MountPoint, Stat,
     };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use narf_capabilities::{Cap, Grant};
 
     struct OuterFs;
     struct InnerFs;
@@ -328,14 +328,9 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     // had run before this test. Assert against the actual
     // invariant: when root is mounted, every path resolves; when
     // it isn't, paths not covered by another mount don't.
-    let root_present = registry()
-        .list()
-        .iter()
-        .any(|p| p == "/");
-    let elsewhere_resolved = registry()
-        .resolve_absolute("/elsewhere/z", |_, rel| {
-            alloc::string::String::from(rel)
-        });
+    let root_present = registry().list().iter().any(|p| p == "/");
+    let elsewhere_resolved =
+        registry().resolve_absolute("/elsewhere/z", |_, rel| alloc::string::String::from(rel));
     match (root_present, &elsewhere_resolved) {
         (true, Some(rel)) if rel == "elsewhere/z" => {}
         (true, _) => {
@@ -358,7 +353,10 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_filesystem_resolve_absolute_picks_longest_prefix);
+kernel_test_in!(
+    "filesystem",
+    smoke_filesystem_resolve_absolute_picks_longest_prefix
+);
 
 fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
@@ -384,8 +382,8 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
     // Mount a MemFs at /test_unlink seeded with one file. The first
     // resolve_parent_absolute → unlink should succeed; the second
     // should hit NotFound (file already gone).
-    use narf_capabilities::{Cap, Grant};
     use crate::{bootstrap_mount_authority, registry, FsError, MemFs, MountPoint};
+    use narf_capabilities::{Cap, Grant};
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let fs = MemFs::with_seeds("test-unlink", &[("doomed", b"x")]);
@@ -436,9 +434,9 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
 kernel_test_in!("filesystem", smoke_filesystem_memfs_unlink_round_trip);
 
 fn smoke_filesystem_devfs_null_zero() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, DevFs};
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use crate::{bootstrap_mount_authority, registry, DevFs};
 
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
@@ -463,9 +461,7 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
 
     // /dev/null: read returns 0; write returns the requested length.
     let null_ops = registry()
-        .resolve_absolute("/dev/null", |fs, rel| {
-            crate::resolve(fs.root(), rel).ok()
-        })
+        .resolve_absolute("/dev/null", |fs, rel| crate::resolve(fs.root(), rel).ok())
         .flatten();
     let null_ops = match null_ops {
         Some(o) => o,
@@ -484,9 +480,7 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
 
     // /dev/zero: read fills with zeros + returns the requested length.
     let zero_ops = registry()
-        .resolve_absolute("/dev/zero", |fs, rel| {
-            crate::resolve(fs.root(), rel).ok()
-        })
+        .resolve_absolute("/dev/zero", |fs, rel| crate::resolve(fs.root(), rel).ok())
         .flatten();
     let zero_ops = match zero_ops {
         Some(o) => o,
@@ -515,9 +509,9 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
 kernel_test_in!("filesystem", smoke_filesystem_devfs_null_zero);
 
 fn smoke_filesystem_devfs_random_urandom() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, DevFs};
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use crate::{bootstrap_mount_authority, registry, DevFs};
 
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
@@ -544,9 +538,7 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
     // 16 bytes and (b) produce a not-all-zero buffer.
     for path in ["/dev/random", "/dev/urandom"] {
         let ops = registry()
-            .resolve_absolute(path, |fs, rel| {
-                crate::resolve(fs.root(), rel).ok()
-            })
+            .resolve_absolute(path, |fs, rel| crate::resolve(fs.root(), rel).ok())
             .flatten();
         let ops = match ops {
             Some(o) => o,
@@ -571,14 +563,16 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
     // then read `/dev/console` and verify each press surfaces as the
     // expected ASCII byte. Exercises the full keyboard-→-VFS path
     // without depending on a live xHCI controller.
+    use crate::{bootstrap_mount_authority, registry, DevFs};
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use crate::{bootstrap_mount_authority, registry, DevFs};
     use narf_input::{init_global_ring, push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
 
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
@@ -618,11 +612,31 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
     // Push: 'h', 'I' (shift held), '1', '\n', release of 'h'.
     let mods_none = Modifiers::EMPTY;
     let mods_shift = Modifiers::SHIFT;
-    push_global(InputEvent::Key(KeyEvent { code: KeyCode::H, pressed: true, modifiers: mods_none }));
-    push_global(InputEvent::Key(KeyEvent { code: KeyCode::I, pressed: true, modifiers: mods_shift }));
-    push_global(InputEvent::Key(KeyEvent { code: KeyCode::Key1, pressed: true, modifiers: mods_none }));
-    push_global(InputEvent::Key(KeyEvent { code: KeyCode::Enter, pressed: true, modifiers: mods_none }));
-    push_global(InputEvent::Key(KeyEvent { code: KeyCode::H, pressed: false, modifiers: mods_none }));
+    push_global(InputEvent::Key(KeyEvent {
+        code: KeyCode::H,
+        pressed: true,
+        modifiers: mods_none,
+    }));
+    push_global(InputEvent::Key(KeyEvent {
+        code: KeyCode::I,
+        pressed: true,
+        modifiers: mods_shift,
+    }));
+    push_global(InputEvent::Key(KeyEvent {
+        code: KeyCode::Key1,
+        pressed: true,
+        modifiers: mods_none,
+    }));
+    push_global(InputEvent::Key(KeyEvent {
+        code: KeyCode::Enter,
+        pressed: true,
+        modifiers: mods_none,
+    }));
+    push_global(InputEvent::Key(KeyEvent {
+        code: KeyCode::H,
+        pressed: false,
+        modifiers: mods_none,
+    }));
 
     let mut buf = [0u8; 16];
     let n = match poll_once(console.read(0, &mut buf)) {
@@ -660,16 +674,17 @@ fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
     // /dev is reachable: resolve_absolute against /dev/null finds
     // a DirOps lookup hit.
     let ops = registry()
-        .resolve_absolute("/dev/null", |fs, rel| {
-            crate::resolve(fs.root(), rel).ok()
-        })
+        .resolve_absolute("/dev/null", |fs, rel| crate::resolve(fs.root(), rel).ok())
         .flatten();
     if ops.is_none() {
         return TestResult::Fail("mount_default did not mount /dev");
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_filesystem_devfs_mount_default_idempotent);
+kernel_test_in!(
+    "filesystem",
+    smoke_filesystem_devfs_mount_default_idempotent
+);
 
 // ── extended filesystem coverage ───────────────────────────────────
 //
@@ -736,12 +751,14 @@ kernel_test_in!("filesystem", smoke_fs_posix_access_owner_group_other);
 
 fn smoke_fs_resolve_rejects_empty_path() -> TestResult {
     // resolve() rejects empty paths with InvalidPath.
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
-    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
     struct EmptyDir;
     impl DirOps for EmptyDir {
-        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> { None }
+        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> {
+            None
+        }
         fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
             Box::new(core::iter::empty())
         }
@@ -755,12 +772,14 @@ kernel_test_in!("filesystem", smoke_fs_resolve_rejects_empty_path);
 
 fn smoke_fs_resolve_rejects_absolute_path() -> TestResult {
     // resolve() is for RELATIVE paths — leading `/` must be rejected.
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
-    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
     struct EmptyDir;
     impl DirOps for EmptyDir {
-        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> { None }
+        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> {
+            None
+        }
         fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
             Box::new(core::iter::empty())
         }
@@ -775,12 +794,14 @@ kernel_test_in!("filesystem", smoke_fs_resolve_rejects_absolute_path);
 fn smoke_fs_resolve_rejects_dot_dot() -> TestResult {
     // sync resolve() doesn't support `..` — must surface InvalidPath
     // rather than walking off the mount.
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
-    use crate::{resolve, DirEntry, DirOps, FileOps, FsError};
     struct EmptyDir;
     impl DirOps for EmptyDir {
-        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> { None }
+        fn lookup(&self, _: &str) -> Option<Arc<dyn FileOps>> {
+            None
+        }
         fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
             Box::new(core::iter::empty())
         }
@@ -795,10 +816,10 @@ kernel_test_in!("filesystem", smoke_fs_resolve_rejects_dot_dot);
 fn smoke_fs_resolve_tolerates_redundant_separators_and_dot() -> TestResult {
     // `//` and `.` segments are tolerated and skipped. Confirm that
     // `foo` and `.//foo` resolve to the same node by stub instrumentation.
+    use crate::{resolve, DirEntry, DirOps, FileOps, FsFuture, Mode, Stat};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
-    use crate::{resolve, DirEntry, DirOps, FileOps, FsFuture, Mode, Stat};
 
     static LOOKUPS: AtomicU32 = AtomicU32::new(0);
     LOOKUPS.store(0, Ordering::Relaxed);
@@ -812,7 +833,12 @@ fn smoke_fs_resolve_tolerates_redundant_separators_and_dot() -> TestResult {
             Box::pin(async { Ok(0) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: 0, blocks: 0, mode: Mode::FILE_RO, mtime_cycles: 0 }
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
         }
     }
     struct StubDir;
@@ -843,12 +869,19 @@ fn smoke_fs_resolve_tolerates_redundant_separators_and_dot() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_fs_resolve_tolerates_redundant_separators_and_dot);
+kernel_test_in!(
+    "filesystem",
+    smoke_fs_resolve_tolerates_redundant_separators_and_dot
+);
 
 fn smoke_fs_page_cache_lookup_missing_is_none() -> TestResult {
     use crate::{PageCache, PageKey};
     let pc = PageCache::new();
-    let k = PageKey { fs_id: 99, inode: 99, page_off: 99 };
+    let k = PageKey {
+        fs_id: 99,
+        inode: 99,
+        page_off: 99,
+    };
     if pc.lookup(k).is_some() {
         return TestResult::Fail("lookup on absent key returned Some");
     }
@@ -870,7 +903,11 @@ fn smoke_fs_page_cache_generation_bumps_on_dirty() -> TestResult {
     // to detect they raced against a writer.
     use crate::{Page, PageCache, PageKey};
     let pc = PageCache::new();
-    let k = PageKey { fs_id: 1, inode: 1, page_off: 0 };
+    let k = PageKey {
+        fs_id: 1,
+        inode: 1,
+        page_off: 0,
+    };
     pc.insert(k, Page::zeroed());
     let g0 = pc.lookup(k).unwrap().gen;
     pc.mark_dirty(k);
@@ -901,7 +938,11 @@ fn smoke_fs_page_cache_insert_overwrites() -> TestResult {
     // Insert replaces in place — second insert with same key wins.
     use crate::{Page, PageCache, PageKey};
     let pc = PageCache::new();
-    let k = PageKey { fs_id: 1, inode: 1, page_off: 0 };
+    let k = PageKey {
+        fs_id: 1,
+        inode: 1,
+        page_off: 0,
+    };
     pc.insert(k, Page::zeroed());
     if pc.len() != 1 {
         return TestResult::Fail("first insert didn't grow to 1");
@@ -997,7 +1038,10 @@ fn smoke_fs_registry_unmount_revoked_handle_rejected() -> TestResult {
         _ => TestResult::Fail("revoked handle accepted unmount"),
     }
 }
-kernel_test_in!("filesystem", smoke_fs_registry_unmount_revoked_handle_rejected);
+kernel_test_in!(
+    "filesystem",
+    smoke_fs_registry_unmount_revoked_handle_rejected
+);
 
 fn smoke_fs_error_variants_distinct() -> TestResult {
     use crate::FsError;
@@ -1043,9 +1087,7 @@ kernel_test_in!("filesystem", smoke_fs_filetype_variants_distinct);
 // ── filesystem/root_mount ──────────────────────────────────────────
 
 fn smoke_fs_root_mount_factory_register_lookup() -> TestResult {
-    use crate::root_mount::{
-        factory_count, lookup_factory, register_fs_factory, __reset_for_test,
-    };
+    use crate::root_mount::{__reset_for_test, factory_count, lookup_factory, register_fs_factory};
     use narf_block::fs_detect::FsType;
     __reset_for_test();
     if factory_count() != 0 {
@@ -1074,7 +1116,10 @@ fn smoke_fs_root_mount_factory_register_lookup() -> TestResult {
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("filesystem/root_mount", smoke_fs_root_mount_factory_register_lookup);
+kernel_test_in!(
+    "filesystem/root_mount",
+    smoke_fs_root_mount_factory_register_lookup
+);
 
 fn smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry() -> TestResult {
     use crate::root_mount::{try_mount_root, RootMountError, __reset_for_test};
@@ -1085,9 +1130,7 @@ fn smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry() -> TestRes
     // if block devices have known FS magic.
     let auth: Cap<MountPoint, Grant> = Cap::bootstrap();
     match try_mount_root(&auth) {
-        Err(RootMountError::NoFactory(_)) | Err(RootMountError::NoMountable) => {
-            TestResult::Pass
-        }
+        Err(RootMountError::NoFactory(_)) | Err(RootMountError::NoMountable) => TestResult::Pass,
         Ok(_) => TestResult::Fail("no factories must NOT yield a mount"),
         Err(other) => {
             let _ = other;
@@ -1109,7 +1152,10 @@ fn smoke_root_selector_parses_dev_path() -> TestResult {
         _ => TestResult::Fail("root=/dev/nvme0p1 must yield ByName(\"nvme0p1\")"),
     }
 }
-kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_dev_path);
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_selector_parses_dev_path
+);
 
 fn smoke_root_selector_parses_bare_name() -> TestResult {
     use crate::root_selector::RootSelector;
@@ -1119,7 +1165,10 @@ fn smoke_root_selector_parses_bare_name() -> TestResult {
         _ => TestResult::Fail("bare name root= must yield ByName"),
     }
 }
-kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_bare_name);
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_selector_parses_bare_name
+);
 
 fn smoke_root_selector_parses_partlabel() -> TestResult {
     use crate::root_selector::RootSelector;
@@ -1128,7 +1177,10 @@ fn smoke_root_selector_parses_partlabel() -> TestResult {
         _ => TestResult::Fail("PARTLABEL not parsed"),
     }
 }
-kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_partlabel);
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_selector_parses_partlabel
+);
 
 fn smoke_root_selector_parses_uuid_variants() -> TestResult {
     use crate::root_selector::RootSelector;
@@ -1144,7 +1196,10 @@ fn smoke_root_selector_parses_uuid_variants() -> TestResult {
         _ => TestResult::Fail("UUID not parsed"),
     }
 }
-kernel_test_in!("filesystem/root_selector", smoke_root_selector_parses_uuid_variants);
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_selector_parses_uuid_variants
+);
 
 fn smoke_root_selector_returns_none_when_absent() -> TestResult {
     use crate::root_selector::RootSelector;
@@ -1153,7 +1208,10 @@ fn smoke_root_selector_returns_none_when_absent() -> TestResult {
         _ => TestResult::Fail("absent root= must yield None"),
     }
 }
-kernel_test_in!("filesystem/root_selector", smoke_root_selector_returns_none_when_absent);
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_selector_returns_none_when_absent
+);
 
 fn smoke_root_selector_first_root_wins() -> TestResult {
     use crate::root_selector::RootSelector;
@@ -1163,7 +1221,10 @@ fn smoke_root_selector_first_root_wins() -> TestResult {
         _ => TestResult::Fail("first root= must win"),
     }
 }
-kernel_test_in!("filesystem/root_selector", smoke_root_selector_first_root_wins);
+kernel_test_in!(
+    "filesystem/root_selector",
+    smoke_root_selector_first_root_wins
+);
 
 fn smoke_root_mount_selector_no_match_refuses() -> TestResult {
     use crate::root_mount::{try_mount_root_with, RootMountError, __reset_for_test};
@@ -1176,8 +1237,7 @@ fn smoke_root_mount_selector_no_match_refuses() -> TestResult {
     // must refuse rather than fall through to a different device.
     let sel = RootSelector::ByName(alloc::string::String::from("doesnt-exist-p1"));
     match try_mount_root_with(&auth, Some(&sel)) {
-        Err(RootMountError::SelectorNoMatch)
-        | Err(RootMountError::NoMountable) => TestResult::Pass,
+        Err(RootMountError::SelectorNoMatch) | Err(RootMountError::NoMountable) => TestResult::Pass,
         _ => TestResult::Fail("name-only selector miss must refuse"),
     }
 }
@@ -1197,7 +1257,9 @@ fn poll_once_devfs_input<F: core::future::Future>(mut fut: F) -> Option<F::Outpu
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -1213,9 +1275,9 @@ fn poll_once_devfs_input<F: core::future::Future>(mut fut: F) -> Option<F::Outpu
 
 /// 1. DevInputDir enumerate finds event0 after a device registers.
 fn smoke_dev_input_dir_enumerate_finds_event0() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, ROUTER};
     use crate::devfs_input::DevInputDir;
     use crate::DirOps;
+    use narf_input::evdev::{DeviceCaps, ROUTER};
 
     let (id, _node) = ROUTER.register_device(DeviceCaps::new());
 
@@ -1229,13 +1291,16 @@ fn smoke_dev_input_dir_enumerate_finds_event0() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs_input", smoke_dev_input_dir_enumerate_finds_event0);
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_dir_enumerate_finds_event0
+);
 
 /// 2. InputEventFile read with empty ring + zero-size buf → 0 bytes (non-blocking).
 fn smoke_dev_input_read_zero_buf_non_blocking() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, ROUTER};
     use crate::devfs_input::{DeviceKind, InputEventFile};
     use crate::FileOps;
+    use narf_input::evdev::{DeviceCaps, ROUTER};
 
     let (id, _node) = ROUTER.register_device(DeviceCaps::new());
     let file = match InputEventFile::open(id, DeviceKind::Hardware) {
@@ -1260,23 +1325,31 @@ fn smoke_dev_input_read_zero_buf_non_blocking() -> TestResult {
         None => TestResult::Fail("empty buf read returned Pending"),
     }
 }
-kernel_test_in!("filesystem/devfs_input", smoke_dev_input_read_zero_buf_non_blocking);
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_read_zero_buf_non_blocking
+);
 
 /// 3. InputEventFile read with 1 event available → exactly EVDEV_EVENT_SIZE bytes,
 ///    layout matches the event that was dispatched.
 fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
-    use narf_input::evdev::key::KEY_A;
     use crate::devfs_input::{DeviceKind, InputEventFile};
     use crate::FileOps;
     use core::mem;
+    use narf_input::evdev::key::KEY_A;
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
     let (id, node) = ROUTER.register_device(caps);
 
     let now = narf_time::now_cycles();
-    let sent = EvdevEvent { time: now, type_: EventType::Key, code: KEY_A, value: 1 };
+    let sent = EvdevEvent {
+        time: now,
+        type_: EventType::Key,
+        code: KEY_A,
+        value: 1,
+    };
     node.dispatch(sent);
 
     let file = match InputEventFile::open(id, DeviceKind::Hardware) {
@@ -1317,16 +1390,19 @@ fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs_input", smoke_dev_input_read_one_event_correct_layout);
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_read_one_event_correct_layout
+);
 
 /// 4. InputEventFile read with 5 events available and a 10-event buffer →
 ///    exactly 5 events returned in one call.
 fn smoke_dev_input_read_five_events_in_one_call() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
-    use narf_input::evdev::key::KEY_A;
     use crate::devfs_input::{DeviceKind, InputEventFile};
     use crate::FileOps;
     use core::mem;
+    use narf_input::evdev::key::KEY_A;
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
@@ -1334,7 +1410,12 @@ fn smoke_dev_input_read_five_events_in_one_call() -> TestResult {
 
     let now = narf_time::now_cycles();
     for v in 0i32..5 {
-        node.dispatch(EvdevEvent { time: now, type_: EventType::Key, code: KEY_A, value: v });
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Key,
+            code: KEY_A,
+            value: v,
+        });
     }
 
     let file = match InputEventFile::open(id, DeviceKind::Hardware) {
@@ -1359,13 +1440,16 @@ fn smoke_dev_input_read_five_events_in_one_call() -> TestResult {
         _ => TestResult::Fail("read failed or returned Pending"),
     }
 }
-kernel_test_in!("filesystem/devfs_input", smoke_dev_input_read_five_events_in_one_call);
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_read_five_events_in_one_call
+);
 
 /// 5. Write to hardware device → PermissionDenied.
 fn smoke_dev_input_write_hardware_denied() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, ROUTER};
     use crate::devfs_input::{DeviceKind, InputEventFile};
     use crate::{FileOps, FsError};
+    use narf_input::evdev::{DeviceCaps, ROUTER};
 
     let (id, _node) = ROUTER.register_device(DeviceCaps::new());
     let file = match InputEventFile::open(id, DeviceKind::Hardware) {
@@ -1388,15 +1472,18 @@ fn smoke_dev_input_write_hardware_denied() -> TestResult {
         None => TestResult::Fail("hardware write returned Pending"),
     }
 }
-kernel_test_in!("filesystem/devfs_input", smoke_dev_input_write_hardware_denied);
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_write_hardware_denied
+);
 
 /// 6. Write to UserDevice → event injected; reader sees it round-trip.
 fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
-    use narf_input::evdev::key::KEY_A;
     use crate::devfs_input::{DeviceKind, InputEventFile};
     use crate::FileOps;
     use core::mem;
+    use narf_input::evdev::key::KEY_A;
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
@@ -1448,19 +1535,20 @@ fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
     ROUTER.unregister_device(id);
 
     match ev_got {
-        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1 => {
-            TestResult::Pass
-        }
+        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1 => TestResult::Pass,
         Some(_) => TestResult::Fail("injected event had wrong fields"),
         None => TestResult::Fail("reader saw no event after uinput write"),
     }
 }
-kernel_test_in!("filesystem/devfs_input", smoke_dev_input_write_uinput_injects_event);
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_write_uinput_injects_event
+);
 
 /// 7. `/dev/input/event0` open by path resolves through DevDir → InputEventFile.
 fn smoke_dev_input_open_by_path() -> TestResult {
-    use narf_input::evdev::{DeviceCaps, ROUTER};
     use crate::{bootstrap_mount_authority, registry, DevFs, FileType};
+    use narf_input::evdev::{DeviceCaps, ROUTER};
 
     let (id, _node) = ROUTER.register_device(DeviceCaps::new());
     let event_num = id.0 - 1;
@@ -1471,10 +1559,8 @@ fn smoke_dev_input_open_by_path() -> TestResult {
 
     // Build the path "/dev/input/eventN" for the device we just registered.
     let abs_path = alloc::format!("/dev/input/event{}", event_num);
-    let result = registry().resolve_absolute(
-        &abs_path,
-        |fs, rel| crate::resolve(fs.root(), rel).ok(),
-    );
+    let result =
+        registry().resolve_absolute(&abs_path, |fs, rel| crate::resolve(fs.root(), rel).ok());
 
     ROUTER.unregister_device(id);
 
