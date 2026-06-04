@@ -43,7 +43,7 @@ pub fn ed25519_sign(sk: &SecretKey, msg: &[u8]) -> Signature {
     a[31] |= 64;
 
     let prefix = &h[32..64];
-    
+
     // r = H(prefix || msg) mod L
     let mut hasher = Sha512::new();
     hasher.update(prefix);
@@ -55,7 +55,7 @@ pub fn ed25519_sign(sk: &SecretKey, msg: &[u8]) -> Signature {
 
     // k = H(R || A || msg) mod L
     let pk_bytes = Point::BASE.mul(&a).to_bytes();
-    
+
     let mut hasher = Sha512::new();
     hasher.update(&r_point_bytes);
     hasher.update(&pk_bytes);
@@ -76,7 +76,7 @@ pub fn ed25519_sign(sk: &SecretKey, msg: &[u8]) -> Signature {
 pub fn ed25519_verify(pk: &PublicKey, msg: &[u8], sig: &Signature) -> bool {
     let r_bytes: [u8; 32] = sig[0..32].try_into().unwrap();
     let s_bytes: [u8; 32] = sig[32..64].try_into().unwrap();
-    
+
     // 1. S < L check
     let s_limbs = [
         u64::from_le_bytes(s_bytes[0..8].try_into().unwrap()),
@@ -84,7 +84,9 @@ pub fn ed25519_verify(pk: &PublicKey, msg: &[u8], sig: &Signature) -> bool {
         u64::from_le_bytes(s_bytes[16..24].try_into().unwrap()),
         u64::from_le_bytes(s_bytes[24..32].try_into().unwrap()),
     ];
-    if is_ge_l(&s_limbs) { return false; }
+    if is_ge_l(&s_limbs) {
+        return false;
+    }
 
     // 2. Decode points
     let a = match Point::from_bytes_checked(pk) {
@@ -108,7 +110,7 @@ pub fn ed25519_verify(pk: &PublicKey, msg: &[u8], sig: &Signature) -> bool {
     let sb = Point::BASE.mul(&s_bytes);
     let ka = a.mul(&k);
     let r_plus_ka = r.add(&ka);
-    
+
     // Clear cofactor
     sb.double().double().double() == r_plus_ka.double().double().double()
 }
@@ -124,8 +126,12 @@ const L: [u64; 4] = [
 /// Helper to check if a 256-bit number is >= L
 fn is_ge_l(val: &[u64; 4]) -> bool {
     for i in (0..4).rev() {
-        if val[i] > L[i] { return true; }
-        if val[i] < L[i] { return false; }
+        if val[i] > L[i] {
+            return true;
+        }
+        if val[i] < L[i] {
+            return false;
+        }
     }
     true
 }
@@ -135,12 +141,12 @@ pub fn reduce_mod_l(h: &[u8; 64]) -> [u8; 32] {
     // Treat h as a 512-bit little-endian integer.
     // We want to calculate h mod L.
     // L = 2^252 + 27742317777372353535851937790883648493
-    
+
     let mut r = [0u64; 9]; // 512 bits + extra for shift
     for i in 0..8 {
-        r[i] = u64::from_le_bytes(h[i*8..i*8+8].try_into().unwrap());
+        r[i] = u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap());
     }
-    
+
     // We use a simpler approach: process from top down.
     // But since it's 512 bits and L is ~252 bits, we can do it more traditionally.
     let mut rem = [0u64; 8];
@@ -152,32 +158,38 @@ pub fn reduce_mod_l(h: &[u8; 64]) -> [u8; 32] {
             rem[j] = (rem[j] << 1) | carry;
             carry = next_carry;
         }
-        
+
         // bit = h[i]
         let bit = (r[i / 64] >> (i % 64)) & 1;
         rem[0] |= bit;
-        
+
         // if rem >= L, rem -= L
         // Note: rem is 512 bits, L is 256 bits.
         while is_ge_l_large(&rem) {
             sub_l_large(&mut rem);
         }
     }
-    
+
     let mut out = [0u8; 32];
     for i in 0..4 {
-        out[i*8..i*8+8].copy_from_slice(&rem[i].to_le_bytes());
+        out[i * 8..i * 8 + 8].copy_from_slice(&rem[i].to_le_bytes());
     }
     out
 }
 
 fn is_ge_l_large(val: &[u64; 8]) -> bool {
     for i in (4..8).rev() {
-        if val[i] > 0 { return true; }
+        if val[i] > 0 {
+            return true;
+        }
     }
     for i in (0..4).rev() {
-        if val[i] > L[i] { return true; }
-        if val[i] < L[i] { return false; }
+        if val[i] > L[i] {
+            return true;
+        }
+        if val[i] < L[i] {
+            return false;
+        }
     }
     true
 }
@@ -212,7 +224,7 @@ pub(crate) fn mul_add_mod_l(k: &[u8; 32], a: &[u8; 32], r: &[u8; 32]) -> [u8; 32
         u64::from_le_bytes(a[16..24].try_into().unwrap()),
         u64::from_le_bytes(a[24..32].try_into().unwrap()),
     ];
-    
+
     for i in 0..4 {
         let mut carry = 0u128;
         for j in 0..4 {
@@ -222,7 +234,7 @@ pub(crate) fn mul_add_mod_l(k: &[u8; 32], a: &[u8; 32], r: &[u8; 32]) -> [u8; 32
         }
         prod[i + 4] = carry as u64;
     }
-    
+
     let r_limbs = [
         u64::from_le_bytes(r[0..8].try_into().unwrap()),
         u64::from_le_bytes(r[8..16].try_into().unwrap()),
@@ -241,10 +253,10 @@ pub(crate) fn mul_add_mod_l(k: &[u8; 32], a: &[u8; 32], r: &[u8; 32]) -> [u8; 32
         prod[i] = res;
         carry = if b { 1 } else { 0 };
     }
-    
+
     let mut h = [0u8; 64];
     for i in 0..8 {
-        h[i*8..i*8+8].copy_from_slice(&prod[i].to_le_bytes());
+        h[i * 8..i * 8 + 8].copy_from_slice(&prod[i].to_le_bytes());
     }
     reduce_mod_l(&h)
 }

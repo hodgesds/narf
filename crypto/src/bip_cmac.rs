@@ -261,7 +261,7 @@ pub mod tests {
         let mut hdr = [0u8; 24];
         hdr[0] = 0xD0; // subtype Action
         hdr[1] = 0x38; // Retry|PwrMgmt|MoreData
-        // A1 / A2 / A3
+                       // A1 / A2 / A3
         hdr[4..10].copy_from_slice(&[0x11; 6]);
         hdr[10..16].copy_from_slice(&[0x22; 6]);
         hdr[16..22].copy_from_slice(&[0x33; 6]);
@@ -326,7 +326,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("crypto/bip", smoke_bip_ipn_replay_window_strictly_increasing);
+    kernel_test_in!(
+        "crypto/bip",
+        smoke_bip_ipn_replay_window_strictly_increasing
+    );
 
     fn smoke_bip_mmie_body_round_trip() -> TestResult {
         let mic = [0xDEu8; 16];

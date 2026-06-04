@@ -51,10 +51,10 @@ pub mod rsaes_oaep;
 pub mod sha256;
 pub mod sha512;
 
-mod tests;
+mod e2e_tests;
 #[cfg(test)]
 mod primitive_tests;
-mod e2e_tests;
+mod tests;
 
 extern crate alloc;
 

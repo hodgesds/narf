@@ -240,11 +240,7 @@ pub fn compute_v(
 
 /// Compute M = HMAC-SHA256(StreamID_Type ‖ seq_num_M, k=kh).
 /// HDCP 2.3 §2.3.6 stream management.
-pub fn compute_m(
-    kh: &[u8; 16],
-    stream_id_type: &[u8],
-    seq_num_m: &[u8; 3],
-) -> [u8; HDCP_MIC_LEN] {
+pub fn compute_m(kh: &[u8; 16], stream_id_type: &[u8], seq_num_m: &[u8; 3]) -> [u8; HDCP_MIC_LEN] {
     let mut msg: Vec<u8> = Vec::with_capacity(stream_id_type.len() + 3);
     msg.extend_from_slice(stream_id_type);
     msg.extend_from_slice(seq_num_m);

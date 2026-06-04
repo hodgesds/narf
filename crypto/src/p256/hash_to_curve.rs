@@ -245,9 +245,9 @@ fn map_to_curve_sswu(u: &Fp) -> AffinePoint {
     let a = curve_a();
     let b = Fp::from_limbs(super::CURVE_B);
 
-    let z_u2 = z.mul(&u.square());           // Z·u²
-    let z2_u4 = z_u2.square();               // Z²·u⁴
-    let denom = z2_u4.add(&z_u2);            // Z²u⁴ + Z u²
+    let z_u2 = z.mul(&u.square()); // Z·u²
+    let z2_u4 = z_u2.square(); // Z²·u⁴
+    let denom = z2_u4.add(&z_u2); // Z²u⁴ + Z u²
 
     // x1 = (-B / A) * (1 + inv0(denom)); exceptional path picks B/(Z·A).
     let x1 = if denom.is_zero() {

@@ -6,7 +6,7 @@
 //!
 //! Poly1305 is a one-time authenticator that computes a 128-bit tag for a message
 //! using a 256-bit key. The key is split into two 128-bit parts: r and s.
-//! The algorithm computes (h + s) mod 2^128, where h is the evaluation of a 
+//! The algorithm computes (h + s) mod 2^128, where h is the evaluation of a
 //! polynomial in r modulo 2^130 - 5.
 
 #![allow(dead_code)]
@@ -57,7 +57,7 @@ impl FieldElement {
     /// This performs a full reduction modulo 2^130 - 5 and conditional subtraction.
     fn to_bytes(self) -> [u8; 16] {
         let mut limbs = self.0;
-        
+
         // Partial reduction: h = h mod 2^130 - 5
         let mut carry = limbs[0] >> 26;
         limbs[0] &= 0x3ffffff;
@@ -185,7 +185,7 @@ impl Poly1305 {
     pub fn new(key: &[u8; 32]) -> Self {
         let mut r_bytes = [0u8; 16];
         r_bytes.copy_from_slice(&key[0..16]);
-        
+
         // Clamping r as required by RFC 8439 Section 2.5
         r_bytes[3] &= 15;
         r_bytes[7] &= 15;

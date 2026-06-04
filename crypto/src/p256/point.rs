@@ -409,7 +409,10 @@ pub mod point_tests {
         // 2 * G = G.double()
         let two = Scalar::from_limbs([2, 0, 0, 0]);
         let result = scalar_mul_base(&two);
-        let expected = AffinePoint::generator().to_projective().double().to_affine();
+        let expected = AffinePoint::generator()
+            .to_projective()
+            .double()
+            .to_affine();
         if result != expected {
             return TestResult::Fail("2 * G != double(G)");
         }
@@ -434,12 +437,10 @@ pub mod point_tests {
             None => return TestResult::Fail("decode i"),
         };
         let pub_pt = scalar_mul_base(&i);
-        let exp_x = hex_decode_32(
-            b"DAD0B65394221CF9B051E1FECA5787D098DFE637FC90B9EF945D0C3772581180",
-        );
-        let exp_y = hex_decode_32(
-            b"5271A0461CDB8252D61F1C456FA3E59AB1F45B33ACCF5F58389E0577B8990BB3",
-        );
+        let exp_x =
+            hex_decode_32(b"DAD0B65394221CF9B051E1FECA5787D098DFE637FC90B9EF945D0C3772581180");
+        let exp_y =
+            hex_decode_32(b"5271A0461CDB8252D61F1C456FA3E59AB1F45B33ACCF5F58389E0577B8990BB3");
         if pub_pt.x.to_bytes_be() != exp_x {
             return TestResult::Fail("i*G.x mismatch");
         }
@@ -477,9 +478,8 @@ pub mod point_tests {
             return TestResult::Fail("peer's gR not on curve");
         }
         let shared = scalar_mul(&i, &g_r);
-        let exp_z = hex_decode_32(
-            b"D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE",
-        );
+        let exp_z =
+            hex_decode_32(b"D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE");
         if shared.x.to_bytes_be() != exp_z {
             return TestResult::Fail("shared Z mismatch");
         }

@@ -147,17 +147,33 @@ fn test_chacha20_poly1305_aead_roundtrip() {
 
     let mut buf = plaintext.to_vec();
     let tag = chacha20_poly1305_seal(&key, &nonce, aad, &mut buf);
-    assert_ne!(&buf[..], plaintext, "seal must overwrite plaintext with ciphertext");
+    assert_ne!(
+        &buf[..],
+        plaintext,
+        "seal must overwrite plaintext with ciphertext"
+    );
 
     // Tag tamper → open rejects, ciphertext stays sealed.
     let mut tampered = buf.clone();
     let mut bad_tag = tag;
     bad_tag[0] ^= 1;
-    assert!(!chacha20_poly1305_open(&key, &nonce, aad, &mut tampered, &bad_tag));
+    assert!(!chacha20_poly1305_open(
+        &key,
+        &nonce,
+        aad,
+        &mut tampered,
+        &bad_tag
+    ));
 
     // AAD tamper → open rejects.
     let mut tampered = buf.clone();
-    assert!(!chacha20_poly1305_open(&key, &nonce, b"wrong-aad", &mut tampered, &tag));
+    assert!(!chacha20_poly1305_open(
+        &key,
+        &nonce,
+        b"wrong-aad",
+        &mut tampered,
+        &tag
+    ));
 
     // Honest open → plaintext recovered.
     assert!(chacha20_poly1305_open(&key, &nonce, aad, &mut buf, &tag));
@@ -196,7 +212,11 @@ fn test_base_mul_one() {
     let mut scalar = [0u8; 32];
     scalar[0] = 1;
     let p = Point::BASE.mul(&scalar);
-    assert_eq!(p.to_bytes(), Point::BASE.to_bytes(), "BASE*1 should equal BASE");
+    assert_eq!(
+        p.to_bytes(),
+        Point::BASE.to_bytes(),
+        "BASE*1 should equal BASE"
+    );
 }
 
 #[test]
@@ -204,10 +224,9 @@ fn test_base_double() {
     use crate::curve25519::Point;
     // 2*B compressed (well-known): see e.g. RFC 8032 §6.
     let expected: [u8; 32] = [
-        0xc9, 0xa3, 0xf8, 0x6a, 0xae, 0x46, 0x5f, 0x0e,
-        0x56, 0x51, 0x38, 0x64, 0x51, 0x0f, 0x39, 0x97,
-        0x56, 0x1f, 0xa2, 0xc9, 0xe8, 0x5e, 0xa2, 0x1d,
-        0xc2, 0x29, 0x23, 0x09, 0xf3, 0xcd, 0x60, 0x22,
+        0xc9, 0xa3, 0xf8, 0x6a, 0xae, 0x46, 0x5f, 0x0e, 0x56, 0x51, 0x38, 0x64, 0x51, 0x0f, 0x39,
+        0x97, 0x56, 0x1f, 0xa2, 0xc9, 0xe8, 0x5e, 0xa2, 0x1d, 0xc2, 0x29, 0x23, 0x09, 0xf3, 0xcd,
+        0x60, 0x22,
     ];
     assert_eq!(Point::BASE.double().to_bytes(), expected);
 }

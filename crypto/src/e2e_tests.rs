@@ -135,8 +135,7 @@ fn e2e_aes256_ecb_fips197_c3() -> TestResult {
     use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes256;
 
-    let key: [u8; 32] =
-        hex(b"000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
+    let key: [u8; 32] = hex(b"000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
     let pt: [u8; 16] = hex(b"00112233445566778899AABBCCDDEEFF");
     let want: [u8; 16] = hex(b"8EA2B7CA516745BFEAFC49904B496089");
 
@@ -231,7 +230,9 @@ fn e2e_aes128_ctr_streaming_spot_check() -> TestResult {
     apply_keystream(&key, &mut ctr3, &mut buf3);
     // buf3 matches buf[..1023]; buf[1023] is from the same block.
     if buf3[..] != buf[..1023] {
-        return TestResult::Fail("AES-128 CTR streaming: 1023-byte prefix mismatches 1024-byte run");
+        return TestResult::Fail(
+            "AES-128 CTR streaming: 1023-byte prefix mismatches 1024-byte run",
+        );
     }
 
     // Pin the value — this is the AES keystream byte 1023 from the NIST key+IV.
@@ -261,9 +262,7 @@ kernel_test_in!("crypto/e2e", e2e_aes128_ctr_streaming_spot_check);
 fn e2e_aes128_gcm_nist_tc2_encrypt() -> TestResult {
     use aes_gcm::{
         aead::{AeadInPlace, KeyInit},
-        Aes128Gcm,
-        Key as GcmKey,
-        Nonce,
+        Aes128Gcm, Key as GcmKey, Nonce,
     };
 
     let key: [u8; 16] = hex(b"00000000000000000000000000000000");
@@ -296,9 +295,7 @@ kernel_test_in!("crypto/e2e", e2e_aes128_gcm_nist_tc2_encrypt);
 fn e2e_aes128_gcm_nist_tc2_roundtrip() -> TestResult {
     use aes_gcm::{
         aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
-        Aes128Gcm,
-        Key as GcmKey,
-        Nonce,
+        Aes128Gcm, Key as GcmKey, Nonce,
     };
 
     let key: [u8; 16] = hex(b"00000000000000000000000000000000");
@@ -522,7 +519,7 @@ fn e2e_sha256_multiblock_1000_a() -> TestResult {
 
     let mut h = Sha256::new();
     let chunk = [b'a'; 64]; // 16 full blocks in 1000-byte run
-    // 1000 = 15*64 + 40
+                            // 1000 = 15*64 + 40
     for _ in 0..15 {
         h.update(&chunk);
     }
@@ -530,8 +527,7 @@ fn e2e_sha256_multiblock_1000_a() -> TestResult {
 
     let got = h.finalize();
     // FIPS 180-4 CAVP: SHA-256(1000 × 'a')
-    let want: [u8; 32] =
-        hex(b"41EDECE42D63E8D9BF515A9BA6932E1C20CBC9F5A5D134645ADB5DB1B9737EA3");
+    let want: [u8; 32] = hex(b"41EDECE42D63E8D9BF515A9BA6932E1C20CBC9F5A5D134645ADB5DB1B9737EA3");
 
     if got != want {
         return TestResult::Fail("SHA-256 of 1000 'a' bytes drifted from FIPS 180-4 CAVP vector");
@@ -546,8 +542,7 @@ fn e2e_sha256_empty() -> TestResult {
 
     let h = Sha256::new();
     let got = h.finalize();
-    let want: [u8; 32] =
-        hex(b"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855");
+    let want: [u8; 32] = hex(b"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855");
 
     if got != want {
         return TestResult::Fail("SHA-256 empty string drifted from FIPS 180-4 §B.1");
@@ -644,8 +639,7 @@ fn e2e_hmac_sha256_rfc4231_test1() -> TestResult {
 
     let key = [0x0Bu8; 20];
     let got = hmac_sha256(&key, b"Hi There");
-    let want: [u8; 32] =
-        hex(b"B0344C61D8DB38535CA8AFCEAF0BF12B881DC200C9833DA726E9376C2E32CFF7");
+    let want: [u8; 32] = hex(b"B0344C61D8DB38535CA8AFCEAF0BF12B881DC200C9833DA726E9376C2E32CFF7");
 
     if got != want {
         return TestResult::Fail("HMAC-SHA-256 RFC 4231 §4.2 Test 1 mismatch");
@@ -792,8 +786,7 @@ fn e2e_ecdh_p256_rfc5903_shared_secret() -> TestResult {
     };
 
     let z = scalar_mul(&i, &gr);
-    let want_z =
-        hex_32(b"D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE");
+    let want_z = hex_32(b"D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE");
 
     if z.x.to_bytes_be() != want_z {
         return TestResult::Fail("RFC 5903 shared Z mismatch");
@@ -905,16 +898,14 @@ kernel_test_in!("crypto/e2e", e2e_rsa3072_oaep_roundtrip);
 
 /// ECDH P-256 → AES-128-GCM: derive shared key, encrypt, decrypt.
 fn e2e_ecdh_p256_plus_aes128_gcm_smp_style() -> TestResult {
-    use aes_gcm::{
-        aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
-        Aes128Gcm,
-        Key as GcmKey,
-        Nonce,
-    };
     use crate::p256::{
         point::{scalar_mul, scalar_mul_base},
         scalar::Scalar,
         Fp,
+    };
+    use aes_gcm::{
+        aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
+        Aes128Gcm, Key as GcmKey, Nonce,
     };
 
     // Alice's private scalar (RFC 5903 initiator).
@@ -931,12 +922,12 @@ fn e2e_ecdh_p256_plus_aes128_gcm_smp_style() -> TestResult {
 
     // Public keys: alice_pub = alice_priv * G, bob_pub = bob_priv * G.
     let alice_pub = scalar_mul_base(&alice_priv);
-    let bob_pub   = scalar_mul_base(&bob_priv);
+    let bob_pub = scalar_mul_base(&bob_priv);
 
     // Shared secret: both sides compute alice_priv * bob_pub =
     //                              bob_priv * alice_pub = same X coordinate.
     let shared_alice = scalar_mul(&alice_priv, &bob_pub);
-    let shared_bob   = scalar_mul(&bob_priv,   &alice_pub);
+    let shared_bob = scalar_mul(&bob_priv, &alice_pub);
 
     if shared_alice.x != shared_bob.x {
         return TestResult::Fail("ECDH P-256: Alice and Bob disagree on shared X");

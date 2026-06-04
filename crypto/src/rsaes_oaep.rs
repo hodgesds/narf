@@ -138,9 +138,7 @@ fn mul_full(a: &[u64; N_LIMBS], b: &[u64; N_LIMBS]) -> [u64; 2 * N_LIMBS] {
         for j in 0..N_LIMBS {
             // (out[i+j] + a[i]*b[j] + carry) fits in 128 bits even when
             // each operand is at its max u64::MAX.
-            let prod = (a[i] as u128) * (b[j] as u128)
-                + out[i + j] as u128
-                + carry as u128;
+            let prod = (a[i] as u128) * (b[j] as u128) + out[i + j] as u128 + carry as u128;
             out[i + j] = prod as u64;
             carry = (prod >> 64) as u64;
         }
@@ -205,9 +203,7 @@ fn mod_reduce(x: &[u64; 2 * N_LIMBS], m: &[u64; N_LIMBS]) -> [u64; N_LIMBS] {
         // If r >= m, subtract m. r is N+1 limbs; m is N limbs. The
         // comparison must include r's top limb (which is 0 unless the
         // last shift carried).
-        if r[N_LIMBS] > 0
-            || limb_cmp(&r[..N_LIMBS], m) != core::cmp::Ordering::Less
-        {
+        if r[N_LIMBS] > 0 || limb_cmp(&r[..N_LIMBS], m) != core::cmp::Ordering::Less {
             // Subtract m from r[..N_LIMBS] and borrow into r[N_LIMBS].
             let borrow = sub_in_place(&mut r[..N_LIMBS], m);
             r[N_LIMBS] = r[N_LIMBS].wrapping_sub(borrow);
@@ -469,7 +465,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("crypto/rsaes_oaep", smoke_mgf1_sha256_matches_rfc8017_construction);
+    kernel_test_in!(
+        "crypto/rsaes_oaep",
+        smoke_mgf1_sha256_matches_rfc8017_construction
+    );
 
     fn smoke_oaep_encode_decode_round_trip() -> TestResult {
         // Modulus + private exponent — small "synthetic" RSA-3072 keypair
@@ -565,8 +564,8 @@ pub mod tests {
         n_be[RSA_3072_LEN - 1] = 0xFD; // odd modulus
         let seed = [0xBBu8; 32];
         let m = b"hdcp-km-32-byte-test-vector----."; // 31 bytes < 318 max
-        let c = rsaes_oaep_sha256_encrypt(&n_be, HDCP_RSA_PUB_EXP_F4, &seed, m, b"")
-            .expect("encrypt");
+        let c =
+            rsaes_oaep_sha256_encrypt(&n_be, HDCP_RSA_PUB_EXP_F4, &seed, m, b"").expect("encrypt");
         if c.iter().all(|&b| b == 0) {
             return TestResult::Fail("ciphertext is all-zero");
         }
@@ -585,7 +584,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("crypto/rsaes_oaep", smoke_rsaes_oaep_encrypt_then_decrypt_self_test);
+    kernel_test_in!(
+        "crypto/rsaes_oaep",
+        smoke_rsaes_oaep_encrypt_then_decrypt_self_test
+    );
 
     fn smoke_oaep_label_binding() -> TestResult {
         // Different labels must produce different EM (so different
