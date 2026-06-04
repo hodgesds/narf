@@ -256,7 +256,13 @@ pub trait HmacPrimitive {
 
 /// PRF: produce `out_bits` bits of pseudo-random output keyed on
 /// `key`, salted with `label || 0x00 || context`.
-pub fn prf(hmac: &dyn HmacPrimitive, key: &[u8], label: &[u8], context: &[u8], out_bits: usize) -> Vec<u8> {
+pub fn prf(
+    hmac: &dyn HmacPrimitive,
+    key: &[u8],
+    label: &[u8],
+    context: &[u8],
+    out_bits: usize,
+) -> Vec<u8> {
     let out_bytes = (out_bits + 7) / 8;
     let mut result = Vec::with_capacity(out_bytes);
     let chunks = (out_bytes + hmac.out_len() - 1) / hmac.out_len();
@@ -413,7 +419,15 @@ impl Supplicant {
         }
         self.anonce = m1.key_nonce;
         self.last_replay_counter = m1.replay_counter;
-        let ptk = derive_ptk(hmac, pmk, &self.aa, &self.sa, &self.anonce, &self.snonce, tk_len);
+        let ptk = derive_ptk(
+            hmac,
+            pmk,
+            &self.aa,
+            &self.sa,
+            &self.anonce,
+            &self.snonce,
+            tk_len,
+        );
 
         // M2: Pairwise set, MIC set (computed across the EAPOL frame
         // with MIC field zeroed), Install/ACK clear, Replay counter

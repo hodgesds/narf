@@ -49,9 +49,9 @@
 use alloc::vec::Vec;
 
 use narf_crypto::hkdf::{hkdf_expand, hkdf_extract};
+use narf_crypto::p256::p256_hash_to_curve;
 use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
-use narf_crypto::p256::p256_hash_to_curve;
 use narf_crypto::sha256::Sha256;
 
 /// Domain Separation Tag for SAE Hash-to-Element on P-256.
@@ -101,7 +101,11 @@ pub fn pt_h2e(ssid: &str, password: &str, identifier: Option<&str>) -> AffinePoi
 pub fn pwe_from_pt(pt: AffinePoint, mac_a: &[u8; 6], mac_b: &[u8; 6]) -> AffinePoint {
     // Canonical MAC pair ordering (§12.4.4.2.3 step 5): the higher MAC
     // sorts first. Match `dragonfly::order_mac_pair`.
-    let (high, low) = if mac_a > mac_b { (mac_a, mac_b) } else { (mac_b, mac_a) };
+    let (high, low) = if mac_a > mac_b {
+        (mac_a, mac_b)
+    } else {
+        (mac_b, mac_a)
+    };
 
     // Step 6: salt = SHA-256(high || low).
     let mut salt_in: Vec<u8> = Vec::with_capacity(12);

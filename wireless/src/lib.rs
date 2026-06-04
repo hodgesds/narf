@@ -305,7 +305,11 @@ mod tests {
         use crate::mlme::{iter_ies, write_ie, ElementId};
         let mut buf = Vec::new();
         write_ie(&mut buf, ElementId::Ssid, b"narf");
-        write_ie(&mut buf, ElementId::SupportedRates, &[0x82, 0x84, 0x8B, 0x96]);
+        write_ie(
+            &mut buf,
+            ElementId::SupportedRates,
+            &[0x82, 0x84, 0x8B, 0x96],
+        );
         let ies: Vec<_> = iter_ies(&buf).collect();
         if ies.len() != 2 {
             return TestResult::Fail("expected 2 IEs back from iter");
@@ -380,8 +384,7 @@ mod tests {
 
     fn smoke_eapol_key_frame_round_trip() -> TestResult {
         use crate::eapol::{
-            KeyFrame, KEY_DESCRIPTOR_RSN, KI_INSTALL, KI_KEY_ACK, KI_KEY_MIC,
-            KI_KEY_TYPE_PAIRWISE,
+            KeyFrame, KEY_DESCRIPTOR_RSN, KI_INSTALL, KI_KEY_ACK, KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE,
         };
         // 16-byte MIC (HMAC-SHA1 AKM) — typical WPA2-Personal.
         let mut k = KeyFrame::empty(16);
@@ -457,7 +460,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("wireless/eapol", smoke_eapol_prf_extends_to_requested_length);
+    kernel_test_in!(
+        "wireless/eapol",
+        smoke_eapol_prf_extends_to_requested_length
+    );
 
     fn smoke_eapol_derive_ptk_splits_kck_kek_tk() -> TestResult {
         use crate::eapol::derive_ptk;
@@ -856,10 +862,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "wireless/ccmp",
-        smoke_ccmp_replay_window_rejects_regression
-    );
+    kernel_test_in!("wireless/ccmp", smoke_ccmp_replay_window_rejects_regression);
 
     /// Identity AES-CCM stub: encrypt = no-op + zero MIC; decrypt =
     /// accept iff MIC is zero. Production wires AES-128-CCM from
@@ -901,8 +904,8 @@ mod tests {
         let mut body = plaintext.to_vec();
         let mut wire = protect(&StubCcm, &hdr, &key, 1, 0, 0, false, &mut body);
         let mut replay = ReplayWindow::default();
-        let recovered = unprotect(&StubCcm, &hdr, &key, 0, false, &mut replay, &mut wire)
-            .expect("unprotect");
+        let recovered =
+            unprotect(&StubCcm, &hdr, &key, 0, false, &mut replay, &mut wire).expect("unprotect");
         if recovered != plaintext {
             return TestResult::Fail("CCMP round-trip lost plaintext");
         }

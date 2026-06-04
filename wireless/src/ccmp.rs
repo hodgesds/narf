@@ -132,12 +132,7 @@ pub fn decode_ccmp_header(hdr: &[u8; CCMP_HDR_LEN]) -> Result<(u64, u8), CcmpErr
 ///
 /// `priority` is the QoS TID (or 0 for non-QoS). `mgmt` is `true`
 /// for management frames. `a2` is the transmitter MAC.
-pub fn build_nonce(
-    priority: u8,
-    mgmt: bool,
-    a2: &[u8; 6],
-    pn: u64,
-) -> [u8; CCMP_NONCE_LEN] {
+pub fn build_nonce(priority: u8, mgmt: bool, a2: &[u8; 6], pn: u64) -> [u8; CCMP_NONCE_LEN] {
     let mut nonce = [0u8; CCMP_NONCE_LEN];
     nonce[0] = (priority & 0x0F) | ((mgmt as u8) << 4);
     nonce[1..7].copy_from_slice(a2);

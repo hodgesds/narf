@@ -49,9 +49,7 @@ use alloc::vec::Vec;
 use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
 
-use super::dragonfly::{
-    CommitFrame, ConfirmFrame, HmacSha256, MacPrimitive, SaeError, SaeState,
-};
+use super::dragonfly::{CommitFrame, ConfirmFrame, HmacSha256, MacPrimitive, SaeError, SaeState};
 use super::pt::{pt_h2e, pwe_from_pt, pwe_valid};
 
 /// SAE sync-retry limit (§12.4.8.6.4: `dot11RSNASAESync`, default 5).
@@ -208,10 +206,7 @@ impl SaeSession {
         let mut out = Vec::with_capacity(2 + 32 + 64);
         out.extend_from_slice(&19u16.to_le_bytes()); // Group 19 = P-256
         out.extend_from_slice(&commit_scalar.to_bytes_be());
-        let enc = self
-            .commit_element
-            .to_encoded()
-            .unwrap_or([0u8; 64]);
+        let enc = self.commit_element.to_encoded().unwrap_or([0u8; 64]);
         out.extend_from_slice(&enc);
         out
     }
@@ -223,8 +218,7 @@ impl SaeSession {
             return Err(SaeError::Protocol);
         }
         // Decode the SAE Commit variable body.
-        let frame =
-            CommitFrame::decode(peer_commit, 32, 64).ok_or(SaeError::InvalidParameters)?;
+        let frame = CommitFrame::decode(peer_commit, 32, 64).ok_or(SaeError::InvalidParameters)?;
         if frame.group != 19 {
             // §12.4.7.4 + §9.4.1.9: rejection signalled at the SAE
             // status layer (status 77). At this API surface we just
@@ -238,8 +232,8 @@ impl SaeSession {
         let mut s_buf = [0u8; 32];
         s_buf.copy_from_slice(&frame.scalar);
         let peer_scalar = Scalar::from_bytes_be(&s_buf).ok_or(SaeError::InvalidParameters)?;
-        let peer_element = AffinePoint::from_encoded(&frame.element)
-            .ok_or(SaeError::InvalidParameters)?;
+        let peer_element =
+            AffinePoint::from_encoded(&frame.element).ok_or(SaeError::InvalidParameters)?;
         if peer_element.infinity {
             return Err(SaeError::InvalidParameters);
         }
@@ -438,8 +432,7 @@ mod session_tests {
     fn smoke_sae_session_commit_frame_layout() -> TestResult {
         // §9.4.1.36 / Table 9-72: Commit body = group(2 LE) || scalar(32)
         // || element(64). build_commit emits exactly that layout.
-        let mut s =
-            SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0x33; 64]);
+        let mut s = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0x33; 64]);
         let body = s.build_commit();
         if body.len() != 2 + 32 + 64 {
             return TestResult::Fail("Commit body length should be 98");
@@ -456,10 +449,8 @@ mod session_tests {
 
     fn smoke_sae_session_confirm_frame_layout() -> TestResult {
         // §9.4.1.36: Confirm body = send-confirm(2 LE) || MAC(32 for HMAC-SHA256).
-        let mut a =
-            SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
-        let mut b =
-            SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
+        let mut a = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
+        let mut b = SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
         let commit_a = a.build_commit();
         let commit_b = b.build_commit();
         a.on_commit(&commit_b).expect("a on_commit");
@@ -480,10 +471,8 @@ mod session_tests {
     fn smoke_sae_session_full_handshake_pmk_agrees() -> TestResult {
         // End-to-end: A and B share (ssid, password); both reach
         // Accepted; both PMKs match.
-        let mut a =
-            SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
-        let mut b =
-            SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
+        let mut a = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
+        let mut b = SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
         let commit_a = a.build_commit();
         let commit_b = b.build_commit();
         a.on_commit(&commit_b).expect("a on_commit");
@@ -518,10 +507,9 @@ mod session_tests {
         // A and B use different passwords. The Commit exchange still
         // produces a (different) K on each side; Confirm verification
         // must then fail on at least one side.
-        let mut a = SaeSession::new("net", "alpha", [0x11; 6], [0x22; 6])
-            .with_test_seed([0xAA; 64]);
-        let mut b =
-            SaeSession::new("net", "beta", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
+        let mut a =
+            SaeSession::new("net", "alpha", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
+        let mut b = SaeSession::new("net", "beta", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
         let commit_a = a.build_commit();
         let commit_b = b.build_commit();
         // on_commit succeeds because it's just curve arithmetic; the
@@ -538,7 +526,10 @@ mod session_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("wireless/sae", smoke_sae_session_password_mismatch_fails_confirm);
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_session_password_mismatch_fails_confirm
+    );
 
     fn smoke_sae_session_state_machine_rejects_premature_confirm() -> TestResult {
         // build_confirm before on_commit must not advance state.
@@ -576,10 +567,8 @@ mod session_tests {
         // straight-through observation: both PMKs match (covered by
         // the full-handshake smoke); the structural property is that
         // the PWE byte form is identical on both sides.
-        let mut a =
-            SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
-        let mut b =
-            SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
+        let mut a = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
+        let mut b = SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
         // Both call build_commit, which derives PWE first.
         let _ = a.build_commit();
         let _ = b.build_commit();
@@ -601,10 +590,8 @@ mod session_tests {
     fn smoke_sae_session_pmk_is_32_bytes() -> TestResult {
         // SAE produces a 256-bit PMK (HKDF expand to 64 bytes total,
         // split into KCK 32 || PMK 32).
-        let mut a =
-            SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
-        let mut b =
-            SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
+        let mut a = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0xAA; 64]);
+        let mut b = SaeSession::new("net", "pw", [0x22; 6], [0x11; 6]).with_test_seed([0xBB; 64]);
         let ca = a.build_commit();
         let cb = b.build_commit();
         a.on_commit(&cb).expect("a");

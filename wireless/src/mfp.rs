@@ -151,8 +151,7 @@ pub fn protect_outbound(
     // but the prepass needs the right KeyID/IPN bytes — write them now.
     let mmie_body_off = start_of_mmie + mmie_header_len;
     body[mmie_body_off..mmie_body_off + 2].copy_from_slice(&igtk.key_id.to_le_bytes());
-    body[mmie_body_off + 2..mmie_body_off + 8]
-        .copy_from_slice(&bip_cmac::encode_ipn(ipn));
+    body[mmie_body_off + 2..mmie_body_off + 8].copy_from_slice(&bip_cmac::encode_ipn(ipn));
     // MIC bytes already zero.
 
     let mic = bip_cmac::compute_mic(igtk, &aad, body);
@@ -201,9 +200,7 @@ pub fn verify_inbound<'a>(
     probe.extend(core::iter::repeat(0u8).take(BIP_MIC_LEN)); // MIC zeroed
 
     let aad = build_bip_aad(hdr_24).map_err(MfpError::from)?;
-    let igtk = store
-        .find_by_key_id_mut(key_id)
-        .ok_or(MfpError::NoMmie)?;
+    let igtk = store.find_by_key_id_mut(key_id).ok_or(MfpError::NoMmie)?;
     bip_cmac::verify_mic(igtk, &aad, &probe, &mic).map_err(MfpError::from)?;
     bip_cmac::ipn_check_and_update(igtk, ipn).map_err(MfpError::from)?;
     Ok(&body[..split])

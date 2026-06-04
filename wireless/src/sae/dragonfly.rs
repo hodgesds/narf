@@ -101,8 +101,12 @@ pub trait EccGroup {
     ///
     /// `password` is the SSID-keyed pass-phrase or 32-byte PMK; the
     /// implementation owns the hash-to-element derivation per §12.4.4.
-    fn make_commit(&mut self, password: &[u8], peer_mac: &[u8; 6], own_mac: &[u8; 6])
-        -> (Vec<u8>, Vec<u8>);
+    fn make_commit(
+        &mut self,
+        password: &[u8],
+        peer_mac: &[u8; 6],
+        own_mac: &[u8; 6],
+    ) -> (Vec<u8>, Vec<u8>);
 
     /// Compute the shared secret `K = scalar(rand, peer_element + scalar(peer_scalar, pwe))`
     /// using the local `rand` saved from `make_commit`. Returns a
@@ -228,7 +232,9 @@ impl<G: EccGroup, M: MacPrimitive> Sae<G, M> {
     /// Build our outgoing Commit frame. Drives `make_commit` on the
     /// underlying group.
     pub fn build_commit(&mut self, password: &[u8]) -> CommitFrame {
-        let (scalar, element) = self.group.make_commit(password, &self.peer_mac, &self.own_mac);
+        let (scalar, element) = self
+            .group
+            .make_commit(password, &self.peer_mac, &self.own_mac);
         self.local_scalar = scalar.clone();
         self.local_element = element.clone();
         self.state = SaeState::Committed;
@@ -694,10 +700,7 @@ impl EccGroup for P256Group {
         };
 
         let s_bytes = commit_scalar.to_bytes_be().to_vec();
-        let e_bytes = commit_element
-            .to_encoded()
-            .unwrap_or([0u8; 64])
-            .to_vec();
+        let e_bytes = commit_element.to_encoded().unwrap_or([0u8; 64]).to_vec();
         (s_bytes, e_bytes)
     }
 
@@ -983,7 +986,10 @@ mod hp_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("wireless/sae", smoke_sae_h2p_converges_within_iteration_floor);
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_h2p_converges_within_iteration_floor
+    );
 
     fn smoke_sae_h2p_iteration_floor_is_constant() -> TestResult {
         // The constant-time discipline: the loop MUST run the full
@@ -1006,16 +1012,12 @@ mod hp_tests {
         // Pick a password we know converges quickly (counter <= 4
         // for most inputs).
         let mut g1 = P256Group::new();
-        let (_e1, c1) = g1
-            .hunt_and_peck(b"narfwifi", &mac_a, &mac_b)
-            .expect("h2p");
+        let (_e1, c1) = g1.hunt_and_peck(b"narfwifi", &mac_a, &mac_b).expect("h2p");
         // Re-running on the same password must give the same first-success
         // counter (deterministic) — confirms our save-first-then-keep-going
         // logic.
         let mut g2 = P256Group::new();
-        let (_e2, c2) = g2
-            .hunt_and_peck(b"narfwifi", &mac_a, &mac_b)
-            .expect("h2p");
+        let (_e2, c2) = g2.hunt_and_peck(b"narfwifi", &mac_a, &mac_b).expect("h2p");
         if c1 != c2 {
             return TestResult::Fail("h2p must be deterministic on (pwd, MACs)");
         }
@@ -1123,8 +1125,16 @@ mod hp_tests {
         let cs_b = rand_b.add(&mask_b);
         let mpa = scalar_mul(&mask_a, &pwe);
         let mpb = scalar_mul(&mask_b, &pwe);
-        let cea = AffinePoint { x: mpa.x, y: mpa.y.neg(), infinity: false };
-        let ceb = AffinePoint { x: mpb.x, y: mpb.y.neg(), infinity: false };
+        let cea = AffinePoint {
+            x: mpa.x,
+            y: mpa.y.neg(),
+            infinity: false,
+        };
+        let ceb = AffinePoint {
+            x: mpb.x,
+            y: mpb.y.neg(),
+            infinity: false,
+        };
 
         // A's view: term1 = cs_b * PWE; sum = term1 + ceb.
         let term1_a = scalar_mul(&cs_b, &pwe);
@@ -1252,7 +1262,10 @@ mod hp_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("wireless/sae", smoke_sae_group_finish_agrees_on_shared_secret);
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_group_finish_agrees_on_shared_secret
+    );
 
     fn smoke_sae_handshake_pmk_agrees_on_both_sides() -> TestResult {
         // Once the handshake completes both peers must hold the same
