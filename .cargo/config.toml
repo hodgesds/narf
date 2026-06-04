@@ -20,19 +20,50 @@
 
 # Path remapping for reproducible builds (build/ §4).
 # SOURCE_DATE_EPOCH covers timestamps; this covers absolute paths in debug info.
-# Worktree-local override (Wave-64): rustflags arrays emptied per
-# task hard-constraint #2 ("Fix rustflags first"). The kernel build
-# is driven from the main worktree; this isolated worktree only needs
-# to compile narf-userspace + smoke tests on the host target.
-
 [build]
-rustflags = []
+# xtask/ always runs on the host; narf/ crates run on the kernel target.
+# No default target here — `cargo xtask run --arch=x86_64` sets it per command.
+rustflags = [
+    "--remap-path-prefix", ".=.",
+]
 
+# ─── x86_64 kernel target ──────────────────────────────────────────
+# CPU feature flags (per build/ §4) that *must* be added to unlock the
+# domain-switch intrinsics are gated: +pks and +userintrins are still
+# LLVM-nightly features. They'll be added once upstream stabilises in a
+# nightly we can pin; until then Stage 1 runs on the plain x86-64 baseline.
 [target.x86_64-unknown-none]
-rustflags = []
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    "-C", "link-arg=-Tbuild/linker/x86_64.ld",
+    "-C", "link-arg=--gc-sections",
+    "-Z", "plt=no",
+    # curve25519: same as poly1305.
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+    # poly1305: same as curve25519.
+    "--cfg", "poly1305_force_soft",
+    # aes: same as curve25519/poly1305.
+    "--cfg", "aes_force_soft",
+    # polyval (ghash backend for aes-gcm): same family of SIMD issues as
+    # poly1305/aes under code-model=kernel. Pin the soft path.
+    "--cfg", "polyval_force_soft",
+]
 
+# ─── aarch64 kernel target ─────────────────────────────────────────
+# MTE and pointer-auth flags are Stage 2+ and gated similarly.
+# +lse enables ARMv8.1 Large System Extensions (CASP, LDADD, …) —
+# required for the 128-bit cap-slot compare-and-swap in arch/asm.rs.
+# QEMU `-cpu max` exposes v8.6+, and every server-class arm64 CPU
+# since Cortex-A75 / Neoverse has LSE. Stage-1/2 don't need it.
 [target.aarch64-unknown-none]
-rustflags = []
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=large",
+    "-C", "target-feature=+lse",
+    "-C", "link-arg=-Tbuild/linker/aarch64.ld",
+    "-C", "link-arg=--gc-sections",
+]
 
 # ─── Alias shortcuts ───────────────────────────────────────────────
 # Mirrors build/ §3 xtask interface, usable as raw cargo for debugging:
