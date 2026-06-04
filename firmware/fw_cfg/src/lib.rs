@@ -156,10 +156,7 @@ pub fn select(key: u16) {
     // valid 16-byte device window. The selector register is at
     // offset 8 and accepts 16-bit writes.
     unsafe {
-        core::ptr::write_volatile(
-            (base + MMIO_OFFSET_SELECTOR) as *mut u16,
-            be,
-        );
+        core::ptr::write_volatile((base + MMIO_OFFSET_SELECTOR) as *mut u16, be);
     }
 }
 

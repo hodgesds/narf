@@ -556,7 +556,8 @@ fn smoke_firmware_hybrid_rootfs_shadows_initramfs() -> TestResult {
     let cpio_path = alloc::format!("firmware/{}", BLOB_NAME);
     let archive = make_cpio_newc(&[(cpio_path.as_str(), &init_blob)]);
     let archive_static: &'static [u8] = alloc::boxed::Box::leak(archive.into_boxed_slice());
-    let fs = match narf_filesystem::Initramfs::from_cpio("hybrid-shadow-initramfs", archive_static) {
+    let fs = match narf_filesystem::Initramfs::from_cpio("hybrid-shadow-initramfs", archive_static)
+    {
         Ok(f) => f,
         Err(_) => return TestResult::Fail("CPIO parse"),
     };

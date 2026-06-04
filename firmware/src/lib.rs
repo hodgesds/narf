@@ -569,12 +569,10 @@ pub fn scan_rootfs(auth: &Cap<FirmwareRegistry, Write>) -> Result<usize, Firmwar
 
     // Walk lib → firmware asynchronously (ext2/ext4 lookups are async;
     // block_on bridges from the sync initcall context).
-    let lib_dir =
-        narf_scheduler::block_on(root_dir.lookup_dir_async("lib"))
-            .map_err(|_| FirmwareError::NotFound)?;
-    let lib_firmware_dir =
-        narf_scheduler::block_on(lib_dir.lookup_dir_async("firmware"))
-            .map_err(|_| FirmwareError::NotFound)?;
+    let lib_dir = narf_scheduler::block_on(root_dir.lookup_dir_async("lib"))
+        .map_err(|_| FirmwareError::NotFound)?;
+    let lib_firmware_dir = narf_scheduler::block_on(lib_dir.lookup_dir_async("firmware"))
+        .map_err(|_| FirmwareError::NotFound)?;
 
     walk_and_register_dir(lib_firmware_dir, String::new(), BlobSource::Rootfs, auth)
 }
@@ -605,8 +603,7 @@ fn walk_and_register_dir(
     // version ext2/ext4 implements; the sync `iter()` returns empty
     // for disk-backed FSes (DirOps::iter contract).
     let entries: Vec<(String, narf_filesystem::FileType)> =
-        narf_scheduler::block_on(dir.enumerate_async(0, usize::MAX))
-            .unwrap_or_default();
+        narf_scheduler::block_on(dir.enumerate_async(0, usize::MAX)).unwrap_or_default();
 
     for (name, file_type) in entries {
         // Skip the two POSIX self/parent entries.
@@ -622,9 +619,7 @@ fn walk_and_register_dir(
         match file_type {
             narf_filesystem::FileType::Dir => {
                 // Descend into subdirectory.
-                let subdir = narf_scheduler::block_on(
-                    dir.lookup_dir_async(&name),
-                );
+                let subdir = narf_scheduler::block_on(dir.lookup_dir_async(&name));
                 match subdir {
                     Ok(d) => {
                         match walk_and_register_dir(d, canonical, source, auth) {
@@ -653,8 +648,7 @@ fn walk_and_register_dir(
                     continue;
                 }
                 let mut buf: Vec<u8> = alloc::vec![0u8; size];
-                let n_read = narf_scheduler::block_on(file.read(0, &mut buf))
-                    .unwrap_or(0);
+                let n_read = narf_scheduler::block_on(file.read(0, &mut buf)).unwrap_or(0);
                 if n_read == 0 {
                     continue;
                 }
@@ -664,8 +658,7 @@ fn walk_and_register_dir(
                 // can keep it for the kernel's lifetime. The blob
                 // bytes are copied by `install_blob` into DMA-coherent
                 // memory, so `buf` may be dropped after the call.
-                let name_static: &'static str =
-                    alloc::boxed::Box::leak(canonical.into_boxed_str());
+                let name_static: &'static str = alloc::boxed::Box::leak(canonical.into_boxed_str());
                 match registry::install_blob(name_static, &buf, source) {
                     Ok(()) => n_ok += 1,
                     Err(_) => {

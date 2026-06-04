@@ -8,9 +8,9 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+use crate::{decode_file_entry, FwCfgFile, FILE_ENTRY_SIZE, FILE_NAME_LEN, MAGIC};
 #[cfg(target_arch = "x86_64")]
 use crate::{find, is_present, read_directory, read_string};
-use crate::{decode_file_entry, FwCfgFile, FILE_ENTRY_SIZE, FILE_NAME_LEN, MAGIC};
 
 // 1. Live presence — QEMU always exposes fw_cfg under `cargo xtask
 //    test`. Skip cleanly on bare-metal / non-QEMU runs.
@@ -198,7 +198,4 @@ fn smoke_fw_cfg_mmio_selector_is_big_endian() -> TestResult {
     TestResult::Pass
 }
 #[cfg(not(target_arch = "x86_64"))]
-kernel_test_in!(
-    "firmware/fw_cfg",
-    smoke_fw_cfg_mmio_selector_is_big_endian
-);
+kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_mmio_selector_is_big_endian);
