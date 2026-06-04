@@ -1091,6 +1091,18 @@ impl AddressSpace {
             child.map_region(r)?;
         }
 
+        // Wave-49fu: inherit the parent's mmap_cursor. Without this
+        // the child's first malloc-driven mmap (heap grow_heap) picks
+        // MMAP_CURSOR_BASE — which already overlaps a parent-mmap'd
+        // region the child just cloned — and map_region fails with
+        // Overlap, breaking libc's malloc in the post-fork child.
+        let parent_cursor = self
+            .mmap_cursor
+            .load(core::sync::atomic::Ordering::Relaxed);
+        child
+            .mmap_cursor
+            .store(parent_cursor, core::sync::atomic::Ordering::Relaxed);
+
         Ok(child)
     }
 
