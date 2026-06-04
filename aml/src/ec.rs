@@ -537,8 +537,14 @@ fn smoke_aml_ec_decode_default_ports_from_fixed_io() -> TestResult {
     // port FIRST then status/cmd. Standard PC defaults are
     // 0x62 (data) + 0x66 (status/cmd).
     let items = alloc::vec![
-        ResourceItem::FixedIo { base: 0x62, length: 1 },
-        ResourceItem::FixedIo { base: 0x66, length: 1 },
+        ResourceItem::FixedIo {
+            base: 0x62,
+            length: 1
+        },
+        ResourceItem::FixedIo {
+            base: 0x66,
+            length: 1
+        },
         ResourceItem::EndTag,
     ];
     match decode_ports_from_crs(&items) {
@@ -554,8 +560,20 @@ fn smoke_aml_ec_decode_non_default_ports_from_io_range() -> TestResult {
     // 1-byte length and a min == max. Decoder must accept both.
     // Pick non-default ports to make sure we're not just lucky.
     let items = alloc::vec![
-        ResourceItem::Io { info: 0, min: 0x80, max: 0x80, alignment: 1, length: 1 },
-        ResourceItem::Io { info: 0, min: 0x84, max: 0x84, alignment: 1, length: 1 },
+        ResourceItem::Io {
+            info: 0,
+            min: 0x80,
+            max: 0x80,
+            alignment: 1,
+            length: 1
+        },
+        ResourceItem::Io {
+            info: 0,
+            min: 0x84,
+            max: 0x84,
+            alignment: 1,
+            length: 1
+        },
         ResourceItem::EndTag,
     ];
     match decode_ports_from_crs(&items) {
@@ -577,7 +595,10 @@ kernel_test_in!(
 fn smoke_aml_ec_decode_rejects_single_port() -> TestResult {
     // Only one IO descriptor — must NOT bind (we need both).
     let items = alloc::vec![
-        ResourceItem::FixedIo { base: 0x62, length: 1 },
+        ResourceItem::FixedIo {
+            base: 0x62,
+            length: 1
+        },
         ResourceItem::EndTag,
     ];
     if decode_ports_from_crs(&items).is_some() {

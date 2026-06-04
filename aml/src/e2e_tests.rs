@@ -203,7 +203,7 @@ fn e2e_aml_if_else_control_flow() -> TestResult {
     // Predicate: LGreater(Arg0, 50) = [0x94, 0x68, 0x0A, 0x32]
     let if_body: &[u8] = &[0xA4, 0x01]; // Return(One)
     let pred: &[u8] = &[0x94, 0x68, 0x0A, 0x32]; // LGreater(Arg0, 50)
-    // PkgLength for If: includes the PkgLen byte + pred + if_body
+                                                 // PkgLength for If: includes the PkgLen byte + pred + if_body
     let if_content = pred.len() + if_body.len();
 
     let mut body = alloc::vec::Vec::new();
@@ -329,7 +329,7 @@ fn e2e_aml_sysmem_opregion_via_method() -> TestResult {
     // `read_name_string` in the evaluator resolves against method scope "\\"
     // so a bare NameSeg b"E7F0" resolves to "\\E7F0".
     let method_body: &[u8] = &[
-        0xA4,                    // ReturnOp
+        0xA4, // ReturnOp
         b'E', b'7', b'F', b'0', // NameSeg (4-char, relative)
     ];
     let meth = method_blob(b"E07_", 0, method_body);
@@ -838,9 +838,9 @@ fn e2e_aml_notify_dispatches_to_handler() -> TestResult {
 
     // Method(\E13_, 0) { NotifyOp \E13T BytePrefix(0x80) }
     let method_body: &[u8] = &[
-        0x86,                            // NotifyOp
-        b'\\', b'E', b'1', b'3', b'T',  // \E13T
-        0x0A, 0x80,                      // BytePrefix 0x80
+        0x86, // NotifyOp
+        b'\\', b'E', b'1', b'3', b'T', // \E13T
+        0x0A, 0x80, // BytePrefix 0x80
     ];
     let meth = method_blob(b"E13_", 0, method_body);
 
@@ -973,9 +973,7 @@ fn e2e_aml_concatenate_buffers() -> TestResult {
     ];
     let buf_bb: &[u8] = &[
         0x11, // BufferOp
-        0x04,
-        0x0A, 0x01,
-        0xBB,
+        0x04, 0x0A, 0x01, 0xBB,
     ];
 
     // Method body: ReturnOp ConcatOp buf_aa buf_bb ZeroOp(target)
@@ -1156,12 +1154,11 @@ fn e2e_aml_mutex_critical_section() -> TestResult {
     //   Return(One)
     // }
     let method_body: &[u8] = &[
-        0x5B, 0x23,              // AcquireOp
+        0x5B, 0x23, // AcquireOp
         b'\\', b'E', b'1', b'8', b'M', // \E18M
-        0xFF, 0xFF,              // timeout 0xFFFF
-        0x5B, 0x27,              // ReleaseOp
-        b'\\', b'E', b'1', b'8', b'M',
-        0xA4, 0x01,              // Return(One)
+        0xFF, 0xFF, // timeout 0xFFFF
+        0x5B, 0x27, // ReleaseOp
+        b'\\', b'E', b'1', b'8', b'M', 0xA4, 0x01, // Return(One)
     ];
     let meth = method_blob(b"E18_", 0, method_body);
     blob.extend_from_slice(&meth);

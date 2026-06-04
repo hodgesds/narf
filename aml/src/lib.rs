@@ -58,8 +58,8 @@ pub mod resource;
 pub mod sync;
 pub mod wmi;
 
-mod tests;
 mod e2e_tests;
+mod tests;
 
 /// Run-time AML value, used by the method evaluator + Field
 /// accessors. `Name(...)` flat-constant decoding stays in
@@ -270,10 +270,8 @@ static BOOT_DEVICE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 /// which on real silicon with 100s of AML devices was both slow
 /// and a lock-contention hazard (IrqSafeSpinLock disables IF on
 /// the waiter; the executor would freeze).
-static BOOT_AMDI001X_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-static BOOT_PNP0C50_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static BOOT_AMDI001X_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BOOT_PNP0C50_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Number of direct AML children under any AMDI*/AMD0* I2C
 /// controller. Populated by `dump_amd_i2c_subtree`. Exposed via
 /// `boot_amdi_children_count` so the FB status panel can show "are
@@ -390,8 +388,8 @@ pub fn capture_boot_snapshot() {
 /// from `AMD_FCH_HIDS` and (b) which touchpad vendor `_HID` to
 /// add to the i2c-hid bind whitelist.
 pub fn dump_i2c_slaves() {
-    use core::fmt::Write as _;
     use crate::resource::ResourceItem;
+    use core::fmt::Write as _;
     let device_paths = list_all_device_paths();
     let mut any = false;
     for path in device_paths.iter() {
@@ -408,11 +406,7 @@ pub fn dump_i2c_slaves() {
                 ..
             } = item
             {
-                i2c = Some((
-                    *slave_address,
-                    *connection_speed,
-                    resource_source.clone(),
-                ));
+                i2c = Some((*slave_address, *connection_speed, resource_source.clone()));
                 break;
             }
         }
@@ -609,10 +603,7 @@ pub fn find_node_by_suffix(path: &str) -> Option<AmlNode> {
         s
     };
     let g = NAMESPACE.lock();
-    g.nodes
-        .iter()
-        .find(|n| n.path.ends_with(&needle))
-        .cloned()
+    g.nodes.iter().find(|n| n.path.ends_with(&needle)).cloned()
 }
 
 /// Iterate every Device node, calling `f` with its path.
@@ -656,11 +647,7 @@ pub fn for_each_node<F: FnMut(&AmlNode)>(mut f: F) {
 pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
     let snapshot: alloc::vec::Vec<AmlNode> = {
         let g = NAMESPACE.lock();
-        g.nodes
-            .iter()
-            .filter(|n| n.kind == kind)
-            .cloned()
-            .collect()
+        g.nodes.iter().filter(|n| n.kind == kind).cloned().collect()
     };
     for n in &snapshot {
         f(n);
@@ -788,7 +775,11 @@ pub fn eisa_id_from_u32(v: u32) -> alloc::string::String {
     let h2 = ((v >> 28) & 0xF) as u8;
     let h3 = ((v >> 24) & 0xF) as u8;
     fn nyb(n: u8) -> char {
-        if n < 10 { (b'0' + n) as char } else { (b'A' + n - 10) as char }
+        if n < 10 {
+            (b'0' + n) as char
+        } else {
+            (b'A' + n - 10) as char
+        }
     }
     let mut s = alloc::string::String::with_capacity(7);
     s.push(((l1 - 1) + b'A') as char);
@@ -1404,8 +1395,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::Device,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1426,8 +1417,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::Processor,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1448,8 +1439,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::PowerResource,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1468,8 +1459,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::ThermalZone,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1487,8 +1478,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::Mutex,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                     }
@@ -1500,8 +1491,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::Event,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                     }
@@ -1514,8 +1505,8 @@ fn parse_term_list_inner(
                             kind: NodeKind::OpRegion,
                             value: None,
                             method_body: (0, 0),
-                    method_flags: 0,
-                    buffer_field: None,
+                            method_flags: 0,
+                            buffer_field: None,
                         });
                         *count += 1;
                         // Try to decode RegionSpace + TermArg×2 and register
@@ -1689,11 +1680,11 @@ fn parse_term_list_inner(
                 let fpath = full_path(fname, parent);
                 if let Some(src) = src_path {
                     let (bit_offset, bit_length) = match opc {
-                        0x8D => (idx, 1),       // CreateBitField
-                        0x8C => (idx * 8, 8),   // CreateByteField
-                        0x8B => (idx * 8, 16),  // CreateWordField
-                        0x8A => (idx * 8, 32),  // CreateDWordField
-                        0x8F => (idx * 8, 64),  // CreateQWordField
+                        0x8D => (idx, 1),      // CreateBitField
+                        0x8C => (idx * 8, 8),  // CreateByteField
+                        0x8B => (idx * 8, 16), // CreateWordField
+                        0x8A => (idx * 8, 32), // CreateDWordField
+                        0x8F => (idx * 8, 64), // CreateQWordField
                         _ => unreachable!(),
                     };
                     register_buffer_field(&fpath, &src, bit_offset, bit_length);
@@ -1744,8 +1735,7 @@ fn read_simple_uint(p: &mut Parser<'_>) -> Result<u64, AmlError> {
         QWORD_PREFIX => {
             let bytes = p.slice_n(8)?;
             u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])
         }
         _ => 0,
@@ -1935,11 +1925,7 @@ fn read_pkg_length_at(buf: &[u8], cur: &mut usize) -> Result<usize, AmlError> {
 /// (or concatenated for DualName / MultiName). RootChar prefix
 /// (`\`) and ParentPrefix (`^`) are stripped; predicates use
 /// short relative names overwhelmingly.
-fn read_name_string_inline(
-    buf: &[u8],
-    cur: &mut usize,
-    end: usize,
-) -> Result<String, AmlError> {
+fn read_name_string_inline(buf: &[u8], cur: &mut usize, end: usize) -> Result<String, AmlError> {
     let mut name = String::new();
     if *cur >= end {
         return Err(AmlError::Truncated);

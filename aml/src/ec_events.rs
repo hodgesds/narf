@@ -27,8 +27,7 @@ pub type QxxHandler = fn(idx: u8);
 
 /// 256 slots — one per possible `_Qxx` index (0-255). `None` means
 /// "no handler registered; ignore the event".
-static QXX_HANDLERS: IrqSafeSpinLock<[Option<QxxHandler>; 256]> =
-    IrqSafeSpinLock::new([None; 256]);
+static QXX_HANDLERS: IrqSafeSpinLock<[Option<QxxHandler>; 256]> = IrqSafeSpinLock::new([None; 256]);
 
 /// Register `h` to fire whenever the EC reports query index `idx`.
 /// Idempotent — registering a second time replaces the previous

@@ -530,8 +530,8 @@ fn smoke_buttons_notify_dispatch_on_pnp0c0d() -> TestResult {
     let method_body: Vec<u8> = {
         let mut v: Vec<u8> = Vec::new();
         v.push(0xA4); // ReturnOp
-        // Fully-qualified NameString \LID.STAT:
-        //   ROOT '\\' + DualNamePrefix 0x2E + "LID_" + "STAT"
+                      // Fully-qualified NameString \LID.STAT:
+                      //   ROOT '\\' + DualNamePrefix 0x2E + "LID_" + "STAT"
         v.push(b'\\');
         v.push(0x2E);
         v.extend_from_slice(b"LID_");

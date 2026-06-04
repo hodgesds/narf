@@ -452,8 +452,8 @@ fn smoke_aml_resource_i2c_serial_bus_10bit() -> TestResult {
     buf.extend_from_slice(res_src);
     buf.extend_from_slice(&[0x79, 0x00]);
 
-    let items = crate::resource::decode_resource_template(&buf)
-        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    let items =
+        crate::resource::decode_resource_template(&buf).unwrap_or_else(|_| alloc::vec::Vec::new());
     match items.first() {
         Some(crate::resource::ResourceItem::I2cSerialBus {
             addr_10bit: true,
@@ -506,15 +506,15 @@ fn smoke_aml_resource_gpio_int_decode() -> TestResult {
     buf.extend_from_slice(&res_off.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes()); // vendor data offset
     buf.extend_from_slice(&0u16.to_le_bytes()); // vendor data length
-    // Pin Table: pin 130
+                                                // Pin Table: pin 130
     buf.extend_from_slice(&130u16.to_le_bytes());
     // ResourceSource
     buf.extend_from_slice(res_src);
     // EndTag
     buf.extend_from_slice(&[0x79, 0x00]);
 
-    let items = crate::resource::decode_resource_template(&buf)
-        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    let items =
+        crate::resource::decode_resource_template(&buf).unwrap_or_else(|_| alloc::vec::Vec::new());
     match items.first() {
         Some(crate::resource::ResourceItem::GpioInt {
             level_triggered: false,
@@ -572,8 +572,8 @@ fn smoke_aml_resource_gpio_io_decode() -> TestResult {
     buf.extend_from_slice(res_src);
     buf.extend_from_slice(&[0x79, 0x00]);
 
-    let items = crate::resource::decode_resource_template(&buf)
-        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    let items =
+        crate::resource::decode_resource_template(&buf).unwrap_or_else(|_| alloc::vec::Vec::new());
     match items.first() {
         Some(crate::resource::ResourceItem::GpioIo {
             shared: false,
@@ -607,14 +607,17 @@ fn smoke_aml_resource_serial_bus_unknown_type_falls_through() -> TestResult {
     buf.extend_from_slice(&[0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
     buf.extend_from_slice(&[0x79, 0x00]);
 
-    let items = crate::resource::decode_resource_template(&buf)
-        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    let items =
+        crate::resource::decode_resource_template(&buf).unwrap_or_else(|_| alloc::vec::Vec::new());
     match items.first() {
         Some(crate::resource::ResourceItem::Unknown { tag: 0x8E, .. }) => TestResult::Pass,
         _ => TestResult::Fail("SPI bus type should fall through to Unknown"),
     }
 }
-kernel_test_in!("aml", smoke_aml_resource_serial_bus_unknown_type_falls_through);
+kernel_test_in!(
+    "aml",
+    smoke_aml_resource_serial_bus_unknown_type_falls_through
+);
 
 fn smoke_aml_prt_decode() -> TestResult {
     use crate::Value;
@@ -736,9 +739,7 @@ fn smoke_aml_oregion_sysmem_dword_field() -> TestResult {
                 TestResult::Fail("\\F0 value mismatch (expected 0xDEADBEEF)")
             }
         }
-        Err(crate::oregion::FieldAccessError::NoField) => {
-            TestResult::Fail("\\F0 not registered")
-        }
+        Err(crate::oregion::FieldAccessError::NoField) => TestResult::Fail("\\F0 not registered"),
         Err(crate::oregion::FieldAccessError::NoRegion) => {
             TestResult::Fail("\\RGN0 not registered")
         }
@@ -804,12 +805,8 @@ fn smoke_aml_oregion_bit_fields() -> TestResult {
         (_, _, Ok(0)) => TestResult::Fail("\\F2 bit=0 from 0xFF buffer"),
         (Ok(1), Ok(1), Ok(1)) => TestResult::Pass,
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => match e {
-            crate::oregion::FieldAccessError::NoField => {
-                TestResult::Fail("field not registered")
-            }
-            crate::oregion::FieldAccessError::NoRegion => {
-                TestResult::Fail("region not registered")
-            }
+            crate::oregion::FieldAccessError::NoField => TestResult::Fail("field not registered"),
+            crate::oregion::FieldAccessError::NoRegion => TestResult::Fail("region not registered"),
             crate::oregion::FieldAccessError::TooWide => TestResult::Fail("field TooWide"),
             crate::oregion::FieldAccessError::Unsupported => TestResult::Fail("Unsupported"),
         },
@@ -939,9 +936,7 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
         Err(crate::oregion::FieldAccessError::NoField) => {
             TestResult::Fail("B0RT field not registered")
         }
-        Err(crate::oregion::FieldAccessError::NoRegion) => {
-            TestResult::Fail("RGNT region missing")
-        }
+        Err(crate::oregion::FieldAccessError::NoRegion) => TestResult::Fail("RGNT region missing"),
         Err(crate::oregion::FieldAccessError::TooWide) => TestResult::Fail("B0RT TooWide"),
     }
 }
@@ -1793,8 +1788,18 @@ fn smoke_aml_irq_routing_register_and_query() -> TestResult {
     use crate::resource::PrtEntry;
     crate::irq_routing::clear();
     let entries = [
-        PrtEntry { address: 0x0001_FFFF, pin: 0, source: None, source_index: 11 },
-        PrtEntry { address: 0x0002_FFFF, pin: 1, source: None, source_index: 10 },
+        PrtEntry {
+            address: 0x0001_FFFF,
+            pin: 0,
+            source: None,
+            source_index: 11,
+        },
+        PrtEntry {
+            address: 0x0002_FFFF,
+            pin: 1,
+            source: None,
+            source_index: 10,
+        },
     ];
     crate::irq_routing::register_bridge("\\_SB.PCITEST", &entries);
     if crate::irq_routing::len() != 2 {
@@ -1829,9 +1834,7 @@ fn smoke_aml_skip_predicate_term_arg_decodes_lequal_osi() -> TestResult {
     // Total: 1 + 4 + 7 + 1 = 13 bytes.
     let buf: &[u8] = &[
         0x93, // LEqual
-        b'_', b'O', b'S', b'I',
-        0x0D, b'L', b'i', b'n', b'u', b'x', 0x00,
-        0xFF,
+        b'_', b'O', b'S', b'I', 0x0D, b'L', b'i', b'n', b'u', b'x', 0x00, 0xFF,
     ];
     let mut cur = 0usize;
     if crate::skip_predicate_term_arg(buf, &mut cur, buf.len()).is_err() {
@@ -1919,11 +1922,9 @@ fn smoke_aml_namespace_walks_into_else_body() -> TestResult {
     // Else pkg: ElseOp PkgLength(8) DeviceOp PkgLength(5) "EID2"
     let body: alloc::vec::Vec<u8> = alloc::vec![
         // If(Zero) { Device(EID1) {} }
-        0xA0, 0x09, 0x00,
-        0x5B, 0x82, 0x05, b'E', b'I', b'D', b'1',
+        0xA0, 0x09, 0x00, 0x5B, 0x82, 0x05, b'E', b'I', b'D', b'1',
         // Else { Device(EID2) {} }
-        0xA1, 0x08,
-        0x5B, 0x82, 0x05, b'E', b'I', b'D', b'2',
+        0xA1, 0x08, 0x5B, 0x82, 0x05, b'E', b'I', b'D', b'2',
     ];
 
     if crate::__parse_body_for_test(&body, "\\").is_err() {
@@ -2041,7 +2042,7 @@ fn smoke_aml_evaluate_dsm_missing_method_errors() -> TestResult {
     // Device(\TSTE) with no _DSM child — call should return MethodNotFound.
     let blob: &[u8] = &[
         0x5B, 0x82, // Device
-        6, // PkgLength = 1 (PkgLen) + 1 (root) + 4 (NameSeg) = 6
+        6,    // PkgLength = 1 (PkgLen) + 1 (root) + 4 (NameSeg) = 6
         b'\\', b'T', b'S', b'T', b'E',
     ];
     if crate::__parse_body_for_test(blob, "\\").is_err() {
@@ -2065,7 +2066,7 @@ kernel_test_in!("aml", smoke_aml_evaluate_dsm_missing_method_errors);
 
 fn smoke_aml_ec_events_register_and_lookup_round_trip() -> TestResult {
     use crate::ec_events::{
-        lookup_qxx_handler, register_qxx_handler, unregister_qxx_handler, __reset_for_test,
+        __reset_for_test, lookup_qxx_handler, register_qxx_handler, unregister_qxx_handler,
     };
     __reset_for_test();
     fn handler_42(_idx: u8) {
@@ -2091,7 +2092,10 @@ fn smoke_aml_ec_events_register_and_lookup_round_trip() -> TestResult {
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("aml/ec_events", smoke_aml_ec_events_register_and_lookup_round_trip);
+kernel_test_in!(
+    "aml/ec_events",
+    smoke_aml_ec_events_register_and_lookup_round_trip
+);
 
 fn smoke_aml_ec_events_drain_bails_without_configured_ec() -> TestResult {
     use crate::ec_events::drain_ec_events;
@@ -2158,9 +2162,7 @@ fn smoke_aml_wmi_decode_wdg_single_descriptor() -> TestResult {
 kernel_test_in!("aml/wmi", smoke_aml_wmi_decode_wdg_single_descriptor);
 
 fn smoke_aml_wmi_dispatch_invokes_registered_handlers() -> TestResult {
-    use crate::wmi::{
-        dispatch_wmi_event, register_wmi_event_handler, __reset_for_test,
-    };
+    use crate::wmi::{__reset_for_test, dispatch_wmi_event, register_wmi_event_handler};
     use core::sync::atomic::{AtomicU64, Ordering};
     __reset_for_test();
 
@@ -2171,15 +2173,21 @@ fn smoke_aml_wmi_dispatch_invokes_registered_handlers() -> TestResult {
     OBSERVED_A.store(0, Ordering::Release);
     OBSERVED_B.store(0, Ordering::Release);
 
-    fn handler_a(v: u64) { OBSERVED_A.store(v, Ordering::Release); }
-    fn handler_b(v: u64) { OBSERVED_B.store(v, Ordering::Release); }
+    fn handler_a(v: u64) {
+        OBSERVED_A.store(v, Ordering::Release);
+    }
+    fn handler_b(v: u64) {
+        OBSERVED_B.store(v, Ordering::Release);
+    }
 
     let target = [0xAAu8; 16];
     let other = [0xBBu8; 16];
     register_wmi_event_handler(target, handler_a);
     register_wmi_event_handler(target, handler_b);
     // Register a third for a DIFFERENT GUID — must NOT fire.
-    fn handler_c(_v: u64) { panic!("handler_c must not fire"); }
+    fn handler_c(_v: u64) {
+        panic!("handler_c must not fire");
+    }
     register_wmi_event_handler(other, handler_c);
 
     let n = dispatch_wmi_event(&target, 0xC0FFEE);
@@ -2195,10 +2203,13 @@ fn smoke_aml_wmi_dispatch_invokes_registered_handlers() -> TestResult {
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("aml/wmi", smoke_aml_wmi_dispatch_invokes_registered_handlers);
+kernel_test_in!(
+    "aml/wmi",
+    smoke_aml_wmi_dispatch_invokes_registered_handlers
+);
 
 fn smoke_aml_wmi_dispatch_no_match_returns_zero() -> TestResult {
-    use crate::wmi::{dispatch_wmi_event, __reset_for_test};
+    use crate::wmi::{__reset_for_test, dispatch_wmi_event};
     __reset_for_test();
     let unknown = [0x42u8; 16];
     if dispatch_wmi_event(&unknown, 0) != 0 {
@@ -2211,7 +2222,7 @@ kernel_test_in!("aml/wmi", smoke_aml_wmi_dispatch_no_match_returns_zero);
 fn smoke_aml_wmi_guid_method_path_encoding() -> TestResult {
     // WmiGuid.method_path() must encode "AA" as device.WMAA,
     // "BB" as device.WMBB, and an event GUID as device.WEAA.
-    use crate::wmi::{WmiGuid, WDG_FLAG_METHOD, WDG_FLAG_EVENT};
+    use crate::wmi::{WmiGuid, WDG_FLAG_EVENT, WDG_FLAG_METHOD};
     let device_path = alloc::string::String::from("\\_SB.WMI0");
 
     let method_guid = WmiGuid {
@@ -2254,7 +2265,7 @@ kernel_test_in!("aml/wmi", smoke_aml_wmi_guid_method_path_encoding);
 
 fn smoke_aml_wmi_decode_wdg_two_descriptors() -> TestResult {
     // Two 20-byte entries — first is a method, second an event.
-    use crate::wmi::{decode_wdg, WDG_FLAG_METHOD, WDG_FLAG_EVENT};
+    use crate::wmi::{decode_wdg, WDG_FLAG_EVENT, WDG_FLAG_METHOD};
     let mut buf = alloc::vec![0u8; 40];
 
     // Entry 0: GUID all-0xAA, object_id "AA", count 3, flags=METHOD.
@@ -2302,7 +2313,7 @@ kernel_test_in!("aml/wmi", smoke_aml_wmi_decode_wdg_two_descriptors);
 fn smoke_aml_wmi_subscribe_event_fires() -> TestResult {
     // subscribe_event + dispatch_wmi_event with WmiGuid.
     use crate::wmi::{
-        WmiGuid, WmiEvent, WmiEventHandler, subscribe_event, dispatch_wmi_event, __reset_for_test,
+        dispatch_wmi_event, subscribe_event, WmiEvent, WmiEventHandler, WmiGuid, __reset_for_test,
         WDG_FLAG_EVENT,
     };
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -2346,7 +2357,7 @@ fn smoke_aml_wmi_invoke_method_via_aml() -> TestResult {
     // invoke_method always prepends [instance=0, method_id] as Arg0/Arg1.
     // The method computes Arg0 + Arg1 = 0 + method_id.
     // We call with method_id=9 → expect Integer(9).
-    use crate::wmi::{WmiGuid, invoke_method, WDG_FLAG_METHOD};
+    use crate::wmi::{invoke_method, WmiGuid, WDG_FLAG_METHOD};
     use crate::Value;
 
     // Build Method(\WITS, 2, { Return(Add(Arg0, Arg1, Local0)) })

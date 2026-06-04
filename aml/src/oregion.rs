@@ -526,8 +526,7 @@ pub enum GsbOp {
 /// read value or 0 on write/error.
 pub type GsbDispatcher = fn(region_path: &str, byte_offset: u64, op: GsbOp) -> u64;
 
-static GSB_DISPATCHER: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static GSB_DISPATCHER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Install the GenericSerialBus dispatcher. Boot-only — call
 /// once during driver init. drivers/i2c registers the I2C
@@ -760,7 +759,8 @@ pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
         } else {
             ((1u64 << slice_width) - 1) << in_unit_bit
         };
-        let slice_val = (masked_val >> slice_lo_bit.saturating_sub(bit_in_unit)) & ((1u64 << slice_width) - 1);
+        let slice_val =
+            (masked_val >> slice_lo_bit.saturating_sub(bit_in_unit)) & ((1u64 << slice_width) - 1);
         let new_bits = (slice_val << in_unit_bit) & unit_mask;
         // Apply UpdateRule to bits in this access unit that do NOT
         // belong to the field. ACPI 6.5 §19.6.31 / ACPICA

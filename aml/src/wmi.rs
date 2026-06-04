@@ -434,7 +434,7 @@ pub fn register_wmi_event_handler(guid: [u8; 16], handler: fn(notify_value: u64)
             // Limitation: we can only bridge handlers whose raw u64 value
             // is what they need. This is the legacy API path.
             let _ = handler; // unused in the WmiEventHandler path
-            // Store as a no-op in the new system and add directly below.
+                             // Store as a no-op in the new system and add directly below.
             |_: &WmiEvent| {}
         },
     });
@@ -443,7 +443,9 @@ pub fn register_wmi_event_handler(guid: [u8; 16], handler: fn(notify_value: u64)
     // cleanly separated.
     WMI_HANDLERS.lock().pop();
 
-    LEGACY_HANDLERS.lock().push(LegacyRegistration { guid, handler });
+    LEGACY_HANDLERS
+        .lock()
+        .push(LegacyRegistration { guid, handler });
 }
 
 /// Look up + invoke every handler registered for `guid`. Called by
@@ -543,8 +545,7 @@ struct LegacyRegistration {
     handler: fn(u64),
 }
 
-static LEGACY_HANDLERS: IrqSafeSpinLock<Vec<LegacyRegistration>> =
-    IrqSafeSpinLock::new(Vec::new());
+static LEGACY_HANDLERS: IrqSafeSpinLock<Vec<LegacyRegistration>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Test helpers ───────────────────────────────────────────────────
 

@@ -370,10 +370,7 @@ pub fn notify_reg_handlers() {
         work.push((method_path, space_id));
     });
     for (path, space) in work {
-        let _ = evaluate_method(
-            &path,
-            &[Value::Integer(space), Value::Integer(1)],
-        );
+        let _ = evaluate_method(&path, &[Value::Integer(space), Value::Integer(1)]);
     }
 }
 
@@ -1352,13 +1349,21 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             // silently take the wrong branch.
             let a = eval_term_arg(buf, cur, state)?;
             let b = eval_term_arg(buf, cur, state)?;
-            Value::Integer(if values_cmp(&a, &b) == core::cmp::Ordering::Greater { 1 } else { 0 })
+            Value::Integer(if values_cmp(&a, &b) == core::cmp::Ordering::Greater {
+                1
+            } else {
+                0
+            })
         }
         LLESS_OP => {
             // ACPI 6.5 §19.6.88, same shape as LGreater.
             let a = eval_term_arg(buf, cur, state)?;
             let b = eval_term_arg(buf, cur, state)?;
-            Value::Integer(if values_cmp(&a, &b) == core::cmp::Ordering::Less { 1 } else { 0 })
+            Value::Integer(if values_cmp(&a, &b) == core::cmp::Ordering::Less {
+                1
+            } else {
+                0
+            })
         }
 
         // Buffer: BufferOp PkgLength SizeTermArg ByteList
@@ -1489,8 +1494,7 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                     // detour in DSDT/SSDT returned 0.
                     crate::NodeKind::Method => {
                         let argc = (node.method_flags & 0x07) as usize;
-                        let mut args: alloc::vec::Vec<Value> =
-                            alloc::vec::Vec::with_capacity(argc);
+                        let mut args: alloc::vec::Vec<Value> = alloc::vec::Vec::with_capacity(argc);
                         for _ in 0..argc {
                             args.push(eval_term_arg(buf, cur, state)?);
                         }
@@ -1798,8 +1802,7 @@ fn to_integer(v: &Value) -> Value {
         Value::Buffer(_) => Value::Integer(v.as_integer()),
         Value::String(s) => {
             let s = s.trim();
-            let n = if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
-            {
+            let n = if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
                 u64::from_str_radix(stripped, 16).unwrap_or(0)
             } else {
                 s.parse::<u64>().unwrap_or(0)
