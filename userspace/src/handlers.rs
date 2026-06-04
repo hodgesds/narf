@@ -3411,7 +3411,19 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
 // ── GetPid / GetPpid — POSIX-shaped task-id surface ────────────────
 
 fn sys_getpid(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(current_task_id()));
+    let task = current_task_id();
+    #[cfg(feature = "container")]
+    {
+        // Wave-67 — translate the outer pid through whichever PID
+        // namespace the task belongs to. Root-namespace tasks fall
+        // through to the legacy outer == inner path.
+        let outer = task_to_pid_raw(task).unwrap_or(task);
+        let inner = crate::pid_ns::self_inner_pid(task, outer);
+        ctx.set_return(SyscallReturn::ok(inner));
+        return;
+    }
+    #[cfg(not(feature = "container"))]
+    ctx.set_return(SyscallReturn::ok(task));
 }
 
 fn sys_getppid(ctx: &mut dyn TrapContext) {
@@ -3703,6 +3715,15 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     cwd_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
+    // Wave-67 — propagate the parent's PID + mount namespaces into
+    // the child. Tasks in the root namespace skip the rebind (no
+    // translation needed) but inherit_into_child returns None
+    // silently in that case.
+    #[cfg(feature = "container")]
+    {
+        let _ = crate::pid_ns::inherit_into_child(parent_pid, child_pid.raw());
+        mount_ns_inherit(parent_pid, child_tid.raw());
+    }
     // Parent-of bookkeeping for waitpid: keyed by the child's
     // ProcessId so `on_child_exit(child_pid)` can resolve the
     // parent. `notify_task_exited` uses `this.process.pid.raw()`
@@ -3976,6 +3997,20 @@ fn on_child_exit(child_pid: u64) {
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
     crate::pidfd::notify_exit(child_pid);
+
+    // Wave-67: release the dying task from its PID namespace's
+    // inner-pid table so a recycled outer pid doesn't inherit the
+    // dead task's inner slot. Mount-namespace entries are keyed on
+    // the scheduler TaskId, not the outer pid, so we leave them
+    // alone here — they get cleaned up implicitly when the scheduler
+    // tears the task down.
+    #[cfg(feature = "container")]
+    {
+        if let Some(ns) = crate::pid_ns::ns_of(child_pid) {
+            ns.release_outer(child_pid);
+        }
+        crate::pid_ns::clear_ns(child_pid);
+    }
 
     let parent = match parent_of_get(child_pid) {
         Some(p) => p,
@@ -6184,22 +6219,141 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+/// Look up the mount namespace of an arbitrary task by id.
+#[cfg(feature = "container")]
+pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
+    let g = TASK_MOUNT_NS.lock();
+    g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+/// Wave-67 — install a private mount namespace for `task`. Replaces
+/// any existing entry. Used by `setns` and the fork-inheritance
+/// path.
+#[cfg(feature = "container")]
+pub fn install_mount_namespace(task: u64, ns: alloc::sync::Arc<narf_filesystem::MountNamespace>) {
+    task_mount_ns_init();
+    let mut g = TASK_MOUNT_NS.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task, ns);
+    }
+}
+
+/// Wave-67 — child inherits the parent's mount namespace by Arc
+/// share (no deep clone — they keep the same view until one calls
+/// unshare(CLONE_NEWNS) again). A parent in the root-global view
+/// leaves the child in the same root-global view.
+#[cfg(feature = "container")]
+fn mount_ns_inherit(parent_task: u64, child_task: u64) {
+    let parent_ns = {
+        let g = TASK_MOUNT_NS.lock();
+        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
+    };
+    if let Some(ns) = parent_ns {
+        install_mount_namespace(child_task, ns);
+    }
+}
+
 fn sys_unshare(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0;
     const CLONE_NEWNS: u64 = 0x00020000;
-    if flags & CLONE_NEWNS == 0 {
-        // No-op for non-NS flags today.
+    #[cfg(feature = "container")]
+    const CLONE_NEWPID: u64 = 0x20000000;
+
+    let mut any = false;
+
+    if flags & CLONE_NEWNS != 0 {
+        task_mount_ns_init();
+        let task = current_task_id();
+        let snap = narf_filesystem::MountNamespace::snapshot_global();
+        let mut g = TASK_MOUNT_NS.lock();
+        if let Some(m) = g.as_mut() {
+            m.insert(task, snap);
+            any = true;
+        } else {
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
+    }
+
+    #[cfg(feature = "container")]
+    if flags & CLONE_NEWPID != 0 {
+        let task = current_task_id();
+        // The task's outer pid is what the root-namespace fork
+        // recorded. If no mapping is present, fall back to the task
+        // id itself — it's a kernel-spawned task with implicit
+        // outer == inner already.
+        let outer = task_to_pid_raw(task).unwrap_or(task);
+        let _ns = crate::pid_ns::unshare_pid_ns(task, outer);
+        any = true;
+    }
+
+    // Honour the no-op path (no NS bits set) as success — Linux unshare
+    // returns 0 with flags=0.
+    let _ = any;
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── Wave-67: setns(target, nstype) ─────────────────────────────────
+//
+// Linux setns takes a fd referring to /proc/[pid]/ns/<type>. NARF
+// doesn't yet expose those symlinks; the interim NARF surface
+// accepts `target` as the outer TaskId / outer ProcessId of a task
+// whose namespace family we want to join. Once /proc/[pid]/ns/* is
+// plumbed, we'll add an inner branch that resolves the fd via the
+// fd table.
+
+fn sys_setns(ctx: &mut dyn TrapContext) {
+    #[cfg(feature = "container")]
+    {
+        let args = *ctx.args();
+        let target = args.arg0;
+        let nstype = args.arg1;
+        const CLONE_NEWNS: u64 = 0x00020000;
+        const CLONE_NEWPID: u64 = 0x20000000;
+        let caller = current_task_id();
+        let mut any = false;
+
+        // Resolve target: prefer outer-pid lookup, fall back to
+        // treating `target` as an outer TaskId directly.
+        let target_task = pid_to_task_raw(target).unwrap_or(target);
+
+        if nstype & CLONE_NEWPID != 0 {
+            match crate::pid_ns::ns_of(target_task) {
+                Some(ns) => {
+                    let outer = task_to_pid_raw(caller).unwrap_or(caller);
+                    let _ = crate::pid_ns::attach_to_ns(caller, outer, ns);
+                    any = true;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok(!0u64));
+                    return;
+                }
+            }
+        }
+
+        if nstype & CLONE_NEWNS != 0 {
+            match mount_namespace_of(target_task) {
+                Some(ns) => {
+                    install_mount_namespace(caller, ns);
+                    any = true;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok(!0u64));
+                    return;
+                }
+            }
+        }
+
+        if !any {
+            // No supported nstype bits — Linux returns EINVAL.
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    task_mount_ns_init();
-    let task = current_task_id();
-    let snap = narf_filesystem::MountNamespace::snapshot_global();
-    let mut g = TASK_MOUNT_NS.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task, snap);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
+    #[cfg(not(feature = "container"))]
+    {
         ctx.set_return(SyscallReturn::ok(!0u64));
     }
 }
@@ -6905,11 +7059,28 @@ pub fn signal_mask_of(task: u64) -> u32 {
 
 fn sys_kill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let target = args.arg0;
+    let mut target = args.arg0;
     let signum = args.arg1 as u32;
     if signum >= 32 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
+    }
+    // Wave-67 — translate the user-supplied pid (interpreted as
+    // in-namespace per Linux semantics) to the outer pid that the
+    // signal-delivery path is keyed on. Targets that the calling
+    // task cannot see in its namespace fail loudly. Outside-the-
+    // namespace callers (root NS) can still address by outer pid
+    // because the root NS resolver is the identity.
+    #[cfg(feature = "container")]
+    {
+        let caller = current_task_id();
+        match crate::pid_ns::resolve_inner_pid(caller, target) {
+            Some(outer) => target = outer,
+            None => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+        }
     }
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
@@ -9601,6 +9772,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Statfs, "statfs", RawFnHandler(sys_statfs));
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
     table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
+    table.install_raw(Syscall::Setns, "setns", RawFnHandler(sys_setns));
     table.install_raw(Syscall::Sigreturn, "sigreturn", RawFnHandler(sys_sigreturn));
     table.install_raw(Syscall::SocketOpen, "socket", RawFnHandler(sys_socket));
     table.install_raw(Syscall::SocketBind, "bind", RawFnHandler(sys_socket_bind));

@@ -1326,6 +1326,21 @@ pub enum Syscall {
     /// sending sibling `pidfd_send_signal` (424) and the waitid
     /// P_PIDFD variant are Wave-62 follow-ups.
     PidfdOpen,
+
+    /// Wave-67 — `setns(target, nstype)`. Linux x86_64=308; on
+    /// Linux, `target` is a fd referring to `/proc/[pid]/ns/<type>`
+    /// (or, on newer kernels, a pidfd). NARF doesn't yet plumb
+    /// /proc/[pid]/ns/* — until that lands, the NARF surface accepts
+    /// `target` as the outer TaskId / outer ProcessId of a task
+    /// whose namespace the caller wants to join. `nstype` is the
+    /// CLONE_NEW* bit identifying which namespace family to attach.
+    /// CLONE_NEWPID (0x20000000) attaches the caller's task to the
+    /// target's PID namespace; CLONE_NEWNS (0x00020000) attaches to
+    /// the target's mount namespace.
+    ///
+    /// Returns 0 on success, !0u64 on failure (target task has no
+    /// such namespace, or unsupported nstype).
+    Setns,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1456,6 +1471,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fchmodat, 268),
     (Syscall::Faccessat, 269),
     (Syscall::Unshare, 272),
+    // Wave-67 — Linux x86_64 setns = 308.
+    (Syscall::Setns, 308),
     (Syscall::Signalfd, 282), // signalfd / signalfd4 share name
     (Syscall::TimerfdCreate, 283),
     (Syscall::Eventfd, 284), // eventfd / eventfd2 share name
@@ -1536,6 +1553,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdSettime, 86),
     (Syscall::ExitTask, 93), // exit
     (Syscall::Unshare, 97),
+    // Wave-67 — Linux aarch64 setns = 268.
+    (Syscall::Setns, 268),
     (Syscall::Futex, 98),
     (Syscall::Sleep, 101), // nanosleep
     (Syscall::ClockSetTime, 112),
