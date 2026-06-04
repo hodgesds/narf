@@ -407,7 +407,7 @@ pub fn drop_wait_child_waker(parent_id: u64) {
 /// Test-only: drain the waker table.
 #[doc(hidden)]
 pub fn __test_wait_child_waker_reset() {
-    *WAIT_CHILD_WAKERS.lock() = None;
+    *WAIT_CHILD_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
 }
 
 #[inline]

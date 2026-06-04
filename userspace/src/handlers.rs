@@ -349,7 +349,7 @@ pub fn init_per_task_state() {
 /// Reset the registry — test hook; drops every per-task ring set.
 #[doc(hidden)]
 pub fn __test_bootstrap_reset() {
-    *BOOTSTRAP_TABLE.lock() = None;
+    *BOOTSTRAP_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// Diagnostic: number of tasks that have called Bootstrap.
@@ -4044,7 +4044,7 @@ pub fn pgid_init() {
 
 #[doc(hidden)]
 pub fn __test_pgid_reset() {
-    *PGID_TABLE.lock() = None;
+    *PGID_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn read_pgid(target: u64) -> u64 {
@@ -4095,7 +4095,7 @@ pub fn sid_init() {
 
 #[doc(hidden)]
 pub fn __test_sid_reset() {
-    *SID_TABLE.lock() = None;
+    *SID_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn read_sid(target: u64) -> u64 {
@@ -4164,7 +4164,7 @@ pub fn uidgid_init() {
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_uidgid_reset() {
-    *UIDGID_TABLE.lock() = None;
+    *UIDGID_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn read_uidgid(task: u64) -> UidGid {
@@ -4281,7 +4281,7 @@ pub fn rlimit_init() {
 
 #[doc(hidden)]
 pub fn __test_rlimit_reset() {
-    *RLIMIT_TABLE.lock() = None;
+    *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
@@ -4451,7 +4451,7 @@ pub fn prctl_init() {
 
 #[doc(hidden)]
 pub fn __test_prctl_reset() {
-    *PRCTL_TABLE.lock() = None;
+    *PRCTL_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn read_prctl(task: u64) -> PrctlState {
@@ -4597,7 +4597,7 @@ pub fn sched_param_init() {
 
 #[doc(hidden)]
 pub fn __test_sched_param_reset() {
-    *SCHED_PARAM_TABLE.lock() = None;
+    *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
@@ -4749,7 +4749,7 @@ pub fn umask_init() {
 
 #[doc(hidden)]
 pub fn __test_umask_reset() {
-    *UMASK_TABLE.lock() = None;
+    *UMASK_TABLE.lock() = Some(BTreeMap::new());
 }
 
 const UMASK_DEFAULT: u32 = 0o022;
@@ -4792,7 +4792,7 @@ pub fn nice_init() {
 
 #[doc(hidden)]
 pub fn __test_nice_reset() {
-    *NICE_TABLE.lock() = None;
+    *NICE_TABLE.lock() = Some(BTreeMap::new());
 }
 
 fn read_nice(task: u64) -> i32 {
@@ -5326,7 +5326,7 @@ pub fn cwd_init() {
 /// Reset the registry — test hook. Drops every per-task entry.
 #[doc(hidden)]
 pub fn __test_cwd_reset() {
-    *CWD_TABLE.lock() = None;
+    *CWD_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// fork(2) inheritance: copy `parent`'s cwd to `child`. No-op
@@ -5468,7 +5468,7 @@ pub fn brk_fork(parent: u64, child: u64) {
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_brk_reset() {
-    *BRK_TABLE.lock() = None;
+    *BRK_TABLE.lock() = Some(BTreeMap::new());
 }
 
 // ── execve — re-image the current task ─────────────────────────────
@@ -6352,9 +6352,9 @@ pub fn signal_init() {
 /// Reset the registries — test hook. Drops every per-task entry.
 #[doc(hidden)]
 pub fn __test_signal_reset() {
-    *SIGNAL_PENDING.lock() = None;
-    *SIGNAL_MASK.lock() = None;
-    *SIG_ALTSTACK.lock() = None;
+    *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *SIGNAL_MASK.lock() = Some(BTreeMap::new());
+    *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
 
 /// Diagnostic: peek the pending bitmap for `task`.
@@ -7697,7 +7697,7 @@ pub fn sigaction_fork(parent: u64, child: u64) {
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_sigaction_reset() {
-    *SIGACTION_TABLE.lock() = None;
+    *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// Diagnostic: peek the recorded handler vaddr for `(task, signum)`.
