@@ -3712,9 +3712,9 @@ pub fn wait_init() {
 
 #[doc(hidden)]
 pub fn __test_wait_reset() {
-    *PARENT_OF.lock() = None;
-    *PENDING_EXITS.lock() = None;
-    pid_task_map_reset();
+    *PARENT_OF.lock() = Some(BTreeMap::new());
+    *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    pid_task_map_init();
     crate::user_task::__test_wait_child_waker_reset();
 }
 
