@@ -206,8 +206,14 @@ impl ReportDescriptor {
     /// length before extraction.
     pub fn report_body_bits(&self, id: u8, kind: FieldKind) -> u32 {
         let mut max_end = 0u32;
-        for f in self.fields.iter().filter(|f| f.report_id == id && f.kind == kind) {
-            let end = f.bit_offset.saturating_add(f.report_size.saturating_mul(f.report_count));
+        for f in self
+            .fields
+            .iter()
+            .filter(|f| f.report_id == id && f.kind == kind)
+        {
+            let end = f
+                .bit_offset
+                .saturating_add(f.report_size.saturating_mul(f.report_count));
             if end > max_end {
                 max_end = end;
             }
@@ -289,12 +295,7 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
             0 => 0,
             1 => blob[i + 1] as u32,
             2 => u16::from_le_bytes([blob[i + 1], blob[i + 2]]) as u32,
-            4 => u32::from_le_bytes([
-                blob[i + 1],
-                blob[i + 2],
-                blob[i + 3],
-                blob[i + 4],
-            ]),
+            4 => u32::from_le_bytes([blob[i + 1], blob[i + 2], blob[i + 3], blob[i + 4]]),
             _ => unreachable!(),
         };
         // Sign-extended view for items that take signed data.
@@ -379,7 +380,9 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
                     globals_stack.push(global.clone());
                 }
                 0xB => {
-                    global = globals_stack.pop().ok_or(DescriptorError::PushPopUnderflow)?;
+                    global = globals_stack
+                        .pop()
+                        .ok_or(DescriptorError::PushPopUnderflow)?;
                 }
                 _ => {}
             },
@@ -455,9 +458,13 @@ fn emit_field(
             0
         }
     };
-    let bits = global.report_size.checked_mul(global.report_count)
+    let bits = global
+        .report_size
+        .checked_mul(global.report_count)
         .ok_or(DescriptorError::BitOffsetOverflow)?;
-    let new_cur = cur.checked_add(bits).ok_or(DescriptorError::BitOffsetOverflow)?;
+    let new_cur = cur
+        .checked_add(bits)
+        .ok_or(DescriptorError::BitOffsetOverflow)?;
     if let Some(slot) = bucket.iter_mut().find(|(rid, _)| *rid == id) {
         slot.1 = new_cur;
     }
@@ -483,4 +490,3 @@ fn emit_field(
     });
     Ok(())
 }
-

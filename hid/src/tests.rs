@@ -7,7 +7,7 @@ extern crate alloc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::descriptor::{parse, FieldFlags, FieldKind};
-use crate::ptp::{decode_input, detect, mode, build_mode_feature_report};
+use crate::ptp::{build_mode_feature_report, decode_input, detect, mode};
 use crate::report::{array_active_usages, extract, pack};
 use crate::usage::{digitizer, generic_desktop, keyboard};
 
@@ -32,7 +32,10 @@ fn smoke_hid_descriptor_unbalanced_end_collection_rejected() -> TestResult {
         _ => TestResult::Fail("orphan End-Collection must be rejected"),
     }
 }
-kernel_test_in!("hid", smoke_hid_descriptor_unbalanced_end_collection_rejected);
+kernel_test_in!(
+    "hid",
+    smoke_hid_descriptor_unbalanced_end_collection_rejected
+);
 
 fn smoke_hid_descriptor_long_item_skipped() -> TestResult {
     // Long item: 0xFE, dataSize=2, longTag=0x55, two data bytes.
@@ -91,7 +94,7 @@ fn smoke_hid_descriptor_parses_boot_keyboard() -> TestResult {
         0x19, 0x00, //   Usage Min (0)
         0x29, 0x65, //   Usage Max (Keyboard Application)
         0x81, 0x00, //   Input (Data, Array, Abs) — key array
-        0xC0,       // End Collection
+        0xC0, // End Collection
     ];
     let d = parse(&blob).expect("parse");
     if d.has_report_ids {
@@ -102,7 +105,11 @@ fn smoke_hid_descriptor_parses_boot_keyboard() -> TestResult {
     {
         return TestResult::Fail("expected 1 top-level Keyboard application collection");
     }
-    let inputs: alloc::vec::Vec<_> = d.fields.iter().filter(|f| f.kind == FieldKind::Input).collect();
+    let inputs: alloc::vec::Vec<_> = d
+        .fields
+        .iter()
+        .filter(|f| f.kind == FieldKind::Input)
+        .collect();
     if inputs.len() != 3 {
         return TestResult::Fail("expected 3 Input fields");
     }
@@ -145,10 +152,10 @@ fn smoke_hid_report_extract_bits_unsigned() -> TestResult {
     // an 8-bit reserved byte, then 6 × 8-bit keys (matches the boot
     // kbd modifier field with 8 elements of 1 bit).
     let blob: [u8; 17] = [
-        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01,   //
-        0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,   //
-        0x15, 0x00, 0x25, 0x01,               //
-        0xC0,                                  //
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, //
+        0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, //
+        0x15, 0x00, 0x25, 0x01, //
+        0xC0, //
     ];
     // Hand-built, simpler: just use parse and ask for an artificial
     // modifier-only descriptor.
@@ -163,8 +170,8 @@ fn smoke_hid_report_extract_bits_unsigned() -> TestResult {
     // and add it.
     let _ = blob;
     let blob: [u8; 23] = [
-        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
-        0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xC0,
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xC0,
     ];
     let d = parse(&blob).expect("parse");
     let f = &d.fields[0];
@@ -191,7 +198,7 @@ fn smoke_hid_report_extract_signed_8bit() -> TestResult {
         0x75, 0x08, // Report Size 8
         0x95, 0x01, // Report Count 1
         0x81, 0x06, // Input(Data,Var,Rel)
-        0xC0,       // End Collection
+        0xC0, // End Collection
         0x00, 0x00, // padding so length is right
     ];
     // Trim trailing padding — we don't actually need it, but the
@@ -222,8 +229,8 @@ kernel_test_in!("hid", smoke_hid_report_extract_signed_8bit);
 fn smoke_hid_report_extract_short_buffer_errors() -> TestResult {
     // Same 8-bit signed field; pass an empty body.
     let blob: [u8; 19] = [
-        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x30, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
-        0x95, 0x01, 0x81, 0x06, 0xC0,
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x30, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95,
+        0x01, 0x81, 0x06, 0xC0,
     ];
     let d = parse(&blob).expect("parse");
     let f = &d.fields[0];
@@ -325,15 +332,14 @@ fn smoke_hid_descriptor_parses_ptp_finger() -> TestResult {
         0x26, 0xFF, 0x7F, // Logical Max 0x7FFF (16-bit data)
         0x75, 0x10, //     Size 16
         0x81, 0x02, //     Input
-        0xC0,       //   End Collection
-        0xC0,       // End Collection
+        0xC0, //   End Collection
+        0xC0, // End Collection
     ];
     let d = parse(&blob).expect("parse");
     if !d.has_report_ids {
         return TestResult::Fail("PTP descriptor must use report IDs");
     }
-    if d.top_level_apps.len() != 1
-        || d.top_level_apps[0] != (digitizer::PAGE, digitizer::TOUCH_PAD)
+    if d.top_level_apps.len() != 1 || d.top_level_apps[0] != (digitizer::PAGE, digitizer::TOUCH_PAD)
     {
         return TestResult::Fail("expected Touch Pad top-level application");
     }
@@ -342,7 +348,9 @@ fn smoke_hid_descriptor_parses_ptp_finger() -> TestResult {
         .fields
         .iter()
         .find(|f| {
-            f.usages.iter().any(|u| u.0 == digitizer::PAGE && u.1 == digitizer::TIP_SWITCH)
+            f.usages
+                .iter()
+                .any(|u| u.0 == digitizer::PAGE && u.1 == digitizer::TIP_SWITCH)
         })
         .ok_or(())
         .map_err(|_| ());
@@ -392,85 +400,85 @@ kernel_test_in!("hid", smoke_hid_descriptor_parses_ptp_finger);
 /// a Device Mode Feature item.
 const PTP_DESCRIPTOR: &[u8] = &[
     // ── Touch Pad Application Collection (Input report ID 1) ────
-    0x05, 0x0D,             // Usage Page (Digitizer)
-    0x09, 0x05,             // Usage (Touch Pad)
-    0xA1, 0x01,             //   Collection (Application)
-    0x85, 0x01,             //     Report ID (1)
+    0x05, 0x0D, // Usage Page (Digitizer)
+    0x09, 0x05, // Usage (Touch Pad)
+    0xA1, 0x01, //   Collection (Application)
+    0x85, 0x01, //     Report ID (1)
     // Finger 0
-    0x09, 0x22,             //     Usage (Finger)
-    0xA1, 0x02,             //     Collection (Logical)
-    0x05, 0x0D,             //       Usage Page (Digitizer)
-    0x09, 0x42,             //       Usage (Tip Switch)
+    0x09, 0x22, //     Usage (Finger)
+    0xA1, 0x02, //     Collection (Logical)
+    0x05, 0x0D, //       Usage Page (Digitizer)
+    0x09, 0x42, //       Usage (Tip Switch)
     0x15, 0x00, 0x25, 0x01, //       Logical 0..1
     0x75, 0x01, 0x95, 0x01, //       Size 1, Count 1
-    0x81, 0x02,             //       Input (Data,Var,Abs)
-    0x09, 0x51,             //       Usage (Contact ID)
-    0x25, 0x07,             //       Logical Max 7
+    0x81, 0x02, //       Input (Data,Var,Abs)
+    0x09, 0x51, //       Usage (Contact ID)
+    0x25, 0x07, //       Logical Max 7
     0x75, 0x03, 0x95, 0x01, //       Size 3, Count 1
-    0x81, 0x02,             //       Input
+    0x81, 0x02, //       Input
     0x75, 0x04, 0x95, 0x01, //       Size 4, Count 1 (padding)
-    0x81, 0x03,             //       Input (Const)
-    0x05, 0x01,             //       Usage Page (Generic Desktop)
-    0x09, 0x30,             //       Usage (X)
-    0x26, 0xFF, 0x7F,       //       Logical Max 0x7FFF
+    0x81, 0x03, //       Input (Const)
+    0x05, 0x01, //       Usage Page (Generic Desktop)
+    0x09, 0x30, //       Usage (X)
+    0x26, 0xFF, 0x7F, //       Logical Max 0x7FFF
     0x75, 0x10, 0x95, 0x01, //       Size 16, Count 1
-    0x81, 0x02,             //       Input
-    0x09, 0x31,             //       Usage (Y)
-    0x81, 0x02,             //       Input
-    0xC0,                   //     End Collection (Finger 0)
+    0x81, 0x02, //       Input
+    0x09, 0x31, //       Usage (Y)
+    0x81, 0x02, //       Input
+    0xC0, //     End Collection (Finger 0)
     // Finger 1
-    0x05, 0x0D,             //     Usage Page (Digitizer)
-    0x09, 0x22,             //     Usage (Finger)
-    0xA1, 0x02,             //     Collection (Logical)
-    0x09, 0x42,             //       Usage (Tip Switch)
+    0x05, 0x0D, //     Usage Page (Digitizer)
+    0x09, 0x22, //     Usage (Finger)
+    0xA1, 0x02, //     Collection (Logical)
+    0x09, 0x42, //       Usage (Tip Switch)
     0x15, 0x00, 0x25, 0x01, //       Logical 0..1
     0x75, 0x01, 0x95, 0x01, //       Size 1, Count 1
-    0x81, 0x02,             //       Input
-    0x09, 0x51,             //       Usage (Contact ID)
-    0x25, 0x07,             //       Logical Max 7
+    0x81, 0x02, //       Input
+    0x09, 0x51, //       Usage (Contact ID)
+    0x25, 0x07, //       Logical Max 7
     0x75, 0x03, 0x95, 0x01, //       Size 3, Count 1
-    0x81, 0x02,             //       Input
+    0x81, 0x02, //       Input
     0x75, 0x04, 0x95, 0x01, //       Size 4 padding
-    0x81, 0x03,             //       Input (Const)
-    0x05, 0x01,             //       Usage Page (Generic Desktop)
-    0x09, 0x30,             //       Usage (X)
-    0x26, 0xFF, 0x7F,       //       Logical Max 0x7FFF
+    0x81, 0x03, //       Input (Const)
+    0x05, 0x01, //       Usage Page (Generic Desktop)
+    0x09, 0x30, //       Usage (X)
+    0x26, 0xFF, 0x7F, //       Logical Max 0x7FFF
     0x75, 0x10, 0x95, 0x01, //       Size 16, Count 1
-    0x81, 0x02,             //       Input
-    0x09, 0x31,             //       Usage (Y)
-    0x81, 0x02,             //       Input
-    0xC0,                   //     End Collection (Finger 1)
+    0x81, 0x02, //       Input
+    0x09, 0x31, //       Usage (Y)
+    0x81, 0x02, //       Input
+    0xC0, //     End Collection (Finger 1)
     // Contact Count + Scan Time + Button 1 + padding
-    0x05, 0x0D,             //     Usage Page (Digitizer)
-    0x09, 0x54,             //     Usage (Contact Count)
-    0x25, 0x05,             //     Logical Max 5
+    0x05, 0x0D, //     Usage Page (Digitizer)
+    0x09, 0x54, //     Usage (Contact Count)
+    0x25, 0x05, //     Logical Max 5
     0x75, 0x08, 0x95, 0x01, //     Size 8, Count 1
-    0x81, 0x02,             //     Input
-    0x09, 0x56,             //     Usage (Scan Time)
+    0x81, 0x02, //     Input
+    0x09, 0x56, //     Usage (Scan Time)
     0x27, 0xFF, 0xFF, 0x00, 0x00, // Logical Max 0xFFFF (4-byte form)
     0x75, 0x10, 0x95, 0x01, //     Size 16, Count 1
-    0x81, 0x02,             //     Input
-    0x05, 0x09,             //     Usage Page (Button)
-    0x09, 0x01,             //     Usage (Button 1)
+    0x81, 0x02, //     Input
+    0x05, 0x09, //     Usage Page (Button)
+    0x09, 0x01, //     Usage (Button 1)
     0x15, 0x00, 0x25, 0x01, //     Logical 0..1
     0x75, 0x01, 0x95, 0x01, //     Size 1, Count 1
-    0x81, 0x02,             //     Input
+    0x81, 0x02, //     Input
     0x75, 0x07, 0x95, 0x01, //     Size 7 padding
-    0x81, 0x03,             //     Input (Const)
-    0xC0,                   //   End Collection (Touch Pad)
+    0x81, 0x03, //     Input (Const)
+    0xC0, //   End Collection (Touch Pad)
     // ── Configuration TLC (Feature report ID 3) ─────────────────
-    0x05, 0x0D,             // Usage Page (Digitizer)
-    0x09, 0x0E,             // Usage (Configuration)
-    0xA1, 0x01,             // Collection (Application)
-    0x85, 0x03,             //   Report ID (3)
-    0x09, 0x22,             //   Usage (Finger)
-    0xA1, 0x02,             //   Collection (Logical)
-    0x09, 0x60,             //     Usage (Device Mode)
+    0x05, 0x0D, // Usage Page (Digitizer)
+    0x09, 0x0E, // Usage (Configuration)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x03, //   Report ID (3)
+    0x09, 0x22, //   Usage (Finger)
+    0xA1, 0x02, //   Collection (Logical)
+    0x09, 0x60, //     Usage (Device Mode)
     0x15, 0x00, 0x25, 0x0A, //     Logical 0..10
     0x75, 0x08, 0x95, 0x01, //     Size 8, Count 1
-    0xB1, 0x02,             //     Feature (Data,Var,Abs)
-    0xC0,                   //   End Collection
-    0xC0,                   // End Collection
+    0xB1, 0x02, //     Feature (Data,Var,Abs)
+    0xC0, //   End Collection
+    0xC0, // End Collection
 ];
 
 fn smoke_ptp_detect_basic_shape() -> TestResult {
@@ -515,16 +523,21 @@ fn smoke_ptp_decode_one_active_contact() -> TestResult {
     // Finger 1: tip=0, cid=0, X=0, Y=0
     // Contact Count=1, Scan Time=0xABCD, Button 1 = pressed.
     let report = [
-        0x01, // Report ID 1
+        0x01,        // Report ID 1
         0b0000_0111, // tip=1, cid=011, pad=0000
-        0x34, 0x12, // X = 0x1234
-        0x78, 0x56, // Y = 0x5678
+        0x34,
+        0x12, // X = 0x1234
+        0x78,
+        0x56, // Y = 0x5678
         0x00, // Finger 1: tip=0, cid=0, pad=0
-        0x00, 0x00, // Finger 1 X
-        0x00, 0x00, // Finger 1 Y
-        0x01,       // Contact Count = 1
-        0xCD, 0xAB, // Scan Time = 0xABCD
-        0x01,       // Button 1 = 1, pad 7 bits = 0
+        0x00,
+        0x00, // Finger 1 X
+        0x00,
+        0x00, // Finger 1 Y
+        0x01, // Contact Count = 1
+        0xCD,
+        0xAB, // Scan Time = 0xABCD
+        0x01, // Button 1 = 1, pad 7 bits = 0
     ];
     let r = match decode_input(&p, &report) {
         Ok(r) => r,
@@ -577,11 +590,11 @@ kernel_test_in!("hid/ptp", smoke_ptp_build_mode_feature_multi_touch);
 fn smoke_ptp_detect_rejects_non_touchpad() -> TestResult {
     // A boot-keyboard descriptor must not be detected as PTP.
     let blob: [u8; 63] = [
-        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
-        0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
-        0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01,
-        0x75, 0x03, 0x91, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07,
-        0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05,
+        0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91,
+        0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
+        0x81, 0x00, 0xC0,
     ];
     let d = parse(&blob).expect("parse");
     if detect(&d).is_some() {
@@ -591,12 +604,7 @@ fn smoke_ptp_detect_rejects_non_touchpad() -> TestResult {
 }
 kernel_test_in!("hid/ptp", smoke_ptp_detect_rejects_non_touchpad);
 
-
-
-
 // ── HID Pen profile ───────────────────────────────────────────────
-
-
 
 /// Synthetic Pen descriptor. One Pen Application Collection, Report
 
@@ -607,135 +615,64 @@ kernel_test_in!("hid/ptp", smoke_ptp_detect_rejects_non_touchpad);
 /// + Twist (16).
 
 const PEN_DESCRIPTOR: &[u8] = &[
-
     0x05, 0x0D, // Digitizer page
-
     0x09, 0x02, // Usage (Pen)
-
     0xA1, 0x01, // Collection (Application)
-
     0x85, 0x05, //   Report ID (5)
-
     0x09, 0x20, //   Usage (Stylus)
-
     0xA1, 0x00, //   Collection (Physical)
-
     0x09, 0x42, //     Tip Switch
-
     0x09, 0x44, //     Barrel Switch
-
     0x09, 0x3C, //     Invert
-
     0x09, 0x45, //     Eraser
-
     0x09, 0x32, //     In Range
-
-    0x15, 0x00, 0x25, 0x01,
-
-    0x75, 0x01, 0x95, 0x05,
-
-    0x81, 0x02, //     Input (Data,Var,Abs)
-
-    0x75, 0x03, 0x95, 0x01,
-
-    0x81, 0x03, //     Input (Const,Var) — padding
-
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x05, 0x81, 0x02, //     Input (Data,Var,Abs)
+    0x75, 0x03, 0x95, 0x01, 0x81, 0x03, //     Input (Const,Var) — padding
     0x05, 0x01, //     Generic Desktop
-
     0x09, 0x30, //     Usage (X)
-
     0x26, 0xFF, 0x7F, // Logical Max 0x7FFF
-
-    0x75, 0x10, 0x95, 0x01,
-
-    0x81, 0x02,
-
-    0x09, 0x31, //     Usage (Y)
-
-    0x81, 0x02,
-
-    0x05, 0x0D, //     Digitizer
-
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x02, 0x09, 0x31, //     Usage (Y)
+    0x81, 0x02, 0x05, 0x0D, //     Digitizer
     0x09, 0x30, //     Tip Pressure
-
     0x26, 0xFF, 0x0F, // Logical Max 4095
-
-    0x75, 0x10, 0x95, 0x01,
-
-    0x81, 0x02,
-
-    0x09, 0x3D, //     X-Tilt
-
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x02, 0x09, 0x3D, //     X-Tilt
     0x15, 0x80, 0x25, 0x7F, // signed -128..127
-
-    0x75, 0x08, 0x95, 0x01,
-
-    0x81, 0x02,
-
-    0x09, 0x3E, //     Y-Tilt
-
-    0x81, 0x02,
-
-    0x09, 0x41, //     Twist
-
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x09, 0x3E, //     Y-Tilt
+    0x81, 0x02, 0x09, 0x41, //     Twist
     0x15, 0x00, 0x26, 0x67, 0x01, // 0..359
-
-    0x75, 0x10, 0x95, 0x01,
-
-    0x81, 0x02,
-
-    0xC0,       //   End Collection
-
-    0xC0,       // End Collection
-
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x02, 0xC0, //   End Collection
+    0xC0, // End Collection
 ];
 
-
-
 fn smoke_pen_detect_finds_minimum_field_set() -> TestResult {
-
     use crate::pen::detect;
 
     let d = parse(PEN_DESCRIPTOR).expect("parse");
 
     let p = match detect(&d) {
-
         Some(p) => p,
 
         None => return TestResult::Fail("pen detect rejected valid descriptor"),
-
     };
 
     if p.input_report_id != 5 {
-
         return TestResult::Fail("report id");
-
     }
 
     if p.fields.tip_pressure.is_none()
-
         || p.fields.x_tilt.is_none()
-
         || p.fields.twist.is_none()
-
         || p.fields.barrel_switch.is_none()
-
     {
-
         return TestResult::Fail("missing optional field");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("hid/pen", smoke_pen_detect_finds_minimum_field_set);
 
-
-
 fn smoke_pen_decode_input_round_trip() -> TestResult {
-
     use crate::pen::{decode_input, detect};
 
     let d = parse(PEN_DESCRIPTOR).expect("parse");
@@ -749,137 +686,88 @@ fn smoke_pen_decode_input_round_trip() -> TestResult {
     //   X=0x1234, Y=0x5678, Pressure=0x0F00, X-Tilt=-30, Y-Tilt=+45, Twist=180
 
     let report = [
-
-        5, // Report ID
-
+        5,           // Report ID
         0b0001_0001, // tip + in-range, others clear
-
-        0x34, 0x12, // X
-
-        0x78, 0x56, // Y
-
-        0x00, 0x0F, // Pressure
-
+        0x34,
+        0x12, // X
+        0x78,
+        0x56, // Y
+        0x00,
+        0x0F,          // Pressure
         (-30i8) as u8, // X-Tilt
-
         45,            // Y-Tilt
-
-        180, 0,        // Twist (LE)
-
+        180,
+        0, // Twist (LE)
     ];
 
     let pen = match decode_input(&p, &report) {
-
         Ok(d) => d,
 
         Err(_) => return TestResult::Fail("decode_input failed"),
-
     };
 
     if !(pen.tip && pen.in_range && !pen.eraser && !pen.invert && !pen.barrel_button) {
-
         return TestResult::Fail("button state wrong");
-
     }
 
     if pen.x != 0x1234 || pen.y != 0x5678 {
-
         return TestResult::Fail("X/Y wrong");
-
     }
 
     if pen.pressure != Some(0x0F00) {
-
         return TestResult::Fail("pressure wrong");
-
     }
 
     if pen.x_tilt_deg != Some(-30) || pen.y_tilt_deg != Some(45) {
-
         return TestResult::Fail("tilt wrong");
-
     }
 
     if pen.twist != Some(180) {
-
         return TestResult::Fail("twist wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("hid/pen", smoke_pen_decode_input_round_trip);
 
-
-
 fn smoke_pen_detect_rejects_non_pen_descriptor() -> TestResult {
-
     use crate::pen::detect;
 
     let d = parse(PTP_DESCRIPTOR).expect("parse");
 
     if detect(&d).is_some() {
-
         return TestResult::Fail("PTP must not be detected as Pen");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("hid/pen", smoke_pen_detect_rejects_non_pen_descriptor);
 
-
-
 // ── HID Sensor Collections ────────────────────────────────────────
-
-
 
 /// Synthetic accelerometer descriptor: page 0x20 / usage 0x73, with
 
 /// 16-bit X/Y/Z fields under report ID 1.
 
 const ACCEL_DESCRIPTOR: &[u8] = &[
-
     0x05, 0x20, // Usage Page (Sensors)
-
     0x09, 0x73, // Usage (Motion: Accelerometer 3D)
-
     0xA1, 0x01, // Collection (Application)
-
     0x85, 0x01, //   Report ID (1)
-
     0x05, 0x20, //   Usage Page (Sensors) - same
-
     0x0A, 0x53, 0x04, // Usage (Acceleration X) — 2-byte form
-
     0x16, 0x00, 0x80, // Logical Min -32768
-
     0x26, 0xFF, 0x7F, // Logical Max 32767
-
     0x75, 0x10, 0x95, 0x01, //   Size 16, Count 1
-
     0x81, 0x02, //   Input (Data,Var,Abs)
-
     0x0A, 0x54, 0x04, // Usage (Acceleration Y)
-
-    0x81, 0x02,
-
-    0x0A, 0x55, 0x04, // Usage (Acceleration Z)
-
-    0x81, 0x02,
-
-    0xC0,       // End Collection
-
+    0x81, 0x02, 0x0A, 0x55, 0x04, // Usage (Acceleration Z)
+    0x81, 0x02, 0xC0, // End Collection
 ];
 
-
-
 fn smoke_sensor_detects_accelerometer() -> TestResult {
-
     use crate::sensor::{detect, SensorKind};
 
     let d = parse(ACCEL_DESCRIPTOR).expect("parse");
@@ -887,27 +775,19 @@ fn smoke_sensor_detects_accelerometer() -> TestResult {
     let p = detect(&d).expect("detect");
 
     if p.kind != SensorKind::Accelerometer3D {
-
         return TestResult::Fail("sensor kind");
-
     }
 
     if p.axes.len() != 3 || p.input_report_id != 1 {
-
         return TestResult::Fail("axes / report id");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("hid/sensor", smoke_sensor_detects_accelerometer);
 
-
-
 fn smoke_sensor_decode_xyz_signed() -> TestResult {
-
     use crate::sensor::{decode_input, detect};
 
     let d = parse(ACCEL_DESCRIPTOR).expect("parse");
@@ -917,63 +797,36 @@ fn smoke_sensor_decode_xyz_signed() -> TestResult {
     // X = +1000, Y = -500, Z = +9806 (1g).
 
     let report = [
-
-        1,
-
-        0xE8, 0x03,        // X = 1000
-
-        0x0C, 0xFE,        // Y = -500
-
-        0x4E, 0x26,        // Z = 9806
-
+        1, 0xE8, 0x03, // X = 1000
+        0x0C, 0xFE, // Y = -500
+        0x4E, 0x26, // Z = 9806
     ];
 
     let s = decode_input(&p, &report).expect("decode");
 
     if s.values != [1000, -500, 9806] {
-
         return TestResult::Fail("axis values wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("hid/sensor", smoke_sensor_decode_xyz_signed);
 
-
-
 /// Ambient-light descriptor: single 32-bit Illuminance field.
 
 const ALS_DESCRIPTOR: &[u8] = &[
-
     0x05, 0x20, // Sensors
-
     0x09, 0x41, // Light: Ambient Light
-
-    0xA1, 0x01,
-
-    0x85, 0x02, //   Report ID 2
-
+    0xA1, 0x01, 0x85, 0x02, //   Report ID 2
     0x0A, 0xD1, 0x04, // Illuminance (lux)
-
     0x17, 0x00, 0x00, 0x00, 0x00, // Logical Min 0 (4-byte form)
-
     0x27, 0xFF, 0xFF, 0xFF, 0x7F, // Logical Max 0x7FFFFFFF
-
     0x75, 0x20, 0x95, 0x01, //   Size 32, Count 1
-
-    0x81, 0x02,
-
-    0xC0,
-
+    0x81, 0x02, 0xC0,
 ];
 
-
-
 fn smoke_sensor_detects_ambient_light() -> TestResult {
-
     use crate::sensor::{decode_input, detect, SensorKind};
 
     let d = parse(ALS_DESCRIPTOR).expect("parse");
@@ -981,15 +834,11 @@ fn smoke_sensor_detects_ambient_light() -> TestResult {
     let p = detect(&d).expect("detect");
 
     if p.kind != SensorKind::AmbientLight {
-
         return TestResult::Fail("sensor kind");
-
     }
 
     if p.axes.len() != 1 || p.input_report_id != 2 {
-
         return TestResult::Fail("axes");
-
     }
 
     let report = [2u8, 0xE8, 0x03, 0x00, 0x00]; // 1000 lux
@@ -997,13 +846,10 @@ fn smoke_sensor_detects_ambient_light() -> TestResult {
     let s = decode_input(&p, &report).expect("decode");
 
     if s.values != [1000] {
-
         return TestResult::Fail("value");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("hid/sensor", smoke_sensor_detects_ambient_light);
@@ -1078,7 +924,7 @@ fn smoke_touchscreen_decodes_report_payload() -> TestResult {
     // bytes.
     let mut report = alloc::vec![0u8; 1 + 2 * (1 + 1 + 2 + 2) + 1];
     report[0] = 1; // report id
-    // Finger 0
+                   // Finger 0
     report[1] = 0b0000_0011; // tip + in_range
     report[2] = 0x05;
     report[3..5].copy_from_slice(&0x1234u16.to_le_bytes());
@@ -1117,10 +963,7 @@ fn smoke_touchscreen_decodes_report_payload() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "hid/touchscreen",
-    smoke_touchscreen_decodes_report_payload
-);
+kernel_test_in!("hid/touchscreen", smoke_touchscreen_decodes_report_payload);
 
 fn smoke_touchscreen_rejects_wrong_report_id() -> TestResult {
     use crate::touchscreen;
@@ -1134,8 +977,4 @@ fn smoke_touchscreen_rejects_wrong_report_id() -> TestResult {
         Ok(_) => TestResult::Fail("mismatched report id should have been rejected"),
     }
 }
-kernel_test_in!(
-    "hid/touchscreen",
-    smoke_touchscreen_rejects_wrong_report_id
-);
-
+kernel_test_in!("hid/touchscreen", smoke_touchscreen_rejects_wrong_report_id);

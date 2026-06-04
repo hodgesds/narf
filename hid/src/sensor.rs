@@ -110,9 +110,7 @@ fn pick_axis_field(d: &ReportDescriptor, usage: u16) -> Option<Field> {
         .iter()
         .find(|f| {
             f.kind == FieldKind::Input
-                && f.usages
-                    .iter()
-                    .any(|u| u.0 == SENSORS_PAGE && u.1 == usage)
+                && f.usages.iter().any(|u| u.0 == SENSORS_PAGE && u.1 == usage)
         })
         .cloned()
 }

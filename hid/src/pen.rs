@@ -83,7 +83,7 @@ fn pick(d: &ReportDescriptor, page: u16, usage_id: u16) -> Option<UsagePick> {
 /// minimum-required field set (Tip Switch + X + Y).
 pub fn detect(d: &ReportDescriptor) -> Option<PenProfile> {
     let has_pen_root = d.top_level_apps.iter().any(|&(p, u)| {
-        p == digitizer::PAGE && (u == digitizer::PEN || u == 0x20 /* Stylus */)
+        p == digitizer::PAGE && (u == digitizer::PEN || u == 0x20/* Stylus */)
     });
     if !has_pen_root {
         return None;
