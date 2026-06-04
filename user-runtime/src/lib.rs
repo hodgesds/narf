@@ -159,6 +159,8 @@ mod arch_syscalls {
     pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 147;
     pub const SYS_MLOCK: u64 = 149;
     pub const SYS_MUNLOCK: u64 = 150;
+    // madvise — Linux x86_64 syscall 28. Wave-66.
+    pub const SYS_MADVISE: u64 = 28;
     pub const SYS_PRCTL: u64 = 157;
     pub const SYS_SETRLIMIT: u64 = 160;
     pub const SYS_MOUNT: u64 = 165;
@@ -314,6 +316,8 @@ mod arch_syscalls {
     pub const SYS_MPROTECT: u64 = 226;
     pub const SYS_MLOCK: u64 = 228;
     pub const SYS_MUNLOCK: u64 = 229;
+    // madvise — aarch64 generic ABI syscall 233. Wave-66.
+    pub const SYS_MADVISE: u64 = 233;
     pub const SYS_WAIT4: u64 = 260;
     pub const SYS_PRLIMIT64: u64 = 261;
     pub const SYS_GETRANDOM: u64 = 278;
@@ -1831,6 +1835,30 @@ pub unsafe fn mlock(addr: *const u8, len: usize) -> Result<(), ()> {
 pub unsafe fn munlock(addr: *const u8, len: usize) -> Result<(), ()> {
     // SAFETY: SYS_MUNLOCK signature: arg0 base, arg1 len.
     let r = unsafe { syscall2(SYS_MUNLOCK, addr as u64, len as u64) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// `madvise(addr, len, advice)` — Linux syscall 28. Hint to the
+/// kernel about how the calling task intends to use the page range.
+/// MADV_DONTNEED (4) and MADV_FREE (8) release the backing frames
+/// so the next access reads zero. Every other advice value is a
+/// successful no-op.
+///
+/// Returns `Ok(())` on success, `Err(())` on failure (no region
+/// intersects, AS lookup failed, …).
+///
+/// # Safety
+/// `addr` should point at a previously-mmap'd region in the calling
+/// task's AS. Issuing MADV_DONTNEED on a page the caller is actively
+/// using drops the contents — the next read returns zero.
+#[inline]
+pub unsafe fn madvise(addr: *mut u8, len: usize, advice: i32) -> Result<(), ()> {
+    // SAFETY: SYS_MADVISE signature: arg0 base, arg1 len, arg2 advice.
+    let r = unsafe { syscall3(SYS_MADVISE, addr as u64, len as u64, advice as u64) };
     if r == 0 {
         Ok(())
     } else {

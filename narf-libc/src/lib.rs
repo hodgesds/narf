@@ -163,7 +163,10 @@ pub use posix::{
 pub use sys::{
     brk, cpu_set_t, dlclose, dlerror, dlopen, dlsym, getcpu, getrlimit,
     getrusage, madvise, mlock, mlockall, mmap, mprotect, mremap, munlock,
-    munlockall, munmap, prlimit, rlimit, rusage, sbrk,
+    munlockall, munmap, posix_madvise, prlimit, rlimit, rusage, sbrk,
+    MADV_DOFORK, MADV_DODUMP, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED,
+    MADV_FREE, MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_RANDOM,
+    MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED,
     sched_get_priority_max, sched_get_priority_min, sched_getaffinity,
     sched_getcpu, sched_getparam, sched_param, sched_setaffinity,
     sched_setparam, setrlimit, sysinfo, sysinfo_t, uname, utsname,

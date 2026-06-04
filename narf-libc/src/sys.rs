@@ -136,12 +136,54 @@ pub unsafe extern "C" fn mlockall(_flags: c_int) -> c_int { 0 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn munlockall() -> c_int { 0 }
 
-/// `madvise(addr, len, advice)` — accept and ignore. `MADV_DONTNEED`
-/// in particular is a routine performance hint with no correctness
-/// requirement.
+// ── <sys/mman.h> madvise constants ──────────────────────────────────
+//
+// Linux POSIX madvise advice values. NARF honours MADV_DONTNEED and
+// MADV_FREE (both release the backing frames so the next access reads
+// zero); every other advice value succeeds as a no-op.
+pub const MADV_NORMAL:     c_int = 0;
+pub const MADV_RANDOM:     c_int = 1;
+pub const MADV_SEQUENTIAL: c_int = 2;
+pub const MADV_WILLNEED:   c_int = 3;
+pub const MADV_DONTNEED:   c_int = 4;
+pub const MADV_FREE:       c_int = 8;
+pub const MADV_REMOVE:     c_int = 9;
+pub const MADV_DONTFORK:   c_int = 10;
+pub const MADV_DOFORK:     c_int = 11;
+pub const MADV_HUGEPAGE:   c_int = 14;
+pub const MADV_NOHUGEPAGE: c_int = 15;
+pub const MADV_DONTDUMP:   c_int = 16;
+pub const MADV_DODUMP:     c_int = 17;
+
+/// `madvise(addr, len, advice)` — hint about how `[addr, addr+len)`
+/// will be used. MADV_DONTNEED / MADV_FREE release the backing frames
+/// so the next access reads zero; every other advice value is a
+/// successful no-op. Backed by the kernel SYS_MADVISE.
+///
+/// Returns 0 on success, -1 + errno=ENOMEM on failure (no region
+/// intersects, range misaligned, AS lookup failed). Matches Linux's
+/// madvise(2) errno mapping: `EINVAL` would arguably fit misaligned
+/// args better, but jemalloc/mimalloc consumers treat ENOMEM as
+/// "back off and retry" which is the right behaviour for either case.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn madvise(_addr: *mut c_void, _len: usize, _advice: c_int) -> c_int {
-    0
+pub unsafe extern "C" fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int {
+    // SAFETY: forwarded; user-runtime issues SYS_MADVISE.
+    match unsafe { narf_user_runtime::madvise(addr as *mut u8, len, advice) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(12); // ENOMEM
+            -1
+        }
+    }
+}
+
+/// `posix_madvise(addr, len, advice)` — POSIX alias of madvise with
+/// the same advice values pinned (POSIX_MADV_* = MADV_*). Backed by
+/// the same kernel surface.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn posix_madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int {
+    // SAFETY: same as madvise.
+    unsafe { madvise(addr, len, advice) }
 }
 
 /// `brk(end_data_segment)` — Linux brk(2). Sets the program-break
