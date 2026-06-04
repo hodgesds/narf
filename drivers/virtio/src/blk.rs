@@ -349,9 +349,9 @@ impl VirtioBlkDevice {
         // completions land in microseconds; this is the "device
         // wedged / lost MSI / EC quirk" fallback that keeps a dead
         // device from parking the await forever.
-        let waiter = self.irq_vector.map(|v| {
-            narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000))
-        });
+        let waiter = self
+            .irq_vector
+            .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
         let fut = self.submit(req);
         if let Some(w) = waiter {
             // Await the IRQ (or timeout) first so we don't busy-poll

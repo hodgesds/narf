@@ -250,8 +250,14 @@ impl core::fmt::Debug for VirtioNetPci {
         f.debug_struct("VirtioNetPci")
             .field("ready", &self.ready)
             .field("num_pairs", &self.pairs.len())
-            .field("rx_qsize", &self.pairs.first().map(|p| p.rx_qsize).unwrap_or(0))
-            .field("tx_qsize", &self.pairs.first().map(|p| p.tx_qsize).unwrap_or(0))
+            .field(
+                "rx_qsize",
+                &self.pairs.first().map(|p| p.rx_qsize).unwrap_or(0),
+            )
+            .field(
+                "tx_qsize",
+                &self.pairs.first().map(|p| p.tx_qsize).unwrap_or(0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -656,8 +662,7 @@ impl VirtioNetPci {
         device: &BusDevice,
     ) -> Result<u8, VirtioPciError> {
         // SAFETY: caller-owns the device.
-        let (v, table) =
-            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 0) }?;
+        let (v, table) = unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 0) }?;
         self.irq_vector = Some(v);
         self.msix = Some(table);
         Ok(v)
@@ -675,8 +680,7 @@ impl VirtioNetPci {
         device: &BusDevice,
     ) -> Result<u8, VirtioPciError> {
         // SAFETY: caller-owns the device.
-        let (v, table) =
-            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 1) }?;
+        let (v, table) = unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 1) }?;
         self.tx_irq_vector = Some(v);
         // Replace the MSI-X table handle with the latest one
         // (enable_msix_queue allocates a fresh slot in the
@@ -847,11 +851,7 @@ impl VirtioNetPci {
         if !self.has_ctrl_mac_addr {
             return Err(VirtioPciError::NoQueues);
         }
-        let ack = self.submit_control(
-            VIRTIO_NET_CTRL_MAC,
-            VIRTIO_NET_CTRL_MAC_ADDR_SET,
-            &mac,
-        )?;
+        let ack = self.submit_control(VIRTIO_NET_CTRL_MAC, VIRTIO_NET_CTRL_MAC_ADDR_SET, &mac)?;
         if ack != VIRTIO_NET_OK {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
@@ -900,12 +900,7 @@ impl VirtioNetPci {
     /// callers, so concurrent set_promisc + set_allmulti pairs are
     /// fine but interleaving is sequential. Control commands are
     /// rare (PHY-driven events), so no contention concern.
-    pub fn submit_control(
-        &self,
-        class: u8,
-        cmd: u8,
-        payload: &[u8],
-    ) -> Result<u8, VirtioPciError> {
+    pub fn submit_control(&self, class: u8, cmd: u8, payload: &[u8]) -> Result<u8, VirtioPciError> {
         let ctrl = self.ctrl.as_ref().ok_or(VirtioPciError::NoQueues)?;
         let mut g = ctrl.lock();
         // Layout within `buf`:
@@ -952,10 +947,9 @@ impl VirtioNetPci {
                 next: 0,
             },
         ];
-        let head = g
-            .q
-            .add_buffer(&descs)
-            .ok_or(VirtioPciError::QueueTooSmall)?;
+        let head =
+            g.q.add_buffer(&descs)
+                .ok_or(VirtioPciError::QueueTooSmall)?;
         let notify_off = (g.notify_off as u64) * (self.notify_off_multiplier as u64);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped notify region. Notify the runtime
@@ -986,8 +980,7 @@ impl VirtioNetPci {
     /// the ack wasn't `VIRTIO_NET_OK`.
     pub fn set_promisc(&self, on: bool) -> Result<(), VirtioPciError> {
         let payload = [u8::from(on)];
-        let ack =
-            self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_PROMISC, &payload)?;
+        let ack = self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_PROMISC, &payload)?;
         if ack != VIRTIO_NET_OK {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
@@ -1000,8 +993,7 @@ impl VirtioNetPci {
     /// without per-address filter setup.
     pub fn set_allmulti(&self, on: bool) -> Result<(), VirtioPciError> {
         let payload = [u8::from(on)];
-        let ack =
-            self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_ALLMULTI, &payload)?;
+        let ack = self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_ALLMULTI, &payload)?;
         if ack != VIRTIO_NET_OK {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
@@ -1191,8 +1183,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     };
     let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
     let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
-    let iface =
-        narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
+    let iface = narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
     let authority = narf_net::bootstrap_authority();
     // Registration failure leaks the iface (returned by-value into
     // the registry would have moved it) — we constructed it above
@@ -1224,11 +1215,9 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     // fallback period — if the MSI-X path goes
                     // silent we re-poll the rx queue at the same
                     // cadence the no-IRQ branch uses.
-                    let _ = narf_interrupts::wait_for_irq_until(
-                        v,
-                        narf_time::Deadline::after_ms(100),
-                    )
-                    .await;
+                    let _ =
+                        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(100))
+                            .await;
                 } else {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
                 }
@@ -1337,8 +1326,7 @@ fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
         return Err(());
     }
-    let mut buf =
-        alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| ())?;
+    let mut buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| ())?;
     {
         let slice = buf.as_mut_slice();
         if slice.len() < frame.len() {
@@ -1416,4 +1404,3 @@ pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
 pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
     CONTROLLERS.lock().get(idx).map(f)
 }
-

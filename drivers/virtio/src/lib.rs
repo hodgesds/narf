@@ -27,8 +27,8 @@ pub mod scsi_pci;
 pub mod snd_pci;
 pub mod vsock_pci;
 
-mod tests;
 mod e2e_tests;
+mod tests;
 
 /// Stage::Subsys initcalls — register every virtio-PCI driver with
 /// the bus match table. Each call is idempotent on its own; the
@@ -138,11 +138,9 @@ fn spawn_input_pump_task() {
                     // still re-poll the device every cycle. The
                     // drain_events() call below works the same
                     // whether woken by IRQ or timeout.
-                    let _ = narf_interrupts::wait_for_irq_until(
-                        v,
-                        narf_time::Deadline::after_ms(100),
-                    )
-                    .await;
+                    let _ =
+                        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(100))
+                            .await;
                 } else {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
                 }

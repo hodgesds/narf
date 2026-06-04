@@ -896,9 +896,8 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
     // Construct waiter BEFORE submit so a synchronously-delivered
     // MSI-X (QEMU completes virtio-blk reads inline) can't slip past
     // us — the future's baseline is the pre-submit fire_count.
-    let waiter = vector.map(|v| {
-        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000))
-    });
+    let waiter = vector
+        .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
     let (head, payload, status_phys, payload_phys) = {
         let g = CONTROLLER.lock();
         let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
@@ -930,9 +929,8 @@ pub async fn write_sector_irq_async(sector: u64, data: [u8; 512]) -> Result<(), 
         let g = CONTROLLER.lock();
         g.as_ref().ok_or(VirtioPciError::NoQueues)?.irq_vector
     };
-    let waiter = vector.map(|v| {
-        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000))
-    });
+    let waiter = vector
+        .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
     let (head, payload, status_phys) = {
         let g = CONTROLLER.lock();
         let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;

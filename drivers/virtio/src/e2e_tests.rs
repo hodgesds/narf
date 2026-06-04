@@ -247,10 +247,7 @@ fn smoke_e2e_common_status_state_machine() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_common_status_state_machine
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_common_status_state_machine);
 
 /// Smoke 2 — Virtqueue 0 init: desc ring, avail ring, used ring
 /// addresses recorded (VirtIO 1.2 §3.2.1, §4.2.2).
@@ -375,7 +372,7 @@ fn smoke_e2e_blk_read_descriptor_chain() -> TestResult {
     let descs = [
         VirtqDesc {
             addr: header_phys,
-            len: 16, // sizeof(virtio_blk_req) minus the 512-byte data
+            len: 16,  // sizeof(virtio_blk_req) minus the 512-byte data
             flags: 0, // device-readable → no WRITE flag
             next: 0,
         },
@@ -427,10 +424,7 @@ fn smoke_e2e_blk_read_descriptor_chain() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_blk_read_descriptor_chain
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_blk_read_descriptor_chain);
 
 /// Smoke 4 — virtio-blk WRITE descriptor chain flags.
 ///
@@ -476,7 +470,9 @@ fn smoke_e2e_blk_write_descriptor_chain() -> TestResult {
 
     // desc[1] must NOT have WRITE flag for a WRITE request.
     if descs[1].flags & VIRTQ_DESC_F_WRITE != 0 {
-        return TestResult::Fail("desc[1] for WRITE request must be device-readable (no WRITE flag)");
+        return TestResult::Fail(
+            "desc[1] for WRITE request must be device-readable (no WRITE flag)",
+        );
     }
     // Status descriptor must always have WRITE flag.
     if descs[2].flags & VIRTQ_DESC_F_WRITE == 0 {
@@ -484,10 +480,7 @@ fn smoke_e2e_blk_write_descriptor_chain() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_blk_write_descriptor_chain
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_blk_write_descriptor_chain);
 
 /// Smoke 5 — virtio-blk live read+write round-trip (QEMU only).
 ///
@@ -551,12 +544,11 @@ fn smoke_e2e_net_feature_negotiation_wire() -> TestResult {
     const F_MQ: u64 = 22;
     const F_VERSION_1: u64 = crate::VIRTIO_F_VERSION_1;
 
-    let device_feats: u64 = (1 << F_MAC) | (1 << F_STATUS) | (1 << F_CTRL_VQ) | (1 << F_MQ)
-        | (1 << F_VERSION_1);
+    let device_feats: u64 =
+        (1 << F_MAC) | (1 << F_STATUS) | (1 << F_CTRL_VQ) | (1 << F_MQ) | (1 << F_VERSION_1);
 
     // Driver accepts the subset it cares about.
-    let driver_feats: u64 =
-        (1 << F_MAC) | (1 << F_STATUS) | (1 << F_CTRL_VQ) | (1 << F_VERSION_1);
+    let driver_feats: u64 = (1 << F_MAC) | (1 << F_STATUS) | (1 << F_CTRL_VQ) | (1 << F_VERSION_1);
 
     // Every feature the driver accepted must have been offered by the device.
     if driver_feats & !device_feats != 0 {
@@ -594,10 +586,7 @@ fn smoke_e2e_net_feature_negotiation_wire() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_net_feature_negotiation_wire
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_net_feature_negotiation_wire);
 
 /// Smoke 7 — TX descriptor chain: virtio_net_hdr + frame bytes.
 ///
@@ -674,10 +663,7 @@ fn smoke_e2e_net_tx_descriptor_chain() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_net_tx_descriptor_chain
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_net_tx_descriptor_chain);
 
 /// Smoke 8 — virtio-net live TX + queue sizes (QEMU only).
 ///
@@ -699,10 +685,7 @@ fn smoke_e2e_net_live_tx_queue_sizes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_net_live_tx_queue_sizes
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_net_live_tx_queue_sizes);
 
 // ── VIRTIO-GPU ───────────────────────────────────────────────────────
 //
@@ -745,10 +728,7 @@ fn smoke_e2e_gpu_get_display_info_header() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_gpu_get_display_info_header
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_gpu_get_display_info_header);
 
 /// Smoke 10 — RESOURCE_CREATE_2D round-trip.
 ///
@@ -842,10 +822,7 @@ fn smoke_e2e_gpu_attach_backing_1080p() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_gpu_attach_backing_1080p
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_gpu_attach_backing_1080p);
 
 // ── VIRTIO-INPUT ─────────────────────────────────────────────────────
 //
@@ -892,10 +869,7 @@ fn smoke_e2e_input_event_wire_layout() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_input_event_wire_layout
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_input_event_wire_layout);
 
 /// Smoke 13 — Inject EV_KEY/KEY_A via synthetic event feed.
 ///
@@ -1016,10 +990,7 @@ fn smoke_e2e_common_reset_reverts_state() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_common_reset_reverts_state
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_common_reset_reverts_state);
 
 /// Smoke 15 — ISR / notify doorbell simulation.
 ///
@@ -1064,10 +1035,7 @@ fn smoke_e2e_common_isr_notify_ack_cycle() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_common_isr_notify_ack_cycle
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_common_isr_notify_ack_cycle);
 
 // ── ADDITIONAL COVERAGE ───────────────────────────────────────────────
 //
@@ -1107,10 +1075,7 @@ fn smoke_e2e_input_cfg_id_name_decode() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_input_cfg_id_name_decode
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_input_cfg_id_name_decode);
 
 /// Smoke 17 — virtio-gpu TRANSFER_TO_HOST_2D + RESOURCE_FLUSH wire.
 ///
@@ -1155,10 +1120,7 @@ fn smoke_e2e_gpu_transfer_and_flush_wire() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/virtio/e2e",
-    smoke_e2e_gpu_transfer_and_flush_wire
-);
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_gpu_transfer_and_flush_wire);
 
 /// Smoke 18 — virtio-blk register_block_device name (QEMU only).
 ///

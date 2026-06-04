@@ -261,13 +261,12 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     // Skip if a real arm callback (e.g. timer_pump's wheel_arm)
     // is already installed so we don't clobber it.
     fn _wheel_arm_noop(_deadline_cycles: u64) {}
-    let _wheel_arm_installed_by_us =
-        if !narf_time::timer_wheel::arm_callback_installed() {
-            narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
-            true
-        } else {
-            false
-        };
+    let _wheel_arm_installed_by_us = if !narf_time::timer_wheel::arm_callback_installed() {
+        narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
+        true
+    } else {
+        false
+    };
     // SAFETY: enter the wait loop with IRQs DISABLED.
     unsafe {
         narf_arch::disable_interrupts();
@@ -463,13 +462,12 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     // breaks the HLT idle loop in kernel-test mode where
     // timer_pump::init never ran).
     fn _wheel_arm_noop(_deadline_cycles: u64) {}
-    let _wheel_arm_installed_by_us =
-        if !narf_time::timer_wheel::arm_callback_installed() {
-            narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
-            true
-        } else {
-            false
-        };
+    let _wheel_arm_installed_by_us = if !narf_time::timer_wheel::arm_callback_installed() {
+        narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
+        true
+    } else {
+        false
+    };
     // SAFETY: IF=0 idle pattern.
     unsafe {
         narf_arch::disable_interrupts();
@@ -535,8 +533,8 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
     // Build a synthetic 64-byte frame in a fresh DMA buffer and
     // hand it to tx_dma — zero-copy: the device descriptor will
     // point at this buffer directly.
-    let mut tx_buf = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
-        .expect("alloc tx scratch");
+    let mut tx_buf =
+        narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc tx scratch");
     {
         let slice = tx_buf.as_mut_slice();
         for i in 14..64 {
@@ -579,8 +577,8 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
     if probe_all_pci(&authority).is_err() {
         return TestResult::Fail("probe_all_pci");
     }
-    let mut tx_dma = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
-        .expect("alloc arp scratch");
+    let mut tx_dma =
+        narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc arp scratch");
     {
         let f = tx_dma.as_mut_slice();
         for i in 0..6 {
@@ -663,7 +661,10 @@ fn smoke_virtio_net_pci_registers_iface() -> TestResult {
         None => TestResult::Fail("vnet0 not registered with narf_net::registry()"),
     }
 }
-kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_registers_iface);
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_registers_iface
+);
 
 fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
     // The TCP stack consumes from narf_net::iface (fn-pointer
@@ -837,10 +838,7 @@ fn smoke_virtio_net_pci_dhcp_acquire() -> TestResult {
         Err(()) => TestResult::Skip("DHCP timed out — no user-mode netdev?"),
     }
 }
-kernel_test_in!(
-    "drivers/virtio/net-pci",
-    smoke_virtio_net_pci_dhcp_acquire
-);
+kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_dhcp_acquire);
 
 fn smoke_virtio_net_pci_count_matches_probe() -> TestResult {
     use crate::net_pci;
@@ -870,15 +868,13 @@ fn smoke_virtio_net_pci_ctrl_vq_set_promisc() -> TestResult {
     }
     // Enable promisc, then disable. Both must round-trip through
     // the device with VIRTIO_NET_OK acks.
-    let on = net_pci::with_controller(|c| c.set_promisc(true)).unwrap_or(Err(
-        crate::pci::VirtioPciError::NoQueues,
-    ));
+    let on = net_pci::with_controller(|c| c.set_promisc(true))
+        .unwrap_or(Err(crate::pci::VirtioPciError::NoQueues));
     if on.is_err() {
         return TestResult::Fail("promisc=on rejected");
     }
-    let off = net_pci::with_controller(|c| c.set_promisc(false)).unwrap_or(Err(
-        crate::pci::VirtioPciError::NoQueues,
-    ));
+    let off = net_pci::with_controller(|c| c.set_promisc(false))
+        .unwrap_or(Err(crate::pci::VirtioPciError::NoQueues));
     if off.is_err() {
         return TestResult::Fail("promisc=off rejected");
     }
@@ -911,8 +907,8 @@ fn smoke_virtio_net_pci_mq_pairs_consistent() -> TestResult {
         return TestResult::Fail("primary-pair queue sizes zero");
     }
     // tx_dma_on(0) should accept a small frame even with MQ active.
-    let mut buf = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
-        .expect("alloc tx scratch");
+    let mut buf =
+        narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc tx scratch");
     {
         let s = buf.as_mut_slice();
         for (i, b) in s.iter_mut().enumerate().take(64) {

@@ -32,8 +32,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use narf_input::{
-    abs, push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, KeyCode,
-    PointerButtons, PointerEvent, TouchEvent,
+    abs, push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, KeyCode, PointerButtons,
+    PointerEvent, TouchEvent,
 };
 
 /// True when `code` belongs to the Linux evdev BTN_* range but
@@ -483,11 +483,7 @@ impl VirtioInputPci {
                 common.write16(CC_QUEUE_ENABLE, 1);
             }
             // SAFETY: zero-initialised coherent DMA.
-            (
-                unsafe { Virtqueue::new(layout_s) },
-                q1_buf,
-                Some(s_notify),
-            )
+            (unsafe { Virtqueue::new(layout_s) }, q1_buf, Some(s_notify))
         } else {
             // Make a placeholder zero-size Virtqueue is awkward; reuse
             // a tiny buffer + size=1 layout instead. LED writes are
@@ -572,10 +568,7 @@ impl VirtioInputPci {
             name,
             axis_info,
             notify_off_multiplier,
-            queues: IrqSafeSpinLock::new(Some(Queues {
-                event_q,
-                status_q,
-            })),
+            queues: IrqSafeSpinLock::new(Some(Queues { event_q, status_q })),
             rx_buf,
             _status_buf: q1_buf,
             _q0_layout_buf: q0_buf,
@@ -833,10 +826,7 @@ impl VirtioInputPci {
                         // isn't keyboard or mouse-pointer-button
                         // shaped. Consumers compare `code` against
                         // narf_input::btn constants.
-                        let _ = push_global(InputEvent::Button(ButtonEvent {
-                            code,
-                            pressed,
-                        }));
+                        let _ = push_global(InputEvent::Button(ButtonEvent { code, pressed }));
                     } else {
                         let kc = KeyCode::from_evdev(code);
                         let _ = push_key(kc, pressed);
@@ -857,14 +847,16 @@ impl VirtioInputPci {
                             // immediately — wheels are already
                             // semantically discrete, so there's
                             // nothing to accumulate-until-SYN.
-                            let _ = push_global(InputEvent::Scroll(
-                                narf_input::ScrollEvent { dx: 0, dy: delta },
-                            ));
+                            let _ = push_global(InputEvent::Scroll(narf_input::ScrollEvent {
+                                dx: 0,
+                                dy: delta,
+                            }));
                         }
                         REL_HWHEEL => {
-                            let _ = push_global(InputEvent::Scroll(
-                                narf_input::ScrollEvent { dx: delta, dy: 0 },
-                            ));
+                            let _ = push_global(InputEvent::Scroll(narf_input::ScrollEvent {
+                                dx: delta,
+                                dy: 0,
+                            }));
                         }
                         _ => {}
                     }
@@ -895,8 +887,7 @@ impl VirtioInputPci {
                             match code {
                                 c if c == abs::ABS_MT_TRACKING_ID => {
                                     // evdev: -1 means "slot released".
-                                    slot.tracking_id =
-                                        if signed < 0 { None } else { Some(signed) };
+                                    slot.tracking_id = if signed < 0 { None } else { Some(signed) };
                                 }
                                 c if c == abs::ABS_MT_POSITION_X => slot.x = signed,
                                 c if c == abs::ABS_MT_POSITION_Y => slot.y = signed,
@@ -927,11 +918,7 @@ impl VirtioInputPci {
                     let buttons =
                         PointerButtons::from_bits_truncate(self.buttons.load(Ordering::Acquire));
                     if dx != 0 || dy != 0 || buttons != PointerButtons::EMPTY {
-                        let _ = push_global(InputEvent::Pointer(PointerEvent {
-                            dx,
-                            dy,
-                            buttons,
-                        }));
+                        let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
                     }
                     // Flush every dirty MT slot as one Touch event.
                     // Pulled out under the lock so concurrent EV_ABS
@@ -1197,11 +1184,7 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
                 let dx = rel_dx.swap(0, Ordering::AcqRel);
                 let dy = rel_dy.swap(0, Ordering::AcqRel);
                 if dx != 0 || dy != 0 || buttons != PointerButtons::EMPTY {
-                    let _ = push_global(InputEvent::Pointer(PointerEvent {
-                        dx,
-                        dy,
-                        buttons,
-                    }));
+                    let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
                 }
                 for (idx, slot) in mt.slots.iter_mut().enumerate() {
                     if slot.dirty {
