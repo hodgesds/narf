@@ -561,6 +561,24 @@ pub enum Syscall {
     /// Returns 0 on success, !0u64 on failure.
     Unshare,
 
+    /// `chroot(path)` — Linux 161 (x86_64) / 51 (aarch64). Rebind the
+    /// calling task's notion of `/` to `path`. After chroot, every
+    /// absolute path the task hands to a path-resolving syscall is
+    /// transparently rewritten under `path` before resolution.
+    /// arg0 = path ptr, arg1 = path len. Returns 0 / !0u64.
+    /// Gated behind `linux-compat`.
+    Chroot,
+
+    /// `pivot_root(new_root, put_old)` — Linux 155 (x86_64) / 41
+    /// (aarch64). Atomically swap the calling task's root with
+    /// `new_root`; the previous root becomes accessible at
+    /// `put_old` (an absolute path under the new root). Used by
+    /// container-init to drop the bootstrap root after mounting
+    /// the new image. arg0 = new_root ptr, arg1 = new_root len,
+    /// arg2 = put_old ptr, arg3 = put_old len. Returns 0 / !0u64.
+    /// Gated behind `linux-compat` + `container`.
+    PivotRoot,
+
     /// `sigreturn()` — restore the calling task's user-mode trap
     /// context from a SigContext frame at the current RSP. Called
     /// from a libc-provided signal trampoline after the user's
@@ -1507,6 +1525,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Madvise, 28),
     (Syscall::Prctl, 157),
     (Syscall::Setrlimit, 160),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Chroot, 161),
+    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    (Syscall::PivotRoot, 155),
     (Syscall::Mount, 165),
     (Syscall::Umount2, 166),
     (Syscall::SetHostname, 170),
@@ -1586,6 +1608,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Renameat, 38),
     (Syscall::Umount2, 39),
     (Syscall::Mount, 40),
+    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    (Syscall::PivotRoot, 41),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Chroot, 51),
     (Syscall::Fallocate, 47),
     (Syscall::Faccessat, 48),
     (Syscall::Chdir, 49),

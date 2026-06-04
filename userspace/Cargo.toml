@@ -48,12 +48,13 @@ user-mode-e2e = []
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # set_tid_address, mprotect, madvise, dynamic-linker plumbing,
 # pthread bring-up under relibc, fcntl(2) extensions, signalfd, memfd,
-# Linux ABI struct stat + statx.
+# Linux ABI struct stat + statx, mount/umount2/chroot.
 linux-compat = ["narf-memory/linux-compat"]
 
 # Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
 # Orthogonal to linux-compat — a container runtime needs both; a
-# namespace-aware native kernel needs only this.
+# namespace-aware native kernel needs only this. pivot_root also
+# requires both linux-compat and container.
 container = []
 
 [lints]

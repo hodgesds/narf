@@ -68,6 +68,7 @@ pub mod tls;
 pub mod user_task;
 pub mod xdp_socket;
 
+mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;
 mod tests;

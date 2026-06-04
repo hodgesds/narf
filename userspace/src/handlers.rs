@@ -7095,7 +7095,21 @@ fn copy_user_str(ptr: *const u8, len: usize, cap: usize) -> Result<alloc::string
 /// Uses [`copy_from_user`] for the SMAP-bracketed copy, then validates
 /// as UTF-8.  Returns `None` on null pointer, zero length, length > 4 KiB,
 /// copy failure, or UTF-8 violation.
+///
+/// Under `linux-compat`, absolute paths are rewritten through the
+/// calling task's chroot prefix (if any) so every path-resolving
+/// syscall transparently respects chroot(2) / pivot_root(2). Use
+/// `copy_user_path_raw` to bypass the chroot rewrite (the chroot
+/// syscalls themselves want the literal user string).
 fn copy_user_path(ptr: u64, len: usize) -> Option<alloc::string::String> {
+    let raw = copy_user_path_raw(ptr, len)?;
+    Some(apply_chroot(&raw))
+}
+
+/// Like `copy_user_path` but never applies the chroot rewrite. Used
+/// by chroot(2) / pivot_root(2) themselves so the kernel sees the
+/// literal target the caller typed.
+fn copy_user_path_raw(ptr: u64, len: usize) -> Option<alloc::string::String> {
     if len == 0 || ptr == 0 || len > 4096 {
         return None;
     }
@@ -7256,6 +7270,20 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     Ok(())
 }
 
+// Wave-71: Linux MS_* flag bits — userspace passes them in arg5.
+// Only the bits NARF acts on are documented here; the rest are
+// accepted but currently a no-op (relatime, nosuid, nodev, noexec,
+// ro modulate read-only state — they're parked until the FsInstance
+// trait grows a per-mount option vector).
+const MS_RDONLY: u64 = 1 << 0;
+const MS_NOSUID: u64 = 1 << 1;
+const MS_NODEV: u64 = 1 << 2;
+const MS_NOEXEC: u64 = 1 << 3;
+const MS_REMOUNT: u64 = 1 << 5;
+const MS_BIND: u64 = 1 << 12;
+const MS_REC: u64 = 1 << 14;
+const MS_RELATIME: u64 = 1 << 21;
+
 fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok(!0u64);
@@ -7267,12 +7295,22 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let target = match copy_user_str(args.arg2 as *const u8, args.arg3 as usize, 256) {
+    let target_raw = match copy_user_str(args.arg2 as *const u8, args.arg3 as usize, 256) {
         Ok(s) => s,
         Err(()) => {
             ctx.set_return(fail);
             return;
         }
+    };
+    // Resolve target under the calling task's chroot.
+    let target = apply_chroot(target_raw.as_str());
+    // Resolve source under chroot too when it's a path (bind / tmpfs
+    // source-as-label is harmless to pass through; block-device names
+    // don't start with `/` so apply_chroot is a no-op).
+    let source_resolved = if source.starts_with('/') {
+        apply_chroot(source.as_str())
+    } else {
+        source.clone()
     };
     // arg4 packs (fstype_ptr<<32 | fstype_len) — fstype is short
     // (< 32 chars in practice) so 32 bits each is plenty.
@@ -7285,15 +7323,40 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // arg5 carries the MS_* flag word.
+    let flags = args.arg5;
+    // Silence-the-warning swallow for option bits we accept but
+    // don't yet act on; they're documented above.
+    let _ = flags
+        & (MS_RDONLY
+            | MS_NOSUID
+            | MS_NODEV
+            | MS_NOEXEC
+            | MS_REMOUNT
+            | MS_REC
+            | MS_RELATIME);
 
     let auth = narf_filesystem::bootstrap_mount_authority();
     let domain = narf_lib::id::DomainId::DRIVER_0;
 
-    // Bind mount: `source` is an absolute path to an existing mount;
-    // `target` is the new path. No block device involved.
-    if fstype == "bind" {
-        return match narf_filesystem::registry().bind_mount(&auth, source.as_str(), target.as_str())
-        {
+    // Wave-71: MS_BIND or fstype=="bind" → bind mount. `source` is
+    // an absolute path; `target` is the new path. No block device.
+    if fstype == "bind" || (flags & MS_BIND) != 0 {
+        return match narf_filesystem::registry().bind_mount(
+            &auth,
+            source_resolved.as_str(),
+            target.as_str(),
+        ) {
+            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(fail),
+        };
+    }
+
+    // Wave-71: tmpfs / memfs — synthesize an empty in-memory FS.
+    if fstype == "tmpfs" || fstype == "ramfs" {
+        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::MemFs::new("tmpfs"));
+        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),
         };
@@ -7329,23 +7392,29 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     }
 }
 
+// Wave-71: Linux MNT_* flags for umount2(2).
+const MNT_FORCE: u64 = 1 << 0;
+const MNT_DETACH: u64 = 1 << 1;
+const MNT_EXPIRE: u64 = 1 << 2;
+const UMOUNT_NOFOLLOW: u64 = 1 << 3;
+
 fn sys_umount2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok(!0u64);
-    let target = match copy_user_str(args.arg0 as *const u8, args.arg1 as usize, 256) {
+    let target_raw = match copy_user_str(args.arg0 as *const u8, args.arg1 as usize, 256) {
         Ok(s) => s,
         Err(()) => {
             ctx.set_return(fail);
             return;
         }
     };
-    // We need the per-mount handle to call unmount(). Today the
-    // registry doesn't expose that lookup — every mount returned its
-    // handle to the original caller and we never stored it. As a
-    // pragmatic interim, mint a fresh authority and let the registry
-    // pop by path. Cap-side perfection lands once the per-task mount
-    // namespace work in task #93 wires per-process mount tables.
-    let _ = args.arg2; // flags ignored (MNT_FORCE / MNT_DETACH not yet wired)
+    let target = apply_chroot(target_raw.as_str());
+    let flags = args.arg2;
+    // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
+    // but the registry doesn't yet track in-flight refs against a
+    // mount, so the pop-by-path is unconditional. The flag word is
+    // recorded for diagnostic symmetry only.
+    let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
     let auth = narf_filesystem::bootstrap_mount_authority();
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
     // the registry uses internally to mint the per-mount handle.
@@ -7580,6 +7649,227 @@ fn sys_setns(ctx: &mut dyn TrapContext) {
     {
         ctx.set_return(SyscallReturn::ok(!0u64));
     }
+}
+
+// ── Wave-71: Per-task chroot table ────────────────────────────────
+//
+// Tracks each task's chroot-overridden notion of `/`. Absent entries
+// mean the task sees the global root; present entries cause every
+// absolute path the task hands to a path-resolving syscall to be
+// rewritten under the stored prefix before resolution.
+//
+// pivot_root atomically replaces the entry; chroot installs it
+// directly. fork inherits parent's entry; exec preserves it.
+// Stored under linux-compat because chroot(2) is the entry point;
+// pivot_root reuses the same slot.
+
+#[cfg(feature = "linux-compat")]
+static ROOT_DIR_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "linux-compat")]
+fn root_dir_init_if_needed() {
+    let mut g = ROOT_DIR_TABLE.lock();
+    if g.is_none() {
+        *g = Some(alloc::collections::BTreeMap::new());
+    }
+}
+
+/// Diagnostic: read the chroot prefix for `task`, or `None` if the
+/// task sees the global root. Used by tests + procfs.
+#[cfg(feature = "linux-compat")]
+pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
+    let g = ROOT_DIR_TABLE.lock();
+    g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+/// fork(2) inheritance — child inherits parent's chroot.
+#[cfg(feature = "linux-compat")]
+pub fn root_dir_fork(parent: u64, child: u64) {
+    let mut g = ROOT_DIR_TABLE.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(v) = map.get(&parent).cloned() {
+            map.insert(child, v);
+        }
+    }
+}
+
+/// Test hook — drop every per-task entry.
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn __test_root_dir_reset() {
+    *ROOT_DIR_TABLE.lock() = Some(alloc::collections::BTreeMap::new());
+}
+
+/// Rewrite `path` under the calling task's chroot, if any. Absolute
+/// paths get the chroot prefix prepended; relative paths pass
+/// through unchanged. Joining strips a leading `/` from `path` so
+/// the result has no double-slash.
+#[cfg(feature = "linux-compat")]
+fn apply_chroot(path: &str) -> alloc::string::String {
+    let task = current_task_id();
+    let prefix = {
+        let g = ROOT_DIR_TABLE.lock();
+        match g.as_ref().and_then(|m| m.get(&task).cloned()) {
+            Some(p) => p,
+            None => return alloc::string::String::from(path),
+        }
+    };
+    if !path.starts_with('/') {
+        return alloc::string::String::from(path);
+    }
+    // Compose prefix + path; prefix has no trailing `/` (except when
+    // it equals `/`), path starts with `/`.
+    let mut out = alloc::string::String::with_capacity(prefix.len() + path.len());
+    if prefix != "/" {
+        out.push_str(&prefix);
+    }
+    out.push_str(path);
+    out
+}
+
+#[cfg(not(feature = "linux-compat"))]
+#[inline]
+fn apply_chroot(path: &str) -> alloc::string::String {
+    alloc::string::String::from(path)
+}
+
+// ── Wave-71: chroot(2) ────────────────────────────────────────────
+#[cfg(feature = "linux-compat")]
+fn sys_chroot(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let raw = match copy_user_path_raw(args.arg0 as u64, args.arg1 as usize) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    if !raw.starts_with('/') {
+        ctx.set_return(fail);
+        return;
+    }
+    // Compose against any existing chroot (nested chroot resolves
+    // under the current root before installation).
+    let resolved = apply_chroot(&raw);
+    // Verify resolved exists as a directory under the global
+    // registry — match Linux semantics: chroot fails if target
+    // doesn't exist. We treat a covering mount as sufficient.
+    let covered = narf_filesystem::registry()
+        .resolve_absolute(&resolved, |_fs, _rel| true)
+        .unwrap_or(false);
+    if !covered {
+        ctx.set_return(fail);
+        return;
+    }
+    root_dir_init_if_needed();
+    let task = current_task_id();
+    let mut g = ROOT_DIR_TABLE.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task, resolved);
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
+// ── Wave-71: pivot_root(2) ────────────────────────────────────────
+//
+// Linux semantics: the calling task's old root becomes accessible at
+// `put_old` (an absolute path under `new_root`), and `new_root`
+// becomes the new `/`. NARF approximation: register `put_old`
+// (resolved under the new root) as a bind mount of the previous
+// root path, then install the new chroot.
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+fn sys_pivot_root(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let new_root = match copy_user_path_raw(args.arg0 as u64, args.arg1 as usize) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let put_old = match copy_user_path_raw(args.arg2 as u64, args.arg3 as usize) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    if !new_root.starts_with('/') || !put_old.starts_with('/') {
+        ctx.set_return(fail);
+        return;
+    }
+    // Resolve under the current chroot.
+    let new_root_resolved = apply_chroot(&new_root);
+    let put_old_resolved = apply_chroot(&put_old);
+    // Snapshot the prior root for bind-mounting.
+    let task = current_task_id();
+    let prior_root = {
+        let g = ROOT_DIR_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task).cloned())
+            .unwrap_or_else(|| alloc::string::String::from("/"))
+    };
+    // new_root must exist under the prior root.
+    let new_root_ok = narf_filesystem::registry()
+        .resolve_absolute(&new_root_resolved, |_fs, _rel| true)
+        .unwrap_or(false);
+    if !new_root_ok {
+        ctx.set_return(fail);
+        return;
+    }
+    // Bind-mount prior_root at put_old_resolved so the old root is
+    // still reachable from inside the new root.
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let _ = narf_filesystem::registry().bind_mount(&auth, &prior_root, &put_old_resolved);
+    // Install the new root.
+    root_dir_init_if_needed();
+    let mut g = ROOT_DIR_TABLE.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task, new_root_resolved);
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
+// ── Wave-71 test hooks ────────────────────────────────────────────
+//
+// Smokes in `mount_e2e_tests` drive the syscall handlers through a
+// synthetic TrapContext + kernel-heap path buffers. These thin
+// wrappers expose the file-private handlers without re-exporting
+// the entire `sys_*` family.
+
+#[doc(hidden)]
+pub fn sys_mount_for_test(ctx: &mut dyn TrapContext) {
+    sys_mount(ctx);
+}
+
+#[doc(hidden)]
+pub fn sys_umount2_for_test(ctx: &mut dyn TrapContext) {
+    sys_umount2(ctx);
+}
+
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn sys_chroot_for_test(ctx: &mut dyn TrapContext) {
+    sys_chroot(ctx);
+}
+
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+#[doc(hidden)]
+pub fn sys_pivot_root_for_test(ctx: &mut dyn TrapContext) {
+    sys_pivot_root(ctx);
+}
+
+#[doc(hidden)]
+pub fn apply_chroot_for_test(p: &str) -> alloc::string::String {
+    apply_chroot(p)
 }
 
 fn sys_fstatfs(ctx: &mut dyn TrapContext) {
@@ -11129,6 +11419,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
     table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
     table.install_raw(Syscall::Setns, "setns", RawFnHandler(sys_setns));
+    #[cfg(feature = "linux-compat")]
+    table.install_raw(Syscall::Chroot, "chroot", RawFnHandler(sys_chroot));
+    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    table.install_raw(
+        Syscall::PivotRoot,
+        "pivot_root",
+        RawFnHandler(sys_pivot_root),
+    );
     table.install_raw(Syscall::Sigreturn, "sigreturn", RawFnHandler(sys_sigreturn));
     table.install_raw(Syscall::SocketOpen, "socket", RawFnHandler(sys_socket));
     table.install_raw(Syscall::SocketBind, "bind", RawFnHandler(sys_socket_bind));
