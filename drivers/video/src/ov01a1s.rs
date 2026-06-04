@@ -254,4 +254,3 @@ impl SensorDriver for Ov01a1s {
         i2c_write_reg(bus, I2C_ADDR, REG_STREAM_CTRL, STREAM_OFF)
     }
 }
-

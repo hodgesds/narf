@@ -20,13 +20,11 @@
 //! - `drivers/media/usb/uvc/uvc_video.c` — `uvc_probe_video()` probe/commit
 //!   negotiation loop.
 
-use alloc::vec::Vec;
 use crate::uvc::{
-    ControlId, ControlRange, FormatDescriptor, PixelFmt,
-    ProbeCommit, StreamFormat, StreamHandle, TransferMode,
-    UvcProbeResult,
-    flatten_formats, parse_streaming_descriptors,
+    flatten_formats, parse_streaming_descriptors, ControlId, ControlRange, FormatDescriptor,
+    PixelFmt, ProbeCommit, StreamFormat, StreamHandle, TransferMode, UvcProbeResult,
 };
+use alloc::vec::Vec;
 
 // ── Error types ──────────────────────────────────────────────────────
 
@@ -69,7 +67,11 @@ pub struct StreamParams {
 
 impl StreamParams {
     pub fn fps(&self) -> u32 {
-        if self.frame_interval == 0 { 0 } else { 10_000_000 / self.frame_interval }
+        if self.frame_interval == 0 {
+            0
+        } else {
+            10_000_000 / self.frame_interval
+        }
     }
 }
 
@@ -148,10 +150,16 @@ impl Camera {
     ///
     /// Searches `self.formats` for a matching entry; returns
     /// `Err(UnsupportedFormat)` if none match.
-    pub fn build_probe(&self, pixel_fmt: PixelFmt, width: u16, height: u16, fps: u32)
-        -> Result<ProbeCommit>
-    {
-        let fmt = self.formats.iter()
+    pub fn build_probe(
+        &self,
+        pixel_fmt: PixelFmt,
+        width: u16,
+        height: u16,
+        fps: u32,
+    ) -> Result<ProbeCommit> {
+        let fmt = self
+            .formats
+            .iter()
             .find(|f| f.pixel_fmt == pixel_fmt)
             .ok_or(CameraError::UnsupportedFormat)?;
 
@@ -225,7 +233,10 @@ impl Camera {
     /// for every isochronous / bulk packet received from the device.
     /// Each packet must include the UVC payload header at offset 0.
     pub fn ingest_packet(&mut self, packet: &[u8]) -> Result<()> {
-        let handle = self.stream_handle.as_mut().ok_or(CameraError::NotStreaming)?;
+        let handle = self
+            .stream_handle
+            .as_mut()
+            .ok_or(CameraError::NotStreaming)?;
         handle.ingest_packet(packet);
         Ok(())
     }
@@ -236,7 +247,10 @@ impl Camera {
     ///
     /// Returns `Err(NoFrame)` when no complete frame has arrived yet.
     pub fn next_frame(&mut self) -> Result<crate::uvc::CompletedFrame> {
-        let handle = self.stream_handle.as_mut().ok_or(CameraError::NotStreaming)?;
+        let handle = self
+            .stream_handle
+            .as_mut()
+            .ok_or(CameraError::NotStreaming)?;
         handle.take_frame().ok_or(CameraError::NoFrame)
     }
 
@@ -264,10 +278,14 @@ impl Camera {
     pub fn control_routing(&self, id: ControlId) -> Result<(u8, u8)> {
         let (selector, is_ct) = id.selector_and_is_ct();
         let unit_id = if is_ct {
-            if self.ct_unit_id == 0 { return Err(CameraError::UnsupportedFormat); }
+            if self.ct_unit_id == 0 {
+                return Err(CameraError::UnsupportedFormat);
+            }
             self.ct_unit_id
         } else {
-            if self.pu_unit_id == 0 { return Err(CameraError::UnsupportedFormat); }
+            if self.pu_unit_id == 0 {
+                return Err(CameraError::UnsupportedFormat);
+            }
             self.pu_unit_id
         };
         Ok((unit_id, selector))

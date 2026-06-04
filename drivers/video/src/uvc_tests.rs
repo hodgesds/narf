@@ -28,20 +28,25 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 // ── Smoke 1: VC header descriptor decode ────────────────────────────
 
 fn smoke_uvc_vc_header_decode() -> TestResult {
-    use crate::uvc::descriptor::{VcHeader, VC_HEADER, CS_INTERFACE};
+    use crate::uvc::descriptor::{VcHeader, CS_INTERFACE, VC_HEADER};
 
     // Synthesise a valid VC_HEADER with bcdUVC=0x0150, wTotalLength=0x0027,
     // dwClockFrequency=48_000_000, bInCollection=1, baInterfaceNr=0x01.
     // Total: bLength=13, bDescriptorType=CS_INTERFACE, bDescriptorSubtype=VC_HEADER.
     let buf: &[u8] = &[
-        13,          // bLength
+        13,           // bLength
         CS_INTERFACE, // bDescriptorType
-        VC_HEADER,   // bDescriptorSubtype
-        0x50, 0x01,  // bcdUVC = 0x0150 (UVC 1.5)
-        0x27, 0x00,  // wTotalLength = 39
-        0x00, 0x6C, 0xDC, 0x02, // dwClockFrequency = 48_000_000
-        0x01,        // bInCollection = 1
-        0x01,        // baInterfaceNr[0] = 1
+        VC_HEADER,    // bDescriptorSubtype
+        0x50,
+        0x01, // bcdUVC = 0x0150 (UVC 1.5)
+        0x27,
+        0x00, // wTotalLength = 39
+        0x00,
+        0x6C,
+        0xDC,
+        0x02, // dwClockFrequency = 48_000_000
+        0x01, // bInCollection = 1
+        0x01, // baInterfaceNr[0] = 1
     ];
     let h = match VcHeader::parse(buf) {
         Ok(h) => h,
@@ -63,7 +68,7 @@ kernel_test_in!("drivers/video/uvc", smoke_uvc_vc_header_decode);
 // ── Smoke 2: Input Terminal (CAMERA) descriptor + controls ──────────
 
 fn smoke_uvc_camera_input_terminal() -> TestResult {
-    use crate::uvc::descriptor::{InputTerminal, VC_INPUT_TERMINAL, CS_INTERFACE, ITT_CAMERA};
+    use crate::uvc::descriptor::{InputTerminal, CS_INTERFACE, ITT_CAMERA, VC_INPUT_TERMINAL};
 
     // Table 3-6 minimal Camera Terminal: total 17 bytes.
     // bLength=17, bDescriptorType=CS_INTERFACE, bDescriptorSubtype=VC_INPUT_TERMINAL,
@@ -71,16 +76,24 @@ fn smoke_uvc_camera_input_terminal() -> TestResult {
     // wObjectiveFocalLengthMin=0, wObjectiveFocalLengthMax=0,
     // wOcularFocalLength=0, bControlSize=3, bmControls[3]=0x0E, 0x00, 0x00.
     let buf: &[u8] = &[
-        17, CS_INTERFACE, VC_INPUT_TERMINAL,
-        1,              // bTerminalID
-        0x01, 0x02,     // wTerminalType = ITT_CAMERA
-        0,              // bAssocTerminal
-        0,              // iTerminal
-        0x00, 0x00,     // wObjectiveFocalLengthMin
-        0x00, 0x00,     // wObjectiveFocalLengthMax
-        0x00, 0x00,     // wOcularFocalLength
-        3,              // bControlSize = 3
-        0x0E, 0x00, 0x00, // bmControls: bits 1,2,3 set
+        17,
+        CS_INTERFACE,
+        VC_INPUT_TERMINAL,
+        1, // bTerminalID
+        0x01,
+        0x02, // wTerminalType = ITT_CAMERA
+        0,    // bAssocTerminal
+        0,    // iTerminal
+        0x00,
+        0x00, // wObjectiveFocalLengthMin
+        0x00,
+        0x00, // wObjectiveFocalLengthMax
+        0x00,
+        0x00, // wOcularFocalLength
+        3,    // bControlSize = 3
+        0x0E,
+        0x00,
+        0x00, // bmControls: bits 1,2,3 set
     ];
     let it = match InputTerminal::parse(buf) {
         Ok(t) => t,
@@ -104,19 +117,23 @@ kernel_test_in!("drivers/video/uvc", smoke_uvc_camera_input_terminal);
 // ── Smoke 3: Processing Unit descriptor + controls ───────────────────
 
 fn smoke_uvc_processing_unit() -> TestResult {
-    use crate::uvc::descriptor::{ProcessingUnit, VC_PROCESSING_UNIT, CS_INTERFACE};
+    use crate::uvc::descriptor::{ProcessingUnit, CS_INTERFACE, VC_PROCESSING_UNIT};
 
     // bLength=11, CS_INTERFACE, VC_PROCESSING_UNIT,
     // bUnitID=2, bSourceID=1, wMaxMultiplier=0,
     // bControlSize=2, bmControls[2]=0x5F, 0x17, iProcessing=0.
     let buf: &[u8] = &[
-        11, CS_INTERFACE, VC_PROCESSING_UNIT,
-        2,              // bUnitID
-        1,              // bSourceID
-        0x00, 0x00,     // wMaxMultiplier
-        2,              // bControlSize
-        0x5F, 0x17,     // bmControls: brightness(bit1)+contrast(bit2)+gain(bit3) etc.
-        0,              // iProcessing
+        11,
+        CS_INTERFACE,
+        VC_PROCESSING_UNIT,
+        2, // bUnitID
+        1, // bSourceID
+        0x00,
+        0x00, // wMaxMultiplier
+        2,    // bControlSize
+        0x5F,
+        0x17, // bmControls: brightness(bit1)+contrast(bit2)+gain(bit3) etc.
+        0,    // iProcessing
     ];
     let pu = match ProcessingUnit::parse(buf) {
         Ok(p) => p,
@@ -139,11 +156,15 @@ kernel_test_in!("drivers/video/uvc", smoke_uvc_processing_unit);
 // ── Smoke 4: VS_FORMAT_MJPEG + VS_FRAME_MJPEG decode ────────────────
 
 fn smoke_uvc_mjpeg_format_and_frame() -> TestResult {
-    use crate::uvc::descriptor::{FormatMjpeg, FrameMjpeg, VS_FORMAT_MJPEG, VS_FRAME_MJPEG, CS_INTERFACE};
+    use crate::uvc::descriptor::{
+        FormatMjpeg, FrameMjpeg, CS_INTERFACE, VS_FORMAT_MJPEG, VS_FRAME_MJPEG,
+    };
 
     // VS_FORMAT_MJPEG: 11 bytes, format_index=1, num_frames=1.
     let fmt_buf: &[u8] = &[
-        11, CS_INTERFACE, VS_FORMAT_MJPEG,
+        11,
+        CS_INTERFACE,
+        VS_FORMAT_MJPEG,
         1,    // bFormatIndex
         1,    // bNumFrameDescriptors
         0x01, // bmFlags
@@ -166,17 +187,36 @@ fn smoke_uvc_mjpeg_format_and_frame() -> TestResult {
 
     // VS_FRAME_MJPEG for 1280×720 @ 30fps (one discrete interval = 333_333).
     let frame_buf: &[u8] = &[
-        30, CS_INTERFACE, VS_FRAME_MJPEG,
-        1,              // bFrameIndex
-        0,              // bmCapabilities
-        0x00, 0x05,     // wWidth  = 1280
-        0xD0, 0x02,     // wHeight = 720
-        0x00, 0x00, 0xC2, 0x01, // dwMinBitRate
-        0x00, 0x00, 0x48, 0x03, // dwMaxBitRate
-        0x00, 0x80, 0x3E, 0x00, // dwMaxVideoFrameBufferSize
-        0x15, 0x16, 0x05, 0x00, // dwDefaultFrameInterval = 333_333
-        1,              // bFrameIntervalType = 1 (discrete)
-        0x15, 0x16, 0x05, 0x00, // dwFrameInterval[0] = 333_333
+        30,
+        CS_INTERFACE,
+        VS_FRAME_MJPEG,
+        1, // bFrameIndex
+        0, // bmCapabilities
+        0x00,
+        0x05, // wWidth  = 1280
+        0xD0,
+        0x02, // wHeight = 720
+        0x00,
+        0x00,
+        0xC2,
+        0x01, // dwMinBitRate
+        0x00,
+        0x00,
+        0x48,
+        0x03, // dwMaxBitRate
+        0x00,
+        0x80,
+        0x3E,
+        0x00, // dwMaxVideoFrameBufferSize
+        0x15,
+        0x16,
+        0x05,
+        0x00, // dwDefaultFrameInterval = 333_333
+        1,    // bFrameIntervalType = 1 (discrete)
+        0x15,
+        0x16,
+        0x05,
+        0x00, // dwFrameInterval[0] = 333_333
     ];
     let frm = match FrameMjpeg::parse(frame_buf) {
         Ok(f) => f,
@@ -199,7 +239,9 @@ kernel_test_in!("drivers/video/uvc", smoke_uvc_mjpeg_format_and_frame);
 // ── Smoke 5: VS_FORMAT_UNCOMPRESSED (YUYV) ───────────────────────────
 
 fn smoke_uvc_format_uncompressed_yuyv() -> TestResult {
-    use crate::uvc::descriptor::{FormatUncompressed, VS_FORMAT_UNCOMPRESSED, CS_INTERFACE, GUID_FORMAT_YUY2};
+    use crate::uvc::descriptor::{
+        FormatUncompressed, CS_INTERFACE, GUID_FORMAT_YUY2, VS_FORMAT_UNCOMPRESSED,
+    };
 
     let mut buf = [0u8; 27];
     buf[0] = 27;
@@ -209,7 +251,7 @@ fn smoke_uvc_format_uncompressed_yuyv() -> TestResult {
     buf[4] = 2; // num_frame_descriptors
     buf[5..21].copy_from_slice(&GUID_FORMAT_YUY2);
     buf[21] = 16; // bits_per_pixel
-    buf[22] = 1;  // default_frame_index
+    buf[22] = 1; // default_frame_index
 
     let f = match FormatUncompressed::parse(&buf) {
         Ok(f) => f,
@@ -320,7 +362,7 @@ kernel_test_in!("drivers/video/uvc", smoke_uvc_probe_commit_encode_v15);
 // ── Smoke 8: UVC payload header decode: FID / EOF ───────────────────
 
 fn smoke_uvc_payload_header_fid_eof() -> TestResult {
-    use crate::uvc::payload::{PayloadHeader, BFH_FID, BFH_EOF, BFH_EOH};
+    use crate::uvc::payload::{PayloadHeader, BFH_EOF, BFH_EOH, BFH_FID};
 
     // Minimal 2-byte header: FID=1, EOF=1, EOH=1.
     let bfh_byte: u8 = BFH_FID | BFH_EOF | BFH_EOH;
@@ -392,7 +434,10 @@ fn smoke_uvc_frame_reassembly_three_payloads() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/video/uvc", smoke_uvc_frame_reassembly_three_payloads);
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_frame_reassembly_three_payloads
+);
 
 // ── Smoke 10: Brightness control GET_MIN/MAX/RES round-trip ─────────
 
@@ -418,9 +463,15 @@ fn smoke_uvc_brightness_control_range() -> TestResult {
         None => return TestResult::Fail("parse_i16(res) failed"),
     };
 
-    if min_val != -128 { return TestResult::Fail("min value wrong"); }
-    if max_val != 127  { return TestResult::Fail("max value wrong"); }
-    if res_val != 1    { return TestResult::Fail("res value wrong"); }
+    if min_val != -128 {
+        return TestResult::Fail("min value wrong");
+    }
+    if max_val != 127 {
+        return TestResult::Fail("max value wrong");
+    }
+    if res_val != 1 {
+        return TestResult::Fail("res value wrong");
+    }
     if PU_BRIGHTNESS_CONTROL != 0x02 {
         return TestResult::Fail("PU_BRIGHTNESS_CONTROL selector should be 0x02");
     }
@@ -431,39 +482,37 @@ kernel_test_in!("drivers/video/uvc", smoke_uvc_brightness_control_range);
 // ── Smoke 11: Format negotiation 1280×720 MJPEG @ 30fps ─────────────
 
 fn smoke_uvc_format_negotiation_720p_30fps() -> TestResult {
-    use crate::uvc::streaming::{PixelFmt, FrameMode, StreamFormat};
+    use crate::uvc::streaming::{FrameMode, PixelFmt, StreamFormat};
     use alloc::vec;
 
     // Device supports MJPEG: 1280×720 @ 30fps and 640×480 @ 30fps.
-    let formats = vec![
-        StreamFormat {
-            format_index: 1,
-            pixel_fmt: PixelFmt::Mjpeg,
-            default_frame_index: 1,
-            frames: vec![
-                FrameMode {
-                    frame_index: 1,
-                    width: 1280,
-                    height: 720,
-                    frame_intervals: vec![333_333],
-                    continuous_min: None,
-                    continuous_max: None,
-                    continuous_step: None,
-                    default_frame_interval: 333_333,
-                },
-                FrameMode {
-                    frame_index: 2,
-                    width: 640,
-                    height: 480,
-                    frame_intervals: vec![333_333, 666_666],
-                    continuous_min: None,
-                    continuous_max: None,
-                    continuous_step: None,
-                    default_frame_interval: 333_333,
-                },
-            ],
-        },
-    ];
+    let formats = vec![StreamFormat {
+        format_index: 1,
+        pixel_fmt: PixelFmt::Mjpeg,
+        default_frame_index: 1,
+        frames: vec![
+            FrameMode {
+                frame_index: 1,
+                width: 1280,
+                height: 720,
+                frame_intervals: vec![333_333],
+                continuous_min: None,
+                continuous_max: None,
+                continuous_step: None,
+                default_frame_interval: 333_333,
+            },
+            FrameMode {
+                frame_index: 2,
+                width: 640,
+                height: 480,
+                frame_intervals: vec![333_333, 666_666],
+                continuous_min: None,
+                continuous_max: None,
+                continuous_step: None,
+                default_frame_interval: 333_333,
+            },
+        ],
+    }];
 
     // Request 1280×720 @ 30fps → should match frame_index=1, interval=333_333.
     let fmt = &formats[0];
@@ -483,8 +532,12 @@ fn smoke_uvc_format_negotiation_720p_30fps() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("find_frame(640, 480, 30) returned None"),
     };
-    if fi2 != 2 { return TestResult::Fail("frame_index should be 2 for 640×480"); }
-    if iv2 != 333_333 { return TestResult::Fail("should pick 30fps for 640×480"); }
+    if fi2 != 2 {
+        return TestResult::Fail("frame_index should be 2 for 640×480");
+    }
+    if iv2 != 333_333 {
+        return TestResult::Fail("should pick 30fps for 640×480");
+    }
 
     // Request a resolution that doesn't exist → None.
     if fmt.find_frame(1920, 1080, 30).is_some() {
@@ -508,38 +561,27 @@ fn smoke_uvc_probe_config_blob() -> TestResult {
     //   Endpoint iso-IN (7 bytes)
     let cfg: &[u8] = &[
         // Configuration descriptor (9 bytes)
-        9, 0x02, 0x3E, 0x00, 1, 1, 0, 0x80, 0xFA,
-
-        // VC interface (9 bytes)
-        9, 0x04,
-        1,    // bInterfaceNumber
+        9, 0x02, 0x3E, 0x00, 1, 1, 0, 0x80, 0xFA, // VC interface (9 bytes)
+        9, 0x04, 1,    // bInterfaceNumber
         0,    // bAlternateSetting
         0,    // bNumEndpoints
         0x0E, // bInterfaceClass = VIDEO
         0x01, // bInterfaceSubClass = VIDEOCONTROL
-        0x00, 0x00,
-
-        // VC CS_INTERFACE VC_HEADER (13 bytes)
-        13, 0x24,
-        0x01, // VC_HEADER
-        0x50, 0x01,              // bcdUVC = 0x0150
-        0x27, 0x00,              // wTotalLength
+        0x00, 0x00, // VC CS_INTERFACE VC_HEADER (13 bytes)
+        13, 0x24, 0x01, // VC_HEADER
+        0x50, 0x01, // bcdUVC = 0x0150
+        0x27, 0x00, // wTotalLength
         0x80, 0x8D, 0x5B, 0x02, // dwClockFrequency
-        0x01,                   // bInCollection
-        0x02,                   // baInterfaceNr[0] = 2
-
+        0x01, // bInCollection
+        0x02, // baInterfaceNr[0] = 2
         // VS interface alt-setting 0 (9 bytes)
-        9, 0x04,
-        2,    // bInterfaceNumber
+        9, 0x04, 2,    // bInterfaceNumber
         0,    // bAlternateSetting
         1,    // bNumEndpoints
         0x0E, // bInterfaceClass = VIDEO
         0x02, // bInterfaceSubClass = VIDEOSTREAMING
-        0x00, 0x00,
-
-        // VS CS_INTERFACE VS_INPUT_HEADER (13 bytes)
-        13, 0x24,
-        0x01, // VS_INPUT_HEADER
+        0x00, 0x00, // VS CS_INTERFACE VS_INPUT_HEADER (13 bytes)
+        13, 0x24, 0x01, // VS_INPUT_HEADER
         0x01, // bNumFormats
         0x1E, 0x00, // wTotalLength
         0x81, // bEndpointAddress (IN ep 1)
@@ -549,10 +591,8 @@ fn smoke_uvc_probe_config_blob() -> TestResult {
         0x00, // bTriggerSupport
         0x00, // bTriggerUsage
         0x00, // bControlSize
-
         // Endpoint descriptor: iso IN ep 0x81 (7 bytes)
-        7, 0x05,
-        0x81, // bEndpointAddress: IN, ep 1
+        7, 0x05, 0x81, // bEndpointAddress: IN, ep 1
         0x01, // bmAttributes: isochronous
         0x00, 0x04, // wMaxPacketSize = 1024
         0x01, // bInterval

@@ -57,10 +57,7 @@ pub const MP2_DID_15E4: u16 = 0x15E4;
 pub const MP2_DID_164A: u16 = 0x164A;
 
 /// All recognized AMD MP2 ISP (vendor, device) pairs, for testing.
-pub const PCI_IDS: &[(u16, u16)] = &[
-    (AMD_VENDOR, MP2_DID_15E4),
-    (AMD_VENDOR, MP2_DID_164A),
-];
+pub const PCI_IDS: &[(u16, u16)] = &[(AMD_VENDOR, MP2_DID_15E4), (AMD_VENDOR, MP2_DID_164A)];
 
 // ── Firmware blob name ───────────────────────────────────────────────
 
@@ -163,8 +160,7 @@ pub fn probe(
     if device.id.vendor != AMD_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    let gen = Mp2Gen::from_did(device.id.device)
-        .ok_or(narf_bus::ProbeError::NotForThisDriver)?;
+    let gen = Mp2Gen::from_did(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
 
     narf_bus::pci::set_command(
         &cap,
@@ -175,8 +171,8 @@ pub fn probe(
 
     // Map BAR2: MP2 ISP register window.
     // SAFETY: exclusive BAR ownership held by bus probe contract.
-    let regs = unsafe { map_bar(&device, BAR_REGS) }
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let regs =
+        unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     let isp = AmdMp2Isp {
         vid: device.id.vendor,

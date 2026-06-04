@@ -9,16 +9,13 @@
 //! specific descriptors with the same bLength-based walking strategy,
 //! building `uvc_streaming::formats[]`.
 
-use alloc::vec::Vec;
 use super::descriptor::{
-    DescError, FormatMjpeg, FormatUncompressed, FrameMjpeg, FrameUncompressed,
-    FormatFrameBased, FrameFrameBased,
-    GUID_FORMAT_YUY2, GUID_FORMAT_NV12,
-    VS_FORMAT_MJPEG, VS_FRAME_MJPEG,
-    VS_FORMAT_UNCOMPRESSED, VS_FRAME_UNCOMPRESSED,
-    VS_FORMAT_FRAME_BASED, VS_FRAME_FRAME_BASED,
-    CS_INTERFACE,
+    DescError, FormatFrameBased, FormatMjpeg, FormatUncompressed, FrameFrameBased, FrameMjpeg,
+    FrameUncompressed, CS_INTERFACE, GUID_FORMAT_NV12, GUID_FORMAT_YUY2, VS_FORMAT_FRAME_BASED,
+    VS_FORMAT_MJPEG, VS_FORMAT_UNCOMPRESSED, VS_FRAME_FRAME_BASED, VS_FRAME_MJPEG,
+    VS_FRAME_UNCOMPRESSED,
 };
+use alloc::vec::Vec;
 
 /// Pixel format classification.
 ///
@@ -61,9 +58,11 @@ impl FrameMode {
             return self.frame_intervals.contains(&interval_100ns);
         }
         // Continuous range.
-        if let (Some(mn), Some(mx), Some(st)) =
-            (self.continuous_min, self.continuous_max, self.continuous_step)
-        {
+        if let (Some(mn), Some(mx), Some(st)) = (
+            self.continuous_min,
+            self.continuous_max,
+            self.continuous_step,
+        ) {
             if interval_100ns < mn || interval_100ns > mx {
                 return false;
             }
@@ -88,7 +87,13 @@ impl FrameMode {
                 .frame_intervals
                 .iter()
                 .copied()
-                .min_by_key(|&iv| if iv >= want_interval { iv - want_interval } else { want_interval - iv })
+                .min_by_key(|&iv| {
+                    if iv >= want_interval {
+                        iv - want_interval
+                    } else {
+                        want_interval - iv
+                    }
+                })
                 .unwrap_or(self.default_frame_interval);
             return best;
         }
@@ -133,7 +138,11 @@ impl StreamFormat {
             .min_by_key(|f| {
                 let iv = f.nearest_interval_for_fps(fps);
                 let want_iv = if fps == 0 { u32::MAX } else { 10_000_000 / fps };
-                if iv >= want_iv { iv - want_iv } else { want_iv - iv }
+                if iv >= want_iv {
+                    iv - want_iv
+                } else {
+                    want_iv - iv
+                }
             })
             .unwrap();
 
@@ -312,8 +321,12 @@ pub fn flatten_formats(formats: &[StreamFormat]) -> Vec<FormatDescriptor> {
                 // Continuous range — emit min/max.
                 let mut v = Vec::new();
                 if let (Some(mn), Some(mx)) = (fm.continuous_min, fm.continuous_max) {
-                    if mn > 0 { v.push(10_000_000 / mn); }
-                    if mx > 0 && mx != mn { v.push(10_000_000 / mx); }
+                    if mn > 0 {
+                        v.push(10_000_000 / mn);
+                    }
+                    if mx > 0 && mx != mn {
+                        v.push(10_000_000 / mx);
+                    }
                 }
                 v
             };

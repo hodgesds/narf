@@ -209,7 +209,13 @@ impl InputTerminal {
             None
         };
 
-        Ok(Self { terminal_id, terminal_type, assoc_terminal, terminal_idx, camera })
+        Ok(Self {
+            terminal_id,
+            terminal_type,
+            assoc_terminal,
+            terminal_idx,
+            camera,
+        })
     }
 }
 
@@ -261,7 +267,11 @@ impl SelectorUnit {
         }
         let sources = buf[5..5 + n_in].to_vec();
         let selector_idx = buf[5 + n_in];
-        Ok(Self { unit_id, sources, selector_idx })
+        Ok(Self {
+            unit_id,
+            sources,
+            selector_idx,
+        })
     }
 }
 
@@ -490,7 +500,11 @@ impl FrameUncompressed {
 
     /// Convert a 100 ns interval to fps.
     pub fn fps_from_interval(interval_100ns: u32) -> u32 {
-        if interval_100ns == 0 { 0 } else { 10_000_000 / interval_100ns }
+        if interval_100ns == 0 {
+            0
+        } else {
+            10_000_000 / interval_100ns
+        }
     }
 }
 
@@ -561,7 +575,11 @@ impl FrameMjpeg {
     }
 
     pub fn fps_from_interval(interval_100ns: u32) -> u32 {
-        if interval_100ns == 0 { 0 } else { 10_000_000 / interval_100ns }
+        if interval_100ns == 0 {
+            0
+        } else {
+            10_000_000 / interval_100ns
+        }
     }
 }
 
@@ -649,10 +667,18 @@ impl FrameFrameBased {
             let cmax = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let cstep = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
             Ok(Self {
-                frame_index, capabilities, width, height, min_bitrate, max_bitrate,
-                default_frame_interval, bytes_per_line,
+                frame_index,
+                capabilities,
+                width,
+                height,
+                min_bitrate,
+                max_bitrate,
+                default_frame_interval,
+                bytes_per_line,
                 frame_intervals: Vec::new(),
-                continuous_min: Some(cmin), continuous_max: Some(cmax), continuous_step: Some(cstep),
+                continuous_min: Some(cmin),
+                continuous_max: Some(cmax),
+                continuous_step: Some(cstep),
             })
         } else {
             let need = interval_type as usize * 4;
@@ -664,10 +690,18 @@ impl FrameFrameBased {
                 intervals.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
             Ok(Self {
-                frame_index, capabilities, width, height, min_bitrate, max_bitrate,
-                default_frame_interval, bytes_per_line,
+                frame_index,
+                capabilities,
+                width,
+                height,
+                min_bitrate,
+                max_bitrate,
+                default_frame_interval,
+                bytes_per_line,
                 frame_intervals: intervals,
-                continuous_min: None, continuous_max: None, continuous_step: None,
+                continuous_min: None,
+                continuous_max: None,
+                continuous_step: None,
             })
         }
     }
@@ -703,10 +737,18 @@ where
         let cmax = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let cstep = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
         Ok(T::from_frame(FrameBodyData {
-            frame_index, capabilities, width, height, min_bitrate, max_bitrate,
-            max_frame_buf_size, default_frame_interval,
+            frame_index,
+            capabilities,
+            width,
+            height,
+            min_bitrate,
+            max_bitrate,
+            max_frame_buf_size,
+            default_frame_interval,
             frame_intervals: Vec::new(),
-            continuous_min: Some(cmin), continuous_max: Some(cmax), continuous_step: Some(cstep),
+            continuous_min: Some(cmin),
+            continuous_max: Some(cmax),
+            continuous_step: Some(cstep),
         }))
     } else {
         let need = interval_type as usize * 4;
@@ -718,10 +760,18 @@ where
             intervals.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(T::from_frame(FrameBodyData {
-            frame_index, capabilities, width, height, min_bitrate, max_bitrate,
-            max_frame_buf_size, default_frame_interval,
+            frame_index,
+            capabilities,
+            width,
+            height,
+            min_bitrate,
+            max_bitrate,
+            max_frame_buf_size,
+            default_frame_interval,
             frame_intervals: intervals,
-            continuous_min: None, continuous_max: None, continuous_step: None,
+            continuous_min: None,
+            continuous_max: None,
+            continuous_step: None,
         }))
     }
 }

@@ -11,8 +11,8 @@
 //! `uvc_video_decode_data()` in `uvc_video.c` line ~590 which simply
 //! copies compressed data without decompression.
 
-use alloc::vec::Vec;
 use super::streaming::PixelFmt;
+use alloc::vec::Vec;
 
 /// A decoded or passthrough video frame.
 #[derive(Clone, Debug)]
@@ -35,7 +35,12 @@ pub struct DecodedFrame {
 /// decompress. The application layer or a separate codec daemon handles
 /// decompression.
 pub fn passthrough(pixel_fmt: PixelFmt, width: u16, height: u16, raw: Vec<u8>) -> DecodedFrame {
-    DecodedFrame { pixel_fmt, width, height, data: raw }
+    DecodedFrame {
+        pixel_fmt,
+        width,
+        height,
+        data: raw,
+    }
 }
 
 /// Convert a YUYV (YUY2) frame to RGBA8888.

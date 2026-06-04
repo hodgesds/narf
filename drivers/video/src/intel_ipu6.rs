@@ -196,10 +196,10 @@ pub fn probe(
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    let variant = Ipu6Variant::from_did(device.id.device)
-        .ok_or(narf_bus::ProbeError::NotForThisDriver)?;
-    let firmware_name = firmware_for(device.id.device)
-        .ok_or(narf_bus::ProbeError::NotForThisDriver)?;
+    let variant =
+        Ipu6Variant::from_did(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
+    let firmware_name =
+        firmware_for(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
 
     narf_bus::pci::set_command(
         &cap,
@@ -210,8 +210,8 @@ pub fn probe(
 
     // Map BAR0: IPU6 register window.
     // SAFETY: exclusive BAR ownership held by bus probe contract.
-    let regs = unsafe { map_bar(&device, BAR_REGS) }
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let regs =
+        unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     let ipu6 = Ipu6 {
         vid: device.id.vendor,

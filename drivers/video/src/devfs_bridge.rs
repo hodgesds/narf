@@ -45,8 +45,8 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use narf_lib::sync::IrqSafeSpinLock;
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
+use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Major number ─────────────────────────────────────────────────────────
 
@@ -87,7 +87,11 @@ pub struct VideoDevice {
 
 impl VideoDevice {
     pub fn new(index: usize, name: String) -> Self {
-        VideoDevice { index, name, frames: Vec::new() }
+        VideoDevice {
+            index,
+            name,
+            frames: Vec::new(),
+        }
     }
 
     /// Enqueue a complete frame. Drops oldest if over capacity (4).
@@ -138,7 +142,11 @@ pub fn register_video(name: &str) -> usize {
 
 /// Retrieve the device state for video<N>, if registered.
 pub fn get_device(index: usize) -> Option<Arc<IrqSafeSpinLock<VideoDevice>>> {
-    VIDEO_NODES.lock().iter().find(|d| d.lock().index == index).cloned()
+    VIDEO_NODES
+        .lock()
+        .iter()
+        .find(|d| d.lock().index == index)
+        .cloned()
 }
 
 /// Number of registered video devices.
@@ -162,7 +170,7 @@ pub fn __reset_for_test() {
 /// `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`
 /// (GPL-2.0-or-later).
 fn register_sysfs(idx: usize, camera_name: &str) {
-    use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr};
+    use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
     let v4l2_class = class_register("video4linux");
     let node_name = format!("video{}", idx);
@@ -241,7 +249,11 @@ impl FileOps for VideoFile {
 
     /// `POLL_IN` when a frame is ready.
     fn poll_readiness(&self) -> u32 {
-        if self.dev.lock().has_frame() { POLL_IN } else { 0 }
+        if self.dev.lock().has_frame() {
+            POLL_IN
+        } else {
+            0
+        }
     }
 }
 
@@ -286,7 +298,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/video/devfs_bridge", smoke_uvc_probe_allocates_video0);
+    kernel_test_in!(
+        "drivers/video/devfs_bridge",
+        smoke_uvc_probe_allocates_video0
+    );
 
     /// /sys/class/video4linux/video0/name returns the camera string.
     fn smoke_video_sysfs_name_attr() -> TestResult {

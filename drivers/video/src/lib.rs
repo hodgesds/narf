@@ -39,9 +39,9 @@
 extern crate alloc;
 
 // ── Per-vendor ISP modules ──────────────────────────────────────────
+pub mod amd_mp2_isp;
 pub mod intel_ipu3;
 pub mod intel_ipu6;
-pub mod amd_mp2_isp;
 
 // ── devfs / sysfs bridge ────────────────────────────────────────────
 pub mod devfs_bridge;

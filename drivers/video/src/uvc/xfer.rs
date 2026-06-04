@@ -13,8 +13,8 @@
 //! in-flight transfers mirrors the value of `UVC_URBS` = 5 in the
 //! Linux driver.
 
-use alloc::vec::Vec;
 use super::payload::{FrameReassembler, PushResult};
+use alloc::vec::Vec;
 
 // ── Transfer constants ───────────────────────────────────────────────
 
@@ -113,7 +113,10 @@ impl StreamHandle {
             PushResult::FrameComplete => {
                 let data = self.reassembler.take_frame();
                 let seq = self.reassembler.frames_completed;
-                self.frame_queue.push(CompletedFrame { data, sequence: seq });
+                self.frame_queue.push(CompletedFrame {
+                    data,
+                    sequence: seq,
+                });
                 self.stats.frames_delivered += 1;
             }
             PushResult::Errored => {
@@ -162,7 +165,10 @@ pub struct IsocScheduler {
 
 impl IsocScheduler {
     pub fn new() -> Self {
-        Self { in_flight: 0, depth: ISOC_DEPTH }
+        Self {
+            in_flight: 0,
+            depth: ISOC_DEPTH,
+        }
     }
 
     /// One scheduler slot has completed — decrement the in-flight counter.

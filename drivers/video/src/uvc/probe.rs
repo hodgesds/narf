@@ -10,12 +10,10 @@
 //! against `bInterfaceClass == USB_CLASS_VIDEO` and then delegates to
 //! `uvc_parse_control()` / `uvc_parse_streaming()`.
 
-use alloc::vec::Vec;
 use super::descriptor::{
-    USB_CLASS_VIDEO,
-    USB_VIDEO_SUBCLASS_VIDEOCONTROL,
-    USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
+    USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL, USB_VIDEO_SUBCLASS_VIDEOSTREAMING,
 };
+use alloc::vec::Vec;
 
 /// Error type for the probe walk.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -142,8 +140,7 @@ pub fn probe_uvc(cfg: &[u8]) -> Result<UvcProbeResult, ProbeError> {
 
             // ── Endpoint descriptor (0x05) ───────────────────────────
             0x05 if blen >= 7 => {
-                if cur_class == USB_CLASS_VIDEO
-                    && cur_subclass == USB_VIDEO_SUBCLASS_VIDEOSTREAMING
+                if cur_class == USB_CLASS_VIDEO && cur_subclass == USB_VIDEO_SUBCLASS_VIDEOSTREAMING
                 {
                     let ep_addr = cfg[i + 2];
                     let attrs = cfg[i + 3];
@@ -151,7 +148,12 @@ pub fn probe_uvc(cfg: &[u8]) -> Result<UvcProbeResult, ProbeError> {
                     let ep_num = ep_addr & 0x0F;
                     let dir_bit = if ep_addr & 0x80 != 0 { 1u8 } else { 0u8 };
                     let dci = ep_num * 2 + dir_bit;
-                    let ep = EndpointInfo { address: ep_addr, attributes: attrs, max_packet_size: mps, dci };
+                    let ep = EndpointInfo {
+                        address: ep_addr,
+                        attributes: attrs,
+                        max_packet_size: mps,
+                        dci,
+                    };
 
                     if ep.is_iso_in() && iso_in.is_none() {
                         iso_in = Some(ep);

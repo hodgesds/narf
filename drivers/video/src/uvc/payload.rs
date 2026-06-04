@@ -106,7 +106,12 @@ impl PayloadHeader {
         };
 
         Ok((
-            Self { length, bfh, pts, scr },
+            Self {
+                length,
+                bfh,
+                pts,
+                scr,
+            },
             length as usize,
         ))
     }

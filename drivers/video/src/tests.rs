@@ -14,7 +14,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn smoke_ipu_pci_id_table() -> TestResult {
     use crate::intel_ipu3::{INTEL_VENDOR, IPU3_DID, PCI_IDS as IPU3_IDS};
     use crate::intel_ipu6::{
-        IPU6_DID, IPU6EP_ADLN_DID, IPU6EP_ADLP_DID, IPU6EP_MTL_DID, IPU6EP_RPLP_DID, IPU6SE_DID,
+        IPU6EP_ADLN_DID, IPU6EP_ADLP_DID, IPU6EP_MTL_DID, IPU6EP_RPLP_DID, IPU6SE_DID, IPU6_DID,
         PCI_IDS as IPU6_IDS,
     };
 
@@ -99,9 +99,21 @@ fn smoke_buffer_queue_fifo() -> TestResult {
     }
 
     // Enqueue 3 buffers at distinct physical addresses.
-    let b0 = CameraBuffer { phys: 0x1000_0000, len: 4096, kind: BufferKind::VideoCapture };
-    let b1 = CameraBuffer { phys: 0x1001_0000, len: 4096, kind: BufferKind::VideoCapture };
-    let b2 = CameraBuffer { phys: 0x1002_0000, len: 512, kind: BufferKind::MetaCapture };
+    let b0 = CameraBuffer {
+        phys: 0x1000_0000,
+        len: 4096,
+        kind: BufferKind::VideoCapture,
+    };
+    let b1 = CameraBuffer {
+        phys: 0x1001_0000,
+        len: 4096,
+        kind: BufferKind::VideoCapture,
+    };
+    let b2 = CameraBuffer {
+        phys: 0x1002_0000,
+        len: 512,
+        kind: BufferKind::MetaCapture,
+    };
 
     if !q.enqueue(b0) {
         return TestResult::Fail("enqueue b0 failed");
@@ -163,7 +175,11 @@ fn smoke_buffer_queue_fifo() -> TestResult {
             return TestResult::Fail("enqueue to non-full queue should not fail");
         }
     }
-    let overflow = CameraBuffer { phys: 0xDEAD_BEEF, len: 1, kind: BufferKind::VideoCapture };
+    let overflow = CameraBuffer {
+        phys: 0xDEAD_BEEF,
+        len: 1,
+        kind: BufferKind::VideoCapture,
+    };
     if q.enqueue(overflow) {
         return TestResult::Fail("enqueue to full queue should return false");
     }
@@ -211,8 +227,8 @@ kernel_test_in!("drivers/video", smoke_pixel_format_enum);
 
 fn smoke_ipu6_firmware_name_resolution() -> TestResult {
     use crate::intel_ipu6::{
-        firmware_for, IPU6EP_ADLN_DID, IPU6EP_ADLP_DID, IPU6EP_MTL_DID, IPU6EP_RPLP_DID,
-        IPU6SE_DID, IPU6_DID, FW_IPU6, FW_IPU6EP, FW_IPU6EP_ADLN, FW_IPU6EP_MTL, FW_IPU6SE,
+        firmware_for, FW_IPU6, FW_IPU6EP, FW_IPU6EP_ADLN, FW_IPU6EP_MTL, FW_IPU6SE,
+        IPU6EP_ADLN_DID, IPU6EP_ADLP_DID, IPU6EP_MTL_DID, IPU6EP_RPLP_DID, IPU6SE_DID, IPU6_DID,
     };
 
     if firmware_for(IPU6_DID) != Some(FW_IPU6) {
@@ -353,8 +369,12 @@ fn smoke_ov02c10_init_table_length() -> TestResult {
     }
 
     // The table must include the window-size registers 0x3808/0x3809.
-    let has_width_hi = ov02c10::INIT_1928X1092_TABLE.iter().any(|&(r, _)| r == 0x3808);
-    let has_width_lo = ov02c10::INIT_1928X1092_TABLE.iter().any(|&(r, _)| r == 0x3809);
+    let has_width_hi = ov02c10::INIT_1928X1092_TABLE
+        .iter()
+        .any(|&(r, _)| r == 0x3808);
+    let has_width_lo = ov02c10::INIT_1928X1092_TABLE
+        .iter()
+        .any(|&(r, _)| r == 0x3809);
     if !has_width_hi || !has_width_lo {
         return TestResult::Fail("OV02C10 init table missing output-size regs");
     }
