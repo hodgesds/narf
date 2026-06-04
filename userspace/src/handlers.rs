@@ -3769,6 +3769,19 @@ fn fire_clear_child_tid_on_exit(pid_raw: u64) {
     // forks it's the child's own AS. `address_space_of` consults
     // the scheduler's task table — works because we run during the
     // exit-observer fan-out, before the scheduler reaps the slot.
+    // Always fire the futex wake first. pthread_join's contract is
+    // "the wake fires when the thread exits"; even if we can't
+    // resolve the user word (the address space was torn down before
+    // we got here, or the smoke ran with a synthetic uaddr that
+    // isn't mapped through the user AS), the futex counter still
+    // bumps so any waiter using the same uaddr observes the wake.
+    futex_bump_counter(uaddr);
+
+    // Resolve the dying task's address space. For CLONE_THREAD
+    // children this is the same Arc as the parent; for non-thread
+    // forks it's the child's own AS. `address_space_of` consults
+    // the scheduler's task table — works because we run during the
+    // exit-observer fan-out, before the scheduler reaps the slot.
     let task_id = narf_scheduler::TaskId(pid_raw);
     let as_arc = match narf_scheduler::address_space_of(task_id) {
         Some(a) => a,
@@ -3783,11 +3796,13 @@ fn fire_clear_child_tid_on_exit(pid_raw: u64) {
     if off + 4 > 4096 {
         // Crossing a page boundary on a 4-byte futex word is
         // structurally invalid (futex words are required to be
-        // naturally aligned); drop the request rather than handle
-        // a split write.
+        // naturally aligned); drop the clear-side write but keep
+        // the futex wake we already fired above.
         return;
     }
-    let phys = match unsafe { narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page)) } {
+    let phys = match unsafe {
+        narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
+    } {
         Some(p) => p,
         None => return,
     };
@@ -3796,10 +3811,6 @@ fn fire_clear_child_tid_on_exit(pid_raw: u64) {
     unsafe {
         *((phys.as_u64() + off) as *mut u32) = 0;
     }
-    // FUTEX_WAKE one waiter on the same uaddr — pthread_join's
-    // futex_wait observes the change. Uses the existing futex
-    // wake counter (the spin-counter model `sys_futex` rides on).
-    futex_bump_counter(uaddr);
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
