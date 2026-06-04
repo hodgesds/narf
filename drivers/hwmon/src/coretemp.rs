@@ -164,7 +164,7 @@ pub fn register_msr_driver() {
     // SAFETY: rdmsr is a CPL-0 privileged instruction; safe in kernel context.
     let raw = unsafe { narf_arch::x86_64::msr::rdmsr(MSR_TEMPERATURE_TARGET) };
     let tjmax = decode_tjmax(raw);
-    if tjmax < 75 || tjmax > 125 {
+    if !(75..=125).contains(&tjmax) {
         let _ = writeln!(
             narf_console::Writer,
             "  coretemp: Tjmax={} out of range [75,125], skipping",

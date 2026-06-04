@@ -193,7 +193,7 @@ impl NctChip {
 /// count = 0 or 0xFFFF means fan stopped / not connected.
 #[inline]
 pub fn fan_count_to_rpm(count: u16) -> Option<u32> {
-    if count == 0 || count >= 0xFFFF {
+    if count == 0 || count == 0xFFFF {
         return None;
     }
     Some(1_350_000 / count as u32)
@@ -204,6 +204,11 @@ pub fn fan_count_to_rpm(count: u16) -> Option<u32> {
 /// Enter Extended Function Mode.
 /// Write the unlock sequence 0x87, 0x87 to the index port.
 /// Linux nct6775_core.c `superio_enter`.
+///
+/// # Safety
+///
+/// The caller must ensure we are in kernel context (CPL-0) and that
+/// `index_port` is a valid Super-I/O port (0x2E or 0x4E).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn sio_enter(index_port: u16) {
@@ -218,6 +223,10 @@ pub unsafe fn sio_enter(index_port: u16) {
 /// Exit Extended Function Mode.
 /// Write the lock sequence 0xAA to the index port.
 /// Linux nct6775_core.c `superio_exit`.
+///
+/// # Safety
+///
+/// Same requirements as `sio_enter`.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn sio_exit(index_port: u16) {
@@ -229,6 +238,10 @@ pub unsafe fn sio_exit(index_port: u16) {
 
 /// Read a byte from a Super-I/O register. Must be called with the
 /// device in EFM (after `sio_enter`).
+///
+/// # Safety
+///
+/// Must be called with CPL-0 privileges and within an EFM block (after `sio_enter` and before `sio_exit`).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn sio_read(index_port: u16, data_port: u16, reg: u8) -> u8 {
@@ -240,6 +253,10 @@ pub unsafe fn sio_read(index_port: u16, data_port: u16, reg: u8) -> u8 {
 }
 
 /// Write a byte to a Super-I/O register.
+///
+/// # Safety
+///
+/// Same requirements as `sio_read`.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn sio_write(index_port: u16, data_port: u16, reg: u8, val: u8) {
@@ -374,16 +391,15 @@ pub fn register_isa_driver() {
     use core::fmt::Write as _;
     #[cfg(target_arch = "x86_64")]
     {
-        let candidates = [
-            (SIO_INDEX_STD, SIO_DATA_STD),
-            (SIO_INDEX_ALT, SIO_DATA_ALT),
-        ];
+        let candidates = [(SIO_INDEX_STD, SIO_DATA_STD), (SIO_INDEX_ALT, SIO_DATA_ALT)];
         for (idx, dat) in candidates {
             if let Some((chip, chip_id)) = detect_chip(idx, dat) {
                 let _ = writeln!(
                     narf_console::Writer,
                     "  nct6775: {} (id=0x{:04X}) at 0x{:02X}",
-                    chip.name(), chip_id, idx
+                    chip.name(),
+                    chip_id,
+                    idx
                 );
                 registry::register(registry::RegisteredSensor {
                     name: "nct6775",
