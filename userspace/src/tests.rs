@@ -11581,3 +11581,172 @@ fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_unknown_cmd_returns_enotty);
+
+// ── Wave-51: async-signal default-action lookup ────────────────────
+//
+// POSIX signal(7) assigns a default action per signal. Pre-fix, NARF
+// had no way to consult that table: a SIGTERM with no installed
+// handler silently did nothing (the SIGNAL_PENDING bit stayed set
+// but the task kept running). Wave-51 introduces `default_signal_action`
+// — a pure function userspace can call to decide whether to terminate,
+// core-dump, stop, continue, or ignore. Wiring this into the actual
+// kill→exit path is deferred; this smoke pins the lookup table.
+
+fn smoke_default_signal_action_table_matches_posix() -> TestResult {
+    use crate::handlers::{default_signal_action, DefaultAction};
+    // Spot-check the high-leverage rows; the table itself is the
+    // source of truth.
+    if default_signal_action(15) != DefaultAction::Terminate {
+        return TestResult::Fail("SIGTERM default should be Terminate");
+    }
+    if default_signal_action(2) != DefaultAction::Terminate {
+        return TestResult::Fail("SIGINT default should be Terminate");
+    }
+    if default_signal_action(1) != DefaultAction::Terminate {
+        return TestResult::Fail("SIGHUP default should be Terminate");
+    }
+    if default_signal_action(9) != DefaultAction::Terminate {
+        return TestResult::Fail("SIGKILL default should be Terminate");
+    }
+    if default_signal_action(6) != DefaultAction::CoreDump {
+        return TestResult::Fail("SIGABRT default should be CoreDump");
+    }
+    if default_signal_action(11) != DefaultAction::CoreDump {
+        return TestResult::Fail("SIGSEGV default should be CoreDump");
+    }
+    if default_signal_action(8) != DefaultAction::CoreDump {
+        return TestResult::Fail("SIGFPE default should be CoreDump");
+    }
+    if default_signal_action(7) != DefaultAction::CoreDump {
+        return TestResult::Fail("SIGBUS default should be CoreDump");
+    }
+    if default_signal_action(17) != DefaultAction::Ignore {
+        return TestResult::Fail("SIGCHLD default should be Ignore");
+    }
+    if default_signal_action(19) != DefaultAction::Stop {
+        return TestResult::Fail("SIGSTOP default should be Stop");
+    }
+    if default_signal_action(18) != DefaultAction::Continue {
+        return TestResult::Fail("SIGCONT default should be Continue");
+    }
+    if default_signal_action(28) != DefaultAction::Ignore {
+        return TestResult::Fail("SIGWINCH default should be Ignore");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_default_signal_action_table_matches_posix);
+
+fn smoke_sys_kill_sigterm_marks_pending() -> TestResult {
+    // sys_kill(target, 15) sets bit 15 in SIGNAL_PENDING[target].
+    // Verifies the foundational kill-path works for the async signals
+    // POSIX userspace cares about.
+    use crate::{
+        handlers::{signal_init, signal_pending_of, __test_signal_reset},
+        install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_2001);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+
+    __test_signal_reset();
+    signal_init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let target: u64 = 0xC5_2099;
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    // Issue kill(target, 15)
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target,
+            arg1: 15, // SIGTERM
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    let kill_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0);
+    let pending = signal_pending_of(target);
+    __test_signal_reset();
+    __test_clear_global();
+
+    if !kill_ok {
+        return TestResult::Fail("kill(SIGTERM) did not return Ok(0)");
+    }
+    if pending & (1u32 << 15) == 0 {
+        return TestResult::Fail("SIGTERM did not land in SIGNAL_PENDING");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_sys_kill_sigterm_marks_pending);
+
+fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
+    // Stress the kill path against the three other "terminate on
+    // default" signals POSIX userspace reaches for: SIGHUP (1),
+    // SIGINT (2), SIGABRT (6). All three must land in pending.
+    use crate::{
+        handlers::{signal_init, signal_pending_of, __test_signal_reset},
+        install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_2002);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+
+    __test_signal_reset();
+    signal_init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let target: u64 = 0xC5_2199;
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    for signum in [1u64, 2, 6] {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: target,
+                arg1: signum,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+        let ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0);
+        if !ok {
+            __test_signal_reset();
+            __test_clear_global();
+            return TestResult::Fail("kill returned not-Ok for one of HUP/INT/ABRT");
+        }
+    }
+    let pending = signal_pending_of(target);
+    __test_signal_reset();
+    __test_clear_global();
+
+    let want = (1u32 << 1) | (1u32 << 2) | (1u32 << 6);
+    if pending & want == want {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("not all of SIGHUP/SIGINT/SIGABRT landed in pending")
+    }
+}
+kernel_test_in!("userspace", smoke_sys_kill_sighup_sigint_sigabrt_round_trip);

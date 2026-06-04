@@ -6348,6 +6348,66 @@ pub fn signal_pending_of(task: u64) -> u32 {
         .unwrap_or(0)
 }
 
+/// POSIX default action for a signal when no handler is installed.
+/// Mirrors the table in `signal(7)`. Used by the kernel to decide
+/// what to do when a signal is pending + deliverable but the task
+/// has no sigaction registered: terminate it, terminate + dump,
+/// stop it, continue it, or ignore it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DefaultAction {
+    /// Default action is "terminate the process" (POSIX `Term`).
+    Terminate,
+    /// Default action is "terminate + core dump" (POSIX `Core`).
+    CoreDump,
+    /// Default action is "stop the process" (POSIX `Stop`).
+    Stop,
+    /// Default action is "continue the process if stopped" (POSIX `Cont`).
+    Continue,
+    /// Default action is "ignore the signal" (POSIX `Ign`).
+    Ignore,
+}
+
+/// Look up the POSIX-default action for `signum`. Reference table:
+/// `signal(7)`, Linux's `kernel/signal.c::sig_kernel_*` family.
+/// Signals not assigned in the standard table fall through to
+/// `Terminate` — Linux uses the same fallback.
+pub fn default_signal_action(signum: u32) -> DefaultAction {
+    match signum {
+        1 => DefaultAction::Terminate, // SIGHUP
+        2 => DefaultAction::Terminate, // SIGINT
+        3 => DefaultAction::CoreDump,  // SIGQUIT
+        4 => DefaultAction::CoreDump,  // SIGILL
+        5 => DefaultAction::CoreDump,  // SIGTRAP
+        6 => DefaultAction::CoreDump,  // SIGABRT / SIGIOT
+        7 => DefaultAction::CoreDump,  // SIGBUS
+        8 => DefaultAction::CoreDump,  // SIGFPE
+        9 => DefaultAction::Terminate, // SIGKILL (cannot be caught)
+        10 => DefaultAction::Terminate, // SIGUSR1
+        11 => DefaultAction::CoreDump, // SIGSEGV
+        12 => DefaultAction::Terminate, // SIGUSR2
+        13 => DefaultAction::Terminate, // SIGPIPE
+        14 => DefaultAction::Terminate, // SIGALRM
+        15 => DefaultAction::Terminate, // SIGTERM
+        16 => DefaultAction::Terminate, // SIGSTKFLT (Linux-specific)
+        17 => DefaultAction::Ignore,    // SIGCHLD
+        18 => DefaultAction::Continue,  // SIGCONT
+        19 => DefaultAction::Stop,      // SIGSTOP (cannot be caught)
+        20 => DefaultAction::Stop,      // SIGTSTP
+        21 => DefaultAction::Stop,      // SIGTTIN
+        22 => DefaultAction::Stop,      // SIGTTOU
+        23 => DefaultAction::Ignore,    // SIGURG
+        24 => DefaultAction::CoreDump,  // SIGXCPU
+        25 => DefaultAction::CoreDump,  // SIGXFSZ
+        26 => DefaultAction::Terminate, // SIGVTALRM
+        27 => DefaultAction::Terminate, // SIGPROF
+        28 => DefaultAction::Ignore,    // SIGWINCH
+        29 => DefaultAction::Terminate, // SIGIO / SIGPOLL
+        30 => DefaultAction::Terminate, // SIGPWR
+        31 => DefaultAction::CoreDump,  // SIGSYS
+        _ => DefaultAction::Terminate,
+    }
+}
+
 // ── /proc/[pid]/{cmdline,comm} backing tables ───────────────────
 //
 // Both are populated at task-creation time (boot init, sys_execve)
