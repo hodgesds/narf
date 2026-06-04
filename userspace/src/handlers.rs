@@ -7549,6 +7549,16 @@ pub fn vector_to_signum(vector: u64) -> Option<u32> {
     }
 }
 
+/// Per-fault payload the arch trap path hands to the sync-signal
+/// hook. Wave-58: `addr` is the faulting address (CR2 on x86_64
+/// #PF, FAR_EL1 on aarch64 sync EL0 aborts). 0 for vectors that
+/// don't have one (#UD/#DE/#OF/#BP — the hook substitutes RIP).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SyncFaultInfo {
+    /// Faulting address (CR2 / FAR_EL1). 0 when N/A.
+    pub addr: u64,
+}
+
 /// Function-pointer hook the arch trap dispatcher calls for
 /// every CPU exception (vectors 0..31) that originated in user
 /// mode. Returns `true` if the trap frame was rewritten to
@@ -7557,7 +7567,7 @@ pub fn vector_to_signum(vector: u64) -> Option<u32> {
 /// Returns `false` if no handler was installed (or the vector
 /// has no signal mapping); the caller falls through to the
 /// existing panic / probe-catch path.
-type SyncSignalHook = fn(&mut dyn TrapContext, u64) -> bool;
+type SyncSignalHook = fn(&mut dyn TrapContext, u64, SyncFaultInfo) -> bool;
 
 static SYNC_SIGNAL_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SyncSignalHook>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -7611,7 +7621,11 @@ pub fn sync_signal_hook() -> Option<SyncSignalHook> {
 ///                                 si_addr = trapping RIP.
 ///   #BP (3)         → SIGTRAP, si_code = TRAP_BRKPT (1),
 ///                                 si_addr = trapping RIP.
-pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> bool {
+pub fn default_sync_signal_delivery(
+    ctx: &mut dyn TrapContext,
+    vector: u64,
+    info: SyncFaultInfo,
+) -> bool {
     let signum = match vector_to_signum(vector) {
         Some(s) => s,
         None => return false,
@@ -7621,21 +7635,19 @@ pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> b
         Some(a) => a,
         None => return false,
     };
-    // Best-effort si_code + si_addr. NARF's sync hook doesn't have
-    // direct access to CR2 (the arch trap path didn't forward it),
-    // so SEGV uses SI_KERNEL and SIGILL/etc. all report si_addr = 0.
-    // When the arch trap gains a `vector + payload` shape (#PF can
-    // carry CR2, others can carry RIP), this code is the call site
-    // that will start populating si_addr properly.
+    // Wave-58: arch trap forwards the faulting address (CR2 / FAR_EL1)
+    // via `info.addr`. For #PF that becomes si_addr verbatim. For
+    // RIP-flavoured vectors (#UD/#DE/#OF/#BP/#AC) the arch passes
+    // RIP through the same field.
     let (si_code, si_addr) = match vector {
-        14 => (2 /* SEGV_ACCERR */, 0),
-        13 => (0x80 /* SI_KERNEL */, 0),
-        6 => (1 /* ILL_ILLOPC */, 0),
-        17 => (1 /* BUS_ADRALN */, 0),
-        0 => (1 /* FPE_INTDIV */, 0),
-        4 => (2 /* FPE_INTOVF */, 0),
-        3 => (1 /* TRAP_BRKPT */, 0),
-        _ => (0, 0),
+        14 => (2 /* SEGV_ACCERR */, info.addr),
+        13 => (0x80 /* SI_KERNEL */, info.addr),
+        6 => (1 /* ILL_ILLOPC */, info.addr),
+        17 => (1 /* BUS_ADRALN */, info.addr),
+        0 => (1 /* FPE_INTDIV */, info.addr),
+        4 => (2 /* FPE_INTOVF */, info.addr),
+        3 => (1 /* TRAP_BRKPT */, info.addr),
+        _ => (0, info.addr),
     };
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).

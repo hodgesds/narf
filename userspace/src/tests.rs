@@ -1295,7 +1295,7 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     use crate::{
         default_sync_signal_delivery, install_core_syscalls, install_global,
         install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
-        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        SyncFaultInfo, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -1316,6 +1316,7 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
         delivered: Option<(u64, u32)>,
+        last_si_addr: u64,
     }
     impl TrapContext for FakeCtx {
         fn args(&self) -> &SyscallArgs {
@@ -1329,6 +1330,7 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         }
         fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
             self.delivered = Some((p.handler, p.signum));
+            self.last_si_addr = p.si_addr;
             true
         }
     }
@@ -1344,6 +1346,7 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         },
         ret: None,
         delivered: None,
+        last_si_addr: 0,
     };
     kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
@@ -1359,8 +1362,9 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
         delivered: None,
+        last_si_addr: 0,
     };
-    let rewrote = default_sync_signal_delivery(&mut ctx, 14);
+    let rewrote = default_sync_signal_delivery(&mut ctx, 14, SyncFaultInfo::default());
     let delivered = ctx.delivered;
 
     // Mapping-less vector should return false without touching
@@ -1369,8 +1373,9 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
         delivered: None,
+        last_si_addr: 0,
     };
-    let rewrote_unknown = default_sync_signal_delivery(&mut ctx2, 1);
+    let rewrote_unknown = default_sync_signal_delivery(&mut ctx2, 1, SyncFaultInfo::default());
     let unknown_delivered = ctx2.delivered;
 
     __test_clear_global();
@@ -1396,6 +1401,102 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_userspace_synchronous_signal_delivery);
+
+fn smoke_userspace_sync_signal_si_addr_from_payload() -> TestResult {
+    // Wave-58: arch trap forwards CR2/FAR_EL1 via SyncFaultInfo.addr.
+    // Verify default_sync_signal_delivery stamps it into params.si_addr
+    // for #PF (vector 14) so userspace handlers see the real faulting
+    // address rather than hardcoded 0.
+    use crate::{
+        default_sync_signal_delivery, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyncFaultInfo, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0x5E65);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(task_lookup);
+
+    crate::handlers::__test_sigaction_reset();
+    crate::sigaction_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        last_si_addr: u64,
+        last_si_code: i32,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.last_si_addr = p.si_addr;
+            self.last_si_code = p.si_code;
+            true
+        }
+    }
+
+    let mut old: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 11,
+            arg1: 0xC0DE_F00D,
+            arg2: &mut old as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+        last_si_addr: 0,
+        last_si_code: 0,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        crate::handlers::__test_sigaction_reset();
+        return TestResult::Fail("Sigaction registration did not Ok");
+    }
+
+    // Forward a fake CR2 for vector 14 — handler must see it.
+    let fake_cr2: u64 = 0xDEAD_BEEF_CAFE_0000;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        last_si_addr: 0,
+        last_si_code: 0,
+    };
+    let rewrote =
+        default_sync_signal_delivery(&mut ctx, 14, SyncFaultInfo { addr: fake_cr2 });
+    let si_addr = ctx.last_si_addr;
+    let si_code = ctx.last_si_code;
+
+    __test_clear_global();
+    crate::handlers::__test_sigaction_reset();
+
+    if !rewrote {
+        return TestResult::Fail("sync hook did not report rewrite for vector 14");
+    }
+    if si_addr != fake_cr2 {
+        return TestResult::Fail("si_addr was not stamped from SyncFaultInfo.addr");
+    }
+    if si_code != 2 {
+        return TestResult::Fail("#PF si_code was not SEGV_ACCERR(2)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_sync_signal_si_addr_from_payload);
 
 fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     use crate::{

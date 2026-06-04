@@ -79,7 +79,7 @@ pub use handlers::{
     set_exit_landing, shared_rings_for, sid_init, sigaction_init, sigaction_lookup,
     signal_delivery_hook, signal_init, signal_mask_of, signal_pending_of, spawn_dispatcher_for,
     sync_signal_hook, take_kernel_ends, take_user_ends, uidgid_init, umask_init, vector_to_signum,
-    SharedRingPair, TaskRings, UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
+    SharedRingPair, SyncFaultInfo, TaskRings, UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
 };
 pub use loader::{
     apply_relocations, load_elf_bytes, load_elf_into_at, load_into, EntryPoint, LoadBytesError,
