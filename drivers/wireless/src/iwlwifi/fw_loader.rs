@@ -31,13 +31,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use super::transport::{
-    load_image_gen2, signal_load_done_gen2, release_cpu_gen2, boot_gen3,
-    stage_sections_gen2, wait_alive, AliveSink, Gen3BootRegions, IwlMmio,
-    SectionTableEntry, CtxtInfoV2, TransportError,
-};
-use super::{ParsedUcode, Generation, ChipConfig};
 use super::transport::IML_SECTION_SENTINEL;
+use super::transport::{
+    boot_gen3, load_image_gen2, release_cpu_gen2, signal_load_done_gen2, stage_sections_gen2,
+    wait_alive, AliveSink, CtxtInfoV2, Gen3BootRegions, IwlMmio, SectionTableEntry, TransportError,
+};
+use super::{ChipConfig, Generation, ParsedUcode};
 
 use narf_io;
 
@@ -277,8 +276,7 @@ where
     // Step 3: prph_scratch + prph_info.
     let (_, scratch_phys) =
         alloc.alloc_coherent(core::mem::size_of::<super::transport::PrphScratch>());
-    let (_, info_phys) =
-        alloc.alloc_coherent(core::mem::size_of::<super::transport::PrphInfo>());
+    let (_, info_phys) = alloc.alloc_coherent(core::mem::size_of::<super::transport::PrphInfo>());
 
     // Step 4: populate CtxtInfoV2.
     let ctxt = CtxtInfoV2 {
@@ -296,15 +294,10 @@ where
         _pad2: 0,
     };
 
-    let (ctxt_virt, ctxt_phys) =
-        alloc.alloc_coherent(core::mem::size_of::<CtxtInfoV2>());
+    let (ctxt_virt, ctxt_phys) = alloc.alloc_coherent(core::mem::size_of::<CtxtInfoV2>());
     unsafe {
         let src = &ctxt as *const CtxtInfoV2 as *const u8;
-        core::ptr::copy_nonoverlapping(
-            src,
-            ctxt_virt,
-            core::mem::size_of::<CtxtInfoV2>(),
-        );
+        core::ptr::copy_nonoverlapping(src, ctxt_virt, core::mem::size_of::<CtxtInfoV2>());
     }
 
     // Step 5: boot kick.
@@ -342,13 +335,12 @@ where
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
+    use super::super::{
+        parse_ucode, FwSection, UcodeHeader, CPU1_CPU2_SEPARATOR, IWL_TLV_UCODE_MAGIC,
+    };
     use super::*;
     use alloc::{collections::VecDeque, string::String};
     use narf_kernel_test::{kernel_test_in, TestResult};
-    use super::super::{
-        parse_ucode, FwSection, UcodeHeader, IWL_TLV_UCODE_MAGIC,
-        CPU1_CPU2_SEPARATOR,
-    };
 
     // ── Mock MMIO ──────────────────────────────────────────────────
 
@@ -358,14 +350,21 @@ pub mod tests {
     }
     impl MockMmio {
         fn new() -> Self {
-            Self { reads: VecDeque::new(), writes: alloc::vec::Vec::new() }
+            Self {
+                reads: VecDeque::new(),
+                writes: alloc::vec::Vec::new(),
+            }
         }
         fn stage(&mut self, off: u32, val: u32) {
             self.reads.push_back((off, val));
         }
         #[allow(dead_code)]
         fn last_write(&self, off: u32) -> Option<u32> {
-            self.writes.iter().rev().find(|(o, _)| *o == off).map(|(_, v)| *v)
+            self.writes
+                .iter()
+                .rev()
+                .find(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
         }
     }
     impl IwlMmio for MockMmio {
@@ -393,7 +392,11 @@ pub mod tests {
     }
     impl BumpAllocator {
         fn new(size: usize, base_phys: u64) -> Self {
-            Self { buf: alloc::vec![0u8; size], offset: 0, base_phys }
+            Self {
+                buf: alloc::vec![0u8; size],
+                offset: 0,
+                base_phys,
+            }
         }
     }
     impl DmaAllocator for BumpAllocator {
@@ -410,7 +413,7 @@ pub mod tests {
 
     // ── Mock AliveSink ─────────────────────────────────────────────
 
-    use super::super::regs::{IWL_ALIVE_STATUS_OK, CSR_RESET};
+    use super::super::regs::{CSR_RESET, IWL_ALIVE_STATUS_OK};
 
     struct MockAlive {
         /// Pre-loaded responses. Each call to `wait` pops one.
@@ -449,14 +452,14 @@ pub mod tests {
         blob.extend_from_slice(&1u32.to_le_bytes()); // version
         blob.extend_from_slice(&0u32.to_le_bytes()); // build
         blob.extend_from_slice(&[0u8; 8]); // ignore
-        // SEC_INIT: dest=0x0000_0000, payload=[0xAA, 0xBB, 0xCC, 0xDD].
+                                           // SEC_INIT: dest=0x0000_0000, payload=[0xAA, 0xBB, 0xCC, 0xDD].
         blob.extend_from_slice(&20u32.to_le_bytes()); // type=SecInit
-        blob.extend_from_slice(&8u32.to_le_bytes());  // len = 4+4
-        blob.extend_from_slice(&0u32.to_le_bytes());  // dest
+        blob.extend_from_slice(&8u32.to_le_bytes()); // len = 4+4
+        blob.extend_from_slice(&0u32.to_le_bytes()); // dest
         blob.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         // SEC_RT: dest=0x0010_0000, payload=[0x11, 0x22].
         blob.extend_from_slice(&19u32.to_le_bytes()); // type=SecRt
-        blob.extend_from_slice(&6u32.to_le_bytes());  // len=4+2 (padded to 8)
+        blob.extend_from_slice(&6u32.to_le_bytes()); // len=4+2 (padded to 8)
         blob.extend_from_slice(&0x0010_0000u32.to_le_bytes()); // dest
         blob.extend_from_slice(&[0x11, 0x22]);
         blob.extend_from_slice(&[0, 0]); // pad
@@ -550,10 +553,22 @@ pub mod tests {
             num_of_cpu: 1,
             init_sections: alloc::vec![],
             rt_sections: alloc::vec![
-                FwSection { dest_offset: 0x0010_0000, payload: &p1 },
-                FwSection { dest_offset: CPU1_CPU2_SEPARATOR, payload: &[] },
-                FwSection { dest_offset: 0x0020_0000, payload: &p2 },
-                FwSection { dest_offset: IML_SECTION_SENTINEL, payload: &p3 },
+                FwSection {
+                    dest_offset: 0x0010_0000,
+                    payload: &p1
+                },
+                FwSection {
+                    dest_offset: CPU1_CPU2_SEPARATOR,
+                    payload: &[]
+                },
+                FwSection {
+                    dest_offset: 0x0020_0000,
+                    payload: &p2
+                },
+                FwSection {
+                    dest_offset: IML_SECTION_SENTINEL,
+                    payload: &p3
+                },
             ],
             fw_version: None,
             pnvm_version: None,
@@ -589,7 +604,10 @@ pub mod tests {
             init_sections: alloc::vec![],
             rt_sections: alloc::vec![
                 // Normal section, no IML sentinel.
-                FwSection { dest_offset: 0x0010_0000, payload: &p1 },
+                FwSection {
+                    dest_offset: 0x0010_0000,
+                    payload: &p1
+                },
             ],
             fw_version: None,
             pnvm_version: None,
@@ -621,7 +639,9 @@ pub mod tests {
             return TestResult::Fail("DmaAllocatorImpl returned zero phys address");
         }
         // Verify we can write into the buffer without fault.
-        unsafe { vptr.write_bytes(0xAB, 4096); }
+        unsafe {
+            vptr.write_bytes(0xAB, 4096);
+        }
         TestResult::Pass
     }
 

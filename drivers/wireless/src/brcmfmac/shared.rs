@@ -165,14 +165,12 @@ impl SharedInfo {
             return None;
         }
         let console_addr = u32::from_le_bytes(
-            bytes[SHARED_CONSOLE_ADDR_OFFSET as usize
-                ..SHARED_CONSOLE_ADDR_OFFSET as usize + 4]
+            bytes[SHARED_CONSOLE_ADDR_OFFSET as usize..SHARED_CONSOLE_ADDR_OFFSET as usize + 4]
                 .try_into()
                 .ok()?,
         );
         let mut max_rxbufpost = u16::from_le_bytes(
-            bytes[SHARED_MAX_RXBUFPOST_OFFSET as usize
-                ..SHARED_MAX_RXBUFPOST_OFFSET as usize + 2]
+            bytes[SHARED_MAX_RXBUFPOST_OFFSET as usize..SHARED_MAX_RXBUFPOST_OFFSET as usize + 2]
                 .try_into()
                 .ok()?,
         );
@@ -180,8 +178,7 @@ impl SharedInfo {
             max_rxbufpost = DEF_MAX_RXBUFPOST;
         }
         let rx_dataoffset = u32::from_le_bytes(
-            bytes[SHARED_RX_DATAOFFSET_OFFSET as usize
-                ..SHARED_RX_DATAOFFSET_OFFSET as usize + 4]
+            bytes[SHARED_RX_DATAOFFSET_OFFSET as usize..SHARED_RX_DATAOFFSET_OFFSET as usize + 4]
                 .try_into()
                 .ok()?,
         );
@@ -198,8 +195,7 @@ impl SharedInfo {
                 .ok()?,
         );
         let ring_info_addr = u32::from_le_bytes(
-            bytes[SHARED_RING_INFO_ADDR_OFFSET as usize
-                ..SHARED_RING_INFO_ADDR_OFFSET as usize + 4]
+            bytes[SHARED_RING_INFO_ADDR_OFFSET as usize..SHARED_RING_INFO_ADDR_OFFSET as usize + 4]
                 .try_into()
                 .ok()?,
         );

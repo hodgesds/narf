@@ -11,12 +11,6 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::dma::{
-    addr_set_for, addr_set_for_chip, pack_idx, split_idx, RingState, AX_DMA_ADDR_SET,
-    AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
-    RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
-};
-use super::datapath::{consume_rx_bd, stage_tx, RxChannelState, TxChannelState};
 use super::btc::{
     build_btc_set_cmd, encode_cxhdr, encode_cxhdr_v7, make_btc_ctrl_h2c, make_btc_init_h2c,
     make_btc_run_h2c, make_btc_set_h2c, BTFC_FW_EVENT, BTFC_GET, BTFC_SET, CXDRVINFO_CTRL,
@@ -26,14 +20,18 @@ use super::btc::{
 use super::chan::{
     freq_to_band_chan, Band, JoinInfo, DEFAULT_BAND, DEFAULT_CHAN, DEFAULT_FREQ_MHZ,
     JOININFO_W0_BAND, JOININFO_W0_ISHESTA, JOININFO_W0_MACID_MASK, JOININFO_W0_NET_TYPE_SHIFT,
-    JOININFO_W0_OP, JOININFO_W0_PORT_ID_SHIFT, JOININFO_W0_SELF_ROLE_SHIFT, JOININFO_W0_WIFI_ROLE_SHIFT,
-    NET_TYPE_AP_MODE, NET_TYPE_INFRA, NET_TYPE_NO_LINK, SELF_ROLE_CLIENT, SELF_ROLE_NONE,
-    WIFI_ROLE_STATION,
+    JOININFO_W0_OP, JOININFO_W0_PORT_ID_SHIFT, JOININFO_W0_SELF_ROLE_SHIFT,
+    JOININFO_W0_WIFI_ROLE_SHIFT, NET_TYPE_AP_MODE, NET_TYPE_INFRA, NET_TYPE_NO_LINK,
+    SELF_ROLE_CLIENT, SELF_ROLE_NONE, WIFI_ROLE_STATION,
 };
-use super::phy_table::{
-    pd, pp, pw, tx_pwr_clamp, PhyEntry, PhyOp, TxPwrByRate, BB_RF_BOOTSTRAP_TABLE,
-    TXPWR_BYRATE_TABLE_SIZE,
+use super::datapath::{consume_rx_bd, stage_tx, RxChannelState, TxChannelState};
+use super::dma::{
+    addr_set_for, addr_set_for_chip, pack_idx, split_idx, RingState, AX_DMA_ADDR_SET,
+    AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
+    RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
 };
+use super::efuse::{mac_is_valid, EfuseError};
+use super::fw::{expected_blob_name, FwError};
 use super::fwdl::{
     detect_version, packet_count, parse_auto, parse_v0, parse_v1, FwSection, FwdlPacketIter,
     FWDL_SECTION_CHKSUM_LEN, FWDL_SECTION_MAX_NUM, FWDL_SECTION_PER_PKT_LEN, FW_HDR_V0_BASE_SIZE,
@@ -42,33 +40,34 @@ use super::fwdl::{
 };
 use super::h2c::{
     make_fwhdr_dl_h2c, make_joininfo_h2c, make_log_cfg_h2c, make_ofld_cfg_h2c,
-    make_ra_macidcfg_h2c, make_scanofld_h2c, H2cBuilder, H2cSeqAllocator,
-    H2C_CAT_CTL_DRV_GEN, H2C_CAT_MAC as H2C_CAT_MAC_H2C, H2C_CAT_OUTSRC, H2C_CAT_TEST,
-    H2C_CL_FW_INFO, H2C_CL_MAC_FR_EXCHG, H2C_CL_MAC_FWDL as H2C_CL_MAC_FWDL_H2C,
-    H2C_CL_MAC_FW_OFLD, H2C_CL_MAC_MEDIA_RPT, H2C_CL_OUTSRC_RA, H2C_CL_OUTSRC_RF_FW_RFK,
-    H2C_FUNC_MAC_BCN_UPD, H2C_FUNC_MAC_JOININFO, H2C_FUNC_OFLD_CFG, H2C_FUNC_OUTSRC_RA_MACIDCFG,
-    H2C_FUNC_SCANOFLD, H2C_FUNC_SCANOFLD_BE,
+    make_ra_macidcfg_h2c, make_scanofld_h2c, H2cBuilder, H2cSeqAllocator, H2C_CAT_CTL_DRV_GEN,
+    H2C_CAT_MAC as H2C_CAT_MAC_H2C, H2C_CAT_OUTSRC, H2C_CAT_TEST, H2C_CL_FW_INFO,
+    H2C_CL_MAC_FR_EXCHG, H2C_CL_MAC_FWDL as H2C_CL_MAC_FWDL_H2C, H2C_CL_MAC_FW_OFLD,
+    H2C_CL_MAC_MEDIA_RPT, H2C_CL_OUTSRC_RA, H2C_CL_OUTSRC_RF_FW_RFK, H2C_FUNC_MAC_BCN_UPD,
+    H2C_FUNC_MAC_JOININFO, H2C_FUNC_OFLD_CFG, H2C_FUNC_OUTSRC_RA_MACIDCFG, H2C_FUNC_SCANOFLD,
+    H2C_FUNC_SCANOFLD_BE,
 };
-use super::mac_init::{
-    QtaMode, B_AX_CMAC_DMA_EN, B_AX_CMAC_EN, B_AX_DLE_DMAC_EN, B_AX_DMAC_FUNC_EN,
-    B_AX_DMAC_MIX_EN, B_AX_DMAC_PKT_IN_EN, B_AX_HCI_RXDMA_EN, B_AX_HCI_TXDMA_EN, B_AX_PHYINTF_EN,
-    B_AX_PTCLTOP_EN, B_AX_RMAC_EN, B_AX_SCHEDULER_EN, B_AX_TMAC_EN, B_AX_WLRF1_CTRL_1,
-    B_AX_WLRF1_CTRL_7, B_AX_WLRF_CTRL_1, B_AX_WLRF_CTRL_7, CMAC_ENABLE_MASK, DMAC_PRE_EN_MASK,
-    PHYREG_SET_ALL_CYCLE, R_AX_CMAC_FUNC_EN, R_AX_DMAC_FUNC_EN, R_AX_HCI_FUNC_EN,
-    R_AX_PHYREG_SET, R_AX_WLRF_CTRL, WLRF_ENABLE_MASK,
-};
-use super::efuse::{mac_is_valid, EfuseError};
-use super::fw::{expected_blob_name, FwError};
 use super::mac::*;
+use super::mac_init::{
+    QtaMode, B_AX_CMAC_DMA_EN, B_AX_CMAC_EN, B_AX_DLE_DMAC_EN, B_AX_DMAC_FUNC_EN, B_AX_DMAC_MIX_EN,
+    B_AX_DMAC_PKT_IN_EN, B_AX_HCI_RXDMA_EN, B_AX_HCI_TXDMA_EN, B_AX_PHYINTF_EN, B_AX_PTCLTOP_EN,
+    B_AX_RMAC_EN, B_AX_SCHEDULER_EN, B_AX_TMAC_EN, B_AX_WLRF1_CTRL_1, B_AX_WLRF1_CTRL_7,
+    B_AX_WLRF_CTRL_1, B_AX_WLRF_CTRL_7, CMAC_ENABLE_MASK, DMAC_PRE_EN_MASK, PHYREG_SET_ALL_CYCLE,
+    R_AX_CMAC_FUNC_EN, R_AX_DMAC_FUNC_EN, R_AX_HCI_FUNC_EN, R_AX_PHYREG_SET, R_AX_WLRF_CTRL,
+    WLRF_ENABLE_MASK,
+};
 use super::pci::{name_for, register_pci_driver};
 use super::phy::PhyError;
+use super::phy_table::{
+    pd, pp, pw, tx_pwr_clamp, PhyEntry, PhyOp, TxPwrByRate, BB_RF_BOOTSTRAP_TABLE,
+    TXPWR_BYRATE_TABLE_SIZE,
+};
 use super::txrx::{
-    decode_rxd, encode_h2c_header, encode_rxd_for_test, encode_txwd as encode_txd, RxdInfo, TxwdInfo,
-    H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL, H2C_HEADER_LEN, H2C_HDR_REC_ACK,
-    TXWD_BODY0_CHANNEL_MASK, TXWD_BODY0_WD_INFO_EN, TXWD_BODY2_MACID_MASK,
-    TXWD_BODY2_QSEL_MASK, TXWD_BODY2_TXPKT_SIZE_MASK, TXWD_BODY_SIZE,
-    AX_RXD_CRC32_ERR, AX_RXD_RPKT_TYPE_WIFI, RXD_SHORT_SIZE,
-    QSEL_B0_BE,
+    decode_rxd, encode_h2c_header, encode_rxd_for_test, encode_txwd as encode_txd, RxdInfo,
+    TxwdInfo, AX_RXD_CRC32_ERR, AX_RXD_RPKT_TYPE_WIFI, H2C_CAT_MAC, H2C_CL_MAC_FWDL,
+    H2C_FUNC_MAC_FWHDR_DL, H2C_HDR_REC_ACK, H2C_HEADER_LEN, QSEL_B0_BE, RXD_SHORT_SIZE,
+    TXWD_BODY0_CHANNEL_MASK, TXWD_BODY0_WD_INFO_EN, TXWD_BODY2_MACID_MASK, TXWD_BODY2_QSEL_MASK,
+    TXWD_BODY2_TXPKT_SIZE_MASK, TXWD_BODY_SIZE,
 };
 use super::*;
 
@@ -78,14 +77,18 @@ fn smoke_rtw89_bd_layout() -> TestResult {
     let mut tx = super::dma::TxBd::default();
     tx.length = 0x1234;
     tx.set_phys(0x1_2345_6789);
-    
+
     // Manual check of packed layout.
     let bytes: [u8; 8] = unsafe { core::mem::transmute(tx) };
-    if bytes[0] != 0x34 || bytes[1] != 0x12 { return TestResult::Fail("length wrong"); }
+    if bytes[0] != 0x34 || bytes[1] != 0x12 {
+        return TestResult::Fail("length wrong");
+    }
     // opt @ bytes 2..4. bit 14 of u16 opt should be LS.
     // phys bits 39:32 in opt bits 13:6.
     // 0x1_2345_6789 -> hi = 1. opt bits 13:6 = 1 -> opt = 1 << 6 = 0x40.
-    if bytes[2] != 0x40 || bytes[3] != 0x00 { return TestResult::Fail("opt wrong"); }
+    if bytes[2] != 0x40 || bytes[3] != 0x00 {
+        return TestResult::Fail("opt wrong");
+    }
     // dma @ bytes 4..8.
     if bytes[4] != 0x89 || bytes[5] != 0x67 || bytes[6] != 0x45 || bytes[7] != 0x23 {
         return TestResult::Fail("dma address wrong");
@@ -94,7 +97,9 @@ fn smoke_rtw89_bd_layout() -> TestResult {
     let mut rx = super::dma::RxBd::default();
     rx.buf_size = 2048;
     rx.set_phys(0xFEDC_BA98_7654_3210);
-    if rx.buf_size != 2048 { return TestResult::Fail("rx buf_size wrong"); }
+    if rx.buf_size != 2048 {
+        return TestResult::Fail("rx buf_size wrong");
+    }
     // 0xFEDC_BA98_7654_3210 -> dma = 0x76543210, hi = 0xFEDCBA98.
     // opt bits 13:6 = hi bits 7:0 (since hi is u16? no, hi is u32).
     // Wait, my set_phys cast hi to u16.
@@ -242,7 +247,10 @@ fn smoke_rtw89_register_offsets_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_register_offsets_distinct);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_register_offsets_distinct
+);
 
 fn smoke_rtw89_efuse_field_layout() -> TestResult {
     // Per `rtw89/reg.h`:
@@ -315,7 +323,10 @@ fn smoke_rtw89_mac_is_valid_classifier() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_is_valid_classifier);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_mac_is_valid_classifier
+);
 
 // ── Firmware-blob name table ───────────────────────────────────────
 
@@ -370,7 +381,7 @@ fn smoke_rtw89_txwd_encode() -> TestResult {
     // best-effort queue, mac_id=1. Mirrors the fields
     // `rtw89_core_tx_build_txwd` fills at ~L300, v6.6.
     let info = TxwdInfo {
-        channel: 0,          // RTW89_TXCH_ACH0
+        channel: 0, // RTW89_TXCH_ACH0
         qsel: QSEL_B0_BE,
         mac_id: 1,
         pkt_size: 1000,
@@ -449,8 +460,18 @@ fn smoke_rtw89_h2c_header_encode() -> TestResult {
     // seq=3, payload=16 bytes). Mirrors `rtw89_h2c_pkt_set_hdr` call
     // shape from `fw.c:1564`.
     let mut hdr = [0u8; H2C_HEADER_LEN];
-    if encode_h2c_header(H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL,
-                         3, 16, true, false, &mut hdr).is_none() {
+    if encode_h2c_header(
+        H2C_CAT_MAC,
+        H2C_CL_MAC_FWDL,
+        H2C_FUNC_MAC_FWHDR_DL,
+        3,
+        16,
+        true,
+        false,
+        &mut hdr,
+    )
+    .is_none()
+    {
         return TestResult::Fail("encode_h2c_header returned None");
     }
     let dw0 = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
@@ -549,7 +570,10 @@ fn smoke_rtw89_dma_ax_v1_addr_set_pins() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_ax_v1_addr_set_pins);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_dma_ax_v1_addr_set_pins
+);
 
 fn smoke_rtw89_dma_addr_set_for_chip() -> TestResult {
     // AX baseline parts → AX_DMA_ADDR_SET.
@@ -691,7 +715,10 @@ fn smoke_rtw89_dma_all_ax_offsets_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_all_ax_offsets_distinct);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_dma_all_ax_offsets_distinct
+);
 
 // ── Stage-5: MAC init register addresses + bit masks ──────────────
 
@@ -721,7 +748,12 @@ fn smoke_rtw89_mac_init_wlrf_mask() -> TestResult {
         return TestResult::Fail("WLRF_ENABLE_MASK doesn't recompose");
     }
     // Bits must be distinct.
-    let bits = [B_AX_WLRF_CTRL_1, B_AX_WLRF_CTRL_7, B_AX_WLRF1_CTRL_1, B_AX_WLRF1_CTRL_7];
+    let bits = [
+        B_AX_WLRF_CTRL_1,
+        B_AX_WLRF_CTRL_7,
+        B_AX_WLRF1_CTRL_1,
+        B_AX_WLRF1_CTRL_7,
+    ];
     for i in 0..bits.len() {
         for j in (i + 1)..bits.len() {
             if bits[i] & bits[j] != 0 {
@@ -747,13 +779,24 @@ fn smoke_rtw89_mac_init_hci_dmac_cmac_bits() -> TestResult {
         return TestResult::Fail("DMAC_PRE_EN_MASK missing required bits");
     }
     // CMAC enable mask must include TMAC + RMAC.
-    let cmac_needed = B_AX_CMAC_EN | B_AX_TMAC_EN | B_AX_RMAC_EN
-        | B_AX_PHYINTF_EN | B_AX_CMAC_DMA_EN | B_AX_PTCLTOP_EN | B_AX_SCHEDULER_EN;
+    let cmac_needed = B_AX_CMAC_EN
+        | B_AX_TMAC_EN
+        | B_AX_RMAC_EN
+        | B_AX_PHYINTF_EN
+        | B_AX_CMAC_DMA_EN
+        | B_AX_PTCLTOP_EN
+        | B_AX_SCHEDULER_EN;
     if CMAC_ENABLE_MASK & cmac_needed != cmac_needed {
         return TestResult::Fail("CMAC_ENABLE_MASK missing required bits");
     }
     // Register addresses must be distinct.
-    let regs = [R_AX_HCI_FUNC_EN, R_AX_DMAC_FUNC_EN, R_AX_CMAC_FUNC_EN, R_AX_WLRF_CTRL, R_AX_PHYREG_SET];
+    let regs = [
+        R_AX_HCI_FUNC_EN,
+        R_AX_DMAC_FUNC_EN,
+        R_AX_CMAC_FUNC_EN,
+        R_AX_WLRF_CTRL,
+        R_AX_PHYREG_SET,
+    ];
     for i in 0..regs.len() {
         for j in (i + 1)..regs.len() {
             if regs[i] == regs[j] {
@@ -763,7 +806,10 @@ fn smoke_rtw89_mac_init_hci_dmac_cmac_bits() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_hci_dmac_cmac_bits);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_mac_init_hci_dmac_cmac_bits
+);
 
 fn smoke_rtw89_mac_init_qta_mode_enum() -> TestResult {
     // QtaMode covers the two values the FW-DL path uses.
@@ -946,17 +992,39 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_prebuilt_helpers);
 // ── Stage-7: FW downloader (header parser + packet segmentation) ──
 
 fn smoke_rtw89_fwdl_constants() -> TestResult {
-    if FW_TYPE_NORMAL != 1 { return TestResult::Fail("FW_TYPE_NORMAL drift"); }
-    if FW_TYPE_WOWLAN != 3 { return TestResult::Fail("FW_TYPE_WOWLAN drift"); }
-    if FW_TYPE_BBMCU0 != 64 { return TestResult::Fail("FW_TYPE_BBMCU0 drift"); }
-    if FW_TYPE_LOGFMT != 255 { return TestResult::Fail("FW_TYPE_LOGFMT drift"); }
-    if FWDL_SECTION_PER_PKT_LEN != 2020 { return TestResult::Fail("PER_PKT_LEN drift"); }
-    if FWDL_SECTION_CHKSUM_LEN != 8 { return TestResult::Fail("CHKSUM_LEN drift"); }
-    if FWDL_SECTION_MAX_NUM != 10 { return TestResult::Fail("MAX_NUM drift"); }
-    if FW_HDR_V0_BASE_SIZE != 32 { return TestResult::Fail("v0 base hdr"); }
-    if FW_HDR_V0_SECTION_SIZE != 12 { return TestResult::Fail("v0 section"); }
-    if FW_HDR_V1_BASE_SIZE != 48 { return TestResult::Fail("v1 base hdr"); }
-    if FW_HDR_V1_SECTION_SIZE != 16 { return TestResult::Fail("v1 section"); }
+    if FW_TYPE_NORMAL != 1 {
+        return TestResult::Fail("FW_TYPE_NORMAL drift");
+    }
+    if FW_TYPE_WOWLAN != 3 {
+        return TestResult::Fail("FW_TYPE_WOWLAN drift");
+    }
+    if FW_TYPE_BBMCU0 != 64 {
+        return TestResult::Fail("FW_TYPE_BBMCU0 drift");
+    }
+    if FW_TYPE_LOGFMT != 255 {
+        return TestResult::Fail("FW_TYPE_LOGFMT drift");
+    }
+    if FWDL_SECTION_PER_PKT_LEN != 2020 {
+        return TestResult::Fail("PER_PKT_LEN drift");
+    }
+    if FWDL_SECTION_CHKSUM_LEN != 8 {
+        return TestResult::Fail("CHKSUM_LEN drift");
+    }
+    if FWDL_SECTION_MAX_NUM != 10 {
+        return TestResult::Fail("MAX_NUM drift");
+    }
+    if FW_HDR_V0_BASE_SIZE != 32 {
+        return TestResult::Fail("v0 base hdr");
+    }
+    if FW_HDR_V0_SECTION_SIZE != 12 {
+        return TestResult::Fail("v0 section");
+    }
+    if FW_HDR_V1_BASE_SIZE != 48 {
+        return TestResult::Fail("v1 base hdr");
+    }
+    if FW_HDR_V1_SECTION_SIZE != 16 {
+        return TestResult::Fail("v1 section");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_constants);
@@ -968,7 +1036,9 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     hdr[1] = 0x0000_0102;
     hdr[6] = section_num << 8;
     hdr[7] = 0;
-    for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
+    for w in hdr.iter() {
+        blob.extend_from_slice(&w.to_le_bytes());
+    }
     let sw0 = 0x0000_1000u32;
     let sw1 = (1u32 << 24) | 512u32;
     let sw2 = 0u32;
@@ -978,21 +1048,42 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     blob.extend(core::iter::repeat(0xABu8).take(512));
 
     let mut sections = [FwSection {
-        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+        kind: 0,
+        dladdr: 0,
+        len: 0,
+        chksum: false,
+        redl: false,
+        payload_off: 0,
     }; FWDL_SECTION_MAX_NUM];
     let h = match parse_v0(&blob, &mut sections) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("v0 parse failed"),
     };
-    if h.section_num != 1 { return TestResult::Fail("section_num"); }
-    if h.fw_major != 2 || h.fw_minor != 1 { return TestResult::Fail("major/minor"); }
-    if h.version != 0 { return TestResult::Fail("version"); }
-    if h.hdr_len != 44 { return TestResult::Fail("hdr_len"); }
+    if h.section_num != 1 {
+        return TestResult::Fail("section_num");
+    }
+    if h.fw_major != 2 || h.fw_minor != 1 {
+        return TestResult::Fail("major/minor");
+    }
+    if h.version != 0 {
+        return TestResult::Fail("version");
+    }
+    if h.hdr_len != 44 {
+        return TestResult::Fail("hdr_len");
+    }
     let s = &sections[0];
-    if s.kind != 1 { return TestResult::Fail("section type"); }
-    if s.dladdr != 0x1000 { return TestResult::Fail("dladdr"); }
-    if s.len != 512 { return TestResult::Fail("section len"); }
-    if s.payload_off != 44 { return TestResult::Fail("payload_off"); }
+    if s.kind != 1 {
+        return TestResult::Fail("section type");
+    }
+    if s.dladdr != 0x1000 {
+        return TestResult::Fail("dladdr");
+    }
+    if s.len != 512 {
+        return TestResult::Fail("section len");
+    }
+    if s.payload_off != 44 {
+        return TestResult::Fail("payload_off");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v0_parse);
@@ -1000,7 +1091,9 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v0_parse);
 fn smoke_rtw89_fwdl_v0_chksum() -> TestResult {
     let mut blob = alloc::vec::Vec::new();
     let hdr = [0u32, 0, 0, 0, 0, 0, 1u32 << 8, 0];
-    for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
+    for w in hdr.iter() {
+        blob.extend_from_slice(&w.to_le_bytes());
+    }
     let sw0 = 0u32;
     let sw1 = (1u32 << 24) | (1u32 << 28) | 1000u32;
     let sw2 = 0u32;
@@ -1010,15 +1103,24 @@ fn smoke_rtw89_fwdl_v0_chksum() -> TestResult {
     blob.extend(core::iter::repeat(0x55u8).take(1008));
 
     let mut sections = [FwSection {
-        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+        kind: 0,
+        dladdr: 0,
+        len: 0,
+        chksum: false,
+        redl: false,
+        payload_off: 0,
     }; FWDL_SECTION_MAX_NUM];
     let _ = match parse_v0(&blob, &mut sections) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("v0+chksum parse failed"),
     };
     let s = &sections[0];
-    if !s.chksum { return TestResult::Fail("chksum bit"); }
-    if s.len != 1008 { return TestResult::Fail("len did not add 8"); }
+    if !s.chksum {
+        return TestResult::Fail("chksum bit");
+    }
+    if s.len != 1008 {
+        return TestResult::Fail("len did not add 8");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v0_chksum);
@@ -1030,7 +1132,9 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
     hdr[3] = 1u32 << 24;
     hdr[6] = 1u32 << 8;
     hdr[7] = 0;
-    for w in hdr.iter() { blob.extend_from_slice(&w.to_le_bytes()); }
+    for w in hdr.iter() {
+        blob.extend_from_slice(&w.to_le_bytes());
+    }
     let sw0 = 0x4000_0000u32;
     let sw1 = (64u32 << 24) | 256u32;
     let sw2 = 0u32;
@@ -1042,19 +1146,36 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
     blob.extend(core::iter::repeat(0xCDu8).take(256));
 
     let mut sections = [FwSection {
-        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+        kind: 0,
+        dladdr: 0,
+        len: 0,
+        chksum: false,
+        redl: false,
+        payload_off: 0,
     }; FWDL_SECTION_MAX_NUM];
     let h = match parse_v1(&blob, &mut sections) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("v1 parse failed"),
     };
-    if h.version != 1 { return TestResult::Fail("v1 version"); }
-    if h.section_num != 1 { return TestResult::Fail("v1 section_num"); }
-    if h.fw_major != 5 || h.fw_minor != 4 { return TestResult::Fail("v1 major/minor"); }
+    if h.version != 1 {
+        return TestResult::Fail("v1 version");
+    }
+    if h.section_num != 1 {
+        return TestResult::Fail("v1 section_num");
+    }
+    if h.fw_major != 5 || h.fw_minor != 4 {
+        return TestResult::Fail("v1 major/minor");
+    }
     let s = &sections[0];
-    if s.kind != 64 { return TestResult::Fail("v1 BBMCU0"); }
-    if s.dladdr != 0x4000_0000 { return TestResult::Fail("v1 dladdr"); }
-    if s.len != 256 { return TestResult::Fail("v1 section len"); }
+    if s.kind != 64 {
+        return TestResult::Fail("v1 BBMCU0");
+    }
+    if s.dladdr != 0x4000_0000 {
+        return TestResult::Fail("v1 dladdr");
+    }
+    if s.len != 256 {
+        return TestResult::Fail("v1 section len");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v1_parse);
@@ -1062,15 +1183,28 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_v1_parse);
 fn smoke_rtw89_fwdl_auto_detect() -> TestResult {
     let mut v0 = alloc::vec::Vec::new();
     let hdr0 = [0u32; 8];
-    for w in hdr0.iter() { v0.extend_from_slice(&w.to_le_bytes()); }
-    if detect_version(&v0).map_err(|_| ()) != Ok(0) { return TestResult::Fail("v0 detect"); }
+    for w in hdr0.iter() {
+        v0.extend_from_slice(&w.to_le_bytes());
+    }
+    if detect_version(&v0).map_err(|_| ()) != Ok(0) {
+        return TestResult::Fail("v0 detect");
+    }
     let mut v1 = alloc::vec::Vec::new();
     let mut hdr1 = [0u32; 12];
     hdr1[3] = 1 << 24;
-    for w in hdr1.iter() { v1.extend_from_slice(&w.to_le_bytes()); }
-    if detect_version(&v1).map_err(|_| ()) != Ok(1) { return TestResult::Fail("v1 detect"); }
+    for w in hdr1.iter() {
+        v1.extend_from_slice(&w.to_le_bytes());
+    }
+    if detect_version(&v1).map_err(|_| ()) != Ok(1) {
+        return TestResult::Fail("v1 detect");
+    }
     let mut sections = [FwSection {
-        kind: 0, dladdr: 0, len: 0, chksum: false, redl: false, payload_off: 0,
+        kind: 0,
+        dladdr: 0,
+        len: 0,
+        chksum: false,
+        redl: false,
+        payload_off: 0,
     }; FWDL_SECTION_MAX_NUM];
     let _ = parse_auto(&v1, &mut sections);
     TestResult::Pass
@@ -1080,16 +1214,32 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_auto_detect);
 fn smoke_rtw89_fwdl_packet_segment() -> TestResult {
     let mut iter = FwdlPacketIter::new(5060, FWDL_SECTION_PER_PKT_LEN);
     let p0 = iter.next().expect("p0");
-    if p0.section_off != 0 || p0.len != 2020 || p0.is_last { return TestResult::Fail("pkt0"); }
+    if p0.section_off != 0 || p0.len != 2020 || p0.is_last {
+        return TestResult::Fail("pkt0");
+    }
     let p1 = iter.next().expect("p1");
-    if p1.section_off != 2020 || p1.len != 2020 || p1.is_last { return TestResult::Fail("pkt1"); }
+    if p1.section_off != 2020 || p1.len != 2020 || p1.is_last {
+        return TestResult::Fail("pkt1");
+    }
     let p2 = iter.next().expect("p2");
-    if p2.section_off != 4040 || p2.len != 1020 || !p2.is_last { return TestResult::Fail("pkt2"); }
-    if iter.next().is_some() { return TestResult::Fail("extra pkt"); }
-    if packet_count(5060, 2020) != 3 { return TestResult::Fail("count(5060,2020)"); }
-    if packet_count(2020, 2020) != 1 { return TestResult::Fail("exact"); }
-    if packet_count(0, 2020) != 0 { return TestResult::Fail("zero"); }
-    if packet_count(5060, 0) != 3 { return TestResult::Fail("default fallback"); }
+    if p2.section_off != 4040 || p2.len != 1020 || !p2.is_last {
+        return TestResult::Fail("pkt2");
+    }
+    if iter.next().is_some() {
+        return TestResult::Fail("extra pkt");
+    }
+    if packet_count(5060, 2020) != 3 {
+        return TestResult::Fail("count(5060,2020)");
+    }
+    if packet_count(2020, 2020) != 1 {
+        return TestResult::Fail("exact");
+    }
+    if packet_count(0, 2020) != 0 {
+        return TestResult::Fail("zero");
+    }
+    if packet_count(5060, 0) != 3 {
+        return TestResult::Fail("default fallback");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwdl_packet_segment);
@@ -1137,11 +1287,17 @@ fn smoke_rtw89_phy_bootstrap_table_shape() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_phy_bootstrap_table_shape);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_phy_bootstrap_table_shape
+);
 
 fn smoke_rtw89_txpwr_clamp() -> TestResult {
-    let envelope = TxPwrByRate { rate_idx: 0, max_pwr_q1: 60 }; // +30.0 dBm
-    // Target above envelope.
+    let envelope = TxPwrByRate {
+        rate_idx: 0,
+        max_pwr_q1: 60,
+    }; // +30.0 dBm
+       // Target above envelope.
     if tx_pwr_clamp(100, envelope) != 60 {
         return TestResult::Fail("upper clamp wrong");
     }
@@ -1259,7 +1415,10 @@ fn smoke_rtw89_joininfo_for_disconnect() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_joininfo_for_disconnect);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_joininfo_for_disconnect
+);
 
 fn smoke_rtw89_joininfo_into_bytes() -> TestResult {
     let info = JoinInfo::for_assoc(0x42);

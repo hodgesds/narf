@@ -92,9 +92,7 @@ pub unsafe fn set_channel(
         }
     }
     // Linux waits 10 µs between channel-change writes; honour it.
-    narf_time::busy_wait_cycles(
-        10 * 1_000 * narf_time::cycles_per_ns().max(1) as u64,
-    );
+    narf_time::busy_wait_cycles(10 * 1_000 * narf_time::cycles_per_ns().max(1) as u64);
 
     let _ = RF_LC_TRIM;
     Ok(freq)

@@ -53,8 +53,8 @@ use super::regs::*;
 pub struct UsbControlSetup {
     pub bm_request_type: u8,
     pub b_request: u8,
-    pub w_value: u16, // register address (LE)
-    pub w_index: u16, // always 0
+    pub w_value: u16,  // register address (LE)
+    pub w_index: u16,  // always 0
     pub w_length: u16, // 1 / 2 / 4
 }
 
@@ -230,17 +230,14 @@ pub struct IntrIn {
 
 impl IntrIn {
     pub const fn new() -> Self {
-        Self { data: [0u8; USB_INTR_CONTENT_LEN] }
+        Self {
+            data: [0u8; USB_INTR_CONTENT_LEN],
+        }
     }
 
     /// Low 4 bytes as a status word.
     pub fn status_word(&self) -> u32 {
-        u32::from_le_bytes([
-            self.data[0],
-            self.data[1],
-            self.data[2],
-            self.data[3],
-        ])
+        u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]])
     }
 }
 
@@ -495,7 +492,12 @@ impl FakeUsbTransport {
 
     /// Count `BulkOut` operations.
     pub fn bulk_out_count(&self) -> usize {
-        self.inner.borrow().log.iter().filter(|op| matches!(op, FakeOp::BulkOut { .. })).count()
+        self.inner
+            .borrow()
+            .log
+            .iter()
+            .filter(|op| matches!(op, FakeOp::BulkOut { .. }))
+            .count()
     }
 }
 
@@ -558,7 +560,10 @@ impl Rtl8xxxuTransport for FakeUsbTransport {
 
     fn bulk_out(&self, ep: u8, bytes: &[u8]) -> Result<usize, TransportError> {
         let mut g = self.inner.borrow_mut();
-        g.log.push(FakeOp::BulkOut { ep, bytes: bytes.to_vec() });
+        g.log.push(FakeOp::BulkOut {
+            ep,
+            bytes: bytes.to_vec(),
+        });
         Ok(bytes.len())
     }
 

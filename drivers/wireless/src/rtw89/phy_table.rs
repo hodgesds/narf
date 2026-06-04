@@ -106,7 +106,9 @@ pub unsafe fn apply_table(mmio: &MmioRegion, table: PhyTable) -> Result<usize, P
                 let cur = unsafe { mmio.read32(entry.reg) };
                 let new = (cur & !entry.mask) | (entry.val & entry.mask);
                 // SAFETY: identity-mapped MMIO.
-                unsafe { mmio.write32(entry.reg, new); }
+                unsafe {
+                    mmio.write32(entry.reg, new);
+                }
             }
             PhyOp::Poll => {
                 let mut last: u32 = 0;
@@ -147,9 +149,7 @@ pub unsafe fn apply_table(mmio: &MmioRegion, table: PhyTable) -> Result<usize, P
 // `rtw89_mac_enable_bb_rf` (mac.c:4172) — that captures the canonical
 // "set the bits / poll the ready" idiom every per-chip table extends.
 
-use super::mac_init::{
-    PHYREG_SET_ALL_CYCLE, R_AX_PHYREG_SET, R_AX_WLRF_CTRL, WLRF_ENABLE_MASK,
-};
+use super::mac_init::{PHYREG_SET_ALL_CYCLE, R_AX_PHYREG_SET, R_AX_WLRF_CTRL, WLRF_ENABLE_MASK};
 
 /// Bootstrap BB / RF enable as one PHY-table walk. Functionally
 /// identical to `mac_init::enable_bb_rf` but drives the walker so the

@@ -29,13 +29,11 @@
 
 #![allow(dead_code)]
 
-use narf_drivers_sdio::sdio::function::{
-    SdioError, SdioFunction,
-    encode_cmd52_read, encode_cmd52_write,
-    encode_cmd53_byte_read, encode_cmd53_byte_write,
-    encode_cmd53_block_read, encode_cmd53_block_write,
-};
 use narf_drivers_sdio::sdhci::cmd::{cmd52_arg, cmd53_arg};
+use narf_drivers_sdio::sdio::function::{
+    encode_cmd52_read, encode_cmd52_write, encode_cmd53_block_read, encode_cmd53_block_write,
+    encode_cmd53_byte_read, encode_cmd53_byte_write, SdioError, SdioFunction,
+};
 
 use super::transport::{Function, Transport, TransportError};
 
@@ -79,10 +77,10 @@ pub fn bridge_cmd53_write_arg(function: Function, address: u32, len: u16) -> u32
 fn map_err(e: SdioError) -> TransportError {
     match e {
         SdioError::ResponseError(_) => TransportError::BadFraming,
-        SdioError::LengthOverflow   => TransportError::LengthOverflow,
-        SdioError::BadFunction      => TransportError::AddressOverflow,
-        SdioError::HostError        => TransportError::Timeout,
-        SdioError::NotEnabled       => TransportError::NotReady,
+        SdioError::LengthOverflow => TransportError::LengthOverflow,
+        SdioError::BadFunction => TransportError::AddressOverflow,
+        SdioError::HostError => TransportError::Timeout,
+        SdioError::NotEnabled => TransportError::NotReady,
     }
 }
 
@@ -117,7 +115,8 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
         // Four sequential CMD52 reads; CYW43439 datasheet §6.5.
         let mut word = 0u32;
         for i in 0..4u32 {
-            let b = self.func
+            let b = self
+                .func
                 .cmd52_read(function as u8, address + i)
                 .map_err(map_err)?;
             word |= (b as u32) << (i * 8);
@@ -188,7 +187,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/cyw43439/sdio_bridge", smoke_bridge_cmd52_read_backplane);
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/sdio_bridge",
+        smoke_bridge_cmd52_read_backplane
+    );
 
     fn smoke_bridge_cmd52_write_io_enable() -> TestResult {
         // Write IO_ENABLE to enable F2 — matches Embassy cyw43 SDIO init.
@@ -208,7 +210,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/cyw43439/sdio_bridge", smoke_bridge_cmd52_write_io_enable);
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/sdio_bridge",
+        smoke_bridge_cmd52_write_io_enable
+    );
 
     fn smoke_bridge_cmd53_wlan_burst() -> TestResult {
         // 256-byte bulk write to F2, address 0 — matches soypat/cyw43439
@@ -233,7 +238,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/cyw43439/sdio_bridge", smoke_bridge_cmd53_wlan_burst);
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/sdio_bridge",
+        smoke_bridge_cmd53_wlan_burst
+    );
 
     fn smoke_bridge_cmd53_512_encodes_zero() -> TestResult {
         // Per SDIO spec: count field = 0 means 512 bytes in byte mode.
@@ -243,5 +251,8 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/cyw43439/sdio_bridge", smoke_bridge_cmd53_512_encodes_zero);
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/sdio_bridge",
+        smoke_bridge_cmd53_512_encodes_zero
+    );
 }

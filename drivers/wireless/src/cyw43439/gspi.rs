@@ -113,7 +113,11 @@ impl fmt::Display for CommandError {
 impl CommandWord {
     /// Convenience constructor for the common register-style access:
     /// auto-increment + 32-bit width.
-    pub fn reg(direction: Direction, function: Function, address: u32) -> Result<Self, CommandError> {
+    pub fn reg(
+        direction: Direction,
+        function: Function,
+        address: u32,
+    ) -> Result<Self, CommandError> {
         Self::new(direction, AddrMode::Increment, function, address, 4)
     }
 

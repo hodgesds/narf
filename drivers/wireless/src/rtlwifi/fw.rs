@@ -76,7 +76,7 @@ pub const FW_PAGE_SIZE: usize = 4096;
 /// Number of pages needed for `len` bytes.
 #[inline]
 pub const fn fw_page_count(len: usize) -> usize {
-    (len + 127) >> 7  // pagenum_128 — 128-byte pages for H2C staging
+    (len + 127) >> 7 // pagenum_128 — 128-byte pages for H2C staging
 }
 
 // ── Blob-name resolver ────────────────────────────────────────────────────

@@ -13,16 +13,18 @@ use super::btcoex::{
 };
 use super::channel::{ch_to_freq_mhz, Bandwidth, ChannelError, DEFAULT_CHANNEL_24G};
 use super::dma::{
-    queue_register_table, ACTIVE_TX_QUEUES, REG_TXDMA_OFFSET_CHK, RX_RING_DEPTH,
-    TXBD_SEG_NUM, TXDMA_BD_DESC_POLL, TX_RING_DEPTH_BE, TX_RING_DEPTH_DEFAULT,
+    queue_register_table, ACTIVE_TX_QUEUES, REG_TXDMA_OFFSET_CHK, RX_RING_DEPTH, TXBD_SEG_NUM,
+    TXDMA_BD_DESC_POLL, TX_RING_DEPTH_BE, TX_RING_DEPTH_DEFAULT,
 };
 use super::efuse::{mac_is_valid, EfuseError};
 use super::fw::fw_name_for;
-use super::h2c::{box_reg, H2cState, FWDL_CHKSUM_RPT, FW_PAGE_SIZE, FW_START_ADDRESS, MCUFWDL_RDY,
-    REG_HMEBOX_0, REG_HMEBOX_3, REG_HMEBOX_EXT_0, REG_HMETFR, WINTINI_RDY};
+use super::h2c::{
+    box_reg, H2cState, FWDL_CHKSUM_RPT, FW_PAGE_SIZE, FW_START_ADDRESS, MCUFWDL_RDY, REG_HMEBOX_0,
+    REG_HMEBOX_3, REG_HMEBOX_EXT_0, REG_HMETFR, WINTINI_RDY,
+};
 use super::irq::{
-    HIMRE_DEFAULT, HIMR_DEFAULT, IMR_BEDOK, IMR_BKDOK, IMR_C2HCMD, IMR_HIGHDOK, IMR_MGNTDOK,
-    IMR_PSTIMEOUT, IMR_RDU, IMR_ROK, IMR_VIDOK, IMR_VODOK, IMRE_RXFOVW, IsrStatus,
+    IsrStatus, HIMRE_DEFAULT, HIMR_DEFAULT, IMRE_RXFOVW, IMR_BEDOK, IMR_BKDOK, IMR_C2HCMD,
+    IMR_HIGHDOK, IMR_MGNTDOK, IMR_PSTIMEOUT, IMR_RDU, IMR_ROK, IMR_VIDOK, IMR_VODOK,
 };
 use super::mac::{
     bd_num_reg_for_queue, desa_reg_for_queue, txpktbuf_bndy_for, RCR_DEFAULT, TCR_DEFAULT,
@@ -53,7 +55,13 @@ fn smoke_rtlwifi_pci_id_table_coverage() -> TestResult {
     let count = registered
         .iter()
         .filter(|m| {
-            matches!(m.kind, MatchKind::VendorDevice { vendor: REALTEK_VENDOR, .. })
+            matches!(
+                m.kind,
+                MatchKind::VendorDevice {
+                    vendor: REALTEK_VENDOR,
+                    ..
+                }
+            )
         })
         .count();
 
@@ -86,7 +94,10 @@ fn smoke_rtlwifi_pci_id_table_coverage() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_pci_id_table_coverage);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_pci_id_table_coverage
+);
 
 // ── 2. EFUSE descriptor decoder ───────────────────────────────────────────
 
@@ -109,7 +120,10 @@ fn smoke_rtlwifi_efuse_descriptor_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_efuse_descriptor_layout);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_efuse_descriptor_layout
+);
 
 // ── 3. TX descriptor layout for BE queue ─────────────────────────────────
 
@@ -201,7 +215,10 @@ fn smoke_rtlwifi_fw_blob_name_by_chip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_fw_blob_name_by_chip);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_fw_blob_name_by_chip
+);
 
 // ── 6. Per-chip register-bank size table ─────────────────────────────────
 
@@ -224,7 +241,10 @@ fn smoke_rtlwifi_per_chip_mmio_size_table() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_per_chip_mmio_size_table);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_per_chip_mmio_size_table
+);
 
 // ── 7. MAC validity classifier ────────────────────────────────────────────
 
@@ -297,7 +317,10 @@ fn smoke_rtlwifi_probe_bound_or_skip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_probe_bound_or_skip);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_probe_bound_or_skip
+);
 
 // ── 11. Power-on table presence + terminator per chip ────────────────────
 
@@ -334,7 +357,10 @@ fn smoke_rtlwifi_power_on_tables_present() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_power_on_tables_present);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_power_on_tables_present
+);
 
 // ── 12. Power-on row field packing ───────────────────────────────────────
 
@@ -370,7 +396,10 @@ fn smoke_rtlwifi_power_on_row_encoding() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_power_on_row_encoding);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_power_on_row_encoding
+);
 
 // ── 13. MAC TRX FIFO boundary per chip ───────────────────────────────────
 
@@ -391,7 +420,10 @@ fn smoke_rtlwifi_mac_trx_boundary_table() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_mac_trx_boundary_table);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_mac_trx_boundary_table
+);
 
 // ── 14. MAC RCR + TCR defaults ───────────────────────────────────────────
 
@@ -406,7 +438,10 @@ fn smoke_rtlwifi_mac_rcr_tcr_defaults() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_mac_rcr_tcr_defaults);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_mac_rcr_tcr_defaults
+);
 
 // ── 15. Per-queue DESA / TXBD_NUM register table ─────────────────────────
 
@@ -437,7 +472,10 @@ fn smoke_rtlwifi_per_queue_register_table() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_per_queue_register_table);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_per_queue_register_table
+);
 
 // ── 16. H2C mailbox bank selector + state advance ────────────────────────
 
@@ -488,7 +526,10 @@ fn smoke_rtlwifi_fw_download_constants() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_fw_download_constants);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_fw_download_constants
+);
 
 // ── 18. PHY BB-bringup preamble + RF reset constants ─────────────────────
 
@@ -511,7 +552,10 @@ fn smoke_rtlwifi_phy_bringup_constants() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_phy_bringup_constants);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_phy_bringup_constants
+);
 
 // ── 19. RF LSSI packer ───────────────────────────────────────────────────
 
@@ -576,7 +620,10 @@ fn smoke_rtlwifi_dma_queue_register_table() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_dma_queue_register_table);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_dma_queue_register_table
+);
 
 // ── 22. IRQ HIMR default mask carries every TX queue completion ──────────
 
@@ -757,7 +804,10 @@ fn smoke_rtlwifi_per_chip_coverage_matrix() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_per_chip_coverage_matrix);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_per_chip_coverage_matrix
+);
 
 // ── 28. Per-chip BT-coex + VHT feature flag matrix ───────────────────────
 
@@ -784,4 +834,7 @@ fn smoke_rtlwifi_per_chip_feature_flags() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_per_chip_feature_flags);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_per_chip_feature_flags
+);

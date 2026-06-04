@@ -18,10 +18,9 @@ use super::mcu::{mcu_ext_cmd_header, McuError, EFUSE_BLOCK_LEN};
 use super::pci::{firmware_blobs_for, l1_remap, name_for, register_pci_driver};
 use super::regs::*;
 use super::txrx::{
-    decode_rxd, encode_rxd_for_test, encode_sta_rec_update, encode_txd, RxdInfo, STA_REC_CMD_SIZE,
-    TXD_SIZE, TxdInfo, MCU_EXT_CMD_STA_REC_UPDATE,
-    TXD0_PKT_FMT_802_3, TXD1_LONG_FORMAT, TXD5_TX_STATUS_HOST,
-    RXD_BASE_SIZE, RXD0_PKT_TYPE_NORMAL,
+    decode_rxd, encode_rxd_for_test, encode_sta_rec_update, encode_txd, RxdInfo, TxdInfo,
+    MCU_EXT_CMD_STA_REC_UPDATE, RXD0_PKT_TYPE_NORMAL, RXD_BASE_SIZE, STA_REC_CMD_SIZE,
+    TXD0_PKT_FMT_802_3, TXD1_LONG_FORMAT, TXD5_TX_STATUS_HOST, TXD_SIZE,
 };
 
 // ── PCI match table ────────────────────────────────────────────────
@@ -287,10 +286,7 @@ fn smoke_mt7921_mcu_ext_cmd_encoder() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_mcu_ext_cmd_encoder
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_mcu_ext_cmd_encoder);
 
 // ── Register-offset uniqueness ─────────────────────────────────────
 
@@ -456,7 +452,10 @@ fn smoke_mt7921_sta_rec_update_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_sta_rec_update_encode);
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_sta_rec_update_encode
+);
 
 // ── Live-silicon smoke (Skip on QEMU) ──────────────────────────────
 //
@@ -477,15 +476,12 @@ fn smoke_mt7921_probe_bound_or_skip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_probe_bound_or_skip
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_probe_bound_or_skip);
 
 // ── Stage-4: DMA ring scaffolding ──────────────────────────────────
 
 fn smoke_mt7921_ring_regs_per_block() -> TestResult {
-    use super::dma::{mt7921_tx_ring_regs, mt7921_rx_ring_regs, RingRegs};
+    use super::dma::{mt7921_rx_ring_regs, mt7921_tx_ring_regs, RingRegs};
     // TX ring 0 must land at MT_TX_RING_BASE + 0.
     let tx0 = match mt7921_tx_ring_regs(0) {
         Ok(r) => r,
@@ -545,10 +541,7 @@ fn smoke_mt7921_ring_regs_per_block() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_ring_regs_per_block
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_ring_regs_per_block);
 
 fn smoke_mt7921_desc_size_and_dma_ctl() -> TestResult {
     use super::dma::{
@@ -647,10 +640,7 @@ fn smoke_mt7921_rx_ring_alloc_primed() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_rx_ring_alloc_primed
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_rx_ring_alloc_primed);
 
 fn smoke_mt7921_l1_remap_helper() -> TestResult {
     use super::dma::l1_remapped_offset;
@@ -692,10 +682,7 @@ fn smoke_mt7921_ring_set_allocates() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_ring_set_allocates
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_ring_set_allocates);
 
 fn smoke_mt7921_linux_ring_sizes_visible() -> TestResult {
     // Pin the Linux ring sizes against drift in mt7921.h.
@@ -759,10 +746,7 @@ fn smoke_mt7921_extended_mcu_opcodes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_extended_mcu_opcodes
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_extended_mcu_opcodes);
 
 fn smoke_mt7921_infra_window_constants() -> TestResult {
     // Catch drift on the INFRA L1 remap window constants — these are
@@ -832,10 +816,7 @@ fn smoke_mt7921_wfdma0_extended_bits() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_wfdma0_extended_bits
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_wfdma0_extended_bits);
 
 // ── Stage-5/6/7: firmware download parsers ────────────────────────
 
@@ -884,8 +865,8 @@ kernel_test_in!(
 
 fn smoke_mt7921_patch_section_parse() -> TestResult {
     use super::fwdl::{
-        iter_patch_sections, parse_patch_header, FwParseError, PATCH_HDR_SIZE,
-        PATCH_SEC_SIZE, PATCH_SEC_TYPE_INFO,
+        iter_patch_sections, parse_patch_header, FwParseError, PATCH_HDR_SIZE, PATCH_SEC_SIZE,
+        PATCH_SEC_TYPE_INFO,
     };
     let n_sec = 2usize;
     let total = PATCH_HDR_SIZE + n_sec * PATCH_SEC_SIZE;
@@ -928,10 +909,7 @@ fn smoke_mt7921_patch_section_parse() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_patch_section_parse
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_patch_section_parse);
 
 fn smoke_mt7921_fw_trailer_parse() -> TestResult {
     use super::fwdl::{parse_fw_trailer, FW_TRAILER_SIZE};
@@ -940,8 +918,7 @@ fn smoke_mt7921_fw_trailer_parse() -> TestResult {
     blob[trailer_start] = 0x79;
     blob[trailer_start + 1] = 0x01;
     blob[trailer_start + 2] = 4;
-    blob[trailer_start + 32..trailer_start + 36]
-        .copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+    blob[trailer_start + 32..trailer_start + 36].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
     let t = parse_fw_trailer(&blob).unwrap();
     if t.chip_id != 0x79 {
         return TestResult::Fail("chip_id round-trip wrong");
@@ -993,10 +970,7 @@ fn smoke_mt7921_fw_scatter_chunking() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_fw_scatter_chunking
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_fw_scatter_chunking);
 
 fn smoke_mt7921_target_addr_len_encode() -> TestResult {
     use super::fwdl::encode_target_address_len_req;
@@ -1030,16 +1004,20 @@ fn smoke_mt7921_pm_state_ctrl_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_pm_state_ctrl_encode
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_pm_state_ctrl_encode);
 
 fn smoke_mt7921_init_ra_cfg_encode() -> TestResult {
     use super::cmd::{encode_init_ra_cfg, INIT_RA_CFG_SIZE};
     let mut buf = [0xFFu8; INIT_RA_CFG_SIZE];
     encode_init_ra_cfg(0, 2, true, false, true, 1, true, 0x12345678, &mut buf).unwrap();
-    if buf[0] != 0 || buf[1] != 2 || buf[2] != 1 || buf[3] != 0 || buf[4] != 1 || buf[5] != 1 || buf[6] != 1 {
+    if buf[0] != 0
+        || buf[1] != 2
+        || buf[2] != 1
+        || buf[3] != 0
+        || buf[4] != 1
+        || buf[5] != 1
+        || buf[6] != 1
+    {
         return TestResult::Fail("init_ra_cfg byte fields wrong");
     }
     let mr = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
@@ -1048,15 +1026,13 @@ fn smoke_mt7921_init_ra_cfg_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_init_ra_cfg_encode
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_init_ra_cfg_encode);
 
 fn smoke_mt7921_uni_dev_info_update_encode() -> TestResult {
-    use super::cmd::{encode_uni_dev_info_update, UNI_DEV_INFO_BODY_SIZE,
-                     UNI_DEV_INFO_HDR_SIZE, UNI_DEV_INFO_TAG_ACTIVE,
-                     UNI_DEV_INFO_TAG_INFO};
+    use super::cmd::{
+        encode_uni_dev_info_update, UNI_DEV_INFO_BODY_SIZE, UNI_DEV_INFO_HDR_SIZE,
+        UNI_DEV_INFO_TAG_ACTIVE, UNI_DEV_INFO_TAG_INFO,
+    };
     let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
     let mut buf = [0xFFu8; UNI_DEV_INFO_BODY_SIZE];
     encode_uni_dev_info_update(0, 0, true, mac, &mut buf).unwrap();
@@ -1086,14 +1062,24 @@ kernel_test_in!(
 
 fn smoke_mt7921_bss_info_basic_tlv_encode() -> TestResult {
     use super::cmd::{
-        encode_bss_info_basic_tlv, BSS_INFO_BASIC_TLV_SIZE, BSS_INFO_TAG_BASIC,
-        NETWORK_TYPE_INFRA, PHY_MODE_HE,
+        encode_bss_info_basic_tlv, BSS_INFO_BASIC_TLV_SIZE, BSS_INFO_TAG_BASIC, NETWORK_TYPE_INFRA,
+        PHY_MODE_HE,
     };
     let bssid = [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x42];
     let mut buf = [0xFFu8; BSS_INFO_BASIC_TLV_SIZE];
     encode_bss_info_basic_tlv(
-        NETWORK_TYPE_INFRA, 0, 0, bssid, 100, 2, PHY_MODE_HE, 1, true, &mut buf,
-    ).unwrap();
+        NETWORK_TYPE_INFRA,
+        0,
+        0,
+        bssid,
+        100,
+        2,
+        PHY_MODE_HE,
+        1,
+        true,
+        &mut buf,
+    )
+    .unwrap();
     let tag = u16::from_le_bytes([buf[0], buf[1]]);
     if tag != BSS_INFO_TAG_BASIC {
         return TestResult::Fail("BSS_INFO_BASIC tag wrong");
@@ -1135,14 +1121,22 @@ kernel_test_in!(
 
 fn smoke_mt7921_sta_rec_basic_tlv_encode() -> TestResult {
     use super::cmd::{
-        encode_sta_rec_basic_tlv, CONN_STATE_PORT_SECURE, CONN_TYPE_STA_INFRA,
-        PHY_MODE_HE, STA_REC_BASIC_TLV_SIZE,
+        encode_sta_rec_basic_tlv, CONN_STATE_PORT_SECURE, CONN_TYPE_STA_INFRA, PHY_MODE_HE,
+        STA_REC_BASIC_TLV_SIZE,
     };
     let peer = [0xDE, 0xAD, 0xBE, 0xEF, 0x55, 0x55];
     let mut buf = [0xFFu8; STA_REC_BASIC_TLV_SIZE];
     encode_sta_rec_basic_tlv(
-        CONN_TYPE_STA_INFRA, CONN_STATE_PORT_SECURE, 1, peer, PHY_MODE_HE, 2, true, &mut buf,
-    ).unwrap();
+        CONN_TYPE_STA_INFRA,
+        CONN_STATE_PORT_SECURE,
+        1,
+        peer,
+        PHY_MODE_HE,
+        2,
+        true,
+        &mut buf,
+    )
+    .unwrap();
     let conn = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     if conn != CONN_TYPE_STA_INFRA {
         return TestResult::Fail("conn_type wrong");
@@ -1160,7 +1154,7 @@ kernel_test_in!(
 // ── Stage-10: channel switch ──────────────────────────────────────
 
 fn smoke_mt7921_channel_switch_default_5g() -> TestResult {
-    use super::cmd::{build_default_channel_switch_vec, CH_BAND_5G, CH_BW_20, CHANNEL_SWITCH_SIZE};
+    use super::cmd::{build_default_channel_switch_vec, CHANNEL_SWITCH_SIZE, CH_BAND_5G, CH_BW_20};
     let body = build_default_channel_switch_vec();
     if body.len() != CHANNEL_SWITCH_SIZE {
         return TestResult::Fail("channel switch body size wrong");
@@ -1274,7 +1268,7 @@ kernel_test_in!(
 // ── Stage-12: cipher suites + STA_REC WTBL ───────────────────────
 
 fn smoke_mt7921_cipher_suite_constants() -> TestResult {
-    use super::cmd::{AKM_PSK_OUI, AKM_SAE_OUI, CIPHER_CCMP_128_OUI, StaCipher};
+    use super::cmd::{StaCipher, AKM_PSK_OUI, AKM_SAE_OUI, CIPHER_CCMP_128_OUI};
     if CIPHER_CCMP_128_OUI != [0x00, 0x0F, 0xAC, 0x04] {
         return TestResult::Fail("CCMP-128 OUI wrong");
     }
@@ -1320,22 +1314,27 @@ fn smoke_mt7921_sta_rec_wtbl_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_sta_rec_wtbl_encode
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_sta_rec_wtbl_encode);
 
 fn smoke_mt7921_build_sta_rec_body_for_join() -> TestResult {
     use super::cmd::{
-        build_sta_rec_body_for_join, PHY_MODE_HE, StaCipher, STA_REC_BASIC_TLV_SIZE,
+        build_sta_rec_body_for_join, StaCipher, PHY_MODE_HE, STA_REC_BASIC_TLV_SIZE,
         STA_REC_WTBL_TLV_SIZE,
     };
     let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
     let key = [0x11u8; 16];
     let mut buf = [0u8; STA_REC_BASIC_TLV_SIZE + STA_REC_WTBL_TLV_SIZE];
     let n = build_sta_rec_body_for_join(
-        1, peer, 2, PHY_MODE_HE, StaCipher::Ccmp128, 0, &key, &mut buf,
-    ).unwrap();
+        1,
+        peer,
+        2,
+        PHY_MODE_HE,
+        StaCipher::Ccmp128,
+        0,
+        &key,
+        &mut buf,
+    )
+    .unwrap();
     if n != STA_REC_BASIC_TLV_SIZE + STA_REC_WTBL_TLV_SIZE {
         return TestResult::Fail("combined body length wrong");
     }
@@ -1376,8 +1375,9 @@ kernel_test_in!(
 
 fn smoke_mt7921_mcu_init_sequence_layout() -> TestResult {
     use super::bringup::{build_mcu_init_sequence, BringUpConfig};
-    use super::cmd::{INIT_RA_CFG_SIZE, PM_STATE_CTRL_SIZE, UNI_DEV_INFO_BODY_SIZE,
-                     PM_STATE_ACTIVE};
+    use super::cmd::{
+        INIT_RA_CFG_SIZE, PM_STATE_ACTIVE, PM_STATE_CTRL_SIZE, UNI_DEV_INFO_BODY_SIZE,
+    };
     let cfg = BringUpConfig::default();
     let seq = build_mcu_init_sequence(&cfg);
     let expected = PM_STATE_CTRL_SIZE + INIT_RA_CFG_SIZE + UNI_DEV_INFO_BODY_SIZE;
@@ -1412,10 +1412,7 @@ fn smoke_mt7921_mac_vif_setup_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/mt7921",
-    smoke_mt7921_mac_vif_setup_layout
-);
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_mac_vif_setup_layout);
 
 fn smoke_mt7921_assoc_open_frames_for_ssid() -> TestResult {
     use super::bringup::{build_assoc_open_frames, BringUpConfig};

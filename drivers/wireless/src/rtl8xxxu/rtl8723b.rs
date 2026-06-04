@@ -125,16 +125,46 @@ pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
     if buf.len() < IQK_PATH_A_STEP_COUNT {
         return 0;
     }
-    buf[0] = IqkStep { reg: REG_FPGA0_IQK, val: 0 };
-    buf[1] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0 };
-    buf[2] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0 };
-    buf[3] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0 };
-    buf[4] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0 };
-    buf[5] = IqkStep { reg: REG_TX_IQK,        val: 0 };
-    buf[6] = IqkStep { reg: REG_RX_IQK,        val: 0 };
-    buf[7] = IqkStep { reg: REG_IQK_AGC_RSP,   val: 0 };
-    buf[8] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
-    buf[9] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
+    buf[0] = IqkStep {
+        reg: REG_FPGA0_IQK,
+        val: 0,
+    };
+    buf[1] = IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[2] = IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[3] = IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0,
+    };
+    buf[4] = IqkStep {
+        reg: REG_RX_IQK_PI_A,
+        val: 0,
+    };
+    buf[5] = IqkStep {
+        reg: REG_TX_IQK,
+        val: 0,
+    };
+    buf[6] = IqkStep {
+        reg: REG_RX_IQK,
+        val: 0,
+    };
+    buf[7] = IqkStep {
+        reg: REG_IQK_AGC_RSP,
+        val: 0,
+    };
+    buf[8] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[9] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
     IQK_PATH_A_STEP_COUNT
 }
 
@@ -189,7 +219,10 @@ pub const CHANNEL_MAX: u8 = 14;
 /// Source: `core.c::rtl8xxxu_gen2_config_channel` L1328+.
 pub fn channel_set_writes_8723b(channel: u8) -> [(u16, u32); 1] {
     use super::phy::{lssi_encode, REG_FPGA0_LSSI_A};
-    [(REG_FPGA0_LSSI_A, lssi_encode(RF6052_REG_MODE_AG, channel as u32))]
+    [(
+        REG_FPGA0_LSSI_A,
+        lssi_encode(RF6052_REG_MODE_AG, channel as u32),
+    )]
 }
 
 pub fn channel_valid(channel: u8) -> bool {
@@ -201,9 +234,9 @@ pub fn channel_valid(channel: u8) -> bool {
 /// Re-export the BT coex decision logic so callers can drive the 8723BU
 /// PTA from a single namespace.
 pub use super::btcoex::{
-    Bt8723b1AntStatus, BtLinkProfile, CoexTableWrite, CoexType,
-    REG_BT_COEX_TABLE1, REG_BT_COEX_TABLE2, REG_BT_COEX_TABLE3, REG_BT_COEX_TABLE4,
-    coex_table_write_for_type, coex_type_for_state,
+    coex_table_write_for_type, coex_type_for_state, Bt8723b1AntStatus, BtLinkProfile,
+    CoexTableWrite, CoexType, REG_BT_COEX_TABLE1, REG_BT_COEX_TABLE2, REG_BT_COEX_TABLE3,
+    REG_BT_COEX_TABLE4,
 };
 
 /// Apply a BT coex table-write set via the supplied register writers.

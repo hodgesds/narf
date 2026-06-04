@@ -151,11 +151,7 @@ pub fn plan_common_rings(pre_v7: bool) -> [PlannedRing; NROF_COMMON_MSGRINGS] {
 
 /// Compute the contiguous DMA-indices buffer size for the given
 /// firmware ring-counts + idx width.
-pub fn idx_buffer_size(
-    max_submission: u16,
-    max_completion: u16,
-    idx_size: u8,
-) -> u32 {
+pub fn idx_buffer_size(max_submission: u16, max_completion: u16, idx_size: u8) -> u32 {
     ((max_submission as u32) + (max_completion as u32)) * (idx_size as u32) * 2
 }
 
@@ -255,8 +251,7 @@ pub fn preflight(
 
     let _nvram = parse_nvram(nvram_text);
     let shared = SharedInfo::parse(shared_bytes).ok_or(BringUpError::SharedInfoBadVersion)?;
-    let ring_info =
-        RingInfo::parse(ring_info_bytes).ok_or(BringUpError::RingInfoParseFailed)?;
+    let ring_info = RingInfo::parse(ring_info_bytes).ok_or(BringUpError::RingInfoParseFailed)?;
     if ring_info.max_flowrings > 512 {
         return Err(BringUpError::TooManyFlowrings);
     }

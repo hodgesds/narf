@@ -209,7 +209,7 @@ pub mod fc {
     // Management frame subtypes (bits 7:4) — OR with TYPE_MGMT.
     pub const SUBTYPE_PROBE_REQ: u16 = 0x40;
     pub const SUBTYPE_AUTH: u16 = 0xB0;
-    pub const SUBTYPE_ASSOC_REQ: u16 = 0x00;  // subtype 0 = assoc req
+    pub const SUBTYPE_ASSOC_REQ: u16 = 0x00; // subtype 0 = assoc req
     pub const SUBTYPE_DEAUTH: u16 = 0xC0;
     pub const SUBTYPE_DISASSOC: u16 = 0xA0;
 
@@ -321,7 +321,11 @@ impl Tfd {
         if n >= MAX_TFD_SEGS {
             return false;
         }
-        self.segs[n] = TbSeg { host_phys: phys, len, _res: 0 };
+        self.segs[n] = TbSeg {
+            host_phys: phys,
+            len,
+            _res: 0,
+        };
         self.n_segs += 1;
         true
     }
@@ -346,7 +350,12 @@ unsafe impl Sync for TxQueue {}
 
 impl TxQueue {
     pub fn new(queue_id: u8, tfds: *mut Tfd) -> Self {
-        Self { queue_id, write_ptr: 0, read_ptr: 0, tfds }
+        Self {
+            queue_id,
+            write_ptr: 0,
+            read_ptr: 0,
+            tfds,
+        }
     }
 
     /// Enqueue a pre-built `Tfd` and advance the write-pointer.
@@ -368,8 +377,8 @@ impl TxQueue {
 
 // ── Doorbell write ──────────────────────────────────────────────────
 
+use super::transport::prph_write;
 use super::transport::IwlMmio;
-use super::transport::{prph_write};
 
 /// Write the updated TX queue write-pointer to the SCD doorbell via
 /// the PRPH indirect-access registers. This is the "kick" that wakes
@@ -425,9 +434,9 @@ impl TxPacket {
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
+    use super::super::regs;
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
-    use super::super::regs;
 
     // ── Mock MMIO ──────────────────────────────────────────────────
 
@@ -436,14 +445,22 @@ pub mod tests {
     }
     impl MockMmio {
         fn new() -> Self {
-            Self { writes: alloc::vec::Vec::new() }
+            Self {
+                writes: alloc::vec::Vec::new(),
+            }
         }
         fn last_write(&self, off: u32) -> Option<u32> {
-            self.writes.iter().rev().find(|(o, _)| *o == off).map(|(_, v)| *v)
+            self.writes
+                .iter()
+                .rev()
+                .find(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
         }
     }
     impl IwlMmio for MockMmio {
-        fn read(&mut self, _off: u32) -> u32 { 0 }
+        fn read(&mut self, _off: u32) -> u32 {
+            0
+        }
         fn write(&mut self, off: u32, value: u32) {
             self.writes.push((off, value));
         }
@@ -514,8 +531,7 @@ pub mod tests {
     // ── Smoke: TxQueue enqueue advances write_ptr ──────────────────
 
     fn smoke_iwlwifi_tx_queue_enqueue_advances_wptr() -> TestResult {
-        let mut ring: alloc::vec::Vec<Tfd> =
-            (0..TX_RING_SIZE).map(|_| Tfd::default()).collect();
+        let mut ring: alloc::vec::Vec<Tfd> = (0..TX_RING_SIZE).map(|_| Tfd::default()).collect();
         let mut q = TxQueue::new(0, ring.as_mut_ptr());
         let tfd = Tfd::default();
         let slot = q.enqueue(tfd);
@@ -581,9 +597,24 @@ pub mod tests {
     }
 
     kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_cmd_builder);
-    kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_doorbell_write);
-    kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tfd_push_and_overflow_guard);
-    kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_queue_enqueue_advances_wptr);
-    kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_mac_header_management_build);
-    kernel_test_in!("drivers/wireless/iwlwifi/tx", smoke_iwlwifi_tx_cmd_ccmp_sec_ctl);
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/tx",
+        smoke_iwlwifi_tx_doorbell_write
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/tx",
+        smoke_iwlwifi_tfd_push_and_overflow_guard
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/tx",
+        smoke_iwlwifi_tx_queue_enqueue_advances_wptr
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/tx",
+        smoke_iwlwifi_mac_header_management_build
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/tx",
+        smoke_iwlwifi_tx_cmd_ccmp_sec_ctl
+    );
 }

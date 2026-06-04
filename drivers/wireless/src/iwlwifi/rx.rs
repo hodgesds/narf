@@ -112,7 +112,12 @@ pub fn parse_rx_header(bytes: &[u8]) -> Option<RxPacketHeader> {
     let cmd = bytes[4];
     let group_id = bytes[5];
     let sequence = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-    Some(RxPacketHeader { len_n_flags, cmd, group_id, sequence })
+    Some(RxPacketHeader {
+        len_n_flags,
+        cmd,
+        group_id,
+        sequence,
+    })
 }
 
 // ── Well-known notification command IDs ────────────────────────────
@@ -224,7 +229,10 @@ pub fn classify_rx(hdr: &RxPacketHeader) -> RxKind {
         (NOTIF_SCAN_COMPLETE_UMAC, NOTIF_SCAN_COMPLETE_GROUP) => RxKind::ScanComplete,
         (NOTIF_RX_MPDU, NOTIF_RX_MPDU_GROUP) => RxKind::RxMpdu,
         (NOTIF_MAC_CONTEXT_CHANGED, NOTIF_MAC_CONTEXT_GROUP) => RxKind::MacContextChanged,
-        _ => RxKind::Unknown { cmd: hdr.cmd, group_id: hdr.group_id },
+        _ => RxKind::Unknown {
+            cmd: hdr.cmd,
+            group_id: hdr.group_id,
+        },
     }
 }
 
@@ -255,8 +263,7 @@ pub fn drain_rx_queue<'a, H, F>(
     mmio_wptr: usize,
     mut rxb_data: F,
     handler: &mut H,
-)
-where
+) where
     H: RxHandler,
     F: FnMut(usize) -> &'a [u8],
 {
@@ -268,7 +275,11 @@ where
         if let Some(hdr) = parse_rx_header(data) {
             let payload_len = hdr.payload_len();
             let payload_end = 8usize.saturating_add(payload_len).min(data.len());
-            let payload = if data.len() >= 8 { &data[8..payload_end] } else { &[] };
+            let payload = if data.len() >= 8 {
+                &data[8..payload_end]
+            } else {
+                &[]
+            };
             let kind = classify_rx(&hdr);
             handler.handle(kind, hdr, payload);
         }
@@ -293,8 +304,7 @@ pub mod tests {
             // len_n_flags: total=12 (0x0C), no flags
             0x0C, 0x00, 0x00, 0x00,
             // cmd=ALIVE(0x01), group=0x00, seq=0xFFFF (notification)
-            0x01, 0x00, 0xFF, 0xFF,
-            // payload: ALIVE status = 0xCAFE (little-endian)
+            0x01, 0x00, 0xFF, 0xFF, // payload: ALIVE status = 0xCAFE (little-endian)
             0xFE, 0xCA, 0x00, 0x00,
         ];
 
@@ -313,13 +323,11 @@ pub mod tests {
             }
         }
 
-        let mut cap = Capture { kind: None, payload_len: 0 };
-        drain_rx_queue(
-            &mut rxq,
-            mmio_wptr,
-            |_slot| RXB,
-            &mut cap,
-        );
+        let mut cap = Capture {
+            kind: None,
+            payload_len: 0,
+        };
+        drain_rx_queue(&mut rxq, mmio_wptr, |_slot| RXB, &mut cap);
 
         match cap.kind {
             Some(RxKind::Alive) => {}
@@ -388,7 +396,10 @@ pub mod tests {
             sequence: 0x0042,
         };
         match classify_rx(&unk) {
-            RxKind::Unknown { cmd: 0xFE, group_id: 0xFF } => {}
+            RxKind::Unknown {
+                cmd: 0xFE,
+                group_id: 0xFF,
+            } => {}
             _ => return TestResult::Fail("unknown pair not Unknown"),
         }
 

@@ -14,20 +14,18 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::msgbuf::{
-    ring_layout, BufAddr, CommonHdr, IoctlReq, IoctlResp, MsgType, Ring, RxComplete, TxPost,
-    TxStatus, WlEvent,
-    chanspec_20mhz, chanspec_channel, chanspec_is5g,
-    D2H_MSGRING_CONTROL_COMPLETE, D2H_MSGRING_CONTROL_COMPLETE_ITEMSIZE,
-    D2H_MSGRING_CONTROL_COMPLETE_MAX_ITEM, D2H_MSGRING_RX_COMPLETE,
-    D2H_MSGRING_RX_COMPLETE_ITEMSIZE, D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7,
-    D2H_MSGRING_TX_COMPLETE, D2H_MSGRING_TX_COMPLETE_ITEMSIZE,
-    D2H_MSGRING_TX_COMPLETE_ITEMSIZE_PRE_V7, H2D_MSGRING_CONTROL_SUBMIT,
-    H2D_MSGRING_CONTROL_SUBMIT_ITEMSIZE, H2D_MSGRING_CONTROL_SUBMIT_MAX_ITEM,
-    H2D_MSGRING_RXPOST_SUBMIT, H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE,
-    H2D_MSGRING_RXPOST_SUBMIT_MAX_ITEM, IOCTL_REQ_SIZE, IOCTL_RESP_SIZE,
-    NROF_COMMON_MSGRINGS, NROF_D2H_COMMON_MSGRINGS, NROF_H2D_COMMON_MSGRINGS,
-    RX_COMPLETE_SIZE, TX_POST_SIZE, TX_STATUS_SIZE, WL_EVENT_SIZE,
-    WL_CHANSPEC_BAND_5G, WL_CHANSPEC_BW_20,
+    chanspec_20mhz, chanspec_channel, chanspec_is5g, ring_layout, BufAddr, CommonHdr, IoctlReq,
+    IoctlResp, MsgType, Ring, RxComplete, TxPost, TxStatus, WlEvent, D2H_MSGRING_CONTROL_COMPLETE,
+    D2H_MSGRING_CONTROL_COMPLETE_ITEMSIZE, D2H_MSGRING_CONTROL_COMPLETE_MAX_ITEM,
+    D2H_MSGRING_RX_COMPLETE, D2H_MSGRING_RX_COMPLETE_ITEMSIZE,
+    D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7, D2H_MSGRING_TX_COMPLETE,
+    D2H_MSGRING_TX_COMPLETE_ITEMSIZE, D2H_MSGRING_TX_COMPLETE_ITEMSIZE_PRE_V7,
+    H2D_MSGRING_CONTROL_SUBMIT, H2D_MSGRING_CONTROL_SUBMIT_ITEMSIZE,
+    H2D_MSGRING_CONTROL_SUBMIT_MAX_ITEM, H2D_MSGRING_RXPOST_SUBMIT,
+    H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE, H2D_MSGRING_RXPOST_SUBMIT_MAX_ITEM, IOCTL_REQ_SIZE,
+    IOCTL_RESP_SIZE, NROF_COMMON_MSGRINGS, NROF_D2H_COMMON_MSGRINGS, NROF_H2D_COMMON_MSGRINGS,
+    RX_COMPLETE_SIZE, TX_POST_SIZE, TX_STATUS_SIZE, WL_CHANSPEC_BAND_5G, WL_CHANSPEC_BW_20,
+    WL_EVENT_SIZE,
 };
 use super::pcie::{
     firmware_filename, name_for, register_pci_driver, ALL_DEV_IDS, BRCM_PCIE_43602_DEVICE_ID,
@@ -79,7 +77,10 @@ fn smoke_brcmfmac_name_for_known_ids() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_name_for_known_ids);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_name_for_known_ids
+);
 
 fn smoke_brcmfmac_firmware_filename_lookup() -> TestResult {
     // Every device id with a registered per-chip name also gets a
@@ -176,7 +177,10 @@ fn smoke_brcmfmac_ring_layout_lookup() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_ring_layout_lookup);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_ring_layout_lookup
+);
 
 // ── Common-ring SPSC state machine (Stage-1) ───────────────────────
 
@@ -210,7 +214,10 @@ fn smoke_brcmfmac_ring_empty_and_full() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_ring_empty_and_full);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_ring_empty_and_full
+);
 
 fn smoke_brcmfmac_ring_wraparound() -> TestResult {
     // Reservations wrap at `depth`. After publish + read_complete the
@@ -550,7 +557,10 @@ fn smoke_brcmfmac_bcdc_tx_post_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_bcdc_tx_post_encode);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_bcdc_tx_post_encode
+);
 
 fn smoke_brcmfmac_rx_complete_decode() -> TestResult {
     // Build an RxComplete for a 1500-byte frame with data_offset=28
@@ -590,7 +600,10 @@ fn smoke_brcmfmac_rx_complete_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_rx_complete_decode);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_rx_complete_decode
+);
 
 fn smoke_brcmfmac_tx_status_roundtrip() -> TestResult {
     let st = TxStatus {
@@ -620,7 +633,10 @@ fn smoke_brcmfmac_tx_status_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_tx_status_roundtrip);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_tx_status_roundtrip
+);
 
 fn smoke_brcmfmac_chanspec_5g_5180() -> TestResult {
     // 5180 MHz = channel 36 (5 GHz). Mirrors Linux's `ch20mhz_chspec`
@@ -661,8 +677,8 @@ kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_chanspec_5g_5180);
 
 fn smoke_brcmfmac_fwil_command_table_constants() -> TestResult {
     use super::fwil::{
-        BRCMF_C_DOWN, BRCMF_C_GET_REVINFO, BRCMF_C_GET_VAR, BRCMF_C_SET_KEY,
-        BRCMF_C_SET_SSID, BRCMF_C_SET_VAR, BRCMF_C_SET_WSEC_PMK, BRCMF_C_UP,
+        BRCMF_C_DOWN, BRCMF_C_GET_REVINFO, BRCMF_C_GET_VAR, BRCMF_C_SET_KEY, BRCMF_C_SET_SSID,
+        BRCMF_C_SET_VAR, BRCMF_C_SET_WSEC_PMK, BRCMF_C_UP,
     };
     // Per Linux `fwil.h` (lines 14..83 verbatim).
     if BRCMF_C_UP != 2 {
@@ -1009,13 +1025,15 @@ fn smoke_brcmfmac_trx_header_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_trx_header_decode);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_trx_header_decode
+);
 
 fn smoke_brcmfmac_fw_embedded_ramsize() -> TestResult {
     use super::firmware::{embedded_ramsize, FW_RAMSIZE_MAGIC, FW_RAMSIZE_OFFSET};
     let mut blob = alloc::vec![0u8; FW_RAMSIZE_OFFSET + 8 + 256];
-    blob[FW_RAMSIZE_OFFSET..FW_RAMSIZE_OFFSET + 4]
-        .copy_from_slice(&FW_RAMSIZE_MAGIC.to_le_bytes());
+    blob[FW_RAMSIZE_OFFSET..FW_RAMSIZE_OFFSET + 4].copy_from_slice(&FW_RAMSIZE_MAGIC.to_le_bytes());
     blob[FW_RAMSIZE_OFFSET + 4..FW_RAMSIZE_OFFSET + 8]
         .copy_from_slice(&0x0040_0000u32.to_le_bytes());
     match embedded_ramsize(&blob) {
@@ -1079,7 +1097,10 @@ fn smoke_brcmfmac_nvram_parse_basic() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_nvram_parse_basic);
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_nvram_parse_basic
+);
 
 fn smoke_brcmfmac_nvram_skips_raw1_and_bom() -> TestResult {
     use super::firmware::parse_nvram;
@@ -1204,7 +1225,7 @@ kernel_test_in!(
 
 fn smoke_brcmfmac_fweh_link_up_decode() -> TestResult {
     use super::fweh::{
-        EventMsg, BRCMF_E_LINK, BRCMF_EVENT_MSG_LINK, EVENT_BE_OFFSET, EVENT_ENVELOPE_SIZE,
+        EventMsg, BRCMF_EVENT_MSG_LINK, BRCMF_E_LINK, EVENT_BE_OFFSET, EVENT_ENVELOPE_SIZE,
     };
     let mut buf = [0u8; EVENT_ENVELOPE_SIZE + 16];
     // Fill the BE event_msg fields at offset EVENT_BE_OFFSET.
@@ -1309,7 +1330,8 @@ fn smoke_brcmfmac_eapol_m2_build() -> TestResult {
     let ap_mac = [0xA0u8, 0xB1, 0xC2, 0xD3, 0xE4, 0xF5];
     let sta_mac = [0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55];
     let snonce = [0xABu8; 32];
-    let rsn_ie = b"\x30\x14\x01\x00\x00\x0F\xAC\x04\x01\x00\x00\x0F\xAC\x04\x01\x00\x00\x0F\xAC\x02\x00\x00";
+    let rsn_ie =
+        b"\x30\x14\x01\x00\x00\x0F\xAC\x04\x01\x00\x00\x0F\xAC\x04\x01\x00\x00\x0F\xAC\x02\x00\x00";
     let m2 = build_m2(ap_mac, sta_mac, snonce, 1, rsn_ie);
     let mut buf = [0u8; EAPOL_KEY_FRAME_FIXED_SIZE + 32];
     let n = match m2.encode(&mut buf) {
@@ -1426,8 +1448,8 @@ kernel_test_in!(
 fn smoke_brcmfmac_connect_orchestrator_happy_path() -> TestResult {
     use super::connect::{connect_wpa2_psk, EventQueue, RecordingIoctl};
     use super::fweh::{
-        EventMsg, BRCMF_E_ASSOC, BRCMF_E_LINK, BRCMF_E_PSK_SUP, BRCMF_E_STATUS_FWSUP_COMPLETED,
-        BRCMF_E_STATUS_SUCCESS, BRCMF_EVENT_MSG_LINK,
+        EventMsg, BRCMF_EVENT_MSG_LINK, BRCMF_E_ASSOC, BRCMF_E_LINK, BRCMF_E_PSK_SUP,
+        BRCMF_E_STATUS_FWSUP_COMPLETED, BRCMF_E_STATUS_SUCCESS,
     };
     use super::fwil::{BRCMF_C_SET_SSID, BRCMF_C_UP};
     use super::msgbuf::chanspec_20mhz;
@@ -1574,11 +1596,11 @@ kernel_test_in!(
 fn smoke_brcmfmac_bus_plan_common_rings() -> TestResult {
     use super::bus::plan_common_rings;
     use super::msgbuf::{
-        D2H_MSGRING_CONTROL_COMPLETE, D2H_MSGRING_RX_COMPLETE, D2H_MSGRING_TX_COMPLETE,
-        H2D_MSGRING_CONTROL_SUBMIT, H2D_MSGRING_RXPOST_SUBMIT,
-        D2H_MSGRING_TX_COMPLETE_ITEMSIZE_PRE_V7, D2H_MSGRING_TX_COMPLETE_ITEMSIZE,
-        D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7, D2H_MSGRING_RX_COMPLETE_ITEMSIZE,
-        H2D_MSGRING_CONTROL_SUBMIT_ITEMSIZE, H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE,
+        D2H_MSGRING_CONTROL_COMPLETE, D2H_MSGRING_RX_COMPLETE, D2H_MSGRING_RX_COMPLETE_ITEMSIZE,
+        D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7, D2H_MSGRING_TX_COMPLETE,
+        D2H_MSGRING_TX_COMPLETE_ITEMSIZE, D2H_MSGRING_TX_COMPLETE_ITEMSIZE_PRE_V7,
+        H2D_MSGRING_CONTROL_SUBMIT, H2D_MSGRING_CONTROL_SUBMIT_ITEMSIZE, H2D_MSGRING_RXPOST_SUBMIT,
+        H2D_MSGRING_RXPOST_SUBMIT_ITEMSIZE,
     };
     // v7 (pre_v7=false) plan: TX/RX complete pick the larger 24/40
     // item sizes.
@@ -1598,13 +1620,11 @@ fn smoke_brcmfmac_bus_plan_common_rings() -> TestResult {
     if plan[2].id != D2H_MSGRING_CONTROL_COMPLETE || plan[2].is_h2d {
         return TestResult::Fail("plan[2] D2H control-complete mismatch");
     }
-    if plan[3].id != D2H_MSGRING_TX_COMPLETE
-        || plan[3].item_len != D2H_MSGRING_TX_COMPLETE_ITEMSIZE
+    if plan[3].id != D2H_MSGRING_TX_COMPLETE || plan[3].item_len != D2H_MSGRING_TX_COMPLETE_ITEMSIZE
     {
         return TestResult::Fail("plan[3] D2H tx-complete v7 size wrong");
     }
-    if plan[4].id != D2H_MSGRING_RX_COMPLETE
-        || plan[4].item_len != D2H_MSGRING_RX_COMPLETE_ITEMSIZE
+    if plan[4].id != D2H_MSGRING_RX_COMPLETE || plan[4].item_len != D2H_MSGRING_RX_COMPLETE_ITEMSIZE
     {
         return TestResult::Fail("plan[4] D2H rx-complete v7 size wrong");
     }
@@ -1679,9 +1699,7 @@ kernel_test_in!(
 fn smoke_brcmfmac_bus_preflight_happy() -> TestResult {
     use super::bus::preflight;
     use super::firmware::{FW_RAMSIZE_MAGIC, FW_RAMSIZE_OFFSET};
-    use super::shared::{
-        SHARED_FLAG_DMA_INDEX, SHARED_FLAG_HOSTRDY_DB1, RINGINFO_SIZE,
-    };
+    use super::shared::{RINGINFO_SIZE, SHARED_FLAG_DMA_INDEX, SHARED_FLAG_HOSTRDY_DB1};
     // Build a fake firmware blob with the SMAR magic.
     let mut fw_blob = alloc::vec![0u8; FW_RAMSIZE_OFFSET + 8 + 1024];
     fw_blob[FW_RAMSIZE_OFFSET..FW_RAMSIZE_OFFSET + 4]

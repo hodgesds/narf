@@ -154,15 +154,36 @@ pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
     // Source: `core.c::rtl8xxxu_iqk_path_a` L3094..L3117 — these are the
     // shared gen1 IQK values 8188EU uses. 8188EU is 1T1R so the
     // `priv->rf_paths > 1` branch is never taken → RX_IQK_PI_A=0x28160502.
-    buf[0] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0x10008c1f };
-    buf[1] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0x10008c1f };
-    buf[2] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0x82140102 };
-    buf[3] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0x28160502 };
+    buf[0] = IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0x10008c1f,
+    };
+    buf[1] = IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0x10008c1f,
+    };
+    buf[2] = IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0x82140102,
+    };
+    buf[3] = IqkStep {
+        reg: REG_RX_IQK_PI_A,
+        val: 0x28160502,
+    };
     // LO calibration setting.
-    buf[4] = IqkStep { reg: REG_IQK_AGC_RSP,   val: 0x001028d1 };
+    buf[4] = IqkStep {
+        reg: REG_IQK_AGC_RSP,
+        val: 0x001028d1,
+    };
     // One shot, path A LOK & IQK — two writes to AGC_PTS.
-    buf[5] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0xf9000000 };
-    buf[6] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0xf8000000 };
+    buf[5] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0xf9000000,
+    };
+    buf[6] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0xf8000000,
+    };
     IQK_PATH_A_STEP_COUNT
 }
 
@@ -200,7 +221,10 @@ pub const CHANNEL_MAX: u8 = 14;
 /// Build the channel-set RF writes for 8188EU.
 pub fn channel_set_writes_8188e(channel: u8) -> [(u16, u32); 1] {
     use super::phy::{lssi_encode, REG_FPGA0_LSSI_A};
-    [(REG_FPGA0_LSSI_A, lssi_encode(RF_REG_CHANNEL, channel as u32))]
+    [(
+        REG_FPGA0_LSSI_A,
+        lssi_encode(RF_REG_CHANNEL, channel as u32),
+    )]
 }
 
 /// Validate a 2.4 GHz channel number for this chip.

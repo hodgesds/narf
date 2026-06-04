@@ -61,7 +61,10 @@ impl EfuseAddr {
 pub fn efuse_addr_setups(addr: EfuseAddr) -> EfuseAddrSetups {
     let lo = (addr.0 & 0xFF) as u8;
     let hi = ((addr.0 >> 8) & 0x03) as u8;
-    EfuseAddrSetups { addr_lo: lo, addr_hi_bits: hi }
+    EfuseAddrSetups {
+        addr_lo: lo,
+        addr_hi_bits: hi,
+    }
 }
 
 /// The two data fields extracted by `efuse_addr_setups`.
@@ -150,31 +153,25 @@ pub fn read_efuse_byte_with_transport(
     let setups = efuse_addr_setups(addr);
 
     // Step 1: write addr_lo to REG_EFUSE_CTRL + 1.
-    reg_write(REG_EFUSE_CTRL + 1, &[setups.addr_lo])
-        .map_err(|_| EfuseReadError::TransportError)?;
+    reg_write(REG_EFUSE_CTRL + 1, &[setups.addr_lo]).map_err(|_| EfuseReadError::TransportError)?;
 
     // Step 2: read-modify-write REG_EFUSE_CTRL + 2 to inject addr_hi.
     let mut ctrl2 = [0u8; 1];
-    reg_read(REG_EFUSE_CTRL + 2, &mut ctrl2)
-        .map_err(|_| EfuseReadError::TransportError)?;
+    reg_read(REG_EFUSE_CTRL + 2, &mut ctrl2).map_err(|_| EfuseReadError::TransportError)?;
     let ctrl2_new = setups.apply_ctrl2(ctrl2[0]);
-    reg_write(REG_EFUSE_CTRL + 2, &[ctrl2_new])
-        .map_err(|_| EfuseReadError::TransportError)?;
+    reg_write(REG_EFUSE_CTRL + 2, &[ctrl2_new]).map_err(|_| EfuseReadError::TransportError)?;
 
     // Step 3: clear bit 7 of REG_EFUSE_CTRL + 3 to arm the read trigger.
     let mut ctrl3 = [0u8; 1];
-    reg_read(REG_EFUSE_CTRL + 3, &mut ctrl3)
-        .map_err(|_| EfuseReadError::TransportError)?;
+    reg_read(REG_EFUSE_CTRL + 3, &mut ctrl3).map_err(|_| EfuseReadError::TransportError)?;
     let ctrl3_new = EfuseAddrSetups::apply_ctrl3_clear_trigger(ctrl3[0]);
-    reg_write(REG_EFUSE_CTRL + 3, &[ctrl3_new])
-        .map_err(|_| EfuseReadError::TransportError)?;
+    reg_write(REG_EFUSE_CTRL + 3, &[ctrl3_new]).map_err(|_| EfuseReadError::TransportError)?;
 
     // Step 4: poll REG_EFUSE_CTRL (32-bit) until bit 31 is set.
     const MAX_POLLS: usize = 100;
     for _ in 0..MAX_POLLS {
         let mut ctrl = [0u8; 4];
-        reg_read(REG_EFUSE_CTRL, &mut ctrl)
-            .map_err(|_| EfuseReadError::TransportError)?;
+        reg_read(REG_EFUSE_CTRL, &mut ctrl).map_err(|_| EfuseReadError::TransportError)?;
         let word = u32::from_le_bytes(ctrl);
         if word & (1 << 31) != 0 {
             // Step 5: data ready — bits[7:0] is the byte.

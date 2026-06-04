@@ -114,10 +114,7 @@ pub const fn name_for(vendor: u16, device: u16) -> &'static str {
 
 /// Probe entry called by `narf-bus::driver_match` when a matching
 /// `(vendor, device)` pair surfaces.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Refuse re-probe — single-instance for Stage 0.
     if CONTROLLER.lock().is_some() {
         return Ok(());
@@ -179,7 +176,8 @@ pub fn probe(
     // try to actually load it; Stage 0 just announces the path.
     let _ = writeln!(
         narf_console::Writer,
-        "  ath10k:   firmware required at /firmware/ath10k/{}/", hw_rev.short_name(),
+        "  ath10k:   firmware required at /firmware/ath10k/{}/",
+        hw_rev.short_name(),
     );
 
     let vid = dev.vendor_id;
@@ -202,10 +200,7 @@ pub fn probe(
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(
-    device: &BusDevice,
-    hw_rev: HwRev,
-) -> Result<Ath10kDevice, ProbeError> {
+pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity.
     let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 

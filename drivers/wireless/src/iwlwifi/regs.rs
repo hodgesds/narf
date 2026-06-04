@@ -141,12 +141,10 @@ pub const FH_TCSR_CHNL_TX_BUF_STS_REG_SRVC: u32 =
 pub const FH_SRVC_CHNL_SRAM_ADDR_REG_SRVC: u32 =
     FH_MEM_LOWER_BOUND_GEN2 + 0x180 + FH_SRVC_CHNL * 0x4;
 /// `FH_TFDIB_CTRL0_REG(SRVC)` — host phys, low 32 bits.
-pub const FH_TFDIB_CTRL0_REG_SRVC: u32 =
-    FH_MEM_LOWER_BOUND_GEN2 + 0x900 + FH_SRVC_CHNL * 0x8;
+pub const FH_TFDIB_CTRL0_REG_SRVC: u32 = FH_MEM_LOWER_BOUND_GEN2 + 0x900 + FH_SRVC_CHNL * 0x8;
 /// `FH_TFDIB_CTRL1_REG(SRVC)` — host phys high 32 bits (low
 /// nibble) packed with the byte count.
-pub const FH_TFDIB_CTRL1_REG_SRVC: u32 =
-    FH_MEM_LOWER_BOUND_GEN2 + 0x904 + FH_SRVC_CHNL * 0x8;
+pub const FH_TFDIB_CTRL1_REG_SRVC: u32 = FH_MEM_LOWER_BOUND_GEN2 + 0x904 + FH_SRVC_CHNL * 0x8;
 
 /// CTRL1 packing helper: 4 high bits of phys go into bits 28-31
 /// of CTRL1; byte count lives in bits 0-19.

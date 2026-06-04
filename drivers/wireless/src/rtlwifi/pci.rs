@@ -73,10 +73,7 @@ impl WirelessNetIface for RtlwifiDevice {
             modes: narf_wireless::iface::WirelessModes::STATION,
             hw_caps: narf_wireless::iface::HwCaps {
                 ht_supported: true,
-                vht_supported: matches!(
-                    self.device_id,
-                    RTL_DEV_8821AE | RTL_DEV_8822BE
-                ),
+                vht_supported: matches!(self.device_id, RTL_DEV_8821AE | RTL_DEV_8822BE),
                 he_supported: false,
                 eht_supported: false,
             },
@@ -150,10 +147,7 @@ pub fn register_pci_driver() {
 }
 
 /// PCI probe callback.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }

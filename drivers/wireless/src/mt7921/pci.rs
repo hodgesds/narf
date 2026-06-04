@@ -53,7 +53,10 @@ pub struct Mt7921Device {
 impl core::fmt::Debug for Mt7921Device {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Mt7921Device")
-            .field("effective_did", &format_args!("{:#06x}", self.effective_did))
+            .field(
+                "effective_did",
+                &format_args!("{:#06x}", self.effective_did),
+            )
             .field("chip_id", &format_args!("{:#010x}", self.chip_id))
             .field("chip_rev", &format_args!("{:#04x}", self.chip_rev))
             .field("driver_owned", &self.driver_owned)
@@ -119,10 +122,7 @@ pub fn register_pci_driver() {
 
 /// PCI probe entry. Called by the bus dispatch layer when one of our
 /// registered (vendor, device) pairs is enumerated.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Skip if we already bound a device. Single-instance baseline;
     // a second probe is an enumeration race.
     if CONTROLLER.lock().is_some() {
@@ -149,7 +149,9 @@ pub fn probe(
             let _ = writeln!(
                 narf_console::Writer,
                 "  mt7921: bring-up failed ({:04x}:{:04x}): {:?}",
-                device.id.vendor, device.id.device, e,
+                device.id.vendor,
+                device.id.device,
+                e,
             );
             return Err(narf_bus::ProbeError::BadDevice);
         }
@@ -232,12 +234,11 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     //   if (chipid == 0x7961 && (mt7921_l1_rr(dev, MT_HW_BOUND) & BIT(7)))
     //       chipid = 0x7920;
     let raw_chip = (chip_id & 0xffff) as u16;
-    let effective_did =
-        if raw_chip == MTK_DEV_MT7961 && (bound & MT_HW_BOUND_DBDC) != 0 {
-            MTK_DEV_MT7920
-        } else {
-            raw_chip
-        };
+    let effective_did = if raw_chip == MTK_DEV_MT7961 && (bound & MT_HW_BOUND_DBDC) != 0 {
+        MTK_DEV_MT7920
+    } else {
+        raw_chip
+    };
 
     // ── Stage 1: driver-own + firmware-load stub + EFUSE ─────────
     //

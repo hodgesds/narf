@@ -154,10 +154,7 @@ pub fn register_pci_driver() {
 
 /// Probe entry called by `narf-bus::driver_match` when a Realtek
 /// vendor/device pair we registered for surfaces.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Skip if a device is already bound. Real laptops only ship one
     // RTW88; a second probe is a re-enumeration race.
     if CONTROLLER.lock().is_some() {
@@ -242,11 +239,18 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
         } {
             Ok(()) => {
                 use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "  rtw88: firmware loaded successfully");
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtw88: firmware loaded successfully"
+                );
             }
             Err(e) => {
                 use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "  rtw88: firmware load failed: {:?}", e);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtw88: firmware load failed: {:?}",
+                    e
+                );
             }
         }
     }

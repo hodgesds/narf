@@ -32,7 +32,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use narf_wireless::eapol::{HmacPrimitive, KeyFrame, Ptk, Supplicant, derive_ptk};
+use narf_wireless::eapol::{derive_ptk, HmacPrimitive, KeyFrame, Ptk, Supplicant};
 
 // ── SHA-1 (FIPS 180-4 §6.1) ─────────────────────────────────────────
 
@@ -49,7 +49,13 @@ impl Sha1 {
     fn new() -> Self {
         Self {
             // Initial hash values from FIPS 180-4 §5.3.1.
-            state: [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0],
+            state: [
+                0x6745_2301,
+                0xEFCD_AB89,
+                0x98BA_DCFE,
+                0x1032_5476,
+                0xC3D2_E1F0,
+            ],
             count: 0,
             buf: [0u8; 64],
             buf_len: 0,
@@ -119,7 +125,12 @@ impl Sha1 {
                 40..=59 => ((b & c) | (b & d) | (c & d), K[2]),
                 _ => (b ^ c ^ d, K[3]),
             };
-            let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -252,10 +263,8 @@ pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_wireless::eapol::{
-        FourWayState, KeyFrame, Supplicant,
-        KI_KEY_ACK, KI_KEY_TYPE_PAIRWISE, KI_KEY_MIC, KI_SECURE,
-        KI_VERSION_HMAC_SHA1_AES,
-        KEY_DESCRIPTOR_RSN,
+        FourWayState, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_KEY_ACK, KI_KEY_MIC,
+        KI_KEY_TYPE_PAIRWISE, KI_SECURE, KI_VERSION_HMAC_SHA1_AES,
     };
 
     // ── FIPS 180-4 SHA-1 known-answer ─────────────────────────────
@@ -265,8 +274,8 @@ pub mod tests {
         h.update(b"abc");
         let d = h.finalize();
         let expected: [u8; 20] = [
-            0xA9, 0x99, 0x3E, 0x36, 0x47, 0x06, 0x81, 0x6A, 0xBA, 0x3E,
-            0x25, 0x71, 0x78, 0x50, 0xC2, 0x6C, 0x9C, 0xD0, 0xD8, 0x9D,
+            0xA9, 0x99, 0x3E, 0x36, 0x47, 0x06, 0x81, 0x6A, 0xBA, 0x3E, 0x25, 0x71, 0x78, 0x50,
+            0xC2, 0x6C, 0x9C, 0xD0, 0xD8, 0x9D,
         ];
         if d != expected {
             return TestResult::Fail("SHA-1(abc) FIPS vector mismatch");
@@ -282,8 +291,8 @@ pub mod tests {
         let data = b"Hi There";
         let mac = hmac_sha1(&key, data);
         let expected: [u8; 20] = [
-            0xB6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xE2, 0x8B,
-            0xC0, 0xB6, 0xFB, 0x37, 0x8C, 0x8E, 0xF1, 0x46, 0xBE, 0x00,
+            0xB6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xE2, 0x8B, 0xC0, 0xB6, 0xFB, 0x37,
+            0x8C, 0x8E, 0xF1, 0x46, 0xBE, 0x00,
         ];
         if mac != expected {
             return TestResult::Fail("HMAC-SHA1 RFC 2104 vector mismatch");
@@ -301,10 +310,18 @@ pub mod tests {
         m1.replay_counter = 1;
         m1.key_nonce = [0xAAu8; 32];
 
-        if !m1.key_ack() { return TestResult::Fail("M1 key_ack should be set"); }
-        if m1.has_mic()  { return TestResult::Fail("M1 should not have MIC"); }
-        if !m1.pairwise() { return TestResult::Fail("M1 should be pairwise"); }
-        if m1.install()  { return TestResult::Fail("M1 should not have Install"); }
+        if !m1.key_ack() {
+            return TestResult::Fail("M1 key_ack should be set");
+        }
+        if m1.has_mic() {
+            return TestResult::Fail("M1 should not have MIC");
+        }
+        if !m1.pairwise() {
+            return TestResult::Fail("M1 should be pairwise");
+        }
+        if m1.install() {
+            return TestResult::Fail("M1 should not have Install");
+        }
         TestResult::Pass
     }
 
@@ -387,8 +404,8 @@ pub mod tests {
     // and deterministic.
     fn smoke_wpa_ptk_deriv_nonzero_and_deterministic() -> TestResult {
         let pmk = [0x42u8; 32];
-        let aa  = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let sa  = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let aa = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let sa = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let anonce = [0x11u8; 32];
         let snonce = [0x22u8; 32];
 
@@ -429,10 +446,28 @@ pub mod tests {
     }
 
     kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_sha1_abc_vector);
-    kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_hmac_sha1_rfc2104_vector);
-    kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_eapol_key_info_m1_bits);
-    kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_eapol_key_frame_encode_decode);
-    kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_4way_m1_m2_transition);
-    kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_ptk_deriv_nonzero_and_deterministic);
-    kernel_test_in!("drivers/wireless/iwlwifi/wpa", smoke_wpa_assoc_response_decode);
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_hmac_sha1_rfc2104_vector
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_eapol_key_info_m1_bits
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_eapol_key_frame_encode_decode
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_4way_m1_m2_transition
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_ptk_deriv_nonzero_and_deterministic
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_assoc_response_decode
+    );
 }

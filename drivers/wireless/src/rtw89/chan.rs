@@ -146,10 +146,18 @@ impl JoinInfo {
     /// path uses; BE extends to W1+W2 — that's Stage-10 work).
     pub const fn encode_w0(&self) -> u32 {
         let mut w: u32 = self.mac_id as u32 & JOININFO_W0_MACID_MASK;
-        if self.disconnect { w |= JOININFO_W0_OP; }
-        if self.band != 0 { w |= JOININFO_W0_BAND; }
-        if self.trigger { w |= JOININFO_W0_TGR; }
-        if self.is_hesta { w |= JOININFO_W0_ISHESTA; }
+        if self.disconnect {
+            w |= JOININFO_W0_OP;
+        }
+        if self.band != 0 {
+            w |= JOININFO_W0_BAND;
+        }
+        if self.trigger {
+            w |= JOININFO_W0_TGR;
+        }
+        if self.is_hesta {
+            w |= JOININFO_W0_ISHESTA;
+        }
         w |= ((self.port_id as u32) << JOININFO_W0_PORT_ID_SHIFT) & JOININFO_W0_PORT_ID_MASK;
         w |= ((self.net_type as u32) << JOININFO_W0_NET_TYPE_SHIFT) & JOININFO_W0_NET_TYPE_MASK;
         w |= ((self.wifi_role as u32) << JOININFO_W0_WIFI_ROLE_SHIFT) & JOININFO_W0_WIFI_ROLE_MASK;

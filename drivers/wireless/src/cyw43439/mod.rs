@@ -75,7 +75,7 @@ pub mod transport;
 
 pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
 pub use ioctl::{build_request, parse_response, Direction, ParseError, Response};
-pub use iovar::{build_region_cmd, VAR_COUNTRY, COUNTRY_WORLDWIDE, WL_COUNTRY_T_SIZE};
+pub use iovar::{build_region_cmd, COUNTRY_WORLDWIDE, VAR_COUNTRY, WL_COUNTRY_T_SIZE};
 pub use transport::{Function, Transport, TransportError};
 
 // ── Hardware identification (public datasheet cover sheet) ─────────
@@ -170,7 +170,7 @@ pub mod tests {
         //   bytes 8-9 = 'X','X'  (ccode)
         //   bytes 10-11 = 0,0  (NUL pad)
         use super::ioctl::WLC_SET_VAR;
-        use super::sdpcm::{BcdcHeader, HW_HEADER_LEN, SW_HEADER_LEN, BCDC_HEADER_LEN};
+        use super::sdpcm::{BcdcHeader, BCDC_HEADER_LEN, HW_HEADER_LEN, SW_HEADER_LEN};
 
         let frame = match build_region_cmd(1, 0, 0, b"XX") {
             Some(f) => f,
@@ -206,7 +206,8 @@ pub mod tests {
             return TestResult::Fail("country var name not at payload start");
         }
         // Verify wl_country_t.
-        let ct = &frame[payload_start + var_name.len()..payload_start + var_name.len() + WL_COUNTRY_T_SIZE];
+        let ct = &frame
+            [payload_start + var_name.len()..payload_start + var_name.len() + WL_COUNTRY_T_SIZE];
         if ct[0] != b'X' || ct[1] != b'X' {
             return TestResult::Fail("country abbreviation bytes 0-1 must be 'XX'");
         }

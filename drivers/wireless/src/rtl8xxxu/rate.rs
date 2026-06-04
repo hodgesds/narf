@@ -141,9 +141,7 @@ pub fn pack_dw4_rate(rate: RateIdx) -> u32 {
 
 /// Encode `(retry_limit, short_gi)` flags into DW4.
 pub fn pack_dw4_flags(retry_limit: u8, short_gi: bool) -> u32 {
-    use super::regs::{
-        TXDESC32_RETRY_LIMIT_ENABLE, TXDESC32_RETRY_LIMIT_SHIFT, TXDESC32_SHORT_GI,
-    };
+    use super::regs::{TXDESC32_RETRY_LIMIT_ENABLE, TXDESC32_RETRY_LIMIT_SHIFT, TXDESC32_SHORT_GI};
     let mut v = 0;
     if short_gi {
         v |= TXDESC32_SHORT_GI;

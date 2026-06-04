@@ -40,7 +40,10 @@ fn smoke_ath11k_pci_match_table_registers() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_pci_match_table_registers);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_pci_match_table_registers
+);
 
 fn smoke_ath11k_name_for_known_ids() -> TestResult {
     if name_for(ATH11K_DEV_QCA6390) != "ath11k-qca6390" {
@@ -82,7 +85,10 @@ fn smoke_ath11k_chip_for_pci_id_known_pairs() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_chip_for_pci_id_known_pairs);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_chip_for_pci_id_known_pairs
+);
 
 fn smoke_ath11k_refine_hw_rev_wcn6855_subversions() -> TestResult {
     // WCN6855 2.0 stays WCN6855 2.0.
@@ -142,7 +148,9 @@ fn smoke_ath11k_mhi_ring_push_pop_modular() -> TestResult {
     }
     // Push 7 (capacity - 1 since MHI reserves a slot).
     for i in 0..7 {
-        if r.push(MhiTre::pack_data(0x1000 + i, 64, true, false, false, false)).is_none() {
+        if r.push(MhiTre::pack_data(0x1000 + i, 64, true, false, false, false))
+            .is_none()
+        {
             return TestResult::Fail("push under capacity rejected");
         }
     }
@@ -168,7 +176,10 @@ fn smoke_ath11k_mhi_ring_push_pop_modular() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_ring_push_pop_modular);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mhi_ring_push_pop_modular
+);
 
 fn smoke_ath11k_mhi_tre_pack_and_unpack() -> TestResult {
     let dma = 0x1234_5678_9ABC_DEF0u64;
@@ -187,7 +198,10 @@ fn smoke_ath11k_mhi_tre_pack_and_unpack() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_tre_pack_and_unpack);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mhi_tre_pack_and_unpack
+);
 
 fn smoke_ath11k_mhi_channel_tables() -> TestResult {
     // QCA6390 channel set: ch20/ch21 IPCR, 64 elements.
@@ -355,7 +369,10 @@ fn smoke_ath11k_wmi_truncated_tlv_detected() -> TestResult {
         }
     }
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_truncated_tlv_detected);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_wmi_truncated_tlv_detected
+);
 
 // ── DP descriptor sizing ───────────────────────────────────────────
 
@@ -371,7 +388,10 @@ fn smoke_ath11k_dp_ring_default_sizes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_ring_default_sizes);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_ring_default_sizes
+);
 
 fn smoke_ath11k_dp_descriptor_sizes() -> TestResult {
     if HalTclDataCmd::SIZE != 32 {
@@ -409,7 +429,10 @@ fn smoke_ath11k_dp_ring_dir_classification() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_ring_dir_classification);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_ring_dir_classification
+);
 
 // ── Live-silicon smoke ─────────────────────────────────────────────
 //
@@ -466,7 +489,10 @@ fn smoke_ath11k_wmi_vdev_create_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath11k/wmi", smoke_ath11k_wmi_vdev_create_encode);
+kernel_test_in!(
+    "drivers/wireless/ath11k/wmi",
+    smoke_ath11k_wmi_vdev_create_encode
+);
 
 fn smoke_ath11k_wmi_vdev_set_param_channel_encode() -> TestResult {
     let frame = build_vdev_set_param(0, vdev_param::CHANNEL, 5180);

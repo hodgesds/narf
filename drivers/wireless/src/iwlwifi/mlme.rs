@@ -105,7 +105,10 @@ impl ScanSsid {
         let mut ssid = [0u8; 32];
         let len = b.len().min(32);
         ssid[..len].copy_from_slice(&b[..len]);
-        Self { ssid, ssid_len: len as u8 }
+        Self {
+            ssid,
+            ssid_len: len as u8,
+        }
     }
 }
 
@@ -135,7 +138,12 @@ impl ScanRequest {
                 dwell_time_ms_max: 110,
             })
             .collect();
-        Self { channels, ssids: Vec::new(), passive: true, rand_mac: false }
+        Self {
+            channels,
+            ssids: Vec::new(),
+            passive: true,
+            rand_mac: false,
+        }
     }
 
     /// Quick constructor: active directed scan for a specific SSID.
@@ -307,7 +315,7 @@ pub struct AssocParams {
 /// [Supported-Rates IE: 0x01 | len | rates...]
 /// ```
 pub fn build_assoc_request(params: &AssocParams) -> Vec<u8> {
-    use super::tx::{MacHeader, fc};
+    use super::tx::{fc, MacHeader};
     let mac_hdr = MacHeader::management(
         fc::SUBTYPE_ASSOC_REQ,
         params.ap_bssid,
@@ -389,8 +397,8 @@ impl AuthResponse {
         }
         Some(Self {
             algorithm: u16::from_le_bytes([body[0], body[1]]),
-            seq:       u16::from_le_bytes([body[2], body[3]]),
-            status:    u16::from_le_bytes([body[4], body[5]]),
+            seq: u16::from_le_bytes([body[2], body[3]]),
+            status: u16::from_le_bytes([body[4], body[5]]),
         })
     }
 
@@ -476,8 +484,8 @@ impl AssocResponseFields {
         }
         Some(Self {
             capability_info: u16::from_le_bytes([body[0], body[1]]),
-            status_code:     u16::from_le_bytes([body[2], body[3]]),
-            aid:             u16::from_le_bytes([body[4], body[5]]) & 0x3FFF,
+            status_code: u16::from_le_bytes([body[2], body[3]]),
+            aid: u16::from_le_bytes([body[4], body[5]]) & 0x3FFF,
         })
     }
 
@@ -546,9 +554,9 @@ pub fn parse_beacon_to_bss(bssid: [u8; 6], body: &[u8]) -> Option<BssDescriptor>
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
+    use super::super::tx::fc;
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
-    use super::super::tx::fc;
 
     // ── Smoke: scan request encode ─────────────────────────────────
 
@@ -625,12 +633,9 @@ pub mod tests {
             // Timestamp (8 bytes)
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             // Beacon interval = 100 TU = 0x64
-            0x64, 0x00,
-            // Capability info = 0x0431
-            0x31, 0x04,
-            // SSID IE
-            0x00, 0x05, b'h', b'e', b'l', b'l', b'o',
-            // Supported Rates IE
+            0x64, 0x00, // Capability info = 0x0431
+            0x31, 0x04, // SSID IE
+            0x00, 0x05, b'h', b'e', b'l', b'l', b'o', // Supported Rates IE
             0x01, 0x02, 0x82, 0x84,
         ];
 
@@ -789,13 +794,13 @@ pub mod tests {
         // version=1, group=CCMP(00:0F:AC:04), 1 pairwise=CCMP,
         // 1 AKM=PSK(00:0F:AC:02), caps=0.
         let rsn_body: Vec<u8> = alloc::vec![
-            0x01, 0x00,              // version = 1
+            0x01, 0x00, // version = 1
             0x00, 0x0F, 0xAC, 0x04, // group cipher: CCMP-128
-            0x01, 0x00,              // pairwise count = 1
+            0x01, 0x00, // pairwise count = 1
             0x00, 0x0F, 0xAC, 0x04, // pairwise: CCMP-128
-            0x01, 0x00,              // AKM count = 1
+            0x01, 0x00, // AKM count = 1
             0x00, 0x0F, 0xAC, 0x02, // AKM: PSK
-            0x00, 0x00,              // RSN capabilities = 0
+            0x00, 0x00, // RSN capabilities = 0
         ];
 
         let params = AssocParamsRsn {
@@ -865,11 +870,11 @@ pub mod tests {
         // Beacon body with timestamp(8) + interval(2) + cap(2) +
         // SSID IE + Supported Rates IE + RSN IE (tag 0x30).
         let rsn_body: &[u8] = &[
-            0x01, 0x00,              // version = 1
+            0x01, 0x00, // version = 1
             0x00, 0x0F, 0xAC, 0x04, // CCMP-128 group
             0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, // 1 pairwise CCMP-128
             0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02, // 1 AKM PSK
-            0x00, 0x00,              // caps
+            0x00, 0x00, // caps
         ];
         let mut beacon: Vec<u8> = alloc::vec![
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
@@ -892,8 +897,9 @@ pub mod tests {
         }
         match &bss.rsn_ie_body {
             None => return TestResult::Fail("RSN IE not extracted"),
-            Some(body) if body.as_slice() != rsn_body =>
-                return TestResult::Fail("RSN IE body mismatch"),
+            Some(body) if body.as_slice() != rsn_body => {
+                return TestResult::Fail("RSN IE body mismatch")
+            }
             _ => {}
         }
         TestResult::Pass

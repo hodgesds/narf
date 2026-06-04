@@ -168,7 +168,9 @@ pub struct FwHeader {
 // ── v0 parser ───────────────────────────────────────────────────────
 
 fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
 }
 
 /// Parse a v0 firmware blob header. Sections are written into
@@ -263,7 +265,8 @@ pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
     let section_num = ((w6 & FW_HDR_V1_W6_SEC_NUM_MASK) >> FW_HDR_V1_W6_SEC_NUM_SHIFT) as u8;
     let dynamic = w7 & FW_HDR_V1_W7_DYN_HDR != 0;
     let part_size = (w7 & FW_HDR_V1_W7_PART_SIZE_MASK) as usize;
-    let hdr_size_field = ((w5 & FW_HDR_V1_W5_HDR_SIZE_MASK) >> FW_HDR_V1_W5_HDR_SIZE_SHIFT) as usize;
+    let hdr_size_field =
+        ((w5 & FW_HDR_V1_W5_HDR_SIZE_MASK) >> FW_HDR_V1_W5_HDR_SIZE_SHIFT) as usize;
 
     if section_num as usize > FWDL_SECTION_MAX_NUM {
         return Err(FwError::BadFormat);
@@ -273,7 +276,11 @@ pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
     }
 
     let base_hdr_len = FW_HDR_V1_BASE_SIZE + section_num as usize * FW_HDR_V1_SECTION_SIZE;
-    let hdr_len = if hdr_size_field != 0 { hdr_size_field } else { base_hdr_len };
+    let hdr_len = if hdr_size_field != 0 {
+        hdr_size_field
+    } else {
+        base_hdr_len
+    };
 
     if blob.len() < hdr_len {
         return Err(FwError::BadFormat);
@@ -313,7 +320,11 @@ pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
         fw_minor: minor,
         section_num,
         hdr_len,
-        part_size: if part_size != 0 { part_size } else { FWDL_SECTION_PER_PKT_LEN },
+        part_size: if part_size != 0 {
+            part_size
+        } else {
+            FWDL_SECTION_PER_PKT_LEN
+        },
         dynamic_hdr: dynamic,
     })
 }
@@ -369,7 +380,11 @@ pub struct FwdlPacketIter {
 impl FwdlPacketIter {
     /// Build an iterator that walks `section` in `part_size` chunks.
     pub fn new(section_len: usize, part_size: usize) -> Self {
-        let part_size = if part_size == 0 { FWDL_SECTION_PER_PKT_LEN } else { part_size };
+        let part_size = if part_size == 0 {
+            FWDL_SECTION_PER_PKT_LEN
+        } else {
+            part_size
+        };
         Self {
             section_len,
             part_size,
@@ -404,6 +419,10 @@ impl Iterator for FwdlPacketIter {
 /// Convenience: total packet count for a section of `len` bytes split
 /// into `part_size`-byte packets.
 pub const fn packet_count(len: usize, part_size: usize) -> usize {
-    let ps = if part_size == 0 { FWDL_SECTION_PER_PKT_LEN } else { part_size };
+    let ps = if part_size == 0 {
+        FWDL_SECTION_PER_PKT_LEN
+    } else {
+        part_size
+    };
     (len + ps - 1) / ps
 }

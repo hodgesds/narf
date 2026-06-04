@@ -69,7 +69,7 @@ pub mod rtl8821ae;
 pub mod rtl8822be;
 
 pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
-pub use regs::{REALTEK_VENDOR, ALL_DEV_IDS};
+pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
 
 /// Entry point invoked from `drivers/wireless/src/lib.rs`.
 pub fn register() {

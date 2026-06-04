@@ -29,13 +29,13 @@ use super::efuse;
 use super::mac::{self, ChipId};
 use super::*;
 
-use core::fmt::Write as _;
+use crate::rtw89::datapath::{RxChannelState, TxChannelState};
 use alloc::boxed::Box;
-use narf_io::{alloc_coherent, DmaBuffer};
-use narf_lib::id::DomainId;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::rtw89::datapath::{RxChannelState, TxChannelState};
+use core::fmt::Write as _;
+use narf_io::{alloc_coherent, DmaBuffer};
+use narf_lib::id::DomainId;
 
 /// One bound RTW89 device.
 pub struct Rtw89Device {
@@ -89,10 +89,7 @@ pub enum ProbeError {
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw89Device>>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry called by `narf-bus::driver_match`.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -125,9 +122,9 @@ pub fn probe(
     });
 
     narf_net::iface::register("wlan0", mac, send_frame);
-    
+
     spawn_pumps(arc_dev);
-    
+
     Ok(())
 }
 
@@ -144,9 +141,9 @@ fn spawn_pumps(device: Arc<Rtw89Device>) {
 async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
     use crate::rtw89::datapath::*;
     use crate::rtw89::dma::*;
-    
+
     let _ = writeln!(narf_console::Writer, "  rtw89: RX pump started");
-    
+
     loop {
         if let Some(v) = device.irq_vector {
             narf_interrupts::wait::wait_for_irq(v).await;
@@ -159,24 +156,30 @@ async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
             let mmio = &device.mmio_bar2;
             let idx = unsafe { read_rx_ring_idx(mmio, &rx_q.regs) };
             let (rp, _) = split_idx(idx);
-            
+
             // hardware advances rp when it fills a BD.
             // host wp is where we last acknowledged.
             while rx_q.state.wp != rp {
                 let slot = rx_q.state.wp as usize;
                 let bd_payload = device.rx_buffers[RXCH_RXQ as usize][slot].as_slice();
-                
+
                 if let Some(delivery) = consume_rx_bd(bd_payload) {
                     // Push to network stack.
                     // For now we just log.
-                    let _ = writeln!(narf_console::Writer, "  rtw89: RX frame len={}", delivery.rxd.pkt_len);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  rtw89: RX frame len={}",
+                        delivery.rxd.pkt_len
+                    );
                 }
-                
+
                 rx_q.state.advance_wp(1);
             }
-            
+
             // Acknowledge processed BDs by updating doorbell WP.
-            unsafe { ring_doorbell_rx(mmio, &rx_q.regs, rx_q.state.wp); }
+            unsafe {
+                ring_doorbell_rx(mmio, &rx_q.regs, rx_q.state.wp);
+            }
         }
     }
 }
@@ -186,7 +189,10 @@ async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Result<Rtw89Device, ProbeError> {
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Rtw89Device, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity. rtw89 maps BAR2 only.
     let mmio_bar2 = unsafe { map_bar(device, 2) }.map_err(|_| ProbeError::Bar2MapFailed)?;
 
@@ -214,15 +220,21 @@ pub unsafe fn bring_up(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Re
 
     // ── DMA Ring Allocation ──
     use crate::rtw89::dma::*;
-    
+
     let mut tx_rings = Vec::new();
     let mut tx_ring_dma = Vec::new();
     for ch in 0..TXCH_NUM as u8 {
         let buf = alloc_coherent(tx_ring_bytes(DEFAULT_TXBD_NUM), DomainId::DRIVER_0)
             .map_err(|_| ProbeError::NoMemory)?;
-        unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, tx_ring_bytes(DEFAULT_TXBD_NUM)); }
+        unsafe {
+            core::ptr::write_bytes(buf.as_mut_ptr(), 0, tx_ring_bytes(DEFAULT_TXBD_NUM));
+        }
         tx_ring_dma.push(buf);
-        tx_rings.push(IrqSafeSpinLock::new(TxChannelState::new(chip_id, ch, DEFAULT_TXBD_NUM)));
+        tx_rings.push(IrqSafeSpinLock::new(TxChannelState::new(
+            chip_id,
+            ch,
+            DEFAULT_TXBD_NUM,
+        )));
     }
 
     let mut rx_rings = Vec::new();
@@ -231,11 +243,14 @@ pub unsafe fn bring_up(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Re
     for ch in 0..RXCH_NUM as u8 {
         let buf = alloc_coherent(rx_ring_bytes(DEFAULT_RXBD_NUM), DomainId::DRIVER_0)
             .map_err(|_| ProbeError::NoMemory)?;
-        unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, rx_ring_bytes(DEFAULT_RXBD_NUM)); }
+        unsafe {
+            core::ptr::write_bytes(buf.as_mut_ptr(), 0, rx_ring_bytes(DEFAULT_RXBD_NUM));
+        }
         let mut bufs = Vec::with_capacity(DEFAULT_RXBD_NUM as usize);
         let ring_ptr = buf.as_mut_ptr() as *mut RxBd;
         for i in 0..DEFAULT_RXBD_NUM {
-            let pkt_buf = alloc_coherent(2048, DomainId::DRIVER_0).map_err(|_| ProbeError::NoMemory)?;
+            let pkt_buf =
+                alloc_coherent(2048, DomainId::DRIVER_0).map_err(|_| ProbeError::NoMemory)?;
             unsafe {
                 let mut bd = RxBd::default();
                 bd.buf_size = 2048;
@@ -246,7 +261,11 @@ pub unsafe fn bring_up(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Re
         }
         rx_ring_dma.push(buf);
         rx_buffers.push(bufs);
-        rx_rings.push(IrqSafeSpinLock::new(RxChannelState::new(chip_id, ch, DEFAULT_RXBD_NUM)));
+        rx_rings.push(IrqSafeSpinLock::new(RxChannelState::new(
+            chip_id,
+            ch,
+            DEFAULT_RXBD_NUM,
+        )));
     }
 
     // ── Hardware Ring Init ──
@@ -259,7 +278,7 @@ pub unsafe fn bring_up(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Re
             mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
             mmio_bar2.write16(r.regs.num, DEFAULT_TXBD_NUM);
             // BDRAM_CTRL init — typical values from Linux pci.c
-            mmio_bar2.write32(r.regs.bdram, 0); 
+            mmio_bar2.write32(r.regs.bdram, 0);
             // Set initial host write pointer to 0.
             mmio_bar2.write32(r.regs.idx, 0);
         }
@@ -307,19 +326,21 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
         // ACH0 (BE) for general data.
         let mut tx_q = dev.tx_rings[TXCH_ACH0 as usize].lock();
         let mmio = &dev.mmio_bar2;
-        
+
         if tx_q.state.is_full() {
             // Poll for completion to free up slots.
             let idx = unsafe { read_tx_ring_idx(mmio, &tx_q.regs) };
             let (rp, _) = split_idx(idx);
             tx_q.state.set_rp(rp);
-            if tx_q.state.is_full() { return Err(()); }
+            if tx_q.state.is_full() {
+                return Err(());
+            }
         }
 
         // 1. Stage TXWD.
         // mac_id 0, qsel BE (ACH0)
         let sub = stage_tx(TXCH_ACH0, 0, 0, frame).ok_or(())?;
-        
+
         // 2. Setup DMA.
         // We reuse the pre-allocated packet buffers in a real driver,
         // but for now we allocate coherent memory for simplicity
@@ -327,14 +348,18 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
         let buf = alloc_coherent(sub.total, DomainId::DRIVER_0).map_err(|_| ())?;
         unsafe {
             core::ptr::copy_nonoverlapping(sub.txwd.as_ptr(), buf.as_mut_ptr(), sub.txwd.len());
-            core::ptr::copy_nonoverlapping(sub.frame.as_ptr(), buf.as_mut_ptr().add(sub.txwd.len()), sub.frame.len());
+            core::ptr::copy_nonoverlapping(
+                sub.frame.as_ptr(),
+                buf.as_mut_ptr().add(sub.txwd.len()),
+                sub.frame.len(),
+            );
         }
 
         // 3. Fill BD.
         let ring_dma = &dev.tx_ring_dma[TXCH_ACH0 as usize];
         let ring_ptr = ring_dma.as_mut_ptr() as *mut TxBd;
         let slot = tx_q.state.wp as usize;
-        
+
         unsafe {
             let mut bd = TxBd::default();
             bd.length = sub.total as u16;
@@ -345,14 +370,17 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
 
         // 4. Advance WP + Ring Doorbell.
         tx_q.state.advance_wp(1);
-        unsafe { ring_doorbell_tx(mmio, &tx_q.regs, tx_q.state.wp); }
-        
-        // Keep buf alive (leaked for now in this Stage-2 sketch; 
+        unsafe {
+            ring_doorbell_tx(mmio, &tx_q.regs, tx_q.state.wp);
+        }
+
+        // Keep buf alive (leaked for now in this Stage-2 sketch;
         // real driver would stash it for completion cleanup).
         Box::leak(Box::new(buf));
-        
+
         Ok(())
-    }).unwrap_or(Err(()))
+    })
+    .unwrap_or(Err(()))
 }
 
 /// Human-readable name for a known device id. Used as the

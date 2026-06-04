@@ -149,10 +149,7 @@ pub mod rx_ring_flags {
 /// `ring_base_paddr` — host physical address of the ring base.
 /// `fw_idx_shadow_paddr` — host physical address of the firmware
 ///   shadow write-index DWORD (must be 4-byte aligned, zeroed at boot).
-pub fn build_rx_ring_setup(
-    ring_base_paddr: u32,
-    fw_idx_shadow_paddr: u32,
-) -> HttRxRingSetup32 {
+pub fn build_rx_ring_setup(ring_base_paddr: u32, fw_idx_shadow_paddr: u32) -> HttRxRingSetup32 {
     HttRxRingSetup32 {
         fw_idx_shadow_reg_paddr: fw_idx_shadow_paddr,
         rx_ring_base_paddr: ring_base_paddr,
@@ -161,9 +158,7 @@ pub fn build_rx_ring_setup(
         // For 32-bit ring the field is slot count (`rx_ring_len = num_slots`).
         rx_ring_len: HTT_RX_RING_SIZE,
         rx_ring_bufsize: HTT_RX_BUF_SIZE,
-        flags: rx_ring_flags::UNICAST_RX
-            | rx_ring_flags::MULTICAST_RX
-            | rx_ring_flags::MGMT_RX,
+        flags: rx_ring_flags::UNICAST_RX | rx_ring_flags::MULTICAST_RX | rx_ring_flags::MGMT_RX,
         fw_idx_init_val: HTT_RX_RING_FILL_LEVEL,
         offsets: RxDescOffsets::default(),
     }
@@ -294,7 +289,11 @@ pub fn decode_rx_indication(msg: &[u8]) -> Option<RxIndication> {
     let info0 = msg[1];
     let peer_id = u16::from_le_bytes(msg[2..4].try_into().ok()?);
     let info1 = u32::from_le_bytes(msg[4..8].try_into().ok()?);
-    let hdr = HttRxIndHdr { info0, peer_id, info1 };
+    let hdr = HttRxIndHdr {
+        info0,
+        peer_id,
+        info1,
+    };
 
     // Skip: PPDU (44 bytes starting at offset 8).
     // prefix: bytes at offset 8+44 = 52.
@@ -303,8 +302,7 @@ pub fn decode_rx_indication(msg: &[u8]) -> Option<RxIndication> {
         u16::from_le_bytes(msg[prefix_start..prefix_start + 2].try_into().ok()?) as usize;
 
     // fw_rx_desc follows prefix (4 bytes), rounded up to 4-byte alignment.
-    let fw_desc_end =
-        prefix_start + RX_IND_PREFIX_SIZE + ((fw_rx_desc_bytes + 3) & !3);
+    let fw_desc_end = prefix_start + RX_IND_PREFIX_SIZE + ((fw_rx_desc_bytes + 3) & !3);
 
     // mpdu_ranges follow fw_desc.
     let mpdu_ranges_start = fw_desc_end;
@@ -312,16 +310,12 @@ pub fn decode_rx_indication(msg: &[u8]) -> Option<RxIndication> {
     let remaining = msg.len().saturating_sub(mpdu_ranges_start);
     let num_mpdu_ranges = remaining / MPDU_RANGE_SIZE;
 
-    let (mpdu_count, mpdu_status) = if num_mpdu_ranges > 0
-        && mpdu_ranges_start + MPDU_RANGE_SIZE <= msg.len()
-    {
-        (
-            msg[mpdu_ranges_start],
-            msg[mpdu_ranges_start + 1],
-        )
-    } else {
-        (0, 0)
-    };
+    let (mpdu_count, mpdu_status) =
+        if num_mpdu_ranges > 0 && mpdu_ranges_start + MPDU_RANGE_SIZE <= msg.len() {
+            (msg[mpdu_ranges_start], msg[mpdu_ranges_start + 1])
+        } else {
+            (0, 0)
+        };
 
     Some(RxIndication {
         hdr,

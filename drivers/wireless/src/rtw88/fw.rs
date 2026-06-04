@@ -1,9 +1,9 @@
+use super::regs::*;
 use narf_bus::MmioRegion;
 use narf_capabilities::{Cap, Read};
-use narf_firmware::{open, view_of, FirmwareRegistry, FirmwareError};
+use narf_firmware::{open, view_of, FirmwareError, FirmwareRegistry};
 use narf_scheduler::responsive_spin_until;
 use narf_time::Deadline;
-use super::regs::*;
 
 #[derive(Debug)]
 pub enum FwError {
@@ -14,7 +14,7 @@ pub enum FwError {
 }
 
 /// Implement `download_firmware` using the IDDMA mechanism for `RTL8822C`.
-/// 
+///
 /// # Safety
 /// Caller must ensure that `mmio_bar0` and `mmio_bar2` are valid and belong to the same device.
 pub unsafe fn download_firmware(
@@ -56,17 +56,21 @@ pub unsafe fn download_firmware(
     unsafe {
         mmio_bar0.write32(REG_DDMA_CH0SA, OCPBASE_TXBUF_88XX);
         mmio_bar0.write32(REG_DDMA_CH0DA, OCPBASE_IMEM_88XX);
-        
+
         let len = bytes.len() as u32;
         // Ensure len fits in BIT_MASK_DDMACH0_DLEN
         let len = len & BIT_MASK_DDMACH0_DLEN;
-        mmio_bar0.write32(REG_DDMA_CH0CTRL, BIT_DDMACH0_OWN | BIT_DDMACH0_CHKSUM_EN | len);
+        mmio_bar0.write32(
+            REG_DDMA_CH0CTRL,
+            BIT_DDMACH0_OWN | BIT_DDMACH0_CHKSUM_EN | len,
+        );
     }
 
     // 4. Wait for BIT_DDMACH0_OWN to clear in REG_DDMA_CH0CTRL.
-    if !responsive_spin_until(|| {
-        unsafe { (mmio_bar0.read32(REG_DDMA_CH0CTRL) & BIT_DDMACH0_OWN) == 0 }
-    }, Deadline::after_ms(500)) {
+    if !responsive_spin_until(
+        || unsafe { (mmio_bar0.read32(REG_DDMA_CH0CTRL) & BIT_DDMACH0_OWN) == 0 },
+        Deadline::after_ms(500),
+    ) {
         return Err(FwError::DownloadTimeout);
     }
 
@@ -78,9 +82,10 @@ pub unsafe fn download_firmware(
         mmio_bar0.write32(REG_MCUFW_CTRL, val);
     }
 
-    if !responsive_spin_until(|| {
-        unsafe { (mmio_bar0.read32(REG_MCUFW_CTRL) & FW_READY_MASK) == FW_READY_MASK }
-    }, Deadline::after_ms(500)) {
+    if !responsive_spin_until(
+        || unsafe { (mmio_bar0.read32(REG_MCUFW_CTRL) & FW_READY_MASK) == FW_READY_MASK },
+        Deadline::after_ms(500),
+    ) {
         return Err(FwError::ReadyTimeout);
     }
 

@@ -225,8 +225,10 @@ impl WirelessNetIface for IwlDevice {
         };
 
         let cmd_body = mlme::scan_request_cmd(&iwl_req);
-        
-        let payload_dma = if let Ok(pd) = narf_io::alloc_coherent(cmd_body.len(), DomainId::DRIVER_0) {
+
+        let payload_dma = if let Ok(pd) =
+            narf_io::alloc_coherent(cmd_body.len(), DomainId::DRIVER_0)
+        {
             unsafe {
                 core::ptr::copy_nonoverlapping(cmd_body.as_ptr(), pd.as_mut_ptr(), cmd_body.len());
             }
@@ -245,12 +247,18 @@ impl WirelessNetIface for IwlDevice {
 
                 // 2. Write header to DMA.
                 let cmd_dma = &self.tx_cmd_bufs[0];
-                let hdr_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlCmdHeader };
-                unsafe { core::ptr::write_volatile(hdr_ptr, hdr); }
+                let hdr_ptr =
+                    unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlCmdHeader };
+                unsafe {
+                    core::ptr::write_volatile(hdr_ptr, hdr);
+                }
 
                 // 3. Build TFD.
                 let mut tfd = tx::Tfd::default();
-                tfd.push_seg(cmd_dma.phys_addr().as_u64() + (slot * 32) as u64, core::mem::size_of::<tx::IwlCmdHeader>() as u16);
+                tfd.push_seg(
+                    cmd_dma.phys_addr().as_u64() + (slot * 32) as u64,
+                    core::mem::size_of::<tx::IwlCmdHeader>() as u16,
+                );
                 tfd.push_seg(pd.phys_addr().as_u64(), cmd_body.len() as u16);
 
                 // 4. Enqueue and kick.
@@ -279,8 +287,12 @@ impl WirelessNetIface for IwlDevice {
     }
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
-        let _ = writeln!(narf_console::Writer, "  iwlwifi: associating to {:?}", req.ssid);
-        
+        let _ = writeln!(
+            narf_console::Writer,
+            "  iwlwifi: associating to {:?}",
+            req.ssid
+        );
+
         // 1. Send Association Request.
         let params = mlme::AssocParams {
             sta_addr: self.mac_addr,
@@ -293,10 +305,11 @@ impl WirelessNetIface for IwlDevice {
         };
 
         let frame_bytes = mlme::build_assoc_request(&params);
-        let buf = narf_io::alloc_coherent(frame_bytes.len(), DomainId::DRIVER_0).map_err(|_| WirelessError::HardwareError)?;
+        let buf = narf_io::alloc_coherent(frame_bytes.len(), DomainId::DRIVER_0)
+            .map_err(|_| WirelessError::HardwareError)?;
         let mut frame = Frame::new(buf, frame_bytes.len() as u32);
         frame.payload_mut().copy_from_slice(&frame_bytes);
-        
+
         {
             let mut tx_q = self.tx_q0.lock();
             let mut mmio = IwlMmioImpl(self.mmio);
@@ -305,21 +318,29 @@ impl WirelessNetIface for IwlDevice {
             let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF);
             let cmd_dma = &self.tx_cmd_bufs[0];
             let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
-            unsafe { core::ptr::write_volatile(cmd_ptr, cmd); }
+            unsafe {
+                core::ptr::write_volatile(cmd_ptr, cmd);
+            }
 
             let mut tfd = tx::Tfd::default();
-            tfd.push_seg(cmd_dma.phys_addr().as_u64() + (slot * 32) as u64, core::mem::size_of::<tx::IwlTxCmd>() as u16);
-            tfd.push_seg(frame.buf().phys_addr().as_u64() + frame.offset() as u64, frame.len() as u16);
+            tfd.push_seg(
+                cmd_dma.phys_addr().as_u64() + (slot * 32) as u64,
+                core::mem::size_of::<tx::IwlTxCmd>() as u16,
+            );
+            tfd.push_seg(
+                frame.buf().phys_addr().as_u64() + frame.offset() as u64,
+                frame.len() as u16,
+            );
 
             tx_q.enqueue(tfd);
             tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
         }
-        
+
         // 2. Keep the frame alive until the device is likely done.
         // For now, we just assume it's sent immediately or stashed.
         // In a real driver we'd wait for the TX completion interrupt.
         let _ = frame;
-        
+
         self.link_up.store(true, Ordering::Release);
         Ok(())
     }
@@ -361,7 +382,10 @@ impl rx::RxHandler for IwlRxHandler {
     fn handle(&mut self, kind: rx::RxKind, _hdr: rx::RxPacketHeader, payload: &[u8]) {
         match kind {
             rx::RxKind::Alive => {
-                let _ = writeln!(narf_console::Writer, "  iwlwifi: firmware alive notification");
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  iwlwifi: firmware alive notification"
+                );
             }
             rx::RxKind::ScanComplete => {
                 self.device.scan_in_progress.store(false, Ordering::Release);
@@ -404,7 +428,7 @@ impl rx::RxHandler for IwlRxHandler {
 
 async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>) {
     let _ = writeln!(narf_console::Writer, "  iwlwifi: RX pump started");
-    
+
     let mut handler = IwlRxHandler {
         device: device.clone(),
         rx_prod,
@@ -421,7 +445,7 @@ async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>
             let mut rx_q = device.rx_q.lock();
             let mut mmio = IwlMmioImpl(device.mmio);
             let wptr = mmio.read(rx::CSR_FH_RSCSR_CHNL0_STTS_WPTR_REG);
-            
+
             rx::drain_rx_queue(
                 &mut rx_q,
                 wptr as usize,
@@ -434,29 +458,34 @@ async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>
 
             // Give the buffers back to the device by writing the current
             // read-pointer to the WPTR register.
-            mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx_q.read_ptr.wrapping_sub(1) & rx::RX_RING_MASK) as u32);
+            mmio.write(
+                rx::CSR_FH_RSCSR_CHNL0_WPTR,
+                (rx_q.read_ptr.wrapping_sub(1) & rx::RX_RING_MASK) as u32,
+            );
         }
     }
 }
 
 async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     let _ = writeln!(narf_console::Writer, "  iwlwifi: TX pump started");
-    
+
     while let Ok(frame) = tx_cons.recv().await {
         let mut tx_q = device.tx_q0.lock();
         let mut mmio = IwlMmioImpl(device.mmio);
-        
+
         let slot = tx_q.write_ptr;
-        
+
         // 1. Build IwlTxCmd.
         // Management frames use OFDM-6Mbps by default.
-        let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF); 
-        
+        let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF);
+
         // 2. Write IwlTxCmd to DMA-coherent buffer.
         let cmd_dma = &device.tx_cmd_bufs[0];
         let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
-        unsafe { core::ptr::write_volatile(cmd_ptr, cmd); }
-        
+        unsafe {
+            core::ptr::write_volatile(cmd_ptr, cmd);
+        }
+
         // 3. Build TFD with two segments.
         let mut tfd = tx::Tfd::default();
         // Segment 0: IwlTxCmd header.
@@ -464,8 +493,11 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
         let cmd_phys = cmd_dma.phys_addr().as_u64() + (slot * 32) as u64;
         tfd.push_seg(cmd_phys, cmd_size as u16);
         // Segment 1: Frame payload.
-        tfd.push_seg(frame.buf().phys_addr().as_u64() + frame.offset() as u64, frame.len() as u16);
-        
+        tfd.push_seg(
+            frame.buf().phys_addr().as_u64() + frame.offset() as u64,
+            frame.len() as u16,
+        );
+
         // 4. Enqueue and kick the doorbell.
         tx_q.enqueue(tfd);
         tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
@@ -1067,10 +1099,7 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 /// (BAR0 mapping, MMIO programming, ALIVE handshake) is deferred
 /// until the gen2/gen3 transport paths land — this commit only
 /// validates that we can match the device + find its firmware.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     let chip = match chip_config_for_pci_id(device.id.vendor, device.id.device) {
         Some(c) => c,
         None => return Err(narf_bus::ProbeError::NotForThisDriver),
@@ -1153,7 +1182,9 @@ pub fn probe(
             let _ = writeln!(
                 narf_console::Writer,
                 "  iwlwifi:   header.version={:#x} build={} hr={:?}",
-                parsed.header.version, parsed.header.build, parsed.header.human_readable,
+                parsed.header.version,
+                parsed.header.build,
+                parsed.header.human_readable,
             );
             let _ = writeln!(
                 narf_console::Writer,
@@ -1168,7 +1199,9 @@ pub fn probe(
                 let _ = writeln!(
                     narf_console::Writer,
                     "  iwlwifi:   fw_version={}.{} api={}",
-                    ma, mi, api,
+                    ma,
+                    mi,
+                    api,
                 );
             }
             if parsed.requires_pnvm() {
@@ -1200,7 +1233,10 @@ pub fn probe(
 
             match fw_loader::load_firmware(&mut mmio, &chip, &parsed, &mut allocator, &mut alive) {
                 Ok(()) => {
-                    let _ = writeln!(narf_console::Writer, "  iwlwifi: ALIVE handshake successful");
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  iwlwifi: ALIVE handshake successful"
+                    );
                 }
                 Err(e) => {
                     let _ = writeln!(
@@ -1213,7 +1249,7 @@ pub fn probe(
             }
 
             // 4. Hardware Initialization (RX/TX rings).
-            
+
             // Allocate RX ring memory.
             let rx_ring_mem = narf_io::alloc_coherent(
                 rx::RX_RING_SIZE * core::mem::size_of::<rx::RxDescriptor>(),
@@ -1245,11 +1281,9 @@ pub fn probe(
             .map_err(|_| narf_bus::ProbeError::Other("TX ring alloc failed"))?;
 
             // Allocate TX command buffers (queue 0).
-            let tx_cmd0_mem = narf_io::alloc_coherent(
-                tx::TX_RING_SIZE * 32,
-                narf_lib::id::DomainId::DRIVER_0,
-            )
-            .map_err(|_| narf_bus::ProbeError::Other("TX cmd buffer alloc failed"))?;
+            let tx_cmd0_mem =
+                narf_io::alloc_coherent(tx::TX_RING_SIZE * 32, narf_lib::id::DomainId::DRIVER_0)
+                    .map_err(|_| narf_bus::ProbeError::Other("TX cmd buffer alloc failed"))?;
 
             // ── 4a. Interrupt setup ──
             let mut irq_vector = None;
@@ -1268,20 +1302,23 @@ pub fn probe(
                     }
                     irq_vector = Some(v);
                 }
-                
+
                 if let Some(v) = irq_vector {
                     narf_interrupts::install_handler(v, || {});
                 }
             }
 
             // Program hardware RX registers.
-            mmio.write(rx::CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG, rx_ring_mem.phys_addr().as_u64() as u32);
+            mmio.write(
+                rx::CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG,
+                rx_ring_mem.phys_addr().as_u64() as u32,
+            );
             mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx::RX_RING_SIZE - 1) as u32);
 
             // 5. Instantiate and register the device.
             // TODO: Read real MAC from hardware/firmware.
             let mac_addr = [0x00, 0x16, 0xEA, 0x12, 0x34, 0x56];
-            
+
             let rx_q = rx::RxQueue::new(rx_descs, rx_ring_mem.phys_addr().as_u64());
             let tx_q0 = tx::TxQueue::new(0, tx_ring0_mem.as_mut_ptr() as *mut tx::Tfd);
 
@@ -1312,11 +1349,7 @@ pub fn probe(
             spawn_pumps(device, rx_prod, tx_cons);
         }
         Err(e) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  iwlwifi:   parse failed: {}",
-                e
-            );
+            let _ = writeln!(narf_console::Writer, "  iwlwifi:   parse failed: {}", e);
         }
     }
 
@@ -1423,14 +1456,14 @@ pub mod tests {
         blob.extend_from_slice(&0x0102_0304u32.to_le_bytes()); // ver
         blob.extend_from_slice(&42u32.to_le_bytes()); // build
         blob.extend_from_slice(&[0u8; 8]); // ignore
-        // TLV: SEC_RT (19), length = 4 (dest) + 3 (payload), so
-        // 7 bytes — needs 1 byte of padding to 8.
+                                           // TLV: SEC_RT (19), length = 4 (dest) + 3 (payload), so
+                                           // 7 bytes — needs 1 byte of padding to 8.
         blob.extend_from_slice(&19u32.to_le_bytes()); // type
         blob.extend_from_slice(&7u32.to_le_bytes()); // len
         blob.extend_from_slice(&0x0040_1000u32.to_le_bytes()); // dest
         blob.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // payload
         blob.push(0); // alignment pad
-        // TLV: NUM_OF_CPU = 2.
+                      // TLV: NUM_OF_CPU = 2.
         blob.extend_from_slice(&27u32.to_le_bytes());
         blob.extend_from_slice(&4u32.to_le_bytes());
         blob.extend_from_slice(&2u32.to_le_bytes());
@@ -1503,7 +1536,10 @@ pub mod tests {
         TestResult::Pass
     }
 
-    kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_chip_table_is_complete);
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_chip_table_is_complete
+    );
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_ax200_ladder_pinned_api_100
@@ -1512,7 +1548,10 @@ pub mod tests {
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_be200_ladder_spans_rfs_and_apis
     );
-    kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_tlv_parser_round_trip);
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_tlv_parser_round_trip
+    );
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_tlv_parser_rejects_bad_magic
@@ -1586,8 +1625,9 @@ pub mod tests {
     // ── Stage 3: MAC_CONTEXT_CMD + TIME_EVENT_CMD encode ──────────
 
     fn smoke_iwlwifi_mac_context_cmd_encode() -> TestResult {
-        use mac_ctx::{build_mac_context_cmd, ctxt_action, filter_flags, mac_type,
-                      MAC_CONTEXT_CMD};
+        use mac_ctx::{
+            build_mac_context_cmd, ctxt_action, filter_flags, mac_type, MAC_CONTEXT_CMD,
+        };
         let node_addr: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let bssid: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         let filter = filter_flags::IN_NON_MCAST | filter_flags::IN_MCAST;
@@ -1678,14 +1718,17 @@ pub mod tests {
         }
         // Manual decode to verify packing + LE.
         let bytes: [u8; 4] = unsafe { core::mem::transmute(hdr) };
-        if bytes[0] != 0x07 { return TestResult::Fail("cmd wrong"); }
-        if bytes[1] != 0x0C { return TestResult::Fail("group_id wrong"); }
+        if bytes[0] != 0x07 {
+            return TestResult::Fail("cmd wrong");
+        }
+        if bytes[1] != 0x0C {
+            return TestResult::Fail("group_id wrong");
+        }
         // sequence is u16 LE.
-        if bytes[2] != 0x34 || bytes[3] != 0x12 { return TestResult::Fail("sequence (LE) wrong"); }
+        if bytes[2] != 0x34 || bytes[3] != 0x12 {
+            return TestResult::Fail("sequence (LE) wrong");
+        }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/wireless/iwlwifi",
-        smoke_iwlwifi_cmd_header_layout
-    );
+    kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_cmd_header_layout);
 }

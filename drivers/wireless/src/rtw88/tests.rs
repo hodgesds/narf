@@ -126,7 +126,10 @@ fn smoke_rtw88_register_offsets_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw88", smoke_rtw88_register_offsets_distinct);
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_register_offsets_distinct
+);
 
 // ── MAC validity ───────────────────────────────────────────────────
 
@@ -142,7 +145,10 @@ fn smoke_rtw88_mac_is_valid_classifier() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtw88", smoke_rtw88_mac_is_valid_classifier);
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_mac_is_valid_classifier
+);
 
 // ── Error-type debug-presence sanity ───────────────────────────────
 //

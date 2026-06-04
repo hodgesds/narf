@@ -25,9 +25,7 @@ use alloc::vec::Vec;
 use super::backplane::{split as window_split, window_writes};
 use super::chipclk;
 use super::core::{bring_up_sequence, reset_sequence, wrapper, SOC_RAM_BASE};
-use super::sdio::{
-    BusWidth, CCCR_BUS_IFACE_CTRL, CCCR_IO_ENABLE, CCCR_IO_READY, F1_CHIPCLK_CTRL,
-};
+use super::sdio::{BusWidth, CCCR_BUS_IFACE_CTRL, CCCR_IO_ENABLE, CCCR_IO_READY, F1_CHIPCLK_CTRL};
 use super::transport::{Function, Transport, TransportError};
 
 /// Errors specific to firmware loading on top of the underlying
@@ -243,11 +241,7 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
 
     fn bus_init(&mut self) -> Result<(), LoadError> {
         // 4-bit bus + enable F1 are the SDIO-side sequence.
-        self.write_byte(
-            Function::Bus,
-            CCCR_BUS_IFACE_CTRL,
-            BusWidth::FourBit as u8,
-        )?;
+        self.write_byte(Function::Bus, CCCR_BUS_IFACE_CTRL, BusWidth::FourBit as u8)?;
         self.write_byte(Function::Bus, CCCR_IO_ENABLE, 1 << 1)?; // F1
         self.poll_byte(Function::Bus, CCCR_IO_READY, 1 << 1)?;
         Ok(())
@@ -508,8 +502,13 @@ ccode=US
             log: alloc::vec::Vec::new(),
             poll_call: 0,
         };
-        let mut loader =
-            FirmwareLoader::new(mock, &firmware, &nvram_blob, 256 * 1024, false /* SDIO */);
+        let mut loader = FirmwareLoader::new(
+            mock,
+            &firmware,
+            &nvram_blob,
+            256 * 1024,
+            false, /* SDIO */
+        );
         if loader.run().is_err() {
             return TestResult::Fail("loader returned an error");
         }

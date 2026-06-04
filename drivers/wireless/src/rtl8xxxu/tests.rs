@@ -56,7 +56,10 @@ fn smoke_rtl8xxxu_usb_id_table_coverage() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_usb_id_table_coverage);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_usb_id_table_coverage
+);
 
 // ── 2. EFUSE byte-decode round-trip ────────────────────────────────
 
@@ -72,10 +75,22 @@ fn smoke_rtl8xxxu_efuse_decode_round_trip() -> TestResult {
     let raw: &[u8] = &[
         // Record 1: section 0, all words.
         0x00,
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x01,
+        0x02,
+        0x03,
+        0x04,
+        0x05,
+        0x06,
+        0x07,
+        0x08,
         // Record 2: section 2 (header[7:4]=2), word_mask = 0x08 (skip word 3).
         (0x20u8 | 0x08), // header: (2 << 4) | 0x08
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x11,
+        0x12,
+        0x13,
+        0x14,
+        0x15,
+        0x16,
         // Terminator.
         0xFF,
     ];
@@ -107,7 +122,10 @@ fn smoke_rtl8xxxu_efuse_decode_round_trip() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_efuse_decode_round_trip);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_efuse_decode_round_trip
+);
 
 // ── 3. USB control-transfer encode for EFUSE read ──────────────────
 
@@ -166,7 +184,10 @@ fn smoke_rtl8xxxu_usb_ctrl_efuse_read_encode() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_usb_ctrl_efuse_read_encode);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_usb_ctrl_efuse_read_encode
+);
 
 // ── 4. Per-chip register-bank decode ───────────────────────────────
 
@@ -178,21 +199,31 @@ fn smoke_rtl8xxxu_per_chip_register_bank_decode() -> TestResult {
     if bank_8188.is_empty() {
         return TestResult::Fail("rtl8188e stage0 bank empty");
     }
-    let has_aps_8188 = bank_8188.iter().any(|&(r, _)| r == REG_APS_FSMCO as u16 + 1);
+    let has_aps_8188 = bank_8188
+        .iter()
+        .any(|&(r, _)| r == REG_APS_FSMCO as u16 + 1);
     let has_cr_8188 = bank_8188.iter().any(|&(r, _)| r == REG_CR);
-    if !has_aps_8188 { return TestResult::Fail("rtl8188e missing APS_FSMCO+1"); }
-    if !has_cr_8188  { return TestResult::Fail("rtl8188e missing REG_CR"); }
+    if !has_aps_8188 {
+        return TestResult::Fail("rtl8188e missing APS_FSMCO+1");
+    }
+    if !has_cr_8188 {
+        return TestResult::Fail("rtl8188e missing REG_CR");
+    }
 
     // 8192EU: must have LDO entry + APS_FSMCO.
     let bank_8192 = rtl8192e::stage0_register_bank();
-    let has_ldo = bank_8192.iter().any(|&(r, _)| r == rtl8192e::REG_8192E_LDOV12_CTRL);
-    if !has_ldo { return TestResult::Fail("rtl8192e missing LDO entry"); }
+    let has_ldo = bank_8192
+        .iter()
+        .any(|&(r, _)| r == rtl8192e::REG_8192E_LDOV12_CTRL);
+    if !has_ldo {
+        return TestResult::Fail("rtl8192e missing LDO entry");
+    }
 
     // 8723BU: must have EFUSE_ACCESS entry.
     let bank_8723 = rtl8723b::stage0_register_bank();
-    let has_efuse_access = bank_8723.iter().any(|&(r, v)| {
-        r == REG_EFUSE_ACCESS && v == EFUSE_ACCESS_ENABLE
-    });
+    let has_efuse_access = bank_8723
+        .iter()
+        .any(|&(r, v)| r == REG_EFUSE_ACCESS && v == EFUSE_ACCESS_ENABLE);
     if !has_efuse_access {
         return TestResult::Fail("rtl8723b missing EFUSE_ACCESS_ENABLE");
     }
@@ -211,7 +242,10 @@ fn smoke_rtl8xxxu_per_chip_register_bank_decode() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_per_chip_register_bank_decode);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_per_chip_register_bank_decode
+);
 
 // ── 5. Firmware blob name resolution ───────────────────────────────
 
@@ -222,7 +256,7 @@ fn smoke_rtl8xxxu_firmware_name_resolution() -> TestResult {
         (ChipFamily::Rtl8723bu, Some("rtlwifi/rtl8723bufw.bin")),
         (ChipFamily::Rtl8821cu, Some("rtlwifi/rtl8821cufw.bin")),
         (ChipFamily::Rtl8822bu, Some("rtlwifi/rtl8822bufw.bin")),
-        (ChipFamily::Unknown,   None),
+        (ChipFamily::Unknown, None),
     ];
 
     for &(chip, expected) in cases {
@@ -251,7 +285,10 @@ fn smoke_rtl8xxxu_firmware_name_resolution() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_firmware_name_resolution);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_firmware_name_resolution
+);
 
 // ── 6. USB bulk-OUT TX descriptor layout (32-byte) ─────────────────
 
@@ -331,7 +368,10 @@ fn smoke_rtl8xxxu_intr_in_status_word() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_intr_in_status_word);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_intr_in_status_word
+);
 
 // ── 8. ChipFamily::from_usb_id round-trip ──────────────────────────
 
@@ -373,15 +413,17 @@ fn smoke_rtl8xxxu_chip_family_from_usb_id() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_chip_family_from_usb_id);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_chip_family_from_usb_id
+);
 
 // ── 9. phy_tables sentinel + apply-loop semantics ──────────────────
 
 fn smoke_rtl8xxxu_phy_tables_apply_loops() -> TestResult {
     use super::phy_tables::{
-        MacRow, PhyRow, RfRow,
-        apply_mac_table, apply_phy_table, apply_rf_table,
-        live_rows_mac, live_rows_phy, live_rows_rf,
+        apply_mac_table, apply_phy_table, apply_rf_table, live_rows_mac, live_rows_phy,
+        live_rows_rf, MacRow, PhyRow, RfRow,
     };
 
     // Sentinel detection.
@@ -394,12 +436,24 @@ fn smoke_rtl8xxxu_phy_tables_apply_loops() -> TestResult {
 
     // MAC apply-loop: 3 rows + sentinel.
     let mac_table: &[MacRow] = &[
-        MacRow { reg: 0x100, val: 0x11 },
-        MacRow { reg: 0x101, val: 0x22 },
-        MacRow { reg: 0x102, val: 0x33 },
+        MacRow {
+            reg: 0x100,
+            val: 0x11,
+        },
+        MacRow {
+            reg: 0x101,
+            val: 0x22,
+        },
+        MacRow {
+            reg: 0x102,
+            val: 0x33,
+        },
         MacRow::SENTINEL,
         // Sentinel should stop the loop — these rows must not be applied.
-        MacRow { reg: 0x900, val: 0xFF },
+        MacRow {
+            reg: 0x900,
+            val: 0xFF,
+        },
     ];
     if live_rows_mac(mac_table) != 3 {
         return TestResult::Fail("MAC live_rows != 3");
@@ -412,8 +466,14 @@ fn smoke_rtl8xxxu_phy_tables_apply_loops() -> TestResult {
 
     // PHY apply-loop: 2 rows + sentinel.
     let phy_table: &[PhyRow] = &[
-        PhyRow { reg: 0x800, val: 0xDEADBEEF },
-        PhyRow { reg: 0x804, val: 0xCAFEBABE },
+        PhyRow {
+            reg: 0x800,
+            val: 0xDEADBEEF,
+        },
+        PhyRow {
+            reg: 0x804,
+            val: 0xCAFEBABE,
+        },
         PhyRow::SENTINEL,
     ];
     if live_rows_phy(phy_table) != 2 {
@@ -431,10 +491,22 @@ fn smoke_rtl8xxxu_phy_tables_apply_loops() -> TestResult {
 
     // RF apply-loop: 4 rows + sentinel.
     let rf_table: &[RfRow] = &[
-        RfRow { reg: 0x00, val: 0x00030000 },
-        RfRow { reg: 0x18, val: 0x00000407 },
-        RfRow { reg: 0x1E, val: 0x00080009 },
-        RfRow { reg: 0x1F, val: 0x00000880 },
+        RfRow {
+            reg: 0x00,
+            val: 0x00030000,
+        },
+        RfRow {
+            reg: 0x18,
+            val: 0x00000407,
+        },
+        RfRow {
+            reg: 0x1E,
+            val: 0x00080009,
+        },
+        RfRow {
+            reg: 0x1F,
+            val: 0x00000880,
+        },
         RfRow::SENTINEL,
     ];
     if live_rows_rf(rf_table) != 4 {
@@ -448,7 +520,10 @@ fn smoke_rtl8xxxu_phy_tables_apply_loops() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_phy_tables_apply_loops);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_phy_tables_apply_loops
+);
 
 // ── 10. 8188EU per-chip integration ────────────────────────────────
 
@@ -473,8 +548,7 @@ fn smoke_rtl8xxxu_8188eu_per_chip() -> TestResult {
     }
 
     // IQK shape.
-    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
-                   rtl8188e::IQK_PATH_A_STEP_COUNT];
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8188e::IQK_PATH_A_STEP_COUNT];
     let n = rtl8188e::build_iqk_path_a_sequence(&mut iqk);
     if n != 7 {
         return TestResult::Fail("8188e IQK step count != 7");
@@ -545,8 +619,7 @@ fn smoke_rtl8xxxu_8188eu_per_chip() -> TestResult {
         return TestResult::Fail("8188e RF-A first row != (0x00, 0x00030000)");
     }
     // IQK values populated — step 0 = REG_TX_IQK_TONE_A val 0x10008c1f.
-    let mut iqk2 = [super::phy::IqkStep { reg: 0, val: 0 };
-                    rtl8188e::IQK_PATH_A_STEP_COUNT];
+    let mut iqk2 = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8188e::IQK_PATH_A_STEP_COUNT];
     rtl8188e::build_iqk_path_a_sequence(&mut iqk2);
     if iqk2[0].val != 0x10008c1f {
         return TestResult::Fail("8188e IQK step 0 val != 0x10008c1f");
@@ -590,10 +663,8 @@ fn smoke_rtl8xxxu_8192eu_per_chip() -> TestResult {
     }
 
     // IQK both paths.
-    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 };
-                     rtl8192e::IQK_PATH_A_STEP_COUNT];
-    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 };
-                     rtl8192e::IQK_PATH_B_STEP_COUNT];
+    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8192e::IQK_PATH_A_STEP_COUNT];
+    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8192e::IQK_PATH_B_STEP_COUNT];
     if rtl8192e::build_iqk_path_a_sequence(&mut iqk_a) != 8 {
         return TestResult::Fail("8192e IQK_A step count != 8");
     }
@@ -637,8 +708,7 @@ fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
     }
 
     // IQK shape — gen2 has 10 steps.
-    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
-                   rtl8723b::IQK_PATH_A_STEP_COUNT];
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8723b::IQK_PATH_A_STEP_COUNT];
     if rtl8723b::build_iqk_path_a_sequence(&mut iqk) != 10 {
         return TestResult::Fail("8723b IQK step count != 10");
     }
@@ -677,15 +747,23 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8723bu_per_chip);
 
 fn smoke_rtl8xxxu_8723bu_bt_coex() -> TestResult {
     use super::btcoex::{
-        Bt8723b1AntStatus, BtLinkProfile, coex_table_write_for_type, coex_type_for_state,
+        coex_table_write_for_type, coex_type_for_state, Bt8723b1AntStatus, BtLinkProfile,
         REG_BT_COEX_TABLE1, REG_BT_COEX_TABLE2, REG_BT_COEX_TABLE3, REG_BT_COEX_TABLE4,
     };
 
     // Coex register addresses.
-    if REG_BT_COEX_TABLE1 != 0x06C0 { return TestResult::Fail("table1 addr"); }
-    if REG_BT_COEX_TABLE2 != 0x06C4 { return TestResult::Fail("table2 addr"); }
-    if REG_BT_COEX_TABLE3 != 0x06C8 { return TestResult::Fail("table3 addr"); }
-    if REG_BT_COEX_TABLE4 != 0x06CC { return TestResult::Fail("table4 addr"); }
+    if REG_BT_COEX_TABLE1 != 0x06C0 {
+        return TestResult::Fail("table1 addr");
+    }
+    if REG_BT_COEX_TABLE2 != 0x06C4 {
+        return TestResult::Fail("table2 addr");
+    }
+    if REG_BT_COEX_TABLE3 != 0x06C8 {
+        return TestResult::Fail("table3 addr");
+    }
+    if REG_BT_COEX_TABLE4 != 0x06CC {
+        return TestResult::Fail("table4 addr");
+    }
 
     // Decision matrix: idle -> type 0, inq -> type 2, sco -> type 7.
     let p = BtLinkProfile::default();
@@ -706,18 +784,28 @@ fn smoke_rtl8xxxu_8723bu_bt_coex() -> TestResult {
     }
 
     // ACL busy + a2dp-only -> type 5.
-    let p_a2dp = BtLinkProfile { has_a2dp: true, a2dp_only: true, ..Default::default() };
+    let p_a2dp = BtLinkProfile {
+        has_a2dp: true,
+        a2dp_only: true,
+        ..Default::default()
+    };
     if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_a2dp) != 5 {
         return TestResult::Fail("AclBusy + a2dp_only should be type 5");
     }
     // ACL busy + hid-only -> type 4.
-    let p_hid = BtLinkProfile { has_hid: true, hid_only: true, ..Default::default() };
+    let p_hid = BtLinkProfile {
+        has_hid: true,
+        hid_only: true,
+        ..Default::default()
+    };
     if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_hid) != 4 {
         return TestResult::Fail("AclBusy + hid_only should be type 4");
     }
     // ACL busy + hid + a2dp -> type 6.
     let p_hid_a2dp = BtLinkProfile {
-        has_hid: true, has_a2dp: true, ..Default::default()
+        has_hid: true,
+        has_a2dp: true,
+        ..Default::default()
     };
     if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_hid_a2dp) != 6 {
         return TestResult::Fail("AclBusy + hid+a2dp should be type 6");
@@ -788,8 +876,7 @@ fn smoke_rtl8xxxu_8821cu_per_chip() -> TestResult {
     }
 
     // IQK shape.
-    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
-                   rtl8821c::IQK_PATH_A_STEP_COUNT];
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8821c::IQK_PATH_A_STEP_COUNT];
     if rtl8821c::build_iqk_path_a_sequence(&mut iqk) != 12 {
         return TestResult::Fail("8821c IQK step count != 12");
     }
@@ -839,10 +926,8 @@ fn smoke_rtl8xxxu_8822bu_per_chip() -> TestResult {
     }
 
     // IQK both paths — 14 steps each.
-    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 };
-                     rtl8822b::IQK_PATH_A_STEP_COUNT];
-    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 };
-                     rtl8822b::IQK_PATH_B_STEP_COUNT];
+    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8822b::IQK_PATH_A_STEP_COUNT];
+    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8822b::IQK_PATH_B_STEP_COUNT];
     if rtl8822b::build_iqk_path_a_sequence(&mut iqk_a) != 14 {
         return TestResult::Fail("8822b IQK_A != 14");
     }
@@ -886,8 +971,7 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_channel_5180_mhz);
 
 fn smoke_rtl8xxxu_iqk_lc_shapes() -> TestResult {
     use super::phy::{
-        IQK_PREAMBLE_GEN1, IQK_POLL_MAX, IQK_RESTORE_GEN1,
-        lc_calibrate_rf_writes, lssi_encode,
+        lc_calibrate_rf_writes, lssi_encode, IQK_POLL_MAX, IQK_PREAMBLE_GEN1, IQK_RESTORE_GEN1,
     };
 
     // Gen1 IQK preamble should be non-empty.
@@ -954,13 +1038,16 @@ fn smoke_rtl8xxxu_class_registry_no_match() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_class_registry_no_match);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_class_registry_no_match
+);
 
 // ── 19. class_registry: RTL8188EU VID/PID claimed after registration ─
 
 fn smoke_rtl8xxxu_class_registry_rtl8188eu_match() -> TestResult {
-    use narf_drivers_usb::class_registry;
     use super::RTL8XXXU_USB_IDS;
+    use narf_drivers_usb::class_registry;
 
     class_registry::reset_for_test();
 
@@ -998,13 +1085,16 @@ fn smoke_rtl8xxxu_class_registry_rtl8188eu_match() -> TestResult {
     class_registry::reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_class_registry_rtl8188eu_match);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_class_registry_rtl8188eu_match
+);
 
 // ── 20. class_registry: non-matching VID/PID not claimed ────────────
 
 fn smoke_rtl8xxxu_class_registry_non_matching() -> TestResult {
-    use narf_drivers_usb::class_registry;
     use super::RTL8XXXU_USB_IDS;
+    use narf_drivers_usb::class_registry;
 
     class_registry::reset_for_test();
 
@@ -1030,7 +1120,10 @@ fn smoke_rtl8xxxu_class_registry_non_matching() -> TestResult {
     class_registry::reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_class_registry_non_matching);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_class_registry_non_matching
+);
 
 // ── 21. rtl8xxxu_probe stores the device handle ─────────────────────
 //
@@ -1067,14 +1160,16 @@ fn smoke_rtl8xxxu_probe_stores_device_handle() -> TestResult {
     }
 
     // DEVICES should now contain one entry for slot 0xFF.
-    let count = super::DEVICES.lock()
+    let count = super::DEVICES
+        .lock()
         .iter()
         .filter(|d| d.device.slot_id() == 0xFF)
         .count();
     if count != 1 {
         return TestResult::Fail("DEVICES registry missing probe entry");
     }
-    if super::DEVICES.lock()
+    if super::DEVICES
+        .lock()
         .iter()
         .find(|d| d.device.slot_id() == 0xFF)
         .map(|d| d.family)
@@ -1087,7 +1182,10 @@ fn smoke_rtl8xxxu_probe_stores_device_handle() -> TestResult {
     super::DEVICES.lock().retain(|d| d.device.slot_id() != 0xFF);
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_probe_stores_device_handle);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_probe_stores_device_handle
+);
 
 // ── 22. EFUSE byte read: transport-abstracted round-trip ────────────
 //
@@ -1098,7 +1196,7 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_probe_stores_device_
 // Linux ref: rtl8xxxu_read_efuse8 (~L1746) in rtl8xxxu_core.c.
 
 fn smoke_rtl8xxxu_efuse_byte_read_transport() -> TestResult {
-    use super::efuse::{EfuseAddr, EfuseReadError, read_efuse_byte_with_transport};
+    use super::efuse::{read_efuse_byte_with_transport, EfuseAddr, EfuseReadError};
     use core::cell::Cell;
 
     // Simulated register bank. We prime REG_EFUSE_CTRL with:
@@ -1118,26 +1216,40 @@ fn smoke_rtl8xxxu_efuse_byte_read_transport() -> TestResult {
                 buf.copy_from_slice(&efuse_ctrl_word.to_le_bytes());
                 Ok(())
             }
-            (a, 1) if a == REG_EFUSE_CTRL + 1 => { buf[0] = reg_ctrl1.get(); Ok(()) }
-            (a, 1) if a == REG_EFUSE_CTRL + 2 => { buf[0] = reg_ctrl2.get(); Ok(()) }
-            (a, 1) if a == REG_EFUSE_CTRL + 3 => { buf[0] = reg_ctrl3.get(); Ok(()) }
+            (a, 1) if a == REG_EFUSE_CTRL + 1 => {
+                buf[0] = reg_ctrl1.get();
+                Ok(())
+            }
+            (a, 1) if a == REG_EFUSE_CTRL + 2 => {
+                buf[0] = reg_ctrl2.get();
+                Ok(())
+            }
+            (a, 1) if a == REG_EFUSE_CTRL + 3 => {
+                buf[0] = reg_ctrl3.get();
+                Ok(())
+            }
             _ => Err(()),
         }
     };
     let mut reg_write = |addr: u16, data: &[u8]| -> Result<(), ()> {
         match (addr, data.len()) {
-            (a, 1) if a == REG_EFUSE_CTRL + 1 => { reg_ctrl1.set(data[0]); Ok(()) }
-            (a, 1) if a == REG_EFUSE_CTRL + 2 => { reg_ctrl2.set(data[0]); Ok(()) }
-            (a, 1) if a == REG_EFUSE_CTRL + 3 => { reg_ctrl3.set(data[0]); Ok(()) }
+            (a, 1) if a == REG_EFUSE_CTRL + 1 => {
+                reg_ctrl1.set(data[0]);
+                Ok(())
+            }
+            (a, 1) if a == REG_EFUSE_CTRL + 2 => {
+                reg_ctrl2.set(data[0]);
+                Ok(())
+            }
+            (a, 1) if a == REG_EFUSE_CTRL + 3 => {
+                reg_ctrl3.set(data[0]);
+                Ok(())
+            }
             _ => Err(()),
         }
     };
 
-    let byte = read_efuse_byte_with_transport(
-        EfuseAddr::new(0),
-        &mut reg_read,
-        &mut reg_write,
-    );
+    let byte = read_efuse_byte_with_transport(EfuseAddr::new(0), &mut reg_read, &mut reg_write);
     match byte {
         Ok(0xAB) => {}
         Ok(v) => {
@@ -1154,7 +1266,10 @@ fn smoke_rtl8xxxu_efuse_byte_read_transport() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_efuse_byte_read_transport);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_efuse_byte_read_transport
+);
 
 // ── 23. EFUSE MAC read: extract MAC from 6-byte EFUSE map block ──────
 //
@@ -1195,7 +1310,10 @@ fn smoke_rtl8xxxu_efuse_mac_extract() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_efuse_mac_extract);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_efuse_mac_extract
+);
 
 // ── 24. Chip family detection: RTL8723BU → ChipFamily::Rtl8723b ──────
 //
@@ -1240,7 +1358,10 @@ fn smoke_rtl8xxxu_chip_family_detection_8723bu() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_chip_family_detection_8723bu);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_chip_family_detection_8723bu
+);
 
 // ── 25. Disconnect path: re-register after DEVICES cleared ──────────
 //
@@ -1272,7 +1393,8 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     if super::rtl8xxxu_probe(dev1).is_err() {
         return TestResult::Fail("first probe failed");
     }
-    let count_after_first = super::DEVICES.lock()
+    let count_after_first = super::DEVICES
+        .lock()
         .iter()
         .filter(|d| d.device.slot_id() == 0xFE)
         .count();
@@ -1282,7 +1404,8 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
 
     // Simulate disconnect by removing the entry.
     super::DEVICES.lock().retain(|d| d.device.slot_id() != 0xFE);
-    let count_after_disconnect = super::DEVICES.lock()
+    let count_after_disconnect = super::DEVICES
+        .lock()
         .iter()
         .filter(|d| d.device.slot_id() == 0xFE)
         .count();
@@ -1303,7 +1426,8 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     if super::rtl8xxxu_probe(dev2).is_err() {
         return TestResult::Fail("second probe after disconnect failed");
     }
-    let count_after_second = super::DEVICES.lock()
+    let count_after_second = super::DEVICES
+        .lock()
         .iter()
         .filter(|d| d.device.slot_id() == 0xFE)
         .count();
@@ -1315,7 +1439,10 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     super::DEVICES.lock().retain(|d| d.device.slot_id() != 0xFE);
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_disconnect_re_register);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_disconnect_re_register
+);
 
 // ── 26. RTL8188EU register tables populated — count + first row ─────
 //
@@ -1357,12 +1484,15 @@ fn smoke_rtl8xxxu_wave36_8188eu_tables_populated() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_8188eu_tables_populated);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_8188eu_tables_populated
+);
 
 // ── 27. MAC init drives N_MAC_ROWS writes on FakeUsbTransport ───────
 
 fn smoke_rtl8xxxu_wave36_init_mac_via_fake() -> TestResult {
-    use super::usb::{FakeUsbTransport, FakeOp, Rtl8xxxuTransport};
+    use super::usb::{FakeOp, FakeUsbTransport, Rtl8xxxuTransport};
     let t = FakeUsbTransport::new();
     let mut n = 0usize;
     let _ = super::rtl8188e::init_mac(|r, v| {
@@ -1383,12 +1513,15 @@ fn smoke_rtl8xxxu_wave36_init_mac_via_fake() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_init_mac_via_fake);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_init_mac_via_fake
+);
 
 // ── 28. PHY+AGC init drives 322 write32 calls in order ─────────────
 
 fn smoke_rtl8xxxu_wave36_init_phy_via_fake() -> TestResult {
-    use super::usb::{FakeUsbTransport, FakeOp, Rtl8xxxuTransport};
+    use super::usb::{FakeOp, FakeUsbTransport, Rtl8xxxuTransport};
     let t = FakeUsbTransport::new();
     let mut n = 0usize;
     let _ = super::rtl8188e::init_phy(|r, v| {
@@ -1411,7 +1544,10 @@ fn smoke_rtl8xxxu_wave36_init_phy_via_fake() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_init_phy_via_fake);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_init_phy_via_fake
+);
 
 // ── 29. RF init drives 95 RF-A writes ───────────────────────────────
 
@@ -1429,7 +1565,10 @@ fn smoke_rtl8xxxu_wave36_init_rf_via_fake() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_init_rf_via_fake);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_init_rf_via_fake
+);
 
 // ── 30. FW upload via bulk-OUT: 2-page synthetic blob ───────────────
 
@@ -1470,7 +1609,10 @@ fn smoke_rtl8xxxu_wave36_fw_upload_bulk_out() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_fw_upload_bulk_out);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_fw_upload_bulk_out
+);
 
 // ── 31. RX ring: single MPDU per URB ───────────────────────────────
 
@@ -1495,7 +1637,10 @@ fn smoke_rtl8xxxu_wave36_rx_single_mpdu() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_rx_single_mpdu);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_rx_single_mpdu
+);
 
 // ── 32. RX ring: 3 MPDUs in one URB ─────────────────────────────────
 
@@ -1517,15 +1662,19 @@ fn smoke_rtl8xxxu_wave36_rx_multi_mpdu() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_rx_multi_mpdu);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_rx_multi_mpdu
+);
 
 // ── 33. IQK calibration: 7 steps in expected order ──────────────────
 
 fn smoke_rtl8xxxu_wave36_iqk_step_order() -> TestResult {
-    use super::regs::{REG_TX_IQK_TONE_A, REG_RX_IQK_TONE_A, REG_TX_IQK_PI_A,
-                      REG_RX_IQK_PI_A, REG_IQK_AGC_RSP, REG_IQK_AGC_PTS};
-    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 };
-                   super::rtl8188e::IQK_PATH_A_STEP_COUNT];
+    use super::regs::{
+        REG_IQK_AGC_PTS, REG_IQK_AGC_RSP, REG_RX_IQK_PI_A, REG_RX_IQK_TONE_A, REG_TX_IQK_PI_A,
+        REG_TX_IQK_TONE_A,
+    };
+    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 }; super::rtl8188e::IQK_PATH_A_STEP_COUNT];
     let n = super::rtl8188e::build_iqk_path_a_sequence(&mut iqk);
     if n != 7 {
         return TestResult::Fail("IQK step count != 7");
@@ -1533,11 +1682,11 @@ fn smoke_rtl8xxxu_wave36_iqk_step_order() -> TestResult {
     let expected = [
         (REG_TX_IQK_TONE_A, 0x10008c1fu32),
         (REG_RX_IQK_TONE_A, 0x10008c1f),
-        (REG_TX_IQK_PI_A,   0x82140102),
-        (REG_RX_IQK_PI_A,   0x28160502),
-        (REG_IQK_AGC_RSP,   0x001028d1),
-        (REG_IQK_AGC_PTS,   0xf9000000),
-        (REG_IQK_AGC_PTS,   0xf8000000),
+        (REG_TX_IQK_PI_A, 0x82140102),
+        (REG_RX_IQK_PI_A, 0x28160502),
+        (REG_IQK_AGC_RSP, 0x001028d1),
+        (REG_IQK_AGC_PTS, 0xf9000000),
+        (REG_IQK_AGC_PTS, 0xf8000000),
     ];
     for (i, &(r, v)) in expected.iter().enumerate() {
         if iqk[i].reg != r || iqk[i].val != v {
@@ -1546,12 +1695,15 @@ fn smoke_rtl8xxxu_wave36_iqk_step_order() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_iqk_step_order);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_iqk_step_order
+);
 
 // ── 34. Channel set: ch 6 tune yields 1 LSSI write ───────────────────
 
 fn smoke_rtl8xxxu_wave36_channel_set_ch6() -> TestResult {
-    use super::usb::{FakeUsbTransport, FakeOp, Rtl8xxxuTransport};
+    use super::usb::{FakeOp, FakeUsbTransport, Rtl8xxxuTransport};
     let t = FakeUsbTransport::new();
     let writes = super::rtl8188e::channel_set_writes_8188e(6);
     for &(reg, val) in writes.iter() {
@@ -1568,7 +1720,10 @@ fn smoke_rtl8xxxu_wave36_channel_set_ch6() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_channel_set_ch6);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_channel_set_ch6
+);
 
 // ── 35. Full bring_up_8188eu against FakeUsbTransport ────────────────
 
@@ -1600,7 +1755,10 @@ fn smoke_rtl8xxxu_wave36_full_bring_up() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_full_bring_up);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_full_bring_up
+);
 
 // ── 36. bring_up rejects out-of-range channel ───────────────────────
 
@@ -1615,7 +1773,10 @@ fn smoke_rtl8xxxu_wave36_bring_up_bad_channel() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_bring_up_bad_channel);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_bring_up_bad_channel
+);
 
 // ── 37. FW upload: poll timeout when CSUM never asserts ─────────────
 
@@ -1632,4 +1793,7 @@ fn smoke_rtl8xxxu_wave36_fw_upload_poll_timeout() -> TestResult {
         Err(_) => TestResult::Fail("upload wrong error for CSUM timeout"),
     }
 }
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_wave36_fw_upload_poll_timeout);
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8xxxu_wave36_fw_upload_poll_timeout
+);

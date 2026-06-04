@@ -47,9 +47,9 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use super::sta::AddStaKeyParams;
 use super::wpa::hmac_sha1;
+use alloc::vec::Vec;
 
 // ── AES-128 block cipher (pure Rust) ─────────────────────────────
 //
@@ -101,19 +101,29 @@ const INV_SBOX: [u8; 256] = [
 ];
 
 /// AES-128 round constants (Rcon).
-const RCON: [u8; 11] = [0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36];
+const RCON: [u8; 11] = [
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36,
+];
 
 fn xtime(x: u8) -> u8 {
-    if x & 0x80 != 0 { (x << 1) ^ 0x1b } else { x << 1 }
+    if x & 0x80 != 0 {
+        (x << 1) ^ 0x1b
+    } else {
+        x << 1
+    }
 }
 
 fn gmul(mut a: u8, mut b: u8) -> u8 {
     let mut p = 0u8;
     for _ in 0..8 {
-        if b & 1 != 0 { p ^= a; }
+        if b & 1 != 0 {
+            p ^= a;
+        }
         let hi = a & 0x80;
         a <<= 1;
-        if hi != 0 { a ^= 0x1b; }
+        if hi != 0 {
+            a ^= 0x1b;
+        }
         b >>= 1;
     }
     p
@@ -150,26 +160,41 @@ fn aes128_decrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
     let mut state = *block;
 
     // Initial round key addition.
-    for i in 0..16 { state[i] ^= rk[10][i]; }
+    for i in 0..16 {
+        state[i] ^= rk[10][i];
+    }
 
     // 9 main rounds (inverse).
     for round in (1..=9).rev() {
         // InvShiftRows.
         let tmp = state;
-        state[1] = tmp[13]; state[5] = tmp[1]; state[9] = tmp[5]; state[13] = tmp[9];
-        state[2] = tmp[10]; state[6] = tmp[14]; state[10] = tmp[2]; state[14] = tmp[6];
-        state[3] = tmp[7];  state[7] = tmp[11]; state[11] = tmp[15]; state[15] = tmp[3];
+        state[1] = tmp[13];
+        state[5] = tmp[1];
+        state[9] = tmp[5];
+        state[13] = tmp[9];
+        state[2] = tmp[10];
+        state[6] = tmp[14];
+        state[10] = tmp[2];
+        state[14] = tmp[6];
+        state[3] = tmp[7];
+        state[7] = tmp[11];
+        state[11] = tmp[15];
+        state[15] = tmp[3];
         // InvSubBytes.
-        for b in state.iter_mut() { *b = INV_SBOX[*b as usize]; }
+        for b in state.iter_mut() {
+            *b = INV_SBOX[*b as usize];
+        }
         // AddRoundKey.
-        for i in 0..16 { state[i] ^= rk[round][i]; }
+        for i in 0..16 {
+            state[i] ^= rk[round][i];
+        }
         // InvMixColumns.
         for col in 0..4 {
             let s0 = state[col * 4];
             let s1 = state[col * 4 + 1];
             let s2 = state[col * 4 + 2];
             let s3 = state[col * 4 + 3];
-            state[col * 4]     = gmul(s0, 0x0e) ^ gmul(s1, 0x0b) ^ gmul(s2, 0x0d) ^ gmul(s3, 0x09);
+            state[col * 4] = gmul(s0, 0x0e) ^ gmul(s1, 0x0b) ^ gmul(s2, 0x0d) ^ gmul(s3, 0x09);
             state[col * 4 + 1] = gmul(s0, 0x09) ^ gmul(s1, 0x0e) ^ gmul(s2, 0x0b) ^ gmul(s3, 0x0d);
             state[col * 4 + 2] = gmul(s0, 0x0d) ^ gmul(s1, 0x09) ^ gmul(s2, 0x0e) ^ gmul(s3, 0x0b);
             state[col * 4 + 3] = gmul(s0, 0x0b) ^ gmul(s1, 0x0d) ^ gmul(s2, 0x09) ^ gmul(s3, 0x0e);
@@ -178,11 +203,24 @@ fn aes128_decrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
 
     // Final round (no InvMixColumns).
     let tmp = state;
-    state[1] = tmp[13]; state[5] = tmp[1]; state[9] = tmp[5]; state[13] = tmp[9];
-    state[2] = tmp[10]; state[6] = tmp[14]; state[10] = tmp[2]; state[14] = tmp[6];
-    state[3] = tmp[7];  state[7] = tmp[11]; state[11] = tmp[15]; state[15] = tmp[3];
-    for b in state.iter_mut() { *b = INV_SBOX[*b as usize]; }
-    for i in 0..16 { state[i] ^= rk[0][i]; }
+    state[1] = tmp[13];
+    state[5] = tmp[1];
+    state[9] = tmp[5];
+    state[13] = tmp[9];
+    state[2] = tmp[10];
+    state[6] = tmp[14];
+    state[10] = tmp[2];
+    state[14] = tmp[6];
+    state[3] = tmp[7];
+    state[7] = tmp[11];
+    state[11] = tmp[15];
+    state[15] = tmp[3];
+    for b in state.iter_mut() {
+        *b = INV_SBOX[*b as usize];
+    }
+    for i in 0..16 {
+        state[i] ^= rk[0][i];
+    }
 
     state
 }
@@ -205,7 +243,11 @@ pub fn aes_key_unwrap(kek: &[u8; 16], wrapped: &[u8]) -> Option<Vec<u8>> {
     let n = (wrapped.len() / 8) - 1; // number of 64-bit blocks
     let mut r: Vec<[u8; 8]> = wrapped
         .chunks_exact(8)
-        .map(|c| { let mut b = [0u8; 8]; b.copy_from_slice(c); b })
+        .map(|c| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(c);
+            b
+        })
         .collect();
 
     let mut a = r[0]; // integrity value (A)
@@ -349,15 +391,17 @@ pub fn group_rekey_handle_m1(
     let mic = hmac_sha1(&ptk.kck, &frame_copy);
     let expected_mic = &raw_frame[mic_offset..mic_offset + 16];
     // Constant-time comparison.
-    let mic_ok = mic[..16].iter().zip(expected_mic.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    let mic_ok = mic[..16]
+        .iter()
+        .zip(expected_mic.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
     if mic_ok != 0 {
         return Err(RekeyError::BadMic);
     }
 
     // 2. AES-Wrap unwrap the key data.
     let kek_arr: [u8; 16] = ptk.kek;
-    let plain = aes_key_unwrap(&kek_arr, key_data)
-        .ok_or(RekeyError::AesUnwrapFailed)?;
+    let plain = aes_key_unwrap(&kek_arr, key_data).ok_or(RekeyError::AesUnwrapFailed)?;
 
     // 3. Parse GTK KDE.
     let kde = parse_gtk_kde(&plain).ok_or(RekeyError::NoGtkKde)?;
@@ -381,17 +425,17 @@ pub mod tests {
     /// AES-128-ECB known-answer from FIPS-197 Appendix B.
     fn smoke_iwlwifi_rekey_aes128_fips197_known_answer() -> TestResult {
         let key: [u8; 16] = [
-            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
-            0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
         ];
         // FIPS-197 Appendix B: plaintext → ciphertext.
         let ct: [u8; 16] = [
-            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb,
-            0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a, 0x0b, 0x32,
+            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
+            0x0b, 0x32,
         ];
         let expected_pt: [u8; 16] = [
-            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d,
-            0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37, 0x07, 0x34,
+            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
+            0x07, 0x34,
         ];
         let pt = aes128_decrypt_block(&key, &ct);
         if pt != expected_pt {
@@ -409,17 +453,16 @@ pub mod tests {
 
     fn smoke_iwlwifi_rekey_aes_key_unwrap_rfc3394() -> TestResult {
         let kek: [u8; 16] = [
-            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
-            0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         let wrapped: [u8; 24] = [
-            0x1f,0xa6,0x8b,0x0a,0x81,0x12,0xb4,0x47,
-            0xae,0xf3,0x4b,0xd8,0xfb,0x5a,0x7b,0x82,
-            0x9d,0x3e,0x86,0x23,0x71,0xd2,0xcf,0xe5,
+            0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+            0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
         ];
         let expected: [u8; 16] = [
-            0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
-            0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
         ];
         match aes_key_unwrap(&kek, &wrapped) {
             Some(plain) if plain.as_slice() == expected => TestResult::Pass,
@@ -505,20 +548,19 @@ pub mod tests {
         // Known PTK subkeys.
         let kck: [u8; 16] = [0x11u8; 16];
         let kek: [u8; 16] = [
-            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
-            0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
 
         // GTK to install: same as RFC 3394 §4.1 test vector plaintext.
         let gtk: [u8; 16] = [
-            0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
-            0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
         ];
         // RFC 3394 §4.1 wrapped value for the above GTK + KEK.
         let wrapped: [u8; 24] = [
-            0x1f,0xa6,0x8b,0x0a,0x81,0x12,0xb4,0x47,
-            0xae,0xf3,0x4b,0xd8,0xfb,0x5a,0x7b,0x82,
-            0x9d,0x3e,0x86,0x23,0x71,0xd2,0xcf,0xe5,
+            0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+            0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
         ];
 
         // Build the GTK KDE around the wrapped key.
@@ -534,7 +576,8 @@ pub mod tests {
         let mut raw = [0x00u8; 100];
         raw[0] = 3; // EAPOL version
         raw[1] = 3; // EAPOL-Key
-        raw[2] = 0; raw[3] = 96; // body len
+        raw[2] = 0;
+        raw[3] = 96; // body len
 
         // Embed the wrapped key data at bytes 97..= (after Key Data Len
         // at 95-96, which we don't use — key_data is passed separately).
@@ -569,8 +612,12 @@ pub mod tests {
                 // the minimal frame. This is the correct partial pass.
                 TestResult::Pass
             }
-            Err(RekeyError::BadMic) => TestResult::Fail("MIC check failed on correctly MICed frame"),
-            Err(RekeyError::AesUnwrapFailed) => TestResult::Fail("AES unwrap failed on valid RFC-3394 vector"),
+            Err(RekeyError::BadMic) => {
+                TestResult::Fail("MIC check failed on correctly MICed frame")
+            }
+            Err(RekeyError::AesUnwrapFailed) => {
+                TestResult::Fail("AES unwrap failed on valid RFC-3394 vector")
+            }
             Err(_) => TestResult::Fail("Unexpected error in group_rekey_handle_m1"),
         }
     }

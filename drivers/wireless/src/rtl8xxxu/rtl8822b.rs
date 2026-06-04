@@ -81,9 +81,15 @@ pub const N_RF_B_ROWS: usize = 245;
 /// Stage 0/1 register init table.
 pub const INIT_TABLE: &[(u16, u8)] = &[
     (REG_APS_FSMCO as u16 + 1, 0x08),
-    (REG_CR, (CR_HCI_TXDMA_ENABLE | CR_HCI_RXDMA_ENABLE |
-              CR_TXDMA_ENABLE | CR_RXDMA_ENABLE |
-              CR_PROTOCOL_ENABLE | CR_SCHEDULE_ENABLE) as u8),
+    (
+        REG_CR,
+        (CR_HCI_TXDMA_ENABLE
+            | CR_HCI_RXDMA_ENABLE
+            | CR_TXDMA_ENABLE
+            | CR_RXDMA_ENABLE
+            | CR_PROTOCOL_ENABLE
+            | CR_SCHEDULE_ENABLE) as u8,
+    ),
 ];
 
 /// Chip-init stage-0 register bank.
@@ -132,20 +138,62 @@ pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
     if buf.len() < IQK_PATH_A_STEP_COUNT {
         return 0;
     }
-    buf[0]  = IqkStep { reg: REG_FPGA0_IQK,        val: 0 };
-    buf[1]  = IqkStep { reg: REG_S0S1_PATH_SWITCH, val: 0 };
-    buf[2]  = IqkStep { reg: REG_TX_IQK_TONE_A,    val: 0 };
-    buf[3]  = IqkStep { reg: REG_RX_IQK_TONE_A,    val: 0 };
-    buf[4]  = IqkStep { reg: REG_TX_IQK_PI_A,      val: 0 };
-    buf[5]  = IqkStep { reg: REG_RX_IQK_PI_A,      val: 0 };
-    buf[6]  = IqkStep { reg: REG_TX_IQK,           val: 0 };
-    buf[7]  = IqkStep { reg: REG_RX_IQK,           val: 0 };
-    buf[8]  = IqkStep { reg: REG_IQK_AGC_RSP,      val: 0 };
-    buf[9]  = IqkStep { reg: REG_IQK_AGC_PTS,      val: 0 };
-    buf[10] = IqkStep { reg: REG_IQK_AGC_PTS,      val: 0 };
-    buf[11] = IqkStep { reg: REG_FPGA0_RF_MODE,    val: 0 };
-    buf[12] = IqkStep { reg: REG_FPGA1_RF_MODE,    val: 0 };
-    buf[13] = IqkStep { reg: REG_WMAC_TRXPTCL_CTL, val: 0 };
+    buf[0] = IqkStep {
+        reg: REG_FPGA0_IQK,
+        val: 0,
+    };
+    buf[1] = IqkStep {
+        reg: REG_S0S1_PATH_SWITCH,
+        val: 0,
+    };
+    buf[2] = IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[3] = IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[4] = IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0,
+    };
+    buf[5] = IqkStep {
+        reg: REG_RX_IQK_PI_A,
+        val: 0,
+    };
+    buf[6] = IqkStep {
+        reg: REG_TX_IQK,
+        val: 0,
+    };
+    buf[7] = IqkStep {
+        reg: REG_RX_IQK,
+        val: 0,
+    };
+    buf[8] = IqkStep {
+        reg: REG_IQK_AGC_RSP,
+        val: 0,
+    };
+    buf[9] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[10] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[11] = IqkStep {
+        reg: REG_FPGA0_RF_MODE,
+        val: 0,
+    };
+    buf[12] = IqkStep {
+        reg: REG_FPGA1_RF_MODE,
+        val: 0,
+    };
+    buf[13] = IqkStep {
+        reg: REG_WMAC_TRXPTCL_CTL,
+        val: 0,
+    };
     IQK_PATH_A_STEP_COUNT
 }
 
@@ -155,20 +203,62 @@ pub fn build_iqk_path_b_sequence(buf: &mut [IqkStep]) -> usize {
         return 0;
     }
     // Same register set as path A; the values differ (path-B routing).
-    buf[0]  = IqkStep { reg: REG_FPGA0_IQK,        val: 0 };
-    buf[1]  = IqkStep { reg: REG_S0S1_PATH_SWITCH, val: 0 };
-    buf[2]  = IqkStep { reg: REG_TX_IQK_TONE_A,    val: 0 };
-    buf[3]  = IqkStep { reg: REG_RX_IQK_TONE_A,    val: 0 };
-    buf[4]  = IqkStep { reg: REG_TX_IQK_PI_A,      val: 0 };
-    buf[5]  = IqkStep { reg: REG_RX_IQK_PI_A,      val: 0 };
-    buf[6]  = IqkStep { reg: REG_TX_IQK,           val: 0 };
-    buf[7]  = IqkStep { reg: REG_RX_IQK,           val: 0 };
-    buf[8]  = IqkStep { reg: REG_IQK_AGC_RSP,      val: 0 };
-    buf[9]  = IqkStep { reg: REG_IQK_AGC_PTS,      val: 0 };
-    buf[10] = IqkStep { reg: REG_IQK_AGC_PTS,      val: 0 };
-    buf[11] = IqkStep { reg: REG_FPGA0_RF_MODE,    val: 0 };
-    buf[12] = IqkStep { reg: REG_FPGA1_RF_MODE,    val: 0 };
-    buf[13] = IqkStep { reg: REG_WMAC_TRXPTCL_CTL, val: 0 };
+    buf[0] = IqkStep {
+        reg: REG_FPGA0_IQK,
+        val: 0,
+    };
+    buf[1] = IqkStep {
+        reg: REG_S0S1_PATH_SWITCH,
+        val: 0,
+    };
+    buf[2] = IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[3] = IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[4] = IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0,
+    };
+    buf[5] = IqkStep {
+        reg: REG_RX_IQK_PI_A,
+        val: 0,
+    };
+    buf[6] = IqkStep {
+        reg: REG_TX_IQK,
+        val: 0,
+    };
+    buf[7] = IqkStep {
+        reg: REG_RX_IQK,
+        val: 0,
+    };
+    buf[8] = IqkStep {
+        reg: REG_IQK_AGC_RSP,
+        val: 0,
+    };
+    buf[9] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[10] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[11] = IqkStep {
+        reg: REG_FPGA0_RF_MODE,
+        val: 0,
+    };
+    buf[12] = IqkStep {
+        reg: REG_FPGA1_RF_MODE,
+        val: 0,
+    };
+    buf[13] = IqkStep {
+        reg: REG_WMAC_TRXPTCL_CTL,
+        val: 0,
+    };
     IQK_PATH_B_STEP_COUNT
 }
 
@@ -258,14 +348,12 @@ pub fn init_phy<W: FnMut(u16, u32)>(mut write32: W) -> usize {
 pub fn init_rf<W: FnMut(u8, u8, u32)>(mut write_rfreg: W) -> usize {
     use super::phy::RfPath;
     let mut n = 0usize;
-    n += super::phy_tables::apply_rf_table(
-        RADIO_A_INIT_TABLE,
-        |r, v| write_rfreg(RfPath::A.index(), r, v),
-    );
-    n += super::phy_tables::apply_rf_table(
-        RADIO_B_INIT_TABLE,
-        |r, v| write_rfreg(RfPath::B.index(), r, v),
-    );
+    n += super::phy_tables::apply_rf_table(RADIO_A_INIT_TABLE, |r, v| {
+        write_rfreg(RfPath::A.index(), r, v)
+    });
+    n += super::phy_tables::apply_rf_table(RADIO_B_INIT_TABLE, |r, v| {
+        write_rfreg(RfPath::B.index(), r, v)
+    });
     n
 }
 

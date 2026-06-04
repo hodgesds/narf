@@ -274,10 +274,7 @@ pub unsafe fn baseline_power_on(mmio: &MmioRegion) -> Result<(), MacError> {
     // SAFETY: same.
     unsafe {
         let v = mmio.read32(R_AX_SYS_PW_CTRL);
-        mmio.write32(
-            R_AX_SYS_PW_CTRL,
-            v | B_AX_EN_WLON | B_AX_APFN_ONMAC,
-        );
+        mmio.write32(R_AX_SYS_PW_CTRL, v | B_AX_EN_WLON | B_AX_APFN_ONMAC);
     }
 
     // Step 4: wait for B_AX_RDY_SYSPWR. Linux's per-chip PWR-seq

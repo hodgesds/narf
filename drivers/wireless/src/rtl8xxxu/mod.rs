@@ -67,19 +67,9 @@ pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 // iwlwifi (PCIe UMAC cmd) and rtl8xxxu (bulk-OUT with TxDesc header).
 
 pub use crate::iwlwifi::mlme::{
-    AssocParams,
-    AssocParamsRsn,
-    AssocResponseFields,
-    AuthResponse,
-    BssDescriptor,
-    BeaconInfo,
-    ScanRequest,
-    auth_algorithm,
-    build_assoc_request,
-    build_assoc_request_rsn,
-    build_open_auth_body,
-    parse_beacon,
-    parse_beacon_to_bss,
+    auth_algorithm, build_assoc_request, build_assoc_request_rsn, build_open_auth_body,
+    parse_beacon, parse_beacon_to_bss, AssocParams, AssocParamsRsn, AssocResponseFields,
+    AuthResponse, BeaconInfo, BssDescriptor, ScanRequest,
 };
 
 /// The static VID/PID match table for all RTL8XXXU chip families.
@@ -151,9 +141,7 @@ pub fn rtl8xxxu_probe(
     // async init task can find it.
     {
         let mut g = DEVICES.lock();
-        if g.iter().any(|d| {
-            d.device.slot_id() == device.slot_id()
-        }) {
+        if g.iter().any(|d| d.device.slot_id() == device.slot_id()) {
             // Already registered (e.g. double-probe after hub reset).
             return Ok(());
         }
@@ -167,7 +155,10 @@ pub fn rtl8xxxu_probe(
     let _ = writeln!(
         narf_console::Writer,
         "  rtl8xxxu: {:04x}:{:04x} {} slot={}",
-        vid, pid, family.name(), device.slot_id()
+        vid,
+        pid,
+        family.name(),
+        device.slot_id()
     );
 
     Ok(())
@@ -266,8 +257,8 @@ pub fn bring_up_8188eu<T: usb::Rtl8xxxuTransport>(
     let mut total_writes = rtl8188e::stage0_register_bank().len();
     if !fw_payload.is_empty() {
         // Caller is expected to have armed the fake-poll progression.
-        let n = fw::upload_firmware_blob(transport, fw_payload)
-            .map_err(BringUpError::FwDownload)?;
+        let n =
+            fw::upload_firmware_blob(transport, fw_payload).map_err(BringUpError::FwDownload)?;
         total_writes += n.div_ceil(regs::RTL_FW_PAGE_SIZE);
     }
 
@@ -297,8 +288,7 @@ pub fn bring_up_8188eu<T: usb::Rtl8xxxuTransport>(
     total_writes += n_rf;
 
     // Stage 5: IQK path A (single iteration; the real driver retries).
-    let mut iqk = [phy::IqkStep { reg: 0, val: 0 };
-                   rtl8188e::IQK_PATH_A_STEP_COUNT];
+    let mut iqk = [phy::IqkStep { reg: 0, val: 0 }; rtl8188e::IQK_PATH_A_STEP_COUNT];
     let n_iqk = rtl8188e::build_iqk_path_a_sequence(&mut iqk);
     for step in &iqk[..n_iqk] {
         transport.write32(step.reg, step.val)?;

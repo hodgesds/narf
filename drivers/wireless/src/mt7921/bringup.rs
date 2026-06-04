@@ -128,16 +128,20 @@ pub fn build_mcu_init_sequence(config: &BringUpConfig) -> alloc::vec::Vec<u8> {
     let ra_start = out.len();
     out.resize(ra_start + cmd::INIT_RA_CFG_SIZE, 0);
     let _ = cmd::encode_init_ra_cfg(
-        0, 2, true, false, true, config.bw, true, 0,
+        0,
+        2,
+        true,
+        false,
+        true,
+        config.bw,
+        true,
+        0,
         &mut out[ra_start..],
     );
 
     let dev_start = out.len();
     out.resize(dev_start + cmd::UNI_DEV_INFO_BODY_SIZE, 0);
-    let _ = cmd::encode_uni_dev_info_update(
-        0, 0, true, config.own_mac,
-        &mut out[dev_start..],
-    );
+    let _ = cmd::encode_uni_dev_info_update(0, 0, true, config.own_mac, &mut out[dev_start..]);
 
     out
 }

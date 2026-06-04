@@ -343,11 +343,9 @@ pub fn alloc_tx_ring(q_idx: u8, depth: usize) -> Result<Ring, DmaError> {
     if depth == 0 || depth > MT7921_BASELINE_RING_DEPTH {
         return Err(DmaError::DepthExceedsPage);
     }
-    let desc_mem = narf_io::alloc_coherent(
-        depth * MT76_DESC_SIZE,
-        narf_lib::id::DomainId::DRIVER_0,
-    )
-    .map_err(|_| DmaError::BufferAllocFailed)?;
+    let desc_mem =
+        narf_io::alloc_coherent(depth * MT76_DESC_SIZE, narf_lib::id::DomainId::DRIVER_0)
+            .map_err(|_| DmaError::BufferAllocFailed)?;
 
     Ok(Ring {
         q_idx,
@@ -368,11 +366,9 @@ pub fn alloc_rx_ring(q_idx: u8, depth: usize, buf_len: usize) -> Result<Ring, Dm
     if depth == 0 || depth > MT7921_BASELINE_RING_DEPTH {
         return Err(DmaError::DepthExceedsPage);
     }
-    let desc_mem = narf_io::alloc_coherent(
-        depth * MT76_DESC_SIZE,
-        narf_lib::id::DomainId::DRIVER_0,
-    )
-    .map_err(|_| DmaError::BufferAllocFailed)?;
+    let desc_mem =
+        narf_io::alloc_coherent(depth * MT76_DESC_SIZE, narf_lib::id::DomainId::DRIVER_0)
+            .map_err(|_| DmaError::BufferAllocFailed)?;
 
     let mut buffers = Vec::with_capacity(depth);
     for _ in 0..depth {
@@ -410,8 +406,7 @@ pub fn alloc_rx_ring(q_idx: u8, depth: usize, buf_len: usize) -> Result<Ring, Dm
             let phys = phys_addrs[i];
             descs[i].buf0 = phys as u32;
             descs[i].buf1 = ((phys >> 32) as u32) & 0x0F;
-            descs[i].ctrl =
-                (buf_len_capped << MT_DMA_CTL_SD_LEN0_SHIFT) & MT_DMA_CTL_SD_LEN0_MASK;
+            descs[i].ctrl = (buf_len_capped << MT_DMA_CTL_SD_LEN0_SHIFT) & MT_DMA_CTL_SD_LEN0_MASK;
             descs[i].info = 0;
         }
     }
@@ -472,8 +467,7 @@ pub const DMA_BUSY_POLL_MS: u64 = 100;
 pub unsafe fn dma_disable(mmio: &MmioRegion) -> Result<(), DmaError> {
     use narf_time::Deadline;
     let deadline = Deadline::after_ms(DMA_BUSY_POLL_MS);
-    let busy_mask =
-        MT_WFDMA0_GLO_CFG_TX_DMA_BUSY | MT_WFDMA0_GLO_CFG_RX_DMA_BUSY;
+    let busy_mask = MT_WFDMA0_GLO_CFG_TX_DMA_BUSY | MT_WFDMA0_GLO_CFG_RX_DMA_BUSY;
     let cleared = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: BAR0 mapped + owned.
@@ -659,10 +653,7 @@ pub fn allocate_ring_set() -> Result<RingSet, DmaError> {
 ///
 /// # Safety
 /// BAR0 mapped + owned.
-pub unsafe fn program_ring_set(
-    mmio: &MmioRegion,
-    rings: &RingSet,
-) -> Result<(), DmaError> {
+pub unsafe fn program_ring_set(mmio: &MmioRegion, rings: &RingSet) -> Result<(), DmaError> {
     // SAFETY: forwarded.
     unsafe { dma_disable(mmio)? };
     // SAFETY: forwarded.
@@ -698,4 +689,3 @@ pub unsafe fn program_ring_set(
     unsafe { dma_enable(mmio) };
     Ok(())
 }
-

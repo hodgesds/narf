@@ -257,11 +257,10 @@ pub mod tests {
             return TestResult::Fail("SW channel must be CONTROL");
         }
         // BCDC header.
-        let bcdc =
-            match BcdcHeader::decode(&frame[HW_HEADER_LEN + SW_HEADER_LEN..]) {
-                Ok(b) => b,
-                Err(_) => return TestResult::Fail("BCDC header decode failed"),
-            };
+        let bcdc = match BcdcHeader::decode(&frame[HW_HEADER_LEN + SW_HEADER_LEN..]) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("BCDC header decode failed"),
+        };
         if bcdc.cmd != WLC_SET_VAR {
             return TestResult::Fail("BCDC cmd field wrong");
         }
@@ -294,8 +293,7 @@ pub mod tests {
         // Build a request, swap the BCDC `status` to a fake error,
         // and assert parse_response surfaces it.
         let payload = b"\x00\x00\x00\x00";
-        let mut frame =
-            build_request(3, 7, 0, Direction::Get, WLC_GET_MAGIC, payload);
+        let mut frame = build_request(3, 7, 0, Direction::Get, WLC_GET_MAGIC, payload);
         // Patch BCDC status to non-zero.
         let bcdc_start = HW_HEADER_LEN + SW_HEADER_LEN;
         frame[bcdc_start + 12] = 0xAA;
@@ -323,17 +321,15 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/wireless/cyw43439/ioctl",
-        smoke_response_round_trip
-    );
+    kernel_test_in!("drivers/wireless/cyw43439/ioctl", smoke_response_round_trip);
 
     fn smoke_response_rejects_wrong_channel() -> TestResult {
         let payload = [0u8; 4];
         let mut frame = build_request(0, 0, 0, Direction::Get, WLC_GET_MAGIC, &payload);
         // Flip channel field to DATA.
         let chan_byte_index = HW_HEADER_LEN + 1;
-        frame[chan_byte_index] = (frame[chan_byte_index] & 0xF0) | super::super::sdpcm::CHANNEL_DATA;
+        frame[chan_byte_index] =
+            (frame[chan_byte_index] & 0xF0) | super::super::sdpcm::CHANNEL_DATA;
         match parse_response(&frame) {
             Err(ParseError::NotControlChannel) => TestResult::Pass,
             _ => TestResult::Fail("data-channel frame must not parse as IOCTL"),

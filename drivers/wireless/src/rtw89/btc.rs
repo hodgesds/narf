@@ -135,12 +135,7 @@ pub fn make_btc_set_h2c(func: u8, seq: u8) -> H2cBuilder {
 /// `[H2C 8-byte header] [CXHDR 2 bytes] [payload]`
 ///
 /// Returns total wire length.
-pub fn build_btc_set_cmd(
-    cxtype: u8,
-    seq: u8,
-    payload: &[u8],
-    out: &mut [u8],
-) -> Option<usize> {
+pub fn build_btc_set_cmd(cxtype: u8, seq: u8, payload: &[u8], out: &mut [u8]) -> Option<usize> {
     let cmd_payload_len = CXHDR_LEN + payload.len();
     let total = H2C_HEADER_LEN + cmd_payload_len;
     if out.len() < total {

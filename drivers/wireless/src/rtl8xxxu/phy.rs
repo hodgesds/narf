@@ -35,7 +35,10 @@ pub struct Reg32Val {
 }
 
 impl Reg32Val {
-    pub const SENTINEL: Self = Self { reg: 0xFFFF, val: 0xFFFFFFFF };
+    pub const SENTINEL: Self = Self {
+        reg: 0xFFFF,
+        val: 0xFFFFFFFF,
+    };
 }
 
 /// A 16-bit register init entry.
@@ -112,23 +115,42 @@ pub struct IqkStep {
 /// Source: `core.c::rtl8xxxu_gen1_phy_iq_calibrate` ~L3398..L3420.
 pub const IQK_PREAMBLE_GEN1: &[IqkStep] = &[
     // Save BB switch — disable CCK lock during calibration.
-    IqkStep { reg: REG_FPGA0_RF_MODE, val: 0x00000000 },
+    IqkStep {
+        reg: REG_FPGA0_RF_MODE,
+        val: 0x00000000,
+    },
     // Configure IQK transmit tone (offset 0x0E30 = REG_TX_IQK_TONE_A).
-    IqkStep { reg: REG_TX_IQK_TONE_A, val: 0x10008C1F },
+    IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0x10008C1F,
+    },
     // RX IQK tone (offset 0x0E50).
-    IqkStep { reg: REG_RX_IQK_TONE_A, val: 0x30008C1F },
+    IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0x30008C1F,
+    },
     // PI control for path A.
-    IqkStep { reg: REG_TX_IQK_PI_A, val: 0x8214032A },
+    IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0x8214032A,
+    },
     // AGC PTS (path A).
-    IqkStep { reg: REG_IQK_AGC_PTS, val: 0x00462911 },
+    IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0x00462911,
+    },
     // Trigger IQK — set bit 0 of REG_IQK_AGC_RSP, then poll.
-    IqkStep { reg: REG_IQK_AGC_RSP, val: 0x00000080 },
+    IqkStep {
+        reg: REG_IQK_AGC_RSP,
+        val: 0x00000080,
+    },
 ];
 
 /// The gen1 IQ-cal post — restore BB switch.
-pub const IQK_RESTORE_GEN1: &[IqkStep] = &[
-    IqkStep { reg: REG_FPGA0_RF_MODE, val: 0x00000003 },
-];
+pub const IQK_RESTORE_GEN1: &[IqkStep] = &[IqkStep {
+    reg: REG_FPGA0_RF_MODE,
+    val: 0x00000003,
+}];
 
 /// Number of IQK polling iterations.
 pub const IQK_POLL_MAX: usize = 50;

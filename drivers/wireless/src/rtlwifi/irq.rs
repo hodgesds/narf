@@ -124,8 +124,7 @@ impl IsrStatus {
     /// True if any TX queue completed.
     #[inline]
     pub fn tx_any_done(self) -> bool {
-        self.hisr & (IMR_BEDOK | IMR_BKDOK | IMR_VIDOK | IMR_VODOK | IMR_MGNTDOK | IMR_HIGHDOK)
-            != 0
+        self.hisr & (IMR_BEDOK | IMR_BKDOK | IMR_VIDOK | IMR_VODOK | IMR_MGNTDOK | IMR_HIGHDOK) != 0
     }
 
     /// True if the chip flagged an RX FIFO overflow (drop, recover).

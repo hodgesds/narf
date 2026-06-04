@@ -232,8 +232,7 @@ pub mod tests {
 
     fn smoke_cmd52_io_enable_write() -> TestResult {
         // Drive F2 enable: write 0x04 to CCCR_IO_ENABLE on F0.
-        let arg =
-            Cmd52Arg::write(FUNC_F0_CONTROL, CCCR_IO_ENABLE, 0x04).expect("valid CMD52 args");
+        let arg = Cmd52Arg::write(FUNC_F0_CONTROL, CCCR_IO_ENABLE, 0x04).expect("valid CMD52 args");
         let word = arg.encode();
         // Bit 31 should be set (write).
         if (word >> 31) & 1 != 1 {

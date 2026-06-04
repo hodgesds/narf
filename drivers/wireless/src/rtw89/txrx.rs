@@ -186,8 +186,7 @@ pub fn encode_txwd(info: &TxwdInfo, out: &mut [u8]) -> Option<()> {
     out[4..8].fill(0);
 
     // Dword 2: MAC-ID + queue selector + packet size.
-    let dw2: u32 =
-        ((info.mac_id as u32) << TXWD_BODY2_MACID_SHIFT & TXWD_BODY2_MACID_MASK)
+    let dw2: u32 = ((info.mac_id as u32) << TXWD_BODY2_MACID_SHIFT & TXWD_BODY2_MACID_MASK)
         | ((info.qsel as u32) << TXWD_BODY2_QSEL_SHIFT & TXWD_BODY2_QSEL_MASK)
         | (info.pkt_size as u32 & TXWD_BODY2_TXPKT_SIZE_MASK);
     out[8..12].copy_from_slice(&dw2.to_le_bytes());
@@ -284,8 +283,7 @@ pub fn encode_h2c_header(
     if out.len() < H2C_HEADER_LEN {
         return None;
     }
-    let dw0: u32 =
-        ((seq as u32) << H2C_HDR_SEQ_SHIFT)
+    let dw0: u32 = ((seq as u32) << H2C_HDR_SEQ_SHIFT)
         | (FWCMD_TYPE_H2C as u32) << H2C_HDR_DEL_TYPE_SHIFT
         | ((func as u32) << H2C_HDR_FUNC_SHIFT)
         | ((class as u32) << H2C_HDR_CLASS_SHIFT)

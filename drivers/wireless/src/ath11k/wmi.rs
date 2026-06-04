@@ -341,7 +341,10 @@ pub fn build_vdev_create(
     // ARRAY_STRUCT TLV containing 2 VDEV_TXRX_STREAMS entries.
     // Each entry: TLV header(4) + band(4) + supported_rate_chains(4) + preferred_tx_streams(4) = 12 bytes.
     let mut streams_payload = Vec::with_capacity(24);
-    for band in [WMI_TPC_CHAINMASK_CONFIG_BAND_2G, WMI_TPC_CHAINMASK_CONFIG_BAND_5G] {
+    for band in [
+        WMI_TPC_CHAINMASK_CONFIG_BAND_2G,
+        WMI_TPC_CHAINMASK_CONFIG_BAND_5G,
+    ] {
         // Inner TLV header for VDEV_TXRX_STREAMS.
         let inner_hdr = pack_tlv_header(WMI_TAG_VDEV_TXRX_STREAMS, 8);
         streams_payload.extend_from_slice(&inner_hdr.to_le_bytes());

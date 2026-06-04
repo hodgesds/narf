@@ -65,11 +65,17 @@ pub struct CoexDecision {
 
 impl CoexDecision {
     /// WLAN-only mode: tell the BT controller to back off entirely.
-    pub const WLAN_ONLY: Self = Self { h2c_cmd: H2C_BT_WLAN_ONLY, param: 1 };
+    pub const WLAN_ONLY: Self = Self {
+        h2c_cmd: H2C_BT_WLAN_ONLY,
+        param: 1,
+    };
 
     /// TDMA with given BT-percentage of the airtime budget.
     pub const fn tdma(bt_percent: u8) -> Self {
-        Self { h2c_cmd: H2C_BT_TDMA, param: bt_percent }
+        Self {
+            h2c_cmd: H2C_BT_TDMA,
+            param: bt_percent,
+        }
     }
 }
 
@@ -153,10 +159,7 @@ pub type CoexType = u8;
 /// Pick a coex type based on BT status and link profile.
 ///
 /// Implements the decision matrix in `core.c::rtl8723bu_run_coex_1ant_*`.
-pub fn coex_type_for_state(
-    status: Bt8723b1AntStatus,
-    profile: BtLinkProfile,
-) -> CoexType {
+pub fn coex_type_for_state(status: Bt8723b1AntStatus, profile: BtLinkProfile) -> CoexType {
     use Bt8723b1AntStatus::*;
     match status {
         NonConnectedIdle | ConnectedIdle => 0,
@@ -201,7 +204,12 @@ pub fn coex_table_write_for_type(coex_type: CoexType) -> CoexTableWrite {
     // table1/2/3 carry the type-specific 32-bit patterns; declared 0
     // here, populated from `core.c` at firmware-bundle time.
     let _ = coex_type;
-    CoexTableWrite { table1: 0, table2: 0, table3: 0, table4: 0x03 }
+    CoexTableWrite {
+        table1: 0,
+        table2: 0,
+        table3: 0,
+        table4: 0x03,
+    }
 }
 
 /// `REG_BT_COEX_TABLE1` offset.

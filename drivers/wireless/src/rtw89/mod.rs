@@ -72,7 +72,7 @@ pub mod phy;
 pub mod phy_table;
 pub mod txrx;
 
-pub use mac::{ChipId, ChipGeneration, MacError};
+pub use mac::{ChipGeneration, ChipId, MacError};
 pub use pci::{name_for, probe, register_pci_driver, Rtw89Device};
 
 // ── PCI ids exported so `lib.rs` and tests don't have to dig into the

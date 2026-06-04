@@ -165,10 +165,7 @@ pub fn register_pci_driver() {
 
 /// Probe entry called by `narf-bus::driver_match` when one of our
 /// vendor/device pairs surfaces.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -198,7 +195,7 @@ pub fn probe(
 
     let did = dev.device_id;
     let hw_rev = dev.hw_rev;
-    
+
     // ── Stage 2: MHI initialization ──
     let auth = match narf_firmware::trusted_loader_authority() {
         Some(a) => a.derive().ok(),
@@ -207,20 +204,30 @@ pub fn probe(
     if let Some(auth) = auth {
         match unsafe { crate::ath11k::mhi::mhi_init(&dev.mmio_bar0, did, &auth) } {
             Ok(()) => {
-                let _ = writeln!(narf_console::Writer, "  ath11k: MHI Mission Mode (M0) reached");
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  ath11k: MHI Mission Mode (M0) reached"
+                );
             }
             Err(e) => {
-                let _ = writeln!(narf_console::Writer, "  ath11k: MHI initialization failed: {:?}", e);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  ath11k: MHI initialization failed: {:?}",
+                    e
+                );
                 // We don't fail probe here yet so the log stays visible
             }
         }
     } else {
-        let _ = writeln!(narf_console::Writer, "  ath11k: no firmware authority — skipping MHI start");
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: no firmware authority — skipping MHI start"
+        );
     }
 
     // ── Stage 3: Interface registration ──
     let mac_addr = [0x00, 0x16, 0xEA, 0x11, 0x11, 0x11]; // TODO: Read from HW
-    
+
     // Initialize IPC rings.
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
@@ -243,7 +250,7 @@ pub fn probe(
     narf_wireless::registry::register(device.clone());
 
     // TODO: Spawn pumps for ath11k
-    
+
     *CONTROLLER.lock() = Some(Ath11kDevice {
         mmio_bar0: device.mmio_bar0.clone(),
         chip: device.chip,
@@ -292,7 +299,8 @@ pub unsafe fn bring_up(device: &BusDevice, chip: ChipInfo) -> Result<Ath11kDevic
         return Err(ProbeError::LinkDown);
     }
 
-    let major = (initial & hw::TCSR_SOC_HW_VERSION_MAJOR_MASK) >> hw::TCSR_SOC_HW_VERSION_MAJOR_SHIFT;
+    let major =
+        (initial & hw::TCSR_SOC_HW_VERSION_MAJOR_MASK) >> hw::TCSR_SOC_HW_VERSION_MAJOR_SHIFT;
     let minor = initial & hw::TCSR_SOC_HW_VERSION_MINOR_MASK;
     let hw_rev = refine_hw_rev(chip.did, major, minor);
 

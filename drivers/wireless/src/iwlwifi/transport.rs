@@ -52,9 +52,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_bus;
 use super::regs::{self, csr_gp_cntrl, csr_int, csr_reset};
 use super::{FwSection, ParsedUcode, CPU1_CPU2_SEPARATOR, PAGING_SEPARATOR};
+use narf_bus;
 
 // ── MMIO trait ─────────────────────────────────────────────────────
 
@@ -137,7 +137,10 @@ pub fn apm_init<M: IwlMmio>(mmio: &mut M) -> Result<(), TransportError> {
             // RF_KILL / CT_KILL / ALIVE etc. fire.
             mmio.write(regs::CSR_INT_MASK, regs::CSR_INI_SET_MASK);
             // Step 4: program the platform-fixed config bits.
-            mmio.write(regs::CSR_HW_IF_CONFIG_REG, regs::csr_hw_if_config::NIC_READY);
+            mmio.write(
+                regs::CSR_HW_IF_CONFIG_REG,
+                regs::csr_hw_if_config::NIC_READY,
+            );
             return Ok(());
         }
     }
@@ -444,14 +447,14 @@ impl AliveSink for PollingAliveSink {
         // narf might have a sleep/delay function.
         // Actually, let's just use a large number of iterations
         // or check if there's a way to get time.
-        
+
         for _ in 0..(deadline_ms * 1000) {
             let intr = unsafe { self.region.read32(regs::CSR_INT as u64) };
             if intr & csr_int::ALIVE != 0 {
                 // Acknowledge the interrupt.
                 unsafe { self.region.write32(regs::CSR_INT as u64, csr_int::ALIVE) };
-                
-                // On many Intel chips, the ALIVE status is written to 
+
+                // On many Intel chips, the ALIVE status is written to
                 // CSR_UCODE_DRV_GP2 (0x60).
                 let status = unsafe { self.region.read32(regs::CSR_UCODE_DRV_GP2 as u64) };
                 if status == regs::IWL_ALIVE_STATUS_OK {
@@ -529,7 +532,10 @@ pub mod tests {
 
     impl MockMmio {
         fn new() -> Self {
-            Self { reads: VecDeque::new(), writes: Vec::new() }
+            Self {
+                reads: VecDeque::new(),
+                writes: Vec::new(),
+            }
         }
         fn stage_read(&mut self, off: u32, val: u32) {
             self.reads.push_back((off, val));
@@ -538,7 +544,11 @@ pub mod tests {
             self.writes.iter().filter(|(o, _)| *o == off).count()
         }
         fn last_write_to(&self, off: u32) -> Option<u32> {
-            self.writes.iter().rev().find(|(o, _)| *o == off).map(|(_, v)| *v)
+            self.writes
+                .iter()
+                .rev()
+                .find(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
         }
     }
 
@@ -570,9 +580,7 @@ pub mod tests {
         if m.last_write_to(regs::CSR_INT_MASK) != Some(regs::CSR_INI_SET_MASK) {
             return TestResult::Fail("CSR_INT_MASK not written");
         }
-        if m.last_write_to(regs::CSR_HW_IF_CONFIG_REG)
-            != Some(regs::csr_hw_if_config::NIC_READY)
-        {
+        if m.last_write_to(regs::CSR_HW_IF_CONFIG_REG) != Some(regs::csr_hw_if_config::NIC_READY) {
             return TestResult::Fail("CSR_HW_IF_CONFIG_REG not written");
         }
         TestResult::Pass
@@ -626,9 +634,7 @@ pub mod tests {
         if m.last_write_to(regs::FH_TFDIB_CTRL0_REG_SRVC) != Some(0x0000_5000) {
             return TestResult::Fail("TFDIB_CTRL0 phys lo wrong");
         }
-        if m.last_write_to(regs::FH_TFDIB_CTRL1_REG_SRVC)
-            != Some(regs::fh_tfdib_ctrl1(0x1, 1024))
-        {
+        if m.last_write_to(regs::FH_TFDIB_CTRL1_REG_SRVC) != Some(regs::fh_tfdib_ctrl1(0x1, 1024)) {
             return TestResult::Fail("TFDIB_CTRL1 packing wrong");
         }
         if m.last_write_to(regs::FH_TCSR_CHNL_TX_BUF_STS_REG_SRVC) != Some(0x3) {
@@ -655,9 +661,7 @@ pub mod tests {
         if m.count_writes_to(regs::HBUS_TARG_PRPH_WADDR) < 1 {
             return TestResult::Fail("no PRPH chick write happened");
         }
-        if m.last_write_to(regs::HBUS_TARG_PRPH_WDAT)
-            != Some(regs::PRPH_LMPM_CHICK_EXT_ADDR_LSB)
-        {
+        if m.last_write_to(regs::HBUS_TARG_PRPH_WDAT) != Some(regs::PRPH_LMPM_CHICK_EXT_ADDR_LSB) {
             return TestResult::Fail("PRPH chick value wrong");
         }
         TestResult::Pass
@@ -687,18 +691,14 @@ pub mod tests {
         if m.last_write_to(regs::CSR_IML_DATA_ADDR) != Some(regions.iml_phys as u32) {
             return TestResult::Fail("CSR_IML_DATA_ADDR lo wrong");
         }
-        if m.last_write_to(regs::CSR_IML_DATA_ADDR + 4)
-            != Some((regions.iml_phys >> 32) as u32)
-        {
+        if m.last_write_to(regs::CSR_IML_DATA_ADDR + 4) != Some((regions.iml_phys >> 32) as u32) {
             return TestResult::Fail("CSR_IML_DATA_ADDR hi wrong");
         }
         if m.last_write_to(regs::CSR_IML_SIZE_ADDR) != Some(regions.iml_size) {
             return TestResult::Fail("CSR_IML_SIZE_ADDR wrong");
         }
         // Boot kick.
-        if m.last_write_to(regs::CSR_CTXT_INFO_BOOT_CTRL)
-            != Some(regs::CSR_AUTO_FUNC_BOOT_ENA)
-        {
+        if m.last_write_to(regs::CSR_CTXT_INFO_BOOT_CTRL) != Some(regs::CSR_AUTO_FUNC_BOOT_ENA) {
             return TestResult::Fail("CSR_CTXT_INFO_BOOT_CTRL kick missing");
         }
         TestResult::Pass
@@ -707,14 +707,10 @@ pub mod tests {
     fn smoke_iwlwifi_signal_load_done_writes_prph() -> TestResult {
         let mut m = MockMmio::new();
         signal_load_done_gen2(&mut m);
-        if m.last_write_to(regs::HBUS_TARG_PRPH_WADDR)
-            != Some(regs::PRPH_UREG_UCODE_LOAD_STATUS)
-        {
+        if m.last_write_to(regs::HBUS_TARG_PRPH_WADDR) != Some(regs::PRPH_UREG_UCODE_LOAD_STATUS) {
             return TestResult::Fail("PRPH WADDR wrong");
         }
-        if m.last_write_to(regs::HBUS_TARG_PRPH_WDAT)
-            != Some(regs::FH_UCODE_LOAD_STATUS_GEN2)
-        {
+        if m.last_write_to(regs::HBUS_TARG_PRPH_WDAT) != Some(regs::FH_UCODE_LOAD_STATUS_GEN2) {
             return TestResult::Fail("PRPH WDAT wrong");
         }
         TestResult::Pass
@@ -760,7 +756,9 @@ pub mod tests {
                 self.status
             }
         }
-        let mut sink = MockSink { status: Some(0xDEAD) };
+        let mut sink = MockSink {
+            status: Some(0xDEAD),
+        };
         match wait_alive(&mut sink) {
             Err(TransportError::AliveTimeout) => TestResult::Pass,
             _ => TestResult::Fail("wait_alive should treat non-OK as timeout"),

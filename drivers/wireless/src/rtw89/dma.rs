@@ -133,11 +133,22 @@ pub struct DmaAddrSet {
 // `pci.h:535..664`.
 
 const fn txring_ax(idx: u64, desa_l: u64, desa_h: u64, num: u64, bdram: u64) -> TxRingRegs {
-    TxRingRegs { idx, desa_l, desa_h, num, bdram }
+    TxRingRegs {
+        idx,
+        desa_l,
+        desa_h,
+        num,
+        bdram,
+    }
 }
 
 const fn rxring_ax(idx: u64, desa_l: u64, desa_h: u64, num: u64) -> RxRingRegs {
-    RxRingRegs { idx, desa_l, desa_h, num }
+    RxRingRegs {
+        idx,
+        desa_l,
+        desa_h,
+        num,
+    }
 }
 
 /// AX baseline ring addresses (`rtw89_pci_ch_dma_addr_set`,

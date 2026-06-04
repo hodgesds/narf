@@ -145,14 +145,38 @@ pub fn build_iqk_path_a_sequence(buf: &mut [IqkStep]) -> usize {
     if buf.len() < IQK_PATH_A_STEP_COUNT {
         return 0;
     }
-    buf[0] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0 };
-    buf[1] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0 };
-    buf[2] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0 };
-    buf[3] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0 };
-    buf[4] = IqkStep { reg: REG_TX_IQK,        val: 0 };
-    buf[5] = IqkStep { reg: REG_RX_IQK,        val: 0 };
-    buf[6] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
-    buf[7] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
+    buf[0] = IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[1] = IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[2] = IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0,
+    };
+    buf[3] = IqkStep {
+        reg: REG_RX_IQK_PI_A,
+        val: 0,
+    };
+    buf[4] = IqkStep {
+        reg: REG_TX_IQK,
+        val: 0,
+    };
+    buf[5] = IqkStep {
+        reg: REG_RX_IQK,
+        val: 0,
+    };
+    buf[6] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[7] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
     IQK_PATH_A_STEP_COUNT
 }
 
@@ -165,14 +189,38 @@ pub fn build_iqk_path_b_sequence(buf: &mut [IqkStep]) -> usize {
     // Path B reads/writes through path-B RF mode and PI control
     // registers, but the LOK + IQK trigger sequence has the same
     // shape as path A.
-    buf[0] = IqkStep { reg: REG_TX_IQK_TONE_A, val: 0 };
-    buf[1] = IqkStep { reg: REG_RX_IQK_TONE_A, val: 0 };
-    buf[2] = IqkStep { reg: REG_TX_IQK_PI_A,   val: 0 };
-    buf[3] = IqkStep { reg: REG_RX_IQK_PI_A,   val: 0 };
-    buf[4] = IqkStep { reg: REG_TX_IQK,        val: 0 };
-    buf[5] = IqkStep { reg: REG_RX_IQK,        val: 0 };
-    buf[6] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
-    buf[7] = IqkStep { reg: REG_IQK_AGC_PTS,   val: 0 };
+    buf[0] = IqkStep {
+        reg: REG_TX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[1] = IqkStep {
+        reg: REG_RX_IQK_TONE_A,
+        val: 0,
+    };
+    buf[2] = IqkStep {
+        reg: REG_TX_IQK_PI_A,
+        val: 0,
+    };
+    buf[3] = IqkStep {
+        reg: REG_RX_IQK_PI_A,
+        val: 0,
+    };
+    buf[4] = IqkStep {
+        reg: REG_TX_IQK,
+        val: 0,
+    };
+    buf[5] = IqkStep {
+        reg: REG_RX_IQK,
+        val: 0,
+    };
+    buf[6] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
+    buf[7] = IqkStep {
+        reg: REG_IQK_AGC_PTS,
+        val: 0,
+    };
     IQK_PATH_B_STEP_COUNT
 }
 
@@ -200,10 +248,7 @@ pub const CHANNEL_MAX: u8 = 14;
 pub fn channel_set_writes_8192e(channel: u8) -> [(u16, u32); 2] {
     use super::phy::{lssi_encode, REG_FPGA0_LSSI_A, REG_FPGA0_LSSI_B};
     let w = lssi_encode(RF_REG_CHANNEL, channel as u32);
-    [
-        (REG_FPGA0_LSSI_A, w),
-        (REG_FPGA0_LSSI_B, w),
-    ]
+    [(REG_FPGA0_LSSI_A, w), (REG_FPGA0_LSSI_B, w)]
 }
 
 /// Validate a 2.4 GHz channel number.
@@ -230,14 +275,12 @@ pub fn init_phy<W: FnMut(u16, u32)>(mut write32: W) -> usize {
 pub fn init_rf<W: FnMut(u8, u8, u32)>(mut write_rfreg: W) -> usize {
     use super::phy::RfPath;
     let mut a = 0usize;
-    a += super::phy_tables::apply_rf_table(
-        RADIO_A_INIT_TABLE,
-        |r, v| write_rfreg(RfPath::A.index(), r, v),
-    );
-    a += super::phy_tables::apply_rf_table(
-        RADIO_B_INIT_TABLE,
-        |r, v| write_rfreg(RfPath::B.index(), r, v),
-    );
+    a += super::phy_tables::apply_rf_table(RADIO_A_INIT_TABLE, |r, v| {
+        write_rfreg(RfPath::A.index(), r, v)
+    });
+    a += super::phy_tables::apply_rf_table(RADIO_B_INIT_TABLE, |r, v| {
+        write_rfreg(RfPath::B.index(), r, v)
+    });
     a
 }
 

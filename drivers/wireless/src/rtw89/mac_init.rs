@@ -49,10 +49,7 @@
 
 use narf_bus::MmioRegion;
 
-use super::mac::{
-    B_AX_FEN_BBRSTB, B_AX_FEN_BB_GLB_RSTN, R_AX_SYS_FUNC_EN,
-    MacError,
-};
+use super::mac::{MacError, B_AX_FEN_BBRSTB, B_AX_FEN_BB_GLB_RSTN, R_AX_SYS_FUNC_EN};
 
 /// `R_AX_WLRF_CTRL` — WL-RF control register. `reg.h:307`.
 pub const R_AX_WLRF_CTRL: u64 = 0x02F0;
@@ -102,9 +99,12 @@ pub const B_AX_DMAC_MIX_EN: u32 = 1 << 24;
 /// Linux sets in `chip->mac_def->dmac_func_pre_en` (`mac.c:4155`); the
 /// Stage-5 mask covers the dispatcher + DLE + TBL + MIX + top-level
 /// enables — enough for the FW downloader to push its first H2C.
-pub const DMAC_PRE_EN_MASK: u32 =
-    B_AX_DMAC_FUNC_EN | B_AX_DMAC_CRPRT | B_AX_DLE_DMAC_EN
-    | B_AX_DMAC_PKT_IN_EN | B_AX_DISPATCHER_EN | B_AX_DMAC_TBL_EN
+pub const DMAC_PRE_EN_MASK: u32 = B_AX_DMAC_FUNC_EN
+    | B_AX_DMAC_CRPRT
+    | B_AX_DLE_DMAC_EN
+    | B_AX_DMAC_PKT_IN_EN
+    | B_AX_DISPATCHER_EN
+    | B_AX_DMAC_TBL_EN
     | B_AX_DMAC_MIX_EN;
 
 /// `R_AX_CMAC_FUNC_EN` — Channel-MAC function enable. `reg.h:265`.
@@ -129,9 +129,13 @@ pub const B_AX_RMAC_EN: u32 = 1 << 24;
 
 /// Composite CMAC enable; covers TX+RX MAC plus the scheduler / PHY
 /// interface / DMA bits the firmware needs alive before sending data.
-pub const CMAC_ENABLE_MASK: u32 =
-    B_AX_CMAC_EN | B_AX_PHYINTF_EN | B_AX_CMAC_DMA_EN | B_AX_PTCLTOP_EN
-    | B_AX_SCHEDULER_EN | B_AX_TMAC_EN | B_AX_RMAC_EN;
+pub const CMAC_ENABLE_MASK: u32 = B_AX_CMAC_EN
+    | B_AX_PHYINTF_EN
+    | B_AX_CMAC_DMA_EN
+    | B_AX_PTCLTOP_EN
+    | B_AX_SCHEDULER_EN
+    | B_AX_TMAC_EN
+    | B_AX_RMAC_EN;
 
 /// DLE-quota mode hint. `enum rtw89_qta_mode` in `mac.h`. We track
 /// just the two values the FW-DL path ever uses.
@@ -204,7 +208,10 @@ pub unsafe fn enable_bb_reset(mmio: &MmioRegion) {
     // SAFETY: identity-mapped MMIO.
     unsafe {
         let cur = mmio.read16(R_AX_SYS_FUNC_EN);
-        mmio.write16(R_AX_SYS_FUNC_EN, cur | B_AX_FEN_BBRSTB | B_AX_FEN_BB_GLB_RSTN);
+        mmio.write16(
+            R_AX_SYS_FUNC_EN,
+            cur | B_AX_FEN_BBRSTB | B_AX_FEN_BB_GLB_RSTN,
+        );
     }
 }
 

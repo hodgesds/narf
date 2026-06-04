@@ -209,10 +209,7 @@ pub fn register_pci_driver() {
 
 /// Probe entry — called by `narf-bus::driver_match` when a Broadcom
 /// vendor/device pair we registered for surfaces.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -271,10 +268,8 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<BrcmfmacDevice, ProbeError>
     // sequence Linux runs at `brcmf_pcie_release_*`.
     // SAFETY: BAR0 mapped + 32-bit aligned offsets.
     unsafe {
-        let mailboxint_off =
-            BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_MAILBOXINT;
-        let mailboxmask_off =
-            BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_MAILBOXMASK;
+        let mailboxint_off = BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_MAILBOXINT;
+        let mailboxmask_off = BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_MAILBOXMASK;
         // RW1C — write a sticky-clear pattern of all-1s.
         mmio_bar0.write32(mailboxint_off, 0xFFFF_FFFF);
         // Mask everything until the data-path follow-up lights the

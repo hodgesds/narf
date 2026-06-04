@@ -61,10 +61,8 @@ pub trait EventSink {
     /// Block waiting for the next event matching `pred`. Returns the
     /// matching event, or `ConnectError::EventTimeout` on the
     /// transport's per-call timeout.
-    fn next_matching(
-        &mut self,
-        pred: &dyn Fn(&EventMsg) -> bool,
-    ) -> Result<EventMsg, ConnectError>;
+    fn next_matching(&mut self, pred: &dyn Fn(&EventMsg) -> bool)
+        -> Result<EventMsg, ConnectError>;
 }
 
 // ── ConnectError ──────────────────────────────────────────────────

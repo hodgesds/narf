@@ -42,8 +42,7 @@ pub fn peek_descriptor(ring: &RxRing, slot: u16) -> Option<RxDesc> {
     let mut desc = RxDesc::default();
     unsafe {
         for i in 0..desc.dwords.len() {
-            desc.dwords[i] =
-                core::ptr::read_volatile(base.add(offset + i * 4).cast::<u32>());
+            desc.dwords[i] = core::ptr::read_volatile(base.add(offset + i * 4).cast::<u32>());
         }
     }
     if desc.is_hw_owned() {
@@ -76,10 +75,7 @@ pub fn drain<F: FnMut(&[u8])>(ring: &RxRing, max: u16, mut sink: F) -> u16 {
             let len = desc.pkt_len().min(2048) as usize;
             // SAFETY: DMA-coherent backing; offset bounded.
             unsafe {
-                let payload = core::slice::from_raw_parts(
-                    base.add(next as usize * 2048),
-                    len,
-                );
+                let payload = core::slice::from_raw_parts(base.add(next as usize * 2048), len);
                 sink(payload);
             }
         }

@@ -102,7 +102,12 @@ fn smoke_e2e_mt7921_wfdma0_nine_ring_allocation() -> TestResult {
     }
     // tx_fwdl + tx_mcu + rx_data + rx_mcu_evt = 4 more rings, total 9.
     // Touch each so its Drop is exercised and the struct lays out.
-    let _ = (&rings.tx_fwdl, &rings.tx_mcu, &rings.rx_data, &rings.rx_mcu_evt);
+    let _ = (
+        &rings.tx_fwdl,
+        &rings.tx_mcu,
+        &rings.rx_data,
+        &rings.rx_mcu_evt,
+    );
     TestResult::Pass
 }
 kernel_test_in!(
@@ -289,14 +294,15 @@ fn smoke_e2e_mt7921_open_auth_frame_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/e2e", smoke_e2e_mt7921_open_auth_frame_layout);
+kernel_test_in!(
+    "drivers/wireless/e2e",
+    smoke_e2e_mt7921_open_auth_frame_layout
+);
 
 // ── Smoke 8 — Association Request frame carries SSID IE ─────────────
 
 fn smoke_e2e_mt7921_assoc_req_frame_carries_ssid_ie() -> TestResult {
-    use crate::mt7921::cmd::{
-        encode_assoc_req_frame, FC_MGMT_ASSOC_REQ, IEEE80211_MAC_HDR_SIZE,
-    };
+    use crate::mt7921::cmd::{encode_assoc_req_frame, FC_MGMT_ASSOC_REQ, IEEE80211_MAC_HDR_SIZE};
     let sta = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
     let bssid = [0x42u8; 6];
     let ssid = b"NARF-TEST";
@@ -347,8 +353,7 @@ kernel_test_in!(
 fn smoke_e2e_wpa2_4way_handshake_m1_to_m2() -> TestResult {
     use crate::iwlwifi::wpa::{derive_ptk_sha1, HmacSha1};
     use narf_wireless::eapol::{
-        FourWayState, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_KEY_ACK,
-        KI_KEY_TYPE_PAIRWISE,
+        FourWayState, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_KEY_ACK, KI_KEY_TYPE_PAIRWISE,
     };
 
     // AP BSSID + STA MAC. Conform to RFC 4493 byte ordering — APs use
@@ -429,9 +434,9 @@ fn smoke_e2e_iwlwifi_probe_and_mac_context_cmd() -> TestResult {
     let regs = registered_pci_drivers();
     // AX201 SKU 8086:24FD per Linux iwl_dev_info_table — not all
     // SKUs are registered here, so accept any Intel WiFi match.
-    let intel_match = regs
-        .iter()
-        .any(|m| matches!(m.kind, MatchKind::VendorDevice { vendor, .. } if vendor == INTEL_VENDOR));
+    let intel_match = regs.iter().any(
+        |m| matches!(m.kind, MatchKind::VendorDevice { vendor, .. } if vendor == INTEL_VENDOR),
+    );
     if !intel_match {
         return TestResult::Fail("iwlwifi: no Intel VID PCI match registered");
     }
@@ -464,8 +469,8 @@ kernel_test_in!(
 // ── Smoke 11 — rtw88 probe match + name resolution for 8822CE ───────
 
 fn smoke_e2e_rtw88_probe_match_for_8822ce() -> TestResult {
-    use crate::rtw88::{name_for, register_pci_driver, RTL_DEV_8822CE};
     use crate::rtw88::regs::REALTEK_VENDOR;
+    use crate::rtw88::{name_for, register_pci_driver, RTL_DEV_8822CE};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
 
@@ -574,7 +579,9 @@ fn smoke_e2e_ath11k_probe_and_vdev_create_encode() -> TestResult {
     // Build a WMI_VDEV_CREATE_CMDID frame and verify the MAC + vdev_id
     // round-trip into the TLV body.
     let vdev_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let frame = build_vdev_create(0, /* vdev_type = STA */ 1, vdev_mac, /* pdev = 1 */ 1);
+    let frame = build_vdev_create(
+        0, /* vdev_type = STA */ 1, vdev_mac, /* pdev = 1 */ 1,
+    );
     if frame.is_empty() {
         return TestResult::Fail("VDEV_CREATE frame empty");
     }

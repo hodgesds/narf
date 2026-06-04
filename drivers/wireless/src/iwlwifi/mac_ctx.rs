@@ -128,11 +128,23 @@ pub struct AcQos {
 impl AcQos {
     /// Default EDCA parameters for best-effort (AC_BE).
     pub const fn best_effort() -> Self {
-        Self { cw_min: 15, cw_max: 63, aifsn: 3, fifos_mask: 0, edca_txop: 0 }
+        Self {
+            cw_min: 15,
+            cw_max: 63,
+            aifsn: 3,
+            fifos_mask: 0,
+            edca_txop: 0,
+        }
     }
     /// Management queue defaults.
     pub const fn management() -> Self {
-        Self { cw_min: 15, cw_max: 63, aifsn: 2, fifos_mask: 0, edca_txop: 0 }
+        Self {
+            cw_min: 15,
+            cw_max: 63,
+            aifsn: 2,
+            fifos_mask: 0,
+            edca_txop: 0,
+        }
     }
 }
 
@@ -234,7 +246,11 @@ pub fn build_mac_context_cmd(
     // ac[5] — 5 × AcQos structs
     let default_ac = AcQos::best_effort();
     for i in 0..AC_COUNT {
-        let ac = if i == 4 { AcQos::management() } else { default_ac };
+        let ac = if i == 4 {
+            AcQos::management()
+        } else {
+            default_ac
+        };
         out.extend_from_slice(&ac.cw_min.to_le_bytes());
         out.extend_from_slice(&ac.cw_max.to_le_bytes());
         out.push(ac.aifsn);
@@ -346,11 +362,7 @@ use super::tx::{tx_doorbell, Tfd, TxQueue};
 /// the TFD with a fake phys address sourced from the slice pointer
 /// (which is NOT DMA-safe on real HW; replace with a coherent
 /// allocation before running on silicon).
-pub fn cmd_queue_send<M: IwlMmio>(
-    mmio: &mut M,
-    tx_q: &mut TxQueue,
-    cmd_bytes: &[u8],
-) {
+pub fn cmd_queue_send<M: IwlMmio>(mmio: &mut M, tx_q: &mut TxQueue, cmd_bytes: &[u8]) {
     let mut tfd = Tfd::default();
     // In the real path: dma_copy = alloc_coherent(cmd_bytes.len()),
     // copy_nonoverlapping, tfd.push_seg(dma_phys, len).

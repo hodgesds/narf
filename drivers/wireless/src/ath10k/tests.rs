@@ -16,26 +16,24 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use core::convert::TryInto;
 
 use super::ce::{
-    self, validate, Ath10kMmio, CeDesc, CeDesc64, PipeDefault, RingConfig,
-    DEFAULT_PIPE_CONFIG,
+    self, validate, Ath10kMmio, CeDesc, CeDesc64, PipeDefault, RingConfig, DEFAULT_PIPE_CONFIG,
 };
 use super::htc::{
     build_connect_service, build_setup_complete, decode_htc_hdr, encode_htc_hdr,
-    parse_connect_service_response, run_handshake, svc, ConnectStatus,
-    ConnectServiceResponse, HandshakeError, HtcHdr, MessageId, SVC_ID_HTT_DATA_MSG,
-    SVC_ID_WMI_CONTROL,
-};
-use super::hw::*;
-use super::hw::ce_off;
-use super::pci::{name_for, register_pci_driver};
-use super::wmi::{
-    build_pdev_set_param, build_vdev_create, build_vdev_set_param,
-    decode_event, decode_wmi_hdr, encode_wmi_hdr, vdev_param,
-    EventFrame, VdevSubtype, VdevType, WmiCmdHdr, WmiCmdId, WmiError, WmiEventId,
+    parse_connect_service_response, run_handshake, svc, ConnectServiceResponse, ConnectStatus,
+    HandshakeError, HtcHdr, MessageId, SVC_ID_HTT_DATA_MSG, SVC_ID_WMI_CONTROL,
 };
 use super::htt::{
-    build_rx_ring_setup, decode_rx_indication, encode_rx_ring_cfg,
-    h2t_msg_type, HTT_RX_RING_FILL_LEVEL, HTT_RX_RING_SIZE,
+    build_rx_ring_setup, decode_rx_indication, encode_rx_ring_cfg, h2t_msg_type,
+    HTT_RX_RING_FILL_LEVEL, HTT_RX_RING_SIZE,
+};
+use super::hw::ce_off;
+use super::hw::*;
+use super::pci::{name_for, register_pci_driver};
+use super::wmi::{
+    build_pdev_set_param, build_vdev_create, build_vdev_set_param, decode_event, decode_wmi_hdr,
+    encode_wmi_hdr, vdev_param, EventFrame, VdevSubtype, VdevType, WmiCmdHdr, WmiCmdId, WmiError,
+    WmiEventId,
 };
 use alloc::vec;
 
@@ -113,7 +111,10 @@ fn smoke_ath10k_hw_rev_from_pci_id_coverage() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath10k", smoke_ath10k_hw_rev_from_pci_id_coverage);
+kernel_test_in!(
+    "drivers/wireless/ath10k",
+    smoke_ath10k_hw_rev_from_pci_id_coverage
+);
 
 fn smoke_ath10k_chip_id_rev_extraction() -> TestResult {
     // `(rev << 8) | misc bits`. Linux docs: rev = (raw >> 8) & 0xF.
@@ -127,7 +128,10 @@ fn smoke_ath10k_chip_id_rev_extraction() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/wireless/ath10k", smoke_ath10k_chip_id_rev_extraction);
+kernel_test_in!(
+    "drivers/wireless/ath10k",
+    smoke_ath10k_chip_id_rev_extraction
+);
 
 fn smoke_ath10k_per_chip_chip_id_addr_distinct() -> TestResult {
     // QCA6174 uses 0xF0; the rest use 0xEC.
@@ -182,10 +186,7 @@ fn smoke_ath10k_probe_bound_or_skip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/ath10k",
-    smoke_ath10k_probe_bound_or_skip
-);
+kernel_test_in!("drivers/wireless/ath10k", smoke_ath10k_probe_bound_or_skip);
 
 // ── Stage 1: Copy Engine ring + descriptor ─────────────────────────
 
@@ -423,7 +424,12 @@ fn smoke_ath10k_default_pipe_config_shape() -> TestResult {
         }
     }
     // Silence unused-warning for PipeDefault import.
-    let _ = PipeDefault { pipe: 9, is_src: false, nentries: 1, service: "" };
+    let _ = PipeDefault {
+        pipe: 9,
+        is_src: false,
+        nentries: 1,
+        service: "",
+    };
     TestResult::Pass
 }
 kernel_test_in!(
@@ -786,14 +792,14 @@ fn smoke_ath10k_htt_rx_indication_decode() -> TestResult {
     // Total = 8 + 44 + 4 + 4 = 60 bytes.
     let mut msg = vec![0u8; 60];
     msg[0] = super::htt::t2h_msg_type::RX_IND; // msg_type = 1
-    // peer_id at bytes 2..4 = 42.
+                                               // peer_id at bytes 2..4 = 42.
     msg[2..4].copy_from_slice(&42u16.to_le_bytes());
     // PPDU block occupies bytes 8..52 — leave zeroed.
     // fw_rx_desc_bytes at bytes 52..54 = 0 (no per-frame desc).
     msg[52] = 0;
     msg[53] = 0;
     // mpdu_range at bytes 56..60: count=3, status=OK=1, pad.
-    msg[56] = 3;  // mpdu_count
+    msg[56] = 3; // mpdu_count
     msg[57] = mpdu_status::OK; // mpdu_range_status
     let ind = match decode_rx_indication(&msg) {
         Some(i) => i,

@@ -274,14 +274,22 @@ pub fn make_joininfo_h2c(seq: u8) -> H2cBuilder {
 /// `H2C_CL_OUTSRC_RA`, function `H2C_FUNC_OUTSRC_RA_MACIDCFG`. Sent
 /// after JOININFO during association.
 pub fn make_ra_macidcfg_h2c(seq: u8) -> H2cBuilder {
-    H2cBuilder::new(H2C_CAT_OUTSRC, H2C_CL_OUTSRC_RA, H2C_FUNC_OUTSRC_RA_MACIDCFG)
-        .with_seq(seq)
+    H2cBuilder::new(
+        H2C_CAT_OUTSRC,
+        H2C_CL_OUTSRC_RA,
+        H2C_FUNC_OUTSRC_RA_MACIDCFG,
+    )
+    .with_seq(seq)
 }
 
 /// `SCANOFLD` H2C — scan-offload start/stop. Class `H2C_CL_MAC_FW_OFLD`,
 /// function `H2C_FUNC_SCANOFLD` for AX or `H2C_FUNC_SCANOFLD_BE` for BE.
 pub fn make_scanofld_h2c(seq: u8, is_be: bool) -> H2cBuilder {
-    let func = if is_be { H2C_FUNC_SCANOFLD_BE } else { H2C_FUNC_SCANOFLD };
+    let func = if is_be {
+        H2C_FUNC_SCANOFLD_BE
+    } else {
+        H2C_FUNC_SCANOFLD
+    };
     H2cBuilder::new(H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, func).with_seq(seq)
 }
 

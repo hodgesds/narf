@@ -83,7 +83,11 @@ impl CeDesc {
     /// is responsible for `core::ptr::write_volatile`-ing it into
     /// the CE-owned ring memory.
     pub const fn new(addr: u32, nbytes: u16, flags: u16) -> Self {
-        Self { addr, nbytes, flags }
+        Self {
+            addr,
+            nbytes,
+            flags,
+        }
     }
 
     /// `true` iff the `GATHER` bit is set, meaning more descriptors
@@ -291,10 +295,40 @@ pub struct PipeDefault {
 /// HTT). The pure-data table lets Stage 1 unit-test the
 /// "build N ring configs" path without touching MMIO.
 pub const DEFAULT_PIPE_CONFIG: &[PipeDefault] = &[
-    PipeDefault { pipe: 0, is_src: true,  nentries: 16,  service: "htc-ctrl-tx" },
-    PipeDefault { pipe: 1, is_src: false, nentries: 16,  service: "htc-ctrl-rx" },
-    PipeDefault { pipe: 2, is_src: false, nentries: 32,  service: "wmi-events"  },
-    PipeDefault { pipe: 3, is_src: true,  nentries: 32,  service: "wmi-cmds"    },
-    PipeDefault { pipe: 4, is_src: true,  nentries: 256, service: "htt-tx"      },
-    PipeDefault { pipe: 5, is_src: false, nentries: 512, service: "htt-rx"      },
+    PipeDefault {
+        pipe: 0,
+        is_src: true,
+        nentries: 16,
+        service: "htc-ctrl-tx",
+    },
+    PipeDefault {
+        pipe: 1,
+        is_src: false,
+        nentries: 16,
+        service: "htc-ctrl-rx",
+    },
+    PipeDefault {
+        pipe: 2,
+        is_src: false,
+        nentries: 32,
+        service: "wmi-events",
+    },
+    PipeDefault {
+        pipe: 3,
+        is_src: true,
+        nentries: 32,
+        service: "wmi-cmds",
+    },
+    PipeDefault {
+        pipe: 4,
+        is_src: true,
+        nentries: 256,
+        service: "htt-tx",
+    },
+    PipeDefault {
+        pipe: 5,
+        is_src: false,
+        nentries: 512,
+        service: "htt-rx",
+    },
 ];

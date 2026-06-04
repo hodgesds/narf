@@ -93,7 +93,6 @@ pub fn build_region_cmd(seq: u8, xact_id: u16, if_idx: u8, code: &[u8; 2]) -> Op
     Some(build_set_request(seq, xact_id, if_idx, VAR_COUNTRY, &value))
 }
 
-
 /// Build the IOCTL payload for an IOVAR access.
 ///
 /// Layout:
@@ -114,13 +113,7 @@ pub fn build_payload(name: &str, value: &[u8]) -> Vec<u8> {
 }
 
 /// Compose a complete IOVAR SET request frame.
-pub fn build_set_request(
-    seq: u8,
-    xact_id: u16,
-    if_idx: u8,
-    name: &str,
-    value: &[u8],
-) -> Vec<u8> {
+pub fn build_set_request(seq: u8, xact_id: u16, if_idx: u8, name: &str, value: &[u8]) -> Vec<u8> {
     let payload = build_payload(name, value);
     build_request(seq, xact_id, if_idx, Direction::Set, WLC_SET_VAR, &payload)
 }
@@ -128,13 +121,7 @@ pub fn build_set_request(
 /// Compose a complete IOVAR GET request frame. `out_len` is the
 /// number of bytes the host has reserved in the buffer for the
 /// chip's response value (the chip writes its response in-place).
-pub fn build_get_request(
-    seq: u8,
-    xact_id: u16,
-    if_idx: u8,
-    name: &str,
-    out_len: usize,
-) -> Vec<u8> {
+pub fn build_get_request(seq: u8, xact_id: u16, if_idx: u8, name: &str, out_len: usize) -> Vec<u8> {
     let zero = alloc::vec![0u8; out_len];
     let payload = build_payload(name, &zero);
     build_request(seq, xact_id, if_idx, Direction::Get, WLC_GET_VAR, &payload)

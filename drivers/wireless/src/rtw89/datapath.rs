@@ -30,7 +30,7 @@ use narf_bus::MmioRegion;
 
 use super::dma::{addr_set_for_chip, RingState, RxRingRegs, TxRingRegs, RING_IDX_HOST_SHIFT};
 use super::mac::ChipId;
-use super::txrx::{decode_rxd, encode_txwd, RxdInfo, TxwdInfo, TXWD_BODY_SIZE, RXD_SHORT_SIZE};
+use super::txrx::{decode_rxd, encode_txwd, RxdInfo, TxwdInfo, RXD_SHORT_SIZE, TXWD_BODY_SIZE};
 
 // ── TX submit ───────────────────────────────────────────────────────
 
@@ -85,7 +85,9 @@ pub unsafe fn ring_doorbell_tx(mmio: &MmioRegion, regs: &TxRingRegs, new_wp: u16
     // in bits[31:16].
     let new = (cur & 0x0000_FFFF) | ((new_wp as u32) << RING_IDX_HOST_SHIFT);
     // SAFETY: same.
-    unsafe { mmio.write32(regs.idx, new); }
+    unsafe {
+        mmio.write32(regs.idx, new);
+    }
 }
 
 /// Read the current ring index back to update the host's `RingState`.
@@ -108,7 +110,9 @@ pub unsafe fn ring_doorbell_rx(mmio: &MmioRegion, regs: &RxRingRegs, new_wp: u16
     let cur = unsafe { mmio.read32(regs.idx) };
     let new = (cur & 0x0000_FFFF) | ((new_wp as u32) << RING_IDX_HOST_SHIFT);
     // SAFETY: same.
-    unsafe { mmio.write32(regs.idx, new); }
+    unsafe {
+        mmio.write32(regs.idx, new);
+    }
 }
 
 /// Read the RX ring index.

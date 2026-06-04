@@ -301,7 +301,10 @@ pub mod tests {
         if !matches!(SwHeader::decode(&[0u8; 4]), Err(FramingError::ShortHeader)) {
             return TestResult::Fail("SW decode should reject short slice");
         }
-        if !matches!(BcdcHeader::decode(&[0u8; 8]), Err(FramingError::ShortHeader)) {
+        if !matches!(
+            BcdcHeader::decode(&[0u8; 8]),
+            Err(FramingError::ShortHeader)
+        ) {
             return TestResult::Fail("BCDC decode should reject short slice");
         }
         TestResult::Pass

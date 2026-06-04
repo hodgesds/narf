@@ -471,8 +471,7 @@ pub fn encode_ieee80211_mgmt_hdr(
 /// Payload after the MAC header: `{ algo: u16 LE = 0 (Open),
 /// seq: u16 LE = 1, status: u16 LE = 0 }` — 6 bytes.
 pub const IEEE80211_AUTH_PAYLOAD_SIZE: usize = 6;
-pub const IEEE80211_AUTH_FRAME_SIZE: usize =
-    IEEE80211_MAC_HDR_SIZE + IEEE80211_AUTH_PAYLOAD_SIZE;
+pub const IEEE80211_AUTH_FRAME_SIZE: usize = IEEE80211_MAC_HDR_SIZE + IEEE80211_AUTH_PAYLOAD_SIZE;
 
 pub fn encode_open_auth_frame(
     sta: [u8; MAC_ADDR_LEN],
@@ -643,10 +642,7 @@ pub fn build_default_channel_switch_vec() -> Vec<u8> {
     v
 }
 
-pub fn build_default_open_auth_vec(
-    sta: [u8; MAC_ADDR_LEN],
-    bssid: [u8; MAC_ADDR_LEN],
-) -> Vec<u8> {
+pub fn build_default_open_auth_vec(sta: [u8; MAC_ADDR_LEN], bssid: [u8; MAC_ADDR_LEN]) -> Vec<u8> {
     let mut v = alloc::vec![0u8; IEEE80211_AUTH_FRAME_SIZE];
     let _ = encode_open_auth_frame(sta, bssid, &mut v);
     v

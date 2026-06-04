@@ -192,29 +192,29 @@ impl AddStaParams {
     /// ```
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(48);
-        out.push(self.mode as u8);          // add_modify
-        out.push(0u8);                       // awake_acs
+        out.push(self.mode as u8); // add_modify
+        out.push(0u8); // awake_acs
         out.extend_from_slice(&0u16.to_le_bytes()); // tid_disable_tx
         out.extend_from_slice(&self.mac_id_n_color.to_le_bytes());
         out.extend_from_slice(&self.addr);
         out.extend_from_slice(&0u16.to_le_bytes()); // reserved2
         out.push(self.sta_id);
-        out.push(0u8);                       // modify_mask
+        out.push(0u8); // modify_mask
         out.extend_from_slice(&0u16.to_le_bytes()); // reserved3
         out.extend_from_slice(&self.station_flags.to_le_bytes());
         out.extend_from_slice(&self.station_flags_msk.to_le_bytes());
-        out.push(0u8);                       // add_immediate_ba_tid
-        out.push(0u8);                       // remove_immediate_ba_tid
+        out.push(0u8); // add_immediate_ba_tid
+        out.push(0u8); // remove_immediate_ba_tid
         out.extend_from_slice(&0u16.to_le_bytes()); // add_immediate_ba_ssn
         out.extend_from_slice(&0u16.to_le_bytes()); // sleep_tx_count
-        out.push(0u8);                       // sleep_state_flags
+        out.push(0u8); // sleep_state_flags
         out.push(self.station_type as u8);
         out.extend_from_slice(&self.assoc_id.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // beamform_flags
         out.extend_from_slice(&self.tfd_queue_msk.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // rx_ba_window
-        out.push(0u8);                       // sp_length
-        out.push(0u8);                       // uapsd_acs
+        out.push(0u8); // sp_length
+        out.push(0u8); // uapsd_acs
         out
     }
 }

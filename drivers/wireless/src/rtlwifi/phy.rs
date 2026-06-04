@@ -88,10 +88,7 @@ pub unsafe fn open_bb_for_table_load(mmio: &MmioRegion) -> Result<(), PhyError> 
     // SAFETY: caller-asserted.
     unsafe {
         let regval = mmio.read16(REG_SYS_FUNC_EN);
-        mmio.write16(
-            REG_SYS_FUNC_EN,
-            regval | (1 << 13) | (1 << 0) | (1 << 1),
-        );
+        mmio.write16(REG_SYS_FUNC_EN, regval | (1 << 13) | (1 << 0) | (1 << 1));
 
         mmio.write8(REG_RF_CTRL, RF_EN | RF_RSTB | RF_SDMRSTB);
         mmio.write8(REG_SYS_FUNC_EN, BB_RST_VALUE);
@@ -162,15 +159,11 @@ pub const BB_ADDR_LDELAY: u32 = 0xFFE;
 pub unsafe fn write_bb_table(mmio: &MmioRegion, table: &[BbRow]) {
     for row in table {
         if row.addr == BB_ADDR_DELAY {
-            narf_time::busy_wait_cycles(
-                50 * 1_000 * narf_time::cycles_per_ns().max(1) as u64,
-            );
+            narf_time::busy_wait_cycles(50 * 1_000 * narf_time::cycles_per_ns().max(1) as u64);
             continue;
         }
         if row.addr == BB_ADDR_LDELAY {
-            narf_time::busy_wait_cycles(
-                50 * 1_000_000 * narf_time::cycles_per_ns().max(1) as u64,
-            );
+            narf_time::busy_wait_cycles(50 * 1_000_000 * narf_time::cycles_per_ns().max(1) as u64);
             continue;
         }
         // SAFETY: caller-asserted in-range.

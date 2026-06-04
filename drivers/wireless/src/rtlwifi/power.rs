@@ -271,7 +271,16 @@ const fn pci_p(offset: u16, msk: u8, value: u8) -> WlanPwrCfg {
 /// End-of-table sentinel (matches Linux `RTL8XXX_TRANS_END`).
 #[inline]
 const fn pci_end() -> WlanPwrCfg {
-    WlanPwrCfg::new(0xFFFF, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK, PWR_INTF_ALL_MSK, 0, PWR_CMD_END, 0, 0)
+    WlanPwrCfg::new(
+        0xFFFF,
+        PWR_CUT_ALL_MSK,
+        PWR_FAB_ALL_MSK,
+        PWR_INTF_ALL_MSK,
+        0,
+        PWR_CMD_END,
+        0,
+        0,
+    )
 }
 
 /// RTL8192EE Cardemu→Active power-on flow.
@@ -393,5 +402,13 @@ pub unsafe fn power_on(mmio: &MmioRegion, did: u16) -> Result<(), PwrSeqError> {
     // tables is `PWR_CUT_ALL_MSK | PWR_FAB_ALL_MSK` so the broad mask
     // matches them all.
     // SAFETY: forwarded.
-    unsafe { run_pwrseq(mmio, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK, table) }
+    unsafe {
+        run_pwrseq(
+            mmio,
+            PWR_CUT_ALL_MSK,
+            PWR_FAB_ALL_MSK,
+            PWR_INTF_PCI_MSK,
+            table,
+        )
+    }
 }

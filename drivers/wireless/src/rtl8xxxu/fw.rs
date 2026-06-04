@@ -99,7 +99,10 @@ impl FwLayout {
     pub fn from_blob_len(len: usize) -> Self {
         use super::regs::RTL_FW_PAGE_SIZE;
         let page_count = ((len + RTL_FW_PAGE_SIZE - 1) / RTL_FW_PAGE_SIZE) as u8;
-        Self { page_count, total_bytes: len }
+        Self {
+            page_count,
+            total_bytes: len,
+        }
     }
 
     /// Skip the firmware header (first 32 bytes for the canonical Realtek
@@ -108,12 +111,20 @@ impl FwLayout {
     /// Source: `rtl8xxxu_firmware_header` in `rtl8xxxu.h` is 32 bytes.
     pub fn strip_header(blob: &[u8]) -> &[u8] {
         const HDR: usize = 32;
-        if blob.len() <= HDR { &[] } else { &blob[HDR..] }
+        if blob.len() <= HDR {
+            &[]
+        } else {
+            &blob[HDR..]
+        }
     }
 
     /// Iterator over 4 KiB firmware pages.
     pub fn pages<'a>(&self, blob: &'a [u8]) -> FwPageIter<'a> {
-        FwPageIter { blob, pos: 0, page_idx: 0 }
+        FwPageIter {
+            blob,
+            pos: 0,
+            page_idx: 0,
+        }
     }
 }
 
@@ -148,61 +159,131 @@ impl<'a> Iterator for FwPageIter<'a> {
 /// `core.c::rtl8xxxu_start_firmware` L1925..L2003.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FwDlStep {
-    Read8 { addr: u16 },
-    Read16 { addr: u16 },
-    Read32 { addr: u16 },
-    Write8 { addr: u16, val: u8 },
-    Write16 { addr: u16, val: u16 },
-    Write32 { addr: u16, val: u32 },
+    Read8 {
+        addr: u16,
+    },
+    Read16 {
+        addr: u16,
+    },
+    Read32 {
+        addr: u16,
+    },
+    Write8 {
+        addr: u16,
+        val: u8,
+    },
+    Write16 {
+        addr: u16,
+        val: u16,
+    },
+    Write32 {
+        addr: u16,
+        val: u32,
+    },
     /// Read-modify-write 8-bit: `(cur & keep) | set`.
-    Write8RMW { addr: u16, keep: u8, set: u8 },
+    Write8RMW {
+        addr: u16,
+        keep: u8,
+        set: u8,
+    },
     /// Bulk-OUT page transfer: `len` bytes starting at `REG_FW_START_ADDRESS`.
-    PageOut { page_idx: u8, len: usize },
+    PageOut {
+        page_idx: u8,
+        len: usize,
+    },
     /// Poll until `(cur & mask) == match_val` or `max` iterations elapse.
-    Poll32 { addr: u16, mask: u32, match_val: u32, max: usize },
+    Poll32 {
+        addr: u16,
+        mask: u32,
+        match_val: u32,
+        max: usize,
+    },
 }
 
 /// Build the deterministic FW-download plan for non-RTL8710B / non-RTL8192F
 /// targets.
 pub fn fw_download_plan(fw_payload: &[u8]) -> alloc::vec::Vec<FwDlStep> {
     use super::regs::{
-        FW_POLL_MAX, MCU_FW_DL_CSUM_REPORT, MCU_FW_DL_ENABLE, MCU_FW_DL_READY,
-        MCU_WINT_INIT_READY, REG_HMTFR, REG_MCU_FW_DL, REG_SYS_FUNC,
-        RTL_FW_PAGE_SIZE, SYS_FUNC_CPU_ENABLE,
+        FW_POLL_MAX, MCU_FW_DL_CSUM_REPORT, MCU_FW_DL_ENABLE, MCU_FW_DL_READY, MCU_WINT_INIT_READY,
+        REG_HMTFR, REG_MCU_FW_DL, REG_SYS_FUNC, RTL_FW_PAGE_SIZE, SYS_FUNC_CPU_ENABLE,
     };
     use alloc::vec::Vec;
     let mut plan: Vec<FwDlStep> = Vec::with_capacity(32);
 
     // SYS_FUNC byte 1 |= 4 — enables 8051.
-    plan.push(FwDlStep::Write8RMW { addr: REG_SYS_FUNC + 1, keep: 0xFF, set: 0x04 });
+    plan.push(FwDlStep::Write8RMW {
+        addr: REG_SYS_FUNC + 1,
+        keep: 0xFF,
+        set: 0x04,
+    });
     // SYS_FUNC |= CPU_ENABLE.
     plan.push(FwDlStep::Read16 { addr: REG_SYS_FUNC });
-    plan.push(FwDlStep::Write16 { addr: REG_SYS_FUNC, val: SYS_FUNC_CPU_ENABLE });
+    plan.push(FwDlStep::Write16 {
+        addr: REG_SYS_FUNC,
+        val: SYS_FUNC_CPU_ENABLE,
+    });
     // If FW already loaded, hard-reset.
-    plan.push(FwDlStep::Read8 { addr: REG_MCU_FW_DL });
-    plan.push(FwDlStep::Write8 { addr: REG_MCU_FW_DL, val: 0x00 });
+    plan.push(FwDlStep::Read8 {
+        addr: REG_MCU_FW_DL,
+    });
+    plan.push(FwDlStep::Write8 {
+        addr: REG_MCU_FW_DL,
+        val: 0x00,
+    });
     // Enable FW download.
-    plan.push(FwDlStep::Write8RMW { addr: REG_MCU_FW_DL, keep: 0xFF, set: MCU_FW_DL_ENABLE });
+    plan.push(FwDlStep::Write8RMW {
+        addr: REG_MCU_FW_DL,
+        keep: 0xFF,
+        set: MCU_FW_DL_ENABLE,
+    });
     // 8051 reset — clear bit 19.
-    plan.push(FwDlStep::Read32 { addr: REG_MCU_FW_DL });
-    plan.push(FwDlStep::Write32 { addr: REG_MCU_FW_DL, val: 0 });
+    plan.push(FwDlStep::Read32 {
+        addr: REG_MCU_FW_DL,
+    });
+    plan.push(FwDlStep::Write32 {
+        addr: REG_MCU_FW_DL,
+        val: 0,
+    });
     // Reset CSUM report.
-    plan.push(FwDlStep::Write8RMW { addr: REG_MCU_FW_DL, keep: 0xFF, set: MCU_FW_DL_CSUM_REPORT });
+    plan.push(FwDlStep::Write8RMW {
+        addr: REG_MCU_FW_DL,
+        keep: 0xFF,
+        set: MCU_FW_DL_CSUM_REPORT,
+    });
 
     let pages = fw_payload.len() / RTL_FW_PAGE_SIZE;
     let remainder = fw_payload.len() % RTL_FW_PAGE_SIZE;
     for i in 0..pages {
-        plan.push(FwDlStep::Write8RMW { addr: REG_MCU_FW_DL + 2, keep: 0xF8, set: i as u8 });
-        plan.push(FwDlStep::PageOut { page_idx: i as u8, len: RTL_FW_PAGE_SIZE });
+        plan.push(FwDlStep::Write8RMW {
+            addr: REG_MCU_FW_DL + 2,
+            keep: 0xF8,
+            set: i as u8,
+        });
+        plan.push(FwDlStep::PageOut {
+            page_idx: i as u8,
+            len: RTL_FW_PAGE_SIZE,
+        });
     }
     if remainder != 0 {
-        plan.push(FwDlStep::Write8RMW { addr: REG_MCU_FW_DL + 2, keep: 0xF8, set: pages as u8 });
-        plan.push(FwDlStep::PageOut { page_idx: pages as u8, len: remainder });
+        plan.push(FwDlStep::Write8RMW {
+            addr: REG_MCU_FW_DL + 2,
+            keep: 0xF8,
+            set: pages as u8,
+        });
+        plan.push(FwDlStep::PageOut {
+            page_idx: pages as u8,
+            len: remainder,
+        });
     }
 
     // Disable FW download.
-    plan.push(FwDlStep::Read16 { addr: REG_MCU_FW_DL });
-    plan.push(FwDlStep::Write16 { addr: REG_MCU_FW_DL, val: 0 });
+    plan.push(FwDlStep::Read16 {
+        addr: REG_MCU_FW_DL,
+    });
+    plan.push(FwDlStep::Write16 {
+        addr: REG_MCU_FW_DL,
+        val: 0,
+    });
 
     // Poll for CSUM report.
     plan.push(FwDlStep::Poll32 {
@@ -212,11 +293,20 @@ pub fn fw_download_plan(fw_payload: &[u8]) -> alloc::vec::Vec<FwDlStep> {
         max: FW_POLL_MAX,
     });
     // Mark FW ready.
-    plan.push(FwDlStep::Write32 { addr: REG_MCU_FW_DL, val: MCU_FW_DL_READY as u32 });
+    plan.push(FwDlStep::Write32 {
+        addr: REG_MCU_FW_DL,
+        val: MCU_FW_DL_READY as u32,
+    });
     // 8051 reset.
     plan.push(FwDlStep::Read16 { addr: REG_SYS_FUNC });
-    plan.push(FwDlStep::Write16 { addr: REG_SYS_FUNC, val: 0 });
-    plan.push(FwDlStep::Write16 { addr: REG_SYS_FUNC, val: SYS_FUNC_CPU_ENABLE });
+    plan.push(FwDlStep::Write16 {
+        addr: REG_SYS_FUNC,
+        val: 0,
+    });
+    plan.push(FwDlStep::Write16 {
+        addr: REG_SYS_FUNC,
+        val: SYS_FUNC_CPU_ENABLE,
+    });
     // Wait FW ready.
     plan.push(FwDlStep::Poll32 {
         addr: REG_MCU_FW_DL,
@@ -225,7 +315,10 @@ pub fn fw_download_plan(fw_payload: &[u8]) -> alloc::vec::Vec<FwDlStep> {
         max: FW_POLL_MAX,
     });
     // H2C init mark.
-    plan.push(FwDlStep::Write8 { addr: REG_HMTFR, val: 0x0F });
+    plan.push(FwDlStep::Write8 {
+        addr: REG_HMTFR,
+        val: 0x0F,
+    });
 
     plan
 }
@@ -292,18 +385,26 @@ pub fn execute_fw_download<T: super::usb::Rtl8xxxuTransport>(
                 let _ = transport.read32(addr).map_err(FwDlError::TransportError)?;
             }
             FwDlStep::Write8 { addr, val } => {
-                transport.write8(addr, val).map_err(FwDlError::TransportError)?;
+                transport
+                    .write8(addr, val)
+                    .map_err(FwDlError::TransportError)?;
             }
             FwDlStep::Write16 { addr, val } => {
-                transport.write16(addr, val).map_err(FwDlError::TransportError)?;
+                transport
+                    .write16(addr, val)
+                    .map_err(FwDlError::TransportError)?;
             }
             FwDlStep::Write32 { addr, val } => {
-                transport.write32(addr, val).map_err(FwDlError::TransportError)?;
+                transport
+                    .write32(addr, val)
+                    .map_err(FwDlError::TransportError)?;
             }
             FwDlStep::Write8RMW { addr, keep, set } => {
                 let cur = transport.read8(addr).map_err(FwDlError::TransportError)?;
                 let new = (cur & keep) | set;
-                transport.write8(addr, new).map_err(FwDlError::TransportError)?;
+                transport
+                    .write8(addr, new)
+                    .map_err(FwDlError::TransportError)?;
             }
             FwDlStep::PageOut { page_idx, len } => {
                 let off = (page_idx as usize) * RTL_FW_PAGE_SIZE;
@@ -316,7 +417,12 @@ pub fn execute_fw_download<T: super::usb::Rtl8xxxuTransport>(
                     .map_err(FwDlError::TransportError)?;
                 bytes_xferred = bytes_xferred.saturating_add(n);
             }
-            FwDlStep::Poll32 { addr, mask, match_val, max } => {
+            FwDlStep::Poll32 {
+                addr,
+                mask,
+                match_val,
+                max,
+            } => {
                 let mut ok = false;
                 for _ in 0..max {
                     let v = transport.read32(addr).map_err(FwDlError::TransportError)?;

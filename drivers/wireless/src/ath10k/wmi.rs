@@ -252,8 +252,8 @@ pub fn decode_event(bytes: &[u8]) -> Result<EventFrame<'_>, ()> {
     if bytes.len() < WMI_HDR_LEN {
         return Err(());
     }
-    let raw_event_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap())
-        & WMI_CMD_HDR_CMD_ID_MASK;
+    let raw_event_id =
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()) & WMI_CMD_HDR_CMD_ID_MASK;
     Ok(EventFrame {
         event_id: WmiEventId::from_raw(raw_event_id).unwrap_or(WmiEventId::DebugMessage),
         raw_event_id,

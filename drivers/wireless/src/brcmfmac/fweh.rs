@@ -157,8 +157,7 @@ impl EventMsg {
         let event_code = u32::from_be_bytes(bytes[s + 4..s + 8].try_into().ok()?);
         let status = u32::from_be_bytes(bytes[s + 8..s + 12].try_into().ok()?);
         let reason = u32::from_be_bytes(bytes[s + 12..s + 16].try_into().ok()?);
-        let auth_type =
-            i32::from_be_bytes(bytes[s + 16..s + 20].try_into().ok()?);
+        let auth_type = i32::from_be_bytes(bytes[s + 16..s + 20].try_into().ok()?);
         let datalen = u32::from_be_bytes(bytes[s + 20..s + 24].try_into().ok()?);
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&bytes[s + 24..s + 30]);

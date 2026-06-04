@@ -59,16 +59,14 @@ pub enum McuError {
 ///
 /// # Safety
 /// `mmio` is the live BAR0 region; driver-own already taken.
-pub unsafe fn load_firmware_stub(
-    _mmio: &MmioRegion,
-    effective_did: u16,
-) -> Result<(), McuError> {
+pub unsafe fn load_firmware_stub(_mmio: &MmioRegion, effective_did: u16) -> Result<(), McuError> {
     let (patch_name, ram_name) = firmware_blobs_for(effective_did);
 
     let _ = writeln!(
         narf_console::Writer,
         "  mt7921: firmware resolve patch={} ram={}",
-        patch_name, ram_name,
+        patch_name,
+        ram_name,
     );
 
     // Try to open both blobs via the trusted-loader authority.
@@ -95,7 +93,8 @@ pub unsafe fn load_firmware_stub(
         let _ = writeln!(
             narf_console::Writer,
             "  mt7921: firmware missing (patch={}, ram={})",
-            patch_present, ram_present,
+            patch_present,
+            ram_present,
         );
         return Err(McuError::BlobMissing);
     }
@@ -120,9 +119,7 @@ pub unsafe fn load_firmware_stub(
 ///
 /// # Safety
 /// BAR0 mapped + owned; firmware loaded.
-pub unsafe fn read_efuse_mac(
-    _mmio: &MmioRegion,
-) -> Result<[u8; MAC_ADDR_LEN], McuError> {
+pub unsafe fn read_efuse_mac(_mmio: &MmioRegion) -> Result<[u8; MAC_ADDR_LEN], McuError> {
     // Stage-1 stops here: no DMA rings, no MCU command path. The
     // probe orchestrator wraps this in an `if firmware_outcome.is_ok()`
     // guard so we only reach here when the firmware actually loaded
