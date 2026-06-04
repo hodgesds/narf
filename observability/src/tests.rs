@@ -304,8 +304,8 @@ kernel_test_in!("observability", smoke_obs_gdb_packet_checksum);
 fn smoke_obs_gdb_attach_legacy_no_transport() -> TestResult {
     // Legacy no-transport `attach` shim still returns NotImplemented:
     // the real entry point is now `run_session` / `attach_com1`.
-    use narf_capabilities::{Cap, Invoke};
     use crate::{gdb, Debugger, GdbError};
+    use narf_capabilities::{Cap, Invoke};
     let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
     match gdb::attach(&cap) {
         Err(GdbError::NotImplemented) => {}
@@ -348,7 +348,10 @@ fn smoke_obs_gdb_handshake_qsupported_then_halt() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("observability", smoke_obs_gdb_handshake_qsupported_then_halt);
+kernel_test_in!(
+    "observability",
+    smoke_obs_gdb_handshake_qsupported_then_halt
+);
 
 fn smoke_obs_gdb_read_regs_packs_archregs() -> TestResult {
     use crate::{gdb, ArchRegs, Debugger};
@@ -471,10 +474,19 @@ fn smoke_obs_gdb_parse_command_dispatch() -> TestResult {
     if !matches!(parse_command("g"), Ok(GdbCommand::ReadRegs)) {
         return TestResult::Fail("g did not parse as ReadRegs");
     }
-    if !matches!(parse_command("mABCD,4"), Ok(GdbCommand::ReadMem { addr: 0xABCD, len: 4 })) {
+    if !matches!(
+        parse_command("mABCD,4"),
+        Ok(GdbCommand::ReadMem {
+            addr: 0xABCD,
+            len: 4
+        })
+    ) {
         return TestResult::Fail("m did not parse addr+len in hex");
     }
-    if !matches!(parse_command("c1000"), Ok(GdbCommand::Continue { addr: Some(0x1000) })) {
+    if !matches!(
+        parse_command("c1000"),
+        Ok(GdbCommand::Continue { addr: Some(0x1000) })
+    ) {
         return TestResult::Fail("c<addr> did not parse continue with address");
     }
     if !matches!(parse_command("s"), Ok(GdbCommand::Step { addr: None })) {
@@ -493,9 +505,9 @@ fn smoke_obs_gdb_parse_command_dispatch() -> TestResult {
 kernel_test_in!("observability", smoke_obs_gdb_parse_command_dispatch);
 
 fn smoke_obs_peek_provider_registration() -> TestResult {
+    use crate::{peek, Diagnostics, MetricSample, MetricValue, Provider};
     use alloc::vec::Vec;
     use narf_capabilities::{Cap, Read};
-    use crate::{peek, Diagnostics, MetricSample, MetricValue, Provider};
 
     peek::__test_reset();
 
@@ -564,7 +576,10 @@ fn smoke_obs_panic_snapshot_ring_empty_after_reset() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("observability", smoke_obs_panic_snapshot_ring_empty_after_reset);
+kernel_test_in!(
+    "observability",
+    smoke_obs_panic_snapshot_ring_empty_after_reset
+);
 
 fn smoke_obs_pmu_read_cycles_revoked_cap_rejected() -> TestResult {
     use crate::{ObsError, Pmu};
@@ -576,7 +591,10 @@ fn smoke_obs_pmu_read_cycles_revoked_cap_rejected() -> TestResult {
         _ => TestResult::Fail("revoked cap didn't surface Revoked"),
     }
 }
-kernel_test_in!("observability", smoke_obs_pmu_read_cycles_revoked_cap_rejected);
+kernel_test_in!(
+    "observability",
+    smoke_obs_pmu_read_cycles_revoked_cap_rejected
+);
 
 fn smoke_obs_pmu_read_instructions_revoked_cap_rejected() -> TestResult {
     use crate::{ObsError, Pmu};
@@ -588,7 +606,10 @@ fn smoke_obs_pmu_read_instructions_revoked_cap_rejected() -> TestResult {
         _ => TestResult::Fail("revoked cap didn't surface Revoked"),
     }
 }
-kernel_test_in!("observability", smoke_obs_pmu_read_instructions_revoked_cap_rejected);
+kernel_test_in!(
+    "observability",
+    smoke_obs_pmu_read_instructions_revoked_cap_rejected
+);
 
 fn smoke_obs_pmu_enable_user_reads_revoked_cap_rejected() -> TestResult {
     use crate::{ObsError, Pmu};
@@ -600,7 +621,10 @@ fn smoke_obs_pmu_enable_user_reads_revoked_cap_rejected() -> TestResult {
         _ => TestResult::Fail("revoked cap didn't surface Revoked"),
     }
 }
-kernel_test_in!("observability", smoke_obs_pmu_enable_user_reads_revoked_cap_rejected);
+kernel_test_in!(
+    "observability",
+    smoke_obs_pmu_enable_user_reads_revoked_cap_rejected
+);
 
 // ── deep observability/gdb + peek ───────────────────────────────────
 
@@ -630,12 +654,24 @@ fn smoke_obs_gdb_command_variants_distinct() -> TestResult {
     use crate::gdb::GdbCommand;
     let a = GdbCommand::ReadRegs;
     let b = GdbCommand::WriteRegs(alloc::vec![1, 2]);
-    let c = GdbCommand::ReadMem { addr: 0x1000, len: 4 };
-    let d = GdbCommand::WriteMem { addr: 0x2000, bytes: alloc::vec![0xFF] };
+    let c = GdbCommand::ReadMem {
+        addr: 0x1000,
+        len: 4,
+    };
+    let d = GdbCommand::WriteMem {
+        addr: 0x2000,
+        bytes: alloc::vec![0xFF],
+    };
     let e = GdbCommand::Continue { addr: None };
     let f = GdbCommand::Step { addr: Some(0x3000) };
-    let g = GdbCommand::InsertBp { addr: 0x4000, kind: 1 };
-    let h = GdbCommand::RemoveBp { addr: 0x4000, kind: 1 };
+    let g = GdbCommand::InsertBp {
+        addr: 0x4000,
+        kind: 1,
+    };
+    let h = GdbCommand::RemoveBp {
+        addr: 0x4000,
+        kind: 1,
+    };
     let i = GdbCommand::HaltReason;
     let j = GdbCommand::QSupported(alloc::string::String::from("multiprocess+"));
     // Spot-check distinctness on a few pairs that share addr/kind
@@ -697,7 +733,10 @@ fn smoke_obs_peek_metric_value_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("observability", smoke_obs_peek_metric_value_variants_distinct);
+kernel_test_in!(
+    "observability",
+    smoke_obs_peek_metric_value_variants_distinct
+);
 
 fn smoke_obs_peek_error_variants_distinct() -> TestResult {
     use crate::peek::PeekError;
@@ -728,13 +767,21 @@ fn smoke_obs_gdb_bp_install_restore_round_trip() -> TestResult {
     gdb::__test_clear_bp_map();
 
     // Synthetic 1-byte "memory" at address 0xF000_0000, seeded 0x90 (NOP).
-    static CELL: narf_lib::sync::IrqSafeSpinLock<u8> =
-        narf_lib::sync::IrqSafeSpinLock::new(0x90);
+    static CELL: narf_lib::sync::IrqSafeSpinLock<u8> = narf_lib::sync::IrqSafeSpinLock::new(0x90);
     fn fake_read(va: u64) -> Option<u8> {
-        if va == 0xF000_0000 { Some(*CELL.lock()) } else { None }
+        if va == 0xF000_0000 {
+            Some(*CELL.lock())
+        } else {
+            None
+        }
     }
     fn fake_write(va: u64, byte: u8) -> bool {
-        if va == 0xF000_0000 { *CELL.lock() = byte; true } else { false }
+        if va == 0xF000_0000 {
+            *CELL.lock() = byte;
+            true
+        } else {
+            false
+        }
     }
     gdb::__test_install_bp_hooks(fake_read, fake_write);
 
@@ -772,13 +819,21 @@ fn smoke_obs_gdb_bp_map_preserves_original_byte() -> TestResult {
 
     gdb::__test_clear_bp_map();
 
-    static CELL2: narf_lib::sync::IrqSafeSpinLock<u8> =
-        narf_lib::sync::IrqSafeSpinLock::new(0x55);
+    static CELL2: narf_lib::sync::IrqSafeSpinLock<u8> = narf_lib::sync::IrqSafeSpinLock::new(0x55);
     fn fake_read2(va: u64) -> Option<u8> {
-        if va == 0xF000_1000 { Some(*CELL2.lock()) } else { None }
+        if va == 0xF000_1000 {
+            Some(*CELL2.lock())
+        } else {
+            None
+        }
     }
     fn fake_write2(va: u64, byte: u8) -> bool {
-        if va == 0xF000_1000 { *CELL2.lock() = byte; true } else { false }
+        if va == 0xF000_1000 {
+            *CELL2.lock() = byte;
+            true
+        } else {
+            false
+        }
     }
     gdb::__test_install_bp_hooks(fake_read2, fake_write2);
 
@@ -828,4 +883,7 @@ fn smoke_obs_gdb_bp_map_preserves_original_byte() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("observability", smoke_obs_gdb_bp_map_preserves_original_byte);
+kernel_test_in!(
+    "observability",
+    smoke_obs_gdb_bp_map_preserves_original_byte
+);

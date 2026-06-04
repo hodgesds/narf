@@ -550,8 +550,7 @@ fn poke_memory(addr: u64, bytes: &[u8]) -> bool {
 /// software breakpoints. Protected by an `IrqSafeSpinLock` so the
 /// #BP trap handler (which runs at interrupt time) can look up entries
 /// safely.
-pub static BP_MAP: IrqSafeSpinLock<BTreeMap<u64, u8>> =
-    IrqSafeSpinLock::new(BTreeMap::new());
+pub static BP_MAP: IrqSafeSpinLock<BTreeMap<u64, u8>> = IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Test-only hook: drain the BP map so independent tests don't leak
 /// state across runs.
@@ -570,10 +569,10 @@ const INT3: u8 = 0xCC;
 // exercises without touching real kernel memory — same pattern as the
 // MEM_PEEK / MEM_POKE hooks above.
 
-type BpReadFn  = fn(va: u64) -> Option<u8>;
+type BpReadFn = fn(va: u64) -> Option<u8>;
 type BpWriteFn = fn(va: u64, byte: u8) -> bool;
 
-static BP_READ:  IrqSafeSpinLock<Option<BpReadFn>>  = IrqSafeSpinLock::new(None);
+static BP_READ: IrqSafeSpinLock<Option<BpReadFn>> = IrqSafeSpinLock::new(None);
 static BP_WRITE: IrqSafeSpinLock<Option<BpWriteFn>> = IrqSafeSpinLock::new(None);
 
 /// Test-only: register synthetic byte-level read/write primitives so
@@ -581,14 +580,14 @@ static BP_WRITE: IrqSafeSpinLock<Option<BpWriteFn>> = IrqSafeSpinLock::new(None)
 /// memory during unit tests.
 #[doc(hidden)]
 pub fn __test_install_bp_hooks(read: BpReadFn, write: BpWriteFn) {
-    *BP_READ.lock()  = Some(read);
+    *BP_READ.lock() = Some(read);
     *BP_WRITE.lock() = Some(write);
 }
 
 /// Test-only: clear the synthetic BP hooks.
 #[doc(hidden)]
 pub fn __test_clear_bp_hooks() {
-    *BP_READ.lock()  = None;
+    *BP_READ.lock() = None;
     *BP_WRITE.lock() = None;
 }
 
