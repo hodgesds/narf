@@ -307,6 +307,45 @@ impl RingState {
     }
 }
 
+/// One TX BD descriptor (§11.x). 8 bytes.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct TxBd {
+    pub length: u16,
+    pub opt: u16,
+    pub dma: u32,
+}
+
+pub const TXBD_OPT_LS: u16 = 1 << 14; // Last segment
+pub const TXBD_OPT_DMA_HI_MASK: u16 = 0x3FC0; // bits 13:6
+
+impl TxBd {
+    pub fn set_phys(&mut self, phys: u64) {
+        self.dma = (phys & 0xFFFFFFFF) as u32;
+        let hi = (phys >> 32) as u16;
+        self.opt = (self.opt & !TXBD_OPT_DMA_HI_MASK) | ((hi << 6) & TXBD_OPT_DMA_HI_MASK);
+    }
+}
+
+/// One RX BD descriptor. 8 bytes.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RxBd {
+    pub buf_size: u16,
+    pub opt: u16,
+    pub dma: u32,
+}
+
+pub const RXBD_OPT_DMA_HI_MASK: u16 = 0x3FC0; // bits 13:6
+
+impl RxBd {
+    pub fn set_phys(&mut self, phys: u64) {
+        self.dma = (phys & 0xFFFFFFFF) as u32;
+        let hi = (phys >> 32) as u16;
+        self.opt = (self.opt & !RXBD_OPT_DMA_HI_MASK) | ((hi << 6) & RXBD_OPT_DMA_HI_MASK);
+    }
+}
+
 /// Size of one TX BD descriptor (8 bytes). Matches Linux's
 /// `struct rtw89_pci_tx_bd_32` (`pci.h:1283`).
 pub const TX_BD_SIZE: usize = 8;

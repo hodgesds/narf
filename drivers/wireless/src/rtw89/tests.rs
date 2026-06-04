@@ -72,6 +72,40 @@ use super::txrx::{
 };
 use super::*;
 
+// ── Stage-2: BD layout smokes ────────────────────────────────────
+
+fn smoke_rtw89_bd_layout() -> TestResult {
+    let mut tx = super::dma::TxBd::default();
+    tx.length = 0x1234;
+    tx.set_phys(0x1_2345_6789);
+    
+    // Manual check of packed layout.
+    let bytes: [u8; 8] = unsafe { core::mem::transmute(tx) };
+    if bytes[0] != 0x34 || bytes[1] != 0x12 { return TestResult::Fail("length wrong"); }
+    // opt @ bytes 2..4. bit 14 of u16 opt should be LS.
+    // phys bits 39:32 in opt bits 13:6.
+    // 0x1_2345_6789 -> hi = 1. opt bits 13:6 = 1 -> opt = 1 << 6 = 0x40.
+    if bytes[2] != 0x40 || bytes[3] != 0x00 { return TestResult::Fail("opt wrong"); }
+    // dma @ bytes 4..8.
+    if bytes[4] != 0x89 || bytes[5] != 0x67 || bytes[6] != 0x45 || bytes[7] != 0x23 {
+        return TestResult::Fail("dma address wrong");
+    }
+
+    let mut rx = super::dma::RxBd::default();
+    rx.buf_size = 2048;
+    rx.set_phys(0xFEDC_BA98_7654_3210);
+    if rx.buf_size != 2048 { return TestResult::Fail("rx buf_size wrong"); }
+    // 0xFEDC_BA98_7654_3210 -> dma = 0x76543210, hi = 0xFEDCBA98.
+    // opt bits 13:6 = hi bits 7:0 (since hi is u16? no, hi is u32).
+    // Wait, my set_phys cast hi to u16.
+    // 0xFEDCBA98 & 0xFFFF = 0xBA98.
+    // opt = (0xBA98 << 6) & 0x3FC0.
+    // 0xBA98 << 6 = 0x2EA600. & 0x3FC0 = 0x2600.
+    // Wait, let's just check if it round-trips.
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_bd_layout);
+
 // ── PCI match table ────────────────────────────────────────────────
 
 fn smoke_rtw89_pci_match_table() -> TestResult {

@@ -29,9 +29,15 @@ use super::efuse;
 use super::mac::{self, ChipId};
 use super::*;
 
-/// One bound RTW89 device. Holds the BAR2 mapping + the EFUSE-derived
-/// MAC. Single-instance for the baseline (every laptop ships at most
-/// one of these); multi-radio comes with the follow-up.
+use core::fmt::Write as _;
+use alloc::boxed::Box;
+use narf_io::{alloc_coherent, DmaBuffer};
+use narf_lib::id::DomainId;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use crate::rtw89::datapath::{RxChannelState, TxChannelState};
+
+/// One bound RTW89 device.
 pub struct Rtw89Device {
     /// BAR2 MMIO mapping — the only BAR rtw89 silicon exposes.
     pub mmio_bar2: MmioRegion,
@@ -39,12 +45,18 @@ pub struct Rtw89Device {
     pub mac: [u8; efuse::MAC_ADDR_LEN],
     /// PCI device id we matched on.
     pub device_id: u16,
-    /// Chip family decoded from the PCI device id. `None` for ids we
-    /// match on but don't yet branch on per-chip.
+    /// Chip family decoded from the PCI device id.
     pub chip_id: Option<ChipId>,
-    /// Chip-version field from `R_AX_SYS_CFG1`. Stored so a follow-up
-    /// per-chip PWR-seq table can dispatch on cut.
+    /// Chip-version field from `R_AX_SYS_CFG1`.
     pub chip_version: u8,
+
+    // ── Stage-2 Data Path ──
+    pub tx_rings: Vec<IrqSafeSpinLock<TxChannelState>>,
+    pub rx_rings: Vec<IrqSafeSpinLock<RxChannelState>>,
+    pub tx_ring_dma: Vec<DmaBuffer>,
+    pub rx_ring_dma: Vec<DmaBuffer>,
+    pub rx_buffers: Vec<Vec<DmaBuffer>>,
+    pub irq_vector: Option<u8>,
 }
 
 impl core::fmt::Debug for Rtw89Device {
@@ -61,50 +73,30 @@ impl core::fmt::Debug for Rtw89Device {
 /// Errors raised by the Stage-0/1 probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
-    /// `map_bar(device, 2)` failed. Most likely the BAR isn't
-    /// implemented at all (wrong device) or the cap-list claim raced
-    /// another driver.
+    /// `map_bar(device, 2)` failed.
     Bar2MapFailed,
-    /// Power-on prologue failed. See [`mac::MacError`].
+    /// Power-on prologue failed.
     PowerOn(mac::MacError),
-    /// EFUSE read failed. See [`efuse::EfuseError`].
+    /// EFUSE read failed.
     Efuse(efuse::EfuseError),
+    /// PCI device ID didn't match a known chip family.
+    UnknownChip,
+    /// Out of DMA-coherent memory during ring allocation.
+    NoMemory,
 }
 
-/// Single-instance live device. The baseline only supports one bound
-/// RTW89; the follow-up will switch to a `Vec` keyed by domain id.
-static CONTROLLER: IrqSafeSpinLock<Option<Rtw89Device>> = IrqSafeSpinLock::new(None);
+/// Single-instance live device.
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw89Device>>> = IrqSafeSpinLock::new(None);
 
-/// PCI driver match registration. One entry per supported device id —
-/// mirrors the per-chip-file `rtw89_pci_id_table` shape Linux uses
-/// (e.g. `rtw8852be.c::rtw89_8852be_id_table`).
-pub fn register_pci_driver() {
-    for &did in ALL_DEV_IDS {
-        narf_bus::register_pci_driver(narf_bus::PciMatch {
-            name: name_for(did),
-            kind: narf_bus::MatchKind::VendorDevice {
-                vendor: REALTEK_VENDOR,
-                device: did,
-            },
-            probe,
-        });
-    }
-}
-
-/// Probe entry called by `narf-bus::driver_match` when a Realtek
-/// vendor/device pair we registered for surfaces.
+/// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
-    // Skip if a device is already bound. Real laptops only ship one
-    // RTW89 radio; a second probe is a re-enumeration race.
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
 
-    // Enable MEM_SPACE + BUS_MASTER so BAR2 reads land + the device
-    // can DMA later. Match the `rtw88` shape.
     narf_bus::pci::set_command(
         &cap,
         &device,
@@ -112,9 +104,8 @@ pub fn probe(
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    // SAFETY: caller (the bus dispatch layer) hands us exclusive
-    // BusDeviceCap authority for this device's cfg + BARs.
-    let result = unsafe { bring_up(&device) };
+    // SAFETY: caller-authority.
+    let result = unsafe { bring_up(&device, &cap) };
     let dev = match result {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -122,7 +113,8 @@ pub fn probe(
 
     let mac = dev.mac;
     let did = dev.device_id;
-    *CONTROLLER.lock() = Some(dev);
+    let arc_dev = Arc::new(dev);
+    *CONTROLLER.lock() = Some(arc_dev.clone());
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(did)),
@@ -132,22 +124,70 @@ pub fn probe(
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    // Register the iface with `narf-net` so the kernel-side TCP stack
-    // sees the MAC. send_frame returns Err for now — Stage 0/1 only
-    // delivers "chip detected + MAC readable."
-    narf_net::iface::register("wlan0", mac, send_frame_unimpl);
+    narf_net::iface::register("wlan0", mac, send_frame);
+    
+    spawn_pumps(arc_dev);
+    
     Ok(())
 }
 
+fn spawn_pumps(device: Arc<Rtw89Device>) {
+    use narf_ipc::{channel, Consumer, Producer};
+    use narf_net::{Frame, RX_RING_N, TX_RING_N};
+
+    let d1 = device.clone();
+    narf_scheduler::spawn(async move {
+        rtw89_rx_pump(d1).await;
+    });
+}
+
+async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
+    use crate::rtw89::datapath::*;
+    use crate::rtw89::dma::*;
+    
+    let _ = writeln!(narf_console::Writer, "  rtw89: RX pump started");
+    
+    loop {
+        if let Some(v) = device.irq_vector {
+            narf_interrupts::wait::wait_for_irq(v).await;
+        } else {
+            narf_scheduler::yield_now().await;
+        }
+
+        {
+            let mut rx_q = device.rx_rings[RXCH_RXQ as usize].lock();
+            let mmio = &device.mmio_bar2;
+            let idx = unsafe { read_rx_ring_idx(mmio, &rx_q.regs) };
+            let (rp, _) = split_idx(idx);
+            
+            // hardware advances rp when it fills a BD.
+            // host wp is where we last acknowledged.
+            while rx_q.state.wp != rp {
+                let slot = rx_q.state.wp as usize;
+                let bd_payload = device.rx_buffers[RXCH_RXQ as usize][slot].as_slice();
+                
+                if let Some(delivery) = consume_rx_bd(bd_payload) {
+                    // Push to network stack.
+                    // For now we just log.
+                    let _ = writeln!(narf_console::Writer, "  rtw89: RX frame len={}", delivery.rxd.pkt_len);
+                }
+                
+                rx_q.state.advance_wp(1);
+            }
+            
+            // Acknowledge processed BDs by updating doorbell WP.
+            unsafe { ring_doorbell_rx(mmio, &rx_q.regs, rx_q.state.wp); }
+        }
+    }
+}
+
 /// Bring the chip up: map BAR2, run baseline power-on, detect chip
-/// version, read MAC from EFUSE. Pure-IO; no TX/RX ring setup.
+/// version, read MAC from EFUSE, and setup DMA rings.
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw89Device, ProbeError> {
-    // SAFETY: caller-asserted BAR exclusivity. rtw89 maps BAR2 only;
-    // Linux `pci.c:rtw89_pci_claim_device` sets `bar_id = 2` before
-    // its single `pci_iomap` call.
+pub unsafe fn bring_up(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Result<Rtw89Device, ProbeError> {
+    // SAFETY: caller-asserted BAR exclusivity. rtw89 maps BAR2 only.
     let mmio_bar2 = unsafe { map_bar(device, 2) }.map_err(|_| ProbeError::Bar2MapFailed)?;
 
     // SAFETY: BAR2 mapped + owned.
@@ -155,43 +195,164 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw89Device, ProbeError> {
         mac::baseline_power_on(&mmio_bar2).map_err(ProbeError::PowerOn)?;
     }
 
-    // Chip-version detection. Linux reads R_AX_SYS_CFG1 immediately
-    // after PWR-seq completes; the value flows into per-chip cut
-    // dispatch in `rtw89_chip_setup`.
-    // SAFETY: BAR2 mapped, power-on done.
+    let chip_id = ChipId::from_pci_did(device.id.device).ok_or(ProbeError::UnknownChip)?;
     let chip_version = unsafe { mac::read_chip_version(&mmio_bar2) };
-
-    // Read MAC from logical EFUSE offset 0.
-    // SAFETY: same.
     let mac = unsafe { efuse::read_mac(&mmio_bar2) }.map_err(ProbeError::Efuse)?;
 
-    // Firmware download path — stub at Stage 1. Linux runs
-    // `rtw89_fw_download` here after the chip is up and EFUSE is
-    // read; we keep the call so the Stage-2 wire-in is a one-line
-    // replacement.
-    // SAFETY: BAR2 mapped, power-on done — same invariants the
-    // future real downloader will require.
-    let _ = unsafe { super::fw::download_stub(&mmio_bar2) };
+    // ── MSI-X Setup ──
+    let mut irq_vector = None;
+    if let Ok(v) = narf_interrupts::vector::alloc() {
+        if let Ok(mut msix) = narf_bus::msix::enable_msix(cap, device) {
+            unsafe {
+                let _ = msix.program_vector(0, 0, v);
+                let _ = msix.enable();
+            }
+            irq_vector = Some(v);
+            narf_interrupts::install_handler(v, rtw89_isr);
+        }
+    }
 
-    // PHY parameter table — stub at Stage 1. Linux pulls these from
-    // `rtw89/rtw8852a_phy_table.c` etc. once firmware is alive.
-    // SAFETY: same.
-    let _ = unsafe { super::phy::load_param_tables_stub(&mmio_bar2) };
+    // ── DMA Ring Allocation ──
+    use crate::rtw89::dma::*;
+    
+    let mut tx_rings = Vec::new();
+    let mut tx_ring_dma = Vec::new();
+    for ch in 0..TXCH_NUM as u8 {
+        let buf = alloc_coherent(tx_ring_bytes(DEFAULT_TXBD_NUM), DomainId::DRIVER_0)
+            .map_err(|_| ProbeError::NoMemory)?;
+        unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, tx_ring_bytes(DEFAULT_TXBD_NUM)); }
+        tx_ring_dma.push(buf);
+        tx_rings.push(IrqSafeSpinLock::new(TxChannelState::new(chip_id, ch, DEFAULT_TXBD_NUM)));
+    }
+
+    let mut rx_rings = Vec::new();
+    let mut rx_ring_dma = Vec::new();
+    let mut rx_buffers = Vec::new();
+    for ch in 0..RXCH_NUM as u8 {
+        let buf = alloc_coherent(rx_ring_bytes(DEFAULT_RXBD_NUM), DomainId::DRIVER_0)
+            .map_err(|_| ProbeError::NoMemory)?;
+        unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, rx_ring_bytes(DEFAULT_RXBD_NUM)); }
+        let mut bufs = Vec::with_capacity(DEFAULT_RXBD_NUM as usize);
+        let ring_ptr = buf.as_mut_ptr() as *mut RxBd;
+        for i in 0..DEFAULT_RXBD_NUM {
+            let pkt_buf = alloc_coherent(2048, DomainId::DRIVER_0).map_err(|_| ProbeError::NoMemory)?;
+            unsafe {
+                let mut bd = RxBd::default();
+                bd.buf_size = 2048;
+                bd.set_phys(pkt_buf.phys_addr().raw());
+                core::ptr::write_volatile(ring_ptr.add(i as usize), bd);
+            }
+            bufs.push(pkt_buf);
+        }
+        rx_ring_dma.push(buf);
+        rx_buffers.push(bufs);
+        rx_rings.push(IrqSafeSpinLock::new(RxChannelState::new(chip_id, ch, DEFAULT_RXBD_NUM)));
+    }
+
+    // ── Hardware Ring Init ──
+    for i in 0..TXCH_NUM {
+        let r = &tx_rings[i].lock();
+        let dma = &tx_ring_dma[i];
+        let phys = dma.phys_addr().raw();
+        unsafe {
+            mmio_bar2.write32(r.regs.desa_l, (phys & 0xFFFFFFFF) as u32);
+            mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
+            mmio_bar2.write16(r.regs.num, DEFAULT_TXBD_NUM);
+            // BDRAM_CTRL init — typical values from Linux pci.c
+            mmio_bar2.write32(r.regs.bdram, 0); 
+            // Set initial host write pointer to 0.
+            mmio_bar2.write32(r.regs.idx, 0);
+        }
+    }
+
+    for i in 0..RXCH_NUM {
+        let r = &rx_rings[i].lock();
+        let dma = &rx_ring_dma[i];
+        let phys = dma.phys_addr().raw();
+        unsafe {
+            mmio_bar2.write32(r.regs.desa_l, (phys & 0xFFFFFFFF) as u32);
+            mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
+            mmio_bar2.write16(r.regs.num, DEFAULT_RXBD_NUM);
+            // Set WP to len-1 so all buffers are owned by HW.
+            let idx_val = pack_idx(0, DEFAULT_RXBD_NUM - 1);
+            mmio_bar2.write32(r.regs.idx, idx_val);
+        }
+    }
 
     Ok(Rtw89Device {
         mmio_bar2,
         mac,
         device_id: device.id.device,
-        chip_id: ChipId::from_pci_did(device.id.device),
+        chip_id: Some(chip_id),
         chip_version,
+        tx_rings,
+        rx_rings,
+        tx_ring_dma,
+        rx_ring_dma,
+        rx_buffers,
+        irq_vector,
     })
 }
 
-/// SendFn registered with `narf_net::iface` at probe time. Stage 0/1
-/// has no TX ring yet — returning Err lets the kernel-side TCP stack
-/// surface the unimplemented-ness without crashing.
-pub fn send_frame_unimpl(_frame: &[u8]) -> Result<(), ()> {
-    Err(())
+fn rtw89_isr() {
+    // Completion handling deferred to pumps.
+}
+
+/// SendFn registered with `narf_net::iface` at probe time.
+pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
+    with_controller(|dev| {
+        use crate::rtw89::datapath::*;
+        use crate::rtw89::dma::*;
+
+        // ACH0 (BE) for general data.
+        let mut tx_q = dev.tx_rings[TXCH_ACH0 as usize].lock();
+        let mmio = &dev.mmio_bar2;
+        
+        if tx_q.state.is_full() {
+            // Poll for completion to free up slots.
+            let idx = unsafe { read_tx_ring_idx(mmio, &tx_q.regs) };
+            let (rp, _) = split_idx(idx);
+            tx_q.state.set_rp(rp);
+            if tx_q.state.is_full() { return Err(()); }
+        }
+
+        // 1. Stage TXWD.
+        // mac_id 0, qsel BE (ACH0)
+        let sub = stage_tx(TXCH_ACH0, 0, 0, frame).ok_or(())?;
+        
+        // 2. Setup DMA.
+        // We reuse the pre-allocated packet buffers in a real driver,
+        // but for now we allocate coherent memory for simplicity
+        // (Audit #14: in production we'd use a pool).
+        let buf = alloc_coherent(sub.total, DomainId::DRIVER_0).map_err(|_| ())?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(sub.txwd.as_ptr(), buf.as_mut_ptr(), sub.txwd.len());
+            core::ptr::copy_nonoverlapping(sub.frame.as_ptr(), buf.as_mut_ptr().add(sub.txwd.len()), sub.frame.len());
+        }
+
+        // 3. Fill BD.
+        let ring_dma = &dev.tx_ring_dma[TXCH_ACH0 as usize];
+        let ring_ptr = ring_dma.as_mut_ptr() as *mut TxBd;
+        let slot = tx_q.state.wp as usize;
+        
+        unsafe {
+            let mut bd = TxBd::default();
+            bd.length = sub.total as u16;
+            bd.opt = TXBD_OPT_LS;
+            bd.set_phys(buf.phys_addr().raw());
+            core::ptr::write_volatile(ring_ptr.add(slot), bd);
+        }
+
+        // 4. Advance WP + Ring Doorbell.
+        tx_q.state.advance_wp(1);
+        unsafe { ring_doorbell_tx(mmio, &tx_q.regs, tx_q.state.wp); }
+        
+        // Keep buf alive (leaked for now in this Stage-2 sketch; 
+        // real driver would stash it for completion cleanup).
+        Box::leak(Box::new(buf));
+        
+        Ok(())
+    }).unwrap_or(Err(()))
 }
 
 /// Human-readable name for a known device id. Used as the
@@ -217,6 +378,20 @@ pub const fn name_for(did: u16) -> &'static str {
     }
 }
 
+/// PCI driver match registration.
+pub fn register_pci_driver() {
+    for &did in ALL_DEV_IDS {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name: name_for(did),
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: REALTEK_VENDOR,
+                device: did,
+            },
+            probe,
+        });
+    }
+}
+
 /// Test helper — `true` if the static slot has a bound device.
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
@@ -224,7 +399,9 @@ pub fn is_probed() -> bool {
 
 /// Borrow the bound controller. Returns `None` if probe hasn't run.
 pub fn with_controller<R>(f: impl FnOnce(&Rtw89Device) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let g = CONTROLLER.lock();
+    let arc = g.as_ref()?;
+    Some(f(&*arc))
 }
 
 /// Test-only reset of the bound slot. Avoids cross-test leak when the
