@@ -1315,6 +1315,17 @@ pub enum Syscall {
     /// sigsetsize. Returns 0 on success. Linux `rt_sigpending`
     /// (x86_64=127, aarch64=136).
     RtSigpending,
+
+    /// Wave-61: `pidfd_open(pid, flags)` — return a new fd whose
+    /// `poll(POLLIN)` becomes ready when the target ProcessId exits.
+    /// `arg0 = pid`, `arg1 = flags` (ignored — PIDFD_NONBLOCK only).
+    /// Returns the fd on success or `-1` on failure (pid 0 or fd
+    /// table full).
+    ///
+    /// Linux `pidfd_open` (x86_64=434, aarch64=434). The signal-
+    /// sending sibling `pidfd_send_signal` (424) and the waitid
+    /// P_PIDFD variant are Wave-62 follow-ups.
+    PidfdOpen,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1459,6 +1470,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRandom, 318),
     (Syscall::MemfdCreate, 319),
     (Syscall::CopyFileRange, 326),
+    (Syscall::PidfdOpen, 434),
     // Loadable kernel modules — Linux x86_64 numbers.
     // init_module = 175, delete_module = 176, finit_module = 313.
     (Syscall::InitModule, 175),
@@ -1593,6 +1605,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRandom, 278),
     (Syscall::MemfdCreate, 279),
     (Syscall::CopyFileRange, 285),
+    (Syscall::PidfdOpen, 434),
     (Syscall::Statfs, 43),
     (Syscall::Fstatfs, 44),
     (Syscall::Pselect6, 72), // pselect6
