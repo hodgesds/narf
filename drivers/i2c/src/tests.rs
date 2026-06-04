@@ -43,13 +43,15 @@ impl I2cBus for MockBus {
     }
 }
 
-// ── Synthetic MMIO backing for AMD FCH ───────────────────────────
+// ── Synthetic MMIO backing (AMD FCH + Intel LPSS) ────────────────
 //
-// 256 B of zeroed memory (the DW register window is < 0x100 except
-// for IC_COMP_TYPE at 0xfc). We seed COMP_TYPE so probe_component
-// passes; the driver's enable + poll loops then run against the
-// rest of the buffer happily because every "wait for bit clear"
-// sees an initial 0.
+// 1024 B (256 u32s) of zeroed memory, shared by both the AMD FCH
+// and Intel LPSS smoke suites.  The DW core register window is
+// < 0x100 (IC_COMP_TYPE at 0xfc = u32 index 63), and the LPSS
+// private-register window extends to LPSS_PRIV_REMAP_ADDR+4 =
+// 0x248 (584 B).  1024 B comfortably covers both.  We seed
+// COMP_TYPE so probe_component_type passes; every "wait for bit
+// clear" poll sees an initial 0 and exits immediately.
 
 const DW_COMP_TYPE: u32 = 0x4457_0140;
 
