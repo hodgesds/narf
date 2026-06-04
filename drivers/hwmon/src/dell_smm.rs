@@ -271,7 +271,10 @@ fn is_dell_platform() -> bool {
     let count = narf_firmware_smbios::copy_system(&mut system_records);
     if count > 0 {
         let manufacturer = &system_records[0].manufacturer;
-        let len = manufacturer.iter().position(|&b| b == 0).unwrap_or(manufacturer.len());
+        let len = manufacturer
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(manufacturer.len());
         if let Ok(m_str) = core::str::from_utf8(&manufacturer[..len]) {
             return m_str.to_ascii_lowercase().contains("dell");
         }
@@ -283,8 +286,8 @@ fn is_dell_platform() -> bool {
 /// containing "Dell" parsed from SMBIOS.
 #[cfg(target_arch = "x86_64")]
 pub fn register_smm_driver() {
-    use core::fmt::Write as _;
     use alloc::sync::Arc;
+    use core::fmt::Write as _;
 
     if !is_dell_platform() {
         let _ = writeln!(

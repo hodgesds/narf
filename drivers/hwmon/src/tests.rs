@@ -482,7 +482,6 @@ fn smoke_bridge_update_interval_attr() -> TestResult {
 }
 kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_update_interval_attr);
 
-
 // ── dell_smm ──────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -500,7 +499,10 @@ mod dell_smm_tests {
                 } else if arg == 1 {
                     SmmResult { eax: 55, edx: 0 }
                 } else {
-                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                    SmmResult {
+                        eax: SMM_ERR_NOSUPPORT,
+                        edx: 0,
+                    }
                 }
             }
             SMM_GET_FAN_STATUS => {
@@ -509,7 +511,10 @@ mod dell_smm_tests {
                 } else if arg == 1 {
                     SmmResult { eax: 1, edx: 0 }
                 } else {
-                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                    SmmResult {
+                        eax: SMM_ERR_NOSUPPORT,
+                        edx: 0,
+                    }
                 }
             }
             SMM_GET_FAN_NOMINAL_RPM => {
@@ -518,7 +523,10 @@ mod dell_smm_tests {
                 } else if arg == 1 {
                     SmmResult { eax: 80, edx: 0 }
                 } else {
-                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                    SmmResult {
+                        eax: SMM_ERR_NOSUPPORT,
+                        edx: 0,
+                    }
                 }
             }
             SMM_SET_FAN => {
@@ -527,10 +535,16 @@ mod dell_smm_tests {
                 if fan_idx < 2 && level <= 3 {
                     SmmResult { eax: 0, edx: 0 }
                 } else {
-                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                    SmmResult {
+                        eax: SMM_ERR_NOSUPPORT,
+                        edx: 0,
+                    }
                 }
             }
-            _ => SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 },
+            _ => SmmResult {
+                eax: SMM_ERR_NOSUPPORT,
+                edx: 0,
+            },
         }
     }
 
@@ -621,7 +635,10 @@ mod dell_smm_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_registration_skips_non_dell);
+    kernel_test_in!(
+        "drivers/hwmon/dell_smm",
+        smoke_dell_smm_registration_skips_non_dell
+    );
 
     /// Verify that Dell systems successfully register the dell_smm driver.
     fn smoke_dell_smm_registration_accepts_dell() -> TestResult {
@@ -635,7 +652,8 @@ mod dell_smm_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_registration_accepts_dell);
+    kernel_test_in!(
+        "drivers/hwmon/dell_smm",
+        smoke_dell_smm_registration_accepts_dell
+    );
 }
-
-
