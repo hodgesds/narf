@@ -113,15 +113,15 @@ pub fn bind_all() -> usize {
     // device list, and (b) populates the AMDI-children count atom
     // so the panel can surface "are there any I2C slaves at all"
     // independent of klog visibility.
-    let amdi_n = narf_aml::boot_amdi001x_count();
+    let i2c_n = narf_aml::boot_i2c_ctrl_count();
     let pnp_n = narf_aml::boot_pnp0c50_count();
     let _ = writeln!(
         narf_console::Writer,
-        "i2c-hid-bind: AMDI={} PNP0C50={} — subtree dump follows",
-        amdi_n,
+        "i2c-hid-bind: I2C-ctrl={} PNP0C50={} — subtree dump follows",
+        i2c_n,
         pnp_n
     );
-    narf_aml::dump_amd_i2c_subtree();
+    narf_aml::dump_i2c_subtree();
     // Also enumerate every device in the namespace that has an
     // `I2cSerialBus` resource — covers touchpads / sensor hubs
     // whose parent I2C controller doesn't have a `_HID` we

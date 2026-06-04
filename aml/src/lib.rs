@@ -270,14 +270,14 @@ static BOOT_DEVICE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 /// which on real silicon with 100s of AML devices was both slow
 /// and a lock-contention hazard (IrqSafeSpinLock disables IF on
 /// the waiter; the executor would freeze).
-static BOOT_AMDI001X_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BOOT_I2C_CTRL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static BOOT_PNP0C50_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Number of direct AML children under any AMDI*/AMD0* I2C
-/// controller. Populated by `dump_amd_i2c_subtree`. Exposed via
-/// `boot_amdi_children_count` so the FB status panel can show "are
+/// Number of direct AML children under any matched designware I2C
+/// controller. Populated by `dump_i2c_subtree`. Exposed via
+/// `boot_i2c_ctrl_children_count` so the FB status panel can show "are
 /// there any devices declared under the I2C controller" without
 /// re-walking the namespace each paint.
-static BOOT_AMDI_CHILDREN_COUNT: core::sync::atomic::AtomicU32 =
+static BOOT_I2C_CTRL_CHILDREN_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
 /// Capture the current namespace counts as the boot-time snapshot.
@@ -305,7 +305,9 @@ pub fn capture_boot_snapshot() {
     //   - I2C-over-ACPI driver: AMDI* / AMD* prefix (covers
     //     AMDI0010, AMDI0019, AMDI0510, AMDI0020, AMD0010,
     //     AMD0020 — Linux's i2c-designware-platdrv.c match
-    //     table, including the newer Phoenix-era 0020 IDs).
+    //     table, including the newer Phoenix-era 0020 IDs),
+    //     plus Intel LPSS DesignWare I2C HIDs (INT3xxx, INTCxxxx,
+    //     80860Fxx, 808622xx).
     //
     //   - i2c-hid driver: PNP0C50 OR ACPI0C50 in either _HID
     //     or _CID. Vendor touchpads typically have a vendor
@@ -315,34 +317,42 @@ pub fn capture_boot_snapshot() {
     // Sources:
     //   drivers/hid/i2c-hid/i2c-hid-acpi.c     (HID-I2C IDs)
     //   drivers/i2c/busses/i2c-designware-platdrv.c (AMD I2C)
+    //   drivers/i2c/busses/i2c-designware-pcidrv.c (Intel LPSS I2C)
     //   drivers/acpi/bus.c::acpi_driver_match_device (_CID logic)
-    let mut amdi_n = 0u32;
+    let mut i2c_n = 0u32;
     let mut pnp_n = 0u32;
     for path in device_paths.iter() {
         let hid = device_hid(path);
         let cids = device_cids(path);
-        let mut matched_amdi = false;
+        let mut matched_i2c = false;
         let mut matched_pnp = false;
-        let is_amd_i2c_id = |s: &str| s.starts_with("AMDI") || s.starts_with("AMD0");
+        let is_i2c_ctrl_id = |s: &str| {
+            s.starts_with("AMDI")
+                || s.starts_with("AMD0")
+                || s.starts_with("INT3")
+                || s.starts_with("INTC")
+                || s.starts_with("80860F")
+                || s.starts_with("808622")
+        };
         let is_hid_i2c_id = |s: &str| s == "PNP0C50" || s == "ACPI0C50";
         if let Some(ref h) = hid {
-            if is_amd_i2c_id(h) {
-                matched_amdi = true;
+            if is_i2c_ctrl_id(h) {
+                matched_i2c = true;
             }
             if is_hid_i2c_id(h) {
                 matched_pnp = true;
             }
         }
         for cid in cids.iter() {
-            if is_amd_i2c_id(cid) {
-                matched_amdi = true;
+            if is_i2c_ctrl_id(cid) {
+                matched_i2c = true;
             }
             if is_hid_i2c_id(cid) {
                 matched_pnp = true;
             }
         }
-        if matched_amdi {
-            amdi_n += 1;
+        if matched_i2c {
+            i2c_n += 1;
         }
         if matched_pnp {
             pnp_n += 1;
@@ -350,7 +360,7 @@ pub fn capture_boot_snapshot() {
     }
     BOOT_NODE_COUNT.store(n, core::sync::atomic::Ordering::Release);
     BOOT_DEVICE_COUNT.store(d, core::sync::atomic::Ordering::Release);
-    BOOT_AMDI001X_COUNT.store(amdi_n, core::sync::atomic::Ordering::Release);
+    BOOT_I2C_CTRL_COUNT.store(i2c_n, core::sync::atomic::Ordering::Release);
     BOOT_PNP0C50_COUNT.store(pnp_n, core::sync::atomic::Ordering::Release);
 }
 
@@ -472,24 +482,31 @@ pub fn dump_all_devices() {
     }
 }
 
-pub fn dump_amd_i2c_subtree() {
+pub fn dump_i2c_subtree() {
     use core::fmt::Write as _;
     let device_paths = list_all_device_paths();
     let mut any = false;
     let mut total_children: u32 = 0;
     for path in device_paths.iter() {
         let h = device_hid(path);
-        let is_amdi = match &h {
-            Some(s) => s.starts_with("AMDI") || s.starts_with("AMD0"),
+        let is_i2c_ctrl = match &h {
+            Some(s) => {
+                s.starts_with("AMDI")
+                    || s.starts_with("AMD0")
+                    || s.starts_with("INT3")
+                    || s.starts_with("INTC")
+                    || s.starts_with("80860F")
+                    || s.starts_with("808622")
+            }
             None => false,
         };
-        if !is_amdi {
+        if !is_i2c_ctrl {
             continue;
         }
         if !any {
             let _ = writeln!(
                 narf_console::Writer,
-                "  aml-i2c-subtree: dumping AMD I2C controllers + children:",
+                "  aml-i2c-subtree: dumping DesignWare I2C controllers + children:",
             );
             any = true;
         }
@@ -532,10 +549,10 @@ pub fn dump_amd_i2c_subtree() {
     if !any {
         let _ = writeln!(
             narf_console::Writer,
-            "  aml-i2c-subtree: no AMDI*/AMD0* controllers found in namespace",
+            "  aml-i2c-subtree: no designware controllers found in namespace",
         );
     }
-    BOOT_AMDI_CHILDREN_COUNT.store(total_children, core::sync::atomic::Ordering::Release);
+    BOOT_I2C_CTRL_CHILDREN_COUNT.store(total_children, core::sync::atomic::Ordering::Release);
 }
 
 /// Returns `(boot_node_count, boot_device_count)` from the snapshot
@@ -553,8 +570,10 @@ pub fn boot_snapshot() -> (u32, u32) {
 /// `find_all_devices_by_hid` for each of {AMDI0010, AMDI0011,
 /// AMDI0019, AMDI0510} returned at boot, but computed ONCE under
 /// a single NAMESPACE.lock and exposed as an atomic.
-pub fn boot_amdi001x_count() -> u32 {
-    BOOT_AMDI001X_COUNT.load(core::sync::atomic::Ordering::Acquire)
+/// Lock-free boot-snapshot count of designware I2C controllers in
+/// the AML namespace. For diagnostics.
+pub fn boot_i2c_ctrl_count() -> u32 {
+    BOOT_I2C_CTRL_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Lock-free boot-snapshot count of PNP0C50 (HID-over-I2C) devices.
@@ -562,12 +581,12 @@ pub fn boot_pnp0c50_count() -> u32 {
     BOOT_PNP0C50_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Lock-free count of direct children under any AMDI*/AMD0* I2C
-/// controller in AML. Populated by `dump_amd_i2c_subtree`. The FB
+/// Lock-free count of direct children under any matched designware I2C
+/// controller in AML. Populated by `dump_i2c_subtree`. The FB
 /// status panel reads this to surface "controller has N declared
 /// I2C slaves" without re-walking the namespace each paint.
-pub fn boot_amdi_children_count() -> u32 {
-    BOOT_AMDI_CHILDREN_COUNT.load(core::sync::atomic::Ordering::Acquire)
+pub fn boot_i2c_ctrl_children_count() -> u32 {
+    BOOT_I2C_CTRL_CHILDREN_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Find the first node with the given canonical path
