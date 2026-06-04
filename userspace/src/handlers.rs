@@ -725,6 +725,7 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             ops,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,
@@ -862,6 +863,7 @@ fn sys_dup(ctx: &mut dyn TrapContext) {
             ops: entry.ops.clone(),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         };
         Some(t.open(clone))
     });
@@ -894,6 +896,7 @@ fn sys_dup2(ctx: &mut dyn TrapContext) {
             ops: entry.ops.clone(),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         };
         // Replace whatever sat at `newfd` (POSIX: silently close).
         t.set(newfd, clone);
@@ -927,6 +930,7 @@ fn sys_dup3(ctx: &mut dyn TrapContext) {
             // accepts the lower-bit shape (FD_CLOEXEC = 1) directly
             // since narf-libc's `dup3` already passes FD_CLOEXEC.
             flags: flags & crate::fd::FD_CLOEXEC,
+            status_flags: 0,
         };
         t.set(newfd, clone);
         Some(())
@@ -937,10 +941,39 @@ fn sys_dup3(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── fcntl command constants (Linux numbering) ──────────────────────
+const F_DUPFD: u64 = 0;
 const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
+const F_GETLK: u64 = 5;
+const F_SETLK: u64 = 6;
+const F_SETLKW: u64 = 7;
+#[cfg(feature = "linux-compat")]
+const F_DUPFD_CLOEXEC: u64 = 1030;
+
+/// Linux EAGAIN value (11).
+const EAGAIN_CODE: u64 = 11;
+
+/// Wire-stable `struct flock` (Linux x86_64 / aarch64 layout).
+#[cfg(feature = "linux-compat")]
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+struct UFlock {
+    l_type: i16,
+    l_whence: i16,
+    _pad: [u8; 4],
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+    _pad2: [u8; 4],
+}
+
+#[cfg(feature = "linux-compat")]
+fn flock_size() -> usize {
+    core::mem::size_of::<UFlock>()
+}
 
 fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
@@ -948,13 +981,129 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let cmd = args.arg1;
     let arg = args.arg2;
     let task = current_task_id();
-    // For F_SETFL on a socket fd, push O_NONBLOCK down into the
-    // SocketFile so recv/send/accept/connect see the flag.
+
+    // F_SETFL on a socket: mirror O_NONBLOCK into the SocketFile so
+    // recv/send/accept/connect see the flag.
     if cmd == F_SETFL {
         if let Some(sock) = current_socket(fd) {
             sock.set_nonblock((arg as u32) & crate::socket::O_NONBLOCK != 0);
         }
     }
+
+    // F_DUPFD / F_DUPFD_CLOEXEC: dup oldfd into the lowest free slot
+    // >= arg. Linux returns the new fd. CLOEXEC variant stamps
+    // FD_CLOEXEC atomically.
+    #[cfg(feature = "linux-compat")]
+    {
+        if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+            let min_fd = arg as u32;
+            let cloexec = cmd == F_DUPFD_CLOEXEC;
+            let outcome = fd::with_table(task, |t| {
+                let entry = t.get(fd)?;
+                let clone = crate::fd::FdEntry {
+                    ops: entry.ops.clone(),
+                    offset: 0,
+                    flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
+                    status_flags: entry.status_flags,
+                };
+                Some(t.open_at_least(clone, min_fd))
+            });
+            match outcome {
+                Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
+                _ => ctx.set_return(SyscallReturn::invalid_op()),
+            }
+            return;
+        }
+    }
+
+    // F_GETLK / F_SETLK / F_SETLKW: advisory POSIX locking. Gated
+    // under linux-compat because the wire `struct flock` layout +
+    // BTreeMap lock table only matter for Linux ABI consumers.
+    #[cfg(feature = "linux-compat")]
+    {
+        if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW {
+            // Resolve the open-file identity from the fd table.
+            let ops_key = fd::with_table(task, |t| {
+                t.get(fd)
+                    .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+            });
+            let key = match ops_key {
+                Some(Some(k)) => k,
+                _ => {
+                    ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                    return;
+                }
+            };
+            // Pull the `struct flock` from user memory.
+            let mut bytes = alloc::vec![0u8; flock_size()];
+            if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                return;
+            }
+            let uf: UFlock = unsafe {
+                let mut tmp = UFlock::default();
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    &mut tmp as *mut _ as *mut u8,
+                    flock_size(),
+                );
+                tmp
+            };
+            // Only SEEK_SET (l_whence = 0) is supported on the wire
+            // path. Other whence values would need the current offset
+            // / file size, which is OFD-tier work.
+            if uf.l_whence != 0 {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+            let req = crate::fd::locks::Lock {
+                owner: task,
+                ty: uf.l_type,
+                start: uf.l_start,
+                len: uf.l_len,
+            };
+            if cmd == F_GETLK {
+                let blocker = crate::fd::locks::probe(key, req);
+                let mut out = uf;
+                match blocker {
+                    None => out.l_type = crate::fd::locks::F_UNLCK,
+                    Some(b) => {
+                        out.l_type = b.ty;
+                        out.l_start = b.start;
+                        out.l_len = b.len;
+                        out.l_pid = b.owner as i32;
+                    }
+                }
+                let mut obytes = alloc::vec![0u8; flock_size()];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &out as *const _ as *const u8,
+                        obytes.as_mut_ptr(),
+                        flock_size(),
+                    );
+                }
+                if unsafe { copy_to_user(arg, &obytes) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                    return;
+                }
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+            // F_SETLK / F_SETLKW.
+            // TODO(wave-69): F_SETLKW should block on a per-inode
+            // waker; today we treat it like F_SETLK and return
+            // EAGAIN on conflict. Surface to the caller so they can
+            // retry, or fall back to fcntl-managed sleep.
+            match crate::fd::locks::try_set(key, req) {
+                Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(_) => {
+                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                }
+            }
+            return;
+        }
+    }
+
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
         Some(match cmd {
@@ -963,19 +1112,31 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 entry.flags = arg as u32;
                 SyscallReturn::ok(0)
             }
-            // F_GETFL returns whichever per-fd flag bits we model
-            // explicitly: O_NONBLOCK (mirrored to/from SocketFile),
-            // others reported as 0.
+            // F_GETFL: report the per-fd status_flags. Socket
+            // O_NONBLOCK overrides the bit if the SocketFile carries
+            // its own nonblock toggle (kept in sync via F_SETFL).
             F_GETFL => {
-                let nb = current_socket(fd).map(|s| s.is_nonblock()).unwrap_or(false);
-                let v = if nb {
-                    crate::socket::O_NONBLOCK as u64
-                } else {
-                    0
-                };
+                let mut v = entry.status_flags as u64;
+                if let Some(sock) = current_socket(fd) {
+                    if sock.is_nonblock() {
+                        v |= crate::socket::O_NONBLOCK as u64;
+                    } else {
+                        v &= !(crate::socket::O_NONBLOCK as u64);
+                    }
+                }
                 SyscallReturn::ok(v)
             }
-            F_SETFL => SyscallReturn::ok(0),
+            // F_SETFL: only the settable subset (O_NONBLOCK | O_APPEND
+            // | O_DIRECT) is honoured. Access-mode bits are ignored.
+            F_SETFL => {
+                #[cfg(feature = "linux-compat")]
+                let mask = crate::fd::O_SETFL_MASK;
+                #[cfg(not(feature = "linux-compat"))]
+                let mask = 0o4000u32; // O_NONBLOCK only.
+                let new = (arg as u32) & mask;
+                entry.status_flags = (entry.status_flags & !mask) | new;
+                SyscallReturn::ok(0)
+            }
             _ => SyscallReturn::invalid_op(),
         })
     });
@@ -1892,6 +2053,7 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
             ops,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     });
     // `with_table` returns `Option<u32>` (the fd or None on
@@ -1941,11 +2103,13 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         });
         let w = t.open(crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         });
         (r, w)
     });
@@ -1999,11 +2163,13 @@ fn sys_pipe2(ctx: &mut dyn TrapContext) {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
+            status_flags: 0,
         });
         let w = t.open(crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
+            status_flags: 0,
         });
         (r, w)
     });
@@ -8747,6 +8913,7 @@ fn sys_socket(ctx: &mut dyn TrapContext) {
             ops: sock.clone(),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,
@@ -8826,6 +8993,7 @@ fn sys_socket_accept(ctx: &mut dyn TrapContext) {
                     ops: socket,
                     offset: 0,
                     flags: 0,
+                    status_flags: 0,
                 })
             }) {
                 Some(n) => n,
@@ -9762,6 +9930,7 @@ fn sys_epoll_create(ctx: &mut dyn TrapContext) {
             ops: ep,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,
@@ -9935,6 +10104,7 @@ fn sys_eventfd(ctx: &mut dyn TrapContext) {
             ops: efd,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,
@@ -9972,6 +10142,7 @@ fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
             ops: file,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,
@@ -9993,6 +10164,7 @@ fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
             ops: tfd,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,
@@ -10133,6 +10305,7 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
             ops: sfd,
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     }) {
         Some(n) => n,

@@ -340,15 +340,32 @@ mod arch_syscalls {
 // to them by the generic name.
 pub use arch_syscalls::*;
 
-/// `fcntl` command constants — match Linux numbering for the subset
-/// NARF supports today (FD_CLOEXEC + the file-flag query/set pair).
+/// `fcntl` command constants — match Linux numbering for the
+/// Wave-68 extended surface: dup family, fd flags, status flags,
+/// and advisory POSIX locks.
+pub const F_DUPFD: u32 = 0;
 pub const F_GETFD: u32 = 1;
 pub const F_SETFD: u32 = 2;
 pub const F_GETFL: u32 = 3;
 pub const F_SETFL: u32 = 4;
-/// `FD_CLOEXEC` flag bit — the only `flags` bit NARF currently
-/// stamps onto an fd entry.
+pub const F_GETLK: u32 = 5;
+pub const F_SETLK: u32 = 6;
+pub const F_SETLKW: u32 = 7;
+pub const F_DUPFD_CLOEXEC: u32 = 1030;
+/// `FD_CLOEXEC` flag bit on the per-fd-slot flags word.
 pub const FD_CLOEXEC: u32 = 1;
+
+/// `struct flock::l_type` values (POSIX).
+pub const F_RDLCK: i16 = 0;
+pub const F_WRLCK: i16 = 1;
+pub const F_UNLCK: i16 = 2;
+
+/// File-status flag bits honoured by `F_SETFL` / reported by
+/// `F_GETFL`. Linux x86_64 numbering — aarch64 matches.
+pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_APPEND: u32 = 0o2000;
+pub const O_DIRECT: u32 = 0o40000;
+pub const O_CLOEXEC: u32 = 0o2000000;
 
 /// `sigprocmask` how-flags — match POSIX.
 pub const SIG_BLOCK: u32 = 0;

@@ -17,7 +17,8 @@
 use crate::errno::set_errno;
 
 pub use narf_user_runtime::{
-    F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, StatBuf,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_RDLCK, F_SETFD, F_SETFL, F_SETLK,
+    F_SETLKW, F_UNLCK, F_WRLCK, FD_CLOEXEC, O_APPEND, O_CLOEXEC, O_DIRECT, O_NONBLOCK, StatBuf,
 };
 
 /// Sentinel errno: bad fd. Matches Linux's EBADF so consumers that

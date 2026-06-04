@@ -1918,6 +1918,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
             ops: Arc::new(CountingFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     })
     .expect("with_table");
@@ -2088,6 +2089,7 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
             ops: Arc::new(StubFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     })
     .expect("with_table");
@@ -2231,6 +2233,7 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
             ops: Arc::new(Sink),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     })
     .expect("with_table");
@@ -2558,6 +2561,7 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
             ops: Arc::new(FixedFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     });
     if fd_a != Some(3) {
@@ -2570,6 +2574,7 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
             ops: Arc::new(FixedFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     });
     if fd_b != Some(3) {
@@ -2604,6 +2609,7 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
             ops: Arc::new(FixedFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     });
     if reused != Some(3) {
@@ -9469,6 +9475,7 @@ fn install_ready_file(task_id: u64, mask: u32) -> u32 {
             ops: Arc::new(ReadyFile(AtomicU32::new(mask))),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     })
     .unwrap()
@@ -11418,6 +11425,7 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
             ops: Arc::new(SentinelFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     })
     .expect("with_table");
@@ -11646,6 +11654,7 @@ fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
             ops: Arc::new(CcFile),
             offset: 0,
             flags: 0,
+            status_flags: 0,
         })
     })
     .expect("with_table");

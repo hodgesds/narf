@@ -29,14 +29,16 @@ pub struct FdEntry {
     /// every `Read` / `Write` so they're position-tracking by
     /// default (POSIX semantics).
     pub offset: u64,
-    /// Per-fd flags bitfield. Stage-4 round 2 (Tier-2 fd-table
-    /// breadth) only models `FD_CLOEXEC = bit 0` so dup3/fcntl can
-    /// round-trip the flag; other bits are reserved for future
-    /// O_NONBLOCK / O_DIRECT / etc. Defaults to 0 on every newly
-    /// installed fd — including the dup'd half — so the historical
-    /// "everything inherits across exec" Stage-4 behaviour holds
-    /// until exec actually consults the bit.
+    /// Per-fd-slot flags. `FD_CLOEXEC = bit 0`. Mirrors the kernel
+    /// fd-table "fd flags" word that `fcntl(F_GETFD/F_SETFD)`
+    /// manipulates — not the open-file-description status flags
+    /// (those live in `status_flags`).
     pub flags: u32,
+    /// Open-file-description status flags (`F_GETFL`/`F_SETFL`).
+    /// `O_NONBLOCK | O_APPEND | O_DIRECT` are honoured; access mode
+    /// bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) are stored but not yet
+    /// enforced at the syscall layer. Defaults to 0 on every new fd.
+    pub status_flags: u32,
 }
 
 /// `FD_CLOEXEC` — bit 0 of `FdEntry::flags`. Mirrors POSIX. Kept
@@ -44,11 +46,31 @@ pub struct FdEntry {
 /// poke the bit.
 pub const FD_CLOEXEC: u32 = 1;
 
+// ── Open-file status flag bits (Linux x86_64 numbering) ────────────
+//
+// These live in `FdEntry::status_flags` and are toggled by
+// `fcntl(F_SETFL)`. Access-mode bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`)
+// are reported by `F_GETFL` but ignored by `F_SETFL` (POSIX: only the
+// mutable subset is settable).
+pub const O_RDONLY: u32 = 0o0;
+pub const O_WRONLY: u32 = 0o1;
+pub const O_RDWR: u32 = 0o2;
+pub const O_ACCMODE: u32 = 0o3;
+pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_APPEND: u32 = 0o2000;
+pub const O_DIRECT: u32 = 0o40000;
+pub const O_CLOEXEC: u32 = 0o2000000;
+
+/// Settable subset of file status flags per `F_SETFL`. Linux honours
+/// these and silently masks the rest.
+pub const O_SETFL_MASK: u32 = O_NONBLOCK | O_APPEND | O_DIRECT;
+
 impl core::fmt::Debug for FdEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FdEntry")
             .field("offset", &self.offset)
             .field("flags", &self.flags)
+            .field("status_flags", &self.status_flags)
             .finish_non_exhaustive()
     }
 }
@@ -74,6 +96,25 @@ impl FdTable {
             self.slots.push(None);
         }
         for (i, s) in self.slots.iter_mut().enumerate().skip(3) {
+            if s.is_none() {
+                *s = Some(entry);
+                return i as u32;
+            }
+        }
+        let i = self.slots.len();
+        self.slots.push(Some(entry));
+        i as u32
+    }
+
+    /// Insert `entry` at the lowest free slot ≥ `min`. Used by
+    /// `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC`. Caps `min` at 3 if it
+    /// would otherwise land on the stdio reservations.
+    pub fn open_at_least(&mut self, entry: FdEntry, min: u32) -> u32 {
+        let min = (min as usize).max(3);
+        while self.slots.len() <= min {
+            self.slots.push(None);
+        }
+        for (i, s) in self.slots.iter_mut().enumerate().skip(min) {
             if s.is_none() {
                 *s = Some(entry);
                 return i as u32;
@@ -147,6 +188,7 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
                 ops: console.clone(),
                 offset: 0,
                 flags: 0,
+                status_flags: 0,
             },
         );
         t.set(
@@ -155,6 +197,7 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
                 ops: console.clone(),
                 offset: 0,
                 flags: 0,
+                status_flags: 0,
             },
         );
         t.set(
@@ -163,6 +206,7 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
                 ops: console,
                 offset: 0,
                 flags: 0,
+                status_flags: 0,
             },
         );
         t
@@ -407,6 +451,10 @@ pub fn detach(task_id: u64) {
     if let Some(map) = TABLES.lock().as_mut() {
         map.remove(&task_id);
     }
+    // Drop any advisory POSIX locks the task held so its peers can
+    // make progress on shared inodes.
+    #[cfg(feature = "linux-compat")]
+    locks::release_owner(task_id);
 }
 
 /// Test/reset hook — wipe every per-task table. Lets independent
@@ -419,4 +467,121 @@ pub fn __test_reset() {
 /// Number of tasks with at least one fd installed. Diagnostic.
 pub fn live_task_count() -> usize {
     TABLES.lock().as_ref().map(|m| m.len()).unwrap_or(0)
+}
+
+// ── Advisory POSIX file locks (Wave-68, linux-compat) ──────────────
+//
+// `fcntl(F_SETLK/F_SETLKW/F_GETLK)` advisory range locks. Keyed by
+// the underlying open-file object identity (`Arc::as_ptr` cast to
+// usize), so two fds that point at the same inode share locks.
+// Conflict rule: a write lock conflicts with any other lock on an
+// overlapping range; a read lock conflicts only with a write lock.
+// `owner` is the holding task id — same owner replaces / extends.
+//
+// F_SETLKW (blocking) is *not* wired to a waker; today it returns
+// EAGAIN on conflict just like F_SETLK. A follow-up wave will add
+// the per-inode wait queue.
+
+#[cfg(feature = "linux-compat")]
+pub mod locks {
+    use super::*;
+
+    /// `l_type` values from POSIX `struct flock`.
+    pub const F_RDLCK: i16 = 0;
+    pub const F_WRLCK: i16 = 1;
+    pub const F_UNLCK: i16 = 2;
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Lock {
+        pub owner: u64,
+        pub ty: i16, // F_RDLCK or F_WRLCK
+        pub start: i64,
+        pub len: i64, // 0 = to EOF
+    }
+
+    impl Lock {
+        /// Inclusive end of this range; `i64::MAX` if `len == 0`.
+        pub fn end(&self) -> i64 {
+            if self.len == 0 {
+                i64::MAX
+            } else {
+                self.start.saturating_add(self.len).saturating_sub(1)
+            }
+        }
+        pub fn overlaps(&self, other: &Lock) -> bool {
+            self.start <= other.end() && other.start <= self.end()
+        }
+        pub fn conflicts(&self, other: &Lock) -> bool {
+            if self.owner == other.owner {
+                return false;
+            }
+            if !self.overlaps(other) {
+                return false;
+            }
+            self.ty == F_WRLCK || other.ty == F_WRLCK
+        }
+    }
+
+    static TABLE: IrqSafeSpinLock<Option<BTreeMap<usize, Vec<Lock>>>> =
+        IrqSafeSpinLock::new(None);
+
+    fn ensure() {
+        let mut g = TABLE.lock();
+        if g.is_none() {
+            *g = Some(BTreeMap::new());
+        }
+    }
+
+    /// Attempt to install `req`. Returns Ok if installed, Err with
+    /// the first conflicting lock if not.
+    pub fn try_set(key: usize, req: Lock) -> Result<(), Lock> {
+        ensure();
+        let mut g = TABLE.lock();
+        let map = g.as_mut().unwrap();
+        let bucket = map.entry(key).or_insert_with(Vec::new);
+        if req.ty == F_UNLCK {
+            bucket.retain(|l| !(l.owner == req.owner && l.overlaps(&req)));
+            return Ok(());
+        }
+        for l in bucket.iter() {
+            if l.conflicts(&req) {
+                return Err(*l);
+            }
+        }
+        // Merge with same-owner locks of the same type, drop covered.
+        bucket.retain(|l| !(l.owner == req.owner && l.overlaps(&req)));
+        bucket.push(req);
+        Ok(())
+    }
+
+    /// Probe `req`. If a conflict exists, returns the blocker; else
+    /// returns None (caller should report F_UNLCK).
+    pub fn probe(key: usize, req: Lock) -> Option<Lock> {
+        let g = TABLE.lock();
+        let map = match g.as_ref() {
+            Some(m) => m,
+            None => return None,
+        };
+        let bucket = map.get(&key)?;
+        bucket.iter().copied().find(|l| l.conflicts(&req))
+    }
+
+    /// Drop every lock owned by `owner`. Call on task exit so leaked
+    /// locks don't pin out other tasks forever.
+    pub fn release_owner(owner: u64) {
+        let mut g = TABLE.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None => return,
+        };
+        for bucket in map.values_mut() {
+            bucket.retain(|l| l.owner != owner);
+        }
+        map.retain(|_, v| !v.is_empty());
+    }
+
+    #[doc(hidden)]
+    pub fn __test_reset() {
+        *TABLE.lock() = Some(BTreeMap::new());
+    }
 }

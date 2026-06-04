@@ -428,6 +428,7 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
             ops,
             offset: 0,
             flags: cloexec,
+            status_flags: 0,
         })
     });
 
