@@ -47,6 +47,7 @@ pub mod init;
 pub mod interp;
 pub mod io_mux;
 pub mod loader;
+pub mod pidfd;
 pub mod pipe;
 pub mod poll;
 pub mod process;
