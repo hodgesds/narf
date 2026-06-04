@@ -53,6 +53,8 @@ pub mod interp;
 pub mod io_mux;
 pub mod loader;
 pub mod pidfd;
+#[cfg(feature = "container")]
+pub mod pid_ns;
 pub mod pipe;
 pub mod poll;
 pub mod process;
