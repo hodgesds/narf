@@ -22,9 +22,7 @@ pub const MAX_SEGMENTS: usize = 5;
 
 /// Reserved root prefixes that only the kernel can mint topics
 /// under.
-pub const RESERVED_ROOTS: &[&str] = &[
-    "kernel", "system", "net", "block", "input", "acpi", "power",
-];
+pub const RESERVED_ROOTS: &[&str] = &["kernel", "system", "net", "block", "input", "acpi", "power"];
 
 /// User-mint prefix.
 pub const USER_ROOT: &str = "user";

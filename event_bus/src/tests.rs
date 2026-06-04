@@ -396,7 +396,10 @@ fn smoke_event_bus_name_validation() -> TestResult {
         return TestResult::Fail("over-long name should be TooLong");
     }
     // Invalid char.
-    if !matches!(TopicName::parse("user.bad name"), Err(NameError::InvalidChar)) {
+    if !matches!(
+        TopicName::parse("user.bad name"),
+        Err(NameError::InvalidChar)
+    ) {
         return TestResult::Fail("space should be InvalidChar");
     }
     TestResult::Pass

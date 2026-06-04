@@ -23,9 +23,9 @@
 
 extern crate alloc;
 
-mod engine;
 pub mod audit;
 pub mod cap;
+mod engine;
 pub mod payload;
 pub mod publisher;
 pub mod registry;
@@ -40,8 +40,8 @@ pub mod topic;
 #[doc(hidden)]
 pub use registry::__reset_for_test as __registry_reset_for_test;
 
-mod tests;
 mod e2e_tests;
+mod tests;
 
 pub use audit::AuditEvent;
 pub use cap::{Publisher as PublisherCap, Subscriber as SubscriberCap, TopicRegistry};
@@ -49,8 +49,8 @@ pub use engine::SeqNum;
 pub use payload::{ArenaHandle, Event};
 pub use publisher::{PublishError, Publisher};
 pub use registry::{
-    audit_subscribe_kernel, create_topic, create_topic_with_arena, init, lookup_topic,
-    CreateError, LookupError, TopicId,
+    audit_subscribe_kernel, create_topic, create_topic_with_arena, init, lookup_topic, CreateError,
+    LookupError, TopicId,
 };
 pub use subscriber::{RecvError, Subscriber};
 pub use topic::{NameError, TopicName, MAX_NAME_BYTES, MAX_SEGMENTS};

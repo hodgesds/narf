@@ -26,8 +26,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::cap::TopicRegistry;
 use crate::{
-    audit_subscribe_kernel, create_topic, create_topic_with_arena, init, lookup_topic,
-    AuditEvent, ArenaHandle, CreateError, LookupError, PublishError, RecvError, SeqNum,
+    audit_subscribe_kernel, create_topic, create_topic_with_arena, init, lookup_topic, ArenaHandle,
+    AuditEvent, CreateError, LookupError, PublishError, RecvError, SeqNum,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -187,7 +187,11 @@ fn e2e_fanout_three_subscribers() -> TestResult {
     let subs_mut: [&mut dyn FnMut() -> TestResult; 0] = [];
     let _ = subs_mut;
 
-    for (label, sub) in [("sub_a", &mut sub_a), ("sub_b", &mut sub_b), ("sub_c", &mut sub_c)] {
+    for (label, sub) in [
+        ("sub_a", &mut sub_a),
+        ("sub_b", &mut sub_b),
+        ("sub_c", &mut sub_c),
+    ] {
         for i in 0u32..5 {
             match sub.try_next() {
                 Ok(Some((_seq, ev))) if ev.id == i => {}
@@ -358,7 +362,11 @@ fn e2e_late_join_sees_new_only() -> TestResult {
                     return TestResult::Fail("late subscriber received unexpected event id");
                 }
             }
-            Ok(None) => return TestResult::Fail("late subscriber ring empty before all post-join events delivered"),
+            Ok(None) => {
+                return TestResult::Fail(
+                    "late subscriber ring empty before all post-join events delivered",
+                )
+            }
             Err(_) => return TestResult::Fail("late subscriber try_next error"),
         }
     }
@@ -493,15 +501,11 @@ fn e2e_arena_variable_payload() -> TestResult {
     let reg_r: Cap<TopicRegistry, Read> = Cap::bootstrap();
 
     // 128 bytes per arena slot — bigger than a typical fixed slot.
-    let (_id, publisher) = match create_topic_with_arena::<ArenaTestEvent>(
-        &reg_w,
-        "user.e2e.arena",
-        16,
-        128,
-    ) {
-        Ok(v) => v,
-        Err(_) => return TestResult::Fail("create_topic_with_arena failed"),
-    };
+    let (_id, publisher) =
+        match create_topic_with_arena::<ArenaTestEvent>(&reg_w, "user.e2e.arena", 16, 128) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("create_topic_with_arena failed"),
+        };
     let mut sub = match lookup_topic::<ArenaTestEvent>(&reg_r, "user.e2e.arena") {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("lookup failed"),
@@ -649,14 +653,13 @@ fn e2e_acpi_notify_migrated_shape() -> TestResult {
 
     // Exact same call the migrated bus::acpi_notify::init() makes:
     // create a topic on the reserved "acpi." root, capacity 64.
-    let (_id, publisher) =
-        match create_topic::<MirrorNotifyEvent>(&reg_w, "acpi.notify", 64) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = e;
-                return TestResult::Fail("create_topic for acpi.notify failed");
-            }
-        };
+    let (_id, publisher) = match create_topic::<MirrorNotifyEvent>(&reg_w, "acpi.notify", 64) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("create_topic for acpi.notify failed");
+        }
+    };
 
     // Exact same path as bus::acpi_notify::subscribe().
     let mut sub = match lookup_topic::<MirrorNotifyEvent>(&reg_r, "acpi.notify") {

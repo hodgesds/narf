@@ -8,9 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::TypeId;
 
-use narf_capabilities::{
-    object_table, Cap, CapKind, CapSlot, Invoke, Read, Rights, Write,
-};
+use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Invoke, Read, Rights, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::audit::{publish_audit_mint, AuditOp};
