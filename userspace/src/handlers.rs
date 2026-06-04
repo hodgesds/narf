@@ -6336,8 +6336,22 @@ fn sys_gethostname(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let g = HOSTNAME.lock();
-    let bytes = g.as_bytes();
+    // Wave-72: per-task UTS namespace wins when present.
+    #[cfg(feature = "container")]
+    let host_owned: Option<alloc::string::String> = {
+        let task = current_task_id();
+        crate::namespaces::uts_ns_of(task).map(|ns| ns.hostname())
+    };
+    #[cfg(not(feature = "container"))]
+    let host_owned: Option<alloc::string::String> = None;
+
+    let g_fallback;
+    let bytes: &[u8] = if let Some(ref s) = host_owned {
+        s.as_bytes()
+    } else {
+        g_fallback = HOSTNAME.lock();
+        g_fallback.as_bytes()
+    };
     if bytes.len() + 1 > len {
         ctx.set_return(fail);
         return;
@@ -6346,11 +6360,13 @@ fn sys_gethostname(ctx: &mut dyn TrapContext) {
     let mut kbuf = alloc::vec![0u8; bytes.len() + 1];
     kbuf[..bytes.len()].copy_from_slice(bytes);
     // kbuf[bytes.len()] is already 0 (NUL).
+    let n = bytes.len();
+    drop(host_owned);
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
     }
-    ctx.set_return(SyscallReturn::ok(bytes.len() as u64));
+    ctx.set_return(SyscallReturn::ok(n as u64));
 }
 
 fn sys_sethostname(ctx: &mut dyn TrapContext) {
@@ -6369,10 +6385,139 @@ fn sys_sethostname(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Wave-72: if caller has an explicit UTS NS, write there; else fall
+    // through to the global hostname slot.
+    #[cfg(feature = "container")]
+    {
+        let task = current_task_id();
+        if let Some(ns) = crate::namespaces::uts_ns_of(task) {
+            ns.set_hostname(&s);
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+    }
     let mut g = HOSTNAME.lock();
     g.clear();
     g.push_str(&s);
     ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── Wave-72 — uname(2), setdomainname(2), SysV IPC get-by-key ─────
+//
+// `struct utsname` is six 65-byte fixed-length fields (NUL-terminated)
+// per Linux. Total 390 bytes. NARF cap matches Linux __NEW_UTS_LEN=64
+// plus the trailing NUL byte → 65.
+
+#[cfg(feature = "container")]
+const UTSNAME_FIELD_LEN: usize = 65;
+#[cfg(feature = "container")]
+const UTSNAME_STRUCT_LEN: usize = UTSNAME_FIELD_LEN * 6;
+
+#[cfg(feature = "container")]
+fn pack_utsname_field(dst: &mut [u8], src: &str) {
+    let n = core::cmp::min(src.len(), UTSNAME_FIELD_LEN - 1);
+    dst[..n].copy_from_slice(&src.as_bytes()[..n]);
+    // remaining bytes already zeroed by caller
+}
+
+#[cfg(feature = "container")]
+fn sys_uname(ctx: &mut dyn TrapContext) {
+    let buf = ctx.args().arg0 as u64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if buf == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let ns = crate::namespaces::current_uts_ns(task);
+    let hostname = ns.hostname();
+    let domainname = ns.domainname();
+    let mut kbuf = alloc::vec![0u8; UTSNAME_STRUCT_LEN];
+    let mut off = 0usize;
+    // sysname / nodename / release / version / machine / domainname.
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "NARF");
+    off += UTSNAME_FIELD_LEN;
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &hostname);
+    off += UTSNAME_FIELD_LEN;
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "0.1");
+    off += UTSNAME_FIELD_LEN;
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "narf");
+    off += UTSNAME_FIELD_LEN;
+    #[cfg(target_arch = "x86_64")]
+    let machine = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let machine = "aarch64";
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let machine = "unknown";
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], machine);
+    off += UTSNAME_FIELD_LEN;
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &domainname);
+    let _ = off;
+    if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+#[cfg(feature = "container")]
+fn sys_setdomainname(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let buf = args.arg0 as u64;
+    let len = args.arg1 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if len == 0 || len > crate::namespaces::UTS_NAME_MAX {
+        ctx.set_return(fail);
+        return;
+    }
+    let s = match copy_user_path_raw(buf, len) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let task = current_task_id();
+    let ns = crate::namespaces::current_uts_ns(task);
+    ns.set_domainname(&s);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+#[cfg(feature = "container")]
+fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
+    if let Some(ns) = crate::namespaces::current_ipc_ns(task) {
+        return ns;
+    }
+    // Lazy-install a per-task IPC NS so the get-by-key family has a
+    // stable id space even for tasks that never unshared. Matches the
+    // shape Linux uses (every task is always in some IPC NS).
+    crate::namespaces::unshare_ipc(task);
+    crate::namespaces::current_ipc_ns(task)
+        .expect("unshare_ipc just installed an entry")
+}
+
+#[cfg(feature = "container")]
+fn sys_shmget(ctx: &mut dyn TrapContext) {
+    let key = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let ns = current_or_default_ipc_ns(task);
+    ctx.set_return(SyscallReturn::ok(ns.shmget(key) as u64));
+}
+
+#[cfg(feature = "container")]
+fn sys_semget(ctx: &mut dyn TrapContext) {
+    let key = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let ns = current_or_default_ipc_ns(task);
+    ctx.set_return(SyscallReturn::ok(ns.semget(key) as u64));
+}
+
+#[cfg(feature = "container")]
+fn sys_msgget(ctx: &mut dyn TrapContext) {
+    let key = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let ns = current_or_default_ipc_ns(task);
+    ctx.set_return(SyscallReturn::ok(ns.msgget(key) as u64));
 }
 
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
@@ -7580,6 +7725,24 @@ fn sys_unshare(ctx: &mut dyn TrapContext) {
         any = true;
     }
 
+    // Wave-72 — UTS / NET / IPC namespaces.
+    #[cfg(feature = "container")]
+    {
+        let task = current_task_id();
+        if flags & crate::namespaces::CLONE_NEWUTS != 0 {
+            crate::namespaces::unshare_uts(task);
+            any = true;
+        }
+        if flags & crate::namespaces::CLONE_NEWNET != 0 {
+            crate::namespaces::unshare_net(task);
+            any = true;
+        }
+        if flags & crate::namespaces::CLONE_NEWIPC != 0 {
+            crate::namespaces::unshare_ipc(task);
+            any = true;
+        }
+    }
+
     // Honour the no-op path (no NS bits set) as success — Linux unshare
     // returns 0 with flags=0.
     let _ = any;
@@ -7628,6 +7791,45 @@ fn sys_setns(ctx: &mut dyn TrapContext) {
             match mount_namespace_of(target_task) {
                 Some(ns) => {
                     install_mount_namespace(caller, ns);
+                    any = true;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok(!0u64));
+                    return;
+                }
+            }
+        }
+
+        // Wave-72 — UTS / NET / IPC. Target must have an explicit
+        // per-task NS of the requested flavour; otherwise EINVAL.
+        if nstype & crate::namespaces::CLONE_NEWUTS != 0 {
+            match crate::namespaces::uts_ns_of(target_task) {
+                Some(ns) => {
+                    crate::namespaces::setns_uts(caller, ns);
+                    any = true;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok(!0u64));
+                    return;
+                }
+            }
+        }
+        if nstype & crate::namespaces::CLONE_NEWNET != 0 {
+            match crate::namespaces::net_ns_of(target_task) {
+                Some(ns) => {
+                    crate::namespaces::setns_net(caller, ns);
+                    any = true;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok(!0u64));
+                    return;
+                }
+            }
+        }
+        if nstype & crate::namespaces::CLONE_NEWIPC != 0 {
+            match crate::namespaces::ipc_ns_of(target_task) {
+                Some(ns) => {
+                    crate::namespaces::setns_ipc(caller, ns);
                     any = true;
                 }
                 None => {
@@ -11600,6 +11802,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "sethostname",
         RawFnHandler(sys_sethostname),
     );
+    #[cfg(feature = "container")]
+    {
+        table.install_raw(Syscall::Uname, "uname", RawFnHandler(sys_uname));
+        table.install_raw(
+            Syscall::Setdomainname,
+            "setdomainname",
+            RawFnHandler(sys_setdomainname),
+        );
+        table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget));
+        table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
+        table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
+    }
     table.install_raw(Syscall::Getrlimit, "getrlimit", RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit, "setrlimit", RawFnHandler(sys_setrlimit));
     table.install_raw(Syscall::Prlimit64, "prlimit64", RawFnHandler(sys_prlimit64));

@@ -328,6 +328,26 @@ pub fn current_uts_ns(task: u64) -> Arc<UtsNamespace> {
     global_uts()
 }
 
+/// Like `current_uts_ns` but returns `None` if the task has no
+/// explicit UTS namespace. Used by `setns(2)` to refuse joining a
+/// task that still shares the global default.
+pub fn uts_ns_of(task: u64) -> Option<Arc<UtsNamespace>> {
+    let g = UTS_BY_TASK.lock();
+    g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+/// Alias for `current_net_ns` matching the `*_ns_of` naming used by
+/// setns(2) call sites.
+pub fn net_ns_of(task: u64) -> Option<Arc<NetNamespace>> {
+    current_net_ns(task)
+}
+
+/// Alias for `current_ipc_ns` matching the `*_ns_of` naming used by
+/// setns(2) call sites.
+pub fn ipc_ns_of(task: u64) -> Option<Arc<IpcNamespace>> {
+    current_ipc_ns(task)
+}
+
 /// Look up the calling task's net namespace. `None` means "share
 /// the global iface registry" — the caller routes through
 /// `narf_net::iface::*` as before.

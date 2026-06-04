@@ -1417,6 +1417,30 @@ pub enum Syscall {
     /// `mask` and `flags` (AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW,
     /// AT_NO_AUTOMOUNT, AT_STATX_SYNC_*). Returns 0 / -1.
     Statx,
+
+    /// Wave-72 — `uname(buf)`. arg0 = utsname-out ptr. Fills the
+    /// 6×UTSNAME_LEN fields (sysname/nodename/release/version/
+    /// machine/domainname) from the calling task's UTS namespace.
+    /// Returns 0 / -1. Gated `container`.
+    Uname,
+
+    /// Wave-72 — `setdomainname(buf, len)`. arg0 = buf ptr, arg1 =
+    /// len. Replaces the domainname of the calling task's UTS
+    /// namespace. Returns 0 / -1. Gated `container`.
+    Setdomainname,
+
+    /// Wave-72 — `shmget(key, size, flags)`. arg0 = key, arg1 =
+    /// size (ignored — segments are stubbed), arg2 = flags
+    /// (ignored). Returns the per-NS id for `key`. Gated `container`.
+    Shmget,
+
+    /// Wave-72 — `semget(key, nsems, flags)`. Same shape as shmget.
+    /// Gated `container`.
+    Semget,
+
+    /// Wave-72 — `msgget(key, flags)`. arg0 = key, arg1 = flags
+    /// (ignored). Returns the per-NS id for `key`. Gated `container`.
+    Msgget,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1578,6 +1602,17 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::InitModule, 175),
     (Syscall::DeleteModule, 176),
     (Syscall::FinitModule, 313),
+    // Wave-72 — UTS/IPC syscalls (gated `container`).
+    #[cfg(feature = "container")]
+    (Syscall::Uname, 63),
+    #[cfg(feature = "container")]
+    (Syscall::Setdomainname, 171),
+    #[cfg(feature = "container")]
+    (Syscall::Shmget, 29),
+    #[cfg(feature = "container")]
+    (Syscall::Semget, 64),
+    #[cfg(feature = "container")]
+    (Syscall::Msgget, 68),
     // tcgetattr/tcsetattr are libc-only on Linux (ioctl(TCGETS) backed);
     // we keep them as direct syscalls and place them in the NARF range.
     // gethostname is libc-only on Linux too.
@@ -1728,6 +1763,17 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::InitModule, 105),
     (Syscall::DeleteModule, 106),
     (Syscall::FinitModule, 273),
+    // Wave-72 — UTS/IPC syscalls (gated `container`).
+    #[cfg(feature = "container")]
+    (Syscall::Uname, 160),
+    #[cfg(feature = "container")]
+    (Syscall::Setdomainname, 162),
+    #[cfg(feature = "container")]
+    (Syscall::Shmget, 194),
+    #[cfg(feature = "container")]
+    (Syscall::Semget, 190),
+    #[cfg(feature = "container")]
+    (Syscall::Msgget, 186),
 ];
 
 /// NARF-only extension numbers — single shared range on every arch.
