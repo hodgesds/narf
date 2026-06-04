@@ -1486,9 +1486,9 @@ fn build_smbios_3_anchor(structure_table_addr: u64) -> [u8; 24] {
     let mut buf = [0u8; 24];
     buf[0..5].copy_from_slice(ANCHOR_SM3);
     buf[6] = 24; // entry-point length
-    buf[7] = 3;  // major
-    buf[8] = 6;  // minor
-    buf[9] = 0;  // doc rev
+    buf[7] = 3; // major
+    buf[8] = 6; // minor
+    buf[9] = 0; // doc rev
     buf[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
     buf[16..24].copy_from_slice(&structure_table_addr.to_le_bytes());
     // Compute checksum at byte 5.
@@ -2204,7 +2204,12 @@ kernel_test_in!("acpi", smoke_acpi_unknown_state_clean_after_reset);
 fn smoke_acpi_copy_memory_ranges_empty_after_reset() -> TestResult {
     use crate::MemRange;
     crate::__reset_for_test();
-    let mut buf = [MemRange { base: 0, length: 0, node: 0, enabled: false }; 8];
+    let mut buf = [MemRange {
+        base: 0,
+        length: 0,
+        node: 0,
+        enabled: false,
+    }; 8];
     let n = crate::copy_memory_ranges(&mut buf);
     if n != 0 {
         return TestResult::Fail("copy_memory_ranges returned items after reset");
@@ -2583,7 +2588,10 @@ fn smoke_acpi_ac_adapter_decode_psr_online_offline() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("acpi/ac_adapter", smoke_acpi_ac_adapter_decode_psr_online_offline);
+kernel_test_in!(
+    "acpi/ac_adapter",
+    smoke_acpi_ac_adapter_decode_psr_online_offline
+);
 
 // ── acpi/lid ───────────────────────────────────────────────────────
 
@@ -2606,9 +2614,7 @@ kernel_test_in!("acpi/lid", smoke_acpi_lid_decode_closed_open_and_nonzero);
 // ── acpi/buttons ───────────────────────────────────────────────────
 
 fn smoke_acpi_buttons_power_press_count_drain() -> TestResult {
-    use crate::buttons::{
-        drain_power_button_presses, record_power_button_press, __reset_for_test,
-    };
+    use crate::buttons::{__reset_for_test, drain_power_button_presses, record_power_button_press};
     __reset_for_test();
     record_power_button_press();
     record_power_button_press();
@@ -2626,8 +2632,8 @@ kernel_test_in!("acpi/buttons", smoke_acpi_buttons_power_press_count_drain);
 
 fn smoke_acpi_buttons_sleep_and_power_independent() -> TestResult {
     use crate::buttons::{
-        drain_power_button_presses, drain_sleep_button_presses, record_power_button_press,
-        record_sleep_button_press, __reset_for_test,
+        __reset_for_test, drain_power_button_presses, drain_sleep_button_presses,
+        record_power_button_press, record_sleep_button_press,
     };
     __reset_for_test();
     record_power_button_press();
@@ -2704,8 +2710,7 @@ kernel_test_in!("acpi/fan", smoke_acpi_fan_has_tachometer_handles_unknown);
 
 fn smoke_acpi_fan_registry_register_and_iterate() -> TestResult {
     use crate::fan::{
-        fan_count, register_fan, registered_fans, Fan, FanRuntimeError, FanStatus,
-        __reset_for_test,
+        fan_count, register_fan, registered_fans, Fan, FanRuntimeError, FanStatus, __reset_for_test,
     };
     use alloc::sync::Arc;
     __reset_for_test();
@@ -2714,11 +2719,19 @@ fn smoke_acpi_fan_registry_register_and_iterate() -> TestResult {
     }
     struct StubFan;
     impl Fan for StubFan {
-        fn name(&self) -> &'static str { "cpu_fan" }
-        fn status(&self) -> Result<FanStatus, FanRuntimeError> {
-            Ok(FanStatus { revision: 0, control: 600, speed_rpm: 3000 })
+        fn name(&self) -> &'static str {
+            "cpu_fan"
         }
-        fn set_control(&self, c: u32) -> Result<u32, FanRuntimeError> { Ok(c) }
+        fn status(&self) -> Result<FanStatus, FanRuntimeError> {
+            Ok(FanStatus {
+                revision: 0,
+                control: 600,
+                speed_rpm: 3000,
+            })
+        }
+        fn set_control(&self, c: u32) -> Result<u32, FanRuntimeError> {
+            Ok(c)
+        }
     }
     register_fan(Arc::new(StubFan));
     if fan_count() != 1 {
@@ -2819,4 +2832,7 @@ fn smoke_acpi_arm_s3_waking_vector_requires_facs() -> TestResult {
         _ => TestResult::Fail("FACS phys=0 must yield FacsNotParsed"),
     }
 }
-kernel_test_in!("acpi/wake_vector", smoke_acpi_arm_s3_waking_vector_requires_facs);
+kernel_test_in!(
+    "acpi/wake_vector",
+    smoke_acpi_arm_s3_waking_vector_requires_facs
+);

@@ -215,7 +215,10 @@ impl<'a> Iterator for StructIter<'a> {
         // ending in an extra NUL. If the formatted section is followed
         // immediately by a single NUL, the structure has no strings.
         let mut strings = Vec::new();
-        if p + 1 <= self.buf.len() && self.buf[p] == 0 && (p + 2 > self.buf.len() || self.buf[p + 1] == 0) {
+        if p + 1 <= self.buf.len()
+            && self.buf[p] == 0
+            && (p + 2 > self.buf.len() || self.buf[p + 1] == 0)
+        {
             p += 2;
         } else {
             loop {
@@ -229,7 +232,9 @@ impl<'a> Iterator for StructIter<'a> {
                 if p == self.buf.len() {
                     return None;
                 }
-                let s = core::str::from_utf8(&self.buf[start..p]).unwrap_or("").into();
+                let s = core::str::from_utf8(&self.buf[start..p])
+                    .unwrap_or("")
+                    .into();
                 strings.push(s);
                 p += 1; // consume NUL
                 if p < self.buf.len() && self.buf[p] == 0 {
@@ -308,7 +313,8 @@ impl MemoryDevice {
         };
         let form_factor = formatted[0x0A];
         let memory_type = formatted[0x0E];
-        let configured_speed_mt_per_s = u16::from_le_bytes([formatted[0x1B - 4], formatted[0x1B - 3]]);
+        let configured_speed_mt_per_s =
+            u16::from_le_bytes([formatted[0x1B - 4], formatted[0x1B - 3]]);
         let max_speed_mt_per_s = u16::from_le_bytes([formatted[0x11], formatted[0x12]]);
         Ok(Self {
             size_bytes,

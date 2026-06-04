@@ -1822,13 +1822,13 @@ pub fn fadt_pm() -> Option<FadtPm> {
 // ── PM1 status / control I/O helpers ────────────────────────────────
 //
 // PM1 status bits we care about (ACPI 6.5 §4.8.3.1.1):
-pub const PM1_STS_TMR:    u16 = 1 << 0;
-pub const PM1_STS_BM:     u16 = 1 << 4;
-pub const PM1_STS_GBL:    u16 = 1 << 5;
+pub const PM1_STS_TMR: u16 = 1 << 0;
+pub const PM1_STS_BM: u16 = 1 << 4;
+pub const PM1_STS_GBL: u16 = 1 << 5;
 pub const PM1_STS_PWRBTN: u16 = 1 << 8;
 pub const PM1_STS_SLPBTN: u16 = 1 << 9;
-pub const PM1_STS_RTC:    u16 = 1 << 10;
-pub const PM1_STS_WAK:    u16 = 1 << 15;
+pub const PM1_STS_RTC: u16 = 1 << 10;
+pub const PM1_STS_WAK: u16 = 1 << 15;
 
 /// Read the OR of PM1a and PM1b status registers. Status block lives
 /// in the first half of `pm1*_evt`.
@@ -2107,9 +2107,9 @@ pub fn gpe_status_clear_bit(gpe_num: u32) {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct EcdtInfo {
     pub control_addr: u64,
-    pub data_addr:    u64,
-    pub uid:          u32,
-    pub gpe_bit:      u8,
+    pub data_addr: u64,
+    pub uid: u32,
+    pub gpe_bit: u8,
 }
 
 static ECDT_DATA: IrqSafeSpinLock<EcdtInfo> = IrqSafeSpinLock::new(EcdtInfo {
@@ -2129,18 +2129,38 @@ fn parse_ecdt_body(body: &[u8]) {
     let off = SDT_HEADER_SIZE;
     // GAS.Address @ +4..12 of each GAS.
     let control_addr = u64::from_le_bytes([
-        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
-        body[off + 8], body[off + 9], body[off + 10], body[off + 11],
+        body[off + 4],
+        body[off + 5],
+        body[off + 6],
+        body[off + 7],
+        body[off + 8],
+        body[off + 9],
+        body[off + 10],
+        body[off + 11],
     ]);
     let data_addr = u64::from_le_bytes([
-        body[off + 16], body[off + 17], body[off + 18], body[off + 19],
-        body[off + 20], body[off + 21], body[off + 22], body[off + 23],
+        body[off + 16],
+        body[off + 17],
+        body[off + 18],
+        body[off + 19],
+        body[off + 20],
+        body[off + 21],
+        body[off + 22],
+        body[off + 23],
     ]);
     let uid = u32::from_le_bytes([
-        body[off + 24], body[off + 25], body[off + 26], body[off + 27],
+        body[off + 24],
+        body[off + 25],
+        body[off + 26],
+        body[off + 27],
     ]);
     let gpe_bit = body[off + 28];
-    *ECDT_DATA.lock() = EcdtInfo { control_addr, data_addr, uid, gpe_bit };
+    *ECDT_DATA.lock() = EcdtInfo {
+        control_addr,
+        data_addr,
+        uid,
+        gpe_bit,
+    };
     ECDT_PARSED.store(true, Ordering::Release);
 }
 
@@ -2155,7 +2175,10 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
             }
         })?;
     }
-    let ecdt_phys = match ecdt { Some(p) => p, None => return Ok(()) };
+    let ecdt_phys = match ecdt {
+        Some(p) => p,
+        None => return Ok(()),
+    };
 
     let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
     if total < SDT_HEADER_SIZE + 29 {

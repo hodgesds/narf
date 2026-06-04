@@ -221,12 +221,7 @@ pub unsafe fn read_id(h: &IoApicHandle) -> u8 {
 /// that the corresponding handler is installed before this routes
 /// the line — otherwise the next IRQ delivery hits an unconfigured
 /// dispatch slot.
-pub unsafe fn route_gsi_to_vector(
-    gsi: u32,
-    vector: u8,
-    dest_apic: u8,
-    flags: u32,
-) -> bool {
+pub unsafe fn route_gsi_to_vector(gsi: u32, vector: u8, dest_apic: u8, flags: u32) -> bool {
     let mut ioapics = [crate::IoApic::default(); crate::MAX_IOAPICS];
     let n = crate::copy_ioapics(&mut ioapics);
     for io in &ioapics[..n] {
