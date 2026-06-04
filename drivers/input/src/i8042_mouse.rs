@@ -123,7 +123,11 @@ pub enum InitError {
 
 fn deadline_cycles(ms: u64) -> u64 {
     let cpns = narf_time::cycles_per_ns() as u64;
-    let cpms = if cpns == 0 { 1_000_000 } else { cpns * 1_000_000 };
+    let cpms = if cpns == 0 {
+        1_000_000
+    } else {
+        cpns * 1_000_000
+    };
     narf_time::now_cycles().saturating_add(cpms.saturating_mul(ms))
 }
 
@@ -275,9 +279,7 @@ pub fn mouse_evdev_node() -> Option<Arc<DeviceNode>> {
 pub unsafe fn on_irq12() {
     // SAFETY: 0x60 data port read.
     let byte = unsafe { inb(PS2_DATA) };
-    let irqs = narf_input::I8042_MOUSE_IRQ_COUNT
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
+    let irqs = narf_input::I8042_MOUSE_IRQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     // Log every 64 IRQs and at IRQ 1 — the user can grep
     // /dev/kmsg to see if PS/2 mouse activity is reaching the
     // ISR. Logging from inside on_irq12 is acceptable because
@@ -285,12 +287,12 @@ pub unsafe fn on_irq12() {
     // backend's lock (see klog::record).
     if irqs == 1 || irqs % 64 == 0 {
         use core::fmt::Write as _;
-        let pkts = narf_input::I8042_MOUSE_PACKET_COUNT
-            .load(Ordering::Relaxed);
+        let pkts = narf_input::I8042_MOUSE_PACKET_COUNT.load(Ordering::Relaxed);
         let _ = writeln!(
             narf_console::Writer,
             "  i8042-mouse: irqs={} packets={}",
-            irqs, pkts
+            irqs,
+            pkts
         );
     }
 
@@ -330,8 +332,7 @@ pub unsafe fn on_irq12() {
 
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
     STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
-    narf_input::I8042_MOUSE_PACKET_COUNT
-        .fetch_add(1, Ordering::Relaxed);
+    narf_input::I8042_MOUSE_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // Legacy global ring (for cursor pump / FB status panel).
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));

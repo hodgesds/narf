@@ -189,9 +189,7 @@ const MT_CLASSES: &[MtClassEntry] = &[
     // Linux: hid-multitouch.c:268-270.
     MtClassEntry {
         class: MtClass::Default,
-        quirks: MtQuirks(
-            MtQuirks::ALWAYS_VALID.bits() | MtQuirks::CONTACT_CNT_ACCURATE.bits(),
-        ),
+        quirks: MtQuirks(MtQuirks::ALWAYS_VALID.bits() | MtQuirks::CONTACT_CNT_ACCURATE.bits()),
         max_contacts: 0,
         is_indirect: true,
     },
@@ -223,9 +221,7 @@ const MT_CLASSES: &[MtClassEntry] = &[
     // Linux: hid-multitouch.c:277-279.
     MtClassEntry {
         class: MtClass::ConfidenceContactId,
-        quirks: MtQuirks(
-            MtQuirks::VALID_IS_CONFIDENCE.bits() | MtQuirks::SLOT_IS_CONTACTID.bits(),
-        ),
+        quirks: MtQuirks(MtQuirks::VALID_IS_CONFIDENCE.bits() | MtQuirks::SLOT_IS_CONTACTID.bits()),
         max_contacts: 0,
         is_indirect: true,
     },
@@ -234,8 +230,7 @@ const MT_CLASSES: &[MtClassEntry] = &[
     MtClassEntry {
         class: MtClass::ConfidenceMinusOne,
         quirks: MtQuirks(
-            MtQuirks::VALID_IS_CONFIDENCE.bits()
-                | MtQuirks::SLOT_IS_CONTACTID_MINUS_ONE.bits(),
+            MtQuirks::VALID_IS_CONFIDENCE.bits() | MtQuirks::SLOT_IS_CONTACTID_MINUS_ONE.bits(),
         ),
         max_contacts: 0,
         is_indirect: true,
@@ -262,9 +257,7 @@ const MT_CLASSES: &[MtClassEntry] = &[
     // Linux: hid-multitouch.c:302-305.
     MtClassEntry {
         class: MtClass::ExportAllInputs,
-        quirks: MtQuirks(
-            MtQuirks::ALWAYS_VALID.bits() | MtQuirks::CONTACT_CNT_ACCURATE.bits(),
-        ),
+        quirks: MtQuirks(MtQuirks::ALWAYS_VALID.bits() | MtQuirks::CONTACT_CNT_ACCURATE.bits()),
         max_contacts: 0,
         is_indirect: true,
     },
@@ -495,13 +488,9 @@ impl MtDevice {
             MtShape::TouchScreen => {
                 let p = touchscreen::detect(d)?;
                 let max_contacts = if entry.max_contacts > 0 {
-                    entry
-                        .max_contacts
-                        .min(mt_features::HARD_MAX_CONTACTS)
+                    entry.max_contacts.min(mt_features::HARD_MAX_CONTACTS)
                 } else if p.contacts_max > 0 {
-                    (p.contacts_max as u32)
-                        .clamp(1, mt_features::HARD_MAX_CONTACTS as u32)
-                        as u8
+                    (p.contacts_max as u32).clamp(1, mt_features::HARD_MAX_CONTACTS as u32) as u8
                 } else {
                     mt_features::DEFAULT_MAX_CONTACTS
                 };
@@ -583,16 +572,14 @@ pub fn __reset_registry_for_test() {
 /// `TouchEvent`s + button events. Mirrors the structure of
 /// `i2c_hid_touch::pump_report` so the two pumps share the same
 /// per-frame contract.
-fn pump_ptp_inner(
-    dev: &MtDevice,
-    state: &mut MtPumpState,
-    r: &PtpDecoded,
-) -> usize {
+fn pump_ptp_inner(dev: &MtDevice, state: &mut MtPumpState, r: &PtpDecoded) -> usize {
     state.begin_frame();
     let mut emitted = 0usize;
 
     // Per-contact processing.
-    let n = (r.contact_count as usize).min(r.contacts.len()).min(dev.max_contacts as usize);
+    let n = (r.contact_count as usize)
+        .min(r.contacts.len())
+        .min(dev.max_contacts as usize);
     for c in r.contacts.iter().take(n) {
         let valid = is_contact_valid(dev.quirks, c.tip_switch, c.in_range, c.confidence);
         let cid = c.contact_id;
@@ -674,11 +661,7 @@ fn pump_ptp_inner(
     emitted
 }
 
-fn pump_screen_inner(
-    dev: &MtDevice,
-    state: &mut MtPumpState,
-    r: &DecodedTouchReport,
-) -> usize {
+fn pump_screen_inner(dev: &MtDevice, state: &mut MtPumpState, r: &DecodedTouchReport) -> usize {
     state.begin_frame();
     let mut emitted = 0usize;
 
@@ -692,7 +675,9 @@ fn pump_screen_inner(
     let (x_min, x_max) = profile.x_range;
     let (y_min, y_max) = profile.y_range;
 
-    let n = (r.contact_count as usize).min(r.contacts.len()).min(dev.max_contacts as usize);
+    let n = (r.contact_count as usize)
+        .min(r.contacts.len())
+        .min(dev.max_contacts as usize);
     let mut primary_emitted = false;
     for c in r.contacts.iter().take(n) {
         let valid = is_contact_valid(dev.quirks, c.tip_switch, c.in_range, c.confidence);
@@ -942,9 +927,7 @@ pub fn __build_ptp_decoded_for_test(
 /// Build a synthetic `DecodedTouchReport` for the touchscreen smoke
 /// pump tests.
 #[doc(hidden)]
-pub fn __build_screen_decoded_for_test(
-    contacts: &[(u8, bool, i32, i32)],
-) -> DecodedTouchReport {
+pub fn __build_screen_decoded_for_test(contacts: &[(u8, bool, i32, i32)]) -> DecodedTouchReport {
     use narf_hid::touchscreen::DecodedTouchContact;
     let mut decoded = Vec::with_capacity(contacts.len());
     for &(cid, tip, x, y) in contacts {
@@ -995,10 +978,7 @@ pub fn __attach_synth_pad_for_test(class: MtClass, max_contacts: u8) -> Arc<MtDe
 /// shape. Builds a synthetic descriptor inline since the
 /// touchscreen module doesn't expose a public blob.
 #[doc(hidden)]
-pub fn __attach_synth_screen_for_test(
-    class: MtClass,
-    max_contacts: u8,
-) -> Arc<MtDevice> {
+pub fn __attach_synth_screen_for_test(class: MtClass, max_contacts: u8) -> Arc<MtDevice> {
     let entry = lookup_class(class);
     let blob = synth_touchscreen_descriptor_blob();
     let parsed = narf_hid::descriptor::parse(&blob).expect("synth blob parses");
@@ -1050,13 +1030,13 @@ fn synth_touchscreen_descriptor_blob() -> Vec<u8> {
         0x81, 0x02, //     Input
         0x09, 0x31, //     Usage (Y)
         0x81, 0x02, //     Input
-        0xC0,       //   End Collection
+        0xC0, //   End Collection
         0x05, 0x0D, //   Usage Page (Digitizer)
         0x09, 0x54, //   Usage (Contact Count)
         0x25, 0x02, //   Logical Max (2)
         0x75, 0x08, //   Report Size (8)
         0x95, 0x01, //   Report Count (1)
         0x81, 0x02, //   Input
-        0xC0,       // End Collection
+        0xC0, // End Collection
     ]
 }

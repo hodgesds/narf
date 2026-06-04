@@ -34,12 +34,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub use narf_input::rmi4::{
-    Finger, F01DeviceStatus, PdtEntry, Rmi4Error, TouchpadReport,
-    F01_CONFIGURED, F01_DEVICE_CONTROL, F01_NOSLEEP, F01_REPORT_RATE_HIGH,
-    F01_SLEEP_NORMAL, F01_SLEEP_RESERVED, F01_SLEEP_SENSOR_SLEEP,
-    F01_SLEEP_SLEEP_NO_RECAL, F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT,
-    F30_GPIO_LED, F34_FLASH_REFLASH, F54_TEST_AND_REPORTING, PDT_ENTRY_SIZE,
-    PDT_LAST_SLOT_OFFSET,
+    F01DeviceStatus, Finger, PdtEntry, Rmi4Error, TouchpadReport, F01_CONFIGURED,
+    F01_DEVICE_CONTROL, F01_NOSLEEP, F01_REPORT_RATE_HIGH, F01_SLEEP_NORMAL, F01_SLEEP_RESERVED,
+    F01_SLEEP_SENSOR_SLEEP, F01_SLEEP_SLEEP_NO_RECAL, F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT,
+    F30_GPIO_LED, F34_FLASH_REFLASH, F54_TEST_AND_REPORTING, PDT_ENTRY_SIZE, PDT_LAST_SLOT_OFFSET,
 };
 
 // ── F$01 Product info ──────────────────────────────────────────────
@@ -307,11 +305,7 @@ pub fn decode_f30_buttons(data_regs: &[u8], gpio_count: u8) -> Result<u32, Rmi4E
 /// BTN_LEFT, bit 1 → BTN_RIGHT, bit 2 → BTN_MIDDLE. Returns
 /// `(left, right, middle)` booleans.
 pub fn classic_clickpad_buttons(bitmap: u32) -> (bool, bool, bool) {
-    (
-        (bitmap & 1) != 0,
-        (bitmap & 2) != 0,
-        (bitmap & 4) != 0,
-    )
+    ((bitmap & 1) != 0, (bitmap & 2) != 0, (bitmap & 4) != 0)
 }
 
 // ── Transport abstraction ──────────────────────────────────────────

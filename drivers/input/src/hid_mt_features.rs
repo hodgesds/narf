@@ -124,7 +124,9 @@ pub fn find_contact_count_max_feature(d: &ReportDescriptor) -> Option<&Field> {
     d.fields.iter().find(|f| {
         f.kind == FieldKind::Feature
             && f.usage_page == digitizer::PAGE
-            && f.usages.iter().any(|&(_, u)| u == digitizer::CONTACT_COUNT_MAX)
+            && f.usages
+                .iter()
+                .any(|&(_, u)| u == digitizer::CONTACT_COUNT_MAX)
     })
 }
 
@@ -163,10 +165,7 @@ pub fn decode_max_contact_count(field: &Field, body: &[u8]) -> u8 {
 /// Feature field. On success, returns the full report body (no
 /// report-id prefix) ready to feed to the transport's `set_feature`
 /// call.
-pub fn encode_max_contact_count(
-    d: &ReportDescriptor,
-    max_contacts: u8,
-) -> Option<Vec<u8>> {
+pub fn encode_max_contact_count(d: &ReportDescriptor, max_contacts: u8) -> Option<Vec<u8>> {
     let f = find_contact_count_max_feature(d)?;
     let report_id = f.report_id;
     let body_bits = d.report_body_bits(report_id, FieldKind::Feature);
@@ -190,11 +189,7 @@ pub fn encode_max_contact_count(
 ///    issued `GET_FEATURE` yet.
 /// 3. The per-contact slot list length (`profile.contacts_max`).
 /// 4. [`DEFAULT_MAX_CONTACTS`].
-pub fn resolve_max_contacts(
-    p: &PtpProfile,
-    d: &ReportDescriptor,
-    class_max: Option<u8>,
-) -> u8 {
+pub fn resolve_max_contacts(p: &PtpProfile, d: &ReportDescriptor, class_max: Option<u8>) -> u8 {
     if let Some(m) = class_max.filter(|&m| m > 0) {
         return m.min(HARD_MAX_CONTACTS);
     }

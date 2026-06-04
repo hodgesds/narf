@@ -39,7 +39,9 @@ use core::fmt::Write as _;
 
 use narf_hid::pen::DecodedPen;
 use narf_hid::touchscreen::{DecodedTouchContact, DecodedTouchReport, TouchscreenProfile};
-use narf_input::{abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent, TouchEvent, TouchState};
+use narf_input::{
+    abs, btn, push_global, AbsoluteEvent, ButtonEvent, InputEvent, TouchEvent, TouchState,
+};
 
 /// Maximum simultaneously tracked contacts. Modern touchscreens
 /// ship 5- or 10-finger panels; capping at 10 here costs only
@@ -156,16 +158,7 @@ pub fn pump_report(
             // a final "lift" frame with the position from the
             // last hold; we surface that as an Up event so the
             // consumer can finalise gestures.
-            push_touch_event(
-                slot,
-                cid,
-                c,
-                TouchState::Up,
-                x_min,
-                x_max,
-                y_min,
-                y_max,
-            );
+            push_touch_event(slot, cid, c, TouchState::Up, x_min, x_max, y_min, y_max);
             state.release(cid);
             pushed += 1;
         }
@@ -245,7 +238,10 @@ pub fn pump_pen_report(state: &mut PenPumpState, pen: &DecodedPen) -> usize {
             } else {
                 btn::BTN_TOOL_PEN
             };
-            let _ = push_global(InputEvent::Button(ButtonEvent { code: tool, pressed: true }));
+            let _ = push_global(InputEvent::Button(ButtonEvent {
+                code: tool,
+                pressed: true,
+            }));
             pushed += 1;
             // If the old tool was the other type, release it.
             if state.in_range {
@@ -336,7 +332,12 @@ pub fn log_boot_summary(path: &str, profile: &TouchscreenProfile) {
     let _ = writeln!(
         narf_console::Writer,
         "  touch: {} digitizer, {} contacts max, x=[{}..={}] y=[{}..={}]",
-        path, profile.contacts_max, xmin, xmax, ymin, ymax,
+        path,
+        profile.contacts_max,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
     );
 }
 

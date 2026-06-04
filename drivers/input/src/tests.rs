@@ -198,10 +198,10 @@ fn smoke_virtio_input_btn_left_emits_pointer() -> TestResult {
     // EV_REL REL_X=+5, EV_REL REL_Y=-3, EV_KEY BTN_LEFT=0x110 press,
     // EV_SYN → expect one PointerEvent(dx=5, dy=-3, LEFT).
     let _ = feed_synthetic_events_for_test(&[
-        (2, 0, 5u32),         // EV_REL REL_X +5
+        (2, 0, 5u32),           // EV_REL REL_X +5
         (2, 1, (-3i32) as u32), // EV_REL REL_Y -3
-        (1, 0x110, 1),        // EV_KEY BTN_LEFT press
-        (0, 0, 0),            // EV_SYN
+        (1, 0x110, 1),          // EV_KEY BTN_LEFT press
+        (0, 0, 0),              // EV_SYN
     ]);
     // After SYN, exactly one Pointer event sits in the global ring.
     match pop_global() {
@@ -229,12 +229,7 @@ fn smoke_virtio_input_shift_a_stamps_modifier() -> TestResult {
     __reset_global_ring_for_test();
     __reset_modifiers_for_test();
     // LeftShift=42 press, A=30 press, A release, LeftShift release.
-    let _ = feed_synthetic_events_for_test(&[
-        (1, 42, 1),
-        (1, 30, 1),
-        (1, 30, 0),
-        (1, 42, 0),
-    ]);
+    let _ = feed_synthetic_events_for_test(&[(1, 42, 1), (1, 30, 1), (1, 30, 0), (1, 42, 0)]);
     let _shift_press = pop_key();
     let a_press = match pop_key() {
         Some(k) => k,
@@ -253,9 +248,7 @@ kernel_test_in!("drivers/input", smoke_virtio_input_shift_a_stamps_modifier);
 
 fn smoke_virtio_input_tablet_abs_xy_emits_absolute() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
-    use narf_input::{
-        abs, __reset_global_ring_for_test, init_global_ring, pop_absolute,
-    };
+    use narf_input::{__reset_global_ring_for_test, abs, init_global_ring, pop_absolute};
     init_global_ring(8);
     __reset_global_ring_for_test();
     // Tablet frame: ABS_X=1000, ABS_Y=2000, SYN.
@@ -283,13 +276,14 @@ fn smoke_virtio_input_tablet_abs_xy_emits_absolute() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/input", smoke_virtio_input_tablet_abs_xy_emits_absolute);
+kernel_test_in!(
+    "drivers/input",
+    smoke_virtio_input_tablet_abs_xy_emits_absolute
+);
 
 fn smoke_virtio_input_multitouch_slot_protocol_b() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
-    use narf_input::{
-        abs, __reset_global_ring_for_test, init_global_ring, pop_touch,
-    };
+    use narf_input::{__reset_global_ring_for_test, abs, init_global_ring, pop_touch};
     init_global_ring(16);
     __reset_global_ring_for_test();
     // Two fingers down at once:
@@ -348,12 +342,7 @@ fn smoke_virtio_input_btn_touch_drives_slot_zero() -> TestResult {
     init_global_ring(8);
     __reset_global_ring_for_test();
     // BTN_TOUCH = 0x14a. Press, SYN, release, SYN.
-    let _ = feed_synthetic_events_for_test(&[
-        (1, 0x14a, 1),
-        (0, 0, 0),
-        (1, 0x14a, 0),
-        (0, 0, 0),
-    ]);
+    let _ = feed_synthetic_events_for_test(&[(1, 0x14a, 1), (0, 0, 0), (1, 0x14a, 0), (0, 0, 0)]);
     let down = match pop_touch() {
         Some(t) => t,
         None => return TestResult::Fail("expected BTN_TOUCH down event"),
@@ -370,7 +359,10 @@ fn smoke_virtio_input_btn_touch_drives_slot_zero() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/input", smoke_virtio_input_btn_touch_drives_slot_zero);
+kernel_test_in!(
+    "drivers/input",
+    smoke_virtio_input_btn_touch_drives_slot_zero
+);
 
 fn smoke_virtio_input_extra_mouse_buttons() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
@@ -453,17 +445,12 @@ kernel_test_in!("drivers/input", smoke_virtio_input_device_name_populated);
 
 fn smoke_virtio_input_hwheel_emits_horizontal_scroll() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
-    use narf_input::{
-        InputEvent, __reset_global_ring_for_test, init_global_ring, pop_global,
-    };
+    use narf_input::{InputEvent, __reset_global_ring_for_test, init_global_ring, pop_global};
     init_global_ring(8);
     __reset_global_ring_for_test();
     // EV_REL REL_HWHEEL=6 value=+1 → ScrollEvent{dx:+1,dy:0}.
     // EV_REL REL_HWHEEL value=-2 → ScrollEvent{dx:-2,dy:0}.
-    let _ = feed_synthetic_events_for_test(&[
-        (2, 6, 1u32),
-        (2, 6, (-2i32) as u32),
-    ]);
+    let _ = feed_synthetic_events_for_test(&[(2, 6, 1u32), (2, 6, (-2i32) as u32)]);
     match pop_global() {
         Some(InputEvent::Scroll(s)) => {
             if s.dx != 1 || s.dy != 0 {
@@ -504,9 +491,7 @@ kernel_test_in!("drivers/input", smoke_virtio_input_count_matches_probe);
 
 fn smoke_virtio_input_gamepad_buttons_routed_to_button_ring() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
-    use narf_input::{
-        btn, __reset_global_ring_for_test, init_global_ring, pop_button, pop_key,
-    };
+    use narf_input::{__reset_global_ring_for_test, btn, init_global_ring, pop_button, pop_key};
     init_global_ring(8);
     __reset_global_ring_for_test();
     // BTN_SOUTH press + release, BTN_TL2 press, BTN_DPAD_UP press.
@@ -614,14 +599,9 @@ fn smoke_generic_fb_discovery() -> TestResult {
 }
 kernel_test_in!("drivers/graphics", smoke_generic_fb_discovery);
 
-
-
 // ── WBDI / MS OS 2.0 Descriptor recogniser ────────────────────────
 
-
-
 fn smoke_wbdi_set_header_decode() -> TestResult {
-
     use crate::wbdi::{desc_type, SetHeader};
 
     let mut buf = [0u8; 10];
@@ -637,21 +617,15 @@ fn smoke_wbdi_set_header_decode() -> TestResult {
     let h = SetHeader::decode(&buf).expect("hdr");
 
     if h.total_length != 30 || h.windows_version != 0x0603_0000 {
-
         return TestResult::Fail("header decode");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("drivers/input/wbdi", smoke_wbdi_set_header_decode);
 
-
-
 fn smoke_wbdi_recogniser_accepts_winusb_wbdi() -> TestResult {
-
     use crate::wbdi::{desc_type, is_wbdi, COMPATIBLE_ID_WINUSB, SUB_COMPATIBLE_ID_WBDI};
 
     let mut blob = alloc::vec::Vec::new();
@@ -677,22 +651,21 @@ fn smoke_wbdi_recogniser_accepts_winusb_wbdi() -> TestResult {
     blob.extend_from_slice(SUB_COMPATIBLE_ID_WBDI);
 
     if !is_wbdi(&blob) {
-
         return TestResult::Fail("WBDI compatible-id should match");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("drivers/input/wbdi", smoke_wbdi_recogniser_accepts_winusb_wbdi);
-
-
+kernel_test_in!(
+    "drivers/input/wbdi",
+    smoke_wbdi_recogniser_accepts_winusb_wbdi
+);
 
 fn smoke_wbdi_find_interface_in_vendor_class_config() -> TestResult {
-
-    use crate::wbdi::{desc_type, find_wbdi_interface, COMPATIBLE_ID_WINUSB, SUB_COMPATIBLE_ID_WBDI};
+    use crate::wbdi::{
+        desc_type, find_wbdi_interface, COMPATIBLE_ID_WINUSB, SUB_COMPATIBLE_ID_WBDI,
+    };
 
     // OS desc set: WBDI.
 
@@ -717,29 +690,23 @@ fn smoke_wbdi_find_interface_in_vendor_class_config() -> TestResult {
     // USB cfg: vendor-class iface 5.
 
     let cfg: [u8; 18] = [
-
-        9, 2, 18, 0, 1, 1, 0, 0xA0, 0,
-
-        9, 4, 5, 0, 1, 0xFF, 0xFF, 0xFF, 0, // 9-byte interface descriptor
-
+        9, 2, 18, 0, 1, 1, 0, 0xA0, 0, 9, 4, 5, 0, 1, 0xFF, 0xFF, 0xFF,
+        0, // 9-byte interface descriptor
     ];
 
     match find_wbdi_interface(&cfg, &ms) {
-
         Some(5) => TestResult::Pass,
 
         _ => TestResult::Fail("interface number wrong"),
-
     }
-
 }
 
-kernel_test_in!("drivers/input/wbdi", smoke_wbdi_find_interface_in_vendor_class_config);
-
-
+kernel_test_in!(
+    "drivers/input/wbdi",
+    smoke_wbdi_find_interface_in_vendor_class_config
+);
 
 fn smoke_wbdi_recogniser_rejects_non_wbdi() -> TestResult {
-
     use crate::wbdi::{desc_type, is_wbdi};
 
     let mut blob = alloc::vec::Vec::new();
@@ -761,13 +728,10 @@ fn smoke_wbdi_recogniser_rejects_non_wbdi() -> TestResult {
     blob.extend_from_slice(b"OTHER\0\0\0");
 
     if is_wbdi(&blob) {
-
         return TestResult::Fail("sub-id mismatch must reject");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("drivers/input/wbdi", smoke_wbdi_recogniser_rejects_non_wbdi);
@@ -1044,11 +1008,7 @@ mod i2c_hid_smokes {
         let bus_for_check = bus.clone();
         run_async(async move {
             drv.read_descriptor().await.unwrap();
-            if drv
-                .set_power(crate::i2c_hid::POWER_SLEEP)
-                .await
-                .is_err()
-            {
+            if drv.set_power(crate::i2c_hid::POWER_SLEEP).await.is_err() {
                 return TestResult::Fail("set_power(SLEEP) errored");
             }
             let writes = bus_for_check.writes();
@@ -1210,7 +1170,10 @@ mod i2c_hid_bind_smokes {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/input/i2c-hid", smoke_ptp_pointer_emits_relative_motion);
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_ptp_pointer_emits_relative_motion
+    );
 
     fn smoke_ptp_pointer_button_change_emits_event() -> TestResult {
         init_global_ring(8);
@@ -1288,9 +1251,9 @@ mod i2c_hid_bind_smokes {
         use alloc::sync::Arc;
         use narf_drivers_i2c::I2cBus;
 
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
         use crate::i2c_hid::{HidDescriptor, I2cHidDriver};
         use crate::i2c_hid_bind::{set_ptp_multi_touch_mode, PtpModeSetResult};
-        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
 
         // Parse the shared PTP descriptor blob → ReportDescriptor →
         // PtpProfile. The blob is the synthetic 2-finger fixture
@@ -1388,9 +1351,7 @@ mod i2c_hid_bind_smokes {
 // on top of the decoder.
 
 mod i2c_hid_touch_smokes {
-    use narf_input::{
-        TouchState, __reset_global_ring_for_test, init_global_ring, pop_touch,
-    };
+    use narf_input::{TouchState, __reset_global_ring_for_test, init_global_ring, pop_touch};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::i2c_hid_touch::{
@@ -1481,10 +1442,7 @@ mod i2c_hid_touch_smokes {
         let n = __pump_report_for_test(
             &profile,
             &mut state,
-            &__build_decoded_for_test(&[
-                (3, true, 0x0100, 0x0100),
-                (7, true, 0x6000, 0x6000),
-            ]),
+            &__build_decoded_for_test(&[(3, true, 0x0100, 0x0100), (7, true, 0x6000, 0x6000)]),
         );
         if n != 2 {
             return TestResult::Fail("two contacts down should push 2 events");
@@ -1634,10 +1592,12 @@ mod i2c_hid_touch_smokes {
     // `narf_hid::pen::DecodedPen` and the Button + Absolute rings.
 
     fn smoke_pen_in_range_emits_btn_tool_pen_and_abs_xy() -> TestResult {
-        use narf_input::{abs, btn, __reset_global_ring_for_test, init_global_ring,
-                         pop_absolute, pop_button};
-        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
-                                   __pump_pen_for_test};
+        use crate::i2c_hid_touch::{
+            __build_pen_for_test, __new_pen_state_for_test, __pump_pen_for_test,
+        };
+        use narf_input::{
+            __reset_global_ring_for_test, abs, btn, init_global_ring, pop_absolute, pop_button,
+        };
         init_global_ring(16);
         __reset_global_ring_for_test();
         let mut state = __new_pen_state_for_test();
@@ -1679,10 +1639,12 @@ mod i2c_hid_touch_smokes {
     );
 
     fn smoke_pen_tip_down_emits_btn_stylus_and_pressure() -> TestResult {
-        use narf_input::{abs, btn, __reset_global_ring_for_test, init_global_ring,
-                         pop_absolute, pop_button};
-        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
-                                   __pump_pen_for_test};
+        use crate::i2c_hid_touch::{
+            __build_pen_for_test, __new_pen_state_for_test, __pump_pen_for_test,
+        };
+        use narf_input::{
+            __reset_global_ring_for_test, abs, btn, init_global_ring, pop_absolute, pop_button,
+        };
         init_global_ring(16);
         __reset_global_ring_for_test();
         let mut state = __new_pen_state_for_test();
@@ -1725,9 +1687,10 @@ mod i2c_hid_touch_smokes {
     );
 
     fn smoke_pen_eraser_emits_btn_tool_rubber() -> TestResult {
-        use narf_input::{btn, __reset_global_ring_for_test, init_global_ring, pop_button};
-        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
-                                   __pump_pen_for_test};
+        use crate::i2c_hid_touch::{
+            __build_pen_for_test, __new_pen_state_for_test, __pump_pen_for_test,
+        };
+        use narf_input::{__reset_global_ring_for_test, btn, init_global_ring, pop_button};
         init_global_ring(16);
         __reset_global_ring_for_test();
         let mut state = __new_pen_state_for_test();
@@ -1753,9 +1716,10 @@ mod i2c_hid_touch_smokes {
     );
 
     fn smoke_pen_leave_range_releases_tool() -> TestResult {
-        use narf_input::{btn, __reset_global_ring_for_test, init_global_ring, pop_button};
-        use crate::i2c_hid_touch::{__build_pen_for_test, __new_pen_state_for_test,
-                                   __pump_pen_for_test};
+        use crate::i2c_hid_touch::{
+            __build_pen_for_test, __new_pen_state_for_test, __pump_pen_for_test,
+        };
+        use narf_input::{__reset_global_ring_for_test, btn, init_global_ring, pop_button};
         init_global_ring(16);
         __reset_global_ring_for_test();
         let mut state = __new_pen_state_for_test();
@@ -1778,10 +1742,7 @@ mod i2c_hid_touch_smokes {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/input/i2c-hid",
-        smoke_pen_leave_range_releases_tool
-    );
+    kernel_test_in!("drivers/input/i2c-hid", smoke_pen_leave_range_releases_tool);
 
     // ── End-to-end FakeI2cHid bind ───────────────────────────────
     //
@@ -1791,11 +1752,11 @@ mod i2c_hid_touch_smokes {
     // This exercises the entire decode chain without real hardware.
 
     fn smoke_fake_i2c_hid_touchscreen_end_to_end() -> TestResult {
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
+        use crate::i2c_hid::{I2cHidDriver, POWER_ON};
         use alloc::sync::Arc;
         use narf_drivers_i2c::I2cBus;
         use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
-        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
-        use crate::i2c_hid::{I2cHidDriver, POWER_ON};
 
         // ── Build the report-descriptor blob ─────────────────────
         // Re-use the canonical 2-finger touchscreen blob from narf-hid.
@@ -1822,16 +1783,20 @@ mod i2c_hid_touch_smokes {
         // Finger 1: tip+in_range=0b11, id=2, X=0x5000, Y=0x6000
         // contact_count=2
         let input_report: alloc::vec::Vec<u8> = alloc::vec![
-            0x01,               // Report ID
-            0b0000_0011,        // F0: tip=1, in_range=1, pad=000000
-            0x01,               // F0: contact_id = 1
-            0x00, 0x10,         // F0: X = 0x1000
-            0x00, 0x20,         // F0: Y = 0x2000
-            0b0000_0011,        // F1: tip=1, in_range=1, pad=000000
-            0x02,               // F1: contact_id = 2
-            0x00, 0x50,         // F1: X = 0x5000
-            0x00, 0x60,         // F1: Y = 0x6000
-            0x02,               // contact_count = 2
+            0x01,        // Report ID
+            0b0000_0011, // F0: tip=1, in_range=1, pad=000000
+            0x01,        // F0: contact_id = 1
+            0x00,
+            0x10, // F0: X = 0x1000
+            0x00,
+            0x20,        // F0: Y = 0x2000
+            0b0000_0011, // F1: tip=1, in_range=1, pad=000000
+            0x02,        // F1: contact_id = 2
+            0x00,
+            0x50, // F1: X = 0x5000
+            0x00,
+            0x60, // F1: Y = 0x6000
+            0x02, // contact_count = 2
         ];
 
         // ── Wire up the MockBus ───────────────────────────────────
@@ -1845,16 +1810,16 @@ mod i2c_hid_touch_smokes {
         // wMaxInputLength large enough to hold input_report + 2-byte len prefix.
         let mut hid_desc = make_descriptor_bytes();
         let put16 = |buf: &mut [u8], off: usize, v: u16| {
-            buf[off..off+2].copy_from_slice(&v.to_le_bytes());
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
         };
         put16(&mut hid_desc, 4, report_desc_blob.len() as u16); // wReportDescLength
         put16(&mut hid_desc, 10, input_report.len() as u16 + 2); // wMaxInputLength
-        // Call sequence in the test:
-        //   read_descriptor() → reads HID descriptor
-        //   reset()           → WRITE cmd, then polls input register (reads 2-byte len)
-        //   set_power(ON)     → WRITE only, no read
-        //   read_report_descriptor() → reads report descriptor bytes
-        //   read_input_report() → reads length-prefixed input report
+                                                                 // Call sequence in the test:
+                                                                 //   read_descriptor() → reads HID descriptor
+                                                                 //   reset()           → WRITE cmd, then polls input register (reads 2-byte len)
+                                                                 //   set_power(ON)     → WRITE only, no read
+                                                                 //   read_report_descriptor() → reads report descriptor bytes
+                                                                 //   read_input_report() → reads length-prefixed input report
 
         // (1) HID descriptor — 30 bytes, no prefix.
         bus.stage_read(hid_desc);
@@ -1972,7 +1937,7 @@ fn smoke_rmi4_pdt_three_function_walk() -> TestResult {
     let mut page = FakePage { bytes: [0u8; 256] };
     let last = PDT_LAST_SLOT_OFFSET as usize;
     // F01 entry at PDT_LAST_SLOT_OFFSET.
-    page.bytes[last] = 0x10;     // query base
+    page.bytes[last] = 0x10; // query base
     page.bytes[last + 1] = 0x20; // command base
     page.bytes[last + 2] = 0x30; // control base
     page.bytes[last + 3] = 0x40; // data base
@@ -2400,9 +2365,7 @@ fn smoke_mt_button1_press_emits_pointer_left() -> TestResult {
         MtClass, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
         __reset_registry_for_test,
     };
-    use narf_input::{
-        __reset_global_ring_for_test, init_global_ring, pop_pointer, PointerButtons,
-    };
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_pointer, PointerButtons};
     init_global_ring(16);
     __reset_global_ring_for_test();
     __reset_registry_for_test();
@@ -2468,9 +2431,7 @@ fn smoke_mt_touchscreen_emits_abs_x_y_without_slot_first() -> TestResult {
         MtClass, __attach_synth_screen_for_test, __build_screen_decoded_for_test,
         __reset_registry_for_test,
     };
-    use narf_input::{
-        abs, __reset_global_ring_for_test, init_global_ring, pop_absolute,
-    };
+    use narf_input::{__reset_global_ring_for_test, abs, init_global_ring, pop_absolute};
     init_global_ring(16);
     __reset_global_ring_for_test();
     __reset_registry_for_test();
@@ -2510,9 +2471,7 @@ fn smoke_mt_frame_emits_touch_events_per_slot() -> TestResult {
         MtClass, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
         __reset_registry_for_test,
     };
-    use narf_input::{
-        __reset_global_ring_for_test, init_global_ring, pop_touch, TouchState,
-    };
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
     init_global_ring(16);
     __reset_global_ring_for_test();
     __reset_registry_for_test();
@@ -2529,10 +2488,7 @@ fn smoke_mt_frame_emits_touch_events_per_slot() -> TestResult {
     }
     let first_slot = t1.slot;
     // Frame 2: same contact 42 stays down, new contact 43 added.
-    let f2 = __build_ptp_decoded_for_test(
-        &[(42, true, 110, 210), (43, true, 300, 400)],
-        false,
-    );
+    let f2 = __build_ptp_decoded_for_test(&[(42, true, 110, 210), (43, true, 300, 400)], false);
     let _ = dev.pump_ptp(&f2);
     // Drain — expect Move for slot 0, Down for slot 1.
     let mut got_move_42 = false;
@@ -2544,10 +2500,7 @@ fn smoke_mt_frame_emits_touch_events_per_slot() -> TestResult {
         };
         if t.slot == first_slot && t.state == TouchState::Move && t.tracking_id == Some(42) {
             got_move_42 = true;
-        } else if t.slot != first_slot
-            && t.state == TouchState::Down
-            && t.tracking_id == Some(43)
-        {
+        } else if t.slot != first_slot && t.state == TouchState::Down && t.tracking_id == Some(43) {
             got_down_43 = true;
         }
     }
@@ -2610,9 +2563,7 @@ fn smoke_mt_apple_synth_descriptor_carries_scan_time() -> TestResult {
     // field present". The PTP canonical blob includes a Scan Time
     // field; verify the Apple class attach exposes it via the PTP
     // profile (the profile holds the parsed Field).
-    use crate::hid_multitouch::{
-        MtClass, MtProfile, __attach_synth_pad_for_test,
-    };
+    use crate::hid_multitouch::{MtClass, MtProfile, __attach_synth_pad_for_test};
     let dev = __attach_synth_pad_for_test(MtClass::Apple, 0);
     match &dev.profile {
         MtProfile::Pad(p) => {
@@ -2632,9 +2583,7 @@ kernel_test_in!(
 // ─── hid-rmi (RMI4 over HID transport) smoke tests ─────────────────
 
 fn smoke_hid_rmi_set_rmi_mode_feature_encode() -> TestResult {
-    use crate::hid_rmi::{
-        encode_set_rmi_mode, RMI_MODE_ATTN_REPORTS, RMI_SET_RMI_MODE_REPORT_ID,
-    };
+    use crate::hid_rmi::{encode_set_rmi_mode, RMI_MODE_ATTN_REPORTS, RMI_SET_RMI_MODE_REPORT_ID};
     let buf = encode_set_rmi_mode(RMI_MODE_ATTN_REPORTS);
     if buf.len() != 2 {
         return TestResult::Fail("Set_RMI_Mode body must be exactly 2 bytes");
@@ -2697,9 +2646,7 @@ fn smoke_hid_rmi_clickpad_quirk_path() -> TestResult {
     // Razer Blade 14: HAS_PHYS_BUTTONS → NOT a clickpad.
     let razer_quirks = DeviceQuirks::HAS_PHYS_BUTTONS;
     if is_clickpad(razer_quirks.contains(DeviceQuirks::HAS_PHYS_BUTTONS), 2) {
-        return TestResult::Fail(
-            "phys-buttons quirk + 2 mech_mouse_btns must NOT be clickpad",
-        );
+        return TestResult::Fail("phys-buttons quirk + 2 mech_mouse_btns must NOT be clickpad");
     }
     // F$30 bitmap 0b001 → BTN_LEFT pressed on clickpad.
     if !clickpad_btn_left(0b001) {
@@ -2731,12 +2678,13 @@ fn smoke_hid_rmi_device_id_table_covers_canonical_vids() -> TestResult {
         None => return TestResult::Fail("Razer Blade 14 not in table"),
     }
     // Synaptics Acer Switch 5 must carry OUTPUT_SET_REPORT.
-    match match_device(USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_ACER_SWITCH5) {
+    match match_device(
+        USB_VENDOR_ID_SYNAPTICS,
+        USB_DEVICE_ID_SYNAPTICS_ACER_SWITCH5,
+    ) {
         Some(m) => {
             if !m.quirks.contains(DeviceQuirks::OUTPUT_SET_REPORT) {
-                return TestResult::Fail(
-                    "Synaptics Acer Switch 5 missing OUTPUT_SET_REPORT",
-                );
+                return TestResult::Fail("Synaptics Acer Switch 5 missing OUTPUT_SET_REPORT");
             }
         }
         None => return TestResult::Fail("Synaptics Acer Switch 5 not in table"),
@@ -3035,6 +2983,3 @@ kernel_test_in!(
     "drivers/input/hid-elan",
     smoke_hid_elan_usb_single_finger_report
 );
-
-
-

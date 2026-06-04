@@ -77,8 +77,7 @@ fn register_i8042_initcalls() {
         // SAFETY: BSP boot context, no other agent driving 0x60/0x64.
         let init_res = unsafe { i8042::init() };
         let init_ok = init_res.is_ok();
-        narf_input::I8042_KBD_INIT_OK
-            .store(init_ok, core::sync::atomic::Ordering::Release);
+        narf_input::I8042_KBD_INIT_OK.store(init_ok, core::sync::atomic::Ordering::Release);
         if !init_ok {
             return InitResult::NotPresent;
         }
@@ -87,8 +86,7 @@ fn register_i8042_initcalls() {
         // is unsafe at module level, but installation through the
         // dispatch table is safe (just stores a fn ptr).
         let irq_ok = install_isa_irq(1, on_irq1_safe);
-        narf_input::I8042_KBD_IRQ_ROUTED
-            .store(irq_ok, core::sync::atomic::Ordering::Release);
+        narf_input::I8042_KBD_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -101,8 +99,7 @@ fn register_i8042_initcalls() {
         // SAFETY: BSP, post-keyboard-init.
         let init_res = unsafe { i8042_mouse::init() };
         let init_ok = init_res.is_ok();
-        narf_input::I8042_MOUSE_INIT_OK
-            .store(init_ok, core::sync::atomic::Ordering::Release);
+        narf_input::I8042_MOUSE_INIT_OK.store(init_ok, core::sync::atomic::Ordering::Release);
         use core::fmt::Write as _;
         if !init_ok {
             let _ = writeln!(
@@ -114,8 +111,7 @@ fn register_i8042_initcalls() {
             return InitResult::NotPresent;
         }
         let irq_ok = install_isa_irq(12, on_irq12_safe);
-        narf_input::I8042_MOUSE_IRQ_ROUTED
-            .store(irq_ok, core::sync::atomic::Ordering::Release);
+        narf_input::I8042_MOUSE_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
         let _ = writeln!(
             narf_console::Writer,
             "  i8042-mouse: init=ok irq12={}",
@@ -189,9 +185,21 @@ fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
         "  isa-irq: ISA{} → GSI{} flags=POL{} TRIG{} (override={})",
         isa_irq,
         gsi,
-        if flags & narf_acpi::ioapic::POLARITY_LOW != 0 { "LOW" } else { "HIGH" },
-        if flags & narf_acpi::ioapic::TRIGGER_LEVEL != 0 { "LEVEL" } else { "EDGE" },
-        if matched_override.is_some() { "MADT" } else { "default" },
+        if flags & narf_acpi::ioapic::POLARITY_LOW != 0 {
+            "LOW"
+        } else {
+            "HIGH"
+        },
+        if flags & narf_acpi::ioapic::TRIGGER_LEVEL != 0 {
+            "LEVEL"
+        } else {
+            "EDGE"
+        },
+        if matched_override.is_some() {
+            "MADT"
+        } else {
+            "default"
+        },
     );
     let v = match narf_interrupts::vector::alloc() {
         Ok(v) => v,

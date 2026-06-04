@@ -365,11 +365,7 @@ pub trait ElanHidIo {
     fn set_feature(&mut self, report: &[u8]) -> Result<(), TransportError>;
     /// Issue `GET_REPORT(HID_FEATURE_REPORT)` of `len` bytes into
     /// `dst`. Returns the number of bytes received.
-    fn get_feature(
-        &mut self,
-        report_id: u8,
-        dst: &mut [u8],
-    ) -> Result<usize, TransportError>;
+    fn get_feature(&mut self, report_id: u8, dst: &mut [u8]) -> Result<usize, TransportError>;
 }
 
 /// Probe-time queried device parameters (Linux

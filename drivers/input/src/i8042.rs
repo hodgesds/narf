@@ -129,7 +129,11 @@ const KBD_BAT_MS: u64 = 500;
 /// that still yields a measurable wait — never zero.
 fn deadline_cycles(ms: u64) -> u64 {
     let cpns = narf_time::cycles_per_ns() as u64;
-    let cpms = if cpns == 0 { 1_000_000 } else { cpns * 1_000_000 };
+    let cpms = if cpns == 0 {
+        1_000_000
+    } else {
+        cpns * 1_000_000
+    };
     narf_time::now_cycles().saturating_add(cpms.saturating_mul(ms))
 }
 
@@ -285,12 +289,10 @@ pub unsafe fn init() -> Result<(), InitError> {
     // The first byte arrives within ~100 ms; the second (BAT after
     // ACK) can take up to 500 ms.
     match wait_output_byte_ms(KBD_REPLY_MS) {
-        Some(KBD_ACK) => {
-            match wait_output_byte_ms(KBD_BAT_MS) {
-                Some(KBD_BAT_OK) => {}
-                _ => scanning_ok = false,
-            }
-        }
+        Some(KBD_ACK) => match wait_output_byte_ms(KBD_BAT_MS) {
+            Some(KBD_BAT_OK) => {}
+            _ => scanning_ok = false,
+        },
         Some(KBD_BAT_OK) => {} // reset complete in one byte
         _ => scanning_ok = false,
     }
@@ -337,7 +339,9 @@ pub unsafe fn init() -> Result<(), InitError> {
     for c in 1u16..=127 {
         caps.add_key(c);
     }
-    for c in [97u16, 100, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126, 127] {
+    for c in [
+        97u16, 100, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126, 127,
+    ] {
         caps.add_key(c);
     }
     let _ = key::KEY_A; // ensure import is used

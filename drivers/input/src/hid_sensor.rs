@@ -151,11 +151,19 @@ pub struct SensorCalibration {
 
 impl SensorCalibration {
     /// Identity calibration: no offset, unity scale, zero exponent.
-    pub const IDENTITY: Self = Self { offset: 0, scale_milli: 1000, unit_exp: 0 };
+    pub const IDENTITY: Self = Self {
+        offset: 0,
+        scale_milli: 1000,
+        unit_exp: 0,
+    };
 
     /// Construct from raw HID feature-report values.
     pub fn new(offset: i32, scale_milli: i32, unit_exp: i8) -> Self {
-        Self { offset, scale_milli, unit_exp }
+        Self {
+            offset,
+            scale_milli,
+            unit_exp,
+        }
     }
 }
 
@@ -169,8 +177,7 @@ impl SensorCalibration {
 /// ```
 pub fn apply_calibration(raw: i32, cal: &SensorCalibration) -> i32 {
     let after_offset = raw.saturating_add(cal.offset);
-    let after_scale =
-        (after_offset as i64).saturating_mul(cal.scale_milli as i64) / 1000;
+    let after_scale = (after_offset as i64).saturating_mul(cal.scale_milli as i64) / 1000;
     let exp = cal.unit_exp;
     let result = if exp == 0 {
         after_scale
@@ -299,19 +306,16 @@ impl ComplementaryFilter {
         let old = self.orientation_milli_deg;
 
         let new_yaw = {
-            let gyro_pred =
-                (old[0] as i64).saturating_add(gyro_delta(gyro_milli_dps[2]) as i64);
+            let gyro_pred = (old[0] as i64).saturating_add(gyro_delta(gyro_milli_dps[2]) as i64);
             ((alpha * gyro_pred) / 10000) as i32
         };
         let new_pitch = {
-            let gyro_pred =
-                (old[1] as i64).saturating_add(gyro_delta(gyro_milli_dps[0]) as i64);
+            let gyro_pred = (old[1] as i64).saturating_add(gyro_delta(gyro_milli_dps[0]) as i64);
             let fused = (alpha * gyro_pred + one_minus * accel_pitch as i64) / 10000;
             fused as i32
         };
         let new_roll = {
-            let gyro_pred =
-                (old[2] as i64).saturating_add(gyro_delta(gyro_milli_dps[1]) as i64);
+            let gyro_pred = (old[2] as i64).saturating_add(gyro_delta(gyro_milli_dps[1]) as i64);
             let fused = (alpha * gyro_pred + one_minus * accel_roll as i64) / 10000;
             fused as i32
         };
@@ -476,7 +480,9 @@ fn pick_input_field(rd: &ReportDescriptor, usage_id: u16) -> Option<Field> {
         .iter()
         .find(|f| {
             f.kind == FieldKind::Input
-                && f.usages.iter().any(|&(p, u)| p == PAGE_SENSORS && u == usage_id)
+                && f.usages
+                    .iter()
+                    .any(|&(p, u)| p == PAGE_SENSORS && u == usage_id)
         })
         .cloned()
 }
@@ -486,7 +492,9 @@ fn pick_feature_field(rd: &ReportDescriptor, usage_id: u16) -> Option<Field> {
         .iter()
         .find(|f| {
             f.kind == FieldKind::Feature
-                && f.usages.iter().any(|&(p, u)| p == PAGE_SENSORS && u == usage_id)
+                && f.usages
+                    .iter()
+                    .any(|&(p, u)| p == PAGE_SENSORS && u == usage_id)
         })
         .cloned()
 }
@@ -537,9 +545,7 @@ fn build_fields(rd: &ReportDescriptor, kind: HidSensorKind) -> Option<(Vec<Field
             pick_input_field(rd, data_usage::MAG_Y)?,
             pick_input_field(rd, data_usage::MAG_Z)?,
         ]),
-        HidSensorKind::AmbientLight => {
-            Some(vec![pick_input_field(rd, data_usage::ILLUM_LUX)?])
-        }
+        HidSensorKind::AmbientLight => Some(vec![pick_input_field(rd, data_usage::ILLUM_LUX)?]),
         HidSensorKind::Proximity => {
             let f = pick_input_field(rd, data_usage::HUMAN_PROXIMITY)
                 .or_else(|| pick_input_field(rd, data_usage::HUMAN_PRESENCE))?;
@@ -607,7 +613,12 @@ pub fn decode_report(
             let x = extract_one(&profile.fields[0], body)?;
             let y = extract_one(&profile.fields[1], body)?;
             let z = extract_one(&profile.fields[2], body)?;
-            Ok(SensorEvent::Accel3d { x_milli_g: x, y_milli_g: y, z_milli_g: z, timestamp_ns })
+            Ok(SensorEvent::Accel3d {
+                x_milli_g: x,
+                y_milli_g: y,
+                z_milli_g: z,
+                timestamp_ns,
+            })
         }
         HidSensorKind::Inclinometer => {
             // HID Inclinometer reports tilt angles, not G-forces.
@@ -637,11 +648,19 @@ pub fn decode_report(
             let x = extract_one(&profile.fields[0], body)?;
             let y = extract_one(&profile.fields[1], body)?;
             let z = extract_one(&profile.fields[2], body)?;
-            Ok(SensorEvent::Magneto3d { x_micro_t: x, y_micro_t: y, z_micro_t: z, timestamp_ns })
+            Ok(SensorEvent::Magneto3d {
+                x_micro_t: x,
+                y_micro_t: y,
+                z_micro_t: z,
+                timestamp_ns,
+            })
         }
         HidSensorKind::AmbientLight => {
             let raw = extract_one(&profile.fields[0], body)?;
-            Ok(SensorEvent::Lux { lux: raw as u32, timestamp_ns })
+            Ok(SensorEvent::Lux {
+                lux: raw as u32,
+                timestamp_ns,
+            })
         }
         HidSensorKind::Proximity => {
             let raw = extract_one(&profile.fields[0], body)?;
@@ -721,8 +740,7 @@ pub fn parse_interval_feature_report(
 
 const SENSOR_RING_CAPACITY: usize = 64;
 
-static SENSOR_RING: IrqSafeSpinLock<Option<VecDeque<SensorEvent>>> =
-    IrqSafeSpinLock::new(None);
+static SENSOR_RING: IrqSafeSpinLock<Option<VecDeque<SensorEvent>>> = IrqSafeSpinLock::new(None);
 
 /// Initialise the sensor-event ring. Idempotent.
 pub fn init_sensor_ring() {
@@ -787,7 +805,11 @@ pub fn build_test_descriptor(
     };
 
     push_item(0x0, 1, &[0x20, 0x00]);
-    push_item(0x0, 2, &[sensor_type_usage as u8, (sensor_type_usage >> 8) as u8]);
+    push_item(
+        0x0,
+        2,
+        &[sensor_type_usage as u8, (sensor_type_usage >> 8) as u8],
+    );
     push_item(0xA, 0, &[0x01]);
     push_item(0x8, 1, &[report_id]);
 
@@ -858,7 +880,11 @@ pub mod tests {
     fn smoke_sensor_hub_detection_accel_descriptor() -> TestResult {
         let desc = build_test_descriptor(
             sensor_usage::ACCEL_3D,
-            &[data_usage::ACCEL_X, data_usage::ACCEL_Y, data_usage::ACCEL_Z],
+            &[
+                data_usage::ACCEL_X,
+                data_usage::ACCEL_Y,
+                data_usage::ACCEL_Z,
+            ],
             0x01,
             true,
         );
@@ -889,7 +915,11 @@ pub mod tests {
     fn smoke_accel_3d_xyz_decode() -> TestResult {
         let desc = build_test_descriptor(
             sensor_usage::ACCEL_3D,
-            &[data_usage::ACCEL_X, data_usage::ACCEL_Y, data_usage::ACCEL_Z],
+            &[
+                data_usage::ACCEL_X,
+                data_usage::ACCEL_Y,
+                data_usage::ACCEL_Z,
+            ],
             0x01,
             true,
         );
@@ -911,15 +941,29 @@ pub mod tests {
         let z_val: i16 = 981;
         let report = [
             0x01u8,
-            x_val as u8, (x_val >> 8) as u8,
-            y_val as u8, (y_val >> 8) as u8,
-            z_val as u8, (z_val >> 8) as u8,
+            x_val as u8,
+            (x_val >> 8) as u8,
+            y_val as u8,
+            (y_val >> 8) as u8,
+            z_val as u8,
+            (z_val >> 8) as u8,
         ];
         match decode_report(p, &report, 0) {
-            Ok(SensorEvent::Accel3d { x_milli_g, y_milli_g, z_milli_g, .. }) => {
-                if x_milli_g != 100 { return TestResult::Fail("accel X wrong"); }
-                if y_milli_g != -200 { return TestResult::Fail("accel Y wrong"); }
-                if z_milli_g != 981 { return TestResult::Fail("accel Z wrong"); }
+            Ok(SensorEvent::Accel3d {
+                x_milli_g,
+                y_milli_g,
+                z_milli_g,
+                ..
+            }) => {
+                if x_milli_g != 100 {
+                    return TestResult::Fail("accel X wrong");
+                }
+                if y_milli_g != -200 {
+                    return TestResult::Fail("accel Y wrong");
+                }
+                if z_milli_g != 981 {
+                    return TestResult::Fail("accel Z wrong");
+                }
             }
             Ok(_) => return TestResult::Fail("unexpected event variant"),
             Err(_) => return TestResult::Fail("accel decode returned error"),
@@ -948,7 +992,9 @@ pub mod tests {
         let report = [0x02u8, lux as u8, (lux >> 8) as u8];
         match decode_report(p, &report, 0) {
             Ok(SensorEvent::Lux { lux: v, .. }) => {
-                if v != 1200 { return TestResult::Fail("ALS lux value wrong"); }
+                if v != 1200 {
+                    return TestResult::Fail("ALS lux value wrong");
+                }
             }
             Ok(_) => return TestResult::Fail("unexpected event variant for ALS"),
             Err(_) => return TestResult::Fail("ALS decode error"),
@@ -962,7 +1008,11 @@ pub mod tests {
     fn smoke_feature_report_interval_encode_decode() -> TestResult {
         let desc = build_test_descriptor_with_feature(
             sensor_usage::ACCEL_3D,
-            &[data_usage::ACCEL_X, data_usage::ACCEL_Y, data_usage::ACCEL_Z],
+            &[
+                data_usage::ACCEL_X,
+                data_usage::ACCEL_Y,
+                data_usage::ACCEL_Z,
+            ],
             0x01,
             0x03,
         );
@@ -1002,7 +1052,11 @@ pub mod tests {
     fn smoke_multi_sensor_hub_report_id_dispatch() -> TestResult {
         let accel_part = build_test_descriptor(
             sensor_usage::ACCEL_3D,
-            &[data_usage::ACCEL_X, data_usage::ACCEL_Y, data_usage::ACCEL_Z],
+            &[
+                data_usage::ACCEL_X,
+                data_usage::ACCEL_Y,
+                data_usage::ACCEL_Z,
+            ],
             0x01,
             true,
         );
@@ -1017,12 +1071,20 @@ pub mod tests {
         if all_profiles.len() != 2 {
             return TestResult::Fail("expected 2 sensor profiles");
         }
-        let accel_p = all_profiles.iter().find(|p| p.kind == HidSensorKind::Accelerometer3D);
-        let als_p = all_profiles.iter().find(|p| p.kind == HidSensorKind::AmbientLight);
+        let accel_p = all_profiles
+            .iter()
+            .find(|p| p.kind == HidSensorKind::Accelerometer3D);
+        let als_p = all_profiles
+            .iter()
+            .find(|p| p.kind == HidSensorKind::AmbientLight);
         match (accel_p, als_p) {
             (Some(a), Some(b)) => {
-                if a.input_report_id != 1 { return TestResult::Fail("accel report id wrong"); }
-                if b.input_report_id != 2 { return TestResult::Fail("ALS report id wrong"); }
+                if a.input_report_id != 1 {
+                    return TestResult::Fail("accel report id wrong");
+                }
+                if b.input_report_id != 2 {
+                    return TestResult::Fail("ALS report id wrong");
+                }
             }
             _ => return TestResult::Fail("could not find both sensor profiles"),
         }
@@ -1048,7 +1110,10 @@ pub mod tests {
 
     fn smoke_sensor_event_ring_push_pop() -> TestResult {
         __reset_sensor_ring_for_test();
-        let ev = SensorEvent::Lux { lux: 42, timestamp_ns: 0 };
+        let ev = SensorEvent::Lux {
+            lux: 42,
+            timestamp_ns: 0,
+        };
         push_sensor_event(ev);
         match pop_sensor_event() {
             Some(SensorEvent::Lux { lux: 42, .. }) => {}
@@ -1072,19 +1137,29 @@ pub mod tests {
         );
         let rd = parse(&desc).expect("gyro desc parse");
         let profiles = enumerate_sensors(&rd);
-        if profiles.is_empty() { return TestResult::Fail("no gyro profile"); }
+        if profiles.is_empty() {
+            return TestResult::Fail("no gyro profile");
+        }
         let p = &profiles[0];
         if p.kind != HidSensorKind::Gyrometer3D {
             return TestResult::Fail("expected Gyrometer3D");
         }
         let report = [
             0x04u8,
-            50i16 as u8, (50i16 >> 8) as u8,
-            0u8, 0u8,
-            (-75i16) as u8, ((-75i16) >> 8) as u8,
+            50i16 as u8,
+            (50i16 >> 8) as u8,
+            0u8,
+            0u8,
+            (-75i16) as u8,
+            ((-75i16) >> 8) as u8,
         ];
         match decode_report(p, &report, 0) {
-            Ok(SensorEvent::Gyro3d { x_milli_dps: 50, y_milli_dps: 0, z_milli_dps: -75, .. }) => {}
+            Ok(SensorEvent::Gyro3d {
+                x_milli_dps: 50,
+                y_milli_dps: 0,
+                z_milli_dps: -75,
+                ..
+            }) => {}
             _ => return TestResult::Fail("gyro decode wrong"),
         }
         TestResult::Pass
@@ -1117,25 +1192,45 @@ pub mod tests {
         let z_val: i16 = 0;
         let report = [
             0x05u8,
-            x_val as u8, (x_val >> 8) as u8,
-            y_val as u8, (y_val >> 8) as u8,
-            z_val as u8, (z_val >> 8) as u8,
+            x_val as u8,
+            (x_val >> 8) as u8,
+            y_val as u8,
+            (y_val >> 8) as u8,
+            z_val as u8,
+            (z_val >> 8) as u8,
         ];
         match decode_report(p, &report, 12345) {
-            Ok(SensorEvent::Inclination { x_milli_deg, y_milli_deg, z_milli_deg, timestamp_ns }) => {
-                if x_milli_deg != 450 { return TestResult::Fail("inclinometer X wrong"); }
-                if y_milli_deg != -900 { return TestResult::Fail("inclinometer Y wrong"); }
-                if z_milli_deg != 0 { return TestResult::Fail("inclinometer Z wrong"); }
-                if timestamp_ns != 12345 { return TestResult::Fail("inclinometer timestamp wrong"); }
+            Ok(SensorEvent::Inclination {
+                x_milli_deg,
+                y_milli_deg,
+                z_milli_deg,
+                timestamp_ns,
+            }) => {
+                if x_milli_deg != 450 {
+                    return TestResult::Fail("inclinometer X wrong");
+                }
+                if y_milli_deg != -900 {
+                    return TestResult::Fail("inclinometer Y wrong");
+                }
+                if z_milli_deg != 0 {
+                    return TestResult::Fail("inclinometer Z wrong");
+                }
+                if timestamp_ns != 12345 {
+                    return TestResult::Fail("inclinometer timestamp wrong");
+                }
             }
-            Ok(SensorEvent::Accel3d { .. }) =>
-                return TestResult::Fail("inclinometer must NOT produce Accel3d"),
+            Ok(SensorEvent::Accel3d { .. }) => {
+                return TestResult::Fail("inclinometer must NOT produce Accel3d")
+            }
             Ok(_) => return TestResult::Fail("unexpected event variant for inclinometer"),
             Err(_) => return TestResult::Fail("inclinometer decode error"),
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/input", smoke_inclinometer_routes_to_inclination_variant);
+    kernel_test_in!(
+        "drivers/input",
+        smoke_inclinometer_routes_to_inclination_variant
+    );
 
     // smoke 9: calibration -- unit exponent application
 
@@ -1190,11 +1285,24 @@ pub mod tests {
         let accel = [0i32, 0i32, 1000i32];
         let ev = cf.update(gyro, accel, 1000, 99);
         match ev {
-            SensorEvent::FusedOrientation { yaw_milli_deg, pitch_milli_deg, roll_milli_deg, timestamp_ns } => {
-                if yaw_milli_deg != 88200 { return TestResult::Fail("yaw after 1s rotation wrong"); }
-                if pitch_milli_deg != 0 { return TestResult::Fail("pitch should be 0"); }
-                if roll_milli_deg != 0 { return TestResult::Fail("roll should be 0"); }
-                if timestamp_ns != 99 { return TestResult::Fail("timestamp not passed through"); }
+            SensorEvent::FusedOrientation {
+                yaw_milli_deg,
+                pitch_milli_deg,
+                roll_milli_deg,
+                timestamp_ns,
+            } => {
+                if yaw_milli_deg != 88200 {
+                    return TestResult::Fail("yaw after 1s rotation wrong");
+                }
+                if pitch_milli_deg != 0 {
+                    return TestResult::Fail("pitch should be 0");
+                }
+                if roll_milli_deg != 0 {
+                    return TestResult::Fail("roll should be 0");
+                }
+                if timestamp_ns != 99 {
+                    return TestResult::Fail("timestamp not passed through");
+                }
             }
             _ => return TestResult::Fail("expected FusedOrientation"),
         }
@@ -1233,7 +1341,11 @@ pub mod tests {
     fn smoke_inclinometer_distinct_from_accel3d() -> TestResult {
         let accel_desc = build_test_descriptor(
             sensor_usage::ACCEL_3D,
-            &[data_usage::ACCEL_X, data_usage::ACCEL_Y, data_usage::ACCEL_Z],
+            &[
+                data_usage::ACCEL_X,
+                data_usage::ACCEL_Y,
+                data_usage::ACCEL_Z,
+            ],
             0x01,
             true,
         );
@@ -1254,10 +1366,22 @@ pub mod tests {
         let ip = &incl_profiles[0];
         let val: i16 = 100;
         let accel_report = [
-            0x01u8, val as u8, (val >> 8) as u8, val as u8, (val >> 8) as u8, val as u8, (val >> 8) as u8,
+            0x01u8,
+            val as u8,
+            (val >> 8) as u8,
+            val as u8,
+            (val >> 8) as u8,
+            val as u8,
+            (val >> 8) as u8,
         ];
         let incl_report = [
-            0x06u8, val as u8, (val >> 8) as u8, val as u8, (val >> 8) as u8, val as u8, (val >> 8) as u8,
+            0x06u8,
+            val as u8,
+            (val >> 8) as u8,
+            val as u8,
+            (val >> 8) as u8,
+            val as u8,
+            (val >> 8) as u8,
         ];
         match decode_report(ap, &accel_report, 0) {
             Ok(SensorEvent::Accel3d { .. }) => {}
@@ -1265,8 +1389,9 @@ pub mod tests {
         }
         match decode_report(ip, &incl_report, 0) {
             Ok(SensorEvent::Inclination { .. }) => {}
-            Ok(SensorEvent::Accel3d { .. }) =>
-                return TestResult::Fail("inclinometer must NOT produce Accel3d"),
+            Ok(SensorEvent::Accel3d { .. }) => {
+                return TestResult::Fail("inclinometer must NOT produce Accel3d")
+            }
             _ => return TestResult::Fail("inclinometer report should decode as Inclination"),
         }
         TestResult::Pass

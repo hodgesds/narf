@@ -408,52 +408,62 @@ pub fn register_initcalls() {
     // AML walks for PNP0C50 + vendor _CID matches across a real-HW
     // DSDT regularly take 500-2000 ms — false-positives the
     // default budget. Bump explicitly to 3 s.
-    narf_init::register_with_budget(Stage::Device, "i2c-hid-probe", || {
-        // Discovery + logging pass: enumerate every PNP0C50 child +
-        // log the I2C controllers already brought up by
-        // `amd-fch-i2c`. The actual driver-instance construction +
-        // pump-task spawn happens in `i2c-hid-bind` below, which
-        // runs after this pass so the per-child `_CRS` summary lands
-        // before the bind log line.
+    narf_init::register_with_budget(
+        Stage::Device,
+        "i2c-hid-probe",
+        || {
+            // Discovery + logging pass: enumerate every PNP0C50 child +
+            // log the I2C controllers already brought up by
+            // `amd-fch-i2c`. The actual driver-instance construction +
+            // pump-task spawn happens in `i2c-hid-bind` below, which
+            // runs after this pass so the per-child `_CRS` summary lands
+            // before the bind log line.
 
-        let buses = narf_drivers_i2c::registered_buses();
-        let _ = writeln!(
-            narf_console::Writer,
-            "  i2c-hid: {} I2C bus(es) registered",
-            buses.len()
-        );
-        for bus in &buses {
-            let _ = writeln!(narf_console::Writer, "    bus: {}", bus.name());
-        }
-
-        let mut hid_count = 0usize;
-        for child in narf_aml::find_all_devices_by_hid("PNP0C50") {
-            hid_count += 1;
+            let buses = narf_drivers_i2c::registered_buses();
             let _ = writeln!(
                 narf_console::Writer,
-                "  i2c-hid: PNP0C50 child {}",
-                child.path
+                "  i2c-hid: {} I2C bus(es) registered",
+                buses.len()
             );
-            report_crs(&child.path);
-        }
-        if hid_count == 0 {
-            let _ = writeln!(narf_console::Writer, "  i2c-hid: no PNP0C50 children found");
-        }
-        InitResult::Ok
-    }, 3000);
-    narf_init::register_with_budget(Stage::Device, "i2c-hid-bind", || {
-        let n = crate::i2c_hid_bind::bind_all();
-        let _ = writeln!(
-            narf_console::Writer,
-            "  i2c-hid-bind: {} HID-over-I2C device(s) bound",
-            n
-        );
-        if n == 0 {
-            InitResult::NotPresent
-        } else {
+            for bus in &buses {
+                let _ = writeln!(narf_console::Writer, "    bus: {}", bus.name());
+            }
+
+            let mut hid_count = 0usize;
+            for child in narf_aml::find_all_devices_by_hid("PNP0C50") {
+                hid_count += 1;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i2c-hid: PNP0C50 child {}",
+                    child.path
+                );
+                report_crs(&child.path);
+            }
+            if hid_count == 0 {
+                let _ = writeln!(narf_console::Writer, "  i2c-hid: no PNP0C50 children found");
+            }
             InitResult::Ok
-        }
-    }, 3000);
+        },
+        3000,
+    );
+    narf_init::register_with_budget(
+        Stage::Device,
+        "i2c-hid-bind",
+        || {
+            let n = crate::i2c_hid_bind::bind_all();
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-bind: {} HID-over-I2C device(s) bound",
+                n
+            );
+            if n == 0 {
+                InitResult::NotPresent
+            } else {
+                InitResult::Ok
+            }
+        },
+        3000,
+    );
 }
 
 /// Evaluate `<path>._CRS` and print each resource item we recognize.
@@ -472,14 +482,16 @@ fn report_crs(path: &str) {
                         let _ = writeln!(
                             narf_console::Writer,
                             "    _CRS: Memory32Fixed base={:#010x} length={:#x}",
-                            base, length
+                            base,
+                            length
                         );
                     }
                     ResourceItem::ExtendedIrq { flags, gsis } => {
                         let _ = writeln!(
                             narf_console::Writer,
                             "    _CRS: ExtendedIrq flags={:#x} gsis={:?}",
-                            flags, gsis
+                            flags,
+                            gsis
                         );
                     }
                     ResourceItem::I2cSerialBus {
@@ -491,7 +503,9 @@ fn report_crs(path: &str) {
                         let _ = writeln!(
                             narf_console::Writer,
                             "    _CRS: I2cSerialBus addr={:#04x} speed={}Hz src={:?}",
-                            slave_address, connection_speed, resource_source
+                            slave_address,
+                            connection_speed,
+                            resource_source
                         );
                     }
                     ResourceItem::GpioInt {
@@ -518,7 +532,8 @@ fn report_crs(path: &str) {
                         let _ = writeln!(
                             narf_console::Writer,
                             "    _CRS: GpioIo pins={:?} src={:?}",
-                            pins, resource_source
+                            pins,
+                            resource_source
                         );
                     }
                     ResourceItem::Unknown { tag, payload } => {

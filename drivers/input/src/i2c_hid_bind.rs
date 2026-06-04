@@ -118,7 +118,8 @@ pub fn bind_all() -> usize {
     let _ = writeln!(
         narf_console::Writer,
         "i2c-hid-bind: AMDI={} PNP0C50={} — subtree dump follows",
-        amdi_n, pnp_n
+        amdi_n,
+        pnp_n
     );
     narf_aml::dump_amd_i2c_subtree();
     // Also enumerate every device in the namespace that has an
@@ -194,7 +195,8 @@ fn bind_one(path: &str) -> bool {
             let _ = writeln!(
                 narf_console::Writer,
                 "  i2c-hid-bind: {}: _CRS eval failed ({:?})",
-                path, e
+                path,
+                e
             );
             return false;
         }
@@ -260,7 +262,8 @@ fn bind_one(path: &str) -> bool {
             let _ = writeln!(
                 narf_console::Writer,
                 "  i2c-hid-bind: {}: parent bus {:?} not registered, skipping",
-                path, bus_name
+                path,
+                bus_name
             );
             return false;
         }
@@ -289,13 +292,17 @@ fn bind_one(path: &str) -> bool {
                     let _ = writeln!(
                         narf_console::Writer,
                         "  i2c-hid-bind: {}: GPIO register_irq failed ({:?}); polling",
-                        path, e
+                        path,
+                        e
                     );
                     // Drop the dangling wake registration since the
                     // ISR will never fire — keeps the lookup table
                     // tidy.
                     let mut g = PIN_WAKES.lock();
-                    if let Some(idx) = g.iter().position(|(p, f)| *p == pin && core::ptr::eq(*f, wake_flag)) {
+                    if let Some(idx) = g
+                        .iter()
+                        .position(|(p, f)| *p == pin && core::ptr::eq(*f, wake_flag))
+                    {
                         g.swap_remove(idx);
                     }
                 }
@@ -307,7 +314,10 @@ fn bind_one(path: &str) -> bool {
         let _ = writeln!(
             narf_console::Writer,
             "  i2c-hid-bind: {} → bus={} addr={:#04x} hid_desc_reg={:#06x} (polled)",
-            path, bus_name, addr, hid_desc_register
+            path,
+            bus_name,
+            addr,
+            hid_desc_register
         );
     }
 
@@ -330,7 +340,8 @@ async fn pump_task(
         let _ = writeln!(
             narf_console::Writer,
             "  i2c-hid-pump: {}: read_descriptor failed ({:?}); pump exiting",
-            path, e
+            path,
+            e
         );
         return;
     }
@@ -338,14 +349,16 @@ async fn pump_task(
         let _ = writeln!(
             narf_console::Writer,
             "  i2c-hid-pump: {}: RESET failed ({:?})",
-            path, e
+            path,
+            e
         );
     }
     if let Err(e) = driver.set_power(POWER_ON).await {
         let _ = writeln!(
             narf_console::Writer,
             "  i2c-hid-pump: {}: SET_POWER(ON) failed ({:?})",
-            path, e
+            path,
+            e
         );
     }
 
@@ -355,7 +368,8 @@ async fn pump_task(
             let _ = writeln!(
                 narf_console::Writer,
                 "  i2c-hid-pump: {}: read_report_descriptor failed ({:?}); pump exiting",
-                path, e
+                path,
+                e
             );
             return;
         }
@@ -366,7 +380,8 @@ async fn pump_task(
             let _ = writeln!(
                 narf_console::Writer,
                 "  i2c-hid-pump: {}: HID descriptor parse failed ({:?}); pump exiting",
-                path, e
+                path,
+                e
             );
             return;
         }
@@ -457,12 +472,7 @@ async fn pump_task(
         if let Some(profile) = &ptp {
             if payload.first() == Some(&profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::ptp::decode_input(profile, payload) {
-                    push_ptp_pointer(
-                        &decoded,
-                        &mut last_x,
-                        &mut last_y,
-                        &mut last_button,
-                    );
+                    push_ptp_pointer(&decoded, &mut last_x, &mut last_y, &mut last_button);
                 }
                 continue;
             }
@@ -540,9 +550,11 @@ fn push_ptp_pointer(
     if dx == 0 && dy == 0 && !button_changed {
         return;
     }
-    let _ = narf_input::push_global(narf_input::InputEvent::Pointer(
-        narf_input::PointerEvent { dx, dy, buttons },
-    ));
+    let _ = narf_input::push_global(narf_input::InputEvent::Pointer(narf_input::PointerEvent {
+        dx,
+        dy,
+        buttons,
+    }));
 }
 
 /// Microsoft HID-over-I2C `_DSM` UUID, in the byte order ACPI
