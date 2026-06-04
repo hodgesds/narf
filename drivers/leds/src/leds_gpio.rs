@@ -100,7 +100,11 @@ impl LedGpio {
 
     fn apply_brightness(&self, level: u32) {
         // active_low inverts: level > 0 → drive low (false), 0 → drive high (true).
-        let pin_high = if self.active_low { level == 0 } else { level > 0 };
+        let pin_high = if self.active_low {
+            level == 0
+        } else {
+            level > 0
+        };
         // Ignore errors — hardware might not be present on QEMU.
         let _ = self.ctrl.set_pin(self.pin, pin_high);
     }

@@ -84,7 +84,9 @@ struct MockPwm {
 
 impl MockPwm {
     fn new() -> Self {
-        Self { last_duty: IrqSafeSpinLock::new(0) }
+        Self {
+            last_duty: IrqSafeSpinLock::new(0),
+        }
     }
     fn last_duty_ns(&self) -> u64 {
         *self.last_duty.lock()
@@ -93,11 +95,7 @@ impl MockPwm {
 
 #[async_trait::async_trait]
 impl PwmDevice for MockPwm {
-    async fn set_config(
-        &self,
-        _channel: u32,
-        config: &PwmConfig,
-    ) -> Result<(), PwmError> {
+    async fn set_config(&self, _channel: u32, config: &PwmConfig) -> Result<(), PwmError> {
         *self.last_duty.lock() = config.duty_cycle_ns;
         Ok(())
     }
@@ -148,13 +146,7 @@ fn smoke_led_registry_dedup() -> TestResult {
         false,
         DefaultState::Off,
     ));
-    let led_b = Arc::new(LedGpio::new(
-        "test::dup",
-        gpio,
-        1,
-        false,
-        DefaultState::Off,
-    ));
+    let led_b = Arc::new(LedGpio::new("test::dup", gpio, 1, false, DefaultState::Off));
     register_led(led_a);
     register_led(led_b);
     let count = led_devices().len();
@@ -253,12 +245,15 @@ kernel_test_in!("drivers/leds", smoke_trigger_heartbeat_ramp);
 
 fn smoke_trigger_timer_duty() -> TestResult {
     let max = 1u32;
-    let t = Trigger::Timer { on_ms: 200, off_ms: 800 };
+    let t = Trigger::Timer {
+        on_ms: 200,
+        off_ms: 800,
+    };
     // period = 1000 ms = 10 ticks; on = 2 ticks.
     // tick 0 → on, tick 1 → on, tick 2 → off … tick 9 → off.
-    let on_count = (0u32..10).filter(|&i| {
-        __compute_brightness_for_test(&t, i, max) > 0
-    }).count();
+    let on_count = (0u32..10)
+        .filter(|&i| __compute_brightness_for_test(&t, i, max) > 0)
+        .count();
     if on_count != 2 {
         return TestResult::Fail("timer 200/800 should be on for 2 of 10 ticks (20%)");
     }

@@ -126,9 +126,9 @@ fn narf_pwm_sync_set(
 
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         |p| RawWaker::new(p, &VTABLE), // clone
-        |_| {},                         // wake
-        |_| {},                         // wake_by_ref
-        |_| {},                         // drop
+        |_| {},                        // wake
+        |_| {},                        // wake_by_ref
+        |_| {},                        // drop
     );
 
     let raw = RawWaker::new(core::ptr::null(), &VTABLE);
@@ -179,7 +179,10 @@ impl core::fmt::Debug for LedPwm {
             .field("channel", &self.channel)
             .field("period_ns", &self.period_ns)
             .field("max_brightness", &self.max_brightness)
-            .field("cur_brightness", &self.cur_brightness.load(Ordering::Relaxed))
+            .field(
+                "cur_brightness",
+                &self.cur_brightness.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }

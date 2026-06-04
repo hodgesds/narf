@@ -58,8 +58,7 @@ pub trait LedDevice: Send + Sync + core::fmt::Debug {
 
 // ── Global registry ────────────────────────────────────────────────
 
-static LEDS: IrqSafeSpinLock<Vec<Arc<dyn LedDevice>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static LEDS: IrqSafeSpinLock<Vec<Arc<dyn LedDevice>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Count of currently registered LED devices. Useful for diagnostics
 /// that must not contend with the LEDS lock.
@@ -164,7 +163,8 @@ impl LedDevice for SimpleLed {
     }
 
     fn set_brightness(&self, level: u32) {
-        self.brightness.store(level.min(self.max), Ordering::Release);
+        self.brightness
+            .store(level.min(self.max), Ordering::Release);
     }
 
     fn current_trigger(&self) -> crate::triggers::Trigger {

@@ -60,7 +60,11 @@ impl LedDevice for LedScrollLock {
         let on = level > 0;
         self.cur_brightness.store(on as u32, Ordering::Release);
         let _ = HID_LED_BYTE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
-            Some(if on { b | HID_LED_SCROLL_LOCK } else { b & !HID_LED_SCROLL_LOCK })
+            Some(if on {
+                b | HID_LED_SCROLL_LOCK
+            } else {
+                b & !HID_LED_SCROLL_LOCK
+            })
         });
         flush_led_byte();
     }

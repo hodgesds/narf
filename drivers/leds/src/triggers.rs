@@ -144,7 +144,9 @@ pub fn tick() {
 /// All trigger curves normalised to `[0, max]`.
 pub(crate) fn compute_brightness(trigger: &Trigger, ticks: u32, max: u32) -> u32 {
     match trigger {
-        Trigger::None | Trigger::DiskActivity | Trigger::NetworkActivity { .. }
+        Trigger::None
+        | Trigger::DiskActivity
+        | Trigger::NetworkActivity { .. }
         | Trigger::KeyboardCapsLock
         | Trigger::KeyboardNumLock
         | Trigger::KeyboardScrollLock
@@ -160,11 +162,11 @@ pub(crate) fn compute_brightness(trigger: &Trigger, ticks: u32, max: u32) -> u32
         Trigger::Heartbeat => {
             let phase = ticks % 10; // 10 ticks = 1 s
             match phase {
-                0 => max,       // first pulse on
-                1 => max / 2,   // first pulse decay
-                2 => max,       // second pulse on
-                3 => max / 2,   // second pulse decay
-                _ => 0,         // off for 600 ms
+                0 => max,     // first pulse on
+                1 => max / 2, // first pulse decay
+                2 => max,     // second pulse on
+                3 => max / 2, // second pulse decay
+                _ => 0,       // off for 600 ms
             }
         }
 
@@ -177,11 +179,19 @@ pub(crate) fn compute_brightness(trigger: &Trigger, ticks: u32, max: u32) -> u32
             }
             let phase = ticks % period_ticks;
             let on_ticks = on_ms / 100;
-            if phase < on_ticks { max } else { 0 }
+            if phase < on_ticks {
+                max
+            } else {
+                0
+            }
         }
 
         // OneShot: delay, then one pulse.
-        Trigger::OneShot { delay_ms, on_ms, off_ms } => {
+        Trigger::OneShot {
+            delay_ms,
+            on_ms,
+            off_ms,
+        } => {
             let delay_ticks = delay_ms / 100;
             let on_ticks = on_ms / 100;
             let _off_ticks = off_ms / 100;

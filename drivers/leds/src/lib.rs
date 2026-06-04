@@ -61,8 +61,8 @@ pub use class::{
 };
 pub use leds_gpio::{DefaultState, LedGpio};
 pub use leds_input_caps::{
-    register_set_report, unregister_set_report, LedCapsLock, SetReportFn,
-    HID_LED_CAPS_LOCK, HID_LED_NUM_LOCK, HID_LED_SCROLL_LOCK,
+    register_set_report, unregister_set_report, LedCapsLock, SetReportFn, HID_LED_CAPS_LOCK,
+    HID_LED_NUM_LOCK, HID_LED_SCROLL_LOCK,
 };
 pub use leds_input_num::LedNumLock;
 pub use leds_input_scroll::LedScrollLock;

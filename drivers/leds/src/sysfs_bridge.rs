@@ -85,8 +85,15 @@ fn parse_trigger(name: &str) -> Option<Trigger> {
         "none" => Some(Trigger::None),
         "default-on" => Some(Trigger::DefaultOn),
         "heartbeat" => Some(Trigger::Heartbeat),
-        "timer" => Some(Trigger::Timer { on_ms: 500, off_ms: 500 }),
-        "oneshot" => Some(Trigger::OneShot { delay_ms: 0, on_ms: 100, off_ms: 100 }),
+        "timer" => Some(Trigger::Timer {
+            on_ms: 500,
+            off_ms: 500,
+        }),
+        "oneshot" => Some(Trigger::OneShot {
+            delay_ms: 0,
+            on_ms: 100,
+            off_ms: 100,
+        }),
         "disk-activity" => Some(Trigger::DiskActivity),
         "netdev" | "network-activity" => Some(Trigger::NetworkActivity { iface: "eth0" }),
         "ac-online" => Some(Trigger::AcOnline),
@@ -136,10 +143,7 @@ pub fn populate_leds_class() {
     }
 }
 
-fn register_one(
-    class: Arc<narf_filesystem::sysfs::Kobject>,
-    dev: Arc<dyn LedDevice>,
-) {
+fn register_one(class: Arc<narf_filesystem::sysfs::Kobject>, dev: Arc<dyn LedDevice>) {
     let name = dev.name();
     let kobj = class_device_register(class, name);
 
@@ -187,7 +191,10 @@ fn register_one(
                     .map_err(|_| FsError::InvalidData)?
                     .trim();
                 match parse_trigger(s) {
-                    Some(t) => { d2.set_trigger(t); Ok(()) }
+                    Some(t) => {
+                        d2.set_trigger(t);
+                        Ok(())
+                    }
                     None => Err(FsError::InvalidData),
                 }
             },
@@ -215,7 +222,10 @@ fn register_one(
                 // Re-arm the timer trigger with new delays if currently active.
                 if matches!(dev_dw.current_trigger(), Trigger::Timer { .. }) {
                     let off = dw.off_ms.load(Ordering::Acquire);
-                    dev_dw.set_trigger(Trigger::Timer { on_ms: v, off_ms: off });
+                    dev_dw.set_trigger(Trigger::Timer {
+                        on_ms: v,
+                        off_ms: off,
+                    });
                 }
                 Ok(())
             },
@@ -243,7 +253,10 @@ fn register_one(
                 // Re-arm the timer trigger with new delays if currently active.
                 if matches!(dev_dw2.current_trigger(), Trigger::Timer { .. }) {
                     let on = dw2.on_ms.load(Ordering::Acquire);
-                    dev_dw2.set_trigger(Trigger::Timer { on_ms: on, off_ms: v });
+                    dev_dw2.set_trigger(Trigger::Timer {
+                        on_ms: on,
+                        off_ms: v,
+                    });
                 }
                 Ok(())
             },
@@ -257,15 +270,15 @@ fn register_one(
 pub mod tests {
     extern crate alloc;
 
-    use alloc::sync::Arc;
     use alloc::string::ToString;
+    use alloc::sync::Arc;
     use core::sync::atomic::Ordering;
 
-    use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use crate::class::{__reset_for_test as led_reset, register_led, LedDevice, SimpleLed};
     use super::populate_leds_class;
+    use crate::class::{__reset_for_test as led_reset, register_led, LedDevice, SimpleLed};
 
     fn read_attr(kobj: &narf_filesystem::sysfs::Kobject, attr: &str) -> alloc::string::String {
         kobj.attr_show(attr).unwrap_or_default()
@@ -287,12 +300,18 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("input0::capslock") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("input0::capslock kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("input0::capslock kobj missing");
+            }
         };
 
         match kobj.attr_store("brightness", b"1") {
             Some(Ok(())) => {}
-            _ => { reset(); return TestResult::Fail("brightness store(1) failed"); }
+            _ => {
+                reset();
+                return TestResult::Fail("brightness store(1) failed");
+            }
         }
         // SimpleLed.brightness uses AtomicU32.
         let got = led.brightness();
@@ -315,7 +334,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("input0::capslock") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         let got = read_attr(&kobj, "max_brightness").trim().to_string();
         reset();
@@ -337,11 +359,17 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("platform::power") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         match kobj.attr_store("trigger", b"heartbeat") {
             Some(Ok(())) => {}
-            _ => { reset(); return TestResult::Fail("trigger store failed"); }
+            _ => {
+                reset();
+                return TestResult::Fail("trigger store failed");
+            }
         }
         use crate::triggers::Trigger;
         let got = (led as Arc<dyn LedDevice>).current_trigger();
@@ -364,7 +392,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("input0::numlock") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         let got = read_attr(&kobj, "trigger").trim().to_string();
         reset();
@@ -379,8 +410,12 @@ pub mod tests {
 
     fn smoke_led_class_enumerate_min4() -> TestResult {
         reset();
-        for name in &["input0::capslock", "input0::numlock",
-                       "input0::scrolllock", "platform::power"] {
+        for name in &[
+            "input0::capslock",
+            "input0::numlock",
+            "input0::scrolllock",
+            "platform::power",
+        ] {
             let led = Arc::new(SimpleLed::onoff(name));
             register_led(led as Arc<dyn LedDevice>);
         }
@@ -408,7 +443,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("test::kbd") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         let got = read_attr(&kobj, "brightness").trim().to_string();
         reset();
@@ -430,7 +468,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("test::timer") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
 
         // First set trigger to timer.
@@ -438,7 +479,10 @@ pub mod tests {
         // Now write delay_on.
         match kobj.attr_store("delay_on", b"200") {
             Some(Ok(())) => {}
-            _ => { reset(); return TestResult::Fail("delay_on store failed"); }
+            _ => {
+                reset();
+                return TestResult::Fail("delay_on store failed");
+            }
         }
         let got = read_attr(&kobj, "delay_on").trim().to_string();
         reset();
@@ -460,7 +504,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("leds");
         let kobj = match class.get_child("test::bad") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         let r = kobj.attr_store("trigger", b"not-a-real-trigger");
         reset();

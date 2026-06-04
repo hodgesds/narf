@@ -64,8 +64,7 @@ pub type SetReportFn = fn(led_byte: u8);
 
 /// The registered hardware SET_REPORT callback. `None` means no
 /// keyboard is wired up yet (e.g. on QEMU without USB HID).
-static SET_REPORT: IrqSafeSpinLock<Option<SetReportFn>> =
-    IrqSafeSpinLock::new(None);
+static SET_REPORT: IrqSafeSpinLock<Option<SetReportFn>> = IrqSafeSpinLock::new(None);
 
 /// Register the hardware callback for LED output.
 ///
@@ -130,7 +129,11 @@ impl LedDevice for LedCapsLock {
         self.cur_brightness.store(on as u32, Ordering::Release);
         // Update the shared LED byte and flush to hardware.
         let _ = HID_LED_BYTE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
-            Some(if on { b | HID_LED_CAPS_LOCK } else { b & !HID_LED_CAPS_LOCK })
+            Some(if on {
+                b | HID_LED_CAPS_LOCK
+            } else {
+                b & !HID_LED_CAPS_LOCK
+            })
         });
         flush_led_byte();
     }
