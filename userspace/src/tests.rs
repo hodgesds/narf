@@ -13825,3 +13825,832 @@ fn smoke_wave72_sys_unshare_honours_new_flags() -> TestResult {
 }
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_wave72_sys_unshare_honours_new_flags);
+
+// ── Wave-69: statx smokes ──────────────────────────────────────────────
+//
+// The kernel implementation lives in handlers::sys_statx, gated by
+// linux-compat. These four smokes confirm the wire shape, mask=0
+// semantics, AT_EMPTY_PATH, and the linux_compat::Stat field offsets.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_statx_known_file_reports_mode_size() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        handlers::linux_compat::{Statx, AT_FDCWD},
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
+    };
+
+    struct StatxKnownFile;
+    impl FileOps for StatxKnownFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len(); Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 42, blocks: 1, mode: narf_filesystem::Mode::FILE_RO, mtime_cycles: 0 }
+        }
+    }
+    struct StatxKnownDir;
+    impl DirOps for StatxKnownDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "probe" { Some(Arc::new(StatxKnownFile)) } else { None }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StatxKnownFs;
+    impl FsInstance for StatxKnownFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StatxKnownDir) }
+        fn name(&self) -> &str { "statx-known" }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/statx-known", StatxKnownFs);
+
+    fd::__test_reset();
+    fd::init();
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE001);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    let path = b"/statx-known/probe";
+    let mut out = Statx::default();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: AT_FDCWD as u64,
+            arg1: path.as_ptr() as u64,
+            arg2: path.len() as u64,
+            arg3: 0,
+            arg4: 0xFFF, // STATX_BASIC_STATS
+            arg5: &mut out as *mut Statx as u64,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Statx.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("statx did not return Ok(0)");
+    }
+    if out.stx_size == 0 {
+        return TestResult::Fail("stx_size is 0");
+    }
+    if out.stx_mode & 0o170000 != 0o100000 {
+        return TestResult::Fail("stx_mode not regular-file");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_statx_known_file_reports_mode_size);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
+    // mask=0 — kernel fills what it can and sets stx_mask accordingly.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        handlers::linux_compat::{Statx, AT_FDCWD},
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
+    };
+
+    struct StatxM0File;
+    impl FileOps for StatxM0File {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len(); Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 7, blocks: 1, mode: narf_filesystem::Mode::FILE_RO, mtime_cycles: 0 }
+        }
+    }
+    struct StatxM0Dir;
+    impl DirOps for StatxM0Dir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "m0" { Some(Arc::new(StatxM0File)) } else { None }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StatxM0Fs;
+    impl FsInstance for StatxM0Fs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StatxM0Dir) }
+        fn name(&self) -> &str { "statx-m0" }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/statx-m0", StatxM0Fs);
+
+    fd::__test_reset();
+    fd::init();
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE002);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    let path = b"/statx-m0/m0";
+    let mut out = Statx::default();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: AT_FDCWD as u64,
+            arg1: path.as_ptr() as u64,
+            arg2: path.len() as u64,
+            arg3: 0,
+            arg4: 0, // mask = 0
+            arg5: &mut out as *mut Statx as u64,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Statx.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("statx(mask=0) did not return Ok(0)");
+    }
+    if out.stx_mode == 0 {
+        return TestResult::Fail("stx_mode not filled with mask=0");
+    }
+    if out.stx_size == 0 {
+        return TestResult::Fail("stx_size not filled with mask=0");
+    }
+    if out.stx_ino == 0 {
+        return TestResult::Fail("stx_ino not filled with mask=0");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_statx_mask_zero_still_fills_basic_fields);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
+    // Open a file fd, then statx(fd, "", AT_EMPTY_PATH, ...) — must
+    // return the fd's own metadata.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        handlers::linux_compat::{Statx, AT_EMPTY_PATH},
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
+    };
+
+    struct StatxEpFile;
+    impl FileOps for StatxEpFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len(); Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 99, blocks: 1, mode: narf_filesystem::Mode::FILE_RO, mtime_cycles: 0 }
+        }
+    }
+    struct StatxEpDir;
+    impl DirOps for StatxEpDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "ep" { Some(Arc::new(StatxEpFile)) } else { None }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StatxEpFs;
+    impl FsInstance for StatxEpFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StatxEpDir) }
+        fn name(&self) -> &str { "statx-ep" }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/statx-ep", StatxEpFs);
+
+    fd::__test_reset();
+    fd::init();
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE003);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // Open /statx-ep/ep to get a real fd.
+    let path = b"/statx-ep/ep";
+    let mut open_ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::OpenFile.raw(), &mut open_ctx);
+    let opened_fd = match open_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as i32,
+        _ => {
+            fd::__test_reset();
+            __test_clear_global();
+            return TestResult::Fail("open failed before AT_EMPTY_PATH statx");
+        }
+    };
+
+    let empty: &[u8] = b"";
+    let mut out = Statx::default();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: opened_fd as u64,
+            arg1: empty.as_ptr() as u64,
+            arg2: 0, // path_len = 0
+            arg3: AT_EMPTY_PATH as u64,
+            arg4: 0xFFF,
+            arg5: &mut out as *mut Statx as u64,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Statx.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("statx(AT_EMPTY_PATH) did not return Ok(0)");
+    }
+    if out.stx_size != 99 {
+        return TestResult::Fail("stx_size via AT_EMPTY_PATH mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_statx_at_empty_path_uses_dirfd);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
+    // Compile-time check that linux_compat::Stat field offsets match
+    // the Linux x86_64 ABI (man 2 stat).
+    use crate::handlers::linux_compat::Stat;
+    use core::mem::offset_of;
+
+    if offset_of!(Stat, st_dev) != 0 {
+        return TestResult::Fail("st_dev offset != 0");
+    }
+    if offset_of!(Stat, st_ino) != 8 {
+        return TestResult::Fail("st_ino offset != 8");
+    }
+    if offset_of!(Stat, st_nlink) != 16 {
+        return TestResult::Fail("st_nlink offset != 16");
+    }
+    if offset_of!(Stat, st_mode) != 24 {
+        return TestResult::Fail("st_mode offset != 24");
+    }
+    if offset_of!(Stat, st_uid) != 28 {
+        return TestResult::Fail("st_uid offset != 28");
+    }
+    if offset_of!(Stat, st_gid) != 32 {
+        return TestResult::Fail("st_gid offset != 32");
+    }
+    if offset_of!(Stat, st_rdev) != 40 {
+        return TestResult::Fail("st_rdev offset != 40");
+    }
+    if offset_of!(Stat, st_size) != 48 {
+        return TestResult::Fail("st_size offset != 48");
+    }
+    if offset_of!(Stat, st_blksize) != 56 {
+        return TestResult::Fail("st_blksize offset != 56");
+    }
+    if offset_of!(Stat, st_blocks) != 64 {
+        return TestResult::Fail("st_blocks offset != 64");
+    }
+    if offset_of!(Stat, st_atim) != 72 {
+        return TestResult::Fail("st_atim offset != 72");
+    }
+    if offset_of!(Stat, st_mtim) != 88 {
+        return TestResult::Fail("st_mtim offset != 88");
+    }
+    if offset_of!(Stat, st_ctim) != 104 {
+        return TestResult::Fail("st_ctim offset != 104");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_linux_stat_layout_offsets);
+
+// ── Wave-73: POSIX timer smokes ────────────────────────────────────────
+//
+// The kernel implementation lives in posix_timer.rs, gated by
+// linux-compat. These five smokes confirm signal delivery, gettime
+// remaining, delete/invalidation, clock_nanosleep abs-time, and
+// CLOCK_MONOTONIC_RAW/BOOTTIME sanity.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        handlers::{signal_init, signal_pending_of, __test_signal_reset},
+        posix_timer,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xE010);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    __test_signal_reset();
+    signal_init();
+    posix_timer::__test_reset();
+    posix_timer::posix_timer_init();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // Build sigevent: sigev_value(8B) + sigev_signo(4B) + sigev_notify(4B).
+    // SIGUSR1 = 10, SIGEV_SIGNAL = 0.
+    let mut sigevent = [0u8; 16];
+    sigevent[8..12].copy_from_slice(&10i32.to_le_bytes()); // sigev_signo = SIGUSR1
+    sigevent[12..16].copy_from_slice(&0i32.to_le_bytes()); // sigev_notify = SIGEV_SIGNAL
+
+    let mut timerid: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1, // CLOCK_MONOTONIC
+            arg1: sigevent.as_ptr() as u64,
+            arg2: &mut timerid as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerCreate.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_signal_reset();
+        __test_clear_global();
+        return TestResult::Fail("timer_create failed");
+    }
+    let id = timerid as u32;
+
+    // itimerspec: interval={0,0}, value={0,1} (1ns initial).
+    let mut itimerspec = [0u8; 32];
+    itimerspec[24..32].copy_from_slice(&1i64.to_le_bytes()); // it_value.tv_nsec = 1
+
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: id as u64,
+            arg1: 0, // flags = 0 (relative)
+            arg2: itimerspec.as_ptr() as u64,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerSettime.raw(), &mut ctx2);
+    if !matches!(ctx2.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_signal_reset();
+        __test_clear_global();
+        return TestResult::Fail("timer_settime failed");
+    }
+
+    // Force expiry by advancing past the deadline via the pump.
+    posix_timer::__test_run_pump();
+
+    let pending = signal_pending_of(task);
+    __test_signal_reset();
+    __test_clear_global();
+
+    if pending & (1u32 << 10) != 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("SIGUSR1 not in pending after timer pump")
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_posix_timer_signal_delivery);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
+    // Arm a 1-second timer; timer_gettime must return sane remaining value.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        posix_timer,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xE011);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+
+    posix_timer::__test_reset();
+    posix_timer::posix_timer_init();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    let mut timerid: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1, // CLOCK_MONOTONIC
+            arg1: 0, // NULL sigevent → SIGALRM default
+            arg2: &mut timerid as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerCreate.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_clear_global();
+        return TestResult::Fail("timer_create failed");
+    }
+    let id = timerid as u32;
+
+    // Arm 1-second one-shot.
+    let mut itimerspec = [0u8; 32];
+    itimerspec[16..24].copy_from_slice(&1i64.to_le_bytes()); // it_value.tv_sec = 1
+
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: id as u64,
+            arg1: 0,
+            arg2: itimerspec.as_ptr() as u64,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerSettime.raw(), &mut ctx2);
+    if !matches!(ctx2.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_clear_global();
+        return TestResult::Fail("timer_settime failed");
+    }
+
+    let mut cur = [0u8; 32];
+    let mut ctx3 = FakeCtx {
+        args: SyscallArgs {
+            arg0: id as u64,
+            arg1: cur.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerGettime.raw(), &mut ctx3);
+    __test_clear_global();
+
+    if !matches!(ctx3.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("timer_gettime failed");
+    }
+    // it_value.tv_sec (bytes 16..24) and it_value.tv_nsec (bytes 24..32).
+    let val_sec = i64::from_le_bytes(cur[16..24].try_into().unwrap());
+    let val_nsec = i64::from_le_bytes(cur[24..32].try_into().unwrap());
+    if val_sec < 0 {
+        return TestResult::Fail("timer_gettime: remaining tv_sec < 0");
+    }
+    if val_nsec < 0 || val_nsec >= 1_000_000_000 {
+        return TestResult::Fail("timer_gettime: remaining tv_nsec out of range");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_posix_timer_gettime_remaining);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
+    // Arm a timer, then delete it; timer_gettime on the stale id returns -1.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        posix_timer,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xE012);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+
+    posix_timer::__test_reset();
+    posix_timer::posix_timer_init();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    let mut timerid: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: 0,
+            arg2: &mut timerid as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerCreate.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_clear_global();
+        return TestResult::Fail("timer_create failed");
+    }
+    let id = timerid as u32;
+
+    let itimerspec = [0u8; 32]; // will be overwritten for it_value
+    let mut arm = itimerspec;
+    arm[16..24].copy_from_slice(&1i64.to_le_bytes()); // 1s
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: id as u64, arg1: 0,
+            arg2: arm.as_ptr() as u64, arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerSettime.raw(), &mut ctx2);
+
+    // Delete it.
+    let mut ctx3 = FakeCtx {
+        args: SyscallArgs { arg0: id as u64, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerDelete.raw(), &mut ctx3);
+    if !matches!(ctx3.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_clear_global();
+        return TestResult::Fail("timer_delete failed");
+    }
+
+    // timer_gettime on the deleted id must return -1.
+    let mut cur = [0u8; 32];
+    let mut ctx4 = FakeCtx {
+        args: SyscallArgs {
+            arg0: id as u64, arg1: cur.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::TimerGettime.raw(), &mut ctx4);
+    __test_clear_global();
+
+    match ctx4.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -1 => TestResult::Pass,
+        _ => TestResult::Fail("timer_gettime after delete did not return -1"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_posix_timer_delete_cancels);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target() -> TestResult {
+    // clock_gettime → build target = now + 10ms →
+    // clock_nanosleep(ABSTIME, target) → assert monotonic_ns >= target.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xE013);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    // Read current monotonic time.
+    let mut ts_now = [0u8; 16];
+    let mut ctx_get = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1, // CLOCK_MONOTONIC
+            arg1: ts_now.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx_get);
+    if !matches!(ctx_get.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        __test_clear_global();
+        return TestResult::Fail("clock_gettime failed");
+    }
+    let now_sec = i64::from_ne_bytes(ts_now[..8].try_into().unwrap());
+    let now_nsec = i64::from_ne_bytes(ts_now[8..].try_into().unwrap());
+    let now_ns = (now_sec as u64).saturating_mul(1_000_000_000)
+        .saturating_add(now_nsec as u64);
+
+    // Target = now + 10ms.
+    let target_ns: u64 = now_ns.saturating_add(10_000_000);
+    let target_sec = (target_ns / 1_000_000_000) as i64;
+    let target_nsec = (target_ns % 1_000_000_000) as i64;
+    let mut ts_target = [0u8; 16];
+    ts_target[..8].copy_from_slice(&target_sec.to_ne_bytes());
+    ts_target[8..].copy_from_slice(&target_nsec.to_ne_bytes());
+
+    // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME=1, &target, NULL).
+    let mut ctx_sleep = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: 1, // TIMER_ABSTIME
+            arg2: ts_target.as_ptr() as u64,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockNanosleep.raw(), &mut ctx_sleep);
+    __test_clear_global();
+
+    if !matches!(ctx_sleep.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("clock_nanosleep failed");
+    }
+    let after_ns = narf_scheduler::narf_time::monotonic_ns();
+    if after_ns >= target_ns {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("monotonic_ns after clock_nanosleep is before target")
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
+    // CLOCK_MONOTONIC_RAW(4) and CLOCK_BOOTTIME(7) both return sane
+    // timespec values and two consecutive readings are non-decreasing.
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xE014);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+
+    for clkid in [4u64, 7u64] {
+        let mut ts1 = [0u8; 16];
+        let mut ctx1 = FakeCtx {
+            args: SyscallArgs {
+                arg0: clkid,
+                arg1: ts1.as_mut_ptr() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx1);
+        if !matches!(ctx1.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+            __test_clear_global();
+            return TestResult::Fail("clock_gettime failed for RAW/BOOTTIME");
+        }
+        let sec1 = i64::from_ne_bytes(ts1[..8].try_into().unwrap());
+        let nsec1 = i64::from_ne_bytes(ts1[8..].try_into().unwrap());
+        if sec1 < 0 {
+            __test_clear_global();
+            return TestResult::Fail("tv_sec < 0 on first read");
+        }
+        if nsec1 < 0 || nsec1 >= 1_000_000_000 {
+            __test_clear_global();
+            return TestResult::Fail("tv_nsec out of range on first read");
+        }
+
+        let mut ts2 = [0u8; 16];
+        let mut ctx2 = FakeCtx {
+            args: SyscallArgs {
+                arg0: clkid,
+                arg1: ts2.as_mut_ptr() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx2);
+        if !matches!(ctx2.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+            __test_clear_global();
+            return TestResult::Fail("clock_gettime second read failed");
+        }
+        let sec2 = i64::from_ne_bytes(ts2[..8].try_into().unwrap());
+        let nsec2 = i64::from_ne_bytes(ts2[8..].try_into().unwrap());
+        let ns1 = (sec1 as u64).saturating_mul(1_000_000_000).saturating_add(nsec1 as u64);
+        let ns2 = (sec2 as u64).saturating_mul(1_000_000_000).saturating_add(nsec2 as u64);
+        if ns2 < ns1 {
+            __test_clear_global();
+            return TestResult::Fail("clock_gettime not monotonically non-decreasing");
+        }
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_clock_gettime_monotonic_raw_and_boottime);
