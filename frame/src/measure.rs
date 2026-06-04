@@ -401,7 +401,8 @@ pub fn tcg_event_log_decode_one(buf: &[u8]) -> Option<(Measurement, usize)> {
     let mut digest = [0u8; SHA256_DIGEST_SIZE];
     digest.copy_from_slice(&buf[14..14 + SHA256_DIGEST_SIZE]);
     let off = 14 + SHA256_DIGEST_SIZE;
-    let event_size = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+    let event_size =
+        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
     let off = off + 4;
     if off + event_size > buf.len() {
         return None;
@@ -529,7 +530,13 @@ kernel_test_in!("frame/measure", smoke_measure_pcr_out_of_range_rejected);
 fn smoke_measure_tcg_event_log_round_trip() -> TestResult {
     __reset_for_test();
     let d = [0xABu8; 32];
-    record_owned(7, EV_IPL, alloc::string::ToString::to_string("test-event"), &d, 42);
+    record_owned(
+        7,
+        EV_IPL,
+        alloc::string::ToString::to_string("test-event"),
+        &d,
+        42,
+    );
     let bytes = tcg_event_log_encode();
     let (m, n) = match tcg_event_log_decode_one(&bytes) {
         Some(p) => p,
@@ -575,7 +582,13 @@ kernel_test_in!("frame/measure", smoke_measure_initramfs_event_records_pcr_6);
 fn smoke_measure_event_log_encoder_layout() -> TestResult {
     __reset_for_test();
     let d = [0x55u8; 32];
-    record_owned(4, EV_EFI_BOOT_SERVICES_APPLICATION, alloc::string::ToString::to_string("kernel"), &d, 100);
+    record_owned(
+        4,
+        EV_EFI_BOOT_SERVICES_APPLICATION,
+        alloc::string::ToString::to_string("kernel"),
+        &d,
+        100,
+    );
     let bytes = tcg_event_log_encode();
     // Minimum record length = 4 (pcr) + 4 (et) + 4 (count) + 2 (alg)
     // + 32 (digest) + 4 (size) + label.

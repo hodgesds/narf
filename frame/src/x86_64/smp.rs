@@ -156,10 +156,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // SAFETY: CPUID at CPL=0 is always legal.
     unsafe {
         let raw = narf_arch::x86_64::cpuid::read_hybrid_cpu_type();
-        narf_lib::percpu::set_cpu_type(
-            id,
-            narf_lib::percpu::CpuType::from_raw(raw),
-        );
+        narf_lib::percpu::set_cpu_type(id, narf_lib::percpu::CpuType::from_raw(raw));
     }
 
     // 1b. Apply per-silicon errata on this AP. Same table as the
@@ -212,10 +209,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
                 period_cycles,
             );
         } else {
-            narf_interrupts::x86_64::apic::start_timer(
-                narf_interrupts::VECTOR_TIMER,
-                10_000,
-            );
+            narf_interrupts::x86_64::apic::start_timer(narf_interrupts::VECTOR_TIMER, 10_000);
         }
     }
 
@@ -282,9 +276,7 @@ pub unsafe fn start_aps() -> u32 {
     // 0x830) when live, xAPIC MMIO ICR (LAPIC base + 0x300/0x310)
     // otherwise. So SMP works on real HW with x2APIC and under
     // QEMU TCG (which emulates xAPIC MMIO but not x2APIC ICR).
-    if !narf_interrupts::x86_64::apic::X2APIC_ACTIVE
-        .load(core::sync::atomic::Ordering::Acquire)
-    {
+    if !narf_interrupts::x86_64::apic::X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         let _ = writeln!(Writer, "  smp(x86): using xAPIC MMIO IPI fallback");
     }
 

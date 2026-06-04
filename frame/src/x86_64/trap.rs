@@ -193,8 +193,8 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // selected — degraded mode), still treat vector 32 as the
         // LAPIC tick on the assumption the legacy direct
         // start_timer path is in use.
-        let tick_vector = narf_time::clockevent::TICK_VECTOR
-            .load(core::sync::atomic::Ordering::Acquire);
+        let tick_vector =
+            narf_time::clockevent::TICK_VECTOR.load(core::sync::atomic::Ordering::Acquire);
         let is_tick = if tick_vector != 0 {
             frame.vector as u8 == tick_vector
         } else {
@@ -256,8 +256,8 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             // SAFETY: TrapFrame layout matches narf-scheduler's
             // re-declared TrapFrame (asserted below).
             unsafe {
-                let sched_frame_ptr = frame as *mut TrapFrame
-                    as *mut narf_scheduler::stackful::TrapFrame;
+                let sched_frame_ptr =
+                    frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
                 narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
             }
         }
@@ -443,12 +443,12 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // so you can group nibble-pairs into bytes visually.
         let bg = 0x00_10_10_10; // near-black grid background
         let (fg_e, fg_o) = match frame.vector {
-            6  => (0x00_FF_60_60, 0x00_A0_30_30), // #UD reds
+            6 => (0x00_FF_60_60, 0x00_A0_30_30),  // #UD reds
             13 => (0x00_FF_C0_60, 0x00_A0_70_30), // #GP oranges
             14 => (0x00_FF_FF_60, 0x00_A0_A0_30), // #PF yellows
-            8  => (0x00_FF_60_FF, 0x00_A0_30_A0), // #DF magentas
+            8 => (0x00_FF_60_FF, 0x00_A0_30_A0),  // #DF magentas
             18 => (0x00_60_60_FF, 0x00_30_30_A0), // #MC blues
-            _  => (0x00_FF_FF_FF, 0x00_80_80_80), // generic
+            _ => (0x00_FF_FF_FF, 0x00_80_80_80),  // generic
         };
         narf_memory::beacon::paint_u64_hex(0, 5, frame.rip, fg_e, fg_o, bg);
         if frame.vector == 14 {
@@ -562,7 +562,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
 
 // ── TrapContext impl for the int-0x80 path ─────────────────────────
 
-use narf_userspace::{SigDeliveryParams, SyscallArgs, SyscallReturn, TrapContext, SA_ONSTACK, SA_RESTART, SA_SIGINFO};
+use narf_userspace::{
+    SigDeliveryParams, SyscallArgs, SyscallReturn, TrapContext, SA_ONSTACK, SA_RESTART, SA_SIGINFO,
+};
 
 /// Arch-specific `TrapContext` wrapper around a live trap frame.
 /// Constructed at int-0x80 dispatch time so raw handlers get
@@ -1106,8 +1108,8 @@ fn smoke_signal_trap_frame(rip: u64, rsp: u64) -> TrapFrame {
         r12: 0xC4C4_C4C4_C4C4_C4C4,
         r11: 0xB5B5_B5B5_B5B5_B5B5,
         r10: 0xA6A6_A6A6_A6A6_A6A6,
-        r9:  0x9797_9797_9797_9797,
-        r8:  0x8888_8888_8888_8888,
+        r9: 0x9797_9797_9797_9797,
+        r8: 0x8888_8888_8888_8888,
         rbp: 0x7979_7979_7979_7979,
         rdi: 0x6A6A_6A6A_6A6A_6A6A,
         rsi: 0x5B5B_5B5B_5B5B_5B5B,
@@ -1118,10 +1120,10 @@ fn smoke_signal_trap_frame(rip: u64, rsp: u64) -> TrapFrame {
         vector: 128,
         error_code: 0,
         rip,
-        cs: 0x33,        // UCODE_SEL with RPL=3
+        cs: 0x33, // UCODE_SEL with RPL=3
         rflags: 0x202,
         rsp,
-        ss: 0x2B,        // UDATA_SEL with RPL=3
+        ss: 0x2B, // UDATA_SEL with RPL=3
     }
 }
 
@@ -1206,7 +1208,10 @@ fn smoke_x86_64_sa_restart_clear_does_not_rewind() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_clear_does_not_rewind);
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sa_restart_clear_does_not_rewind
+);
 
 /// SA_RESTART set but restartable_syscall false (non-restartable
 /// syscall like nanosleep/poll/sigtimedwait): the arch must NOT
@@ -1239,7 +1244,10 @@ fn smoke_x86_64_sa_restart_non_restartable_syscall() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_non_restartable_syscall);
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sa_restart_non_restartable_syscall
+);
 
 /// SA_ONSTACK with a valid altstack: the arch must lay the
 /// sigframe at the TOP of the altstack (`sp + size - frame_size`),
@@ -1296,7 +1304,7 @@ fn smoke_x86_64_sa_onstack_no_altstack_falls_back() -> TestResult {
         handler: 0xBABEFACE,
         signum: 12,
         flags: SA_ONSTACK,
-        altstack_sp: 0,         // no altstack
+        altstack_sp: 0, // no altstack
         altstack_size: 0,
         restartable_syscall: false,
         si_code: 0,
@@ -1316,7 +1324,10 @@ fn smoke_x86_64_sa_onstack_no_altstack_falls_back() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("frame/x86_64", smoke_x86_64_sa_onstack_no_altstack_falls_back);
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sa_onstack_no_altstack_falls_back
+);
 
 /// SA_SIGINFO: the 3-arg handler observes RDI = signum,
 /// RSI = &siginfo, RDX = &ucontext. The siginfo and ucontext are
@@ -1388,8 +1399,7 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
     // ucontext_vaddr is offset_of!(UContext, uc_mcontext) +
     // offset_of!(McContext, rip).
     let mcontext_rip_offset =
-        core::mem::offset_of!(UContext, uc_mcontext)
-            + core::mem::offset_of!(McContext, rip);
+        core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, rip);
     // SAFETY: same justification as siginfo read.
     let saved_rip =
         unsafe { ((ucontext_vaddr + mcontext_rip_offset as u64) as *const u64).read_unaligned() };

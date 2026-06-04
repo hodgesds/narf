@@ -262,7 +262,9 @@ pub extern "C" fn rust_aarch64_unimpl(frame: &TrapFrame) -> ! {
 
 // ── TrapContext impl for the SVC path ──────────────────────────────
 
-use narf_userspace::{SigDeliveryParams, SyscallArgs, SyscallReturn, TrapContext, SA_ONSTACK, SA_RESTART, SA_SIGINFO};
+use narf_userspace::{
+    SigDeliveryParams, SyscallArgs, SyscallReturn, TrapContext, SA_ONSTACK, SA_RESTART, SA_SIGINFO,
+};
 
 /// aarch64 `TrapContext` wrapper around a live SVC-trap frame.
 struct Aarch64TrapContext<'a> {
@@ -324,16 +326,16 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         let s = unsafe { &mut *(out as *mut UserState) };
         let f = &self.frame;
         // x0..=x30 (31 registers).
-        s.x[0]  = f.x0;
-        s.x[1]  = f.x1;
-        s.x[2]  = f.x2;
-        s.x[3]  = f.x3;
-        s.x[4]  = f.x4;
-        s.x[5]  = f.x5;
-        s.x[6]  = f.x6;
-        s.x[7]  = f.x7;
-        s.x[8]  = f.x8;
-        s.x[9]  = f.x9;
+        s.x[0] = f.x0;
+        s.x[1] = f.x1;
+        s.x[2] = f.x2;
+        s.x[3] = f.x3;
+        s.x[4] = f.x4;
+        s.x[5] = f.x5;
+        s.x[6] = f.x6;
+        s.x[7] = f.x7;
+        s.x[8] = f.x8;
+        s.x[9] = f.x9;
         s.x[10] = f.x10;
         s.x[11] = f.x11;
         s.x[12] = f.x12;
@@ -487,14 +489,38 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
                 uc_mcontext: AArch64MContext {
                     fault_address: params.si_addr,
                     x: [
-                        self.frame.x0,  self.frame.x1,  self.frame.x2,  self.frame.x3,
-                        self.frame.x4,  self.frame.x5,  self.frame.x6,  self.frame.x7,
-                        self.frame.x8,  self.frame.x9,  self.frame.x10, self.frame.x11,
-                        self.frame.x12, self.frame.x13, self.frame.x14, self.frame.x15,
-                        self.frame.x16, self.frame.x17, self.frame.x18, self.frame.x19,
-                        self.frame.x20, self.frame.x21, self.frame.x22, self.frame.x23,
-                        self.frame.x24, self.frame.x25, self.frame.x26, self.frame.x27,
-                        self.frame.x28, self.frame.x29, self.frame.x30, user_sp,
+                        self.frame.x0,
+                        self.frame.x1,
+                        self.frame.x2,
+                        self.frame.x3,
+                        self.frame.x4,
+                        self.frame.x5,
+                        self.frame.x6,
+                        self.frame.x7,
+                        self.frame.x8,
+                        self.frame.x9,
+                        self.frame.x10,
+                        self.frame.x11,
+                        self.frame.x12,
+                        self.frame.x13,
+                        self.frame.x14,
+                        self.frame.x15,
+                        self.frame.x16,
+                        self.frame.x17,
+                        self.frame.x18,
+                        self.frame.x19,
+                        self.frame.x20,
+                        self.frame.x21,
+                        self.frame.x22,
+                        self.frame.x23,
+                        self.frame.x24,
+                        self.frame.x25,
+                        self.frame.x26,
+                        self.frame.x27,
+                        self.frame.x28,
+                        self.frame.x29,
+                        self.frame.x30,
+                        user_sp,
                     ],
                     pc: saved_pc,
                     pstate: self.frame.spsr,
@@ -532,9 +558,9 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
                     options(nostack, preserves_flags),
                 );
             }
-            self.frame.x0  = params.signum as u64;
-            self.frame.x1  = siginfo_vaddr;
-            self.frame.x2  = uctx_vaddr;
+            self.frame.x0 = params.signum as u64;
+            self.frame.x1 = siginfo_vaddr;
+            self.frame.x2 = uctx_vaddr;
             self.frame.elr = params.handler;
             true
         } else {
@@ -542,14 +568,38 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
             let ctx_vaddr = new_sp + 8;
             let ctx = AArch64SigContext {
                 x: [
-                    self.frame.x0,  self.frame.x1,  self.frame.x2,  self.frame.x3,
-                    self.frame.x4,  self.frame.x5,  self.frame.x6,  self.frame.x7,
-                    self.frame.x8,  self.frame.x9,  self.frame.x10, self.frame.x11,
-                    self.frame.x12, self.frame.x13, self.frame.x14, self.frame.x15,
-                    self.frame.x16, self.frame.x17, self.frame.x18, self.frame.x19,
-                    self.frame.x20, self.frame.x21, self.frame.x22, self.frame.x23,
-                    self.frame.x24, self.frame.x25, self.frame.x26, self.frame.x27,
-                    self.frame.x28, self.frame.x29, self.frame.x30, user_sp,
+                    self.frame.x0,
+                    self.frame.x1,
+                    self.frame.x2,
+                    self.frame.x3,
+                    self.frame.x4,
+                    self.frame.x5,
+                    self.frame.x6,
+                    self.frame.x7,
+                    self.frame.x8,
+                    self.frame.x9,
+                    self.frame.x10,
+                    self.frame.x11,
+                    self.frame.x12,
+                    self.frame.x13,
+                    self.frame.x14,
+                    self.frame.x15,
+                    self.frame.x16,
+                    self.frame.x17,
+                    self.frame.x18,
+                    self.frame.x19,
+                    self.frame.x20,
+                    self.frame.x21,
+                    self.frame.x22,
+                    self.frame.x23,
+                    self.frame.x24,
+                    self.frame.x25,
+                    self.frame.x26,
+                    self.frame.x27,
+                    self.frame.x28,
+                    self.frame.x29,
+                    self.frame.x30,
+                    user_sp,
                 ],
                 pc: saved_pc,
                 spsr: self.frame.spsr,
@@ -569,8 +619,8 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
             }
             // x0 = signum; x1 = &sigcontext (trampoline reads it for
             // sigreturn via sys_sigreturn on handler return).
-            self.frame.x0  = params.signum as u64;
-            self.frame.x1  = ctx_vaddr;
+            self.frame.x0 = params.signum as u64;
+            self.frame.x1 = ctx_vaddr;
             self.frame.elr = params.handler;
             true
         }
@@ -663,16 +713,16 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
         _pad: 0,
         elr: 0xE1E1_E1E1_E1E1_E1E1u64,
         spsr: 0x0000_0000_8000_0000, // arbitrary PSTATE
-        x0:  0x0000_0000_0000_0000,
-        x1:  0x0101_0101_0101_0101,
-        x2:  0x0202_0202_0202_0202,
-        x3:  0x0303_0303_0303_0303,
-        x4:  0x0404_0404_0404_0404,
-        x5:  0x0505_0505_0505_0505,
-        x6:  0x0606_0606_0606_0606,
-        x7:  0x0707_0707_0707_0707,
-        x8:  0x0808_0808_0808_0808,
-        x9:  0x0909_0909_0909_0909,
+        x0: 0x0000_0000_0000_0000,
+        x1: 0x0101_0101_0101_0101,
+        x2: 0x0202_0202_0202_0202,
+        x3: 0x0303_0303_0303_0303,
+        x4: 0x0404_0404_0404_0404,
+        x5: 0x0505_0505_0505_0505,
+        x6: 0x0606_0606_0606_0606,
+        x7: 0x0707_0707_0707_0707,
+        x8: 0x0808_0808_0808_0808,
+        x9: 0x0909_0909_0909_0909,
         x10: 0x0A0A_0A0A_0A0A_0A0A,
         x11: 0x0B0B_0B0B_0B0B_0B0B,
         x12: 0x0C0C_0C0C_0C0C_0C0C,
@@ -734,16 +784,36 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
     // UserState into the buffer.
     let s = unsafe { buf.assume_init() };
 
-    if s.x[0]  != 0x0000_0000_0000_0000 { return TestResult::Fail("x0 mismatch"); }
-    if s.x[1]  != 0x0101_0101_0101_0101 { return TestResult::Fail("x1 mismatch"); }
-    if s.x[15] != 0x0F0F_0F0F_0F0F_0F0F { return TestResult::Fail("x15 mismatch"); }
-    if s.x[28] != 0x1C1C_1C1C_1C1C_1C1C { return TestResult::Fail("x28 mismatch"); }
-    if s.x[29] != 0x1D1D_1D1D_1D1D_1D1D { return TestResult::Fail("x29 mismatch"); }
-    if s.x[30] != 0x3030_3030_3030_3030 { return TestResult::Fail("x30 mismatch"); }
-    if s.pc    != 0xE1E1_E1E1_E1E1_E1E1u64 { return TestResult::Fail("pc != ELR"); }
-    if s.spsr  != 0x0000_0000_8000_0000 { return TestResult::Fail("spsr mismatch"); }
-    if s.sp    != SP_SENTINEL { return TestResult::Fail("sp != SP_EL0"); }
-    if s.valid != 1 { return TestResult::Fail("valid != 1"); }
+    if s.x[0] != 0x0000_0000_0000_0000 {
+        return TestResult::Fail("x0 mismatch");
+    }
+    if s.x[1] != 0x0101_0101_0101_0101 {
+        return TestResult::Fail("x1 mismatch");
+    }
+    if s.x[15] != 0x0F0F_0F0F_0F0F_0F0F {
+        return TestResult::Fail("x15 mismatch");
+    }
+    if s.x[28] != 0x1C1C_1C1C_1C1C_1C1C {
+        return TestResult::Fail("x28 mismatch");
+    }
+    if s.x[29] != 0x1D1D_1D1D_1D1D_1D1D {
+        return TestResult::Fail("x29 mismatch");
+    }
+    if s.x[30] != 0x3030_3030_3030_3030 {
+        return TestResult::Fail("x30 mismatch");
+    }
+    if s.pc != 0xE1E1_E1E1_E1E1_E1E1u64 {
+        return TestResult::Fail("pc != ELR");
+    }
+    if s.spsr != 0x0000_0000_8000_0000 {
+        return TestResult::Fail("spsr mismatch");
+    }
+    if s.sp != SP_SENTINEL {
+        return TestResult::Fail("sp != SP_EL0");
+    }
+    if s.valid != 1 {
+        return TestResult::Fail("valid != 1");
+    }
     TestResult::Pass
 }
 kernel_test_in!("aarch64", smoke_aarch64_trap_save_user_state_round_trip);
@@ -783,14 +853,36 @@ fn smoke_aarch64_trap_frame(elr: u64) -> TrapFrame {
         _pad: 0,
         elr,
         spsr: 0x0000_0000_0000_0000, // M[3:0] = 0 → EL0t
-        x0:  0x0001, x1: 0x0002, x2: 0x0003, x3: 0x0004,
-        x4:  0x0005, x5: 0x0006, x6: 0x0007, x7: 0x0008,
-        x8:  0x0009, x9: 0x000A, x10: 0x000B, x11: 0x000C,
-        x12: 0x000D, x13: 0x000E, x14: 0x000F, x15: 0x0010,
-        x16: 0x0011, x17: 0x0012, x18: 0x0013, x19: 0x0014,
-        x20: 0x0015, x21: 0x0016, x22: 0x0017, x23: 0x0018,
-        x24: 0x0019, x25: 0x001A, x26: 0x001B, x27: 0x001C,
-        x28: 0x001D, x29: 0x001E,
+        x0: 0x0001,
+        x1: 0x0002,
+        x2: 0x0003,
+        x3: 0x0004,
+        x4: 0x0005,
+        x5: 0x0006,
+        x6: 0x0007,
+        x7: 0x0008,
+        x8: 0x0009,
+        x9: 0x000A,
+        x10: 0x000B,
+        x11: 0x000C,
+        x12: 0x000D,
+        x13: 0x000E,
+        x14: 0x000F,
+        x15: 0x0010,
+        x16: 0x0011,
+        x17: 0x0012,
+        x18: 0x0013,
+        x19: 0x0014,
+        x20: 0x0015,
+        x21: 0x0016,
+        x22: 0x0017,
+        x23: 0x0018,
+        x24: 0x0019,
+        x25: 0x001A,
+        x26: 0x001B,
+        x27: 0x001C,
+        x28: 0x001D,
+        x29: 0x001E,
     }
 }
 
@@ -871,8 +963,8 @@ kernel_test_in!("aarch64", smoke_aarch64_sa_restart_rewinds_elr);
 /// altstack region, not on the user SP.
 fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
     let user_stack = Aarch64SmokeStack::new();
-    let altstack   = Aarch64SmokeStack::new();
-    let mut frame  = smoke_aarch64_trap_frame(0xDEAD_F00D);
+    let altstack = Aarch64SmokeStack::new();
+    let mut frame = smoke_aarch64_trap_frame(0xDEAD_F00D);
 
     let params = SigDeliveryParams {
         handler: 0xBABE_FACE,
@@ -995,21 +1087,24 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
     // SAFETY: deliver_signal wrote 128 B of siginfo there.
     unsafe {
         let signo = (siginfo_vaddr as *const i32).read_unaligned();
-        let code  = ((siginfo_vaddr + 8) as *const i32).read_unaligned();
-        let addr  = ((siginfo_vaddr + 16) as *const u64).read_unaligned();
-        if signo != 11 { return TestResult::Fail("siginfo.si_signo mismatch"); }
-        if code  != 1  { return TestResult::Fail("siginfo.si_code mismatch"); }
-        if addr  != 0xDEAD_AAAA { return TestResult::Fail("siginfo.si_addr mismatch"); }
+        let code = ((siginfo_vaddr + 8) as *const i32).read_unaligned();
+        let addr = ((siginfo_vaddr + 16) as *const u64).read_unaligned();
+        if signo != 11 {
+            return TestResult::Fail("siginfo.si_signo mismatch");
+        }
+        if code != 1 {
+            return TestResult::Fail("siginfo.si_code mismatch");
+        }
+        if addr != 0xDEAD_AAAA {
+            return TestResult::Fail("siginfo.si_addr mismatch");
+        }
     }
 
     // mcontext.pc must be the unmodified post-trap ELR (no SA_RESTART).
-    let mctx_pc_offset =
-        core::mem::offset_of!(AArch64UContext, uc_mcontext)
+    let mctx_pc_offset = core::mem::offset_of!(AArch64UContext, uc_mcontext)
         + core::mem::offset_of!(AArch64MContext, pc);
     // SAFETY: deliver_signal wrote an AArch64UContext at uctx_vaddr.
-    let saved_pc = unsafe {
-        ((uctx_vaddr + mctx_pc_offset as u64) as *const u64).read_unaligned()
-    };
+    let saved_pc = unsafe { ((uctx_vaddr + mctx_pc_offset as u64) as *const u64).read_unaligned() };
     if saved_pc != POST_TRAP_ELR {
         return TestResult::Fail("mcontext.pc != saved post-trap ELR");
     }

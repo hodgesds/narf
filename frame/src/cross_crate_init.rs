@@ -297,7 +297,7 @@ fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
     // until those land in narf_net, surface a baseline MIB with
     // the static defaults RFC 1213 specifies as well-known.
     narf_filesystem::procfs::net::SnmpMib {
-        ip_forwarding: 2,    // 1=router, 2=host (NARF: host today)
+        ip_forwarding: 2, // 1=router, 2=host (NARF: host today)
         ip_default_ttl: 64,
         tcp_rto_algorithm: 1, // 1=other, 2=constant, 3=mil-std-1778, 4=van-jacobson
         tcp_rto_min: 200,

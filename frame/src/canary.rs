@@ -164,7 +164,10 @@ fn smoke_canary_fresh_value_nonzero_low_byte_clear() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("frame/canary", smoke_canary_fresh_value_nonzero_low_byte_clear);
+kernel_test_in!(
+    "frame/canary",
+    smoke_canary_fresh_value_nonzero_low_byte_clear
+);
 
 fn smoke_canary_init_moves_off_sentinel() -> TestResult {
     let sentinel = 0xDEAD_C0DE_DEAD_C0DE;

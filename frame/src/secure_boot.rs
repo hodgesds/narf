@@ -765,7 +765,10 @@ fn smoke_secure_boot_pkcs7_signer_info_extract() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("frame/secure_boot", smoke_secure_boot_pkcs7_signer_info_extract);
+kernel_test_in!(
+    "frame/secure_boot",
+    smoke_secure_boot_pkcs7_signer_info_extract
+);
 
 fn smoke_secure_boot_enabled_resolution() -> TestResult {
     __reset_for_test();
