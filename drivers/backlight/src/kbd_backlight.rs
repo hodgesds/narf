@@ -131,11 +131,13 @@ impl KbdBlVendor {
 pub struct KbdBacklightDevice {
     name: String,
     vendor: KbdBlVendor,
-    /// Cached level (0..=max_level). `-1` means uninitialised.
+    /// Cached level (0..=max_level).
     cached: AtomicU32,
     max: u32,
     /// WMI GUID used to invoke the set method, if WMI-backed.
     wmi_guid: Option<WmiGuid>,
+    /// ACPI path of the HKEY device, if ACPI-backed (Lenovo).
+    acpi_hkey_path: Option<String>,
 }
 
 impl KbdBacklightDevice {
@@ -148,6 +150,20 @@ impl KbdBacklightDevice {
             cached: AtomicU32::new(0),
             max,
             wmi_guid,
+            acpi_hkey_path: None,
+        })
+    }
+
+    /// Create a new ACPI-backed keyboard backlight LED device (Lenovo ThinkPad).
+    pub fn new_acpi(vendor: KbdBlVendor, hkey_path: String) -> Arc<Self> {
+        let max = vendor.max_level();
+        Arc::new(Self {
+            name: vendor.led_name().to_string(),
+            vendor,
+            cached: AtomicU32::new(0),
+            max,
+            wmi_guid: None,
+            acpi_hkey_path: Some(hkey_path),
         })
     }
 
@@ -172,29 +188,17 @@ impl KbdBacklightDevice {
             KbdBlVendor::Dell => {
                 // Dell WMAX keyboard-backlight: method_id = 0x12, Arg1 = level.
                 // Reference: dell_wmi.c `dell_wmi_kbd_backlight_set`.
-                let _ = invoke_method(
-                    guid,
-                    0x12,
-                    &[narf_aml::Value::Integer(level as u64)],
-                );
+                let _ = invoke_method(guid, 0x12, &[narf_aml::Value::Integer(level as u64)]);
             }
             KbdBlVendor::Hp => {
                 // HP: BIOS command 0x1A4 with level as argument.
                 // Reference: hp_wmi.c `hp_wmi_keyboard_backlight`.
-                let _ = invoke_method(
-                    guid,
-                    0x1A4,
-                    &[narf_aml::Value::Integer(level as u64)],
-                );
+                let _ = invoke_method(guid, 0x1A4, &[narf_aml::Value::Integer(level as u64)]);
             }
             KbdBlVendor::Asus => {
                 // ASUS: DEVS with device-id 0x00050021.
                 // Reference: asus_wmi.c `asus_wmi_set_devstate`.
-                let _ = invoke_method(
-                    guid,
-                    0x00050021,
-                    &[narf_aml::Value::Integer(level as u64)],
-                );
+                let _ = invoke_method(guid, 0x00050021, &[narf_aml::Value::Integer(level as u64)]);
             }
             KbdBlVendor::Lenovo => {
                 // ThinkPad uses direct ACPI; WMI path not used.
@@ -213,12 +217,33 @@ impl LedDevice for KbdBacklightDevice {
     }
 
     fn brightness(&self) -> u32 {
+        if self.vendor == KbdBlVendor::Lenovo {
+            if let Some(hkey_path) = &self.acpi_hkey_path {
+                let method = alloc::format!("{}.MLCG", hkey_path);
+                if let Ok(val) =
+                    narf_aml::eval::evaluate_method(&method, &[narf_aml::Value::Integer(0)])
+                {
+                    let status = val.as_integer() as u32;
+                    return status & 0x3;
+                }
+            }
+        }
         self.cached.load(Ordering::Acquire)
     }
 
     fn set_brightness(&self, level: u32) {
         let clamped = level.min(self.max);
-        self.write_level_wmi(clamped);
+        if self.vendor == KbdBlVendor::Lenovo {
+            if let Some(hkey_path) = &self.acpi_hkey_path {
+                let method = alloc::format!("{}.MLCS", hkey_path);
+                let _ = narf_aml::eval::evaluate_method(
+                    &method,
+                    &[narf_aml::Value::Integer(clamped as u64)],
+                );
+            }
+        } else {
+            self.write_level_wmi(clamped);
+        }
         self.cached.store(clamped, Ordering::Release);
     }
 
@@ -233,8 +258,7 @@ impl LedDevice for KbdBacklightDevice {
 
 // ── Global installed kbd backlight ────────────────────────────────
 
-static KBD_BL: IrqSafeSpinLock<Option<Arc<KbdBacklightDevice>>> =
-    IrqSafeSpinLock::new(None);
+static KBD_BL: IrqSafeSpinLock<Option<Arc<KbdBacklightDevice>>> = IrqSafeSpinLock::new(None);
 
 /// Return the currently-installed keyboard backlight device, if any.
 pub fn kbd_backlight_device() -> Option<Arc<KbdBacklightDevice>> {
@@ -294,8 +318,32 @@ pub fn init() {
         }
     }
 
+    // Try Lenovo ThinkPad ACPI HKEY detection next.
+    for hid in &["LEN0268", "IBM0068", "LEN0018"] {
+        for dev in narf_aml::find_all_devices_by_hid(hid) {
+            // Check if MLCG is supported on this device.
+            // MLCG(0) must return a value where bit 9 (0x200) is set.
+            let method = alloc::format!("{}.MLCG", dev.path);
+            if let Ok(val) =
+                narf_aml::eval::evaluate_method(&method, &[narf_aml::Value::Integer(0)])
+            {
+                let status = val.as_integer();
+                if status & 0x200 != 0 {
+                    let kbd_dev =
+                        KbdBacklightDevice::new_acpi(KbdBlVendor::Lenovo, dev.path.clone());
+                    install(kbd_dev);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  kbd-backlight: registered tpacpi::kbd_backlight (Lenovo)"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     let _ = writeln!(
         narf_console::Writer,
-        "  kbd-backlight: no supported WMI GUID found"
+        "  kbd-backlight: no supported WMI GUID or ACPI interface found"
     );
 }

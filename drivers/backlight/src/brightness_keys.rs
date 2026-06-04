@@ -109,13 +109,11 @@ fn step_brightness_down() {
     let devs = crate::acpi_video::acpi_video_devices();
     if let Some(dev) = devs.first() {
         dev.step_down();
-    } else {
-        if let Some(amd) = crate::amdgpu_bl::amdgpu_bl_device() {
-            let cur = amd.current_brightness();
-            let max = amd.max_brightness();
-            let step = (max / 10).max(1);
-            amd.set_brightness(cur.saturating_sub(step));
-        }
+    } else if let Some(amd) = crate::amdgpu_bl::amdgpu_bl_device() {
+        let cur = amd.current_brightness();
+        let max = amd.max_brightness();
+        let step = (max / 10).max(1);
+        amd.set_brightness(cur.saturating_sub(step));
     }
 }
 

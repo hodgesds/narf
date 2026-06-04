@@ -1,5 +1,6 @@
 //! Smoke tests for the backlight subsystem (≥10 required).
 //!
+#![allow(clippy::undocumented_unsafe_blocks)]
 //! All tests are pure (no hardware, no AML live evaluation) — they
 //! use synthetic devices registered via the `__test_install*` helpers.
 //! The global registries are cleared before each test via
@@ -17,16 +18,14 @@ mod smokes {
 
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use crate::acpi_video::{AcpiVideoDevice, __reset_for_test as av_reset, __test_install};
-    use crate::amdgpu_bl::{
-        build_set_level_writes, AmdgpuBacklightDevice, MockAmdgpuBlExecutor,
-    };
+    use crate::acpi_video::{__reset_for_test as av_reset, __test_install};
+    use crate::amdgpu_bl::{build_set_level_writes, AmdgpuBacklightDevice, MockAmdgpuBlExecutor};
     use crate::brightness_keys::{handle_notify, NOTIFY_BRIGHTNESS_DOWN, NOTIFY_BRIGHTNESS_UP};
     use crate::kbd_backlight::dell_encode_kbd_level;
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
     use crate::{
-        backlight_device, backlight_devices, register_backlight, unregister_backlight,
-        BacklightDevice, BacklightKind, __reset_all_for_test,
+        backlight_device, backlight_devices, unregister_backlight, BacklightDevice, BacklightKind,
+        __reset_all_for_test,
     };
 
     // ── 1. BacklightDevice registry add / remove ───────────────────
@@ -188,10 +187,7 @@ mod smokes {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/backlight",
-        smoke_amdgpu_build_set_level_writes
-    );
+    kernel_test_in!("drivers/backlight", smoke_amdgpu_build_set_level_writes);
 
     // ── 6. LED class registry ─────────────────────────────────────
 
@@ -266,11 +262,7 @@ mod smokes {
         av_reset();
 
         // Install a 5-step ladder panel at level 50 (index 2 of 0).
-        let dev = __test_install(
-            "acpi_video0",
-            r"\_SB.GFX0.DD0",
-            vec![0, 25, 50, 75, 100],
-        );
+        let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", vec![0, 25, 50, 75, 100]);
         // Prime the cached level to 50.
         dev.last.store(50, Ordering::Release);
 
@@ -301,11 +293,7 @@ mod smokes {
         __reset_all_for_test();
         av_reset();
 
-        let dev = __test_install(
-            "acpi_video0",
-            r"\_SB.GFX0.DD0",
-            vec![0, 25, 50, 75, 100],
-        );
+        let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", vec![0, 25, 50, 75, 100]);
         // Prime the cached level to 50.
         dev.last.store(50, Ordering::Release);
 
@@ -357,11 +345,7 @@ mod smokes {
         __reset_all_for_test();
         av_reset();
 
-        let dev = __test_install(
-            "acpi_video0",
-            r"\_SB.GFX0.DD0",
-            vec![0, 50, 100],
-        );
+        let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", vec![0, 50, 100]);
         // Start at max.
         dev.last.store(100, Ordering::Release);
 
@@ -384,11 +368,7 @@ mod smokes {
         __reset_all_for_test();
         av_reset();
 
-        let dev = __test_install(
-            "acpi_video0",
-            r"\_SB.GFX0.DD0",
-            vec![0, 50, 100],
-        );
+        let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", vec![0, 50, 100]);
         // Start at min.
         dev.last.store(0, Ordering::Release);
 
@@ -449,7 +429,9 @@ mod smokes {
         let mmio = narf_driver_runtime::MmioRegion {
             phys,
             len: 1024,
-            kind: narf_driver_runtime::BarKind::Mmio32 { prefetchable: false },
+            kind: narf_driver_runtime::BarKind::Mmio32 {
+                prefetchable: false,
+            },
         };
 
         // Seed BXT_BLC_PWM_FREQ1 (offset 0xC8254) with a period.
@@ -462,9 +444,8 @@ mod smokes {
 
         // 50% → duty 0x800.
         dev.set_brightness(50);
-        let duty = unsafe {
-            core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8258 / 4))
-        };
+        let duty =
+            unsafe { core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8258 / 4)) };
         if duty != 0x800 {
             return TestResult::Fail("50% did not yield duty 0x800");
         }
@@ -489,4 +470,47 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/backlight", smoke_intel_backlight_pwm_roundtrip);
+
+    // ── 16. Lenovo keyboard backlight ACPI operations ───────────────
+
+    fn smoke_lenovo_kbd_backlight_acpi_operations() -> TestResult {
+        __reset_all_for_test();
+
+        let dev = crate::kbd_backlight::KbdBacklightDevice::new_acpi(
+            crate::kbd_backlight::KbdBlVendor::Lenovo,
+            alloc::string::String::from("\\_SB.PCI0.LPCB.EC.HKEY"),
+        );
+
+        if dev.name() != "tpacpi::kbd_backlight" {
+            return TestResult::Fail("incorrect LED name for Lenovo kbd backlight");
+        }
+
+        if dev.max_brightness() != 2 {
+            return TestResult::Fail("incorrect max brightness for Lenovo");
+        }
+
+        // Initially 0.
+        if dev.brightness() != 0 {
+            return TestResult::Fail("initial brightness should be 0");
+        }
+
+        // Set to 2.
+        dev.set_brightness(2);
+        if dev.brightness() != 2 {
+            return TestResult::Fail("brightness did not update to 2");
+        }
+
+        // Clamp to max.
+        dev.set_brightness(5);
+        if dev.brightness() != 2 {
+            return TestResult::Fail("brightness clamping to max failed");
+        }
+
+        __reset_all_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_lenovo_kbd_backlight_acpi_operations
+    );
 }

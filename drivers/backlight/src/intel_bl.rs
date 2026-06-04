@@ -1,5 +1,6 @@
 //! Intel integrated GPU backlight driver.
 //!
+#![allow(clippy::undocumented_unsafe_blocks)]
 //! This module implements direct PWM duty-cycle programming against the
 //! Intel display engine's PWM block.
 //!
@@ -17,8 +18,8 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt::Write as FmtWrite;
 
-use narf_driver_runtime::MmioRegion;
 use crate::{BacklightDevice, BacklightKind};
+use narf_driver_runtime::MmioRegion;
 
 // ── Intel BLC PWM Registers ──────────────────────────────────────
 

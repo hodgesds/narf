@@ -36,7 +36,6 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -86,10 +85,7 @@ pub fn populate_backlight_class() {
     }
 }
 
-fn register_one(
-    class: Arc<narf_filesystem::sysfs::Kobject>,
-    dev: Arc<dyn BacklightDevice>,
-) {
+fn register_one(class: Arc<narf_filesystem::sysfs::Kobject>, dev: Arc<dyn BacklightDevice>) {
     let name = dev.name();
     let kobj = class_device_register(class, name);
 
@@ -185,17 +181,17 @@ fn register_one(
 pub mod tests {
     extern crate alloc;
 
-    use alloc::sync::Arc;
     use alloc::string::ToString;
+    use alloc::sync::Arc;
     use core::sync::atomic::Ordering;
 
-    use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use crate::acpi_video::__test_install;
-    use crate::acpi_video::__reset_for_test as av_reset;
-    use crate::{__reset_all_for_test, BacklightDevice};
     use super::populate_backlight_class;
+    use crate::acpi_video::__reset_for_test as av_reset;
+    use crate::acpi_video::__test_install;
+    use crate::{BacklightDevice, __reset_all_for_test};
 
     fn read_attr(kobj: &narf_filesystem::sysfs::Kobject, attr: &str) -> alloc::string::String {
         kobj.attr_show(attr).unwrap_or_default()
@@ -219,7 +215,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("backlight");
         let kobj = match class.get_child("acpi_video0") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("acpi_video0 kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("acpi_video0 kobj missing");
+            }
         };
         let got = read_attr(&kobj, "brightness").trim().to_string();
         reset();
@@ -242,11 +241,17 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("backlight");
         let kobj = match class.get_child("acpi_video0") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         match kobj.attr_store("brightness", b"50\n") {
             Some(Ok(())) => {}
-            _ => { reset(); return TestResult::Fail("brightness store failed"); }
+            _ => {
+                reset();
+                return TestResult::Fail("brightness store failed");
+            }
         }
         let new_level = dev.last.load(Ordering::Acquire);
         reset();
@@ -268,7 +273,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("backlight");
         let kobj = match class.get_child("acpi_video0") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         let got = read_attr(&kobj, "max_brightness").trim().to_string();
         reset();
@@ -290,7 +298,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("backlight");
         let kobj = match class.get_child("acpi_video0") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         let got = read_attr(&kobj, "type").trim().to_string();
         reset();
@@ -313,7 +324,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("backlight");
         let kobj = match class.get_child("acpi_video0") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
 
         if !matches!(kobj.attr_store("bl_power", b"4"), Some(Ok(()))) {
@@ -349,7 +363,10 @@ pub mod tests {
         let class = narf_filesystem::sysfs::class_register("backlight");
         let kobj = match class.get_child("acpi_video0") {
             Some(k) => k,
-            None => { reset(); return TestResult::Fail("kobj missing"); }
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing");
+            }
         };
         if !matches!(kobj.attr_store("brightness", b"9999"), Some(Ok(()))) {
             reset();
