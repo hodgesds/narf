@@ -43,6 +43,12 @@ use alloc::vec::Vec;
 
 use crate::registry;
 
+pub type SmmMockFn = fn(cmd: u32, arg: u32) -> SmmResult;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub static SMM_MOCK: narf_lib::sync::IrqSafeSpinLock<Option<SmmMockFn>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
 // ── SMM command codes ─────────────────────────────────────────────────
 
 /// Read fan tachometer status. Returns speed tier (0–2) in eax.
@@ -89,8 +95,15 @@ pub struct SmmResult {
 /// same workaround (`push %rbx` / `mov %esi, %ebx` / `pop %rbx`).
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn smm_call(cmd: u32, arg: u32) -> SmmResult {
+    #[cfg(any(test, feature = "kernel-test"))]
+    {
+        if let Some(mock) = *SMM_MOCK.lock() {
+            return mock(cmd, arg);
+        }
+    }
+
     let mut eax: u32 = cmd;
-    let mut edx: u32 = 0;
+    let edx: u32;
     // SAFETY: caller guarantees Dell firmware + CPL-0 + x86_64.
     // We save/restore rbx around the int because LLVM reserves it.
     unsafe {
@@ -137,6 +150,7 @@ pub fn read_fan_status(fan_idx: u8) -> Option<u32> {
 pub fn set_fan_level(fan_idx: u8, level: u8) -> bool {
     // SAFETY: same as read_temp_celsius.
     let arg = (fan_idx as u32) | ((level as u32) << 8);
+    // SAFETY: same as read_temp_celsius.
     let r = unsafe { smm_call(SMM_SET_FAN, arg) };
     r.eax != SMM_ERR_NOSUPPORT
 }
@@ -164,9 +178,19 @@ impl DellSmm {
     }
 }
 
+impl Default for DellSmm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl core::fmt::Display for DellSmm {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "DellSmm(fans={}, temps={})", self.num_fans, self.num_temps)
+        write!(
+            f,
+            "DellSmm(fans={}, temps={})",
+            self.num_fans, self.num_temps
+        )
     }
 }
 
@@ -183,7 +207,7 @@ impl crate::HwmonDevice for DellSmm {
         #[cfg(target_arch = "x86_64")]
         {
             let c = read_temp_celsius(idx)? as i32;
-            return Some(c * 1000);
+            Some(c * 1000)
         }
         #[cfg(not(target_arch = "x86_64"))]
         None
@@ -203,7 +227,7 @@ impl crate::HwmonDevice for DellSmm {
             if r.eax == SMM_ERR_NOSUPPORT {
                 return None;
             }
-            return Some(r.eax * 30);
+            Some(r.eax * 30)
         }
         #[cfg(not(target_arch = "x86_64"))]
         None
@@ -241,22 +265,43 @@ impl crate::HwmonDevice for DellSmm {
 
 // ── Driver registration ───────────────────────────────────────────────
 
+#[cfg(target_arch = "x86_64")]
+fn is_dell_platform() -> bool {
+    let mut system_records = [narf_firmware_smbios::SmbiosSystem::ZERO; 1];
+    let count = narf_firmware_smbios::copy_system(&mut system_records);
+    if count > 0 {
+        let manufacturer = &system_records[0].manufacturer;
+        let len = manufacturer.iter().position(|&b| b == 0).unwrap_or(manufacturer.len());
+        if let Ok(m_str) = core::str::from_utf8(&manufacturer[..len]) {
+            return m_str.to_ascii_lowercase().contains("dell");
+        }
+    }
+    false
+}
+
 /// Register the Dell SMM hwmon driver. Gated on DMI vendor string
-/// containing "Dell" (TODO: wire to `firmware::smbios` crate).
+/// containing "Dell" parsed from SMBIOS.
 #[cfg(target_arch = "x86_64")]
 pub fn register_smm_driver() {
     use core::fmt::Write as _;
-    // TODO: add DMI `sys_vendor` check via narf_firmware::smbios.
-    // For now, always register on x86_64 for structural probe smoke.
+    use alloc::sync::Arc;
+
+    if !is_dell_platform() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  dell_smm: skipped (system vendor is not Dell)"
+        );
+        return;
+    }
+
     let _ = writeln!(
         narf_console::Writer,
-        "  dell_smm: SMM hwmon driver registered (DMI check TODO)"
+        "  dell_smm: SMM hwmon driver registered"
     );
     registry::register(registry::RegisteredSensor {
         name: "dell_smm",
         description: "Dell SMM fan/temperature",
         bus_loc: "smm",
     });
-    use alloc::sync::Arc;
     registry::register_device(Arc::new(DellSmm::new()));
 }

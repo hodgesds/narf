@@ -20,6 +20,10 @@ narf-console      = { path = "../../console" }
 narf-filesystem   = { path = "../../filesystem" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-firmware-smbios = { path = "../../firmware/smbios" }
+
+[features]
+kernel-test = []
 
 [lints]
 workspace = true
