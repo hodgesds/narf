@@ -448,7 +448,12 @@ where
         let mut widgets = Vec::new();
         if group_type == 0x01 {
             // Audio Function Group — walk its widgets.
-            let sub_afg = send(cad, fg_nid, VERB_GET_PARAMETER, param::SUBORDINATE_NODE_COUNT)?;
+            let sub_afg = send(
+                cad,
+                fg_nid,
+                VERB_GET_PARAMETER,
+                param::SUBORDINATE_NODE_COUNT,
+            )?;
             let first_w = (sub_afg >> 16) as u8;
             let n_w = (sub_afg & 0xFF) as u8;
             for j in 0..n_w {
@@ -463,12 +468,7 @@ where
                     let long_form = cll & (1 << 7) != 0;
                     let mut idx: u8 = 0;
                     while idx < n {
-                        let resp = send(
-                            cad,
-                            nid,
-                            VERB_GET_CONNECTION_LIST_ENTRY,
-                            idx,
-                        )?;
+                        let resp = send(cad, nid, VERB_GET_CONNECTION_LIST_ENTRY, idx)?;
                         if long_form {
                             // Two 16-bit entries per response.
                             connections.push((resp & 0xFF) as u8);
@@ -596,9 +596,9 @@ impl FakeCorb {
     /// `true` if a verb with `(cad, nid, verb_id, payload)` was sent
     /// at any point.
     pub fn saw(&self, cad: u8, nid: u8, verb_id: u16, payload: u8) -> bool {
-        self.sent.iter().any(|v| {
-            v.cad == cad && v.nid == nid && v.verb_id == verb_id && v.payload == payload
-        })
+        self.sent
+            .iter()
+            .any(|v| v.cad == cad && v.nid == nid && v.verb_id == verb_id && v.payload == payload)
     }
 
     /// Clear the recorded log + canned responses.
@@ -728,8 +728,8 @@ mod tests {
         // Pin Default Config — speaker, jack present, default association 1.
         fake.arm(cad, 3, VERB_GET_CONFIG_DEFAULT, 0, 0x9017_0110);
 
-        let tree = enumerate_with(cad, |c, n, v, p| Ok(fake.send(c, n, v, p)))
-            .expect("enumerate_with ok");
+        let tree =
+            enumerate_with(cad, |c, n, v, p| Ok(fake.send(c, n, v, p))).expect("enumerate_with ok");
         if tree.vendor_id != 0x10EC {
             return TestResult::Fail("vendor_id wrong");
         }

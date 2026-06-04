@@ -215,7 +215,8 @@ fn program_dma_registers(dev: &AcpDevice, ring_phys: u64, ring_bytes: u32) {
         // Linear position counter starts at 0; explicitly clear
         // so `output_position()` is meaningful from the first read.
         dev.mmio.write32(regs::ACP_I2STX_LINEARPOSITION_CNTR_LOW, 0);
-        dev.mmio.write32(regs::ACP_I2STX_LINEARPOSITION_CNTR_HIGH, 0);
+        dev.mmio
+            .write32(regs::ACP_I2STX_LINEARPOSITION_CNTR_HIGH, 0);
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -230,8 +231,7 @@ fn program_i2s_frame(dev: &AcpDevice) {
         dev.mmio.write32(regs::ACP_BTTDM_TXFRMT, frmt);
         // Arm the TX interrupt enable (does not start the link —
         // that's `ACP_BTTDM_ITER`).
-        dev.mmio
-            .write32(regs::ACP_BTTDM_IER, regs::TDM_TX_ENABLE);
+        dev.mmio.write32(regs::ACP_BTTDM_IER, regs::TDM_TX_ENABLE);
         // Enable the controller-side DMA-complete interrupt source.
         let cur = dev.mmio.read32(regs::ACP_EXTERNAL_INTR_ENB);
         dev.mmio.write32(

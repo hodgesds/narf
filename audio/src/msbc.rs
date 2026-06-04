@@ -50,8 +50,8 @@ extern crate alloc;
 use alloc::vec;
 
 use crate::sbc::{
-    analysis, bitalloc, crc8, synthesis, BitReader, BitWriter, Header,
-    ALLOC_LOUDNESS, BLOCKS_16, CM_MONO, FREQ_16000,
+    analysis, bitalloc, crc8, synthesis, BitReader, BitWriter, Header, ALLOC_LOUDNESS, BLOCKS_16,
+    CM_MONO, FREQ_16000,
 };
 
 // ── mSBC constants ────────────────────────────────────────────────────
@@ -85,9 +85,8 @@ pub const MSBC_SEQ_BYTES: [u8; 4] = [0x08, 0x38, 0xC8, 0xF8];
 ///
 /// The `blocks` field is 0b11 (BLOCKS_16) as specified in the mSBC
 /// header — the actual audio uses 15 blocks (see module doc).
-pub const MSBC_SBC_CFG1: u8 = (FREQ_16000 << 6) | (BLOCKS_16 << 4) | (CM_MONO << 2)
-    | (ALLOC_LOUDNESS << 1)
-    | 0; // subbands=0 → 4 subbands
+pub const MSBC_SBC_CFG1: u8 =
+    (FREQ_16000 << 6) | (BLOCKS_16 << 4) | (CM_MONO << 2) | (ALLOC_LOUDNESS << 1) | 0; // subbands=0 → 4 subbands
 
 /// SBC header byte 2 (bitpool) for mSBC.
 pub const MSBC_SBC_CFG2: u8 = MSBC_BITPOOL;
@@ -166,7 +165,7 @@ impl Msbc {
     fn header() -> Header {
         Header {
             sampling_frequency: FREQ_16000,
-            blocks: BLOCKS_16,   // wire value = 0b11; actual blocks = 15
+            blocks: BLOCKS_16, // wire value = 0b11; actual blocks = 15
             channel_mode: CM_MONO,
             allocation_method: ALLOC_LOUDNESS,
             subbands: 0, // 0 → 4 subbands
@@ -500,7 +499,11 @@ mod tests {
         let mut pcm_in = [0i16; MSBC_PCM_SAMPLES];
         for i in 0..MSBC_PCM_SAMPLES {
             let phase = (i % 32) as i32;
-            let v = if phase < 16 { phase * 256 } else { (32 - phase) * 256 };
+            let v = if phase < 16 {
+                phase * 256
+            } else {
+                (32 - phase) * 256
+            };
             pcm_in[i] = (v - 2048) as i16;
         }
 

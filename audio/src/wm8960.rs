@@ -119,7 +119,10 @@ pub fn build_init_sequence_i2s_master_16bit() -> Vec<(u8, u16)> {
     // Power Management 1: VMID=50 kΩ (bit 8/7 = 01), VREF on.
     out.push((regs::POWER_MGMT_1, (0b01 << 7) | (1 << 6)));
     // Power Management 2: DACL, DACR, LOUT1, ROUT1 on.
-    out.push((regs::POWER_MGMT_2, (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5)));
+    out.push((
+        regs::POWER_MGMT_2,
+        (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5),
+    ));
     // Power Management 3: LOMIX, ROMIX on.
     out.push((regs::POWER_MGMT_3, (1 << 3) | (1 << 2)));
     // Audio Interface (R7): I2S, 16-bit, master.

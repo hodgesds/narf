@@ -248,19 +248,12 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("audio/hda", smoke_hda_writer_submit_round_trip);
 
-
-
 // ── HDA codec walker (transport-neutral) ──────────────────────────
 
-
-
 fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
-
     use crate::hda_codec::{enumerate, find_output_path, make_verb, param, verb, WidgetType};
 
     use alloc::vec;
-
-
 
     // Synthetic codec: addr 0, AFG NID 1, three widgets:
 
@@ -276,124 +269,156 @@ fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
 
     // Vendor 0x10EC (Realtek), Device 0x0287.
 
-    table.insert(make_verb(addr, 0, verb::GET_PARAMETER | param::VENDOR_ID), 0x0287_10EC);
+    table.insert(
+        make_verb(addr, 0, verb::GET_PARAMETER | param::VENDOR_ID),
+        0x0287_10EC,
+    );
 
-    table.insert(make_verb(addr, 0, verb::GET_PARAMETER | param::REVISION_ID), 0x0010_0001);
+    table.insert(
+        make_verb(addr, 0, verb::GET_PARAMETER | param::REVISION_ID),
+        0x0010_0001,
+    );
 
     // Root subordinate node count: first FG = 1, count = 1.
 
-    table.insert(make_verb(addr, 0, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT), 0x0001_0001);
+    table.insert(
+        make_verb(addr, 0, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT),
+        0x0001_0001,
+    );
 
     // FG type = 1 (Audio Function Group).
 
-    table.insert(make_verb(addr, 1, verb::GET_PARAMETER | param::FUNCTION_GROUP_TYPE), 0x0000_0001);
+    table.insert(
+        make_verb(addr, 1, verb::GET_PARAMETER | param::FUNCTION_GROUP_TYPE),
+        0x0000_0001,
+    );
 
     // AFG subordinate: first widget = 2, count = 3.
 
-    table.insert(make_verb(addr, 1, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT), 0x0003_0002);
+    table.insert(
+        make_verb(addr, 1, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT),
+        0x0003_0002,
+    );
 
     // Widget 2: PinComplex, has conn list, has out amp.
 
     //   bits[23:20] = 4 (Pin), bit 8 = 1 (conn list), bit 2 = 1 (out amp), bit 0 = 1 (stereo)
 
-    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS), 0x0040_0105);
+    table.insert(
+        make_verb(addr, 2, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS),
+        0x0040_0105,
+    );
 
-    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::CONNECTION_LIST_LENGTH), 0x0000_0001);
+    table.insert(
+        make_verb(addr, 2, verb::GET_PARAMETER | param::CONNECTION_LIST_LENGTH),
+        0x0000_0001,
+    );
 
-    table.insert(make_verb(addr, 2, verb::GET_CONNECTION_LIST_ENTRY | 0), 0x0000_0003);
+    table.insert(
+        make_verb(addr, 2, verb::GET_CONNECTION_LIST_ENTRY | 0),
+        0x0000_0003,
+    );
 
-    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::PIN_CAPS), 0x0000_0010); // out-capable
+    table.insert(
+        make_verb(addr, 2, verb::GET_PARAMETER | param::PIN_CAPS),
+        0x0000_0010,
+    ); // out-capable
 
     // pin_config_default: default_device=1 (Speaker), connectivity=2 (fixed)
 
-    table.insert(make_verb(addr, 2, verb::GET_CONFIG_DEFAULT), (2u32 << 30) | (1u32 << 20));
+    table.insert(
+        make_verb(addr, 2, verb::GET_CONFIG_DEFAULT),
+        (2u32 << 30) | (1u32 << 20),
+    );
 
-    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS), 0x8002_0F00);
+    table.insert(
+        make_verb(addr, 2, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS),
+        0x8002_0F00,
+    );
 
     // Widget 3: AudioMixer (type 2), conn list, out amp
 
-    table.insert(make_verb(addr, 3, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS), 0x0020_0105);
+    table.insert(
+        make_verb(addr, 3, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS),
+        0x0020_0105,
+    );
 
-    table.insert(make_verb(addr, 3, verb::GET_PARAMETER | param::CONNECTION_LIST_LENGTH), 0x0000_0001);
+    table.insert(
+        make_verb(addr, 3, verb::GET_PARAMETER | param::CONNECTION_LIST_LENGTH),
+        0x0000_0001,
+    );
 
-    table.insert(make_verb(addr, 3, verb::GET_CONNECTION_LIST_ENTRY | 0), 0x0000_0004);
+    table.insert(
+        make_verb(addr, 3, verb::GET_CONNECTION_LIST_ENTRY | 0),
+        0x0000_0004,
+    );
 
-    table.insert(make_verb(addr, 3, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS), 0x8002_0F00);
+    table.insert(
+        make_verb(addr, 3, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS),
+        0x8002_0F00,
+    );
 
     // Widget 4: AudioOutput (type 0), no conn list, out amp
 
-    table.insert(make_verb(addr, 4, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS), 0x0000_0005);
+    table.insert(
+        make_verb(addr, 4, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS),
+        0x0000_0005,
+    );
 
-    table.insert(make_verb(addr, 4, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS), 0x8002_0F00);
-
-
+    table.insert(
+        make_verb(addr, 4, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS),
+        0x8002_0F00,
+    );
 
     let resolver = |v: u32| *table.get(&v).unwrap_or(&0);
 
     let codec = enumerate(addr, resolver);
 
     if codec.vendor_id != 0x10EC || codec.device_id != 0x0287 {
-
         return TestResult::Fail("vendor / device id mis-decoded");
-
     }
 
     if codec.afg_nid != 1 {
-
         return TestResult::Fail("AFG NID should be 1");
-
     }
 
     if codec.widgets.len() != 3 {
-
         return TestResult::Fail("widget count");
-
     }
 
     let pin = codec.widget(2).expect("pin");
 
     if pin.ty() != WidgetType::PinComplex {
-
         return TestResult::Fail("NID 2 should be PinComplex");
-
     }
 
     if pin.connections != vec![3u8] {
-
         return TestResult::Fail("pin connections");
-
     }
 
     if pin.pin_config.expect("cfg").default_device != 0x1 {
-
         return TestResult::Fail("speaker default device lost");
-
     }
 
     let path = find_output_path(&codec).expect("output path");
 
     if path.pin_nid != 2 || path.converter_nid != 4 {
-
         return TestResult::Fail("output path endpoints wrong");
-
     }
 
     if path.chain != vec![3u8] {
-
         return TestResult::Fail("output path should traverse mixer NID 3");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("audio/hda-codec", smoke_hda_codec_enumerates_output_path_via_mock_verb_table);
-
-
+kernel_test_in!(
+    "audio/hda-codec",
+    smoke_hda_codec_enumerates_output_path_via_mock_verb_table
+);
 
 fn smoke_hda_codec_pin_config_default_decoder() -> TestResult {
-
     use crate::hda_codec::PinConfigDefault;
 
     // Speaker: default_device=1, connectivity=2 (fixed), color=0xC (lime — default)
@@ -403,9 +428,7 @@ fn smoke_hda_codec_pin_config_default_decoder() -> TestResult {
     let p = PinConfigDefault::decode(raw);
 
     if !p.is_speaker() || !p.is_output_role() || p.is_input_role() {
-
         return TestResult::Fail("speaker classification wrong");
-
     }
 
     // Mic In: default_device=0xA, connectivity=0 (jack)
@@ -415,21 +438,18 @@ fn smoke_hda_codec_pin_config_default_decoder() -> TestResult {
     let p = PinConfigDefault::decode(raw);
 
     if !p.is_microphone() || !p.is_input_role() || p.is_output_role() {
-
         return TestResult::Fail("mic classification wrong");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("audio/hda-codec", smoke_hda_codec_pin_config_default_decoder);
-
-
+kernel_test_in!(
+    "audio/hda-codec",
+    smoke_hda_codec_pin_config_default_decoder
+);
 
 fn smoke_hda_codec_amp_caps_round_trip() -> TestResult {
-
     use crate::hda_codec::AmpCaps;
 
     // offset=0, num_steps=2, step_size=15 (0.25 dB units), mute capable
@@ -439,25 +459,17 @@ fn smoke_hda_codec_amp_caps_round_trip() -> TestResult {
     let a = AmpCaps::decode(raw);
 
     if a.num_steps != 2 || a.step_size != 15 || !a.mute_capable {
-
         return TestResult::Fail("AmpCaps decode wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("audio/hda-codec", smoke_hda_codec_amp_caps_round_trip);
 
-
-
 // ── I2S + WM8960 codecs ───────────────────────────────────────────
 
-
-
 fn smoke_i2s_bit_clock_math() -> TestResult {
-
     use crate::i2s::I2sFormat;
 
     let f = I2sFormat::cd_quality_stereo();
@@ -465,27 +477,19 @@ fn smoke_i2s_bit_clock_math() -> TestResult {
     // 44_100 × 2 × 16 = 1_411_200 Hz.
 
     if f.bit_clock_hz() != 1_411_200 {
-
         return TestResult::Fail("BCLK math");
-
     }
 
     if f.master_clock_hz(256) != 44_100 * 256 {
-
         return TestResult::Fail("MCLK math");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("audio/i2s", smoke_i2s_bit_clock_math);
 
-
-
 fn smoke_wm8960_register_write_round_trip() -> TestResult {
-
     use crate::wm8960::{pack_register_write, regs, unpack_register_write};
 
     let buf = pack_register_write(regs::AUDIO_INTERFACE, 0x142);
@@ -493,39 +497,28 @@ fn smoke_wm8960_register_write_round_trip() -> TestResult {
     let (reg, data) = unpack_register_write(buf);
 
     if reg != regs::AUDIO_INTERFACE || data != 0x142 {
-
         return TestResult::Fail("register write round-trip");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("audio/wm8960", smoke_wm8960_register_write_round_trip);
 
-
-
 fn smoke_wm8960_init_sequence_starts_with_reset() -> TestResult {
-
     use crate::wm8960::{build_init_sequence_i2s_master_16bit, regs};
 
     let seq = build_init_sequence_i2s_master_16bit();
 
     if seq.is_empty() || seq[0].0 != regs::RESET {
-
         return TestResult::Fail("first write must be RESET");
-
     }
 
     if !seq.iter().any(|(r, _)| *r == regs::AUDIO_INTERFACE) {
-
         return TestResult::Fail("audio-interface programming missing");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("audio/wm8960", smoke_wm8960_init_sequence_starts_with_reset);
@@ -534,7 +527,12 @@ kernel_test_in!("audio/wm8960", smoke_wm8960_init_sequence_starts_with_reset);
 
 fn smoke_i2s_word_length_variants_distinct() -> TestResult {
     use crate::i2s::WordLength;
-    let all = [WordLength::Bits16, WordLength::Bits20, WordLength::Bits24, WordLength::Bits32];
+    let all = [
+        WordLength::Bits16,
+        WordLength::Bits20,
+        WordLength::Bits24,
+        WordLength::Bits32,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -543,19 +541,33 @@ fn smoke_i2s_word_length_variants_distinct() -> TestResult {
         }
     }
     // repr(u8) values match the bit count.
-    if WordLength::Bits16 as u8 != 16 { return TestResult::Fail("Bits16 != 16"); }
-    if WordLength::Bits32 as u8 != 32 { return TestResult::Fail("Bits32 != 32"); }
+    if WordLength::Bits16 as u8 != 16 {
+        return TestResult::Fail("Bits16 != 16");
+    }
+    if WordLength::Bits32 as u8 != 32 {
+        return TestResult::Fail("Bits32 != 32");
+    }
     TestResult::Pass
 }
 kernel_test_in!("audio/i2s", smoke_i2s_word_length_variants_distinct);
 
 fn smoke_i2s_channels_repr_matches_count() -> TestResult {
     use crate::i2s::Channels;
-    if Channels::Mono as u8 != 1 { return TestResult::Fail("Mono != 1"); }
-    if Channels::Stereo as u8 != 2 { return TestResult::Fail("Stereo != 2"); }
-    if Channels::Tdm4 as u8 != 4 { return TestResult::Fail("Tdm4 != 4"); }
-    if Channels::Tdm6 as u8 != 6 { return TestResult::Fail("Tdm6 != 6"); }
-    if Channels::Tdm8 as u8 != 8 { return TestResult::Fail("Tdm8 != 8"); }
+    if Channels::Mono as u8 != 1 {
+        return TestResult::Fail("Mono != 1");
+    }
+    if Channels::Stereo as u8 != 2 {
+        return TestResult::Fail("Stereo != 2");
+    }
+    if Channels::Tdm4 as u8 != 4 {
+        return TestResult::Fail("Tdm4 != 4");
+    }
+    if Channels::Tdm6 as u8 != 6 {
+        return TestResult::Fail("Tdm6 != 6");
+    }
+    if Channels::Tdm8 as u8 != 8 {
+        return TestResult::Fail("Tdm8 != 8");
+    }
     TestResult::Pass
 }
 kernel_test_in!("audio/i2s", smoke_i2s_channels_repr_matches_count);
@@ -582,11 +594,21 @@ kernel_test_in!("audio/i2s", smoke_i2s_frame_format_variants_distinct);
 fn smoke_i2s_cd_quality_default_shape() -> TestResult {
     use crate::i2s::{Channels, FrameFormat, I2sFormat, WordLength};
     let f = I2sFormat::cd_quality_stereo();
-    if f.word_length != WordLength::Bits16 { return TestResult::Fail("WL"); }
-    if f.frame_format != FrameFormat::Standard { return TestResult::Fail("FF"); }
-    if f.channels != Channels::Stereo { return TestResult::Fail("CH"); }
-    if f.sample_rate_hz != 44_100 { return TestResult::Fail("SR"); }
-    if !f.host_is_master { return TestResult::Fail("master flag"); }
+    if f.word_length != WordLength::Bits16 {
+        return TestResult::Fail("WL");
+    }
+    if f.frame_format != FrameFormat::Standard {
+        return TestResult::Fail("FF");
+    }
+    if f.channels != Channels::Stereo {
+        return TestResult::Fail("CH");
+    }
+    if f.sample_rate_hz != 44_100 {
+        return TestResult::Fail("SR");
+    }
+    if !f.host_is_master {
+        return TestResult::Fail("master flag");
+    }
     TestResult::Pass
 }
 kernel_test_in!("audio/i2s", smoke_i2s_cd_quality_default_shape);
@@ -609,7 +631,10 @@ fn smoke_i2s_bit_clock_scales_with_word_length_and_channels() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("audio/i2s", smoke_i2s_bit_clock_scales_with_word_length_and_channels);
+kernel_test_in!(
+    "audio/i2s",
+    smoke_i2s_bit_clock_scales_with_word_length_and_channels
+);
 
 // ── deep audio/wm8960 ───────────────────────────────────────────
 
@@ -649,13 +674,21 @@ fn smoke_wm8960_pack_unpack_walks_register_corners() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("audio/wm8960", smoke_wm8960_pack_unpack_walks_register_corners);
+kernel_test_in!(
+    "audio/wm8960",
+    smoke_wm8960_pack_unpack_walks_register_corners
+);
 
 fn smoke_wm8960_audio_iface_format_bits_distinct() -> TestResult {
     use crate::wm8960::audio_iface::{
         FORMAT_DSP, FORMAT_I2S, FORMAT_LEFT_JUSTIFIED, FORMAT_RIGHT_JUSTIFIED,
     };
-    let all = [FORMAT_RIGHT_JUSTIFIED, FORMAT_LEFT_JUSTIFIED, FORMAT_I2S, FORMAT_DSP];
+    let all = [
+        FORMAT_RIGHT_JUSTIFIED,
+        FORMAT_LEFT_JUSTIFIED,
+        FORMAT_I2S,
+        FORMAT_DSP,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -664,13 +697,24 @@ fn smoke_wm8960_audio_iface_format_bits_distinct() -> TestResult {
         }
     }
     // Datasheet pins these values (R7 bits [1:0]).
-    if FORMAT_RIGHT_JUSTIFIED != 0 { return TestResult::Fail("RJ != 0"); }
-    if FORMAT_LEFT_JUSTIFIED != 1 { return TestResult::Fail("LJ != 1"); }
-    if FORMAT_I2S != 2 { return TestResult::Fail("I2S != 2"); }
-    if FORMAT_DSP != 3 { return TestResult::Fail("DSP != 3"); }
+    if FORMAT_RIGHT_JUSTIFIED != 0 {
+        return TestResult::Fail("RJ != 0");
+    }
+    if FORMAT_LEFT_JUSTIFIED != 1 {
+        return TestResult::Fail("LJ != 1");
+    }
+    if FORMAT_I2S != 2 {
+        return TestResult::Fail("I2S != 2");
+    }
+    if FORMAT_DSP != 3 {
+        return TestResult::Fail("DSP != 3");
+    }
     TestResult::Pass
 }
-kernel_test_in!("audio/wm8960", smoke_wm8960_audio_iface_format_bits_distinct);
+kernel_test_in!(
+    "audio/wm8960",
+    smoke_wm8960_audio_iface_format_bits_distinct
+);
 
 fn smoke_wm8960_init_sequence_drives_dac_volume() -> TestResult {
     use crate::wm8960::{build_init_sequence_i2s_master_16bit, regs};

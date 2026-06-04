@@ -369,8 +369,11 @@ where
                 let long_form = cll & (1 << 7) != 0;
                 let mut idx = 0u8;
                 while idx < n {
-                    let resp =
-                        verb(make_verb(addr, nid, verb::GET_CONNECTION_LIST_ENTRY | idx as u32));
+                    let resp = verb(make_verb(
+                        addr,
+                        nid,
+                        verb::GET_CONNECTION_LIST_ENTRY | idx as u32,
+                    ));
                     if long_form {
                         // Two 16-bit entries per response (§7.3.3.3).
                         connections.push((resp & 0xFFFF) as u8);
@@ -477,7 +480,11 @@ pub fn find_output_path(c: &Codec) -> Option<AudioPath> {
     // Preference: Speaker (1) > Line Out (0) > HP Out (2).
     const PREF: &[u8] = &[0x1, 0x0, 0x2];
     for &want in PREF {
-        for w in c.widgets.iter().filter(|w| matches!(w.ty(), WidgetType::PinComplex)) {
+        for w in c
+            .widgets
+            .iter()
+            .filter(|w| matches!(w.ty(), WidgetType::PinComplex))
+        {
             let cfg = match w.pin_config {
                 Some(c) => c,
                 None => continue,
@@ -502,7 +509,11 @@ pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
     // Preference: Mic In (0xA) > Line In (0x8) > AUX (0x9).
     const PREF: &[u8] = &[0xA, 0x8, 0x9];
     for &want in PREF {
-        for w in c.widgets.iter().filter(|w| matches!(w.ty(), WidgetType::PinComplex)) {
+        for w in c
+            .widgets
+            .iter()
+            .filter(|w| matches!(w.ty(), WidgetType::PinComplex))
+        {
             let cfg = match w.pin_config {
                 Some(c) => c,
                 None => continue,
@@ -564,4 +575,3 @@ fn trace_step(
     }
     None
 }
-

@@ -166,11 +166,19 @@ impl Header {
     }
     /// Number of subbands (4 or 8).
     pub fn nrof_subbands(&self) -> usize {
-        if self.subbands == 1 { 8 } else { 4 }
+        if self.subbands == 1 {
+            8
+        } else {
+            4
+        }
     }
     /// Number of channels (1 for mono; 2 otherwise).
     pub fn nrof_channels(&self) -> usize {
-        if self.channel_mode == CM_MONO { 1 } else { 2 }
+        if self.channel_mode == CM_MONO {
+            1
+        } else {
+            2
+        }
     }
     /// Decoded sampling rate in Hz.
     pub fn sample_rate_hz(&self) -> u32 {
@@ -251,10 +259,8 @@ pub mod tables {
     /// header calls them "Q15" loosely but they are an independent normative
     /// table matching the spec's 40-entry prototype).
     pub const PROTO_8_Q15: [i32; 40] = [
-        0, 5, 21, 35, -1, -75, -181, -260,
-        -160, 224, 824, 1422, 1670, 1224, -94, -2106,
-        -4255, -5677, -5564, -3398, 0, 3398, 5564, 5677,
-        4255, 2106, 94, -1224, -1670, -1422, -824, -224,
+        0, 5, 21, 35, -1, -75, -181, -260, -160, 224, 824, 1422, 1670, 1224, -94, -2106, -4255,
+        -5677, -5564, -3398, 0, 3398, 5564, 5677, 4255, 2106, 94, -1224, -1670, -1422, -824, -224,
         160, 260, 181, 75, 1, -35, -21, -5,
     ];
 
@@ -270,16 +276,11 @@ pub mod tables {
     /// wrap back to 0..39.
     pub const PROTO_8_SYN_Q15: [i32; 80] = [
         // taps 0..39 (same as analysis PROTO_8_Q15)
-        0, 5, 21, 35, -1, -75, -181, -260,
-        -160, 224, 824, 1422, 1670, 1224, -94, -2106,
-        -4255, -5677, -5564, -3398, 0, 3398, 5564, 5677,
-        4255, 2106, 94, -1224, -1670, -1422, -824, -224,
-        160, 260, 181, 75, 1, -35, -21, -5,
-        // taps 40..79 (period repeat)
-        0, 5, 21, 35, -1, -75, -181, -260,
-        -160, 224, 824, 1422, 1670, 1224, -94, -2106,
-        -4255, -5677, -5564, -3398, 0, 3398, 5564, 5677,
-        4255, 2106, 94, -1224, -1670, -1422, -824, -224,
+        0, 5, 21, 35, -1, -75, -181, -260, -160, 224, 824, 1422, 1670, 1224, -94, -2106, -4255,
+        -5677, -5564, -3398, 0, 3398, 5564, 5677, 4255, 2106, 94, -1224, -1670, -1422, -824, -224,
+        160, 260, 181, 75, 1, -35, -21, -5, // taps 40..79 (period repeat)
+        0, 5, 21, 35, -1, -75, -181, -260, -160, 224, 824, 1422, 1670, 1224, -94, -2106, -4255,
+        -5677, -5564, -3398, 0, 3398, 5564, 5677, 4255, 2106, 94, -1224, -1670, -1422, -824, -224,
         160, 260, 181, 75, 1, -35, -21, -5,
     ];
 
@@ -287,8 +288,7 @@ pub mod tables {
     ///
     /// Reference: A2DP §12.8 Annex B Table H.
     pub const PROTO_4_Q15: [i32; 20] = [
-        0, 99, 277, 0, -823, -1493, -973, 1581,
-        5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
+        0, 99, 277, 0, -823, -1493, -973, 1581, 5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
         -844, 0, 217, 109,
     ];
 
@@ -298,12 +298,9 @@ pub mod tables {
     /// has period 5×M=20, so taps 20..39 repeat taps 0..19.
     pub const PROTO_4_SYN_Q15: [i32; 40] = [
         // taps 0..19 (same as analysis PROTO_4_Q15)
-        0, 99, 277, 0, -823, -1493, -973, 1581,
-        5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
-        -844, 0, 217, 109,
-        // taps 20..39 (period repeat)
-        0, 99, 277, 0, -823, -1493, -973, 1581,
-        5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
+        0, 99, 277, 0, -823, -1493, -973, 1581, 5189, 8347, 9446, 7916, 4220, 0, -1981, -1899, -844,
+        0, 217, 109, // taps 20..39 (period repeat)
+        0, 99, 277, 0, -823, -1493, -973, 1581, 5189, 8347, 9446, 7916, 4220, 0, -1981, -1899,
         -844, 0, 217, 109,
     ];
 
@@ -392,9 +389,7 @@ pub mod analysis {
     //!
     //! Reference: A2DP §12.5 "Analysis subband filter".
 
-    use super::tables::{
-        analysis_mat_4, analysis_mat_8, PROTO_4_Q15, PROTO_8_Q15,
-    };
+    use super::tables::{analysis_mat_4, analysis_mat_8, PROTO_4_Q15, PROTO_8_Q15};
 
     /// QMF state for one channel. Owns the rolling X[] history of
     /// length 10 * nrof_subbands.
@@ -447,8 +442,8 @@ pub mod analysis {
             for k in 0..m {
                 let mut acc: i64 = 0;
                 for j in 0..5 {
-                    let x_idx = k + j * 2 * m;   // stride 2M in history
-                    let p_idx = j * m + k;        // stride M in proto
+                    let x_idx = k + j * 2 * m; // stride 2M in history
+                    let p_idx = j * m + k; // stride M in proto
                     acc += (self.x[x_idx] as i64) * (proto[p_idx] as i64);
                 }
                 y[k] = acc;
@@ -482,9 +477,7 @@ pub mod synthesis {
     //!
     //! Reference: A2DP §12.7 "Synthesis subband filter".
 
-    use super::tables::{
-        synthesis_mat_4, synthesis_mat_8, PROTO_4_SYN_Q15, PROTO_8_SYN_Q15,
-    };
+    use super::tables::{synthesis_mat_4, synthesis_mat_8, PROTO_4_SYN_Q15, PROTO_8_SYN_Q15};
 
     #[derive(Clone, Debug)]
     pub struct ChannelState {
@@ -531,7 +524,11 @@ pub mod synthesis {
             //    10·M taps indexed as D[i·M + j] for i=0..9, j=0..M-1.
             //    Max D index = 9·M + (M-1) = 10M-1 = 79 for M=8  ✓
             //    Max V index = 9·2M + (M-1) = 18M + M-1 = 19M-1 < 20M  ✓
-            let syn_proto: &[i32] = if m == 8 { &PROTO_8_SYN_Q15 } else { &PROTO_4_SYN_Q15 };
+            let syn_proto: &[i32] = if m == 8 {
+                &PROTO_8_SYN_Q15
+            } else {
+                &PROTO_4_SYN_Q15
+            };
             for j in 0..m {
                 let mut acc: i64 = 0;
                 for i in 0..10 {
@@ -566,7 +563,9 @@ pub mod bitalloc {
     //! `sbc/sbc.c::sbc_calculate_bits_internal` — same recipe, just
     //! re-derived from the prose in the spec.
 
-    use super::{ALLOC_LOUDNESS, ALLOC_SNR, CM_DUAL_CHANNEL, CM_JOINT_STEREO, CM_MONO, CM_STEREO, Header};
+    use super::{
+        Header, ALLOC_LOUDNESS, ALLOC_SNR, CM_DUAL_CHANNEL, CM_JOINT_STEREO, CM_MONO, CM_STEREO,
+    };
 
     /// Loudness offset table for 4 subbands @ 4 sampling rates
     /// (A2DP §12.6.2 Table 12.4 / SBC PDF Annex G). Indexed by
@@ -600,11 +599,7 @@ pub mod bitalloc {
     /// - `bits[ch][sb]` — output bits per channel/subband.
     ///
     /// Returns the per-channel bit-need sums for diagnostics.
-    pub fn allocate(
-        h: &Header,
-        scale_factors: &[[u8; 8]],
-        bits: &mut [[u8; 8]],
-    ) -> [u32; 2] {
+    pub fn allocate(h: &Header, scale_factors: &[[u8; 8]], bits: &mut [[u8; 8]]) -> [u32; 2] {
         let nb = h.nrof_subbands();
         let nch = h.nrof_channels();
         let bp = h.bitpool as i32;
@@ -622,11 +617,9 @@ pub mod bitalloc {
                     ALLOC_LOUDNESS | _ => {
                         // Loudness: subtract a small perceptual offset.
                         let off = if nb == 4 {
-                            LOUDNESS_OFFSET_4
-                                [h.sampling_frequency as usize][sb]
+                            LOUDNESS_OFFSET_4[h.sampling_frequency as usize][sb]
                         } else {
-                            LOUDNESS_OFFSET_8
-                                [h.sampling_frequency as usize][sb]
+                            LOUDNESS_OFFSET_8[h.sampling_frequency as usize][sb]
                         };
                         let mut loudness = sf - off;
                         if loudness > 0 {
@@ -656,8 +649,7 @@ pub mod bitalloc {
                         bp - consumed as i32,
                         &mut bits[ch][..nb],
                     );
-                    bits_sum[ch] =
-                        bits[ch][..nb].iter().map(|&b| b as u32).sum();
+                    bits_sum[ch] = bits[ch][..nb].iter().map(|&b| b as u32).sum();
                 }
             }
             CM_STEREO | CM_JOINT_STEREO => {
@@ -668,8 +660,7 @@ pub mod bitalloc {
                         pooled[ch * nb + sb] = bitneed[ch][sb];
                     }
                 }
-                let (consumed, bitslice) =
-                    bisect_bitslice(&pooled[..nch * nb], bp);
+                let (consumed, bitslice) = bisect_bitslice(&pooled[..nch * nb], bp);
                 let mut flat = [0u8; 16];
                 distribute(
                     &pooled[..nch * nb],
@@ -681,8 +672,7 @@ pub mod bitalloc {
                     for sb in 0..nb {
                         bits[ch][sb] = flat[ch * nb + sb];
                     }
-                    bits_sum[ch] =
-                        bits[ch][..nb].iter().map(|&b| b as u32).sum();
+                    bits_sum[ch] = bits[ch][..nb].iter().map(|&b| b as u32).sum();
                 }
             }
             _ => {}
@@ -923,7 +913,11 @@ impl Sbc {
             enc_state.push(analysis::ChannelState::new(nb));
             dec_state.push(synthesis::ChannelState::new(nb));
         }
-        Self { header, enc_state, dec_state }
+        Self {
+            header,
+            enc_state,
+            dec_state,
+        }
     }
 
     /// PCM frame size in samples (per channel): nrof_blocks * nrof_subbands.
@@ -979,10 +973,8 @@ impl Sbc {
                     let r = x[b][1][s];
                     let m = (l + r) / 2;
                     let s2 = (l - r) / 2;
-                    max_lr =
-                        max_lr.max(l.unsigned_abs()).max(r.unsigned_abs());
-                    max_ms =
-                        max_ms.max(m.unsigned_abs()).max(s2.unsigned_abs());
+                    max_lr = max_lr.max(l.unsigned_abs()).max(r.unsigned_abs());
+                    max_ms = max_ms.max(m.unsigned_abs()).max(s2.unsigned_abs());
                 }
                 if max_ms < max_lr && s > 0 {
                     // Use joint coding for this subband (bit set).
@@ -1036,7 +1028,11 @@ impl Sbc {
         // Body length = frame_bytes - 4.
         let body_len = frame_bytes - 4;
         let mut body = vec![0u8; body_len];
-        let join_bits = if self.header.channel_mode == CM_JOINT_STEREO { nb } else { 0 };
+        let join_bits = if self.header.channel_mode == CM_JOINT_STEREO {
+            nb
+        } else {
+            0
+        };
         let sf_bits = nb * nch * 4;
         {
             let mut bw = BitWriter::new(&mut body);
@@ -1120,7 +1116,11 @@ impl Sbc {
         }
         // CRC check
         let sf_bits = nb * nch * 4;
-        let join_bits = if header.channel_mode == CM_JOINT_STEREO { nb } else { 0 };
+        let join_bits = if header.channel_mode == CM_JOINT_STEREO {
+            nb
+        } else {
+            0
+        };
         let crc_bits_total = 16 + join_bits + sf_bits;
         let crc_bytes_len = (crc_bits_total + 7) / 8;
         let mut crc_input = vec![0u8; crc_bytes_len];
@@ -1198,7 +1198,7 @@ fn quantize_sample(sample: i32, sf: u8, nbits: usize) -> u32 {
     }
     let levels = (1u32 << nbits) - 1;
     let scale = 1i64 << (sf as u32 + 1); // 2^(sf+1)
-    // q = (((sample / scale) + 1) * levels) / 2, clipped to [0, levels].
+                                         // q = (((sample / scale) + 1) * levels) / 2, clipped to [0, levels].
     let num = (sample as i64 + scale) * (levels as i64);
     let den = (scale << 1) as i64; // 2 * scale
     let q = num / den;
@@ -1404,7 +1404,11 @@ mod tests {
         for i in 0..pcm_len {
             // Triangle wave, amplitude 0x2000.
             let phase = (i % 64) as i32;
-            let v = if phase < 32 { phase * 256 } else { (64 - phase) * 256 };
+            let v = if phase < 32 {
+                phase * 256
+            } else {
+                (64 - phase) * 256
+            };
             pcm_in[i] = (v - 4096) as i16;
         }
         let mut buf = vec![0u8; enc.frame_bytes()];

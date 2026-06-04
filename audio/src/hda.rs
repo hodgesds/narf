@@ -47,9 +47,9 @@
 
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
-use narf_bus::{bar, enable_msix, BusDevice, BusDeviceCap, MsixTable};
 #[cfg(target_arch = "x86_64")]
 use narf_bus::BusKind;
+use narf_bus::{bar, enable_msix, BusDevice, BusDeviceCap, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
@@ -648,8 +648,7 @@ impl IntelHda {
             let blk = bar0.read32(REG_RIRBCTL & !0x3);
             bar0.write32(
                 REG_RIRBCTL & !0x3,
-                (blk & 0xFFFF_FF00)
-                    | (RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC) as u32,
+                (blk & 0xFFFF_FF00) | (RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC) as u32,
             );
         }
 
@@ -922,8 +921,7 @@ impl IntelHda {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
-        let _ = unsafe { msix.program_vector(0, 0, v) }
-            .map_err(|_| HdaError::DmaAllocFailed)?;
+        let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| HdaError::DmaAllocFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         let _ = unsafe { msix.enable() }.map_err(|_| HdaError::DmaAllocFailed)?;
         Ok((msix, v))
@@ -942,10 +940,7 @@ impl IntelHda {
     /// named link source return `None` and the caller falls
     /// through to the polled `send_verb` path.
     #[cfg(target_arch = "x86_64")]
-    fn try_install_intx(
-        cap: &Cap<BusDeviceCap, Write>,
-        device: &BusDevice,
-    ) -> Option<u8> {
+    fn try_install_intx(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Option<u8> {
         let pin = narf_bus::pci::read_intx_pin(cap, device).ok()?;
         if pin == 0 || pin > 4 {
             return None;
@@ -982,10 +977,7 @@ impl IntelHda {
         Some(v)
     }
     #[cfg(not(target_arch = "x86_64"))]
-    fn try_install_intx(
-        _cap: &Cap<BusDeviceCap, Write>,
-        _device: &BusDevice,
-    ) -> Option<u8> {
+    fn try_install_intx(_cap: &Cap<BusDeviceCap, Write>, _device: &BusDevice) -> Option<u8> {
         None
     }
 
@@ -1110,9 +1102,8 @@ impl IntelHda {
         // set). For laptop codecs the first entry is almost always
         // the AOC; we only walk one hop deeper if it's a mixer.
         // SAFETY: same.
-        let entry = unsafe {
-            self.send_verb(make_verb(cad, pin_nid, VERB_GET_CONNECTION_LIST_ENTRY))?
-        };
+        let entry =
+            unsafe { self.send_verb(make_verb(cad, pin_nid, VERB_GET_CONNECTION_LIST_ENTRY))? };
         let mut conv_nid = (entry & 0xFF) as u8;
         // SAFETY: same.
         let conv_caps = unsafe {
@@ -1526,10 +1517,7 @@ impl IntelHda {
         //    the loop re-checks RIRBWP (often we won the race) and
         //    re-arms.
         loop {
-            let waiter = narf_interrupts::wait_for_irq_until(
-                v,
-                narf_time::Deadline::after_ms(200),
-            );
+            let waiter = narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(200));
 
             // 4. Kick CORBWP — controller fetches the new verb,
             //    sends it down the link, and on the codec response
@@ -1730,29 +1718,109 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// inside `probe`.
 const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
     // AMD — Family-19h Phoenix HD Audio + Radeon HD Audio iGPU.
-    ("hda-amd-phoenix", HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE),
-    ("hda-amd-radeon", HDA_AMD_RADEON_VENDOR, HDA_AMD_RADEON_DEVICE),
+    (
+        "hda-amd-phoenix",
+        HDA_AMD_PHOENIX_VENDOR,
+        HDA_AMD_PHOENIX_DEVICE,
+    ),
+    (
+        "hda-amd-radeon",
+        HDA_AMD_RADEON_VENDOR,
+        HDA_AMD_RADEON_DEVICE,
+    ),
     // Intel legacy ICH HD Audio.
-    ("hda-intel-ich6", HDA_INTEL_ICH6_VENDOR, HDA_INTEL_ICH6_DEVICE),
-    ("hda-intel-ich7", HDA_INTEL_ICH7_VENDOR, HDA_INTEL_ICH7_DEVICE),
-    ("hda-intel-ich9", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ICH9_DEVICE),
+    (
+        "hda-intel-ich6",
+        HDA_INTEL_ICH6_VENDOR,
+        HDA_INTEL_ICH6_DEVICE,
+    ),
+    (
+        "hda-intel-ich7",
+        HDA_INTEL_ICH7_VENDOR,
+        HDA_INTEL_ICH7_DEVICE,
+    ),
+    (
+        "hda-intel-ich9",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_ICH9_DEVICE,
+    ),
     // Intel PCH HDA (Skylake → Meteor Lake).
-    ("hda-intel-sunrise-point-lp", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_SUNRISE_POINT_LP_DEVICE),
-    ("hda-intel-sunrise-point-lp-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_SUNRISE_POINT_LP_DEVICE_B),
-    ("hda-intel-cannon-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_CANNON_LAKE_DEVICE),
-    ("hda-intel-comet-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_COMET_LAKE_DEVICE),
-    ("hda-intel-comet-lake-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_COMET_LAKE_DEVICE_B),
-    ("hda-intel-tiger-lake-lp", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_LP_DEVICE),
-    ("hda-intel-tiger-lake-lp-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_LP_DEVICE_B),
-    ("hda-intel-alder-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ALDER_LAKE_DEVICE),
-    ("hda-intel-alder-lake-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ALDER_LAKE_DEVICE_B),
-    ("hda-intel-alder-lake-c", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_ALDER_LAKE_DEVICE_C),
-    ("hda-intel-meteor-lake", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_METEOR_LAKE_DEVICE),
+    (
+        "hda-intel-sunrise-point-lp",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_SUNRISE_POINT_LP_DEVICE,
+    ),
+    (
+        "hda-intel-sunrise-point-lp-b",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_SUNRISE_POINT_LP_DEVICE_B,
+    ),
+    (
+        "hda-intel-cannon-lake",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_CANNON_LAKE_DEVICE,
+    ),
+    (
+        "hda-intel-comet-lake",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_COMET_LAKE_DEVICE,
+    ),
+    (
+        "hda-intel-comet-lake-b",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_COMET_LAKE_DEVICE_B,
+    ),
+    (
+        "hda-intel-tiger-lake-lp",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_TIGER_LAKE_LP_DEVICE,
+    ),
+    (
+        "hda-intel-tiger-lake-lp-b",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_TIGER_LAKE_LP_DEVICE_B,
+    ),
+    (
+        "hda-intel-alder-lake",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_ALDER_LAKE_DEVICE,
+    ),
+    (
+        "hda-intel-alder-lake-b",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_ALDER_LAKE_DEVICE_B,
+    ),
+    (
+        "hda-intel-alder-lake-c",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_ALDER_LAKE_DEVICE_C,
+    ),
+    (
+        "hda-intel-meteor-lake",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_METEOR_LAKE_DEVICE,
+    ),
     // Intel iGPU display-audio (TGL / TGL-LP graphics function).
-    ("hda-intel-tgl-gfx", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE),
-    ("hda-intel-tgl-gfx-b", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE_B),
-    ("hda-intel-tgl-gfx-c", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE_C),
-    ("hda-intel-tgl-gfx-d", HDA_INTEL_ICH9_VENDOR, HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D),
+    (
+        "hda-intel-tgl-gfx",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_TIGER_LAKE_GFX_DEVICE,
+    ),
+    (
+        "hda-intel-tgl-gfx-b",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_TIGER_LAKE_GFX_DEVICE_B,
+    ),
+    (
+        "hda-intel-tgl-gfx-c",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_TIGER_LAKE_GFX_DEVICE_C,
+    ),
+    (
+        "hda-intel-tgl-gfx-d",
+        HDA_INTEL_ICH9_VENDOR,
+        HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D,
+    ),
 ];
 
 /// Register every supported HDA controller PCI id with the bus match

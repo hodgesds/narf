@@ -46,10 +46,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::codec::{
-    self, param, CodecError, CodecTree, CodecWidget, FakeCorb, WidgetKind,
-    VERB_GET_PARAMETER, VERB_SET_AMP_GAIN_MUTE_PREFIX,
-    VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL, VERB_SET_POWER_STATE,
-    VERB_SET_UNSOLICITED_RESPONSE,
+    self, param, CodecError, CodecTree, CodecWidget, FakeCorb, WidgetKind, VERB_GET_PARAMETER,
+    VERB_SET_AMP_GAIN_MUTE_PREFIX, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL,
+    VERB_SET_POWER_STATE, VERB_SET_UNSOLICITED_RESPONSE,
 };
 
 // ── Vendor / Chip detection ─────────────────────────────────────────
@@ -445,12 +444,13 @@ pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), Al
     // 2. Enumerate.
     let tree = codec::enumerate_with(cad, |c, n, v, p| send(c, n, v, p))
         .map_err(|_| AlcError::EnumerationFailed)?;
-    let afg = tree.audio_function_group().ok_or(AlcError::EnumerationFailed)?;
+    let afg = tree
+        .audio_function_group()
+        .ok_or(AlcError::EnumerationFailed)?;
     let afg_nid = afg.nid;
 
     // 3. Power AFG into D0.
-    send(cad, afg_nid, VERB_SET_POWER_STATE, 0x00)
-        .map_err(|_| AlcError::TransportFailed)?;
+    send(cad, afg_nid, VERB_SET_POWER_STATE, 0x00).map_err(|_| AlcError::TransportFailed)?;
 
     // Collect the lists we need to walk — done up front so the
     // mutable closure doesn't fight the borrow checker mid-loop.
@@ -459,8 +459,7 @@ pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), Al
         .iter()
         .filter(|w| {
             w.kind() == WidgetKind::PinComplex
-                && w.pin_config.map(PinDefault::decode).map(|p| p.is_speaker())
-                    == Some(true)
+                && w.pin_config.map(PinDefault::decode).map(|p| p.is_speaker()) == Some(true)
         })
         .collect();
     let headphone_pins: Vec<&CodecWidget> = afg
@@ -468,7 +467,9 @@ pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), Al
         .iter()
         .filter(|w| {
             w.kind() == WidgetKind::PinComplex
-                && w.pin_config.map(PinDefault::decode).map(|p| p.is_headphone())
+                && w.pin_config
+                    .map(PinDefault::decode)
+                    .map(|p| p.is_headphone())
                     == Some(true)
         })
         .collect();
@@ -482,14 +483,18 @@ pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), Al
     for pin in &speaker_pins {
         // Bit 1 = EAPD enable, bit 0 = BTL (balanced trans-load). We
         // set bit 1 only.
-        send(cad, pin.nid, VERB_SET_EAPD_BTL, 0x02)
-            .map_err(|_| AlcError::TransportFailed)?;
+        send(cad, pin.nid, VERB_SET_EAPD_BTL, 0x02).map_err(|_| AlcError::TransportFailed)?;
     }
 
     // 5. Speaker pins → Pin Widget Control = out_enable | HP-amp.
     for pin in &speaker_pins {
-        send(cad, pin.nid, VERB_SET_PIN_WIDGET_CONTROL, SPEAKER_PIN_PAYLOAD)
-            .map_err(|_| AlcError::TransportFailed)?;
+        send(
+            cad,
+            pin.nid,
+            VERB_SET_PIN_WIDGET_CONTROL,
+            SPEAKER_PIN_PAYLOAD,
+        )
+        .map_err(|_| AlcError::TransportFailed)?;
     }
 
     // 6. For each speaker pin, walk its connection list and unmute
@@ -542,10 +547,7 @@ pub fn detect(cad: u8) -> Result<Option<RealtekChip>, AlcError> {
 }
 
 /// Detection variant with an injected verb closure.
-pub fn detect_with(
-    cad: u8,
-    send: SendVerb<'_>,
-) -> Result<Option<RealtekChip>, AlcError> {
+pub fn detect_with(cad: u8, send: SendVerb<'_>) -> Result<Option<RealtekChip>, AlcError> {
     let vid_did = send(cad, 0, VERB_GET_PARAMETER, param::VENDOR_ID)
         .map_err(|_| AlcError::TransportFailed)?;
     let vendor = ((vid_did >> 16) & 0xFFFF) as u16;
@@ -598,7 +600,13 @@ pub fn arm_fake_alc295(fake: &mut FakeCorb, cad: u8) {
     let speaker_caps = (4u32 << 20) | (1 << 8) | 1; // PinComplex, conn-list, stereo
     fake.arm_param(cad, 4, param::WIDGET_CAPS, speaker_caps);
     fake.arm_param(cad, 4, param::CONNECTION_LIST_LENGTH, 1);
-    fake.arm(cad, 4, codec::VERB_GET_CONNECTION_LIST_ENTRY, 0, 0x0000_0002);
+    fake.arm(
+        cad,
+        4,
+        codec::VERB_GET_CONNECTION_LIST_ENTRY,
+        0,
+        0x0000_0002,
+    );
     // Pin Default — Speaker (device 1), fixed, no jack.
     fake.arm(cad, 4, codec::VERB_GET_CONFIG_DEFAULT, 0, 0x9017_0110);
 
@@ -606,7 +614,13 @@ pub fn arm_fake_alc295(fake: &mut FakeCorb, cad: u8) {
     let hp_caps = (4u32 << 20) | (1 << 8) | (1 << 7) | 1; // PinComplex, conn-list, unsol, stereo
     fake.arm_param(cad, 5, param::WIDGET_CAPS, hp_caps);
     fake.arm_param(cad, 5, param::CONNECTION_LIST_LENGTH, 1);
-    fake.arm(cad, 5, codec::VERB_GET_CONNECTION_LIST_ENTRY, 0, 0x0000_0003);
+    fake.arm(
+        cad,
+        5,
+        codec::VERB_GET_CONNECTION_LIST_ENTRY,
+        0,
+        0x0000_0003,
+    );
     // Pin Default — Headphone Out (device 2), jack, green, assoc 1.
     fake.arm(cad, 5, codec::VERB_GET_CONFIG_DEFAULT, 0, 0x2121_4020);
 }
@@ -705,8 +719,8 @@ mod tests {
         // 1. Realtek ALC295.
         let mut fake = FakeCorb::new();
         fake.arm_param(cad, 0, param::VENDOR_ID, (0x10ECu32 << 16) | 0x0295);
-        let chip = detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)))
-            .expect("detect ok");
+        let chip =
+            detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p))).expect("detect ok");
         if chip != Some(RealtekChip::Alc295) {
             return TestResult::Fail("ALC295 not detected");
         }
@@ -714,8 +728,8 @@ mod tests {
         // 2. Realtek ALC289 (Phoenix HawkPoint1).
         let mut fake = FakeCorb::new();
         fake.arm_param(cad, 0, param::VENDOR_ID, (0x10ECu32 << 16) | 0x0289);
-        let chip = detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)))
-            .expect("detect ok");
+        let chip =
+            detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p))).expect("detect ok");
         if chip != Some(RealtekChip::Alc289) {
             return TestResult::Fail("ALC289 not detected");
         }
@@ -723,8 +737,8 @@ mod tests {
         // 3. Cirrus Logic (vendor 0x1013) — not Realtek.
         let mut fake = FakeCorb::new();
         fake.arm_param(cad, 0, param::VENDOR_ID, (0x1013u32 << 16) | 0x4208);
-        let chip = detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)))
-            .expect("detect ok");
+        let chip =
+            detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p))).expect("detect ok");
         if chip.is_some() {
             return TestResult::Fail("non-Realtek codec misdetected");
         }
@@ -732,8 +746,8 @@ mod tests {
         // 4. Realtek unknown device ID.
         let mut fake = FakeCorb::new();
         fake.arm_param(cad, 0, param::VENDOR_ID, (0x10ECu32 << 16) | 0xFFFF);
-        let chip = detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p)))
-            .expect("detect ok");
+        let chip =
+            detect_with(cad, &mut |c, n, v, p| Ok(fake.send(c, n, v, p))).expect("detect ok");
         if !matches!(chip, Some(RealtekChip::Unknown(0xFFFF))) {
             return TestResult::Fail("Realtek unknown device id not classified");
         }

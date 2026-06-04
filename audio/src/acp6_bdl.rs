@@ -413,7 +413,11 @@ impl FakeMmio {
 
     /// Number of writes to `offset`.
     pub fn write_count(&self, offset: u64) -> usize {
-        self.writes.borrow().iter().filter(|(o, _)| *o == offset).count()
+        self.writes
+            .borrow()
+            .iter()
+            .filter(|(o, _)| *o == offset)
+            .count()
     }
 
     /// Read a 32-bit register at `offset`.
@@ -439,12 +443,7 @@ impl FakeMmio {
 ///
 /// Mirrors the production sequence in `acp6_pcm::program_dma_registers`
 /// but accepts a `&FakeMmio` instead of `&AcpDevice`.
-pub fn fake_program_dma_registers(
-    mmio: &FakeMmio,
-    ring_phys: u64,
-    ring_bytes: u32,
-    bdl: &BdlRing,
-) {
+pub fn fake_program_dma_registers(mmio: &FakeMmio, ring_phys: u64, ring_bytes: u32, bdl: &BdlRing) {
     // SAFETY: FakeMmio::write32 is no-op MMIO — safe in tests.
     unsafe {
         mmio.write32(regs::ACP_I2STX_RINGBUFADDR, ring_phys as u32);
@@ -475,31 +474,46 @@ mod tests {
     /// across the full 16-bit range for both fields.
     fn smoke_acp6_bdl_descriptor_encode_decode() -> TestResult {
         // Nominal descriptor: offset 4096, len 2048.
-        let d = BdlDescriptor { byte_offset: 4096, byte_len: 2048 };
+        let d = BdlDescriptor {
+            byte_offset: 4096,
+            byte_len: 2048,
+        };
         if BdlDescriptor::decode(d.encode()) != d {
             return TestResult::Fail("nominal round-trip failed");
         }
 
         // Zero descriptor.
-        let zero = BdlDescriptor { byte_offset: 0, byte_len: 0 };
+        let zero = BdlDescriptor {
+            byte_offset: 0,
+            byte_len: 0,
+        };
         if BdlDescriptor::decode(zero.encode()) != zero {
             return TestResult::Fail("zero descriptor round-trip");
         }
 
         // Max-value descriptor (both fields at 0xFFFF).
-        let max = BdlDescriptor { byte_offset: 0xFFFF, byte_len: 0xFFFF };
+        let max = BdlDescriptor {
+            byte_offset: 0xFFFF,
+            byte_len: 0xFFFF,
+        };
         if BdlDescriptor::decode(max.encode()) != max {
             return TestResult::Fail("max descriptor round-trip");
         }
 
         // Bit independence: offset 0, len 1.
-        let one_len = BdlDescriptor { byte_offset: 0, byte_len: 1 };
+        let one_len = BdlDescriptor {
+            byte_offset: 0,
+            byte_len: 1,
+        };
         if BdlDescriptor::decode(one_len.encode()) != one_len {
             return TestResult::Fail("single-bit len round-trip");
         }
 
         // Bit independence: offset 1, len 0.
-        let one_off = BdlDescriptor { byte_offset: 1, byte_len: 0 };
+        let one_off = BdlDescriptor {
+            byte_offset: 1,
+            byte_len: 0,
+        };
         if BdlDescriptor::decode(one_off.encode()) != one_off {
             return TestResult::Fail("single-bit offset round-trip");
         }
@@ -666,26 +680,22 @@ mod tests {
     ///   3. `on_i2s_tx_irq` advances the software period pointer.
     fn smoke_acp6_e2e_speaker_amp_buffer_advance() -> TestResult {
         use crate::codec::FakeCorb;
-        use crate::realtek_alc::{arm_fake_alc295, SPEAKER_PIN_PAYLOAD};
         use crate::codec::VERB_SET_PIN_WIDGET_CONTROL;
+        use crate::realtek_alc::{arm_fake_alc295, SPEAKER_PIN_PAYLOAD};
 
         let cad: u8 = 0;
 
         // 1. Build a fake ALC295 codec tree.
         let mut enum_corb = FakeCorb::new();
         arm_fake_alc295(&mut enum_corb, cad);
-        let tree = crate::codec::enumerate_with(cad, |c, n, v, p| {
-            Ok(enum_corb.send(c, n, v, p))
-        })
-        .expect("enumerate_with");
+        let tree = crate::codec::enumerate_with(cad, |c, n, v, p| Ok(enum_corb.send(c, n, v, p)))
+            .expect("enumerate_with");
 
         // Wire the I2S stream to the codec tree via a second FakeCorb.
         let mut wire_corb = FakeCorb::new();
         arm_fake_alc295(&mut wire_corb, cad);
-        let result = wire_i2s_to_codec_tree(
-            &tree,
-            &mut |c, n, v, p| Ok(wire_corb.send(c, n, v, p)),
-        );
+        let result =
+            wire_i2s_to_codec_tree(&tree, &mut |c, n, v, p| Ok(wire_corb.send(c, n, v, p)));
         if result.is_err() {
             return TestResult::Fail("wire_i2s_to_codec_tree failed");
         }

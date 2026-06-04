@@ -325,14 +325,20 @@ mod tests {
         }
 
         // S32LE → val 5, shift 3 → 0x28.
-        let fmt32 = I2sFormat { word_length: WordLength::Bits32, ..fmt16 };
+        let fmt32 = I2sFormat {
+            word_length: WordLength::Bits32,
+            ..fmt16
+        };
         let iter32 = Acp3xIter::build(fmt32);
         if iter32.raw() & ITER_SAMP_LEN_MASK != IterSampLen::Bits32 as u32 {
             return TestResult::Fail("S32LE sample-length code wrong");
         }
 
         // DSP/PCM sets TDM bit.
-        let fmt_tdm = I2sFormat { frame_format: FrameFormat::DspPcm, ..fmt16 };
+        let fmt_tdm = I2sFormat {
+            frame_format: FrameFormat::DspPcm,
+            ..fmt16
+        };
         let iter_tdm = Acp3xIter::build(fmt_tdm);
         if iter_tdm.raw() & Acp3xIter::TDM_ENABLE == 0 {
             return TestResult::Fail("DspPcm did not set TDM_ENABLE");
