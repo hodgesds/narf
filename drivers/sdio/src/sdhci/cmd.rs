@@ -10,16 +10,15 @@
 #![allow(dead_code)]
 
 use super::regs::{
-    make_cmd, CMD_CRC, CMD_DATA, CMD_INDEX, CMD_RESP_NONE,
-    CMD_RESP_SHORT, CMD_RESP_SHORT_BUSY,
+    make_cmd, CMD_CRC, CMD_DATA, CMD_INDEX, CMD_RESP_NONE, CMD_RESP_SHORT, CMD_RESP_SHORT_BUSY,
 };
 
 // ── Command indices ────────────────────────────────────────────────────
-pub const CMD_IDX_GO_IDLE: u8    = 0;   // CMD0
-pub const CMD_IDX_SEND_RCA: u8   = 3;   // CMD3
-pub const CMD_IDX_SEND_OP: u8    = 5;   // CMD5 (SDIO only)
-pub const CMD_IDX_SELECT: u8     = 7;   // CMD7
-pub const CMD_IDX_IO_RW_DIRECT: u8   = 52; // CMD52
+pub const CMD_IDX_GO_IDLE: u8 = 0; // CMD0
+pub const CMD_IDX_SEND_RCA: u8 = 3; // CMD3
+pub const CMD_IDX_SEND_OP: u8 = 5; // CMD5 (SDIO only)
+pub const CMD_IDX_SELECT: u8 = 7; // CMD7
+pub const CMD_IDX_IO_RW_DIRECT: u8 = 52; // CMD52
 pub const CMD_IDX_IO_RW_EXTENDED: u8 = 53; // CMD53
 
 // ── Pre-built COMMAND register words ─────────────────────────────────
@@ -39,8 +38,10 @@ pub const CMD7_WORD: u16 = make_cmd(CMD_IDX_SELECT, CMD_RESP_SHORT_BUSY | CMD_CR
 pub const CMD52_WORD: u16 = make_cmd(CMD_IDX_IO_RW_DIRECT, CMD_RESP_SHORT | CMD_CRC | CMD_INDEX);
 
 /// CMD53 — short response (R5) + data.
-pub const CMD53_WORD: u16 =
-    make_cmd(CMD_IDX_IO_RW_EXTENDED, CMD_RESP_SHORT | CMD_CRC | CMD_INDEX | CMD_DATA);
+pub const CMD53_WORD: u16 = make_cmd(
+    CMD_IDX_IO_RW_EXTENDED,
+    CMD_RESP_SHORT | CMD_CRC | CMD_INDEX | CMD_DATA,
+);
 
 // ── CMD5 argument helpers ─────────────────────────────────────────────
 /// Voltage window bits in the CMD5 argument (negotiation phase).
@@ -55,12 +56,12 @@ pub const CMD5_ARG_S18R: u32 = 0x0100_0000;
 /// OCR memory-present bit in CMD5 R4 response.
 pub const OCR_MEM_PRESENT: u32 = 0x0800_0000;
 /// OCR card ready bit.
-pub const OCR_CARD_READY: u32  = 0x8000_0000;
+pub const OCR_CARD_READY: u32 = 0x8000_0000;
 /// S18A (1.8 V accepted) bit in R4.
-pub const OCR_S18A: u32        = 0x0100_0000;
+pub const OCR_S18A: u32 = 0x0100_0000;
 /// Number-of-SDIO-functions field (R4 bits[30:28]).
 pub const OCR_FUNC_COUNT_SHIFT: u32 = 28;
-pub const OCR_FUNC_COUNT_MASK: u32  = 0x7000_0000;
+pub const OCR_FUNC_COUNT_MASK: u32 = 0x7000_0000;
 
 // ── CMD52 argument builder ─────────────────────────────────────────────
 /// Build the 32-bit CMD52 argument word.
@@ -72,8 +73,8 @@ pub const OCR_FUNC_COUNT_MASK: u32  = 0x7000_0000;
 /// ```
 #[inline]
 pub const fn cmd52_arg(write: bool, func: u8, raw: bool, addr: u32, data: u8) -> u32 {
-    let rw  = if write { 1u32 } else { 0u32 };
-    let raw = if raw   { 1u32 } else { 0u32 };
+    let rw = if write { 1u32 } else { 0u32 };
+    let raw = if raw { 1u32 } else { 0u32 };
     (rw << 31)
         | ((func as u32 & 0b111) << 28)
         | (raw << 27)
@@ -100,9 +101,9 @@ pub const fn cmd53_arg(
     addr: u32,
     count: u16,
 ) -> u32 {
-    let rw    = if write      { 1u32 } else { 0u32 };
+    let rw = if write { 1u32 } else { 0u32 };
     let block = if block_mode { 1u32 } else { 0u32 };
-    let incr  = if increment  { 1u32 } else { 0u32 };
+    let incr = if increment { 1u32 } else { 0u32 };
     (rw << 31)
         | ((func as u32 & 0b111) << 28)
         | (block << 27)
@@ -113,11 +114,11 @@ pub const fn cmd53_arg(
 
 // ── R5 response decoding ────────────────────────────────────────────────
 /// Flags in the R5 response byte (CMD52 / CMD53 response).
-pub const R5_COM_CRC_ERROR: u8  = 0x80;
+pub const R5_COM_CRC_ERROR: u8 = 0x80;
 pub const R5_ILLEGAL_COMMAND: u8 = 0x40;
-pub const R5_ERROR: u8           = 0x08;
-pub const R5_FUNCTION_NUM: u8    = 0x02;
-pub const R5_OUT_OF_RANGE: u8    = 0x01;
+pub const R5_ERROR: u8 = 0x08;
+pub const R5_FUNCTION_NUM: u8 = 0x02;
+pub const R5_OUT_OF_RANGE: u8 = 0x01;
 pub const R5_IO_CURRENT_STATE_TRAN: u8 = 0x10; // bits [5:4] = 0b01 → Transfer
 
 /// Decode the R5 flags from a raw 32-bit response word (bits[15:8]).
@@ -129,8 +130,8 @@ pub fn r5_flags(response: u32) -> u8 {
 /// True if R5 indicates an error condition.
 #[inline]
 pub fn r5_is_error(flags: u8) -> bool {
-    flags & (R5_COM_CRC_ERROR | R5_ILLEGAL_COMMAND | R5_ERROR
-             | R5_FUNCTION_NUM | R5_OUT_OF_RANGE) != 0
+    flags & (R5_COM_CRC_ERROR | R5_ILLEGAL_COMMAND | R5_ERROR | R5_FUNCTION_NUM | R5_OUT_OF_RANGE)
+        != 0
 }
 
 /// Extract the read-data byte from an R5 response.
@@ -260,7 +261,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/sdio/sdhci/cmd", smoke_ocr_voltage_decode_18v_switch);
+    kernel_test_in!(
+        "drivers/sdio/sdhci/cmd",
+        smoke_ocr_voltage_decode_18v_switch
+    );
 
     fn smoke_r5_error_flags() -> TestResult {
         // A clean R5 in Transfer state has bits [5:4] == 0b01,

@@ -12,8 +12,7 @@
 #![allow(dead_code)]
 
 use super::regs::{
-    POWER_180, POWER_330, POWER_ON, CTRL2_VDD_180,
-    CAPS_CAN_VDD_180, CAPS_CAN_VDD_330,
+    CAPS_CAN_VDD_180, CAPS_CAN_VDD_330, CTRL2_VDD_180, POWER_180, POWER_330, POWER_ON,
 };
 
 /// Voltage selection understood by the host's power regulator.
@@ -42,7 +41,7 @@ pub fn caps_voltage_support(caps: u32) -> VoltageSupport {
     let has_180 = caps & CAPS_CAN_VDD_180 != 0;
     let has_330 = caps & CAPS_CAN_VDD_330 != 0;
     match (has_180, has_330) {
-        (true, true)  => VoltageSupport::Both,
+        (true, true) => VoltageSupport::Both,
         (false, true) => VoltageSupport::ThreeThreeOnly,
         (true, false) => VoltageSupport::OneEightOnly,
         (false, false) => VoltageSupport::ThreeThreeOnly, // assume 3.3 V if nothing set
@@ -84,7 +83,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/sdio/sdhci/voltage", smoke_caps_voltage_support_both);
+    kernel_test_in!(
+        "drivers/sdio/sdhci/voltage",
+        smoke_caps_voltage_support_both
+    );
 
     fn smoke_caps_voltage_support_330_only() -> TestResult {
         let caps = CAPS_CAN_VDD_330; // no 1.8 V
@@ -93,7 +95,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/sdio/sdhci/voltage", smoke_caps_voltage_support_330_only);
+    kernel_test_in!(
+        "drivers/sdio/sdhci/voltage",
+        smoke_caps_voltage_support_330_only
+    );
 
     fn smoke_power_ctrl_byte_values() -> TestResult {
         let b33 = power_ctrl_byte(SignalVoltage::V3_3);

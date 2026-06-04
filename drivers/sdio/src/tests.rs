@@ -12,16 +12,14 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::sdhci::cmd::{
-        cmd52_arg, cmd53_arg, CMD5_ARG_QUERY, OCR_CARD_READY, OCR_S18A,
-        CMD_IDX_GO_IDLE, CMD_IDX_SEND_OP, CMD_IDX_SELECT, CMD_IDX_SEND_RCA,
-        CMD_IDX_IO_RW_DIRECT, CMD_IDX_IO_RW_EXTENDED,
+        cmd52_arg, cmd53_arg, CMD5_ARG_QUERY, CMD_IDX_GO_IDLE, CMD_IDX_IO_RW_DIRECT,
+        CMD_IDX_IO_RW_EXTENDED, CMD_IDX_SELECT, CMD_IDX_SEND_OP, CMD_IDX_SEND_RCA, OCR_CARD_READY,
+        OCR_S18A,
     };
-    use crate::sdhci::regs::{
-        PRESENT_STATE, SOFTWARE_RESET, INT_STATUS, CAPABILITIES,
-    };
+    use crate::sdhci::regs::{CAPABILITIES, INT_STATUS, PRESENT_STATE, SOFTWARE_RESET};
     use crate::sdio::cccr::{
-        CCCR_IO_ENABLE, CCCR_IO_READY, CCCR_INT_ENABLE, fbr_base,
-        cistpl_manfid_decode, cis_ptr_from_bytes, SDIO_CLASS_WLAN,
+        cis_ptr_from_bytes, cistpl_manfid_decode, fbr_base, CCCR_INT_ENABLE, CCCR_IO_ENABLE,
+        CCCR_IO_READY, SDIO_CLASS_WLAN,
     };
 
     fn smoke_init_sequence_cmd_args() -> TestResult {

@@ -13,9 +13,9 @@ use super::regs::{PCI_CLASS_SDHCI, PCI_SDHCI_BAR};
 /// PCI base class for "generic system peripherals".
 pub const PCI_BASE_CLASS_SYSTEM: u8 = 0x08;
 /// PCI sub-class for SD host controllers.
-pub const PCI_SUB_CLASS_SDHCI: u8   = 0x05;
+pub const PCI_SUB_CLASS_SDHCI: u8 = 0x05;
 /// Programming interface 0x00 (standard SDHCI; 0x01 is vendor-specific).
-pub const PCI_PROG_IF_SDHCI: u8     = 0x00;
+pub const PCI_PROG_IF_SDHCI: u8 = 0x00;
 
 /// Build the 24-bit class code from base/sub/prog_if.
 #[inline]
@@ -71,7 +71,11 @@ pub mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_pci_class_sdhci_match() -> TestResult {
-        let class = pci_class(PCI_BASE_CLASS_SYSTEM, PCI_SUB_CLASS_SDHCI, PCI_PROG_IF_SDHCI);
+        let class = pci_class(
+            PCI_BASE_CLASS_SYSTEM,
+            PCI_SUB_CLASS_SDHCI,
+            PCI_PROG_IF_SDHCI,
+        );
         if class != PCI_CLASS_SDHCI {
             return TestResult::Fail("pci_class helper mismatch against constant");
         }
@@ -101,7 +105,9 @@ pub mod tests {
     fn smoke_probe_device_happy_path() -> TestResult {
         let class = PCI_CLASS_SDHCI;
         match probe_device(class, 0xFE00_0000) {
-            ProbeResult::Match { bar0_phys: 0xFE00_0000 } => {},
+            ProbeResult::Match {
+                bar0_phys: 0xFE00_0000,
+            } => {}
             _ => return TestResult::Fail("expected Match with correct bar0"),
         }
         TestResult::Pass

@@ -26,10 +26,10 @@ impl core::fmt::Display for SdioError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SdioError::ResponseError(fl) => write!(f, "R5 error flags 0x{:02X}", fl),
-            SdioError::LengthOverflow    => f.write_str("length overflow"),
-            SdioError::BadFunction       => f.write_str("bad function number"),
-            SdioError::HostError         => f.write_str("host error"),
-            SdioError::NotEnabled        => f.write_str("function not enabled"),
+            SdioError::LengthOverflow => f.write_str("length overflow"),
+            SdioError::BadFunction => f.write_str("bad function number"),
+            SdioError::HostError => f.write_str("host error"),
+            SdioError::NotEnabled => f.write_str("function not enabled"),
         }
     }
 }
@@ -125,11 +125,7 @@ pub fn encode_cmd53_byte_write(func: u8, addr: u32, len: u16) -> Result<u32, Sdi
 }
 
 /// Encode a CMD53 argument for a block-mode read.
-pub fn encode_cmd53_block_read(
-    func: u8,
-    addr: u32,
-    block_count: u16,
-) -> Result<u32, SdioError> {
+pub fn encode_cmd53_block_read(func: u8, addr: u32, block_count: u16) -> Result<u32, SdioError> {
     if func > 7 {
         return Err(SdioError::BadFunction);
     }
@@ -140,11 +136,7 @@ pub fn encode_cmd53_block_read(
 }
 
 /// Encode a CMD53 argument for a block-mode write.
-pub fn encode_cmd53_block_write(
-    func: u8,
-    addr: u32,
-    block_count: u16,
-) -> Result<u32, SdioError> {
+pub fn encode_cmd53_block_write(func: u8, addr: u32, block_count: u16) -> Result<u32, SdioError> {
     if func > 7 {
         return Err(SdioError::BadFunction);
     }
