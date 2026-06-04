@@ -7,13 +7,16 @@ extern crate alloc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    WwanPortKind,
-    iosm::{IOSM_PCI_DEVICES, IPC_DOORBELL_CH_OFFSET, INTEL_CP_DEVICE_7560_ID, INTEL_CP_DEVICE_7360_ID, PCI_VENDOR_INTEL},
-    mbim::{
-        self, MbimHeader, MbimMessageType,
-        MBIM_HEADER_SIZE, MBIM_OPEN, MBIM_COMMAND_MSG, MBIM_OPEN_MSG_LEN,
+    iosm::{
+        INTEL_CP_DEVICE_7360_ID, INTEL_CP_DEVICE_7560_ID, IOSM_PCI_DEVICES, IPC_DOORBELL_CH_OFFSET,
+        PCI_VENDOR_INTEL,
     },
-    qmi::{QmiHeader, QMUX_IF_TYPE, QMUX_FLAGS_SENDER_HOST, QMUX_HEADER_SIZE, QMI_SVC_CTL},
+    mbim::{
+        self, MbimHeader, MbimMessageType, MBIM_COMMAND_MSG, MBIM_HEADER_SIZE, MBIM_OPEN,
+        MBIM_OPEN_MSG_LEN,
+    },
+    qmi::{QmiHeader, QMI_SVC_CTL, QMUX_FLAGS_SENDER_HOST, QMUX_HEADER_SIZE, QMUX_IF_TYPE},
+    WwanPortKind,
 };
 
 // ─── Smoke 1: MBIM message header encode (type + length + tx-id) ─────────────
@@ -27,7 +30,7 @@ use crate::{
 
 fn smoke_mbim_header_encode() -> TestResult {
     let hdr = MbimHeader {
-        message_type:   MbimMessageType::Open,
+        message_type: MbimMessageType::Open,
         message_length: 16,
         transaction_id: 1,
     };
@@ -59,7 +62,7 @@ kernel_test_in!("drivers/wwan", smoke_mbim_header_encode);
 // bytes 12..16 carry the MaxControlTransfer value (4096 = 0x1000 LE).
 
 fn smoke_mbim_open_shape() -> TestResult {
-    let pkt = mbim::build_open(/*tx_id=*/1, /*max_ctrl_xfer=*/4096);
+    let pkt = mbim::build_open(/*tx_id=*/ 1, /*max_ctrl_xfer=*/ 4096);
 
     if pkt.len() != MBIM_OPEN_MSG_LEN as usize {
         return TestResult::Fail("MBIM_OPEN packet is not 16 bytes");
@@ -91,13 +94,13 @@ kernel_test_in!("drivers/wwan", smoke_mbim_open_shape);
 
 fn smoke_qmi_ctl_header_encode() -> TestResult {
     let hdr = QmiHeader {
-        if_type:    QMUX_IF_TYPE,
-        length:     (QMUX_HEADER_SIZE - 1) as u16, // 11
-        flags:      QMUX_FLAGS_SENDER_HOST,
+        if_type: QMUX_IF_TYPE,
+        length: (QMUX_HEADER_SIZE - 1) as u16, // 11
+        flags: QMUX_FLAGS_SENDER_HOST,
         service_id: QMI_SVC_CTL,
-        client_id:  0x00,
-        tx_id:      0x0042,
-        msg_id:     0x0021, // QMI_CTL_GET_VERSION_INFO
+        client_id: 0x00,
+        tx_id: 0x0042,
+        msg_id: 0x0021, // QMI_CTL_GET_VERSION_INFO
         tlv_length: 0x0000,
     };
     let wire = hdr.encode();
@@ -156,9 +159,9 @@ fn smoke_port_kind_exhaustive() -> TestResult {
         // Exhaustive match — compiler errors if a variant is missing.
         let name = match kind {
             WwanPortKind::AtCmd => "AtCmd",
-            WwanPortKind::Mbim  => "Mbim",
-            WwanPortKind::Qmi   => "Qmi",
-            WwanPortKind::Data  => "Data",
+            WwanPortKind::Mbim => "Mbim",
+            WwanPortKind::Qmi => "Qmi",
+            WwanPortKind::Data => "Data",
         };
         if name != *expected {
             return TestResult::Fail("WwanPortKind name mismatch");
@@ -178,16 +181,16 @@ fn smoke_iosm_pci_device_ids() -> TestResult {
         return TestResult::Fail("IOSM_PCI_DEVICES must have at least 2 entries");
     }
 
-    let has_7560 = IOSM_PCI_DEVICES.iter().any(|d| {
-        d.vendor == PCI_VENDOR_INTEL && d.device == INTEL_CP_DEVICE_7560_ID
-    });
+    let has_7560 = IOSM_PCI_DEVICES
+        .iter()
+        .any(|d| d.vendor == PCI_VENDOR_INTEL && d.device == INTEL_CP_DEVICE_7560_ID);
     if !has_7560 {
         return TestResult::Fail("XMM 7560 (0x7560) missing from IOSM_PCI_DEVICES");
     }
 
-    let has_7360 = IOSM_PCI_DEVICES.iter().any(|d| {
-        d.vendor == PCI_VENDOR_INTEL && d.device == INTEL_CP_DEVICE_7360_ID
-    });
+    let has_7360 = IOSM_PCI_DEVICES
+        .iter()
+        .any(|d| d.vendor == PCI_VENDOR_INTEL && d.device == INTEL_CP_DEVICE_7360_ID);
     if !has_7360 {
         return TestResult::Fail("XMM 7360 (0x7360) missing from IOSM_PCI_DEVICES");
     }
@@ -205,7 +208,7 @@ kernel_test_in!("drivers/wwan", smoke_iosm_pci_device_ids);
 
 fn smoke_mbim_header_roundtrip() -> TestResult {
     let original = MbimHeader {
-        message_type:   MbimMessageType::CommandDone,
+        message_type: MbimMessageType::CommandDone,
         message_length: 100,
         transaction_id: 0xDEAD_BEEF,
     };
@@ -229,13 +232,13 @@ kernel_test_in!("drivers/wwan", smoke_mbim_header_roundtrip);
 
 fn smoke_qmi_header_roundtrip() -> TestResult {
     let original = QmiHeader {
-        if_type:    QMUX_IF_TYPE,
-        length:     11,
-        flags:      QMUX_FLAGS_SENDER_HOST,
+        if_type: QMUX_IF_TYPE,
+        length: 11,
+        flags: QMUX_FLAGS_SENDER_HOST,
         service_id: 0x01, // WDS
-        client_id:  0x05,
-        tx_id:      0x1234,
-        msg_id:     0x0020,
+        client_id: 0x05,
+        tx_id: 0x1234,
+        msg_id: 0x0020,
         tlv_length: 0,
     };
     let wire = original.encode();

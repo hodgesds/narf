@@ -8,13 +8,10 @@ use core::cell::RefCell;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    core_reset, rf_discover,
-    CoreInitResponse, NciHeader, NciMessage, NfcError, NfcTransport,
-    NCI_GID_CORE, NCI_GID_RF_MGMT, NCI_MT_CMD, NCI_MT_NTF, NCI_MT_RSP,
-    NCI_OID_CORE_INIT, NCI_OID_CORE_RESET, NCI_OID_RF_DISCOVER,
-    NCI_NFC_A_PASSIVE_POLL_MODE, NCI_NFC_B_PASSIVE_POLL_MODE,
-    NCI_RESET_RESET_CONFIG, NCI_STATUS_OK,
-    RfDiscoverEntry,
+    core_reset, rf_discover, CoreInitResponse, NciHeader, NciMessage, NfcError, NfcTransport,
+    RfDiscoverEntry, NCI_GID_CORE, NCI_GID_RF_MGMT, NCI_MT_CMD, NCI_MT_NTF, NCI_MT_RSP,
+    NCI_NFC_A_PASSIVE_POLL_MODE, NCI_NFC_B_PASSIVE_POLL_MODE, NCI_OID_CORE_INIT,
+    NCI_OID_CORE_RESET, NCI_OID_RF_DISCOVER, NCI_RESET_RESET_CONFIG, NCI_STATUS_OK,
 };
 
 // ─── Loopback transport ───────────────────────────────────────────────────────
@@ -29,7 +26,9 @@ struct LoopbackTransport {
 #[allow(dead_code)]
 impl LoopbackTransport {
     fn new() -> Self {
-        Self { rx_queue: RefCell::new(Vec::new()) }
+        Self {
+            rx_queue: RefCell::new(Vec::new()),
+        }
     }
 
     fn enqueue(&self, bytes: &[u8]) {
@@ -61,10 +60,10 @@ fn smoke_nci_header_encode() -> TestResult {
     // CORE_RESET_CMD: MT=CMD(1), PBF=false, GID=CORE(0), OID=0x00, len=1
     // byte 0: (0b001 << 5) | 0 | 0 = 0x20
     let hdr = NciHeader {
-        mt:     NCI_MT_CMD,
-        pbf:    false,
-        gid:    NCI_GID_CORE,
-        oid:    NCI_OID_CORE_RESET,
+        mt: NCI_MT_CMD,
+        pbf: false,
+        gid: NCI_GID_CORE,
+        oid: NCI_OID_CORE_RESET,
         length: 1,
     };
     let wire = hdr.encode();
@@ -87,10 +86,10 @@ fn smoke_nci_header_roundtrip() -> TestResult {
     // MT=NTF(3), PBF=true, GID=RF_MGMT(1), OID=RF_DISCOVER(3), len=0x42
     // byte 0: (0b011<<5)|(1<<4)|0b0001 = 0x60|0x10|0x01 = 0x71
     let original = NciHeader {
-        mt:     NCI_MT_NTF,
-        pbf:    true,
-        gid:    NCI_GID_RF_MGMT,
-        oid:    NCI_OID_RF_DISCOVER,
+        mt: NCI_MT_NTF,
+        pbf: true,
+        gid: NCI_GID_RF_MGMT,
+        oid: NCI_OID_RF_DISCOVER,
         length: 0x42,
     };
     let wire = original.encode();
@@ -155,23 +154,26 @@ kernel_test_in!("drivers/nfc", smoke_core_reset_encoder);
 
 fn smoke_core_init_response_decode() -> TestResult {
     let payload: Vec<u8> = vec![
-        NCI_STATUS_OK,  // [0]  Status
-        0x10,           // [1]  NCI version 1.0
-        0x00,           // [2]
-        0x00,           // [3]
-        0x00,           // [4]  end of NFCC Features
-        0x03,           // [5]  Max Logical Connections
-        0x00, 0x01,     // [6-7] Max Routing Table Size
-        0xFF,           // [8]  Max Ctrl Pkt Payload Size
-        0x00, 0x00,     // [9-10] Max Size for Large Parameters
-        0xAB,           // [11] Manufacturer ID
-        0xDE, 0xAD,     // [12-13] Manufacturer Specific Info
+        NCI_STATUS_OK, // [0]  Status
+        0x10,          // [1]  NCI version 1.0
+        0x00,          // [2]
+        0x00,          // [3]
+        0x00,          // [4]  end of NFCC Features
+        0x03,          // [5]  Max Logical Connections
+        0x00,
+        0x01, // [6-7] Max Routing Table Size
+        0xFF, // [8]  Max Ctrl Pkt Payload Size
+        0x00,
+        0x00, // [9-10] Max Size for Large Parameters
+        0xAB, // [11] Manufacturer ID
+        0xDE,
+        0xAD, // [12-13] Manufacturer Specific Info
     ];
     let msg = NciMessage {
-        mt:      NCI_MT_RSP,
-        pbf:     false,
-        gid:     NCI_GID_CORE,
-        oid:     NCI_OID_CORE_INIT,
+        mt: NCI_MT_RSP,
+        pbf: false,
+        gid: NCI_GID_CORE,
+        oid: NCI_OID_CORE_INIT,
         payload,
     };
     let rsp = match CoreInitResponse::from_message(&msg) {
@@ -200,8 +202,14 @@ kernel_test_in!("drivers/nfc", smoke_core_init_response_decode);
 
 fn smoke_rf_discover_encoder() -> TestResult {
     let entries = vec![
-        RfDiscoverEntry { rf_tech_mode: NCI_NFC_A_PASSIVE_POLL_MODE, frequency: 1 },
-        RfDiscoverEntry { rf_tech_mode: NCI_NFC_B_PASSIVE_POLL_MODE, frequency: 1 },
+        RfDiscoverEntry {
+            rf_tech_mode: NCI_NFC_A_PASSIVE_POLL_MODE,
+            frequency: 1,
+        },
+        RfDiscoverEntry {
+            rf_tech_mode: NCI_NFC_B_PASSIVE_POLL_MODE,
+            frequency: 1,
+        },
     ];
     let msg = rf_discover(&entries);
     if msg.mt != NCI_MT_CMD {

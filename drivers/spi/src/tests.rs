@@ -23,10 +23,13 @@ use alloc::sync::Arc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_memory::PhysAddr;
 
-use crate::amd_fch::{recognised_hids as amd_hids, __new_for_test as amd_new, AMD_FCH_SPI_PCI_DEVICE, AMD_PCI_VENDOR, AMD_SPI_FIFO_DEPTH};
+use crate::amd_fch::{
+    __new_for_test as amd_new, recognised_hids as amd_hids, AMD_FCH_SPI_PCI_DEVICE, AMD_PCI_VENDOR,
+    AMD_SPI_FIFO_DEPTH,
+};
 use crate::intel_lpss::{
-    recognised_hids as lpss_acpi_hids, recognised_pci_ids as lpss_pci_ids,
-    __new_for_test as lpss_new, INTEL_PCI_VENDOR,
+    __new_for_test as lpss_new, recognised_hids as lpss_acpi_hids,
+    recognised_pci_ids as lpss_pci_ids, INTEL_PCI_VENDOR,
 };
 use crate::{registry, SpiBus, SpiError, SpiMode};
 

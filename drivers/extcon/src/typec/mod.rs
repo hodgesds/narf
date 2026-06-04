@@ -237,10 +237,18 @@ impl TypecConnector {
         // Program the mux for the highest-priority active mode.
         if let Some(mux) = g.mux.clone() {
             let orient = g.orientation;
-            let setting = if g.alt_modes.iter().any(|m| matches!(m, AltMode::DisplayPort(_))) {
+            let setting = if g
+                .alt_modes
+                .iter()
+                .any(|m| matches!(m, AltMode::DisplayPort(_)))
+            {
                 // DP takes 4 or 2 lanes depending on pin assignment.
                 let dp_mode = g.alt_modes.iter().find_map(|m| {
-                    if let AltMode::DisplayPort(p) = m { Some(*p) } else { None }
+                    if let AltMode::DisplayPort(p) = m {
+                        Some(*p)
+                    } else {
+                        None
+                    }
                 });
                 MuxSetting::dp(orient, dp_mode.unwrap_or(altmode::DpPinAssign::C))
             } else {
@@ -282,10 +290,7 @@ impl TypecConnector {
     /// it changed.
     pub fn update_cable_state(&self, cable: Cable, attached: bool) {
         let mut g = self.inner.lock();
-        let prev = g
-            .cable_states
-            .iter_mut()
-            .find(|(c, _)| *c == cable);
+        let prev = g.cable_states.iter_mut().find(|(c, _)| *c == cable);
         let changed = if let Some(slot) = prev {
             let old = slot.1;
             slot.1 = attached;

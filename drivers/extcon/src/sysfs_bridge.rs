@@ -50,8 +50,8 @@ use alloc::vec::Vec;
 use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
 use crate::class;
-use crate::typec::{AltMode, DataRole, Orientation, PowerRole, altmode::SVID_DISPLAYPORT};
 use crate::typec::altmode::SVID_THUNDERBOLT;
+use crate::typec::{altmode::SVID_DISPLAYPORT, AltMode, DataRole, Orientation, PowerRole};
 use crate::typec_class;
 
 // ── Extcon class ──────────────────────────────────────────────────────
@@ -71,9 +71,7 @@ pub fn populate_extcon_class() {
 
         // `name` attr — Linux extcon.c::extcon_name_show (line ~432).
         let name_str = dev.name().to_string();
-        kobject_add_attr(&dev_kobj, "name", move || {
-            format!("{}\n", name_str)
-        });
+        kobject_add_attr(&dev_kobj, "name", move || format!("{}\n", name_str));
 
         // `state` attr — bitmap of all supported cables.
         // Linux ref: `extcon.c::cable_state_show` (line ~462):
@@ -94,19 +92,19 @@ pub fn populate_extcon_class() {
         // subdirectory (kobject) per `EXTCON_*` ID (line ~481).
         for (cidx, &cable) in dev.supported_cables().iter().enumerate() {
             let cable_name = format!("cable.{}", cidx);
-            let cable_kobj = narf_filesystem::sysfs::Kobject::new_child(
-                dev_kobj.clone(),
-                cable_name,
-            );
+            let cable_kobj =
+                narf_filesystem::sysfs::Kobject::new_child(dev_kobj.clone(), cable_name);
 
             let cname_str = format!("{}", cable);
-            kobject_add_attr(&cable_kobj, "name", move || {
-                format!("{}\n", cname_str)
-            });
+            kobject_add_attr(&cable_kobj, "name", move || format!("{}\n", cname_str));
 
             let dev_arc2 = dev.clone();
             kobject_add_attr(&cable_kobj, "state", move || {
-                if dev_arc2.cable_state(cable) { "1\n".to_string() } else { "0\n".to_string() }
+                if dev_arc2.cable_state(cable) {
+                    "1\n".to_string()
+                } else {
+                    "0\n".to_string()
+                }
             });
         }
     }
@@ -129,22 +127,18 @@ pub fn populate_typec_class() {
 
         // `data_role` — Linux: `typec_port_show_data_role` (class.c ~550).
         let c = conn.clone();
-        kobject_add_attr(&port_kobj, "data_role", move || {
-            match c.data_role() {
-                DataRole::Host   => "host\n".to_string(),
-                DataRole::Device => "device\n".to_string(),
-                DataRole::Dual   => "dual\n".to_string(),
-            }
+        kobject_add_attr(&port_kobj, "data_role", move || match c.data_role() {
+            DataRole::Host => "host\n".to_string(),
+            DataRole::Device => "device\n".to_string(),
+            DataRole::Dual => "dual\n".to_string(),
         });
 
         // `power_role` — Linux: `typec_port_show_power_role` (class.c ~578).
         let c = conn.clone();
-        kobject_add_attr(&port_kobj, "power_role", move || {
-            match c.power_role() {
-                PowerRole::Source => "source\n".to_string(),
-                PowerRole::Sink   => "sink\n".to_string(),
-                PowerRole::Dual   => "dual\n".to_string(),
-            }
+        kobject_add_attr(&port_kobj, "power_role", move || match c.power_role() {
+            PowerRole::Source => "source\n".to_string(),
+            PowerRole::Sink => "sink\n".to_string(),
+            PowerRole::Dual => "dual\n".to_string(),
         });
 
         // `port_type` — static capability attribute; mirrors `power_role`
@@ -152,12 +146,10 @@ pub fn populate_typec_class() {
         // "source" even if runtime role changes).
         // Linux ref: `typec_port_show_port_type` (class.c ~531).
         let c = conn.clone();
-        kobject_add_attr(&port_kobj, "port_type", move || {
-            match c.power_role() {
-                PowerRole::Source => "source\n".to_string(),
-                PowerRole::Sink   => "sink\n".to_string(),
-                PowerRole::Dual   => "dual\n".to_string(),
-            }
+        kobject_add_attr(&port_kobj, "port_type", move || match c.power_role() {
+            PowerRole::Source => "source\n".to_string(),
+            PowerRole::Sink => "sink\n".to_string(),
+            PowerRole::Dual => "dual\n".to_string(),
         });
 
         // `vconn_source` — stubbed "no"; VCONN tracking not yet wired.
@@ -171,11 +163,9 @@ pub fn populate_typec_class() {
         // `usb_power_delivery_revision` — USB PD Rev 3.0.
         // Linux ref: `typec_port_show_usb_power_delivery_revision`
         // (class.c ~637).
-        kobject_add_attr(
-            &port_kobj,
-            "usb_power_delivery_revision",
-            || "3.0\n".to_string(),
-        );
+        kobject_add_attr(&port_kobj, "usb_power_delivery_revision", || {
+            "3.0\n".to_string()
+        });
 
         // `preferred_role` — empty; DRP preferred role not yet negotiated.
         // Linux ref: `typec_port_show_preferred_role` (class.c ~616).
@@ -184,32 +174,25 @@ pub fn populate_typec_class() {
         // `orientation` — decoded from CC status.
         // Linux ref: `typec_show_orientation` (class.c ~665).
         let c = conn.clone();
-        kobject_add_attr(&port_kobj, "orientation", move || {
-            match c.orientation() {
-                Orientation::Normal   => "normal\n".to_string(),
-                Orientation::Reversed => "reverse\n".to_string(),
-                Orientation::Unknown  => "unknown\n".to_string(),
-            }
+        kobject_add_attr(&port_kobj, "orientation", move || match c.orientation() {
+            Orientation::Normal => "normal\n".to_string(),
+            Orientation::Reversed => "reverse\n".to_string(),
+            Orientation::Unknown => "unknown\n".to_string(),
         });
 
         // `supported_accessory_modes` — DP + TBT if alt modes exist.
         // Linux ref: `typec_port_show_accessory_mode` (class.c ~654).
         // For now hardcode DP + Thunderbolt as this port supports both.
-        kobject_add_attr(
-            &port_kobj,
-            "supported_accessory_modes",
-            || "DisplayPort Thunderbolt\n".to_string(),
-        );
+        kobject_add_attr(&port_kobj, "supported_accessory_modes", || {
+            "DisplayPort Thunderbolt\n".to_string()
+        });
 
         // Alt-mode sub-kobjects: `port<N>.altmode<M>/`.
         // Linux ref: `typec_register_altmode()` (class.c ~316).
         let alt_modes = conn.entered_alt_modes();
         for (aidx, mode) in alt_modes.iter().enumerate() {
             let alt_name = format!("{}.altmode{}", port_name, aidx);
-            let alt_kobj = narf_filesystem::sysfs::Kobject::new_child(
-                port_kobj.clone(),
-                alt_name,
-            );
+            let alt_kobj = narf_filesystem::sysfs::Kobject::new_child(port_kobj.clone(), alt_name);
 
             let (svid, mode_idx) = match mode {
                 AltMode::DisplayPort(_) => (SVID_DISPLAYPORT, 1u8),
@@ -217,12 +200,8 @@ pub fn populate_typec_class() {
             };
 
             let svid_str = format!("{:04x}", svid);
-            kobject_add_attr(&alt_kobj, "svid", move || {
-                format!("{}\n", svid_str)
-            });
-            kobject_add_attr(&alt_kobj, "mode", move || {
-                format!("{}\n", mode_idx)
-            });
+            kobject_add_attr(&alt_kobj, "svid", move || format!("{}\n", svid_str));
+            kobject_add_attr(&alt_kobj, "mode", move || format!("{}\n", mode_idx));
             kobject_add_attr(&alt_kobj, "active", || "yes\n".to_string());
         }
     }
@@ -240,11 +219,11 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_usbpd::tcpc::{CcState, CcStatus};
 
+    use super::{populate_extcon_class, populate_typec_class};
     use crate::cable::Cable;
     use crate::typec::altmode::{AltMode, DpPinAssign};
     use crate::typec::TypecConnector;
     use crate::typec_class;
-    use super::{populate_extcon_class, populate_typec_class};
 
     // ── Helpers ──────────────────────────────────────────────────────
 
@@ -319,10 +298,7 @@ mod tests {
         populate_extcon_class();
 
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
-        let dev_dir = descend_path(
-            &sys_root,
-            &["class", "extcon", "extcon0"],
-        );
+        let dev_dir = descend_path(&sys_root, &["class", "extcon", "extcon0"]);
         let dev_dir = match dev_dir {
             Some(d) => d,
             None => return TestResult::Fail("extcon0 path missing"),
@@ -363,10 +339,7 @@ mod tests {
         let sys_root = narf_filesystem::sysfs::SysFs::new().root();
 
         // Descend: class → extcon → extcon0 → cable.0
-        let cable_dir = descend_path(
-            &sys_root,
-            &["class", "extcon", "extcon0", "cable.0"],
-        );
+        let cable_dir = descend_path(&sys_root, &["class", "extcon", "extcon0", "cable.0"]);
         let cable_dir = match cable_dir {
             Some(d) => d,
             None => return TestResult::Fail("cable.0 subdir missing"),
@@ -445,7 +418,10 @@ mod tests {
 
         let conn = Arc::new(TypecConnector::new("port0"));
         // Set CC1 active → Normal orientation.
-        conn.update_cc(CcStatus { cc1: CcState::Rp3A0, cc2: CcState::Open });
+        conn.update_cc(CcStatus {
+            cc1: CcState::Rp3A0,
+            cc2: CcState::Open,
+        });
         typec_class::typec_register(conn.clone());
         populate_typec_class();
 
@@ -621,7 +597,9 @@ mod tests {
         use core::pin::Pin;
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)

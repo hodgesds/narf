@@ -112,11 +112,7 @@ impl AcpiVideoDevice {
         let cur = self.current_brightness();
         let last_idx = self.levels.len() - 1;
         // Find position just above current.
-        let idx = self
-            .levels
-            .iter()
-            .rposition(|&l| l <= cur)
-            .unwrap_or(0);
+        let idx = self.levels.iter().rposition(|&l| l <= cur).unwrap_or(0);
         let new_level = if idx >= last_idx {
             self.levels[last_idx]
         } else {
@@ -143,10 +139,7 @@ impl AcpiVideoDevice {
         if pkg.len() < 3 {
             return None;
         }
-        let mut levels: Vec<u32> = pkg[2..]
-            .iter()
-            .map(|v| v.as_integer() as u32)
-            .collect();
+        let mut levels: Vec<u32> = pkg[2..].iter().map(|v| v.as_integer() as u32).collect();
         if levels.is_empty() {
             return None;
         }

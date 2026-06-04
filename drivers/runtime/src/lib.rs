@@ -272,7 +272,10 @@ mod user_rt {
         }
     }
     pub fn wait_for_irq(vec: u8) -> IrqWaiter {
-        IrqWaiter { _vec: vec, waker: None }
+        IrqWaiter {
+            _vec: vec,
+            waker: None,
+        }
     }
 
     /// Domain id — same shape as the kernel-side type, just

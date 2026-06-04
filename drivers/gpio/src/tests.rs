@@ -16,9 +16,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_memory::PhysAddr;
 
-use crate::amd_fch::{
-    recognised_hid, AmdFchGpio, __dispatch_for_test, __reset_dispatch_for_test,
-};
+use crate::amd_fch::{recognised_hid, AmdFchGpio, __dispatch_for_test, __reset_dispatch_for_test};
 use crate::intel_pch::{
     recognised_hids as intel_recognised_hids, IntelPchGpio, __new_for_test as intel_new_for_test,
     __probe_community_for_test as intel_probe_community,
@@ -163,7 +161,10 @@ fn smoke_gpio_register_irq_programs_pin_register() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers-gpio", smoke_gpio_register_irq_programs_pin_register);
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_gpio_register_irq_programs_pin_register
+);
 
 fn smoke_gpio_register_irq_rejects_conflicting_handler() -> TestResult {
     __reset_dispatch_for_test();
@@ -488,10 +489,12 @@ fn smoke_intel_pch_set_pin_updates_tx_state() -> TestResult {
     );
     let base = phys.raw() as *mut u32;
     let off = (padbar as usize + 7 * 16) / 4;
-    
+
     // Initial state: ensure TXDIS is set.
-    unsafe { core::ptr::write_volatile(base.add(off), 1u32 << 8); }
-    
+    unsafe {
+        core::ptr::write_volatile(base.add(off), 1u32 << 8);
+    }
+
     drv.set_pin(7, true).unwrap();
     let v = unsafe { core::ptr::read_volatile(base.add(off)) };
     // Should have TXSTATE (bit 0) set and TXDIS (bit 8) cleared.
@@ -501,7 +504,7 @@ fn smoke_intel_pch_set_pin_updates_tx_state() -> TestResult {
     if v & (1 << 8) != 0 {
         return TestResult::Fail("GPIOTXDIS bit didn't get cleared");
     }
-    
+
     drv.set_pin(7, false).unwrap();
     let v2 = unsafe { core::ptr::read_volatile(base.add(off)) };
     if v2 & 1 != 0 {
@@ -523,19 +526,19 @@ fn smoke_intel_pch_register_irq_programs_pad_and_ie() -> TestResult {
         128,
         true,
     );
-    
+
     fn dummy(_p: u16) {}
     let cfg = GpioIrqConfig {
         level_triggered: false,
         polarity: 1, // Active Low / Falling Edge
     };
-    
+
     drv.register_irq(12, GpioPull::Up, cfg, dummy).unwrap();
-    
+
     let base = phys.raw() as *const u32;
     let off0 = (padbar as usize + 12 * 16) / 4;
     let v0 = unsafe { core::ptr::read_volatile(base.add(off0)) };
-    
+
     // RXEVCFG_EDGE_FALL (2) @ [26:25], RXINV (1) @ 23, RXDIS (0) @ 9, TXDIS (1) @ 8, PMODE_GPIO (0) @ [12:10]
     if (v0 >> 25) & 0b11 != 2 {
         return TestResult::Fail("RXEVCFG should be 2 (falling edge)");
@@ -546,13 +549,13 @@ fn smoke_intel_pch_register_irq_programs_pad_and_ie() -> TestResult {
     if v0 & (1 << 9) != 0 {
         return TestResult::Fail("GPIORXDIS should be 0");
     }
-    
+
     // PADCFG1 @ off+4: UP_20K (0b1100) @ [13:10]
     let v1 = unsafe { core::ptr::read_volatile(base.add(off0 + 1)) };
     if (v1 >> 10) & 0b1111 != 0b1100 {
         return TestResult::Fail("PADCFG1 pull-up bits not set correctly");
     }
-    
+
     // GPI_IE @ 0x120 (since rev 0x94 < 0x94 threshold? Wait, 0x94 >= 0x94).
     // Actually, TGL is < 0x94? My new code says >= 0x94 -> 0x220.
     // make_intel_synthetic_mmio(0x94, ...) -> revid = 0x94.
@@ -562,10 +565,13 @@ fn smoke_intel_pch_register_irq_programs_pad_and_ie() -> TestResult {
     if ie & (1 << 12) == 0 {
         return TestResult::Fail("GPI_IE bit 12 not set");
     }
-    
+
     TestResult::Pass
 }
-kernel_test_in!("drivers-gpio", smoke_intel_pch_register_irq_programs_pad_and_ie);
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_intel_pch_register_irq_programs_pad_and_ie
+);
 
 fn smoke_intel_pch_dispatch_irq_fires_handler_and_acks() -> TestResult {
     FIRE_COUNT.store(0, Ordering::SeqCst);
@@ -580,24 +586,33 @@ fn smoke_intel_pch_dispatch_irq_fires_handler_and_acks() -> TestResult {
         128,
         true,
     );
-    
-    drv.register_irq(42, GpioPull::None, GpioIrqConfig { level_triggered: true, polarity: 0 }, fire_handler).unwrap();
-    
+
+    drv.register_irq(
+        42,
+        GpioPull::None,
+        GpioIrqConfig {
+            level_triggered: true,
+            polarity: 0,
+        },
+        fire_handler,
+    )
+    .unwrap();
+
     let base = phys.raw() as *mut u32;
     // Set status bit in group 1 (pin 42).
     // is_offset = 0x200. Group 1 = 0x200 + 4 = 0x204.
     unsafe {
         core::ptr::write_volatile(base.add(0x204 / 4), 1u32 << (42 - 32));
     }
-    
+
     if drv.dispatch_irq() == IrqStatus::None {
         return TestResult::Fail("dispatch_irq should have handled the IRQ");
     }
-    
+
     if FIRE_COUNT.load(Ordering::SeqCst) != 1 {
         return TestResult::Fail("handler didn't fire");
     }
-    
+
     // Verify ack (RW1C).
     let status = unsafe { core::ptr::read_volatile(base.add(0x204 / 4)) };
     if status & (1 << (42 - 32)) != 0 {
@@ -607,10 +622,13 @@ fn smoke_intel_pch_dispatch_irq_fires_handler_and_acks() -> TestResult {
         // In this test, base[0x204/4] |= 1<<10; write(0x204/4, 1<<10).
         // The read-back will still be 1<<10 unless we manually clear it to simulate HW.
     }
-    
+
     TestResult::Pass
 }
-kernel_test_in!("drivers-gpio", smoke_intel_pch_dispatch_irq_fires_handler_and_acks);
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_intel_pch_dispatch_irq_fires_handler_and_acks
+);
 
 fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
     // Two communities under the same ACPI path must get distinct
@@ -699,4 +717,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
     );
     TestResult::Pass
 }
-kernel_test_in!("drivers-gpio", smoke_intel_pch_registers_into_shared_registry);
+kernel_test_in!(
+    "drivers-gpio",
+    smoke_intel_pch_registers_into_shared_registry
+);

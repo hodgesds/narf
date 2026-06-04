@@ -73,8 +73,7 @@ use crate::{I2cBus, I2cError, I2cOp};
 //           non-prefixed ID used by some firmware revisions.
 //           Linux matches both forms.
 const AMD_FCH_HIDS: &[&str] = &[
-    "AMDI0010", "AMDI0011", "AMDI0019", "AMDI0020", "AMDI0510",
-    "AMD0010", "AMD0020",
+    "AMDI0010", "AMDI0011", "AMDI0019", "AMDI0020", "AMDI0510", "AMD0010", "AMD0020",
 ];
 
 // ── DW I2C register offsets ────────────────────────────────────────
@@ -193,12 +192,7 @@ impl AmdFchI2c {
     /// Construct a controller against an already-decoded MMIO region
     /// + IRQ vector. Used both by `probe_all` (real discovery) and by
     /// the smoke tests (synthetic backing buffer instead of MMIO).
-    pub fn new(
-        name: String,
-        mmio_base: PhysAddr,
-        mmio_len: u64,
-        irq_vector: Option<u8>,
-    ) -> Self {
+    pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
         Self {
             name,
             mmio_base,
@@ -271,7 +265,7 @@ impl AmdFchI2c {
             self.write32(IC_RX_TL, 0); // wake on first byte
             self.write32(IC_TX_TL, 0); // wake when FIFO drains
             self.write32(IC_INTR_MASK, 0); // mask all — driver polls/clears
-            // Clear any pending interrupts left by firmware probes.
+                                           // Clear any pending interrupts left by firmware probes.
             let _ = self.read32(IC_CLR_INTR);
             self.write32(IC_ENABLE, 1);
         }
@@ -503,7 +497,8 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
             let _ = writeln!(
                 narf_console::Writer,
                 "  amd-fch-i2c: {} _CRS eval failed: {:?}",
-                path, e
+                path,
+                e
             );
             return None;
         }
@@ -524,13 +519,17 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                     mmio = Some((min as u64, length as u64));
                 }
             }
-            ResourceItem::AddressSpace32 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace32 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 // kind 0 = memory range
                 if mmio.is_none() {
                     mmio = Some((min as u64, length as u64));
                 }
             }
-            ResourceItem::AddressSpace64 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace64 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 if mmio.is_none() {
                     mmio = Some((min, length));
                 }
@@ -551,7 +550,8 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                 narf_console::Writer,
                 "  amd-fch-i2c: {} _CRS had {} item(s) but no memory range — \
                  cannot map BAR",
-                path, n_items
+                path,
+                n_items
             );
             return None;
         }
@@ -578,7 +578,8 @@ pub fn probe_all() -> usize {
             let _ = writeln!(
                 narf_console::Writer,
                 "  amd-fch-i2c: probing {} (HID={})",
-                node.path, hid
+                node.path,
+                hid
             );
             if probe_one(&node.path).is_some() {
                 count += 1;
@@ -616,7 +617,9 @@ fn probe_one(path: &str) -> Option<()> {
         let _ = writeln!(
             narf_console::Writer,
             "  amd-fch-i2c: {} probe failed ({:?}) at {:#x}",
-            path, e, res.mmio_base
+            path,
+            e,
+            res.mmio_base
         );
         return None;
     }
@@ -624,7 +627,8 @@ fn probe_one(path: &str) -> Option<()> {
         let _ = writeln!(
             narf_console::Writer,
             "  amd-fch-i2c: {} enable failed ({:?})",
-            path, e
+            path,
+            e
         );
         return None;
     }
@@ -636,8 +640,12 @@ fn probe_one(path: &str) -> Option<()> {
         path,
         res.mmio_base,
         res.mmio_len,
-        res.gsi.map(|g| format!("{}", g)).unwrap_or_else(|| "?".into()),
-        irq_vec.map(|v| format!("{}", v)).unwrap_or_else(|| "polled".into()),
+        res.gsi
+            .map(|g| format!("{}", g))
+            .unwrap_or_else(|| "?".into()),
+        irq_vec
+            .map(|v| format!("{}", v))
+            .unwrap_or_else(|| "polled".into()),
     );
     let _ = registered; // returned for the unique-merge case; we don't need it here
     Some(())

@@ -282,7 +282,9 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
 /// is short (under 32 entries) and a hashmap would just add
 /// startup cost.
 pub fn match_vid_pid(vid: u16, pid: u16) -> Option<&'static FingerprintDevice> {
-    FINGERPRINT_DEVICES.iter().find(|d| d.vid == vid && d.pid == pid)
+    FINGERPRINT_DEVICES
+        .iter()
+        .find(|d| d.vid == vid && d.pid == pid)
 }
 
 // ── Device-descriptor parsing per USB 2.0 §9.6.1 / §9.6.3 ────────
@@ -437,7 +439,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/fingerprint", smoke_match_table_covers_all_four_vendors);
+    kernel_test_in!(
+        "drivers/fingerprint",
+        smoke_match_table_covers_all_four_vendors
+    );
 
     fn smoke_match_synaptics_prometheus_bd() -> TestResult {
         let entry = match match_vid_pid(0x06CB, 0x00BD) {
@@ -504,15 +509,15 @@ mod tests {
         // 18-byte device descriptor with VID=0x06CB PID=0x00BD.
         // LE encoding per USB 2.0 §9.6.1.
         let dev_desc = [
-            18, 1,           // bLength, bDescriptorType
-            0x00, 0x02,      // bcdUSB = 2.00
+            18, 1, // bLength, bDescriptorType
+            0x00, 0x02, // bcdUSB = 2.00
             0xFF, 0xFF, 0xFF, // class triple (vendor-specific is typical for fp)
-            64,              // bMaxPacketSize0
-            0xCB, 0x06,      // idVendor = 0x06CB (LE)
-            0xBD, 0x00,      // idProduct = 0x00BD (LE)
-            0x00, 0x01,      // bcdDevice = 0x0100
-            1, 2, 3,         // i-strings
-            1,               // bNumConfigurations
+            64,   // bMaxPacketSize0
+            0xCB, 0x06, // idVendor = 0x06CB (LE)
+            0xBD, 0x00, // idProduct = 0x00BD (LE)
+            0x00, 0x01, // bcdDevice = 0x0100
+            1, 2, 3, // i-strings
+            1, // bNumConfigurations
         ];
         let (vid, pid) = match parse_vid_pid(&dev_desc) {
             Some(p) => p,
@@ -546,10 +551,10 @@ mod tests {
     fn smoke_parse_num_interfaces_extracts_from_cfg_header() -> TestResult {
         // 9-byte CONFIG descriptor header with bNumInterfaces = 2.
         let cfg = [
-            9, 0x02,    // bLength, bDescriptorType=CONFIG
-            18, 0,      // wTotalLength
-            2,          // bNumInterfaces
-            1,          // bConfigurationValue
+            9, 0x02, // bLength, bDescriptorType=CONFIG
+            18, 0, // wTotalLength
+            2, // bNumInterfaces
+            1, // bConfigurationValue
             0, 0xC0, 50,
         ];
         match parse_num_interfaces(&cfg) {
@@ -567,22 +572,13 @@ mod tests {
         // Synthesise a Goodix GF512 (27C6:55B4) device descriptor +
         // config header.
         let dev_desc = [
-            18, 1,
-            0x00, 0x02,
-            0xFF, 0xFF, 0xFF,
-            64,
-            0xC6, 0x27,      // VID 0x27C6
-            0xB4, 0x55,      // PID 0x55B4
-            0x00, 0x01,
-            1, 2, 3,
-            1,
+            18, 1, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 64, 0xC6, 0x27, // VID 0x27C6
+            0xB4, 0x55, // PID 0x55B4
+            0x00, 0x01, 1, 2, 3, 1,
         ];
         let cfg = [
-            9, 0x02,
-            18, 0,
-            1,               // bNumInterfaces
-            1,
-            0, 0xC0, 50,
+            9, 0x02, 18, 0, 1, // bNumInterfaces
+            1, 0, 0xC0, 50,
         ];
         let before = probed_count();
         let m = match probe_from_descriptors(&dev_desc, &cfg) {
@@ -606,23 +602,11 @@ mod tests {
         __reset_for_test();
         // Intel ax210 wifi descriptor — not a fingerprint reader.
         let dev_desc = [
-            18, 1,
-            0x00, 0x02,
-            0xFF, 0xFF, 0xFF,
-            64,
-            0x86, 0x80,      // VID 0x8086
-            0x25, 0x27,      // PID 0x2725
-            0x00, 0x01,
-            1, 2, 3,
-            1,
+            18, 1, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 64, 0x86, 0x80, // VID 0x8086
+            0x25, 0x27, // PID 0x2725
+            0x00, 0x01, 1, 2, 3, 1,
         ];
-        let cfg = [
-            9, 0x02,
-            18, 0,
-            1,
-            1,
-            0, 0xC0, 50,
-        ];
+        let cfg = [9, 0x02, 18, 0, 1, 1, 0, 0xC0, 50];
         if probe_from_descriptors(&dev_desc, &cfg).is_some() {
             return TestResult::Fail("non-fingerprint device must not match");
         }
@@ -665,10 +649,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/fingerprint",
-        smoke_match_table_size_matches_brief
-    );
+    kernel_test_in!("drivers/fingerprint", smoke_match_table_size_matches_brief);
 
     fn smoke_match_table_no_duplicate_vid_pid_pairs() -> TestResult {
         // Linear de-dup check — table small enough not to need anything
@@ -706,8 +687,5 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/fingerprint",
-        smoke_family_labels_are_kebab_case
-    );
+    kernel_test_in!("drivers/fingerprint", smoke_family_labels_are_kebab_case);
 }

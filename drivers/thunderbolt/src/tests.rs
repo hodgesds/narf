@@ -35,10 +35,7 @@ fn smoke_tb_register_all_known_ids() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/thunderbolt/nhi",
-    smoke_tb_register_all_known_ids
-);
+kernel_test_in!("drivers/thunderbolt/nhi", smoke_tb_register_all_known_ids);
 
 fn smoke_tb_match_kind_matches_synthetic_tgl() -> TestResult {
     // Build a synthetic BusDevice with the Tiger Lake NHI ID
@@ -82,9 +79,7 @@ fn smoke_tb_match_kind_matches_synthetic_tgl() -> TestResult {
         return TestResult::Fail("thunderbolt: synthetic 9A1B not matched");
     }
     if best_specificity != 3 {
-        return TestResult::Fail(
-            "thunderbolt: best match must be VendorDevice (specificity 3)",
-        );
+        return TestResult::Fail("thunderbolt: best match must be VendorDevice (specificity 3)");
     }
     TestResult::Pass
 }
@@ -212,7 +207,9 @@ fn smoke_tb_not_present_on_qemu_tcg() -> TestResult {
     let has_tb = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
             && d.id.vendor == nhi::INTEL_VENDOR
-            && nhi::TB_DEVICE_IDS.iter().any(|(did, _)| *did == d.id.device)
+            && nhi::TB_DEVICE_IDS
+                .iter()
+                .any(|(did, _)| *did == d.id.device)
     });
     if has_tb {
         return TestResult::Skip(
@@ -224,10 +221,7 @@ fn smoke_tb_not_present_on_qemu_tcg() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/thunderbolt/nhi",
-    smoke_tb_not_present_on_qemu_tcg
-);
+kernel_test_in!("drivers/thunderbolt/nhi", smoke_tb_not_present_on_qemu_tcg);
 
 // ── Stage-1 smokes ─────────────────────────────────────────────────
 //
@@ -258,8 +252,16 @@ fn smoke_cm_header_encode_round_trip() -> TestResult {
     // unknown = 0 + a max-route, then encode with unknown = 0x3FF +
     // route = 0 — the two dword 0 values must differ only in the
     // top 10 bits.
-    let a = Header { route: Header::ROUTE_MAX, unknown: 0 }.encode()[0];
-    let b = Header { route: 0, unknown: 0x3FF }.encode()[0];
+    let a = Header {
+        route: Header::ROUTE_MAX,
+        unknown: 0,
+    }
+    .encode()[0];
+    let b = Header {
+        route: 0,
+        unknown: 0x3FF,
+    }
+    .encode()[0];
     if (a & 0xFFC0_0000) != 0 {
         return TestResult::Fail("thunderbolt: route_hi leaked into unknown");
     }
@@ -323,7 +325,10 @@ fn smoke_cm_cfg_read_encode_layout() -> TestResult {
     // off host), port 3, space SWITCH, offset 0, length 8 dwords.
     // Verify the three on-wire dwords match what we computed by hand.
     use crate::cm::{encode_cfg_read, Address, CfgSpace, Header};
-    let hdr = Header { route: 0x0100, unknown: 0 };
+    let hdr = Header {
+        route: 0x0100,
+        unknown: 0,
+    };
     let addr = Address {
         offset: 0,
         length: 8,
@@ -360,7 +365,10 @@ kernel_test_in!("drivers/thunderbolt/cm", smoke_cm_cfg_read_encode_layout);
 fn smoke_cm_cfg_write_payload_check() -> TestResult {
     // A TB_CFG_PKG_WRITE with `length` ≠ payload.len() must fail.
     use crate::cm::{encode_cfg_write, Address, CfgSpace, CmError, Header};
-    let hdr = Header { route: 0, unknown: 0 };
+    let hdr = Header {
+        route: 0,
+        unknown: 0,
+    };
     let addr = Address {
         offset: 0,
         length: 4,
@@ -627,10 +635,7 @@ fn smoke_topology_walk_synthetic_tree() -> TestResult {
     }
     // switch A must have one PCIe-DOWN + one DP-IN endpoint.
     let a = &topo.switches[1];
-    let endpoints: Vec<AdapterType> = a
-        .tunnel_endpoints()
-        .filter_map(|x| x.kind)
-        .collect();
+    let endpoints: Vec<AdapterType> = a.tunnel_endpoints().filter_map(|x| x.kind).collect();
     if !endpoints.contains(&AdapterType::PcieDown) {
         return TestResult::Fail("thunderbolt: switch A missing PCIe-DOWN");
     }

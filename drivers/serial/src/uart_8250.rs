@@ -39,8 +39,8 @@
 
 extern crate alloc;
 
-use narf_memory::PhysAddr;
 use crate::registry;
+use narf_memory::PhysAddr;
 
 // ── UartBase ──────────────────────────────────────────────────────────
 
@@ -162,7 +162,9 @@ pub fn baud_divisor(baud: u32, clock_hz: u32) -> Option<u16> {
 unsafe fn uart_write(base: UartBase, shift: u8, reg: u16, val: u8) {
     match base {
         UartBase::Io(p) => unsafe { narf_arch::x86_64::io_port::outb(p + (reg << shift), val) },
-        UartBase::Mmio(a) => unsafe { narf_arch::mmio::write8(a.raw() + ((reg as u64) << shift), val) },
+        UartBase::Mmio(a) => unsafe {
+            narf_arch::mmio::write8(a.raw() + ((reg as u64) << shift), val)
+        },
     }
 }
 
@@ -179,7 +181,9 @@ unsafe fn uart_read(base: UartBase, shift: u8, reg: u16) -> u8 {
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn uart_write(_base: UartBase, _shift: u8, _reg: u16, _val: u8) {}
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn uart_read(_base: UartBase, _shift: u8, _reg: u16) -> u8 { 0 }
+unsafe fn uart_read(_base: UartBase, _shift: u8, _reg: u16) -> u8 {
+    0
+}
 
 // ── UART device ───────────────────────────────────────────────────────
 
@@ -292,7 +296,12 @@ impl Uart8250 {
         unsafe {
             uart_write(self.base, self.reg_shift, REG_LCR, LCR_DLAB);
             uart_write(self.base, self.reg_shift, REG_DLL, (div & 0xFF) as u8);
-            uart_write(self.base, self.reg_shift, REG_DLM, ((div >> 8) & 0xFF) as u8);
+            uart_write(
+                self.base,
+                self.reg_shift,
+                REG_DLM,
+                ((div >> 8) & 0xFF) as u8,
+            );
             uart_write(self.base, self.reg_shift, REG_LCR, LCR_8N1);
         }
         self.baud = baud;
@@ -325,7 +334,14 @@ impl Uart8250 {
                 );
             }
         }
-        unsafe { uart_write(self.base, self.reg_shift, REG_MCR, MCR_DTR | MCR_RTS | MCR_OUT2) };
+        unsafe {
+            uart_write(
+                self.base,
+                self.reg_shift,
+                REG_MCR,
+                MCR_DTR | MCR_RTS | MCR_OUT2,
+            )
+        };
         true
     }
 
@@ -381,7 +397,9 @@ impl Uart8250 {
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    pub fn read_lsr(&self) -> u8 { 0 }
+    pub fn read_lsr(&self) -> u8 {
+        0
+    }
 }
 
 // ── Legacy COM port registration ──────────────────────────────────────
@@ -405,7 +423,10 @@ pub fn register_legacy_uarts() {
         let _ = writeln!(
             narf_console::Writer,
             "  serial: {} at 0x{:03X} irq={} {:?}",
-            name, base, irq, utype
+            name,
+            base,
+            irq,
+            utype
         );
         registry::register(registry::UartInfo {
             io_base: base,

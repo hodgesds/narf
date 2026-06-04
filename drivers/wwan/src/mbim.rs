@@ -80,32 +80,32 @@ impl MbimMessageType {
     /// Decode from the raw little-endian u32 on-wire value.
     pub fn from_raw(raw: u32) -> Self {
         match raw {
-            MBIM_OPEN            => Self::Open,
-            MBIM_CLOSE           => Self::Close,
-            MBIM_COMMAND_MSG     => Self::CommandMsg,
-            MBIM_HOST_ERROR      => Self::HostError,
-            MBIM_OPEN_DONE       => Self::OpenDone,
-            MBIM_CLOSE_DONE      => Self::CloseDone,
-            MBIM_COMMAND_DONE    => Self::CommandDone,
-            MBIM_FUNCTION_ERROR  => Self::FunctionError,
+            MBIM_OPEN => Self::Open,
+            MBIM_CLOSE => Self::Close,
+            MBIM_COMMAND_MSG => Self::CommandMsg,
+            MBIM_HOST_ERROR => Self::HostError,
+            MBIM_OPEN_DONE => Self::OpenDone,
+            MBIM_CLOSE_DONE => Self::CloseDone,
+            MBIM_COMMAND_DONE => Self::CommandDone,
+            MBIM_FUNCTION_ERROR => Self::FunctionError,
             MBIM_INDICATE_STATUS => Self::IndicateStatus,
-            other                => Self::Unknown(other),
+            other => Self::Unknown(other),
         }
     }
 
     /// Encode to the raw little-endian u32 wire value.
     pub fn to_raw(self) -> u32 {
         match self {
-            Self::Open            => MBIM_OPEN,
-            Self::Close           => MBIM_CLOSE,
-            Self::CommandMsg      => MBIM_COMMAND_MSG,
-            Self::HostError       => MBIM_HOST_ERROR,
-            Self::OpenDone        => MBIM_OPEN_DONE,
-            Self::CloseDone       => MBIM_CLOSE_DONE,
-            Self::CommandDone     => MBIM_COMMAND_DONE,
-            Self::FunctionError   => MBIM_FUNCTION_ERROR,
-            Self::IndicateStatus  => MBIM_INDICATE_STATUS,
-            Self::Unknown(raw)    => raw,
+            Self::Open => MBIM_OPEN,
+            Self::Close => MBIM_CLOSE,
+            Self::CommandMsg => MBIM_COMMAND_MSG,
+            Self::HostError => MBIM_HOST_ERROR,
+            Self::OpenDone => MBIM_OPEN_DONE,
+            Self::CloseDone => MBIM_CLOSE_DONE,
+            Self::CommandDone => MBIM_COMMAND_DONE,
+            Self::FunctionError => MBIM_FUNCTION_ERROR,
+            Self::IndicateStatus => MBIM_INDICATE_STATUS,
+            Self::Unknown(raw) => raw,
         }
     }
 }
@@ -162,16 +162,16 @@ impl MbimHeader {
         if buf.len() < MBIM_HEADER_SIZE {
             return Err(MbimError::TooShort);
         }
-        let raw_type   = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let msg_len    = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let tx_id      = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let raw_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let msg_len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let tx_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
 
         if (msg_len as usize) < MBIM_HEADER_SIZE {
             return Err(MbimError::InvalidLength);
         }
 
         Ok(Self {
-            message_type:   MbimMessageType::from_raw(raw_type),
+            message_type: MbimMessageType::from_raw(raw_type),
             message_length: msg_len,
             transaction_id: tx_id,
         })
@@ -193,7 +193,7 @@ pub const MBIM_OPEN_MSG_LEN: u32 = 16;
 /// supports; the spec recommends 4096.
 pub fn build_open(transaction_id: u32, max_control_transfer: u32) -> Vec<u8> {
     let hdr = MbimHeader {
-        message_type:   MbimMessageType::Open,
+        message_type: MbimMessageType::Open,
         message_length: MBIM_OPEN_MSG_LEN,
         transaction_id,
     };

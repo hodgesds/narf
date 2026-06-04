@@ -7,8 +7,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::GpioController;
 
-static CTRLS: IrqSafeSpinLock<Vec<Arc<dyn GpioController>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static CTRLS: IrqSafeSpinLock<Vec<Arc<dyn GpioController>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Lock-free snapshot of the registered-controller count. Read by
 /// diagnostics without taking the CTRLS lock.

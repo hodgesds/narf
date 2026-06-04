@@ -18,8 +18,8 @@
 use alloc::vec::Vec;
 
 use crate::{
-    core_init, core_reset, rf_discover, rf_discover_map, CoreInitResponse, NciMessage,
-    NfcError, NfcTransport, RfDiscoverEntry, RfDiscoverMapEntry, NCI_RESET_RESET_CONFIG,
+    core_init, core_reset, rf_discover, rf_discover_map, CoreInitResponse, NciMessage, NfcError,
+    NfcTransport, RfDiscoverEntry, RfDiscoverMapEntry, NCI_RESET_RESET_CONFIG,
 };
 
 /// Default I2C 7-bit address of the NXP PN553.
@@ -49,12 +49,18 @@ pub struct Pn553Driver<T: NfcTransport> {
 impl<T: NfcTransport> Pn553Driver<T> {
     /// Construct a new PN553 driver bound to the given transport.
     pub fn new(transport: T) -> Self {
-        Self { transport, i2c_addr: NXP_PN553_I2C_ADDR }
+        Self {
+            transport,
+            i2c_addr: NXP_PN553_I2C_ADDR,
+        }
     }
 
     /// Construct with a non-default I2C address.
     pub fn with_addr(transport: T, addr: u8) -> Self {
-        Self { transport, i2c_addr: addr }
+        Self {
+            transport,
+            i2c_addr: addr,
+        }
     }
 
     // ─── Low-level dispatch ──────────────────────────────────────────────

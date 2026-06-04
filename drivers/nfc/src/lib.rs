@@ -140,10 +140,10 @@ impl NciHeader {
             return Err(NfcError::ShortResponse);
         }
         Ok(Self {
-            mt:     (bytes[0] >> 5) & 0x07,
-            pbf:    (bytes[0] & (1 << 4)) != 0,
-            gid:    bytes[0] & 0x0F,
-            oid:    bytes[1] & 0x3F,
+            mt: (bytes[0] >> 5) & 0x07,
+            pbf: (bytes[0] & (1 << 4)) != 0,
+            gid: bytes[0] & 0x0F,
+            oid: bytes[1] & 0x3F,
             length: bytes[2],
         })
     }
@@ -154,10 +154,10 @@ impl NciHeader {
 /// Full NCI control message with decoded header fields and owned payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NciMessage {
-    pub mt:      u8,
-    pub pbf:     bool,
-    pub gid:     u8,
-    pub oid:     u8,
+    pub mt: u8,
+    pub pbf: bool,
+    pub gid: u8,
+    pub oid: u8,
     pub payload: Vec<u8>,
 }
 
@@ -165,10 +165,10 @@ impl NciMessage {
     /// Serialize to the complete on-wire byte sequence (header + payload).
     pub fn encode(&self) -> Vec<u8> {
         let hdr = NciHeader {
-            mt:     self.mt,
-            pbf:    self.pbf,
-            gid:    self.gid,
-            oid:    self.oid,
+            mt: self.mt,
+            pbf: self.pbf,
+            gid: self.gid,
+            oid: self.oid,
             length: self.payload.len() as u8,
         };
         let raw = hdr.encode();
@@ -186,10 +186,10 @@ impl NciMessage {
             return Err(NfcError::LengthMismatch);
         }
         Ok(Self {
-            mt:      hdr.mt,
-            pbf:     hdr.pbf,
-            gid:     hdr.gid,
-            oid:     hdr.oid,
+            mt: hdr.mt,
+            pbf: hdr.pbf,
+            gid: hdr.gid,
+            oid: hdr.oid,
             payload: bytes[3..expected_end].to_vec(),
         })
     }
@@ -202,10 +202,10 @@ impl NciMessage {
 /// `reset_type`: `NCI_RESET_KEEP_CONFIG` (0x00) or `NCI_RESET_RESET_CONFIG` (0x01)
 pub fn core_reset(reset_type: u8) -> NciMessage {
     NciMessage {
-        mt:      NCI_MT_CMD,
-        pbf:     false,
-        gid:     NCI_GID_CORE,
-        oid:     NCI_OID_CORE_RESET,
+        mt: NCI_MT_CMD,
+        pbf: false,
+        gid: NCI_GID_CORE,
+        oid: NCI_OID_CORE_RESET,
         payload: alloc::vec![reset_type],
     }
 }
@@ -213,10 +213,10 @@ pub fn core_reset(reset_type: u8) -> NciMessage {
 /// CORE_INIT_CMD — NCI 1.0 §4.1.3  (empty payload)
 pub fn core_init() -> NciMessage {
     NciMessage {
-        mt:      NCI_MT_CMD,
-        pbf:     false,
-        gid:     NCI_GID_CORE,
-        oid:     NCI_OID_CORE_INIT,
+        mt: NCI_MT_CMD,
+        pbf: false,
+        gid: NCI_GID_CORE,
+        oid: NCI_OID_CORE_INIT,
         payload: Vec::new(),
     }
 }
@@ -230,7 +230,7 @@ pub struct RfDiscoverMapEntry {
     /// RF Protocol (NCI_RF_PROTOCOL_*)
     pub rf_protocol: u8,
     /// Mode: NCI_DISC_MAP_MODE_POLL and/or NCI_DISC_MAP_MODE_LISTEN
-    pub mode:        u8,
+    pub mode: u8,
     /// RF Interface (NCI_RF_INTERFACE_*)
     pub rf_interface: u8,
 }
@@ -245,10 +245,10 @@ pub fn rf_discover_map(entries: &[RfDiscoverMapEntry]) -> NciMessage {
         payload.push(e.rf_interface);
     }
     NciMessage {
-        mt:      NCI_MT_CMD,
-        pbf:     false,
-        gid:     NCI_GID_RF_MGMT,
-        oid:     NCI_OID_RF_DISCOVER_MAP,
+        mt: NCI_MT_CMD,
+        pbf: false,
+        gid: NCI_GID_RF_MGMT,
+        oid: NCI_OID_RF_DISCOVER_MAP,
         payload,
     }
 }
@@ -273,10 +273,10 @@ pub fn rf_discover(entries: &[RfDiscoverEntry]) -> NciMessage {
         payload.push(e.frequency);
     }
     NciMessage {
-        mt:      NCI_MT_CMD,
-        pbf:     false,
-        gid:     NCI_GID_RF_MGMT,
-        oid:     NCI_OID_RF_DISCOVER,
+        mt: NCI_MT_CMD,
+        pbf: false,
+        gid: NCI_GID_RF_MGMT,
+        oid: NCI_OID_RF_DISCOVER,
         payload,
     }
 }
@@ -292,9 +292,9 @@ pub fn rf_discover(entries: &[RfDiscoverEntry]) -> NciMessage {
 ///   Manufacturer Specific Info (variable)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreInitResponse {
-    pub status:                u8,
-    pub nci_version:           u8,   // byte 4 of NFCC Features = NCI version
-    pub manufacturer_id:       u8,
+    pub status: u8,
+    pub nci_version: u8, // byte 4 of NFCC Features = NCI version
+    pub manufacturer_id: u8,
     pub manufacturer_specific: Vec<u8>,
 }
 

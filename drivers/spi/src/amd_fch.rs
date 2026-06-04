@@ -140,15 +140,15 @@ const BUSY_WAIT_POLLS: u32 = 100_000;
 // SPI100 enable bit (bit 0 of ENA_REG) is set when speed = 100 MHz.
 
 const SPEED_TABLE: &[(u32, u32, u32)] = &[
-    (100_000_000, 4, 0),        // F_100MHz
-    (66_660_000, 0, 0),         // F_66_66MHz
-    (50_000_000, 7, 0x04),      // SPI_SPD7 + F_50MHz
-    (33_330_000, 1, 0),         // F_33_33MHz
-    (22_220_000, 2, 0),         // F_22_22MHz
-    (16_660_000, 3, 0),         // F_16_66MHz
-    (4_000_000, 7, 0x32),       // SPI_SPD7 + F_4MHz
-    (3_170_000, 7, 0x3F),       // SPI_SPD7 + F_3_17MHz
-    (800_000, 5, 0),            // F_800KHz
+    (100_000_000, 4, 0),   // F_100MHz
+    (66_660_000, 0, 0),    // F_66_66MHz
+    (50_000_000, 7, 0x04), // SPI_SPD7 + F_50MHz
+    (33_330_000, 1, 0),    // F_33_33MHz
+    (22_220_000, 2, 0),    // F_22_22MHz
+    (16_660_000, 3, 0),    // F_16_66MHz
+    (4_000_000, 7, 0x32),  // SPI_SPD7 + F_4MHz
+    (3_170_000, 7, 0x3F),  // SPI_SPD7 + F_3_17MHz
+    (800_000, 5, 0),       // F_800KHz
 ];
 
 const AMD_SPI_MAX_HZ: u32 = 100_000_000;
@@ -359,7 +359,11 @@ impl AmdFchSpi {
         } else {
             tx_chunk[0]
         };
-        let tx_body = if tx_chunk.len() > 1 { &tx_chunk[1..] } else { &[] };
+        let tx_body = if tx_chunk.len() > 1 {
+            &tx_chunk[1..]
+        } else {
+            &[]
+        };
         let tx_len = tx_body.len() as u8;
         let rx_len = rx_buf.len() as u8;
 
@@ -487,7 +491,8 @@ pub fn probe_all() -> usize {
             let _ = writeln!(
                 narf_console::Writer,
                 "  amd-fch-spi: probing {} (HID={})",
-                node.path, hid
+                node.path,
+                hid
             );
             if let Some(()) = probe_one(&node.path, version) {
                 count += 1;
@@ -536,7 +541,10 @@ fn probe_one(path: &str, version: AmdSpiVersion) -> Option<()> {
     let _ = writeln!(
         narf_console::Writer,
         "  amd-fch-spi: {} registered mmio={:#x}+{:#x} version={:?}",
-        path, base, len, version
+        path,
+        base,
+        len,
+        version
     );
     Some(())
 }

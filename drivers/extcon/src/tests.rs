@@ -65,7 +65,9 @@ struct RecordingSink {
 
 impl RecordingSink {
     fn new() -> Self {
-        Self { events: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()) }
+        Self {
+            events: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+        }
     }
     fn event_count(&self) -> usize {
         self.events.lock().len()
@@ -136,19 +138,28 @@ kernel_test_in!("drivers/extcon", smoke_cable_change_notifies_subscribers);
 
 fn smoke_orientation_from_cc1() -> TestResult {
     // CC1 active (Rp3A0), CC2 open → Normal orientation.
-    let cc = CcStatus { cc1: CcState::Rp3A0, cc2: CcState::Open };
+    let cc = CcStatus {
+        cc1: CcState::Rp3A0,
+        cc2: CcState::Open,
+    };
     if orientation_from_cc(cc) != Orientation::Normal {
         return TestResult::Fail("CC1 active should give Normal orientation");
     }
 
     // CC2 active, CC1 open → Reversed.
-    let cc2 = CcStatus { cc1: CcState::Open, cc2: CcState::Rp1A5 };
+    let cc2 = CcStatus {
+        cc1: CcState::Open,
+        cc2: CcState::Rp1A5,
+    };
     if orientation_from_cc(cc2) != Orientation::Reversed {
         return TestResult::Fail("CC2 active should give Reversed orientation");
     }
 
     // Both open → Unknown.
-    let cc3 = CcStatus { cc1: CcState::Open, cc2: CcState::Open };
+    let cc3 = CcStatus {
+        cc1: CcState::Open,
+        cc2: CcState::Open,
+    };
     if orientation_from_cc(cc3) != Orientation::Unknown {
         return TestResult::Fail("both open should give Unknown orientation");
     }
@@ -263,7 +274,10 @@ fn smoke_mux_reversed_pin_c() -> TestResult {
     conn.set_mux(mux);
 
     // Update CC → Reversed.
-    let cc = CcStatus { cc1: CcState::Open, cc2: CcState::Rp3A0 };
+    let cc = CcStatus {
+        cc1: CcState::Open,
+        cc2: CcState::Rp3A0,
+    };
     conn.update_cc(cc);
     if conn.orientation() != Orientation::Reversed {
         return TestResult::Fail("connector should report Reversed after update_cc");

@@ -182,8 +182,7 @@ pub mod registry {
 
     pub static REGISTERED_COUNT: AtomicU32 = AtomicU32::new(0);
 
-    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn SpiBus>>> =
-        IrqSafeSpinLock::new(Vec::new());
+    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn SpiBus>>> = IrqSafeSpinLock::new(Vec::new());
 
     /// Register `bus` if no bus with the same `name()` is present.
     /// Returns the existing Arc when a duplicate is found, otherwise

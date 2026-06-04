@@ -95,12 +95,7 @@ impl core::fmt::Debug for AmdFchGpio {
 }
 
 impl AmdFchGpio {
-    pub fn new(
-        name: String,
-        mmio_base: PhysAddr,
-        mmio_len: u64,
-        irq_vector: Option<u8>,
-    ) -> Self {
+    pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
         let pin_count = (mmio_len / 4).min(MAX_PINS as u64) as u16;
         Self {
             name,
@@ -350,12 +345,16 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                     mmio = Some((min as u64, length as u64));
                 }
             }
-            ResourceItem::AddressSpace32 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace32 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 if mmio.is_none() {
                     mmio = Some((min as u64, length as u64));
                 }
             }
-            ResourceItem::AddressSpace64 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace64 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 if mmio.is_none() {
                     mmio = Some((min, length));
                 }
@@ -447,7 +446,9 @@ fn probe_one(path: &str) -> Option<()> {
         path,
         res.mmio_base,
         res.mmio_len,
-        res.gsi.map(|g| format!("{}", g)).unwrap_or_else(|| "none".into()),
+        res.gsi
+            .map(|g| format!("{}", g))
+            .unwrap_or_else(|| "none".into()),
         irq_vec
             .map(|v| format!("{}", v))
             .unwrap_or_else(|| "polled".into()),

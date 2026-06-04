@@ -112,6 +112,6 @@ pub trait WwanPort {
 
 // ─── Re-exports for convenience ──────────────────────────────────────────────
 
-pub use mbim::{MbimHeader, MbimMessageType, MbimError};
-pub use qmi::{QmiHeader, QmiError};
 pub use iosm::IOSM_PCI_DEVICES;
+pub use mbim::{MbimError, MbimHeader, MbimMessageType};
+pub use qmi::{QmiError, QmiHeader};

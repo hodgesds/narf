@@ -109,7 +109,7 @@ impl IntelPchGpio {
         has_debounce: bool,
     ) -> Self {
         let name = format!("{}.C{}", acpi_path, community_index);
-        
+
         // Heuristic offsets for modern PCHs.
         // TGL/MTL use 0x100/0x120 or 0x200/0x220 depending on community/generation.
         // We probe them by looking for non-zero bits or valid revision.
@@ -147,7 +147,11 @@ impl IntelPchGpio {
     }
 
     fn stride(&self) -> u64 {
-        if self.has_debounce { 16 } else { 8 }
+        if self.has_debounce {
+            16
+        } else {
+            8
+        }
     }
 
     fn padcfg0_offset(&self, pin: u16) -> Option<u64> {
@@ -164,15 +168,15 @@ impl IntelPchGpio {
     pub fn dispatch_irq(&self) -> IrqStatus {
         let mut handled = IrqStatus::None;
         let groups = (self.pin_count as usize + 31) / 32;
-        
+
         for g in 0..groups {
             let is_reg = self.is_offset as u64 + (g as u64 * 4);
             let ie_reg = self.ie_offset as u64 + (g as u64 * 4);
-            
+
             let status = unsafe { self.read32(is_reg) };
             let enabled = unsafe { self.read32(ie_reg) };
             let active = status & enabled;
-            
+
             if active == 0 {
                 continue;
             }
@@ -231,7 +235,7 @@ impl GpioController for IntelPchGpio {
         handler: GpioIrqHandler,
     ) -> Result<(), GpioError> {
         let off = self.padcfg0_offset(pin).ok_or(GpioError::InvalidPin)?;
-        
+
         // 1. Program pad configuration.
         let mut val = unsafe { self.read32(off) };
         // Mode = GPIO, RX enabled, TX disabled.
@@ -239,7 +243,7 @@ impl GpioController for IntelPchGpio {
         val |= PADCFG0_PMODE_GPIO;
         val &= !PADCFG0_GPIORXDIS;
         val |= PADCFG0_GPIOTXDIS;
-        
+
         // Trigger.
         val &= !PADCFG0_RXEVCFG_MASK;
         if irq.level_triggered {
@@ -259,7 +263,7 @@ impl GpioController for IntelPchGpio {
         } else {
             val &= !PADCFG0_RXINV;
         }
-        
+
         unsafe { self.write32(off, val) };
 
         // 2. Program pull-up/down in PADCFG1.
@@ -275,14 +279,14 @@ impl GpioController for IntelPchGpio {
 
         // 3. Store handler and enable in GPI_IE.
         self.handlers.lock().insert(pin, handler);
-        
+
         let g = (pin / 32) as u64;
         let bit = (pin % 32) as u32;
         let ie_reg = self.ie_offset as u64 + (g * 4);
         let mut ie = unsafe { self.read32(ie_reg) };
         ie |= 1 << bit;
         unsafe { self.write32(ie_reg, ie) };
-        
+
         Ok(())
     }
 
@@ -294,7 +298,7 @@ impl GpioController for IntelPchGpio {
             let mut ie = unsafe { self.read32(ie_reg) };
             ie &= !(1 << bit);
             unsafe { self.write32(ie_reg, ie) };
-            
+
             // Disable RX to save power.
             let mut val = unsafe { self.read32(off) };
             val |= PADCFG0_GPIORXDIS;
@@ -338,13 +342,17 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                     mmio_len: length as u64,
                 });
             }
-            ResourceItem::AddressSpace32 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace32 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 communities.push(CommunityRes {
                     mmio_base: min as u64,
                     mmio_len: length as u64,
                 });
             }
-            ResourceItem::AddressSpace64 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace64 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 communities.push(CommunityRes {
                     mmio_base: min,
                     mmio_len: length,
@@ -382,10 +390,7 @@ pub unsafe fn __probe_community_for_test(
     unsafe { probe_community(mmio_base, mmio_len) }
 }
 
-unsafe fn probe_community(
-    mmio_base: PhysAddr,
-    mmio_len: u64,
-) -> Option<(u16, u32, bool, u16)> {
+unsafe fn probe_community(mmio_base: PhysAddr, mmio_len: u64) -> Option<(u16, u32, bool, u16)> {
     if mmio_len < 0x10 {
         return None;
     }
@@ -423,7 +428,8 @@ fn probe_one(hid: &str, path: &str) -> usize {
             let _ = writeln!(
                 narf_console::Writer,
                 "  intel-pch-gpio: {} ({}): _CRS missing or empty",
-                path, hid
+                path,
+                hid
             );
             return 0;
         }
@@ -467,7 +473,7 @@ fn try_route_gsi(gsi: u32, flags: u8, ctrls: alloc::vec::Vec<Arc<IntelPchGpio>>)
         Ok(v) => v,
         Err(_) => return,
     };
-    
+
     let polarity = if flags & (1 << 1) != 0 {
         narf_acpi::ioapic::POLARITY_LOW
     } else {
@@ -478,18 +484,19 @@ fn try_route_gsi(gsi: u32, flags: u8, ctrls: alloc::vec::Vec<Arc<IntelPchGpio>>)
     } else {
         narf_acpi::ioapic::TRIGGER_EDGE
     };
-    
+
     // Leak the controller list for the static ISR.
-    let ctrls_static: &'static [Arc<IntelPchGpio>] = alloc::boxed::Box::leak(ctrls.into_boxed_slice());
+    let ctrls_static: &'static [Arc<IntelPchGpio>] =
+        alloc::boxed::Box::leak(ctrls.into_boxed_slice());
     GSI_MAPPING.lock().insert(vector, ctrls_static);
 
     narf_interrupts::install_handler_named(
         vector,
         "intel-pch-gpio",
         vector as u64,
-        gpio_gsi_bridge
+        gpio_gsi_bridge,
     );
-    
+
     unsafe {
         narf_acpi::ioapic::route_gsi_to_vector(gsi, vector, 0, polarity | trigger);
     }
@@ -499,7 +506,8 @@ fn gpio_gsi_bridge(cookie: u64) -> IrqStatus {
     global_gsi_dispatch(cookie as u8)
 }
 
-static GSI_MAPPING: IrqSafeSpinLock<BTreeMap<u8, &'static [Arc<IntelPchGpio>]>> = IrqSafeSpinLock::new(BTreeMap::new());
+static GSI_MAPPING: IrqSafeSpinLock<BTreeMap<u8, &'static [Arc<IntelPchGpio>]>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
 
 fn global_gsi_dispatch(vector: u8) -> IrqStatus {
     let mut handled = IrqStatus::None;

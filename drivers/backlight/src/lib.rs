@@ -127,7 +127,11 @@ pub fn backlight_devices() -> Vec<Arc<dyn BacklightDevice>> {
 
 /// Find a device by name.
 pub fn backlight_device(name: &str) -> Option<Arc<dyn BacklightDevice>> {
-    BACKLIGHT_DEVS.lock().iter().find(|d| d.name() == name).cloned()
+    BACKLIGHT_DEVS
+        .lock()
+        .iter()
+        .find(|d| d.name() == name)
+        .cloned()
 }
 
 /// Test helper: drain all registries.

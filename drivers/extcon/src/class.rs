@@ -68,8 +68,7 @@ pub trait ExtconDevice: Send + Sync {
 ///
 /// Linux analogue: `extcon_dev_list` (a kernel-linked list in
 /// `drivers/extcon/extcon.c`).
-pub static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn ExtconDevice>>> =
-    IrqSafeSpinLock::new(Vec::new());
+pub static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn ExtconDevice>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register an extcon device, making it visible to the rest of the
 /// kernel.
@@ -82,11 +81,7 @@ pub fn register(dev: Arc<dyn ExtconDevice>) {
 /// Look up an extcon device by name. Returns `None` if no device
 /// with that name is registered.
 pub fn lookup(name: &str) -> Option<Arc<dyn ExtconDevice>> {
-    REGISTRY
-        .lock()
-        .iter()
-        .find(|d| d.name() == name)
-        .cloned()
+    REGISTRY.lock().iter().find(|d| d.name() == name).cloned()
 }
 
 /// Return the number of registered extcon devices.

@@ -235,19 +235,35 @@ impl Desc {
     }
     /// Set `soc` (bit 0 of dw[0]).
     pub fn set_soc(&mut self, v: bool) {
-        if v { self.dw[0] |= 1 << 0; } else { self.dw[0] &= !(1 << 0); }
+        if v {
+            self.dw[0] |= 1 << 0;
+        } else {
+            self.dw[0] &= !(1 << 0);
+        }
     }
     /// Set `ioc` interrupt-on-completion (bit 1 of dw[0]).
     pub fn set_ioc(&mut self, v: bool) {
-        if v { self.dw[0] |= 1 << 1; } else { self.dw[0] &= !(1 << 1); }
+        if v {
+            self.dw[0] |= 1 << 1;
+        } else {
+            self.dw[0] &= !(1 << 1);
+        }
     }
     /// Set `init` context-load bit (bit 3 of dw[0]).
     pub fn set_init(&mut self, v: bool) {
-        if v { self.dw[0] |= 1 << 3; } else { self.dw[0] &= !(1 << 3); }
+        if v {
+            self.dw[0] |= 1 << 3;
+        } else {
+            self.dw[0] &= !(1 << 3);
+        }
     }
     /// Set `eom` end-of-message bit (bit 4 of dw[0]).
     pub fn set_eom(&mut self, v: bool) {
-        if v { self.dw[0] |= 1 << 4; } else { self.dw[0] &= !(1 << 4); }
+        if v {
+            self.dw[0] |= 1 << 4;
+        } else {
+            self.dw[0] &= !(1 << 4);
+        }
     }
     /// Read the engine field (bits[23:20] of dw[0]).
     pub fn engine(&self) -> u8 {
@@ -260,8 +276,12 @@ impl Desc {
 
     // ── dw[1] — data length ──────────────────────────────────────────
 
-    pub fn set_length(&mut self, len: u32) { self.dw[1] = len; }
-    pub fn length(&self) -> u32 { self.dw[1] }
+    pub fn set_length(&mut self, len: u32) {
+        self.dw[1] = len;
+    }
+    pub fn length(&self) -> u32 {
+        self.dw[1]
+    }
 
     // ── dw[2/3] — source address ─────────────────────────────────────
 
@@ -271,9 +291,15 @@ impl Desc {
             | ((addr >> 32) as u32 & 0xFFFF)
             | (((mem_type as u32) & 0x3) << 16);
     }
-    pub fn src_lo(&self) -> u32 { self.dw[2] }
-    pub fn src_hi(&self) -> u16 { (self.dw[3] & 0xFFFF) as u16 }
-    pub fn src_mem(&self) -> u8 { ((self.dw[3] >> 16) & 0x3) as u8 }
+    pub fn src_lo(&self) -> u32 {
+        self.dw[2]
+    }
+    pub fn src_hi(&self) -> u16 {
+        (self.dw[3] & 0xFFFF) as u16
+    }
+    pub fn src_mem(&self) -> u8 {
+        ((self.dw[3] >> 16) & 0x3) as u8
+    }
 
     /// Set LSB context ID (bits[25:18] of dw[3]).
     pub fn set_lsb_cxt_id(&mut self, id: u8) {
@@ -288,9 +314,15 @@ impl Desc {
             | ((addr >> 32) as u32 & 0xFFFF)
             | (((mem_type as u32) & 0x3) << 16);
     }
-    pub fn dst_lo(&self) -> u32 { self.dw[4] }
-    pub fn dst_hi(&self) -> u16 { (self.dw[5] & 0xFFFF) as u16 }
-    pub fn dst_mem(&self) -> u8 { ((self.dw[5] >> 16) & 0x3) as u8 }
+    pub fn dst_lo(&self) -> u32 {
+        self.dw[4]
+    }
+    pub fn dst_hi(&self) -> u16 {
+        (self.dw[5] & 0xFFFF) as u16
+    }
+    pub fn dst_mem(&self) -> u8 {
+        ((self.dw[5] >> 16) & 0x3) as u8
+    }
 
     /// Set SHA message-length in bits (64-bit; split across dw[4] lo and dw[5] hi).
     pub fn set_sha_msg_bits(&mut self, msg_bits: u64) {
@@ -306,9 +338,15 @@ impl Desc {
             | ((addr >> 32) as u32 & 0xFFFF)
             | (((mem_type as u32) & 0x3) << 16);
     }
-    pub fn key_lo(&self) -> u32 { self.dw[6] }
-    pub fn key_hi(&self) -> u16 { (self.dw[7] & 0xFFFF) as u16 }
-    pub fn key_mem(&self) -> u8 { ((self.dw[7] >> 16) & 0x3) as u8 }
+    pub fn key_lo(&self) -> u32 {
+        self.dw[6]
+    }
+    pub fn key_hi(&self) -> u16 {
+        (self.dw[7] & 0xFFFF) as u16
+    }
+    pub fn key_mem(&self) -> u8 {
+        ((self.dw[7] >> 16) & 0x3) as u8
+    }
 }
 
 // ── AES function-field encoder (dw[0] bits[19:5]) ─────────────────────
@@ -667,38 +705,28 @@ pub fn ecc_point_op_submit<M: CcpMmio>(
 
 /// NIST P-256 prime p (big-endian).
 pub const P256_P_BE: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
 
 /// NIST P-256 curve parameter a = p - 3 (big-endian).
 pub const P256_A_BE: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc,
 ];
 
 /// NIST P-384 prime p (big-endian).
 pub const P384_P_BE: [u8; 48] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
 ];
 
 /// NIST P-384 curve parameter a (big-endian).
 pub const P384_A_BE: [u8; 48] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xfc,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xfc,
 ];
 
 // ── ECC buffer helpers ────────────────────────────────────────────────
@@ -728,8 +756,7 @@ pub fn build_ecc_pmul_src(
         ($idx:expr, $src:expr) => {{
             let mut slot = [0u8; ECC_OPERAND_SIZE];
             write_ecc_operand_le(&mut slot, $src);
-            buf[$idx * ECC_OPERAND_SIZE..($idx + 1) * ECC_OPERAND_SIZE]
-                .copy_from_slice(&slot);
+            buf[$idx * ECC_OPERAND_SIZE..($idx + 1) * ECC_OPERAND_SIZE].copy_from_slice(&slot);
         }};
     }
     put!(0, p_be);
@@ -759,8 +786,7 @@ pub fn parse_ecc_pmul_dst(
 /// Check the ECC result flags at byte offset 60 of the 192-byte dst buffer.
 /// Returns `true` if bit 0 (CCP_ECC_RESULT_SUCCESS) is set.
 pub fn ecc_result_ok(dst: &[u8; ECC_DST_BUF_SIZE]) -> bool {
-    let flags =
-        (dst[ECC_RESULT_OFFSET] as u16) | ((dst[ECC_RESULT_OFFSET + 1] as u16) << 8);
+    let flags = (dst[ECC_RESULT_OFFSET] as u16) | ((dst[ECC_RESULT_OFFSET + 1] as u16) << 8);
     (flags & ECC_RESULT_SUCCESS) != 0
 }
 
@@ -875,7 +901,7 @@ pub fn aes_op<M: CcpMmio>(
     desc.set_length(data_len);
     desc.set_src(data_phys, MEMTYPE_SYSTEM);
     desc.set_dst(data_phys, MEMTYPE_SYSTEM); // in-place
-    // Key lives in system memory (we don't use the on-chip LSB here).
+                                             // Key lives in system memory (we don't use the on-chip LSB here).
     desc.set_key(key_phys, MEMTYPE_SYSTEM);
     // Context (IV) stored at LSB; we use the iv_phys slot in system memory.
     // For simplicity we put IV address in the lsb_cxt_id field as 0 and
@@ -904,8 +930,19 @@ pub fn aes_encrypt<M: CcpMmio>(
     if !matches!(mode, AesMode::Ecb) && iv.len() != 16 {
         return Err(CcpError::BadIv);
     }
-    aes_op(mmio, key, mode, AesAction::Encrypt, data_phys, data_len,
-           key_phys, 0, queue_ring, tail_idx, ring_phys)
+    aes_op(
+        mmio,
+        key,
+        mode,
+        AesAction::Encrypt,
+        data_phys,
+        data_len,
+        key_phys,
+        0,
+        queue_ring,
+        tail_idx,
+        ring_phys,
+    )
 }
 
 /// Convenience wrapper: AES decrypt in-place.
@@ -924,8 +961,19 @@ pub fn aes_decrypt<M: CcpMmio>(
     if !matches!(mode, AesMode::Ecb) && iv.len() != 16 {
         return Err(CcpError::BadIv);
     }
-    aes_op(mmio, key, mode, AesAction::Decrypt, data_phys, data_len,
-           key_phys, 0, queue_ring, tail_idx, ring_phys)
+    aes_op(
+        mmio,
+        key,
+        mode,
+        AesAction::Decrypt,
+        data_phys,
+        data_len,
+        key_phys,
+        0,
+        queue_ring,
+        tail_idx,
+        ring_phys,
+    )
 }
 
 /// Build and submit a SHA descriptor.
@@ -971,26 +1019,20 @@ pub fn sha_op<M: CcpMmio>(
 /// The constant arrays are taken from FIPS 180-4.
 pub fn sha256_soft(data: &[u8]) -> [u8; 32] {
     const H0: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
 
     let bit_len = (data.len() as u64) * 8;
@@ -1034,7 +1076,10 @@ pub fn sha256_soft(data: &[u8]) -> [u8; 32] {
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
         // Compression.
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] =
@@ -1042,19 +1087,31 @@ pub fn sha256_soft(data: &[u8]) -> [u8; 32] {
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
-            hh = g; g = f; f = e;
+            hh = g;
+            g = f;
+            f = e;
             e = d.wrapping_add(temp1);
-            d = c; c = b; b = a;
+            d = c;
+            c = b;
+            b = a;
             a = temp1.wrapping_add(temp2);
         }
-        h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
     }
 
     let mut out = [0u8; 32];
@@ -1239,9 +1296,16 @@ fn smoke_ccp_aes256_cbc_round_trip() -> TestResult {
 
     // Encrypt
     let enc = aes_encrypt(
-        &mut mmio, &key, &iv, AesMode::Cbc,
-        0x1000, 64, 0x2000,
-        &mut ring, &mut tail, 0,
+        &mut mmio,
+        &key,
+        &iv,
+        AesMode::Cbc,
+        0x1000,
+        64,
+        0x2000,
+        &mut ring,
+        &mut tail,
+        0,
     );
     if enc.is_err() {
         return TestResult::Fail("aes_encrypt returned error");
@@ -1254,9 +1318,16 @@ fn smoke_ccp_aes256_cbc_round_trip() -> TestResult {
     // Decrypt — reset tail to 0 for simplicity.
     tail = 0;
     let dec = aes_decrypt(
-        &mut mmio, &key, &iv, AesMode::Cbc,
-        0x1000, 64, 0x2000,
-        &mut ring, &mut tail, 0,
+        &mut mmio,
+        &key,
+        &iv,
+        AesMode::Cbc,
+        0x1000,
+        64,
+        0x2000,
+        &mut ring,
+        &mut tail,
+        0,
     );
     if dec.is_err() {
         return TestResult::Fail("aes_decrypt returned error");
@@ -1280,10 +1351,9 @@ fn smoke_ccp_sha256_known_answer() -> TestResult {
     // Empty string: SHA-256("") =
     //   e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     let empty_expected: [u8; 32] = [
-        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
-        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
-        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
-        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
+        0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
+        0xb8, 0x55,
     ];
     let got_empty = sha256_soft(b"");
     if got_empty != empty_expected {
@@ -1292,10 +1362,9 @@ fn smoke_ccp_sha256_known_answer() -> TestResult {
 
     // "abc": ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
     let abc_expected: [u8; 32] = [
-        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
+        0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
+        0x15, 0xad,
     ];
     let got_abc = sha256_soft(b"abc");
     if got_abc != abc_expected {
@@ -1306,10 +1375,9 @@ fn smoke_ccp_sha256_known_answer() -> TestResult {
     // expected: 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
     let abcd_msg = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
     let abcd_expected: [u8; 32] = [
-        0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8,
-        0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
-        0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67,
-        0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+        0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8, 0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60,
+        0x39, 0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67, 0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb,
+        0x06, 0xc1,
     ];
     let got_abcd = sha256_soft(abcd_msg);
     if got_abcd != abcd_expected {
@@ -1346,9 +1414,16 @@ fn smoke_ccp_queue_wrap_around() -> TestResult {
 
     for i in 0..COMMANDS_PER_QUEUE {
         let res = aes_encrypt(
-            &mut mmio, &key, &iv, AesMode::Ecb,
-            0x1000, 16, 0x2000,
-            &mut ring, &mut tail, 0,
+            &mut mmio,
+            &key,
+            &iv,
+            AesMode::Ecb,
+            0x1000,
+            16,
+            0x2000,
+            &mut ring,
+            &mut tail,
+            0,
         );
         if res.is_err() {
             return TestResult::Fail("aes_encrypt failed during wrap test");
@@ -1369,22 +1444,30 @@ kernel_test_in!("drivers/crypto", smoke_ccp_queue_wrap_around);
 /// Smoke 6: PCI ID table contains required Renoir and Phoenix device IDs.
 fn smoke_ccp_pci_id_table() -> TestResult {
     // Renoir 0x15DF must be present.
-    let has_renoir = CCP_PCI_TABLE.iter().any(|&(v, d)| v == 0x1022 && d == 0x15DF);
+    let has_renoir = CCP_PCI_TABLE
+        .iter()
+        .any(|&(v, d)| v == 0x1022 && d == 0x15DF);
     if !has_renoir {
         return TestResult::Fail("PCI table missing Renoir 0x15DF");
     }
     // Phoenix HawkPoint1 0x1134 must be present.
-    let has_phoenix = CCP_PCI_TABLE.iter().any(|&(v, d)| v == 0x1022 && d == 0x1134);
+    let has_phoenix = CCP_PCI_TABLE
+        .iter()
+        .any(|&(v, d)| v == 0x1022 && d == 0x1134);
     if !has_phoenix {
         return TestResult::Fail("PCI table missing Phoenix 0x1134");
     }
     // Cezanne 0x1649 must be present.
-    let has_cez = CCP_PCI_TABLE.iter().any(|&(v, d)| v == 0x1022 && d == 0x1649);
+    let has_cez = CCP_PCI_TABLE
+        .iter()
+        .any(|&(v, d)| v == 0x1022 && d == 0x1649);
     if !has_cez {
         return TestResult::Fail("PCI table missing Cezanne 0x1649");
     }
     // Raven 0x1537 must be present.
-    let has_raven = CCP_PCI_TABLE.iter().any(|&(v, d)| v == 0x1022 && d == 0x1537);
+    let has_raven = CCP_PCI_TABLE
+        .iter()
+        .any(|&(v, d)| v == 0x1022 && d == 0x1537);
     if !has_raven {
         return TestResult::Fail("PCI table missing Raven 0x1537");
     }
@@ -1585,8 +1668,7 @@ fn smoke_ccp_rsa_fake_mmio_round_trip() -> TestResult {
     let mut tail = 0u32;
 
     let res = rsa_modexp_submit(
-        &mut mmio, 2048, 0x4000, 0x5000, 0x6000,
-        &mut ring, &mut tail, 0,
+        &mut mmio, 2048, 0x4000, 0x5000, 0x6000, &mut ring, &mut tail, 0,
     );
     if res.is_err() {
         return TestResult::Fail("rsa_modexp_submit returned error on FakeMmio");
@@ -1649,8 +1731,14 @@ fn smoke_ccp_ecdh_fake_mmio_descriptor() -> TestResult {
     }
 
     let res = ecc_point_op_submit(
-        &mut mmio, ECC_FUNC_PMUL, 0x8000, ECC_SRC_BUF_SIZE as u32, 0x9000,
-        &mut ring, &mut tail, 0,
+        &mut mmio,
+        ECC_FUNC_PMUL,
+        0x8000,
+        ECC_SRC_BUF_SIZE as u32,
+        0x9000,
+        &mut ring,
+        &mut tail,
+        0,
     );
     if res.is_err() {
         return TestResult::Fail("ecc_point_op_submit returned error on FakeMmio");

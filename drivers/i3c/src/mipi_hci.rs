@@ -69,7 +69,9 @@ use core::task::Waker;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
-use narf_i3c::{registry, CccDest, CommonCommandCode, I3cBus, I3cDevice, I3cError, I3cOp, IbiHandler};
+use narf_i3c::{
+    registry, CccDest, CommonCommandCode, I3cBus, I3cDevice, I3cError, I3cOp, IbiHandler,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── HCI Global Register Offsets ────────────────────────────────────
@@ -511,12 +513,20 @@ impl MipiHciI3cMaster {
         //   rh_reg_write(CMD_RING_BASE_LO, lower_32_bits(rh->xfer_dma))
         //   rh_reg_write(CMD_RING_BASE_HI, upper_32_bits(rh->xfer_dma))
         unsafe {
-            self.mmio.write32(rh_base + RH_CMD_RING_BASE_LO, cr_phys as u32);
-            self.mmio.write32(rh_base + RH_CMD_RING_BASE_HI, (cr_phys >> 32) as u32);
-            self.mmio.write32(rh_base + RH_RESP_RING_BASE_LO, rr_phys as u32);
-            self.mmio.write32(rh_base + RH_RESP_RING_BASE_HI, (rr_phys >> 32) as u32);
-            self.mmio.write32(rh_base + RH_IBI_STATUS_RING_BASE_LO, ibi_phys as u32);
-            self.mmio.write32(rh_base + RH_IBI_STATUS_RING_BASE_HI, (ibi_phys >> 32) as u32);
+            self.mmio
+                .write32(rh_base + RH_CMD_RING_BASE_LO, cr_phys as u32);
+            self.mmio
+                .write32(rh_base + RH_CMD_RING_BASE_HI, (cr_phys >> 32) as u32);
+            self.mmio
+                .write32(rh_base + RH_RESP_RING_BASE_LO, rr_phys as u32);
+            self.mmio
+                .write32(rh_base + RH_RESP_RING_BASE_HI, (rr_phys >> 32) as u32);
+            self.mmio
+                .write32(rh_base + RH_IBI_STATUS_RING_BASE_LO, ibi_phys as u32);
+            self.mmio.write32(
+                rh_base + RH_IBI_STATUS_RING_BASE_HI,
+                (ibi_phys >> 32) as u32,
+            );
 
             // Set ring size in CR_SETUP: bits [8:0] = number of entries.
             // Linux: FIELD_PREP(CR_RING_SIZE, rh->xfer_entries).
@@ -537,8 +547,12 @@ impl MipiHciI3cMaster {
 
             // Enable the ring, then start it running.
             // Linux: RING_CTRL_ENABLE then RING_CTRL_ENABLE | RING_CTRL_RUN_STOP.
-            self.mmio.write32(rh_base + RH_RING_CONTROL, RING_CTRL_ENABLE);
-            self.mmio.write32(rh_base + RH_RING_CONTROL, RING_CTRL_ENABLE | RING_CTRL_RUN_STOP);
+            self.mmio
+                .write32(rh_base + RH_RING_CONTROL, RING_CTRL_ENABLE);
+            self.mmio.write32(
+                rh_base + RH_RING_CONTROL,
+                RING_CTRL_ENABLE | RING_CTRL_RUN_STOP,
+            );
         }
 
         // Switch HC_CONTROL to DMA mode: clear PIO_MODE bit (bit 6).
@@ -696,10 +710,7 @@ impl Driver for MipiHciI3cMaster {
             // HC_CONTROL.PIO_MODE = 1 selects PIO over DMA.
             // HC_CONTROL.BUS_ENABLE = 1 starts driving SCL.
             // HCI §6.1.2.
-            self.hci_write(
-                HC_CONTROL,
-                HC_CONTROL_BUS_ENABLE | HC_CONTROL_PIO_MODE,
-            );
+            self.hci_write(HC_CONTROL, HC_CONTROL_BUS_ENABLE | HC_CONTROL_PIO_MODE);
         })
     }
 
@@ -887,9 +898,9 @@ impl I3cBus for MipiHciI3cMaster {
             let cmd_lo_daa = (0x2u32 << 26)   // ADDR_ASSIGN type
                 | (1u32 << 24)                  // RnW = 1
                 | (1u32 << 16)                  // ROC
-                | 8u32;                          // data length = 8 bytes
-            // High word carries the candidate dynamic address in bits [14:8]
-            // (NXP HCI extension; standard HCI puts it in the DAT).
+                | 8u32; // data length = 8 bytes
+                        // High word carries the candidate dynamic address in bits [14:8]
+                        // (NXP HCI extension; standard HCI puts it in the DAT).
             let cmd_hi_daa = (addr_with_parity as u32) << 8;
             self.push_command(cmd_lo_daa, cmd_hi_daa);
 
@@ -957,9 +968,7 @@ impl I3cBus for MipiHciI3cMaster {
     ///
     /// Linux ref: dw-i3c-master.c COMMAND_PORT_SPEED(2) and hdr_ddr ops.
     /// I3C spec rev 1.1 §5.2.3.
-    async fn hdr_ddr_write(&self, addr: u8, command: u8, data: &[u16])
-        -> Result<(), I3cError>
-    {
+    async fn hdr_ddr_write(&self, addr: u8, command: u8, data: &[u16]) -> Result<(), I3cError> {
         self.flush_queues();
 
         // Step 1: Enter HDR-DDR mode on all devices.
@@ -1002,9 +1011,7 @@ impl I3cBus for MipiHciI3cMaster {
     /// drains the RX FIFO after completion.
     ///
     /// I3C spec rev 1.1 §5.2.3.
-    async fn hdr_ddr_read(&self, addr: u8, command: u8, data: &mut [u16])
-        -> Result<(), I3cError>
-    {
+    async fn hdr_ddr_read(&self, addr: u8, command: u8, data: &mut [u16]) -> Result<(), I3cError> {
         self.flush_queues();
 
         // Enter HDR-DDR mode.
@@ -1073,7 +1080,10 @@ impl I3cBus for MipiHciI3cMaster {
         if let Some(slot) = handlers.iter_mut().find(|s| s.addr == dev_addr) {
             slot.handler = handler;
         } else {
-            handlers.push(IbiHandlerSlot { addr: dev_addr, handler });
+            handlers.push(IbiHandlerSlot {
+                addr: dev_addr,
+                handler,
+            });
         }
 
         Ok(())
@@ -1123,7 +1133,12 @@ pub fn hdr_ddr_crc5(mut crc: u8, data: u16, bits: u8) -> u8 {
     let mut val = (data as u32) << (32 - bits as u32);
     for _ in 0..bits {
         let bit = (val >> 31) & 1;
-        crc = (crc << 1) ^ if ((crc >> 4) ^ bit as u8) & 1 != 0 { HDR_DDR_CRC_POLY } else { 0 };
+        crc = (crc << 1)
+            ^ if ((crc >> 4) ^ bit as u8) & 1 != 0 {
+                HDR_DDR_CRC_POLY
+            } else {
+                0
+            };
         crc &= 0x1F;
         val <<= 1;
     }
@@ -1141,7 +1156,11 @@ pub fn hdr_ddr_pack_words(data: &[u16], out: &mut Vec<u32>) {
     let mut i = 0;
     while i < data.len() {
         let lo = data[i] as u32;
-        let hi = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+        let hi = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
         out.push(lo | (hi << 16));
         i += 2;
     }
@@ -1264,7 +1283,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/i3c/mipi-hci", smoke_mipi_hci_global_register_offsets);
+    kernel_test_in!(
+        "drivers/i3c/mipi-hci",
+        smoke_mipi_hci_global_register_offsets
+    );
 
     // ── PIO sub-block register offsets ────────────────────────────
     fn smoke_mipi_hci_pio_register_offsets() -> TestResult {
@@ -1353,7 +1375,10 @@ mod tests {
 
         TestResult::Pass
     }
-    kernel_test_in!("drivers/i3c/mipi-hci", smoke_mipi_hci_cmd_descriptor_encoding);
+    kernel_test_in!(
+        "drivers/i3c/mipi-hci",
+        smoke_mipi_hci_cmd_descriptor_encoding
+    );
 
     // ── parity7 function ──────────────────────────────────────────
     // Odd parity: the parity bit is chosen so the total number of
@@ -1506,10 +1531,7 @@ mod tests {
         //   IBI_DATA_LENGTH = 3 (bits [7:0])
         let addr = 0x42u32;
         let data_len = 3u32;
-        let status: u32 = IBI_STS
-            | IBI_LAST_STATUS
-            | (addr << IBI_TARGET_ADDR_SHIFT)
-            | data_len;
+        let status: u32 = IBI_STS | IBI_LAST_STATUS | (addr << IBI_TARGET_ADDR_SHIFT) | data_len;
 
         let (dec_addr, dec_len, is_last, is_error) = decode_ibi_status(status);
 
@@ -1587,7 +1609,9 @@ mod tests {
         // Write payload byte 0xBE at offset 4 (immediately after the status word).
         ibi_ring[4] = 0xBE;
 
-        let handler = Arc::new(TestHandler { recv: AtomicU8::new(0) });
+        let handler = Arc::new(TestHandler {
+            recv: AtomicU8::new(0),
+        });
 
         let mut handlers: Vec<IbiHandlerSlot> = Vec::new();
         handlers.push(IbiHandlerSlot {

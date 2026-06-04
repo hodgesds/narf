@@ -28,7 +28,9 @@ use core::task::Waker;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
-use narf_i3c::{registry, CccDest, CommonCommandCode, I3cBus, I3cDevice, I3cError, I3cOp, IbiHandler};
+use narf_i3c::{
+    registry, CccDest, CommonCommandCode, I3cBus, I3cDevice, I3cError, I3cOp, IbiHandler,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── NXP I3C Register Offsets ───────────────────────────────────────
@@ -336,12 +338,7 @@ impl I3cBus for NxpI3c {
     /// byte-by-byte to MWDATAB (LSB then MSB per word).
     ///
     /// I3C spec rev 1.1 §5.2.3; NXP i.MX 93 RM §I3C_MCTRL.
-    async fn hdr_ddr_write(
-        &self,
-        addr: u8,
-        _command: u8,
-        data: &[u16],
-    ) -> Result<(), I3cError> {
+    async fn hdr_ddr_write(&self, addr: u8, _command: u8, data: &[u16]) -> Result<(), I3cError> {
         self.flush_fifos();
         for &w in data {
             unsafe {
@@ -362,12 +359,7 @@ impl I3cBus for NxpI3c {
     ///
     /// Triggers DDR_MSG request with the read direction; then drains
     /// MRDATAB byte pairs into the output word slice.
-    async fn hdr_ddr_read(
-        &self,
-        addr: u8,
-        _command: u8,
-        data: &mut [u16],
-    ) -> Result<(), I3cError> {
+    async fn hdr_ddr_read(&self, addr: u8, _command: u8, data: &mut [u16]) -> Result<(), I3cError> {
         self.flush_fifos();
         unsafe {
             self.mmio.write32(

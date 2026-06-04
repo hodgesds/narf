@@ -42,14 +42,10 @@ use crate::{I2cBus, I2cError, I2cOp};
 
 const LPSS_I2C_HIDS: &[&str] = &[
     // Tiger Lake / Alder Lake / Raptor Lake
-    "INT34B7", "INT34BA", "INT34C5",
-    // Skylake / Kaby Lake era
-    "INT3446", "INT3447",
-    // Haswell / Broadwell
-    "INT33C2", "INT33C3", "INT3432", "INT3433",
-    // Lakefield / Jasper Lake
-    "INTC1009", "INTC1010",
-    // Older PCI-mode LPSS (Baytrail / Apollo Lake)
+    "INT34B7", "INT34BA", "INT34C5", // Skylake / Kaby Lake era
+    "INT3446", "INT3447", // Haswell / Broadwell
+    "INT33C2", "INT33C3", "INT3432", "INT3433", // Lakefield / Jasper Lake
+    "INTC1009", "INTC1010", // Older PCI-mode LPSS (Baytrail / Apollo Lake)
     "80860F41", "808622C1",
 ];
 
@@ -135,12 +131,7 @@ impl core::fmt::Debug for LpssI2c {
 }
 
 impl LpssI2c {
-    pub fn new(
-        name: String,
-        mmio_base: PhysAddr,
-        mmio_len: u64,
-        irq_vector: Option<u8>,
-    ) -> Self {
+    pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
         Self {
             name,
             mmio_base,
@@ -172,9 +163,15 @@ impl LpssI2c {
             // Un-gate LPSS core
             self.write32(LPSS_PRIV_RESETS, 0);
             self.write32(LPSS_PRIV_RESETS, 0x7); // FUNC | APB | IDMA
-            // Program Remap Address (64-bit)
-            self.write32(LPSS_PRIV_REMAP_ADDR, (self.mmio_base.raw() & 0xFFFFFFFF) as u32);
-            self.write32(LPSS_PRIV_REMAP_ADDR + 4, (self.mmio_base.raw() >> 32) as u32);
+                                                 // Program Remap Address (64-bit)
+            self.write32(
+                LPSS_PRIV_REMAP_ADDR,
+                (self.mmio_base.raw() & 0xFFFFFFFF) as u32,
+            );
+            self.write32(
+                LPSS_PRIV_REMAP_ADDR + 4,
+                (self.mmio_base.raw() >> 32) as u32,
+            );
         }
 
         let ct = unsafe { self.read32(IC_COMP_TYPE) };
@@ -390,12 +387,16 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                     mmio = Some((min as u64, length as u64));
                 }
             }
-            ResourceItem::AddressSpace32 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace32 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 if mmio.is_none() {
                     mmio = Some((min as u64, length as u64));
                 }
             }
-            ResourceItem::AddressSpace64 { kind, min, length, .. } if kind == 0 => {
+            ResourceItem::AddressSpace64 {
+                kind, min, length, ..
+            } if kind == 0 => {
                 if mmio.is_none() {
                     mmio = Some((min, length));
                 }
@@ -448,7 +449,9 @@ fn probe_one(path: &str) -> Option<()> {
         let _ = writeln!(
             narf_console::Writer,
             "  lpss-i2c: {} probe failed ({:?}) at {:#x}",
-            path, e, res.mmio_base
+            path,
+            e,
+            res.mmio_base
         );
         return None;
     }
@@ -456,7 +459,8 @@ fn probe_one(path: &str) -> Option<()> {
         let _ = writeln!(
             narf_console::Writer,
             "  lpss-i2c: {} enable failed ({:?})",
-            path, e
+            path,
+            e
         );
         return None;
     }
@@ -468,8 +472,12 @@ fn probe_one(path: &str) -> Option<()> {
         res.mmio_base,
         res.mmio_len,
         path,
-        res.gsi.map(|g| format!("{}", g)).unwrap_or_else(|| "?".into()),
-        irq_vec.map(|v| format!("{}", v)).unwrap_or_else(|| "polled".into()),
+        res.gsi
+            .map(|g| format!("{}", g))
+            .unwrap_or_else(|| "?".into()),
+        irq_vec
+            .map(|v| format!("{}", v))
+            .unwrap_or_else(|| "polled".into()),
     );
     let _ = registered;
     Some(())
@@ -510,10 +518,6 @@ pub fn recognised_hids() -> &'static [&'static str] {
 }
 
 #[doc(hidden)]
-pub fn __new_for_test(
-    name: String,
-    mmio_base: PhysAddr,
-    mmio_len: u64,
-) -> LpssI2c {
+pub fn __new_for_test(name: String, mmio_base: PhysAddr, mmio_len: u64) -> LpssI2c {
     LpssI2c::new(name, mmio_base, mmio_len, None)
 }

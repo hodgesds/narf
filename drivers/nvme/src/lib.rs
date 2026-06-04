@@ -998,11 +998,7 @@ impl Controller {
         // ── 3. Per-queue: vector + table entry + CQ + SQ ──────
         let mut vectors: Vec<u8> = Vec::with_capacity(granted as usize);
         let mut queues: Vec<Queue> = Vec::with_capacity(granted as usize);
-        let admin_stride = self
-            .admin
-            .as_ref()
-            .ok_or(NvmeError::NotReady)?
-            .db_stride;
+        let admin_stride = self.admin.as_ref().ok_or(NvmeError::NotReady)?.db_stride;
 
         // Program all MSI-X table entries up-front + flip the
         // global enable bit BEFORE issuing Create I/O CQ. QEMU's
@@ -1019,8 +1015,7 @@ impl Controller {
             // SAFETY: caller holds the BusDeviceCap; we own the
             // MSI-X table exclusively (no concurrent writer); the
             // table-slot index was alloc_block'd above.
-            let _ = unsafe { msix.program_vector(i, 0, v) }
-                .map_err(|_| NvmeError::Msix)?;
+            let _ = unsafe { msix.program_vector(i, 0, v) }.map_err(|_| NvmeError::Msix)?;
             vectors.push(v);
         }
         // ── 4. Flip the global MSI-X enable bit ──────────────
@@ -1107,8 +1102,7 @@ impl Controller {
         }
 
         // ── 5. Publish ────────────────────────────────────────
-        let mut locks: Vec<IrqSafeSpinLock<()>> =
-            Vec::with_capacity(queues.len());
+        let mut locks: Vec<IrqSafeSpinLock<()>> = Vec::with_capacity(queues.len());
         for _ in 0..queues.len() {
             locks.push(IrqSafeSpinLock::new(()));
         }
@@ -1275,8 +1269,10 @@ impl Controller {
             raw[i] = unsafe { core::ptr::read_volatile(base.add(i)) };
         }
         drop(buf);
-        admin::IdentifyNamespaceData::parse(&raw)
-            .ok_or(NvmeError::CommandFailed { cmd: 0x06, status: 0 })
+        admin::IdentifyNamespaceData::parse(&raw).ok_or(NvmeError::CommandFailed {
+            cmd: 0x06,
+            status: 0,
+        })
     }
 
     // ── Admin: Async Event Request (AER) ──────────────────────────────
@@ -1402,8 +1398,7 @@ impl Controller {
             let cid = admin.next_cid;
             admin.next_cid = admin.next_cid.wrapping_add(1);
             let mut sqe = Sqe::zero();
-            sqe.cdw0 = (AdminOpcode::AsyncEventRequest as u32)
-                | ((cid as u32) << 16);
+            sqe.cdw0 = (AdminOpcode::AsyncEventRequest as u32) | ((cid as u32) << 16);
             // SAFETY: admin queue is page-aligned; sq_tail bounded.
             unsafe {
                 write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
@@ -1522,8 +1517,8 @@ impl Controller {
             return Ok(0);
         }
         let al = buf.len() as u32;
-        let dma = alloc_coherent(buf.len(), DomainId::DRIVER_0)
-            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let dma =
+            alloc_coherent(buf.len(), DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         let sqe = build_security_sqe(
@@ -1562,8 +1557,7 @@ impl Controller {
     pub fn discover_opal(&mut self) -> Result<admin::OpalDiscovery, NvmeError> {
         const L0_DISC_BUF: usize = 512;
         let mut raw = alloc::vec![0u8; L0_DISC_BUF];
-        let n =
-            self.security_receive(admin::SECP_TCG_OPAL, admin::SPSP_L0_DISCOVERY, &mut raw)?;
+        let n = self.security_receive(admin::SECP_TCG_OPAL, admin::SPSP_L0_DISCOVERY, &mut raw)?;
         admin::OpalDiscovery::parse(&raw[..n]).ok_or(NvmeError::CommandFailed {
             cmd: admin::OPC_SECURITY_RECEIVE,
             status: 0,
@@ -1612,10 +1606,7 @@ impl Controller {
             return Err(NvmeError::NoIoQueue);
         }
         let qi = self.pick_queue();
-        let v = *self
-            .io_irq_vectors
-            .get(qi)
-            .ok_or(NvmeError::Msix)?;
+        let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
         let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         if n_blocks == 0 {
@@ -1725,10 +1716,7 @@ impl Controller {
         // its state). The vector is the per-queue MSI-X entry's
         // IDT vector so wakeups land on this CQ's task only.
         let qi = self.pick_queue();
-        let v = *self
-            .io_irq_vectors
-            .get(qi)
-            .ok_or(NvmeError::Msix)?;
+        let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
         if n_blocks == 0 {
             return Ok(());
         }
@@ -2478,11 +2466,7 @@ pub fn probe(
     // Register against the device PM registry. NVMe suspend stops
     // the controller via CC.EN=0 (admin + I/O queues quiesce);
     // resume re-enables CC.EN and waits for CSTS.RDY=1.
-    narf_power::device_pm::register_device_pm(
-        "nvme0",
-        nvme_suspend_handler,
-        nvme_resume_handler,
-    );
+    narf_power::device_pm::register_device_pm("nvme0", nvme_suspend_handler, nvme_resume_handler);
     Ok(())
 }
 

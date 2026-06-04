@@ -27,8 +27,8 @@ use crate::uart_8250::Uart8250;
 pub const LPSS_UART_HIDS: &[&str] = &[
     "INT33C4", "INT33C5", // Haswell / Broadwell
     "INT3434", "INT3435", // Broadwell
-    "INT344C", "INT344D", // Skylake+
-    "INTC1008",           // Lakefield
+    "INT344C", "INT344D",  // Skylake+
+    "INTC1008", // Lakefield
 ];
 
 // ── LPSS Private Registers ─────────────────────────────────────────
@@ -54,12 +54,7 @@ impl core::fmt::Debug for IntelLpssUart {
 }
 
 impl IntelLpssUart {
-    pub fn new(
-        name: String,
-        mmio_base: PhysAddr,
-        mmio_len: u64,
-        irq: Option<u8>,
-    ) -> Self {
+    pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq: Option<u8>) -> Self {
         // DesignWare UARTs on Intel PCH typically use 100MHz or 120MHz clock.
         // TGL/ADL use 100MHz.
         let uart = Uart8250::new_mmio(mmio_base, irq, 2, 100_000_000);
@@ -78,9 +73,15 @@ impl IntelLpssUart {
             // Un-gate LPSS core.
             narf_arch::mmio::write32(self.mmio_base.raw() + LPSS_PRIV_RESETS, 0);
             narf_arch::mmio::write32(self.mmio_base.raw() + LPSS_PRIV_RESETS, 0x7); // FUNC | APB | IDMA
-            // Program Remap Address.
-            narf_arch::mmio::write32(self.mmio_base.raw() + LPSS_PRIV_REMAP_ADDR, (self.mmio_base.raw() & 0xFFFFFFFF) as u32);
-            narf_arch::mmio::write32(self.mmio_base.raw() + LPSS_PRIV_REMAP_ADDR + 4, (self.mmio_base.raw() >> 32) as u32);
+                                                                                    // Program Remap Address.
+            narf_arch::mmio::write32(
+                self.mmio_base.raw() + LPSS_PRIV_REMAP_ADDR,
+                (self.mmio_base.raw() & 0xFFFFFFFF) as u32,
+            );
+            narf_arch::mmio::write32(
+                self.mmio_base.raw() + LPSS_PRIV_REMAP_ADDR + 4,
+                (self.mmio_base.raw() >> 32) as u32,
+            );
         }
 
         let mut u = self.uart.lock();
@@ -109,7 +110,7 @@ fn probe_one(path: &str) -> Option<()> {
     let items = narf_aml::prt_crs::evaluate_crs_for(path).ok()?;
     let mut mmio: Option<(u64, u64)> = None;
     let mut gsi: Option<u32> = None;
-    
+
     for item in items {
         match item {
             ResourceItem::Memory32Fixed { base, length, .. } if mmio.is_none() => {
@@ -126,22 +127,18 @@ fn probe_one(path: &str) -> Option<()> {
     }
 
     let (base, len) = mmio?;
-    
+
     // IRQ routing.
     let irq_vec = gsi.and_then(|g| try_route_gsi(g));
 
-    let drv = IntelLpssUart::new(
-        path.to_string(),
-        PhysAddr::new(base),
-        len,
-        irq_vec,
-    );
+    let drv = IntelLpssUart::new(path.to_string(), PhysAddr::new(base), len, irq_vec);
 
     if !drv.init(115_200) {
         let _ = writeln!(
             narf_console::Writer,
             "  lpss-uart: {} init failed at {:#x}",
-            path, base
+            path,
+            base
         );
         return None;
     }
@@ -150,10 +147,15 @@ fn probe_one(path: &str) -> Option<()> {
     let _ = writeln!(
         narf_console::Writer,
         "  lpss-uart: detected at MMIO={:#x}+{:#x} {} irq={} {:?}",
-        base, len, path, irq_vec.map(|v| v.to_string()).unwrap_or_else(|| "polled".into()),
+        base,
+        len,
+        path,
+        irq_vec
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "polled".into()),
         utype
     );
-    
+
     // Register in global registry.
     // Leak the path string for the static registry.
     let static_name: &'static str = Box::leak(path.to_string().into_boxed_str());
@@ -172,7 +174,14 @@ fn try_route_gsi(gsi: u32) -> Option<u8> {
     {
         let v = narf_interrupts::vector::alloc().ok()?;
         // Default: Active High, Level Triggered for PCH devices.
-        if unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, narf_acpi::ioapic::POLARITY_HIGH | narf_acpi::ioapic::TRIGGER_LEVEL) } {
+        if unsafe {
+            narf_acpi::ioapic::route_gsi_to_vector(
+                gsi,
+                v,
+                0,
+                narf_acpi::ioapic::POLARITY_HIGH | narf_acpi::ioapic::TRIGGER_LEVEL,
+            )
+        } {
             narf_interrupts::install_handler(v, || {});
             Some(v)
         } else {

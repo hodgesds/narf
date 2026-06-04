@@ -329,10 +329,7 @@ pub fn read_capabilities<M: PspMmio>(mmio: &mut M) -> Result<PspCapabilities, Ps
 ///
 /// Returns `Err(Timeout)` if RESP is not seen within `PSP_POLL_BUDGET`
 /// iterations. Returns `Err(Recovery)` if the RECOVERY bit is set.
-fn poll_cmdresp<M: PspMmio>(
-    mmio: &mut M,
-    cmdresp_off: u32,
-) -> Result<u32, PspError> {
+fn poll_cmdresp<M: PspMmio>(mmio: &mut M, cmdresp_off: u32) -> Result<u32, PspError> {
     for _ in 0..PSP_POLL_BUDGET {
         let v = mmio.read(cmdresp_off);
         if v & PSP_CMDRESP_RECOVERY != 0 {
@@ -526,10 +523,7 @@ pub fn tee_channel_open<M: PspMmio>(
 ///
 /// Sends `PSP_CMD_TEE_RING_DESTROY` with no command buffer. The caller
 /// must free the ring-buffer memory after this returns.
-pub fn tee_channel_destroy<M: PspMmio>(
-    mmio: &mut M,
-    channel: TeeChannel,
-) -> Result<(), PspError> {
+pub fn tee_channel_destroy<M: PspMmio>(mmio: &mut M, channel: TeeChannel) -> Result<(), PspError> {
     mailbox_command(mmio, channel.variant, PSP_CMD_TEE_RING_DESTROY, None)?;
     Ok(())
 }
@@ -812,8 +806,14 @@ fn smoke_psp_fake_mmio_ring_init_round_trip() -> TestResult {
     }
 
     // Verify cmdbuff lo/hi were written correctly.
-    let lo_write = mock.writes.iter().find(|&&(off, _)| off == variant.cmdbuff_lo());
-    let hi_write = mock.writes.iter().find(|&&(off, _)| off == variant.cmdbuff_hi());
+    let lo_write = mock
+        .writes
+        .iter()
+        .find(|&&(off, _)| off == variant.cmdbuff_lo());
+    let hi_write = mock
+        .writes
+        .iter()
+        .find(|&&(off, _)| off == variant.cmdbuff_hi());
     match lo_write {
         None => return TestResult::Fail("cmdbuff_lo not written"),
         Some(&(_, v)) => {
@@ -832,7 +832,10 @@ fn smoke_psp_fake_mmio_ring_init_round_trip() -> TestResult {
     }
 
     // Verify the trigger word placed the correct CMD id in bits[23:16].
-    let trigger_write = mock.writes.iter().find(|&&(off, _)| off == variant.cmdresp_reg());
+    let trigger_write = mock
+        .writes
+        .iter()
+        .find(|&&(off, _)| off == variant.cmdresp_reg());
     match trigger_write {
         None => return TestResult::Fail("trigger not written to CMDRESP"),
         Some(&(_, v)) => {

@@ -110,19 +110,19 @@ const LPSS_PRIV_CLOCK_GATE: u64 = LPSS_PRIV_OFFSET + 0x38;
 const LPSS_CS_CONTROL: u64 = LPSS_PRIV_OFFSET + 0x18;
 
 // ── SSCR0 bit definitions ──────────────────────────────────────────
-const SSCR0_SSE: u32 = 1 << 7;         // SSP enable
+const SSCR0_SSE: u32 = 1 << 7; // SSP enable
 const SSCR0_FRF_SPI: u32 = 0b00 << 4; // Motorola SPI frame format
-const SSCR0_DSS_8BIT: u32 = 0b0111;   // Data size select: 8 bits
-const SSCR0_SCR_MASK: u32 = 0xFF00;    // Serial Clock Rate
+const SSCR0_DSS_8BIT: u32 = 0b0111; // Data size select: 8 bits
+const SSCR0_SCR_MASK: u32 = 0xFF00; // Serial Clock Rate
 
 // ── SSCR1 bit definitions ──────────────────────────────────────────
 const SSCR1_SPO: u32 = 1 << 3; // Clock polarity
 const SSCR1_SPH: u32 = 1 << 4; // Clock phase (CPHA)
 
 // ── SSSR bit definitions ───────────────────────────────────────────
-const SSSR_TNF: u32 = 1 << 2;  // TX FIFO not full
-const SSSR_RNE: u32 = 1 << 3;  // RX FIFO not empty
-const SSSR_BSY: u32 = 1 << 4;  // SSP busy
+const SSSR_TNF: u32 = 1 << 2; // TX FIFO not full
+const SSSR_RNE: u32 = 1 << 3; // RX FIFO not empty
+const SSSR_BSY: u32 = 1 << 4; // SSP busy
 
 // ── CS_CONTROL bit definitions ─────────────────────────────────────
 const CS_CONTROL_STATE: u32 = 1 << 0;
@@ -307,12 +307,10 @@ impl SpiBus for IntelLpssSpi {
             return Err(SpiError::InvalidCs);
         }
         self.cs.store(cs as u32, Ordering::Relaxed);
-        
+
         // Apply to LPSS private CS control
         if self.mmio_len > LPSS_CS_CONTROL {
-            let val = CS_CONTROL_MODE_SW 
-                | ((cs as u32) << CS_CONTROL_SEL_SHIFT)
-                | CS_CONTROL_STATE; // De-asserted (active-low default)
+            let val = CS_CONTROL_MODE_SW | ((cs as u32) << CS_CONTROL_SEL_SHIFT) | CS_CONTROL_STATE; // De-asserted (active-low default)
             unsafe { self.write32(LPSS_CS_CONTROL, val) };
         }
         Ok(())
@@ -333,7 +331,8 @@ pub fn probe_all() -> usize {
             let _ = writeln!(
                 narf_console::Writer,
                 "  intel-lpss-spi: probing {} (HID={})",
-                node.path, hid
+                node.path,
+                hid
             );
             if let Some(()) = probe_one(&node.path) {
                 count += 1;
@@ -384,7 +383,9 @@ fn probe_one(path: &str) -> Option<()> {
     let _ = writeln!(
         narf_console::Writer,
         "  intel-lpss-spi: {} registered mmio={:#x}+{:#x}",
-        path, base, len
+        path,
+        base,
+        len
     );
     Some(())
 }

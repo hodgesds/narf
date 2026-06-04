@@ -5,8 +5,8 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::uart_8250::{self, UartBase, UART_CLOCK_HZ};
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── Register layout ───────────────────────────────────────────────────
 

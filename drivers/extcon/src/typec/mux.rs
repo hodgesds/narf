@@ -59,7 +59,10 @@ impl MuxSetting {
     /// USB-only setting for the given orientation (both SS pairs to
     /// USB3).
     pub fn from_orientation(orient: Orientation) -> Self {
-        Self { orientation: orient, ss: SsRouting::Usb3 }
+        Self {
+            orientation: orient,
+            ss: SsRouting::Usb3,
+        }
     }
 
     /// DP Alt Mode setting.  Derives `SsRouting` from the pin
@@ -72,17 +75,26 @@ impl MuxSetting {
         } else {
             SsRouting::Dp2Lane
         };
-        Self { orientation: orient, ss }
+        Self {
+            orientation: orient,
+            ss,
+        }
     }
 
     /// Thunderbolt Alt Mode setting.
     pub fn thunderbolt(orient: Orientation) -> Self {
-        Self { orientation: orient, ss: SsRouting::Thunderbolt }
+        Self {
+            orientation: orient,
+            ss: SsRouting::Thunderbolt,
+        }
     }
 
     /// Disconnected state.
     pub fn none() -> Self {
-        Self { orientation: Orientation::Unknown, ss: SsRouting::None }
+        Self {
+            orientation: Orientation::Unknown,
+            ss: SsRouting::None,
+        }
     }
 }
 

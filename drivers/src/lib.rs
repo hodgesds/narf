@@ -93,7 +93,11 @@ pub enum ReclaimToken {
     IdtVector(u8),
     /// VA range returned by `claim_mmio_in_domain`. Released
     /// immediately — the page tables come down synchronously.
-    MmioRange { domain: u8, va_base: u64, len: usize },
+    MmioRange {
+        domain: u8,
+        va_base: u64,
+        len: usize,
+    },
     /// Object-table slot of a `Cap<DmaBuffer, _>` previously minted
     /// via `narf_io::register_with_cap`. The matching backing buffer
     /// is dropped via `narf_io::unregister_by_index`.
@@ -519,10 +523,7 @@ impl DriverRegistry {
     pub fn unbind_named(&self, name: &str) -> Result<(), ()> {
         let (handle_to_revoke, reclaim_tokens) = {
             let mut q = self.inner.lock();
-            let pos = q
-                .iter()
-                .position(|r| r.manifest.name == name)
-                .ok_or(())?;
+            let pos = q.iter().position(|r| r.manifest.name == name).ok_or(())?;
             let entry = &mut q[pos];
             match entry.phase {
                 DriverPhase::Loaded | DriverPhase::Quiesced => {}
@@ -559,7 +560,11 @@ impl DriverRegistry {
                     narf_interrupts::dispatch::clear_all_wakers(v);
                     quarantine_new.push(v);
                 }
-                ReclaimToken::MmioRange { domain, va_base, len } => {
+                ReclaimToken::MmioRange {
+                    domain,
+                    va_base,
+                    len,
+                } => {
                     // SAFETY: the driver registered the same range
                     // via claim_mmio_in_domain; the ownership chain
                     // is the registration itself.
@@ -598,10 +603,7 @@ impl DriverRegistry {
     /// `true` iff a driver with this `name` is currently registered.
     /// After `unbind_named` succeeds this returns `false`.
     pub fn is_registered(&self, name: &str) -> bool {
-        self.inner
-            .lock()
-            .iter()
-            .any(|r| r.manifest.name == name)
+        self.inner.lock().iter().any(|r| r.manifest.name == name)
     }
 
     /// Read-only accessor: run `f` against the named driver's phase +

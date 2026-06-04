@@ -44,7 +44,12 @@ impl GenericFb {
         // hid the bug.
         // SAFETY: caller assertion.
         unsafe {
-            Framebuffer::new(self.addr as *mut u32, self.width, self.height, self.stride())
+            Framebuffer::new(
+                self.addr as *mut u32,
+                self.width,
+                self.height,
+                self.stride(),
+            )
         }
     }
 }

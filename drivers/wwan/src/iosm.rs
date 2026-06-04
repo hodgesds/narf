@@ -52,7 +52,7 @@ pub struct PciDeviceId {
     pub vendor: u16,
     pub device: u16,
     /// Human-readable chip name, for log messages.
-    pub name:   &'static str,
+    pub name: &'static str,
 }
 
 /// IOSM PCI device-ID table.
@@ -65,12 +65,12 @@ pub static IOSM_PCI_DEVICES: &[PciDeviceId] = &[
     PciDeviceId {
         vendor: PCI_VENDOR_INTEL,
         device: INTEL_CP_DEVICE_7560_ID,
-        name:   "Intel XMM 7560",
+        name: "Intel XMM 7560",
     },
     PciDeviceId {
         vendor: PCI_VENDOR_INTEL,
         device: INTEL_CP_DEVICE_7360_ID,
-        name:   "Intel XMM 7360",
+        name: "Intel XMM 7360",
     },
 ];
 
@@ -117,17 +117,17 @@ pub const IPC_CAPTURE_PTR_REG_0: u32 = 1 << 3;
 #[repr(u32)]
 pub enum IpcPhase {
     /// Power-on / reset; scratchpad not yet valid.
-    Off          = 0x00,
+    Off = 0x00,
     /// ROM bootloader active; waiting for firmware download.
-    Rom          = 0x01,
+    Rom = 0x01,
     /// Firmware is loaded and initialising.
-    Boot         = 0x02,
+    Boot = 0x02,
     /// Modem is fully operational.
-    Run          = 0x10,
+    Run = 0x10,
     /// Modem has entered a crash state; coredump available.
-    Crash        = 0x11,
+    Crash = 0x11,
     /// Unrecognised phase value.
-    Unknown      = 0xFF,
+    Unknown = 0xFF,
 }
 
 impl IpcPhase {
@@ -139,7 +139,7 @@ impl IpcPhase {
             0x02 => Self::Boot,
             0x10 => Self::Run,
             0x11 => Self::Crash,
-            _    => Self::Unknown,
+            _ => Self::Unknown,
         }
     }
 }
