@@ -373,8 +373,22 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     if (frame.cs & 3) == 3 {
         if let Some(hook) = narf_userspace::sync_signal_hook() {
             let vector = frame.vector;
+            // Wave-58: forward the faulting address. #PF → CR2;
+            // RIP-flavoured vectors (#UD/#DE/#OF/#BP/#AC/#GP) → trapping RIP.
+            let addr = if vector == 14 {
+                let cr2: u64;
+                // SAFETY: reading CR2 at CPL=0 is always defined.
+                unsafe {
+                    core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
+                        options(nostack, preserves_flags));
+                }
+                cr2
+            } else {
+                frame.rip
+            };
+            let info = narf_userspace::SyncFaultInfo { addr };
             let mut ctx = X86TrapContext::from_int80(frame);
-            if hook(&mut ctx, vector) {
+            if hook(&mut ctx, vector, info) {
                 return;
             }
         }
