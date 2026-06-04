@@ -119,10 +119,8 @@ pub struct TypeVIITiming {
 
 impl TypeVIITiming {
     pub fn parse(buf: &[u8; 20]) -> Self {
-        let pixel_clock_khz = ((buf[0] as u32)
-            | ((buf[1] as u32) << 8)
-            | ((buf[2] as u32) << 16))
-            + 1;
+        let pixel_clock_khz =
+            ((buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16)) + 1;
         let flags = buf[3];
         let interlaced = (flags & 0x10) != 0;
         let h_active = u16::from_le_bytes([buf[4], buf[5]]) as u32 + 1;

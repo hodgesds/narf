@@ -382,7 +382,10 @@ fn smoke_cec_header_byte_packs_initiator_and_destination() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("edid/cec", smoke_cec_header_byte_packs_initiator_and_destination);
+kernel_test_in!(
+    "edid/cec",
+    smoke_cec_header_byte_packs_initiator_and_destination
+);
 
 fn smoke_cec_polling_message_is_header_only() -> TestResult {
     use crate::cec::Frame;
@@ -403,7 +406,7 @@ fn smoke_cec_polling_message_is_header_only() -> TestResult {
 kernel_test_in!("edid/cec", smoke_cec_polling_message_is_header_only);
 
 fn smoke_cec_active_source_carries_phys_addr_be() -> TestResult {
-    use crate::cec::{active_source, Frame, OPCODE_ACTIVE_SOURCE, CEC_BROADCAST};
+    use crate::cec::{active_source, Frame, CEC_BROADCAST, OPCODE_ACTIVE_SOURCE};
     let f = active_source(4, 0x1234);
     let bytes = f.encode();
     // header (0x4F) | opcode (0x82) | phys hi | phys lo
@@ -458,7 +461,7 @@ fn smoke_cec_feature_abort_layout() -> TestResult {
 kernel_test_in!("edid/cec", smoke_cec_feature_abort_layout);
 
 fn smoke_cec_report_physical_address_layout() -> TestResult {
-    use crate::cec::{report_physical_address, OPCODE_REPORT_PHYSICAL_ADDRESS, CEC_BROADCAST};
+    use crate::cec::{report_physical_address, CEC_BROADCAST, OPCODE_REPORT_PHYSICAL_ADDRESS};
     let f = report_physical_address(4, 0x2000, 4);
     let bytes = f.encode();
     if (bytes[0] & 0x0F) != CEC_BROADCAST {

@@ -188,9 +188,15 @@ pub enum DataBlock {
     Vendor(VendorBlock),
     Speaker(SpeakerAllocation),
     /// Extended tag — first payload byte is the extended tag code.
-    Extended { ext_tag: u8, payload: Vec<u8> },
+    Extended {
+        ext_tag: u8,
+        payload: Vec<u8>,
+    },
     /// Anything we didn't decode.
-    Unknown { tag: u8, payload: Vec<u8> },
+    Unknown {
+        tag: u8,
+        payload: Vec<u8>,
+    },
 }
 
 /// One CTA-861 extension block, decoded.
@@ -321,4 +327,3 @@ impl CtaExtension {
         None
     }
 }
-

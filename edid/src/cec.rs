@@ -315,8 +315,12 @@ pub fn active_source(initiator: u8, phys_addr: u16) -> Frame {
 
 /// `<Routing Change>` — broadcast: original phys addr → new phys addr.
 pub fn routing_change(initiator: u8, original: u16, new: u16) -> Frame {
-    Frame::new(initiator, CEC_BROADCAST, OPCODE_ROUTING_CHANGE)
-        .with_operands(&[(original >> 8) as u8, original as u8, (new >> 8) as u8, new as u8])
+    Frame::new(initiator, CEC_BROADCAST, OPCODE_ROUTING_CHANGE).with_operands(&[
+        (original >> 8) as u8,
+        original as u8,
+        (new >> 8) as u8,
+        new as u8,
+    ])
 }
 
 /// `<Report Physical Address>` — broadcast our phys addr + device type.
@@ -360,5 +364,6 @@ pub fn report_power_status(initiator: u8, destination: u8, status: u8) -> Frame 
 /// (§CEC 13.3, reason values: 0=Unrecognised, 1=Not in correct mode,
 /// 2=Cannot provide source, 3=Invalid operand, 4=Refused).
 pub fn feature_abort(initiator: u8, destination: u8, rejected_opcode: u8, reason: u8) -> Frame {
-    Frame::new(initiator, destination, OPCODE_FEATURE_ABORT).with_operands(&[rejected_opcode, reason])
+    Frame::new(initiator, destination, OPCODE_FEATURE_ABORT)
+        .with_operands(&[rejected_opcode, reason])
 }
