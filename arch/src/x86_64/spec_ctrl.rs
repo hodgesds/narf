@@ -153,9 +153,9 @@ pub unsafe fn ibpb() {
     if !features().ibrs {
         return;
     } // IBPB shares the IBRS CPUID bit.
-    // wrmsr_or_gp: IBPB on some AMD parts is microcode-gated
-    // even when CPUID advertises it. Failure means no barrier
-    // is issued — best-effort.
+      // wrmsr_or_gp: IBPB on some AMD parts is microcode-gated
+      // even when CPUID advertises it. Failure means no barrier
+      // is issued — best-effort.
     let _ = wrmsr_or_gp(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
 }
 

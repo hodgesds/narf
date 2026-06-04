@@ -386,7 +386,7 @@ pub fn detect() -> Option<PmuBackend> {
     // "HygonGenuine" EBX = 0x6F67_7948 — treat as AMD-compatible
     let _ = vendor_edx;
     const INTEL_EBX: u32 = 0x756E_6547; // "Genu"
-    const AMD_EBX: u32 = 0x6874_7541;   // "Auth"
+    const AMD_EBX: u32 = 0x6874_7541; // "Auth"
     const HYGON_EBX: u32 = 0x6F67_7948; // "Hygo"
 
     if vendor_ebx == INTEL_EBX {
@@ -495,7 +495,11 @@ pub unsafe fn alloc_counter(event: PmuEvent) -> Result<PmuCounter, PmuError> {
     // SAFETY: caller-asserted CPL=0; idx < n_counters verified above.
     unsafe { program_counter(idx, sel, backend.vendor) };
 
-    Ok(PmuCounter { idx, event, vendor: backend.vendor })
+    Ok(PmuCounter {
+        idx,
+        event,
+        vendor: backend.vendor,
+    })
 }
 
 /// Read the current 64-bit value of a live counter.
@@ -538,31 +542,17 @@ pub unsafe fn release(counter: PmuCounter) {
 fn event_to_evtsel(event: PmuEvent, vendor: PmuVendor) -> Result<PerfEvtSel, PmuError> {
     Ok(match (event, vendor) {
         // Intel architectural events (SDM Table 20-1).
-        (PmuEvent::Cycles, PmuVendor::Intel) => {
-            arch_event::unhalted_core_cycles(true, true)
-        }
-        (PmuEvent::Instructions, PmuVendor::Intel) => {
-            arch_event::instructions_retired(true, true)
-        }
-        (PmuEvent::BranchInstructions, PmuVendor::Intel) => {
-            arch_event::branch_retired(true, true)
-        }
+        (PmuEvent::Cycles, PmuVendor::Intel) => arch_event::unhalted_core_cycles(true, true),
+        (PmuEvent::Instructions, PmuVendor::Intel) => arch_event::instructions_retired(true, true),
+        (PmuEvent::BranchInstructions, PmuVendor::Intel) => arch_event::branch_retired(true, true),
         (PmuEvent::BranchMisses, PmuVendor::Intel) => {
             arch_event::branch_mispredict_retired(true, true)
         }
-        (PmuEvent::CacheMisses, PmuVendor::Intel) => {
-            arch_event::llc_reference(true, true)
-        }
-        (PmuEvent::LlcMisses, PmuVendor::Intel) => {
-            arch_event::llc_miss(true, true)
-        }
+        (PmuEvent::CacheMisses, PmuVendor::Intel) => arch_event::llc_reference(true, true),
+        (PmuEvent::LlcMisses, PmuVendor::Intel) => arch_event::llc_miss(true, true),
         // AMD F17h/F19h events (amd/core.c amd_f17h_perfmon_event_map).
-        (PmuEvent::Cycles, PmuVendor::Amd) => {
-            amd_event::cycles(true, true)
-        }
-        (PmuEvent::Instructions, PmuVendor::Amd) => {
-            amd_event::instructions_retired(true, true)
-        }
+        (PmuEvent::Cycles, PmuVendor::Amd) => amd_event::cycles(true, true),
+        (PmuEvent::Instructions, PmuVendor::Amd) => amd_event::instructions_retired(true, true),
         (PmuEvent::BranchInstructions, PmuVendor::Amd) => {
             // AMD: Retired Branch Instructions — event 0x0C2, umask 0x00.
             // AMD PPR Renoir §2.1.13.
@@ -572,9 +562,7 @@ fn event_to_evtsel(event: PmuEvent, vendor: PmuVendor) -> Result<PerfEvtSel, Pmu
             // AMD: Retired Mispredicted Branch Instructions — 0x0C3 umask 0.
             PerfEvtSel::os_usr_raw(0xC3, 0x00, true, true)
         }
-        (PmuEvent::CacheMisses, PmuVendor::Amd) => {
-            amd_event::l1d_cache_misses(true, true)
-        }
+        (PmuEvent::CacheMisses, PmuVendor::Amd) => amd_event::l1d_cache_misses(true, true),
         (PmuEvent::LlcMisses, PmuVendor::Amd) => {
             // AMD: LLC misses — use l2 miss (event 0x064, umask 0x08 for
             // modified-miss on F17h per AMD Fam17h PPR §2.1.13).

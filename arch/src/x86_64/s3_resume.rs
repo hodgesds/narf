@@ -167,16 +167,14 @@ pub fn captured_context() -> Option<ResumeContext> {
 /// `save_resume_context` so the asm can use RIP-relative lea + add
 /// to find it without needing a long-mode `mov rip-imm32`.
 #[cfg(target_arch = "x86_64")]
-static RESUME_CONTEXT_PHYS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static RESUME_CONTEXT_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Post-wake hook to fan out device resume. Registered by
 /// `narf_power` at boot via [`set_resume_hook`] so this module
 /// stays dependency-free (power → arch, not the other way).
 /// Held as a raw `usize` for atomic storage; transmuted back to
 /// a function pointer at call time.
-static RESUME_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static RESUME_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Register the function the wake continuation calls to run device
 /// resume fan-out. Power crate calls this from `register_initcalls`.
@@ -238,10 +236,7 @@ pub unsafe extern "C" fn s3_wake_continuation() -> ! {
     // setjmp call; its saved frame is still live because the
     // suspending thread never returned.
     unsafe {
-        crate::x86_64::setjmp::longjmp(
-            &*S3_CALLER_JMP.lock() as *const _,
-            S3_RESUMED_SENTINEL,
-        )
+        crate::x86_64::setjmp::longjmp(&*S3_CALLER_JMP.lock() as *const _, S3_RESUMED_SENTINEL)
     }
 }
 

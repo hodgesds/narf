@@ -216,10 +216,10 @@ pub unsafe fn set_variable(
     let mask_bits = !(size_bytes - 1) & addr_mask;
     let physbase = (phys & addr_mask) | (mem_type as u64);
     let physmask = mask_bits | (1 << 11); // V (valid) bit 11.
-    // Use the probe-armed wrappers so a firmware-locked MTRR or
-    // a reserved-bit reject becomes a typed error instead of a
-    // kernel-fatal #GP — early-FB-console install path treats
-    // this as best-effort (no WC just means slow scroll).
+                                          // Use the probe-armed wrappers so a firmware-locked MTRR or
+                                          // a reserved-bit reject becomes a typed error instead of a
+                                          // kernel-fatal #GP — early-FB-console install path treats
+                                          // this as best-effort (no WC just means slow scroll).
     if wrmsr_or_gp(MSR_PHYSBASE_BASE + 2 * idx as u32, physbase).is_err() {
         return Err(());
     }

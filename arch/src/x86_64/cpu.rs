@@ -38,8 +38,7 @@ pub const MAX_CPUS: usize = 64;
 /// correct for the BSP).
 ///
 /// 0 = unknown (probe needed), 1 = no RDTSCP, 2 = has RDTSCP.
-static RDTSCP_STATE: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
+static RDTSCP_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 #[inline(never)]
 fn probe_rdtscp() -> bool {

@@ -290,7 +290,10 @@ fn smoke_microcode_intel_header_reject_bad_version() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_bad_version);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_intel_header_reject_bad_version
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_intel_header_reject_bad_checksum() -> TestResult {
@@ -300,8 +303,8 @@ fn smoke_microcode_intel_header_reject_bad_checksum() -> TestResult {
     let mut blob = [0u8; 2048];
     blob[0] = 1; // header_version
     blob[20] = 1; // loader_revision
-    // Stuff a non-zero dword somewhere to guarantee the sum is
-    // non-zero regardless of platform.
+                  // Stuff a non-zero dword somewhere to guarantee the sum is
+                  // non-zero regardless of platform.
     blob[36] = 0xDE;
     blob[37] = 0xAD;
     blob[38] = 0xBE;
@@ -316,7 +319,10 @@ fn smoke_microcode_intel_header_reject_bad_checksum() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_bad_checksum);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_intel_header_reject_bad_checksum
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_intel_header_reject_unaligned_total() -> TestResult {
@@ -324,7 +330,7 @@ fn smoke_microcode_intel_header_reject_unaligned_total() -> TestResult {
     let mut blob = [0u8; 2048];
     blob[0] = 1; // header_version
     blob[20] = 1; // loader_revision
-    // total_size not a multiple of 4 → reject.
+                  // total_size not a multiple of 4 → reject.
     blob[32..36].copy_from_slice(&123u32.to_le_bytes());
     let h = match IntelUcodeHeader::decode(&blob) {
         Some(h) => h,
@@ -336,7 +342,10 @@ fn smoke_microcode_intel_header_reject_unaligned_total() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_intel_header_reject_unaligned_total);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_intel_header_reject_unaligned_total
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_fms_decode_renoir_phoenix() -> TestResult {
@@ -409,9 +418,8 @@ kernel_test_in!("arch/microcode", smoke_microcode_amd_family_tag);
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_amd_container_decode() -> TestResult {
     use crate::x86_64::microcode::{
-        amd_find_equiv, amd_find_patch, AmdContainerHeader, AMD_CONTAINER_MAGIC,
-        AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN, AMD_PATCH_SECTION_HDR_LEN,
-        AMD_PATCH_SECTION_TYPE,
+        amd_find_equiv, amd_find_patch, AmdContainerHeader, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE,
+        AMD_PATCH_HDR_LEN, AMD_PATCH_SECTION_HDR_LEN, AMD_PATCH_SECTION_TYPE,
     };
     // Build a minimal AMD container with one equiv entry pointing
     // to one patch section.
@@ -430,9 +438,9 @@ fn smoke_microcode_amd_container_decode() -> TestResult {
     blob[8..12].copy_from_slice(&32u32.to_le_bytes());
     // Equiv entry #1.
     blob[12..16].copy_from_slice(&0x0086_0F01u32.to_le_bytes()); // installed_cpu (Renoir)
-    blob[24..26].copy_from_slice(&0x8310u16.to_le_bytes());      // equiv_cpu
-    // Equiv entry #2 = all-zero terminator (already zero).
-    // Patch section header.
+    blob[24..26].copy_from_slice(&0x8310u16.to_le_bytes()); // equiv_cpu
+                                                            // Equiv entry #2 = all-zero terminator (already zero).
+                                                            // Patch section header.
     blob[44..48].copy_from_slice(&AMD_PATCH_SECTION_TYPE.to_le_bytes());
     blob[48..52].copy_from_slice(&(AMD_PATCH_HDR_LEN as u32).to_le_bytes());
     // Patch header: processor_rev_id at offset 24..26.
@@ -508,7 +516,10 @@ fn smoke_microcode_cpu_signature_matches_ident() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_cpu_signature_matches_ident);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_cpu_signature_matches_ident
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_blob_filename_for_current_cpu() -> TestResult {
@@ -544,7 +555,10 @@ fn smoke_microcode_blob_filename_for_current_cpu() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_blob_filename_for_current_cpu);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_blob_filename_for_current_cpu
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_blob_filename_buffer_too_small() -> TestResult {
@@ -557,7 +571,10 @@ fn smoke_microcode_blob_filename_buffer_too_small() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_blob_filename_buffer_too_small);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_blob_filename_buffer_too_small
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_resolve_rejects_short_blob() -> TestResult {
@@ -578,8 +595,7 @@ kernel_test_in!("arch/microcode", smoke_microcode_resolve_rejects_short_blob);
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_amd_resolve_picks_patch() -> TestResult {
     use crate::x86_64::microcode::{
-        self, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN,
-        AMD_PATCH_SECTION_TYPE,
+        self, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN, AMD_PATCH_SECTION_TYPE,
     };
     // Only meaningful on AMD hosts; skip on Intel.
     if microcode::vendor() != microcode::Vendor::Amd {
@@ -592,7 +608,7 @@ fn smoke_microcode_amd_resolve_picks_patch() -> TestResult {
     blob[8..12].copy_from_slice(&32u32.to_le_bytes());
     blob[12..16].copy_from_slice(&sig.to_le_bytes()); // installed_cpu = running CPU
     blob[24..26].copy_from_slice(&0x4242u16.to_le_bytes()); // equiv_cpu
-    // (entry #2 = all-zero terminator)
+                                                            // (entry #2 = all-zero terminator)
     blob[44..48].copy_from_slice(&AMD_PATCH_SECTION_TYPE.to_le_bytes());
     blob[48..52].copy_from_slice(&(AMD_PATCH_HDR_LEN as u32).to_le_bytes());
     blob[52 + 24..52 + 26].copy_from_slice(&0x4242u16.to_le_bytes());
@@ -613,8 +629,8 @@ kernel_test_in!("arch/microcode", smoke_microcode_amd_resolve_picks_patch);
 #[cfg(target_arch = "x86_64")]
 fn smoke_microcode_amd_resolve_misses_wrong_cpu() -> TestResult {
     use crate::x86_64::microcode::{
-        self, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN,
-        AMD_PATCH_SECTION_TYPE, UcodeError,
+        self, UcodeError, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE, AMD_PATCH_HDR_LEN,
+        AMD_PATCH_SECTION_TYPE,
     };
     if microcode::vendor() != microcode::Vendor::Amd {
         return TestResult::Skip("AMD-only");
@@ -636,7 +652,10 @@ fn smoke_microcode_amd_resolve_misses_wrong_cpu() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/microcode", smoke_microcode_amd_resolve_misses_wrong_cpu);
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_amd_resolve_misses_wrong_cpu
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_errata_table_has_patched_in_field() -> TestResult {
@@ -671,7 +690,10 @@ fn smoke_errata_entries_matching_current_cpu_runs() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/errata", smoke_errata_entries_matching_current_cpu_runs);
+kernel_test_in!(
+    "arch/errata",
+    smoke_errata_entries_matching_current_cpu_runs
+);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_psci_version() -> TestResult {
@@ -1968,9 +1990,17 @@ kernel_test_in!("arch", smoke_aarch64_mpidr_aff_present);
 fn smoke_arch_x86_features_default_is_all_false() -> TestResult {
     use crate::x86_64::Features;
     let d = Features::default();
-    if d.nx || d.pku || d.pks || d.uipi || d.invariant_tsc
-        || d.rdseed || d.rdrand || d.x2apic || d.apic
-        || d.tsc_deadline || d.arat
+    if d.nx
+        || d.pku
+        || d.pks
+        || d.uipi
+        || d.invariant_tsc
+        || d.rdseed
+        || d.rdrand
+        || d.x2apic
+        || d.apic
+        || d.tsc_deadline
+        || d.arat
     {
         return TestResult::Fail("Features::default() should be all-false");
     }
@@ -2032,7 +2062,12 @@ kernel_test_in!("arch", smoke_arch_topology_level_kind_distinct);
 #[cfg(target_arch = "x86_64")]
 fn smoke_arch_topology_cache_kind_distinct() -> TestResult {
     use crate::x86_64::topology::CacheKind;
-    let all = [CacheKind::Null, CacheKind::Data, CacheKind::Instr, CacheKind::Unified];
+    let all = [
+        CacheKind::Null,
+        CacheKind::Data,
+        CacheKind::Instr,
+        CacheKind::Unified,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -2076,7 +2111,9 @@ fn smoke_arch_topology_discover_self_consistent() -> TestResult {
     use crate::x86_64::topology;
     let t = topology::discover();
     if t.package_count == 0 {
-        return TestResult::Skip("topology::discover returned package_count=0 (CPUID leaf 1F/0B missing?)");
+        return TestResult::Skip(
+            "topology::discover returned package_count=0 (CPUID leaf 1F/0B missing?)",
+        );
     }
     if t.thread_count < t.core_count {
         return TestResult::Fail("thread_count < core_count");
@@ -2169,7 +2206,10 @@ fn smoke_arch_xsave_area_size_at_least_fxsave_minimum() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/xsave", smoke_arch_xsave_area_size_at_least_fxsave_minimum);
+kernel_test_in!(
+    "arch/xsave",
+    smoke_arch_xsave_area_size_at_least_fxsave_minimum
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_arch_xsave_xcr0_and_xss_disjoint() -> TestResult {
@@ -2415,9 +2455,7 @@ fn smoke_amd_pstate_is_zen2_gates_msr_path() -> TestResult {
     // CPPC MSR read on Intel would #GP. We can't observe absence
     // of an MSR access directly, but we can assert the documented
     // return-shape contract.
-    use crate::x86_64::amd_pstate::{
-        amd_pstate_request, is_zen2, read_caps, read_status,
-    };
+    use crate::x86_64::amd_pstate::{amd_pstate_request, is_zen2, read_caps, read_status};
     if !is_zen2() {
         if read_caps().is_some() {
             return TestResult::Fail("read_caps() returned Some on non-Zen2");
@@ -2459,7 +2497,11 @@ fn smoke_amd_pstate_boot_init_outcome_shape() -> TestResult {
         return TestResult::Skip("not AMD Family 0x17 Model 0x30..=0xAF");
     }
     match outcome {
-        BootInitOutcome::Programmed { caps, des_perf, epp } => {
+        BootInitOutcome::Programmed {
+            caps,
+            des_perf,
+            epp,
+        } => {
             // Sanity-check the field choice the driver makes.
             if des_perf != caps.nominal_perf {
                 return TestResult::Fail("des_perf must equal caps.nominal_perf");
@@ -2482,9 +2524,7 @@ fn smoke_amd_pstate_boot_init_outcome_shape() -> TestResult {
             // Skip so the test still runs on locked-down OEM units.
             TestResult::Skip("CPPC MSRs locked by firmware")
         }
-        BootInitOutcome::NotZen2 => {
-            TestResult::Fail("is_zen2() said true but boot_init disagreed")
-        }
+        BootInitOutcome::NotZen2 => TestResult::Fail("is_zen2() said true but boot_init disagreed"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -2543,9 +2583,7 @@ kernel_test_in!("arch", smoke_k10temp_decode_tdie_from_smn_raw);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_k10temp_read_tdie_drives_smn_index_write() -> TestResult {
-    use crate::x86_64::k10temp::{
-        read_tdie_millicelsius, MockSmn, SMN_ADDR_TEMP_REPORT,
-    };
+    use crate::x86_64::k10temp::{read_tdie_millicelsius, MockSmn, SMN_ADDR_TEMP_REPORT};
     // 70 °C → Tctl_raw = 560 → packed shift-21 = 0x4600_0000.
     let raw_70c: u32 = 560u32 << 21;
     let mut port = MockSmn::new(raw_70c);
@@ -2563,7 +2601,7 @@ kernel_test_in!("arch", smoke_k10temp_read_tdie_drives_smn_index_write);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_s3_resume_context_save_round_trip() -> TestResult {
-    use crate::x86_64::s3_resume::{captured_context, save_resume_context, __reset_for_test};
+    use crate::x86_64::s3_resume::{__reset_for_test, captured_context, save_resume_context};
     __reset_for_test();
     if captured_context().is_some() {
         return TestResult::Fail("fresh state must be uncaptured");
@@ -2672,9 +2710,7 @@ fn smoke_x86_64_hybrid_cpu_type_probe() -> TestResult {
     // can report any of the three (CpuType::Unknown is fine for an
     // unrecognised future type; we don't fail it).
     if !feats.hybrid && ty != CpuType::Unknown {
-        return TestResult::Fail(
-            "non-hybrid CPU reported non-Unknown type from leaf 0x1A",
-        );
+        return TestResult::Fail("non-hybrid CPU reported non-Unknown type from leaf 0x1A");
     }
     TestResult::Pass
 }
@@ -2686,8 +2722,8 @@ kernel_test_in!("arch/cpuid", smoke_x86_64_hybrid_cpu_type_probe);
 #[cfg(target_arch = "x86_64")]
 fn smoke_amd_vi_dte_identity_bit_positions() -> TestResult {
     use crate::x86_64::amd_vi::{
-        DeviceTableEntry, DTE_HOST_PT_MASK, DTE_IR, DTE_IW, DTE_MODE_4_LEVEL,
-        DTE_MODE_SHIFT, DTE_TV, DTE_V, PERM_READ, PERM_WRITE,
+        DeviceTableEntry, DTE_HOST_PT_MASK, DTE_IR, DTE_IW, DTE_MODE_4_LEVEL, DTE_MODE_SHIFT,
+        DTE_TV, DTE_V, PERM_READ, PERM_WRITE,
     };
     let pt_root: u64 = 0xDEAD_F000; // page-aligned
     let dte = DeviceTableEntry::identity(0x42, pt_root, PERM_READ | PERM_WRITE);
@@ -2802,13 +2838,16 @@ fn smoke_amd_vi_cmd_completion_wait_token_round_trip() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("arch/amd_vi", smoke_amd_vi_cmd_completion_wait_token_round_trip);
+kernel_test_in!(
+    "arch/amd_vi",
+    smoke_amd_vi_cmd_completion_wait_token_round_trip
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_amd_vi_cmd_invalidate_pages_all() -> TestResult {
     use crate::x86_64::amd_vi::{
-        IommuCmd, CMD_INV_ALL_PAGES_ADDRESS, CMD_INV_IOMMU_PAGES,
-        CMD_INV_IOMMU_PAGES_PDE_MASK, CMD_INV_IOMMU_PAGES_SIZE_MASK,
+        IommuCmd, CMD_INV_ALL_PAGES_ADDRESS, CMD_INV_IOMMU_PAGES, CMD_INV_IOMMU_PAGES_PDE_MASK,
+        CMD_INV_IOMMU_PAGES_SIZE_MASK,
     };
     let cmd = IommuCmd::invalidate_pages(0x55, 0, true);
     if cmd.opcode() != CMD_INV_IOMMU_PAGES {
@@ -2823,8 +2862,7 @@ fn smoke_amd_vi_cmd_invalidate_pages_all() -> TestResult {
     if cmd.data[2] & CMD_INV_IOMMU_PAGES_SIZE_MASK == 0 {
         return TestResult::Fail("size bit not set on all-pages flush");
     }
-    let addr =
-        ((cmd.data[3] as u64) << 32) | ((cmd.data[2] as u64) & 0xFFFF_FFF0);
+    let addr = ((cmd.data[3] as u64) << 32) | ((cmd.data[2] as u64) & 0xFFFF_FFF0);
     let want = CMD_INV_ALL_PAGES_ADDRESS & 0xFFFF_FFFF_FFFF_FFF0;
     if addr != want {
         return TestResult::Fail("all-pages sentinel address drifted");
@@ -2860,7 +2898,7 @@ kernel_test_in!("arch/amd_vi", smoke_amd_vi_dev_table_base_encode_decode);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_amd_vi_irte_remap_round_trip() -> TestResult {
-    use crate::x86_64::amd_vi::{Irte, IRTE_REMAP_INTCTL_MASK, IRTE_REMAP_INTCTL};
+    use crate::x86_64::amd_vi::{Irte, IRTE_REMAP_INTCTL, IRTE_REMAP_INTCTL_MASK};
     let irte = Irte::remap(0x33, 0x4);
     if !irte.is_valid() {
         return TestResult::Fail("IRTE valid bit not set");
@@ -2883,7 +2921,7 @@ kernel_test_in!("arch/amd_vi", smoke_amd_vi_irte_remap_round_trip);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_vtd_root_entry_layout() -> TestResult {
-    use crate::x86_64::vtd::{RootEntry, ROOT_PRESENT, ROOT_CTX_PTR_MASK};
+    use crate::x86_64::vtd::{RootEntry, ROOT_CTX_PTR_MASK, ROOT_PRESENT};
     let ctx_phys: u64 = 0x0000_0001_F000_0000;
     let root = RootEntry::present(ctx_phys);
     if !root.is_present() {
@@ -2908,9 +2946,7 @@ kernel_test_in!("arch/vtd", smoke_vtd_root_entry_layout);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_vtd_context_entry_legacy() -> TestResult {
-    use crate::x86_64::vtd::{
-        ContextEntry, CTX_AW_48BIT, CTX_PRESENT, CTX_TT_LEGACY,
-    };
+    use crate::x86_64::vtd::{ContextEntry, CTX_AW_48BIT, CTX_PRESENT, CTX_TT_LEGACY};
     let slpt: u64 = 0x0000_0000_1234_5000;
     let did: u16 = 0x77;
     let ctx = ContextEntry::legacy(slpt, did, CTX_AW_48BIT);
@@ -2939,9 +2975,7 @@ kernel_test_in!("arch/vtd", smoke_vtd_context_entry_legacy);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_vtd_sl_pte_leaf_perms() -> TestResult {
-    use crate::x86_64::vtd::{
-        sl_pte_addr, sl_pte_leaf, sl_pte_present, SL_PTE_READ, SL_PTE_WRITE,
-    };
+    use crate::x86_64::vtd::{sl_pte_addr, sl_pte_leaf, sl_pte_present, SL_PTE_READ, SL_PTE_WRITE};
     let phys: u64 = 0x0000_0000_DEAD_B000;
     let rw = sl_pte_leaf(phys, true, true);
     if !sl_pte_present(rw) {
@@ -3072,9 +3106,7 @@ kernel_test_in!("arch/vtd", smoke_vtd_context_passthrough);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_amd_vi_cmd_buf_base_encoding() -> TestResult {
-    use crate::x86_64::amd_vi::{
-        decode_cmd_buf_base, encode_cmd_buf_base, CMD_BUF_SIZE_SHIFT,
-    };
+    use crate::x86_64::amd_vi::{decode_cmd_buf_base, encode_cmd_buf_base, CMD_BUF_SIZE_SHIFT};
     let phys: u64 = 0x0000_0001_5000_0000;
     let reg = encode_cmd_buf_base(phys);
     let (got_phys, size_field) = decode_cmd_buf_base(reg);
@@ -3206,9 +3238,7 @@ fn smoke_vtd_walk_slpt_resolves_iova() -> TestResult {
     // maps IOVA 0xCAFE_F123 → phys 0xBEEF_F000, then walk it.
     // This exercises the per-level shift math without touching
     // any silicon.
-    use crate::x86_64::vtd::{
-        iova_level_index, sl_pte_leaf, sl_pte_next, walk_slpt, WalkResult,
-    };
+    use crate::x86_64::vtd::{iova_level_index, sl_pte_leaf, sl_pte_next, walk_slpt, WalkResult};
 
     // Distinct sentinel phys for L3, L2, L1, leaf.
     const L3_PHYS: u64 = 0x0010_0000;
@@ -3270,9 +3300,7 @@ kernel_test_in!("arch/vtd", smoke_vtd_walk_slpt_unmapped_iova);
 fn smoke_amd_vi_walk_iopt_resolves_iova() -> TestResult {
     // Build a 4-level AMD-Vi I/O page table that maps a known
     // IOVA to a known phys. Confirm the walker resolves it.
-    use crate::x86_64::amd_vi::{
-        pte_leaf, pte_level_index, pte_next, walk_iopt, AmdViWalkResult,
-    };
+    use crate::x86_64::amd_vi::{pte_leaf, pte_level_index, pte_next, walk_iopt, AmdViWalkResult};
     const L3: u64 = 0x0020_0000;
     const L2: u64 = 0x0020_1000;
     const L1: u64 = 0x0020_2000;
@@ -3490,9 +3518,7 @@ fn smoke_cet_caps_probe_consistent() -> TestResult {
     // not see an impossible combo (cr4_cet on with neither shadow_stack
     // nor ibt).
     if caps.cr4_cet && !caps.shadow_stack && !caps.ibt {
-        return TestResult::Fail(
-            "CR4.CET set but neither SHSTK nor IBT advertised — invalid",
-        );
+        return TestResult::Fail("CR4.CET set but neither SHSTK nor IBT advertised — invalid");
     }
     TestResult::Pass
 }

@@ -210,10 +210,7 @@ pub fn read_status() -> Option<Result<u8, MsrFault>> {
 /// `amd_pstate_update_perf` packing.
 #[inline]
 pub const fn build_request(min_perf: u8, max_perf: u8, des_perf: u8, epp: u8) -> u64 {
-    (min_perf as u64)
-        | ((max_perf as u64) << 8)
-        | ((des_perf as u64) << 16)
-        | ((epp as u64) << 24)
+    (min_perf as u64) | ((max_perf as u64) << 8) | ((des_perf as u64) << 16) | ((epp as u64) << 24)
 }
 
 /// Decode a 64-bit `MSR_AMD_CPPC_REQ` value back into its four

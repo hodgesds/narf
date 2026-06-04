@@ -78,16 +78,7 @@ pub fn supported() -> bool {
 
 /// Build the 8-byte PAT value (8 × 3-bit type codes, low byte =
 /// PA0 type). Encoded as one u64 — that's exactly the MSR layout.
-pub const fn encode(
-    pa0: u8,
-    pa1: u8,
-    pa2: u8,
-    pa3: u8,
-    pa4: u8,
-    pa5: u8,
-    pa6: u8,
-    pa7: u8,
-) -> u64 {
+pub const fn encode(pa0: u8, pa1: u8, pa2: u8, pa3: u8, pa4: u8, pa5: u8, pa6: u8, pa7: u8) -> u64 {
     (pa0 as u64) << 0
         | (pa1 as u64) << 8
         | (pa2 as u64) << 16

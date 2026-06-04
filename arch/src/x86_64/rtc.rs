@@ -92,8 +92,7 @@ const STATUS_C_AF: u8 = 1 << 5;
 // alarm can be pending at a time (the MC146818 has one set of alarm
 // registers). The IRQ8 dispatch path reads this and calls it.
 
-static ALARM_HANDLER: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static ALARM_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // ── Errors ─────────────────────────────────────────────────────────
 
@@ -157,10 +156,7 @@ impl RtcTime {
         let doy = (153 * mp + 2) / 5 + d - 1;
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         let days = era * 146_097 + doe - 719_468;
-        days * 86_400
-            + self.hour as i64 * 3600
-            + self.minute as i64 * 60
-            + self.second as i64
+        days * 86_400 + self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64
     }
 }
 
@@ -249,7 +245,11 @@ pub unsafe fn read_now() -> Result<RtcTime, RtcError> {
     let binary = status_b & STATUS_B_BIN != 0;
     let h24 = status_b & STATUS_B_24H != 0;
     let conv = |v: u8| -> u8 {
-        if binary { v } else { from_bcd(v) }
+        if binary {
+            v
+        } else {
+            from_bcd(v)
+        }
     };
 
     // SAFETY: same.
@@ -320,7 +320,13 @@ pub unsafe fn set(time: &RtcTime) -> Result<(), RtcError> {
     // SAFETY: caller-asserted.
     let status_b = unsafe { read_index(REG_STATUS_B) };
     let binary = status_b & STATUS_B_BIN != 0;
-    let enc = |v: u8| -> u8 { if binary { v } else { to_bcd(v) } };
+    let enc = |v: u8| -> u8 {
+        if binary {
+            v
+        } else {
+            to_bcd(v)
+        }
+    };
 
     // Freeze the clock (SET bit).
     // SAFETY: same.
@@ -370,7 +376,13 @@ pub unsafe fn schedule_alarm(alarm: &RtcTime, handler: fn()) -> Result<(), RtcEr
     // SAFETY: caller-asserted.
     let status_b = unsafe { read_index(REG_STATUS_B) };
     let binary = status_b & STATUS_B_BIN != 0;
-    let enc = |v: u8| -> u8 { if binary { v } else { to_bcd(v) } };
+    let enc = |v: u8| -> u8 {
+        if binary {
+            v
+        } else {
+            to_bcd(v)
+        }
+    };
 
     // SAFETY: same.
     unsafe {

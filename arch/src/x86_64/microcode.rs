@@ -609,18 +609,11 @@ pub fn amd_find_patch(blob: &[u8], equiv: u16) -> Option<&[u8]> {
     hdr.validate().ok()?;
     let mut off = 12 + hdr.equiv_table_len as usize;
     while off + AMD_PATCH_SECTION_HDR_LEN <= blob.len() {
-        let section_type = u32::from_le_bytes([
-            blob[off],
-            blob[off + 1],
-            blob[off + 2],
-            blob[off + 3],
-        ]);
-        let section_size = u32::from_le_bytes([
-            blob[off + 4],
-            blob[off + 5],
-            blob[off + 6],
-            blob[off + 7],
-        ]) as usize;
+        let section_type =
+            u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
+        let section_size =
+            u32::from_le_bytes([blob[off + 4], blob[off + 5], blob[off + 6], blob[off + 7]])
+                as usize;
         if section_type != AMD_PATCH_SECTION_TYPE {
             // Unknown section type — bail rather than guess at
             // length; the container is malformed or a newer rev.

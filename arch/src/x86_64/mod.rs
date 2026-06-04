@@ -4,9 +4,6 @@ pub mod acpi;
 pub mod amd_ga;
 pub mod amd_pstate;
 pub mod amd_vi;
-pub mod k10temp;
-pub mod s3_resume;
-pub mod setjmp;
 pub mod asm;
 pub mod avx10;
 pub mod bhi;
@@ -22,11 +19,14 @@ pub mod cr;
 pub mod errata;
 pub mod fred;
 pub mod hfi;
+pub mod hwrng;
 pub mod hypervisor;
 pub mod ident;
 pub mod invlpgb;
 pub mod io_port;
 pub mod ir;
+pub mod k10temp;
+pub mod kernel_ctx;
 pub mod keylocker;
 pub mod kpti;
 pub mod lam;
@@ -38,7 +38,6 @@ pub mod movdir;
 pub mod msr;
 pub mod mtrr;
 pub mod numa;
-pub mod kernel_ctx;
 pub mod pasid;
 pub mod pat;
 pub mod pcid;
@@ -54,6 +53,8 @@ pub mod rdpru;
 pub mod rdt;
 pub mod rtc;
 pub mod rtm_abort;
+pub mod s3_resume;
+pub mod setjmp;
 pub mod sgx;
 pub mod sld;
 pub mod smap;
@@ -69,7 +70,6 @@ pub mod uintr;
 pub mod user_mode;
 pub mod vmx;
 pub mod vtd;
-pub mod hwrng;
 pub mod waitpkg;
 pub mod wrmsrns;
 pub mod xsave;
@@ -78,8 +78,8 @@ pub use asm::{cas128, disable_interrupts, enable_interrupts, halt_forever, patch
 pub use cpuid::Features;
 pub use hwrng::{fill_key_32, HwRngSource};
 pub use user_mode::{
-    enter_user_mode, enter_user_mode_resume, enter_user_mode_with_arg, longjmp,
-    set_user_fs_base, setjmp, JmpBuf, UserState, IA32_FS_BASE, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, enter_user_mode_with_arg, longjmp, set_user_fs_base,
+    setjmp, JmpBuf, UserState, IA32_FS_BASE, USER_RFLAGS,
 };
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to

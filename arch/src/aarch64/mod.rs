@@ -37,12 +37,12 @@ pub mod trbe;
 pub mod user_mode;
 
 pub use asm::{cas128, disable_interrupts, enable_interrupts, halt_forever, patch_word};
-pub use user_mode::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf,
-    UserState, USER_SPSR,
-};
 pub use cpuid::Features;
 pub use mte::Mte;
+pub use user_mode::{
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf, UserState,
+    USER_SPSR,
+};
 
 /// Exit QEMU via ARM semihosting `SYS_EXIT`. Falls back to `halt_forever`
 /// if semihosting isn't enabled.

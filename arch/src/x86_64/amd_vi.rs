@@ -289,10 +289,8 @@ impl Irte {
     /// Build a remap IRTE that retargets an interrupt at `vector` to
     /// CPU `dest_id` with the IntCtl=remap encoding.
     pub const fn remap(vector: u8, dest_id: u8) -> Self {
-        let raw = IRTE_VALID
-            | IRTE_REMAP_INTCTL
-            | ((vector as u64) << 16)
-            | ((dest_id as u64) << 24);
+        let raw =
+            IRTE_VALID | IRTE_REMAP_INTCTL | ((vector as u64) << 16) | ((dest_id as u64) << 24);
         Irte { raw }
     }
 

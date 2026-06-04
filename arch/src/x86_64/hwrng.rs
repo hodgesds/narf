@@ -47,7 +47,11 @@ pub unsafe fn try_rdseed_u32() -> Option<u32> {
             options(nostack, nomem),
         );
     }
-    if ok != 0 { Some(val) } else { None }
+    if ok != 0 {
+        Some(val)
+    } else {
+        None
+    }
 }
 
 /// Attempt to read one `u32` from RDRAND.
@@ -70,7 +74,11 @@ pub unsafe fn try_rdrand_u32() -> Option<u32> {
             options(nostack, nomem),
         );
     }
-    if ok != 0 { Some(val) } else { None }
+    if ok != 0 {
+        Some(val)
+    } else {
+        None
+    }
 }
 
 /// Read one `u32` from RDSEED with up to `MAX_RETRIES` retries.

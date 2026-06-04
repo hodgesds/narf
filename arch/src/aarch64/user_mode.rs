@@ -70,7 +70,7 @@ pub unsafe extern "C" fn enter_user_mode(pc: u64, sp: u64) -> ! {
         // AAPCS64: pc in x0, sp in x1.
         "msr sp_el0,  x1",
         "msr elr_el1, x0",
-        "msr spsr_el1, xzr",   // EL0t, DAIF clear
+        "msr spsr_el1, xzr", // EL0t, DAIF clear
         "eret",
     );
 }
@@ -99,11 +99,11 @@ pub unsafe extern "C" fn enter_user_mode_resume(state: *const UserState) -> ! {
         //
         // Restore SP_EL0 / ELR_EL1 / SPSR_EL1 first; they live in
         // system regs, not in the GPR file we're about to clobber.
-        "ldr x9,  [x0, #256]",   // sp
+        "ldr x9,  [x0, #256]", // sp
         "msr sp_el0,  x9",
-        "ldr x9,  [x0, #248]",   // pc
+        "ldr x9,  [x0, #248]", // pc
         "msr elr_el1, x9",
-        "ldr x9,  [x0, #264]",   // spsr
+        "ldr x9,  [x0, #264]", // spsr
         "msr spsr_el1, x9",
         // Restore x1..=x30, leaving x0 for last.
         "ldp  x1,  x2,  [x0, #8]",
@@ -323,4 +323,7 @@ fn smoke_aarch64_setjmp_longjmp_preserves_callee_saved() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("aarch64", smoke_aarch64_setjmp_longjmp_preserves_callee_saved);
+kernel_test_in!(
+    "aarch64",
+    smoke_aarch64_setjmp_longjmp_preserves_callee_saved
+);

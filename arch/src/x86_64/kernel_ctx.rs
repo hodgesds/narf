@@ -147,10 +147,7 @@ impl KernelContext {
 ///   if the task may be interrupted by a CPL=3→0 trap before its
 ///   own context-switch happens.
 #[unsafe(naked)]
-pub unsafe extern "C" fn kernel_switch(
-    out: *mut KernelContext,
-    incoming: *const KernelContext,
-) {
+pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const KernelContext) {
     naked_asm!(
         // ── Save outgoing context ──────────────────────────────
         //
@@ -179,7 +176,6 @@ pub unsafe extern "C" fn kernel_switch(
         "pushfq",
         "pop rax",
         "mov [rdi + 64], rax",
-
         // ── Restore incoming context ───────────────────────────
         //
         // Load callee-saved GPRs from incoming[0..6].
@@ -380,7 +376,9 @@ pub mod tests {
             let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
             let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
             unsafe { kernel_switch(child_ctx, main_ctx) };
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
 
         let mut stack = alloc::boxed::Box::<[u8; 4096]>::new([0u8; 4096]);
@@ -440,7 +438,9 @@ pub mod tests {
             let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
             let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
             unsafe { kernel_switch(child_ctx, main_ctx) };
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
 
         let mut stack = alloc::boxed::Box::<[u8; 4096]>::new([0u8; 4096]);
@@ -460,14 +460,18 @@ pub mod tests {
         // is the ONLY way IF could come back on for the child.
         // If kernel_switch didn't restore IF from rflags, the
         // child would observe IF=0 (matching our pre-switch state).
-        unsafe { asm!("cli", options(nomem, nostack)); }
+        unsafe {
+            asm!("cli", options(nomem, nostack));
+        }
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
         // The child set IF=1 on entry (via STI in load half) and
         // switched back. On return, our IF state was restored from
         // main_ctx.rflags — which kernel_switch saved on the way
         // out. Since we CLI'd before the switch, main_ctx.rflags
         // recorded IF=0, so we resume with IF=0.
-        unsafe { asm!("sti", options(nomem, nostack)); } // restore for the rest of the suite
+        unsafe {
+            asm!("sti", options(nomem, nostack));
+        } // restore for the rest of the suite
 
         let observed = CHILD_IF_OBSERVED.load(Ordering::Acquire);
         if observed != 0x200 {
@@ -550,7 +554,10 @@ pub mod tests {
 
     kernel_test_in!("arch/kernel_ctx", smoke_kernel_ctx_fresh_layout);
     kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_round_trip);
-    kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_preserves_callee_saved);
+    kernel_test_in!(
+        "arch/kernel_ctx",
+        smoke_kernel_switch_preserves_callee_saved
+    );
     kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_preserves_if_flag);
     kernel_test_in!("arch/kernel_ctx", smoke_kernel_switch_ping_pong);
 }

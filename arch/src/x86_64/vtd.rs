@@ -145,9 +145,7 @@ impl ContextEntry {
     /// is the second-level page-table root (page-aligned). `agaw`
     /// is the address-width encoding (e.g. `CTX_AW_48BIT`).
     pub const fn legacy(slpt_phys: u64, domain_id: u16, agaw: u64) -> Self {
-        let lo = CTX_PRESENT
-            | (CTX_TT_LEGACY << CTX_TT_SHIFT)
-            | (slpt_phys & CTX_ASR_MASK);
+        let lo = CTX_PRESENT | (CTX_TT_LEGACY << CTX_TT_SHIFT) | (slpt_phys & CTX_ASR_MASK);
         let hi = (agaw & CTX_AW_MASK) | ((domain_id as u64) << CTX_DID_SHIFT);
         ContextEntry { lo, hi }
     }
@@ -261,10 +259,7 @@ impl QiDesc {
     /// `domain_id` is only meaningful for domain- or
     /// device-selective grans (high 16 bits of qw0 per §6.5.2.1).
     pub const fn cc_inv(gran: u64, domain_id: u16, source_id: u16) -> Self {
-        let qw0 = QI_CC_TYPE
-            | gran
-            | ((domain_id as u64) << 16)
-            | ((source_id as u64) << 32);
+        let qw0 = QI_CC_TYPE | gran | ((domain_id as u64) << 16) | ((source_id as u64) << 32);
         QiDesc { qw0, qw1: 0 }
     }
 

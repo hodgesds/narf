@@ -266,11 +266,7 @@ pub unsafe extern "C" fn enter_user_mode(rip: u64, rsp: u64) -> ! {
 /// Same as `enter_user_mode`; `arg` is a plain u64 the user code
 /// interprets per its own contract.
 #[unsafe(naked)]
-pub unsafe extern "C" fn enter_user_mode_with_arg(
-    rip: u64,
-    rsp: u64,
-    arg: u64,
-) -> ! {
+pub unsafe extern "C" fn enter_user_mode_with_arg(rip: u64, rsp: u64, arg: u64) -> ! {
     naked_asm!(
         // SysV: rip in rdi, rsp in rsi, arg in rdx.
         "swapgs",
