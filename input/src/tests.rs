@@ -192,7 +192,9 @@ fn smoke_rmi4_pdt_entry_round_trip() -> TestResult {
     // PDT entry: query/cmd/ctl/data bases at 0x40/0x41/0x42/0x43,
     // interrupt source count = 1, version = 0, function number = 0x11.
     let buf = [0x40, 0x41, 0x42, 0x43, 0x01, F11_2D_TOUCHPAD];
-    let entry = PdtEntry::decode(&buf).expect("decode").expect("non-terminal");
+    let entry = PdtEntry::decode(&buf)
+        .expect("decode")
+        .expect("non-terminal");
     if entry.function_number != F11_2D_TOUCHPAD {
         return TestResult::Fail("function number mismatch");
     }
@@ -235,7 +237,9 @@ fn smoke_rmi4_f01_device_status_decode() -> TestResult {
 kernel_test_in!("input/rmi4", smoke_rmi4_f01_device_status_decode);
 
 fn smoke_rmi4_f01_device_control_byte_pack() -> TestResult {
-    use crate::rmi4::{f01_device_control_byte, F01_CONFIGURED, F01_REPORT_RATE_HIGH, F01_SLEEP_NORMAL};
+    use crate::rmi4::{
+        f01_device_control_byte, F01_CONFIGURED, F01_REPORT_RATE_HIGH, F01_SLEEP_NORMAL,
+    };
     let b = f01_device_control_byte(F01_SLEEP_NORMAL, true, true);
     if b & F01_CONFIGURED == 0 {
         return TestResult::Fail("configured bit not set");
@@ -316,7 +320,10 @@ fn smoke_rmi4_touchpad_report_rejects_short_buffer() -> TestResult {
         _ => TestResult::Fail("under-sized buffer must be rejected"),
     }
 }
-kernel_test_in!("input/rmi4", smoke_rmi4_touchpad_report_rejects_short_buffer);
+kernel_test_in!(
+    "input/rmi4",
+    smoke_rmi4_touchpad_report_rejects_short_buffer
+);
 
 // ── Goodix GT911 smokes ────────────────────────────────────────────
 
@@ -376,7 +383,10 @@ fn smoke_goodix_coord_report_decodes_two_fingers() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("input/goodix", smoke_goodix_coord_report_decodes_two_fingers);
+kernel_test_in!(
+    "input/goodix",
+    smoke_goodix_coord_report_decodes_two_fingers
+);
 
 fn smoke_goodix_coord_report_rejects_overflow() -> TestResult {
     use crate::goodix::{CoordReport, GoodixError};
@@ -400,7 +410,10 @@ fn smoke_goodix_coord_report_zero_touches_buffer_ready() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("input/goodix", smoke_goodix_coord_report_zero_touches_buffer_ready);
+kernel_test_in!(
+    "input/goodix",
+    smoke_goodix_coord_report_zero_touches_buffer_ready
+);
 
 fn smoke_goodix_config_checksum_round_trip() -> TestResult {
     use crate::goodix::{config_checksum_byte, verify_config};
@@ -472,9 +485,9 @@ kernel_test_in!("input/evdev", smoke_evdev_code_constants_pinned);
 // ── 3. Queue overflow → SYN_DROPPED emitted ───────────────────────────────────
 
 fn smoke_evdev_queue_overflow_syn_dropped() -> TestResult {
-    use crate::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
-    use crate::evdev::syn::SYN_DROPPED;
     use crate::evdev::key::KEY_A;
+    use crate::evdev::syn::SYN_DROPPED;
+    use crate::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
@@ -521,8 +534,8 @@ kernel_test_in!("input/evdev", smoke_evdev_queue_overflow_syn_dropped);
 // ── 4. Capability bitmap: KEY_A + KEY_B reported, not KEY_C ───────────────────
 
 fn smoke_evdev_capability_bitmap() -> TestResult {
-    use crate::evdev::{DeviceCaps, EventType};
     use crate::evdev::key::{KEY_A, KEY_B, KEY_C};
+    use crate::evdev::{DeviceCaps, EventType};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
@@ -557,7 +570,9 @@ fn smoke_evdev_reader_wait_future_resolves() -> TestResult {
     let mut fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
 
     static VTABLE: RawWakerVTable = {
-        unsafe fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
         unsafe fn wake(_: *const ()) {}
         unsafe fn wake_by_ref(_: *const ()) {}
         unsafe fn drop_waker(_: *const ()) {}
@@ -651,9 +666,9 @@ kernel_test_in!("input/evdev", smoke_evdev_many_readers_fanout);
 // ── 7. uinput: create device with KEY_A cap, inject press, reader sees it ─────
 
 fn smoke_uinput_inject_key_press() -> TestResult {
-    use crate::evdev::{EventType, ROUTER};
     use crate::evdev::key::KEY_A;
     use crate::evdev::DeviceCaps;
+    use crate::evdev::{EventType, ROUTER};
     use crate::uinput::UserDevice;
 
     let mut caps = DeviceCaps::new();
@@ -686,8 +701,8 @@ kernel_test_in!("input/evdev", smoke_uinput_inject_key_press);
 // ── 8. i8042 key dispatch helper → reader sees EV_KEY with correct code ───────
 
 fn smoke_evdev_i8042_key_routes_to_evdev() -> TestResult {
-    use crate::evdev::{DeviceCaps, EventType, ROUTER};
     use crate::evdev::key::KEY_A;
+    use crate::evdev::{DeviceCaps, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
@@ -700,9 +715,7 @@ fn smoke_evdev_i8042_key_routes_to_evdev() -> TestResult {
     let ev = reader.poll_event();
     ROUTER.unregister_device(id);
     match ev {
-        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1 => {
-            TestResult::Pass
-        }
+        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1 => TestResult::Pass,
         Some(_) => TestResult::Fail("wrong event from i8042 key dispatch"),
         None => TestResult::Fail("no event from i8042 key dispatch"),
     }
@@ -744,8 +757,8 @@ kernel_test_in!("input/evdev", smoke_evdev_i8042_mouse_routes_to_evdev);
 // ── 10. Drop device → SYN_DROPPED + reader handle invalidates ─────────────────
 
 fn smoke_evdev_device_drop_invalidates_reader() -> TestResult {
-    use crate::evdev::{DeviceCaps, EventType, ROUTER};
     use crate::evdev::syn::SYN_DROPPED;
+    use crate::evdev::{DeviceCaps, EventType, ROUTER};
 
     let (id, _node) = ROUTER.register_device(DeviceCaps::new());
     let reader = ROUTER.open_reader(id).expect("reader");

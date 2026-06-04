@@ -699,12 +699,7 @@ impl AxisInfo {
             return None;
         }
         let read = |off: usize| -> i32 {
-            i32::from_le_bytes([
-                bytes[off],
-                bytes[off + 1],
-                bytes[off + 2],
-                bytes[off + 3],
-            ])
+            i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
         };
         Some(Self {
             min: read(0),
@@ -1063,11 +1058,7 @@ pub fn pop_scroll() -> Option<ScrollEvent> {
 /// FIONREAD: userspace queries "how many bytes can I read without
 /// blocking?" and the right answer is what's in the ring right now.
 pub fn pending_bytes() -> usize {
-    BYTE_RING
-        .lock()
-        .as_ref()
-        .map(|r| r.len())
-        .unwrap_or(0)
+    BYTE_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0)
 }
 
 /// Pop one raw byte from the AsciiByte stream.
@@ -1256,25 +1247,21 @@ pub static I8042_MOUSE_PACKET_COUNT: core::sync::atomic::AtomicU32 =
 /// successful `push_global` so the panel can show whether kbd
 /// IRQs are firing without requiring serial. If kbd-pushes stays
 /// at 0 across keystroke attempts, IRQ 1 isn't firing.
-pub static KEY_PUSH_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static KEY_PUSH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Counts pop_key() successes. Distinguishes "DevConsole reads
 /// are consuming events" (pop>0) from "no consumer ever ran"
 /// (pop=0). Combined with KEY_PUSH_COUNT, tells you whether the
 /// blockage is on the producer side (no IRQ, no decode) or the
 /// consumer side (shell not reading / read returning nothing).
-pub static KEY_POP_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static KEY_POP_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Same shape for `AsciiByte` events (serial / UART RX). 0 means
 /// no serial bytes ever reached the input ring — useful when
 /// debugging "shell isn't seeing typed input" on QEMU.
-pub static ASCII_PUSH_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static ASCII_PUSH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Counts pop_ascii_byte successes — distinguishes "bytes
 /// pushed but never consumed" (push>pop, possible reader bug)
 /// from "no bytes ever pushed" (push=0).
-pub static ASCII_POP_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static ASCII_POP_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Stage::Subsys initcall: install all per-class rings before any
 /// input driver pushes. Capacity 256 per ring — enough for

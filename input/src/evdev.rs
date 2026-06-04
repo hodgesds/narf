@@ -403,11 +403,7 @@ impl DeviceNode {
 
     /// Pop the oldest event for reader at waker slot `slot_idx`, or
     /// return `Poll::Pending` + register `cx.waker()`.
-    fn poll_for_reader(
-        &self,
-        slot_idx: usize,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<EvdevEvent>> {
+    fn poll_for_reader(&self, slot_idx: usize, cx: &mut Context<'_>) -> Poll<Option<EvdevEvent>> {
         let mut g = self.inner.lock();
         if let Some(ev) = g.ring.pop_front() {
             return Poll::Ready(Some(ev));
@@ -499,9 +495,7 @@ impl core::future::Future for WaitEventFuture<'_> {
     type Output = Option<EvdevEvent>;
 
     fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.reader
-            .node
-            .poll_for_reader(self.reader.waker_slot, cx)
+        self.reader.node.poll_for_reader(self.reader.waker_slot, cx)
     }
 }
 
