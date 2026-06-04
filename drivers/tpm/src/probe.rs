@@ -113,8 +113,7 @@ pub fn parse_tpm2_table(table: &[u8]) -> Option<Tpm2AcpiTable> {
         return None;
     }
     let control_address = u64::from_le_bytes(
-        table[TPM2_TABLE_OFFSET_CONTROL_ADDRESS
-            ..TPM2_TABLE_OFFSET_CONTROL_ADDRESS + 8]
+        table[TPM2_TABLE_OFFSET_CONTROL_ADDRESS..TPM2_TABLE_OFFSET_CONTROL_ADDRESS + 8]
             .try_into()
             .ok()?,
     );

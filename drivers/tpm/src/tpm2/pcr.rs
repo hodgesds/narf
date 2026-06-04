@@ -132,7 +132,14 @@ impl PcrSelection {
     /// hashAlg(u16) + sizeofSelect(u8=3) + bitmap(3 bytes).
     pub fn encode(&self) -> [u8; 6] {
         let [h0, h1] = self.hash_alg.to_be_bytes();
-        [h0, h1, PCR_SELECT_BYTES, self.bitmap[0], self.bitmap[1], self.bitmap[2]]
+        [
+            h0,
+            h1,
+            PCR_SELECT_BYTES,
+            self.bitmap[0],
+            self.bitmap[1],
+            self.bitmap[2],
+        ]
     }
 }
 

@@ -67,16 +67,13 @@ pub const NV_ATTR_PLATFORMCREATE: u32 = 1 << 30;
 // ── Convenience attribute sets ────────────────────────────────────────
 
 /// Owner can read/write, no DA protection.
-pub const NV_ATTR_OWNER_RW: u32 =
-    NV_ATTR_OWNERWRITE | NV_ATTR_OWNERREAD | NV_ATTR_NO_DA;
+pub const NV_ATTR_OWNER_RW: u32 = NV_ATTR_OWNERWRITE | NV_ATTR_OWNERREAD | NV_ATTR_NO_DA;
 
 /// Platform can read/write, no DA protection.
-pub const NV_ATTR_PLATFORM_RW: u32 =
-    NV_ATTR_PPWRITE | NV_ATTR_PPREAD | NV_ATTR_NO_DA;
+pub const NV_ATTR_PLATFORM_RW: u32 = NV_ATTR_PPWRITE | NV_ATTR_PPREAD | NV_ATTR_NO_DA;
 
 /// Auth (self) can read/write, no DA protection.
-pub const NV_ATTR_AUTH_RW: u32 =
-    NV_ATTR_AUTHWRITE | NV_ATTR_AUTHREAD | NV_ATTR_NO_DA;
+pub const NV_ATTR_AUTH_RW: u32 = NV_ATTR_AUTHWRITE | NV_ATTR_AUTHREAD | NV_ATTR_NO_DA;
 
 // ── NARF NV index allocations ─────────────────────────────────────────
 
@@ -104,7 +101,11 @@ pub struct NvIndex {
 impl NvIndex {
     /// Create a new NV index descriptor.
     pub const fn new(handle: u32, size: u16, attributes: u32) -> Self {
-        Self { handle, size, attributes }
+        Self {
+            handle,
+            size,
+            attributes,
+        }
     }
 
     /// Build the `TPM2_NV_DefineSpace` command for this index.
@@ -129,5 +130,4 @@ impl NvIndex {
 }
 
 /// Pre-built NARF disk-key NV index descriptor (32-byte slot).
-pub const NARF_DISK_KEY_NV: NvIndex =
-    NvIndex::new(NV_IDX_DISK_KEY, 32, NV_ATTR_AUTH_RW);
+pub const NARF_DISK_KEY_NV: NvIndex = NvIndex::new(NV_IDX_DISK_KEY, 32, NV_ATTR_AUTH_RW);

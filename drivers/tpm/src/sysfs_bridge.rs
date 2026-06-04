@@ -47,15 +47,11 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::sysfs::{
-    class_device_register, class_register, kobject_add_attr,
-};
+use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
 use crate::devfs_bridge::TpmTransport;
 use crate::tpm2::commands::{get_capability, pcr_read};
-use crate::tpm2::{
-    TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_CAP_TPM_PROPERTIES, TPM_RC_SUCCESS,
-};
+use crate::tpm2::{TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_CAP_TPM_PROPERTIES, TPM_RC_SUCCESS};
 
 // ── TPM PT (permanent property) constants ─────────────────────────────
 
@@ -160,29 +156,43 @@ fn parse_pcr_read_response(raw: &[u8]) -> Option<Vec<Vec<u8>>> {
     //     for our queries N=3
     let mut pos = 10;
     // pcrUpdateCounter
-    if pos + 4 > raw.len() { return None; }
+    if pos + 4 > raw.len() {
+        return None;
+    }
     pos += 4;
     // TPML_PCR_SELECTION count
-    if pos + 4 > raw.len() { return None; }
-    let sel_count = u32::from_be_bytes([raw[pos], raw[pos+1], raw[pos+2], raw[pos+3]]) as usize;
+    if pos + 4 > raw.len() {
+        return None;
+    }
+    let sel_count =
+        u32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]) as usize;
     pos += 4;
     // skip sel_count × TPMS_PCR_SELECTION (hashAlg:2 + sizeofSelect:1 + bitmap:N)
     for _ in 0..sel_count {
-        if pos + 3 > raw.len() { return None; }
+        if pos + 3 > raw.len() {
+            return None;
+        }
         let sos = raw[pos + 2] as usize;
         pos += 3 + sos;
     }
     // TPML_DIGEST: count (u32)
-    if pos + 4 > raw.len() { return None; }
-    let digest_count = u32::from_be_bytes([raw[pos], raw[pos+1], raw[pos+2], raw[pos+3]]) as usize;
+    if pos + 4 > raw.len() {
+        return None;
+    }
+    let digest_count =
+        u32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]) as usize;
     pos += 4;
     let mut digests = Vec::new();
     for _ in 0..digest_count {
-        if pos + 2 > raw.len() { return None; }
-        let dsize = u16::from_be_bytes([raw[pos], raw[pos+1]]) as usize;
+        if pos + 2 > raw.len() {
+            return None;
+        }
+        let dsize = u16::from_be_bytes([raw[pos], raw[pos + 1]]) as usize;
         pos += 2;
-        if pos + dsize > raw.len() { return None; }
-        digests.push(raw[pos..pos+dsize].to_vec());
+        if pos + dsize > raw.len() {
+            return None;
+        }
+        digests.push(raw[pos..pos + dsize].to_vec());
         pos += dsize;
     }
     Some(digests)
@@ -244,14 +254,14 @@ fn make_manufacturer_show(transport: Arc<dyn TpmTransport>) -> impl Fn() -> Stri
 /// Build the `description` attribute show-closure.
 ///
 /// Reads `PT_VENDOR_STRING_1..4` and concatenates them, trimming nulls.
-fn make_description_show(
-    transport: Arc<dyn TpmTransport>,
-) -> impl Fn() -> String + Send + Sync {
+fn make_description_show(transport: Arc<dyn TpmTransport>) -> impl Fn() -> String + Send + Sync {
     move || {
         let mut out = String::new();
         for prop in PT_VENDOR_STRING_1..=PT_VENDOR_STRING_4 {
             let v = read_property(transport.as_ref(), prop).unwrap_or(0);
-            if v == 0 { break; }
+            if v == 0 {
+                break;
+            }
             let s = u32_to_ascii4(v);
             let trimmed: String = s.chars().filter(|&c| c != '\0' && c != '?').collect();
             out.push_str(&trimmed);
@@ -271,11 +281,11 @@ fn make_description_show(
 fn make_caps_show(transport: Arc<dyn TpmTransport>) -> impl Fn() -> String + Send + Sync {
     move || {
         let family = read_property(transport.as_ref(), PT_FAMILY_INDICATOR).unwrap_or(0);
-        let level   = read_property(transport.as_ref(), PT_LEVEL).unwrap_or(0);
-        let rev     = read_property(transport.as_ref(), PT_REVISION).unwrap_or(0);
-        let mfr     = read_property(transport.as_ref(), PT_MANUFACTURER).unwrap_or(0);
+        let level = read_property(transport.as_ref(), PT_LEVEL).unwrap_or(0);
+        let rev = read_property(transport.as_ref(), PT_REVISION).unwrap_or(0);
+        let mfr = read_property(transport.as_ref(), PT_MANUFACTURER).unwrap_or(0);
         let family_str = u32_to_ascii4(family);
-        let mfr_str    = u32_to_ascii4(mfr);
+        let mfr_str = u32_to_ascii4(mfr);
         format!(
             "TPM 2.0 - manufacturer: {} - family: {} - level: {} - revision: {}.{}\n",
             mfr_str,
@@ -301,23 +311,37 @@ fn make_pcrs_show(transport: Arc<dyn TpmTransport>) -> impl Fn() -> String + Sen
         for pcr in 0u32..24 {
             // Build bitmap for single PCR.
             let mut mask = [0u8; 3];
-            if pcr < 24 { mask[(pcr / 8) as usize] |= 1 << (pcr % 8); }
+            if pcr < 24 {
+                mask[(pcr / 8) as usize] |= 1 << (pcr % 8);
+            }
 
             // SHA-1 bank.
             let sha1_hex = {
                 let cmd = pcr_read(TPM_ALG_SHA1, &mask);
-                match transport.submit(&cmd).ok()
+                match transport
+                    .submit(&cmd)
+                    .ok()
                     .and_then(|r| parse_pcr_read_response(&r))
                     .and_then(|v| v.into_iter().next())
                 {
                     Some(d) => {
                         let mut s = String::new();
                         for (i, b) in d.iter().enumerate() {
-                            if i > 0 { s.push(' '); }
+                            if i > 0 {
+                                s.push(' ');
+                            }
                             let hi = (b >> 4) as char;
                             let lo = (b & 0xF) as char;
-                            s.push(char::from_digit(hi as u32, 16).unwrap_or('0').to_ascii_uppercase());
-                            s.push(char::from_digit(lo as u32, 16).unwrap_or('0').to_ascii_uppercase());
+                            s.push(
+                                char::from_digit(hi as u32, 16)
+                                    .unwrap_or('0')
+                                    .to_ascii_uppercase(),
+                            );
+                            s.push(
+                                char::from_digit(lo as u32, 16)
+                                    .unwrap_or('0')
+                                    .to_ascii_uppercase(),
+                            );
                         }
                         s
                     }
@@ -328,18 +352,30 @@ fn make_pcrs_show(transport: Arc<dyn TpmTransport>) -> impl Fn() -> String + Sen
             // SHA-256 bank.
             let sha256_hex = {
                 let cmd = pcr_read(TPM_ALG_SHA256, &mask);
-                match transport.submit(&cmd).ok()
+                match transport
+                    .submit(&cmd)
+                    .ok()
                     .and_then(|r| parse_pcr_read_response(&r))
                     .and_then(|v| v.into_iter().next())
                 {
                     Some(d) => {
                         let mut s = String::new();
                         for (i, b) in d.iter().enumerate() {
-                            if i > 0 { s.push(' '); }
+                            if i > 0 {
+                                s.push(' ');
+                            }
                             let hi = (b >> 4) as char;
                             let lo = (b & 0xF) as char;
-                            s.push(char::from_digit(hi as u32, 16).unwrap_or('0').to_ascii_uppercase());
-                            s.push(char::from_digit(lo as u32, 16).unwrap_or('0').to_ascii_uppercase());
+                            s.push(
+                                char::from_digit(hi as u32, 16)
+                                    .unwrap_or('0')
+                                    .to_ascii_uppercase(),
+                            );
+                            s.push(
+                                char::from_digit(lo as u32, 16)
+                                    .unwrap_or('0')
+                                    .to_ascii_uppercase(),
+                            );
                         }
                         s
                     }
@@ -374,8 +410,8 @@ pub fn register_sysfs_tpm0(transport: Arc<dyn TpmTransport>) {
 
     kobject_add_attr(&tpm0, "tpm_version_major", show_version_major);
     kobject_add_attr(&tpm0, "tpm_version_minor", show_version_minor);
-    kobject_add_attr(&tpm0, "enabled",            show_enabled);
-    kobject_add_attr(&tpm0, "active",             show_active);
+    kobject_add_attr(&tpm0, "enabled", show_enabled);
+    kobject_add_attr(&tpm0, "active", show_active);
 
     // ── Transport-dependent attributes ────────────────────────────────
 

@@ -41,9 +41,9 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat, FileType, POLL_IN, POLL_OUT};
 use narf_block::BlockError;
+use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN, POLL_OUT};
+use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Transport trait ───────────────────────────────────────────────────
 
@@ -64,8 +64,7 @@ pub trait TpmTransport: Send + Sync {
 
 // ── Global transport slot ─────────────────────────────────────────────
 
-static TPM_TRANSPORT: IrqSafeSpinLock<Option<Arc<dyn TpmTransport>>> =
-    IrqSafeSpinLock::new(None);
+static TPM_TRANSPORT: IrqSafeSpinLock<Option<Arc<dyn TpmTransport>>> = IrqSafeSpinLock::new(None);
 
 /// Register (or replace) the TPM transport.  Called by the CRB/TIS
 /// probe layer after the hardware is confirmed alive.
@@ -190,11 +189,7 @@ impl FileOps for DevTpm0 {
 
         let transport = match get_transport() {
             Some(t) => t,
-            None => {
-                return Box::pin(async move {
-                    Err(FsError::Io(BlockError::IOError))
-                })
-            }
+            None => return Box::pin(async move { Err(FsError::Io(BlockError::IOError)) }),
         };
 
         // Submit synchronously; store response.
@@ -379,16 +374,12 @@ impl FileOps for DevTpmRm0 {
 
         // Detect TPM2_Load so we can track any resulting transient handle.
         // TPM_CC_LOAD = 0x0000_0157; command code at bytes 6..9.
-        let is_load = declared >= 10
-            && u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]) == 0x0000_0157;
+        let is_load =
+            declared >= 10 && u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]) == 0x0000_0157;
 
         let transport = match get_transport() {
             Some(t) => t,
-            None => {
-                return Box::pin(async move {
-                    Err(FsError::Io(BlockError::IOError))
-                })
-            }
+            None => return Box::pin(async move { Err(FsError::Io(BlockError::IOError)) }),
         };
 
         match transport.submit(&cmd) {
@@ -461,7 +452,7 @@ impl FileOps for DevTpmRm0 {
 /// (`drivers/char/tpm/tpm-chip.c:319`).
 pub fn register_dev_nodes() {
     narf_filesystem::register_tpm(
-        Arc::new(DevTpm0::new())   as Arc<dyn narf_filesystem::FileOps>,
+        Arc::new(DevTpm0::new()) as Arc<dyn narf_filesystem::FileOps>,
         Arc::new(DevTpmRm0::new()) as Arc<dyn narf_filesystem::FileOps>,
     );
 }

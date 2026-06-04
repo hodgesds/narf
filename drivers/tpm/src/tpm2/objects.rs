@@ -17,7 +17,9 @@
 
 extern crate alloc;
 
-use super::{TPM_ALG_ECC, TPM_ALG_NULL, TPM_ALG_RSA, TPM_ALG_SHA256, TPM_ECC_NIST_P256, TPM_ECC_NIST_P384};
+use super::{
+    TPM_ALG_ECC, TPM_ALG_NULL, TPM_ALG_RSA, TPM_ALG_SHA256, TPM_ECC_NIST_P256, TPM_ECC_NIST_P384,
+};
 use alloc::vec::Vec;
 
 // ── TPMA_OBJECT attribute bits — Part 2 §8.3 ─────────────────────────
@@ -40,13 +42,19 @@ pub const OBJ_DECRYPT: u32 = 1 << 17;
 pub const OBJ_SIGN: u32 = 1 << 18;
 
 /// Typical attribute set for a storage key (parent of other keys).
-pub const OBJ_ATTR_STORAGE: u32 =
-    OBJ_FIXED_TPM | OBJ_ST_CLEAR | OBJ_FIXED_PARENT | OBJ_SENSITIVE_DATA_ORIGIN
-    | OBJ_USER_WITH_AUTH | OBJ_RESTRICTED | OBJ_DECRYPT;
+pub const OBJ_ATTR_STORAGE: u32 = OBJ_FIXED_TPM
+    | OBJ_ST_CLEAR
+    | OBJ_FIXED_PARENT
+    | OBJ_SENSITIVE_DATA_ORIGIN
+    | OBJ_USER_WITH_AUTH
+    | OBJ_RESTRICTED
+    | OBJ_DECRYPT;
 
 /// Typical attribute set for a sealing / data object.
-pub const OBJ_ATTR_SEAL: u32 =
-    OBJ_FIXED_TPM | OBJ_ST_CLEAR | OBJ_FIXED_PARENT | OBJ_SENSITIVE_DATA_ORIGIN
+pub const OBJ_ATTR_SEAL: u32 = OBJ_FIXED_TPM
+    | OBJ_ST_CLEAR
+    | OBJ_FIXED_PARENT
+    | OBJ_SENSITIVE_DATA_ORIGIN
     | OBJ_USER_WITH_AUTH;
 
 // ── Key type selector ─────────────────────────────────────────────────
@@ -133,7 +141,10 @@ impl Tpm2bPublic {
     pub fn object_attributes(&self) -> Option<u32> {
         if self.inner.len() >= 8 {
             Some(u32::from_be_bytes([
-                self.inner[4], self.inner[5], self.inner[6], self.inner[7],
+                self.inner[4],
+                self.inner[5],
+                self.inner[6],
+                self.inner[7],
             ]))
         } else {
             None
@@ -181,12 +192,12 @@ pub fn rsa2048_template(attributes: u32) -> Vec<u8> {
     v.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes()); // nameAlg
     v.extend_from_slice(&attributes.to_be_bytes()); // objectAttributes
     v.extend_from_slice(&0u16.to_be_bytes()); // authPolicy size = 0
-    // TPMS_RSA_PARMS: symmetric(alg+keyBits+mode) + scheme + keyBits + exponent
+                                              // TPMS_RSA_PARMS: symmetric(alg+keyBits+mode) + scheme + keyBits + exponent
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // symmetric = NULL
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // scheme = NULL
     v.extend_from_slice(&2048u16.to_be_bytes()); // keyBits = 2048
     v.extend_from_slice(&0u32.to_be_bytes()); // exponent = 0 (→ 65537)
-    // unique (TPM2B_PUBLIC_KEY_RSA): size = 0 (new key)
+                                              // unique (TPM2B_PUBLIC_KEY_RSA): size = 0 (new key)
     v.extend_from_slice(&0u16.to_be_bytes());
     v
 }
@@ -200,12 +211,12 @@ pub fn ecc_template(curve: u16, attributes: u32) -> Vec<u8> {
     v.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes()); // nameAlg
     v.extend_from_slice(&attributes.to_be_bytes()); // objectAttributes
     v.extend_from_slice(&0u16.to_be_bytes()); // authPolicy size = 0
-    // TPMS_ECC_PARMS: symmetric + scheme + curveID + kdf
+                                              // TPMS_ECC_PARMS: symmetric + scheme + curveID + kdf
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // symmetric = NULL
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // scheme = NULL
     v.extend_from_slice(&curve.to_be_bytes()); // curveID
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // kdf = NULL
-    // unique (TPMS_ECC_POINT): x(TPM2B) + y(TPM2B), both size=0
+                                                      // unique (TPMS_ECC_POINT): x(TPM2B) + y(TPM2B), both size=0
     v.extend_from_slice(&0u16.to_be_bytes()); // x size = 0
     v.extend_from_slice(&0u16.to_be_bytes()); // y size = 0
     v

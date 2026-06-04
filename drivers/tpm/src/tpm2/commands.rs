@@ -34,10 +34,10 @@ extern crate alloc;
 
 use super::{
     begin_command, finalise, TPM_ALG_SHA256, TPM_CC_CREATE, TPM_CC_GET_CAPABILITY,
-    TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD, TPM_CC_NV_DEFINE_SPACE,
-    TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND,
-    TPM_CC_PCR_READ, TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_STIR_RANDOM,
-    TPM_CC_UNSEAL, TPM_RH_OWNER, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+    TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD, TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ,
+    TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ,
+    TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL,
+    TPM_RH_OWNER, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
 };
 use alloc::vec::Vec;
 
@@ -179,7 +179,7 @@ pub fn pcr_extend(pcr: u32, hash_alg: u16, digest: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&0u16.to_be_bytes()); // nonceSize = 0
     buf.push(0u8); // sessionAttributes = 0
     buf.extend_from_slice(&0u16.to_be_bytes()); // hmacSize = 0
-    // TPML_DIGEST_VALUES: count(u32) + TPMT_HA
+                                                // TPML_DIGEST_VALUES: count(u32) + TPMT_HA
     buf.extend_from_slice(&1u32.to_be_bytes()); // count = 1
     buf.extend_from_slice(&hash_alg.to_be_bytes()); // hashAlg
     buf.extend_from_slice(digest); // digest bytes
@@ -211,18 +211,18 @@ pub fn create_rsa2048_under_owner(auth_value: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&0u16.to_be_bytes()); // nonceSize
     buf.push(0u8); // sessionAttributes
     buf.extend_from_slice(&0u16.to_be_bytes()); // hmacSize
-    // inSensitive (TPM2B_SENSITIVE_CREATE): size + TPMS_SENSITIVE_CREATE
-    //   userAuth (TPM2B_AUTH): u16 size + bytes
-    //   data (TPM2B_SENSITIVE_DATA): u16 size (0 = empty)
+                                                // inSensitive (TPM2B_SENSITIVE_CREATE): size + TPMS_SENSITIVE_CREATE
+                                                //   userAuth (TPM2B_AUTH): u16 size + bytes
+                                                //   data (TPM2B_SENSITIVE_DATA): u16 size (0 = empty)
     let inner_size: u16 = 2 + auth_value.len() as u16 + 2;
     buf.extend_from_slice(&inner_size.to_be_bytes());
     buf.extend_from_slice(&(auth_value.len() as u16).to_be_bytes());
     buf.extend_from_slice(auth_value);
     buf.extend_from_slice(&0u16.to_be_bytes()); // data size = 0
-    // inPublic (TPM2B_PUBLIC): u16 size + TPMT_PUBLIC stub
-    // TPMT_PUBLIC: type(u16) + nameAlg(u16) + objectAttributes(u32) +
-    //   authPolicy(TPM2B: u16 + 0 bytes) + parameters + unique
-    // RSA-2048, RSAES, SHA256, restricted=0, decrypt=1
+                                                // inPublic (TPM2B_PUBLIC): u16 size + TPMT_PUBLIC stub
+                                                // TPMT_PUBLIC: type(u16) + nameAlg(u16) + objectAttributes(u32) +
+                                                //   authPolicy(TPM2B: u16 + 0 bytes) + parameters + unique
+                                                // RSA-2048, RSAES, SHA256, restricted=0, decrypt=1
     let pub_inner: &[u8] = &[
         0x00, 0x01, // type = TPM_ALG_RSA
         0x00, 0x0B, // nameAlg = SHA256
@@ -347,7 +347,7 @@ pub fn nv_write(nv_index: u32, data: &[u8], offset: u16) -> Vec<u8> {
     let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_WRITE);
     buf.extend_from_slice(&nv_index.to_be_bytes()); // authHandle
     buf.extend_from_slice(&nv_index.to_be_bytes()); // nvIndex
-    // Empty password session
+                                                    // Empty password session
     buf.extend_from_slice(&9u32.to_be_bytes());
     buf.extend_from_slice(&TPM_RS_PW.to_be_bytes());
     buf.extend_from_slice(&0u16.to_be_bytes());

@@ -65,8 +65,8 @@ mod smokes {
 
     fn smoke_crb_locality_grant_sequence() -> TestResult {
         use crate::crb::{
-            acquire_locality, LOC_CTRL_REQUEST, LOC_STATE_LOC_ASSIGNED, MockCrb,
-            REG_LOC_CTRL, REG_LOC_STATE,
+            acquire_locality, MockCrb, LOC_CTRL_REQUEST, LOC_STATE_LOC_ASSIGNED, REG_LOC_CTRL,
+            REG_LOC_STATE,
         };
         let mut m = MockCrb::new();
         // Simulate TPM asserting locAssigned on the first read
@@ -97,9 +97,7 @@ mod smokes {
     kernel_test_in!("drivers/tpm/crb", smoke_crb_locality_times_out);
 
     fn smoke_crb_run_command_go_self_clears() -> TestResult {
-        use crate::crb::{
-            run_command, MockCrb, CTRL_STS_IDLE, REG_CTRL_START, REG_CTRL_STS,
-        };
+        use crate::crb::{run_command, MockCrb, CTRL_STS_IDLE, REG_CTRL_START, REG_CTRL_STS};
         let mut m = MockCrb::new();
         m.regs[REG_CTRL_STS / 4] = CTRL_STS_IDLE;
         m.install_hook(REG_CTRL_START, |regs| {
@@ -433,8 +431,7 @@ mod smokes {
 
     fn smoke_tpm2_table_parse() -> TestResult {
         use crate::probe::{
-            parse_tpm2_table, Tpm2AcpiTable, ACPI_TPM2_COMMAND_BUFFER,
-            TPM2_TABLE_MIN_LEN,
+            parse_tpm2_table, Tpm2AcpiTable, ACPI_TPM2_COMMAND_BUFFER, TPM2_TABLE_MIN_LEN,
         };
         // Build a synthetic TPM2 ACPI table.
         let mut table = [0u8; TPM2_TABLE_MIN_LEN + 4];
@@ -585,7 +582,7 @@ mod smokes {
     // ── Tpm2bPublic encode / field accessors ─────────────────────────
 
     fn smoke_tpm2b_public_encode() -> TestResult {
-        use crate::tpm2::objects::{Tpm2bPublic, rsa2048_template, OBJ_ATTR_SEAL};
+        use crate::tpm2::objects::{rsa2048_template, Tpm2bPublic, OBJ_ATTR_SEAL};
         let inner = rsa2048_template(OBJ_ATTR_SEAL);
         let pub_obj = Tpm2bPublic::from_bytes(&inner);
         let encoded = pub_obj.encode();
@@ -609,8 +606,8 @@ mod smokes {
 
     fn smoke_crb_program_buffers_six_writes() -> TestResult {
         use crate::crb::{
-            program_buffers, MockCrb, REG_CMD_HADDR, REG_CMD_LADDR, REG_CMD_SIZE,
-            REG_RSP_HADDR, REG_RSP_LADDR, REG_RSP_SIZE,
+            program_buffers, MockCrb, REG_CMD_HADDR, REG_CMD_LADDR, REG_CMD_SIZE, REG_RSP_HADDR,
+            REG_RSP_LADDR, REG_RSP_SIZE,
         };
         let mut m = MockCrb::new();
         let cmd_phys: u64 = 0x0000_0001_DEAD_0000;
@@ -664,27 +661,38 @@ mod smokes {
         fn submit(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
             let mut r = alloc::vec![0u8; 10 + 2 + 8];
             // tag = TPM_ST_NO_SESSIONS
-            r[0] = 0x80; r[1] = 0x01;
+            r[0] = 0x80;
+            r[1] = 0x01;
             // size = 20
             let sz = 20u32;
             r[2] = (sz >> 24) as u8;
             r[3] = (sz >> 16) as u8;
-            r[4] = (sz >> 8)  as u8;
+            r[4] = (sz >> 8) as u8;
             r[5] = sz as u8;
             // rc = TPM_RC_SUCCESS
-            r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+            r[6] = 0;
+            r[7] = 0;
+            r[8] = 0;
+            r[9] = 0;
             // TPM2B_DIGEST size = 8
-            r[10] = 0x00; r[11] = 0x08;
+            r[10] = 0x00;
+            r[11] = 0x08;
             // random bytes
-            r[12] = 0xDE; r[13] = 0xAD; r[14] = 0xBE; r[15] = 0xEF;
-            r[16] = 0x01; r[17] = 0x02; r[18] = 0x03; r[19] = 0x04;
+            r[12] = 0xDE;
+            r[13] = 0xAD;
+            r[14] = 0xBE;
+            r[15] = 0xEF;
+            r[16] = 0x01;
+            r[17] = 0x02;
+            r[18] = 0x03;
+            r[19] = 0x04;
             Ok(r)
         }
     }
 
     fn smoke_tpm0_write_read_roundtrip() -> TestResult {
-        use alloc::sync::Arc;
         use crate::devfs_bridge::{DevTpm0, TpmTransport};
+        use alloc::sync::Arc;
         use narf_filesystem::FileOps;
 
         // Install mock transport
@@ -694,21 +702,27 @@ mod smokes {
 
         // Build a minimal GetRandom command (tag + size + CC + count)
         let mut cmd = alloc::vec![0u8; 12];
-        cmd[0] = 0x80; cmd[1] = 0x01;             // tag TPM_ST_NO_SESSIONS
-        cmd[2] = 0; cmd[3] = 0; cmd[4] = 0; cmd[5] = 12; // size
-        cmd[6] = 0; cmd[7] = 0; cmd[8] = 0x01; cmd[9] = 0x7B; // CC GetRandom
-        cmd[10] = 0; cmd[11] = 8;                 // bytesRequested = 8
+        cmd[0] = 0x80;
+        cmd[1] = 0x01; // tag TPM_ST_NO_SESSIONS
+        cmd[2] = 0;
+        cmd[3] = 0;
+        cmd[4] = 0;
+        cmd[5] = 12; // size
+        cmd[6] = 0;
+        cmd[7] = 0;
+        cmd[8] = 0x01;
+        cmd[9] = 0x7B; // CC GetRandom
+        cmd[10] = 0;
+        cmd[11] = 8; // bytesRequested = 8
 
-        let n = poll_once_sync(dev.write(0, &cmd))
-            .and_then(|r| r.ok());
+        let n = poll_once_sync(dev.write(0, &cmd)).and_then(|r| r.ok());
         if n != Some(12) {
             crate::devfs_bridge::unregister_transport();
             return TestResult::Fail("write did not return 12");
         }
 
         let mut buf = [0u8; 32];
-        let n = poll_once_sync(dev.read(0, &mut buf))
-            .and_then(|r| r.ok());
+        let n = poll_once_sync(dev.read(0, &mut buf)).and_then(|r| r.ok());
         if n != Some(20) {
             crate::devfs_bridge::unregister_transport();
             return TestResult::Fail("read did not return 20");
@@ -732,8 +746,8 @@ mod smokes {
     }
 
     fn smoke_tpm0_poll_readiness_pending() -> TestResult {
-        use alloc::sync::Arc;
         use crate::devfs_bridge::{DevTpm0, TpmTransport};
+        use alloc::sync::Arc;
         use narf_filesystem::{FileOps, POLL_IN, POLL_OUT};
 
         crate::devfs_bridge::register_transport(Arc::new(EchoTransport) as Arc<dyn TpmTransport>);
@@ -753,9 +767,13 @@ mod smokes {
 
         // Write a minimal valid command
         let mut cmd = alloc::vec![0u8; 10];
-        cmd[0] = 0x80; cmd[1] = 0x01; // tag
-        cmd[2] = 0; cmd[3] = 0; cmd[4] = 0; cmd[5] = 10; // size
-        // CC doesn't matter for EchoTransport
+        cmd[0] = 0x80;
+        cmd[1] = 0x01; // tag
+        cmd[2] = 0;
+        cmd[3] = 0;
+        cmd[4] = 0;
+        cmd[5] = 10; // size
+                     // CC doesn't matter for EchoTransport
         let _ = poll_once_sync(dev.write(0, &cmd));
 
         // After write: both POLL_IN | POLL_OUT
@@ -789,8 +807,12 @@ mod smokes {
                     FLUSH_CALLS.lock().push(handle);
                     // Return a success response
                     let mut r = alloc::vec![0u8; 10];
-                    r[0] = 0x80; r[1] = 0x01;
-                    r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 10;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
+                    r[2] = 0;
+                    r[3] = 0;
+                    r[4] = 0;
+                    r[5] = 10;
                     return Ok(r);
                 }
             }
@@ -799,12 +821,22 @@ mod smokes {
                 let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
                 if cc == crate::tpm2::TPM_CC_LOAD {
                     let mut r = alloc::vec![0u8; 14];
-                    r[0] = 0x80; r[1] = 0x01;
-                    r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 14;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
+                    r[2] = 0;
+                    r[3] = 0;
+                    r[4] = 0;
+                    r[5] = 14;
                     // rc = 0 (success)
-                    r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+                    r[6] = 0;
+                    r[7] = 0;
+                    r[8] = 0;
+                    r[9] = 0;
                     // objectHandle = 0x8000_0001 (transient)
-                    r[10] = 0x80; r[11] = 0x00; r[12] = 0x00; r[13] = 0x01;
+                    r[10] = 0x80;
+                    r[11] = 0x00;
+                    r[12] = 0x00;
+                    r[13] = 0x01;
                     return Ok(r);
                 }
             }
@@ -813,15 +845,15 @@ mod smokes {
     }
 
     fn smoke_tpmrm0_flush_on_drop() -> TestResult {
-        use alloc::sync::Arc;
         use crate::devfs_bridge::{DevTpmRm0, TpmTransport};
+        use alloc::sync::Arc;
         use narf_filesystem::FileOps;
 
         // Reset flush call tracker
         FLUSH_CALLS.lock().clear();
 
         crate::devfs_bridge::register_transport(
-            Arc::new(TrackingTransport) as Arc<dyn TpmTransport>,
+            Arc::new(TrackingTransport) as Arc<dyn TpmTransport>
         );
 
         {
@@ -829,10 +861,17 @@ mod smokes {
 
             // Send a TPM2_Load command — the response will contain handle 0x8000_0001
             let mut cmd = alloc::vec![0u8; 10];
-            cmd[0] = 0x80; cmd[1] = 0x01;
-            cmd[2] = 0; cmd[3] = 0; cmd[4] = 0; cmd[5] = 10;
+            cmd[0] = 0x80;
+            cmd[1] = 0x01;
+            cmd[2] = 0;
+            cmd[3] = 0;
+            cmd[4] = 0;
+            cmd[5] = 10;
             // CC = TPM_CC_LOAD = 0x0157
-            cmd[6] = 0x00; cmd[7] = 0x00; cmd[8] = 0x01; cmd[9] = 0x57;
+            cmd[6] = 0x00;
+            cmd[7] = 0x00;
+            cmd[8] = 0x01;
+            cmd[9] = 0x57;
             let _ = poll_once_sync(dev.write(0, &cmd));
 
             // DevTpmRm0 drops here → flush_all_transients → TPM2_FlushContext(0x8000_0001)
@@ -860,8 +899,8 @@ mod smokes {
     }
 
     fn smoke_sysfs_tpm_version_major() -> TestResult {
-        use alloc::sync::Arc;
         use crate::devfs_bridge::TpmTransport;
+        use alloc::sync::Arc;
 
         // register_sysfs_tpm0 calls class_register which is idempotent;
         // the kobject tree allows repeated attribute additions (noop on dup).
@@ -914,28 +953,45 @@ mod smokes {
                 let total = 10 + body_len;
                 let mut r = alloc::vec![0u8; total];
                 // header
-                r[0] = 0x80; r[1] = 0x01;
+                r[0] = 0x80;
+                r[1] = 0x01;
                 let sz = total as u32;
-                r[2] = (sz >> 24) as u8; r[3] = (sz >> 16) as u8;
-                r[4] = (sz >> 8) as u8;  r[5] = sz as u8;
+                r[2] = (sz >> 24) as u8;
+                r[3] = (sz >> 16) as u8;
+                r[4] = (sz >> 8) as u8;
+                r[5] = sz as u8;
                 // rc = 0
-                r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+                r[6] = 0;
+                r[7] = 0;
+                r[8] = 0;
+                r[9] = 0;
                 let mut p = 10usize;
                 // pcrUpdateCounter = 0
                 p += 4;
                 // TPML_PCR_SELECTION count = 1
-                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 1; p += 4;
+                r[p] = 0;
+                r[p + 1] = 0;
+                r[p + 2] = 0;
+                r[p + 3] = 1;
+                p += 4;
                 // hashAlg
-                r[p] = (alg >> 8) as u8; r[p+1] = alg as u8; p += 2;
+                r[p] = (alg >> 8) as u8;
+                r[p + 1] = alg as u8;
+                p += 2;
                 // sizeofSelect = 3
-                r[p] = 3; p += 1;
+                r[p] = 3;
+                p += 1;
                 // pcrSelect = 3 bytes (all zeros, doesn't matter for parsing)
                 p += 3;
                 // TPML_DIGEST count = 1
-                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 1; p += 4;
+                r[p] = 0;
+                r[p + 1] = 0;
+                r[p + 2] = 0;
+                r[p + 3] = 1;
+                p += 4;
                 // TPM2B_DIGEST size
                 r[p] = (digest_size >> 8) as u8;
-                r[p+1] = digest_size as u8;
+                r[p + 1] = digest_size as u8;
                 p += 2;
                 // digest bytes = all zeros (already zeroed)
                 let _ = p; // suppress unused warning
@@ -946,8 +1002,8 @@ mod smokes {
     }
 
     fn smoke_sysfs_pcrs_format() -> TestResult {
-        use alloc::sync::Arc;
         use crate::devfs_bridge::TpmTransport;
+        use alloc::sync::Arc;
 
         let t = Arc::new(PcrTransport) as Arc<dyn TpmTransport>;
         crate::sysfs_bridge::register_sysfs_tpm0(t);
@@ -987,23 +1043,45 @@ mod smokes {
                 let body = 1 + 4 + 4 + 4 + 4; // 17 bytes
                 let total = 10 + body;
                 let mut r = alloc::vec![0u8; total];
-                r[0] = 0x80; r[1] = 0x01;
+                r[0] = 0x80;
+                r[1] = 0x01;
                 let sz = total as u32;
-                r[2] = (sz >> 24) as u8; r[3] = (sz >> 16) as u8;
-                r[4] = (sz >> 8) as u8;  r[5] = sz as u8;
+                r[2] = (sz >> 24) as u8;
+                r[3] = (sz >> 16) as u8;
+                r[4] = (sz >> 8) as u8;
+                r[5] = sz as u8;
                 // rc = 0
-                r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0;
+                r[6] = 0;
+                r[7] = 0;
+                r[8] = 0;
+                r[9] = 0;
                 let mut p = 10usize;
                 // moreData = 0
-                r[p] = 0; p += 1;
+                r[p] = 0;
+                p += 1;
                 // capabilityCode = TPM_CAP_TPM_PROPERTIES = 6
-                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 6; p += 4;
+                r[p] = 0;
+                r[p + 1] = 0;
+                r[p + 2] = 0;
+                r[p + 3] = 6;
+                p += 4;
                 // count = 1
-                r[p] = 0; r[p+1] = 0; r[p+2] = 0; r[p+3] = 1; p += 4;
+                r[p] = 0;
+                r[p + 1] = 0;
+                r[p + 2] = 0;
+                r[p + 3] = 1;
+                p += 4;
                 // property tag = PT_MANUFACTURER = 0x105
-                r[p] = 0; r[p+1] = 0; r[p+2] = 0x01; r[p+3] = 0x05; p += 4;
+                r[p] = 0;
+                r[p + 1] = 0;
+                r[p + 2] = 0x01;
+                r[p + 3] = 0x05;
+                p += 4;
                 // value = 0x494E4643 ("INFC")
-                r[p] = 0x49; r[p+1] = 0x4E; r[p+2] = 0x46; r[p+3] = 0x43;
+                r[p] = 0x49;
+                r[p + 1] = 0x4E;
+                r[p + 2] = 0x46;
+                r[p + 3] = 0x43;
                 return Ok(r);
             }
             Err(())
@@ -1011,8 +1089,8 @@ mod smokes {
     }
 
     fn smoke_sysfs_manufacturer_ascii() -> TestResult {
-        use alloc::sync::Arc;
         use crate::devfs_bridge::TpmTransport;
+        use alloc::sync::Arc;
 
         let t = Arc::new(MfrTransport) as Arc<dyn TpmTransport>;
         crate::sysfs_bridge::register_sysfs_tpm0(t);
@@ -1026,7 +1104,11 @@ mod smokes {
         };
 
         // Should be "INFC\n"
-        if !mfr.trim_end_matches('\n').chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        if !mfr
+            .trim_end_matches('\n')
+            .chars()
+            .all(|c| c.is_ascii_graphic() || c == ' ')
+        {
             return TestResult::Fail("manufacturer value contains non-printable chars");
         }
         if mfr.trim_end_matches('\n').len() != 4 {

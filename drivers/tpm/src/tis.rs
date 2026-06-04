@@ -207,8 +207,7 @@ pub fn request_locality<M: TisMmio>(mmio: &mut M, locality: u32) -> Result<(), T
     mmio.write8(offset, ACCESS_REQUEST_USE);
     for _ in 0..TIS_POLL_BUDGET {
         let v = mmio.read8(offset);
-        if (v & (ACCESS_ACTIVE_LOCALITY | ACCESS_VALID))
-            == (ACCESS_ACTIVE_LOCALITY | ACCESS_VALID)
+        if (v & (ACCESS_ACTIVE_LOCALITY | ACCESS_VALID)) == (ACCESS_ACTIVE_LOCALITY | ACCESS_VALID)
         {
             return Ok(());
         }

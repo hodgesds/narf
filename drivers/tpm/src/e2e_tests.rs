@@ -37,11 +37,11 @@
 mod smokes {
     extern crate alloc;
 
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use crate::devfs_bridge::TpmTransport;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
-    use crate::devfs_bridge::TpmTransport;
 
     use crate::tpm2::{
         TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ,
@@ -58,32 +58,28 @@ mod smokes {
 
     fn sha256(data: &[u8]) -> [u8; 32] {
         const K: [u32; 64] = [
-            0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,
-            0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-            0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
-            0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-            0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,
-            0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-            0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,
-            0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-            0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
-            0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-            0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,
-            0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,
-            0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-            0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
-            0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
         ];
         const H0: [u32; 8] = [
-            0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-            0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
         ];
 
         let bit_len = (data.len() as u64).wrapping_mul(8);
         let pad_len = {
             let mut l = data.len() + 1;
-            while l % 64 != 56 { l += 1; }
+            while l % 64 != 56 {
+                l += 1;
+            }
             l + 8
         };
         let mut msg = alloc::vec![0u8; pad_len];
@@ -96,35 +92,55 @@ mod smokes {
             let mut w = [0u32; 64];
             for i in 0..16 {
                 w[i] = u32::from_be_bytes([
-                    block[i*4], block[i*4+1], block[i*4+2], block[i*4+3],
+                    block[i * 4],
+                    block[i * 4 + 1],
+                    block[i * 4 + 2],
+                    block[i * 4 + 3],
                 ]);
             }
             for i in 16..64 {
-                let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
-                let s1 = w[i-2].rotate_right(17)  ^ w[i-2].rotate_right(19)  ^ (w[i-2]  >> 10);
-                w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
             }
             let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] =
                 [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]];
             for t in 0..64 {
-                let s1  = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-                let ch  = (e & f) ^ (!e & g);
-                let t1  = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[t]).wrapping_add(w[t]);
-                let s0  = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ (!e & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[t])
+                    .wrapping_add(w[t]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
                 let maj = (a & b) ^ (a & c) ^ (b & c);
-                let t2  = s0.wrapping_add(maj);
-                hh = g; g = f; f = e;
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
                 e = d.wrapping_add(t1);
-                d = c; c = b; b = a;
+                d = c;
+                c = b;
+                b = a;
                 a = t1.wrapping_add(t2);
             }
-            h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
-            h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
-            h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
-            h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
         }
         let mut out = [0u8; 32];
-        for i in 0..8 { out[i*4..(i+1)*4].copy_from_slice(&h[i].to_be_bytes()); }
+        for i in 0..8 {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&h[i].to_be_bytes());
+        }
         out
     }
 
@@ -207,35 +223,51 @@ mod smokes {
 
     impl FakeTpmTransport {
         fn new() -> Self {
-            Self { state: IrqSafeSpinLock::new(FakeState::new()) }
+            Self {
+                state: IrqSafeSpinLock::new(FakeState::new()),
+            }
         }
     }
 
     fn success_resp() -> Vec<u8> {
         let mut r = alloc::vec![0u8; 10];
-        r[0] = 0x80; r[1] = 0x01; // TPM_ST_NO_SESSIONS
-        r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 10;
+        r[0] = 0x80;
+        r[1] = 0x01; // TPM_ST_NO_SESSIONS
+        r[2] = 0;
+        r[3] = 0;
+        r[4] = 0;
+        r[5] = 10;
         r
     }
 
     fn failure_resp(rc: u32) -> Vec<u8> {
         let mut r = alloc::vec![0u8; 10];
-        r[0] = 0x80; r[1] = 0x01;
-        r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 10;
-        r[6] = (rc >> 24) as u8; r[7] = (rc >> 16) as u8;
-        r[8] = (rc >>  8) as u8; r[9] = rc as u8;
+        r[0] = 0x80;
+        r[1] = 0x01;
+        r[2] = 0;
+        r[3] = 0;
+        r[4] = 0;
+        r[5] = 10;
+        r[6] = (rc >> 24) as u8;
+        r[7] = (rc >> 16) as u8;
+        r[8] = (rc >> 8) as u8;
+        r[9] = rc as u8;
         r
     }
 
     fn patch_size(r: &mut Vec<u8>) {
         let n = r.len() as u32;
-        r[2] = (n >> 24) as u8; r[3] = (n >> 16) as u8;
-        r[4] = (n >>  8) as u8; r[5] = n as u8;
+        r[2] = (n >> 24) as u8;
+        r[3] = (n >> 16) as u8;
+        r[4] = (n >> 8) as u8;
+        r[5] = n as u8;
     }
 
     impl crate::devfs_bridge::TpmTransport for FakeTpmTransport {
         fn submit(&self, cmd: &[u8]) -> Result<Vec<u8>, ()> {
-            if cmd.len() < 10 { return Err(()); }
+            if cmd.len() < 10 {
+                return Err(());
+            }
             let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
             let mut st = self.state.lock();
 
@@ -248,15 +280,23 @@ mod smokes {
                     // Return FAKE_MANUFACTURER for any property query.
                     // Body: moreData(1) + cap(4) + count(4) + tag(4) + value(4) = 17
                     let mut r = alloc::vec![0u8; 10 + 17];
-                    r[0] = 0x80; r[1] = 0x01;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
                     let mut p = 10usize;
-                    r[p] = 0; p += 1;                         // moreData = 0
-                    r[p+3] = 6; p += 4;                       // cap = TPM_CAP_TPM_PROPERTIES
-                    r[p+3] = 1; p += 4;                       // count = 1
-                    r[p+2] = 0x01; r[p+3] = 0x05; p += 4;    // tag = PT_MANUFACTURER = 0x105
+                    r[p] = 0;
+                    p += 1; // moreData = 0
+                    r[p + 3] = 6;
+                    p += 4; // cap = TPM_CAP_TPM_PROPERTIES
+                    r[p + 3] = 1;
+                    p += 4; // count = 1
+                    r[p + 2] = 0x01;
+                    r[p + 3] = 0x05;
+                    p += 4; // tag = PT_MANUFACTURER = 0x105
                     let mv = FAKE_MANUFACTURER;
-                    r[p]   = (mv >> 24) as u8; r[p+1] = (mv >> 16) as u8;
-                    r[p+2] = (mv >>  8) as u8; r[p+3] = mv as u8;
+                    r[p] = (mv >> 24) as u8;
+                    r[p + 1] = (mv >> 16) as u8;
+                    r[p + 2] = (mv >> 8) as u8;
+                    r[p + 3] = mv as u8;
                     patch_size(&mut r);
                     Ok(r)
                 }
@@ -265,14 +305,21 @@ mod smokes {
                 x if x == TPM_CC_GET_RANDOM => {
                     let n = if cmd.len() >= 12 {
                         u16::from_be_bytes([cmd[10], cmd[11]]) as usize
-                    } else { 32 };
+                    } else {
+                        32
+                    };
                     let mut r = alloc::vec![0u8; 10 + 2 + n];
-                    r[0] = 0x80; r[1] = 0x01;
-                    r[10] = (n >> 8) as u8; r[11] = n as u8;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
+                    r[10] = (n >> 8) as u8;
+                    r[11] = n as u8;
                     // Pseudo-random fill: each byte varies with position.
                     for i in 0..n {
-                        r[12 + i] = ((i.wrapping_mul(0x37).wrapping_add(0xA5)
-                                       .wrapping_add((i >> 3).wrapping_mul(0x5B))) & 0xFF) as u8;
+                        r[12 + i] = ((i
+                            .wrapping_mul(0x37)
+                            .wrapping_add(0xA5)
+                            .wrapping_add((i >> 3).wrapping_mul(0x5B)))
+                            & 0xFF) as u8;
                     }
                     patch_size(&mut r);
                     Ok(r)
@@ -281,9 +328,13 @@ mod smokes {
                 // ── TPM2_PCR_Read ─────────────────────────────────────────
                 x if x == TPM_CC_PCR_READ => {
                     // header(10) + selCount(4) + hashAlg(2) + sos(1) + bitmap(3)
-                    if cmd.len() < 20 { return Err(()); }
+                    if cmd.len() < 20 {
+                        return Err(());
+                    }
                     let sos = cmd[16] as usize;
-                    if sos != 3 { return Err(()); }
+                    if sos != 3 {
+                        return Err(());
+                    }
                     let bitmap = [cmd[17], cmd[18], cmd[19]];
 
                     let mut digests: Vec<[u8; 32]> = Vec::new();
@@ -297,23 +348,37 @@ mod smokes {
                     // Response body:
                     // pcrUpdateCounter(4) + TPML_PCR_SELECTION(4+2+1+3) +
                     // TPML_DIGEST: count(4) + dc × (size(2)+digest(32))
-                    let body = 4 + (4+2+1+3) + 4 + dc*(2+32);
+                    let body = 4 + (4 + 2 + 1 + 3) + 4 + dc * (2 + 32);
                     let mut r = alloc::vec![0u8; 10 + body];
-                    r[0] = 0x80; r[1] = 0x01;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
                     let mut p = 10usize;
                     p += 4; // pcrUpdateCounter = 0
-                    // TPML_PCR_SELECTION count=1
-                    r[p+3] = 1; p += 4;
-                    r[p] = 0x00; r[p+1] = 0x0B; p += 2; // SHA-256
-                    r[p] = 3; p += 1;
-                    r[p] = bitmap[0]; r[p+1] = bitmap[1]; r[p+2] = bitmap[2]; p += 3;
+                            // TPML_PCR_SELECTION count=1
+                    r[p + 3] = 1;
+                    p += 4;
+                    r[p] = 0x00;
+                    r[p + 1] = 0x0B;
+                    p += 2; // SHA-256
+                    r[p] = 3;
+                    p += 1;
+                    r[p] = bitmap[0];
+                    r[p + 1] = bitmap[1];
+                    r[p + 2] = bitmap[2];
+                    p += 3;
                     // TPML_DIGEST count
                     let dcu = dc as u32;
-                    r[p] = (dcu >> 24) as u8; r[p+1] = (dcu >> 16) as u8;
-                    r[p+2] = (dcu >> 8) as u8; r[p+3] = dcu as u8; p += 4;
+                    r[p] = (dcu >> 24) as u8;
+                    r[p + 1] = (dcu >> 16) as u8;
+                    r[p + 2] = (dcu >> 8) as u8;
+                    r[p + 3] = dcu as u8;
+                    p += 4;
                     for d in &digests {
-                        r[p] = 0; r[p+1] = 32; p += 2; // TPM2B_DIGEST size = 32
-                        r[p..p+32].copy_from_slice(d); p += 32;
+                        r[p] = 0;
+                        r[p + 1] = 32;
+                        p += 2; // TPM2B_DIGEST size = 32
+                        r[p..p + 32].copy_from_slice(d);
+                        p += 32;
                     }
                     patch_size(&mut r);
                     Ok(r)
@@ -323,9 +388,13 @@ mod smokes {
                 x if x == TPM_CC_PCR_EXTEND => {
                     // header(10)+pcrHandle(4)+authSize(4)+auth(9)+count(4)+hashAlg(2)+digest(32)
                     // = 10+4+4+9+4+2+32 = 65
-                    if cmd.len() < 65 { return Err(()); }
+                    if cmd.len() < 65 {
+                        return Err(());
+                    }
                     let pcr_handle = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
-                    if pcr_handle >= 24 { return Err(()); }
+                    if pcr_handle >= 24 {
+                        return Err(());
+                    }
                     let pcr = pcr_handle as usize;
                     // digest starts at byte 33 (10+4+4+9+4+2 = 33)
                     let mut digest = [0u8; 32];
@@ -346,17 +415,24 @@ mod smokes {
                 //   TPM2B data: size(2) + bytes +
                 //   offset(2)
                 x if x == TPM_CC_NV_WRITE => {
-                    if cmd.len() < 31 { return Err(()); }
+                    if cmd.len() < 31 {
+                        return Err(());
+                    }
                     // nvIndex at 14..17
                     let nv_index = u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]);
                     // authSize at 18..21; for password session = 9
-                    let auth_size = u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) as usize;
+                    let auth_size =
+                        u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) as usize;
                     // TPM2B_MAX_NV_BUFFER size at 10+4+4+4+auth_size = 22+auth_size
                     let data_hdr = 22 + auth_size;
-                    if cmd.len() < data_hdr + 4 { return Err(()); }
-                    let data_size = u16::from_be_bytes([cmd[data_hdr], cmd[data_hdr+1]]) as usize;
-                    if cmd.len() < data_hdr + 2 + data_size { return Err(()); }
-                    let data = cmd[data_hdr+2..data_hdr+2+data_size].to_vec();
+                    if cmd.len() < data_hdr + 4 {
+                        return Err(());
+                    }
+                    let data_size = u16::from_be_bytes([cmd[data_hdr], cmd[data_hdr + 1]]) as usize;
+                    if cmd.len() < data_hdr + 2 + data_size {
+                        return Err(());
+                    }
+                    let data = cmd[data_hdr + 2..data_hdr + 2 + data_size].to_vec();
 
                     if let Some(entry) = st.nv.iter_mut().find(|e| e.0 == nv_index) {
                         entry.1 = data;
@@ -373,13 +449,19 @@ mod smokes {
                 //   authSize(4) + auth(9) +
                 //   size(2) + offset(2)
                 x if x == TPM_CC_NV_READ => {
-                    if cmd.len() < 31 { return Err(()); }
+                    if cmd.len() < 31 {
+                        return Err(());
+                    }
                     let nv_index = u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]);
-                    let auth_size = u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) as usize;
+                    let auth_size =
+                        u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) as usize;
                     let params = 22 + auth_size;
-                    if cmd.len() < params + 4 { return Err(()); }
-                    let read_size   = u16::from_be_bytes([cmd[params],   cmd[params+1]]) as usize;
-                    let read_offset = u16::from_be_bytes([cmd[params+2], cmd[params+3]]) as usize;
+                    if cmd.len() < params + 4 {
+                        return Err(());
+                    }
+                    let read_size = u16::from_be_bytes([cmd[params], cmd[params + 1]]) as usize;
+                    let read_offset =
+                        u16::from_be_bytes([cmd[params + 2], cmd[params + 3]]) as usize;
 
                     let data = match st.nv.iter().find(|e| e.0 == nv_index) {
                         Some(e) => {
@@ -394,10 +476,12 @@ mod smokes {
                     };
 
                     let mut r = alloc::vec![0u8; 10 + 2 + data.len()];
-                    r[0] = 0x80; r[1] = 0x01;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
                     let dl = data.len() as u16;
-                    r[10] = (dl >> 8) as u8; r[11] = dl as u8;
-                    r[12..12+data.len()].copy_from_slice(&data);
+                    r[10] = (dl >> 8) as u8;
+                    r[11] = dl as u8;
+                    r[12..12 + data.len()].copy_from_slice(&data);
                     patch_size(&mut r);
                     Ok(r)
                 }
@@ -408,9 +492,12 @@ mod smokes {
                     st.sessions.push(AuthSession { handle });
                     // Response: header + sessionHandle(4) + nonceTPM(TPM2B:2+0)
                     let mut r = alloc::vec![0u8; 10 + 4 + 2];
-                    r[0] = 0x80; r[1] = 0x01;
-                    r[10] = (handle >> 24) as u8; r[11] = (handle >> 16) as u8;
-                    r[12] = (handle >>  8) as u8; r[13] = handle as u8;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
+                    r[10] = (handle >> 24) as u8;
+                    r[11] = (handle >> 16) as u8;
+                    r[12] = (handle >> 8) as u8;
+                    r[13] = handle as u8;
                     // nonceTPM size = 0 (already zeroed)
                     patch_size(&mut r);
                     Ok(r)
@@ -420,7 +507,9 @@ mod smokes {
                 x if x == TPM_CC_POLICY_PCR => {
                     // We just check the session exists and return SUCCESS.
                     // The actual PCR check happens at Unseal time.
-                    if cmd.len() < 14 { return Err(()); }
+                    if cmd.len() < 14 {
+                        return Err(());
+                    }
                     let _session = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
                     let sess_exists = st.sessions.iter().any(|s| s.handle == _session);
                     if !sess_exists {
@@ -452,7 +541,7 @@ mod smokes {
                     //           TPMT_TK_CREATION: tag(2)+hierarchy(4)+digest(2+0)
                     let mut r: Vec<u8> = Vec::new();
                     r.extend_from_slice(&[0x80u8, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]); // header placeholder
-                    // TPM2B_PRIVATE: size(2) + handle(4)
+                                                                                  // TPM2B_PRIVATE: size(2) + handle(4)
                     r.extend_from_slice(&(private_blob.len() as u16).to_be_bytes());
                     r.extend_from_slice(&private_blob);
                     // TPM2B_PUBLIC: size = 0
@@ -473,24 +562,37 @@ mod smokes {
                 // returns a transient handle 0x8000_0000|orig_handle.
                 x if x == TPM_CC_LOAD => {
                     // header(10)+parentHandle(4)+authSize(4)+auth(N)+TPM2B_PRIVATE:size(2)+blob
-                    if cmd.len() < 31 { return Err(()); }
-                    let auth_size = u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]) as usize;
+                    if cmd.len() < 31 {
+                        return Err(());
+                    }
+                    let auth_size =
+                        u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]) as usize;
                     let priv_start = 10 + 4 + 4 + auth_size;
-                    if cmd.len() < priv_start + 6 { return Err(()); }
-                    let priv_size = u16::from_be_bytes([cmd[priv_start], cmd[priv_start+1]]) as usize;
-                    if priv_size < 4 || cmd.len() < priv_start + 2 + priv_size { return Err(()); }
+                    if cmd.len() < priv_start + 6 {
+                        return Err(());
+                    }
+                    let priv_size =
+                        u16::from_be_bytes([cmd[priv_start], cmd[priv_start + 1]]) as usize;
+                    if priv_size < 4 || cmd.len() < priv_start + 2 + priv_size {
+                        return Err(());
+                    }
                     let orig_handle = u32::from_be_bytes([
-                        cmd[priv_start+2], cmd[priv_start+3],
-                        cmd[priv_start+4], cmd[priv_start+5],
+                        cmd[priv_start + 2],
+                        cmd[priv_start + 3],
+                        cmd[priv_start + 4],
+                        cmd[priv_start + 5],
                     ]);
                     if !st.sealed.iter().any(|o| o.handle == orig_handle) {
                         return Ok(failure_resp(0x018B)); // TPM_RC_HANDLE
                     }
                     let transient = 0x8000_0000 | orig_handle;
                     let mut r = alloc::vec![0u8; 10 + 4];
-                    r[0] = 0x80; r[1] = 0x01;
-                    r[10] = (transient >> 24) as u8; r[11] = (transient >> 16) as u8;
-                    r[12] = (transient >>  8) as u8; r[13] = transient as u8;
+                    r[0] = 0x80;
+                    r[1] = 0x01;
+                    r[10] = (transient >> 24) as u8;
+                    r[11] = (transient >> 16) as u8;
+                    r[12] = (transient >> 8) as u8;
+                    r[13] = transient as u8;
                     patch_size(&mut r);
                     Ok(r)
                 }
@@ -501,22 +603,26 @@ mod smokes {
                 // PCR-7 value matches the sealed value, and returns the
                 // secret or TPM_RC_POLICY_FAIL.
                 x if x == TPM_CC_UNSEAL => {
-                    if cmd.len() < 14 { return Err(()); }
+                    if cmd.len() < 14 {
+                        return Err(());
+                    }
                     let item_handle = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
                     // Transient handles have bit 31 set; strip it to get orig.
                     let orig_handle = item_handle & !0x8000_0000;
                     let (pcr_idx, sealed_pcr, secret) =
                         match st.sealed.iter().find(|o| o.handle == orig_handle) {
                             Some(o) => (o.pcr_idx, o.sealed_pcr, o.secret.clone()),
-                            None    => return Ok(failure_resp(0x018B)),
+                            None => return Ok(failure_resp(0x018B)),
                         };
                     if st.pcrs[pcr_idx] != sealed_pcr {
                         return Ok(failure_resp(TPM_RC_POLICY_FAIL));
                     }
                     let mut r = alloc::vec![0u8; 10 + 2 + secret.len()];
-                    r[0] = 0x80; r[1] = 0x01;
-                    r[10] = (secret.len() >> 8) as u8; r[11] = secret.len() as u8;
-                    r[12..12+secret.len()].copy_from_slice(&secret);
+                    r[0] = 0x80;
+                    r[1] = 0x01;
+                    r[10] = (secret.len() >> 8) as u8;
+                    r[11] = secret.len() as u8;
+                    r[12..12 + secret.len()].copy_from_slice(&secret);
                     patch_size(&mut r);
                     Ok(r)
                 }
@@ -544,14 +650,20 @@ mod smokes {
     fn extract_sensitive_data(cmd: &[u8]) -> &[u8] {
         // Base = header(10) + parentHandle(4) + authSize(4) + auth(9)
         const BASE: usize = 10 + 4 + 4 + 9;
-        if cmd.len() <= BASE + 4 { return &[]; }
+        if cmd.len() <= BASE + 4 {
+            return &[];
+        }
         // outerSize at BASE (skip it)
-        let ua_size = u16::from_be_bytes([cmd[BASE+2], cmd[BASE+3]]) as usize;
+        let ua_size = u16::from_be_bytes([cmd[BASE + 2], cmd[BASE + 3]]) as usize;
         let data_off = BASE + 2 + 2 + ua_size;
-        if cmd.len() <= data_off + 2 { return &[]; }
-        let data_size = u16::from_be_bytes([cmd[data_off], cmd[data_off+1]]) as usize;
+        if cmd.len() <= data_off + 2 {
+            return &[];
+        }
+        let data_size = u16::from_be_bytes([cmd[data_off], cmd[data_off + 1]]) as usize;
         let data_start = data_off + 2;
-        if cmd.len() < data_start + data_size { return &[]; }
+        if cmd.len() < data_start + data_size {
+            return &[];
+        }
         &cmd[data_start..data_start + data_size]
     }
 
@@ -561,7 +673,9 @@ mod smokes {
 
     fn poll_sync<F: core::future::Future>(fut: F) -> Option<F::Output> {
         use core::task::{Context, RawWaker, RawWakerVTable, Waker};
-        unsafe fn no_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTAB) }
+        unsafe fn no_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTAB)
+        }
         unsafe fn no_op(_: *const ()) {}
         static VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         let raw = RawWaker::new(core::ptr::null(), &VTAB);
@@ -585,11 +699,11 @@ mod smokes {
         let mut b = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_START_AUTH_SESSION);
         b.extend_from_slice(&0x4000_0007u32.to_be_bytes()); // tpmKey   = TPM_RH_NULL
         b.extend_from_slice(&0x4000_0007u32.to_be_bytes()); // bind     = TPM_RH_NULL
-        b.extend_from_slice(&0u16.to_be_bytes());           // nonceCaller TPM2B size=0
-        b.extend_from_slice(&0u16.to_be_bytes());           // encryptedSalt TPM2B size=0
-        b.push(0x01);                                       // sessionType = TPM_SE_POLICY
-        b.extend_from_slice(&0x0010u16.to_be_bytes());      // symmetric  = TPM_ALG_NULL
-        b.extend_from_slice(&0x000Bu16.to_be_bytes());      // authHash   = SHA-256
+        b.extend_from_slice(&0u16.to_be_bytes()); // nonceCaller TPM2B size=0
+        b.extend_from_slice(&0u16.to_be_bytes()); // encryptedSalt TPM2B size=0
+        b.push(0x01); // sessionType = TPM_SE_POLICY
+        b.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric  = TPM_ALG_NULL
+        b.extend_from_slice(&0x000Bu16.to_be_bytes()); // authHash   = SHA-256
         finalise(&mut b);
         b
     }
@@ -605,7 +719,9 @@ mod smokes {
         b.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
         b.push(3); // sizeofSelect = 3
         let mut mask = [0u8; 3];
-        if pcr_idx < 24 { mask[(pcr_idx / 8) as usize] |= 1 << (pcr_idx % 8); }
+        if pcr_idx < 24 {
+            mask[(pcr_idx / 8) as usize] |= 1 << (pcr_idx % 8);
+        }
         b.extend_from_slice(&mask);
         finalise(&mut b);
         b
@@ -624,7 +740,7 @@ mod smokes {
         b.extend_from_slice(&9u32.to_be_bytes());
         b.extend_from_slice(&TPM_RS_PW.to_be_bytes());
         b.extend_from_slice(&0u16.to_be_bytes()); // nonceSize = 0
-        b.push(0u8);                              // sessionAttributes = 0
+        b.push(0u8); // sessionAttributes = 0
         b.extend_from_slice(&0u16.to_be_bytes()); // hmacSize = 0
 
         // inSensitive (TPM2B_SENSITIVE_CREATE):
@@ -640,13 +756,13 @@ mod smokes {
         //   + TPMS_KEYEDHASH_PARMS: scheme=NULL(2) + unique TPM2B size=0(2)
         let attrs: u32 = (1 << 6) | (1 << 2); // USER_WITH_AUTH | ST_CLEAR
         let mut pub_inner: Vec<u8> = Vec::new();
-        pub_inner.extend_from_slice(&0x0008u16.to_be_bytes());     // type = KEYEDHASH
+        pub_inner.extend_from_slice(&0x0008u16.to_be_bytes()); // type = KEYEDHASH
         pub_inner.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
         pub_inner.extend_from_slice(&attrs.to_be_bytes());
-        pub_inner.extend_from_slice(&32u16.to_be_bytes());         // authPolicy size
+        pub_inner.extend_from_slice(&32u16.to_be_bytes()); // authPolicy size
         pub_inner.extend_from_slice(policy_digest);
-        pub_inner.extend_from_slice(&0x0010u16.to_be_bytes());     // scheme = NULL
-        pub_inner.extend_from_slice(&0u16.to_be_bytes());          // unique TPM2B size=0
+        pub_inner.extend_from_slice(&0x0010u16.to_be_bytes()); // scheme = NULL
+        pub_inner.extend_from_slice(&0u16.to_be_bytes()); // unique TPM2B size=0
         b.extend_from_slice(&(pub_inner.len() as u16).to_be_bytes());
         b.extend_from_slice(&pub_inner);
 
@@ -681,7 +797,7 @@ mod smokes {
         b.extend_from_slice(&9u32.to_be_bytes()); // authArea size
         b.extend_from_slice(&session_handle.to_be_bytes());
         b.extend_from_slice(&0u16.to_be_bytes()); // nonceSize=0
-        b.push(0u8);                              // sessionAttributes
+        b.push(0u8); // sessionAttributes
         b.extend_from_slice(&0u16.to_be_bytes()); // hmacSize=0
         finalise(&mut b);
         b
@@ -692,25 +808,33 @@ mod smokes {
     // ─────────────────────────────────────────────────────────────────────
 
     fn rc(raw: &[u8]) -> u32 {
-        if raw.len() < 10 { return !0; }
+        if raw.len() < 10 {
+            return !0;
+        }
         u32::from_be_bytes([raw[6], raw[7], raw[8], raw[9]])
     }
 
     /// Parse a PCR_Read response and return the first SHA-256 digest.
     fn parse_pcr_digest(raw: &[u8]) -> Option<[u8; 32]> {
-        if rc(raw) != TPM_RC_SUCCESS { return None; }
+        if rc(raw) != TPM_RC_SUCCESS {
+            return None;
+        }
         // header(10)+pcrUpdateCounter(4)+selCount(4)+hashAlg(2)+sos(1)+bitmap(3)
         // +digestCount(4)+digestSize(2) = 30 bytes before the digest
         let off = 10 + 4 + 4 + 2 + 1 + 3 + 4 + 2;
-        if raw.len() < off + 32 { return None; }
+        if raw.len() < off + 32 {
+            return None;
+        }
         let mut d = [0u8; 32];
-        d.copy_from_slice(&raw[off..off+32]);
+        d.copy_from_slice(&raw[off..off + 32]);
         Some(d)
     }
 
     /// Parse a `TPM2_Load` response and return the objectHandle.
     fn parse_load_handle(raw: &[u8]) -> Option<u32> {
-        if rc(raw) != TPM_RC_SUCCESS || raw.len() < 14 { return None; }
+        if rc(raw) != TPM_RC_SUCCESS || raw.len() < 14 {
+            return None;
+        }
         Some(u32::from_be_bytes([raw[10], raw[11], raw[12], raw[13]]))
     }
 
@@ -722,18 +846,26 @@ mod smokes {
 
     /// Parse a `TPM2_Create` response and return the TPM2B_PRIVATE bytes.
     fn parse_create_private(raw: &[u8]) -> Option<Vec<u8>> {
-        if rc(raw) != TPM_RC_SUCCESS || raw.len() < 12 { return None; }
+        if rc(raw) != TPM_RC_SUCCESS || raw.len() < 12 {
+            return None;
+        }
         let priv_size = u16::from_be_bytes([raw[10], raw[11]]) as usize;
-        if raw.len() < 12 + priv_size { return None; }
-        Some(raw[12..12+priv_size].to_vec())
+        if raw.len() < 12 + priv_size {
+            return None;
+        }
+        Some(raw[12..12 + priv_size].to_vec())
     }
 
     /// Parse a `TPM2_Unseal` response and return the secret bytes.
     fn parse_unseal_secret(raw: &[u8]) -> Option<Vec<u8>> {
-        if rc(raw) != TPM_RC_SUCCESS || raw.len() < 12 { return None; }
+        if rc(raw) != TPM_RC_SUCCESS || raw.len() < 12 {
+            return None;
+        }
         let size = u16::from_be_bytes([raw[10], raw[11]]) as usize;
-        if raw.len() < 12 + size { return None; }
-        Some(raw[12..12+size].to_vec())
+        if raw.len() < 12 + size {
+            return None;
+        }
+        Some(raw[12..12 + size].to_vec())
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -838,7 +970,7 @@ mod smokes {
         if n != 32 {
             return TestResult::Fail("GetRandom returned wrong byte count");
         }
-        let rand = &resp[12..12+32];
+        let rand = &resp[12..12 + 32];
         // Non-zero variance: not all bytes identical.
         let first = rand[0];
         if rand.iter().all(|&b| b == first) {
@@ -876,10 +1008,14 @@ mod smokes {
         let d1 = [0x11u8; 32];
         let expected = pcr_extend_formula(&[0u8; 32], &d1);
 
-        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1)).is_err() {
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1))
+            .is_err()
+        {
             return TestResult::Fail("PCR_Extend failed");
         }
-        let resp = t.submit(&crate::tpm2::commands::pcr_read_single(7)).unwrap_or_default();
+        let resp = t
+            .submit(&crate::tpm2::commands::pcr_read_single(7))
+            .unwrap_or_default();
         let digest = match parse_pcr_digest(&resp) {
             Some(d) => d,
             None => return TestResult::Fail("could not parse PCR_Read response"),
@@ -900,13 +1036,18 @@ mod smokes {
         let d1 = [0x22u8; 32];
         let d2 = [0x33u8; 32];
         let after_d1 = pcr_extend_formula(&[0u8; 32], &d1);
-        let expected  = pcr_extend_formula(&after_d1, &d2);
+        let expected = pcr_extend_formula(&after_d1, &d2);
 
-        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1)).is_err()
-        || t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d2)).is_err() {
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1))
+            .is_err()
+            || t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d2))
+                .is_err()
+        {
             return TestResult::Fail("PCR_Extend(s) failed");
         }
-        let resp = t.submit(&crate::tpm2::commands::pcr_read_single(7)).unwrap_or_default();
+        let resp = t
+            .submit(&crate::tpm2::commands::pcr_read_single(7))
+            .unwrap_or_default();
         let digest = match parse_pcr_digest(&resp) {
             Some(d) => d,
             None => return TestResult::Fail("could not parse PCR_Read response"),
@@ -927,10 +1068,14 @@ mod smokes {
         let d = [0x42u8; 32];
         let expected = pcr_extend_formula(&[0u8; 32], &d);
 
-        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(3, &d)).is_err() {
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(3, &d))
+            .is_err()
+        {
             return TestResult::Fail("PCR_Extend failed");
         }
-        let resp = t.submit(&crate::tpm2::commands::pcr_read_single(3)).unwrap_or_default();
+        let resp = t
+            .submit(&crate::tpm2::commands::pcr_read_single(3))
+            .unwrap_or_default();
         let digest = match parse_pcr_digest(&resp) {
             Some(d) => d,
             None => return TestResult::Fail("could not parse PCR_Read response"),
@@ -950,7 +1095,10 @@ mod smokes {
         let fake = Arc::new(FakeTpmTransport::new());
         // Extend PCR-0 so the sysfs output shows a non-trivial value.
         let d0 = [0x01u8; 32];
-        if fake.submit(&crate::tpm2::commands::pcr_extend_sha256(0, &d0)).is_err() {
+        if fake
+            .submit(&crate::tpm2::commands::pcr_extend_sha256(0, &d0))
+            .is_err()
+        {
             return TestResult::Fail("PCR_Extend failed in sysfs smoke");
         }
 
@@ -991,21 +1139,27 @@ mod smokes {
         let attrs = crate::tpm2::nv::NV_ATTR_AUTH_RW;
 
         // Define space.
-        if t.submit(&crate::tpm2::commands::nv_define_space(NV_IDX, 16, attrs)).is_err() {
+        if t.submit(&crate::tpm2::commands::nv_define_space(NV_IDX, 16, attrs))
+            .is_err()
+        {
             return TestResult::Fail("NV_DefineSpace failed");
         }
 
         // Write 16 bytes.
         let payload: [u8; 16] = [
-            0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
-            0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08,
         ];
-        if t.submit(&crate::tpm2::commands::nv_write(NV_IDX, &payload, 0)).is_err() {
+        if t.submit(&crate::tpm2::commands::nv_write(NV_IDX, &payload, 0))
+            .is_err()
+        {
             return TestResult::Fail("NV_Write failed");
         }
 
         // Read back.
-        let resp = t.submit(&crate::tpm2::commands::nv_read(NV_IDX, 16, 0)).unwrap_or_default();
+        let resp = t
+            .submit(&crate::tpm2::commands::nv_read(NV_IDX, 16, 0))
+            .unwrap_or_default();
         if rc(&resp) != TPM_RC_SUCCESS {
             return TestResult::Fail("NV_Read returned non-SUCCESS");
         }
@@ -1032,7 +1186,9 @@ mod smokes {
 
         // 1. Extend PCR-7 to a known value.
         let d1 = [0xABu8; 32];
-        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1)).is_err() {
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1))
+            .is_err()
+        {
             return TestResult::Fail("PCR_Extend failed");
         }
 
@@ -1050,14 +1206,17 @@ mod smokes {
 
         // 4. Create sealed object.
         let secret = b"narf-disk-key-analog-32-bytes!!!";
-        let create_resp = t.submit(&create_sealed_cmd(secret, &[0u8; 32])).unwrap_or_default();
+        let create_resp = t
+            .submit(&create_sealed_cmd(secret, &[0u8; 32]))
+            .unwrap_or_default();
         let private_blob = match parse_create_private(&create_resp) {
             Some(b) => b,
             None => return TestResult::Fail("could not parse Create response"),
         };
 
         // 5. Load.
-        let load_resp = t.submit(&load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob))
+        let load_resp = t
+            .submit(&load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob))
             .unwrap_or_default();
         let object_handle = match parse_load_handle(&load_resp) {
             Some(h) => h,
@@ -1065,7 +1224,8 @@ mod smokes {
         };
 
         // 6. Unseal — PCR-7 unchanged → SUCCESS.
-        let unseal_resp = t.submit(&unseal_with_session_cmd(object_handle, session_handle))
+        let unseal_resp = t
+            .submit(&unseal_with_session_cmd(object_handle, session_handle))
             .unwrap_or_default();
         if rc(&unseal_resp) != TPM_RC_SUCCESS {
             return TestResult::Fail("Unseal returned non-SUCCESS when PCR matches sealed value");
@@ -1090,16 +1250,21 @@ mod smokes {
 
         // Extend PCR-7 and seal a secret.
         let d1 = [0xCCu8; 32];
-        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1)).is_err() {
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d1))
+            .is_err()
+        {
             return TestResult::Fail("PCR_Extend (initial) failed");
         }
         let secret = b"disk-encryption-key-placeholder!";
-        let create_resp = t.submit(&create_sealed_cmd(secret, &[0u8; 32])).unwrap_or_default();
+        let create_resp = t
+            .submit(&create_sealed_cmd(secret, &[0u8; 32]))
+            .unwrap_or_default();
         let private_blob = match parse_create_private(&create_resp) {
             Some(b) => b,
             None => return TestResult::Fail("could not parse Create response"),
         };
-        let load_resp = t.submit(&load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob))
+        let load_resp = t
+            .submit(&load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob))
             .unwrap_or_default();
         let object_handle = match parse_load_handle(&load_resp) {
             Some(h) => h,
@@ -1108,14 +1273,17 @@ mod smokes {
 
         // Re-extend PCR-7 → PCR value changes.
         let d2 = [0xDDu8; 32];
-        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d2)).is_err() {
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d2))
+            .is_err()
+        {
             return TestResult::Fail("PCR_Extend (re-extend) failed");
         }
 
         // Unseal → must fail.
         let sess_resp = t.submit(&start_auth_session_cmd()).unwrap_or_default();
         let session_handle = parse_session_handle(&sess_resp).unwrap_or(FAKE_SESSION_HANDLE);
-        let unseal_resp = t.submit(&unseal_with_session_cmd(object_handle, session_handle))
+        let unseal_resp = t
+            .submit(&unseal_with_session_cmd(object_handle, session_handle))
             .unwrap_or_default();
         let returned_rc = rc(&unseal_resp);
         if returned_rc != TPM_RC_POLICY_FAIL {
@@ -1138,14 +1306,17 @@ mod smokes {
 
         // Pre-create a sealed object so the Load command has something to return.
         let secret = b"session-key-material-32-bytes!!!";
-        let create_resp = fake.submit(&create_sealed_cmd(secret, &[0u8; 32])).unwrap_or_default();
+        let create_resp = fake
+            .submit(&create_sealed_cmd(secret, &[0u8; 32]))
+            .unwrap_or_default();
         let private_blob = match parse_create_private(&create_resp) {
             Some(b) => b,
             None => return TestResult::Fail("Create parse failed"),
         };
         let load_cmd = load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob);
 
-        let recorder = Arc::new(FlushRecorder { inner: fake }) as Arc<dyn crate::devfs_bridge::TpmTransport>;
+        let recorder =
+            Arc::new(FlushRecorder { inner: fake }) as Arc<dyn crate::devfs_bridge::TpmTransport>;
         crate::devfs_bridge::register_transport(recorder);
 
         let transient_handle;
@@ -1155,10 +1326,14 @@ mod smokes {
             let _ = poll_sync(dev.write(0, &load_cmd)).and_then(|r| r.ok());
             // Read the response to find the transient handle.
             let mut buf = alloc::vec![0u8; 64];
-            let n = poll_sync(dev.read(0, &mut buf)).and_then(|r| r.ok()).unwrap_or(0);
+            let n = poll_sync(dev.read(0, &mut buf))
+                .and_then(|r| r.ok())
+                .unwrap_or(0);
             transient_handle = if n >= 14 {
                 u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]])
-            } else { 0 };
+            } else {
+                0
+            };
             // DevTpmRm0 drops here → FlushContext(transient_handle)
         }
 
@@ -1188,14 +1363,17 @@ mod smokes {
 
         // Pre-create a sealed object.
         let secret = b"raw-device-secret-should-stay!!!";
-        let create_resp = fake.submit(&create_sealed_cmd(secret, &[0u8; 32])).unwrap_or_default();
+        let create_resp = fake
+            .submit(&create_sealed_cmd(secret, &[0u8; 32]))
+            .unwrap_or_default();
         let private_blob = match parse_create_private(&create_resp) {
             Some(b) => b,
             None => return TestResult::Fail("Create parse failed"),
         };
         let load_cmd = load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob);
 
-        let recorder = Arc::new(FlushRecorder { inner: fake }) as Arc<dyn crate::devfs_bridge::TpmTransport>;
+        let recorder =
+            Arc::new(FlushRecorder { inner: fake }) as Arc<dyn crate::devfs_bridge::TpmTransport>;
         crate::devfs_bridge::register_transport(recorder);
 
         {
