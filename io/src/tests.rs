@@ -121,7 +121,10 @@ fn smoke_iommu_initial_state_is_disabled_or_identity() -> TestResult {
         iommu::IommuMode::PerDomain => TestResult::Fail("PerDomain mode active without backend"),
     }
 }
-kernel_test_in!("io/iommu", smoke_iommu_initial_state_is_disabled_or_identity);
+kernel_test_in!(
+    "io/iommu",
+    smoke_iommu_initial_state_is_disabled_or_identity
+);
 
 fn smoke_iommu_force_identity_makes_map_passthrough() -> TestResult {
     // Force identity mode in the test fixture (so this passes
@@ -131,8 +134,12 @@ fn smoke_iommu_force_identity_makes_map_passthrough() -> TestResult {
 
     let prev_mode = iommu::mode();
     iommu::__force_identity_for_test();
-    let pass_through = iommu::map_phys(0xCAFE_F000).map(|x| x == 0xCAFE_F000).unwrap_or(false);
-    let unmap_through = iommu::unmap_iova(0xCAFE_F000).map(|x| x == 0xCAFE_F000).unwrap_or(false);
+    let pass_through = iommu::map_phys(0xCAFE_F000)
+        .map(|x| x == 0xCAFE_F000)
+        .unwrap_or(false);
+    let unmap_through = iommu::unmap_iova(0xCAFE_F000)
+        .map(|x| x == 0xCAFE_F000)
+        .unwrap_or(false);
     if !pass_through {
         iommu::__reset_for_test();
         return TestResult::Fail("identity map_phys must be a pass-through");
@@ -236,7 +243,10 @@ fn smoke_iommu_init_no_tables_returns_no_tables_parsed() -> TestResult {
         }
     }
 }
-kernel_test_in!("io/iommu", smoke_iommu_init_no_tables_returns_no_tables_parsed);
+kernel_test_in!(
+    "io/iommu",
+    smoke_iommu_init_no_tables_returns_no_tables_parsed
+);
 
 fn smoke_ioremap_direct_round_trip() -> TestResult {
     // Allocate a frame, scribble a sentinel through the identity
@@ -467,7 +477,11 @@ kernel_test_in!("io/iommu", smoke_iommu_vendor_repr_pins_discriminants);
 
 fn smoke_iommu_mode_variants_distinct() -> TestResult {
     use crate::iommu::IommuMode;
-    let all = [IommuMode::Disabled, IommuMode::Identity, IommuMode::PerDomain];
+    let all = [
+        IommuMode::Disabled,
+        IommuMode::Identity,
+        IommuMode::PerDomain,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -538,7 +552,10 @@ fn smoke_iommu_force_identity_sets_active_and_identity_mode() -> TestResult {
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("io/iommu", smoke_iommu_force_identity_sets_active_and_identity_mode);
+kernel_test_in!(
+    "io/iommu",
+    smoke_iommu_force_identity_sets_active_and_identity_mode
+);
 
 fn smoke_iommu_caps_default_zero_after_reset() -> TestResult {
     use crate::iommu::{__reset_for_test, caps};
@@ -591,9 +608,7 @@ fn smoke_iommu_perms_bit_layout() -> TestResult {
 kernel_test_in!("io/iommu", smoke_iommu_perms_bit_layout);
 
 fn smoke_iommu_domain_identity_map_unmap() -> TestResult {
-    use crate::iommu::{
-        __force_identity_for_test, __reset_for_test, Bdf, IommuDomain, IommuPerms,
-    };
+    use crate::iommu::{Bdf, IommuDomain, IommuPerms, __force_identity_for_test, __reset_for_test};
     __reset_for_test();
     __force_identity_for_test();
     let dom = IommuDomain::new(0x10);
@@ -648,7 +663,7 @@ fn smoke_iommu_domain_identity_map_unmap() -> TestResult {
 kernel_test_in!("io/iommu", smoke_iommu_domain_identity_map_unmap);
 
 fn smoke_iommu_domain_rejects_zero_len_and_no_perms() -> TestResult {
-    use crate::iommu::{__force_identity_for_test, __reset_for_test, IommuDomain, IommuPerms};
+    use crate::iommu::{IommuDomain, IommuPerms, __force_identity_for_test, __reset_for_test};
     __reset_for_test();
     __force_identity_for_test();
     let dom = IommuDomain::new(0);
@@ -667,8 +682,7 @@ kernel_test_in!("io/iommu", smoke_iommu_domain_rejects_zero_len_and_no_perms);
 
 fn smoke_iommu_map_free_function_identity() -> TestResult {
     use crate::iommu::{
-        __force_identity_for_test, __reset_for_test, iommu_map, iommu_unmap, Bdf,
-        IommuPerms,
+        __force_identity_for_test, __reset_for_test, iommu_map, iommu_unmap, Bdf, IommuPerms,
     };
     __reset_for_test();
     __force_identity_for_test();

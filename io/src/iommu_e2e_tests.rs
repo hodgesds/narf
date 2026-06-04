@@ -37,16 +37,16 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::id::DomainId;
 use narf_memory::PAGE_SIZE;
 
-use crate::{alloc_coherent, free_coherent, register_with_cap, unregister, IoError};
 use crate::iommu::IommuPerms;
+use crate::{alloc_coherent, free_coherent, register_with_cap, unregister, IoError};
 
 // ─── FakeIommu ──────────────────────────────────────────────────────────────
 //
@@ -149,16 +149,25 @@ impl FakeIommu {
     fn translate(&mut self, iova: u64, write: bool) -> Result<u64, DmaError> {
         match self.pgtbl.get(&iova) {
             None => {
-                self.faults.push(FaultRecord { iova, is_write: write });
+                self.faults.push(FaultRecord {
+                    iova,
+                    is_write: write,
+                });
                 Err(DmaError::PageFault)
             }
             Some(e) => {
                 if write && !e.perms.write() {
-                    self.faults.push(FaultRecord { iova, is_write: true });
+                    self.faults.push(FaultRecord {
+                        iova,
+                        is_write: true,
+                    });
                     return Err(DmaError::PermissionDenied);
                 }
                 if !write && !e.perms.read() {
-                    self.faults.push(FaultRecord { iova, is_write: false });
+                    self.faults.push(FaultRecord {
+                        iova,
+                        is_write: false,
+                    });
                     return Err(DmaError::PermissionDenied);
                 }
                 Ok(e.phys)
@@ -200,39 +209,25 @@ impl FakeDevice {
     /// Device reads `len` bytes starting at `iova`. Returns error on
     /// fault/permission. Copies into a caller-supplied buffer (simulating
     /// a device's internal receive buffer).
-    fn dma_read(
-        &self,
-        iommu: &mut FakeIommu,
-        iova: u64,
-        out: &mut [u8],
-    ) -> Result<(), DmaError> {
-        let phys = iommu.translate(iova, /*write=*/false)?;
+    fn dma_read(&self, iommu: &mut FakeIommu, iova: u64, out: &mut [u8]) -> Result<(), DmaError> {
+        let phys = iommu.translate(iova, /*write=*/ false)?;
         // SAFETY: `phys` was returned by our FakeIommu which only stores
         // addresses obtained from `alloc_coherent` → `alloc_frame`.
         // Those frames are identity-mapped in the kernel address space.
         // `out.len()` is caller-bounded to be within one page in all
         // callers below.  The borrow lives only for this function.
-        let src = unsafe {
-            core::slice::from_raw_parts(phys as *const u8, out.len())
-        };
+        let src = unsafe { core::slice::from_raw_parts(phys as *const u8, out.len()) };
         out.copy_from_slice(src);
         Ok(())
     }
 
     /// Device writes `data` bytes starting at `iova`. Returns error on
     /// fault/permission.
-    fn dma_write(
-        &self,
-        iommu: &mut FakeIommu,
-        iova: u64,
-        data: &[u8],
-    ) -> Result<(), DmaError> {
-        let phys = iommu.translate(iova, /*write=*/true)?;
+    fn dma_write(&self, iommu: &mut FakeIommu, iova: u64, data: &[u8]) -> Result<(), DmaError> {
+        let phys = iommu.translate(iova, /*write=*/ true)?;
         // SAFETY: same argument as `dma_read`. Unique write is safe because
         // the test holds the only live reference to the backing frame.
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(phys as *mut u8, data.len())
-        };
+        let dst = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, data.len()) };
         dst.copy_from_slice(data);
         Ok(())
     }
@@ -421,9 +416,7 @@ fn iommu_e2e_03_host_writes_visible_to_device() -> TestResult {
     // map_page maps entire pages; address the tail byte via a direct phys
     // pointer — models a device that resolves IOVA→phys then offsets within
     // the page.  SAFETY: phys is an allocated frame; offset 4088 < 4096.
-    let tail_val = unsafe {
-        core::ptr::read_volatile((phys + 4088) as *const u8)
-    };
+    let tail_val = unsafe { core::ptr::read_volatile((phys + 4088) as *const u8) };
     if tail_val != PATTERN {
         let _ = iommu.unmap_page(iova);
         free_coherent(buf);
@@ -530,8 +523,8 @@ fn iommu_e2e_05_cap_revoke_unmaps_iova() -> TestResult {
     // two operations would be coupled in the DmaBuffer reclaim path; here
     // we model the invariant: unmap happens at most once per cap lifetime.
     let slot_index = cap.slot().index;
-    unregister(cap);                         // bumps epoch → all cap copies dead
-    let _ = iommu.unmap_page(iova);         // removes page-table entry
+    unregister(cap); // bumps epoch → all cap copies dead
+    let _ = iommu.unmap_page(iova); // removes page-table entry
 
     // Verify: epoch was bumped (object-table slot no longer live).
     let epoch = narf_capabilities::object_table::current_epoch(slot_index);
@@ -647,7 +640,10 @@ fn iommu_e2e_07_realloc_iova_no_alias() -> TestResult {
 
     let mut iommu = FakeIommu::new();
     let iova_a = next_iova();
-    if iommu.map_page(iova_a, phys_a, IommuPerms::READ_WRITE).is_err() {
+    if iommu
+        .map_page(iova_a, phys_a, IommuPerms::READ_WRITE)
+        .is_err()
+    {
         unregister(cap_a);
         return TestResult::Fail("map_page A failed");
     }
@@ -680,7 +676,10 @@ fn iommu_e2e_07_realloc_iova_no_alias() -> TestResult {
         return TestResult::Fail("new alloc reused the freed IOVA (aliasing risk)");
     }
 
-    if iommu.map_page(iova_b, phys_b, IommuPerms::READ_WRITE).is_err() {
+    if iommu
+        .map_page(iova_b, phys_b, IommuPerms::READ_WRITE)
+        .is_err()
+    {
         unregister(cap_b);
         return TestResult::Fail("map_page B failed");
     }
@@ -744,7 +743,10 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
     // Map 4 contiguous IOVAs, one per page.
     for (i, buf) in bufs.iter().enumerate() {
         let iova = base_iova + (i as u64) * PAGE_SIZE;
-        if iommu.map_page(iova, buf.phys_addr().raw(), IommuPerms::READ).is_err() {
+        if iommu
+            .map_page(iova, buf.phys_addr().raw(), IommuPerms::READ)
+            .is_err()
+        {
             for j in 0..i {
                 let _ = iommu.unmap_page(base_iova + (j as u64) * PAGE_SIZE);
             }
@@ -807,7 +809,10 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
 
     // Unmap all pages.
     for i in 0..N_PAGES {
-        if iommu.unmap_page(base_iova + (i as u64) * PAGE_SIZE).is_err() {
+        if iommu
+            .unmap_page(base_iova + (i as u64) * PAGE_SIZE)
+            .is_err()
+        {
             for b in bufs {
                 free_coherent(b);
             }
@@ -863,7 +868,9 @@ fn iommu_e2e_09_dma_direction_enforcement() -> TestResult {
 
     if iommu.map_page(iova_r, phys_r, IommuPerms::READ).is_err()
         || iommu.map_page(iova_w, phys_w, IommuPerms::WRITE).is_err()
-        || iommu.map_page(iova_rw, phys_r, IommuPerms::READ_WRITE).is_err()
+        || iommu
+            .map_page(iova_rw, phys_r, IommuPerms::READ_WRITE)
+            .is_err()
     {
         let _ = iommu.unmap_page(iova_r);
         let _ = iommu.unmap_page(iova_w);
@@ -1037,7 +1044,10 @@ fn iommu_e2e_10_concurrent_allocs_no_collision() -> TestResult {
     }
 
     // Verify duplicate map is rejected (the IOVA already exists).
-    if iommu.map_page(iovas[0], physes[1], IommuPerms::READ_WRITE).is_ok() {
+    if iommu
+        .map_page(iovas[0], physes[1], IommuPerms::READ_WRITE)
+        .is_ok()
+    {
         for b in bufs {
             free_coherent(b);
         }

@@ -213,9 +213,7 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
     *STATE.caps.lock() = effective_caps;
     STATE.vendor.store(vendor as u8, Ordering::Release);
     STATE.units.store(n_units, Ordering::Release);
-    STATE
-        .primary_mmio_base
-        .store(mmio_base, Ordering::Release);
+    STATE.primary_mmio_base.store(mmio_base, Ordering::Release);
     *STATE.mode.lock() = IommuMode::Identity;
 
     Ok(IommuMode::Identity)
@@ -430,7 +428,9 @@ pub fn __reset_for_test() {
 #[doc(hidden)]
 pub fn __force_identity_for_test() {
     STATE.initialised.store(true, Ordering::Release);
-    STATE.vendor.store(IommuVendor::AmdVi as u8, Ordering::Release);
+    STATE
+        .vendor
+        .store(IommuVendor::AmdVi as u8, Ordering::Release);
     STATE.units.store(1, Ordering::Release);
     *STATE.mode.lock() = IommuMode::Identity;
 }
@@ -594,13 +594,7 @@ impl IommuDomain {
     /// `iova == phys` (or `iova == 0` meaning "let the IOMMU pick"
     /// — we resolve that to `phys` too). Returns the actual IOVA
     /// the caller should hand to the device.
-    pub fn map(
-        &self,
-        iova: u64,
-        phys: u64,
-        len: u64,
-        perms: IommuPerms,
-    ) -> Result<u64, IoError> {
+    pub fn map(&self, iova: u64, phys: u64, len: u64, perms: IommuPerms) -> Result<u64, IoError> {
         if len == 0 {
             return Err(IoError::NotMapped);
         }
