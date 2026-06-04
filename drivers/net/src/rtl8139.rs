@@ -380,7 +380,8 @@ impl narf_net::Interface for Rtl8139Nic {
         with_controller(|c| c.link_up()).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -390,7 +391,8 @@ impl narf_net::Interface for Rtl8139Nic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -481,7 +483,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-
 fn spawn_pumps(
     device: Arc<Rtl8139>,
     rx_prod: Producer<Frame, RX_RING_N>,
@@ -517,7 +518,6 @@ async fn rtl8139_tx_pump(device: Arc<Rtl8139>, mut tx_cons: Consumer<Frame, TX_R
         let _ = device.tx(frame.payload());
     }
 }
-
 
 pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {

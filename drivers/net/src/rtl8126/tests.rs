@@ -14,8 +14,8 @@ use super::{
     mac_version_from_xid, name_for, MacVersion, PhyStatus, TxDesc, CR_RST, INT32_LINKCHG,
     INT32_ROK, INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, PHYSTAT_TBI_OR_5G,
     REG_IMR_8125, REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8126,
-    RTL_DEV_8126_VAR, RTL_VENDOR, RX_BUF_LEN, RX_FETCH_DFLT_8125, RX_PAUSE_SLOT_ON,
-    RXD_EOR, RXD_LEN_MASK, RXD_OWN, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
+    RTL_DEV_8126_VAR, RTL_VENDOR, RXD_EOR, RXD_LEN_MASK, RXD_OWN, RX_BUF_LEN, RX_FETCH_DFLT_8125,
+    RX_PAUSE_SLOT_ON, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Smoke 1: PCI match table ──────────────────────────────────────────
@@ -188,7 +188,10 @@ fn smoke_rtl8126_build_tx_desc_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_build_tx_desc_round_trip);
+kernel_test_in!(
+    "drivers/net/rtl8126",
+    smoke_rtl8126_build_tx_desc_round_trip
+);
 
 fn smoke_rtl8126_build_rx_desc_round_trip() -> TestResult {
     let d = build_rx_desc(13, 0xCAFE_BABE_DEAD_BEEFu64, RX_BUF_LEN as u32);
@@ -210,7 +213,10 @@ fn smoke_rtl8126_build_rx_desc_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_build_rx_desc_round_trip);
+kernel_test_in!(
+    "drivers/net/rtl8126",
+    smoke_rtl8126_build_rx_desc_round_trip
+);
 
 // ── Smoke 5: RX_PAUSE_SLOT_ON constant ───────────────────────────────
 

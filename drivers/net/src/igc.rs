@@ -43,7 +43,7 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
@@ -390,14 +390,13 @@ impl AdvRxDescWb {
 impl AdvTxCtxtDesc {
     /// Build a TSO context descriptor for an IPv4/TCP frame.
     pub fn new_tso_v4(mac_len: u8, ip_len: u8, l4_len: u8, mss: u16) -> Self {
-        let vlan_macip_lens = (ip_len as u32)
-            | ((mac_len as u32) << IGC_ADVTXD_MACLEN_SHIFT);
+        let vlan_macip_lens = (ip_len as u32) | ((mac_len as u32) << IGC_ADVTXD_MACLEN_SHIFT);
         let type_tucmd_mlhl = IGC_ADVTXD_DCMD_DEXT
             | IGC_ADVTXD_DTYP_CTXT
             | IGC_ADVTXD_TUCMD_IPV4
             | IGC_ADVTXD_TUCMD_L4T_TCP;
-        let mss_l4len_idx = ((l4_len as u32) << IGC_ADVTXD_L4LEN_SHIFT)
-            | ((mss as u32) << IGC_ADVTXD_MSS_SHIFT);
+        let mss_l4len_idx =
+            ((l4_len as u32) << IGC_ADVTXD_L4LEN_SHIFT) | ((mss as u32) << IGC_ADVTXD_MSS_SHIFT);
         AdvTxCtxtDesc {
             vlan_macip_lens,
             launch_time: 0,
@@ -416,10 +415,13 @@ impl AdvTxDataDesc {
             | IGC_ADVTXD_DCMD_RS
             | IGC_ADVTXD_DCMD_IFCS
             | IGC_ADVTXD_DCMD_EOP;
-        let olinfo_status = ((len as u32) << IGC_ADVTXD_PAYLEN_SHIFT)
-            | IGC_TXD_POPTS_IXSM
-            | IGC_TXD_POPTS_TXSM;
-        AdvTxDataDesc { buffer_addr: addr, cmd_type_len, olinfo_status }
+        let olinfo_status =
+            ((len as u32) << IGC_ADVTXD_PAYLEN_SHIFT) | IGC_TXD_POPTS_IXSM | IGC_TXD_POPTS_TXSM;
+        AdvTxDataDesc {
+            buffer_addr: addr,
+            cmd_type_len,
+            olinfo_status,
+        }
     }
 
     /// Build a data descriptor with TSO enabled. The hardware segments
@@ -432,10 +434,13 @@ impl AdvTxDataDesc {
             | IGC_ADVTXD_DCMD_IFCS
             | IGC_ADVTXD_DCMD_EOP
             | IGC_ADVTXD_DCMD_TSE;
-        let olinfo_status = ((len as u32) << IGC_ADVTXD_PAYLEN_SHIFT)
-            | IGC_TXD_POPTS_IXSM
-            | IGC_TXD_POPTS_TXSM;
-        AdvTxDataDesc { buffer_addr: addr, cmd_type_len, olinfo_status }
+        let olinfo_status =
+            ((len as u32) << IGC_ADVTXD_PAYLEN_SHIFT) | IGC_TXD_POPTS_IXSM | IGC_TXD_POPTS_TXSM;
+        AdvTxDataDesc {
+            buffer_addr: addr,
+            cmd_type_len,
+            olinfo_status,
+        }
     }
 }
 
@@ -700,8 +705,7 @@ impl Igc {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
-        let _ = unsafe { msix.program_vector(0, 0, v) }
-            .map_err(|_| IgcError::BarMapFailed)?;
+        let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| IgcError::BarMapFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         let _ = unsafe { msix.enable() }.map_err(|_| IgcError::BarMapFailed)?;
         Ok((msix, v))
@@ -818,9 +822,9 @@ impl Igc {
             out[i] = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
-        // Refill: write the slot in the read form so the chip can
-        // re-use it. `hdr_addr = 0` clears the wb-form DD bit since
-        // it overlays the same 64 bits.
+                                  // Refill: write the slot in the read form so the chip can
+                                  // re-use it. `hdr_addr = 0` clears the wb-form DD bit since
+                                  // it overlays the same 64 bits.
         let read_form = AdvRxDescRead {
             pkt_addr: buf_phys,
             hdr_addr: 0,
@@ -861,7 +865,8 @@ impl narf_net::Interface for IgcNic {
         with_controller(|c| c.link_up()).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -871,7 +876,8 @@ impl narf_net::Interface for IgcNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {

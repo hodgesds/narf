@@ -6,16 +6,16 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 mod tests;
 
@@ -214,9 +214,7 @@ impl AdvTxDesc {
         AdvTxDesc {
             addr,
             cmd_type_len: Self::ctrl_word(len),
-            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT)
-                | ADVTXD_POPTS_IXSM
-                | ADVTXD_POPTS_TXSM,
+            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM,
         }
     }
 
@@ -226,9 +224,7 @@ impl AdvTxDesc {
         AdvTxDesc {
             addr,
             cmd_type_len: Self::ctrl_word(len) | ADVTXD_DCMD_TSE,
-            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT)
-                | ADVTXD_POPTS_IXSM
-                | ADVTXD_POPTS_TXSM,
+            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM,
         }
     }
 }
@@ -240,14 +236,11 @@ impl AdvTxCtxtDesc {
     /// `l4_len`  = TCP header length in bytes (usually 20).
     /// `mss`     = maximum segment size in bytes.
     pub fn new_tso_v4(mac_len: u8, ip_len: u8, l4_len: u8, mss: u16) -> Self {
-        let vlan_macip_lens = (ip_len as u32)
-            | ((mac_len as u32) << ADVTXD_MACLEN_SHIFT);
-        let type_tucmd_mlhl = ADVTXD_DCMD_DEXT
-            | ADVTXD_DTYP_CTXT
-            | ADVTXD_TUCMD_IPV4
-            | ADVTXD_TUCMD_L4T_TCP;
-        let mss_l4len_idx = ((l4_len as u32) << ADVTXD_L4LEN_SHIFT)
-            | ((mss as u32) << ADVTXD_MSS_SHIFT);
+        let vlan_macip_lens = (ip_len as u32) | ((mac_len as u32) << ADVTXD_MACLEN_SHIFT);
+        let type_tucmd_mlhl =
+            ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT | ADVTXD_TUCMD_IPV4 | ADVTXD_TUCMD_L4T_TCP;
+        let mss_l4len_idx =
+            ((l4_len as u32) << ADVTXD_L4LEN_SHIFT) | ((mss as u32) << ADVTXD_MSS_SHIFT);
         AdvTxCtxtDesc {
             vlan_macip_lens,
             seqnum_seed: 0,
@@ -426,9 +419,8 @@ impl Ixgbe {
         let tx_phys = tx_ring.phys_addr().raw();
         let mut tx_pool: Vec<DmaBuffer> = Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
-            tx_pool.push(
-                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?,
-            );
+            tx_pool
+                .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?);
         }
         // SAFETY: identity-mapped DMA.
         unsafe {
@@ -925,14 +917,11 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_
     }
 }
 
-
 async fn ixgbe_tx_pump(device: Arc<Ixgbe>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.tx(frame.payload(), &TxMeta::plain());
     }
 }
-
-
 
 pub fn register_pci_driver() {
     for did in ALL_DEV_IDS {
@@ -966,5 +955,8 @@ pub fn with_controller<R>(f: impl FnOnce(&Ixgbe) -> R) -> Option<R> {
 }
 
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut Ixgbe) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("Ixgbe static has multiple owners")))
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .map(|a| f(Arc::get_mut(a).expect("Ixgbe static has multiple owners")))
 }

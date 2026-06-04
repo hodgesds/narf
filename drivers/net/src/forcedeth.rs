@@ -95,12 +95,12 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
-use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 // ── PCI ids ─────────────────────────────────────────────────────────
 
@@ -316,7 +316,10 @@ pub const NV_TX2_CHECKSUM_L3: u32 = 1 << 27;
 pub const NV_TX2_CHECKSUM_L4: u32 = 1 << 26;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RxCsumResult { Fail, Ok }
+pub enum RxCsumResult {
+    Fail,
+    Ok,
+}
 
 // ── MII Clause-22 register subset ──────────────────────────────────
 
@@ -376,17 +379,35 @@ const _: () = assert!(core::mem::size_of::<Desc>() == 8);
 
 impl Desc {
     pub fn tx_with_csum(buf: u32, len: u16) -> Self {
-        Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_CHECKSUM_L3 | NV_TX2_CHECKSUM_L4 | (len as u32 & DESC_LEN_MASK_V2) }
+        Desc {
+            buf,
+            flaglen: TXD_VALID
+                | TXD_LASTPACKET
+                | NV_TX2_CHECKSUM_L3
+                | NV_TX2_CHECKSUM_L4
+                | (len as u32 & DESC_LEN_MASK_V2),
+        }
     }
     pub fn tx_with_tso(buf: u32, len: u16, mss: u16) -> Self {
         // NV_TX2_CHECKSUM_L3/L4 are NOT set when TSO is active — they are
         // in an else-branch in Linux forcedeth.c:2335.  MSS occupies
         // bits[27:14]; CHECKSUM_L3 is bit 27 — setting both corrupts the
         // MSS field on the decode side.
-        Desc { buf, flaglen: TXD_VALID | TXD_LASTPACKET | NV_TX2_TSO | ((mss as u32) << NV_TX2_TSO_SHIFT) | (len as u32 & DESC_LEN_MASK_V2) }
+        Desc {
+            buf,
+            flaglen: TXD_VALID
+                | TXD_LASTPACKET
+                | NV_TX2_TSO
+                | ((mss as u32) << NV_TX2_TSO_SHIFT)
+                | (len as u32 & DESC_LEN_MASK_V2),
+        }
     }
     pub fn rx_csum_result(&self) -> RxCsumResult {
-        if self.flaglen & RXD_ERROR != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
+        if self.flaglen & RXD_ERROR != 0 {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
     }
 }
 
@@ -468,7 +489,10 @@ impl ForcedethNic {
         //    `NV_TXRX_RESET_DELAY` (4 µs in Linux), then lower it.
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(REG_TX_RX_CONTROL, TXRXCTL_BIT2 | TXRXCTL_RESET | txrxctl_bits);
+            mmio.write32(
+                REG_TX_RX_CONTROL,
+                TXRXCTL_BIT2 | TXRXCTL_RESET | txrxctl_bits,
+            );
             // PCI flush-by-read (the chip orders ops by ack-back of
             // the write — Linux does this via `pci_push` which is a
             // `readl` of any post-decoded register).
@@ -478,8 +502,7 @@ impl ForcedethNic {
         // responsive variant so background pumps still tick.
         narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(REG_TX_RX_CONTROL) } & TXRXCTL_RESET == 0
-                || true /* TX_RX reset is self-cleared by writing 0 below */,
+            || unsafe { mmio.read32(REG_TX_RX_CONTROL) } & TXRXCTL_RESET == 0 || true, /* TX_RX reset is self-cleared by writing 0 below */
             narf_time::Deadline::after_ms(2),
         );
         // SAFETY: identity-mapped MMIO.
@@ -537,22 +560,19 @@ impl ForcedethNic {
         };
 
         // 3. Allocate descriptor rings + per-slot buffer pools.
-        let tx_ring = alloc_coherent(RING_LEN * 8, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
-        let rx_ring = alloc_coherent(RING_LEN * 8, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
+        let tx_ring =
+            alloc_coherent(RING_LEN * 8, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+        let rx_ring =
+            alloc_coherent(RING_LEN * 8, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
         let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
             rx_pool.push(
-                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
-                    .map_err(|_| NicError::NoMemory)?,
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
             );
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(
-                alloc_coherent(2048, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+            tx_pool.push(alloc_coherent(2048, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
         }
 
         // 4. Program MIISpeed before any MII transaction (the chip
@@ -720,7 +740,10 @@ impl ForcedethNic {
         } else if meta.csum_l4.is_some() {
             Desc::tx_with_csum(phys as u32, frame.len() as u16)
         } else {
-            Desc { buf: phys as u32, flaglen: TXD_VALID | TXD_LASTPACKET | (frame.len() as u32 & DESC_LEN_MASK_V2) }
+            Desc {
+                buf: phys as u32,
+                flaglen: TXD_VALID | TXD_LASTPACKET | (frame.len() as u32 & DESC_LEN_MASK_V2),
+            }
         };
         // Per forcedeth.c §"nv_start_xmit_optimized": write buf first,
         // fence, then flip flaglen (VALID + offload bits). The chip
@@ -836,12 +859,7 @@ impl ForcedethNic {
 /// `value = None` performs a read, `value = Some(v)` performs a write.
 /// Returns the read-back data (or `Ok(0)` after a write). Matches the
 /// shape of forcedeth.c's `mii_rw`.
-fn mii_rw(
-    mmio: &MmioRegion,
-    addr: u8,
-    reg: u32,
-    value: Option<u32>,
-) -> Result<u32, NicError> {
+fn mii_rw(mmio: &MmioRegion, addr: u8, reg: u32, value: Option<u32>) -> Result<u32, NicError> {
     // SAFETY: identity-mapped MMIO.
     unsafe {
         mmio.write32(REG_MII_STATUS, MIISTAT_MASK_RW);
@@ -907,10 +925,7 @@ fn mii_rw(
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<ForcedethNic>>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -987,7 +1002,8 @@ fn spawn_pumps(
 async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
     loop {
         if let Some(pkt) = device.receive() {
-            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let dma_buf =
+                alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
             let _ = rx_prod.send(frame).await;
@@ -996,14 +1012,11 @@ async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Fram
     }
 }
 
-
 async fn forcedeth_tx_pump(device: Arc<ForcedethNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
 }
-
-
 
 /// Register the driver against every supported nForce device id.
 pub fn register_pci_driver() {
@@ -1066,7 +1079,8 @@ impl narf_net::Interface for ForcedethHwNic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1076,7 +1090,8 @@ impl narf_net::Interface for ForcedethHwNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1110,7 +1125,8 @@ impl crate::HwNic for ForcedethHwNic {
         RING_LEN as usize
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1120,7 +1136,8 @@ impl crate::HwNic for ForcedethHwNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1143,7 +1160,10 @@ pub fn with_controller<R>(f: impl FnOnce(&ForcedethNic) -> R) -> Option<R> {
 /// Mutable accessor — used by tests that need to drive PHY state
 /// refresh.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut ForcedethNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("ForcedethNic static has multiple owners")))
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .map(|a| f(Arc::get_mut(a).expect("ForcedethNic static has multiple owners")))
 }
 
 // ── Smoke tests ─────────────────────────────────────────────────────
@@ -1178,11 +1198,7 @@ mod tests {
         // Spot-check the laptop-relevant 7xx IDs explicitly so a
         // future refactor of `SUPPORTED_DEVICE_IDS` can't silently
         // drop them.
-        let must_have: &[u16] = &[
-            NV_DEV_MCP55_1,
-            NV_DEV_MCP73_1,
-            NV_DEV_MCP77_1,
-        ];
+        let must_have: &[u16] = &[NV_DEV_MCP55_1, NV_DEV_MCP73_1, NV_DEV_MCP77_1];
         for did in must_have.iter().copied() {
             let found = registered.iter().any(|m| {
                 matches!(m.kind, MatchKind::VendorDevice {
@@ -1415,8 +1431,8 @@ mod tests {
         if RINGSZ_RXSHIFT != 16 {
             return TestResult::Fail("RINGSZ_RXSHIFT drift");
         }
-        let v = ((RING_LEN as u32 - 1) << RINGSZ_TXSHIFT)
-            | ((RING_LEN as u32 - 1) << RINGSZ_RXSHIFT);
+        let v =
+            ((RING_LEN as u32 - 1) << RINGSZ_TXSHIFT) | ((RING_LEN as u32 - 1) << RINGSZ_RXSHIFT);
         if (v & 0xFFFF) != (RING_LEN as u32 - 1) {
             return TestResult::Fail("TX ring size encode mismatch");
         }
@@ -1425,8 +1441,5 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/net/forcedeth",
-        smoke_forcedeth_ring_sizes_encoding
-    );
+    kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_ring_sizes_encoding);
 }

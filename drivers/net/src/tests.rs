@@ -309,10 +309,7 @@ fn smoke_igc_advanced_rx_descriptor_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/igc",
-    smoke_igc_advanced_rx_descriptor_layout
-);
+kernel_test_in!("drivers/net/igc", smoke_igc_advanced_rx_descriptor_layout);
 
 fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // Structural smoke: register the e1000 driver and assert every
@@ -341,16 +338,16 @@ fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // common Alder / Raptor / Tiger / Meteor LOMs found on Dell /
     // Lenovo / HP business laptops.
     let must_have: &[u16] = &[
-        e1000::E1000E_DEV_82574L,    // QEMU q35 default
-        e1000::E1000E_DEV_I217LM,    // Haswell
-        e1000::E1000E_DEV_I218LM,    // Haswell-ULT
-        e1000::E1000E_DEV_I219LM,    // Skylake
-        e1000::E1000E_DEV_I219LM8,   // Ice Lake
-        e1000::E1000E_DEV_I219LM10,  // Comet Lake
-        e1000::E1000E_DEV_I219LM13,  // Tiger Lake
-        e1000::E1000E_DEV_I219LM16,  // Alder Lake
-        e1000::E1000E_DEV_I219LM18,  // Meteor Lake / Phoenix HawkPoint1
-        e1000::E1000E_DEV_I219LM22,  // Raptor Lake
+        e1000::E1000E_DEV_82574L,   // QEMU q35 default
+        e1000::E1000E_DEV_I217LM,   // Haswell
+        e1000::E1000E_DEV_I218LM,   // Haswell-ULT
+        e1000::E1000E_DEV_I219LM,   // Skylake
+        e1000::E1000E_DEV_I219LM8,  // Ice Lake
+        e1000::E1000E_DEV_I219LM10, // Comet Lake
+        e1000::E1000E_DEV_I219LM13, // Tiger Lake
+        e1000::E1000E_DEV_I219LM16, // Alder Lake
+        e1000::E1000E_DEV_I219LM18, // Meteor Lake / Phoenix HawkPoint1
+        e1000::E1000E_DEV_I219LM22, // Raptor Lake
     ];
     for did in must_have.iter().copied() {
         let found = registered.iter().any(|m| {
@@ -390,7 +387,7 @@ fn smoke_e1000_is_pch_part_discriminator() -> TestResult {
         e1000::E1000E_DEV_I219LM8,
         e1000::E1000E_DEV_I219LM13,
         e1000::E1000E_DEV_I219LM16,
-        e1000::E1000E_DEV_I219LM18,  // Meteor Lake / Phoenix HawkPoint1
+        e1000::E1000E_DEV_I219LM18, // Meteor Lake / Phoenix HawkPoint1
         e1000::E1000E_DEV_I219LM22,
         e1000::E1000E_DEV_I219LM29,
     ];
@@ -403,10 +400,10 @@ fn smoke_e1000_is_pch_part_discriminator() -> TestResult {
     // we recognise for bus-probe purposes — none of these have an
     // ME-attached PHY.
     let must_legacy: &[u16] = &[
-        e1000::E1000_DEV_82540EM,    // QEMU -device e1000
+        e1000::E1000_DEV_82540EM, // QEMU -device e1000
         e1000::E1000_DEV_82545EM,
         e1000::E1000_DEV_82544GC,
-        e1000::E1000E_DEV_82574L,    // QEMU q35 default e1000e
+        e1000::E1000E_DEV_82574L, // QEMU q35 default e1000e
         e1000::E1000_DEV_I210_COPPER,
         e1000::E1000_DEV_I211_COPPER,
         e1000::E1000_DEV_82576,
@@ -419,10 +416,7 @@ fn smoke_e1000_is_pch_part_discriminator() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/e1000",
-    smoke_e1000_is_pch_part_discriminator
-);
+kernel_test_in!("drivers/net/e1000", smoke_e1000_is_pch_part_discriminator);
 
 fn smoke_e1000_eee_disable_constants_match_linux() -> TestResult {
     // Stage-2: `disable_eee_pchlan` clears IPCNFG.EEE_*_AN and
@@ -449,9 +443,7 @@ fn smoke_e1000_eee_disable_constants_match_linux() -> TestResult {
     if e1000::IPCNFG_EEE_100M_AN != 1 << 12 {
         return TestResult::Fail("IPCNFG.EEE_100M_AN bit position drift");
     }
-    if e1000::IPCNFG_EEE_AN_MASK
-        != (e1000::IPCNFG_EEE_1G_AN | e1000::IPCNFG_EEE_100M_AN)
-    {
+    if e1000::IPCNFG_EEE_AN_MASK != (e1000::IPCNFG_EEE_1G_AN | e1000::IPCNFG_EEE_100M_AN) {
         return TestResult::Fail("IPCNFG EEE mask doesn't include both AN bits");
     }
     if e1000::EEER_TX_LPI_EN != 1 << 16 {
@@ -463,8 +455,7 @@ fn smoke_e1000_eee_disable_constants_match_linux() -> TestResult {
     if e1000::EEER_LPI_FC != 1 << 18 {
         return TestResult::Fail("EEER.LPI_FC bit position drift");
     }
-    if e1000::EEER_LPI_MASK
-        != (e1000::EEER_TX_LPI_EN | e1000::EEER_RX_LPI_EN | e1000::EEER_LPI_FC)
+    if e1000::EEER_LPI_MASK != (e1000::EEER_TX_LPI_EN | e1000::EEER_RX_LPI_EN | e1000::EEER_LPI_FC)
     {
         return TestResult::Fail("EEER LPI mask incomplete");
     }
@@ -496,8 +487,7 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     let has_e1000 = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
             && d.id.vendor == e1000::E1000_VENDOR
-            && (d.id.device == e1000::E1000_DEV_82540EM
-                || d.id.device == e1000::E1000E_DEV_82574L)
+            && (d.id.device == e1000::E1000_DEV_82540EM || d.id.device == e1000::E1000E_DEV_82574L)
     });
     if !has_e1000 {
         return TestResult::Skip("no QEMU e1000-class NIC");
@@ -513,8 +503,7 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     }
     // QEMU's 82540EM / 82574L must come up as a legacy part with no
     // active ME — the FWSM dance was skipped entirely.
-    let (pch, me) = e1000::with_controller(|c| (c.pch_part, c.me_active))
-        .unwrap_or((true, true));
+    let (pch, me) = e1000::with_controller(|c| (c.pch_part, c.me_active)).unwrap_or((true, true));
     if pch {
         return TestResult::Fail("QEMU NIC mis-classified as PCH");
     }
@@ -523,10 +512,7 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/e1000",
-    smoke_e1000_qemu_fwsm_dance_is_noop
-);
+kernel_test_in!("drivers/net/e1000", smoke_e1000_qemu_fwsm_dance_is_noop);
 
 // ── atheros (atl1c — AR81xx Gigabit Ethernet) ─────────────────────
 //
@@ -596,8 +582,8 @@ fn smoke_atl1c_default_mac_ctrl_enables_rx_tx() -> TestResult {
     // speed field is the most common source of "link reports up but
     // no frames flow" — pin it here.
     use crate::atheros::{
-        default_mac_ctrl_value, MAC_CTRL_BC_EN, MAC_CTRL_MC_EN, MAC_CTRL_RX_EN, MAC_CTRL_SPEED_1000,
-        MAC_CTRL_TX_EN,
+        default_mac_ctrl_value, MAC_CTRL_BC_EN, MAC_CTRL_MC_EN, MAC_CTRL_RX_EN,
+        MAC_CTRL_SPEED_1000, MAC_CTRL_TX_EN,
     };
     let v = default_mac_ctrl_value();
     if v & MAC_CTRL_RX_EN == 0 {
@@ -719,9 +705,7 @@ fn smoke_atl1c_default_intr_mask_includes_rx_tx() -> TestResult {
     // bring-up off frame-arrival / frame-complete events) and GPHY +
     // PHY_LINKDOWN (link-state change). A drift here would manifest
     // as a NIC that probes cleanly but never wakes the RX pump.
-    use crate::atheros::{
-        default_intr_mask, INT_GPHY, INT_PHY_LINKDOWN, INT_RX_PKT0, INT_TX_PKT,
-    };
+    use crate::atheros::{default_intr_mask, INT_GPHY, INT_PHY_LINKDOWN, INT_RX_PKT0, INT_TX_PKT};
     let m = default_intr_mask();
     if m & INT_RX_PKT0 == 0 {
         return TestResult::Fail("INT.RX_PKT0 missing from default mask");
@@ -799,7 +783,10 @@ fn smoke_rtl_rx_desc_prepare_sets_own_and_eor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_rx_desc_prepare_sets_own_and_eor);
+kernel_test_in!(
+    "drivers/net/rtl-phy",
+    smoke_rtl_rx_desc_prepare_sets_own_and_eor
+);
 
 fn smoke_rtl_rx_status_decodes_chip_returned_descriptor() -> TestResult {
     use crate::rtl_phy::{RxStatus, RXD_FS, RXD_LS, RXD_PAM};
@@ -817,7 +804,10 @@ fn smoke_rtl_rx_status_decodes_chip_returned_descriptor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_rx_status_decodes_chip_returned_descriptor);
+kernel_test_in!(
+    "drivers/net/rtl-phy",
+    smoke_rtl_rx_status_decodes_chip_returned_descriptor
+);
 
 fn smoke_rtl_mii_constants() -> TestResult {
     use crate::rtl_phy::{
@@ -856,9 +846,9 @@ fn smoke_mlx5_eqe_decode() -> TestResult {
     use crate::mlx5::eqe;
 
     let mut raw = [0u8; eqe::EQE_LEN];
-    raw[eqe::EQE_OFF_EVENT_TYPE] = 0x09;      // PortStateChange
+    raw[eqe::EQE_OFF_EVENT_TYPE] = 0x09; // PortStateChange
     raw[eqe::EQE_OFF_EVENT_SUB_TYPE] = 0x04;
-    raw[eqe::EQE_OFF_OWNER] = 0x00;           // SW owns
+    raw[eqe::EQE_OFF_OWNER] = 0x00; // SW owns
 
     // is_hw_owned must be false for SW-owned slot.
     if eqe::is_hw_owned(&raw) {
@@ -969,9 +959,7 @@ fn smoke_vmxnet3_quiesce_cmd_encode() -> TestResult {
     use crate::vmxnet3::regs;
 
     if regs::VMXNET3_CMD_QUIESCE_DEV != 0xCAFE_0001 {
-        return TestResult::Fail(
-            "VMXNET3_CMD_QUIESCE_DEV != 0xCAFE0001 (vmxnet3_defs.h drift)",
-        );
+        return TestResult::Fail("VMXNET3_CMD_QUIESCE_DEV != 0xCAFE0001 (vmxnet3_defs.h drift)");
     }
     // Sanity: must be "set" class (high 16 bits = 0xCAFE).
     if regs::VMXNET3_CMD_QUIESCE_DEV >> 16 != 0xCAFE {
@@ -999,9 +987,7 @@ fn smoke_vmxnet3_reset_cmd_encode() -> TestResult {
     use crate::vmxnet3::regs;
 
     if regs::VMXNET3_CMD_RESET_DEV != 0xCAFE_0002 {
-        return TestResult::Fail(
-            "VMXNET3_CMD_RESET_DEV != 0xCAFE0002 (vmxnet3_defs.h drift)",
-        );
+        return TestResult::Fail("VMXNET3_CMD_RESET_DEV != 0xCAFE0002 (vmxnet3_defs.h drift)");
     }
     if regs::VMXNET3_CMD_RESET_DEV >> 16 != 0xCAFE {
         return TestResult::Fail("RESET_DEV not in set-class range (0xCAFE_xxxx)");
@@ -1020,12 +1006,22 @@ kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_reset_cmd_encode);
 // ── e1000 ─────────────────────────────────────────────────────────
 
 fn smoke_e1000_tso_desc_encode() -> TestResult {
-    use crate::e1000::{TxDesc, TXD_CMD_DEXT, TXD_CMD_TSE, TXD_DTYP_D, TXD_OPTS_IXSM, TXD_OPTS_TXSM};
+    use crate::e1000::{
+        TxDesc, TXD_CMD_DEXT, TXD_CMD_TSE, TXD_DTYP_D, TXD_OPTS_IXSM, TXD_OPTS_TXSM,
+    };
     let d = TxDesc::with_tso(0x1234_0000u64, 1448, 1448);
-    if d.cmd & TXD_CMD_DEXT == 0 { return TestResult::Fail("e1000 TSO: TXD_CMD_DEXT not set"); }
-    if d.cmd & TXD_CMD_TSE == 0 { return TestResult::Fail("e1000 TSO: TXD_CMD_TSE not set"); }
-    if d.cmd & TXD_DTYP_D == 0 { return TestResult::Fail("e1000 TSO: TXD_DTYP_D not set"); }
-    if d.css & TXD_OPTS_IXSM == 0 || d.css & TXD_OPTS_TXSM == 0 { return TestResult::Fail("e1000 TSO: IXSM/TXSM not set"); }
+    if d.cmd & TXD_CMD_DEXT == 0 {
+        return TestResult::Fail("e1000 TSO: TXD_CMD_DEXT not set");
+    }
+    if d.cmd & TXD_CMD_TSE == 0 {
+        return TestResult::Fail("e1000 TSO: TXD_CMD_TSE not set");
+    }
+    if d.cmd & TXD_DTYP_D == 0 {
+        return TestResult::Fail("e1000 TSO: TXD_DTYP_D not set");
+    }
+    if d.css & TXD_OPTS_IXSM == 0 || d.css & TXD_OPTS_TXSM == 0 {
+        return TestResult::Fail("e1000 TSO: IXSM/TXSM not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_tso_desc_encode);
@@ -1033,10 +1029,18 @@ kernel_test_in!("drivers/net/e1000", smoke_e1000_tso_desc_encode);
 fn smoke_e1000_csum_offload_bits() -> TestResult {
     use crate::e1000::{TxDesc, TXD_CMD_DEXT, TXD_DTYP_D, TXD_OPTS_IXSM, TXD_OPTS_TXSM};
     let d = TxDesc::new_with_csum(0xABCD_0000u64, 60, TXD_OPTS_IXSM | TXD_OPTS_TXSM);
-    if d.cmd & TXD_CMD_DEXT == 0 { return TestResult::Fail("e1000 csum: TXD_CMD_DEXT not set"); }
-    if d.cmd & TXD_DTYP_D == 0 { return TestResult::Fail("e1000 csum: TXD_DTYP_D not set"); }
-    if d.css & TXD_OPTS_IXSM == 0 { return TestResult::Fail("e1000 csum: IXSM not set"); }
-    if d.css & TXD_OPTS_TXSM == 0 { return TestResult::Fail("e1000 csum: TXSM not set"); }
+    if d.cmd & TXD_CMD_DEXT == 0 {
+        return TestResult::Fail("e1000 csum: TXD_CMD_DEXT not set");
+    }
+    if d.cmd & TXD_DTYP_D == 0 {
+        return TestResult::Fail("e1000 csum: TXD_DTYP_D not set");
+    }
+    if d.css & TXD_OPTS_IXSM == 0 {
+        return TestResult::Fail("e1000 csum: IXSM not set");
+    }
+    if d.css & TXD_OPTS_TXSM == 0 {
+        return TestResult::Fail("e1000 csum: TXSM not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_csum_offload_bits);
@@ -1044,14 +1048,27 @@ kernel_test_in!("drivers/net/e1000", smoke_e1000_csum_offload_bits);
 // ── ixgbe ─────────────────────────────────────────────────────────
 
 fn smoke_ixgbe_tso_desc_encode() -> TestResult {
-    use crate::ixgbe::{AdvTxCtxtDesc, AdvTxDesc, ADVTXD_DCMD_TSE, ADVTXD_DTYP_CTXT, ADVTXD_MSS_SHIFT, ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP};
+    use crate::ixgbe::{
+        AdvTxCtxtDesc, AdvTxDesc, ADVTXD_DCMD_TSE, ADVTXD_DTYP_CTXT, ADVTXD_MSS_SHIFT,
+        ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP,
+    };
     let ctx = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1448);
-    if ctx.mss_l4len_idx >> ADVTXD_MSS_SHIFT != 1448 { return TestResult::Fail("ixgbe TSO ctx: mss wrong"); }
-    if ctx.type_tucmd_mlhl & ADVTXD_DTYP_CTXT == 0 { return TestResult::Fail("ixgbe TSO ctx: DTYP_CTXT not set"); }
-    if ctx.type_tucmd_mlhl & ADVTXD_TUCMD_IPV4 == 0 { return TestResult::Fail("ixgbe TSO ctx: TUCMD_IPV4 not set"); }
-    if ctx.type_tucmd_mlhl & ADVTXD_TUCMD_L4T_TCP == 0 { return TestResult::Fail("ixgbe TSO ctx: TUCMD_L4T_TCP not set"); }
+    if ctx.mss_l4len_idx >> ADVTXD_MSS_SHIFT != 1448 {
+        return TestResult::Fail("ixgbe TSO ctx: mss wrong");
+    }
+    if ctx.type_tucmd_mlhl & ADVTXD_DTYP_CTXT == 0 {
+        return TestResult::Fail("ixgbe TSO ctx: DTYP_CTXT not set");
+    }
+    if ctx.type_tucmd_mlhl & ADVTXD_TUCMD_IPV4 == 0 {
+        return TestResult::Fail("ixgbe TSO ctx: TUCMD_IPV4 not set");
+    }
+    if ctx.type_tucmd_mlhl & ADVTXD_TUCMD_L4T_TCP == 0 {
+        return TestResult::Fail("ixgbe TSO ctx: TUCMD_L4T_TCP not set");
+    }
     let data = AdvTxDesc::with_tso(0xDEAD_0000u64, 5792, 1448);
-    if data.cmd_type_len & ADVTXD_DCMD_TSE == 0 { return TestResult::Fail("ixgbe TSO data: DCMD_TSE not set"); }
+    if data.cmd_type_len & ADVTXD_DCMD_TSE == 0 {
+        return TestResult::Fail("ixgbe TSO data: DCMD_TSE not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tso_desc_encode);
@@ -1059,8 +1076,12 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tso_desc_encode);
 fn smoke_ixgbe_csum_offload_bits() -> TestResult {
     use crate::ixgbe::{AdvTxDesc, ADVTXD_POPTS_IXSM, ADVTXD_POPTS_TXSM};
     let d = AdvTxDesc::with_csum(0x1000_0000u64, 60);
-    if d.olinfo & ADVTXD_POPTS_IXSM == 0 { return TestResult::Fail("ixgbe csum: POPTS_IXSM not set"); }
-    if d.olinfo & ADVTXD_POPTS_TXSM == 0 { return TestResult::Fail("ixgbe csum: POPTS_TXSM not set"); }
+    if d.olinfo & ADVTXD_POPTS_IXSM == 0 {
+        return TestResult::Fail("ixgbe csum: POPTS_IXSM not set");
+    }
+    if d.olinfo & ADVTXD_POPTS_TXSM == 0 {
+        return TestResult::Fail("ixgbe csum: POPTS_TXSM not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_csum_offload_bits);
@@ -1068,13 +1089,26 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_csum_offload_bits);
 // ── igc ───────────────────────────────────────────────────────────
 
 fn smoke_igc_tso_desc_encode() -> TestResult {
-    use crate::igc::{AdvTxCtxtDesc, IGC_ADVTXD_DCMD_DEXT, IGC_ADVTXD_DTYP_CTXT, IGC_ADVTXD_MSS_SHIFT, IGC_ADVTXD_TUCMD_IPV4, IGC_ADVTXD_TUCMD_L4T_TCP};
+    use crate::igc::{
+        AdvTxCtxtDesc, IGC_ADVTXD_DCMD_DEXT, IGC_ADVTXD_DTYP_CTXT, IGC_ADVTXD_MSS_SHIFT,
+        IGC_ADVTXD_TUCMD_IPV4, IGC_ADVTXD_TUCMD_L4T_TCP,
+    };
     let ctx = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1448);
-    if ctx.mss_l4len_idx >> IGC_ADVTXD_MSS_SHIFT != 1448 { return TestResult::Fail("igc TSO ctx: mss wrong"); }
-    if ctx.type_tucmd_mlhl & IGC_ADVTXD_DTYP_CTXT == 0 { return TestResult::Fail("igc TSO ctx: DTYP_CTXT not set"); }
-    if ctx.type_tucmd_mlhl & IGC_ADVTXD_DCMD_DEXT == 0 { return TestResult::Fail("igc TSO ctx: DCMD_DEXT not set"); }
-    if ctx.type_tucmd_mlhl & IGC_ADVTXD_TUCMD_IPV4 == 0 { return TestResult::Fail("igc TSO ctx: TUCMD_IPV4 not set"); }
-    if ctx.type_tucmd_mlhl & IGC_ADVTXD_TUCMD_L4T_TCP == 0 { return TestResult::Fail("igc TSO ctx: TUCMD_L4T_TCP not set"); }
+    if ctx.mss_l4len_idx >> IGC_ADVTXD_MSS_SHIFT != 1448 {
+        return TestResult::Fail("igc TSO ctx: mss wrong");
+    }
+    if ctx.type_tucmd_mlhl & IGC_ADVTXD_DTYP_CTXT == 0 {
+        return TestResult::Fail("igc TSO ctx: DTYP_CTXT not set");
+    }
+    if ctx.type_tucmd_mlhl & IGC_ADVTXD_DCMD_DEXT == 0 {
+        return TestResult::Fail("igc TSO ctx: DCMD_DEXT not set");
+    }
+    if ctx.type_tucmd_mlhl & IGC_ADVTXD_TUCMD_IPV4 == 0 {
+        return TestResult::Fail("igc TSO ctx: TUCMD_IPV4 not set");
+    }
+    if ctx.type_tucmd_mlhl & IGC_ADVTXD_TUCMD_L4T_TCP == 0 {
+        return TestResult::Fail("igc TSO ctx: TUCMD_L4T_TCP not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_tso_desc_encode);
@@ -1082,8 +1116,12 @@ kernel_test_in!("drivers/net/igc", smoke_igc_tso_desc_encode);
 fn smoke_igc_csum_offload_bits() -> TestResult {
     use crate::igc::{AdvTxDataDesc, IGC_TXD_POPTS_IXSM, IGC_TXD_POPTS_TXSM};
     let d = AdvTxDataDesc::with_csum(0x2000_0000u64, 60);
-    if d.olinfo_status & IGC_TXD_POPTS_IXSM == 0 { return TestResult::Fail("igc csum: POPTS_IXSM not set"); }
-    if d.olinfo_status & IGC_TXD_POPTS_TXSM == 0 { return TestResult::Fail("igc csum: POPTS_TXSM not set"); }
+    if d.olinfo_status & IGC_TXD_POPTS_IXSM == 0 {
+        return TestResult::Fail("igc csum: POPTS_IXSM not set");
+    }
+    if d.olinfo_status & IGC_TXD_POPTS_TXSM == 0 {
+        return TestResult::Fail("igc csum: POPTS_TXSM not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_csum_offload_bits);
@@ -1093,9 +1131,15 @@ kernel_test_in!("drivers/net/igc", smoke_igc_csum_offload_bits);
 fn smoke_tg3_tso_desc_encode() -> TestResult {
     use crate::tg3::{TxBufferDesc, TXD_FLAG_IP_CSUM, TXD_FLAG_TCPUDP_CSUM, TXD_MSS_SHIFT};
     let d = TxBufferDesc::with_tso(0x0001u32, 0x0000_A000u32, 1448, 1448);
-    if d.vlan_tag >> TXD_MSS_SHIFT != 1448 { return TestResult::Fail("tg3 TSO: mss not encoded in vlan_tag[31:16]"); }
-    if d.len_flags & TXD_FLAG_IP_CSUM == 0 { return TestResult::Fail("tg3 TSO: TXD_FLAG_IP_CSUM not set"); }
-    if d.len_flags & TXD_FLAG_TCPUDP_CSUM == 0 { return TestResult::Fail("tg3 TSO: TXD_FLAG_TCPUDP_CSUM not set"); }
+    if d.vlan_tag >> TXD_MSS_SHIFT != 1448 {
+        return TestResult::Fail("tg3 TSO: mss not encoded in vlan_tag[31:16]");
+    }
+    if d.len_flags & TXD_FLAG_IP_CSUM == 0 {
+        return TestResult::Fail("tg3 TSO: TXD_FLAG_IP_CSUM not set");
+    }
+    if d.len_flags & TXD_FLAG_TCPUDP_CSUM == 0 {
+        return TestResult::Fail("tg3 TSO: TXD_FLAG_TCPUDP_CSUM not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/tg3", smoke_tg3_tso_desc_encode);
@@ -1103,9 +1147,15 @@ kernel_test_in!("drivers/net/tg3", smoke_tg3_tso_desc_encode);
 fn smoke_tg3_csum_offload_bits() -> TestResult {
     use crate::tg3::{TxBufferDesc, TXD_FLAG_IP_CSUM, TXD_FLAG_TCPUDP_CSUM};
     let d = TxBufferDesc::with_csum(0x0001u32, 0x0000_B000u32, 60);
-    if d.vlan_tag != 0 { return TestResult::Fail("tg3 csum: vlan_tag should be 0"); }
-    if d.len_flags & TXD_FLAG_IP_CSUM == 0 { return TestResult::Fail("tg3 csum: TXD_FLAG_IP_CSUM not set"); }
-    if d.len_flags & TXD_FLAG_TCPUDP_CSUM == 0 { return TestResult::Fail("tg3 csum: TXD_FLAG_TCPUDP_CSUM not set"); }
+    if d.vlan_tag != 0 {
+        return TestResult::Fail("tg3 csum: vlan_tag should be 0");
+    }
+    if d.len_flags & TXD_FLAG_IP_CSUM == 0 {
+        return TestResult::Fail("tg3 csum: TXD_FLAG_IP_CSUM not set");
+    }
+    if d.len_flags & TXD_FLAG_TCPUDP_CSUM == 0 {
+        return TestResult::Fail("tg3 csum: TXD_FLAG_TCPUDP_CSUM not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/tg3", smoke_tg3_csum_offload_bits);
@@ -1113,22 +1163,36 @@ kernel_test_in!("drivers/net/tg3", smoke_tg3_csum_offload_bits);
 // ── r8169 ─────────────────────────────────────────────────────────
 
 fn smoke_r8169_tso_desc_encode() -> TestResult {
-    use crate::r8169::{Desc, TD1_GTSENV4, TD1_IPv4_CS, TD1_MSS_SHIFT, TD1_TCP_CS};
+    use crate::r8169::{Desc, TD1_IPv4_CS, TD1_GTSENV4, TD1_MSS_SHIFT, TD1_TCP_CS};
     let d = Desc::tx_with_tso(0xC000u32, 0x0001u32, 1448, 1448);
-    if d.vlan & TD1_GTSENV4 == 0 { return TestResult::Fail("r8169 TSO: TD1_GTSENV4 not set"); }
-    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("r8169 TSO: TD1_IPv4_CS not set"); }
-    if d.vlan & TD1_TCP_CS == 0 { return TestResult::Fail("r8169 TSO: TD1_TCP_CS not set"); }
-    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 { return TestResult::Fail("r8169 TSO: mss wrong"); }
+    if d.vlan & TD1_GTSENV4 == 0 {
+        return TestResult::Fail("r8169 TSO: TD1_GTSENV4 not set");
+    }
+    if d.vlan & TD1_IPv4_CS == 0 {
+        return TestResult::Fail("r8169 TSO: TD1_IPv4_CS not set");
+    }
+    if d.vlan & TD1_TCP_CS == 0 {
+        return TestResult::Fail("r8169 TSO: TD1_TCP_CS not set");
+    }
+    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 {
+        return TestResult::Fail("r8169 TSO: mss wrong");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/r8169", smoke_r8169_tso_desc_encode);
 
 fn smoke_r8169_csum_offload_bits() -> TestResult {
-    use crate::r8169::{Desc, TD1_GTSENV4, TD1_IPv4_CS, TD1_TCP_CS};
+    use crate::r8169::{Desc, TD1_IPv4_CS, TD1_GTSENV4, TD1_TCP_CS};
     let d = Desc::tx_with_csum(0xD000u32, 0x0001u32, 60);
-    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("r8169 csum: TD1_IPv4_CS not set"); }
-    if d.vlan & TD1_TCP_CS == 0 { return TestResult::Fail("r8169 csum: TD1_TCP_CS not set"); }
-    if d.vlan & TD1_GTSENV4 != 0 { return TestResult::Fail("r8169 csum: TD1_GTSENV4 must not be set"); }
+    if d.vlan & TD1_IPv4_CS == 0 {
+        return TestResult::Fail("r8169 csum: TD1_IPv4_CS not set");
+    }
+    if d.vlan & TD1_TCP_CS == 0 {
+        return TestResult::Fail("r8169 csum: TD1_TCP_CS not set");
+    }
+    if d.vlan & TD1_GTSENV4 != 0 {
+        return TestResult::Fail("r8169 csum: TD1_GTSENV4 must not be set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/r8169", smoke_r8169_csum_offload_bits);
@@ -1136,22 +1200,36 @@ kernel_test_in!("drivers/net/r8169", smoke_r8169_csum_offload_bits);
 // ── rtl8125 ───────────────────────────────────────────────────────
 
 fn smoke_rtl8125_tso_desc_encode() -> TestResult {
-    use crate::rtl8125::{TxDesc, TD1_GTSENV4, TD1_IPv4_CS, TD1_MSS_SHIFT, TD1_TCP_CS};
+    use crate::rtl8125::{TD1_IPv4_CS, TxDesc, TD1_GTSENV4, TD1_MSS_SHIFT, TD1_TCP_CS};
     let d = TxDesc::with_tso(0xE000u32, 0x0001u32, 1448, 1448);
-    if d.vlan & TD1_GTSENV4 == 0 { return TestResult::Fail("rtl8125 TSO: TD1_GTSENV4 not set"); }
-    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("rtl8125 TSO: TD1_IPv4_CS not set"); }
-    if d.vlan & TD1_TCP_CS == 0 { return TestResult::Fail("rtl8125 TSO: TD1_TCP_CS not set"); }
-    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 { return TestResult::Fail("rtl8125 TSO: mss wrong"); }
+    if d.vlan & TD1_GTSENV4 == 0 {
+        return TestResult::Fail("rtl8125 TSO: TD1_GTSENV4 not set");
+    }
+    if d.vlan & TD1_IPv4_CS == 0 {
+        return TestResult::Fail("rtl8125 TSO: TD1_IPv4_CS not set");
+    }
+    if d.vlan & TD1_TCP_CS == 0 {
+        return TestResult::Fail("rtl8125 TSO: TD1_TCP_CS not set");
+    }
+    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 {
+        return TestResult::Fail("rtl8125 TSO: mss wrong");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_tso_desc_encode);
 
 fn smoke_rtl8125_csum_offload_bits() -> TestResult {
-    use crate::rtl8125::{TxDesc, TD1_GTSENV4, TD1_IPv4_CS, TD1_TCP_CS};
+    use crate::rtl8125::{TD1_IPv4_CS, TxDesc, TD1_GTSENV4, TD1_TCP_CS};
     let d = TxDesc::with_csum(0xF000u32, 0x0001u32, 60);
-    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("rtl8125 csum: TD1_IPv4_CS not set"); }
-    if d.vlan & TD1_TCP_CS == 0 { return TestResult::Fail("rtl8125 csum: TD1_TCP_CS not set"); }
-    if d.vlan & TD1_GTSENV4 != 0 { return TestResult::Fail("rtl8125 csum: TD1_GTSENV4 must not be set"); }
+    if d.vlan & TD1_IPv4_CS == 0 {
+        return TestResult::Fail("rtl8125 csum: TD1_IPv4_CS not set");
+    }
+    if d.vlan & TD1_TCP_CS == 0 {
+        return TestResult::Fail("rtl8125 csum: TD1_TCP_CS not set");
+    }
+    if d.vlan & TD1_GTSENV4 != 0 {
+        return TestResult::Fail("rtl8125 csum: TD1_GTSENV4 must not be set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_csum_offload_bits);
@@ -1163,26 +1241,55 @@ fn smoke_forcedeth_tso_desc_encode() -> TestResult {
     // descriptor.  MSS occupies bits[27:14]; bit 27 == NV_TX2_CHECKSUM_L3,
     // so setting both corrupts the MSS decode (Linux forcedeth.c:2335
     // places them in an else-branch, never together with NV_TX2_TSO).
-    use crate::forcedeth::{Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO, NV_TX2_TSO_SHIFT, TXD_LASTPACKET, TXD_VALID};
+    use crate::forcedeth::{
+        Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO, NV_TX2_TSO_SHIFT, TXD_LASTPACKET,
+        TXD_VALID,
+    };
     let d = Desc::tx_with_tso(0x0000_C000u32, 1460, 1448);
-    if d.flaglen & TXD_VALID == 0 { return TestResult::Fail("forcedeth TSO: TXD_VALID not set"); }
-    if d.flaglen & TXD_LASTPACKET == 0 { return TestResult::Fail("forcedeth TSO: TXD_LASTPACKET not set"); }
-    if d.flaglen & NV_TX2_TSO == 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_TSO not set"); }
-    if d.flaglen & NV_TX2_CHECKSUM_L3 != 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L3 must not be set (corrupts MSS)"); }
-    if d.flaglen & NV_TX2_CHECKSUM_L4 != 0 { return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L4 must not be set"); }
-    if (d.flaglen >> NV_TX2_TSO_SHIFT) & 0x3FFF != 1448 { return TestResult::Fail("forcedeth TSO: mss wrong"); }
+    if d.flaglen & TXD_VALID == 0 {
+        return TestResult::Fail("forcedeth TSO: TXD_VALID not set");
+    }
+    if d.flaglen & TXD_LASTPACKET == 0 {
+        return TestResult::Fail("forcedeth TSO: TXD_LASTPACKET not set");
+    }
+    if d.flaglen & NV_TX2_TSO == 0 {
+        return TestResult::Fail("forcedeth TSO: NV_TX2_TSO not set");
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L3 != 0 {
+        return TestResult::Fail(
+            "forcedeth TSO: NV_TX2_CHECKSUM_L3 must not be set (corrupts MSS)",
+        );
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L4 != 0 {
+        return TestResult::Fail("forcedeth TSO: NV_TX2_CHECKSUM_L4 must not be set");
+    }
+    if (d.flaglen >> NV_TX2_TSO_SHIFT) & 0x3FFF != 1448 {
+        return TestResult::Fail("forcedeth TSO: mss wrong");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_tso_desc_encode);
 
 fn smoke_forcedeth_csum_offload_bits() -> TestResult {
-    use crate::forcedeth::{Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO, TXD_LASTPACKET, TXD_VALID};
+    use crate::forcedeth::{
+        Desc, NV_TX2_CHECKSUM_L3, NV_TX2_CHECKSUM_L4, NV_TX2_TSO, TXD_LASTPACKET, TXD_VALID,
+    };
     let d = Desc::tx_with_csum(0x0000_D000u32, 60);
-    if d.flaglen & TXD_VALID == 0 { return TestResult::Fail("forcedeth csum: TXD_VALID not set"); }
-    if d.flaglen & TXD_LASTPACKET == 0 { return TestResult::Fail("forcedeth csum: TXD_LASTPACKET not set"); }
-    if d.flaglen & NV_TX2_CHECKSUM_L3 == 0 { return TestResult::Fail("forcedeth csum: NV_TX2_CHECKSUM_L3 not set"); }
-    if d.flaglen & NV_TX2_CHECKSUM_L4 == 0 { return TestResult::Fail("forcedeth csum: NV_TX2_CHECKSUM_L4 not set"); }
-    if d.flaglen & NV_TX2_TSO != 0 { return TestResult::Fail("forcedeth csum: NV_TX2_TSO must not be set"); }
+    if d.flaglen & TXD_VALID == 0 {
+        return TestResult::Fail("forcedeth csum: TXD_VALID not set");
+    }
+    if d.flaglen & TXD_LASTPACKET == 0 {
+        return TestResult::Fail("forcedeth csum: TXD_LASTPACKET not set");
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L3 == 0 {
+        return TestResult::Fail("forcedeth csum: NV_TX2_CHECKSUM_L3 not set");
+    }
+    if d.flaglen & NV_TX2_CHECKSUM_L4 == 0 {
+        return TestResult::Fail("forcedeth csum: NV_TX2_CHECKSUM_L4 not set");
+    }
+    if d.flaglen & NV_TX2_TSO != 0 {
+        return TestResult::Fail("forcedeth csum: NV_TX2_TSO must not be set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_csum_offload_bits);
@@ -1241,30 +1348,50 @@ fn smoke_rtl8126_phystat_decode_5g() -> TestResult {
     // PHYStatus bit 7 (TBI_Enable) = 5 Gbps link on RTL8126.
     // Linux r8169_main.c: PHYStatus register at 0x6C.
     use crate::rtl8126::{
-        PhyStatus, PHYSTAT_100BPS, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS,
+        PhyStatus, PHYSTAT_1000BPSF, PHYSTAT_100BPS, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS,
         PHYSTAT_TBI_OR_5G,
     };
     // 5G link.
     let b5g = PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF | PHYSTAT_TBI_OR_5G;
     let s5 = PhyStatus::parse(b5g);
-    if !s5.link_up  { return TestResult::Fail("5G: link_up should be true"); }
-    if !s5.speed_5g { return TestResult::Fail("5G: speed_5g must be set when TBI_Enable=1"); }
-    if !s5.speed_1000m_or_above { return TestResult::Fail("5G: speed_1000m_or_above must be set"); }
-    if s5.speed_label() != "5G" { return TestResult::Fail("5G: speed_label must be \"5G\""); }
+    if !s5.link_up {
+        return TestResult::Fail("5G: link_up should be true");
+    }
+    if !s5.speed_5g {
+        return TestResult::Fail("5G: speed_5g must be set when TBI_Enable=1");
+    }
+    if !s5.speed_1000m_or_above {
+        return TestResult::Fail("5G: speed_1000m_or_above must be set");
+    }
+    if s5.speed_label() != "5G" {
+        return TestResult::Fail("5G: speed_label must be \"5G\"");
+    }
     // 1G link.
     let b1g = PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF;
     let s1g = PhyStatus::parse(b1g);
-    if s1g.speed_5g { return TestResult::Fail("1G: speed_5g must be false when TBI_Enable=0"); }
-    if s1g.speed_label() != "1000M-or-2.5G" { return TestResult::Fail("1G: speed_label wrong"); }
+    if s1g.speed_5g {
+        return TestResult::Fail("1G: speed_5g must be false when TBI_Enable=0");
+    }
+    if s1g.speed_label() != "1000M-or-2.5G" {
+        return TestResult::Fail("1G: speed_label wrong");
+    }
     // 100M link.
     let b100 = PHYSTAT_LINKSTS | PHYSTAT_100BPS;
     let s100 = PhyStatus::parse(b100);
-    if s100.speed_5g { return TestResult::Fail("100M: speed_5g must be false"); }
-    if s100.speed_label() != "100M" { return TestResult::Fail("100M: speed_label wrong"); }
+    if s100.speed_5g {
+        return TestResult::Fail("100M: speed_5g must be false");
+    }
+    if s100.speed_label() != "100M" {
+        return TestResult::Fail("100M: speed_label wrong");
+    }
     // Down.
     let down = PhyStatus::parse(0x00);
-    if down.link_up || down.speed_5g { return TestResult::Fail("down: must not report link_up or speed_5g"); }
-    if down.speed_label() != "down" { return TestResult::Fail("down: speed_label must be \"down\""); }
+    if down.link_up || down.speed_5g {
+        return TestResult::Fail("down: must not report link_up or speed_5g");
+    }
+    if down.speed_label() != "down" {
+        return TestResult::Fail("down: speed_label must be \"down\"");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_phystat_decode_5g);
@@ -1272,28 +1399,50 @@ kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_phystat_decode_5g);
 fn smoke_rtl8126_tso_desc_encode() -> TestResult {
     // TSO descriptor: TD1_GTSENV4 + csum bits + MSS field.
     // Same v2 offload path as RTL8125. Linux r8169_main.c `rtl8169_tso_csum_v2`.
-    use crate::rtl8126::{TxDesc, TD1_GTSENV4, TD1_IPv4_CS, TD1_MSS_SHIFT, TD1_TCP_CS};
+    use crate::rtl8126::{TD1_IPv4_CS, TxDesc, TD1_GTSENV4, TD1_MSS_SHIFT, TD1_TCP_CS};
     let d = TxDesc::with_tso(0xF000u32, 0x0001u32, 1448, 1448);
-    if d.vlan & TD1_GTSENV4 == 0 { return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 not set"); }
-    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("rtl8126 TSO: TD1_IPv4_CS not set"); }
-    if d.vlan & TD1_TCP_CS == 0  { return TestResult::Fail("rtl8126 TSO: TD1_TCP_CS not set"); }
-    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 { return TestResult::Fail("rtl8126 TSO: mss wrong"); }
+    if d.vlan & TD1_GTSENV4 == 0 {
+        return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 not set");
+    }
+    if d.vlan & TD1_IPv4_CS == 0 {
+        return TestResult::Fail("rtl8126 TSO: TD1_IPv4_CS not set");
+    }
+    if d.vlan & TD1_TCP_CS == 0 {
+        return TestResult::Fail("rtl8126 TSO: TD1_TCP_CS not set");
+    }
+    if (d.vlan >> TD1_MSS_SHIFT) & 0x7FF != 1448 {
+        return TestResult::Fail("rtl8126 TSO: mss wrong");
+    }
     // Bit positions must match RTL8125 (shared silicon).
-    if TD1_GTSENV4 != 1 << 26 { return TestResult::Fail("TD1_GTSENV4 bit position drift"); }
-    if TD1_IPv4_CS != 1 << 29 { return TestResult::Fail("TD1_IPv4_CS bit position drift"); }
-    if TD1_TCP_CS  != 1 << 30 { return TestResult::Fail("TD1_TCP_CS bit position drift"); }
-    if TD1_MSS_SHIFT != 18 { return TestResult::Fail("TD1_MSS_SHIFT must be 18"); }
+    if TD1_GTSENV4 != 1 << 26 {
+        return TestResult::Fail("TD1_GTSENV4 bit position drift");
+    }
+    if TD1_IPv4_CS != 1 << 29 {
+        return TestResult::Fail("TD1_IPv4_CS bit position drift");
+    }
+    if TD1_TCP_CS != 1 << 30 {
+        return TestResult::Fail("TD1_TCP_CS bit position drift");
+    }
+    if TD1_MSS_SHIFT != 18 {
+        return TestResult::Fail("TD1_MSS_SHIFT must be 18");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_tso_desc_encode);
 
 fn smoke_rtl8126_csum_offload_bits() -> TestResult {
     // csum-only descriptor: IPv4_CS + TCP_CS set, GTSENV4 must NOT be set.
-    use crate::rtl8126::{TxDesc, TD1_GTSENV4, TD1_IPv4_CS, TD1_TCP_CS};
+    use crate::rtl8126::{TD1_IPv4_CS, TxDesc, TD1_GTSENV4, TD1_TCP_CS};
     let d = TxDesc::with_csum(0xE000u32, 0x0001u32, 60);
-    if d.vlan & TD1_IPv4_CS == 0 { return TestResult::Fail("rtl8126 csum: TD1_IPv4_CS not set"); }
-    if d.vlan & TD1_TCP_CS == 0  { return TestResult::Fail("rtl8126 csum: TD1_TCP_CS not set"); }
-    if d.vlan & TD1_GTSENV4 != 0 { return TestResult::Fail("rtl8126 csum: TD1_GTSENV4 must not be set"); }
+    if d.vlan & TD1_IPv4_CS == 0 {
+        return TestResult::Fail("rtl8126 csum: TD1_IPv4_CS not set");
+    }
+    if d.vlan & TD1_TCP_CS == 0 {
+        return TestResult::Fail("rtl8126 csum: TD1_TCP_CS not set");
+    }
+    if d.vlan & TD1_GTSENV4 != 0 {
+        return TestResult::Fail("rtl8126 csum: TD1_GTSENV4 must not be set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_csum_offload_bits);
@@ -1301,10 +1450,11 @@ kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_csum_offload_bits);
 fn smoke_rtl8126_link_partner_cap_negotiation() -> TestResult {
     // 5G→2.5G→1G→100M fallback in `LinkSpeed::negotiate`.
     use crate::rtl8126::{
-        LinkSpeed, PhyStatus,
-        PHYSTAT_100BPS, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, PHYSTAT_TBI_OR_5G,
+        LinkSpeed, PhyStatus, PHYSTAT_1000BPSF, PHYSTAT_100BPS, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS,
+        PHYSTAT_TBI_OR_5G,
     };
-    let cap_5g = PhyStatus::parse(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF | PHYSTAT_TBI_OR_5G);
+    let cap_5g =
+        PhyStatus::parse(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF | PHYSTAT_TBI_OR_5G);
     // Both 5G → 5G.
     if LinkSpeed::negotiate(&cap_5g, &cap_5g) != LinkSpeed::Speed5G {
         return TestResult::Fail("5G+5G must negotiate 5G");
@@ -1324,9 +1474,15 @@ fn smoke_rtl8126_link_partner_cap_negotiation() -> TestResult {
         return TestResult::Fail("100M+100M must negotiate 100M");
     }
     // Speed ordering.
-    if LinkSpeed::Speed5G <= LinkSpeed::Speed2_5G { return TestResult::Fail("ordering: 5G > 2.5G"); }
-    if LinkSpeed::Speed2_5G <= LinkSpeed::Speed1G { return TestResult::Fail("ordering: 2.5G > 1G"); }
-    if LinkSpeed::Speed1G <= LinkSpeed::Speed100M { return TestResult::Fail("ordering: 1G > 100M"); }
+    if LinkSpeed::Speed5G <= LinkSpeed::Speed2_5G {
+        return TestResult::Fail("ordering: 5G > 2.5G");
+    }
+    if LinkSpeed::Speed2_5G <= LinkSpeed::Speed1G {
+        return TestResult::Fail("ordering: 2.5G > 1G");
+    }
+    if LinkSpeed::Speed1G <= LinkSpeed::Speed100M {
+        return TestResult::Fail("ordering: 1G > 100M");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -1339,9 +1495,15 @@ kernel_test_in!(
 fn smoke_txmeta_default_is_plain() -> TestResult {
     // TxMeta::default() == TxMeta::plain(): no offloads requested.
     let m = narf_net::TxMeta::default();
-    if m.tso_mss.is_some() { return TestResult::Fail("default TxMeta must not request TSO"); }
-    if m.csum_l4.is_some() { return TestResult::Fail("default TxMeta must not request csum"); }
-    if m.vlan_tag.is_some() { return TestResult::Fail("default TxMeta must not request VLAN"); }
+    if m.tso_mss.is_some() {
+        return TestResult::Fail("default TxMeta must not request TSO");
+    }
+    if m.csum_l4.is_some() {
+        return TestResult::Fail("default TxMeta must not request csum");
+    }
+    if m.vlan_tag.is_some() {
+        return TestResult::Fail("default TxMeta must not request VLAN");
+    }
     TestResult::Pass
 }
 kernel_test_in!("narf-net", smoke_txmeta_default_is_plain);
@@ -1349,11 +1511,15 @@ kernel_test_in!("narf-net", smoke_txmeta_default_is_plain);
 fn smoke_txmeta_with_tso_sets_fields() -> TestResult {
     // TxMeta::with_tso: sets tso_mss and csum_l4 (TCP implied).
     let m = narf_net::TxMeta::with_tso(1448);
-    if m.tso_mss != Some(1448) { return TestResult::Fail("with_tso: tso_mss wrong"); }
+    if m.tso_mss != Some(1448) {
+        return TestResult::Fail("with_tso: tso_mss wrong");
+    }
     if m.csum_l4 != Some(narf_net::L4CsumKind::Tcp) {
         return TestResult::Fail("with_tso: csum_l4 must be Tcp");
     }
-    if m.vlan_tag.is_some() { return TestResult::Fail("with_tso: vlan_tag must be None"); }
+    if m.vlan_tag.is_some() {
+        return TestResult::Fail("with_tso: vlan_tag must be None");
+    }
     TestResult::Pass
 }
 kernel_test_in!("narf-net", smoke_txmeta_with_tso_sets_fields);
@@ -1364,7 +1530,9 @@ fn smoke_txmeta_with_csum_sets_kind() -> TestResult {
     if m.csum_l4 != Some(narf_net::L4CsumKind::Udp) {
         return TestResult::Fail("with_csum(Udp): csum_l4 must be Udp");
     }
-    if m.tso_mss.is_some() { return TestResult::Fail("with_csum: tso_mss must be None"); }
+    if m.tso_mss.is_some() {
+        return TestResult::Fail("with_csum: tso_mss must be None");
+    }
     TestResult::Pass
 }
 kernel_test_in!("narf-net", smoke_txmeta_with_csum_sets_kind);
@@ -1372,8 +1540,12 @@ kernel_test_in!("narf-net", smoke_txmeta_with_csum_sets_kind);
 fn smoke_rxmeta_default_false() -> TestResult {
     // RxMeta::default(): both csum bits false.
     let m = narf_net::RxMeta::default();
-    if m.csum_l3 { return TestResult::Fail("default RxMeta: csum_l3 must be false"); }
-    if m.csum_l4 { return TestResult::Fail("default RxMeta: csum_l4 must be false"); }
+    if m.csum_l3 {
+        return TestResult::Fail("default RxMeta: csum_l3 must be false");
+    }
+    if m.csum_l4 {
+        return TestResult::Fail("default RxMeta: csum_l4 must be false");
+    }
     TestResult::Pass
 }
 kernel_test_in!("narf-net", smoke_rxmeta_default_false);
@@ -1422,7 +1594,7 @@ fn smoke_mlx5_eqe_cqn_24bit_mask() -> TestResult {
         return TestResult::Fail("24-bit CQN mask failed");
     }
     // High byte stripped: simulate raw BE u32 = 0xAB_FF_ABCD (high byte = 0xAB).
-    raw[eqe::EQE_OFF_COMP_CQN] = 0xAB;      // high byte of BE u32
+    raw[eqe::EQE_OFF_COMP_CQN] = 0xAB; // high byte of BE u32
     raw[eqe::EQE_OFF_COMP_CQN + 1] = 0xFF;
     raw[eqe::EQE_OFF_COMP_CQN + 2] = 0xAB;
     raw[eqe::EQE_OFF_COMP_CQN + 3] = 0xCD;
@@ -1470,7 +1642,10 @@ fn smoke_vmxnet3_intr_reenable_clears_disable_bit() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_intr_reenable_clears_disable_bit);
+kernel_test_in!(
+    "drivers/net/vmxnet3",
+    smoke_vmxnet3_intr_reenable_clears_disable_bit
+);
 
 // ── forcedeth TSO checksum exclusion (regression) ────────────────────
 
@@ -1524,9 +1699,15 @@ fn smoke_e1000_txmeta_tso_selects_desc() -> TestResult {
     // Simulate what tx() does when meta.tso_mss is Some.
     let mss = m.tso_mss.expect("tso_mss must be set");
     let d = TxDesc::with_tso(0x1234_0000u64, 1448, mss);
-    if d.cmd & TXD_CMD_TSE == 0 { return TestResult::Fail("e1000 tx/meta: TSE not set"); }
-    if d.cmd & TXD_CMD_DEXT == 0 { return TestResult::Fail("e1000 tx/meta: DEXT not set"); }
-    if d.cmd & TXD_DTYP_D == 0 { return TestResult::Fail("e1000 tx/meta: DTYP_D not set"); }
+    if d.cmd & TXD_CMD_TSE == 0 {
+        return TestResult::Fail("e1000 tx/meta: TSE not set");
+    }
+    if d.cmd & TXD_CMD_DEXT == 0 {
+        return TestResult::Fail("e1000 tx/meta: DEXT not set");
+    }
+    if d.cmd & TXD_DTYP_D == 0 {
+        return TestResult::Fail("e1000 tx/meta: DTYP_D not set");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_txmeta_tso_selects_desc);
@@ -1540,8 +1721,12 @@ fn smoke_ixgbe_txmeta_csum_selects_desc() -> TestResult {
     } else {
         return TestResult::Fail("meta.csum_l4 unexpectedly None");
     };
-    if d.olinfo & ADVTXD_POPTS_IXSM == 0 { return TestResult::Fail("ixgbe csum meta: IXSM missing"); }
-    if d.olinfo & ADVTXD_POPTS_TXSM == 0 { return TestResult::Fail("ixgbe csum meta: TXSM missing"); }
+    if d.olinfo & ADVTXD_POPTS_IXSM == 0 {
+        return TestResult::Fail("ixgbe csum meta: IXSM missing");
+    }
+    if d.olinfo & ADVTXD_POPTS_TXSM == 0 {
+        return TestResult::Fail("ixgbe csum meta: TXSM missing");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_txmeta_csum_selects_desc);

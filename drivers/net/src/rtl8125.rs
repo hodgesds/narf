@@ -503,19 +503,39 @@ pub const RX_TCPFAIL: u32 = 1 << 14;
 pub const RX_UDPFAIL: u32 = 1 << 15;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RxCsumResult { None, Ok, Fail }
+pub enum RxCsumResult {
+    None,
+    Ok,
+    Fail,
+}
 
 impl TxDesc {
     pub fn with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
-        TxDesc { flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK), vlan: TD1_IPv4_CS | TD1_TCP_CS, addr_lo, addr_hi }
+        TxDesc {
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
+            vlan: TD1_IPv4_CS | TD1_TCP_CS,
+            addr_lo,
+            addr_hi,
+        }
     }
     pub fn with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
-        TxDesc { flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK), vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT), addr_lo, addr_hi }
+        TxDesc {
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
+            vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT),
+            addr_lo,
+            addr_hi,
+        }
     }
     pub fn rx_csum_result(&self) -> RxCsumResult {
         let done = self.flags_len & (RX_IPOK | RX_TCPOK | RX_UDPOK) != 0;
-        if !done { return RxCsumResult::None; }
-        if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
+        if !done {
+            return RxCsumResult::None;
+        }
+        if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
     }
 }
 
@@ -525,12 +545,12 @@ impl TxDesc {
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
-use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicError {
@@ -675,9 +695,7 @@ impl RtlNic {
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(
-                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
         }
 
         // 5. C+CR first per the Linux bring-up order. VLAN-detag + RX
@@ -748,11 +766,7 @@ impl RtlNic {
         unsafe {
             mmio.write32(
                 REG_RCR,
-                RX_FETCH_DFLT_8125
-                    | RCR_APM
-                    | RCR_AM
-                    | RCR_AB
-                    | RCR_MXDMA_UNLIMITED,
+                RX_FETCH_DFLT_8125 | RCR_APM | RCR_AM | RCR_AB | RCR_MXDMA_UNLIMITED,
             );
         }
 
@@ -886,16 +900,27 @@ impl RtlNic {
         // Select descriptor format based on offload request.
         let d = if let Some(mss) = meta.tso_mss {
             let mut d = TxDesc::with_tso(phys as u32, (phys >> 32) as u32, frame.len() as u16, mss);
-            if slot == RING_LEN - 1 { d.flags_len |= TXD_EOR; }
+            if slot == RING_LEN - 1 {
+                d.flags_len |= TXD_EOR;
+            }
             d
         } else if meta.csum_l4.is_some() {
             let mut d = TxDesc::with_csum(phys as u32, (phys >> 32) as u32, frame.len() as u16);
-            if slot == RING_LEN - 1 { d.flags_len |= TXD_EOR; }
+            if slot == RING_LEN - 1 {
+                d.flags_len |= TXD_EOR;
+            }
             d
         } else {
             let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & TXD_LEN_MASK);
-            if slot == RING_LEN - 1 { flags |= TXD_EOR; }
-            TxDesc { flags_len: flags, vlan: 0, addr_lo: phys as u32, addr_hi: (phys >> 32) as u32 }
+            if slot == RING_LEN - 1 {
+                flags |= TXD_EOR;
+            }
+            TxDesc {
+                flags_len: flags,
+                vlan: 0,
+                addr_lo: phys as u32,
+                addr_hi: (phys >> 32) as u32,
+            }
         };
         // The NIC sees OWN=1 once we publish word0; the addr / vlan
         // / length-without-OWN fields must already be visible. Write
@@ -1107,7 +1132,8 @@ fn spawn_pumps(
 async fn rtl8125_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
     loop {
         if let Some(pkt) = device.receive() {
-            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let dma_buf =
+                alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
             let _ = rx_prod.send(frame).await;
@@ -1116,14 +1142,11 @@ async fn rtl8125_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RI
     }
 }
 
-
 async fn rtl8125_tx_pump(device: Arc<RtlNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
 }
-
-
 
 /// Register a PCI match-table entry per supported device id. Realtek
 /// keeps the IDs distinct between RTL8125 and RTL8125B even though
@@ -1159,7 +1182,8 @@ impl narf_net::Interface for Rtl8125Nic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1169,7 +1193,8 @@ impl narf_net::Interface for Rtl8125Nic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1222,5 +1247,8 @@ pub fn with_controller<R>(f: impl FnOnce(&RtlNic) -> R) -> Option<R> {
 /// Mutable accessor — used by tests that want to switch on MSI-X
 /// after probe.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
 }

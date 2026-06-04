@@ -132,10 +132,8 @@ pub struct Vmxnet3RxFilterConf {
     pub mfTablePA: u64,
     pub vfTable: [u32; VMXNET3_VFT_SIZE],
 }
-const _: () = assert!(
-    core::mem::size_of::<Vmxnet3RxFilterConf>()
-        == 4 + 2 + 2 + 8 + 4 * VMXNET3_VFT_SIZE
-);
+const _: () =
+    assert!(core::mem::size_of::<Vmxnet3RxFilterConf>() == 4 + 2 + 2 + 8 + 4 * VMXNET3_VFT_SIZE);
 
 impl Default for Vmxnet3RxFilterConf {
     fn default() -> Self {

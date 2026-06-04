@@ -188,16 +188,18 @@ impl Vmxnet3Nic {
         //    sits at the head of a contiguous DMA page; the device
         //    polls `cu.cmdInfo` + `devRead` on each command. Stage 0
         //    only stamps the magic + size; Stage 1+ fills `devRead`.
-        let shared = alloc_coherent(core::mem::size_of::<Vmxnet3DriverShared>(), DomainId::DRIVER_0)
-            .map_err(|_| Vmxnet3Error::NoMemory)?;
+        let shared = alloc_coherent(
+            core::mem::size_of::<Vmxnet3DriverShared>(),
+            DomainId::DRIVER_0,
+        )
+        .map_err(|_| Vmxnet3Error::NoMemory)?;
         // SAFETY: alloc_coherent returns a zeroed identity-mapped page.
         let shared_ptr = shared.phys_addr().raw() as *mut Vmxnet3DriverShared;
         // SAFETY: shared_ptr fits an identity-mapped DMA page sized
         // for sizeof::<Vmxnet3DriverShared>().
         unsafe {
             (*shared_ptr).magic = VMXNET3_REV1_MAGIC.to_le();
-            (*shared_ptr).size =
-                (core::mem::size_of::<Vmxnet3DriverShared>() as u32).to_le();
+            (*shared_ptr).size = (core::mem::size_of::<Vmxnet3DriverShared>() as u32).to_le();
         }
 
         // 5. Allocate TX + TX-comp + RX (ring1 + ring2) + RX-comp
@@ -215,8 +217,7 @@ impl Vmxnet3Nic {
         let rx_comp_ring = alloc_coherent(RX_COMP_RING_BYTES, DomainId::DRIVER_0)
             .map_err(|_| Vmxnet3Error::NoMemory)?;
         let queue_desc = alloc_coherent(
-            core::mem::size_of::<Vmxnet3TxQueueDesc>()
-                + core::mem::size_of::<Vmxnet3RxQueueDesc>(),
+            core::mem::size_of::<Vmxnet3TxQueueDesc>() + core::mem::size_of::<Vmxnet3RxQueueDesc>(),
             DomainId::DRIVER_0,
         )
         .map_err(|_| Vmxnet3Error::NoMemory)?;
@@ -275,10 +276,8 @@ impl Vmxnet3Nic {
         // SAFETY: identity-mapped DMA page. devRead lives at offset
         // 8 of Vmxnet3DriverShared (after magic + size).
         unsafe {
-            (*shared_ptr).devRead.misc.driverInfo.version =
-                VMXNET3_DRIVER_VERSION_NUM.to_le();
-            (*shared_ptr).devRead.misc.driverInfo.gos =
-                Vmxnet3GOSInfo::for_narf().to_raw().to_le();
+            (*shared_ptr).devRead.misc.driverInfo.version = VMXNET3_DRIVER_VERSION_NUM.to_le();
+            (*shared_ptr).devRead.misc.driverInfo.gos = Vmxnet3GOSInfo::for_narf().to_raw().to_le();
             (*shared_ptr).devRead.misc.driverInfo.vmxnet3RevSpt = 1u32.to_le();
             (*shared_ptr).devRead.misc.driverInfo.uptVerSpt = 1u32.to_le();
             (*shared_ptr).devRead.misc.uptFeatures = 0u64.to_le();
@@ -286,9 +285,7 @@ impl Vmxnet3Nic {
             (*shared_ptr).devRead.misc.queueDescPA = queue_desc_pa.to_le();
             (*shared_ptr).devRead.misc.ddLen =
                 (core::mem::size_of::<Vmxnet3DriverShared>() as u32).to_le();
-            (*shared_ptr).devRead.misc.queueDescLen = ((core::mem::size_of::<
-                Vmxnet3TxQueueDesc,
-            >()
+            (*shared_ptr).devRead.misc.queueDescLen = ((core::mem::size_of::<Vmxnet3TxQueueDesc>()
                 + core::mem::size_of::<Vmxnet3RxQueueDesc>())
                 as u32)
                 .to_le();
@@ -403,7 +400,8 @@ impl Vmxnet3Nic {
         //     and the ring already carries gen-bit-1 slots.
         let _ = &pt; // pt used by IMR write in a follow-up.
 
-        let _ = writeln!(
+        let _ =
+            writeln!(
             narf_console::Writer,
             "  vmxnet3: VRRS={:#010x} rev=1 MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
             vrrs,

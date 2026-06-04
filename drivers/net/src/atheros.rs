@@ -46,12 +46,12 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
-use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 // ── PCI ids ─────────────────────────────────────────────────────────
 
@@ -382,15 +382,12 @@ impl AtlNic {
         let rrs_ring =
             alloc_coherent(RRS_RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
 
-        let mut tpd_pool: alloc::vec::Vec<DmaBuffer> =
-            alloc::vec::Vec::with_capacity(TPD_RING_LEN);
+        let mut tpd_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(TPD_RING_LEN);
         for _ in 0..TPD_RING_LEN {
-            tpd_pool.push(
-                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+            tpd_pool
+                .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
         }
-        let mut rfd_pool: alloc::vec::Vec<DmaBuffer> =
-            alloc::vec::Vec::with_capacity(RFD_RING_LEN);
+        let mut rfd_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RFD_RING_LEN);
         for _ in 0..RFD_RING_LEN {
             rfd_pool.push(
                 alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
@@ -752,10 +749,7 @@ static CONTROLLER: IrqSafeSpinLock<Option<Arc<AtlNic>>> = IrqSafeSpinLock::new(N
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -830,7 +824,8 @@ fn spawn_pumps(
 async fn atheros_rx_pump(device: Arc<AtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
     loop {
         if let Some(pkt) = device.receive() {
-            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let dma_buf =
+                alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
             let _ = rx_prod.send(frame).await;
@@ -844,9 +839,6 @@ async fn atheros_tx_pump(device: Arc<AtlNic>, mut tx_cons: Consumer<Frame, TX_RI
         let _ = device.transmit(frame.payload());
     }
 }
-
-
-
 
 /// Register the driver against every documented AR81xx device id.
 pub fn register_pci_driver() {
@@ -894,7 +886,8 @@ impl narf_net::Interface for AtlHwNic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -904,7 +897,8 @@ impl narf_net::Interface for AtlHwNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -938,7 +932,8 @@ impl crate::HwNic for AtlHwNic {
         1 << 8
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -948,7 +943,8 @@ impl crate::HwNic for AtlHwNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -970,5 +966,8 @@ pub fn with_controller<R>(f: impl FnOnce(&AtlNic) -> R) -> Option<R> {
 
 /// Mutable accessor.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut AtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(|a| f(Arc::get_mut(a).expect("AtlNic static has multiple owners")))
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .map(|a| f(Arc::get_mut(a).expect("AtlNic static has multiple owners")))
 }

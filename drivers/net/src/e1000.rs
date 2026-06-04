@@ -487,17 +487,32 @@ impl TxDesc {
             cmd |= TXD_CMD_DEXT | TXD_DTYP_D;
             css = csum_opts;
         }
-        TxDesc { addr, length: len, cso: 0, cmd, status: 0, css, special: 0 }
+        TxDesc {
+            addr,
+            length: len,
+            cso: 0,
+            cmd,
+            status: 0,
+            css,
+            special: 0,
+        }
     }
 
     /// Build a TX descriptor with TSO enabled. The hardware will segment
     /// the payload into MSS-sized chunks. DEXT | DTYP_D | TSE must all
     /// be set; both IP and TCP csum-insert bits are also required.
     pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
-        let cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS
-            | TXD_CMD_DEXT | TXD_DTYP_D | TXD_CMD_TSE;
+        let cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS | TXD_CMD_DEXT | TXD_DTYP_D | TXD_CMD_TSE;
         let css = TXD_OPTS_IXSM | TXD_OPTS_TXSM;
-        TxDesc { addr, length: len, cso: 0, cmd, status: 0, css, special: 0 }
+        TxDesc {
+            addr,
+            length: len,
+            cso: 0,
+            cmd,
+            status: 0,
+            css,
+            special: 0,
+        }
     }
 }
 
@@ -905,11 +920,9 @@ impl E1000 {
         //    latency) can't land on a freed page.
         let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
         let ring_phys = tx_ring.phys_addr().raw();
-        let mut tx_pool: alloc::vec::Vec<DmaBuffer> =
-            alloc::vec::Vec::with_capacity(TX_RING_LEN);
+        let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
-            let b =
-                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
+            let b = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
             tx_pool.push(b);
         }
         // Zero the ring (alloc_coherent guarantees fresh memory but
@@ -1441,9 +1454,6 @@ async fn e1000_tx_pump(device: Arc<E1000>, mut tx_cons: Consumer<Frame, TX_RING_
     }
 }
 
-
-
-
 /// SendFn registered with `narf_net::iface` at probe time. Routes
 /// the kernel-side TCP stack's outbound frames through E1000::tx.
 fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
@@ -1690,7 +1700,8 @@ impl narf_net::Interface for E1000Nic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1700,7 +1711,8 @@ impl narf_net::Interface for E1000Nic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1767,10 +1779,7 @@ pub async fn rx_async(out: &mut [u8]) -> usize {
     // when the device goes silent or the IRQ isn't wired right —
     // we fall back to a polled re-drain instead of stalling
     // forever.
-    let waiter = narf_interrupts::wait_for_irq_until(
-        vector,
-        narf_time::Deadline::after_ms(250),
-    );
+    let waiter = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(250));
     // Fast path: there might already be a frame ready (e.g. an IRQ
     // landed before we got here). Drain it without awaiting.
     if let Some(n) = with_controller(|c| {
@@ -1810,19 +1819,16 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // deadline bounds the wait — TX completes in microseconds
     // normally; if it doesn't, the IRQ isn't wired right and we
     // should bail rather than stall.
-    let waiter = narf_interrupts::wait_for_irq_until(
-        vector,
-        narf_time::Deadline::after_ms(500),
-    );
-    let slot =
-        match with_controller(|c| c.tx_enqueue(frame)).unwrap_or(Err(E1000Error::UnsupportedDevice))
-        {
-            Ok(s) => s,
-            Err(e) => {
-                drop(waiter);
-                return Err(e);
-            }
-        };
+    let waiter = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500));
+    let slot = match with_controller(|c| c.tx_enqueue(frame))
+        .unwrap_or(Err(E1000Error::UnsupportedDevice))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            drop(waiter);
+            return Err(e);
+        }
+    };
     // Await the pre-enqueue waiter, then loop on additional IRQs in
     // case the wake was for a different cause (e.g. RXT0) and our
     // slot's DD bit isn't yet set. Each iteration has its own
@@ -1830,11 +1836,8 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // level timeout (sys_send, etc.) will abort us.
     let _ = waiter.await;
     while !with_controller(|c| c.tx_slot_done(slot)).unwrap_or(false) {
-        let _ = narf_interrupts::wait_for_irq_until(
-            vector,
-            narf_time::Deadline::after_ms(500),
-        )
-        .await;
+        let _ =
+            narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500)).await;
     }
     Ok(())
 }

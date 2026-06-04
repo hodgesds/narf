@@ -37,12 +37,12 @@ use core::fmt::Write as _;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
-use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N, TxMeta};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 // ── PCI ids ─────────────────────────────────────────────────────────
 
@@ -86,9 +86,27 @@ pub const BCM_5782: u16 = 0x1696;
 /// single `const` so the registration loop and the match-table
 /// smoke test see the same list.
 pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
-    BCM_5700, BCM_5701, BCM_5705, BCM_5705_2, BCM_5705M, BCM_5705M_2, BCM_5714, BCM_5715, BCM_5721,
-    BCM_5751, BCM_5751M, BCM_5752, BCM_5752M, BCM_5754, BCM_5754M, BCM_5755, BCM_5755M, BCM_5764M,
-    BCM_5780, BCM_5781, BCM_5782,
+    BCM_5700,
+    BCM_5701,
+    BCM_5705,
+    BCM_5705_2,
+    BCM_5705M,
+    BCM_5705M_2,
+    BCM_5714,
+    BCM_5715,
+    BCM_5721,
+    BCM_5751,
+    BCM_5751M,
+    BCM_5752,
+    BCM_5752M,
+    BCM_5754,
+    BCM_5754M,
+    BCM_5755,
+    BCM_5755M,
+    BCM_5764M,
+    BCM_5780,
+    BCM_5781,
+    BCM_5782,
 ];
 
 // ── Register offsets ────────────────────────────────────────────────
@@ -251,7 +269,11 @@ pub const RXD_FLAG_IP_CSUM: u32 = 0x1000;
 pub const RXD_FLAG_TCPUDP_CSUM: u32 = 0x2000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RxCsumResult { None, Ok, Fail }
+pub enum RxCsumResult {
+    None,
+    Ok,
+    Fail,
+}
 
 // Error mask in `err_vlan`. Mirrors Linux `RXD_ERR_MASK` per
 // tg3.h:2630 — BAD_CRC | COLLISION | LINK_LOST | PHY_DECODE |
@@ -276,15 +298,23 @@ pub const RXD_ERR_MASK: u32 = RXD_ERR_BAD_CRC
 impl TxBufferDesc {
     pub fn with_csum(addr_hi: u32, addr_lo: u32, len: u16) -> Self {
         TxBufferDesc {
-            addr_hi, addr_lo,
-            len_flags: ((len as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END | TXD_FLAG_IP_CSUM | TXD_FLAG_TCPUDP_CSUM,
+            addr_hi,
+            addr_lo,
+            len_flags: ((len as u32) << TXD_LEN_SHIFT)
+                | TXD_FLAG_END
+                | TXD_FLAG_IP_CSUM
+                | TXD_FLAG_TCPUDP_CSUM,
             vlan_tag: 0,
         }
     }
     pub fn with_tso(addr_hi: u32, addr_lo: u32, len: u16, mss: u16) -> Self {
         TxBufferDesc {
-            addr_hi, addr_lo,
-            len_flags: ((len as u32) << TXD_LEN_SHIFT) | TXD_FLAG_END | TXD_FLAG_IP_CSUM | TXD_FLAG_TCPUDP_CSUM,
+            addr_hi,
+            addr_lo,
+            len_flags: ((len as u32) << TXD_LEN_SHIFT)
+                | TXD_FLAG_END
+                | TXD_FLAG_IP_CSUM
+                | TXD_FLAG_TCPUDP_CSUM,
             vlan_tag: (mss as u32) << TXD_MSS_SHIFT,
         }
     }
@@ -294,8 +324,14 @@ impl RxBufferDesc {
     pub fn csum_result(&self) -> RxCsumResult {
         let ip_computed = self.type_flags & RXD_FLAG_IP_CSUM != 0;
         let l4_computed = self.type_flags & RXD_FLAG_TCPUDP_CSUM != 0;
-        if !ip_computed && !l4_computed { return RxCsumResult::None; }
-        if self.type_flags & RXD_FLAG_ERROR != 0 { RxCsumResult::Fail } else { RxCsumResult::Ok }
+        if !ip_computed && !l4_computed {
+            return RxCsumResult::None;
+        }
+        if self.type_flags & RXD_FLAG_ERROR != 0 {
+            RxCsumResult::Fail
+        } else {
+            RxCsumResult::Ok
+        }
     }
 }
 
@@ -450,7 +486,12 @@ impl Tg3Nic {
         let _ = writeln!(
             narf_console::Writer,
             "  tg3: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
         );
 
         // Sanity-check: all-zero or all-FFs MAC means the BAR isn't
@@ -473,14 +514,16 @@ impl Tg3Nic {
         // MDIO; Stage 1 leaves the MI_MODE default (no auto-poll, no
         // INTLPBK) so the read path is the simple one.
         // SAFETY: identity-mapped MMIO; caller owns the device.
-        let bmsr = unsafe { Self::read_phy(&mmio, PHY_ADDR_INTERNAL, MII_REG_BMSR) }
-            .unwrap_or(0xFFFF);
+        let bmsr =
+            unsafe { Self::read_phy(&mmio, PHY_ADDR_INTERNAL, MII_REG_BMSR) }.unwrap_or(0xFFFF);
         let link_up = bmsr != 0xFFFF && (bmsr & MII_BMSR_LINK_UP) != 0;
 
         let _ = writeln!(
             narf_console::Writer,
             "  tg3: BMSR={:#06x} link_up={} reset={}",
-            bmsr, link_up, reset_done,
+            bmsr,
+            link_up,
+            reset_done,
         );
 
         // Final GRC_MODE snapshot post-reset — useful when triaging
@@ -500,25 +543,22 @@ impl Tg3Nic {
         // chip has 4 ring types (RX std, RX jumbo, RX RCB, TX); Stage
         // 2 only programs RX std + TX which covers every Ethernet-
         // frame-sized transfer.
-        let tx_ring = alloc_coherent(TX_RING_BYTES, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
+        let tx_ring =
+            alloc_coherent(TX_RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
         let rx_ring = alloc_coherent(RX_STD_RING_BYTES, DomainId::DRIVER_0)
             .map_err(|_| NicError::NoMemory)?;
 
-        let mut tx_pool: alloc::vec::Vec<DmaBuffer> =
-            alloc::vec::Vec::with_capacity(TX_RING_LEN);
+        let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
             tx_pool.push(
-                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
-                    .map_err(|_| NicError::NoMemory)?,
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
             );
         }
         let mut rx_pool: alloc::vec::Vec<DmaBuffer> =
             alloc::vec::Vec::with_capacity(RX_STD_RING_LEN);
         for _ in 0..RX_STD_RING_LEN {
             rx_pool.push(
-                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
-                    .map_err(|_| NicError::NoMemory)?,
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
             );
         }
 
@@ -624,13 +664,12 @@ impl Tg3Nic {
         //    indirect-register window the bring-up walk uses;
         //    TAGGED_STATUS gates the tagged-IRQ feature we need
         //    in Stage 2.
-        let misc_host =
-            MISC_HOST_CTRL_INDIR_ACCESS
-                | MISC_HOST_CTRL_PCISTATE_RW
-                | MISC_HOST_CTRL_CLKREG_RW
-                | MISC_HOST_CTRL_TAGGED_STATUS
-                | MISC_HOST_CTRL_BYTE_SWAP * 0
-                | MISC_HOST_CTRL_WORD_SWAP * 0;
+        let misc_host = MISC_HOST_CTRL_INDIR_ACCESS
+            | MISC_HOST_CTRL_PCISTATE_RW
+            | MISC_HOST_CTRL_CLKREG_RW
+            | MISC_HOST_CTRL_TAGGED_STATUS
+            | MISC_HOST_CTRL_BYTE_SWAP * 0
+            | MISC_HOST_CTRL_WORD_SWAP * 0;
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_MISC_HOST_CTRL, misc_host);
@@ -693,10 +732,7 @@ impl Tg3Nic {
         // 80 us is below our `Deadline` resolution but
         // `responsive_spin_until` polls in a tight loop and the
         // first iteration alone is several us.
-        let _ = narf_scheduler::responsive_spin_until(
-            || true,
-            narf_time::Deadline::after_ms(1),
-        );
+        let _ = narf_scheduler::responsive_spin_until(|| true, narf_time::Deadline::after_ms(1));
 
         cleared
     }
@@ -829,8 +865,7 @@ impl Tg3Nic {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RX_STD_RING_LEN;
         let ring_phys = self.rx_ring.phys_addr().raw();
-        let desc_ptr = (ring_phys
-            + (slot * core::mem::size_of::<RxBufferDesc>()) as u64)
+        let desc_ptr = (ring_phys + (slot * core::mem::size_of::<RxBufferDesc>()) as u64)
             as *const RxBufferDesc;
         // SAFETY: identity-mapped DMA ring; slot < RX_STD_RING_LEN.
         let d = unsafe { core::ptr::read_volatile(desc_ptr) };
@@ -1009,7 +1044,8 @@ fn spawn_pumps(
 async fn tg3_rx_pump(device: Arc<Tg3Nic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
     loop {
         if let Some(pkt) = device.receive() {
-            let dma_buf = alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
+            let dma_buf =
+                alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
             let _ = rx_prod.send(frame).await;
@@ -1018,14 +1054,11 @@ async fn tg3_rx_pump(device: Arc<Tg3Nic>, mut rx_prod: Producer<Frame, RX_RING_N
     }
 }
 
-
 async fn tg3_tx_pump(device: Arc<Tg3Nic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
 }
-
-
 
 /// Register the driver against every Broadcom device id we recognise.
 /// Each match carries a unique name (driver re-registration is
@@ -1093,7 +1126,8 @@ impl narf_net::Interface for Tg3HwNic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1103,7 +1137,8 @@ impl narf_net::Interface for Tg3HwNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1137,7 +1172,8 @@ impl crate::HwNic for Tg3HwNic {
         TX_RING_LEN
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1147,7 +1183,8 @@ impl crate::HwNic for Tg3HwNic {
         &RING
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> = IrqSafeSpinLock::new(None);
+        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
+            IrqSafeSpinLock::new(None);
         with_controller(|c| {
             let mut r = RING.lock();
             if r.is_none() {
@@ -1214,7 +1251,10 @@ mod smoke {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/net/tg3", smoke_tg3_pci_match_table_covers_supported_ids);
+    kernel_test_in!(
+        "drivers/net/tg3",
+        smoke_tg3_pci_match_table_covers_supported_ids
+    );
 
     fn smoke_tg3_decode_mac_round_trips() -> TestResult {
         // Reference vector: HIGH = 0x0000_0011, LOW = 0x2233_4455 →
@@ -1277,8 +1317,10 @@ mod smoke {
         //   bit  [29]    = START / BUSY
         let phy_addr: u32 = 0x01;
         let reg: u32 = 0x01;
-        let frame_val =
-            (phy_addr << MI_COM_PHY_ADDR_SHIFT) | (reg << MI_COM_REG_ADDR_SHIFT) | MI_COM_CMD_READ | MI_COM_START;
+        let frame_val = (phy_addr << MI_COM_PHY_ADDR_SHIFT)
+            | (reg << MI_COM_REG_ADDR_SHIFT)
+            | MI_COM_CMD_READ
+            | MI_COM_START;
         // PHY address ends up in bits [25:21] → phy_addr << 21.
         if (frame_val >> 21) & 0x1F != 0x01 {
             return TestResult::Fail("PHY address shift drift");
@@ -1297,7 +1339,10 @@ mod smoke {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/net/tg3", smoke_tg3_mi_com_frame_bit_layout_matches_linux);
+    kernel_test_in!(
+        "drivers/net/tg3",
+        smoke_tg3_mi_com_frame_bit_layout_matches_linux
+    );
 
     fn smoke_tg3_grc_mode_includes_host_stackup() -> TestResult {
         // Per Linux comment in `tg3_chip_reset`: GRC_MODE must

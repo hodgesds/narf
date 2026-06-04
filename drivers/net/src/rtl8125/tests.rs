@@ -12,10 +12,10 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use super::{
     build_rx_desc, build_tx_desc, chip_kind_from_xid, cr_reset_value, decode_mac, decode_xid,
     mac_is_invalid, name_for, ChipKind, PhyStatus, TxDesc, CR_RST, INT32_LINKCHG, INT32_ROK,
-    INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, REG_IMR_8125,
-    REG_INT_CFG0_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B,
-    RTL_VENDOR, RXD_EOR_LOCAL, RXD_LEN_MASK_LOCAL, RXD_OWN_LOCAL, RX_BUF_LEN, RX_FETCH_DFLT_8125,
-    TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
+    INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, REG_IMR_8125, REG_INT_CFG0_8125,
+    REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B, RTL_VENDOR,
+    RXD_EOR_LOCAL, RXD_LEN_MASK_LOCAL, RXD_OWN_LOCAL, RX_BUF_LEN, RX_FETCH_DFLT_8125, TPPOLL_NPQ,
+    TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -289,7 +289,10 @@ fn smoke_rtl8125_chip_kind_classification() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_chip_kind_classification);
+kernel_test_in!(
+    "drivers/net/rtl8125",
+    smoke_rtl8125_chip_kind_classification
+);
 
 // ── Stage 2: RX descriptor ring round-trip ────────────────────────
 //

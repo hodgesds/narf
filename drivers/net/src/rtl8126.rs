@@ -478,17 +478,53 @@ pub enum PhyConfigKind {
 /// 101–106.
 pub const PHY_CONFIG_TABLE: &[PhyConfigEntry] = &[
     // rtl8168g_enable_gphy_10m: phy_modify_paged(0x0a44, 0x11, 0, BIT(11))
-    PhyConfigEntry { page: 0x0a44, reg: 0x11, mask: 0x0000, val: 1 << 11, kind: PhyConfigKind::ModifyPaged },
+    PhyConfigEntry {
+        page: 0x0a44,
+        reg: 0x11,
+        mask: 0x0000,
+        val: 1 << 11,
+        kind: PhyConfigKind::ModifyPaged,
+    },
     // rtl8125_legacy_force_mode: phy_modify_paged(0xa5b, 0x12, BIT(15), 0)
-    PhyConfigEntry { page: 0x0a5b, reg: 0x12, mask: 1 << 15, val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    PhyConfigEntry {
+        page: 0x0a5b,
+        reg: 0x12,
+        mask: 1 << 15,
+        val: 0x0000,
+        kind: PhyConfigKind::ModifyPaged,
+    },
     // rtl8168g_disable_aldps: phy_modify_paged(0x0a43, 0x10, BIT(2), 0)
-    PhyConfigEntry { page: 0x0a43, reg: 0x10, mask: 1 << 2,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    PhyConfigEntry {
+        page: 0x0a43,
+        reg: 0x10,
+        mask: 1 << 2,
+        val: 0x0000,
+        kind: PhyConfigKind::ModifyPaged,
+    },
     // rtl8125_common_config_eee_phy entry 1: phy_modify_paged(0xa6d, 0x14, 0x0010, 0x0000)
-    PhyConfigEntry { page: 0x0a6d, reg: 0x14, mask: 0x0010,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    PhyConfigEntry {
+        page: 0x0a6d,
+        reg: 0x14,
+        mask: 0x0010,
+        val: 0x0000,
+        kind: PhyConfigKind::ModifyPaged,
+    },
     // rtl8125_common_config_eee_phy entry 2: phy_modify_paged(0xa42, 0x14, 0x0080, 0x0000)
-    PhyConfigEntry { page: 0x0a42, reg: 0x14, mask: 0x0080,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    PhyConfigEntry {
+        page: 0x0a42,
+        reg: 0x14,
+        mask: 0x0080,
+        val: 0x0000,
+        kind: PhyConfigKind::ModifyPaged,
+    },
     // rtl8125_common_config_eee_phy entry 3: phy_modify_paged(0xa4a, 0x11, 0x0200, 0x0000)
-    PhyConfigEntry { page: 0x0a4a, reg: 0x11, mask: 0x0200,  val: 0x0000, kind: PhyConfigKind::ModifyPaged },
+    PhyConfigEntry {
+        page: 0x0a4a,
+        reg: 0x11,
+        mask: 0x0200,
+        val: 0x0000,
+        kind: PhyConfigKind::ModifyPaged,
+    },
 ];
 
 /// Number of entries in `PHY_CONFIG_TABLE`.
@@ -503,12 +539,12 @@ pub const PHY_CONFIG_PAGES: &[u16] = &[0x0a44, 0x0a5b, 0x0a43, 0x0a6d, 0x0a42, 0
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum LinkSpeed {
-    Down    = 0,
-    Speed10M  = 1,
+    Down = 0,
+    Speed10M = 1,
     Speed100M = 2,
-    Speed1G   = 3,
+    Speed1G = 3,
     Speed2_5G = 4,
-    Speed5G   = 5,
+    Speed5G = 5,
 }
 
 impl LinkSpeed {
@@ -524,7 +560,7 @@ impl LinkSpeed {
             Self::Speed5G
         } else if local.speed_1000m_or_above && partner.speed_1000m_or_above {
             if local.speed_5g {
-                Self::Speed2_5G  // partner ≥1G but not 5G; upper bound
+                Self::Speed2_5G // partner ≥1G but not 5G; upper bound
             } else {
                 Self::Speed1G
             }
@@ -578,12 +614,12 @@ pub const fn cr_reset_value() -> u8 {
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::sync::Arc;
-use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
 use narf_driver_runtime::{
     alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
     Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
+use narf_ipc::{channel, Consumer, Producer};
+use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicError {
@@ -692,9 +728,7 @@ impl Rtl8126Nic {
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(
-                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
         }
 
         // 5. C+CR: disable VLAN-detag + RX checksum offload (Stage 1).
@@ -1078,9 +1112,10 @@ pub fn with_controller<R>(f: impl FnOnce(&Rtl8126Nic) -> R) -> Option<R> {
 
 /// Mutable accessor for tests.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut Rtl8126Nic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(|a| {
-        f(Arc::get_mut(a).expect("Rtl8126Nic static has multiple owners"))
-    })
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .map(|a| f(Arc::get_mut(a).expect("Rtl8126Nic static has multiple owners")))
 }
 
 /// `narf_net::Interface` implementation.

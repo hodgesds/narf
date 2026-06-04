@@ -1165,11 +1165,7 @@ impl Mlx5Hca {
     /// `MLX5_EQ_DOORBELL_OFFSET = 0x40` at `eq.c:35`.
     ///
     /// Returns the number of EQEs consumed.
-    pub fn handle_eq_irq(
-        &self,
-        eq_number: u32,
-        on_cq_completion: impl Fn(u32),
-    ) -> u32 {
+    pub fn handle_eq_irq(&self, eq_number: u32, on_cq_completion: impl Fn(u32)) -> u32 {
         // Budget cap mirrors Linux's MLX5_EQ_POLLING_BUDGET = 128
         // (eq.c:41) — prevents a livelock if the EQ fills faster than
         // we drain.
@@ -1256,8 +1252,8 @@ impl Mlx5Hca {
         use narf_bus::enable_msix;
         // Allocate a system-wide IRQ vector number from the NARF
         // interrupt vector allocator.
-        let irq_vec = narf_interrupts::vector::alloc()
-            .map_err(|_| Mlx5Error::Other("vector alloc"))?;
+        let irq_vec =
+            narf_interrupts::vector::alloc().map_err(|_| Mlx5Error::Other("vector alloc"))?;
         let mut table = enable_msix(cap, device).map_err(|_| Mlx5Error::Other("msix setup"))?;
         // Reserve a slot in the MSI-X table (monotonic per-table alloc).
         let _slot = table
@@ -1571,8 +1567,6 @@ async fn mlx5_tx_pump(_device: Arc<Mlx5Hca>, mut _tx_cons: Consumer<Frame, TX_RI
     }
 }
 
-
-
 /// Register the driver against every ConnectX-4..6 device id we
 /// recognise. One match per id pair so each is independently
 /// maintainable.
@@ -1629,7 +1623,11 @@ impl narf_net::Interface for Mlx5NetIface {
     fn mtu(&self) -> u32 {
         with_controller(|c| {
             let m = c.nic_state().mtu;
-            if m == 0 { 1500 } else { m }
+            if m == 0 {
+                1500
+            } else {
+                m
+            }
         })
         .unwrap_or(1500)
     }

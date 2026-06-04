@@ -205,13 +205,7 @@ kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_queue_desc_layout);
 fn smoke_vmxnet3_txdesc_round_trip() -> TestResult {
     // Single-buffer TX desc: addr=0xDEADBEEF_CAFEF00D, len=1500,
     // gen=1, EOP, CQ. Must round-trip with the right bit positions.
-    let d = shared::Vmxnet3TxDesc::new(
-        0xDEAD_BEEF_CAFE_F00Du64,
-        1500,
-        1,
-        true,
-        true,
-    );
+    let d = shared::Vmxnet3TxDesc::new(0xDEAD_BEEF_CAFE_F00Du64, 1500, 1, true, true);
     if d.addr != 0xDEAD_BEEF_CAFE_F00Du64 {
         return TestResult::Fail("addr round-trip");
     }
@@ -271,7 +265,10 @@ fn smoke_vmxnet3_ring_sizing_fits_in_one_page() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_ring_sizing_fits_in_one_page);
+kernel_test_in!(
+    "drivers/net/vmxnet3",
+    smoke_vmxnet3_ring_sizing_fits_in_one_page
+);
 
 fn smoke_vmxnet3_dsa_split_round_trips_64_bit_phys() -> TestResult {
     // Stage-0 split: write low 32 bits to DSAL, high 32 to DSAH. A
