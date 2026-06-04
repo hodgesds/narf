@@ -1441,6 +1441,35 @@ pub enum Syscall {
     /// Wave-72 — `msgget(key, flags)`. arg0 = key, arg1 = flags
     /// (ignored). Returns the per-NS id for `key`. Gated `container`.
     Msgget,
+    // ── Wave-73: POSIX per-process timers + clock cleanup ──────────
+    //
+    // POSIX `timer_*` family + `clock_nanosleep`. Signal-delivered
+    // sibling of `timerfd_*`. Gated under `linux-compat` so the
+    // table only carries them when relibc-shaped binaries need
+    // them; the kernel core stays lean otherwise.
+    /// `timer_create(clockid, sigevent, timerid_out)` — register a
+    /// POSIX per-task timer. arg0 = clockid, arg1 = sigevent ptr
+    /// (may be 0 → SIGALRM default), arg2 = u32 timerid out ptr.
+    /// Linux `timer_create` (x86_64=222, aarch64=107).
+    TimerCreate,
+    /// `timer_settime(timerid, flags, new, old)` — arm or disarm.
+    /// arg0 = timerid, arg1 = flags (1 = `TIMER_ABSTIME`),
+    /// arg2 = `itimerspec*` in, arg3 = `itimerspec*` out (may be 0).
+    /// Linux `timer_settime` (x86_64=223, aarch64=110).
+    TimerSettime,
+    /// `timer_gettime(timerid, cur)` — read remaining + interval.
+    /// arg0 = timerid, arg1 = `itimerspec*` out.
+    /// Linux `timer_gettime` (x86_64=224, aarch64=108).
+    TimerGettime,
+    /// `timer_delete(timerid)` — destroy the timer.
+    /// Linux `timer_delete` (x86_64=226, aarch64=111).
+    TimerDelete,
+    /// `clock_nanosleep(clockid, flags, request, remain)` —
+    /// timed sleep against a named clock. arg0 = clockid,
+    /// arg1 = flags (1 = `TIMER_ABSTIME`), arg2 = request `timespec*`,
+    /// arg3 = remain `timespec*` (may be 0).
+    /// Linux `clock_nanosleep` (x86_64=230, aarch64=115).
+    ClockNanosleep,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1613,6 +1642,17 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Semget, 64),
     #[cfg(feature = "container")]
     (Syscall::Msgget, 68),
+    // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerCreate, 222),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerSettime, 223),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerGettime, 224),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerDelete, 226),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::ClockNanosleep, 230),
     // tcgetattr/tcsetattr are libc-only on Linux (ioctl(TCGETS) backed);
     // we keep them as direct syscalls and place them in the NARF range.
     // gethostname is libc-only on Linux too.
@@ -1774,6 +1814,17 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Semget, 190),
     #[cfg(feature = "container")]
     (Syscall::Msgget, 186),
+    // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerCreate, 107),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerGettime, 108),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerSettime, 110),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::TimerDelete, 111),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::ClockNanosleep, 115),
 ];
 
 /// NARF-only extension numbers — single shared range on every arch.

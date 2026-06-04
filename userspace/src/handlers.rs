@@ -8234,6 +8234,11 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+// Wave-73: CLOCK_MONOTONIC_RAW skips NTP slew (we have no NTP, so
+// RAW == MONOTONIC for now). CLOCK_BOOTTIME counts wall time across
+// suspend (no suspend support → same as MONOTONIC).
+const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_BOOTTIME: u64 = 7;
 
 fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
@@ -8248,7 +8253,7 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
             let w = narf_scheduler::narf_time::now_wall();
             (w.secs, w.nanos as i64)
         }
-        CLOCK_MONOTONIC => {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {
             let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }

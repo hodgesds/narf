@@ -48,7 +48,7 @@ user-mode-e2e = []
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # set_tid_address, mprotect, madvise, dynamic-linker plumbing,
 # pthread bring-up under relibc, fcntl(2) extensions, signalfd, memfd,
-# Linux ABI struct stat + statx, mount/umount2/chroot.
+# Linux ABI struct stat + statx, mount/umount2/chroot, POSIX timers.
 linux-compat = ["narf-memory/linux-compat"]
 
 # Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
