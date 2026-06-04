@@ -288,8 +288,10 @@ static PROBED: AtomicBool = AtomicBool::new(false);
 /// sequence against a synthetic register file. On real HW the bus
 /// crate's `bar::read_u32` / `bar::write_u32` are the canonical
 /// transports.
-pub fn reset_controller(mut read_gctl: impl FnMut() -> u32,
-                        mut write_gctl: impl FnMut(u32)) -> Result<(), ProbeError> {
+pub fn reset_controller(
+    mut read_gctl: impl FnMut() -> u32,
+    mut write_gctl: impl FnMut(u32),
+) -> Result<(), ProbeError> {
     // Step 1: assert CRST = 0 (writing 0 → reset enter).
     write_gctl(0);
     // Step 2: wait for the controller to acknowledge reset (CRST reads back as 0).
@@ -317,8 +319,7 @@ pub fn reset_controller(mut read_gctl: impl FnMut() -> u32,
 
 /// Initialise interrupt enables and the unsolicited-response gate.
 /// Sets GIE + CIE in INTCTL and UNSOL in GCTL.
-pub fn enable_irqs(mut read_intctl: impl FnMut() -> u32,
-                   mut write_intctl: impl FnMut(u32)) {
+pub fn enable_irqs(mut read_intctl: impl FnMut() -> u32, mut write_intctl: impl FnMut(u32)) {
     let cur = read_intctl();
     write_intctl(cur | INTCTL_GIE | INTCTL_CIE);
 }

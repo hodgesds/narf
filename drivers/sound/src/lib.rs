@@ -79,7 +79,8 @@ pub mod sysfs_bridge;
 
 mod tests;
 
-#[cfg(feature = "kernel-test")] mod e2e_tests;
+#[cfg(feature = "kernel-test")]
+mod e2e_tests;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -180,18 +181,38 @@ static NEXT_CARD_INDEX: AtomicUsize = AtomicUsize::new(0);
 /// Register a probed controller as a card. Called from
 /// `hda::controller::probe` after the controller is brought out of
 /// reset and its codecs enumerated.
-pub fn register_card(driver: &'static str, id: &'static str, name: &'static str,
-                     controller_index: usize, playback_count: u32, capture_count: u32) -> u32 {
+pub fn register_card(
+    driver: &'static str,
+    id: &'static str,
+    name: &'static str,
+    controller_index: usize,
+    playback_count: u32,
+    capture_count: u32,
+) -> u32 {
     let index = NEXT_CARD_INDEX.fetch_add(1, Ordering::AcqRel) as u32;
-    let info = CardInfo { index, driver, id, name, playback_count, capture_count };
-    let card = SoundCard { info, controller_index };
+    let info = CardInfo {
+        index,
+        driver,
+        id,
+        name,
+        playback_count,
+        capture_count,
+    };
+    let card = SoundCard {
+        info,
+        controller_index,
+    };
     CARD_REGISTRY.lock().push(card);
     index
 }
 
 /// List every probed sound card. Mirrors `cat /proc/asound/cards`.
 pub fn list_cards() -> Vec<CardInfo> {
-    CARD_REGISTRY.lock().iter().map(|c| c.info.clone()).collect()
+    CARD_REGISTRY
+        .lock()
+        .iter()
+        .map(|c| c.info.clone())
+        .collect()
 }
 
 /// Look up a card by index.
@@ -302,28 +323,42 @@ impl CaptureStream {
 /// `SoundError::NoSuchCard` / `DeviceBusy` per ALSA conventions.
 pub fn open_playback(card: u32, device: u32) -> Result<PlaybackStream, SoundError> {
     let registry = CARD_REGISTRY.lock();
-    let _card = registry.iter().find(|c| c.info.index == card).ok_or(SoundError::NoSuchCard)?;
+    let _card = registry
+        .iter()
+        .find(|c| c.info.index == card)
+        .ok_or(SoundError::NoSuchCard)?;
     if device >= _card.info.playback_count {
         return Err(SoundError::NoSuchDevice);
     }
     let controller_index = _card.controller_index;
     drop(registry);
     let substream = crate::pcm::PcmSubstream::new_playback(controller_index, device)?;
-    Ok(PlaybackStream { card, device, substream })
+    Ok(PlaybackStream {
+        card,
+        device,
+        substream,
+    })
 }
 
 /// Open a capture substream — picks the first free input stream
 /// descriptor on the named card's controller.
 pub fn open_capture(card: u32, device: u32) -> Result<CaptureStream, SoundError> {
     let registry = CARD_REGISTRY.lock();
-    let _card = registry.iter().find(|c| c.info.index == card).ok_or(SoundError::NoSuchCard)?;
+    let _card = registry
+        .iter()
+        .find(|c| c.info.index == card)
+        .ok_or(SoundError::NoSuchCard)?;
     if device >= _card.info.capture_count {
         return Err(SoundError::NoSuchDevice);
     }
     let controller_index = _card.controller_index;
     drop(registry);
     let substream = crate::pcm::PcmSubstream::new_capture(controller_index, device)?;
-    Ok(CaptureStream { card, device, substream })
+    Ok(CaptureStream {
+        card,
+        device,
+        substream,
+    })
 }
 
 // ── Mixer access ────────────────────────────────────────────────────
@@ -333,10 +368,16 @@ pub fn open_capture(card: u32, device: u32) -> Result<CaptureStream, SoundError>
 /// verbs at call time.
 pub fn mixer(card: u32) -> Result<Mixer, SoundError> {
     let registry = CARD_REGISTRY.lock();
-    let c = registry.iter().find(|c| c.info.index == card).ok_or(SoundError::NoSuchCard)?;
+    let c = registry
+        .iter()
+        .find(|c| c.info.index == card)
+        .ok_or(SoundError::NoSuchCard)?;
     let controller_index = c.controller_index;
     drop(registry);
-    Ok(Mixer { card, controller_index })
+    Ok(Mixer {
+        card,
+        controller_index,
+    })
 }
 
 /// ALSA-equivalent mixer handle.
@@ -375,9 +416,22 @@ pub use crate::format::{ChannelCount, SampleRate};
 
 /// Probe-time entry point. Called by `hda::controller::probe` once
 /// the controller is fully brought up.
-pub fn finalize_probe(driver: &'static str, id: &'static str, name: &'static str,
-                      controller_index: usize, playback_count: u32, capture_count: u32) -> u32 {
-    register_card(driver, id, name, controller_index, playback_count, capture_count)
+pub fn finalize_probe(
+    driver: &'static str,
+    id: &'static str,
+    name: &'static str,
+    controller_index: usize,
+    playback_count: u32,
+    capture_count: u32,
+) -> u32 {
+    register_card(
+        driver,
+        id,
+        name,
+        controller_index,
+        playback_count,
+        capture_count,
+    )
 }
 
 /// Sample-format / rate / channel quick-check used by tests.
@@ -414,16 +468,15 @@ pub mod tests_support {
     /// `FsFuture` values produced by the bridge `FileOps` impls are always
     /// immediately ready — they do not yield to the executor.  The no-op
     /// waker is therefore correct: we never need to wake it.
-    pub fn poll_once<T>(
-        fut: impl core::future::Future<Output = T>,
-    ) -> T {
+    pub fn poll_once<T>(fut: impl core::future::Future<Output = T>) -> T {
         use core::pin::Pin;
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
-            const VTAB: RawWakerVTable =
-                RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
         let waker = unsafe { Waker::from_raw(raw_waker()) };

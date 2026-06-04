@@ -87,9 +87,9 @@ impl SampleRate {
     pub const fn fmt_rate_field(self) -> u16 {
         match self {
             // 48 kHz family: bit 14 = 0.
-            SampleRate::R48000 => 0b0_000_000_0000_0000,         // 48k × 1 / 1
-            SampleRate::R96000 => 0b0_001_000_0000_0000,         // 48k × 2 / 1
-            SampleRate::R192000 => 0b0_011_000_0000_0000,        // 48k × 4 / 1
+            SampleRate::R48000 => 0b0_000_000_0000_0000, // 48k × 1 / 1
+            SampleRate::R96000 => 0b0_001_000_0000_0000, // 48k × 2 / 1
+            SampleRate::R192000 => 0b0_011_000_0000_0000, // 48k × 4 / 1
             // 44.1 kHz family: bit 14 = 1.
             SampleRate::R44100 => 0b1_000_000_0000_0000,
             SampleRate::R88200 => 0b1_001_000_0000_0000,
@@ -155,9 +155,7 @@ impl HwParams {
 /// Build the SDxFMT register word for the given params.
 /// HDA §3.3.41: `[15] type | [14:8] rate | [6:4] bits | [3:0] chans`.
 pub const fn pack_sdfmt(fmt: SampleFormat, rate: SampleRate, ch: ChannelCount) -> u16 {
-    rate.fmt_rate_field()
-        | ((fmt.fmt_bits()) << 4)
-        | ch.fmt_channels_field()
+    rate.fmt_rate_field() | ((fmt.fmt_bits()) << 4) | ch.fmt_channels_field()
 }
 
 /// Format/rate/channel feasibility check. Real HW reports its actual

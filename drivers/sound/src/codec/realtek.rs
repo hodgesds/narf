@@ -22,10 +22,9 @@
 use alloc::vec::Vec;
 
 use crate::codec::generic::{
-    encode_verb, set_amp_gain_mute_verb, CodecVerbBus, VerbError,
-    VERB_GET_PARAMETER, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL,
-    VERB_SET_POWER_STATE, VERB_SET_UNSOLICITED_RESPONSE,
-    PARAM_VENDOR_ID,
+    encode_verb, set_amp_gain_mute_verb, CodecVerbBus, VerbError, PARAM_VENDOR_ID,
+    VERB_GET_PARAMETER, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL, VERB_SET_POWER_STATE,
+    VERB_SET_UNSOLICITED_RESPONSE,
 };
 
 /// Realtek vendor ID (HDA `VENDOR_ID` response high 16 bits).
@@ -164,15 +163,25 @@ impl RealtekChip {
 // universal bring-up tables here.
 
 /// Write a COEF register: drive SET_COEF_INDEX, then SET_PROC_COEF.
-pub fn write_coef(bus: &mut dyn CodecVerbBus, cad: u8, nid: u8,
-                  idx: u16, value: u16) -> Result<(), VerbError> {
+pub fn write_coef(
+    bus: &mut dyn CodecVerbBus,
+    cad: u8,
+    nid: u8,
+    idx: u16,
+    value: u16,
+) -> Result<(), VerbError> {
     // SET_COEF_INDEX is a 4-byte verb whose payload is the low byte
     // of the COEF index. The high byte rides in the verb_id low
     // nibble per HDA §7.3.3.13.
     let coef_idx_verb_id = (0x5 << 8) | ((idx >> 8) & 0xFF);
     bus.send_verb(encode_verb(cad, nid, coef_idx_verb_id, (idx & 0xFF) as u8))?;
     let coef_data_verb_id = (0x4 << 8) | ((value >> 8) & 0xFF);
-    bus.send_verb(encode_verb(cad, nid, coef_data_verb_id, (value & 0xFF) as u8))?;
+    bus.send_verb(encode_verb(
+        cad,
+        nid,
+        coef_data_verb_id,
+        (value & 0xFF) as u8,
+    ))?;
     Ok(())
 }
 
@@ -190,8 +199,12 @@ impl CoefRow {
 }
 
 /// Apply a sequence of COEF writes against the codec's AFG node.
-pub fn apply_coef_table(bus: &mut dyn CodecVerbBus, cad: u8, afg_nid: u8,
-                        rows: &[CoefRow]) -> Result<(), VerbError> {
+pub fn apply_coef_table(
+    bus: &mut dyn CodecVerbBus,
+    cad: u8,
+    afg_nid: u8,
+    rows: &[CoefRow],
+) -> Result<(), VerbError> {
     for row in rows {
         write_coef(bus, cad, afg_nid, row.idx, row.value)?;
     }
@@ -243,9 +256,7 @@ pub const ALC233_INIT: &[CoefRow] = &[
 ];
 
 /// ALC235 init — same shape as ALC233.
-pub const ALC235_INIT: &[CoefRow] = &[
-    CoefRow::new(0x36, 0x5757),
-];
+pub const ALC235_INIT: &[CoefRow] = &[CoefRow::new(0x36, 0x5757)];
 
 /// ALC236 init — same shape as ALC235 with one extra POP-noise fix.
 pub const ALC236_INIT: &[CoefRow] = &[
@@ -254,26 +265,16 @@ pub const ALC236_INIT: &[CoefRow] = &[
 ];
 
 /// ALC270 init.
-pub const ALC270_INIT: &[CoefRow] = &[
-    CoefRow::new(0x14, 0x0080),
-];
+pub const ALC270_INIT: &[CoefRow] = &[CoefRow::new(0x14, 0x0080)];
 
 /// ALC280 init.
-pub const ALC280_INIT: &[CoefRow] = &[
-    CoefRow::new(0x35, 0x1080),
-];
+pub const ALC280_INIT: &[CoefRow] = &[CoefRow::new(0x35, 0x1080)];
 
 /// ALC282 init (Linux `alc269.c::alc282_init`).
-pub const ALC282_INIT: &[CoefRow] = &[
-    CoefRow::new(0x35, 0x0000),
-    CoefRow::new(0x36, 0x0000),
-];
+pub const ALC282_INIT: &[CoefRow] = &[CoefRow::new(0x35, 0x0000), CoefRow::new(0x36, 0x0000)];
 
 /// ALC283 init.
-pub const ALC283_INIT: &[CoefRow] = &[
-    CoefRow::new(0x1A, 0x2c11),
-    CoefRow::new(0x06, 0x2104),
-];
+pub const ALC283_INIT: &[CoefRow] = &[CoefRow::new(0x1A, 0x2c11), CoefRow::new(0x06, 0x2104)];
 
 /// ALC285 init (Linux `alc269.c::alc285_init`).
 pub const ALC285_INIT: &[CoefRow] = &[
@@ -284,10 +285,7 @@ pub const ALC285_INIT: &[CoefRow] = &[
 ];
 
 /// ALC286 init.
-pub const ALC286_INIT: &[CoefRow] = &[
-    CoefRow::new(0x10, 0xFA34),
-    CoefRow::new(0x11, 0x6810),
-];
+pub const ALC286_INIT: &[CoefRow] = &[CoefRow::new(0x10, 0xFA34), CoefRow::new(0x11, 0x6810)];
 
 /// ALC287 init — same baseline as ALC285 with one HP-amp-fix bit.
 pub const ALC287_INIT: &[CoefRow] = &[
@@ -297,24 +295,16 @@ pub const ALC287_INIT: &[CoefRow] = &[
 ];
 
 /// ALC289 init.
-pub const ALC289_INIT: &[CoefRow] = &[
-    CoefRow::new(0x36, 0x5757),
-];
+pub const ALC289_INIT: &[CoefRow] = &[CoefRow::new(0x36, 0x5757)];
 
 /// ALC290 init.
-pub const ALC290_INIT: &[CoefRow] = &[
-    CoefRow::new(0x10, 0x0E40),
-];
+pub const ALC290_INIT: &[CoefRow] = &[CoefRow::new(0x10, 0x0E40)];
 
 /// ALC292 init.
-pub const ALC292_INIT: &[CoefRow] = &[
-    CoefRow::new(0x6, 0x2104),
-];
+pub const ALC292_INIT: &[CoefRow] = &[CoefRow::new(0x6, 0x2104)];
 
 /// ALC293 init.
-pub const ALC293_INIT: &[CoefRow] = &[
-    CoefRow::new(0x35, 0x0000),
-];
+pub const ALC293_INIT: &[CoefRow] = &[CoefRow::new(0x35, 0x0000)];
 
 /// ALC294 init.
 pub const ALC294_INIT: &[CoefRow] = &[
@@ -330,10 +320,7 @@ pub const ALC295_INIT: &[CoefRow] = &[
 ];
 
 /// ALC298 init.
-pub const ALC298_INIT: &[CoefRow] = &[
-    CoefRow::new(0x36, 0x5757),
-    CoefRow::new(0x6F, 0x0007),
-];
+pub const ALC298_INIT: &[CoefRow] = &[CoefRow::new(0x36, 0x5757), CoefRow::new(0x6F, 0x0007)];
 
 // "ALC32xx" rebrands share their core silicon with one of the above —
 // reuse the matching base table.
@@ -388,11 +375,15 @@ pub fn init_table_for(chip: RealtekChip) -> &'static [CoefRow] {
 /// graph walker; on a fresh codec they are typically `0x02`, `0x14`,
 /// and `0x21` respectively (the same NIDs Linux's
 /// `auto_parse_config` discovers for ALC256/285/295/298).
-pub fn bring_up(bus: &mut dyn CodecVerbBus, cad: u8, afg_nid: u8,
-                chip: RealtekChip,
-                dac_nid: u8,
-                speaker_pin_nid: u8,
-                headphone_pin_nid: u8) -> Result<(), VerbError> {
+pub fn bring_up(
+    bus: &mut dyn CodecVerbBus,
+    cad: u8,
+    afg_nid: u8,
+    chip: RealtekChip,
+    dac_nid: u8,
+    speaker_pin_nid: u8,
+    headphone_pin_nid: u8,
+) -> Result<(), VerbError> {
     // 1) Vendor-specific COEF table.
     apply_coef_table(bus, cad, afg_nid, init_table_for(chip))?;
     // 2) Power-state D0 on AFG, DAC, both pins.
@@ -400,25 +391,41 @@ pub fn bring_up(bus: &mut dyn CodecVerbBus, cad: u8, afg_nid: u8,
         bus.send_verb(encode_verb(cad, nid, VERB_SET_POWER_STATE, 0x00))?;
     }
     // 3) Unmute the DAC output amp.
-    let unmute = set_amp_gain_mute_verb(cad, dac_nid,
-        /*set_output=*/ true, /*set_input=*/ false,
-        /*left=*/ true, /*right=*/ true,
-        /*index=*/ 0, /*mute=*/ false, /*gain=*/ 0);
+    let unmute = set_amp_gain_mute_verb(
+        cad, dac_nid, /*set_output=*/ true, /*set_input=*/ false, /*left=*/ true,
+        /*right=*/ true, /*index=*/ 0, /*mute=*/ false, /*gain=*/ 0,
+    );
     bus.send_verb(unmute)?;
     // 4) Drive speaker pin OUT enabled.
-    bus.send_verb(encode_verb(cad, speaker_pin_nid, VERB_SET_PIN_WIDGET_CONTROL,
-                               PIN_WIDGET_OUT))?;
+    bus.send_verb(encode_verb(
+        cad,
+        speaker_pin_nid,
+        VERB_SET_PIN_WIDGET_CONTROL,
+        PIN_WIDGET_OUT,
+    ))?;
     // 5) Drive headphone pin OUT + HP enabled (so jack-detect mux
     //    routes correctly when nothing's plugged in).
-    bus.send_verb(encode_verb(cad, headphone_pin_nid, VERB_SET_PIN_WIDGET_CONTROL,
-                               PIN_WIDGET_OUT_HP))?;
+    bus.send_verb(encode_verb(
+        cad,
+        headphone_pin_nid,
+        VERB_SET_PIN_WIDGET_CONTROL,
+        PIN_WIDGET_OUT_HP,
+    ))?;
     // 6) Enable EAPD on the speaker pin so the external amp powers up.
-    bus.send_verb(encode_verb(cad, speaker_pin_nid, VERB_SET_EAPD_BTL,
-                               EAPD_ENABLE))?;
+    bus.send_verb(encode_verb(
+        cad,
+        speaker_pin_nid,
+        VERB_SET_EAPD_BTL,
+        EAPD_ENABLE,
+    ))?;
     // 7) Enable unsolicited-response on the headphone pin so a jack
     //    plug event arrives via the RIRB unsolicited path.
-    bus.send_verb(encode_verb(cad, headphone_pin_nid, VERB_SET_UNSOLICITED_RESPONSE,
-                               /*enable=*/ 0x80 | /*tag=*/ 0x01))?;
+    bus.send_verb(encode_verb(
+        cad,
+        headphone_pin_nid,
+        VERB_SET_UNSOLICITED_RESPONSE,
+        /*enable=*/ 0x80 | /*tag=*/ 0x01,
+    ))?;
     Ok(())
 }
 
@@ -432,8 +439,12 @@ pub fn detect(bus: &mut dyn CodecVerbBus, cad: u8) -> Result<Option<RealtekChip>
 
 /// EAPD verb encoder used by tests.
 pub const fn eapd_verb(cad: u8, pin_nid: u8, enable: bool) -> u32 {
-    encode_verb(cad, pin_nid, VERB_SET_EAPD_BTL,
-                if enable { EAPD_ENABLE } else { 0 })
+    encode_verb(
+        cad,
+        pin_nid,
+        VERB_SET_EAPD_BTL,
+        if enable { EAPD_ENABLE } else { 0 },
+    )
 }
 
 // ── Test-only FakeCorb ──────────────────────────────────────────────
@@ -459,7 +470,10 @@ impl VerbRecorder {
         self.responses[at] = value;
     }
     pub fn with_initial_responses(responses: Vec<u32>) -> Self {
-        VerbRecorder { history: Vec::new(), responses }
+        VerbRecorder {
+            history: Vec::new(),
+            responses,
+        }
     }
 }
 

@@ -154,8 +154,11 @@ impl Control {
         }
         match value {
             ControlValue::Integer { left, right } => {
-                if left < self.info.value_min || left > self.info.value_max
-                    || right < self.info.value_min || right > self.info.value_max {
+                if left < self.info.value_min
+                    || left > self.info.value_max
+                    || right < self.info.value_min
+                    || right > self.info.value_max
+                {
                     return Err(MixerError::OutOfRange);
                 }
                 let packed = ((left as u16 as u32) << 16) | (right as u16 as u32);
@@ -182,8 +185,12 @@ pub fn __reset_for_test() {
 /// Register a standard Realtek-laptop control set against the
 /// controller-index. Called once per card at probe-time after the
 /// codec graph walk identifies which paths exist.
-pub fn register_standard_realtek(controller_index: usize, has_speaker: bool,
-                                 has_headphone: bool, has_mic: bool) {
+pub fn register_standard_realtek(
+    controller_index: usize,
+    has_speaker: bool,
+    has_headphone: bool,
+    has_mic: bool,
+) {
     let mut mx = MIXER_REGISTRY.lock();
     let mut controls = Vec::new();
     let mut next_idx = 0u32;
@@ -201,7 +208,10 @@ pub fn register_standard_realtek(controller_index: usize, has_speaker: bool,
         });
     };
 
-    let master = ControlId { index: next_idx, kind: ControlKind::MasterVolume };
+    let master = ControlId {
+        index: next_idx,
+        kind: ControlKind::MasterVolume,
+    };
     next_idx += 1;
     add(
         ControlInfo {
@@ -217,7 +227,10 @@ pub fn register_standard_realtek(controller_index: usize, has_speaker: bool,
         ControlValue::integer(67, 67), // ~75% default
     );
 
-    let master_mute = ControlId { index: next_idx, kind: ControlKind::MasterMute };
+    let master_mute = ControlId {
+        index: next_idx,
+        kind: ControlKind::MasterMute,
+    };
     next_idx += 1;
     add(
         ControlInfo {
@@ -234,68 +247,108 @@ pub fn register_standard_realtek(controller_index: usize, has_speaker: bool,
     );
 
     if has_speaker {
-        let id = ControlId { index: next_idx, kind: ControlKind::SpeakerVolume };
+        let id = ControlId {
+            index: next_idx,
+            kind: ControlKind::SpeakerVolume,
+        };
         next_idx += 1;
         add(
             ControlInfo {
-                id, name: ControlKind::SpeakerVolume.name(),
-                value_min: 0, value_max: ControlInfo::REALTEK_VOLUME_MAX,
-                step: 1, channels: 2,
-                is_boolean: false, is_read_only: false,
+                id,
+                name: ControlKind::SpeakerVolume.name(),
+                value_min: 0,
+                value_max: ControlInfo::REALTEK_VOLUME_MAX,
+                step: 1,
+                channels: 2,
+                is_boolean: false,
+                is_read_only: false,
             },
             ControlValue::integer(67, 67),
         );
     }
 
     if has_headphone {
-        let id = ControlId { index: next_idx, kind: ControlKind::HeadphoneVolume };
+        let id = ControlId {
+            index: next_idx,
+            kind: ControlKind::HeadphoneVolume,
+        };
         next_idx += 1;
         add(
             ControlInfo {
-                id, name: ControlKind::HeadphoneVolume.name(),
-                value_min: 0, value_max: ControlInfo::REALTEK_VOLUME_MAX,
-                step: 1, channels: 2,
-                is_boolean: false, is_read_only: false,
+                id,
+                name: ControlKind::HeadphoneVolume.name(),
+                value_min: 0,
+                value_max: ControlInfo::REALTEK_VOLUME_MAX,
+                step: 1,
+                channels: 2,
+                is_boolean: false,
+                is_read_only: false,
             },
             ControlValue::integer(67, 67),
         );
-        let jack = ControlId { index: next_idx, kind: ControlKind::JackSense };
+        let jack = ControlId {
+            index: next_idx,
+            kind: ControlKind::JackSense,
+        };
         next_idx += 1;
         add(
             ControlInfo {
-                id: jack, name: ControlKind::JackSense.name(),
-                value_min: 0, value_max: 1, step: 1, channels: 1,
-                is_boolean: true, is_read_only: true,
+                id: jack,
+                name: ControlKind::JackSense.name(),
+                value_min: 0,
+                value_max: 1,
+                step: 1,
+                channels: 1,
+                is_boolean: true,
+                is_read_only: true,
             },
             ControlValue::boolean(false), // not plugged
         );
     }
 
     if has_mic {
-        let id = ControlId { index: next_idx, kind: ControlKind::CaptureVolume };
+        let id = ControlId {
+            index: next_idx,
+            kind: ControlKind::CaptureVolume,
+        };
         next_idx += 1;
         add(
             ControlInfo {
-                id, name: ControlKind::CaptureVolume.name(),
-                value_min: 0, value_max: ControlInfo::REALTEK_VOLUME_MAX,
-                step: 1, channels: 2,
-                is_boolean: false, is_read_only: false,
+                id,
+                name: ControlKind::CaptureVolume.name(),
+                value_min: 0,
+                value_max: ControlInfo::REALTEK_VOLUME_MAX,
+                step: 1,
+                channels: 2,
+                is_boolean: false,
+                is_read_only: false,
             },
             ControlValue::integer(60, 60),
         );
-        let id = ControlId { index: next_idx, kind: ControlKind::MicBoost };
+        let id = ControlId {
+            index: next_idx,
+            kind: ControlKind::MicBoost,
+        };
         let _ = next_idx; // last add — keep symmetry, suppress lint
         add(
             ControlInfo {
-                id, name: ControlKind::MicBoost.name(),
-                value_min: 0, value_max: 3, step: 1, channels: 2,
-                is_boolean: false, is_read_only: false,
+                id,
+                name: ControlKind::MicBoost.name(),
+                value_min: 0,
+                value_max: 3,
+                step: 1,
+                channels: 2,
+                is_boolean: false,
+                is_read_only: false,
             },
             ControlValue::integer(1, 1),
         );
     }
 
-    mx.push(CardMixer { controller_index, controls });
+    mx.push(CardMixer {
+        controller_index,
+        controls,
+    });
 }
 
 /// List the control identities for a controller.
@@ -311,9 +364,13 @@ pub fn list_for_controller(controller_index: usize) -> Vec<ControlId> {
 /// Look up a control's info.
 pub fn info(controller_index: usize, id: ControlId) -> Result<ControlInfo, MixerError> {
     let mx = MIXER_REGISTRY.lock();
-    let card = mx.iter().find(|c| c.controller_index == controller_index)
+    let card = mx
+        .iter()
+        .find(|c| c.controller_index == controller_index)
         .ok_or(MixerError::NoSuchControl)?;
-    let ctrl = card.controls.iter()
+    let ctrl = card
+        .controls
+        .iter()
         .find(|c| c.info.id == id)
         .ok_or(MixerError::NoSuchControl)?;
     Ok(ctrl.info)
@@ -322,21 +379,28 @@ pub fn info(controller_index: usize, id: ControlId) -> Result<ControlInfo, Mixer
 /// Get a control's current value.
 pub fn get(controller_index: usize, id: ControlId) -> Result<ControlValue, MixerError> {
     let mx = MIXER_REGISTRY.lock();
-    let card = mx.iter().find(|c| c.controller_index == controller_index)
+    let card = mx
+        .iter()
+        .find(|c| c.controller_index == controller_index)
         .ok_or(MixerError::NoSuchControl)?;
-    let ctrl = card.controls.iter()
+    let ctrl = card
+        .controls
+        .iter()
         .find(|c| c.info.id == id)
         .ok_or(MixerError::NoSuchControl)?;
     Ok(ctrl.read())
 }
 
 /// Set a control's value. Range-checks against the control's info.
-pub fn set(controller_index: usize, id: ControlId, value: ControlValue)
-           -> Result<(), MixerError> {
+pub fn set(controller_index: usize, id: ControlId, value: ControlValue) -> Result<(), MixerError> {
     let mx = MIXER_REGISTRY.lock();
-    let card = mx.iter().find(|c| c.controller_index == controller_index)
+    let card = mx
+        .iter()
+        .find(|c| c.controller_index == controller_index)
         .ok_or(MixerError::NoSuchControl)?;
-    let ctrl = card.controls.iter()
+    let ctrl = card
+        .controls
+        .iter()
         .find(|c| c.info.id == id)
         .ok_or(MixerError::NoSuchControl)?;
     ctrl.write(value)

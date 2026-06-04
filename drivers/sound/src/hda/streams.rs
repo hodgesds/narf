@@ -73,7 +73,11 @@ pub struct BdlEntry {
 
 impl BdlEntry {
     pub const fn new(addr: u64, length: u32, ioc: bool) -> Self {
-        BdlEntry { addr, length, flags: if ioc { 1 } else { 0 } }
+        BdlEntry {
+            addr,
+            length,
+            flags: if ioc { 1 } else { 0 },
+        }
     }
 
     /// Serialise the entry as the 4-word little-endian image HW reads.
@@ -135,15 +139,13 @@ pub struct StreamDescriptor {
 impl StreamDescriptor {
     /// Build the SDxCTL value to start the stream at the given tag.
     pub const fn ctl_start(tag: u8) -> u32 {
-        SDCTL_RUN | SDCTL_IOCE | SDCTL_FEIE | SDCTL_DEIE
-            | ((tag as u32 & 0xF) << SDCTL_STRM_SHIFT)
+        SDCTL_RUN | SDCTL_IOCE | SDCTL_FEIE | SDCTL_DEIE | ((tag as u32 & 0xF) << SDCTL_STRM_SHIFT)
     }
 
     /// Build the SDxCTL value to clear RUN while leaving tag /
     /// IRQ-enable bits in place — used by `trigger_stop`.
     pub const fn ctl_stop(tag: u8) -> u32 {
-        SDCTL_IOCE | SDCTL_FEIE | SDCTL_DEIE
-            | ((tag as u32 & 0xF) << SDCTL_STRM_SHIFT)
+        SDCTL_IOCE | SDCTL_FEIE | SDCTL_DEIE | ((tag as u32 & 0xF) << SDCTL_STRM_SHIFT)
     }
 
     /// Build the SDxCTL value that drives stream reset (SRST=1).

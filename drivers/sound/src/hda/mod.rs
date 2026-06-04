@@ -8,8 +8,6 @@ pub mod streams;
 pub mod widget;
 
 pub use controller::{
-    HdaController, ProbeError as HdaProbeError, REGISTRY,
-    HDA_AMD_RENOIR_VENDOR, HDA_AMD_RENOIR_DEVICE,
-    HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE,
-    HDA_INTEL_VENDOR, HDA_CLASS_TRIPLE,
+    HdaController, ProbeError as HdaProbeError, HDA_AMD_PHOENIX_DEVICE, HDA_AMD_PHOENIX_VENDOR,
+    HDA_AMD_RENOIR_DEVICE, HDA_AMD_RENOIR_VENDOR, HDA_CLASS_TRIPLE, HDA_INTEL_VENDOR, REGISTRY,
 };

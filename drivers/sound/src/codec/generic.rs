@@ -258,8 +258,12 @@ pub enum VerbError {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Get-Parameter helper.
-pub fn get_param(bus: &mut dyn CodecVerbBus, cad: u8, nid: u8, param: u8)
-                 -> Result<u32, VerbError> {
+pub fn get_param(
+    bus: &mut dyn CodecVerbBus,
+    cad: u8,
+    nid: u8,
+    param: u8,
+) -> Result<u32, VerbError> {
     bus.send_verb(encode_verb(cad, nid, VERB_GET_PARAMETER, param))
 }
 
@@ -274,29 +278,50 @@ pub fn get_param(bus: &mut dyn CodecVerbBus, cad: u8, nid: u8, param: u8)
 /// (containing the channel + amp-type bits), low byte is the
 /// payload's low byte (containing mute + gain). The 0x300 verb is a
 /// 4-bit-major verb so callers pack the high byte into the verb_id.
-pub const fn amp_gain_mute_payload(set_output: bool, set_input: bool,
-                                    left: bool, right: bool,
-                                    index: u8, mute: bool, gain: u8)
-                                    -> u16 {
+pub const fn amp_gain_mute_payload(
+    set_output: bool,
+    set_input: bool,
+    left: bool,
+    right: bool,
+    index: u8,
+    mute: bool,
+    gain: u8,
+) -> u16 {
     let mut hi: u8 = 0;
-    if set_output { hi |= 0x80; }
-    if set_input  { hi |= 0x40; }
-    if left       { hi |= 0x20; }
-    if right      { hi |= 0x10; }
+    if set_output {
+        hi |= 0x80;
+    }
+    if set_input {
+        hi |= 0x40;
+    }
+    if left {
+        hi |= 0x20;
+    }
+    if right {
+        hi |= 0x10;
+    }
     hi |= index & 0x0F;
     let mut lo: u8 = gain & 0x7F;
-    if mute { lo |= 0x80; }
+    if mute {
+        lo |= 0x80;
+    }
     ((hi as u16) << 8) | (lo as u16)
 }
 
 /// Pack a Set Amp Gain/Mute verb (HDA §7.3.3.8). Returns the full
 /// 32-bit CORB word — major opcode 0x3 + payload.
-pub const fn set_amp_gain_mute_verb(cad: u8, nid: u8,
-                                     set_output: bool, set_input: bool,
-                                     left: bool, right: bool,
-                                     index: u8, mute: bool, gain: u8) -> u32 {
-    let payload = amp_gain_mute_payload(set_output, set_input,
-                                         left, right, index, mute, gain);
+pub const fn set_amp_gain_mute_verb(
+    cad: u8,
+    nid: u8,
+    set_output: bool,
+    set_input: bool,
+    left: bool,
+    right: bool,
+    index: u8,
+    mute: bool,
+    gain: u8,
+) -> u32 {
+    let payload = amp_gain_mute_payload(set_output, set_input, left, right, index, mute, gain);
     // major opcode 0x3 lives in bits 19..16 of the CORB word —
     // i.e. the high nibble of the 12-bit verb_id.
     let verb_id = (0x3 << 8) | ((payload >> 8) & 0xFF);
@@ -308,19 +333,21 @@ pub const fn set_amp_gain_mute_verb(cad: u8, nid: u8,
 /// pin-widget-control with `OUT_ENABLE | HP_ENABLE` (0x40 for
 /// headphone amps, 0x40 for speaker EAPD-controlled paths,
 /// 0xC0 = headphone + output).
-pub fn generic_bring_up_output(bus: &mut dyn CodecVerbBus,
-                               cad: u8,
-                               dac_nid: u8,
-                               pin_nid: u8) -> Result<(), VerbError> {
+pub fn generic_bring_up_output(
+    bus: &mut dyn CodecVerbBus,
+    cad: u8,
+    dac_nid: u8,
+    pin_nid: u8,
+) -> Result<(), VerbError> {
     // Set power state D0 (full power) on both the DAC and the pin.
     bus.send_verb(encode_verb(cad, dac_nid, VERB_SET_POWER_STATE, 0x00))?;
     bus.send_verb(encode_verb(cad, pin_nid, VERB_SET_POWER_STATE, 0x00))?;
     // Unmute the DAC output amp (output, both channels, index 0,
     // gain 0 = max).
-    let unmute = set_amp_gain_mute_verb(cad, dac_nid,
-        /*set_output=*/ true, /*set_input=*/ false,
-        /*left=*/ true, /*right=*/ true,
-        /*index=*/ 0, /*mute=*/ false, /*gain=*/ 0);
+    let unmute = set_amp_gain_mute_verb(
+        cad, dac_nid, /*set_output=*/ true, /*set_input=*/ false, /*left=*/ true,
+        /*right=*/ true, /*index=*/ 0, /*mute=*/ false, /*gain=*/ 0,
+    );
     bus.send_verb(unmute)?;
     // Drive pin widget control to "out enable" (bit 6 = 0x40).
     bus.send_verb(encode_verb(cad, pin_nid, VERB_SET_PIN_WIDGET_CONTROL, 0x40))?;

@@ -19,23 +19,13 @@
 //! - `include/sound/core.h` (SNDRV_MAJOR = 116)
 //! - `include/sound/minors.h` (minor-number scheme)
 
-use crate::codec::realtek::{
-    detect, bring_up, VerbRecorder, RealtekChip,
-};
-use crate::format::{
-    pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate,
-};
-use crate::hda::streams::{
-    StreamDescriptor, SDCTL_RUN,
-};
-use crate::mixer::{
-    self, ControlKind, ControlValue,
-};
+use crate::codec::realtek::{bring_up, detect, RealtekChip, VerbRecorder};
+use crate::format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate};
+use crate::hda::streams::{StreamDescriptor, SDCTL_RUN};
+use crate::mixer::{self, ControlKind, ControlValue};
 use crate::pcm::{PcmSubstream, SubstreamState};
 use crate::sysfs_bridge::{render_card_id_attr, SNDRV_MAJOR};
-use crate::{
-    list_cards, mixer as mixer_open, open_playback, register_card, SoundError,
-};
+use crate::{list_cards, mixer as mixer_open, open_playback, register_card, SoundError};
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -96,7 +86,7 @@ fn e2e_smoke_card_register_alc256() -> TestResult {
     // Register the card using the codec name.
     let card_index = register_card(
         "hda-intel",
-        chip.name(),       // "ALC256" — visible in sysfs/procfs
+        chip.name(), // "ALC256" — visible in sysfs/procfs
         "HDA Intel PCH",
         /*controller=*/ 0,
         /*playback=*/ 1,
@@ -190,7 +180,11 @@ fn e2e_smoke_pcm_open_hw_params_48k_stereo_s16() -> TestResult {
     }
 
     // Verify SDxFMT image.
-    let expected_fmt = pack_sdfmt(SampleFormat::S16LE, SampleRate::R48000, ChannelCount::Stereo);
+    let expected_fmt = pack_sdfmt(
+        SampleFormat::S16LE,
+        SampleRate::R48000,
+        ChannelCount::Stereo,
+    );
     // 48k family → bit14 = 0; S16 → bits[6:4]=0b001; stereo → bits[3:0]=1.
     // expected_fmt must have bit14 clear and bits[6:4]=1 and bits[3:0]=1.
     if s.sd_fmt() != expected_fmt {
@@ -416,7 +410,10 @@ fn e2e_smoke_pcm_write_4096_bytes_visible_in_dma() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/sound", e2e_smoke_pcm_write_4096_bytes_visible_in_dma);
+kernel_test_in!(
+    "drivers/sound",
+    e2e_smoke_pcm_write_4096_bytes_visible_in_dma
+);
 
 // ── Smoke #8: PCM pointer advances ───────────────────────────────────────
 //
@@ -609,19 +606,28 @@ fn e2e_smoke_mixer_set_master_volume_readback() -> TestResult {
     };
 
     let ids = mx.list_controls();
-    let master_id = match ids.iter().find(|id| matches!(id.kind, ControlKind::MasterVolume)) {
+    let master_id = match ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterVolume))
+    {
         Some(&id) => id,
         None => return TestResult::Fail("MasterVolume control not found"),
     };
 
     // Set to 60.
-    if mx.set_control_value(master_id, ControlValue::integer(60, 60)).is_err() {
+    if mx
+        .set_control_value(master_id, ControlValue::integer(60, 60))
+        .is_err()
+    {
         return TestResult::Fail("set_control_value(60) failed");
     }
 
     // Read back.
     match mx.get_control_value(master_id) {
-        Ok(ControlValue::Integer { left: 60, right: 60 }) => {}
+        Ok(ControlValue::Integer {
+            left: 60,
+            right: 60,
+        }) => {}
         Ok(v) => {
             let _ = v;
             return TestResult::Fail("read-back value not 60/60");
@@ -658,7 +664,10 @@ fn e2e_smoke_mixer_capture_mute_toggle() -> TestResult {
     };
 
     let ids = mx.list_controls();
-    let mute_id = match ids.iter().find(|id| matches!(id.kind, ControlKind::MasterMute)) {
+    let mute_id = match ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterMute))
+    {
         Some(&id) => id,
         None => return TestResult::Fail("MasterMute control not found"),
     };
@@ -674,7 +683,10 @@ fn e2e_smoke_mixer_capture_mute_toggle() -> TestResult {
     }
 
     // Mute (set false).
-    if mx.set_control_value(mute_id, ControlValue::boolean(false)).is_err() {
+    if mx
+        .set_control_value(mute_id, ControlValue::boolean(false))
+        .is_err()
+    {
         return TestResult::Fail("set mute=false failed");
     }
     match mx.get_control_value(mute_id) {
@@ -683,7 +695,10 @@ fn e2e_smoke_mixer_capture_mute_toggle() -> TestResult {
     }
 
     // Unmute (set true).
-    if mx.set_control_value(mute_id, ControlValue::boolean(true)).is_err() {
+    if mx
+        .set_control_value(mute_id, ControlValue::boolean(true))
+        .is_err()
+    {
         return TestResult::Fail("set mute=true failed");
     }
     match mx.get_control_value(mute_id) {
@@ -710,7 +725,10 @@ fn e2e_smoke_jack_sense_unsolicited_response() -> TestResult {
     mixer::register_standard_realtek(102, true, true, false);
 
     let ids = mixer::list_for_controller(102);
-    let jack_id = match ids.iter().find(|id| matches!(id.kind, ControlKind::JackSense)) {
+    let jack_id = match ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::JackSense))
+    {
         Some(&id) => id,
         None => return TestResult::Fail("JackSense control not found"),
     };

@@ -26,7 +26,7 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::generic::{Widget, WidgetKind, PinDevice};
+use crate::codec::generic::{PinDevice, Widget, WidgetKind};
 
 /// One identified output path through the codec graph.
 #[derive(Clone, Debug)]
@@ -72,12 +72,14 @@ impl CodecGraph {
         for w in widgets {
             if matches!(w.kind, WidgetKind::PinComplex) {
                 let dev = w.pin_device;
-                let is_output = matches!(dev,
-                    PinDevice::LineOut | PinDevice::Speaker
-                        | PinDevice::HpOut | PinDevice::Spdif);
-                let is_input = matches!(dev,
-                    PinDevice::MicIn | PinDevice::LineIn
-                        | PinDevice::SpdifIn);
+                let is_output = matches!(
+                    dev,
+                    PinDevice::LineOut | PinDevice::Speaker | PinDevice::HpOut | PinDevice::Spdif
+                );
+                let is_input = matches!(
+                    dev,
+                    PinDevice::MicIn | PinDevice::LineIn | PinDevice::SpdifIn
+                );
                 if is_output {
                     // For each output pin, trace its connection list
                     // backwards to find a DAC.
@@ -164,9 +166,7 @@ fn trace_via(widgets: &[Widget], from: u8, to: u8) -> Vec<u8> {
         let Some(widget) = widgets.iter().find(|w| w.nid == current) else {
             break;
         };
-        if !matches!(widget.kind, WidgetKind::PinComplex)
-            && current != from && current != to
-        {
+        if !matches!(widget.kind, WidgetKind::PinComplex) && current != from && current != to {
             via.push(current);
         }
         let Some(&next) = widget.connections.first() else {

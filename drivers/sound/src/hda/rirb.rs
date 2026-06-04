@@ -71,10 +71,12 @@ pub struct Rirb {
 impl Rirb {
     /// Drain `[rp+1 .. RIRBWP]` into `dst`, advancing `rp`. Returns
     /// the number of responses copied out.
-    pub fn drain(&mut self,
-                 ring: &[u64; RIRB_ENTRIES],
-                 hw_wp: u16,
-                 dst: &mut alloc::vec::Vec<Response>) -> usize {
+    pub fn drain(
+        &mut self,
+        ring: &[u64; RIRB_ENTRIES],
+        hw_wp: u16,
+        dst: &mut alloc::vec::Vec<Response>,
+    ) -> usize {
         let mut count = 0;
         while self.rp != hw_wp {
             self.rp = (self.rp + 1) % RIRB_ENTRIES as u16;

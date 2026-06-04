@@ -8,21 +8,18 @@
 //! / format encoding.
 
 use crate::codec::generic::{
-    encode_verb, set_amp_gain_mute_verb, PinDevice, Widget, WidgetKind,
-    VERB_GET_PARAMETER, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL,
-};
-use crate::codec::realtek::{
-    detect, bring_up, eapd_verb, init_table_for, RealtekChip,
-    VerbRecorder, EAPD_ENABLE, PIN_WIDGET_OUT,
+    encode_verb, set_amp_gain_mute_verb, PinDevice, Widget, WidgetKind, VERB_GET_PARAMETER,
+    VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL,
 };
 use crate::codec::quirks::{find_quirk, first_for_chip, quirk_count};
-use crate::format::{
-    pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate,
+use crate::codec::realtek::{
+    bring_up, detect, eapd_verb, init_table_for, RealtekChip, VerbRecorder, EAPD_ENABLE,
+    PIN_WIDGET_OUT,
 };
+use crate::format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate};
 use crate::hda::controller::{
-    reset_controller, supported_device, HdaController,
-    GCTL_CRST, HDA_AMD_PHOENIX_DEVICE, HDA_AMD_PHOENIX_VENDOR,
-    HDA_AMD_RENOIR_DEVICE, HDA_AMD_RENOIR_VENDOR, HDA_CLASS_TRIPLE,
+    reset_controller, supported_device, HdaController, GCTL_CRST, HDA_AMD_PHOENIX_DEVICE,
+    HDA_AMD_PHOENIX_VENDOR, HDA_AMD_RENOIR_DEVICE, HDA_AMD_RENOIR_VENDOR, HDA_CLASS_TRIPLE,
 };
 use crate::hda::corb::{Verb, CORB_ENTRIES};
 use crate::hda::rirb::{Response, RIRB_ENTRIES};
@@ -30,14 +27,9 @@ use crate::hda::streams::{
     BdlEntry, StreamDescriptor, SDCTL_DEIE, SDCTL_FEIE, SDCTL_IOCE, SDCTL_RUN,
 };
 use crate::hda::widget::CodecGraph;
-use crate::mixer::{
-    self, ControlInfo, ControlKind, ControlValue,
-};
+use crate::mixer::{self, ControlInfo, ControlKind, ControlValue};
 use crate::pcm::{PcmSubstream, SubstreamState};
-use crate::{
-    open_playback, list_cards, mixer as mixer_open, register_card,
-    SoundError,
-};
+use crate::{list_cards, mixer as mixer_open, open_playback, register_card, SoundError};
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -81,11 +73,21 @@ kernel_test_in!("drivers/sound", smoke_hda_register_layout_gcap_decode);
 // ── #3: CORB ring encode (verb pack) ───────────────────────────────
 
 fn smoke_corb_verb_encode() -> TestResult {
-    let v = Verb::new(/*cad=*/ 0x2, /*nid=*/ 0x14, /*verb=*/ 0x707, /*payload=*/ 0x40);
-    if v.cad() != 0x2 { return TestResult::Fail("cad decode"); }
-    if v.nid() != 0x14 { return TestResult::Fail("nid decode"); }
-    if v.verb_id() != 0x707 { return TestResult::Fail("verb decode"); }
-    if v.payload() != 0x40 { return TestResult::Fail("payload decode"); }
+    let v = Verb::new(
+        /*cad=*/ 0x2, /*nid=*/ 0x14, /*verb=*/ 0x707, /*payload=*/ 0x40,
+    );
+    if v.cad() != 0x2 {
+        return TestResult::Fail("cad decode");
+    }
+    if v.nid() != 0x14 {
+        return TestResult::Fail("nid decode");
+    }
+    if v.verb_id() != 0x707 {
+        return TestResult::Fail("verb decode");
+    }
+    if v.payload() != 0x40 {
+        return TestResult::Fail("payload decode");
+    }
     let raw = v.0;
     let expected = (0x2u32 << 28) | (0x14 << 20) | (0x707 << 8) | 0x40;
     if raw != expected {
@@ -114,7 +116,11 @@ fn smoke_rirb_response_decode() -> TestResult {
     if r.encode() != raw {
         return TestResult::Fail("encode != decode for solicited");
     }
-    let unsol = Response { data: 0xAA, caddr: 0, unsolicited: true };
+    let unsol = Response {
+        data: 0xAA,
+        caddr: 0,
+        unsolicited: true,
+    };
     let raw2 = unsol.encode();
     if Response::decode(raw2) != unsol {
         return TestResult::Fail("unsolicited round-trip");
@@ -126,10 +132,13 @@ kernel_test_in!("drivers/sound", smoke_rirb_response_decode);
 // ── #5: BDL entry encode ────────────────────────────────────────────
 
 fn smoke_bdl_entry_encode() -> TestResult {
-    let e = BdlEntry::new(0x1234_5678_DEAD_BEEFu64, /*len=*/ 4096, /*ioc=*/ true);
+    let e = BdlEntry::new(
+        0x1234_5678_DEAD_BEEFu64,
+        /*len=*/ 4096,
+        /*ioc=*/ true,
+    );
     let bytes = e.to_le_bytes();
-    if bytes[0] != 0xEF || bytes[1] != 0xBE
-        || bytes[4] != 0x78 || bytes[7] != 0x12 {
+    if bytes[0] != 0xEF || bytes[1] != 0xBE || bytes[4] != 0x78 || bytes[7] != 0x12 {
         return TestResult::Fail("BDL addr little-endian wrong");
     }
     if bytes[8] != 0x00 || bytes[9] != 0x10 {
@@ -178,7 +187,11 @@ kernel_test_in!("drivers/sound", smoke_stream_sdctl_bits);
 // ── #7: SDxFMT — 48 kHz × 2 ch × S16 ────────────────────────────────
 
 fn smoke_sdfmt_48k_stereo_s16() -> TestResult {
-    let fmt = pack_sdfmt(SampleFormat::S16LE, SampleRate::R48000, ChannelCount::Stereo);
+    let fmt = pack_sdfmt(
+        SampleFormat::S16LE,
+        SampleRate::R48000,
+        ChannelCount::Stereo,
+    );
     // 48 kHz family → bit 14 = 0.
     if fmt & (1 << 14) != 0 {
         return TestResult::Fail("48k family bit set");
@@ -192,7 +205,11 @@ fn smoke_sdfmt_48k_stereo_s16() -> TestResult {
         return TestResult::Fail("stereo encode");
     }
     // 44.1 kHz family bit set.
-    let fmt44 = pack_sdfmt(SampleFormat::S16LE, SampleRate::R44100, ChannelCount::Stereo);
+    let fmt44 = pack_sdfmt(
+        SampleFormat::S16LE,
+        SampleRate::R44100,
+        ChannelCount::Stereo,
+    );
     if fmt44 & (1 << 14) == 0 {
         return TestResult::Fail("44.1k family bit missing");
     }
@@ -206,9 +223,13 @@ fn smoke_codec_get_param_afg() -> TestResult {
     // Recorder returns 0x00010001 = AFG (function group type 0x01)
     // for the function-group parameter read on NID 0x01.
     let mut bus = VerbRecorder::with_initial_responses(vec![0x0000_0001]);
-    let response = crate::codec::generic::get_param(&mut bus,
-        /*cad=*/ 0, /*nid=*/ 0x01,
-        crate::codec::generic::PARAM_FUNCTION_GROUP).unwrap();
+    let response = crate::codec::generic::get_param(
+        &mut bus,
+        /*cad=*/ 0,
+        /*nid=*/ 0x01,
+        crate::codec::generic::PARAM_FUNCTION_GROUP,
+    )
+    .unwrap();
     if response != 1 {
         return TestResult::Fail("function group response not surfaced");
     }
@@ -217,8 +238,12 @@ fn smoke_codec_get_param_afg() -> TestResult {
         return TestResult::Fail("history length");
     }
     let v = bus.history[0];
-    let expected = encode_verb(0, 0x01, VERB_GET_PARAMETER,
-                                crate::codec::generic::PARAM_FUNCTION_GROUP);
+    let expected = encode_verb(
+        0,
+        0x01,
+        VERB_GET_PARAMETER,
+        crate::codec::generic::PARAM_FUNCTION_GROUP,
+    );
     if v != expected {
         return TestResult::Fail("encoded verb mismatch");
     }
@@ -246,8 +271,10 @@ fn smoke_codec_widget_walk_output_chain() -> TestResult {
         return TestResult::Fail("output path count");
     }
     let path = &graph.outputs[0];
-    if path.dac_nid != 0x02 || path.pin_nid != 0x14
-        || !matches!(path.pin_device, PinDevice::Speaker) {
+    if path.dac_nid != 0x02
+        || path.pin_nid != 0x14
+        || !matches!(path.pin_device, PinDevice::Speaker)
+    {
         return TestResult::Fail("path endpoints");
     }
     TestResult::Pass
@@ -270,8 +297,11 @@ fn smoke_alc256_init_sequence() -> TestResult {
     // DAC power, speaker power, HP power, unmute, set-pin-ctl on
     // both pins, EAPD on speaker, unsolicited-resp on HP.
     let mut bus = VerbRecorder::with_initial_responses(vec![]);
-    bring_up(&mut bus, /*cad=*/ 0, /*afg=*/ 0x01, chip,
-             /*dac=*/ 0x02, /*spk=*/ 0x14, /*hp=*/ 0x21).unwrap();
+    bring_up(
+        &mut bus, /*cad=*/ 0, /*afg=*/ 0x01, chip, /*dac=*/ 0x02,
+        /*spk=*/ 0x14, /*hp=*/ 0x21,
+    )
+    .unwrap();
     // 2 COEF writes (idx+data) × init.len() rows + 4 power + 1 unmute + 2 pin ctrl + 1 EAPD + 1 unsol.
     let expected = init.len() * 2 + 4 + 1 + 2 + 1 + 1;
     if bus.history.len() != expected {
@@ -356,7 +386,11 @@ fn smoke_pcm_open_hw_params_prepare() -> TestResult {
         return TestResult::Fail("state not Prepared after prepare");
     }
     // SDxFMT must encode 44.1k stereo S16.
-    let want = pack_sdfmt(SampleFormat::S16LE, SampleRate::R44100, ChannelCount::Stereo);
+    let want = pack_sdfmt(
+        SampleFormat::S16LE,
+        SampleRate::R44100,
+        ChannelCount::Stereo,
+    );
     if s.sd_fmt() != want {
         return TestResult::Fail("SDxFMT image off");
     }
@@ -398,14 +432,17 @@ kernel_test_in!("drivers/sound", smoke_pcm_trigger_start_running);
 
 fn smoke_mixer_master_volume_range() -> TestResult {
     mixer::__reset_for_test();
-    mixer::register_standard_realtek(/*ctrl=*/ 99,
-                                      /*spk=*/ true,
-                                      /*hp=*/ true,
-                                      /*mic=*/ true);
+    mixer::register_standard_realtek(
+        /*ctrl=*/ 99, /*spk=*/ true, /*hp=*/ true, /*mic=*/ true,
+    );
     let ids = mixer::list_for_controller(99);
-    let master = ids.iter().find(|id| matches!(id.kind, ControlKind::MasterVolume))
+    let master = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterVolume))
         .copied()
-        .ok_or(()).map_err(|_| ()).ok();
+        .ok_or(())
+        .map_err(|_| ())
+        .ok();
     let Some(master) = master else {
         return TestResult::Fail("master volume not registered");
     };
@@ -419,7 +456,10 @@ fn smoke_mixer_master_volume_range() -> TestResult {
     // Set in-range value.
     mixer::set(99, master, ControlValue::integer(50, 50)).unwrap();
     match mixer::get(99, master).unwrap() {
-        ControlValue::Integer { left: 50, right: 50 } => {}
+        ControlValue::Integer {
+            left: 50,
+            right: 50,
+        } => {}
         _ => return TestResult::Fail("value not round-tripped"),
     }
     // Set out-of-range value — must reject.
@@ -437,9 +477,13 @@ fn smoke_mixer_jack_sense_event() -> TestResult {
     mixer::__reset_for_test();
     mixer::register_standard_realtek(/*ctrl=*/ 100, true, true, false);
     let ids = mixer::list_for_controller(100);
-    let jack = ids.iter().find(|id| matches!(id.kind, ControlKind::JackSense))
+    let jack = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::JackSense))
         .copied()
-        .ok_or(()).map_err(|_| ()).ok()
+        .ok_or(())
+        .map_err(|_| ())
+        .ok()
         .ok_or(TestResult::Fail("jack control not registered"));
     let jack = match jack {
         Ok(j) => j,
@@ -471,11 +515,13 @@ fn smoke_controller_reset_sequence() -> TestResult {
     use core::cell::Cell;
     // Synthetic GCTL register that flips with each write.
     let gctl: Cell<u32> = Cell::new(GCTL_CRST); // start "out of reset"
-    // Driver writes 0 → controller mirrors back 0.
-    // Driver then writes CRST → controller mirrors back CRST.
+                                                // Driver writes 0 → controller mirrors back 0.
+                                                // Driver then writes CRST → controller mirrors back CRST.
     let result = reset_controller(
         || gctl.get(),
-        |v| { gctl.set(v); },
+        |v| {
+            gctl.set(v);
+        },
     );
     if result.is_err() {
         return TestResult::Fail("reset_controller errored on cooperating HW");
@@ -490,12 +536,18 @@ kernel_test_in!("drivers/sound", smoke_controller_reset_sequence);
 // ── #18: Format support filter ─────────────────────────────────────
 
 fn smoke_format_filter() -> TestResult {
-    if !crate::supported_format(SampleFormat::S16LE, SampleRate::R44100,
-                                 ChannelCount::Stereo) {
+    if !crate::supported_format(
+        SampleFormat::S16LE,
+        SampleRate::R44100,
+        ChannelCount::Stereo,
+    ) {
         return TestResult::Fail("44.1k stereo S16 rejected");
     }
-    if !crate::supported_format(SampleFormat::S32LE, SampleRate::R192000,
-                                 ChannelCount::Surround71) {
+    if !crate::supported_format(
+        SampleFormat::S32LE,
+        SampleRate::R192000,
+        ChannelCount::Surround71,
+    ) {
         return TestResult::Fail("192k 8ch S32 rejected");
     }
     TestResult::Pass
@@ -581,16 +633,34 @@ kernel_test_in!("drivers/sound", smoke_quirk_table_lookup);
 
 fn smoke_realtek_chip_coverage() -> TestResult {
     let chips = [
-        RealtekChip::Alc233, RealtekChip::Alc235, RealtekChip::Alc236,
-        RealtekChip::Alc255, RealtekChip::Alc256, RealtekChip::Alc257,
-        RealtekChip::Alc270, RealtekChip::Alc280, RealtekChip::Alc282,
-        RealtekChip::Alc283, RealtekChip::Alc285, RealtekChip::Alc286,
-        RealtekChip::Alc287, RealtekChip::Alc289, RealtekChip::Alc290,
-        RealtekChip::Alc292, RealtekChip::Alc293, RealtekChip::Alc294,
-        RealtekChip::Alc295, RealtekChip::Alc298,
-        RealtekChip::Alc3204, RealtekChip::Alc3225, RealtekChip::Alc3236,
-        RealtekChip::Alc3254, RealtekChip::Alc3266, RealtekChip::Alc3268,
-        RealtekChip::Alc3286, RealtekChip::Alc3287,
+        RealtekChip::Alc233,
+        RealtekChip::Alc235,
+        RealtekChip::Alc236,
+        RealtekChip::Alc255,
+        RealtekChip::Alc256,
+        RealtekChip::Alc257,
+        RealtekChip::Alc270,
+        RealtekChip::Alc280,
+        RealtekChip::Alc282,
+        RealtekChip::Alc283,
+        RealtekChip::Alc285,
+        RealtekChip::Alc286,
+        RealtekChip::Alc287,
+        RealtekChip::Alc289,
+        RealtekChip::Alc290,
+        RealtekChip::Alc292,
+        RealtekChip::Alc293,
+        RealtekChip::Alc294,
+        RealtekChip::Alc295,
+        RealtekChip::Alc298,
+        RealtekChip::Alc3204,
+        RealtekChip::Alc3225,
+        RealtekChip::Alc3236,
+        RealtekChip::Alc3254,
+        RealtekChip::Alc3266,
+        RealtekChip::Alc3268,
+        RealtekChip::Alc3286,
+        RealtekChip::Alc3287,
     ];
     if chips.len() < 15 {
         return TestResult::Fail("coverage below 15");
@@ -632,20 +702,19 @@ kernel_test_in!("drivers/sound", smoke_pin_widget_control_verb);
 
 fn smoke_amp_gain_mute_pack() -> TestResult {
     // Output amp, both channels, index 0, mute=false, gain=0 → 0xB000.
-    let p = crate::codec::generic::amp_gain_mute_payload(
-        true, false, true, true, 0, false, 0);
+    let p = crate::codec::generic::amp_gain_mute_payload(true, false, true, true, 0, false, 0);
     if p != 0xB000 {
         return TestResult::Fail("output unmute payload wrong");
     }
     // Output, both channels, mute=true, gain=0x40 → high byte 0xB0, low 0xC0.
-    let p = crate::codec::generic::amp_gain_mute_payload(
-        true, false, true, true, 0, true, 0x40);
+    let p = crate::codec::generic::amp_gain_mute_payload(true, false, true, true, 0, true, 0x40);
     if p != 0xB0C0 {
         return TestResult::Fail("mute payload wrong");
     }
     // Full verb word — major opcode 0x3 split.
-    let w = set_amp_gain_mute_verb(/*cad=*/ 0, /*nid=*/ 0x02,
-        true, false, true, true, 0, false, 0);
+    let w = set_amp_gain_mute_verb(
+        /*cad=*/ 0, /*nid=*/ 0x02, true, false, true, true, 0, false, 0,
+    );
     // Major opcode 3 in bits 19..16.
     if (w >> 16) & 0xF != 0x3 {
         return TestResult::Fail("major opcode not 0x3");
@@ -707,7 +776,10 @@ fn smoke_mixer_handle_list_controls() -> TestResult {
         return TestResult::Fail("mixer reported no controls");
     }
     // Get a value — master volume.
-    if let Some(master) = ids.iter().find(|id| matches!(id.kind, ControlKind::MasterVolume)) {
+    if let Some(master) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterVolume))
+    {
         let _ = mx.get_control_value(*master).unwrap();
     } else {
         return TestResult::Fail("master volume id not in list");
@@ -842,7 +914,7 @@ fn smoke_devfs_multi_card_enumerate() -> TestResult {
     crate::__reset_for_test();
     mixer::__reset_for_test();
     register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
-    register_card("hda-amd",   "HDA AMD",       "HDA AMD Renoir", 1, 1, 1);
+    register_card("hda-amd", "HDA AMD", "HDA AMD Renoir", 1, 1, 1);
     let dir = DevSndDir;
     let entries = dir.enumerate(0, 64);
     let names: alloc::vec::Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();

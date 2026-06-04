@@ -35,9 +35,11 @@ use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mo
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
-use crate::mixer::{ControlValue, ControlId};
-use crate::{card_count, list_cards, open_capture, open_capture as _open_capture,
-             open_playback, CaptureStream, Mixer, PlaybackStream, SoundError};
+use crate::mixer::{ControlId, ControlValue};
+use crate::{
+    card_count, list_cards, open_capture, open_capture as _open_capture, open_playback,
+    CaptureStream, Mixer, PlaybackStream, SoundError,
+};
 
 // ── Offset sentinel for hw_params writes ─────────────────────────────
 
@@ -172,8 +174,7 @@ impl FileOps for SoundControlFile {
             if offset == HW_PARAMS_MAGIC_OFFSET {
                 // hw_params setsockopt path — applies to playback device 0.
                 let params = decode_hw_params(buf).ok_or(FsError::InvalidPath)?;
-                let mut stream = open_playback(card_index, 0)
-                    .map_err(|_| FsError::Busy)?;
+                let mut stream = open_playback(card_index, 0).map_err(|_| FsError::Busy)?;
                 stream.hw_params(params).map_err(|_| FsError::InvalidPath)?;
                 return Ok(buf.len());
             }
@@ -198,7 +199,9 @@ impl FileOps for SoundControlFile {
                 // Accept "left/right" or single integer for both channels.
                 let (l, r) = if let Some(pos) = val_str.find('/') {
                     let l: i32 = val_str[..pos].parse().map_err(|_| FsError::InvalidPath)?;
-                    let r: i32 = val_str[pos + 1..].parse().map_err(|_| FsError::InvalidPath)?;
+                    let r: i32 = val_str[pos + 1..]
+                        .parse()
+                        .map_err(|_| FsError::InvalidPath)?;
                     (l, r)
                 } else {
                     let v: i32 = val_str.parse().map_err(|_| FsError::InvalidPath)?;
@@ -284,8 +287,7 @@ impl FileOps for SoundPcmPlaybackFile {
             if offset == HW_PARAMS_MAGIC_OFFSET {
                 // hw_params setsockopt path on the PCM file itself.
                 let params = decode_hw_params(buf).ok_or(FsError::InvalidPath)?;
-                let mut s = open_playback(card_index, device)
-                    .map_err(|_| FsError::Busy)?;
+                let mut s = open_playback(card_index, device).map_err(|_| FsError::Busy)?;
                 s.hw_params(params).map_err(|_| FsError::InvalidPath)?;
                 return Ok(buf.len());
             }
@@ -520,8 +522,14 @@ impl DirOps for DevSndDir {
         // Static entries only — dynamic card names don't satisfy
         // `&'static str`; callers wanting a full listing use `enumerate`.
         const STATIC: &[DirEntry] = &[
-            DirEntry { name: "timer", file_type: FileType::Special },
-            DirEntry { name: "seq",   file_type: FileType::Special },
+            DirEntry {
+                name: "timer",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "seq",
+                file_type: FileType::Special,
+            },
         ];
         Box::new(STATIC.iter().copied())
     }
@@ -598,7 +606,10 @@ mod devfs_bridge_tests {
         let _idx = setup_card0();
         let dir = DevSndDir;
         let node = dir.lookup("controlC0");
-        assert!(node.is_some(), "controlC0 should be visible after card 0 is registered");
+        assert!(
+            node.is_some(),
+            "controlC0 should be visible after card 0 is registered"
+        );
     }
 
     // Smoke #2: pcmC0D0p appears for default playback.
@@ -624,18 +635,12 @@ mod devfs_bridge_tests {
     fn pcm_playback_write_4096_bytes_succeeds() {
         setup_card0();
         let dir = DevSndDir;
-        let node = dir
-            .lookup("pcmC0D0p")
-            .expect("pcmC0D0p not found");
+        let node = dir.lookup("pcmC0D0p").expect("pcmC0D0p not found");
         let samples = alloc::vec![0u8; 4096];
         // Block-on the future using a trivial poll helper.
         let fut = node.write(0, &samples);
         let result = crate::tests_support::poll_once(fut);
-        assert!(
-            result.is_ok(),
-            "playback write failed: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "playback write failed: {:?}", result);
         let n = result.unwrap();
         assert_eq!(n, 4096, "expected 4096 bytes written, got {}", n);
     }
@@ -662,12 +667,20 @@ mod devfs_bridge_tests {
         crate::__reset_for_test();
         mixer::__reset_for_test();
         crate::register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
-        crate::register_card("hda-amd",   "HDA AMD",       "HDA AMD",       1, 1, 1);
+        crate::register_card("hda-amd", "HDA AMD", "HDA AMD", 1, 1, 1);
         let dir = DevSndDir;
         let entries = dir.enumerate(0, 64);
         let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"controlC0"), "controlC0 missing: {:?}", names);
-        assert!(names.contains(&"controlC1"), "controlC1 missing: {:?}", names);
+        assert!(
+            names.contains(&"controlC0"),
+            "controlC0 missing: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"controlC1"),
+            "controlC1 missing: {:?}",
+            names
+        );
         assert!(names.contains(&"pcmC0D0p"), "pcmC0D0p missing: {:?}", names);
         assert!(names.contains(&"pcmC1D0p"), "pcmC1D0p missing: {:?}", names);
     }
@@ -676,9 +689,9 @@ mod devfs_bridge_tests {
     #[test]
     fn hw_params_decode_roundtrip() {
         let mut buf = [0u8; 20];
-        buf[0..4].copy_from_slice(&0u32.to_le_bytes());   // S16LE
+        buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // S16LE
         buf[4..8].copy_from_slice(&48000u32.to_le_bytes()); // 48 kHz
-        buf[8..12].copy_from_slice(&2u32.to_le_bytes());  // stereo
+        buf[8..12].copy_from_slice(&2u32.to_le_bytes()); // stereo
         buf[12..16].copy_from_slice(&1024u32.to_le_bytes());
         buf[16..20].copy_from_slice(&4u32.to_le_bytes());
         let params = decode_hw_params(&buf).expect("decode failed");

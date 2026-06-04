@@ -72,8 +72,7 @@ pub struct PcmSubstream {
 }
 
 impl PcmSubstream {
-    fn new(controller_index: usize, device: u32, is_capture: bool)
-           -> Result<Self, SoundError> {
+    fn new(controller_index: usize, device: u32, is_capture: bool) -> Result<Self, SoundError> {
         // Slot allocation happens against the controller. For the
         // off-HW test path we use the device number as a synthetic
         // slot — real probe-time wiring claims slots via
@@ -110,7 +109,10 @@ impl PcmSubstream {
 
     /// Configure hw_params. Allocates the cyclic buffer + builds BDL.
     pub fn hw_params(&mut self, params: HwParams) -> Result<(), SoundError> {
-        if !matches!(self.state, SubstreamState::Open | SubstreamState::Configured) {
+        if !matches!(
+            self.state,
+            SubstreamState::Open | SubstreamState::Configured
+        ) {
             return Err(SoundError::BadState);
         }
         if params.period_size == 0 || params.periods == 0 {
@@ -124,7 +126,9 @@ impl PcmSubstream {
         let mut buffer = vec![0u8; buf_bytes];
         // Zero-fill so capture starts clean and playback doesn't
         // shift random memory through the codec.
-        for b in buffer.iter_mut() { *b = 0; }
+        for b in buffer.iter_mut() {
+            *b = 0;
+        }
         // BDL: one entry per period, IOC on every entry so we get
         // per-period IRQs.
         let mut bdl = Vec::with_capacity(params.periods as usize);
@@ -149,8 +153,10 @@ impl PcmSubstream {
     /// Prepare the stream. On real HW: write SDxFMT, SDxCBL, SDxLVI,
     /// SDxBDPL/SDxBDPU, reset SRST, then clear SRST. Here: bookkeeping.
     pub fn prepare(&mut self) -> Result<(), SoundError> {
-        if !matches!(self.state, SubstreamState::Configured | SubstreamState::Prepared
-                     | SubstreamState::Stopped) {
+        if !matches!(
+            self.state,
+            SubstreamState::Configured | SubstreamState::Prepared | SubstreamState::Stopped
+        ) {
             return Err(SoundError::BadState);
         }
         self.position_frames.store(0, Ordering::SeqCst);
@@ -161,7 +167,10 @@ impl PcmSubstream {
 
     /// Trigger SDxCTL.RUN.
     pub fn trigger_start(&mut self) -> Result<(), SoundError> {
-        if !matches!(self.state, SubstreamState::Prepared | SubstreamState::Stopped) {
+        if !matches!(
+            self.state,
+            SubstreamState::Prepared | SubstreamState::Stopped
+        ) {
             return Err(SoundError::BadState);
         }
         self.state = SubstreamState::Running;
@@ -190,9 +199,10 @@ impl PcmSubstream {
 
     /// Write playback samples. Returns bytes copied.
     pub fn write(&mut self, samples: &[u8]) -> Result<usize, SoundError> {
-        if !matches!(self.state,
-                     SubstreamState::Running | SubstreamState::Prepared)
-            || self.is_capture
+        if !matches!(
+            self.state,
+            SubstreamState::Running | SubstreamState::Prepared
+        ) || self.is_capture
         {
             return Err(SoundError::BadState);
         }
@@ -211,9 +221,10 @@ impl PcmSubstream {
 
     /// Read capture samples into `out`. Returns bytes copied.
     pub fn read(&mut self, out: &mut [u8]) -> Result<usize, SoundError> {
-        if !matches!(self.state,
-                     SubstreamState::Running | SubstreamState::Prepared)
-            || !self.is_capture
+        if !matches!(
+            self.state,
+            SubstreamState::Running | SubstreamState::Prepared
+        ) || !self.is_capture
         {
             return Err(SoundError::BadState);
         }

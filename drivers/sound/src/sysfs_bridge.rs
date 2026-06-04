@@ -28,7 +28,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr, Kobject};
+use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr, Kobject};
 
 use crate::CardInfo;
 
@@ -99,10 +99,7 @@ pub fn register_card_sysfs(info: &CardInfo) {
 
     // /sys/class/sound/pcmC<N>D<M>p/ and pcmC<N>D<M>c/ per device.
     for m in 0..info.playback_count {
-        let pb_kobj = class_device_register(
-            sound_class.clone(),
-            &format!("pcmC{}D{}p", n, m),
-        );
+        let pb_kobj = class_device_register(sound_class.clone(), &format!("pcmC{}D{}p", n, m));
         let minor = pcm_playback_minor(n, m);
         kobject_add_attr(&pb_kobj, "dev", move || {
             format!("{}:{}\n", SNDRV_MAJOR, minor)
@@ -111,10 +108,7 @@ pub fn register_card_sysfs(info: &CardInfo) {
     }
 
     for m in 0..info.capture_count {
-        let cap_kobj = class_device_register(
-            sound_class.clone(),
-            &format!("pcmC{}D{}c", n, m),
-        );
+        let cap_kobj = class_device_register(sound_class.clone(), &format!("pcmC{}D{}c", n, m));
         let minor = pcm_capture_minor(n, m);
         kobject_add_attr(&cap_kobj, "dev", move || {
             format!("{}:{}\n", SNDRV_MAJOR, minor)
@@ -168,14 +162,7 @@ mod sysfs_bridge_tests {
         crate::__reset_for_test();
         crate::mixer::__reset_for_test();
         sysfs::__reset_for_test();
-        crate::register_card(
-            "hda-intel",
-            "HDA Intel PCH",
-            "HDA Intel PCH",
-            0,
-            1,
-            1,
-        );
+        crate::register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
         register_all_cards_sysfs();
     }
 
@@ -198,7 +185,9 @@ mod sysfs_bridge_tests {
     fn pcm_playback_dev_attr_format() {
         setup();
         let root = sysfs::class_register("sound");
-        let pcm_kobj = root.get_child("pcmC0D0p").expect("pcmC0D0p kobject missing");
+        let pcm_kobj = root
+            .get_child("pcmC0D0p")
+            .expect("pcmC0D0p kobject missing");
         let dev_val = pcm_kobj.attr_show("dev").expect("dev attr missing");
         assert!(
             dev_val.starts_with("116:"),
@@ -212,9 +201,17 @@ mod sysfs_bridge_tests {
     fn pcm_class_attr_is_generic() {
         setup();
         let root = sysfs::class_register("sound");
-        let pcm_kobj = root.get_child("pcmC0D0p").expect("pcmC0D0p kobject missing");
-        let cls_val = pcm_kobj.attr_show("pcm_class").expect("pcm_class attr missing");
-        assert!(cls_val.contains("generic"), "pcm_class should be 'generic': {:?}", cls_val);
+        let pcm_kobj = root
+            .get_child("pcmC0D0p")
+            .expect("pcmC0D0p kobject missing");
+        let cls_val = pcm_kobj
+            .attr_show("pcm_class")
+            .expect("pcm_class attr missing");
+        assert!(
+            cls_val.contains("generic"),
+            "pcm_class should be 'generic': {:?}",
+            cls_val
+        );
     }
 
     // Smoke: minor number arithmetic matches ALSA spec.
@@ -235,7 +232,7 @@ mod sysfs_bridge_tests {
         crate::mixer::__reset_for_test();
         sysfs::__reset_for_test();
         crate::register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
-        crate::register_card("hda-amd",   "HDA AMD",       "HDA AMD",       1, 1, 1);
+        crate::register_card("hda-amd", "HDA AMD", "HDA AMD", 1, 1, 1);
         register_all_cards_sysfs();
         let root = sysfs::class_register("sound");
         assert!(root.get_child("card0").is_some(), "card0 missing");

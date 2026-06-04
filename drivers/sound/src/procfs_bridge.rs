@@ -137,15 +137,9 @@ pub fn render_codec_dump(card_index: u32, codec_index: u32) -> String {
             // know the codec is alive.
             let widget_count = card.playback_count + card.capture_count;
             out.push_str(&format!("Default PCM:\n"));
-            out.push_str(&format!(
-                "  rates [0x0060]: 44100 48000\n"
-            ));
-            out.push_str(&format!(
-                "  bits [0x0006]: 16 24\n"
-            ));
-            out.push_str(&format!(
-                "  formats [0x00000001]: PCM\n"
-            ));
+            out.push_str(&format!("  rates [0x0060]: 44100 48000\n"));
+            out.push_str(&format!("  bits [0x0006]: 16 24\n"));
+            out.push_str(&format!("  formats [0x00000001]: PCM\n"));
             out.push_str(&format!("Node count: {}\n", widget_count));
             out
         }
@@ -218,11 +212,7 @@ mod procfs_bridge_tests {
         register_card("HDA-Intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
         let out = render_cards_list();
         // Expected: " 0 [HDA Intel PCH  ]: HDA-Intel - HDA Intel PCH"
-        assert!(
-            out.contains(" 0 ["),
-            "cards missing ' 0 [': {:?}",
-            out
-        );
+        assert!(out.contains(" 0 ["), "cards missing ' 0 [': {:?}", out);
         assert!(
             out.contains("HDA-Intel"),
             "cards missing driver name: {:?}",
@@ -244,11 +234,7 @@ mod procfs_bridge_tests {
             "version string wrong: {:?}",
             v
         );
-        assert!(
-            v.contains("1.0.27"),
-            "version missing 1.0.27: {:?}",
-            v
-        );
+        assert!(v.contains("1.0.27"), "version missing 1.0.27: {:?}", v);
     }
 
     // Smoke: codec dump contains chip name.
@@ -257,8 +243,16 @@ mod procfs_bridge_tests {
         setup();
         register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
         let out = render_codec_dump(0, 0);
-        assert!(out.contains("Codec:"), "codec dump missing 'Codec:': {:?}", out);
-        assert!(out.contains("HDA Intel PCH"), "codec dump missing chip name: {:?}", out);
+        assert!(
+            out.contains("Codec:"),
+            "codec dump missing 'Codec:': {:?}",
+            out
+        );
+        assert!(
+            out.contains("HDA Intel PCH"),
+            "codec dump missing chip name: {:?}",
+            out
+        );
     }
 
     // Smoke: pcm info for playback.
@@ -267,8 +261,16 @@ mod procfs_bridge_tests {
         setup();
         register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
         let out = render_pcm_info(0, 0, false);
-        assert!(out.contains("Playback"), "pcm info missing 'Playback': {:?}", out);
-        assert!(out.contains("card: 0"), "pcm info missing 'card: 0': {:?}", out);
+        assert!(
+            out.contains("Playback"),
+            "pcm info missing 'Playback': {:?}",
+            out
+        );
+        assert!(
+            out.contains("card: 0"),
+            "pcm info missing 'card: 0': {:?}",
+            out
+        );
     }
 
     // Smoke: multi-card cards list contains both entries.
@@ -276,7 +278,7 @@ mod procfs_bridge_tests {
     fn cards_format_two_cards() {
         setup();
         register_card("HDA-Intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
-        register_card("hda-amd",   "HDA AMD",       "HDA AMD",       1, 1, 1);
+        register_card("hda-amd", "HDA AMD", "HDA AMD", 1, 1, 1);
         let out = render_cards_list();
         assert!(out.contains(" 0 ["), "missing card 0: {:?}", out);
         assert!(out.contains(" 1 ["), "missing card 1: {:?}", out);

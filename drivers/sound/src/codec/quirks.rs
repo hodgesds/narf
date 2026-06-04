@@ -45,50 +45,113 @@ pub struct Quirk {
 // ALC287_FIXUP_LENOVO_THINKPAD_T14_GEN3.
 
 pub const QUIRK_X1_CARBON_GEN7: &[PinOverride] = &[
-    PinOverride { nid: 0x14, cfg: 0x90170110 }, // speaker @ "Internal mid"
-    PinOverride { nid: 0x17, cfg: 0x90170150 }, // boost amp speaker
-    PinOverride { nid: 0x19, cfg: 0x03A11030 }, // mic @ jack
-    PinOverride { nid: 0x21, cfg: 0x03211020 }, // headphone @ jack
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    }, // speaker @ "Internal mid"
+    PinOverride {
+        nid: 0x17,
+        cfg: 0x90170150,
+    }, // boost amp speaker
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x03A11030,
+    }, // mic @ jack
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    }, // headphone @ jack
 ];
 
 pub const QUIRK_THINKPAD_T14_GEN3: &[PinOverride] = &[
-    PinOverride { nid: 0x14, cfg: 0x90170110 },
-    PinOverride { nid: 0x17, cfg: 0x90170150 },
-    PinOverride { nid: 0x19, cfg: 0x04A11040 },
-    PinOverride { nid: 0x21, cfg: 0x04211020 },
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x17,
+        cfg: 0x90170150,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x04A11040,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x04211020,
+    },
 ];
 
 // ── HP EliteBook / Pavilion bring-up tables ─────────────────────────
 
 pub const QUIRK_HP_ELITEBOOK_845_G8: &[PinOverride] = &[
-    PinOverride { nid: 0x14, cfg: 0x90170110 },
-    PinOverride { nid: 0x19, cfg: 0x03a11020 },
-    PinOverride { nid: 0x21, cfg: 0x03211030 },
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x03a11020,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211030,
+    },
 ];
 
 // ── Dell Latitude / XPS bring-up tables ─────────────────────────────
 
 pub const QUIRK_DELL_LATITUDE_5430: &[PinOverride] = &[
-    PinOverride { nid: 0x14, cfg: 0x90170110 },
-    PinOverride { nid: 0x19, cfg: 0x90a60140 }, // internal mic.
-    PinOverride { nid: 0x21, cfg: 0x03211020 },
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x90a60140,
+    }, // internal mic.
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    },
 ];
 
 // ── ASUS ROG / Zephyrus bring-up tables ─────────────────────────────
 
 pub const QUIRK_ASUS_ROG: &[PinOverride] = &[
-    PinOverride { nid: 0x12, cfg: 0x90A60130 },
-    PinOverride { nid: 0x14, cfg: 0x90170110 },
-    PinOverride { nid: 0x17, cfg: 0x90170120 },
-    PinOverride { nid: 0x21, cfg: 0x03211020 },
+    PinOverride {
+        nid: 0x12,
+        cfg: 0x90A60130,
+    },
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x17,
+        cfg: 0x90170120,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    },
 ];
 
 // ── MSI bring-up tables ─────────────────────────────────────────────
 
 pub const QUIRK_MSI: &[PinOverride] = &[
-    PinOverride { nid: 0x14, cfg: 0x90170110 },
-    PinOverride { nid: 0x19, cfg: 0x03A11040 },
-    PinOverride { nid: 0x21, cfg: 0x03211020 },
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x03A11040,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    },
 ];
 
 // ── Quirk table ─────────────────────────────────────────────────────
