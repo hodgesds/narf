@@ -289,9 +289,7 @@ impl LeLongTermKeyRequest {
         }
         Some(Self {
             handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
-            random_number: u64::from_le_bytes([
-                p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10],
-            ]),
+            random_number: u64::from_le_bytes([p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10]]),
             ediv: u16::from_le_bytes([p[11], p[12]]),
         })
     }
@@ -471,9 +469,13 @@ pub fn parse_inquiry_results(event: &Event) -> Option<alloc::vec::Vec<InquiryRes
         return None;
     }
     let p = &event.params;
-    if p.is_empty() { return None; }
+    if p.is_empty() {
+        return None;
+    }
     let n = p[0] as usize;
-    if p.len() < 1 + n * 14 { return None; }
+    if p.len() < 1 + n * 14 {
+        return None;
+    }
     let mut out = alloc::vec::Vec::with_capacity(n);
     for i in 0..n {
         let base = 1 + i * 14;
@@ -483,8 +485,12 @@ pub fn parse_inquiry_results(event: &Event) -> Option<alloc::vec::Vec<InquiryRes
         let mut cod = [0u8; 3];
         cod.copy_from_slice(&p[base + 9..base + 12]);
         let clk = u16::from_le_bytes([p[base + 12], p[base + 13]]);
-        out.push(InquiryResultEntry { bd_addr: addr, page_scan_repetition_mode: psrm,
-                                      class_of_device: cod, clock_offset: clk });
+        out.push(InquiryResultEntry {
+            bd_addr: addr,
+            page_scan_repetition_mode: psrm,
+            class_of_device: cod,
+            clock_offset: clk,
+        });
     }
     Some(out)
 }
@@ -501,39 +507,68 @@ pub struct ClassicConnectionComplete {
 }
 impl ClassicConnectionComplete {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::ConnectionComplete as u8 { return None; }
+        if event.code != EventCode::ConnectionComplete as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 11 { return None; }
+        if p.len() < 11 {
+            return None;
+        }
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&p[3..9]);
-        Some(Self { status: p[0],
-                    handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
-                    bd_addr: addr, link_type: p[9], encryption_enabled: p[10] })
+        Some(Self {
+            status: p[0],
+            handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+            bd_addr: addr,
+            link_type: p[9],
+            encryption_enabled: p[10],
+        })
     }
 }
 
 /// Decoded `HCI_Authentication_Complete` event (§7.7.6).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct AuthenticationComplete { pub status: u8, pub handle: u16 }
+pub struct AuthenticationComplete {
+    pub status: u8,
+    pub handle: u16,
+}
 impl AuthenticationComplete {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::AuthenticationComplete as u8 { return None; }
+        if event.code != EventCode::AuthenticationComplete as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 3 { return None; }
-        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF })
+        if p.len() < 3 {
+            return None;
+        }
+        Some(Self {
+            status: p[0],
+            handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+        })
     }
 }
 
 /// Decoded `HCI_Encryption_Change` event v1 (§7.7.8).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct EncryptionChangeV1 { pub status: u8, pub handle: u16, pub encryption_enabled: u8 }
+pub struct EncryptionChangeV1 {
+    pub status: u8,
+    pub handle: u16,
+    pub encryption_enabled: u8,
+}
 impl EncryptionChangeV1 {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::EncryptionChange as u8 { return None; }
+        if event.code != EventCode::EncryptionChange as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 4 { return None; }
-        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
-                    encryption_enabled: p[3] })
+        if p.len() < 4 {
+            return None;
+        }
+        Some(Self {
+            status: p[0],
+            handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+            encryption_enabled: p[3],
+        })
     }
 }
 
@@ -542,23 +577,38 @@ impl EncryptionChangeV1 {
 ///         ReTx_Window(1) Rx_Len(2) Tx_Len(2) Air_Mode(1) = 17 bytes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SyncConnectionComplete {
-    pub status: u8, pub handle: u16, pub bd_addr: [u8; 6],
-    pub link_type: u8, pub transmission_interval: u8, pub retransmission_window: u8,
-    pub rx_packet_length: u16, pub tx_packet_length: u16, pub air_mode: u8,
+    pub status: u8,
+    pub handle: u16,
+    pub bd_addr: [u8; 6],
+    pub link_type: u8,
+    pub transmission_interval: u8,
+    pub retransmission_window: u8,
+    pub rx_packet_length: u16,
+    pub tx_packet_length: u16,
+    pub air_mode: u8,
 }
 impl SyncConnectionComplete {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::SyncConnectionComplete as u8 { return None; }
+        if event.code != EventCode::SyncConnectionComplete as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 17 { return None; }
+        if p.len() < 17 {
+            return None;
+        }
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&p[3..9]);
-        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
-                    bd_addr: addr, link_type: p[9], transmission_interval: p[10],
-                    retransmission_window: p[11],
-                    rx_packet_length: u16::from_le_bytes([p[12], p[13]]),
-                    tx_packet_length: u16::from_le_bytes([p[14], p[15]]),
-                    air_mode: p[16] })
+        Some(Self {
+            status: p[0],
+            handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+            bd_addr: addr,
+            link_type: p[9],
+            transmission_interval: p[10],
+            retransmission_window: p[11],
+            rx_packet_length: u16::from_le_bytes([p[12], p[13]]),
+            tx_packet_length: u16::from_le_bytes([p[14], p[15]]),
+            air_mode: p[16],
+        })
     }
 }
 
@@ -573,26 +623,40 @@ pub struct ConnectionRequest {
 }
 impl ConnectionRequest {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::ConnectionRequest as u8 { return None; }
+        if event.code != EventCode::ConnectionRequest as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 10 { return None; }
+        if p.len() < 10 {
+            return None;
+        }
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&p[0..6]);
         let mut cod = [0u8; 3];
         cod.copy_from_slice(&p[6..9]);
-        Some(Self { bd_addr: addr, class_of_device: cod, link_type: p[9] })
+        Some(Self {
+            bd_addr: addr,
+            class_of_device: cod,
+            link_type: p[9],
+        })
     }
 }
 
 /// `HCI_IO_Capability_Request` event (§7.7.40). Controller asks the
 /// host which IO capabilities to advertise for SSP. Layout: BD_ADDR(6).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct IoCapabilityRequest { pub bd_addr: [u8; 6] }
+pub struct IoCapabilityRequest {
+    pub bd_addr: [u8; 6],
+}
 impl IoCapabilityRequest {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::IoCapabilityRequest as u8 { return None; }
+        if event.code != EventCode::IoCapabilityRequest as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 6 { return None; }
+        if p.len() < 6 {
+            return None;
+        }
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&p[0..6]);
         Some(Self { bd_addr: addr })
@@ -608,13 +672,20 @@ pub struct UserConfirmationRequest {
 }
 impl UserConfirmationRequest {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::UserConfirmationRequest as u8 { return None; }
+        if event.code != EventCode::UserConfirmationRequest as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 10 { return None; }
+        if p.len() < 10 {
+            return None;
+        }
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&p[0..6]);
         let val = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
-        Some(Self { bd_addr: addr, numeric_value: val })
+        Some(Self {
+            bd_addr: addr,
+            numeric_value: val,
+        })
     }
 }
 
@@ -627,9 +698,16 @@ pub struct EncryptionKeyRefreshComplete {
 }
 impl EncryptionKeyRefreshComplete {
     pub fn parse(event: &Event) -> Option<Self> {
-        if event.code != EventCode::EncryptionKeyRefreshComplete as u8 { return None; }
+        if event.code != EventCode::EncryptionKeyRefreshComplete as u8 {
+            return None;
+        }
         let p = &event.params;
-        if p.len() < 3 { return None; }
-        Some(Self { status: p[0], handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF })
+        if p.len() < 3 {
+            return None;
+        }
+        Some(Self {
+            status: p[0],
+            handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+        })
     }
 }

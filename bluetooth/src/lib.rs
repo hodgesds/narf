@@ -37,12 +37,11 @@ pub mod att;
 pub mod avdtp;
 pub mod avrcp;
 pub mod btusb_quirks;
-pub mod profiles;
 pub mod classic;
 pub mod cmd_queue;
 pub mod controller;
-pub mod event;
 pub mod ertm;
+pub mod event;
 pub mod gap;
 pub mod gatt;
 pub mod gatt_server;
@@ -52,15 +51,16 @@ pub mod hci;
 pub mod hfp;
 pub mod hid_profile;
 pub mod hogp;
-pub mod usb_transport;
-pub mod rfcomm;
-pub mod sdp;
-pub mod services;
 pub mod l2cap;
 pub mod mesh;
 pub mod opcode;
+pub mod profiles;
+pub mod rfcomm;
+pub mod sdp;
+pub mod services;
 pub mod smp;
 pub mod transport;
+pub mod usb_transport;
 
 pub mod devfs_bridge;
 pub mod sysfs_bridge;
@@ -105,10 +105,13 @@ pub fn register_initcalls() {
     // Stage: install /dev/rfcomm<N> lookup + enumerate hooks into devfs.
     // Linux ref: net/bluetooth/rfcomm/tty.c:rfcomm_dev_add().
     narf_init::register(Stage::Late, "bluetooth-devfs", || {
-        fn rfcomm_lookup_hook(name: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+        fn rfcomm_lookup_hook(
+            name: &str,
+        ) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
             crate::devfs_bridge::lookup_rfcomm_file(name)
         }
-        fn rfcomm_enum_hook() -> alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)> {
+        fn rfcomm_enum_hook() -> alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>
+        {
             crate::devfs_bridge::enumerate_rfcomm_devices(0, usize::MAX)
         }
         narf_filesystem::devfs::install_rfcomm_hooks(rfcomm_lookup_hook, rfcomm_enum_hook);

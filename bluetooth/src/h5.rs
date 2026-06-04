@@ -137,8 +137,7 @@ impl H5Header {
         let b3 = bytes[3];
         // Header checksum: b0 + b1 + b2 + b3 == 0xFF (byte
         // arithmetic). Vol 4 Part D §3.5.
-        let sum =
-            (b0 as u16 + b1 as u16 + b2 as u16 + b3 as u16) & 0xFF;
+        let sum = (b0 as u16 + b1 as u16 + b2 as u16 + b3 as u16) & 0xFF;
         if sum != 0xFF {
             return Err(H5Error::BadHeaderChecksum);
         }
@@ -146,8 +145,8 @@ impl H5Header {
         let ack = (b0 >> 3) & 0x07;
         let crc_present = b0 & (1 << 6) != 0;
         let reliable = b0 & (1 << 7) != 0;
-        let ptype = H5PacketType::from_u8(b1 & 0x0F)
-            .ok_or(H5Error::UnknownPacketType(b1 & 0x0F))?;
+        let ptype =
+            H5PacketType::from_u8(b1 & 0x0F).ok_or(H5Error::UnknownPacketType(b1 & 0x0F))?;
         let payload_len = ((b1 as u16) >> 4) | ((b2 as u16) << 4);
         Ok(Self {
             seq,
@@ -168,7 +167,10 @@ pub enum H5Error {
     /// Body is shorter than the header announces.
     Truncated,
     /// Optional CRC was set but didn't validate.
-    BadCrc { got: u16, want: u16 },
+    BadCrc {
+        got: u16,
+        want: u16,
+    },
     /// SLIP escape sequence was malformed.
     BadEscape(u8),
 }
@@ -394,7 +396,8 @@ pub mod tests {
         };
         let bytes = h.encode();
         // Header checksum: b0+b1+b2+b3 == 0xFF (mod 256).
-        let sum: u16 = (bytes[0] as u16 + bytes[1] as u16 + bytes[2] as u16 + bytes[3] as u16) & 0xFF;
+        let sum: u16 =
+            (bytes[0] as u16 + bytes[1] as u16 + bytes[2] as u16 + bytes[3] as u16) & 0xFF;
         if sum != 0xFF {
             return TestResult::Fail("header checksum byte-sum wrong");
         }

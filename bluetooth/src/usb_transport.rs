@@ -150,10 +150,12 @@ pub fn find_endpoints(cfg: &[u8]) -> Option<HciEndpoints> {
 /// Interface | Host-to-Device) and bRequest=0x00.
 pub fn hci_command_setup(interface: u8, command_len: u16) -> [u8; 8] {
     [
-        0x20,                  // bmRequestType
-        0x00,                  // bRequest
-        0x00, 0x00,            // wValue
-        interface, 0x00,        // wIndex (low byte = interface)
+        0x20, // bmRequestType
+        0x00, // bRequest
+        0x00,
+        0x00, // wValue
+        interface,
+        0x00, // wIndex (low byte = interface)
         (command_len & 0xFF) as u8,
         ((command_len >> 8) & 0xFF) as u8, // wLength
     ]

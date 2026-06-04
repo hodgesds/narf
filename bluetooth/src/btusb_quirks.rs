@@ -71,30 +71,102 @@ pub struct QuirkMatch {
 /// Linux reference: `drivers/bluetooth/btusb.c`, `btusb_table[]`.
 pub const QUIRK_TABLE: &[QuirkMatch] = &[
     // Intel AX2xx (BTUSB_INTEL_COMBINED).
-    QuirkMatch { vendor: 0x8087, product: 0x0026, quirk: Quirk::Intel },
-    QuirkMatch { vendor: 0x8087, product: 0x0029, quirk: Quirk::Intel },
-    QuirkMatch { vendor: 0x8087, product: 0x0032, quirk: Quirk::Intel }, // AX210
-    QuirkMatch { vendor: 0x8087, product: 0x0033, quirk: Quirk::Intel }, // AX211
-    QuirkMatch { vendor: 0x8087, product: 0x0036, quirk: Quirk::Intel }, // BE200
+    QuirkMatch {
+        vendor: 0x8087,
+        product: 0x0026,
+        quirk: Quirk::Intel,
+    },
+    QuirkMatch {
+        vendor: 0x8087,
+        product: 0x0029,
+        quirk: Quirk::Intel,
+    },
+    QuirkMatch {
+        vendor: 0x8087,
+        product: 0x0032,
+        quirk: Quirk::Intel,
+    }, // AX210
+    QuirkMatch {
+        vendor: 0x8087,
+        product: 0x0033,
+        quirk: Quirk::Intel,
+    }, // AX211
+    QuirkMatch {
+        vendor: 0x8087,
+        product: 0x0036,
+        quirk: Quirk::Intel,
+    }, // BE200
     // Realtek RTL8761/RTL8821/RTL8852.
-    QuirkMatch { vendor: 0x0bda, product: 0x8771, quirk: Quirk::Realtek }, // RTL8761B
-    QuirkMatch { vendor: 0x0bda, product: 0xb852, quirk: Quirk::Realtek }, // RTL8852A
-    QuirkMatch { vendor: 0x0bda, product: 0xc852, quirk: Quirk::Realtek }, // RTL8852C
-    QuirkMatch { vendor: 0x0bda, product: 0xc123, quirk: Quirk::Realtek }, // RTL8761
-    QuirkMatch { vendor: 0x13d3, product: 0x3548, quirk: Quirk::Realtek },
+    QuirkMatch {
+        vendor: 0x0bda,
+        product: 0x8771,
+        quirk: Quirk::Realtek,
+    }, // RTL8761B
+    QuirkMatch {
+        vendor: 0x0bda,
+        product: 0xb852,
+        quirk: Quirk::Realtek,
+    }, // RTL8852A
+    QuirkMatch {
+        vendor: 0x0bda,
+        product: 0xc852,
+        quirk: Quirk::Realtek,
+    }, // RTL8852C
+    QuirkMatch {
+        vendor: 0x0bda,
+        product: 0xc123,
+        quirk: Quirk::Realtek,
+    }, // RTL8761
+    QuirkMatch {
+        vendor: 0x13d3,
+        product: 0x3548,
+        quirk: Quirk::Realtek,
+    },
     // Qualcomm WCN6855.
-    QuirkMatch { vendor: 0x0489, product: 0xe0cd, quirk: Quirk::QualcommWcn6855 },
-    QuirkMatch { vendor: 0x0489, product: 0xe0e0, quirk: Quirk::QualcommWcn6855 },
+    QuirkMatch {
+        vendor: 0x0489,
+        product: 0xe0cd,
+        quirk: Quirk::QualcommWcn6855,
+    },
+    QuirkMatch {
+        vendor: 0x0489,
+        product: 0xe0e0,
+        quirk: Quirk::QualcommWcn6855,
+    },
     // MediaTek MT7921 / MT7922 (Phoenix HawkPoint1 default).
-    QuirkMatch { vendor: 0x0e8d, product: 0x7961, quirk: Quirk::MediaTek }, // MT7921
-    QuirkMatch { vendor: 0x0e8d, product: 0x7922, quirk: Quirk::MediaTek }, // MT7922
-    QuirkMatch { vendor: 0x13d3, product: 0x3563, quirk: Quirk::MediaTek }, // MT7922 Lite-On
+    QuirkMatch {
+        vendor: 0x0e8d,
+        product: 0x7961,
+        quirk: Quirk::MediaTek,
+    }, // MT7921
+    QuirkMatch {
+        vendor: 0x0e8d,
+        product: 0x7922,
+        quirk: Quirk::MediaTek,
+    }, // MT7922
+    QuirkMatch {
+        vendor: 0x13d3,
+        product: 0x3563,
+        quirk: Quirk::MediaTek,
+    }, // MT7922 Lite-On
     // Broadcom BCM4377/4378 (Apple Silicon — uncommon on x86 NARF).
-    QuirkMatch { vendor: 0x0a5c, product: 0x6410, quirk: Quirk::Broadcom },
+    QuirkMatch {
+        vendor: 0x0a5c,
+        product: 0x6410,
+        quirk: Quirk::Broadcom,
+    },
     // CSR8510 official + clones.
-    QuirkMatch { vendor: 0x0a12, product: 0x0001, quirk: Quirk::Csr },
+    QuirkMatch {
+        vendor: 0x0a12,
+        product: 0x0001,
+        quirk: Quirk::Csr,
+    },
     // Marvell SD8897 USB.
-    QuirkMatch { vendor: 0x1286, product: 0x2044, quirk: Quirk::Marvell },
+    QuirkMatch {
+        vendor: 0x1286,
+        product: 0x2044,
+        quirk: Quirk::Marvell,
+    },
 ];
 
 /// Match a USB VID:PID against the quirk table.

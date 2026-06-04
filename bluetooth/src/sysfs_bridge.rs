@@ -21,7 +21,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr, Kobject};
+use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr, Kobject};
 
 use crate::controller::ControllerInfo;
 

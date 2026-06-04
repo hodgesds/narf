@@ -30,8 +30,8 @@ use alloc::vec::Vec;
 
 use crate::avdtp::{
     discover_command, get_capabilities_command, open_command, set_configuration_command,
-    start_command, Header, StreamEndPoint, MSG_RESPONSE_ACCEPT, SID_DISCOVER,
-    SID_GET_CAPABILITIES, SID_OPEN, SID_SET_CONFIGURATION, SID_START,
+    start_command, Header, StreamEndPoint, MSG_RESPONSE_ACCEPT, SID_DISCOVER, SID_GET_CAPABILITIES,
+    SID_OPEN, SID_SET_CONFIGURATION, SID_START,
 };
 
 // ── AVDTP session state ──────────────────────────────────────────────
@@ -132,7 +132,10 @@ impl Session {
     pub fn get_capabilities(&mut self, acp_seid: u8) -> Vec<u8> {
         let t = self.next_txn();
         self.acp_seid = acp_seid;
-        self.state = SessionState::GetCapsPending { txn: t, seid: acp_seid };
+        self.state = SessionState::GetCapsPending {
+            txn: t,
+            seid: acp_seid,
+        };
         get_capabilities_command(t, acp_seid)
     }
 

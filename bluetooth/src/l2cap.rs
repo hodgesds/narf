@@ -666,11 +666,7 @@ pub fn build_le_credit_based_connection_request(
 
 /// Build an LE Flow Control Credit signalling command (§4.24). Data:
 /// CID (2 LE) + Credits (2 LE).
-pub fn build_le_flow_control_credit(
-    identifier: u8,
-    cid: u16,
-    credits: u16,
-) -> SignallingCommand {
+pub fn build_le_flow_control_credit(identifier: u8, cid: u16, credits: u16) -> SignallingCommand {
     let mut data = Vec::with_capacity(4);
     data.extend_from_slice(&cid.to_le_bytes());
     data.extend_from_slice(&credits.to_le_bytes());
@@ -714,10 +710,5 @@ pub const CONFIG_OPT_MTU: u8 = 0x01;
 /// Encode the L2CAP MTU configuration option (§5.1). Format:
 /// type(1) length(1=2) MTU (u16 LE).
 pub fn config_option_mtu(mtu: u16) -> [u8; 4] {
-    [
-        CONFIG_OPT_MTU,
-        2,
-        (mtu & 0xFF) as u8,
-        (mtu >> 8) as u8,
-    ]
+    [CONFIG_OPT_MTU, 2, (mtu & 0xFF) as u8, (mtu >> 8) as u8]
 }

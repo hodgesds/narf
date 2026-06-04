@@ -276,13 +276,12 @@ impl HidServiceBuilder {
 
         for entry in self.reports {
             let needs_cccd = (entry.properties & CHAR_PROP_NOTIFY) != 0;
-            let perms = if (entry.properties & (CHAR_PROP_WRITE | CHAR_PROP_WRITE_WITHOUT_RESPONSE))
-                != 0
-            {
-                Permissions::read_write()
-            } else {
-                Permissions::read()
-            };
+            let perms =
+                if (entry.properties & (CHAR_PROP_WRITE | CHAR_PROP_WRITE_WITHOUT_RESPONSE)) != 0 {
+                    Permissions::read_write()
+                } else {
+                    Permissions::read()
+                };
             let (decl, value) = db.add_characteristic(
                 Uuid::U16(UUID_REPORT),
                 entry.properties,

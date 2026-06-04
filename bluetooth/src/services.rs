@@ -75,11 +75,7 @@ pub const APPEARANCE_GENERIC_HEART_RATE_SENSOR: u16 = 0x0340;
 /// Mount the mandatory GAP service (UUID 0x1800) into the supplied
 /// database. Includes Device Name + Appearance. Returns the service
 /// declaration handle.
-pub fn mount_gap_service(
-    db: &mut AttributeDatabase,
-    device_name: &str,
-    appearance: u16,
-) -> u16 {
+pub fn mount_gap_service(db: &mut AttributeDatabase, device_name: &str, appearance: u16) -> u16 {
     let svc_handle = db.add_primary_service(Uuid::U16(UUID_SERVICE_GAP));
     db.add_characteristic(
         Uuid::U16(UUID_DEVICE_NAME),
@@ -215,10 +211,7 @@ pub fn mount_device_information_service(
 /// follows so the host can subscribe.
 ///
 /// Returns `(service_handle, level_value_handle, cccd_handle)`.
-pub fn mount_battery_service(
-    db: &mut AttributeDatabase,
-    initial_level: u8,
-) -> (u16, u16, u16) {
+pub fn mount_battery_service(db: &mut AttributeDatabase, initial_level: u8) -> (u16, u16, u16) {
     let svc_handle = db.add_primary_service(Uuid::U16(UUID_SERVICE_BATTERY));
     let (_decl, level_handle) = db.add_characteristic(
         Uuid::U16(UUID_BATTERY_LEVEL),

@@ -25,12 +25,11 @@
 use alloc::vec::Vec;
 
 use crate::att::{
-    Pdu, ATT_ECODE_ATTRIBUTE_NOT_FOUND, ATT_ECODE_INVALID_HANDLE,
-    ATT_ECODE_REQUEST_NOT_SUPPORTED, ATT_ECODE_WRITE_NOT_PERMITTED, ATT_ERROR_RSP,
-    ATT_EXCHANGE_MTU_REQ, ATT_EXCHANGE_MTU_RSP, ATT_FIND_INFORMATION_REQ,
-    ATT_FIND_INFORMATION_RSP, ATT_READ_BY_GROUP_TYPE_REQ, ATT_READ_BY_GROUP_TYPE_RSP,
-    ATT_READ_BY_TYPE_REQ, ATT_READ_BY_TYPE_RSP, ATT_READ_REQ, ATT_READ_RSP, ATT_WRITE_REQ,
-    ATT_WRITE_RSP,
+    Pdu, ATT_ECODE_ATTRIBUTE_NOT_FOUND, ATT_ECODE_INVALID_HANDLE, ATT_ECODE_REQUEST_NOT_SUPPORTED,
+    ATT_ECODE_WRITE_NOT_PERMITTED, ATT_ERROR_RSP, ATT_EXCHANGE_MTU_REQ, ATT_EXCHANGE_MTU_RSP,
+    ATT_FIND_INFORMATION_REQ, ATT_FIND_INFORMATION_RSP, ATT_READ_BY_GROUP_TYPE_REQ,
+    ATT_READ_BY_GROUP_TYPE_RSP, ATT_READ_BY_TYPE_REQ, ATT_READ_BY_TYPE_RSP, ATT_READ_REQ,
+    ATT_READ_RSP, ATT_WRITE_REQ, ATT_WRITE_RSP,
 };
 use crate::gatt::{Uuid, UUID_PRIMARY_SERVICE};
 
@@ -257,9 +256,7 @@ impl GattServer {
         let end = u16::from_le_bytes([req.params[2], req.params[3]]);
         let group_uuid = match Uuid::from_le_bytes(&req.params[4..]) {
             Some(u) => u,
-            None => {
-                return self.error_rsp(ATT_READ_BY_GROUP_TYPE_REQ, 0, ATT_ECODE_INVALID_HANDLE)
-            }
+            None => return self.error_rsp(ATT_READ_BY_GROUP_TYPE_REQ, 0, ATT_ECODE_INVALID_HANDLE),
         };
         // We only support Primary Service group discovery in this
         // pass — Secondary Service follows the same shape with a
@@ -307,7 +304,11 @@ impl GattServer {
             tuples.extend_from_slice(&t);
         }
         if tuples.is_empty() {
-            return self.error_rsp(ATT_READ_BY_GROUP_TYPE_REQ, start, ATT_ECODE_ATTRIBUTE_NOT_FOUND);
+            return self.error_rsp(
+                ATT_READ_BY_GROUP_TYPE_REQ,
+                start,
+                ATT_ECODE_ATTRIBUTE_NOT_FOUND,
+            );
         }
         let mut out = Vec::with_capacity(1 + tuples.len());
         out.push(unit_size.unwrap_or(0) as u8);

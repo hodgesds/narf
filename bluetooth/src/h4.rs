@@ -105,8 +105,14 @@ pub enum H4Error {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DecState {
     NeedIndicator,
-    NeedHeader { ptype: PacketType, header_len: usize },
-    NeedBody { ptype: PacketType, body_len: usize },
+    NeedHeader {
+        ptype: PacketType,
+        header_len: usize,
+    },
+    NeedBody {
+        ptype: PacketType,
+        body_len: usize,
+    },
 }
 
 /// H4 byte-stream decoder. Feed bytes from the UART into it; pull
@@ -155,10 +161,7 @@ impl Decoder {
                     if announced > self.max_frame {
                         let limit = self.max_frame;
                         self.reset();
-                        return Err(H4Error::BodyTooLong {
-                            announced,
-                            limit,
-                        });
+                        return Err(H4Error::BodyTooLong { announced, limit });
                     }
                     if announced == 0 {
                         // Header-only packet → frame complete now.
@@ -210,10 +213,7 @@ impl Decoder {
                 // decoder above guarantees `buf.len() == 3 + plen`.
                 let opcode = u16::from_le_bytes([buf[0], buf[1]]);
                 let params = buf[3..].to_vec();
-                H4Frame::Command(Command {
-                    opcode,
-                    params,
-                })
+                H4Frame::Command(Command { opcode, params })
             }
             PacketType::AclData => {
                 let acl = AclData::decode(&buf).expect("validated by header decoder");
@@ -346,7 +346,10 @@ pub mod tests {
         // Length lo=0x00, hi=0x10 → 4096 bytes announced.
         assert!(dec.feed(0x00).expect("clean feed").is_none());
         match dec.feed(0x10) {
-            Err(H4Error::BodyTooLong { announced: 4096, limit: 64 }) => TestResult::Pass,
+            Err(H4Error::BodyTooLong {
+                announced: 4096,
+                limit: 64,
+            }) => TestResult::Pass,
             _ => TestResult::Fail("oversize body must surface"),
         }
     }

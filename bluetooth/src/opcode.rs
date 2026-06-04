@@ -9,14 +9,14 @@
 use crate::hci::opcode;
 
 // ── OGF (Opcode Group Field, §5.4.1) ───────────────────────────────
-pub const OGF_LINK_CONTROL:           u8 = 0x01;
-pub const OGF_LINK_POLICY:            u8 = 0x02;
-pub const OGF_CONTROLLER_BASEBAND:    u8 = 0x03;
-pub const OGF_INFORMATIONAL:          u8 = 0x04;
-pub const OGF_STATUS:                 u8 = 0x05;
-pub const OGF_TESTING:                u8 = 0x06;
-pub const OGF_LE_CONTROLLER:          u8 = 0x08;
-pub const OGF_VENDOR:                 u8 = 0x3F;
+pub const OGF_LINK_CONTROL: u8 = 0x01;
+pub const OGF_LINK_POLICY: u8 = 0x02;
+pub const OGF_CONTROLLER_BASEBAND: u8 = 0x03;
+pub const OGF_INFORMATIONAL: u8 = 0x04;
+pub const OGF_STATUS: u8 = 0x05;
+pub const OGF_TESTING: u8 = 0x06;
+pub const OGF_LE_CONTROLLER: u8 = 0x08;
+pub const OGF_VENDOR: u8 = 0x3F;
 
 // ── Mandatory: Controller & Baseband (§7.3) ────────────────────────
 /// HCI_Reset (§7.3.2). No parameters; controller returns Command

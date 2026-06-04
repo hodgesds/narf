@@ -33,7 +33,10 @@ pub const LIAC: [u8; 3] = [0x00, 0x8B, 0x9E];
 /// - `inquiry_length`: units of 1.28 s (1 = 1.28 s, max 0x30 = 61.44 s).
 /// - `num_responses`: max devices to return (0 = unlimited).
 pub fn build_inquiry(lap: [u8; 3], inquiry_length: u8, num_responses: u8) -> Command {
-    Command::with_params(op::HCI_INQUIRY, &[lap[0], lap[1], lap[2], inquiry_length, num_responses])
+    Command::with_params(
+        op::HCI_INQUIRY,
+        &[lap[0], lap[1], lap[2], inquiry_length, num_responses],
+    )
 }
 
 // ── Create Connection ──────────────────────────────────────────────
@@ -219,7 +222,10 @@ pub fn acl_from_bulk_in(raw: &[u8]) -> &[u8] {
 
 /// Build `HCI_Write_Simple_Pairing_Mode` to enable SSP (§7.3.59).
 pub fn build_write_simple_pairing_mode(enable: bool) -> Command {
-    Command::with_params(op::HCI_WRITE_SIMPLE_PAIRING_MODE, &[if enable { 0x01 } else { 0x00 }])
+    Command::with_params(
+        op::HCI_WRITE_SIMPLE_PAIRING_MODE,
+        &[if enable { 0x01 } else { 0x00 }],
+    )
 }
 
 /// Build `HCI_Write_Scan_Enable` (§7.3.18).
@@ -281,8 +287,7 @@ pub struct SyncData {
 impl SyncData {
     /// Encode to wire bytes (without the leading 0x03 indicator).
     pub fn encode(&self) -> Vec<u8> {
-        let h = (self.handle & 0x0FFF)
-            | (((self.packet_status & 0x3) as u16) << 12);
+        let h = (self.handle & 0x0FFF) | (((self.packet_status & 0x3) as u16) << 12);
         let mut out = Vec::with_capacity(4 + self.data.len());
         out.push((h & 0xFF) as u8);
         out.push((h >> 8) as u8);

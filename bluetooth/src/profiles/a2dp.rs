@@ -26,12 +26,11 @@
 use alloc::vec::Vec;
 
 use crate::avdtp::{
-    sbc_media_codec_capability, CAT_MEDIA_TRANSPORT, MEDIA_AUDIO, SbcCapability,
-    SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR, SBC_BLOCK_16, SBC_BLOCK_4, SBC_BLOCK_8, SBC_BLOCK_12,
-    SBC_CHAN_DUAL, SBC_CHAN_JOINT_STEREO, SBC_CHAN_MONO, SBC_CHAN_STEREO,
-    SBC_FREQ_16000, SBC_FREQ_32000, SBC_FREQ_44100, SBC_FREQ_48000,
-    SBC_SUBBANDS_4, SBC_SUBBANDS_8, SEP_TYPE_SINK, SEP_TYPE_SOURCE,
-    StreamEndPoint,
+    sbc_media_codec_capability, SbcCapability, StreamEndPoint, CAT_MEDIA_TRANSPORT, MEDIA_AUDIO,
+    SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR, SBC_BLOCK_12, SBC_BLOCK_16, SBC_BLOCK_4, SBC_BLOCK_8,
+    SBC_CHAN_DUAL, SBC_CHAN_JOINT_STEREO, SBC_CHAN_MONO, SBC_CHAN_STEREO, SBC_FREQ_16000,
+    SBC_FREQ_32000, SBC_FREQ_44100, SBC_FREQ_48000, SBC_SUBBANDS_4, SBC_SUBBANDS_8, SEP_TYPE_SINK,
+    SEP_TYPE_SOURCE,
 };
 
 // ── SEID assignments ─────────────────────────────────────────────────
@@ -141,7 +140,12 @@ pub fn negotiate_sbc(local: &SbcCapability, remote: &SbcCapability) -> Negotiate
     let common_freq = local.frequency & remote.frequency;
     let freq = pick_best(
         common_freq,
-        &[SBC_FREQ_48000, SBC_FREQ_44100, SBC_FREQ_32000, SBC_FREQ_16000],
+        &[
+            SBC_FREQ_48000,
+            SBC_FREQ_44100,
+            SBC_FREQ_32000,
+            SBC_FREQ_16000,
+        ],
     );
     let freq = match freq {
         Some(f) => f,
@@ -181,10 +185,7 @@ pub fn negotiate_sbc(local: &SbcCapability, remote: &SbcCapability) -> Negotiate
     };
 
     let common_alloc = local.allocation & remote.allocation;
-    let allocation = pick_best(
-        common_alloc,
-        &[SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR],
-    );
+    let allocation = pick_best(common_alloc, &[SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR]);
     let allocation = match allocation {
         Some(a) => a,
         None => return NegotiateResult::NoCommonAllocation,
@@ -290,10 +291,7 @@ impl A2dpSource {
     /// following a successful Discover response.  Picks the first
     /// audio-media SINK SEP from `remote_seps` and requests its
     /// capabilities.  Returns the Get Capabilities command bytes.
-    pub fn on_discovered(
-        &mut self,
-        session: &mut super::avdtp::Session,
-    ) -> Option<Vec<u8>> {
+    pub fn on_discovered(&mut self, session: &mut super::avdtp::Session) -> Option<Vec<u8>> {
         let seid = session
             .remote_seps
             .iter()
@@ -351,13 +349,19 @@ impl A2dpSource {
     /// Reference: A2DP 1.4 §4.6.5 "Source role behaviour while in
     /// streaming state" — PCM frames in, SBC media bytes out.
     pub fn encode_pcm(&mut self, pcm: &[i16]) -> Option<alloc::vec::Vec<u8>> {
-        if self.state != SourceState::Streaming { return None; }
+        if self.state != SourceState::Streaming {
+            return None;
+        }
         let cfg = self.config?;
         let h = narf_audio::sbc::Header {
             sampling_frequency: avdtp_freq_to_sbc(cfg.frequency)?,
             blocks: avdtp_blocks_to_sbc(cfg.block_length)?,
             channel_mode: avdtp_chan_to_sbc(cfg.channel_mode)?,
-            allocation_method: if cfg.allocation == SBC_ALLOC_SNR { 1 } else { 0 },
+            allocation_method: if cfg.allocation == SBC_ALLOC_SNR {
+                1
+            } else {
+                0
+            },
             subbands: if cfg.subbands == SBC_SUBBANDS_8 { 1 } else { 0 },
             bitpool: cfg.max_bitpool,
             crc: 0,
@@ -372,24 +376,30 @@ impl A2dpSource {
 /// AVDTP frequency bit → SBC frequency code (0..3).
 fn avdtp_freq_to_sbc(f: u8) -> Option<u8> {
     match f {
-        SBC_FREQ_16000 => Some(0), SBC_FREQ_32000 => Some(1),
-        SBC_FREQ_44100 => Some(2), SBC_FREQ_48000 => Some(3),
+        SBC_FREQ_16000 => Some(0),
+        SBC_FREQ_32000 => Some(1),
+        SBC_FREQ_44100 => Some(2),
+        SBC_FREQ_48000 => Some(3),
         _ => None,
     }
 }
 /// AVDTP block-length bit → SBC blocks code (0..3).
 fn avdtp_blocks_to_sbc(b: u8) -> Option<u8> {
     match b {
-        SBC_BLOCK_4 => Some(0), SBC_BLOCK_8 => Some(1),
-        SBC_BLOCK_12 => Some(2), SBC_BLOCK_16 => Some(3),
+        SBC_BLOCK_4 => Some(0),
+        SBC_BLOCK_8 => Some(1),
+        SBC_BLOCK_12 => Some(2),
+        SBC_BLOCK_16 => Some(3),
         _ => None,
     }
 }
 /// AVDTP channel-mode bit → SBC channel_mode code (0..3).
 fn avdtp_chan_to_sbc(c: u8) -> Option<u8> {
     match c {
-        SBC_CHAN_MONO => Some(0), SBC_CHAN_DUAL => Some(1),
-        SBC_CHAN_STEREO => Some(2), SBC_CHAN_JOINT_STEREO => Some(3),
+        SBC_CHAN_MONO => Some(0),
+        SBC_CHAN_DUAL => Some(1),
+        SBC_CHAN_STEREO => Some(2),
+        SBC_CHAN_JOINT_STEREO => Some(3),
         _ => None,
     }
 }

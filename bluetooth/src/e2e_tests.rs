@@ -154,11 +154,7 @@ fn smoke_e2e_hci_set_event_mask_payload() -> TestResult {
 
     let lt = Arc::new(LoopbackTransport::new("e2e-evmask"));
     lt.enqueue_event(cc(op::HCI_RESET, 0x00, &[]));
-    lt.enqueue_event(cc(
-        op::HCI_READ_LOCAL_VERSION,
-        0x00,
-        &[0; 8],
-    ));
+    lt.enqueue_event(cc(op::HCI_READ_LOCAL_VERSION, 0x00, &[0; 8]));
     lt.enqueue_event(cc(op::HCI_READ_BD_ADDR, 0x00, &[0; 6]));
     lt.enqueue_event(cc(op::HCI_READ_BUFFER_SIZE, 0x00, &[0; 7]));
     lt.enqueue_event(cc(op::HCI_SET_EVENT_MASK, 0x00, &[]));
@@ -196,11 +192,11 @@ fn smoke_e2e_hci_le_scan_enable_opcode_encoding() -> TestResult {
     // LE_Set_Scan_Enable = 0x200C. Build the wire payloads and verify
     // every byte against the spec layout.
     let params = vec![
-        0x00,       // scan_type = passive
+        0x00, // scan_type = passive
         0x12, 0x00, // scan_interval = 0x0012 LE (≈ 11.25 ms)
         0x12, 0x00, // scan_window
-        0x00,       // own_address_type = public
-        0x00,       // filter_policy = accept all
+        0x00, // own_address_type = public
+        0x00, // filter_policy = accept all
     ];
     let cmd = Command::with_params(op::HCI_LE_SET_SCAN_PARAMETERS, &params);
     let bytes = cmd.encode();
@@ -241,7 +237,12 @@ fn smoke_e2e_le_advertising_report_decode() -> TestResult {
         0x00, // event_type = ADV_IND
         0x00, // address_type = public
         // address LE order — first byte is the low byte.
-        0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x66,
+        0x55,
+        0x44,
+        0x33,
+        0x22,
+        0x11,
         ad.len() as u8,
     ];
     payload.extend_from_slice(&ad);
@@ -286,7 +287,7 @@ fn smoke_e2e_le_connection_complete_decode() -> TestResult {
         0x18, 0x00, // interval = 0x0018 (30 ms @ 1.25 ms)
         0x00, 0x00, // peripheral_latency = 0
         0xF4, 0x01, // supervision_timeout = 500 (5 s @ 10 ms)
-        0x00,       // central_clock_accuracy
+        0x00, // central_clock_accuracy
     ];
     let ev = le_meta(LeSubevent::ConnectionComplete, &payload);
     let cc = match LeConnectionComplete::parse(&ev) {
@@ -581,7 +582,11 @@ kernel_test_in!("bluetooth/e2e", smoke_e2e_att_exchange_mtu_round_trip);
 
 fn smoke_e2e_gatt_discover_primary_services() -> TestResult {
     let mut srv = GattServer::new();
-    services::mount_gap_service(&mut srv.db, "narf-be", services::APPEARANCE_GENERIC_COMPUTER);
+    services::mount_gap_service(
+        &mut srv.db,
+        "narf-be",
+        services::APPEARANCE_GENERIC_COMPUTER,
+    );
     services::mount_gatt_service(&mut srv.db);
     services::mount_device_information_service(
         &mut srv.db,
@@ -628,7 +633,11 @@ kernel_test_in!("bluetooth/e2e", smoke_e2e_gatt_discover_primary_services);
 
 fn smoke_e2e_gatt_read_device_name_characteristic() -> TestResult {
     let mut srv = GattServer::new();
-    services::mount_gap_service(&mut srv.db, "narf-test", services::APPEARANCE_GENERIC_COMPUTER);
+    services::mount_gap_service(
+        &mut srv.db,
+        "narf-test",
+        services::APPEARANCE_GENERIC_COMPUTER,
+    );
 
     // Find the Device Name attribute (UUID 0x2A00) by walking the DB.
     let mut name_handle: Option<u16> = None;
@@ -651,22 +660,21 @@ fn smoke_e2e_gatt_read_device_name_characteristic() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/e2e", smoke_e2e_gatt_read_device_name_characteristic);
+kernel_test_in!(
+    "bluetooth/e2e",
+    smoke_e2e_gatt_read_device_name_characteristic
+);
 
 // ── 13. GATT Battery Level subscribe via CCCD + notification PDU ────
 
 fn smoke_e2e_gatt_battery_level_cccd_subscribe_and_notify() -> TestResult {
     let mut srv = GattServer::new();
     services::mount_gatt_service(&mut srv.db);
-    let (_svc, level_handle, cccd_handle) =
-        services::mount_battery_service(&mut srv.db, 85);
+    let (_svc, level_handle, cccd_handle) = services::mount_battery_service(&mut srv.db, 85);
 
     // Peer writes the CCCD with the "enable notifications" bit set
     // (§3.3.3.3 / Vol 3 Part G — bit 0 of the 16-bit CCCD value).
-    let write = att::build_write_request(
-        cccd_handle,
-        &services::cccd_value(true, false),
-    );
+    let write = att::build_write_request(cccd_handle, &services::cccd_value(true, false));
     let wrsp = srv.handle_request(&write);
     if wrsp.opcode != att::ATT_WRITE_RSP {
         return TestResult::Fail("CCCD write did not return Write Response");
@@ -706,8 +714,8 @@ kernel_test_in!(
 
 fn smoke_e2e_hid_over_bt_data_round_trip() -> TestResult {
     use crate::hid_profile::{
-        build_data, build_get_report, decode_header, parse_input_data, ReportType,
-        TransactionType, PSM_HID_CONTROL, PSM_HID_INTERRUPT,
+        build_data, build_get_report, decode_header, parse_input_data, ReportType, TransactionType,
+        PSM_HID_CONTROL, PSM_HID_INTERRUPT,
     };
 
     // §5.2 of the HID Profile spec fixes the L2CAP PSMs at 0x0011 +
@@ -748,8 +756,8 @@ kernel_test_in!("bluetooth/e2e", smoke_e2e_hid_over_bt_data_round_trip);
 
 fn smoke_e2e_devfs_rfcomm_lifecycle() -> TestResult {
     use crate::devfs_bridge::{
-        enumerate_rfcomm_devices, lookup_rfcomm_file, rfcomm_bind_loopback, rfcomm_release,
-        __reset_for_test,
+        __reset_for_test, enumerate_rfcomm_devices, lookup_rfcomm_file, rfcomm_bind_loopback,
+        rfcomm_release,
     };
 
     __reset_for_test();
@@ -858,7 +866,9 @@ kernel_test_in!("bluetooth/e2e", smoke_e2e_a2dp_sbc_encode_sync_word);
 
 fn smoke_e2e_gatt_write_rejected_on_readonly_attribute() -> TestResult {
     let mut srv = GattServer::new();
-    let _ = srv.db.add_primary_service(gatt::Uuid::U16(gatt::UUID_SERVICE_GAP));
+    let _ = srv
+        .db
+        .add_primary_service(gatt::Uuid::U16(gatt::UUID_SERVICE_GAP));
     let (_, val_h) = srv.db.add_characteristic(
         gatt::Uuid::U16(services::UUID_DEVICE_NAME),
         gatt::CHAR_PROP_READ,

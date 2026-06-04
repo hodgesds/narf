@@ -241,12 +241,8 @@ pub trait SmpCrypto {
     /// Compute the X coordinate of the shared secret from our
     /// private and the peer's public point. §2.2.6 "Diffie-Hellman
     /// Key (DHKey)".
-    fn p256_dh(
-        &self,
-        private: &[u8; 32],
-        peer_pub_x: &[u8; 32],
-        peer_pub_y: &[u8; 32],
-    ) -> [u8; 32];
+    fn p256_dh(&self, private: &[u8; 32], peer_pub_x: &[u8; 32], peer_pub_y: &[u8; 32])
+        -> [u8; 32];
 
     /// AES-CMAC over `data` keyed on `key` (16 bytes). §2.2.5.
     fn aes_cmac(&self, key: &[u8; 16], data: &[u8]) -> [u8; 16];
@@ -360,7 +356,11 @@ impl<C: SmpCrypto> Initiator<C> {
     pub fn feed(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
         if rx.code == SMP_PAIRING_FAILED {
             self.state = PairingState::Failed;
-            let reason = rx.payload.first().copied().unwrap_or(SMP_FAILED_UNSPECIFIED);
+            let reason = rx
+                .payload
+                .first()
+                .copied()
+                .unwrap_or(SMP_FAILED_UNSPECIFIED);
             return Err(PairingError::PeerFailed(reason));
         }
         match self.state {
@@ -379,11 +379,11 @@ impl<C: SmpCrypto> Initiator<C> {
         let peer = PairingFeatureExchange::decode(rx).ok_or(PairingError::Protocol)?;
         self.peer_features = peer;
 
-        let mitm = (self.features.auth_req & AUTH_MITM) != 0
-            || (peer.auth_req & AUTH_MITM) != 0;
+        let mitm = (self.features.auth_req & AUTH_MITM) != 0 || (peer.auth_req & AUTH_MITM) != 0;
         let sc = (self.features.auth_req & AUTH_SC) != 0 && (peer.auth_req & AUTH_SC) != 0;
         let oob = self.features.oob_data_flag != 0 && peer.oob_data_flag != 0;
-        let local_io = IoCapability::from_u8(self.features.io_capability).ok_or(PairingError::Protocol)?;
+        let local_io =
+            IoCapability::from_u8(self.features.io_capability).ok_or(PairingError::Protocol)?;
         let peer_io = IoCapability::from_u8(peer.io_capability).ok_or(PairingError::Protocol)?;
         self.method = pick_pairing_method(local_io, peer_io, mitm, sc, oob);
 
@@ -591,7 +591,11 @@ impl<C: SmpCrypto> Responder<C> {
     pub fn feed(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
         if rx.code == SMP_PAIRING_FAILED {
             self.state = ResponderState::Failed;
-            let reason = rx.payload.first().copied().unwrap_or(SMP_FAILED_UNSPECIFIED);
+            let reason = rx
+                .payload
+                .first()
+                .copied()
+                .unwrap_or(SMP_FAILED_UNSPECIFIED);
             return Err(PairingError::PeerFailed(reason));
         }
         match self.state {
@@ -612,8 +616,7 @@ impl<C: SmpCrypto> Responder<C> {
 
         let mitm =
             (peer.auth_req & AUTH_MITM) != 0 || (self.features_local.auth_req & AUTH_MITM) != 0;
-        let sc = (peer.auth_req & AUTH_SC) != 0
-            && (self.features_local.auth_req & AUTH_SC) != 0;
+        let sc = (peer.auth_req & AUTH_SC) != 0 && (self.features_local.auth_req & AUTH_SC) != 0;
         let oob = peer.oob_data_flag != 0 && self.features_local.oob_data_flag != 0;
         let local_io = IoCapability::from_u8(self.features_local.io_capability)
             .ok_or(PairingError::Protocol)?;

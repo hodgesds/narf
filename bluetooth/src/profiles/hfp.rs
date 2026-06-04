@@ -37,8 +37,7 @@
 use alloc::vec::Vec;
 
 use crate::hfp::{
-    brsf_command, cind_read_command, cind_test_command, cmer_enable_command,
-    parse_at, AtForm,
+    brsf_command, cind_read_command, cind_test_command, cmer_enable_command, parse_at, AtForm,
 };
 
 use narf_audio::msbc::{Msbc, MSBC_FRAME_BYTES, MSBC_PCM_SAMPLES};
@@ -79,18 +78,17 @@ pub struct ScoStream {
 impl ScoStream {
     /// Create a new SCO stream for the given negotiated codec.
     pub fn new(codec: u8) -> Self {
-        Self { codec, msbc: Msbc::new() }
+        Self {
+            codec,
+            msbc: Msbc::new(),
+        }
     }
 
     /// Encode 60 mono i16 PCM samples (16 kHz) into a 57-byte mSBC frame.
     ///
     /// Returns [`ScoStreamError::NotMsbc`] when the negotiated codec is
     /// CVSD — CVSD samples are delivered transparently by the HCI layer.
-    pub fn encode_pcm(
-        &mut self,
-        pcm: &[i16],
-        out: &mut [u8],
-    ) -> Result<usize, ScoStreamError> {
+    pub fn encode_pcm(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, ScoStreamError> {
         match self.codec {
             CODEC_MSBC => {
                 if out.len() < MSBC_FRAME_BYTES {
@@ -99,7 +97,9 @@ impl ScoStream {
                 if pcm.len() != MSBC_PCM_SAMPLES {
                     return Err(ScoStreamError::BadInputLength);
                 }
-                self.msbc.encode(pcm, out).map_err(|_| ScoStreamError::CodecError)
+                self.msbc
+                    .encode(pcm, out)
+                    .map_err(|_| ScoStreamError::CodecError)
             }
             _ => Err(ScoStreamError::NotMsbc),
         }
@@ -108,11 +108,7 @@ impl ScoStream {
     /// Decode a 57-byte mSBC SCO packet into 60 mono i16 PCM samples.
     ///
     /// Returns [`ScoStreamError::NotMsbc`] when codec is CVSD.
-    pub fn decode_sco(
-        &mut self,
-        sco: &[u8],
-        pcm: &mut [i16],
-    ) -> Result<usize, ScoStreamError> {
+    pub fn decode_sco(&mut self, sco: &[u8], pcm: &mut [i16]) -> Result<usize, ScoStreamError> {
         match self.codec {
             CODEC_MSBC => {
                 if sco.len() < MSBC_FRAME_BYTES {
@@ -121,7 +117,9 @@ impl ScoStream {
                 if pcm.len() < MSBC_PCM_SAMPLES {
                     return Err(ScoStreamError::OutputTooSmall);
                 }
-                self.msbc.decode(sco, pcm).map_err(|_| ScoStreamError::CodecError)
+                self.msbc
+                    .decode(sco, pcm)
+                    .map_err(|_| ScoStreamError::CodecError)
             }
             _ => Err(ScoStreamError::NotMsbc),
         }
@@ -331,8 +329,8 @@ pub const AT_CLCC: &str = "+CLCC";
 pub const AT_CHUP: &str = "+CHUP";
 pub const AT_VGS: &str = "+VGS";
 pub const AT_VGM: &str = "+VGM";
-pub const AT_BCS: &str = "+BCS";   // codec connection setup
-pub const AT_BAC: &str = "+BAC";   // available codecs
+pub const AT_BCS: &str = "+BCS"; // codec connection setup
+pub const AT_BAC: &str = "+BAC"; // available codecs
 
 /// A decoded, classified HFP command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,9 +378,7 @@ pub fn classify_at(line: &str) -> HfpCommand {
         _ if at.name.eq_ignore_ascii_case(AT_CIND) && at.form == AtForm::Read => {
             HfpCommand::CindRead
         }
-        _ if at.name.eq_ignore_ascii_case(AT_CMER) && at.form == AtForm::Write => {
-            HfpCommand::Cmer
-        }
+        _ if at.name.eq_ignore_ascii_case(AT_CMER) && at.form == AtForm::Write => HfpCommand::Cmer,
         _ if at.name.eq_ignore_ascii_case(AT_CHLD) && at.form == AtForm::Test => {
             HfpCommand::ChldTest
         }

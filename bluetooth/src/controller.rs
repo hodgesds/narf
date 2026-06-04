@@ -33,11 +33,20 @@ pub enum BringupError {
     AuthorityRevoked,
     Transport(TransportError),
     /// Controller's Command Complete carried a non-zero HCI Status.
-    BadStatus { phase: BringupPhase, status: u8 },
+    BadStatus {
+        phase: BringupPhase,
+        status: u8,
+    },
     /// Controller responded with an unexpected event during a phase.
-    UnexpectedEvent { phase: BringupPhase, code: u8 },
+    UnexpectedEvent {
+        phase: BringupPhase,
+        code: u8,
+    },
     /// Got Command Complete for an opcode we didn't issue.
-    OpcodeMismatch { phase: BringupPhase, got: u16 },
+    OpcodeMismatch {
+        phase: BringupPhase,
+        got: u16,
+    },
 }
 
 impl From<CapError> for BringupError {
@@ -180,7 +189,8 @@ impl Controller {
             |_, _| Ok(()),
         )?;
 
-        self.phase.store(BringupPhase::Ready as u8, Ordering::Release);
+        self.phase
+            .store(BringupPhase::Ready as u8, Ordering::Release);
         Ok(*self.info.lock())
     }
 

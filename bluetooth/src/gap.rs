@@ -203,7 +203,8 @@ pub fn find<'a>(buf: &'a [u8], ad_type: u8) -> Option<&'a [u8]> {
 
 /// Decode a Local Name — looks up Complete first then Shortened.
 pub fn local_name(buf: &[u8]) -> Option<String> {
-    let payload = find(buf, AD_COMPLETE_LOCAL_NAME).or_else(|| find(buf, AD_SHORTENED_LOCAL_NAME))?;
+    let payload =
+        find(buf, AD_COMPLETE_LOCAL_NAME).or_else(|| find(buf, AD_SHORTENED_LOCAL_NAME))?;
     Some(String::from_utf8_lossy(payload).into_owned())
 }
 

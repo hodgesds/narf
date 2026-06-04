@@ -180,8 +180,7 @@ impl FileOps for RfcommPort {
 
 /// Map of minor → RfcommPort.  Analogous to Linux's `rfcomm_dev_list`
 /// (`net/bluetooth/rfcomm/tty.c:71`).
-static RFCOMM_REGISTRY: IrqSafeSpinLock<Vec<Arc<RfcommPort>>> =
-    IrqSafeSpinLock::new(Vec::new());
+static RFCOMM_REGISTRY: IrqSafeSpinLock<Vec<Arc<RfcommPort>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Allocate the next free minor number, create a port, and register it.
 /// Returns the minor number (= the N in `/dev/rfcomm<N>`).
@@ -230,7 +229,11 @@ pub fn rfcomm_release(minor: u32) {
 /// Look up a registered port by minor number.  Returns `None` if not
 /// found (the name was not an rfcomm node, or the port was released).
 pub fn lookup_rfcomm_port(minor: u32) -> Option<Arc<RfcommPort>> {
-    RFCOMM_REGISTRY.lock().iter().find(|p| p.minor == minor).cloned()
+    RFCOMM_REGISTRY
+        .lock()
+        .iter()
+        .find(|p| p.minor == minor)
+        .cloned()
 }
 
 /// Snapshot of all registered minor numbers (for readdir enumeration).
@@ -304,7 +307,7 @@ pub mod tests {
             let mut buf = [0u8; 12];
             buf.copy_from_slice(payload);
             port.tx.lock(); // ensure lock is accessible; not blocking
-            // Directly call push to RX for loopback (same as FileOps::write does).
+                            // Directly call push to RX for loopback (same as FileOps::write does).
             port.rx.lock().push(b"hello rfcomm");
             payload.len()
         };

@@ -17,7 +17,9 @@ use crate::controller::{BringupPhase, Controller};
 use crate::event::EventCode;
 use crate::hci::{opcode, AclData, Command, Event};
 use crate::opcode as op;
-use crate::transport::{LoopbackTransport, USB_CLASS_WIRELESS, USB_PROTOCOL_BLUETOOTH, USB_SUBCLASS_RF};
+use crate::transport::{
+    LoopbackTransport, USB_CLASS_WIRELESS, USB_PROTOCOL_BLUETOOTH, USB_SUBCLASS_RF,
+};
 
 fn smoke_hci_command_round_trip() -> TestResult {
     // §5.4.1: opcode encoded LE; param-total-length one byte.
@@ -104,10 +106,7 @@ kernel_test_in!("bluetooth/hci", smoke_opcode_compose_split);
 
 fn smoke_usb_class_constants() -> TestResult {
     // USB-IF "Wireless Controllers" v1.0: class 0xE0 / sub 0x01 / proto 0x01.
-    if USB_CLASS_WIRELESS != 0xE0
-        || USB_SUBCLASS_RF != 0x01
-        || USB_PROTOCOL_BLUETOOTH != 0x01
-    {
+    if USB_CLASS_WIRELESS != 0xE0 || USB_SUBCLASS_RF != 0x01 || USB_PROTOCOL_BLUETOOTH != 0x01 {
         return TestResult::Fail("USB Bluetooth class triple drift");
     }
     TestResult::Pass
@@ -226,10 +225,7 @@ fn smoke_bring_up_propagates_bad_status() -> TestResult {
         _ => TestResult::Fail("bring_up should surface BadStatus on non-zero status"),
     }
 }
-kernel_test_in!(
-    "bluetooth/controller",
-    smoke_bring_up_propagates_bad_status
-);
+kernel_test_in!("bluetooth/controller", smoke_bring_up_propagates_bad_status);
 
 fn smoke_bring_up_cap_revocation() -> TestResult {
     use crate::bootstrap_bluetooth_authority;
@@ -318,9 +314,7 @@ kernel_test_in!(
 );
 
 fn smoke_att_handle_value_notification() -> TestResult {
-    use crate::att::{
-        build_handle_value_notification, decode_handle_value, ATT_HANDLE_VALUE_NTF,
-    };
+    use crate::att::{build_handle_value_notification, decode_handle_value, ATT_HANDLE_VALUE_NTF};
     let pdu = build_handle_value_notification(0x002A, b"hi");
     if pdu.opcode != ATT_HANDLE_VALUE_NTF {
         return TestResult::Fail("opcode should be 0x1B");
@@ -331,10 +325,7 @@ fn smoke_att_handle_value_notification() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/att",
-    smoke_att_handle_value_notification
-);
+kernel_test_in!("bluetooth/att", smoke_att_handle_value_notification);
 
 fn smoke_att_error_response_round_trip() -> TestResult {
     use crate::att::{
@@ -350,15 +341,10 @@ fn smoke_att_error_response_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/att",
-    smoke_att_error_response_round_trip
-);
+kernel_test_in!("bluetooth/att", smoke_att_error_response_round_trip);
 
 fn smoke_att_expects_response_classification() -> TestResult {
-    use crate::att::{
-        Pdu, ATT_HANDLE_VALUE_NTF, ATT_READ_REQ, ATT_WRITE_CMD, ATT_WRITE_REQ,
-    };
+    use crate::att::{Pdu, ATT_HANDLE_VALUE_NTF, ATT_READ_REQ, ATT_WRITE_CMD, ATT_WRITE_REQ};
     let read = Pdu {
         opcode: ATT_READ_REQ,
         params: vec![0, 0],
@@ -389,10 +375,7 @@ fn smoke_att_expects_response_classification() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/att",
-    smoke_att_expects_response_classification
-);
+kernel_test_in!("bluetooth/att", smoke_att_expects_response_classification);
 
 // ── SMP ────────────────────────────────────────────────────────────
 
@@ -425,7 +408,13 @@ kernel_test_in!("bluetooth/smp", smoke_smp_pairing_feature_round_trip);
 fn smoke_smp_pick_pairing_method_just_works() -> TestResult {
     use crate::smp::{pick_pairing_method, IoCapability, PairingMethod};
     // No MITM → always Just Works.
-    let m = pick_pairing_method(IoCapability::DisplayYesNo, IoCapability::KeyboardDisplay, false, true, false);
+    let m = pick_pairing_method(
+        IoCapability::DisplayYesNo,
+        IoCapability::KeyboardDisplay,
+        false,
+        true,
+        false,
+    );
     if m != PairingMethod::JustWorks {
         return TestResult::Fail("no-MITM path should pick Just Works");
     }
@@ -468,9 +457,9 @@ kernel_test_in!("bluetooth/smp", smoke_smp_pick_pairing_method_just_works);
 
 fn smoke_smp_initiator_just_works_walk() -> TestResult {
     use crate::smp::{
-        Initiator, IoCapability, PairingError, PairingFeatureExchange, PairingState,
-        SmpCrypto, AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY,
-        SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
+        Initiator, IoCapability, PairingError, PairingFeatureExchange, PairingState, SmpCrypto,
+        AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
+        SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
     };
 
     /// Deterministic stub crypto — sufficient to exercise the state
@@ -621,13 +610,16 @@ fn smoke_smp_numeric_comparison_value_six_digits() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/smp", smoke_smp_numeric_comparison_value_six_digits);
+kernel_test_in!(
+    "bluetooth/smp",
+    smoke_smp_numeric_comparison_value_six_digits
+);
 
 fn smoke_smp_responder_full_walk() -> TestResult {
     use crate::smp::{
         IoCapability, PairingFeatureExchange, Pdu, Responder, ResponderState, SmpCrypto,
-        AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY,
-        SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
+        AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
+        SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
     };
 
     struct StubCrypto;
@@ -748,7 +740,10 @@ fn smoke_gatt_server_handles_read_request() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/gatt-server", smoke_gatt_server_handles_read_request);
+kernel_test_in!(
+    "bluetooth/gatt-server",
+    smoke_gatt_server_handles_read_request
+);
 
 fn smoke_gatt_server_write_updates_value() -> TestResult {
     use crate::att::{ATT_WRITE_REQ, ATT_WRITE_RSP};
@@ -780,7 +775,10 @@ fn smoke_gatt_server_write_updates_value() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/gatt-server", smoke_gatt_server_write_updates_value);
+kernel_test_in!(
+    "bluetooth/gatt-server",
+    smoke_gatt_server_write_updates_value
+);
 
 fn smoke_gatt_server_read_by_group_type_lists_services() -> TestResult {
     use crate::att::ATT_READ_BY_GROUP_TYPE_RSP;
@@ -817,9 +815,7 @@ kernel_test_in!(
 );
 
 fn smoke_gatt_server_invalid_handle_errors() -> TestResult {
-    use crate::att::{
-        ATT_ECODE_INVALID_HANDLE, ATT_ERROR_RSP, ATT_READ_REQ,
-    };
+    use crate::att::{ATT_ECODE_INVALID_HANDLE, ATT_ERROR_RSP, ATT_READ_REQ};
     use crate::gatt_server::GattServer;
 
     let mut srv = GattServer::new();
@@ -916,10 +912,7 @@ fn smoke_gatt_parse_primary_services_response() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/gatt",
-    smoke_gatt_parse_primary_services_response
-);
+kernel_test_in!("bluetooth/gatt", smoke_gatt_parse_primary_services_response);
 
 fn smoke_gatt_parse_characteristics_response() -> TestResult {
     use crate::gatt::{parse_characteristics, Uuid, CHAR_PROP_NOTIFY, CHAR_PROP_READ};
@@ -946,10 +939,7 @@ fn smoke_gatt_parse_characteristics_response() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/gatt",
-    smoke_gatt_parse_characteristics_response
-);
+kernel_test_in!("bluetooth/gatt", smoke_gatt_parse_characteristics_response);
 
 fn smoke_gatt_parse_descriptors_response() -> TestResult {
     use crate::gatt::{parse_descriptors, Uuid, UUID_CCC_DESCRIPTOR};
@@ -998,7 +988,7 @@ fn smoke_l2cap_reassembler_handles_fragments() -> TestResult {
     use crate::l2cap::{BFrame, PbFlag, Reassembler, CID_ATT};
     let frame = BFrame::new(CID_ATT, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
     let bytes = frame.encode(); // 9 bytes total
-    // Split across three ACL fragments: [0..3], [3..6], [6..9].
+                                // Split across three ACL fragments: [0..3], [3..6], [6..9].
     let mut r = Reassembler::new();
     let out0 = r.feed(PbFlag::StartBrEdr, &bytes[0..3]);
     if !out0.is_empty() {
@@ -1017,10 +1007,7 @@ fn smoke_l2cap_reassembler_handles_fragments() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/l2cap",
-    smoke_l2cap_reassembler_handles_fragments
-);
+kernel_test_in!("bluetooth/l2cap", smoke_l2cap_reassembler_handles_fragments);
 
 fn smoke_l2cap_reassembler_drops_orphaned_continuation() -> TestResult {
     use crate::l2cap::{BFrame, PbFlag, Reassembler, CID_ATT};
@@ -1135,9 +1122,7 @@ kernel_test_in!(
 );
 
 fn smoke_l2cap_wrap_bframe_fragments_across_acl_packets() -> TestResult {
-    use crate::l2cap::{
-        wrap_frame_into_acl, BFrame, CID_ATT, PB_CONTINUATION, PB_FIRST_FLUSHABLE,
-    };
+    use crate::l2cap::{wrap_frame_into_acl, BFrame, CID_ATT, PB_CONTINUATION, PB_FIRST_FLUSHABLE};
     // 100-byte payload + 4-byte L2CAP header = 104-byte frame; an MTU
     // of 27 forces 4 ACL packets.
     let frame = BFrame::new(CID_ATT, vec![0xAB; 100]);
@@ -1238,9 +1223,9 @@ fn smoke_hci_disconnection_complete_parse() -> TestResult {
     let event = Event {
         code: crate::event::EventCode::DisconnectionComplete as u8,
         params: vec![
-            0x00,       // status
+            0x00, // status
             0x2A, 0x00, // handle = 0x002A
-            0x13,       // reason = Remote User Terminated
+            0x13, // reason = Remote User Terminated
         ],
     };
     let dc = DisconnectionComplete::parse(&event).expect("parse");
@@ -1259,8 +1244,7 @@ fn smoke_hci_number_of_completed_packets_parse() -> TestResult {
         code: crate::event::EventCode::NumberOfCompletedPackets as u8,
         params: vec![
             0x02, // num_handles
-            0x2A, 0x00, 0x05, 0x00,
-            0x2B, 0x00, 0x01, 0x00,
+            0x2A, 0x00, 0x05, 0x00, 0x2B, 0x00, 0x01, 0x00,
         ],
     };
     let n = NumberOfCompletedPackets::parse(&event).expect("parse");
@@ -1316,8 +1300,7 @@ fn smoke_hci_le_advertising_report_parse() -> TestResult {
         0x01,   // num_reports
         0x00,   // event type = ADV_IND
         0x00,   // address type = public
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-        0x03,        // data_len
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x03, // data_len
         0x02, 0x01, 0x06, // AD record: Flags=0x06
     ];
     p.push((-50i8) as u8);
@@ -1542,10 +1525,16 @@ kernel_test_in!("bluetooth/hogp", smoke_hogp_report_reference_layout);
 fn smoke_hogp_builder_minimal_layout() -> TestResult {
     use crate::gatt::Uuid;
     use crate::gatt_server::AttributeDatabase;
-    use crate::hogp::{HidInformation, HidServiceBuilder, UUID_HID_INFORMATION,
-        UUID_HID_CONTROL_POINT, UUID_REPORT_MAP};
+    use crate::hogp::{
+        HidInformation, HidServiceBuilder, UUID_HID_CONTROL_POINT, UUID_HID_INFORMATION,
+        UUID_REPORT_MAP,
+    };
     let mut db = AttributeDatabase::new();
-    let info = HidInformation { bcd_hid: 0x0111, country_code: 0, flags: 0 };
+    let info = HidInformation {
+        bcd_hid: 0x0111,
+        country_code: 0,
+        flags: 0,
+    };
     let report_map: Vec<u8> = vec![0x05, 0x01, 0x09, 0x06, 0xC0]; // bogus stub bytes
     let h = HidServiceBuilder::new(info, report_map.clone()).build(&mut db);
     if h.service == 0 {
@@ -1557,7 +1546,9 @@ fn smoke_hogp_builder_minimal_layout() -> TestResult {
         return TestResult::Fail("minimal HID service should yield 7 attrs");
     }
     // info value handle should hold the encoded HidInformation.
-    let info_attr = db.attr_by_handle(h.hid_information_value).expect("info attr");
+    let info_attr = db
+        .attr_by_handle(h.hid_information_value)
+        .expect("info attr");
     if info_attr.value != [0x11, 0x01, 0x00, 0x00] {
         return TestResult::Fail("info value not encoded into attribute");
     }
@@ -1574,18 +1565,24 @@ fn smoke_hogp_builder_input_report_has_cccd() -> TestResult {
     use crate::gatt::CHAR_PROP_READ;
     use crate::gatt_server::AttributeDatabase;
     use crate::hogp::{
-        HidInformation, HidServiceBuilder, ReportEntry, ReportType,
-        UUID_REPORT_REFERENCE,
+        HidInformation, HidServiceBuilder, ReportEntry, ReportType, UUID_REPORT_REFERENCE,
     };
     let mut db = AttributeDatabase::new();
-    let h = HidServiceBuilder::new(HidInformation { bcd_hid: 0x0111, country_code: 0, flags: 0 }, vec![0xC0])
-        .add_report(ReportEntry {
-            report_id: 1,
-            report_type: ReportType::Input,
-            properties: CHAR_PROP_READ | CHAR_PROP_NOTIFY,
-            initial_value: vec![0; 8],
-        })
-        .build(&mut db);
+    let h = HidServiceBuilder::new(
+        HidInformation {
+            bcd_hid: 0x0111,
+            country_code: 0,
+            flags: 0,
+        },
+        vec![0xC0],
+    )
+    .add_report(ReportEntry {
+        report_id: 1,
+        report_type: ReportType::Input,
+        properties: CHAR_PROP_READ | CHAR_PROP_NOTIFY,
+        initial_value: vec![0; 8],
+    })
+    .build(&mut db);
     if h.reports.len() != 1 {
         return TestResult::Fail("expected 1 report");
     }
@@ -1605,7 +1602,10 @@ kernel_test_in!("bluetooth/hogp", smoke_hogp_builder_input_report_has_cccd);
 fn smoke_hogp_boot_keyboard_report_round_trip() -> TestResult {
     use crate::hogp::BootKeyboardReport;
     // Modifier 0x02 (LShift), keycodes 0x04 ('a'), rest empty.
-    let r = BootKeyboardReport { modifiers: 0x02, keycodes: [0x04, 0, 0, 0, 0, 0] };
+    let r = BootKeyboardReport {
+        modifiers: 0x02,
+        keycodes: [0x04, 0, 0, 0, 0, 0],
+    };
     let bytes = r.encode();
     if bytes[0] != 0x02 || bytes[1] != 0x00 || bytes[2] != 0x04 {
         return TestResult::Fail("boot keyboard layout wrong");
@@ -1623,7 +1623,11 @@ kernel_test_in!("bluetooth/hogp", smoke_hogp_boot_keyboard_report_round_trip);
 
 fn smoke_hogp_boot_mouse_signed_displacement() -> TestResult {
     use crate::hogp::BootMouseReport;
-    let r = BootMouseReport { buttons: 0x01, dx: -3, dy: 5 };
+    let r = BootMouseReport {
+        buttons: 0x01,
+        dx: -3,
+        dy: 5,
+    };
     let bytes = r.encode();
     // -3 as i8 -> 0xFD as u8
     if bytes != [0x01, 0xFD, 0x05] {
@@ -1755,7 +1759,10 @@ fn smoke_rfcomm_dlc_state_machine_open_then_send() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_dlc_state_machine_open_then_send);
+kernel_test_in!(
+    "bluetooth/rfcomm",
+    smoke_rfcomm_dlc_state_machine_open_then_send
+);
 
 // ── AVDTP / A2DP smokes ────────────────────────────────────────────
 
@@ -1826,9 +1833,8 @@ kernel_test_in!("bluetooth/avdtp", smoke_avdtp_sep_round_trip);
 
 fn smoke_avdtp_sbc_capability_round_trip() -> TestResult {
     use crate::avdtp::{
-        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR, SBC_BLOCK_16, SBC_BLOCK_4,
-        SBC_BLOCK_8, SBC_CHAN_JOINT_STEREO, SBC_CHAN_STEREO, SBC_FREQ_44100, SBC_FREQ_48000,
-        SBC_SUBBANDS_8,
+        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR, SBC_BLOCK_16, SBC_BLOCK_4, SBC_BLOCK_8,
+        SBC_CHAN_JOINT_STEREO, SBC_CHAN_STEREO, SBC_FREQ_44100, SBC_FREQ_48000, SBC_SUBBANDS_8,
     };
     let cap = SbcCapability {
         frequency: SBC_FREQ_44100 | SBC_FREQ_48000,
@@ -1882,7 +1888,10 @@ fn smoke_avdtp_sbc_media_codec_capability_descriptor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/avdtp", smoke_avdtp_sbc_media_codec_capability_descriptor);
+kernel_test_in!(
+    "bluetooth/avdtp",
+    smoke_avdtp_sbc_media_codec_capability_descriptor
+);
 
 fn smoke_avdtp_set_configuration_command_layout() -> TestResult {
     use crate::avdtp::{set_configuration_command, SID_SET_CONFIGURATION};
@@ -1909,7 +1918,10 @@ fn smoke_avdtp_set_configuration_command_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/avdtp", smoke_avdtp_set_configuration_command_layout);
+kernel_test_in!(
+    "bluetooth/avdtp",
+    smoke_avdtp_set_configuration_command_layout
+);
 
 fn smoke_avdtp_psm_assigned_number() -> TestResult {
     use crate::avdtp::AVDTP_PSM;
@@ -1923,7 +1935,9 @@ kernel_test_in!("bluetooth/avdtp", smoke_avdtp_psm_assigned_number);
 // ── HFP AT-command codec smokes ────────────────────────────────────
 
 fn smoke_hfp_brsf_round_trip() -> TestResult {
-    use crate::hfp::{brsf_command, parse_at, AtForm, HF_FEAT_CODEC_NEGOTIATION, HF_FEAT_VOLUME_CONTROL};
+    use crate::hfp::{
+        brsf_command, parse_at, AtForm, HF_FEAT_CODEC_NEGOTIATION, HF_FEAT_VOLUME_CONTROL,
+    };
     let line = brsf_command(HF_FEAT_VOLUME_CONTROL | HF_FEAT_CODEC_NEGOTIATION);
     let parsed = parse_at(&line).expect("parse");
     if parsed.name != "+BRSF" {
@@ -2172,7 +2186,10 @@ fn smoke_sdp_service_attribute_request_record_handle() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/sdp", smoke_sdp_service_attribute_request_record_handle);
+kernel_test_in!(
+    "bluetooth/sdp",
+    smoke_sdp_service_attribute_request_record_handle
+);
 
 fn smoke_sdp_psm_assigned_number() -> TestResult {
     if crate::sdp::SDP_PSM != 0x0001 {
@@ -2245,7 +2262,10 @@ fn smoke_mesh_segmented_access_header_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/mesh", smoke_mesh_segmented_access_header_round_trip);
+kernel_test_in!(
+    "bluetooth/mesh",
+    smoke_mesh_segmented_access_header_round_trip
+);
 
 fn smoke_mesh_access_opcode_one_byte() -> TestResult {
     use crate::mesh::AccessOpcode;
@@ -2290,7 +2310,12 @@ fn smoke_mesh_access_opcode_vendor_form_carries_company_id_le() -> TestResult {
         return TestResult::Fail("Company ID is little-endian");
     }
     let (op, _) = AccessOpcode::decode(&bytes).expect("decode");
-    if op != (AccessOpcode::Vendor { op: 0x05, company_id: 0x004C }) {
+    if op
+        != (AccessOpcode::Vendor {
+            op: 0x05,
+            company_id: 0x004C,
+        })
+    {
         return TestResult::Fail("vendor opcode round-trip");
     }
     TestResult::Pass
@@ -2338,8 +2363,15 @@ fn smoke_gap_record_iterator_walks_two_records() -> TestResult {
     // Record 1: Flags = 0x06 (LE General Discoverable + BR/EDR not supported)
     // Record 2: Complete Local Name = "narf"
     let buf = [
-        2u8, AD_FLAGS, 0x06,
-        5, AD_COMPLETE_LOCAL_NAME, b'n', b'a', b'r', b'f',
+        2u8,
+        AD_FLAGS,
+        0x06,
+        5,
+        AD_COMPLETE_LOCAL_NAME,
+        b'n',
+        b'a',
+        b'r',
+        b'f',
     ];
     let recs: alloc::vec::Vec<_> = AdIter::new(&buf).collect::<Result<_, _>>().expect("walk");
     if recs.len() != 2 {
@@ -2378,12 +2410,15 @@ kernel_test_in!("bluetooth/gap", smoke_gap_truncated_record_surfaces_error);
 
 fn smoke_gap_builder_round_trip_with_decoders() -> TestResult {
     use crate::gap::{
-        append_complete_local_name, append_flags, append_manufacturer_data, append_tx_power,
-        flags, local_name, manufacturer_data, tx_power, FLAGS_BR_EDR_NOT_SUPPORTED,
+        append_complete_local_name, append_flags, append_manufacturer_data, append_tx_power, flags,
+        local_name, manufacturer_data, tx_power, FLAGS_BR_EDR_NOT_SUPPORTED,
         FLAGS_LE_GENERAL_DISCOVERABLE,
     };
     let mut buf = alloc::vec::Vec::new();
-    append_flags(&mut buf, FLAGS_LE_GENERAL_DISCOVERABLE | FLAGS_BR_EDR_NOT_SUPPORTED);
+    append_flags(
+        &mut buf,
+        FLAGS_LE_GENERAL_DISCOVERABLE | FLAGS_BR_EDR_NOT_SUPPORTED,
+    );
     append_complete_local_name(&mut buf, "narf");
     append_tx_power(&mut buf, -7);
     append_manufacturer_data(&mut buf, 0x004C, &[1, 2, 3]);
@@ -2502,26 +2537,25 @@ kernel_test_in!("bluetooth/hid", smoke_hidp_psm_constants_match_spec);
 fn smoke_btusb_recogniser_accepts_class_triple() -> TestResult {
     use crate::usb_transport::is_bluetooth_hci;
     let cfg: [u8; 25] = [
-        9, 2, 25, 0, 1, 1, 0, 0xA0, 0,
-        9, 4, 0, 0, 1, 0xE0, 0x01, 0x01, 0,
-        7, 5, 0x81, 0x03, 16, 0, 1,
+        9, 2, 25, 0, 1, 1, 0, 0xA0, 0, 9, 4, 0, 0, 1, 0xE0, 0x01, 0x01, 0, 7, 5, 0x81, 0x03, 16, 0,
+        1,
     ];
     if !is_bluetooth_hci(&cfg) {
         return TestResult::Fail("class 0xE0/0x01/0x01 should match");
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/usb-transport", smoke_btusb_recogniser_accepts_class_triple);
+kernel_test_in!(
+    "bluetooth/usb-transport",
+    smoke_btusb_recogniser_accepts_class_triple
+);
 
 fn smoke_btusb_find_endpoints_returns_event_acl() -> TestResult {
     use crate::usb_transport::find_endpoints;
     // CONFIG + INTERFACE(HCI) + INT-IN(0x81) + BULK-OUT(0x02) + BULK-IN(0x82)
     let cfg: [u8; 39] = [
-        9, 2, 39, 0, 1, 1, 0, 0xA0, 0,
-        9, 4, 0, 0, 3, 0xE0, 0x01, 0x01, 0,
-        7, 5, 0x81, 0x03, 16, 0, 1,
-        7, 5, 0x02, 0x02, 64, 0, 0,
-        7, 5, 0x82, 0x02, 64, 0, 0,
+        9, 2, 39, 0, 1, 1, 0, 0xA0, 0, 9, 4, 0, 0, 3, 0xE0, 0x01, 0x01, 0, 7, 5, 0x81, 0x03, 16, 0,
+        1, 7, 5, 0x02, 0x02, 64, 0, 0, 7, 5, 0x82, 0x02, 64, 0, 0,
     ];
     let eps = find_endpoints(&cfg).expect("find");
     if eps.event_ep != Some(0x81) || eps.acl_in_ep != Some(0x82) || eps.acl_out_ep != Some(0x02) {
@@ -2529,7 +2563,10 @@ fn smoke_btusb_find_endpoints_returns_event_acl() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/usb-transport", smoke_btusb_find_endpoints_returns_event_acl);
+kernel_test_in!(
+    "bluetooth/usb-transport",
+    smoke_btusb_find_endpoints_returns_event_acl
+);
 
 fn smoke_btusb_hci_command_setup_packet_shape() -> TestResult {
     use crate::usb_transport::{build_hci_command, hci_command_setup, is_hci_command_setup};
@@ -2546,7 +2583,10 @@ fn smoke_btusb_hci_command_setup_packet_shape() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/usb-transport", smoke_btusb_hci_command_setup_packet_shape);
+kernel_test_in!(
+    "bluetooth/usb-transport",
+    smoke_btusb_hci_command_setup_packet_shape
+);
 
 // ── Stage 2 smokes ──────────────────────────────────────────────────
 //
@@ -2674,7 +2714,10 @@ fn smoke_classic_connection_complete_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/classic", smoke_classic_connection_complete_decode);
+kernel_test_in!(
+    "bluetooth/classic",
+    smoke_classic_connection_complete_decode
+);
 
 /// Smoke 4 — SSP IO_Capability_Request_Reply shapes correctly.
 /// §7.1.29: 9-byte parameter block — BD_ADDR(6) + IO_Cap(1) + OOB(1) + AuthReq(1).
@@ -2714,14 +2757,17 @@ fn smoke_ssp_io_capability_request_reply_shape() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/classic", smoke_ssp_io_capability_request_reply_shape);
+kernel_test_in!(
+    "bluetooth/classic",
+    smoke_ssp_io_capability_request_reply_shape
+);
 
 /// Smoke 5 — HCI_Setup_Synchronous_Connection encodes correctly.
 /// §7.1.26: 17-byte parameter block. Verify handle + bandwidth fields.
 fn smoke_sco_setup_synchronous_connection_encode() -> TestResult {
     use crate::classic::{
-        build_setup_synchronous_connection, SCO_BANDWIDTH_8KHZ, SCO_VOICE_SETTING_CVSD,
-        ESCO_PACKET_TYPES_ALL,
+        build_setup_synchronous_connection, ESCO_PACKET_TYPES_ALL, SCO_BANDWIDTH_8KHZ,
+        SCO_VOICE_SETTING_CVSD,
     };
     use crate::opcode::HCI_SETUP_SYNCHRONOUS_CONNECTION;
 
@@ -2730,7 +2776,7 @@ fn smoke_sco_setup_synchronous_connection_encode() -> TestResult {
         handle,
         SCO_BANDWIDTH_8KHZ,
         SCO_BANDWIDTH_8KHZ,
-        7,   // max_latency in ms
+        7, // max_latency in ms
         SCO_VOICE_SETTING_CVSD,
         0xFF, // retransmission_effort = don't care
         ESCO_PACKET_TYPES_ALL,
@@ -2764,7 +2810,10 @@ fn smoke_sco_setup_synchronous_connection_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bluetooth/classic", smoke_sco_setup_synchronous_connection_encode);
+kernel_test_in!(
+    "bluetooth/classic",
+    smoke_sco_setup_synchronous_connection_encode
+);
 
 /// Smoke 6 — HCI command queue credit model: enqueue, drain on
 /// command-complete, and re-drain pending entries. Mirrors the flow
@@ -2795,7 +2844,8 @@ fn smoke_btusb_hci_cmd_queue_dispatch() -> TestResult {
     if q.pending_len() != 0 {
         return TestResult::Fail("pending queue should be empty before second enqueue");
     }
-    q.enqueue(Command::new(HCI_SET_EVENT_MASK), &lt).expect("enqueue2");
+    q.enqueue(Command::new(HCI_SET_EVENT_MASK), &lt)
+        .expect("enqueue2");
     if q.pending_len() != 1 {
         return TestResult::Fail("second command should be pending (no credits)");
     }
@@ -2945,8 +2995,8 @@ kernel_test_in!(
 /// scenarios: happy path, no-common-frequency, and no-common-bitpool.
 fn smoke_profiles_a2dp_sbc_negotiate_intersects_tables() -> TestResult {
     use crate::avdtp::{
-        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
-        SBC_FREQ_44100, SBC_FREQ_48000, SBC_SUBBANDS_8,
+        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO, SBC_FREQ_44100,
+        SBC_FREQ_48000, SBC_SUBBANDS_8,
     };
     use crate::profiles::a2dp::{negotiate_sbc, NegotiateResult, LOCAL_SBC_SOURCE_CAPS};
 
@@ -2983,8 +3033,7 @@ fn smoke_profiles_a2dp_sbc_negotiate_intersects_tables() -> TestResult {
         frequency: 0x00, // no bits set
         ..remote
     };
-    if negotiate_sbc(&LOCAL_SBC_SOURCE_CAPS, &remote_no_freq)
-        != NegotiateResult::NoCommonFrequency
+    if negotiate_sbc(&LOCAL_SBC_SOURCE_CAPS, &remote_no_freq) != NegotiateResult::NoCommonFrequency
     {
         return TestResult::Fail("should return NoCommonFrequency when bitmask is empty");
     }
@@ -3087,10 +3136,7 @@ fn smoke_profiles_hfp_at_command_parser() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/profiles",
-    smoke_profiles_hfp_at_command_parser
-);
+kernel_test_in!("bluetooth/profiles", smoke_profiles_hfp_at_command_parser);
 
 // ── profiles/hfp: SCO setup ────────────────────────────────────────
 
@@ -3153,10 +3199,10 @@ kernel_test_in!(
 /// `Streaming`.
 fn smoke_profiles_a2dp_source_stream_start_state_machine() -> TestResult {
     use crate::avdtp::{
-        Header, SbcCapability, SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
-        SBC_FREQ_48000, SBC_SUBBANDS_8, SEP_TYPE_SINK, MEDIA_AUDIO,
-        MSG_RESPONSE_ACCEPT, PKT_SINGLE, SID_DISCOVER, SID_GET_CAPABILITIES,
-        SID_SET_CONFIGURATION, SID_OPEN, SID_START, StreamEndPoint,
+        Header, SbcCapability, StreamEndPoint, MEDIA_AUDIO, MSG_RESPONSE_ACCEPT, PKT_SINGLE,
+        SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO, SBC_FREQ_48000, SBC_SUBBANDS_8,
+        SEP_TYPE_SINK, SID_DISCOVER, SID_GET_CAPABILITIES, SID_OPEN, SID_SET_CONFIGURATION,
+        SID_START,
     };
     use crate::profiles::a2dp::{A2dpSource, SourceState};
     use crate::profiles::avdtp::{Session, SessionState};
@@ -3327,8 +3373,8 @@ kernel_test_in!(
 /// for the actual audio path — is wired correctly.
 fn smoke_profiles_a2dp_source_sbc_encode_streaming() -> TestResult {
     use crate::avdtp::{
-        SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO,
-        SBC_FREQ_44100, SBC_SUBBANDS_8, SbcCapability,
+        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO, SBC_FREQ_44100,
+        SBC_SUBBANDS_8,
     };
     use crate::profiles::a2dp::{A2dpSource, SourceState};
 
@@ -3540,7 +3586,7 @@ kernel_test_in!("bluetooth/avrcp", smoke_avrcp_avctp_packet_round_trip);
 /// state. Decode back to assert opcode + state bit.
 fn smoke_avrcp_pass_through_play_press() -> TestResult {
     use crate::avrcp::{
-        pass_through_frame, AVC_OPCODE_PASS_THROUGH, CTYPE_CONTROL, OP_PLAY, PassThrough,
+        pass_through_frame, PassThrough, AVC_OPCODE_PASS_THROUGH, CTYPE_CONTROL, OP_PLAY,
         SUBUNIT_PANEL_BYTE,
     };
     let frame = pass_through_frame(OP_PLAY, false);
@@ -3570,7 +3616,7 @@ kernel_test_in!("bluetooth/avrcp", smoke_avrcp_pass_through_play_press);
 /// AVRCP §4.6.1 PASS THROUGH release frame mirrors the press; the
 /// state bit (bit 7 of byte 3) flips.
 fn smoke_avrcp_pass_through_release() -> TestResult {
-    use crate::avrcp::{pass_through_frame, OP_VOLUME_UP, PassThrough};
+    use crate::avrcp::{pass_through_frame, PassThrough, OP_VOLUME_UP};
     let frame = pass_through_frame(OP_VOLUME_UP, true);
     if (frame[3] & 0x80) == 0 {
         return TestResult::Fail("release bit not set");
@@ -3590,12 +3636,10 @@ kernel_test_in!("bluetooth/avrcp", smoke_avrcp_pass_through_release);
 /// BT-SIG company ID and a 7-bit volume value.
 fn smoke_avrcp_set_absolute_volume() -> TestResult {
     use crate::avrcp::{
-        parse_vendor_dependent, set_absolute_volume, BT_SIG_COMPANY_ID,
-        PDU_SET_ABSOLUTE_VOLUME,
+        parse_vendor_dependent, set_absolute_volume, BT_SIG_COMPANY_ID, PDU_SET_ABSOLUTE_VOLUME,
     };
     let frame = set_absolute_volume(0x40);
-    let (_ctype, cid, pdu_id, params) =
-        parse_vendor_dependent(&frame).expect("parse vendor-dep");
+    let (_ctype, cid, pdu_id, params) = parse_vendor_dependent(&frame).expect("parse vendor-dep");
     if cid != BT_SIG_COMPANY_ID {
         return TestResult::Fail("company ID not BT SIG");
     }
@@ -3613,11 +3657,11 @@ kernel_test_in!("bluetooth/avrcp", smoke_avrcp_set_absolute_volume);
 /// by absolute-volume controllers to learn the peer's volume change.
 fn smoke_avrcp_register_notification_volume_changed() -> TestResult {
     use crate::avrcp::{
-        parse_vendor_dependent, register_notification, EVENT_VOLUME_CHANGED, PDU_REGISTER_NOTIFICATION,
+        parse_vendor_dependent, register_notification, EVENT_VOLUME_CHANGED,
+        PDU_REGISTER_NOTIFICATION,
     };
     let frame = register_notification(EVENT_VOLUME_CHANGED, 0);
-    let (_ctype, _cid, pdu_id, params) =
-        parse_vendor_dependent(&frame).expect("parse vendor-dep");
+    let (_ctype, _cid, pdu_id, params) = parse_vendor_dependent(&frame).expect("parse vendor-dep");
     if pdu_id != PDU_REGISTER_NOTIFICATION {
         return TestResult::Fail("pdu id not REGISTER_NOTIFICATION");
     }
@@ -3950,7 +3994,7 @@ kernel_test_in!("bluetooth/event", smoke_user_confirmation_request_decode);
 /// L2CAP §4.2 Connection Request — PSM(2 LE) + Source_CID(2 LE).
 /// Verify the wire layout matches the spec exactly.
 fn smoke_l2cap_connection_request_encoding() -> TestResult {
-    use crate::l2cap::{build_connection_request, PSM_AVDTP, SignallingCode};
+    use crate::l2cap::{build_connection_request, SignallingCode, PSM_AVDTP};
     let cmd = build_connection_request(0x42, PSM_AVDTP, 0x0050);
     if cmd.code != SignallingCode::ConnectionRequest as u8 {
         return TestResult::Fail("conn-req code wrong");
@@ -3977,8 +4021,13 @@ fn smoke_l2cap_connection_response_success() -> TestResult {
     use crate::l2cap::{
         build_connection_response, CONN_RESULT_SUCCESS, CONN_STATUS_NO_INFORMATION,
     };
-    let cmd = build_connection_response(0x05, 0x0050, 0x0040, CONN_RESULT_SUCCESS,
-                                         CONN_STATUS_NO_INFORMATION);
+    let cmd = build_connection_response(
+        0x05,
+        0x0050,
+        0x0040,
+        CONN_RESULT_SUCCESS,
+        CONN_STATUS_NO_INFORMATION,
+    );
     if cmd.data.len() != 8 {
         return TestResult::Fail("conn-rsp data not 8 bytes");
     }
@@ -4065,17 +4114,12 @@ fn smoke_l2cap_le_conn_param_update_request() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "bluetooth/l2cap",
-    smoke_l2cap_le_conn_param_update_request
-);
+kernel_test_in!("bluetooth/l2cap", smoke_l2cap_le_conn_param_update_request);
 
 /// L2CAP §4.10 Information Request for Extended Features — used by
 /// initiators to discover ERTM / Streaming / FCS support.
 fn smoke_l2cap_information_request_extended_features() -> TestResult {
-    use crate::l2cap::{
-        build_information_request, INFO_TYPE_EXTENDED_FEATURES, SignallingCode,
-    };
+    use crate::l2cap::{build_information_request, SignallingCode, INFO_TYPE_EXTENDED_FEATURES};
     let cmd = build_information_request(0x01, INFO_TYPE_EXTENDED_FEATURES);
     if cmd.code != SignallingCode::InformationRequest as u8 {
         return TestResult::Fail("not InformationRequest");
@@ -4094,17 +4138,33 @@ kernel_test_in!(
 /// every public Bluetooth profile.
 fn smoke_l2cap_well_known_psms() -> TestResult {
     use crate::l2cap::{
-        PSM_AVCTP, PSM_AVCTP_BROWSING, PSM_AVDTP, PSM_BNEP, PSM_HID_CONTROL,
-        PSM_HID_INTERRUPT, PSM_RFCOMM, PSM_SDP,
+        PSM_AVCTP, PSM_AVCTP_BROWSING, PSM_AVDTP, PSM_BNEP, PSM_HID_CONTROL, PSM_HID_INTERRUPT,
+        PSM_RFCOMM, PSM_SDP,
     };
-    if PSM_SDP != 0x0001 { return TestResult::Fail("PSM_SDP wrong"); }
-    if PSM_RFCOMM != 0x0003 { return TestResult::Fail("PSM_RFCOMM wrong"); }
-    if PSM_BNEP != 0x000F { return TestResult::Fail("PSM_BNEP wrong"); }
-    if PSM_HID_CONTROL != 0x0011 { return TestResult::Fail("PSM_HID_CONTROL wrong"); }
-    if PSM_HID_INTERRUPT != 0x0013 { return TestResult::Fail("PSM_HID_INTERRUPT wrong"); }
-    if PSM_AVCTP != 0x0017 { return TestResult::Fail("PSM_AVCTP wrong"); }
-    if PSM_AVDTP != 0x0019 { return TestResult::Fail("PSM_AVDTP wrong"); }
-    if PSM_AVCTP_BROWSING != 0x001B { return TestResult::Fail("PSM_AVCTP_BROWSING wrong"); }
+    if PSM_SDP != 0x0001 {
+        return TestResult::Fail("PSM_SDP wrong");
+    }
+    if PSM_RFCOMM != 0x0003 {
+        return TestResult::Fail("PSM_RFCOMM wrong");
+    }
+    if PSM_BNEP != 0x000F {
+        return TestResult::Fail("PSM_BNEP wrong");
+    }
+    if PSM_HID_CONTROL != 0x0011 {
+        return TestResult::Fail("PSM_HID_CONTROL wrong");
+    }
+    if PSM_HID_INTERRUPT != 0x0013 {
+        return TestResult::Fail("PSM_HID_INTERRUPT wrong");
+    }
+    if PSM_AVCTP != 0x0017 {
+        return TestResult::Fail("PSM_AVCTP wrong");
+    }
+    if PSM_AVDTP != 0x0019 {
+        return TestResult::Fail("PSM_AVDTP wrong");
+    }
+    if PSM_AVCTP_BROWSING != 0x001B {
+        return TestResult::Fail("PSM_AVCTP_BROWSING wrong");
+    }
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/l2cap", smoke_l2cap_well_known_psms);
@@ -4197,15 +4257,22 @@ fn smoke_services_device_info_partial() -> TestResult {
     if attrs.len() != 5 {
         return TestResult::Fail("DIS partial mount expected 5 attrs");
     }
-    let mfr = attrs.iter().find(|a| a.uuid == Uuid::U16(UUID_MANUFACTURER_NAME_STRING));
+    let mfr = attrs
+        .iter()
+        .find(|a| a.uuid == Uuid::U16(UUID_MANUFACTURER_NAME_STRING));
     if mfr.is_none() || mfr.unwrap().value != b"narf" {
         return TestResult::Fail("manufacturer not mounted");
     }
-    let mdl = attrs.iter().find(|a| a.uuid == Uuid::U16(UUID_MODEL_NUMBER_STRING));
+    let mdl = attrs
+        .iter()
+        .find(|a| a.uuid == Uuid::U16(UUID_MODEL_NUMBER_STRING));
     if mdl.is_none() || mdl.unwrap().value != b"narf-001" {
         return TestResult::Fail("model not mounted");
     }
-    if attrs.iter().any(|a| a.uuid == Uuid::U16(UUID_SERIAL_NUMBER_STRING)) {
+    if attrs
+        .iter()
+        .any(|a| a.uuid == Uuid::U16(UUID_SERIAL_NUMBER_STRING))
+    {
         return TestResult::Fail("serial spuriously mounted");
     }
     TestResult::Pass
@@ -4251,4 +4318,3 @@ fn smoke_services_cccd_value_encoding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/services", smoke_services_cccd_value_encoding);
-

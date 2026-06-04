@@ -183,7 +183,7 @@ pub struct SbcCapability {
 impl SbcCapability {
     pub fn encode(self) -> [u8; 4] {
         let b0 = (self.frequency & 0xF0) | (self.channel_mode & 0x0F);
-        let b1 = (self.block_length & 0xF0) | ((self.subbands & 0x0C)) | (self.allocation & 0x03);
+        let b1 = (self.block_length & 0xF0) | (self.subbands & 0x0C) | (self.allocation & 0x03);
         [b0, b1, self.min_bitpool, self.max_bitpool]
     }
 
