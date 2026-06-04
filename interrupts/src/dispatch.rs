@@ -282,12 +282,7 @@ static SLOTS: [Slot; NUM_VECTORS] = [const { Slot::new() }; NUM_VECTORS];
 /// `name` is the driver / device identifier shown in diagnostics;
 /// `cookie` is an opaque per-binding value passed back to the
 /// handler (typically a pointer cast to u64).
-pub fn install_handler_named(
-    vector: u8,
-    name: &'static str,
-    cookie: u64,
-    handler: SyncHandler,
-) {
+pub fn install_handler_named(vector: u8, name: &'static str, cookie: u64, handler: SyncHandler) {
     check_no_reentry("install_handler_named", vector);
     let mut g = SLOTS[vector as usize].handlers.lock();
     g.push(HandlerEntry {
@@ -322,7 +317,8 @@ fn legacy_install(vector: u8, handler: fn()) {
     // legacy handler just replaces the stored fn pointer.
     let chain_present = {
         let g = SLOTS[vector as usize].handlers.lock();
-        g.iter().any(|h| h.handler as usize == legacy_bridge as usize)
+        g.iter()
+            .any(|h| h.handler as usize == legacy_bridge as usize)
     };
     if !chain_present {
         install_handler_named(vector, "legacy", vector as u64, legacy_bridge);
@@ -388,7 +384,9 @@ pub fn disable_irq(vector: u8) {
 /// Inverse of `disable_irq`. Subsequent `on_irq(vector)` calls
 /// resume full dispatch.
 pub fn enable_irq(vector: u8) {
-    SLOTS[vector as usize].masked.store(false, Ordering::Release);
+    SLOTS[vector as usize]
+        .masked
+        .store(false, Ordering::Release);
 }
 
 /// Returns true if the vector is currently soft-masked.

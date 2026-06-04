@@ -211,10 +211,8 @@ fn apic_spurious_handler() {
 
 /// Diagnostic counters — public so tests / debug commands can
 /// observe latched APIC errors + spurious-vector deliveries.
-pub static APIC_ERROR_COUNT: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static APIC_ERROR_LATCH: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static APIC_ERROR_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static APIC_ERROR_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -425,9 +423,11 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
         // 32 bits (x2APIC full APIC ID).
         let icr: u64 = (vector as u64)
             | (1u64 << 14)             // level = assert
-            | ((cpu as u64) << 32);    // destination APIC id
-        // SAFETY: x2APIC confirmed active above.
-        unsafe { wrmsr_icr(icr); }
+            | ((cpu as u64) << 32); // destination APIC id
+                                    // SAFETY: x2APIC confirmed active above.
+        unsafe {
+            wrmsr_icr(icr);
+        }
     }
 }
 

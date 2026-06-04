@@ -150,9 +150,8 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
             HPET_TICK_VECTOR.store(vector, Ordering::Release);
             // SAFETY: vector + handler installed; HPET MMIO live
             // (supported() returned true above).
-            match unsafe {
-                narf_time::hpet::arm_periodic_msi(n, msi_addr, msi_data, period_ticks)
-            } {
+            match unsafe { narf_time::hpet::arm_periodic_msi(n, msi_addr, msi_data, period_ticks) }
+            {
                 Ok(()) => return Ok(()),
                 Err(_) => {
                     HPET_COMPARATOR.store(0xFF, Ordering::Release);
@@ -164,13 +163,11 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
 
         // GSI fallback for HPETs without FSB capability.
         let (n, gsi) = chosen_gsi.ok_or(ClockEventError::NotSupported)?;
-        let flags = narf_acpi::ioapic::POLARITY_HIGH
-            | narf_acpi::ioapic::TRIGGER_LEVEL;
+        let flags = narf_acpi::ioapic::POLARITY_HIGH | narf_acpi::ioapic::TRIGGER_LEVEL;
         // SAFETY: vector + handler installed; IOAPIC code upholds
         // its own preconditions.
-        let routed = unsafe {
-            narf_acpi::ioapic::route_gsi_to_vector(gsi as u32, vector, 0, flags)
-        };
+        let routed =
+            unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi as u32, vector, 0, flags) };
         if !routed {
             return Err(ClockEventError::NoFreeIrq);
         }

@@ -243,8 +243,8 @@ fn smoke_hpet_oneshot_fires_handler() -> TestResult {
     // End-to-end: arm a HPET one-shot for ~1 ms in the future, STI,
     // wait for the handler-installed atomic to flip. Skips when HPET
     // wasn't initialised (some test boots run without ACPI parsing).
-    use core::sync::atomic::{AtomicBool, Ordering};
     use crate::x86_64::hpet_oneshot;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     if !narf_time::hpet::is_present() {
         return TestResult::Skip("HPET not initialised");
@@ -320,13 +320,13 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
     // by polling. The HPET pump (init'd in bare_main) must arm
     // HPET, fire on deadline, and the wheel callback must wake the
     // SleepUntil so its next poll reports Ready.
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use crate::x86_64::timer_pump;
     use alloc::sync::Arc;
     use alloc::task::Wake;
-    use crate::x86_64::timer_pump;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll};
 
     if !timer_pump::is_initialised() {
         return TestResult::Skip("timer_pump not initialised");
@@ -475,8 +475,7 @@ fn smoke_atomic_pool_usable_from_real_irq_handler() -> TestResult {
     // test above.
     const TEST_VEC: u8 = 0xE1;
 
-    static POOL: narf_lib::sync::OnceLock<AtomicPool<u64>> =
-        narf_lib::sync::OnceLock::new();
+    static POOL: narf_lib::sync::OnceLock<AtomicPool<u64>> = narf_lib::sync::OnceLock::new();
     let pool = POOL.get_or_init(|| AtomicPool::new(2, || 0u64));
 
     static OBSERVED: AtomicU64 = AtomicU64::new(0);
@@ -538,7 +537,9 @@ fn smoke_dispatch_sync_handler_runs_on_on_irq() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     static HITS: AtomicU32 = AtomicU32::new(0);
     HITS.store(0, Ordering::Relaxed);
-    fn h() { HITS.fetch_add(1, Ordering::Relaxed); }
+    fn h() {
+        HITS.fetch_add(1, Ordering::Relaxed);
+    }
 
     crate::dispatch::install(SCRATCH_VEC_HANDLER, h);
     crate::on_irq(SCRATCH_VEC_HANDLER);
@@ -557,7 +558,9 @@ fn smoke_dispatch_clear_handler_stops_invocations() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     static HITS: AtomicU32 = AtomicU32::new(0);
     HITS.store(0, Ordering::Relaxed);
-    fn h() { HITS.fetch_add(1, Ordering::Relaxed); }
+    fn h() {
+        HITS.fetch_add(1, Ordering::Relaxed);
+    }
 
     crate::dispatch::install(SCRATCH_VEC_HANDLER_CLEAR, h);
     crate::on_irq(SCRATCH_VEC_HANDLER_CLEAR);
@@ -589,7 +592,9 @@ fn smoke_dispatch_sync_handler_runs_before_waker() -> TestResult {
     }
 
     // Custom waker that records whether the handler ran first.
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     fn wake(_: *const ()) {
         // If HANDLER_SEEN is still 0, the waker fired *before* the
         // handler — would be a contract violation.
@@ -599,10 +604,11 @@ fn smoke_dispatch_sync_handler_runs_before_waker() -> TestResult {
             WAKER_AFTER_HANDLER.store(1, Ordering::Release);
         }
     }
-    fn wake_ref(p: *const ()) { wake(p); }
+    fn wake_ref(p: *const ()) {
+        wake(p);
+    }
     fn noop_drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
 
     HANDLER_SEEN.store(0, Ordering::Release);
     WAKER_AFTER_HANDLER.store(0, Ordering::Release);
@@ -649,12 +655,17 @@ fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
     use core::task::{RawWaker, RawWakerVTable, Waker};
 
     static WOKEN: AtomicBool = AtomicBool::new(false);
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
-    fn wake(_: *const ()) { WOKEN.store(true, Ordering::Release); }
-    fn wake_ref(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    fn wake(_: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
+    fn wake_ref(_: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
     fn noop_drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
 
     WOKEN.store(false, Ordering::Release);
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
@@ -681,16 +692,22 @@ fn smoke_dispatch_clear_waker_targets_only_own() -> TestResult {
     static WOKEN_A: AtomicU32 = AtomicU32::new(0);
     static WOKEN_B: AtomicU32 = AtomicU32::new(0);
 
-    fn clone_a(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE_A) }
-    fn wake_a(_: *const ()) { WOKEN_A.fetch_add(1, Ordering::Release); }
+    fn clone_a(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE_A)
+    }
+    fn wake_a(_: *const ()) {
+        WOKEN_A.fetch_add(1, Ordering::Release);
+    }
     fn noop_drop(_: *const ()) {}
-    static VTABLE_A: RawWakerVTable =
-        RawWakerVTable::new(clone_a, wake_a, wake_a, noop_drop);
+    static VTABLE_A: RawWakerVTable = RawWakerVTable::new(clone_a, wake_a, wake_a, noop_drop);
 
-    fn clone_b(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE_B) }
-    fn wake_b(_: *const ()) { WOKEN_B.fetch_add(1, Ordering::Release); }
-    static VTABLE_B: RawWakerVTable =
-        RawWakerVTable::new(clone_b, wake_b, wake_b, noop_drop);
+    fn clone_b(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE_B)
+    }
+    fn wake_b(_: *const ()) {
+        WOKEN_B.fetch_add(1, Ordering::Release);
+    }
+    static VTABLE_B: RawWakerVTable = RawWakerVTable::new(clone_b, wake_b, wake_b, noop_drop);
 
     WOKEN_A.store(0, Ordering::Release);
     WOKEN_B.store(0, Ordering::Release);
@@ -776,7 +793,9 @@ fn smoke_vector_alloc_block_releases_all_on_free() -> TestResult {
     };
     for i in 0..8 {
         if !is_allocated(base + i) {
-            for j in 0..8 { let _ = free(base + j); }
+            for j in 0..8 {
+                let _ = free(base + j);
+            }
             return TestResult::Fail("block bit not set");
         }
     }
@@ -818,7 +837,9 @@ fn smoke_wait_for_irq_baseline_ignores_prior_fires() -> TestResult {
     crate::on_irq(SCRATCH_VEC_BASELINE);
     crate::on_irq(SCRATCH_VEC_BASELINE);
 
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     fn noop_wake(_: *const ()) {}
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
@@ -843,7 +864,10 @@ fn smoke_wait_for_irq_baseline_ignores_prior_fires() -> TestResult {
         }
     }
 }
-kernel_test_in!("interrupts", smoke_wait_for_irq_baseline_ignores_prior_fires);
+kernel_test_in!(
+    "interrupts",
+    smoke_wait_for_irq_baseline_ignores_prior_fires
+);
 
 fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
     // Construct WaitForIrq, poll once to install the waker, then
@@ -856,11 +880,14 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     static WOKEN: AtomicBool = AtomicBool::new(false);
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
-    fn wake(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    fn wake(_: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
     fn noop_drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(noop_clone, wake, wake, noop_drop);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake, noop_drop);
 
     WOKEN.store(false, Ordering::Release);
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
@@ -870,7 +897,7 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
         let mut fut = crate::wait_for_irq(120);
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         let _ = pinned.poll(&mut cx); // installs waker
-        // fut drops here → WaitForIrq::Drop clears the slot.
+                                      // fut drops here → WaitForIrq::Drop clears the slot.
     }
     crate::on_irq(120);
     if WOKEN.load(Ordering::Acquire) {
@@ -903,8 +930,12 @@ fn smoke_dispatch_install_replaces_prior_handler() -> TestResult {
     static B: AtomicU32 = AtomicU32::new(0);
     A.store(0, Ordering::Relaxed);
     B.store(0, Ordering::Relaxed);
-    fn h_a() { A.fetch_add(1, Ordering::Relaxed); }
-    fn h_b() { B.fetch_add(1, Ordering::Relaxed); }
+    fn h_a() {
+        A.fetch_add(1, Ordering::Relaxed);
+    }
+    fn h_b() {
+        B.fetch_add(1, Ordering::Relaxed);
+    }
 
     crate::dispatch::install(SCRATCH_VEC_REPLACE, h_a);
     crate::dispatch::install(SCRATCH_VEC_REPLACE, h_b);
@@ -992,7 +1023,10 @@ fn smoke_vector_alloc_block_of_one_equivalent_to_alloc() -> TestResult {
     free(v).expect("cleanup");
     TestResult::Pass
 }
-kernel_test_in!("interrupts", smoke_vector_alloc_block_of_one_equivalent_to_alloc);
+kernel_test_in!(
+    "interrupts",
+    smoke_vector_alloc_block_of_one_equivalent_to_alloc
+);
 
 fn smoke_vector_alloc_block_rejects_too_large() -> TestResult {
     // alloc_block(N+1) where N is the allocator's range must return
@@ -1055,7 +1089,9 @@ fn smoke_wait_for_irq_until_succeeds_before_deadline() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     fn noop_wake(_: *const ()) {}
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
@@ -1077,7 +1113,10 @@ fn smoke_wait_for_irq_until_succeeds_before_deadline() -> TestResult {
         Poll::Pending => TestResult::Fail("post-IRQ poll still Pending"),
     }
 }
-kernel_test_in!("interrupts", smoke_wait_for_irq_until_succeeds_before_deadline);
+kernel_test_in!(
+    "interrupts",
+    smoke_wait_for_irq_until_succeeds_before_deadline
+);
 
 fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
     // Already-expired deadline → first poll returns Err(Elapsed)
@@ -1087,7 +1126,9 @@ fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     fn noop_wake(_: *const ()) {}
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
@@ -1130,7 +1171,9 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     fn noop_wake(_: *const ()) {}
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
@@ -1156,7 +1199,9 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
     let mut fut2 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
     let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
-        return TestResult::Fail("second wait first poll should be Pending — baseline snapshot leaked first IRQ");
+        return TestResult::Fail(
+            "second wait first poll should be Pending — baseline snapshot leaked first IRQ",
+        );
     }
     crate::on_irq(SCRATCH_VEC_WAIT_RETRY);
     let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
@@ -1179,14 +1224,19 @@ fn smoke_dispatch_fire_count_monotonic_under_many_irqs() -> TestResult {
     if after - before != N {
         let msg = alloc::format!(
             "fire_count delta {} != {} after {} on_irq calls",
-            after - before, N, N
+            after - before,
+            N,
+            N
         );
         let s: &'static str = alloc::boxed::Box::leak(msg.into_boxed_str());
         return TestResult::Fail(s);
     }
     TestResult::Pass
 }
-kernel_test_in!("interrupts", smoke_dispatch_fire_count_monotonic_under_many_irqs);
+kernel_test_in!(
+    "interrupts",
+    smoke_dispatch_fire_count_monotonic_under_many_irqs
+);
 
 // ── deep interrupts/ipi ──────────────────────────────────────────
 
@@ -1217,7 +1267,9 @@ fn smoke_ipi_handler_bumps_counters_on_self() -> TestResult {
     let ev_before = ever_received(cpu);
     // SAFETY: called from kernel-test context at CPL=0 with no
     // pending VA — handler skips the INVLPG path.
-    unsafe { on_shootdown_irq(); }
+    unsafe {
+        on_shootdown_irq();
+    }
     if ack_count(cpu) != ack_before + 1 {
         return TestResult::Fail("ack_count didn't increment by 1");
     }
@@ -1253,7 +1305,10 @@ fn smoke_hpet_oneshot_error_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_error_variants_distinct);
+kernel_test_in!(
+    "interrupts/hpet",
+    smoke_hpet_oneshot_error_variants_distinct
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_hpet_oneshot_pick_gsi_prefers_high_then_low() -> TestResult {
@@ -1285,7 +1340,10 @@ fn smoke_hpet_oneshot_pick_gsi_prefers_high_then_low() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_pick_gsi_prefers_high_then_low);
+kernel_test_in!(
+    "interrupts/hpet",
+    smoke_hpet_oneshot_pick_gsi_prefers_high_then_low
+);
 
 // ── deep interrupts/timer ────────────────────────────────────────
 
@@ -1311,7 +1369,10 @@ fn smoke_timer_pump_init_error_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/timer", smoke_timer_pump_init_error_variants_distinct);
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_timer_pump_init_error_variants_distinct
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_timer_pump_init_idempotent_after_first_success() -> TestResult {
@@ -1328,7 +1389,10 @@ fn smoke_timer_pump_init_idempotent_after_first_success() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/timer", smoke_timer_pump_init_idempotent_after_first_success);
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_timer_pump_init_idempotent_after_first_success
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_timer_pump_vector_matches_timer_constant() -> TestResult {
@@ -1336,7 +1400,7 @@ fn smoke_timer_pump_vector_matches_timer_constant() -> TestResult {
     // vector the dispatch path uses — the same value the BSP
     // wired into the IDT. Smoke test for "did init lose its
     // vector somewhere along the way".
-    use crate::x86_64::timer_pump::{is_initialised, __vector_for_test};
+    use crate::x86_64::timer_pump::{__vector_for_test, is_initialised};
     if !is_initialised() {
         return TestResult::Skip("timer pump not up");
     }
@@ -1347,7 +1411,10 @@ fn smoke_timer_pump_vector_matches_timer_constant() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/timer", smoke_timer_pump_vector_matches_timer_constant);
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_timer_pump_vector_matches_timer_constant
+);
 
 // ── tag-aware TLB-shootdown IPI (asid-pcid-isolation §4) ──────────
 //
@@ -1442,14 +1509,20 @@ fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_only_request_routes);
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_ipi_shootdown_tag_only_request_routes
+);
 
 #[cfg(not(target_arch = "x86_64"))]
 fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
     TestResult::Skip("aarch64 routes tag-only flush through inner-shareable TLBI")
 }
 #[cfg(not(target_arch = "x86_64"))]
-kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_only_request_routes);
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_ipi_shootdown_tag_only_request_routes
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_ipi_shootdown_tag_zero_uses_plain_invlpg() -> TestResult {
@@ -1473,19 +1546,27 @@ fn smoke_ipi_shootdown_tag_zero_uses_plain_invlpg() -> TestResult {
     // is already visible by the time we sample.
     let after = ipi::invpcid_path_taken();
     if after != before {
-        return TestResult::Fail("tag=0 shootdown took the INVPCID branch (should be plain INVLPG)");
+        return TestResult::Fail(
+            "tag=0 shootdown took the INVPCID branch (should be plain INVLPG)",
+        );
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_zero_uses_plain_invlpg);
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_ipi_shootdown_tag_zero_uses_plain_invlpg
+);
 
 #[cfg(not(target_arch = "x86_64"))]
 fn smoke_ipi_shootdown_tag_zero_uses_plain_invlpg() -> TestResult {
     TestResult::Skip("aarch64 doesn't expose an INVPCID-equivalent counter")
 }
 #[cfg(not(target_arch = "x86_64"))]
-kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_tag_zero_uses_plain_invlpg);
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_ipi_shootdown_tag_zero_uses_plain_invlpg
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_ipi_shootdown_handler_invpcid_path_taken() -> TestResult {
@@ -1513,11 +1594,17 @@ fn smoke_ipi_shootdown_handler_invpcid_path_taken() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_handler_invpcid_path_taken);
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_ipi_shootdown_handler_invpcid_path_taken
+);
 
 #[cfg(not(target_arch = "x86_64"))]
 fn smoke_ipi_shootdown_handler_invpcid_path_taken() -> TestResult {
     TestResult::Skip("INVPCID is x86_64-specific (ARM uses TLBI VAE1IS)")
 }
 #[cfg(not(target_arch = "x86_64"))]
-kernel_test_in!("interrupts/ipi", smoke_ipi_shootdown_handler_invpcid_path_taken);
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_ipi_shootdown_handler_invpcid_path_taken
+);

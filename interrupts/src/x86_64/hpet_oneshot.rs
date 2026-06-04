@@ -25,7 +25,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// Why an [`arm_oneshot`] call failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -191,7 +191,9 @@ pub unsafe fn arm_oneshot(deadline_ticks: u64, handler: fn()) -> Result<(), Hpet
     // before `narf_time::hpet::arm_oneshot` flips `Tn_INT_ENB_CNF`
     // because the line could fire as soon as that bit is set.
     let raw = handler as usize;
-    SLOT0.handler.store((raw & 0xFFFF_FFFF) as u32, Ordering::Release);
+    SLOT0
+        .handler
+        .store((raw & 0xFFFF_FFFF) as u32, Ordering::Release);
     SLOT0
         .handler_high
         .store(((raw >> 32) & 0xFFFF_FFFF) as u32, Ordering::Release);
