@@ -256,7 +256,10 @@ impl crate::HwmonDevice for K10temp {
 
 // ── PCI driver registration ───────────────────────────────────────────
 
-fn probe_k10temp(dev: narf_bus::BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
+fn probe_k10temp(
+    dev: narf_bus::BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), ProbeError> {
     use core::fmt::Write as _;
     let (bus, slot, func) = match dev.kind {
         narf_bus::BusKind::Pcie { addr, .. } => (addr.bus, addr.device, addr.function),
@@ -266,7 +269,10 @@ fn probe_k10temp(dev: narf_bus::BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Re
     let _ = writeln!(
         narf_console::Writer,
         "  k10temp: {} at {:02x}:{:02x}.{} probed",
-        chip.description, bus, slot, func
+        chip.description,
+        bus,
+        slot,
+        func
     );
     registry::register(registry::RegisteredSensor {
         name: "k10temp",

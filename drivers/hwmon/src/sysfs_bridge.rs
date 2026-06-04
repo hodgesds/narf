@@ -47,7 +47,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr};
+use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
 use crate::HwmonDevice;
 
@@ -70,8 +70,10 @@ enum LabelKind {
 /// `'C'` which map to temperature.
 fn classify_label(dev: &dyn HwmonDevice, label: &str) -> Option<LabelKind> {
     // Heuristic first: nct6775 and dell_smm use systematic prefixes.
-    if label.starts_with("temp") || label.starts_with('T')
-        || label.starts_with("Core") || label.starts_with("Package")
+    if label.starts_with("temp")
+        || label.starts_with('T')
+        || label.starts_with("Core")
+        || label.starts_with("Package")
         || matches!(label, "cpu" | "gpu" | "hdd" | "ambient")
     {
         return Some(LabelKind::Temp);
@@ -238,11 +240,9 @@ fn add_fan_attrs(
     {
         let attr_name = intern(format!("fan{}_input", n));
         let dev2 = dev.clone();
-        kobject_add_attr(kobj, attr_name, move || {
-            match dev2.read_fan(label_owned) {
-                Some(rpm) => format!("{}\n", rpm),
-                None => "0\n".into(),
-            }
+        kobject_add_attr(kobj, attr_name, move || match dev2.read_fan(label_owned) {
+            Some(rpm) => format!("{}\n", rpm),
+            None => "0\n".into(),
         });
     }
 

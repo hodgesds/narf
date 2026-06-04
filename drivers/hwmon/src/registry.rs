@@ -37,8 +37,7 @@ pub struct RegisteredSensor {
     pub bus_loc: &'static str,
 }
 
-static REGISTRY: IrqSafeSpinLock<Vec<RegisteredSensor>> =
-    IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<Vec<RegisteredSensor>> = IrqSafeSpinLock::new(Vec::new());
 
 static DEVICE_REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn crate::HwmonDevice + Send + Sync>>> =
     IrqSafeSpinLock::new(Vec::new());
