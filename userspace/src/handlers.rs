@@ -1963,6 +1963,402 @@ fn sys_newfstatat(ctx: &mut dyn TrapContext) {
     sys_stat(&mut proxy);
 }
 
+// ── statx — Linux statx(2) wire-shape ─────────────────────────────
+//
+// statx(dirfd, path, flags, mask, statxbuf). 256-byte struct with
+// 64-bit ns-precision timestamps and a request mask. The mask is
+// advisory — Linux fills more than asked when cheap, fills less
+// when the field isn't available, and reports what was filled in
+// `stx_mask`. NARF's filesystem layer only carries size/blocks/
+// mode/mtime_cycles, so we fill those plus type/ino, and set
+// `stx_mask` to STATX_BASIC_STATS minus the fields we cannot
+// produce (atime/ctime/uid/gid/nlink).
+//
+// Gated behind `linux-compat` so a NARF-only userspace doesn't
+// pay the size cost of the layout assertion or pull in the
+// Linux-shaped constants.
+
+#[cfg(feature = "linux-compat")]
+pub mod linux_compat {
+    //! Linux x86_64 ABI shapes for stat / statx. Layout-checked
+    //! against the upstream uapi at compile time via const asserts.
+
+    use core::mem::{align_of, size_of};
+
+    // ── stat (Linux x86_64) — 144 bytes ──────────────────────────
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Timespec {
+        pub tv_sec: i64,
+        pub tv_nsec: i64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Stat {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_nlink: u64,
+        pub st_mode: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub __pad0: u32,
+        pub st_rdev: u64,
+        pub st_size: i64,
+        pub st_blksize: i64,
+        pub st_blocks: i64,
+        pub st_atim: Timespec,
+        pub st_mtim: Timespec,
+        pub st_ctim: Timespec,
+        pub __unused: [i64; 3],
+    }
+
+    const _: () = assert!(size_of::<Stat>() == 144);
+    const _: () = assert!(align_of::<Stat>() == 8);
+
+    // ── statx (kernel uapi) — 256 bytes ──────────────────────────
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct StatxTimestamp {
+        pub tv_sec: i64,
+        pub tv_nsec: u32,
+        pub __reserved: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Statx {
+        pub stx_mask: u32,
+        pub stx_blksize: u32,
+        pub stx_attributes: u64,
+        pub stx_nlink: u32,
+        pub stx_uid: u32,
+        pub stx_gid: u32,
+        pub stx_mode: u16,
+        pub __spare0: [u16; 1],
+        pub stx_ino: u64,
+        pub stx_size: u64,
+        pub stx_blocks: u64,
+        pub stx_attributes_mask: u64,
+        pub stx_atime: StatxTimestamp,
+        pub stx_btime: StatxTimestamp,
+        pub stx_ctime: StatxTimestamp,
+        pub stx_mtime: StatxTimestamp,
+        pub stx_rdev_major: u32,
+        pub stx_rdev_minor: u32,
+        pub stx_dev_major: u32,
+        pub stx_dev_minor: u32,
+        pub stx_mnt_id: u64,
+        pub stx_dio_mem_align: u32,
+        pub stx_dio_offset_align: u32,
+        pub __spare3: [u64; 12],
+    }
+
+    const _: () = assert!(size_of::<Statx>() == 256);
+    const _: () = assert!(align_of::<Statx>() == 8);
+
+    // ── Mask bits (linux/stat.h) ─────────────────────────────────
+    pub const STATX_TYPE: u32 = 0x0001;
+    pub const STATX_MODE: u32 = 0x0002;
+    pub const STATX_NLINK: u32 = 0x0004;
+    pub const STATX_UID: u32 = 0x0008;
+    pub const STATX_GID: u32 = 0x0010;
+    pub const STATX_ATIME: u32 = 0x0020;
+    pub const STATX_MTIME: u32 = 0x0040;
+    pub const STATX_CTIME: u32 = 0x0080;
+    pub const STATX_INO: u32 = 0x0100;
+    pub const STATX_SIZE: u32 = 0x0200;
+    pub const STATX_BLOCKS: u32 = 0x0400;
+    pub const STATX_BASIC_STATS: u32 = 0x07ff;
+    pub const STATX_BTIME: u32 = 0x0800;
+    pub const STATX_MNT_ID: u32 = 0x1000;
+
+    // ── Flag bits (fcntl.h AT_*) ─────────────────────────────────
+    pub const AT_FDCWD: i32 = -100;
+    pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    pub const AT_NO_AUTOMOUNT: u32 = 0x800;
+    pub const AT_EMPTY_PATH: u32 = 0x1000;
+    pub const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+}
+
+// Build a Linux-shaped struct stat from a `narf_filesystem::Stat`.
+// Same conventions as sys_statx (uid/gid/atime not tracked).
+#[cfg(feature = "linux-compat")]
+fn linux_stat_from_fs(s: narf_filesystem::Stat) -> linux_compat::Stat {
+    let ftype_bits: u32 = match s.mode.file_type {
+        narf_filesystem::FileType::File => 0o100000,
+        narf_filesystem::FileType::Dir => 0o040000,
+        narf_filesystem::FileType::Symlink => 0o120000,
+        narf_filesystem::FileType::Special => 0o020000,
+    };
+    let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
+    let cpns = narf_time::cycles_per_ns().max(1) as u64;
+    let mtime_ns = s.mtime_cycles / cpns;
+    let mtime = linux_compat::Timespec {
+        tv_sec: (mtime_ns / 1_000_000_000) as i64,
+        tv_nsec: (mtime_ns % 1_000_000_000) as i64,
+    };
+    linux_compat::Stat {
+        st_dev: 0,
+        st_ino: (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff,
+        st_nlink: 1,
+        st_mode: mode_word,
+        st_uid: 0,
+        st_gid: 0,
+        __pad0: 0,
+        st_rdev: 0,
+        st_size: s.size as i64,
+        st_blksize: 4096,
+        st_blocks: s.blocks as i64,
+        st_atim: mtime,
+        st_mtim: mtime,
+        st_ctim: mtime,
+        __unused: [0; 3],
+    }
+}
+
+// Linux-ABI sys_stat: writes a 144-byte `struct stat`. Same path-
+// resolution as the NARF-shape sys_stat, only the wire layout
+// changes.
+#[cfg(feature = "linux-compat")]
+fn sys_stat_linux(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_ptr = args.arg0;
+    let path_len = args.arg1 as usize;
+    let out_ptr = args.arg2 as *mut linux_compat::Stat;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let path_owned = match copy_user_path(path_ptr, path_len) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let path: &str = &path_owned;
+    let ops = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
+    let ops = match ops {
+        Some(o) => o,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let out = linux_stat_from_fs(ops.stat());
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            &out as *const linux_compat::Stat as *const u8,
+            core::mem::size_of::<linux_compat::Stat>(),
+        )
+    };
+    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+#[cfg(feature = "linux-compat")]
+fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let out_ptr = args.arg1 as *mut linux_compat::Stat;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let stat = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.stat()));
+    let s = match stat {
+        Some(Some(s)) => s,
+        _ => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let out = linux_stat_from_fs(s);
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            &out as *const linux_compat::Stat as *const u8,
+            core::mem::size_of::<linux_compat::Stat>(),
+        )
+    };
+    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// newfstatat under linux-compat: reshape args then delegate.
+#[cfg(feature = "linux-compat")]
+fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _dirfd = args.arg0;
+    let path_ptr = args.arg1;
+    let path_len = args.arg2;
+    let stat_out = args.arg3;
+    let _flags = args.arg4;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args: SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: SyscallArgs {
+            arg0: path_ptr,
+            arg1: path_len,
+            arg2: stat_out,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+    };
+    sys_stat_linux(&mut proxy);
+}
+
+#[cfg(feature = "linux-compat")]
+fn sys_statx(ctx: &mut dyn TrapContext) {
+    use linux_compat::*;
+    let args = *ctx.args();
+    let dirfd = args.arg0 as i32;
+    let path_ptr = args.arg1;
+    let path_len = args.arg2 as usize;
+    let flags = args.arg3 as u32;
+    let mask = args.arg4 as u32;
+    let out_ptr = args.arg5 as *mut Statx;
+
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+
+    // AT_EMPTY_PATH + path_len == 0 → operate on dirfd directly.
+    let empty = (flags & AT_EMPTY_PATH) != 0 && path_len == 0;
+
+    // Resolve to a FileOps. Three cases:
+    //   1. empty + dirfd >= 0       → look up fd
+    //   2. path absolute            → registry walk (dirfd ignored
+    //                                  beyond requiring AT_FDCWD or
+    //                                  a real fd; NARF has no per-
+    //                                  task cwd so non-AT_FDCWD
+    //                                  relative paths fail)
+    //   3. otherwise                → fail
+    let fs_stat = if empty {
+        if dirfd < 0 {
+            ctx.set_return(fail);
+            return;
+        }
+        let task = current_task_id();
+        fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.stat()))
+            .flatten()
+    } else {
+        let path_owned = match copy_user_path(path_ptr, path_len) {
+            Some(s) => s,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        if !path_owned.starts_with('/') {
+            // NARF has no per-task cwd; only absolute paths resolve.
+            ctx.set_return(fail);
+            return;
+        }
+        let path: &str = &path_owned;
+        narf_filesystem::registry()
+            .resolve_absolute(path, |fs, rel| {
+                narf_filesystem::resolve(fs.root(), rel).ok()
+            })
+            .flatten()
+            .map(|ops| ops.stat())
+    };
+
+    let s = match fs_stat {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+
+    let ftype_bits: u16 = match s.mode.file_type {
+        narf_filesystem::FileType::File => 0o100000,
+        narf_filesystem::FileType::Dir => 0o040000,
+        narf_filesystem::FileType::Symlink => 0o120000,
+        narf_filesystem::FileType::Special => 0o020000,
+    };
+    let mode_word: u16 = ftype_bits | (s.mode.perms & 0o7777);
+
+    // mtime: monotonic cycles → ns via the wall-clock calibration.
+    // Wall-clock per inode isn't tracked, so this surfaces a
+    // stable monotonic ordering, not a real wall time.
+    let cpns = narf_time::cycles_per_ns().max(1) as u64;
+    let mtime_ns = s.mtime_cycles / cpns;
+    let mtime = StatxTimestamp {
+        tv_sec: (mtime_ns / 1_000_000_000) as i64,
+        tv_nsec: (mtime_ns % 1_000_000_000) as u32,
+        __reserved: 0,
+    };
+
+    let mut out = Statx::default();
+    out.stx_blksize = 4096;
+    out.stx_mode = mode_word;
+    out.stx_size = s.size;
+    out.stx_blocks = s.blocks;
+    out.stx_mtime = mtime;
+    out.stx_ctime = mtime;
+    out.stx_ino = (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff;
+    out.stx_nlink = 1;
+
+    // Honour the request mask but only advertise what we filled.
+    // STATX_BASIC_STATS = type|mode|nlink|uid|gid|atime|mtime|
+    // ctime|ino|size|blocks. We fill type/mode/nlink/ino/size/
+    // blocks/mtime/ctime; uid/gid/atime aren't tracked.
+    let filled = STATX_TYPE
+        | STATX_MODE
+        | STATX_NLINK
+        | STATX_INO
+        | STATX_SIZE
+        | STATX_BLOCKS
+        | STATX_MTIME
+        | STATX_CTIME;
+    out.stx_mask = filled & if mask == 0 { filled } else { mask | STATX_BASIC_STATS & filled };
+
+    // SAFETY: Statx is repr(C) POD; bytes are valid for read.
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            &out as *const Statx as *const u8,
+            core::mem::size_of::<Statx>(),
+        )
+    };
+    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── openat — *at-keyed open ────────────────────────────────────────
 //
 // Linux openat(dirfd, path, flags, mode) — modern replacement for
@@ -11005,9 +11401,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Dup3, "dup3", RawFnHandler(sys_dup3));
     table.install_raw(Syscall::Fcntl, "fcntl", RawFnHandler(sys_fcntl));
     table.install_raw(Syscall::Ioctl, "ioctl", RawFnHandler(sys_ioctl));
-    table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
-    table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
-    table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
+        table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
+        table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
+    }
+    #[cfg(feature = "linux-compat")]
+    {
+        table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat_linux));
+        table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat_linux));
+        table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat_linux));
+    }
     table.install_raw(Syscall::Pipe, "pipe", RawFnHandler(sys_pipe));
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
     table.install_raw(Syscall::Truncate, "truncate", RawFnHandler(sys_truncate));
@@ -11054,11 +11459,20 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_fchmodat_or_fchownat),
     );
     table.install_raw(Syscall::Openat, "openat", RawFnHandler(sys_openat));
+    #[cfg(not(feature = "linux-compat"))]
     table.install_raw(
         Syscall::Newfstatat,
         "newfstatat",
         RawFnHandler(sys_newfstatat),
     );
+    #[cfg(feature = "linux-compat")]
+    table.install_raw(
+        Syscall::Newfstatat,
+        "newfstatat",
+        RawFnHandler(sys_newfstatat_linux),
+    );
+    #[cfg(feature = "linux-compat")]
+    table.install_raw(Syscall::Statx, "statx", RawFnHandler(sys_statx));
     table.install_raw(Syscall::Unlinkat, "unlinkat", RawFnHandler(sys_unlinkat));
     table.install_raw(Syscall::Mkdirat, "mkdirat", RawFnHandler(sys_mkdirat));
     table.install_raw(Syscall::Renameat, "renameat", RawFnHandler(sys_renameat));
