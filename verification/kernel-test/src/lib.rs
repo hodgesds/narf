@@ -74,8 +74,12 @@ pub fn tests() -> &'static [KernelTest] {
     // boundaries of the `narf.tests` section. The section contains
     // zero or more `KernelTest` structs and nothing else (the
     // `kernel_test!` / `kernel_test_in!` macros are the only writers).
-    let start = unsafe { &__narf_tests_start as *const KernelTest };
-    let end = unsafe { &__narf_tests_end as *const KernelTest };
+    let (start, end) = unsafe {
+        (
+            &__narf_tests_start as *const KernelTest,
+            &__narf_tests_end as *const KernelTest,
+        )
+    };
     let len = (end as usize - start as usize) / core::mem::size_of::<KernelTest>();
     // SAFETY: `start` and `len` derived from the linker symbols.
     unsafe { core::slice::from_raw_parts(start, len) }
