@@ -18,6 +18,7 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-scheduler    = { path = "../scheduler" }
 narf-memory       = { path = "../memory" }
 narf-io           = { path = "../io" }
+narf-arch         = { path = "../arch" }
 
 [lints]
 workspace = true
