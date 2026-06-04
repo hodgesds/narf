@@ -41,6 +41,15 @@ fn main() {
     println!("cargo:rerun-if-changed=../userspace/shell/src/parser.rs");
     println!("cargo:rerun-if-changed=../userspace/shell/shell.ld");
     println!("cargo:rerun-if-changed=../userspace/shell/Cargo.toml");
+    // Wave-49: coreutils baked alongside init/shell so the
+    // boot-init path can seed /bin/<name> in a kernel-side MemFs
+    // (no Limine initramfs CPIO module is delivered under
+    // `qemu -kernel`).
+    for name in ["echo", "pwd", "cat", "ls", "ps"] {
+        println!("cargo:rerun-if-changed=../userspace/coreutils/{name}/src/main.rs");
+        println!("cargo:rerun-if-changed=../userspace/coreutils/{name}/{name}.ld");
+        println!("cargo:rerun-if-changed=../userspace/coreutils/{name}/Cargo.toml");
+    }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace = manifest_dir.parent().unwrap().to_path_buf();
@@ -122,6 +131,35 @@ fn main() {
             "NARF_SHELL_ELF_AARCH64",
             "shell",
         );
+
+        // Wave-49: coreutils — per-arch env vars
+        // NARF_COREUTIL_<UPPER>_ELF_<ARCH>. The kernel includes the
+        // bytes via include_bytes! in lib.rs and seeds /bin/<name>
+        // at boot.
+        for name in ["echo", "pwd", "cat", "ls", "ps"] {
+            let crate_dir = workspace.join("userspace").join("coreutils").join(name);
+            let upper = name.to_uppercase();
+            build_arch(
+                &crate_dir,
+                &out_dir.join(format!("coreutil-{name}-target-x86_64")),
+                "x86_64-unknown-none",
+                &crate_dir.join(format!("{name}.ld")),
+                Some("code-model=large"),
+                &format!("NARF_COREUTIL_{upper}_ELF_X86_64"),
+                name,
+            );
+            // aarch64 reuses testbin's linker; the env var must
+            // resolve to something cargo can stat, hence the build.
+            build_arch(
+                &crate_dir,
+                &out_dir.join(format!("coreutil-{name}-target-aarch64")),
+                "aarch64-unknown-none",
+                &testbin_dir.join("testbin-aarch64.ld"),
+                None,
+                &format!("NARF_COREUTIL_{upper}_ELF_AARCH64"),
+                name,
+            );
+        }
     } else {
         // Placeholders so include_bytes!() on the consumer side
         // resolves cleanly even when neither feature is enabled.
@@ -129,6 +167,10 @@ fn main() {
         println!("cargo:rustc-env=NARF_INIT_ELF_AARCH64=/dev/null");
         println!("cargo:rustc-env=NARF_SHELL_ELF_X86_64=/dev/null");
         println!("cargo:rustc-env=NARF_SHELL_ELF_AARCH64=/dev/null");
+        for upper in ["ECHO", "PWD", "CAT", "LS", "PS"] {
+            println!("cargo:rustc-env=NARF_COREUTIL_{upper}_ELF_X86_64=/dev/null");
+            println!("cargo:rustc-env=NARF_COREUTIL_{upper}_ELF_AARCH64=/dev/null");
+        }
     }
 
 

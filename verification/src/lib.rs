@@ -3645,6 +3645,35 @@ pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_X86_64"));
 #[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
 pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_AARCH64"));
 
+// Wave-49: baked coreutil ELFs. boot-init mounts a MemFs at /bin
+// and seeds these as files so the shell's fork+exec `/bin/<name>`
+// resolves under `qemu -kernel` (no Limine initramfs CPIO module
+// is delivered there).
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_ECHO_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_ECHO_ELF_AARCH64"));
+
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_PWD_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PWD_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_PWD_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PWD_ELF_AARCH64"));
+
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_CAT_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_CAT_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_CAT_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_CAT_ELF_AARCH64"));
+
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_LS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_LS_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_LS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_LS_ELF_AARCH64"));
+
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_ELF_AARCH64"));
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
 fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Load the real Rust no_std binary `narf-testbin` into a fresh
