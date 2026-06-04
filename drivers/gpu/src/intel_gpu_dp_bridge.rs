@@ -384,6 +384,8 @@ pub mod tests {
             h_sync_width: 44,
             v_sync_offset: 4,
             v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
         };
         let mode = super::detailed_timing_to_mode(&dt);
         if mode.h_active != 1920 || mode.v_active != 1080 {
@@ -427,6 +429,8 @@ pub mod tests {
             h_sync_width: 5,
             v_sync_offset: 0,
             v_sync_width: 0,
+            h_sync_positive: true,
+            v_sync_positive: true,
         };
         let mode = super::detailed_timing_to_mode(&dt);
         if mode.h_total != u16::MAX {
