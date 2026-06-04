@@ -985,6 +985,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-filesystem",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
@@ -1706,6 +1707,7 @@ dependencies = [
 name = "narf-ipc"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-capabilities",
  "narf-io",
  "narf-kernel-test",
