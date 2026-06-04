@@ -173,7 +173,6 @@ fn main() {
         }
     }
 
-
     let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
     if libc_validate_enabled {
         let validate_dir = workspace.join("narf-libc").join("validate");

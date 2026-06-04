@@ -38,33 +38,23 @@ extern crate alloc;
 // needed to keep the unit alive.
 extern crate narf_observability;
 #[used]
-static __FORCE_LINK_OBS: fn() -> usize = || {
-    narf_observability::install_count()
-};
+static __FORCE_LINK_OBS: fn() -> usize = || narf_observability::install_count();
 
 extern crate narf_drivers_sound;
 #[used]
-static __FORCE_LINK_SOUND: fn() -> usize = || {
-    narf_drivers_sound::card_count()
-};
+static __FORCE_LINK_SOUND: fn() -> usize = || narf_drivers_sound::card_count();
 
 extern crate narf_drivers_hwmon;
 #[used]
-static __FORCE_LINK_HWMON: fn() -> usize = || {
-    narf_drivers_hwmon::registry::count()
-};
+static __FORCE_LINK_HWMON: fn() -> usize = || narf_drivers_hwmon::registry::count();
 
 extern crate narf_drivers_extcon;
 #[used]
-static __FORCE_LINK_EXTCON: fn() -> usize = || {
-    narf_drivers_extcon::class::device_count()
-};
+static __FORCE_LINK_EXTCON: fn() -> usize = || narf_drivers_extcon::class::device_count();
 
 extern crate narf_modules;
 #[used]
-static __FORCE_LINK_MODULES: fn() -> usize = || {
-    narf_modules::registry::len()
-};
+static __FORCE_LINK_MODULES: fn() -> usize = || narf_modules::registry::len();
 
 // narf-crypto contributes the `crypto/p256`, `crypto/aes_ctr`, and
 // other crypto-subsystem smokes via `kernel_test_in!`. Nothing in
@@ -73,8 +63,7 @@ static __FORCE_LINK_MODULES: fn() -> usize = || {
 // it with a `#[used]` static touching `blake3_hash`.
 extern crate narf_crypto;
 #[used]
-static __FORCE_LINK_CRYPTO: fn() -> usize =
-    || narf_crypto::blake3_hash(&[]).len();
+static __FORCE_LINK_CRYPTO: fn() -> usize = || narf_crypto::blake3_hash(&[]).len();
 
 use core::fmt::Write;
 
@@ -156,7 +145,12 @@ pub fn run_all() -> Summary {
                 let _ = writeln!(
                     Writer,
                     "  [BUDDY-CORRUPT after {}/{}] zone {} frame {:#x} order {} vs {}",
-                    t.subsystem, t.name, zone, frame_no << narf_memory::PAGE_SHIFT, oa, ob,
+                    t.subsystem,
+                    t.name,
+                    zone,
+                    frame_no << narf_memory::PAGE_SHIFT,
+                    oa,
+                    ob,
                 );
             }
         }
@@ -630,7 +624,6 @@ kernel_test!(smoke_x86_64_shoot_range_one_ipi);
 
 // `smoke_sleep_future_waits` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
-
 // `smoke_tracing_note_section_present` migrated to tracing/src/tests.rs (subsystem `"tracing"`).
 
 // `smoke_tracing_flight_ring_basic` migrated to tracing/src/tests.rs (subsystem `"tracing"`).
@@ -759,7 +752,6 @@ fn smoke_virtio_mmio_probe() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test!(smoke_virtio_mmio_probe);
 
-
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_mmio_probe() -> TestResult {
     // x86_64 under QEMU q35 has no virtio-mmio transports (virtio
@@ -779,7 +771,6 @@ fn smoke_virtio_mmio_probe() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_virtio_mmio_probe);
-
 
 fn smoke_virtio_mmio_wrong_magic() -> TestResult {
     // Synthesise a fake MMIO window on the stack: a zeroed u32 at
@@ -811,7 +802,6 @@ fn smoke_virtio_mmio_wrong_magic() -> TestResult {
     }
 }
 kernel_test!(smoke_virtio_mmio_wrong_magic);
-
 
 // ── Stage-3 exit-gate integration ──────────────────────────────────
 //
@@ -866,9 +856,8 @@ fn smoke_block_device_trait() -> TestResult {
         return TestResult::Fail("DMA alloc failed");
     };
     let cap_w = register_with_cap(buf);
-    let cap: narf_capabilities::Cap<narf_io::DmaBuffer, Read> = cap_w
-        .derive::<Read>()
-        .expect("derive Read from Write");
+    let cap: narf_capabilities::Cap<narf_io::DmaBuffer, Read> =
+        cap_w.derive::<Read>().expect("derive Read from Write");
 
     let req = BlockRequest {
         op: BlockOp::Read,
@@ -931,9 +920,8 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
             return;
         };
         let cap_w = register_with_cap(buf);
-        let cap: narf_capabilities::Cap<narf_io::DmaBuffer, Read> = cap_w
-            .derive::<Read>()
-            .expect("derive Read from Write");
+        let cap: narf_capabilities::Cap<narf_io::DmaBuffer, Read> =
+            cap_w.derive::<Read>().expect("derive Read from Write");
 
         let req = BlockRequest {
             op: BlockOp::Read,
@@ -1429,18 +1417,13 @@ kernel_test!(smoke_pci_probe_all_dispatches_nvme);
 
 // `smoke_syscall_versioning_dispatch` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_pci_cap_walker_finds_msix` migrated to bus/src/tests.rs (subsystem `"bus"`).
-
 
 // `smoke_pci_express_cap_link_status` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-
 // `smoke_vector_alloc_block_contiguous` migrated to interrupts/src/tests.rs (subsystem `"interrupts"`).
 
-
 // `smoke_msix_program_block` migrated to bus/src/tests.rs (subsystem `"bus"`).
-
 
 // `smoke_pci_cap_ext_walker` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
@@ -1465,7 +1448,6 @@ kernel_test!(smoke_pci_probe_all_dispatches_nvme);
 // (subsystem `drivers/storage/ahci`).
 // `smoke_block_registry_uniform_read` migrated to block/src/tests.rs (subsystem `"block"`).
 
-
 // xhci/msc/hid smokes migrated to `drivers/usb/src/tests.rs`
 // (subsystems `drivers/usb/xhci`, `drivers/usb/msc`, `drivers/usb/hid`).
 
@@ -1473,10 +1455,7 @@ kernel_test!(smoke_pci_probe_all_dispatches_nvme);
 
 // `smoke_net_ipv4_checksum` migrated to net/src/tests.rs (subsystem `"net"`).
 
-
 // `smoke_net_icmp_echo_builder` migrated to net/src/tests.rs (subsystem `"net"`).
-
-
 #[cfg(target_arch = "x86_64")]
 fn smoke_net_e1000_arp_round_trip() -> TestResult {
     // Build an ARP request via the new pkt builders, transmit via
@@ -1522,21 +1501,15 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_net_e1000_arp_round_trip);
 
-
 // `smoke_bound_drivers_inventory` migrated to drivers/src/tests.rs (subsystem `"drivers"`).
-
 
 // `smoke_slab_alloc_free_round_trip` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-
 // `smoke_slab_class_picker` migrated to memory/src/tests.rs (subsystem `"memory"`).
-
 
 // `smoke_slab_stats_advance` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-
 // `smoke_slab_magazine_hot_path` migrated to memory/src/tests.rs (subsystem `"memory"`).
-
 
 fn smoke_percpu_current_id() -> TestResult {
     // Single-CPU today — current_cpu_id() must return 0 on the BSP.
@@ -1550,9 +1523,7 @@ kernel_test!(smoke_percpu_current_id);
 
 // `smoke_percpu_storage_isolation` migrated to lib/src/tests.rs (subsystem `"lib"`).
 
-
 // `smoke_aarch64_mpidr_aff_present` migrated to arch/src/tests.rs (subsystem `"arch"`).
-
 
 fn smoke_smp_bsp_baseline() -> TestResult {
     use narf_lib::smp;
@@ -1817,18 +1788,13 @@ kernel_test!(smoke_smp_x86_64_cpuid_count);
 
 // `smoke_acpi_srat_topology_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-
 // `smoke_acpi_srat_memory_node_lookup` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
-
 
 // `smoke_acpi_srat_synthetic_lapic_entry` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-
 // `smoke_acpi_madt_topology_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-
 // `smoke_acpi_mcfg_ecam_base` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
-
 
 // `smoke_aml_namespace_built_at_boot` migrated to aml/src/tests.rs (subsystem `"aml"`).
 // `smoke_aml_synthetic_scope_and_name` migrated to aml/src/tests.rs (subsystem `"aml"`).
@@ -1838,9 +1804,7 @@ kernel_test!(smoke_smp_x86_64_cpuid_count);
 // `smoke_aml_eval_while_increment` migrated to aml/src/tests.rs (subsystem `"aml"`).
 // `smoke_aml_eval_multiply_arg` migrated to aml/src/tests.rs (subsystem `"aml"`).
 
-
 // `smoke_frame_alloc_per_node_distribution` migrated to memory/src/tests.rs (subsystem `"memory"`).
-
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
@@ -1918,21 +1882,15 @@ kernel_test!(smoke_frame_free_routes_to_owning_node);
 
 // `smoke_acpi_hmat_latency_lookup` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-
 // `smoke_acpi_hmat_mem_attrs_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
-
 
 // `smoke_acpi_pmtt_synthetic_dimm_entry` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-
 // `smoke_acpi_srat_synthetic_memory_entry` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
-
 
 // `smoke_scheduler_per_cpu_pin_to_bsp` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
-
 // `smoke_scheduler_numa_steal_prefers_same_node` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
-
 
 // `smoke_scheduler_steal_disabled_returns_clean` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
@@ -1965,78 +1923,53 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
-
 // `smoke_memory_address_space_materialize` migrated to memory/src/tests.rs (subsystem `"memory"`).
-
 
 // `smoke_scheduler_spawn_user_carries_address_space` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
-
 // `smoke_ipc_mpsc_multi_producer_roundtrip` migrated to ipc/src/tests.rs (subsystem `"ipc"`).
-
 
 // `smoke_ipc_mpsc_closed_surfaces` migrated to ipc/src/tests.rs (subsystem `"ipc"`).
 
-
 // `smoke_memory_address_space_region_table` migrated to memory/src/tests.rs (subsystem `"memory"`).
-
 
 // `smoke_abi_dispatcher_serves_file_ops` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_abi_dispatcher_serves_mmap` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_spawn_dispatcher_for_helper` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_shared_ring_kick_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_bootstrap_rings_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_bootstrap_returns_config_page` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_brk_grows_heap` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_clock_gettime_writes_timespec` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_sigaction_records_handler` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_signal_delivery` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_chdir_getcwd_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_sleep_advances_time` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_synchronous_signal_delivery` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_filesystem_resolve_absolute_picks_longest_prefix` migrated to filesystem/src/tests.rs (subsystem `"filesystem"`).
-
 
 // `smoke_filesystem_memfs_unlink_round_trip` migrated to filesystem/src/tests.rs (subsystem `"filesystem"`).
 
-
 // `smoke_userspace_open_routes_through_vfs` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_symlink_create_and_readlink_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_readlink_on_non_symlink_fails` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_read_write_routes_through_fd_table` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // ── Tier-2 fd-table breadth smokes ─────────────────────────────────
 //
@@ -2048,42 +1981,29 @@ kernel_test!(smoke_drivers_net_nic_model_ids);
 
 // `smoke_userspace_dup_clones_fd` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_fcntl_flags_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_stat_returns_size` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_pipe_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_fd_table_roundtrip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_install_core_syscalls_fills_table` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_load_user_process_builds_runnable_image` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_load_user_process_with_argv` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_load_user_process_with_interp` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_parse_pt_tls` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_apply_relative_relocations` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_apply_symbol_relocations` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_unresolved_symbol_errors` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 /// Builder shared by the two `_carries_name` smokes: lays out a
 /// minimal ELF with PT_LOAD + PT_DYNAMIC, one Elf64_Rela entry
@@ -2093,31 +2013,21 @@ kernel_test!(smoke_drivers_net_nic_model_ids);
 #[cfg(target_arch = "x86_64")]
 // `build_unresolved_named_elf` helper migrated to userspace/src/tests.rs.
 
-
 // `smoke_userspace_unresolved_symbol_carries_name` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_unresolved_symbol_name_truncates` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_init_sysv_stack_layout` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_load_elf_bytes_end_to_end` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_load_multi_segment` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_loader_into_address_space` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_parse_minimal_elf64` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_syscall_table_roundtrip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
     // Read the GDT directly via SGDT and inspect the access byte
@@ -2418,7 +2328,6 @@ kernel_test!(smoke_frame_aarch64_svc_dispatches_through_global);
 
 // `smoke_userspace_syscall_dispatch_via_global` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // The end-to-end user-mode round-trip test below boots a real user
 // process, issues `int 0x80`, and longjmps back into the harness.
 // It *works* — on a standalone run it prints [OK] and the magic
@@ -2698,10 +2607,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     //   jmp $                       ; 2 bytes
     let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code_bytes: [u8; 21] = [
-        0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3],
-        0x48, 0xBF, 0x0D, 0xF0, 0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA,
-        0xCD, 0x80,
-        0xEB, 0xFE,
+        0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], 0x48, 0xBF, 0x0D, 0xF0,
+        0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA, 0xCD, 0x80, 0xEB, 0xFE,
     ];
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -3633,45 +3540,87 @@ const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF_X86_64"));
 #[cfg(all(target_arch = "aarch64", feature = "user-mode-testbin"))]
 const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF_AARCH64"));
 
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_INIT_ELF: &[u8] = include_bytes!(env!("NARF_INIT_ELF_X86_64"));
 
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_INIT_ELF: &[u8] = include_bytes!(env!("NARF_INIT_ELF_AARCH64"));
 
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_X86_64"));
 
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_AARCH64"));
 
 // Wave-49: baked coreutil ELFs. boot-init mounts a MemFs at /bin
 // and seeds these as files so the shell's fork+exec `/bin/<name>`
 // resolves under `qemu -kernel` (no Limine initramfs CPIO module
 // is delivered there).
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_ECHO_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_ECHO_ELF_AARCH64"));
 
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_PWD_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PWD_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_PWD_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PWD_ELF_AARCH64"));
 
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_CAT_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_CAT_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_CAT_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_CAT_ELF_AARCH64"));
 
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_LS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_LS_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_LS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_LS_ELF_AARCH64"));
 
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_ELF_AARCH64"));
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
@@ -4167,120 +4116,79 @@ kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
 
 // `smoke_userspace_raw_handler_dispatch` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_process_id_and_aux` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_obs_gdb_packet_checksum` migrated to observability/src/tests.rs (subsystem `"observability"`).
 
-
-
 // `smoke_obs_gdb_attach_not_implemented` migrated to observability/src/tests.rs (subsystem `"observability"`).
-
-
 
 // `smoke_obs_peek_provider_registration` migrated to observability/src/tests.rs (subsystem `"observability"`).
 
-
-
 // `smoke_time_wall_offset_and_leap_smear` migrated to time/src/tests.rs (subsystem `"time"`).
-
 
 // `smoke_power_thermal_zone_transitions` migrated to power/src/tests.rs (subsystem `"power"`).
 
-
 // `smoke_power_energy_aware_governor` migrated to power/src/tests.rs (subsystem `"power"`).
-
 
 // `smoke_block_mq_round_robins_across_lanes` migrated to block/src/tests.rs (subsystem `"block"`).
 
-
 // `smoke_block_deadline_tags_are_monotonic` migrated to block/src/tests.rs (subsystem `"block"`).
-
 
 // `smoke_userspace_getrandom_fills_buffer` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_listdir_walks_memfs` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_clock_gettime_distinguishes_clocks` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_setuid_setgid_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_hostname_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_ftruncate_grows_and_shrinks_memfile` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_pread_pwrite_dont_move_cursor` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_filesystem_devfs_null_zero` migrated to filesystem/src/tests.rs (subsystem `"filesystem"`).
-
 
 // `smoke_filesystem_devfs_random_urandom` migrated to filesystem/src/tests.rs (subsystem `"filesystem"`).
 
-
 // `smoke_filesystem_devfs_mount_default_idempotent` migrated to filesystem/src/tests.rs (subsystem `"filesystem"`).
-
 
 // `smoke_userspace_rlimit_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_priority_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_times_writes_tms_struct` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_getrusage_writes_18_i64s` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_umask_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_getcpu_returns_zero` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_sched_affinity_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_prctl_name_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_fallocate_extends_and_zero_ranges_memfile` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_copy_file_range_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_clock_settime_pushes_wall_offset` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_futex_wait_and_wake_no_op` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_memfd_create_returns_writable_fd` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_getdents64_writes_linux_records` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_init_per_task_state_is_idempotent` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_sched_priority_bounds_and_param` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // `smoke_userspace_pgid_round_trip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-
 // `smoke_userspace_setsid_makes_session_leader` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 
 // ── AML resource decoder smokes ──────────────────────────────────────────────
 
@@ -4299,9 +4207,7 @@ kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
 // `smoke_aml_gpe_dispatch_native` migrated to aml/src/tests.rs (subsystem `"aml"`).
 // `smoke_aml_gpe_dispatch_aml` migrated to aml/src/tests.rs (subsystem `"aml"`).
 
-
 // `smoke_acpi_gpe_block_parsed_at_boot` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
-
 
 // ── _PRT / _CRS bridge smoke tests ───────────────────────────────────────────
 //
@@ -4314,7 +4220,6 @@ kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
 // `smoke_aml_crs_evaluation_round_trip` migrated to aml/src/tests.rs (subsystem `"aml"`).
 // `smoke_aml_prt_method_not_found` migrated to aml/src/tests.rs (subsystem `"aml"`).
 
-
 // ── Driver-foundation arc smokes (e94093a..e99df8e) ────────────────
 //
 // These smokes were originally drafted next to their related code
@@ -4326,12 +4231,9 @@ kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
 
 // `smoke_drivers_reset_default_is_noop` migrated to drivers/src/tests.rs (subsystem `"drivers"`).
 
-
 // `smoke_hotplug_default_dispatcher_round_trip` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-
 // `smoke_aer_classifier_severity` migrated to bus/src/tests.rs (subsystem `"bus"`).
-
 
 // `smoke_power_dstate_classification` migrated to power/src/tests.rs (subsystem `"power"`).
 
@@ -4515,7 +4417,6 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_compat_win_load_pe_pipeline);
 
-
 #[cfg(feature = "user-mode-e2e")]
 fn smoke_firmware_install_syscall_round_trip() -> TestResult {
     // End-to-end: dispatch the FirmwareInstall syscall through the
@@ -4697,8 +4598,7 @@ fn smoke_fdtable_concurrent_open_close_per_task() -> TestResult {
                 LOST.fetch_add(1, Ordering::AcqRel);
                 return Poll::Ready(());
             }
-            let closed = fd::with_table(self.task_id, |t| t.close(fd))
-                .unwrap_or(false);
+            let closed = fd::with_table(self.task_id, |t| t.close(fd)).unwrap_or(false);
             if !closed {
                 LOST.fetch_add(1, Ordering::AcqRel);
                 return Poll::Ready(());
@@ -4921,9 +4821,7 @@ fn smoke_burst_spawn_no_leaked_futures() -> TestResult {
     }
     for _ in 0..64 {
         narf_scheduler::poll_one_round();
-        if POLLED.load(Ordering::Acquire) >= TASKS
-            && DROPPED.load(Ordering::Acquire) >= TASKS
-        {
+        if POLLED.load(Ordering::Acquire) >= TASKS && DROPPED.load(Ordering::Acquire) >= TASKS {
             break;
         }
     }
@@ -4934,9 +4832,7 @@ fn smoke_burst_spawn_no_leaked_futures() -> TestResult {
         return TestResult::Fail("not every task's future was polled to Ready");
     }
     if dropped != constructed {
-        return TestResult::Fail(
-            "some Counted futures never dropped — scheduler leaked a slot",
-        );
+        return TestResult::Fail("some Counted futures never dropped — scheduler leaked a slot");
     }
     TestResult::Pass
 }
@@ -5414,9 +5310,7 @@ fn smoke_userspace_concurrent_fdtable_lazy_init() -> TestResult {
     }
     for n in lens.iter() {
         if *n != 3 {
-            return TestResult::Fail(
-                "lazily-initialised FdTable didn't seed all 3 stdio entries",
-            );
+            return TestResult::Fail("lazily-initialised FdTable didn't seed all 3 stdio entries");
         }
     }
     TestResult::Pass
@@ -5807,8 +5701,8 @@ kernel_test!(smoke_irq_multi_waker_both_resolve);
 /// the issue.
 #[cfg(target_arch = "x86_64")]
 fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
-    use core::pin::Pin;
     use core::future::Future;
+    use core::pin::Pin;
     use core::sync::atomic::{AtomicU32, Ordering};
     use core::task::{Context, Poll};
 
