@@ -52,6 +52,8 @@ pub mod init;
 pub mod interp;
 pub mod io_mux;
 pub mod loader;
+#[cfg(feature = "container")]
+pub mod namespaces;
 pub mod pidfd;
 #[cfg(feature = "container")]
 pub mod pid_ns;
