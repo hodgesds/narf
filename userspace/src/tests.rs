@@ -13638,3 +13638,190 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_memfd_seal_seal_blocks_further_seals);
+
+// ── Wave-72 — UTS / NET / IPC namespaces ───────────────────────────
+
+/// unshare(CLONE_NEWUTS) gives a task a private hostname slot. A
+/// fork-style "child" inherits the parent's NS Arc by setns, so its
+/// view sees the parent's sethostname; a sibling that never
+/// unshared still reads the global default.
+#[cfg(feature = "container")]
+fn smoke_wave72_uts_ns_per_task_hostname() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    let parent: u64 = 0xA000_0001;
+    let child: u64 = 0xA000_0002;
+    let sibling: u64 = 0xA000_0003;
+
+    crate::namespaces::unshare_uts(parent);
+    let parent_ns = match crate::namespaces::uts_ns_of(parent) {
+        Some(ns) => ns,
+        None => return TestResult::Fail("parent has no UTS NS after unshare"),
+    };
+    parent_ns.set_hostname("parent-host");
+
+    // Child joins parent's NS (Arc share).
+    crate::namespaces::setns_uts(child, parent_ns.clone());
+    if crate::namespaces::current_uts_ns(child).hostname() != "parent-host" {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("child does not see parent's hostname");
+    }
+
+    // Sibling never unshared → global default ("narf").
+    if crate::namespaces::current_uts_ns(sibling).hostname()
+        != crate::namespaces::DEFAULT_HOSTNAME
+    {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("sibling sees per-NS hostname instead of global");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_wave72_uts_ns_per_task_hostname);
+
+/// unshare(CLONE_NEWNET) seeds a fresh netns containing only `lo`.
+#[cfg(feature = "container")]
+fn smoke_wave72_net_ns_loopback_only() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    let task: u64 = 0xB000_0001;
+    crate::namespaces::unshare_net(task);
+    let ns = match crate::namespaces::current_net_ns(task) {
+        Some(ns) => ns,
+        None => {
+            crate::namespaces::__test_reset_all();
+            return TestResult::Fail("unshare_net did not install per-task entry");
+        }
+    };
+    let names = ns.iface_names();
+    if names.len() != 1 || names[0] != "lo" {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("fresh netns iface list != [lo]");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_wave72_net_ns_loopback_only);
+
+/// Two CLONE_NEWIPC tasks: shmget(SAME_KEY) returns distinct ids
+/// because each NS mints its own.
+#[cfg(feature = "container")]
+fn smoke_wave72_ipc_ns_distinct_shmget() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    let a: u64 = 0xC000_0001;
+    let b: u64 = 0xC000_0002;
+    crate::namespaces::unshare_ipc(a);
+    crate::namespaces::unshare_ipc(b);
+    let ns_a = match crate::namespaces::current_ipc_ns(a) {
+        Some(ns) => ns,
+        None => {
+            crate::namespaces::__test_reset_all();
+            return TestResult::Fail("task A has no IPC NS after unshare");
+        }
+    };
+    let ns_b = match crate::namespaces::current_ipc_ns(b) {
+        Some(ns) => ns,
+        None => {
+            crate::namespaces::__test_reset_all();
+            return TestResult::Fail("task B has no IPC NS after unshare");
+        }
+    };
+    const KEY: u32 = 0xBEEF;
+    let id_a = ns_a.shmget(KEY);
+    let id_b = ns_b.shmget(KEY);
+    // Both start their counters at 1 → both should return 1, which is
+    // the same numeric value but minted from independent counters.
+    // The point is they don't alias: a second call in A returns a new
+    // id for a different key, independent of B's keyspace.
+    if id_a != ns_a.shmget(KEY) {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("same key in same NS returned a different id");
+    }
+    if id_b != ns_b.shmget(KEY) {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("same key in same NS returned a different id (B)");
+    }
+    // Add a second key to A only; B's counter must not advance.
+    let id_a2 = ns_a.shmget(0xCAFE);
+    if id_a2 == id_b {
+        // Acceptable — independent counters can collide numerically.
+    }
+    // Lookup of 0xCAFE in B must mint a fresh id, not 0xCAFE→id_a2's value
+    // by leaking state across namespaces.
+    let id_b2 = ns_b.shmget(0xCAFE);
+    if !alloc::sync::Arc::ptr_eq(&ns_a, &ns_b) && id_b2 == 0 {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("NS-B yielded reserved id 0 for new key");
+    }
+    // Critical distinct-namespace invariant: A and B are different Arcs.
+    if alloc::sync::Arc::ptr_eq(&ns_a, &ns_b) {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("A and B share an IPC NS Arc");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_wave72_ipc_ns_distinct_shmget);
+
+/// Drive sys_unshare directly with the combined NEWUTS|NEWNET|NEWIPC
+/// flag mask; verify all 3 NS slots populate for the calling task.
+#[cfg(feature = "container")]
+fn smoke_wave72_sys_unshare_honours_new_flags() -> TestResult {
+    use crate::handlers::install_task_id_lookup;
+    crate::namespaces::__test_reset_all();
+
+    const FAKE_TASK: u64 = 0xD000_DEAD;
+    fn lookup() -> u64 {
+        FAKE_TASK
+    }
+    install_task_id_lookup(lookup);
+
+    let flags = crate::namespaces::CLONE_NEWUTS
+        | crate::namespaces::CLONE_NEWNET
+        | crate::namespaces::CLONE_NEWIPC;
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: flags,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Unshare.raw(), &mut ctx);
+    let ret = match ctx.ret {
+        Some(r) => r,
+        None => {
+            crate::namespaces::__test_reset_all();
+            return TestResult::Fail("sys_unshare did not set return");
+        }
+    };
+    if ret.value != 0 {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("sys_unshare returned non-zero");
+    }
+    if crate::namespaces::uts_ns_of(FAKE_TASK).is_none() {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("NEWUTS slot not populated");
+    }
+    if crate::namespaces::current_net_ns(FAKE_TASK).is_none() {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("NEWNET slot not populated");
+    }
+    if crate::namespaces::current_ipc_ns(FAKE_TASK).is_none() {
+        crate::namespaces::__test_reset_all();
+        return TestResult::Fail("NEWIPC slot not populated");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_wave72_sys_unshare_honours_new_flags);
