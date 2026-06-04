@@ -952,9 +952,17 @@ const F_SETLK: u64 = 6;
 const F_SETLKW: u64 = 7;
 #[cfg(feature = "linux-compat")]
 const F_DUPFD_CLOEXEC: u64 = 1030;
+/// Linux fcntl `F_ADD_SEALS` (1033) — add seal bits to a memfd.
+const F_ADD_SEALS: u64 = 1033;
+/// Linux fcntl `F_GET_SEALS` (1034) — read the seal word.
+const F_GET_SEALS: u64 = 1034;
 
 /// Linux EAGAIN value (11).
 const EAGAIN_CODE: u64 = 11;
+/// Linux EPERM (1) — returned as the value of the failed syscall
+/// (sign-flipped at libc; we follow the existing -1 convention).
+#[cfg(feature = "linux-compat")]
+const _EPERM: u64 = 1;
 
 /// Wire-stable `struct flock` (Linux x86_64 / aarch64 layout).
 #[cfg(feature = "linux-compat")]
@@ -1104,10 +1112,38 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // Wave-70: memfd seals. Route F_ADD_SEALS / F_GET_SEALS before
+    // the generic fd-table lookup so the seal word lives on the
+    // concrete MemFdFile rather than as a per-fd flag.
+    #[cfg(feature = "linux-compat")]
+    {
+        if cmd == F_ADD_SEALS {
+            if let Some(mfd) = memfd_arc_from_fd(task, fd) {
+                let r = match mfd.add_seals(arg as u32) {
+                    Ok(()) => SyscallReturn::ok(0),
+                    Err(()) => SyscallReturn::ok((-1i64) as u64),
+                };
+                ctx.set_return(r);
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+        if cmd == F_GET_SEALS {
+            if let Some(mfd) = memfd_arc_from_fd(task, fd) {
+                ctx.set_return(SyscallReturn::ok(mfd.seals() as u64));
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    }
+
     // Resolve any socket-side flag BEFORE entering the fd-table
     // closure — `current_socket` itself locks the table, which would
     // re-enter and deadlock if called from inside `with_table`.
     let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
+
 
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
@@ -2048,26 +2084,71 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _name_ptr = args.arg0;
     let _name_len = args.arg1;
-    let _flags = args.arg2;
+    // NARF-shape layout: (name_ptr, name_len, flags) — three args
+    // because narf-libc serialises the C string length separately.
+    let _flags = args.arg2 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
-
-    let ops = narf_filesystem::new_anon_memfile();
     let task = current_task_id();
-    let fd = fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        })
-    });
-    // `with_table` returns `Option<u32>` (the fd or None on
-    // exhaustion); the outer Option signals "no fd table for the
-    // task". Both must be Some(Some(n)) for success.
-    match fd {
-        Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(fail),
+    #[cfg(feature = "linux-compat")]
+    {
+        let mfd = crate::linux_compat::MemFdFile::new(_flags);
+        memfd_arc_register(&mfd);
+        let cloexec = (_flags & crate::linux_compat::MFD_CLOEXEC) != 0;
+        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+        let fd = fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: mfd,
+                offset: 0,
+                flags: install_flags,
+                status_flags: 0,
+            })
+        });
+        match fd {
+            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            None => ctx.set_return(fail),
+        }
+        return;
     }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        let ops = narf_filesystem::new_anon_memfile();
+        let fd = fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+            })
+        });
+        match fd {
+            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            None => ctx.set_return(fail),
+        }
+    }
+}
+
+// ── Wave-70 MemFdFile side table ───────────────────────────────────
+#[cfg(feature = "linux-compat")]
+static MEMFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::MemFdFile>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "linux-compat")]
+fn memfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::MemFdFile>) {
+    let key = alloc::sync::Arc::as_ptr(arc) as usize;
+    let mut g = MEMFD_ARCS.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(key, arc.clone());
+}
+
+#[cfg(feature = "linux-compat")]
+pub(crate) fn memfd_arc_from_fd(
+    task: u64,
+    fd: u32,
+) -> Option<alloc::sync::Arc<crate::linux_compat::MemFdFile>> {
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
+    let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
+    let g = MEMFD_ARCS.lock();
+    g.as_ref()?.get(&raw).cloned()
 }
 
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
@@ -10292,10 +10373,11 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 
 fn sys_signalfd(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let _fd_arg = args.arg0 as i64; // -1 = create new
+    let fd_arg = args.arg0 as i64; // -1 = create new; else replace mask
     let mask_ptr = args.arg1 as u64;
     let _sizemask = args.arg2;
-    let _flags = args.arg3;
+    let flags = args.arg3 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
     let mut mask: u64 = 0;
     if mask_ptr != 0 {
         let mut bytes = [0u8; 8];
@@ -10304,22 +10386,91 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
         }
     }
     let task = current_task_id();
-    let sfd = crate::io_mux::SignalFd::new(mask, task);
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops: sfd,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        })
-    }) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+
+    // Wave-70: prefer the new linux-compat SignalFdFile; replace mask
+    // path uses its `set_mask`. Fall back to legacy SignalFd on a non-
+    // linux-compat build (skip the side-table register, mint legacy).
+    #[cfg(feature = "linux-compat")]
+    {
+        if fd_arg >= 0 {
+            // Replace mask on existing signalfd.
+            let target = fd_arg as u32;
+            if let Some(sf) = signalfd_arc_from_fd(task, target) {
+                sf.set_mask(mask);
+                ctx.set_return(SyscallReturn::ok(target as u64));
+                return;
+            }
+            ctx.set_return(fail);
             return;
         }
-    };
-    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+        let sfd = crate::linux_compat::SignalFdFile::new(mask, task);
+        signalfd_arc_register(&sfd);
+        let cloexec = (flags & crate::linux_compat::SFD_CLOEXEC) != 0;
+        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+        let new_fd = match fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: sfd,
+                offset: 0,
+                flags: install_flags,
+                status_flags: 0,
+            })
+        }) {
+            Some(n) => n,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        ctx.set_return(SyscallReturn::ok(new_fd as u64));
+        return;
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        let _ = (fd_arg, flags);
+        let sfd = crate::io_mux::SignalFd::new(mask, task);
+        let new_fd = match fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: sfd,
+                offset: 0,
+                flags: 0,
+            })
+        }) {
+            Some(n) => n,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        ctx.set_return(SyscallReturn::ok(new_fd as u64));
+    }
+}
+
+// ── Wave-70 SignalFdFile side table ────────────────────────────────
+// Same shape as the EpollFile / SocketFile / TimerFd Arc maps: a raw-
+// pointer-keyed Arc map lets us recover the concrete type from the
+// `dyn FileOps` we stored in the fd table.
+#[cfg(feature = "linux-compat")]
+static SIGNALFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::SignalFdFile>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "linux-compat")]
+fn signalfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::SignalFdFile>) {
+    let key = alloc::sync::Arc::as_ptr(arc) as usize;
+    let mut g = SIGNALFD_ARCS.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(key, arc.clone());
+}
+
+#[cfg(feature = "linux-compat")]
+pub(crate) fn signalfd_arc_from_fd(
+    task: u64,
+    fd: u32,
+) -> Option<alloc::sync::Arc<crate::linux_compat::SignalFdFile>> {
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
+    let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
+    let g = SIGNALFD_ARCS.lock();
+    g.as_ref()?.get(&raw).cloned()
 }
 
 /// `sigaction(signum, handler, old_out_ptr, flags)` —
