@@ -18,20 +18,20 @@ extern crate alloc;
 // crate's test entries. (Crates that the kernel actually uses by
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
-extern crate narf_security as _;
+extern crate narf_drivers_crypto as _;
+extern crate narf_drivers_fs_9p as _;
+extern crate narf_drivers_fs_exfat as _;
 extern crate narf_drivers_fs_ext2;
 extern crate narf_drivers_fs_fat;
-extern crate narf_drivers_fs_exfat as _;
-extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_iso9660 as _;
+extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_udf as _;
-extern crate narf_drivers_fs_9p as _;
+extern crate narf_drivers_psp as _;
 extern crate narf_edid as _;
 extern crate narf_efi as _;
 extern crate narf_hid as _;
 extern crate narf_pinctrl as _;
-extern crate narf_drivers_psp as _;
-extern crate narf_drivers_crypto as _;
+extern crate narf_security as _;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -140,16 +140,19 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     // FB phys is OS-reserved memory we manage.
     let fb_size = end.saturating_sub(phys);
     let pow2 = fb_size.next_power_of_two().max(0x100_000); // ≥ 1 MiB
-    // Align phys down to the pow2 boundary so the MTRR window
-    // fully covers the FB. The slop below `phys` is also OS-
-    // managed reserved.
+                                                           // Align phys down to the pow2 boundary so the MTRR window
+                                                           // fully covers the FB. The slop below `phys` is also OS-
+                                                           // managed reserved.
     let mtrr_phys = phys & !(pow2 - 1);
     // SAFETY: CPL=0; phys + size point at a UEFI-claimed GOP FB.
     // The MTRR program runs before any cacheable mapping spans
     // this window (we're pre-MMU-rebind here in the early-FB
     // path).
+    #[cfg(target_arch = "x86_64")]
     let wc_slot = unsafe { narf_arch::x86_64::mtrr::set_write_combining(mtrr_phys, pow2) };
-    let _ = wc_slot;
+    #[cfg(not(target_arch = "x86_64"))]
+    let wc_slot: Option<u32> = None;
+    let _ = mtrr_phys;
 
     // SAFETY: BSP, no concurrent draw; FB phys is identity-mapped
     // (verified above to be < 4 GiB).
@@ -272,9 +275,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // isn't running.
                 narf_memory::beacon::paint_build_stripe(0x00800080); // PURPLE
                 narf_memory::beacon::paint(0, 0x0000FFFF); // CYAN — _start_rust alive
-                // Wire arch-side beacon hook to memory beacon
-                // facility so arch code (pcid::enable_pcide etc.)
-                // can paint without depending on memory.
+                                                           // Wire arch-side beacon hook to memory beacon
+                                                           // facility so arch code (pcid::enable_pcide etc.)
+                                                           // can paint without depending on memory.
                 narf_arch::set_beacon_hook(narf_memory::beacon::paint);
             }
             fb
@@ -290,7 +293,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // 16550A COM1 at I/O port 0x3F8 — hard-coded default. Real detection
         // lands with the ACPI/FDT parse in Wave 2.
         console::early_init(PhysAddr::new(0x3F8), UartKind::Uart16550);
-                    narf_memory::beacon::paint(1, 0x00FF_8000); // ORANGE
+        narf_memory::beacon::paint(1, 0x00FF_8000); // ORANGE
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -380,9 +383,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             "  cpu-validate: NX={} SMEP={}/{} SMAP={}/{} OSXSAVE={}/{} \
              EFER.LME={} EFER.NXE={} CR4.PAE={} fsgsbase={} invariant_tsc={}",
             cpuval.nx,
-            cpuval.smep, cpuval.cr4_smep_on,
-            cpuval.smap, cpuval.cr4_smap_on,
-            cpuval.xsave, cpuval.cr4_osxsave_on,
+            cpuval.smep,
+            cpuval.cr4_smep_on,
+            cpuval.smap,
+            cpuval.cr4_smap_on,
+            cpuval.xsave,
+            cpuval.cr4_osxsave_on,
             cpuval.efer_lme_on,
             cpuval.efer_nxe_on,
             cpuval.cr4_pae_on,
@@ -397,10 +403,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_memory::beacon::paint(31, 0x0000FF80); // bright green
             }
             Some(why) => {
-                let _ = writeln!(
-                    console::Writer,
-                    "  cpu-validate: FATAL — {}", why
-                );
+                let _ = writeln!(console::Writer, "  cpu-validate: FATAL — {}", why);
                 // Slot 31 = baseline fail (bright red). Halt with
                 // CLI+HLT loop so the operator sees the message
                 // + beacon instead of crashing into a userspace
@@ -435,13 +438,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         if smep::supported() {
             // SAFETY: SMEP supported; flipping CR4.20 has no other
             // prerequisite at CPL=0 post-paging.
-            unsafe { smep::enable(); }
+            unsafe {
+                smep::enable();
+            }
         }
         // SMAP — fault on data access to a U=1 page from CPL=0 outside
         // an EFLAGS.AC bracket. Same shape.
         if smap::supported() {
             // SAFETY: SMAP supported; CR4.21 flip is benign here.
-            unsafe { smap::enable(); }
+            unsafe {
+                smap::enable();
+            }
         }
         // KPTI detect — Renoir + Phoenix come back Posture::Native and
         // we skip the dual-CR3 dance entirely. Log the decision once.
@@ -492,7 +499,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // diagnostic, used to localize hangs between ORANGE and
         // PURPLE on real HW).
         narf_memory::beacon::paint(22, 0x00FFA500); // amber: post-orange / pre-features
-        // SAFETY: CPUID is always legal at CPL=0.
+                                                    // SAFETY: CPUID is always legal at CPL=0.
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
         narf_memory::beacon::paint(23, 0x00FFB347); // peach: CPUID done
         let _ = writeln!(
@@ -575,10 +582,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_arch::x86_64::pcid::init();
             }
             narf_memory::beacon::paint(21, 0x0040FFC0); // pale-cyan: PCID init done
-            // Allocate + register 16 per-domain PML4 clones, spread
-            // across NUMA nodes. Domain D's PML4 lands on node
-            // (D % num_nodes) so PML4 reads on a CPU local to that
-            // node hit local memory.
+                                                        // Allocate + register 16 per-domain PML4 clones, spread
+                                                        // across NUMA nodes. Domain D's PML4 lands on node
+                                                        // (D % num_nodes) so PML4 reads on a CPU local to that
+                                                        // node hit local memory.
             let num_nodes = if narf_memory::is_numa_aware() {
                 // Count nodes with non-zero free pages.
                 let mut n = 0usize;
@@ -674,7 +681,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(
             console::Writer,
             "  cpu: {} (vendor {:?}, family {:#x}, model {:#x}, stepping {})",
-            brand, cpu.vendor, cpu.family, cpu.model, cpu.stepping
+            brand,
+            cpu.vendor,
+            cpu.family,
+            cpu.model,
+            cpu.stepping
         );
         // SAFETY: CPL=0; per-entry SAFETY notes apply; gated by
         // vendor/family/model match.
@@ -849,7 +860,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     };
 
-            narf_memory::beacon::paint(3, 0x0000_00FF); // BLUE: parse_raw returned
+    narf_memory::beacon::paint(3, 0x0000_00FF); // BLUE: parse_raw returned
 
     match boot_result {
         Ok(info) => {
@@ -858,7 +869,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 RAW_BOOT_INFO = Some(raw);
                 BOOT_INFO = Some(info.clone());
             }
-                            narf_memory::beacon::paint(4, 0x00FF_FF00); // YELLOW: Ok branch
+            narf_memory::beacon::paint(4, 0x00FF_FF00); // YELLOW: Ok branch
             let _ = writeln!(
                 console::Writer,
                 "  boot info: {} memory region(s), uart_phys={:?}",
@@ -955,7 +966,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             unsafe {
                 narf_memory::init_from_map(&regions, &excludes);
             }
-                            narf_memory::beacon::paint(6, 0x0000_FF00); // GREEN: frame alloc
+            narf_memory::beacon::paint(6, 0x0000_FF00); // GREEN: frame alloc
 
             // Register the generic framebuffer if provided by the bootloader.
             if let Some(fb_info) = info.framebuffer {
@@ -994,7 +1005,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             {
                 let _ = writeln!(console::Writer, "  mmu: handoff...");
                 // Pre-init_mmu beacon (slot 8: dim red).
-                                    narf_memory::beacon::paint(8, 0x00800000);
+                narf_memory::beacon::paint(8, 0x00800000);
                 // SAFETY: BSP, interrupts disabled (boot.S CLI + IDT
                 // doesn't unmask), allocator populated above.
                 match unsafe { narf_memory::mmu::init_mmu() } {
@@ -1004,7 +1015,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // new PML4. If we see this but not the next
                         // remap_to_virtual print, something between
                         // CR3 swap and serial output is wedged.
-                                                    narf_memory::beacon::paint(9, 0x00008000);
+                        narf_memory::beacon::paint(9, 0x00008000);
                         // The new PML4 identity-maps 0..=4 GiB, so the
                         // UART (I/O port on x86_64) is reachable and
                         // console::remap_to_virtual with an identity
@@ -1015,7 +1026,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
                         );
-                                                    narf_memory::beacon::paint(7, 0x0000_FFFF); // CYAN: MMU
+                        narf_memory::beacon::paint(7, 0x0000_FFFF); // CYAN: MMU
 
                         // Real-HW bring-up aid: install the FB
                         // console NOW, not at Stage::Late. Without
@@ -1102,24 +1113,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             // Status-panel diag: heap is live; mark
                             // the phase so the bare-metal status
                             // panel transitions out of StartRust.
-                            narf_memory::diag::set_phase(
-                                narf_memory::diag::BootPhase::HeapUp,
-                            );
-                            let _ = writeln!(
-                                console::Writer,
-                                "  heap: slab is live"
-                            );
+                            narf_memory::diag::set_phase(narf_memory::diag::BootPhase::HeapUp);
+                            let _ = writeln!(console::Writer, "  heap: slab is live");
                             let n_nodes = narf_acpi::node_count().max(1) as usize;
                             let mut totals = 0usize;
                             for i in 0..n_nodes.min(narf_memory::FRAME_MAX_NUMA_NODES) {
                                 let f = narf_memory::node_free(i);
                                 totals += f;
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "    node {}: {} free frames",
-                                    i,
-                                    f
-                                );
+                                let _ =
+                                    writeln!(console::Writer, "    node {}: {} free frames", i, f);
                             }
                             let _ = writeln!(
                                 console::Writer,
@@ -1167,7 +1169,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: same.
                         match unsafe { narf_acpi::parse_fadt_pm(p) } {
                             Ok(pm) => {
-                                let _ = writeln!(
+                                let _ =
+                                    writeln!(
                                     console::Writer,
                                     "  acpi: FADT PM parsed (RESET {:#x} = {:#x}, PM1a_CNT {:#x})",
                                     pm.reset_reg_addr, pm.reset_value, pm.pm1a_cnt
@@ -1259,11 +1262,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: same.
                         match unsafe { narf_acpi::parse_dmar(p) } {
                             Ok(n) => {
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  acpi: DMAR parsed, {} DRHD(s)",
-                                    n
-                                );
+                                let _ =
+                                    writeln!(console::Writer, "  acpi: DMAR parsed, {} DRHD(s)", n);
                             }
                             Err(e) => {
                                 let _ = writeln!(
@@ -1273,10 +1273,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 );
                             }
                         }
-                        let _ = writeln!(
-                            console::Writer,
-                            "  aml: parsing namespace..."
-                        );
+                        let _ = writeln!(console::Writer, "  aml: parsing namespace...");
                         // SAFETY: same.
                         match unsafe { narf_aml::parse_namespace(p) } {
                             Ok(n) => {
@@ -1294,7 +1291,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     let _ = writeln!(
                                         console::Writer,
                                         "  aml: \\_S5 → SLP_TYPa={} SLP_TYPb={}",
-                                        a, b
+                                        a,
+                                        b
                                     );
                                 }
                                 // Snapshot — later tests that mutate
@@ -1351,8 +1349,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 let mut prt_total = 0usize;
                                 let mut bridges = 0usize;
                                 narf_aml::for_each_device(|n| {
-                                    let hid = narf_aml::device_hid(&n.path)
-                                        .unwrap_or_default();
+                                    let hid = narf_aml::device_hid(&n.path).unwrap_or_default();
                                     if hid != "PNP0A03" && hid != "PNP0A08" {
                                         return;
                                     }
@@ -1396,12 +1393,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 let mut shown = 0u32;
                                 narf_aml::for_each_device(|n| {
                                     if shown < 12 {
-                                        let hid = narf_aml::device_hid(&n.path)
-                                            .unwrap_or_default();
+                                        let hid = narf_aml::device_hid(&n.path).unwrap_or_default();
                                         let _ = writeln!(
                                             console::Writer,
                                             "    dev: {} (HID={:?})",
-                                            n.path, hid
+                                            n.path,
+                                            hid
                                         );
                                         shown += 1;
                                     }
@@ -1525,15 +1522,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         "  smp: SKIPPED via nosmp cmdline (BSP only)"
                     );
                     narf_memory::beacon::paint(16, 0x00808080); // GRAY: SMP skipped
-                    // BSP-only topology summary. Same as the SMP
-                    // path below but with no APs to count.
+                                                                // BSP-only topology summary. Same as the SMP
+                                                                // path below but with no APs to count.
                     let bsp_ty = narf_lib::percpu::cpu_type(0);
-                    let n_p = narf_lib::percpu::count_cpu_type(
-                        narf_lib::percpu::CpuType::Core,
-                    );
-                    let n_e = narf_lib::percpu::count_cpu_type(
-                        narf_lib::percpu::CpuType::Atom,
-                    );
+                    let n_p = narf_lib::percpu::count_cpu_type(narf_lib::percpu::CpuType::Core);
+                    let n_e = narf_lib::percpu::count_cpu_type(narf_lib::percpu::CpuType::Atom);
                     let _ = writeln!(
                         console::Writer,
                         "  cpu-topology: BSP={}, {} P-core(s) + {} E-core(s)",
@@ -1566,12 +1559,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     // cpu_type; affinity-hinting is follow-up
                     // work.
                     let bsp_ty = narf_lib::percpu::cpu_type(0);
-                    let n_p = narf_lib::percpu::count_cpu_type(
-                        narf_lib::percpu::CpuType::Core,
-                    );
-                    let n_e = narf_lib::percpu::count_cpu_type(
-                        narf_lib::percpu::CpuType::Atom,
-                    );
+                    let n_p = narf_lib::percpu::count_cpu_type(narf_lib::percpu::CpuType::Core);
+                    let n_e = narf_lib::percpu::count_cpu_type(narf_lib::percpu::CpuType::Atom);
                     let _ = writeln!(
                         console::Writer,
                         "  cpu-topology: BSP={}, {} P-core(s) + {} E-core(s)",
@@ -1590,10 +1579,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     #[cfg(not(feature = "kernel-test"))]
                     if started > 0 {
                         narf_scheduler::enable_work_stealing();
-                        let _ = writeln!(
-                            console::Writer,
-                            "  smp: work-stealing enabled"
-                        );
+                        let _ = writeln!(console::Writer, "  smp: work-stealing enabled");
                     }
                 }
             }
@@ -1723,10 +1709,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 #[cfg(not(feature = "kernel-test"))]
                 if started > 0 {
                     narf_scheduler::enable_work_stealing();
-                    let _ = writeln!(
-                        console::Writer,
-                        "  smp: work-stealing enabled"
-                    );
+                    let _ = writeln!(console::Writer, "  smp: work-stealing enabled");
                 }
             }
 
@@ -1793,10 +1776,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             narf_drivers_platform::ec::subscribe_platform_event(|event| {
                 if event == narf_drivers_platform::ec::PlatformEvent::PowerButton {
-                    let _ = writeln!(
-                        console::Writer,
-                        "  acpi: power button → entering S5"
-                    );
+                    let _ = writeln!(console::Writer, "  acpi: power button → entering S5");
                     narf_power::system::power_off();
                 }
             });
@@ -1937,9 +1917,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if let Some(r) = info.and_then(|i| i.initramfs) {
                         // SAFETY: BootInfo::initramfs is the bootloader-
                         // staged identity-mapped initramfs region.
-                        let res = unsafe {
-                            measure::measure_initramfs(r.start.raw(), r.len).await
-                        };
+                        let res = unsafe { measure::measure_initramfs(r.start.raw(), r.len).await };
                         if let Err(e) = res {
                             let _ = writeln!(
                                 console::Writer,
@@ -2040,10 +2018,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // additionally requires `fb_reachable()`, so guard
                 // that one explicitly.
                 if scanout.name() == "bochs" {
-                    let reachable = narf_graphics_driver::bochs::with_controller(|d| {
-                        d.fb_reachable()
-                    })
-                    .unwrap_or(false);
+                    let reachable =
+                        narf_graphics_driver::bochs::with_controller(|d| d.fb_reachable())
+                            .unwrap_or(false);
                     if !reachable {
                         let phys = narf_graphics_driver::bochs::with_controller(|d| d.fb_phys())
                             .unwrap_or(0);
@@ -2110,7 +2087,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: FB phys was registered by Limine/UEFI;
                 // exclusive kernel-side; the new virt is fresh
                 // vmalloc.
-                let m = match unsafe { ioremap(phys, len, MmioAttrs::WriteCombining) } {
+                #[cfg(target_arch = "x86_64")]
+                let attrs = MmioAttrs::WriteCombining;
+                #[cfg(not(target_arch = "x86_64"))]
+                let attrs = MmioAttrs::Device;
+                let m = match unsafe { ioremap(phys, len, attrs) } {
                     Ok(m) => m,
                     Err(_) => {
                         let _ = writeln!(
@@ -2195,10 +2176,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 //      try_mount_root and mount whatever ext / FAT
                 //      filesystem the fs-factory registry finds.
                 let cmdline = narf_boot::cmdline();
-                let has_root_eq = narf_filesystem::root_selector::RootSelector::from_cmdline(
-                    cmdline,
-                )
-                .is_some();
+                let has_root_eq =
+                    narf_filesystem::root_selector::RootSelector::from_cmdline(cmdline).is_some();
 
                 if has_root_eq {
                     match narf_filesystem::root_mount::try_mount_root(&auth) {
@@ -2246,7 +2225,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = writeln!(
                             console::Writer,
                             "  root-mount: {:?} on {} mounted at \"/\" via fs-factory walk",
-                            report.fs_type, report.device_name
+                            report.fs_type,
+                            report.device_name
                         );
                         return narf_init::InitResult::Ok;
                     }
@@ -2288,7 +2268,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             let _ = writeln!(
                                 console::Writer,
                                 "  mnt-mount-ext2: factory failed on {}: {:?}",
-                                entry.name, e
+                                entry.name,
+                                e
                             );
                             continue;
                         }
@@ -2389,9 +2370,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let _ = narf_init::run_stage(s);
                 let (slot, color) = match s {
                     narf_init::Stage::Subsys => (17u32, 0x00FF_C0CB), // PINK
-                    narf_init::Stage::Fs     => (18u32, 0x00FF_D700), // GOLD
+                    narf_init::Stage::Fs => (18u32, 0x00FF_D700),     // GOLD
                     narf_init::Stage::Device => (19u32, 0x0087_CEEB), // SKY
-                    narf_init::Stage::Late   => (20u32, 0x00E6_E6FA), // LAVENDER
+                    narf_init::Stage::Late => (20u32, 0x00E6_E6FA),   // LAVENDER
                     _ => continue,
                 };
                 narf_memory::beacon::paint(slot, color);
@@ -2400,9 +2381,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // Status-panel diag: initcalls done; flip the phase to
             // Userspace so the panel shows the kernel reached its
             // final boot phase (scheduler, executors, sleep_pumps).
-            narf_memory::diag::set_phase(
-                narf_memory::diag::BootPhase::Userspace,
-            );
+            narf_memory::diag::set_phase(narf_memory::diag::BootPhase::Userspace);
 
             // AMD-specific amd-pstate active-mode bring-up. Sibling
             // of narf_power::pstate (which handled Intel HWP /
@@ -2435,7 +2414,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
         }
         Err(e) => {
-                            narf_memory::beacon::paint(5, 0x00FF_FFFF); // WHITE: Err branch
+            narf_memory::beacon::paint(5, 0x00FF_FFFF); // WHITE: Err branch
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");
         }
     }
@@ -2526,7 +2505,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     }
 
     // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
-    #[cfg(not(any(feature = "kernel-test", feature = "boot-smoke", feature = "idt-selftest")))]
+    #[cfg(not(any(
+        feature = "kernel-test",
+        feature = "boot-smoke",
+        feature = "idt-selftest"
+    )))]
     run_async_demo()
 }
 
@@ -2587,7 +2570,10 @@ fn run_async_demo() -> ! {
                     let _ = writeln!(
                         console::Writer,
                         "  hpet:   comp{} periodic={} fsb={} route_cap={:#010x}",
-                        i, periodic, fsb, route_cap,
+                        i,
+                        periodic,
+                        fsb,
+                        route_cap,
                     );
                 }
                 // LAPIC MMIO base from IA32_APIC_BASE MSR — Linux
@@ -2596,9 +2582,7 @@ fn run_async_demo() -> ! {
                 // doesn't match, MMIO writes go nowhere and MSI
                 // delivery (targeted at 0xFEE0_0000) won't reach
                 // the LAPIC.
-                let apic_base = unsafe {
-                    narf_arch::x86_64::msr::rdmsr(0x0000_001B)
-                };
+                let apic_base = unsafe { narf_arch::x86_64::msr::rdmsr(0x0000_001B) };
                 let lapic_phys = apic_base & 0x0000_000F_FFFF_F000;
                 let _ = writeln!(
                     console::Writer,
@@ -2642,12 +2626,8 @@ fn run_async_demo() -> ! {
         // delivers ticks. So on Renoir-style platforms where the
         // LAPIC timer arms but never delivers IRQs, the HPET
         // backend is the canonical Linux-style fallback.
-        narf_time::clockevent::register(
-            &narf_interrupts::x86_64::apic::LAPIC_CLOCKEVENT,
-        );
-        narf_time::clockevent::register(
-            &narf_interrupts::x86_64::hpet_clockevent::HPET_CLOCKEVENT,
-        );
+        narf_time::clockevent::register(&narf_interrupts::x86_64::apic::LAPIC_CLOCKEVENT);
+        narf_time::clockevent::register(&narf_interrupts::x86_64::hpet_clockevent::HPET_CLOCKEVENT);
 
         // Enable CPU-side IRQ delivery BEFORE select_primary so
         // the probe can actually observe ticks. Without this the
@@ -2718,7 +2698,8 @@ fn run_async_demo() -> ! {
         match narf_io::iommu::init() {
             Ok(mode) => {
                 let caps = narf_io::iommu::caps();
-                let _ = writeln!(
+                let _ =
+                    writeln!(
                     console::Writer,
                     "  iommu: {} initialised in {:?} mode ({} unit(s), max_iova_bits {}, IR {})",
                     narf_io::iommu::vendor(),
@@ -2941,10 +2922,9 @@ fn run_async_demo() -> ! {
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     use narf_userspace::{
-        bootstrap_init, brk_init, cwd_init, install_address_space_lookup,
-        install_core_syscalls, install_global, install_task_id_lookup,
-        install_user_task_hooks, load_user_process_with, sigaction_init, signal_init,
-        SyscallTable, UserTaskFuture,
+        bootstrap_init, brk_init, cwd_init, install_address_space_lookup, install_core_syscalls,
+        install_global, install_task_id_lookup, install_user_task_hooks, load_user_process_with,
+        sigaction_init, signal_init, SyscallTable, UserTaskFuture,
     };
 
     let bytes = narf_verification::NARF_INIT_ELF;
@@ -3089,8 +3069,7 @@ fn boot_userspace_init() {
         // IOAPIC. PC AT default for IRQ 4 is edge-triggered
         // active-high, but ACPI may override — copied from the
         // pattern in drivers/input/lib.rs::install_isa_irq.
-        let mut overrides =
-            [narf_acpi::IsaOverride::default(); narf_acpi::MAX_ISA_OVERRIDES];
+        let mut overrides = [narf_acpi::IsaOverride::default(); narf_acpi::MAX_ISA_OVERRIDES];
         let n = narf_acpi::copy_isa_overrides(&mut overrides);
         let (gsi, flags) = overrides[..n]
             .iter()
@@ -3114,14 +3093,14 @@ fn boot_userspace_init() {
             narf_interrupts::install_handler(v, serial_isr);
             // SAFETY: vector + handler installed before
             // unmasking the IOAPIC entry + enabling IER.
-            let routed =
-                unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) };
+            let routed = unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) };
             if routed {
                 narf_console::enable_rx_irq();
                 let _ = writeln!(
                     console::Writer,
                     "  serial: IRQ 4 → GSI {} → vec {} (RX IRQ enabled)",
-                    gsi, v
+                    gsi,
+                    v
                 );
             }
         }
@@ -3207,8 +3186,8 @@ fn boot_userspace_init() {
         let abs = alloc::format!("/{}", name);
         // Pull `(root_dir, rel_path)` out under the registry lock so
         // we don't hold it across awaits.
-        let pair: Option<(Arc<dyn DirOps>, alloc::string::String)> =
-            registry().resolve_absolute(&abs, |fs, rel| {
+        let pair: Option<(Arc<dyn DirOps>, alloc::string::String)> = registry()
+            .resolve_absolute(&abs, |fs, rel| {
                 (fs.root(), alloc::string::String::from(rel))
             });
         let (root, rel) = pair?;
@@ -3270,10 +3249,10 @@ fn boot_userspace_init() {
             "bin",
             &[
                 ("echo", narf_verification::NARF_COREUTIL_ECHO_ELF),
-                ("pwd",  narf_verification::NARF_COREUTIL_PWD_ELF),
-                ("cat",  narf_verification::NARF_COREUTIL_CAT_ELF),
-                ("ls",   narf_verification::NARF_COREUTIL_LS_ELF),
-                ("ps",   narf_verification::NARF_COREUTIL_PS_ELF),
+                ("pwd", narf_verification::NARF_COREUTIL_PWD_ELF),
+                ("cat", narf_verification::NARF_COREUTIL_CAT_ELF),
+                ("ls", narf_verification::NARF_COREUTIL_LS_ELF),
+                ("ps", narf_verification::NARF_COREUTIL_PS_ELF),
             ],
         );
         let count = fs.file_count();
