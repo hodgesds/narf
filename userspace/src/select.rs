@@ -21,9 +21,9 @@
 
 use alloc::vec::Vec;
 
+use crate::handlers::current_task_id;
 use crate::poll::{do_poll, PollFd, POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
 use crate::syscall::{SyscallReturn, TrapContext};
-use crate::handlers::current_task_id;
 
 // ── fd_set helpers ───────────────────────────────────────────────────
 
@@ -78,10 +78,10 @@ unsafe fn fd_zero(ptr: *mut u8) {
 ///
 /// Linux ref: `fs/select.c`:do_select (GPL-2.0-or-later, kernel.org).
 pub fn do_select(
-    task_id:   u64,
-    nfds:      usize,
-    readfds:   Option<*mut u8>,
-    writefds:  Option<*mut u8>,
+    task_id: u64,
+    nfds: usize,
+    readfds: Option<*mut u8>,
+    writefds: Option<*mut u8>,
     exceptfds: Option<*mut u8>,
     timeout_ms: i64,
 ) -> usize {
@@ -91,15 +91,25 @@ pub fn do_select(
     let nfds = nfds.min(FD_SETSIZE);
     let mut items: Vec<PollFd> = Vec::new();
     for fd in 0..nfds {
-        let want_r = readfds.map_or(false,   |p| unsafe { fd_isset(p, fd) });
-        let want_w = writefds.map_or(false,  |p| unsafe { fd_isset(p, fd) });
+        let want_r = readfds.map_or(false, |p| unsafe { fd_isset(p, fd) });
+        let want_w = writefds.map_or(false, |p| unsafe { fd_isset(p, fd) });
         let want_e = exceptfds.map_or(false, |p| unsafe { fd_isset(p, fd) });
         if want_r || want_w || want_e {
             let mut events: u16 = 0;
-            if want_r { events |= POLL_IN as u16; }
-            if want_w { events |= POLL_OUT as u16; }
-            if want_e { events |= (POLL_ERR | POLL_HUP) as u16; }
-            items.push(PollFd { fd: fd as i32, events, revents: 0 });
+            if want_r {
+                events |= POLL_IN as u16;
+            }
+            if want_w {
+                events |= POLL_OUT as u16;
+            }
+            if want_e {
+                events |= (POLL_ERR | POLL_HUP) as u16;
+            }
+            items.push(PollFd {
+                fd: fd as i32,
+                events,
+                revents: 0,
+            });
         }
     }
 
@@ -114,9 +124,15 @@ pub fn do_select(
             }
         }
         // Zero the sets so the caller sees them clean on return.
-        if let Some(p) = readfds   { unsafe { fd_zero(p) }; }
-        if let Some(p) = writefds  { unsafe { fd_zero(p) }; }
-        if let Some(p) = exceptfds { unsafe { fd_zero(p) }; }
+        if let Some(p) = readfds {
+            unsafe { fd_zero(p) };
+        }
+        if let Some(p) = writefds {
+            unsafe { fd_zero(p) };
+        }
+        if let Some(p) = exceptfds {
+            unsafe { fd_zero(p) };
+        }
         return 0;
     }
 
@@ -124,9 +140,15 @@ pub fn do_select(
     let n = do_poll(task_id, &mut items, timeout_ms);
 
     // Clear the fd_set outputs before writing new bits.
-    if let Some(p) = readfds   { unsafe { fd_zero(p) }; }
-    if let Some(p) = writefds  { unsafe { fd_zero(p) }; }
-    if let Some(p) = exceptfds { unsafe { fd_zero(p) }; }
+    if let Some(p) = readfds {
+        unsafe { fd_zero(p) };
+    }
+    if let Some(p) = writefds {
+        unsafe { fd_zero(p) };
+    }
+    if let Some(p) = exceptfds {
+        unsafe { fd_zero(p) };
+    }
 
     if n == 0 {
         return 0; // timeout
@@ -135,7 +157,7 @@ pub fn do_select(
     // Scatter ready bits back into the three fd_set outputs.
     let mut count = 0usize;
     for item in &items {
-        let fd  = item.fd as usize;
+        let fd = item.fd as usize;
         let rev = item.revents;
         if rev == 0 {
             continue;
@@ -194,12 +216,12 @@ pub fn do_select(
 /// (GPL-2.0-or-later, kernel.org).
 pub fn sys_select(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let nfds      = args.arg0 as usize;
-    let rfds_ptr  = args.arg1 as *mut u8;
-    let wfds_ptr  = args.arg2 as *mut u8;
-    let efds_ptr  = args.arg3 as *mut u8;
-    let tv_ptr    = args.arg4 as *const u8;
-    let fail      = SyscallReturn::ok((-1i64) as u64);
+    let nfds = args.arg0 as usize;
+    let rfds_ptr = args.arg1 as *mut u8;
+    let wfds_ptr = args.arg2 as *mut u8;
+    let efds_ptr = args.arg3 as *mut u8;
+    let tv_ptr = args.arg4 as *const u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
 
     if nfds > FD_SETSIZE {
         ctx.set_return(fail);
@@ -211,8 +233,8 @@ pub fn sys_select(ctx: &mut dyn TrapContext) {
         -1 // block forever
     } else {
         // SAFETY: user pointer, validated by size only.
-        let sec  = unsafe { core::ptr::read_unaligned(tv_ptr            as *const i64) };
-        let usec = unsafe { core::ptr::read_unaligned(tv_ptr.add(8)     as *const i64) };
+        let sec = unsafe { core::ptr::read_unaligned(tv_ptr as *const i64) };
+        let usec = unsafe { core::ptr::read_unaligned(tv_ptr.add(8) as *const i64) };
         // Convert to milliseconds; clamp to positive + finite range.
         if sec < 0 || usec < 0 {
             ctx.set_return(fail);
@@ -222,12 +244,24 @@ pub fn sys_select(ctx: &mut dyn TrapContext) {
         ms.max(0)
     };
 
-    let read_opt   = if rfds_ptr.is_null() { None } else { Some(rfds_ptr) };
-    let write_opt  = if wfds_ptr.is_null() { None } else { Some(wfds_ptr) };
-    let except_opt = if efds_ptr.is_null() { None } else { Some(efds_ptr) };
+    let read_opt = if rfds_ptr.is_null() {
+        None
+    } else {
+        Some(rfds_ptr)
+    };
+    let write_opt = if wfds_ptr.is_null() {
+        None
+    } else {
+        Some(wfds_ptr)
+    };
+    let except_opt = if efds_ptr.is_null() {
+        None
+    } else {
+        Some(efds_ptr)
+    };
 
     let task = current_task_id();
-    let n    = do_select(task, nfds, read_opt, write_opt, except_opt, timeout_ms);
+    let n = do_select(task, nfds, read_opt, write_opt, except_opt, timeout_ms);
 
     ctx.set_return(SyscallReturn::ok(n as u64));
 }
@@ -253,11 +287,11 @@ pub fn sys_select(ctx: &mut dyn TrapContext) {
 /// (GPL-2.0-or-later, kernel.org).
 pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let nfds     = args.arg0 as usize;
+    let nfds = args.arg0 as usize;
     let rfds_ptr = args.arg1 as *mut u8;
     let wfds_ptr = args.arg2 as *mut u8;
     let efds_ptr = args.arg3 as *mut u8;
-    let ts_ptr   = args.arg4 as *const u8;
+    let ts_ptr = args.arg4 as *const u8;
     // arg5 = ptr to { sigset_t*, sizemask } — we read it for validity
     // but ignore the mask (see module doc).
     let _sigmask_pair = args.arg5;
@@ -273,7 +307,7 @@ pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
         -1 // block forever
     } else {
         // SAFETY: user pointer; 16-byte access.
-        let sec  = unsafe { core::ptr::read_unaligned(ts_ptr       as *const i64) };
+        let sec = unsafe { core::ptr::read_unaligned(ts_ptr as *const i64) };
         let nsec = unsafe { core::ptr::read_unaligned(ts_ptr.add(8) as *const i64) };
         if sec < 0 || nsec < 0 {
             ctx.set_return(fail);
@@ -283,12 +317,24 @@ pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
         ms.max(0)
     };
 
-    let read_opt   = if rfds_ptr.is_null() { None } else { Some(rfds_ptr) };
-    let write_opt  = if wfds_ptr.is_null() { None } else { Some(wfds_ptr) };
-    let except_opt = if efds_ptr.is_null() { None } else { Some(efds_ptr) };
+    let read_opt = if rfds_ptr.is_null() {
+        None
+    } else {
+        Some(rfds_ptr)
+    };
+    let write_opt = if wfds_ptr.is_null() {
+        None
+    } else {
+        Some(wfds_ptr)
+    };
+    let except_opt = if efds_ptr.is_null() {
+        None
+    } else {
+        Some(efds_ptr)
+    };
 
     let task = current_task_id();
-    let n    = do_select(task, nfds, read_opt, write_opt, except_opt, timeout_ms);
+    let n = do_select(task, nfds, read_opt, write_opt, except_opt, timeout_ms);
 
     ctx.set_return(SyscallReturn::ok(n as u64));
 }

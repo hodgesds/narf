@@ -29,8 +29,8 @@ pub use narf_filesystem::{POLL_ERR, POLL_HUP, POLL_IN, POLL_NVAL, POLL_OUT, POLL
 /// Kernel-internal representation of a single poll item.
 #[derive(Copy, Clone, Debug)]
 pub struct PollFd {
-    pub fd:      i32,
-    pub events:  u16,
+    pub fd: i32,
+    pub events: u16,
     pub revents: u16,
 }
 
@@ -73,8 +73,8 @@ pub fn do_poll(task_id: u64, fds: &mut Vec<PollFd>, timeout_ms: i64) -> usize {
                         // OR in ERR/HUP/NVAL so they're always returned
                         // even if the caller didn't ask for them (POSIX).
                         let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
-                        let want   = item.events | always;
-                        let ready  = (mask as u16) & want;
+                        let want = item.events | always;
+                        let ready = (mask as u16) & want;
                         item.revents = ready;
                         if ready != 0 {
                             n_ready += 1;
@@ -123,11 +123,11 @@ pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> 
     for i in 0..nfds {
         // SAFETY: caller guarantees `nfds * 8` readable bytes from `ptr`.
         let base = unsafe { ptr.add(i * 8) };
-        let fd_val  = unsafe { core::ptr::read_unaligned(base as *const i32) };
-        let ev_val  = unsafe { core::ptr::read_unaligned(base.add(4) as *const u16) };
+        let fd_val = unsafe { core::ptr::read_unaligned(base as *const i32) };
+        let ev_val = unsafe { core::ptr::read_unaligned(base.add(4) as *const u16) };
         out.push(PollFd {
-            fd:      fd_val,
-            events:  ev_val,
+            fd: fd_val,
+            events: ev_val,
             revents: 0,
         });
     }
@@ -148,8 +148,8 @@ pub unsafe fn write_pollfds(ptr: *mut u8, fds: &[PollFd]) {
 
 // ── Syscall body ────────────────────────────────────────────────────
 
-use crate::syscall::{SyscallReturn, TrapContext};
 use crate::handlers::current_task_id;
+use crate::syscall::{SyscallReturn, TrapContext};
 
 /// `sys_poll(pollfds_ptr, nfds, timeout_ms)`
 ///
@@ -161,11 +161,11 @@ use crate::handlers::current_task_id;
 ///
 /// Linux ref: `fs/select.c`:do_sys_poll (GPL-2.0-or-later, kernel.org).
 pub fn sys_poll(ctx: &mut dyn TrapContext) {
-    let args    = *ctx.args();
-    let ptr     = args.arg0 as *mut u8;
-    let nfds    = args.arg1 as usize;
+    let args = *ctx.args();
+    let ptr = args.arg0 as *mut u8;
+    let nfds = args.arg1 as usize;
     let timeout = args.arg2 as i64;
-    let fail    = SyscallReturn::ok((-1i64) as u64);
+    let fail = SyscallReturn::ok((-1i64) as u64);
 
     // Upper bound on nfds to prevent OOM from hostile input.
     if nfds > 1_048_576 {
@@ -197,7 +197,7 @@ pub fn sys_poll(ctx: &mut dyn TrapContext) {
     };
 
     let task = current_task_id();
-    let n    = do_poll(task, &mut fds, timeout);
+    let n = do_poll(task, &mut fds, timeout);
 
     // Write revents back to user memory.
     // SAFETY: same pointer/length as parse step; user AS still active.

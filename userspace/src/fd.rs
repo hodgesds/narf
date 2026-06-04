@@ -313,22 +313,14 @@ impl FileOps for ConsoleFile {
             TIOCGWINSZ => {
                 let ws = console_winsize();
                 let bytes: [u8; 8] = unsafe { core::mem::transmute(ws) };
-                if unsafe {
-                    crate::handlers::copy_to_user(arg as u64, &bytes)
-                }
-                .is_err()
-                {
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
                 Ok(0)
             }
             TIOCSWINSZ => {
                 let mut bytes = [0u8; 8];
-                if unsafe {
-                    crate::handlers::copy_from_user(&mut bytes, arg as u64)
-                }
-                .is_err()
-                {
+                if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
                 let ws: Winsize = unsafe { core::mem::transmute(bytes) };
@@ -339,11 +331,7 @@ impl FileOps for ConsoleFile {
                 // Best-effort: peek the input ring's current depth.
                 let n: i32 = narf_input::pending_bytes() as i32;
                 let bytes = n.to_le_bytes();
-                if unsafe {
-                    crate::handlers::copy_to_user(arg as u64, &bytes)
-                }
-                .is_err()
-                {
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
                 Ok(0)
@@ -352,22 +340,14 @@ impl FileOps for ConsoleFile {
                 // pid_t = i32 on Linux x86_64.
                 let pgrp = console_fg_pgrp() as i32;
                 let bytes = pgrp.to_le_bytes();
-                if unsafe {
-                    crate::handlers::copy_to_user(arg as u64, &bytes)
-                }
-                .is_err()
-                {
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
                 Ok(0)
             }
             TIOCSPGRP => {
                 let mut bytes = [0u8; 4];
-                if unsafe {
-                    crate::handlers::copy_from_user(&mut bytes, arg as u64)
-                }
-                .is_err()
-                {
+                if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
                 let pgrp = i32::from_le_bytes(bytes);

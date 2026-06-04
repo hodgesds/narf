@@ -44,8 +44,7 @@ use crate::{
 /// Shared parent AS for tests that need a live address space.  Kept in
 /// a lock the same way `tests.rs` does it.
 #[cfg(target_arch = "x86_64")]
-static PROC_PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
-    IrqSafeSpinLock::new(None);
+static PROC_PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
 
 #[cfg(target_arch = "x86_64")]
 fn lookup_proc_parent_as() -> Option<Arc<AddressSpace>> {
@@ -207,9 +206,9 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: (-1i64) as u64,               // any child
+            arg0: (-1i64) as u64, // any child
             arg1: &mut status as *mut i32 as u64,
-            arg2: 1,                             // WNOHANG — child already exited
+            arg2: 1, // WNOHANG — child already exited
             arg3: 0,
             arg4: 0,
             arg5: 0,
@@ -339,7 +338,7 @@ fn smoke_process_wait4_wnohang() -> TestResult {
         args: SyscallArgs {
             arg0: (-1i64) as u64, // any child
             arg1: 0,
-            arg2: 1,              // WNOHANG
+            arg2: 1, // WNOHANG
             arg3: 0,
             arg4: 0,
             arg5: 0,
@@ -599,7 +598,11 @@ fn smoke_process_kill_sigusr1_delivery() -> TestResult {
 
     match sctx.delivered {
         Some(p) if p.handler == HANDLER && p.signum == SIGUSR1 => {}
-        _ => return TestResult::Fail("delivery hook did not call deliver_signal with expected params"),
+        _ => {
+            return TestResult::Fail(
+                "delivery hook did not call deliver_signal with expected params",
+            )
+        }
     }
     if pending_after & (1 << SIGUSR1) != 0 {
         return TestResult::Fail("delivery did not clear the pending bit");
@@ -771,7 +774,7 @@ fn smoke_process_sa_mask_blocks_reentry() -> TestResult {
     let unblock_mask: u32 = 1 << SIGUSR1;
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 1u64,                    // SIG_UNBLOCK
+            arg0: 1u64, // SIG_UNBLOCK
             arg1: unblock_mask as u64,
             ..SyscallArgs::default()
         },
@@ -837,7 +840,7 @@ fn smoke_process_sigprocmask_block_unblock() -> TestResult {
     let block_set: u32 = 1 << SIGUSR2;
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 0,                     // SIG_BLOCK
+            arg0: 0, // SIG_BLOCK
             arg1: block_set as u64,
             ..SyscallArgs::default()
         },
@@ -879,7 +882,7 @@ fn smoke_process_sigprocmask_block_unblock() -> TestResult {
     // Unblock.
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 1,                     // SIG_UNBLOCK
+            arg0: 1, // SIG_UNBLOCK
             arg1: block_set as u64,
             ..SyscallArgs::default()
         },
@@ -1183,7 +1186,10 @@ fn smoke_wave35_fork_returns_nonzero_child_pid() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace/process", smoke_wave35_fork_returns_nonzero_child_pid);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave35_fork_returns_nonzero_child_pid
+);
 
 // ── Smoke 14 (Wave-35): pipe allocates two distinct fds > 2 ──────────
 //
@@ -1241,7 +1247,10 @@ fn smoke_wave35_pipe_allocates_distinct_fds() -> TestResult {
     teardown_process_state();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_wave35_pipe_allocates_distinct_fds);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave35_pipe_allocates_distinct_fds
+);
 
 // ── Smoke 15 (Wave-35): dup2 rewires a descriptor ────────────────────
 //
@@ -1286,7 +1295,7 @@ fn smoke_wave35_dup2_rewires_descriptor() -> TestResult {
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: rfd as u64,
-            arg1: 0,          // target = stdin
+            arg1: 0, // target = stdin
             ..SyscallArgs::default()
         },
         ret: None,
@@ -1433,7 +1442,10 @@ fn smoke_wave35_getppid_differs_from_getpid() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace/process", smoke_wave35_getppid_differs_from_getpid);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave35_getppid_differs_from_getpid
+);
 
 // ── Smoke 18 (Wave-35): waitpid WNOHANG before/after child exit ───────
 //
@@ -1468,7 +1480,7 @@ fn smoke_wave35_waitpid_wnohang_before_after() -> TestResult {
         args: SyscallArgs {
             arg0: (-1i64) as u64, // any child
             arg1: 0,
-            arg2: 1,              // WNOHANG
+            arg2: 1, // WNOHANG
             arg3: 0,
             arg4: 0,
             arg5: 0,
@@ -1510,7 +1522,10 @@ fn smoke_wave35_waitpid_wnohang_before_after() -> TestResult {
     teardown_process_state();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_wave35_waitpid_wnohang_before_after);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave35_waitpid_wnohang_before_after
+);
 
 // ── Smoke 19 (Wave-37): blocking wait4 fallback — exit before wait ────
 //
@@ -1577,7 +1592,10 @@ fn smoke_wave37_blocking_wait4_fallback_exit_before_wait() -> TestResult {
     teardown_process_state();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_wave37_blocking_wait4_fallback_exit_before_wait);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave37_blocking_wait4_fallback_exit_before_wait
+);
 
 // ── Smoke 20 (Wave-37): wait_child_check_fn callback contract ─────────
 //
@@ -1629,7 +1647,10 @@ fn smoke_wave37_wait_child_check_fn_contract() -> TestResult {
     teardown_process_state();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_wave37_wait_child_check_fn_contract);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave37_wait_child_check_fn_contract
+);
 
 // ── Smoke 21 (Wave-37): on_child_exit fires wake_wait_child ───────────
 //
@@ -1788,7 +1809,10 @@ fn smoke_wave37_three_children_sequential_reap() -> TestResult {
     teardown_process_state();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_wave37_three_children_sequential_reap);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave37_three_children_sequential_reap
+);
 
 // ── Wave-38 smokes: ProcessId ↔ TaskId aliasing hardening ────────────
 //
@@ -1805,7 +1829,9 @@ kernel_test_in!("userspace/process", smoke_wave37_three_children_sequential_reap
 
 /// Smoke 23: Direct mapping table insert + bidirectional lookup.
 fn smoke_wave38_pid_task_mapping_roundtrip() -> TestResult {
-    use crate::handlers::{__test_wait_reset, pid_to_task_raw, register_pid_task_mapping, task_to_pid_raw, wait_init};
+    use crate::handlers::{
+        __test_wait_reset, pid_to_task_raw, register_pid_task_mapping, task_to_pid_raw, wait_init,
+    };
 
     crate::syscall::__test_clear_global();
     crate::handlers::__test_wait_reset();
@@ -1969,7 +1995,10 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
     install_global(t);
 
     // Fork → child_pid (ProcessId).
-    let mut ctx = StubCtx { args: SyscallArgs::default(), ret: None };
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
     let child_pid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
@@ -2039,20 +2068,23 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace/process", smoke_wave38_wait4_returns_child_process_id);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave38_wait4_returns_child_process_id
+);
 
 /// Smoke 26: on_child_exit fires correctly even when the child's
 /// ProcessId and TaskId are explicitly mismatched (injected directly
 /// into the mapping table, bypassing fork's counter alignment).
 fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     use crate::handlers::{
-        __test_inject_parent_of, __test_wait_reset, pid_to_task_raw,
-        register_pid_task_mapping, signal_pending_of, wait_init,
+        __test_inject_parent_of, __test_wait_reset, pid_to_task_raw, register_pid_task_mapping,
+        signal_pending_of, wait_init,
     };
 
     const PARENT_TASK: u64 = 0xAA01; // parent's "TaskId" (current_task_id() value)
-    const CHILD_PID: u64 = 0xBB05;   // child's ProcessId (alloc_pid() value)
-    const CHILD_TASK: u64 = 0xCC99;  // child's TaskId (spawn_user() value) — different!
+    const CHILD_PID: u64 = 0xBB05; // child's ProcessId (alloc_pid() value)
+    const CHILD_TASK: u64 = 0xCC99; // child's TaskId (spawn_user() value) — different!
 
     crate::syscall::__test_clear_global();
     crate::handlers::__test_wait_reset();
@@ -2107,7 +2139,9 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
             arg0: (-1i64) as u64,
             arg1: &mut status as *mut i32 as u64,
             arg2: 1, // WNOHANG
-            arg3: 0, arg4: 0, arg5: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
         },
         ret: None,
     };
@@ -2140,4 +2174,7 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_wave38_on_child_exit_with_mismatched_ids);
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave38_on_child_exit_with_mismatched_ids
+);

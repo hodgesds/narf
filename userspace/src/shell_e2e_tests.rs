@@ -44,8 +44,7 @@ use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
 use crate::{
-    fd, install_address_space_lookup, install_core_syscalls, install_global,
-    install_task_id_lookup,
+    fd, install_address_space_lookup, install_core_syscalls, install_global, install_task_id_lookup,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -73,8 +72,7 @@ impl TrapContext for StubCtx {
 
 /// Shared AS used by smokes that call `sys_fork`.
 #[cfg(target_arch = "x86_64")]
-static SHELL_PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
-    IrqSafeSpinLock::new(None);
+static SHELL_PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
 
 #[cfg(target_arch = "x86_64")]
 fn lookup_shell_parent_as() -> Option<Arc<AddressSpace>> {
@@ -124,10 +122,7 @@ fn trim_arg(s: &[u8]) -> &[u8] {
 
 /// Returns `(command_token, rest_after_leading_whitespace)`.
 fn split_first(line: &[u8]) -> (&[u8], &[u8]) {
-    let start = line
-        .iter()
-        .position(|&b| b != b' ')
-        .unwrap_or(line.len());
+    let start = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
     let line = &line[start..];
     match line.iter().position(|&b| b == b' ') {
         Some(i) => (&line[..i], skip_ws(&line[i..])),
@@ -261,26 +256,73 @@ fn lex4(input: &[u8]) -> alloc::vec::Vec<Tok4> {
     let mut i = 0usize;
     while i < input.len() {
         let b = input[i];
-        if b == b' ' || b == b'\t' { i += 1; continue; }
+        if b == b' ' || b == b'\t' {
+            i += 1;
+            continue;
+        }
         match b {
-            b'|' if i + 1 < input.len() && input[i+1] == b'|' => { out.push(Tok4::Or);        i += 2; }
-            b'|' => { out.push(Tok4::Pipe);        i += 1; }
-            b'&' if i + 1 < input.len() && input[i+1] == b'&' => { out.push(Tok4::And);        i += 2; }
-            b'&' => { out.push(Tok4::Ampersand);   i += 1; }
-            b';' => { out.push(Tok4::Semicolon);   i += 1; }
-            b'>' if i + 1 < input.len() && input[i+1] == b'>' => { out.push(Tok4::RedirAppend); i += 2; }
-            b'>' => { out.push(Tok4::RedirOut);    i += 1; }
-            b'<' => { out.push(Tok4::RedirIn);     i += 1; }
+            b'|' if i + 1 < input.len() && input[i + 1] == b'|' => {
+                out.push(Tok4::Or);
+                i += 2;
+            }
+            b'|' => {
+                out.push(Tok4::Pipe);
+                i += 1;
+            }
+            b'&' if i + 1 < input.len() && input[i + 1] == b'&' => {
+                out.push(Tok4::And);
+                i += 2;
+            }
+            b'&' => {
+                out.push(Tok4::Ampersand);
+                i += 1;
+            }
+            b';' => {
+                out.push(Tok4::Semicolon);
+                i += 1;
+            }
+            b'>' if i + 1 < input.len() && input[i + 1] == b'>' => {
+                out.push(Tok4::RedirAppend);
+                i += 2;
+            }
+            b'>' => {
+                out.push(Tok4::RedirOut);
+                i += 1;
+            }
+            b'<' => {
+                out.push(Tok4::RedirIn);
+                i += 1;
+            }
             _ => {
                 // Consume a word token.
                 while i < input.len() {
                     let c = input[i];
                     match c {
                         b' ' | b'\t' | b'|' | b'&' | b';' | b'>' | b'<' => break,
-                        b'\'' => { i += 1; while i < input.len() && input[i] != b'\'' { i += 1; } if i < input.len() { i += 1; } }
-                        b'"'  => { i += 1; while i < input.len() && input[i] != b'"'  { i += 1; } if i < input.len() { i += 1; } }
-                        b'\\' => { i += 2; }
-                        _ => { i += 1; }
+                        b'\'' => {
+                            i += 1;
+                            while i < input.len() && input[i] != b'\'' {
+                                i += 1;
+                            }
+                            if i < input.len() {
+                                i += 1;
+                            }
+                        }
+                        b'"' => {
+                            i += 1;
+                            while i < input.len() && input[i] != b'"' {
+                                i += 1;
+                            }
+                            if i < input.len() {
+                                i += 1;
+                            }
+                        }
+                        b'\\' => {
+                            i += 2;
+                        }
+                        _ => {
+                            i += 1;
+                        }
                     }
                 }
                 out.push(Tok4::Word);
@@ -839,9 +881,9 @@ fn smoke_shell_fork_wait4_exit_status() -> TestResult {
     SHELL_TASK.store(PARENT, Ordering::Relaxed);
     let mut wctx = StubCtx {
         args: SyscallArgs {
-            arg0: u64::MAX,                    // -1 as u64 = any child
+            arg0: u64::MAX, // -1 as u64 = any child
             arg1: &mut wstatus as *mut i32 as u64,
-            arg2: 1,                           // WNOHANG
+            arg2: 1, // WNOHANG
             arg3: 0,
             arg4: 0,
             arg5: 0,
@@ -1167,26 +1209,73 @@ fn lex4_with_words<'a>(input: &'a [u8]) -> alloc::vec::Vec<(Tok4, &'a [u8])> {
     let mut i = 0usize;
     while i < input.len() {
         let b = input[i];
-        if b == b' ' || b == b'\t' { i += 1; continue; }
+        if b == b' ' || b == b'\t' {
+            i += 1;
+            continue;
+        }
         match b {
-            b'|' if i + 1 < input.len() && input[i+1] == b'|' => { out.push((Tok4::Or,         &input[i..i+2])); i += 2; }
-            b'|' => { out.push((Tok4::Pipe,        &input[i..i+1])); i += 1; }
-            b'&' if i + 1 < input.len() && input[i+1] == b'&' => { out.push((Tok4::And,         &input[i..i+2])); i += 2; }
-            b'&' => { out.push((Tok4::Ampersand,   &input[i..i+1])); i += 1; }
-            b';' => { out.push((Tok4::Semicolon,   &input[i..i+1])); i += 1; }
-            b'>' if i + 1 < input.len() && input[i+1] == b'>' => { out.push((Tok4::RedirAppend, &input[i..i+2])); i += 2; }
-            b'>' => { out.push((Tok4::RedirOut,    &input[i..i+1])); i += 1; }
-            b'<' => { out.push((Tok4::RedirIn,     &input[i..i+1])); i += 1; }
+            b'|' if i + 1 < input.len() && input[i + 1] == b'|' => {
+                out.push((Tok4::Or, &input[i..i + 2]));
+                i += 2;
+            }
+            b'|' => {
+                out.push((Tok4::Pipe, &input[i..i + 1]));
+                i += 1;
+            }
+            b'&' if i + 1 < input.len() && input[i + 1] == b'&' => {
+                out.push((Tok4::And, &input[i..i + 2]));
+                i += 2;
+            }
+            b'&' => {
+                out.push((Tok4::Ampersand, &input[i..i + 1]));
+                i += 1;
+            }
+            b';' => {
+                out.push((Tok4::Semicolon, &input[i..i + 1]));
+                i += 1;
+            }
+            b'>' if i + 1 < input.len() && input[i + 1] == b'>' => {
+                out.push((Tok4::RedirAppend, &input[i..i + 2]));
+                i += 2;
+            }
+            b'>' => {
+                out.push((Tok4::RedirOut, &input[i..i + 1]));
+                i += 1;
+            }
+            b'<' => {
+                out.push((Tok4::RedirIn, &input[i..i + 1]));
+                i += 1;
+            }
             _ => {
                 let start = i;
                 while i < input.len() {
                     let c = input[i];
                     match c {
                         b' ' | b'\t' | b'|' | b'&' | b';' | b'>' | b'<' => break,
-                        b'\'' => { i += 1; while i < input.len() && input[i] != b'\'' { i += 1; } if i < input.len() { i += 1; } }
-                        b'"'  => { i += 1; while i < input.len() && input[i] != b'"'  { i += 1; } if i < input.len() { i += 1; } }
-                        b'\\' => { i += 2; }
-                        _ => { i += 1; }
+                        b'\'' => {
+                            i += 1;
+                            while i < input.len() && input[i] != b'\'' {
+                                i += 1;
+                            }
+                            if i < input.len() {
+                                i += 1;
+                            }
+                        }
+                        b'"' => {
+                            i += 1;
+                            while i < input.len() && input[i] != b'"' {
+                                i += 1;
+                            }
+                            if i < input.len() {
+                                i += 1;
+                            }
+                        }
+                        b'\\' => {
+                            i += 2;
+                        }
+                        _ => {
+                            i += 1;
+                        }
                     }
                 }
                 out.push((Tok4::Word, &input[start..i]));
@@ -1206,24 +1295,41 @@ fn word_value(raw: &[u8]) -> alloc::vec::Vec<u8> {
         match raw[i] {
             b'\'' => {
                 i += 1;
-                while i < raw.len() && raw[i] != b'\'' { out.push(raw[i]); i += 1; }
-                if i < raw.len() { i += 1; }
+                while i < raw.len() && raw[i] != b'\'' {
+                    out.push(raw[i]);
+                    i += 1;
+                }
+                if i < raw.len() {
+                    i += 1;
+                }
             }
             b'"' => {
                 i += 1;
                 while i < raw.len() && raw[i] != b'"' {
-                    if raw[i] == b'\\' && i + 1 < raw.len() && raw[i+1] == b'"' {
-                        out.push(b'"'); i += 2;
+                    if raw[i] == b'\\' && i + 1 < raw.len() && raw[i + 1] == b'"' {
+                        out.push(b'"');
+                        i += 2;
                     } else {
-                        out.push(raw[i]); i += 1;
+                        out.push(raw[i]);
+                        i += 1;
                     }
                 }
-                if i < raw.len() { i += 1; }
+                if i < raw.len() {
+                    i += 1;
+                }
             }
             b'\\' => {
-                if i + 1 < raw.len() { out.push(raw[i+1]); i += 2; } else { i += 1; }
+                if i + 1 < raw.len() {
+                    out.push(raw[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-            b => { out.push(b); i += 1; }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
     out
@@ -1240,12 +1346,24 @@ fn smoke_shell_parser_sequence_recognized() -> TestResult {
     if toks.len() != 6 {
         return TestResult::Fail("seq: expected 6 tokens");
     }
-    if toks[0] != Tok4::Word      { return TestResult::Fail("seq: tok[0] not Word"); }
-    if toks[1] != Tok4::Word      { return TestResult::Fail("seq: tok[1] not Word"); }
-    if toks[2] != Tok4::Semicolon { return TestResult::Fail("seq: tok[2] not Semicolon"); }
-    if toks[3] != Tok4::Word      { return TestResult::Fail("seq: tok[3] not Word"); }
-    if toks[4] != Tok4::Word      { return TestResult::Fail("seq: tok[4] not Word"); }
-    if toks[5] != Tok4::Eof       { return TestResult::Fail("seq: tok[5] not Eof"); }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("seq: tok[0] not Word");
+    }
+    if toks[1] != Tok4::Word {
+        return TestResult::Fail("seq: tok[1] not Word");
+    }
+    if toks[2] != Tok4::Semicolon {
+        return TestResult::Fail("seq: tok[2] not Semicolon");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("seq: tok[3] not Word");
+    }
+    if toks[4] != Tok4::Word {
+        return TestResult::Fail("seq: tok[4] not Word");
+    }
+    if toks[5] != Tok4::Eof {
+        return TestResult::Fail("seq: tok[5] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_sequence_recognized);
@@ -1256,12 +1374,24 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_sequence_recognized);
 
 fn smoke_shell_parser_and_recognized() -> TestResult {
     let toks = lex4(b"true && echo ok");
-    if toks.len() != 5 { return TestResult::Fail("and: expected 5 tokens"); }
-    if toks[0] != Tok4::Word { return TestResult::Fail("and: tok[0] not Word"); }
-    if toks[1] != Tok4::And  { return TestResult::Fail("and: tok[1] not And"); }
-    if toks[2] != Tok4::Word { return TestResult::Fail("and: tok[2] not Word"); }
-    if toks[3] != Tok4::Word { return TestResult::Fail("and: tok[3] not Word"); }
-    if toks[4] != Tok4::Eof  { return TestResult::Fail("and: tok[4] not Eof"); }
+    if toks.len() != 5 {
+        return TestResult::Fail("and: expected 5 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("and: tok[0] not Word");
+    }
+    if toks[1] != Tok4::And {
+        return TestResult::Fail("and: tok[1] not And");
+    }
+    if toks[2] != Tok4::Word {
+        return TestResult::Fail("and: tok[2] not Word");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("and: tok[3] not Word");
+    }
+    if toks[4] != Tok4::Eof {
+        return TestResult::Fail("and: tok[4] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_and_recognized);
@@ -1272,12 +1402,24 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_and_recognized);
 
 fn smoke_shell_parser_or_recognized() -> TestResult {
     let toks = lex4(b"false || echo recovered");
-    if toks.len() != 5 { return TestResult::Fail("or: expected 5 tokens"); }
-    if toks[0] != Tok4::Word { return TestResult::Fail("or: tok[0] not Word"); }
-    if toks[1] != Tok4::Or   { return TestResult::Fail("or: tok[1] not Or"); }
-    if toks[2] != Tok4::Word { return TestResult::Fail("or: tok[2] not Word"); }
-    if toks[3] != Tok4::Word { return TestResult::Fail("or: tok[3] not Word"); }
-    if toks[4] != Tok4::Eof  { return TestResult::Fail("or: tok[4] not Eof"); }
+    if toks.len() != 5 {
+        return TestResult::Fail("or: expected 5 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("or: tok[0] not Word");
+    }
+    if toks[1] != Tok4::Or {
+        return TestResult::Fail("or: tok[1] not Or");
+    }
+    if toks[2] != Tok4::Word {
+        return TestResult::Fail("or: tok[2] not Word");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("or: tok[3] not Word");
+    }
+    if toks[4] != Tok4::Eof {
+        return TestResult::Fail("or: tok[4] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_or_recognized);
@@ -1288,11 +1430,21 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_or_recognized);
 
 fn smoke_shell_parser_background_recognized() -> TestResult {
     let toks = lex4(b"sleep 0 &");
-    if toks.len() != 4 { return TestResult::Fail("bg: expected 4 tokens"); }
-    if toks[0] != Tok4::Word      { return TestResult::Fail("bg: tok[0] not Word"); }
-    if toks[1] != Tok4::Word      { return TestResult::Fail("bg: tok[1] not Word"); }
-    if toks[2] != Tok4::Ampersand { return TestResult::Fail("bg: tok[2] not Ampersand"); }
-    if toks[3] != Tok4::Eof       { return TestResult::Fail("bg: tok[3] not Eof"); }
+    if toks.len() != 4 {
+        return TestResult::Fail("bg: expected 4 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("bg: tok[0] not Word");
+    }
+    if toks[1] != Tok4::Word {
+        return TestResult::Fail("bg: tok[1] not Word");
+    }
+    if toks[2] != Tok4::Ampersand {
+        return TestResult::Fail("bg: tok[2] not Ampersand");
+    }
+    if toks[3] != Tok4::Eof {
+        return TestResult::Fail("bg: tok[3] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_background_recognized);
@@ -1303,12 +1455,24 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_background_recognized);
 
 fn smoke_shell_parser_append_recognized() -> TestResult {
     let toks = lex4(b"echo line >> /tmp/r.txt");
-    if toks.len() != 5 { return TestResult::Fail("append: expected 5 tokens"); }
-    if toks[0] != Tok4::Word        { return TestResult::Fail("append: tok[0] not Word"); }
-    if toks[1] != Tok4::Word        { return TestResult::Fail("append: tok[1] not Word"); }
-    if toks[2] != Tok4::RedirAppend { return TestResult::Fail("append: tok[2] not RedirAppend"); }
-    if toks[3] != Tok4::Word        { return TestResult::Fail("append: tok[3] not Word"); }
-    if toks[4] != Tok4::Eof         { return TestResult::Fail("append: tok[4] not Eof"); }
+    if toks.len() != 5 {
+        return TestResult::Fail("append: expected 5 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("append: tok[0] not Word");
+    }
+    if toks[1] != Tok4::Word {
+        return TestResult::Fail("append: tok[1] not Word");
+    }
+    if toks[2] != Tok4::RedirAppend {
+        return TestResult::Fail("append: tok[2] not RedirAppend");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("append: tok[3] not Word");
+    }
+    if toks[4] != Tok4::Eof {
+        return TestResult::Fail("append: tok[4] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_append_recognized);
@@ -1319,11 +1483,21 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_append_recognized);
 
 fn smoke_shell_parser_stdin_redir_recognized() -> TestResult {
     let toks = lex4(b"cat < /tmp/r.txt");
-    if toks.len() != 4 { return TestResult::Fail("stdin-redir: expected 4 tokens"); }
-    if toks[0] != Tok4::Word    { return TestResult::Fail("stdin-redir: tok[0] not Word"); }
-    if toks[1] != Tok4::RedirIn { return TestResult::Fail("stdin-redir: tok[1] not RedirIn"); }
-    if toks[2] != Tok4::Word    { return TestResult::Fail("stdin-redir: tok[2] not Word"); }
-    if toks[3] != Tok4::Eof     { return TestResult::Fail("stdin-redir: tok[3] not Eof"); }
+    if toks.len() != 4 {
+        return TestResult::Fail("stdin-redir: expected 4 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("stdin-redir: tok[0] not Word");
+    }
+    if toks[1] != Tok4::RedirIn {
+        return TestResult::Fail("stdin-redir: tok[1] not RedirIn");
+    }
+    if toks[2] != Tok4::Word {
+        return TestResult::Fail("stdin-redir: tok[2] not Word");
+    }
+    if toks[3] != Tok4::Eof {
+        return TestResult::Fail("stdin-redir: tok[3] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_stdin_redir_recognized);
@@ -1335,10 +1509,18 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_stdin_redir_recognized);
 fn smoke_shell_parser_double_quoted() -> TestResult {
     let pairs = lex4_with_words(b"echo \"a b\" c");
     // Tokens: Word("echo") Word("\"a b\"") Word("c") Eof
-    if pairs.len() != 4 { return TestResult::Fail("dquote: expected 4 tokens"); }
-    if pairs[0].0 != Tok4::Word { return TestResult::Fail("dquote: tok[0] not Word"); }
-    if pairs[1].0 != Tok4::Word { return TestResult::Fail("dquote: tok[1] not Word"); }
-    if pairs[2].0 != Tok4::Word { return TestResult::Fail("dquote: tok[2] not Word"); }
+    if pairs.len() != 4 {
+        return TestResult::Fail("dquote: expected 4 tokens");
+    }
+    if pairs[0].0 != Tok4::Word {
+        return TestResult::Fail("dquote: tok[0] not Word");
+    }
+    if pairs[1].0 != Tok4::Word {
+        return TestResult::Fail("dquote: tok[1] not Word");
+    }
+    if pairs[2].0 != Tok4::Word {
+        return TestResult::Fail("dquote: tok[2] not Word");
+    }
     // The raw token for "\"a b\"" — strip quotes and verify interior bytes.
     let v = word_value(pairs[1].1);
     if v != b"a b" {
@@ -1355,12 +1537,20 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_double_quoted);
 
 fn smoke_shell_parser_single_quoted() -> TestResult {
     let pairs = lex4_with_words(b"echo 'literal \"quoted\"'");
-    if pairs.len() != 3 { return TestResult::Fail("squote: expected 3 tokens"); }
-    if pairs[0].0 != Tok4::Word { return TestResult::Fail("squote: tok[0] not Word"); }
-    if pairs[1].0 != Tok4::Word { return TestResult::Fail("squote: tok[1] not Word"); }
+    if pairs.len() != 3 {
+        return TestResult::Fail("squote: expected 3 tokens");
+    }
+    if pairs[0].0 != Tok4::Word {
+        return TestResult::Fail("squote: tok[0] not Word");
+    }
+    if pairs[1].0 != Tok4::Word {
+        return TestResult::Fail("squote: tok[1] not Word");
+    }
     let v = word_value(pairs[1].1);
     if v != b"literal \"quoted\"" {
-        return TestResult::Fail("squote: single-quoted value should preserve double-quotes literally");
+        return TestResult::Fail(
+            "squote: single-quoted value should preserve double-quotes literally",
+        );
     }
     TestResult::Pass
 }
@@ -1372,12 +1562,20 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_single_quoted);
 
 fn smoke_shell_parser_backslash_escape() -> TestResult {
     let pairs = lex4_with_words(b"echo \\\"hello\\\"");
-    if pairs.len() != 3 { return TestResult::Fail("bslash: expected 3 tokens"); }
-    if pairs[0].0 != Tok4::Word { return TestResult::Fail("bslash: tok[0] not Word"); }
-    if pairs[1].0 != Tok4::Word { return TestResult::Fail("bslash: tok[1] not Word"); }
+    if pairs.len() != 3 {
+        return TestResult::Fail("bslash: expected 3 tokens");
+    }
+    if pairs[0].0 != Tok4::Word {
+        return TestResult::Fail("bslash: tok[0] not Word");
+    }
+    if pairs[1].0 != Tok4::Word {
+        return TestResult::Fail("bslash: tok[1] not Word");
+    }
     let v = word_value(pairs[1].1);
     if v != b"\"hello\"" {
-        return TestResult::Fail("bslash: escaped quotes should produce literal double-quote chars");
+        return TestResult::Fail(
+            "bslash: escaped quotes should produce literal double-quote chars",
+        );
     }
     TestResult::Pass
 }
@@ -1391,14 +1589,30 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_backslash_escape);
 fn smoke_shell_parser_multi_pipe() -> TestResult {
     let toks = lex4(b"echo a | cat | cat");
     // Word Word Pipe Word Pipe Word Eof
-    if toks.len() != 7 { return TestResult::Fail("multi-pipe: expected 7 tokens"); }
-    if toks[0] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[0] not Word"); }
-    if toks[1] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[1] not Word"); }
-    if toks[2] != Tok4::Pipe { return TestResult::Fail("multi-pipe: tok[2] not Pipe"); }
-    if toks[3] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[3] not Word"); }
-    if toks[4] != Tok4::Pipe { return TestResult::Fail("multi-pipe: tok[4] not Pipe"); }
-    if toks[5] != Tok4::Word { return TestResult::Fail("multi-pipe: tok[5] not Word"); }
-    if toks[6] != Tok4::Eof  { return TestResult::Fail("multi-pipe: tok[6] not Eof"); }
+    if toks.len() != 7 {
+        return TestResult::Fail("multi-pipe: expected 7 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("multi-pipe: tok[0] not Word");
+    }
+    if toks[1] != Tok4::Word {
+        return TestResult::Fail("multi-pipe: tok[1] not Word");
+    }
+    if toks[2] != Tok4::Pipe {
+        return TestResult::Fail("multi-pipe: tok[2] not Pipe");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("multi-pipe: tok[3] not Word");
+    }
+    if toks[4] != Tok4::Pipe {
+        return TestResult::Fail("multi-pipe: tok[4] not Pipe");
+    }
+    if toks[5] != Tok4::Word {
+        return TestResult::Fail("multi-pipe: tok[5] not Word");
+    }
+    if toks[6] != Tok4::Eof {
+        return TestResult::Fail("multi-pipe: tok[6] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_multi_pipe);
@@ -1410,13 +1624,27 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_multi_pipe);
 
 fn smoke_shell_parser_pipe_vs_or() -> TestResult {
     let toks = lex4(b"a || b | c");
-    if toks.len() != 6 { return TestResult::Fail("pipe-vs-or: expected 6 tokens"); }
-    if toks[0] != Tok4::Word { return TestResult::Fail("pipe-vs-or: tok[0] not Word"); }
-    if toks[1] != Tok4::Or   { return TestResult::Fail("pipe-vs-or: tok[1] not Or (got Pipe?)"); }
-    if toks[2] != Tok4::Word { return TestResult::Fail("pipe-vs-or: tok[2] not Word"); }
-    if toks[3] != Tok4::Pipe { return TestResult::Fail("pipe-vs-or: tok[3] not Pipe"); }
-    if toks[4] != Tok4::Word { return TestResult::Fail("pipe-vs-or: tok[4] not Word"); }
-    if toks[5] != Tok4::Eof  { return TestResult::Fail("pipe-vs-or: tok[5] not Eof"); }
+    if toks.len() != 6 {
+        return TestResult::Fail("pipe-vs-or: expected 6 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("pipe-vs-or: tok[0] not Word");
+    }
+    if toks[1] != Tok4::Or {
+        return TestResult::Fail("pipe-vs-or: tok[1] not Or (got Pipe?)");
+    }
+    if toks[2] != Tok4::Word {
+        return TestResult::Fail("pipe-vs-or: tok[2] not Word");
+    }
+    if toks[3] != Tok4::Pipe {
+        return TestResult::Fail("pipe-vs-or: tok[3] not Pipe");
+    }
+    if toks[4] != Tok4::Word {
+        return TestResult::Fail("pipe-vs-or: tok[4] not Word");
+    }
+    if toks[5] != Tok4::Eof {
+        return TestResult::Fail("pipe-vs-or: tok[5] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_pipe_vs_or);
@@ -1427,12 +1655,24 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_pipe_vs_or);
 
 fn smoke_shell_parser_ampersand_vs_and() -> TestResult {
     let toks = lex4(b"cmd1 && cmd2 &");
-    if toks.len() != 5 { return TestResult::Fail("amp-vs-and: expected 5 tokens"); }
-    if toks[0] != Tok4::Word      { return TestResult::Fail("amp-vs-and: tok[0] not Word"); }
-    if toks[1] != Tok4::And       { return TestResult::Fail("amp-vs-and: tok[1] not And (got Ampersand?)"); }
-    if toks[2] != Tok4::Word      { return TestResult::Fail("amp-vs-and: tok[2] not Word"); }
-    if toks[3] != Tok4::Ampersand { return TestResult::Fail("amp-vs-and: tok[3] not Ampersand"); }
-    if toks[4] != Tok4::Eof       { return TestResult::Fail("amp-vs-and: tok[4] not Eof"); }
+    if toks.len() != 5 {
+        return TestResult::Fail("amp-vs-and: expected 5 tokens");
+    }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("amp-vs-and: tok[0] not Word");
+    }
+    if toks[1] != Tok4::And {
+        return TestResult::Fail("amp-vs-and: tok[1] not And (got Ampersand?)");
+    }
+    if toks[2] != Tok4::Word {
+        return TestResult::Fail("amp-vs-and: tok[2] not Word");
+    }
+    if toks[3] != Tok4::Ampersand {
+        return TestResult::Fail("amp-vs-and: tok[3] not Ampersand");
+    }
+    if toks[4] != Tok4::Eof {
+        return TestResult::Fail("amp-vs-and: tok[4] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_ampersand_vs_and);
@@ -1444,10 +1684,16 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_ampersand_vs_and);
 
 fn smoke_shell_parser_empty_line_v2() -> TestResult {
     let toks = lex4(b"");
-    if toks.len() != 1 { return TestResult::Fail("empty-v2: expected exactly Eof"); }
-    if toks[0] != Tok4::Eof { return TestResult::Fail("empty-v2: only token should be Eof"); }
+    if toks.len() != 1 {
+        return TestResult::Fail("empty-v2: expected exactly Eof");
+    }
+    if toks[0] != Tok4::Eof {
+        return TestResult::Fail("empty-v2: only token should be Eof");
+    }
     let toks2 = lex4(b"   ");
-    if toks2.len() != 1 { return TestResult::Fail("empty-v2: whitespace-only should give just Eof"); }
+    if toks2.len() != 1 {
+        return TestResult::Fail("empty-v2: whitespace-only should give just Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_empty_line_v2);
@@ -1471,9 +1717,7 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_empty_line_v2);
 //  total = 14 tokens
 
 fn smoke_shell_parser_complex_pipeline() -> TestResult {
-    let toks = lex4(
-        b"echo hi > /tmp/out.txt; cat < /tmp/out.txt | grep hi && echo found"
-    );
+    let toks = lex4(b"echo hi > /tmp/out.txt; cat < /tmp/out.txt | grep hi && echo found");
     // Count: echo hi > /tmp/out.txt = 4 tokens
     //        ; = 1
     //        cat < /tmp/out.txt = 3
@@ -1486,21 +1730,51 @@ fn smoke_shell_parser_complex_pipeline() -> TestResult {
     if toks.len() != 15 {
         return TestResult::Fail("complex: expected 15 tokens");
     }
-    if toks[0]  != Tok4::Word        { return TestResult::Fail("complex: tok[0]  not Word"); }
-    if toks[1]  != Tok4::Word        { return TestResult::Fail("complex: tok[1]  not Word"); }
-    if toks[2]  != Tok4::RedirOut    { return TestResult::Fail("complex: tok[2]  not RedirOut"); }
-    if toks[3]  != Tok4::Word        { return TestResult::Fail("complex: tok[3]  not Word"); }
-    if toks[4]  != Tok4::Semicolon   { return TestResult::Fail("complex: tok[4]  not Semicolon"); }
-    if toks[5]  != Tok4::Word        { return TestResult::Fail("complex: tok[5]  not Word"); }
-    if toks[6]  != Tok4::RedirIn     { return TestResult::Fail("complex: tok[6]  not RedirIn"); }
-    if toks[7]  != Tok4::Word        { return TestResult::Fail("complex: tok[7]  not Word"); }
-    if toks[8]  != Tok4::Pipe        { return TestResult::Fail("complex: tok[8]  not Pipe"); }
-    if toks[9]  != Tok4::Word        { return TestResult::Fail("complex: tok[9]  not Word"); }
-    if toks[10] != Tok4::Word        { return TestResult::Fail("complex: tok[10] not Word"); }
-    if toks[11] != Tok4::And         { return TestResult::Fail("complex: tok[11] not And"); }
-    if toks[12] != Tok4::Word        { return TestResult::Fail("complex: tok[12] not Word"); }
-    if toks[13] != Tok4::Word        { return TestResult::Fail("complex: tok[13] not Word"); }
-    if toks[14] != Tok4::Eof         { return TestResult::Fail("complex: tok[14] not Eof"); }
+    if toks[0] != Tok4::Word {
+        return TestResult::Fail("complex: tok[0]  not Word");
+    }
+    if toks[1] != Tok4::Word {
+        return TestResult::Fail("complex: tok[1]  not Word");
+    }
+    if toks[2] != Tok4::RedirOut {
+        return TestResult::Fail("complex: tok[2]  not RedirOut");
+    }
+    if toks[3] != Tok4::Word {
+        return TestResult::Fail("complex: tok[3]  not Word");
+    }
+    if toks[4] != Tok4::Semicolon {
+        return TestResult::Fail("complex: tok[4]  not Semicolon");
+    }
+    if toks[5] != Tok4::Word {
+        return TestResult::Fail("complex: tok[5]  not Word");
+    }
+    if toks[6] != Tok4::RedirIn {
+        return TestResult::Fail("complex: tok[6]  not RedirIn");
+    }
+    if toks[7] != Tok4::Word {
+        return TestResult::Fail("complex: tok[7]  not Word");
+    }
+    if toks[8] != Tok4::Pipe {
+        return TestResult::Fail("complex: tok[8]  not Pipe");
+    }
+    if toks[9] != Tok4::Word {
+        return TestResult::Fail("complex: tok[9]  not Word");
+    }
+    if toks[10] != Tok4::Word {
+        return TestResult::Fail("complex: tok[10] not Word");
+    }
+    if toks[11] != Tok4::And {
+        return TestResult::Fail("complex: tok[11] not And");
+    }
+    if toks[12] != Tok4::Word {
+        return TestResult::Fail("complex: tok[12] not Word");
+    }
+    if toks[13] != Tok4::Word {
+        return TestResult::Fail("complex: tok[13] not Word");
+    }
+    if toks[14] != Tok4::Eof {
+        return TestResult::Fail("complex: tok[14] not Eof");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/shell", smoke_shell_parser_complex_pipeline);
@@ -1539,7 +1813,8 @@ fn smoke_shell_pipe_exec_wiring() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Pipe.raw(), &mut pctx);
     if pctx.ret != Some(SyscallReturn::ok(0)) {
-        fd::__test_reset(); crate::syscall::__test_clear_global();
+        fd::__test_reset();
+        crate::syscall::__test_clear_global();
         return TestResult::Fail("pipe-exec-wiring: sys_pipe failed");
     }
     let rfd = pipe_fds[0] as u64;
@@ -1548,26 +1823,36 @@ fn smoke_shell_pipe_exec_wiring() -> TestResult {
     // (2) "echo side": write "hello\n" to the write-end.
     let payload = b"hello\n";
     let mut wctx = StubCtx {
-        args: SyscallArgs { arg0: wfd, arg1: payload.as_ptr() as u64, arg2: payload.len() as u64,
-                             ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: wfd,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
     if wctx.ret != Some(SyscallReturn::ok(payload.len() as u64)) {
-        fd::__test_reset(); crate::syscall::__test_clear_global();
+        fd::__test_reset();
+        crate::syscall::__test_clear_global();
         return TestResult::Fail("pipe-exec-wiring: write to wfd failed");
     }
 
     // (3) dup2(rfd, 0) — wire stdin to the read-end.
     let mut dctx = StubCtx {
-        args: SyscallArgs { arg0: rfd, arg1: 0, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: rfd,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Dup2.raw(), &mut dctx);
     match dctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
         _ => {
-            fd::__test_reset(); crate::syscall::__test_clear_global();
+            fd::__test_reset();
+            crate::syscall::__test_clear_global();
             return TestResult::Fail("pipe-exec-wiring: dup2(rfd,0) failed");
         }
     }
@@ -1575,20 +1860,26 @@ fn smoke_shell_pipe_exec_wiring() -> TestResult {
     // (4) "cat side": read from fd 0.
     let mut buf = [0u8; 16];
     let mut rctx = StubCtx {
-        args: SyscallArgs { arg0: 0, arg1: buf.as_mut_ptr() as u64, arg2: buf.len() as u64,
-                             ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
     let n = match rctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value as usize,
         _ => {
-            fd::__test_reset(); crate::syscall::__test_clear_global();
+            fd::__test_reset();
+            crate::syscall::__test_clear_global();
             return TestResult::Fail("pipe-exec-wiring: read from fd 0 failed");
         }
     };
     if n != payload.len() || &buf[..n] != payload {
-        fd::__test_reset(); crate::syscall::__test_clear_global();
+        fd::__test_reset();
+        crate::syscall::__test_clear_global();
         return TestResult::Fail("pipe-exec-wiring: payload mismatch on cat-side read");
     }
 

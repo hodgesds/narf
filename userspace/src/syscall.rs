@@ -569,7 +569,6 @@ pub enum Syscall {
     // ABI boundary; the ZC opcodes (208/209) reference pre-pinned
     // buffer slots from a registered pool. libc defaults to POSIX;
     // hot paths opt into ZC via `narf_register_buffer()`.
-
     /// `socket(domain, type, protocol)` → fd. arg0 = domain
     /// (AF_UNIX = 1, AF_INET, AF_INET6 = 10), arg1 = type
     /// (SOCK_STREAM = 1, SOCK_DGRAM = 2), arg2 = protocol (0 for
@@ -652,7 +651,6 @@ pub enum Syscall {
     SockSendZc,
 
     // ── I/O multiplexing (210-219) ────────────────────────────────
-
     /// `poll(pollfds, n, timeout_ms)`. arg0 = ptr to a packed
     /// array of `[fd: i32, events: u16, revents: u16]` triples,
     /// arg1 = element count, arg2 = timeout in ms (-1 = block
@@ -1285,7 +1283,6 @@ pub enum Syscall {
     //
     // Linux signal surface needed for relibc to bind directly.
     // Numbering follows the per-arch `LINUX_TABLE` below.
-
     /// `sigaltstack(ss, old_ss)` — install an alternate signal
     /// stack used when a handler has `SA_ONSTACK`. arg0 = `stack_t*`
     /// (may be 0 = query-only), arg1 = `stack_t*` old (may be 0).
@@ -1343,24 +1340,24 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MProtect, 10),
     (Syscall::Munmap, 11),
     (Syscall::Brk, 12),
-    (Syscall::Sigaction, 13),       // rt_sigaction
-    (Syscall::Sigprocmask, 14),     // rt_sigprocmask
-    (Syscall::Sigreturn, 15),       // rt_sigreturn
+    (Syscall::Sigaction, 13),   // rt_sigaction
+    (Syscall::Sigprocmask, 14), // rt_sigprocmask
+    (Syscall::Sigreturn, 15),   // rt_sigreturn
     (Syscall::Ioctl, 16),
     (Syscall::Pread64, 17),
     (Syscall::Pwrite64, 18),
     (Syscall::Access, 21),
     (Syscall::Pipe, 22),
-    (Syscall::Yield, 24),           // sched_yield
+    (Syscall::Yield, 24), // sched_yield
     (Syscall::Dup, 32),
     (Syscall::Dup2, 33),
-    (Syscall::Sleep, 35),           // nanosleep
+    (Syscall::Sleep, 35), // nanosleep
     (Syscall::GetPid, 39),
-    (Syscall::SocketOpen, 41),      // socket
+    (Syscall::SocketOpen, 41), // socket
     (Syscall::SocketConnect, 42),
     (Syscall::SocketAccept, 43),
-    (Syscall::SocketSend, 44),      // sendto
-    (Syscall::SocketRecv, 45),      // recvfrom
+    (Syscall::SocketSend, 44), // sendto
+    (Syscall::SocketRecv, 45), // recvfrom
     (Syscall::SocketSendMsg, 46),
     (Syscall::SocketRecvMsg, 47),
     (Syscall::SocketShutdown, 48),
@@ -1373,7 +1370,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Clone, 56),
     (Syscall::Fork, 57),
     (Syscall::Execve, 59),
-    (Syscall::ExitTask, 60),        // exit
+    (Syscall::ExitTask, 60), // exit
     (Syscall::Wait4, 61),
     (Syscall::Kill, 62),
     (Syscall::Fcntl, 72),
@@ -1448,12 +1445,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fchmodat, 268),
     (Syscall::Faccessat, 269),
     (Syscall::Unshare, 272),
-    (Syscall::Signalfd, 282),       // signalfd / signalfd4 share name
+    (Syscall::Signalfd, 282), // signalfd / signalfd4 share name
     (Syscall::TimerfdCreate, 283),
-    (Syscall::Eventfd, 284),        // eventfd / eventfd2 share name
+    (Syscall::Eventfd, 284), // eventfd / eventfd2 share name
     (Syscall::Fallocate, 285),
     (Syscall::TimerfdSettime, 286),
-    (Syscall::EpollWait, 232),      // epoll_wait
+    (Syscall::EpollWait, 232), // epoll_wait
     (Syscall::EpollCtl, 233),
     (Syscall::Pipe2, 293),
     (Syscall::Dup3, 292),
@@ -1482,10 +1479,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
 #[cfg(target_arch = "aarch64")]
 const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getcwd, 17),
-    (Syscall::Eventfd, 19),         // eventfd2
-    (Syscall::EpollCreate, 20),     // epoll_create1
+    (Syscall::Eventfd, 19),     // eventfd2
+    (Syscall::EpollCreate, 20), // epoll_create1
     (Syscall::EpollCtl, 21),
-    (Syscall::EpollWait, 22),       // epoll_pwait
+    (Syscall::EpollWait, 22), // epoll_pwait
     (Syscall::Dup, 23),
     (Syscall::Dup3, 24),
     (Syscall::Fcntl, 25),
@@ -1505,37 +1502,37 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fchownat, 54),
     (Syscall::Fchown, 55),
     (Syscall::Openat, 56),
-    (Syscall::OpenFile, 56),        // legacy open → openat on aarch64
+    (Syscall::OpenFile, 56), // legacy open → openat on aarch64
     (Syscall::Close, 57),
     (Syscall::Pipe2, 59),
-    (Syscall::Pipe, 59),            // legacy pipe → pipe2 on aarch64
+    (Syscall::Pipe, 59), // legacy pipe → pipe2 on aarch64
     (Syscall::Getdents64, 61),
     (Syscall::Lseek, 62),
     (Syscall::Read, 63),
     (Syscall::Write, 64),
     (Syscall::Pread64, 67),
     (Syscall::Pwrite64, 68),
-    (Syscall::Signalfd, 74),        // signalfd4
+    (Syscall::Signalfd, 74), // signalfd4
     (Syscall::Readlinkat, 78),
     (Syscall::Newfstatat, 79),
     (Syscall::Fstat, 80),
-    (Syscall::Stat, 79),            // legacy stat → newfstatat on aarch64
-    (Syscall::Lstat, 79),           // ditto
+    (Syscall::Stat, 79),  // legacy stat → newfstatat on aarch64
+    (Syscall::Lstat, 79), // ditto
     (Syscall::Fsync, 82),
     (Syscall::Fdatasync, 83),
     (Syscall::TimerfdCreate, 85),
     (Syscall::TimerfdSettime, 86),
-    (Syscall::ExitTask, 93),        // exit
+    (Syscall::ExitTask, 93), // exit
     (Syscall::Unshare, 97),
     (Syscall::Futex, 98),
-    (Syscall::Sleep, 101),          // nanosleep
+    (Syscall::Sleep, 101), // nanosleep
     (Syscall::ClockSetTime, 112),
     (Syscall::ClockGetTime, 113),
     (Syscall::SchedSetparam, 118),
     (Syscall::SchedGetparam, 121),
     (Syscall::SchedSetaffinity, 122),
     (Syscall::SchedGetaffinity, 123),
-    (Syscall::Yield, 124),          // sched_yield
+    (Syscall::Yield, 124), // sched_yield
     (Syscall::SchedGetPriorityMax, 125),
     (Syscall::SchedGetPriorityMin, 126),
     (Syscall::Kill, 129),
@@ -1543,11 +1540,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Tgkill, 131),
     (Syscall::Sigaltstack, 132),
     (Syscall::RtSigsuspend, 133),
-    (Syscall::Sigaction, 134),      // rt_sigaction
-    (Syscall::Sigprocmask, 135),    // rt_sigprocmask
+    (Syscall::Sigaction, 134),   // rt_sigaction
+    (Syscall::Sigprocmask, 135), // rt_sigprocmask
     (Syscall::RtSigpending, 136),
     (Syscall::RtSigtimedwait, 137),
-    (Syscall::Sigreturn, 139),      // rt_sigreturn
+    (Syscall::Sigreturn, 139), // rt_sigreturn
     (Syscall::Setpriority, 140),
     (Syscall::Getpriority, 141),
     (Syscall::SetGid, 144),
@@ -1569,15 +1566,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetUid, 174),
     (Syscall::GetGid, 176),
     (Syscall::Gettid, 178),
-    (Syscall::SocketOpen, 198),     // socket
+    (Syscall::SocketOpen, 198), // socket
     (Syscall::SocketBind, 200),
     (Syscall::SocketListen, 201),
     (Syscall::SocketAccept, 202),
     (Syscall::SocketConnect, 203),
     (Syscall::SocketGetSockName, 204),
     (Syscall::SocketGetPeerName, 205),
-    (Syscall::SocketSend, 206),     // sendto
-    (Syscall::SocketRecv, 207),     // recvfrom
+    (Syscall::SocketSend, 206), // sendto
+    (Syscall::SocketRecv, 207), // recvfrom
     (Syscall::SocketSetSockOpt, 208),
     (Syscall::SocketGetSockOpt, 209),
     (Syscall::SocketShutdown, 210),
@@ -1598,8 +1595,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::CopyFileRange, 285),
     (Syscall::Statfs, 43),
     (Syscall::Fstatfs, 44),
-    (Syscall::Pselect6, 72),        // pselect6
-    (Syscall::Poll, 73),            // ppoll
+    (Syscall::Pselect6, 72), // pselect6
+    (Syscall::Poll, 73),     // ppoll
     // Loadable kernel modules — aarch64 generic ABI numbers.
     // init_module = 105, delete_module = 106, finit_module = 273.
     (Syscall::InitModule, 105),

@@ -29,7 +29,10 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
-use crate::{fd, RawFnHandler, SigDeliveryParams, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext};
+use crate::{
+    fd, RawFnHandler, SigDeliveryParams, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+    TrapContext,
+};
 
 // ── Current-task lookup shim ───────────────────────────────────────
 //
@@ -623,11 +626,19 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         Some(s) => {
             {
                 use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "sys_open: path='{}' task={}", s, current_task_id());
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "sys_open: path='{}' task={}",
+                    s,
+                    current_task_id()
+                );
             }
             s
         }
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let path: &str = &path_owned;
 
@@ -639,19 +650,20 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let ops = if mnt_len == 0 {
         narf_filesystem::registry()
             .resolve_absolute(path, |fs, rel| {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
-                    .and_then(|r| r.ok())
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
             })
             .flatten()
     } else {
         let mount_owned = match copy_user_path(mnt_ptr, mnt_len) {
             Some(s) => s,
-            None => { ctx.set_return(fail); return; }
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
         };
         narf_filesystem::registry()
             .with_mount(&mount_owned, |fs| {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), path))
-                    .and_then(|r| r.ok())
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), path)).and_then(|r| r.ok())
             })
             .flatten()
     };
@@ -663,9 +675,9 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let ops = match ops {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
-            match narf_filesystem::registry()
-                .resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.create(leaf)))
-            {
+            match narf_filesystem::registry().resolve_parent_absolute(path, |_fs, parent, leaf| {
+                poll_blocking(parent.create(leaf))
+            }) {
                 Some(Some(Ok(o))) => o,
                 _ => {
                     ctx.set_return(fail);
@@ -955,10 +967,12 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // explicitly: O_NONBLOCK (mirrored to/from SocketFile),
             // others reported as 0.
             F_GETFL => {
-                let nb = current_socket(fd)
-                    .map(|s| s.is_nonblock())
-                    .unwrap_or(false);
-                let v = if nb { crate::socket::O_NONBLOCK as u64 } else { 0 };
+                let nb = current_socket(fd).map(|s| s.is_nonblock()).unwrap_or(false);
+                let v = if nb {
+                    crate::socket::O_NONBLOCK as u64
+                } else {
+                    0
+                };
                 SyscallReturn::ok(v)
             }
             F_SETFL => SyscallReturn::ok(0),
@@ -1015,8 +1029,7 @@ fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // EACCES = 13
             ctx.set_return(SyscallReturn::ok((-13i64) as u64));
         }
-        Err(narf_filesystem::FsError::InvalidData)
-        | Err(narf_filesystem::FsError::InvalidPath) => {
+        Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
             ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
         }
         Err(_) => {
@@ -1082,7 +1095,10 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
     }
     let path_owned = match copy_user_path(path_ptr, path_len) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let path: &str = &path_owned;
     let ops = narf_filesystem::registry()
@@ -1286,7 +1302,10 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
         // Always ensure size >= offset + len. truncate handles
         // grow + zero-fill.
         if target_end > cur_size {
-            if poll_blocking(ops.truncate(target_end)).and_then(|r| r.ok()).is_none() {
+            if poll_blocking(ops.truncate(target_end))
+                .and_then(|r| r.ok())
+                .is_none()
+            {
                 return Some(false);
             }
         }
@@ -2069,7 +2088,9 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.unlink(leaf)));
+        .resolve_parent_absolute(&path, |_fs, parent, leaf| {
+            poll_blocking(parent.unlink(leaf))
+        });
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
@@ -2481,7 +2502,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
         rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes()); // d_reclen
         rec[18] = dt; // d_type
         rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
-        // NUL terminator + zero-padding through end already zeroed by vec init.
+                                                                    // NUL terminator + zero-padding through end already zeroed by vec init.
         let dest = unsafe { out_ptr.add(written) } as u64;
         if unsafe { copy_to_user(dest, &rec) }.is_err() {
             break;
@@ -3076,8 +3097,7 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     // is dropped from the registry but stays leaked. Acceptable
     // because firmware-install events are rare (vendor updates,
     // not per-frame).
-    let leaked: &'static str =
-        alloc::boxed::Box::leak(name_str.into_boxed_str());
+    let leaked: &'static str = alloc::boxed::Box::leak(name_str.into_boxed_str());
 
     // Copy firmware bytes from user memory into a kernel-owned Vec
     // under the SMAP bracket before passing into sys_install.
@@ -3602,7 +3622,11 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
                     options(nostack, preserves_flags),
                 );
                 let v = (lo as u64) | ((hi as u64) << 32);
-                if v == 0 { None } else { Some(v) }
+                if v == 0 {
+                    None
+                } else {
+                    Some(v)
+                }
             }
             #[cfg(not(target_arch = "x86_64"))]
             None
@@ -3616,11 +3640,8 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         // with synthetic TrapContexts whose stub returns false).
         None => crate::user_task::UserTaskFuture::new(proc),
     };
-    let child_tid = narf_scheduler::spawn_user(
-        future,
-        narf_scheduler::TaskSpec::unthrottled(),
-        child_as,
-    );
+    let child_tid =
+        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::unthrottled(), child_as);
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
@@ -3820,14 +3841,20 @@ pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
 /// `None` when the pid was never registered (kernel-internal tasks,
 /// boot tasks spawned before the table was inited, etc.).
 pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
-    PID_TO_TASK.lock().as_ref().and_then(|m| m.get(&pid_raw).copied())
+    PID_TO_TASK
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&pid_raw).copied())
 }
 
 /// Translate a scheduler TaskId to the user-visible ProcessId registered
 /// at fork/spawn time. Returns `None` when the task has no registered
 /// ProcessId (kernel-only tasks, test stubs).
 pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
-    TASK_TO_PID.lock().as_ref().and_then(|m| m.get(&task_raw).copied())
+    TASK_TO_PID
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task_raw).copied())
 }
 
 /// Exit observer registered by `wait_init`. Called when a polled
@@ -4648,8 +4675,8 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
         return;
     }
     let bytes = size & !7; // round to 8
-    // Validate the destination range before allocating — an oversized size
-    // would otherwise OOM the kernel heap before copy_to_user fires.
+                           // Validate the destination range before allocating — an oversized size
+                           // would otherwise OOM the kernel heap before copy_to_user fires.
     if validate_user_range(out, bytes).is_err() {
         ctx.set_return(fail);
         return;
@@ -4845,7 +4872,7 @@ fn sys_times(ctx: &mut dyn TrapContext) {
         // in kernel memory, then copy to user under the SMAP bracket.
         let mut kbuf = [0u8; 32];
         kbuf[..8].copy_from_slice(&ticks.to_ne_bytes()); // utime
-        // stime, cutime, cstime already zero.
+                                                         // stime, cutime, cstime already zero.
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -4887,7 +4914,7 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let mut kbuf = [0u8; RUSAGE_TOTAL_I64S * 8];
     kbuf[..8].copy_from_slice(&utime_sec.to_ne_bytes()); // ru_utime.tv_sec
     kbuf[8..16].copy_from_slice(&utime_usec.to_ne_bytes()); // ru_utime.tv_usec
-    // ru_stime + 14 tail fields already zero.
+                                                            // ru_stime + 14 tail fields already zero.
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -5021,8 +5048,7 @@ static GETRANDOM_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// CPUID feature cache: bit 0 = RDRAND probed, bit 1 = RDRAND
 /// available, bit 2 = RDSEED probed, bit 3 = RDSEED available.
 /// Computed lazily on first use; subsequent calls bit-test.
-static RNG_FEATURES: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static RNG_FEATURES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(target_arch = "x86_64")]
 fn cpu_has_rdrand() -> bool {
@@ -5133,9 +5159,13 @@ fn rdseed_u64() -> Option<u64> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn rdrand_u64() -> Option<u64> { None }
+fn rdrand_u64() -> Option<u64> {
+    None
+}
 #[cfg(not(target_arch = "x86_64"))]
-fn rdseed_u64() -> Option<u64> { None }
+fn rdseed_u64() -> Option<u64> {
+    None
+}
 
 fn next_random_u32() -> u32 {
     use core::sync::atomic::Ordering;
@@ -5535,21 +5565,14 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let argv_refs: alloc::vec::Vec<&str> =
-        argv_strs.iter().map(|s| s.as_str()).collect();
-    let envp_refs: alloc::vec::Vec<&str> =
-        envp_strs.iter().map(|s| s.as_str()).collect();
+    let argv_refs: alloc::vec::Vec<&str> = argv_strs.iter().map(|s| s.as_str()).collect();
+    let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
 
     // Step 4: load the new image. SAFETY: load_user_process_with's
     // contract — identity-mapped low 4 GiB, frame allocator
     // initialised. Both hold by the time any user task is running.
     let new_proc = match unsafe {
-        crate::process::load_user_process_with(
-            &elf_buf,
-            &argv_refs,
-            &envp_refs,
-            &[],
-        )
+        crate::process::load_user_process_with(&elf_buf, &argv_refs, &envp_refs, &[])
     } {
         Ok(p) => p,
         Err(_) => {
@@ -5678,11 +5701,7 @@ fn copy_user_pack(
 // is the privilege boundary. Today we accept any caller; once UID/
 // GID land we'll gate on UID==0 (root) per POSIX `mount(2)`.
 
-fn copy_user_str(
-    ptr: *const u8,
-    len: usize,
-    cap: usize,
-) -> Result<alloc::string::String, ()> {
+fn copy_user_str(ptr: *const u8, len: usize, cap: usize) -> Result<alloc::string::String, ()> {
     if len == 0 || ptr.is_null() || len > cap {
         return Err(());
     }
@@ -5899,8 +5918,7 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     // Bind mount: `source` is an absolute path to an existing mount;
     // `target` is the new path. No block device involved.
     if fstype == "bind" {
-        return match narf_filesystem::registry()
-            .bind_mount(&auth, source.as_str(), target.as_str())
+        return match narf_filesystem::registry().bind_mount(&auth, source.as_str(), target.as_str())
         {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),
@@ -5958,7 +5976,8 @@ fn sys_umount2(ctx: &mut dyn TrapContext) {
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
     // the registry uses internally to mint the per-mount handle.
     let handle: narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write> =
-        narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap();
+        narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
+        );
     let _ = auth;
     match narf_filesystem::registry().unmount(&handle, target.as_str()) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
@@ -5972,14 +5991,14 @@ fn sys_umount2(ctx: &mut dyn TrapContext) {
 #[repr(C)]
 #[derive(Default)]
 struct StatfsBuf {
-    bsize: u64,    // block size in bytes
-    frsize: u64,   // fragment size (== bsize on simple FSes)
-    blocks: u64,   // total blocks
-    bfree: u64,    // free blocks
-    bavail: u64,   // free blocks available to non-root
-    files: u64,    // total inodes
-    ffree: u64,    // free inodes
-    namemax: u64,  // max filename length
+    bsize: u64,   // block size in bytes
+    frsize: u64,  // fragment size (== bsize on simple FSes)
+    blocks: u64,  // total blocks
+    bfree: u64,   // free blocks
+    bavail: u64,  // free blocks available to non-root
+    files: u64,   // total inodes
+    ffree: u64,   // free inodes
+    namemax: u64, // max filename length
 }
 
 fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
@@ -6004,8 +6023,7 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
         namemax: 255,
     };
     // Copy the statfs struct to user space under the SMAP bracket.
-    let bytes: [u8; core::mem::size_of::<StatfsBuf>()] =
-        unsafe { core::mem::transmute(stat) };
+    let bytes: [u8; core::mem::size_of::<StatfsBuf>()] = unsafe { core::mem::transmute(stat) };
     unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
 }
 
@@ -6373,17 +6391,17 @@ pub enum DefaultAction {
 /// `Terminate` — Linux uses the same fallback.
 pub fn default_signal_action(signum: u32) -> DefaultAction {
     match signum {
-        1 => DefaultAction::Terminate, // SIGHUP
-        2 => DefaultAction::Terminate, // SIGINT
-        3 => DefaultAction::CoreDump,  // SIGQUIT
-        4 => DefaultAction::CoreDump,  // SIGILL
-        5 => DefaultAction::CoreDump,  // SIGTRAP
-        6 => DefaultAction::CoreDump,  // SIGABRT / SIGIOT
-        7 => DefaultAction::CoreDump,  // SIGBUS
-        8 => DefaultAction::CoreDump,  // SIGFPE
-        9 => DefaultAction::Terminate, // SIGKILL (cannot be caught)
+        1 => DefaultAction::Terminate,  // SIGHUP
+        2 => DefaultAction::Terminate,  // SIGINT
+        3 => DefaultAction::CoreDump,   // SIGQUIT
+        4 => DefaultAction::CoreDump,   // SIGILL
+        5 => DefaultAction::CoreDump,   // SIGTRAP
+        6 => DefaultAction::CoreDump,   // SIGABRT / SIGIOT
+        7 => DefaultAction::CoreDump,   // SIGBUS
+        8 => DefaultAction::CoreDump,   // SIGFPE
+        9 => DefaultAction::Terminate,  // SIGKILL (cannot be caught)
         10 => DefaultAction::Terminate, // SIGUSR1
-        11 => DefaultAction::CoreDump, // SIGSEGV
+        11 => DefaultAction::CoreDump,  // SIGSEGV
         12 => DefaultAction::Terminate, // SIGUSR2
         13 => DefaultAction::Terminate, // SIGPIPE
         14 => DefaultAction::Terminate, // SIGALRM
@@ -6445,8 +6463,7 @@ pub fn set_proc_argv_packed(pid: u64, packed: alloc::vec::Vec<u8>) {
 /// Set the per-task comm name. Truncated to 15 bytes per Linux's
 /// PR_SET_NAME (TASK_COMM_LEN = 16 including NUL).
 pub fn set_proc_comm(pid: u64, name: &str) {
-    let trimmed: alloc::string::String =
-        name.chars().take(15).collect();
+    let trimmed: alloc::string::String = name.chars().take(15).collect();
     let mut g = PROC_COMM.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     map.insert(pid, trimmed);
@@ -6511,8 +6528,12 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
         let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid));
         task.map(|as_arc| {
             let regions = as_arc.regions_snapshot();
-            regions.iter().map(|r| (r.len / 4096).max(1) as u64).sum::<u64>()
-        }).unwrap_or(0)
+            regions
+                .iter()
+                .map(|r| (r.len / 4096).max(1) as u64)
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
     };
     let total = stats.total.max(1);
     let base = (rss_pages as i64 * 1000 / total as i64) as i32;
@@ -6567,8 +6588,7 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // fail that check while it's the very task asking. Treat any
     // pid that matches the caller OR a queued task as live.
     let current = current_task_id();
-    let live = pid == current
-        || narf_scheduler::all_task_ids().iter().any(|t| t.0 == pid);
+    let live = pid == current || narf_scheduler::all_task_ids().iter().any(|t| t.0 == pid);
     if !live {
         return None;
     }
@@ -6581,8 +6601,8 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // Stack top — from the AS's regions table, look for the top
     // RW-X region with the user-stack base. Stage-1 just reports
     // the standard DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES.
-    let stack_top = crate::process::DEFAULT_USER_STACK_BASE
-        + crate::process::DEFAULT_USER_STACK_BYTES;
+    let stack_top =
+        crate::process::DEFAULT_USER_STACK_BASE + crate::process::DEFAULT_USER_STACK_BYTES;
     // Comm name — from the PROC_COMM table (written at exec time
     // or via prctl(PR_SET_NAME)). Falls back to a "task-N"
     // default when no name has been set.
@@ -6602,8 +6622,8 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     use narf_filesystem::procfs::ProcVma;
     use narf_memory::RegionPerms;
     let mut vmas = alloc::vec::Vec::new();
-    if let Some(as_arc) = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid))
-        .or_else(|| {
+    if let Some(as_arc) =
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).or_else(|| {
             // Currently-polling task isn't in the queue scan;
             // fall back to the active-AS slot.
             if pid == current_task_id() {
@@ -6617,16 +6637,16 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
             let base = r.base.as_u64();
             let end = base + r.len;
             let prot = r.perms.prot_only();
-            let label: &'static str =
-                if base == crate::process::DEFAULT_USER_STACK_BASE {
-                    "[stack]"
-                } else if base == 0x8000_0000_0000_u64 || (base & 0xffff_ffff_0000_0000) == 0x8000_0000 {
-                    "[text]"
-                } else if brk_top != 0 && base <= brk_top && brk_top <= end {
-                    "[heap]"
-                } else {
-                    ""
-                };
+            let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
+                "[stack]"
+            } else if base == 0x8000_0000_0000_u64 || (base & 0xffff_ffff_0000_0000) == 0x8000_0000
+            {
+                "[text]"
+            } else if brk_top != 0 && base <= brk_top && brk_top <= end {
+                "[heap]"
+            } else {
+                ""
+            };
             vmas.push(ProcVma {
                 start: base,
                 end,
@@ -6708,8 +6728,7 @@ pub fn set_proc_environ(pid: u64, envp: &[&str]) {
 /// Record packed auxv (key, value) pairs for a task at execve time.
 /// AT_NULL is appended automatically.
 pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
-    let mut packed: alloc::vec::Vec<u8> =
-        alloc::vec::Vec::with_capacity((aux.len() + 1) * 16);
+    let mut packed: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity((aux.len() + 1) * 16);
     for (key, val) in aux {
         packed.extend_from_slice(&key.to_le_bytes());
         packed.extend_from_slice(&val.to_le_bytes());
@@ -6836,9 +6855,7 @@ fn futex_table_init() {
 fn futex_wake_counter(uaddr: u64) -> u64 {
     futex_table_init();
     let g = FUTEX_WAKE_COUNTERS.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&uaddr).copied())
-        .unwrap_or(0)
+    g.as_ref().and_then(|m| m.get(&uaddr).copied()).unwrap_or(0)
 }
 
 fn futex_bump_counter(uaddr: u64) {
@@ -6923,8 +6940,7 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                 crate::user_task::yield_hook(),
             ) {
                 ctx.set_return(SyscallReturn::ok(0));
-                let deadline = narf_scheduler::narf_time::monotonic_ns()
-                    .saturating_add(park_ns);
+                let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(park_ns);
                 // SAFETY: uctx is live for the trap round-trip.
                 unsafe {
                     let uc = &*uctx;
@@ -7039,9 +7055,8 @@ const SS_ONSTACK: u32 = 1;
 /// we honour the same lower bound.
 const MIN_SIGSTKSZ: u64 = 2048;
 
-static SIG_ALTSTACK: narf_lib::sync::IrqSafeSpinLock<
-    Option<BTreeMap<u64, SigAltStack>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIG_ALTSTACK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, SigAltStack>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn sigaltstack_table_init() {
     let mut g = SIG_ALTSTACK.lock();
@@ -7281,8 +7296,8 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
             let p = info_out as *mut u8;
             core::ptr::write_bytes(p, 0, 128);
             (p as *mut i32).write_unaligned(signum as i32); // si_signo
-            (p.add(4) as *mut i32).write_unaligned(0);      // si_errno
-            (p.add(8) as *mut i32).write_unaligned(0);      // si_code = SI_USER
+            (p.add(4) as *mut i32).write_unaligned(0); // si_errno
+            (p.add(8) as *mut i32).write_unaligned(0); // si_code = SI_USER
         }
     }
     ctx.set_return(SyscallReturn::ok(signum as u64));
@@ -7624,8 +7639,7 @@ pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> b
     };
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
-    let params =
-        build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr);
+    let params = build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr);
     ctx.deliver_signal(&params)
 }
 
@@ -7715,7 +7729,6 @@ fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     }
 }
 
-
 // ── Sockets — POSIX shims over the SocketOp dispatcher ───────────
 //
 // Both POSIX-shaped syscalls (sys_socket / sys_bind / ...) and the
@@ -7756,9 +7769,7 @@ fn socket_arc_register(arc: &alloc::sync::Arc<crate::socket::SocketFile>) {
     map.insert(key, arc.clone());
 }
 
-fn socket_arc_lookup(
-    raw: *const (),
-) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
+fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
     let g = SOCKET_ARCS.lock();
     g.as_ref()?.get(&(raw as usize)).cloned()
 }
@@ -7822,11 +7833,17 @@ fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let addr = match copy_user_addr(addr_ptr, addr_len) {
         Some(a) => a,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
@@ -7841,7 +7858,10 @@ fn sys_socket_listen(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     match sock.dispatch_op(crate::socket::SocketOp::Listen { backlog }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
@@ -7857,7 +7877,10 @@ fn sys_socket_accept(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Single-shot: pop pending if any, else WouldBlock-style yield
     // mirroring sys_futex. Caller (libc accept) loops.
@@ -7889,8 +7912,7 @@ fn sys_socket_accept(ctx: &mut dyn TrapContext) {
                 crate::user_task::yield_hook(),
             ) {
                 ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-                let deadline = narf_scheduler::narf_time::monotonic_ns()
-                    .saturating_add(1_000_000);
+                let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -7913,11 +7935,17 @@ fn sys_socket_connect(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let addr = match copy_user_addr(addr_ptr, addr_len) {
         Some(a) => a,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     match sock.dispatch_op(crate::socket::SocketOp::Connect { addr }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
@@ -7939,7 +7967,10 @@ fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Copy user send buffer into kernel memory under the SMAP bracket.
     // Validate length before allocating — reject oversized len with EINVAL.
@@ -7947,7 +7978,10 @@ fn sys_socket_send(ctx: &mut dyn TrapContext) {
         // SAFETY: AS active; SMAP bracket inside copy_from_user_vec.
         match unsafe { copy_from_user_vec(buf_ptr, buf_len) } {
             Ok(b) => b,
-            Err(_) => { ctx.set_return(fail); return; }
+            Err(_) => {
+                ctx.set_return(fail);
+                return;
+            }
         }
     } else {
         alloc::vec::Vec::new()
@@ -7980,7 +8014,10 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Validate destination range before issuing the Recv op.
     if buf_len > 0 {
@@ -8011,8 +8048,7 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 crate::user_task::yield_hook(),
             ) {
                 ctx.set_return(SyscallReturn::ok(0));
-                let deadline = narf_scheduler::narf_time::monotonic_ns()
-                    .saturating_add(1_000_000);
+                let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -8034,7 +8070,10 @@ fn sys_socket_shutdown(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     match sock.dispatch_op(crate::socket::SocketOp::Shutdown { how }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
@@ -8054,7 +8093,10 @@ fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Read the in/out length field via SMAP bracket.
     let in_len = if len_ptr != 0 {
@@ -8102,7 +8144,10 @@ fn sys_socket_setsockopt(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if val_ptr == 0 || val_len == 0 || val_len > 256 {
         ctx.set_return(fail);
@@ -8143,7 +8188,10 @@ fn sys_socket_get_addr(ctx: &mut dyn TrapContext, peer: bool) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let op = if peer {
         crate::socket::SocketOp::GetPeerName
@@ -8191,7 +8239,10 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if msg_ptr == 0 {
         ctx.set_return(fail);
@@ -8212,7 +8263,9 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
         let base = iov_ptr + (i as u64) * 16;
         let p = read_user_u64(base);
         let l = read_user_u64(base + 8) as usize;
-        if p == 0 || l == 0 { continue; }
+        if p == 0 || l == 0 {
+            continue;
+        }
         if total.len().saturating_add(l) > MAX_USER_COPY {
             ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
             return;
@@ -8246,7 +8299,10 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if msg_ptr == 0 {
         ctx.set_return(fail);
@@ -8278,7 +8334,9 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             // Scatter into iovec destinations under SMAP bracket.
             let mut copied = 0;
             for i in 0..iov_len {
-                if copied >= n { break; }
+                if copied >= n {
+                    break;
+                }
                 let base = iov_ptr + (i as u64) * 16;
                 let p = read_user_u64(base);
                 let l = read_user_u64(base + 8) as usize;
@@ -8359,11 +8417,17 @@ fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let (vaddr, slice_len) = match crate::socket::registered_buffer_slice(task, buf_id, off, len) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let sock = match current_socket(fd) {
         Some(s) => s,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // "Zero-copy" in the NARF sense: copy once under SMAP bracket into
     // a kernel staging buffer, then hand to the socket dispatcher.
@@ -8427,7 +8491,9 @@ fn flock_try(file_ptr: usize, op: u32, task: u64) -> Result<(), ()> {
     }
     if op & LOCK_EX != 0 {
         // Exclusive: succeed iff no shared, no other exclusive.
-        if e.exclusive_owner == task { return Ok(()); }
+        if e.exclusive_owner == task {
+            return Ok(());
+        }
         if e.shared_count == 0 && e.exclusive_owner == 0 {
             e.exclusive_owner = task;
             return Ok(());
@@ -8454,7 +8520,10 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
     let arc_ops = match arc_ops {
         Some(a) => a,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let file_ptr = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
     let nonblock = op & LOCK_NB != 0;
@@ -8474,8 +8543,7 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
             crate::user_task::yield_hook(),
         ) {
             ctx.set_return(fail);
-            let dl = narf_scheduler::narf_time::monotonic_ns()
-                .saturating_add(1_000_000);
+            let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -8556,8 +8624,7 @@ pub fn set_termios_of_task(task: u64, t: KTermios) {
 /// Most recent task to read from the console. Tracked so the
 /// console driver knows which task to deliver SIGINT to when ^C
 /// is read. Updated on each console read.
-static FOREGROUND_TASK: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static FOREGROUND_TASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn note_console_reader(task: u64) {
     FOREGROUND_TASK.store(task, Ordering::Release);
@@ -8693,10 +8760,8 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
                 0
             } else {
                 let fd = fd_raw as u32;
-                let readiness = fd::with_table(task, |t| {
-                    t.get(fd).map(|e| e.ops.poll_readiness())
-                })
-                .flatten();
+                let readiness =
+                    fd::with_table(task, |t| t.get(fd).map(|e| e.ops.poll_readiness())).flatten();
                 match readiness {
                     Some(r) => (r & events) as u16,
                     None => narf_filesystem::POLL_NVAL as u16,
@@ -8760,7 +8825,11 @@ fn sys_epoll_create(ctx: &mut dyn TrapContext) {
     epoll_arc_register(&ep);
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops: ep, offset: 0, flags: 0 })
+        t.open(crate::fd::FdEntry {
+            ops: ep,
+            offset: 0,
+            flags: 0,
+        })
     }) {
         Some(n) => n,
         None => {
@@ -8785,7 +8854,10 @@ fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let ep_arc = match epoll_arc_from_fd(task, epfd) {
         Some(e) => e,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if op == EPOLL_CTL_DEL {
         ep_arc.ctl_del(fd);
@@ -8827,7 +8899,10 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let ep_arc = match epoll_arc_from_fd(task, epfd) {
         Some(e) => e,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let deadline_ns = if timeout_ms < 0 {
         None
@@ -8842,12 +8917,14 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             if written >= max {
                 break;
             }
-            let fd_u = if *fd < 0 { continue; } else { *fd as u32 };
-            let readiness = fd::with_table(task, |t| {
-                t.get(fd_u).map(|e| e.ops.poll_readiness())
-            })
-            .flatten()
-            .unwrap_or(0);
+            let fd_u = if *fd < 0 {
+                continue;
+            } else {
+                *fd as u32
+            };
+            let readiness = fd::with_table(task, |t| t.get(fd_u).map(|e| e.ops.poll_readiness()))
+                .flatten()
+                .unwrap_or(0);
             let active = readiness & entry.events;
             if active != 0 {
                 let off = (written * 12) as u64;
@@ -8921,10 +8998,17 @@ fn sys_eventfd(ctx: &mut dyn TrapContext) {
     let efd = crate::io_mux::EventFd::new(initval, flags);
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops: efd, offset: 0, flags: 0 })
+        t.open(crate::fd::FdEntry {
+            ops: efd,
+            offset: 0,
+            flags: 0,
+        })
     }) {
         Some(n) => n,
-        None => { ctx.set_return(SyscallReturn::ok((-1i64) as u64)); return; }
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
     };
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
@@ -8935,10 +9019,17 @@ fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
     timerfd_arc_register(&tfd);
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops: tfd, offset: 0, flags: 0 })
+        t.open(crate::fd::FdEntry {
+            ops: tfd,
+            offset: 0,
+            flags: 0,
+        })
     }) {
         Some(n) => n,
-        None => { ctx.set_return(SyscallReturn::ok((-1i64) as u64)); return; }
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
     };
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
@@ -8966,15 +9057,24 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let interval_ns = i64::from_le_bytes(buf[8..16].try_into().unwrap());
     let value_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
     let value_ns = i64::from_le_bytes(buf[24..32].try_into().unwrap());
-    let interval_total = (interval_sec as u64).saturating_mul(1_000_000_000)
+    let interval_total = (interval_sec as u64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(interval_ns as u64);
-    let value_total = (value_sec as u64).saturating_mul(1_000_000_000)
+    let value_total = (value_sec as u64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(value_ns as u64);
     let now = narf_scheduler::narf_time::monotonic_ns();
-    let next_fire = if value_total == 0 { 0 } else { now.saturating_add(value_total) };
+    let next_fire = if value_total == 0 {
+        0
+    } else {
+        now.saturating_add(value_total)
+    };
     let tfd = match timerfd_arc_from_fd(task, fd) {
         Some(t) => t,
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     tfd.arm(next_fire, interval_total);
     ctx.set_return(SyscallReturn::ok(0));
@@ -9014,10 +9114,17 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let sfd = crate::io_mux::SignalFd::new(mask, task);
     let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops: sfd, offset: 0, flags: 0 })
+        t.open(crate::fd::FdEntry {
+            ops: sfd,
+            offset: 0,
+            flags: 0,
+        })
     }) {
         Some(n) => n,
-        None => { ctx.set_return(SyscallReturn::ok((-1i64) as u64)); return; }
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
     };
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
@@ -9063,7 +9170,10 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
         slots[signum] = if new_handler == 0 {
             None
         } else {
-            Some(SigAction { handler: new_handler, flags })
+            Some(SigAction {
+                handler: new_handler,
+                flags,
+            })
         };
         prior
     };
@@ -9094,7 +9204,10 @@ pub fn abi_file_op_bridge(
         // Signal Cancelled to the dispatcher (status=2 mirrors
         // NarfStatus::Cancelled). The dispatcher converts to
         // Cancelled / CancelRequested based on CANCELLABLE.
-        return narf_abi::FileOpReturn { status: 2, value: 0 };
+        return narf_abi::FileOpReturn {
+            status: 2,
+            value: 0,
+        };
     }
     let num: u32 = match kind {
         narf_abi::FileOpKind::Open => Syscall::OpenFile.raw(),
@@ -9276,27 +9389,91 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Sigreturn, "sigreturn", RawFnHandler(sys_sigreturn));
     table.install_raw(Syscall::SocketOpen, "socket", RawFnHandler(sys_socket));
     table.install_raw(Syscall::SocketBind, "bind", RawFnHandler(sys_socket_bind));
-    table.install_raw(Syscall::SocketListen, "listen", RawFnHandler(sys_socket_listen));
-    table.install_raw(Syscall::SocketAccept, "accept", RawFnHandler(sys_socket_accept));
-    table.install_raw(Syscall::SocketConnect, "connect", RawFnHandler(sys_socket_connect));
+    table.install_raw(
+        Syscall::SocketListen,
+        "listen",
+        RawFnHandler(sys_socket_listen),
+    );
+    table.install_raw(
+        Syscall::SocketAccept,
+        "accept",
+        RawFnHandler(sys_socket_accept),
+    );
+    table.install_raw(
+        Syscall::SocketConnect,
+        "connect",
+        RawFnHandler(sys_socket_connect),
+    );
     table.install_raw(Syscall::SocketSend, "send", RawFnHandler(sys_socket_send));
     table.install_raw(Syscall::SocketRecv, "recv", RawFnHandler(sys_socket_recv));
-    table.install_raw(Syscall::SocketShutdown, "shutdown", RawFnHandler(sys_socket_shutdown));
-    table.install_raw(Syscall::SocketGetSockOpt, "getsockopt", RawFnHandler(sys_socket_getsockopt));
-    table.install_raw(Syscall::SocketSetSockOpt, "setsockopt", RawFnHandler(sys_socket_setsockopt));
-    table.install_raw(Syscall::SocketGetSockName, "getsockname", RawFnHandler(sys_socket_getsockname));
-    table.install_raw(Syscall::SocketGetPeerName, "getpeername", RawFnHandler(sys_socket_getpeername));
-    table.install_raw(Syscall::SocketSendMsg, "sendmsg", RawFnHandler(sys_socket_sendmsg));
-    table.install_raw(Syscall::SocketRecvMsg, "recvmsg", RawFnHandler(sys_socket_recvmsg));
-    table.install_raw(Syscall::SockRegisterBuf, "sock_register_buf", RawFnHandler(sys_sock_register_buf));
-    table.install_raw(Syscall::SockSendZc, "sock_send_zc", RawFnHandler(sys_sock_send_zc));
+    table.install_raw(
+        Syscall::SocketShutdown,
+        "shutdown",
+        RawFnHandler(sys_socket_shutdown),
+    );
+    table.install_raw(
+        Syscall::SocketGetSockOpt,
+        "getsockopt",
+        RawFnHandler(sys_socket_getsockopt),
+    );
+    table.install_raw(
+        Syscall::SocketSetSockOpt,
+        "setsockopt",
+        RawFnHandler(sys_socket_setsockopt),
+    );
+    table.install_raw(
+        Syscall::SocketGetSockName,
+        "getsockname",
+        RawFnHandler(sys_socket_getsockname),
+    );
+    table.install_raw(
+        Syscall::SocketGetPeerName,
+        "getpeername",
+        RawFnHandler(sys_socket_getpeername),
+    );
+    table.install_raw(
+        Syscall::SocketSendMsg,
+        "sendmsg",
+        RawFnHandler(sys_socket_sendmsg),
+    );
+    table.install_raw(
+        Syscall::SocketRecvMsg,
+        "recvmsg",
+        RawFnHandler(sys_socket_recvmsg),
+    );
+    table.install_raw(
+        Syscall::SockRegisterBuf,
+        "sock_register_buf",
+        RawFnHandler(sys_sock_register_buf),
+    );
+    table.install_raw(
+        Syscall::SockSendZc,
+        "sock_send_zc",
+        RawFnHandler(sys_sock_send_zc),
+    );
     table.install_raw(Syscall::Poll, "poll", RawFnHandler(sys_poll));
-    table.install_raw(Syscall::EpollCreate, "epoll_create", RawFnHandler(sys_epoll_create));
+    table.install_raw(
+        Syscall::EpollCreate,
+        "epoll_create",
+        RawFnHandler(sys_epoll_create),
+    );
     table.install_raw(Syscall::EpollCtl, "epoll_ctl", RawFnHandler(sys_epoll_ctl));
-    table.install_raw(Syscall::EpollWait, "epoll_wait", RawFnHandler(sys_epoll_wait));
+    table.install_raw(
+        Syscall::EpollWait,
+        "epoll_wait",
+        RawFnHandler(sys_epoll_wait),
+    );
     table.install_raw(Syscall::Eventfd, "eventfd", RawFnHandler(sys_eventfd));
-    table.install_raw(Syscall::TimerfdCreate, "timerfd_create", RawFnHandler(sys_timerfd_create));
-    table.install_raw(Syscall::TimerfdSettime, "timerfd_settime", RawFnHandler(sys_timerfd_settime));
+    table.install_raw(
+        Syscall::TimerfdCreate,
+        "timerfd_create",
+        RawFnHandler(sys_timerfd_create),
+    );
+    table.install_raw(
+        Syscall::TimerfdSettime,
+        "timerfd_settime",
+        RawFnHandler(sys_timerfd_settime),
+    );
     table.install_raw(Syscall::Signalfd, "signalfd", RawFnHandler(sys_signalfd));
     table.install_raw(Syscall::Tcgetattr, "tcgetattr", RawFnHandler(sys_tcgetattr));
     table.install_raw(Syscall::Tcsetattr, "tcsetattr", RawFnHandler(sys_tcsetattr));
@@ -9562,9 +9739,17 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));
 
     // I/O multiplexing: poll / select / pselect6 / epoll.
-    table.install_raw(Syscall::Poll,     "poll",       RawFnHandler(crate::poll::sys_poll));
-    table.install_raw(Syscall::Select,   "select",     RawFnHandler(crate::select::sys_select));
-    table.install_raw(Syscall::Pselect6, "pselect6",   RawFnHandler(crate::select::sys_pselect6));
+    table.install_raw(Syscall::Poll, "poll", RawFnHandler(crate::poll::sys_poll));
+    table.install_raw(
+        Syscall::Select,
+        "select",
+        RawFnHandler(crate::select::sys_select),
+    );
+    table.install_raw(
+        Syscall::Pselect6,
+        "pselect6",
+        RawFnHandler(crate::select::sys_pselect6),
+    );
     table.install_raw(
         Syscall::EpollCreate,
         "epoll_create1",

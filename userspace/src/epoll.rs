@@ -51,28 +51,28 @@ use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
-use crate::syscall::{SyscallReturn, TrapContext};
 use crate::handlers::current_task_id;
+use crate::syscall::{SyscallReturn, TrapContext};
 
 // ── epoll event flag constants ───────────────────────────────────────
 // Matches Linux `<sys/epoll.h>` (GPL-2.0-or-later, kernel.org).
 
 /// Data available to read.
-pub const EPOLLIN: u32       = 0x00000001;
+pub const EPOLLIN: u32 = 0x00000001;
 /// Urgent (out-of-band) data.
-pub const EPOLLPRI: u32      = 0x00000002;
+pub const EPOLLPRI: u32 = 0x00000002;
 /// Ready to write.
-pub const EPOLLOUT: u32      = 0x00000004;
+pub const EPOLLOUT: u32 = 0x00000004;
 /// Stream peer half-closed (read half).
-pub const EPOLLRDHUP: u32    = 0x00002000;
+pub const EPOLLRDHUP: u32 = 0x00002000;
 /// Error condition.
-pub const EPOLLERR: u32      = 0x00000008;
+pub const EPOLLERR: u32 = 0x00000008;
 /// Hang-up / peer closed.
-pub const EPOLLHUP: u32      = 0x00000010;
+pub const EPOLLHUP: u32 = 0x00000010;
 /// Edge-triggered: notify only on transitions.
-pub const EPOLLET: u32       = 0x80000000;
+pub const EPOLLET: u32 = 0x80000000;
 /// One-shot: disarm after first event.
-pub const EPOLLONESHOT: u32  = 0x40000000;
+pub const EPOLLONESHOT: u32 = 0x40000000;
 /// Exclusive wakeup (avoid thundering herd on accept).
 pub const EPOLLEXCLUSIVE: u32 = 0x10000000;
 
@@ -95,7 +95,7 @@ const EPOLL_EVENT_SIZE: usize = 12;
 unsafe fn read_epoll_event(ptr: *const u8) -> (u32, u64) {
     // SAFETY: caller guarantees 12 readable bytes.
     let events = unsafe { core::ptr::read_unaligned(ptr as *const u32) };
-    let data   = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u64) };
+    let data = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u64) };
     (events, data)
 }
 
@@ -144,7 +144,10 @@ fn exclusive_try_claim(fd: i32, owner_id: usize) -> bool {
         None => return true,
     };
     match m.get(&fd) {
-        None    => { m.insert(fd, owner_id); true }
+        None => {
+            m.insert(fd, owner_id);
+            true
+        }
         Some(&id) => id == owner_id,
     }
 }
@@ -239,15 +242,22 @@ impl EpollInstance {
         if g.interest.contains_key(&fd) {
             return false; // EEXIST
         }
-        g.interest.insert(fd, EpollItem { events, data, last_mask: 0 });
+        g.interest.insert(
+            fd,
+            EpollItem {
+                events,
+                data,
+                last_mask: 0,
+            },
+        );
         true
     }
 
     fn ctl_mod(&self, fd: i32, events: u32, data: u64) -> bool {
         let mut g = self.inner.lock();
         if let Some(item) = g.interest.get_mut(&fd) {
-            item.events    = events;
-            item.data      = data;
+            item.events = events;
+            item.data = data;
             item.last_mask = 0; // reset edge-tracking for re-arm
             true
         } else {
@@ -282,7 +292,8 @@ impl EpollInstance {
         // Snapshot interest table so we don't hold the lock across
         // the poll_readiness() calls (which may themselves lock).
         let snapshot: Vec<(i32, EpollItem)> = {
-            self.inner.lock()
+            self.inner
+                .lock()
                 .interest
                 .iter()
                 .map(|(k, v)| (*k, v.clone()))
@@ -306,7 +317,7 @@ impl EpollInstance {
             .unwrap_or(0);
 
             // Only report events the caller asked for.
-            let want  = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+            let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             let ready = cur_mask & want;
             if ready == 0 {
                 continue;
@@ -398,18 +409,26 @@ impl FileOps for EpollInstance {
 /// (GPL-2.0-or-later, kernel.org).
 pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0 as u32;
-    let fail  = SyscallReturn::ok((-1i64) as u64);
-    let task  = current_task_id();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
 
     exclusive_init();
     instances_init();
 
     let instance = EpollInstance::new();
     let ops: Arc<dyn FileOps> = instance.clone();
-    let cloexec = if (flags & EPOLL_CLOEXEC) != 0 { crate::fd::FD_CLOEXEC } else { 0 };
+    let cloexec = if (flags & EPOLL_CLOEXEC) != 0 {
+        crate::fd::FD_CLOEXEC
+    } else {
+        0
+    };
 
     let new_fd = fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops, offset: 0, flags: cloexec })
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: cloexec,
+        })
     });
 
     match new_fd {
@@ -433,24 +452,30 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
 /// Linux ref: `fs/eventpoll.c`:SYSCALL_DEFINE4(epoll_ctl, …)
 /// (GPL-2.0-or-later, kernel.org).
 pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
-    let args   = *ctx.args();
-    let epfd   = args.arg0 as u32;
-    let op     = args.arg1 as u32;
-    let tfd    = args.arg2 as i32;
+    let args = *ctx.args();
+    let epfd = args.arg0 as u32;
+    let op = args.arg1 as u32;
+    let tfd = args.arg2 as i32;
     let ev_ptr = args.arg3 as *const u8;
-    let fail   = SyscallReturn::ok((-1i64) as u64);
-    let task   = current_task_id();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
 
     let instance = match instances_lookup(task, epfd) {
         Some(i) => i,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     let owner_id = instance.self_id();
 
     match op {
         EPOLL_CTL_ADD => {
-            if ev_ptr.is_null() { ctx.set_return(fail); return; }
+            if ev_ptr.is_null() {
+                ctx.set_return(fail);
+                return;
+            }
             // SAFETY: user pointer; 12 bytes.
             let (events, data) = unsafe { read_epoll_event(ev_ptr) };
             if instance.ctl_add(tfd, events, data) {
@@ -460,7 +485,10 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             }
         }
         EPOLL_CTL_MOD => {
-            if ev_ptr.is_null() { ctx.set_return(fail); return; }
+            if ev_ptr.is_null() {
+                ctx.set_return(fail);
+                return;
+            }
             let (events, data) = unsafe { read_epoll_event(ev_ptr) };
             if instance.ctl_mod(tfd, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
@@ -494,13 +522,13 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
 /// Linux ref: `fs/eventpoll.c`:SYSCALL_DEFINE4(epoll_wait, …)
 /// (GPL-2.0-or-later, kernel.org).
 pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
-    let args       = *ctx.args();
-    let epfd       = args.arg0 as u32;
+    let args = *ctx.args();
+    let epfd = args.arg0 as u32;
     let events_ptr = args.arg1 as *mut u8;
-    let maxevents  = args.arg2 as usize;
+    let maxevents = args.arg2 as usize;
     let timeout_ms = args.arg3 as i64;
-    let fail       = SyscallReturn::ok((-1i64) as u64);
-    let task       = current_task_id();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
 
     if events_ptr.is_null() || maxevents == 0 {
         ctx.set_return(fail);
@@ -509,7 +537,10 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
 
     let instance = match instances_lookup(task, epfd) {
         Some(i) => i,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     let deadline_ns: Option<u64> = if timeout_ms == 0 {
@@ -530,11 +561,7 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             // SAFETY: user pointer; n * EPOLL_EVENT_SIZE writable bytes.
             for (i, (events, data)) in ready[..n].iter().enumerate() {
                 unsafe {
-                    write_epoll_event(
-                        events_ptr.add(i * EPOLL_EVENT_SIZE),
-                        *events,
-                        *data,
-                    );
+                    write_epoll_event(events_ptr.add(i * EPOLL_EVENT_SIZE), *events, *data);
                 }
             }
             ctx.set_return(SyscallReturn::ok(n as u64));
@@ -568,6 +595,6 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
 /// Clear the epoll instance registry + exclusive holders. Test hook.
 #[doc(hidden)]
 pub fn __test_reset() {
-    *EPOLL_INSTANCES.lock()    = Some(BTreeMap::new());
-    *EXCLUSIVE_HOLDERS.lock()  = Some(BTreeMap::new());
+    *EPOLL_INSTANCES.lock() = Some(BTreeMap::new());
+    *EXCLUSIVE_HOLDERS.lock() = Some(BTreeMap::new());
 }

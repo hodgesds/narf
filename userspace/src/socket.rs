@@ -110,35 +110,66 @@ pub struct SockAddr {
 
 #[derive(Debug)]
 pub enum SocketOp<'a> {
-    Bind { addr: SockAddr },
-    Listen { backlog: u32 },
+    Bind {
+        addr: SockAddr,
+    },
+    Listen {
+        backlog: u32,
+    },
     Accept,
-    Connect { addr: SockAddr },
-    Send { buf: &'a [u8], flags: u32, addr: Option<SockAddr> },
-    Recv { buf: &'a mut [u8], flags: u32 },
-    Shutdown { how: u32 },
+    Connect {
+        addr: SockAddr,
+    },
+    Send {
+        buf: &'a [u8],
+        flags: u32,
+        addr: Option<SockAddr>,
+    },
+    Recv {
+        buf: &'a mut [u8],
+        flags: u32,
+    },
+    Shutdown {
+        how: u32,
+    },
     /// `getsockname` — return the locally-bound address.
     GetSockName,
     /// `getpeername` — return the connected peer's address.
     GetPeerName,
     /// `setsockopt(fd, level, optname, value)`.
-    SetSockOpt { level: u32, name: u32, value: &'a [u8] },
+    SetSockOpt {
+        level: u32,
+        name: u32,
+        value: &'a [u8],
+    },
     /// `getsockopt(fd, level, optname, &out_buf)`. The dispatcher
     /// writes into `buf` and returns the byte count via `OptValue`.
-    GetSockOpt { level: u32, name: u32, buf: &'a mut [u8] },
+    GetSockOpt {
+        level: u32,
+        name: u32,
+        buf: &'a mut [u8],
+    },
 }
 
 #[derive(Debug)]
 pub enum SocketOpResult {
     Ok(u64),
-    Accepted { socket: Arc<SocketFile>, peer: Option<SockAddr> },
-    Received { n: usize, peer: Option<SockAddr> },
+    Accepted {
+        socket: Arc<SocketFile>,
+        peer: Option<SockAddr>,
+    },
+    Received {
+        n: usize,
+        peer: Option<SockAddr>,
+    },
     /// Result of GetSockName / GetPeerName.
     Addr(SockAddr),
     /// Result of GetSockOpt — bytes written into the user-supplied
     /// buffer (the dispatcher wrote them directly through the
     /// `&mut [u8]` borrow on the op).
-    OptValue { n: usize },
+    OptValue {
+        n: usize,
+    },
     Err(SockError),
 }
 
@@ -161,17 +192,17 @@ impl SockError {
     /// Map onto the libc-style errno value the user sees on -1.
     pub fn errno(self) -> i32 {
         match self {
-            Self::BadFd => 9,             // EBADF
-            Self::InvalidArg => 22,       // EINVAL
-            Self::NotSupported => 95,     // ENOTSUP
-            Self::NotConnected => 107,    // ENOTCONN
-            Self::AlreadyConnected => 56, // EISCONN
-            Self::WouldBlock => 11,       // EAGAIN
-            Self::AddrInUse => 98,        // EADDRINUSE
-            Self::AddrNotAvail => 99,     // EADDRNOTAVAIL
+            Self::BadFd => 9,               // EBADF
+            Self::InvalidArg => 22,         // EINVAL
+            Self::NotSupported => 95,       // ENOTSUP
+            Self::NotConnected => 107,      // ENOTCONN
+            Self::AlreadyConnected => 56,   // EISCONN
+            Self::WouldBlock => 11,         // EAGAIN
+            Self::AddrInUse => 98,          // EADDRINUSE
+            Self::AddrNotAvail => 99,       // EADDRNOTAVAIL
             Self::ConnectionRefused => 111, // ECONNREFUSED
-            Self::Pipe => 32,             // EPIPE
-            Self::InProgress => 115,      // EINPROGRESS
+            Self::Pipe => 32,               // EPIPE
+            Self::InProgress => 115,        // EINPROGRESS
         }
     }
 }
@@ -433,23 +464,29 @@ impl SocketFile {
     pub fn local_addr(&self) -> Option<SockAddr> {
         let state = self.state.lock();
         match &*state {
-            SocketState::InetListener { addr, port, .. } => {
-                Some(make_sockaddr_in(*addr, *port))
-            }
-            SocketState::InetConnected { peer_addr, peer_port, .. } => {
+            SocketState::InetListener { addr, port, .. } => Some(make_sockaddr_in(*addr, *port)),
+            SocketState::InetConnected {
+                peer_addr,
+                peer_port,
+                ..
+            } => {
                 let _ = (peer_addr, peer_port);
                 Some(make_sockaddr_in(0, 0))
             }
-            SocketState::InetWired { peer_addr, peer_port, .. } => {
+            SocketState::InetWired {
+                peer_addr,
+                peer_port,
+                ..
+            } => {
                 let _ = (peer_addr, peer_port);
                 Some(make_sockaddr_in(0, 0))
             }
-            SocketState::InetDgram { local_addr, local_port, .. } => {
-                Some(make_sockaddr_in(*local_addr, *local_port))
-            }
-            SocketState::InetRaw { local_addr, .. } => {
-                Some(make_sockaddr_in(*local_addr, 0))
-            }
+            SocketState::InetDgram {
+                local_addr,
+                local_port,
+                ..
+            } => Some(make_sockaddr_in(*local_addr, *local_port)),
+            SocketState::InetRaw { local_addr, .. } => Some(make_sockaddr_in(*local_addr, 0)),
             SocketState::UnixListener { path, .. } => Some(SockAddr {
                 family: AF_UNIX,
                 body: path.as_bytes().to_vec(),
@@ -458,10 +495,12 @@ impl SocketFile {
                 family: AF_UNIX,
                 body: p.as_bytes().to_vec(),
             }),
-            SocketState::Inet6Listener { addr, port, .. } => {
-                Some(make_sockaddr_in6(*addr, *port))
-            }
-            SocketState::Inet6Connected { peer_addr, peer_port, .. } => {
+            SocketState::Inet6Listener { addr, port, .. } => Some(make_sockaddr_in6(*addr, *port)),
+            SocketState::Inet6Connected {
+                peer_addr,
+                peer_port,
+                ..
+            } => {
                 let _ = (peer_addr, peer_port);
                 Some(make_sockaddr_in6([0u8; 16], 0))
             }
@@ -473,25 +512,31 @@ impl SocketFile {
     pub fn peer_addr(&self) -> Option<SockAddr> {
         let state = self.state.lock();
         match &*state {
-            SocketState::InetConnected { peer_addr, peer_port, .. } => {
-                Some(make_sockaddr_in(*peer_addr, *peer_port))
-            }
-            SocketState::InetWired { peer_addr, peer_port, .. } => {
-                Some(make_sockaddr_in(*peer_addr, *peer_port))
-            }
-            SocketState::InetDgram { peer: Some((a, p)), .. } => {
-                Some(make_sockaddr_in(*a, *p))
-            }
-            SocketState::InetRaw { peer: Some((a, p)), .. } => {
-                Some(make_sockaddr_in(*a, *p))
-            }
+            SocketState::InetConnected {
+                peer_addr,
+                peer_port,
+                ..
+            } => Some(make_sockaddr_in(*peer_addr, *peer_port)),
+            SocketState::InetWired {
+                peer_addr,
+                peer_port,
+                ..
+            } => Some(make_sockaddr_in(*peer_addr, *peer_port)),
+            SocketState::InetDgram {
+                peer: Some((a, p)), ..
+            } => Some(make_sockaddr_in(*a, *p)),
+            SocketState::InetRaw {
+                peer: Some((a, p)), ..
+            } => Some(make_sockaddr_in(*a, *p)),
             SocketState::UnixDgram { peer: Some(p), .. } => Some(SockAddr {
                 family: AF_UNIX,
                 body: p.as_bytes().to_vec(),
             }),
-            SocketState::Inet6Connected { peer_addr, peer_port, .. } => {
-                Some(make_sockaddr_in6(*peer_addr, *peer_port))
-            }
+            SocketState::Inet6Connected {
+                peer_addr,
+                peer_port,
+                ..
+            } => Some(make_sockaddr_in6(*peer_addr, *peer_port)),
             _ => None,
         }
     }
@@ -517,28 +562,40 @@ impl SocketFile {
                 SocketState::InetListener { addr, port, .. } => Reg::Inet(*addr, *port),
                 SocketState::Inet6Listener { addr, port, .. } => Reg::Inet6(*addr, *port),
                 SocketState::UnixDgram { path: Some(p), .. } => Reg::UnixDgram(p.clone()),
-                SocketState::InetDgram { local_addr, local_port, .. } => {
-                    Reg::InetDgram(*local_addr, *local_port)
-                }
+                SocketState::InetDgram {
+                    local_addr,
+                    local_port,
+                    ..
+                } => Reg::InetDgram(*local_addr, *local_port),
                 SocketState::InetWired { tcb_id, .. } => Reg::Tcb(*tcb_id),
                 _ => Reg::None,
             }
         };
         match reg {
             Reg::Unix(p) => {
-                if let Some(map) = LISTENERS.lock().as_mut() { map.remove(&p); }
+                if let Some(map) = LISTENERS.lock().as_mut() {
+                    map.remove(&p);
+                }
             }
             Reg::Inet(a, p) => {
-                if let Some(map) = INET_LISTENERS.lock().as_mut() { map.remove(&(a, p)); }
+                if let Some(map) = INET_LISTENERS.lock().as_mut() {
+                    map.remove(&(a, p));
+                }
             }
             Reg::Inet6(a, p) => {
-                if let Some(map) = INET6_LISTENERS.lock().as_mut() { map.remove(&(a, p)); }
+                if let Some(map) = INET6_LISTENERS.lock().as_mut() {
+                    map.remove(&(a, p));
+                }
             }
             Reg::UnixDgram(p) => {
-                if let Some(map) = UNIX_DGRAM_BOUND.lock().as_mut() { map.remove(&p); }
+                if let Some(map) = UNIX_DGRAM_BOUND.lock().as_mut() {
+                    map.remove(&p);
+                }
             }
             Reg::InetDgram(a, p) => {
-                if let Some(map) = INET_DGRAM_BOUND.lock().as_mut() { map.remove(&(a, p)); }
+                if let Some(map) = INET_DGRAM_BOUND.lock().as_mut() {
+                    map.remove(&(a, p));
+                }
                 // Release any ephemeral reservation. clear() on an
                 // unset bit is a no-op, so an explicit bind() to a
                 // port in this range is harmless.
@@ -609,9 +666,7 @@ pub fn parse_sockaddr_in(addr: &SockAddr) -> Option<(u32, u16)> {
         return None;
     }
     let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-    let ip = u32::from_be_bytes([
-        addr.body[2], addr.body[3], addr.body[4], addr.body[5],
-    ]);
+    let ip = u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
     Some((ip, port))
 }
 
@@ -679,8 +734,7 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
-            SocketState::InetDgram { inbox, .. }
-            | SocketState::UnixDgram { inbox, .. } => {
+            SocketState::InetDgram { inbox, .. } | SocketState::UnixDgram { inbox, .. } => {
                 let mut bits = narf_filesystem::POLL_OUT; // always sendable
                 if !inbox.is_empty() {
                     bits |= narf_filesystem::POLL_IN;
@@ -778,17 +832,15 @@ impl SocketFile {
                     Err(_) => SocketOpResult::Err(SockError::InvalidArg),
                 }
             }
-            SocketOp::Recv { buf, flags: _ } => {
-                match crate::xdp_socket::try_recv(&state_arc) {
-                    Ok(Some((_slot, bytes))) => {
-                        let n = core::cmp::min(buf.len(), bytes.len());
-                        buf[..n].copy_from_slice(&bytes[..n]);
-                        SocketOpResult::Received { n, peer: None }
-                    }
-                    Ok(None) => SocketOpResult::Err(SockError::WouldBlock),
-                    Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+            SocketOp::Recv { buf, flags: _ } => match crate::xdp_socket::try_recv(&state_arc) {
+                Ok(Some((_slot, bytes))) => {
+                    let n = core::cmp::min(buf.len(), bytes.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    SocketOpResult::Received { n, peer: None }
                 }
-            }
+                Ok(None) => SocketOpResult::Err(SockError::WouldBlock),
+                Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+            },
             SocketOp::Shutdown { how: _ } => {
                 crate::xdp_socket::close(&state_arc);
                 SocketOpResult::Ok(0)
@@ -802,12 +854,7 @@ impl SocketFile {
     /// `setsockopt` dispatcher. `value` is the in-kernel
     /// representation: 4-byte native-endian int for integer
     /// options, raw bytes for string options.
-    fn handle_setsockopt(
-        &self,
-        level: u32,
-        name: u32,
-        value: &[u8],
-    ) -> SocketOpResult {
+    fn handle_setsockopt(&self, level: u32, name: u32, value: &[u8]) -> SocketOpResult {
         let read_u32 = |slot: &[u8]| -> Result<u32, SockError> {
             if slot.len() < 4 {
                 return Err(SockError::InvalidArg);
@@ -839,7 +886,10 @@ impl SocketFile {
                         );
                     }
                 } else {
-                    let raw = match read_u32(value) { Ok(v) => v as i32, Err(_) => 0 };
+                    let raw = match read_u32(value) {
+                        Ok(v) => v as i32,
+                        Err(_) => 0,
+                    };
                     let kid: Option<i32> = match name {
                         TCP_NODELAY => Some(narf_net::tcp_stack::TCP_NODELAY),
                         TCP_KEEPIDLE => Some(narf_net::tcp_stack::TCP_KEEPIDLE),
@@ -867,7 +917,10 @@ impl SocketFile {
                 }
             };
             if let Some(id) = tcb_id {
-                let raw = match read_u32(value) { Ok(v) => v as i32, Err(_) => 0 };
+                let raw = match read_u32(value) {
+                    Ok(v) => v as i32,
+                    Err(_) => 0,
+                };
                 let _ = narf_net::tcp_stack::setsockopt_int(
                     id,
                     narf_net::tcp_stack::TCP_KEEPALIVE,
@@ -878,19 +931,31 @@ impl SocketFile {
         let mut opts = self.options.lock();
         match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => match read_u32(value) {
-                Ok(v) => { opts.reuseaddr = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.reuseaddr = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (SOL_SOCKET, SO_REUSEPORT) => match read_u32(value) {
-                Ok(v) => { opts.reuseport = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.reuseport = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (SOL_SOCKET, SO_KEEPALIVE) => match read_u32(value) {
-                Ok(v) => { opts.keepalive = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.keepalive = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (SOL_SOCKET, SO_BROADCAST) => match read_u32(value) {
-                Ok(v) => { opts.broadcast = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.broadcast = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (SOL_SOCKET, SO_LINGER) => {
@@ -904,11 +969,17 @@ impl SocketFile {
                 SocketOpResult::Ok(0)
             }
             (SOL_SOCKET, SO_RCVBUF) => match read_u32(value) {
-                Ok(v) => { opts.rcvbuf = v.max(2_048); SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.rcvbuf = v.max(2_048);
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (SOL_SOCKET, SO_SNDBUF) => match read_u32(value) {
-                Ok(v) => { opts.sndbuf = v.max(2_048); SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.sndbuf = v.max(2_048);
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (SOL_SOCKET, SO_BINDTODEVICE) => match core::str::from_utf8(value) {
@@ -919,28 +990,43 @@ impl SocketFile {
                 }
                 Err(_) => SocketOpResult::Err(SockError::InvalidArg),
             },
-            (SOL_SOCKET, SO_TYPE) | (SOL_SOCKET, SO_DOMAIN)
-            | (SOL_SOCKET, SO_PROTOCOL) | (SOL_SOCKET, SO_ERROR) => {
-                SocketOpResult::Err(SockError::InvalidArg)
-            }
+            (SOL_SOCKET, SO_TYPE)
+            | (SOL_SOCKET, SO_DOMAIN)
+            | (SOL_SOCKET, SO_PROTOCOL)
+            | (SOL_SOCKET, SO_ERROR) => SocketOpResult::Err(SockError::InvalidArg),
             (IPPROTO_TCP, TCP_NODELAY) => match read_u32(value) {
-                Ok(v) => { opts.tcp_nodelay = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_nodelay = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_KEEPIDLE) => match read_u32(value) {
-                Ok(v) => { opts.tcp_keepidle = v; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_keepidle = v;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_KEEPINTVL) => match read_u32(value) {
-                Ok(v) => { opts.tcp_keepintvl = v; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_keepintvl = v;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_KEEPCNT) => match read_u32(value) {
-                Ok(v) => { opts.tcp_keepcnt = v; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_keepcnt = v;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_USER_TIMEOUT) => match read_u32(value) {
-                Ok(v) => { opts.tcp_user_timeout = v; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_user_timeout = v;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_MAXSEG) => match read_u32(value) {
@@ -954,11 +1040,17 @@ impl SocketFile {
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_CORK) => match read_u32(value) {
-                Ok(v) => { opts.tcp_cork = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_cork = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_QUICKACK) => match read_u32(value) {
-                Ok(v) => { opts.tcp_quickack = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.tcp_quickack = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_TCP, TCP_CONGESTION) => match core::str::from_utf8(value) {
@@ -995,11 +1087,17 @@ impl SocketFile {
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_IP, IP_PKTINFO) => match read_u32(value) {
-                Ok(v) => { opts.ip_pktinfo = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.ip_pktinfo = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_IP, IP_RECVTTL) => match read_u32(value) {
-                Ok(v) => { opts.ip_recvttl = v != 0; SocketOpResult::Ok(0) }
+                Ok(v) => {
+                    opts.ip_recvttl = v != 0;
+                    SocketOpResult::Ok(0)
+                }
                 Err(e) => SocketOpResult::Err(e),
             },
             (IPPROTO_IP, IP_MULTICAST_TTL) => match read_u32(value) {
@@ -1019,12 +1117,7 @@ impl SocketFile {
     /// `getsockopt` dispatcher. Writes the value into `buf` and
     /// returns the byte count via `OptValue`. Integers are
     /// native-endian 4 bytes per Linux ABI.
-    fn handle_getsockopt(
-        &self,
-        level: u32,
-        name: u32,
-        buf: &mut [u8],
-    ) -> SocketOpResult {
+    fn handle_getsockopt(&self, level: u32, name: u32, buf: &mut [u8]) -> SocketOpResult {
         let write_u32 = |buf: &mut [u8], v: u32| -> SocketOpResult {
             if buf.len() < 4 {
                 return SocketOpResult::Err(SockError::InvalidArg);
@@ -1121,7 +1214,11 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
-            SocketOp::Send { buf, flags: _, addr } => {
+            SocketOp::Send {
+                buf,
+                flags: _,
+                addr,
+            } => {
                 let state = self.state.lock();
                 let (protocol, dest) = match &*state {
                     SocketState::InetRaw { protocol, peer, .. } => {
@@ -1152,7 +1249,10 @@ impl SocketFile {
                         let n = core::cmp::min(buf.len(), pkt.payload.len());
                         buf[..n].copy_from_slice(&pkt.payload[..n]);
                         let peer = make_sockaddr_in(pkt.peer_addr, pkt.peer_port);
-                        return SocketOpResult::Received { n, peer: Some(peer) };
+                        return SocketOpResult::Received {
+                            n,
+                            peer: Some(peer),
+                        };
                     }
                     return SocketOpResult::Err(SockError::WouldBlock);
                 }
@@ -1166,11 +1266,7 @@ impl SocketFile {
     /// Loopback ICMP echo: pushes the payload to our own inbox so
     /// a paired `recvfrom` returns the same bytes. Minimal moral
     /// equivalent of the in-kernel ICMP path.
-    fn deliver_icmp_loopback(
-        &self,
-        buf: &[u8],
-        dest: (u32, u16),
-    ) -> SocketOpResult {
+    fn deliver_icmp_loopback(&self, buf: &[u8], dest: (u32, u16)) -> SocketOpResult {
         let mut state = self.state.lock();
         if let SocketState::InetRaw { inbox, .. } = &mut *state {
             inbox.push_back(DgramPacket {
@@ -1224,7 +1320,9 @@ impl SocketFile {
             SocketOp::Listen { backlog } => {
                 let mut state = self.state.lock();
                 match &mut *state {
-                    SocketState::UnixListener { path, backlog: b, .. } => {
+                    SocketState::UnixListener {
+                        path, backlog: b, ..
+                    } => {
                         *b = backlog;
                         let path = path.clone();
                         drop(state);
@@ -1243,7 +1341,10 @@ impl SocketFile {
                 match &mut *state {
                     SocketState::UnixListener { pending, .. } => {
                         if let Some(s) = pending.pop_front() {
-                            SocketOpResult::Accepted { socket: s, peer: None }
+                            SocketOpResult::Accepted {
+                                socket: s,
+                                peer: None,
+                            }
                         } else {
                             SocketOpResult::Err(SockError::WouldBlock)
                         }
@@ -1261,9 +1362,7 @@ impl SocketFile {
                 };
                 let listener = {
                     let listeners = LISTENERS.lock();
-                    listeners
-                        .as_ref()
-                        .and_then(|m| m.get(&path).cloned())
+                    listeners.as_ref().and_then(|m| m.get(&path).cloned())
                 };
                 let listener = match listener {
                     Some(l) => l,
@@ -1304,18 +1403,18 @@ impl SocketFile {
                     _ => SocketOpResult::Err(SockError::AlreadyConnected),
                 }
             }
-            SocketOp::Send { buf, flags, addr: _ } => {
-                match self.do_send(buf, flags, None) {
-                    Ok(n) => SocketOpResult::Ok(n as u64),
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
-            SocketOp::Recv { buf, flags } => {
-                match self.do_recv(buf, flags) {
-                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
+            SocketOp::Send {
+                buf,
+                flags,
+                addr: _,
+            } => match self.do_send(buf, flags, None) {
+                Ok(n) => SocketOpResult::Ok(n as u64),
+                Err(e) => SocketOpResult::Err(e),
+            },
+            SocketOp::Recv { buf, flags } => match self.do_recv(buf, flags) {
+                Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                Err(e) => SocketOpResult::Err(e),
+            },
             SocketOp::Shutdown { how } => {
                 let state = self.state.lock();
                 match &*state {
@@ -1348,12 +1447,8 @@ impl SocketFile {
                 }
                 // sockaddr_in body: port (u16 BE) + ip (u32 BE).
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let ip = u32::from_be_bytes([
-                    addr.body[2],
-                    addr.body[3],
-                    addr.body[4],
-                    addr.body[5],
-                ]);
+                let ip =
+                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
                 let mut state = self.state.lock();
                 match &*state {
                     SocketState::Fresh => {
@@ -1383,7 +1478,12 @@ impl SocketFile {
             SocketOp::Listen { backlog } => {
                 let mut state = self.state.lock();
                 match &mut *state {
-                    SocketState::InetListener { addr, port, backlog: b, .. } => {
+                    SocketState::InetListener {
+                        addr,
+                        port,
+                        backlog: b,
+                        ..
+                    } => {
                         *b = backlog;
                         let key = (*addr, *port);
                         drop(state);
@@ -1400,7 +1500,10 @@ impl SocketFile {
                 match &mut *state {
                     SocketState::InetListener { pending, .. } => {
                         if let Some(s) = pending.pop_front() {
-                            SocketOpResult::Accepted { socket: s, peer: None }
+                            SocketOpResult::Accepted {
+                                socket: s,
+                                peer: None,
+                            }
                         } else {
                             SocketOpResult::Err(SockError::WouldBlock)
                         }
@@ -1413,22 +1516,14 @@ impl SocketFile {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let ip = u32::from_be_bytes([
-                    addr.body[2],
-                    addr.body[3],
-                    addr.body[4],
-                    addr.body[5],
-                ]);
+                let ip =
+                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
                 // Look up the listener. Loopback (127.x.x.x) and
                 // 0.0.0.0 (INADDR_ANY) listeners both match.
                 let listener = {
                     let listeners = INET_LISTENERS.lock();
                     let m = listeners.as_ref();
-                    m.and_then(|m| {
-                        m.get(&(ip, port))
-                            .or_else(|| m.get(&(0, port)))
-                            .cloned()
-                    })
+                    m.and_then(|m| m.get(&(ip, port)).or_else(|| m.get(&(0, port))).cloned())
                 };
                 let listener = match listener {
                     Some(l) => l,
@@ -1494,24 +1589,28 @@ impl SocketFile {
                     _ => SocketOpResult::Err(SockError::AlreadyConnected),
                 }
             }
-            SocketOp::Send { buf, flags, addr: _ } => {
-                match self.do_send(buf, flags, None) {
-                    Ok(n) => SocketOpResult::Ok(n as u64),
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
-            SocketOp::Recv { buf, flags } => {
-                match self.do_recv(buf, flags) {
-                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
+            SocketOp::Send {
+                buf,
+                flags,
+                addr: _,
+            } => match self.do_send(buf, flags, None) {
+                Ok(n) => SocketOpResult::Ok(n as u64),
+                Err(e) => SocketOpResult::Err(e),
+            },
+            SocketOp::Recv { buf, flags } => match self.do_recv(buf, flags) {
+                Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                Err(e) => SocketOpResult::Err(e),
+            },
             SocketOp::Shutdown { how } => {
                 let state = self.state.lock();
                 match &*state {
                     SocketState::InetConnected { tx, rx, .. } => {
-                        if how == SHUT_WR || how == SHUT_RDWR { tx.close(); }
-                        if how == SHUT_RD || how == SHUT_RDWR { rx.close(); }
+                        if how == SHUT_WR || how == SHUT_RDWR {
+                            tx.close();
+                        }
+                        if how == SHUT_RD || how == SHUT_RDWR {
+                            rx.close();
+                        }
                         SocketOpResult::Ok(0)
                     }
                     SocketState::InetWired { tcb_id, .. } => {
@@ -1541,9 +1640,8 @@ impl SocketFile {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let ip = u32::from_be_bytes([
-                    addr.body[2], addr.body[3], addr.body[4], addr.body[5],
-                ]);
+                let ip =
+                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
                 let mut state = self.state.lock();
                 match &*state {
                     SocketState::Fresh => {
@@ -1570,9 +1668,8 @@ impl SocketFile {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
                 let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
-                let ip = u32::from_be_bytes([
-                    addr.body[2], addr.body[3], addr.body[4], addr.body[5],
-                ]);
+                let ip =
+                    u32::from_be_bytes([addr.body[2], addr.body[3], addr.body[4], addr.body[5]]);
                 let mut state = self.state.lock();
                 // If unbound, auto-bind to (0, ephemeral-port).
                 // RFC 6056 §3.2 Algorithm 1, IANA dynamic range.
@@ -1600,18 +1697,26 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
-            SocketOp::Send { buf, flags: _, addr } => {
+            SocketOp::Send {
+                buf,
+                flags: _,
+                addr,
+            } => {
                 let state = self.state.lock();
                 let (local_addr, local_port, dest) = match &*state {
-                    SocketState::InetDgram { local_addr, local_port, peer, .. } => {
+                    SocketState::InetDgram {
+                        local_addr,
+                        local_port,
+                        peer,
+                        ..
+                    } => {
                         let dest = if let Some(a) = addr {
                             if a.body.len() < 6 {
                                 return SocketOpResult::Err(SockError::InvalidArg);
                             }
                             let p = u16::from_be_bytes([a.body[0], a.body[1]]);
-                            let i = u32::from_be_bytes([
-                                a.body[2], a.body[3], a.body[4], a.body[5],
-                            ]);
+                            let i =
+                                u32::from_be_bytes([a.body[2], a.body[3], a.body[4], a.body[5]]);
                             (i, p)
                         } else if let Some(d) = peer {
                             *d
@@ -1632,11 +1737,9 @@ impl SocketFile {
                 // Find the destination socket. Loopback + INADDR_ANY both match.
                 let dest_sock = {
                     let bound = INET_DGRAM_BOUND.lock();
-                    bound.as_ref().and_then(|m| {
-                        m.get(&dest)
-                            .or_else(|| m.get(&(0, dest.1)))
-                            .cloned()
-                    })
+                    bound
+                        .as_ref()
+                        .and_then(|m| m.get(&dest).or_else(|| m.get(&(0, dest.1))).cloned())
                 };
                 let dest_sock = match dest_sock {
                     Some(s) => s,
@@ -1751,7 +1854,11 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
-            SocketOp::Send { buf, flags: _, addr } => {
+            SocketOp::Send {
+                buf,
+                flags: _,
+                addr,
+            } => {
                 let state = self.state.lock();
                 let (local_path, dest_path) = match &*state {
                     SocketState::UnixDgram { path, peer, .. } => {
@@ -1799,7 +1906,10 @@ impl SocketFile {
                         let body = pkt.peer_unix.unwrap_or_default().into_bytes();
                         return SocketOpResult::Received {
                             n,
-                            peer: Some(SockAddr { family: AF_UNIX, body }),
+                            peer: Some(SockAddr {
+                                family: AF_UNIX,
+                                body,
+                            }),
                         };
                     }
                     return SocketOpResult::Err(SockError::WouldBlock);
@@ -1848,7 +1958,13 @@ impl SocketFile {
             }
             SocketOp::Listen { backlog } => {
                 let mut state = self.state.lock();
-                if let SocketState::Inet6Listener { addr, port, backlog: b, .. } = &mut *state {
+                if let SocketState::Inet6Listener {
+                    addr,
+                    port,
+                    backlog: b,
+                    ..
+                } = &mut *state
+                {
                     *b = backlog;
                     let key = (*addr, *port);
                     drop(state);
@@ -1864,7 +1980,10 @@ impl SocketFile {
                 let mut state = self.state.lock();
                 if let SocketState::Inet6Listener { pending, .. } = &mut *state {
                     if let Some(s) = pending.pop_front() {
-                        SocketOpResult::Accepted { socket: s, peer: None }
+                        SocketOpResult::Accepted {
+                            socket: s,
+                            peer: None,
+                        }
                     } else {
                         SocketOpResult::Err(SockError::WouldBlock)
                     }
@@ -1928,23 +2047,27 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::AlreadyConnected)
                 }
             }
-            SocketOp::Send { buf, flags, addr: _ } => {
-                match self.do_send(buf, flags, None) {
-                    Ok(n) => SocketOpResult::Ok(n as u64),
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
-            SocketOp::Recv { buf, flags } => {
-                match self.do_recv(buf, flags) {
-                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
-                    Err(e) => SocketOpResult::Err(e),
-                }
-            }
+            SocketOp::Send {
+                buf,
+                flags,
+                addr: _,
+            } => match self.do_send(buf, flags, None) {
+                Ok(n) => SocketOpResult::Ok(n as u64),
+                Err(e) => SocketOpResult::Err(e),
+            },
+            SocketOp::Recv { buf, flags } => match self.do_recv(buf, flags) {
+                Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                Err(e) => SocketOpResult::Err(e),
+            },
             SocketOp::Shutdown { how } => {
                 let state = self.state.lock();
                 if let SocketState::Inet6Connected { tx, rx, .. } = &*state {
-                    if how == SHUT_WR || how == SHUT_RDWR { tx.close(); }
-                    if how == SHUT_RD || how == SHUT_RDWR { rx.close(); }
+                    if how == SHUT_WR || how == SHUT_RDWR {
+                        tx.close();
+                    }
+                    if how == SHUT_RD || how == SHUT_RDWR {
+                        rx.close();
+                    }
                     SocketOpResult::Ok(0)
                 } else {
                     SocketOpResult::Err(SockError::NotConnected)
@@ -1984,11 +2107,7 @@ impl SocketFile {
         }
     }
 
-    fn do_recv(
-        &self,
-        buf: &mut [u8],
-        _flags: u32,
-    ) -> Result<(usize, Option<SockAddr>), SockError> {
+    fn do_recv(&self, buf: &mut [u8], _flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
         if let SocketState::InetWired { tcb_id, .. } = &*state {
             let id = *tcb_id;
@@ -2111,8 +2230,7 @@ static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>
 
 // ── ZC fast-path: registered buffer pool ────────────────────────
 
-static REGISTERED_BUFS: IrqSafeSpinLock<Option<BTreeMap<u32, RegBuf>>> =
-    IrqSafeSpinLock::new(None);
+static REGISTERED_BUFS: IrqSafeSpinLock<Option<BTreeMap<u32, RegBuf>>> = IrqSafeSpinLock::new(None);
 static NEXT_BUF_ID: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Debug)]
@@ -2131,20 +2249,18 @@ pub fn register_user_buffer(owner: u64, ptr: u64, len: u64) -> Option<u32> {
     let id = NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed);
     let mut g = REGISTERED_BUFS.lock();
     let map = g.get_or_insert_with(BTreeMap::new);
-    map.insert(id, RegBuf {
-        base: ptr,
-        len,
-        owner,
-    });
+    map.insert(
+        id,
+        RegBuf {
+            base: ptr,
+            len,
+            owner,
+        },
+    );
     Some(id)
 }
 
-pub fn registered_buffer_slice(
-    owner: u64,
-    buf_id: u32,
-    off: u64,
-    len: u64,
-) -> Option<(u64, u64)> {
+pub fn registered_buffer_slice(owner: u64, buf_id: u32, off: u64, len: u64) -> Option<(u64, u64)> {
     let g = REGISTERED_BUFS.lock();
     let m = g.as_ref()?;
     let r = m.get(&buf_id)?;

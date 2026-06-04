@@ -26,9 +26,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use narf_net::bypass::{
-    FlowKey, Umem, UmemSlot, XdpSocket as KernelXdpSocket, XdpSocketParts,
-};
+use narf_net::bypass::{FlowKey, Umem, UmemSlot, XdpSocket as KernelXdpSocket, XdpSocketParts};
 
 // ── Address family + ABI constants ──────────────────────────────────
 
@@ -233,10 +231,16 @@ pub fn handle_bind(state: &XdpSocketState, addr: &SockAddrXdp) -> Result<(), Xdp
 /// the UMEM frame into user space when narf-mmap matures). The
 /// frame slot must be returned to FILL by the caller via
 /// [`return_to_fill`].
-pub fn try_recv(state: &XdpSocketState) -> Result<Option<(UmemSlot, alloc::vec::Vec<u8>)>, XdpOpError> {
+pub fn try_recv(
+    state: &XdpSocketState,
+) -> Result<Option<(UmemSlot, alloc::vec::Vec<u8>)>, XdpOpError> {
     let mut g = state.kernel_parts.lock();
     let parts = g.as_mut().ok_or(XdpOpError::RingsNotCreated)?;
-    let umem = state.umem.lock().clone().ok_or(XdpOpError::UmemNotRegistered)?;
+    let umem = state
+        .umem
+        .lock()
+        .clone()
+        .ok_or(XdpOpError::UmemNotRegistered)?;
     let v = match parts.rx_cons.try_recv() {
         Ok(Some(v)) => v,
         _ => return Ok(None),
@@ -256,7 +260,13 @@ pub fn return_to_fill(state: &XdpSocketState, slot: UmemSlot) -> Result<(), XdpO
     let parts = g.as_mut().ok_or(XdpOpError::RingsNotCreated)?;
     parts
         .fill_prod
-        .try_send(UmemSlot { frame_idx: slot.frame_idx, len: 0 }.pack())
+        .try_send(
+            UmemSlot {
+                frame_idx: slot.frame_idx,
+                len: 0,
+            }
+            .pack(),
+        )
         .map_err(|_| XdpOpError::InvalidArg)
 }
 
@@ -319,10 +329,8 @@ pub fn parse_xdp_umem_reg(body: &[u8]) -> Option<XdpUmemReg> {
     let len = u64::from_ne_bytes([
         body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
     ]);
-    let chunk_size =
-        u32::from_ne_bytes([body[16], body[17], body[18], body[19]]);
-    let headroom =
-        u32::from_ne_bytes([body[20], body[21], body[22], body[23]]);
+    let chunk_size = u32::from_ne_bytes([body[16], body[17], body[18], body[19]]);
+    let headroom = u32::from_ne_bytes([body[20], body[21], body[22], body[23]]);
     let flags = u32::from_ne_bytes([body[24], body[25], body[26], body[27]]);
     Some(XdpUmemReg {
         addr,

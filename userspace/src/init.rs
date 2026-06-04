@@ -110,9 +110,7 @@ pub struct Pid1SpawnReport {
 ///
 /// # Safety
 /// Same as [`spawn_pid1_from_bytes`].
-pub unsafe fn spawn_pid1_from_bytes_report(
-    bytes: &[u8],
-) -> Result<Pid1SpawnReport, InitError> {
+pub unsafe fn spawn_pid1_from_bytes_report(bytes: &[u8]) -> Result<Pid1SpawnReport, InitError> {
     // SAFETY: forwarding.
     let process = unsafe { load_user_process(bytes)? };
     let entry = process.entry.0.raw();

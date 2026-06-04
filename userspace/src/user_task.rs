@@ -122,7 +122,6 @@ pub struct UserTaskCtx {
     // `on_child_exit` fires the waker.
     //
     // Mirror of the `WaitAsciiByteFuture` pattern in narf-input.
-
     /// Set by `sys_wait4` before longjmping; cleared by the poll
     /// routine once a successful reap has been written into the
     /// saved UserState.
@@ -743,8 +742,7 @@ impl core::future::Future for UserTaskFuture {
                 unsafe {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        let us = &mut *(this.ctx.state.get()
-                            as *mut narf_scheduler::UserState);
+                        let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
                         us.rax = reaped as u64;
                     }
                 }
@@ -766,8 +764,7 @@ impl core::future::Future for UserTaskFuture {
                     unsafe {
                         #[cfg(target_arch = "x86_64")]
                         {
-                            let us = &mut *(this.ctx.state.get()
-                                as *mut narf_scheduler::UserState);
+                            let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
                             us.rax = reaped2 as u64;
                         }
                     }
@@ -858,17 +855,15 @@ impl core::future::Future for UserTaskFuture {
                     // IRQ the scheduler hasn't delivered).
                     #[cfg(target_arch = "x86_64")]
                     narf_memory::beacon::paint(50, 0x00FF_60FF); // magenta: pre-iretq
-                    // SAFETY: the AS is activated and the user
-                    // mappings cover entry + rsp by construction
-                    // (load_user_process_with mapped them). Never
-                    // returns — control reaches CPL=3. When the
-                    // process carries an entry_arg (clone(2) for
-                    // pthread start), deliver it as the first
-                    // SysV integer arg (RDI).
+                                                                 // SAFETY: the AS is activated and the user
+                                                                 // mappings cover entry + rsp by construction
+                                                                 // (load_user_process_with mapped them). Never
+                                                                 // returns — control reaches CPL=3. When the
+                                                                 // process carries an entry_arg (clone(2) for
+                                                                 // pthread start), deliver it as the first
+                                                                 // SysV integer arg (RDI).
                     if let Some(arg) = this.process.entry_arg {
-                        unsafe {
-                            narf_scheduler::enter_user_mode_with_arg(entry, rsp, arg)
-                        }
+                        unsafe { narf_scheduler::enter_user_mode_with_arg(entry, rsp, arg) }
                     } else {
                         unsafe { narf_scheduler::enter_user_mode(entry, rsp) }
                     }
@@ -936,10 +931,10 @@ impl core::future::Future for UserTaskFuture {
             // POSIX execve(2) preserves the task's PID, fd table,
             // brk top, and signal handler table — those live in
             // crate-side tables keyed by pid, untouched here.
-            let req_ptr = this.ctx.pending_exec.swap(
-                core::ptr::null_mut(),
-                Ordering::AcqRel,
-            );
+            let req_ptr = this
+                .ctx
+                .pending_exec
+                .swap(core::ptr::null_mut(), Ordering::AcqRel);
             if !req_ptr.is_null() {
                 // SAFETY: the syscall handler allocated this with
                 // `Box::into_raw(Box::new(ExecRequest{..}))` and
@@ -947,11 +942,8 @@ impl core::future::Future for UserTaskFuture {
                 // longjmp'ing here; we're the sole consumer.
                 let req = unsafe { alloc::boxed::Box::from_raw(req_ptr) };
                 this.process.address_space = req.new_as;
-                this.process.entry = crate::EntryPoint(
-                    narf_memory::VirtAddr::new(req.entry),
-                );
-                this.process.stack_top =
-                    narf_memory::VirtAddr::new(req.stack_top);
+                this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));
+                this.process.stack_top = narf_memory::VirtAddr::new(req.stack_top);
                 this.process.fs_base = req.fs_base;
                 this.state = TaskState::Initial;
             }
@@ -1105,8 +1097,7 @@ impl core::future::Future for UserTaskFuture {
                     #[cfg(target_arch = "aarch64")]
                     {
                         // On aarch64 x0 is the return register.
-                        let us = &mut *(this.ctx.state.get()
-                            as *mut narf_scheduler::UserState);
+                        let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
                         us.x[0] = reaped as u64;
                     }
                 }
@@ -1119,8 +1110,7 @@ impl core::future::Future for UserTaskFuture {
                     unsafe {
                         #[cfg(target_arch = "aarch64")]
                         {
-                            let us = &mut *(this.ctx.state.get()
-                                as *mut narf_scheduler::UserState);
+                            let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
                             us.x[0] = reaped2 as u64;
                         }
                     }
@@ -1175,7 +1165,10 @@ impl core::future::Future for UserTaskFuture {
         // trap-back path keeps DAIF masked through the longjmp.
         // SAFETY: msr DAIFSet has no memory effect.
         unsafe {
-            core::arch::asm!("msr DAIFSet, #0xF", options(nomem, nostack, preserves_flags));
+            core::arch::asm!(
+                "msr DAIFSet, #0xF",
+                options(nomem, nostack, preserves_flags)
+            );
         }
 
         // setjmp. On the initial call returns 0; the hooks
@@ -1197,9 +1190,7 @@ impl core::future::Future for UserTaskFuture {
                 TaskState::Running => {
                     // SAFETY: a prior poll's trap path populated
                     // ctx.state via TrapContext::save_user_state.
-                    unsafe {
-                        narf_scheduler::enter_user_mode_resume(this.ctx.state.get())
-                    }
+                    unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
             }
@@ -1226,7 +1217,10 @@ impl core::future::Future for UserTaskFuture {
                 "isb",
                 options(nostack, preserves_flags),
             );
-            core::arch::asm!("msr DAIFSet, #0xF", options(nomem, nostack, preserves_flags));
+            core::arch::asm!(
+                "msr DAIFSet, #0xF",
+                options(nomem, nostack, preserves_flags)
+            );
         }
 
         clear_current();

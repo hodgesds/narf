@@ -160,8 +160,7 @@ impl TimerFd {
             s.next_fire_ns = 0;
         } else {
             // Count missed expirations.
-            let missed =
-                ((now - s.next_fire_ns) / s.interval_ns).saturating_add(1);
+            let missed = ((now - s.next_fire_ns) / s.interval_ns).saturating_add(1);
             s.expirations = s.expirations.saturating_add(missed);
             s.next_fire_ns = s
                 .next_fire_ns
@@ -265,10 +264,7 @@ impl FileOps for SignalFd {
             buf[..SI_LEN].fill(0);
             buf[..4].copy_from_slice(&signum.to_le_bytes());
             // Clear the bit so subsequent reads see the next signal.
-            crate::handlers::clear_signal_pending(
-                self.owner_task,
-                signum,
-            );
+            crate::handlers::clear_signal_pending(self.owner_task, signum);
             Ok(SI_LEN)
         })
     }
@@ -333,11 +329,7 @@ impl EpollFile {
     }
 
     pub fn snapshot(&self) -> Vec<(i32, EpollEntry)> {
-        self.interest
-            .lock()
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect()
+        self.interest.lock().iter().map(|(k, v)| (*k, *v)).collect()
     }
 }
 

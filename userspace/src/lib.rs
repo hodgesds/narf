@@ -41,12 +41,12 @@ extern crate alloc;
 pub mod elf;
 pub mod ephemeral_port;
 pub mod epoll;
-pub mod init;
 pub mod fd;
 pub mod handlers;
+pub mod init;
 pub mod interp;
-pub mod loader;
 pub mod io_mux;
+pub mod loader;
 pub mod pipe;
 pub mod poll;
 pub mod process;
@@ -58,9 +58,9 @@ pub mod tls;
 pub mod user_task;
 pub mod xdp_socket;
 
-mod tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;
+mod tests;
 
 pub use interp::{lookup_interpreter, register_interpreter};
 
