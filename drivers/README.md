@@ -59,6 +59,11 @@ device to the highest-specificity matching probe.
 | `narf-drivers-storage` (SDHCI)   | PCI class 08:05 (any vendor)            | software reset + 3.3V power + 400 kHz init clock + CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7 SD identification + CMD17/CMD24 PIO read/write_block |
 | `narf-drivers-net` (igc)         | 0x8086 : 0x15F2/0x15F3/0x0D9F (I225) + 0x125B/0x125C/0x125D (I226) | clean-room from public Intel datasheets — CTRL.RST reset + RAL/RAH MAC + legacy TX + RX rings + tx/rx |
 | `narf-drivers-net` (rtl8139)     | 0x10EC : 0x8139                         | clean-room from public Realtek programming guide — CONFIG1 unlock + CR.RST + IDR0..5 MAC + 64 KiB RX ring + 4 × 2 KiB TX buffers + tx/rx + link status |
+| `narf-drivers-net` (rtl8126)     | 0x10EC : 0x8126                         | clean-room PCIe match + reset + MAC decode + TX descriptor layout |
+| `narf-drivers-net` (atheros)     | 0x1969 : 0x1063/0x1083/0x10A1/0x2060    | Atheros AR81xx (atl1c) Gigabit Ethernet — MAC/PHY reset + EEPROM reload + split RX ring (RFD/RRS) + TX ring |
+| `narf-drivers-net` (tg3)         | 0x14E4 : BCM5700..BCM5782 family        | Broadcom Tigon3 Gigabit Ethernet — hardware reset + core clock config + MAC/PHY init + TX/RX rings |
+| `narf-drivers-net` (forcedeth)   | 0x10DE : MCP55..MCP77 family            | Nvidia nForce MAC — PHY init + EEPROM MAC decode + TX/RX descriptor rings |
+| `narf-drivers-net` (vmxnet3)     | 0x15AD : 0x07B0                         | VMware vmxnet3 paravirtual NIC — UPT init + shared-memory queue config + TX/RX rings |
 | `narf-drivers-platform` (smbus)  | PCI class 0x0C, subclass 0x05 (any vendor) | Intel ICH SMBus — IO BAR4 + read/write byte data + read word data via host-controller PIO transactions per ICH9 datasheet |
 | `narf-drivers-platform` (tpm)    | MMIO 0xFED40000 (locality 0)            | TPM 2.0 — CRB (PC Client PTP) + TIS (legacy) auto-detect + `submit(cmd)` + `tpm2_get_random` per TCG public spec |
 | `narf-drivers-hwmon`             | Dell SMBIOS vendor (`dell_smm`) / CPUID + MSR (`coretemp`, `k10temp`) / Super-I/O port (`nct6775`) | Hardware monitoring: `coretemp` (Intel DTS) and `k10temp` (AMD Zen) temperature sensors, `dell_smm` Dell SMM fan/temp control, and `nct6775` Super-I/O sensors. |
