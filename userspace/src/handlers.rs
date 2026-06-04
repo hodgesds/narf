@@ -8755,6 +8755,23 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Set the pending bit for `signum` on `task`. Used by Wave-73
+/// POSIX timer expiries to queue a signal without going through
+/// `sys_kill` (which expects a syscall trap frame). Mirrors the
+/// `*slot |= 1 << signum` step inside `sys_kill`.
+pub fn raise_signal_pending(task: u64, signum: u32) {
+    if signum >= 32 {
+        return;
+    }
+    let mut g = SIGNAL_PENDING.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    let slot = map.entry(task).or_insert(0);
+    *slot |= 1u32 << signum;
+}
+
 /// Clear the pending bit for `signum` on `task`. Used by signalfd
 /// after delivering the signal through the fd path.
 pub fn clear_signal_pending(task: u64, signum: u32) {
@@ -11881,6 +11898,35 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "clock_settime",
         RawFnHandler(sys_clock_settime),
     );
+    #[cfg(feature = "linux-compat")]
+    {
+        // Wave-73: POSIX per-process timers + clock_nanosleep.
+        table.install_raw(
+            Syscall::TimerCreate,
+            "timer_create",
+            RawFnHandler(crate::posix_timer::sys_timer_create),
+        );
+        table.install_raw(
+            Syscall::TimerSettime,
+            "timer_settime",
+            RawFnHandler(crate::posix_timer::sys_timer_settime),
+        );
+        table.install_raw(
+            Syscall::TimerGettime,
+            "timer_gettime",
+            RawFnHandler(crate::posix_timer::sys_timer_gettime),
+        );
+        table.install_raw(
+            Syscall::TimerDelete,
+            "timer_delete",
+            RawFnHandler(crate::posix_timer::sys_timer_delete),
+        );
+        table.install_raw(
+            Syscall::ClockNanosleep,
+            "clock_nanosleep",
+            RawFnHandler(crate::posix_timer::sys_clock_nanosleep),
+        );
+    }
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
     table.install_raw(Syscall::Kill, "kill", RawFnHandler(sys_kill));
     table.install_raw(Syscall::Tgkill, "tgkill", RawFnHandler(sys_tgkill));

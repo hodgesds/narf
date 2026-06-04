@@ -59,6 +59,8 @@ pub mod pidfd;
 pub mod pid_ns;
 pub mod pipe;
 pub mod poll;
+#[cfg(feature = "linux-compat")]
+pub mod posix_timer;
 pub mod process;
 pub mod select;
 pub mod socket;
