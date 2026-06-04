@@ -22,11 +22,11 @@ pub struct DirEntry {
 
 pub mod attr {
     pub const READ_ONLY: u8 = 0x01;
-    pub const HIDDEN: u8    = 0x02;
-    pub const SYSTEM: u8    = 0x04;
+    pub const HIDDEN: u8 = 0x02;
+    pub const SYSTEM: u8 = 0x04;
     pub const VOLUME_ID: u8 = 0x08;
     pub const DIRECTORY: u8 = 0x10;
-    pub const ARCHIVE: u8   = 0x20;
+    pub const ARCHIVE: u8 = 0x20;
     pub const LONG_NAME: u8 = READ_ONLY | HIDDEN | SYSTEM | VOLUME_ID;
 }
 
@@ -73,7 +73,7 @@ pub fn to_dos_time(_cycles: u64) -> (u16, u16) {
     // NARF monotonic cycles to UTC/Local time is Stage 4 'time' crate scope.
     // For now, return a fixed value or simple placeholder.
     // Base: 1980-01-01 00:00:00 -> (0x0021, 0x0000)
-    (0x0021, 0x0000) 
+    (0x0021, 0x0000)
 }
 
 pub fn calculate_checksum(name: &[u8; 11]) -> u8 {
@@ -89,19 +89,25 @@ impl LfnEntry {
         let mut count = 0;
         let name1 = self.name1;
         for &c in &name1 {
-            if c == 0 || c == 0xFFFF { return count; }
+            if c == 0 || c == 0xFFFF {
+                return count;
+            }
             out[count] = c;
             count += 1;
         }
         let name2 = self.name2;
         for &c in &name2 {
-            if c == 0 || c == 0xFFFF { return count; }
+            if c == 0 || c == 0xFFFF {
+                return count;
+            }
             out[count] = c;
             count += 1;
         }
         let name3 = self.name3;
         for &c in &name3 {
-            if c == 0 || c == 0xFFFF { return count; }
+            if c == 0 || c == 0xFFFF {
+                return count;
+            }
             out[count] = c;
             count += 1;
         }

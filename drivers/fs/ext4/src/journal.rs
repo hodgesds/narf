@@ -18,10 +18,9 @@
 extern crate alloc;
 
 pub use narf_drivers_fs_ext2::journal::{
-    JBD2_MAGIC_NUMBER, block_type, tag_flag,
-    JournalHeader, JournalSuperblock, DescriptorTag, DescriptorBlock,
-    CommitBlock, RevokeBlock, ReplayReport, JournalError,
-    replay_journal, replay_journal_flat,
+    block_type, replay_journal, replay_journal_flat, tag_flag, CommitBlock, DescriptorBlock,
+    DescriptorTag, JournalError, JournalHeader, JournalSuperblock, ReplayReport, RevokeBlock,
+    JBD2_MAGIC_NUMBER,
 };
 
 use alloc::vec::Vec;
@@ -187,11 +186,7 @@ pub fn encode_revoke(buf: &mut [u8], sequence: u32, revoked: &[u64]) {
 /// `tags` carries `(target_fs_block, data_bytes)` pairs. Caller
 /// chooses `block_size`; each data slice must be exactly
 /// `block_size` bytes.
-pub fn build_one_txn_image(
-    block_size: usize,
-    tags: &[(u64, Vec<u8>)],
-    sequence: u32,
-) -> Vec<u8> {
+pub fn build_one_txn_image(block_size: usize, tags: &[(u64, Vec<u8>)], sequence: u32) -> Vec<u8> {
     let first = 1u32;
     let n_tags = tags.len() as u32;
     // Layout: [sb][descriptor][data*N][commit]
@@ -214,7 +209,11 @@ pub fn build_one_txn_image(
     for (t, _) in tags {
         tag_list.push((*t, 0));
     }
-    encode_descriptor(&mut image[desc_off..desc_off + block_size], sequence, &tag_list);
+    encode_descriptor(
+        &mut image[desc_off..desc_off + block_size],
+        sequence,
+        &tag_list,
+    );
 
     // Data blocks.
     for (i, (_, data)) in tags.iter().enumerate() {

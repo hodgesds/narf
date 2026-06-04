@@ -28,11 +28,11 @@
 extern crate alloc;
 
 pub mod bpb;
-pub mod fat;
 pub mod dir;
+pub mod fat;
 pub mod fsinfo;
-pub mod volume;
 pub mod node;
+pub mod volume;
 
 mod tests;
 
@@ -120,17 +120,12 @@ pub fn register_initcalls() {
 ///
 /// Errors bubble up unchanged so the root-mount walker can log the
 /// reason and try the next candidate device.
-fn fat_factory(
-    dev: Arc<dyn narf_block::BlockDeviceSync>,
-) -> Result<Arc<dyn FsInstance>, FsError> {
+fn fat_factory(dev: Arc<dyn narf_block::BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
     use narf_block::SyncBlock;
 
     // SyncBlock::new returns Arc<SyncBlock> — exactly the
     // `Arc<B: BlockDevice>` shape FatVolume::mount expects.
     let async_dev = SyncBlock::new(dev);
-    let vol = narf_scheduler::block_on(volume::FatVolume::mount(
-        async_dev,
-        DomainId::DRIVER_0,
-    ))?;
+    let vol = narf_scheduler::block_on(volume::FatVolume::mount(async_dev, DomainId::DRIVER_0))?;
     Ok(vol as Arc<dyn FsInstance>)
 }

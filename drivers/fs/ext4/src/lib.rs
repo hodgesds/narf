@@ -37,12 +37,12 @@
 
 extern crate alloc;
 
-pub mod superblock;
-pub mod inode;
-pub mod extent;
 pub mod dir;
+pub mod extent;
 pub mod htree;
+pub mod inode;
 pub mod journal;
+pub mod superblock;
 
 mod tests;
 

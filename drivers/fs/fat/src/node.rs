@@ -26,9 +26,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{
@@ -102,13 +100,12 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                 return None;
             }
             let fat_sz = self.volume.bpb.fat_size(self.volume.fat32_ext.as_ref());
-            let first_root_sec = self.volume.bpb.rsvd_sec_cnt as u32
-                + (self.volume.bpb.num_fats as u32 * fat_sz);
+            let first_root_sec =
+                self.volume.bpb.rsvd_sec_cnt as u32 + (self.volume.bpb.num_fats as u32 * fat_sz);
             Some(first_root_sec as u64 + self.sector_in_cluster as u64)
         } else {
             Some(
-                self.volume.first_sector_of_cluster(cluster) as u64
-                    + self.sector_in_cluster as u64,
+                self.volume.first_sector_of_cluster(cluster) as u64 + self.sector_in_cluster as u64,
             )
         }
     }
@@ -127,9 +124,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
         Ok(())
     }
 
-    async fn next(
-        &mut self,
-    ) -> Result<Option<(String, RawDirEntry, u64, usize)>, FsError> {
+    async fn next(&mut self) -> Result<Option<(String, RawDirEntry, u64, usize)>, FsError> {
         loop {
             let lba = match self.current_lba() {
                 Some(l) => l,
@@ -137,14 +132,10 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
             };
             self.ensure_sector_loaded(lba).await?;
 
-            let entries_per_sector =
-                (self.volume.bpb.bytes_per_sec as u32) / DIR_ENTRY_SIZE as u32;
+            let entries_per_sector = (self.volume.bpb.bytes_per_sec as u32) / DIR_ENTRY_SIZE as u32;
             while self.entry_in_sector < entries_per_sector {
                 let offset = (self.entry_in_sector as usize) * DIR_ENTRY_SIZE;
-                let entry = read_dir_entry(
-                    &self.sector.as_ref().unwrap().1,
-                    offset,
-                );
+                let entry = read_dir_entry(&self.sector.as_ref().unwrap().1, offset);
 
                 if entry.is_end() {
                     return Ok(None);
@@ -155,10 +146,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                     continue;
                 }
                 if entry.is_lfn() {
-                    let lfn = read_lfn_entry(
-                        &self.sector.as_ref().unwrap().1,
-                        offset,
-                    );
+                    let lfn = read_lfn_entry(&self.sector.as_ref().unwrap().1, offset);
                     let ord = lfn.ord;
                     let is_last = (ord & LFN_ENTRY_LAST_MASK) != 0;
                     if is_last {
@@ -171,9 +159,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                     let index = (ord & !LFN_ENTRY_LAST_MASK) as usize;
                     if index > 0 && index <= 20 {
                         let pos = (index - 1) * 13;
-                        let len = lfn.extract_name(
-                            &mut self.lfn_buffer[pos..pos + 13],
-                        );
+                        let len = lfn.extract_name(&mut self.lfn_buffer[pos..pos + 13]);
                         if is_last {
                             self.lfn_len = pos + len;
                         }
@@ -203,9 +189,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
             self.entry_in_sector = 0;
             self.sector_in_cluster += 1;
             if let Some(cluster) = self.current_cluster {
-                if cluster != 0
-                    && self.sector_in_cluster >= self.volume.bpb.sec_per_clus as u32
-                {
+                if cluster != 0 && self.sector_in_cluster >= self.volume.bpb.sec_per_clus as u32 {
                     self.sector_in_cluster = 0;
                     match self.volume.next_cluster(cluster).await? {
                         super::fat::FatEntry::Next(next) => {
@@ -296,7 +280,10 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     ) -> Self {
         Self {
             volume,
-            state: IrqSafeSpinLock::new(FatNodeState { first_cluster, stat }),
+            state: IrqSafeSpinLock::new(FatNodeState {
+                first_cluster,
+                stat,
+            }),
             entry_location,
         }
     }
@@ -334,7 +321,11 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         if len < old_size {
             let bytes_per_cluster =
                 self.volume.bpb.bytes_per_sec as u64 * self.volume.bpb.sec_per_clus as u64;
-            let last_cluster_index = if len == 0 { 0 } else { (len - 1) / bytes_per_cluster };
+            let last_cluster_index = if len == 0 {
+                0
+            } else {
+                (len - 1) / bytes_per_cluster
+            };
 
             if cluster < 2 {
                 // Block-scope the IrqSafeSpinLock guard so it's
@@ -473,9 +464,8 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         let base = parts.next().unwrap_or("");
         let ext = parts.next().unwrap_or("");
 
-        let is_valid_sfn_char = |c: u8| -> bool {
-            c.is_ascii_alphanumeric() || b"$%'-_@~`!()^{}#&".contains(&c)
-        };
+        let is_valid_sfn_char =
+            |c: u8| -> bool { c.is_ascii_alphanumeric() || b"$%'-_@~`!()^{}#&".contains(&c) };
 
         let mut base_idx = 0;
         for &b in base.as_bytes() {
@@ -614,10 +604,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
 
             while scanner.entry_in_sector < entries_per_sector {
                 let offset = scanner.entry_in_sector as usize * DIR_ENTRY_SIZE;
-                let entry = read_dir_entry(
-                    &scanner.sector.as_ref().unwrap().1,
-                    offset,
-                );
+                let entry = read_dir_entry(&scanner.sector.as_ref().unwrap().1, offset);
 
                 if entry.is_free() || entry.is_end() {
                     if contiguous_found == 0 {
@@ -637,8 +624,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
             scanner.entry_in_sector = 0;
             scanner.sector_in_cluster += 1;
             if let Some(cluster) = scanner.current_cluster {
-                if cluster != 0
-                    && scanner.sector_in_cluster >= self.volume.bpb.sec_per_clus as u32
+                if cluster != 0 && scanner.sector_in_cluster >= self.volume.bpb.sec_per_clus as u32
                 {
                     scanner.sector_in_cluster = 0;
                     match self.volume.next_cluster(cluster).await? {
@@ -650,8 +636,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
                             let next = self.volume.allocate_cluster().await?;
                             self.volume.update_fat_entry(cluster, next).await?;
                             let zero = vec![0u8; lbs];
-                            let start_lba =
-                                self.volume.first_sector_of_cluster(next) as u64;
+                            let start_lba = self.volume.first_sector_of_cluster(next) as u64;
                             for i in 0..self.volume.bpb.sec_per_clus {
                                 self.volume
                                     .write_sector(start_lba + i as u64, &zero)
@@ -754,9 +739,7 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
                 let lba_start = self.volume.first_sector_of_cluster(cluster) as u64;
                 let mut sector_in_cluster = (cluster_offset / lbs) as u32;
                 let mut sector_offset = (cluster_offset % lbs) as usize;
-                while sector_in_cluster < self.volume.bpb.sec_per_clus as u32
-                    && remaining > 0
-                {
+                while sector_in_cluster < self.volume.bpb.sec_per_clus as u32 && remaining > 0 {
                     let lba = lba_start + sector_in_cluster as u64;
                     self.volume.read_sector(lba, &mut sector).await?;
                     let n = core::cmp::min(remaining as usize, lbs_us - sector_offset);
@@ -831,9 +814,7 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
                 let lba_start = self.volume.first_sector_of_cluster(cluster) as u64;
                 let mut sector_in_cluster = (cluster_offset / lbs) as u32;
                 let mut sector_offset = (cluster_offset % lbs) as usize;
-                while sector_in_cluster < self.volume.bpb.sec_per_clus as u32
-                    && remaining > 0
-                {
+                while sector_in_cluster < self.volume.bpb.sec_per_clus as u32 && remaining > 0 {
                     let lba = lba_start + sector_in_cluster as u64;
                     let n = core::cmp::min(remaining, lbs_us - sector_offset);
                     if n < lbs_us {
@@ -874,8 +855,7 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
                 {
                     let mut g = self.state.lock();
                     g.stat.size = offset + total_written as u64;
-                    g.stat.blocks =
-                        g.stat.size.div_ceil(self.volume.bpb.bytes_per_sec as u64);
+                    g.stat.blocks = g.stat.size.div_ceil(self.volume.bpb.bytes_per_sec as u64);
                 }
                 self.sync_metadata().await?;
             }
@@ -1153,8 +1133,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                     if !entry.is_directory() {
                         return Err(FsError::InvalidPath);
                     }
-                    let mut sub =
-                        DirectoryScanner::new(self.volume.clone(), entry.first_cluster());
+                    let mut sub = DirectoryScanner::new(self.volume.clone(), entry.first_cluster());
                     while let Some((n, _, _, _)) = sub.next().await? {
                         if n != "." && n != ".." {
                             return Err(FsError::Busy);

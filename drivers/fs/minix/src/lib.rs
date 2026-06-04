@@ -41,11 +41,11 @@
 
 extern crate alloc;
 
-pub mod superblock;
-pub mod inode;
 pub mod dir;
-pub mod volume;
+pub mod inode;
 pub mod node;
+pub mod superblock;
+pub mod volume;
 
 mod tests;
 

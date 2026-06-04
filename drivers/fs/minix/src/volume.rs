@@ -107,8 +107,13 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let mut buf = vec![0u8; n_sectors * lbs];
         for i in 0..n_sectors {
             let offset = i * lbs;
-            Self::read_sector_into(&*device, &io, sb_lba + i as u64, &mut buf[offset..offset + lbs])
-                .await?;
+            Self::read_sector_into(
+                &*device,
+                &io,
+                sb_lba + i as u64,
+                &mut buf[offset..offset + lbs],
+            )
+            .await?;
         }
         let sb = match Superblock::decode(&buf, sb_off_in_sector) {
             Some(sb) => sb,
@@ -283,20 +288,19 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let blocks_per_zone = (1u32 << self.sb.log_zone_size as u32) as usize;
         let bs = self.sb.block_size as usize;
         for i in 0..blocks_per_zone {
-            let block = zone_no.checked_mul(blocks_per_zone as u32)
+            let block = zone_no
+                .checked_mul(blocks_per_zone as u32)
                 .and_then(|b| b.checked_add(i as u32))
                 .ok_or(FsError::Io(narf_block::BlockError::InvalidRange))?;
-            self.read_block(block, &mut dst[i * bs..(i + 1) * bs]).await?;
+            self.read_block(block, &mut dst[i * bs..(i + 1) * bs])
+                .await?;
         }
         Ok(())
     }
 
     /// Read inode `ino` (1-based) from the inode table.
     pub async fn read_inode(&self, ino: u32) -> Result<super::inode::Inode, FsError> {
-        let (block, off_in_block) = self
-            .sb
-            .inode_location(ino)
-            .ok_or(FsError::NotFound)?;
+        let (block, off_in_block) = self.sb.inode_location(ino).ok_or(FsError::NotFound)?;
         let bs = self.sb.block_size as usize;
         let mut buf = vec![0u8; bs];
         self.read_block(block, &mut buf).await?;
@@ -382,15 +386,10 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         let z = match self.sb.version {
-            super::MinixVersion::V1 => {
-                u16::from_le_bytes([buf[off], buf[off + 1]]) as u32
+            super::MinixVersion::V1 => u16::from_le_bytes([buf[off], buf[off + 1]]) as u32,
+            super::MinixVersion::V2 | super::MinixVersion::V3 => {
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
             }
-            super::MinixVersion::V2 | super::MinixVersion::V3 => u32::from_le_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]),
         };
         Ok(if z == 0 { None } else { Some(z) })
     }
@@ -426,8 +425,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
                 Some(zone_no) => {
                     let mut zbuf = vec![0u8; zs as usize];
                     self.read_zone(zone_no, &mut zbuf).await?;
-                    dst[total..total + n]
-                        .copy_from_slice(&zbuf[zone_offset..zone_offset + n]);
+                    dst[total..total + n].copy_from_slice(&zbuf[zone_offset..zone_offset + n]);
                 }
                 None => {
                     // Hole — zero-fill.
@@ -446,10 +444,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     /// Read the full directory contents of `inode` (which must be a
     /// directory) into a `Vec<u8>` and return it. Sized at
     /// `inode.size` bytes.
-    pub async fn read_dir_bytes(
-        &self,
-        inode: &super::inode::Inode,
-    ) -> Result<Vec<u8>, FsError> {
+    pub async fn read_dir_bytes(&self, inode: &super::inode::Inode) -> Result<Vec<u8>, FsError> {
         let mut out = vec![0u8; inode.size as usize];
         let n = self.read_file(inode, 0, &mut out).await?;
         out.truncate(n);
@@ -459,15 +454,8 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     // ── Write paths ─────────────────────────────────────────────
 
     /// Write inode `ino` (1-based) back into the inode table.
-    pub async fn write_inode(
-        &self,
-        ino: u32,
-        inode: &super::inode::Inode,
-    ) -> Result<(), FsError> {
-        let (block, off_in_block) = self
-            .sb
-            .inode_location(ino)
-            .ok_or(FsError::NotFound)?;
+    pub async fn write_inode(&self, ino: u32, inode: &super::inode::Inode) -> Result<(), FsError> {
+        let (block, off_in_block) = self.sb.inode_location(ino).ok_or(FsError::NotFound)?;
         let bs = self.sb.block_size as usize;
         let mut buf = vec![0u8; bs];
         self.read_block(block, &mut buf).await?;
@@ -506,8 +494,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
                     if *byte & (1 << bit) != 0 {
                         continue;
                     }
-                    let ordinal =
-                        blk * (bs as u32 * 8) + byte_idx as u32 * 8 + bit;
+                    let ordinal = blk * (bs as u32 * 8) + byte_idx as u32 * 8 + bit;
                     if ordinal == 0 {
                         // Reserved per MINIX convention.
                         continue;
@@ -684,15 +671,10 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         let cur = match self.sb.version {
-            super::MinixVersion::V1 => {
-                u16::from_le_bytes([buf[off], buf[off + 1]]) as u32
+            super::MinixVersion::V1 => u16::from_le_bytes([buf[off], buf[off + 1]]) as u32,
+            super::MinixVersion::V2 | super::MinixVersion::V3 => {
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
             }
-            super::MinixVersion::V2 | super::MinixVersion::V3 => u32::from_le_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]),
         };
         if cur != 0 {
             return Ok(cur);
@@ -719,10 +701,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     /// Free every zone an inode owns (direct + indirect) and zero
     /// the inode's `zones[]` field. Used by `unlink` / `rmdir` /
     /// `truncate(0)`.
-    pub async fn truncate_inode(
-        &self,
-        inode: &mut super::inode::Inode,
-    ) -> Result<(), FsError> {
+    pub async fn truncate_inode(&self, inode: &mut super::inode::Inode) -> Result<(), FsError> {
         use super::inode::{DBL_SLOT, DIRECT_ZONES, IND_SLOT, TRI_SLOT};
         let zpb = self.sb.zone_ptrs_per_block();
 
@@ -805,15 +784,10 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let zps = self.sb.zone_ptr_size();
         let off = idx as usize * zps;
         match self.sb.version {
-            super::MinixVersion::V1 => {
-                u16::from_le_bytes([buf[off], buf[off + 1]]) as u32
+            super::MinixVersion::V1 => u16::from_le_bytes([buf[off], buf[off + 1]]) as u32,
+            super::MinixVersion::V2 | super::MinixVersion::V3 => {
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
             }
-            super::MinixVersion::V2 | super::MinixVersion::V3 => u32::from_le_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]),
         }
     }
 
@@ -840,8 +814,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             if zone_offset != 0 || n != zs as usize {
                 self.read_zone(zone_no, &mut zbuf).await?;
             }
-            zbuf[zone_offset..zone_offset + n]
-                .copy_from_slice(&src[total..total + n]);
+            zbuf[zone_offset..zone_offset + n].copy_from_slice(&src[total..total + n]);
             self.write_zone(zone_no, &zbuf).await?;
             total += n;
             remaining -= n;

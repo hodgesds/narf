@@ -22,7 +22,7 @@ pub mod magic {
     pub const V1_30: u16 = 0x138F;
     pub const V2_14: u16 = 0x2468;
     pub const V2_30: u16 = 0x2478;
-    pub const V3:    u16 = 0x4D5A;
+    pub const V3: u16 = 0x4D5A;
 }
 
 /// Decoded superblock — version-agnostic view used by the rest of
@@ -66,9 +66,7 @@ impl Superblock {
         }
         let s = &buf[byte_offset..];
 
-        let read_u16 = |off: usize| -> u16 {
-            u16::from_le_bytes([s[off], s[off + 1]])
-        };
+        let read_u16 = |off: usize| -> u16 { u16::from_le_bytes([s[off], s[off + 1]]) };
         let read_u32 = |off: usize| -> u32 {
             u32::from_le_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]])
         };
@@ -80,7 +78,7 @@ impl Superblock {
             magic::V1_30 => (MinixVersion::V1, NameLen::N30),
             magic::V2_14 => (MinixVersion::V2, NameLen::N14),
             magic::V2_30 => (MinixVersion::V2, NameLen::N30),
-            magic::V3    => (MinixVersion::V3, NameLen::N60),
+            magic::V3 => (MinixVersion::V3, NameLen::N60),
             _ => return None,
         };
 

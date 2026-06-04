@@ -58,20 +58,34 @@ pub enum DecodeError {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MsgType {
-    Tversion = 100, Rversion = 101,
-    Tauth    = 102, Rauth    = 103,
-    Tattach  = 104, Rattach  = 105,
-    Terror   = 106, Rerror   = 107,
-    Tflush   = 108, Rflush   = 109,
-    Twalk    = 110, Rwalk    = 111,
-    Topen    = 112, Ropen    = 113,
-    Tcreate  = 114, Rcreate  = 115,
-    Tread    = 116, Rread    = 117,
-    Twrite   = 118, Rwrite   = 119,
-    Tclunk   = 120, Rclunk   = 121,
-    Tremove  = 122, Rremove  = 123,
-    Tstat    = 124, Rstat    = 125,
-    Twstat   = 126, Rwstat   = 127,
+    Tversion = 100,
+    Rversion = 101,
+    Tauth = 102,
+    Rauth = 103,
+    Tattach = 104,
+    Rattach = 105,
+    Terror = 106,
+    Rerror = 107,
+    Tflush = 108,
+    Rflush = 109,
+    Twalk = 110,
+    Rwalk = 111,
+    Topen = 112,
+    Ropen = 113,
+    Tcreate = 114,
+    Rcreate = 115,
+    Tread = 116,
+    Rread = 117,
+    Twrite = 118,
+    Rwrite = 119,
+    Tclunk = 120,
+    Rclunk = 121,
+    Tremove = 122,
+    Rremove = 123,
+    Tstat = 124,
+    Rstat = 125,
+    Twstat = 126,
+    Rwstat = 127,
 }
 
 impl MsgType {
@@ -463,7 +477,12 @@ pub fn encode_topen(w: &mut WireWrite, fid: u32, mode: u8) -> Result<(), DecodeE
 }
 
 /// Tread body: `fid[4] offset[8] count[4]`.
-pub fn encode_tread(w: &mut WireWrite, fid: u32, offset: u64, count: u32) -> Result<(), DecodeError> {
+pub fn encode_tread(
+    w: &mut WireWrite,
+    fid: u32,
+    offset: u64,
+    count: u32,
+) -> Result<(), DecodeError> {
     w.write_u32(fid)?;
     w.write_u64(offset)?;
     w.write_u32(count)

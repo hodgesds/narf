@@ -21,10 +21,7 @@
 //! - Linux `include/uapi/linux/ext4_fs.h::DX_HASH_*` constants.
 
 pub use narf_drivers_fs_ext2::htree::{
-    hash_version, DxRoot, DxEntry, DirHash,
-    DX_ROOT_INFO_OFF, DX_ROOT_HEAD_OFF, DX_ROOT_ENTRIES_OFF,
-    DX_NODE_HEAD_OFF, DX_NODE_ENTRIES_OFF,
-    dx_node_head, dx_node_entry,
-    dx_find_entry_root, dx_find_entry_node,
-    name_hash,
+    dx_find_entry_node, dx_find_entry_root, dx_node_entry, dx_node_head, hash_version, name_hash,
+    DirHash, DxEntry, DxRoot, DX_NODE_ENTRIES_OFF, DX_NODE_HEAD_OFF, DX_ROOT_ENTRIES_OFF,
+    DX_ROOT_HEAD_OFF, DX_ROOT_INFO_OFF,
 };

@@ -40,10 +40,7 @@ fn ftype_for_mode(mode: u16) -> u8 {
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Read every directory data block of `parent_inode` into a
     /// flat `Vec<u8>`. Length equals `parent_inode.size`.
-    pub(crate) async fn read_dir_bytes(
-        &self,
-        parent_inode: &Inode,
-    ) -> Result<Vec<u8>, FsError> {
+    pub(crate) async fn read_dir_bytes(&self, parent_inode: &Inode) -> Result<Vec<u8>, FsError> {
         let size = parent_inode.size as usize;
         if size == 0 {
             return Ok(Vec::new());
@@ -63,8 +60,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             } else {
                 let mut blockbuf = vec![0u8; bs];
                 self.read_block(phys, &mut blockbuf).await?;
-                out[off..off + want]
-                    .copy_from_slice(&blockbuf[in_block..in_block + want]);
+                out[off..off + want].copy_from_slice(&blockbuf[in_block..in_block + want]);
             }
             off += want;
         }
@@ -81,9 +77,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let bytes = self.read_dir_bytes(parent_inode).await?;
         let mut off = 0usize;
         while off + 8 <= bytes.len() {
-            let inode = u32::from_le_bytes([
-                bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-            ]);
+            let inode =
+                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
             let rec_len = u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]) as usize;
             let name_len = bytes[off + 6] as usize;
             let file_type = bytes[off + 7];
@@ -129,8 +124,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Two conditions must both hold:
         //   (a) The superblock has compat::DIR_INDEX set.
         //   (b) The inode has I_FLAGS_INDEX set.
-        let htree_active = self.superblock.feature_compat & compat::DIR_INDEX != 0
-            && parent_inode.is_htree();
+        let htree_active =
+            self.superblock.feature_compat & compat::DIR_INDEX != 0 && parent_inode.is_htree();
 
         // Try each existing block.
         for i in 0..blocks {
@@ -182,7 +177,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
                             // Write repacked halves.
                             self.write_block(phys, &split.old_block_data).await?;
-                            self.write_block(new_phys as u64, &split.new_block_data).await?;
+                            self.write_block(new_phys as u64, &split.new_block_data)
+                                .await?;
 
                             // Update the root-node index with the new
                             // (split_hash, new_phys) entry. Only the
@@ -294,10 +290,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     blockbuf[off + 2],
                     blockbuf[off + 3],
                 ]);
-                let rec_len = u16::from_le_bytes([
-                    blockbuf[off + 4],
-                    blockbuf[off + 5],
-                ]) as usize;
+                let rec_len = u16::from_le_bytes([blockbuf[off + 4], blockbuf[off + 5]]) as usize;
                 let name_len = blockbuf[off + 6] as usize;
                 let file_type = blockbuf[off + 7];
                 if rec_len < 8 || off + rec_len > blockbuf.len() {
@@ -340,7 +333,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::InvalidPath);
         }
         if let Err(e) = self
-            .dir_insert(parent_inode_no, &mut parent_inode, name, new_ino, new_inode.mode)
+            .dir_insert(
+                parent_inode_no,
+                &mut parent_inode,
+                name,
+                new_ino,
+                new_inode.mode,
+            )
             .await
         {
             let _ = self.free_inode(new_ino).await;
@@ -398,7 +397,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::InvalidPath);
         }
         if let Err(e) = self
-            .dir_insert(parent_inode_no, &mut parent_inode, name, new_ino, new_inode.mode)
+            .dir_insert(
+                parent_inode_no,
+                &mut parent_inode,
+                name,
+                new_ino,
+                new_inode.mode,
+            )
             .await
         {
             let _ = self.free_block(data_block).await;
@@ -414,11 +419,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
     /// Remove a file dirent. Decrements the target's link count; if
     /// it drops to zero, frees its blocks + inode slot.
-    pub async fn dir_unlink(
-        &self,
-        parent_inode_no: u32,
-        name: &[u8],
-    ) -> Result<(), FsError> {
+    pub async fn dir_unlink(&self, parent_inode_no: u32, name: &[u8]) -> Result<(), FsError> {
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -462,11 +463,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// the data blocks and the inode regardless of the link count
     /// (rmdir invalidates the slot — `.` and `..` are removed
     /// implicitly when the block is freed).
-    pub async fn dir_rmdir(
-        &self,
-        parent_inode_no: u32,
-        name: &[u8],
-    ) -> Result<(), FsError> {
+    pub async fn dir_rmdir(&self, parent_inode_no: u32, name: &[u8]) -> Result<(), FsError> {
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -721,10 +718,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Read the textual target of a symlink. For fast symlinks the
     /// bytes come from `i_block`; for slow symlinks the first data
     /// block is read.
-    pub async fn read_symlink_target(
-        &self,
-        inode: &Inode,
-    ) -> Result<Vec<u8>, FsError> {
+    pub async fn read_symlink_target(&self, inode: &Inode) -> Result<Vec<u8>, FsError> {
         if !inode.is_symlink() {
             return Err(FsError::InvalidPath);
         }

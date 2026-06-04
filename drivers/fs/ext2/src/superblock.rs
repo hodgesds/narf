@@ -217,8 +217,7 @@ impl Superblock {
         // s_blocks_count_hi is in the 64-bit-only extended section
         // (byte 336). Reading only when present + when 64BIT bit
         // says it's meaningful.
-        let blocks_count_hi = if buf.len() >= 340
-            && feature_incompat & incompat::SIXTYFOURBIT != 0
+        let blocks_count_hi = if buf.len() >= 340 && feature_incompat & incompat::SIXTYFOURBIT != 0
         {
             u32::from_le_bytes([buf[336], buf[337], buf[338], buf[339]])
         } else {
@@ -320,9 +319,7 @@ impl Superblock {
     /// 64 on ext4 with 64BIT. Falls back to 32 when `desc_size`
     /// is zero on a legacy superblock.
     pub fn effective_desc_size(&self) -> usize {
-        if self.feature_incompat & incompat::SIXTYFOURBIT != 0
-            && self.desc_size >= 64
-        {
+        if self.feature_incompat & incompat::SIXTYFOURBIT != 0 && self.desc_size >= 64 {
             self.desc_size as usize
         } else {
             32

@@ -40,7 +40,7 @@ use narf_filesystem::{
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::dir::{ftype, for_each_entry};
+use super::dir::{for_each_entry, ftype};
 use super::inode::Inode;
 use super::volume::Ext2Volume;
 
@@ -156,8 +156,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             } else {
                 let mut blockbuf = vec![0u8; bs as usize];
                 self.volume.read_block(physical, &mut blockbuf).await?;
-                dst[total..total + chunk]
-                    .copy_from_slice(&blockbuf[in_block..in_block + chunk]);
+                dst[total..total + chunk].copy_from_slice(&blockbuf[in_block..in_block + chunk]);
             }
             total += chunk;
             cursor += chunk as u64;
@@ -286,11 +285,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
             }
             let target = self.volume.read_inode(found_ino).await?;
             let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(
-                self.volume.clone(),
-                found_ino,
-                stat,
-            )) as Arc<dyn FileOps>)
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), found_ino, stat)) as Arc<dyn FileOps>)
         })
     }
 
@@ -327,11 +322,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 return Err(FsError::NotFound);
             }
             let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(
-                self.volume.clone(),
-                found_ino,
-                stat,
-            )) as Arc<dyn DirOps>)
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), found_ino, stat)) as Arc<dyn DirOps>)
         })
     }
 
@@ -395,8 +386,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .await?;
             let target = self.volume.read_inode(new_ino).await?;
             let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat))
-                as Arc<dyn FileOps>)
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat)) as Arc<dyn FileOps>)
         })
     }
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -408,8 +398,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .await?;
             let target = self.volume.read_inode(new_ino).await?;
             let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat))
-                as Arc<dyn DirOps>)
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat)) as Arc<dyn DirOps>)
         })
     }
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
@@ -428,7 +417,12 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         Box::pin(async move {
             let parent_ino = self.state.lock().inode_no;
             self.volume
-                .dir_rename(parent_ino, old_name.as_bytes(), parent_ino, new_name.as_bytes())
+                .dir_rename(
+                    parent_ino,
+                    old_name.as_bytes(),
+                    parent_ino,
+                    new_name.as_bytes(),
+                )
                 .await
         })
     }
@@ -441,8 +435,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .await?;
             let target_inode = self.volume.read_inode(new_ino).await?;
             let stat = Self::stat_from_inode(&self.volume, &target_inode);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat))
-                as Arc<dyn FileOps>)
+            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat)) as Arc<dyn FileOps>)
         })
     }
 }

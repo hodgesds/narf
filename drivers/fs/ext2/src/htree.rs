@@ -242,7 +242,11 @@ fn str2hashbuf(msg: &[u8], buf: &mut [u32; 4], num: usize, signed: bool) {
     let pad = (msg.len() as u32) | ((msg.len() as u32) << 8);
     let pad = pad | (pad << 16);
     let mut val = pad;
-    let bytes = if msg.len() > num * 4 { num * 4 } else { msg.len() };
+    let bytes = if msg.len() > num * 4 {
+        num * 4
+    } else {
+        msg.len()
+    };
     let mut out_i = 0usize;
     let mut left = num;
     for i in 0..bytes {
@@ -283,12 +287,7 @@ pub struct DirHash {
 /// zero in practice for our generated images).
 pub fn name_hash(name: &[u8], hash_version: u8, seed: &[u32; 4]) -> DirHash {
     // Default Linux seed when s_hash_seed is all zeros.
-    let default_seed: [u32; 4] = [
-        0x6745_2301,
-        0xefcd_ab89,
-        0x98ba_dcfe,
-        0x1032_5476,
-    ];
+    let default_seed: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
     let mut buf = if seed.iter().any(|&v| v != 0) {
         *seed
     } else {
@@ -301,11 +300,7 @@ pub fn name_hash(name: &[u8], hash_version: u8, seed: &[u32; 4]) -> DirHash {
             let mut hash0: u32 = 0x12a3_fe2d;
             let mut hash1: u32 = 0x37ab_e8f9;
             for &b in name {
-                let ch = if signed {
-                    b as i8 as i32
-                } else {
-                    b as i32
-                };
+                let ch = if signed { b as i8 as i32 } else { b as i32 };
                 let mut hash = hash1.wrapping_add(hash0 ^ ((ch as u32).wrapping_mul(7152373)));
                 if hash & 0x8000_0000 != 0 {
                     hash = hash.wrapping_sub(0x7fff_ffff);
@@ -410,7 +405,8 @@ pub fn collect_sorted_leaf_entries(
     let mut out = Vec::new();
     let mut off = 0usize;
     while off + 8 <= block.len() {
-        let inode = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        let inode =
+            u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
         let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
         let name_len = block[off + 6] as usize;
         let file_type = block[off + 7];
@@ -421,7 +417,10 @@ pub fn collect_sorted_leaf_entries(
             let name = &block[off + 8..off + 8 + name_len];
             let h = name_hash(name, hash_version, seed);
             let bytes = pack_dirent(inode, name, file_type);
-            out.push(LeafEntry { hash: h.hash, bytes });
+            out.push(LeafEntry {
+                hash: h.hash,
+                bytes,
+            });
         }
         off += rec_len;
     }

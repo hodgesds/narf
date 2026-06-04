@@ -30,8 +30,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::descriptor::{
-    read_anchor, read_descriptor_tag, read_file_set, read_lvd_header, read_partition,
-    tag_id, AnchorVolumeDescriptorPointer, FileSetDescriptor, LogicalVolumeDescriptorHeader,
+    read_anchor, read_descriptor_tag, read_file_set, read_lvd_header, read_partition, tag_id,
+    AnchorVolumeDescriptorPointer, FileSetDescriptor, LogicalVolumeDescriptorHeader,
     PartitionDescriptor,
 };
 use super::icb::{read_long_ad, LongAd};
@@ -121,8 +121,8 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
         // Allocate + register the per-volume scratch buffer. Mints
         // exactly one object-table slot for the lifetime of the
         // volume.
-        let buffer = alloc_coherent(SECTOR_SIZE, domain)
-            .map_err(|_| FsError::Io(BlockError::IOError))?;
+        let buffer =
+            alloc_coherent(SECTOR_SIZE, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
         let cap = register_with_cap(buffer);
         let io = VolumeIo { cap };
 
@@ -191,11 +191,8 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
                 }
                 tag_id::LOGICAL_VOLUME_DESCRIPTOR if lvd_header.is_none() => {
                     let header = read_lvd_header(&sector_buf, 0);
-                    let map_off =
-                        core::mem::size_of::<LogicalVolumeDescriptorHeader>();
-                    if header.number_of_partition_maps >= 1
-                        && map_off + 2 <= sector_buf.len()
-                    {
+                    let map_off = core::mem::size_of::<LogicalVolumeDescriptorHeader>();
+                    if header.number_of_partition_maps >= 1 && map_off + 2 <= sector_buf.len() {
                         // Type-1 partition map (§3/10.7.2) — first
                         // byte is the map type. Bytes after that
                         // give the volume seq + partition number.
@@ -231,8 +228,7 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
         let fsd_long_ad = read_long_ad(&lvd.logical_volume_contents_use, 0);
         // The long_ad's LBN is partition-relative; the absolute
         // sector is `partition_starting_location + lbn`.
-        let fsd_lsn =
-            partition.partition_starting_location as u64 + fsd_long_ad.extent_lbn as u64;
+        let fsd_lsn = partition.partition_starting_location as u64 + fsd_long_ad.extent_lbn as u64;
         if fsd_lsn >= cap_blocks {
             drop(io);
             return Err(FsError::Unsupported);

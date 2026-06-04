@@ -18,9 +18,7 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::boot::{ExfatBootSector, BOOT_SIGNATURE, EXFAT_SIGNATURE};
-use super::dir::{
-    entry_type, file_attr, name_hash, stream_flags, DIR_ENTRY_SIZE,
-};
+use super::dir::{entry_type, file_attr, name_hash, stream_flags, DIR_ENTRY_SIZE};
 use super::fat::{classify, FatEntry};
 use super::upcase::UpcaseTable;
 
@@ -77,7 +75,7 @@ fn smoke_exfat_cluster_shift_math() -> TestResult {
     // §3.1.14 — SectorsPerCluster = 1 << shift; capped so the
     //           product ≤ 25 (max 32 MiB cluster).
     let mut boot = blank_boot();
-    boot.bytes_per_sector_shift = 9;   // 512 bytes/sector
+    boot.bytes_per_sector_shift = 9; // 512 bytes/sector
     boot.sectors_per_cluster_shift = 3; // 8 sectors/cluster
     if boot.bytes_per_sector() != 512 {
         return TestResult::Fail("bytes_per_sector should be 512");
@@ -196,7 +194,13 @@ fn smoke_exfat_bitmap_bit_position_math() -> TestResult {
     // §7.1: the bitmap holds one bit per cluster, bit 0 = cluster 2.
     // For cluster index `c`, the bit lives at bit `(c-2) % 8` of
     // byte `(c-2) / 8` of the stream.
-    let cases = [(2u32, 0usize, 0u8), (3, 0, 1), (9, 0, 7), (10, 1, 0), (17, 1, 7)];
+    let cases = [
+        (2u32, 0usize, 0u8),
+        (3, 0, 1),
+        (9, 0, 7),
+        (10, 1, 0),
+        (17, 1, 7),
+    ];
     for (cluster, byte, bit) in cases {
         let i = cluster - 2;
         let by = (i / 8) as usize;
@@ -267,9 +271,9 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 /// every region fits in a small handful of sectors.
 const LBS: usize = 512;
 const SECTORS_PER_CLUSTER: u32 = 1;
-const FAT_OFFSET_SECTORS: u32 = 24;     // 24 reserved sectors (matches typical exFAT).
-const FAT_LENGTH_SECTORS: u32 = 8;      // Plenty for a small image.
-const CLUSTER_HEAP_OFFSET: u32 = 32;    // FAT_OFFSET + FAT_LENGTH.
+const FAT_OFFSET_SECTORS: u32 = 24; // 24 reserved sectors (matches typical exFAT).
+const FAT_LENGTH_SECTORS: u32 = 8; // Plenty for a small image.
+const CLUSTER_HEAP_OFFSET: u32 = 32; // FAT_OFFSET + FAT_LENGTH.
 const TOTAL_SECTORS: u64 = 256;
 const CLUSTER_COUNT: u32 = 64;
 const ROOT_DIRECTORY_CLUSTER: u32 = 2;
@@ -305,25 +309,25 @@ fn build_exfat_image(file_name: &str, file_data: &[u8]) -> Vec<u8> {
     // ── Boot sector (§3.1) ───────────────────────────────────────
     {
         let s = lba_off(&mut img, 0);
-        s[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);     // §3.1.1 JumpBoot
-        s[3..11].copy_from_slice(EXFAT_SIGNATURE);          // §3.1.2 FileSystemName
-        // §3.1.3 MustBeZero stays at zero.
-        write_le_u64(s, 64, 0);                              // §3.1.4 PartitionOffset
-        write_le_u64(s, 72, TOTAL_SECTORS);                  // §3.1.5 VolumeLength
-        write_le_u32(s, 80, FAT_OFFSET_SECTORS);             // §3.1.6 FatOffset
-        write_le_u32(s, 84, FAT_LENGTH_SECTORS);             // §3.1.7 FatLength
-        write_le_u32(s, 88, CLUSTER_HEAP_OFFSET);            // §3.1.8 ClusterHeapOffset
-        write_le_u32(s, 92, CLUSTER_COUNT);                  // §3.1.9 ClusterCount
-        write_le_u32(s, 96, ROOT_DIRECTORY_CLUSTER);         // §3.1.10 FirstClusterOfRootDirectory
-        write_le_u32(s, 100, 0xDEADBEEF);                    // §3.1.11 VolumeSerialNumber
-        write_le_u16(s, 104, 0x0100);                        // §3.1.12 FileSystemRevision (1.00)
-        write_le_u16(s, 106, 0);                             // §3.1.13 VolumeFlags
-        s[108] = 9;                                          // §3.1.13 BytesPerSectorShift (512)
-        s[109] = 0;                                          // §3.1.14 SectorsPerClusterShift (1)
-        s[110] = 1;                                          // §3.1.15 NumberOfFats
-        s[111] = 0x80;                                       // §3.1.16 DriveSelect
-        s[112] = 0;                                          // §3.1.17 PercentInUse
-        // §3.1.19 BootSignature
+        s[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]); // §3.1.1 JumpBoot
+        s[3..11].copy_from_slice(EXFAT_SIGNATURE); // §3.1.2 FileSystemName
+                                                   // §3.1.3 MustBeZero stays at zero.
+        write_le_u64(s, 64, 0); // §3.1.4 PartitionOffset
+        write_le_u64(s, 72, TOTAL_SECTORS); // §3.1.5 VolumeLength
+        write_le_u32(s, 80, FAT_OFFSET_SECTORS); // §3.1.6 FatOffset
+        write_le_u32(s, 84, FAT_LENGTH_SECTORS); // §3.1.7 FatLength
+        write_le_u32(s, 88, CLUSTER_HEAP_OFFSET); // §3.1.8 ClusterHeapOffset
+        write_le_u32(s, 92, CLUSTER_COUNT); // §3.1.9 ClusterCount
+        write_le_u32(s, 96, ROOT_DIRECTORY_CLUSTER); // §3.1.10 FirstClusterOfRootDirectory
+        write_le_u32(s, 100, 0xDEADBEEF); // §3.1.11 VolumeSerialNumber
+        write_le_u16(s, 104, 0x0100); // §3.1.12 FileSystemRevision (1.00)
+        write_le_u16(s, 106, 0); // §3.1.13 VolumeFlags
+        s[108] = 9; // §3.1.13 BytesPerSectorShift (512)
+        s[109] = 0; // §3.1.14 SectorsPerClusterShift (1)
+        s[110] = 1; // §3.1.15 NumberOfFats
+        s[111] = 0x80; // §3.1.16 DriveSelect
+        s[112] = 0; // §3.1.17 PercentInUse
+                    // §3.1.19 BootSignature
         s[510] = 0x55;
         s[511] = 0xAA;
     }
@@ -334,8 +338,8 @@ fn build_exfat_image(file_name: &str, file_data: &[u8]) -> Vec<u8> {
     // = EOC. Root dir is also single-cluster = EOC.
     {
         let s = lba_off(&mut img, FAT_OFFSET_SECTORS as u64);
-        write_le_u32(s, 0, 0xFFFF_FFF8);                    // FAT[0]
-        write_le_u32(s, 4, 0xFFFF_FFFF);                    // FAT[1]
+        write_le_u32(s, 0, 0xFFFF_FFF8); // FAT[0]
+        write_le_u32(s, 4, 0xFFFF_FFFF); // FAT[1]
         write_le_u32(s, (ROOT_DIRECTORY_CLUSTER as usize) * 4, 0xFFFF_FFFF);
         write_le_u32(s, (BITMAP_CLUSTER as usize) * 4, 0xFFFF_FFFF);
         write_le_u32(s, (UPCASE_CLUSTER as usize) * 4, 0xFFFF_FFFF);
@@ -359,8 +363,7 @@ fn build_exfat_image(file_name: &str, file_data: &[u8]) -> Vec<u8> {
             } else {
                 i
             };
-            s[(i as usize) * 2..(i as usize) * 2 + 2]
-                .copy_from_slice(&mapped.to_le_bytes());
+            s[(i as usize) * 2..(i as usize) * 2 + 2].copy_from_slice(&mapped.to_le_bytes());
         }
         // §7.2.5.2 — 0xFFFF + run length identity-fills the rest.
         let off = 0x80 * 2;
@@ -548,13 +551,13 @@ kernel_test_in!("drivers/fs/exfat", smoke_exfat_mount_ramblock_round_trip);
 /// (the checksum field itself). Verify round-trip on a constructed
 /// 32-byte group.
 fn smoke_exfat_set_checksum_round_trip() -> TestResult {
-    use super::dir::{finalize_set_checksum, verify_set_checksum, set_checksum};
+    use super::dir::{finalize_set_checksum, set_checksum, verify_set_checksum};
 
     // Build a 64-byte group (one primary + one secondary entry).
     let mut group = [0u8; 64];
     group[0] = 0x85; // FILE entry type
     group[1] = 1; // secondary_count
-    // Bytes 4..32 are file attributes / timestamps / reserved.
+                  // Bytes 4..32 are file attributes / timestamps / reserved.
     for i in 4..32 {
         group[i] = i as u8;
     }
@@ -652,24 +655,32 @@ fn smoke_exfat_set_checksum_3entry_set() -> TestResult {
     // 3-entry set: FileDirectory (0x85) + StreamExtension (0xC0) +
     // FileName (0xC1). 3 × 32 = 96 bytes total.
     // Spec §7.4 — primary entry first; secondary_count = 2.
-    use super::dir::{finalize_set_checksum, recompute_set_checksum, verify_set_checksum, set_checksum};
+    use super::dir::{
+        finalize_set_checksum, recompute_set_checksum, set_checksum, verify_set_checksum,
+    };
 
     let mut group = [0u8; 96];
     // Primary: FileDirectory.
     group[0] = 0x85; // type
-    group[1] = 2;    // SecondaryCount = 2
-    // bytes 2..4 are the checksum field — left as zero initially.
-    // FileAttributes = ARCHIVE (0x0020).
+    group[1] = 2; // SecondaryCount = 2
+                  // bytes 2..4 are the checksum field — left as zero initially.
+                  // FileAttributes = ARCHIVE (0x0020).
     group[4] = 0x20;
     group[5] = 0x00;
     // Stream Extension.
     group[32] = 0xC0; // type
     group[33] = 0x03; // GeneralSecondaryFlags
-    group[35] = 5;    // NameLength = 5
-    // FileName slot.
+    group[35] = 5; // NameLength = 5
+                   // FileName slot.
     group[64] = 0xC1; // type
-    // First 5 UTF-16 chars of name "HELLO" packed LE.
-    let hello: &[u16] = &[b'H' as u16, b'E' as u16, b'L' as u16, b'L' as u16, b'O' as u16];
+                      // First 5 UTF-16 chars of name "HELLO" packed LE.
+    let hello: &[u16] = &[
+        b'H' as u16,
+        b'E' as u16,
+        b'L' as u16,
+        b'L' as u16,
+        b'O' as u16,
+    ];
     for (i, &cu) in hello.iter().enumerate() {
         let bytes = cu.to_le_bytes();
         group[66 + i * 2] = bytes[0];
@@ -707,24 +718,26 @@ fn smoke_exfat_set_checksum_5entry_set() -> TestResult {
     // 5-entry set: FileDirectory (0x85) + StreamExtension (0xC0) +
     // three FileName entries (0xC1). 5 × 32 = 160 bytes total.
     // SecondaryCount = 4 (1 stream + 3 name slots).
-    use super::dir::{finalize_set_checksum, recompute_set_checksum, verify_set_checksum, set_checksum};
+    use super::dir::{
+        finalize_set_checksum, recompute_set_checksum, set_checksum, verify_set_checksum,
+    };
 
     let mut group = [0u8; 160];
     group[0] = 0x85; // primary type
-    group[1] = 4;    // SecondaryCount = 4
+    group[1] = 4; // SecondaryCount = 4
     group[4] = 0x20; // FileAttributes = ARCHIVE
     group[32] = 0xC0; // stream extension
     group[33] = 0x01; // ALLOCATION_POSSIBLE
-    group[35] = 40;   // NameLength = 40 (3 × 15 = 45 > 40 — fills 2 full + partial slot)
-    // Three FileName entries.
-    group[64]  = 0xC1;
-    group[96]  = 0xC1;
+    group[35] = 40; // NameLength = 40 (3 × 15 = 45 > 40 — fills 2 full + partial slot)
+                    // Three FileName entries.
+    group[64] = 0xC1;
+    group[96] = 0xC1;
     group[128] = 0xC1;
     // Fill each name slot with a distinct repeating pattern.
     for i in 0..15usize {
         let bytes = ((0x41u16 + i as u16) & 0xFF).to_le_bytes();
-        group[66  + i * 2] = bytes[0]; // first slot: A..O
-        group[98  + i * 2] = bytes[0].wrapping_add(0x10); // second: Q..
+        group[66 + i * 2] = bytes[0]; // first slot: A..O
+        group[98 + i * 2] = bytes[0].wrapping_add(0x10); // second: Q..
         group[130 + i * 2] = bytes[0].wrapping_add(0x20); // third: a..
     }
 
@@ -745,7 +758,9 @@ fn smoke_exfat_set_checksum_5entry_set() -> TestResult {
     group[80] ^= 0xAA;
     recompute_set_checksum(&mut group);
     if !verify_set_checksum(&group) {
-        return TestResult::Fail("verify_set_checksum failed after recompute_set_checksum on 5-entry");
+        return TestResult::Fail(
+            "verify_set_checksum failed after recompute_set_checksum on 5-entry",
+        );
     }
 
     TestResult::Pass

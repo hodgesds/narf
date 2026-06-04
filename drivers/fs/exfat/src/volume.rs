@@ -28,8 +28,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use super::boot::{ExfatBootSector, BOOT_SIGNATURE};
 use super::dir::{
-    entry_type, AllocationBitmapEntry, StreamExtensionEntry, UpcaseTableEntry,
-    DIR_ENTRY_SIZE,
+    entry_type, AllocationBitmapEntry, StreamExtensionEntry, UpcaseTableEntry, DIR_ENTRY_SIZE,
 };
 use super::fat::{self, FatEntry};
 use super::upcase::UpcaseTable;
@@ -394,10 +393,9 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         let mut sector_in_cluster: u32 = 0;
 
         while sectors_scanned < MAX_SECTORS_TO_SCAN {
-            let lba =
-                boot.cluster_heap_offset as u64
-                    + (cluster as u64 - 2) * spc as u64
-                    + sector_in_cluster as u64;
+            let lba = boot.cluster_heap_offset as u64
+                + (cluster as u64 - 2) * spc as u64
+                + sector_in_cluster as u64;
             Self::read_sector_into(device, io, lba, &mut sector_buf).await?;
 
             let entries_per_sector = lbs / DIR_ENTRY_SIZE;
@@ -415,7 +413,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                     // heap buffer we own.
                     let upcase: UpcaseTableEntry = unsafe {
                         core::ptr::read_unaligned(
-                            sector_buf.as_ptr().add(off) as *const UpcaseTableEntry,
+                            sector_buf.as_ptr().add(off) as *const UpcaseTableEntry
                         )
                     };
                     let first_cluster = upcase.first_cluster;
@@ -425,14 +423,8 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                     // contiguous (NoFatChain semantically), but
                     // §7.2 doesn't actually expose a NoFatChain
                     // flag here — we walk the FAT.
-                    return Self::read_upcase_stream(
-                        device,
-                        io,
-                        boot,
-                        first_cluster,
-                        data_length,
-                    )
-                    .await;
+                    return Self::read_upcase_stream(device, io, boot, first_cluster, data_length)
+                        .await;
                 }
             }
 
@@ -441,8 +433,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             if sector_in_cluster >= spc {
                 sector_in_cluster = 0;
                 // Walk to the next cluster in the root chain.
-                let (fat_sec, fat_off) =
-                    fat::entry_location(boot.fat_offset, bps, cluster);
+                let (fat_sec, fat_off) = fat::entry_location(boot.fat_offset, bps, cluster);
                 Self::read_sector_into(device, io, fat_sec, &mut sector_buf).await?;
                 match fat::parse_entry(&sector_buf, fat_off) {
                     FatEntry::Next(n) => cluster = n,
@@ -480,13 +471,11 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                 }
                 Self::read_sector_into(device, io, lba_start + s, &mut sector_buf).await?;
                 let n = ((data_length - written) as usize).min(lbs);
-                bytes[written as usize..written as usize + n]
-                    .copy_from_slice(&sector_buf[..n]);
+                bytes[written as usize..written as usize + n].copy_from_slice(&sector_buf[..n]);
                 written += n as u64;
             }
             if written < data_length {
-                let (fat_sec, fat_off) =
-                    fat::entry_location(boot.fat_offset, bps, cluster);
+                let (fat_sec, fat_off) = fat::entry_location(boot.fat_offset, bps, cluster);
                 Self::read_sector_into(device, io, fat_sec, &mut sector_buf).await?;
                 match fat::parse_entry(&sector_buf, fat_off) {
                     FatEntry::Next(n) => cluster = n,
@@ -542,8 +531,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         let lbs = self.io.lock().lbs;
         let mut buf = vec![0u8; lbs];
         self.read_sector(sector, &mut buf).await?;
-        buf[byte_in_sector..byte_in_sector + 4]
-            .copy_from_slice(&value.to_le_bytes());
+        buf[byte_in_sector..byte_in_sector + 4].copy_from_slice(&value.to_le_bytes());
         self.write_sector(sector, &buf).await
     }
 
@@ -595,8 +583,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                         if run_len == n {
                             // Found enough; mark them and write back.
                             let start = run_start.unwrap();
-                            self.set_bitmap_range(bm_first, start, n, true)
-                                .await?;
+                            self.set_bitmap_range(bm_first, start, n, true).await?;
                             // Build a chain in the FAT.
                             for i in 0..n {
                                 let c = start + i;
@@ -722,7 +709,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                     // SAFETY: 32-byte packed layout from §7.1.
                     let bm: AllocationBitmapEntry = unsafe {
                         core::ptr::read_unaligned(
-                            sector_buf.as_ptr().add(off) as *const AllocationBitmapEntry,
+                            sector_buf.as_ptr().add(off) as *const AllocationBitmapEntry
                         )
                     };
                     let fc = bm.first_cluster;

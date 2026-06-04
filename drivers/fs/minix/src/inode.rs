@@ -26,13 +26,13 @@ pub const TRI_SLOT: usize = 9;
 
 /// File-type bits in `i_mode` (high bits). Tanenbaum §5.5 / POSIX.
 pub mod mode {
-    pub const IFMT:   u16 = 0o170000;
-    pub const IFREG:  u16 = 0o100000;
-    pub const IFDIR:  u16 = 0o040000;
-    pub const IFLNK:  u16 = 0o120000;
-    pub const IFCHR:  u16 = 0o020000;
-    pub const IFBLK:  u16 = 0o060000;
-    pub const IFIFO:  u16 = 0o010000;
+    pub const IFMT: u16 = 0o170000;
+    pub const IFREG: u16 = 0o100000;
+    pub const IFDIR: u16 = 0o040000;
+    pub const IFLNK: u16 = 0o120000;
+    pub const IFCHR: u16 = 0o020000;
+    pub const IFBLK: u16 = 0o060000;
+    pub const IFIFO: u16 = 0o010000;
 }
 
 /// Decoded inode (version-agnostic). Times collapse onto a single
@@ -67,9 +67,7 @@ impl Inode {
         }
         let s = &buf[offset..offset + 32];
         let u16le = |o: usize| u16::from_le_bytes([s[o], s[o + 1]]);
-        let u32le = |o: usize| {
-            u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]])
-        };
+        let u32le = |o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
         let mode = u16le(0);
         let uid = u16le(2);
         let size = u32le(4);
@@ -97,9 +95,7 @@ impl Inode {
         }
         let s = &buf[offset..offset + 64];
         let u16le = |o: usize| u16::from_le_bytes([s[o], s[o + 1]]);
-        let u32le = |o: usize| {
-            u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]])
-        };
+        let u32le = |o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
         let mode = u16le(0);
         let nlinks = u16le(2);
         let uid = u16le(4);
@@ -178,8 +174,7 @@ impl Inode {
         // mounts.
         s[20..24].copy_from_slice(&self.mtime.to_le_bytes());
         for i in 0..10 {
-            s[24 + i * 4..24 + i * 4 + 4]
-                .copy_from_slice(&self.zones[i].to_le_bytes());
+            s[24 + i * 4..24 + i * 4 + 4].copy_from_slice(&self.zones[i].to_le_bytes());
         }
     }
 

@@ -42,8 +42,8 @@ extern crate alloc;
 pub mod boot;
 pub mod dir;
 pub mod fat;
+pub mod node;
 pub mod upcase;
 pub mod volume;
-pub mod node;
 
 mod tests;

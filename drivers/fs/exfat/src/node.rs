@@ -31,9 +31,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{
@@ -250,15 +248,13 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                     }
 
                     // Stream extension follows the primary.
-                    let (stream_lba, stream_off) =
-                        self.locate_next_slot(lba).await?;
+                    let (stream_lba, stream_off) = self.locate_next_slot(lba).await?;
                     self.ensure_sector_loaded(stream_lba).await?;
                     let stream_etype = self.sector.as_ref().unwrap().1[stream_off];
                     if stream_etype != entry_type::STREAM_EXTENSION {
                         continue;
                     }
-                    let stream =
-                        read_stream_entry(&self.sector.as_ref().unwrap().1, stream_off);
+                    let stream = read_stream_entry(&self.sector.as_ref().unwrap().1, stream_off);
                     self.advance_one_slot();
                     let name_slot_count = secondary_count - 1;
                     let name_length = stream.name_length as usize;
@@ -277,8 +273,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
                         if nt != entry_type::FILE_NAME {
                             break;
                         }
-                        let n_entry =
-                            read_filename_entry(&self.sector.as_ref().unwrap().1, n_off);
+                        let n_entry = read_filename_entry(&self.sector.as_ref().unwrap().1, n_off);
                         let take = remaining.min(15);
                         let n = n_entry.file_name;
                         for &cu in &n[..take] {

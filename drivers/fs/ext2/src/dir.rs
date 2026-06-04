@@ -72,12 +72,7 @@ pub mod splice {
     /// entry with enough slack at its tail to be split.
     ///
     /// Mirrors Linux `fs/ext2/dir.c::ext2_add_link`, post-relicense.
-    pub fn insert_entry(
-        block: &mut [u8],
-        inode: u32,
-        name: &[u8],
-        file_type: u8,
-    ) -> InsertResult {
+    pub fn insert_entry(block: &mut [u8], inode: u32, name: &[u8], file_type: u8) -> InsertResult {
         if name.is_empty() || name.len() > 255 {
             return InsertResult::Corrupt;
         }
@@ -89,9 +84,8 @@ pub mod splice {
 
         let mut off = 0usize;
         while off + 8 <= blocksize {
-            let cur_inode = u32::from_le_bytes([
-                block[off], block[off + 1], block[off + 2], block[off + 3],
-            ]);
+            let cur_inode =
+                u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
             let cur_rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]);
             let cur_name_len = block[off + 6];
 
@@ -126,13 +120,11 @@ pub mod splice {
                 let new_rec_len = (cur_rec_len as usize - minimal) as u16;
                 if minimal != 0 {
                     // Shrink existing rec_len in place.
-                    block[off + 4..off + 6]
-                        .copy_from_slice(&(minimal as u16).to_le_bytes());
+                    block[off + 4..off + 6].copy_from_slice(&(minimal as u16).to_le_bytes());
                 }
                 // Write the new entry.
                 block[new_off..new_off + 4].copy_from_slice(&inode.to_le_bytes());
-                block[new_off + 4..new_off + 6]
-                    .copy_from_slice(&new_rec_len.to_le_bytes());
+                block[new_off + 4..new_off + 6].copy_from_slice(&new_rec_len.to_le_bytes());
                 block[new_off + 6] = name.len() as u8;
                 block[new_off + 7] = file_type;
                 block[new_off + 8..new_off + 8 + name.len()].copy_from_slice(name);
@@ -159,10 +151,7 @@ pub mod splice {
         if target_off + 8 > blocksize {
             return Err(());
         }
-        let target_rec_len = u16::from_le_bytes([
-            block[target_off + 4],
-            block[target_off + 5],
-        ]);
+        let target_rec_len = u16::from_le_bytes([block[target_off + 4], block[target_off + 5]]);
         if target_rec_len < 8 {
             return Err(());
         }
@@ -208,11 +197,7 @@ pub mod splice {
     /// Write a fresh "." + ".." pair into the first block of an empty
     /// directory, filling the whole block. Mirrors
     /// `fs/ext2/dir.c::ext2_make_empty`.
-    pub fn make_empty_dir(
-        block: &mut [u8],
-        self_ino: u32,
-        parent_ino: u32,
-    ) {
+    pub fn make_empty_dir(block: &mut [u8], self_ino: u32, parent_ino: u32) {
         for b in block.iter_mut() {
             *b = 0;
         }

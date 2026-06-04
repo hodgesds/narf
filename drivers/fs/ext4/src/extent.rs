@@ -16,8 +16,8 @@
 extern crate alloc;
 
 pub use narf_drivers_fs_ext2::extent::{
-    ExtentHeader, ExtentLeaf, ExtentIndex, LookupOutcome, EXT4_EXTENT_MAGIC,
-    lookup_in_node, iter_leaf_extents,
+    iter_leaf_extents, lookup_in_node, ExtentHeader, ExtentIndex, ExtentLeaf, LookupOutcome,
+    EXT4_EXTENT_MAGIC,
 };
 
 use alloc::vec::Vec;
@@ -40,7 +40,10 @@ pub enum InsertOutcome {
     /// existing entries plus the requested insert. Caller updates
     /// the parent (the root) to become a single-entry index node
     /// pointing at the child's physical block.
-    Split { child_leaf_bytes: Vec<u8>, new_root_index_bytes: Vec<u8> },
+    Split {
+        child_leaf_bytes: Vec<u8>,
+        new_root_index_bytes: Vec<u8>,
+    },
     /// The proposed extent overlaps an existing one. Refuse rather
     /// than silently overwrite.
     Overlap,
@@ -201,7 +204,10 @@ pub fn insert_into_leaf(
         // Insert in-place, maintaining logical-block ascending order.
         let mut new_set = existing.clone();
         // Find sorted position.
-        let pos = new_set.iter().position(|e| e.logical > new_extent.logical).unwrap_or(new_set.len());
+        let pos = new_set
+            .iter()
+            .position(|e| e.logical > new_extent.logical)
+            .unwrap_or(new_set.len());
         new_set.insert(pos, new_extent);
         let mut out = node_bytes.to_vec();
         write_header(
@@ -232,7 +238,10 @@ pub fn insert_into_leaf(
     // upward to the parent. The single-level case is what we
     // implement here.
     let mut combined = existing.clone();
-    let pos = combined.iter().position(|e| e.logical > new_extent.logical).unwrap_or(combined.len());
+    let pos = combined
+        .iter()
+        .position(|e| e.logical > new_extent.logical)
+        .unwrap_or(combined.len());
     combined.insert(pos, new_extent);
 
     // Child node lives in a freshly-allocated full FS block (the
@@ -318,7 +327,10 @@ pub fn find_physical_for_logical(
     // Depth-limit so a corrupt tree can't put us in an infinite descend.
     for _ in 0..6 {
         match lookup_in_node(&buf, logical_block) {
-            LookupOutcome::Mapped { physical, is_uninitialized } => {
+            LookupOutcome::Mapped {
+                physical,
+                is_uninitialized,
+            } => {
                 if is_uninitialized {
                     // Uninitialized extent — Linux returns zero data.
                     // Caller treats `0` as "read zeros for this block".

@@ -20,9 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{clear_entry, find_entry, DirEntry as MxDirEntry};
@@ -94,7 +92,10 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
         }
         let bytes = self.volume.read_dir_bytes(&inode).await?;
         let entries = super::dir::DirEntry::decode_all(self.volume.sb.name_len, &bytes);
-        Ok(entries.into_iter().map(|e| (e.name, e.ino as u32)).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| (e.name, e.ino as u32))
+            .collect())
     }
 
     /// Append (or fill the first empty slot of) a directory entry
@@ -235,11 +236,10 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             for (n, ino) in entries {
                 if n == name {
                     let child = self.volume.read_inode(ino).await?;
-                    return Ok(Arc::new(MinixNode::new_with_inode(
-                        self.volume.clone(),
-                        ino,
-                        child,
-                    )) as Arc<dyn FileOps>);
+                    return Ok(
+                        Arc::new(MinixNode::new_with_inode(self.volume.clone(), ino, child))
+                            as Arc<dyn FileOps>,
+                    );
                 }
             }
             Err(FsError::NotFound)
@@ -259,11 +259,10 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
                     if !(child.mode & mode::IFMT == mode::IFDIR) {
                         return Err(FsError::InvalidPath);
                     }
-                    return Ok(Arc::new(MinixNode::new_with_inode(
-                        self.volume.clone(),
-                        ino,
-                        child,
-                    )) as Arc<dyn DirOps>);
+                    return Ok(
+                        Arc::new(MinixNode::new_with_inode(self.volume.clone(), ino, child))
+                            as Arc<dyn DirOps>,
+                    );
                 }
             }
             Err(FsError::NotFound)
@@ -401,8 +400,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             }
             let mut dir_inode = self.ensure_inode().await?;
             let mut bytes = self.volume.read_dir_bytes(&dir_inode).await?;
-            let off = find_entry(self.volume.sb.name_len, &bytes, name)
-                .ok_or(FsError::NotFound)?;
+            let off = find_entry(self.volume.sb.name_len, &bytes, name).ok_or(FsError::NotFound)?;
             let entry = MxDirEntry::decode(self.volume.sb.name_len, &bytes, off)
                 .ok_or(FsError::NotFound)?;
             let mut victim = self.volume.read_inode(entry.ino as u32).await?;
@@ -420,9 +418,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             // doesn't either; future inserts reuse the hole.
             clear_entry(self.volume.sb.name_len, &mut bytes, off);
             // Rewrite the directory body up to its original size.
-            self.volume
-                .write_file(&mut dir_inode, 0, &bytes)
-                .await?;
+            self.volume.write_file(&mut dir_inode, 0, &bytes).await?;
             self.volume.write_inode(self.ino, &dir_inode).await?;
             *self.inode.lock() = Some(dir_inode);
             Ok(())
@@ -436,8 +432,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             }
             let mut dir_inode = self.ensure_inode().await?;
             let mut bytes = self.volume.read_dir_bytes(&dir_inode).await?;
-            let off = find_entry(self.volume.sb.name_len, &bytes, name)
-                .ok_or(FsError::NotFound)?;
+            let off = find_entry(self.volume.sb.name_len, &bytes, name).ok_or(FsError::NotFound)?;
             let entry = MxDirEntry::decode(self.volume.sb.name_len, &bytes, off)
                 .ok_or(FsError::NotFound)?;
             let mut victim = self.volume.read_inode(entry.ino as u32).await?;
@@ -446,10 +441,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             }
             // Refuse non-empty (more than just "." and "..").
             let child_bytes = self.volume.read_dir_bytes(&victim).await?;
-            let entries = super::dir::DirEntry::decode_all(
-                self.volume.sb.name_len,
-                &child_bytes,
-            );
+            let entries = super::dir::DirEntry::decode_all(self.volume.sb.name_len, &child_bytes);
             let user_count = entries
                 .iter()
                 .filter(|e| e.name != "." && e.name != "..")
@@ -468,11 +460,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
         })
     }
 
-    fn symlink<'a>(
-        &'a self,
-        name: &'a str,
-        target: &'a str,
-    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             if name.is_empty() || name.contains('/') || name == "." || name == ".." {
                 return Err(FsError::InvalidPath);
@@ -517,8 +505,8 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             }
             let mut dir_inode = self.ensure_inode().await?;
             let mut bytes = self.volume.read_dir_bytes(&dir_inode).await?;
-            let old_off = find_entry(self.volume.sb.name_len, &bytes, old_name)
-                .ok_or(FsError::NotFound)?;
+            let old_off =
+                find_entry(self.volume.sb.name_len, &bytes, old_name).ok_or(FsError::NotFound)?;
             let old_entry = MxDirEntry::decode(self.volume.sb.name_len, &bytes, old_off)
                 .ok_or(FsError::NotFound)?;
             // Refuse if new_name already exists. Linux replaces, but

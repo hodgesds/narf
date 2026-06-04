@@ -15,7 +15,7 @@
 //!   `..._64BIT`, `..._FLEX_BG`.
 
 pub use narf_drivers_fs_ext2::superblock::{
-    Superblock, ExtFlavour, FeatureError, compat, incompat, ro_compat,
+    compat, incompat, ro_compat, ExtFlavour, FeatureError, Superblock,
     EXT2_VALID_FS as EXT4_VALID_FS,
 };
 

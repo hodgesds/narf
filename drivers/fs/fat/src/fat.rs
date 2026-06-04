@@ -51,11 +51,14 @@ pub fn parse_entry(version: FatVersion, offset: usize, buffer: &[u8]) -> FatEntr
                 (b1 >> 4) | (b2 << 4)
             }
         }
-        FatVersion::Fat16 => {
-            u16::from_le_bytes([buffer[offset], buffer[offset + 1]]) as u32
-        }
+        FatVersion::Fat16 => u16::from_le_bytes([buffer[offset], buffer[offset + 1]]) as u32,
         FatVersion::Fat32 => {
-            u32::from_le_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]]) & 0x0FFFFFFF
+            u32::from_le_bytes([
+                buffer[offset],
+                buffer[offset + 1],
+                buffer[offset + 2],
+                buffer[offset + 3],
+            ]) & 0x0FFFFFFF
         }
     };
 
@@ -91,10 +94,15 @@ pub fn write_entry(version: FatVersion, offset: usize, buffer: &mut [u8], value:
             buffer[offset + 1] = bytes[1];
         }
         FatVersion::Fat32 => {
-            let existing = u32::from_le_bytes([buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3]]);
+            let existing = u32::from_le_bytes([
+                buffer[offset],
+                buffer[offset + 1],
+                buffer[offset + 2],
+                buffer[offset + 3],
+            ]);
             let new_val = (existing & 0xF0000000) | (value & 0x0FFFFFFF);
             let bytes = new_val.to_le_bytes();
-            buffer[offset..offset+4].copy_from_slice(&bytes);
+            buffer[offset..offset + 4].copy_from_slice(&bytes);
         }
     }
 }

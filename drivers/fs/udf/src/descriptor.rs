@@ -47,8 +47,7 @@ pub struct DescriptorTag {
     pub tag_location: u32,
 }
 
-const _ASSERT_DESCRIPTOR_TAG_SIZE: () =
-    assert!(core::mem::size_of::<DescriptorTag>() == 16);
+const _ASSERT_DESCRIPTOR_TAG_SIZE: () = assert!(core::mem::size_of::<DescriptorTag>() == 16);
 
 impl fmt::Debug for DescriptorTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -241,9 +240,7 @@ pub fn read_anchor(buf: &[u8]) -> AnchorVolumeDescriptorPointer {
     debug_assert!(buf.len() >= core::mem::size_of::<AnchorVolumeDescriptorPointer>());
     // SAFETY: `AnchorVolumeDescriptorPointer` is `#[repr(C, packed)]`
     // with the 512-byte layout matching ECMA-167 §3/10.2.
-    unsafe {
-        core::ptr::read_unaligned(buf.as_ptr() as *const AnchorVolumeDescriptorPointer)
-    }
+    unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const AnchorVolumeDescriptorPointer) }
 }
 
 // ── Partition Descriptor ────────────────────────────────────────────
@@ -303,9 +300,7 @@ pub fn read_partition(buf: &[u8], offset: usize) -> PartitionDescriptor {
     debug_assert!(offset + core::mem::size_of::<PartitionDescriptor>() <= buf.len());
     // SAFETY: `PartitionDescriptor` is `#[repr(C, packed)]`,
     // 512 bytes, matching ECMA-167 §3/10.5.
-    unsafe {
-        core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const PartitionDescriptor)
-    }
+    unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const PartitionDescriptor) }
 }
 
 // ── Logical Volume Descriptor ───────────────────────────────────────
@@ -365,15 +360,11 @@ impl fmt::Debug for LogicalVolumeDescriptorHeader {
 /// Decode the LVD fixed prefix from a sector buffer at `offset`.
 #[inline]
 pub fn read_lvd_header(buf: &[u8], offset: usize) -> LogicalVolumeDescriptorHeader {
-    debug_assert!(
-        offset + core::mem::size_of::<LogicalVolumeDescriptorHeader>() <= buf.len()
-    );
+    debug_assert!(offset + core::mem::size_of::<LogicalVolumeDescriptorHeader>() <= buf.len());
     // SAFETY: the type is `#[repr(C, packed)]` with the 440-byte
     // layout from ECMA-167 §3/10.6.
     unsafe {
-        core::ptr::read_unaligned(
-            buf.as_ptr().add(offset) as *const LogicalVolumeDescriptorHeader,
-        )
+        core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const LogicalVolumeDescriptorHeader)
     }
 }
 
@@ -426,8 +417,7 @@ pub struct FileSetDescriptor {
     pub _reserved: [u8; 32],
 }
 
-const _ASSERT_FSD_SIZE: () =
-    assert!(core::mem::size_of::<FileSetDescriptor>() == 512);
+const _ASSERT_FSD_SIZE: () = assert!(core::mem::size_of::<FileSetDescriptor>() == 512);
 
 impl fmt::Debug for FileSetDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -443,7 +433,5 @@ pub fn read_file_set(buf: &[u8], offset: usize) -> FileSetDescriptor {
     debug_assert!(offset + core::mem::size_of::<FileSetDescriptor>() <= buf.len());
     // SAFETY: `FileSetDescriptor` is `#[repr(C, packed)]` with the
     // 512-byte ECMA-167 §4/14.1 layout.
-    unsafe {
-        core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FileSetDescriptor)
-    }
+    unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FileSetDescriptor) }
 }

@@ -142,9 +142,7 @@ impl JournalSuperblock {
         if buf.len() < 36 {
             return None;
         }
-        let g32 = |o: usize| {
-            u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
-        };
+        let g32 = |o: usize| u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
         let block_size = g32(12);
         let maxlen = g32(16);
         let first = g32(20);
@@ -319,7 +317,8 @@ impl RevokeBlock {
         let mut revoked = Vec::with_capacity(payload.len() / 4);
         let mut i = 0;
         while i + 4 <= payload.len() {
-            let b = u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
+            let b =
+                u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
             revoked.push(b as u64);
             i += 4;
         }
@@ -440,19 +439,27 @@ where
                 // Each tag consumes the next log block as its data.
                 let mut pending: Vec<(u64, Vec<u8>, bool)> = Vec::new();
                 for tag in &desc.tags {
-                    cursor = if cursor + 1 >= maxlen { first } else { cursor + 1 };
+                    cursor = if cursor + 1 >= maxlen {
+                        first
+                    } else {
+                        cursor + 1
+                    };
                     if steps_remaining == 0 {
                         return Err(JournalError::UnterminatedTransaction);
                     }
                     steps_remaining -= 1;
-                    let data = journal_block(cursor)
-                        .ok_or(JournalError::UnterminatedTransaction)?;
+                    let data =
+                        journal_block(cursor).ok_or(JournalError::UnterminatedTransaction)?;
                     pending.push((tag.target_block, data, tag.is_escaped()));
                 }
                 // Advance past the last data block; the next block
                 // in the log should be a commit / revoke / next
                 // descriptor for the same sequence.
-                cursor = if cursor + 1 >= maxlen { first } else { cursor + 1 };
+                cursor = if cursor + 1 >= maxlen {
+                    first
+                } else {
+                    cursor + 1
+                };
 
                 // Buffer transactionally — only commit installs.
                 // Walk forward from here looking for commit, applying
@@ -483,8 +490,7 @@ where
                             break;
                         }
                         block_type::REVOKE => {
-                            let rev = RevokeBlock::parse(&nxt)
-                                .ok_or(JournalError::CorruptBlock)?;
+                            let rev = RevokeBlock::parse(&nxt).ok_or(JournalError::CorruptBlock)?;
                             for b in &rev.revoked {
                                 let entry = revoke_at.entry(*b).or_insert(0);
                                 if expected_seq > *entry {
@@ -496,8 +502,8 @@ where
                         block_type::DESCRIPTOR => {
                             // A second descriptor inside the same
                             // sequence — buffer its tags too.
-                            let dd = DescriptorBlock::parse(&nxt)
-                                .ok_or(JournalError::CorruptBlock)?;
+                            let dd =
+                                DescriptorBlock::parse(&nxt).ok_or(JournalError::CorruptBlock)?;
                             for tag in &dd.tags {
                                 walk = if walk + 1 >= maxlen { first } else { walk + 1 };
                                 let data = journal_block(walk)
@@ -545,7 +551,11 @@ where
             block_type::COMMIT => {
                 // Standalone commit (e.g. an empty transaction) —
                 // skip + advance.
-                cursor = if cursor + 1 >= maxlen { first } else { cursor + 1 };
+                cursor = if cursor + 1 >= maxlen {
+                    first
+                } else {
+                    cursor + 1
+                };
                 expected_seq = expected_seq.wrapping_add(1);
             }
             block_type::REVOKE => {
@@ -556,7 +566,11 @@ where
                         *entry = expected_seq;
                     }
                 }
-                cursor = if cursor + 1 >= maxlen { first } else { cursor + 1 };
+                cursor = if cursor + 1 >= maxlen {
+                    first
+                } else {
+                    cursor + 1
+                };
             }
             _ => break,
         }
@@ -570,10 +584,7 @@ where
 ///
 /// Used by the smokes in `tests.rs`; also handy for any caller that
 /// has already read the entire journal into a contiguous buffer.
-pub fn replay_journal_flat(
-    image: &[u8],
-    block_size: usize,
-) -> Result<ReplayReport, JournalError> {
+pub fn replay_journal_flat(image: &[u8], block_size: usize) -> Result<ReplayReport, JournalError> {
     let count = (image.len() / block_size) as u32;
     replay_journal(count, |i| {
         let off = (i as usize).checked_mul(block_size)?;

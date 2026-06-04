@@ -51,7 +51,7 @@ fn smoke_iso9660_directory_record_decode() -> TestResult {
     let off = 0;
     sector[off] = 33; // §9.1.1 length
     sector[off + 1] = 0; // §9.1.2 ext-attr len
-    // §9.1.3 — extent_location (both-endian); LE 0x0000_0014, BE
+                         // §9.1.3 — extent_location (both-endian); LE 0x0000_0014, BE
     sector[off + 2..off + 6].copy_from_slice(&20u32.to_le_bytes());
     sector[off + 6..off + 10].copy_from_slice(&20u32.to_be_bytes());
     // §9.1.4 — data_length (both-endian); LE 0x0000_002A, BE
@@ -172,9 +172,9 @@ fn write_dir_record(
     dst[off + 1] = 0; // §9.1.2
     write_u32_be_le(dst, off + 2, extent_lba); // §9.1.3
     write_u32_be_le(dst, off + 10, data_length); // §9.1.4
-    // §9.1.5 — recording_date_time (7 bytes left zero).
+                                                 // §9.1.5 — recording_date_time (7 bytes left zero).
     dst[off + 25] = file_flags; // §9.1.6
-    // §9.1.7/8 — left zero.
+                                // §9.1.7/8 — left zero.
     write_u16_be_le(dst, off + 28, 1); // §9.1.9 — vol seq
     dst[off + 32] = identifier.len() as u8; // §9.1.10
     dst[off + 33..off + 33 + identifier.len()].copy_from_slice(identifier);
@@ -237,9 +237,9 @@ fn build_iso9660_image() -> (Vec<u8>, &'static [u8]) {
     img[pvd_off] = vd_type::PRIMARY; // §8.1.1
     img[pvd_off + 1..pvd_off + 6].copy_from_slice(b"CD001"); // §8.1.2
     img[pvd_off + 6] = 1; // §8.1.3 version
-    // §8.4.4 unused (zero).
-    // §8.4.5/6 — system + volume identifier left as zeros.
-    // §8.4.8 — volume_space_size (both-endian).
+                          // §8.4.4 unused (zero).
+                          // §8.4.5/6 — system + volume identifier left as zeros.
+                          // §8.4.8 — volume_space_size (both-endian).
     write_u32_be_le(&mut img, pvd_off + 80, TOTAL_SECTORS as u32);
     // §8.4.10 — volume_set_size = 1.
     write_u16_be_le(&mut img, pvd_off + 120, 1);
@@ -299,10 +299,7 @@ fn smoke_iso9660_mount_ramblock_round_trip() -> TestResult {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("enumerate_async failed"),
     };
-    if entries.len() != 1
-        || entries[0].0 != "TEST.TXT"
-        || entries[0].1 != FileType::File
-    {
+    if entries.len() != 1 || entries[0].0 != "TEST.TXT" || entries[0].1 != FileType::File {
         return TestResult::Fail("root entry mismatch (expected exactly TEST.TXT)");
     }
 
@@ -315,7 +312,10 @@ fn smoke_iso9660_mount_ramblock_round_trip() -> TestResult {
     }
 
     // Lookups must be case-insensitive (ECMA-119 §7.4.1).
-    if poll_once(root.lookup_async("test.txt")).and_then(|r| r.ok()).is_none() {
+    if poll_once(root.lookup_async("test.txt"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
         return TestResult::Fail("case-insensitive lookup failed");
     }
 

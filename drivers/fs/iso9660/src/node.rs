@@ -23,9 +23,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_block::{BlockDevice, BlockError};
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{read_directory_record, DirectoryRecord};
@@ -145,10 +143,10 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
             let entries = scan_directory(&self.volume, &self.state).await?;
             for (found_name, record) in entries {
                 if names_match(&found_name, name) {
-                    return Ok(Arc::new(Iso9660Node::from_record(
-                        self.volume.clone(),
-                        &record,
-                    )) as Arc<dyn FileOps>);
+                    return Ok(
+                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record))
+                            as Arc<dyn FileOps>,
+                    );
                 }
             }
             Err(FsError::NotFound)
@@ -164,10 +162,10 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
             let entries = scan_directory(&self.volume, &self.state).await?;
             for (found_name, record) in entries {
                 if names_match(&found_name, name) && record.is_directory() {
-                    return Ok(Arc::new(Iso9660Node::from_record(
-                        self.volume.clone(),
-                        &record,
-                    )) as Arc<dyn DirOps>);
+                    return Ok(
+                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record))
+                            as Arc<dyn DirOps>,
+                    );
                 }
             }
             Err(FsError::NotFound)

@@ -107,8 +107,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         // on-disk byte order. The bytes were just read from disk
         // into a heap buffer we own, so the read is a plain memcpy
         // through a properly-aligned u8 source.
-        let bpb: Bpb =
-            unsafe { core::ptr::read_unaligned(bpb_bytes.as_ptr() as *const Bpb) };
+        let bpb: Bpb = unsafe { core::ptr::read_unaligned(bpb_bytes.as_ptr() as *const Bpb) };
 
         let fat32_ext = if bpb.fat_sz_16 == 0 {
             // SAFETY: Fat32ExtBpb sits at offset 36 of the BPB on a
@@ -134,9 +133,8 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
                     .is_ok()
                 {
                     // SAFETY: same packed-layout argument as Bpb.
-                    let info: FsInfo = unsafe {
-                        core::ptr::read_unaligned(info_bytes.as_ptr() as *const FsInfo)
-                    };
+                    let info: FsInfo =
+                        unsafe { core::ptr::read_unaligned(info_bytes.as_ptr() as *const FsInfo) };
                     if info.is_valid() {
                         fsinfo = Some(info);
                     }
@@ -186,8 +184,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             FatVersion::Fat16 => cluster * 2,
             FatVersion::Fat32 => cluster * 4,
         };
-        let sec_num =
-            self.bpb.rsvd_sec_cnt as u32 + (fat_offset / self.bpb.bytes_per_sec as u32);
+        let sec_num = self.bpb.rsvd_sec_cnt as u32 + (fat_offset / self.bpb.bytes_per_sec as u32);
         let ent_offset = (fat_offset % self.bpb.bytes_per_sec as u32) as usize;
         (sec_num, ent_offset)
     }

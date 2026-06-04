@@ -40,12 +40,20 @@ fn smoke_fat_bpb_detect_version_floppy_is_fat12() -> TestResult {
     // Standard 1.44MB floppy: 2880 sectors, 1 sector/cluster — well
     // under the FAT12 cluster threshold from FATGEN §3 p.14.
     let bpb = Bpb {
-        jmp_boot: [0; 3], oem_name: [0; 8],
-        bytes_per_sec: 512, sec_per_clus: 1,
-        rsvd_sec_cnt: 1, num_fats: 2, root_ent_cnt: 224,
-        tot_sec_16: 2880, media: 0xF0, fat_sz_16: 9,
-        sec_per_trk: 18, num_heads: 2,
-        hidd_sec: 0, tot_sec_32: 0,
+        jmp_boot: [0; 3],
+        oem_name: [0; 8],
+        bytes_per_sec: 512,
+        sec_per_clus: 1,
+        rsvd_sec_cnt: 1,
+        num_fats: 2,
+        root_ent_cnt: 224,
+        tot_sec_16: 2880,
+        media: 0xF0,
+        fat_sz_16: 9,
+        sec_per_trk: 18,
+        num_heads: 2,
+        hidd_sec: 0,
+        tot_sec_32: 0,
     };
     if bpb.detect_version(None) != FatVersion::Fat12 {
         return TestResult::Fail("floppy must be detected as FAT12");
@@ -57,12 +65,20 @@ fn smoke_fat_bpb_detect_version_large_is_fat16() -> TestResult {
     // 65535 sectors × 2-sector clusters → ~32k clusters, which falls
     // squarely inside the FAT16 range [4085, 65525) per FATGEN p.14.
     let bpb = Bpb {
-        jmp_boot: [0; 3], oem_name: [0; 8],
-        bytes_per_sec: 512, sec_per_clus: 2,
-        rsvd_sec_cnt: 1, num_fats: 2, root_ent_cnt: 512,
-        tot_sec_16: 0, media: 0xF8, fat_sz_16: 200,
-        sec_per_trk: 0, num_heads: 0,
-        hidd_sec: 0, tot_sec_32: 65_535,
+        jmp_boot: [0; 3],
+        oem_name: [0; 8],
+        bytes_per_sec: 512,
+        sec_per_clus: 2,
+        rsvd_sec_cnt: 1,
+        num_fats: 2,
+        root_ent_cnt: 512,
+        tot_sec_16: 0,
+        media: 0xF8,
+        fat_sz_16: 200,
+        sec_per_trk: 0,
+        num_heads: 0,
+        hidd_sec: 0,
+        tot_sec_32: 65_535,
     };
     if bpb.detect_version(None) != FatVersion::Fat16 {
         return TestResult::Fail("32k-cluster volume must be FAT16");
@@ -122,7 +138,10 @@ fn smoke_fat_entry_codec_round_trip_fat32() -> TestResult {
     // EOC sentinels recognised.
     let mut eoc = [0u8; 8];
     write_entry(FatVersion::Fat32, 0, &mut eoc, 0x0FFF_FFFF);
-    if !matches!(parse_entry(FatVersion::Fat32, 0, &eoc), FatEntry::EndOfChain) {
+    if !matches!(
+        parse_entry(FatVersion::Fat32, 0, &eoc),
+        FatEntry::EndOfChain
+    ) {
         return TestResult::Fail("0x0FFFFFFF must decode as EndOfChain");
     }
 
@@ -141,18 +160,33 @@ fn smoke_fat_entry_codec_fat12_packed() -> TestResult {
     write_entry(FatVersion::Fat12, 0, &mut buf, 0x0ABC);
     write_entry(FatVersion::Fat12, 1, &mut buf, 0x0123);
 
-    if !matches!(parse_entry(FatVersion::Fat12, 0, &buf), FatEntry::Next(0x0ABC)) {
+    if !matches!(
+        parse_entry(FatVersion::Fat12, 0, &buf),
+        FatEntry::Next(0x0ABC)
+    ) {
         return TestResult::Fail("FAT12 even-offset round-trip failed");
     }
-    if !matches!(parse_entry(FatVersion::Fat12, 1, &buf), FatEntry::Next(0x0123)) {
+    if !matches!(
+        parse_entry(FatVersion::Fat12, 1, &buf),
+        FatEntry::Next(0x0123)
+    ) {
         return TestResult::Fail("FAT12 odd-offset round-trip failed");
     }
     TestResult::Pass
 }
 
-kernel_test_in!("drivers/fs/fat", smoke_fat_lfn_checksum_matches_msft_example);
-kernel_test_in!("drivers/fs/fat", smoke_fat_bpb_detect_version_floppy_is_fat12);
-kernel_test_in!("drivers/fs/fat", smoke_fat_bpb_detect_version_large_is_fat16);
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_lfn_checksum_matches_msft_example
+);
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_bpb_detect_version_floppy_is_fat12
+);
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_bpb_detect_version_large_is_fat16
+);
 kernel_test_in!("drivers/fs/fat", smoke_fat_sfn_reassemble_round_trip);
 kernel_test_in!("drivers/fs/fat", smoke_fat_entry_codec_round_trip_fat32);
 kernel_test_in!("drivers/fs/fat", smoke_fat_entry_codec_fat12_packed);
@@ -271,10 +305,7 @@ fn smoke_fat_mount_ramblock_round_trip() -> TestResult {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("enumerate_async failed"),
     };
-    if entries.len() != 1
-        || entries[0].0 != "NARF.TXT"
-        || entries[0].1 != FileType::File
-    {
+    if entries.len() != 1 || entries[0].0 != "NARF.TXT" || entries[0].1 != FileType::File {
         return TestResult::Fail("root entry name/type mismatch");
     }
     let file = match poll_once(root.lookup_async("NARF.TXT")) {
@@ -302,11 +333,9 @@ fn smoke_fat_mount_root_via_vfs_resolve() -> TestResult {
     // `narf_filesystem::resolve`. Mirrors what the boot path will do
     // once a real disk + bootloader handoff lands a block device
     // under the root mount.
-    
+
     use narf_block::ram::RamBlockDevice;
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, resolve_async,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, resolve_async};
     use narf_lib::id::DomainId;
 
     use crate::mount_fat;
@@ -430,4 +459,7 @@ fn smoke_fat_create_write_read_unlink_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/fat", smoke_fat_create_write_read_unlink_round_trip);
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_create_write_read_unlink_round_trip
+);

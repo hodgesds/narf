@@ -112,8 +112,7 @@ impl ExtentLeaf {
 
     /// True iff `logical_block` falls within this extent.
     pub fn covers(&self, logical_block: u32) -> bool {
-        logical_block >= self.logical
-            && logical_block < self.logical + self.len as u32
+        logical_block >= self.logical && logical_block < self.logical + self.len as u32
     }
 
     /// Physical block backing the given logical block, or None if
@@ -157,7 +156,10 @@ pub enum LookupOutcome {
     /// `is_uninitialized` is propagated so the caller can return
     /// zeros for sparse-file extent regions instead of reading
     /// stale on-disk data.
-    Mapped { physical: u64, is_uninitialized: bool },
+    Mapped {
+        physical: u64,
+        is_uninitialized: bool,
+    },
     /// Logical block is past the file's last extent (sparse hole or
     /// past EOF). Caller returns zeros for reads.
     Hole,

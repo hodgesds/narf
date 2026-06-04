@@ -232,13 +232,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // mount (we just fall back to the on-disk state — same
             // as ext2 was before journal support). The override
             // map only narrows reads, never invents data.
-            if let Ok(map) = Self::replay_journal_at_mount(
-                &*device,
-                &io,
-                &superblock,
-                &group_descs,
-            )
-            .await
+            if let Ok(map) =
+                Self::replay_journal_at_mount(&*device, &io, &superblock, &group_descs).await
             {
                 journal_overrides = map;
             }
@@ -297,8 +292,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
         let mut inode_buf = vec![0u8; 128];
         read_byte_range_into_static::<B>(device, io, inode_byte_off, &mut inode_buf).await?;
-        let inode = Inode::parse(&inode_buf)
-            .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+        let inode = Inode::parse(&inode_buf).ok_or(FsError::Io(narf_block::BlockError::IOError))?;
 
         // Size of the journal in bytes → number of journal blocks.
         let journal_bytes = inode.size as u64;
@@ -313,10 +307,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // to a demand-fetch closure later if needed.
         let mut journal_image: Vec<Vec<u8>> = Vec::with_capacity(n_blocks as usize);
         for i in 0..n_blocks {
-            let phys = Self::map_block_static(
-                device, io, sb, group_descs, &inode, i as u64,
-            )
-            .await?;
+            let phys =
+                Self::map_block_static(device, io, sb, group_descs, &inode, i as u64).await?;
             if phys == 0 {
                 // Sparse hole in the journal — treat as a block of
                 // zeros. The replay walker will hit a bad-magic
@@ -329,10 +321,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             journal_image.push(buf);
         }
 
-        let report = journal::replay_journal(n_blocks, |i| {
-            journal_image.get(i as usize).cloned()
-        })
-        .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
+        let report = journal::replay_journal(n_blocks, |i| journal_image.get(i as usize).cloned())
+            .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
         Ok(report.blocks_to_write)
     }
 
@@ -488,26 +478,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// for inode-table reads (which are sub-block byte ranges)
     /// without paying the override-check cost in the device-LBA
     /// loop.
-    pub async fn read_byte_range(
-        &self,
-        byte_off: u64,
-        dst: &mut [u8],
-    ) -> Result<(), FsError> {
+    pub async fn read_byte_range(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), FsError> {
         // Fast path — no overrides installed.
         if self.journal_overrides.is_empty() {
             let (cap, lbs) = {
                 let g = self.io.lock();
                 (g.cap, g.lbs)
             };
-            return Self::read_byte_range_with(
-                &*self.device,
-                cap,
-                lbs,
-                &self.io,
-                byte_off,
-                dst,
-            )
-            .await;
+            return Self::read_byte_range_with(&*self.device, cap, lbs, &self.io, byte_off, dst)
+                .await;
         }
         // Walk one FS-block at a time, consulting the override map.
         let bs = self.block_size() as u64;
@@ -519,8 +498,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let want = core::cmp::min(dst.len() - cursor, bs as usize - in_block);
             if let Some(ov) = self.journal_overrides.get(&fs_block) {
                 if ov.len() == bs as usize {
-                    dst[cursor..cursor + want]
-                        .copy_from_slice(&ov[in_block..in_block + want]);
+                    dst[cursor..cursor + want].copy_from_slice(&ov[in_block..in_block + want]);
                     cursor += want;
                     continue;
                 }
@@ -547,11 +525,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// `byte_off`. Inverse of `read_byte_range`. Note: this is a
     /// byte-granularity write — for sub-LBA spans we read-modify-
     /// write the enclosing sector.
-    pub async fn write_byte_range(
-        &self,
-        byte_off: u64,
-        src: &[u8],
-    ) -> Result<(), FsError> {
+    pub async fn write_byte_range(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
         let (cap, lbs) = {
             let g = self.io.lock();
             (g.cap, g.lbs)
@@ -733,11 +707,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Write inode `inode_no` back to the inode table. Preserves
     /// the rev-1+ extra-fields tail by read-modify-writing the full
     /// `inode_size_bytes()` slot.
-    pub async fn write_inode(
-        &self,
-        inode_no: u32,
-        inode: &Inode,
-    ) -> Result<(), FsError> {
+    pub async fn write_inode(&self, inode_no: u32, inode: &Inode) -> Result<(), FsError> {
         let (group, index) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;
@@ -784,11 +754,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     }
 
     /// Clear bit `bit_index` in bitmap block `bm_block`.
-    async fn free_in_bitmap_block(
-        &self,
-        bm_block: u64,
-        bit_index: u32,
-    ) -> Result<(), FsError> {
+    async fn free_in_bitmap_block(&self, bm_block: u64, bit_index: u32) -> Result<(), FsError> {
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(bm_block, &mut buf).await?;
@@ -890,11 +856,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ///
     /// Only the legacy (non-extents) path is supported on the write
     /// side — ext4 extents trees stay read-only for now.
-    pub async fn map_block_alloc(
-        &self,
-        inode: &mut Inode,
-        logical: u64,
-    ) -> Result<u64, FsError> {
+    pub async fn map_block_alloc(&self, inode: &mut Inode, logical: u64) -> Result<u64, FsError> {
         if self.superblock.uses_extents() {
             // Refuse extents-tree writes — implementing a write-side
             // walker is multi-thousand lines on top of this.
@@ -966,11 +928,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Read pointer `idx` from indirect block `ind_block`. If zero,
     /// allocate a fresh data block, write the pointer back, and
     /// return the new block number.
-    async fn alloc_indirect_slot(
-        &self,
-        ind_block: u64,
-        idx: u64,
-    ) -> Result<u64, FsError> {
+    async fn alloc_indirect_slot(&self, ind_block: u64, idx: u64) -> Result<u64, FsError> {
         let bs = self.block_size();
         let p = self.pointers_per_block() as u64;
         if idx >= p {
@@ -1076,12 +1034,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     }
 
     /// Free every pointer in a single-indirect block.
-    async fn free_indirect_one(
-        &self,
-        ind_block: u64,
-        p: u64,
-        bs: usize,
-    ) -> Result<(), FsError> {
+    async fn free_indirect_one(&self, ind_block: u64, p: u64, bs: usize) -> Result<(), FsError> {
         let mut buf = vec![0u8; bs];
         self.read_block(ind_block, &mut buf).await?;
         for i in 0..p {
@@ -1201,11 +1154,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// inode's 60-byte i_block region as the extent root and walks
     /// the tree, fetching index-child blocks via `read_block` as
     /// the walker descends.
-    async fn map_block_extents(
-        &self,
-        inode: &Inode,
-        logical: u64,
-    ) -> Result<u64, FsError> {
+    async fn map_block_extents(&self, inode: &Inode, logical: u64) -> Result<u64, FsError> {
         use super::extent::{lookup_in_node, LookupOutcome};
         // Serialise inode.block[15] as 60 bytes (15 × u32 LE).
         let mut node_buf = alloc::vec![0u8; 60];

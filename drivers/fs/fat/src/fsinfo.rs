@@ -6,13 +6,13 @@
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct FsInfo {
-    pub lead_sig: u32,       // 0x41615252
+    pub lead_sig: u32, // 0x41615252
     pub reserved1: [u8; 480],
-    pub struc_sig: u32,      // 0x61417272
-    pub free_count: u32,     // Hint for free cluster count (0xFFFFFFFF if unknown)
-    pub nxt_free: u32,       // Hint for next free cluster
+    pub struc_sig: u32,  // 0x61417272
+    pub free_count: u32, // Hint for free cluster count (0xFFFFFFFF if unknown)
+    pub nxt_free: u32,   // Hint for next free cluster
     pub reserved2: [u8; 12],
-    pub trail_sig: u32,      // 0xAA550000
+    pub trail_sig: u32, // 0xAA550000
 }
 
 impl FsInfo {
@@ -21,8 +21,8 @@ impl FsInfo {
     pub const TRAIL_SIG: u32 = 0xAA550000;
 
     pub fn is_valid(&self) -> bool {
-        self.lead_sig == Self::LEAD_SIG && 
-        self.struc_sig == Self::STRUC_SIG && 
-        self.trail_sig == Self::TRAIL_SIG
+        self.lead_sig == Self::LEAD_SIG
+            && self.struc_sig == Self::STRUC_SIG
+            && self.trail_sig == Self::TRAIL_SIG
     }
 }

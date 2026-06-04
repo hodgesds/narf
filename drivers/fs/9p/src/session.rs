@@ -16,8 +16,7 @@ use super::message::{DecodeError, MsgType, WireWrite, HEADER_SIZE};
 
 /// Per-RPC future returned by a `Transport`. Resolves to the raw
 /// reply frame (a length-prefixed `[size, type, tag, body...]`).
-pub type RpcFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + 'a>>;
+pub type RpcFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + 'a>>;
 
 /// Transport surface that the protocol layer drives. Real
 /// implementations: virtio-9p (DMA over a virtio queue), TCP-9P
@@ -71,12 +70,7 @@ impl From<DecodeError> for TransportError {
 ///
 /// `cap` bounds the buffer we allocate — the negotiated msize from
 /// version(5). `kind` + `tag` populate the header.
-pub fn frame_message<F>(
-    cap: u32,
-    kind: MsgType,
-    tag: u16,
-    f: F,
-) -> Result<Vec<u8>, TransportError>
+pub fn frame_message<F>(cap: u32, kind: MsgType, tag: u16, f: F) -> Result<Vec<u8>, TransportError>
 where
     F: FnOnce(&mut WireWrite) -> Result<(), DecodeError>,
 {

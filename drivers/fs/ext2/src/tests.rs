@@ -85,7 +85,7 @@ fn smoke_ext2_dirent_walk_two_entries() -> TestResult {
     buf[18] = 8;
     buf[19] = ftype::REGULAR;
     buf[20..28].copy_from_slice(b"hi.world"); // 8 bytes
-    // bytes 28..64 are padding
+                                              // bytes 28..64 are padding
 
     // First entry
     let e0 = match parse_entry(&buf, 0) {
@@ -131,7 +131,7 @@ fn smoke_ext2_inode_group_index_math() -> TestResult {
 
     let pairs: &[(u32, u32, u32)] = &[
         (1, 0, 0),
-        (2, 0, 1),    // root
+        (2, 0, 1), // root
         (32, 0, 31),
         (33, 1, 0),
         (64, 1, 31),
@@ -182,7 +182,7 @@ fn smoke_ext2_inode_parse_block_pointers() -> TestResult {
     buf[0..2].copy_from_slice(&0x41EDu16.to_le_bytes()); // S_IFDIR | 0755
     buf[4..8].copy_from_slice(&1024u32.to_le_bytes()); // size
     buf[28..32].copy_from_slice(&2u32.to_le_bytes()); // i_blocks (sectors)
-    // i_block[0..14]
+                                                      // i_block[0..14]
     let ptrs: [u32; 15] = [
         9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 12 direct
         77, 0, 0, // single, double, triple
@@ -208,7 +208,10 @@ fn smoke_ext2_inode_parse_block_pointers() -> TestResult {
     TestResult::Pass
 }
 
-kernel_test_in!("drivers/fs/ext2", smoke_ext2_superblock_magic_and_block_size);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_superblock_magic_and_block_size
+);
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_dirent_walk_two_entries);
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_inode_group_index_math);
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_group_desc_parse);
@@ -314,7 +317,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     put_u16(&mut img, root_off + 0, 0x4000 | 0o755); // S_IFDIR | 0755
     put_u32(&mut img, root_off + 4, BS as u32); // size = 1 block
     put_u32(&mut img, root_off + 28, (BS / 512) as u32); // i_blocks
-    // i_block[0] = 9 (data block for the root dir)
+                                                         // i_block[0] = 9 (data block for the root dir)
     put_u32(&mut img, root_off + 40, 9);
 
     // File inode (#12) at index 11.
@@ -531,7 +534,10 @@ fn smoke_ext_flavour_classifies_ext2_ext3_ext4() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext_flavour_classifies_ext2_ext3_ext4);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext_flavour_classifies_ext2_ext3_ext4
+);
 
 fn smoke_ext_check_incompat_rejects_unknown_features() -> TestResult {
     use crate::superblock::{incompat, FeatureError, Superblock};
@@ -542,15 +548,16 @@ fn smoke_ext_check_incompat_rejects_unknown_features() -> TestResult {
     buf[96..100].copy_from_slice(&incompat::ENCRYPT.to_le_bytes());
     let sb = Superblock::parse(&buf).expect("parse");
     match sb.check_incompat_features() {
-        Err(FeatureError::UnsupportedIncompat(bits))
-            if bits & incompat::ENCRYPT != 0 =>
-        {
+        Err(FeatureError::UnsupportedIncompat(bits)) if bits & incompat::ENCRYPT != 0 => {
             TestResult::Pass
         }
         _ => TestResult::Fail("ENCRYPT incompat must trigger rejection"),
     }
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext_check_incompat_rejects_unknown_features);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext_check_incompat_rejects_unknown_features
+);
 
 fn smoke_ext_64bit_block_count_combines_lo_and_hi() -> TestResult {
     use crate::superblock::{incompat, Superblock};
@@ -570,7 +577,10 @@ fn smoke_ext_64bit_block_count_combines_lo_and_hi() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext_64bit_block_count_combines_lo_and_hi);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext_64bit_block_count_combines_lo_and_hi
+);
 
 // ── ext4 extent parser ─────────────────────────────────────────────
 
@@ -586,7 +596,7 @@ fn smoke_ext4_extent_header_parse_and_leaf_translate() -> TestResult {
     buf[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries=1
     buf[4..6].copy_from_slice(&4u16.to_le_bytes()); // max=4
     buf[6..8].copy_from_slice(&0u16.to_le_bytes()); // depth=0 leaf
-    // Leaf entry.
+                                                    // Leaf entry.
     buf[12..16].copy_from_slice(&100u32.to_le_bytes()); // logical=100
     buf[16..18].copy_from_slice(&20u16.to_le_bytes()); // len=20
     buf[18..20].copy_from_slice(&0u16.to_le_bytes()); // start_hi=0
@@ -602,7 +612,10 @@ fn smoke_ext4_extent_header_parse_and_leaf_translate() -> TestResult {
     }
     // Lookup-in-node: 110 → Mapped { physical: 5010 }.
     match lookup_in_node(&buf, 110) {
-        LookupOutcome::Mapped { physical: 5_010, is_uninitialized: false } => {}
+        LookupOutcome::Mapped {
+            physical: 5_010,
+            is_uninitialized: false,
+        } => {}
         other => {
             let _ = other;
             return TestResult::Fail("lookup_in_node didn't yield Mapped(5010)");
@@ -620,7 +633,10 @@ fn smoke_ext4_extent_header_parse_and_leaf_translate() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_header_parse_and_leaf_translate);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_header_parse_and_leaf_translate
+);
 
 fn smoke_ext4_extent_uninitialized_marker_propagates() -> TestResult {
     use crate::extent::{lookup_in_node, LookupOutcome, EXT4_EXTENT_MAGIC};
@@ -633,13 +649,17 @@ fn smoke_ext4_extent_uninitialized_marker_propagates() -> TestResult {
     buf[16..18].copy_from_slice(&(0x8000u16 | 10u16).to_le_bytes()); // uninit, len=10
     buf[20..24].copy_from_slice(&7_000u32.to_le_bytes());
     match lookup_in_node(&buf, 5) {
-        LookupOutcome::Mapped { physical: 7_005, is_uninitialized: true } => {
-            TestResult::Pass
-        }
+        LookupOutcome::Mapped {
+            physical: 7_005,
+            is_uninitialized: true,
+        } => TestResult::Pass,
         _ => TestResult::Fail("uninit bit must propagate through Mapped"),
     }
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_uninitialized_marker_propagates);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_uninitialized_marker_propagates
+);
 
 fn smoke_ext4_extent_index_returns_deeper_lookup() -> TestResult {
     use crate::extent::{lookup_in_node, LookupOutcome, EXT4_EXTENT_MAGIC};
@@ -649,7 +669,7 @@ fn smoke_ext4_extent_index_returns_deeper_lookup() -> TestResult {
     buf[2..4].copy_from_slice(&1u16.to_le_bytes());
     buf[4..6].copy_from_slice(&4u16.to_le_bytes());
     buf[6..8].copy_from_slice(&1u16.to_le_bytes()); // depth=1 → index
-    // Index: logical=0, leaf=99.
+                                                    // Index: logical=0, leaf=99.
     buf[12..16].copy_from_slice(&0u32.to_le_bytes());
     buf[16..20].copy_from_slice(&99u32.to_le_bytes());
     match lookup_in_node(&buf, 50) {
@@ -657,7 +677,10 @@ fn smoke_ext4_extent_index_returns_deeper_lookup() -> TestResult {
         _ => TestResult::Fail("index node must yield DeeperLookupRequired"),
     }
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_index_returns_deeper_lookup);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_index_returns_deeper_lookup
+);
 
 fn smoke_ext4_extent_corrupt_header_yields_error() -> TestResult {
     use crate::extent::{lookup_in_node, LookupOutcome};
@@ -667,7 +690,10 @@ fn smoke_ext4_extent_corrupt_header_yields_error() -> TestResult {
         _ => TestResult::Fail("zero magic must yield Corrupt"),
     }
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_corrupt_header_yields_error);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_corrupt_header_yields_error
+);
 
 // ── 64-bit group descriptors ───────────────────────────────────────
 
@@ -696,7 +722,10 @@ fn smoke_ext4_group_desc_64byte_assembles_hi_lo_fields() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext4_group_desc_64byte_assembles_hi_lo_fields);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_group_desc_64byte_assembles_hi_lo_fields
+);
 
 fn smoke_ext4_group_desc_32byte_legacy_path_unchanged() -> TestResult {
     use crate::group_desc::GroupDesc;
@@ -721,7 +750,10 @@ fn smoke_ext4_group_desc_32byte_legacy_path_unchanged() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext4_group_desc_32byte_legacy_path_unchanged);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_group_desc_32byte_legacy_path_unchanged
+);
 
 // ── ext4 map_block dispatch ────────────────────────────────────────
 //
@@ -741,7 +773,7 @@ fn smoke_ext4_inode_block_array_serialises_as_extent_root() -> TestResult {
     bytes[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries
     bytes[4..6].copy_from_slice(&4u16.to_le_bytes()); // max
     bytes[6..8].copy_from_slice(&0u16.to_le_bytes()); // depth = 0 (leaf)
-    // Leaf @ offset 12: logical=0, len=5, phys=300.
+                                                      // Leaf @ offset 12: logical=0, len=5, phys=300.
     bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
     bytes[16..18].copy_from_slice(&5u16.to_le_bytes());
     bytes[18..20].copy_from_slice(&0u16.to_le_bytes());
@@ -751,9 +783,8 @@ fn smoke_ext4_inode_block_array_serialises_as_extent_root() -> TestResult {
     let mut block_array = [0u32; I_BLOCK_LEN];
     for i in 0..I_BLOCK_LEN {
         let off = i * 4;
-        block_array[i] = u32::from_le_bytes([
-            bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-        ]);
+        block_array[i] =
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
     }
     // Re-serialise back to bytes — what map_block_extents does.
     let mut node_buf = alloc::vec![0u8; 60];
@@ -762,9 +793,10 @@ fn smoke_ext4_inode_block_array_serialises_as_extent_root() -> TestResult {
     }
     // Verify the round-trip + lookup against logical block 2.
     match lookup_in_node(&node_buf, 2) {
-        LookupOutcome::Mapped { physical: 302, is_uninitialized: false } => {
-            TestResult::Pass
-        }
+        LookupOutcome::Mapped {
+            physical: 302,
+            is_uninitialized: false,
+        } => TestResult::Pass,
         other => {
             let _ = other;
             TestResult::Fail("inode → extent-root round-trip + lookup failed")
@@ -839,15 +871,13 @@ fn smoke_jbd2_superblock_magic_and_fields() -> TestResult {
 kernel_test_in!("drivers/fs/ext2", smoke_jbd2_superblock_magic_and_fields);
 
 fn smoke_jbd2_descriptor_block_decodes_two_tags() -> TestResult {
-    use crate::journal::{
-        block_type, tag_flag, DescriptorBlock, JBD2_MAGIC_NUMBER,
-    };
+    use crate::journal::{block_type, tag_flag, DescriptorBlock, JBD2_MAGIC_NUMBER};
     let bs = 1024usize;
     let mut b = vec![0u8; bs];
     put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
     put_u32_be(&mut b, 4, block_type::DESCRIPTOR);
     put_u32_be(&mut b, 8, 5); // sequence
-    // tag 0: target=10, flags=0 — UUID follows.
+                              // tag 0: target=10, flags=0 — UUID follows.
     put_u32_be(&mut b, 12, 10);
     put_u32_be(&mut b, 16, 0);
     // (16-byte UUID stays as zeros.)
@@ -873,7 +903,10 @@ fn smoke_jbd2_descriptor_block_decodes_two_tags() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_descriptor_block_decodes_two_tags);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_jbd2_descriptor_block_decodes_two_tags
+);
 
 fn smoke_jbd2_commit_block_decodes() -> TestResult {
     use crate::journal::{block_type, CommitBlock, JBD2_MAGIC_NUMBER};
@@ -901,7 +934,7 @@ fn smoke_jbd2_commit_block_decodes() -> TestResult {
 kernel_test_in!("drivers/fs/ext2", smoke_jbd2_commit_block_decodes);
 
 fn smoke_jbd2_revoke_block_lists_targets() -> TestResult {
-    use crate::journal::{block_type, JBD2_MAGIC_NUMBER, RevokeBlock};
+    use crate::journal::{block_type, RevokeBlock, JBD2_MAGIC_NUMBER};
     let bs = 1024usize;
     let mut b = vec![0u8; bs];
     put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
@@ -916,11 +949,7 @@ fn smoke_jbd2_revoke_block_lists_targets() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("revoke parse failed"),
     };
-    if r.revoked.len() != 3
-        || r.revoked[0] != 100
-        || r.revoked[1] != 200
-        || r.revoked[2] != 300
-    {
+    if r.revoked.len() != 3 || r.revoked[0] != 100 || r.revoked[1] != 200 || r.revoked[2] != 300 {
         return TestResult::Fail("revoke targets mismatch");
     }
     TestResult::Pass
@@ -934,9 +963,7 @@ fn smoke_jbd2_replay_end_to_end_one_txn() -> TestResult {
     //   block 2: data block (the bytes journaled for block 42)
     //   block 3: commit (seq=5)
     //   block 4+: zeroed (walk terminates on bad magic)
-    use crate::journal::{
-        block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER,
-    };
+    use crate::journal::{block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER};
     let bs = 1024usize;
     let mut img = vec![0u8; bs * 8];
     let sb = build_journal_sb_v2(bs as u32, 8, 1, 5, 1);
@@ -999,15 +1026,16 @@ fn smoke_jbd2_replay_clean_journal_no_overrides() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_replay_clean_journal_no_overrides);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_jbd2_replay_clean_journal_no_overrides
+);
 
 fn smoke_jbd2_replay_revoke_suppresses_target() -> TestResult {
     // Same as the end-to-end smoke, but a revoke block at seq=5 for
     // target 42 sits between the data block and the commit. The
     // override map must NOT contain 42.
-    use crate::journal::{
-        block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER,
-    };
+    use crate::journal::{block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER};
     let bs = 1024usize;
     let mut img = vec![0u8; bs * 8];
     let sb = build_journal_sb_v2(bs as u32, 8, 1, 5, 1);
@@ -1045,7 +1073,10 @@ fn smoke_jbd2_replay_revoke_suppresses_target() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_replay_revoke_suppresses_target);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_jbd2_replay_revoke_suppresses_target
+);
 
 // ── Volume mount with unclean journaled image installs overrides ──
 
@@ -1212,9 +1243,7 @@ fn smoke_ext3_unclean_mount_replays_root_dir() -> TestResult {
     };
     // Replay should have installed at least one override for block 9.
     if volume.journal_override_count() == 0 {
-        return TestResult::Fail(
-            "expected ≥1 journal override after unclean ext3 mount",
-        );
+        return TestResult::Fail("expected ≥1 journal override after unclean ext3 mount");
     }
     // Reading the root directory should return the JOURNAL-side
     // entry (REPLAYED), not the on-disk stale entry (ondisk).
@@ -1225,9 +1254,7 @@ fn smoke_ext3_unclean_mount_replays_root_dir() -> TestResult {
     };
     let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
     if names.iter().any(|n| *n == "ondisk") {
-        return TestResult::Fail(
-            "post-replay enumeration must NOT see the on-disk stale entry",
-        );
+        return TestResult::Fail("post-replay enumeration must NOT see the on-disk stale entry");
     }
     if !names.iter().any(|n| *n == "REPLAYED") {
         return TestResult::Fail("expected REPLAYED entry from replay override");
@@ -1362,7 +1389,10 @@ fn smoke_ext2_alloc_inode_then_free_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext2_alloc_inode_then_free_round_trip);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_alloc_inode_then_free_round_trip
+);
 
 // ── Directory mutator smokes (Stage-1: create/unlink, mkdir/rmdir,
 //     rename, hardlink, symlink fast+slow, HTREE root+leaf, full-dir
@@ -1395,7 +1425,10 @@ fn smoke_ext2_create_then_unlink_round_trip() -> TestResult {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("enumerate after create failed"),
     };
-    if !entries.iter().any(|(n, t)| n == "newfile" && *t == FileType::File) {
+    if !entries
+        .iter()
+        .any(|(n, t)| n == "newfile" && *t == FileType::File)
+    {
         return TestResult::Fail("created file not visible in enumeration");
     }
     // Look up should succeed.
@@ -1403,7 +1436,10 @@ fn smoke_ext2_create_then_unlink_round_trip() -> TestResult {
         return TestResult::Fail("lookup of created file failed");
     }
     // Unlink it.
-    if poll_once(root.unlink("newfile")).and_then(|r| r.ok()).is_none() {
+    if poll_once(root.unlink("newfile"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
         return TestResult::Fail("unlink failed");
     }
     // Re-enumerate — should be gone.
@@ -1442,7 +1478,10 @@ fn smoke_ext2_mkdir_then_rmdir_round_trip() -> TestResult {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("enumerate after mkdir failed"),
     };
-    if !entries.iter().any(|(n, t)| n == "subdir" && *t == FileType::Dir) {
+    if !entries
+        .iter()
+        .any(|(n, t)| n == "subdir" && *t == FileType::Dir)
+    {
         return TestResult::Fail("mkdir target not a Dir in enumeration");
     }
     // Subdir should contain "." and ".." entries.
@@ -1463,7 +1502,10 @@ fn smoke_ext2_mkdir_then_rmdir_round_trip() -> TestResult {
     // Drop the subdir handle before rmdir.
     drop(subdir);
     // rmdir should succeed (empty).
-    if poll_once(root.rmdir("subdir")).and_then(|r| r.ok()).is_none() {
+    if poll_once(root.rmdir("subdir"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
         return TestResult::Fail("rmdir of empty dir failed");
     }
     // Should be gone.
@@ -1659,15 +1701,12 @@ fn smoke_ext2_symlink_fast_round_trip() -> TestResult {
     };
     let root = volume.root();
     let target_path = b"data"; // 4 bytes ≤ 60 — fast symlink.
-    // Create the symlink via the volume API (DirOps::symlink also wired).
-    let sym_ino = match poll_once(volume.dir_create_symlink(
-        crate::EXT2_ROOT_INO,
-        b"sym",
-        target_path,
-    )) {
-        Some(Ok(i)) => i,
-        _ => return TestResult::Fail("symlink create failed"),
-    };
+                               // Create the symlink via the volume API (DirOps::symlink also wired).
+    let sym_ino =
+        match poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"sym", target_path)) {
+            Some(Ok(i)) => i,
+            _ => return TestResult::Fail("symlink create failed"),
+        };
     // Read it back via the volume helper.
     let inode = match poll_once(volume.read_inode(sym_ino)) {
         Some(Ok(i)) => i,
@@ -1706,16 +1745,12 @@ fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
     };
     let _ = volume.root();
     // 61+-byte target → slow symlink path (block allocated).
-    let target_path =
-        b"this-target-is-deliberately-longer-than-sixty-bytes-to-trigger-slow-path";
-    let sym_ino = match poll_once(volume.dir_create_symlink(
-        crate::EXT2_ROOT_INO,
-        b"slowsym",
-        target_path,
-    )) {
-        Some(Ok(i)) => i,
-        _ => return TestResult::Fail("slow symlink create failed"),
-    };
+    let target_path = b"this-target-is-deliberately-longer-than-sixty-bytes-to-trigger-slow-path";
+    let sym_ino =
+        match poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"slowsym", target_path)) {
+            Some(Ok(i)) => i,
+            _ => return TestResult::Fail("slow symlink create failed"),
+        };
     let inode = match poll_once(volume.read_inode(sym_ino)) {
         Some(Ok(i)) => i,
         _ => return TestResult::Fail("read inode failed"),
@@ -1758,14 +1793,16 @@ fn smoke_ext2_dir_full_block_invariant_holds() -> TestResult {
     // Walk forward from `off`: rec_len must take us to byte 1024.
     let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
     if off + rec_len != bs {
-        return TestResult::Fail(
-            "last entry's rec_len must extend exactly to end-of-block",
-        );
+        return TestResult::Fail("last entry's rec_len must extend exactly to end-of-block");
     }
     // Walking from byte 0 the cumulative rec_lens must also sum to bs.
     let dot_rec_len = u16::from_le_bytes([block[4], block[5]]) as usize;
-    let dotdot_rec_len = u16::from_le_bytes([block[dot_rec_len + 4], block[dot_rec_len + 5]]) as usize;
-    let extra_rec_len = u16::from_le_bytes([block[dot_rec_len + dotdot_rec_len + 4], block[dot_rec_len + dotdot_rec_len + 5]]) as usize;
+    let dotdot_rec_len =
+        u16::from_le_bytes([block[dot_rec_len + 4], block[dot_rec_len + 5]]) as usize;
+    let extra_rec_len = u16::from_le_bytes([
+        block[dot_rec_len + dotdot_rec_len + 4],
+        block[dot_rec_len + dotdot_rec_len + 5],
+    ]) as usize;
     if dot_rec_len + dotdot_rec_len + extra_rec_len != bs {
         return TestResult::Fail("cumulative rec_lens must equal block size");
     }
@@ -1802,23 +1839,17 @@ fn smoke_ext2_htree_root_decode() -> TestResult {
     block[DX_ROOT_INFO_OFF + 4] = hash_version::TEA;
     block[DX_ROOT_INFO_OFF + 5] = 8;
     // dx_head: limit, count.
-    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2]
-        .copy_from_slice(&10u16.to_le_bytes());
-    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4]
-        .copy_from_slice(&3u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&10u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&3u16.to_le_bytes());
     // 3 entries: (0, 5), (0xA000_0000, 6), (0xC000_0000, 7).
-    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
-    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8]
-        .copy_from_slice(&5u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8].copy_from_slice(&5u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
         .copy_from_slice(&0xA000_0000u32.to_le_bytes());
-    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16]
-        .copy_from_slice(&6u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16].copy_from_slice(&6u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 16..DX_ROOT_ENTRIES_OFF + 20]
         .copy_from_slice(&0xC000_0000u32.to_le_bytes());
-    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24]
-        .copy_from_slice(&7u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24].copy_from_slice(&7u32.to_le_bytes());
 
     let root = match DxRoot::parse(&block) {
         Some(r) => r,
@@ -1848,8 +1879,7 @@ kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_root_decode);
 fn smoke_ext2_htree_lookup_chooses_correct_bucket() -> TestResult {
     use crate::dir::ftype;
     use crate::htree::{
-        dx_find_entry_root, hash_version, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF,
-        DX_ROOT_INFO_OFF,
+        dx_find_entry_root, hash_version, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF, DX_ROOT_INFO_OFF,
     };
     let mut block = alloc::vec![0u8; 1024];
     // Bare-minimum dirent prefix so DxRoot::parse accepts the block.
@@ -1866,23 +1896,17 @@ fn smoke_ext2_htree_lookup_chooses_correct_bucket() -> TestResult {
     block[21] = b'.';
     block[DX_ROOT_INFO_OFF + 4] = hash_version::TEA;
     block[DX_ROOT_INFO_OFF + 5] = 8;
-    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2]
-        .copy_from_slice(&10u16.to_le_bytes());
-    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4]
-        .copy_from_slice(&3u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&10u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&3u16.to_le_bytes());
     // Sorted entries: (0, 5), (0x4000_0000, 6), (0x8000_0000, 7).
-    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
-    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8]
-        .copy_from_slice(&5u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8].copy_from_slice(&5u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
         .copy_from_slice(&0x4000_0000u32.to_le_bytes());
-    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16]
-        .copy_from_slice(&6u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16].copy_from_slice(&6u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 16..DX_ROOT_ENTRIES_OFF + 20]
         .copy_from_slice(&0x8000_0000u32.to_le_bytes());
-    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24]
-        .copy_from_slice(&7u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24].copy_from_slice(&7u32.to_le_bytes());
 
     // Target hash 0x3000_0000 → falls in bucket 0 (below 0x4000_0000) → block 5.
     let e = dx_find_entry_root(&block, 0x3000_0000).unwrap();
@@ -1901,7 +1925,10 @@ fn smoke_ext2_htree_lookup_chooses_correct_bucket() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_lookup_chooses_correct_bucket);
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_htree_lookup_chooses_correct_bucket
+);
 
 fn smoke_ext2_htree_tea_hash_deterministic() -> TestResult {
     use crate::htree::{hash_version, name_hash};
@@ -2087,8 +2114,8 @@ fn smoke_ext2_rename_noreplace_dest_exists_rejected() -> TestResult {
     // Simulate the collision check: inserting the same name twice in a
     // directory block should return InsertResult::Exists, which
     // dir_rename translates to InvalidPath.
-    use crate::dir::splice;
     use crate::dir::ftype;
+    use crate::dir::splice;
 
     let mut block = vec![0u8; 1024];
     // Seed with a "." entry.
@@ -2216,35 +2243,12 @@ fn smoke_ext2_htree_index_node_insert_sorted() -> TestResult {
 
     // Insert (hash=300, block=3), (hash=100, block=2), (hash=200, block=4).
     // After all inserts the order (by hash) should be: 0, 100, 200, 300.
-    index_node_insert_entry(
-        &mut node,
-        DX_NODE_HEAD_OFF,
-        DX_NODE_ENTRIES_OFF,
-        300,
-        3,
-    )
-    .unwrap();
-    index_node_insert_entry(
-        &mut node,
-        DX_NODE_HEAD_OFF,
-        DX_NODE_ENTRIES_OFF,
-        100,
-        2,
-    )
-    .unwrap();
-    index_node_insert_entry(
-        &mut node,
-        DX_NODE_HEAD_OFF,
-        DX_NODE_ENTRIES_OFF,
-        200,
-        4,
-    )
-    .unwrap();
+    index_node_insert_entry(&mut node, DX_NODE_HEAD_OFF, DX_NODE_ENTRIES_OFF, 300, 3).unwrap();
+    index_node_insert_entry(&mut node, DX_NODE_HEAD_OFF, DX_NODE_ENTRIES_OFF, 100, 2).unwrap();
+    index_node_insert_entry(&mut node, DX_NODE_HEAD_OFF, DX_NODE_ENTRIES_OFF, 200, 4).unwrap();
 
-    let count = u16::from_le_bytes([
-        node[DX_NODE_HEAD_OFF + 2],
-        node[DX_NODE_HEAD_OFF + 3],
-    ]) as usize;
+    let count =
+        u16::from_le_bytes([node[DX_NODE_HEAD_OFF + 2], node[DX_NODE_HEAD_OFF + 3]]) as usize;
     if count != 4 {
         return TestResult::Fail("count should be 4 after 3 inserts");
     }
@@ -2260,10 +2264,7 @@ fn smoke_ext2_htree_index_node_insert_sorted() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/fs/ext2",
-    smoke_ext2_htree_index_node_insert_sorted
-);
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_index_node_insert_sorted);
 
 fn smoke_ext2_htree_collect_sorted_entries() -> TestResult {
     use crate::htree::{collect_sorted_leaf_entries, hash_version};
@@ -2308,7 +2309,4 @@ fn smoke_ext2_htree_collect_sorted_entries() -> TestResult {
     let _ = inodes; // silence warning
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/fs/ext2",
-    smoke_ext2_htree_collect_sorted_entries
-);
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_collect_sorted_entries);

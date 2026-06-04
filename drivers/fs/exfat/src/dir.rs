@@ -54,10 +54,10 @@ pub mod entry_type {
 /// FileAttributes bits (§7.4.4).
 pub mod file_attr {
     pub const READ_ONLY: u16 = 0x0001;
-    pub const HIDDEN: u16    = 0x0002;
-    pub const SYSTEM: u16    = 0x0004;
+    pub const HIDDEN: u16 = 0x0002;
+    pub const SYSTEM: u16 = 0x0004;
     pub const DIRECTORY: u16 = 0x0010;
-    pub const ARCHIVE: u16   = 0x0020;
+    pub const ARCHIVE: u16 = 0x0020;
 }
 
 /// GeneralSecondaryFlags bits inside the Stream Extension entry
@@ -65,7 +65,7 @@ pub mod file_attr {
 /// the data is one contiguous run of `data_length` bytes.
 pub mod stream_flags {
     pub const ALLOCATION_POSSIBLE: u8 = 0x01;
-    pub const NO_FAT_CHAIN: u8        = 0x02;
+    pub const NO_FAT_CHAIN: u8 = 0x02;
 }
 
 /// §7.4 File Directory Entry (type 0x85). Primary entry; describes
@@ -228,7 +228,9 @@ pub fn set_checksum(group: &[u8]) -> u16 {
         if i == 2 || i == 3 {
             continue;
         }
-        sum = ((sum & 1) << 15).wrapping_add(sum >> 1).wrapping_add(b as u16);
+        sum = ((sum & 1) << 15)
+            .wrapping_add(sum >> 1)
+            .wrapping_add(b as u16);
     }
     sum
 }

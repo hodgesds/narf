@@ -31,15 +31,14 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::extent::{
-    empty_iblock_leaf, find_physical_for_logical, insert_into_leaf, lookup_in_node,
-    ExtentHeader, ExtentIndex, ExtentLeaf, InsertOutcome, LookupOutcome, EXT4_EXTENT_MAGIC,
+    empty_iblock_leaf, find_physical_for_logical, insert_into_leaf, lookup_in_node, ExtentHeader,
+    ExtentIndex, ExtentLeaf, InsertOutcome, LookupOutcome, EXT4_EXTENT_MAGIC,
 };
-use super::htree::{name_hash, hash_version, DxRoot};
+use super::htree::{hash_version, name_hash, DxRoot};
 use super::inode::{Ext4Inode, EXT4_EXTENTS_FL, EXT4_INDEX_FL};
 use super::journal::{
-    build_one_txn_image, encode_commit, encode_descriptor, encode_superblock,
-    replay_journal_flat, CommitBlock, DescriptorBlock, JournalSuperblock,
-    JBD2_MAGIC_NUMBER, block_type as jbt,
+    block_type as jbt, build_one_txn_image, encode_commit, encode_descriptor, encode_superblock,
+    replay_journal_flat, CommitBlock, DescriptorBlock, JournalSuperblock, JBD2_MAGIC_NUMBER,
 };
 use super::superblock::{
     incompat, is_64bit, is_flex_bg, validate, Ext4SuperblockError, EXT4_VALID_FS,
@@ -61,7 +60,7 @@ fn synth_ext4_sb() -> Vec<u8> {
     buf[58..60].copy_from_slice(&EXT4_VALID_FS.to_le_bytes()); // s_state = clean
     buf[76..80].copy_from_slice(&1u32.to_le_bytes()); // s_rev_level = 1
     buf[88..90].copy_from_slice(&256u16.to_le_bytes()); // s_inode_size = 256 (ext4)
-    // feature_incompat: EXTENTS + FILETYPE
+                                                        // feature_incompat: EXTENTS + FILETYPE
     let incompat_bits = incompat::EXTENTS | incompat::FILETYPE;
     buf[96..100].copy_from_slice(&incompat_bits.to_le_bytes());
     buf
@@ -132,7 +131,10 @@ fn smoke_ext4_superblock_rejects_without_extents() -> TestResult {
         Ok(_) => TestResult::Fail("validate must reject ext3-flavour volumes"),
     }
 }
-kernel_test_in!("drivers/fs/ext4", smoke_ext4_superblock_rejects_without_extents);
+kernel_test_in!(
+    "drivers/fs/ext4",
+    smoke_ext4_superblock_rejects_without_extents
+);
 
 // ── 3: Extent header + extent struct layout ────────────────────────
 
@@ -179,19 +181,31 @@ fn smoke_ext4_extent_walk_leaf_only() -> TestResult {
     put_extent_leaf(&mut buf, 24, 8, 8, 2000);
 
     match lookup_in_node(&buf, 0) {
-        LookupOutcome::Mapped { physical: 1000, is_uninitialized: false } => {}
+        LookupOutcome::Mapped {
+            physical: 1000,
+            is_uninitialized: false,
+        } => {}
         _ => return TestResult::Fail("logical 0 must map to phys 1000"),
     }
     match lookup_in_node(&buf, 7) {
-        LookupOutcome::Mapped { physical: 1007, is_uninitialized: false } => {}
+        LookupOutcome::Mapped {
+            physical: 1007,
+            is_uninitialized: false,
+        } => {}
         _ => return TestResult::Fail("logical 7 must map to phys 1007"),
     }
     match lookup_in_node(&buf, 8) {
-        LookupOutcome::Mapped { physical: 2000, is_uninitialized: false } => {}
+        LookupOutcome::Mapped {
+            physical: 2000,
+            is_uninitialized: false,
+        } => {}
         _ => return TestResult::Fail("logical 8 must map to phys 2000"),
     }
     match lookup_in_node(&buf, 15) {
-        LookupOutcome::Mapped { physical: 2007, is_uninitialized: false } => {}
+        LookupOutcome::Mapped {
+            physical: 2007,
+            is_uninitialized: false,
+        } => {}
         _ => return TestResult::Fail("logical 15 must map to phys 2007"),
     }
     match lookup_in_node(&buf, 16) {
@@ -222,7 +236,11 @@ fn smoke_ext4_extent_walk_index_to_leaf() -> TestResult {
     }
     // Drive find_physical_for_logical via a closure that returns the child.
     let phys = find_physical_for_logical(&root, 7, |blk| {
-        if blk == 555 { Some(child.clone()) } else { None }
+        if blk == 555 {
+            Some(child.clone())
+        } else {
+            None
+        }
     });
     if phys != Some(9002) {
         return TestResult::Fail("two-level walk must land at phys 9002");
@@ -230,7 +248,11 @@ fn smoke_ext4_extent_walk_index_to_leaf() -> TestResult {
     // Below the index range (logical 1) — root walker has no entry
     // covering it; it returns Hole.
     let phys = find_physical_for_logical(&root, 1, |blk| {
-        if blk == 555 { Some(child.clone()) } else { None }
+        if blk == 555 {
+            Some(child.clone())
+        } else {
+            None
+        }
     });
     if phys != Some(0) && phys.is_some() {
         // The walk descends because the root's first index logical
@@ -329,7 +351,10 @@ fn smoke_ext4_extent_insert_triggers_split() -> TestResult {
         physical: 20_000,
     };
     match insert_into_leaf(&buf, overflow, 4242, 4096) {
-        InsertOutcome::Split { child_leaf_bytes, new_root_index_bytes } => {
+        InsertOutcome::Split {
+            child_leaf_bytes,
+            new_root_index_bytes,
+        } => {
             // Child must be a depth-0 leaf with 5 entries.
             let h = match ExtentHeader::parse(&child_leaf_bytes) {
                 Some(h) => h,
@@ -433,8 +458,14 @@ kernel_test_in!("drivers/fs/ext4", smoke_ext4_htree_root_decode_same_format);
 fn smoke_ext4_jbd2_superblock_encode_decode_round_trip() -> TestResult {
     let block_size = 4096usize;
     let mut sb = vec![0u8; block_size];
-    encode_superblock(&mut sb, block_size as u32, /*maxlen*/ 100,
-                      /*first*/ 1, /*sequence*/ 42, /*start*/ 0);
+    encode_superblock(
+        &mut sb,
+        block_size as u32,
+        /*maxlen*/ 100,
+        /*first*/ 1,
+        /*sequence*/ 42,
+        /*start*/ 0,
+    );
     let parsed = match JournalSuperblock::parse(&sb) {
         Some(p) => p,
         None => return TestResult::Fail("encoded superblock failed to parse"),
@@ -469,7 +500,10 @@ fn smoke_ext4_jbd2_superblock_encode_decode_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext4", smoke_ext4_jbd2_superblock_encode_decode_round_trip);
+kernel_test_in!(
+    "drivers/fs/ext4",
+    smoke_ext4_jbd2_superblock_encode_decode_round_trip
+);
 
 // ── 10: JBD2 replay end-to-end via the encoder ─────────────────────
 
@@ -537,7 +571,10 @@ fn smoke_ext4_file_write_extent_round_trip() -> TestResult {
     };
     // "Read" logical block 3 — must return physical 4245.
     let phys = match lookup_in_node(&iblock, 3) {
-        LookupOutcome::Mapped { physical, is_uninitialized: false } => physical,
+        LookupOutcome::Mapped {
+            physical,
+            is_uninitialized: false,
+        } => physical,
         _ => return TestResult::Fail("logical 3 must be mapped"),
     };
     if phys != 4245 {
@@ -559,7 +596,7 @@ kernel_test_in!("drivers/fs/ext4", smoke_ext4_file_write_extent_round_trip);
 // extending the previous entry's rec_len over it.
 
 fn smoke_ext4_dir_create_then_unlink_round_trip() -> TestResult {
-    use crate::dir::{parse_entry, ftype};
+    use crate::dir::{ftype, parse_entry};
 
     // Start with a 1024-byte directory block holding only "." +
     // ".." (12 + 1012 rec_len). Common after mkdir.
@@ -590,7 +627,7 @@ fn smoke_ext4_dir_create_then_unlink_round_trip() -> TestResult {
 
     // === Create: shrink ".."s rec_len, append "newfile" ===
     let new_name = b"newfile"; // 7 bytes; on-disk entry rounds to 16 bytes
-    // Shrink ".." to its minimal rec_len = 12.
+                               // Shrink ".." to its minimal rec_len = 12.
     block[16..18].copy_from_slice(&12u16.to_le_bytes());
     // New entry at offset 24.
     let off = 24usize;
@@ -622,14 +659,15 @@ fn smoke_ext4_dir_create_then_unlink_round_trip() -> TestResult {
     let e_dotdot_after = parse_entry(&block, 12).expect("..");
     let next = 12 + e_dotdot_after.rec_len as usize;
     if next != 1024 {
-        return TestResult::Fail(
-            "unlink: '..' rec_len should now span to end of block",
-        );
+        return TestResult::Fail("unlink: '..' rec_len should now span to end of block");
     }
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext4", smoke_ext4_dir_create_then_unlink_round_trip);
+kernel_test_in!(
+    "drivers/fs/ext4",
+    smoke_ext4_dir_create_then_unlink_round_trip
+);
 
 // ── 13: Ext4Inode flag decode — EXTENTS_FL on/off ──────────────────
 
@@ -676,7 +714,7 @@ kernel_test_in!("drivers/fs/ext4", smoke_ext4_inode_flag_decode);
 fn smoke_ext4_inode_size_64bit_assembly() -> TestResult {
     let mut buf = vec![0u8; 256];
     buf[0..2].copy_from_slice(&0x81A4u16.to_le_bytes()); // S_IFREG | 0644
-    // i_size_lo = 0x1234_5678, i_size_high = 0xABCD_0001.
+                                                         // i_size_lo = 0x1234_5678, i_size_high = 0xABCD_0001.
     buf[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
     buf[32..36].copy_from_slice(&EXT4_EXTENTS_FL.to_le_bytes());
     buf[108..112].copy_from_slice(&0xABCD_0001u32.to_le_bytes());
@@ -696,7 +734,11 @@ kernel_test_in!("drivers/fs/ext4", smoke_ext4_inode_size_64bit_assembly);
 
 fn smoke_ext4_jbd2_descriptor_encode_decodes() -> TestResult {
     let mut buf = vec![0u8; 256];
-    encode_descriptor(&mut buf, /*sequence*/ 33, &[(100, 0), (200, 0), (300, 0)]);
+    encode_descriptor(
+        &mut buf,
+        /*sequence*/ 33,
+        &[(100, 0), (200, 0), (300, 0)],
+    );
     let dd = match DescriptorBlock::parse(&buf) {
         Some(d) => d,
         None => return TestResult::Fail("descriptor decode failed"),
@@ -707,7 +749,10 @@ fn smoke_ext4_jbd2_descriptor_encode_decodes() -> TestResult {
     if dd.tags.len() != 3 {
         return TestResult::Fail("expected 3 tags");
     }
-    if dd.tags[0].target_block != 100 || dd.tags[1].target_block != 200 || dd.tags[2].target_block != 300 {
+    if dd.tags[0].target_block != 100
+        || dd.tags[1].target_block != 200
+        || dd.tags[2].target_block != 300
+    {
         return TestResult::Fail("tag target_block round-trip wrong");
     }
     if !dd.tags[2].is_last() {

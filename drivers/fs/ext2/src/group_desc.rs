@@ -51,8 +51,14 @@ impl GroupDesc {
         let free_inodes_lo = u16::from_le_bytes([buf[14], buf[15]]);
         let used_dirs_lo = u16::from_le_bytes([buf[16], buf[17]]);
 
-        let (block_bitmap_hi, inode_bitmap_hi, inode_table_hi,
-             free_blocks_hi, free_inodes_hi, used_dirs_hi) = if desc_size >= 64 {
+        let (
+            block_bitmap_hi,
+            inode_bitmap_hi,
+            inode_table_hi,
+            free_blocks_hi,
+            free_inodes_hi,
+            used_dirs_hi,
+        ) = if desc_size >= 64 {
             // ext4 64BIT layout — _hi fields at offsets 32..52.
             //   32..36 block_bitmap_hi  (u32)
             //   36..40 inode_bitmap_hi

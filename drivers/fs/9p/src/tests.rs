@@ -146,10 +146,7 @@ fn smoke_9p_tversion_rversion_frame_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/fs/9p",
-    smoke_9p_tversion_rversion_frame_decode
-);
+kernel_test_in!("drivers/fs/9p", smoke_9p_tversion_rversion_frame_decode);
 
 fn smoke_9p_stat_decode_variable_length() -> TestResult {
     // Hand-build a stat structure with name="hello", uid="u",
@@ -316,8 +313,7 @@ fn smoke_9p_loopback_mount_and_enumerate() -> TestResult {
     // "hello 9p". Mount, enumerate root, look up the file, read the
     // bytes back. Exercises Tversion + Tattach + Twalk + Topen + Tread
     // + the directory-stat parser + the stream-of-stats reader.
-    let transport: Arc<LoopbackTransport> =
-        LoopbackTransport::new(&[("greeting", b"hello 9p")]);
+    let transport: Arc<LoopbackTransport> = LoopbackTransport::new(&[("greeting", b"hello 9p")]);
     // We need an Arc<dyn Transport>; the struct's `new` returns
     // `Arc<LoopbackTransport>` which dyn-coerces.
     let t: Arc<dyn crate::session::Transport> = transport.clone();
@@ -399,11 +395,7 @@ kernel_test_in!(
 );
 
 fn smoke_9p_loopback_multiple_files_enumerate_in_order() -> TestResult {
-    let transport = LoopbackTransport::new(&[
-        ("alpha", b"a"),
-        ("beta", b"bb"),
-        ("gamma", b"ccc"),
-    ]);
+    let transport = LoopbackTransport::new(&[("alpha", b"a"), ("beta", b"bb"), ("gamma", b"ccc")]);
     let t: Arc<dyn crate::session::Transport> = transport.clone();
     let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,

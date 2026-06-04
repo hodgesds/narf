@@ -13,8 +13,8 @@ use narf_driver_runtime::DomainId;
 use narf_filesystem::{DirOps, FsError, FsInstance};
 
 use super::message::{
-    decode_header, decode_rerror, decode_rversion, encode_tattach, encode_tversion, qtype,
-    MsgType, Qid, WireRead, NOFID, NOTAG,
+    decode_header, decode_rerror, decode_rversion, encode_tattach, encode_tversion, qtype, MsgType,
+    Qid, WireRead, NOFID, NOTAG,
 };
 use super::node::NinepNode;
 use super::session::{frame_message, P9Session, Transport};

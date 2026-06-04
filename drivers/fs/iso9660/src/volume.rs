@@ -95,8 +95,8 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
         // Allocate + register the volume's per-mount scratch
         // buffer. Capacity: one logical sector. Mints exactly one
         // object-table slot for the lifetime of the volume.
-        let buffer = alloc_coherent(SECTOR_SIZE, domain)
-            .map_err(|_| FsError::Io(BlockError::IOError))?;
+        let buffer =
+            alloc_coherent(SECTOR_SIZE, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
         let cap = register_with_cap(buffer);
         let io = VolumeIo { cap };
 
@@ -118,9 +118,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
             // `#[repr(C, packed)]`, and the layout matches §8.1.
             // We just read a full 2048-byte sector into `sector_buf`.
             let header: VolumeDescriptorHeader = unsafe {
-                core::ptr::read_unaligned(
-                    sector_buf.as_ptr() as *const VolumeDescriptorHeader,
-                )
+                core::ptr::read_unaligned(sector_buf.as_ptr() as *const VolumeDescriptorHeader)
             };
 
             if header.standard_identifier != STANDARD_IDENTIFIER {
@@ -136,7 +134,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
                     // `descriptor.rs`), and the layout matches §8.4.
                     let p: PrimaryVolumeDescriptor = unsafe {
                         core::ptr::read_unaligned(
-                            sector_buf.as_ptr() as *const PrimaryVolumeDescriptor,
+                            sector_buf.as_ptr() as *const PrimaryVolumeDescriptor
                         )
                     };
                     pvd = Some(p);

@@ -28,16 +28,16 @@
 
 extern crate alloc;
 
-pub mod superblock;
-pub mod group_desc;
-pub mod inode;
 pub mod dir;
 pub mod dir_mut;
 pub mod extent;
+pub mod group_desc;
 pub mod htree;
+pub mod inode;
 pub mod journal;
-pub mod volume;
 pub mod node;
+pub mod superblock;
+pub mod volume;
 
 mod tests;
 
@@ -88,9 +88,7 @@ fn ext_factory(
     // SyncBlock::new returns Arc<SyncBlock> — exactly the
     // `Arc<B: BlockDevice>` shape Ext2Volume::mount expects.
     let async_dev = SyncBlock::new(dev);
-    let volume = narf_scheduler::block_on(volume::Ext2Volume::mount(
-        async_dev,
-        DomainId::DRIVER_0,
-    ))?;
+    let volume =
+        narf_scheduler::block_on(volume::Ext2Volume::mount(async_dev, DomainId::DRIVER_0))?;
     Ok(volume as Arc<dyn narf_filesystem::FsInstance>)
 }

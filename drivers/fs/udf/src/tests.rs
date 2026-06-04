@@ -41,9 +41,7 @@ use super::descriptor::{
     LogicalVolumeDescriptorHeader,
 };
 use super::fid::{decode_fid, decode_identifier};
-use super::icb::{
-    ad_type, file_type, flags as icb_flags, read_long_ad, read_short_ad,
-};
+use super::icb::{ad_type, file_type, flags as icb_flags, read_long_ad, read_short_ad};
 use super::SECTOR_SIZE;
 
 // ── Pure-logic smokes ──────────────────────────────────────────────
@@ -324,8 +322,7 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 fn finalise_tag(buf: &mut [u8], tag_off: usize, body_off: usize, body_len: usize) {
     let crc = crc_ccitt(&buf[body_off..body_off + body_len]);
     buf[tag_off + 8..tag_off + 10].copy_from_slice(&crc.to_le_bytes());
-    buf[tag_off + 10..tag_off + 12]
-        .copy_from_slice(&(body_len as u16).to_le_bytes());
+    buf[tag_off + 10..tag_off + 12].copy_from_slice(&(body_len as u16).to_le_bytes());
     let mut tag_bytes = [0u8; 16];
     tag_bytes.copy_from_slice(&buf[tag_off..tag_off + 16]);
     let cs = tag_checksum(&tag_bytes);
@@ -357,13 +354,7 @@ fn write_tag_header(
 }
 
 /// Encode a long_ad at `dst[off..off+16]`.
-fn write_long_ad(
-    dst: &mut [u8],
-    off: usize,
-    extent_length_raw: u32,
-    lbn: u32,
-    partition_ref: u16,
-) {
+fn write_long_ad(dst: &mut [u8], off: usize, extent_length_raw: u32, lbn: u32, partition_ref: u16) {
     dst[off..off + 4].copy_from_slice(&extent_length_raw.to_le_bytes());
     dst[off + 4..off + 8].copy_from_slice(&lbn.to_le_bytes());
     dst[off + 8..off + 10].copy_from_slice(&partition_ref.to_le_bytes());
@@ -389,7 +380,13 @@ fn write_fid(
     let raw_len = 38 + l_iu + l_fi;
     let total = (raw_len + 3) & !3;
 
-    write_tag_header(dst, off, tag_id::FILE_IDENTIFIER_DESCRIPTOR, 1, tag_location);
+    write_tag_header(
+        dst,
+        off,
+        tag_id::FILE_IDENTIFIER_DESCRIPTOR,
+        1,
+        tag_location,
+    );
     dst[off + 16..off + 18].copy_from_slice(&1u16.to_le_bytes()); // FileVersionNumber
     dst[off + 18] = file_characteristics;
     dst[off + 19] = l_fi as u8;
@@ -462,10 +459,8 @@ fn build_udf_image() -> (Vec<u8>, &'static [u8]) {
     write_tag_header(&mut img, pd_off, tag_id::PARTITION_DESCRIPTOR, 1, 34);
     // Body fields used by the driver: starting_location (offset 188),
     // length (offset 192). See descriptor.rs `PartitionDescriptor`.
-    img[pd_off + 188..pd_off + 192]
-        .copy_from_slice(&partition_start.to_le_bytes());
-    img[pd_off + 192..pd_off + 196]
-        .copy_from_slice(&partition_length.to_le_bytes());
+    img[pd_off + 188..pd_off + 192].copy_from_slice(&partition_start.to_le_bytes());
+    img[pd_off + 192..pd_off + 196].copy_from_slice(&partition_length.to_le_bytes());
     // partition_number at offset 22.
     img[pd_off + 22..pd_off + 24].copy_from_slice(&0u16.to_le_bytes());
     finalise_tag(&mut img, pd_off, pd_off + 16, 496);
@@ -474,19 +469,18 @@ fn build_udf_image() -> (Vec<u8>, &'static [u8]) {
     let lvd_off = 35 * SECTOR_SIZE;
     write_tag_header(&mut img, lvd_off, tag_id::LOGICAL_VOLUME_DESCRIPTOR, 1, 35);
     // logical_block_size at offset 16+4+64+128 = 212.
-    let lbs_off = lvd_off
-        + core::mem::offset_of!(LogicalVolumeDescriptorHeader, logical_block_size);
+    let lbs_off =
+        lvd_off + core::mem::offset_of!(LogicalVolumeDescriptorHeader, logical_block_size);
     img[lbs_off..lbs_off + 4].copy_from_slice(&(SECTOR_SIZE as u32).to_le_bytes());
     // logical_volume_contents_use long_ad → FSD at (LBN 0, partition 0).
-    let lvcu_off = lvd_off
-        + core::mem::offset_of!(LogicalVolumeDescriptorHeader, logical_volume_contents_use);
+    let lvcu_off =
+        lvd_off + core::mem::offset_of!(LogicalVolumeDescriptorHeader, logical_volume_contents_use);
     write_long_ad(&mut img, lvcu_off, SECTOR_SIZE as u32, fsd_lbn, 0);
     // map_table_length = 6, number_of_partition_maps = 1.
-    let mtl_off = lvd_off
-        + core::mem::offset_of!(LogicalVolumeDescriptorHeader, map_table_length);
+    let mtl_off = lvd_off + core::mem::offset_of!(LogicalVolumeDescriptorHeader, map_table_length);
     img[mtl_off..mtl_off + 4].copy_from_slice(&6u32.to_le_bytes());
-    let nopm_off = lvd_off
-        + core::mem::offset_of!(LogicalVolumeDescriptorHeader, number_of_partition_maps);
+    let nopm_off =
+        lvd_off + core::mem::offset_of!(LogicalVolumeDescriptorHeader, number_of_partition_maps);
     img[nopm_off..nopm_off + 4].copy_from_slice(&1u32.to_le_bytes());
     // Type-1 partition map immediately after the fixed header
     // (offset 440):
@@ -503,7 +497,13 @@ fn build_udf_image() -> (Vec<u8>, &'static [u8]) {
 
     // ── Sector 36: Unallocated Space Descriptor (tag 7) ───────
     let usd_off = 36 * SECTOR_SIZE;
-    write_tag_header(&mut img, usd_off, tag_id::UNALLOCATED_SPACE_DESCRIPTOR, 1, 36);
+    write_tag_header(
+        &mut img,
+        usd_off,
+        tag_id::UNALLOCATED_SPACE_DESCRIPTOR,
+        1,
+        36,
+    );
     finalise_tag(&mut img, usd_off, usd_off + 16, 8);
 
     // ── Sector 37: Terminating Descriptor (tag 8) ─────────────
@@ -513,7 +513,13 @@ fn build_udf_image() -> (Vec<u8>, &'static [u8]) {
 
     // ── Sector 256: AVDP (tag 2) ──────────────────────────────
     let avdp_off = 256 * SECTOR_SIZE;
-    write_tag_header(&mut img, avdp_off, tag_id::ANCHOR_VOLUME_DESCRIPTOR_POINTER, 1, 256);
+    write_tag_header(
+        &mut img,
+        avdp_off,
+        tag_id::ANCHOR_VOLUME_DESCRIPTOR_POINTER,
+        1,
+        256,
+    );
     // Main VDS: extent_length covers sectors 32..38 = 6 sectors =
     // 0x3000 bytes; extent_location = 32.
     img[avdp_off + 16..avdp_off + 20].copy_from_slice(&(6u32 * SECTOR_SIZE as u32).to_le_bytes());
@@ -534,13 +540,7 @@ fn build_udf_image() -> (Vec<u8>, &'static [u8]) {
     // 16 for tag = 396.) — we use offset_of! to be exact:
     use super::descriptor::FileSetDescriptor;
     let rdi_off = fsd_off + core::mem::offset_of!(FileSetDescriptor, root_directory_icb);
-    write_long_ad(
-        &mut img,
-        rdi_off,
-        SECTOR_SIZE as u32,
-        root_fe_lbn,
-        0,
-    );
+    write_long_ad(&mut img, rdi_off, SECTOR_SIZE as u32, root_fe_lbn, 0);
     finalise_tag(&mut img, fsd_off, fsd_off + 16, 496);
 
     // ── Sector 258: Root Directory File Entry (tag 261) ───────
@@ -610,8 +610,7 @@ fn build_udf_image() -> (Vec<u8>, &'static [u8]) {
     img[file_fe_off + 16 + 11] = file_type::REGULAR_FILE;
     img[file_fe_off + 16 + 18..file_fe_off + 16 + 20]
         .copy_from_slice(&icb_flags::ALLOC_TYPE_LONG.to_le_bytes());
-    img[file_fe_off + 56..file_fe_off + 64]
-        .copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    img[file_fe_off + 56..file_fe_off + 64].copy_from_slice(&(payload.len() as u64).to_le_bytes());
     img[file_fe_off + 168..file_fe_off + 172].copy_from_slice(&0u32.to_le_bytes());
     img[file_fe_off + 172..file_fe_off + 176].copy_from_slice(&16u32.to_le_bytes());
     write_long_ad(

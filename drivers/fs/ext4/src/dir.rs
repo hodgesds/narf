@@ -15,4 +15,4 @@
 //! - Linux `include/uapi/linux/ext4_fs.h::EXT4_FT_*` — the
 //!   file-type discriminator.
 
-pub use narf_drivers_fs_ext2::dir::{ftype, DirEntry, parse_entry};
+pub use narf_drivers_fs_ext2::dir::{ftype, parse_entry, DirEntry};

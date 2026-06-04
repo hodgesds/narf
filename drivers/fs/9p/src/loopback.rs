@@ -247,9 +247,7 @@ impl LoopbackTransport {
                         },
                     );
                     drop(inner);
-                    return frame_message(self.cap(), MsgType::Rwalk, tag, |w| {
-                        w.write_u16(0)
-                    });
+                    return frame_message(self.cap(), MsgType::Rwalk, tag, |w| w.write_u16(0));
                 }
                 // Synthetic tree is one level deep. We require the
                 // walk to start at the root (child == None).
@@ -396,8 +394,7 @@ impl LoopbackTransport {
                         // at the cursor implied by `offset`. We treat
                         // `offset` as an opaque cumulative byte count,
                         // matching `read(5)`'s semantics.
-                        let stats: Vec<P9Stat> =
-                            inner.files.iter().map(Self::file_stat).collect();
+                        let stats: Vec<P9Stat> = inner.files.iter().map(Self::file_stat).collect();
                         // Encode all stats into a temporary buffer
                         // first so we can slice from `offset`.
                         let mut all: Vec<u8> = Vec::with_capacity(stats.len() * 64);

@@ -11,14 +11,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::message::{
     decode_header, decode_rerror, decode_rread, decode_rwalk, decode_rwrite, encode_tclunk,
-    encode_topen, encode_tread, encode_tstat, encode_twalk, encode_twrite, oflag, qtype,
-    MsgType, P9Stat, Qid, WireRead,
+    encode_topen, encode_tread, encode_tstat, encode_twalk, encode_twrite, oflag, qtype, MsgType,
+    P9Stat, Qid, WireRead,
 };
 use super::session::{frame_message, P9Session, Transport};
 
@@ -68,11 +66,7 @@ impl NinepNode {
             encode_twalk(w, self.fid, newfid, &[])
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
@@ -99,11 +93,7 @@ impl NinepNode {
             encode_twalk(w, self.fid, newfid, &names)
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
@@ -133,11 +123,7 @@ impl NinepNode {
             encode_topen(w, fid, mode)
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
@@ -150,22 +136,13 @@ impl NinepNode {
         }
     }
 
-    async fn twrite(
-        &self,
-        fid: u32,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<u32, FsError> {
+    async fn twrite(&self, fid: u32, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         let tag = self.session.alloc_tag();
         let req = frame_message(self.session.msize(), MsgType::Twrite, tag, |w| {
             encode_twrite(w, fid, offset, data)
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
@@ -184,11 +161,7 @@ impl NinepNode {
             encode_tread(w, fid, offset, count)
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
@@ -207,11 +180,7 @@ impl NinepNode {
             encode_tstat(w, fid)
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         match mt {
@@ -235,11 +204,7 @@ impl NinepNode {
             encode_tclunk(w, fid)
         })
         .map_err(Self::map_err)?;
-        let reply = self
-            .transport
-            .rpc(&req)
-            .await
-            .map_err(Self::map_err)?;
+        let reply = self.transport.rpc(&req).await.map_err(Self::map_err)?;
         let mut r = WireRead::new(&reply);
         let (_, mt, _) = decode_header(&mut r).map_err(Self::map_err)?;
         // Rclunk has no body. Errors are non-fatal — we lose track
@@ -336,8 +301,7 @@ impl FileOps for NinepNode {
             // Cap the per-message payload at the server's msize
             // minus the Twrite fixed-header overhead (11 bytes:
             // size[4] type[1] tag[2] fid[4]) per write(5).
-            let max_per_msg =
-                (self.session.msize().saturating_sub(23)).max(1) as usize;
+            let max_per_msg = (self.session.msize().saturating_sub(23)).max(1) as usize;
             let mut total = 0usize;
             while total < buf.len() {
                 let n = core::cmp::min(buf.len() - total, max_per_msg);

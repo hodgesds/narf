@@ -100,12 +100,7 @@ impl Inode {
         let mut block = [0u32; I_BLOCK_LEN];
         for i in 0..I_BLOCK_LEN {
             let off = 40 + i * 4;
-            block[i] = u32::from_le_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]);
+            block[i] = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
         }
         Some(Self {
             mode,

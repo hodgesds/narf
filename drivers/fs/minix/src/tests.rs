@@ -190,7 +190,10 @@ fn smoke_minix_inode_decode_v1_v2() -> TestResult {
     TestResult::Pass
 }
 
-kernel_test_in!("drivers/fs/minix", smoke_minix_superblock_magic_recognises_v1_v2_v3);
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_superblock_magic_recognises_v1_v2_v3
+);
 kernel_test_in!("drivers/fs/minix", smoke_minix_inode_location_math);
 kernel_test_in!("drivers/fs/minix", smoke_minix_dir_entry_decode_v3_60byte);
 kernel_test_in!("drivers/fs/minix", smoke_minix_inode_decode_v1_v2);
@@ -346,10 +349,16 @@ fn smoke_minix_mount_ramblock_round_trip() -> TestResult {
     if entries.len() != 3 {
         return TestResult::Fail("expected 3 entries in root");
     }
-    if !entries.iter().any(|(n, ft)| n == "hi.txt" && *ft == FileType::File) {
+    if !entries
+        .iter()
+        .any(|(n, ft)| n == "hi.txt" && *ft == FileType::File)
+    {
         return TestResult::Fail("hi.txt not enumerated as a file");
     }
-    if !entries.iter().any(|(n, ft)| n == "." && *ft == FileType::Dir) {
+    if !entries
+        .iter()
+        .any(|(n, ft)| n == "." && *ft == FileType::Dir)
+    {
         return TestResult::Fail("'.' not enumerated as a dir");
     }
 
@@ -459,7 +468,10 @@ fn smoke_minix_create_file_then_delete() -> TestResult {
         return TestResult::Fail("created file not found on lookup");
     }
     // Unlink.
-    if poll_once(root.unlink("new.txt")).and_then(|r| r.ok()).is_none() {
+    if poll_once(root.unlink("new.txt"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
         return TestResult::Fail("unlink failed");
     }
     // Lookup must now miss.

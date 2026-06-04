@@ -21,16 +21,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_block::{BlockDevice, BlockError};
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::descriptor::read_descriptor_tag;
 use super::fid::{decode_fid, Fid};
-use super::icb::{
-    ad_type, decode_entry_layout, file_type, read_long_ad, EntryLayout, LongAd,
-};
+use super::icb::{ad_type, decode_entry_layout, file_type, read_long_ad, EntryLayout, LongAd};
 use super::volume::{read_extent, UdfVolume};
 use super::SECTOR_SIZE;
 
@@ -121,8 +117,7 @@ async fn read_and_decode_icb<B: BlockDevice + 'static>(
     volume.read_sector(icb_lsn, &mut sector).await?;
     let tag = read_descriptor_tag(&sector, 0);
     use super::descriptor::tag_id;
-    if tag.tag_identifier != tag_id::FILE_ENTRY
-        && tag.tag_identifier != tag_id::EXTENDED_FILE_ENTRY
+    if tag.tag_identifier != tag_id::FILE_ENTRY && tag.tag_identifier != tag_id::EXTENDED_FILE_ENTRY
     {
         return Err(FsError::Io(BlockError::IOError));
     }
@@ -190,10 +185,8 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
             if offset >= icb.layout.information_length {
                 return Ok(0);
             }
-            let mut remaining = core::cmp::min(
-                buf.len() as u64,
-                icb.layout.information_length - offset,
-            );
+            let mut remaining =
+                core::cmp::min(buf.len() as u64, icb.layout.information_length - offset);
             // Embedded-data form: data lives in the AD area itself;
             // we don't currently surface that, so the caller sees
             // an empty read. Real DVD/BD media doesn't use embedded

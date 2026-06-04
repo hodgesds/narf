@@ -14,8 +14,8 @@
 //!   flag bits.
 
 pub use narf_drivers_fs_ext2::inode::{
-    Inode, I_BLOCK_LEN, N_DIRECT, SINGLE_IND_IDX, DOUBLE_IND_IDX, TRIPLE_IND_IDX,
-    S_IFMT, S_IFDIR, S_IFREG, S_IFLNK,
+    Inode, DOUBLE_IND_IDX, I_BLOCK_LEN, N_DIRECT, SINGLE_IND_IDX, S_IFDIR, S_IFLNK, S_IFMT,
+    S_IFREG, TRIPLE_IND_IDX,
 };
 
 /// `EXT4_EXTENTS_FL` — when set in `i_flags` (offset 32 of the
@@ -69,7 +69,11 @@ impl Ext4Inode {
         } else {
             0
         };
-        Some(Self { core, flags, size_hi })
+        Some(Self {
+            core,
+            flags,
+            size_hi,
+        })
     }
 
     /// 64-bit file size — `i_size_high << 32 | i_size`. Files larger

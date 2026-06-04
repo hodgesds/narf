@@ -44,8 +44,7 @@ pub struct DirectoryRecord {
     pub file_identifier_length: u8,
 }
 
-const _ASSERT_DIR_HEADER_SIZE: () =
-    assert!(core::mem::size_of::<DirectoryRecord>() == 33);
+const _ASSERT_DIR_HEADER_SIZE: () = assert!(core::mem::size_of::<DirectoryRecord>() == 33);
 
 /// File-flag bits (ECMA-119 §9.1.5). Stored in
 /// [`DirectoryRecord::file_flags`].
@@ -118,7 +117,5 @@ pub fn read_directory_record(buf: &[u8], offset: usize) -> DirectoryRecord {
     // byte layout that exactly matches ECMA-119 §9.1.1–§9.1.10. The
     // buffer is a freshly-read sector copy we own and the caller has
     // bounded `offset`.
-    unsafe {
-        core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const DirectoryRecord)
-    }
+    unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const DirectoryRecord) }
 }
