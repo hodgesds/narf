@@ -486,6 +486,18 @@ pub enum Syscall {
     /// on no-region.
     MUnlock,
 
+    /// `madvise(addr, len, advice)` — Linux syscall 28. Honoured
+    /// advice values: MADV_DONTNEED (4) and MADV_FREE (8) both
+    /// release the backing frames in `[addr, addr+len)` and mark
+    /// the slots demand-paged so the next access reads zero.
+    /// All other advice values (MADV_WILLNEED, MADV_HUGEPAGE,
+    /// MADV_DONTFORK, …) return Ok(0) — `madvise` is a hint, not
+    /// a contract. arg0 = base, arg1 = length, arg2 = advice.
+    /// Wave-66. Gated by the `linux-compat` feature on the kernel
+    /// side; the variant exists on every build so the wire number
+    /// stays stable.
+    Madvise,
+
     /// `execve(elf_buf, elf_len, argv_pack, argv_len, envp_pack,
     /// envp_len)` — re-image the calling task with a freshly-
     /// loaded program while preserving pid / fd table / brk top /
@@ -1444,6 +1456,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SchedGetPriorityMin, 147),
     (Syscall::MLock, 149),
     (Syscall::MUnlock, 150),
+    (Syscall::Madvise, 28),
     (Syscall::Prctl, 157),
     (Syscall::Setrlimit, 160),
     (Syscall::Mount, 165),
@@ -1619,6 +1632,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MProtect, 226),
     (Syscall::MLock, 228),
     (Syscall::MUnlock, 229),
+    (Syscall::Madvise, 233),
     (Syscall::Wait4, 260),
     (Syscall::Prlimit64, 261),
     (Syscall::GetRandom, 278),

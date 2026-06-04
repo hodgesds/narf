@@ -3204,16 +3204,99 @@ fn sys_mprotect(ctx: &mut dyn TrapContext) {
     let base = VirtAddr::new(args.arg0);
     let len = args.arg1;
     let prot = args.arg2 as u32;
-    let mut perms = RegionPerms::READ;
+
+    // POSIX prot bit layout (mirrored from narf-libc::sys):
+    //   PROT_NONE  = 0
+    //   PROT_READ  = 1
+    //   PROT_WRITE = 2
+    //   PROT_EXEC  = 4
+    //
+    // Note: PROT_NONE is `prot == 0`. We do NOT silently coerce to
+    // READ — Linux mprotect(PROT_NONE) installs an unreadable region
+    // that faults on any access. `materialize` / `rewrite_perms_pages`
+    // already key off `prot_only().0 == 0` to leave PTEs absent for
+    // such regions; the user-mode #PF then reports a clean SEGV via
+    // Wave-55's signal-induced termination.
+    let mut perms = RegionPerms(0);
+    if prot & 0b001 != 0 {
+        perms = perms | RegionPerms::READ;
+    }
     if prot & 0b010 != 0 {
         perms = perms | RegionPerms::WRITE;
     }
     if prot & 0b100 != 0 {
         perms = perms | RegionPerms::EXEC;
     }
-    match as_ref.change_perms_range(base, len, perms) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+
+    // Wave-66: take the Linux-compat split path. The legacy
+    // change_perms_range surface is whole-region only and silently
+    // accepted W|X (W^X enforcement was deferred to the wx module's
+    // classify_mprotect, which sys_mprotect never consulted). The
+    // new mprotect_range surface rejects W|X at the entry and splits
+    // a region cleanly when the request only covers a slice.
+    #[cfg(feature = "linux-compat")]
+    {
+        match as_ref.mprotect_range(base, len, perms) {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+        }
+        return;
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        match as_ref.change_perms_range(base, len, perms) {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+        }
+    }
+}
+
+/// `madvise(addr, len, advice)` — Linux syscall 28. The kernel honours
+/// MADV_DONTNEED (4) and MADV_FREE (8) as "release backing frames; next
+/// access reads zero." Every other advice value returns Ok(0) — `madvise`
+/// is a hint, not a contract, so silently accepting unknown advice values
+/// matches Linux's behaviour for callers that probe by value.
+///
+/// `arg0` = base, `arg1` = len, `arg2` = advice.
+///
+/// Returns `Ok(0)` on success or no-op-advice; `InvalidOp` if no region
+/// intersects the range (Linux returns ENOMEM in that case — libc maps
+/// our InvalidOp to ENOMEM).
+#[cfg(feature = "linux-compat")]
+fn sys_madvise(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let base = VirtAddr::new(args.arg0);
+    let len = args.arg1;
+    let advice = args.arg2 as i32;
+
+    // MADV_DONTNEED (4) and MADV_FREE (8) — Linux's two "release this
+    // memory" hints. NARF collapses them to the same shape because we
+    // don't have a swap / page-aging path to differentiate the
+    // eager-release (DONTNEED) from lazy-reclaim (FREE) semantics; both
+    // end up with "next access reads zero", which is what callers need.
+    const MADV_DONTNEED: i32 = 4;
+    const MADV_FREE: i32 = 8;
+
+    match advice {
+        MADV_DONTNEED | MADV_FREE => match as_ref.madvise_dontneed(base, len) {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+        },
+        // Other advice values (MADV_NORMAL, MADV_RANDOM, MADV_WILLNEED,
+        // MADV_SEQUENTIAL, MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_DONTFORK,
+        // MADV_DOFORK, MADV_REMOVE, MADV_DONTDUMP, MADV_DODUMP, …) —
+        // accept and ignore. `madvise` is a hint; the contract is that
+        // the kernel does its best and the program runs correctly either
+        // way. Returning success here matches Linux's behaviour for
+        // architectures that don't implement a given advice.
+        _ => ctx.set_return(SyscallReturn::ok(0)),
     }
 }
 
@@ -9765,6 +9848,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
     table.install_raw(Syscall::MLock, "mlock", RawFnHandler(sys_mlock));
     table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
+    #[cfg(feature = "linux-compat")]
+    table.install_raw(Syscall::Madvise, "madvise", RawFnHandler(sys_madvise));
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
     table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
     table.install_raw(Syscall::Mount, "mount", RawFnHandler(sys_mount));

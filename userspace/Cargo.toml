@@ -31,6 +31,8 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-modules      = { path = "../modules" }
 
 [features]
+default = ["linux-compat"]
+
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's
 # `user-mode-e2e` feature drives the test-bin runner; this
@@ -39,12 +41,12 @@ narf-modules      = { path = "../modules" }
 user-mode-e2e = []
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
-# mprotect, madvise, and dynamic-linker plumbing.  Stub for Waves 63-67.
-linux-compat = []
+# mprotect, madvise, and dynamic-linker plumbing.
+linux-compat = ["narf-memory/linux-compat"]
 
 # Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
 # Orthogonal to linux-compat — a container runtime needs both; a
-# namespace-aware native kernel needs only this.  Stub for Waves 63-67.
+# namespace-aware native kernel needs only this.
 container = []
 
 [lints]
