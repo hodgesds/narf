@@ -362,14 +362,25 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// NoDetailed / etc.).
     fn read_preferred_mode_via_edid(&mut self) -> Result<Mode, ModesetError> {
         let mut aux = IntelAux::new(self.mmio, self.ddi);
-        let mut edid = [0u8; 128];
-        // dp_edid::read_edid_block(&mut aux, 0, &mut edid)
-        //   .map_err(ModesetError::AuxFailure)?;
-        // TODO: pull in dp_edid once its API stabilizes. For
-        // Stage 1 we surface EdidUnavailable so callers always
-        // fall back to a hardcoded mode.
-        let _ = (&mut aux, &mut edid);
-        Err(ModesetError::EdidUnavailable)
+        let mut edid_buf = [0u8; 128];
+        let edid = crate::dp_edid::read_panel_edid(&mut aux, &mut edid_buf)
+            .map_err(|_| ModesetError::EdidUnavailable)?;
+
+        let d = edid.preferred_timing().map_err(|_| ModesetError::EdidUnavailable)?;
+
+        Ok(Mode {
+            pixel_clock_khz: d.pixel_clock_khz,
+            h_active: d.h_active,
+            h_total: d.h_active + d.h_blanking,
+            h_sync_start: d.h_active + d.h_sync_offset,
+            h_sync_end: d.h_active + d.h_sync_offset + d.h_sync_width,
+            v_active: d.v_active,
+            v_total: d.v_active + d.v_blanking,
+            v_sync_start: d.v_active + d.v_sync_offset,
+            v_sync_end: d.v_active + d.v_sync_offset + d.v_sync_width,
+            h_sync_positive: d.h_sync_positive,
+            v_sync_positive: d.v_sync_positive,
+        })
     }
 
     // ── Power wells ──────────────────────────────────────────

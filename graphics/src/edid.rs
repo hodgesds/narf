@@ -97,6 +97,10 @@ pub struct DetailedTiming {
     pub v_sync_offset: u16,
     /// Vertical sync pulse width (lines).
     pub v_sync_width: u16,
+    /// Horizontal sync polarity (true = positive).
+    pub h_sync_positive: bool,
+    /// Vertical sync polarity (true = positive).
+    pub v_sync_positive: bool,
 }
 
 impl DetailedTiming {
@@ -192,6 +196,12 @@ impl<'a> Edid<'a> {
         let h_sync_width = ((d[11] as u16 & 0x30) << 4) | d[9] as u16;
         let v_sync_offset = ((d[11] as u16 & 0x0C) << 2) | ((d[10] as u16 & 0xF0) >> 4);
         let v_sync_width = ((d[11] as u16 & 0x03) << 4) | (d[10] as u16 & 0x0F);
+        // Byte 17 contains flags. If bits [4:3] are 0b11 (digital separate),
+        // bit 2 is V sync (1 = positive) and bit 1 is H sync (1 = positive).
+        // We assume digital separate for modern panels.
+        let h_sync_positive = (d[17] & (1 << 1)) != 0;
+        let v_sync_positive = (d[17] & (1 << 2)) != 0;
+
         Ok(DetailedTiming {
             pixel_clock_khz,
             h_active,
@@ -202,6 +212,8 @@ impl<'a> Edid<'a> {
             h_sync_width,
             v_sync_offset,
             v_sync_width,
+            h_sync_positive,
+            v_sync_positive,
         })
     }
 
