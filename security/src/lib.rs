@@ -27,12 +27,12 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
-pub mod redact;
 pub mod cap_leak;
 pub mod posture;
+pub mod redact;
 
 mod tests;
 
-pub use redact::{Redact, redact_pointer, kernel_va_cutoff};
 pub use cap_leak::{assert_no_cap_leak, CapLeakError};
 pub use posture::{Posture, PostureReport};
+pub use redact::{kernel_va_cutoff, redact_pointer, Redact};

@@ -41,7 +41,7 @@ fn smoke_redact_user_va_passes_through() -> TestResult {
 kernel_test_in!("security/redact", smoke_redact_user_va_passes_through);
 
 fn smoke_cap_leak_clean_path() -> TestResult {
-    use crate::cap_leak::{assert_no_cap_leak, _reset_for_test};
+    use crate::cap_leak::{_reset_for_test, assert_no_cap_leak};
     _reset_for_test();
     // No caps held, no domain transition: clean.
     if assert_no_cap_leak().is_err() {
@@ -79,7 +79,10 @@ fn smoke_cap_leak_detects_write_crossing_domain() -> TestResult {
     _reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("security/cap_leak", smoke_cap_leak_detects_write_crossing_domain);
+kernel_test_in!(
+    "security/cap_leak",
+    smoke_cap_leak_detects_write_crossing_domain
+);
 
 fn smoke_posture_floors_check() -> TestResult {
     use crate::posture::PostureReport;
