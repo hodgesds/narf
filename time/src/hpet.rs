@@ -387,9 +387,7 @@ impl Hpet {
         // SAFETY: caller-asserted live window + valid index.
         let mut cfg = unsafe { read_u64(block + TIMER_REG_CONFIG) };
         // Step 1: program config (still disabled until step 5).
-        cfg &= !(TN_INT_ENB_CNF
-            | TN_FSB_EN_CNF
-            | TN_INT_ROUTE_CNF_MASK);
+        cfg &= !(TN_INT_ENB_CNF | TN_FSB_EN_CNF | TN_INT_ROUTE_CNF_MASK);
         cfg |= TN_TYPE_CNF_PERIODIC | TN_VAL_SET_CNF | TN_INT_TYPE_CNF;
         if cfg & TN_SIZE_CAP == 0 {
             cfg |= TN_32MODE_CNF;
@@ -759,11 +757,7 @@ pub unsafe fn arm_oneshot(n: u8, gsi: u8, deadline: u64) -> Result<(), ArmError>
 /// # Safety
 /// Caller asserts HPET MMIO is live and that IDT / IOAPIC
 /// plumbing for `gsi` is in place before this fires.
-pub unsafe fn arm_periodic(
-    n: u8,
-    gsi: u8,
-    period_ticks: u64,
-) -> Result<(), ArmError> {
+pub unsafe fn arm_periodic(n: u8, gsi: u8, period_ticks: u64) -> Result<(), ArmError> {
     let g = HPET.lock();
     let h = g.as_ref().ok_or(ArmError::NotPresent)?;
     if n >= h.caps.num_comparators {
@@ -926,9 +920,7 @@ pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64>
     loop {
         // SAFETY: same as above.
         let now = unsafe { dev.read_counter() };
-        if now.wrapping_sub(hpet_t0) >= calibration_window_hpet_ticks
-            || now == hpet_deadline
-        {
+        if now.wrapping_sub(hpet_t0) >= calibration_window_hpet_ticks || now == hpet_deadline {
             break;
         }
         core::hint::spin_loop();

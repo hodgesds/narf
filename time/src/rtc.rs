@@ -133,7 +133,11 @@ pub mod cmos {
             // BCD conversion.
             let pm = hour & 0x80 != 0;
             let h = conv(hour & 0x7F) % 12;
-            if pm { h + 12 } else { h }
+            if pm {
+                h + 12
+            } else {
+                h
+            }
         };
         if hour >= 24 {
             hour = 0; // defensive — broken RTCs occasionally stamp 24
@@ -213,7 +217,11 @@ pub mod pl031 {
         let second = (tod % 60) as u8;
         // Howard Hinnant inverse: days since 1970-01-01 → (y, m, d).
         let z = days + 719_468;
-        let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+        let era = if z >= 0 {
+            z / 146_097
+        } else {
+            (z - 146_096) / 146_097
+        };
         let doe = (z - era * 146_097) as u64;
         let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
         let y = yoe as i64 + era * 400;

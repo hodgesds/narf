@@ -22,7 +22,7 @@
 //! local timer stops in deep C-states). Phase 6 of the bring-up plan
 //! lands per-CPU + broadcast on top of this trait.
 
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -167,7 +167,9 @@ pub fn select_primary(hz: u32, vector: u8) -> Option<&'static dyn ClockEvent> {
     use core::fmt::Write as _;
     let snapshot: [Option<&'static dyn ClockEvent>; MAX_BACKENDS] = *REGISTRY.lock();
     for (idx, slot) in snapshot.iter().enumerate() {
-        let Some(dev) = slot else { continue; };
+        let Some(dev) = slot else {
+            continue;
+        };
         if !dev.supported() {
             let _ = writeln!(
                 narf_console::Writer,
@@ -199,7 +201,9 @@ pub fn select_primary(hz: u32, vector: u8) -> Option<&'static dyn ClockEvent> {
                 after
             );
             // SAFETY: same.
-            unsafe { dev.disarm(); }
+            unsafe {
+                dev.disarm();
+            }
             continue;
         }
         PRIMARY_IDX.store(idx + 1, Ordering::Release);

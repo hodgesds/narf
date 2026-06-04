@@ -25,76 +25,49 @@ fn smoke_monotonic_advances() -> TestResult {
 }
 kernel_test_in!("time", smoke_monotonic_advances);
 
-
-
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
-
-
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {
-
     use crate::rtc::cmos::{bcd_to_bin, bin_to_bcd};
 
     if bcd_to_bin(0x42) != 42 {
-
         return TestResult::Fail("BCD decode");
-
     }
 
     if bin_to_bcd(99) != 0x99 {
-
         return TestResult::Fail("BCD encode");
-
     }
 
     if bin_to_bcd(bcd_to_bin(0x59)) != 0x59 {
-
         return TestResult::Fail("BCD round-trip");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("time/rtc", smoke_rtc_cmos_bcd_to_bin_and_back);
 
-
-
 fn smoke_rtc_cmos_decodes_bcd_24h_with_century() -> TestResult {
-
     use crate::rtc::cmos::{decode_snapshot, STATUS_B_24H};
 
     // 2026-05-07 14:35:22, BCD + 24h.
 
-    let dt = decode_snapshot(
-
-        0x22, 0x35, 0x14, 0x07, 0x05, 0x26, 0x20, STATUS_B_24H,
-
-    );
+    let dt = decode_snapshot(0x22, 0x35, 0x14, 0x07, 0x05, 0x26, 0x20, STATUS_B_24H);
 
     if dt.year != 2026 || dt.month != 5 || dt.day != 7 {
-
         return TestResult::Fail("date wrong");
-
     }
 
     if dt.hour != 14 || dt.minute != 35 || dt.second != 22 {
-
         return TestResult::Fail("time wrong");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("time/rtc", smoke_rtc_cmos_decodes_bcd_24h_with_century);
 
-
-
 fn smoke_rtc_cmos_12h_pm_bit_promotes_hour() -> TestResult {
-
     use crate::rtc::cmos::decode_snapshot;
 
     // 12h mode: status_b 24H bit clear. 03 PM with PM bit set →
@@ -106,21 +79,15 @@ fn smoke_rtc_cmos_12h_pm_bit_promotes_hour() -> TestResult {
     let dt = decode_snapshot(0, 0, 0x83, 0x01, 0x01, 0x26, 0x20, 0);
 
     if dt.hour != 15 {
-
         return TestResult::Fail("PM 03 should be 15:00");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("time/rtc", smoke_rtc_cmos_12h_pm_bit_promotes_hour);
 
-
-
 fn smoke_rtc_pl031_unix_seconds_to_datetime_known_vector() -> TestResult {
-
     use crate::rtc::pl031::unix_seconds_to_datetime;
 
     // 2026-05-07 14:35:22 UTC = 1762525122 (cross-checked vs the
@@ -134,29 +101,24 @@ fn smoke_rtc_pl031_unix_seconds_to_datetime_known_vector() -> TestResult {
     // a sane month, and the seconds round-trip.
 
     if dt.year != 2026 {
-
         return TestResult::Fail("year");
-
     }
 
     let s = crate::rtc::RtcDateTime { ..dt }.to_unix_seconds();
 
     if s != 1_778_589_322 {
-
         return TestResult::Fail("round-trip");
-
     }
 
     TestResult::Pass
-
 }
 
-kernel_test_in!("time/rtc", smoke_rtc_pl031_unix_seconds_to_datetime_known_vector);
-
-
+kernel_test_in!(
+    "time/rtc",
+    smoke_rtc_pl031_unix_seconds_to_datetime_known_vector
+);
 
 fn smoke_rtc_pmic_decodes_4_byte_rdata_snapshot() -> TestResult {
-
     use crate::rtc::pmic::decode_snapshot;
 
     let s = 0u32; // Unix epoch.
@@ -164,51 +126,52 @@ fn smoke_rtc_pmic_decodes_4_byte_rdata_snapshot() -> TestResult {
     let dt = decode_snapshot(s.to_le_bytes());
 
     if dt.year != 1970 || dt.month != 1 || dt.day != 1 {
-
         return TestResult::Fail("epoch decode");
-
     }
 
     if dt.hour != 0 || dt.minute != 0 || dt.second != 0 {
-
         return TestResult::Fail("epoch h/m/s");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("time/rtc", smoke_rtc_pmic_decodes_4_byte_rdata_snapshot);
 
-
-
 fn smoke_rtc_datetime_unix_seconds_known_vectors() -> TestResult {
-
     use crate::rtc::RtcDateTime;
 
     // 1970-01-01 00:00:00 = 0.
 
-    let dt = RtcDateTime { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
+    let dt = RtcDateTime {
+        year: 1970,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    };
 
     if dt.to_unix_seconds() != 0 {
-
         return TestResult::Fail("epoch");
-
     }
 
     // 2000-01-01 00:00:00 = 946684800.
 
-    let dt = RtcDateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
+    let dt = RtcDateTime {
+        year: 2000,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    };
 
     if dt.to_unix_seconds() != 946_684_800 {
-
         return TestResult::Fail("y2k");
-
     }
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("time/rtc", smoke_rtc_datetime_unix_seconds_known_vectors);
@@ -216,8 +179,8 @@ kernel_test_in!("time/rtc", smoke_rtc_datetime_unix_seconds_known_vectors);
 // ── relocated from verification (subsystem 'time') ──
 
 fn smoke_time_wall_offset_and_leap_smear() -> TestResult {
-    use narf_capabilities::{Cap, Write};
     use crate::{begin_leap_smear, now_wall, set_wall_offset, wall, WallClock, WallError};
+    use narf_capabilities::{Cap, Write};
 
     wall::__test_reset();
 
@@ -277,7 +240,10 @@ fn smoke_hpet_arm_oneshot_rejects_when_uninitialised() -> TestResult {
         TestResult::Fail("arm_oneshot accepted a missing HPET")
     }
 }
-kernel_test_in!("time/hpet", smoke_hpet_arm_oneshot_rejects_when_uninitialised);
+kernel_test_in!(
+    "time/hpet",
+    smoke_hpet_arm_oneshot_rejects_when_uninitialised
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_hpet_arm_oneshot_rejects_bad_gsi() -> TestResult {
@@ -585,8 +551,12 @@ fn smoke_wheel_fire_due_wakes_only_expired() -> TestResult {
     timer_wheel::__reset_for_test();
     struct W(AtomicU32);
     impl Wake for W {
-        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
-        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let a = Arc::new(W(AtomicU32::new(0)));
     let b = Arc::new(W(AtomicU32::new(0)));
@@ -602,7 +572,10 @@ fn smoke_wheel_fire_due_wakes_only_expired() -> TestResult {
     if timer_wheel::fire_due(150) != 1 {
         return TestResult::Fail("fire_due(150) didn't fire exactly one");
     }
-    if a.0.load(Ordering::Relaxed) != 1 || b.0.load(Ordering::Relaxed) != 0 || c.0.load(Ordering::Relaxed) != 0 {
+    if a.0.load(Ordering::Relaxed) != 1
+        || b.0.load(Ordering::Relaxed) != 0
+        || c.0.load(Ordering::Relaxed) != 0
+    {
         return TestResult::Fail("wrong waker fired at 150");
     }
 
@@ -655,8 +628,12 @@ fn smoke_wheel_refresh_waker_updates_live_slot() -> TestResult {
     timer_wheel::__reset_for_test();
     struct W(AtomicU32);
     impl Wake for W {
-        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
-        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let old = Arc::new(W(AtomicU32::new(0)));
     let new = Arc::new(W(AtomicU32::new(0)));
@@ -688,13 +665,15 @@ fn smoke_wheel_refresh_waker_rejects_recycled_handle() -> TestResult {
     use alloc::sync::Arc;
     use alloc::task::Wake;
     struct Noop;
-    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
 
     timer_wheel::__reset_for_test();
     let waker = Arc::new(Noop).into();
     let stale_h = timer_wheel::register(100, waker).unwrap();
     timer_wheel::fire_due(150); // slot cleared
-    // Recycle the same slot with a fresh registration.
+                                // Recycle the same slot with a fresh registration.
     let _fresh_h = timer_wheel::register(200, Arc::new(Noop).into()).unwrap();
     // The stale handle's gen mismatches the slot's new gen.
     if timer_wheel::refresh_waker(stale_h, Arc::new(Noop).into()) {
@@ -708,7 +687,10 @@ fn smoke_wheel_refresh_waker_rejects_recycled_handle() -> TestResult {
     timer_wheel::__reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("time/wheel", smoke_wheel_refresh_waker_rejects_recycled_handle);
+kernel_test_in!(
+    "time/wheel",
+    smoke_wheel_refresh_waker_rejects_recycled_handle
+);
 
 fn smoke_wheel_handles_are_generationally_unique() -> TestResult {
     // Register / cancel / register cycles through the same slot
@@ -718,7 +700,9 @@ fn smoke_wheel_handles_are_generationally_unique() -> TestResult {
     use alloc::sync::Arc;
     use alloc::task::Wake;
     struct Noop;
-    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
 
     timer_wheel::__reset_for_test();
     let h1 = timer_wheel::register(100, Arc::new(Noop).into()).unwrap();
@@ -748,8 +732,12 @@ fn smoke_wheel_set_arm_callback_replaces_prior() -> TestResult {
 
     static FIRST: AtomicUsize = AtomicUsize::new(0);
     static SECOND: AtomicUsize = AtomicUsize::new(0);
-    fn first_cb(_: u64) { FIRST.fetch_add(1, Ordering::Relaxed); }
-    fn second_cb(_: u64) { SECOND.fetch_add(1, Ordering::Relaxed); }
+    fn first_cb(_: u64) {
+        FIRST.fetch_add(1, Ordering::Relaxed);
+    }
+    fn second_cb(_: u64) {
+        SECOND.fetch_add(1, Ordering::Relaxed);
+    }
 
     timer_wheel::__reset_for_test();
     FIRST.store(0, Ordering::Relaxed);
@@ -759,7 +747,9 @@ fn smoke_wheel_set_arm_callback_replaces_prior() -> TestResult {
     timer_wheel::set_arm_callback(second_cb);
 
     struct Noop;
-    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
     let _h = timer_wheel::register(100, Arc::new(Noop).into()).unwrap();
 
     if FIRST.load(Ordering::Relaxed) != 0 {
@@ -780,7 +770,9 @@ fn smoke_wheel_cancel_after_fire_is_silent() -> TestResult {
     use alloc::sync::Arc;
     use alloc::task::Wake;
     struct Noop;
-    impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
 
     timer_wheel::__reset_for_test();
     let h = timer_wheel::register(50, Arc::new(Noop).into()).unwrap();

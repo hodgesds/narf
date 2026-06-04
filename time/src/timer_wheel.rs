@@ -70,7 +70,10 @@ impl WheelInner {
     }
 
     fn min_deadline(&self) -> Option<u64> {
-        self.slots.iter().filter_map(|s| s.as_ref().map(|s| s.deadline_cycles)).min()
+        self.slots
+            .iter()
+            .filter_map(|s| s.as_ref().map(|s| s.deadline_cycles))
+            .min()
     }
 }
 
@@ -300,12 +303,7 @@ pub fn next_deadline_cycles() -> Option<u64> {
 
 /// Diagnostic: number of currently-occupied slots.
 pub fn occupied() -> usize {
-    WHEEL
-        .lock()
-        .slots
-        .iter()
-        .filter(|s| s.is_some())
-        .count()
+    WHEEL.lock().slots.iter().filter(|s| s.is_some()).count()
 }
 
 #[doc(hidden)]
@@ -326,8 +324,7 @@ pub fn __reset_for_test() {
 #[doc(hidden)]
 pub static ARM_FIRED: AtomicUsize = AtomicUsize::new(0);
 #[doc(hidden)]
-pub static LAST_ARM_DEADLINE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static LAST_ARM_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[doc(hidden)]
 pub fn __test_arm_callback(deadline: u64) {
