@@ -2714,3 +2714,95 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave61_pid_recycled_after_reap);
+
+// ── Wave-61 smokes: pidfd_open ─────────────────────────────────────
+//
+// Smoke 31: pidfd_open against a live pid yields a non-readable fd;
+//           on_child_exit flips it readable.
+// Smoke 32: pidfd_open against an already-exited pid is immediately
+//           readable (Linux zombie-pidfd parity).
+// Smoke 33: multiple pidfds for the same pid share state.
+
+/// Smoke 31: pidfd_open returns a non-readable fd for a live pid;
+/// `on_child_exit(pid)` flips POLLIN on. Direct API exercise — does
+/// not go through the syscall trap.
+fn smoke_wave61_pidfd_signals_on_exit() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+
+    const PID: u64 = 0xA110;
+    // assume_alive=true → exited=false at mint time.
+    let st = crate::pidfd::mint_for(PID, true);
+    let file = crate::pidfd::PidFdFile::new(st.clone());
+
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN != 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("fresh pidfd should not be readable");
+    }
+
+    crate::pidfd::notify_exit(PID);
+
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("post-exit pidfd not POLLIN-readable");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pidfd_signals_on_exit);
+
+/// Smoke 32: pidfd_open against an already-exited pid is immediately
+/// readable — Linux's zombie-pidfd behaviour.
+fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+
+    const PID: u64 = 0xDEAD;
+    // assume_alive=false → exited bit initialised true.
+    let st = crate::pidfd::mint_for(PID, false);
+    let file = crate::pidfd::PidFdFile::new(st);
+
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("zombie-pid pidfd not immediately readable");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pidfd_zombie_immediate);
+
+/// Smoke 33: multiple pidfds for the same pid share state. Once one
+/// observes the exit, every other observer agrees.
+fn smoke_wave61_pidfd_shared_state() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+
+    const PID: u64 = 0xB055;
+    let a = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let b = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+
+    if narf_filesystem::FileOps::poll_readiness(&a) & POLL_IN != 0
+        || narf_filesystem::FileOps::poll_readiness(&b) & POLL_IN != 0
+    {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("pidfd readable before exit");
+    }
+
+    crate::pidfd::notify_exit(PID);
+
+    if narf_filesystem::FileOps::poll_readiness(&a) & POLL_IN == 0
+        || narf_filesystem::FileOps::poll_readiness(&b) & POLL_IN == 0
+    {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("shared-state pidfds disagree post-exit");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pidfd_shared_state);
