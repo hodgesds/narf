@@ -39,7 +39,7 @@ enum Cmd {
     /// QEMU's serial stdout. Closes the Wave-37+ interactive loop:
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
-    RunInteractive(BuildArgs),
+    RunInteractive(RunInteractiveArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
     /// Build the bootable Limine ISO and boot it under QEMU + OVMF.
@@ -270,6 +270,29 @@ struct BuildArgs {
     ///          --initramfs-firmware "intel-ucode/*"
     #[arg(long, value_name = "GLOB")]
     initramfs_firmware: Vec<String>,
+}
+
+/// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
+/// (flatten) so all the usual `--features`, `--release`,
+/// `--display`, `--arch` knobs work, plus `--cmd <LINE>` /
+/// `--expect <SUBSTR>` for scripted command testing.
+#[derive(Parser, Clone)]
+struct RunInteractiveArgs {
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Command typed at the shell prompt (no trailing newline —
+    /// the harness appends `\n`). Defaults to `echo hello world`
+    /// for parity with the Wave-45 echo smoke.
+    #[arg(long, default_value = "echo hello world")]
+    cmd: String,
+
+    /// Substring asserted on QEMU's serial stdout AFTER the
+    /// command is typed. Defaults to `hello world`. For
+    /// coreutils: `--cmd "pwd" --expect "/"`,
+    /// `--cmd "ls /bin" --expect "cat"`, etc.
+    #[arg(long, default_value = "hello world")]
+    expect: String,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default, Debug)]
@@ -1137,28 +1160,28 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
 /// Success criteria: `narf> ` prompt observed within `prompt_secs`,
 /// then `hello world\n` observed within `echo_secs` after typing.
 /// Failure: any panic marker, OR either deadline missed.
-fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
+fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     use std::io::Write;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
 
-    if !matches!(args.arch, Arch::X86_64) {
+    if !matches!(args.build.arch, Arch::X86_64) {
         // The shell + boot_userspace_init are x86_64-only today
         // (`cfg(all(feature = "boot-init", target_arch = "x86_64"))`).
         bail!("xtask run-interactive: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
 
-    let mut args = args.clone();
-    ensure_feature(&mut args.features, "boot-init");
+    let mut build = args.build.clone();
+    ensure_feature(&mut build.features, "boot-init");
     // Bring up at least the firmware ack the boot-init flow assumes;
     // matches `Cmd::IsoBoot` / `Cmd::Image` defaults so the shell
     // actually loads.
-    ensure_feature(&mut args.features, "firmware-allow-unsigned");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
 
     let root = workspace_root()?;
-    let out_dir = cargo_build(&args, &root)?;
+    let out_dir = cargo_build(&build, &root)?;
 
-    let kernel = out_dir.join(&args.package);
+    let kernel = out_dir.join(&build.package);
     if !kernel.exists() {
         bail!(
             "expected kernel binary at {} — did `cargo build` succeed?",
@@ -1166,9 +1189,9 @@ fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
 
-    let qemu = args.arch.qemu_bin();
+    let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
+    cmd.args(build.arch.qemu_args(&kernel, &build.display, build.hw_profile));
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1323,7 +1346,7 @@ fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
 
-    println!("\nxtask run-interactive: prompt seen, typing `echo hello world`...");
+    println!("\nxtask run-interactive: prompt seen, typing `{}`...", args.cmd);
 
     // Drain the kernel's late-boot log noise (USB-HID enumeration
     // typically lands a few hundred ms after the shell prompt is
@@ -1343,8 +1366,12 @@ fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
     // to consider bytes from here onwards.
     let pre_type_pos = captured.lock().map(|g| g.len()).unwrap_or(0);
 
-    let line = b"echo hello world\n";
-    for &b in line {
+    // Wave-49: typed line is the configurable `args.cmd` with a
+    // trailing newline. Default is "echo hello world" for parity
+    // with the Wave-45 echo smoke.
+    let mut typed: Vec<u8> = args.cmd.as_bytes().to_vec();
+    typed.push(b'\n');
+    for &b in &typed {
         if stdin.write_all(&[b]).is_err() {
             let _ = child.kill();
             let _ = child.wait();
@@ -1378,7 +1405,9 @@ fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
     // local-echo copy when it arrives intact, which only happens
     // when the keystroke→shell→UART loop is working end to end
     // anyway. Either way, the test asserts what it claims to.
-    const NEEDLE: &[u8] = b"hello world";
+    // Wave-49: the expected substring is configurable via
+    // `args.expect`. Default is "hello world".
+    let needle: Vec<u8> = args.expect.as_bytes().to_vec();
     let echo_deadline = Duration::from_secs(echo_secs);
     let echo_start = std::time::Instant::now();
     let mut got_echo = false;
@@ -1408,9 +1437,9 @@ fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
                 // next byte is `\r` or `\n` (or EOF on the buffer
                 // — but in that case keep waiting).
                 let mut idx = 0usize;
-                while idx + NEEDLE.len() < tail.len() {
-                    if &tail[idx..idx + NEEDLE.len()] == NEEDLE {
-                        let next = tail[idx + NEEDLE.len()];
+                while idx + needle.len() < tail.len() {
+                    if &tail[idx..idx + needle.len()] == needle.as_slice() {
+                        let next = tail[idx + needle.len()];
                         if next == b'\r' || next == b'\n' {
                             got_echo = true;
                             break;
@@ -1434,13 +1463,18 @@ fn run_interactive_cmd(args: &BuildArgs) -> Result<()> {
 
     if !got_echo {
         bail!(
-            "xtask run-interactive: typed `echo hello world` but did not \
-             see `hello world\\n` echoed back within {}s",
+            "xtask run-interactive: typed `{}` but did not \
+             see `{}` echoed back within {}s",
+            args.cmd,
+            args.expect,
             echo_secs
         );
     }
 
-    println!("\nxtask run-interactive: ok — full keystroke→shell→echo→serial loop");
+    println!(
+        "\nxtask run-interactive: ok — typed `{}`, saw `{}`",
+        args.cmd, args.expect,
+    );
     Ok(())
 }
 
