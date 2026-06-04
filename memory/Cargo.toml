@@ -16,5 +16,14 @@ narf-lib         = { path = "../lib" }
 narf-arch        = { path = "../arch" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
+[features]
+# mprotect / madvise / brk extension needed by Linux-compat syscalls.
+# Stub for Waves 63-67.
+linux-compat = []
+
+# Per-namespace address-space tagging.  Orthogonal to linux-compat.
+# Stub for Waves 63-67.
+container = []
+
 [lints]
 workspace = true

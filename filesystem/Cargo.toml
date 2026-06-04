@@ -28,5 +28,13 @@ narf-console      = { path = "../console" }
 narf-interrupts   = { path = "../interrupts" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
+[features]
+# Linux-shaped mount/bind-mount/overlayfs plumbing.  Stub for Waves 63-67.
+linux-compat = []
+
+# Per-namespace mount trees.  Orthogonal to linux-compat.
+# Stub for Waves 63-67.
+container = []
+
 [lints]
 workspace = true

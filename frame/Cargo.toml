@@ -94,6 +94,14 @@ narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
 [features]
+# Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
+# mprotect, madvise, and dynamic-linker plumbing.  Forwarded from
+# narf-userspace.  Stub for Waves 63-67.
+linux-compat = ["narf-userspace/linux-compat"]
+
+# Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
+container = ["narf-userspace/container"]
+
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
 idt-selftest = []

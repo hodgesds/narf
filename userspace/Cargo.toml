@@ -38,5 +38,14 @@ narf-modules      = { path = "../modules" }
 # it.
 user-mode-e2e = []
 
+# Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
+# mprotect, madvise, and dynamic-linker plumbing.  Stub for Waves 63-67.
+linux-compat = []
+
+# Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
+# Orthogonal to linux-compat — a container runtime needs both; a
+# namespace-aware native kernel needs only this.  Stub for Waves 63-67.
+container = []
+
 [lints]
 workspace = true
