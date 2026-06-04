@@ -1164,6 +1164,7 @@ name = "narf-drivers-serial"
 version = "0.0.0"
 dependencies = [
  "narf-acpi",
+ "narf-aml",
  "narf-arch",
  "narf-bus",
  "narf-console",
@@ -1171,6 +1172,7 @@ dependencies = [
  "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
 ]
 
 [[package]]
