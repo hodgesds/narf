@@ -264,34 +264,6 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
-    // Synchronous-signal delivery for user-mode CPU exceptions.
-    // Strict gate on CS RPL == 3 so kernel-mode exceptions stay
-    // on the existing probe-catch / panic path: the probe-catch
-    // surface below is for kernel-issued recovery (test
-    // infrastructure), and a kernel-mode crash is unambiguously
-    // a kernel bug we want to panic on.
-    //
-    // The hook returns true when it rewrote the trap frame to
-    // land at a user signal handler — fall through to the asm
-    // tail's iretq, which carries the rewritten RIP back to user
-    // mode where the handler runs. Returning false (no handler
-    // installed, or an unmappable vector like #DF) means the user
-    // genuinely deserves the panic surface below.
-    if (frame.cs & 3) == 3 {
-        if let Some(hook) = narf_userspace::sync_signal_hook() {
-            // Snapshot the vector before the mutable borrow of
-            // `frame` lands inside `from_int80`. The hook may
-            // rewrite RIP/RSP on the trap frame to deliver, so
-            // `frame` must be mutably borrowed for the duration
-            // of the call.
-            let vector = frame.vector;
-            let mut ctx = X86TrapContext::from_int80(frame);
-            if hook(&mut ctx, vector) {
-                return;
-            }
-        }
-    }
-
     // COW write-fault recovery (user-mode only). When a fork()'d
     // process writes a shared, write-protected page for the first
     // time, #PF lands here with the present + write + user bits
@@ -380,6 +352,30 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                         return;
                     }
                 }
+            }
+        }
+    }
+
+    // Synchronous-signal delivery for user-mode CPU exceptions.
+    // Runs AFTER demand-paging / stack-grow / COW so a legitimate
+    // fault that has a normal recovery path doesn't get stolen by
+    // an installed SIGSEGV handler. Only genuine user crashes —
+    // dereferencing NULL, writing to a non-mapped page, divide by
+    // zero — reach this. Strict CS RPL == 3 gate keeps kernel-mode
+    // exceptions on the existing probe-catch / panic path.
+    //
+    // The hook returns true when it rewrote the trap frame to land
+    // at a user signal handler — fall through to the asm tail's
+    // iretq, which carries the rewritten RIP back to user mode where
+    // the handler runs. Returning false (no handler installed, or an
+    // unmappable vector like #DF) means the user genuinely deserves
+    // the panic surface below.
+    if (frame.cs & 3) == 3 {
+        if let Some(hook) = narf_userspace::sync_signal_hook() {
+            let vector = frame.vector;
+            let mut ctx = X86TrapContext::from_int80(frame);
+            if hook(&mut ctx, vector) {
+                return;
             }
         }
     }
